@@ -24,6 +24,7 @@ import {
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
   ADVISOR_AGENT_ID,
+  AGENT_MODEL_AUTO,
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
@@ -1236,7 +1237,10 @@ export async function _runDelegateTaskCore(
   // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
   // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
   // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
-  const requestedModel = isReview ? reviewerModelOverride : input.model
+  const taskboardDefault = input.modelPolicy === 'taskboard-stage-agent-auto' &&
+    delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO
+    ? delegatedAgent.model : undefined
+  const requestedModel = isReview ? reviewerModelOverride : input.model || taskboardDefault
   let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
   let delegateExec: LocalExecutionDecision | undefined
   // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
@@ -1799,6 +1803,7 @@ export async function _runDelegateTaskCore(
   let lastChildActivityAt = Date.now()
   const markChildActivity = () => {
     lastChildActivityAt = Date.now()
+    if (session?.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
   }
   let session: AgentSession
   let detachAncestorActivity: (() => void) | undefined
@@ -1831,6 +1836,7 @@ export async function _runDelegateTaskCore(
       },
     })
     hooks?.onSessionSpawned?.()
+    if (session.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
     session._durableDelegateTranscript = durableTranscript
     session._durableDelegateRuntimeEvents = durableRuntimeEvents
     session._durableDelegateEngineBillings = durableEngineBillings
@@ -2468,6 +2474,7 @@ export async function _runTaskboardDelegate(
     goal: input.goal,
     context: input.context,
     sourceAgent: 'taskboard',
+    modelPolicy: 'taskboard-stage-agent-auto',
     toolsets: input.toolsets ?? undefined,
     depth: 0,
     effort: input.effort ?? undefined,

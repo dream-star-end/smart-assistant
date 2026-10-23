@@ -922,6 +922,47 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   })
 
+  for (const scenario of [
+    { name: 'stage wins over agent', stage: 'deepseek-v4-flash', agent: 'grok-build', expected: 'deepseek-v4-flash', mint: 0, admits: 0 },
+    { name: 'agent default wins over grok preference', agent: 'deepseek-v4-flash', expected: 'deepseek-v4-flash', mint: 0, admits: 0 },
+    { name: 'explicit agent grok refuses route denial', agent: 'grok-build', denied: true, mint: 1, admits: 0 },
+    { name: 'auto retains grok routing', agent: 'auto', expected: 'grok-build', mint: 1, admits: 1 },
+    { name: 'auto retains route fallback', agent: 'auto', denied: true, expected: 'deepseek-v4-flash', mint: 1, admits: 0 },
+    { name: 'unavailable explicit model refuses before spawn', agent: 'deepseek-v4-flash', stage: 'retired-task-model', mint: 0, admits: 0 },
+    { name: 'explicit stage grok does not fall back', agent: 'deepseek-v4-flash', stage: 'grok-build', denied: true, mint: 1, admits: 0 },
+  ]) {
+    test(`taskboard model A: ${scenario.name}`, async () => {
+      installCatalog({ extraModels: GROK_ROWS })
+      await withFlags({ authority: true, exempt: true }, async () => {
+        const gw = makeDelegateGateway()
+        const getConfig = gw._getAgentsConfig
+        gw._getAgentsConfig = async () => {
+          const config = await getConfig()
+          return { ...config, agents: config.agents.map((agent: any) => agent.id === 'coding-assistant' ? { ...agent, model: scenario.agent } : agent) }
+        }
+        let minted = 0
+        const admits: any[] = []
+        const admit = gw._delegateEngineBilling.admit
+        gw._delegateEngineBilling.admit = async (input: any) => { admits.push(input); return admit(input) }
+        gw._acquireDelegateGrokRoute = async () => { minted += 1; return scenario.denied ? deniedMint() : okMint() }
+        const result = await gw._runTaskboardDelegate({ agentId: 'coding-assistant', goal: 'taskboard model policy fixture', model: scenario.stage, sessionKey: 'agent:coding-assistant:taskboard:fixture:stage:run', timeoutSec: 60 })
+        assert.equal(minted, scenario.mint)
+        assert.equal(admits.length, scenario.admits)
+        if (scenario.expected) {
+          assert.equal(result.ok, true, JSON.stringify(result))
+          assert.equal(gw.sessions.getOrCreateCalls, 1)
+          assert.equal(gw.sessions.getOrCreateArgs[0].model, scenario.expected)
+          assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority.canonicalModel, scenario.expected)
+          if (admits.length) assert.equal(admits[0].model, scenario.expected)
+        } else {
+          assert.equal(result.ok, false)
+          assert.equal(gw.sessions.getOrCreateCalls, 0)
+          assert.equal(admits.length, 0)
+        }
+      })
+    })
+  }
+
   test('decideLocalExecution:preferredModels 排在 agent.model 之前,但不可路由时静默跳过', () => {
     const v = view([row('glm-5.2', 'ccb'), row('grok-build', 'grok')])
     const exempt = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv

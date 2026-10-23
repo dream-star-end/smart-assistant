@@ -18,12 +18,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { type AgentsConfig, paths } from '@openclaude/storage'
 import { filterUserVisibleByAgentField } from '../agentVisibility.js'
-import { handleTaskboardApi, resolveTaskboardActor } from '../taskboard/http.js'
+import { handleTaskboardApi, resolveTaskboardActor, type TaskboardHttpContext } from '../taskboard/http.js'
 import type { WebhookRouter } from '../webhooks.js'
 import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface WorkspaceApiRoutesIo {
+  getRunSnapshots: NonNullable<TaskboardHttpContext['getRunSnapshots']>
   _getAgentsConfigUserView(): Promise<AgentsConfig>
   _handleTaskItem(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void>
   _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void>
@@ -214,6 +215,7 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/),
     (io, req, res, url) => {
       handleTaskboardApi(req, res, {
+        getRunSnapshots: (runs) => io.getRunSnapshots(runs),
         resolveActor: (r) =>
           resolveTaskboardActor(r, {
             jwtSecret: io.deps.config.gateway.accessToken,

@@ -117,6 +117,8 @@ export interface RunDelegateInput {
   idleTimeoutMs?: number
   /** 可选:覆盖目标成员默认模型的 catalog 型号。审查委派忽略(审查员型号由 gateway 选)。 */
   model?: string
+  /** Internal taskboard adapter only; HTTP request bodies never set this. */
+  modelPolicy?: 'taskboard-stage-agent-auto'
   /** 2026-09-04 团队模式:审查任务书模板(execution 验收 / deliberation 审议对比)。
    *  仅审查委派读取;非法/缺省 → execution。只影响提示词,不影响闸与计费。 */
   reviewMode?: string

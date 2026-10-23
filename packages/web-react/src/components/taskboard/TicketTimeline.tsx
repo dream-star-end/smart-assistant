@@ -259,6 +259,7 @@ function SystemRun({
         <p className="text-caption text-muted">
           {RUN_TRIGGER_LABEL[run.trigger] ?? run.trigger} · 开始执行
         </p>
+        <p className="text-caption text-faint break-all">执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}</p>
       </div>
     )
   }
@@ -276,6 +277,14 @@ function SystemRun({
       <p className="text-caption text-muted break-words">
         {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
+      <p className="text-caption text-muted break-all" data-testid="ticket-run-models">执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}</p>
+      {run.status === 'running' && run.preview && (
+        <div className="rounded-lg border border-border bg-hover px-3 py-2" data-testid="ticket-run-preview">
+          <p className="text-caption text-muted">实时预览{run.preview.lastActivityAt ? ` · ${new Date(run.preview.lastActivityAt).toLocaleTimeString()}` : ''}</p>
+          {run.preview.toolNames.length > 0 && <p className="mt-1 break-words text-caption text-faint">工具：{run.preview.toolNames.join('、')}</p>}
+          {run.preview.text && <p className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-body">{run.preview.text}</p>}
+        </div>
+      )}
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
       {(run.contextSha256 || run.contextVersion != null) && (
         <details className="text-caption text-muted" data-testid="ticket-run-context">

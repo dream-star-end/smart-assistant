@@ -269,6 +269,9 @@ export interface PipelineStage {
 }
 
 export interface TicketRun {
+  /** Read-only response projection from actual usage/live runner; never persisted. */
+  actualModels?: string[]
+  preview?: { text: string; toolNames: string[]; lastActivityAt: number | null }
   id: string
   ticketId: string
   stageId: string

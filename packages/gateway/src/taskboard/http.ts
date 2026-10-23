@@ -121,6 +121,7 @@ import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 import {
   type BoardAgent,
   type TaskboardHttpContext,
+  enrichTaskboardRuns,
   sendJson,
   sendError,
   asString,
@@ -771,6 +772,7 @@ async function dispatch(
         actor,
         idOrIdent,
         sub as TicketCollection,
+        ctx,
       )
     }
     if ((TICKET_ACTIONS as readonly string[]).includes(sub)) {
@@ -844,7 +846,7 @@ async function dispatch(
 
   const runItem = path.match(/^\/api\/board\/runs\/([^/]+)$/)
   if (runItem) {
-    if (method === 'GET') return handleGetRun(res, db, decodeURIComponent(runItem[1]))
+    if (method === 'GET') return handleGetRun(res, db, decodeURIComponent(runItem[1]), ctx)
     return sendError(res, 405, 'method not allowed')
   }
 
@@ -1443,6 +1445,7 @@ async function handleTicketCollection(
   actor: Actor,
   idOrIdent: string,
   collection: TicketCollection,
+  ctx: TaskboardHttpContext,
 ): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
   if (collection === 'runs') {
@@ -1459,7 +1462,7 @@ async function handleTicketCollection(
       limit: parseLimit(url),
       offset: parseOffset(url),
     })
-    return sendJson(res, 200, result)
+    return sendJson(res, 200, { ...result, items: await enrichTaskboardRuns(ctx, result.items) })
   }
   if (collection === 'relations') {
     if (method === 'GET') return sendJson(res, 200, { items: listRelations(db, ticket.id) })
@@ -1488,7 +1491,7 @@ async function handleTicketCollection(
     })
   }
   if (method !== 'GET') return sendError(res, 405, 'method not allowed')
-  return handleTimeline(res, url, db, ticket)
+  return handleTimeline(res, url, db, ticket, ctx)
 }
 
 function handleAddRelation(
@@ -1523,7 +1526,7 @@ function handleAddRelation(
   sendJson(res, 201, { ok: true, relation })
 }
 
-function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket): void {
+async function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket, ctx: TaskboardHttpContext): Promise<void> {
   const limit = parseLimit(url, 100, 500)
   const comments = listComments(db, ticket.id, { limit: 500, offset: 0 })
   const activities = listActivities(db, ticket.id, { limit: 500, offset: 0 })
@@ -1546,7 +1549,10 @@ function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: 
     })),
   ]
   items.sort((a, b) => a.createdAt - b.createdAt || a.kind.localeCompare(b.kind))
-  sendJson(res, 200, { items: items.slice(0, limit) })
+  const window = items.slice(0, limit)
+  const enriched = await enrichTaskboardRuns(ctx, window.flatMap((item) => item.kind === 'run' ? [item.run] : []))
+  const byId = new Map(enriched.map((run) => [run.id, run]))
+  sendJson(res, 200, { items: window.map((item) => item.kind === 'run' ? { ...item, run: byId.get(item.run.id) ?? item.run } : item) })
 }
 
 function handleTicketAction(

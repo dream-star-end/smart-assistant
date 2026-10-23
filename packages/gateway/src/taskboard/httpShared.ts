@@ -7,7 +7,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type TaskboardDb, TaskboardValidationError } from './db/index.js'
 import { getProject, getProjectByKey } from './db/projects.js'
-import type { Actor } from './domain.js'
+import type { Actor, TicketRun } from './domain.js'
 
 /** 单次 run 允许配置的最大无活动窗口；活跃 run 没有 45 分钟墙钟上限。 */
 export const DELEGATE_IDLE_TIMEOUT_MAX_SEC = 45 * 60
@@ -33,6 +33,8 @@ export interface TaskboardHttpContext {
   jwtSecret?: string
   isCommercialJwt?: (token: string) => boolean
   listAgents?: () => Promise<BoardAgent[]>
+  /** Only database-resolved runs are accepted; no client supplied session keys. */
+  getRunSnapshots?: (runs: readonly TicketRun[]) => Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview'>>>
   /**
    * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
    * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。
@@ -100,4 +102,16 @@ export function isUniqueConstraint(err: unknown, needle?: string): boolean {
 
 export function resolveProject(db: TaskboardDb, idOrKey: string) {
   return getProject(db, idOrKey) ?? getProjectByKey(db, idOrKey)
+}
+
+/** Enrich only the response window, with one batch lookup and no stored mutation. */
+export async function enrichTaskboardRuns(ctx: TaskboardHttpContext, runs: readonly TicketRun[]): Promise<TicketRun[]> {
+  if (!ctx.getRunSnapshots || runs.length === 0) return [...runs]
+  try {
+    const snapshots = await ctx.getRunSnapshots(runs)
+    return runs.map((run) => ({ ...run, ...snapshots[run.id] }))
+  } catch {
+    // Usage persistence may be briefly unavailable. Missing stays unrecorded.
+    return runs.map((run) => ({ ...run, actualModels: [] }))
+  }
 }

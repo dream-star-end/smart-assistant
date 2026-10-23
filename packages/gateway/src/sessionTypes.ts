@@ -148,6 +148,8 @@ export interface AgentSession {
    * Nested delegates append their full transcript here in execution order so
    * the first-level durable team card survives reload with every descendant. */
   _durableDelegateTranscript?: unknown[]
+  /** Exact live taskboard activity timestamp; not persisted or inferred from polling. */
+  _taskboardLastActivityAt?: number
   /** Complete raw event stream for this one-shot delegate turn. The delegate
    * channel is not persisted as its own chat session, so handleDelegateTask
    * moves this collector into the parent DurableAgentGroup. */

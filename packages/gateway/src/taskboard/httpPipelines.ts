@@ -35,6 +35,7 @@ import { parseEntryCondition } from './entryCondition.js'
 import {
   DELEGATE_IDLE_TIMEOUT_MAX_SEC,
   type TaskboardHttpContext,
+  enrichTaskboardRuns,
   sendJson,
   sendError,
   asString,
@@ -394,8 +395,8 @@ export async function handlePatchStage(
   sendJson(res, 200, { ok: true, stage })
 }
 
-export function handleGetRun(res: ServerResponse, db: TaskboardDb, id: string): void {
+export async function handleGetRun(res: ServerResponse, db: TaskboardDb, id: string, ctx: TaskboardHttpContext = {}): Promise<void> {
   const run = getRun(db, id)
   if (!run) throw new TaskboardNotFound('run', id)
-  sendJson(res, 200, { run })
+  sendJson(res, 200, { run: (await enrichTaskboardRuns(ctx, [run]))[0] })
 }
