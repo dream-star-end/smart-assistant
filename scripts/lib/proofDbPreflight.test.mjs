@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { connectionFor, evaluate, vetDsn } from "./proofDbPreflight.mjs";
+import { CONNECT_TIMEOUT_MS, READ_TIMEOUTS_MS, connectionFor, evaluate, readFactsRetryingTimeout, vetDsn } from "./proofDbPreflight.mjs";
 
 const healthy = {
   user: "test", database: "openclaude_test", serverVersion: "16.15",
@@ -75,4 +75,42 @@ test("gate-db reads the server through postgres like gateTestDb.mjs; shared-db r
   assert.equal(connectionFor("shared-db", conn).database, "missing_test");
   const tool = readFileSync(new URL("./gateTestDb.mjs", import.meta.url), "utf8");
   assert.match(tool, /database: "postgres"/, "gateTestDb.mjs still connects through postgres");
+});
+
+test("a statement timeout is retried once with a longer budget; nothing else is (OCV5-583)", async () => {
+  const timeout = () => Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+  const calls = [];
+  const seq = (...outcomes) => async (ms) => {
+    calls.push(ms);
+    const o = outcomes.shift();
+    if (o instanceof Error) throw o;
+    return o;
+  };
+  // 2026-10-23 04:39Z: the first read timed out, the server was fine
+  calls.length = 0;
+  const got = await readFactsRetryingTimeout(seq(timeout(), healthy));
+  assert.deepEqual(calls, [10_000, 30_000]);
+  assert.equal(got.facts, healthy);
+  assert.match(got.warn, /statement timeout once; retried with 30s/);
+  // a fast answer: one read, no warning
+  calls.length = 0;
+  assert.deepEqual(await readFactsRetryingTimeout(seq(healthy)), { facts: healthy });
+  assert.deepEqual(calls, [10_000]);
+  // two timeouts: still refused (fail-closed), never a third read
+  calls.length = 0;
+  await assert.rejects(readFactsRetryingTimeout(seq(timeout(), timeout(), healthy)), /statement timeout/);
+  assert.deepEqual(calls, [10_000, 30_000]);
+  // any other error is not retried
+  calls.length = 0;
+  await assert.rejects(readFactsRetryingTimeout(seq(Object.assign(new Error("permission denied"), { code: "42501" }), healthy)),
+    /permission denied/);
+  assert.deepEqual(calls, [10_000]);
+});
+
+test("the shell wrapper's timeout covers the probe's worst case, retry included (Codex #1021 r1)", () => {
+  const wrapper = readFileSync(new URL("./v5-release-preflight.sh", import.meta.url), "utf8");
+  const m = /OC_V5_PREFLIGHT_PROOF_DSN="\$dsn" timeout (\d+) node "\$probe"/.exec(wrapper);
+  assert.ok(m, "wrapper runs the probe under timeout N");
+  const worstMs = READ_TIMEOUTS_MS.length * CONNECT_TIMEOUT_MS + READ_TIMEOUTS_MS.reduce((a, b) => a + b, 0);
+  assert.ok(Number(m[1]) * 1000 > worstMs, `timeout ${m[1]}s must exceed the probe's worst case ${worstMs / 1000}s`);
 });
