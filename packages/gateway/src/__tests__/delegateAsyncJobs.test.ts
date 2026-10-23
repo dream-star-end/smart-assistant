@@ -615,9 +615,18 @@ describe('605 delegate trace boundaries', () => {
     let arrived!: () => void
     let release!: (status: number) => void
     let observed: any
-    const ready = new Promise<void>(resolve => { arrived = resolve })
+    let readyTimeout: ReturnType<typeof setTimeout>
+    const ready = new Promise<void>((resolve, reject) => {
+      arrived = () => { clearTimeout(readyTimeout); resolve() }
+      readyTimeout = setTimeout(() => reject(new Error('trace fixture did not receive mint request')), 4000)
+    })
     const gate = new Promise<number>(resolve => { release = resolve })
     const server = createServer(async (req, res) => {
+      if (req.url === '/internal/v3/marketplace/sync') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '765', profiles: [] } }))
+        return
+      }
       const chunks: Buffer[] = []
       for await (const chunk of req) chunks.push(Buffer.from(chunk))
       observed = JSON.parse(Buffer.concat(chunks).toString())
@@ -629,7 +638,9 @@ describe('605 delegate trace boundaries', () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as any).port}`
     process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'synthetic-proof-only'
+    process.env.OC_USER_ID = '765'
     return { ready, release, observed: () => observed, close: async () => {
+      clearTimeout(readyTimeout)
       release(503)
       server.closeAllConnections()
       await new Promise<void>(resolve => server.close(() => resolve()))
@@ -648,7 +659,7 @@ describe('605 delegate trace boundaries', () => {
     const mint = await mintBarrier()
     try {
       const pending = call(gw, 'handleDelegateTask', { goal: 'stop during mint' }, 'coding-assistant', signed())
-      await mint.ready
+      await Promise.race([mint.ready, pending.then(() => { throw new Error('delegate returned before trace fixture') })])
       assert.equal(gw._delegateQueueWaiters?.size ?? 0, 0)
       assert.equal(gw._interruptDelegationsForParent(PARENT_KEY), true)
       mint.release(200)
@@ -689,7 +700,7 @@ describe('605 delegate trace boundaries', () => {
         headers[DELEGATE_CONTEXT_HEADER] = issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0, traceId: 'c'.repeat(32) })
         return JSON.stringify({ goal: 'canonical trace', parentTraceId: 'd'.repeat(32) })
       } })
-      await mint.ready
+      await Promise.race([mint.ready, pending.then(() => { throw new Error('delegate returned before trace fixture') })])
       assert.equal(mint.observed().parentTraceId, parentTraceId)
       mint.release(200)
       const result = await pending
