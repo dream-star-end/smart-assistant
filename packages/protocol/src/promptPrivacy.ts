@@ -22,3 +22,13 @@ export function effectivePromptPrivacy(raw: unknown, sessionId: string | undefin
   const p = parsePromptPrivacyPolicy(raw)
   return p?.profile && sessionId && p.profile.sessionId === sessionId ? p : { schemaVersion: 1, profile: null }
 }
+
+
+export interface PromptPrivacySupport { version: 1; state: 'ready' | 'upgrade_required' | 'unknown' }
+export const DEFAULT_PROMPT_PRIVACY_SUPPORT: Readonly<PromptPrivacySupport> = Object.freeze({ version: 1, state: 'unknown' })
+export function parsePromptPrivacySupport(raw: unknown): PromptPrivacySupport | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const p = raw as Record<string, unknown>
+  if (Object.keys(p).sort().join(',') !== 'state,version' || p.version !== 1 || typeof p.state !== 'string' || !['ready', 'upgrade_required', 'unknown'].includes(p.state)) return null
+  return { version: 1, state: p.state as PromptPrivacySupport['state'] }
+}

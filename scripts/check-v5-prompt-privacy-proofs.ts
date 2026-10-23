@@ -12,6 +12,7 @@ const result = spawnSync(process.execPath, ['--import', 'tsx', '--test',
   'packages/gateway/src/__tests__/sessionManagerPromptPrivacy.test.ts',
   'packages/gateway/src/__tests__/enginePreheatPreparationLock.test.ts',
   'packages/gateway/src/__tests__/codexAppServerRunner.test.ts',
+  'packages/commercial/src/__tests__/promptPrivacySupport.test.ts',
 ], { cwd: root, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: scratch, TMPDIR: scratch },
   stdio: 'inherit', timeout: 120_000 })
 if (result.error || result.signal || result.status !== 0) {

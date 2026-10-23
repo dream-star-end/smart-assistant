@@ -1,3 +1,4 @@
+import { DEFAULT_PROMPT_PRIVACY_SUPPORT, parsePromptPrivacySupport, type PromptPrivacySupport } from '@openclaude/protocol/browser'
 import { Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
@@ -115,6 +116,9 @@ export function SettingsCenter({
   const [ledgerReload, setLedgerReload] = useState(0);
 
   const [prefs, setPrefs] = useState<PrefsView | null>(null);
+  const [prefsEpoch, setPrefsEpoch] = useState<number | null>(null);
+  const [privacySupport, setPrivacySupport] = useState<PromptPrivacySupport>({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
+  const currentEpoch = auth?.snapshot().epoch ?? null;
   const [prefsLoading, setPrefsLoading] = useState(false);
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
   const [prefsReloadTick, setPrefsReloadTick] = useState(0);
@@ -133,23 +137,28 @@ export function SettingsCenter({
     } else {
       setSection("account");
       setSubOpen(false);
+      setPrivacySupport({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
     }
   }, [open, initialSection, subscribeOpenSignal, sections]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: prefsReloadTick 是显式重试触发器。
   useEffect(() => {
-    if (!open || demo || !auth || !needsPreferences || prefs != null) {
+    if (!open || demo || !auth || !needsPreferences) {
       return;
     }
     let alive = true;
+    const requestEpoch = auth.snapshot().epoch;
+    setPrivacySupport({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
     setPrefsLoading(true);
     setPrefsErr(null);
     api
       .getPreferences(auth)
       .then((snap) => {
-        if (!alive) return;
+        if (!alive || auth.snapshot().epoch !== requestEpoch) return;
         const next = extractPrefs(snap);
         setPrefs(next);
+        setPrefsEpoch(requestEpoch);
+        setPrivacySupport(parsePromptPrivacySupport((snap as { features?: { prompt_privacy?: unknown } }).features?.prompt_privacy) ?? { ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
         applyIntelligentUiSnapshot(snap);
         onPreferencesChange?.(next);
       })
@@ -162,14 +171,18 @@ export function SettingsCenter({
     return () => {
       alive = false;
     };
-  }, [open, demo, auth, needsPreferences, prefs, onPreferencesChange, prefsReloadTick]);
+  }, [open, demo, auth, needsPreferences, onPreferencesChange, prefsReloadTick]);
 
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {
       if (!auth) return;
+      const requestEpoch = auth.snapshot().epoch;
       const snap = await api.patchPreferences(auth, patch);
+      if (auth.snapshot().epoch !== requestEpoch) throw new Error("登录身份已改变，请重新查看设置。");
       const next = extractPrefs(snap);
       setPrefs(next);
+      setPrefsEpoch(requestEpoch);
+      setPrivacySupport(parsePromptPrivacySupport((snap as { features?: { prompt_privacy?: unknown } }).features?.prompt_privacy) ?? { ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
       applyIntelligentUiSnapshot(snap);
       onPreferencesChange?.(next, patch);
     },
@@ -246,7 +259,8 @@ export function SettingsCenter({
               auth={auth}
               user={user}
               theme={theme}
-              prefs={prefs}
+              prefs={prefsEpoch === currentEpoch ? prefs : null}
+              privacySupport={prefsEpoch === currentEpoch ? privacySupport : { ...DEFAULT_PROMPT_PRIVACY_SUPPORT }}
               prefsLoading={prefsLoading}
               prefsErr={prefsErr}
               onRetryPrefs={() => setPrefsReloadTick((tick) => tick + 1)}
@@ -284,6 +298,7 @@ function SettingsPanel({
   theme,
   prefs,
   prefsLoading,
+  privacySupport,
   prefsErr,
   onRetryPrefs,
   onSetTheme,
@@ -301,6 +316,7 @@ function SettingsPanel({
   theme: Theme;
   prefs: PrefsView | null;
   prefsLoading: boolean;
+  privacySupport: PromptPrivacySupport;
   prefsErr: string | null;
   onRetryPrefs: () => void;
   onSetTheme: (t: Theme) => void;
@@ -369,6 +385,7 @@ function SettingsPanel({
         ) : (
           <PreferencesTab
             activeSessionId={activeSessionId}
+            privacySupport={privacySupport}
             auth={auth}
             prefs={prefs}
             theme={theme}

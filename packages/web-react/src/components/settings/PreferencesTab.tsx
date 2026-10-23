@@ -1,3 +1,4 @@
+import type { PromptPrivacySupport } from '@openclaude/protocol/browser'
 import { Monitor, Moon, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
@@ -67,6 +68,7 @@ export function modifierKeyLabel(): string {
  */
 export function PreferencesTab({
   activeSessionId,
+  privacySupport,
   auth,
   prefs,
   theme,
@@ -74,6 +76,7 @@ export function PreferencesTab({
   onPatch,
 }: {
   activeSessionId?: string
+  privacySupport?: PromptPrivacySupport
   auth: AuthSession
   prefs: PrefsView
   theme: Theme
@@ -294,7 +297,7 @@ export function PreferencesTab({
         </div>
       </div>
 
-      <AssistantPrivacyPreferences key={`${auth.snapshot().epoch}:${activeSessionId ?? "none"}`} auth={auth} sessionId={activeSessionId} profile={prefs.system_assistant_profile} onPatch={onPatch} />
+      <AssistantPrivacyPreferences key={`${auth.snapshot().epoch}:${activeSessionId ?? "none"}`} auth={auth} privacySupport={privacySupport} sessionId={activeSessionId} profile={prefs.system_assistant_profile} onPatch={onPatch} />
 
       {/* 输入：仅本设备 */}
       <div className="border-t border-border px-5 py-4">
