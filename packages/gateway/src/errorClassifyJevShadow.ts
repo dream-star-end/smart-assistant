@@ -33,6 +33,7 @@ const CRITERIA: Record<string, string> = {
   insufficient_credits: 'the account is out of credits or payment is required',
   auth_error: 'authentication or credentials failed, are missing, or were rejected',
   rate_limited: 'the request was throttled by a rate limit or per-period quota',
+  request_too_large: 'the complete request exceeded the transport envelope',
   context_too_long: 'the prompt exceeded the model context window',
   model_capacity: 'the model or serving pool is overloaded; the same model may work later',
   model_not_available:

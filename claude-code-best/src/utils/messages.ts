@@ -35,7 +35,6 @@ import {
   getPdfInvalidErrorMessage,
   getPdfPasswordProtectedErrorMessage,
   getPdfTooLargeErrorMessage,
-  getRequestTooLargeErrorMessage,
 } from '../services/api/errors.js'
 import type { AnyObject, Progress } from '../Tool.js'
 import { isConnectorTextBlock } from '../types/connectorText.js'
@@ -2317,7 +2316,6 @@ export function normalizeMessagesForAPI(
     [getPdfPasswordProtectedErrorMessage()]: new Set(['document']),
     [getPdfInvalidErrorMessage()]: new Set(['document']),
     [getImageTooLargeErrorMessage()]: new Set(['image']),
-    [getRequestTooLargeErrorMessage()]: new Set(['document', 'image']),
   }
 
   // Walk the reordered messages to build a targeted strip map:

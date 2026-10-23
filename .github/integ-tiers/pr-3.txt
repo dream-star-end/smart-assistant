@@ -18,6 +18,7 @@ packages/commercial/src/http/proxy/boxDurableJournal.modelSet.integ.test.ts
 packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts
 packages/commercial/src/http/proxy/boxToolInputEcho.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts
+packages/commercial/src/http/proxy/boxContextTransport.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts
 packages/commercial/src/http/proxy/boxPrelaunchJournal.integ.test.ts
 packages/commercial/src/__tests__/retentionRegistry.integ.test.ts

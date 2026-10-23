@@ -294,6 +294,14 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     // 夜跑梯队:确实会跑,但发现延迟到次日,不能当作 PR 门级证据。
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
+  if (path === "claude-code-best/src/utils/model/boxContextTransport.test.ts"
+    || path === "claude-code-best/src/utils/__tests__/messages.test.ts") {
+    const command = JSON.parse(ROOT_PACKAGE_JSON).scripts?.["test:ccb:box-context"];
+    if (typeof command !== "string" || !command.includes(path.replace("claude-code-best/", ""))) {
+      fail(`${path} 未列进 test:ccb:box-context 的实际文件清单`);
+    }
+    return requireCi("test:ccb:box-context", "CI → npm run test:ccb:box-context → Bun tests");
+  }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
   // test:gateway 是 `find packages/gateway/src -type f -name "*.test.ts"`:src 下任何位置的
   // *.test.ts 都被跑(含与源码同目录的 engine/*.test.ts),这里按 runner 的真实口径放行。
