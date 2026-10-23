@@ -121,6 +121,8 @@ export function makeAnnotationApi(
     async create(userId: string, projectId: string, body: Record<string, unknown>) {
       const f = validateFields(body)
       const takeId = typeof body.takeId === 'string' ? body.takeId : ''
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(takeId))
+        throw bad('takeId must be a take id')
       return inTx(pool, async (c) => {
         const status = await ownedProject(c, userId, projectId)
         if (['canceled', 'failed'].includes(status))
@@ -199,9 +201,9 @@ export function makeAnnotationApi(
           throw new HttpError(409, 'ANNOTATION_NOT_DRAFT', 'this annotation was already sent')
         const sent = await c.query<{ n: string }>(
           `UPDATE studio_annotations SET status = 'sent', interpretation = NULL
-            WHERE id = $1 AND length(text) > 0 RETURNING
-              (SELECT COUNT(*) FROM studio_tasks WHERE kind = 'interpret' AND payload->>'annotationId' = $1)::text AS n`,
-          [id],
+            WHERE id = $1::uuid AND length(text) > 0 RETURNING
+              (SELECT COUNT(*) FROM studio_tasks WHERE kind = 'interpret' AND payload->>'annotationId' = $2)::text AS n`,
+          [id, id],
         )
         if (!sent.rows[0]) throw new HttpError(400, 'BAD_REQUEST', 'write what should change first')
         const inflight = await c.query<{ n: string }>(
