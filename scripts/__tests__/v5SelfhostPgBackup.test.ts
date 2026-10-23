@@ -522,7 +522,13 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
         '\' "$B" "$key" ;;',
         '  deletefile) [[ -f "$B/$key" ]] || exit 4; rm -f -- "$B/$key" ;;',
         '  rcat) t="$STUB_DIR/rcat.$$"; cat > "$t" || exit 1; mkdir -p "$(dirname "$B/$key")"; mv "$t" "$B/$key" ;;',
-        '  backend) [[ "${args[1]}" == cleanup ]] || exit 2 ;;',
+        // multipart uploads: $STUB_DIR/multipart holds the list-multipart-uploads JSON;
+        // cleanup empties it unless $STUB_DIR/cleanup_noop (an abort that fails silently).
+        '  backend) case "${args[1]}" in',
+        '    cleanup) [[ -f "$STUB_DIR/cleanup_noop" ]] || echo \'{"ocv5-personal-backup": []}\' > "$STUB_DIR/multipart" ;;',
+        '    list-multipart-uploads) cat "$STUB_DIR/multipart" 2>/dev/null || echo \'{"ocv5-personal-backup": []}\' ;;',
+        '    *) exit 2 ;;',
+        '  esac ;;',
         '  *) exit 2 ;;',
         'esac',
       ].join('\n'),
@@ -591,6 +597,21 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       const put = log.findIndex((l) => l.startsWith('rcat'))
       const cleanups = log.flatMap((l, i) => (l.startsWith('backend cleanup') ? [i] : []))
       assert.ok(cleanups.some((i) => i < put) && cleanups.some((i) => i > put), log.join('\n'))
+    })
+
+    test('a cleanup that exits 0 but leaves uploads behind still stops the command (Codex r2 P1)', () => {
+      writeFileSync(path.join(dir, 'cleanup_noop'), '')
+      writeFileSync(
+        path.join(dir, 'multipart'),
+        JSON.stringify({ 'ocv5-personal-backup': [{ Key: 'pg/full/x.gpg', UploadId: 'u1' }] }),
+      )
+      const r = runR2(['precheck'])
+      assert.equal(r.status, 1, r.out)
+      assert.match(r.out, /still present after cleanup: 1/)
+      assert.equal(runR2(['full', 'full-20261025T131000Z.dump'], {}, 'a').status, 1)
+      assert.deepEqual(objects('full'), [])
+      rmSync(path.join(dir, 'cleanup_noop'))
+      assert.equal(runR2(['precheck']).status, 0)
     })
 
     test('a failing multipart cleanup stops every command before it writes', () => {

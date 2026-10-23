@@ -18,8 +18,9 @@
 #         --max-transfer with a hard cutoff backs the counter up.
 #   Unfinished multipart uploads take space but are not listed as objects, so
 #   every command first aborts them (`rclone backend cleanup`, only this host
-#   writes the bucket and the backup lock serialises runs) and fails closed when
-#   that does not work; a killed or failed upload is cleaned up again at once.
+#   writes the bucket and the backup lock serialises runs), then lists them again
+#   and fails closed unless none is left (cleanup's exit code alone is not proof);
+#   a killed or failed upload is cleaned up again at once.
 #   core  Upload, then keep the newest V5SB_R2_CORE_KEEP copies.
 # After every write a bucket total above V5SB_R2_WARN_BYTES (9e9) exits 5, so the
 # unit fails and alerts. First answer: raise V5SB_FULL_COMPRESS; if that is not
@@ -74,8 +75,24 @@ rc() { "$RCLONE" --config "$RCLONE_CONF" "$@"; }
 # against the account but not in lsjson). max-age=1s: anything already pending
 # when a command starts is left over from an earlier killed or failed upload.
 abort_multipart() {
-  rc backend cleanup "$REMOTE" -o max-age=1s
+  local listing left
+  rc backend cleanup "$REMOTE" -o max-age=1s || return 1
+  # rclone 1.70.x returns 0 even when an abort fails (Codex r2): count what is left.
+  listing=$(rc backend list-multipart-uploads "$REMOTE") || return 1
+  left=$(python3 -c "$PY_MULTIPART_LEFT" <<<"$listing") || return 1
+  if [[ "$left" != 0 ]]; then
+    log "unfinished multipart uploads still present after cleanup: $left"
+    return 1
+  fi
 }
+PY_MULTIPART_LEFT='
+import json, sys
+v = json.load(sys.stdin)
+if not isinstance(v, dict):
+    sys.exit(1)
+print(sum(len(x or []) for x in v.values()))
+'
+
 
 encrypt() {
   GNUPGHOME="$GPG_HOME" "$GPG" --batch --quiet --no-tty --trust-model always \
