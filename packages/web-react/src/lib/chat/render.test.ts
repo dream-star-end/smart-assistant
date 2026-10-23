@@ -6,6 +6,7 @@ import {
   defaultCollapsed,
   errorLabel,
   errorPresentation,
+  isLegacyRequestTooLargeDiagnostic,
   isRedundantRuntimeEnvelope,
   isLive,
   messageKind,
@@ -498,5 +499,23 @@ describe("大请求完整资料错误", () => {
     const shown = errorPresentation("request_too_large", "这是已完成的分析。", old);
     expect(shown.bodyText).toBe("这是已完成的分析。");
     expect(shown.detail).toBeUndefined();
+  });
+});
+
+describe("legacy size card compatibility stays exact", () => {
+  const diagnostic = "Request too large (max 20MB). Try with a smaller file.";
+  test("only a complete legacy SDK diagnostic changes presentation semantics", () => {
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", diagnostic)).toBe(true);
+    expect(isLegacyRequestTooLargeDiagnostic(undefined, diagnostic)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("upstream_failed", diagnostic)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", `真实部分回答\n${diagnostic}`)).toBe(false);
+    expect(isLegacyRequestTooLargeDiagnostic("ENGINE_ERROR", "普通旧错误内容")).toBe(false);
+  });
+  test("cached diagnostic details expose only the original request ID", () => {
+    const requestId = "60760760760760760760760760760760";
+    const view = errorPresentation("request_too_large", diagnostic, `${diagnostic} request id: ${requestId}`);
+    expect(view.title).toBe("资料暂未处理完成");
+    expect(view.bodyText).toBeUndefined();
+    expect(view.detail).toBe(`请求 ID：${requestId}`);
   });
 });

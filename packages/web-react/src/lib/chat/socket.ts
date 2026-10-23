@@ -60,6 +60,7 @@ import {
 import { repairPostFinalProcessOrder } from "./order";
 import {
   freezeErrorCardSnapshots,
+  carryLegacySizeRequestReferences,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -4127,6 +4128,8 @@ export class ChatSocket {
     const existing = this.sessions.get(stored.id);
     if (existing) {
       let changed = restoreRejectedNoticeMetadata(existing, stored);
+      const referenced = carryLegacySizeRequestReferences(existing.messages, stored.messages ?? []);
+      if (referenced !== existing.messages) { existing.messages = referenced; changed = true; }
       // A route placeholder may precede asynchronous IndexedDB hydration.
       // Preserve live data, but durable rejection fences are monotonic.
       const raw = stored._automaticRecoveryDecisions;
@@ -4428,6 +4431,7 @@ export class ChatSocket {
     const watermark = s._lastServerSyncUpdatedAt ?? 0;
     if (hasVersion && serverUpdatedAt < watermark) return;
     msgs = applyRejectedNoticeMetadata(s, msgs);
+    msgs = carryLegacySizeRequestReferences(msgs, s.messages);
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;

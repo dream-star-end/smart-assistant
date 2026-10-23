@@ -16,8 +16,11 @@ const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const red = process.env.OC_REQUEST_SIZE_CARD_RED === "1";
+const snapshotRed = process.env.OC_REQUEST_SIZE_SNAPSHOT_RED === "1";
 const old = "Request too large (max 20MB). Try with a smaller file.";
 const partial = "已完成的分析：原始资料均保留。";
+const cachedId = "60760760760760760760760760760760";
+const cachedTitle = "任务执行失败";
 const evidence = process.env.OC_G607_BROWSER_EVIDENCE_DIR
   ?? resolve(here, "../test-results/request-size-card");
 let transforms = 0;
@@ -34,17 +37,24 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
       alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
       define: { "process.env.NODE_ENV": '"production"',
         "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
-      plugins: red ? [{ name: "restore-english-diagnostic-leak", setup(b) {
-        b.onLoad({ filter: /\/lib\/chat\/render\.ts$/ }, ({ path }) => {
+      plugins: red || snapshotRed ? [{ name: "restore-request-diagnostic-regressions", setup(b) {
+        if (red) b.onLoad({ filter: /\/lib\/chat\/render\.ts$/ }, ({ path }) => {
           const source = readFileSync(path, "utf8");
           const needle = '.replace(diagnostic, "").trim()';
           assert.ok(source.includes(needle));
           transforms++;
           return { contents: source.replace(needle, ""), loader: "ts" };
         });
+        if (snapshotRed) b.onLoad({ filter: /\/components\/chat\/cards\.tsx$/ }, ({ path }) => {
+          const source = readFileSync(path, "utf8");
+          const needle = "const legacySize = isLegacyRequestTooLargeDiagnostic(msg._errorCode, msg.text);";
+          assert.ok(source.includes(needle));
+          transforms++;
+          return { contents: source.replace(needle, "const legacySize = false;"), loader: "tsx" };
+        });
       }}] : [], logLevel: "warning",
     });
-    assert.equal(transforms, red ? 1 : 0);
+    assert.equal(transforms, Number(red) + Number(snapshotRed));
     const cssDir = join(assetDir, "css-build"); mkdirSync(cssDir);
     await viteBuild({ root: join(here, ".."), configFile: false, logLevel: "silent",
       plugins: [tailwindcss()], build: { outDir: cssDir, emptyOutDir: true, cssCodeSplit: false,
@@ -69,19 +79,24 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
       browser = await chromium.launch({ executablePath: resolveBrowserExecutable(),
         headless: true, args: ["--no-sandbox"] });
       for (const width of [1280, 390]) {
-        for (const shape of ["legacy", "mixed", "separate"]) {
+        for (const shape of ["legacy", "mixed", "separate", "legacy-frozen"]) {
           await t.test(`${width} ${shape}`, async () => {
             const ts = Date.now();
             const cmid = `g607-card-${shape}`;
             const rows = [{ id: cmid, role: "user", text: "请完整处理这些资料。",
               status: "error", ts, _source: "server",
               _routing: { model: "box-api-claude-opus-5-5", effortLevel: "high", teamMode: false } }];
-            if (shape === "separate") rows.push({ id: "partial", role: "assistant", text: partial,
+            if (shape === "separate" || shape === "legacy-frozen") rows.push({ id: "partial", role: "assistant", text: partial,
               status: "completed", ts: ts + 1, _source: "server", _clientMessageId: cmid });
             rows.push({ id: "error", role: "assistant",
               text: shape === "mixed" ? `${partial}\n${old}` : old,
-              status: "crashed", ts: ts + 2, _source: "server", _clientMessageId: cmid,
-              _errorCode: shape === "legacy" ? "ENGINE_ERROR" : "request_too_large" });
+              status: shape.startsWith("legacy") ? "completed" : "crashed", ts: ts + 2, _source: "server", _clientMessageId: cmid,
+              _errorCode: shape.startsWith("legacy") ? "ENGINE_ERROR" : "request_too_large",
+              ...(shape === "legacy-frozen" ? { _errorCardSnapshot: {
+                disposition: "card", tone: "red", title: cachedTitle,
+                message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
+                detail: `${old} request id: ${cachedId}`,
+              } } : {}) });
             if (shape === "legacy") rows.push(
               { id: "later-user", role: "user", text: "后续记录。", status: "completed", ts: ts + 3, _source: "server" },
               { id: "later-answer", role: "assistant", text: "后续已完成。", status: "completed", ts: ts + 4, _source: "server", _clientMessageId: "later-user" });
@@ -93,19 +108,47 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
             page.on("pageerror", (e) => errors.push(e.message));
             try {
               for (const reload of [false, true]) {
+                if (reload && shape === "legacy-frozen") {
+                  await page.waitForFunction(async ({ id, title, requestId }) => {
+                    if (!(await indexedDB.databases()).some((d) => d.name === "ocv5_sessions__u1")) return false;
+                    const db = await new Promise((resolve, reject) => {
+                      const request = indexedDB.open("ocv5_sessions__u1");
+                      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+                    });
+                    try {
+                      const stored = await new Promise((resolve, reject) => {
+                        const request = db.transaction("sessions").objectStore("sessions").get(id);
+                        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+                      });
+                      return stored?.messages?.some((m) => m.id === "error" && m._errorCardSnapshot?.title === title && m._errorCardSnapshot.detail?.includes(requestId));
+                    } finally { db.close(); }
+                  }, { id: BOARD_SESSION, title: cachedTitle, requestId: cachedId }, { timeout: 10000 });
+                  preview.store.board = preview.store.board.map(({ _errorCardSnapshot: _snapshot, ...row }) => row);
+                  preview.store.revision++;
+                }
                 if (reload) await page.reload(); else await page.goto(preview.url);
-                await page.getByText("资料暂未处理完成", { exact: true }).waitFor();
+                if (shape === "legacy-frozen") await page.getByText(partial, { exact: true }).waitFor();
+                else await page.getByText("资料暂未处理完成", { exact: true }).waitFor();
                 const body = await page.locator("body").innerText();
                 assert.equal(await page.getByText("资料暂未处理完成", { exact: true }).count(), 1);
                 assert.match(body, /文件和对话均已保留/);
                 assert.doesNotMatch(body, /Request too large|max 20MB|内部错误/);
                 if (shape !== "legacy") assert.ok(body.includes(partial));
+                if (shape === "legacy-frozen") {
+                  assert.ok(!body.includes(cachedTitle));
+                  const details = page.locator("details").filter({ hasText: cachedId });
+                  assert.equal(await details.count(), 1, "cached request ID must survive the display projection");
+                  await details.locator("summary").click();
+                  const detail = await details.innerText();
+                  assert.ok(detail.includes(`请求 ID：${cachedId}`));
+                  assert.doesNotMatch(detail, /Request too large|max 20MB|内部错误/);
+                }
                 if (width === 390) assert.ok(await page.evaluate(() =>
                   document.documentElement.scrollWidth <= window.innerWidth + 2));
               }
               await page.screenshot({ path: join(evidence, `${shape}-${width}.png`), fullPage: true });
               assert.deepEqual(errors, []);
-              console.log("REQUEST_SIZE_CARD_RECEIPT", JSON.stringify({ width, shape, red, transforms }));
+              console.log("REQUEST_SIZE_CARD_RECEIPT", JSON.stringify({ width, shape, red, snapshotRed, transforms }));
             } finally { await context.close(); }
           });
         }
