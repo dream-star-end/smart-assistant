@@ -122,6 +122,31 @@ export interface StudioProjectView {
   assets: StudioAsset[]
   takes: StudioTake[]
   events: StudioEvent[]
+  /** OCV5-591 A2-1b-2: annotations the user sent (drafts stay in the tab until sent). */
+  annotations?: StudioAnnotation[]
+}
+
+/** A sent annotation and what the director agent made of it (OCV5-593 FE-7b). */
+export interface StudioAnnotation {
+  id: string
+  targetKind: 'shot' | 'line' | 'music' | 'final' | 'asset'
+  targetId: string
+  takeId: string | null
+  kind: 'point' | 'box' | 'range' | 'text'
+  tStartMs: number | null
+  tEndMs: number | null
+  geom: { x: number; y: number; w?: number; h?: number } | null
+  text: string
+  status: 'draft' | 'sent' | 'applied' | 'rejected'
+  interpretation: {
+    op: string | null
+    explanation: string | null
+    confidence: number | null
+    state: 'running' | 'done' | 'failed' | null
+    error: string | null
+  } | null
+  appliedTakeId: string | null
+  createdAt: string
 }
 
 export interface StudioProjectPage {

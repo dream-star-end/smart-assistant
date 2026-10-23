@@ -1,14 +1,19 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
+const createAnnotation = vi.fn(async () => ({ id: 'srv1' }))
+const annotationAction = vi.fn(async () => ({ ok: true }))
 vi.mock('../../lib/studio/api', () => ({
   studioApi: {
     blobTicket: vi.fn(async (_a: unknown, sha: string) => ({
       url: `/blob/${sha}`,
       expiresInSeconds: 900,
     })),
+    createAnnotation: (...a: unknown[]) => createAnnotation(...(a as [])),
+    annotationAction: (...a: unknown[]) => annotationAction(...(a as [])),
   },
+  studioErrorText: () => '出错了',
 }))
 
 import type { StudioProjectView, StudioTake } from '../../lib/studio/types'
@@ -82,14 +87,14 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByText('尾巴颜色和设定不符')).toBeInTheDocument()
   })
 
-  test('a point drops a draft with normalised coordinates; text is kept; submit stays disabled', async () => {
+  test('a point drops a draft with normalised coordinates; text is kept; it can be handed over', async () => {
     render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: '点' }))
     fireEvent.pointerDown(box(), { clientX: 250, clientY: 125, pointerId: 1 })
     const dialog = await screen.findByRole('dialog', { name: '批注 1' })
     fireEvent.change(screen.getByLabelText('批注说明'), { target: { value: '眼睛别看镜头' } })
     expect(dialog).toBeInTheDocument()
-    for (const b of screen.getAllByRole('button', { name: /交给 agent/ })) expect(b).toBeDisabled()
+    for (const b of screen.getAllByRole('button', { name: /交给 agent/ })) expect(b).toBeEnabled()
     const saved = JSON.parse(sessionStorage.getItem('oc.studio.annotationDrafts.p')!)
     expect(saved).toEqual([
       expect.objectContaining({
@@ -125,6 +130,68 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByRole('tab', { name: '批注 1' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /^v1/ }))
     expect(screen.getByRole('tab', { name: '批注 0' })).toBeInTheDocument()
+  })
+})
+
+describe('ReviewPage hand over to the agent (OCV5-593 FE-7b)', () => {
+  test('a draft becomes a server annotation, is sent, and leaves the tab', async () => {
+    createAnnotation.mockClear()
+    annotationAction.mockClear()
+    const onReload = vi.fn()
+    render(
+      <ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} onReload={onReload} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '点' }))
+    fireEvent.pointerDown(box(), { clientX: 250, clientY: 125, pointerId: 1 })
+    await screen.findByRole('dialog', { name: '批注 1' })
+    fireEvent.change(screen.getByLabelText('批注说明'), { target: { value: '眼睛别看镜头' } })
+    fireEvent.click(screen.getByTestId('hand-over'))
+    await waitFor(() => expect(onReload).toHaveBeenCalled())
+    expect(createAnnotation).toHaveBeenCalledWith(auth, 'p', {
+      takeId: 't2',
+      kind: 'point',
+      tStartMs: 0,
+      geom: { x: 0.25, y: 0.25 },
+      text: '眼睛别看镜头',
+    })
+    expect(annotationAction).toHaveBeenCalledWith(auth, 'srv1', 'send')
+    expect(sessionStorage.getItem('oc.studio.annotationDrafts.p')).toBeNull()
+  })
+
+  test('what the agent understood is shown; 确认执行 applies it, 不采用 rejects it', async () => {
+    annotationAction.mockClear()
+    const v = view()
+    v.annotations = [
+      {
+        id: 'a1',
+        targetKind: 'shot',
+        targetId: 's1',
+        takeId: 't2',
+        kind: 'text',
+        tStartMs: null,
+        tEndMs: null,
+        geom: null,
+        text: '尾巴改成白色',
+        status: 'sent',
+        interpretation: {
+          op: 'regenerate_shot',
+          explanation: '重画首帧，尾巴改白',
+          confidence: 0.7,
+          state: null,
+          error: null,
+        },
+        appliedTakeId: null,
+        createdAt: '',
+      },
+    ]
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} onReload={() => {}} />)
+    const note = screen.getByTestId('sent-note')
+    expect(note).toHaveTextContent('等你确认')
+    expect(note).toHaveTextContent('agent 理解为：重画首帧，尾巴改白')
+    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'apply'))
+    fireEvent.click(screen.getByRole('button', { name: '不采用' }))
+    await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'reject'))
   })
 })
 

@@ -1,6 +1,7 @@
 // OCV5-593 FE-2b 审阅批注 (d05 / m03): one shot's take on the stage with point / box annotations,
 // time ranges dragged on the filmstrip, version strip, QA report and history. Annotations are drafts
-// in this tab until the orchestrator's POST /annotations ships (A2-1); "交给 agent" stays disabled.
+// in this tab until "交给 agent" (FE-7b) sends them; then the server's annotation shows what the
+// agent understood, with 确认执行 / 不采用 / 再发一次.
 
 import {
   ArrowLeft,
@@ -22,18 +23,24 @@ import { useVideoFrames } from '../../../hooks/useVideoFrames'
 import {
   ANNOTATION_TEXT_MAX,
   type AnnotationDraft,
+  SENT_LABEL,
   annotationLabel,
   boxFromDrag,
+  draftToBody,
   loadDrafts,
   newDraftId,
   rangeFromDrag,
   saveDrafts,
+  sentDetail,
+  sentState,
 } from '../../../lib/studio/annotations'
+import { studioApi, studioErrorText } from '../../../lib/studio/api'
 import { formatCredits, formatTimecode } from '../../../lib/studio/format'
 import { qaScoreOf, shotCard, takesOf } from '../../../lib/studio/model'
 import { MODERATION_TEXT, qaView, recommendedTakes } from '../../../lib/studio/qa'
 import type { StudioProjectView, StudioTake } from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
+import { useToast } from '../../ui'
 import { MediaThumb, isVideoTake } from '../MediaThumb'
 
 type Tool = 'view' | 'point' | 'box'
@@ -60,6 +67,8 @@ export function ReviewPage(props: {
   view: StudioProjectView
   shotId?: string
   onBack: () => void
+  /** Refresh the project after sending / applying (useStudioProject.refresh). */
+  onReload?: () => void
 }) {
   const { auth, view } = props
   const shots = useMemo(() => [...view.shots].sort((a, b) => a.ordinal - b.ordinal), [view.shots])
@@ -77,7 +86,16 @@ export function ReviewPage(props: {
       </div>
     )
   }
-  return <ShotReview key={shot.id} auth={auth} view={view} shotId={shot.id} onBack={props.onBack} />
+  return (
+    <ShotReview
+      key={shot.id}
+      auth={auth}
+      view={view}
+      shotId={shot.id}
+      onBack={props.onBack}
+      {...(props.onReload ? { onReload: props.onReload } : {})}
+    />
+  )
 }
 
 function ShotReview(props: {
@@ -85,6 +103,7 @@ function ShotReview(props: {
   view: StudioProjectView
   shotId: string
   onBack: () => void
+  onReload?: () => void
 }) {
   const { auth, view } = props
   const shot = view.shots.find((s) => s.id === props.shotId)!
@@ -112,6 +131,58 @@ function ShotReview(props: {
     [view.project.id],
   )
   const mine = drafts.filter((d) => d.takeId === take?.id)
+  // FE-7b: what was handed to the agent on this version, newest first.
+  const sent = (view.annotations ?? []).filter((a) => a.takeId === take?.id)
+  const toast = useToast()
+  const [busy, setBusy] = useState(false)
+  /** Create each draft on the server and send it; a sent draft leaves this tab. */
+  const handOver = async (ids: string[]) => {
+    if (busy) return
+    const ready = drafts.filter((d) => ids.includes(d.id) && d.text.trim())
+    if (!ready.length) {
+      toast('先写一句话说明哪里要改', 'error')
+      return
+    }
+    setBusy(true)
+    const done: string[] = []
+    try {
+      for (const d of ready) {
+        const { id } = await studioApi.createAnnotation(auth, view.project.id, draftToBody(d))
+        await studioApi.annotationAction(auth, id, 'send')
+        done.push(d.id)
+      }
+      toast(ready.length > 1 ? `${ready.length} 条批注已交给 agent` : '批注已交给 agent', 'success')
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      if (done.length) {
+        persist(drafts.filter((d) => !done.includes(d.id)))
+        if (selected && done.includes(selected)) setSelected(null)
+      }
+      setBusy(false)
+      props.onReload?.()
+    }
+  }
+  const act = async (id: string, action: 'apply' | 'reject' | 'send') => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await studioApi.annotationAction(auth, id, action)
+      toast(
+        action === 'apply'
+          ? '开始按批注修改'
+          : action === 'reject'
+            ? '这条批注不采用了'
+            : '已重新交给 agent',
+        'success',
+      )
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setBusy(false)
+      props.onReload?.()
+    }
+  }
 
   // media + playback
   const url = useBlobUrl(auth, take?.blobSha)
@@ -404,6 +475,8 @@ function ShotReview(props: {
                   onText={(t) => update(selectedDraft.id, t)}
                   onDelete={() => remove(selectedDraft.id)}
                   onClose={() => setSelected(null)}
+                  onSend={() => void handOver([selectedDraft.id])}
+                  busy={busy}
                 />
               ) : null}
             </div>
@@ -552,28 +625,81 @@ function ShotReview(props: {
         </div>
         <div className="st-review-side-body">
           {tab === 'notes' ? (
-            mine.length === 0 ? (
+            mine.length === 0 && sent.length === 0 ? (
               <div className="st-cap">
                 用「点」或「框选」在画面上标出问题，或在时间轴上拖出一段，再写一句话说明哪里不对。
               </div>
             ) : (
-              mine.map((d, i) => (
-                <div key={d.id} className={`st-card st-note${selected === d.id ? ' sel' : ''}`}>
-                  <button
-                    type="button"
-                    className="st-row st-note-head"
-                    onClick={() => setSelected(d.id)}
-                  >
-                    <span className={`st-note-n ${d.kind === 'point' ? 'pin' : 'amber'}`}>
-                      {i + 1}
-                    </span>
-                    <b>{annotationLabel(d)}</b>
-                    <span style={{ flex: 1 }} />
-                    <span className="st-chip">草稿</span>
-                  </button>
-                  <div className="st-note-text">{d.text || '（还没写说明）'}</div>
-                </div>
-              ))
+              mine
+                .map((d, i) => (
+                  <div key={d.id} className={`st-card st-note${selected === d.id ? ' sel' : ''}`}>
+                    <button
+                      type="button"
+                      className="st-row st-note-head"
+                      onClick={() => setSelected(d.id)}
+                    >
+                      <span className={`st-note-n ${d.kind === 'point' ? 'pin' : 'amber'}`}>
+                        {i + 1}
+                      </span>
+                      <b>{annotationLabel(d)}</b>
+                      <span style={{ flex: 1 }} />
+                      <span className="st-chip">草稿</span>
+                    </button>
+                    <div className="st-note-text">{d.text || '（还没写说明）'}</div>
+                  </div>
+                ))
+                .concat(
+                  sent.map((a) => {
+                    const st = sentState(a)
+                    return (
+                      <div key={a.id} className="st-card st-note" data-testid="sent-note">
+                        <div className="st-row st-note-head">
+                          <b className="st-note-sent">{a.text}</b>
+                          <span style={{ flex: 1 }} />
+                          <span
+                            className={`st-chip ${st === 'applied' ? 'st-chip-ok' : st === 'failed' || st === 'not_understood' ? 'st-chip-warn' : ''}`}
+                          >
+                            {SENT_LABEL[st]}
+                          </span>
+                        </div>
+                        {sentDetail(a) ? (
+                          <div className="st-understood">{sentDetail(a)}</div>
+                        ) : null}
+                        {st === 'understood' || st === 'failed' ? (
+                          <div className="st-row" style={{ gap: 8, marginTop: 8 }}>
+                            <button
+                              type="button"
+                              className="st-btn st-btn-sm st-btn-primary"
+                              disabled={busy}
+                              onClick={() => void act(a.id, 'apply')}
+                            >
+                              {st === 'failed' ? '再试一次' : '确认执行'}
+                            </button>
+                            <button
+                              type="button"
+                              className="st-btn st-btn-sm"
+                              disabled={busy}
+                              onClick={() => void act(a.id, 'reject')}
+                            >
+                              不采用
+                            </button>
+                          </div>
+                        ) : st === 'not_understood' ? (
+                          <div className="st-row" style={{ gap: 8, marginTop: 8 }}>
+                            <button
+                              type="button"
+                              className="st-btn st-btn-sm"
+                              disabled={busy}
+                              onClick={() => void act(a.id, 'send')}
+                            >
+                              再发一次
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    )
+                  }),
+                )
             )
           ) : tab === 'qa' ? (
             <div className="st-card st-qa">
@@ -683,15 +809,15 @@ function ShotReview(props: {
             type="button"
             className="st-btn st-btn-primary"
             style={{ width: '100%' }}
-            disabled
-            title="导演 agent 上线后可用"
+            disabled={busy || !mine.some((d) => d.text.trim())}
+            onClick={() => void handOver(mine.map((d) => d.id))}
+            data-testid="hand-over"
           >
             <Send />
-            交给 agent（即将开放）
+            {busy ? '正在交给 agent…' : `交给 agent${mine.length ? `（${mine.length} 条）` : ''}`}
           </button>
           <div className="st-cap" style={{ textAlign: 'center', marginTop: 6 }}>
-            批注先保存在这个页面里；导演 agent 上线后会把它变成修改指令，先给出“agent
-            理解为”再执行。
+            agent 会先说明它打算怎么改；全自动项目里有把握的修改会直接执行，其余等你确认。
           </div>
         </div>
       </aside>
@@ -705,6 +831,8 @@ export function AnnotationBubble(props: {
   onText: (t: string) => void
   onDelete: () => void
   onClose: () => void
+  onSend?: () => void
+  busy?: boolean
 }) {
   const d = props.draft
   const ref = useRef<HTMLTextAreaElement>(null)
@@ -753,15 +881,14 @@ export function AnnotationBubble(props: {
         onChange={(e) => props.onText(e.target.value)}
       />
       <div className="st-understood">
-        <b>agent 理解为：</b>导演 agent
-        上线后，会在这里先说明它打算怎么改、大约多少积分，再等你确认。
+        交给 agent 后，它会先在批注栏说明打算怎么改，再按项目设置直接执行或等你确认。
       </div>
       <div className="st-row" style={{ marginTop: 10, gap: 8 }}>
         <button
           type="button"
           className="st-btn st-btn-sm st-btn-primary"
-          disabled
-          title="导演 agent 上线后可用"
+          disabled={!props.onSend || props.busy || !d.text.trim()}
+          onClick={props.onSend}
         >
           <Send />
           交给 agent

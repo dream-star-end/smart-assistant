@@ -3,6 +3,7 @@
 
 import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../api'
 import type { AuthSession } from '../types'
+import type { AnnotationBody } from './annotations'
 import type { MusicEdit, MusicQuery, MusicSearchResult } from './music'
 import type {
   ExportVariant,
@@ -193,6 +194,16 @@ export const studioApi = {
       `/projects/${encodeURIComponent(projectId)}/export`,
       { method: 'POST', body: JSON.stringify(variant) },
     ),
+  /** OCV5-593 FE-7b (OCV5-591 A2-1b-2): annotations — create a draft, send it, apply / reject. */
+  createAnnotation: (auth: AuthSession, projectId: string, body: AnnotationBody) =>
+    call<{ id: string }>(auth, `/projects/${encodeURIComponent(projectId)}/annotations`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  annotationAction: (auth: AuthSession, id: string, action: 'send' | 'apply' | 'reject') =>
+    call<{ ok: true }>(auth, `/annotations/${encodeURIComponent(id)}/${action}`, {
+      method: 'POST',
+    }),
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -233,6 +244,12 @@ export function studioErrorText(err: unknown): string {
         return '这首曲子已经不在曲库里了，换一首吧'
       case 'STUDIO_ORCHESTRATOR_OFF':
         return '导演 agent 暂时没有运行'
+      case 'ANNOTATION_BUSY':
+        return '这条批注正在执行或已经处理过了'
+      case 'ANNOTATION_LIMIT':
+        return '这个项目的批注太多了'
+      case 'ANNOTATION_NOT_DRAFT':
+        return '这条批注已经交给 agent 了'
       case 'STUDIO_COMPOSE_OFF':
         return '合成沙箱暂时没有运行'
       case 'STUDIO_NOT_DONE':

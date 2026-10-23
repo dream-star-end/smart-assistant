@@ -1,6 +1,9 @@
 // OCV5-593 FE-2b: annotation drafts on a take (point / box / time range). Coordinates are
-// normalised to the media box (0–1) so they survive any display size. Until the orchestrator's
-// POST /annotations ships (A2-1) drafts live only in this tab (sessionStorage, per project).
+// normalised to the media box (0–1) so they survive any display size. Drafts live in this tab
+// (sessionStorage, per project) until they are handed to the agent (FE-7b: POST /annotations +
+// send), after which the server's annotation is the record.
+
+import type { StudioAnnotation } from './types'
 
 export type AnnotationKind = 'point' | 'box' | 'range'
 
@@ -99,4 +102,73 @@ let seq = 0
 export function newDraftId(now = Date.now()): string {
   seq = (seq + 1) % 1_000_000
   return `d${now.toString(36)}${seq.toString(36)}`
+}
+
+/** The body POST /projects/:id/annotations takes for a draft (OCV5-591 A2-1b-2). */
+export interface AnnotationBody {
+  takeId: string
+  kind: 'point' | 'box' | 'range' | 'text'
+  tStartMs?: number
+  tEndMs?: number
+  geom?: { x: number; y: number; w?: number; h?: number }
+  text: string
+}
+
+export function draftToBody(d: AnnotationDraft): AnnotationBody {
+  const ms = (sec: number) => Math.max(0, Math.round(sec * 1000))
+  return {
+    takeId: d.takeId,
+    kind: d.kind,
+    tStartMs: ms(d.tStart),
+    ...(d.tEnd !== undefined ? { tEndMs: ms(d.tEnd) } : {}),
+    ...(d.kind === 'point' ? { geom: { x: d.x ?? 0, y: d.y ?? 0 } } : {}),
+    ...(d.kind === 'box' ? { geom: { x: d.x ?? 0, y: d.y ?? 0, w: d.w ?? 0, h: d.h ?? 0 } } : {}),
+    text: d.text.trim(),
+  }
+}
+
+export type SentState =
+  | 'interpreting'
+  | 'understood'
+  | 'running'
+  | 'applied'
+  | 'rejected'
+  | 'not_understood'
+  | 'failed'
+
+export const SENT_LABEL: Record<SentState, string> = {
+  interpreting: 'agent 理解中',
+  understood: '等你确认',
+  running: '执行中',
+  applied: '已执行',
+  rejected: '未采用',
+  not_understood: '没看懂',
+  failed: '没执行成功',
+}
+
+export function sentState(a: StudioAnnotation): SentState {
+  if (a.status === 'applied') return 'applied'
+  if (a.status === 'rejected') return 'rejected'
+  const i = a.interpretation
+  if (!i) return 'interpreting'
+  if (i.op === null) return 'not_understood'
+  if (i.state === 'running') return 'running'
+  if (i.state === 'failed') return 'failed'
+  return 'understood'
+}
+
+const FAIL_TEXT: Record<string, string> = {
+  budget: '预算不够执行这条批注，调高预算后可以再试。',
+  no_provider: '现在没有可用的服务执行这条批注，稍后可以再试。',
+  target_gone: '批注指向的内容已经不在了。',
+  needs_user: '按批注重做的版本需要你看一下。',
+}
+
+/** One line under the note: what the agent understood / why it did not run. */
+export function sentDetail(a: StudioAnnotation): string {
+  const i = a.interpretation
+  const s = sentState(a)
+  if (s === 'failed') return FAIL_TEXT[i?.error ?? ''] ?? '没执行成功，可以再试一次。'
+  if (!i?.explanation) return ''
+  return s === 'not_understood' ? i.explanation : `agent 理解为：${i.explanation}`
 }
