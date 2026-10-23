@@ -258,9 +258,13 @@ export function FinalPage(props: {
                 下载 mp4
               </button>
             )}
-            <div className="st-cap" style={{ marginTop: 6 }}>
+            {/* User 2026-10-23 22:13: re-composing for another export format is free. */}
+            <div className="st-cap" style={{ marginTop: 6 }} data-testid="export-free-note">
+              切换规格（分辨率、竖屏、字幕方式）会重新合成一次，免费，不收任何费用。
+            </div>
+            <div className="st-cap" style={{ marginTop: 4 }} data-testid="export-format-note">
               {res !== '1080p' || subs !== 'burn'
-                ? '其他规格会在导演 agent 上线后按需重新合成；现在下载的是已合成的版本。'
+                ? '换成这个规格需要重新合成一次（免费）；重新合成在导演 agent 上线后开放，现在下载的是已合成的版本。'
                 : '下载已合成的版本。'}
             </div>
           </div>

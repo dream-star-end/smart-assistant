@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 vi.mock('../../lib/studio/api', () => ({
@@ -203,6 +203,30 @@ describe('compose has no fixed fee (user 2026-10-23 21:42)', () => {
     const text = document.body.textContent ?? ''
     expect(text).not.toMatch(/合成[^。]{0,12}\d+\s*积分/)
     expect(text).not.toContain('10 积分')
+  })
+})
+
+describe('export re-compose is free (user 2026-10-23 22:13)', () => {
+  test('the export says switching format re-composes for free, and never shows a price', () => {
+    const takes = [
+      take({
+        id: 'fin',
+        ownerKind: 'final',
+        ownerId: 'p',
+        provider: 'compose',
+        costCredits: '0',
+        blobSha: 'f'.repeat(64),
+      }),
+    ]
+    render(<FinalPage auth={auth} view={view({ takes })} onOpenBoard={() => {}} />)
+    expect(screen.getByTestId('export-free-note')).toHaveTextContent(
+      '切换规格（分辨率、竖屏、字幕方式）会重新合成一次，免费，不收任何费用。',
+    )
+    for (const label of ['竖屏 9:16', '.srt', '720p', '无字幕']) {
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      expect(screen.getByTestId('export-format-note')).toHaveTextContent('免费')
+      expect(screen.getByTestId('export-format-note').textContent).not.toMatch(/\d+\s*积分/)
+    }
   })
 })
 
