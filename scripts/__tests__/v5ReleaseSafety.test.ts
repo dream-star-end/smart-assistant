@@ -7356,6 +7356,27 @@ describe('v5 host monitor independent atomic installer', () => {
 })
 
 describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
+  test('every deploy/v5 OnFailure= names a template shipped in deploy/v5', async () => {
+    const dir = path.join(root, 'deploy/v5')
+    let checked = 0
+    for (const name of await readdir(dir)) {
+      if (!/\.(service|timer|socket|path|target)$/.test(name)) continue
+      const source = await readFile(path.join(dir, name), 'utf8')
+      for (const match of source.matchAll(/^OnFailure=(.+)$/gm)) {
+        for (const target of match[1].trim().split(/\s+/)) {
+          const template = target.includes('@')
+            ? `${target.split('@')[0]}@.service`
+            : target.endsWith('.service')
+              ? target
+              : `${target}.service`
+          assert.ok(existsSync(path.join(dir, template)), `${name}: ${target} needs ${template}`)
+          checked++
+        }
+      }
+    }
+    assert.ok(checked > 0, 'deploy/v5 failure targets must be checked')
+  })
+
   // 三个探针根治的是"静默失败"这一整类。背景:异地容灾 v5-dr-sync/v5-dr-volumes 连败
   // 43 小时无人知晓,根因是这两个单元的 OnFailure= 是空的。逐个单元补 OnFailure 只能救
   // 已知的那几个,新单元照样漏 —— 所以改成"本机存在任何 failed 单元"就报。
