@@ -216,8 +216,9 @@ export interface SkippedStep { where: string; why: string; run: string }
 const isMap = (v: unknown): v is Yaml => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** Why the workflow does not run on every pull request into PR_BASE, or null when it does.
- * Filters (paths, paths-ignore, branches-ignore, types, branch globs) may skip a PR, so any filter
- * other than `branches` listing PR_BASE literally counts as "may not run". */
+ * Filters (paths, paths-ignore, branches-ignore, types, negated branch patterns) may skip a PR, so
+ * any filter other than `branches` listing PR_BASE literally, with no `!` pattern, counts as "may
+ * not run". */
 function prTriggerGap(on: unknown): string | null {
   if (on === "pull_request" || (Array.isArray(on) && on.includes("pull_request"))) return null;
   if (!isMap(on) || !("pull_request" in on)) return "on: has no pull_request trigger";
@@ -227,8 +228,10 @@ function prTriggerGap(on: unknown): string | null {
   const extra = Object.keys(pr).filter((k) => k !== "branches");
   if (extra.length) return `on.pull_request filters by ${extra.join(", ")}`;
   if (!("branches" in pr)) return null;
-  const b = pr.branches;
-  return b === PR_BASE || (Array.isArray(b) && b.includes(PR_BASE)) ? null : `on.pull_request.branches does not list ${PR_BASE}`;
+  const b = Array.isArray(pr.branches) ? pr.branches : [pr.branches];
+  // a later `!pattern` can exclude the base again (patterns apply in order; Codex item8 r1)
+  if (b.some((x) => typeof x !== "string" || x.startsWith("!"))) return "on.pull_request.branches has a negated pattern";
+  return b.includes(PR_BASE) ? null : `on.pull_request.branches does not list ${PR_BASE}`;
 }
 
 /** Why a job or step may not run, or may fail without failing CI; null when it always runs and

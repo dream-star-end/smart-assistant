@@ -292,6 +292,9 @@ test("red: a CI step that a PR may skip, or whose failure CI ignores, is not a r
     ["pull_request paths filter", onWith("on:\n  pull_request:\n    branches: [feat/v5-selfhost]\n    paths: [docs/**]\n")],
     ["pull_request paths-ignore", onWith("on:\n  pull_request:\n    paths-ignore: ['scripts/**']\n")],
     ["pull_request types filter", onWith("on:\n  pull_request:\n    types: [closed]\n")],
+    // Codex item8 r1: patterns apply in order, a later negation excludes the base again
+    ["pull_request branches negated later", onWith("on:\n  pull_request:\n    branches: [feat/v5-selfhost, '!feat/v5-selfhost']\n")],
+    ["pull_request branches negated by glob", onWith("on:\n  pull_request:\n    branches: [feat/v5-selfhost, '!feat/**']\n")],
     ["if: false through a YAML merge key", (y) => y.replace(job, `${job}    <<: {if: false}\n`)],
   ];
   const counted: string[] = [];
