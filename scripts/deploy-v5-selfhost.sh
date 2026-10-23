@@ -427,7 +427,7 @@ selfhost_backup_lock_holder() {
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info holder_line starttime backup_waited backup_info
+  local lock wait_s interval waited info holder_line starttime backup_waited backup_info backup_wait
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     release_policy_mutation_barrier || exit "$?"
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
@@ -439,6 +439,10 @@ acquire_selfhost_deploy_lock() {
   interval="$SELFHOST_DEPLOY_LOCK_POLL"
   [[ "$wait_s" =~ ^[0-9]+$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_POLL 必须是正整数秒(当前=$interval)"
+  # 非法值会让下面的算术比较恒假,备份持锁时就永远等下去(Codex r1)。
+  backup_wait="${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
+  [[ "$backup_wait" =~ ^[0-9]+$ ]] \
+    || die "OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒(当前=$backup_wait)"
   if (( interval > wait_s && wait_s > 0 )); then
     interval="$wait_s"
   fi
@@ -455,13 +459,13 @@ acquire_selfhost_deploy_lock() {
     while ! flock -n 8; do
       # 备份占锁:排队等它结束,不计入 wait_s,也不当成超时失败(OCV5-600)。
       if backup_info="$(selfhost_backup_lock_holder "$lock")"; then
-        if (( backup_waited >= SELFHOST_DEPLOY_LOCK_BACKUP_WAIT )); then
-          echo "✗ 个人版 PG 备份占锁中,已排队 ${backup_waited}s 仍未结束(上限 ${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT}s)。锁=$lock 备份=$backup_info
+        if (( backup_waited >= backup_wait )); then
+          echo "✗ 个人版 PG 备份占锁中,已排队 ${backup_waited}s 仍未结束(上限 ${backup_wait}s)。锁=$lock 备份=$backup_info
 补救: systemctl status openclaude-v5-selfhost-pg-backup-full.service / openclaude-v5-selfhost-pg-backup.service;备份结束后重发。" >&2
           exit 1
         fi
         if (( backup_waited % 300 == 0 )); then
-          log "⏳ 个人版 PG 备份占锁中($backup_info),列车排队等它结束: 已等 ${backup_waited}s / ${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT}s(不计入 ${wait_s}s 超时)"
+          log "⏳ 个人版 PG 备份占锁中($backup_info),列车排队等它结束: 已等 ${backup_waited}s / ${backup_wait}s(不计入 ${wait_s}s 超时)"
         fi
         sleep "$interval"
         backup_waited=$((backup_waited + interval))

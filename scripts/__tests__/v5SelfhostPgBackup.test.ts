@@ -875,7 +875,7 @@ describe('deploy-v5-selfhost.sh lock wait with a backup holding the lock', () =>
   function acquire(opts: {
     marker: 'backup' | 'none' | 'stale'
     hold: number
-    backupWait: number
+    backupWait: number | string
   }) {
     const lib = path.join(dir, 'acquire.sh')
     writeFileSync(
@@ -938,6 +938,13 @@ describe('deploy-v5-selfhost.sh lock wait with a backup holding the lock', () =>
     const r = acquire({ marker: 'backup', hold: 8, backupWait: 2 })
     assert.equal(r.status, 1, r.out)
     assert.match(r.out, /个人版 PG 备份占锁中,已排队 \d+s 仍未结束/)
+  })
+
+  test('a malformed backup wait is refused up front instead of waiting forever (Codex r1)', () => {
+    const r = acquire({ marker: 'backup', hold: 8, backupWait: '4h' })
+    assert.equal(r.status, 1, r.out)
+    assert.match(r.out, /DIE OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒/)
+    assert.doesNotMatch(r.out, /ACQUIRED/)
   })
 
   test('any other holder keeps the plain timeout', () => {
