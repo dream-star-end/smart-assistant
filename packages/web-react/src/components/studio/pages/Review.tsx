@@ -178,6 +178,9 @@ function ShotReview(props: {
   }
   const onDown = (e: PointerEvent<HTMLDivElement>) => {
     if (tool === 'view' || !take || compare) return
+    // Stop the browser's native image drag / text selection from taking over the pointer stream
+    // (code r1 P1); pointercancel below clears a drag the browser still interrupts.
+    e.preventDefault()
     const p = rel(e)
     if (tool === 'point') {
       add({ kind: 'point', x: p.x, y: p.y, tStart: video ? time : 0 })
@@ -305,6 +308,8 @@ function ShotReview(props: {
               onPointerDown={onDown}
               onPointerMove={onMove}
               onPointerUp={onUp}
+              onPointerCancel={() => setDrag(null)}
+              onDragStart={(e) => e.preventDefault()}
               data-testid="review-media"
             >
               {url && video ? (
@@ -315,6 +320,15 @@ function ShotReview(props: {
                   playsInline
                   preload="auto"
                   onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+                  // A remounted video (after compare, or another version) starts at 0: put it back at
+                  // the time the UI shows, so new annotations land on the frame that is on screen
+                  // (code r1 P1).
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget
+                    const t = Math.min(time, Number.isFinite(v.duration) ? v.duration : time)
+                    v.currentTime = t
+                    setTime(t)
+                  }}
                   onPlay={() => setPlaying(true)}
                   onPause={() => setPlaying(false)}
                 >
@@ -325,6 +339,7 @@ function ShotReview(props: {
                 <img
                   className="st-media-fill"
                   src={url}
+                  draggable={false}
                   alt={`镜头 #${shot.ordinal + 1} v${take?.version ?? ''}`}
                 />
               ) : (
@@ -397,7 +412,9 @@ function ShotReview(props: {
               ref={stripRef}
               className="st-filmstrip"
               aria-label="时间轴：拖动选出一段时间即可批注"
+              onPointerCancel={() => setRange(null)}
               onPointerDown={(e) => {
+                e.preventDefault()
                 e.currentTarget.setPointerCapture(e.pointerId)
                 const t = stripTime(e)
                 setRange({ a: t, b: t })

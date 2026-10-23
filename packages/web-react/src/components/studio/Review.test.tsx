@@ -127,3 +127,24 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByRole('tab', { name: '批注 0' })).toBeInTheDocument()
   })
 })
+
+describe('ReviewPage pointer robustness (OCV5-593 FE-2b code r1)', () => {
+  test('box mode prevents the native drag and a cancelled pointer leaves no half box', async () => {
+    render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: '框选' }))
+    const el = box()
+    el.setPointerCapture = () => {}
+    const down = fireEvent.pointerDown(el, {
+      clientX: 100,
+      clientY: 100,
+      pointerId: 1,
+      cancelable: true,
+    })
+    expect(down).toBe(false) // default prevented
+    fireEvent.pointerMove(el, { clientX: 400, clientY: 300, pointerId: 1 })
+    fireEvent.pointerCancel(el, { pointerId: 1 })
+    fireEvent.pointerUp(el, { pointerId: 1 })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(sessionStorage.getItem('oc.studio.annotationDrafts.p')).toBeNull()
+  })
+})
