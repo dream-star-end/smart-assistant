@@ -65,6 +65,7 @@ import {
 import { assertTaskboardStagesRunnable, TaskboardPreflightError } from './stagePreflight.js'
 import { hasPendingTaskboardExecution } from './executionState.js'
 import { listBuiltinPipelineTemplates, seedDefaultPipelines } from './db/seed.js'
+import { listTicketTimelinePage } from './db/timeline.js'
 import {
   type TaskboardSettings,
   type TaskboardUsage,
@@ -1547,6 +1548,15 @@ function handleAddRelation(
 
 async function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ticket: Ticket, ctx: TaskboardHttpContext): Promise<void> {
   const limit = parseLimit(url, 100, 500)
+  if (url.searchParams.get('window') === 'latest') {
+    const page = listTicketTimelinePage(db, ticket.id, { limit, before: url.searchParams.get('before'), ifHead: url.searchParams.get('ifHead') })
+    const runs = page.items.flatMap((item) => item.kind === 'run' ? [item.run] : [])
+    const enriched: typeof runs = []
+    for (let index = 0; index < runs.length; index += 200) enriched.push(...await enrichTaskboardRuns(ctx, runs.slice(index, index + 200)))
+    const byId = new Map(enriched.map((run) => [run.id, run]))
+    sendJson(res, 200, { ...page, items: page.items.map((item) => item.kind === 'run' ? { ...item, run: byId.get(item.run.id) ?? item.run } : item) })
+    return
+  }
   const comments = listComments(db, ticket.id, { limit: 500, offset: 0 })
   const activities = listActivities(db, ticket.id, { limit: 500, offset: 0 })
   const runs = listRuns(db, { ticketId: ticket.id, limit: 200, offset: 0 }).items

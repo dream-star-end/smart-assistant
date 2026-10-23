@@ -777,3 +777,17 @@ describe("internalPlatformPromptSlots — INTELLIGENT_UI", () => {
     assert.equal(called, false);
   });
 });
+
+
+test("taskboard surface keeps container identity as the only preference uid authority", async () => {
+  const id = makeIdentity(765, 765);
+  const repo = memRepo([{ id: id.containerId, user_id: id.userId, host_uuid: HOST, bound_ip: IP, secret_hash: id.secretHash }]);
+  const seen: unknown[] = [];
+  const handler = makePlatformPromptSlotsHandler({ identityRepo: repo, pricingCache: makePricing([]), readLiteratureSkillConfig: async () => litDisabled,
+    resolveIntelligentUi: async (uid, options) => { seen.push([uid, options]); return { name: "INTELLIGENT_UI", content: "COMPONENTS_ONLY" }; } });
+  const res = makeRes();
+  await handler(makeReq({ authorization: `Bearer oc-v3.${id.containerId}.${id.secretHex}`, url: `${PLATFORM_PROMPT_SLOTS_PATH}?surface=taskboard&uid=999` }), res, { hostUuid: HOST, boundIp: IP });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(seen, [[765, { surface: "taskboard" }]]);
+  assert.deepEqual(parseBody(res.body).slots, [{ name: "INTELLIGENT_UI", content: "COMPONENTS_ONLY" }]);
+});

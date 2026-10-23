@@ -25,6 +25,7 @@ const {
   fetchPlatformSlotsFromMaster,
   fetchPlatformSlotsFromMasterDetailed,
   isWebchatSessionKey,
+  isWebRenderedIuiSessionKey,
   INTELLIGENT_UI_SLOT,
   intelligentUiFingerprint,
 } = await import('../promptSlots.js')
@@ -39,13 +40,17 @@ let server: Server
 let baseUrl = ''
 let mock: { status: number; body: string } = { status: 200, body: '{"slots":[]}' }
 let hits = 0
+let requestedUrls: string[] = []
+let surfaceBodies: { webchat: string; taskboard: string } | null = null
 
 before(async () => {
-  server = createServer((_req, res) => {
+  server = createServer((req, res) => {
+    requestedUrls.push(req.url ?? '/')
     hits += 1
     res.statusCode = mock.status
     res.setHeader('content-type', 'application/json')
-    res.end(mock.body)
+    const content = surfaceBodies ? (new URL(req.url ?? '/', 'http://fixture').searchParams.get('surface') === 'taskboard' ? surfaceBodies.taskboard : surfaceBodies.webchat) : null
+    res.end(content === null ? mock.body : JSON.stringify({ slots: [{ name: INTELLIGENT_UI_SLOT, content }] }))
   })
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -58,6 +63,8 @@ beforeEach(() => {
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = TOKEN
   __resetIntelligentUiDesiredCacheForTests()
   hits = 0
+  requestedUrls = []
+  surfaceBodies = null
 })
 afterEach(() => {
   delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
@@ -182,5 +189,37 @@ describe('intelligentUiNeedsRestart', () => {
     assert.equal(intelligentUiFingerprint(IUI_BODY), ON)
     assert.equal(intelligentUiFingerprint(undefined), false)
     assert.match(ON, /^[0-9a-f]{64}$/)
+  })
+})
+
+
+const TASK = 'agent:main:taskboard:ticket:stage:run'
+describe('taskboard IUI surface', () => {
+  it('allows only canonical taskboard roots without changing webchat routing classification', () => {
+    assert.equal(isWebRenderedIuiSessionKey(TASK), true)
+    assert.equal(isWebchatSessionKey(TASK), false)
+    assert.equal(isWebRenderedIuiSessionKey(WEB), true)
+    for (const key of ['agent:main:delegate:main:1:n', 'agent:main:wechat:dm:x', 'agent:main:cron:dm:x', 'agent:main:taskboard:missing', undefined]) assert.equal(isWebRenderedIuiSessionKey(key), false)
+  })
+  it('injects the existing component slot and sends surface only for taskboard', async () => {
+    mock = { status: 200, body: withIui() }
+    const task = await buildPromptContext({ agentId: 'iui-task', sessionKey: TASK })
+    assert.equal(task.intelligentUi, intelligentUiFingerprint(IUI_BODY))
+    assert.ok(task.applied.some((slot) => slot.name === INTELLIGENT_UI_SLOT))
+    assert.equal(new URL(requestedUrls[0]!, 'http://fixture').searchParams.get('surface'), 'taskboard')
+    await fetchPlatformSlotsFromMasterDetailed({ agentId: 'main', sessionKey: WEB })
+    assert.equal(new URL(requestedUrls.at(-1)!, 'http://fixture').searchParams.has('surface'), false)
+  })
+  it('caches webchat and taskboard fingerprints independently in either order', async () => {
+    for (const order of [[WEB, TASK], [TASK, WEB]]) {
+      __resetIntelligentUiDesiredCacheForTests()
+      hits = 0
+      surfaceBodies = { taskboard: 'COMPONENTS_ONLY', webchat: 'COMPONENTS_AND_PREDICTION' }
+      for (const key of [...order, ...order]) {
+        const value = await getDesiredIntelligentUi(key, { now: () => 1000 })
+        assert.equal(value, intelligentUiFingerprint(key === TASK ? 'COMPONENTS_ONLY' : 'COMPONENTS_AND_PREDICTION'))
+      }
+      assert.equal(hits, 2)
+    }
   })
 })
