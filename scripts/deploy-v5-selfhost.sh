@@ -437,11 +437,12 @@ acquire_selfhost_deploy_lock() {
   lock="$SELFHOST_DEPLOY_LOCK"
   wait_s="$SELFHOST_DEPLOY_LOCK_WAIT"
   interval="$SELFHOST_DEPLOY_LOCK_POLL"
-  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
+  # 十进制、无前导零:bash 算术把 08 当八进制并报错,比较恒假就会永远等(Codex r2)。
+  [[ "$wait_s" =~ ^(0|[1-9][0-9]*)$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_POLL 必须是正整数秒(当前=$interval)"
   # 非法值会让下面的算术比较恒假,备份持锁时就永远等下去(Codex r1)。
   backup_wait="${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
-  [[ "$backup_wait" =~ ^[0-9]+$ ]] \
+  [[ "$backup_wait" =~ ^(0|[1-9][0-9]*)$ ]] \
     || die "OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒(当前=$backup_wait)"
   if (( interval > wait_s && wait_s > 0 )); then
     interval="$wait_s"

@@ -535,7 +535,8 @@ esac
 
 [[ -z "$OFFSITE" || -z "$FULL_SINK" ]] || die_usage "set V5SB_OFFSITE or V5SB_FULL_SINK, not both"
 for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC LOCK_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
-  [[ "${!knob}" =~ ^[0-9]+$ ]] || die_usage "$knob must be a non-negative integer"
+  # decimal without leading zeros: bash arithmetic reads 08 as octal and fails
+  [[ "${!knob}" =~ ^(0|[1-9][0-9]*)$ ]] || die_usage "$knob must be a non-negative integer"
 done
 (( KEEP >= 1 )) || die_usage "V5SB_KEEP must be >= 1"
 (( ABORT_FREE_GIB <= MIN_FREE_GIB )) || die_usage "V5SB_ABORT_FREE_GIB must be <= V5SB_MIN_FREE_GIB"

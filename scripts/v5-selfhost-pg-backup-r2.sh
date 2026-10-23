@@ -348,7 +348,8 @@ cmd_core() {
 cmd="${1:-}"
 shift || true
 for knob in CAP_BYTES WARN_BYTES CORE_KEEP FULL_EST_BYTES; do
-  [[ "${!knob}" =~ ^[0-9]+$ ]] || die_usage "$knob must be a non-negative integer"
+  # decimal without leading zeros: bash arithmetic reads 09 as octal and fails
+  [[ "${!knob}" =~ ^(0|[1-9][0-9]*)$ ]] || die_usage "$knob must be a non-negative integer"
 done
 (( CORE_KEEP >= 1 )) || die_usage "V5SB_R2_CORE_KEEP must be >= 1"
 (( WARN_BYTES <= CAP_BYTES )) || die_usage "V5SB_R2_WARN_BYTES must be <= V5SB_R2_CAP_BYTES"

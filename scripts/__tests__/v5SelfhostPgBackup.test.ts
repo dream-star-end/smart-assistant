@@ -732,6 +732,7 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       assert.equal(runR2(['full', '../x'], {}, 'a').status, 2)
       assert.equal(runR2(['core', path.join(dir, 'rclone.conf')]).status, 2)
       assert.equal(runR2(['precheck'], { V5SB_R2_WARN_BYTES: '20000' }).status, 2)
+      assert.equal(runR2(['precheck'], { V5SB_R2_CAP_BYTES: '09500' }).status, 2)
       assert.equal(runR2(['nope']).status, 2)
     })
   })
@@ -941,10 +942,13 @@ describe('deploy-v5-selfhost.sh lock wait with a backup holding the lock', () =>
   })
 
   test('a malformed backup wait is refused up front instead of waiting forever (Codex r1)', () => {
-    const r = acquire({ marker: 'backup', hold: 8, backupWait: '4h' })
-    assert.equal(r.status, 1, r.out)
-    assert.match(r.out, /DIE OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒/)
-    assert.doesNotMatch(r.out, /ACQUIRED/)
+    // '08' passes a plain digit check but is invalid octal in bash arithmetic (Codex r2)
+    for (const bad of ['4h', '08']) {
+      const r = acquire({ marker: 'backup', hold: 8, backupWait: bad })
+      assert.equal(r.status, 1, `${bad}: ${r.out}`)
+      assert.match(r.out, /DIE OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒/)
+      assert.doesNotMatch(r.out, /ACQUIRED/)
+    }
   })
 
   test('any other holder keeps the plain timeout', () => {
