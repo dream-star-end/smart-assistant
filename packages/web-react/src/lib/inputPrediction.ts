@@ -2,7 +2,7 @@
  * 输入预测(OCV5-375,个人版):输入框里用浅色字显示「用户接下来最可能输入的话」,Tab / → 采用。
  *
  * 预测由助手自己给:每条回答的最后写一个 ```ui {"type":"next","text":"…"} 块(提示词在 master
- * `intelligentUi/index.ts` 的 INPUT_PREDICTION_PROMPT)。这个块在聊天、复制、导出里都不出现
+ * 按需 `system-assistant/references/input-prediction.md`)。这个块在聊天、复制、导出里都不出现
  * (IuiBlock / toMarkdown 见 isNextBlockCode),只在这里被读出来交给输入框。
  * 没写 next 块的回答退回到它的「接着问」(suggestions)第一条。
  * 输入中补全:当前正文是某个候选的开头 → 显示候选剩下的部分。候选 = 上面几条 + 本会话里

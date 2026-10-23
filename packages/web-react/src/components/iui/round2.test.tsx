@@ -168,9 +168,9 @@ describe("schema · new components", () => {
     expect(specToMarkdown(s)).toContain("曲线(年数 从 0 到 20)");
   });
 
-  it("the example in the master prompt passes this validator unchanged", () => {
-    const src = readFileSync(resolve(__dirname, "../../../../commercial/src/intelligentUi/index.ts"), "utf8");
-    const line = /'(\{"type":"tabs".*\})',\n\s*F,/.exec(src)?.[1];
+  it("the example in the on-demand UI guide passes this validator unchanged", () => {
+    const src = readFileSync(resolve(__dirname, "../../../../commercial/agent-sandbox/platform-runtime/prompts/system-assistant/references/ui.md"), "utf8");
+    const line = /```ui\n(\{"type":"tabs".*\})\n```/.exec(src)?.[1];
     expect(line).toBeTruthy();
     const v = validateSpec(JSON.parse(line!) as Record<string, unknown>, false);
     expect(v.ok && v.notes).toEqual([]);
