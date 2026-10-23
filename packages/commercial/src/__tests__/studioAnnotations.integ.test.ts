@@ -1,12 +1,14 @@
 /**
  * OCV5-591 A2-1b-2 integ: annotations end to end on the real schema — API → interpret task (fake
  * Grok, fake sandbox for the marked frame) → one-time execution → settle.
- *   - a sure instruction on an autonomous, finished project runs at once and reopens it
- *   - otherwise it waits; two applies dispatch once; reject is refused while it runs
- *   - a voice swap dispatches every line under its own key (plan r2 P1)
- *   - an instruction outside the whitelist never runs; the annotation can be sent again
- *   - a running execution is applied when its target is ready on a new version
- *   - a budget that cannot cover it leaves nothing behind and records the failure
+ *   - a sure instruction on an autonomous, finished project runs at once and reopens it; the change
+ *     lives on the shot and the director dispatches it (an edit as image.edit of the current frame)
+ *   - otherwise it waits; two applies start once; reject is refused while it runs; one execution
+ *     per target
+ *   - a voice swap re-voices every line; an instruction outside the whitelist never runs
+ *   - a running execution is applied when its target is ready on a new version, and ends when the
+ *     project is handed to the user; a budget pause keeps it waiting
+ *   - an export asked for before the rework waits; apply on a canceled project is refused
  *   - another user's annotation is 404
  */
 import assert from 'node:assert/strict'
@@ -286,11 +288,15 @@ const annotation = async (id: string) =>
   ).rows[0]!
 const genTasks = async (projectId: string) =>
   (
-    await query<{ key: string }>(
-      `SELECT idempotency_key AS key FROM studio_tasks WHERE project_id = $1 AND kind = 'gen' ORDER BY idempotency_key`,
+    await query<{
+      key: string
+      request: { op: string; prompt?: string; inputs?: Array<{ role: string; blobSha: string }> }
+    }>(
+      `SELECT idempotency_key AS key, payload->'request' AS request FROM studio_tasks
+        WHERE project_id = $1 AND kind = 'gen' ORDER BY idempotency_key`,
       [projectId],
     )
-  ).rows.map((r) => r.key)
+  ).rows
 const projectRow = async (id: string) =>
   (
     await query<{ status: string; reserved: string }>(
@@ -302,7 +308,7 @@ const sure = (op: string, args: unknown, confidence = 0.92) =>
   JSON.stringify({ op, args, confidence, explanation: '按批注重画这个镜头' })
 
 describe('studio annotations (OCV5-591 A2-1b-2)', () => {
-  test('a sure instruction on an autonomous finished film runs at once and reopens it', async (t) => {
+  test('a sure instruction on an autonomous finished film runs at once: reopened, the change kept on the shot', async (t) => {
     if (skip(t)) return
     const s = await setup()
     const { id } = await s.api.create(s.uid, s.p.id, {
@@ -323,17 +329,56 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.equal(a.interpretation?.execution?.state, 'running')
     assert.ok(a.frame, 'the marked frame is kept with the annotation')
     assert.equal((await projectRow(s.p.id)).status, 'running')
-    assert.deepEqual(await genTasks(s.p.id), [`annot:${id}:1:shot_frame:${s.shot}:frame`])
     const shot = (
       await query<{ status: string; active: string | null; redo: unknown }>(
         `SELECT status, active_take_id::text AS active, spec->'redo' AS redo FROM studio_shots WHERE id = $1`,
         [s.shot],
       )
     ).rows[0]!
-    assert.deepEqual(shot, { status: 'generating', active: null, redo: { frame: 2, video: 2 } })
+    assert.deepEqual(shot, {
+      status: 'generating',
+      active: null,
+      redo: { frame: 2, video: 2, delta: '尾巴白色' },
+    })
+    // The director dispatches the new first frame, with the change in its prompt (kept on retries).
+    await advanceProject(s.advanceDeps, s.p.id)
+    const gens = await genTasks(s.p.id)
+    assert.deepEqual(
+      gens.map((g) => g.key),
+      [`gen:shot_frame:${s.shot}:v2`],
+    )
+    assert.ok(gens[0]!.request.prompt?.includes('修改要求：尾巴白色'))
   })
 
-  test('otherwise it waits; two applies dispatch once; reject is refused while it runs', async (t) => {
+  test('an edit is dispatched as image.edit of the current frame with the marked frame as reference', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'box',
+      geom: { x: 0.5, y: 0.5, w: 0.2, h: 0.2 },
+      text: '这里加一棵树',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(
+      sure('edit_frame', {
+        shotId: s.shot,
+        region: { x: 0.5, y: 0.5, w: 0.2, h: 0.2 },
+        instruction: '加一棵雪松',
+      }),
+    )
+    await runOne(s.exec)
+    await advanceProject(s.advanceDeps, s.p.id)
+    const [g] = await genTasks(s.p.id)
+    const marked = (await annotation(id)).frame
+    assert.equal(g?.request.op, 'image.edit')
+    assert.deepEqual(g?.request.inputs, [
+      { role: 'source', blobSha: s.frame.sha },
+      { role: 'reference', blobSha: marked },
+    ])
+  })
+
+  test('otherwise it waits; two applies start once; reject is refused while it runs', async (t) => {
     if (skip(t)) return
     const s = await setup({ autonomy: 'confirm', status: 'awaiting_user' })
     const { id } = await s.api.create(s.uid, s.p.id, {
@@ -356,10 +401,38 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
       )
     ).rows[0]!
     assert.equal(spec.d, 7)
+    await advanceProject(s.advanceDeps, s.p.id)
+    assert.deepEqual(
+      (await genTasks(s.p.id)).map((g) => g.key),
+      [`gen:shot_video:${s.shot}:v2`],
+      'one new video',
+    )
     await assert.rejects(s.api.reject(s.uid, id), { code: 'ANNOTATION_BUSY' })
   })
 
-  test('a voice swap dispatches every line under its own key (plan r2 P1)', async (t) => {
+  test('a second annotation on a target being changed fails as busy (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ autonomy: 'confirm' })
+    const ids: string[] = []
+    for (const text of ['镜头长一点', '镜头再短一点']) {
+      const { id } = await s.api.create(s.uid, s.p.id, { takeId: s.frame.id, kind: 'text', text })
+      await s.api.send(s.uid, id)
+      s.grok.answers.push(
+        sure('retime_shot', { shotId: s.shot, durationSec: text.includes('长') ? 7 : 3 }),
+      )
+      await runOne(s.exec)
+      ids.push(id)
+    }
+    await s.api.apply(s.uid, ids[0]!)
+    await s.api.apply(s.uid, ids[1]!)
+    const second = await annotation(ids[1]!)
+    assert.deepEqual(
+      [second.interpretation?.execution?.state, second.interpretation?.execution?.error],
+      ['failed', 'target_busy'],
+    )
+  })
+
+  test('a voice swap re-voices every line (plan r2 P1)', async (t) => {
     if (skip(t)) return
     const s = await setup()
     const lineTake = (
@@ -376,15 +449,13 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     await s.api.send(s.uid, id)
     s.grok.answers.push(sure('swap_voice', { voiceId: 'female-shaonv' }))
     await runOne(s.exec)
+    await advanceProject(s.advanceDeps, s.p.id)
+    const gens = await genTasks(s.p.id)
     assert.deepEqual(
-      await genTasks(s.p.id),
-      s.lines.map((l) => `annot:${id}:1:line:${l}:tts`).sort(),
+      gens.map((g) => g.key),
+      s.lines.map((l) => `gen:line:${l}:v2`).sort(),
     )
-    const v = await query<{ v: string }>(
-      `SELECT settings->'narration'->>'voiceId' AS v FROM studio_projects WHERE id = $1`,
-      [s.p.id],
-    )
-    assert.equal(v.rows[0]!.v, 'female-shaonv')
+    assert.ok(gens.every((g) => (g.request as { voiceId?: string }).voiceId === 'female-shaonv'))
   })
 
   test('outside the whitelist nothing runs; the annotation can be sent again', async (t) => {
@@ -400,7 +471,6 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     await runOne(s.exec)
     const a = await annotation(id)
     assert.deepEqual([a.status, a.interpretation?.op], ['sent', null])
-    assert.deepEqual(await genTasks(s.p.id), [])
     assert.equal((await projectRow(s.p.id)).status, 'done', 'not reopened')
     await s.api.send(s.uid, id)
     const keys = await query<{ key: string }>(
@@ -424,24 +494,43 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     await s.api.send(s.uid, id)
     s.grok.answers.push(sure('change_line', { lineId: s.lines[0], text: '雪停了' }))
     await runOne(s.exec)
-    assert.equal((await annotation(id)).interpretation?.execution?.state, 'running')
     await advanceProject(s.advanceDeps, s.p.id)
     assert.equal((await annotation(id)).status, 'sent', 'still running')
-    // A new voice take finishes and is adopted (v2 is the queued one the execution dispatched).
-    const v2 = await s.take('line', s.lines[0]!, 3, 'audio/mpeg')
+    // A new voice take finishes and is adopted (v2 is the queued one the director dispatched).
+    const v3 = await s.take('line', s.lines[0]!, 3, 'audio/mpeg')
     await query(`UPDATE studio_lines SET active_take_id = $2, status = 'ready' WHERE id = $1`, [
       s.lines[0],
-      v2.id,
+      v3.id,
     ])
     await advanceProject(s.advanceDeps, s.p.id)
     const a = await annotation(id)
     assert.deepEqual(
       [a.status, a.applied, a.interpretation?.execution?.state],
-      ['applied', v2.id, 'done'],
+      ['applied', v3.id, 'done'],
     )
   })
 
-  test('a budget that cannot cover it leaves nothing behind and records the failure', async (t) => {
+  test('an execution ends when the project is handed to the user with its target unfinished', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '长一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('retime_shot', { shotId: s.shot, durationSec: 7 }))
+    await runOne(s.exec)
+    await query(`UPDATE studio_projects SET status = 'awaiting_user' WHERE id = $1`, [s.p.id])
+    await advanceProject(s.advanceDeps, s.p.id)
+    const a = await annotation(id)
+    assert.deepEqual(
+      [a.interpretation?.execution?.state, a.interpretation?.execution?.error],
+      ['failed', 'needs_user'],
+    )
+  })
+
+  test('a budget that cannot cover the redo pauses the project; the annotation waits for it', async (t) => {
     if (skip(t)) return
     const s = await setup({ budget: 5 })
     const { id } = await s.api.create(s.uid, s.p.id, {
@@ -452,18 +541,67 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     await s.api.send(s.uid, id)
     s.grok.answers.push(sure('regenerate_shot', { shotId: s.shot, promptDelta: '更亮' }))
     await runOne(s.exec)
-    const a = await annotation(id)
-    assert.deepEqual(
-      [a.status, a.interpretation?.execution?.state, a.interpretation?.execution?.error],
-      ['sent', 'failed', 'budget'],
-    )
-    assert.deepEqual(await genTasks(s.p.id), [])
+    await advanceProject(s.advanceDeps, s.p.id)
     const p = await projectRow(s.p.id)
-    assert.deepEqual([p.status, p.reserved], ['done', '0'], 'the reopen was rolled back too')
-    const shot = (
-      await query<{ status: string }>('SELECT status FROM studio_shots WHERE id = $1', [s.shot])
-    ).rows[0]!
-    assert.equal(shot.status, 'ready')
+    assert.deepEqual([p.status, p.reserved], ['paused', '0'])
+    assert.equal(
+      (await annotation(id)).interpretation?.execution?.state,
+      'running',
+      'resumes with the budget',
+    )
+  })
+
+  test('an export asked for before the rework waits for the new film (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    // A 720p export is waiting to run when the annotation reopens the film.
+    await query(
+      `INSERT INTO studio_tasks(id, project_id, kind, payload, idempotency_key, exec_request_id, run_after)
+       VALUES (gen_random_uuid(), $1, 'compose', '{"reason":"export","variant":{"resolution":"720p","subtitles":"burn"}}'::jsonb,
+               'compose:test-export', 'studio:test-export', NOW() + interval '1 hour')`,
+      [s.p.id],
+    )
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '长一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('retime_shot', { shotId: s.shot, durationSec: 7 }))
+    assert.equal((await runOne(s.exec)).kind, 'interpret')
+    assert.equal((await projectRow(s.p.id)).status, 'running')
+    await query(
+      `UPDATE studio_tasks SET run_after = NOW() WHERE idempotency_key = 'compose:test-export'`,
+      [],
+    )
+    assert.equal((await runOne(s.exec)).kind, 'compose')
+    const compose = await query<{ key: string; status: string; variant: unknown }>(
+      `SELECT idempotency_key AS key, status, payload->'variant' AS variant FROM studio_tasks
+        WHERE project_id = $1 AND kind = 'compose' ORDER BY created_at`,
+      [s.p.id],
+    )
+    assert.deepEqual(
+      compose.rows.map((r) => r.status),
+      ['done', 'queued'],
+      'the export did not fail; it waits',
+    )
+    assert.deepEqual(compose.rows[1]!.variant, { resolution: '720p', subtitles: 'burn' })
+  })
+
+  test('apply is refused on a canceled project', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ autonomy: 'confirm' })
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '长一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('retime_shot', { shotId: s.shot, durationSec: 7 }))
+    await runOne(s.exec)
+    await query(`UPDATE studio_projects SET status = 'canceled' WHERE id = $1`, [s.p.id])
+    await assert.rejects(s.api.apply(s.uid, id), { code: 'STUDIO_BAD_TRANSITION' })
+    assert.equal((await annotation(id)).interpretation?.execution, undefined)
   })
 
   test("another user's annotation is not found", async (t) => {
@@ -482,7 +620,6 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
       () => other.api.remove(other.uid, id),
     ])
       await assert.rejects(call(), { status: 404 })
-    // A take of another project cannot be annotated either.
     await assert.rejects(
       s.api.create(s.uid, s.p.id, { takeId: other.frame.id, kind: 'text', text: 'x' }),
       {

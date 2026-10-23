@@ -230,8 +230,14 @@ export function makeAnnotationApi(
         throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
       const projectId = await inTx(pool, async (c) => {
         const a = await ownedAnnotation(c, userId, id)
-        await ownedProject(c, userId, a.project_id)
-        const out = await executeAnnotation(c, deps, a.project_id, id)
+        const status = await ownedProject(c, userId, a.project_id)
+        if (['canceled', 'failed', 'draft', 'planning'].includes(status))
+          throw new HttpError(
+            409,
+            'STUDIO_BAD_TRANSITION',
+            `cannot apply an annotation while the project is ${status}`,
+          )
+        const out = await executeAnnotation(c, a.project_id, id)
         if (out === false)
           throw new HttpError(
             409,

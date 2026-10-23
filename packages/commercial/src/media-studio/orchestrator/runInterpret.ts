@@ -80,10 +80,13 @@ async function markedFrame(
     }
   }
   if (!frame) return null
-  const img = sharp(frame).resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
-  const meta = await img.clone().metadata()
-  const w = meta.width ?? 1600
-  const h = meta.height ?? 900
+  // The mark is drawn at the size of the resized frame (code r1 P1: never larger than the base).
+  const base = await sharp(frame)
+    .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+    .png()
+    .toBuffer({ resolveWithObject: true })
+  const w = base.info.width
+  const h = base.info.height
   const g = a.geom
   const mark =
     a.kind === 'box' && g?.w && g.h
@@ -94,7 +97,7 @@ async function markedFrame(
   const svg = Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">${mark}</svg>`,
   )
-  return img
+  return sharp(base.data)
     .composite([{ input: svg, left: 0, top: 0 }])
     .jpeg({ quality: 85 })
     .toBuffer()
@@ -299,8 +302,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
             ? interpretation.explanation
             : `agent 理解为：${interpretation.explanation}`,
       })
-      if (autoApply(interpretation, p.autonomy))
-        await executeAnnotation(c, deps, task.projectId, a.id)
+      if (autoApply(interpretation, p.autonomy)) await executeAnnotation(c, task.projectId, a.id)
     }
     await finishStudioTask(c, task, { status: 'done' })
   })

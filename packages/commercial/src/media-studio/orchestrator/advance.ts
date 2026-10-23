@@ -9,7 +9,7 @@ import type { ProviderRegistry } from '../providers/registry.js'
 import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
-import { settleAnnotations } from './annotate.js'
+import { type ShotRedo, settleAnnotations } from './annotate.js'
 import { reserveBudget } from './budget.js'
 import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
@@ -222,9 +222,30 @@ function buildRequest(
   }
   if (d.ownerKind === 'shot_frame') {
     const spec = ctx.specs.get(d.ownerId) ?? {}
+    const base = framePrompt(spec, ctx.bible, aspect)
+    // A2-1b-2: a shot redone from an annotation keeps the change on every retry and fallback.
+    const redo = (spec.redo ?? null) as ShotRedo | null
+    if (redo?.edit) {
+      const r = redo.edit.region
+      const where = `画面中 x ${Math.round(r.x * 100)}%–${Math.round((r.x + r.w) * 100)}%、y ${Math.round(r.y * 100)}%–${Math.round((r.y + r.h) * 100)}% 的区域`
+      return {
+        op: 'image.edit',
+        prompt: withAvoid(
+          `只修改${where}：${redo.edit.instruction}。其余部分保持完全不变。\n${base}`,
+          d.avoid,
+        ),
+        aspect,
+        inputs: [
+          { role: 'source', blobSha: redo.edit.source },
+          ...(redo.edit.reference
+            ? [{ role: 'reference' as const, blobSha: redo.edit.reference }]
+            : []),
+        ],
+      }
+    }
     return {
       op: d.op,
-      prompt: withAvoid(framePrompt(spec, ctx.bible, aspect), d.avoid),
+      prompt: withAvoid(redo?.delta ? `${base}\n修改要求：${redo.delta}` : base, d.avoid),
       aspect,
       inputs,
     }
@@ -264,12 +285,14 @@ async function dispatchOne(
   ctx: NonNullable<Awaited<ReturnType<typeof loadState>>>,
   d: Dispatch,
 ): Promise<'queued' | 'budget' | 'no_provider'> {
+  const req = buildRequest(d, ctx)
+  // A redone first frame may be an edit of the current one: the provider is picked for that op.
   return dispatchRequest(
     client,
     deps,
     { id: ctx.project.id, userId: ctx.project.user_id },
-    d,
-    buildRequest(d, ctx),
+    req.op === d.op ? d : { ...d, op: req.op },
+    req,
   )
 }
 

@@ -211,6 +211,33 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
     await finishStudioTask(deps.pool, task, { status: 'canceled', error: 'project gone' })
     return
   }
+  // A2-1b-2: the film is being reworked (an annotation reopened it). An export waits for the new
+  // film instead of failing on missing inputs; an auto run ends — the director composes again.
+  if (inputs.status !== 'done' && inputs.status !== 'composing') {
+    await withLease(deps.pool, task, async (c) => {
+      if (
+        pl.reason === 'export' &&
+        ['running', 'awaiting_user', 'paused'].includes(inputs.status)
+      ) {
+        await enqueueStudioTask(c, {
+          projectId: task.projectId,
+          kind: 'compose',
+          idempotencyKey: `compose:${task.projectId}:export-wait:${task.id}`,
+          payload: { reason: 'export', variant: pl.variant },
+          runAfterSeconds: 60,
+        })
+      }
+      if (pl.takeId) {
+        await c.query(
+          `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1 AND status IN ('queued','running')`,
+          [pl.takeId],
+        )
+        await deps.blobs.dropRefs(BigInt(inputs.userId), { kind: 'final', id: pl.takeId }, c)
+      }
+      await finishStudioTask(c, task, { status: 'done', error: `project is ${inputs.status}` })
+    })
+    return
+  }
   if (inputs.missing.length)
     throw new MediaProviderError(
       'COMPOSE_INPUTS',

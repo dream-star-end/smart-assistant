@@ -586,6 +586,7 @@ async function outcome(
       await c.query(
         `UPDATE studio_shots s SET active_take_id = $2, status = 'ready', spec = s.spec - 'frameTakeId'
           WHERE s.id = $1 AND s.project_id = $3 AND s.status IN ('generating', 'qa')
+            AND (SELECT version FROM studio_takes WHERE id = $2) >= COALESCE((s.spec->'redo'->>'video')::int, 0)
             AND (NOT s.spec ? 'frameTakeId'
                  OR EXISTS (SELECT 1 FROM studio_takes f
                              WHERE f.id::text = s.spec->>'frameTakeId' AND f.blob_sha = $4))`,

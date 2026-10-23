@@ -1,33 +1,50 @@
-// OCV5-591 A2-1b-2 — running an interpreted annotation (plan §2.2): one claim per execution, all
-// of its dispatches in the claim's transaction, and completion read from the targets afterwards.
+// OCV5-591 A2-1b-2 — running an interpreted annotation (plan §2.2): one claim per execution; the
+// change is recorded on its target and the director (decide) does the generating.
 //
 //   - claim: `sent` + an op + no execution running (or the last one failed) → execution n+1
 //     running. Auto-apply and a user's apply share this one entry, so two applies (or an apply
-//     racing auto-apply) dispatch and reserve once (plan r1 P1).
-//   - every generation of an execution gets its own stable key annot:<id>:<n>:<kind>:<owner>:<step>
-//     (plan r2 P1), so a voice swap over many lines never dedupes its own lines.
-//   - a finished project is reopened in the same transaction (plan r1 P1).
-//   - settleAnnotations() (each advance) turns a running execution into applied / failed once its
-//     targets are ready again (new takes judged by QA as usual) or were handed to the user.
+//     racing auto-apply) start one execution (plan r1 P1).
+//   - the change lives on the target, not in a one-off request (code r1 P1): a shot carries
+//     `spec.redo` (version floors + the prompt delta or the frame edit), a line its new text and the
+//     narration its new voice. decide dispatches from it — one generation per owner at a time, and
+//     a retry or a fallback provider redoes the same change. Runs never lose it.
+//   - a finished / composing / waiting project is reopened in the claim's transaction; an export
+//     asked for meanwhile waits for the new film (compose start).
+//   - one execution per target at a time: a second annotation on a shot or line being changed
+//     fails with "busy" instead of racing it (code r1 P1).
+//   - settleAnnotations() (each advance) applies it once every target is ready on a version made
+//     for it, or fails it when a target or the project was handed to the user.
 
 import type { PoolClient } from 'pg'
 
-import type { MediaRequest } from '../providers/types.js'
 import { appendStudioEvent } from '../store.js'
-import { type AdvanceDeps, dispatchRequest, loadState } from './advance.js'
 import type { Interpretation } from './interpret.js'
-import { framePrompt } from './prompts.js'
 
-type Target =
+export type Target =
   | { kind: 'shot'; id: string; minVideo: number }
   | { kind: 'line'; id: string; minVersion: number }
 
-export class AnnotationRunError extends Error {
-  constructor(readonly code: 'budget' | 'no_provider' | 'target_gone') {
+/** A redo the director builds its next first frame from (advance.buildRequest). */
+export interface ShotRedo {
+  frame: number
+  video: number
+  delta?: string
+  edit?: {
+    source: string
+    reference: string | null
+    instruction: string
+    region: { x: number; y: number; w: number; h: number }
+  }
+}
+
+class AnnotationRunError extends Error {
+  constructor(readonly code: 'target_gone' | 'target_busy') {
     super(code)
     this.name = 'AnnotationRunError'
   }
 }
+
+const OPEN = ['running', 'awaiting_user', 'composing', 'done', 'paused']
 
 const nextVersion = async (c: PoolClient, ownerKind: string, ownerId: string) =>
   (
@@ -37,17 +54,35 @@ const nextVersion = async (c: PoolClient, ownerKind: string, ownerId: string) =>
     )
   ).rows[0]!.next
 
+/** The ids an instruction changes (to keep one execution per target). */
+async function touches(c: PoolClient, projectId: string, i: Interpretation): Promise<string[]> {
+  if (i.op === 'regenerate_shot' || i.op === 'edit_frame' || i.op === 'retime_shot')
+    return [i.args.shotId]
+  if (i.op === 'change_line') return [i.args.lineId]
+  if (i.op === 'swap_voice')
+    return (
+      await c.query<{ id: string }>(
+        'SELECT id::text AS id FROM studio_lines WHERE project_id = $1',
+        [projectId],
+      )
+    ).rows.map((r) => r.id)
+  return []
+}
+
 /**
- * Claim and run one execution. Returns false when there is nothing to claim (already running,
- * applied, rejected, or no op). A dispatch that cannot happen (budget, no provider) rolls the
- * execution's own writes back and records it as failed, so the user can try again later.
+ * Claim and start one execution. Returns false when there is nothing to claim (already running,
+ * applied, rejected, no op) or the project cannot take work (canceled / failed / not started).
  */
 export async function executeAnnotation(
   c: PoolClient,
-  deps: AdvanceDeps,
   projectId: string,
   annotationId: string,
 ): Promise<'running' | 'applied' | 'failed' | false> {
+  const p = await c.query<{ status: string }>(
+    'SELECT status FROM studio_projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+    [projectId],
+  )
+  if (!p.rows[0] || !OPEN.includes(p.rows[0].status)) return false
   const claim = await c.query<{
     n: number
     interpretation: Interpretation
@@ -65,15 +100,105 @@ export async function executeAnnotation(
   )
   const row = claim.rows[0]
   if (!row) return false
-  const key = (kind: string, owner: string, step: string) =>
-    `annot:${annotationId}:${row.n}:${kind}:${owner}:${step}`
+  const i = row.interpretation
   await c.query('SAVEPOINT annot_run')
   try {
-    // A finished film (or one waiting on the user) goes back to the director (plan r1 P1).
+    // One execution per target: another annotation changing it now would race this one.
+    const ids = await touches(c, projectId, i)
+    if (ids.length) {
+      const busy = await c.query(
+        `SELECT 1 FROM studio_annotations a, jsonb_array_elements(COALESCE(a.interpretation->'execution'->'targets', '[]'::jsonb)) t
+          WHERE a.project_id = $1 AND a.id <> $2 AND a.status = 'sent'
+            AND a.interpretation->'execution'->>'state' = 'running' AND t->>'id' = ANY($3::text[]) LIMIT 1`,
+        [projectId, annotationId, ids],
+      )
+      if (busy.rowCount) throw new AnnotationRunError('target_busy')
+      // A line with a voice take still on its way would be overwritten by that older take.
+      const live = await c.query(
+        `SELECT 1 FROM studio_takes WHERE project_id = $1 AND owner_kind = 'line'
+            AND owner_id::text = ANY($2::text[]) AND status IN ('queued', 'running') LIMIT 1`,
+        [projectId, ids],
+      )
+      if (live.rowCount && (i.op === 'change_line' || i.op === 'swap_voice'))
+        throw new AnnotationRunError('target_busy')
+    }
+    const targets: Target[] = []
+    const redoShot = async (
+      shotId: string,
+      from: 'frame' | 'video',
+      extra: Partial<ShotRedo> = {},
+    ) => {
+      const redo: ShotRedo = {
+        frame: from === 'frame' ? await nextVersion(c, 'shot_frame', shotId) : 0,
+        video: await nextVersion(c, 'shot_video', shotId),
+        ...extra,
+      }
+      const r = await c.query(
+        `UPDATE studio_shots SET status = 'generating', active_take_id = NULL,
+                spec = (spec - 'frameTakeId') || jsonb_build_object('redo', $2::jsonb)
+          WHERE id = $1 AND project_id = $3`,
+        [shotId, JSON.stringify(redo), projectId],
+      )
+      if (!r.rowCount) throw new AnnotationRunError('target_gone')
+      targets.push({ kind: 'shot', id: shotId, minVideo: redo.video })
+    }
+    const redoLine = async (lineId: string, text?: string) => {
+      const minVersion = await nextVersion(c, 'line', lineId)
+      const r = await c.query(
+        `UPDATE studio_lines SET status = 'planned', text = COALESCE($2, text) WHERE id = $1 AND project_id = $3`,
+        [lineId, text ?? null, projectId],
+      )
+      if (!r.rowCount) throw new AnnotationRunError('target_gone')
+      targets.push({ kind: 'line', id: lineId, minVersion })
+    }
+
+    if (i.op === 'adopt_take') {
+      if (!(await adoptTakeIn(c, projectId, i.args.takeId)))
+        throw new AnnotationRunError('target_gone')
+    } else if (i.op === 'regenerate_shot') {
+      await redoShot(i.args.shotId, 'frame', { delta: i.args.promptDelta })
+    } else if (i.op === 'edit_frame') {
+      const source = await currentFrame(c, i.args.shotId)
+      if (!source) throw new AnnotationRunError('target_gone')
+      await redoShot(i.args.shotId, 'frame', {
+        edit: {
+          source,
+          reference: row.frame_blob_sha,
+          instruction: i.args.instruction,
+          region: i.args.region,
+        },
+      })
+    } else if (i.op === 'retime_shot') {
+      const r = await c.query(
+        `UPDATE studio_shots SET spec = jsonb_set(spec, '{durationSec}', to_jsonb($2::float8)) WHERE id = $1 AND project_id = $3`,
+        [i.args.shotId, i.args.durationSec, projectId],
+      )
+      if (!r.rowCount) throw new AnnotationRunError('target_gone')
+      // The same first frame, a new video of the new length.
+      await redoShot(i.args.shotId, 'video')
+    } else if (i.op === 'change_line') {
+      await redoLine(i.args.lineId, i.args.text)
+    } else if (i.op === 'swap_voice') {
+      await c.query(
+        `UPDATE studio_projects
+            SET settings = jsonb_set(settings, '{narration}', COALESCE(settings->'narration', '{}'::jsonb) || jsonb_build_object('voiceId', $2::text))
+          WHERE id = $1`,
+        [projectId, i.args.voiceId],
+      )
+      for (const id of await touches(c, projectId, i)) await redoLine(id)
+    }
+
+    // A finished film (or one waiting on the user, or being composed) goes back to the director.
     const reopened = await c.query(
       `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason',
               rev = rev + 1, updated_at = NOW()
-        WHERE id = $1 AND status IN ('done', 'awaiting_user') RETURNING id`,
+        WHERE id = $1 AND status IN ('done', 'awaiting_user', 'composing') RETURNING id`,
+      [projectId],
+    )
+    // Paused: resuming lands on the director, which picks the change up.
+    await c.query(
+      `UPDATE studio_projects SET settings = settings || '{"resumeTo":"running"}'::jsonb
+        WHERE id = $1 AND status = 'paused' AND settings->>'resumeTo' IN ('done', 'composing', 'awaiting_user')`,
       [projectId],
     )
     if (reopened.rowCount) {
@@ -82,115 +207,7 @@ export async function executeAnnotation(
         message: '按你的批注重新制作，完成后会重新合成成片（不收费）。',
       })
     }
-    const ctx = await loadState(c, deps, projectId)
-    if (!ctx) throw new AnnotationRunError('target_gone')
-    const project = { id: projectId, userId: ctx.project.user_id }
-    const i = row.interpretation
-    const targets: Target[] = []
-    const dispatch = async (
-      d: { ownerKind: 'shot_frame' | 'line'; ownerId: string; op: MediaRequest['op'] },
-      req: MediaRequest,
-      step: string,
-    ) => {
-      const r = await dispatchRequest(
-        c,
-        deps,
-        project,
-        { ...d, exclude: [], idempotencyKey: key(d.ownerKind, d.ownerId, step) },
-        req,
-      )
-      if (r !== 'queued') throw new AnnotationRunError(r)
-    }
-    /** The shot starts over from a new first frame (or only a new video): older versions no longer count. */
-    const redoShot = async (shotId: string, from: 'frame' | 'video') => {
-      const frame = from === 'frame' ? await nextVersion(c, 'shot_frame', shotId) : 0
-      const video = await nextVersion(c, 'shot_video', shotId)
-      await c.query(
-        `UPDATE studio_shots SET status = 'generating', active_take_id = NULL,
-                spec = (spec - 'frameTakeId') || jsonb_build_object('redo', jsonb_build_object('frame', $2::int, 'video', $3::int))
-          WHERE id = $1 AND project_id = $4`,
-        [shotId, frame, video, projectId],
-      )
-      targets.push({ kind: 'shot', id: shotId, minVideo: video })
-    }
-    const spec = (shotId: string) => ctx.specs.get(shotId) ?? {}
-    const aspect = ctx.project.aspect
-
-    if (i.op === 'regenerate_shot') {
-      const prompt = `${framePrompt(spec(i.args.shotId), ctx.bible, aspect)}\n修改要求：${i.args.promptDelta}`
-      const refs = ctx.bible.flatMap((b) =>
-        b.blobSha ? [{ role: 'reference' as const, blobSha: b.blobSha }] : [],
-      )
-      await redoShot(i.args.shotId, 'frame')
-      await dispatch(
-        { ownerKind: 'shot_frame', ownerId: i.args.shotId, op: 'image.generate' },
-        { op: 'image.generate', prompt, aspect, inputs: refs },
-        'frame',
-      )
-    } else if (i.op === 'edit_frame') {
-      const source = await currentFrame(c, i.args.shotId)
-      if (!source) throw new AnnotationRunError('target_gone')
-      const r = i.args.region
-      const where = `画面中 x ${Math.round(r.x * 100)}%–${Math.round((r.x + r.w) * 100)}%、y ${Math.round(r.y * 100)}%–${Math.round((r.y + r.h) * 100)}% 的区域`
-      const prompt = `只修改${where}：${i.args.instruction}。其余部分保持完全不变。\n${framePrompt(spec(i.args.shotId), ctx.bible, aspect)}`
-      await redoShot(i.args.shotId, 'frame')
-      await dispatch(
-        { ownerKind: 'shot_frame', ownerId: i.args.shotId, op: 'image.edit' },
-        {
-          op: 'image.edit',
-          prompt,
-          aspect,
-          inputs: [
-            { role: 'source', blobSha: source },
-            ...(row.frame_blob_sha
-              ? [{ role: 'reference' as const, blobSha: row.frame_blob_sha }]
-              : []),
-          ],
-        },
-        'edit',
-      )
-    } else if (i.op === 'retime_shot') {
-      await c.query(
-        `UPDATE studio_shots SET spec = jsonb_set(spec, '{durationSec}', to_jsonb($2::float8)) WHERE id = $1`,
-        [i.args.shotId, i.args.durationSec],
-      )
-      // Same first frame, a new video of the new length: the director dispatches it.
-      await redoShot(i.args.shotId, 'video')
-    } else if (i.op === 'change_line') {
-      const voiceId = ctx.state.narrationVoiceId
-      if (!voiceId) throw new AnnotationRunError('no_provider')
-      const minVersion = await nextVersion(c, 'line', i.args.lineId)
-      await c.query(
-        `UPDATE studio_lines SET text = $2, status = 'generating' WHERE id = $1 AND project_id = $3`,
-        [i.args.lineId, i.args.text, projectId],
-      )
-      await dispatch(
-        { ownerKind: 'line', ownerId: i.args.lineId, op: 'voice.tts' },
-        { op: 'voice.tts', text: i.args.text, voiceId },
-        'tts',
-      )
-      targets.push({ kind: 'line', id: i.args.lineId, minVersion })
-    } else if (i.op === 'swap_voice') {
-      await c.query(
-        `UPDATE studio_projects
-            SET settings = jsonb_set(settings, '{narration}', COALESCE(settings->'narration', '{}'::jsonb) || jsonb_build_object('voiceId', $2::text))
-          WHERE id = $1`,
-        [projectId, i.args.voiceId],
-      )
-      for (const [lineId, text] of ctx.lineText) {
-        if (!text.trim()) continue
-        const minVersion = await nextVersion(c, 'line', lineId)
-        await c.query(`UPDATE studio_lines SET status = 'generating' WHERE id = $1`, [lineId])
-        await dispatch(
-          { ownerKind: 'line', ownerId: lineId, op: 'voice.tts' },
-          { op: 'voice.tts', text, voiceId: i.args.voiceId },
-          'tts',
-        )
-        targets.push({ kind: 'line', id: lineId, minVersion })
-      }
-    } else if (i.op === 'adopt_take') {
-      const adopted = await adoptTakeIn(c, projectId, i.args.takeId)
-      if (!adopted) throw new AnnotationRunError('target_gone')
+    if (i.op === 'adopt_take') {
       await c.query(
         `UPDATE studio_annotations
             SET status = 'applied', applied_take_id = $2,
@@ -219,26 +236,32 @@ export async function executeAnnotation(
     return 'running'
   } catch (err) {
     if (!(err instanceof AnnotationRunError)) throw err
-    // Nothing of this execution stays (no take, no reservation, no reopen); it is recorded failed.
+    // Nothing of this execution stays; it is recorded failed and can be tried again.
     await c.query('ROLLBACK TO SAVEPOINT annot_run')
-    await c.query(
-      `UPDATE studio_annotations
-          SET interpretation = jsonb_set(jsonb_set(interpretation, '{execution,state}', '"failed"'),
-                                         '{execution,error}', to_jsonb($2::text))
-        WHERE id = $1`,
-      [annotationId, err.code],
-    )
-    await appendStudioEvent(c, projectId, 'annotation.failed', {
-      annotationId,
-      message:
-        err.code === 'budget'
-          ? '预算不够执行这条批注，调高预算后可以再试。'
-          : err.code === 'no_provider'
-            ? '现在没有可用的服务执行这条批注，稍后可以再试。'
-            : '批注指向的内容已经不在了。',
-    })
+    await failExecution(c, projectId, annotationId, err.code)
     return 'failed'
   }
+}
+
+const FAIL_MESSAGE: Record<string, string> = {
+  target_gone: '批注指向的内容已经不在了。',
+  target_busy: '这一项正在按另一条批注修改，等它完成后可以再试。',
+  needs_user: '按批注重做的版本需要你看一下，可以选一个版本，或再试一次。',
+  user_chose: '你选了另一个版本，这条批注没有继续执行；需要的话可以再试一次。',
+}
+
+async function failExecution(c: PoolClient, projectId: string, annotationId: string, code: string) {
+  await c.query(
+    `UPDATE studio_annotations
+        SET interpretation = jsonb_set(jsonb_set(interpretation, '{execution,state}', '"failed"'),
+                                       '{execution,error}', to_jsonb($2::text))
+      WHERE id = $1`,
+    [annotationId, code],
+  )
+  await appendStudioEvent(c, projectId, 'annotation.failed', {
+    annotationId,
+    message: FAIL_MESSAGE[code] ?? '这条批注没执行成功，可以再试一次。',
+  })
 }
 
 /** The shot's current first frame: its adopted video's, else its newest usable frame. */
@@ -281,13 +304,13 @@ export async function adoptTakeIn(
   if (!t || t.status !== 'succeeded' || !t.blob_sha) return false
   if (t.owner_kind === 'shot_video') {
     await c.query(
-      `UPDATE studio_shots SET active_take_id = $2, status = 'ready', spec = spec - 'frameTakeId' WHERE id = $1`,
+      `UPDATE studio_shots SET active_take_id = $2, status = 'ready', spec = spec - 'frameTakeId' - 'redo' WHERE id = $1`,
       [t.owner_id, takeId],
     )
   } else if (t.owner_kind === 'shot_frame') {
     await c.query(
       `UPDATE studio_shots SET status = 'generating', active_take_id = NULL,
-              spec = jsonb_set(spec, '{frameTakeId}', to_jsonb($2::text)) WHERE id = $1`,
+              spec = jsonb_set(spec - 'redo', '{frameTakeId}', to_jsonb($2::text)) WHERE id = $1`,
       [t.owner_id, takeId],
     )
   } else if (t.owner_kind === 'line') {
@@ -308,20 +331,23 @@ export async function adoptTakeIn(
 
 /**
  * Each advance: a running execution is applied once every target is ready again on a version made
- * for it (new takes go through QA as usual), or failed when a target was handed to the user.
+ * for it (new takes go through QA as usual); it fails when a target was handed to the user, or the
+ * project stopped (waiting on the user, failed, canceled) with a target still unfinished.
  */
 export async function settleAnnotations(c: PoolClient, projectId: string): Promise<void> {
-  const running = await c.query<{ id: string; targets: Target[] | null }>(
-    `SELECT id::text AS id, interpretation->'execution'->'targets' AS targets FROM studio_annotations
-      WHERE project_id = $1 AND status = 'sent' AND interpretation->'execution'->>'state' = 'running'`,
+  const running = await c.query<{ id: string; targets: Target[] | null; pstatus: string }>(
+    `SELECT a.id::text AS id, a.interpretation->'execution'->'targets' AS targets, p.status AS pstatus
+       FROM studio_annotations a JOIN studio_projects p ON p.id = a.project_id
+      WHERE a.project_id = $1 AND a.status = 'sent' AND a.interpretation->'execution'->>'state' = 'running'`,
     [projectId],
   )
   for (const a of running.rows) {
-    const targets = a.targets ?? []
+    const stopped = ['awaiting_user', 'failed', 'canceled'].includes(a.pstatus)
     let pending = false
     let failed = false
+    let chose = false
     let last: string | null = null
-    for (const t of targets) {
+    for (const t of a.targets ?? []) {
       const r =
         t.kind === 'shot'
           ? await c.query<{ status: string; take: string | null; ok: boolean }>(
@@ -338,21 +364,14 @@ export async function settleAnnotations(c: PoolClient, projectId: string): Promi
       const s = r.rows[0]
       if (!s || s.status === 'needs_user' || s.status === 'failed') failed = true
       else if (s.status === 'ready' && s.ok) last = s.take
+      else if (s.status === 'ready')
+        chose = true // the user picked an older version meanwhile
+      else if (stopped) failed = true
       else pending = true
     }
-    if (pending && !failed) continue
-    if (failed) {
-      await c.query(
-        `UPDATE studio_annotations
-            SET interpretation = jsonb_set(jsonb_set(interpretation, '{execution,state}', '"failed"'),
-                                           '{execution,error}', '"needs_user"')
-          WHERE id = $1`,
-        [a.id],
-      )
-      await appendStudioEvent(c, projectId, 'annotation.failed', {
-        annotationId: a.id,
-        message: '按批注重做的版本需要你看一下，可以选一个版本，或再发一次。',
-      })
+    if (pending && !failed && !chose) continue
+    if (failed || chose) {
+      await failExecution(c, projectId, a.id, failed ? 'needs_user' : 'user_chose')
     } else {
       await c.query(
         `UPDATE studio_annotations

@@ -398,14 +398,20 @@ async function adopt(
     await c.query(
       `UPDATE studio_shots s SET active_take_id = $2, status = 'ready', spec = s.spec - 'frameTakeId'
         WHERE s.id = $1 AND s.project_id = $3 AND s.status IN ('generating', 'qa')
+          -- A2-1b-2: a shot redone from an annotation takes only a video made for the redo.
+          AND (SELECT version FROM studio_takes WHERE id = $2) >= COALESCE((s.spec->'redo'->>'video')::int, 0)
           AND (NOT s.spec ? 'frameTakeId'
                OR EXISTS (SELECT 1 FROM studio_takes f
                            WHERE f.id::text = s.spec->>'frameTakeId' AND f.blob_sha = $4))`,
       [g.ownerId, takeId, projectId, first],
     )
   } else if (g.ownerKind === 'line') {
+    // Never an older voice take over a newer one (A2-1b-2: a line re-voiced meanwhile).
     await c.query(
-      `UPDATE studio_lines SET active_take_id = $2, status = 'ready' WHERE id = $1 AND project_id = $3`,
+      `UPDATE studio_lines l SET active_take_id = $2, status = 'ready'
+        WHERE l.id = $1 AND l.project_id = $3
+          AND NOT EXISTS (SELECT 1 FROM studio_takes cur, studio_takes mine
+                           WHERE cur.id = l.active_take_id AND mine.id = $2 AND cur.version > mine.version)`,
       [g.ownerId, takeId, projectId],
     )
     const ms = out.outputs[0]?.durationMs
