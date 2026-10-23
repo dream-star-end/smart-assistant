@@ -95,6 +95,52 @@ const blogApi: ApiMockTable = {
   fetchTutorialImage: async (_auth: unknown, sha: string) => fixtureBlob(sha),
 }
 
+// 修改已投稿（OCV5-577 跟进）：已发布帖的修改在审 / 没通过。
+const EDIT_BODY = BODY.split('\n```')[0]!.trim()
+const mineEdits: CommunityTutorialMine[] = [
+  {
+    ...mine[1]!,
+    id: '3',
+    bodyMarkdown: EDIT_BODY,
+    summary: '用项目记住数据源和口径，定时任务每天跑一次，结果发到站内信。',
+    edit: {
+      id: '41',
+      status: 'pending',
+      needsHuman: false,
+      reviewNote: null,
+      title: '项目工作区 + 定时任务：每天 9 点自动生成销售日报（补充口径变更）',
+      summary: '用项目记住数据源和口径，定时任务每天跑一次，结果发到站内信。',
+      category: 'general',
+      bodyMarkdown: EDIT_BODY,
+      createdAt: new Date(now - 0.05 * HOUR).toISOString(),
+      reviewedAt: null,
+    },
+  },
+  {
+    ...mine[1]!,
+    id: '8',
+    title: '把会议纪要交给 Agent 整理成待办：三步模板',
+    viewCount: 46,
+    coverSha: PLANET,
+    edit: {
+      id: '39',
+      status: 'rejected',
+      needsHuman: false,
+      reviewNote: '新增的「工具推荐」一节包含站外购买链接和优惠码。删掉推广内容后可以再提交修改。',
+      title: '把会议纪要交给 Agent 整理成待办：三步模板',
+      summary: '…',
+      category: 'general',
+      bodyMarkdown: EDIT_BODY,
+      createdAt: '2026-10-22T20:00:00+08:00',
+      reviewedAt: '2026-10-22T20:01:00+08:00',
+    },
+  },
+  mine[0]!,
+  mine[2]!,
+]
+
+const blogEditApi: ApiMockTable = { ...blogApi, listMyCommunityTutorials: async () => ({ tutorials: mineEdits, nextCursor: null }) }
+
 function BlogHost({ communityId = null, children }: { communityId?: string | null; children?: ReactNode }) {
   const [view, setView] = useState<TutorialBrowseView>('blog')
   const [community, setCommunity] = useState<string | null>(communityId)
@@ -187,9 +233,37 @@ const adminPosts: AdminBlogPost[] = [
   },
 ]
 
-function AdminHost() {
+const adminEditPosts: AdminBlogPost[] = [
+  {
+    ...adminPosts[0]!,
+    id: '3',
+    title: '项目工作区 + 定时任务：每天 9 点自动生成销售日报（补充口径变更）',
+    category: 'general',
+    bodyMarkdown: '用项目记住数据源和口径，定时任务每天跑一次。第二周加了一张表，口径说明里同步写清楚了新增字段……',
+    publishedAt: '2026-10-19T09:01:00+08:00',
+    createdAt: '2026-10-23T18:40:00+08:00',
+    authorName: '周周',
+    imageCount: 1,
+    bodyChars: 2180,
+    editId: '41',
+    reviewToken: 'r:41',
+    moderation: {
+      ...adminPosts[0]!.moderation!,
+      categories: {
+        violation: { choice: 'no', confidence: 0.98, yes: 0.02 },
+        ad: { choice: 'no', confidence: 0.85, yes: 0.15 },
+        leak: { choice: 'no', confidence: 0.97, yes: 0.03 },
+        low_quality: { choice: 'no', confidence: 0.97, yes: 0.03 },
+      },
+      adminNote: '「广告」判为否，置信度 0.85，未达到自动处理阈值 0.9',
+    },
+  },
+  ...adminPosts,
+]
+
+function AdminHost({ posts = adminPosts }: { posts?: AdminBlogPost[] }) {
   Object.assign(adminApi, {
-    adminListBlogPosts: async () => ({ tutorials: adminPosts, nextCursor: null }),
+    adminListBlogPosts: async () => ({ tutorials: posts, nextCursor: null }),
     adminBlogModerationStats: async () => ({ mode: 'on', vision: true, today: { autoApproved: 4, autoRejected: 1, toHuman: 1 } }),
     adminBlogModerations: async () => ({ moderations: [], nextCursor: null }),
   })
@@ -248,4 +322,51 @@ export const blogScenes: Scene[] = [
     ),
   },
   { id: 'blog-5-admin', label: '经验分享 · 管理端', group: '管理中心', viewports: ['desktop'], api: blogApi, render: () => <AdminHost /> },
+  {
+    id: 'blog-6-mine-edits',
+    label: '经验分享 · 我的投稿（修改在审 / 修改未通过）',
+    group: '工作区',
+    viewports: both,
+    api: blogEditApi,
+    render: () => (
+      <BlogHost>
+        <Click labels={['我的投稿']} />
+      </BlogHost>
+    ),
+  },
+  {
+    id: 'blog-7-edit-published',
+    label: '经验分享 · 修改已发布的帖子',
+    group: '工作区',
+    viewports: both,
+    api: blogEditApi,
+    render: () => {
+      window.localStorage.removeItem('oc:blog-edit:3')
+      return (
+        <BlogHost>
+          <Click labels={['我的投稿', '修改']} />
+        </BlogHost>
+      )
+    },
+  },
+  {
+    id: 'blog-8-withdraw-published',
+    label: '经验分享 · 撤回已发布的帖子',
+    group: '工作区',
+    viewports: both,
+    api: blogEditApi,
+    render: () => (
+      <BlogHost>
+        <Click labels={['我的投稿', '撤回']} />
+      </BlogHost>
+    ),
+  },
+  {
+    id: 'blog-9-admin-edit',
+    label: '经验分享 · 管理端（修改稿待复核）',
+    group: '管理中心',
+    viewports: ['desktop'],
+    api: blogApi,
+    render: () => <AdminHost posts={adminEditPosts} />,
+  },
 ]

@@ -12,6 +12,7 @@ import type {
   CommunityTutorialDraft,
   CommunityTutorialMine,
   CommunityTutorialPage,
+  CommunityTutorialReviseResult,
   CommunityTutorialSummary,
   TutorialImageUpload,
   TutorialKind,
@@ -800,6 +801,19 @@ export const memorySkillsApi = {
     if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
     return res.blob();
   },
+
+  /** 修改已投稿的经验分享：待审 / 未通过的改后重审；已发布的审核通过前线上仍是旧版。 */
+  reviseCommunityTutorial: (a: AuthSession, id: string, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialReviseResult }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/${encodeURIComponent(id)}/revise`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.tutorial),
 
   withdrawCommunityTutorial: (a: AuthSession, id: string) =>
     jsonOrThrow<{ ok: boolean }>(

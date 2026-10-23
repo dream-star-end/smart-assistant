@@ -49,7 +49,7 @@ export default function TutorialReviewPage() {
     setBusyId(item.id)
     setError(null)
     try {
-      await adminApi.adminReviewCommunityTutorial(adminSession, item.id, decision, note || undefined)
+      await adminApi.adminReviewCommunityTutorial(adminSession, item.id, decision, note || undefined, item.reviewToken)
       setItems((current) => current.filter((entry) => entry.id !== item.id))
       setNotes((current) => {
         const next = { ...current }
