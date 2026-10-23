@@ -391,8 +391,8 @@ export function check(input: {
         problems.push({ kind: "ci-missing", message: `${gate.id}: workflow ${gate.ci} does not exist` });
       } else if (!(gate.script ? runs.scripts.has(key) : runs.npm.has(key))) {
         const why = runs.skipped.filter((s) => s.run.includes(key)).map((s) => `${s.where}: ${s.why}`);
-        problems.push({ kind: "ci-missing", message: `${gate.id}: ${gate.ci} does not run ${key}`
-          + (why.length ? ` (not counted: ${why.join("; ")})` : "") });
+        const note = why.length ? ` (not counted: ${why.join("; ")})` : "";
+        problems.push({ kind: "ci-missing", message: `${gate.id}: ${gate.ci} does not run ${key}${note}` });
       }
     } else if (!gate.ciExempt || gate.ciExempt.trim().length < 20) {
       problems.push({ kind: "ci-missing", message: `${gate.id}: no ci workflow and no written ciExempt reason` });
