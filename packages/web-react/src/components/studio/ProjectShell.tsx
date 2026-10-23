@@ -10,8 +10,11 @@ import type { AuthSession } from '../../lib/types'
 import { StateView } from './StateViews'
 import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
+import { FinalPage } from './pages/Final'
 import { ImageStudioPage } from './pages/ImageStudio'
+import { MusicPage } from './pages/Music'
 import { ReviewPage } from './pages/Review'
+import { VoicePage } from './pages/Voice'
 
 const STEPS: Array<[StudioPage, string]> = [
   ['brief', '需求'],
@@ -66,6 +69,8 @@ export function ProjectShell(props: {
   const { project } = state.view
   const pct = budgetPercent(project.spentCredits, project.reservedCredits, project.budgetCredits)
   const go = (p: StudioPage) => navigate({ kind: 'project', id: projectId, page: p })
+  const openShot = (shot: string) =>
+    navigate({ kind: 'project', id: projectId, page: 'review', shot })
 
   return (
     <>
@@ -137,7 +142,7 @@ export function ProjectShell(props: {
           auth={auth}
           view={state.view}
           providers={props.providers}
-          onOpenShot={(shot) => navigate({ kind: 'project', id: projectId, page: 'review', shot })}
+          onOpenShot={openShot}
           onOpenBrief={() => go('brief')}
         />
       ) : page === 'image' ? (
@@ -149,13 +154,22 @@ export function ProjectShell(props: {
         />
       ) : page === 'review' ? (
         <ReviewPage auth={auth} view={state.view} shotId={props.shot} onBack={() => go('board')} />
-      ) : (
-        <StateView
-          kind="soon"
-          title={`${PAGE_NAMES[page]}页即将开放`}
-          body="导演 agent 开拍后，这里会显示镜头、版本和批注。现在可以先在「需求」里调整方案和预算。"
-          action={{ label: '去需求页', onClick: () => go('brief') }}
+      ) : page === 'voice' ? (
+        <VoicePage
+          auth={auth}
+          view={state.view}
+          providers={props.providers}
+          onOpenShot={openShot}
         />
+      ) : page === 'music' ? (
+        <MusicPage
+          auth={auth}
+          view={state.view}
+          providers={props.providers}
+          onOpenShot={openShot}
+        />
+      ) : (
+        <FinalPage auth={auth} view={state.view} onOpenBoard={() => go('board')} />
       )}
     </>
   )

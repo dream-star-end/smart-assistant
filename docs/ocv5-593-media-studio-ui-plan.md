@@ -81,3 +81,4 @@ src/components/studio/studio.css   # 只放工作台组件样式；token 进 sty
 - 镜头媒体：`owner_kind = shot_video`（视频）或 `shot_frame`（首帧图）；`studio_shots.active_take_id` 指向采纳的版本，没有时前端取最新的成功版本。
 - 台词：`studio_lines.shot_id` 决定它落在哪个镜头的时间段；配音版本 `owner_kind = line`。音乐版本 `owner_kind = music`。
 - `studio_events.payload.message`：给人看的一句话；没有时前端按 `type` 显示通用文案。
+- FE-3 起前端还读：`studio_lines.status = 'auto_extended'`（台词比画面长、镜头已自动延长时由编排器写入，配音页高亮）；`studio_assets.kind = 'voice'`（`voice_id`、`locked`、可选 `blob_sha` 作为试听）；成片版本 `owner_kind = final`，`qa` 可含 `passed`、`character`、`subtitleSyncMs`、`loudnessLufs`、`glitches`、`moderation`（缺项不显示）；音乐候选 `owner_kind = music`，`qa.score` 显示为“情绪贴合”。
