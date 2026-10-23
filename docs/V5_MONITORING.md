@@ -110,7 +110,7 @@ active。`deploy_state` 读取失败或字段非法时，独立 `deploy_state` c
 2. **只有发送侧自证**:成功与否只看本机脚本退出码,接收侧没有任何探针。
    必须加接收侧的产物新鲜度检查(目标机最新备份 mtime),否则"推过去但落地失败"看不出来。
 3. **`OnFailure=` 未配**:这是连败 43 小时无人知晓的直接原因。新单元必须配
-   `OnFailure=v3-timer-failure-alert@%n.service`;同时 `failed_units` 探针已作为整类兜底。
+   `OnFailure=openclaude-v5-alert-fail@%n.service`;同时 `failed_units` 探针已作为整类兜底。
 
 重建后必须做一次**真实恢复演练**(从备份拉起一个可用实例)才算完成,不能只验证"文件推过去了"。
 
