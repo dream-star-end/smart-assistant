@@ -8067,6 +8067,23 @@
           "assertion": "OCV5-613 deploy proof: canonical trace uses admitted identity"
         }
       ]
+    },
+    {
+      "id": "INC-20261023-SYSTEM-APPROVAL-FENCING",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选在默认Codex审查及独立SQLite fixture中发现：同资源预先创建的master/browser提案可绕过另一次执行的unknown闸门；DEFERRED事务升级可出现SQLITE_BUSY_SNAPSHOT，使完成回执丢失。未涉及真实用户副作用或资金。",
+      "rootFixCommit": "e72089cd",
+      "coverageCommits": [
+        "987d2125"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-approval-proofs.ts",
+          "assertion": "[ocv5-610-durable-approval-fencing] PASS"
+        }
+      ]
     }
   ]
 }
