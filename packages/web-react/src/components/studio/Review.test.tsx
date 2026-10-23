@@ -128,6 +128,42 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
   })
 })
 
+describe('ReviewPage QA outcome (OCV5-593 FE-7a)', () => {
+  test('moderation, issues and the hand-off reason; the offered versions are marked', () => {
+    const v = view()
+    v.takes = [
+      take(1, 0.68),
+      {
+        ...take(2, 0.62),
+        qa: {
+          score: 0.62,
+          character: 0.62,
+          moderation: 'pass',
+          summary: '尾巴颜色和设定不符',
+          issues: [{ frame: 'F1', what: '尾巴颜色不对' }],
+          next: 'handoff',
+          reason: 'retries_exhausted',
+        },
+      },
+    ]
+    v.events = [
+      {
+        id: '5',
+        ts: '',
+        type: 'shot.needs_user',
+        payload: { shotId: 's1', takeIds: ['t1', 't2'] },
+      } as never,
+    ]
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    fireEvent.click(screen.getByRole('tab', { name: 'QA 报告' }))
+    expect(screen.getByTestId('qa-moderation')).toHaveTextContent('通过')
+    expect(screen.getByTestId('qa-issues')).toHaveTextContent('尾巴颜色不对')
+    expect(screen.getByTestId('qa-outcome')).toHaveTextContent('自动重做了 2 次仍未通过，交给你选')
+    fireEvent.click(screen.getByRole('tab', { name: /历史/ }))
+    expect(screen.getAllByTestId('qa-recommended')).toHaveLength(2)
+  })
+})
+
 describe('ReviewPage pointer robustness (OCV5-593 FE-2b code r1)', () => {
   test('box mode prevents the native drag and a cancelled pointer leaves no half box', async () => {
     render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)

@@ -243,6 +243,12 @@ const EVENT_TEXT: Record<string, string> = {
   'take.failed': '生成失败',
   'voice.ready': '配音已生成',
   'compose.done': '成片已合成',
+  // OCV5-591 A2-1b-1
+  'qa.passed': '质检通过',
+  'qa.redo': '质检未通过，已自动重做',
+  'qa.needs_user': '质检后需要你看一下',
+  'brief.moderation': '需求未通过内容审核',
+  'brief.moderation_deferred': '需求审核待画面复核',
 }
 
 export function eventText(e: StudioEvent): string {
@@ -251,8 +257,8 @@ export function eventText(e: StudioEvent): string {
 }
 
 export function eventTone(e: StudioEvent): 'ok' | 'retry' | 'bad' | 'info' {
-  if (/ready|done|created/.test(e.type)) return 'ok'
-  if (/retry/.test(e.type)) return 'retry'
-  if (/fail|cancel/.test(e.type)) return 'bad'
+  if (/ready|done|created|passed/.test(e.type)) return 'ok'
+  if (/retry|redo/.test(e.type)) return 'retry'
+  if (/fail|cancel|moderation$/.test(e.type)) return 'bad'
   return 'info'
 }

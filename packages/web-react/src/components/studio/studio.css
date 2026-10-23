@@ -2296,6 +2296,18 @@ fieldset.st-versions {
   gap: 10px;
   font-size: 12.5px;
 }
+/* OCV5-593 FE-7a: QA issues and outcome on the review page. */
+.st-qa-issues {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--st-amber);
+}
+.st-qa-outcome.st-qa-handoff,
+.st-qa-outcome.st-qa-redo {
+  color: var(--st-amber);
+}
+
 /* OCV5-593 FE-6 (d14): CC BY credits on the final page. */
 .st-final-credits {
   list-style: none;

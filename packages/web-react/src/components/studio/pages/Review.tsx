@@ -31,6 +31,7 @@ import {
 } from '../../../lib/studio/annotations'
 import { formatCredits, formatTimecode } from '../../../lib/studio/format'
 import { qaScoreOf, shotCard, takesOf } from '../../../lib/studio/model'
+import { MODERATION_TEXT, qaView, recommendedTakes } from '../../../lib/studio/qa'
 import type { StudioProjectView, StudioTake } from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
 import { MediaThumb, isVideoTake } from '../MediaThumb'
@@ -218,6 +219,9 @@ function ShotReview(props: {
   }
   const qa = (take?.qa ?? null) as Record<string, unknown> | null
   const score = qaScoreOf(take)
+  // FE-7a: the QA outcome in words, and the versions QA offered when it handed the shot over.
+  const qv = qaView(qa)
+  const recommended = recommendedTakes(view, shot.id)
   const ratio = ASPECT_RATIO[view.project.aspect] ?? '16 / 9'
 
   return (
@@ -603,9 +607,36 @@ function ShotReview(props: {
                       )
                     })}
                   </div>
+                  {qv.moderation ? (
+                    <div className="st-qa-row" data-testid="qa-moderation">
+                      <span>内容审核</span>
+                      <span style={{ flex: 1 }} />
+                      <span
+                        className={`st-chip ${qv.moderation === 'pass' ? 'st-chip-ok' : 'st-chip-warn'}`}
+                      >
+                        {MODERATION_TEXT[qv.moderation]}
+                      </span>
+                    </div>
+                  ) : null}
                   {typeof qa.summary === 'string' ? (
                     <div className="st-cap" style={{ marginTop: 10 }}>
                       {qa.summary}
+                    </div>
+                  ) : null}
+                  {qv.issues.length ? (
+                    <ul className="st-qa-issues" data-testid="qa-issues">
+                      {qv.issues.map((i) => (
+                        <li key={i}>{i}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {qv.outcomeText ? (
+                    <div
+                      className={`st-cap st-qa-outcome st-qa-${qv.outcome}`}
+                      data-testid="qa-outcome"
+                      style={{ marginTop: 8 }}
+                    >
+                      {qv.outcomeText}
                     </div>
                   ) : null}
                 </>
@@ -621,6 +652,11 @@ function ShotReview(props: {
                 <li key={t.id} className="st-row">
                   <b>v{t.version}</b>
                   <span className="st-cap">{t.ownerKind === 'shot_frame' ? '首帧' : '视频'}</span>
+                  {recommended.has(t.id) ? (
+                    <span className="st-chip st-chip-ok" data-testid="qa-recommended">
+                      推荐
+                    </span>
+                  ) : null}
                   <span className="st-cap">{t.provider}</span>
                   <span style={{ flex: 1 }} />
                   <span
