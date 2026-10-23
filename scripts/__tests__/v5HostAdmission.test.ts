@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -27,14 +27,14 @@ async function fixture() {
     MODE: 'deploy', DRY: '0', CANARY_RELEASE: '',
   }
   const run = (body = 'v5_host_admission_for_mode', extra = {}) => spawnSync(
-    'bash', ['-c', 'set -Eeuo pipefail; source "$1"; ' + body, 'admission-test', lib],
+    'bash', ['-c', `set -Eeuo pipefail; source "$1"; ${body}`, 'admission-test', lib],
     { cwd: root, env: { ...env, ...extra }, encoding: 'utf8', timeout: 10_000 },
   )
   return { dir, load, locks, proc, env, run }
 }
 
 function status(result: ReturnType<typeof spawnSync>, expected: number) {
-  assert.equal(result.status, expected, String(result.stdout) + String(result.stderr))
+  assert.equal(result.status, expected, `${String(result.stdout)}${String(result.stderr)}`)
 }
 
 test('host admission accepts an idle host without creating lock files', async () => {
@@ -50,7 +50,7 @@ test('host admission accepts an idle host without creating lock files', async ()
 test('host admission rejects threshold load and unreadable load in strict shells', async () => {
   const f = await fixture()
   for (const value of ['8.00', '12.3', 'invalid']) {
-    await writeFile(f.load, value + ' 0 0\n')
+    await writeFile(f.load, `${value} 0 0\n`)
     status(f.run(), 1)
   }
   status(f.run(undefined, { V5_HOST_ADMISSION_LOADAVG: path.join(f.dir, 'absent') }), 1)
@@ -84,11 +84,11 @@ test('host admission detects npm tests and v5 checks without rejecting builds', 
     ['npm', 'test'], ['npm', 'run', 'test:web-react'],
     ['/usr/bin/node', '/usr/lib/node_modules/npm/bin/npm-cli.js', 'run', 'check:v5:incidents'],
   ]) {
-    await writeFile(path.join(procDir, 'cmdline'), args.join('\0') + '\0')
+    await writeFile(path.join(procDir, 'cmdline'), `${args.join('\0')}\0`)
     status(f.run(), 1)
   }
   for (const args of [['npm', 'run', 'build'], ['node', '--test', 'isolated.node-test.mjs']]) {
-    await writeFile(path.join(procDir, 'cmdline'), args.join('\0') + '\0')
+    await writeFile(path.join(procDir, 'cmdline'), `${args.join('\0')}\0`)
     status(f.run(), 0)
   }
 })
