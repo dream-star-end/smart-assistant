@@ -337,8 +337,16 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
     assert.ok(all[1]!.meta.srtSha, 'the .srt is kept next to the film')
     // A2-1c-2: the final page reads each film's format, credits and .srt from the project view.
     const view = (await new StudioStore(getPool()).projectView(s.uid, s.p.id)) as {
-      takes: Array<{ id: string; final: Record<string, unknown> | null }>
+      takes: Array<{
+        id: string
+        ownerKind: string
+        durationMs: number | null
+        final: Record<string, unknown> | null
+      }>
     }
+    // …and each narration take's real length, which the timeline places lines by.
+    const voiced = view.takes.filter((tk) => tk.ownerKind === 'line')
+    assert.ok(voiced.length > 0 && voiced.every((tk) => typeof tk.durationMs === 'number'))
     const vertical = view.takes.find((tk) => tk.id === all[1]!.id)
     assert.deepEqual(
       [

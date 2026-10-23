@@ -264,6 +264,10 @@ export class StudioStore {
                 -- other takes' meta (provider internals) stays server-side.
                 CASE WHEN owner_kind = 'music'
                      THEN jsonb_build_object('license', meta->'license', 'track', meta->'track') END AS music,
+                -- OCV5-591 A2-1c-2: the media's real length (the timeline places narration by it, as compose
+                -- does); a malformed value is left out rather than failing the view.
+                CASE WHEN jsonb_typeof(meta->'durationMs') = 'number'
+                     THEN (meta->>'durationMs')::float8 END AS "durationMs",
                 -- OCV5-591 A2-1c-2: a film's export format, CC BY credits and soft-subtitle file (a film
                 -- still being composed has only the format it was asked for, in its inputs).
                 CASE WHEN owner_kind = 'final'
