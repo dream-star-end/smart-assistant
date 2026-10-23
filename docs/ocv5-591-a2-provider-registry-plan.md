@@ -151,6 +151,14 @@ interface ProviderRegistry {
 
 - 适配器目录 `adapters/index.ts` 导出 `BUILTIN_ADAPTERS: AdapterFactory[]`。新增供应商的步骤写进本文 §8 和代码注释。
 - 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限：GPT 按 `IMAGE2_UNIT_COST × n`（固定价），Muse 按 `OC_MUSE_PRICE_*`（按 job 固定价）。
+- **TTS 的上限（plan r1 P1-1 / r2 P1）**：`synthesizeSpeech` 按上游返回的 `usage_characters` 结算，本地字数只是报价，不是上限。处理（**在扣费之前封顶**，不靠事后暂停）：
+  1. 预留按 `calculateMiniMaxSpeechCost({usageCharacters: 2 × 码点数 + 16})`：MiniMax 规则是汉字记 2、其余记 1（10-23 实测 14 字中文 → 上游 26，本地计数 26），正常情况下预留就够；
+  2. 给 `synthesizeSpeech` 增加可选参数 `costCap`（OCV5-589 客户端，本 PR 内修改）：按上游字数算出的价格超过 `costCap` 时，**只按 `costCap` 结算**，`price_snapshot.notes` 记 `capped from <原价>`，超出部分由平台承担。容器路由不传它，行为不变；
+  3. 适配器调用时传 `costCap = ctx.maxCostCredits`（本任务已原子预留的额度），所以**实际扣费永远 ≤ 预留**，项目预算硬上限成立；注册表外层在调用前还会拒绝 `estimateMaxCost > ctx.maxCostCredits` 的任务（`RESERVATION_TOO_SMALL`）；
+  4. `MediaResult.overReservation` 只作为对所有适配器的防御性检查保留（实际扣费 > 预留时为 true，A2-1 记录告警并暂停项目）；对内置适配器它不会发生：GPT、Muse 是固定价且不超过预留，TTS 已封顶；
+  5. 测试：英文 50 字符 → 上限 116 字 ≥ 上游 51；integ：上游返回 151 字、`costCap=3` → 实扣 3、余额只少 3、snapshot 带 `capped from 4`；不传 `costCap` → 实扣 4。
+- 适配器目录 `adapters/index.ts` 导出 `BUILTIN_ADAPTERS: AdapterFactory[]`。新增供应商的步骤写进本文 §8 和代码注释。
+- 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限：GPT 按 `IMAGE2_UNIT_COST × n`（固定价），Muse 按 `OC_MUSE_PRICE_*`（按 job 固定价）。
 - **TTS 的上限（plan r1 P1-1）**：`synthesizeSpeech` 按上游返回的 `usage_characters` 结算，本地字数只是报价，不是上限。处理：
   1. 预留按 `calculateMiniMaxSpeechCost({usageCharacters: 2 × 码点数 + 16})`：MiniMax 规则是汉字记 2、其余记 1（10-23 实测 14 字中文 → 上游 26，本地计数 26），所以 2 × 码点数覆盖全部字符都按最重的规则计，+16 兜住上游可能追加的停顿/标记字符；
   2. 适配器在 `run()` 前确认 `estimateMaxCost(req) ≤ 调用方传入的预留额`，并把预留额作为 `ctx.maxCostCredits` 传入；结算后若实际扣费超过 `ctx.maxCostCredits`（上游计数规则变化等极端情况），结果带 `overReservation: true`，A2-1 必须在同一事务里把超出部分计入 spent 并把项目转为 `paused`（预算类 `needs_user`），不再派发新任务。单次超出量最多一句台词（≤ 500 字），不会连续突破；
