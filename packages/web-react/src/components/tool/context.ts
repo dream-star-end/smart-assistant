@@ -8,15 +8,29 @@
  * 这样 ToolCard 的数据契约保持纯净（只吃单个 tool 对象，见 ToolCard.tsx），交互能力按需
  * 由上层 App/MessageRenderer 注入，不污染 props，也不引入第二套传参机制。
  */
-import { createContext, useContext } from "react";
+import { createContext, type ReactNode, useContext } from "react";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 import type { Ticket } from "../../lib/taskboard";
 import type { CommunityBlogPrecheck, CommunityTutorialCategory, CommunityTutorialMine } from "../../lib/types";
 import type { ToolLike } from "./format";
 
+import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser';
+
+export type SystemActionCardActions = {
+  identityKey: string;
+  getDetail: (id: string) => Promise<SystemActionDetail>;
+  getConfirmation: (id: string) => Promise<{ detail: SystemActionDetail; nonce: string }>;
+  confirm: (id: string, proof: { nonce: string; previewHash: string }) => Promise<SystemActionSummary>;
+  deny: (id: string) => Promise<SystemActionSummary>;
+  /** Native gestures are rendered by fixed, trusted adapters; never model-provided DOM/JS. */
+  renderContinuation?: (id: string) => ReactNode;
+};
+
 export type LiteratureArtifactMeta = { expiresAt: string; bytes: number; saved: boolean };
 
 export type ToolCardActions = {
+  /** First-party server-verified system action approvals. Optional in history/demo/unauthenticated views. */
+  systemActions?: SystemActionCardActions;
   /** 打开记忆中心（memory / archival / session_search 类）。 */
   onOpenMemory?: () => void;
   /** 打开技能库（skill_* 类）。 */
