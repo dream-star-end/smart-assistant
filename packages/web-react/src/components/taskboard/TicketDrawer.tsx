@@ -615,7 +615,13 @@ export function TicketDrawer({
       const ticketId = currentRef.current?.id
       const requestedOwner = ownerLookupRef.current
       const present = history.fullRun(run.id)
-      if (present || run.outputMd != null) {
+      if (
+        present ||
+        (!run.settling &&
+          run.status !== 'running' &&
+          run.status !== 'queued' &&
+          run.outputMd != null)
+      ) {
         const full = present ?? run
         history.acceptRun(full)
         history.resultFailures.delete(run.id)

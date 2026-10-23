@@ -180,3 +180,53 @@ describe('timeline history coverage', () => {
     expect(history.rows()).toHaveLength(100)
   })
 })
+
+test('a formerly complete same-time run window exposes a lower-rank comment behind its cursor', async () => {
+  const runs: TimelineItem[] = Array.from({ length: 100 }, (_, i) => ({
+    kind: 'run',
+    createdAt: 100,
+    run: run({ id: `r-${i}`, createdAt: 100 }),
+  }))
+  const inserted: TimelineItem = {
+    kind: 'comment',
+    createdAt: 100,
+    comment: {
+      id: 'lower-rank',
+      ticketId: 'ticket',
+      authorKind: 'human',
+      author: 'user:765',
+      body: 'SAME_TIME_LOWER_COMMENT',
+      createdAt: 100,
+      runId: null,
+    },
+  }
+  let latest: TimelinePage = {
+    window: 'latest-v1',
+    items: runs,
+    hasMore: false,
+    nextBefore: null,
+    head: 'complete',
+    unchanged: false,
+  }
+  const history = new TimelineHistory(async (_id, options) =>
+    options?.before
+      ? {
+          window: 'latest-v1',
+          items: [inserted],
+          hasMore: false,
+          nextBefore: null,
+          head: 'older',
+          unchanged: false,
+        }
+      : latest,
+  )
+  await accept(history)
+  expect(history.snapshot.hasMore).toBe(false)
+  latest = { ...latest, hasMore: true, nextBefore: 'below-runs', head: 'new-lower-record' }
+  await accept(history)
+  expect(history.snapshot.hasMore).toBe(true)
+  const rows = await history.loadEarlier('ticket')
+  expect(rows).toHaveLength(101)
+  expect(rows[0]).toEqual(inserted)
+  expect(history.snapshot.hasMore).toBe(false)
+})

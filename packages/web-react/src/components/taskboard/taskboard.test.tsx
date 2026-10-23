@@ -1654,3 +1654,36 @@ test('an older settling result outside the latest window is hydrated after anoth
   expect(screen.queryByTestId('ticket-run-settling')).not.toBeInTheDocument()
   expect(screen.getByTestId('ticket-drawer-stop')).toBeEnabled()
 })
+
+test('nonempty paid output still settling is refreshed by exact old run id', async () => {
+  const ticket = sampleTicket({ status: 'running' })
+  const old = sampleRun({
+    id: 'settling-paid',
+    status: 'succeeded',
+    createdAt: 1,
+    outputMd: 'PAID_BODY_BEFORE_CONTROL_FINISH',
+    settling: true,
+  })
+  const current = sampleRun({ id: 'other-running', status: 'running', outputMd: null })
+  vi.spyOn(taskboardApi, 'getTicketDetail').mockResolvedValue({
+    ticket,
+    pipeline: null,
+    stage: sampleStage(),
+    execution: current,
+  })
+  vi.spyOn(taskboardApi, 'listTimelinePage').mockResolvedValue({
+    window: 'latest-v1',
+    items: [{ kind: 'run', createdAt: old.createdAt, run: old }],
+    head: 'fixture',
+    unchanged: false,
+    hasMore: false,
+    nextBefore: null,
+  })
+  const getRun = vi
+    .spyOn(taskboardApi, 'getRun')
+    .mockResolvedValue({ ...old, settling: false, outputMd: 'PAID_BODY_FINAL_END' })
+  renderDrawer(ticket)
+  expect(await screen.findByText('PAID_BODY_FINAL_END')).toBeInTheDocument()
+  expect(getRun).toHaveBeenCalledWith(auth, old.id)
+  expect(screen.queryByTestId('ticket-run-settling')).not.toBeInTheDocument()
+})

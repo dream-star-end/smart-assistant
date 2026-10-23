@@ -75,6 +75,7 @@ export class TimelineHistory {
   private sequence = 0
   private initialized = false
   private supported = false
+  private latestHasMore = false
   private loading = false
   private error = ''
   snapshot = {
@@ -154,6 +155,11 @@ export class TimelineHistory {
       ) {
         this.gaps.unshift({ id: ++this.sequence, before: page.nextBefore, stopAt: this.newest })
       }
+      // A same-time lower-rank insertion can turn a formerly complete latest
+      // window into a partial one while every returned key still overlaps.
+      if (!this.gaps.length && page.hasMore && !this.latestHasMore && page.nextBefore)
+        this.gaps = [{ id: ++this.sequence, before: page.nextBefore, stopAt: null }]
+      this.latestHasMore = page.hasMore
       this.head = page.head
       this.supported = true
       this.cover(items)

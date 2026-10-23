@@ -355,8 +355,10 @@ test('history read cannot combine an old empty payload with post-archive settled
     assert.equal(archived.run.outputMd, 'ARCHIVED_DURING_PROJECTION_END')
   } finally {
     resume?.()
-    leave()
-    taskboardRunControls.finish(control)
+    if (taskboardRunControls.getActiveForTicket(f.ticket.id) === control) {
+      leave()
+      taskboardRunControls.finish(control)
+    }
     await new Promise<void>((resolve) => server.close(() => resolve()))
     f.close()
   }
