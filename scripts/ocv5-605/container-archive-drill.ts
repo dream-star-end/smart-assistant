@@ -103,6 +103,20 @@ async function run(): Promise<void> {
   const verify = async (container: Docker.Container) => {
     const info = await container.inspect()
     assertOwnedProof(info as ProofInspect, container.id, runId)
+    const row = ledger.find((entry) => entry.id === container.id)
+    assert.ok(row, 'identity evidence must belong to this run ledger')
+    row.lastIdentityCheck = {
+      verifiedAt: new Date().toISOString(),
+      fullId: info.Id,
+      name: info.Name,
+      labels: {
+        [LABEL]: info.Config.Labels[LABEL],
+        'proof-ticket': info.Config.Labels['proof-ticket'],
+        'proof-uid': info.Config.Labels['proof-uid'],
+      },
+      running: info.State.Running,
+    }
+    await persist()
     return info
   }
   const create = async (event: string, oom = false) => {
