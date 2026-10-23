@@ -22,30 +22,31 @@ export function StageAgentSelect({
   const [refreshed, setRefreshed] = useState<BoardAgent[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const epoch = useRef(0)
+  const currentOwner = useRef({ auth, agents, active: true })
   useEffect(() => {
-    epoch.current += 1
+    const owner = { auth, agents, active: true }
+    currentOwner.current = owner
     setRefreshed(null)
     setLoading(false)
     setError('')
     return () => {
-      epoch.current += 1
+      owner.active = false
     }
   }, [auth, agents])
   const available = refreshed ?? agents
   const refresh = async () => {
-    const owner = epoch.current
+    const owner = currentOwner.current
     setLoading(true)
     setError('')
     try {
       const items = await taskboardApi.listAgents(auth)
-      if (owner === epoch.current) setRefreshed(items)
+      if (owner.active && currentOwner.current === owner) setRefreshed(items)
     } catch (e) {
-      if (owner === epoch.current && !(e instanceof AuthEpochStaleError)) {
+      if (owner.active && currentOwner.current === owner && !(e instanceof AuthEpochStaleError)) {
         setError(taskboardErrorMessage(e, '加载助手失败'))
       }
     } finally {
-      if (owner === epoch.current) setLoading(false)
+      if (owner.active && currentOwner.current === owner) setLoading(false)
     }
   }
   return (

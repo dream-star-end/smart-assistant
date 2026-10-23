@@ -109,7 +109,7 @@ type TicketJson = {
 }
 
 async function setup(base: string, db: TaskboardDb) {
-  const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+  const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
   assert.equal(created.status, 201, JSON.stringify(created.body))
   const projectId = (created.body.project as { id: string }).id
   const ticketRes = await call(base, 'POST', '/api/board/tickets', {
@@ -648,7 +648,7 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
   it('canceled / waiting_human 不进阶段列；waiting_human 只在 inbox', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       const waitingRes = await call(base, 'POST', '/api/board/tickets', {
         projectId,
@@ -694,7 +694,7 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
   it('未指定 ticketType 且仅有积压时选 backlog 最多的 type;显式指定仍尊重', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       const feat = await call(base, 'POST', '/api/board/tickets', {
         projectId,
@@ -723,7 +723,7 @@ describe('board 响应 allowedMoves / backlog / 默认 ticketType', () => {
   it('用户库场景: bug 2 张 backlog + chore 1 张 backlog + feature 1 张 waiting_human → 默认选 feature', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       for (const title of ['积压 bug 1', '积压 bug 2']) {
         const bug = await call(base, 'POST', '/api/board/tickets', {
@@ -782,7 +782,7 @@ describe('新建单据 status', () => {
   it('默认 backlog;human 可显式 ready;agent 显式 ready → 403', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
-      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5' })
+      const created = await call(base, 'POST', '/api/board/projects', { key: 'OCV5', name: 'V5', executionAgentId: 'main' })
       const projectId = (created.body.project as { id: string }).id
       const def = await call(base, 'POST', '/api/board/tickets', {
         projectId,

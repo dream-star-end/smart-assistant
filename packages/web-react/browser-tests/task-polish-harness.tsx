@@ -7,7 +7,7 @@ import { VirtualList } from '../src/components/sidebar/VirtualList'
 import { ToastProvider, TooltipProvider } from '../src/components/ui'
 import { ApiError } from '../src/lib/api'
 import { createMemoryAuthSession } from '../src/lib/authSession'
-import { taskboardApi, type Ticket, type PipelineStage, type TicketListQuery } from '../src/lib/taskboard'
+import { taskboardApi, type Ticket, type PipelineStage, type TicketListQuery, type TicketRun } from '../src/lib/taskboard'
 import type { FlatItem } from '../src/components/sidebar/flattenItems'
 
 const control = window as unknown as Record<string, unknown>
@@ -73,5 +73,78 @@ function Drawer() {
   control.releasePoll = () => { const done = serverRef.held; serverRef.held = null; done?.() }
   return <><output data-testid="client-status">{row.status}</output><output data-testid="client-version">{row.version}</output><output data-testid="writes">{writes}</output><TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={(next) => { setWrites((n) => n + 1); setRow(next) }} /></>
 }
+function ExecutionDrawer() {
+  const [row, setRow] = useState(() => ticket(3, 'running'))
+  const [open, setOpen] = useState(true)
+  const run = (id: string): TicketRun => ({ id, ticketId: row.id, stageId: stage.id, agentId: 'main',
+    status: 'running', trigger: 'manual', sessionKey: `exact-${id}`, startedAt: Date.now(), finishedAt: null,
+    durationMs: null, tokensIn: null, tokensOut: null, costUsd: null, costImprecise: null,
+    summary: null, outputMd: null, error: null, skipReason: null, leaseOwner: 'fixture-owner',
+    leaseExpiresAt: Date.now() + 60_000, createdAt: Date.now(), actualModels: [`actual-${id}`],
+    preview: { text: `真实执行进度 ${id}`, toolNames: ['Bash'], lastActivityAt: Date.now() } })
+  const [server] = useState(() => ({ row: ticket(3, 'running'), run: run('r1'), history: [] as TicketRun[],
+    holdReady: false, heldReady: null as null | (() => void), delayStop: true, heldStop: null as null | (() => void), holdTimeline: false,
+    heldTimeline: null as null | (() => void), readyVersions: [] as number[], patrolVersions: [] as number[] }))
+  const saveRun = (next: TicketRun) => { server.run = next; server.history = [...server.history.filter((r) => r.id !== next.id), next] }
+  if (!server.history.length) server.history = [server.run]
+  taskboardApi.getTicketDetail = async () => ({ ticket: { ...server.row }, stage, execution: { ...server.run, outputMd: null, summary: null } })
+  taskboardApi.listRuns = async () => ({ items: server.history.map((r) => ({ ...r })), total: server.history.length })
+  taskboardApi.listTimeline = async () => {
+    const items = server.history.map((r) => ({ kind: 'run' as const, createdAt: r.createdAt, run: { ...r } }))
+    if (server.holdTimeline) {
+      server.holdTimeline = false
+      await new Promise<void>((resolve) => { server.heldTimeline = resolve })
+    }
+    return items
+  }
+  taskboardApi.stopRun = async (_auth, _ticket, version, runId) => {
+    if (version !== server.row.version || runId !== server.run.id) throw new ApiError({ status: 409, code: 'run_changed', message: 'run changed' })
+    server.row = { ...server.row, status: 'blocked', blockedReason: '用户停止本次执行', version: version + 1 }
+    saveRun({ ...server.run, stopRequested: true })
+    const snapshot = { ok: true as const, state: 'stopping' as const, ticket: { ...server.row }, run: { ...server.run } }
+    if (server.delayStop) await new Promise<void>((resolve) => { server.heldStop = resolve })
+    return snapshot
+  }
+  taskboardApi.ready = async (_auth, _id, version) => {
+    if (version !== server.row.version) throw new ApiError({ status: 409, code: 'version_conflict', message: 'version conflict' })
+    server.readyVersions.push(version)
+    server.row = { ...server.row, status: 'ready', version: version + 1 }
+    const snapshot = { ok: true, ticket: { ...server.row } }
+    if (server.holdReady) await new Promise<void>((resolve) => { server.heldReady = resolve })
+    return snapshot
+  }
+  taskboardApi.patrol = async (_auth, _id, version) => {
+    if (version !== server.row.version) throw new ApiError({ status: 409, code: 'version_conflict', message: 'version conflict' })
+    server.patrolVersions.push(version)
+    server.row = { ...server.row, status: 'running', blockedReason: null, version: version + 1 }
+    saveRun(run('r2'))
+    return { ok: true, ticket: { ...server.row }, run: { ...server.run } }
+  }
+  control.holdReady = () => { server.holdReady = true }
+  control.isReadyHeld = () => !!server.heldReady
+  control.releaseReady = () => { const resolve = server.heldReady; server.heldReady = null; resolve?.() }
+  control.switchExecutionOwner = () => {
+    const next = ticket(4, 'running')
+    server.row = next
+    server.run = { ...run('other'), ticketId: next.id }
+    server.history = [server.run]
+    setRow(next)
+  }
+  control.executionStats = () => ({ runId: server.run.id, readyVersions: server.readyVersions, patrolVersions: server.patrolVersions })
+  control.isStopHeld = () => !!server.heldStop
+  control.releaseStop = () => { const resolve = server.heldStop; server.heldStop = null; resolve?.() }
+  control.immediateStop = () => { server.delayStop = false }
+  control.holdTimeline = () => { server.holdTimeline = true }
+  control.isTimelineHeld = () => !!server.heldTimeline
+  control.releaseTimeline = () => { const resolve = server.heldTimeline; server.heldTimeline = null; resolve?.() }
+  control.completeExecution = () => {
+    saveRun({ ...server.run, status: 'failed', error: 'USER_CANCELLED: stopped', stopRequested: false,
+      finishedAt: Date.now(), outputMd: '完整付费结果 FIRST_PAID_OUTPUT_END', preview: undefined })
+    document.dispatchEvent(new Event('visibilitychange'))
+  }
+  return <TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches}
+    agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}}
+    onDetailLoaded={setRow} onTicketUpdated={setRow} />
+}
 const scenario = new URLSearchParams(location.search).get('scenario')
-createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : <Drawer />}</ToastProvider></TooltipProvider>)
+createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : scenario === 'execution' ? <ExecutionDrawer /> : <Drawer />}</ToastProvider></TooltipProvider>)

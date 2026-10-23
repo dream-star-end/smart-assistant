@@ -975,6 +975,77 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   })
 
+  function gatewayWithAgentModel(model: string): any {
+    const gw = makeDelegateGateway()
+    const original = gw._getAgentsConfig
+    gw._getAgentsConfig = async () => {
+      const config = await original()
+      return { ...config, agents: config.agents.map((agent: any) => agent.id === 'coding-assistant' ? { ...agent, model } : agent) }
+    }
+    return gw
+  }
+
+  function traceRoute(gw: any, denied = false) {
+    let minted = 0
+    const admits: Array<{ model: string; engine: string }> = []
+    const originalAdmit = gw._delegateEngineBilling.admit
+    gw._acquireDelegateGrokRoute = async () => { minted += 1; return denied ? deniedMint() : okMint() }
+    gw._delegateEngineBilling.admit = async (input: any) => {
+      admits.push({ model: input.model, engine: input.engine })
+      return originalAdmit(input)
+    }
+    return () => {
+      const opts = gw.sessions.getOrCreateArgs[0]
+      return { minted, admits, model: opts?.model, agentModel: opts?.agent?.model,
+        canonicalModel: opts?.executionAuthority?.canonicalModel, engine: opts?.executionAuthority?.engine,
+        grokRoute: gw.sessions.submitExtras[0]?.grokRoute ?? null }
+    }
+  }
+
+  test('ordinary HTTP cannot inject taskboard-only execution fields', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const observations: unknown[] = []
+      for (const forged of [false, true]) {
+        const gw = gatewayWithAgentModel('deepseek-v4-flash')
+        const trace = traceRoute(gw)
+        let captured: any
+        const original = gw._runDelegateTask.bind(gw)
+        gw._runDelegateTask = async (input: any) => { captured = { ...input }; return original(input) }
+        const response = await runDelegate(gw, 'coding-assistant', { goal: 'ordinary HTTP policy boundary', sourceAgent: 'main',
+          ...(forged ? { modelPolicy: 'taskboard-stage-agent-auto', delegationGuardOwnerKey: 'taskboard-run:forged', taskboardControl: { rootSessionKey: 'forged-root' } } : {}) })
+        assert.equal(response.status, 200, JSON.stringify(response.body))
+        assert.equal(captured.modelPolicy, undefined)
+        assert.equal(captured.delegationGuardOwnerKey, undefined)
+        assert.equal(captured.taskboardControl, undefined)
+        assert.equal(gw.sessions.getOrCreateArgs[0].channel, 'delegate')
+        assert.equal(gw.sessions.getOrCreateArgs[0].model, 'grok-build')
+        observations.push(trace())
+      }
+      assert.deepEqual(observations[1], observations[0])
+    })
+  })
+
+  for (const denied of [false, true]) {
+    test(`taskboard auto equals ordinary route, denied=${denied}`, async () => {
+      installCatalog({ extraModels: GROK_ROWS })
+      await withFlags({ authority: true, exempt: true }, async () => {
+        const ordinary = gatewayWithAgentModel('auto')
+        const taskboard = gatewayWithAgentModel('auto')
+        const ordinaryTrace = traceRoute(ordinary, denied)
+        const taskboardTrace = traceRoute(taskboard, denied)
+        const baseline = await runDelegate(ordinary, 'coding-assistant', { goal: 'ordinary auto reference', sourceAgent: 'main' })
+        const actual = await taskboard._runTaskboardDelegate({ agentId: 'coding-assistant', goal: 'taskboard auto equivalence',
+          sessionKey: `agent:coding-assistant:taskboard:auto:stage:${denied}`, timeoutSec: 60 })
+        assert.equal(baseline.status, 200, JSON.stringify(baseline.body))
+        assert.equal(actual.ok, true, JSON.stringify(actual))
+        assert.equal(ordinary.sessions.getOrCreateCalls, 1)
+        assert.equal(taskboard.sessions.getOrCreateCalls, 1)
+        assert.deepEqual(taskboardTrace(), ordinaryTrace())
+      })
+    })
+  }
+
   test('decideLocalExecution:preferredModels 排在 agent.model 之前,但不可路由时静默跳过', () => {
     const v = view([row('glm-5.2', 'ccb'), row('grok-build', 'grok')])
     const exempt = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv

@@ -1047,6 +1047,7 @@ export function TaskboardView({
         onTicketUpdated={board.replaceTicket}
         onDetailLoaded={setDetailTicket}
         onOpenSession={onOpenSession}
+        onConfigureStage={() => { setReviseOpen(false); onOpenTicket(null); setStageSettingsOpen(true) }}
       />
       {confirmEl}
       {promptEl}

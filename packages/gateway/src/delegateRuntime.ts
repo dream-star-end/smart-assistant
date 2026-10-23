@@ -2137,7 +2137,7 @@ export async function _runDelegateTaskCore(
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         if (e.kind === 'error') {
           error = e.error
-          cancelled = e.errorCode === 'USER_CANCELLED'
+          cancelled = e.errorCode === 'user_cancelled'
           if (cancelled && input.taskboardControl?.rootSessionKey === sessionKey) input.taskboardControl.requestStop()
         }
         if (streamProgress) emitProgress(progressBlock)

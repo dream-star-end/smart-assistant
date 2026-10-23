@@ -10,7 +10,7 @@ test('a never ending signed request body cannot keep Stop waiting for a pending 
   const control = registry.begin('run-body', 'ticket', 'owner', 'root-body')
   const leaveRoot = control.enter('root-body')
   const leavePending = control.enterPending('root-body')
-  const req = Object.assign(new EventEmitter(), { complete: false, destroyed: false, destroy() { this.destroyed = true; this.emit('aborted') } })
+  const req = Object.assign(new EventEmitter(), { complete: false, destroyed: false, destroy(this: EventEmitter & { destroyed: boolean }) { this.destroyed = true; this.emit('aborted') } })
   const body = readTaskboardDelegateBody(req as unknown as IncomingMessage, () => new Promise(() => {}), control).finally(leavePending)
   control.requestStop()
   await assert.rejects(body, TaskboardCancelledError)

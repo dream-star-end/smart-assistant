@@ -84,6 +84,67 @@ test('task polish user flows (real Chromium, isolated)', { timeout: 240_000 }, a
           assert.deepEqual(errors, [])
         } finally { await context.close() }
       })
+      await t.test(`${width}: stop, paid result and retry fence a delayed old stop receipt`, async () => {
+        const { context, page, errors } = await pageFor('scenario=execution')
+        try {
+          await page.getByText('执行模型：actual-r1', { exact: true }).waitFor()
+          await page.getByText('真实执行进度 r1', { exact: true }).waitFor()
+          await page.getByTestId('ticket-drawer-stop').click()
+          await page.waitForFunction(() => window.isStopHeld())
+          assert.equal(await page.getByTestId('ticket-drawer-stop').isDisabled(), true)
+          await page.evaluate(() => window.completeExecution())
+          await page.getByTestId('ticket-drawer-retry').waitFor()
+          assert.equal(await page.getByTestId('ticket-drawer-stop').count(), 0)
+          await page.getByText('完整付费结果 FIRST_PAID_OUTPUT_END', { exact: true }).waitFor()
+          await page.getByTestId('ticket-drawer-retry').click()
+          await page.getByText('执行模型：actual-r2', { exact: true }).waitFor()
+          await page.getByTestId('ticket-drawer-stop').waitFor()
+          assert.equal(await page.getByTestId('ticket-drawer-stop').isDisabled(), false)
+          await page.evaluate(() => window.releaseStop())
+          await page.waitForTimeout(100)
+          assert.equal(await page.getByTestId('ticket-drawer-stop').isDisabled(), false)
+          assert.deepEqual(await page.evaluate(() => window.executionStats()), { runId: 'r2', readyVersions: [2], patrolVersions: [3] })
+          assert.deepEqual(errors, [])
+        } finally { await context.close() }
+      })
+      await t.test(`${width}: slow timeline cannot regress a known same-version terminal execution`, async () => {
+        const { context, page, errors } = await pageFor('scenario=execution')
+        try {
+          await page.getByTestId('ticket-drawer-stop').waitFor()
+          await page.evaluate(() => { window.immediateStop(); window.holdTimeline() })
+          await page.getByTestId('ticket-drawer-stop').click()
+          await page.waitForFunction(() => window.isTimelineHeld())
+          await page.evaluate(() => window.completeExecution())
+          await page.getByTestId('ticket-drawer-retry').waitFor()
+          await page.evaluate(() => window.releaseTimeline())
+          await page.waitForTimeout(100)
+          assert.equal(await page.getByTestId('ticket-drawer-stop').count(), 0)
+          assert.equal(await page.getByTestId('ticket-drawer-retry').isDisabled(), false)
+          assert.deepEqual(errors, [])
+        } finally { await context.close() }
+      })
+      await t.test(`${width}: switching ticket fences a held retry approval before patrol`, async () => {
+        const { context, page, errors } = await pageFor('scenario=execution')
+        try {
+          await page.getByTestId('ticket-drawer-stop').waitFor()
+          await page.evaluate(() => window.immediateStop())
+          await page.getByTestId('ticket-drawer-stop').click()
+          await page.evaluate(() => window.completeExecution())
+          await page.getByTestId('ticket-drawer-retry').waitFor()
+          await page.evaluate(() => window.holdReady())
+          await page.getByTestId('ticket-drawer-retry').click()
+          await page.waitForFunction(() => window.isReadyHeld())
+          await page.evaluate(() => window.switchExecutionOwner())
+          await page.getByText('执行模型：actual-other', { exact: true }).waitFor()
+          await page.getByTestId('ticket-drawer-edit').click()
+          await page.getByRole('textbox', { name: '单据标题', exact: true }).fill('新票草稿')
+          await page.evaluate(() => window.releaseReady())
+          await page.waitForTimeout(100)
+          assert.deepEqual((await page.evaluate(() => window.executionStats())).patrolVersions, [])
+          assert.equal(await page.getByRole('textbox', { name: '单据标题', exact: true }).inputValue(), '新票草稿')
+          assert.deepEqual(errors, [])
+        } finally { await context.close() }
+      })
       await t.test(`${width}: completion refresh keeps drafts and fences old owner replies`, async () => {
         const { context, page, errors } = await pageFor('scenario=drawer')
         try {

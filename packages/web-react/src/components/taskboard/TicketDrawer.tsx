@@ -13,6 +13,7 @@ import {
   type TicketRun,
   type TimelineItem,
   assigneeLabel,
+  boardErrorCode,
   isVersionConflict,
   mergeTimelineSources,
   resolveOriginSessionId,
@@ -119,6 +120,7 @@ export function TicketDrawer({
   onTicketUpdated,
   onDetailLoaded,
   onOpenSession,
+  onConfigureStage,
 }: {
   auth: AuthSession
   ticket: Ticket | null
@@ -139,6 +141,7 @@ export function TicketDrawer({
    */
   onDetailLoaded?: (ticket: Ticket) => void
   onOpenSession?: (sessionId: string) => void
+  onConfigureStage?: () => void
 }) {
   const toast = useToast()
   const [detail, setDetail] = useState<Ticket | null>(null)
@@ -157,6 +160,7 @@ export function TicketDrawer({
   const [commenting, setCommenting] = useState(false)
   const [patrolling, setPatrolling] = useState(false)
   const [execution, setExecution] = useState<TicketRun | null>(null)
+  const [executionNeedsSetup, setExecutionNeedsSetup] = useState(false)
   const [stopState, setStopState] = useState<'requesting' | 'stopping' | null>(null)
 
   const ownerLookup = ticketRef || ticket?.identifier || ticket?.id || null
@@ -183,6 +187,7 @@ export function TicketDrawer({
     if (patrolling) setPatrolling(false)
     if (execution) setExecution(null)
     if (stopState) setStopState(null)
+    if (executionNeedsSetup) setExecutionNeedsSetup(false)
     paintedOwnerRef.current = open ? ownerLookup : null
   }
   const current = belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
@@ -200,7 +205,8 @@ export function TicketDrawer({
   const applyExecution = useCallback((next: TicketRun | null | undefined) => {
     if (next === undefined) return false
     const previous = executionRef.current
-    const knownTerminal = next && timelineRef.current.some((item) => item.kind === 'run' && item.run.id === next.id && item.run.status !== 'running' && item.run.status !== 'queued')
+    const previousTerminal = previous && next && previous.id === next.id && previous.status !== 'running' && previous.status !== 'queued'
+    const knownTerminal = previousTerminal || next && timelineRef.current.some((item) => item.kind === 'run' && item.run.id === next.id && item.run.status !== 'running' && item.run.status !== 'queued')
     if (next && knownTerminal && (next.status === 'running' || next.status === 'queued')) return false
     executionRef.current = next
     setExecution(next)
@@ -213,8 +219,9 @@ export function TicketDrawer({
   const currentStage = detailStage?.id === current?.stageId
     ? detailStage
     : stages.find((stage) => stage.id === current?.stageId) ?? null
-  const canRetry = !activeExecution && !!execution && !!current && execution.stageId === current.stageId && (current.status === 'blocked' || current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
-  const canStart = !canRetry && !activeExecution && !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const needsSetup = currentStage?.kind === 'ai' && (!currentStage.agentId || executionNeedsSetup)
+  const canRetry = !needsSetup && !activeExecution && !!execution && !!current && execution.stageId === current.stageId && (current.status === 'blocked' || current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const canStart = !needsSetup && !canRetry && !activeExecution && !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
   const reads = useMemo(() => {
     const details = new Map<string, ReturnType<typeof taskboardApi.getTicketDetail>>()
     const timelines = new Map<string, ReturnType<typeof taskboardApi.listTimeline>>()
@@ -530,6 +537,7 @@ export function TicketDrawer({
         void refreshAfterWrite(current.identifier, gen)
         return
       }
+      if (['stage_agent_unavailable', 'stage_model_unavailable'].includes(boardErrorCode(e) ?? '')) setExecutionNeedsSetup(true)
       toast(taskboardErrorMessage(e, '启动巡检失败'), 'error')
     } finally {
       if (ownerGen.current === gen) setPatrolling(false)
@@ -539,10 +547,12 @@ export function TicketDrawer({
   const stopRun = async () => {
     if (!current || !activeExecution || stopState) return
     const gen = ownerGen.current
+    const requestedRunId = activeExecution.id
+    const stillOwnsRun = () => executionRef.current?.id === requestedRunId && (executionRef.current.status === 'running' || executionRef.current.status === 'queued')
     setStopState('requesting')
     try {
-      const out = await taskboardApi.stopRun(auth, current.id, current.version, activeExecution.id)
-      if (ownerGen.current !== gen) return
+      const out = await taskboardApi.stopRun(auth, current.id, current.version, requestedRunId)
+      if (ownerGen.current !== gen || !stillOwnsRun()) return
       if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
         currentRef.current = out.ticket
         setDetail(out.ticket)
@@ -552,7 +562,7 @@ export function TicketDrawer({
       toast(out.state === 'stopping' ? '已请求停止，正在保留输出并收尾' : '本次执行已结束', 'success')
       void refreshAfterWrite(current.identifier, gen)
     } catch (error) {
-      if (ownerGen.current !== gen) return
+      if (ownerGen.current !== gen || !stillOwnsRun()) return
       setStopState(null)
       if (error instanceof AuthEpochStaleError) return
       toast(taskboardErrorMessage(error, '停止执行失败，请稍后重试'), 'error')
@@ -685,6 +695,12 @@ export function TicketDrawer({
           )}
 
           {actions}
+          {needsSetup && (
+            <div className="rounded-lg border border-border bg-hover px-3 py-2 text-body">
+              <p>执行助手待配置，请先选择已安装且可用的助手。</p>
+              {onConfigureStage && <Button type="button" className="mt-2 min-h-11" variant="secondary" data-testid="ticket-configure-execution" onClick={onConfigureStage}>配置执行助手</Button>}
+            </div>
+          )}
 
           <div className="flex flex-wrap gap-1">
             {!editing && current.status !== 'done' && current.status !== 'canceled' && (
@@ -699,12 +715,12 @@ export function TicketDrawer({
               </Button>
             )}
             {activeExecution && (
-              <Button type="button" size="sm" variant="danger" data-testid="ticket-drawer-stop" loading={stopState === 'requesting'} disabled={stopState !== null} onClick={() => void stopRun()}>
+              <Button type="button" size="sm" variant="danger" className="min-h-11" data-testid="ticket-drawer-stop" loading={stopState === 'requesting'} disabled={stopState !== null} onClick={() => void stopRun()}>
                 {stopState === 'requesting' ? '请求停止…' : stopState === 'stopping' ? '停止处理中' : '停止本次执行'}
               </Button>
             )}
             {canRetry && (
-              <Button type="button" size="sm" variant="secondary" loading={patrolling} data-testid="ticket-drawer-retry" onClick={() => void runPatrol(true)}>
+              <Button type="button" size="sm" variant="secondary" className="min-h-11" loading={patrolling} data-testid="ticket-drawer-retry" onClick={() => void runPatrol(true)}>
                 重新执行本阶段
               </Button>
             )}
@@ -715,6 +731,7 @@ export function TicketDrawer({
                 variant="secondary"
                 loading={patrolling}
                 data-testid="ticket-drawer-patrol"
+                className="min-h-11"
                 onClick={() => void runPatrol()}
               >
                 {current.status === 'waiting_human' ? '重新执行本阶段' : '开始执行'}
