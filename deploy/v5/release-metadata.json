@@ -187,7 +187,10 @@
     "0316_commercial_literature_captcha_requests",
     "0317_commercial_muse_media",
     "0318_commercial_box_gpt_6_astra_pro",
-    "0319_commercial_muse_billing"
+    "0319_commercial_muse_billing",
+    "0322_minimax_voices",
+    "0324_media_studio",
+    "0325_media_studio_music"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
