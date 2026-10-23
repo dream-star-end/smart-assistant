@@ -180,6 +180,18 @@ export type SessionCheck = 'ok' | 'superseded' | 'unknown'
 
 const ORPHAN_SWEEP_MS = 60_000
 
+/**
+ * Deterministic Muse job id for an idempotent caller (media studio, OCV5-591): a UUIDv5-shaped id
+ * derived from a stable execution key, so a retried submission maps to the same job.
+ */
+export function deterministicMuseJobId(executionKey: string): string {
+  const h = createHash('sha1').update('oc-studio-muse\0').update(executionKey).digest()
+  h[6] = (h[6]! & 0x0f) | 0x50
+  h[8] = (h[8]! & 0x3f) | 0x80
+  const x = h.subarray(0, 16).toString('hex')
+  return `mj_${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`
+}
+
 export class MuseBridgeHub {
   private readonly store: MuseStore
   private readonly root: string
@@ -564,7 +576,26 @@ export class MuseBridgeHub {
 
   // ── container side ───────────────────────────────────────────────────────
 
-  async submit(userId: string, containerId: string | null, spec: MuseJobSpec): Promise<string> {
+  async submit(
+    userId: string,
+    containerId: string | null,
+    spec: MuseJobSpec,
+    opts: { jobId?: string } = {},
+  ): Promise<string> {
+    // Idempotent submission (OCV5-591 A0): a caller-chosen deterministic id that already exists for
+    // this user returns that job — never a second queue entry, never a second charge.
+    if (opts.jobId !== undefined) {
+      if (!/^mj_[0-9a-f-]{36}$/.test(opts.jobId)) {
+        throw new MuseError(400, 'MUSE_INVALID_INPUT', 'invalid job id')
+      }
+      const live = this.jobs.get(opts.jobId)
+      if (live) {
+        if (live.userId !== userId)
+          throw new MuseError(409, 'MUSE_JOB_ID_TAKEN', 'job id belongs to another account')
+        return live.id
+      }
+      if (await this.store.findJob(userId, opts.jobId)) return opts.jobId
+    }
     if (!this.isAllowed(userId)) {
       throw new MuseError(
         403,
@@ -598,7 +629,7 @@ export class MuseBridgeHub {
     this.reservedByUser.set(userId, { count: own.count + 1, credits: own.credits + price })
     try {
       // Other admissions of this account in this process, not yet in the database.
-      return await this.admit(userId, containerId, spec, pending, price, own.credits)
+      return await this.admit(userId, containerId, spec, pending, price, own.credits, opts.jobId)
     } finally {
       this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1
@@ -626,6 +657,7 @@ export class MuseBridgeHub {
     pending: number,
     price: bigint,
     admittingCredits: bigint,
+    fixedId?: string,
   ): Promise<string> {
     const counts = await this.store.countRecent(userId, spec.kind)
     const [perHour, perDay] =
@@ -657,23 +689,33 @@ export class MuseBridgeHub {
       const open = await this.store.openCredits(userId)
       await this.billing.ensureBalance(userId, price + open + admittingCredits)
     }
-    const id = `mj_${randomUUID()}`
-    await this.store.insertJob({
-      id,
-      userId,
-      containerId,
-      kind: spec.kind,
-      promptSha256: createHash('sha256').update(spec.prompt).digest(),
-      promptPreview: spec.prompt.slice(0, 500),
-      priceCredits: price,
-      params: {
-        orientation: spec.orientation ?? null,
-        aspect_ratio: spec.aspect_ratio ?? null,
-        image_format: spec.image_format ?? null,
-        source_count: spec.source_images?.length ?? 0,
-        resumed: Boolean(spec.resume_snapshot_id),
-      },
-    })
+    const id = fixedId ?? `mj_${randomUUID()}`
+    try {
+      await this.store.insertJob({
+        id,
+        userId,
+        containerId,
+        kind: spec.kind,
+        promptSha256: createHash('sha256').update(spec.prompt).digest(),
+        promptPreview: spec.prompt.slice(0, 500),
+        priceCredits: price,
+        params: {
+          orientation: spec.orientation ?? null,
+          aspect_ratio: spec.aspect_ratio ?? null,
+          image_format: spec.image_format ?? null,
+          source_count: spec.source_images?.length ?? 0,
+          resumed: Boolean(spec.resume_snapshot_id),
+        },
+      })
+    } catch (err) {
+      // A concurrent submission of the same deterministic id (the other A/B slot, a retry) won the
+      // insert: hand back that job instead of queuing a duplicate.
+      if (fixedId && (err as { code?: string }).code === '23505') {
+        if (await this.store.findJob(userId, fixedId)) return fixedId
+        throw new MuseError(409, 'MUSE_JOB_ID_TAKEN', 'job id belongs to another account')
+      }
+      throw err
+    }
     const now = this.now()
     const job: HubJob = {
       id,

@@ -1,0 +1,427 @@
+// OCV5-591 A2-1a — advanceProject(): read the project under its advisory lock, ask decide() what to
+// do, and apply it in the same transaction. Only one process advances a project at a time; any
+// other caller returns immediately (the lock holder will see the new state on its next pass).
+
+import { randomUUID } from 'node:crypto'
+import type { Pool, PoolClient } from 'pg'
+
+import type { ProviderRegistry } from '../providers/registry.js'
+import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../providers/types.js'
+import { enqueueStudioTask } from '../queue.js'
+import { appendStudioEvent } from '../store.js'
+import { reserveBudget } from './budget.js'
+import { type Action, type DState, type Dispatch, decide } from './decide.js'
+import { type BibleEntry, biblePrompt, framePrompt, videoPrompt } from './prompts.js'
+
+export interface AdvanceDeps {
+  pool: Pool
+  providers: ProviderRegistry
+}
+
+const REPRESENTATIVE_OP: Record<'image' | 'video' | 'voice' | 'music', MediaOp> = {
+  image: 'image.generate',
+  video: 'video.from_image',
+  voice: 'voice.tts',
+  music: 'music.generate',
+}
+
+interface ProjectRow {
+  id: string
+  user_id: string
+  status: DState['status']
+  aspect: '16:9' | '9:16' | '1:1'
+  settings: Record<string, unknown>
+}
+
+export async function loadState(
+  client: PoolClient,
+  deps: AdvanceDeps,
+  projectId: string,
+): Promise<{
+  project: ProjectRow
+  state: DState
+  bible: Array<BibleEntry & { id: string; blobSha: string | null }>
+  specs: Map<string, Record<string, unknown>>
+  lineText: Map<string, string>
+} | null> {
+  const p = await client.query<ProjectRow>(
+    `SELECT id::text AS id, user_id::text AS user_id, status, aspect, settings
+       FROM studio_projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+    [projectId],
+  )
+  const project = p.rows[0]
+  if (!project) return null
+  const [shots, lines, assets, takes, tasks] = await Promise.all([
+    client.query<{
+      id: string
+      ordinal: number
+      status: string
+      active_take_id: string | null
+      spec: Record<string, unknown>
+    }>(
+      `SELECT id::text AS id, ordinal, status, active_take_id::text AS active_take_id, spec
+         FROM studio_shots WHERE project_id = $1`,
+      [projectId],
+    ),
+    client.query<{ id: string; status: string; active_take_id: string | null; text: string }>(
+      `SELECT id::text AS id, status, active_take_id::text AS active_take_id, text
+         FROM studio_lines WHERE project_id = $1`,
+      [projectId],
+    ),
+    client.query<{
+      id: string
+      kind: string
+      locked: boolean
+      blob_sha: string | null
+      name: string
+      descriptor: string
+    }>(
+      `SELECT id::text AS id, kind, locked, blob_sha, name, descriptor
+         FROM studio_assets WHERE project_id = $1 AND user_id = $2`,
+      [projectId, project.user_id],
+    ),
+    client.query<{
+      id: string
+      owner_kind: string
+      owner_id: string
+      version: number
+      provider: string
+      status: string
+      blob_sha: string | null
+    }>(
+      `SELECT id::text AS id, owner_kind, owner_id::text AS owner_id, version, provider, status, blob_sha
+         FROM studio_takes WHERE project_id = $1`,
+      [projectId],
+    ),
+    client.query<{ kind: string; n: string }>(
+      `SELECT kind, COUNT(*)::text AS n FROM studio_tasks
+        WHERE project_id = $1 AND status IN ('queued', 'leased') GROUP BY kind`,
+      [projectId],
+    ),
+  ])
+  const user = { id: project.user_id }
+  const can = (k: keyof typeof REPRESENTATIVE_OP) =>
+    deps.providers.candidates(k, REPRESENTATIVE_OP[k], user, { includeOffline: true }).length > 0
+  const inflight = tasks.rows.filter((t) => t.kind === 'gen').reduce((s, t) => s + Number(t.n), 0)
+  const settings = project.settings ?? {}
+  const narration = settings.narration as { voiceId?: unknown } | null | undefined
+  const state: DState = {
+    status: project.status,
+    hasPlanTask: tasks.rows.some((t) => t.kind === 'plan'),
+    inflight,
+    shots: shots.rows.map((s) => ({
+      id: s.id,
+      ordinal: s.ordinal,
+      status: s.status as DState['shots'][number]['status'],
+      activeTakeId: s.active_take_id,
+      frameTakeId: typeof s.spec?.frameTakeId === 'string' ? s.spec.frameTakeId : null,
+    })),
+    lines: lines.rows.map((l) => ({
+      id: l.id,
+      status: l.status as DState['lines'][number]['status'],
+      activeTakeId: l.active_take_id,
+    })),
+    assets: assets.rows.map((a) => ({
+      id: a.id,
+      kind: a.kind as DState['assets'][number]['kind'],
+      locked: a.locked,
+      blobSha: a.blob_sha,
+    })),
+    takes: takes.rows.map((t) => ({
+      id: t.id,
+      ownerKind: t.owner_kind as DState['takes'][number]['ownerKind'],
+      ownerId: t.owner_id,
+      version: t.version,
+      provider: t.provider,
+      status: t.status as DState['takes'][number]['status'],
+      blobSha: t.blob_sha,
+    })),
+    narrationVoiceId: typeof narration?.voiceId === 'string' ? narration.voiceId : null,
+    musicSkippedNoted: settings.musicSkippedNoted === true,
+    canDispatch: {
+      image: can('image'),
+      video: can('video'),
+      voice: can('voice'),
+      music: can('music'),
+    },
+  }
+  const bible = assets.rows
+    .filter((a) => a.kind === 'character' || a.kind === 'scene' || a.kind === 'style')
+    .map((a) => ({
+      id: a.id,
+      kind: a.kind as BibleEntry['kind'],
+      name: a.name,
+      descriptor: a.descriptor,
+      blobSha: a.blob_sha,
+    }))
+  return {
+    project,
+    state,
+    bible,
+    specs: new Map(shots.rows.map((s) => [s.id, s.spec ?? {}])),
+    lineText: new Map(lines.rows.map((l) => [l.id, l.text])),
+  }
+}
+
+function buildRequest(
+  d: Dispatch,
+  ctx: NonNullable<Awaited<ReturnType<typeof loadState>>>,
+): MediaRequest {
+  const aspect = ctx.project.aspect
+  const inputs = d.inputs.map((i) => ({ role: i.role, blobSha: i.blobSha }))
+  if (d.ownerKind === 'bible') {
+    const entry = ctx.bible.find((b) => b.id === d.ownerId)!
+    return { op: d.op, prompt: biblePrompt(entry, aspect), aspect }
+  }
+  if (d.ownerKind === 'shot_frame') {
+    const spec = ctx.specs.get(d.ownerId) ?? {}
+    return { op: d.op, prompt: framePrompt(spec, ctx.bible, aspect), aspect, inputs }
+  }
+  if (d.ownerKind === 'shot_video') {
+    const spec = ctx.specs.get(d.ownerId) ?? {}
+    const dur = Number(spec.durationSec)
+    return {
+      op: d.op,
+      prompt: videoPrompt(spec),
+      aspect,
+      inputs,
+      ...(Number.isFinite(dur) ? { durationSec: dur } : {}),
+    }
+  }
+  // line
+  return {
+    op: d.op,
+    text: ctx.lineText.get(d.ownerId) ?? '',
+    voiceId: ctx.state.narrationVoiceId ?? '',
+  }
+}
+
+const OWNER_TABLE: Record<string, string> = {
+  // A project's music take is owned by the project itself (OCV5-591 M1).
+  music: 'studio_projects',
+  bible: 'studio_assets',
+  shot_frame: 'studio_shots',
+  shot_video: 'studio_shots',
+  line: 'studio_lines',
+}
+
+/** Dispatch one generation: reserve budget, create the take, enqueue the task bound to it. */
+async function dispatchOne(
+  client: PoolClient,
+  deps: AdvanceDeps,
+  ctx: NonNullable<Awaited<ReturnType<typeof loadState>>>,
+  d: Dispatch,
+): Promise<'queued' | 'budget' | 'no_provider'> {
+  return dispatchRequest(
+    client,
+    deps,
+    { id: ctx.project.id, userId: ctx.project.user_id },
+    d,
+    buildRequest(d, ctx),
+  )
+}
+
+/**
+ * The one dispatch path (also used for user-made voices): pick a provider, reserve its worst case,
+ * create the take under the owner's lock and enqueue the task bound to it.
+ */
+export async function dispatchRequest(
+  client: PoolClient,
+  deps: AdvanceDeps,
+  project: { id: string; userId: string },
+  d: Pick<Dispatch, 'ownerKind' | 'ownerId' | 'op' | 'exclude'> & {
+    /** Only this provider (the source the user picked); no fallback to another one. */
+    only?: string
+  },
+  req: MediaRequest,
+): Promise<'queued' | 'budget' | 'no_provider'> {
+  const ctx = { project: { id: project.id, user_id: project.userId } }
+  const user = { id: project.userId }
+  const provider = deps.providers
+    .candidates(kindOf(d.op), d.op, user, { includeOffline: true, exclude: d.exclude })
+    .filter((p) => !d.only || p.id === d.only)[0]
+  if (!provider) return 'no_provider'
+  const est = provider.estimateMaxCost(req)
+  if (!(await reserveBudget(client, ctx.project.id, est))) return 'budget'
+  // Lock the owner so two dispatches can never compute the same next version (plan r1 P1-2).
+  await client.query(`SELECT 1 FROM ${OWNER_TABLE[d.ownerKind]} WHERE id = $1 FOR UPDATE`, [
+    d.ownerId,
+  ])
+  const v = await client.query<{ next: number }>(
+    'SELECT COALESCE(MAX(version), 0) + 1 AS next FROM studio_takes WHERE owner_kind = $1 AND owner_id = $2',
+    [d.ownerKind, d.ownerId],
+  )
+  const version = v.rows[0]!.next
+  const takeId = randomUUID()
+  // The default model for this op (a provider's overall default may not run it, e.g. MiniMax TTS
+  // vs voice design); frozen into the task so a re-claim runs the same model.
+  const model = req.model ?? defaultModelFor(provider, d.op)?.id ?? ''
+  await client.query(
+    `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, inputs, prompt, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, 'queued')`,
+    [
+      takeId,
+      ctx.project.id,
+      d.ownerKind,
+      d.ownerId,
+      version,
+      provider.id.slice(0, 32),
+      model.slice(0, 64),
+      d.op.slice(0, 32),
+      JSON.stringify({ inputs: req.inputs ?? [] }),
+      (req.prompt ?? req.text ?? null)?.slice(0, 8000) ?? null,
+    ],
+  )
+  const affinity = provider.affinity()
+  await enqueueStudioTask(client, {
+    projectId: ctx.project.id,
+    kind: 'gen',
+    idempotencyKey: `gen:${d.ownerKind}:${d.ownerId}:v${version}`,
+    payload: {
+      takeId,
+      providerId: provider.id,
+      ownerKind: d.ownerKind,
+      ownerId: d.ownerId,
+      request: { ...req, model },
+      booked: '0',
+    },
+    reservedCredits: est,
+    ...(affinity === 'muse' ? { affinity: 'muse' as const } : {}),
+  })
+  await appendStudioEvent(client, ctx.project.id, 'take.queued', {
+    ownerKind: d.ownerKind,
+    ownerId: d.ownerId,
+    provider: provider.id,
+    version,
+  })
+  return 'queued'
+}
+
+async function apply(
+  client: PoolClient,
+  deps: AdvanceDeps,
+  ctx: NonNullable<Awaited<ReturnType<typeof loadState>>>,
+  actions: Action[],
+): Promise<void> {
+  const id = ctx.project.id
+  for (const a of actions) {
+    if (a.type === 'enqueue_plan') {
+      const rev = await client.query<{ rev: number }>(
+        'SELECT rev FROM studio_projects WHERE id = $1',
+        [id],
+      )
+      await enqueueStudioTask(client, {
+        projectId: id,
+        kind: 'plan',
+        idempotencyKey: `plan:${id}:${rev.rows[0]!.rev}`,
+      })
+    } else if (a.type === 'dispatch') {
+      const r = await dispatchOne(client, deps, ctx, a.dispatch)
+      if (r === 'budget') {
+        await client.query(
+          `UPDATE studio_projects SET status = 'paused', settings = settings || '{"pausedReason":"budget"}'::jsonb,
+                  rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+          [id],
+        )
+        await appendStudioEvent(client, id, 'budget.exhausted', {
+          message: '预算不够下一步了，已暂停。调高预算后点“继续”。',
+        })
+        return
+      }
+      if (r === 'no_provider') {
+        const d = a.dispatch
+        if (d.ownerKind === 'shot_frame' || d.ownerKind === 'shot_video') {
+          await client.query(`UPDATE studio_shots SET status = 'needs_user' WHERE id = $1`, [
+            d.ownerId,
+          ])
+        } else if (d.ownerKind === 'line') {
+          await client.query(`UPDATE studio_lines SET status = 'failed' WHERE id = $1`, [d.ownerId])
+        }
+        await appendStudioEvent(client, id, 'provider.exhausted', {
+          ownerKind: d.ownerKind,
+          ownerId: d.ownerId,
+          message: '可用的服务都试过了，这一步需要你看一下。',
+        })
+        if (d.ownerKind === 'bible') {
+          // Nothing marks an asset as stuck and every frame waits on it: hand the project over.
+          await client.query(
+            `UPDATE studio_projects SET status = 'awaiting_user',
+                    settings = settings || '{"awaitingReason":"needs_user"}'::jsonb,
+                    rev = rev + 1, updated_at = NOW()
+              WHERE id = $1 AND status = 'running'`,
+            [id],
+          )
+          return
+        }
+      }
+    } else if (a.type === 'adopt_video') {
+      await client.query(
+        `UPDATE studio_shots SET active_take_id = $2, status = 'ready'
+          WHERE id = $1 AND project_id = $3 AND status NOT IN ('needs_user', 'failed')`,
+        [a.shotId, a.takeId, id],
+      )
+    } else if (a.type === 'shot_status') {
+      await client.query('UPDATE studio_shots SET status = $2 WHERE id = $1 AND project_id = $3', [
+        a.shotId,
+        a.status,
+        id,
+      ])
+    } else if (a.type === 'line_status') {
+      await client.query('UPDATE studio_lines SET status = $2 WHERE id = $1 AND project_id = $3', [
+        a.lineId,
+        a.status,
+        id,
+      ])
+    } else if (a.type === 'note_music_skipped') {
+      await client.query(
+        `UPDATE studio_projects SET settings = settings || '{"musicSkippedNoted":true}'::jsonb WHERE id = $1`,
+        [id],
+      )
+      await appendStudioEvent(client, id, 'music.skipped', {
+        message: '音乐生成未配置，这次不配乐。',
+      })
+    } else if (a.type === 'set_status') {
+      await client.query(
+        `UPDATE studio_projects
+            SET status = $2, settings = settings || jsonb_build_object('awaitingReason', $3::text),
+                rev = rev + 1, updated_at = NOW()
+          WHERE id = $1`,
+        [id, a.status, a.reason ?? null],
+      )
+      await appendStudioEvent(client, id, `project.${a.status}`, {
+        reason: a.reason ?? null,
+        message:
+          a.reason === 'compose_pending'
+            ? '镜头和配音都好了，等待合成（合成即将开放）。'
+            : a.reason === 'needs_user'
+              ? '有镜头需要你看一下。'
+              : undefined,
+      })
+    }
+  }
+}
+
+/** Advance once. Returns false when another process holds the project's advance lock. */
+export async function advanceProject(deps: AdvanceDeps, projectId: string): Promise<boolean> {
+  const client = await deps.pool.connect()
+  try {
+    await client.query('BEGIN')
+    const lock = await client.query<{ ok: boolean }>(
+      `SELECT pg_try_advisory_xact_lock(hashtext('studio-advance:' || $1)) AS ok`,
+      [projectId],
+    )
+    if (!lock.rows[0]?.ok) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    const ctx = await loadState(client, deps, projectId)
+    if (ctx) await apply(client, deps, ctx, decide(ctx.state))
+    await client.query('COMMIT')
+    return true
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
