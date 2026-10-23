@@ -285,8 +285,9 @@ export function TicketDrawer({
     let failures = 0
     let lastTimelineAt = Date.now()
     const owned = () => !stopped && ownerGen.current === gen && ownerLookupRef.current === requested
+    const visible = () => document.visibilityState !== 'hidden'
     const tick = async (forceTimeline = false) => {
-      if (!owned() || inFlight || document.visibilityState === 'hidden') return
+      if (!owned() || inFlight || !visible()) return
       inFlight = true
       try {
         const fresh = await reads.detail(requested)
@@ -314,7 +315,7 @@ export function TicketDrawer({
         if (!(e instanceof AuthEpochStaleError)) failures = Math.min(failures + 1, 4)
       } finally {
         inFlight = false
-        if (owned() && document.visibilityState !== 'hidden') {
+        if (owned() && visible()) {
           const interval = currentRef.current?.status === 'running' ? 3_000 : 15_000
           timer = setTimeout(() => void tick(), Math.min(60_000, interval * 2 ** failures))
         }
@@ -322,7 +323,7 @@ export function TicketDrawer({
     }
     const resume = () => {
       clearTimeout(timer)
-      if (document.visibilityState !== 'hidden') void tick(true)
+      if (visible()) void tick(true)
     }
     timer = setTimeout(() => void tick(), currentRef.current?.status === 'running' ? 3_000 : 15_000)
     document.addEventListener('visibilitychange', resume)
@@ -558,7 +559,7 @@ export function TicketDrawer({
                   </Field>
                 </div>
                 {editVersion !== null && editVersion !== current.version && (
-                  <p role="status" className="text-caption text-warning">任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。</p>
+                  <output className="block text-caption text-warning">任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。</output>
                 )}
                 <div className="flex flex-wrap gap-1">
                   <Button

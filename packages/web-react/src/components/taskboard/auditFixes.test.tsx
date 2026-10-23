@@ -409,7 +409,7 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     fireEvent.keyDown(more, { key: 'Enter' })
     expect(await screen.findByRole('menuitem', { name: '完成' })).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: '标记受阻' })).toBeInTheDocument()
-    expect(screen.queryByRole('menuitem', { name: '取消', exact: true })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /^取消$/ })).not.toBeInTheDocument()
     const cancel = screen.getByRole('menuitem', { name: '取消单据' })
     cancel.focus()
     fireEvent.keyDown(cancel, { key: 'Enter' })
