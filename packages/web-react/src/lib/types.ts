@@ -1458,6 +1458,20 @@ export type CommunityTutorialPage<T> = {
 };
 
 /** POST /api/tutorials/images 的返回。 */
+/** 对话写博客的投稿预检（POST /api/tutorials/precheck）。block = 投稿会被拒；warn = 能投但会转人工。 */
+export type CommunityBlogPrecheckIssue = {
+  code: string;
+  level: "block" | "warn";
+  field: string;
+  message: string;
+  where?: string;
+};
+
+export type CommunityBlogPrecheck = {
+  issues: CommunityBlogPrecheckIssue[];
+  quota: { pendingLeft: number; dailyLeft: number };
+};
+
 export type TutorialImageUpload = {
   sha256: string;
   mime: string;

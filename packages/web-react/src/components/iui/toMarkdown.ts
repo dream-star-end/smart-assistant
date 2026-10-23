@@ -7,6 +7,7 @@
 import { isNextBlockCode } from "../../lib/nextBlock";
 import { normalizeInlineUiFences } from "../../lib/uiFence";
 import { biliToMarkdown } from "./biliMarkdown";
+import { blogToMarkdown } from "./blogMarkdown";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
@@ -340,6 +341,10 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "bili_danmaku":
     case "bili_subtitle":
       return biliToMarkdown(spec);
+    case "blog_draft":
+    case "blog_status":
+    case "blog_published":
+      return blogToMarkdown(spec);
   }
 }
 

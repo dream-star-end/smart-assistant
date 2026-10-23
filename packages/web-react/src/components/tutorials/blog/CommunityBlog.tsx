@@ -8,7 +8,7 @@ import {
   SquarePen,
   Users,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { tutorialHref } from "../../../hooks/useAppRoute";
 import { api, apiErrorMessage } from "../../../lib/api";
 import type {
@@ -33,7 +33,10 @@ import {
 
 const PUBLIC_SOURCE: BlogImageSource = { kind: "public" };
 
-type BlogView = { kind: "list" } | { kind: "editor"; seed?: BlogDraft } | { kind: "mine" };
+type BlogView = { kind: "list" } | { kind: "editor"; seed?: BlogDraft; nonce?: number } | { kind: "mine" };
+
+/** 从对话里的经验分享卡打开子视图（App → TutorialCenter → 这里）；nonce 变化执行一次。 */
+export type BlogViewRequest = { kind: "editor"; seed: BlogDraft; nonce: number } | { kind: "mine"; nonce: number };
 
 /**
  * 「经验分享」(OCV5-577):列表 / 详情 / 写一篇 / 我的投稿。详情 id 由宿主镜像到
@@ -44,13 +47,29 @@ export function CommunityBlog({
   onRequireLogin,
   detailId = null,
   onDetailIdChange,
+  request = null,
 }: {
   auth?: AuthSession | null;
   onRequireLogin?: () => void;
   detailId?: string | null;
   onDetailIdChange?: (id: string | null) => void;
+  request?: BlogViewRequest | null;
 }) {
-  const [view, setView] = useState<BlogView>({ kind: "list" });
+  const [view, setView] = useState<BlogView>(() =>
+    request && auth ? (request.kind === "editor" ? { kind: "editor", seed: request.seed, nonce: request.nonce } : { kind: "mine" }) : { kind: "list" },
+  );
+  const handledRequest = useRef(request && auth ? request.nonce : 0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 只按 nonce 执行一次；auth / 回调变化不重放请求
+  useEffect(() => {
+    if (!request || handledRequest.current === request.nonce) return;
+    handledRequest.current = request.nonce;
+    if (!auth) {
+      onRequireLogin?.();
+      return;
+    }
+    onDetailIdChange?.(null);
+    setView(request.kind === "editor" ? { kind: "editor", seed: request.seed, nonce: request.nonce } : { kind: "mine" });
+  }, [request?.nonce]);
   const [aiReview, setAiReview] = useState(false);
 
   useEffect(() => {
@@ -86,6 +105,7 @@ export function CommunityBlog({
   if (view.kind === "editor" && auth) {
     return (
       <BlogEditor
+        key={view.nonce ?? 0}
         auth={auth}
         seed={view.seed}
         aiReview={aiReview}

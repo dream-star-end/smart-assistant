@@ -6,6 +6,7 @@
  */
 import type {
   AuthSession,
+  CommunityBlogPrecheck,
   CommunityTutorialCategory,
   CommunityTutorialDetail,
   CommunityTutorialDraft,
@@ -750,6 +751,30 @@ export const memorySkillsApi = {
         }),
       ),
     ),
+
+  /** 对话写博客的草稿卡预检：只读，和投稿同一套确定性检查（不含 AI 审核）。 */
+  precheckCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<CommunityBlogPrecheck>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/precheck", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ),
+
+  /** 我的某一篇投稿（作者本人）：状态、审核理由、正文。 */
+  getMyCommunityTutorial: (a: AuthSession, id: string) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialMine }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/mine/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ).then((result) => result.tutorial),
 
   /** 经验分享图片上传：原始字节（前端已压成 webp），服务端按魔数复核并去元数据。 */
   uploadTutorialImage: (a: AuthSession, file: Blob) =>

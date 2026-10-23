@@ -11,6 +11,7 @@
 import { createContext, useContext } from "react";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 import type { Ticket } from "../../lib/taskboard";
+import type { CommunityBlogPrecheck, CommunityTutorialCategory, CommunityTutorialMine } from "../../lib/types";
 import type { ToolLike } from "./format";
 
 export type LiteratureArtifactMeta = { expiresAt: string; bytes: number; saved: boolean };
@@ -48,6 +49,32 @@ export type ToolCardActions = {
   };
   /** 打开任务面板(可选定位到 identifier)。 */
   onOpenTaskboard?: (identifier?: string) => void;
+  /**
+   * 对话写博客（经验分享草稿卡，OCV5-577 跟进）：全部走用户浏览器登录态，与「写一篇经验」同一套接口；
+   * Agent 没有任何投稿能力。经验分享开关关闭、demo、未登录时不注入，草稿卡降级为只读预览。
+   */
+  communityBlog?: CommunityBlogActions;
+};
+
+export type CommunityBlogDraftPayload = {
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+};
+
+export type CommunityBlogActions = {
+  precheck: (draft: CommunityBlogDraftPayload) => Promise<CommunityBlogPrecheck>;
+  /** 读容器里的图片文件（经媒体签名）。 */
+  readContainerImage: (path: string) => Promise<Blob>;
+  uploadImage: (image: Blob) => Promise<{ sha256: string }>;
+  submit: (draft: CommunityBlogDraftPayload) => Promise<{ id: string }>;
+  getMine: (id: string) => Promise<CommunityTutorialMine>;
+  /** 文章的站内链接（与经验分享详情页「复制链接」同一写法）。 */
+  postUrl: (id: string) => string;
+  openPost: (id: string) => void;
+  openMine: () => void;
+  openEditor: (draft: CommunityBlogDraftPayload) => void;
 };
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});
