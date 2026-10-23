@@ -213,12 +213,20 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
   }
   // A2-1b-2: the film is being reworked (an annotation reopened it). An export waits for the new
   // film instead of failing on missing inputs; an auto run ends — the director composes again.
-  if (inputs.status !== 'done' && inputs.status !== 'composing') {
+  // Inputs and status are read separately: missing inputs get a fresh status (code r2 P1), so a
+  // rework that started in between waits instead of failing the export.
+  const status =
+    inputs.missing.length > 0
+      ? ((
+          await deps.pool.query<{ status: string }>(
+            'SELECT status FROM studio_projects WHERE id = $1',
+            [task.projectId],
+          )
+        ).rows[0]?.status ?? inputs.status)
+      : inputs.status
+  if (status !== 'done' && status !== 'composing') {
     await withLease(deps.pool, task, async (c) => {
-      if (
-        pl.reason === 'export' &&
-        ['running', 'awaiting_user', 'paused'].includes(inputs.status)
-      ) {
+      if (pl.reason === 'export' && ['running', 'awaiting_user', 'paused'].includes(status)) {
         await enqueueStudioTask(c, {
           projectId: task.projectId,
           kind: 'compose',
@@ -234,7 +242,7 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
         )
         await deps.blobs.dropRefs(BigInt(inputs.userId), { kind: 'final', id: pl.takeId }, c)
       }
-      await finishStudioTask(c, task, { status: 'done', error: `project is ${inputs.status}` })
+      await finishStudioTask(c, task, { status: 'done', error: `project is ${status}` })
     })
     return
   }

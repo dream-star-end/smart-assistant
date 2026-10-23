@@ -145,7 +145,10 @@ export async function executeAnnotation(
     const redoLine = async (lineId: string, text?: string) => {
       const minVersion = await nextVersion(c, 'line', lineId)
       const r = await c.query(
-        `UPDATE studio_lines SET status = 'planned', text = COALESCE($2, text) WHERE id = $1 AND project_id = $3`,
+        // The old voice take is let go (code r2 P1): the film's inputs change at once, so a compose
+        // in flight (an export) never publishes the old voice while the new one waits.
+        `UPDATE studio_lines SET status = 'planned', active_take_id = NULL, text = COALESCE($2, text)
+          WHERE id = $1 AND project_id = $3`,
         [lineId, text ?? null, projectId],
       )
       if (!r.rowCount) throw new AnnotationRunError('target_gone')

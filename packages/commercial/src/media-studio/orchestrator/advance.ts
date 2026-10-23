@@ -567,10 +567,13 @@ export async function advanceProject(deps: AdvanceDeps, projectId: string): Prom
       await client.query('ROLLBACK')
       return false
     }
-    // A2-1b-2: an annotation's execution is applied / failed once its targets settle.
+    // A2-1b-2: an annotation's execution is applied / failed once its targets settle — before the
+    // decisions (a finished one frees its target) and after them (code r2 P1: a project this very
+    // pass hands to the user ends what was waiting on it; nothing else would settle it later).
     await settleAnnotations(client, projectId)
     const ctx = await loadState(client, deps, projectId)
     if (ctx) await apply(client, deps, ctx, decide(ctx.state))
+    await settleAnnotations(client, projectId)
     await client.query('COMMIT')
     return true
   } catch (err) {

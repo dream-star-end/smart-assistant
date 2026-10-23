@@ -456,6 +456,12 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
       s.lines.map((l) => `gen:line:${l}:v2`).sort(),
     )
     assert.ok(gens.every((g) => (g.request as { voiceId?: string }).voiceId === 'female-shaonv'))
+    // The old voice takes are let go at once (code r2 P1): a film composed now cannot use them.
+    const active = await query<{ a: string | null }>(
+      'SELECT active_take_id::text AS a FROM studio_lines WHERE project_id = $1',
+      [s.p.id],
+    )
+    assert.ok(active.rows.every((r) => r.a === null))
   })
 
   test('outside the whitelist nothing runs; the annotation can be sent again', async (t) => {
@@ -507,6 +513,32 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.deepEqual(
       [a.status, a.applied, a.interpretation?.execution?.state],
       ['applied', v3.id, 'done'],
+    )
+  })
+
+  test('a project handed to the user in the same pass ends the execution waiting on it (code r2 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '长一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('retime_shot', { shotId: s.shot, durationSec: 7 }))
+    await runOne(s.exec)
+    // No video service at all: the director can only hand the shot over.
+    const noVideo: ProviderRegistry = {
+      ...registry,
+      candidates: (kind, op, user, opts) =>
+        kind === 'video' ? [] : registry.candidates(kind, op, user, opts),
+    }
+    await advanceProject({ ...s.advanceDeps, providers: noVideo }, s.p.id)
+    assert.equal((await projectRow(s.p.id)).status, 'awaiting_user')
+    const a = await annotation(id)
+    assert.deepEqual(
+      [a.interpretation?.execution?.state, a.interpretation?.execution?.error],
+      ['failed', 'needs_user'],
     )
   })
 
