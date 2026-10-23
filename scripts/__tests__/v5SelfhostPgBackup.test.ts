@@ -258,23 +258,27 @@ describe('v5-selfhost-pg-backup.sh cli and units', () => {
     assert.equal(run(['run', '--tier', 'x']).status, 2)
   })
 
-  test('service runs from the live release, alerts on failure, and the timer is persistent', () => {
-    const svc = readFileSync(
-      path.join(root, 'deploy/v5-selfhost/openclaude-v5-selfhost-pg-backup.service'),
-      'utf8',
-    )
-    assert.match(
-      svc,
-      /^ExecStart=\/opt\/openclaude\/openclaude-v5-selfhost-live\/scripts\/v5-selfhost-pg-backup\.sh run$/m,
-    )
-    assert.match(svc, /^OnFailure=openclaude-v5-selfhost-watch-alert@%n\.service$/m)
-    assert.match(svc, /^EnvironmentFile=-\/etc\/openclaude\/selfhost-pg-backup\.env$/m)
-    const timer = readFileSync(
-      path.join(root, 'deploy/v5-selfhost/openclaude-v5-selfhost-pg-backup.timer'),
-      'utf8',
-    )
-    assert.match(timer, /^Persistent=true$/m)
-    assert.match(timer, /^OnCalendar=/m)
+  test('services run from the live release, alert on failure, and the timers are persistent', () => {
+    // OCV5-600: core daily, full weekly (a full run every day would not fit the off-host bucket)
+    for (const [unit, tier, calendar] of [
+      ['openclaude-v5-selfhost-pg-backup', 'core', /^OnCalendar=\*-\*-\* /m],
+      ['openclaude-v5-selfhost-pg-backup-full', 'full', /^OnCalendar=Sun /m],
+    ] as const) {
+      const svc = readFileSync(path.join(root, `deploy/v5-selfhost/${unit}.service`), 'utf8')
+      assert.match(
+        svc,
+        new RegExp(
+          `^ExecStart=/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup\\.sh run --tier ${tier}$`,
+          'm',
+        ),
+      )
+      assert.match(svc, /^OnFailure=openclaude-v5-selfhost-watch-alert@%n\.service$/m)
+      assert.match(svc, /^EnvironmentFile=-\/etc\/openclaude\/selfhost-pg-backup\.env$/m)
+      const timer = readFileSync(path.join(root, `deploy/v5-selfhost/${unit}.timer`), 'utf8')
+      assert.match(timer, /^Persistent=true$/m)
+      assert.match(timer, calendar)
+      assert.match(timer, new RegExp(`^Unit=${unit}\\.service$`, 'm'))
+    }
   })
 })
 
@@ -395,5 +399,403 @@ describe('v5-selfhost-pg-backup.sh review r1 hardening', () => {
     assert.equal(run(['run'], { V5SB_MIN_FREE_GIB: 'x' }).status, 2)
     assert.equal(run(['run'], { V5SB_DIR: 'relative/dir' }).status, 2)
     assert.equal(run(['run'], { V5SB_DIR: '/' }).status, 2)
+  })
+})
+
+// OCV5-600: scripts/v5-selfhost-pg-backup-r2.sh (encrypted off-host copies on R2) and the
+// V5SB_OFFSITE hooks. rclone keeps "objects" in the temp dir, gpg only prefixes a marker,
+// psql prints a size from a file: no bucket, key or database is touched.
+describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
+  const r2 = path.join(root, 'scripts/v5-selfhost-pg-backup-r2.sh')
+  const FPR = '818A5364333BDAE64CDE84916203CFEA2A840A7A'
+
+  /** Put an object into the fake bucket (path relative to the bucket root). */
+  function putObject(rel: string, bytes: number) {
+    const p = path.join(dir, 'bucket', rel)
+    mkdirSync(path.dirname(p), { recursive: true })
+    writeFileSync(p, 'x'.repeat(bytes))
+  }
+
+  function objects(sub: string): string[] {
+    const d = path.join(dir, 'bucket', 'pg', sub)
+    return existsSync(d) ? readdirSync(d).sort() : []
+  }
+
+  function rcloneLog(): string[] {
+    const p = path.join(dir, 'rclone.log')
+    return existsSync(p) ? readFileSync(p, 'utf8').trim().split('\n') : []
+  }
+
+  function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
+    return {
+      PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`,
+      HOME: dir,
+      STUB_DIR: dir,
+      V5SB_PG_AS: '',
+      V5SB_RCLONE: path.join(dir, 'bin/rclone'),
+      V5SB_GPG: path.join(dir, 'bin/gpg'),
+      V5SB_PSQL: path.join(dir, 'bin/psql'),
+      V5SB_R2_RCLONE_CONF: path.join(dir, 'rclone.conf'),
+      V5SB_R2_GPG_HOME: path.join(dir, 'gnupg'),
+      V5SB_R2_GPG_RECIPIENT: FPR,
+      V5SB_R2_STATE: path.join(dir, 'state/r2.json'),
+      V5SB_R2_CAP_BYTES: '10000',
+      V5SB_R2_WARN_BYTES: '9000',
+      ...extra,
+    }
+  }
+
+  function runR2(args: string[], extra: Record<string, string> = {}, input = '') {
+    const r = spawnSync('bash', [r2, ...args], {
+      env: baseEnv(extra),
+      input,
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+    return { status: r.status, out: `${r.stdout}${r.stderr}` }
+  }
+
+  function runBackup(args: string[], extra: Record<string, string> = {}) {
+    const env = baseEnv({
+      V5SB_DIR: path.join(dir, 'backups'),
+      V5SB_STATUS: path.join(dir, 'state/status.json'),
+      V5SB_LOCK: path.join(dir, 'run/backup.lock'),
+      V5SB_DEPLOY_LOCK: path.join(dir, 'run/deploy.lock'),
+      V5SB_DEPLOY_WAIT_SEC: '0',
+      V5SB_WATCH_INTERVAL: '0.1',
+      V5SB_CORE_EST_BYTES: String(GIB),
+      V5SB_FULL_SINK: '',
+      V5SB_OFFSITE: r2,
+      ...extra,
+    })
+    const r = spawnSync('bash', [script, ...args], { env, encoding: 'utf8', timeout: 30_000 })
+    return { status: r.status, out: `${r.stdout}${r.stderr}` }
+  }
+
+  function writeState(bytes: number, dbBytes: number, compress = 'zstd:3') {
+    mkdirSync(path.join(dir, 'state'), { recursive: true })
+    writeFileSync(
+      path.join(dir, 'state/r2.json'),
+      JSON.stringify({
+        lastFullBytes: bytes,
+        lastFullDbBytes: dbBytes,
+        lastFullCompress: compress,
+      }),
+    )
+  }
+
+  beforeEach(() => {
+    mkdirSync(path.join(dir, 'bucket'))
+    writeFileSync(path.join(dir, 'rclone.conf'), '[r2]\ntype = local\n')
+    writeFileSync(path.join(dir, 'dbsize'), '20000')
+    // rclone: objects are files under $STUB_DIR/bucket; "r2:<bucket>/<key>" maps to bucket/<key>.
+    // rcat writes to a temp file outside the bucket and renames at EOF, so a killed upload
+    // leaves no object. $STUB_DIR/rclone_fail=<subcommand> makes that subcommand fail.
+    stub(
+      'rclone',
+      [
+        'args=()',
+        'while (($#)); do case "$1" in',
+        '  --config|--s3-chunk-size|--max-transfer|--cutoff-mode|-o) shift 2 ;;',
+        '  -R|--files-only) shift ;;',
+        '  *) args+=("$1"); shift ;;',
+        'esac; done',
+        'printf "%s\\n" "${args[*]}" >> "$STUB_DIR/rclone.log"',
+        'sub=${args[0]}; rest=${args[1]#*:}',
+        'if [[ "$rest" == */* ]]; then key=${rest#*/}; else key=""; fi',
+        'B="$STUB_DIR/bucket"',
+        '[[ "$(cat "$STUB_DIR/rclone_fail" 2>/dev/null)" == "$sub" ]] && { cat >/dev/null; exit 9; }',
+        'case "$sub" in',
+        "  lsjson) python3 -c '",
+        'import json, os, sys',
+        'b, key = sys.argv[1], sys.argv[2]',
+        'out = []',
+        'if key:',
+        '    p = os.path.join(b, key)',
+        '    if os.path.isfile(p): out.append({"Path": os.path.basename(p), "Size": os.path.getsize(p)})',
+        'else:',
+        '    for d, _, fs in os.walk(b):',
+        '        for f in fs:',
+        '            p = os.path.join(d, f)',
+        '            out.append({"Path": os.path.relpath(p, b), "Size": os.path.getsize(p)})',
+        'print(json.dumps(out))',
+        '\' "$B" "$key" ;;',
+        '  deletefile) [[ -f "$B/$key" ]] || exit 4; rm -f -- "$B/$key" ;;',
+        '  rcat) t="$STUB_DIR/rcat.$$"; cat > "$t" || exit 1; mkdir -p "$(dirname "$B/$key")"; mv "$t" "$B/$key" ;;',
+        // multipart uploads: $STUB_DIR/multipart holds the list-multipart-uploads JSON;
+        // cleanup empties it unless $STUB_DIR/cleanup_noop (an abort that fails silently).
+        '  backend) case "${args[1]}" in',
+        '    cleanup) [[ -f "$STUB_DIR/cleanup_noop" ]] || echo \'{"ocv5-personal-backup": []}\' > "$STUB_DIR/multipart" ;;',
+        '    list-multipart-uploads) cat "$STUB_DIR/multipart" 2>/dev/null || echo \'{"ocv5-personal-backup": []}\' ;;',
+        '    *) exit 2 ;;',
+        '  esac ;;',
+        '  *) exit 2 ;;',
+        'esac',
+      ].join('\n'),
+    )
+    // gpg: record args, prefix a marker so "encrypted" output is recognisable.
+    stub(
+      'gpg',
+      'printf "%s\\n" "$@" > "$STUB_DIR/gpg.args"; [[ -f "$STUB_DIR/gpg_fail" ]] && exit 2; printf "GPG:"; cat',
+    )
+    stub('psql', 'cat "$STUB_DIR/dbsize"')
+    // pg_dump with two more modes than the file-level stub
+    stub(
+      'pg_dump',
+      [
+        'printf "%s\\n" "$@" > "$STUB_DIR/pg_dump.args"',
+        'mode=$(cat "$STUB_DIR/dump_mode" 2>/dev/null || echo ok)',
+        'case "$mode" in',
+        '  fail) echo partial; exit 1 ;;',
+        '  big) head -c 50000 /dev/zero ;;',
+        // can a deploy take its lock while the dump runs?
+        '  probe) if flock -n -x "$STUB_DIR/run/deploy.lock" true; then echo free; else echo held; fi > "$STUB_DIR/probe"; echo PGDMP ;;',
+        '  *) echo "PGDMP-stub-archive" ;;',
+        'esac',
+      ].join('\n'),
+    )
+  })
+
+  describe('v5-selfhost-pg-backup-r2.sh full', () => {
+    test('deletes the old full copy before uploading the new one, encrypted to the recipient', () => {
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 3000)
+      putObject('pg/core/core-20261022T194000Z.dump.gpg', 100)
+      const r = runR2(['full', 'full-20261025T131000Z.dump'], {}, 'PGDMP-archive')
+      assert.equal(r.status, 0, r.out)
+      assert.deepEqual(objects('full'), ['full-20261025T131000Z.dump.gpg'])
+      assert.deepEqual(objects('core'), ['core-20261022T194000Z.dump.gpg'])
+      const body = readFileSync(
+        path.join(dir, 'bucket/pg/full/full-20261025T131000Z.dump.gpg'),
+        'utf8',
+      )
+      assert.equal(body, 'GPG:PGDMP-archive')
+      const log = rcloneLog()
+      const del = log.findIndex((l) => l.startsWith('deletefile') && l.includes('full-20261018'))
+      const put = log.findIndex((l) => l.startsWith('rcat'))
+      assert.ok(del >= 0 && put > del, log.join('\n'))
+      const gpgArgs = readFileSync(path.join(dir, 'gpg.args'), 'utf8').split('\n')
+      assert.ok(gpgArgs.includes('--encrypt') && gpgArgs.includes(FPR))
+      assert.ok(gpgArgs.includes('--compress-algo'))
+      const st = JSON.parse(readFileSync(path.join(dir, 'state/r2.json'), 'utf8'))
+      assert.equal(st.lastFullBytes, body.length)
+      assert.equal(st.lastFullDbBytes, 20000)
+      assert.equal(st.lastFullCompress, 'zstd:3')
+    })
+
+    test('a stream that would pass the cap is killed before the object completes', () => {
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 3000)
+      putObject('pg/core/core-20261022T194000Z.dump.gpg', 2000)
+      // cap 10000, core 2000 -> room 8000; the stream is 20000 bytes
+      const r = runR2(['full', 'full-20261025T131000Z.dump'], {}, 'y'.repeat(20000))
+      assert.equal(r.status, 3, r.out)
+      assert.match(r.out, /ABORT over cap/)
+      assert.deepEqual(objects('full'), [])
+      assert.deepEqual(objects('core'), ['core-20261022T194000Z.dump.gpg'])
+      assert.equal(existsSync(path.join(dir, 'state/r2.json')), false)
+      // the killed upload's parts are aborted right away, and were before it started (Codex r1 P1)
+      const log = rcloneLog()
+      const put = log.findIndex((l) => l.startsWith('rcat'))
+      const cleanups = log.flatMap((l, i) => (l.startsWith('backend cleanup') ? [i] : []))
+      assert.ok(cleanups.some((i) => i < put) && cleanups.some((i) => i > put), log.join('\n'))
+    })
+
+    test('a cleanup that exits 0 but leaves uploads behind still stops the command (Codex r2 P1)', () => {
+      writeFileSync(path.join(dir, 'cleanup_noop'), '')
+      writeFileSync(
+        path.join(dir, 'multipart'),
+        JSON.stringify({ 'ocv5-personal-backup': [{ Key: 'pg/full/x.gpg', UploadId: 'u1' }] }),
+      )
+      const r = runR2(['precheck'])
+      assert.equal(r.status, 1, r.out)
+      assert.match(r.out, /still present after cleanup: 1/)
+      assert.equal(runR2(['full', 'full-20261025T131000Z.dump'], {}, 'a').status, 1)
+      assert.deepEqual(objects('full'), [])
+      rmSync(path.join(dir, 'cleanup_noop'))
+      assert.equal(runR2(['precheck']).status, 0)
+    })
+
+    test('a failing multipart cleanup stops every command before it writes', () => {
+      writeFileSync(path.join(dir, 'rclone_fail'), 'backend')
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 3000)
+      assert.equal(runR2(['precheck']).status, 1)
+      assert.equal(runR2(['full', 'full-20261025T131000Z.dump'], {}, 'a').status, 1)
+      assert.deepEqual(objects('full'), ['full-20261018T131000Z.dump.gpg'])
+      mkdirSync(path.join(dir, 'backups'))
+      const f = path.join(dir, 'backups/core-20261023T194000Z.dump')
+      writeFileSync(f, 'PGDMP-core')
+      assert.equal(runR2(['core', f]).status, 1)
+      assert.deepEqual(objects('core'), [])
+    })
+
+    test('a bucket total above the warning line after the upload exits 5', () => {
+      putObject('pg/core/core-20261022T194000Z.dump.gpg', 8990)
+      const r = runR2(['full', 'full-20261025T131000Z.dump'], {}, 'z'.repeat(500))
+      assert.equal(r.status, 5, r.out)
+      assert.match(r.out, /WARN bucket total=9494/)
+      assert.deepEqual(objects('full'), ['full-20261025T131000Z.dump.gpg'])
+    })
+
+    test('a failed upload leaves no object and exits 1', () => {
+      writeFileSync(path.join(dir, 'rclone_fail'), 'rcat')
+      const r = runR2(['full', 'full-20261025T131000Z.dump'], {}, 'PGDMP-archive')
+      assert.equal(r.status, 1, r.out)
+      assert.deepEqual(objects('full'), [])
+    })
+
+    test('discard-full drops the copy and the size state', () => {
+      putObject('pg/full/full-20261025T131000Z.dump.gpg', 10)
+      writeState(10, 20000)
+      const r = runR2(['discard-full', 'full-20261025T131000Z.dump'])
+      assert.equal(r.status, 0, r.out)
+      assert.deepEqual(objects('full'), [])
+      assert.equal(existsSync(path.join(dir, 'state/r2.json')), false)
+    })
+  })
+
+  describe('v5-selfhost-pg-backup-r2.sh precheck', () => {
+    test('skips when the estimate scaled by database growth does not fit', () => {
+      writeState(8000, 20000)
+      writeFileSync(path.join(dir, 'dbsize'), '24000') // 8000 * 1.2 * 1.05 = 10080 > 10000
+      const r = runR2(['precheck'])
+      assert.equal(r.status, 3, r.out)
+      assert.match(r.out, /precheck SKIP estimate=10080 > room=10000/)
+    })
+
+    test('real sizes do not overflow the estimate (Codex r1 P1)', () => {
+      // 8e9 x 24e9 does not fit 64-bit shell arithmetic
+      writeState(8_000_000_000, 20_000_000_000)
+      writeFileSync(path.join(dir, 'dbsize'), '24000000000')
+      const r = runR2(['precheck'], {
+        V5SB_R2_CAP_BYTES: '9500000000',
+        V5SB_R2_WARN_BYTES: '9000000000',
+      })
+      assert.equal(r.status, 3, r.out)
+      assert.match(r.out, /precheck SKIP estimate=10080000000 > room=9500000000/)
+    })
+
+    test('the old full copy does not count against the room (it is deleted first)', () => {
+      writeState(8000, 20000)
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 8000)
+      putObject('pg/core/core-20261022T194000Z.dump.gpg', 1000)
+      const r = runR2(['precheck']) // estimate 8400, room 10000 - 1000
+      assert.equal(r.status, 0, r.out)
+      putObject('pg/core/core-20261023T194000Z.dump.gpg', 700) // room 8300 < 8400
+      assert.equal(runR2(['precheck']).status, 3)
+    })
+
+    test('a changed compression level makes the old size unknown, so precheck lets it run', () => {
+      writeState(8000, 20000)
+      writeFileSync(path.join(dir, 'dbsize'), '24000')
+      const r = runR2(['precheck'], { V5SB_FULL_COMPRESS: 'zstd:9' })
+      assert.equal(r.status, 0, r.out)
+    })
+  })
+
+  describe('v5-selfhost-pg-backup-r2.sh core and config', () => {
+    test('uploads the core dump and keeps the newest V5SB_R2_CORE_KEEP copies', () => {
+      for (const d of ['20261020', '20261021', '20261022']) {
+        putObject(`pg/core/core-${d}T194000Z.dump.gpg`, 10)
+      }
+      mkdirSync(path.join(dir, 'backups'))
+      const f = path.join(dir, 'backups/core-20261023T194000Z.dump')
+      writeFileSync(f, 'PGDMP-core')
+      const r = runR2(['core', f], { V5SB_R2_CORE_KEEP: '2' })
+      assert.equal(r.status, 0, r.out)
+      assert.deepEqual(objects('core'), [
+        'core-20261022T194000Z.dump.gpg',
+        'core-20261023T194000Z.dump.gpg',
+      ])
+    })
+
+    test('core is skipped when it would pass the cap', () => {
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 9900)
+      mkdirSync(path.join(dir, 'backups'))
+      const f = path.join(dir, 'backups/core-20261023T194000Z.dump')
+      writeFileSync(f, 'x'.repeat(200))
+      const r = runR2(['core', f])
+      assert.equal(r.status, 3, r.out)
+      assert.deepEqual(objects('core'), [])
+    })
+
+    test('missing recipient, bad names and bad knobs are usage errors', () => {
+      assert.equal(runR2(['precheck'], { V5SB_R2_GPG_RECIPIENT: '' }).status, 2)
+      assert.equal(runR2(['full', '../x'], {}, 'a').status, 2)
+      assert.equal(runR2(['core', path.join(dir, 'rclone.conf')]).status, 2)
+      assert.equal(runR2(['precheck'], { V5SB_R2_WARN_BYTES: '20000' }).status, 2)
+      assert.equal(runR2(['nope']).status, 2)
+    })
+  })
+
+  describe('v5-selfhost-pg-backup.sh with V5SB_OFFSITE', () => {
+    test('full tier: precheck, then the dump streams to R2 at V5SB_FULL_COMPRESS', () => {
+      const r = runBackup(['run', '--tier', 'full'], { V5SB_FULL_COMPRESS: 'zstd:9' })
+      assert.equal(r.status, 0, r.out)
+      const full = objects('full')
+      assert.equal(full.length, 1)
+      assert.match(full[0], /^full-\d{8}T\d{6}Z\.dump\.gpg$/)
+      const args = readFileSync(path.join(dir, 'pg_dump.args'), 'utf8').split('\n')
+      assert.equal(args[args.indexOf('-Z') + 1], 'zstd:9')
+      assert.equal(status().full.result, 'ok')
+    })
+
+    test('full tier: a precheck skip exits 3 without running pg_dump', () => {
+      writeState(9000, 10000)
+      const r = runBackup(['run', '--tier', 'full'])
+      assert.equal(r.status, 3, r.out)
+      assert.equal(existsSync(path.join(dir, 'pg_dump.args')), false)
+      assert.equal(status().full.result, 'skipped_over_cap')
+    })
+
+    test('full tier: a stream over the cap is reported as aborted_over_cap', () => {
+      writeFileSync(path.join(dir, 'dump_mode'), 'big')
+      const r = runBackup(['run', '--tier', 'full'])
+      assert.equal(r.status, 3, r.out)
+      assert.equal(status().full.result, 'aborted_over_cap')
+      assert.deepEqual(objects('full'), [])
+    })
+
+    test('full tier: a failed pg_dump has the truncated copy discarded', () => {
+      writeFileSync(path.join(dir, 'dump_mode'), 'fail')
+      const r = runBackup(['run', '--tier', 'full'])
+      assert.equal(r.status, 1, r.out)
+      assert.equal(status().full.result, 'failed')
+      assert.deepEqual(objects('full'), [])
+    })
+
+    test('core tier: the verified dump also goes to R2', () => {
+      const r = runBackup(['run', '--tier', 'core'])
+      assert.equal(r.status, 0, r.out)
+      assert.equal(objects('core').length, 1)
+      assert.equal(status().core.result, 'ok')
+      assert.equal(status().coreOffsite.result, 'ok')
+    })
+
+    test('core tier: a failed upload fails the run but keeps the local core ok', () => {
+      writeFileSync(path.join(dir, 'rclone_fail'), 'rcat')
+      const r = runBackup(['run', '--tier', 'core'])
+      assert.equal(r.status, 1, r.out)
+      assert.equal(status().core.result, 'ok')
+      assert.equal(status().coreOffsite.result, 'failed')
+      assert.equal(
+        readdirSync(path.join(dir, 'backups')).filter((f) => f.endsWith('.dump')).length,
+        1,
+      )
+    })
+
+    test('the deploy lock is held (shared) for the whole dump, so a train cannot start mid-dump', () => {
+      writeFileSync(path.join(dir, 'run/deploy.lock'), '')
+      writeFileSync(path.join(dir, 'dump_mode'), 'probe')
+      for (const tier of ['full', 'core']) {
+        const r = runBackup(['run', '--tier', tier])
+        assert.equal(r.status, 0, r.out)
+        assert.equal(readFileSync(path.join(dir, 'probe'), 'utf8').trim(), 'held', tier)
+      }
+    })
+
+    test('V5SB_OFFSITE and V5SB_FULL_SINK together are a usage error', () => {
+      stub('sink', 'cat >/dev/null')
+      const r = runBackup(['run'], { V5SB_FULL_SINK: path.join(dir, 'bin/sink') })
+      assert.equal(r.status, 2, r.out)
+    })
   })
 })
