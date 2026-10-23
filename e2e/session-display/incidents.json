@@ -5870,7 +5870,7 @@
         "92acb899",
         "dc1ea28c",
         "43b509a0",
-        "571fa589c3722f699935fc274805b401cc400bc1"
+        "571fa589"
       ],
       "proofPending": {
         "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
