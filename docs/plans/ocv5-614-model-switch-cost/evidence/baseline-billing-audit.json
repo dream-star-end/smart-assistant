@@ -1,0 +1,51 @@
+{
+  "ticket": "OCV5-614",
+  "uid": 765,
+  "session": "webmvljtrqyyk9tkj",
+  "method": "Independent read-only SQL audit joined by clientMessageId -> dispatch_id -> usage_records/journal/ledger; each price snapshot recalculated with existing computeCostFen",
+  "unit": "fen; 100 fen = 1 displayed credit",
+  "rows": [
+    {
+      "atUtc": "2026-10-23 22:36",
+      "clientMessageId": "m-mvljtv3r-1-5q5f",
+      "model": "gpt-6-luna",
+      "dispatchId": "a70a58d2-eb96-4d11-82ec-4866942d0c37",
+      "usageId": 26807,
+      "ledgerId": 24894,
+      "inputTokens": 200453,
+      "outputTokens": 7,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "priceFenPerMtok": [53, 265, 11, 64],
+      "multiplier": "0.400",
+      "usageFen": 5,
+      "formulaFen": 5,
+      "journalStatus": "committed",
+      "journalFen": 5,
+      "ledgerFen": -5
+    },
+    {
+      "atUtc": "2026-10-23 22:39",
+      "clientMessageId": "m-mvljyj5s-1-s0u0",
+      "model": "gpt-6-astra",
+      "dispatchId": "82f7c8a2-6868-4577-ba83-c20af7056caa",
+      "usageId": 26808,
+      "ledgerId": 24895,
+      "inputTokens": 208841,
+      "outputTokens": 7,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "priceFenPerMtok": [598, 3598, 60, 0],
+      "multiplier": "1.000",
+      "usageFen": 125,
+      "formulaFen": 125,
+      "journalStatus": "committed",
+      "journalFen": 125,
+      "ledgerFen": -125
+    }
+  ],
+  "totalUsageFen": 130,
+  "totalJournalFen": 130,
+  "totalLedgerFen": -130,
+  "reconciliation": "MATCH"
+}

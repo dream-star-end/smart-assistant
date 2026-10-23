@@ -49,3 +49,5 @@ export { measureLogWrite, takeLogWriteTimingSnapshot } from './logWriteTiming.js
 export * from './upstreamRetryHint.js'
 
 export * from './systemActions.js'
+
+export type { ModelSwitchCostRequest, ModelSwitchCostQuote, ModelSwitchCostRange } from './modelSwitchCost.js'

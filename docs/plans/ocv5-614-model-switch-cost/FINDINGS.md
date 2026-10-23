@@ -50,6 +50,9 @@
 - 2026-10-23 22:21 UTC 第一次浏览器访问恰遇在途发布切流，18790 拒绝连接；失败原件保留 `evidence/baseline-ui-attempt1-failed.json`（远端证据目录），没有登录/模型调用。
 - 22:24 UTC 第二次使用真实冷浏览器登录，响应用户为 **765**；无模型请求。桌面 1440×1000、手机 390×844 的现有模型菜单截图已取回同目录 `evidence/`。
 - 该登录返回的可用价格示例（积分 / 千 token，已含模型倍率）：GPT-6-Astra 输入 0.005980、输出 0.035980、读 0.000600、写 0；DeepSeek V4.1 Flash 输入 0.001120、输出 0.003370、读 0.000030、写 0。可见大上下文首轮风险与固定 cost_x 并非同一概念。
-- **真实模型切换与扣费实测尚未执行**：OCV5-611 发布仍占用共享列车。待正式空闲后仅创建本票自己的 uid 765 会话，不使用其已有会话。
+- 22:33:42 UTC 共享等待脚本返回 FREE 后，仅使用本票新建会话 `webmvljtrqyyk9tkj` 实测。源 GPT-6-Luna 首轮输入 **200,453**、输出 7、缓存读写 0；切 GPT-6-Astra 时现有弹层只提示多模态降档，**没有预估积分或余额**。使用现有“直接切换”后同会话首轮输入 **208,841**、输出 7、缓存读写 0。
+- 源轮实扣 **5 分 = 0.05 积分**；切换后首轮 **125 分 = 1.25 积分**，为源轮 25 倍。按真实 price_snapshot 和 computeCostFen 重算，usage / committed journal / ledger 逐请求相等；合计 **130 分 = 1.30 积分**。精确用量/dispatch/ledger ID 见 `evidence/baseline-billing-audit.json`。
+- 真实浏览器证据：`evidence/baseline-turns.checkpoint.json`、`baseline-resume.json`；改前桌面/手机弹层截图 `desktop-before-switch-notice.png`、`mobile-before-switch-notice.png`。第一次大上下文脚本在等待选择器标签时因现有压缩弹层超时；失败原件保留，恢复脚本沿同一会话继续，没有重复发送源轮。
+- 额外 **8,388** 输入 token 的差异证明“上次调用计数”不能作为下一轮精确承诺；输出预测与上下文变化必须作为估计说明。当前 1 积分默认阈值会覆盖此实测场景。
 
 远端证据根：`/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g614-model-switch-cost/`。
