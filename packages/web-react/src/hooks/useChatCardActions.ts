@@ -28,6 +28,10 @@ import type { ImplicitReason } from "./useResponseRatings";
 import type { ChatError } from "../components/ErrorBanner";
 import type { SaveToProjectRequest } from "../components/project/SaveToProjectDialog";
 import type { ToastFn } from "../components/ui/Toast";
+import type { BlogDraft } from "../components/tutorials/blog/blogLib";
+
+/** 对话里的经验分享卡要打开的地方（App 负责打开教程中心的经验分享页签）。 */
+export type BlogOpenTarget = { kind: "post"; id: string } | { kind: "mine" } | { kind: "editor"; seed: BlogDraft };
 
 function replyQuoteText(message: ChatMessage): string {
   if (message.text.trim()) return message.text;
@@ -45,10 +49,13 @@ export type ChatCardActionsInput = {
   chat: UseChatSocket;
   chipsBoardProjectId: string | null;
   chipsProjectName: string;
+  /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
+  communityBlogEnabled: boolean;
   demo: boolean;
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
+  openBlog: (target: BlogOpenTarget) => void;
   openManage: (tab: ManageTab) => void;
   openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
@@ -80,10 +87,12 @@ export function useChatCardActions({
   chat,
   chipsBoardProjectId,
   chipsProjectName,
+  communityBlogEnabled,
   demo,
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
+  openBlog,
   openManage,
   openPane,
   openSettings,
@@ -197,8 +206,28 @@ export function useChatCardActions({
                   },
                 }
               : {}),
+            ...(communityBlogEnabled
+              ? {
+                  communityBlog: {
+                    precheck: (draft: BlogDraft) => api.precheckCommunityTutorial(authRef.current, draft),
+                    readContainerImage: async (path: string) => {
+                      const url = (await api.mediaSign(authRef.current, [path])).urls[path];
+                      if (!url) throw new Error("图片签名失败");
+                      const res = await fetch(url);
+                      if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
+                      return res.blob();
+                    },
+                    uploadImage: (image: Blob) => api.uploadTutorialImage(authRef.current, image),
+                    submit: (draft: BlogDraft) => api.submitCommunityTutorial(authRef.current, draft),
+                    getMine: (id: string) => api.getMyCommunityTutorial(authRef.current, id),
+                    openPost: (id: string) => openBlog({ kind: "post", id }),
+                    openMine: () => openBlog({ kind: "mine" }),
+                    openEditor: (seed: BlogDraft) => openBlog({ kind: "editor", seed }),
+                  },
+                }
+              : {}),
           },
-    [demo, openManage, setBoardOpen],
+    [demo, openManage, setBoardOpen, communityBlogEnabled, openBlog],
   );
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),

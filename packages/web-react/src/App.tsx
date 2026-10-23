@@ -224,7 +224,8 @@ import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } fr
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
-import { useChatCardActions } from "./hooks/useChatCardActions";
+import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
+import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
 import { useComposerSend } from "./hooks/useComposerSend";
@@ -454,6 +455,8 @@ export function App() {
   const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(urlRoute.tutorialCommunity);
   // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
   const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(urlRoute.tutorialTab);
+  // 对话里的经验分享卡请求的子视图（我的投稿 / 带草稿的编辑器）；教程中心关闭即作废。
+  const [blogRequest, setBlogRequest] = useState<BlogViewRequest | null>(null);
   const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(urlRoute.tutorialWork);
   const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -1411,6 +1414,18 @@ export function App() {
   // 横幅 2s 延迟（P3 RFC D6）：断开 >2s 才点亮，2s 内重连成功零闪烁。只作用于横幅显示——
   // deriveConnBanner 仍即时反映断线真相，断线排队/禁发等发送语义不受影响。
   const connBanner = useDelayedConnBanner(rawConnBanner);
+  useEffect(() => {
+    if (!tutorialOpen) setBlogRequest(null);
+  }, [tutorialOpen]);
+  const openBlog = useCallback(
+    (target: BlogOpenTarget) => {
+      openTutorial();
+      setTutorialTab("blog");
+      if (target.kind === "post") setTutorialCommunity(target.id);
+      setBlogRequest(target.kind === "post" ? null : { ...target, nonce: Date.now() });
+    },
+    [openTutorial],
+  );
   const {
     artifactInspect,
     cardCallbacks,
@@ -1426,10 +1441,12 @@ export function App() {
     chat,
     chipsBoardProjectId,
     chipsProjectName,
+    communityBlogEnabled,
     demo,
     loadExactUserMessage,
     messageFeedbackTriggerRef,
     newSession,
+    openBlog,
     openManage,
     openPane,
     openSettings,
@@ -1727,6 +1744,7 @@ export function App() {
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
               blogEnabled={communityBlogEnabled}
+              blogRequest={blogRequest}
               onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
@@ -2748,6 +2766,7 @@ export function App() {
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
             blogEnabled={communityBlogEnabled}
+            blogRequest={blogRequest}
             onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}

@@ -88,7 +88,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { CommunityTutorials } from "./tutorials/CommunityTutorials";
-import { CommunityBlog } from "./tutorials/blog/CommunityBlog";
+import { type BlogViewRequest, CommunityBlog } from "./tutorials/blog/CommunityBlog";
 import { CaseShowroom, ShowcaseDetail } from "./tutorials/CaseShowroom";
 import { showcaseById } from "../lib/tutorialShowcase";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
@@ -238,6 +238,7 @@ export function TutorialCenter({
   onSignatureWorkChange,
   stepIndex = null,
   blogEnabled = true,
+  blogRequest = null,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
@@ -274,6 +275,8 @@ export function TutorialCenter({
    * 商业版默认关；关闭时页签隐藏，`tab=blog` 深链回落到案例展厅。缺省 true 只为 ui-preview 与旧测试。
    */
   blogEnabled?: boolean;
+  /** 对话里的经验分享卡请求打开「我的投稿」或带草稿的编辑器（nonce 变化即执行一次）。 */
+  blogRequest?: BlogViewRequest | null;
 }) {
   // 经验分享的文章详情也走 communityId，但它属于 blog 页签，不打开教程工作室。
   const [communityOpen, setCommunityOpen] = useState(!!communityId && browseViewProp !== "blog");
@@ -628,6 +631,7 @@ export function TutorialCenter({
                     onRequireLogin={onRequireLogin}
                     detailId={communityId}
                     onDetailIdChange={onCommunityChange}
+                    request={blogRequest}
                   />
                 ) : mode === "community" ? (
                   <CommunityTutorials
