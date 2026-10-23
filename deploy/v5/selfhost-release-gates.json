@@ -11,6 +11,7 @@
     { "id": "callback-payload-hash", "script": "scripts/check-v5-callback-payload-hash.mjs", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "cron-submit-boundary", "script": "scripts/check-v5-cron-submit-boundary.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "system-approval-fencing", "script": "scripts/check-v5-system-approval-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "system-executor-fencing", "script": "scripts/check-v5-system-executor-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "session-unavailable-rootfix", "script": "scripts/check-v5-session-unavailable-rootfix.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "host-log-policy", "script": "scripts/v5-selfhost-host-log-policy.test.sh", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "architecture", "script": "scripts/check-architecture.ts", "ci": "v5-selfhost-gates.yml" },

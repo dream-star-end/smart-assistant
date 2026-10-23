@@ -1091,6 +1091,12 @@ build_master_release() {
     cleanup_master_staging
     die "pinned system approval fencing proof failed"
   fi
+  tsum_mark C.system-executor 2>/dev/null || :
+  mlog "  independent browser approval and frozen executor proof @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned system executor fencing proof failed"
+  fi
   tsum_mark C.session-rootfix 2>/dev/null || :
   mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then

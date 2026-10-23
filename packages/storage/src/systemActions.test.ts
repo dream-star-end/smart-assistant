@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 import Database from 'better-sqlite3'
 import type { SystemActionPreview } from '@openclaude/protocol'
-import { SystemActionError, SystemActionStore, type PrepareSystemAction, type SystemActionExecution } from './systemActions.js'
+import { SystemActionError, SystemActionStore, systemActionRequestHash, type PrepareSystemAction, type SystemActionExecution } from './systemActions.js'
 
 const USER = '765'
 const OTHER_FIXTURE_USER = 'synthetic-other'
@@ -245,4 +245,46 @@ describe('master-private persistent system action approvals', () => {
     assert.equal(wrong.get(USER, a.id).state, 'prepared')
     wrong.close()
   })
+})
+
+test('stable original request replay survives a changed business snapshot and process reopen', () => {
+  const f = setup()
+  const original = { operationId: 'preferences.update', args: { intelligent_ui: false, theme: 'dark' } }
+  const requestHash = systemActionRequestHash(original)
+  let store = f.create()
+  const prepared = store.prepare({ ...input({ idempotencyKey: 'stable-original' }), requestHash })
+  store.close(); store = f.create()
+  try {
+    assert.equal(systemActionRequestHash({ args: { theme: 'dark', intelligent_ui: false }, operationId: 'preferences.update' }), requestHash)
+    assert.equal(store.replayPrepared(USER, 'stable-original', requestHash)?.id, prepared.id)
+    const concurrentRecompute = store.prepare({ ...input({ idempotencyKey: 'stable-original' }), requestHash, expectedVersion: 'a-new-resource-version', preview: { ...preview, before: [{ label: '通知', value: '其他设备刚更改' }] } })
+    assert.equal(concurrentRecompute.id, prepared.id)
+    assert.deepEqual(store.detail(USER, prepared.id).preview, preview)
+    assert.throws(() => store.replayPrepared(USER, 'stable-original', systemActionRequestHash({ ...original, args: { intelligent_ui: true } })), e => e instanceof SystemActionError && e.code === 'CONFLICT')
+    assert.equal(store.replayPrepared(OTHER_FIXTURE_USER, 'stable-original', requestHash), null)
+  } finally { store.close() }
+})
+for (const legacyVersion of [0, 1]) test(`a legacy private ledger (version ${legacyVersion}) migrates without losing its owner-scoped terminal receipt`, () => {
+  const f = setup()
+  const legacy = new Database(f.dbPath)
+  legacy.exec(`CREATE TABLE system_actions (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL, operation_version INTEGER NOT NULL, executor TEXT NOT NULL,
+    resource_key TEXT NOT NULL, idempotency_key TEXT NOT NULL, input_hash TEXT NOT NULL, preview_hash TEXT NOT NULL,
+    title TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    sealed TEXT, quote_hash TEXT, expected_version TEXT, device_id TEXT, approval_hash TEXT,
+    grant_hash TEXT, execution_hash TEXT, executor_id TEXT, result_json TEXT, UNIQUE(user_id,idempotency_key));
+    PRAGMA user_version=${legacyVersion};`)
+  legacy.prepare(`INSERT INTO system_actions (id,user_id,session_id,agent_id,operation_id,operation_version,executor,
+    resource_key,idempotency_key,input_hash,preview_hash,title,state,created_at,updated_at,expires_at,result_json)
+    VALUES ('legacy-action',?,'fixture','main','preferences.update',1,'master','resource','legacy-key','input','preview','旧审批','succeeded',1,2,3,?)`).run(USER, JSON.stringify({ summary: '已保存', completion: 'done' }))
+  legacy.close()
+  const store = f.create()
+  try {
+    assert.equal(store.get(USER, 'legacy-action').result?.summary, '已保存')
+    assert.throws(() => store.replayPrepared(USER, 'legacy-key', systemActionRequestHash({})), e => e instanceof SystemActionError && e.code === 'CONFLICT')
+    const inspect = new Database(f.dbPath, { readonly: true })
+    assert.equal(inspect.pragma('user_version', { simple: true }), 2)
+    inspect.close()
+  } finally { store.close() }
 })

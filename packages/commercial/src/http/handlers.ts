@@ -125,6 +125,8 @@ import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 
 export interface CommercialHttpDeps {
+  /** Master-private system actions; absent until explicit composition has initialized the ledger. */
+  systemActionsHttp?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   literatureSetup?: LiteratureSetupService
   literatureArtifacts?: LiteratureArtifactStore
   jwtSecret: string | Uint8Array;
@@ -1655,24 +1657,9 @@ export async function handlePatchMyPreferences(
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
   }
-  const requestedAutoDream = (body as Record<string, unknown>).auto_dream_enabled;
-  const requestedOptimizer = (body as Record<string, unknown>).auto_optimizer_enabled;
-  if (requestedAutoDream === true || requestedOptimizer === true) {
-    const { getAutoDreamFeature } = await import("../user/autoDream.js");
-    const feature = await getAutoDreamFeature(user.id, true);
-    if (!feature.eligible) {
-      throw new HttpError(403, "AUTO_DREAM_MAX_REQUIRED", "Auto-Dream requires Max or above");
-    }
-    if (!feature.available) {
-      throw new HttpError(503, "AUTO_DREAM_UNAVAILABLE", "Auto-Dream model is unavailable");
-    }
-  }
-  const { normalizeAutoDreamPreferencePatch } = await import("../user/autoDream.js");
-  const effectiveBody = normalizeAutoDreamPreferencePatch(body as Record<string, unknown>);
-  // V2 and V1 are mutually exclusive. Turning on V2 first turns the legacy
-  // auto-mutating path off, so rolling back to an older runtime remains safe.
-  const { patchPreferences, PreferencesError } = await import("../user/preferences.js");
+  const { patchPreferences, PreferencesError, resolvePreferencesPatch } = await import("../user/preferences.js");
   try {
+    const effectiveBody = await resolvePreferencesPatch(user.id, body);
     const snap = await patchPreferences(user.id, effectiveBody);
     const { getAutoDreamFeature } = await import("../user/autoDream.js");
     const autoDream = await getAutoDreamFeature(
@@ -1691,6 +1678,8 @@ export async function handlePatchMyPreferences(
     });
   } catch (err) {
     if (err instanceof PreferencesError) {
+      if (err.code === 'FORBIDDEN') throw new HttpError(403, 'AUTO_DREAM_MAX_REQUIRED', err.message);
+      if (err.code === 'UNAVAILABLE') throw new HttpError(503, 'AUTO_DREAM_UNAVAILABLE', err.message);
       if (err.code === "VALIDATION") {
         throw new HttpError(400, "INVALID_PREFERENCES", err.message);
       }
