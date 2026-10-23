@@ -226,7 +226,7 @@ export async function patchPreferences(
     // Lock the actor row for this same statement. Concurrent role/status changes
     // serialize with the approved mutation, rather than racing a prior ACL read.
     prefix = prefix.replace('WITH ', `WITH eligible_user AS MATERIALIZED (
-      SELECT id FROM users WHERE id=$1 AND status='active' AND role=${roleParam} FOR SHARE
+      SELECT id FROM users WHERE id=$1 AND status='active' AND deleted_at IS NULL AND role=${roleParam} FOR SHARE
     ), `);
     values = values.replace('WHERE\n      ', 'WHERE EXISTS (SELECT 1 FROM eligible_user) AND (\n      ') + ')';
     conflictGuard += ' AND EXISTS (SELECT 1 FROM eligible_user)';

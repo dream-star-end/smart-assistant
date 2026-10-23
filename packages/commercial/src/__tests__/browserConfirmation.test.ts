@@ -17,7 +17,7 @@ async function setup() {
   const runner = { async query(sql: string, params: unknown[]) {
     reads++
     assert.ok(sql.trimStart().startsWith('SELECT '))
-    for (const predicate of ['rt.revoked_at IS NULL', 'rt.rotated_to_id IS NULL', 'rt.expires_at > CURRENT_TIMESTAMP', "u.status = 'active'", 'rt.user_id = $2::bigint']) assert.ok(sql.includes(predicate))
+    for (const predicate of ['rt.revoked_at IS NULL', 'rt.rotated_to_id IS NULL', 'rt.expires_at > CURRENT_TIMESTAMP', "u.status = 'active'", 'u.deleted_at IS NULL', 'rt.user_id = $2::bigint']) assert.ok(sql.includes(predicate))
     assert.ok(params[0] === refresh.hash && params[1] === '765')
     return { rows: active ? [{ id: '765', role: dbRole, refresh_session_id: '91', refresh_family_id: family }] : [] }
   } } as unknown as QueryRunner

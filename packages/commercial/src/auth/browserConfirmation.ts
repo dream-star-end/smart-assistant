@@ -55,7 +55,7 @@ export async function findActiveRefreshSession(tokenHash: string, expectedUserId
        FROM refresh_tokens rt JOIN users u ON u.id = rt.user_id
       WHERE rt.token_hash = $1 AND rt.user_id = $2::bigint
         AND rt.revoked_at IS NULL AND rt.rotated_to_id IS NULL AND rt.expires_at > CURRENT_TIMESTAMP
-        AND u.status = 'active' AND u.role IN ('user', 'admin') LIMIT 1`, [tokenHash, expectedUserId])
+        AND u.status = 'active' AND u.deleted_at IS NULL AND u.role IN ('user', 'admin') LIMIT 1`, [tokenHash, expectedUserId])
   const row = result.rows[0]
   if (!row || row.id !== expectedUserId || !['user', 'admin'].includes(row.role) || !UUID.test(row.refresh_family_id) || !/^[1-9][0-9]*$/.test(row.refresh_session_id)) return null
   return { id: row.id, role: row.role as 'user' | 'admin', refreshFamilyId: row.refresh_family_id, refreshSessionId: row.refresh_session_id }
