@@ -491,7 +491,7 @@ slot_baseline_dir() { # <A|B>
 run_baseline_guard_remote() { # <mode> <absolute-path> [extra-args...]
   local guard_mode="$1" target="$2" qmode qtarget extra_q="" q a
   shift 2
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-structure-release|check-structure-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
