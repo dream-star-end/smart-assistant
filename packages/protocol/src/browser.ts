@@ -47,3 +47,6 @@ export * from './identityCompat.js'
 export * from './serverFeatures.js'
 export { measureLogWrite, takeLogWriteTimingSnapshot } from './logWriteTiming.js'
 export * from './upstreamRetryHint.js'
+
+export * from './promptPrivacy.js'
+export * from './systemActions.js'

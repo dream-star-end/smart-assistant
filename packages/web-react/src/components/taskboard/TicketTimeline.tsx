@@ -529,7 +529,7 @@ export function TicketTimeline({
 
   return (
     <div
-      className="flex min-w-0 max-w-full flex-col gap-3 overflow-x-hidden border-t border-border pt-3"
+      className="flex min-w-0 max-w-full shrink-0 flex-col gap-3 overflow-x-hidden border-t border-border pt-3"
       data-testid="ticket-timeline"
       data-filter={filter}
     >

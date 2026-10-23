@@ -1,3 +1,5 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
+import { withFreshPromptPrivacy, refreshRunnerPromptPrivacy, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from '../promptPrivacyRuntime.js'
 /** Stable cursor-engine facade. One account-pool credential is bound at a
  * time; its admin-authored Sand flag pins the session transport while
  * same-transport credential failover preserves native history. */
@@ -120,6 +122,34 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   private credentialNeedsRefresh = false
   private readonly selectCredential: typeof selectCursorCredential
   private goal: GoalStateSnapshot | null = null
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return (this.inner as EngineAdapter & PromptPrivacyRunner).promptPolicyFingerprint }
+  get setPromptPrivacy(): ((policy: PromptPrivacyPolicy) => void) | undefined {
+    return this.variant === 'native' ? undefined : this.applyPromptPrivacy
+  }
+  private readonly applyPromptPrivacy = (policy: PromptPrivacyPolicy): void => {
+    this.promptPolicy = structuredClone(policy)
+    const inner = this.inner as EngineAdapter & PromptPrivacyRunner
+    if (!inner.setPromptPrivacy) throw new Error('常驻引擎缺少隐私刷新接口。')
+    inner.setPromptPrivacy(policy)
+  }
+  clearPromptPrivacy(): void {
+    this.promptPolicy = undefined
+    ;(this.inner as EngineAdapter & PromptPrivacyRunner).clearPromptPrivacy?.()
+  }
+  assertPromptPrivacyStopped(): void {
+    if (this.variant === 'native') return
+    const inner = this.inner as EngineAdapter & PromptPrivacyRunner
+    if (!inner.assertPromptPrivacyStopped) throw new Error('无法核验常驻引擎是否已停止。')
+    inner.assertPromptPrivacyStopped()
+  }
+  private async withInnerPrivacy<T>(operation: (inner: EngineAdapter) => Promise<T>): Promise<T> {
+    const inner = this.inner
+    if (this.variant === 'native' || this.promptPolicy) return operation(inner)
+    const generation = this.lifecycleGeneration
+    return withFreshPromptPrivacy(inner, this.opts.sessionId, () => { this.assertLifecycle(generation); return operation(inner) })
+  }
+
   private readonly innerListeners = new Map<string, (...args: unknown[]) => void>()
   private activeCancel: (() => boolean) | null = null
   private lifecycleGeneration = 0
@@ -186,9 +216,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
         : 'ccb' as const,
       boxResidentCc: variant === 'sand-box-cc',
     }
-    if (variant === 'native') return new CursorAdapter(innerOpts)
-    if (variant === 'sand-box-cc') return new CursorBoxCcAdapter(innerOpts)
-    return new CursorSandAdapter(innerOpts)
+    const inner = variant === 'native' ? new CursorAdapter(innerOpts)
+      : variant === 'sand-box-cc' ? new CursorBoxCcAdapter(innerOpts) : new CursorSandAdapter(innerOpts)
+    if (this.promptPolicy && variant !== 'native') {
+      const setter = (inner as EngineAdapter & PromptPrivacyRunner).setPromptPrivacy
+      if (!setter) throw new Error('常驻引擎缺少隐私刷新接口。')
+      setter.call(inner, this.promptPolicy)
+    }
+    return inner
   }
 
   private bindInner(): void {
@@ -339,7 +374,7 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     await this.trackLifecycle(this.withLifecycleLock(async () => {
       await this.ensureVariant(generation)
       this.assertLifecycle(generation)
-      await this.inner.start()
+      await this.withInnerPrivacy(inner => inner.start())
       this.assertLifecycle(generation)
     }))
   }
@@ -349,8 +384,8 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     await this.trackLifecycle(this.withLifecycleLock(async () => {
       await this.ensureVariant(generation)
       this.assertLifecycle(generation)
-      if (this.inner.preheat) await this.inner.preheat()
-      else await this.inner.start()
+      if (this.inner.preheat) await this.withInnerPrivacy(inner => inner.preheat!())
+      else await this.withInnerPrivacy(inner => inner.start())
       this.assertLifecycle(generation)
     }))
   }
@@ -358,6 +393,8 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   submitTurn(params: TurnParams): EngineTurnRun {
     const generation = this.lifecycleGeneration
     let innerRun: EngineTurnRun | null = null
+    let privacyLeaseInner: (EngineAdapter & PromptPrivacyRunner) | null = null
+    const releasePrivacy = (): void => { if (privacyLeaseInner) clearRunnerPromptPrivacy(privacyLeaseInner); privacyLeaseInner = null }
     let ended = false
     let resolveSummary!: (summary: Awaited<EngineTurnRun['summary']>) => void
     const summary = new Promise<Awaited<EngineTurnRun['summary']>>((resolvePromise) => {
@@ -385,13 +422,21 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
           clearActiveCancel()
           return
         }
+        if (this.variant !== 'native' && !this.promptPolicy) {
+          privacyLeaseInner = this.inner
+          await refreshRunnerPromptPrivacy(privacyLeaseInner, this.opts.sessionId)
+          this.assertLifecycle(generation)
+        }
+        if (ended) { releasePrivacy(); resolveSummary(null); clearActiveCancel(); return }
         innerRun = this.inner.submitTurn(params)
         void innerRun.summary.then((result) => {
+          releasePrivacy()
           resolveSummary(result)
           clearActiveCancel()
-        })
+        }, () => { releasePrivacy(); resolveSummary(null); clearActiveCancel() })
         await innerRun.submitted
       } catch (error) {
+        releasePrivacy()
         resolveSummary(null)
         clearActiveCancel()
         throw error

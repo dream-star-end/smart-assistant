@@ -411,6 +411,7 @@ export function AppDialogs({
       {settingsOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
+            activeSessionId={activeId}
             open={settingsOpen}
             initialSection={settingsSection}
             auth={auth}

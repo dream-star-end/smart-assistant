@@ -5869,13 +5869,19 @@
         "74984cbf",
         "92acb899",
         "dc1ea28c",
-        "43b509a0"
+        "43b509a0",
+        "571fa589"
       ],
       "proofPending": {
         "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
         "since": "2026-10-05"
       },
       "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCcWriteCleanup.test.ts",
+          "assertion": "a clean host exit cannot hide a refused write"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
@@ -8044,6 +8050,67 @@
       ]
     },
     {
+      "id": "INC-20261024-CANONICAL-ADMITTED-AGENT",
+      "occurredAt": "2026-10-23",
+      "severity": "P2",
+      "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
+      "rootFixCommit": "1bb8a534",
+      "coverageCommits": [
+        "892f3ed6"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "OCV5-613 canonical identity follows the admitted dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "OCV5-613 admitted canonical projection"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-callback-payload-hash.mjs",
+          "assertion": "OCV5-613 deploy proof: canonical trace uses admitted identity"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261023-SYSTEM-APPROVAL-FENCING",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选在默认Codex审查及独立SQLite fixture中发现：同资源预先创建的master/browser提案可绕过另一次执行的unknown闸门；DEFERRED事务升级可出现SQLITE_BUSY_SNAPSHOT，使完成回执丢失。未涉及真实用户副作用或资金。",
+      "rootFixCommit": "e72089cd",
+      "coverageCommits": [
+        "987d2125"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-approval-proofs.ts",
+          "assertion": "[ocv5-610-durable-approval-fencing] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261023-PROMPT-PRIVACY-LIFECYCLE",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选默认Codex复审发现：隐私metadata失败后可能遗留已修改的desired配置，使重试跳过warm重启；native compact/preheat等待metadata期间销毁会话仍可新启动。仅隔离fixture复现，无真实用户、模型或资金影响。",
+      "rootFixCommit": "4395e393",
+      "coverageCommits": [
+        "4395e393"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-prompt-privacy-proofs.ts",
+          "assertion": "[prompt-privacy-proofs] PASS fresh consent, operation lifetime and stopped-process boundary"
+        }
+      ]
+    },
+    {
       "id": "INC-20261024-CCB-TRANSCRIPT-INTEGRITY",
       "occurredAt": "2026-10-24",
       "severity": "P1",
@@ -8087,6 +8154,9 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts"
         }
+      ],
+      "coverageCommits": [
+        "43f18ea0"
       ]
     }
   ]

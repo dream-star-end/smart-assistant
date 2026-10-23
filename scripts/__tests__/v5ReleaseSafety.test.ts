@@ -4797,6 +4797,7 @@ describe('v5 release safety lanes', () => {
       'model_authority_v1',
       'lossless-turn-tape-v2',
       'durable-turn-dispatch-v1',
+      'prompt-privacy-v1',
     ])
     assert.ok(meta.capabilities.includes('durable-turn-dispatch-v1'))
     assert.ok(meta.requiredMigrations.includes('0170_durable_turn_dispatch'))
