@@ -19,7 +19,9 @@ the private gpg key never leaves Box/user custody.
   Unix-socket cluster/database/epoch. Role credentials reach psql only through PG environment.
 - Remote execution has an independent guardian and a gated body process group. Every
   qualification is killed after five seconds. Lost proof, a dead supervisor or an unexpected
-  guardian exit kills the owned body group. This prevents a half-open command SSH leaving a
+  guardian exit kills the owned body group. A Python waiter retains an exited body leader
+  with WNOWAIT until it kills remaining descendants, then reaps it; killing only the body
+  shell therefore cannot release the lease while an orphan dump continues. This prevents a half-open command SSH leaving a
   long-running dump. It reuses the official lease's failure contract; it does not add a new
   lease protocol or promise zero scheduling latency after an externally killed holder.
 - Recovery markers are checked under `/opt/openclaude/openclaude-v5-releases`.
@@ -40,7 +42,7 @@ merge SHA. Archive these files into `/root/ocv5-600-pg-r2-<sha>`:
 - `scripts/v5-commercial-pg-backup{,-controller}.sh`
 - `scripts/v5-commercial-pg-backup-lease.ts`
 - `scripts/v5-selfhost-pg-backup-r2.sh`
-- `scripts/lib/v5-commercial-backup-supervisor.sh`
+- `scripts/lib/v5-commercial-backup-supervisor.sh` and `v5-commercial-backup-waiter.py`
 - unchanged `scripts/with-production-mutation-lease.sh`, `scripts/lib/v5-mutation-admission.sh`
 - unchanged `ops/ocv5-308/model-release-operator.ts`
 - `deploy/v5-dev/openclaude-v5-pg-r2-backup.{service,timer}`

@@ -259,9 +259,9 @@ case "$cmd" in
   status) if [[ -f "$STATUS_FILE" ]]; then cat -- "$STATUS_FILE"; else echo '{"schemaVersion":1}'; fi; exit 0 ;;
   __watch) backup_watch "$2" "$3" "$4"; exit $? ;;
   __body)
-    [[ "$PPID" == "$3" ]] && backup_live "$3" "$4" || exit 1
+    [[ "$PPID" == "$3" ]] && backup_live "$3" "$4" && backup_live "$5" "$6" || exit 1
     [[ -e /proc/$$/fd/9 && /proc/$$/fd/9 -ef "$LOCK_FILE" ]] || exit 1
-    while [[ ! -e "$2/go" ]]; do backup_live "$3" "$4" || exit 1; sleep 0.02; done
+    while [[ ! -e "$2/go" ]]; do backup_live "$3" "$4" && backup_live "$5" "$6" || exit 1; sleep 0.02; done
     trap drop_marker EXIT
     rc=0; run || rc=$?; exit "$rc"
     ;;

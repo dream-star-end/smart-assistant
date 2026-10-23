@@ -113,6 +113,8 @@ beforeEach(() => {
       '  lose) echo $$ > "$STUB_DIR/dump.pid"; touch "$STUB_DIR/lease_invalid"; exec sleep 40 ;;',
       '  parentdie) echo $$ > "$STUB_DIR/dump.pid"; kill -KILL "$V5CB_SUPERVISOR_PID"; exec sleep 40 ;;',
       '  guarddie) echo $$ > "$STUB_DIR/dump.pid"; kill -KILL "$V5CB_GUARDIAN_PID"; exec sleep 40 ;;',
+      '  waiterdie) echo $$ > "$STUB_DIR/dump.pid"; kill -KILL "$V5CB_WAITER_PID"; exec sleep 40 ;;',
+      '  bodydie) echo $$ > "$STUB_DIR/dump.pid"; sleep 40 & echo $! > "$STUB_DIR/dump-child.pid"; body=$(cut -d" " -f1 "$V5CB_MARKER"); kill -KILL "${body#pid=}"; exec sleep 40 ;;',
       '  hold) echo $$ > "$STUB_DIR/dump.pid"; exec sleep 40 ;;',
       '  big) head -c 300000 /dev/zero ;;',
       '  *) cat "$STUB_DIR/run/openclaude/pg-r2-backup.running" > "$STUB_DIR/marker_during_dump" 2>/dev/null; echo "PGDMP-commercial" ;;',
@@ -251,7 +253,7 @@ describe('v5-commercial-pg-backup.sh', () => {
     assert.deepEqual(objects('pg/full'), [])
   })
 
-  for (const mode of ['parentdie', 'guarddie']) {
+  for (const mode of ['parentdie', 'guarddie', 'waiterdie']) {
     test(`${mode}: the other execution supervisor kills the dump and prevents upload`, () => {
       writeFileSync(path.join(dir, 'dump_mode'), mode)
       const started = Date.now()
@@ -264,6 +266,27 @@ describe('v5-commercial-pg-backup.sh', () => {
       assert.equal(existsSync(path.join(dir, 'run/openclaude/pg-r2-backup.running')), false)
     })
   }
+
+  test('bodydie: clear orphaned dump descendants before releasing the backup lock', () => {
+    const sentinel = spawn('sleep', ['60'], { stdio: 'ignore' })
+    try {
+      writeFileSync(path.join(dir, 'dump_mode'), 'bodydie')
+      const started = Date.now()
+      const r = run()
+      assert.notEqual(r.status, 0, r.out)
+      assert.ok(Date.now() - started < 15_000, `orphan ran until its natural timeout: ${r.out}`)
+      for (const file of ['dump.pid', 'dump-child.pid']) {
+        const pid = Number(readFileSync(path.join(dir, file), 'utf8'))
+        assert.equal(alive(pid), false, `owned descendant ${pid} survived body death`)
+      }
+      assert.deepEqual(objects('pg/full'), [])
+      assert.equal(existsSync(path.join(dir, 'run/openclaude/pg-r2-backup.running')), false)
+      assert.equal(spawnSync('flock', ['-n', path.join(dir, 'run/backup.lock'), 'true']).status, 0)
+      assert.ok(sentinel.pid && alive(sentinel.pid), 'unrelated sentinel was killed')
+    } finally {
+      sentinel.kill('SIGKILL')
+    }
+  })
 
   test('waits for the file-level backup unit, and skips when it stays active', () => {
     writeFileSync(path.join(dir, 'active_polls'), '2')

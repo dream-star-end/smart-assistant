@@ -34,19 +34,22 @@ backup_watch() { # private-dir supervisor-pid supervisor-start
       fi
       return 1
     fi
-    [[ -z "$body" ]] || backup_live "$body" "$body_start" || return 0
+    # Only the waiter reports completion, after it kills all remaining group members.
     sleep 1
   done
 }
 backup_supervise() {
-  local state parent_start watch watch_start body="" body_start="" completed="" rc=1
+  local state parent_start watch watch_start waiter="" waiter_start="" body="" body_start="" completed="" rc=1
   state=$(mktemp -d "${LOCK_FILE}.supervisor.XXXXXX") || return 1
   parent_start=$(backup_start "$$") || return 1
   # Start the independent guardian before creating a body. It closes the backup lock fd.
   ( exec 9>&-; exec setsid bash "$0" __watch "$state" "$$" "$parent_start" ) &
   watch=$!; watch_start=$(backup_start "$watch") || return 1
   backup_supervisor_cleanup() {
+    if [[ -s "$state/body" ]]; then read -r body body_start <"$state/body"; fi
     if [[ -n "$body" ]]; then backup_kill_body "$body" "$body_start"; backup_remove_marker "$body"; fi
+    if [[ -n "$waiter" ]] && backup_same "$waiter" "$waiter_start"; then kill -KILL "$waiter" 2>/dev/null || true; fi
+    if [[ -n "$waiter" ]]; then wait "$waiter" 2>/dev/null || true; fi
     if backup_same "$watch" "$watch_start"; then kill -KILL "$watch" 2>/dev/null || true; fi
     wait "$watch" 2>/dev/null || true
     rm -rf -- "$state"
@@ -59,22 +62,18 @@ backup_supervise() {
     backup_live "$watch" "$watch_start" || return 1
     sleep 0.02
   done
-  # A gate prevents the spawn->identity-write window from starting pg_dump after parent death.
-  set -m
-  V5CB_SUPERVISOR_PID=$$ V5CB_GUARDIAN_PID=$watch bash "$0" __body "$state" "$$" "$parent_start" &
-  body=$!
-  set +m
-  body_start=$(backup_start "$body") || return 1
-  printf '%s %s\n' "$body" "$body_start" >"$state/body"
+  # Python owns/reaps the real body. Its WNOWAIT preserves the group identity until
+  # every descendant is killed; Bash wait-n would reap a killed leader too early.
+  V5CB_SUPERVISOR_PID=$$ V5CB_GUARDIAN_PID=$watch python3 "$SELF_DIR/lib/v5-commercial-backup-waiter.py" "$0" "$state" "$$" "$parent_start" &
+  waiter=$!; waiter_start=$(backup_start "$waiter") || return 1
+  while [[ ! -s "$state/body" ]]; do
+    backup_live "$waiter" "$waiter_start" && backup_live "$watch" "$watch_start" || return 1
+    sleep 0.02
+  done
+  read -r body body_start <"$state/body"
   : >"$state/go"
-  if wait -n -p completed "$body" "$watch"; then rc=0; else rc=$?; fi
-  if [[ "$completed" == "$watch" ]]; then
-    backup_kill_body "$body" "$body_start"
-    wait "$body" 2>/dev/null || true
-    rc=1
-  fi
-  backup_remove_marker "$body"
-  body=""
+  if wait -n -p completed "$waiter" "$watch"; then rc=0; else rc=$?; fi
+  if [[ "$completed" == "$watch" ]]; then rc=1; fi
   backup_supervisor_cleanup
   trap - EXIT INT TERM HUP
   return "$rc"
