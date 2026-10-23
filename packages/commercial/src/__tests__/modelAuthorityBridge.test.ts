@@ -146,10 +146,16 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
+  entries.push(entry({ entryId: 60, modelId: "k3.1-pro", providerId: "moonshot",
+    upstreamModelId: "k3.1-pro", contextWindow: 1_048_576,
+    capabilityProfile: { supportsVision: true,
+      reasoning: { supported: ["low", "high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true } } }));
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
+    ["k3.1-pro", { ...price("k3.1-pro"), defaultEffort: "max" }],
   ]);
   // CCB 子 agent 默认钉是平台 aux 集第二成员;platformAuxModels 对所有声明成员 fail-closed。它与
   // 次级模型不同时夹具常驻它,auxState 只演练首位成员(deepseek)的缺失/禁用。2026-10-20 起二者同为
@@ -747,6 +753,8 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     };
     assert.equal(await grab("user", "kimi-k3"), 512_000);
     assert.equal(await grab("admin", "kimi-k3"), 1_048_576);
+    assert.equal(await grab("user", "k3.1-pro"), 512_000);
+    assert.equal(await grab("admin", "k3.1-pro"), 1_048_576);
     // 未登记模型不受策略影响(哪个角色都拿机制窗口)
     assert.equal(await grab("user", "glm-5.2"), 200_000);
   });
