@@ -175,7 +175,7 @@ import {
   isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
-import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
+import { systemHelpDispatchFields } from "../system-assistant/helpBridge.js";
 import {
   backfillDispatchTraceId,
   casAdmittedToAccepted,
@@ -4159,41 +4159,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         : null;
       return cmid === null ? undefined : admittedDispatches.get(cmid);
     };
-    /** 帧注入 __oc_dispatch envelope(记录存在 + 签发基建就位才注)。mirror MODEL_AUTHORITY_FIELD。 */
-    const dispatchAuthorityField = (
-      record: AdmittedDispatch | undefined,
-    ): Record<string, unknown> => {
-      if (
-        record === undefined ||
-        authorityDeps === undefined ||
-        containerChallenge === null ||
-        containerId === undefined
-      ) {
-        return {};
-      }
-      const fields: Record<string, unknown> = {
-        [DISPATCH_AUTHORITY_FIELD]: mintDispatchEnvelope(authorityDeps.signer, {
-          uid,
-          containerId,
-          sessionId: record.sessionId,
-          clientMessageId: record.clientMessageId,
-          dispatchId: record.dispatchId,
-          attemptNo: record.attemptNo,
-          payloadHash: record.requestHash,
-          billingRequestId: record.billingRequestId,
-          connectionChallenge: containerChallenge,
-        }),
-      };
-      if (containerHasSystemHelp && deps.issueSystemHelpBootstrap) {
-        try {
-          fields[SYSTEM_HELP_BOOTSTRAP_FIELD] = deps.issueSystemHelpBootstrap({
-            uid: uid.toString(), containerId: containerId.toString(), sessionId: record.sessionId, agentId: record.agentId,
-            dispatchId: record.dispatchId, attemptNo: record.attemptNo, ownerId: record.leaseOwnerId, dispatchLeaseEpoch: String(record.leaseEpoch),
-          }).token;
-        } catch { log?.warn('system help unavailable for admitted turn'); }
-      }
-      return fields;
-    };
+    /** Preserve the strict dispatch wire; help is a separate optional sidecar. */
+    const dispatchAuthorityField = (record: AdmittedDispatch | undefined): Record<string, unknown> =>
+      systemHelpDispatchFields({ record, signer: authorityDeps?.signer, uid, containerId,
+        connectionChallenge: containerChallenge, supported: containerHasSystemHelp,
+        issueBootstrap: deps.issueSystemHelpBootstrap, onUnavailable: () => log?.warn('system help unavailable for admitted turn'),
+      });
 
     const recordBillingRecovery = (
       requestId: string,
