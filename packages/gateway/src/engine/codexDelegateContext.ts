@@ -3,7 +3,7 @@ import { issueParentCallerToken } from '../delegateContext.js'
 
 /** Write the immutable caller snapshot selected for this queued turn. */
 export function writeCodexDelegateContext(input: {
-  file?: string
+  file?: string | null
   agentId: string
   sessionKey: string
   depth: number

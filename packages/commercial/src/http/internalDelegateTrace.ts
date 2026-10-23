@@ -73,11 +73,12 @@ export function makeDelegateTraceHandler(deps: {
     }
     try {
       if (parentTraceId) {
-        const parent = await deps.pool.query({
+        const query = {
           text: 'SELECT trace_id FROM turn_traces WHERE trace_id=$1 AND user_id=$2',
           values: [parentTraceId, identity.userId],
           query_timeout: 2_000,
-        })
+        }
+        const parent = await deps.pool.query(query)
         if (parent.rows.length !== 1) return send(403, { error: 'PARENT_TRACE_NOT_OWNED' })
       }
       const traceId = newTraceId()

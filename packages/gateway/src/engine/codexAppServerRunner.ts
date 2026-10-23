@@ -1346,7 +1346,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.requestId,
         turn.collabAgentPolicy,
         turn.automaticRetryState,
-        turn.traceId,
+        turn.traceId ?? null,
       )
       turn.resolve()
     } catch (err) {
@@ -2371,8 +2371,9 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
-    traceId?: string,
+    traceId?: string | null,
   ): Promise<void> {
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
     // Join speculative preparation; a failed warmup falls back to normal preparation.
@@ -2384,7 +2385,7 @@ export class CodexAppServerRunner extends EventEmitter {
         : delta?.type === 'thinking_delta' && delta.thinking?.length ? 'first_reasoning_delta' : null
       if (!stage || seenDeltas.has(stage) || message.session_id !== this.threadId) return
       seenDeltas.add(stage)
-      log.info('codex_turn_timing', { traceId: traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage, elapsedMs: performance.now() - timingStartedAt })
     }
     this.on('message', observeFirstDelta)
@@ -2400,7 +2401,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const repoSnap = this._currentRepoSnapshot()
     let effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
-      traceId: traceId,
+      traceId: turnTraceId,
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       pid: this.proc?.pid ?? null,
@@ -2454,10 +2455,10 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       const reusedProcess = Boolean(this.proc && this.initialized && !this.staleProcGeneration)
       await this.ensureSpawned(repoSnap, effectiveCwd)
-      log.info('codex_turn_timing', { traceId: traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'engine_ready', reusedProcess, elapsedMs: performance.now() - timingStartedAt })
       const threadStartedAt = performance.now()
-      this.refreshDelegateContext(traceId)
+      this.refreshDelegateContext(turnTraceId)
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this
@@ -2554,7 +2555,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.emit('session_id', this.threadId)
       }
       this._preheatedSignature = null
-      log.info('codex_turn_timing', { traceId: traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
@@ -2596,9 +2597,9 @@ export class CodexAppServerRunner extends EventEmitter {
 
         let tres: { turn?: { id?: string } } | undefined
         try {
-          log.info('codex_turn_timing', { traceId: traceId, threadId: this.threadId,
+          log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
-          tres = (await withCodexTurnTrace(this.threadId, traceId, () =>
+          tres = (await withCodexTurnTrace(this.threadId, turnTraceId, () =>
             this.sendRequest('turn/start', this.buildTurnStartParams(prompt)))) as
             | { turn?: { id?: string } }
             | undefined
@@ -2677,7 +2678,7 @@ export class CodexAppServerRunner extends EventEmitter {
           throw startErr
         }
 
-        log.info('codex_turn_timing', { traceId: traceId, threadId: this.threadId,
+        log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
           stage: 'turn_start_accepted', elapsedMs: performance.now() - timingStartedAt })
         const turnId = tres?.turn?.id
         if (typeof turnId !== 'string' || !turnId) {
