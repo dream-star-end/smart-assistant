@@ -240,10 +240,14 @@ async function setAttempt(c: PoolClient, task: StudioTask, n: number): Promise<v
 /**
  * The billing attempt for the next call (code r1 P1): it does not follow the claim count, so two
  * holders can never pay twice. The finalize journal is the fence — one admitted call per billing
- * id. An id still in flight belongs to another (or a crashed) holder: wait. An id that ended
- * without a stored answer (aborted, or settled but lost) is spent: move to the next one.
+ * id. An id still in flight belongs to another (or a crashed) holder: wait. An id that has ended
+ * is looked at again for a stored answer first (code r2 P1: the other holder may have stored and
+ * settled it after we last looked); only an ended id without one is spent: move to the next.
  */
-async function billingAttempt(deps: ExecuteDeps, task: StudioTask): Promise<number> {
+async function billingAttempt(
+  deps: ExecuteDeps,
+  task: StudioTask,
+): Promise<{ attempt: number } | { stored: StoredAnswer }> {
   const n = attemptOf(task)
   const id = n === 0 ? task.execRequestId : `${task.execRequestId}~${n}`
   const j = await deps.pool.query<{ state: string }>(
@@ -258,10 +262,30 @@ async function billingAttempt(deps: ExecuteDeps, task: StudioTask): Promise<numb
       'an earlier call of this QA is still running',
     )
   if (state === 'aborted' || state === 'committed') {
+    const again = await storedAnswer(deps, task)
+    if (again) return { stored: again }
     await withLease(deps.pool, task, (c) => setAttempt(c, task, n + 1))
-    return n + 1
+    return { attempt: n + 1 }
   }
-  return n
+  return { attempt: n }
+}
+
+async function storedAnswer(deps: ExecuteDeps, task: StudioTask): Promise<StoredAnswer | null> {
+  const r = await deps.pool.query<{ output: StoredAnswer }>(
+    'SELECT output FROM studio_step_results WHERE request_id = $1',
+    [task.execRequestId],
+  )
+  const out = r.rows[0]?.output
+  return out && typeof out.text === 'string' ? out : null
+}
+
+/** The user picked a first frame for this shot: their choice is not judged (code r1 / r2 P1). */
+async function userPickedFrame(deps: ExecuteDeps, shotId: string): Promise<boolean> {
+  const r = await deps.pool.query<{ picked: boolean }>(
+    `SELECT spec ? 'frameTakeId' AS picked FROM studio_shots WHERE id = $1`,
+    [shotId],
+  )
+  return r.rows[0]?.picked === true
 }
 
 /** Grok failures: busy / transient ones retry with the executor's backoff; the rest end QA. */
@@ -292,15 +316,37 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
   const kind = t.owner_kind as QaOwnerKind
   const target = QA_TARGET[kind]
   const userId = BigInt(t.user_id)
+  // Picked by the user while this QA was queued: not judged, nothing charged (code r2 P1).
+  if (kind === 'shot_frame' && (await userPickedFrame(deps, t.owner_id))) {
+    await withLease(deps.pool, task, async (c) => {
+      await c.query(
+        `UPDATE studio_takes SET qa = '{"skipped":true,"reason":"user_picked"}'::jsonb WHERE id = $1 AND qa IS NULL`,
+        [t.id],
+      )
+      await bookTaskCharge(
+        c,
+        task,
+        BigInt(String((task.payload as { booked?: unknown }).booked ?? '0')),
+        {
+          release: true,
+        },
+      )
+      await finishStudioTask(c, task, { status: 'done', error: 'the user picked a frame' })
+    })
+    return
+  }
   const ctx = await loadContext(deps, task.projectId, kind, t.owner_id)
 
-  const stored = await deps.pool.query<{ output: StoredAnswer }>(
-    'SELECT output FROM studio_step_results WHERE request_id = $1',
-    [task.execRequestId],
-  )
-  const out = stored.rows[0]?.output
-  let answer = typeof out?.text === 'string' ? out.text : null
-  if (answer !== null && out?.requestId && out.usage && deps.grokResettle) {
+  let out = await storedAnswer(deps, task)
+  let attempt = 0
+  if (!out) {
+    if (!deps.grok)
+      throw new MediaProviderError('QA_UNAVAILABLE', false, 'the QA judge is not configured')
+    const next = await billingAttempt(deps, task)
+    if ('stored' in next) out = next.stored
+    else attempt = next.attempt
+  }
+  if (out?.requestId && out.usage && deps.grokResettle) {
     // An earlier holder got (and stored) the answer; its settle may not have happened (code r1
     // P1). Settling again under the id it billed is idempotent.
     try {
@@ -309,10 +355,10 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
       throw new MediaProviderError('QA_BILLING', true, (err as Error)?.message ?? 'resettle failed')
     }
   }
+  let answer = out?.text ?? null
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError('QA_UNAVAILABLE', false, 'the QA judge is not configured')
-    const attempt = await billingAttempt(deps, task)
     const [cands, refs] = await Promise.all([
       candidates(deps, task, t, ctx, userId),
       Promise.all(ctx.refShas.map((sha) => readBlob(deps, userId, sha))),
@@ -544,18 +590,23 @@ async function outcome(
     }
     await appendStudioEvent(c, projectId, 'qa.passed', { takeId: t.id, message: why('passed') })
   } else if (j.next === 'redo') {
-    await c.query(`UPDATE studio_shots SET status = 'generating' WHERE id = $1 AND status = 'qa'`, [
-      t.owner_id,
-    ])
+    await c.query(
+      `UPDATE studio_shots s SET status = 'generating' WHERE s.id = $1 AND s.status = 'qa' AND ${PICK_OK}`,
+      [t.owner_id, firstFrame(t)],
+    )
     await appendStudioEvent(c, projectId, 'qa.redo', {
       takeId: t.id,
       message: `${why(j.reason)}。自动重做。`,
     })
   } else {
-    await c.query(
-      `UPDATE studio_shots SET status = 'needs_user' WHERE id = $1 AND status IN ('generating', 'qa')`,
-      [t.owner_id],
+    // A frame the user picked meanwhile is theirs (code r2 P1): an older take's verdict does not
+    // stop the shot.
+    const stopped = await c.query(
+      `UPDATE studio_shots s SET status = 'needs_user'
+        WHERE s.id = $1 AND s.status IN ('generating', 'qa') AND ${PICK_OK}`,
+      [t.owner_id, firstFrame(t)],
     )
+    if (!stopped.rowCount) return
     await appendStudioEvent(c, projectId, 'shot.needs_user', {
       shotId: t.owner_id,
       takeId: t.id,
@@ -564,6 +615,20 @@ async function outcome(
       message: `${why(j.reason)}。最好的版本已留给你挑，也可以写批注。`,
     })
   }
+}
+
+/**
+ * A verdict may move the shot only while the user has not picked a first frame since — or, for a
+ * video, picked the very frame it was made from. $2 is the take's own first frame (or null).
+ */
+const PICK_OK = `(NOT s.spec ? 'frameTakeId'
+  OR ($2::text IS NOT NULL AND EXISTS (SELECT 1 FROM studio_takes f
+                                       WHERE f.id::text = s.spec->>'frameTakeId' AND f.blob_sha = $2::text)))`
+
+function firstFrame(t: QaTake): string | null {
+  return t.owner_kind === 'shot_video'
+    ? (t.inputs?.inputs?.find((i) => i.role === 'first_frame')?.blobSha ?? null)
+    : null
 }
 
 function best2(scored: Array<{ id: string; score: number }>): string[] {
