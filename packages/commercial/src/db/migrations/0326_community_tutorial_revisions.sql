@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS community_tutorial_revisions (
 );
 
 -- At most one edit of a post waits for review at a time.
+-- compat: unique index on the table created just above; no existing rows, old code never writes it
 CREATE UNIQUE INDEX IF NOT EXISTS uq_community_tutorial_revisions_pending
   ON community_tutorial_revisions (publication_id)
   WHERE status = 'pending';
