@@ -8120,7 +8120,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[ocv5-607-native-transcript-integrity] PASS"
+          "assertion": "[ocv5-607-lossless-context-transport] PASS"
         },
         {
           "layer": "unit",

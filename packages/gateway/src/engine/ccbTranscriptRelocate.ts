@@ -173,7 +173,7 @@ export async function relocateCcbJsonlToCwdManaged(opts: {
   if (!targetDir) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_PATH_INVALID')
   const projectsDir = join(config, 'projects')
   const target = join(targetDir, `${opts.innerId}.jsonl`)
-  let dirs
+  let dirs: import('node:fs').Dirent[]
   try { dirs = await fsReaddir(projectsDir, { withFileTypes: true }) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
   const candidates: string[] = []
