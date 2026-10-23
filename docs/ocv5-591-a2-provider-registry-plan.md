@@ -54,7 +54,7 @@ export interface MediaRequest {            // 各 op 的入参是判别联合，
 export interface MediaRunContext {
   userId: bigint
   execRequestId: string                    // studio:<task id>，重领不变（A1 方案 §3）
-  maxCostCredits: bigint                   // 本任务已原子预留的积分（A1 §4），适配器据此标记 overReservation
+  maxCostCredits: bigint                   // 本任务已原子预留的积分（A1 §4），适配器据此封顶扣费（TTS 传作 costCap）
   signal: AbortSignal
   readInput(sha: string): Promise<Buffer>  // 只能读本人有引用的 blob（StudioBlobStore.open）
 }
@@ -147,7 +147,7 @@ interface ProviderRegistry {
 |---|---|---|---|
 | `gpt-image` | image: generate, edit | A0 `makeImage2Runner().runImage2ForUser`，requestId = `execRequestId` | 沿用 image2 账本与完成缓存回放；`IMAGE_DAILY_LIMIT` → 不可重试错误，编排器换下一个候选 |
 | `muse` | image: generate, edit；video: from_image, from_text, extend | `MuseBridgeHub.submit(..., {jobId: mj_<uuidv5(execRequestId)>})` → `view(wait)` 直到终态 → `fileFor()` 读文件 | 沿用 Muse 按 job 扣费；`affinity()='muse'`；`retryable` 取 hub 的 outcome |
-| `minimax-speech` | voice: tts（声明 design、clone 能力位） | OCV5-589 `synthesizeSpeech`，requestId = `voice:tts:<execRequestId>` | 沿用 minimax 媒体账本按字数比例计费；design/clone 本 PR 不接入 run（返回 `UNSUPPORTED_OP`），保留给后续 |
+| `minimax-speech` | voice: tts（声明 design、clone 能力位） | OCV5-589 `synthesizeSpeech`，requestId = `voice:tts:<execRequestId>` | 沿用 minimax 媒体账本按字数比例计费，按任务预留额封顶（`costCap`，见下）；design/clone 本 PR 不接入 run（返回 `UNSUPPORTED_OP`），保留给后续 |
 
 - 适配器目录 `adapters/index.ts` 导出 `BUILTIN_ADAPTERS: AdapterFactory[]`。新增供应商的步骤写进本文 §8 和代码注释。
 - 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限：GPT 按 `IMAGE2_UNIT_COST × n`（固定价），Muse 按 `OC_MUSE_PRICE_*`（按 job 固定价）。
@@ -157,12 +157,6 @@ interface ProviderRegistry {
   3. 适配器调用时传 `costCap = ctx.maxCostCredits`（本任务已原子预留的额度），所以**实际扣费永远 ≤ 预留**，项目预算硬上限成立；注册表外层在调用前还会拒绝 `estimateMaxCost > ctx.maxCostCredits` 的任务（`RESERVATION_TOO_SMALL`）；
   4. `MediaResult.overReservation` 只作为对所有适配器的防御性检查保留（实际扣费 > 预留时为 true，A2-1 记录告警并暂停项目）；对内置适配器它不会发生：GPT、Muse 是固定价且不超过预留，TTS 已封顶；
   5. 测试：英文 50 字符 → 上限 116 字 ≥ 上游 51；integ：上游返回 151 字、`costCap=3` → 实扣 3、余额只少 3、snapshot 带 `capped from 4`；不传 `costCap` → 实扣 4。
-- 适配器目录 `adapters/index.ts` 导出 `BUILTIN_ADAPTERS: AdapterFactory[]`。新增供应商的步骤写进本文 §8 和代码注释。
-- 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限：GPT 按 `IMAGE2_UNIT_COST × n`（固定价），Muse 按 `OC_MUSE_PRICE_*`（按 job 固定价）。
-- **TTS 的上限（plan r1 P1-1）**：`synthesizeSpeech` 按上游返回的 `usage_characters` 结算，本地字数只是报价，不是上限。处理：
-  1. 预留按 `calculateMiniMaxSpeechCost({usageCharacters: 2 × 码点数 + 16})`：MiniMax 规则是汉字记 2、其余记 1（10-23 实测 14 字中文 → 上游 26，本地计数 26），所以 2 × 码点数覆盖全部字符都按最重的规则计，+16 兜住上游可能追加的停顿/标记字符；
-  2. 适配器在 `run()` 前确认 `estimateMaxCost(req) ≤ 调用方传入的预留额`，并把预留额作为 `ctx.maxCostCredits` 传入；结算后若实际扣费超过 `ctx.maxCostCredits`（上游计数规则变化等极端情况），结果带 `overReservation: true`，A2-1 必须在同一事务里把超出部分计入 spent 并把项目转为 `paused`（预算类 `needs_user`），不再派发新任务。单次超出量最多一句台词（≤ 500 字），不会连续突破；
-  3. 单测覆盖：英文 50 字符、上游 `usage_characters=51` → 预留足够；人为构造上游 `usage_characters` 超过预留 → `overReservation: true`。
 - 输出统一成 `MediaOutput[]`，由调用方（A2-1）写入 `StudioBlobStore`；适配器不碰工作台存储。
 
 ## 6. HTTP：`GET /api/studio/providers`
