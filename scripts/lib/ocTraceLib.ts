@@ -23,6 +23,8 @@ export interface TraceEvent {
   level?: 'error' | 'warn' | 'info'
   ids: Record<string, string>
   message?: string
+  /** A diagnostic code (e.g. user cancellation), rather than a failure. */
+  isFailure?: boolean
   /** a run of identical consecutive events collapsed into this one (collapseRuns) */
   count?: number
   until?: string
@@ -33,13 +35,22 @@ export const RETENTION_DAYS: Record<Source, number | null> = {
   turn_traces: 90,
   turn_runtime_observations: 90,
   turn_upstream_performance: 90,
-  request_finalize_journal: 7, // finished rows; durable-recovery rows 30 / 90 days
+  request_finalize_journal: null, // conditional GC by updated_at; see JOURNAL_RETENTION_POLICY
   turn_dispatches: null,
   usage_records: null,
   'master-log': 14, // logrotate daily, rotate 14, maxsize 200M (may be shorter under load)
   'egress-log': 14,
   'container-log': 14, // saved before removal to /var/log/openclaude-v5-containers (§7.5, OCV5-568), pruned at 14 days / 1 GiB
 }
+
+/** Age thresholds describe GC eligibility, never proof that a missing row was deleted. */
+export const JOURNAL_RETENTION_POLICY = {
+  ordinaryTerminal: 'updated_at; default 7 days (runtime-configurable)',
+  durableCommitted: 'updated_at; 30 days, only with surviving usage evidence',
+  durableAborted: 'updated_at; 90 days',
+  excludedFromOrdinaryGc: 'Box recovery v1 and non-terminal rows',
+  missingRow: 'not found; cause unknown (retention is only a possible explanation)',
+} as const
 
 /** RFC 4180-ish CSV (psql --csv): quoted fields, doubled quotes, embedded newlines. */
 export function parseCsv(text: string): Record<string, string>[] {
@@ -137,15 +148,21 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
         )
         add(r, 'runtime_observed_at', 'trace.runtime_observed')
         break
-      case 'turn_dispatches':
+      case 'turn_dispatches': {
+        const failed = /^(crashed|executed_error|not_accepted|failed)$/.test(
+          r.outcome || r.status || '',
+        )
+        const cancelled = code === 'USER_CANCELLED'
         add(r, 'admitted_at', 'dispatch.admitted')
         add(r, 'accepted_at', 'dispatch.accepted')
         add(r, 'last_attempt_at', `dispatch.attempt#${r.attempt_no || '?'}`)
-        add(r, 'terminal_at', `dispatch.${r.status || 'terminal'}`, {
+        add(r, 'terminal_at', `dispatch.${r.outcome || r.status || 'terminal'}`, {
           code,
-          level: code ? 'error' : 'info',
+          level: !cancelled && (code || failed) ? 'error' : 'info',
+          ...(cancelled ? { isFailure: false } : {}),
         })
         break
+      }
       case 'request_finalize_journal':
         add(r, 'created_at', 'finalize.opened')
         add(r, 'updated_at', `finalize.${r.state || 'updated'}`, {
@@ -159,7 +176,7 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
             r.status && r.status !== 'success' && r.status !== 'ok'
               ? `USAGE_${r.status.toUpperCase()}`
               : undefined,
-          level: hasError(r) ? 'error' : 'info',
+          level: hasError(r) || (r.status && !/^(success|ok)$/.test(r.status)) ? 'error' : 'info',
         })
         break
       case 'turn_upstream_performance':
@@ -191,6 +208,11 @@ export function eventFromLogLine(source: Source, line: string): TraceEvent | nul
   } catch {
     return null
   }
+  return eventFromLogRecord(source, o)
+}
+
+/** Reuse a parsed record during full-file scans (timestamps require parsing every JSON line). */
+export function eventFromLogRecord(source: Source, o: Record<string, unknown>): TraceEvent | null {
   if (!o || typeof o !== 'object') return null
   const at = typeof o.ts === 'string' ? toIso(o.ts) : undefined
   if (!at) return null
@@ -198,7 +220,17 @@ export function eventFromLogLine(source: Source, line: string): TraceEvent | nul
   const level = lvl === 'error' || lvl === 'fatal' ? 'error' : lvl === 'warn' ? 'warn' : 'info'
   const codeRaw = o.errorCode ?? o.code ?? o.failureCode ?? o.failure_code
   const ids: Record<string, string> = {}
-  for (const k of ['traceId', 'dispatchId', 'requestId', 'sessionKey'])
+  for (const k of [
+    'traceId',
+    'dispatchId',
+    'requestId',
+    'clientTraceId',
+    'parentTraceId',
+    'turnRequestId',
+    'billingRequestId',
+    'dispatchTraceId',
+    'sessionKey',
+  ])
     if (typeof o[k] === 'string') ids[k] = o[k] as string
   return {
     at,
@@ -208,23 +240,54 @@ export function eventFromLogLine(source: Source, line: string): TraceEvent | nul
     level,
     ids,
     message: typeof o.error === 'string' ? o.error : undefined,
+    ...(level === 'info' && !o.errorCode && !o.failureCode && !o.failure_code
+      ? { isFailure: false }
+      : {}),
   }
 }
 
 export function timeline(events: TraceEvent[]): TraceEvent[] {
   return [...events].sort((a, b) =>
-    a.at < b.at ? -1 : a.at > b.at ? 1 : a.source < b.source ? -1 : 1,
+    a.at < b.at ? -1 : a.at > b.at ? 1 : a.source < b.source ? -1 : a.source > b.source ? 1 : 0,
   )
+}
+
+const SERVER_LOG_ID_KEYS = [
+  'traceId',
+  'dispatchId',
+  'requestId',
+  'parentTraceId',
+  'turnRequestId',
+  'billingRequestId',
+  'dispatchTraceId',
+] as const
+
+/** Match a fixed number of structured fields, independent of the number of discovered ids. */
+export function isRelatedLogRecord(
+  record: Record<string, unknown>,
+  ids: Set<string>,
+  clientInput?: string,
+): boolean {
+  if (clientInput !== undefined && record.clientTraceId === clientInput) return true
+  return SERVER_LOG_ID_KEYS.some((key) => {
+    const id = record[key]
+    return typeof id === 'string' && ids.has(id)
+  })
+}
+
+/** Client ids are caller-controlled: only the original unresolved input may match that field. */
+export function isRelatedLogEvent(
+  event: TraceEvent,
+  ids: Set<string>,
+  clientInput?: string,
+): boolean {
+  return isRelatedLogRecord(event.ids, ids, clientInput)
 }
 
 /** The earliest event carrying an error code, else the earliest error-level event. */
 export function firstError(events: TraceEvent[]): TraceEvent | undefined {
   const t = timeline(events)
-  return (
-    t.find((e) => e.code && e.level === 'error') ??
-    t.find((e) => e.code) ??
-    t.find((e) => e.level === 'error')
-  )
+  return t.find((e) => e.code && e.isFailure !== false) ?? t.find((e) => e.level === 'error')
 }
 
 /** Sources whose retention window no longer covers `startedAt` (so missing events are expected). */
@@ -249,7 +312,10 @@ export function collapseRuns(events: TraceEvent[]): TraceEvent[] {
       prev.source === e.source &&
       prev.event === e.event &&
       prev.code === e.code &&
-      prev.level === e.level
+      prev.level === e.level &&
+      prev.isFailure === e.isFailure &&
+      Object.keys(prev.ids).length === Object.keys(e.ids).length &&
+      Object.entries(prev.ids).every(([key, value]) => e.ids[key] === value)
     ) {
       prev.count = (prev.count ?? 1) + 1
       prev.until = e.at
