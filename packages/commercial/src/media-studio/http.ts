@@ -32,6 +32,7 @@ import {
   verifyBlobTicket,
 } from './access.js'
 import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from './blobs.js'
+import { audioDurationMs } from './music/audioLength.js'
 import type { ComposeRunnerLike } from './orchestrator/compose.js'
 import type { OrchestratorApi } from './orchestrator/service.js'
 import type { ProviderRegistry } from './providers/registry.js'
@@ -294,6 +295,8 @@ export async function dispatchStudioRoute(
           acceptedAt: new Date().toISOString(),
           ...(note ? { note } : {}),
         },
+        // M1 follow-up: the real length, so length filters, the editor and compose can use it.
+        durationMs: audioDurationMs(mime, body),
       })
       .catch(async (err) => {
         // No row holds the audio then: give the bytes back instead of leaving an orphan ref.

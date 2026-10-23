@@ -147,6 +147,8 @@ export class StudioStore {
       blobSha: string
       mime: string
       rights: Record<string, unknown>
+      /** Real length read from the upload (null when it cannot be read). */
+      durationMs?: number | null
     },
   ): Promise<{ id: string; title: string; blobSha: string; createdAt: string }> {
     const r = await this.pool.query<{
@@ -155,10 +157,18 @@ export class StudioStore {
       blob_sha: string
       created_at: Date
     }>(
-      `INSERT INTO studio_user_tracks(id, user_id, title, blob_sha, mime, rights_statement)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `INSERT INTO studio_user_tracks(id, user_id, title, blob_sha, mime, rights_statement, duration_ms)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
        RETURNING id::text AS id, title, blob_sha, created_at`,
-      [input.id, userId, input.title, input.blobSha, input.mime, JSON.stringify(input.rights)],
+      [
+        input.id,
+        userId,
+        input.title,
+        input.blobSha,
+        input.mime,
+        JSON.stringify(input.rights),
+        input.durationMs ?? null,
+      ],
     )
     const row = r.rows[0]!
     return {
