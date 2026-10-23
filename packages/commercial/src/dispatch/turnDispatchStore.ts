@@ -65,6 +65,8 @@ export interface TurnDispatchRow {
   runtimeKind?: string | null
 }
 
+// trace_id (0323) is written here but not read back: no caller needs it yet, and reading it
+// would make every isolated-schema integ suite add the column.
 const DISPATCH_COLUMNS = `
   dispatch_id, user_id, session_id, client_message_id, agent_id, model,
   request_hash, billing_request_id, attempt_no, status, outcome, failure_code,
@@ -170,6 +172,9 @@ export interface AdmitDispatchInput {
   now?: number
   agentContainerId?: number | null
   runtimeKind?: string | null
+  /** Master canonical traceId of this frame. Written on insert; a takeover moves the row to
+   *  the new owner's trace (that attempt's egress traffic carries it). */
+  traceId?: string | null
 }
 
 /**
@@ -221,8 +226,8 @@ export async function admitDispatch(
          (dispatch_id, user_id, session_id, client_message_id, agent_id, model,
           request_hash, billing_request_id, attempt_no, status,
           owner_id, lease_epoch, lease_until, anchor_seq, admitted_at, last_attempt_at,
-          agent_container_id, runtime_kind)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'admitted',$9,1,$10,$11,$12,$12,$13,$14)
+          agent_container_id, runtime_kind, trace_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'admitted',$9,1,$10,$11,$12,$12,$13,$14,$15)
        RETURNING ${DISPATCH_COLUMNS}`,
       [
         input.dispatchId,
@@ -239,6 +244,7 @@ export async function admitDispatch(
         nowDate,
         input.agentContainerId ?? null,
         input.runtimeKind ?? null,
+        input.traceId ?? null,
       ],
     )
     return { kind: 'admitted', dispatch: mapRow(inserted.rows[0]!), takeover: false }
@@ -258,10 +264,10 @@ export async function admitDispatch(
       const taken = await client.query<RawDispatchRow>(
         `UPDATE turn_dispatches
             SET owner_id = $2, lease_epoch = lease_epoch + 1, lease_until = $3,
-                last_attempt_at = $4
+                last_attempt_at = $4, trace_id = COALESCE($6, trace_id)
           WHERE dispatch_id = $1 AND lease_epoch = $5 AND status = 'admitted'
           RETURNING ${DISPATCH_COLUMNS}`,
-        [row.dispatchId, input.ownerId, leaseUntil, nowDate, String(row.leaseEpoch)],
+        [row.dispatchId, input.ownerId, leaseUntil, nowDate, String(row.leaseEpoch), input.traceId ?? null],
       )
       if (taken.rows.length === 0) {
         // 并发接管输了(别的 bridge 先 epoch++)→ 当作已被占用,回 busy。
@@ -521,6 +527,23 @@ export async function getDispatch(q: Queryable, dispatchId: string): Promise<Tur
     [dispatchId],
   )
   return res.rows.length === 0 ? null : mapRow(res.rows[0]!)
+}
+
+/**
+ * Lanes admitted before their frame's trace exists (cron origin, prompt queue) link it here
+ * (plan §7.4). Keeps an existing trace; display/attribution only, so the caller fires and
+ * forgets. Returns whether a row took the trace.
+ */
+export async function backfillDispatchTraceId(
+  q: Queryable,
+  input: { dispatchId: string; traceId: string },
+): Promise<boolean> {
+  const res = await q.query(
+    `UPDATE turn_dispatches SET trace_id = $2
+      WHERE dispatch_id = $1 AND trace_id IS NULL`,
+    [input.dispatchId, input.traceId],
+  )
+  return (res.rowCount ?? 0) === 1
 }
 
 /**
