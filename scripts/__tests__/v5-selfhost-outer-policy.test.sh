@@ -104,6 +104,11 @@ gate_cutover_migrations() { CUTOVER_HAS_MIGRATION=0; trace migration-read; }
 backup_installed_units_for_cutover() { printf -v "$1" '%s' "$WORK/backup"; trace backup; }
 cutover_arm_survivor() { CUTOVER_SURVIVOR_ARMED=1; trace arm-survivor; }
 cutover_persist_phase() { CUTOVER_PHASE="$1"; printf 'phase=%s\n' "$1" >"$SURVIVOR_STATE"; trace "phase:$1"; }
+install_host_log_policy_from_snapshot() {
+  [[ "$1" == "$DEPLOY_BUILT_RELEASE" && "$2" == "$WORK/units" ]] || return 92
+  trace host-log-install
+  [[ "$OUTER_CASE" != host-policy-failure ]] || return 43
+}
 install_unit() { trace install-unit; }
 install_egress_slot_units_from() { trace install-slot; }
 systemctl() { trace "service-boundary:$*"; }
@@ -207,8 +212,24 @@ assert c['extraApply'].startswith('release_policy_flip_live ') and c['extraRever
 CHECK_ARGS
   [[ "$(readlink -f "$MASTER_LIVE_LINK")" == "$DEPLOY_BUILT_RELEASE" ]]
   grep -qx "drain:$DEPLOY_BUILT_RELEASE" "$OUTER_TRACE"
+  python3 - "$OUTER_TRACE" "$OLD_REL" <<'ORDER'
+from pathlib import Path
+import sys
+lines=Path(sys.argv[1]).read_text().splitlines()
+assert lines.index('idle:'+sys.argv[2]) < lines.index('phase:mutated') < lines.index('host-log-install') < lines.index('install-unit')
+ORDER
   printf 'PASS actual-outer rc=%s no-compensation arg19-and-real-hook\n' "$want"
 done
+
+# Actual caller refuses before the first unit install when policy installation fails.
+setup_case host-policy-failure;rc=0
+cmd_cutover >"$OUTER_CASE_DIR/caller.log" 2>&1 || rc=$?
+[[ "$rc" == 97 ]]
+grep -qx host-log-install "$OUTER_TRACE"
+grep -qx OUTER_COMPENSATE "$OUTER_TRACE"
+! grep -Eq 'install-unit|install-slot|service-boundary:|runtime-restart' "$OUTER_TRACE"
+[[ "$(readlink -f "$MASTER_LIVE_LINK")" == "$OLD_REL" ]]
+printf 'PASS actual-host-policy refuses-before-unit-install\n'
 
 # Direct actual gate wrapper: global policy opts in, legacy stay must not turn
 # a failed raw gate into false0; keep a legacy control using actual policy getter.
@@ -240,7 +261,7 @@ cp "$V5_ENV" "$V5_ENV.before";cp "$OC_HOTCFG_HISTORY" "$OC_HOTCFG_HISTORY.before
 before_live="$(readlink "$MASTER_LIVE_LINK")";before_current="$(readlink "$OC_HOTCFG_PLATFORM_ROOT/current")"
 rc=0;cmd_cutover >"$OUTER_CASE_DIR/caller.log" 2>&1 || rc=$?
 [[ "$rc" == 0 ]];! grep -Eq 'command not found|unbound variable' "$OUTER_CASE_DIR/caller.log"
-! grep -Eq 'phase:|arm-survivor|install-unit|install-slot|service-boundary:|grace|overlay-seed|runtime-restart|guard-install|outer-prepare|OUTER_COMPENSATE|FINISH_COMPENSATE|LEGACY_KEEP|KEEP:|UNEXPECTED_|FORBIDDEN_' "$OUTER_TRACE"
+! grep -Eq 'phase:|arm-survivor|host-log-install|install-unit|install-slot|service-boundary:|grace|overlay-seed|runtime-restart|guard-install|outer-prepare|OUTER_COMPENSATE|FINISH_COMPENSATE|LEGACY_KEEP|KEEP:|UNEXPECTED_|FORBIDDEN_' "$OUTER_TRACE"
 [[ ! -e "$SURVIVOR_STATE" && ! -e "$RELEASE_POLICY_CONTEXT" ]]
 [[ "$(readlink "$MASTER_LIVE_LINK")" == "$before_live" && "$(readlink "$OC_HOTCFG_PLATFORM_ROOT/current")" == "$before_current" ]]
 cmp -s "$V5_ENV" "$V5_ENV.before";cmp -s "$OC_HOTCFG_HISTORY" "$OC_HOTCFG_HISTORY.before"

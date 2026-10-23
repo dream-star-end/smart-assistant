@@ -67,11 +67,14 @@ test("continuation must stay in the first turn's session with a new message id",
   assert.throws(() => assertSameSession({ peer: {} }, { peer: {}, clientMessageId: "m2" }));
 });
 const deploy = readFileSync(new URL("../deploy-v5-selfhost.sh", import.meta.url), "utf8");
+const diagnostics = readFileSync(new URL("../lib/v5-selfhost-diagnostics.sh", import.meta.url), "utf8");
 function shellFunction(name: string) {
-  const start = deploy.indexOf(`${name}() {`);
+  const source = name === "cmd_smoke" ? diagnostics : deploy;
+  assert.ok(deploy.includes('source "$SCRIPT_DIR/lib/v5-selfhost-diagnostics.sh"'));
+  const start = source.indexOf(`${name}() {`);
   assert.ok(start >= 0);
-  const end = deploy.indexOf("\n}\n", start);
-  return deploy.slice(start, end + 3);
+  const end = source.indexOf("\n}\n", start);
+  return source.slice(start, end + 3);
 }
 test("deploy gate missing credential fails closed without executing node", () => {
   const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", "/nonexistent-r2-canary-password");

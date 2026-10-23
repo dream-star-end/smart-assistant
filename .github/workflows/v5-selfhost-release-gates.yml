@@ -58,6 +58,12 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Install host log policy proof dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3 logrotate gzip
+      - name: Host log policy filesystem and real rotation gate
+        run: bash scripts/v5-selfhost-host-log-policy.test.sh
       - name: Setup Bun
         id: bun
         uses: oven-sh/setup-bun@v2
