@@ -4,6 +4,7 @@
 import { createHash } from 'node:crypto'
 
 import type { MuseJobSpec } from '../../../muse/protocol.js'
+import { ledgerDebited } from '../charges.js'
 import type { AdapterFactory, AdapterImpl } from '../registry.js'
 import { type MediaKind, MediaProviderError, type ModelInfo } from '../types.js'
 import type { BuiltinAdapterDeps } from './deps.js'
@@ -36,6 +37,10 @@ function museImpl(kind: 'image' | 'video', deps: BuiltinAdapterDeps): AdapterImp
     },
     estimateMaxCost: () => (muse ? muse.prices[kind] : 0n),
     affinity: () => 'muse',
+    async chargedFor(_userId, execRequestId) {
+      if (!deps.pool) return 0n
+      return ledgerDebited(deps.pool, 'muse_media_job', [museJobIdFor(execRequestId)])
+    },
     async run(ctx, req) {
       if (!muse) throw new MediaProviderError('PROVIDER_UNAVAILABLE', false, 'Muse is not enabled')
       const uid = String(ctx.userId)

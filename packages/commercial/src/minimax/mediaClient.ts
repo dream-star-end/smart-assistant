@@ -289,6 +289,8 @@ export async function synthesizeSpeech(
   audio: Buffer
   format: AudioFormat
   usageCharacters: number | null
+  /** extra_info.audio_length (ms) when the upstream reports it. */
+  audioMs: number | null
   settled: Settled
 }> {
   const key = requireKey(deps)
@@ -318,6 +320,10 @@ export async function synthesizeSpeech(
   const usageCharacters =
     isObj(json) && isObj(json.extra_info) && typeof json.extra_info.usage_characters === 'number'
       ? json.extra_info.usage_characters
+      : null
+  const audioMs =
+    isObj(json) && isObj(json.extra_info) && typeof json.extra_info.audio_length === 'number'
+      ? json.extra_info.audio_length
       : null
   const priced = calculateMiniMaxSpeechCost({
     model: args.model,
@@ -350,7 +356,7 @@ export async function synthesizeSpeech(
     },
   })
   if (access.owned) await touchOwnedVoice(deps.pool, args.userId, args.voiceId).catch(() => {})
-  return { audio, format: args.format, usageCharacters, settled }
+  return { audio, format: args.format, usageCharacters, audioMs, settled }
 }
 
 function voiceCostWithPreview(

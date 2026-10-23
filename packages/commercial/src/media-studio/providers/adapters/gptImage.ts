@@ -3,6 +3,7 @@
 
 import { Image2RunError } from '../../../billing/image2Run.js'
 import { IMAGE2_UNIT_COST } from '../../../billing/imageBilling.js'
+import { ledgerDebited } from '../charges.js'
 import type { AdapterFactory } from '../registry.js'
 import { MediaProviderError, type ModelInfo } from '../types.js'
 import type { BuiltinAdapterDeps } from './deps.js'
@@ -42,6 +43,20 @@ export const gptImageAdapter: AdapterFactory<BuiltinAdapterDeps> = {
     return {
       status: () => (image2?.enabled ? null : { state: 'disabled', reason: 'FEATURE_OFF' }),
       estimateMaxCost: () => IMAGE2_UNIT_COST,
+      async chargedFor(userId, execRequestId) {
+        if (!deps.pool) return 0n
+        // The journey id is `<requestKey>#<input digest>` (A0), requestKey = the execution id.
+        const rows = await deps.pool.query<{ id: string }>(
+          `SELECT id::text AS id FROM image_generation_usage_records
+            WHERE user_id = $1 AND left(request_id, length($2) + 1) = $2 || '#'`,
+          [userId.toString(), execRequestId],
+        )
+        return ledgerDebited(
+          deps.pool,
+          'image_generation',
+          rows.rows.map((r) => r.id),
+        )
+      },
       async run(ctx, req, model) {
         if (!image2?.enabled) {
           throw new MediaProviderError('PROVIDER_UNAVAILABLE', false, 'Image 2 is not enabled')

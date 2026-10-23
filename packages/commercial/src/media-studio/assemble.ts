@@ -34,7 +34,7 @@ function providerDeps(
   services: StudioProviderServices,
   warn: (msg: string) => void,
 ): BuiltinAdapterDeps {
-  const deps: BuiltinAdapterDeps = {}
+  const deps: BuiltinAdapterDeps = { pool }
   if (services.preCheckRedis) {
     const policy = parseImageModelPolicy(process.env, warn)
     deps.image2 = {

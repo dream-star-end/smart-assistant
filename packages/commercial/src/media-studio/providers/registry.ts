@@ -68,6 +68,7 @@ export interface AdapterImpl {
   status(user?: StudioUser): ProviderStatus | null
   estimateMaxCost(req: MediaRequest, model: ModelInfo): bigint
   affinity?(): string | null
+  chargedFor(userId: bigint, execRequestId: string): Promise<bigint>
   run(
     ctx: MediaRunContext,
     req: MediaRequest,
@@ -225,6 +226,10 @@ class UnavailableProvider implements MediaProvider {
   affinity(): string | null {
     return null
   }
+  // An unavailable provider never ran anything, so it never charged.
+  async chargedFor(): Promise<bigint> {
+    return 0n
+  }
   async run(): Promise<never> {
     throw new MediaProviderError(
       'PROVIDER_UNAVAILABLE',
@@ -269,6 +274,9 @@ class ConfiguredProvider implements MediaProvider {
   }
   affinity(): string | null {
     return this.impl.affinity?.() ?? null
+  }
+  chargedFor(userId: bigint, execRequestId: string): Promise<bigint> {
+    return this.impl.chargedFor(userId, execRequestId)
   }
   async run(ctx: MediaRunContext, req: MediaRequest) {
     const model = this.pick(req)

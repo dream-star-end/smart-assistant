@@ -66,6 +66,10 @@ export interface MediaRequest {
   inputs?: MediaInput[]
   /** Muse continuation (video.extend). */
   resumeSnapshotId?: string
+  /** voice.design / voice.clone: a label for the new voice. */
+  label?: string
+  /** voice.clone: the uploader's statement that the sample is their own voice or authorized. */
+  consent?: { statement: 'self_or_authorized'; acceptedAt: string }
 }
 
 export interface MediaRunContext {
@@ -132,6 +136,8 @@ export interface MediaProvider {
   estimateMaxCost(req: MediaRequest): bigint
   /** Queue affinity (A1 §3), e.g. `muse`; null when any slot may run it. */
   affinity(): string | null
+  /** Credits actually debited for one execution id (0 when nothing was charged). */
+  chargedFor(userId: bigint, execRequestId: string): Promise<bigint>
   run(ctx: MediaRunContext, req: MediaRequest): Promise<MediaResult>
 }
 

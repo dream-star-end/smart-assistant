@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import { Image2RunError } from '../billing/image2Run.js'
+import { HttpError } from '../http/util.js'
 import {
   BUILTIN_ADAPTERS,
   type BuiltinAdapterDeps,
@@ -275,6 +276,7 @@ describe('keys', () => {
         return {
           status: () => null,
           estimateMaxCost: () => 5n,
+          chargedFor: async () => 0n,
           run: async () => {
             throw new Error('unused')
           },
@@ -448,7 +450,7 @@ describe('adapters', () => {
     )
   })
 
-  it('minimax-speech: reservation bound covers upstream counting; design/clone are not wired', async () => {
+  it('minimax-speech: reservation bound covers upstream counting; design / clone validate their input', async () => {
     // r1 P1-1: 50 ASCII chars locally, upstream bills 51 → the bound still covers it.
     assert.ok(speechCharBound('a'.repeat(50)) >= 51)
     assert.ok(speechCharBound('清晨，北方的雪松林慢慢醒来。') >= 26)
@@ -461,10 +463,10 @@ describe('adapters', () => {
     const p = build(undefined, deps).registry.get('minimax-speech')!
     assert.equal(p.estimateMaxCost({ op: 'voice.tts', text: 'a'.repeat(50) }), 3n)
     await assert.rejects(p.run(ctx(), { op: 'voice.design', text: 'x', voiceId: 'v' }), {
-      code: 'UNSUPPORTED_OP',
+      code: 'INVALID_REQUEST',
     })
     await assert.rejects(p.run(ctx(), { op: 'voice.clone', text: 'x', voiceId: 'v' }), {
-      code: 'UNSUPPORTED_OP',
+      code: 'INVALID_REQUEST',
     })
     await assert.rejects(p.run(ctx(), { op: 'voice.tts', text: 'x' }), { code: 'INVALID_REQUEST' })
   })
@@ -571,6 +573,121 @@ describe('adapters', () => {
     await assert.rejects(
       registry.get('minimax-speech')!.run(ctx(), { op: 'voice.tts', text: 'x', voiceId: 'v' }),
       { code: 'PROVIDER_UNAVAILABLE' },
+    )
+  })
+})
+
+describe('MiniMax voice design / clone (user decision 2026-10-23 13:03)', () => {
+  const settled = {
+    usageId: 3n,
+    ledgerId: 1n,
+    costCredits: 991n,
+    debitedCredits: 991n,
+    balanceAfter: 0n,
+    clamped: false,
+    replayed: false,
+  }
+  function voiceDeps(over: Record<string, unknown> = {}) {
+    return fakeDeps({
+      minimax: {
+        mediaKey: { key: SENTINEL_KEY, source: 'file' },
+        client: { pool: {} as never },
+        ...over,
+      } as never,
+    })
+  }
+
+  it('design: exec id as request id, preview becomes the output, voice id in meta', async () => {
+    const calls: unknown[] = []
+    const deps = voiceDeps({
+      design: async (_d: unknown, args: unknown) => {
+        calls.push(args)
+        return { voiceId: 'oc247xdesigned1', trialAudio: Buffer.from('ID3'), settled }
+      },
+    })
+    const p = build(undefined, deps).registry.get('minimax-speech')!
+    assert.equal(p.estimateMaxCost({ op: 'voice.design', text: '清晨' }), 991n)
+    const out = await p.run(ctx({ maxCostCredits: 991n }), {
+      op: 'voice.design',
+      prompt: '沉稳男声',
+      text: '清晨',
+      label: '旁白',
+    })
+    assert.deepEqual(calls[0], {
+      userId: 247n,
+      requestId: ctx().execRequestId,
+      prompt: '沉稳男声',
+      previewText: '清晨',
+      label: '旁白',
+    })
+    assert.equal(out.meta?.voiceId, 'oc247xdesigned1')
+    assert.equal(out.outputs[0]?.mime, 'audio/mpeg')
+    assert.equal(out.costCredits, 991n)
+  })
+
+  it('clone: needs consent and a sample; preview fetched from the demo url', async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const deps = voiceDeps({
+      clone: async (_d: unknown, args: Record<string, unknown>) => {
+        calls.push(args)
+        return { voiceId: 'oc247xcloned01', demoAudioUrl: 'https://cdn.example/demo.mp3', settled }
+      },
+      fetchPreview: async () => Buffer.from('ID3demo'),
+    })
+    const p = build(undefined, deps).registry.get('minimax-speech')!
+    const consent = { statement: 'self_or_authorized' as const, acceptedAt: '2026-10-23T05:00:00Z' }
+    await assert.rejects(p.run(ctx({ maxCostCredits: 991n }), { op: 'voice.clone', consent }), {
+      code: 'INVALID_REQUEST',
+    })
+    await assert.rejects(
+      p.run(ctx({ maxCostCredits: 991n }), {
+        op: 'voice.clone',
+        inputs: [{ role: 'source', blobSha: 'a'.repeat(64) }],
+      }),
+      {
+        code: 'CLONE_CONSENT_REQUIRED',
+      },
+    )
+    const out = await p.run(ctx({ maxCostCredits: 991n }), {
+      op: 'voice.clone',
+      label: '我的声音',
+      inputs: [{ role: 'source', blobSha: 'a'.repeat(64) }],
+      consent,
+    })
+    assert.equal(calls.length, 1)
+    assert.deepEqual(calls[0]!.consent, consent)
+    assert.equal(out.meta?.voiceId, 'oc247xcloned01')
+    assert.equal(out.outputs[0]?.bytes.toString(), 'ID3demo')
+  })
+
+  it('MiniMax plan / account refusals become clear, non-retryable codes', async () => {
+    const deps = voiceDeps({
+      design: async () => {
+        throw new HttpError(
+          502,
+          'MINIMAX_UPSTREAM_ERROR',
+          'your current token plan not support model, voice_design',
+        )
+      },
+      clone: async () => {
+        throw new HttpError(502, 'MINIMAX_UPSTREAM_ERROR', 'voice clone user forbidden')
+      },
+    })
+    const p = build(undefined, deps).registry.get('minimax-speech')!
+    await assert.rejects(
+      p.run(ctx({ maxCostCredits: 991n }), { op: 'voice.design', prompt: 'x', text: 'y' }),
+      {
+        code: 'MINIMAX_PLAN_NO_VOICE_DESIGN',
+        retryable: false,
+      },
+    )
+    await assert.rejects(
+      p.run(ctx({ maxCostCredits: 991n }), {
+        op: 'voice.clone',
+        inputs: [{ role: 'source', blobSha: 'a'.repeat(64) }],
+        consent: { statement: 'self_or_authorized', acceptedAt: '2026-10-23T05:00:00Z' },
+      }),
+      { code: 'MINIMAX_CLONE_NOT_ENABLED', retryable: false },
     )
   })
 })
