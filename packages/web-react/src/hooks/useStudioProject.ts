@@ -19,9 +19,11 @@ export type ProjectState =
 export function useStudioProject(auth: AuthSession, id: string) {
   const [state, setState] = useState<ProjectState>({ state: 'loading' })
   const seq = useRef(0)
+  const inFlight = useRef(0)
 
   const reload = useCallback(async () => {
     const mine = ++seq.current
+    inFlight.current += 1
     try {
       const view = await studioApi.project(auth, id)
       if (mine === seq.current) setState({ state: 'ready', view })
@@ -30,8 +32,16 @@ export function useStudioProject(auth: AuthSession, id: string) {
       if (err instanceof StudioApiError && err.status === 404) setState({ state: 'missing' })
       // Keep showing the last good view on a transient poll failure.
       else setState((cur) => (cur.state === 'ready' ? cur : { state: 'error', error: err }))
+    } finally {
+      inFlight.current -= 1
     }
   }, [auth, id])
+
+  // A poll tick never starts a second request while one is still out (code r1 P1): on a network
+  // slower than the poll period every response would otherwise be superseded and dropped.
+  const poll = useCallback(() => {
+    if (inFlight.current === 0 && document.visibilityState === 'visible') void reload()
+  }, [reload])
 
   useEffect(() => {
     void reload()
@@ -40,18 +50,14 @@ export function useStudioProject(auth: AuthSession, id: string) {
   const active = state.state === 'ready' && ACTIVE_STATUSES.has(state.view.project.status)
   useEffect(() => {
     if (!active) return
-    const tick = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void reload()
-    }, STUDIO_POLL_MS)
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') void reload()
-    }
+    const tick = window.setInterval(poll, STUDIO_POLL_MS)
+    const onVisible = () => poll()
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       window.clearInterval(tick)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [active, reload])
+  }, [active, poll])
 
   /** Apply a server-returned project row (after PATCH / pause …) without a refetch. */
   const applyProject = useCallback((project: StudioProject) => {
