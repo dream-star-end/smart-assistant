@@ -1,5 +1,5 @@
 import type { SystemActionDetail, SystemActionPreview, SystemActionSummary } from '@openclaude/protocol/browser'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useToolCardActions } from '../tool/context'
 import { Button } from '../ui/Button'
 import { Modal } from '../ui/Modal'
@@ -60,10 +60,10 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
   const active = detail && ['prepared', 'approved_waiting_browser'].includes(detail.state)
   const expired = Boolean(active && detail.expiresAt <= Date.now()) || detail?.state === 'expired'
 
-  function accept(d: SystemActionDetail, key: string) {
+  const accept = useCallback((d: SystemActionDetail, key: string) => {
     if (scope.current !== key || d.id !== proposalId) return
     setRecord({ scope: key, detail: d })
-  }
+  }, [proposalId])
   async function refresh() {
     if (!allowed || !actions) return
     const key = scopeKey
@@ -89,7 +89,7 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
     if (!active || !detail) return
     const timer = setTimeout(() => tick(n => n + 1), Math.max(0, detail.expiresAt - Date.now()) + 10)
     return () => clearTimeout(timer)
-  }, [detail?.expiresAt, detail?.state, active])
+  }, [detail, active])
   useEffect(() => {
     if (!allowed || !actions || !['executing', 'approved_waiting_browser'].includes(detail?.state ?? '')) return
     let fetching = false
@@ -99,7 +99,7 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
       actions.getDetail(proposalId).then(d => accept(d, scopeKey)).catch(() => {}).finally(() => { fetching = false })
     }, 5000)
     return () => clearInterval(timer)
-  }, [allowed, actions, detail?.state, proposalId, scopeKey])
+  }, [allowed, actions, detail?.state, proposalId, scopeKey, accept])
 
   async function openConfirmation() {
     if (!actions || !allowed || busy || expired || detail?.state !== 'prepared') return
@@ -116,7 +116,8 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
   }
   async function confirm() {
     if (!actions || !confirmation || busy || expired || !confirmation.detail.preview) return
-    const key = scopeKey, c = confirmation
+    const key = scopeKey
+    const c = confirmation
     setBusy(true); setError('')
     // Discard the challenge after one attempt, including a transport failure.
     setChallenge(null)
@@ -145,17 +146,17 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
     <Frame kind="form" title={plainTitle(detail?.title ?? '系统操作')} actions={<span className="oc-iui-chip">{status}</span>}>
       <div className="space-y-4 px-4 pb-4">
         {!allowed && <p className="text-body text-muted">请在本人登录的会话中核验并操作。</p>}
-        {allowed && !detail && !error && <p className="text-body text-muted" role="status">正在读取操作详情…</p>}
+        {allowed && !detail && !error && <output className="block text-body text-muted">正在读取操作详情…</output>}
         {allowed && detail?.preview && <Preview value={detail.preview} />}
-        {detail?.result && <p className="text-body text-fg" role="status">{detail.result.summary}</p>}
+        {detail?.result && <output className="block text-body text-fg">{detail.result.summary}</output>}
         {detail?.state === 'unknown' && <p className="text-body text-muted">先核对实际结果，再决定下一步；请勿重复执行。</p>}
         {error && <p className="text-body text-muted" role="alert">{error}</p>}
         {allowed && <div className="flex flex-wrap justify-end gap-2">
           {detail?.state === 'prepared' && !expired && <>
-            <Button size="sm" disabled={busy} onClick={() => void deny()}>暂时不用</Button>
-            <Button size="sm" variant="accent" loading={busy} onClick={() => void openConfirmation()}>查看并确认</Button>
+            <Button size="sm" variant="ghost" className="oc-iui-btn" disabled={busy} onClick={() => void deny()}>暂时不用</Button>
+            <Button size="sm" variant="accent" className="oc-iui-btn is-primary" loading={busy} onClick={() => void openConfirmation()}>查看并确认</Button>
           </>}
-          {(error || expired || detail?.state === 'unknown') && <Button size="sm" disabled={busy} onClick={() => void refresh()}>刷新状态</Button>}
+          {(error || expired || detail?.state === 'unknown') && <Button size="sm" variant="ghost" className="oc-iui-btn" disabled={busy} onClick={() => void refresh()}>刷新状态</Button>}
         </div>}
         {allowed && !expired && detail && (['approved_waiting_browser', 'executing'].includes(detail.state) || (detail.state === 'succeeded' && detail.result?.completion === 'awaiting_user')) && actions?.renderContinuation?.(proposalId)}
       </div>

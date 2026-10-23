@@ -10,10 +10,12 @@ import Database from 'better-sqlite3'
 import type { SystemActionPreview } from '@openclaude/protocol'
 import { SystemActionError, SystemActionStore, type PrepareSystemAction, type SystemActionExecution } from './systemActions.js'
 
-const USER = '765', OTHER_FIXTURE_USER = 'synthetic-other'
+const USER = '765'
+const OTHER_FIXTURE_USER = 'synthetic-other'
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'oc-system-ledger-proof-'))
-  const dbPath = join(dir, 'actions.db'), key = randomBytes(32)
+  const dbPath = join(dir, 'actions.db')
+  const key = randomBytes(32)
   let now = 1_000_000
   const create = (k = key) => new SystemActionStore({ dbPath, key: k, now: () => now })
   return { dbPath, key, create, tick: (ms: number) => { now += ms } }
@@ -58,7 +60,9 @@ describe('master-private persistent system action approvals', () => {
     reopened.close()
   })
   test('cross-user reads, challenge, decision and execution proof never change the owner record', () => {
-    const t = setup(), s = t.create(), a = s.prepare(input())
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input())
     throwsCode(() => s.get(OTHER_FIXTURE_USER, a.id), 'NOT_FOUND')
     throwsCode(() => s.detail(OTHER_FIXTURE_USER, a.id), 'NOT_FOUND')
     throwsCode(() => s.issueChallenge(OTHER_FIXTURE_USER, a.id, 'device-a', 'x'), 'NOT_FOUND')
@@ -69,7 +73,11 @@ describe('master-private persistent system action approvals', () => {
     s.close()
   })
   test('wrong nonce, device or preview cannot execute; two connections may claim only once', () => {
-    const t = setup(), a = t.create(), b = t.create(), proposal = a.prepare(input()), p = proof(a, proposal.id)
+    const t = setup()
+    const a = t.create()
+    const b = t.create()
+    const proposal = a.prepare(input())
+    const p = proof(a, proposal.id)
     throwsCode(() => a.confirm(USER, proposal.id, { ...p, nonce: 'wrong' }, 'worker'), 'INVALID_PROOF')
     throwsCode(() => a.confirm(USER, proposal.id, { ...p, deviceId: 'other-device' }, 'worker'), 'INVALID_PROOF')
     throwsCode(() => a.confirm(USER, proposal.id, { ...p, previewHash: 'changed-price-or-preview' }, 'worker'), 'INVALID_PROOF')
@@ -84,7 +92,10 @@ describe('master-private persistent system action approvals', () => {
     a.close(); b.close()
   })
   test('browser confirmation is waiting, not execution; token and device bind a single claim', () => {
-    const t = setup(), s = t.create(), a = s.prepare(input({ executor: 'browser' })), p = proof(s, a.id)
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input({ executor: 'browser' }))
+    const p = proof(s, a.id)
     const approved = s.confirm(USER, a.id, p, 'web-a')
     if (!('browserGrant' in approved)) throw new Error('expected browser grant')
     assert.equal(s.get(USER, a.id).state, 'approved_waiting_browser')
@@ -98,21 +109,27 @@ describe('master-private persistent system action approvals', () => {
     s.close()
   })
   test('expiry/denial clear execution materials and never expire or rerun an executing operation', () => {
-    const t = setup(), s = t.create(), a = s.prepare(input({ ttlMs: 10 })), p = proof(s, a.id)
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input({ ttlMs: 10 }))
+    const p = proof(s, a.id)
     t.tick(11)
     throwsCode(() => s.confirm(USER, a.id, p, 'worker'), 'EXPIRED')
     assert.deepEqual(materials(t.dbPath, a.id), { sealed: null, approval_hash: null, grant_hash: null, execution_hash: null })
     const b = s.prepare(input({ idempotencyKey: 'b' })); s.deny(USER, b.id)
     assert.equal(s.get(USER, b.id).state, 'denied')
     assert.equal((materials(t.dbPath, b.id) as { sealed: unknown }).sealed, null)
-    const c = s.prepare(input({ idempotencyKey: 'c', ttlMs: 10 })), h = handle(s.confirm(USER, c.id, proof(s, c.id), 'worker-c'))
+    const c = s.prepare(input({ idempotencyKey: 'c', ttlMs: 10 }))
+    const h = handle(s.confirm(USER, c.id, proof(s, c.id), 'worker-c'))
     t.tick(1000); s.expire()
     assert.equal(s.get(USER, c.id).state, 'executing')
     s.finish(h, 'failed', { summary: '已确认未生效', completion: 'done' })
     s.close()
   })
   test('reopen does not steal an executor; proven lost execution becomes unknown and cannot auto-retry', () => {
-    const t = setup(), s = t.create(), a = s.prepare(input())
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input())
     handle(s.confirm(USER, a.id, proof(s, a.id), 'proven-dead-worker'))
     s.close()
     const reopened = t.create()
@@ -125,10 +142,13 @@ describe('master-private persistent system action approvals', () => {
     reopened.close()
   })
   test('two child processes race one approval; a lost finish never repeats the actual effect', { timeout: 15000 }, async () => {
-    const t = setup(), s = t.create(), action = s.prepare(input()), p = proof(s, action.id)
-    const counter = join(t.dbPath + '-proof-effects')
+    const t = setup()
+    const s = t.create()
+    const action = s.prepare(input())
+    const p = proof(s, action.id)
+    const counter = join(`${t.dbPath}-proof-effects`)
     writeFileSync(counter, '')
-    const worker = t.dbPath + '-worker.mjs'
+    const worker = `${t.dbPath}-worker.mjs`
     writeFileSync(worker, `
       import { appendFileSync } from 'node:fs';
       import { SystemActionStore } from ${JSON.stringify(new URL('./systemActions.ts', import.meta.url).href)};
@@ -186,8 +206,40 @@ describe('master-private persistent system action approvals', () => {
       s.close()
     }
   })
+  test('preexisting master and approved browser proposals cannot bypass an unknown resource', () => {
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input())
+    const b = s.prepare(input({ idempotencyKey: 'preexisting-b' }))
+    const c = s.prepare(input({ idempotencyKey: 'preexisting-browser', executor: 'browser' }))
+    const pb = proof(s, b.id)
+    const approved = s.confirm(USER, c.id, proof(s, c.id), 'browser')
+    if (!('browserGrant' in approved)) throw new Error('expected browser approval')
+    handle(s.confirm(USER, a.id, proof(s, a.id), 'lost-executor'))
+    s.markExecutorLost('lost-executor')
+    throwsCode(() => s.confirm(USER, b.id, pb, 'worker-b'), 'RECONCILIATION_REQUIRED')
+    throwsCode(() => s.claimBrowser(USER, c.id, 'device-a', approved.browserGrant, 'browser'), 'RECONCILIATION_REQUIRED')
+    assert.equal(s.get(USER, b.id).state, 'prepared')
+    assert.equal(s.get(USER, c.id).state, 'approved_waiting_browser')
+    s.close()
+  })
+  test('an in-flight resource serializes existing proposals until its result is durable', () => {
+    const t = setup()
+    const s = t.create()
+    const a = s.prepare(input())
+    const b = s.prepare(input({ idempotencyKey: 'b' }))
+    const pb = proof(s, b.id)
+    const h = handle(s.confirm(USER, a.id, proof(s, a.id), 'live-worker'))
+    throwsCode(() => s.confirm(USER, b.id, pb, 'worker-b'), 'CONFLICT')
+    s.finish(h, 'succeeded', { summary: '第一项结果已落库', completion: 'done' })
+    const hb = handle(s.confirm(USER, b.id, pb, 'worker-b'))
+    s.finish(hb, 'succeeded', { summary: '第二项结果已落库', completion: 'done' })
+    s.close()
+  })
   test('a wrong encryption key cannot read pending content', () => {
-    const t = setup(), s = t.create(), a = s.prepare(input()); s.close()
+    const t = setup();
+    const s = t.create();
+    const a = s.prepare(input()); s.close()
     const wrong = t.create(randomBytes(32))
     assert.throws(() => wrong.detail(USER, a.id))
     assert.equal(wrong.get(USER, a.id).state, 'prepared')

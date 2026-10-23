@@ -69,14 +69,20 @@ function canonical(value: unknown, depth = 0): string {
   }
   throw new SystemActionError('INVALID_INPUT')
 }
+function hasControl(value: string, allowWhitespace = false): boolean {
+  return [...value].some(ch => {
+    const n = ch.charCodeAt(0)
+    return n === 127 || (n < 32 && !(allowWhitespace && (n === 9 || n === 10 || n === 13)))
+  })
+}
 function required(value: string, max = 512): void {
-  if (typeof value !== 'string' || !value || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) throw new SystemActionError('INVALID_INPUT')
+  if (typeof value !== 'string' || !value || value.length > max || hasControl(value)) throw new SystemActionError('INVALID_INPUT')
 }
 function sameHash(a: string | null, b: string): boolean {
   return Boolean(typeof b === 'string' && b.length <= 128 && a && /^[a-f0-9]{64}$/.test(a) && timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(digest(b), 'hex')))
 }
 function content(value: string, max: number): void {
-  if (typeof value !== 'string' || value.length > max || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) throw new SystemActionError('INVALID_INPUT')
+  if (typeof value !== 'string' || value.length > max || hasControl(value, true)) throw new SystemActionError('INVALID_INPUT')
 }
 function validatePreview(p: SystemActionPreview): void {
   if (!p || typeof p !== 'object') throw new SystemActionError('INVALID_INPUT')
@@ -142,7 +148,8 @@ export class SystemActionStore {
   private seal(value: Sealed, r: Pick<Row, 'id' | 'user_id' | 'input_hash'>): string {
     const plain = canonical(value)
     if (Buffer.byteLength(plain) > MAX_BYTES) throw new SystemActionError('INVALID_INPUT')
-    const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', this.key, iv)
+    const iv = randomBytes(12)
+    const cipher = createCipheriv('aes-256-gcm', this.key, iv)
     cipher.setAAD(this.aad(r))
     const out = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()])
     return ['v1', iv.toString('base64url'), cipher.getAuthTag().toString('base64url'), out.toString('base64url')].join('.')
@@ -185,7 +192,9 @@ export class SystemActionStore {
         return this.summary(existing)
       }
       if (this.db.prepare("SELECT 1 FROM system_actions WHERE user_id=? AND resource_key=? AND state='unknown'").get(input.userId, digest(input.resourceKey))) throw new SystemActionError('RECONCILIATION_REQUIRED')
-      const id = randomUUID(), now = this.now(), ttl = input.ttlMs ?? 300000
+      const id = randomUUID()
+      const now = this.now()
+      const ttl = input.ttlMs ?? 300000
       if (!Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 3600000) throw new SystemActionError('INVALID_INPUT')
       const sealed = this.seal(body, { id, user_id: input.userId, input_hash: inputHash })
       this.db.prepare(`INSERT INTO system_actions (id,user_id,session_id,agent_id,operation_id,operation_version,executor,
@@ -194,7 +203,7 @@ export class SystemActionStore {
         input.operationVersion, input.executor, digest(input.resourceKey), input.idempotencyKey, inputHash, previewHash, input.operationTitle,
         now, now, now + ttl, sealed, input.quoteHash ?? null, input.expectedVersion ?? null)
       return this.summary(this.row(input.userId, id))
-    })()
+    }).immediate()
   }
   get(userId: string, id: string): SystemActionSummary { this.expire(); return this.summary(this.row(userId, id)) }
   detail(userId: string, id: string): SystemActionDetail {
@@ -211,13 +220,19 @@ export class SystemActionStore {
       const nonce = randomBytes(32).toString('base64url')
       this.db.prepare("UPDATE system_actions SET approval_hash=?,device_id=?,updated_at=? WHERE id=? AND user_id=? AND state='prepared'").run(digest(nonce), deviceId, this.now(), id, userId)
       return nonce
-    })()
+    }).immediate()
+  }
+  /** Checked under the IMMEDIATE write transaction, including proposals made before an unknown result. */
+  private assertResourceAvailable(r: Row): void {
+    const blocked = this.db.prepare("SELECT state FROM system_actions WHERE user_id=? AND resource_key=? AND id<>? AND state IN ('unknown','executing') ORDER BY CASE state WHEN 'unknown' THEN 0 ELSE 1 END LIMIT 1").get(r.user_id, r.resource_key, r.id) as { state: string } | undefined
+    if (blocked) throw new SystemActionError(blocked.state === 'unknown' ? 'RECONCILIATION_REQUIRED' : 'CONFLICT')
   }
   private verifyPending(userId: string, id: string, proof: { nonce: string; previewHash: string; deviceId: string }): Row {
     required(proof.nonce, 128); required(proof.deviceId, 128); required(proof.previewHash, 128)
     const r = this.row(userId, id)
     if (r.state === 'expired') throw new SystemActionError('EXPIRED')
     if (r.state !== 'prepared') throw new SystemActionError('CONFLICT')
+    this.assertResourceAvailable(r)
     if (r.preview_hash !== proof.previewHash || r.device_id !== proof.deviceId || !sameHash(r.approval_hash, proof.nonce)) throw new SystemActionError('INVALID_PROOF')
     return r
   }
@@ -225,7 +240,8 @@ export class SystemActionStore {
     required(executorId, 128)
     this.expire()
     return this.db.transaction(() => {
-      const r = this.verifyPending(userId, id, proof), body = this.open(r)
+      const r = this.verifyPending(userId, id, proof)
+      const body = this.open(r)
       const nonce = randomBytes(32).toString('base64url')
       const browser = r.executor === 'browser'
       const changed = this.db.prepare(`UPDATE system_actions SET state=?,approval_hash=NULL,grant_hash=?,execution_hash=?,executor_id=?,updated_at=?
@@ -235,7 +251,7 @@ export class SystemActionStore {
       if (changed !== 1) throw new SystemActionError('CONFLICT')
       if (browser) return { browserGrant: nonce, action: this.summary(this.row(userId, id)) }
       return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
-    })()
+    }).immediate()
   }
   renewBrowserGrant(userId: string, id: string, deviceId: string): string {
     this.expire()
@@ -245,7 +261,7 @@ export class SystemActionStore {
       const nonce = randomBytes(32).toString('base64url')
       this.db.prepare("UPDATE system_actions SET grant_hash=?,updated_at=? WHERE id=? AND user_id=? AND state='approved_waiting_browser'").run(digest(nonce), this.now(), id, userId)
       return nonce
-    })()
+    }).immediate()
   }
   claimBrowser(userId: string, id: string, deviceId: string, grant: string, executorId: string): SystemActionExecution {
     required(executorId, 128)
@@ -253,11 +269,13 @@ export class SystemActionStore {
     return this.db.transaction(() => {
       const r = this.row(userId, id)
       if (r.state !== 'approved_waiting_browser') throw new SystemActionError('CONFLICT')
+      this.assertResourceAvailable(r)
       if (r.device_id !== deviceId || !sameHash(r.grant_hash, grant)) throw new SystemActionError('INVALID_PROOF')
-      const body = this.open(r), nonce = randomBytes(32).toString('base64url')
+      const body = this.open(r)
+      const nonce = randomBytes(32).toString('base64url')
       if (this.db.prepare("UPDATE system_actions SET state='executing',grant_hash=NULL,execution_hash=?,executor_id=?,updated_at=? WHERE id=? AND user_id=? AND state='approved_waiting_browser' AND grant_hash=? AND expires_at>?").run(digest(nonce), executorId, this.now(), id, userId, r.grant_hash, this.now()).changes !== 1) throw new SystemActionError('CONFLICT')
       return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
-    })()
+    }).immediate()
   }
   deny(userId: string, id: string): SystemActionSummary {
     this.expire()
@@ -266,7 +284,7 @@ export class SystemActionStore {
       if (!['prepared','approved_waiting_browser'].includes(r.state)) throw new SystemActionError('CONFLICT')
       this.clearTerminal(id, userId, 'denied', null)
       return this.summary(this.row(userId, id))
-    })()
+    }).immediate()
   }
   finish(handle: Pick<SystemActionExecution, 'id' | 'userId' | 'executorId' | 'executionNonce'>, state: 'succeeded' | 'failed' | 'unknown', result: SystemActionResult): SystemActionSummary {
     if (!['succeeded','failed','unknown'].includes(state)) throw new SystemActionError('INVALID_INPUT')
@@ -280,7 +298,7 @@ export class SystemActionStore {
       if (r.state !== 'executing' || r.executor_id !== handle.executorId || !sameHash(r.execution_hash, handle.executionNonce)) throw new SystemActionError('INVALID_PROOF')
       this.clearTerminal(r.id, r.user_id, state, safeResult)
       return this.summary(this.row(r.user_id, r.id))
-    })()
+    }).immediate()
   }
   /** Trusted supervisor only, after proving this executor is gone. Never an agent/user API or constructor side effect. */
   markExecutorLost(executorId: string): number {

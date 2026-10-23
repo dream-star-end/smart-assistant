@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import type { SystemActionDetail } from '@openclaude/protocol/browser'
+import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ToolCardActionsContext, type SystemActionCardActions } from '../tool/context'
 import { IuiBlock } from './IuiBlock'
@@ -15,8 +15,8 @@ function detail(): SystemActionDetail {
 function actions(): SystemActionCardActions {
   return { identityKey: 'fixture-person', getDetail: vi.fn(async () => detail()),
     getConfirmation: vi.fn(async () => ({ detail: detail(), nonce: 'browser-only-confirmation-nonce' })),
-    confirm: vi.fn(async () => ({ ...detail(), state: 'succeeded', result: { summary: '已关闭邮件通知', completion: 'done' } })),
-    deny: vi.fn(async () => ({ ...detail(), state: 'denied' })), }
+    confirm: vi.fn(async (): Promise<SystemActionSummary> => ({ ...detail(), state: 'succeeded', result: { summary: '已关闭邮件通知', completion: 'done' } })),
+    deny: vi.fn(async (): Promise<SystemActionSummary> => ({ ...detail(), state: 'denied' })), }
 }
 function view(a: SystemActionCardActions, raw = code, props: { live?: boolean; readOnly?: boolean } = {}) {
   return <ToolCardActionsContext.Provider value={{ systemActions: a }}><IuiBlock code={raw} {...props} /></ToolCardActionsContext.Provider>
@@ -36,18 +36,18 @@ describe('verified system action sheet', () => {
     expect(a.confirm).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '查看并确认' }))
     dialog = await screen.findByRole('dialog')
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认执行', exact: true }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认执行' }))
     await screen.findByText('已关闭邮件通知')
     expect(a.confirm).toHaveBeenCalledExactlyOnceWith(id, { nonce: 'browser-only-confirmation-nonce', previewHash: 'preview-frozen-hash' })
     expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
   })
   it('does not describe an accepted job or an unknown effect as completed', async () => {
     const a = actions()
-    a.getDetail = vi.fn(async () => ({ ...detail(), state: 'succeeded', preview: null, result: { summary: '后台任务已提交', completion: 'accepted' } }))
+    a.getDetail = vi.fn(async (): Promise<SystemActionDetail> => ({ ...detail(), state: 'succeeded', preview: null, result: { summary: '后台任务已提交', completion: 'accepted' } }))
     const r = render(view(a))
     await screen.findByText('已提交')
     expect(screen.queryByText('已完成')).not.toBeInTheDocument()
-    a.getDetail = vi.fn(async () => ({ ...detail(), state: 'unknown', preview: null, result: { summary: '执行结果待核对', completion: 'accepted' } }))
+    a.getDetail = vi.fn(async (): Promise<SystemActionDetail> => ({ ...detail(), state: 'unknown', preview: null, result: { summary: '执行结果待核对', completion: 'accepted' } }))
     a.identityKey = 'next-fixture'
     r.rerender(view(a))
     await screen.findByText('结果待核对')
@@ -72,7 +72,7 @@ describe('verified system action sheet', () => {
   it('rejects details for another id and masks previous identity data immediately', async () => {
     const a = actions(); const r = render(view(a)); await screen.findByText('更改通知')
     const b = actions(); b.identityKey = 'another-fixture-identity'
-    b.getDetail = vi.fn(async () => ({ ...detail(), id: 'a5be0795-e604-45ee-bd8b-a519324b5cf4' }))
+    b.getDetail = vi.fn(async (): Promise<SystemActionDetail> => ({ ...detail(), id: 'a5be0795-e604-45ee-bd8b-a519324b5cf4' }))
     r.rerender(view(b))
     expect(screen.queryByText('更改通知')).not.toBeInTheDocument()
     await screen.findByText('这项操作无法核验。')
@@ -81,11 +81,11 @@ describe('verified system action sheet', () => {
   it('transport failure discards the nonce and refreshes an unknown result without resubmission', async () => {
     const a = actions(); let unknown = false
     a.confirm = vi.fn(async () => { unknown = true; throw new Error('lost response') })
-    a.getDetail = vi.fn(async () => unknown ? { ...detail(), state: 'unknown', preview: null } : detail())
+    a.getDetail = vi.fn(async (): Promise<SystemActionDetail> => unknown ? { ...detail(), state: 'unknown', preview: null } : detail())
     render(view(a)); await screen.findByText('更改通知')
     fireEvent.click(screen.getByRole('button', { name: '查看并确认' }))
     const dialog = await screen.findByRole('dialog')
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认执行', exact: true }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '确认执行' }))
     await screen.findByText('结果待核对')
     expect(a.confirm).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
