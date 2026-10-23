@@ -393,6 +393,36 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
     const now = await loadComposeInputs(c, task.projectId, pl.variant)
     // What this run actually composed (a re-claim composes the inputs as they are now).
     const composedKey = inputs.inputsKey
+    // A2-1b-2 (code r3 P1): reopened for a rework while this ran (an annotation changed a shot, a
+    // line or the voice) — whatever the inputs look like, this is not the film: an export waits for
+    // the new one, an auto run ends (the director composes again). Checked under the project lock
+    // the annotation's claim also takes, so a rework is either before this or after the publish.
+    const reworked =
+      !!now &&
+      (pl.reason === 'export'
+        ? now.status !== 'done'
+        : now.status === 'running' || now.status === 'awaiting_user')
+    if (reworked) {
+      await c.query(
+        `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1`,
+        [takeId],
+      )
+      if (
+        pl.reason === 'export' &&
+        ['running', 'awaiting_user', 'paused', 'composing'].includes(now.status)
+      ) {
+        await enqueueStudioTask(c, {
+          projectId: task.projectId,
+          kind: 'compose',
+          idempotencyKey: `compose:${task.projectId}:export-wait:${task.id}`,
+          payload: { reason: 'export', variant: pl.variant },
+          runAfterSeconds: 60,
+        })
+      }
+      await deps.blobs.dropRefs(userId, { kind: 'final', id: takeId }, c)
+      await finishStudioTask(c, task, { status: 'done', error: 'superseded by a rework' })
+      return 'superseded' as const
+    }
     // A generation still in flight (e.g. a newly chosen track) will change the inputs (code r1 P1).
     const pending = await c.query(
       `SELECT 1 FROM studio_tasks WHERE project_id = $1 AND kind = 'gen' AND status IN ('queued','leased') LIMIT 1`,
