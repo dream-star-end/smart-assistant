@@ -208,7 +208,8 @@
   "runtimeCapabilities": [
     "model_authority_v1",
     "lossless-turn-tape-v2",
-    "durable-turn-dispatch-v1"
+    "durable-turn-dispatch-v1",
+    "prompt-privacy-v1"
   ],
   "bridgeFrameSchema": "1",
   "runtimeApi": "1"
