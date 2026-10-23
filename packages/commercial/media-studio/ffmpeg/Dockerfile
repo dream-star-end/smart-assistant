@@ -7,7 +7,7 @@ ARG BASE_IMAGE=debian:bookworm-slim
 FROM ${BASE_IMAGE}
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk fonts-noto-color-emoji ca-certificates; \
+    apt-get install -y --no-install-recommends ffmpeg fontconfig fonts-noto-cjk fonts-noto-color-emoji ca-certificates; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd -g 1000 media; useradd -u 1000 -g 1000 -M -d /tmp -s /usr/sbin/nologin media; \
     mkdir -p /work/in /work/out; \

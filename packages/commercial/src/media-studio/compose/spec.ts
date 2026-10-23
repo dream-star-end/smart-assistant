@@ -264,6 +264,31 @@ function musicPlacement(
 }
 
 export function buildCommand(op: ComposeOp): BuiltCommand {
+  return boundThreads(buildUnbounded(op))
+}
+
+/**
+ * Pin ffmpeg's thread pools (Codex Sol r1 P1): left on auto, every input opens a decoder with
+ * ~one thread per host core, so 40 clips on a 16-core host need 640 threads and hit the sandbox's
+ * PidsLimit 256. One decoder thread per input, two filter threads and four encoder threads keep a
+ * maximal compose (40 clips + 24 voice + music) near 80 threads.
+ */
+function boundThreads(cmd: BuiltCommand): BuiltCommand {
+  if (cmd.argv[0] !== 'ffmpeg') return cmd
+  const argv: string[] = []
+  cmd.argv.forEach((a, i) => {
+    if (a === '-i') argv.push('-threads', '1')
+    if (a === '-c:v' && cmd.argv[i + 1] === 'libx264')
+      argv.push('-threads', String(ENCODER_THREADS))
+    argv.push(a)
+  })
+  argv.splice(1, 0, '-filter_threads', '2', '-filter_complex_threads', '2')
+  return { ...cmd, argv }
+}
+
+const ENCODER_THREADS = 4
+
+function buildUnbounded(op: ComposeOp): BuiltCommand {
   switch (op.op) {
     case 'probe':
       return {
