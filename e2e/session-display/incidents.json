@@ -8049,6 +8049,7 @@
       "severity": "P2",
       "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
       "rootFixCommit": "1bb8a534",
+      "coverageCommits": ["892f3ed6"],
       "regressions": [
         {
           "layer": "unit",
