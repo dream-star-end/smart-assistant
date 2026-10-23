@@ -713,6 +713,39 @@ export type ErrorPresentation = {
   waived: boolean;
 };
 
+/** Only the old SDK's complete fixed diagnostic may bypass a stale error card. */
+export function isLegacyRequestTooLargeDiagnostic(code: string | undefined, text?: string): boolean {
+  return typeof code === "string" && code.length > 0
+    && normalizeTurnErrorCode(code) === "engine_error"
+    && typeof text === "string"
+    && /^Request too large \(max 20MB\)\. (?:Try with a smaller file\.|Double press esc to go back and try with a smaller file\.)$/i.test(text.trim());
+}
+
+/** Carry only a safe legacy request ID; never replace a committed snapshot. */
+export function carryLegacySizeRequestReferences(current: ChatMessage[], cached: readonly ChatMessage[]): ChatMessage[] {
+  if (!Array.isArray(cached)) return current;
+  const references = new Map<string, Set<string>>();
+  for (const row of cached) {
+    if (!row || row.role !== "assistant" || typeof row._clientMessageId !== "string" || !row._clientMessageId.trim() || !isLegacyRequestTooLargeDiagnostic(row._errorCode, row.text)) continue;
+    const ids = references.get(row._clientMessageId) ?? new Set<string>();
+    for (const detail of [row._errorDetail, row._errorCardSnapshot?.disposition === "card" ? row._errorCardSnapshot.detail : undefined]) {
+      const ref = typeof detail === "string" ? requestReference(detail) : undefined;
+      if (ref) ids.add(ref);
+    }
+    references.set(row._clientMessageId, ids);
+  }
+  let changed = false;
+  const result = current.map((row) => {
+    if (!row || row.role !== "assistant" || typeof row._clientMessageId !== "string" || !row._clientMessageId.trim() || !isLegacyRequestTooLargeDiagnostic(row._errorCode, row.text)) return row;
+    if (requestReference(row._errorDetail, row._errorCardSnapshot?.disposition === "card" ? row._errorCardSnapshot.detail : undefined)) return row;
+    const ids = references.get(row._clientMessageId);
+    if (!ids || ids.size !== 1) return row;
+    changed = true;
+    return { ...row, _errorDetail: [row._errorDetail, `请求 ID：${[...ids][0]}`].filter(Boolean).join("\n") };
+  });
+  return changed ? result : current;
+}
+
 /** Render-time privacy/UX boundary for both new and already-persisted errors. */
 export function errorPresentation(
   code: string | undefined,
@@ -788,8 +821,7 @@ export function errorPresentation(
   }
   // Old tapes used ENGINE_ERROR for the SDK's fixed size diagnostic.
   // Reclassify only that exact diagnostic; keep genuine partial answers.
-  if (normalized === "engine_error"
-    && /^Request too large \([^\n)]*\)\. (?:Try with a smaller file\.|Double press esc to go back and try with a smaller file\.)$/i.test(text?.trim() ?? "")) {
+  if (isLegacyRequestTooLargeDiagnostic(normalized, text)) {
     return errorPresentation("request_too_large", text, detail, false);
   }
   // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"

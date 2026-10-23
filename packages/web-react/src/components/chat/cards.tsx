@@ -47,6 +47,7 @@ import {
   CONTINUE_PROMPT,
   defaultCollapsed,
   errorPresentation,
+  isLegacyRequestTooLargeDiagnostic,
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
@@ -946,20 +947,28 @@ export function AssistantCard({
   if (msg._hideUnpublishedFallback === true) return null;
   if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
   const hasError = !!msg._errorCode;
+  const legacySize = isLegacyRequestTooLargeDiagnostic(msg._errorCode, msg.text);
+  const effectiveCode = legacySize ? "request_too_large" : msg._errorCode;
+  // Display-only compatibility. Keep persisted snapshots monotone for every other error.
+  const effectiveDetail = legacySize
+    ? [msg._errorDetail, msg._errorCardSnapshot?.disposition === "card"
+      ? msg._errorCardSnapshot.detail : undefined].filter((value): value is string =>
+      typeof value === "string" && value.length > 0).join("\n")
+    : msg._errorDetail;
   const presentedError = hasError
-    ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
+    ? errorPresentation(effectiveCode, msg.text, effectiveDetail, msg.usage?.waived === true)
     : null;
   const isSyntheticEmptyNotice =
     !hasError && (msg.text ?? "").trim() === "本轮未能产出可见回复，已结束，可重试或继续";
 
   // ── 红卡重试 CTA 硬门(任务④)────────────────────────────────────────────────────
   // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
-  const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
+  const normalizedCode = normalizeTurnErrorCode(effectiveCode);
   const isEmptyNoReply =
     normalizedCode === "no_response" || normalizedCode === "phantom_turn";
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
-  const frozenCard = msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
+  const frozenCard = !legacySize && msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
   const errorTone = frozenCard
     ? (frozenCard.tone === "yellow" ? "warning" : "danger")
     : (problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
@@ -968,7 +977,7 @@ export function AssistantCard({
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
   const suppressErrorAlert =
     !isUserCancelled &&
-    (msg._errorCardSnapshot?.disposition === "silent" ||
+    ((!legacySize && msg._errorCardSnapshot?.disposition === "silent") ||
       (!frozenCard && isSilentTurnErrorCode(normalizedCode)));
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
