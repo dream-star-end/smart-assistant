@@ -5,6 +5,7 @@ import type { Pool } from 'pg'
 
 import type { Logger } from '../logging/logger.js'
 import {
+  GAP_TTL_MS,
   type StudioEventFrame,
   startStudioEventPump,
   toFrame,
@@ -25,6 +26,7 @@ const row = (id: number, over: Record<string, unknown> = {}) => ({
   type: 'compose.started',
   ts: new Date('2026-10-24T01:02:03.000Z'),
   message: null,
+  live: true,
   ...over,
 })
 
@@ -35,8 +37,17 @@ function fakePool(events: ReturnType<typeof row>[], bootMax: number) {
     query: async (sql: string, params?: unknown[]) => {
       queries.push(params ?? [])
       if (sql.includes('MAX(id)')) return { rows: [{ id: String(bootMax) }] }
+      if (sql.includes('ANY(')) {
+        const ids = (params as [string[]])[0]
+        return { rows: events.filter((e) => ids.includes(e.id)) }
+      }
       const [cursor, limit] = params as [string, number]
-      return { rows: events.filter((e) => Number(e.id) > Number(cursor)).slice(0, limit) }
+      return {
+        rows: events
+          .filter((e) => Number(e.id) > Number(cursor))
+          .sort((a, b) => Number(a.id) - Number(b.id))
+          .slice(0, limit),
+      }
     },
   }
   return { pool: pool as unknown as Pool, queries }
@@ -118,5 +129,57 @@ describe('studio push (A2-1c-2)', () => {
     const n = queries.length
     await new Promise((r) => setTimeout(r, 50))
     assert.equal(queries.length, n, 'no queries after stop')
+  })
+
+  test('an event that commits after a higher id is still delivered (code r1 P1)', async () => {
+    const events = [row(1)]
+    const { pool } = fakePool(events, 1)
+    const sent: string[] = []
+    const stop = startStudioEventPump({
+      pool,
+      send: (_uid, frame) => sent.push(frame.event.id),
+      log: silent,
+      everyMs: 10,
+    })
+    try {
+      await new Promise((r) => setTimeout(r, 30))
+      // 2 is still in flight when 3 commits and is read.
+      events.push(row(3))
+      await until(() => sent.length === 1)
+      events.push(row(2))
+      await until(() => sent.length === 2)
+      await new Promise((r) => setTimeout(r, 40))
+      assert.deepEqual(sent, ['3', '2'], 'each once')
+    } finally {
+      stop()
+    }
+  })
+
+  test('a gap that never fills expires; events of deleted projects are not sent', async () => {
+    const events = [row(1)]
+    const { pool, queries } = fakePool(events, 1)
+    let clock = 0
+    const sent: string[] = []
+    const stop = startStudioEventPump({
+      pool,
+      send: (_uid, frame) => sent.push(frame.event.id),
+      log: silent,
+      everyMs: 10,
+      now: () => clock,
+    })
+    try {
+      await new Promise((r) => setTimeout(r, 30))
+      events.push(row(3), row(4, { live: false }))
+      await until(() => sent.length === 1)
+      clock = GAP_TTL_MS + 1
+      await new Promise((r) => setTimeout(r, 40))
+      const n = queries.length
+      await new Promise((r) => setTimeout(r, 40))
+      const gapQueries = queries.slice(n).filter((q) => Array.isArray(q[0]))
+      assert.equal(gapQueries.length, 0, 'the rolled-back id is no longer checked')
+      assert.deepEqual(sent, ['3'])
+    } finally {
+      stop()
+    }
   })
 })
