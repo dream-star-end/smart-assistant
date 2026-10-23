@@ -32,7 +32,7 @@ test('rewrite and later append remain visible through every existing hard link',
   await mkdir(join(projects, 'cwd-b'), { mode: 0o700 })
   await link(file(), alias)
   const inode = (await stat(file())).ino
-  const target = Buffer.from('recovered\n' + 'X'.repeat(640 * 1024) + '\n')
+  const target = Buffer.from(`recovered\n${'X'.repeat(640 * 1024)}\n`)
   await replaceSessionFile(alias, target, scope())
   await appendSessionFile(alias, 'new-user-and-assistant\n', scope())
   expect((await readSessionFile(file(), scope())).equals(Buffer.concat([target, Buffer.from('new-user-and-assistant\n')]))).toBe(true)
@@ -41,7 +41,7 @@ test('rewrite and later append remain visible through every existing hard link',
 })
 
 test('concurrent appends preserve admission order without partial JSONL rows', async () => {
-  const rows = Array.from({ length: 16 }, (_, i) => JSON.stringify({ i, text: 'synthetic-' + i }) + '\n')
+  const rows = Array.from({ length: 16 }, (_, i) => `${JSON.stringify({ i, text: `synthetic-${i}` })}\n`)
   await Promise.all(rows.map(row => appendSessionFile(file(), row, scope())))
   expect((await readSessionFile(file(), scope())).toString()).toBe(rows.join(''))
   expect((await readSessionFile(file(), scope())).toString().trim().split('\n').map(x => JSON.parse(x).i)).toEqual(rows.map((_, i) => i))
@@ -101,8 +101,8 @@ test('a wrong target digest never overwrites a partial original or accepts parti
 for (const mode of ['replace', 'append'] as const) {
 for (const crashAt of ['before-truncate', 'after-truncate', 'during-write', 'after-data-sync', 'after-commit'] as const) {
   test(`a real ${mode} writer killed ${crashAt} releases its lock and both aliases recover the complete target`, async () => {
-    const original = Buffer.from('original\n' + 'O'.repeat(900000) + '\n')
-    const tail = Buffer.from('recovered\n' + 'T'.repeat(740000) + '\n')
+    const original = Buffer.from(`original\n${'O'.repeat(900000)}\n`)
+    const tail = Buffer.from(`recovered\n${'T'.repeat(740000)}\n`)
     const target = mode === 'append' ? Buffer.concat([original, tail]) : tail
     await appendSessionFile(file(), original.toString(), scope())
     const alias = join(projects, 'cwd-b', `${sid}.jsonl`)
@@ -196,13 +196,15 @@ test('committed staging stays bounded while preserving the first complete origin
 })
 
 test('a recovery receipt verifies both byte owners and retains its source after subsequent appends', async () => {
-  const original = Buffer.from('original-corrupt-byte-owner\n'), target = Buffer.from('complete-restored-byte-owner\n')
+  const original = Buffer.from('original-corrupt-byte-owner\n')
+  const target = Buffer.from('complete-restored-byte-owner\n')
   await appendSessionFile(file(), original.toString(), scope())
   const receipt = { schema: 1 as const, sourceSha256: digest(original), targetSha256: digest(target), archiveSha256: digest(Buffer.from('synthetic-authority')),
     sourceBytes: original.length, targetBytes: target.length, verifiedReadCount: 2, fragmentCount: 4, fragmentManifestSha256: digest(Buffer.from('synthetic-partition')) }
   await withSessionFile(file(), scope(), false, async (_file, patch, recordReceipt) => { await patch(0, target); await recordReceipt(receipt) })
   for (let n = 0; n < 3; n++) await appendSessionFile(file(), `later-${n}\n`, scope())
-  const scopes = await readdir(join(projects, '.oc-transcript-integrity')), tx = join(projects, '.oc-transcript-integrity', scopes[0]!)
+  const scopes = await readdir(join(projects, '.oc-transcript-integrity'))
+  const tx = join(projects, '.oc-transcript-integrity', scopes[0]!)
   expect(JSON.parse(await readFile(join(tx, 'restore-receipt.json'), 'utf8'))).toEqual(receipt)
   expect((await readFile(join(tx, `source-${receipt.sourceSha256}.blob`))).equals(original)).toBe(true)
   expect((await stat(join(tx, 'restore-receipt.json'))).mode & 0o777).toBe(0o600)

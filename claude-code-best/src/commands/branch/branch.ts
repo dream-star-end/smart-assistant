@@ -167,8 +167,8 @@ async function createFork(customTitle?: string): Promise<{
 
   // Write the fork session file
   if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
-    await replaceSessionFile(forkSessionPath, Buffer.from(lines.join('\n') + '\n'), { projectsDir: getProjectsDir(), sessionId: forkSessionId, requireKernelLock: true })
-  } else await writeFile(forkSessionPath, lines.join('\n') + '\n', {
+    await replaceSessionFile(forkSessionPath, Buffer.from(`${lines.join('\n')}\n`), { projectsDir: getProjectsDir(), sessionId: forkSessionId, requireKernelLock: true })
+  } else await writeFile(forkSessionPath, `${lines.join('\n')}\n`, {
     encoding: 'utf8',
     mode: 0o600,
   })

@@ -12,7 +12,8 @@ const id = (n: number): string => `60700000-0000-4000-8000-${String(n).padStart(
 const stamp = (n: number): string => new Date(Date.UTC(2026, 9, 24, 0, 0, n)).toISOString()
 const hash = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
-let directory: string, file: string
+let directory: string
+let file: string
 let saved: Record<string, string | undefined>
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), 'g607-reader-'))
@@ -33,7 +34,7 @@ afterEach(async () => {
 function message(n: number, parent: string | null, type: 'user' | 'assistant', content: unknown, sidechain = false, group?: string): any {
   return { parentUuid: parent, isSidechain: sidechain, type, message: { role: type, ...(type === 'assistant' ? { id: group ?? `m-${n}` } : {}), content }, uuid: id(n), timestamp: stamp(n), cwd: '/synthetic', sessionId: sid, version: 'fixture', userType: 'external' }
 }
-async function write(entries: unknown[]): Promise<void> { await writeFile(file, entries.map(entry => JSON.stringify(entry) + '\n').join(''), { mode: 0o600 }) }
+async function write(entries: unknown[]): Promise<void> { await writeFile(file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(''), { mode: 0o600 }) }
 async function both(): Promise<{ full: LogOption; optimized: LogOption }> {
   const log = { sessionId: sid, fullPath: file, messages: [], modified: new Date(0), created: new Date(0), firstPrompt: 'fixture', messageCount: 0 } as unknown as LogOption
   process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP = '1'
@@ -55,7 +56,7 @@ for (const sidechain of [false, true]) {
       message(6, id(4), 'user', [{ type: 'tool_result', tool_use_id: 'read-a', content: [{ type: 'image', source: { type: 'base64', data: image, media_type: 'image/png' } }] }], sidechain),
       message(7, id(5), 'user', [{ type: 'tool_result', tool_use_id: 'read-b', content: [{ type: 'image', source: { type: 'base64', data: image, media_type: 'image/png' } }] }], sidechain),
       // A large, valid dead branch makes the optimization's benefit gate real.
-      message(0, null, 'assistant', 'dead-branch-' + 'x'.repeat(6 * 1024 * 1024), sidechain),
+      message(0, null, 'assistant', `dead-branch-${'x'.repeat(6 * 1024 * 1024)}`, sidechain),
       message(8, id(6), 'user', 'continue with both images', sidechain),
       { type: 'custom-title', sessionId: sid, customTitle: 'synthetic title' },
     ]
@@ -86,7 +87,7 @@ test('Snip can remove its own source and a large parent bridge without losing th
   source.snipMetadata = { removedUuids: [id(3), id(5)] }
   await write([
     message(1, null, 'user', 'base'), message(2, id(1), 'assistant', 'A'),
-    message(3, id(2), 'user', 'explicitly-removed-' + 'x'.repeat(6 * 1024 * 1024)),
+    message(3, id(2), 'user', `explicitly-removed-${'x'.repeat(6 * 1024 * 1024)}`),
     message(4, id(3), 'assistant', 'B'), source,
     message(6, id(5), 'user', 'retained final prompt'),
   ])
@@ -102,7 +103,7 @@ test('legacy progress bridging is as-of each physical row, including a reused pr
     message(3, id(2), 'user', 'middle'),
     { type: 'progress', uuid: id(99), parentUuid: id(3), timestamp: stamp(3) },
     message(4, id(99), 'assistant', 'later child'),
-    message(0, null, 'assistant', 'dead-' + 'x'.repeat(6 * 1024 * 1024)),
+    message(0, null, 'assistant', `dead-${'x'.repeat(6 * 1024 * 1024)}`),
     message(5, id(4), 'user', 'final'),
   ])
   const { optimized } = await both()
@@ -115,6 +116,6 @@ test('duplicate UUID last value and first insertion order survive equal timestam
   first.timestamp = stamp(10); other.timestamp = stamp(10)
   const replacement = { ...first, message: { ...first.message, content: 'final value' } }
   await write([message(1, null, 'user', 'base'), first, other,
-    message(0, null, 'assistant', 'dead-' + 'x'.repeat(6 * 1024 * 1024)), replacement])
+    message(0, null, 'assistant', `dead-${'x'.repeat(6 * 1024 * 1024)}`), replacement])
   await both()
 })

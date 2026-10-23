@@ -7,7 +7,8 @@ import { materializeLosslessTurn } from '../http/losslessTurnTape.js'
 import { readCcbNativeRestoreArchive } from '../db/pgSessionsBackend.js'
 
 const binding = { peerId: 'g607-temp-only', agentId: 'main', nativeSessionId: '60700000-0000-4000-8000-000000000001' }
-const owner = 'c:765', clock = 1792800000000
+const owner = 'c:765'
+const clock = 1792800000000
 const sha = (bytes: Buffer | string): string => createHash('sha256').update(bytes).digest('hex')
 const ddl = `
 CREATE TEMP TABLE client_sessions (id text,user_id text,deleted_at bigint,messages jsonb);
@@ -32,7 +33,8 @@ async function seed(client: Client, opts: { archived?: boolean; deferred?: boole
     runtimeEvents: events.map((payload, ordinal) => ({ ordinal, observedAt: clock + ordinal, source: 'ccb', payload })) }
   const turn = materializeLosslessTurn(payload, { runtimeBatching: true })
   assert.ok(turn.runtimeBatchManifestSha256, 'fixture must exercise real gzip batches')
-  const tapeId = opts.recovery ? 'recovery-tape' : 'fixture-tape', tapeSha = sha(JSON.stringify(payload))
+  const tapeId = opts.recovery ? 'recovery-tape' : 'fixture-tape'
+  const tapeSha = sha(JSON.stringify(payload))
   const anchor = { id: 'fixture-anchor', role: 'assistant', text: payload.text, _turnTapeComplete: true, _turnTapeId: tapeId, _turnTapeSha256: tapeSha,
     _turnTapePhysicalRecordCount: turn.records.length, _turnTapeLogicalRecordCount: turn.logicalRecordCount, _turnTapeRuntimeManifestSha256: turn.runtimeBatchManifestSha256, _orderSeq: 10 }
   const user = opts.deferred ? { id: input.id, role: 'user', _userPayloadDeferred: true } : input
@@ -44,7 +46,9 @@ async function seed(client: Client, opts: { archived?: boolean; deferred?: boole
   for (const [ordinal, record] of turn.records.entries()) await client.query('INSERT INTO client_session_turn_tape_records VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
     [tapeId, binding.peerId, owner, record.id, ordinal, record.role, record.payloadSha256, record.payloadBytes])
   if (opts.recovery) {
-    const dispatch = '60700000-0000-4000-8000-000000000002', sourceSha = sha('synthetic-source-tape'), sourceKey = '2'.repeat(64)
+    const dispatch = '60700000-0000-4000-8000-000000000002'
+    const sourceSha = sha('synthetic-source-tape')
+    const sourceKey = '2'.repeat(64)
     await client.query(`INSERT INTO client_session_turn_tapes VALUES ('source-tape',$1,$2,$3,$4,1,1,1,$5,1,$6,'crashed',$7,$6,'complete',$8,$9,1,NULL)`,
       [binding.peerId, owner, binding.agentId, sourceSha, input.id, clock, sourceKey, turn.billingAnchorId, dispatch])
     await client.query("INSERT INTO turn_dispatches VALUES ($1,765,$2,$3,$4,'terminal','crashed')", [dispatch, binding.peerId, binding.agentId, input.id])
@@ -54,7 +58,8 @@ async function seed(client: Client, opts: { archived?: boolean; deferred?: boole
 }
 
 test('raw restore validates tenant authority, batched bytes, deferred input and administrative recovery without touching shared tables', async t => {
-  const url = getTestDatabaseUrlForTempTables(), parsed = new URL(url)
+  const url = getTestDatabaseUrlForTempTables()
+  const parsed = new URL(url)
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname), 'TEMP_FIXTURE_REQUIRES_LOOPBACK')
   assert.match(decodeURIComponent(parsed.pathname.slice(1)), /^[a-z][a-z0-9_]*_test$/, 'TEMP_FIXTURE_REQUIRES_TEST_DATABASE')
   const client = new Client({ connectionString: url, connectionTimeoutMillis: 5000 })
@@ -65,7 +70,8 @@ test('raw restore validates tenant authority, batched bytes, deferred input and 
     const read = (bound = binding, owned = owner) => readCcbNativeRestoreArchive(client as unknown as PoolClient, owned, bound)
     const scenario = async (name: string, fn: () => Promise<void>) => t.test(name, async () => { await client.query('BEGIN'); try { await fn() } finally { await client.query('ROLLBACK') } })
     await scenario('raw signature and complete native arrays survive real gzip batch expansion', async () => {
-      const seeded = await seed(client), archive = await read()
+      const seeded = await seed(client)
+      const archive = await read()
       assert.equal(archive.tapes.length, 1); assert.deepEqual(archive.tapes[0]!.records.map(record => record.payload), seeded.events.slice(1))
       assert.equal(archive.tapes[0]!.canonicalInput.modelText, seeded.input._modelText)
       assert.equal(archive.tapes[0]!.records[0]!.sha256, sha(JSON.stringify(seeded.events[1])))

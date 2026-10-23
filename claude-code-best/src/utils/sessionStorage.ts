@@ -771,7 +771,7 @@ class Project {
           while (index < batch.length) {
             const item = batch[index]!
             if (item.kind !== 'entry') break
-            const line = jsonStringify(item.entry) + '\n'
+            const line = `${jsonStringify(item.entry)}\n`
             const size = Buffer.byteLength(line)
             if (content && bytes + size > this.MAX_CHUNK_BYTES) break
             content += line; bytes += size; chunk.push(item); index++
@@ -874,7 +874,7 @@ class Project {
           if (title !== undefined) this.currentSessionTitle = title || undefined
           if (tag !== undefined) this.currentSessionTag = tag || undefined
         }
-        if (current.length) await patch(size, Buffer.from(current.map(entry => jsonStringify(entry) + '\n').join('')))
+        if (current.length) await patch(size, Buffer.from(current.map(entry => `${jsonStringify(entry)}\n`).join('')))
       }).catch(error => { this.rememberWriteFailure(error, this.writeQueueIdentity(filePath).key) })
       return
     }
@@ -2852,7 +2852,7 @@ export function appendEntryToFile(
     return write
   }
   const fs = getFsImplementation()
-  const line = jsonStringify(entry) + '\n'
+  const line = `${jsonStringify(entry)}\n`
   try {
     fs.appendFileSync(fullPath, line, { mode: 0o600 })
   } catch {

@@ -10,11 +10,17 @@ const sid = '60700000-0000-4000-8000-000000004000'
 const uuid = (n: number) => `60700000-0000-4000-8000-${String(n).padStart(12, '0')}`
 
 test('producer admission, queue backpressure, metadata and tombstones all commit before terminal flush', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'g607-queue-')), projectDir = join(directory, 'projects', 'fixture'), file = join(projectDir, `${sid}.jsonl`)
+  const directory = await mkdtemp(join(tmpdir(), 'g607-queue-'))
+  const projectDir = join(directory, 'projects', 'fixture')
+  const file = join(projectDir, `${sid}.jsonl`)
   const keys = ['CLAUDE_CONFIG_DIR', 'OPENCLAUDE_TRANSCRIPT_INTEGRITY', 'TEST_ENABLE_SESSION_PERSISTENCE']
-  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]])), originalSid = getSessionId(), originalProject = getSessionProjectDir()
-  let release!: () => void, entered!: () => void
-  const gate = new Promise<void>(r => { release = r }), ready = new Promise<void>(r => { entered = r })
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+  const originalSid = getSessionId()
+  const originalProject = getSessionProjectDir()
+  let release!: () => void
+  let entered!: () => void
+  const gate = new Promise<void>(r => { release = r })
+  const ready = new Promise<void>(r => { entered = r })
   let holder: Promise<void> | undefined
   try {
     process.env.CLAUDE_CONFIG_DIR = directory; process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY = '1'; process.env.TEST_ENABLE_SESSION_PERSISTENCE = '1'
@@ -24,7 +30,8 @@ test('producer admission, queue backpressure, metadata and tombstones all commit
     await ready
     const original = Array.from({ length: 1105 }, (_, i) => ({ type: i % 2 ? 'assistant' : 'user', uuid: uuid(i + 1), timestamp: new Date(1792800000000 + i).toISOString(),
       message: { role: i % 2 ? 'assistant' : 'user', ...(i % 2 ? { id: `model-${i}` } : {}), content: [{ type: 'text', text: `synthetic exact row ${i}` }] } }))
-    const admitted = original.slice(), recording = storage.recordTranscript(admitted as any, undefined, undefined, undefined, true)
+    const admitted = original.slice()
+    const recording = storage.recordTranscript(admitted as any, undefined, undefined, undefined, true)
     admitted.length = 0 // Admission owns membership even if the caller clears its array.
     const title = storage.saveCustomTitle(sid as any, 'synthetic newest title', file)
     const orphan = { parentUuid: null, isSidechain: false, type: 'user', uuid: uuid(3000), timestamp: new Date(1792800005000).toISOString(), sessionId: sid,

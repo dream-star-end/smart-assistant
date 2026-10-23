@@ -21,7 +21,8 @@ function capability(name: string) {
   let closes = 0
   return { socketPath: `/synthetic/${name}.sock`, async close() { closes++ }, get closes() { return closes } }
 }
-let directory: string, saved: Record<string, string | undefined>
+let directory: string
+let saved: Record<string, string | undefined>
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), 'g607-generation-'))
   saved = Object.fromEntries(['OC_CONTAINER_ID', 'CLAUDE_CONFIG_DIR'].map(key => [key, process.env[key]]))
@@ -54,12 +55,17 @@ test('a failed spawn releases its exact restore capability before start rejects'
 })
 
 test('a late old capability closes itself without spawning or replacing the new generation', async () => {
-  const a = capability('old'), b = capability('new'), entered = deferred<void>(), release = deferred<typeof a>()
+  const a = capability('old')
+  const b = capability('new')
+  const entered = deferred<void>()
+  const release = deferred<typeof a>()
   let factories = 0
   __setCcbTranscriptRestoreSocketFactoryForTests(async () => { if (++factories === 1) { entered.resolve(); return release.promise } return b })
-  const child = new FakeProc(), envs: Array<Record<string, string | undefined>> = []
+  const child = new FakeProc()
+  const envs: Array<Record<string, string | undefined>> = []
   __setCcbSpawnForTests(opts => { envs.push({ ...opts.env }); return child as never })
-  const r = runner(), first = r.start()
+  const r = runner()
+  const first = r.start()
   await entered.promise
   await r.shutdown()
   await r.start()
@@ -74,10 +80,14 @@ test('a late old capability closes itself without spawning or replacing the new 
 })
 
 test('an old start delayed before learning context cannot close the new generation socket', async () => {
-  const b = capability('new-after-context'), entered = deferred<void>(), release = deferred<{ workingDir: string }>()
-  let preparations = 0, factories = 0
+  const b = capability('new-after-context')
+  const entered = deferred<void>()
+  const release = deferred<{ workingDir: string }>()
+  let preparations = 0
+  let factories = 0
   __setCcbTranscriptRestoreSocketFactoryForTests(async () => { factories++; return b })
-  const child = new FakeProc(), envs: Array<Record<string, string | undefined>> = []
+  const child = new FakeProc()
+  const envs: Array<Record<string, string | undefined>> = []
   __setCcbSpawnForTests(opts => { envs.push({ ...opts.env }); return child as never })
   const r = runner()
   Reflect.set(r, 'buildLearningContext', async () => { if (++preparations === 1) { entered.resolve(); return release.promise } return { workingDir: directory } })
