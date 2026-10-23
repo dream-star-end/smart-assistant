@@ -137,14 +137,19 @@ export function ImageStudioPage(props: {
     e.target.value = ''
     if (!files.length) return
     setUploading(true)
+    let done = 0
     try {
-      for (const f of files) await studioApi.uploadAsset(auth, view.project.id, f)
+      for (const f of files) {
+        await studioApi.uploadAsset(auth, view.project.id, f)
+        done += 1
+      }
       toast(files.length > 1 ? `已上传 ${files.length} 张参考图` : '参考图已上传', 'success')
-      await props.onReload()
     } catch (err) {
-      toast(studioErrorText(err), 'error')
+      // Earlier files of a batch may already be stored: say so, and still refresh (code r1 P2).
+      toast(done ? `已上传 ${done} 张；${studioErrorText(err)}` : studioErrorText(err), 'error')
     } finally {
       setUploading(false)
+      if (done) await props.onReload()
     }
   }
 
@@ -261,6 +266,7 @@ export function ImageStudioPage(props: {
             <button
               type="button"
               className={`st-glass-t${tool === 'view' && !compare ? ' on' : ''}`}
+              aria-label="查看"
               aria-pressed={tool === 'view' && !compare}
               onClick={() => {
                 setCompare(false)
@@ -273,6 +279,7 @@ export function ImageStudioPage(props: {
             <button
               type="button"
               className={`st-glass-t${tool === 'comment' && !compare ? ' on' : ''}`}
+              aria-label="评论"
               aria-pressed={tool === 'comment' && !compare}
               onClick={() => {
                 setCompare(false)
@@ -287,6 +294,7 @@ export function ImageStudioPage(props: {
             <button
               type="button"
               className={`st-glass-t${compare ? ' on' : ''}`}
+              aria-label="对比"
               aria-pressed={compare}
               disabled={!compareWith}
               onClick={() => setCompare((c) => !c)}
@@ -335,7 +343,13 @@ export function ImageStudioPage(props: {
               data-testid="image-canvas"
             >
               {url ? (
-                <img className="st-media-fill" src={url} alt={asset?.name ?? '设定图'} />
+                <img
+                  className="st-media-fill"
+                  style={{ objectFit: 'contain' }}
+                  src={url}
+                  draggable={false}
+                  alt={asset?.name ?? '设定图'}
+                />
               ) : (
                 <div className="st-media-fill st-placeholder" />
               )}

@@ -136,6 +136,20 @@ describe('ImageStudioPage (OCV5-593 FE-2c)', () => {
     expect(uploadAsset).toHaveBeenCalledWith(auth, 'p', png)
   })
 
+  test('a batch where a later file fails still refreshes for the files already stored (code r1 P2)', async () => {
+    const onReload = vi.fn()
+    uploadAsset.mockResolvedValueOnce({ id: 'u2' }).mockRejectedValueOnce(new Error('net'))
+    const { container } = render(
+      <ImageStudioPage auth={auth} view={view()} providers={providers} onReload={onReload} />,
+    )
+    const input = container.querySelector('input[type=file]') as HTMLInputElement
+    const a = new File([new Uint8Array([1])], 'a.png', { type: 'image/png' })
+    const b = new File([new Uint8Array([1])], 'b.png', { type: 'image/png' })
+    fireEvent.change(input, { target: { files: [a, b] } })
+    await waitFor(() => expect(onReload).toHaveBeenCalledTimes(1))
+    expect(uploadAsset).toHaveBeenCalledTimes(2)
+  })
+
   test('comment mode drops a pin draft on the current version', async () => {
     render(<ImageStudioPage auth={auth} view={view()} providers={providers} onReload={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: '评论' }))
