@@ -66,6 +66,8 @@ jobs:
       - name: Install CCB from lockfile
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: CCB lossless context transport and media retention tests
+        run: npm run test:ccb:box-context
       - name: Incident trailer gate (deploy, before build)
         run: bash scripts/check-v5-fix-trailers.sh --repo . --head "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Box multitool continuation gate

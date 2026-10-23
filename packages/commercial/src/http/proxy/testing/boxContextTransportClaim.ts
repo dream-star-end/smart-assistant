@@ -45,7 +45,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
       clientName: "Read", inputHash: hashBoxToolInput(tool.input) })),
     verifiedPendingToolUseIds: assistant.map((tool) => tool.id),
     usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
-  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,ctx) VALUES ($1,$2,'committed',$3::jsonb)",
+  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,precheck_credits,ctx) VALUES ($1,$2,'committed',0,$3::jsonb)",
     [owner, uid.toString(), JSON.stringify({
       model: body.model, boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool",
       boxAccountId: "765", boxRunNonce: nonce, boxLeaseEpoch: epoch,
@@ -55,7 +55,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
       boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`, boxNativeCliVersion: "2.1.280",
     })]);
-  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,ctx) VALUES ($1,$2,'inflight',$3::jsonb)",
+  await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,precheck_credits,ctx) VALUES ($1,$2,'inflight',0,$3::jsonb)",
     [child, uid.toString(), JSON.stringify({
       model: body.model, boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing,
     })]);

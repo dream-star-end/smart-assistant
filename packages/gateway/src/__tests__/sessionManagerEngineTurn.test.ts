@@ -2668,7 +2668,7 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
-      assert.equal(payload.status, "completed");
+      assert.equal(payload.status, "crashed");
       assert.equal(payload.errorCode, "upstream_failed");
       assert.equal(
         payload.errorDetail,
