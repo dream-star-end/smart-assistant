@@ -247,11 +247,21 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
         shotId: err.shotId,
         message: err.message,
       })
+      if (pl.takeId) {
+        await c.query(
+          `UPDATE studio_takes SET status = 'failed', error_code = 'COMPOSE_NARRATION', finished_at = NOW()
+            WHERE id = $1 AND status IN ('queued','running')`,
+          [pl.takeId],
+        )
+      }
       await finishStudioTask(c, task, {
         status: 'failed',
         error: `COMPOSE_NARRATION: ${err.message}`.slice(0, 500),
       })
     })
+    // An earlier attempt may have written its blob already (code r1 P1): give it back.
+    if (pl.takeId)
+      await deps.blobs.dropRefs(BigInt(inputs.userId), { kind: 'final', id: pl.takeId })
     return
   }
 
@@ -287,8 +297,9 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
   }
 
   const userId = BigInt(inputs.userId)
-  const jobId = `c-${task.id}`
-  const qaJob = `q-${task.id}`
+  // Per lease epoch (code r1 P1): a holder that lost its lease never touches the new holder's dirs.
+  const jobId = `c-${task.id}-e${task.epoch}`
+  const qaJob = `q-${task.id}-e${task.epoch}`
   let finalSha: string
   let srtSha: string | null = null
   let qa: ReturnType<typeof finalQa>
@@ -347,6 +358,28 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
     const now = await loadComposeInputs(c, task.projectId, pl.variant)
     // What this run actually composed (a re-claim composes the inputs as they are now).
     const composedKey = inputs.inputsKey
+    // A generation still in flight (e.g. a newly chosen track) will change the inputs (code r1 P1).
+    const pending = await c.query(
+      `SELECT 1 FROM studio_tasks WHERE project_id = $1 AND kind = 'gen' AND status IN ('queued','leased') LIMIT 1`,
+      [task.projectId],
+    )
+    if (pending.rowCount) {
+      await c.query(
+        `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1`,
+        [takeId],
+      )
+      // Back to the director: it composes again once that work has finished.
+      await c.query(
+        `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason', rev = rev + 1, updated_at = NOW()
+          WHERE id = $1 AND status IN ('composing','done')`,
+        [task.projectId],
+      )
+      await appendStudioEvent(c, task.projectId, 'compose.superseded', {
+        message: '合成期间有新的改动（如换配乐）还在进行，等它完成后重新合成。',
+      })
+      await finishStudioTask(c, task, { status: 'done', error: 'superseded by pending work' })
+      return 'superseded' as const
+    }
     if (!now || now.inputsKey !== composedKey) {
       await c.query(
         `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1`,
@@ -390,6 +423,12 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
           WHERE id = $1 AND status = 'composing'`,
         [task.projectId],
       )
+      // Paused while composing (code r1 P1): resume then lands on the finished film.
+      await c.query(
+        `UPDATE studio_projects SET settings = settings || '{"resumeTo":"done"}'::jsonb
+          WHERE id = $1 AND status = 'paused' AND settings->>'resumeTo' = 'composing'`,
+        [task.projectId],
+      )
     }
     await appendStudioEvent(c, task.projectId, 'compose.done', {
       takeId,
@@ -405,6 +444,12 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
     return 'published' as const
   })
   if (outcome === 'superseded') await deps.blobs.dropRefs(userId, { kind: 'final', id: takeId })
+  // A re-claimed run reuses the take; what an earlier attempt stored on it is given back (code r1 P1).
+  else
+    await deps.blobs.dropRefsExcept(userId, { kind: 'final', id: takeId }, [
+      finalSha,
+      ...(srtSha ? [srtSha] : []),
+    ])
 }
 
 /** A compose that will not be retried: its take fails and gives its blob refs back (plan §4). */

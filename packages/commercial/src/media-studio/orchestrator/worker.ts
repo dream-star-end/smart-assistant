@@ -133,7 +133,7 @@ export class StudioWorker {
     try {
       const r = await this.deps.pool.query<{ id: string }>(
         `SELECT p.id::text AS id FROM studio_projects p
-          WHERE p.deleted_at IS NULL AND p.status IN ('planning', 'running')
+          WHERE p.deleted_at IS NULL AND p.status IN ('planning', 'running', 'composing')
             AND NOT EXISTS (SELECT 1 FROM studio_events e WHERE e.project_id = p.id AND e.ts > NOW() - INTERVAL '2 minutes')
           LIMIT 20`,
       )

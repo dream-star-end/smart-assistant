@@ -45,8 +45,9 @@ export async function runStudioGc(deps: {
   }
 
   let takes = 0
-  const stale = await deps.pool.query<{ id: string; user_id: string }>(
-    `SELECT t.id::text AS id, p.user_id::text AS user_id
+  const stale = await deps.pool.query<{ id: string; user_id: string; kind: 'take' | 'final' }>(
+    `SELECT t.id::text AS id, p.user_id::text AS user_id,
+            CASE WHEN t.owner_kind = 'final' THEN 'final' ELSE 'take' END AS kind
        FROM studio_takes t JOIN studio_projects p ON p.id=t.project_id
       WHERE t.finished_at < NOW() - INTERVAL '30 days'
         -- A finished film is kept; a final take that failed or was superseded is not (A2-1c).
@@ -55,13 +56,15 @@ export async function runStudioGc(deps: {
         AND NOT EXISTS (SELECT 1 FROM studio_lines l WHERE l.active_take_id=t.id)
         AND NOT EXISTS (SELECT 1 FROM studio_assets a
                          WHERE a.project_id=t.project_id AND a.blob_sha=t.blob_sha)
+        -- A final take's blobs are held under ref kind 'final' (A2-1c), every other take's under 'take'.
         AND EXISTS (SELECT 1 FROM studio_blob_refs r
-                     WHERE r.user_id=p.user_id AND r.ref_kind='take' AND r.ref_id=t.id)
+                     WHERE r.user_id=p.user_id AND r.ref_id=t.id
+                       AND r.ref_kind = CASE WHEN t.owner_kind = 'final' THEN 'final' ELSE 'take' END)
       LIMIT $1`,
     [batch * 10],
   )
   for (const t of stale.rows) {
-    takes += await deps.blobs.dropRefs(BigInt(t.user_id), { kind: 'take', id: t.id })
+    takes += await deps.blobs.dropRefs(BigInt(t.user_id), { kind: t.kind, id: t.id })
   }
 
   const blobs = await deps.blobs.gc()

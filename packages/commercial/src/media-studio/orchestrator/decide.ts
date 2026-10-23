@@ -112,6 +112,9 @@ export function shotDone(s: DState, shot: DShot): boolean {
 
 export function decide(s: DState): Action[] {
   if (s.status === 'planning') return s.hasPlanTask ? [] : [{ type: 'enqueue_plan' }]
+  // A2-1c: composing without its task (e.g. it ended while the project was paused) re-queues one.
+  if (s.status === 'composing')
+    return s.canCompose && !s.composeQueued && s.inflight === 0 ? [{ type: 'enqueue_compose' }] : []
   if (s.status !== 'running') return []
 
   const actions: Action[] = []

@@ -218,7 +218,10 @@ describe('decide (OCV5-591 A2-1a)', () => {
     assert.deepEqual(decide({ ...ready, composeQueued: true }), [
       { type: 'set_status', status: 'composing' },
     ])
-    assert.deepEqual(decide({ ...ready, status: 'composing' }), [])
+    assert.deepEqual(decide({ ...ready, status: 'composing', composeQueued: true }), [])
+    // Composing without its task (it ended while paused, code r1 P1) re-queues one, once idle.
+    assert.deepEqual(decide({ ...ready, status: 'composing' }), [{ type: 'enqueue_compose' }])
+    assert.deepEqual(decide({ ...ready, status: 'composing', inflight: 1 }), [])
     assert.deepEqual(decide({ ...ready, canCompose: false }), [
       { type: 'set_status', status: 'awaiting_user', reason: 'compose_pending' },
     ])

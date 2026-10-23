@@ -398,6 +398,38 @@ export class StudioBlobStore {
     })
   }
 
+  /** Like dropRefs, but keeps the refs to `keep` (a re-used take keeps only what it publishes). */
+  async dropRefsExcept(
+    userId: bigint,
+    ref: { kind: BlobRefKind; id: string },
+    keep: string[],
+  ): Promise<number> {
+    return inTx(this.opts.pool, async (client) => {
+      await client.query('SELECT 1 FROM studio_quota WHERE scope=$1 FOR UPDATE', [
+        userScope(userId),
+      ])
+      const dropped = await client.query<{ sha256: string }>(
+        `DELETE FROM studio_blob_refs WHERE user_id=$1 AND ref_kind=$2 AND ref_id=$3 AND sha256 <> ALL($4::text[])
+         RETURNING sha256`,
+        [userId.toString(), ref.kind, ref.id, keep],
+      )
+      const shas = [...new Set(dropped.rows.map((row) => row.sha256))]
+      if (shas.length === 0) return 0
+      const released = await client.query<{ bytes: string }>(
+        `SELECT COALESCE(SUM(b.bytes),0)::text AS bytes FROM studio_blobs b
+         WHERE b.sha256 = ANY($2::text[])
+           AND NOT EXISTS (SELECT 1 FROM studio_blob_refs r WHERE r.user_id=$1 AND r.sha256=b.sha256)`,
+        [userId.toString(), shas],
+      )
+      await client.query(
+        `UPDATE studio_quota SET used_bytes = GREATEST(0, used_bytes - $1), updated_at = NOW()
+         WHERE scope=$2`,
+        [released.rows[0]!.bytes, userScope(userId)],
+      )
+      return dropped.rowCount ?? 0
+    })
+  }
+
   /** Removes the user's refs held by one object; gives back bytes of shas the user no longer references. */
   async dropRefs(userId: bigint, ref: { kind: BlobRefKind; id: string }): Promise<number> {
     return inTx(this.opts.pool, async (client) => {

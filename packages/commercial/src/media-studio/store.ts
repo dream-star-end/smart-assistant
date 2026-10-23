@@ -373,7 +373,12 @@ export class StudioStore {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', `cannot resume a ${row.status} project`)
         const to = settings.resumeTo
         next =
-          to === 'planning' || to === 'running' || to === 'awaiting_user' || to === 'composing'
+          to === 'planning' ||
+          to === 'running' ||
+          to === 'awaiting_user' ||
+          to === 'composing' ||
+          // A compose that finished while paused (OCV5-591 A2-1c).
+          to === 'done'
             ? to
             : 'running'
         const { resumeTo: _drop, ...rest } = settings

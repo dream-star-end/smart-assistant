@@ -311,7 +311,8 @@ export function makeOrchestratorApi(
         )
         const p = r.rows[0]
         if (!p) throw notFound()
-        if (['done', 'canceled', 'failed'].includes(p.status))
+        // A finished film may change its music: it then goes back to the director (A2-1c).
+        if (['canceled', 'failed'].includes(p.status))
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', `cannot change a ${p.status} project`)
         const outcome = await dispatchRequest(
           c,
@@ -358,7 +359,7 @@ export function makeOrchestratorApi(
                 -- A finished film goes back to the director with the new edit (free re-compose).
                 status = CASE WHEN status = 'done' THEN 'running' ELSE status END,
                 rev = rev + 1, updated_at = NOW()
-          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND status NOT IN ('done','canceled','failed')`,
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND status NOT IN ('canceled','failed')`,
         [projectId, userId, JSON.stringify(edit)],
       )
       if (r.rowCount !== 1) {

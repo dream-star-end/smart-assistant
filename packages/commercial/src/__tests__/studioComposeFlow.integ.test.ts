@@ -25,12 +25,13 @@ import { query } from '../db/queries.js'
 import { StudioBlobStore } from '../media-studio/blobs.js'
 import type { ComposeResult } from '../media-studio/compose/runner.js'
 import type { ComposeOp } from '../media-studio/compose/spec.js'
+import { runStudioGc } from '../media-studio/gc.js'
 import { advanceProject } from '../media-studio/orchestrator/advance.js'
 import type { ComposeRunnerLike } from '../media-studio/orchestrator/compose.js'
 import { type ExecuteDeps, executeTask } from '../media-studio/orchestrator/execute.js'
 import { makeOrchestratorApi } from '../media-studio/orchestrator/service.js'
 import type { ProviderRegistry } from '../media-studio/providers/registry.js'
-import { claimStudioTasks } from '../media-studio/queue.js'
+import { claimStudioTasks, enqueueStudioTask } from '../media-studio/queue.js'
 import { StudioStore } from '../media-studio/store.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
 
@@ -96,6 +97,7 @@ const skip = (t: { skip: (m: string) => void }) => {
 /** A sandbox that writes a tiny "mp4" and answers probe with the length it is told to. */
 class FakeRunner implements ComposeRunnerLike {
   ran: ComposeOp[] = []
+  prepared: string[] = []
   probeSec = 0
   fail: Error | null = null
   onCompose: (() => Promise<void>) | null = null
@@ -104,6 +106,7 @@ class FakeRunner implements ComposeRunnerLike {
     return true
   }
   async prepare(jobId: string) {
+    this.prepared.push(jobId)
     const inDir = path.join(this.root, jobId, 'in')
     const outDir = path.join(this.root, jobId, 'out')
     await mkdir(inDir, { recursive: true })
@@ -418,5 +421,148 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
     const all = await finals(s.p.id)
     assert.equal(all.length, 2)
     assert.equal(all[1]!.status, 'succeeded')
+  })
+
+  test('a compose that finishes while paused resumes to the film, not a stuck composing (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    s.runner.onCompose = async () => {
+      await new StudioStore(getPool()).transition(s.uid, s.p.id, 'pause')
+    }
+    await runOne(s.exec)
+    assert.equal((await project(s.p.id)).status, 'paused')
+    await new StudioStore(getPool()).transition(s.uid, s.p.id, 'resume')
+    assert.equal((await project(s.p.id)).status, 'done')
+  })
+
+  test('sandbox dirs are per lease epoch (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    const task = await runOne(s.exec)
+    assert.deepEqual(s.runner.prepared, [
+      `c-${task.id}-e${task.epoch}`,
+      `q-${task.id}-e${task.epoch}`,
+    ])
+  })
+
+  test('a re-used final take keeps only the film it publishes (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    const [task] = await claimStudioTasks(getPool(), { owner: 'A', limit: 1, museOnline: false })
+    // An earlier attempt created the take and stored a blob on it, then lost its lease.
+    const takeId = randomUUID()
+    await query(
+      `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, status, cost_credits)
+       VALUES ($1, $2, 'final', $2, 1, 'compose', 'ffmpeg', 'compose', 'running', 0)`,
+      [takeId, s.p.id],
+    )
+    await query('UPDATE studio_tasks SET payload = payload || $2::jsonb WHERE id = $1', [
+      task!.id,
+      JSON.stringify({ takeId }),
+    ])
+    task!.payload = { ...task!.payload, takeId }
+    const stale = await s.blobs.put({
+      userId: BigInt(s.uid),
+      mime: 'video/mp4',
+      maxBytes: 64,
+      source: Buffer.from('stale film'),
+      ref: { kind: 'final', id: takeId },
+    })
+    await executeTask(s.exec, task!, new AbortController().signal)
+    const [film] = await finals(s.p.id)
+    assert.equal(film!.id, takeId, 'the same take was re-used')
+    const refs = await query<{ sha: string }>(
+      `SELECT sha256 AS sha FROM studio_blob_refs WHERE ref_kind = 'final' AND ref_id = $1`,
+      [takeId],
+    )
+    assert.deepEqual(
+      refs.rows.map((r) => r.sha),
+      [film!.sha],
+    )
+    assert.equal(
+      await s.blobs.open(BigInt(s.uid), stale.sha),
+      null,
+      'the stale blob is no longer the user’s',
+    )
+  })
+
+  test('refusing narration closes the take an earlier attempt created (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup([3, 2.5])
+    await advanceProject(s.advanceDeps, s.p.id)
+    const [task] = await claimStudioTasks(getPool(), { owner: 'A', limit: 1, museOnline: false })
+    const takeId = randomUUID()
+    await query(
+      `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, status, cost_credits)
+       VALUES ($1, $2, 'final', $2, 1, 'compose', 'ffmpeg', 'compose', 'running', 0)`,
+      [takeId, s.p.id],
+    )
+    task!.payload = { ...task!.payload, takeId }
+    await s.blobs.put({
+      userId: BigInt(s.uid),
+      mime: 'video/mp4',
+      maxBytes: 64,
+      source: Buffer.from('half film'),
+      ref: { kind: 'final', id: takeId },
+    })
+    await executeTask(s.exec, task!, new AbortController().signal)
+    const [film] = await finals(s.p.id)
+    assert.equal(film!.status, 'failed')
+    const refs = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM studio_blob_refs WHERE ref_kind = 'final' AND ref_id = $1`,
+      [takeId],
+    )
+    assert.equal(refs.rows[0]!.n, '0')
+  })
+
+  test('the GC collects a failed film’s blob under its final ref (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const takeId = randomUUID()
+    await query(
+      `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, status, cost_credits, finished_at)
+       VALUES ($1, $2, 'final', $2, 1, 'compose', 'ffmpeg', 'compose', 'failed', 0, NOW() - INTERVAL '40 days')`,
+      [takeId, s.p.id],
+    )
+    await s.blobs.put({
+      userId: BigInt(s.uid),
+      mime: 'video/mp4',
+      maxBytes: 64,
+      source: Buffer.from('left behind'),
+      ref: { kind: 'final', id: takeId },
+    })
+    const out = await runStudioGc({ pool: getPool(), blobs: s.blobs })
+    assert.ok(out.takes >= 1)
+    const refs = await query<{ n: string }>(
+      'SELECT COUNT(*)::text AS n FROM studio_blob_refs WHERE ref_id = $1',
+      [takeId],
+    )
+    assert.equal(refs.rows[0]!.n, '0')
+  })
+
+  test('work still in flight (a new track) is not overtaken by an older film (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    s.runner.onCompose = async () => {
+      // The user picks another track while the film is being composed.
+      await enqueueStudioTask(getPool(), {
+        projectId: s.p.id,
+        kind: 'gen',
+        idempotencyKey: `gen:music:${randomUUID()}`,
+        payload: {},
+      })
+    }
+    await runOne(s.exec)
+    const [film] = await finals(s.p.id)
+    assert.equal(film!.status, 'canceled')
+    assert.equal(
+      (await project(s.p.id)).status,
+      'running',
+      'back to the director, who composes after that work',
+    )
   })
 })
