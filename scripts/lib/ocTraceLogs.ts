@@ -4,7 +4,13 @@ import { readdir } from 'node:fs/promises'
 import path from 'node:path'
 import { createInterface } from 'node:readline'
 import { createGunzip } from 'node:zlib'
-import { type Source, type TraceEvent, eventFromLogLine, toIso } from './ocTraceLib.ts'
+import {
+  type Source,
+  type TraceEvent,
+  eventFromLogLine,
+  isRelatedLogEvent,
+  toIso,
+} from './ocTraceLib.ts'
 
 export interface LogLocation {
   source: Source
@@ -30,6 +36,7 @@ export async function readLogEvents(
   locations: LogLocation[],
   deadline: number,
   lineCap = 5000,
+  clientInput?: string,
 ): Promise<LogReadResult> {
   const needles = [...ids]
   const result: LogReadResult = {
@@ -91,11 +98,7 @@ export async function readLogEvents(
           if (!needles.some((id) => line.includes(id))) continue
           const event = eventFromLogLine(source, line)
           // An id mentioned only in free text or a session key is not an association.
-          if (
-            !event ||
-            !Object.entries(event.ids).some(([key, id]) => key !== 'sessionKey' && ids.has(id))
-          )
-            continue
+          if (!event || !isRelatedLogEvent(event, ids, clientInput)) continue
           if (result.events.length >= lineCap) result.truncated = true
           else result.events.push(event)
         }

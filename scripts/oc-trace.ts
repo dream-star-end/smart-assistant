@@ -24,6 +24,7 @@ import {
   eventsFromRows,
   firstError,
   idsFromRows,
+  isRelatedLogEvent,
   parseCsv,
   pastRetention,
   timeline,
@@ -156,7 +157,7 @@ function collect(seed: Iterable<string>, query: typeof psql, deadline: number): 
     )
     q(
       'turn_runtime_observations',
-      `SELECT trace_id, dispatch_id, session_key, duration_ms, tool_calls, observed_at
+      `SELECT event_id, trace_id, dispatch_id, session_key, duration_ms, tool_calls, observed_at
          FROM turn_runtime_observations WHERE trace_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[]) ORDER BY observed_at, event_id`,
     )
     for (const id of idsFromRows(rows)) {
@@ -172,7 +173,74 @@ function collect(seed: Iterable<string>, query: typeof psql, deadline: number): 
 
 export interface TraceIo {
   query?: typeof psql
-  readLogs?: (ids: Set<string>, deadline: number) => Promise<LogReadResult>
+  readLogs?: (ids: Set<string>, deadline: number, clientInput?: string) => Promise<LogReadResult>
+}
+
+function mergeFound(previous: Found, next: Found): Found {
+  const keyColumns: Partial<Record<Source, string[]>> = {
+    turn_traces: ['trace_id'],
+    turn_dispatches: ['dispatch_id'],
+    request_finalize_journal: ['request_id'],
+    usage_records: ['request_id', 'attempt_no', 'created_at'],
+    turn_upstream_performance: ['request_id', 'dispatch_id', 'observed_at'],
+    turn_runtime_observations: ['event_id'],
+  }
+  const rows = { ...previous.rows }
+  for (const [source, incoming] of Object.entries(next.rows) as [
+    Source,
+    Record<string, string>[],
+  ][]) {
+    const key = (row: Record<string, string>) =>
+      JSON.stringify(keyColumns[source]?.map((column) => row[column]))
+    const merged = new Map((rows[source] ?? []).map((row) => [key(row), row]))
+    for (const row of incoming) merged.set(key(row), row)
+    rows[source] = [...merged.values()]
+  }
+  return {
+    ids: new Set([...previous.ids, ...next.ids]),
+    rows,
+    truncated: [...new Set([...previous.truncated, ...next.truncated])],
+    incomplete: [...new Set([...previous.incomplete, ...next.incomplete])],
+  }
+}
+
+function mergeLogs(previous: LogReadResult, next: LogReadResult): LogReadResult {
+  // Keep the maximum observed multiplicity, without counting the same scan twice.
+  const seen = new Map<string, number>()
+  const events = [...previous.events]
+  for (const event of previous.events) {
+    const key = JSON.stringify(event)
+    seen.set(key, (seen.get(key) ?? 0) + 1)
+  }
+  const incomingCounts = new Map<string, number>()
+  for (const event of next.events) {
+    const key = JSON.stringify(event)
+    const count = (incomingCounts.get(key) ?? 0) + 1
+    incomingCounts.set(key, count)
+    if (count > (seen.get(key) ?? 0)) events.push(event)
+  }
+  const windows = new Map(
+    previous.windows.map((window) => [`${window.source}:${window.file}`, window]),
+  )
+  for (const window of next.windows) {
+    const key = `${window.source}:${window.file}`
+    const old = windows.get(key)
+    const bounds = [old?.first, old?.last, window.first, window.last]
+      .filter((x): x is string => !!x)
+      .sort()
+    windows.set(key, {
+      ...window,
+      first: bounds[0] ?? null,
+      last: bounds.at(-1) ?? null,
+      complete: window.complete && (old?.complete ?? true),
+    })
+  }
+  return {
+    events,
+    windows: [...windows.values()],
+    truncated: previous.truncated || next.truncated,
+    errors: [...new Set([...previous.errors, ...next.errors])],
+  }
 }
 
 export async function trace(input: string, io: TraceIo = {}) {
@@ -180,7 +248,9 @@ export async function trace(input: string, io: TraceIo = {}) {
   const t0 = Date.now()
   const deadline = t0 + TRACE_BUDGET_MS
   const query = io.query ?? psql
-  const readLogs = io.readLogs ?? ((ids, until) => readLogEvents(ids, LOGS, until, LOG_LINE_CAP))
+  const readLogs =
+    io.readLogs ??
+    ((ids, until, clientInput) => readLogEvents(ids, LOGS, until, LOG_LINE_CAP, clientInput))
   let found = collect([input], query, deadline)
   let logs: LogReadResult = {
     events: [],
@@ -190,14 +260,32 @@ export async function trace(input: string, io: TraceIo = {}) {
   }
   const incomplete = new Set(found.incomplete)
   const clientCandidates = new Set<string>()
+  let clientInput = idsFromRows(found.rows).has(input) ? undefined : input
   for (let round = 0; round < DISCOVERY_ROUNDS; round++) {
-    logs = await readLogs(found.ids, deadline)
+    if (Date.now() >= deadline) {
+      incomplete.add('trace-deadline')
+      break
+    }
+    const latest = await readLogs(found.ids, deadline, clientInput)
+    const serverRootObserved = latest.events.some((event) =>
+      Object.entries(event.ids).some(
+        ([key, id]) => key !== 'clientTraceId' && key !== 'sessionKey' && id === input,
+      ),
+    )
+    if (clientInput && serverRootObserved) {
+      if (clientCandidates.size || latest.events.some((event) => event.ids.clientTraceId === input))
+        incomplete.add('ambiguous-input-namespace')
+      clientInput = undefined
+    }
+    latest.events = latest.events.filter((event) =>
+      isRelatedLogEvent(event, found.ids, clientInput),
+    )
+    logs = mergeLogs(logs, latest)
     for (const error of logs.errors) incomplete.add(error)
     const extra = new Set(found.ids)
     for (const event of logs.events) {
-      if (!Object.entries(event.ids).some(([key, id]) => key !== 'sessionKey' && found.ids.has(id)))
-        continue
-      if (event.ids.clientTraceId === input && event.ids.traceId)
+      if (!isRelatedLogEvent(event, found.ids, clientInput)) continue
+      if (clientInput && event.ids.clientTraceId === clientInput && event.ids.traceId)
         clientCandidates.add(event.ids.traceId)
       // Do not follow a canonical id back through a potentially reused client id or session key.
       for (const key of [
@@ -215,12 +303,16 @@ export async function trace(input: string, io: TraceIo = {}) {
         else extra.add(id)
       }
     }
+    if (Date.now() >= deadline) {
+      incomplete.add('trace-deadline')
+      break
+    }
     if (extra.size === found.ids.size) break
     if (round === DISCOVERY_ROUNDS - 1) {
       incomplete.add('log-closure-incomplete')
       break
     }
-    found = collect(extra, query, deadline)
+    found = mergeFound(found, collect(extra, query, deadline))
     for (const error of found.incomplete) incomplete.add(error)
   }
   if (clientCandidates.size > 1) incomplete.add('ambiguous-client-trace-id')

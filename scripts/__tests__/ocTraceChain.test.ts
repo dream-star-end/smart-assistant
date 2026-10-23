@@ -204,3 +204,53 @@ test('604: real plain/gzip reader returns actual source windows and rejects free
   )
   assert.ok(absent.errors.includes('master-log:directory-unreadable'))
 })
+
+test('604 Codex r1: discovered server ids cannot match another turn client field', async () => {
+  const r = await trace(T, {
+    query: durableQuery,
+    readLogs: logs([event({ clientTraceId: D, traceId: T2 }, 'UNRELATED_ERROR')]),
+  })
+  assert.ok(!r.ids.includes(T2))
+  assert.equal(r.firstError?.code, 'SERVICE_RESTART')
+  assert.deepEqual(r.clientCandidates, [])
+  assert.deepEqual(r.incomplete, [])
+})
+
+test('604 Codex r1: deadline during expansion preserves DB and log evidence', async (t) => {
+  let clock = 0
+  t.mock.method(Date, 'now', () => clock)
+  const early = {
+    ...event({ traceId: T, requestId: 'new-request-604' }, 'UPSTREAM_ERROR'),
+    at: '2026-10-23T06:59:00.000Z',
+  }
+  const r = await trace(T, {
+    query: durableQuery,
+    readLogs: async () => {
+      clock = 50_001
+      return { events: [early], truncated: false, errors: [], windows: [] }
+    },
+  })
+  assert.ok(r.events.some((event) => event.source === 'turn_dispatches'))
+  assert.ok(r.events.some((event) => event.code === 'UPSTREAM_ERROR'))
+  assert.equal(r.firstError?.code, 'UPSTREAM_ERROR')
+  assert.ok(r.incomplete.includes('trace-deadline'))
+})
+
+test('604: expansion preserves distinct runtime observations at the same timestamp', async () => {
+  const r = await trace(T, {
+    query: (sql) =>
+      sql.includes('FROM turn_runtime_observations')
+        ? [
+            { event_id: '60400000-0000-4000-8000-000000000011', trace_id: T, observed_at: at },
+            { event_id: '60400000-0000-4000-8000-000000000012', trace_id: T, observed_at: at },
+          ]
+        : [],
+    readLogs: logs([event({ traceId: T, requestId: 'request-expand-604' })]),
+  })
+  assert.equal(
+    r.events
+      .filter((e) => e.source === 'turn_runtime_observations')
+      .reduce((n, e) => n + (e.count ?? 1), 0),
+    2,
+  )
+})
