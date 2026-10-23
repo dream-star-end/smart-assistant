@@ -48,7 +48,7 @@ import { isCursorCredentialMember } from "../cursor/access.js";
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
-import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
+import { admittedTraceIdentity, recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import {
   extractFirstVisibleAttribution,
   FirstVisiblePersistGate,
@@ -1638,6 +1638,7 @@ export type CronOriginExecutor = (payload: {
   admitted: {
     clientMessageId: string
     sessionId: string
+    agentId: string
     dispatchId: string
     billingRequestId: string
     attemptNo: number
@@ -1866,6 +1867,7 @@ export async function executeCronOriginInject(opts: {
     admitted: {
       clientMessageId: d.clientMessageId,
       sessionId: d.sessionId,
+      agentId: d.agentId,
       dispatchId: d.dispatchId,
       billingRequestId: d.billingRequestId,
       attemptNo: d.attemptNo,
@@ -3819,6 +3821,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     interface AdmittedDispatch {
       clientMessageId: string;
       sessionId: string;
+      agentId: string;
       dispatchId: string;
       billingRequestId: string;
       attemptNo: number;
@@ -4432,12 +4435,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ensureDispatchHeartbeat();
         }
       }
-      // OCV5-403: cron-origin and prompt-queue dispatches are admitted before
-      // this frame's trace row is written, and the admission block below is
-      // skipped for them (persistUserRow=false), so the "admitted" backfill never
-      // runs. Link the trace here (display-only columns, COALESCE, fire-and-forget,
-      // warn only). Browser frames keep their post-admission backfill: a record
-      // found only by clientMessageId may belong to another session.
+      // Pre-admitted cron/prompt lanes bypass browser admission; project their DB identity here.
+      // Keep the session guard: clientMessageId alone may belong to another session.
+      // This only enriches the current trace, without changing admission/billing/lease keys.
       if (
         !persistUserRow &&
         admittedThisFrame !== null &&
@@ -4448,6 +4448,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           traceId,
           dispatchId: admittedThisFrame.record.dispatchId,
           requestId: admittedThisFrame.record.billingRequestId,
+          identity: admittedTraceIdentity(admittedThisFrame.record),
         });
         // Plan §7.4: these lanes admit without a trace, so link turn_dispatches.trace_id too.
         if (deps.pgPool) {
@@ -4698,6 +4699,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const admittedRecord: AdmittedDispatch = {
                 clientMessageId,
                 sessionId: peerId,
+                agentId: d.agentId,
                 dispatchId: d.dispatchId,
                 billingRequestId: d.billingRequestId,
                 attemptNo: d.attemptNo,
@@ -4762,6 +4764,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   traceId,
                   dispatchId: d.dispatchId,
                   requestId: d.billingRequestId,
+                  identity: admittedTraceIdentity(d),
                 });
               }
               break; // 继续 enrichment / forward
@@ -6148,11 +6151,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 typeof peerIdRaw === "string" && peerIdRaw !== ""
                   ? `agent:${effectiveFrameAgentId}:webchat:dm:${peerIdRaw.replace(/[^a-zA-Z0-9_-]/g, "_")}`
                   : "(unknown-peer)";
-              // TODO(durable-dispatch): turn_traces.dispatch_id/request_id 是纯展示列
-              // (RFC §2 I3),但本 trace 登记是**同步**发生于分类阶段,而 dispatch 受理与
-              // server requestId 铸造都在下游 async IIFE(attach 之后)。此处两者均未就绪 →
-              // 保持 null(recordTurnTrace 默认 null,schema 兼容)。要填充需把 trace insert
-              // 移到受理后逐 IIFE 重复登记,与"不 restructure id-minting"约束冲突,故不做。
+              // Keep an early trace even if admission fails. Once admitted, only this
+              // trace is enriched with the returned dispatch's identity and display links.
               recordTurnTrace(
                 deps.pgPool,
                 (msg, fields) => turnLogForFrame?.warn(msg, fields),
