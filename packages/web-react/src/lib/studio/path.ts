@@ -12,7 +12,10 @@ export const STUDIO_PAGES = [
 ] as const
 export type StudioPage = (typeof STUDIO_PAGES)[number]
 
-export type StudioRoute = { kind: 'home' } | { kind: 'project'; id: string; page: StudioPage }
+export type StudioRoute =
+  | { kind: 'home' }
+  /** `shot` selects one shot on the review page (`?shot=<id>`). */
+  | { kind: 'project'; id: string; page: StudioPage; shot?: string }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
@@ -21,17 +24,22 @@ export function isStudioPath(pathname: string): boolean {
 }
 
 /** null → not a studio URL, or an unknown one (the app shows its own not-found state). */
-export function parseStudioPath(pathname: string): StudioRoute | null {
+export function parseStudioPath(pathname: string, search = ''): StudioRoute | null {
   if (!isStudioPath(pathname)) return null
   const parts = pathname.split('/').filter(Boolean)
   if (parts.length === 1) return { kind: 'home' }
   if (parts[1] !== 'p' || !parts[2] || !UUID.test(parts[2]) || parts.length > 4) return null
   const page = (parts[3] ?? 'board') as StudioPage
   if (!STUDIO_PAGES.includes(page)) return null
-  return { kind: 'project', id: parts[2], page }
+  const shot = new URLSearchParams(search).get('shot')
+  return shot && UUID.test(shot)
+    ? { kind: 'project', id: parts[2], page, shot }
+    : { kind: 'project', id: parts[2], page }
 }
 
 export function studioHref(route: StudioRoute): string {
   if (route.kind === 'home') return '/studio'
-  return route.page === 'board' ? `/studio/p/${route.id}` : `/studio/p/${route.id}/${route.page}`
+  const base =
+    route.page === 'board' ? `/studio/p/${route.id}` : `/studio/p/${route.id}/${route.page}`
+  return route.shot ? `${base}?shot=${route.shot}` : base
 }

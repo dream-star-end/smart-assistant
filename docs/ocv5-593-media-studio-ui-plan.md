@@ -74,3 +74,10 @@ src/components/studio/studio.css   # 只放工作台组件样式；token 进 sty
 - 编排器、批注转指令、`sys.studio_event` 推送（A2-1；在此之前用轮询）。
 - 管理端供应商配置界面（运维改 `OC_STUDIO_PROVIDERS`）。
 - 上线：媒体工作台的商业发布需要用户批准；本票只到 draft PR。
+
+## 9. 给编排器（A2-1）的数据约定（FE-2a 起前端在读）
+- `studio_shots.spec`：`title`（短标题，如「起跑」）、`framing`（景别）、`action`（动作描述）、`durationSec`（秒，缺省按 5 秒排时间线）、`source`（首帧来源说明，如「首帧 · GPT Image」「续接 #2」）。全部可选，前端对缺失字段有兜底。
+- `studio_takes.qa.score`：0–1 的总分，镜头卡和需要你卡片显示它。
+- 镜头媒体：`owner_kind = shot_video`（视频）或 `shot_frame`（首帧图）；`studio_shots.active_take_id` 指向采纳的版本，没有时前端取最新的成功版本。
+- 台词：`studio_lines.shot_id` 决定它落在哪个镜头的时间段；配音版本 `owner_kind = line`。音乐版本 `owner_kind = music`。
+- `studio_events.payload.message`：给人看的一句话；没有时前端按 `type` 显示通用文案。

@@ -21,17 +21,19 @@ export interface StudioAppProps {
 
 export function StudioApp({ auth, theme, onCycleTheme }: StudioAppProps) {
   const availability = useStudioAvailability(auth)
-  const [route, setRoute] = useState<StudioRoute | null>(() => parseStudioPath(location.pathname))
+  const [route, setRoute] = useState<StudioRoute | null>(() =>
+    parseStudioPath(location.pathname, location.search),
+  )
 
   useEffect(() => {
-    const onPop = () => setRoute(parseStudioPath(location.pathname))
+    const onPop = () => setRoute(parseStudioPath(location.pathname, location.search))
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
   }, [])
 
   const navigate = useCallback((next: StudioRoute, replace = false) => {
     const href = studioHref(next)
-    if (href !== location.pathname) {
+    if (href !== location.pathname + location.search) {
       if (replace) history.replaceState(null, '', href)
       else history.pushState(null, '', href)
     }
@@ -95,6 +97,7 @@ export function StudioApp({ auth, theme, onCycleTheme }: StudioAppProps) {
         ) : (
           <ProjectShell
             key={route.id}
+            shot={route.shot}
             auth={auth}
             projectId={route.id}
             page={route.page}

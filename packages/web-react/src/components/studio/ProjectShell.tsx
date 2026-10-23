@@ -8,6 +8,7 @@ import type { StudioPage, StudioRoute } from '../../lib/studio/path'
 import type { ProvidersView } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
 import { StateView } from './StateViews'
+import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
 
 const STEPS: Array<[StudioPage, string]> = [
@@ -33,6 +34,7 @@ export function ProjectShell(props: {
   auth: AuthSession
   projectId: string
   page: StudioPage
+  shot?: string
   providers: ProvidersView
   navigate: (r: StudioRoute, replace?: boolean) => void
 }) {
@@ -127,6 +129,14 @@ export function ProjectShell(props: {
           onProject={applyProject}
           onReload={reload}
           onDeleted={() => navigate({ kind: 'home' }, true)}
+        />
+      ) : page === 'board' ? (
+        <BoardPage
+          auth={auth}
+          view={state.view}
+          providers={props.providers}
+          onOpenShot={(shot) => navigate({ kind: 'project', id: projectId, page: 'review', shot })}
+          onOpenBrief={() => go('brief')}
         />
       ) : (
         <StateView
