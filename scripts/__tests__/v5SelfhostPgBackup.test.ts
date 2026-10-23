@@ -881,9 +881,10 @@ describe('deploy-v5-selfhost.sh lock wait with a backup holding the lock', () =>
     const lib = path.join(dir, 'acquire.sh')
     writeFileSync(
       lib,
-      ['proc_starttime_of', 'selfhost_backup_lock_holder', 'acquire_selfhost_deploy_lock']
-        .map(extract)
-        .join('\n'),
+      [
+        ...['proc_starttime_of', 'acquire_selfhost_deploy_lock'].map(extract),
+        readFileSync(path.join(root, 'scripts/lib/v5-selfhost-backup-lock.sh'), 'utf8'),
+      ].join('\n'),
     )
     mkdirSync(path.join(dir, 'fake'), { recursive: true })
     const fake = path.join(dir, 'fake/v5-selfhost-pg-backup.sh')

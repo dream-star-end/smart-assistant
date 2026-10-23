@@ -192,6 +192,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
+source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -408,20 +409,6 @@ PY
 proc_starttime_of() { # <pid>
   python3 -c 'import sys
 t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split()[19])' "$1"
-}
-
-# 备份持锁时写 <lock>.backup(pid/starttime/tier/started)。pid 活着、/proc starttime 一致、
-# cmdline 是备份脚本才算数(防 PID 复用和残留文件);是则打印该行并返回 0。
-selfhost_backup_lock_holder() {
-  local marker="${1}.backup" line pid st cur
-  [[ -f "$marker" && ! -L "$marker" ]] || return 1
-  line="$(head -n1 -- "$marker" 2>/dev/null)" || return 1
-  [[ "$line" =~ ^pid=([0-9]+)\ starttime=([0-9]+)\  ]] || return 1
-  pid="${BASH_REMATCH[1]}"; st="${BASH_REMATCH[2]}"
-  cur="$(proc_starttime_of "$pid" 2>/dev/null)" || return 1
-  [[ "$cur" == "$st" ]] || return 1
-  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'v5-selfhost-pg-backup\.sh' || return 1
-  printf '%s' "$line"
 }
 
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
