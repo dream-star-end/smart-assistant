@@ -65,8 +65,8 @@ export interface TurnDispatchRow {
   runtimeKind?: string | null
 }
 
-// trace_id (0323) is written here but not read back: no caller needs it yet, and reading it
-// would make every isolated-schema integ suite add the column.
+// trace_id (0323) is not in the shared column list: only the egress fallback lookup
+// (getDispatchByBillingRequestId) reads it, so isolated-schema integ suites need no new column.
 const DISPATCH_COLUMNS = `
   dispatch_id, user_id, session_id, client_message_id, agent_id, model,
   request_hash, billing_request_id, attempt_no, status, outcome, failure_code,
@@ -560,9 +560,14 @@ export async function getDispatchForUpdate(
 export async function getDispatchByBillingRequestId(
   q: Queryable,
   billingRequestId: string,
-): Promise<Pick<TurnDispatchRow, 'dispatchId' | 'attemptNo' | 'sessionId'> | null> {
-  const res = await q.query<{ dispatch_id: string; attempt_no: number; session_id: string }>(
-    `SELECT dispatch_id, attempt_no, session_id FROM turn_dispatches WHERE billing_request_id = $1`,
+): Promise<(Pick<TurnDispatchRow, 'dispatchId' | 'attemptNo' | 'sessionId'> & { traceId: string | null }) | null> {
+  const res = await q.query<{
+    dispatch_id: string
+    attempt_no: number
+    session_id: string
+    trace_id: string | null
+  }>(
+    `SELECT dispatch_id, attempt_no, session_id, trace_id FROM turn_dispatches WHERE billing_request_id = $1`,
     [billingRequestId],
   )
   return res.rows.length === 0
@@ -571,6 +576,8 @@ export async function getDispatchByBillingRequestId(
         dispatchId: res.rows[0]!.dispatch_id,
         attemptNo: res.rows[0]!.attempt_no,
         sessionId: res.rows[0]!.session_id,
+        // Plan §7.4 fallback for egress requests that arrive without a trace header.
+        traceId: res.rows[0]!.trace_id,
       }
 }
 

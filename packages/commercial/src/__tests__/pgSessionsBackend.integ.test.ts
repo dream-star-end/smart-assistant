@@ -54,6 +54,7 @@ import {
   backfillDispatchTraceId,
   casToTerminal,
   getDispatch,
+  getDispatchByBillingRequestId,
   resolveManualReconcile,
   scanOpenSessionGone,
 } from "../dispatch/turnDispatchStore.js";
@@ -8306,6 +8307,10 @@ describe("turn_dispatches.trace_id (0323, OCV5-599)", () => {
     assert.equal(taken.takeover, true);
     assert.equal(taken.dispatch.dispatchId, first.dispatch.dispatchId);
     assert.equal(await traceOf(first.dispatch.dispatchId), TRACE_B);
+    // The egress fallback lookup returns it.
+    const byBilling = await getDispatchByBillingRequestId(pool, "brq-cm-trace-1");
+    assert.equal(byBilling?.dispatchId, first.dispatch.dispatchId);
+    assert.equal(byBilling?.traceId, TRACE_B);
   });
 
   maybe("admit without a trace stores NULL; the lane backfill sets it once and keeps it", async () => {

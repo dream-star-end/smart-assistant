@@ -5,6 +5,7 @@ import type { IncomingMessage } from 'node:http'
 import { describe, test } from 'node:test'
 import {
   bindEgressTrace,
+  dispatchTraceFallback,
   egressTraceBindingCounts,
   egressTraceFields,
   egressTurnRoute,
@@ -81,5 +82,15 @@ describe('egress trace binding (step 0)', () => {
     assert.equal(egressTurnRoute('/internal/codex-relayX', PREFIXES), null)
     assert.equal(egressTurnRoute('/internal/v5/egress-health', PREFIXES), null)
     assert.equal(egressTurnRoute('/v1/messages/count_tokens', PREFIXES), null)
+  })
+
+  test('dispatch fallback (OCV5-599): used only when step 0 bound no trace; a bound header wins', () => {
+    const D = 'd'.repeat(32)
+    assert.equal(dispatchTraceFallback({ traceId: T }, D), null)
+    assert.equal(dispatchTraceFallback({ traceId: null, traceIdMissing: 'no-header' }, D), D)
+    assert.equal(dispatchTraceFallback({ traceId: null, traceIdMissing: 'bad-header' }, D), D)
+    assert.equal(dispatchTraceFallback({}, D), D)
+    assert.equal(dispatchTraceFallback({ traceId: null, traceIdMissing: 'no-header' }, null), null)
+    assert.equal(dispatchTraceFallback({}, undefined), null)
   })
 })
