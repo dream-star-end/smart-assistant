@@ -80,6 +80,8 @@ export interface StudioTake {
   blobSha: string | null
   createdAt: string
   finishedAt: string | null
+  /** Music takes only (OCV5-591 M1): licence snapshot and track card. */
+  music?: { license: Record<string, unknown> | null; track: Record<string, unknown> | null } | null
 }
 
 export interface StudioEvent {

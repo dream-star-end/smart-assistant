@@ -143,7 +143,11 @@ export function Timeline(props: {
           ) : (
             <div className="st-ph-slot" data-testid="timeline-music-slot">
               <Music size={12} />
-              {props.musicState === 'unconfigured' ? '音乐生成未配置' : '配乐待生成'}
+              {props.musicState === 'unconfigured'
+                ? '音乐生成未配置'
+                : props.musicState === 'ready'
+                  ? '还没选配乐'
+                  : '配乐待生成'}
             </div>
           )}
         </div>

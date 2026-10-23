@@ -108,7 +108,8 @@ describe('BoardPage (OCV5-593 FE-2a)', () => {
         onOpenBrief={() => {}}
       />,
     )
-    expect(screen.getByTestId('timeline-music-slot')).toHaveTextContent('配乐待生成')
+    // FE-5: with music sources ready, the lane asks for a choice instead of waiting for a generator.
+    expect(screen.getByTestId('timeline-music-slot')).toHaveTextContent('还没选配乐')
   })
 
   test('the instruction box stays disabled until the director agent ships', () => {

@@ -3,6 +3,7 @@
 
 import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../api'
 import type { AuthSession } from '../types'
+import type { MusicEdit, MusicQuery, MusicSearchResult } from './music'
 import type {
   ProvidersView,
   StudioAspect,
@@ -137,6 +138,50 @@ export const studioApi = {
     call<{ projectId: string }>(auth, `/assets/${encodeURIComponent(assetId)}/narration`, {
       method: 'POST',
     }),
+  /** OCV5-593 FE-5: search one music source (the curated catalog or My Music). */
+  musicSearch: (auth: AuthSession, provider: string, q: MusicQuery) => {
+    const p = new URLSearchParams({ provider })
+    if (q.text?.trim()) p.set('text', q.text.trim())
+    if (q.moods?.length) p.set('moods', q.moods.join(','))
+    if (q.genres?.length) p.set('genres', q.genres.join(','))
+    for (const k of ['bpmMin', 'bpmMax', 'minSec', 'maxSec'] as const)
+      if (q[k] !== undefined) p.set(k, String(q[k]))
+    if (q.vocals !== undefined) p.set('vocals', String(q.vocals))
+    if (q.cursor) p.set('cursor', q.cursor)
+    return call<MusicSearchResult>(auth, `/music/search?${p.toString()}`)
+  },
+  /** Use a track as the project's music (a free music take; watch the project for it). */
+  selectMusic: (auth: AuthSession, projectId: string, providerId: string, trackId: string) =>
+    call<{ queued: true }>(auth, `/projects/${encodeURIComponent(projectId)}/music`, {
+      method: 'POST',
+      body: JSON.stringify({ providerId, trackId }),
+    }),
+  setMusicEdit: async (auth: AuthSession, projectId: string, edit: MusicEdit) =>
+    (
+      await call<{ musicEdit: MusicEdit }>(
+        auth,
+        `/projects/${encodeURIComponent(projectId)}/music/edit`,
+        { method: 'PUT', body: JSON.stringify(edit) },
+      )
+    ).musicEdit,
+  /** My Music upload (MP3 / WAV ≤ 25 MB) with the uploader's rights statement. */
+  uploadTrack: async (auth: AuthSession, file: File, title: string, note: string) => {
+    if (!UPLOAD_AUDIO_TYPES.includes(file.type)) {
+      throw new StudioApiError(415, 'STUDIO_UNSUPPORTED_MEDIA', 'unsupported upload type')
+    }
+    if (file.size > UPLOAD_MAX_BYTES) {
+      throw new StudioApiError(413, 'STUDIO_UPLOAD_TOO_LARGE', 'upload exceeds 25 MB')
+    }
+    const p = new URLSearchParams({ title: title.trim().slice(0, 200), rights: 'own_or_licensed' })
+    if (note.trim()) p.set('note', note.trim().slice(0, 300))
+    return (
+      await call<{ track: { id: string; title: string } }>(auth, `/music/tracks?${p.toString()}`, {
+        method: 'POST',
+        body: file,
+        headers: { 'content-type': file.type },
+      })
+    ).track
+  },
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -169,6 +214,12 @@ export function studioErrorText(err: unknown): string {
         return '这个音色还没准备好'
       case 'CLONE_CONSENT_REQUIRED':
         return '请先确认声音样本是你本人的，或你已获得授权'
+      case 'STUDIO_MUSIC_UNAVAILABLE':
+        return '这个音乐来源暂时不可用'
+      case 'MUSIC_RIGHTS_REQUIRED':
+        return '请先确认你拥有这段音乐，或已获得授权'
+      case 'TRACK_UNAVAILABLE':
+        return '这首曲子已经不在曲库里了，换一首吧'
       case 'STUDIO_ORCHESTRATOR_OFF':
         return '导演 agent 暂时没有运行'
       case 'STUDIO_QUOTA':

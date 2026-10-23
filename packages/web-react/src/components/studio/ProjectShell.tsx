@@ -164,6 +164,7 @@ export function ProjectShell(props: {
         />
       ) : page === 'music' ? (
         <MusicPage
+          onReload={reload}
           auth={auth}
           view={state.view}
           providers={props.providers}

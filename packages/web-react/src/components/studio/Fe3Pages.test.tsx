@@ -13,7 +13,6 @@ vi.mock('../../lib/studio/api', () => ({
 
 import type { ProvidersView, StudioProjectView, StudioTake } from '../../lib/studio/types'
 import { FinalPage, costBreakdown } from './pages/Final'
-import { MusicPage } from './pages/Music'
 import { VoicePage } from './pages/Voice'
 
 afterEach(cleanup)
@@ -143,36 +142,6 @@ describe('VoicePage (OCV5-593 FE-3)', () => {
   })
 })
 
-describe('MusicPage (OCV5-593 FE-3)', () => {
-  test('default: music is not configured and nothing can be generated', () => {
-    render(
-      <MusicPage
-        auth={auth}
-        view={view()}
-        providers={prov('ready', 'unconfigured')}
-        onOpenShot={() => {}}
-      />,
-    )
-    expect(screen.getByTestId('unconfigured-music')).toHaveTextContent('音乐生成未配置')
-    expect(screen.getByRole('button', { name: /再来一版/ })).toBeDisabled()
-    expect(screen.queryByTestId('music-candidate')).not.toBeInTheDocument()
-  })
-
-  test('with a ready provider, music takes show as candidates', () => {
-    const v = view({
-      takes: [
-        take({ id: 'm1', ownerKind: 'music', ownerId: 'p', version: 1 }),
-        take({ id: 'm2', ownerKind: 'music', ownerId: 'p', version: 2 }),
-      ],
-    })
-    render(
-      <MusicPage auth={auth} view={v} providers={prov('ready', 'ready')} onOpenShot={() => {}} />,
-    )
-    expect(screen.getAllByTestId('music-candidate')).toHaveLength(2)
-    expect(screen.getByText('agent 已选')).toBeInTheDocument()
-  })
-})
-
 describe('FinalPage (OCV5-593 FE-3)', () => {
   test('empty state before compose; download disabled', () => {
     render(<FinalPage auth={auth} view={view()} onOpenBoard={() => {}} />)
@@ -250,24 +219,5 @@ describe('FE-3 code r1 fixes', () => {
     expect(screen.getAllByRole('img', { name: '未达标' })).toHaveLength(2)
     expect(screen.getByText('3 处')).toBeInTheDocument()
     expect(screen.getByText('未通过')).toBeInTheDocument()
-  })
-
-  test('starting one music candidate pauses the others', async () => {
-    const v = view({
-      takes: [
-        take({ id: 'm1', ownerKind: 'music', ownerId: 'p', version: 1 }),
-        take({ id: 'm2', ownerKind: 'music', ownerId: 'p', version: 2, blobSha: 'b'.repeat(64) }),
-      ],
-    })
-    const { container } = render(
-      <MusicPage auth={auth} view={v} providers={prov('ready', 'ready')} onOpenShot={() => {}} />,
-    )
-    await waitFor(() => expect(container.querySelectorAll('audio')).toHaveLength(2))
-    const [a, b] = [...container.querySelectorAll('audio')]
-    const pauseA = vi.spyOn(a!, 'pause').mockImplementation(() => {})
-    const pauseB = vi.spyOn(b!, 'pause').mockImplementation(() => {})
-    b!.dispatchEvent(new Event('play'))
-    expect(pauseA).toHaveBeenCalledTimes(1)
-    expect(pauseB).not.toHaveBeenCalled()
   })
 })

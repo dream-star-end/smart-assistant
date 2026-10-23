@@ -3,7 +3,7 @@
 // decision 2026-10-23 13:03: real calls allowed). Each new voice is 990 credits plus its preview.
 
 import { Lock, Mic, Upload, Wand2, X } from 'lucide-react'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 
 import { useBlobUrl } from '../../hooks/useBlobUrl'
 import {
@@ -15,6 +15,7 @@ import {
 import type { StudioAsset, StudioProjectView, StudioTake } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
 import { useToast } from '../ui'
+import { StudioDialog } from './Dialog'
 import { Waveform } from './Waveform'
 
 export const VOICE_PRICE_CREDITS = 990
@@ -114,50 +115,6 @@ function VoiceCard(props: {
   )
 }
 
-/**
- * A modal <dialog>: the page behind is inert, Escape closes it, focus starts on the first field
- * and returns to the button that opened it. Falls back to a plain open dialog where showModal is
- * missing (jsdom).
- */
-function VoiceDialog(props: { label: string; onClose: () => void; children: ReactNode }) {
-  const ref = useRef<HTMLDialogElement>(null)
-  const onClose = useRef(props.onClose)
-  onClose.current = props.onClose
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    if (typeof el.showModal === 'function') el.showModal()
-    else el.setAttribute('open', '')
-    el.querySelector<HTMLElement>('input, textarea')?.focus()
-    const cancel = (e: Event) => {
-      e.preventDefault()
-      onClose.current()
-    }
-    el.addEventListener('cancel', cancel)
-    return () => {
-      el.removeEventListener('cancel', cancel)
-      if (el.open && typeof el.close === 'function') el.close()
-      opener?.focus()
-    }
-  }, [])
-  return (
-    <dialog
-      ref={ref}
-      className="st-voice-dialog"
-      aria-label={props.label}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') {
-          e.preventDefault()
-          props.onClose()
-        }
-      }}
-    >
-      {props.children}
-    </dialog>
-  )
-}
-
 function DesignDialog(props: {
   auth: AuthSession
   projectId: string
@@ -171,7 +128,7 @@ function DesignDialog(props: {
   const [busy, setBusy] = useState(false)
   const ok = name.trim() && prompt.trim() && preview.trim()
   return (
-    <VoiceDialog label="一句话设计音色" onClose={props.onClose}>
+    <StudioDialog label="一句话设计音色" onClose={props.onClose}>
       <form
         onSubmit={async (e) => {
           e.preventDefault()
@@ -243,7 +200,7 @@ function DesignDialog(props: {
           {busy ? '提交中…' : `设计音色 · ${VOICE_PRICE_CREDITS} 积分起`}
         </button>
       </form>
-    </VoiceDialog>
+    </StudioDialog>
   )
 }
 
@@ -261,7 +218,7 @@ function CloneDialog(props: {
   const [busy, setBusy] = useState(false)
   const ok = name.trim() && file && consent
   return (
-    <VoiceDialog label="上传声音样本复刻音色" onClose={props.onClose}>
+    <StudioDialog label="上传声音样本复刻音色" onClose={props.onClose}>
       <form
         onSubmit={async (e) => {
           e.preventDefault()
@@ -347,7 +304,7 @@ function CloneDialog(props: {
           {busy ? '上传中…' : `复刻音色 · ${VOICE_PRICE_CREDITS} 积分起`}
         </button>
       </form>
-    </VoiceDialog>
+    </StudioDialog>
   )
 }
 

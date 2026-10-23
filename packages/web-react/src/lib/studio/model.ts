@@ -162,10 +162,15 @@ export function timeline(view: StudioProjectView): TimelineModel {
       })
     })
   }
+  // OCV5-593 FE-5: the soundtrack is the take the project points at (the user's latest choice).
+  const finished = view.takes.filter(
+    (x) => x.ownerKind === 'music' && x.status === 'succeeded' && x.blobSha,
+  )
+  const chosenId = view.project.settings?.musicTakeId
   const music =
-    view.takes
-      .filter((x) => x.ownerKind === 'music' && x.status === 'succeeded' && x.blobSha)
-      .sort((a, b) => b.version - a.version)[0] ?? null
+    (typeof chosenId === 'string' ? finished.find((x) => x.id === chosenId) : undefined) ??
+    [...finished].sort((a, b) => b.version - a.version)[0] ??
+    null
   return { total: t, clips, lines, music }
 }
 
