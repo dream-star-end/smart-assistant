@@ -17,12 +17,21 @@ describe("MiniMax media pricing", () => {
     assert.equal(r.snapshot.unit_price_cents, "3");
   });
 
-  test("speech counts Han as 2 chars and bills per started 10k chars", () => {
+  // OCV5-589 / D6a (user decision 2026-10-23): speech is billed pro-rata per
+  // character, rounded up to the cent (min 1), instead of per started 10k-char
+  // block. The old expectations (10_001 chars → 400, 1 char hd → 350) encoded
+  // the block rounding that was deliberately removed.
+  test("speech counts Han as 2 chars and bills pro-rata per character (min 1 cent)", () => {
     assert.equal(countMiniMaxSpeechCharacters("中文A。"), 6);
     const turbo = calculateMiniMaxSpeechCost({ model: "speech-2.8-turbo", usageCharacters: 10_001 });
-    assert.equal(turbo.costCredits, 400n);
+    assert.equal(turbo.costCredits, 201n);
+    assert.equal(calculateMiniMaxSpeechCost({ model: "speech-2.8-turbo", usageCharacters: 10_000 }).costCredits, 200n);
     const hd = calculateMiniMaxSpeechCost({ model: "speech-2.8-hd", usageCharacters: 1 });
-    assert.equal(hd.costCredits, 350n);
+    assert.equal(hd.costCredits, 1n);
+    const line = calculateMiniMaxSpeechCost({ model: "speech-2.8-turbo", text: "清晨，北方的雪松林慢慢醒来。" });
+    assert.equal(line.units.characters, 26);
+    assert.equal(line.costCredits, 1n, "a one-line voiceover costs 1 cent, not a whole 200-cent block");
+    assert.equal(calculateMiniMaxSpeechCost({ model: "speech-2.8-hd", usageCharacters: 300 }).costCredits, 11n);
   });
 
   test("video current tiers are exact RMB cents", () => {
