@@ -30,6 +30,7 @@ export class TaskboardRunControl {
   private readonly waiters = new Set<Waiter>()
   private readonly results = new Map<string, TaskboardExecutionResult>()
   private complete = false
+  private humanStop = false
   readonly signal = this.controller.signal
 
   constructor(
@@ -41,6 +42,14 @@ export class TaskboardRunControl {
   ) {
     this.members.set(rootSessionKey, { parent: null, active: 0, sealed: false })
     registerSession(rootSessionKey)
+  }
+
+  get humanStopRegistered(): boolean { return this.humanStop }
+
+  /** Call only after the human stop intent commits to the ticket/audit. */
+  registerHumanStop(): void {
+    this.humanStop = true
+    this.requestStop()
   }
 
   assertOpen(parent?: string): void {

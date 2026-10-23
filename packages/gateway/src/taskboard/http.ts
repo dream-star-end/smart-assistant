@@ -1748,7 +1748,6 @@ function handleMove(
   if (activeRun && cancelRunningRun) {
     const stopped = requestHumanRunStop(db, ticket.id, expectedVersion, activeRun.id)
     if (stopped.kind === 'conflict') throw new TaskboardMoveDenied(409, stopped.code, stopped.message)
-    if (stopped.kind === 'requested') stopped.control.requestStop()
     if (stopped.kind !== 'terminal') throw new TaskboardMoveDenied(409, 'stop_pending', '已请求停止本次执行，收尾完成后请再次移动任务。', { ticket: stopped.ticket, runId: activeRun.id })
   }
   const actorId = actorIdOf(actor)
@@ -2350,7 +2349,7 @@ function recordHumanRunStop(db: TaskboardDb, current: Ticket, runId: string, exp
 }
 
 function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion: number, runId: string) {
-  return db.transaction(() => {
+  const outcome = db.transaction(() => {
     const current = requireTicket(db, ticketId)
     const run = getRun(db, runId)
     if (!run || run.ticketId !== current.id) throw new TaskboardNotFound('run', runId)
@@ -2360,7 +2359,7 @@ function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion:
       if (latest?.id !== run.id || (active && active.id !== run.id)) return { kind: 'terminal' as const, ticket: current, run }
       const closing = taskboardRunControls.getActiveForTicket(current.id)
       if (!closing || closing.runId !== run.id || closing.rootSessionKey !== run.sessionKey) return { kind: 'terminal' as const, ticket: current, run }
-      if (closing.signal.aborted) return { kind: 'pending' as const, ticket: current, run }
+      if (closing.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
       if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
       const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
       return { kind: 'requested' as const, ticket: updated, run, control: closing }
@@ -2370,11 +2369,13 @@ function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion:
     if (!active || active.id !== run.id || !run.leaseOwner) return { kind: 'conflict' as const, code: 'run_changed', message: '当前执行已变化，请刷新后操作' }
     const control = taskboardRunControls.get(run.id, current.id, run.leaseOwner)
     if (!control) return { kind: 'conflict' as const, code: 'run_control_unavailable', message: '当前执行控制不可用，请等待执行收尾后重试' }
-    if (control.signal.aborted) return { kind: 'pending' as const, ticket: current, run }
+    if (control.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
     if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
     const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
     return { kind: 'requested' as const, ticket: updated, run, control }
   }).immediate()
+  if (outcome.kind === 'requested') outcome.control.registerHumanStop()
+  return outcome
 }
 
 /** Human stop is an exact-run request, never a lease release or terminal claim. */
@@ -2397,7 +2398,6 @@ function handleStop(
     sendError(res, 409, outcome.message, { code: outcome.code })
     return
   }
-  if (outcome.kind === 'requested') outcome.control.requestStop()
   sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
 }
 

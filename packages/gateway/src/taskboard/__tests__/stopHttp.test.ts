@@ -250,7 +250,7 @@ test('a reaped terminal row stays visibly settling until its exact controller fi
     updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
     await serverFor({ db: f.db, actor: 'human' }, async (base) => {
       const get = async () => {
-        const response = await fetch(`${base}/api/board/tickets/${f.ticket.id}`)
+        const response = await fetch(`${base}/api/board/tickets/${f.ticket.id}?expand=pipeline,stage,execution`)
         assert.equal(response.status, 200)
         return await response.json() as { execution: { settling: boolean; status: string } }
       }
@@ -288,8 +288,32 @@ test('an old terminal controller cannot block a newer database run, including eq
       assert.deepEqual(getTicket(f.db, f.ticket.id), running)
       assert.equal(f.control.signal.aborted, false)
       assert.equal(getActiveLease(f.db, f.ticket.id)!.id, replacement.id)
-      const detail = await (await fetch(`${base}/api/board/tickets/${f.ticket.id}`)).json() as { execution: { id: string } }
+      const detail = await (await fetch(`${base}/api/board/tickets/${f.ticket.id}?expand=pipeline,stage,execution`)).json() as { execution: { id: string } }
       assert.equal(detail.execution.id, replacement.id)
     })
   } finally { f.leave(); taskboardRunControls.finish(f.control); f.db.close() }
+})
+
+
+test('lease-loss abort is not a registered human stop: the later human intent still blocks a ready ticket', async () => {
+  const f = fixture()
+  try {
+    updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
+    const ready = updateTicket(f.db, f.ticket.id, f.ticket.version, { status: 'ready' })
+    f.control.requestStop()
+    assert.equal(f.control.humanStopRegistered, false)
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const path = `/api/board/tickets/${f.ticket.id}/stop`
+      const stopped = await post(base, path, { expectedVersion: ready.version, runId: f.run.id })
+      assert.equal(stopped.status, 202)
+      assert.equal(stopped.body.ticket.status, 'blocked')
+      assert.equal(f.control.humanStopRegistered, true)
+      const version = stopped.body.ticket.version
+      const repeated = await post(base, path, { expectedVersion: ready.version, runId: f.run.id })
+      assert.equal(repeated.status, 202)
+      assert.equal(repeated.body.ticket.version, version)
+      f.leave(); taskboardRunControls.finish(f.control)
+      assert.equal(getTicket(f.db, f.ticket.id)!.status, 'blocked')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
 })

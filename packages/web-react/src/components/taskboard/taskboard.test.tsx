@@ -1145,6 +1145,7 @@ describe('项目管理', () => {
     await screen.findByTestId('project-create')
     fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'ocv5' } })
     fireEvent.change(screen.getByTestId('project-name'), { target: { value: 'V5 自用' } })
+    await screen.findByRole('option', { name: '主助手' })
     fireEvent.change(screen.getByTestId('builtin-execution-agent'), { target: { value: 'main' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('project-create-submit'))

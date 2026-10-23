@@ -1,5 +1,5 @@
 import { RefreshCw } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import { type BoardAgent, taskboardApi, taskboardErrorMessage } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
@@ -23,18 +23,8 @@ export function StageAgentSelect({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const currentOwner = useRef({ auth, agents, active: true })
-  useEffect(() => {
-    const owner = { auth, agents, active: true }
-    currentOwner.current = owner
-    setRefreshed(null)
-    setLoading(false)
-    setError('')
-    return () => {
-      owner.active = false
-    }
-  }, [auth, agents])
   const available = refreshed ?? agents
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     const owner = currentOwner.current
     setLoading(true)
     setError('')
@@ -48,16 +38,31 @@ export function StageAgentSelect({
     } finally {
       if (owner.active && currentOwner.current === owner) setLoading(false)
     }
-  }
+  }, [auth])
+  useEffect(() => {
+    const owner = { auth, agents, active: true }
+    currentOwner.current = owner
+    setRefreshed(null)
+    setLoading(false)
+    setError('')
+    if (agents.length === 0) void refresh()
+    return () => {
+      owner.active = false
+    }
+  }, [auth, agents, refresh])
   return (
     <Field
       label="新增 AI 阶段的执行助手"
       required
       error={error || undefined}
       hint={
-        available.length
-          ? '用于新建的内置 AI 阶段，模型跟随助手默认。已有阶段和自定义模板保持原配置。'
-          : '请先安装助手，再刷新列表并选择。未配置的 AI 阶段不会自动运行。'
+        loading
+          ? '正在加载已安装助手…'
+          : error
+            ? '可以刷新助手列表后重试。'
+            : available.length
+              ? '用于新建的内置 AI 阶段，模型跟随助手默认。已有阶段和自定义模板保持原配置。'
+              : '请先安装助手，再刷新列表并选择。未配置的 AI 阶段不会自动运行。'
       }
     >
       <div className="flex items-center gap-2">
