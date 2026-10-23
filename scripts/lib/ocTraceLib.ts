@@ -208,6 +208,11 @@ export function eventFromLogLine(source: Source, line: string): TraceEvent | nul
   } catch {
     return null
   }
+  return eventFromLogRecord(source, o)
+}
+
+/** Reuse a parsed record during full-file scans (timestamps require parsing every JSON line). */
+export function eventFromLogRecord(source: Source, o: Record<string, unknown>): TraceEvent | null {
   if (!o || typeof o !== 'object') return null
   const at = typeof o.ts === 'string' ? toIso(o.ts) : undefined
   if (!at) return null
@@ -247,15 +252,36 @@ export function timeline(events: TraceEvent[]): TraceEvent[] {
   )
 }
 
+const SERVER_LOG_ID_KEYS = [
+  'traceId',
+  'dispatchId',
+  'requestId',
+  'parentTraceId',
+  'turnRequestId',
+  'billingRequestId',
+  'dispatchTraceId',
+] as const
+
+/** Match a fixed number of structured fields, independent of the number of discovered ids. */
+export function isRelatedLogRecord(
+  record: Record<string, unknown>,
+  ids: Set<string>,
+  clientInput?: string,
+): boolean {
+  if (clientInput !== undefined && record.clientTraceId === clientInput) return true
+  return SERVER_LOG_ID_KEYS.some((key) => {
+    const id = record[key]
+    return typeof id === 'string' && ids.has(id)
+  })
+}
+
 /** Client ids are caller-controlled: only the original unresolved input may match that field. */
 export function isRelatedLogEvent(
   event: TraceEvent,
   ids: Set<string>,
   clientInput?: string,
 ): boolean {
-  return Object.entries(event.ids).some(([key, id]) =>
-    key === 'clientTraceId' ? id === clientInput : key !== 'sessionKey' && ids.has(id),
-  )
+  return isRelatedLogRecord(event.ids, ids, clientInput)
 }
 
 /** The earliest event carrying an error code, else the earliest error-level event. */
