@@ -1211,6 +1211,133 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
   };
 }
 
+describe("OCV5-613 canonical identity follows the admitted dispatch", () => {
+  const cases: Array<{ name: string; frame: Record<string, unknown>; inputAgent: string; admittedAgent: string }> = [
+    { name: "omitted", frame: {}, inputAgent: "main", admittedAgent: "main" },
+    { name: "null", frame: { agentId: null }, inputAgent: "main", admittedAgent: "main" },
+    { name: "empty", frame: { agentId: "" }, inputAgent: "main", admittedAgent: "main" },
+    { name: "explicit butler", frame: { agentId: "butler" }, inputAgent: "butler", admittedAgent: "butler" },
+    { name: "takeover preserves stored worker", frame: {}, inputAgent: "main", admittedAgent: "worker" },
+  ];
+  for (const [index, sample] of cases.entries()) {
+    test(`OCV5-613 browser ${sample.name}`, { timeout: 15_000 }, async () => {
+      const admissions: AdmitUserTurnInput[] = [];
+      const rig = await startRig({
+        attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+        admitUserTurn: async (input) => {
+          admissions.push(input);
+          const admitted = fakeAdmittedDispatch(input);
+          assert.equal(admitted.kind, "admitted");
+          if (admitted.kind !== "admitted") throw new Error("fixture did not admit");
+          admitted.dispatch.agentId = sample.admittedAgent;
+          admitted.takeover = sample.admittedAgent !== input.agentId;
+          return admitted;
+        },
+      });
+      let client: WebSocket | undefined;
+      try {
+        client = await openClient(rig.port);
+        const cmid = `cm-613-${index}`;
+        const peer = `sess-613-${index}:/peer`;
+        client.send(inboundFrame({ ...sample.frame, clientMessageId: cmid, peer: { id: peer, kind: "dm" } }));
+        await waitFor(() => rig.receiptCasCalls.length === 1);
+        assert.equal(admissions.length, 1);
+        const admission = admissions[0]!;
+        assert.equal(admission.agentId, sample.inputAgent);
+        const inserts = rig.traceWrites.filter((write) => /INSERT INTO turn_traces/.test(write.sql));
+        assert.equal(inserts.length, 1, "keep the early trace even before admission");
+        const updates = rig.traceWrites.filter((write) => /SET dispatch_id = COALESCE/.test(write.sql));
+        assert.equal(updates.length, 1);
+        assert.deepEqual(updates[0]!.params, [
+          inserts[0]!.params[0], admission.dispatchId, admission.billingRequestId,
+          sample.admittedAgent, `agent:${sample.admittedAgent}:webchat:dm:sess-613-${index}__peer`,
+        ]);
+        assert.equal(inserts[0]!.params[0], admission.traceId);
+        if (sample.name === "omitted") assert.equal(inserts[0]!.params[3], null, "generic early registration stays unchanged");
+        const forwarded = rig.containerSeen.map((raw) => JSON.parse(raw))
+          .filter((frame) => frame.type === "inbound.message" && frame.clientMessageId === cmid);
+        assert.equal(forwarded.length, 1);
+        assert.equal(forwarded[0].traceId, admission.traceId);
+        assert.equal(forwarded[0].agentId, sample.frame.agentId, "projection must not rewrite execution routing");
+        assert.equal(admission.requestHash, computeDispatchRequestHash({ text: "hi" }));
+        assert.equal(rig.receiptCasCalls[0]!.dispatchId, admission.dispatchId);
+        assert.deepEqual(rig.dispatchValidationErrors, [], "billing/lease envelope remains valid");
+        assert.deepEqual(rig.deferredPoolErrors, []);
+      } finally {
+        client?.terminate();
+        await stopRig(rig);
+      }
+    });
+  }
+
+  test("OCV5-613 cron-origin uses stored admitted identity without rewriting its frame", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, verifyDispatchReceipt: true,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("fixture did not admit");
+        admitted.dispatch.agentId = "worker";
+        admitted.takeover = true;
+        return admitted;
+      },
+    });
+    let client: WebSocket | undefined;
+    let injection: ReturnType<UserChatBridgeHandler["injectCronOriginTurn"]> | undefined;
+    try {
+      client = await openClient(rig.port);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      injection = rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID), sessionId: "sess-613-cron:/peer", clientMessageId: "dlgcb-613-cron",
+        agentId: "main", text: "613 canonical projection proof",
+      });
+      assert.equal((await injection).kind, "injected");
+      assert.equal(admissions.length, 1);
+      assert.equal(admissions[0]!.agentId, "main");
+      const insert = rig.traceWrites.find((write) => /INSERT INTO turn_traces/.test(write.sql));
+      assert.ok(insert);
+      const updates = rig.traceWrites.filter((write) => /SET dispatch_id = COALESCE/.test(write.sql));
+      assert.equal(updates.length, 1);
+      assert.deepEqual(updates[0]!.params, [
+        insert.params[0], admissions[0]!.dispatchId, admissions[0]!.billingRequestId,
+        "worker", "agent:worker:webchat:dm:sess-613-cron__peer",
+      ]);
+      const frame = rig.containerSeen.map((raw) => JSON.parse(raw))
+        .find((value) => value.type === "inbound.message" && value.clientMessageId === "dlgcb-613-cron");
+      assert.ok(frame);
+      assert.equal(frame.agentId, "main");
+      assert.deepEqual(frame.content, { text: "613 canonical projection proof" });
+      assert.deepEqual(rig.dispatchValidationErrors, []);
+      assert.deepEqual(rig.deferredPoolErrors, []);
+    } finally {
+      client?.terminate();
+      await stopRig(rig);
+      await injection;
+    }
+  });
+
+  test("OCV5-613 rejected admission keeps its early trace and never invents admitted identity", { timeout: 15_000 }, async () => {
+    let admissions = 0;
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true,
+      admitUserTurn: async () => { admissions++; throw new Error("613 admission unavailable"); },
+    });
+    let client: WebSocket | undefined;
+    try {
+      client = await openClient(rig.port);
+      client.send(inboundFrame({ clientMessageId: "cm-613-rejected", peer: { id: "sess-613-rejected", kind: "dm" } }));
+      await waitFor(() => admissions === 1);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(rig.traceWrites.filter((write) => /INSERT INTO turn_traces/.test(write.sql)).length, 1);
+      assert.equal(rig.traceWrites.filter((write) => /SET dispatch_id = COALESCE/.test(write.sql)).length, 0);
+    } finally {
+      client?.terminate();
+      await stopRig(rig);
+    }
+  });
+});
+
 describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
   // OCV5-492: per-case hang guard. The deploy proof's run() timeout covers the whole file
   // (cold module load included), so each case carries its own tighter limit.
@@ -1265,6 +1392,7 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
         assert.equal(backfill.length, 1, "exactly one dispatch backfill");
         assert.deepEqual(backfill[0]!.params, [
           traceInsert.params[0], admissions[0]!.dispatchId, admissions[0]!.billingRequestId,
+          "main", `agent:main:webchat:dm:sess-callback-${index}`,
         ]);
         // OCV5-599: admitted before its trace existed, so turn_dispatches.trace_id is backfilled.
         assert.equal(admissions[0]!.traceId, undefined);
@@ -2034,6 +2162,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         admitted: {
           clientMessageId: "cron-origin-enrichment-race",
           sessionId: "sess-cron-enrichment",
+          agentId: "main",
           dispatchId: "11111111-2222-4333-8444-555555555555",
           billingRequestId: "0123456789abcdef0123456789abcdef",
           attemptNo: 1,
@@ -2044,6 +2173,9 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
         },
       });
       await waitFor(() => historyStarted);
+      const traceLink = queries.find((q) => /SET dispatch_id = COALESCE/.test(q.sql));
+      assert.ok(traceLink);
+      assert.deepEqual(traceLink.params.slice(3), ["main", "agent:main:webchat:dm:sess-cron-enrichment"]);
       await waitFor(() => queries.some((q) =>
         /SET lease_until/.test(q.sql) && q.params[1] === "cron-origin:cron-origin-enrichment-race"
       ), 500);
