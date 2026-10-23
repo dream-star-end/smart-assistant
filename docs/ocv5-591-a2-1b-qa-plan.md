@@ -75,7 +75,8 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
   | `adopt_take` | `{takeId}` | 选用已有的某一版（同 `/takes/:id/select`） |
 - 不在白名单、参数不合法、或目标不属于该项目 → 批注保持 `sent`，`interpretation = {op: null, explanation}`，界面显示「agent 没看懂，可以换个说法」。
 - `autonomy = 'max'` 且 confidence ≥ 0.8 → 直接执行；否则把 `interpretation` 写进批注，界面显示「agent 理解为 …」，等用户 apply / reject（后端方案 §3）。
-- **一次性执行记录**（plan r1 P1）：自动执行和用户 apply 走同一个入口 `executeAnnotation`，先在一个事务里原子认领：`UPDATE studio_annotations SET interpretation = interpretation || {"execution": {"n": k, "state": "running", "taskKey": "annot:<id>:<k>"}} WHERE id = $1 AND status = 'sent' AND (interpretation->'execution' IS NULL OR interpretation->'execution'->>'state' = 'failed') RETURNING …`，只有认领成功的那一次才派发（同一事务里入队，生成任务的幂等键用 `annot:<id>:<k>`，不经过每次新建版本的 `dispatchRequest`，所以重复 apply / 自动执行与 apply 并发都只会派发一次、预留一次）。认领不到 → 409 `ANNOTATION_BUSY`（已在执行）。
+- **一次性执行记录**（plan r1 P1）：自动执行和用户 apply 走同一个入口 `executeAnnotation`，先在一个事务里原子认领：`UPDATE studio_annotations SET interpretation = interpretation || {"execution": {"n": k, "state": "running", "taskKey": "annot:<id>:<k>"}} WHERE id = $1 AND status = 'sent' AND (interpretation->'execution' IS NULL OR interpretation->'execution'->>'state' = 'failed') RETURNING …`，只有认领成功的那一次才派发（同一事务里入队，不经过每次新建版本的 `dispatchRequest`，所以重复 apply / 自动执行与 apply 并发都只会派发一次、预留一次）。认领不到 → 409 `ANNOTATION_BUSY`（已在执行）。
+- **子任务的幂等键**（plan r2 P1）：一次执行可能派发多个生成（`swap_voice` 重配全部台词、`regenerate_shot` 先首帧后视频），队列的 `idempotency_key` 全局唯一，所以每个子任务用由目标和步骤派生的独立、稳定的键：`annot:<id>:<k>:<ownerKind>:<ownerId>:<step>`（例：`annot:…:2:line:<lineId>:tts`、`annot:…:2:shot_frame:<shotId>:edit`）。同一次执行重放时得到同样的键（不重复派发），不同目标 / 步骤互不去重；执行记录 `execution.tasks` 记下派发的键，全部完成才算 `done`，任一交给用户或失败即 `failed`。
 - `reject` 只在没有执行在跑时允许（同样的原子条件 `execution IS NULL OR state = 'failed'`），否则 409。
 - 执行完成（新 take 通过质检，或 adopt 完成）→ 批注 `applied`，`applied_take_id` 指向新 take，`execution.state = 'done'`；执行失败或新 take 交给了用户 → `execution.state = 'failed'` 并写原因，批注保持 `sent`，可以再次 apply（k + 1）。
 - **完成的项目上的批注**（target final 或任意目标，项目 `done`，plan r1 P1）：`interpret` 只读不改素材，所以执行器的门控对 `interpret` 放行 `done` 项目（其它任务仍按现有规则）；**执行时**（认领成功的同一事务里）把项目从 `done` 转回 `running`（`rev + 1`，事件 `project.reopened`，原因是这条批注），再派发重做；成片批注按时间点找到对应镜头再按上表处理。重做完成后照 A2-1c 的规则重新合成（不收费）。在途的导出合成按 A2-1c 已有的输入指纹复核处理：输入变了就不发布，导出按新输入重新入队。`adopt_take` 在 `done` 项目上同样先转回 `running` 再选版本（`selectTake` 对 `done` 的拒绝不变，批注执行走自己的事务）。Interpret 没给出可执行的指令时项目保持 `done`。
@@ -90,7 +91,7 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
 
 ## 4. 测试
 - 单测：评分判定与阈值、JSON 解析与重问、联系表布局（尺寸 / 格数 / ≤ 6 MB）、decide 的 qa 分支、Interpret 白名单与参数校验、批注几何 / 时间校验、take → target 推导。
-- integ（CI，`.github/integ-tiers/pr-2.txt`，min-tests 相应上调）：假沙箱 + 假 Grok 跑通「首帧 → 质检通过 → 视频 → 质检通过 → ready」；不通过自动重做 2 次后交人且给出最好的两个候选；质检扣费进账本和项目 `spent`、重领不重复扣；预算不足暂停；质检关闭时直接采用；批注 draft → send → interpret → autonomy max 直接执行 / 否则等确认 → apply → applied；不在白名单 → 保持 sent；reject；**同一批注并发 apply 两次只派发一次、只预留一次**；执行中 reject → 409；**done 项目上的成片批注** → interpret 不被取消、执行时转回 running 并重新合成，在途导出按新输入重排；**重做上限**：三次都不通过（分数一直在升）→ needs_user；审核 block → 不采用、不重做、交人；质检关闭 + 需求审核 uncertain → 不开始。
+- integ（CI，`.github/integ-tiers/pr-2.txt`，min-tests 相应上调）：假沙箱 + 假 Grok 跑通「首帧 → 质检通过 → 视频 → 质检通过 → ready」；不通过自动重做 2 次后交人且给出最好的两个候选；质检扣费进账本和项目 `spent`、重领不重复扣；预算不足暂停；质检关闭时直接采用；批注 draft → send → interpret → autonomy max 直接执行 / 否则等确认 → apply → applied；不在白名单 → 保持 sent；reject；**同一批注并发 apply 两次只派发一次、只预留一次**；`swap_voice` 在两条以上台词的项目上每条台词各派发一次（子任务键不互相去重）；执行中 reject → 409；**done 项目上的成片批注** → interpret 不被取消、执行时转回 running 并重新合成，在途导出按新输入重排；**重做上限**：三次都不通过（分数一直在升）→ needs_user；审核 block → 不采用、不重做、交人；质检关闭 + 需求审核 uncertain → 不开始。
 
 ## 5. 不在本步
 - 续接镜头用上一镜头尾帧；设定图 2 候选择优；片尾字幕署名（成片 end card）；导演自动选曲（M1-3）。
