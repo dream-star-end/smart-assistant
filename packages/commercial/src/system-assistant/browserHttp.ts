@@ -4,8 +4,9 @@ import { z } from 'zod'
 import { SystemActionError } from '@openclaude/storage'
 import type { QueryRunner } from '../db/queries.js'
 import { requireAuth } from '../http/auth.js'
-import { HttpError, readJsonBody, sendJson } from '../http/util.js'
+import { HttpError, sendJson } from '../http/util.js'
 import { requireBrowserConfirmationPrincipal } from '../auth/browserConfirmation.js'
+import { readSystemActionBody } from './httpLifetime.js'
 import { SystemOperationRejected } from './operations.js'
 import type { SystemActionsService } from './service.js'
 
@@ -25,8 +26,8 @@ export interface SystemActionsBrowserHttpDeps {
   firstPartyOrigin: string | null
   runner: QueryRunner
 }
-export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDeps): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  return async (req, res) => {
+export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDeps): (req: IncomingMessage, res: ServerResponse, signal?: AbortSignal) => Promise<void> {
+  return async (req, res, signal) => {
     res.setHeader('Cache-Control', 'no-store')
     const path = new URL(req.url ?? '/', 'http://system-actions.invalid').pathname
     const read = readPath.exec(path)
@@ -44,7 +45,7 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
       if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'POST required')
       // Origin / Fetch Metadata / independent HttpOnly refresh proof are checked on every POST.
       const principal = await requireBrowserConfirmationPrincipal(req, deps)
-      const body = await readJsonBody(req, 16 * 1024)
+      const body = await readSystemActionBody(req, 16 * 1024, signal)
       const id = write![1]!
       const action = write![2]!
       if (action === 'deny') {
