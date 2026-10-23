@@ -316,28 +316,36 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
   const kind = t.owner_kind as QaOwnerKind
   const target = QA_TARGET[kind]
   const userId = BigInt(t.user_id)
-  // Picked by the user while this QA was queued: not judged, nothing charged (code r2 P1).
+  // A stored answer means a call already ran: settle it again first (idempotent), whatever
+  // happens next — even a skip below must not leave a finished call unbilled (code r3 P1).
+  const kept = await storedAnswer(deps, task)
+  if (kept?.requestId && kept.usage && deps.grokResettle) {
+    try {
+      await deps.grokResettle({ userId, requestId: kept.requestId, usage: kept.usage })
+    } catch (err) {
+      throw new MediaProviderError('QA_BILLING', true, (err as Error)?.message ?? 'resettle failed')
+    }
+  }
+  // Picked by the user while this QA was queued: not judged (code r2 P1). Whatever an earlier
+  // attempt did charge is booked; a call still in flight is booked later by reconcile().
   if (kind === 'shot_frame' && (await userPickedFrame(deps, t.owner_id))) {
+    const booked = BigInt(String((task.payload as { booked?: unknown }).booked ?? '0'))
+    const charged =
+      (await grokCharged(deps.pool, userId, task.execRequestId).catch(() => null)) ?? booked
     await withLease(deps.pool, task, async (c) => {
       await c.query(
-        `UPDATE studio_takes SET qa = '{"skipped":true,"reason":"user_picked"}'::jsonb WHERE id = $1 AND qa IS NULL`,
-        [t.id],
+        `UPDATE studio_takes SET qa = jsonb_build_object('skipped', true, 'reason', 'user_picked', 'costCredits', $2::text)
+          WHERE id = $1 AND qa IS NULL`,
+        [t.id, charged.toString()],
       )
-      await bookTaskCharge(
-        c,
-        task,
-        BigInt(String((task.payload as { booked?: unknown }).booked ?? '0')),
-        {
-          release: true,
-        },
-      )
+      await bookTaskCharge(c, task, charged, { release: true })
       await finishStudioTask(c, task, { status: 'done', error: 'the user picked a frame' })
     })
     return
   }
   const ctx = await loadContext(deps, task.projectId, kind, t.owner_id)
 
-  let out = await storedAnswer(deps, task)
+  let out = kept
   let attempt = 0
   if (!out) {
     if (!deps.grok)
@@ -346,7 +354,8 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
     if ('stored' in next) out = next.stored
     else attempt = next.attempt
   }
-  if (out?.requestId && out.usage && deps.grokResettle) {
+  // An answer found only now (another holder stored it after we first looked) is settled too.
+  if (out && out !== kept && out.requestId && out.usage && deps.grokResettle) {
     // An earlier holder got (and stored) the answer; its settle may not have happened (code r1
     // P1). Settling again under the id it billed is idempotent.
     try {

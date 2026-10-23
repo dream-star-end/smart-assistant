@@ -624,7 +624,7 @@ describe('studio visual QA (OCV5-591 A2-1b-1)', () => {
     )
     await runOne(s.exec)
     assert.equal(s.grok.calls.length, 0)
-    assert.deepEqual(await takeQa(f.id), { skipped: true, reason: 'user_picked' })
+    assert.deepEqual(await takeQa(f.id), { skipped: true, reason: 'user_picked', costCredits: '0' })
     assert.equal((await shotRow(s.shot)).status, 'generating')
     const p = await projectRow(s.p.id)
     assert.deepEqual([p.spent, p.reserved], ['0', '0'])
@@ -650,5 +650,39 @@ describe('studio visual QA (OCV5-591 A2-1b-1)', () => {
     assert.equal(s.grok.calls.length, 1)
     assert.equal(s.grok.calls[0]!.attempt, 1)
     assert.equal((await takeQa(f.id))?.passed, true)
+  })
+
+  test('a pick does not leave an answered call unbilled: the stored answer is settled first (code r3 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const f = await s.take('shot_frame', s.shot)
+    const resettled: string[] = []
+    const exec: ExecuteDeps = {
+      ...s.exec,
+      grokResettle: async (i) => {
+        resettled.push(i.requestId)
+        await settle(i.userId, i.requestId, 7n)
+      },
+    }
+    await advanceProject(s.advanceDeps, s.p.id)
+    const exe = (
+      await query<{ exec: string }>(
+        `SELECT exec_request_id AS exec FROM studio_tasks WHERE project_id = $1 AND kind = 'qa'`,
+        [s.p.id],
+      )
+    ).rows[0]!.exec
+    // Answered and stored, then the process died before settling; then the user picks the frame.
+    await query(
+      'INSERT INTO studio_step_results(request_id, user_id, output) VALUES ($1, $2, $3::jsonb)',
+      [exe, s.uid, JSON.stringify({ text: answer(), usage: { input_tokens: 1 }, requestId: exe })],
+    )
+    await query(
+      `UPDATE studio_shots SET spec = jsonb_set(spec, '{frameTakeId}', to_jsonb($2::text)) WHERE id = $1`,
+      [s.shot, f.id],
+    )
+    await runOne(exec)
+    assert.deepEqual(resettled, [exe])
+    assert.equal((await takeQa(f.id))?.reason, 'user_picked')
+    assert.equal((await projectRow(s.p.id)).spent, '7', 'the finished call is billed and booked')
   })
 })
