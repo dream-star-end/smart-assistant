@@ -92,6 +92,8 @@ export interface RunDelegateInput {
   sourceAgent?: string
   toolsets?: unknown
   /** 父会话 sessionKey(容器内部键):委派归因 + 进度回传 + per-parent 分桶的解析源。 */
+  traceId?: string
+  parentTraceId?: string
   parentSessionKey?: string
   streamProgress?: boolean
   depth: number

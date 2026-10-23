@@ -616,7 +616,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       this.runner.setConsultTurn(undefined)
     }
     const submitted = this.runner
-      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
+      .submit(params.input, params.requestId, params.modelAuthority, params.turnKey, params.traceId ?? null)
       .then(() => {
         if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
           this._activeTurn = ctx

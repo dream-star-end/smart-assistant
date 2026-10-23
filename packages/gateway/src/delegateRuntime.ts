@@ -30,6 +30,7 @@ import {
   isDelegateTerminalState,
   type DelegateFailureClass,
 } from '@openclaude/protocol'
+import { mintDelegateTrace, registerDelegateTraceWait } from './delegateTrace.js'
 import { classifyDelegateOutputError } from './errorClassify.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
 import type { AgentSession } from './sessionManager.js'
@@ -553,6 +554,10 @@ export async function handleDelegateTask(
   targetAgentId: string,
 ): Promise<void> {
   if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+  const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
+  const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
+  const entryContext = typeof contextRaw === 'string' ? verifyDelegateContextToken(contextRaw) : null
+  const parentTraceId = entryContext?.traceId
   const body = await this.readBody(req)
   let parsed: any
   try {
@@ -596,8 +601,6 @@ export async function handleDelegateTask(
     }
   }
   const depthHeader = req.headers['x-delegation-depth']
-  const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
-  const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
   const boundContext =
     typeof contextRaw === 'string' && contextRaw.trim()
       ? verifyDelegateContextToken(contextRaw)
@@ -692,6 +695,7 @@ export async function handleDelegateTask(
     sourceAgent: sourceAgentId,
     toolsets,
     parentSessionKey,
+    parentTraceId,
     streamProgress: parsed.streamProgress === true,
     depth,
     effort,
@@ -747,6 +751,7 @@ export async function handleDelegateTask(
     const created = store.create(targetAgentId, {
       sessionKey: resume.sessionKey,
       parentSessionKey,
+      parentTraceId,
       queued: sm,
       kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
       callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
@@ -1602,6 +1607,46 @@ export async function _runDelegateTaskCore(
     timer.unref()
     input._leaseTimer = timer
   }
+  const jobSnapshot = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
+  input.traceId = jobSnapshot?.traceId ?? input.traceId
+  if (jobSnapshot) input.parentTraceId = jobSnapshot.parentTraceId
+  let traceMissingReason = 'master-trace-not-configured'
+  if (!input.traceId) {
+    let traceAborted = false
+    const traceWait = registerDelegateTraceWait(this, sessionKey)
+    const fence = input.claimToken && input.fencingEpoch !== undefined
+      ? { claimToken: input.claimToken, fencingEpoch: input.fencingEpoch }
+      : jobSnapshot?.claimToken ? { claimToken: jobSnapshot.claimToken, fencingEpoch: jobSnapshot.fencingEpoch } : undefined
+    try {
+      const trace = await mintDelegateTrace({
+        sessionKey, agentId: targetAgentId, delegateRunId: input.backgroundJobId ?? progressRunId,
+        parentTraceId: input.parentTraceId, model: delegateExec?.canonicalModel ?? requestedModel,
+      })
+      if (!traceWait.isAborted() && trace) {
+        if (input.backgroundJobId && (!fence || !this._delegateJobs?.bindTrace(input.backgroundJobId, trace, fence))) {
+          traceAborted = true
+        } else input.traceId = trace.traceId
+      }
+    } catch {
+      traceMissingReason = 'master-trace-unavailable'
+    } finally {
+      traceWait.close()
+    }
+    // Every mint outcome (including timeout/unconfigured) must recheck the owner.
+    const current = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
+    if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
+        current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
+    if (traceAborted || traceWait.isAborted() || this._shuttingDown) {
+      if (input._leaseTimer) clearInterval(input._leaseTimer)
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+      return { kind: 'rejected', httpStatus: 409, message: 'delegate cancelled before spawn', failureClass: 'cancelled' }
+    }
+  }
+  if (!input.traceId) this.log.warn('delegate_trace_unbound', {
+    parentTraceId: input.parentTraceId, delegateRunId: input.backgroundJobId ?? progressRunId,
+    reason: traceMissingReason,
+  })
   // ── grok delegate turn:向 master 铸造 relay route(与浏览器 turn 同一账号池)──
   // delegate 是容器本地 turn,没有 bridge 注入 __oc_grok_route;不铸 route 则
   // GrokAdapter 在 spawn 前 fail-closed(GROK_ROUTE_REQUIRED)。放在资源闸之后:
@@ -1982,7 +2027,7 @@ export async function _runDelegateTaskCore(
     input.effort,
     delegateExec?.canonicalModel ?? requestedModel,
     engineBillingAdmission?.requestId,
-    undefined,
+    input.traceId,
     undefined,
     { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
   )
