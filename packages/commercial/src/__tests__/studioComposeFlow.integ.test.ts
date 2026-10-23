@@ -335,6 +335,20 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
     assert.equal(all[1]!.meta.variantKey, 'vertical-srt')
     assert.equal(all[1]!.cost, '0')
     assert.ok(all[1]!.meta.srtSha, 'the .srt is kept next to the film')
+    // A2-1c-2: the final page reads each film's format, credits and .srt from the project view.
+    const view = (await new StudioStore(getPool()).projectView(s.uid, s.p.id)) as {
+      takes: Array<{ id: string; final: Record<string, unknown> | null }>
+    }
+    const vertical = view.takes.find((tk) => tk.id === all[1]!.id)
+    assert.deepEqual(
+      [
+        vertical?.final?.variantKey,
+        vertical?.final?.srtSha,
+        Array.isArray(vertical?.final?.credits),
+      ],
+      ['vertical-srt', all[1]!.meta.srtSha, true],
+    )
+    assert.deepEqual((vertical?.final?.variant as { resolution?: string })?.resolution, 'vertical')
     const spec = s.runner.ran.filter((o) => o.op === 'compose').at(-1) as Extract<
       ComposeOp,
       { op: 'compose' }

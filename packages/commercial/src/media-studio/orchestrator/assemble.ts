@@ -13,6 +13,7 @@ import { SystemVoiceCache } from '../../minimax/voices.js'
 import type { MuseBridgeHub } from '../../muse/hub.js'
 import type { StudioHttpDeps } from '../http.js'
 import type { PlanVoice } from './plan.js'
+import { startStudioEventPump } from './push.js'
 import { makeOrchestratorApi } from './service.js'
 import { StudioWorker } from './worker.js'
 
@@ -22,6 +23,8 @@ export function startStudioOrchestrator(input: {
   studio: StudioHttpDeps
   grok?: GrokRunner
   museHub?: MuseBridgeHub
+  /** OCV5-591 A2-1c-2: deliver a frame to this slot's connections of a user (userChatBridge). */
+  push?: (userId: bigint, frame: unknown) => void
 }): { stop: () => Promise<void> } | undefined {
   const { studio } = input
   if (!studio.providers) return undefined
@@ -60,10 +63,18 @@ export function startStudioOrchestrator(input: {
     },
   )
   worker.start()
+  const stopPush = input.push
+    ? startStudioEventPump({ pool: input.pool, send: input.push, log })
+    : () => {}
   log.info('studio_orchestrator_started', {
     owner: worker.owner,
     planner: input.grok ? 'grok' : 'missing',
     compose: studio.compose?.configured() ? 'sandbox' : 'missing',
   })
-  return { stop: () => worker.stop() }
+  return {
+    stop: async () => {
+      stopPush()
+      await worker.stop()
+    },
+  }
 }

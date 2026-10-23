@@ -263,7 +263,11 @@ export class StudioStore {
                 -- OCV5-591 M1: a music take carries its licence snapshot and track card for the UI;
                 -- other takes' meta (provider internals) stays server-side.
                 CASE WHEN owner_kind = 'music'
-                     THEN jsonb_build_object('license', meta->'license', 'track', meta->'track') END AS music
+                     THEN jsonb_build_object('license', meta->'license', 'track', meta->'track') END AS music,
+                -- OCV5-591 A2-1c-2: a film's export format, CC BY credits and soft-subtitle file.
+                CASE WHEN owner_kind = 'final'
+                     THEN jsonb_build_object('variant', meta->'variant', 'variantKey', meta->'variantKey',
+                                             'credits', meta->'credits', 'srtSha', meta->'srtSha') END AS final
          FROM studio_takes WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500`,
         [id],
       ),

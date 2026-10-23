@@ -2081,6 +2081,10 @@ export async function registerCommercial(
   // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
   const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
   let stopStudioOrchestrator: (() => Promise<void>) | undefined;
+  // OCV5-591 A2-1c-2: studio activity to this slot's connections (assigned once the bridge exists).
+  const studioPushRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2522,6 +2526,7 @@ export async function registerCommercial(
           pool: getPool(),
           studio: studioHttp,
           museHub,
+          push: (uid, frame) => studioPushRef.current(uid, frame),
           grok: makeGrokRunner({
             getPool,
             preCheckRedis,
@@ -6199,6 +6204,9 @@ export async function registerCommercial(
     userChatBridge.broadcastToUser(BigInt(uid), payload);
   };
   goalBroadcastRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
+  studioPushRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
   goalSyncRef.current = (uid, payload) => {
