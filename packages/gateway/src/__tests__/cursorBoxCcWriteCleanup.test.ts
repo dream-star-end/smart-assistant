@@ -20,7 +20,8 @@ function frame(value: unknown): Buffer {
   return Buffer.concat([header, payload])
 }
 
-async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'network') {
+async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'network',
+  ending: 'error' | 'clean' | 'early-clean' | 'early-error' = 'error') {
   const home = mkdtempSync(join(tmpdir(), 'ocv5-527-write-cleanup-'))
   const stdin = new PassThrough()
   const stdout = new PassThrough()
@@ -34,6 +35,8 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
   const ready = barrier()
   const stopped = barrier()
   const aborted = barrier()
+  const writing = barrier()
+  const writeReply = barrier()
   let launch!: ReadableStreamDefaultController<Uint8Array>
   let stopBody!: ReadableStreamDefaultController<Uint8Array>
   const original = new Error('original launch abort after refused write')
@@ -47,6 +50,15 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
     const body = JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString()) as BoxCcExecRequest
     if (body.environment.OC_BOX_CC_SEQ !== undefined) {
       writes++
+      writing.release()
+      if (ending.startsWith('early-')) {
+        if (ending === 'early-error') launch.error(original)
+        else {
+          launch.enqueue(Uint8Array.from(frame({ exitEvent: { exitCode: 0 } })))
+          launch.close()
+        }
+        await writeReply.promise
+      }
       return new Response(Uint8Array.from(frame({ exitEvent: { exitCode: 1 } })))
     }
     if (body.args.includes(BOX_CC_STOP_SCRIPT)) {
@@ -58,7 +70,14 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
     launches++
     return new Response(new ReadableStream<Uint8Array>({ start(controller) {
       launch = controller
-      init.signal?.addEventListener('abort', () => { controller.error(original); aborted.release() }, { once: true })
+      init.signal?.addEventListener('abort', () => {
+        if (ending === 'error') controller.error(original)
+        else if (ending === 'clean') {
+          controller.enqueue(Uint8Array.from(frame({ exitEvent: { exitCode: 0 } })))
+          controller.close()
+        }
+        aborted.release()
+      }, { once: true })
       launched.release()
     } }))
   }
@@ -84,6 +103,12 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
     launch.enqueue(Uint8Array.from(frame({ stderrEvent: { data: 'BOX_INTERACTIVE_READY\n' } })))
     await ready.promise
     if (entry === 'ready') stdin.write(line)
+    if (ending.startsWith('early-')) {
+      await writing.promise
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      assert.equal(settled, false, 'bridge must join the delayed write after the launch stream ends')
+      writeReply.release()
+    }
     await stopped.promise
     await aborted.promise
     await new Promise<void>((resolve) => setImmediate(resolve))
@@ -92,8 +117,13 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
       stopBody.close()
     } else if (stopFailure === 'body') stopBody.error(stopError)
     const outcome = await bridge
-    assert.equal(outcome.error, original, 'cleanup must preserve the original failed-write rejection')
-    assert.equal(outcome.code, undefined)
+    if (ending === 'error' || ending === 'early-error') {
+      assert.equal(outcome.error, original, 'cleanup must preserve the original failed-write rejection')
+      assert.equal(outcome.code, undefined)
+    } else {
+      assert.equal(outcome.error, undefined)
+      assert.equal(outcome.code, 1, 'a clean host exit cannot hide a refused write')
+    }
     assert.equal(writes, 1, 'an explicit refused write is never replayed')
     assert.equal(launches, 1, 'the failed turn never starts another host')
     assert.equal(stops, 1)
@@ -101,6 +131,7 @@ async function refusedWrite(entry: 'held' | 'ready', stopFailure?: 'body' | 'net
     assert.equal(out, '', 'the refused line produced no result')
   } finally {
     choose.release()
+    writeReply.release()
     try { stopBody?.close() } catch { /* already settled or failed */ }
     stdin.destroy()
     await bridge
@@ -116,5 +147,18 @@ for (const entry of ['held', 'ready'] as const) {
 for (const failure of ['body', 'network'] as const) {
   test(`failed Box write preserves its original rejection when stop ${failure} fails`, { timeout: 5_000 }, async () => {
     await refusedWrite('held', failure)
+  })
+}
+
+for (const entry of ['held', 'ready'] as const) {
+  for (const ending of ['clean', 'early-clean', 'early-error'] as const) {
+    test(`refused Box write stays failed across ${ending} launch completion: ${entry}`, { timeout: 5_000 }, async () => {
+      await refusedWrite(entry, undefined, ending)
+    })
+  }
+}
+for (const failure of ['body', 'network'] as const) {
+  test(`refused Box write keeps nonzero exit when stop ${failure} fails`, { timeout: 5_000 }, async () => {
+    await refusedWrite('held', failure, 'clean')
   })
 }
