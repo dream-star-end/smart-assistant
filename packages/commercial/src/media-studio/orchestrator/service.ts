@@ -83,7 +83,8 @@ export function makeOrchestratorApi(
         if (busy.rowCount)
           throw new HttpError(409, 'STUDIO_PROJECT_BUSY', 'another project is still running')
         await c.query(
-          `UPDATE studio_projects SET status = 'planning', rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+          `UPDATE studio_projects SET status = 'planning', settings = settings - 'planFailed',
+                  rev = rev + 1, updated_at = NOW() WHERE id = $1`,
           [projectId],
         )
         await appendStudioEvent(c, projectId, 'project.started', {
@@ -318,7 +319,8 @@ export function makeOrchestratorApi(
         // A project waiting on the user picks up again once something was chosen.
         await c.query(
           `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason', rev = rev + 1, updated_at = NOW()
-            WHERE id = $1 AND status = 'awaiting_user' AND settings->>'awaitingReason' = 'needs_user'`,
+            WHERE id = $1 AND status = 'awaiting_user'
+              AND settings->>'awaitingReason' IN ('needs_user', 'compose_pending')`,
           [t.project_id],
         )
         await appendStudioEvent(c, t.project_id, 'take.selected', {

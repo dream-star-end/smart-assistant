@@ -22,6 +22,8 @@ import {
 } from './plan.js'
 
 export const MAX_PROVIDER_ATTEMPTS = 3
+/** Claims (including lease expiries after a crash or timeout) before a task is given up. */
+export const MAX_TASK_CLAIMS = 6
 /** Longest raw Muse clip a shot can stretch to when its line runs long (plan §2). */
 export const MAX_SHOT_SEC = 10
 
@@ -188,7 +190,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
       }
       await finishStudioTask(c, task, { status: 'failed', error: 'plan invalid twice' })
       await c.query(
-        `UPDATE studio_projects SET status = 'awaiting_user', settings = settings || '{"awaitingReason":"plan_failed"}'::jsonb,
+        `UPDATE studio_projects SET status = 'draft', settings = settings || '{"planFailed":true}'::jsonb,
                 rev = rev + 1, updated_at = NOW() WHERE id = $1 AND status = 'planning'`,
         [task.projectId],
       )
@@ -328,9 +330,17 @@ async function adopt(
       [g.ownerId, sha, projectId],
     )
   } else if (g.ownerKind === 'shot_video') {
+    // Only while the shot still waits for this video: not after the user chose another take, not
+    // when a long line sent it to the user, not when a different first frame was picked since.
+    // A declined video stays a finished version the user can choose.
+    const first = g.request.inputs?.find((i) => i.role === 'first_frame')?.blobSha ?? null
     await c.query(
-      `UPDATE studio_shots SET active_take_id = $2, status = 'ready', spec = spec - 'frameTakeId' WHERE id = $1 AND project_id = $3`,
-      [g.ownerId, takeId, projectId],
+      `UPDATE studio_shots s SET active_take_id = $2, status = 'ready', spec = s.spec - 'frameTakeId'
+        WHERE s.id = $1 AND s.project_id = $3 AND s.status = 'generating'
+          AND (NOT s.spec ? 'frameTakeId'
+               OR EXISTS (SELECT 1 FROM studio_takes f
+                           WHERE f.id::text = s.spec->>'frameTakeId' AND f.blob_sha = $4))`,
+      [g.ownerId, takeId, projectId, first],
     )
   } else if (g.ownerKind === 'line') {
     await c.query(
@@ -509,10 +519,13 @@ async function failGen(
   provider?: ReturnType<ProviderRegistry['get']>,
 ): Promise<void> {
   // Book whatever this execution did charge right away; late charges are caught by reconcile().
-  const charged =
+  // An unreadable ledger books nothing here (booked stays as it was); reconcile() catches up.
+  const read =
     userId !== undefined && provider
-      ? await provider.chargedFor(userId, task.execRequestId).catch(() => 0n)
+      ? await provider.chargedFor(userId, task.execRequestId).catch(() => null)
       : 0n
+  const booked = BigInt(String((task.payload as { booked?: unknown }).booked ?? '0'))
+  const charged = read ?? booked
   await withLease(deps.pool, task, async (c) => {
     await c.query(
       `UPDATE studio_takes SET status = 'failed', error_code = $2, cost_credits = $3, finished_at = NOW() WHERE id = $1`,
@@ -562,16 +575,75 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
   return true
 }
 
+/**
+ * An executor error that is not a lost lease: retry with backoff a bounded number of times, then
+ * close the task — a generation books what was charged and releases its reservation, a plan hands
+ * the project to the user. Never leaves the task leased (it would re-run on every lease expiry).
+ */
+async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promise<void> {
+  const e =
+    err instanceof MediaProviderError
+      ? err
+      : new MediaProviderError('EXECUTOR_ERROR', true, (err as Error)?.message ?? 'error')
+  if (e.retryable && task.attempts < MAX_PROVIDER_ATTEMPTS) {
+    await withLease(deps.pool, task, (c) =>
+      retryStudioTask(c, task, {
+        delaySeconds: 30 * 2 ** (task.attempts - 1),
+        error: `${e.code}: ${e.message}`,
+      }),
+    )
+    return
+  }
+  if (task.kind === 'gen') {
+    let g: GenPayload | null = null
+    try {
+      g = genPayload(task)
+    } catch {
+      g = null
+    }
+    if (g) {
+      const p = await projectOf(deps.pool, task.projectId)
+      const provider = deps.providers.get(g.providerId)
+      await failGen(deps, task, g, e, p ? BigInt(p.user_id) : undefined, provider)
+      return
+    }
+    await withLease(deps.pool, task, async (c) => {
+      await bookTaskCharge(c, task, 0n, { release: true })
+      await finishStudioTask(c, task, { status: 'failed', error: `${e.code}: ${e.message}` })
+    })
+    return
+  }
+  await withLease(deps.pool, task, async (c) => {
+    await finishStudioTask(c, task, { status: 'failed', error: `${e.code}: ${e.message}` })
+    if (task.kind === 'plan') {
+      await c.query(
+        `UPDATE studio_projects SET status = 'draft', settings = settings || '{"planFailed":true}'::jsonb,
+                rev = rev + 1, updated_at = NOW() WHERE id = $1 AND status = 'planning'`,
+        [task.projectId],
+      )
+      await appendStudioEvent(c, task.projectId, 'plan.failed', {
+        message: '导演 agent 这次没能写出分镜方案，可以改一下需求或稍后再开拍。',
+      })
+    }
+  })
+}
+
 export async function executeTask(
   deps: ExecuteDeps,
   task: StudioTask,
   signal: AbortSignal,
 ): Promise<void> {
-  if (!(await gate(deps, task))) return
-  if (task.kind === 'plan') return runPlan(deps, task)
-  if (task.kind === 'gen') return runGen(deps, task, signal)
-  await finishStudioTask(deps.pool, task, {
-    status: 'failed',
-    error: `unknown task kind ${task.kind}`,
-  })
+  try {
+    if (task.attempts > MAX_TASK_CLAIMS) {
+      throw new MediaProviderError('TOO_MANY_ATTEMPTS', false, `claimed ${task.attempts} times`)
+    }
+    if (!(await gate(deps, task))) return
+    if (task.kind === 'plan') return await runPlan(deps, task)
+    if (task.kind === 'gen') return await runGen(deps, task, signal)
+    throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
+  } catch (err) {
+    // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.
+    if (err instanceof LeaseLostError || signal.aborted) throw err
+    await recover(deps, task, err)
+  }
 }

@@ -212,7 +212,8 @@ export async function retryStudioTask(
 /**
  * Cancels a project's queued tasks. Leased ones finish their in-flight upstream call (plan §4).
  * Their budget reservations are released and their bound takes canceled in the same statement
- * (OCV5-591 A2-1); any charge an earlier attempt still makes is booked by the reconciler.
+ * (OCV5-591 A2-1; a retried task's take may still say 'running'); any charge an earlier attempt
+ * still makes is booked by the reconciler.
  */
 export async function cancelQueuedStudioTasks(db: Db, projectId: string): Promise<number> {
   const r = await db.query<{ n: string }>(
@@ -224,7 +225,7 @@ export async function cancelQueuedStudioTasks(db: Db, projectId: string): Promis
          FROM old WHERE t.id=old.id RETURNING old.held, old.take_id
      ), tk AS (
        UPDATE studio_takes SET status='canceled', finished_at=NOW()
-        WHERE project_id=$1 AND status='queued'
+        WHERE project_id=$1 AND status IN ('queued','running')
           AND id::text IN (SELECT take_id FROM c WHERE take_id IS NOT NULL)
        RETURNING id
      ), p AS (

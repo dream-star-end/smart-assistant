@@ -277,7 +277,7 @@ export async function dispatchRequest(
       providerId: provider.id,
       ownerKind: d.ownerKind,
       ownerId: d.ownerId,
-      request: req,
+      request: { ...req, model },
       booked: '0',
     },
     reservedCredits: est,
@@ -337,7 +337,24 @@ async function apply(
           ownerId: d.ownerId,
           message: '可用的服务都试过了，这一步需要你看一下。',
         })
+        if (d.ownerKind === 'bible') {
+          // Nothing marks an asset as stuck and every frame waits on it: hand the project over.
+          await client.query(
+            `UPDATE studio_projects SET status = 'awaiting_user',
+                    settings = settings || '{"awaitingReason":"needs_user"}'::jsonb,
+                    rev = rev + 1, updated_at = NOW()
+              WHERE id = $1 AND status = 'running'`,
+            [id],
+          )
+          return
+        }
       }
+    } else if (a.type === 'adopt_video') {
+      await client.query(
+        `UPDATE studio_shots SET active_take_id = $2, status = 'ready'
+          WHERE id = $1 AND project_id = $3 AND status NOT IN ('needs_user', 'failed')`,
+        [a.shotId, a.takeId, id],
+      )
     } else if (a.type === 'shot_status') {
       await client.query('UPDATE studio_shots SET status = $2 WHERE id = $1 AND project_id = $3', [
         a.shotId,

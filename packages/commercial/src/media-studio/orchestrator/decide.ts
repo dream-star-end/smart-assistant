@@ -80,6 +80,8 @@ export type Action =
   | { type: 'dispatch'; dispatch: Dispatch }
   | { type: 'set_status'; status: ProjectStatus; reason?: string }
   | { type: 'shot_status'; shotId: string; status: DShot['status'] }
+  /** A finished video nobody adopted (the executor declined: the shot had moved on meanwhile). */
+  | { type: 'adopt_video'; shotId: string; takeId: string }
   | { type: 'line_status'; lineId: string; status: DLine['status'] }
   | { type: 'note_music_skipped' }
 
@@ -115,6 +117,7 @@ export function decide(s: DState): Action[] {
     return true
   }
   let blocked = false // something can never finish without the user
+  const adopted = new Set<string>()
 
   // 1) bible: every character / scene / style asset gets one locked image.
   const bible = s.assets.filter((a) => BIBLE_KINDS.has(a.kind))
@@ -173,11 +176,14 @@ export function decide(s: DState): Action[] {
       }
       continue
     }
-    // A video made from this frame that succeeded and is not adopted yet → adopt it is the
-    // executor's job; here we only start one when none exists for the chosen frame.
-    const fromFrame = videos.filter((v) => v.status !== 'canceled')
-    const usable = fromFrame.find(ok)
-    if (usable && !shot.frameTakeId) continue
+    // No frame picked and a finished video exists → adopt the newest one (the executor adopts
+    // only into the state it was dispatched for). A picked frame always gets its own video.
+    const usable = [...videos].filter(ok).sort((a, b) => b.version - a.version)[0]
+    if (usable && !shot.frameTakeId) {
+      actions.push({ type: 'adopt_video', shotId: shot.id, takeId: usable.id })
+      adopted.add(shot.id)
+      continue
+    }
     if (!s.canDispatch.video) {
       blocked = true
       continue
@@ -227,7 +233,8 @@ export function decide(s: DState): Action[] {
   if (!s.canDispatch.music && !s.musicSkippedNoted) actions.push({ type: 'note_music_skipped' })
 
   const dispatched = actions.some((a) => a.type === 'dispatch')
-  const allShots = s.shots.length > 0 && s.shots.every((sh) => shotDone(s, sh))
+  const allShots =
+    s.shots.length > 0 && s.shots.every((sh) => shotDone(s, sh) || adopted.has(sh.id))
   const allLines = s.lines.every((l) => l.status === 'ready' && l.activeTakeId)
   if (allShots && allLines && s.inflight === 0 && !dispatched) {
     // Compose lands in A2-1c; until then the project waits for it.

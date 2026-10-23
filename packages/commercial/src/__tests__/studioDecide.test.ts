@@ -128,6 +128,26 @@ describe('decide (OCV5-591 A2-1a)', () => {
     assert.equal(shotDone(video, video.shots[0]!), true)
   })
 
+  it('a finished video nobody adopted is adopted (newest first) and counts as done', () => {
+    const s = state({
+      shots: [
+        { id: 's0', ordinal: 0, status: 'generating', activeTakeId: null, frameTakeId: null },
+      ],
+      takes: [
+        take({ id: 'f1' }),
+        take({ id: 'v1', ownerKind: 'shot_video' }),
+        take({ id: 'v2', ownerKind: 'shot_video', version: 2 }),
+      ],
+    })
+    assert.deepEqual(decide(s), [
+      { type: 'adopt_video', shotId: 's0', takeId: 'v2' },
+      { type: 'set_status', status: 'awaiting_user', reason: 'compose_pending' },
+    ])
+    // A shot sent to the user is left alone even with a finished video.
+    const held = { ...s, shots: [{ ...s.shots[0]!, status: 'needs_user' as const }] }
+    assert.ok(!decide(held).some((a) => a.type === 'adopt_video'))
+  })
+
   it('a chosen frame re-runs the video even when an older video exists', () => {
     const s = state({
       shots: [

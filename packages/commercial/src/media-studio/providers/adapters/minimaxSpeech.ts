@@ -196,11 +196,10 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
             ],
           ],
         )
-        return ledgerDebited(
-          pool,
-          'minimax_media_usage_record',
-          rows.rows.map((r) => r.id),
-        )
+        return ledgerDebited(pool, 'minimax_media_usage_record', [
+          ...rows.rows.map((r) => r.id),
+          ...created.rows.map((r) => r.id),
+        ])
       },
       estimateMaxCost: (req, model) =>
         req.op === 'voice.design' || req.op === 'voice.clone'

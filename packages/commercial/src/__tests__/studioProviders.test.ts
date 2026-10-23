@@ -575,6 +575,36 @@ describe('adapters', () => {
       { code: 'PROVIDER_UNAVAILABLE' },
     )
   })
+
+  it('an unavailable provider cannot tell what it charged: unknown, never 0 (code r1 P1)', async () => {
+    const { registry } = build(undefined)
+    await assert.rejects(registry.get('minimax-speech')!.chargedFor(247n, 'studio:t1'), {
+      code: 'PROVIDER_UNAVAILABLE',
+    })
+  })
+
+  it('minimax-speech chargedFor counts a design / clone settlement too (code r1 P1)', async () => {
+    let ledgerIds: unknown = null
+    const pool = {
+      query: async (sql: string, args: unknown[]) => {
+        if (sql.includes('credit_ledger')) {
+          ledgerIds = args[1]
+          return { rows: [{ debited: '991' }] }
+        }
+        if (sql.includes('ANY')) return { rows: [{ id: '5' }] }
+        return { rows: [] }
+      },
+    }
+    const deps = fakeDeps({
+      minimax: {
+        mediaKey: { key: SENTINEL_KEY, source: 'file' },
+        client: { pool: pool as never },
+      } as never,
+    })
+    const p = build(undefined, deps).registry.get('minimax-speech')!
+    assert.equal(await p.chargedFor(247n, 'studio:t1'), 991n)
+    assert.deepEqual(ledgerIds, ['5'])
+  })
 })
 
 describe('MiniMax voice design / clone (user decision 2026-10-23 13:03)', () => {

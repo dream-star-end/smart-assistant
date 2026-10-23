@@ -60,8 +60,9 @@ async function reconcileBatch(
     for (const r of rows.rows) {
       const provider = deps.providers.get(r.provider)
       if (!provider) continue
-      const charged = await provider.chargedFor(BigInt(r.user_id), r.exec)
-      if (charged === BigInt(r.booked)) continue
+      // A provider that cannot read its ledger now is retried on a later pass, never booked as 0.
+      const charged = await provider.chargedFor(BigInt(r.user_id), r.exec).catch(() => null)
+      if (charged === null || charged === BigInt(r.booked)) continue
       await bookTaskCharge(client, { id: r.id, projectId: r.project_id }, charged, {
         release: false,
       })

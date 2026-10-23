@@ -226,9 +226,14 @@ class UnavailableProvider implements MediaProvider {
   affinity(): string | null {
     return null
   }
-  // An unavailable provider never ran anything, so it never charged.
+  // Not built, so its ledger cannot be read. Unknown is not zero: callers skip and retry later
+  // (the reconciler would otherwise refund real charges of a provider switched off after use).
   async chargedFor(): Promise<bigint> {
-    return 0n
+    throw new MediaProviderError(
+      'PROVIDER_UNAVAILABLE',
+      true,
+      `media provider ${this.id} is not available`,
+    )
   }
   async run(): Promise<never> {
     throw new MediaProviderError(
