@@ -1,6 +1,6 @@
 /** Migration-free selfhost preparation. Default plan is read-only.
  * stage only creates an unavailable model; activation is a separate existing
- * admin operation after real upstream cost proof and verified deployment. */
+ * admin operation after a user-approved cost decision and verified deployment. */
 import { execFileSync } from 'node:child_process'
 import { readFileSync, realpathSync } from 'node:fs'
 import { hostname } from 'node:os'

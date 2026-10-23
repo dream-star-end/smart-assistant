@@ -22,9 +22,9 @@ export const KIMI31_VERSION = {
 export const KIMI31_PRICE = {
   model_id: KIMI31_MODEL_ID,
   display_name: 'Kimi K3.1 Pro',
-  input_per_mtok: '914',
-  output_per_mtok: '4569',
-  cache_read_per_mtok: '92',
+  input_per_mtok: '609',
+  output_per_mtok: '3046',
+  cache_read_per_mtok: '61',
   cache_write_per_mtok: '0',
   multiplier: '1.000',
   enabled: false,

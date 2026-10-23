@@ -7,20 +7,18 @@ dynamic tools. No maximum output is invented. The existing K3 product window
 policy also applies: admin 1M, ordinary users 512000. Old K3 1M and 256K remain.
 Highspeed and OpenCode aliases are excluded.
 
-The steward approved temporary PLATFORM prices of input/output/cache-read/write
-914/4569/92/0 fen per million tokens, multiplier 1, default effort max.
-These are not a claim about the new upstream unit cost.
+The user approved PLATFORM prices of input/output/cache-read/write
+609/3046/61/0 fen per million tokens, multiplier 1, default effort max, on
+2026-10-24 05:07 (rounded two-thirds of the prior 914/4569/92/0 platform price).
+Both existing K3 rows retain their prices. These are not a vendor cost claim.
 
-## Release hold: upstream cost has not passed
+The user selected the existing Kimi Code subscription on 2026-10-24 05:02,
+knowingly accepting the observed 33–40% higher quota increments. This explicit
+cost decision supersedes the earlier release hold; no lower upstream cost is
+claimed. OpenCode Go is stopped. Commercial PR #1045 has release authorization,
+conditional on full personal acceptance and prior disclosure of non-Kimi diff.
 
-Official `/coding/v1/usages` currently exposes aggregate subscription ratios.
-Direct bounded requests identify the correct models and return token counts,
-but no monetary cost or unit rate. A rounded ratio change, a zero wallet delta,
-or platform usage/journal/ledger agreement cannot prove equal upstream price.
-Do not merge, deploy or activate while that evidence is missing or new rates
-exceed K3. Keep both PRs draft. Do not create a synthetic cost-passed receipt.
-
-## Preparation after the hold is resolved
+## Preparation and acceptance
 
 Use the reviewed default Codex + required CI result, load<6, two FREE checks,
 >=8GiB free, no other train/turn, and the official personal ride/lease. Verify
@@ -45,7 +43,7 @@ make a completed stage repeatable and reject changed profiles/prices or an
 already-active entry. Interrupted preparation leaves a non-executable staged
 entry. Existing K3 rows are never updated.
 
-Activation is separate: after actual cost proof and release verification, use
+Activation is separate: after the accepted cost decision and release verification, use
 the existing `admin/modelCatalogOps.activateEntry(entryId, lockVersion, ctx)`
 operation. It checks semantics and creates `model_catalog.activate` audit;
 catalog->pricing trigger mirrors enabled in the same transaction. Never set
@@ -53,9 +51,17 @@ pricing.enabled first or directly write active state. The new script contains
 no activation command or cost override. Emergency disable uses the existing
 `disableEntry` for `k3.1-pro` only.
 
-Accept with personal uid765: real multi-turn including an unpredictable tool
-result, 300s same-session continuation, old K3 regression and three-ledger
-formula reconciliation. Direct upstream metadata probes are not this acceptance.
-Commercial uid247 is reserved if any commercial testing is later authorized;
-commercial production and egress are untouched. The commercial PR stays draft
-and explicitly DO NOT MERGE until the user says to release.
+Before activation, use existing audited patchPricing with lock_version to set
+visibility hidden, then add only the target canary grant. activateEntry mirrors
+enabled from catalog state; never patch enabled. Personal uid765 must pass real
+multi-turn, a Bash result, same-session continuation after at least 300 seconds,
+old-K3 regression, concurrent sessions and usage/journal/ledger reconciliation
+at the new frozen prices. Only then remove the temporary grant and change
+visibility to public. On failure revoke only the owned grant and disable the
+new hidden entry. Direct upstream probes do not count as this acceptance.
+
+After personal acceptance, commercial uid247 repeats the release and billing
+verification under the official queue and production-mutation lease. Report
+all non-Kimi release differences before deployment. The selfhost-only stage
+script remains selfhost-only; a separately reviewed commercial operator must
+verify commercial DB/release identity and use the same product catalog APIs.
