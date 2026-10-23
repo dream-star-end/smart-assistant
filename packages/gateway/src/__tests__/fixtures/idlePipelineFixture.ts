@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign as cryptoSign } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, lstatSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { isolatedBoxArgs } from "./isolatedBoxArgs.js";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -2180,8 +2181,7 @@ function makeLocalPythonExec(toolNames: () => string[]): {
         return { stdout: JSON.stringify({ runNonce, leaseEpoch, keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
       }
       log.push("python");
-      const ran = spawnSync(request.command, request.args.map((arg) =>
-        arg.replaceAll("/home/box/.claude", join(HOME, "synthetic-box"))), {
+      const ran = spawnSync(request.command, isolatedBoxArgs(request.args, join(HOME, "synthetic-box")), {
         cwd: request.cwd && existsSync(request.cwd) ? request.cwd : "/tmp",
         env: { ...process.env, ...request.environment },
         encoding: "utf8",
@@ -2320,14 +2320,13 @@ async function execStage(plan: {
   run: { command: string; args: string[] }; cleanup: { command: string; args: string[]; cwd: string; environment: NodeJS.ProcessEnv };
 }): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "ocv5-296-idle-stage-"));
-  const from = "/home/box/.claude/projects";
   const runKey = JSON.stringify([plan.run.command, plan.run.args]);
   try {
     for (const step of [...plan.stageInputs, plan.cleanup]) {
       if (JSON.stringify([step.command, step.args]) === runKey) throw new Error("refusing inner claude exec");
       if (step.command !== "/usr/bin/python3") throw new Error(`refusing ${step.command}`);
       await new Promise<void>((resolveStep, reject) => {
-        const child: ChildProcess = spawn(step.command, step.args.map((arg) => arg.replaceAll(from, root)), {
+        const child: ChildProcess = spawn(step.command, isolatedBoxArgs(step.args, root), {
           cwd: step.cwd, env: step.environment,
         });
         let stderr = "";
