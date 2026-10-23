@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../utils/sessionTransition.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle'
 import { readFile, stat } from 'fs/promises'
@@ -5222,6 +5223,7 @@ async function loadInitialMessages(
     restoredWorkerState: Promise<SessionExternalMetadata | null>
   },
 ): Promise<LoadInitialMessagesResult> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   const persistSession = !isSessionPersistenceDisabled()
   // Handle continue in print mode
   if (options.continue) {
@@ -5264,6 +5266,7 @@ async function loadInitialMessages(
         // Reuse the resumed session's ID
         if (!options.forkSession) {
           if (result.sessionId) {
+            if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
             switchSession(
               asSessionId(result.sessionId),
               result.fullPath ? dirname(result.fullPath) : null,
@@ -5471,6 +5474,7 @@ async function loadInitialMessages(
 
       // Reuse the resumed session's ID
       if (!options.forkSession && result.sessionId) {
+        if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
         switchSession(
           asSessionId(result.sessionId),
           result.fullPath ? dirname(result.fullPath) : null,

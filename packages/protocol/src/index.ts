@@ -67,3 +67,5 @@ export {
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
 } from './boxGptWebModels.js'
+
+export * from './ccbTranscriptRestore.js'

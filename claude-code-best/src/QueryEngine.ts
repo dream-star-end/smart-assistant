@@ -488,7 +488,8 @@ export class QueryEngine {
       } else {
         await transcriptPromise
         if (
-          isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+          (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
           isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
         ) {
           await flushSessionStorage()
@@ -644,7 +645,8 @@ export class QueryEngine {
       if (persistSession) {
         await recordTranscript(messages)
         if (
-          isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+          (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
           isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
         ) {
           await flushSessionStorage()
@@ -910,7 +912,8 @@ export class QueryEngine {
           else if (attachment.type === 'max_turns_reached') {
             if (persistSession) {
               if (
-                isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+                (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
                 isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
               ) {
                 await flushSessionStorage()
@@ -1047,7 +1050,8 @@ export class QueryEngine {
       if (maxBudgetUsd !== undefined && getTotalCost() >= maxBudgetUsd) {
         if (persistSession) {
           if (
-            isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+            (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
             isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
           ) {
             await flushSessionStorage()
@@ -1092,7 +1096,8 @@ export class QueryEngine {
         if (callsThisQuery >= maxRetries) {
           if (persistSession) {
             if (
-              isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+              (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
               isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
             ) {
               await flushSessionStorage()
@@ -1152,7 +1157,8 @@ export class QueryEngine {
     // result message, so any unflushed writes would be lost.
     if (persistSession) {
       if (
-        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH) ||
+        (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ||
+        isEnvTruthy(process.env.CLAUDE_CODE_EAGER_FLUSH)) ||
         isEnvTruthy(process.env.CLAUDE_CODE_IS_COWORK)
       ) {
         await flushSessionStorage()

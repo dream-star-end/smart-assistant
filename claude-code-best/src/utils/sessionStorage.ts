@@ -1,3 +1,5 @@
+import { transcriptNeedsRecovery, readNativeTranscriptArchive, recoverNativeTranscript } from './nativeTranscriptRecovery.js'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { feature } from 'bun:bundle'
 import type { UUID } from 'crypto'
 import type { Dirent } from 'fs'
@@ -9,6 +11,7 @@ import {
   appendFile as fsAppendFile,
   open as fsOpen,
   mkdir,
+  lstat,
   readdir,
   readFile,
   stat,
@@ -95,6 +98,7 @@ import { getSettings_DEPRECATED } from './settings/settings.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
 import { validateUuid } from './uuid.js'
+import { replaceSessionFile, readSessionFile, withSessionFile, flushSessionFileIo, type SessionFileScope, type SessionReadHandle, SessionFileIntegrityError } from './sessionFileIo.js'
 
 // Cache MACRO.VERSION at module level to work around bun --define bug in async contexts
 // See: https://github.com/oven-sh/bun/issues/26168
@@ -458,8 +462,10 @@ function getProject(): Project {
         await project?.flush()
         try {
           project?.reAppendSessionMetadata()
-        } catch {
-          // Best-effort — don't let metadata re-append crash the cleanup
+          await project?.flush()
+        } catch (error) {
+          if (managedTranscriptIo()) throw error
+          // Legacy metadata-only cleanup remains best effort.
         }
       })
       cleanupRegistered = true
@@ -483,6 +489,9 @@ export function resetProjectFlushStateForTesting(): void {
  */
 export function resetProjectForTesting(): void {
   project = null
+  transcriptProducerFailure = undefined
+  sessionTaskTails.clear()
+  transcriptProducers.clear()
 }
 
 export function setSessionFileForTesting(path: string): void {
@@ -535,6 +544,24 @@ const REMOTE_FLUSH_INTERVAL_MS = 10
 // in long-running daemon / swarm sessions that spawn many sub-agents.
 const MAX_CACHED_SESSION_FILES = 200
 
+const managedTranscriptIo = (): boolean => process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1'
+function transcriptIoScope(filePath: string, hint?: string): SessionFileScope {
+  const parts = filePath.split(/[\\/]/)
+  const subagents = parts.lastIndexOf('subagents')
+  const sessionId = hint ?? (subagents > 0 ? parts[subagents - 1]! : basename(filePath, '.jsonl'))
+  return { projectsDir: getProjectsDir(), sessionId, requireKernelLock: true }
+}
+
+
+type SessionPatch = (offset: number, target: Buffer) => Promise<void>
+type SessionMutation = (file: SessionReadHandle, patch: SessionPatch) => Promise<void>
+type QueuedSessionWrite = {
+  filePath: string
+  scope?: SessionFileScope
+  resolve: () => void
+  reject: (error: unknown) => void
+} & ({ kind: 'entry'; entry: Entry | Record<string, unknown> } | { kind: 'mutation'; apply: SessionMutation })
+
 class Project {
   // Minimal cache for current session only (not all sessions)
   currentSessionTag: string | undefined
@@ -563,14 +590,12 @@ class Project {
   private internalSubagentEventReader: InternalEventReader | null = null
   private pendingWriteCount: number = 0
   private flushResolvers: Array<() => void> = []
-  // Per-file write queues. Each entry carries a resolve callback so
-  // callers of enqueueWrite can optionally await their specific write.
-  private writeQueues = new Map<
-    string,
-    Array<{ entry: Entry; resolve: () => void }>
-  >()
+  // One ordered queue per native artifact, including cwd hard-link aliases.
+  private writeQueues = new Map<string, QueuedSessionWrite[]>()
+  private writeErrors = new Map<string, Error[]>()
+  private metadataCapture: Entry[] | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
-  private activeDrain: Promise<void> | null = null
+  private activeDrains = new Map<string, Promise<void>>()
   private FLUSH_INTERVAL_MS = 100
   private readonly MAX_CHUNK_BYTES = 100 * 1024 * 1024
 
@@ -582,8 +607,10 @@ class Project {
     this.flushResolvers = []
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = null
-    this.activeDrain = null
+    this.activeDrains = new Map()
     this.writeQueues = new Map()
+    this.writeErrors = new Map()
+    this.metadataCapture = null
     this.existingSessionFiles = new Map()
   }
 
@@ -602,101 +629,164 @@ class Project {
     }
   }
 
-  private async trackWrite<T>(fn: () => Promise<T>): Promise<T> {
+  private async trackWrite<T>(fn: () => Promise<T>, filePath?: string): Promise<T> {
     this.incrementPendingWrites()
     try {
-      return await fn()
+      return await serializeTranscriptTask(fn, filePath ? transcriptIoScope(filePath).sessionId : undefined)
     } finally {
       this.decrementPendingWrites()
     }
   }
 
-  private enqueueWrite(filePath: string, entry: Entry): Promise<void> {
-    return new Promise<void>(resolve => {
-      let queue = this.writeQueues.get(filePath)
-      if (!queue) {
-        queue = []
-        this.writeQueues.set(filePath, queue)
-      }
-      // Drop oldest entries when queue exceeds limit to prevent unbounded memory growth
-      if (queue.length >= 1000) {
-        const dropped = queue.splice(0, queue.length - 999)
-        for (const d of dropped) {
-          d.resolve()
-        }
-      }
-      queue.push({ entry, resolve })
+  private writeQueueIdentity(filePath: string, entry?: Entry | Record<string, unknown>): { key: string; scope?: SessionFileScope } {
+    if (!managedTranscriptIo()) return { key: filePath }
+    const hint = entry && 'sessionId' in entry && typeof entry.sessionId === 'string' ? entry.sessionId : undefined
+    const scope = transcriptIoScope(filePath)
+    if (hint && hint !== scope.sessionId) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SCOPE_INVALID')
+    const artifact = filePath.split(/[\\/]/).includes('subagents') ? basename(filePath) : 'main'
+    return { key: JSON.stringify([scope.projectsDir, scope.sessionId, artifact]), scope }
+  }
+
+  private rememberWriteFailure(error: unknown, key: string): Error {
+    const e = error instanceof Error ? error : new SessionFileIntegrityError('CCB_TRANSCRIPT_IO_FAILED')
+    const errors = this.writeErrors.get(key) ?? []
+    if (!errors.includes(e)) errors.push(e)
+    this.writeErrors.set(key, errors)
+    return e
+  }
+
+  private enqueueWrite(filePath: string, entry: Entry | Record<string, unknown>): Promise<void> {
+    const { key, scope } = this.writeQueueIdentity(filePath, entry)
+    return new Promise<void>((resolve, reject) => {
+      let queue = this.writeQueues.get(key)
+      if (!queue) { queue = []; this.writeQueues.set(key, queue) }
+      queue.push({ kind: 'entry', filePath, scope, entry, resolve, reject })
       this.scheduleDrain()
     })
   }
 
-  private scheduleDrain(): void {
-    if (this.flushTimer) {
-      return
-    }
-    this.flushTimer = setTimeout(async () => {
-      this.flushTimer = null
-      this.activeDrain = this.drainWriteQueue()
-      await this.activeDrain
-      this.activeDrain = null
-      // If more items arrived during drain, schedule again
-      if (this.writeQueues.size > 0) {
+  private async admitWrite(filePath: string, entry: Entry | Record<string, unknown>): Promise<void> {
+    const { key } = this.writeQueueIdentity(filePath, entry)
+    while ((this.writeQueues.get(key)?.length ?? 0) >= 1000) await this.driveWriteQueues(key)
+    // Admission can return before the batch commits; insertMessageChain and
+    // public flush await the actual commit. Errors are retained until observed.
+    void this.enqueueWrite(filePath, entry).catch(error => { this.rememberWriteFailure(error, key) })
+  }
+
+  async appendExternalEntry(filePath: string, entry: Record<string, unknown>): Promise<void> {
+    return this.trackWrite(async () => {
+      const { key } = this.writeQueueIdentity(filePath, entry)
+      await this.admitWrite(filePath, entry)
+      await this.flushQueuedWrites(key)
+    }, filePath)
+  }
+
+  private async enqueueFileMutation(filePath: string, apply: SessionMutation): Promise<void> {
+    return this.trackWrite(async () => {
+      const { key, scope } = this.writeQueueIdentity(filePath)
+      while ((this.writeQueues.get(key)?.length ?? 0) >= 1000) await this.driveWriteQueues(key)
+      return new Promise<void>((resolve, reject) => {
+        let queue = this.writeQueues.get(key)
+        if (!queue) { queue = []; this.writeQueues.set(key, queue) }
+        queue.push({ kind: 'mutation', filePath, scope, apply, resolve, reject })
         this.scheduleDrain()
-      }
+      })
+    }, filePath)
+  }
+
+  private scheduleDrain(): void {
+    if (this.flushTimer) return
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null
+      // Each drain retains its own failure for producers and public flush.
+      void this.driveWriteQueues().catch(() => {})
     }, this.FLUSH_INTERVAL_MS)
   }
 
-  private async appendToFile(filePath: string, data: string): Promise<void> {
-    try {
-      await fsAppendFile(filePath, data, { mode: 0o600 })
-    } catch {
-      // Directory may not exist — some NFS-like filesystems return
-      // unexpected error codes, so don't discriminate on code.
-      await mkdir(dirname(filePath), { recursive: true, mode: 0o700 })
-      await fsAppendFile(filePath, data, { mode: 0o600 })
+  private async driveWriteQueues(onlyKey?: string): Promise<void> {
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null }
+    const keys = onlyKey ? [onlyKey] : [...new Set([...this.writeQueues.keys(), ...this.activeDrains.keys()])]
+    const pending = keys.map(key => {
+      const active = this.activeDrains.get(key)
+      if (active) return active
+      if (!this.writeQueues.get(key)?.length) return Promise.resolve()
+      const drain = this.drainWriteQueue(key)
+      this.activeDrains.set(key, drain)
+      const clear = () => { if (this.activeDrains.get(key) === drain) this.activeDrains.delete(key) }
+      void drain.then(clear, clear)
+      return drain
+    })
+    const settled = await Promise.allSettled(pending)
+    const failed = settled.find(result => result.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
+  }
+
+  private async flushQueuedWrites(onlyKey?: string): Promise<void> {
+    let failure: unknown
+    try { await this.driveWriteQueues(onlyKey) } catch (error) { failure = error }
+    if (!onlyKey) {
+      try { await flushSessionFileIo() } catch (error) { failure ??= error }
+    }
+    const errors = onlyKey ? this.writeErrors.get(onlyKey) ?? [] : [...this.writeErrors.values()].flat()
+    if (failure || errors.length) {
+      const error = errors[0] ?? (failure instanceof Error ? failure : new SessionFileIntegrityError('CCB_TRANSCRIPT_IO_FAILED'))
+      if (!managedTranscriptIo()) { if (onlyKey) this.writeErrors.delete(onlyKey); else this.writeErrors.clear() }
+      clearSessionMessagesCache()
+      throw error
     }
   }
 
-  private async drainWriteQueue(): Promise<void> {
-    for (const [filePath, queue] of this.writeQueues) {
-      if (queue.length === 0) {
-        continue
-      }
-      const batch = queue.splice(0)
-
-      let content = ''
-      const resolvers: Array<() => void> = []
-
-      for (const { entry, resolve } of batch) {
-        const line = jsonStringify(entry) + '\n'
-
-        if (content.length + line.length >= this.MAX_CHUNK_BYTES) {
-          // Flush chunk and resolve its entries before starting a new one
-          await this.appendToFile(filePath, content)
-          for (const r of resolvers) {
-            r()
-          }
-          resolvers.length = 0
-          content = ''
+  private async appendToFile(filePath: string, data: string, scope?: SessionFileScope, aliases: readonly string[] = []): Promise<void> {
+    if (managedTranscriptIo()) {
+      await withSessionFile(filePath, scope ?? transcriptIoScope(filePath), true, async (file, patch) => {
+        const identity = await file.stat()
+        for (const alias of aliases) {
+          try {
+            const other = await lstat(alias)
+            if (other.isSymbolicLink() || other.dev !== identity.dev || other.ino !== identity.ino) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED')
+          } catch (error) { if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error }
         }
-
-        content += line
-        resolvers.push(resolve)
-      }
-
-      if (content.length > 0) {
-        await this.appendToFile(filePath, content)
-        for (const r of resolvers) {
-          r()
-        }
-      }
+        await patch(identity.size, Buffer.from(data))
+      })
+      return
     }
+    try { await fsAppendFile(filePath, data, { mode: 0o600 }) }
+    catch { await mkdir(dirname(filePath), { recursive: true, mode: 0o700 }); await fsAppendFile(filePath, data, { mode: 0o600 }) }
+  }
 
-    // Clean up empty queues
-    for (const [filePath, queue] of this.writeQueues) {
-      if (queue.length === 0) {
-        this.writeQueues.delete(filePath)
+  private async drainWriteQueue(key: string): Promise<void> {
+    for (;;) {
+      const queue = this.writeQueues.get(key)
+      if (!queue?.length) { this.writeQueues.delete(key); return }
+      const batch = queue.splice(0)
+      try {
+        for (let index = 0; index < batch.length;) {
+          const first = batch[index]!
+          if (first.kind === 'mutation') {
+            await withSessionFile(first.filePath, first.scope ?? transcriptIoScope(first.filePath), true, first.apply)
+            first.resolve(); index++; continue
+          }
+          let content = ''; let bytes = 0
+          const chunk: QueuedSessionWrite[] = []
+          while (index < batch.length) {
+            const item = batch[index]!
+            if (item.kind !== 'entry') break
+            const line = jsonStringify(item.entry) + '\n'
+            const size = Buffer.byteLength(line)
+            if (content && bytes + size > this.MAX_CHUNK_BYTES) break
+            content += line; bytes += size; chunk.push(item); index++
+          }
+          await this.appendToFile(first.filePath, content, first.scope, [...new Set(chunk.map(item => item.filePath))])
+          for (const item of chunk) item.resolve()
+        }
+      } catch (error) {
+        const failure = this.rememberWriteFailure(error, key)
+        for (const item of [...batch, ...queue.splice(0)]) item.reject(failure)
+        this.writeQueues.delete(key)
+        clearSessionMessagesCache()
+        throw failure
       }
+      if (!queue.length) this.writeQueues.delete(key)
     }
   }
 
@@ -733,15 +823,66 @@ class Project {
    * the SDK cannot touch (last-prompt, agent-*, mode, pr-link) have no
    * external-writer concern — their caches are authoritative.
    */
+  private appendCachedMetadata(filePath: string, entry: Entry): void {
+    if (this.metadataCapture) { this.metadataCapture.push(structuredClone(entry)); return }
+    appendEntryToFile(filePath, entry)
+  }
+
   reAppendSessionMetadata(skipTitleRefresh = false): void {
     if (!this.sessionFile) return
     const sessionId = getSessionId() as UUID
     if (!sessionId) return
+    if (managedTranscriptIo() && this.metadataCapture === null) {
+      const filePath = this.sessionFile
+      this.metadataCapture = []
+      let entries: Entry[]
+      try {
+        this.reAppendSessionMetadata(true)
+        entries = this.metadataCapture
+      } finally { this.metadataCapture = null }
+      const snapshot = entries
+      void this.enqueueFileMutation(filePath, async (file, patch) => {
+        const size = (await file.stat()).size
+        const length = Math.min(size, LITE_READ_BUF_SIZE)
+        const bytes = Buffer.alloc(length)
+        let offset = 0
+        while (offset < length) {
+          const read = await file.read(bytes, offset, length - offset, size - length + offset)
+          if (read.bytesRead <= 0) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SHORT_READ')
+          offset += read.bytesRead
+        }
+        const lines = bytes.toString('utf8').split('\n')
+        let current = snapshot.map(entry => structuredClone(entry))
+        const refresh = (type: 'custom-title' | 'tag', key: 'customTitle' | 'tag'): string | undefined => {
+          const line = lines.findLast(value => value.startsWith(`{"type":"${type}"`))
+          if (!line) return undefined
+          const value = extractLastJsonStringField(line, key)
+          if (value === undefined) return undefined
+          const old = current.findIndex(entry => entry.type === type)
+          current = current.filter(entry => entry.type !== type)
+          if (value) {
+            const entry = type === 'custom-title'
+              ? { type: 'custom-title' as const, customTitle: value, sessionId }
+              : { type: 'tag' as const, tag: value, sessionId }
+            current.splice(old < 0 ? 0 : old, 0, entry)
+          }
+          return value
+        }
+        const title = skipTitleRefresh ? undefined : refresh('custom-title', 'customTitle')
+        const tag = refresh('tag', 'tag')
+        if (this.sessionFile === filePath && getSessionId() === sessionId) {
+          if (title !== undefined) this.currentSessionTitle = title || undefined
+          if (tag !== undefined) this.currentSessionTag = tag || undefined
+        }
+        if (current.length) await patch(size, Buffer.from(current.map(entry => jsonStringify(entry) + '\n').join('')))
+      }).catch(error => { this.rememberWriteFailure(error, this.writeQueueIdentity(filePath).key) })
+      return
+    }
 
     // One sync tail read to refresh SDK-mutable fields. Same
     // LITE_READ_BUF_SIZE window readLiteMetadata uses. Empty string on
     // failure → extract returns null → cache is the only source of truth.
-    const tail = readFileTailSync(this.sessionFile)
+    const tail = this.metadataCapture ? '' : readFileTailSync(this.sessionFile)
 
     // Absorb any fresher SDK-written title/tag into our cache. If the SDK
     // wrote while we had the session open, our cache is stale — the tail
@@ -780,7 +921,7 @@ class Project {
     // user was most recently doing. Written first so customTitle/tag/etc
     // land closer to EOF (they're the more critical fields for tail reads).
     if (this.currentSessionLastPrompt) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'last-prompt',
         lastPrompt: this.currentSessionLastPrompt,
         sessionId,
@@ -789,49 +930,49 @@ class Project {
     // Unconditional: cache was refreshed from tail above; re-append keeps
     // the entry at EOF so compaction-pushed content doesn't evict it.
     if (this.currentSessionTitle) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'custom-title',
         customTitle: this.currentSessionTitle,
         sessionId,
       })
     }
     if (this.currentSessionTag) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'tag',
         tag: this.currentSessionTag,
         sessionId,
       })
     }
     if (this.currentSessionAgentName) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'agent-name',
         agentName: this.currentSessionAgentName,
         sessionId,
       })
     }
     if (this.currentSessionAgentColor) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'agent-color',
         agentColor: this.currentSessionAgentColor,
         sessionId,
       })
     }
     if (this.currentSessionAgentSetting) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'agent-setting',
         agentSetting: this.currentSessionAgentSetting,
         sessionId,
       })
     }
     if (this.currentSessionMode) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'mode',
         mode: this.currentSessionMode,
         sessionId,
       })
     }
     if (this.currentSessionGoal) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'goal',
         sessionId,
         state: this.currentSessionGoal,
@@ -839,7 +980,7 @@ class Project {
       })
     }
     if (this.currentSessionWorktree !== undefined) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'worktree-state',
         worktreeSession: this.currentSessionWorktree,
         sessionId,
@@ -850,7 +991,7 @@ class Project {
       this.currentSessionPrUrl &&
       this.currentSessionPrRepository
     ) {
-      appendEntryToFile(this.sessionFile, {
+      this.appendCachedMetadata(this.sessionFile, {
         type: 'pr-link',
         sessionId,
         prNumber: this.currentSessionPrNumber,
@@ -862,25 +1003,9 @@ class Project {
   }
 
   async flush(): Promise<void> {
-    // Cancel pending timer
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer)
-      this.flushTimer = null
-    }
-    // Wait for any in-flight drain to finish
-    if (this.activeDrain) {
-      await this.activeDrain
-    }
-    // Drain anything remaining in the queues
-    await this.drainWriteQueue()
-
-    // Wait for non-queue tracked operations (e.g. removeMessageByUuid)
-    if (this.pendingWriteCount === 0) {
-      return
-    }
-    return new Promise<void>(resolve => {
-      this.flushResolvers.push(resolve)
-    })
+    await this.flushQueuedWrites()
+    if (this.pendingWriteCount > 0) await new Promise<void>(resolve => { this.flushResolvers.push(resolve) })
+    await this.flushQueuedWrites()
   }
 
   /**
@@ -892,6 +1017,40 @@ class Project {
    * positional write + truncate instead of rewriting the whole file.
    */
   async removeMessageByUuid(targetUuid: UUID): Promise<void> {
+    if (managedTranscriptIo()) {
+      if (!this.sessionFile) return
+      const filePath = this.sessionFile
+      return this.enqueueFileMutation(filePath, async (file, patch) => {
+        const size = (await file.stat()).size
+        const bytes = Buffer.alloc(size)
+        let readOffset = 0
+        while (readOffset < size) {
+          const part = await file.read(bytes, readOffset, Math.min(65536, size - readOffset), readOffset)
+          if (!part.bytesRead) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SHORT_READ')
+          readOffset += part.bytesRead
+        }
+        let start = 0
+        let firstRemoved = -1
+        const kept: Buffer[] = []
+        while (start < bytes.length) {
+          const nl = bytes.indexOf(10, start)
+          const end = nl < 0 ? bytes.length : nl + 1
+          const line = bytes.subarray(start, end)
+          let remove = false
+          if (line.toString('utf8').trim()) {
+            let value: unknown
+            try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line)) }
+            catch { throw new SessionFileIntegrityError('CCB_TRANSCRIPT_CORRUPT') }
+            remove = !!value && typeof value === 'object' && 'uuid' in value && value.uuid === targetUuid
+          }
+          if (remove) { if (firstRemoved < 0) firstRemoved = start }
+          else if (firstRemoved >= 0) kept.push(line)
+          start = end
+        }
+        if (firstRemoved >= 0) await patch(firstRemoved, Buffer.concat(kept))
+          clearSessionMessagesCache()
+      })
+    }
     return this.trackWrite(async () => {
       if (this.sessionFile === null) return
       try {
@@ -1106,6 +1265,10 @@ class Project {
             flat.length > 200 ? flat.slice(0, 200).trim() + '…' : flat
         }
       }
+      if (managedTranscriptIo()) {
+        const target = isSidechain && agentId ? getAgentTranscriptPath(asAgentId(agentId)) : this.sessionFile
+        if (target) await this.flushQueuedWrites(this.writeQueueIdentity(target).key)
+      }
     })
   }
 
@@ -1184,46 +1347,46 @@ class Project {
     // Only load current session messages if needed
     if (entry.type === 'summary') {
       // Summaries can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'custom-title') {
       // Custom titles can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'ai-title') {
       // AI titles can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'last-prompt') {
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'task-summary') {
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'tag') {
       // Tags can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'agent-name') {
       // Agent names can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'agent-color') {
       // Agent colors can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'agent-setting') {
       // Agent settings can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'pr-link') {
       // PR links can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'file-history-snapshot') {
       // File history snapshots can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'attribution-snapshot') {
       // Attribution snapshots can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'speculation-accept') {
       // Speculation accept entries can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'mode') {
       // Mode entries can always be appended
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'worktree-state') {
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'content-replacement') {
       // Content replacement records can always be appended. Subagent records
       // go to the sidechain file (for AgentTool resume); main-thread
@@ -1231,24 +1394,24 @@ class Project {
       const targetFile = entry.agentId
         ? getAgentTranscriptPath(entry.agentId)
         : sessionFile
-      void this.enqueueWrite(targetFile, entry)
+      await this.admitWrite(targetFile, entry)
     } else if (entry.type === 'marble-origami-commit') {
       // Always append. Commit order matters for restore (later commits may
       // reference earlier commits' summary messages), so these must be
       // written in the order received and read back sequentially.
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'marble-origami-snapshot') {
       // Always append. Last-wins on restore — later entries supersede.
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'goal') {
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else if (entry.type === 'goal-cleared') {
-      void this.enqueueWrite(sessionFile, entry)
+      await this.admitWrite(sessionFile, entry)
     } else {
       const messageSet = await getSessionMessages(sessionId)
       if (entry.type === 'queue-operation') {
         // Queue operations are always appended to the session file
-        void this.enqueueWrite(sessionFile, entry)
+        await this.admitWrite(sessionFile, entry)
       } else {
         // At this point, entry must be a TranscriptMessage (user/assistant/attachment/system)
         // All other entry types have been handled above
@@ -1273,7 +1436,7 @@ class Project {
         const isNewUuid = !messageSet.has(entry.uuid)
         if (isAgentSidechain || isNewUuid) {
           // Enqueue write — appendToFile handles ENOENT by creating directories
-          void this.enqueueWrite(targetFile, entry)
+          await this.admitWrite(targetFile, entry)
 
           if (!isAgentSidechain) {
             // messageSet is main-file-authoritative. Sidechain entries go to a
@@ -1446,7 +1609,59 @@ export type TeamInfo = {
 //  - Compaction (useLogMessages): new CB/summary appear FIRST, then recorded
 //    messagesToKeep → not a prefix → not tracked → CB gets parentUuid=null
 //    (correct: truncates --continue chain at compact boundary).
-export async function recordTranscript(
+const transcriptProducers = new Set<Promise<unknown>>()
+const sessionTaskTails = new Map<string, Promise<unknown>>()
+const sessionTaskContext = new AsyncLocalStorage<{ sid: string; key: string }>()
+let transcriptProducerFailure: unknown
+function serializeTranscriptTask<T>(produce: () => Promise<T>, targetSid?: string): Promise<T> {
+  if (!managedTranscriptIo()) return produce()
+  const sid = getSessionId()
+  const key = JSON.stringify([getProjectsDir(), targetSid ?? sid])
+  const active = sessionTaskContext.getStore()
+  if (active?.key === key) {
+    if (active.sid !== sid) return Promise.reject(new SessionFileIntegrityError('CCB_TRANSCRIPT_SESSION_CHANGED'))
+    return produce()
+  }
+  const projectDir = getSessionProjectDir()
+  const originalCwd = getOriginalCwd()
+  const previous = sessionTaskTails.get(key) ?? Promise.resolve()
+  const pending = previous.catch(() => {}).then(() => {
+    if (getSessionId() !== sid || getSessionProjectDir() !== projectDir || getOriginalCwd() !== originalCwd) {
+      throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SESSION_CHANGED')
+    }
+    return sessionTaskContext.run({ sid, key }, produce)
+  })
+  sessionTaskTails.set(key, pending)
+  void pending.then(() => {
+    if (sessionTaskTails.get(key) === pending) sessionTaskTails.delete(key)
+  }, error => {
+    transcriptProducerFailure ??= error
+    if (sessionTaskTails.get(key) === pending) sessionTaskTails.delete(key)
+  })
+  return pending
+}
+function trackTranscriptProducer<T>(produce: () => Promise<T>): Promise<T> {
+  const pending = serializeTranscriptTask(produce)
+  if (!managedTranscriptIo()) return pending
+  transcriptProducers.add(pending)
+  void pending.then(() => { transcriptProducers.delete(pending) }, error => {
+    transcriptProducerFailure ??= error
+    transcriptProducers.delete(pending)
+  })
+  return pending
+}
+export function recordTranscript(
+  messages: Message[], teamInfo?: TeamInfo, startingParentUuidHint?: UUID,
+  allMessages?: readonly Message[], preserveMessageTimestamp = false,
+): Promise<UUID | null> {
+  // Freeze membership at admission, retaining object references for the
+  // existing lazy usage/stop_reason updates while streaming.
+  const slice = messages.slice()
+  const allSlice = allMessages?.slice()
+  return trackTranscriptProducer(() => recordTranscriptImpl(slice, teamInfo, startingParentUuidHint, allSlice, preserveMessageTimestamp))
+}
+
+async function recordTranscriptImpl(
   messages: Message[],
   teamInfo?: TeamInfo,
   startingParentUuidHint?: UUID,
@@ -1491,7 +1706,12 @@ export async function recordTranscript(
   return (lastRecorded?.uuid as UUID | undefined) ?? startingParentUuid ?? null
 }
 
-export async function recordSidechainTranscript(
+export function recordSidechainTranscript(...args: Parameters<typeof recordSidechainTranscriptImpl>): Promise<void> {
+  const [messages, agentId, startingParentUuid] = args
+  const slice = messages.slice()
+  return trackTranscriptProducer(() => recordSidechainTranscriptImpl(slice, agentId, startingParentUuid))
+}
+async function recordSidechainTranscriptImpl(
   messages: Message[],
   agentId?: string,
   startingParentUuid?: UUID | null,
@@ -1546,7 +1766,9 @@ export async function recordContentReplacement(
  * The new file is created lazily on the first user/assistant message.
  */
 export async function resetSessionFilePointer() {
-  getProject().resetSessionFile()
+  const current = getProject()
+  if (managedTranscriptIo() && current.sessionFile && transcriptIoScope(current.sessionFile).sessionId !== getSessionId()) clearSessionMetadata()
+  current.resetSessionFile()
 }
 
 /**
@@ -1624,13 +1846,21 @@ export async function recordContextCollapseSnapshot(snapshot: {
 }
 
 export async function flushSessionStorage(): Promise<void> {
-  await getProject().flush()
+  if (managedTranscriptIo() && sessionTaskContext.getStore()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_NESTED_FLUSH')
+  do {
+    if (managedTranscriptIo()) {
+      while (transcriptProducers.size || sessionTaskTails.size) await Promise.allSettled([...transcriptProducers, ...sessionTaskTails.values()])
+    }
+    await getProject().flush()
+  } while (managedTranscriptIo() && (transcriptProducers.size || sessionTaskTails.size))
+  if (managedTranscriptIo() && transcriptProducerFailure) throw transcriptProducerFailure
 }
 
 export async function hydrateRemoteSession(
   sessionId: string,
   ingressUrl: string,
 ): Promise<boolean> {
+  if (managedTranscriptIo()) await flushSessionStorage()
   switchSession(asSessionId(sessionId))
 
   const project = getProject()
@@ -1648,11 +1878,13 @@ export async function hydrateRemoteSession(
     // Replace local logs with remote logs. writeFile truncates, so no
     // unlink is needed; an empty remoteLogs array produces an empty file.
     const content = remoteLogs.map(e => jsonStringify(e) + '\n').join('')
-    await writeFile(sessionFile, content, { encoding: 'utf8', mode: 0o600 })
+    if (managedTranscriptIo()) { await replaceSessionFile(sessionFile, Buffer.from(content), transcriptIoScope(sessionFile, sessionId)); clearSessionMessagesCache() }
+    else await writeFile(sessionFile, content, { encoding: 'utf8', mode: 0o600 })
 
     logForDebugging(`Hydrated ${remoteLogs.length} entries from remote`)
     return remoteLogs.length > 0
   } catch (error) {
+    if (managedTranscriptIo()) throw error
     logForDebugging(`Error hydrating session from remote: ${error}`)
     logForDiagnosticsNoPII('error', 'hydrate_remote_session_fail')
     return false
@@ -1676,6 +1908,7 @@ export async function hydrateFromCCRv2InternalEvents(
   sessionId: string,
 ): Promise<boolean> {
   const startMs = Date.now()
+  if (managedTranscriptIo()) await flushSessionStorage()
   switchSession(asSessionId(sessionId))
 
   const project = getProject()
@@ -1700,7 +1933,8 @@ export async function hydrateFromCCRv2InternalEvents(
     // Write foreground transcript
     const sessionFile = getTranscriptPathForSession(sessionId)
     const fgContent = events.map(e => jsonStringify(e.payload) + '\n').join('')
-    await writeFile(sessionFile, fgContent, { encoding: 'utf8', mode: 0o600 })
+    if (managedTranscriptIo()) { await replaceSessionFile(sessionFile, Buffer.from(fgContent), transcriptIoScope(sessionFile, sessionId)); clearSessionMessagesCache() }
+    else await writeFile(sessionFile, fgContent, { encoding: 'utf8', mode: 0o600 })
 
     logForDebugging(
       `Hydrated ${events.length} foreground entries from CCR v2 internal events`,
@@ -1733,10 +1967,8 @@ export async function hydrateFromCCRv2InternalEvents(
           const agentContent = entries
             .map(p => jsonStringify(p) + '\n')
             .join('')
-          await writeFile(agentFile, agentContent, {
-            encoding: 'utf8',
-            mode: 0o600,
-          })
+          if (managedTranscriptIo()) await replaceSessionFile(agentFile, Buffer.from(agentContent), transcriptIoScope(agentFile, sessionId))
+          else await writeFile(agentFile, agentContent, { encoding: 'utf8', mode: 0o600 })
         }
 
         logForDebugging(
@@ -1752,6 +1984,7 @@ export async function hydrateFromCCRv2InternalEvents(
     })
     return events.length > 0
   } catch (error) {
+    if (managedTranscriptIo()) throw error
     // Re-throw epoch mismatch so the worker doesn't race against gracefulShutdown
     if (
       error instanceof Error &&
@@ -2022,10 +2255,7 @@ function applyPreservedSegmentRelinks(
  *
  * Mutates the Map in place.
  */
-function applySnipRemovals(messages: Map<UUID, TranscriptMessage>): void {
-  // Structural check — snipMetadata only exists on the boundary subtype.
-  // Avoids the subtype literal which is in excluded-strings.txt
-  // (HISTORY_SNIP is ant-only; the literal must not leak into external builds).
+function transcriptSnipPlan<T extends TranscriptGraphNode>(messages: Map<UUID, T>): TranscriptSnipPlan {
   type WithSnipMeta = { snipMetadata?: { removedUuids?: UUID[] } }
   const toDelete = new Set<UUID>()
   for (const entry of messages.values()) {
@@ -2033,23 +2263,19 @@ function applySnipRemovals(messages: Map<UUID, TranscriptMessage>): void {
     if (!removedUuids) continue
     for (const uuid of removedUuids) toDelete.add(uuid)
   }
-  if (toDelete.size === 0) return
-
-  // Capture each to-delete entry's own parentUuid BEFORE deleting so we can
-  // walk backward through contiguous removed ranges. Entries not in the Map
-  // (already absent, e.g. from a prior compact_boundary prune) contribute no
-  // link; the relink walk will stop at the gap and pick up null (chain-root
-  // behavior — same as if compact truncated there, which it did).
   const deletedParent = new Map<UUID, UUID | null>()
-  let removedCount = 0
   for (const uuid of toDelete) {
     const entry = messages.get(uuid)
-    if (!entry) continue
-    deletedParent.set(uuid, entry.parentUuid)
-    messages.delete(uuid)
-    removedCount++
+    if (entry) deletedParent.set(uuid, entry.parentUuid)
   }
-
+  return { toDelete, deletedParent }
+}
+function applySnipRemovals<T extends TranscriptGraphNode>(messages: Map<UUID, T>, plan = transcriptSnipPlan(messages)): void {
+  const { toDelete } = plan
+  if (toDelete.size === 0) return
+  const deletedParent = new Map(plan.deletedParent)
+  let removedCount = 0
+  for (const uuid of toDelete) if (messages.delete(uuid)) removedCount++
   // Relink survivors with dangling parentUuid. Walk backward through
   // deletedParent until we hit a UUID not in toDelete (or null). Path
   // compression: after resolving, seed the map with the resolved link so
@@ -2079,7 +2305,7 @@ function applySnipRemovals(messages: Map<UUID, TranscriptMessage>): void {
     removed_count: removedCount,
     relinked_count: relinkedCount,
   })
-}
+ }
 
 /**
  * O(n) single-pass: find the message with the latest timestamp matching a predicate.
@@ -2401,12 +2627,14 @@ export async function loadTranscriptFromFile(
   }
 
   // json log files
+  // JSON imports are user-selected snapshots, not native JSONL artifacts.
   const content = await readFile(filePath, { encoding: 'utf-8' })
   let parsed: unknown
 
   try {
     parsed = jsonParse(content)
   } catch (error) {
+    if (managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_IMPORT_INVALID')
     throw new Error(`Invalid JSON in transcript file: ${error}`)
   }
 
@@ -2614,10 +2842,15 @@ export async function fetchLogs(limit?: number): Promise<LogOption[]> {
  * Append an entry to a session file. Creates the parent dir if missing.
  */
 /* eslint-disable custom-rules/no-sync-fs -- sync callers (exit cleanup, materialize) */
-function appendEntryToFile(
+export function appendEntryToFile(
   fullPath: string,
   entry: Record<string, unknown>,
-): void {
+): void | Promise<void> {
+  if (managedTranscriptIo()) {
+    const write = getProject().appendExternalEntry(fullPath, entry)
+    void write.catch(() => {}) // flush/producer already records and reports this failure.
+    return write
+  }
   const fs = getFsImplementation()
   const line = jsonStringify(entry) + '\n'
   try {
@@ -2667,7 +2900,7 @@ export async function saveCustomTitle(
 ) {
   // Fall back to computed path if fullPath is not provided
   const resolvedPath = fullPath ?? getTranscriptPathForSession(sessionId)
-  appendEntryToFile(resolvedPath, {
+  await appendEntryToFile(resolvedPath, {
     type: 'custom-title',
     customTitle,
     sessionId,
@@ -2735,7 +2968,7 @@ export function saveTaskSummary(sessionId: UUID, summary: string): void {
 export async function saveTag(sessionId: UUID, tag: string, fullPath?: string) {
   // Fall back to computed path if fullPath is not provided
   const resolvedPath = fullPath ?? getTranscriptPathForSession(sessionId)
-  appendEntryToFile(resolvedPath, { type: 'tag', tag, sessionId })
+  await appendEntryToFile(resolvedPath, { type: 'tag', tag, sessionId })
   // Cache for current session only (for immediate visibility)
   if (sessionId === getSessionId()) {
     getProject().currentSessionTag = tag
@@ -2797,7 +3030,7 @@ export async function linkSessionToPR(
   fullPath?: string,
 ): Promise<void> {
   const resolvedPath = fullPath ?? getTranscriptPathForSession(sessionId)
-  appendEntryToFile(resolvedPath, {
+  await appendEntryToFile(resolvedPath, {
     type: 'pr-link',
     sessionId,
     prNumber,
@@ -2913,7 +3146,7 @@ export async function saveAgentName(
   source: 'user' | 'auto' = 'user',
 ) {
   const resolvedPath = fullPath ?? getTranscriptPathForSession(sessionId)
-  appendEntryToFile(resolvedPath, { type: 'agent-name', agentName, sessionId })
+  await appendEntryToFile(resolvedPath, { type: 'agent-name', agentName, sessionId })
   // Cache for current session only (for immediate visibility)
   if (sessionId === getSessionId()) {
     getProject().currentSessionAgentName = agentName
@@ -2931,7 +3164,7 @@ export async function saveAgentColor(
   fullPath?: string,
 ) {
   const resolvedPath = fullPath ?? getTranscriptPathForSession(sessionId)
-  appendEntryToFile(resolvedPath, {
+  await appendEntryToFile(resolvedPath, {
     type: 'agent-color',
     agentColor,
     sessionId,
@@ -3147,8 +3380,9 @@ export async function loadFullLog(log: LogOption): Promise<LogOption> {
           ? contextCollapseSnapshot
           : undefined,
     }
-  } catch {
-    // If loading fails, return the original log
+  } catch (error) {
+    if (managedTranscriptIo()) throw error
+    // Legacy callers keep their existing unreadable-log behavior.
     return log
   }
 }
@@ -3254,14 +3488,39 @@ function resolveMetadataBuf(
  * Fast path: if a chunk contains zero markers (the common case — metadata entries
  * are <50 per session), the entire chunk is skipped without line splitting.
  */
+async function readTranscriptHandle(file: SessionReadHandle): Promise<Buffer> {
+  const { size } = await file.stat()
+  const bytes = Buffer.alloc(size)
+  let position = 0
+  while (position < size) {
+    const { bytesRead } = await file.read(bytes, position, Math.min(65536, size - position), position)
+    if (bytesRead === 0) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SHORT_READ')
+    position += bytesRead
+  }
+  return bytes
+}
+
 async function scanPreBoundaryMetadata(
   filePath: string,
   endOffset: number,
+  verifiedHandle?: SessionReadHandle,
 ): Promise<string[]> {
   const { createReadStream } = await import('fs')
   const NEWLINE = 0x0a
 
-  const stream = createReadStream(filePath, { end: endOffset - 1 })
+  async function* readVerifiedChunks(file: SessionReadHandle): AsyncGenerator<Buffer> {
+    let position = 0
+    while (position < endOffset) {
+      const chunk = Buffer.alloc(Math.min(65536, endOffset - position))
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, position)
+      if (bytesRead === 0) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_SHORT_READ')
+      position += bytesRead
+      yield chunk.subarray(0, bytesRead)
+    }
+  }
+  const stream = verifiedHandle
+    ? readVerifiedChunks(verifiedHandle)
+    : createReadStream(filePath, { end: endOffset - 1 })
   const metadataLines: string[] = []
   let carry: Buffer | null = null
 
@@ -3403,167 +3662,179 @@ function pickDepthOneUuidCandidate(
   return candidates.at(-1)!
 }
 
-function walkChainBeforeParse(buf: Buffer): Buffer {
-  const NEWLINE = 0x0a
-  const OPEN_BRACE = 0x7b
-  const QUOTE = 0x22
-  const PARENT_PREFIX = Buffer.from('{"parentUuid":')
-  const UUID_KEY = Buffer.from('"uuid":"')
-  const SIDECHAIN_TRUE = Buffer.from('"isSidechain":true')
-  const UUID_LEN = 36
-  const TS_SUFFIX = Buffer.from('","timestamp":"')
-  const TS_SUFFIX_LEN = TS_SUFFIX.length
-  const PREFIX_LEN = PARENT_PREFIX.length
-  const KEY_LEN = UUID_KEY.length
-
-  // Stride-3 flat index of transcript messages: [lineStart, lineEnd, parentStart].
-  // parentStart is the byte offset of the parent uuid's first char, or -1 for null.
-  // Metadata lines (summary, mode, file-history-snapshot, etc.) go in metaRanges
-  // unfiltered - they lack the parentUuid prefix and downstream needs all of them.
-  const msgIdx: number[] = []
-  const metaRanges: number[] = []
-  const uuidToSlot = new Map<string, number>()
-
-  let pos = 0
-  const len = buf.length
-  while (pos < len) {
-    const nl = buf.indexOf(NEWLINE, pos)
-    const lineEnd = nl === -1 ? len : nl + 1
-    if (
-      lineEnd - pos > PREFIX_LEN &&
-      buf[pos] === OPEN_BRACE &&
-      buf.compare(PARENT_PREFIX, 0, PREFIX_LEN, pos, pos + PREFIX_LEN) === 0
-    ) {
-      // `{"parentUuid":null,` or `{"parentUuid":"<36 chars>",`
-      const parentStart =
-        buf[pos + PREFIX_LEN] === QUOTE ? pos + PREFIX_LEN + 1 : -1
-      // The top-level uuid is immediately followed by `","timestamp":"` in
-      // user/assistant/attachment entries (the create* helpers put them
-      // adjacent; both always defined). But the suffix is NOT unique:
-      //   - agent_progress entries carry a nested Message in data.message,
-      //     serialized BEFORE top-level uuid — that inner Message has its
-      //     own uuid,timestamp adjacent, so its bytes also satisfy the
-      //     suffix check.
-      //   - mcpMeta/toolUseResult come AFTER top-level uuid and hold
-      //     server-controlled Record<string,unknown> — a server returning
-      //     {uuid:"<36>",timestamp:"..."} would also match.
-      // Collect all suffix matches; a single one is unambiguous (common
-      // case), multiple need a brace-depth check to pick the one at
-      // JSON nesting depth 1. Entries with NO suffix match (some progress
-      // variants put timestamp BEFORE uuid → `"uuid":"<36>"}` at EOL)
-      // have only one `"uuid":"` and the first-match fallback is sound.
-      let firstAny = -1
-      let suffix0 = -1
-      let suffixN: number[] | undefined
-      let from = pos
-      for (;;) {
-        const next = buf.indexOf(UUID_KEY, from)
-        if (next < 0 || next >= lineEnd) break
-        if (firstAny < 0) firstAny = next
-        const after = next + KEY_LEN + UUID_LEN
-        if (
-          after + TS_SUFFIX_LEN <= lineEnd &&
-          buf.compare(
-            TS_SUFFIX,
-            0,
-            TS_SUFFIX_LEN,
-            after,
-            after + TS_SUFFIX_LEN,
-          ) === 0
-        ) {
-          if (suffix0 < 0) suffix0 = next
-          else (suffixN ??= [suffix0]).push(next)
-        }
-        from = next + KEY_LEN
-      }
-      const uk = suffixN
-        ? pickDepthOneUuidCandidate(buf, pos, suffixN)
-        : suffix0 >= 0
-          ? suffix0
-          : firstAny
-      if (uk >= 0) {
-        const uuidStart = uk + KEY_LEN
-        // UUIDs are pure ASCII so latin1 avoids UTF-8 decode overhead.
-        const uuid = buf.toString('latin1', uuidStart, uuidStart + UUID_LEN)
-        uuidToSlot.set(uuid, msgIdx.length)
-        msgIdx.push(pos, lineEnd, parentStart)
-      } else {
-        metaRanges.push(pos, lineEnd)
-      }
-    } else {
-      metaRanges.push(pos, lineEnd)
-    }
-    pos = lineEnd
-  }
-
-  // Leaf = last non-sidechain entry. isSidechain is the 2nd or 3rd key
-  // (after parentUuid, maybe logicalParentUuid) so indexOf from lineStart
-  // finds it within a few dozen bytes when present; when absent it spills
-  // into the next line, caught by the bounds check.
-  let leafSlot = -1
-  for (let i = msgIdx.length - 3; i >= 0; i -= 3) {
-    const sc = buf.indexOf(SIDECHAIN_TRUE, msgIdx[i]!)
-    if (sc === -1 || sc >= msgIdx[i + 1]!) {
-      leafSlot = i
-      break
-    }
-  }
-  if (leafSlot < 0) return buf
-
-  // Walk parentUuid to root. Collect kept-message line starts and sum their
-  // byte lengths so we can decide whether the concat is worth it. A dangling
-  // parent (uuid not in file) is the normal termination for forked sessions
-  // and post-boundary chains -- same semantics as buildConversationChain.
-  // Correctness against index poisoning rests on the timestamp suffix check
-  // above: a nested `"uuid":"` match without the suffix never becomes uk.
-  const seen = new Set<number>()
-  const chain = new Set<number>()
-  let chainBytes = 0
-  let slot: number | undefined = leafSlot
-  while (slot !== undefined) {
-    if (seen.has(slot)) break
-    seen.add(slot)
-    chain.add(msgIdx[slot]!)
-    chainBytes += msgIdx[slot + 1]! - msgIdx[slot]!
-    const parentStart = msgIdx[slot + 2]!
-    if (parentStart < 0) break
-    const parent = buf.toString('latin1', parentStart, parentStart + UUID_LEN)
-    slot = uuidToSlot.get(parent)
-  }
-
-  // parseJSONL cost scales with bytes, not entry count. A session can have
-  // thousands of dead entries by count but only single-digit-% of bytes if
-  // the dead branches are short turns and the live chain holds the fat
-  // assistant responses (measured: 107 MB session, 69% dead entries, 30%
-  // dead bytes - index+concat overhead exceeded parse savings). Gate on
-  // bytes: only stitch if we would drop at least half the buffer. Metadata
-  // is tiny so len - chainBytes approximates dead bytes closely enough.
-  // Near break-even the concat memcpy (copying chainBytes into a fresh
-  // allocation) dominates, so a conservative 50% gate stays safely on the
-  // winning side.
-  if (len - chainBytes < len >> 1) return buf
-
-  // Merge chain entries with metadata in original file order. Both msgIdx and
-  // metaRanges are already sorted by offset; interleave them into subarray
-  // views and concat once.
-  const parts: Buffer[] = []
-  let m = 0
-  for (let i = 0; i < msgIdx.length; i += 3) {
-    const start = msgIdx[i]!
-    while (m < metaRanges.length && metaRanges[m]! < start) {
-      parts.push(buf.subarray(metaRanges[m]!, metaRanges[m + 1]!))
-      m += 2
-    }
-    if (chain.has(start)) {
-      parts.push(buf.subarray(start, msgIdx[i + 1]!))
-    }
-  }
-  while (m < metaRanges.length) {
-    parts.push(buf.subarray(metaRanges[m]!, metaRanges[m + 1]!))
-    m += 2
-  }
-  return Buffer.concat(parts)
+interface TranscriptGraphNode {
+  uuid: UUID
+  parentUuid: UUID | null
+  timestamp: string
+  type: TranscriptMessage['type']
+  isSidechain?: boolean
 }
+interface TranscriptSnipPlan {
+  toDelete: Set<UUID>
+  deletedParent: Map<UUID, UUID | null>
+}
+function computeTranscriptLeafUuids<T extends TranscriptGraphNode>(messages: Map<UUID, T>, prune: boolean, reportCycles = true): Set<UUID> {
+  const allMessages = [...messages.values()]
+
+  // Standard leaf computation using parent relationships
+  const parentUuids = new Set(
+    allMessages
+      .map(msg => msg.parentUuid)
+      .filter((uuid): uuid is UUID => uuid !== null),
+  )
+
+  // Find all terminal messages (messages with no children)
+  const terminalMessages = allMessages.filter(msg => !parentUuids.has(msg.uuid))
+
+  const leafUuids = new Set<UUID>()
+  let hasCycle = false
+
+  if (prune) {
+    // Build a set of UUIDs that have user/assistant children
+    // (these are mid-conversation nodes, not dead ends)
+    const hasUserAssistantChild = new Set<UUID>()
+    for (const msg of allMessages) {
+      if (msg.parentUuid && (msg.type === 'user' || msg.type === 'assistant')) {
+        hasUserAssistantChild.add(msg.parentUuid)
+      }
+    }
+
+    // For each terminal message, walk back to find the nearest user/assistant ancestor.
+    // Skip ancestors that already have user/assistant children - those are mid-conversation
+    // nodes where the conversation continued (e.g., an assistant tool_use message whose
+    // progress child is terminal, but whose tool_result child continues the conversation).
+    for (const terminal of terminalMessages) {
+      const seen = new Set<UUID>()
+      let current: T | undefined = terminal
+      while (current) {
+        if (seen.has(current.uuid)) {
+          hasCycle = true
+          break
+        }
+        seen.add(current.uuid)
+        if (current.type === 'user' || current.type === 'assistant') {
+          if (!hasUserAssistantChild.has(current.uuid)) {
+            leafUuids.add(current.uuid)
+          }
+          break
+        }
+        current = current.parentUuid
+          ? messages.get(current.parentUuid)
+          : undefined
+      }
+    }
+  } else {
+    // Original leaf computation: walk back from terminal messages to find
+    // the nearest user/assistant ancestor unconditionally
+    for (const terminal of terminalMessages) {
+      const seen = new Set<UUID>()
+      let current: T | undefined = terminal
+      while (current) {
+        if (seen.has(current.uuid)) {
+          hasCycle = true
+          break
+        }
+        seen.add(current.uuid)
+        if (current.type === 'user' || current.type === 'assistant') {
+          leafUuids.add(current.uuid)
+          break
+        }
+        current = current.parentUuid
+          ? messages.get(current.parentUuid)
+          : undefined
+      }
+    }
+  }
+
+  if (hasCycle && reportCycles) {
+    logEvent('tengu_transcript_parent_cycle', {})
+  }
+  return leafUuids
+}
+
+interface TranscriptLightNode extends TranscriptGraphNode {
+  assistantId?: string
+  hasToolResult: boolean
+  snipMetadata?: { removedUuids?: UUID[] }
+}
+interface TranscriptWalkResult {
+  buffer: Buffer
+  originalLeafUuids?: Set<UUID>
+  snipPlan?: TranscriptSnipPlan
+}
+function walkChainBeforeParse(buf: Buffer, prune: boolean): TranscriptWalkResult {
+  const messages = new Map<UUID, TranscriptLightNode>()
+  const progressBridge = new Map<UUID, UUID | null | undefined>()
+  const ranges: Array<{ start: number; end: number; uuid?: UUID }> = []
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let start = 0
+  while (start < buf.length) {
+    const nl = buf.indexOf(10, start)
+    const end = nl < 0 ? buf.length : nl + 1
+    const line = buf.subarray(start, end)
+    if (!line.toString('utf8').trim()) { ranges.push({ start, end }); start = end; continue }
+    let entry: Entry
+    try { entry = JSON.parse(decoder.decode(line)) as Entry }
+    catch {
+      if (managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_CORRUPT')
+      return { buffer: buf }
+    }
+    if (isLegacyProgressEntry(entry)) {
+      const parent = entry.parentUuid
+      progressBridge.set(entry.uuid, parent && progressBridge.has(parent) ? (progressBridge.get(parent) ?? null) : parent)
+      ranges.push({ start, end }); start = end; continue
+    }
+    if (isTranscriptMessage(entry)) {
+      const parentUuid = entry.parentUuid && progressBridge.has(entry.parentUuid)
+        ? (progressBridge.get(entry.parentUuid) ?? null) : entry.parentUuid
+      const content = entry.type === 'user' ? entry.message.content : undefined
+      const node: TranscriptLightNode = {
+        uuid: entry.uuid, parentUuid, timestamp: entry.timestamp, type: entry.type,
+        isSidechain: entry.isSidechain,
+        assistantId: entry.type === 'assistant' ? entry.message.id : undefined,
+        hasToolResult: Array.isArray(content) && content.some(block => block.type === 'tool_result'),
+        snipMetadata: (entry as { snipMetadata?: { removedUuids?: UUID[] } }).snipMetadata,
+      }
+      messages.set(entry.uuid, node)
+      ranges.push({ start, end, uuid: entry.uuid })
+    } else ranges.push({ start, end })
+    start = end
+  }
+  const snipPlan = transcriptSnipPlan(messages)
+  applySnipRemovals(messages, snipPlan)
+  const originalLeafUuids = computeTranscriptLeafUuids(messages, prune, false)
+  const roots = [
+    findLatestMessage(messages.values(), message => !message.isSidechain),
+    findLatestMessage(messages.values(), message => originalLeafUuids.has(message.uuid) && (message.type === 'user' || message.type === 'assistant')),
+    findLatestMessage(messages.values(), message => originalLeafUuids.has(message.uuid) && !message.isSidechain && (message.type === 'user' || message.type === 'assistant')),
+  ].filter((message): message is TranscriptLightNode => message !== undefined)
+  if (!roots.length) return { buffer: buf }
+  const keep = new Set<UUID>()
+  for (const root of roots) {
+    const seen = new Set<UUID>()
+    let current: TranscriptLightNode | undefined = root
+    while (current) {
+      if (seen.has(current.uuid)) return { buffer: buf }
+      seen.add(current.uuid); keep.add(current.uuid)
+      current = current.parentUuid ? messages.get(current.parentUuid) : undefined
+    }
+  }
+  const groups = new Set<string>()
+  for (const uuid of keep) { const id = messages.get(uuid)?.assistantId; if (id) groups.add(id) }
+  const assistants = new Set<UUID>()
+  for (const node of messages.values()) if (node.assistantId && groups.has(node.assistantId)) { keep.add(node.uuid); assistants.add(node.uuid) }
+  for (const node of messages.values()) if (node.type === 'user' && node.hasToolResult && node.parentUuid && assistants.has(node.parentUuid)) keep.add(node.uuid)
+  const retained = ranges.filter(range => range.uuid === undefined || keep.has(range.uuid))
+  const bytes = retained.reduce((sum, range) => sum + range.end - range.start, 0)
+  // Keep the existing profitability threshold: never trade correctness for
+  // a tiny memory saving, and keep callers' all-leaves/preserved bypasses.
+  if (bytes > buf.length / 2) return { buffer: buf }
+  return {
+    buffer: Buffer.concat(retained.map(range => buf.subarray(range.start, range.end)), bytes),
+    originalLeafUuids, snipPlan,
+  }
+}
+
 
 /**
  * Loads all messages, summaries, and file history snapshots from a transcript file.
@@ -3619,6 +3890,10 @@ export async function loadTranscriptFile(
   // Last-wins — later entries supersede.
   let contextCollapseSnapshot: ContextCollapseSnapshotEntry | undefined
 
+  const leafPruneEnabled = getFeatureValue_CACHED_MAY_BE_STALE('tengu_pebble_leaf_prune', false)
+  let originalLeafUuids: Set<UUID> | undefined
+  let originalSnipPlan: TranscriptSnipPlan | undefined
+
   try {
     // For large transcripts, avoid materializing megabytes of stale content.
     // Single forward chunked read: attribution-snapshot lines are skipped at
@@ -3632,13 +3907,14 @@ export async function loadTranscriptFile(
     //
     // Pre-boundary metadata (agent-setting, mode, pr-link, etc.) is recovered
     // via a cheap byte-level forward scan of [0, boundary).
-    let buf: Buffer | null = null
+    const readSnapshot = async (verifiedHandle?: SessionReadHandle) => {
+      let buf: Buffer | null = null
     let metadataLines: string[] | null = null
     let hasPreservedSegment = false
     if (!isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP)) {
-      const { size } = await stat(filePath)
+      const { size } = verifiedHandle ? await verifiedHandle.stat() : await stat(filePath)
       if (size > SKIP_PRECOMPACT_THRESHOLD) {
-        const scan = await readTranscriptForLoad(filePath, size)
+        const scan = await readTranscriptForLoad(filePath, size, verifiedHandle)
         buf = scan.postBoundaryBuf
         hasPreservedSegment = scan.hasPreservedSegment
         // >0 means we truncated pre-boundary bytes and must recover
@@ -3652,11 +3928,63 @@ export async function loadTranscriptFile(
           metadataLines = await scanPreBoundaryMetadata(
             filePath,
             scan.boundaryStartOffset,
+            verifiedHandle,
           )
         }
       }
     }
-    buf ??= await readFile(filePath)
+    buf ??= verifiedHandle ? await readTranscriptHandle(verifiedHandle) : await readFile(filePath)
+      return { buf, metadataLines, hasPreservedSegment }
+    }
+    const snapshot = managedTranscriptIo()
+      ? await withSessionFile(filePath, transcriptIoScope(filePath), false, async (file, patch, recordReceipt) => {
+          if (await transcriptNeedsRecovery(file)) {
+            const scope = transcriptIoScope(filePath)
+            const socketPath = process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_SOCKET
+            const peerId = process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_PEER
+            const agentId = process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_AGENT
+            if (!socketPath || !peerId || !agentId || basename(filePath, '.jsonl') !== scope.sessionId) {
+              throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_UNAVAILABLE')
+            }
+            try {
+              const binding = { peerId, agentId, nativeSessionId: scope.sessionId }
+              const original = await readTranscriptHandle(file)
+              const archive = await readNativeTranscriptArchive(socketPath, binding)
+              const restored = recoverNativeTranscript(original, binding, archive, (entries, authority) => {
+                const all = new Map<UUID, TranscriptMessage>()
+                for (const entry of entries) {
+                  if (!isTranscriptMessage(entry as unknown as Entry)) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_GRAPH')
+                  const message = entry as unknown as TranscriptMessage
+                  if (all.has(message.uuid)) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_GRAPH')
+                  all.set(message.uuid, message)
+                }
+                for (const message of all.values()) {
+                  if (message.parentUuid && !all.has(message.parentUuid)) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_GRAPH')
+                }
+                const latest = findLatestMessage(all.values(), m => !m.isSidechain)
+                if (!latest) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_GRAPH')
+                const chain = buildConversationChain(all, latest)
+                const expected = new Set(authority)
+                const actual = chain.filter(m => expected.has(m.uuid)).map(m => m.uuid)
+                if (actual.length !== authority.length || actual.some((id, i) => id !== authority[i])) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_ORDER')
+              })
+              await patch(0, restored.bytes)
+              await recordReceipt({ schema: 1, sourceSha256: restored.sourceSha256, targetSha256: restored.targetSha256,
+                archiveSha256: restored.archiveSha256, sourceBytes: original.length, targetBytes: restored.bytes.length,
+                verifiedReadCount: restored.readCount, fragmentCount: restored.fragmentCount,
+                fragmentManifestSha256: restored.fragmentManifestSha256 })
+              clearSessionMessagesCache()
+              logForDiagnosticsNoPII('info', 'ccb_transcript_lossless_restored', {
+                bytes: original.length, read_count: restored.readCount,
+                fragment_count: restored.fragmentCount,
+              })
+            } catch { throw new SessionFileIntegrityError('CCB_TRANSCRIPT_RESTORE_UNPROVEN') }
+          }
+          return readSnapshot(file)
+        })
+      : await readSnapshot()
+    let { buf } = snapshot
+    const { metadataLines, hasPreservedSegment } = snapshot
     // For large buffers (which here means readTranscriptForLoad output with
     // attr-snaps already stripped at the fd level — the <5MB readFile path
     // falls through the size gate below), the dominant cost is parsing dead
@@ -3677,7 +4005,10 @@ export async function loadTranscriptFile(
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP) &&
       buf.length > SKIP_PRECOMPACT_THRESHOLD
     ) {
-      buf = walkChainBeforeParse(buf)
+      const walked = walkChainBeforeParse(buf, leafPruneEnabled)
+      buf = walked.buffer
+      originalLeafUuids = walked.originalLeafUuids
+      originalSnipPlan = walked.snipPlan
     }
 
     // First pass: process metadata-only lines collected during the boundary scan.
@@ -3807,12 +4138,13 @@ export async function loadTranscriptFile(
         contextCollapseSnapshot = entry
       }
     }
-  } catch {
-    // File doesn't exist or can't be read
+  } catch (error) {
+    if (managedTranscriptIo() && !(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
+    // A genuinely absent transcript is handled by the existing session lookup.
   }
 
   applyPreservedSegmentRelinks(messages)
-  applySnipRemovals(messages)
+  applySnipRemovals(messages, originalSnipPlan)
 
   // Compute leaf UUIDs once at load time
   // Only user/assistant messages should be considered as leaves for anchoring resume.
@@ -3823,81 +4155,9 @@ export async function loadTranscriptFile(
   // handle cases where the last message is a system/metadata message.
   // For each conversation chain (identified by following parent links), the leaf
   // is the most recent user/assistant message.
-  const allMessages = [...messages.values()]
-
-  // Standard leaf computation using parent relationships
-  const parentUuids = new Set(
-    allMessages
-      .map(msg => msg.parentUuid)
-      .filter((uuid): uuid is UUID => uuid !== null),
-  )
-
-  // Find all terminal messages (messages with no children)
-  const terminalMessages = allMessages.filter(msg => !parentUuids.has(msg.uuid))
-
-  const leafUuids = new Set<UUID>()
-  let hasCycle = false
-
-  if (getFeatureValue_CACHED_MAY_BE_STALE('tengu_pebble_leaf_prune', false)) {
-    // Build a set of UUIDs that have user/assistant children
-    // (these are mid-conversation nodes, not dead ends)
-    const hasUserAssistantChild = new Set<UUID>()
-    for (const msg of allMessages) {
-      if (msg.parentUuid && (msg.type === 'user' || msg.type === 'assistant')) {
-        hasUserAssistantChild.add(msg.parentUuid)
-      }
-    }
-
-    // For each terminal message, walk back to find the nearest user/assistant ancestor.
-    // Skip ancestors that already have user/assistant children - those are mid-conversation
-    // nodes where the conversation continued (e.g., an assistant tool_use message whose
-    // progress child is terminal, but whose tool_result child continues the conversation).
-    for (const terminal of terminalMessages) {
-      const seen = new Set<UUID>()
-      let current: TranscriptMessage | undefined = terminal
-      while (current) {
-        if (seen.has(current.uuid)) {
-          hasCycle = true
-          break
-        }
-        seen.add(current.uuid)
-        if (current.type === 'user' || current.type === 'assistant') {
-          if (!hasUserAssistantChild.has(current.uuid)) {
-            leafUuids.add(current.uuid)
-          }
-          break
-        }
-        current = current.parentUuid
-          ? messages.get(current.parentUuid)
-          : undefined
-      }
-    }
-  } else {
-    // Original leaf computation: walk back from terminal messages to find
-    // the nearest user/assistant ancestor unconditionally
-    for (const terminal of terminalMessages) {
-      const seen = new Set<UUID>()
-      let current: TranscriptMessage | undefined = terminal
-      while (current) {
-        if (seen.has(current.uuid)) {
-          hasCycle = true
-          break
-        }
-        seen.add(current.uuid)
-        if (current.type === 'user' || current.type === 'assistant') {
-          leafUuids.add(current.uuid)
-          break
-        }
-        current = current.parentUuid
-          ? messages.get(current.parentUuid)
-          : undefined
-      }
-    }
-  }
-
-  if (hasCycle) {
-    logEvent('tengu_transcript_parent_cycle', {})
-  }
+  const leafUuids = originalLeafUuids
+    ? new Set([...originalLeafUuids].filter(uuid => messages.has(uuid)))
+    : computeTranscriptLeafUuids(messages, leafPruneEnabled)
 
   return {
     messages,

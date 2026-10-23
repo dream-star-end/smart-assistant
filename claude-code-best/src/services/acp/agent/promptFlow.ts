@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../../../utils/sessionTransition.js'
 /**
  * Prompt-flow methods for AcpAgent, attached to the prototype via
  * Object.assign. Kept in a sibling module to keep AcpAgent.ts under the
@@ -16,6 +17,7 @@ import type {
 import type { SessionId } from '../../../types/ids.js'
 import {
   switchSession,
+  setOriginalCwd,
   getSessionProjectDir,
 } from '../../../bootstrap/state.js'
 import { forwardSessionUpdates } from '../bridge.js'
@@ -38,6 +40,7 @@ async function prompt(
   this: AcpAgent,
   params: PromptRequest,
 ): Promise<PromptResponse> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   const session = this.sessions.get(params.sessionId)
   if (!session) {
     throw new Error(`Session ${params.sessionId} not found`)
@@ -90,7 +93,12 @@ async function prompt(
     // Switch global session state so recordTranscript writes to the correct
     // session file. Without this, multi-session scenarios (or creating a new
     // session after another) write transcript data to the wrong file.
-    switchSession(params.sessionId as SessionId, getSessionProjectDir())
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
+    switchSession(params.sessionId as SessionId, process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ? session.sessionProjectDir ?? null : getSessionProjectDir())
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
+      setOriginalCwd(session.cwd)
+      await (await import('../../../utils/sessionStorage.js')).resetSessionFilePointer()
+    }
 
     const sdkMessages = session.queryEngine.submitMessage(promptInput)
 

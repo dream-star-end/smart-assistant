@@ -66,6 +66,7 @@ export const TURN_LEASE_RENEW_PATH = '/internal/v3/turn-lease/renew'
 export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
 export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
+export const CCB_TRANSCRIPT_RESTORE_PATH = '/internal/v3/ccb-transcript-restore'
 export const TURN_TAPE_STATE_PATH = '/internal/v3/turn-tape-state'
 export const MEMORY_USAGE_PATH = '/internal/v3/memory-usage'
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
@@ -299,6 +300,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/v3MasterSink.ts', 'commercial/src/http/internalServerAuthored.ts'],
+  },
+  {
+    path: CCB_TRANSCRIPT_RESTORE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/ccbTranscriptRestore.ts', 'commercial/src/http/internalCcbTranscriptRestore.ts'],
   },
   {
     path: TURN_TAPE_STATE_PATH,

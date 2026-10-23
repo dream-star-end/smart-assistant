@@ -11,3 +11,4 @@
 # file-timeout-ms: 3600000
 # mutex-timeout-seconds: 3900
 packages/gateway/src/__tests__/idlePipeline.grow2.integ.test.ts
+packages/commercial/src/__tests__/ccbNativeRestoreArchive.integ.test.ts
