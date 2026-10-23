@@ -156,7 +156,7 @@ export function TaskboardView({
 
   const ownedDetail = detailTicket && ticketId &&
     (detailTicket.identifier === ticketId || detailTicket.id === ticketId) ? detailTicket : null
-  const actionTicket = ownedDetail && (!selected || ownedDetail.version >= selected.version)
+  const actionTicket = ownedDetail && (!selected || ownedDetail.version > selected.version)
     ? ownedDetail : selected
 
   const openTicket = (ticket: Ticket) => onOpenTicket(ticket.identifier)

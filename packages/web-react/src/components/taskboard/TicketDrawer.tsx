@@ -128,6 +128,7 @@ export function TicketDrawer({
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [loading, setLoading] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [editVersion, setEditVersion] = useState<number | null>(null)
   const [draftTitle, setDraftTitle] = useState('')
   const [draftBody, setDraftBody] = useState('')
   const [draftPriority, setDraftPriority] = useState<TicketPriority>('P2')
@@ -193,6 +194,7 @@ export function TicketDrawer({
   const originSessionId = resolveOriginSessionId(current?.originSessionKey, sessionIds)
 
   const beginEdit = useCallback((src: Ticket) => {
+    setEditVersion(src.version)
     setDraftTitle(src.title)
     setDraftBody(src.body)
     setDraftPriority(src.priority)
@@ -376,7 +378,7 @@ export function TicketDrawer({
     setSaving(true)
     try {
       const out = await taskboardApi.patchTicket(auth, current.id, {
-        expectedVersion: current.version,
+        expectedVersion: editVersion ?? current.version,
         title,
         body: draftBody,
         priority: draftPriority,
@@ -555,6 +557,9 @@ export function TicketDrawer({
                     />
                   </Field>
                 </div>
+                {editVersion !== null && editVersion !== current.version && (
+                  <p role="status" className="text-caption text-warning">任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。</p>
+                )}
                 <div className="flex flex-wrap gap-1">
                   <Button
                     type="button"

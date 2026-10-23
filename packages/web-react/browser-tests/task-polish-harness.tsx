@@ -5,6 +5,7 @@ import { TicketListView } from '../src/components/taskboard/TicketListView'
 import { TicketDrawer } from '../src/components/taskboard/TicketDrawer'
 import { VirtualList } from '../src/components/sidebar/VirtualList'
 import { ToastProvider, TooltipProvider } from '../src/components/ui'
+import { ApiError } from '../src/lib/api'
 import { createMemoryAuthSession } from '../src/lib/authSession'
 import { taskboardApi, type Ticket, type PipelineStage, type TicketListQuery } from '../src/lib/taskboard'
 import type { FlatItem } from '../src/components/sidebar/flattenItems'
@@ -39,30 +40,38 @@ function Drawer() {
   const [open, setOpen] = useState(true)
   let server = row
   // Keep the server-side fixture independent of React's displayed row.
-  const serverRef = useState(() => ({ row: ticket(1, initial), hold: false, held: null as null | (() => void), calls: 0 }))[0]
+  const serverRef = useState(() => ({ row: ticket(1, initial), hold: false, held: null as null | (() => void), calls: 0, active: 0, maxActive: 0, patchVersion: 0 }))[0]
   const [writes, setWrites] = useState(0)
   taskboardApi.patchTicket = async (_a, _id, body) => {
+    serverRef.patchVersion = body.expectedVersion
+    if (body.expectedVersion !== serverRef.row.version) throw new ApiError({ status: 409, message: 'version conflict', code: 'version_conflict' })
     serverRef.row = { ...serverRef.row, title: body.title ?? serverRef.row.title, version: serverRef.row.version + 1 }
     return { ok: true, ticket: serverRef.row }
   }
   taskboardApi.getTicketDetail = async () => {
     const snapshot = serverRef.row
     serverRef.calls += 1
+    serverRef.active += 1
+    serverRef.maxActive = Math.max(serverRef.maxActive, serverRef.active)
+    try {
     if (serverRef.hold) {
       serverRef.hold = false
       await new Promise<void>((resolve) => { serverRef.held = resolve })
     }
     return { ticket: snapshot, stage }
+    } finally { serverRef.active -= 1 }
   }
   taskboardApi.listRuns = async () => ({ items: [], total: 0 })
   taskboardApi.listTimeline = async () => []
   control.finish = () => { serverRef.row = { ...serverRef.row, version: serverRef.row.version + 1, status: 'waiting_human' } }
   control.clientStatus = () => serverRef.calls
+  control.stats = () => ({ maxActive: serverRef.maxActive, patchVersion: serverRef.patchVersion, body: serverRef.row.body })
+  control.externalEdit = () => { serverRef.row = { ...serverRef.row, body: '另一客户端保存的最新正文', version: serverRef.row.version + 1 }; document.dispatchEvent(new Event('visibilitychange')) }
   control.delayPoll = () => { serverRef.hold = true; document.dispatchEvent(new Event('visibilitychange')) }
   control.isHeld = () => !!serverRef.held
   control.switchOwner = () => { server = ticket(2); serverRef.row = server; setRow(server) }
   control.releasePoll = () => { const done = serverRef.held; serverRef.held = null; done?.() }
-  return <><output data-testid="client-status">{row.status}</output><output data-testid="writes">{writes}</output><TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={(next) => { setWrites((n) => n + 1); setRow(next) }} /></>
+  return <><output data-testid="client-status">{row.status}</output><output data-testid="client-version">{row.version}</output><output data-testid="writes">{writes}</output><TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={(next) => { setWrites((n) => n + 1); setRow(next) }} /></>
 }
 const scenario = new URLSearchParams(location.search).get('scenario')
 createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : <Drawer />}</ToastProvider></TooltipProvider>)

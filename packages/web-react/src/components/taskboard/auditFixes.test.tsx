@@ -437,7 +437,9 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
       ],
     })
     stubBoard({ columns: [{ stage: stage(), tickets: [running] }] })
-    mockDrawerApis(running)
+    // The detail API omits allowedMoves. Equal-version detail must not hide
+    // the capabilities supplied by the selected board row.
+    mockDrawerApis({ ...running, allowedMoves: undefined })
     vi.spyOn(taskboardApi, 'moveTicket').mockImplementation(() => new Promise(() => {}))
     renderBoard({ ticketId: 'OCV5-42' })
     const drawer = await screen.findByTestId('ticket-drawer')
