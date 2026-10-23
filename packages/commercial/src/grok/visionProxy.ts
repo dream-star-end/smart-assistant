@@ -205,6 +205,8 @@ export function grokVisionBody(input: {
   mediaType: string;
   data: string;
   prompt: string;
+  /** Responses API `text.format` (e.g. a strict json_schema) for callers that need structured output. */
+  textFormat?: Record<string, unknown>;
 }): string {
   return JSON.stringify({
     model: input.upstreamModel,
@@ -220,6 +222,7 @@ export function grokVisionBody(input: {
     reasoning: { effort: "low" },
     max_output_tokens: MAX_OUTPUT_TOKENS,
     store: false,
+    ...(input.textFormat ? { text: { format: input.textFormat } } : {}),
   });
 }
 

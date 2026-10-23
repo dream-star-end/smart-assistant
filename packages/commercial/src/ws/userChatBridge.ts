@@ -175,6 +175,7 @@ import {
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
+  backfillDispatchTraceId,
   casAdmittedToAccepted,
   casToManualReconcile,
   casToTerminal,
@@ -4448,6 +4449,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           dispatchId: admittedThisFrame.record.dispatchId,
           requestId: admittedThisFrame.record.billingRequestId,
         });
+        // Plan §7.4: these lanes admit without a trace, so link turn_dispatches.trace_id too.
+        if (deps.pgPool) {
+          const dispatchId = admittedThisFrame.record.dispatchId;
+          void backfillDispatchTraceId(deps.pgPool, { dispatchId, traceId }).catch((err) => {
+            turnLog?.warn("user-chat-bridge: dispatch trace backfill failed", { dispatchId, err });
+          });
+        }
       }
 
       // 主会话历史**只读一次**,给「dispatch 受理前 dedup」与「受理/持久化后 enrichment」共用。
@@ -4641,6 +4649,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               ownerId: connId,
               agentContainerId: containerId ?? null,
               runtimeKind: endpoint.desktop ? "desktop" : "docker",
+              ...(traceId !== null ? { traceId } : {}),
               message,
               ...(validatedRecovery ? { recovery: validatedRecovery } : {}),
               ...(recoveryJob ? {

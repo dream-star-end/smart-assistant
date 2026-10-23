@@ -2240,7 +2240,7 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
       "0229_turn_finalize_integrity.sql", "0230_chat_projects.sql", "0231_turn_tape_materialization_resilience.sql",
       "0233_client_session_list_archived_at.sql", "0239_turn_dispatch_shutdown_ctx.sql",
       "0240_client_session_last_read_at.sql", "0241_raise_last_read_watermark.sql", "0243_live_unit_checkpoints.sql",
-      "0246_chat_project_board_bind.sql");
+      "0246_chat_project_board_bind.sql", "0323_turn_dispatches_trace_id.sql");
     // columns and tables the backend's SQL reads that belong to migration chains outside this slice
     await pool.query(`CREATE TABLE agent_containers (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
         state TEXT NOT NULL, runtime_kind TEXT NOT NULL DEFAULT 'docker');
