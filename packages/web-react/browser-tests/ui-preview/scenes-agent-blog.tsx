@@ -33,8 +33,8 @@ const DRAFT = {
 
 const ISSUES: CommunityBlogPrecheck = {
   issues: [
-    { code: 'leak_phone', level: 'block', field: 'bodyMarkdown', message: '有手机号，公开内容里不能出现，删掉或打码', where: '「怎么做的」一节' },
-    { code: 'external_image', level: 'block', field: 'bodyMarkdown', message: '用了站外图片或不支持的图片写法；经验分享只显示本站上传的图片，改用对话里生成的图片或删掉', where: '「怎么做的」一节' },
+    { code: 'leak_phone', level: 'block', field: 'bodyMarkdown', message: '有手机号，公开内容里不能出现，删掉或打码', where: '第 2 节' },
+    { code: 'external_image', level: 'block', field: 'bodyMarkdown', message: '用了站外图片或不支持的图片写法；经验分享只显示本站上传的图片，改用对话里生成的图片或删掉', where: '第 2 节' },
   ],
   quota: { pendingLeft: 3, dailyLeft: 5 },
 }

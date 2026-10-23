@@ -127,7 +127,16 @@ export type DraftImage = { alt: string; src: string; index: number }
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/
 const IMAGE_RE = /!\[([^\]\n]{0,300})\]\(\s*<?([^)\s>]{1,1024})>?(?:\s+"[^"\n]{0,300}")?\s*\)/g
 
-/** 逐行跳过围栏代码块，对其余行调用 fn（返回替换后的行）。 */
+const INLINE_CODE_RE = /(`+)[^`]+?\1(?!`)/g
+
+/** 行内代码先换成占位，处理完再换回：代码示例里的图片写法不算图片（Codex D2 R1 P1）。 */
+function outsideInlineCode(line: string, fn: (text: string) => string): string {
+  const spans: string[] = []
+  const masked = line.replace(INLINE_CODE_RE, (span) => `\u0000${spans.push(span) - 1}\u0000`)
+  return fn(masked).replace(/\u0000(\d+)\u0000/g, (_, i: string) => spans[Number(i)] ?? '')
+}
+
+/** 逐行跳过围栏代码块和行内代码，对其余文字调用 fn（返回替换后的文字）。 */
 function mapOutsideFences(markdown: string, fn: (line: string) => string): string {
   let fence: string | null = null
   return markdown
@@ -142,7 +151,7 @@ function mapOutsideFences(markdown: string, fn: (line: string) => string): strin
         fence = open[1]!
         return l
       }
-      return fn(l)
+      return outsideInlineCode(l, fn)
     })
     .join('\n')
 }

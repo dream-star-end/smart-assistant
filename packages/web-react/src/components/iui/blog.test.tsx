@@ -16,6 +16,7 @@ import {
   composeRevisionMessage,
   composeSubmittedMessage,
   fixableIssues,
+  latestSubmitted,
   rememberSubmitted,
   submittedFor,
 } from "./blogChat";
@@ -97,6 +98,15 @@ describe("schema 与图片换算", () => {
     expect(validateSpec({ type: "blog_status", id: "1;drop" }, false).ok).toBe(false);
   });
 
+  test("行内代码里的图片写法不算图片，不上传也不改写（Codex D2 R1）", () => {
+    const body = "正文写法示例：`![说明](/example.png)` 和 ``![双](/b.png)``。\n\n![真图](/home/agent/outputs/a.png)";
+    expect(draftImages(body).map((i) => i.src)).toEqual(["/home/agent/outputs/a.png"]);
+    const replaced = replaceDraftImages(body, () => SHA);
+    expect(replaced).toContain("`![说明](/example.png)`");
+    expect(replaced).toContain("``![双](/b.png)``");
+    expect(replaced).toContain(`![真图](tutorial-blob:${SHA})`);
+  });
+
   test("只认围栏外的容器路径图片；预检用占位 sha；投稿时换成真实 sha", () => {
     const body = `${BODY}\n\n![外链](https://e.com/a.png)\n\n![再引用](/home/agent/outputs/weekly.png)`;
     expect(draftImages(body)).toEqual([{ alt: "汇总", src: "/home/agent/outputs/weekly.png", index: 0 }]);
@@ -125,12 +135,14 @@ describe("发给 Agent 的话 / 本机记录 / Markdown", () => {
     expect(composeRevisionMessage("12", "内容包含站外联系方式")).toContain("理由：内容包含站外联系方式");
   });
 
-  test("已投稿记录按 draftId 覆盖；存储坏了不抛错", () => {
+  test("已投稿记录按草稿 + 版本分别存；存储坏了不抛错", () => {
     rememberSubmitted({ draftId: "a", version: 1, id: "3", at: 1 });
     rememberSubmitted({ draftId: "a", version: 2, id: "4", at: 2 });
-    expect(submittedFor("a")).toMatchObject({ version: 2, id: "4" });
+    expect(submittedFor("a", 1)).toMatchObject({ id: "3" });
+    expect(submittedFor("a", 2)).toMatchObject({ id: "4" });
+    expect(latestSubmitted("a")).toMatchObject({ version: 2 });
     localStorage.setItem("oc-blog-chat-submitted", "{bad");
-    expect(submittedFor("a")).toBeNull();
+    expect(submittedFor("a", 2)).toBeNull();
   });
 
   test("降级 Markdown：草稿转文章，状态卡不编造状态", () => {
@@ -180,7 +192,7 @@ describe("草稿卡", () => {
     expect(submitted.bodyMarkdown).toContain("![示例](/not/an/image.png)");
     await waitFor(() => expect(send).toHaveBeenCalledWith(composeSubmittedMessage({ draftId: "weekly", version: 2 }, "12")));
     await screen.findByText("AI 审核中");
-    expect(submittedFor("weekly")).toMatchObject({ version: 2, id: "12" });
+    expect(submittedFor("weekly", 2)).toMatchObject({ id: "12" });
   });
 
   test("投稿失败就地显示原因，不发消息、不记已投稿", async () => {
@@ -193,7 +205,7 @@ describe("草稿卡", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "确认投稿" }).at(-1)!);
     expect((await screen.findAllByRole("alert")).some((n) => n.textContent?.includes("24 小时内最多投稿 5 篇"))).toBe(true);
     expect(send).not.toHaveBeenCalled();
-    expect(submittedFor("weekly")).toBeNull();
+    expect(submittedFor("weekly", 2)).toBeNull();
   });
 
   test("同一 draftId 出了新版本：旧卡只读、不预检；只读上下文和没有登录态时也不调接口", async () => {
@@ -221,6 +233,36 @@ describe("草稿卡", () => {
     cleanup();
     render(wrap(<IuiBlock code={block(DRAFT)} />));
     expect(screen.getByText(/登录后可以一键投稿/)).toBeInTheDocument();
+  });
+
+  test("v1 投过（被驳回）后，Agent 按理由改的 v2 仍能投；v1 显示自己的状态，更旧的未投版本只读（Codex D2 R1）", async () => {
+    rememberSubmitted({ draftId: "weekly", version: 1, id: "11", at: 1 });
+    rememberSubmitted({ draftId: "old", version: 3, id: "9", at: 1 });
+    const actions = actionsMock({ getMine: vi.fn(async () => mine({ id: "11", status: "rejected", reviewNote: "这里是驳回理由" })) });
+    render(
+      wrap(
+        <>
+          <IuiBlock code={block({ ...DRAFT, version: 1 })} />
+          <IuiBlock code={block(DRAFT)} />
+          <IuiBlock code={block({ ...DRAFT, draft_id: "old", version: 2 })} />
+        </>,
+        actions,
+        vi.fn(),
+      ),
+    );
+    await screen.findByText(/这里是驳回理由/);
+    await screen.findByText("检查通过");
+    expect(screen.getAllByRole("button", { name: "确认投稿" })).toHaveLength(1);
+    expect(screen.getByText("v3 已投稿")).toBeInTheDocument();
+  });
+
+  test("只读上下文里已投稿的草稿：状态卡也不查接口、不能发消息（Codex D2 R1）", async () => {
+    rememberSubmitted({ draftId: "weekly", version: 2, id: "12", at: 1 });
+    const actions = actionsMock();
+    render(wrap(<IuiBlock code={block(DRAFT)} readOnly />, actions, vi.fn()));
+    await act(async () => {});
+    expect(actions.getMine).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /按理由修改/ })).toBeNull();
   });
 
   test("流式未完成时只显示骨架", () => {

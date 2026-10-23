@@ -26,6 +26,7 @@ import {
   fixableIssues,
   issueWhere,
   latestDraftVersion,
+  latestSubmitted,
   registerDraftVersion,
   rememberSubmitted,
   submittedFor,
@@ -80,12 +81,17 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
   const { sendUserText, busy, reason } = useChatInteraction();
   const latest = useLatestVersion(spec.draftId, spec.version);
   const superseded = latest > spec.version;
-  const [submitted, setSubmitted] = useState(() => submittedFor(spec.draftId));
+  const [submitted, setSubmitted] = useState(() => submittedFor(spec.draftId, spec.version));
+  // 更新的版本已经投过：这一版只读。更旧的投稿不挡这一版（被驳回后按理由改的新版本要能重投）。
+  const [laterSubmitted] = useState(() => {
+    const last = latestSubmitted(spec.draftId);
+    return last && last.version > spec.version ? last : null;
+  });
   const [check, setCheck] = useState<CheckState>({ kind: "idle" });
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [submit, setSubmit] = useState<SubmitState>({ kind: "idle" });
   const [fixSent, setFixSent] = useState(false);
-  const interactive = !!actions && !readOnly && !streaming && !superseded && !submitted;
+  const interactive = !!actions && !readOnly && !streaming && !superseded && !submitted && !laterSubmitted;
 
   const precheckBody = useMemo(() => bodyForPrecheck(spec.body), [spec.body]);
   const runCheck = useCallback(() => {
@@ -101,9 +107,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
     if (interactive && latestDraftVersion(spec.draftId) <= spec.version) runCheck();
   }, [interactive, runCheck, spec.draftId, spec.version]);
 
-  if (submitted && submitted.version === spec.version) {
-    return <BlogStatusView id={submitted.id} nested={nested} />;
-  }
+  if (submitted) return <BlogStatusView id={submitted.id} nested={nested} readOnly={readOnly} />;
 
   const issues = check.kind === "ready" ? check.result.issues : [];
   const blocking = issues.filter((i) => i.level === "block");
@@ -149,8 +153,8 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
     }
   };
 
-  const status = submitted ? (
-    <span className="oc-iui-chip">已投稿 #{submitted.id}</span>
+  const status = laterSubmitted ? (
+    <span className="oc-iui-chip">v{laterSubmitted.version} 已投稿</span>
   ) : superseded ? (
     <span className="oc-iui-chip">已有新版本</span>
   ) : (
@@ -161,8 +165,8 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
     <Frame kind="blog_draft" title={`经验分享草稿 · v${spec.version}`} subtitle={subtitle} notes={notes} streaming={streaming} nested={nested} actions={status}>
       {spec.note && <p className="oc-blog-chat-note">本版改动：{spec.note}</p>}
       <DraftPreview spec={spec} />
-      {submitted ? (
-        <p className="oc-blog-chat-hint">这份草稿的 v{submitted.version} 已经投稿（稿件 #{submitted.id}），这一版不能再投。</p>
+      {laterSubmitted ? (
+        <p className="oc-blog-chat-hint">这份草稿的 v{laterSubmitted.version} 已经投稿（稿件 #{laterSubmitted.id}），这一版不能再投。</p>
       ) : superseded ? (
         <p className="oc-blog-chat-hint">下面有更新的版本（v{latest}），请在新版本上确认。</p>
       ) : !actions ? (

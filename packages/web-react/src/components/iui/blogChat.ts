@@ -60,13 +60,21 @@ function readAll(): SubmittedRecord[] {
   }
 }
 
-export function submittedFor(draftId: string): SubmittedRecord | null {
-  return readAll().find((r) => r.draftId === draftId) ?? null
+/** 这一版投过的记录。 */
+export function submittedFor(draftId: string, version: number): SubmittedRecord | null {
+  return readAll().find((r) => r.draftId === draftId && r.version === version) ?? null
+}
+
+/** 同一草稿里投过的最新一版（更旧的版本据此变只读；更新的版本可以重新投，例如被驳回后改的版本）。 */
+export function latestSubmitted(draftId: string): SubmittedRecord | null {
+  return readAll()
+    .filter((r) => r.draftId === draftId)
+    .reduce<SubmittedRecord | null>((best, r) => (!best || r.version > best.version ? r : best), null)
 }
 
 export function rememberSubmitted(record: SubmittedRecord): void {
   try {
-    const next = [record, ...readAll().filter((r) => r.draftId !== record.draftId)].slice(0, SUBMITTED_MAX)
+    const next = [record, ...readAll().filter((r) => r.draftId !== record.draftId || r.version !== record.version)].slice(0, SUBMITTED_MAX)
     globalThis.localStorage?.setItem(SUBMITTED_KEY, JSON.stringify(next))
   } catch {
     // 存不下就只在本页有效；服务端频控兜底重复投稿。
