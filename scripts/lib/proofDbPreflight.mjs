@@ -82,6 +82,23 @@ export function evaluate(mode, f) {
   return out;
 }
 
+/** Postgres SQLSTATE 57014 (query_canceled): here, the statement timeout. */
+const STATEMENT_TIMEOUT = "57014";
+
+/** OCV5-583: the facts query is read-only catalog work that normally takes milliseconds; on
+ * 2026-10-23 04:39Z one run passed the 10 s statement timeout on an otherwise idle server, and the
+ * next train a minute later passed. A timeout says nothing about the proof server's state, so it is
+ * retried once with a longer budget; a second timeout (or any other error) still refuses. */
+export async function readFactsRetryingTimeout(read, timeouts = [10_000, 30_000]) {
+  try {
+    return { facts: await read(timeouts[0]) };
+  } catch (error) {
+    if (error?.code !== STATEMENT_TIMEOUT) throw error;
+  }
+  return { facts: await read(timeouts[1]),
+    warn: `facts query passed the ${timeouts[0] / 1000}s statement timeout once; retried with ${timeouts[1] / 1000}s and got an answer` };
+}
+
 const FACTS_SQL = `
 SELECT current_user AS user, current_database() AS database,
        current_setting('server_version') AS "serverVersion",
@@ -122,24 +139,36 @@ async function main() {
     process.stdout.write("warn\tpg not installed in this tree yet (dependencies are installed after L0); proof server not probed\n");
     process.exit(0);
   }
-  const client = new (pg.default ?? pg).Client({
-    ...connectionFor(mode, conn), ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: 10_000,
-    application_name: "ocv5-581-preflight",
-  });
-  try {
-    await client.connect();
-  } catch (error) {
-    // node-postgres messages carry no password; keep only the code/message
-    process.stdout.write(`fail\tcannot connect to the proof database: ${error?.code ?? ""} ${error?.message ?? error}\n`);
-    process.exit(1);
-  }
+  const read = async (timeoutMs) => {
+    const client = new (pg.default ?? pg).Client({
+      ...connectionFor(mode, conn), ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: timeoutMs,
+      application_name: "ocv5-581-preflight",
+    });
+    try {
+      await client.connect();
+    } catch (error) {
+      // node-postgres messages carry no password; keep only the code/message
+      throw Object.assign(new Error(`cannot connect to the proof database: ${error?.code ?? ""} ${error?.message ?? error}`),
+        { connect: true });
+    }
+    try {
+      await client.query("BEGIN READ ONLY");
+      const row = (await client.query(FACTS_SQL)).rows[0];
+      await client.query("ROLLBACK");
+      return row;
+    } finally {
+      await client.end().catch(() => {});
+    }
+  };
   let facts;
   try {
-    await client.query("BEGIN READ ONLY");
-    facts = (await client.query(FACTS_SQL)).rows[0];
-    await client.query("ROLLBACK");
-  } finally {
-    await client.end().catch(() => {});
+    const got = await readFactsRetryingTimeout(read);
+    facts = got.facts;
+    if (got.warn) process.stdout.write(`warn\t${got.warn}\n`);
+  } catch (error) {
+    if (!error?.connect) throw error;
+    process.stdout.write(`fail\t${error.message}\n`);
+    process.exit(1);
   }
   if (!facts) {
     process.stdout.write("fail\tcurrent role not found in pg_roles\n");
