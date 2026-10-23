@@ -172,6 +172,7 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
 source "$SCRIPT_DIR/lib/v5-commercial-release-policy.sh"
+source "$SCRIPT_DIR/lib/v5-host-admission.sh"
 FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
 if [[ -f "$FLAVOR_LIB" ]]; then
   # shellcheck source=scripts/lib/assert-flavor.sh
@@ -490,7 +491,7 @@ slot_baseline_dir() { # <A|B>
 run_baseline_guard_remote() { # <mode> <absolute-path> [extra-args...]
   local guard_mode="$1" target="$2" qmode qtarget extra_q="" q a
   shift 2
-  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
+  [[ "$guard_mode" =~ ^(check-release|harden-release|check-release-legacy-cursor|harden-release-legacy-cursor|check-structure-release|check-structure-release-legacy-cursor|check-dir|harden-dir|verify-release|write-manifest)$ ]] \
     || { echo "✗ baseline guard mode 非法:$guard_mode" >&2; return 2; }
   [[ "$target" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || { echo "✗ baseline guard path 非法:$target" >&2; return 2; }
@@ -11922,6 +11923,7 @@ fi
 maybe_run_ci_green_gate_for_mode || exit 1
 # egress surface gate 同样在 lease 外、只读:egress 面有变更却没带 --egress 直接拒,别等构建完才发现。
 assert_egress_surface_covered || exit 1
+v5_host_admission_for_mode || exit 1
 
 # 只读 lane(smoke/baseline-census/两个 model-authority 只读态)不取;dry-run 只打印意图。
 case "$MODE" in

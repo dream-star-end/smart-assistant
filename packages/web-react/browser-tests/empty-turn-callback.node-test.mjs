@@ -83,6 +83,10 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
       });
       try {
         await page.goto(preview.url);
+        // Gate readiness precedes deep-link restoration. Filling the temporary
+        // new-session draft lets selection replace it with the target's empty draft.
+        // The sidebar stays mounted on mobile, so wait for selection, not visibility.
+        await page.locator('[data-session-row] button[aria-current="true"][aria-label="库存看板"]').waitFor({state:"attached"});
         await page.getByPlaceholder(/对话/).fill("EMPTY_REAL_COMPOSER_REQUEST");
         holdTerminalReads=mode==="empty";
         await page.getByRole("button",{name:"发送",exact:true}).click();
