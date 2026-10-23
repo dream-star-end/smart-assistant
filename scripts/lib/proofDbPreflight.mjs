@@ -89,7 +89,11 @@ const STATEMENT_TIMEOUT = "57014";
  * 2026-10-23 04:39Z one run passed the 10 s statement timeout on an otherwise idle server, and the
  * next train a minute later passed. A timeout says nothing about the proof server's state, so it is
  * retried once with a longer budget; a second timeout (or any other error) still refuses. */
-export async function readFactsRetryingTimeout(read, timeouts = [10_000, 30_000]) {
+/** Statement budgets of the first read and the one retry; the wrapper's `timeout` must cover both. */
+export const READ_TIMEOUTS_MS = [10_000, 30_000];
+export const CONNECT_TIMEOUT_MS = 10_000;
+
+export async function readFactsRetryingTimeout(read, timeouts = READ_TIMEOUTS_MS) {
   try {
     return { facts: await read(timeouts[0]) };
   } catch (error) {
@@ -141,7 +145,7 @@ async function main() {
   }
   const read = async (timeoutMs) => {
     const client = new (pg.default ?? pg).Client({
-      ...connectionFor(mode, conn), ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: timeoutMs,
+      ...connectionFor(mode, conn), ssl: false, connectionTimeoutMillis: CONNECT_TIMEOUT_MS, statement_timeout: timeoutMs,
       application_name: "ocv5-581-preflight",
     });
     try {

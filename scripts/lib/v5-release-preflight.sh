@@ -159,7 +159,9 @@ rpf_check_proof_db() { # <repo> <gate-db|shared-db> <dsn>
     rpf_add warn proof-db "probe replaced by OC_V5_PREFLIGHT_PROOF_PROBE=$probe (test-only; a real departure must not set it)"
   fi
   # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib.
-  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$probe" "$mode" 2>&1)" || rc=$?
+  # 75 s covers the probe's worst case: two connects (10 s each) + a 10 s read + one 30 s retry after a
+  # statement timeout (OCV5-583; proofDbPreflight.test.mjs pins the two budgets together).
+  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 75 node "$probe" "$mode" 2>&1)" || rc=$?
   while IFS=$'\t' read -r s detail; do
     case "$s" in
       ok|warn|fail) rpf_add "$s" proof-db "$detail"; any=1; [[ "$s" != fail ]] || failed=1 ;;
