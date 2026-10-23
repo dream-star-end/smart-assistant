@@ -28,6 +28,7 @@ export type ClassifiedErrorCode =
   | 'model_not_available'
   | 'upstream_failed'
   | 'context_too_long'
+  | 'request_too_large'
   | 'bad_request'
   | 'auth_error'
   | 'platform_credential_expired'
@@ -55,6 +56,11 @@ const PATTERNS: Array<{
   code: Exclude<ClassifiedErrorCode, 'unknown'>
   message: string
 }> = [
+  {
+    re: /BODY_FIELD_TOO_LARGE|PAYLOAD_TOO_LARGE|BOX_CONTEXT_TOO_LARGE|\bRequest too large\b|本轮资料未能完整处理|这轮资料暂时无法完整处理/i,
+    code: 'request_too_large',
+    message: '本轮资料未能完整处理，文件和对话均已保留。',
+  },
   {
     re: /(?:"code"\s*:\s*"MODEL_CONFIG_CHANGED_RETRY_TURN")|(?:\\"code\\"\s*:\s*\\"MODEL_CONFIG_CHANGED_RETRY_TURN\\")/,
     code: 'model_config_changed_retry_turn',

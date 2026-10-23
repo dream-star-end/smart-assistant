@@ -8005,6 +8005,43 @@
           "assertion": "OCV5-584 adjacent citations delivered before a reconnect keep their own links"
         }
       ]
+    },
+    {
+      "id": "INC-20261023-BOX-REQUEST-CONTEXT-TOO-LARGE",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "Box会话累计91张图片后，messages超过16MiB字段预算而在派发前被413拒绝；CCB误显示固定20MB英文，并将错误终态落为completed。",
+      "rootFixCommit": "9cbb8682",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-607-lossless-context-transport] PASS"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxContextTransport.admission.test.ts",
+          "assertion": "OCV5-607 restores all 91 images with unchanged canonical bytes and v1 context hash"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/messages.test.ts",
+          "assertion": "a size error keeps every image and PDF for automatic lossless transport"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "旧ENGINE_ERROR与新分类都不把固定英文当作回答"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/legacySizeReference.test.ts",
+          "assertion": "only the safe ID transfers while the current snapshot and content remain untouched"
+        }
+      ],
+      "coverageCommits": [
+        "8a349801"
+      ]
     }
   ]
 }

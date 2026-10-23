@@ -453,6 +453,10 @@ jobs:
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
 
+      - name: CCB lossless context transport and media retention tests
+        if: matrix.shard == 'pr-4'
+        run: npm run test:ccb:box-context
+
       - name: Install redis-server for the isolated reservation test
         # preCheckLongTtl starts its own redis-server on a unix socket; the
         # service container only offers a TCP port.
