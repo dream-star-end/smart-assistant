@@ -453,7 +453,7 @@ describe('P3 create single-flight and list pagination', () => {
         />
       </TooltipProvider>,
     )
-    expect(screen.getByTestId('ticket-list-truncated')).toHaveTextContent('已显示 200 / 201 条')
+    expect(screen.getByTestId('ticket-list-truncated')).toHaveTextContent('已加载 200 / 201 条')
     fireEvent.click(screen.getByTestId('ticket-list-load-more'))
     expect(onLoadMore).toHaveBeenCalledTimes(1)
   })
