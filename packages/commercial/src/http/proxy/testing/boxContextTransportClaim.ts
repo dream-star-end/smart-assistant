@@ -20,10 +20,13 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
   const beforeMoney = async () => JSON.stringify((await db.query("SELECT (SELECT COUNT(*)::text FROM usage_records) AS usage, (SELECT COUNT(*)::text FROM credit_ledger) AS ledger, (SELECT credits::text FROM users WHERE id=$1) AS wallet", [uid.toString()])).rows);
   const money = await beforeMoney();
   const meta = JSON.parse(body.metadata!.user_id!);
-  const session = String(meta.session_id), turn = String(meta.oc_turn_key);
+  const session = String(meta.session_id);
+  const turn = String(meta.oc_turn_key);
   const tag = randomBytes(6).toString("hex");
-  const owner = "g607-owner-" + tag, child = "g607-child-" + tag;
-  const nonce = randomBytes(12).toString("hex"), epoch = randomBytes(16).toString("hex");
+  const owner = `g607-owner-${tag}`;
+  const child = `g607-child-${tag}`;
+  const nonce = randomBytes(12).toString("hex");
+  const epoch = randomBytes(16).toString("hex");
   const runner = "c".repeat(64);
   const catalog = compileBoxToolCatalog(body.tools!);
   const assistant = (body.messages.at(-2) as { content: any[] }).content;
@@ -33,7 +36,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
   const billing = { v: 1, sessionId: session, mode: "chat", parentSessionId: null,
     delegateAgentId: null, turnKey: turn, parentTurnKey: null, authority: null,
     dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null };
-  const handoff = { version: 1, roundNo: 1, messageId: "msg_g607_" + tag,
+  const handoff = { version: 1, roundNo: 1, messageId: `msg_g607_${tag}`,
     assistantContentHash: hashBoxAssistantContent(assistant),
     assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
     assistantEchoHash: hashBoxAssistantEchoContent(assistant),
@@ -50,7 +53,7 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody): Promise
       boxToolHandoff: handoff, boxState: "handoff", boxSessionId: session, boxTurnKey: turn,
       billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
-      boxNativeCliCwd: "/tmp/ocv5-289-run-" + nonce, boxNativeCliVersion: "2.1.280",
+      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`, boxNativeCliVersion: "2.1.280",
     })]);
   await db.query("INSERT INTO request_finalize_journal(request_id,user_id,state,ctx) VALUES ($1,$2,'inflight',$3::jsonb)",
     [child, uid.toString(), JSON.stringify({

@@ -70,16 +70,16 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
         headless: true, args: ["--no-sandbox"] });
       for (const width of [1280, 390]) {
         for (const shape of ["legacy", "mixed", "separate"]) {
-          await t.test(width + " " + shape, async () => {
+          await t.test(`${width} ${shape}`, async () => {
             const ts = Date.now();
-            const cmid = "g607-card-" + shape;
+            const cmid = `g607-card-${shape}`;
             const rows = [{ id: cmid, role: "user", text: "请完整处理这些资料。",
               status: "error", ts, _source: "server",
               _routing: { model: "box-api-claude-opus-5-5", effortLevel: "high", teamMode: false } }];
             if (shape === "separate") rows.push({ id: "partial", role: "assistant", text: partial,
               status: "completed", ts: ts + 1, _source: "server", _clientMessageId: cmid });
             rows.push({ id: "error", role: "assistant",
-              text: shape === "mixed" ? partial + "\n" + old : old,
+              text: shape === "mixed" ? `${partial}\n${old}` : old,
               status: "crashed", ts: ts + 2, _source: "server", _clientMessageId: cmid,
               _errorCode: shape === "legacy" ? "ENGINE_ERROR" : "request_too_large" });
             if (shape === "legacy") rows.push(
@@ -103,7 +103,7 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
                 if (width === 390) assert.ok(await page.evaluate(() =>
                   document.documentElement.scrollWidth <= window.innerWidth + 2));
               }
-              await page.screenshot({ path: join(evidence, shape + "-" + width + ".png"), fullPage: true });
+              await page.screenshot({ path: join(evidence, `${shape}-${width}.png`), fullPage: true });
               assert.deepEqual(errors, []);
               console.log("REQUEST_SIZE_CARD_RECEIPT", JSON.stringify({ width, shape, red, transforms }));
             } finally { await context.close(); }

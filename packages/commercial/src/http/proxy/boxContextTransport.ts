@@ -2,7 +2,7 @@
  * Every hydrated request still goes through the original Box v1 owner checks. */
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, link, unlink, readdir } from "node:fs/promises";
+import { mkdir, open, link, unlink, readdir, type FileHandle } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import {
@@ -127,7 +127,7 @@ export class FileBoxContextTransport implements BoxContextTransport {
   }
 
   private async header(name: string): Promise<Header | null> {
-    let fd;
+    let fd: FileHandle | undefined;
     try {
       fd = await this.file(name);
       const bytes = Buffer.alloc(1024);
@@ -137,7 +137,7 @@ export class FileBoxContextTransport implements BoxContextTransport {
       const h: unknown = JSON.parse(bytes.subarray(0, end).toString("utf8"));
       const info = await fd.stat();
       return validHeader(h) && h.bytes + end + 1 === info.size
-        && name.startsWith(h.binding + ".") ? h : null;
+        && name.startsWith(`${h.binding}.`) ? h : null;
     } catch { return null; }
     finally { await fd?.close(); }
   }
@@ -198,14 +198,14 @@ export class FileBoxContextTransport implements BoxContextTransport {
     return this.locked(async () => {
       await this.quota(header.owner, data.length + 1024);
       const reference = randomBytes(32).toString("hex");
-      const name = key + "." + reference + ".json";
+      const name = `${key}.${reference}.json`;
       const target = path.join(this.directory, name);
-      const tmp = target + "." + randomBytes(12).toString("hex") + ".part";
+      const tmp = `${target}.${randomBytes(12).toString("hex")}.part`;
       try {
         const fd = await open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
           | constants.O_NOFOLLOW, 0o600);
         try {
-          await fd.writeFile(Buffer.concat([Buffer.from(JSON.stringify(header) + "\n"), data]));
+          await fd.writeFile(Buffer.concat([Buffer.from(`${JSON.stringify(header)}\n`), data]));
           await fd.sync();
         } finally { await fd.close(); }
         await link(tmp, target);
@@ -226,7 +226,7 @@ export class FileBoxContextTransport implements BoxContextTransport {
     if (!HEX.test(reference)) throw new BoxContextTransportError("BOX_CONTEXT_REF_INVALID");
     const dir = await this.directoryHandle();
     try {
-      const fd = await this.file(key + "." + reference + ".json");
+      const fd = await this.file(`${key}.${reference}.json`);
       try {
         const all = await fd.readFile();
         const end = all.indexOf(10);

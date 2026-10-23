@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { FileBoxContextTransport, restoreBoxContextRequest } from "../boxContextTransport.js";
 import {
   enforceFieldByteBudgets, enforceVerifiedProxyBudget, PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
-  runWithVerifiedProxyByteBudget, type ProxyBody,
+  runWithVerifiedProxyByteBudget, proxyBodySchema, type ProxyBody,
 } from "../shared.js";
 import { deriveBoxContextHash } from "../boxCallFingerprint.js";
 import { boxContextSummary } from "../boxContextMetrics.js";
@@ -28,15 +28,15 @@ export async function contextProbeHistory(): Promise<unknown[]> {
   });
   const messages: unknown[] = [{ role: "user", content: "Read every fixture and retain the last marker." }];
   for (const [i, image] of images.slice(0, 85).entries()) {
-    messages.push({ role: "assistant", content: [{ type: "tool_use", id: "toolu_g607_" + i,
-      name: "Read", input: { file_path: "synthetic-" + i + ".jpg" } }] });
-    messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_g607_" + i,
+    messages.push({ role: "assistant", content: [{ type: "tool_use", id: `toolu_g607_${i}`,
+      name: "Read", input: { file_path: `synthetic-${i}.jpg` } }] });
+    messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_g607_${i}`,
       content: [image] }] });
   }
   const pending = images.slice(85).map((image, i) => ({
-    use: { type: "tool_use", id: "toolu_g607_tail_" + i, name: "Read",
-      input: { file_path: "synthetic-tail-" + i + ".jpg" } },
-    result: { type: "tool_result", tool_use_id: "toolu_g607_tail_" + i, content: [image] },
+    use: { type: "tool_use", id: `toolu_g607_tail_${i}`, name: "Read",
+      input: { file_path: `synthetic-tail-${i}.jpg` } },
+    result: { type: "tool_result", tool_use_id: `toolu_g607_tail_${i}`, content: [image] },
   }));
   messages.push({ role: "assistant", content: pending.map((p) => p.use) });
   messages.push({ role: "user", content: pending.map((p) => p.result) });
@@ -50,12 +50,14 @@ export async function runBoxContextTransportProbe(directory: string,
   const store = new FileBoxContextTransport(directory);
   const harness = contextProbeHarness(store);
   const messages = await contextProbeHistory();
-  const session = "g607-" + randomBytes(8).toString("hex");
-  const original = contextProbeBody(messages, {
+  const session = `g607-${randomBytes(8).toString("hex")}`;
+  const rawOriginal = contextProbeBody(messages, {
     metadata: { session_id: session,
       user_id: JSON.stringify({ session_id: session, oc_turn_key: randomBytes(32).toString("hex") }) },
     tools: [{ name: "Read", description: "Read",
     input_schema: { type: "object", properties: { file_path: { type: "string" } } } }] });
+  const rawOriginalJSON = JSON.stringify(rawOriginal);
+  const original = proxyBodySchema.parse(rawOriginal);
   const originalJSON = JSON.stringify(original);
   const bytes = Buffer.byteLength(originalJSON);
   assert.ok(bytes > 16 * 1024 * 1024 && bytes < 24 * 1024 * 1024);
@@ -92,7 +94,9 @@ export async function runBoxContextTransportProbe(directory: string,
       PROXY_BYTE_BUDGET_BOX_NATIVE_V1);
     const restored = await restoreBoxContextRequest({ store, uid: 765n, containerId: 765n,
       body: wire, budget: PROXY_BYTE_BUDGET_BOX_NATIVE_V1, stage: false });
-    assert.equal(JSON.stringify(restored.body), originalJSON);
+    assert.equal(JSON.stringify(restored.body) === originalJSON, true, "normal admission and ref hydration produce identical canonical bytes");
+    assert.equal(JSON.stringify(restored.body.messages) === JSON.stringify(rawOriginal.messages), true,
+      "every original message byte is preserved");
     const summary = boxContextSummary(restored.body);
     assert.equal(summary.imageCount, 91);
     assert.equal(summary.uniqueImageCount, 91);
@@ -108,7 +112,7 @@ export async function runBoxContextTransportProbe(directory: string,
     assert.deepEqual({ prechecks: harness.counts.prechecks, db: harness.counts.db,
       models: harness.counts.models, cursor: harness.counts.cursor },
     { prechecks: 0, db: 0, models: 0, cursor: 0 });
-    assert.equal(JSON.stringify(original), originalJSON, "original input stays untouched");
+    assert.equal(JSON.stringify(rawOriginal) === rawOriginalJSON, true, "original input stays untouched");
     if (verifyLegacyClaim) await runWithVerifiedProxyByteBudget(
       PROXY_BYTE_BUDGET_BOX_NATIVE_V1, () => verifyLegacyClaim(restored.body));
     return { bodyBytes: bytes, messages: messages.length, images: 91, registrations };

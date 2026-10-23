@@ -840,7 +840,7 @@ export function errorPresentation(
     : text?.trim() ?? "";
   const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
   const safeDetail = normalized === "request_too_large"
-    ? (ref ? "请求 ID：" + ref : undefined)
+    ? (ref ? `请求 ID：${ref}` : undefined)
     : sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
   // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
   // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。

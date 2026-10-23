@@ -490,7 +490,7 @@ describe("大请求完整资料错误", () => {
     }
   });
   test("保留此前真实回答，只去掉末尾固定诊断", () => {
-    const shown = errorPresentation("request_too_large", "已完成的分析。\n" + old, undefined);
+    const shown = errorPresentation("request_too_large", `已完成的分析。\n${old}`, undefined);
     expect(shown.bodyText).toBe("已完成的分析。");
     expect(shown.message).toContain("文件和对话均已保留");
   });
