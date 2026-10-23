@@ -8036,7 +8036,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/legacySizeReference.test.ts",
-          "assertion": "REST-first and later REST keep the original request ID"
+          "assertion": "only the safe ID transfers while the current snapshot and content remain untouched"
         }
       ],
       "coverageCommits": [
