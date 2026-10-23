@@ -207,6 +207,9 @@ class HostLogPolicyTest(unittest.TestCase):
             for turn in (1, 2):
                 writer.write(("turn-" + str(turn) + "\n").encode())
                 egress_writer.write(("egress-turn-" + str(turn) + "\n").encode())
+                for name in ("cloudflared-v5-selfhost.log", "openclaude-v5-selfhost-watch.log"):
+                    with self.log(name).open("a") as sibling:
+                        sibling.write("still-writing-before-rotation\n")
                 r = subprocess.run(["logrotate", "--force", "--state", str(self.root / "rotation.state"),
                                     str(view)], capture_output=True, text=True, timeout=10)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
