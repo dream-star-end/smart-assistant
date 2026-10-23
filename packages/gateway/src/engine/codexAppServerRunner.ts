@@ -1,3 +1,5 @@
+import { readLatestCodexNativeHandoff, runnerShutdownTimeoutMs, waitForCloseWithin, killCodexProcessGroup } from './codexLifecycle.js'
+export { readLatestCodexNativeHandoff } from './codexLifecycle.js'
 import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
@@ -13,17 +15,13 @@ export { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 import { EventEmitter } from 'node:events'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import {
-  createReadStream,
-  lstatSync,
   mkdtempSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
-import { createInterface } from 'node:readline'
+import { join } from 'node:path'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
@@ -173,45 +171,6 @@ const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 
 const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
-const CODEX_ROLLOUT_MAX_BYTES = 256 * 1024 * 1024
-
-export async function readLatestCodexNativeHandoff(
-  rolloutPath: string,
-  compactStartedAt: number,
-): Promise<NativeModelHandoffArtifact> {
-  if (!isAbsolute(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const canonical = realpathSync(rolloutPath)
-  if (canonical !== resolve(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const info = lstatSync(canonical)
-  if (!info.isFile() || info.isSymbolicLink() || info.size > CODEX_ROLLOUT_MAX_BYTES) {
-    throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  }
-  let latest: { timestamp: number; message: string } | null = null
-  const lines = createInterface({
-    input: createReadStream(canonical, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  })
-  for await (const line of lines) {
-    if (!line.includes('"type":"compacted"')) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (!parsed || typeof parsed !== 'object') continue
-    const row = parsed as Record<string, unknown>
-    if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
-    const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number.NaN
-    if (!Number.isFinite(ts) || ts + 5_000 < compactStartedAt) continue
-    const payload = row.payload as Record<string, unknown>
-    const message = typeof payload.message === 'string' ? payload.message.trim() : ''
-    if (!message || !Array.isArray(payload.replacement_history)) continue
-    if (!latest || ts >= latest.timestamp) latest = { timestamp: ts, message }
-  }
-  if (!latest) throw new Error('CODEX_NATIVE_COMPACTION_NOT_EXPORTED')
-  return { summaryText: latest.message, source: 'codex', compactStartedAt }
-}
 
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
 // 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
@@ -221,42 +180,6 @@ export async function readLatestCodexNativeHandoff(
 /** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
-
-function runnerShutdownTimeoutMs(name: string, fallback: number): number {
-  const raw = Number(process.env[name])
-  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
-}
-
-function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (closed: boolean) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve(closed)
-    }
-    const timer = setTimeout(() => finish(false), timeoutMs)
-    closePromise.then(() => finish(true))
-  })
-}
-
-function killCodexProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-  try {
-    if (typeof proc.pid === 'number' && proc.pid > 0) {
-      process.kill(-proc.pid, signal)
-      return
-    }
-  } catch {
-    // Fall back to the direct child if the detached process group is already
-    // gone or unavailable on this platform.
-  }
-  try {
-    proc.kill(signal)
-  } catch {
-    /* ignore */
-  }
-}
 
 const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
   'You are in implementation mode, not plan-only mode.',
