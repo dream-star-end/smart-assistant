@@ -325,7 +325,14 @@ dispatch_train() {
   # 取 deploy.lock(fd 8,与 deploy 脚本同一把;取到就持有并传给执行器继承)
   mkdir -p "$(dirname "$LEASE_DEPLOY_LOCK")" 2>/dev/null || true
   exec 8>"$LEASE_DEPLOY_LOCK"
-  flock -n 8 || { wlog "deploy.lock 被持有,不发车"; exec 8>&-; return 0; }
+  if ! flock -n 8; then
+    # 个人版 PG 备份整次运行共享持锁(OCV5-600):写明是备份,列车留在队里,备份结束后下一 tick 发车。
+    local bk=""
+    [[ -f "$LEASE_DEPLOY_LOCK.backup" && ! -L "$LEASE_DEPLOY_LOCK.backup" ]] && bk="$(head -c 200 "$LEASE_DEPLOY_LOCK.backup" 2>/dev/null | head -n1)"
+    if [[ -n "$bk" ]]; then wlog "deploy.lock 被个人版 PG 备份持有($bk),列车排队,备份结束后发车"
+    else wlog "deploy.lock 被持有,不发车"; fi
+    exec 8>&-; return 0
+  fi
 
   # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)。
   # OCV5-439:落后时在 deploy.lock 内自动快进;不能快进就告警、不覆盖、不发车。

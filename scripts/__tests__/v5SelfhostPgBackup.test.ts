@@ -262,7 +262,12 @@ describe('v5-selfhost-pg-backup.sh cli and units', () => {
     // OCV5-600: core daily, full weekly (a full run every day would not fit the off-host bucket)
     for (const [unit, tier, calendar] of [
       ['openclaude-v5-selfhost-pg-backup', 'core', /^OnCalendar=\*-\*-\* /m],
-      ['openclaude-v5-selfhost-pg-backup-full', 'full', /^OnCalendar=Sun /m],
+      // steward 2026-10-23: weekly full at night low traffic
+      [
+        'openclaude-v5-selfhost-pg-backup-full',
+        'full',
+        /^OnCalendar=Sun \*-\*-\* 04:00:00 Asia\/Taipei$/m,
+      ],
     ] as const) {
       const svc = readFileSync(path.join(root, `deploy/v5-selfhost/${unit}.service`), 'utf8')
       assert.match(
@@ -279,6 +284,11 @@ describe('v5-selfhost-pg-backup.sh cli and units', () => {
       assert.match(timer, calendar)
       assert.match(timer, new RegExp(`^Unit=${unit}\\.service$`, 'm'))
     }
+    const full = readFileSync(
+      path.join(root, 'deploy/v5-selfhost/openclaude-v5-selfhost-pg-backup-full.service'),
+      'utf8',
+    )
+    assert.match(full, /^Environment=V5SB_LOCK_WAIT_SEC=\d+$/m)
   })
 })
 
@@ -549,7 +559,7 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
         '  fail) echo partial; exit 1 ;;',
         '  big) head -c 50000 /dev/zero ;;',
         // can a deploy take its lock while the dump runs?
-        '  probe) if flock -n -x "$STUB_DIR/run/deploy.lock" true; then echo free; else echo held; fi > "$STUB_DIR/probe"; echo PGDMP ;;',
+        '  probe) if flock -n -x "$STUB_DIR/run/deploy.lock" true; then echo free; else echo held; fi > "$STUB_DIR/probe"; cat "$STUB_DIR/run/deploy.lock.backup" > "$STUB_DIR/marker" 2>/dev/null; echo PGDMP ;;',
         '  *) echo "PGDMP-stub-archive" ;;',
         'esac',
       ].join('\n'),
@@ -789,6 +799,50 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
         const r = runBackup(['run', '--tier', tier])
         assert.equal(r.status, 0, r.out)
         assert.equal(readFileSync(path.join(dir, 'probe'), 'utf8').trim(), 'held', tier)
+        // while it runs, the backup names itself next to the lock; gone afterwards
+        assert.match(
+          readFileSync(path.join(dir, 'marker'), 'utf8'),
+          new RegExp(`^pid=\\d+ starttime=\\d+ tier=${tier} started=`),
+        )
+        assert.equal(existsSync(path.join(dir, 'run/deploy.lock.backup')), false, tier)
+      }
+    })
+
+    test('V5SB_LOCK_WAIT_SEC waits for a running backup instead of exiting 4', () => {
+      const lock = path.join(dir, 'run/backup.lock')
+      for (const [wait, want] of [
+        ['0', 4],
+        ['15', 0],
+      ] as const) {
+        const r = spawnSync(
+          'bash',
+          [
+            '-c',
+            '( flock -x 9; sleep 2 ) 9>"$LOCKF" & sleep 0.5; bash "$0" run --tier core; rc=$?; wait; exit $rc',
+            script,
+          ],
+          {
+            env: {
+              ...process.env,
+              PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`,
+              LOCKF: lock,
+              STUB_DIR: dir,
+              V5SB_PG_AS: '',
+              V5SB_DIR: path.join(dir, 'backups'),
+              V5SB_STATUS: path.join(dir, 'state/status.json'),
+              V5SB_LOCK: lock,
+              V5SB_DEPLOY_LOCK: path.join(dir, 'run/deploy.lock'),
+              V5SB_DEPLOY_WAIT_SEC: '0',
+              V5SB_WATCH_INTERVAL: '0.1',
+              V5SB_CORE_EST_BYTES: String(GIB),
+              V5SB_FULL_SINK: '',
+              V5SB_LOCK_WAIT_SEC: wait,
+            },
+            encoding: 'utf8',
+            timeout: 30_000,
+          },
+        )
+        assert.equal(r.status, want, `${wait}: ${r.stdout}${r.stderr}`)
       }
     })
 
@@ -797,5 +851,105 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       const r = runBackup(['run'], { V5SB_FULL_SINK: path.join(dir, 'bin/sink') })
       assert.equal(r.status, 2, r.out)
     })
+  })
+})
+
+// OCV5-600 (steward): deploy waits behind a running backup instead of timing out.
+// The real lock functions are cut out of deploy-v5-selfhost.sh and run against a real
+// shared flock held by a fake backup process (cmdline names the backup script).
+describe('deploy-v5-selfhost.sh lock wait with a backup holding the lock', () => {
+  const deploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
+
+  function extract(name: string): string {
+    const lines = readFileSync(deploy, 'utf8').split('\n')
+    const start = lines.findIndex((l) => l.startsWith(`${name}() {`))
+    assert.ok(start >= 0, name)
+    for (let end = start + 1; end <= lines.length; end++) {
+      if (lines[end - 1].trim() !== '}') continue
+      const body = `${lines.slice(start, end).join('\n')}\n`
+      if (spawnSync('bash', ['-n'], { input: body }).status === 0) return body
+    }
+    throw new Error(`function not found: ${name}`)
+  }
+
+  function acquire(opts: {
+    marker: 'backup' | 'none' | 'stale'
+    hold: number
+    backupWait: number
+  }) {
+    const lib = path.join(dir, 'acquire.sh')
+    writeFileSync(
+      lib,
+      ['proc_starttime_of', 'selfhost_backup_lock_holder', 'acquire_selfhost_deploy_lock']
+        .map(extract)
+        .join('\n'),
+    )
+    mkdirSync(path.join(dir, 'fake'), { recursive: true })
+    const fake = path.join(dir, 'fake/v5-selfhost-pg-backup.sh')
+    writeFileSync(
+      fake,
+      [
+        'exec 7<"$1"; flock -s 7',
+        "st=$(awk '{print $22}' /proc/$$/stat)",
+        '[[ "$3" == stale ]] && st=1',
+        '[[ "$3" != none ]] && printf "pid=%s starttime=%s tier=full started=x\\n" $$ "$st" > "$1.backup"',
+        'sleep "$2"',
+      ].join('\n'),
+    )
+    const lock = path.join(dir, 'run/deploy.lock')
+    writeFileSync(lock, '')
+    const body = [
+      'source "$LIB"',
+      'log() { echo "LOG $*"; }; die() { echo "DIE $*"; exit 1; }',
+      'selfhost_lock_py() { case "$1" in prepare) : >"$2" ;; esac; }',
+      'release_policy_mutation_barrier() { :; }',
+      'selfhost_lock_holder_info() { echo "holder=x"; }',
+      'SELFHOST_DEPLOY_LOCK_DIR="$(dirname "$LOCKF")"; SELFHOST_DEPLOY_LOCK="$LOCKF"',
+      'SELFHOST_DEPLOY_LOCK_WAIT=1; SELFHOST_DEPLOY_LOCK_POLL=1; SELFHOST_DEPLOY_LOCK_BACKUP_WAIT="$BW"',
+      'unset OC_V5_SELFHOST_DEPLOY_LOCK_HELD',
+      'bash "$FAKE" "$LOCKF" "$HOLD" "$MODE" & sleep 0.5',
+      '( acquire_selfhost_deploy_lock && echo ACQUIRED ); rc=$?; kill %1 2>/dev/null; wait; exit $rc',
+    ].join('\n')
+    const r = spawnSync('bash', ['-c', body], {
+      env: {
+        ...process.env,
+        LIB: lib,
+        FAKE: fake,
+        LOCKF: lock,
+        HOLD: String(opts.hold),
+        MODE: opts.marker,
+        BW: String(opts.backupWait),
+      },
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+    return { status: r.status, out: `${r.stdout}${r.stderr}` }
+  }
+
+  test('a backup holding the lock: deploy says so and queues past its own timeout', () => {
+    const r = acquire({ marker: 'backup', hold: 4, backupWait: 30 })
+    assert.equal(r.status, 0, r.out)
+    assert.match(r.out, /个人版 PG 备份占锁中\(pid=\d+ starttime=\d+ tier=full/)
+    assert.match(r.out, /ACQUIRED/)
+    assert.doesNotMatch(r.out, /等待 selfhost 发布锁超时/)
+  })
+
+  test('a backup holding past the backup cap fails with an explicit message', () => {
+    const r = acquire({ marker: 'backup', hold: 8, backupWait: 2 })
+    assert.equal(r.status, 1, r.out)
+    assert.match(r.out, /个人版 PG 备份占锁中,已排队 \d+s 仍未结束/)
+  })
+
+  test('any other holder keeps the plain timeout', () => {
+    const r = acquire({ marker: 'none', hold: 8, backupWait: 30 })
+    assert.equal(r.status, 1, r.out)
+    assert.match(r.out, /等待 selfhost 发布锁超时/)
+  })
+
+  test('a marker whose starttime does not match (PID reuse, stale file) is not trusted', () => {
+    const r = acquire({ marker: 'stale', hold: 8, backupWait: 30 })
+    assert.equal(r.status, 1, r.out)
+    assert.match(r.out, /等待 selfhost 发布锁超时/)
+    assert.doesNotMatch(r.out, /备份占锁中/)
   })
 })

@@ -170,6 +170,9 @@ SELFHOST_DEPLOY_LOCK_DIR="/run/openclaude-v5-selfhost"
 SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-${SELFHOST_DEPLOY_LOCK_DIR}/deploy.lock}"
 SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
 SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
+# 个人版 PG 备份(scripts/v5-selfhost-pg-backup.sh)整次运行共享持锁(OCV5-600),每周全量可超过
+# 一小时。持锁者是活着的备份时,等待不计入上面的超时,改按这个上限排队。
+SELFHOST_DEPLOY_LOCK_BACKUP_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
 SELFHOST_DEPLOY_LOCK_HOLDER=""
 SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
 PLATFORM_ARCHIVE_TMP=""
@@ -407,10 +410,24 @@ proc_starttime_of() { # <pid>
 t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split()[19])' "$1"
 }
 
+# 备份持锁时写 <lock>.backup(pid/starttime/tier/started)。pid 活着、/proc starttime 一致、
+# cmdline 是备份脚本才算数(防 PID 复用和残留文件);是则打印该行并返回 0。
+selfhost_backup_lock_holder() {
+  local marker="${1}.backup" line pid st cur
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  line="$(head -n1 -- "$marker" 2>/dev/null)" || return 1
+  [[ "$line" =~ ^pid=([0-9]+)\ starttime=([0-9]+)\  ]] || return 1
+  pid="${BASH_REMATCH[1]}"; st="${BASH_REMATCH[2]}"
+  cur="$(proc_starttime_of "$pid" 2>/dev/null)" || return 1
+  [[ "$cur" == "$st" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'v5-selfhost-pg-backup\.sh' || return 1
+  printf '%s' "$line"
+}
+
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info holder_line starttime
+  local lock wait_s interval waited info holder_line starttime backup_waited backup_info
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     release_policy_mutation_barrier || exit "$?"
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
@@ -434,7 +451,22 @@ acquire_selfhost_deploy_lock() {
   exec 8<>"$lock" || die "无法打开锁文件 $lock"
   if ! flock -n 8; then
     waited=0
+    backup_waited=0
     while ! flock -n 8; do
+      # 备份占锁:排队等它结束,不计入 wait_s,也不当成超时失败(OCV5-600)。
+      if backup_info="$(selfhost_backup_lock_holder "$lock")"; then
+        if (( backup_waited >= SELFHOST_DEPLOY_LOCK_BACKUP_WAIT )); then
+          echo "✗ 个人版 PG 备份占锁中,已排队 ${backup_waited}s 仍未结束(上限 ${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT}s)。锁=$lock 备份=$backup_info
+补救: systemctl status openclaude-v5-selfhost-pg-backup-full.service / openclaude-v5-selfhost-pg-backup.service;备份结束后重发。" >&2
+          exit 1
+        fi
+        if (( backup_waited % 300 == 0 )); then
+          log "⏳ 个人版 PG 备份占锁中($backup_info),列车排队等它结束: 已等 ${backup_waited}s / ${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT}s(不计入 ${wait_s}s 超时)"
+        fi
+        sleep "$interval"
+        backup_waited=$((backup_waited + interval))
+        continue
+      fi
       if (( waited >= wait_s )); then
         info="$(selfhost_lock_holder_info "$lock")"
         echo "✗ 等待 selfhost 发布锁超时(${wait_s}s)。锁=$lock $info

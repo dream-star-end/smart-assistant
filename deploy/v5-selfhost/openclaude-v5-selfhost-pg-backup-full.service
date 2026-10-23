@@ -10,6 +10,8 @@ OnFailure=openclaude-v5-selfhost-watch-alert@%n.service
 [Service]
 Type=oneshot
 User=root
+# The 03:40 core run may still hold the backup lock (it can wait up to 1 h for a train).
+Environment=V5SB_LOCK_WAIT_SEC=5400
 EnvironmentFile=-/etc/openclaude/selfhost-pg-backup.env
 ExecStart=/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh run --tier full
 Nice=15
