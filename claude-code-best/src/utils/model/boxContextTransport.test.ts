@@ -17,7 +17,7 @@ function server() {
   const staged: Array<{ path: string; body: Record<string, any> }> = []
   let stages = 0
   const client = {
-    baseURL: 'http://g607.invalid/' + randomUUID(),
+    baseURL: `http://g607.invalid/${randomUUID()}`,
     async post<R>(path: string, options: { body: unknown }): Promise<R> {
       expect(path).toBe('/v1/messages/context')
       const body = options.body as Record<string, any>

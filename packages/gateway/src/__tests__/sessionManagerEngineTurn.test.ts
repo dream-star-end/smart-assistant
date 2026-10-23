@@ -2936,7 +2936,7 @@ describe("crash/interrupt partial persistence", () => {
       await sm.awaitPendingPersistence();
 
       assert.equal(captured.payloads.length, 1);
-      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.equal(captured.payloads[0]!.status, "crashed");
       assert.equal(captured.payloads[0]!.errorCode, "ENGINE_ERROR");
       assert.equal(
         captured.payloads[0]!.errorDetail,
@@ -3141,8 +3141,8 @@ describe("crash/interrupt partial persistence", () => {
 
       assert.equal(captured.payloads.length, 1);
       const payload = captured.payloads[0]!;
-      assert.equal(payload.status, "completed");
-      assert.equal(payload.text, EMPTY_COMPLETED_TURN_NOTICE);
+      assert.equal(payload.status, "crashed");
+      assert.equal(payload.text, "");
       assert.equal(
         payload.errorDetail,
         JSON.stringify({
@@ -5105,7 +5105,7 @@ for (const succeedsAfter of [4, Number.POSITIVE_INFINITY]) {
       assert.equal(retries.length, submits - 1);
       assert.deepEqual(runner.submittedInputs, ['finish', ...Array(submits - 1).fill(TRANSIENT_RETRY_INPUT)]);
       assert.equal(captured.payloads.length, 1);
-      assert.equal(captured.payloads[0]!.status, 'completed');
+      assert.equal(captured.payloads[0]!.status, succeedsAfter === Number.POSITIVE_INFINITY ? 'crashed' : 'completed');
       if (succeedsAfter === Number.POSITIVE_INFINITY) assert.equal(captured.payloads[0]!.errorCode, 'rate_limited');
     } finally { setV3MasterSinkSingleton(null); }
   });

@@ -35,8 +35,7 @@ export function boxContextSummary(body: ProxyBody): {
       const source = block.source as { type?: unknown; data?: unknown; media_type?: unknown } | undefined;
       if (source?.type === "base64" && typeof source.data === "string") {
         result.mediaBase64Bytes += Buffer.byteLength(source.data);
-        if (block.type === "image") images.add((typeof source.media_type === "string" ? source.media_type : "") + ":" +
-          createHash("sha256").update(source.data).digest("hex"));
+        if (block.type === "image") images.add(`${typeof source.media_type === "string" ? source.media_type : ""}:${createHash("sha256").update(source.data).digest("hex")}`);
       }
     } else if (block.type === "tool_result") {
       if (typeof block.content === "string") result.textBytes += Buffer.byteLength(block.content);

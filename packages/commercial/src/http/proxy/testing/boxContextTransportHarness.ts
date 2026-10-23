@@ -131,9 +131,9 @@ export function contextProbeHarness(store: BoxContextTransport, options: {
       return res;
     },
     close() {
-      if (previous === undefined) delete process.env.OC_BOX_MODEL_API;
+      if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_MODEL_API");
       else process.env.OC_BOX_MODEL_API = previous;
-      if (previousHealth === undefined) delete process.env.OC_PROVIDER_HEALTH_ENFORCE;
+      if (previousHealth === undefined) Reflect.deleteProperty(process.env, "OC_PROVIDER_HEALTH_ENFORCE");
       else process.env.OC_PROVIDER_HEALTH_ENFORCE = previousHealth;
     },
   };

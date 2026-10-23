@@ -23,7 +23,7 @@ test("lossless context transport preserves every byte of a 17 MiB history after 
     const messages = Array.from({ length: 91 }, (_, i) => ({
       role: "user", content: [{ type: "image",
         source: { type: "base64", media_type: "image/jpeg", data: image },
-        marker: "image-" + i }],
+        marker: `image-${i}` }],
     }));
     const raw = JSON.stringify(messages);
     assert.ok(Buffer.byteLength(raw) > 16 * 1024 * 1024);
@@ -99,11 +99,11 @@ test("independent store instances serialize file publication and quota with kern
   await fixture(async (dir) => {
     const stores = [new FileBoxContextTransport(dir), new FileBoxContextTransport(dir)];
     const refs = await Promise.all(Array.from({ length: 12 }, async (_, i) =>
-      stores[i % 2]!.put(binding, [{ role: "user", content: "item-" + i }])));
+      stores[i % 2]!.put(binding, [{ role: "user", content: `item-${i}` }])));
     assert.equal(new Set(refs.map((r) => r.reference)).size, 12);
     await Promise.all(refs.map(async (ref, i) =>
       assert.deepEqual(await stores[(i + 1) % 2]!.get(binding, ref.reference),
-        [{ role: "user", content: "item-" + i }])));
+        [{ role: "user", content: `item-${i}` }])));
     assert.equal((await readdir(dir)).filter((n) => n.endsWith(".part")).length, 0);
   });
 });
@@ -123,11 +123,11 @@ test("cache entry count is bounded and older references can be re-registered", a
   await fixture(async (dir) => {
     const store = new FileBoxContextTransport(dir);
     const first = await store.put(binding, [{ role: "user", content: "first" }]);
-    for (let i = 0; i < 128; i++) await store.put(binding, [{ role: "user", content: "later-" + i }]);
+    for (let i = 0; i < 128; i++) await store.put(binding, [{ role: "user", content: `later-${i}` }]);
     assert.equal((await readdir(dir)).filter((n) => n.endsWith(".json")).length, 128);
     const peer = new FileBoxContextTransport(dir);
     await Promise.all(Array.from({ length: 12 }, (_, i) =>
-      (i % 2 ? peer : store).put(binding, [{ role: "user", content: "concurrent-" + i }])));
+      (i % 2 ? peer : store).put(binding, [{ role: "user", content: `concurrent-${i}` }])));
     assert.equal((await readdir(dir)).filter((n) => n.endsWith(".json")).length, 128,
       "kernel lock also serializes quota admission, not only unique filenames");
     await assert.rejects(store.get(binding, first.reference), rejectCode("BOX_CONTEXT_REF_EXPIRED"));

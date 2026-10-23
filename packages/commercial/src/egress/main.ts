@@ -543,7 +543,7 @@ export async function startEgress(): Promise<void> {
   const contextDirectory = boxReplayDirectory(process.env.OC_PLATFORM_ROOT);
   const proxyHandler = makeAnthropicProxyHandler({
     ...(contextDirectory ? { boxContextTransport:
-      new FileBoxContextTransport(contextDirectory + "/context-transport") } : {}),
+      new FileBoxContextTransport(`${contextDirectory}/context-transport`) } : {}),
     pgPool: getPool(),
     pricing,
     preCheckRedis,
