@@ -37,6 +37,7 @@
  */
 export const NON_ADMIN_CONTEXT_WINDOW_LIMITS: Readonly<Record<string, number>> = {
   'kimi-k3': 512_000,
+  'k3.1-pro': 512_000,
 }
 
 /**
