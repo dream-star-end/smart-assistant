@@ -82,7 +82,7 @@ export async function runBoxContextTransportProbe(directory: string,
       const response = await harness.call(request);
       assert.equal(response.statusCode, 200, "stage must finish before precheck/model work");
       const ref = response.json();
-      assert.equal(ref.message_count, end);
+      assert.equal(ref.message_count, end, "CONTEXT_TRANSPORT_PREFIX_COUNT");
       assert.equal(ref.messages_sha256,
         createHash("sha256").update(JSON.stringify(messages.slice(0, end))).digest("hex"));
       reference = ref.reference;
