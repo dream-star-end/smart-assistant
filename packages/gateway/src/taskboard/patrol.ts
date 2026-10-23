@@ -1,3 +1,5 @@
+import { checkTaskboardStages, type TaskboardPreflight } from './stagePreflight.js'
+import { hasPendingTaskboardExecution } from './executionState.js'
 // Taskboard 统一 60s tick 引擎 + run 执行 + 状态推进。
 //
 // 设计意图:
@@ -50,7 +52,7 @@ import { getStage, listStages } from './db/pipelines.js'
 import { listRelations } from './db/relations.js'
 import {
   acquireLease,
-  getActiveLease,
+  archiveExpiredRunOutput,
   getRun,
   insertRun,
   listRuns,
@@ -69,7 +71,7 @@ import {
   hasSkippedRunToday,
   updateSettings,
 } from './db/settings.js'
-import { getTicket, listTickets, updateTicket } from './db/tickets.js'
+import { getTicket, listReadyStageIds, listTickets, updateTicket } from './db/tickets.js'
 import {
   type Actor,
   GUARDRAIL_DEFAULTS,
@@ -293,6 +295,7 @@ export function isRunUsageComplete(usage: RunUsageSnapshot): boolean {
 export const DEFAULT_USAGE_BACKFILL_DELAY_MS = 500
 
 export interface PatrolEngineOptions {
+  preflightStages?: TaskboardPreflight
   getDb: () => TaskboardDb
   delegate: PatrolDelegateFn
   now?: () => number
@@ -338,6 +341,7 @@ export function resetSharedPatrolState(): void {
 export class PatrolEngine {
   readonly slots: PatrolSlotCounter
   readonly idle: IdleBackoffState
+  private readonly preflightStages?: TaskboardPreflight
   private readonly getDb: () => TaskboardDb
   private readonly delegate: PatrolDelegateFn
   private readonly nowFn: () => number
@@ -352,6 +356,7 @@ export class PatrolEngine {
   private ticking = false
 
   constructor(opts: PatrolEngineOptions) {
+    this.preflightStages = opts.preflightStages
     this.getDb = opts.getDb
     this.delegate = opts.delegate
     this.nowFn = opts.now ?? Date.now
@@ -434,10 +439,13 @@ export class PatrolEngine {
 
   private async tickOnceInner(
     db: TaskboardDb,
-    at: Date,
-    now: number,
-    settings: TaskboardSettings,
+    initialAt: Date,
+    initialNow: number,
+    initialSettings: TaskboardSettings,
   ): Promise<TickReport> {
+    let at = initialAt
+    let now = initialNow
+    let settings = initialSettings
     const reaped = this.recoverExpired(db, now)
 
     const paused = checkPatrolPaused(settings)
@@ -454,6 +462,22 @@ export class PatrolEngine {
     }
 
     const stages = listPatrolEnabledStages(db)
+    const readyStages = new Set(listReadyStageIds(db))
+    const pendingStages = stages.filter((stage) => readyStages.has(stage.id))
+    const beforePreflight = this.nowFn()
+    const checks = await checkTaskboardStages(this.preflightStages, pendingStages)
+    const issuesByStage = new Map(pendingStages.map((stage, index) => [stage.id, checks[index]]))
+    now += Math.max(0, this.nowFn() - beforePreflight)
+    at = new Date(now)
+    settings = getSettings(db)
+    this.slots.setLimit(settings.maxConcurrentRuns)
+    if (settings.patrolPaused) return { reaped, paused: true, started: 0, skipped: 0, settled: 0 }
+    const freshBudget = checkDailyBudget(getUsage(db, now), settings, now)
+    if (!freshBudget.ok) {
+      emitGuardrailAlert(this.onAlert, freshBudget.alert)
+      updateSettings(db, { patrolPaused: true })
+      return { reaped, paused: true, started: 0, skipped: 0, settled: 0 }
+    }
     let started = 0
     let skipped = 0
     let settled = 0
@@ -506,6 +530,12 @@ export class PatrolEngine {
         continue
       }
       this.idle.recordBusy(stage.id, at)
+      const issue = issuesByStage.get(stage.id)
+      if (!issuesByStage.has(stage.id) || issue !== null) {
+        skipped += picked.runnable.length
+        this.log('taskboard stage is not executable', { stageId: stage.id, code: issue?.code ?? 'preflight_pending', message: issue?.message })
+        continue
+      }
 
       for (const ticket of picked.runnable) {
         if (started >= settings.maxRunsPerTick) break
@@ -619,7 +649,7 @@ export class PatrolEngine {
     if (countTicketStageRunsToday(db, ticket.id, stage.id, now) >= stage.maxRunsPerDay) {
       return 'daily_quota'
     }
-    if (getActiveLease(db, ticket.id, now)) return 'lease_held'
+    if (hasPendingTaskboardExecution(db, ticket.id)) return 'lease_held'
     const loop = checkStageLoop(ticket.stageLoopCount, settings.maxStageLoops, ticket.id, stage.id)
     if (!loop.ok) {
       emitGuardrailAlert(this.onAlert, loop.alert)
@@ -644,12 +674,15 @@ export class PatrolEngine {
         const current = getTicket(db, ticket.id)
         if (
           !current ||
+          hasPendingTaskboardExecution(db, ticket.id) ||
           current.status !== 'ready' ||
           current.version !== ticket.version ||
           current.stageId !== stage.id
         ) {
           return null
         }
+        const freshStage = getStage(db, stage.id)
+        if (!freshStage || JSON.stringify(freshStage) !== JSON.stringify(stage)) return null
         assertTransition({
           from: current.status,
           to: 'running',
@@ -835,13 +868,25 @@ export class PatrolEngine {
           error: err instanceof Error ? err.message : String(err),
         }
       }
-      if (leaseLost) return
+      if (leaseLost) {
+        await control.waitForDescendants(sessionKey)
+        this.archiveLateOutput(db, run, result.output ?? '')
+        return
+      }
       await control.waitForDescendants(sessionKey)
       await this.finishRun(db, ticket, stage, run, settings, result)
     } finally {
       clearInterval(renewTimer)
       await control.waitForDescendants(sessionKey)
       taskboardRunControls.finish(control)
+    }
+  }
+
+  private archiveLateOutput(db: TaskboardDb, run: TicketRun, output: string): void {
+    const control = run.leaseOwner ? taskboardRunControls.get(run.id, run.ticketId, run.leaseOwner) : undefined
+    if (!control || control.rootSessionKey !== run.sessionKey) return
+    if (archiveExpiredRunOutput(db, run, output, this.nowFn())) {
+      this.log('taskboard late output archived without lease or ticket changes', { runId: run.id })
     }
   }
 
@@ -932,6 +977,7 @@ export class PatrolEngine {
     }).immediate()
 
     if (!settled) {
+      this.archiveLateOutput(db, run, output)
       this.log('taskboard stale result discarded:fence lost', { runId: run.id, owner })
       return
     }

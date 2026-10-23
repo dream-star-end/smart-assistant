@@ -20,7 +20,9 @@ import {
   updateStage,
 } from './db/pipelines.js'
 import { getRun } from './db/runs.js'
-import { getTemplate } from './db/templates.js'
+import { getTemplate, type PipelineTemplate } from './db/templates.js'
+import type { BuiltinExecutionOptions } from './db/seed.js'
+import { assertTaskboardStagesRunnable, type TaskboardExecutionSpec } from './stagePreflight.js'
 import {
   type Actor,
   type OnFailureAction,
@@ -188,14 +190,22 @@ function validateStageWrite(input: {
   }
 }
 
+export class TaskboardTemplateChangedError extends Error {
+  constructor() { super('模板已变更，请重新加载后再套用'); this.name = 'TaskboardTemplateChangedError' }
+}
+
 export async function assertTemplatesValidForApply(
   db: TaskboardDb,
   templateIds: string[],
   ctx: TaskboardHttpContext,
-): Promise<void> {
+  options: BuiltinExecutionOptions = {},
+): Promise<{ templateIds: string[]; assertUnchanged: () => void }> {
+  const stages: TaskboardExecutionSpec[] = []
+  const snapshots: PipelineTemplate[] = []
   for (const templateId of templateIds) {
-    const template = getTemplate(db, templateId)
+    const template = getTemplate(db, templateId, options)
     if (!template) throw new TaskboardNotFound('template', templateId)
+    snapshots.push(template)
     for (const stage of template.stages) {
       validateStageWrite({
         kind: stage.kind,
@@ -207,7 +217,19 @@ export async function assertTemplatesValidForApply(
         timeoutSec: stage.timeoutSec,
       })
       if (stage.model) await assertStageModelAvailable(stage.model, ctx)
+      stages.push(stage)
     }
+  }
+  await assertTaskboardStagesRunnable(ctx.preflightStages, stages)
+  return {
+    templateIds: snapshots.map((template) => template.id),
+    assertUnchanged: () => {
+      for (const snapshot of snapshots) {
+        if (JSON.stringify(getTemplate(db, snapshot.id, options)) !== JSON.stringify(snapshot)) {
+          throw new TaskboardTemplateChangedError()
+        }
+      }
+    },
   }
 }
 
@@ -256,6 +278,7 @@ export async function handleCreateStage(
     entryCondition,
     timeoutSec,
   })
+  await assertTaskboardStagesRunnable(ctx.preflightStages, [{ kind, agentId, model }])
   let stage: PipelineStage
   try {
     stage = createStage(db, {
@@ -360,6 +383,15 @@ export async function handlePatchStage(
     entryCondition,
     timeoutSec,
   })
+  const executionChanged = kind !== existing.kind || agentId !== existing.agentId ||
+    (model !== undefined && model !== existing.model) || (!existing.patrolEnabled && patrolEnabled)
+  if (executionChanged) {
+    await assertTaskboardStagesRunnable(ctx.preflightStages, [{ kind, agentId, model: model === undefined ? existing.model : model }])
+  }
+  if (JSON.stringify(getStage(db, id)) !== JSON.stringify(existing)) {
+    sendError(res, 409, '阶段配置已变更，请重新加载后再保存', { code: 'stage_configuration_changed' })
+    return
+  }
   let stage: PipelineStage
   try {
     stage = updateStage(db, id, {

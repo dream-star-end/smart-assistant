@@ -874,6 +874,7 @@ export function TaskboardView({
           <div className={desktop ? 'flex shrink-0 items-center gap-1' : 'hidden'}>
             <ProjectSettings
               auth={auth}
+              agents={board.agents}
               current={currentProject}
               mode={projectMode}
               onModeChange={setProjectMode}
@@ -912,6 +913,7 @@ export function TaskboardView({
             />
             <TemplateLibrary
               auth={auth}
+              agents={board.agents}
               projectId={board.projectId}
               onChanged={() => void board.reconcile()}
               open={templatesOpen}

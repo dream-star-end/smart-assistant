@@ -210,6 +210,12 @@ export function getLatestRunMetadata(db: TaskboardDb, ticketId: string): TicketR
   return row ? mapRun(row) : null
 }
 
+/** A lease expiring is not proof that its worker has finished. */
+export function hasUnfinishedRun(db: TaskboardDb, ticketId: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM tb_ticket_run WHERE ticket_id = ?
+    AND status IN ('queued', 'running') LIMIT 1`).get(ticketId)
+}
+
 export function insertRun(db: TaskboardDb, input: CreateRunInput): TicketRun {
   const now = nowMs()
   const id = newId()
@@ -463,6 +469,30 @@ export function settleLeaseRun(
     costImprecise: bindCostImprecise(patch.costImprecise),
   })
   return result.changes === 1 ? getRun(db, runId) : null
+}
+
+/** Preserve a late worker's result on its exact old row, without reacquiring authority. */
+export function archiveExpiredRunOutput(db: TaskboardDb, original: TicketRun, output: string, now: number): boolean {
+  if (!output || !original.sessionKey || !original.leaseOwner) return false
+  const current = getRun(db, original.id)
+  if (!current || current.outputMd !== null) return false
+  const expiredActive = (current.status === 'queued' || current.status === 'running') &&
+    current.leaseOwner === original.leaseOwner && current.leaseExpiresAt !== null && current.leaseExpiresAt <= now
+  const reaped = current.status === 'timeout' && current.leaseOwner === null &&
+    current.leaseExpiresAt === null && current.error === 'lease expired' && current.finishedAt !== null
+  if (!expiredActive && !reaped) return false
+  // Reaping clears owner. For that branch controller provenance is checked by the caller;
+  // compare all immutable execution bindings and the observed terminal facts here.
+  return db.prepare(`UPDATE tb_ticket_run SET output_md = @output
+    WHERE id = @id AND ticket_id = @ticketId AND stage_id = @stageId
+      AND session_key = @sessionKey AND agent_id IS @agentId AND started_at IS @startedAt
+      AND status = @status AND lease_owner IS @owner AND lease_expires_at IS @expiresAt
+      AND error IS @error AND finished_at IS @finishedAt AND output_md IS NULL`).run({
+    output, id: original.id, ticketId: original.ticketId, stageId: original.stageId,
+    sessionKey: original.sessionKey, agentId: original.agentId, startedAt: original.startedAt,
+    status: current.status, owner: current.leaseOwner, expiresAt: current.leaseExpiresAt,
+    error: current.error, finishedAt: current.finishedAt,
+  }).changes === 1
 }
 
 /** 清掉 run 上的 lease。不改 status;调用方随后 updateRun 写终态。 */

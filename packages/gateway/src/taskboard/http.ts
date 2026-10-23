@@ -62,7 +62,9 @@ import {
   listRuns,
   updateRun,
 } from './db/runs.js'
-import { seedDefaultPipelines } from './db/seed.js'
+import { assertTaskboardStagesRunnable, TaskboardPreflightError } from './stagePreflight.js'
+import { hasPendingTaskboardExecution } from './executionState.js'
+import { listBuiltinPipelineTemplates, seedDefaultPipelines } from './db/seed.js'
 import {
   type TaskboardSettings,
   type TaskboardUsage,
@@ -140,6 +142,7 @@ import {
   handlePatchPipeline,
   handleListStages,
   assertTemplatesValidForApply,
+  TaskboardTemplateChangedError,
   handleCreateStage,
   handleGetStage,
   handleReorderStages,
@@ -552,6 +555,8 @@ function recordAudit(
 }
 
 function mapHttpError(res: ServerResponse, err: unknown): boolean {
+  if (err instanceof TaskboardTemplateChangedError) { sendError(res, 409, err.message, { code: 'template_configuration_changed' }); return true }
+  if (err instanceof TaskboardPreflightError) { sendError(res, err.issue.status, err.message, { code: err.issue.code }); return true }
   if (err instanceof BodyTooLargeError) {
     sendError(res, 413, 'payload too large')
     return true
@@ -786,6 +791,7 @@ async function dispatch(
         actor,
         idOrIdent,
         sub as TicketAction,
+        ctx,
       )
     }
     return sendError(res, 404, 'not found', { code: 'not_found' })
@@ -932,13 +938,18 @@ async function handleCreateProject(
   const name = asString(body.name)
   if (!key || !name) throw new TaskboardValidationError('key and name are required')
   const templateIds = asStringArray(body.templateIds)
-  if (actor !== 'human' && templateIds !== undefined && templateIds.length > 0) {
+  const executionAgentId = asNullableString(body.executionAgentId)?.trim() || null
+  if (actor !== 'human' && (Object.hasOwn(body, 'executionAgentId') || (templateIds !== undefined && templateIds.length > 0))) {
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
     return
   }
-  if (templateIds?.length) await assertTemplatesValidForApply(db, templateIds, ctx)
+  const options = { executionAgentId }
+  const selectedTemplates = templateIds ?? listBuiltinPipelineTemplates().map((template) => template.id)
+  const validated = actor === 'human' && selectedTemplates.length > 0
+    ? await assertTemplatesValidForApply(db, selectedTemplates, ctx, options) : null
   try {
     const created = db.transaction(() => {
+      validated?.assertUnchanged()
       const project = createProject(db, {
         key,
         name,
@@ -948,9 +959,9 @@ async function handleCreateProject(
         labels: asStringArray(body.labels) ?? [],
       })
       if (templateIds === undefined) {
-        seedDefaultPipelines(db, project.id)
+        seedDefaultPipelines(db, project.id, undefined, options)
       } else if (templateIds.length > 0) {
-        applyTemplates(db, project.id, templateIds)
+        applyTemplates(db, project.id, validated?.templateIds ?? templateIds, options)
       }
       return project
     })()
@@ -1563,23 +1574,25 @@ async function handleTimeline(res: ServerResponse, url: URL, db: TaskboardDb, ti
   sendJson(res, 200, { items: window.map((item) => item.kind === 'run' ? { ...item, run: byId.get(item.run.id) ?? item.run } : item) })
 }
 
-function handleTicketAction(
+async function handleTicketAction(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   actor: Actor,
   idOrIdent: string,
   action: TicketAction,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
   const activeExecution = getActiveLease(db, ticket.id)
   const control = activeExecution?.leaseOwner ? taskboardRunControls.get(activeExecution.id, ticket.id, activeExecution.leaseOwner) : undefined
-  if (actor !== 'human' && action !== 'comment' && control?.signal.aborted) return sendError(res, 409, '本次执行已停止', { code: 'USER_CANCELLED' })
-  if (actor === 'human' && !['comment', 'patrol', 'stop', 'move'].includes(action) && activeExecution) {
+  const runningControl = control ?? taskboardRunControls.getActiveForTicket(ticket.id)
+  if (actor !== 'human' && action !== 'comment' && runningControl?.signal.aborted) return sendError(res, 409, '本次执行已停止', { code: 'USER_CANCELLED' })
+  if (actor === 'human' && !['comment', 'patrol', 'stop', 'move'].includes(action) && hasPendingTaskboardExecution(db, ticket.id)) {
     return sendError(res, 409, '请先停止本次执行，收尾完成后再操作', { code: 'active_execution' })
   }
   if (action === 'comment') handleComment(res, body, db, actor, ticket)
-  else if (action === 'patrol') handlePatrol(res, body, db, actor, ticket)
+  else if (action === 'patrol') await handlePatrol(res, body, db, actor, ticket, ctx)
   else if (action === 'stop') handleStop(res, body, db, actor, ticket)
   else if (action === 'claim') handleClaim(res, body, db, actor, ticket)
   else if (action === 'ready') handleReady(res, body, db, actor, ticket)
@@ -1606,6 +1619,9 @@ function handleMove(
   if (actor !== 'human') {
     sendError(res, 403, 'forbidden', { code: 'forbidden' })
     return
+  }
+  if (!getActiveLease(db, ticket.id) && hasPendingTaskboardExecution(db, ticket.id)) {
+    return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
   }
   const expectedVersion = requireExpectedVersion(body)
   if (expectedVersion !== ticket.version) {
@@ -1954,21 +1970,18 @@ function handleReady(
 ): void {
   const expectedVersion = requireExpectedVersion(body)
   const actorId = actorIdOf(actor, asString(body.owner) ?? asString(body.author))
-  if (ticket.status === 'backlog') {
-    const updated = applyBacklogApproval(db, ticket, expectedVersion, actor, actorId)
-    sendJson(res, 200, { ok: true, ticket: updated })
-    return
-  }
-  const stage = currentStage(db, ticket)
-  assertTransition({
-    from: ticket.status,
-    to: 'ready',
-    actor,
-    autoClose: stage?.autoClose,
-    stageOnSuccess: stage?.onSuccess,
-  })
-  const updated = updateTicket(db, ticket.id, expectedVersion, { status: 'ready' })
-  recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'ready')
+  const updated = db.transaction(() => {
+    const current = requireTicket(db, ticket.id)
+    if (current.version !== expectedVersion) throw new TaskboardVersionConflict(ticket.id, expectedVersion, current.version)
+    if (hasPendingTaskboardExecution(db, ticket.id)) return null
+    if (current.status === 'backlog') return applyBacklogApproval(db, current, expectedVersion, actor, actorId)
+    const stage = currentStage(db, current)
+    assertTransition({ from: current.status, to: 'ready', actor, autoClose: stage?.autoClose, stageOnSuccess: stage?.onSuccess })
+    const result = updateTicket(db, current.id, expectedVersion, { status: 'ready' })
+    recordActivity(db, current.id, actor, actorId, 'status_changed', 'status', current.status, 'ready')
+    return result
+  }).immediate()
+  if (!updated) return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -2358,18 +2371,20 @@ function handleStop(
   sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
 }
 
-function handlePatrol(
+async function handlePatrol(
   res: ServerResponse,
   body: Record<string, unknown>,
   db: TaskboardDb,
   actor: Actor,
   ticket: Ticket,
-): void {
+  ctx: TaskboardHttpContext,
+): Promise<void> {
   const expectedVersion = requireExpectedVersion(body)
   if (ticket.version !== expectedVersion) {
     throw new TaskboardVersionConflict(ticket.id, expectedVersion, ticket.version)
   }
-  const settings = getSettings(db)
+  if (hasPendingTaskboardExecution(db, ticket.id)) return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+  let settings = getSettings(db)
   if (settings.patrolPaused) {
     throw new TaskboardValidationError('patrol is paused')
   }
@@ -2378,6 +2393,9 @@ function handlePatrol(
   const stage = getStage(db, stageRef)
   if (!stage) throw new TaskboardNotFound('stage', stageRef)
   if (stage.kind !== 'ai') throw new TaskboardValidationError('stage is not an ai stage')
+  await assertTaskboardStagesRunnable(ctx.preflightStages, [stage])
+  settings = getSettings(db)
+  if (settings.patrolPaused) return sendError(res, 409, '巡检已暂停，请先恢复巡检', { code: 'patrol_paused' })
 
   const usage = getUsage(db)
   const slots = getSharedPatrolSlots()
@@ -2411,6 +2429,14 @@ function handlePatrol(
 
   const owner = actorIdOf(actor, asString(body.owner), stage.agentId)
   const result = db.transaction(() => {
+    const fresh = requireTicket(db, ticket.id)
+    if (fresh.version !== expectedVersion) throw new TaskboardVersionConflict(ticket.id, expectedVersion, fresh.version)
+    if (hasPendingTaskboardExecution(db, ticket.id)) return { kind: 'busy' } as const
+    const freshStage = getStage(db, stage.id)
+    if (!freshStage || JSON.stringify(freshStage) !== JSON.stringify(stage)) return { kind: 'stage_changed' } as const
+    const liveSettings = getSettings(db)
+    if (liveSettings.patrolPaused) return { kind: 'paused' } as const
+    if (getUsage(db).activeRuns >= liveSettings.maxConcurrentRuns || slots.getActive() >= liveSettings.maxConcurrentRuns) return { kind: 'full' } as const
     const run = acquireLease(db, ticket.id, stage.id, owner, alignedLeaseTtlMs(stage.timeoutSec), {
       agentId: stage.agentId,
       trigger: 'manual',
@@ -2434,8 +2460,12 @@ function handlePatrol(
         'running',
       )
     }
-    return { run: withKey, ticket: updated }
-  })()
+    return { kind: 'claimed', run: withKey, ticket: updated } as const
+  }).immediate()
+  if (result.kind === 'busy') return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+  if (result.kind === 'stage_changed') return sendError(res, 409, '阶段配置已更新，请刷新后重试', { code: 'stage_configuration_changed' })
+  if (result.kind === 'paused') return sendError(res, 409, '巡检已暂停，请先恢复巡检', { code: 'patrol_paused' })
+  if (result.kind === 'full') return sendError(res, 429, 'taskboard concurrency full', { code: 'concurrency_full' })
 
   enqueuePatrolExecution({
     ticketId: result.ticket.id,

@@ -204,15 +204,17 @@ export function TicketDrawer({
     if (next && knownTerminal && (next.status === 'running' || next.status === 'queued')) return false
     executionRef.current = next
     setExecution(next)
-    if (next?.stopRequested) setStopState('stopping')
-    else if (!next || (next.status !== 'running' && next.status !== 'queued')) setStopState(null)
+    if (!next || (next.status !== 'running' && next.status !== 'queued')) setStopState(null)
+    else if (next.stopRequested) setStopState('stopping')
+    else if (previous?.id !== next.id) setStopState(null)
     setTimeline((items) => mergeExecution(items, next))
     return previous?.id !== next?.id || previous?.status !== next?.status
   }, [])
   const currentStage = detailStage?.id === current?.stageId
     ? detailStage
     : stages.find((stage) => stage.id === current?.stageId) ?? null
-  const canStart = !activeExecution && !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const canRetry = !activeExecution && !!execution && !!current && execution.stageId === current.stageId && (current.status === 'blocked' || current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const canStart = !canRetry && !activeExecution && !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
   const reads = useMemo(() => {
     const details = new Map<string, ReturnType<typeof taskboardApi.getTicketDetail>>()
     const timelines = new Map<string, ReturnType<typeof taskboardApi.listTimeline>>()
@@ -495,12 +497,22 @@ export function TicketDrawer({
     }
   }
 
-  const runPatrol = async () => {
+  const runPatrol = async (retry = false) => {
     if (!current) return
     const gen = ownerGen.current
     setPatrolling(true)
     try {
-      const out = await taskboardApi.patrol(auth, current.id, current.version)
+      let ready = current
+      if (retry && current.status !== 'ready') {
+        ready = (await taskboardApi.ready(auth, current.id, current.version)).ticket
+        if (ownerGen.current !== gen) return
+        if (!currentRef.current || ready.version >= currentRef.current.version) {
+          currentRef.current = ready
+          setDetail(ready)
+          onTicketUpdated(ready)
+        }
+      }
+      const out = await taskboardApi.patrol(auth, ready.id, ready.version)
       if (ownerGen.current !== gen) return
       if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
         currentRef.current = out.ticket
@@ -689,6 +701,11 @@ export function TicketDrawer({
             {activeExecution && (
               <Button type="button" size="sm" variant="danger" data-testid="ticket-drawer-stop" loading={stopState === 'requesting'} disabled={stopState !== null} onClick={() => void stopRun()}>
                 {stopState === 'requesting' ? '请求停止…' : stopState === 'stopping' ? '停止处理中' : '停止本次执行'}
+              </Button>
+            )}
+            {canRetry && (
+              <Button type="button" size="sm" variant="secondary" loading={patrolling} data-testid="ticket-drawer-retry" onClick={() => void runPatrol(true)}>
+                重新执行本阶段
               </Button>
             )}
             {canStart && (

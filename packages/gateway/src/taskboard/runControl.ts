@@ -149,7 +149,15 @@ export class TaskboardRunControls {
   private readonly sessions = new Map<string, Binding>()
   private readonly runs = new Map<string, TaskboardRunControl>()
 
+  getActiveForTicket(ticketId: string): TaskboardRunControl | undefined {
+    for (const control of this.runs.values()) if (control.ticketId === ticketId) return control
+    return undefined
+  }
+
+  hasActiveTicket(ticketId: string): boolean { return this.getActiveForTicket(ticketId) !== undefined }
+
   begin(runId: string, ticketId: string, leaseOwner: string, rootSessionKey: string): TaskboardRunControl {
+    if (this.hasActiveTicket(ticketId)) throw new Error('taskboard ticket still has an active execution')
     if (this.runs.has(runId) || this.sessions.has(rootSessionKey)) throw new Error('taskboard run control already exists')
     const binding: Binding = { control: null, closed: false }
     const control = new TaskboardRunControl(runId, ticketId, leaseOwner, rootSessionKey, (key) => {

@@ -1,3 +1,4 @@
+import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -1025,6 +1026,7 @@ export class Gateway {
 
   /** Narrow view of the Gateway for routes/workspaceApi.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly workspaceApiRoutesIo: WorkspaceApiRoutesIo = ((gw: Gateway): WorkspaceApiRoutesIo => ({
+    preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => gw._getAgentsConfig(), defaultModel: gw.deps.config.defaults.model })(stages),
     getRunSnapshots: (runs) => projectTaskboardRunSnapshots(runs, (key) => gw.sessions.getByKey(key)),
     _getAgentsConfigUserView: (...args) => gw._getAgentsConfigUserView(...args),
     _handleTaskItem: (...args) => gw._handleTaskItem(...args),

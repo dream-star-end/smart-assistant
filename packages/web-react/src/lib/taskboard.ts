@@ -425,6 +425,7 @@ export interface ProjectCreateInput {
   labels?: string[]
   /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
   templateIds?: string[]
+  executionAgentId?: string | null
 }
 
 export interface ProjectPatchInput {
@@ -1536,7 +1537,7 @@ export const taskboardApi = {
   deleteTemplate: (a: AuthSession, id: string) =>
     boardSend<{ ok: boolean }>(a, `/api/board/templates/${encodeURIComponent(id)}`, 'DELETE'),
 
-  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean }) =>
+  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean; executionAgentId?: string | null }) =>
     boardSend<ApplyTemplateResult>(
       a,
       `/api/board/templates/${encodeURIComponent(id)}/apply`,

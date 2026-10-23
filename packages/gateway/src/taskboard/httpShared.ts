@@ -7,6 +7,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type TaskboardDb, TaskboardValidationError } from './db/index.js'
 import { getProject, getProjectByKey } from './db/projects.js'
+import type { TaskboardPreflight } from './stagePreflight.js'
 import type { Actor, TicketRun } from './domain.js'
 
 /** 单次 run 允许配置的最大无活动窗口；活跃 run 没有 45 分钟墙钟上限。 */
@@ -22,6 +23,7 @@ export interface BoardAgent {
 }
 
 export interface TaskboardHttpContext {
+  preflightStages?: TaskboardPreflight
   /** 显式传入的库。测试用临时目录;生产省略则走 getTaskboardDb()。null = 未初始化。 */
   db?: TaskboardDb | null
   /**

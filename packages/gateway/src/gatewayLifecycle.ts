@@ -1,3 +1,4 @@
+import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
 /**
  * Gateway lifecycle: start-up, shutdown, boot auto-resume, turn-dispatch inbox recovery, notifier and scheduler ticks
@@ -787,6 +788,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       },
     })
     this._taskboardPatrol = new PatrolEngine({
+      preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model })(stages),
       getDb: () => getTaskboardDb(),
       delegate: (input) => this._runTaskboardDelegate(input),
       log: (msg, extra) => this.log.info(msg, extra),

@@ -1,3 +1,4 @@
+import { createTaskboardPreflight } from '../stagePreflight.js'
 import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -7,7 +8,7 @@ import { test } from 'node:test'
 import { openTaskboardDb } from '../db/index.js'
 import { createProject } from '../db/projects.js'
 import { listPipelines, listStages, updateStage } from '../db/pipelines.js'
-import { acquireLease, getActiveLease, getRun, settleLeaseRun, updateRun } from '../db/runs.js'
+import { acquireLease, getActiveLease, getRun, listRuns, settleLeaseRun, updateRun } from '../db/runs.js'
 import { seedDefaultPipelines } from '../db/seed.js'
 import { createTicket, getTicket, updateTicket } from '../db/tickets.js'
 import { buildPatrolSessionKey } from '../domain.js'
@@ -20,7 +21,7 @@ function fixture() {
   seedDefaultPipelines(db, project.id, ['spike'])
   const pipeline = listPipelines(db, project.id)[0]!
   const stage = updateStage(db, listStages(db, pipeline.id)[0]!.id, { agentId: 'main', onSuccess: 'wait_human' })
-  const ticket = createTicket(db, { projectId: project.id, type: 'spike', title: 'Stop fixture', status: 'ready', pipelineId: pipeline.id, stageId: stage.id })
+  const ticket = createTicket(db, { projectId: project.id, type: 'spike', title: 'Stop fixture', reporter: 'user:765', status: 'ready', pipelineId: pipeline.id, stageId: stage.id })
   const claimed = acquireLease(db, ticket.id, stage.id, 'agent:main', 60_000, { agentId: 'main', trigger: 'manual' })
   const run = updateRun(db, claimed.id, { sessionKey: buildPatrolSessionKey('main', ticket.id, stage.id, claimed.id) })
   const running = updateTicket(db, ticket.id, ticket.version, { status: 'running' })
@@ -30,7 +31,7 @@ function fixture() {
 }
 
 async function serverFor(ctx: TaskboardHttpContext, fn: (base: string) => Promise<void>) {
-  const server = createServer((req, res) => { void handleTaskboardApi(req, res, ctx).catch(() => { if (!res.headersSent) { res.writeHead(500); res.end('{}') } }) })
+  const server = createServer((req, res) => { void handleTaskboardApi(req, res, { preflightStages: async (stages) => stages.map(() => null), ...ctx }).catch(() => { if (!res.headersSent) { res.writeHead(500); res.end('{}') } }) })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   try {
     const address = server.address()
@@ -133,4 +134,92 @@ test('detail, run page and returned timeline all enrich only database-resolved r
       assert.deepEqual(seen, [[f.run.id], [f.run.id], [f.run.id]])
     })
   } finally { f.leave(); taskboardRunControls.finish(f.control); f.db.close() }
+})
+
+test('retry waits for old cleanup even after lease expiry and a persisted terminal row', async () => {
+  const f = fixture()
+  try {
+    const blocked = updateTicket(f.db, f.ticket.id, f.ticket.version, { status: 'blocked', blockedReason: '正在停止' })
+    updateRun(f.db, f.run.id, { leaseExpiresAt: Date.now() - 1 })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      for (const action of ['ready', 'patrol', 'move']) {
+        const result = await post(base, `/api/board/tickets/${f.ticket.id}/${action}`, { expectedVersion: blocked.version, toStageId: f.stage.id })
+        assert.equal(result.status, 409, `${action} must wait for the old promise tree`)
+        assert.equal(result.body.code, 'active_execution')
+      }
+      updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, outputMd: '旧执行完整输出' })
+      const whileCleaning = await post(base, `/api/board/tickets/${f.ticket.id}/ready`, { expectedVersion: blocked.version })
+      assert.equal(whileCleaning.status, 409, 'a reaper terminal row does not complete the local finally')
+      f.leave(); taskboardRunControls.finish(f.control)
+      const ready = await post(base, `/api/board/tickets/${f.ticket.id}/ready`, { expectedVersion: blocked.version })
+      assert.equal(ready.status, 200)
+      const retried = await post(base, `/api/board/tickets/${f.ticket.id}/patrol`, { expectedVersion: ready.body.ticket.version })
+      assert.equal(retried.status, 202)
+      assert.notEqual(retried.body.run.id, f.run.id)
+      assert.notEqual(retried.body.run.sessionKey, f.run.sessionKey)
+      assert.equal(getRun(f.db, f.run.id)!.outputMd, '旧执行完整输出')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})
+
+test('an unfinished expired database run cannot be reopened without settlement', async () => {
+  const f = fixture()
+  f.leave(); taskboardRunControls.finish(f.control)
+  try {
+    const blocked = updateTicket(f.db, f.ticket.id, f.ticket.version, { status: 'blocked' })
+    updateRun(f.db, f.run.id, { leaseExpiresAt: Date.now() - 1 })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const pending = await post(base, `/api/board/tickets/${f.ticket.id}/ready`, { expectedVersion: blocked.version })
+      assert.equal(pending.status, 409)
+      updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null })
+      const terminal = await post(base, `/api/board/tickets/${f.ticket.id}/ready`, { expectedVersion: blocked.version })
+      assert.equal(terminal.status, 200)
+    })
+  } finally { f.db.close() }
+})
+
+test('manual patrol rejects missing preflight and missing installed agents before claiming or counting', async () => {
+  const f = fixture()
+  settle(f)
+  try {
+    const ready = updateTicket(f.db, f.ticket.id, getTicket(f.db, f.ticket.id)!.version, { status: 'ready' })
+    const before = listRuns(f.db, { ticketId: f.ticket.id }).items.length
+    await serverFor({ db: f.db, actor: 'human', preflightStages: undefined }, async (base) => {
+      const out = await post(base, `/api/board/tickets/${f.ticket.id}/patrol`, { expectedVersion: ready.version })
+      assert.equal(out.status, 503)
+    })
+    const check = createTaskboardPreflight({ getAgentsConfig: async () => ({ agents: [], routes: [], default: 'main' }), getIdentityProjection: async () => undefined, env: {} })
+    await serverFor({ db: f.db, actor: 'human', preflightStages: check }, async (base) => {
+      const out = await post(base, `/api/board/tickets/${f.ticket.id}/patrol`, { expectedVersion: ready.version })
+      assert.equal(out.status, 422)
+      assert.equal(out.body.code, 'stage_agent_unavailable')
+    })
+    assert.equal(getTicket(f.db, f.ticket.id)!.version, ready.version)
+    assert.equal(getTicket(f.db, f.ticket.id)!.stageLoopCount, ready.stageLoopCount)
+    assert.equal(listRuns(f.db, { ticketId: f.ticket.id }).items.length, before)
+    assert.equal(getActiveLease(f.db, f.ticket.id), null)
+  } finally { f.db.close() }
+})
+
+test('a stage edited during asynchronous preflight is rechecked in the claim transaction', async () => {
+  const f = fixture()
+  settle(f)
+  let release!: () => void
+  let entered!: () => void
+  const checking = new Promise<void>((resolve) => { entered = resolve })
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  try {
+    const ready = updateTicket(f.db, f.ticket.id, getTicket(f.db, f.ticket.id)!.version, { status: 'ready' })
+    await serverFor({ db: f.db, actor: 'human', preflightStages: async (stages) => { entered(); await gate; return stages.map(() => null) } }, async (base) => {
+      const response = post(base, `/api/board/tickets/${f.ticket.id}/patrol`, { expectedVersion: ready.version })
+      await checking
+      updateStage(f.db, f.stage.id, { model: 'grok-build' })
+      release()
+      const out = await response
+      assert.equal(out.status, 409)
+      assert.equal(out.body.code, 'stage_configuration_changed')
+      assert.equal(getActiveLease(f.db, f.ticket.id), null)
+      assert.equal(getTicket(f.db, f.ticket.id)!.version, ready.version)
+    })
+  } finally { release(); f.db.close() }
 })

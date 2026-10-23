@@ -84,7 +84,7 @@ async function call(base: string, method: string, path: string, body?: unknown):
 }
 
 function humanCtx(db: TaskboardDb): TaskboardHttpContext {
-  return { db, actor: 'human', listAgents: async () => [] }
+  return { db, actor: 'human', preflightStages: async (stages) => stages.map(() => null), listAgents: async () => [] }
 }
 function agentCtx(db: TaskboardDb): TaskboardHttpContext {
   return { ...humanCtx(db), actor: 'agent' }

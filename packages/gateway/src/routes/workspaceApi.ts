@@ -24,6 +24,7 @@ import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface WorkspaceApiRoutesIo {
+  preflightStages: NonNullable<TaskboardHttpContext['preflightStages']>
   getRunSnapshots: NonNullable<TaskboardHttpContext['getRunSnapshots']>
   _getAgentsConfigUserView(): Promise<AgentsConfig>
   _handleTaskItem(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void>
@@ -215,6 +216,7 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/),
     (io, req, res, url) => {
       handleTaskboardApi(req, res, {
+        preflightStages: io.preflightStages,
         getRunSnapshots: (runs) => io.getRunSnapshots(runs),
         resolveActor: (r) =>
           resolveTaskboardActor(r, {
