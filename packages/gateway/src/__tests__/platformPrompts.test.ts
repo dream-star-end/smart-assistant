@@ -409,17 +409,8 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
   it('htmlpreview 无缝嵌入的写法(主题变量、套件类、CDN、文件桥)覆盖按需指南、基线与平台 skill', () => {
     const sources = {
       guide: readFileSync('packages/commercial/agent-sandbox/platform-runtime/prompts/system-assistant/references/ui-preview.md', 'utf8'),
-      agents: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8'),
-      agentsAdmin: readFileSync(
-        'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.admin.md',
-        'utf8',
-      ),
       skill: readFileSync(
         'packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md',
-        'utf8',
-      ),
-      codex: readFileSync(
-        'packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md',
         'utf8',
       ),
     }
@@ -441,7 +432,6 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
   it('原生容器网站预览 SOP 覆盖按需指南、Codex 基线与平台 skill', () => {
     const sources = {
       guide: readFileSync('packages/commercial/agent-sandbox/platform-runtime/prompts/system-assistant/references/ui-preview.md', 'utf8'),
-      codex: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8'),
       skill: readFileSync(
         'packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md',
         'utf8',
@@ -489,6 +479,20 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(prompt.includes('/run/oc/platform/current/bin/oc-system skill'))
     assert.ok(prompt.includes('oc-system skill ui-preview'))
     assert.ok(!prompt.includes('data-oc-src'))
+  })
+  it('原生Codex规则和preamble不再重复常驻预览协议', () => {
+    for (const file of [
+      'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md',
+      'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.admin.md',
+      'packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md',
+    ]) {
+      const source = readFileSync(file, 'utf8')
+      assert.ok(source.includes('/run/oc/platform/current/bin/oc-system skill ui'))
+      assert.ok(source.includes('skill ui-preview'))
+      assert.ok(!source.includes('data-oc-src'))
+      assert.ok(!source.includes('ocFile('))
+      assert.ok(!source.includes('```htmlpreview'))
+    }
   })
   it('memory-instructions.md === MEMORY_INSTRUCTIONS_FALLBACK', () => {
     const fb = _platformPromptFallbacks.MEMORY_INSTRUCTIONS_FALLBACK
