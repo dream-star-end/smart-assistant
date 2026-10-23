@@ -53,6 +53,9 @@ STATUS_FILE="${V5SB_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.jso
 LOCK_FILE="${V5SB_LOCK:-/run/openclaude-v5-selfhost-pg-backup.lock}"
 DEPLOY_LOCK="${V5SB_DEPLOY_LOCK:-/run/openclaude-v5-selfhost/deploy.lock}"
 DEPLOY_WAIT_SEC="${V5SB_DEPLOY_WAIT_SEC:-3600}"
+# Wait this long for another backup run to finish instead of exiting 4 at once
+# (the weekly full unit sets it: the daily core run may still hold the lock).
+LOCK_WAIT_SEC="${V5SB_LOCK_WAIT_SEC:-0}"
 LARGE_TABLES="${V5SB_LARGE_TABLES:-client_session_turn_tape_records client_session_live_frames client_session_turn_tape_model_records}"
 COMPRESS="${V5SB_COMPRESS:-zstd:3}"
 CORE_EST_DEFAULT_BYTES="${V5SB_CORE_EST_BYTES:-1073741824}"
@@ -173,7 +176,31 @@ wait_deploy_free() {
     sleep 10
     waited=$((waited + 10))
   done
+  write_backup_marker
   return 0
+}
+
+# <deploy lock>.backup names this run while it holds the deploy lock, so deploy
+# and the lease worker can say "the backup holds the lock" and keep waiting
+# instead of timing out (scripts/deploy-v5-selfhost.sh selfhost_backup_lock_holder).
+# pid + /proc starttime guard against PID reuse; removed on exit. Best effort:
+# without the marker deploy just falls back to its plain timeout.
+BACKUP_MARKER=""
+write_backup_marker() {
+  local marker="${DEPLOY_LOCK}.backup" dir tmp st
+  dir="$(dirname -- "$marker")"
+  st=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null) || st=""
+  [[ "$st" =~ ^[0-9]+$ ]] || { log "backup marker skipped: no starttime"; return 0; }
+  tmp="$(mktemp -p "$dir" .deploy.lock.backup.XXXXXX 2>/dev/null)" || { log "backup marker skipped: $dir"; return 0; }
+  printf 'pid=%s starttime=%s tier=%s started=%s\n' "$$" "$st" "$tier" "$(now_iso)" >"$tmp" \
+    && chmod 644 -- "$tmp" && mv -T -- "$tmp" "$marker" || { rm -f -- "$tmp"; log "backup marker skipped"; return 0; }
+  BACKUP_MARKER="$marker"
+  trap drop_backup_marker EXIT
+}
+drop_backup_marker() {
+  [[ -n "$BACKUP_MARKER" && ! -L "$BACKUP_MARKER" ]] || return 0
+  # only our own line: a later run may already have replaced it
+  if grep -q "^pid=$$ " "$BACKUP_MARKER" 2>/dev/null; then rm -f -- "$BACKUP_MARKER"; fi
 }
 
 exclude_args() {
@@ -507,8 +534,9 @@ case "$cmd" in
 esac
 
 [[ -z "$OFFSITE" || -z "$FULL_SINK" ]] || die_usage "set V5SB_OFFSITE or V5SB_FULL_SINK, not both"
-for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
-  [[ "${!knob}" =~ ^[0-9]+$ ]] || die_usage "$knob must be a non-negative integer"
+for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC LOCK_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
+  # decimal without leading zeros: bash arithmetic reads 08 as octal and fails
+  [[ "${!knob}" =~ ^(0|[1-9][0-9]*)$ ]] || die_usage "$knob must be a non-negative integer"
 done
 (( KEEP >= 1 )) || die_usage "V5SB_KEEP must be >= 1"
 (( ABORT_FREE_GIB <= MIN_FREE_GIB )) || die_usage "V5SB_ABORT_FREE_GIB must be <= V5SB_MIN_FREE_GIB"
@@ -529,8 +557,11 @@ fi
 install -d -m 755 -- "$(dirname -- "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  log "another pg-backup run holds $LOCK_FILE"
-  exit 4
+  if (( LOCK_WAIT_SEC > 0 )); then log "another pg-backup run holds $LOCK_FILE, waiting up to ${LOCK_WAIT_SEC}s"; fi
+  if (( LOCK_WAIT_SEC == 0 )) || ! flock -w "$LOCK_WAIT_SEC" 9; then
+    log "another pg-backup run holds $LOCK_FILE"
+    exit 4
+  fi
 fi
 
 if [[ "$cmd" == drill ]]; then

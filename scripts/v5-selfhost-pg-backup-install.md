@@ -9,11 +9,17 @@ v5-dev after the commit carrying `scripts/v5-selfhost-pg-backup.sh` is live
 | tier | content | where | when |
 |---|---|---|---|
 | core | schema of every table + data of every table except `client_session_turn_tape_records`, `client_session_live_frames`, `client_session_turn_tape_model_records` | `/var/backups/openclaude-v5-selfhost/core-<UTC>.dump` (+ `.sha256`), newest 7 kept; with `V5SB_OFFSITE` also encrypted to R2 `pg/core/`, newest 7 kept | daily 03:40 Asia/Taipei (`openclaude-v5-selfhost-pg-backup.timer`) |
-| full | whole database | streamed to the off-host sink: `V5SB_OFFSITE` (R2, below) or `V5SB_FULL_SINK` (an executable you provide, gets the file name as `$1` and the dump on stdin); nothing is written locally | weekly, Sunday 21:10 Asia/Taipei (`openclaude-v5-selfhost-pg-backup-full.timer`, OCV5-600) |
+| full | whole database | streamed to the off-host sink: `V5SB_OFFSITE` (R2, below) or `V5SB_FULL_SINK` (an executable you provide, gets the file name as `$1` and the dump on stdin); nothing is written locally | weekly, Sunday 04:00 Asia/Taipei (`openclaude-v5-selfhost-pg-backup-full.timer`, OCV5-600); about 1 h for the 20.8 GB database (2026-10-23) |
 
 Both units hold a shared lock on the selfhost deploy lock for the whole run, so
-a release train waits for a running backup (deploy waits up to 40 min) instead
-of queueing its migration DDL behind the dump's table locks.
+a release train waits for a running backup instead of queueing its migration
+DDL behind the dump's table locks. While it holds the lock the backup writes
+`/run/openclaude-v5-selfhost/deploy.lock.backup` (pid, starttime, tier); the
+lease worker logs "deploy.lock 被个人版 PG 备份持有…,列车排队" and dispatches on
+the next tick after the backup, and `deploy-v5-selfhost.sh` logs "个人版 PG 备份占锁中"
+and keeps waiting outside its 40 min timeout, up to
+`OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT` (4 h). The full unit waits up to
+`V5SB_LOCK_WAIT_SEC=5400` for a core run that still holds the backup lock.
 
 Without a sink the core tier still protects identity, billing, usage, catalog,
 settings and audit data. Chat content (the tape tables) is only protected once
@@ -112,7 +118,7 @@ pg_restore --list /var/backups/openclaude-v5-selfhost/core-<UTC>.dump | head   #
 ## Optional env (`/etc/openclaude/selfhost-pg-backup.env`, root 0600)
 
 `V5SB_FULL_SINK`, `V5SB_KEEP` (7), `V5SB_MIN_FREE_GIB` (10), `V5SB_ABORT_FREE_GIB` (9),
-`V5SB_DIR`, `V5SB_COMPRESS` (`zstd:3`), `V5SB_DEPLOY_WAIT_SEC` (3600).
+`V5SB_DIR`, `V5SB_COMPRESS` (`zstd:3`), `V5SB_DEPLOY_WAIT_SEC` (3600), `V5SB_LOCK_WAIT_SEC` (0 = exit 4 at once).
 Off-host (OCV5-600): `V5SB_OFFSITE`, `V5SB_FULL_COMPRESS` (= `V5SB_COMPRESS`),
 `V5SB_R2_GPG_RECIPIENT` (required), `V5SB_R2_REMOTE` (`r2:ocv5-personal-backup`),
 `V5SB_R2_PREFIX` (`pg`), `V5SB_R2_RCLONE_CONF` (`/etc/openclaude/r2-rclone.conf`),

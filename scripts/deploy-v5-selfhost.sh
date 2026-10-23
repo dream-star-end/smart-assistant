@@ -170,6 +170,9 @@ SELFHOST_DEPLOY_LOCK_DIR="/run/openclaude-v5-selfhost"
 SELFHOST_DEPLOY_LOCK="${OC_V5_SELFHOST_DEPLOY_LOCK:-${SELFHOST_DEPLOY_LOCK_DIR}/deploy.lock}"
 SELFHOST_DEPLOY_LOCK_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_WAIT:-2400}"
 SELFHOST_DEPLOY_LOCK_POLL="${OC_V5_SELFHOST_DEPLOY_LOCK_POLL:-15}"
+# 个人版 PG 备份(scripts/v5-selfhost-pg-backup.sh)整次运行共享持锁(OCV5-600),每周全量可超过
+# 一小时。持锁者是活着的备份时,等待不计入上面的超时,改按这个上限排队。
+SELFHOST_DEPLOY_LOCK_BACKUP_WAIT="${OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
 SELFHOST_DEPLOY_LOCK_HOLDER=""
 SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
 PLATFORM_ARCHIVE_TMP=""
@@ -189,6 +192,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
+source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -410,7 +414,7 @@ t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split(
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
-  local lock wait_s interval waited info holder_line starttime
+  local lock wait_s interval waited info holder_line starttime backup_waited backup_info backup_wait
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
     release_policy_mutation_barrier || exit "$?"
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
@@ -420,8 +424,13 @@ acquire_selfhost_deploy_lock() {
   lock="$SELFHOST_DEPLOY_LOCK"
   wait_s="$SELFHOST_DEPLOY_LOCK_WAIT"
   interval="$SELFHOST_DEPLOY_LOCK_POLL"
-  [[ "$wait_s" =~ ^[0-9]+$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
+  # 十进制、无前导零:bash 算术把 08 当八进制并报错,比较恒假就会永远等(Codex r2)。
+  [[ "$wait_s" =~ ^(0|[1-9][0-9]*)$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_WAIT 必须是非负整数秒(当前=$wait_s)"
   [[ "$interval" =~ ^[1-9][0-9]*$ ]] || die "OC_V5_SELFHOST_DEPLOY_LOCK_POLL 必须是正整数秒(当前=$interval)"
+  # 非法值会让下面的算术比较恒假,备份持锁时就永远等下去(Codex r1)。
+  backup_wait="${SELFHOST_DEPLOY_LOCK_BACKUP_WAIT:-14400}"
+  [[ "$backup_wait" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || die "OC_V5_SELFHOST_DEPLOY_LOCK_BACKUP_WAIT 必须是非负整数秒(当前=$backup_wait)"
   if (( interval > wait_s && wait_s > 0 )); then
     interval="$wait_s"
   fi
@@ -434,7 +443,22 @@ acquire_selfhost_deploy_lock() {
   exec 8<>"$lock" || die "无法打开锁文件 $lock"
   if ! flock -n 8; then
     waited=0
+    backup_waited=0
     while ! flock -n 8; do
+      # 备份占锁:排队等它结束,不计入 wait_s,也不当成超时失败(OCV5-600)。
+      if backup_info="$(selfhost_backup_lock_holder "$lock")"; then
+        if (( backup_waited >= backup_wait )); then
+          echo "✗ 个人版 PG 备份占锁中,已排队 ${backup_waited}s 仍未结束(上限 ${backup_wait}s)。锁=$lock 备份=$backup_info
+补救: systemctl status openclaude-v5-selfhost-pg-backup-full.service / openclaude-v5-selfhost-pg-backup.service;备份结束后重发。" >&2
+          exit 1
+        fi
+        if (( backup_waited % 300 == 0 )); then
+          log "⏳ 个人版 PG 备份占锁中($backup_info),列车排队等它结束: 已等 ${backup_waited}s / ${backup_wait}s(不计入 ${wait_s}s 超时)"
+        fi
+        sleep "$interval"
+        backup_waited=$((backup_waited + interval))
+        continue
+      fi
       if (( waited >= wait_s )); then
         info="$(selfhost_lock_holder_info "$lock")"
         echo "✗ 等待 selfhost 发布锁超时(${wait_s}s)。锁=$lock $info

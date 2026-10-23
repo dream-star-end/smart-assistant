@@ -1,9 +1,10 @@
 [Unit]
-Description=OpenClaude v5 selfhost PostgreSQL full backup timer (weekly, Sunday 21:10 Asia/Taipei)
+Description=OpenClaude v5 selfhost PostgreSQL full backup timer (weekly, Sunday 04:00 Asia/Taipei)
 
 [Timer]
-# 13Z is the quietest selfhost hour; the daily core run is at 19:40Z.
-OnCalendar=Sun *-*-* 13:10:00 UTC
+# Night low traffic (steward 2026-10-23); the daily core run is at 03:40 Asia/Taipei.
+# A full dump took ~1 h on 2026-10-23; a train arriving meanwhile queues behind it.
+OnCalendar=Sun *-*-* 04:00:00 Asia/Taipei
 RandomizedDelaySec=10m
 Persistent=true
 Unit=openclaude-v5-selfhost-pg-backup-full.service
