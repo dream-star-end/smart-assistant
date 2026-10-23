@@ -397,21 +397,22 @@ describe('T-16 空态给出下一步', () => {
 })
 
 describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
-  test('抽屉常驻关闭按钮；移动端也平铺全部动作，「取消单据」「标记受阻」不再叫「取消」「受阻」', async () => {
+  test('抽屉常驻关闭按钮；次要动作通过有标签菜单可达，确认框保留清晰文案', async () => {
     const running = ticket({ allowedMoves: [] })
     stubBoard({ columns: [{ stage: stage(), tickets: [running] }] })
     mockDrawerApis(running)
     const onOpenTicket = vi.fn()
     renderBoard({ ticketId: 'OCV5-42', onOpenTicket })
-    const actions = await screen.findByTestId('ticket-actions-full')
-    expect(within(actions).getByRole('button', { name: '完成' })).toBeInTheDocument()
-    expect(within(actions).getByRole('button', { name: '取消单据' })).toBeInTheDocument()
-    expect(within(actions).getByRole('button', { name: '标记受阻' })).toBeInTheDocument()
-    expect(within(actions).queryByTestId('ticket-more-actions')).not.toBeInTheDocument()
-    expect(within(actions).queryByRole('button', { name: '取消' })).not.toBeInTheDocument()
-
-    // 确认框:[返回] [取消单据],不再是 [取消] [取消单据] 并排。
-    fireEvent.click(within(actions).getByRole('button', { name: '取消单据' }))
+    const drawer = await screen.findByTestId('ticket-drawer')
+    const more = within(drawer).getByRole('button', { name: '更多任务操作' })
+    more.focus()
+    fireEvent.keyDown(more, { key: 'Enter' })
+    expect(await screen.findByRole('menuitem', { name: '完成' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: '标记受阻' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '取消', exact: true })).not.toBeInTheDocument()
+    const cancel = screen.getByRole('menuitem', { name: '取消单据' })
+    cancel.focus()
+    fireEvent.keyDown(cancel, { key: 'Enter' })
     const dialog = await screen.findByRole('dialog', { name: '取消单据 OCV5-42？' })
     expect(within(dialog).getByRole('button', { name: '返回' })).toBeInTheDocument()
     expect(within(dialog).getByRole('button', { name: '取消单据' })).toBeInTheDocument()
@@ -439,9 +440,8 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     mockDrawerApis(running)
     vi.spyOn(taskboardApi, 'moveTicket').mockImplementation(() => new Promise(() => {}))
     renderBoard({ ticketId: 'OCV5-42' })
-    const actions = await screen.findByTestId('ticket-actions-full')
-    // 抽屉里「移动到…」是带文字的按钮(审计 T-06),键盘打开菜单选一项。
-    const moveMenu = within(actions).getByTestId('ticket-move-menu')
+    const drawer = await screen.findByTestId('ticket-drawer')
+    const moveMenu = within(drawer).getByRole('button', { name: '更多任务操作' })
     moveMenu.focus()
     await act(async () => {
       fireEvent.keyDown(moveMenu, { key: 'Enter' })
@@ -452,13 +452,12 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
       fireEvent.keyDown(option, { key: 'Enter' })
     })
     await waitFor(() => {
-      expect(screen.getByTestId('ticket-move-menu')).toHaveAttribute('aria-busy', 'true')
+      expect(moveMenu).toHaveAttribute('aria-busy', 'true')
+      expect(moveMenu).toBeDisabled()
     })
-    // 以前所有按钮一起转圈;现在其余只是禁用。
-    expect(screen.getByTestId('ticket-done')).toBeDisabled()
-    expect(screen.getByTestId('ticket-done')).not.toHaveAttribute('aria-busy')
-    expect(screen.getByTestId('ticket-cancel')).toBeDisabled()
-    expect(screen.getByTestId('ticket-cancel')).not.toHaveAttribute('aria-busy')
+    // The menu closes after selection and its disabled trigger prevents a
+    // second move/status action while the first move is pending.
+    expect(screen.queryByRole('menuitem', { name: /退回积压/ })).not.toBeInTheDocument()
   })
 
   test('T-30 深链到不在已加载列表里的单，详情到位后也有状态操作', async () => {
@@ -467,9 +466,12 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     mockDrawerApis(hidden)
     renderBoard({ ticketId: 'OCV5-99' })
     expect(await screen.findByRole('heading', { name: '翻页之外的单' })).toBeInTheDocument()
-    const actions = await screen.findByTestId('ticket-actions-full')
-    expect(within(actions).getByRole('button', { name: '完成' })).toBeInTheDocument()
-    expect(within(actions).getByRole('button', { name: '标记受阻' })).toBeInTheDocument()
+    const drawer = await screen.findByTestId('ticket-drawer')
+    const more = within(drawer).getByRole('button', { name: '更多任务操作' })
+    more.focus()
+    fireEvent.keyDown(more, { key: 'Enter' })
+    expect(await screen.findByRole('menuitem', { name: '完成' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: '标记受阻' })).toBeInTheDocument()
   })
 
   test('T-27 乐观评论显示「我」与发送中，而不是 default', async () => {
