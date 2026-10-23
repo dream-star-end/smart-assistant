@@ -36,7 +36,7 @@ test('actual saga policy ablation fails the healthy-candidate contract', () => {
 
 test('actual outer caller preserves holds and dry-run boundaries', () => {
   const out = focused('bash', 'v5-selfhost-outer-policy.test.sh')
-  assert.equal((out.match(/^PASS /gm) ?? []).length, 6)
+  assert.equal((out.match(/^PASS /gm) ?? []).length, 7)
   for (const rc of [78, 79, 86]) assert.match(out, new RegExp(`PASS actual-outer rc=${rc} no-compensation`))
 })
 

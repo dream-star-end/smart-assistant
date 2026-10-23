@@ -11,8 +11,10 @@ const root=process.env.OC_SOURCE_PIN_TEST_ROOT||fileURLToPath(new URL('../../',i
 const d=readFileSync(join(root,'scripts/deploy-v5-selfhost.sh'),'utf8'),m=readFileSync(join(root,'scripts/v5-selfhost-master-release-lib.sh'),'utf8');
 function fn(s,n){const match=s.match(new RegExp('^'+n+'\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}','m'));assert.ok(match,n);return match[0];}
 function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(startRe));const rest=s.slice(a);const b=rest.search(endRe);assert.ok(b>0,String(endRe));return rest.slice(0,b);}
+const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy.sh'),'utf8');
+const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
@@ -56,6 +58,7 @@ function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="
  mkdirSync(join(rel,'node_modules/tsx'),{recursive:true});mkdirSync(join(rel,'deploy/v5'),{recursive:true});
  writeFileSync(join(rel,'package.json'),'{}');writeFileSync(join(rel,'deploy/v5/release-metadata.json'),'{}');
  writeFileSync(join(rel,'VERSION.json'),JSON.stringify({commit:f.base.slice(0,9)}));
+ for(const policyPath of hostPolicyFiles){const target=join(rel,policyPath);mkdirSync(join(target,'..'),{recursive:true});writeFileSync(target,readFileSync(join(root,policyPath)));}
  if(poison)writeFileSync(join(rel,'.poisoned'),'');
  if(record)ok(bash(f,webLib,'write_web_dist_reuse_record '+q(rel)+' '+q(k)+' built '+q(f.base)));
  if(seal)ok(bash(f,webLib,'write_strong_release_marker_local '+q(rel)+' '+q(f.base)+' '+q(f.base.slice(0,9))+' 20261008-000000 2'));

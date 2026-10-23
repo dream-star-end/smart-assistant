@@ -1,0 +1,11 @@
+/var/log/openclaude-v5-selfhost.log
+/var/log/cloudflared-v5-selfhost.log {
+    daily
+    maxsize 200M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

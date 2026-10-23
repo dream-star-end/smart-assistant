@@ -28,6 +28,9 @@ CUTOVER_UNIT_SNAP="${CUTOVER_UNIT_SNAP:-}"
 SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
 SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
+
 mlog() { echo "$*" >&2; }
 
 # 只允许删除「本进程创建、仍是同一 inode」的 ${MASTER_RELEASES_ROOT}/.staging-*。
@@ -574,6 +577,7 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     echo 'FATAL: strong release root 非法' >&2
     return 1
   }
+  host_log_policy_require_bundle "$root" || return $?
   chown 0:0 -- "$root" || return 1
   chmod go-w -- "$root" || return 1
   read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
@@ -605,7 +609,7 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg artifactSha256 "$artifact_sha" \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
       metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:1}' >"$marker_tmp"; then
+      flavorGuardGeneration:1,hostLogPolicyGeneration:1}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -1087,6 +1091,12 @@ build_master_release() {
     cleanup_master_staging
     die "pinned session unavailable / data-safety rootfix contract gate 失败"
   fi
+  tsum_mark C.host-log-policy 2>/dev/null || :
+  mlog "  host log policy filesystem/logrotate gate @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-host-log-policy.test.sh ); then
+    cleanup_master_staging
+    die "pinned host log policy filesystem/logrotate gate 失败"
+  fi
   # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
   # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
   # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
@@ -1309,6 +1319,7 @@ assert_master_release_static_gate() { # <rel> [expected-full-sha]
     || die "静态门: release 根 ownership/mode 不可信 uid=$root_uid gid=$root_gid mode=$root_mode"
   got="$(release_artifact_digest "$rel")"
   [[ "$got" == "$art" ]] || die "静态门: artifactSha256 复算不匹配 expected=$art got=$got"
+  host_log_policy_generation "$rel" >/dev/null || die "静态门: host log policy generation/bundle 不合法"
   mlog "  ✓ 静态门通过 $rel sourceCommit=${commit:0:9} digest=${art:0:12}…"
 }
 
@@ -1586,34 +1597,6 @@ PY
 }
 
 # 从已过 digest 的候选 release 快照 unit 到 root-owned 临时目录。危险窗口只读这份。
-snapshot_cutover_units_from_release() { # <rel> <out-var>
-  local rel="$1" dest_var="$2" snap src_dir
-  [[ "$dest_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
-  src_dir="$rel/deploy/v5-selfhost"
-  [[ -d "$src_dir" ]] || { mlog "候选缺 $src_dir"; return 1; }
-  assert_unit_templates_live_wd "$src_dir"
-  snap="/run/openclaude-v5-selfhost/cutover-unit-snap.$$"
-  rm -rf -- "$snap"
-  mkdir -p -- "$snap" || return 1
-  chmod 0700 -- "$snap" || return 1
-  cp -a -- "$src_dir/${V5_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
-  cp -a -- "$src_dir/${V5_EGRESS_UNIT}" "$snap/" || { rm -rf -- "$snap"; return 1; }
-  # 双槽 egress 模板 + sysctl(候选自带才快照)。
-  local f
-  for f in "${V5_EGRESS_SLOT_SOCKET_TPL:-openclaude-v5-selfhost-egress@.socket}" \
-           "${V5_EGRESS_SLOT_SERVICE_TPL:-openclaude-v5-selfhost-egress@.service}" \
-           "${V5_EGRESS_SYSCTL_FILE:-99-openclaude-v5-selfhost-egress.sysctl.conf}"; do
-    if [[ -f "$src_dir/$f" && ! -L "$src_dir/$f" ]]; then
-      cp -a -- "$src_dir/$f" "$snap/" || { rm -rf -- "$snap"; return 1; }
-      fsync_path "$snap/$f" || { rm -rf -- "$snap"; return 1; }
-    fi
-  done
-  assert_unit_templates_live_wd "$snap"
-  fsync_path "$snap/${V5_UNIT}" || { rm -rf -- "$snap"; return 1; }
-  fsync_path "$snap/${V5_EGRESS_UNIT}" || { rm -rf -- "$snap"; return 1; }
-  CUTOVER_UNIT_SNAP="$snap"
-  printf -v "$dest_var" '%s' "$snap"
-}
 
 # 解析已验证的工作树 unit 备份(二级回滚目标)。不更新任何指针。
 resolve_worktree_unit_backup() {
@@ -1725,16 +1708,6 @@ run_migrations_from_release() { # <rel>  失败 return 1,不 exit(调用方走�
   fi
 }
 
-cleanup_cutover_unit_snap() {
-  local snap="${CUTOVER_UNIT_SNAP:-}"
-  CUTOVER_UNIT_SNAP=""
-  [[ -n "$snap" ]] || return 0
-  case "$snap" in
-    /run/openclaude-v5-selfhost/cutover-unit-snap.*)
-      rm -rf -- "$snap"
-      ;;
-  esac
-}
 
 # Bootstrap the new executor even when the installed live worker predates the flag.
 # Only the typed, exact-source registration can authorize this local CLI state.
