@@ -29,9 +29,9 @@ function wavMs(b: Buffer): number | null {
     if (id === 'fmt ' && body + 12 <= b.length) byteRate = b.readUInt32LE(body + 8)
     if (id === 'data') {
       if (!byteRate) return null
-      // A streamed WAV may leave the size unset: count what is there.
-      const bytes =
-        size === 0 || size === 0xffffffff ? b.length - body : Math.min(size, b.length - body)
+      // A streamed WAV leaves the size at 0xFFFFFFFF: count what is there. A size of 0 is an empty
+      // data chunk (whatever follows is other chunks, not audio), so 0 ms → unknown (code r1 P1).
+      const bytes = size === 0xffffffff ? b.length - body : Math.min(size, b.length - body)
       return (bytes / byteRate) * 1000
     }
     pos = body + size + (size % 2)
@@ -99,13 +99,23 @@ function mp3Ms(b: Buffer): number | null {
   if (pos < 0) return null
   let seconds = 0
   let frames = 0
+  let last = 0
   for (;;) {
     const f = mp3Frame(b, pos)
     if (!f || pos + f.length > b.length) break
     seconds += f.seconds
     frames += 1
+    last = f.length
     pos += f.length
   }
+  // The walk must reach the end (code r1 P1): what may follow the last frame is an ID3v1 / APE tag
+  // or a cut-off final frame. Anything longer means lost sync mid-file, and the prefix is not the
+  // track's length: unknown.
+  const rest = b.length - pos
+  const tag = rest >= 128 && b.toString('ascii', b.length - 128, b.length - 125) === 'TAG' ? 128 : 0
+  const ape = b.indexOf('APETAGEX', pos, 'ascii')
+  const tail = ape >= 0 ? ape - pos : rest - tag
+  if (tail > last) return null
   // A Xing / Info (VBR header) frame is counted as one silent frame (~26 ms): close enough here.
   return frames >= 2 ? seconds * 1000 : null
 }

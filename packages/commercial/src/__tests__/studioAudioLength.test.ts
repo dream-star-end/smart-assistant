@@ -83,6 +83,22 @@ describe('uploaded track length (OCV5-591 M1)', () => {
     assert.equal(audioDurationMs('audio/mpeg', mp3(50, 320, { id3: 300 })), Math.round(50 * spf))
   })
 
+  test('lost sync mid-file or an empty data chunk is unknown, not a prefix (code r1 P1)', () => {
+    const good = mp3(100, 128)
+    const broken = Buffer.from(good)
+    broken[2 * 417] = 0x00 // the third frame's sync byte
+    assert.equal(audioDurationMs('audio/mpeg', broken), null)
+    // A cut-off last frame still counts what is there.
+    const cut = Buffer.concat([good.subarray(0, 99 * 417), good.subarray(99 * 417, 99 * 417 + 200)])
+    assert.equal(audioDurationMs('audio/mpeg', cut), Math.round(99 * ((1152 / 44_100) * 1000)))
+    // data.size = 0, then a 1 s JUNK chunk: no audio, never 1000 ms.
+    const empty = wav(0)
+    const junk = Buffer.alloc(8 + 176_400)
+    junk.write('JUNK', 0, 'ascii')
+    junk.writeUInt32LE(176_400, 4)
+    assert.equal(audioDurationMs('audio/wav', Buffer.concat([empty, junk])), null)
+  })
+
   test('unknown or broken input is unknown, never a guess', () => {
     assert.equal(audioDurationMs('audio/mpeg', Buffer.from('not audio at all')), null)
     assert.equal(audioDurationMs('audio/wav', Buffer.from('RIFF\0\0\0\0WAVE')), null)
