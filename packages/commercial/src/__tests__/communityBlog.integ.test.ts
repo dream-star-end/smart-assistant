@@ -474,10 +474,10 @@ describe('经验分享 · 投稿预检（对话写博客）', () => {
     assert.equal(byCode.title_length?.level, 'block')
     assert.equal(byCode.summary_length?.level, 'block')
     assert.equal(byCode.category?.level, 'block')
-    assert.equal(byCode.leak_phone?.where, '「怎么做的」一节')
-    assert.equal(byCode.external_image?.where, '「怎么做的」一节')
+    assert.equal(byCode.leak_phone?.where, '第 2 节')
+    assert.equal(byCode.external_image?.where, '第 2 节')
     assert.equal(byCode.reviewer_instruction?.level, 'warn')
-    assert.equal(byCode.reviewer_instruction?.where, '「收尾」一节')
+    assert.equal(byCode.reviewer_instruction?.where, '第 3 节')
     assert.ok(!JSON.stringify(body).includes('1234 5678'))
   })
 

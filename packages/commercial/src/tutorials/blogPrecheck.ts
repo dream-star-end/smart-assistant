@@ -4,7 +4,7 @@
  * 对话里的草稿卡在用户点「确认投稿」前调用它，把会被拒、会转人工的地方提前列出来，交给 Agent 改。
  * 只做确定性检查，和真正投稿用同一套规则：长度与分类、正文图片写法与张数、泄密扫描、对审核者下指令的
  * 特征、频控余量。**不调用模型、不写库、不入队**，也不返回任何 AI 审核结论，免得被用来反复试探审核口径。
- * 位置只给到「哪一节」，不回显命中的原文（草稿里的密钥不该再出现在对话里）。
+ * 位置只给到第几节，不回显命中的原文或标题（草稿里的密钥不该再出现在对话里）。
  */
 import type { TutorialLeakRule } from '@openclaude/protocol'
 
@@ -31,7 +31,7 @@ export type BlogPrecheckIssue = {
   level: 'block' | 'warn'
   field: BlogPrecheckField
   message: string
-  /** 「「怎么做的」一节」「开头」之类；不含原文。 */
+  /** 「第 2 节」「开头」之类；不含原文。 */
   where?: string
 }
 
@@ -114,11 +114,12 @@ export function splitSections(markdown: string): Section[] {
   return sections.filter((s) => s.text.trim().length > 0)
 }
 
-/** 节标题本身可能含密钥或注入句：这种时候不回显标题，只给节序号（Codex R1 P1）。 */
+/**
+ * 位置只给节序号，不回显标题：标题单看无害、和正文合起来才命中的泄密规则（trace + 32 位十六进制）
+ * 判断不了，所以一律不回显（Codex R1/R2 P1）。没有标题的开头一段记为「开头」。
+ */
 function where(section: Section, index: number): string {
-  if (!section.heading) return index === 0 ? '开头' : `第 ${index + 1} 节`
-  const safe = scanText(maskTutorialImageRefs(section.heading), 'heading').length === 0 && !detectPromptInjection(section.heading)
-  return safe ? `「${section.heading}」一节` : `第 ${index + 1} 节`
+  return index === 0 && !section.heading ? '开头' : `第 ${index + 1} 节`
 }
 
 function charLength(value: string): number {

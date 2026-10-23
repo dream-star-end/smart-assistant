@@ -39,8 +39,8 @@ describe('blogPrecheck · 纯检查', () => {
     })
     const codes = issues.map((i) => `${i.field}:${i.code}:${i.where ?? ''}`)
     assert.deepEqual(codes.sort(), [
-      'bodyMarkdown:leak_email:「一」一节',
-      'bodyMarkdown:leak_phone:「一」一节',
+      'bodyMarkdown:leak_email:第 1 节',
+      'bodyMarkdown:leak_phone:第 1 节',
       'title:leak_email:',
     ])
   })
@@ -52,7 +52,7 @@ describe('blogPrecheck · 纯检查', () => {
     assert.equal(issues.find((i) => i.code === 'reviewer_instruction')?.level, 'warn')
   })
 
-  test('节标题本身含密钥或注入句时不回显，改用节序号（Codex R1 P1）', () => {
+  test('位置只给节序号，从不回显节标题（Codex R1/R2 P1）', () => {
     const issues = precheckBlogDraft({
       ...ok,
       bodyMarkdown: '开头一段足够长的文字，说明这篇写什么。\n\n## API_KEY=sk-test1234567890abcdefghijklmn\n\n正文内容 138 1234 5678。',
@@ -70,6 +70,11 @@ describe('blogPrecheck · 纯检查', () => {
     const leak = issues.find((i) => i.code === 'leak_trace_identifier')
     assert.ok(leak, JSON.stringify(issues))
     assert.equal(leak.where, undefined)
+    const hexHeading = precheckBlogDraft({
+      ...ok,
+      bodyMarkdown: '## 0123456789abcdef0123456789abcdef\n\n这里记录 trace 的用法，写得足够长一些以满足正文的长度要求。',
+    })
+    assert.ok(!JSON.stringify(hexHeading).includes('0123456789abcdef'), JSON.stringify(hexHeading))
   })
 
   test('缺字段、非字符串不抛错，全部列为问题', () => {
