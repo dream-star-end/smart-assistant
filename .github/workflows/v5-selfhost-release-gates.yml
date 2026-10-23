@@ -1,0 +1,154 @@
+name: V5 selfhost release gates
+
+# OCV5-582(发布可靠性 P0-2):个人版列车在 build_master_release 里跑的发布门,PR 上用同一条
+# 命令先跑一遍。此前这些门只在列车里跑(构建 5–25 分钟后才暴露确定性缺陷):Box 证明、callback WS
+# 证明、正式参数前端构建(vite first-screen-budget)、trailer 门等。清单只有一处:
+# deploy/v5/selfhost-release-gates.json;scripts/check-release-gate-parity.ts 双向核对
+# 列车 ↔ 清单 ↔ 本文件,列车新增一道门而这里没接,gate-parity 即红。
+# 这里不替代列车:列车照常在 pinned staging 上再跑一遍(宿主状态、负载、私有库只有列车能看到)。
+
+on:
+  pull_request:
+    branches: [feat/v5-selfhost]
+  push:
+    branches: [feat/v5-selfhost]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-selfhost-release-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-parity:
+    name: release-gate-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Train ↔ manifest ↔ CI parity
+        run: npx tsx scripts/check-release-gate-parity.ts
+      - name: Checker tests
+        run: npx tsx --test scripts/__tests__/checkReleaseGateParity.test.ts
+
+  offline-gates:
+    name: release-gates-offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # trailer 门要看提交历史
+          fetch-depth: 0
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Setup Bun
+        id: bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install CCB from lockfile
+        working-directory: claude-code-best
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Incident trailer gate (deploy, before build)
+        run: bash scripts/check-v5-fix-trailers.sh --repo . --head "${{ github.event.pull_request.head.sha || github.sha }}"
+      - name: Box multitool continuation gate
+        run: env -u DATABASE_URL -u TEST_DATABASE_URL npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$(git rev-parse HEAD)"
+      # 列车以 root 跑;这道门的 INC-20260909-CURSOR-EMPTY-POOL-MOUNT 段执行真实 root 文件系统迁移
+      # (root-only 元数据、非 root 属主标记被拒),非 root 必红。用 sudo 与列车同权限,只透传 PATH/HOME。
+      - name: Cursor Sand InferenceService contract gate
+        run: sudo env "PATH=$PATH" "HOME=$HOME" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts
+      - name: CCB MCP availability contract gate
+        run: npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts
+      - name: delegate engine billing requestId contract gate
+        run: npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts
+      - name: callback payload hash WS proof
+        run: node scripts/check-v5-callback-payload-hash.mjs
+      - name: cron submit durability + execution-heartbeat proof
+        run: npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts
+      - name: session unavailable / data-safety rootfix contract gate
+        run: npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts
+      - name: oc-memory MCP bundle build
+        env:
+          BUN_BIN: ${{ steps.bun.outputs.bun-path }}
+        run: bash packages/mcp-memory/scripts/build-oc-memory-mcp.sh
+
+  box-db-gates:
+    name: release-gates-box-db
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_gate_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_gate_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # 列车给这两道门一个新建的私有库(gateTestDb.mjs);这里是同样只属于本 job 的服务库。
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_gate_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Setup Bun
+        id: bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install CCB from lockfile
+        working-directory: claude-code-best
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Box success recovery behavioral gate
+        run: env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$(git rev-parse HEAD)"
+      - name: Box incident proofs gate (OCV5-488)
+        run: env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$(git rev-parse HEAD)"
+
+  web-build:
+    name: release-gates-web-production-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      # 与列车同一条命令(含 vite.config.ts 的 first-screen-budget 门);输出完整保留在日志里。
+      - name: web-react official build (first-screen budget)
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: npm run build --workspace packages/web-react

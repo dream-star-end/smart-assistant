@@ -1,0 +1,21 @@
+{
+  "schema": "oc.v5.selfhost.release-gates/1",
+  "_doc": "OCV5-582: every gate the selfhost release train runs, and the PR workflow that runs the same script/command. scripts/check-release-gate-parity.ts keeps this list, build_master_release() and .github/workflows/v5-selfhost-*.yml equal in both directions. A gate CI cannot run needs a written ciExempt reason instead of ci.",
+  "gates": [
+    { "id": "box-success-recovery", "script": "scripts/check-v5-box-success-recovery.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "box-continuation", "script": "scripts/check-v5-box-continuation.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "box-incident-proofs", "script": "scripts/check-v5-box-incident-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "cursor-sand-inference", "script": "scripts/check-v5-cursor-sand-inference.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "ccb-mcp-availability", "script": "scripts/check-v5-ccb-mcp-availability.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "delegate-billing-requestid", "script": "scripts/check-v5-delegate-billing-requestid.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "callback-payload-hash", "script": "scripts/check-v5-callback-payload-hash.mjs", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "cron-submit-boundary", "script": "scripts/check-v5-cron-submit-boundary.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "session-unavailable-rootfix", "script": "scripts/check-v5-session-unavailable-rootfix.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "architecture", "script": "scripts/check-architecture.ts", "ci": "v5-selfhost-gates.yml" },
+    { "id": "watch-gate", "script": "scripts/v5-selfhost-watch-gate.sh", "ci": "v5-selfhost-gates.yml" },
+    { "id": "oc-memory-mcp-build", "script": "packages/mcp-memory/scripts/build-oc-memory-mcp.sh", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "web-react-production-build", "command": "npm run build --workspace packages/web-react", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "fix-trailers", "script": "scripts/check-v5-fix-trailers.sh", "stage": "deploy", "deploy": { "caller": "cmd_deploy", "function": "assert_fix_trailers", "variable": "FIX_TRAILER_GATE" }, "ci": "v5-selfhost-release-gates.yml" }
+  ],
+  "helpers": []
+}
