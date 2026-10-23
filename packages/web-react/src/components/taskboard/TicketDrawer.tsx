@@ -188,6 +188,8 @@ export function TicketDrawer({
   const belongsToOwner = (row: Ticket | null | undefined) =>
     !!row && !!ownerLookup && (row.id === ownerLookup || row.identifier === ownerLookup)
   const [history, historyStatus] = useTimelineHistory(auth, ownerLookup)
+  const openRef = useRef(open)
+  openRef.current = open
   const historyRef = useRef(history)
   historyRef.current = history
   const resultRequests = history.resultRequests
@@ -226,7 +228,8 @@ export function TicketDrawer({
   const executionRef = useRef(execution)
   executionRef.current = execution
   const activeExecution =
-    execution && (execution.status === 'running' || execution.status === 'queued')
+    execution &&
+    (execution.status === 'running' || execution.status === 'queued' || execution.settling === true)
       ? execution
       : null
   const applyExecution = useCallback((next: TicketRun | null | undefined) => {
@@ -252,11 +255,16 @@ export function TicketDrawer({
       return false
     executionRef.current = next
     setExecution(next)
-    if (!next || (next.status !== 'running' && next.status !== 'queued')) setStopState(null)
+    if (!next || (next.status !== 'running' && next.status !== 'queued' && !next.settling))
+      setStopState(null)
     else if (next.stopRequested) setStopState('stopping')
     else if (previous?.id !== next.id) setStopState(null)
     setTimeline((items) => mergeExecution(items, next))
-    return previous?.id !== next?.id || previous?.status !== next?.status
+    return (
+      previous?.id !== next?.id ||
+      previous?.status !== next?.status ||
+      previous?.settling !== next?.settling
+    )
   }, [])
   const currentStage =
     detailStage?.id === current?.stageId
@@ -389,6 +397,7 @@ export function TicketDrawer({
     const gen = ownerGen.current
     let stopped = false
     let inFlight = false
+    let resumeRequested = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let failures = 0
     let lastTimelineAt = Date.now()
@@ -436,20 +445,31 @@ export function TicketDrawer({
         inFlight = false
         if (owned() && visible()) {
           const interval =
-            executionRef.current?.status === 'running' || executionRef.current?.status === 'queued'
+            executionRef.current?.status === 'running' ||
+            executionRef.current?.status === 'queued' ||
+            executionRef.current?.settling
               ? 2_000
               : currentRef.current?.status === 'running'
                 ? 3_000
                 : 15_000
-          timer = setTimeout(() => void tick(), Math.min(60_000, interval * 2 ** failures))
+          const resume = resumeRequested
+          resumeRequested = false
+          timer = setTimeout(
+            () => void tick(resume),
+            resume ? 0 : Math.min(60_000, interval * 2 ** failures),
+          )
         }
       }
     }
     const resume = () => {
       clearTimeout(timer)
-      if (visible()) void tick(true)
+      if (visible()) {
+        if (inFlight) resumeRequested = true
+        else void tick(true)
+      }
     }
-    timer = setTimeout(() => void tick(), currentRef.current?.status === 'running' ? 3_000 : 15_000)
+    // Initial detail metadata arrives after this effect; use the active cadence for the first follow-up.
+    timer = setTimeout(() => void tick(), 2_000)
     document.addEventListener('visibilitychange', resume)
     return () => {
       stopped = true
@@ -717,7 +737,9 @@ export function TicketDrawer({
     const requestedRunId = activeExecution.id
     const stillOwnsRun = () =>
       executionRef.current?.id === requestedRunId &&
-      (executionRef.current.status === 'running' || executionRef.current.status === 'queued')
+      (executionRef.current.status === 'running' ||
+        executionRef.current.status === 'queued' ||
+        executionRef.current.settling === true)
     setStopState('requesting')
     try {
       const out = await taskboardApi.stopRun(auth, current.id, current.version, requestedRunId)

@@ -137,8 +137,12 @@ function ExecutionDrawer() {
   control.holdTimeline = () => { server.holdTimeline = true }
   control.isTimelineHeld = () => !!server.heldTimeline
   control.releaseTimeline = () => { const resolve = server.heldTimeline; server.heldTimeline = null; resolve?.() }
+  control.reapExecution = () => {
+    saveRun({ ...server.run, status: 'timeout', settling: true, stopRequested: true, error: 'lease expired', finishedAt: Date.now() })
+    document.dispatchEvent(new Event('visibilitychange'))
+  }
   control.completeExecution = () => {
-    saveRun({ ...server.run, status: 'failed', error: 'USER_CANCELLED: stopped', stopRequested: false,
+    saveRun({ ...server.run, status: server.run.status === 'timeout' ? 'timeout' : 'failed', settling: false, error: server.run.status === 'timeout' ? 'lease expired' : 'USER_CANCELLED: stopped', stopRequested: false,
       finishedAt: Date.now(), outputMd: '完整付费结果 FIRST_PAID_OUTPUT_END', preview: undefined })
     document.dispatchEvent(new Event('visibilitychange'))
   }

@@ -223,3 +223,97 @@ test('a stage edited during asynchronous preflight is rechecked in the claim tra
     })
   } finally { release(); f.db.close() }
 })
+
+
+for (const status of ['done', 'canceled'] as const) test(`human can stop a still-live run after its ticket is ${status}, preserving closure`, async () => {
+  const f = fixture()
+  try {
+    const closed = updateTicket(f.db, f.ticket.id, f.ticket.version, { status, closedAt: Date.now() })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const stopped = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: closed.version, runId: f.run.id })
+      assert.equal(stopped.status, 202, JSON.stringify(stopped.body))
+      assert.equal(f.control.signal.aborted, true)
+      assert.deepEqual(getTicket(f.db, f.ticket.id), closed)
+      assert.equal(getRun(f.db, f.run.id)!.status, 'running')
+      const duplicate = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: closed.version, runId: f.run.id })
+      assert.equal(duplicate.status, 202)
+      settle(f)
+      assert.deepEqual(getTicket(f.db, f.ticket.id), closed)
+      assert.equal(getRun(f.db, f.run.id)!.outputMd, '已付费的完整部分结果')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})
+
+test('a reaped terminal row stays visibly settling until its exact controller finally completes', async () => {
+  const f = fixture()
+  try {
+    updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const get = async () => {
+        const response = await fetch(`${base}/api/board/tickets/${f.ticket.id}?expand=pipeline,stage,execution`)
+        assert.equal(response.status, 200)
+        return await response.json() as { execution: { settling: boolean; status: string } }
+      }
+      assert.equal((await get()).execution.settling, true)
+      const pending = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: f.ticket.version, runId: f.run.id })
+      assert.equal(pending.status, 202)
+      assert.equal(pending.body.state, 'stopping')
+      assert.equal(getTicket(f.db, f.ticket.id)!.status, 'blocked', 'stop must also prevent automatic re-dispatch after lease reaping')
+      assert.equal(f.control.signal.aborted, true)
+      assert.equal((await get()).execution.settling, true)
+      f.leave(); taskboardRunControls.finish(f.control)
+      assert.equal((await get()).execution.settling, false)
+      const terminal = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: f.ticket.version, runId: f.run.id })
+      assert.equal(terminal.status, 200)
+      assert.equal(terminal.body.state, 'terminal')
+      assert.equal(getRun(f.db, f.run.id)!.status, 'timeout')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})
+
+
+test('an old terminal controller cannot block a newer database run, including equal creation timestamps', async () => {
+  const f = fixture()
+  try {
+    updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
+    const ready = updateTicket(f.db, f.ticket.id, f.ticket.version, { status: 'ready' })
+    // Simulate a separately restarted worker owning the newer DB run.
+    const replacement = acquireLease(f.db, f.ticket.id, f.stage.id, 'new-worker', 60_000, { agentId: 'main', trigger: 'manual' })
+    f.db.prepare('UPDATE tb_ticket_run SET created_at=? WHERE id=?').run(f.run.createdAt, replacement.id)
+    const running = updateTicket(f.db, f.ticket.id, ready.version, { status: 'running' })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const old = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: running.version, runId: f.run.id })
+      assert.equal(old.status, 200)
+      assert.equal(old.body.state, 'terminal')
+      assert.deepEqual(getTicket(f.db, f.ticket.id), running)
+      assert.equal(f.control.signal.aborted, false)
+      assert.equal(getActiveLease(f.db, f.ticket.id)!.id, replacement.id)
+      const detail = await (await fetch(`${base}/api/board/tickets/${f.ticket.id}?expand=pipeline,stage,execution`)).json() as { execution: { id: string } }
+      assert.equal(detail.execution.id, replacement.id)
+    })
+  } finally { f.leave(); taskboardRunControls.finish(f.control); f.db.close() }
+})
+
+
+test('lease-loss abort is not a registered human stop: the later human intent still blocks a ready ticket', async () => {
+  const f = fixture()
+  try {
+    updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
+    const ready = updateTicket(f.db, f.ticket.id, f.ticket.version, { status: 'ready' })
+    f.control.requestStop()
+    assert.equal(f.control.humanStopRegistered, false)
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const path = `/api/board/tickets/${f.ticket.id}/stop`
+      const stopped = await post(base, path, { expectedVersion: ready.version, runId: f.run.id })
+      assert.equal(stopped.status, 202)
+      assert.equal(stopped.body.ticket.status, 'blocked')
+      assert.equal(f.control.humanStopRegistered, true)
+      const version = stopped.body.ticket.version
+      const repeated = await post(base, path, { expectedVersion: ready.version, runId: f.run.id })
+      assert.equal(repeated.status, 202)
+      assert.equal(repeated.body.ticket.version, version)
+      f.leave(); taskboardRunControls.finish(f.control)
+      assert.equal(getTicket(f.db, f.ticket.id)!.status, 'blocked')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})

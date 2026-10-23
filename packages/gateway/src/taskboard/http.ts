@@ -1758,7 +1758,6 @@ function handleMove(
   if (activeRun && cancelRunningRun) {
     const stopped = requestHumanRunStop(db, ticket.id, expectedVersion, activeRun.id)
     if (stopped.kind === 'conflict') throw new TaskboardMoveDenied(409, stopped.code, stopped.message)
-    if (stopped.kind === 'requested') stopped.control.requestStop()
     if (stopped.kind !== 'terminal') throw new TaskboardMoveDenied(409, 'stop_pending', '已请求停止本次执行，收尾完成后请再次移动任务。', { ticket: stopped.ticket, runId: activeRun.id })
   }
   const actorId = actorIdOf(actor)
@@ -2346,25 +2345,47 @@ function handleCancel(
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
+/** A stop controls execution; already closed business tickets remain closed. */
+function recordHumanRunStop(db: TaskboardDb, current: Ticket, runId: string, expectedVersion: number): Ticket {
+  const closed = current.status === 'done' || current.status === 'canceled'
+  if (!closed && current.status !== 'blocked') assertTransition({ from: current.status, to: 'blocked', actor: 'human' })
+  const updated = closed ? current : updateTicket(db, current.id, expectedVersion, { status: 'blocked', blockedReason: '用户停止本次执行' })
+  if (closed) recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'run_stop_requested', null, null, runId)
+  else recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'status_changed', 'status', current.status, 'blocked')
+  createComment(db, { ticketId: current.id, authorKind: 'human', author: HUMAN_ACTOR_ID, runId, body: closed
+    ? '已请求停止仍在运行的本次执行，保留单据关闭状态与已有输出。'
+    : '已请求停止本次执行，正在保留输出并收尾。结束后可重试。' })
+  return updated
+}
+
 function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion: number, runId: string) {
-  return db.transaction(() => {
+  const outcome = db.transaction(() => {
     const current = requireTicket(db, ticketId)
     const run = getRun(db, runId)
     if (!run || run.ticketId !== current.id) throw new TaskboardNotFound('run', runId)
-    if (run.status !== 'running' && run.status !== 'queued') return { kind: 'terminal' as const, ticket: current, run }
+    if (run.status !== 'running' && run.status !== 'queued') {
+      const latest = getLatestRunMetadata(db, current.id)
+      const active = getActiveLease(db, current.id)
+      if (latest?.id !== run.id || (active && active.id !== run.id)) return { kind: 'terminal' as const, ticket: current, run }
+      const closing = taskboardRunControls.getActiveForTicket(current.id)
+      if (!closing || closing.runId !== run.id || closing.rootSessionKey !== run.sessionKey) return { kind: 'terminal' as const, ticket: current, run }
+      if (closing.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
+      if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
+      const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
+      return { kind: 'requested' as const, ticket: updated, run, control: closing }
+    }
     const now = Date.now()
     const active = getActiveLease(db, current.id, now)
     if (!active || active.id !== run.id || !run.leaseOwner) return { kind: 'conflict' as const, code: 'run_changed', message: '当前执行已变化，请刷新后操作' }
     const control = taskboardRunControls.get(run.id, current.id, run.leaseOwner)
     if (!control) return { kind: 'conflict' as const, code: 'run_control_unavailable', message: '当前执行控制不可用，请等待执行收尾后重试' }
-    if (control.signal.aborted) return { kind: 'pending' as const, ticket: current, run }
+    if (control.humanStopRegistered && (current.status === 'blocked' || current.status === 'done' || current.status === 'canceled')) return { kind: 'pending' as const, ticket: current, run }
     if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
-    if (current.status !== 'blocked') assertTransition({ from: current.status, to: 'blocked', actor: 'human' })
-    const updated = updateTicket(db, current.id, expectedVersion, { status: 'blocked', blockedReason: '用户停止本次执行' })
-    recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'status_changed', 'status', current.status, 'blocked')
-    createComment(db, { ticketId: current.id, authorKind: 'human', author: HUMAN_ACTOR_ID, runId: run.id, body: '已请求停止本次执行，正在保留输出并收尾。结束后可重试。' })
+    const updated = recordHumanRunStop(db, current, run.id, expectedVersion)
     return { kind: 'requested' as const, ticket: updated, run, control }
   }).immediate()
+  if (outcome.kind === 'requested') outcome.control.registerHumanStop()
+  return outcome
 }
 
 /** Human stop is an exact-run request, never a lease release or terminal claim. */
@@ -2387,7 +2408,6 @@ function handleStop(
     sendError(res, 409, outcome.message, { code: outcome.code })
     return
   }
-  if (outcome.kind === 'requested') outcome.control.requestStop()
   sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
 }
 

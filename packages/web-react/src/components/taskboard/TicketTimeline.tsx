@@ -280,6 +280,11 @@ function SystemRun({
       <p className="text-caption text-muted break-words">
         {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
+      {run.settling && run.status !== 'running' && run.status !== 'queued' && (
+        <p className="text-caption text-muted" data-testid="ticket-run-settling">
+          执行仍在收尾，结果归档后可重试。
+        </p>
+      )}
       <p className="text-caption text-muted break-all" data-testid="ticket-run-models">
         执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}
       </p>

@@ -5,6 +5,7 @@
  * imports these back and re-exports its former exports, so its import surface is unchanged.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { taskboardRunControls } from './runControl.js'
 import { type TaskboardDb, TaskboardValidationError } from './db/index.js'
 import { getProject, getProjectByKey } from './db/projects.js'
 import type { TaskboardPreflight } from './stagePreflight.js'
@@ -108,12 +109,19 @@ export function resolveProject(db: TaskboardDb, idOrKey: string) {
 
 /** Enrich only the response window, with one batch lookup and no stored mutation. */
 export async function enrichTaskboardRuns(ctx: TaskboardHttpContext, runs: readonly TicketRun[]): Promise<TicketRun[]> {
-  if (!ctx.getRunSnapshots || runs.length === 0) return [...runs]
-  try {
-    const snapshots = await ctx.getRunSnapshots(runs)
-    return runs.map((run) => ({ ...run, ...snapshots[run.id] }))
-  } catch {
-    // Usage persistence may be briefly unavailable. Missing stays unrecorded.
-    return runs.map((run) => ({ ...run, actualModels: [] }))
+  let projected = [...runs]
+  if (ctx.getRunSnapshots && runs.length) {
+    try {
+      const snapshots = await ctx.getRunSnapshots(runs)
+      projected = runs.map((run) => ({ ...run, ...snapshots[run.id] }))
+    } catch {
+      // Usage persistence may be briefly unavailable. Missing stays unrecorded.
+      projected = runs.map((run) => ({ ...run, actualModels: [] }))
+    }
   }
+  return projected.map((run) => {
+    const control = taskboardRunControls.getActiveForTicket(run.ticketId)
+    const settling = !!control && control.runId === run.id && control.rootSessionKey === run.sessionKey
+    return { ...run, settling, stopRequested: settling ? control.signal.aborted : run.stopRequested === true }
+  })
 }
