@@ -5869,13 +5869,19 @@
         "74984cbf",
         "92acb899",
         "dc1ea28c",
-        "43b509a0"
+        "43b509a0",
+        "571fa589"
       ],
       "proofPending": {
         "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
         "since": "2026-10-05"
       },
       "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCcWriteCleanup.test.ts",
+          "assertion": "a clean host exit cannot hide a refused write"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
@@ -8041,6 +8047,23 @@
       ],
       "coverageCommits": [
         "8a349801"
+      ]
+    },
+    {
+      "id": "INC-20261023-SYSTEM-APPROVAL-FENCING",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选在默认Codex审查及独立SQLite fixture中发现：同资源预先创建的master/browser提案可绕过另一次执行的unknown闸门；DEFERRED事务升级可出现SQLITE_BUSY_SNAPSHOT，使完成回执丢失。未涉及真实用户副作用或资金。",
+      "rootFixCommit": "e72089cd",
+      "coverageCommits": [
+        "987d2125"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-approval-proofs.ts",
+          "assertion": "[ocv5-610-durable-approval-fencing] PASS"
+        }
       ]
     }
   ]

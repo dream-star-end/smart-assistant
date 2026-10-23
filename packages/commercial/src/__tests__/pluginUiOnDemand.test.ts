@@ -25,6 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const BASELINE = resolve(here, "../../agent-sandbox/ccb-baseline");
 const SKILLS = join(BASELINE, "skills");
 const SCHEMA = resolve(here, "../../../web-react/src/components/iui/schema.ts");
+const CORE_UI_PROTOCOL = readFileSync(resolve(here, "../../agent-sandbox/platform-runtime/prompts/system-assistant/references/ui.md"), "utf8");
 
 /**
  * 一个类型在文本里「被定义」：JSON 写法 "type":"x" 或定义行 `- x:` / `- x：`。
@@ -92,7 +93,7 @@ describe("2. 前端类型的归属", () => {
     for (const t of all) {
       if (frontendOnly.has(t)) continue;
       const owners = PLUGIN_UI_COMPONENTS.filter((s) => s.types.includes(t)).length;
-      const core = new RegExp(`"type":"${t}"`).test(INTELLIGENT_UI_PROMPT);
+      const core = new RegExp(`"type":"${t}"`).test(CORE_UI_PROTOCOL);
       assert.ok(core !== (owners === 1), `${t}: core=${core} pluginOwners=${owners} — must be exactly one of the two`);
     }
     for (const t of pluginUiTypes()) assert.ok(all.includes(t), `registered plugin type ${t} is unknown to the frontend`);

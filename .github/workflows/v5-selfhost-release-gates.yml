@@ -58,6 +58,12 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Install host log policy proof dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3 logrotate gzip
+      - name: Host log policy filesystem and real rotation gate
+        run: bash scripts/v5-selfhost-host-log-policy.test.sh
       - name: Setup Bun
         id: bun
         uses: oven-sh/setup-bun@v2
@@ -84,6 +90,8 @@ jobs:
         run: node scripts/check-v5-callback-payload-hash.mjs
       - name: cron submit durability + execution-heartbeat proof
         run: npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts
+      - name: durable system approval fencing proof
+        run: npx --no-install tsx scripts/check-v5-system-approval-proofs.ts
       - name: session unavailable / data-safety rootfix contract gate
         run: npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts
       - name: oc-memory MCP bundle build
