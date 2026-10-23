@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
   isProjectSearchEnabled,
@@ -240,6 +241,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
+  promptPolicy?: PromptPrivacyPolicy
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
@@ -297,6 +299,7 @@ export interface CodexLaunchOverridesContext {
 
 export interface CodexLaunchOverrides {
   /** Intelligent UI(OCV5-361):instructions 里 INTELLIGENT_UI 段的指纹,没有 = false(开关切换后判断要否重启)。 */
+  promptPolicyFingerprint?: string
   intelligentUiApplied: IntelligentUiApplied
   /** Absolute path of the instructions file. Caller writes
    *  `instructionsContent` to this path before spawn. */
@@ -371,6 +374,7 @@ export async function buildCodexLaunchOverrides(
     ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => projectSearchOn || name !== 'project_search')
     : []
   const platformResult = await buildPromptContext({
+    promptPolicy: ctx.promptPolicy,
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
     persona: ctx.persona,
@@ -514,6 +518,7 @@ export async function buildCodexLaunchOverrides(
 
   return {
     intelligentUiApplied: platformResult.intelligentUi ?? false,
+    promptPolicyFingerprint: platformResult.promptPolicyFingerprint,
     instructionsFile,
     instructionsContent,
     tokenFile,

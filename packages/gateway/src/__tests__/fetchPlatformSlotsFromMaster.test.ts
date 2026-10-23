@@ -113,8 +113,10 @@ describe('fetchPlatformSlotsFromMaster — request shape', () => {
     )
     assert.ok(cap.url, 'fetcher must be called')
     assert.ok(cap.url!.startsWith(`${MASTER}${PLATFORM_PROMPT_SLOTS_PATH}?model=`))
-    // model param must be URI-encoded (space → %20, & → %26)
-    assert.match(cap.url!, /model=claude-opus-4-7%20special%26chars/)
+    // URLSearchParams uses '+' for spaces; decoded data and parameter boundaries are the contract.
+    const sent = new URL(cap.url!)
+    assert.equal(sent.searchParams.get('model'), 'claude-opus-4-7 special&chars')
+    assert.deepEqual([...sent.searchParams.keys()], ['model'])
     assert.equal(cap.headers!.authorization, `Bearer ${TOKEN}`)
   })
 

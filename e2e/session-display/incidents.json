@@ -8090,6 +8090,23 @@
           "assertion": "[ocv5-610-durable-approval-fencing] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261023-PROMPT-PRIVACY-LIFECYCLE",
+      "occurredAt": "2026-10-23",
+      "severity": "P1",
+      "symptom": "未上线候选默认Codex复审发现：隐私metadata失败后可能遗留已修改的desired配置，使重试跳过warm重启；native compact/preheat等待metadata期间销毁会话仍可新启动。仅隔离fixture复现，无真实用户、模型或资金影响。",
+      "rootFixCommit": "4395e393",
+      "coverageCommits": [
+        "4395e393"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-prompt-privacy-proofs.ts",
+          "assertion": "[prompt-privacy-proofs] PASS fresh consent, operation lifetime and stopped-process boundary"
+        }
+      ]
     }
   ]
 }

@@ -1,3 +1,5 @@
+import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
+import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
@@ -4393,6 +4395,10 @@ export async function registerCommercial(
     }
   }
 
+  const resolvePromptPrivacySupport = makePromptPrivacySupportResolver({
+    inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
+    validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
+  });
   const handler = createCommercialHandler({
     jwtSecret,
     mediaGeneration: mediaGenerationService,
@@ -4451,6 +4457,7 @@ export async function registerCommercial(
     containerRuntimeReady: Boolean(v3Deps),
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
+    resolvePromptPrivacySupport,
     prewarmContainer,
     prepareWorkspaceContainer,
     // v1.0.191 — /api/media-signed 冷启动护栏。装配端做了 per-uid singleflight 合并,

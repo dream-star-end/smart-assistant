@@ -136,3 +136,16 @@ describe("intelligent_ui(OCV5-361)", () => {
     assert.equal(PreferencesPatchSchema.safeParse({ intelligent_ui: 1 }).success, false);
   });
 });
+
+describe('system assistant consent', () => {
+  test('absent means no extra consent; exact profile object is validated and removable', () => {
+    assert.deepEqual(PreferencesSchema.parse({}), {})
+    const profile = { enabled: true, nickname: ' 小林 ', sessionId: 'scope-a' }
+    const parsed = PreferencesPatchSchema.parse({ system_assistant_profile: profile, system_assistant_recommendations: false })
+    assert.equal(parsed.system_assistant_profile?.nickname, '小林')
+    assert.deepEqual(PreferencesPatchSchema.parse({ system_assistant_profile: null }), { system_assistant_profile: null })
+    for (const value of [{ ...profile, admin: true }, { ...profile, sessionId: '' }, { ...profile, nickname: 'x\ny' }, { nickname: 'x' }]) {
+      assert.equal(PreferencesPatchSchema.safeParse({ system_assistant_profile: value }).success, false)
+    }
+  })
+})

@@ -10,7 +10,8 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign as cryptoSign } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, lstatSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { isolatedBoxArgs } from "./isolatedBoxArgs.js";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -477,7 +478,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     const textFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxTextFetch.ts")).href);
     const registryMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxInvocationRegistry.ts")).href);
     const preparedMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxPreparedContinuation.ts")).href);
-    const boxProjects = "/home/box/.claude/projects";
+    const boxProjects = join(HOME, "synthetic-box", "projects");
     if (!existsSync(boxProjects)) mkdirSync(boxProjects, { recursive: true, mode: 0o755 });
     const boxStat = statSync(boxProjects);
     if (!boxStat.isDirectory() || boxStat.uid !== (process.getuid?.() ?? 0)) {
@@ -600,6 +601,11 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       if (path === "/internal/box/idle-proof") {
         await proof(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
         hits.push({ url: path, status: res.statusCode, bytes: raw.length, summary: false, body: responseBody.slice(0, 4000) });
+        return;
+      }
+      if (req.method === "GET" && path === "/internal/v3/platform-prompt-slots") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }));
         return;
       }
       if (path !== "/v1/messages") {
@@ -2175,7 +2181,7 @@ function makeLocalPythonExec(toolNames: () => string[]): {
         return { stdout: JSON.stringify({ runNonce, leaseEpoch, keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
       }
       log.push("python");
-      const ran = spawnSync(request.command, request.args, {
+      const ran = spawnSync(request.command, isolatedBoxArgs(request.args, join(HOME, "synthetic-box")), {
         cwd: request.cwd && existsSync(request.cwd) ? request.cwd : "/tmp",
         env: { ...process.env, ...request.environment },
         encoding: "utf8",
@@ -2244,16 +2250,16 @@ function capturePreIdleTranscript(label: string): { files: Array<{ file: string;
     for (const name of names) {
       const path = join(dir, name);
       let info;
-      try { info = statSync(path); } catch { continue; }
+      try { info = lstatSync(path); } catch { continue; }
+      if (info.isSymbolicLink()) continue;
       if (info.isDirectory()) {
         if (name === "node_modules" || name === "candidate") continue;
         walk(path);
       } else if (name.endsWith(".jsonl") && info.size <= 20_000_000 && Date.now() - info.mtimeMs < 6 * 60 * 60 * 1000) jsonl.push(path);
     }
   };
-  for (const root of [process.env.CLAUDE_CONFIG_DIR, HOME, "/home/box/.claude"]) {
-    if (root) walk(root);
-  }
+  // Only this fixture owns HOME. Never discover another user/session transcript.
+  walk(HOME);
   const tag = SCHEMA.slice(-6);
   jsonl.sort().forEach((file, index) => {
     const dest = join(rawDir, `ocv5-296-pre-idle-${label}-${tag}-${index}.jsonl`);
@@ -2314,14 +2320,13 @@ async function execStage(plan: {
   run: { command: string; args: string[] }; cleanup: { command: string; args: string[]; cwd: string; environment: NodeJS.ProcessEnv };
 }): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "ocv5-296-idle-stage-"));
-  const from = "/home/box/.claude/projects";
   const runKey = JSON.stringify([plan.run.command, plan.run.args]);
   try {
     for (const step of [...plan.stageInputs, plan.cleanup]) {
       if (JSON.stringify([step.command, step.args]) === runKey) throw new Error("refusing inner claude exec");
       if (step.command !== "/usr/bin/python3") throw new Error(`refusing ${step.command}`);
       await new Promise<void>((resolveStep, reject) => {
-        const child: ChildProcess = spawn(step.command, step.args.map((arg) => arg.replaceAll(from, root)), {
+        const child: ChildProcess = spawn(step.command, isolatedBoxArgs(step.args, root), {
           cwd: step.cwd, env: step.environment,
         });
         let stderr = "";

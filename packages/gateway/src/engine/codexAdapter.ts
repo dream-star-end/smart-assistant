@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CodexAdapter — codex(gpt-5.5,app-server 形态)底座的 EngineAdapter 实现(M1a)。
  *
@@ -688,6 +689,20 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  clearPromptPrivacy(): void {
+    (this.kernel as { clearPromptPrivacy?: () => void }).clearPromptPrivacy?.()
+  }
+  assertPromptPrivacyStopped(): void {
+    const assertStopped = (this.kernel as { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    if (!assertStopped) throw new Error('助手隐私刷新无法核验旧进程状态。')
+    assertStopped.call(this.kernel)
+  }
+  get promptPolicyFingerprint(): string | undefined {
+    return (this.kernel as { promptPolicyFingerprint?: string }).promptPolicyFingerprint
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    (this.kernel as { setPromptPrivacy?: (p: PromptPrivacyPolicy) => void }).setPromptPrivacy?.(policy)
+  }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return (this.kernel as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }
