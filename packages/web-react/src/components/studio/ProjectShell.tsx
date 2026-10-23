@@ -171,7 +171,12 @@ export function ProjectShell(props: {
           onOpenShot={openShot}
         />
       ) : (
-        <FinalPage auth={auth} view={state.view} onOpenBoard={() => go('board')} />
+        <FinalPage
+          auth={auth}
+          view={state.view}
+          onOpenBoard={() => go('board')}
+          onReload={reload}
+        />
       )}
     </>
   )

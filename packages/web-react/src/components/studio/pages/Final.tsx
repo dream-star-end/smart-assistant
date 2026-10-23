@@ -6,17 +6,20 @@ import { Check, CircleAlert, Clapperboard, Download, MapPin, RefreshCw } from 'l
 import { useEffect, useMemo, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
+import { STUDIO_POLL_MS } from '../../../hooks/useStudioProject'
 import { studioApi, studioErrorText } from '../../../lib/studio/api'
 import {
   RESOLUTIONS,
   SUBTITLE_MODES,
   composingFilm,
   creditsText,
+  failedFilm,
   filmFor,
   finalFilms,
   variantKey,
   variantOf,
 } from '../../../lib/studio/final'
+import type { ReusedFilm } from '../../../lib/studio/final'
 import { formatCredits } from '../../../lib/studio/format'
 import { shotCard } from '../../../lib/studio/model'
 import type {
@@ -114,7 +117,7 @@ export function FinalPage(props: {
   const [subs, setSubs] = useState<ExportSubtitles>(() => variantOf(latest).subtitles)
   const key = variantKey({ resolution: res, subtitles: subs })
   /** Format → film the server said is current for it (an export answered `reused`). */
-  const [reused, setReused] = useState<Record<string, string>>({})
+  const [reused, setReused] = useState<Record<string, ReusedFilm>>({})
   /** Format → newest film version when its re-compose was asked for. */
   const [asked, setAsked] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState(false)
@@ -130,7 +133,19 @@ export function FinalPage(props: {
 
   const film = filmFor(films, key, reused[key], asked[key])
   const composing = composingFilm(view, key)
-  const waiting = !film && (composing !== null || asked[key] !== undefined)
+  // A re-compose that failed (the project stays done) ends the wait and can be asked again (r1 P1).
+  const failed = composing ? null : failedFilm(view, key, asked[key])
+  const waiting = !film && (composing !== null || (asked[key] !== undefined && !failed))
+  // A done project with nothing in flight is not polled; while a re-compose is only queued (its
+  // take not created yet) keep the view fresh here, in case no push arrives (r1 P1).
+  const { onReload } = props
+  useEffect(() => {
+    if (!waiting || composing || !onReload) return
+    const tick = window.setInterval(() => {
+      if (document.visibilityState === 'visible') onReload()
+    }, STUDIO_POLL_MS)
+    return () => window.clearInterval(tick)
+  }, [waiting, composing, onReload])
   const shown = film ?? latest
   const url = useBlobUrl(auth, shown?.blobSha)
   const srtUrl = useBlobUrl(auth, film && subs === 'srt' ? film.final?.srtSha : null)
@@ -160,7 +175,8 @@ export function FinalPage(props: {
         resolution: res,
         subtitles: subs,
       })
-      if ('reused' in out) setReused((m) => ({ ...m, [key]: out.takeId }))
+      if ('reused' in out)
+        setReused((m) => ({ ...m, [key]: { takeId: out.takeId, latestId: latest?.id ?? null } }))
       else {
         setAsked((m) => ({ ...m, [key]: at }))
         toast('正在按这个规格重新合成，免费', 'success')
@@ -354,13 +370,15 @@ export function FinalPage(props: {
             <div className="st-cap" style={{ marginTop: 4 }} data-testid="export-format-note">
               {film
                 ? '下载已合成的版本。'
-                : waiting
-                  ? '正在按这个规格重新合成（免费），好了会自动出现在这里。'
-                  : !latest
-                    ? '成片合成后可导出。'
-                    : done
-                      ? '这个规格还没合成过：点上方按钮免费重新合成一次。'
-                      : '成片完成后可按其他规格重新合成（免费）。'}
+                : failed && done
+                  ? '上次按这个规格合成没有成功，可以再试一次（免费）。'
+                  : waiting
+                    ? '正在按这个规格重新合成（免费），好了会自动出现在这里。'
+                    : !latest
+                      ? '成片合成后可导出。'
+                      : done
+                        ? '这个规格还没合成过：点上方按钮免费重新合成一次。'
+                        : '成片完成后可按其他规格重新合成（免费）。'}
             </div>
           </div>
           <div data-testid="final-credits">

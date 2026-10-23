@@ -141,6 +141,22 @@ export interface TimelineModel {
   music: StudioTake | null
 }
 
+/**
+ * A shot's length in the cut, as compose cuts it (backend composeJob.ts, FE-6 r1 P2): the planned
+ * length, capped by the active video's real length when known, and never under 0.5 s.
+ */
+export function clipSeconds(view: StudioProjectView, shot: StudioShot): number {
+  const planned = shotSeconds(shot)
+  const video = shot.activeTakeId
+    ? view.takes.find((x) => x.id === shot.activeTakeId && x.ownerKind === 'shot_video')
+    : undefined
+  const real =
+    video && typeof video.durationMs === 'number' && video.durationMs > 0
+      ? video.durationMs / 1000
+      : null
+  return real === null ? planned : Math.max(0.5, Math.min(planned, real))
+}
+
 /** Narration layout constants shared with compose (backend orchestrator/composeJob.ts). */
 export const LEAD_SEC = 0.15
 export const GAP_SEC = 0.3
@@ -150,7 +166,7 @@ export function timeline(view: StudioProjectView): TimelineModel {
   let t = 0
   const clips = shots.map((shot) => {
     const start = t
-    t += shotSeconds(shot)
+    t += clipSeconds(view, shot)
     return { shot, start, end: t }
   })
   const byShot = new Map(clips.map((c) => [c.shot.id, c]))

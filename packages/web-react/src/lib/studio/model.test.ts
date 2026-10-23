@@ -174,6 +174,23 @@ describe('timeline (OCV5-593)', () => {
     ])
   })
 
+  test('a clip is as long as compose cuts it: planned, capped by the real video (r1 P2)', () => {
+    const v = view({
+      shots: [
+        shot(0, { spec: { durationSec: 6 }, activeTakeId: 'v0' }),
+        shot(1, { spec: { durationSec: 4 }, activeTakeId: 'v1' }),
+      ],
+      takes: [
+        take({ id: 'v0', ownerKind: 'shot_video', ownerId: 's0', durationMs: 4000 }),
+        take({ id: 'v1', ownerKind: 'shot_video', ownerId: 's1', durationMs: 9000 }),
+      ],
+    })
+    expect(timeline(v).clips.map((c) => [c.start, c.end])).toEqual([
+      [0, 4],
+      [4, 8],
+    ])
+  })
+
   test('a shot without a duration counts as 5 s; ruler steps scale with length', () => {
     expect(timeline(view({ shots: [shot(0, { spec: {} })] })).total).toBe(5)
     expect(rulerTicks(10)).toEqual([0, 2, 4, 6, 8, 10])

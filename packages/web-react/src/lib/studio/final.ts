@@ -52,19 +52,44 @@ export function composingFilm(view: StudioProjectView, key: string): StudioTake 
   )
 }
 
+/** A film for this format that failed or was canceled after `after` (the version when asked). */
+export function failedFilm(
+  view: StudioProjectView,
+  key: string,
+  after: number | undefined,
+): StudioTake | null {
+  if (after === undefined) return null
+  return (
+    view.takes.find(
+      (t) =>
+        t.ownerKind === 'final' &&
+        (t.status === 'failed' || t.status === 'canceled') &&
+        t.version > after &&
+        filmKey(t) === key,
+    ) ?? null
+  )
+}
+
+/** The server confirmed `takeId` current for a format while `latestId` was the newest film. */
+export interface ReusedFilm {
+  takeId: string
+  latestId: string | null
+}
+
 /**
  * The film to hand out for a format. The newest film is current for its own format; another
- * format is only known current once the server said so (`reusedId`, from an export request) or
- * a film for it finished after it was asked for (`askedAfter`, the newest version at that time).
+ * format is only known current once the server said so (`reused`, from an export request — only
+ * while no newer film has landed since, code r1 P1: a newer film may carry new music) or a film
+ * for it finished after it was asked for (`askedAfter`, the newest version at that time).
  */
 export function filmFor(
   films: StudioTake[],
   key: string,
-  reusedId: string | undefined,
+  reused: ReusedFilm | undefined,
   askedAfter: number | undefined,
 ): StudioTake | null {
-  if (reusedId) {
-    const hit = films.find((t) => t.id === reusedId)
+  if (reused && (films[0]?.id ?? null) === reused.latestId) {
+    const hit = films.find((t) => t.id === reused.takeId)
     if (hit) return hit
   }
   if (askedAfter !== undefined) {

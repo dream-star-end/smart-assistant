@@ -68,7 +68,9 @@ describe('final films by export format (OCV5-593 FE-6)', () => {
     ]
     expect(filmFor(films, 'vertical-burn', undefined, undefined)?.id).toBe('v3')
     expect(filmFor(films, '720p-burn', undefined, undefined)).toBeNull()
-    expect(filmFor(films, '720p-burn', 'v2', undefined)?.id).toBe('v2')
+    expect(filmFor(films, '720p-burn', { takeId: 'v2', latestId: 'v3' }, undefined)?.id).toBe('v2')
+    // Confirmed while v2 was newest; v3 has landed since: no longer known current (r1 P1).
+    expect(filmFor(films, '720p-burn', { takeId: 'v2', latestId: 'v2' }, undefined)).toBeNull()
     // Asked after v2 existed: v2 is not the answer, a newer 720p film is.
     expect(filmFor(films, '720p-burn', undefined, 2)).toBeNull()
     expect(filmFor([fin('v4', 4, '720p-burn'), ...films], '720p-burn', undefined, 2)?.id).toBe('v4')

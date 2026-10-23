@@ -195,6 +195,84 @@ describe('final page export (OCV5-593 FE-6)', () => {
   })
 })
 
+describe('final page export review r1', () => {
+  test('a confirmed film stops counting once a newer film lands (it may carry new music)', async () => {
+    requestExport.mockResolvedValueOnce({ reused: true, takeId: 'old720' })
+    const other = film({ id: 'old720', key: '720p-burn', version: 1 })
+    const latest = film({ id: 'new', key: '1080p-burn', version: 2 })
+    const { rerender } = render(
+      <FinalPage auth={auth} view={view([latest, other])} onOpenBoard={() => {}} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '720p' }))
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('final-export'))
+    })
+    await waitFor(() => expect(screen.getByTestId('final-download')).toBeInTheDocument())
+    // Reconnected straight into done: a newer film exists (another client changed the music).
+    rerender(
+      <FinalPage
+        auth={auth}
+        view={view([film({ id: 'newer', key: '1080p-burn', version: 3 }), latest, other])}
+        onOpenBoard={() => {}}
+      />,
+    )
+    expect(screen.queryByTestId('final-download')).toBeNull()
+    expect(screen.getByTestId('final-export')).toBeInTheDocument()
+  })
+
+  test('a re-compose that failed ends the wait and can be asked again', async () => {
+    requestExport.mockResolvedValueOnce({ queued: true })
+    const first = film({ id: 'f1', version: 1 })
+    const { rerender } = render(
+      <FinalPage auth={auth} view={view([first])} onOpenBoard={() => {}} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '720p' }))
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('final-export'))
+    })
+    expect(screen.queryByTestId('final-export')).toBeNull()
+    rerender(
+      <FinalPage
+        auth={auth}
+        view={view([
+          film({ id: 'f2', key: '720p-burn', version: 2, status: 'failed', blobSha: null }),
+          first,
+        ])}
+        onOpenBoard={() => {}}
+      />,
+    )
+    expect(screen.getByTestId('final-export')).toBeInTheDocument()
+    expect(screen.getByTestId('export-format-note')).toHaveTextContent('可以再试一次（免费）')
+  })
+
+  test('while a re-compose is only queued the page keeps reloading', async () => {
+    vi.useFakeTimers()
+    try {
+      requestExport.mockResolvedValueOnce({ queued: true })
+      const onReload = vi.fn()
+      render(
+        <FinalPage
+          auth={auth}
+          view={view([film({})])}
+          onOpenBoard={() => {}}
+          onReload={onReload}
+        />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '720p' }))
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('final-export'))
+      })
+      expect(onReload).toHaveBeenCalledTimes(1)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3100)
+      })
+      expect(onReload).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe('final page credits (OCV5-593 FE-6, d14)', () => {
   const credit: FilmCredit = {
     kind: 'music',
