@@ -171,6 +171,7 @@ function fakeDocker(behaviour: {
   killHangs?: boolean
   removeHangs?: boolean
   stdoutDelayMs?: number
+  startHangs?: boolean
 }) {
   const created: Created[] = []
   const docker = {
@@ -193,6 +194,7 @@ function fakeDocker(behaviour: {
           return stream
         },
         async start() {
+          if (behaviour.startHangs) await new Promise(() => {})
           if (behaviour.write && behaviour.outDir) await behaviour.write(behaviour.outDir)
           if (!behaviour.hang && !behaviour.waitNever)
             release({ StatusCode: behaviour.status ?? 0 })
@@ -481,9 +483,48 @@ describe('ComposeRunner (OCV5-588)', () => {
     assert.equal(swept, 2)
     assert.deepEqual(
       (sweeper as unknown as { removedIds: string[] }).removedIds,
-      ['running-dead-owner', 'exited'],
-      'only stopped containers and containers whose owner is proven dead are removed; live work of the other master is kept',
+      ['running-dead-owner', 'running-mine'],
+      "only a dead owner's containers and our own untracked ones are removed; the live master's exited container waits for its owner to read the status (Codex Sol r1 P1)",
     )
+  })
+
+  test('a daemon that never answers start() times out and frees the slot (Codex Sol r1 P1)', async () => {
+    const root = await setup()
+    const mk = (docker: ReturnType<typeof fakeDocker>) =>
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+        maxConcurrent: 1,
+        setupTimeoutMsOverride: 30,
+        killGraceMs: 30,
+      })
+    const stuck = fakeDocker({ startHangs: true })
+    const runner = mk(stuck)
+    const { inDir } = await runner.prepare('job-00000011')
+    await writeFile(join(inDir, 'a.mp4'), 'x')
+    await assert.rejects(
+      runner.run('job-00000011', { op: 'probe', file: 'a.mp4' }),
+      (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_TIMEOUT',
+    )
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(stuck.created[0]!.removed, true)
+    const ok = fakeDocker({ status: 0, stdout: '{"format":{}}' })
+    const res = await mk(ok).run('job-00000011', { op: 'probe', file: 'a.mp4' })
+    assert.deepEqual(res.stdoutJson, { format: {} })
+  })
+
+  test('every ffmpeg input decodes on one thread; filters and x264 are capped (Codex Sol r1 P1)', () => {
+    const argv = buildCommand({ op: 'compose', spec: base() }).argv
+    const inputs = argv.flatMap((a, i) => (a === '-i' ? [i] : []))
+    assert.ok(inputs.length > 0)
+    for (const i of inputs) assert.deepEqual(argv.slice(i - 2, i), ['-threads', '1'])
+    assert.deepEqual(argv.slice(1, 5), ['-filter_threads', '2', '-filter_complex_threads', '2'])
+    const cv = argv.indexOf('-c:v')
+    assert.deepEqual(argv.slice(cv - 2, cv), ['-threads', '4'])
+    assert.equal(buildCommand({ op: 'probe', file: 'a.mp4' }).argv.includes('-threads'), false)
   })
 
   test('not enough free disk refuses before any container starts; frames carry a runtime -fs cap', async () => {

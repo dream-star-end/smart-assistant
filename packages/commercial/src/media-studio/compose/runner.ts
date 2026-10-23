@@ -38,6 +38,10 @@ export const STARTED_LABEL = 'com.openclaude.studio.started'
 const DISK_HEADROOM_BYTES = 1024 * 1024 * 1024
 const LOCK_WAIT_MS = 5_000
 const KILL_GRACE_MS = 10_000
+/** Bound on each create / attach / start call: docker-modem has no request deadline of its own. */
+const SETUP_TIMEOUT_MS = 60_000
+/** Process-wide: every runner in one process shares the owner token, so they share this set too. */
+const ACTIVE_CONTAINERS = new Set<string>()
 const STREAM_DRAIN_MS = 5_000
 const REMOVE_RETRY_MS = 30_000
 const REMOVE_RETRIES = 10
@@ -180,6 +184,8 @@ export interface ComposeRunnerOptions {
   ownerDead?: (owner: string | undefined) => boolean
   removeRetryMs?: number
   killGraceMs?: number
+  /** Test seam: bound on each create / attach / start call (default 60 s). */
+  setupTimeoutMsOverride?: number
 }
 
 export interface ComposeResult {
@@ -229,6 +235,8 @@ export class ComposeRunner {
   private readonly max: number
   readonly owner: string
   private readonly ownerDead: (owner: string | undefined) => boolean
+  /** Names of containers a run() in this process created and has not yet removed. */
+  private readonly tracked = ACTIVE_CONTAINERS
 
   constructor(private readonly opts: ComposeRunnerOptions) {
     this.max = Math.max(1, Math.min(8, opts.maxConcurrent ?? 2))
@@ -278,10 +286,13 @@ export class ComposeRunner {
     let n = 0
     for (const c of list) {
       const labels = (c.Labels ?? {}) as Record<string, string>
-      // Only a stopped container (exited/dead) is safe without an owner check; created, restarting
-      // and paused containers may run at any moment (plan r3 P1-1).
-      const stopped = c.State === 'exited' || c.State === 'dead'
-      if (!stopped && !this.ownerDead(labels[OWNER_LABEL])) continue
+      // A live owner may still be about to read an exited container's status (Codex Sol r1 P1), so
+      // only a proven-dead owner's containers go, plus this runner's own containers that no run()
+      // is tracking (e.g. a create that answered after its setup deadline).
+      const owner = labels[OWNER_LABEL]
+      const mine = owner === this.owner
+      const orphan = mine && !(c.Names ?? []).some((n) => this.tracked.has(n.replace(/^\//, '')))
+      if (!orphan && (mine || !this.ownerDead(owner))) continue
       await this.opts.docker
         .getContainer(c.Id)
         .remove({ force: true })
@@ -404,10 +415,17 @@ export class ComposeRunner {
       throw err
     }
     let container: Docker.Container | null = null
+    let activeName: string | null = null
     let stream: Duplex | null = null
     try {
-      container = await this.opts.docker.createContainer({
-        name: `oc-v5-studio-compose-${jobId}-${randomUUID().slice(0, 8)}`,
+      const name = `oc-v5-studio-compose-${jobId}-${randomUUID().slice(0, 8)}`
+      this.tracked.add(name)
+      activeName = name
+      // Every docker call before the step's own timer is bounded too (Codex Sol r1 P1): a daemon
+      // that accepts a request and never answers must not hold the slot and reservation forever.
+      const setupMs = this.opts.setupTimeoutMsOverride ?? SETUP_TIMEOUT_MS
+      const creating = this.opts.docker.createContainer({
+        name,
         Image: this.opts.imageId!,
         User: `${SANDBOX_UID}:${SANDBOX_UID}`,
         WorkingDir: '/work',
@@ -460,7 +478,25 @@ export class ComposeRunner {
           ShmSize: 64 * 1024 * 1024,
         },
       })
-      stream = (await container.attach({ stream: true, stdout: true, stderr: true })) as Duplex
+      container = (await withTimeout(creating, setupMs)) ?? null
+      if (!container) {
+        // A late answer still creates the container: remove it as soon as it exists.
+        void creating.then((c) => c.remove({ force: true })).catch(() => {})
+        throw new ComposeRunnerError(
+          'COMPOSE_TIMEOUT',
+          'docker did not create the compose container in time',
+        )
+      }
+      const attached = await withTimeout(
+        container.attach({ stream: true, stdout: true, stderr: true }),
+        setupMs,
+      )
+      if (!attached)
+        throw new ComposeRunnerError(
+          'COMPOSE_TIMEOUT',
+          'docker did not attach to the compose container in time',
+        )
+      stream = attached as Duplex
       const stdout = new Bounded(MAX_STDOUT_BYTES)
       const stderr = new Bounded(MAX_STDERR_BYTES)
       this.opts.docker.modem.demuxStream(stream, sink(stdout), sink(stderr))
@@ -469,7 +505,15 @@ export class ComposeRunner {
         stream?.once('close', () => resolveEnd())
         stream?.once('error', () => resolveEnd())
       })
-      await container.start()
+      const started = await withTimeout(
+        container.start().then(() => true),
+        setupMs,
+      )
+      if (started !== true)
+        throw new ComposeRunnerError(
+          'COMPOSE_TIMEOUT',
+          'docker did not start the compose container in time',
+        )
       const timeoutMs = this.opts.timeoutMsOverride ?? cmd.timeoutMs
       const waited = container.wait().then(
         (r) => ({ status: (r as { StatusCode?: number }).StatusCode ?? -1 }),
@@ -521,8 +565,9 @@ export class ComposeRunner {
       stream?.destroy()
       // The concurrency slot and the disk reservation are released only once the container is
       // confirmed removed, so stuck containers can never exceed the concurrency cap (code r2 P1-2).
-      if (container) void this.retireContainer(container, releaseDisk)
+      if (container) void this.retireContainer(container, releaseDisk, activeName)
       else {
+        if (activeName) this.tracked.delete(activeName)
         this.release()
         await releaseDisk()
       }
@@ -533,8 +578,10 @@ export class ComposeRunner {
   private async retireContainer(
     container: Docker.Container,
     releaseDisk: () => Promise<void>,
+    name: string | null,
   ): Promise<void> {
     const done = async () => {
+      if (name) this.tracked.delete(name)
       this.release()
       await releaseDisk()
     }
