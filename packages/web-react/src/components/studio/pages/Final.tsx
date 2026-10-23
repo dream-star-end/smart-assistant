@@ -296,6 +296,11 @@ export function FinalPage(props: {
                 </dl>
               </>
             )}
+            {/* User 2026-10-23 21:42: compose is the director agent's job and is billed only by
+                what the agent uses; there is no fixed per-compose fee to show here. */}
+            <div className="st-cap st-cost-note" data-testid="compose-fee-note">
+              成片合成由导演 agent 完成，按 agent 实际用量计费，不另收固定费用。
+            </div>
           </div>
         </div>
       </aside>

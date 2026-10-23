@@ -3,7 +3,7 @@
 // it; the statement (and an optional note, e.g. a contract number) is stored with the track.
 
 import { Upload, X } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 
 import {
   UPLOAD_AUDIO_TYPES,
@@ -11,12 +11,15 @@ import {
   studioApi,
   studioErrorText,
 } from '../../../lib/studio/api'
-import type { MusicTrack } from '../../../lib/studio/music'
+import type { MusicQuery, MusicTrack } from '../../../lib/studio/music'
 import type { AuthSession } from '../../../lib/types'
 import { useToast } from '../../ui'
 import { StudioDialog } from '../Dialog'
 import { TrackRow } from './TrackRow'
+import { usePagedSearch } from './usePagedSearch'
 import type { Preview } from './usePreview'
+
+const NO_QUERY: MusicQuery = {}
 
 function UploadDialog(props: { auth: AuthSession; onClose: () => void; onDone: () => void }) {
   const toast = useToast()
@@ -117,22 +120,9 @@ export function MyMusic(props: {
   onFocus: (track: MusicTrack) => void
   onError: (err: unknown) => void
 }) {
-  const [tracks, setTracks] = useState<MusicTrack[] | null>(null)
   const [uploading, setUploading] = useState(false)
-  const onError = useRef(props.onError)
-  onError.current = props.onError
-  const load = useCallback(async () => {
-    try {
-      setTracks((await studioApi.musicSearch(props.auth, props.providerId, {})).tracks)
-    } catch (err) {
-      setTracks((cur) => cur ?? [])
-      onError.current(err)
-    }
-  }, [props.auth, props.providerId])
-  useEffect(() => {
-    void load()
-  }, [load])
-
+  const search = usePagedSearch(props.auth, props.providerId, NO_QUERY, props.onError)
+  const tracks = search.tracks
   return (
     <div className="st-lib">
       <div className="st-row st-lib-count">
@@ -168,6 +158,16 @@ export function MyMusic(props: {
             onFocus={() => props.onFocus(t)}
           />
         ))}
+        {search.next ? (
+          <button
+            type="button"
+            className="st-btn st-lib-next"
+            disabled={search.loadingMore}
+            onClick={search.more}
+          >
+            {search.loadingMore ? '加载中…' : '再看 20 首'}
+          </button>
+        ) : null}
       </div>
       {uploading ? (
         <UploadDialog
@@ -175,7 +175,7 @@ export function MyMusic(props: {
           onClose={() => setUploading(false)}
           onDone={() => {
             setUploading(false)
-            void load()
+            search.reload()
           }}
         />
       ) : null}

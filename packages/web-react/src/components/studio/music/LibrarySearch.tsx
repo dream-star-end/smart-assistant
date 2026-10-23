@@ -3,9 +3,8 @@
 // exist in the catalog, so "只看可商用" is a fixed fact, not a switch.
 
 import { Activity, Check, Lock, Search, SlidersHorizontal } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useState } from 'react'
 
-import { studioApi } from '../../../lib/studio/api'
 import {
   MUSIC_GENRES,
   MUSIC_MOODS,
@@ -14,6 +13,7 @@ import {
 } from '../../../lib/studio/music'
 import type { AuthSession } from '../../../lib/types'
 import { TrackRow } from './TrackRow'
+import { usePagedSearch } from './usePagedSearch'
 import type { Preview } from './usePreview'
 
 const SEARCH_DEBOUNCE_MS = 300
@@ -94,10 +94,6 @@ export function LibrarySearch(props: {
   const [dur, setDur] = useState<[number, number]>([0, 300])
   const [bpm, setBpm] = useState<[number, number]>([40, 200])
   const [filtersOpen, setFiltersOpen] = useState(false)
-  const [tracks, setTracks] = useState<MusicTrack[]>([])
-  const [next, setNext] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  const seq = useRef(0)
 
   const query = useMemo<MusicQuery>(
     () => ({
@@ -113,41 +109,15 @@ export function LibrarySearch(props: {
     [text, moods, genres, dur, bpm, vocals],
   )
 
-  const onError = useRef(props.onError)
-  onError.current = props.onError
-  useEffect(() => {
-    const mine = ++seq.current
-    const timer = window.setTimeout(() => {
-      setLoading(true)
-      studioApi
-        .musicSearch(props.auth, props.providerId, query)
-        .then((r) => {
-          if (seq.current !== mine) return
-          setTracks(r.tracks)
-          setNext(r.next)
-        })
-        .catch((err) => {
-          if (seq.current === mine) onError.current(err)
-        })
-        .finally(() => {
-          if (seq.current === mine) setLoading(false)
-        })
-    }, SEARCH_DEBOUNCE_MS)
-    return () => window.clearTimeout(timer)
-  }, [props.auth, props.providerId, query])
-
-  const more = () => {
-    if (!next) return
-    const mine = seq.current
-    studioApi
-      .musicSearch(props.auth, props.providerId, { ...query, cursor: next })
-      .then((r) => {
-        if (seq.current !== mine) return
-        setTracks((cur) => [...cur, ...r.tracks])
-        setNext(r.next)
-      })
-      .catch(props.onError)
-  }
+  const search = usePagedSearch(
+    props.auth,
+    props.providerId,
+    query,
+    props.onError,
+    SEARCH_DEBOUNCE_MS,
+  )
+  const tracks = search.tracks ?? []
+  const loading = search.loading
   const toggle = (list: string[], v: string) =>
     list.includes(v) ? list.filter((x) => x !== v) : [...list, v]
   const followTempo = props.tempo && bpm[0] === props.tempo.min && bpm[1] === props.tempo.max
@@ -270,7 +240,7 @@ export function LibrarySearch(props: {
         <b>
           {loading && tracks.length === 0
             ? '正在搜索…'
-            : `${tracks.length}${next ? '+' : ''} 首符合`}
+            : `${tracks.length}${search.next ? '+' : ''} 首符合`}
         </b>
         <span className="st-cap">BPM 未知的曲目不会出现在 BPM 区间筛选里</span>
       </div>
@@ -291,9 +261,14 @@ export function LibrarySearch(props: {
             onFocus={() => props.onFocus(t)}
           />
         ))}
-        {next ? (
-          <button type="button" className="st-btn st-lib-next" onClick={more}>
-            再看 20 首
+        {search.next ? (
+          <button
+            type="button"
+            className="st-btn st-lib-next"
+            disabled={search.loadingMore}
+            onClick={search.more}
+          >
+            {search.loadingMore ? '加载中…' : '再看 20 首'}
           </button>
         ) : null}
       </div>

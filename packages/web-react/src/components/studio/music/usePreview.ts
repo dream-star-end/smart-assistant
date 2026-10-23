@@ -20,13 +20,17 @@ export function usePreview(auth: AuthSession, onError: (err: unknown) => void): 
   const errRef = useRef(onError)
   errRef.current = onError
 
-  useEffect(
-    () => () => {
+  const alive = useRef(true)
+  useEffect(() => {
+    alive.current = true
+    return () => {
+      // Unmount: invalidate a preview still waiting for its ticket and stop the player.
+      alive.current = false
+      want.current = null
       audio.current?.pause()
       audio.current = null
-    },
-    [],
-  )
+    }
+  }, [])
 
   const toggle = useCallback(
     (sha: string) => {
@@ -50,17 +54,25 @@ export function usePreview(auth: AuthSession, onError: (err: unknown) => void): 
       }
       blobTicketUrl(auth, sha)
         .then(async (url) => {
-          if (want.current !== sha) return
+          if (!alive.current || want.current !== sha || audio.current !== el) return
           el.src = url
           await el.play()
-          if (want.current === sha) setPlaying(sha)
+          // The page may have gone (or another track started) while play() was pending.
+          if (!alive.current || want.current !== sha) {
+            el.pause()
+            return
+          }
+          setPlaying(sha)
         })
         .catch((err) => {
+          if (!alive.current) return
           if (want.current === sha) want.current = null
           setPlaying(null)
           errRef.current(err)
         })
-        .finally(() => setLoading((cur) => (cur === sha ? null : cur)))
+        .finally(() => {
+          if (alive.current) setLoading((cur) => (cur === sha ? null : cur))
+        })
     },
     [auth],
   )

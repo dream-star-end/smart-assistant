@@ -56,6 +56,28 @@ function Slider(props: {
 
 const round1 = (v: number) => Math.round(v * 10) / 10
 
+/** The audio's own length (seconds) from its metadata; null until known or when unreadable. */
+function useAudioDuration(url: string | null): number | null {
+  const [sec, setSec] = useState<number | null>(null)
+  useEffect(() => {
+    setSec(null)
+    if (!url) return
+    const a = new Audio()
+    a.preload = 'metadata'
+    const done = () => {
+      if (Number.isFinite(a.duration) && a.duration > 0) setSec(a.duration)
+    }
+    a.addEventListener('loadedmetadata', done)
+    a.src = url
+    return () => {
+      a.removeEventListener('loadedmetadata', done)
+      a.removeAttribute('src')
+      a.load?.()
+    }
+  }, [url])
+  return sec
+}
+
 export function MusicEditor(props: {
   auth: AuthSession
   projectId: string
@@ -70,12 +92,19 @@ export function MusicEditor(props: {
   const toast = useToast()
   const url = useBlobUrl(props.auth, props.take.blobSha)
   const film = Math.max(1, props.tl.total)
-  const trackSec = props.track?.durationMs ? props.track.durationMs / 1000 : null
+  // Uploaded tracks may carry no length (code r1 P1): read it from the audio itself.
+  const measured = useAudioDuration(url)
+  const trackSec = props.track?.durationMs ? props.track.durationMs / 1000 : measured
   const [edit, setEdit] = useState<MusicEdit>(props.stored)
   const [saving, setSaving] = useState(false)
-  useEffect(() => setEdit(props.stored), [props.stored])
+  // Reset the draft only when the saved edit itself changed (code r1 P1): every poll returns a new
+  // object, and unsaved changes must survive it.
+  const storedKey = JSON.stringify(compactEdit(props.stored))
+  // biome-ignore lint/correctness/useExhaustiveDependencies: storedKey stands for props.stored
+  useEffect(() => setEdit(props.stored), [storedKey])
 
   const inSec = edit.inSec ?? 0
+  const lengthKnown = trackSec !== null
   const outSec = edit.outSec ?? trackSec ?? film
   const trackLen = Math.max(trackSec ?? outSec, outSec, 1)
   const problem = editProblem(edit, film)
@@ -104,6 +133,8 @@ export function MusicEditor(props: {
   }
   const onDown = (kind: 'in' | 'out' | 'move') => (e: ReactPointerEvent) => {
     e.preventDefault()
+    // A handle sits inside the window: without this the window's 'move' would replace it.
+    e.stopPropagation()
     ;(e.target as Element).setPointerCapture?.(e.pointerId)
     drag.current = { kind, x0: e.clientX, in0: inSec, out0: outSec }
   }
@@ -181,48 +212,64 @@ export function MusicEditor(props: {
             换一首
           </button>
         </div>
-        <div
-          className="st-trim"
-          ref={lane}
-          onPointerMove={onMove}
-          onPointerUp={onUp}
-          onPointerCancel={onUp}
-        >
-          <div className="st-trim-wave" aria-hidden="true">
-            <Waveform sha={props.take.blobSha} url={url} bars={180} height={80} label={title} />
+        {lengthKnown ? (
+          <>
+            <div
+              className="st-trim"
+              ref={lane}
+              onPointerMove={onMove}
+              onPointerUp={onUp}
+              onPointerCancel={onUp}
+            >
+              <div className="st-trim-wave" aria-hidden="true">
+                <Waveform sha={props.take.blobSha} url={url} bars={180} height={80} label={title} />
+              </div>
+              <div
+                className="st-trim-window"
+                style={{ left: `${left}%`, width: `${width}%` }}
+                onPointerDown={onDown('move')}
+                data-testid="trim-window"
+              >
+                <span
+                  className="st-trim-handle in"
+                  onPointerDown={onDown('in')}
+                  aria-hidden="true"
+                />
+                <span
+                  className="st-trim-handle out"
+                  onPointerDown={onDown('out')}
+                  aria-hidden="true"
+                />
+              </div>
+            </div>
+            <div className="st-trim-sliders">
+              <Slider
+                id="st-me-in"
+                label="入点"
+                min={0}
+                max={trackLen}
+                step={0.1}
+                value={inSec}
+                format={mmss}
+                onChange={(v) => set({ inSec: round1(Math.min(v, outSec - 1)) })}
+              />
+              <Slider
+                id="st-me-out"
+                label="出点"
+                min={0}
+                max={trackLen}
+                step={0.1}
+                value={outSec}
+                format={mmss}
+                onChange={(v) => set({ outSec: round1(Math.max(v, inSec + 1)) })}
+              />
+            </div>
+          </>
+        ) : (
+          <div className="st-cap" style={{ color: 'var(--st-stage-muted)' }}>
+            正在读取曲子时长…
           </div>
-          <div
-            className="st-trim-window"
-            style={{ left: `${left}%`, width: `${width}%` }}
-            onPointerDown={onDown('move')}
-            data-testid="trim-window"
-          >
-            <span className="st-trim-handle in" onPointerDown={onDown('in')} aria-hidden="true" />
-            <span className="st-trim-handle out" onPointerDown={onDown('out')} aria-hidden="true" />
-          </div>
-        </div>
-        <div className="st-trim-sliders">
-          <Slider
-            id="st-me-in"
-            label="入点"
-            min={0}
-            max={trackLen}
-            step={0.1}
-            value={inSec}
-            format={mmss}
-            onChange={(v) => set({ inSec: round1(Math.min(v, outSec - 1)) })}
-          />
-          <Slider
-            id="st-me-out"
-            label="出点"
-            min={0}
-            max={trackLen}
-            step={0.1}
-            value={outSec}
-            format={mmss}
-            onChange={(v) => set({ outSec: round1(Math.max(v, inSec + 1)) })}
-          />
-        </div>
+        )}
       </section>
 
       <div className="st-edit-grid">
@@ -307,6 +354,7 @@ export function MusicEditor(props: {
               id="st-me-loop"
               type="checkbox"
               checked={Boolean(edit.loop)}
+              disabled={!lengthKnown}
               onChange={(e) =>
                 set(
                   e.target.checked

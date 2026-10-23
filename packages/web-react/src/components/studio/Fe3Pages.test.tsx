@@ -182,6 +182,30 @@ describe('FinalPage (OCV5-593 FE-3)', () => {
   })
 })
 
+describe('compose has no fixed fee (user 2026-10-23 21:42)', () => {
+  test('a free compose take is not listed as a cost, and the page says compose is billed by agent usage', () => {
+    const takes = [
+      take({ ownerKind: 'bible', provider: 'GPT Image', costCredits: '50' }),
+      take({
+        id: 'fin',
+        ownerKind: 'final',
+        ownerId: 'p',
+        provider: 'compose',
+        costCredits: '0',
+        blobSha: 'f'.repeat(64),
+      }),
+    ]
+    expect(costBreakdown(takes).map((r) => r.label)).toEqual(['设定图 · GPT Image'])
+    render(<FinalPage auth={auth} view={view({ takes })} onOpenBoard={() => {}} />)
+    expect(screen.getByTestId('compose-fee-note')).toHaveTextContent(
+      '成片合成由导演 agent 完成，按 agent 实际用量计费，不另收固定费用。',
+    )
+    const text = document.body.textContent ?? ''
+    expect(text).not.toMatch(/合成[^。]{0,12}\d+\s*积分/)
+    expect(text).not.toContain('10 积分')
+  })
+})
+
 describe('costBreakdown', () => {
   test('groups by kind and provider in pipeline order, skips unfinished and free takes', () => {
     const rows = costBreakdown([

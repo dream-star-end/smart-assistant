@@ -24,6 +24,7 @@ vi.mock('../../lib/studio/api', async () => {
   }
 })
 
+import { studioApi } from '../../lib/studio/api'
 import type { MusicTrack } from '../../lib/studio/music'
 import type { ProvidersView, StudioProjectView, StudioTake } from '../../lib/studio/types'
 import { MusicPage } from './pages/Music'
@@ -290,5 +291,124 @@ describe('MusicPage (OCV5-593 FE-5)', () => {
     // 换一首 goes back to the sources.
     fireEvent.click(screen.getByRole('button', { name: '换一首' }))
     expect(screen.getByRole('tab', { name: /免版权曲库/ })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  test('a poll with the same saved edit keeps unsaved changes (code r1 P1)', () => {
+    const props = { auth, providers: music(true), onOpenShot: () => {} }
+    const { rerender } = render(
+      <MusicPage
+        {...props}
+        view={view({ takes: [musicTake()] }, { musicTakeId: 'mt1', musicEdit: { inSec: 2 } })}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('入点'), { target: { value: '8' } })
+    // The next poll: a new object with the same content.
+    rerender(
+      <MusicPage
+        {...props}
+        view={view({ takes: [musicTake()] }, { musicTakeId: 'mt1', musicEdit: { inSec: 2 } })}
+      />,
+    )
+    expect(screen.getByLabelText('入点')).toHaveValue('8')
+    expect(screen.getByRole('button', { name: /保存剪辑/ })).toBeEnabled()
+    // A changed saved edit does replace the draft.
+    rerender(
+      <MusicPage
+        {...props}
+        view={view({ takes: [musicTake()] }, { musicTakeId: 'mt1', musicEdit: { inSec: 5 } })}
+      />,
+    )
+    expect(screen.getByLabelText('入点')).toHaveValue('5')
+  })
+
+  test('dragging an edge handle moves that edge only (code r1 P1)', () => {
+    render(
+      <MusicPage
+        auth={auth}
+        view={view({ takes: [musicTake()] }, { musicTakeId: 'mt1' })}
+        providers={music(true)}
+        onOpenShot={() => {}}
+      />,
+    )
+    const handle = document.querySelector('.st-trim-handle.in') as HTMLElement
+    const lane = document.querySelector('.st-trim') as HTMLElement
+    fireEvent.pointerDown(handle, { clientX: 0, pointerId: 1 })
+    fireEvent.pointerMove(lane, { clientX: 5, pointerId: 1 })
+    fireEvent.pointerUp(lane, { pointerId: 1 })
+    // The in point moved (clamped 1 s before the out point); the out point stayed at the track end.
+    expect(Number((screen.getByLabelText('入点') as HTMLInputElement).value)).toBeGreaterThan(100)
+    expect(screen.getByLabelText('出点')).toHaveValue('126')
+  })
+
+  test('a track without a known length waits for it: no trim on the film length, no loop (code r1 P1)', () => {
+    const t = musicTake()
+    const noLength = {
+      ...t,
+      music: { ...t.music!, track: { ...(t.music!.track as object), durationMs: null } },
+    } as StudioTake
+    render(
+      <MusicPage
+        auth={auth}
+        view={view({ takes: [noLength] }, { musicTakeId: 'mt1' })}
+        providers={music(true)}
+        onOpenShot={() => {}}
+      />,
+    )
+    expect(screen.getByText('正在读取曲子时长…')).toBeInTheDocument()
+    expect(screen.queryByLabelText('入点')).toBeNull()
+    expect(screen.getByLabelText(/不够长时循环/)).toBeDisabled()
+  })
+
+  test('leaving the page before the preview ticket arrives plays nothing (code r1 P1)', async () => {
+    musicSearch.mockResolvedValue({ tracks: [track('x')], next: null })
+    let release: (v: { url: string; expiresInSeconds: number }) => void = () => {}
+    vi.mocked(studioApi.blobTicket).mockImplementationOnce(() => new Promise((r) => (release = r)))
+    const { unmount } = render(
+      <MusicPage auth={auth} view={view()} providers={music(true)} onOpenShot={() => {}} />,
+    )
+    await waitFor(() => expect(screen.getAllByTestId('music-track')).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: '试听 Track x' }))
+    unmount()
+    await act(async () => {
+      release({ url: '/blob/late', expiresInSeconds: 900 })
+    })
+    expect(played).toEqual([])
+  })
+
+  test('paging belongs to its query; one page at a time (code r1 P1)', async () => {
+    let resolvePage: (v: unknown) => void = () => {}
+    musicSearch.mockImplementation((_a: unknown, _p: unknown, q: { cursor?: string }) =>
+      q.cursor
+        ? new Promise((r) => (resolvePage = r))
+        : Promise.resolve({ tracks: [track('a')], next: 'c1' }),
+    )
+    render(<MusicPage auth={auth} view={view()} providers={music(true)} onOpenShot={() => {}} />)
+    const more = await screen.findByRole('button', { name: '再看 20 首' })
+    fireEvent.click(more)
+    fireEvent.click(more)
+    expect(musicSearch.mock.calls.filter((c) => (c[2] as { cursor?: string }).cursor)).toHaveLength(
+      1,
+    )
+    // A new query drops the old cursor at once; the late page of the old query is ignored.
+    fireEvent.click(screen.getByRole('button', { name: '温暖' }))
+    await act(async () => {
+      resolvePage({ tracks: [track('z')], next: null })
+    })
+    expect(screen.queryByText('Track z')).toBeNull()
+  })
+
+  test('My Music pages past the first 20 tracks (code r1 P1)', async () => {
+    musicSearch.mockImplementation((_a: unknown, _p: unknown, q: { cursor?: string }) =>
+      Promise.resolve(
+        q.cursor
+          ? { tracks: [track('old', { title: '最早的曲子' })], next: null }
+          : { tracks: [track('new')], next: 'm1' },
+      ),
+    )
+    render(<MusicPage auth={auth} view={view()} providers={music(true)} onOpenShot={() => {}} />)
+    fireEvent.click(screen.getByRole('tab', { name: /我的音乐/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '再看 20 首' }))
+    expect(await screen.findByText('最早的曲子')).toBeInTheDocument()
+    expect(musicSearch).toHaveBeenLastCalledWith(auth, 'music-mine', { cursor: 'm1' })
   })
 })
