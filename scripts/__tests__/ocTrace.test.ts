@@ -5,9 +5,11 @@ import { describe, test } from 'node:test'
 import {
   collapseRuns,
   eventFromLogLine,
+  eventFromLogRecord,
   eventsFromRows,
   firstError,
   idsFromRows,
+  isRelatedLogRecord,
   parseCsv,
   pastRetention,
   timeline,
@@ -319,5 +321,24 @@ describe('oc-trace lib', () => {
     })
     assert.equal(collapseRuns([e(1, 'request-one'), e(2, 'request-two')]).length, 2)
     assert.equal(collapseRuns([e(1, 'request-one'), e(2, 'request-one')])[0]?.count, 2)
+  })
+  test('604: parsed record matching preserves lowercase codes and only exact structured ids', () => {
+    const record = {
+      ts: '2026-10-22T03:04:12Z',
+      level: 'warn',
+      msg: 'capacity',
+      traceId: T,
+      code: 'model_capacity',
+    }
+    assert.deepEqual(
+      eventFromLogRecord('container-log', record),
+      eventFromLogLine('container-log', JSON.stringify(record)),
+    )
+    assert.equal(firstError([eventFromLogRecord('container-log', record)!])?.code, 'model_capacity')
+    const ids = new Set([T, ...Array.from({ length: 200 }, (_, n) => `request-id-${n}`)])
+    assert.ok(isRelatedLogRecord(record, ids))
+    assert.ok(!isRelatedLogRecord({ ts: record.ts, msg: T, sessionKey: T }, ids))
+    assert.ok(!isRelatedLogRecord({ clientTraceId: T, traceId: 'unrelated-trace' }, ids))
+    assert.ok(isRelatedLogRecord({ clientTraceId: 'original-client' }, ids, 'original-client'))
   })
 })

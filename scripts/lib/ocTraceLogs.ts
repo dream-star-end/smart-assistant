@@ -7,8 +7,8 @@ import { createGunzip } from 'node:zlib'
 import {
   type Source,
   type TraceEvent,
-  eventFromLogLine,
-  isRelatedLogEvent,
+  eventFromLogRecord,
+  isRelatedLogRecord,
   toIso,
 } from './ocTraceLib.ts'
 
@@ -38,7 +38,6 @@ export async function readLogEvents(
   lineCap = 5000,
   clientInput?: string,
 ): Promise<LogReadResult> {
-  const needles = [...ids]
   const result: LogReadResult = {
     events: [],
     truncated: false,
@@ -84,9 +83,12 @@ export async function readLogEvents(
             return result
           }
           let at: string | undefined
+          let record: Record<string, unknown> | undefined
           try {
             const json = line.startsWith('{') ? line : line.replace(/^\d{4}-\d\d-\d\dT\S+Z /, '')
-            const record = JSON.parse(json)
+            const decoded: unknown = JSON.parse(json)
+            if (decoded && typeof decoded === 'object' && !Array.isArray(decoded))
+              record = decoded as Record<string, unknown>
             at = typeof record?.ts === 'string' ? toIso(record.ts) : undefined
           } catch {
             // Plain stack lines and non-JSON runtime output have no structured timestamp.
@@ -95,10 +97,10 @@ export async function readLogEvents(
             if (window.first === null || at < window.first) window.first = at
             if (window.last === null || at > window.last) window.last = at
           }
-          if (!needles.some((id) => line.includes(id))) continue
-          const event = eventFromLogLine(source, line)
+          if (!record || !isRelatedLogRecord(record, ids, clientInput)) continue
+          const event = eventFromLogRecord(source, record)
           // An id mentioned only in free text or a session key is not an association.
-          if (!event || !isRelatedLogEvent(event, ids, clientInput)) continue
+          if (!event) continue
           if (result.events.length >= lineCap) result.truncated = true
           else result.events.push(event)
         }
