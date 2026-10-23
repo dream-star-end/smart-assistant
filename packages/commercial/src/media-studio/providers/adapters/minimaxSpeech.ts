@@ -44,6 +44,18 @@ const MODELS: ModelInfo[] = [
   { id: 'voice-clone', label: '快速复刻', ops: ['voice.clone'], isDefault: true },
 ]
 
+/**
+ * User 2026-10-24 05:02: voice design / clone (MiniMax paid features) are reserved, not wired up —
+ * off unless OC_STUDIO_VOICE_CUSTOM=on. Off, the provider lists only text-to-speech (system voices
+ * are untouched) and design / clone requests are refused; the web shows the entries as 即将开放.
+ */
+export function voiceCustomOn(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env.OC_STUDIO_VOICE_CUSTOM ?? '').trim().toLowerCase() === 'on'
+}
+
+const listedModels = (): ModelInfo[] =>
+  voiceCustomOn() ? MODELS : MODELS.filter((m) => m.ops.every((op) => op === 'voice.tts'))
+
 /** MiniMax refusals that mean "not in this plan / not enabled for this account" (10-23 live test). */
 export function voiceRefusal(err: HttpError): MediaProviderError | null {
   const m = err.message.toLowerCase()
@@ -68,7 +80,7 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
   adapter: 'minimax-speech',
   kind: 'voice',
   label: 'MiniMax 语音',
-  models: () => MODELS,
+  models: listedModels,
   defaultKey(deps) {
     const k = deps.minimax?.mediaKey
     if (k?.key) return { key: k.key }
@@ -103,6 +115,12 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
     ): Promise<Omit<MediaResult, 'overReservation'>> => {
       if (!client)
         throw new MediaProviderError('PROVIDER_UNAVAILABLE', false, 'MiniMax is not enabled')
+      if (!voiceCustomOn())
+        throw new MediaProviderError(
+          'VOICE_CUSTOM_OFF',
+          false,
+          'voice design and clone are not open yet',
+        )
       const label =
         (req.label ?? '').trim().slice(0, 60) ||
         (req.op === 'voice.design' ? '设计音色' : '复刻音色')

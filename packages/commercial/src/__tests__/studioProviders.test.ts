@@ -25,6 +25,8 @@ import { MediaProviderError, type MediaRunContext } from '../media-studio/provid
 const SENTINEL_KEY = 'sk-SENTINEL-do-not-leak-0123456789'
 const SENTINEL_PATH = '/secret/path/sentinel-key-file'
 const USER = { id: '247', role: 'user' }
+// Voice design / clone are reserved (user 2026-10-24 05:02); these tests run them switched on.
+process.env.OC_STUDIO_VOICE_CUSTOM = 'on'
 
 function ctx(over: Partial<MediaRunContext> = {}): MediaRunContext {
   return {
@@ -515,6 +517,27 @@ describe('adapters', () => {
       code: 'INVALID_REQUEST',
     })
     await assert.rejects(p.run(ctx(), { op: 'voice.tts', text: 'x' }), { code: 'INVALID_REQUEST' })
+  })
+
+  it('voice design / clone stay reserved unless switched on; text-to-speech is untouched', async () => {
+    const deps = fakeDeps({
+      minimax: { mediaKey: { key: SENTINEL_KEY, source: 'file' }, client: { pool: {} as never } },
+    })
+    process.env.OC_STUDIO_VOICE_CUSTOM = ''
+    try {
+      const p = build(undefined, deps).registry.get('minimax-speech')!
+      const ops = p.models().flatMap((m) => m.ops)
+      assert.ok(ops.includes('voice.tts'))
+      assert.ok(!ops.includes('voice.design') && !ops.includes('voice.clone'))
+      await assert.rejects(
+        p.run(ctx(), { op: 'voice.design', prompt: '沉稳男声', text: '清晨', voiceId: 'v' }),
+        { code: 'UNSUPPORTED_OP' }, // refused before the adapter is reached
+      )
+    } finally {
+      process.env.OC_STUDIO_VOICE_CUSTOM = 'on'
+    }
+    const on = build(undefined, deps).registry.get('minimax-speech')!
+    assert.ok(on.models().some((m) => m.ops.includes('voice.design')))
   })
 
   it('minimax-speech lists system voices with its own keyFile key (code r1 P1)', async () => {

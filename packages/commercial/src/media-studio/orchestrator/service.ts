@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 
 import { HttpError } from '../../http/util.js'
 import { ComposeSpecError, type MusicEdit, validateMusicEdit } from '../compose/spec.js'
+import { voiceCustomOn } from '../providers/adapters/minimaxSpeech.js'
 import type { MediaRequest } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
 import { STUDIO_MAX_TARGET_SEC, appendStudioEvent } from '../store.js'
@@ -168,6 +169,13 @@ export function makeOrchestratorApi(
       const mode = body.mode
       if (mode !== 'design' && mode !== 'clone')
         throw new HttpError(400, 'BAD_REQUEST', 'mode must be design or clone')
+      // Reserved, not open (user 2026-10-24 05:02): nothing is created or charged.
+      if (!voiceCustomOn())
+        throw new HttpError(
+          409,
+          'STUDIO_VOICE_CUSTOM_OFF',
+          'voice design and clone are not open yet',
+        )
       const name = str(body.name, 40)
       if (!name) throw new HttpError(400, 'BAD_REQUEST', 'name must be 1..40 chars')
       const preview = body.previewText === undefined ? null : str(body.previewText, 200)
