@@ -80,7 +80,9 @@ export function stripShell(text: string): string {
 }
 
 interface ScanState { heredocs: { tag: string; dash: boolean }[] }
-const newlines = (s: string) => s.replace(/[^\n]/g, "");
+/** The line breaks inside a quoted span, as continuations: line k stays line k, but the text after
+ * the closing quote is still the same command's arguments, not a new command (Codex item8 final). */
+const newlines = (s: string) => s.replace(/[^\n]/g, "").replace(/\n/g, "\\\n");
 /** `<<` / `<<-` and its delimiter: one bash word, quoted parts and unquoted parts mixed (`E"OF"` is
  * EOF; Codex final4 r1). */
 const HEREDOC = /^<<(-?)[ \t]*((?:'[^'\n]*'|"(?:\\.|[^"\\\n])*"|\\.|[^\s;&|<>()'"])+)/;

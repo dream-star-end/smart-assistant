@@ -108,6 +108,10 @@ test("red: a quote or heredoc spanning lines that only prints the gate does not 
     "run: |\n          cat <<E\"OF\"\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
     "run: |\n          cat <<'E'OF\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
     "run: |\n          cat <<E\\OF\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
+    // Codex item8 final: a newline inside a quote does not end the command around it
+    "run: |\n          echo '\n          ' node scripts/check-v5-callback-payload-hash.mjs",
+    "run: |\n          echo \"\n          \" node scripts/check-v5-callback-payload-hash.mjs",
+    "run: |\n          echo `\n          ` node scripts/check-v5-callback-payload-hash.mjs",
   ]) {
     const input = real();
     input.workflows[wf] = input.workflows[wf]!.replace(step, fake);
