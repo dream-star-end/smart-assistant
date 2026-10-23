@@ -50,7 +50,7 @@ function fixture(t: import('node:test').TestContext) {
   return { manager, raw, runner, session, map, relay, run, started, request }
 }
 test('real turn orchestration exposes help only during its current runner attempt and revokes it before completion persistence', { timeout: 5000 }, async t => {
-  const f = fixture(t); const running = f.run(); await f.started
+  const f = fixture(t); const running = f.run(); await Promise.race([f.started, running])
   assert.deepEqual(await f.request(), { visible: true })
   f.session._plannedTeardown = 'service_restart'; await assert.rejects(f.request()); f.session._plannedTeardown = undefined
   f.map.delete(f.session.sessionKey); await assert.rejects(f.request()); f.map.set(f.session.sessionKey, f.session)
@@ -59,7 +59,7 @@ test('real turn orchestration exposes help only during its current runner attemp
   await assert.rejects(f.request())
 })
 test('Stop synchronously closes help before a cooperative runner can finish', { timeout: 5000 }, async t => {
-  const f = fixture(t); const running = f.run(); await f.started
+  const f = fixture(t); const running = f.run(); await Promise.race([f.started, running])
   assert.deepEqual(await f.request(), { visible: true })
   f.manager.interrupt(f.session.sessionKey, 'user')
   await assert.rejects(f.request())
