@@ -155,6 +155,8 @@ export interface OwnTutorialDetailRow extends OwnTutorialMineRow {
 
 export interface PendingTutorialRow extends OwnTutorialRow {
   authorName: string
+  /** 审核时原样带回（p:<正文版本>）。 */
+  reviewToken: string
 }
 
 export interface TutorialModerationSummaryRow {
@@ -265,8 +267,11 @@ export async function submitCommunityTutorial(
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
       `tutorial-quota:${authorUserId}`,
     ])
+    // 在审篇数含已发布帖在审的修改稿（与修改入口同一口径）。
     const counts = await client.query<{ pending: string; recent: string }>(
-      `SELECT count(*) FILTER (WHERE status = 'pending')::text AS pending,
+      `SELECT (count(*) FILTER (WHERE status = 'pending')
+               + (SELECT count(*) FROM community_tutorial_revisions
+                   WHERE author_user_id = $1::bigint AND status = 'pending'))::text AS pending,
               count(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::text AS recent
          FROM community_tutorials
         WHERE author_user_id = $1::bigint AND kind = 'markdown'`,
@@ -693,7 +698,11 @@ export async function listPendingCommunityTutorials(
   )
   const page = splitPage(result.rows, args.limit, (row) => row.cursor_at)
   return {
-    items: page.rows.map((row) => ({ ...mapOwnRow(row), authorName: row.author_name })),
+    items: page.rows.map((row) => ({
+      ...mapOwnRow(row),
+      authorName: row.author_name,
+      reviewToken: `p:${Number(row.content_version ?? 1)}`,
+    })),
     nextCursor: page.nextCursor,
   }
 }

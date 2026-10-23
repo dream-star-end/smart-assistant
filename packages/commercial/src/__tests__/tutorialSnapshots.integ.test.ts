@@ -182,7 +182,7 @@ describe('tutorial snapshots HTTP', () => {
     const approved = await request(`/api/admin/tutorials/${pendingId}/review`, {
       method: 'POST',
       token: admin.token,
-      body: { decision: 'approve', note: '干净' },
+      body: { reviewToken: 'p:1', decision: 'approve', note: '干净' },
     })
     assert.equal(approved.status, 200)
     const publicDetail = await request(`/api/tutorials/${pendingId}`)
@@ -240,7 +240,7 @@ describe('tutorial snapshots HTTP', () => {
         await request(`/api/admin/tutorials/${id}/review`, {
           method: 'POST',
           token: admin.token,
-          body: { decision: 'approve' },
+          body: { reviewToken: 'p:1', decision: 'approve' },
         })
       ).status,
       200,
@@ -366,7 +366,7 @@ describe('tutorial snapshots HTTP', () => {
     const rejected = await request(`/api/admin/tutorials/${id}/review`, {
       method: 'POST',
       token: admin.token,
-      body: { decision: 'reject', note: '内容不安全但仍允许拒绝' },
+      body: { reviewToken: 'p:1', decision: 'reject', note: '内容不安全但仍允许拒绝' },
     })
     assert.equal(rejected.status, 200, await rejected.text())
 
@@ -386,7 +386,7 @@ describe('tutorial snapshots HTTP', () => {
     await request(`/api/admin/tutorials/${id2}/review`, {
       method: 'POST',
       token: admin.token,
-      body: { decision: 'approve' },
+      body: { reviewToken: 'p:1', decision: 'approve' },
     })
     const sha = (
       (await (await request(`/api/tutorials/${id2}`)).json()) as {

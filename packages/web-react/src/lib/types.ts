@@ -1427,6 +1427,8 @@ export type CommunityTutorialReviseResult = {
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
   authorName: string;
+  /** 审核时原样带回（p:<正文版本> / r:<修改稿 id>），作者中途改过服务端返回 409。 */
+  reviewToken?: string;
 };
 
 export type CommunityTutorialDraft = {
@@ -1529,8 +1531,6 @@ export type AdminBlogPost = CommunityTutorialPending & {
   moderation?: BlogModeration | null;
   /** 已发布帖的修改稿（内容是修改稿的，线上仍是旧版）。 */
   editId?: string | null;
-  /** 审核时原样带回，作者中途改过服务端会拒绝（409）。 */
-  reviewToken?: string;
 };
 
 export type BlogModerationStats = {

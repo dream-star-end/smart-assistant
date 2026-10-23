@@ -1,4 +1,4 @@
--- order-dependency: none  (0324/0325 are held by OCV5-591 aurora media-studio branches, not on feat/v5-selfhost; number pending 管家 confirmation)
+-- order-dependency: none  (0324/0325 are held by OCV5-591 aurora media-studio branches, not on feat/v5-selfhost; 0326 confirmed by 管家 2026-10-23 18:38, the commercial sync orders them)
 -- 0326_community_tutorial_revisions.sql (OCV5-577 follow-up)
 -- 经验分享 authors can edit what they submitted, and every edit is reviewed again:
 --   - pending / rejected posts are edited in place and go back to review (content_version + 1);

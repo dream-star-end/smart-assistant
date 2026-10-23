@@ -525,11 +525,12 @@ export async function handleAdminReviewCommunityTutorial(
   if (rawNote.length > 2000) throw new HttpError(400, 'BAD_REQUEST', 'note too long')
   if (decision === 'reject' && !rawNote)
     throw new HttpError(400, 'BAD_REQUEST', '拒绝时必须填写理由')
-  // 列表给的 reviewToken：p:<正文版本>（稿件本身）或 r:<修改稿 id>（已发布帖的修改）。
-  const token = typeof body.reviewToken === 'string' ? body.reviewToken : null
-  const tokenMatch = token === null ? null : /^(p|r):([1-9]\d{0,18})$/.exec(token)
-  if (token !== null && !tokenMatch) throw new HttpError(400, 'BAD_REQUEST', 'invalid reviewToken')
-  const revisionId = tokenMatch?.[1] === 'r' ? tokenMatch[2]! : null
+  // 列表给的 reviewToken：p:<正文版本>（稿件本身）或 r:<修改稿 id>（已发布帖的修改）。必填：没有它就
+  // 无法确认管理员看到的就是现在的内容（作者可能刚改过）；旧页面要刷新后再审。
+  const token = typeof body.reviewToken === 'string' ? body.reviewToken : ''
+  const tokenMatch = /^(p|r):([1-9]\d{0,18})$/.exec(token)
+  if (!tokenMatch) throw new HttpError(400, 'BAD_REQUEST', '审核页面版本过旧，请刷新后再审')
+  const revisionId = tokenMatch[1] === 'r' ? tokenMatch[2]! : null
   try {
     const result = revisionId
       ? await reviewCommunityTutorialRevision({
@@ -544,7 +545,7 @@ export async function handleAdminReviewCommunityTutorial(
           reviewerUserId: admin.id,
           decision,
           note: rawNote || null,
-          expectedVersion: tokenMatch?.[1] === 'p' ? Number(tokenMatch[2]) : null,
+          expectedVersion: Number(tokenMatch[2]),
         })
     await writeAdminAuditBestEffort(
       { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },

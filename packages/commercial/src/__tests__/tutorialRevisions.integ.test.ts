@@ -285,6 +285,46 @@ describe('经验分享 · 修改已发布的帖子', () => {
     assert.equal(audit.rows[0]?.after?.revision_id, fresh.editId)
   })
 
+  test('审核接口必须带 reviewToken：没带 400，不会按「不比对版本」放过作者刚改的内容', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const admin = await createUser('admin@example.com', 'admin')
+    const author = await createUser('a@example.com')
+    const { id } = await submitCommunityTutorial(author.id, draft(), { moderationMode: 'off' })
+    await reviseCommunityTutorial(author.id, id, draft(BODY_V2), { moderationMode: 'off' })
+    const res = await request(`/api/admin/tutorials/${id}/review`, admin.token, { decision: 'approve' })
+    assert.equal(res.status, 400)
+    assert.equal(await getPublishedCommunityTutorial(id), null)
+    const bad = await request(`/api/admin/tutorials/${id}/review`, admin.token, { decision: 'approve', reviewToken: 'x:1' })
+    assert.equal(bad.status, 400)
+  })
+
+  test('作者改稿与管理员审核修改稿并发：不死锁（无 40P01），结果要么生效要么 STALE', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const admin = await createUser('admin@example.com', 'admin')
+    const author = await createUser('a@example.com')
+    const id = await published(author.id)
+    const limits = { dailyEdits: 100, maxPending: 3 }
+    for (let round = 0; round < 15; round += 1) {
+      const { revisionId } = await reviseCommunityTutorial(author.id, id, draft(`${BODY_V2}\n\n第 ${round} 版。`), {
+        moderationMode: 'off',
+        limits,
+      })
+      const results = await Promise.allSettled([
+        reviewCommunityTutorialRevision({ publicationId: id, revisionId, reviewerUserId: admin.id, decision: 'approve', note: null }),
+        reviseCommunityTutorial(author.id, id, draft(`${BODY_V2}\n\n第 ${round} 版补充。`), { moderationMode: 'off', limits }),
+      ])
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          const error = result.reason as Error & { code?: string }
+          assert.notEqual(error.code, '40P01', `round ${round}: deadlock`)
+          assert.equal(error.code, 'STALE', `round ${round}: ${error.message}`)
+        }
+      }
+      // 每轮收尾：在审的那份撤掉，下一轮从干净状态开始。
+      await query(`UPDATE community_tutorial_revisions SET status = 'superseded' WHERE publication_id = $1::bigint AND status = 'pending'`, [id])
+    }
+  })
+
   test('人工驳回修改稿必须写理由；驳回后线上不变', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const admin = await createUser('admin@example.com', 'admin')
@@ -449,6 +489,18 @@ describe('经验分享 · 修改的权限与频控', () => {
     await assert.rejects(
       reviseCommunityTutorial(author.id, live, draft(BODY_V2), { moderationMode: 'off', limits: { dailyEdits: 10, maxPending: 2 } }),
       /最多同时有 2 篇在审核/,
+    )
+  })
+
+  test('新投稿也把在审的修改稿算进「同时在审」上限', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    await createUser('admin@example.com', 'admin')
+    const author = await createUser('a@example.com')
+    const posts = [await published(author.id), await published(author.id), await published(author.id)]
+    for (const id of posts) await reviseCommunityTutorial(author.id, id, draft(BODY_V2), { moderationMode: 'off' })
+    await assert.rejects(
+      submitCommunityTutorial(author.id, draft(BODY, '第四篇'), { moderationMode: 'off', limits: { daily: 10, maxPending: 3 } }),
+      /最多同时有 3 篇在审核/,
     )
   })
 

@@ -23,6 +23,7 @@ const pending: CommunityTutorialPending = {
   reviewedAt: null,
   publishedAt: null,
   authorName: '投稿者',
+  reviewToken: 'p:1',
 }
 
 beforeEach(() => {
@@ -59,6 +60,7 @@ describe('TutorialReviewPage', () => {
         pending.id,
         'approve',
         undefined,
+        'p:1',
       ),
     )
     expect(await screen.findByText('教程审核队列已清空')).toBeInTheDocument()
@@ -99,6 +101,7 @@ describe('TutorialReviewPage', () => {
         pending.id,
         'reject',
         '请补充回归测试输出',
+        'p:1',
       ),
     )
   })

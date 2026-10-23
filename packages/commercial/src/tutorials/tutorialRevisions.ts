@@ -16,6 +16,9 @@ import { enqueueTutorialModeration, tutorialModerationMode } from './tutorialMod
 import { notifyCommunityTutorialDecision } from './tutorialNotices.js'
 
 /**
+ * 加锁顺序（全模块一致，避免死锁 40P01）：审核作业行 → 稿件行 → 修改稿行。
+ * 作者修改、AI 结论（settle 先收作业）、人工审核、撤回 / 下架都按这个顺序拿锁。
+ *
  * 「经验分享」作者修改已投稿的帖子（OCV5-577 跟进，推翻原 Q8）。每次修改都重新审核：
  *   - 待审 / 未通过：原地改，回到待审（content_version + 1），审核作业重置重跑；
  *     另记一行 revisions(direct) 作审计与频控。
@@ -59,6 +62,8 @@ export async function reviseCommunityTutorial(
   return tx(async (client) => {
     // 与投稿同一把锁：在审篇数和修改次数按作者串行统计。
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`tutorial-quota:${authorUserId}`])
+    // 先锁作业行（若有），再锁稿件行：与 AI settle（先收作业再动稿件）同序。
+    await client.query('SELECT 1 FROM community_tutorial_moderation_jobs WHERE publication_id = $1::bigint FOR UPDATE', [id])
     const post = (
       await client.query<{ author_user_id: string; status: string; kind: string; content_version: number }>(
         `SELECT author_user_id::text AS author_user_id, status, kind, content_version
@@ -222,6 +227,18 @@ export async function assertRevisionPublishable(revisionId: string, runner: Quer
 
 type Settled = { publicationId: string; authorUserId: string; title: string }
 
+/** 动修改稿之前先锁它所属的稿件行（加锁顺序：稿件 → 修改稿）。 */
+async function lockRevisionPost(client: QueryRunner, revisionId: string): Promise<void> {
+  await query(
+    `SELECT t.id FROM community_tutorials t
+       JOIN community_tutorial_revisions r ON r.publication_id = t.id
+      WHERE r.id = $1::bigint
+        FOR UPDATE OF t`,
+    [revisionId],
+    client,
+  )
+}
+
 /**
  * 修改稿通过：替换线上正文、标题、摘要、分类和图片引用，content_version + 1。
  * 修改稿已不在审（作者又改了、帖子被撤回）返回 null，调用方按「没生效」处理。
@@ -230,6 +247,7 @@ export async function applyRevision(
   client: QueryRunner,
   args: { revisionId: string; reviewerUserId: string; source: 'ai' | 'human'; note: string | null },
 ): Promise<Settled | null> {
+  await lockRevisionPost(client, args.revisionId)
   const revision = (
     await query<{
       publication_id: string
@@ -275,6 +293,7 @@ export async function rejectRevision(
   client: QueryRunner,
   args: { revisionId: string; reviewerUserId: string; source: 'ai' | 'human'; note: string },
 ): Promise<Settled | null> {
+  await lockRevisionPost(client, args.revisionId)
   const row = (
     await query<{ publication_id: string; author_user_id: string; title: string }>(
       `UPDATE community_tutorial_revisions

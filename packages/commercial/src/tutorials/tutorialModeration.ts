@@ -819,6 +819,8 @@ async function settle(
   const revisionId = target.kind === 'revision' ? target.revisionId : null
   const committed = await tx(async (client) => {
     if (!(await finishJob(job, owner, outcome.verdict === 'error' ? 'failed' : 'done', client))) return false
+    // 加锁顺序：作业 → 稿件 → 修改稿（与作者修改同序，见 tutorialRevisions.ts）。
+    await client.query('SELECT 1 FROM community_tutorials WHERE id = $1::bigint FOR UPDATE', [job.publicationId])
     let verdict = outcome.verdict
     let adminNote = outcome.decision.adminNote
     let applied = false
