@@ -24,6 +24,16 @@ import { Markdown } from '../Markdown'
 import { Button, Field, IconButton, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
 import { LOCAL_COMMENT_ID_PREFIX, TicketTimeline } from './TicketTimeline'
 
+// Share reads from background, initial and post-write reconciliation. A slow
+// response may be shared, but its owner/version is checked before it is applied.
+function joinRead<T>(pending: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> {
+  const active = pending.get(key)
+  if (active) return active
+  const next = load().finally(() => pending.delete(key))
+  pending.set(key, next)
+  return next
+}
+
 function TicketMarkdown({
   children,
   testId,
@@ -114,9 +124,11 @@ export function TicketDrawer({
   const toast = useToast()
   const [detail, setDetail] = useState<Ticket | null>(null)
   const [stageName, setStageName] = useState<string | null>(null)
+  const [detailStage, setDetailStage] = useState<PipelineStage | null>(null)
   const [timeline, setTimeline] = useState<TimelineItem[]>([])
   const [loading, setLoading] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [editVersion, setEditVersion] = useState<number | null>(null)
   const [draftTitle, setDraftTitle] = useState('')
   const [draftBody, setDraftBody] = useState('')
   const [draftPriority, setDraftPriority] = useState<TicketPriority>('P2')
@@ -143,14 +155,34 @@ export function TicketDrawer({
     if (detail) setDetail(null)
     if (timeline.length) setTimeline([])
     if (stageName) setStageName(null)
+    if (detailStage) setDetailStage(null)
     if (comment) setComment('')
     if (saving) setSaving(false)
     if (commenting) setCommenting(false)
     if (patrolling) setPatrolling(false)
     paintedOwnerRef.current = open ? ownerLookup : null
   }
-  const current = belongsToOwner(detail) ? detail : belongsToOwner(ticket) ? ticket : null
+  const current = belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
+    ? detail : belongsToOwner(ticket) ? ticket : null
   const lookup = ownerLookup
+  const commentingRef = useRef(commenting)
+  commentingRef.current = commenting
+  const currentRef = useRef(current)
+  currentRef.current = current
+  const timelineRef = useRef(timeline)
+  timelineRef.current = timeline
+  const currentStage = detailStage?.id === current?.stageId
+    ? detailStage
+    : stages.find((stage) => stage.id === current?.stageId) ?? null
+  const canStart = !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const reads = useMemo(() => {
+    const details = new Map<string, ReturnType<typeof taskboardApi.getTicketDetail>>()
+    const timelines = new Map<string, ReturnType<typeof taskboardApi.listTimeline>>()
+    return {
+      detail: (id: string) => joinRead(details, id, () => taskboardApi.getTicketDetail(auth, id)),
+      timeline: (id: string) => joinRead(timelines, id, () => taskboardApi.listTimeline(auth, id)),
+    }
+  }, [auth])
   const editingRef = useRef(false)
 
   const stageById = useMemo(() => {
@@ -162,6 +194,7 @@ export function TicketDrawer({
   const originSessionId = resolveOriginSessionId(current?.originSessionKey, sessionIds)
 
   const beginEdit = useCallback((src: Ticket) => {
+    setEditVersion(src.version)
     setDraftTitle(src.title)
     setDraftBody(src.body)
     setDraftPriority(src.priority)
@@ -195,20 +228,23 @@ export function TicketDrawer({
     const gen = ownerGen.current
     const requested = lookup
     let cancelled = false
-    setLoading(true)
+    setLoading(timelineRef.current.length === 0)
     const load = async () => {
       try {
         const [fresh, runs] = await Promise.all([
-          taskboardApi.getTicketDetail(auth, requested),
+          reads.detail(requested),
           taskboardApi.listRuns(auth, requested),
         ])
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
+        if (currentRef.current && fresh.ticket.version < currentRef.current.version) return
+        currentRef.current = fresh.ticket
         setDetail(fresh.ticket)
         setStageName(fresh.stage?.name ?? null)
+        setDetailStage(fresh.stage ?? null)
         onDetailLoadedRef.current?.(fresh.ticket)
         let items: TimelineItem[]
         try {
-          items = await taskboardApi.listTimeline(auth, requested)
+          items = await reads.timeline(requested)
         } catch (e) {
           if (e instanceof AuthEpochStaleError) return
           const [comments, activities] = await Promise.all([
@@ -222,6 +258,7 @@ export function TicketDrawer({
           })
         }
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
+        if (currentRef.current?.version !== fresh.ticket.version || commentingRef.current) return
         setTimeline(sortTimelineAsc(items))
       } catch (e) {
         if (e instanceof AuthEpochStaleError || cancelled || ownerGen.current !== gen) return
@@ -234,13 +271,75 @@ export function TicketDrawer({
     return () => {
       cancelled = true
     }
-  }, [auth, lookup, open, ticket?.version, toast])
+  }, [auth, lookup, open, reads, ticket?.version, toast])
+
+  // Refresh only the open owner. Do not reload project metadata or blank the
+  // timeline on a background tick. Visibility resume also catches comments.
+  useEffect(() => {
+    if (!open || !lookup) return
+    const requested = lookup
+    const gen = ownerGen.current
+    let stopped = false
+    let inFlight = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let failures = 0
+    let lastTimelineAt = Date.now()
+    const owned = () => !stopped && ownerGen.current === gen && ownerLookupRef.current === requested
+    const visible = () => document.visibilityState !== 'hidden'
+    const tick = async (forceTimeline = false) => {
+      if (!owned() || inFlight || !visible()) return
+      inFlight = true
+      try {
+        const fresh = await reads.detail(requested)
+        if (!owned() || (currentRef.current && fresh.ticket.version < currentRef.current.version)) return
+        failures = 0
+        setStageName(fresh.stage?.name ?? null)
+        setDetailStage(fresh.stage ?? null)
+        const changed = fresh.ticket.version !== currentRef.current?.version
+        if (changed) {
+          currentRef.current = fresh.ticket
+          setDetail(fresh.ticket)
+          onDetailLoadedRef.current?.(fresh.ticket)
+        }
+        if (changed || forceTimeline || Date.now() - lastTimelineAt >= 15_000) {
+          const version = fresh.ticket.version
+          const items = await reads.timeline(requested)
+          if (!owned() || currentRef.current?.version !== version || commentingRef.current) return
+          setTimeline((cur) => sortTimelineAsc([
+            ...items,
+            ...cur.filter((item) => item.kind === 'comment' && item.comment.id.startsWith(LOCAL_COMMENT_ID_PREFIX)),
+          ]))
+          lastTimelineAt = Date.now()
+        }
+      } catch (e) {
+        if (!(e instanceof AuthEpochStaleError)) failures = Math.min(failures + 1, 4)
+      } finally {
+        inFlight = false
+        if (owned() && visible()) {
+          const interval = currentRef.current?.status === 'running' ? 3_000 : 15_000
+          timer = setTimeout(() => void tick(), Math.min(60_000, interval * 2 ** failures))
+        }
+      }
+    }
+    const resume = () => {
+      clearTimeout(timer)
+      if (visible()) void tick(true)
+    }
+    timer = setTimeout(() => void tick(), currentRef.current?.status === 'running' ? 3_000 : 15_000)
+    document.addEventListener('visibilitychange', resume)
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+      document.removeEventListener('visibilitychange', resume)
+    }
+  }, [lookup, open, reads])
 
   const refreshAfterWrite = async (idOrIdent: string, gen: number) => {
     try {
+      const requested = ownerLookupRef.current ?? idOrIdent
       const [fresh, items] = await Promise.all([
-        taskboardApi.getTicketDetail(auth, idOrIdent),
-        taskboardApi.listTimeline(auth, idOrIdent).catch(async () => {
+        reads.detail(requested),
+        reads.timeline(requested).catch(async () => {
           const [runs, comments, activities] = await Promise.all([
             taskboardApi.listRuns(auth, idOrIdent),
             taskboardApi.listComments(auth, idOrIdent),
@@ -256,9 +355,12 @@ export function TicketDrawer({
       if (ownerGen.current !== gen) return
       const owner = ownerLookupRef.current
       if (owner && fresh.ticket.id !== owner && fresh.ticket.identifier !== owner) return
+      if (currentRef.current && fresh.ticket.version < currentRef.current.version) return
+      currentRef.current = fresh.ticket
       setDetail(fresh.ticket)
       setStageName(fresh.stage?.name ?? null)
-      setTimeline(sortTimelineAsc(items))
+      setDetailStage(fresh.stage ?? null)
+      if (!commentingRef.current) setTimeline(sortTimelineAsc(items))
       onTicketUpdated(fresh.ticket)
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
@@ -277,15 +379,18 @@ export function TicketDrawer({
     setSaving(true)
     try {
       const out = await taskboardApi.patchTicket(auth, current.id, {
-        expectedVersion: current.version,
+        expectedVersion: editVersion ?? current.version,
         title,
         body: draftBody,
         priority: draftPriority,
         assignee: draftAssignee || null,
       })
       if (ownerGen.current !== gen) return
-      setDetail(out.ticket)
-      onTicketUpdated(out.ticket)
+      if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
+        currentRef.current = out.ticket
+        setDetail(out.ticket)
+        onTicketUpdated(out.ticket)
+      }
       setEditing(false)
       toast('已更新需求', 'success')
       void onReconcile()
@@ -356,8 +461,11 @@ export function TicketDrawer({
     try {
       const out = await taskboardApi.patrol(auth, current.id, current.version)
       if (ownerGen.current !== gen) return
-      setDetail(out.ticket)
-      onTicketUpdated(out.ticket)
+      if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
+        currentRef.current = out.ticket
+        setDetail(out.ticket)
+        onTicketUpdated(out.ticket)
+      }
       toast('已开始巡检', 'success')
       void onReconcile()
       void refreshAfterWrite(out.ticket.identifier, gen)
@@ -399,7 +507,7 @@ export function TicketDrawer({
       }}
       side={desktop ? 'right' : 'bottom'}
       srTitle={current ? current.identifier : '单据详情'}
-      className={desktop ? 'w-[36rem] max-w-[96vw]' : undefined}
+      className={desktop ? 'w-[36rem] max-w-[96vw]' : 'h-[94dvh] max-h-[94dvh]'}
     >
       <DrawerBar
         desktop={desktop}
@@ -450,6 +558,9 @@ export function TicketDrawer({
                     />
                   </Field>
                 </div>
+                {editVersion !== null && editVersion !== current.version && (
+                  <output className="block text-caption text-warning">任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。</output>
+                )}
                 <div className="flex flex-wrap gap-1">
                   <Button
                     type="button"
@@ -482,7 +593,10 @@ export function TicketDrawer({
 
           {!editing &&
             (current.body ? (
-              <TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown>
+              <details open={desktop} className="rounded-lg border border-border px-3 py-2">
+                <summary className="cursor-pointer text-caption font-medium text-muted">任务说明</summary>
+                <div className="mt-2"><TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown></div>
+              </details>
             ) : (
               <p className="text-meta text-faint">还没有描述</p>
             ))}
@@ -507,7 +621,7 @@ export function TicketDrawer({
                 改需求
               </Button>
             )}
-            {current.status !== 'done' && current.status !== 'canceled' && (
+            {canStart && (
               <Button
                 type="button"
                 size="sm"
@@ -516,7 +630,7 @@ export function TicketDrawer({
                 data-testid="ticket-drawer-patrol"
                 onClick={() => void runPatrol()}
               >
-                立刻巡检
+                {current.status === 'waiting_human' ? '重新执行本阶段' : '开始执行'}
               </Button>
             )}
             {current.originSessionKey && onOpenSession && (
