@@ -35,6 +35,7 @@ import {
   takedownCommunityTutorial,
   withdrawCommunityTutorial,
 } from './communityTutorials.js'
+import { precheckCommunityTutorial, takeBlogPrecheckToken } from './blogPrecheck.js'
 import { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES } from './snapshotSanitizer.js'
 import {
   TUTORIAL_IMAGE_MAX_BYTES,
@@ -210,6 +211,25 @@ export async function handleSubmitCommunityTutorial(
     }
     throw mapTutorialError(error)
   }
+}
+
+/**
+ * 投稿预检（对话写博客的草稿卡）：和投稿同样的确定性检查，只读、不入队、不调用模型。
+ * 字段不合法不报 400，而是作为问题列出来，草稿卡据此提示要改什么。
+ */
+export async function handlePrecheckCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  if (!communityBlogEnabled()) throw new HttpError(404, 'FEATURE_DISABLED', '经验分享未开启')
+  if (!takeBlogPrecheckToken(user.id))
+    throw new HttpError(429, 'RATE_LIMITED', '检查太频繁，稍等一分钟再试')
+  const body = await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)
+  const draft = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {}
+  res.setHeader('Cache-Control', 'private, no-store')
+  sendJson(res, 200, await precheckCommunityTutorial(user.id, draft))
 }
 
 function optionalBodyMarkdown(value: unknown): string | undefined {

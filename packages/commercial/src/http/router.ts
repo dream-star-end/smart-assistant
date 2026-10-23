@@ -63,6 +63,7 @@ import {
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
   handleListOwnCommunityTutorials,
+  handlePrecheckCommunityTutorial,
   handleSubmitCommunityTutorial,
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
@@ -871,6 +872,12 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/tutorials/mine',
       handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
+    },
+    // 对话写博客的草稿卡预检：只读，不投稿。exact 路由，优先于下面的 POST 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/precheck',
+      handler: (req, res) => handlePrecheckCommunityTutorial(req, res, deps),
     },
     // 经验分享图片上传（原始字节）。exact 路由优先于下面的 POST `/api/tutorials/` 前缀（撤回）。
     {
