@@ -44,7 +44,7 @@ export function ProjectShell(props: {
   navigate: (r: StudioRoute, replace?: boolean) => void
 }) {
   const { auth, projectId, page, navigate } = props
-  const { state, reload, applyProject } = useStudioProject(auth, projectId)
+  const { state, reload, refresh, applyProject } = useStudioProject(auth, projectId)
 
   if (state.state === 'loading') return <StateView kind="loading" />
   if (state.state === 'missing') {
@@ -175,7 +175,7 @@ export function ProjectShell(props: {
           auth={auth}
           view={state.view}
           onOpenBoard={() => go('board')}
-          onReload={reload}
+          onReload={refresh}
         />
       )}
     </>

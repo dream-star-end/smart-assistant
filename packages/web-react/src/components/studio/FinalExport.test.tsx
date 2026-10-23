@@ -245,6 +245,26 @@ describe('final page export review r1', () => {
     expect(screen.getByTestId('export-format-note')).toHaveTextContent('可以再试一次（免费）')
   })
 
+  test('asking again after a failure is not ended by that old failure (r2 P1)', async () => {
+    requestExport.mockResolvedValueOnce({ queued: true })
+    const first = film({ id: 'f1', version: 1 })
+    const failedBefore = film({
+      id: 'f2',
+      key: '720p-burn',
+      version: 2,
+      status: 'failed',
+      blobSha: null,
+    })
+    render(<FinalPage auth={auth} view={view([failedBefore, first])} onOpenBoard={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: '720p' }))
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('final-export'))
+    })
+    // The new attempt has no take yet; the old failure (v2) must not end this wait.
+    expect(screen.queryByTestId('final-export')).toBeNull()
+    expect(screen.getByTestId('export-format-note')).toHaveTextContent('正在按这个规格重新合成')
+  })
+
   test('while a re-compose is only queued the page keeps reloading', async () => {
     vi.useFakeTimers()
     try {

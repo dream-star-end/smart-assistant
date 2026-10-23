@@ -102,6 +102,7 @@ export function FinalPage(props: {
   auth: AuthSession
   view: StudioProjectView
   onOpenBoard: () => void
+  /** A reload that does not overlap one in flight (useStudioProject.refresh). */
   onReload?: () => void
 }) {
   const { auth, view } = props
@@ -118,7 +119,7 @@ export function FinalPage(props: {
   const key = variantKey({ resolution: res, subtitles: subs })
   /** Format → film the server said is current for it (an export answered `reused`). */
   const [reused, setReused] = useState<Record<string, ReusedFilm>>({})
-  /** Format → newest film version when its re-compose was asked for. */
+  /** Format → newest final take version (any status) when its re-compose was asked for. */
   const [asked, setAsked] = useState<Record<string, number>>({})
   const [busy, setBusy] = useState(false)
   const toast = useToast()
@@ -169,7 +170,11 @@ export function FinalPage(props: {
   const exportFormat = async () => {
     if (busy) return
     setBusy(true)
-    const at = latest?.version ?? 0
+    // After every attempt so far, failed ones included (code r2 P1): only a newer attempt can
+    // end this wait, never the failure of an earlier one.
+    const at = view.takes
+      .filter((t) => t.ownerKind === 'final')
+      .reduce((m, t) => Math.max(m, t.version), 0)
     try {
       const out = await studioApi.requestExport(auth, view.project.id, {
         resolution: res,

@@ -102,3 +102,25 @@ describe('useStudioProject push (OCV5-593 FE-6)', () => {
     expect(result.current.state).toMatchObject({ view: { project: { status: 'running' } } })
   })
 })
+
+describe('useStudioProject refresh (OCV5-593 FE-6 r2 P1)', () => {
+  test('a refresh while a request is out does not start a second one; it runs once after', async () => {
+    project.mockResolvedValueOnce(view('done'))
+    const auth = {} as never
+    const { result } = renderHook(() => useStudioProject(auth, 'p'))
+    await act(async () => {})
+    let release: (v: unknown) => void = () => {}
+    project.mockImplementationOnce(() => new Promise((r) => (release = r)))
+    project.mockResolvedValueOnce(view('done'))
+    await act(async () => {
+      result.current.refresh()
+      result.current.refresh()
+      result.current.refresh()
+    })
+    expect(project).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      release(view('done'))
+    })
+    expect(project).toHaveBeenCalledTimes(3)
+  })
+})

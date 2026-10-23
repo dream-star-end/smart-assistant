@@ -57,14 +57,21 @@ export function useStudioProject(auth: AuthSession, id: string) {
     void reload()
   }, [reload])
 
+  /**
+   * A reload that never overlaps one in flight (code r2 P1): while a request is out it runs once
+   * more after it instead, so a slow network still lands every answer. Pushes and pages use it.
+   */
+  const refresh = useCallback(() => {
+    if (inFlight.current > 0) pushedDuring.current = true
+    else void reload()
+  }, [reload])
+
   useEffect(
     () =>
       onStudioPush((d) => {
-        if (d.projectId !== null && d.projectId !== id) return
-        if (inFlight.current > 0) pushedDuring.current = true
-        else void reload()
+        if (d.projectId === null || d.projectId === id) refresh()
       }),
-    [id, reload],
+    [id, refresh],
   )
 
   // Also while any take is in flight (e.g. a voice being designed in a draft project, FE-4).
@@ -90,5 +97,5 @@ export function useStudioProject(auth: AuthSession, id: string) {
     )
   }, [])
 
-  return { state, reload, applyProject }
+  return { state, reload, refresh, applyProject }
 }
