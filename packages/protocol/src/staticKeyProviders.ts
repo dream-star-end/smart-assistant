@@ -528,18 +528,21 @@ const MOONSHOT_CODING: StaticKeyProviderSpec = {
   authScheme: 'x-api-key',
   matchesRoute(modelId) {
     const model = modelId.toLowerCase()
-    return model === 'kimi-k3' || model === 'k3-256k'
+    return model === 'kimi-k3' || model === 'k3-256k' || model === 'k3.1-pro'
   },
-  inboundModelIds: ['kimi-k3', 'k3-256k'],
+  inboundModelIds: ['kimi-k3', 'k3-256k', 'k3.1-pro'],
   canonicalizeForPricing(modelId) {
     const model = modelId.toLowerCase()
-    return model === 'kimi-k3' || model === 'k3-256k' ? model : null
+    return model === 'kimi-k3' || model === 'k3-256k' || model === 'k3.1-pro' ? model : null
   },
   stripHeaders: ['anthropic-beta'],
   // **保留 thinking**:两型号实测接受 enabled+budget / disabled。output_config 仅透传
   // effort=low/high/max,其余 first-party 子字段由 master 收窄清洗。
   stripBodyFields: ['context_management', 'service_tier'],
   allowedOutputConfigEfforts: ['low', 'high', 'max'],
+  // K3.1 Pro is thinking-only; disabled may silently select another model.
+  // Preserve the older K3 models' disabled-thinking behavior.
+  stripDisabledThinkingModels: ['k3.1-pro'],
   // provider 机制上限取较大的 kimi-k3 1,048,576；k3-256k 的 262,144 由签名 catalog
   // descriptor + 已有 signed-window guard 收窄，不能把整个 provider 降到 256k。
   // 注意平台产品层另有按角色的窗口分档(admin 1M / 其他 500k),那是 commercial
