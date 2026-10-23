@@ -76,7 +76,11 @@ describe('oc-trace lib', () => {
       ],
     )
     const u = eventsFromRows('turn_upstream_performance', [
-      { request_id: 'r', outcome: 'timeout', observed_at: '2026-10-21 10:00:30+00' },
+      {
+        request_id: 'r',
+        outcome: 'timeout',
+        observed_at: '2026-10-21 10:00:30+00',
+      },
     ])
     assert.equal(u[0]!.code, 'UPSTREAM_TIMEOUT')
     const ok = eventsFromRows('turn_upstream_performance', [
@@ -152,13 +156,13 @@ describe('oc-trace lib', () => {
     assert.equal(firstError([ev[1]]), undefined)
   })
 
-  test('retention: what a 20-day-old turn can no longer show', () => {
+  test('retention: nominal windows do not claim conditional journal rows were deleted', () => {
     const now = new Date('2026-11-10T00:00:00Z')
     const past = pastRetention('2026-10-21T10:00:00Z', now)
     assert.ok(
       past.includes('master-log') &&
         past.includes('egress-log') &&
-        past.includes('request_finalize_journal'),
+        !past.includes('request_finalize_journal'),
     )
     assert.ok(
       !past.includes('turn_traces') &&
@@ -201,7 +205,12 @@ describe('oc-trace lib', () => {
 
   test('Codex r1: a usage / journal error flag (has_error = t) makes an error event that can be the first error', () => {
     const usage = eventsFromRows('usage_records', [
-      { request_id: 'r', status: 'error', has_error: 't', created_at: '2026-10-21 10:00:00+00' },
+      {
+        request_id: 'r',
+        status: 'error',
+        has_error: 't',
+        created_at: '2026-10-21 10:00:00+00',
+      },
     ])
     const journal = eventsFromRows('request_finalize_journal', [
       {
@@ -224,7 +233,12 @@ describe('oc-trace lib', () => {
     ])
     assert.equal(firstError([...restart, ...usage])!.source, 'usage_records')
     const ok = eventsFromRows('usage_records', [
-      { request_id: 'r', status: 'success', has_error: 'f', created_at: '2026-10-21 10:00:00+00' },
+      {
+        request_id: 'r',
+        status: 'success',
+        has_error: 'f',
+        created_at: '2026-10-21 10:00:00+00',
+      },
     ])
     assert.equal(ok[0]!.level, 'info')
   })
@@ -237,5 +251,73 @@ describe('oc-trace lib', () => {
       turn_dispatches: [{ dispatch_id: D, billing_request_id: 'B' }],
     })
     assert.deepEqual([...ids].sort(), [D, 'B', 'R-upstream', 'R2', T].sort())
+  })
+  test('604: an earlier usage error or warn code wins over a later dispatch error', () => {
+    const usage = eventsFromRows('usage_records', [
+      { status: 'error', has_error: 'f', created_at: '2026-10-21T10:00:00Z' },
+    ])
+    const dispatch = eventsFromRows('turn_dispatches', [
+      {
+        status: 'terminal',
+        outcome: 'crashed',
+        failure_code: 'SERVICE_RESTART',
+        terminal_at: '2026-10-21T10:01:00Z',
+      },
+    ])
+    assert.equal(firstError([...dispatch, ...usage])?.code, 'USAGE_ERROR')
+    const warn = eventFromLogLine(
+      'egress-log',
+      JSON.stringify({
+        ts: '2026-10-21T09:59:00Z',
+        level: 'warn',
+        code: 'RATE_LIMITED',
+        msg: 'upstream rejected',
+      }),
+    )!
+    assert.equal(firstError([...dispatch, warn])?.code, 'RATE_LIMITED')
+  })
+
+  test('604: crashed without failure_code is an uncoded error; cancellation is not a failure', () => {
+    const crashed = eventsFromRows('turn_dispatches', [
+      {
+        status: 'terminal',
+        outcome: 'crashed',
+        terminal_at: '2026-10-21T10:00:00Z',
+      },
+    ])
+    assert.equal(firstError(crashed)?.event, 'dispatch.crashed')
+    assert.equal(firstError(crashed)?.code, undefined)
+    const cancelled = eventsFromRows('turn_dispatches', [
+      {
+        status: 'terminal',
+        outcome: 'interrupted',
+        failure_code: 'USER_CANCELLED',
+        terminal_at: '2026-10-21T10:00:00Z',
+      },
+    ])
+    assert.equal(firstError(cancelled), undefined)
+    const informational = eventFromLogLine(
+      'master-log',
+      JSON.stringify({
+        ts: '2026-10-21T10:00:00Z',
+        level: 'info',
+        msg: 'success',
+        code: 'OK',
+      }),
+    )!
+    assert.equal(firstError([informational]), undefined)
+  })
+
+  test('604: different request identities never collapse; identical identities still collapse', () => {
+    const e = (second: number, requestId: string) => ({
+      at: `2026-10-21T10:00:0${second}Z`,
+      source: 'egress-log' as const,
+      event: 'retry',
+      code: 'UPSTREAM_ERROR',
+      level: 'error' as const,
+      ids: { requestId },
+    })
+    assert.equal(collapseRuns([e(1, 'request-one'), e(2, 'request-two')]).length, 2)
+    assert.equal(collapseRuns([e(1, 'request-one'), e(2, 'request-one')])[0]?.count, 2)
   })
 })
