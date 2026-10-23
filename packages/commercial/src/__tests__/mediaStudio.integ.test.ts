@@ -16,7 +16,7 @@
  */
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { access, mkdtemp, readFile, readdir } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -30,6 +30,7 @@ import {
   StudioQuotaError,
 } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
+import { importCatalogEntries, parseCatalogManifest } from '../media-studio/music/catalogImport.js'
 import {
   claimStudioTasks,
   enqueueStudioTask,
@@ -697,6 +698,65 @@ describe('media studio music catalog (0325, OCV5-591 M1)', () => {
     assert.equal(await blobs.putSite(content, 'audio/mpeg'), sha)
     assert.equal(await blobs.gc(), 0, 'fresh again: the import has its full hour to list it')
     await access(blobs.blobPath(sha))
+  })
+
+  test('importing verified tracks: once per track, refused when a file changed after verification', async (t) => {
+    if (skip(t)) return
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-studio-import-'))
+    const blobs = blobStore(await mkdtemp(path.join(tmpdir(), 'oc-studio-import-blobs-')))
+    const put = async (name: string, body: string) => {
+      await mkdir(path.join(dir, path.dirname(name)), { recursive: true })
+      await writeFile(path.join(dir, name), body)
+      return createHash('sha256').update(body).digest('hex')
+    }
+    const entry = async (id: string) => ({
+      source: 'incompetech',
+      sourceTrackId: id,
+      title: `Track ${id}`,
+      artist: 'Kevin MacLeod',
+      landingUrl: `https://incompetech.com/music/royalty-free/index.html?isrc=${id}`,
+      license: 'CC-BY-4.0',
+      licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
+      attributionText: `"Track ${id}" Kevin MacLeod (incompetech.com)`,
+      durationMs: 90000,
+      bpm: 82,
+      moods: ['宁静'],
+      mime: 'audio/mpeg',
+      audioPath: `tracks/${id}.mp3`,
+      audioSha: await put(`tracks/${id}.mp3`, `ID3 audio ${id}`),
+      evidencePath: `evidence/${id}.png`,
+      evidenceSha: await put(`evidence/${id}.png`, `PNG page ${id}`),
+      verifiedAt: '2026-10-23T06:56:16.472Z',
+      verifiedBy: 'claude',
+    })
+    const entries = parseCatalogManifest([await entry('A1'), await entry('B2')])
+    const first = await importCatalogEntries({ pool: getPool(), blobs, dir, entries })
+    assert.deepEqual(first, {
+      inserted: ['incompetech:A1', 'incompetech:B2'],
+      skipped: [],
+      failed: [],
+    })
+    const again = await importCatalogEntries({ pool: getPool(), blobs, dir, entries })
+    assert.deepEqual(again.skipped, ['incompetech:A1', 'incompetech:B2'])
+    const row = await query<{ required: boolean; text: string }>(
+      "SELECT attribution_required AS required, attribution_text AS text FROM studio_music_catalog WHERE source_track_id = 'A1'",
+    )
+    assert.deepEqual(row.rows[0], {
+      required: true,
+      text: '"Track A1" Kevin MacLeod (incompetech.com)',
+    })
+
+    const c3 = await entry('C3')
+    await writeFile(path.join(dir, c3.audioPath), 'swapped after verification')
+    const bad = await importCatalogEntries({
+      pool: getPool(),
+      blobs,
+      dir,
+      entries: parseCatalogManifest([c3]),
+    })
+    assert.equal(bad.failed[0]?.reason, 'audio file changed since it was verified')
+    const n = await query<{ n: string }>('SELECT COUNT(*)::text AS n FROM studio_music_catalog')
+    assert.equal(n.rows[0]!.n, '2')
   })
 
   test('a user track needs the rights statement', async (t) => {
