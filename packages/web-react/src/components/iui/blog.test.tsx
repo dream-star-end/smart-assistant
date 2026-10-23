@@ -65,6 +65,7 @@ function actionsMock(over: Partial<CommunityBlogActions> = {}): CommunityBlogAct
     uploadImage: vi.fn(async () => ({ sha256: SHA })),
     submit: vi.fn(async () => ({ id: "12" })),
     getMine: vi.fn(async () => mine()),
+    postUrl: (id: string) => `https://example.test/?panel=help&tab=blog&community=${id}`,
     openPost: vi.fn(),
     openMine: vi.fn(),
     openEditor: vi.fn(),
@@ -99,12 +100,14 @@ describe("schema 与图片换算", () => {
   });
 
   test("行内代码里的图片写法不算图片，不上传也不改写（Codex D2 R1）", () => {
-    const body = "正文写法示例：`![说明](/example.png)` 和 ``![双](/b.png)``。\n\n![真图](/home/agent/outputs/a.png)";
+    const body =
+      "正文写法示例：`![说明](/example.png)` 和 ``![双](/b.png)``，以及 `` 含 ` 反引号与 ![说明](/c.png)``；\n跨行 `第一行\n![跨](/d.png)`。\n\n```md\n![围栏](/e.png)\n```\n\n![真图](/home/agent/outputs/a.png) 和孤立的 ` 反引号";
     expect(draftImages(body).map((i) => i.src)).toEqual(["/home/agent/outputs/a.png"]);
     const replaced = replaceDraftImages(body, () => SHA);
     expect(replaced).toContain("`![说明](/example.png)`");
     expect(replaced).toContain("``![双](/b.png)``");
     expect(replaced).toContain(`![真图](tutorial-blob:${SHA})`);
+    expect(replaced.match(/tutorial-blob/g)).toHaveLength(1);
   });
 
   test("只认围栏外的容器路径图片；预检用占位 sha；投稿时换成真实 sha", () => {

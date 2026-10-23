@@ -70,6 +70,8 @@ export type CommunityBlogActions = {
   uploadImage: (image: Blob) => Promise<{ sha256: string }>;
   submit: (draft: CommunityBlogDraftPayload) => Promise<{ id: string }>;
   getMine: (id: string) => Promise<CommunityTutorialMine>;
+  /** 文章的站内链接（与经验分享详情页「复制链接」同一写法）。 */
+  postUrl: (id: string) => string;
   openPost: (id: string) => void;
   openMine: () => void;
   openEditor: (draft: CommunityBlogDraftPayload) => void;

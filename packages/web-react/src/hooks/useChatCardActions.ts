@@ -29,6 +29,7 @@ import type { ChatError } from "../components/ErrorBanner";
 import type { SaveToProjectRequest } from "../components/project/SaveToProjectDialog";
 import type { ToastFn } from "../components/ui/Toast";
 import type { BlogDraft } from "../components/tutorials/blog/blogLib";
+import { tutorialHref } from "./useAppRoute";
 
 /** 对话里的经验分享卡要打开的地方（App 负责打开教程中心的经验分享页签）。 */
 export type BlogOpenTarget = { kind: "post"; id: string } | { kind: "mine" } | { kind: "editor"; seed: BlogDraft };
@@ -220,6 +221,8 @@ export function useChatCardActions({
                     uploadImage: (image: Blob) => api.uploadTutorialImage(authRef.current, image),
                     submit: (draft: BlogDraft) => api.submitCommunityTutorial(authRef.current, draft),
                     getMine: (id: string) => api.getMyCommunityTutorial(authRef.current, id),
+                    postUrl: (id: string) =>
+                      `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
                     openPost: (id: string) => openBlog({ kind: "post", id }),
                     openMine: () => openBlog({ kind: "mine" }),
                     openEditor: (seed: BlogDraft) => openBlog({ kind: "editor", seed }),

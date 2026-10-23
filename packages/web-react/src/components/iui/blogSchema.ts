@@ -127,49 +127,99 @@ export type DraftImage = { alt: string; src: string; index: number }
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/
 const IMAGE_RE = /!\[([^\]\n]{0,300})\]\(\s*<?([^)\s>]{1,1024})>?(?:\s+"[^"\n]{0,300}")?\s*\)/g
 
-const INLINE_CODE_RE = /(`+)[^`]+?\1(?!`)/g
+/**
+ * 全文里的代码区间：围栏代码块（逐行）和行内代码（长度为 n 的反引号串与下一个同为 n 的串配对，
+ * 可以跨行、中间可以有别的长度的反引号）。与服务端 tutorialImages.ts 的 withoutCode 同一规则，
+ * 代码示例里的图片写法不算图片（Codex D2 R1/R2 P1）。返回按起点排序的 [start, end) 区间。
+ */
+export function codeRanges(markdown: string): Array<[number, number]> {
+  const fences: Array<[number, number]> = []
+  let fence: string | null = null
+  let fenceStart = 0
+  let offset = 0
+  for (const line of markdown.split('\n')) {
+    const open = FENCE_RE.exec(line)
+    if (fence) {
+      if (open && open[1]![0] === fence[0] && open[1]!.length >= fence.length && line.trim() === open[1]) {
+        fences.push([fenceStart, offset + line.length])
+        fence = null
+      }
+    } else if (open) {
+      fence = open[1]!
+      fenceStart = offset
+    }
+    offset += line.length + 1
+  }
+  if (fence) fences.push([fenceStart, markdown.length])
 
-/** 行内代码先换成占位，处理完再换回：代码示例里的图片写法不算图片（Codex D2 R1 P1）。 */
-function outsideInlineCode(line: string, fn: (text: string) => string): string {
-  const spans: string[] = []
-  const masked = line.replace(INLINE_CODE_RE, (span) => `\u0000${spans.push(span) - 1}\u0000`)
-  return fn(masked).replace(/\u0000(\d+)\u0000/g, (_, i: string) => spans[Number(i)] ?? '')
+  const ranges: Array<[number, number]> = [...fences]
+  const inFence = (at: number) => fences.some(([a, b]) => at >= a && at < b)
+  const nextTick = (from: number): number => {
+    let at = markdown.indexOf('`', from)
+    while (at >= 0 && inFence(at)) {
+      const fenceEnd = fences.find(([a, b]) => at >= a && at < b)![1]
+      at = markdown.indexOf('`', fenceEnd)
+    }
+    return at
+  }
+  const unmatched = new Set<number>()
+  let i = 0
+  while (i < markdown.length) {
+    const tick = nextTick(i)
+    if (tick < 0) break
+    let runEnd = tick
+    while (markdown[runEnd] === '`') runEnd += 1
+    const run = runEnd - tick
+    let close = -1
+    if (!unmatched.has(run)) {
+      let k = runEnd
+      while (k < markdown.length) {
+        const next = nextTick(k)
+        if (next < 0) break
+        let end = next
+        while (markdown[end] === '`') end += 1
+        if (end - next === run) {
+          close = next
+          break
+        }
+        k = end
+      }
+    }
+    if (close < 0) {
+      unmatched.add(run)
+      i = runEnd
+    } else {
+      ranges.push([tick, close + run])
+      i = close + run
+    }
+  }
+  return ranges.sort((a, b) => a[0] - b[0])
 }
 
-/** 逐行跳过围栏代码块和行内代码，对其余文字调用 fn（返回替换后的文字）。 */
-function mapOutsideFences(markdown: string, fn: (line: string) => string): string {
-  let fence: string | null = null
-  return markdown
-    .split('\n')
-    .map((l) => {
-      const open = FENCE_RE.exec(l)
-      if (fence) {
-        if (open && open[1]![0] === fence[0] && open[1]!.length >= fence.length && l.trim() === open[1]) fence = null
-        return l
-      }
-      if (open) {
-        fence = open[1]!
-        return l
-      }
-      return outsideInlineCode(l, fn)
-    })
-    .join('\n')
+type ImageMatch = { start: number; end: number; alt: string; src: string }
+
+/** 代码区间以外的所有图片写法。 */
+function imageMatches(markdown: string): ImageMatch[] {
+  const ranges = codeRanges(markdown)
+  const out: ImageMatch[] = []
+  for (const m of markdown.matchAll(IMAGE_RE)) {
+    const start = m.index ?? 0
+    if (ranges.some(([a, b]) => start >= a && start < b)) continue
+    out.push({ start, end: start + m[0].length, alt: m[1]!, src: m[2]! })
+  }
+  return out
 }
 
 function isContainerFile(src: string): boolean {
   return src.startsWith('/') && !src.startsWith('//') && !src.startsWith('/api/')
 }
 
-/** 正文里引用容器文件的图片（按首次出现去重，围栏代码里的不算）。 */
+/** 正文里引用容器文件的图片（按首次出现去重，代码里的不算）。 */
 export function draftImages(body: string): DraftImage[] {
   const out: DraftImage[] = []
-  mapOutsideFences(body, (l) => {
-    for (const m of l.matchAll(IMAGE_RE)) {
-      const src = m[2]!
-      if (isContainerFile(src) && !out.some((i) => i.src === src)) out.push({ alt: m[1]!.trim(), src, index: out.length })
-    }
-    return l
-  })
+  for (const m of imageMatches(body)) {
+    if (isContainerFile(m.src) && !out.some((i) => i.src === m.src)) out.push({ alt: m.alt.trim(), src: m.src, index: out.length })
+  }
   return out
 }
 
@@ -180,13 +230,15 @@ export function placeholderSha(index: number): string {
 
 /** 把容器文件图片换成 `tutorial-blob:<sha>`；shaOf 返回 undefined 的保持原样。 */
 export function replaceDraftImages(body: string, shaOf: (src: string) => string | undefined): string {
-  return mapOutsideFences(body, (l) =>
-    l.replace(IMAGE_RE, (whole, alt: string, src: string) => {
-      if (!isContainerFile(src)) return whole
-      const sha = shaOf(src)
-      return sha ? `![${alt}](tutorial-blob:${sha})` : whole
-    }),
-  )
+  let out = ''
+  let last = 0
+  for (const m of imageMatches(body)) {
+    const sha = isContainerFile(m.src) ? shaOf(m.src) : undefined
+    if (!sha) continue
+    out += `${body.slice(last, m.start)}![${m.alt}](tutorial-blob:${sha})`
+    last = m.end
+  }
+  return out + body.slice(last)
 }
 
 /** 给预检的正文：容器图片按出现顺序换成占位 sha（服务端只检查写法和张数）。 */

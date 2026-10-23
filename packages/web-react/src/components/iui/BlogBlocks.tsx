@@ -8,9 +8,8 @@
  */
 import { ArrowUpRight, Circle, CircleAlert, CircleCheck, CircleX, Link2, LoaderCircle, PenLine, RefreshCw, ShieldCheck, SquarePen, TriangleAlert, UserCheck, Wand2 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { tutorialHref } from "../../hooks/useAppRoute";
-import { ApiError } from "../../lib/api";
-import { tutorialPublishErrorMessage } from "../../lib/tutorialStudio";
+// 不从 lib/tutorialStudio 取文案：它会把路由模块（连带任务面板）拉进智能 UI 的依赖里。
+import { ApiError, apiErrorMessage } from "../../lib/api";
 import type { CommunityTutorialMine } from "../../lib/types";
 import { Markdown } from "../Markdown";
 import { type CommunityBlogActions, type CommunityBlogDraftPayload, chatInteractionUnavailableText, useChatInteraction, useToolCardActions } from "../tool/context";
@@ -100,7 +99,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
     actions
       .precheck(payloadOf(spec, precheckBody))
       .then((result) => setCheck({ kind: "ready", result }))
-      .catch((error: unknown) => setCheck({ kind: "error", message: tutorialPublishErrorMessage(error, "检查没有完成") }));
+      .catch((error: unknown) => setCheck({ kind: "error", message: apiErrorMessage(error, "检查没有完成") }));
   }, [actions, spec, precheckBody]);
   // 只有当前可投稿的那一版自动预检；旧版本、已投稿、只读上下文不调用。
   useEffect(() => {
@@ -136,7 +135,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
       setSubmitted(record);
       sendUserText?.(composeSubmittedMessage(spec, id));
     } catch (error) {
-      setSubmit({ kind: "error", message: tutorialPublishErrorMessage(error, "投稿没有成功") });
+      setSubmit({ kind: "error", message: apiErrorMessage(error, "投稿没有成功") });
     }
   };
   const doOpenEditor = async () => {
@@ -149,7 +148,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
       setSubmit({ kind: "idle" });
       actions.openEditor(payloadOf(spec, body));
     } catch (error) {
-      setSubmit({ kind: "error", message: tutorialPublishErrorMessage(error, "没能打开编辑器") });
+      setSubmit({ kind: "error", message: apiErrorMessage(error, "没能打开编辑器") });
     }
   };
 
@@ -388,7 +387,7 @@ function useOwnTutorial(id: string, actions: CommunityBlogActions | undefined): 
         if (error instanceof ApiError && error.status === 404) {
           setState({ kind: "missing" });
           settled = true;
-        } else setState((prev) => (prev.kind === "ok" ? prev : { kind: "error", message: tutorialPublishErrorMessage(error, "读取审核状态失败") }));
+        } else setState((prev) => (prev.kind === "ok" ? prev : { kind: "error", message: apiErrorMessage(error, "读取审核状态失败") }));
       }
       const age = Date.now() - startedRef.current;
       if (settled) return;
@@ -562,8 +561,8 @@ function BlogStatusView({ id, nested, readOnly }: { id: string; nested?: boolean
 function PublishedView({ item, nested }: { item: CommunityTutorialMine; nested?: boolean }) {
   const { communityBlog: actions } = useToolCardActions();
   const [copied, setCopied] = useState(false);
-  const href = useMemo(() => blogPostUrl(item.id), [item.id]);
   if (!actions) return null;
+  const href = actions.postUrl(item.id);
   const copy = () => {
     void navigator.clipboard?.writeText(href).then(() => {
       setCopied(true);
@@ -610,10 +609,6 @@ function PublishedView({ item, nested }: { item: CommunityTutorialMine; nested?:
   );
 }
 
-/** 文章的站内链接，与经验分享详情页的「复制链接」同一写法。 */
-export function blogPostUrl(id: string): string {
-  return `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`;
-}
 
 export function BlogStatusBlock({ spec, nested, readOnly }: BlockProps<BlogStatusSpec>) {
   return <BlogStatusView id={spec.id} nested={nested} readOnly={readOnly} />;

@@ -66,6 +66,7 @@ function actions(precheck: CommunityBlogPrecheck, item: CommunityTutorialMine): 
     uploadImage: async () => ({ sha256: 'a'.repeat(64) }),
     submit: async () => ({ id: item.id }),
     getMine: async () => item,
+    postUrl: (id) => `${window.location.origin}/?panel=help&tab=blog&community=${id}`,
     openPost: noop,
     openMine: noop,
     openEditor: noop,
