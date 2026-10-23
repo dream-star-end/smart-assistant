@@ -7,8 +7,9 @@ import type { StoredSession } from "../persist";
 const diagnostic = "Request too large (max 20MB). Try with a smaller file.";
 const requestId = "60760760760760760760760760760760";
 const snapshot = { disposition: "card", tone: "red", title: "任务执行失败", message: "旧错误", detail: `${diagnostic} request id: ${requestId}` } as const;
+// Actual legacy tape has completed; the current UI status type is narrower.
 const row = (extra: Partial<ChatMessage> = {}): ChatMessage => ({ id: "error", role: "assistant", text: diagnostic,
-  ts: 2, status: "completed", _source: "server", _clientMessageId: "m-g607-cache", _errorCode: "ENGINE_ERROR", ...extra });
+  ts: 2, status: "completed" as unknown as ChatMessage["status"], _source: "server", _clientMessageId: "m-g607-cache", _errorCode: "ENGINE_ERROR", ...extra });
 
 describe("legacy size request ID hydration", () => {
   test("only the safe ID transfers while the current snapshot and content remain untouched", () => {
