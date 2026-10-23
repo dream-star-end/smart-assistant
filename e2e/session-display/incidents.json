@@ -9006,6 +9006,33 @@
           "assertion": "'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot"
         }
       ]
+    },
+    {
+      "id": "INC-20261024-CANONICAL-ADMITTED-AGENT",
+      "occurredAt": "2026-10-23",
+      "severity": "P2",
+      "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
+      "rootFixCommit": "1bb8a534",
+      "coverageCommits": [
+        "892f3ed6"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts",
+          "assertion": "OCV5-613 canonical identity follows the admitted dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/ws/__tests__/turnTraces.test.ts",
+          "assertion": "OCV5-613 admitted canonical projection"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-callback-payload-hash.mjs",
+          "assertion": "OCV5-613 deploy proof: canonical trace uses admitted identity"
+        }
+      ]
     }
   ]
 }
