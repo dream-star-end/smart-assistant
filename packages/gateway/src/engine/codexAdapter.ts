@@ -608,6 +608,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         params.collabAgentPolicy,
         params.queueTurn,
         params.automaticRetryState,
+        params.traceId ?? null,
       )
     } catch (err) {
       submitted = Promise.reject(err)

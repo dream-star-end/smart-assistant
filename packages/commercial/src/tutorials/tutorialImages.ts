@@ -306,6 +306,33 @@ export function tutorialImageRole(sha256: string, taken: ReadonlySet<string>): s
   return taken.has(short) ? `image:${sha256}` : short
 }
 
+/** 每张都必须由作者本人上传过，否则整篇拒收（不泄露别人的图是否存在）。 */
+export async function assertTutorialImagesOwned(
+  authorUserId: string,
+  shas: readonly string[],
+  runner: QueryRunner,
+): Promise<void> {
+  if (shas.length === 0) return
+  const owned = await query<{ sha256: string }>(
+    `SELECT sha256 FROM tutorial_blob_uploads
+      WHERE user_id = $1::bigint AND sha256 = ANY($2::text[])`,
+    [authorUserId, shas],
+    runner,
+  )
+  const ownedSet = new Set(owned.rows.map((row) => row.sha256))
+  if (shas.some((sha) => !ownedSet.has(sha)))
+    throw new TutorialImageError('BAD_IMAGE', '正文引用了不存在或不属于你的图片，请重新上传')
+}
+
+/** 修改后重绑图片：先删稿件的图片引用（快照的其它 blob 不动），再按新正文绑定。 */
+export async function replaceTutorialImageRefs(
+  args: { publicationId: string; authorUserId: string; shas: readonly string[] },
+  runner: QueryRunner,
+): Promise<void> {
+  await query(`DELETE FROM tutorial_blob_refs WHERE publication_id = $1::bigint AND role LIKE 'image:%'`, [args.publicationId], runner)
+  await bindTutorialImages(args, runner)
+}
+
 /**
  * 投稿时绑定图片：每张都必须由作者本人上传过，否则整篇拒收（不泄露别人的图是否存在）。
  */
@@ -314,15 +341,7 @@ export async function bindTutorialImages(
   runner: QueryRunner,
 ): Promise<void> {
   if (args.shas.length === 0) return
-  const owned = await query<{ sha256: string }>(
-    `SELECT sha256 FROM tutorial_blob_uploads
-      WHERE user_id = $1::bigint AND sha256 = ANY($2::text[])`,
-    [args.authorUserId, args.shas],
-    runner,
-  )
-  const ownedSet = new Set(owned.rows.map((row) => row.sha256))
-  if (args.shas.some((sha) => !ownedSet.has(sha)))
-    throw new TutorialImageError('BAD_IMAGE', '正文引用了不存在或不属于你的图片，请重新上传')
+  await assertTutorialImagesOwned(args.authorUserId, args.shas, runner)
   const roles = new Set<string>()
   for (const sha of args.shas) {
     const role = tutorialImageRole(sha, roles)

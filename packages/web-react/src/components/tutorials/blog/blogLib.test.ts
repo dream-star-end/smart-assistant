@@ -3,6 +3,12 @@ import {
   BLOG_IMAGE_MAX_BYTES,
   BlogImageError,
   applyToolbar,
+  blogCanEdit,
+  blogDraftKey,
+  blogEditChangeMessage,
+  blogEditDraftKey,
+  blogEditSeed,
+  blogEditStage,
   blogImageShas,
   blogMineStage,
   blogReadMinutes,
@@ -100,5 +106,67 @@ describe('blogLib · 草稿、状态、日期', () => {
   it('阅读时长与短日期', () => {
     expect(blogReadMinutes('字'.repeat(401))).toBe(2)
     expect(blogShortDate('2026-10-21T10:00:00+08:00', new Date('2026-10-22T00:00:00+08:00'))).toBe('10月21日')
+  })
+})
+
+describe('blogLib · 修改已投稿', () => {
+  const base = {
+    id: '4',
+    title: '线上标题',
+    summary: '线上摘要',
+    category: 'general' as const,
+    bodyMarkdown: '线上正文',
+    status: 'approved' as const,
+    reviewNote: null,
+    createdAt: '2026-10-20T10:00:00.000Z',
+    reviewedAt: null,
+    publishedAt: '2026-10-20T10:00:00.000Z',
+    kind: 'markdown' as const,
+  }
+  const edit = (status: 'pending' | 'rejected', needsHuman = false) => ({
+    id: '9',
+    status,
+    needsHuman,
+    reviewNote: status === 'rejected' ? '理由' : null,
+    title: '修改后的标题',
+    summary: '修改后的摘要',
+    category: 'coding' as const,
+    bodyMarkdown: '修改后的正文',
+    createdAt: '2026-10-23T10:00:00.000Z',
+    reviewedAt: null,
+  })
+
+  it('修改阶段：只看已发布帖；在审按 needsHuman 分 AI / 人工', () => {
+    expect(blogEditStage({ status: 'approved', edit: null })).toBeNull()
+    expect(blogEditStage({ status: 'approved', edit: edit('pending') })).toBe('ai')
+    expect(blogEditStage({ status: 'approved', edit: edit('pending', true) })).toBe('human')
+    expect(blogEditStage({ status: 'approved', edit: edit('rejected') })).toBe('rejected')
+    expect(blogEditStage({ status: 'withdrawn', edit: edit('pending') })).toBeNull()
+  })
+
+  it('修改结果提示：通过（edit 消失）、未通过、转人工；没有变化不提示', () => {
+    expect(blogEditChangeMessage('周报', 'ai', null)).toBe('「周报」的修改已通过，线上已换成新版本')
+    expect(blogEditChangeMessage('周报', 'human', 'rejected')).toBe('「周报」的修改未通过，线上仍是原版')
+    expect(blogEditChangeMessage('周报', 'ai', 'human')).toBe('「周报」的修改已转人工复核')
+    expect(blogEditChangeMessage('周报', null, 'ai')).toBeNull()
+    expect(blogEditChangeMessage('周报', 'rejected', null)).toBeNull()
+  })
+
+  it('能不能改；修改起点优先取在审 / 未通过的修改稿；修改草稿单独存', () => {
+    expect(blogCanEdit({ status: 'approved', kind: 'markdown' })).toBe(true)
+    expect(blogCanEdit({ status: 'rejected', kind: 'markdown' })).toBe(true)
+    expect(blogCanEdit({ status: 'pending', kind: 'markdown' })).toBe(true)
+    expect(blogCanEdit({ status: 'withdrawn', kind: 'markdown' })).toBe(false)
+    expect(blogCanEdit({ status: 'takedown', kind: 'markdown' })).toBe(false)
+    expect(blogCanEdit({ status: 'approved', kind: 'snapshot' })).toBe(false)
+    expect(blogEditSeed(base)).toEqual({ title: '线上标题', summary: '线上摘要', category: 'general', bodyMarkdown: '线上正文' })
+    expect(blogEditSeed({ ...base, edit: edit('rejected') })).toEqual({
+      title: '修改后的标题',
+      summary: '修改后的摘要',
+      category: 'coding',
+      bodyMarkdown: '修改后的正文',
+    })
+    expect(blogEditDraftKey('4')).toBe('oc:blog-edit:4')
+    expect(blogEditDraftKey('4')).not.toBe(blogDraftKey())
   })
 })

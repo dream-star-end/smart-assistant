@@ -277,3 +277,39 @@ export function blogStageChangeMessage(title: string, before: BlogMineStage, aft
   if (after === "human" && before === "ai") return `「${title}」已转人工复核`;
   return null;
 }
+
+/** 已发布帖的修改在哪一步:AI 审核中 / 转人工 / 没通过;没有在审或没通过的修改为 null。 */
+export type BlogEditStage = "ai" | "human" | "rejected";
+
+export function blogEditStage(item: Pick<CommunityTutorialMine, "status" | "edit">): BlogEditStage | null {
+  const edit = item.edit;
+  if (item.status !== "approved" || !edit) return null;
+  if (edit.status === "rejected") return "rejected";
+  return edit.needsHuman ? "human" : "ai";
+}
+
+/** 轮询期间修改的审核结果出来了 → toast 文案(修改通过时 edit 变成 null)。 */
+export function blogEditChangeMessage(title: string, before: BlogEditStage | null, after: BlogEditStage | null): string | null {
+  if (before === after || before === null || before === "rejected") return null;
+  if (after === null) return `「${title}」的修改已通过，线上已换成新版本`;
+  if (after === "rejected") return `「${title}」的修改未通过，线上仍是原版`;
+  if (after === "human" && before === "ai") return `「${title}」的修改已转人工复核`;
+  return null;
+}
+
+/** 这篇投稿能不能由作者修改(快照教程、已撤回、被下架的不行)。 */
+export function blogCanEdit(item: Pick<CommunityTutorialMine, "status" | "kind">): boolean {
+  if (item.kind === "snapshot") return false;
+  return item.status === "pending" || item.status === "rejected" || item.status === "approved";
+}
+
+/** 打开编辑器修改时的起点:已发布帖有没通过 / 在审的修改,就从那一版接着改。 */
+export function blogEditSeed(item: CommunityTutorialMine): BlogDraft {
+  const from = item.status === "approved" && item.edit ? item.edit : item;
+  return { title: from.title, summary: from.summary, category: from.category, bodyMarkdown: from.bodyMarkdown };
+}
+
+/** 修改模式的本机草稿单独存,不覆盖「写一篇经验」的新稿草稿。 */
+export function blogEditDraftKey(id: string): string {
+  return `oc:blog-edit:${id}`;
+}

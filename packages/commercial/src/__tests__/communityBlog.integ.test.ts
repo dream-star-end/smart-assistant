@@ -214,7 +214,7 @@ describe('经验分享 · 图片上传与归属', () => {
     const approve = await request(`/api/admin/tutorials/${submitted.id}/review`, {
       method: 'POST',
       token: admin.token,
-      json: { decision: 'approve', note: '' },
+      json: { reviewToken: 'p:1', decision: 'approve', note: '' },
     })
     assert.equal(approve.status, 200)
     const embed = await request(`/api/tutorial-embeds/${sha}`)
@@ -296,7 +296,7 @@ describe('经验分享 · 投稿', () => {
       await request(`/api/admin/tutorials/${id}/review`, {
         method: 'POST',
         token: admin.token,
-        json: { decision: 'reject', note: '请补充步骤' },
+        json: { reviewToken: 'p:1', decision: 'reject', note: '请补充步骤' },
       })
     }
     assert.equal((await submit(author.token, `${LONG_TEXT} 第 5 篇`)).status, 201)
@@ -325,7 +325,7 @@ describe('经验分享 · 投稿', () => {
     await request(`/api/admin/tutorials/${id}/review`, {
       method: 'POST',
       token: admin.token,
-      json: { decision: 'approve', note: '' },
+      json: { reviewToken: 'p:1', decision: 'approve', note: '' },
     })
     await request(`/api/tutorials/${id}`)
     await request(`/api/tutorials/${id}`)

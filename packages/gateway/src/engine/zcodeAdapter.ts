@@ -1061,6 +1061,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
       identityCompat: this.opts.identityCompat,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
         gatewayPort: this.opts.config.gateway.port,
         gatewayToken: this.opts.config.gateway.accessToken ?? '',
         delegationDepth: this.opts.delegationDepth ?? 0,
