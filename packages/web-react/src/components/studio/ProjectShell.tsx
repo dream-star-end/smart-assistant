@@ -10,6 +10,7 @@ import type { AuthSession } from '../../lib/types'
 import { StateView } from './StateViews'
 import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
+import { ReviewPage } from './pages/Review'
 
 const STEPS: Array<[StudioPage, string]> = [
   ['brief', '需求'],
@@ -138,6 +139,8 @@ export function ProjectShell(props: {
           onOpenShot={(shot) => navigate({ kind: 'project', id: projectId, page: 'review', shot })}
           onOpenBrief={() => go('brief')}
         />
+      ) : page === 'review' ? (
+        <ReviewPage auth={auth} view={state.view} shotId={props.shot} onBack={() => go('board')} />
       ) : (
         <StateView
           kind="soon"
