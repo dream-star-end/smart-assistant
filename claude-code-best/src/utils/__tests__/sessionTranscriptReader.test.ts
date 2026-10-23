@@ -20,7 +20,7 @@ beforeEach(async () => {
   saved = Object.fromEntries(['CLAUDE_CONFIG_DIR', 'OPENCLAUDE_TRANSCRIPT_INTEGRITY', 'CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP'].map(key => [key, process.env[key]]))
   process.env.CLAUDE_CONFIG_DIR = directory
   process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY = '1'
-  delete process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP
+  Reflect.deleteProperty(process.env, 'CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP')
   await mkdir(join(directory, 'projects', 'fixture'), { recursive: true, mode: 0o700 })
   file = join(directory, 'projects', 'fixture', `${sid}.jsonl`)
   clearSessionMessagesCache(); resetProjectForTesting()
@@ -39,7 +39,7 @@ async function both(): Promise<{ full: LogOption; optimized: LogOption }> {
   const log = { sessionId: sid, fullPath: file, messages: [], modified: new Date(0), created: new Date(0), firstPrompt: 'fixture', messageCount: 0 } as unknown as LogOption
   process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP = '1'
   const full = await loadFullLog(log)
-  delete process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP
+  Reflect.deleteProperty(process.env, 'CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP')
   const optimized = await loadFullLog(log)
   if (hash(full.messages) !== hash(optimized.messages)) throw new Error('G607_READER_MODEL_CONTEXT_MISMATCH')
   expect(hash(optimized)).toBe(hash(full))
@@ -65,7 +65,7 @@ for (const sidechain of [false, true]) {
       // Agent callers anchor a UA leaf even when there is no foreground root.
       process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP = '1'
       const full = await loadTranscriptFile(file, { keepAllLeaves: true })
-      delete process.env.CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP
+      Reflect.deleteProperty(process.env, 'CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP')
       const optimized = await loadTranscriptFile(file)
       const { buildConversationChain } = await import('../sessionStorage.js')
       const original = buildConversationChain(full.messages, full.messages.get(id(8) as any)!)
