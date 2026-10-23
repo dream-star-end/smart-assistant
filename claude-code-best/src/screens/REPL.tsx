@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../utils/sessionTransition.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle';
 import { spawnSync } from 'child_process';
@@ -2122,6 +2123,7 @@ export function REPL({
 
   const resume = useCallback(
     async (sessionId: UUID, log: LogOption, entrypoint: ResumeEntrypoint) => {
+      if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
       const resumeStart = performance.now();
       try {
         // Deserialize messages to properly clean up the conversation
@@ -2232,6 +2234,7 @@ export function REPL({
         // Switch session (id + project dir atomically). fullPath may point to
         // a different project (cross-worktree, /branch); null derives from
         // current originalCwd.
+        if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
         switchSession(asSessionId(sessionId), log.fullPath ? dirname(log.fullPath) : null);
         // Rename asciicast recording to match the resumed session ID
         const { renameRecordingForSession } = await import('../utils/asciicast.js');

@@ -73,3 +73,5 @@ export {
   BOX_GPT_WEB_ALLOWED_UIDS_ENV,
   BOX_GPT_WEB_CONTAINER_ALLOWED_ENV,
 } from './boxGptWebModels.js'
+
+export * from './ccbTranscriptRestore.js'

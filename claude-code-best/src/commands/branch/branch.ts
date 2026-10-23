@@ -11,9 +11,12 @@ import type {
   SerializedMessage,
   TranscriptMessage,
 } from '../../types/logs.js'
+import { readSessionFile, replaceSessionFile } from '../../utils/sessionFileIo.js'
+import { getProjectsDir } from '../../utils/sessionStoragePortable.js'
 import { parseJSONL } from '../../utils/json.js'
 import {
   getProjectDir,
+  flushSessionStorage,
   getTranscriptPath,
   getTranscriptPathForSession,
   isTranscriptMessage,
@@ -79,7 +82,10 @@ async function createFork(customTitle?: string): Promise<{
   // Read current transcript file
   let transcriptContent: Buffer
   try {
-    transcriptContent = await readFile(currentTranscriptPath)
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
+      await flushSessionStorage()
+      transcriptContent = await readSessionFile(currentTranscriptPath, { projectsDir: getProjectsDir(), sessionId: originalSessionId, requireKernelLock: true })
+    } else transcriptContent = await readFile(currentTranscriptPath)
   } catch {
     throw new Error('No conversation to branch')
   }
@@ -160,7 +166,9 @@ async function createFork(customTitle?: string): Promise<{
   }
 
   // Write the fork session file
-  await writeFile(forkSessionPath, lines.join('\n') + '\n', {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
+    await replaceSessionFile(forkSessionPath, Buffer.from(lines.join('\n') + '\n'), { projectsDir: getProjectsDir(), sessionId: forkSessionId, requireKernelLock: true })
+  } else await writeFile(forkSessionPath, lines.join('\n') + '\n', {
     encoding: 'utf8',
     mode: 0o600,
   })

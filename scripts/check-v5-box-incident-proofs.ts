@@ -3702,7 +3702,8 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
-  const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
+  const proofs = [await (await import("./lib/sessionFileIntegrityProof.js")).proveSessionFileIntegrity(), // [ocv5-607-native-transcript-integrity] PASS
+    proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
     proveForeignToolHistory(api), await proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),

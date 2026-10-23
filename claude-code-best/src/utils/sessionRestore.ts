@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from './sessionTransition.js'
 import { feature } from 'bun:bundle'
 import type { UUID } from 'crypto'
 import { dirname } from 'path'
@@ -425,6 +426,7 @@ export async function processResumedConversation(
   },
 ): Promise<ProcessedResume> {
   // Match coordinator/normal mode to the resumed session
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   let modeWarning: string | undefined
   if (feature('COORDINATOR_MODE')) {
     modeWarning = context.modeApi?.matchSessionMode(result.mode)
@@ -440,6 +442,7 @@ export async function processResumedConversation(
       // When resuming from a different project directory (git worktrees,
       // cross-project), transcriptPath points to the actual file; its dirname
       // is the project dir. Otherwise the session lives in the current project.
+      if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
       switchSession(
         asSessionId(sid),
         opts.transcriptPath ? dirname(opts.transcriptPath) : null,

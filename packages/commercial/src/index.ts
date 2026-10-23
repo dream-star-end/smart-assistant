@@ -1,3 +1,5 @@
+import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
+import { readCcbNativeRestoreArchive } from './db/pgSessionsBackend.js';
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
@@ -2671,6 +2673,19 @@ export async function registerCommercial(
         getSigner: () => modelAuthoritySigner,
       });
       // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
+      const ccbTranscriptRestoreHandler = makeCcbTranscriptRestoreHandler({
+        identityRepo,
+        read: async (owner, binding) => {
+          const client = await getPool().connect();
+          try {
+            await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY');
+            const archive = await readCcbNativeRestoreArchive(client, owner, binding);
+            await client.query('COMMIT');
+            return archive;
+          } catch (error) { await client.query('ROLLBACK'); throw error; }
+          finally { client.release(); }
+        },
+      });
       const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
         identityRepo,
         storage: dispatchAdmissionBackend,
@@ -3038,6 +3053,7 @@ export async function registerCommercial(
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
         }
+        if (path === CCB_TRANSCRIPT_RESTORE_PATH) return ccbTranscriptRestoreHandler(req, res, ctx);
         if (path === TURN_TAPE_STATE_PATH) {
           return turnTapeStateHandler(req, res, ctx);
         }

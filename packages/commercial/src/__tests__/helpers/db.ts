@@ -95,6 +95,11 @@ export async function resetTestSchemaForTest(
 const BASE_TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 
+/** URL only: no connection, migration, reset, or test hooks. Callers must validate scope. */
+export function getTestDatabaseUrlForTempTables(): string {
+  return process.env.OC_V5_PROOF_TEST_DATABASE_URL ?? BASE_TEST_DB_URL;
+}
+
 /** 与 gate 脚本同一判据:CI 或 REQUIRE_TEST_DB=1 时,PG 不可达必须 fail-loud。 */
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
