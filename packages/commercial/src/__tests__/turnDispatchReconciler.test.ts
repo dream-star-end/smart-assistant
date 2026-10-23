@@ -43,6 +43,7 @@ type Raw = Record<string, unknown>
 
 function rawRow(o: Partial<Raw> = {}): Raw {
   return {
+    trace_id: '60500000000000000000000000000001',
     dispatch_id: 'd-1',
     user_id: '42',
     session_id: 'sess-0001',
@@ -898,6 +899,8 @@ describe('carrier-death fast path (accepted)', () => {
     // OCV5-567: the close leaves a line with the dispatch id and the evidence it was based on
     const line = cap.lines.find((l) => l.msg === 'dispatch transition by reconciler')
     assert.ok(line, 'transition line written')
+    assert.equal(line.traceId, '60500000000000000000000000000001')
+    assert.equal(line.attempt, 1)
     assert.equal(line.level, 'warn')
     assert.equal(line.dispatchId, 'd-1')
     assert.equal(line.failureCode, 'SERVICE_RESTART')
@@ -1317,6 +1320,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
 
   function orphanRow(over: Partial<Raw> = {}): Raw {
     return {
+      trace_id: '60500000000000000000000000000002',
       dispatch_id: 'd-vis-1',
       attempt_no: 1,
       user_id: '42',
@@ -1921,7 +1925,8 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       ],
       orphanFirstVisibleReverify: [
         {
-          dispatch_id: 'd-vis-1',
+          trace_id: '60500000000000000000000000000002',
+      dispatch_id: 'd-vis-1',
           user_id: '42',
           session_key: 'agent:main:webchat:dm:sess-vis',
           first_visible_at: new Date(nowMs - 60_000),

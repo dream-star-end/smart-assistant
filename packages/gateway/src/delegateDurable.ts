@@ -25,7 +25,7 @@ export type DurableJobResult = {
   body: Record<string, unknown>
 }
 
-export const DELEGATE_DURABLE_SCHEMA_VERSION = 4
+export const DELEGATE_DURABLE_SCHEMA_VERSION = 5
 
 /**
  * OCV5-164: how long a retired (TTL-elapsed) terminal row stays readable for
@@ -64,6 +64,8 @@ export type DurableJobRecord = {
   kind: DelegateJobKind
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   generation: number
   ownerInstanceId?: string
   ownerLeaseUntil?: number | null
@@ -106,6 +108,8 @@ CREATE TABLE IF NOT EXISTS delegate_jobs (
   kind TEXT NOT NULL,
   session_key TEXT,
   parent_session_key TEXT,
+  trace_id TEXT,
+  parent_trace_id TEXT,
   generation INTEGER NOT NULL DEFAULT 0,
   owner_instance_id TEXT,
   owner_lease_until INTEGER,
@@ -205,7 +209,7 @@ export class DelegateDurableDb {
     this.migrate()
     this.upsertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
-        job_id, agent_id, state, kind, session_key, parent_session_key, generation,
+        job_id, agent_id, state, kind, session_key, parent_session_key, trace_id, parent_trace_id, generation,
         owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
         checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
         failure_class, failure_detail, result_json, created_at, updated_at,
@@ -213,7 +217,7 @@ export class DelegateDurableDb {
         callback_origin_session_key, callback_origin_user_id, notify_retry_at, notify_attempt,
         notify_delivery_token, notify_claimed_until, terminal_committed_at
       ) VALUES (
-        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
+        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @trace_id, @parent_trace_id, @generation,
         @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
         @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
         @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
@@ -227,6 +231,8 @@ export class DelegateDurableDb {
         kind=excluded.kind,
         session_key=excluded.session_key,
         parent_session_key=excluded.parent_session_key,
+        trace_id=excluded.trace_id,
+        parent_trace_id=excluded.parent_trace_id,
         generation=excluded.generation,
         owner_instance_id=excluded.owner_instance_id,
         owner_lease_until=excluded.owner_lease_until,
@@ -257,7 +263,7 @@ export class DelegateDurableDb {
     `)
     this.insertStmt = this.db.prepare(`
       INSERT INTO delegate_jobs (
-        job_id, agent_id, state, kind, session_key, parent_session_key, generation,
+        job_id, agent_id, state, kind, session_key, parent_session_key, trace_id, parent_trace_id, generation,
         owner_instance_id, owner_lease_until, claim_token, attempt_no, fencing_epoch,
         checkpoint_kind, callback, callback_state, callback_epoch, idempotency_key,
         failure_class, failure_detail, result_json, created_at, updated_at,
@@ -265,7 +271,7 @@ export class DelegateDurableDb {
         callback_origin_session_key, callback_origin_user_id, notify_retry_at, notify_attempt,
         notify_delivery_token, notify_claimed_until, terminal_committed_at
       ) VALUES (
-        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @generation,
+        @job_id, @agent_id, @state, @kind, @session_key, @parent_session_key, @trace_id, @parent_trace_id, @generation,
         @owner_instance_id, @owner_lease_until, @claim_token, @attempt_no, @fencing_epoch,
         @checkpoint_kind, @callback, @callback_state, @callback_epoch, @idempotency_key,
         @failure_class, @failure_detail, @result_json, @created_at, @updated_at,
@@ -281,6 +287,8 @@ export class DelegateDurableDb {
         kind=@kind,
         session_key=@session_key,
         parent_session_key=@parent_session_key,
+        trace_id=@trace_id,
+        parent_trace_id=@parent_trace_id,
         generation=@generation,
         owner_instance_id=@owner_instance_id,
         owner_lease_until=@owner_lease_until,
@@ -480,6 +488,12 @@ export class DelegateDurableDb {
       if (current < 2) this.addNotifyDeliveryColumns()
       if (current < 3) this.addNotifyAAttemptedColumn()
       if (current < 4) this.addRetiredAtColumn()
+      if (current < 5) {
+        const columns = new Set((this.db.prepare('PRAGMA table_info(delegate_jobs)').all() as Array<{ name: string }>).map(row => row.name))
+        for (const name of ['trace_id', 'parent_trace_id']) {
+          if (!columns.has(name)) this.db.exec(`ALTER TABLE delegate_jobs ADD COLUMN ${name} TEXT`)
+        }
+      }
       this.db.pragma(`user_version = ${DELEGATE_DURABLE_SCHEMA_VERSION}`)
     })
     apply()
@@ -816,6 +830,8 @@ function toRow(record: DurableJobRecord): Record<string, unknown> {
     kind: record.kind,
     session_key: record.sessionKey ?? null,
     parent_session_key: record.parentSessionKey ?? null,
+    trace_id: record.traceId ?? null,
+    parent_trace_id: record.parentTraceId ?? null,
     generation: record.generation,
     owner_instance_id: record.ownerInstanceId ?? null,
     owner_lease_until: record.ownerLeaseUntil ?? null,
@@ -864,6 +880,8 @@ function fromRow(row: Record<string, unknown>): DurableJobRecord {
     kind: (row.kind as DelegateJobKind) ?? 'delegate',
     sessionKey: str(row.session_key),
     parentSessionKey: str(row.parent_session_key),
+    traceId: str(row.trace_id),
+    parentTraceId: str(row.parent_trace_id),
     generation: num(row.generation),
     ownerInstanceId: str(row.owner_instance_id),
     ownerLeaseUntil: row.owner_lease_until == null ? null : num(row.owner_lease_until),
