@@ -343,6 +343,14 @@ master_gate_flaky_signature() { # <attempt-log>
   printf '%s' "$sig"
 }
 
+# 失败尝试的首错签名(第一条 [gate-failure] 行;没有就记退出码),写进 train summary 时首跑与重跑分开(OCV5-583)。
+master_gate_first_failure() { # <attempt-log> <rc>
+  local line=""
+  line="$(sed -n '/^\[gate-failure\] /{s/^\[gate-failure\] //p;q;}' "$1" 2>/dev/null)" || line=""
+  [[ -n "$line" ]] || line="rc=$2 (no [gate-failure] line)"
+  printf '%s' "${line:0:200}"
+}
+
 # 跑一道可重跑的门:最多两次,第二次只在第一次是已知假失败时才跑。rc 0 = 某一次通过。
 master_gate_retryable() { # <gate> <command...>
   local gate="$1" n log first="" rcf rc sig
@@ -363,6 +371,7 @@ master_gate_retryable() { # <gate> <command...>
     rc="$(cat -- "$rcf" 2>/dev/null)"
     rm -f -- "$rcf"
     [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    [[ "$rc" == 0 ]] || tsum_note "gateFailure.$gate.attempt$n" "$(master_gate_first_failure "$log" "$rc")" 2>/dev/null || :
     if [[ "$rc" == 0 ]]; then
       if [[ "$n" == 2 ]]; then
         tsum_note "retry.$gate.result" passed 2>/dev/null || :
@@ -913,6 +922,11 @@ build_master_release() {
   command -v npm >/dev/null 2>&1 || die "缺少 npm"
   command -v jq >/dev/null 2>&1 || die "缺少 jq"
   [[ ! -e "$reldir" ]] || die "目标已存在,拒绝覆盖: $reldir"
+  # OCV5-583 资源准入前移:主机忙(负载、被持有的 test-mutex、别的会话在跑全量测试)时,以前先建候选
+  # (archive + 依赖)再在 Box 门前等最多 900s;现在先在这里等,超时就在建任何东西之前放弃。
+  # Box 门前那次等待保留(构建期间可能又忙起来),通常立即通过。
+  master_gate_wait_host_idle admission \
+    || die "发车准入:主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s,未建候选(live 未改)"
 
   mkdir -p -- "$MASTER_RELEASES_ROOT"
   chown 0:0 -- "$MASTER_RELEASES_ROOT"
