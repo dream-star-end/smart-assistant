@@ -1783,6 +1783,8 @@ export interface AdmitUserTurnInput {
   now?: number;
   agentContainerId?: number | null;
   runtimeKind?: string | null;
+  /** Master canonical traceId of the admitting frame (turn_dispatches.trace_id). */
+  traceId?: string | null;
 }
 
 export type AdmitUserTurnResult =
@@ -9304,6 +9306,7 @@ export function createPgSessionsBackend(
           ...(input.now !== undefined ? { now: input.now } : {}),
           ...(input.agentContainerId !== undefined ? { agentContainerId: input.agentContainerId } : {}),
           ...(input.runtimeKind !== undefined ? { runtimeKind: input.runtimeKind } : {}),
+          ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
         });
         if (input.recoveryJob) {
           const bound = await bindRecoveryJobDispatch(client, {
