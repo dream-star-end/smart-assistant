@@ -48,8 +48,9 @@ export async function runStudioGc(deps: {
   const stale = await deps.pool.query<{ id: string; user_id: string }>(
     `SELECT t.id::text AS id, p.user_id::text AS user_id
        FROM studio_takes t JOIN studio_projects p ON p.id=t.project_id
-      WHERE t.finished_at < NOW() - INTERVAL '30 days' AND t.blob_sha IS NOT NULL
-        AND t.owner_kind <> 'final'
+      WHERE t.finished_at < NOW() - INTERVAL '30 days'
+        -- A finished film is kept; a final take that failed or was superseded is not (A2-1c).
+        AND (t.owner_kind <> 'final' OR t.status <> 'succeeded')
         AND NOT EXISTS (SELECT 1 FROM studio_shots s WHERE s.active_take_id=t.id)
         AND NOT EXISTS (SELECT 1 FROM studio_lines l WHERE l.active_take_id=t.id)
         AND NOT EXISTS (SELECT 1 FROM studio_assets a

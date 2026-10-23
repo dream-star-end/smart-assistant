@@ -8,8 +8,11 @@ import { randomUUID } from 'node:crypto'
 import { HttpError } from '../../http/util.js'
 import { ComposeSpecError, type MusicEdit, validateMusicEdit } from '../compose/spec.js'
 import type { MediaRequest } from '../providers/types.js'
+import { enqueueStudioTask } from '../queue.js'
 import { STUDIO_MAX_TARGET_SEC, appendStudioEvent } from '../store.js'
 import { type AdvanceDeps, dispatchRequest } from './advance.js'
+import { loadComposeInputs } from './compose.js'
+import { parseVariant, variantKey } from './composeJob.js'
 
 export interface OrchestratorApi {
   start(userId: string, projectId: string): Promise<void>
@@ -31,6 +34,15 @@ export interface OrchestratorApi {
   ): Promise<{ queued: true }>
   /** OCV5-591 M1: trim / place / loop / fades / ducking for the project's music. */
   setMusicEdit(userId: string, projectId: string, body: Record<string, unknown>): Promise<MusicEdit>
+  /**
+   * OCV5-591 A2-1c: the film in another export format. Free (user decision 2026-10-23 22:13);
+   * a film already composed for the same format and inputs is returned instead of re-composing.
+   */
+  requestExport(
+    userId: string,
+    projectId: string,
+    body: Record<string, unknown>,
+  ): Promise<{ queued: true } | { reused: true; takeId: string }>
   /** Advance soon, off the request path. */
   kick(projectId: string): void
 }
@@ -240,6 +252,48 @@ export function makeOrchestratorApi(
       })
       return { assetId }
     },
+    async requestExport(userId, projectId, body) {
+      if (!deps?.compose?.configured())
+        throw new HttpError(503, 'STUDIO_COMPOSE_OFF', 'the compose sandbox is not configured')
+      const variant = parseVariant(body)
+      if (!variant) throw new HttpError(400, 'BAD_REQUEST', 'resolution and subtitles are required')
+      return inTx(pool, async (c) => {
+        const r = await c.query<{ status: string }>(
+          'SELECT status FROM studio_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE',
+          [projectId, userId],
+        )
+        const p = r.rows[0]
+        if (!p) throw notFound()
+        if (p.status !== 'done')
+          throw new HttpError(409, 'STUDIO_NOT_DONE', 'the film is not composed yet')
+        const inputs = await loadComposeInputs(c, projectId, variant)
+        if (!inputs) throw notFound()
+        const same = await c.query<{ id: string }>(
+          `SELECT id::text AS id FROM studio_takes
+            WHERE project_id = $1 AND owner_kind = 'final' AND status = 'succeeded'
+              AND meta->>'variantKey' = $2 AND meta->>'inputsKey' = $3
+            ORDER BY version DESC LIMIT 1`,
+          [projectId, variantKey(variant), inputs.inputsKey],
+        )
+        if (same.rows[0]) return { reused: true as const, takeId: same.rows[0].id }
+        // A failed attempt for these inputs does not block another request for them.
+        const tries = await c.query<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM studio_tasks WHERE project_id = $1 AND kind = 'compose' AND status IN ('failed','canceled')`,
+          [projectId],
+        )
+        await enqueueStudioTask(c, {
+          projectId,
+          kind: 'compose',
+          idempotencyKey: `compose:${projectId}:${inputs.inputsKey}:export:${tries.rows[0]!.n}`,
+          payload: { reason: 'export', variant },
+        })
+        await appendStudioEvent(c, projectId, 'compose.export_requested', {
+          variantKey: variantKey(variant),
+          message: '正在按新规格重新合成，免费。',
+        })
+        return { queued: true as const }
+      })
+    },
     async selectMusic(userId, projectId, body) {
       if (!deps)
         throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
@@ -276,6 +330,12 @@ export function makeOrchestratorApi(
           throw new HttpError(409, 'STUDIO_MUSIC_UNAVAILABLE', 'this music source is not available')
         if (outcome === 'budget')
           throw new HttpError(409, 'STUDIO_BUDGET_TOO_LOW', 'the project is over its budget')
+        // A finished film goes back to the director, who re-composes it with the new music (free).
+        await c.query(
+          `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason', rev = rev + 1, updated_at = NOW()
+            WHERE id = $1 AND status = 'done'`,
+          [projectId],
+        )
         await appendStudioEvent(c, projectId, 'music.requested', {
           providerId,
           trackId,
@@ -295,6 +355,8 @@ export function makeOrchestratorApi(
       }
       const r = await pool.query(
         `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicEdit', $3::jsonb),
+                -- A finished film goes back to the director with the new edit (free re-compose).
+                status = CASE WHEN status = 'done' THEN 'running' ELSE status END,
                 rev = rev + 1, updated_at = NOW()
           WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND status NOT IN ('done','canceled','failed')`,
         [projectId, userId, JSON.stringify(edit)],
@@ -307,6 +369,7 @@ export function makeOrchestratorApi(
         if (!exists.rowCount) throw notFound()
         throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'the project no longer takes edits')
       }
+      kick(projectId)
       return edit
     },
     async useVoiceForNarration(userId, assetId) {

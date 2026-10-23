@@ -13,6 +13,8 @@ import { MediaProviderError, type MediaRequest, type MediaResult } from '../prov
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
+import { type ComposeRunnerLike, composePayload, failCompose, runCompose } from './compose.js'
+import { LeaseLostError, withLease } from './lease.js'
 import {
   PlanParseError,
   type PlanVoice,
@@ -20,6 +22,8 @@ import {
   buildPlanPrompt,
   parsePlan,
 } from './plan.js'
+
+export { LeaseLostError }
 
 export const MAX_PROVIDER_ATTEMPTS = 3
 /** Claims (including lease expiries after a crash or timeout) before a task is given up. */
@@ -33,37 +37,8 @@ export interface ExecuteDeps {
   providers: ProviderRegistry
   grok?: GrokRunner
   systemVoices: () => Promise<PlanVoice[]>
-}
-
-export class LeaseLostError extends Error {
-  constructor() {
-    super('studio task lease lost')
-    this.name = 'LeaseLostError'
-  }
-}
-
-async function withLease<T>(
-  pool: Pool,
-  task: StudioTask,
-  fn: (c: PoolClient) => Promise<T>,
-): Promise<T> {
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const own = await client.query(
-      `SELECT 1 FROM studio_tasks WHERE id = $1 AND lease_owner = $2 AND lease_epoch = $3 AND status = 'leased' FOR UPDATE`,
-      [task.id, task.owner, task.epoch],
-    )
-    if (own.rowCount !== 1) throw new LeaseLostError()
-    const out = await fn(client)
-    await client.query('COMMIT')
-    return out
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw err
-  } finally {
-    client.release()
-  }
+  /** OCV5-588 sandbox (OC_STUDIO_FFMPEG_IMAGE_ID); absent → compose waits (compose_pending). */
+  compose?: ComposeRunnerLike
 }
 
 async function projectOf(pool: Pool, projectId: string) {
@@ -569,8 +544,24 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
     [task.projectId],
   )
   const p = r.rows[0]
-  if (!p || p.deleted || p.status === 'canceled' || p.status === 'failed' || p.status === 'done') {
+  // An export-format switch re-composes a finished project (plan §1); everything else stops at done.
+  const exportOfDone =
+    p?.status === 'done' && task.kind === 'compose' && composePayload(task).reason === 'export'
+  if (
+    !p ||
+    p.deleted ||
+    p.status === 'canceled' ||
+    p.status === 'failed' ||
+    (p.status === 'done' && !exportOfDone)
+  ) {
+    const composeTake = task.kind === 'compose' ? composePayload(task).takeId : undefined
     await withLease(deps.pool, task, async (c) => {
+      if (composeTake) {
+        await c.query(
+          `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1 AND status IN ('queued','running')`,
+          [composeTake],
+        )
+      }
       if (task.kind === 'gen') {
         const takeId = (task.payload as { takeId?: unknown }).takeId
         if (typeof takeId === 'string') {
@@ -583,6 +574,14 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
       }
       await finishStudioTask(c, task, { status: 'canceled', error: 'project is no longer active' })
     })
+    if (composeTake) {
+      const u = await deps.pool.query<{ user_id: string }>(
+        'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+        [task.projectId],
+      )
+      if (u.rows[0])
+        await deps.blobs.dropRefs(BigInt(u.rows[0].user_id), { kind: 'final', id: composeTake })
+    }
     return false
   }
   if (p.status === 'paused') {
@@ -615,6 +614,10 @@ async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promi
         error: `${e.code}: ${e.message}`,
       }),
     )
+    return
+  }
+  if (task.kind === 'compose') {
+    await failCompose(deps, task, e.code, e.message)
     return
   }
   if (task.kind === 'gen') {
@@ -663,6 +666,7 @@ export async function executeTask(
     if (!(await gate(deps, task))) return
     if (task.kind === 'plan') return await runPlan(deps, task)
     if (task.kind === 'gen') return await runGen(deps, task, signal)
+    if (task.kind === 'compose') return await runCompose(deps, task)
     throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
   } catch (err) {
     // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.

@@ -10,12 +10,15 @@ import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../pro
 import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { reserveBudget } from './budget.js'
+import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DState, type Dispatch, decide } from './decide.js'
 import { type BibleEntry, biblePrompt, framePrompt, videoPrompt } from './prompts.js'
 
 export interface AdvanceDeps {
   pool: Pool
   providers: ProviderRegistry
+  /** OCV5-591 A2-1c: the compose sandbox; absent or unconfigured → compose_pending. */
+  compose?: { configured(): boolean }
 }
 
 const REPRESENTATIVE_OP: Record<'image' | 'video' | 'voice' | 'music', MediaOp> = {
@@ -138,6 +141,8 @@ export async function loadState(
     })),
     narrationVoiceId: typeof narration?.voiceId === 'string' ? narration.voiceId : null,
     musicSkippedNoted: settings.musicSkippedNoted === true,
+    canCompose: deps.compose?.configured() ?? false,
+    composeQueued: tasks.rows.some((t) => t.kind === 'compose'),
     canDispatch: {
       image: can('image'),
       video: can('video'),
@@ -372,6 +377,17 @@ async function apply(
         a.status,
         id,
       ])
+    } else if (a.type === 'enqueue_compose') {
+      const rev = await client.query<{ rev: number }>(
+        'SELECT rev FROM studio_projects WHERE id = $1',
+        [id],
+      )
+      await enqueueStudioTask(client, {
+        projectId: id,
+        kind: 'compose',
+        idempotencyKey: `compose:${id}:auto:${rev.rows[0]!.rev}`,
+        payload: { reason: 'auto', variant: DEFAULT_VARIANT },
+      })
     } else if (a.type === 'note_music_skipped') {
       await client.query(
         `UPDATE studio_projects SET settings = settings || '{"musicSkippedNoted":true}'::jsonb WHERE id = $1`,
@@ -391,11 +407,13 @@ async function apply(
       await appendStudioEvent(client, id, `project.${a.status}`, {
         reason: a.reason ?? null,
         message:
-          a.reason === 'compose_pending'
-            ? '镜头和配音都好了，等待合成（合成即将开放）。'
-            : a.reason === 'needs_user'
-              ? '有镜头需要你看一下。'
-              : undefined,
+          a.status === 'composing'
+            ? '镜头和配音都好了，导演 agent 开始合成成片。'
+            : a.reason === 'compose_pending'
+              ? '镜头和配音都好了，等待合成（合成沙箱未配置）。'
+              : a.reason === 'needs_user'
+                ? '有镜头需要你看一下。'
+                : undefined,
       })
     }
   }

@@ -290,6 +290,12 @@ describe('dispatchStudioRoute', () => {
       kick: (id) => void seen.push(`kick:${id}`),
       selectMusic: async () => ({ queued: true as const }),
       setMusicEdit: async () => ({}),
+      requestExport: async (uid, id, body) => {
+        seen.push(`export:${uid}:${id}:${body.resolution}:${body.subtitles}`)
+        return body.resolution === '1080p'
+          ? { reused: true as const, takeId: 'fin1' }
+          : { queued: true as const }
+      },
     }
     try {
       for (const r of [`/projects/${PROJECT}/start`, `/projects/${PROJECT}/approve`]) {
@@ -303,6 +309,19 @@ describe('dispatchStudioRoute', () => {
       assert.equal((await post(`/takes/${TAKE}/select`)).status, 200)
       assert.equal((await post(`/assets/${ASSET}/narration`)).status, 200)
       assert.equal((await post(`/projects/${PROJECT}/resume`)).status, 200)
+      // A2-1c export: a film for the same format is returned (200), another format is queued (202).
+      const reused = await post(`/projects/${PROJECT}/export`, {
+        resolution: '1080p',
+        subtitles: 'burn',
+      })
+      assert.equal(reused.status, 200)
+      assert.deepEqual(await reused.json(), { reused: true, takeId: 'fin1' })
+      assert.equal(
+        (await post(`/projects/${PROJECT}/export`, { resolution: 'vertical', subtitles: 'srt' }))
+          .status,
+        202,
+      )
+      seen.splice(seen.indexOf(`export:247:${PROJECT}:1080p:burn`), 2)
       assert.deepEqual(seen, [
         `start:247:${PROJECT}`,
         `approve:247:${PROJECT}`,

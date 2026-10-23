@@ -12,6 +12,7 @@
  *   POST   /api/studio/music/tracks?title=&rights=own_or_licensed[&note=]   raw audio body (My Music)
  *   POST   /api/studio/projects/:id/music            {providerId, trackId} → a free music take
  *   PUT    /api/studio/projects/:id/music/edit       trim / place / loop / fades / ducking
+ *   POST   /api/studio/projects/:id/export           {resolution, subtitles} → free re-compose (A2-1c)
  *   POST   /api/studio/blobs/:sha/ticket             → {url, expiresInSeconds}
  *   GET    /api/studio/blobs/:sha?ticket=            Range-capable
  *
@@ -31,6 +32,7 @@ import {
   verifyBlobTicket,
 } from './access.js'
 import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from './blobs.js'
+import type { ComposeRunnerLike } from './orchestrator/compose.js'
 import type { OrchestratorApi } from './orchestrator/service.js'
 import type { ProviderRegistry } from './providers/registry.js'
 import { MEDIA_KINDS, type MusicQuery } from './providers/types.js'
@@ -47,6 +49,8 @@ export interface StudioHttpDeps {
   providers?: ProviderRegistry
   /** OCV5-591 A2-1; absent → start / approve / take selection answer 503. */
   orchestrator?: OrchestratorApi
+  /** OCV5-591 A2-1c: the compose sandbox (OCV5-588), when OC_STUDIO_FFMPEG_IMAGE_ID is set. */
+  compose?: ComposeRunnerLike
 }
 
 const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
@@ -64,7 +68,7 @@ const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
 const notFound = () => new HttpError(404, 'NOT_FOUND', 'not found')
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 const PROJECT_RE = new RegExp(
-  `^/projects/(${UUID})(?:/(pause|resume|cancel|uploads|start|approve|voices))?$`,
+  `^/projects/(${UUID})(?:/(pause|resume|cancel|uploads|start|approve|voices|export))?$`,
 )
 const TAKE_SELECT_RE = new RegExp(`^/takes/(${UUID})/select$`)
 const VOICE_NARRATION_RE = new RegExp(`^/assets/(${UUID})/narration$`)
@@ -369,6 +373,17 @@ export async function dispatchStudioRoute(
       201,
       await studio.orchestrator.createVoice(uid, projectId, bodyRecord(await readJsonBody(req))),
     )
+    return
+  }
+  if (action === 'export' && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    const out = await studio.orchestrator.requestExport(
+      uid,
+      projectId,
+      bodyRecord(await readJsonBody(req)),
+    )
+    sendJson(res, 'reused' in out ? 200 : 202, out)
     return
   }
   if ((action === 'start' || action === 'approve') && method === 'POST') {

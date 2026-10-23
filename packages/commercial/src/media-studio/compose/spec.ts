@@ -59,8 +59,9 @@ export type ComposeOp =
   | { op: 'compose'; spec: ComposeSpec }
 
 export interface ComposeSpec {
-  width: 1280 | 1920
-  height: 720 | 1080
+  /** 16:9, 9:16 or 1:1 at 720 / 1080 (OCV5-591 A2-1c: studio projects and the 竖屏 export). */
+  width: 720 | 1080 | 1280 | 1920
+  height: 720 | 1080 | 1280 | 1920
   fps: 24 | 25 | 30
   clips: Array<{ file: string; inSec: number; outSec: number }>
   transitions?: { kind: 'cut' | 'fade'; durSec?: number }
@@ -387,12 +388,21 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
   }
 }
 
+/** 16:9, 9:16 and 1:1 canvases at 720 / 1080 (OCV5-591 A2-1c). */
+const CANVASES: ReadonlyArray<readonly [number, number]> = [
+  [1280, 720],
+  [1920, 1080],
+  [720, 1280],
+  [1080, 1920],
+  [720, 720],
+  [1080, 1080],
+]
+
 function validateSpec(spec: ComposeSpec): void {
-  if (
-    !(spec.width === 1280 && spec.height === 720) &&
-    !(spec.width === 1920 && spec.height === 1080)
-  ) {
-    throw new ComposeSpecError('resolution must be 1280x720 or 1920x1080')
+  if (!CANVASES.some(([w, h]) => spec.width === w && spec.height === h)) {
+    throw new ComposeSpecError(
+      `resolution must be one of ${CANVASES.map(([w, h]) => `${w}x${h}`).join(', ')}`,
+    )
   }
   if (![24, 25, 30].includes(spec.fps)) throw new ComposeSpecError('fps must be 24, 25 or 30')
   if (!Array.isArray(spec.clips) || spec.clips.length < 1 || spec.clips.length > LIMITS.maxClips) {

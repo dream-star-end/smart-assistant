@@ -7,7 +7,7 @@
 ## 0. 原则
 1. **编排放在 master，状态放在 PG**。扛得住容器回收、A/B 两个 master 并存和发布切换。
 2. **LLM 只做“步骤函数”**（Plan、Prompt、Script、QA、Interpret），全部是无状态调用，输出用 zod 校验。是否推进、是否重试、是否扣费由确定性的状态机决定。
-3. **计费复用各 provider 现有的账本**（GPT 图片、Muse、MiniMax、Grok 视觉）。工作台只记项目级汇总，并新增唯一一个自有扣费项：合成（ledger reason `media_studio`）。
+3. **计费复用各 provider 现有的账本**（GPT 图片、Muse、MiniMax、Grok 视觉）。工作台只记项目级汇总。**合成不收费**（用户 2026-10-23 21:42：合成由导演 agent 操作，只按 agent 的 token 用量计费，不加固定费；22:13：导出切换规格的重新合成免费），见 `docs/ocv5-591-a2-1c-compose-plan.md` §2。
 4. 默认关闭，按白名单灰度；合入后对现网零行为变化。
 
 ## 1. 拆成 4 个 PR（每个都过 Codex 和 CI）
@@ -55,7 +55,7 @@ studio_blob_refs(user_id fk cascade, sha256 fk, ref_kind, ref_id uuid, created_a
 studio_quota(scope text pk /* 'site' 或 'u:<id>' */, used_bytes bigint, reserved_bytes bigint, limit_bytes bigint)
 studio_step_results(request_id text pk, user_id, task_id uuid, output jsonb, blob_sha text null, created_at)
 studio_charges(id bigserial pk, user_id, project_id, request_id text, kind check(compose|music), cost_credits,
-  ledger_id fk null, created_at, unique(user_id, request_id))            -- 工作台自有扣费（合成、音乐）
+  ledger_id fk null, created_at, unique(user_id, request_id))            -- 工作台自有扣费（音乐生成预留；合成不收费，见 A2-1c 方案 §2）
 ```
 
 - `credit_ledger_reason_check` 增加 `media_studio`（写法同 0319 的放宽方式）。
@@ -76,7 +76,7 @@ studio_charges(id bigserial pk, user_id, project_id, request_id text, kind check
   - Muse（plan r2 P1-1：提交本身必须幂等）：A0 给 `MuseBridgeHub.submit` 增加一个可选参数 `jobId`。工作台传入**由 `exec_request_id` 确定性导出**的 id：`mj_<uuidv5(namespace, exec_request_id)>`，格式仍满足 `^mj_[0-9a-f-]{36}$`。hub 写入时用 `INSERT … ON CONFLICT (id) DO NOTHING`：如果这个 id 已存在且属于同一用户，直接返回已有的 job（不重复入队，也不重复扣费，因为扣费按 job 只发生一次）；属于别人则拒绝。这样即使“submit 成功、写 `provider_job_ref` 失败”，重领时算出的还是同一个 id，`submit` 返回原 job，接着 `view` 等待即可。`provider_job_ref` 只作为缓存，不再是正确性的前提。
   - MiniMax：结算对 `(user, request_id)` 唯一。崩溃发生在结算之后、结果落库之前时，重领会再调一次上游，但结算走 replay，**不会向用户重复扣费**（平台多付一次上游成本，可以接受，并会记日志）。
   - Grok（QA、Plan 等步骤）：`runGrokResponsesForUser` 接受外部传入的稳定 requestId。执行顺序是：上游 → **先把结果写进 `studio_step_results`** → 再结算（`usage_records` 对 `(user, request_id)` 唯一，结算本身幂等）→ 任务完成。重领时，如果 `studio_step_results` 里已经有结果，就只补做幂等结算，不再调上游；如果没有结果，说明还没结算过，可以重调。所以两种情况都不会重复扣费。
-  - ElevenLabs、合成：顺序是 生成 → 写 blob → 往 `studio_charges` 写 `(user, request_id)` 唯一的记录并扣费 → 完成。重领时先查 blob 和扣费记录。
+  - ElevenLabs：顺序是 生成 → 写 blob → 往 `studio_charges` 写 `(user, request_id)` 唯一的记录并扣费 → 完成。重领时先查 blob 和扣费记录。合成不扣费（A2-1c 方案 §2）。
 - **Muse 不在线时不能卡死（plan r1 P1-3）**：带亲和的任务入队时，设 `affinity_deadline = now() + 3 min`。过了期限，**任何**一个 slot 的 worker 都可以认领它，但只做“故障转移”：把任务标为 `failed`（`PROVIDER_OFFLINE`），由编排器改用备选（视频用 MiniMax Hailuo，并按其价格重新预留预算），或者在预算不够、没有备选时转为 `needs_user`。所以项目一定会收敛，不会永远停在 running。
 
 ## 4. 编排状态机（默认最高自动化）

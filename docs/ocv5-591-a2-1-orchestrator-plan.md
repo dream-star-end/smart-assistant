@@ -9,7 +9,7 @@
 |---|---|
 | **A2-1a** 引擎与规划 | worker（认领 / 续租 / 完成）、项目状态机、预算原子预留与对账、Plan 步骤（Grok，平台承担）、生成执行器（设定图、镜头首帧、镜头视频、逐句配音，全部经 A2-0 注册表）、`POST /projects/:id/start|approve`、`POST /takes/:id/select` |
 | **A2-1b** 质检与批注 | QA 步骤（合成沙箱抽帧 → sharp 拼联系表 → Grok 视觉，按用户计费）及重试 / needs_user 逻辑、批注 API（`POST /annotations`、`POST /annotations/:id/send`）、Interpret 步骤与指令白名单 |
-| **A2-1c** 合成与推送 | 合成任务（OCV5-588 沙箱 + `studio_charges` 扣费，ledger reason `media_studio`）、成片 QA、`sys.studio_event` 推送（protocol / userChatBridge / web 端）|
+| **A2-1c** 合成与推送 | 合成任务（OCV5-588 沙箱；**不收费**：用户 2026-10-23 21:42 / 22:13，见 `docs/ocv5-591-a2-1c-compose-plan.md`）、成片 QA、`sys.studio_event` 推送（protocol / userChatBridge / web 端，A2-1c-2）|
 | FE-4（前端，单独 PR） | 启用「全自动开始」、批注「交给 agent」、选版本等按钮，接 A2-1 的新接口；推送到达前继续轮询 |
 
 本文给出三块的整体设计；Codex 方案审查针对整份文档。实现按 a → b → c 的顺序。

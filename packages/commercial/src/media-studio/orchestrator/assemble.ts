@@ -46,6 +46,7 @@ export function startStudioOrchestrator(input: {
         description: v.description,
       })),
     museOnline: () => input.museHub?.bridgeOnline() ?? false,
+    ...(studio.compose ? { compose: studio.compose } : {}),
     log,
     slot: process.env.OC_SLOT?.trim() || 'A',
   })
@@ -55,12 +56,14 @@ export function startStudioOrchestrator(input: {
     {
       pool: input.pool,
       providers: studio.providers,
+      ...(studio.compose ? { compose: studio.compose } : {}),
     },
   )
   worker.start()
   log.info('studio_orchestrator_started', {
     owner: worker.owner,
     planner: input.grok ? 'grok' : 'missing',
+    compose: studio.compose?.configured() ? 'sandbox' : 'missing',
   })
   return { stop: () => worker.stop() }
 }

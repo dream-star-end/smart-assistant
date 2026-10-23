@@ -63,6 +63,10 @@ export interface DState {
   musicSkippedNoted: boolean
   /** Media kinds with a provider that can take work now or queue it. */
   canDispatch: { image: boolean; video: boolean; voice: boolean; music: boolean }
+  /** OCV5-591 A2-1c: the compose sandbox is configured. */
+  canCompose: boolean
+  /** A compose task of this project is queued or leased. */
+  composeQueued: boolean
 }
 
 export interface Dispatch {
@@ -84,6 +88,8 @@ export type Action =
   | { type: 'adopt_video'; shotId: string; takeId: string }
   | { type: 'line_status'; lineId: string; status: DLine['status'] }
   | { type: 'note_music_skipped' }
+  /** Everything is ready: the director composes the film (A2-1c). */
+  | { type: 'enqueue_compose' }
 
 const BIBLE_KINDS = new Set(['character', 'scene', 'style'])
 
@@ -237,8 +243,13 @@ export function decide(s: DState): Action[] {
     s.shots.length > 0 && s.shots.every((sh) => shotDone(s, sh) || adopted.has(sh.id))
   const allLines = s.lines.every((l) => l.status === 'ready' && l.activeTakeId)
   if (allShots && allLines && s.inflight === 0 && !dispatched) {
-    // Compose lands in A2-1c; until then the project waits for it.
-    actions.push({ type: 'set_status', status: 'awaiting_user', reason: 'compose_pending' })
+    // A2-1c: the director composes the film itself; without a sandbox the project waits.
+    if (!s.canCompose) {
+      actions.push({ type: 'set_status', status: 'awaiting_user', reason: 'compose_pending' })
+    } else {
+      if (!s.composeQueued) actions.push({ type: 'enqueue_compose' })
+      actions.push({ type: 'set_status', status: 'composing' })
+    }
   } else if (blocked && s.inflight === 0 && !dispatched) {
     actions.push({ type: 'set_status', status: 'awaiting_user', reason: 'needs_user' })
   }

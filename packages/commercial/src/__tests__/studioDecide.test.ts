@@ -35,6 +35,8 @@ function state(over: Partial<DState> = {}): DState {
     narrationVoiceId: 'male-qn-jingying',
     musicSkippedNoted: true,
     canDispatch: { image: true, video: true, voice: true, music: false },
+    canCompose: false,
+    composeQueued: false,
     ...over,
   }
 }
@@ -201,5 +203,26 @@ describe('decide (OCV5-591 A2-1a)', () => {
       { type: 'set_status', status: 'awaiting_user', reason: 'needs_user' },
     ])
     assert.deepEqual(decide({ ...stuck, inflight: 1 }), [])
+  })
+
+  it('A2-1c: everything ready → the director composes once; without a sandbox the project waits', () => {
+    const ready = state({
+      shots: [{ id: 's0', ordinal: 0, status: 'ready', activeTakeId: 'v1', frameTakeId: null }],
+      takes: [take({ id: 'v1', ownerKind: 'shot_video' })],
+      canCompose: true,
+    })
+    assert.deepEqual(decide(ready), [
+      { type: 'enqueue_compose' },
+      { type: 'set_status', status: 'composing' },
+    ])
+    assert.deepEqual(decide({ ...ready, composeQueued: true }), [
+      { type: 'set_status', status: 'composing' },
+    ])
+    assert.deepEqual(decide({ ...ready, status: 'composing' }), [])
+    assert.deepEqual(decide({ ...ready, canCompose: false }), [
+      { type: 'set_status', status: 'awaiting_user', reason: 'compose_pending' },
+    ])
+    // Nothing composes while a generation is still in flight.
+    assert.ok(!decide({ ...ready, inflight: 1 }).some((a) => a.type === 'enqueue_compose'))
   })
 })

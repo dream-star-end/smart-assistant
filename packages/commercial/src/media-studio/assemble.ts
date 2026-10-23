@@ -5,6 +5,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import type { Pool } from 'pg'
 
+import Docker from 'dockerode'
 import { makeImage2Runner } from '../billing/image2Run.js'
 import { parseImageModelPolicy } from '../billing/imageModels.js'
 import type { PreCheckRedis } from '../billing/preCheck.js'
@@ -13,7 +14,9 @@ import { rootLogger } from '../logging/logger.js'
 import { resolveMiniMaxMediaKey } from '../minimax/mediaKey.js'
 import type { MuseBridgeHub } from '../muse/hub.js'
 import { studioAccess } from './access.js'
+
 import { StudioBlobStore } from './blobs.js'
+import { ComposeRunner, type DockerLike, pgHostLock } from './compose/runner.js'
 import { STUDIO_GC_INTERVAL_MS, runStudioGc } from './gc.js'
 import type { StudioHttpDeps } from './http.js'
 import { BUILTIN_ADAPTERS, type BuiltinAdapterDeps } from './providers/adapters/index.js'
@@ -104,5 +107,19 @@ export async function createStudioFromConfig(
     deps,
     warn,
   })
-  return { access, store: new StudioStore(pool), blobs, providers }
+  // OCV5-591 A2-1c: the compose sandbox, only when its exact image is configured (OCV5-588).
+  const compose = cfg.OC_STUDIO_FFMPEG_IMAGE_ID
+    ? new ComposeRunner({
+        docker: new Docker() as unknown as DockerLike,
+        imageId: cfg.OC_STUDIO_FFMPEG_IMAGE_ID,
+        root,
+        maxConcurrent: cfg.OC_STUDIO_COMPOSE_CONCURRENCY ?? 2,
+        hostLock: pgHostLock(pool),
+      })
+    : undefined
+  if (compose)
+    void compose
+      .sweepStale()
+      .catch((err) => log.warn('studio_compose_sweep_failed', { err: err as Error }))
+  return { access, store: new StudioStore(pool), blobs, providers, ...(compose ? { compose } : {}) }
 }

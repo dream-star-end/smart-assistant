@@ -9,6 +9,7 @@ import type { Logger } from '../../logging/logger.js'
 import { STUDIO_TASK_HARD_TIMEOUT_MS } from '../providers/charges.js'
 import { type StudioTask, claimStudioTasks, renewStudioTask } from '../queue.js'
 import { type AdvanceDeps, advanceProject } from './advance.js'
+import type { ComposeRunnerLike } from './compose.js'
 import { type ExecuteDeps, LeaseLostError, executeTask } from './execute.js'
 import { RECONCILE_INTERVAL_MS, reconcileCharges } from './reconcile.js'
 
@@ -19,6 +20,8 @@ const RENEW_EVERY_MS = 30_000
 const SWEEP_EVERY_MS = 30_000
 
 export interface WorkerDeps extends ExecuteDeps, AdvanceDeps {
+  /** Both sides read the sandbox; the executor needs the full runner. */
+  compose?: ComposeRunnerLike
   pool: Pool
   museOnline: () => boolean
   log: Logger
