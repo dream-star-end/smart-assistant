@@ -114,6 +114,13 @@ test('task polish user flows (real Chromium, isolated)', { timeout: 240_000 }, a
           assert.equal(await page.getByTestId('ticket-comment-expand').getAttribute('aria-expanded'), 'true')
           await page.getByText('PAID_RESULT_END', { exact: true }).waitFor()
           assert.equal((await page.evaluate(() => window.historyStats())).fullReads, 1)
+          await page.getByTestId('ticket-drawer-close').click()
+          await page.getByTestId('ticket-drawer').waitFor({ state: 'hidden' })
+          await page.evaluate(() => window.reopenHistory())
+          await page.getByTestId('ticket-comment-expand').waitFor()
+          await page.getByTestId('ticket-comment-expand').click()
+          await page.getByText('PAID_RESULT_END', { exact: true }).waitFor()
+          assert.equal((await page.evaluate(() => window.historyStats())).fullReads, 1)
           assert.deepEqual(errors, [])
         } finally { await context.close() }
       })

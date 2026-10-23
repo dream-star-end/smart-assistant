@@ -152,6 +152,7 @@ function ExecutionDrawer() {
 }
 function ResultHistoryDrawer() {
   const [row, setRow] = useState(() => ticket(5, 'blocked'))
+  const [open, setOpen] = useState(true)
   const [server] = useState(() => ({ newest: 520, reads: 0, earlier: [] as string[], fullReads: 0 }))
   const record = (n: number): TimelineItem => ({ kind: 'activity', createdAt: 10000 + n * 600000, activity: { id: `activity-${n}`, ticketId: row.id, actor: 'system', actorId: 'system', action: `HISTORY_RECORD_${n}`, field: null, fromValue: null, toValue: null, runId: null, createdAt: 10000 + n * 600000 } })
   const current = { id: 'old-created-paid', ticketId: row.id, stageId: stage.id, agentId: 'main', trigger: 'manual', status: 'failed', createdAt: 1, startedAt: 1, finishedAt: 2, outputMd: null, summary: null, settling: false, actualModels: ['actual-paid'], costUsd: null, costImprecise: true } as TicketRun
@@ -167,9 +168,10 @@ function ResultHistoryDrawer() {
   }
   taskboardApi.getRun = async () => { server.fullReads += 1; return { ...current, outputMd: output } }
   taskboardApi.listRuns = async () => { throw new Error('Modern window must not load legacy runs') }
+  control.reopenHistory = () => setOpen(true)
   control.historyStats = () => ({ reads: server.reads, earlier: server.earlier, fullReads: server.fullReads })
   control.burstHistory = () => { server.newest = 670; document.dispatchEvent(new Event('visibilitychange')) }
-  return <TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => {}} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={setRow} />
+  return <TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={setRow} />
 }
 const scenario = new URLSearchParams(location.search).get('scenario')
 createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : scenario === 'execution' ? <ExecutionDrawer /> : scenario === 'history' ? <ResultHistoryDrawer /> : <Drawer />}</ToastProvider></TooltipProvider>)

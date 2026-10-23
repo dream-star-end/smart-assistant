@@ -115,7 +115,11 @@ describe('timeline history coverage', () => {
   test('unchanged window responses preserve loaded history and the older cursor', async () => {
     let latest = page(81, 100, 'b81')
     const fetch = vi.fn(async (_id: string, options?: { before?: string }) =>
-      options?.before ? page(61, 80, 'b61') : latest,
+      options?.before
+        ? options.before === 'b81'
+          ? page(61, 80, 'b61')
+          : page(41, 60, 'b41')
+        : latest,
     )
     const history = new TimelineHistory(fetch)
     await accept(history)

@@ -194,7 +194,8 @@ export function TicketDrawer({
   const [resultError, setResultError] = useState(false)
   const scrollContainer = useRef<HTMLDivElement>(null)
   const paintedOwnerRef = useRef<string | null>(null)
-  if (paintedOwnerRef.current !== ownerLookup || (!open && paintedOwnerRef.current !== null)) {
+  const paintedOwner = open ? ownerLookup : null
+  if (paintedOwnerRef.current !== paintedOwner) {
     setDescriptionOpen(desktop)
     if (resultError) setResultError(false)
     if (detail) setDetail(null)
@@ -208,7 +209,7 @@ export function TicketDrawer({
     if (execution) setExecution(null)
     if (stopState) setStopState(null)
     if (executionNeedsSetup) setExecutionNeedsSetup(false)
-    paintedOwnerRef.current = open ? ownerLookup : null
+    paintedOwnerRef.current = paintedOwner
   }
   const current =
     belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
