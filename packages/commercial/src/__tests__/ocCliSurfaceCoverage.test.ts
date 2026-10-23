@@ -545,6 +545,9 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     schema: reviewProbe(['schema'], 0, /ReviewFile/),
     collate: reviewProbe(['collate'], 2, /collate --dir/),
   },
+  'oc-system': {
+    skill: scriptProbe('oc-system.py', ['skill', 'preferences'], { code: 0, stdout: /用户偏好设置/ }),
+  },
   'oc-skill': {
     train: skillProbe(['train', 'demo', '--confirm'], 'request'),
     'train-status': skillProbe(['train-status', 'run-1'], 'request'),
@@ -957,6 +960,7 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-rank': tsDispatchCommands('packages/gateway/src/ocRankCli.ts', 'cmd'),
     'oc-report': singlePurpose('packages/gateway/src/ocReportCli.ts', 'render', /usage: oc-report/),
     'oc-review': tsDispatchCommands('packages/gateway/src/ocReviewCli.ts', 'cmd'),
+    'oc-system': pythonArgparseCommands('packages/commercial/agent-sandbox/platform-runtime/bin/oc-system.py'),
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
     'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),
