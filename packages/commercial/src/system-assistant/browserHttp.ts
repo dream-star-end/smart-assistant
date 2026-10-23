@@ -29,7 +29,8 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
   return async (req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     const path = new URL(req.url ?? '/', 'http://system-actions.invalid').pathname
-    const read = readPath.exec(path), write = writePath.exec(path)
+    const read = readPath.exec(path)
+    const write = writePath.exec(path)
     if (!read && !write) throw new HttpError(404, 'NOT_FOUND', '操作不存在。')
     try {
       if (read) {
@@ -44,7 +45,8 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
       // Origin / Fetch Metadata / independent HttpOnly refresh proof are checked on every POST.
       const principal = await requireBrowserConfirmationPrincipal(req, deps)
       const body = await readJsonBody(req, 16 * 1024)
-      const id = write![1]!, action = write![2]!
+      const id = write![1]!
+      const action = write![2]!
       if (action === 'deny') {
         parse(z.object({}).strict(), body)
         sendJson(res, 200, deps.service.deny(principal, id))

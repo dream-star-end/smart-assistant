@@ -219,7 +219,7 @@ export async function patchPreferences(
     values = values.replace('WHERE\n      ', 'WHERE EXISTS (SELECT 1 FROM eligible_user) AND (\n      ') + ')';
     conflictGuard += ' AND EXISTS (SELECT 1 FROM eligible_user)';
   }
-  let r;
+  let r: { rows: { prefs: unknown; updated_at: Date }[] };
   try {
     r = await query<{ prefs: unknown; updated_at: Date }>(
       `${prefix}INSERT INTO user_preferences (user_id, prefs, updated_at)

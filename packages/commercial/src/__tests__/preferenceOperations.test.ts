@@ -14,7 +14,11 @@ const actor: SystemActor = { userId: '765', role: 'user', sessionId: 'synthetic-
 const principal: BrowserConfirmationPrincipal = { id: '765', role: 'user', accessJti: 'synthetic-jti', accessExpiresAt: 9999999999, refreshFamilyId: randomUUID(), refreshSessionId: '19' }
 function fixture(t: import('node:test').TestContext) {
   let prefs: Preferences = { intelligent_ui: true }
-  let version = 1, writes = 0, eligible = true, allowed = true, brokerReady = true
+  let version = 1
+  let writes = 0
+  let eligible = true
+  let allowed = true
+  let brokerReady = true
   const registry = new SystemOperationRegistry(preferenceOperations({
     authorize: async a => { assert.equal(a.userId, '765'); if (!allowed) throw new SystemOperationRejected('FORBIDDEN') },
     privacySupported: async () => true,
