@@ -34,7 +34,7 @@ import {
   sentDetail,
   sentState,
 } from '../../../lib/studio/annotations'
-import { studioApi, studioErrorText } from '../../../lib/studio/api'
+import { StudioApiError, studioApi, studioErrorText } from '../../../lib/studio/api'
 import { formatCredits, formatTimecode } from '../../../lib/studio/format'
 import { qaScoreOf, shotCard, takesOf } from '../../../lib/studio/model'
 import { MODERATION_TEXT, qaView, recommendedTakes } from '../../../lib/studio/qa'
@@ -132,10 +132,24 @@ function ShotReview(props: {
   )
   const mine = drafts.filter((d) => d.takeId === take?.id)
   // FE-7b: what was handed to the agent on this version, newest first.
-  const sent = (view.annotations ?? []).filter((a) => a.takeId === take?.id)
+  const localIds = new Set(drafts.flatMap((d) => (d.serverId ? [d.serverId] : [])))
+  const sent = (view.annotations ?? []).filter((a) => a.takeId === take?.id && !localIds.has(a.id))
   const toast = useToast()
   const [busy, setBusy] = useState(false)
-  /** Create each draft on the server and send it; a sent draft leaves this tab. */
+  /** Change the stored drafts from the latest state (never a snapshot taken before an await). */
+  const updateDrafts = useCallback(
+    (fn: (cur: AnnotationDraft[]) => AnnotationDraft[]) =>
+      setDrafts((cur) => {
+        const next = fn(cur)
+        saveDrafts(view.project.id, next)
+        return next
+      }),
+    [view.project.id],
+  )
+  /**
+   * Create each draft on the server (once — its server id is kept on the draft, FE-7b r1) and send
+   * it; a sent draft leaves this tab. "Already sent" (a lost response) counts as sent.
+   */
   const handOver = async (ids: string[]) => {
     if (busy) return
     const ready = drafts.filter((d) => ids.includes(d.id) && d.text.trim())
@@ -144,21 +158,28 @@ function ShotReview(props: {
       return
     }
     setBusy(true)
-    const done: string[] = []
+    let sentCount = 0
     try {
       for (const d of ready) {
-        const { id } = await studioApi.createAnnotation(auth, view.project.id, draftToBody(d))
-        await studioApi.annotationAction(auth, id, 'send')
-        done.push(d.id)
+        let serverId = d.serverId
+        if (!serverId) {
+          serverId = (await studioApi.createAnnotation(auth, view.project.id, draftToBody(d))).id
+          const sid = serverId
+          updateDrafts((cur) => cur.map((x) => (x.id === d.id ? { ...x, serverId: sid } : x)))
+        }
+        try {
+          await studioApi.annotationAction(auth, serverId, 'send')
+        } catch (err) {
+          if (!(err instanceof StudioApiError && err.code === 'ANNOTATION_NOT_DRAFT')) throw err
+        }
+        updateDrafts((cur) => cur.filter((x) => x.id !== d.id))
+        setSelected((sel) => (sel === d.id ? null : sel))
+        sentCount += 1
       }
-      toast(ready.length > 1 ? `${ready.length} 条批注已交给 agent` : '批注已交给 agent', 'success')
+      toast(sentCount > 1 ? `${sentCount} 条批注已交给 agent` : '批注已交给 agent', 'success')
     } catch (err) {
       toast(studioErrorText(err), 'error')
     } finally {
-      if (done.length) {
-        persist(drafts.filter((d) => !done.includes(d.id)))
-        if (selected && done.includes(selected)) setSelected(null)
-      }
       setBusy(false)
       props.onReload?.()
     }
@@ -684,7 +705,7 @@ function ShotReview(props: {
                               不采用
                             </button>
                           </div>
-                        ) : st === 'not_understood' ? (
+                        ) : st === 'not_understood' || st === 'unsent' ? (
                           <div className="st-row" style={{ gap: 8, marginTop: 8 }}>
                             <button
                               type="button"

@@ -21,6 +21,8 @@ export interface AnnotationDraft {
   tEnd?: number
   text: string
   createdAt: number
+  /** Created on the server already (FE-7b r1): a retry only sends it, never creates it twice. */
+  serverId?: string
 }
 
 export const ANNOTATION_TEXT_MAX = 1000
@@ -128,6 +130,7 @@ export function draftToBody(d: AnnotationDraft): AnnotationBody {
 }
 
 export type SentState =
+  | 'unsent'
   | 'interpreting'
   | 'understood'
   | 'running'
@@ -137,6 +140,7 @@ export type SentState =
   | 'failed'
 
 export const SENT_LABEL: Record<SentState, string> = {
+  unsent: '还没交给 agent',
   interpreting: 'agent 理解中',
   understood: '等你确认',
   running: '执行中',
@@ -147,6 +151,7 @@ export const SENT_LABEL: Record<SentState, string> = {
 }
 
 export function sentState(a: StudioAnnotation): SentState {
+  if (a.status === 'draft') return 'unsent'
   if (a.status === 'applied') return 'applied'
   if (a.status === 'rejected') return 'rejected'
   const i = a.interpretation

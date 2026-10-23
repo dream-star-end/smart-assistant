@@ -14,6 +14,14 @@ vi.mock('../../lib/studio/api', () => ({
     annotationAction: (...a: unknown[]) => annotationAction(...(a as [])),
   },
   studioErrorText: () => '出错了',
+  StudioApiError: class StudioApiError extends Error {
+    constructor(
+      readonly status: number,
+      readonly code: string,
+    ) {
+      super(code)
+    }
+  },
 }))
 
 import type { StudioProjectView, StudioTake } from '../../lib/studio/types'
@@ -156,6 +164,28 @@ describe('ReviewPage hand over to the agent (OCV5-593 FE-7b)', () => {
     })
     expect(annotationAction).toHaveBeenCalledWith(auth, 'srv1', 'send')
     expect(sessionStorage.getItem('oc.studio.annotationDrafts.p')).toBeNull()
+  })
+
+  test('a send that fails keeps the draft with its server id; the retry only sends (FE-7b r1)', async () => {
+    createAnnotation.mockClear()
+    annotationAction.mockClear()
+    annotationAction.mockRejectedValueOnce(new Error('503'))
+    render(
+      <ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} onReload={() => {}} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '点' }))
+    fireEvent.pointerDown(box(), { clientX: 250, clientY: 125, pointerId: 1 })
+    await screen.findByRole('dialog', { name: '批注 1' })
+    fireEvent.change(screen.getByLabelText('批注说明'), { target: { value: '眼睛别看镜头' } })
+    fireEvent.click(screen.getByTestId('hand-over'))
+    await waitFor(() => expect(annotationAction).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('hand-over')).toBeEnabled())
+    const kept = JSON.parse(sessionStorage.getItem('oc.studio.annotationDrafts.p')!)
+    expect(kept[0].serverId).toBe('srv1')
+    fireEvent.click(screen.getByTestId('hand-over'))
+    await waitFor(() => expect(annotationAction).toHaveBeenCalledTimes(2))
+    expect(createAnnotation).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(sessionStorage.getItem('oc.studio.annotationDrafts.p')).toBeNull())
   })
 
   test('what the agent understood is shown; 确认执行 applies it, 不采用 rejects it', async () => {
