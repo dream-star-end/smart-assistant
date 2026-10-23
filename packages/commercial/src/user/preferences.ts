@@ -32,6 +32,7 @@
  *   - 不做合并冲突保护(冲突几率 ≈ 同一用户两个 tab 同时改;最坏后果 = 后写覆盖前写)
  */
 
+import { scanMemoryContent } from "@openclaude/storage";
 import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
 import { z } from "zod";
 import { query } from "../db/queries.js";
@@ -51,6 +52,13 @@ const disabledPluginsSchema = z
   .array(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "invalid plugin slug"))
   .max(200)
   .refine((a) => new Set(a).size === a.length, { message: "duplicate plugin slug" });
+
+/** Explicit nickname consent is scoped to one conversation; absent means disabled. */
+const assistantProfileSchema = z.object({
+  enabled: z.boolean(),
+  nickname: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/).refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
+  sessionId: z.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/),
+}).strict();
 
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
@@ -72,6 +80,8 @@ export const PreferencesSchema = z
     input_prediction: z.boolean().optional(),
     disabled_plugins: disabledPluginsSchema.optional(),
     enabled_plugins: disabledPluginsSchema.optional(),
+    system_assistant_profile: assistantProfileSchema.optional(),
+    system_assistant_recommendations: z.boolean().optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -97,6 +107,8 @@ export const PreferencesPatchSchema = z
     input_prediction: z.boolean().nullable().optional(),
     disabled_plugins: disabledPluginsSchema.nullable().optional(),
     enabled_plugins: disabledPluginsSchema.nullable().optional(),
+    system_assistant_profile: assistantProfileSchema.nullable().optional(),
+    system_assistant_recommendations: z.boolean().nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;

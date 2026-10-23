@@ -2122,6 +2122,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
               {err}
             </Alert>
           )}
+          <p className="text-meta leading-relaxed text-muted">画像供助手在需要时查阅，不自动整篇发送。称呼可在“偏好 → 隐私与助手”中按会话授权；此处保存不会更改该授权。</p>
           <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}

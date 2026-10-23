@@ -72,6 +72,7 @@ function useVisibleSections(user: User | null) {
  * 不是 `/settings` 路由。教程深链仍走 `openSettings(section)`。
  */
 export function SettingsCenter({
+  activeSessionId,
   open,
   auth,
   user,
@@ -86,6 +87,7 @@ export function SettingsCenter({
   initialSection = "account",
   subscribeOpenSignal = 0,
 }: {
+  activeSessionId?: string;
   open: boolean;
   auth: AuthSession | null;
   user: User | null;
@@ -239,6 +241,7 @@ export function SettingsCenter({
             className="min-h-0 min-w-0 flex-1 overflow-y-auto outline-none"
           >
             <SettingsPanel
+              activeSessionId={activeSessionId}
               section={section}
               auth={auth}
               user={user}
@@ -274,6 +277,7 @@ export function SettingsCenter({
 }
 
 function SettingsPanel({
+  activeSessionId,
   section,
   auth,
   user,
@@ -290,6 +294,7 @@ function SettingsPanel({
   feedbackContext,
   onOpenProjectSettings,
 }: {
+  activeSessionId?: string;
   section: SettingsSection;
   auth: AuthSession | null;
   user: User | null;
@@ -363,6 +368,7 @@ function SettingsPanel({
           </div>
         ) : (
           <PreferencesTab
+            activeSessionId={activeSessionId}
             auth={auth}
             prefs={prefs}
             theme={theme}

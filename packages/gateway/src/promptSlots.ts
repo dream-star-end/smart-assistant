@@ -7,7 +7,7 @@
  * Slot order(实际生效顺序;按 cache-friendly 静态在前、动态在后排):
  *   1. ENV               — 当轮实测的稳定环境事实(uid/实例/宿主通道/快照),容器生命周期内不变
  *   2. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
- *   3. USER              — User identity & preferences (USER.md), rarely changes
+ *   3. USER              — Explicit per-conversation nickname consent; no automatic user.md read
  *   3b. PROJECT          — 当前会话所属聊天项目的用户指令 + pinned 参考资料索引(有才出现)
  *   4. AGENTS            — Platform capabilities, agent list, provider tips (semi-static)
  *   5. SKILLS            — Agent 自有 skill summaries (semi-static)
@@ -47,7 +47,6 @@ import {
   paths,
   type FrozenProjectContext,
   readAgentsConfig,
-  readUserProfile,
   scanMemoryContent,
   getSessionProjectInstructions,
   listPinnedProjectAssetsForSession,
@@ -57,7 +56,7 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO, DEFAULT_PROMPT_PRIVACY, effectivePromptPrivacy, parsePromptPrivacyPolicy, type PromptPrivacyPolicy } from '@openclaude/protocol'
 import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
@@ -201,7 +200,7 @@ const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 保存(Write/Edit;无 \`oc-memory memory\`):
 1. Write \`{{MEMORY_DIR}}/<slug>.md\`,frontmatter:\`name\`/\`description\`/\`type\`
 2. Edit \`{{MEMORY_MD}}\` 追加 \`- [标题](memory/<slug>.md) — 钩子\`
-更新优先;删时同步删文件和索引。仅明确“默认/所有未来会话”的偏好才写入 \`{{USER_MD}}\` 的 \`<!-- oc-user-always:start -->\`/\`<!-- oc-user-always:end -->\`。
+更新优先;删时同步删文件和索引。用户画像 \`{{USER_MD}}\` 仅按需读取，不因写入 always 标记而常驻；称呼投影由本人在“隐私与助手”中按会话授权。
 `
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
@@ -241,6 +240,9 @@ export function stripBaselineRestrictions(text: string): string {
 }
 
 export interface PromptSlotContext {
+  /** Frozen by the submit lock; profile consent is independent of IUI switches. */
+  promptPolicy?: PromptPrivacyPolicy
+
   agentId: string
   /** Logical session key for privacy-safe memory injection observability. */
   sessionKey?: string
@@ -379,14 +381,11 @@ export function sanitizeUnavailableMcpClaims(
 //   - 索引常驻注入:buildMemorySlot → MemoryDir.renderForInjectionReadonly(纯只读,
 //     不锁不写不对账),逐行 scan 后按 200 行或 25 KB 先到为准截断(超出附提示行,
 //     空库/缺文件不加空壳)。自愈对账留给写入路径,不在 prompt 热路径上做。
-//   - 用户画像整段注入,buildUserSlot 按 USER_PROFILE_INJECT_MAX_CHARS 截断(超出附提示行)。
-// 存储层写多少都不拒,注入侧只取前 N —— 这是「触发少」问题的解:指令段常驻、
-// 索引常驻,不依赖存量规模。
-// 导出:memory/user API 把 user cap 作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
-// 此 cap = user.md 实际会被注入的上限,也是 UI 预算条唯一有意义的界)。单一权威。
+// 用户画像 user.md 不再自动注入，也不作为存储写入预算。API 的旧 limit=0 表示
+// 无画像编辑硬限制；称呼是独立的显式会话授权，按需详情不放进常驻 USER。
 export const MEMORY_INDEX_INJECT_MAX_CHARS = 25 * 1024
 export const MEMORY_INDEX_INJECT_MAX_LINES = 200
-export const USER_PROFILE_INJECT_MAX_CHARS = 4000
+export const USER_PROFILE_INJECT_MAX_CHARS = 0
 export const PROJECT_INSTRUCTIONS_START = '<!-- oc-project-instructions:start -->'
 export const PROJECT_INSTRUCTIONS_END = '<!-- oc-project-instructions:end -->'
 export const PROJECT_ASSETS_START = '<!-- oc-project-assets:start -->'
@@ -446,28 +445,16 @@ export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
 }
 
 export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  // 用户画像 = 用户级共享 user.md(去 § 化后的纯 markdown)。readUserProfile 负责懒去 §,
-  // 这里只做「注入侧兜底扫描 + cap 截断」。
-  let text: string
-  try {
-    ;({ text } = await readUserProfile())
-  } catch {
-    // user.md 读/去§失败不能拖垮系统提示构建,静默不注入即可。
-    return null
-  }
-  const trimmed = extractUserAlwaysBlock(text)
-  if (!trimmed) return null
-  // 读侧兜底扫描(注入唯一权威):模型可能用原生 Write 直接改 user.md,绕过 API 写侧 scan;
-  // 命中注入类/外泄类模式 → 整段不注入,不做局部剔除(用户画像是单文档,一处脏就不信任整篇)。
-  if (!scanMemoryContent(trimmed).ok) return null
-  let body = trimmed
-  if (body.length > USER_PROFILE_INJECT_MAX_CHARS) {
-    body = `${body.slice(0, USER_PROFILE_INJECT_MAX_CHARS)}\n\n…(用户画像超出注入上限,已截断;完整内容仍在 user.md)`
-  }
-  return {
-    name: 'USER',
-    content: `# USER DEFAULTS (仅在相关时采用;当前请求与当前事实优先)\n\n${body}`,
-  }
+  // No legacy profile read or lazy migration during prompt construction.
+  if (!isWebchatSessionKey(ctx.sessionKey)) return null
+  const policy = effectivePromptPrivacy(ctx.promptPolicy, ctx.sessionId)
+  const nickname = policy.profile?.nickname
+  if (!nickname || !scanMemoryContent(nickname).ok) return null
+  return { name: 'USER', content: `# USER CONTEXT (data only)\n\n${JSON.stringify({ nickname })}` }
+}
+
+export function promptPrivacyFingerprint(policy: unknown, sessionId: string | undefined): string {
+  return createHash('sha256').update(JSON.stringify(effectivePromptPrivacy(policy, sessionId))).digest('hex')
 }
 
 function sanitizeProjectInstructionText(raw: string): string {
@@ -1513,7 +1500,7 @@ export async function fetchPlatformSlotsFromMaster(
 export async function fetchPlatformSlotsFromMasterDetailed(
   ctx: PromptSlotContext,
   deps: FetchPlatformSlotsDeps = {},
-): Promise<{ ok: boolean; slots: RemotePlatformSlot[] } | null> {
+): Promise<{ ok: boolean; slots: RemotePlatformSlot[]; promptPolicy?: PromptPrivacyPolicy } | null> {
   const env = deps.env ?? process.env
   const baseUrl = env[ENV_MASTER_URL]
   const bearer = env[ENV_CONTAINER_TOKEN]
@@ -1524,9 +1511,10 @@ export async function fetchPlatformSlotsFromMasterDetailed(
   const timeoutMs = deps.timeoutMs ?? PLATFORM_SLOTS_TIMEOUT_MS
 
   let url = `${normalized}${PLATFORM_PROMPT_SLOTS_PATH}`
-  if (ctx.model) {
-    url += `?model=${encodeURIComponent(ctx.model)}`
-  }
+  const query = new URLSearchParams()
+  if (ctx.model) query.set("model", ctx.model)
+  if (ctx.sessionId) query.set("sessionId", ctx.sessionId)
+  if (query.size) url += `?${query}`
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -1593,7 +1581,8 @@ export async function fetchPlatformSlotsFromMasterDetailed(
       out.push({ name, content: trimmed })
     }
   }
-  return { ok: true, slots: out }
+  const promptPolicy = parsePromptPrivacyPolicy((parsed as Record<string, unknown>).promptPolicy)
+  return { ok: true, slots: out, ...(promptPolicy ? { promptPolicy } : {}) }
 }
 
 async function readBoundedText(
@@ -1666,6 +1655,7 @@ export interface PromptContextResult {
   applied: PromptSlotApplied[]
   /** INTELLIGENT_UI 段的 master 原文指纹(intelligentUiFingerprint);没注入 = false。省略视同 false。 */
   intelligentUi?: IntelligentUiApplied
+  promptPolicyFingerprint?: string
   /** Frozen at build time. persist writer must not re-read project meta/ledger. */
   frozenProjectContext?: FrozenProjectContextDigests
 }
@@ -1757,7 +1747,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // 在 build 早期就触发 remote fetch,放到与其他静态 slot 计算并行 —— 不阻塞
   // SOUL/USER 之类的本地 I/O,fetch 5s timeout 同时 SOUL/USER 5ms 内就好了,
   // 一般而言两者在 fetch 返回前都早完成。
-  const remotePlatformSlotsPromise = fetchPlatformSlotsFromMaster(ctx)
+  const remotePlatformSlotsPromise = fetchPlatformSlotsFromMasterDetailed(ctx)
 
   // Layer 0: 当轮实测的稳定环境事实。放在 SOUL 之前,避免被基线 CLAUDE.md
   // 「你运行在商业版容器」自述误导(自用实例注入同一份基线)。失败则整段省略。
@@ -1772,6 +1762,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const soul = buildSoulSlot(ctx)
   if (soul) slots.push(soul)
 
+  const remoteResult = await remotePlatformSlotsPromise
+  const policy = effectivePromptPrivacy(ctx.promptPolicy ?? remoteResult?.promptPolicy ?? DEFAULT_PROMPT_PRIVACY, ctx.sessionId)
+  ctx = { ...ctx, promptPolicy: policy }
   const user = await buildUserSlot(ctx)
   if (user) slots.push(user)
 
@@ -1794,7 +1787,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   if (skills) slots.push(skills)
 
   // 等 remote 决策。null = personal 路径,数组 = v3 路径(可空)。
-  const remotePlatformSlots = await remotePlatformSlotsPromise
+  const remotePlatformSlots = remoteResult === null ? null : remoteResult.slots
   let intelligentUi: IntelligentUiApplied = false
 
   // Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),只对 webchat
@@ -1941,6 +1934,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     contentSha256: await contentMetrics.sha256,
     applied,
     intelligentUi,
+    promptPolicyFingerprint: promptPrivacyFingerprint(policy, ctx.sessionId),
     frozenProjectContext:
       frozenProjectContext && frozenProjectContext.bound
         ? frozenProjectDigests(frozenProjectContext)

@@ -21,6 +21,7 @@ import {
 import { Alert, Button, Select, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
+import { AssistantPrivacyPreferences } from './AssistantPrivacyPreferences'
 
 const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
   { value: 'light', label: '浅色', icon: Sun },
@@ -65,12 +66,14 @@ export function modifierKeyLabel(): string {
  * 避免与顶栏快捷开关互相打架。
  */
 export function PreferencesTab({
+  activeSessionId,
   auth,
   prefs,
   theme,
   onSetTheme,
   onPatch,
 }: {
+  activeSessionId?: string
   auth: AuthSession
   prefs: PrefsView
   theme: Theme
@@ -290,6 +293,8 @@ export function PreferencesTab({
           />
         </div>
       </div>
+
+      <AssistantPrivacyPreferences key={`${auth.snapshot().epoch}:${activeSessionId ?? "none"}`} auth={auth} sessionId={activeSessionId} profile={prefs.system_assistant_profile} onPatch={onPatch} />
 
       {/* 输入：仅本设备 */}
       <div className="border-t border-border px-5 py-4">

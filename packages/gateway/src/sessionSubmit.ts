@@ -1,3 +1,5 @@
+import { getDesiredPromptPrivacy, promptPrivacyNeedsRestart } from './promptPrivacyDesired.js'
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -774,6 +776,18 @@ export async function submit(
     // Intelligent UI(OCV5-361):CCB/Codex 的系统提示在 spawn 时写死;开关切换后第一轮
     // 并入同一次 shutdown → 本次 submit 以 resume 重启并重建提示。拉取失败不重启。
     // 按内容指纹比(输入预测 OCV5-375 与组件协议同在这一段,单关其中一个也要重建)。
+    const privacyRunner = session.runner as {
+      promptPolicyFingerprint?: string
+      assertPromptPrivacyStopped?: () => void
+      setPromptPrivacy?: (policy: PromptPrivacyPolicy) => void
+    }
+    let privacyChanged = false
+    if (typeof privacyRunner.setPromptPrivacy === 'function') {
+      // Fetch even when IUI and prediction are both off. The same snapshot goes to spawn.
+      const policy = await getDesiredPromptPrivacy(session.peerId)
+      privacyChanged = promptPrivacyNeedsRestart(privacyRunner.promptPolicyFingerprint, policy, session.peerId)
+      privacyRunner.setPromptPrivacy(policy)
+    }
     const iuiApplied = (session.runner as { promptIntelligentUi?: unknown }).promptIntelligentUi
     const iuiChanged =
       isIntelligentUiApplied(iuiApplied) &&
@@ -810,12 +824,17 @@ export async function submit(
         opts?.serviceTier === 'fast' ? 'fast' : null,
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
-    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || serviceTierChanged) {
+    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
       try {
         await session.runner.shutdown()
+        if (privacyChanged) {
+          if (!privacyRunner.assertPromptPrivacyStopped) throw new Error('无法核验旧进程是否已停止。')
+          privacyRunner.assertPromptPrivacyStopped()
+        }
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
       } catch (err) {
+        if (privacyChanged) throw new Error('助手隐私设置尚未生效，本轮未发送；请稍后重试或新建会话。', { cause: err })
         log.warn(
           'effort/model/toolsets-change shutdown failed',
           // CG7 — traceId tagged so submit-layer failures join the turn's

@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 // Test-only override of the spawn used to launch `codex app-server`. See
@@ -610,6 +611,13 @@ export class CodexAppServerRunner extends EventEmitter {
   public effortLevel: string | undefined = undefined
   /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 里 INTELLIGENT_UI 段的指纹(没有 = false)。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  private _promptPolicyFingerprint: string | undefined
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
+  assertPromptPrivacyStopped(): void {
+    if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
@@ -1048,9 +1056,11 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.sessionDir = null
     }
+    const privacyGeneration = this._preheatGeneration
     const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
     try {
       const overrides = await buildCodexLaunchOverrides({
+        promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1072,8 +1082,8 @@ export class CodexAppServerRunner extends EventEmitter {
         frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
       })
+      if (privacyGeneration !== this._preheatGeneration) throw new Error('PROMPT_PRIVACY_SPAWN_STALE')
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
-      this._promptIntelligentUi = overrides.intelligentUiApplied
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
@@ -1083,6 +1093,8 @@ export class CodexAppServerRunner extends EventEmitter {
           mode: 0o600,
         })
       }
+      this._promptIntelligentUi = overrides.intelligentUiApplied
+      this._promptPolicyFingerprint = overrides.promptPolicyFingerprint
       this.sessionDir = dir
       this.cachedOverrides = overrides
       return overrides
@@ -1522,6 +1534,7 @@ export class CodexAppServerRunner extends EventEmitter {
         if (overrides) argvOverrides = overrides.argvOverrides
       }
     } catch (err) {
+      if (this.promptPolicy) throw err
       log.warn(
         'codex app-server launch overrides build failed; spawning without platform context',
         {
