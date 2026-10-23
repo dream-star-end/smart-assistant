@@ -166,6 +166,13 @@ export class TimelineHistory {
     this.publish()
     return this.rows()
   }
+  pendingRuns(excludeId?: string): TicketRun[] {
+    return this.rows().flatMap((item) =>
+      item.kind === 'run' && item.run.id !== excludeId && (!terminal(item.run) || item.run.settling)
+        ? [item.run]
+        : [],
+    )
+  }
   fullRun(id: string): TicketRun | undefined {
     const item = this.records.get(`run:${id}`)
     return item?.kind === 'run' && terminal(item.run) && !item.run.settling ? item.run : undefined

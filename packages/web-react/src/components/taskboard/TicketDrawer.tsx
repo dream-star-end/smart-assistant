@@ -188,8 +188,6 @@ export function TicketDrawer({
   const belongsToOwner = (row: Ticket | null | undefined) =>
     !!row && !!ownerLookup && (row.id === ownerLookup || row.identifier === ownerLookup)
   const [history, historyStatus] = useTimelineHistory(auth, ownerLookup)
-  const openRef = useRef(open)
-  openRef.current = open
   const historyRef = useRef(history)
   historyRef.current = history
   const resultRequests = history.resultRequests
@@ -606,9 +604,13 @@ export function TicketDrawer({
   }
 
   const hydrateResult = useCallback(
-    (run: TicketRun): void => {
-      if (run.status === 'running' || run.status === 'queued' || run.settling) return
-      if (resultRequests.has(run.id)) return
+    (run: TicketRun, reconcilePending = false): void => {
+      if (
+        !reconcilePending &&
+        (run.status === 'running' || run.status === 'queued' || run.settling)
+      )
+        return
+      if (resultRequests.size) return
       const gen = ownerGen.current
       const ticketId = currentRef.current?.id
       const requestedOwner = ownerLookupRef.current
@@ -658,8 +660,11 @@ export function TicketDrawer({
   )
 
   useEffect(() => {
-    if (open && execution) hydrateResult(execution)
-  }, [open, execution, hydrateResult])
+    if (!open) return
+    if (execution) hydrateResult(execution)
+    const pending = history.pendingRuns(execution?.id)[0]
+    if (pending) hydrateResult(pending, true)
+  }, [open, execution, hydrateResult, history, historyStatus])
 
   const loadEarlier = async () => {
     if (!lookup) return
@@ -878,11 +883,11 @@ export function TicketDrawer({
           {!editing &&
             (current.body ? (
               <details
-                open={desktop}
+                open={descriptionOpen}
                 onToggle={(event) => setDescriptionOpen(event.currentTarget.open)}
                 className="rounded-lg border border-border px-3 py-2"
               >
-                <summary className="cursor-pointer text-caption font-medium text-muted">
+                <summary className="flex min-h-11 cursor-pointer items-center text-caption font-medium text-muted">
                   任务说明
                 </summary>
                 {descriptionOpen && (
@@ -1027,7 +1032,7 @@ export function TicketDrawer({
               className="min-h-11"
               data-testid="retry-run-result"
               onClick={() => {
-                for (const failed of history.resultFailures.values()) hydrateResult(failed)
+                for (const failed of history.resultFailures.values()) hydrateResult(failed, true)
               }}
             >
               完整结果暂未加载，点击重试

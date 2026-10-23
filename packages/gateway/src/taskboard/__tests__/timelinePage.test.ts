@@ -14,6 +14,7 @@ import { createActivity } from '../db/activity.js'
 import { insertRun, updateRun } from '../db/runs.js'
 import { listTicketTimelinePage } from '../db/timeline.js'
 import { handleTaskboardApi } from '../http.js'
+import { taskboardRunControls } from '../runControl.js'
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'oc-task-timeline-'))
@@ -260,6 +261,103 @@ test('same-millisecond additions below the maximum key still invalidate the wind
     assert.notEqual(fresh.head, first.head)
     assert.ok(fresh.items.some((item) => item.kind === 'comment' && item.comment.id === comment.id))
   } finally {
+    f.close()
+  }
+})
+
+test('late reference usage and archive output invalidate an existing run window revision', () => {
+  const f = fixture()
+  try {
+    const old = insertRun(f.db, {
+      ticketId: f.ticket.id,
+      stageId: f.stage.id,
+      trigger: 'manual',
+      status: 'timeout',
+    })
+    insertRun(f.db, {
+      ticketId: f.ticket.id,
+      stageId: f.stage.id,
+      trigger: 'manual',
+      status: 'running',
+    })
+    const first = listTicketTimelinePage(f.db, f.ticket.id)
+    updateRun(f.db, old.id, { tokensIn: 17, tokensOut: 4, costUsd: 0.04, costImprecise: true })
+    const usage = listTicketTimelinePage(f.db, f.ticket.id, { ifHead: first.head })
+    assert.equal(usage.unchanged, false)
+    assert.equal(
+      usage.items.find((item) => item.kind === 'run' && item.run.id === old.id)?.kind,
+      'run',
+    )
+    updateRun(f.db, old.id, { outputMd: 'LATE_PAID_ARCHIVE_END' })
+    const archive = listTicketTimelinePage(f.db, f.ticket.id, { ifHead: usage.head })
+    assert.equal(archive.unchanged, false)
+    assert.ok(
+      archive.items.some(
+        (item) => item.kind === 'run' && item.run.outputMd === 'LATE_PAID_ARCHIVE_END',
+      ),
+    )
+  } finally {
+    f.close()
+  }
+})
+
+test('history read cannot combine an old empty payload with post-archive settled metadata', async () => {
+  const f = fixture()
+  const sessionKey = 'agent:main:taskboard:fixture:stage:archive'
+  const row = insertRun(f.db, {
+    ticketId: f.ticket.id,
+    stageId: f.stage.id,
+    trigger: 'manual',
+    status: 'timeout',
+    agentId: 'main',
+  })
+  updateRun(f.db, row.id, { sessionKey })
+  const control = taskboardRunControls.begin(row.id, f.ticket.id, 'fixture-owner', sessionKey)
+  const leave = control.enter(sessionKey)
+  let resume!: () => void
+  let entered!: () => void
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const held = new Promise<void>((resolve) => {
+    resume = resolve
+  })
+  const server = createServer((req, res) => {
+    void handleTaskboardApi(req, res, {
+      db: f.db,
+      actor: 'human',
+      getRunSnapshots: async () => {
+        entered()
+        await held
+        return {}
+      },
+    })
+  })
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    assert.ok(address && typeof address === 'object')
+    const url = `http://127.0.0.1:${address.port}/api/board/tickets/${f.ticket.id}/timeline?window=latest`
+    const response = fetch(url)
+    await started
+    updateRun(f.db, row.id, { outputMd: 'ARCHIVED_DURING_PROJECTION_END' })
+    leave()
+    taskboardRunControls.finish(control)
+    resume()
+    const page = (await (await response).json()) as ReturnType<typeof listTicketTimelinePage>
+    const item = page.items.find((item) => item.kind === 'run')
+    assert.ok(item?.kind === 'run')
+    assert.ok(item.run.settling || item.run.outputMd === 'ARCHIVED_DURING_PROJECTION_END')
+    const fresh = (await (await fetch(url)).json()) as ReturnType<typeof listTicketTimelinePage>
+    const archived = fresh.items.find((item) => item.kind === 'run')
+    assert.ok(archived?.kind === 'run')
+    assert.equal(archived.run.settling, false)
+    assert.equal(archived.run.outputMd, 'ARCHIVED_DURING_PROJECTION_END')
+  } finally {
+    resume?.()
+    leave()
+    taskboardRunControls.finish(control)
+    await new Promise<void>((resolve) => server.close(() => resolve()))
     f.close()
   }
 })

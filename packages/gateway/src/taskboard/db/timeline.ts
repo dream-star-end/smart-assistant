@@ -89,7 +89,7 @@ export function listTicketTimelinePage(
     const keys: TimelineKey[] = []
     for (const source of sources) {
       const rows = db
-        .prepare(`SELECT id, created_at AS createdAt FROM ${source.table}
+        .prepare(`SELECT id, created_at AS createdAt ${source.kind === 'run' ? ', json_array(status, finished_at, duration_ms, tokens_in, tokens_out, cost_usd, cost_imprecise, output_md IS NOT NULL) AS revision' : ''} FROM ${source.table}
         WHERE ticket_id = @ticketId ${before ? `AND (created_at < @at OR (created_at = @at AND (@rank < @beforeRank OR (@rank = @beforeRank AND id < @id))))` : ''}
         ORDER BY created_at DESC, id DESC LIMIT @take`)
         .all({
@@ -112,8 +112,8 @@ export function listTicketTimelinePage(
     const head = windowRevision(ticketId, selected, hasMore)
     const last = selected.at(-1)
     const nextBefore = hasMore && last ? encode(ticketId, last) : null
-    // Current run status/output are fetched independently. Immutable history can
-    // avoid rereading long payloads when its bounded key window has not changed.
+    // Include lightweight run state in the revision so late output and reference
+    // usage updates invalidate the window without reading long payloads unchanged.
     if (!before && head && head === options.ifHead)
       return { window: 'latest-v1' as const, items: [], head, hasMore, nextBefore, unchanged: true }
     const activity = new Map(
