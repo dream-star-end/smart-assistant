@@ -32,7 +32,8 @@
  *   - 不做合并冲突保护(冲突几率 ≈ 同一用户两个 tab 同时改;最坏后果 = 后写覆盖前写)
  */
 
-import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
+import { scanMemoryContent } from "@openclaude/storage";
+import { PLATFORM_REASONING_EFFORTS, hasPromptPrivacyControlCharacters } from "@openclaude/protocol";
 import { z } from "zod";
 import { query } from "../db/queries.js";
 
@@ -51,6 +52,13 @@ const disabledPluginsSchema = z
   .array(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "invalid plugin slug"))
   .max(200)
   .refine((a) => new Set(a).size === a.length, { message: "duplicate plugin slug" });
+
+/** Explicit nickname consent is scoped to one conversation; absent means disabled. */
+const assistantProfileSchema = z.object({
+  enabled: z.boolean(),
+  nickname: z.string().trim().min(1).max(80).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符").refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
+  sessionId: z.string().min(1).max(256).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符"),
+}).strict();
 
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
@@ -72,6 +80,8 @@ export const PreferencesSchema = z
     input_prediction: z.boolean().optional(),
     disabled_plugins: disabledPluginsSchema.optional(),
     enabled_plugins: disabledPluginsSchema.optional(),
+    system_assistant_profile: assistantProfileSchema.optional(),
+    system_assistant_recommendations: z.boolean().optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -97,6 +107,8 @@ export const PreferencesPatchSchema = z
     input_prediction: z.boolean().nullable().optional(),
     disabled_plugins: disabledPluginsSchema.nullable().optional(),
     enabled_plugins: disabledPluginsSchema.nullable().optional(),
+    system_assistant_profile: assistantProfileSchema.nullable().optional(),
+    system_assistant_recommendations: z.boolean().nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;
@@ -214,7 +226,7 @@ export async function patchPreferences(
     // Lock the actor row for this same statement. Concurrent role/status changes
     // serialize with the approved mutation, rather than racing a prior ACL read.
     prefix = prefix.replace('WITH ', `WITH eligible_user AS MATERIALIZED (
-      SELECT id FROM users WHERE id=$1 AND status='active' AND role=${roleParam} FOR SHARE
+      SELECT id FROM users WHERE id=$1 AND status='active' AND deleted_at IS NULL AND role=${roleParam} FOR SHARE
     ), `);
     values = values.replace('WHERE\n      ', 'WHERE EXISTS (SELECT 1 FROM eligible_user) AND (\n      ') + ')';
     conflictGuard += ' AND EXISTS (SELECT 1 FROM eligible_user)';

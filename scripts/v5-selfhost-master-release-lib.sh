@@ -1085,6 +1085,12 @@ build_master_release() {
     cleanup_master_staging
     die "pinned cron submit durability boundary gate 失败"
   fi
+  tsum_mark C.prompt-privacy 2>/dev/null || :
+  mlog "  fresh prompt privacy lifecycle proof @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
+    cleanup_master_staging
+    die "pinned prompt privacy lifecycle proof 失败"
+  fi
   tsum_mark C.system-approval 2>/dev/null || :
   mlog "  durable system approval fencing proof @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then

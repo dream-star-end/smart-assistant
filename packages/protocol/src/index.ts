@@ -68,4 +68,5 @@ export {
   isBoxGptWebOwnerUid,
 } from './boxGptWebModels.js'
 
+export * from './promptPrivacy.js'
 export * from './systemActions.js'

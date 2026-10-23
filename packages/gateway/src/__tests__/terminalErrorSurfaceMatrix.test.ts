@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * Terminal-error surface matrix —— "错误以正常返回值出现" 这一类引擎适配 bug 的门。
  *
@@ -28,7 +29,6 @@
  */
 
 import * as assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
 import { describe, it } from 'node:test'
 
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -167,7 +167,9 @@ function makeConfigStub(): OpenClaudeConfig {
   } as unknown as OpenClaudeConfig
 }
 
-class FakeCcbRunner extends EventEmitter {
+class FakeCcbRunner extends MinimalPrivacyRunner {
+  isRunning = false
+
   lastActivityAt = Date.now()
   submits = 0
   consultTurnBinding:
@@ -187,11 +189,15 @@ class FakeCcbRunner extends EventEmitter {
   interrupt(): boolean {
     return false
   }
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
   clearSessionId(): void {}
   async waitForOutputDrain(): Promise<void> {}
 
   async submit(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     this.submits += 1
     this.onSubmit(this)
   }

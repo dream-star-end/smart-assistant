@@ -386,7 +386,7 @@ describe("Moonshot K3 family effort support", () => {
   test("kimi-k3/k3-256k 放行 low/high/max，不注入默认，xhigh 降级 high", () => {
     const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
     delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
-    for (const model of ["kimi-k3", "K3-256K"]) {
+    for (const model of ["kimi-k3", "K3-256K", "k3.1-pro"]) {
       expect(modelSupportsEffort(model)).toBe(true);
       expect(modelSupportsMaxEffort(model)).toBe(true);
       expect(resolveAppliedEffort(model, "low")).toBe("low");

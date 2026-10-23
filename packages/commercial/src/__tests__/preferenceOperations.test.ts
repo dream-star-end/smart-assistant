@@ -12,16 +12,17 @@ import { PreferencesError, resolvePreferencesPatch, type Preferences } from '../
 import type { BrowserConfirmationPrincipal } from '../auth/browserConfirmation.js'
 const actor: SystemActor = { userId: '765', role: 'user', sessionId: 'synthetic-session', agentId: 'main' }
 const principal: BrowserConfirmationPrincipal = { id: '765', role: 'user', accessJti: 'synthetic-jti', accessExpiresAt: 9999999999, refreshFamilyId: randomUUID(), refreshSessionId: '19' }
-function fixture(t: import('node:test').TestContext) {
-  let prefs: Preferences = { intelligent_ui: true }
+function fixture(t: import('node:test').TestContext, initial: Preferences = { intelligent_ui: true }) {
+  let prefs: Preferences = initial
   let version = 1
   let writes = 0
   let eligible = true
   let allowed = true
   let brokerReady = true
+  let privacyReady = true
   const registry = new SystemOperationRegistry(preferenceOperations({
     authorize: async a => { assert.equal(a.userId, '765'); if (!allowed) throw new SystemOperationRejected('FORBIDDEN') },
-    privacySupported: async () => true,
+    privacySupported: async () => privacyReady,
     backgroundApprovalReady: async () => brokerReady,
     read: async () => ({ prefs: { ...prefs }, version: String(version), updated_at: '2026-10-24T00:00:00Z' }),
     resolve: (uid, raw) => resolvePreferencesPatch(uid, raw, { feature: async () => ({ eligible, available: true }) }),
@@ -43,7 +44,7 @@ function fixture(t: import('node:test').TestContext) {
     return { id: p.id, idempotencyKey, detail, proof: { nonce, deviceId, previewHash: detail.previewHash } }
   }
   return { registry, service, proposal, writes: () => writes, prefs: () => prefs,
-    intervene: () => { version++ }, revoke: () => { allowed = false }, loseEntitlement: () => { eligible = false }, stopBroker: () => { brokerReady = false } }
+    intervene: () => { version++ }, revoke: () => { allowed = false }, loseEntitlement: () => { eligible = false }, stopBroker: () => { brokerReady = false }, losePrivacySupport: () => { privacyReady = false } }
 }
 test('a real preference adapter reads without mutation and needs browser approval before the atomic writer', async t => {
   const f = fixture(t)
@@ -117,5 +118,29 @@ test('enabling background writers requires a broker that separately approves eve
   assert.equal(f.writes(), 0)
   const disable = await f.proposal({ auto_dream_enabled: false })
   assert.equal('state' in await f.service.confirm(principal, disable.id, disable.proof), true)
+  assert.equal(f.writes(), 1)
+})
+
+test('profile reads expose nickname only to the explicitly authorized session and default reads omit it', async t => {
+  const f = fixture(t, { system_assistant_profile: { enabled: true, nickname: 'Synthetic Name', sessionId: actor.sessionId } })
+  const normal = await f.registry.read(actor, 'preferences.read', {}) as { prefs: Record<string, unknown> }
+  assert.equal('system_assistant_profile' in normal.prefs, false)
+  const authorized = await f.registry.read(actor, 'preferences.read', { keys: ['system_assistant_profile'] }) as { prefs: Record<string, unknown> }
+  assert.equal((authorized.prefs.system_assistant_profile as { nickname: string }).nickname, 'Synthetic Name')
+  const other = await f.registry.read({ ...actor, sessionId: 'synthetic-other-session' }, 'preferences.read', { keys: ['system_assistant_profile'] }) as { prefs: Record<string, unknown> }
+  assert.deepEqual(other.prefs.system_assistant_profile, { enabled: true, authorizedForCurrentSession: false })
+  assert.equal(f.writes(), 0)
+})
+test('an actual runtime support change blocks new profile grants but still permits withdrawal', async t => {
+  const f = fixture(t)
+  const proposed = await f.proposal({ system_assistant_profile: { enabled: true, nickname: 'Synthetic Name', sessionId: actor.sessionId } })
+  f.losePrivacySupport()
+  const result = await f.service.confirm(principal, proposed.id, proposed.proof)
+  assert.equal('state' in result && result.state, 'failed')
+  assert.equal(f.writes(), 0)
+  await assert.rejects(f.proposal({ system_assistant_profile: { enabled: true, nickname: 'Synthetic Name', sessionId: actor.sessionId } }))
+  const withdraw = await f.proposal({ system_assistant_profile: null })
+  const saved = await f.service.confirm(principal, withdraw.id, withdraw.proof)
+  assert.equal('state' in saved && saved.state, 'succeeded')
   assert.equal(f.writes(), 1)
 })

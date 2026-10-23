@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import { encodeUpstreamRetryHint } from '@openclaude/protocol';
 import { waitForRetryDelay } from '../sessionTurnRunner.js';
 /**
@@ -16,7 +17,6 @@ import { waitForRetryDelay } from '../sessionTurnRunner.js';
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 
 import {
   SessionManager,
@@ -68,7 +68,7 @@ function makeConfigStub(): OpenClaudeConfig {
 
 type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
 
-class FakeCcbRunner extends EventEmitter {
+class FakeCcbRunner extends MinimalPrivacyRunner {
   lastActivityAt = Date.now();
   /** Warm process by default so legacy sequence assertions see no synthetic
    * engine_starting frame; cold-start tests flip this to false. */
@@ -96,19 +96,25 @@ class FakeCcbRunner extends EventEmitter {
       await new Promise((resolve) => setTimeout(resolve, this.startDelayMs));
     }
     this.isRunning = true;
+
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
   }
 
   interrupt(): boolean {
     return false;
   }
 
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
 
   clearSessionId(): void {}
 
   async waitForOutputDrain(): Promise<void> {}
 
   async submit(input?: unknown): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     this.submittedInputs.push(input);
     this.onSubmit(this);
   }
@@ -4963,6 +4969,7 @@ describe("preheatRunner", () => {
     runner.isRunning = false;
     runner.startDelayMs = 20;
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     const [a, b] = await Promise.all([sm.preheatRunner(session), sm.preheatRunner(session)]);
     assert.equal(a, "started");
     // 第二个并发调用要么共享同一 in-flight(started),要么在 isRunning 后到达。
@@ -4975,6 +4982,7 @@ describe("preheatRunner", () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeCcbRunner(() => {});
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     assert.equal(await sm.preheatRunner(session), "already_running");
     assert.equal(runner.startCalls, 0);
   });
@@ -5013,6 +5021,7 @@ describe("preheatRunner", () => {
       throw new Error("spawn boom");
     };
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     assert.equal(await sm.preheatRunner(session), "failed");
     // lock 已释放:后续等待者不悬挂。
     await session.lock;
@@ -5026,6 +5035,7 @@ describe("preheatRunner", () => {
       const inner = new FakeCcbRunner(() => {});
       inner.isRunning = false;
       const session = makeSession(inner);
+      (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
       const hung = new Promise<void>(() => {});
       let generation = 0;
       let startCalls = 0;
@@ -5069,6 +5079,7 @@ describe("preheatRunner", () => {
       runner.isRunning = false;
       runner.startDelayMs = 20;
       const session = makeSession(runner);
+      (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
       assert.equal(await sm.preheatRunner(session), "started");
       assert.equal(runner.startCalls, 1);
       assert.ok(session.lastUsedAt > 0);

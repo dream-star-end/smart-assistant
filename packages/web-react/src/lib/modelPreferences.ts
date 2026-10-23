@@ -16,6 +16,8 @@ export type PrefsView = {
   auto_dream_enabled?: boolean;
   auto_optimizer_enabled?: boolean;
   hotkeys?: Record<string, string>;
+  system_assistant_profile?: { enabled: boolean; nickname: string; sessionId: string };
+  system_assistant_recommendations?: boolean;
 };
 
 export type AutoDreamFeatureView = {

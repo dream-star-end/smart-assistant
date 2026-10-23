@@ -30,6 +30,13 @@ export interface PreferenceOperationDeps {
   resolve?: (userId: string, raw: unknown) => Promise<PreferencesPatch>
   write?: (userId: string, patch: unknown, version: string, role: SystemActor['role']) => Promise<unknown>
 }
+function readablePreference(actor: SystemActor, key: string, value: unknown): unknown {
+  if (key === 'system_assistant_profile' && value && typeof value === 'object') {
+    const profile = value as { enabled?: unknown; sessionId?: unknown }
+    if (profile.enabled === true && profile.sessionId !== actor.sessionId) return { enabled: true, authorizedForCurrentSession: false }
+  }
+  return value
+}
 function display(value: unknown): string {
   if (value === undefined) return '使用系统默认值'
   if (value === null) return '恢复系统默认值'
@@ -66,7 +73,7 @@ export function preferenceOperations(deps: PreferenceOperationDeps): SystemOpera
       const { keys } = raw as z.infer<typeof readSchema>
       const snapshot = await read(actor.userId)
       const wanted = keys ?? DEFAULT_KEYS
-      return { prefs: Object.fromEntries(wanted.filter(k => k in snapshot.prefs).map(k => [k, snapshot.prefs[k as keyof Preferences]])), version: snapshot.version }
+      return { prefs: Object.fromEntries(wanted.filter(k => k in snapshot.prefs).map(k => [k, readablePreference(actor, k, snapshot.prefs[k as keyof Preferences])])), version: snapshot.version }
     },
   }, {
     ...common, id: 'preferences.update', title: '更改偏好设置', effect: 'write', schema: patchSchema, frozenSchema: patchSchema,

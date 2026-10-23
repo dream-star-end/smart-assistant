@@ -1,3 +1,4 @@
+import { DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -127,6 +128,7 @@ import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 export interface CommercialHttpDeps {
   /** Master-private system actions; absent until explicit composition has initialized the ledger. */
   systemActionsHttp?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
+  resolvePromptPrivacySupport?: (userId: string) => Promise<PromptPrivacySupport>;
   literatureSetup?: LiteratureSetupService
   literatureArtifacts?: LiteratureArtifactStore
   jwtSecret: string | Uint8Array;
@@ -1642,6 +1644,7 @@ export async function handleGetMyPreferences(
       auto_dream: autoDream,
       intelligent_ui: intelligentUiFeatureView(snap.prefs),
       input_prediction: inputPredictionFeatureView(snap.prefs),
+      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
     },
   });
 }
@@ -1656,6 +1659,11 @@ export async function handlePatchMyPreferences(
   const body = await readJsonBody(req);
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "INVALID_BODY", "body must be a JSON object");
+  }
+  const profile = (body as Record<string, unknown>).system_assistant_profile;
+  if (profile && typeof profile === 'object' && (profile as { enabled?: unknown }).enabled === true) {
+    const support = await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT }));
+    if (support.state !== 'ready') throw new HttpError(409, 'PRIVACY_RUNTIME_REQUIRED', '当前运行环境尚未支持此设置，请更新运行环境后再授权。');
   }
   const { patchPreferences, PreferencesError, resolvePreferencesPatch } = await import("../user/preferences.js");
   try {
@@ -1674,6 +1682,7 @@ export async function handlePatchMyPreferences(
         auto_dream: autoDream,
         intelligent_ui: intelligentUiFeatureView(snap.prefs),
         input_prediction: inputPredictionFeatureView(snap.prefs),
+      prompt_privacy: await (deps.resolvePromptPrivacySupport?.(user.id) ?? Promise.resolve({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })).catch(() => ({ ...DEFAULT_PROMPT_PRIVACY_SUPPORT })),
       },
     });
   } catch (err) {

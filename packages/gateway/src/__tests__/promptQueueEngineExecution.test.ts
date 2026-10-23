@@ -1,5 +1,5 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
 import { describe, test } from 'node:test'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 
@@ -19,7 +19,7 @@ const config = {
   defaults: { model: 'glm-5.2' },
 } as unknown as OpenClaudeConfig
 
-class FakeCcbKernel extends EventEmitter {
+class FakeCcbKernel extends MinimalPrivacyRunner {
   submitted = false
   lastActivityAt = Date.now()
   sessionId: string | null = 'ccb-queue-thread'
@@ -30,15 +30,16 @@ class FakeCcbKernel extends EventEmitter {
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
-  get isRunning() {
-    return true
-  }
+  private privacyFixtureRunning = true
+  get isRunning() { return this.privacyFixtureRunning }
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
   ): void {
     this.consultTurnBinding = binding
   }
   async submit(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.privacyFixtureRunning = true
+
     this.submitted = true
   }
   finish(): void {
@@ -50,8 +51,12 @@ class FakeCcbKernel extends EventEmitter {
       is_error: false,
     })
   }
-  async start(): Promise<void> {}
-  async shutdown(): Promise<void> {}
+  async start(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.privacyFixtureRunning = true
+  }
+  async shutdown(): Promise<void> {
+    this.privacyFixtureRunning = false
+  }
   async waitForOutputDrain(): Promise<void> {}
   interrupt(): boolean {
     return false
@@ -85,7 +90,7 @@ class FakeCcbKernel extends EventEmitter {
   async updateTurnLease(): Promise<void> {}
 }
 
-class FakeCodexKernel extends EventEmitter {
+class FakeCodexKernel extends MinimalPrivacyRunner {
   submitted = false
   queueTurn: boolean | undefined
   lastActivityAt = Date.now()
@@ -94,9 +99,8 @@ class FakeCodexKernel extends EventEmitter {
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
-  get isRunning() {
-    return true
-  }
+  private privacyFixtureRunning = true
+  get isRunning() { return this.privacyFixtureRunning }
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
   ): void {
@@ -108,6 +112,8 @@ class FakeCodexKernel extends EventEmitter {
     _policy?: unknown,
     queueTurn?: boolean,
   ): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.privacyFixtureRunning = true
+
     this.submitted = true
     this.queueTurn = queueTurn
     this.requestId = requestId
@@ -123,8 +129,12 @@ class FakeCodexKernel extends EventEmitter {
       requestId: this.requestId,
     })
   }
-  async start(): Promise<void> {}
-  async shutdown(): Promise<void> {}
+  async start(): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.privacyFixtureRunning = true
+  }
+  async shutdown(): Promise<void> {
+    this.privacyFixtureRunning = false
+  }
   async waitForOutputDrain(): Promise<void> {}
   interrupt(): boolean {
     return false

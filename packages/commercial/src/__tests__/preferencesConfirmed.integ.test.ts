@@ -13,8 +13,8 @@ const pool = new Pool({ connectionString: target.toString(), max: 6, options: `-
 before(async () => {
   await admin.query(`CREATE SCHEMA ${schema}`)
   await pool.query('CREATE TABLE user_preferences (user_id bigint PRIMARY KEY, prefs jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())')
-  await pool.query("CREATE TABLE users (id bigint PRIMARY KEY, role text NOT NULL, status text NOT NULL)")
-  await pool.query("INSERT INTO users VALUES (765, 'user', 'active')")
+  await pool.query("CREATE TABLE users (id bigint PRIMARY KEY, role text NOT NULL, status text NOT NULL, deleted_at timestamptz)")
+  await pool.query("INSERT INTO users (id,role,status) VALUES (765, 'user', 'active')")
   setPoolOverride(pool)
 })
 after(async () => {
@@ -70,4 +70,23 @@ test('the approved writer atomically checks current role and active status', asy
   await assert.rejects(patchPreferences('765', { theme: 'dark' }, snapshot.version, 'user'), conflict)
   assert.equal((await getVersionedPreferences('765')).prefs.theme, 'light')
   await pool.query("UPDATE users SET status='active' WHERE id=765")
+})
+
+test('soft deletion without a status change still invalidates an approved preference write', async () => {
+  const before = await getVersionedPreferences('765')
+  await pool.query('UPDATE users SET deleted_at=now() WHERE id=765')
+  try {
+    await assert.rejects(patchPreferences('765', { notify_email: true }, before.version, 'user'), conflict)
+    assert.equal((await getVersionedPreferences('765')).version, before.version)
+  } finally { await pool.query('UPDATE users SET deleted_at=NULL WHERE id=765') }
+})
+test('withdrawing a profile removes its stored fields and old approvals cannot restore it', async () => {
+  const before = await getVersionedPreferences('765')
+  await patchPreferences('765', { system_assistant_profile: { enabled: true, nickname: 'Synthetic Name', sessionId: 'synthetic-session' } }, before.version, 'user')
+  const granted = await getVersionedPreferences('765')
+  assert.equal(granted.prefs.system_assistant_profile?.enabled, true)
+  await patchPreferences('765', { system_assistant_profile: null }, granted.version, 'user')
+  const withdrawn = await getVersionedPreferences('765')
+  assert.equal('system_assistant_profile' in withdrawn.prefs, false)
+  await assert.rejects(patchPreferences('765', { system_assistant_profile: { enabled: true, nickname: 'Synthetic Name', sessionId: 'synthetic-session' } }, granted.version, 'user'), conflict)
 })
