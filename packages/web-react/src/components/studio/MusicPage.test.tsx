@@ -411,4 +411,24 @@ describe('MusicPage (OCV5-593 FE-5)', () => {
     expect(await screen.findByText('最早的曲子')).toBeInTheDocument()
     expect(musicSearch).toHaveBeenLastCalledWith(auth, 'music-mine', { cursor: 'm1' })
   })
+
+  test('恢复默认 clears unsaved changes even when the saved edit already is the default (code r2 P1)', async () => {
+    setMusicEdit.mockImplementation(async (_a, _p, e) => e)
+    render(
+      <MusicPage
+        auth={auth}
+        view={view({ takes: [musicTake()] }, { musicTakeId: 'mt1' })}
+        providers={music(true)}
+        onOpenShot={() => {}}
+      />,
+    )
+    fireEvent.change(screen.getByLabelText('入点'), { target: { value: '8' } })
+    expect(screen.getByRole('button', { name: /保存剪辑/ })).toBeEnabled()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /恢复默认/ }))
+    })
+    expect(setMusicEdit).toHaveBeenLastCalledWith(auth, 'p', {})
+    expect(screen.getByLabelText('入点')).toHaveValue('0')
+    expect(screen.getByRole('button', { name: /保存剪辑/ })).toBeDisabled()
+  })
 })

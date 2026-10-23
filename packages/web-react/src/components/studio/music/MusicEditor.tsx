@@ -164,7 +164,10 @@ export function MusicEditor(props: {
     }
     setSaving(true)
     try {
-      await studioApi.setMusicEdit(props.auth, props.projectId, body)
+      const saved = await studioApi.setMusicEdit(props.auth, props.projectId, body)
+      // The draft becomes what was saved (code r2 P1): "恢复默认" over an already-default saved edit
+      // leaves the stored key unchanged, so the reset must come from here, not from the next poll.
+      setEdit(saved ?? body)
       toast('剪辑已保存，合成时按这个来', 'success')
       await props.onSaved()
     } catch (err) {
