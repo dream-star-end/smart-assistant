@@ -186,10 +186,13 @@ describe('MiniMax media client (OCV5-589)', () => {
     assert.equal(first.settled.debitedCredits, 1n)
     assert.equal(await credits(poor), 0n)
     assert.equal(await miniMaxDebitedCredits(getPool(), first.settled.usageId), 1n)
+    // The replay passes the balance pre-check again before reaching the settle replay.
+    await query('UPDATE users SET credits = 10 WHERE id = $1', [poor.toString()])
     const replay = await synthesizeSpeech(d, args)
     assert.equal(replay.settled.replayed, true)
     assert.equal(replay.settled.debitedCredits, null)
     assert.equal(await miniMaxDebitedCredits(getPool(), replay.settled.usageId), 1n)
+    assert.equal(await credits(poor), 10n, 'a replay never debits again')
   })
 
   test('speech costCap: an upstream count above the reservation is charged at the cap (OCV5-591 A2-0)', async (t) => {
