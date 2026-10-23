@@ -5,8 +5,8 @@
 // once per (source, sourceTrackId) — a rerun skips what is already there.
 
 import { createHash, randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
-import { join, normalize } from 'node:path'
+import { readFile, realpath } from 'node:fs/promises'
+import { join, normalize, sep } from 'node:path'
 import type { Pool } from 'pg'
 import { z } from 'zod'
 
@@ -90,6 +90,13 @@ export async function importCatalogEntries(input: {
 }): Promise<ImportOutcome> {
   const out: ImportOutcome = { inserted: [], skipped: [], failed: [] }
   const digest = (b: Buffer) => createHash('sha256').update(b).digest('hex')
+  // The schema keeps paths relative; the real path (symlinks resolved) must stay inside too.
+  const base = await realpath(input.dir)
+  const readInside = async (rel: string) => {
+    const real = await realpath(join(input.dir, rel))
+    if (!real.startsWith(base + sep)) throw new Error('file is outside the manifest dir')
+    return readFile(real)
+  }
   for (const e of input.entries) {
     const key = `${e.source}:${e.sourceTrackId}`
     try {
@@ -101,8 +108,8 @@ export async function importCatalogEntries(input: {
         out.skipped.push(key)
         continue
       }
-      const audio = await readFile(join(input.dir, e.audioPath))
-      const shot = await readFile(join(input.dir, e.evidencePath))
+      const audio = await readInside(e.audioPath)
+      const shot = await readInside(e.evidencePath)
       if (digest(audio) !== e.audioSha) throw new Error('audio file changed since it was verified')
       if (digest(shot) !== e.evidenceSha)
         throw new Error('evidence file changed since it was verified')

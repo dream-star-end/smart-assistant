@@ -16,7 +16,7 @@
  */
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -755,6 +755,19 @@ describe('media studio music catalog (0325, OCV5-591 M1)', () => {
       entries: parseCatalogManifest([c3]),
     })
     assert.equal(bad.failed[0]?.reason, 'audio file changed since it was verified')
+    // A symlink pointing outside the manifest dir is refused even when its hash matches (code r3 P1).
+    const outside = await mkdtemp(path.join(tmpdir(), 'oc-studio-outside-'))
+    await writeFile(path.join(outside, 'private.mp3'), 'ID3 audio D4')
+    const d4 = await entry('D4')
+    await rm(path.join(dir, d4.audioPath))
+    await symlink(path.join(outside, 'private.mp3'), path.join(dir, d4.audioPath))
+    const linked = await importCatalogEntries({
+      pool: getPool(),
+      blobs,
+      dir,
+      entries: parseCatalogManifest([d4]),
+    })
+    assert.equal(linked.failed[0]?.reason, 'file is outside the manifest dir')
     const n = await query<{ n: string }>('SELECT COUNT(*)::text AS n FROM studio_music_catalog')
     assert.equal(n.rows[0]!.n, '2')
   })
