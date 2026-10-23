@@ -13,6 +13,8 @@ the private gpg key never leaves Box/user custody.
 - The controller uses the unchanged `with-production-mutation-lease.sh`, then foreground
   `ssh -tt kl-mirror`. It constructs the invocation nonce only inside the wrapped child;
   neither it nor credentials are logged. The lease covers dump, local rotation and uploads.
+  The SSH payload applies nice 15 and idle I/O on kl-mirror itself, so the remote worker
+  and its children retain the intended low priority after scheduling moves to v5-dev.
 - kl-mirror: only the pinned scripts and R2/public-key configuration. No new timer/service.
   `v5-commercial-pg-backup-lease.ts` imports the existing `verifyLocalLease` authority;
   it checks nonce, actual flock/holder/expiry and PG identity, then compares the dump's

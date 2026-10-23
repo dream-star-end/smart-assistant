@@ -21,7 +21,7 @@ case "${1:-run}" in
   __leased)
     [[ "${OC_V5_MANUAL_LEASE_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || { echo 'official lease nonce missing' >&2; exit 3; }
     # Construct this only inside the wrapped child. The wrapper logs fixed argv, never proof values.
-    printf -v command 'exec env OC_V5_MANUAL_LEASE_NONCE=%q bash %q run' "$OC_V5_MANUAL_LEASE_NONCE" "$REMOTE"
+    printf -v command 'exec nice -n 15 ionice -c 3 env OC_V5_MANUAL_LEASE_NONCE=%q bash %q run' "$OC_V5_MANUAL_LEASE_NONCE" "$REMOTE"
     exec "$SSH" -tt -o BatchMode=yes -o ConnectTimeout=15 -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$HOST" "$command" </dev/null
     ;;
   *) echo 'usage: v5-commercial-pg-backup-controller.sh run' >&2; exit 2 ;;
