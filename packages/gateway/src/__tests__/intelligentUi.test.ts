@@ -223,3 +223,16 @@ describe('taskboard IUI surface', () => {
     }
   })
 })
+
+
+it('taskboard IUI keeps model and exact privacy session query while USER remains webchat-only', async () => {
+  mock = { status: 200, body: JSON.stringify({ slots: [{ name: INTELLIGENT_UI_SLOT, content: IUI_BODY }], promptPolicy: { schemaVersion: 1, profile: { nickname: 'SYNTH_PRIVATE_NICK', sessionId: 'task-scope' } } }) }
+  const result = await buildPromptContext({ agentId: 'iui-task-integration', sessionKey: TASK, model: 'grok-build', sessionId: 'task-scope' })
+  const query = new URL(requestedUrls.at(-1)!, 'http://fixture').searchParams
+  assert.equal(query.get('model'), 'grok-build')
+  assert.equal(query.get('sessionId'), 'task-scope')
+  assert.equal(query.get('surface'), 'taskboard')
+  assert.equal(result.intelligentUi, intelligentUiFingerprint(IUI_BODY))
+  assert.ok(!result.applied.some(slot => slot.name === 'USER'))
+  assert.doesNotMatch(result.content, /SYNTH_PRIVATE_NICK/)
+})

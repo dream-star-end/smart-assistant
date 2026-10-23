@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * OCV5-188 C / D1: cron execution-scope heartbeat tests.
  *
@@ -12,7 +13,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { EventEmitter } from 'node:events'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, it } from 'node:test'
 import { stringify as stringifyYaml } from 'yaml'
@@ -979,7 +979,7 @@ async function assertDestroyBarrier(
   }
 }
 
-class HangRunner extends EventEmitter {
+class HangRunner extends MinimalPrivacyRunner {
   lastActivityAt = Date.now()
   isRunning = true
   pendingToolCalls = 0
@@ -995,6 +995,8 @@ class HangRunner extends EventEmitter {
 
   async start() {
     this.isRunning = true
+
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
   }
   interrupt() {
     this.emit('message', {
@@ -1006,10 +1008,14 @@ class HangRunner extends EventEmitter {
     })
     return true
   }
-  async shutdown() {}
+  async shutdown() {
+    this.isRunning = false
+  }
   clearSessionId() {}
   async waitForOutputDrain() {}
   async submit() {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     // Return immediately so SessionManager can arm the 15s liveness timer.
     // The turn stays open until a result event or interrupt.
   }

@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
  *
@@ -888,6 +889,20 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  clearPromptPrivacy(): void {
+    (this.runner as { clearPromptPrivacy?: () => void }).clearPromptPrivacy?.()
+  }
+  assertPromptPrivacyStopped(): void {
+    const assertStopped = (this.runner as { assertPromptPrivacyStopped?: () => void }).assertPromptPrivacyStopped
+    if (!assertStopped) throw new Error('助手隐私刷新无法核验旧进程状态。')
+    assertStopped.call(this.runner)
+  }
+  get promptPolicyFingerprint(): string | undefined {
+    return (this.runner as { promptPolicyFingerprint?: string }).promptPolicyFingerprint
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void {
+    (this.runner as { setPromptPrivacy?: (p: PromptPrivacyPolicy) => void }).setPromptPrivacy?.(policy)
+  }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return (this.runner as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }

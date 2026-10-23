@@ -335,8 +335,7 @@ export async function handleMemory(
       this.sendJson(res, 200, {
         text,
         charCount: text.length,
-        // memdir 下无写侧硬预算;limit = 注入侧 cap(user.md 实际会被注入的上限),
-        // 仍是 UI 预算条唯一有意义的界。单一权威 = promptSlots.USER_PROFILE_INJECT_MAX_CHARS。
+        // Legacy profile is now on-demand only. Zero disables the obsolete editor budget.
         limit: USER_PROFILE_INJECT_MAX_CHARS,
         // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
         version,

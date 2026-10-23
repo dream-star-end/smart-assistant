@@ -1,3 +1,4 @@
+import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy } from './promptPrivacyRuntime.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -742,6 +743,13 @@ export async function submit(
     // 应用。CodexAppServerRunner 在 runTurn 顶部比对 route 签名,变化时自行
     // shutdown + respawn(spawn 期 -c 参数),这里只 stash,不参与下方
     // effort/model 的合并 shutdown。
+    // Freeze consent before changing desired runtime configuration. A failed metadata read
+    // must leave old desired values intact so a retry still knows it must restart the warm process.
+    const privacyRunner = session.runner
+    const assertSessionCurrent = () => {
+      if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_PRIVACY_OPERATION_CANCELLED')
+    }
+    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertSessionCurrent })
     const maybeSetCodexRoute = (session.runner as any).setCodexRoute
     if (typeof maybeSetCodexRoute === 'function') {
       maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
@@ -781,6 +789,7 @@ export async function submit(
         iuiApplied,
         await getDesiredIntelligentUi(session.sessionKey).catch(() => undefined),
       )
+    assertSessionCurrent()
     if (effortChanged) session.runner.setEffortLevel(desiredEffort)
     if (modelChanged) {
       session.runner.setModel(desiredModel)
@@ -810,12 +819,14 @@ export async function submit(
         opts?.serviceTier === 'fast' ? 'fast' : null,
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
-    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || serviceTierChanged) {
+    if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
       try {
         await session.runner.shutdown()
+        if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
       } catch (err) {
+        if (privacyChanged) throw new Error('助手隐私设置尚未生效，本轮未发送；请稍后重试或新建会话。', { cause: err })
         log.warn(
           'effort/model/toolsets-change shutdown failed',
           // CG7 — traceId tagged so submit-layer failures join the turn's
@@ -1239,6 +1250,7 @@ export async function submit(
     const CHECK_INTERVAL = 15_000 // check every 15s
     const logicalTurnStartedAt = Date.now()
     let livenessTimer: NodeJS.Timeout | null = null
+    assertSessionCurrent()
     const livenessPromise = new Promise<never>((_, reject) => {
       livenessTimer = setInterval(() => {
         if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
@@ -1356,6 +1368,7 @@ export async function submit(
       throw err
     }
   } finally {
+    clearRunnerPromptPrivacy(session.runner)
     if (
       consumingModelSwitch &&
       transition &&
@@ -2260,231 +2273,249 @@ export async function finishIdleUnderLock(
     clearIdleCandidate(recoveryDir, session.sessionKey)
     return
   }
-  const started = startIdleOp({
-    dir: recoveryDir,
-    sessionKey: session.sessionKey,
-    sourceSessionId: source.sessionId,
-    sourceTurnKey: source.turnKey,
-    revision: proof.revision,
-    idleTurnKey: createHash('sha256')
-      .update(`${session.sessionKey}:${proof.revision}`)
-      .digest('hex'),
-    frozenTail: [],
-    attachments: [],
-  })
-  let op = withIncarnationShutdown(recoveryDir, started.op)
-  if (idleOpSettled(op)) {
+  const existingIdle = readIdleOp(recoveryDir, session.sessionKey, proof.revision)
+  if (existingIdle && idleOpSettled(existingIdle)) { clearIdleCandidate(recoveryDir, session.sessionKey); return }
+  const existingNative = existingIdle && readIdleNative(recoveryDir, source.sessionId, proof.revision)
+  if (existingIdle && nativeShortForOp(existingNative || undefined, { idleTurnKey: existingIdle.idleTurnKey, revision: proof.revision, sourceSessionId: source.sessionId })) {
     clearIdleCandidate(recoveryDir, session.sessionKey)
+    writeSettledIdleOp(recoveryDir, { ...withIncarnationShutdown(recoveryDir, existingIdle), disposition: 'short' })
     return
   }
-  const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
-  if (
-    nativeShortForOp(native, {
-      idleTurnKey: op.idleTurnKey,
-      revision: proof.revision,
-      sourceSessionId: source.sessionId,
-    })
-  ) {
-    clearIdleCandidate(recoveryDir, session.sessionKey)
-    writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
-    return
+  const privacyRunner = session.runner
+  const assertIdleCurrent = () => {
+    if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_IDLE_PRIVACY_CANCELLED')
   }
-  if (native?.frozenTail.length)
-    op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
-  const summaryProof = await fetchBoxIdleProof({
-    sessionId: source.sessionId,
-    turnKey: op.idleTurnKey,
-  })
-  const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
-  if (abandon) {
-    log.warn('box idle op abandoned', {
+  await refreshRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertIdleCurrent })
+  try {
+    const started = startIdleOp({
+      dir: recoveryDir,
       sessionKey: session.sessionKey,
-      revision: op.revision,
-      reason: abandon,
+      sourceSessionId: source.sessionId,
+      sourceTurnKey: source.turnKey,
+      revision: proof.revision,
+      idleTurnKey: createHash('sha256')
+        .update(`${session.sessionKey}:${proof.revision}`)
+        .digest('hex'),
+      frozenTail: [],
+      attachments: [],
     })
-    clearIdleCandidate(recoveryDir, session.sessionKey)
-    writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
-    return
-  }
-  const accepted = idleSummaryAccepted(summaryProof, {
-    sessionId: source.sessionId,
-    idleTurnKey: op.idleTurnKey,
-    nativeSummary: native?.summaryText,
-  })
-  if (accepted) {
-    op = {
-      ...op,
-      summaryText: accepted.summaryText,
-      capsuleSha256: accepted.capsuleSha256,
+    let op = withIncarnationShutdown(recoveryDir, started.op)
+    if (idleOpSettled(op)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
     }
-    if (!native?.summaryText) {
-      writeIdleNative(recoveryDir, {
-        v: 1,
-        opId: op.idleTurnKey,
+    const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    if (
+      nativeShortForOp(native, {
+        idleTurnKey: op.idleTurnKey,
+        revision: proof.revision,
+        sourceSessionId: source.sessionId,
+      })
+    ) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
+      return
+    }
+    if (native?.frozenTail.length)
+      op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
+    const summaryProof = await fetchBoxIdleProof({
+      sessionId: source.sessionId,
+      turnKey: op.idleTurnKey,
+    })
+    const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
+    if (abandon) {
+      log.warn('box idle op abandoned', {
+        sessionKey: session.sessionKey,
         revision: op.revision,
-        sessionId: source.sessionId,
+        reason: abandon,
+      })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+      return
+    }
+    const accepted = idleSummaryAccepted(summaryProof, {
+      sessionId: source.sessionId,
+      idleTurnKey: op.idleTurnKey,
+      nativeSummary: native?.summaryText,
+    })
+    if (accepted) {
+      op = {
+        ...op,
         summaryText: accepted.summaryText,
-        modelCalls: native?.modelCalls ?? 1,
-        modelStarted: true,
-        frozenTail: op.frozenTail,
-        attachments: op.attachments,
-      })
-    }
-  }
-  let step = advanceIdleOp({
-    op,
-    proof,
-    allowDispatch:
-      started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
-  })
-  const needsApply = Boolean(
-    step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest,
-  )
-  if (step.callModel || needsApply) {
-    if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
-      writeIdleNative(recoveryDir, {
-        v: 1,
-        opId: step.op.idleTurnKey,
-        revision: step.op.revision,
-        sessionId: source.sessionId,
-        ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
-        modelCalls: 0,
-        frozenTail: step.op.frozenTail,
-        attachments: step.op.attachments,
-      })
-    }
-    session._idleRunning = true
-    session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
-    try {
-      const settled = await runBoxIdleTurn(session.runner, {
-        input: IDLE_COMPACT_PROMPT,
-        turnKey: step.op.idleTurnKey,
-        onEvent: () => {},
-        sessionTotals: session,
-        toolUseIdToName: session.toolUseIdToName ?? new Map(),
-      })
-      const receipt = settled?.nativeIdleReceipt
-      const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
-      if (
-        nativeShortForOp(after, {
-          idleTurnKey: step.op.idleTurnKey,
-          revision: proof.revision,
-          sourceSessionId: source.sessionId,
-        })
-      ) {
-        clearIdleCandidate(recoveryDir, session.sessionKey)
-        step = { ...step, op: { ...step.op, disposition: 'short' } }
-      } else if (!step.op.summaryText && after?.summaryText) {
-        const again = await fetchBoxIdleProof({
+        capsuleSha256: accepted.capsuleSha256,
+      }
+      if (!native?.summaryText) {
+        writeIdleNative(recoveryDir, {
+          v: 1,
+          opId: op.idleTurnKey,
+          revision: op.revision,
           sessionId: source.sessionId,
+          summaryText: accepted.summaryText,
+          modelCalls: native?.modelCalls ?? 1,
+          modelStarted: true,
+          frozenTail: op.frozenTail,
+          attachments: op.attachments,
+        })
+      }
+    }
+    let step = advanceIdleOp({
+      op,
+      proof,
+      allowDispatch:
+        started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
+    })
+    const needsApply = Boolean(
+      step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest,
+    )
+    if (step.callModel || needsApply) {
+      if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
+        writeIdleNative(recoveryDir, {
+          v: 1,
+          opId: step.op.idleTurnKey,
+          revision: step.op.revision,
+          sessionId: source.sessionId,
+          ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
+          modelCalls: 0,
+          frozenTail: step.op.frozenTail,
+          attachments: step.op.attachments,
+        })
+      }
+      session._idleRunning = true
+      session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+      try {
+        assertIdleCurrent()
+        const settled = await runBoxIdleTurn(privacyRunner, {
+          input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
+          onEvent: () => {},
+          sessionTotals: session,
+          toolUseIdToName: session.toolUseIdToName ?? new Map(),
         })
-        const confirmed = idleSummaryAccepted(again, {
-          sessionId: source.sessionId,
-          idleTurnKey: step.op.idleTurnKey,
-          nativeSummary: after.summaryText,
-        })
-        if (confirmed) {
-          step = advanceIdleOp({
-            op: {
-              ...step.op,
-              summaryText: confirmed.summaryText,
-              capsuleSha256: confirmed.capsuleSha256,
-              frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
-              attachments: after.attachments,
-            },
-            proof,
-            allowDispatch: false,
+        const receipt = settled?.nativeIdleReceipt
+        const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        if (
+          nativeShortForOp(after, {
+            idleTurnKey: step.op.idleTurnKey,
+            revision: proof.revision,
+            sourceSessionId: source.sessionId,
           })
-          if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
-            const applied = await runBoxIdleTurn(session.runner, {
-              input: IDLE_COMPACT_PROMPT,
-              turnKey: step.op.idleTurnKey,
-              onEvent: () => {},
-              sessionTotals: session,
-              toolUseIdToName: session.toolUseIdToName ?? new Map(),
+        ) {
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+          step = { ...step, op: { ...step.op, disposition: 'short' } }
+        } else if (!step.op.summaryText && after?.summaryText) {
+          const again = await fetchBoxIdleProof({
+            sessionId: source.sessionId,
+            turnKey: step.op.idleTurnKey,
+          })
+          const confirmed = idleSummaryAccepted(again, {
+            sessionId: source.sessionId,
+            idleTurnKey: step.op.idleTurnKey,
+            nativeSummary: after.summaryText,
+          })
+          if (confirmed) {
+            step = advanceIdleOp({
+              op: {
+                ...step.op,
+                summaryText: confirmed.summaryText,
+                capsuleSha256: confirmed.capsuleSha256,
+                frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
+                attachments: after.attachments,
+              },
+              proof,
+              allowDispatch: false,
             })
-            const applyReceipt = applied?.nativeIdleReceipt
-            if (
-              applyReceipt &&
-              applyReceipt.opId === step.op.idleTurnKey &&
-              applyReceipt.digest === step.op.artifact.digest
-            ) {
-              step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
-              clearIdleCandidate(recoveryDir, session.sessionKey)
+            if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
+              assertIdleCurrent()
+              const applied = await runBoxIdleTurn(privacyRunner, {
+                input: IDLE_COMPACT_PROMPT,
+                turnKey: step.op.idleTurnKey,
+                onEvent: () => {},
+                sessionTotals: session,
+                toolUseIdToName: session.toolUseIdToName ?? new Map(),
+              })
+              const applyReceipt = applied?.nativeIdleReceipt
+              if (
+                applyReceipt &&
+                applyReceipt.opId === step.op.idleTurnKey &&
+                applyReceipt.digest === step.op.artifact.digest
+              ) {
+                step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
+                clearIdleCandidate(recoveryDir, session.sessionKey)
+              }
             }
           }
         }
-      }
-      if (
-        receipt &&
-        receipt.opId === step.op.idleTurnKey &&
-        step.op.artifact &&
-        receipt.digest === step.op.artifact.digest
-      ) {
-        step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
-        clearIdleCandidate(recoveryDir, session.sessionKey)
-      }
-      // OCV5-319: CCB ends the idle turn normally when its summary request
-      // was refused (e.g. Box egress BOX_PARAMETER_UNMAPPED on the
-      // thinking-disabled compact fallback). No summary arrived and none can
-      // be re-dispatched, so this is the same "ended without result" as a
-      // thrown turn: shut the child down and record it, or the op never
-      // settles and every next message fails with IDLE_HISTORY_PENDING.
-      if (
-        step.callModel &&
-        !step.op.summaryText &&
-        !idleOpSettled(step.op) &&
-        !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText
-      ) {
-        const killed =
-          typeof session.runner.shutdown === 'function' &&
-          (await session.runner.shutdown().then(
+        if (
+          receipt &&
+          receipt.opId === step.op.idleTurnKey &&
+          step.op.artifact &&
+          receipt.digest === step.op.artifact.digest
+        ) {
+          step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+        }
+        // OCV5-319: CCB ends the idle turn normally when its summary request
+        // was refused (e.g. Box egress BOX_PARAMETER_UNMAPPED on the
+        // thinking-disabled compact fallback). No summary arrived and none can
+        // be re-dispatched, so this is the same "ended without result" as a
+        // thrown turn: shut the child down and record it, or the op never
+        // settles and every next message fails with IDLE_HISTORY_PENDING.
+        if (
+          step.callModel &&
+          !step.op.summaryText &&
+          !idleOpSettled(step.op) &&
+          !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText
+        ) {
+          const killed =
+            typeof session.runner.shutdown === 'function' &&
+            (await session.runner.shutdown().then(
+              () => true,
+              () => false,
+            ))
+          if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+          if (killed) await stopParkedIdleTurn(step.op)
+          log.warn('box idle turn ended without result', {
+            sessionKey: session.sessionKey,
+            revision: step.op.revision,
+            timeout: false,
+            noSummary: true,
+            runnerKilled: killed,
+          })
+        }
+      } catch (idleErr) {
+        // Timeout, crash or error: never a result and never a re-dispatch
+        // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
+        // runner is recorded as evidence that it can no longer send the
+        // compact request; a later `not_found` past the grace window then
+        // proves nothing was sent. Without it the op waits for egress proof
+        // or the operator reset.
+        let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
+        if (!killed && typeof session.runner.shutdown === 'function') {
+          killed = await session.runner.shutdown().then(
             () => true,
             () => false,
-          ))
+          )
+        }
         if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
         if (killed) await stopParkedIdleTurn(step.op)
-        log.warn('box idle turn ended without result', {
-          sessionKey: session.sessionKey,
-          revision: step.op.revision,
-          timeout: false,
-          noSummary: true,
-          runnerKilled: killed,
-        })
-      }
-    } catch (idleErr) {
-      // Timeout, crash or error: never a result and never a re-dispatch
-      // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
-      // runner is recorded as evidence that it can no longer send the
-      // compact request; a later `not_found` past the grace window then
-      // proves nothing was sent. Without it the op waits for egress proof
-      // or the operator reset.
-      let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
-      if (!killed && typeof session.runner.shutdown === 'function') {
-        killed = await session.runner.shutdown().then(
-          () => true,
-          () => false,
+        log.warn(
+          'box idle turn ended without result',
+          {
+            sessionKey: session.sessionKey,
+            revision: step.op.revision,
+            timeout: idleErr instanceof IdleTurnTimeoutError,
+            runnerKilled: killed,
+          },
+          idleErr,
         )
+      } finally {
+        session._idleRunning = false
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
       }
-      if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
-      if (killed) await stopParkedIdleTurn(step.op)
-      log.warn(
-        'box idle turn ended without result',
-        {
-          sessionKey: session.sessionKey,
-          revision: step.op.revision,
-          timeout: idleErr instanceof IdleTurnTimeoutError,
-          runnerKilled: killed,
-        },
-        idleErr,
-      )
-    } finally {
-      session._idleRunning = false
-      session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
     }
-  }
-  writeSettledIdleOp(recoveryDir, step.op)
+    writeSettledIdleOp(recoveryDir, step.op)
+  } finally { clearRunnerPromptPrivacy(session.runner) }
+
 }
 
 /** Record a platform-executed turn (for example a trusted Image 2 edit)

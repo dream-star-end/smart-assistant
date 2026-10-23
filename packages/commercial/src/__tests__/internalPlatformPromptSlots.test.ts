@@ -187,6 +187,7 @@ describe("internalPlatformPromptSlots — auth & method gate", () => {
   test("非 GET → 405", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -200,6 +201,7 @@ describe("internalPlatformPromptSlots — auth & method gate", () => {
 
   test("identity 失败 → 401(repo 找不到 row)", async () => {
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: memRepo([]), // 空 repo
       pricingCache: makePricing([]),
@@ -216,6 +218,7 @@ describe("internalPlatformPromptSlots — auth & method gate", () => {
 
   test("identity 失败 → 响应体不暴露 errcode 细节", async () => {
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: memRepo([]),
       pricingCache: makePricing([]),
@@ -236,6 +239,7 @@ describe("internalPlatformPromptSlots — auth & method gate", () => {
   test("missing Authorization → 401", async () => {
     const { repo } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -252,6 +256,7 @@ describe("internalPlatformPromptSlots — SKILLS_LITERATURE slot", () => {
   test("cfg.enabled=false → SKILLS_LITERATURE 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -268,6 +273,7 @@ describe("internalPlatformPromptSlots — SKILLS_LITERATURE slot", () => {
   test("cfg.enabled=true && token_set=false → 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -284,6 +290,7 @@ describe("internalPlatformPromptSlots — SKILLS_LITERATURE slot", () => {
   test("cfg enabled+token_set → emit + content 非空 + 不带 canonicalModelId", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -305,6 +312,7 @@ describe("internalPlatformPromptSlots — SKILLS_LITERATURE slot", () => {
   test("readLitCfg 抛错 → 该 slot 静默不 emit,整体 200(fail-soft)", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -325,6 +333,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("无 ?model query → 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -343,6 +352,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("?model 命中 + extra_system_prompt 非空 → emit + 包成与 hook 同型 markdown + canonicalModelId", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -376,6 +386,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("?model 命中但 extra_system_prompt = null → 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -397,6 +408,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("?model 命中但 extra_system_prompt 全空白 → 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -417,6 +429,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("?model miss pricing → 不 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]), // 空表
@@ -435,6 +448,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
   test("?model 超长(>128 bytes)→ 等同没传,只 emit literature", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -459,6 +473,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT slot", () => {
     // 入参是带日期 alias 的 firstParty 形式,canonicalize 后落到 row.model_id
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -489,6 +504,7 @@ describe("internalPlatformPromptSlots — combined behavior", () => {
   test("literature + model_hint 都启用 → 两个 slot 都 emit", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -516,6 +532,7 @@ describe("internalPlatformPromptSlots — combined behavior", () => {
   test("空结果 {slots: []} 是合法 200 响应", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -525,12 +542,13 @@ describe("internalPlatformPromptSlots — combined behavior", () => {
     const res = makeRes();
     await handler(req, res, { hostUuid: HOST, boundIp: IP });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(parseBody(res.body), { slots: [] });
+    assert.deepEqual(parseBody(res.body), { slots: [], promptPolicy: { schemaVersion: 1, profile: null } });
   });
 
   test("响应带 Cache-Control: no-store(防中间层缓存)", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -545,6 +563,7 @@ describe("internalPlatformPromptSlots — combined behavior", () => {
   test("响应 Content-Type 是 application/json; charset=utf-8", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([]),
@@ -632,6 +651,7 @@ async function hintFor(
 ): Promise<PlatformSlotResponse | undefined> {
   const { repo, auth } = setupValidIdentity();
   const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
     identityRepo: repo,
     pricingCache: makePricing(
@@ -687,6 +707,7 @@ describe("internalPlatformPromptSlots — MODEL_HINT alias 经 catalog 归一", 
   test("catalog fence 失败 → MODEL_HINT 静默不出(fail-soft),literature 不受影响", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       resolveIntelligentUi: async () => null,
       identityRepo: repo,
       pricingCache: makePricing([
@@ -714,6 +735,7 @@ describe("internalPlatformPromptSlots — INTELLIGENT_UI", () => {
     const { repo, auth } = setupValidIdentity();
     const seen: number[] = [];
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       identityRepo: repo,
       pricingCache: makePricing([]),
       readLiteratureSkillConfig: async () => litDisabled,
@@ -733,6 +755,7 @@ describe("internalPlatformPromptSlots — INTELLIGENT_UI", () => {
   test("开关关(resolver 返回 null)→ 不下发", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       identityRepo: repo,
       pricingCache: makePricing([]),
       readLiteratureSkillConfig: async () => litDisabled,
@@ -746,6 +769,7 @@ describe("internalPlatformPromptSlots — INTELLIGENT_UI", () => {
   test("resolver 抛错 → fail-soft,其它 slot 照常", async () => {
     const { repo, auth } = setupValidIdentity();
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       identityRepo: repo,
       pricingCache: makePricing([]),
       readLiteratureSkillConfig: async () => litEnabled,
@@ -763,6 +787,7 @@ describe("internalPlatformPromptSlots — INTELLIGENT_UI", () => {
     const { repo } = setupValidIdentity();
     let called = false;
     const handler = makePlatformPromptSlotsHandler({
+      readPreferences: async () => ({ prefs: {}, updated_at: "2000-01-01T00:00:00Z" }),
       identityRepo: repo,
       pricingCache: makePricing([]),
       readLiteratureSkillConfig: async () => litDisabled,
@@ -791,3 +816,34 @@ test("taskboard surface keeps container identity as the only preference uid auth
   assert.deepEqual(seen, [[765, { surface: "taskboard" }]]);
   assert.deepEqual(parseBody(res.body).slots, [{ name: "INTELLIGENT_UI", content: "COMPONENTS_ONLY" }]);
 });
+
+// Pure in-memory identity and preferences; no real user/PG access.
+describe('minimal prompt privacy metadata', () => {
+  test('identity-derived uid and exact conversation scope work with IUI disabled', async () => {
+    const { repo, auth, id } = setupValidIdentity()
+    const calls: string[] = []
+    const handler = makePlatformPromptSlotsHandler({
+      identityRepo: repo, pricingCache: makePricing([]),
+      readLiteratureSkillConfig: async () => litDisabled, resolveIntelligentUi: async () => null,
+      readPreferences: async uid => { calls.push(String(uid)); return { prefs: { system_assistant_profile: { enabled: true, nickname: '小林', sessionId: 'scope-a' } }, updated_at: '2000-01-01T00:00:00Z' } },
+    })
+    const res = makeRes()
+    await handler(makeReq({ authorization: auth, url: `${PLATFORM_PROMPT_SLOTS_PATH}?sessionId=scope-a&userId=765` }), res, { hostUuid: HOST, boundIp: IP })
+    assert.deepEqual(calls, [String(id.userId)])
+    assert.deepEqual(parseBody(res.body), { slots: [], promptPolicy: { schemaVersion: 1, profile: { nickname: '小林', sessionId: 'scope-a' } } })
+    const other = makeRes()
+    await handler(makeReq({ authorization: auth, url: `${PLATFORM_PROMPT_SLOTS_PATH}?sessionId=scope-b` }), other, { hostUuid: HOST, boundIp: IP })
+    assert.deepEqual(parseBody(other.body).promptPolicy, { schemaVersion: 1, profile: null })
+  })
+  test('preference failure returns a closed projection and no raw failure details', async () => {
+    const { repo, auth } = setupValidIdentity()
+    const handler = makePlatformPromptSlotsHandler({ identityRepo: repo, pricingCache: makePricing([]),
+      readLiteratureSkillConfig: async () => litDisabled, resolveIntelligentUi: async () => null,
+      readPreferences: async () => { throw new Error('fixture-private-profile') },
+    })
+    const res = makeRes()
+    await handler(makeReq({ authorization: auth }), res, { hostUuid: HOST, boundIp: IP })
+    assert.deepEqual(parseBody(res.body).promptPolicy, { schemaVersion: 1, profile: null })
+    assert.doesNotMatch(res.body, /fixture-private-profile/)
+  })
+})
