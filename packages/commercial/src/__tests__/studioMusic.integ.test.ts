@@ -275,6 +275,29 @@ describe('studio music sources (OCV5-591 M1)', () => {
     assert.deepEqual(s.rows[0], { take: row.id, spent: '0' })
   })
 
+  test('an older choice finishing last never replaces a newer one (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const { blobs, exec, api } = await setup()
+    const uid = await user()
+    const p = await new StudioStore(getPool()).createProject(uid, {})
+    const a = await catalogTrack(blobs, { title: 'Track A', bpm: 80, moods: ['宁静'], seconds: 90 })
+    const b = await catalogTrack(blobs, { title: 'Track B', bpm: 90, moods: ['轻快'], seconds: 90 })
+    await api.selectMusic(uid, p.id, { providerId: 'music-catalog', trackId: a.id })
+    await api.selectMusic(uid, p.id, { providerId: 'music-catalog', trackId: b.id })
+    const tasks = await claimStudioTasks(getPool(), { owner: 'A', limit: 2, museOnline: false })
+    const byTrack = (id: string) =>
+      tasks.find((x) => (x.payload as { request: { trackId: string } }).request.trackId === id)!
+    // B (the newer choice) finishes first, then A.
+    await executeTask(exec, byTrack(b.id), new AbortController().signal)
+    await executeTask(exec, byTrack(a.id), new AbortController().signal)
+    const cur = await query<{ sha: string }>(
+      `SELECT t.blob_sha AS sha FROM studio_projects p JOIN studio_takes t ON t.id::text = p.settings->>'musicTakeId'
+        WHERE p.id = $1`,
+      [p.id],
+    )
+    assert.equal(cur.rows[0]!.sha, b.audio)
+  })
+
   test('My Music is per user', async (t) => {
     if (skip(t)) return
     const { blobs, exec, api, providers } = await setup()

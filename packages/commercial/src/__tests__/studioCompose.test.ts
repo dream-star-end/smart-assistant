@@ -57,6 +57,14 @@ describe('compose music edit (OCV5-591 M1)', () => {
     return cmd.argv[cmd.argv.indexOf('-filter_complex') + 1]!
   }
 
+  const graphOfSpan = (spec: Record<string, unknown>, music: Record<string, unknown>) => {
+    const cmd = buildCommand({
+      op: 'compose',
+      spec: { ...spec, music: { file: 'm.mp3', ...music } } as never,
+    })
+    return cmd.argv[cmd.argv.indexOf('-filter_complex') + 1]!
+  }
+
   test('without placement the graph is the A0 one', () => {
     const g = graphOf({ gainDb: -6 })
     assert.match(g, /volume=-6dB,afade=t=in:st=0:d=1,afade=t=out:st=17\.5:d=2\.5\[mus\]/)
@@ -86,6 +94,24 @@ describe('compose music edit (OCV5-591 M1)', () => {
   test('a loop without crossfade concatenates; a short span is never looped', () => {
     assert.match(graphOf({ outSec: 5, loop: {} }), /concat=n=4:v=0:a=1\[mloop\]/)
     assert.doesNotMatch(graphOf({ outSec: 30, loop: {} }), /\[mrep0\]/)
+  })
+
+  test('a loop that would need too many repeats is refused, never cut short with silence (code r1 P1)', () => {
+    assert.throws(
+      () => validateMusicEdit({ inSec: 0, outSec: 1, startSec: 0, endSec: 60, loop: {} }),
+      /more than 24 repeats/,
+    )
+    // Span only known from the film: refused when the command is built.
+    const long = { ...MUSIC_BASE, clips: [{ file: 'a.mp4', inSec: 0, outSec: 60 }] }
+    assert.throws(
+      () =>
+        buildCommand({
+          op: 'compose',
+          spec: { ...long, music: { file: 'm.mp3', outSec: 1, loop: {} } } as never,
+        }),
+      /more than 24 repeats/,
+    )
+    assert.match(graphOfSpan(long, { outSec: 3, loop: {} }), /asplit=20/)
   })
 
   test('refuses edits that cannot be cut', () => {

@@ -95,6 +95,15 @@ export interface MusicEdit {
 
 const MUSIC_LOOP_MAX_REPEATS = 24
 
+/** Copies of the looped part needed to fill `span` seconds (crossfades overlap by `xf`). */
+function loopRepeats(span: number, part: number, xf: number): number {
+  return Math.max(1, Math.ceil((span - xf) / (part - xf)))
+}
+const tooManyRepeats = () =>
+  new ComposeSpecError(
+    `music.loop would need more than ${MUSIC_LOOP_MAX_REPEATS} repeats; use a longer part of the track`,
+  )
+
 /** Validates a music edit (also used by the HTTP API before it is stored). Returns a clean copy. */
 export function validateMusicEdit(raw: unknown): MusicEdit {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw))
@@ -142,6 +151,12 @@ export function validateMusicEdit(raw: unknown): MusicEdit {
     if (xf * 2 >= out.outSec - (out.inSec ?? 0))
       throw new ComposeSpecError('music.loop.crossfadeSec must be under half the looped part')
     out.loop = { crossfadeSec: xf }
+    // Known span: refuse now rather than at compose time (code r1 P1: no silent tail).
+    if (out.endSec !== undefined) {
+      const span = out.endSec - (out.startSec ?? 0)
+      if (loopRepeats(span, out.outSec - (out.inSec ?? 0), xf) > MUSIC_LOOP_MAX_REPEATS)
+        throw tooManyRepeats()
+    }
   }
   if (m.duck !== undefined) {
     if (!m.duck || typeof m.duck !== 'object' || Array.isArray(m.duck))
@@ -217,10 +232,9 @@ function musicPlacement(
   if (m.loop && m.outSec !== undefined) {
     const part = m.outSec - (m.inSec ?? 0)
     const xf = m.loop.crossfadeSec ?? 0
-    const repeats = Math.min(
-      MUSIC_LOOP_MAX_REPEATS,
-      Math.max(1, Math.ceil((span - xf) / (part - xf))),
-    )
+    const repeats = loopRepeats(span, part, xf)
+    // Never cap silently: a capped loop would leave the rest of the span without music.
+    if (repeats > MUSIC_LOOP_MAX_REPEATS) throw tooManyRepeats()
     if (repeats > 1) {
       const copies = Array.from({ length: repeats }, (_, i) => `mrep${i}`)
       graph.push(`[mtrim]asplit=${repeats}${copies.map((c) => `[${c}]`).join('')}`)

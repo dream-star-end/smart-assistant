@@ -377,17 +377,24 @@ async function adopt(
       }
     }
   } else if (g.ownerKind === 'music') {
-    // The project's soundtrack (OCV5-591 M1): the newest chosen track wins. Its licence snapshot is
-    // in the take's meta; the edit (trim, loop, fades, ducking) stays as the user set it.
-    await c.query(
-      `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicTakeId', $2::text),
-              rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+    // The project's soundtrack (OCV5-591 M1): the newest chosen track wins. Takes are versioned in
+    // the order the user chose them, so a slower, older choice finishing last never replaces a newer
+    // one (code r1 P1). Its licence snapshot is in the take's meta; the edit stays as the user set it.
+    const adopted = await c.query(
+      `UPDATE studio_projects p SET settings = p.settings || jsonb_build_object('musicTakeId', $2::text),
+              rev = p.rev + 1, updated_at = NOW()
+        WHERE p.id = $1
+          AND NOT EXISTS (SELECT 1 FROM studio_takes cur, studio_takes mine
+                           WHERE cur.id::text = p.settings->>'musicTakeId' AND mine.id = $2::uuid
+                             AND cur.version > mine.version)`,
       [projectId, takeId],
     )
-    await appendStudioEvent(c, projectId, 'music.selected', {
-      takeId,
-      message: '配乐换成了你选的曲子。',
-    })
+    if (adopted.rowCount) {
+      await appendStudioEvent(c, projectId, 'music.selected', {
+        takeId,
+        message: '配乐换成了你选的曲子。',
+      })
+    }
   }
   // shot_frame: nothing to adopt — the next advance starts the video from it.
 }
