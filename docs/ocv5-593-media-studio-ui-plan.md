@@ -11,6 +11,11 @@
   - 新增 `parseStudioPath()`（纯函数 + 单测）；`popstate` 同步；未授权或项目不存在时显示工作台内的 404 空态，不跳回聊天。
 - 整个工作台是一个 lazy chunk（`components/studio/StudioApp.tsx`），首屏预算（`firstScreenBudget`）不变；预取只在侧栏入口 hover 时触发。
 
+### 实现修订（FE-1，2026-10-23）
+- **整页独立界面，而不是第四个聊天工作区**：设计稿的工作台用的是 64px 窄图标栏（d01–d08），不是聊天侧栏；把它塞进 App 的「对话 / 任务面板 / 项目主页」三工作区和 `useAppRoute` 的 popstate 状态机，改动面大、回归风险高。实际做法：`readLocationRoute` 识别 `/studio[/…]`（`studio: true`）并对其关闭聊天路由的解析和 URL 镜像；App 在 `/desktop/enroll` 分支旁提前返回 `<StudioApp>`（lazy chunk，未登录时仍先走登录页）。工作台内部用 `pushState` + `popstate` 自管路由；回到对话是整页跳转到 `/`。
+- **入口**：账号菜单「媒体工作台」，App 登录后探测一次 `GET /api/studio/providers`（照「ChatGPT 直连」的门控：明确 200 才显示，默认隐藏；按身份 epoch 缓存）。
+- **token 作用域**：工作台专有 token（舞台、agent 青柠、批注、轨道色）定义在 `.studio-root` / `.dark .studio-root` 上，放在随 lazy chunk 加载的 `components/studio/studio.css`，**不改全局 `styles.css`**，首屏 CSS 零增量；外壳颜色直接用主站已有 token。
+
 ## 2. 代码结构
 ```
 src/lib/studio/
