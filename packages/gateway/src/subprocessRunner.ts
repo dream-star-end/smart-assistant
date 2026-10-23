@@ -642,6 +642,7 @@ export class SubprocessRunner extends EventEmitter {
       throw err
     }
 
+    if (epoch !== this._startEpoch) return
     const restrictedMemorySources = isV3ContainerRuntime()
     // Claude Code resolves `--resume <uuid>` ONLY under
     // `$CLAUDE_CONFIG_DIR/projects/<sanitize(cwd)>/`. Our resume-map probe
@@ -668,6 +669,7 @@ export class SubprocessRunner extends EventEmitter {
         })
       }
     }
+    if (epoch !== this._startEpoch) return
     const previousRestoreSocket = this.transcriptRestoreSocket
     if (previousRestoreSocket) {
       await previousRestoreSocket.close()

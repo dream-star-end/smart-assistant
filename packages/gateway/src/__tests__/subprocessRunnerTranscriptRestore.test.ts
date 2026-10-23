@@ -72,3 +72,22 @@ test('a late old capability closes itself without spawning or replacing the new 
   assert.equal(r.isRunning, false); assert.equal(Reflect.get(r, 'transcriptRestoreSocket'), null)
   await r.shutdown()
 })
+
+test('an old start delayed before learning context cannot close the new generation socket', async () => {
+  const b = capability('new-after-context'), entered = deferred<void>(), release = deferred<{ workingDir: string }>()
+  let preparations = 0, factories = 0
+  __setCcbTranscriptRestoreSocketFactoryForTests(async () => { factories++; return b })
+  const child = new FakeProc(), envs: Array<Record<string, string | undefined>> = []
+  __setCcbSpawnForTests(opts => { envs.push({ ...opts.env }); return child as never })
+  const r = runner()
+  Reflect.set(r, 'buildLearningContext', async () => { if (++preparations === 1) { entered.resolve(); return release.promise } return { workingDir: directory } })
+  const first = r.start()
+  await entered.promise
+  await r.shutdown(); await r.start()
+  assert.equal(factories, 1); assert.equal(envs.length, 1)
+  assert.equal(envs[0]!.OPENCLAUDE_TRANSCRIPT_RECOVERY_SOCKET, b.socketPath)
+  release.resolve({ workingDir: directory }); await first
+  assert.equal(factories, 1); assert.equal(envs.length, 1); assert.equal(b.closes, 0)
+  assert.equal(r.isRunning, true); assert.equal(Reflect.get(r, 'transcriptRestoreSocket'), b)
+  child.finish(); assert.equal(b.closes, 1); await r.shutdown()
+})
