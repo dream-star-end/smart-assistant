@@ -28,7 +28,8 @@ const vars = (() => {
   return lib.slice(a, b + 'MASTER_GATE_DB_STAGING=""'.length);
 })();
 const fns = ["master_gate_base_dsn", "master_gate_load1", "master_gate_load_scale", "master_gate_busy_reason",
-  "master_gate_wait_host_idle", "master_gate_attempt_log", "master_gate_flaky_signature", "master_gate_retryable"]
+  "master_gate_wait_host_idle", "master_gate_attempt_log", "master_gate_flaky_signature", "master_gate_first_failure",
+  "master_gate_retryable"]
   .map(fn).join("\n");
 
 type Fx = { dir: string; loadavg: string; locks: string; proc: string; trains: string };
@@ -235,6 +236,40 @@ fake_gate() { echo PASS; }; rc=0; master_gate_retryable ccb-mcp fake_gate || rc=
     assert.equal(notes["retry.box-incident-proofs"], undefined);
     assert.equal(notes["retry.ccb-mcp"], undefined);
     assert.equal(notes["loadScale.ccb-mcp"], "1.00");
+  });
+
+  test("each failed attempt's first error is in the summary, first run and rerun apart (OCV5-583)", (t) => {
+    const fx = fixture(t);
+    const r = run(fx, `${gate(["[box-incident-proofs] CONFIG_ROW_handoff"])}
+LEASE_TRAIN_ID=${TID}; tsum_init; MASTER_GATE_TMPDIR="$TMPDIR"
+rc=0; master_gate_retryable box-incident-proofs fake_gate || rc=$?; echo rc=$rc
+rm -f "$TMPDIR/n"; ${gate(["Query read timeout", "Query read timeout"])}
+rc=0; master_gate_retryable box-success-recovery fake_gate || rc=$?; echo rc=$rc
+fake_gate() { echo no marker; return 3; }; rc=0; master_gate_retryable ccb-mcp fake_gate || rc=$?; echo rc=$rc
+rm -f "$TMPDIR/n"; ${gate(["Query read timeout"])}
+rc=0; master_gate_retryable cron fake_gate || rc=$?; echo rc=$rc; tsum_finish 1`, { MASTER_GATE_IDLE_TIMEOUT_S: "5" });
+    assert.match(r.stdout, /^rc=1\nrc=1\nrc=1\nrc=0$/m, r.stderr); // a failure that is not rerun returns 1, not the gate's rc
+    const notes = summary(fx).notes;
+    assert.match(notes["gateFailure.box-incident-proofs.attempt1"]!, /box-incident-proofs.*CONFIG_ROW_handoff$/);
+    assert.equal(notes["gateFailure.box-incident-proofs.attempt2"], undefined, "an unknown failure is not rerun");
+    assert.match(notes["gateFailure.box-success-recovery.attempt1"]!, /Query.read.timeout$/);
+    assert.match(notes["gateFailure.box-success-recovery.attempt2"]!, /Query.read.timeout$/);
+    assert.match(notes["gateFailure.ccb-mcp.attempt1"]!, /^rc=3.*no.*gate-failure.*line/);
+    // a flake that passes on the rerun keeps its first error; the pass adds nothing
+    assert.match(notes["gateFailure.cron.attempt1"]!, /Query.read.timeout$/);
+    assert.equal(notes["gateFailure.cron.attempt2"], undefined);
+  });
+
+  test("admission: the host-idle wait runs before the candidate is built (OCV5-583)", () => {
+    const body = fn("build_master_release");
+    const dry = body.indexOf('if [[ "${DRY:-0}" == 1 ]]; then');
+    const admission = body.indexOf("master_gate_wait_host_idle admission");
+    const staging = body.indexOf('mkdir -p -- "$staging"');
+    const boxGates = body.indexOf("master_gate_wait_host_idle box-gates");
+    assert.ok(dry > 0 && admission > dry, "after the dry-run return: a dry run never waits");
+    assert.ok(staging > admission, "before the staging tree, the archive and the dependencies");
+    assert.ok(boxGates > staging, "the Box-gate wait stays: the host can turn busy during the build");
+    assert.match(body.slice(admission, admission + 200), /\|\| die /, "still busy after the limit: give up, nothing built");
   });
 
   test("without a train id the attempt logs still land on disk", (t) => {
