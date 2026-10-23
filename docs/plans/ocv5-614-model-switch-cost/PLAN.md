@@ -1,6 +1,6 @@
 # OCV5-614：切换贵模型首轮费用确认方案
 
-状态：草案，尚未送默认 Codex 审查；禁止先实现产品代码。仅个人版，基线 f6077bf22；不改价格、扣费公式、模型路由、现有 Opus/Fable 新会话限制。
+状态：草案第 1 轮默认 Codex APPROVED；以下补充有界读取和取消保稿细节，复审后才能实现产品代码。仅个人版，基线 f6077bf22；不改价格、扣费公式、模型路由、现有 Opus/Fable 新会话限制。
 
 ## 1. 判断什么是“贵”
 
@@ -15,11 +15,13 @@
 
 ## 2. 上下文与估价
 
-复用 FINDINGS 中的最近父调用 `_callUsage`，上下文为 input+cacheRead+cacheCreation；只遍历父消息/块，不下钻 agent-group 子树，按 callId 去重。它是上次请求时点的计数，下一轮仍是预估。其他引擎复用平台现有 `modelHistory` 语义序列化与 `estimateModelHistoryTokens`，标明“约/历史估算”；不再实现一个 tokenizer，不拿累计 usage 冒充 context。
+复用 FINDINGS 中的最近父调用 `_callUsage`，上下文为 input+cacheRead+cacheCreation；只遍历父消息/块，不下钻 agent-group 子树，按 callId 去重。它是上次请求时点的计数，下一轮仍是预估。报价不能调用全量 `getClientSession exact`：先读取限定 owner/session 的最近 5 条已终结根 tape 的小型 usage 元数据；最近根 tape 尾部最多读取 16 条父记录，按现有 inline/page 字节预算限定总载荷，在 Node 用既有 JSON.parse 语义提取计数（不对含 Unicode 边界的 payload 强制转 PG JSONB）。最新记录超界或缺失时不能拿旧调用冒充最新计数。
+
+其他引擎复用平台现有 `modelHistory` 语义序列化与 `estimateModelHistoryTokens`，优先读已完成 sidecar 的既有 token_estimate；重建时沿用 `getEngineContextMessages` 的可信有效窗口/engine/currentUserText。不得使用 contextWindow=undefined 触发无界读取，不调用 legacy/backfill 全量水合兜底；缺 sidecar/超预算则返回“暂时无法可靠预估”，可重试或新会话。标明“约/历史估算”，说明不含原生隐藏状态的精确计数；不再实现 tokenizer，不拿累计 usage 冒充 context。最近成功回合整轮 usage 只用于输出统计和模型来源。
 
 输出预测取本会话最近 5 个正常完成父回合的输出中位数与较高分位数，排除失败/取消；不足时使用配置默认 2048/4096 token，受目标已有输出上限约束。工具调用次数有可用 call snapshots 时，按最近成功回合 callId 去重统计；无数据默认一次请求，并明确工具/重试可能增加费用。
 
-单次基础预估：`C × 冷输入/写缓存价 + O × 输出价`；冷价按实际引擎收费路径使用 input 或 cache write，无法确定分类时取较高者。后续工具往返有统计时，另按重复输入的缓存读/普通输入区间估计。留在当前模型根据最近调用的缓存比例估计，并展示缓存失效下的较高端；不承诺缓存一定命中。两端都复用 `computeCostFen`，同一模型/agent/Fast/Cursor 生效倍率，只在显示时除以 100。
+单次基础预估：`C × 冷输入/写缓存价 + O × 输出价`；冷价按实际引擎收费路径使用 input 或 cache write，无法确定分类时取较高者。后续工具往返有统计时，以 `max(K-1,0) × C × 后续输入价` 加入预测，K 为近期成功父回合去重调用数；低端按可用缓存读价、高端按冷价，O 为整轮输出、不能再乘 K。K 缺失默认 1，需文案明确未预测额外工具循环。留在当前模型根据最近调用的缓存比例估计，并展示缓存失效下的较高端；不承诺缓存一定命中。两端都复用 `computeCostFen`，同一模型/agent/Fast/Cursor 生效倍率，只在显示时除以 100。
 
 响应包含中值、区间、统计样本数、计数来源/时点和估计解释。UI 文案：“首轮预估，工具调用、重试及上下文变化可能增加费用，以实际扣费为准。”预估区间不是消费上限。跨引擎重建、压缩等沿用原策略，不按完整历史计数承诺一定发送完整历史；压缩操作本身另有当前模型用量，不混入目标冷首请求。
 
@@ -27,11 +29,13 @@
 
 新增独立 modelSwitchCost policy/service 与已鉴权的 `POST /api/me/sessions/:id/model-switch-estimate`。所有权来自登录 uid 与 `c:<uid>`，读取已有 session/tape/价格/完整可用余额；客户端不能提交可信 token 数、余额、价格或 sourceModel。新会话不存在时仅在真正没有持久内容的情况下豁免。
 
-比较源取上次实际执行/完成的父模型（持久化消息元数据或 dispatch execution snapshot），不取刚 PATCH 的 UI modelId。目标沿用现有解析结果：team main > frame.model > agent 权威；估价服务只检查解析结果，不参与选路。
+比较源取上次实际执行/完成的父模型：根 tape.usage.model，必要时限定 owner/session 查询已实际终结成功的 turn_dispatches.model；此基线没有 execution_snapshot 列。不取刚 PATCH 的 UI modelId。目标沿用现有解析结果：team main > frame.model > agent 权威；估价服务只检查解析结果，不参与选路。
 
 报价绑定 uid、session、源/目标型号、agent、Fast/contextTier/模式等影响定价的执行参数、历史修订/最新调用、价格指纹、余额和短有效期（默认 5 分钟）。前端只能确认后取得/提交服务端签名授权；不得接受 `confirmed:true`。复用既有签名能力，签名/原始凭据不写日志。
 
-实际 WS dispatch 在最终有效模型已确定、任何付费动作/route acquire/preCheck/journal/转发前执行同一检查。缺确认返回结构化 `MODEL_SWITCH_CONFIRMATION_REQUIRED`；过期、上下文/价格/余额变动重新报价，不产生上游费用。授权绑定下一次请求幂等标识，重连重试不重复执行；不持久化免提醒豁免，不改变已有 dispatch 幂等和结算机制。直接 WS、默认偏好、team、重试/恢复的有效模型变化都受此兜底。
+实际 WS dispatch 在最终有效模型已确定、任何付费动作/route acquire/preCheck/journal/转发前执行同一检查，落点为 attachMasterTurnState 开头（其 historyModel 已是有效目标），在 durable admission 之前。缺确认返回结构化 `MODEL_SWITCH_CONFIRMATION_REQUIRED`；过期、上下文/价格/余额变动重新报价，不产生上游费用；走现有 onReject/promptQueue/refusal 收口，分类为等待明确用户处理，不能自动循环重试。授权绑定下一次请求幂等标识，重连重试不重复执行；不持久化免提醒豁免，不改变已有 dispatch 幂等和结算机制。直接 WS、默认偏好、team、重试/恢复的有效模型变化都受此兜底。
+
+选择时的授权不能掩盖用户随后粘贴的大额新输入：发送预检用既有计数函数加入新消息/可计量附件输入，超出已确认范围则重新确认。签名包含确认费用范围及请求 ID；选择时预分配该 ID，真正发送沿用，不能把同一个授权用在任意新请求。不能精确计量的输入要披露精度，不宣称区间为硬上限。
 
 后台新 run 的阶段会话豁免，不修改 PR1044 的阶段优先级。独立 delegate 的授权不得复用主会话授权；若确有同一已有委派会话改模型的入口，须同样阻止未确认的昂贵续用，不能借主会话 token 绕过。实现时以实际可执行入口为准；不为了本票扩展 CLI/后台模型路由。
 
@@ -45,9 +49,9 @@
 
 此处是新增的切换准入，不改变既有 preCheck/reservation/spend；现有 spend clamp 保持。足额报价不能承诺整轮最高花费，UI 明示预测局限。不会新增预扣、超额扣费或改成负余额。
 
-普通选择器先预检，再进入既有压缩/新会话流程；需要压缩时完成后重新报价，不能先花钱压缩再问是否接受目标模型费用。team/模式改变预检有效父模型；智能体切换与偏好恢复的遗漏由统一发送检查与后端兜底覆盖。发送兜底须在插入用户消息/清空草稿之前确认；取消不会留下假发送或自动重发。
+普通选择器先预检，再进入既有压缩/新会话流程；需要压缩时完成后重新报价，不能先花钱压缩再问是否接受目标模型费用。team/模式改变预检有效父模型；智能体切换与偏好恢复的遗漏由统一发送检查与后端兜底覆盖。发送兜底须在插入用户消息/清空草稿之前确认；取消不会留下假发送或自动重发。Composer 的 onSend 契约必须可 await 并返回成功/取消；只有成功且 draftKey/编辑版本未变化才清文本、附件、reply，等待时防重复点击。socket 的 routing/pending/retry/recovery 传播同一受限授权，任何漏接入口仍由后端零费用拒绝。
 
-桌面 1440×1000 与手机 390×844 原生组件设计稿待附 `evidence/desktop-design.png`、`mobile-design.png`。设计示例数值必须标注为示例，不当作真实预估/扣费验收。
+桌面 1440×1000 与手机 390×844 原生组件设计稿已附 `evidence/desktop-design.png`、`evidence/mobile-design.png`（本机同目录；远端 g614-model-switch-cost）。使用现有 Modal/Button 和线上 CSS，数字不拆行，无横向溢出。示例明确标记“设计示例 · 数值用于展示，尚未上线”，不当作真实预估/扣费验收。
 
 ## 5. 测试、评审与发布
 

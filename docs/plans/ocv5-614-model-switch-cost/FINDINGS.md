@@ -26,7 +26,7 @@
 
 - `sessionTypes.ts:182` 的 totalInput/Output/Cache* 是跨回合累计；CCB result.usage 也是整轮多次 API 请求之和；二者都不能充当当前上下文。
 - CCB 的既有正确口径为最近一次请求 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`（`claude-code-best/src/utils/context.ts:151`）。Codex `thread/tokenUsage/updated.last` 已规范化为不相交四维（gateway `codexAppServerNotifications.ts:747`、`codexAppServerProtocol.ts:385`）。
-- CCB/Codex 的 `_callUsage` 已附着到文本/思考/工具/结构块并持久化（gateway `sessionTurnRunner.ts:329`；protocol `losslessTurnTape.ts:217,473,869`）。master `getClientSession(id, owner, {view:'exact'})` 能读取；须按 callId 去重、取最后一个父调用，排除 delegate 子树，不能只看 timeline 首屏。
+- CCB/Codex 的 `_callUsage` 已附着到文本/思考/工具/结构块并持久化（gateway `sessionTurnRunner.ts:329`；protocol `losslessTurnTape.ts:217,473,869`）。master 的既有 exact 水合证明计数已持久化，但报价不能调用其全量读取：长会话可能数百 MB（bridge `:1726` 已有事故注释）。应有界读取最近根 tape 的小型元数据/尾记录；按 callId 去重、取最后一个父调用，排除 delegate 子树，不能只看 timeline 首屏。
 - Grok/Cursor/Zcode 等未发现同等 call snapshot。可复用 protocol `estimateModelHistoryTokens()`（`modelHistory.ts:508`）对已有历史语义文本估算，显示“约/历史估算”；不能将未知当 0，也不能声称这是底座精确 tokenizer 结果。
 - 跨引擎可能走现有受上下文窗口约束的历史重建，未必真的重送所有原始历史；本票不改变这一策略。报价必须说明估计口径与实际重建/压缩的影响。
 
