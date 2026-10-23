@@ -223,3 +223,49 @@ test('a stage edited during asynchronous preflight is rechecked in the claim tra
     })
   } finally { release(); f.db.close() }
 })
+
+
+for (const status of ['done', 'canceled'] as const) test(`human can stop a still-live run after its ticket is ${status}, preserving closure`, async () => {
+  const f = fixture()
+  try {
+    const closed = updateTicket(f.db, f.ticket.id, f.ticket.version, { status, closedAt: Date.now() })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const stopped = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: closed.version, runId: f.run.id })
+      assert.equal(stopped.status, 202, JSON.stringify(stopped.body))
+      assert.equal(f.control.signal.aborted, true)
+      assert.deepEqual(getTicket(f.db, f.ticket.id), closed)
+      assert.equal(getRun(f.db, f.run.id)!.status, 'running')
+      const duplicate = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: closed.version, runId: f.run.id })
+      assert.equal(duplicate.status, 202)
+      settle(f)
+      assert.deepEqual(getTicket(f.db, f.ticket.id), closed)
+      assert.equal(getRun(f.db, f.run.id)!.outputMd, '已付费的完整部分结果')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})
+
+test('a reaped terminal row stays visibly settling until its exact controller finally completes', async () => {
+  const f = fixture()
+  try {
+    updateRun(f.db, f.run.id, { status: 'timeout', leaseOwner: null, leaseExpiresAt: null, error: 'lease expired', finishedAt: Date.now() })
+    await serverFor({ db: f.db, actor: 'human' }, async (base) => {
+      const get = async () => {
+        const response = await fetch(`${base}/api/board/tickets/${f.ticket.id}`)
+        assert.equal(response.status, 200)
+        return await response.json() as { execution: { settling: boolean; status: string } }
+      }
+      assert.equal((await get()).execution.settling, true)
+      const pending = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: f.ticket.version, runId: f.run.id })
+      assert.equal(pending.status, 202)
+      assert.equal(pending.body.state, 'stopping')
+      assert.equal(f.control.signal.aborted, true)
+      assert.equal((await get()).execution.settling, true)
+      f.leave(); taskboardRunControls.finish(f.control)
+      assert.equal((await get()).execution.settling, false)
+      const terminal = await post(base, `/api/board/tickets/${f.ticket.id}/stop`, { expectedVersion: f.ticket.version, runId: f.run.id })
+      assert.equal(terminal.status, 200)
+      assert.equal(terminal.body.state, 'terminal')
+      assert.equal(getRun(f.db, f.run.id)!.status, 'timeout')
+    })
+  } finally { if (taskboardRunControls.get(f.run.id, f.ticket.id, f.run.leaseOwner!)) { f.leave(); taskboardRunControls.finish(f.control) } f.db.close() }
+})

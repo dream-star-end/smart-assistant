@@ -1122,6 +1122,7 @@ describe('项目管理', () => {
     let stored: ReturnType<typeof sampleProject>[] = []
     vi.spyOn(taskboardApi, 'listProjects').mockImplementation(async () => stored)
     mockEmptyBoard()
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([{ id: 'main', name: '主助手' }])
     const createProject = vi
       .spyOn(taskboardApi, 'createProject')
       .mockImplementation(async (_a, body) => {
@@ -1144,6 +1145,7 @@ describe('项目管理', () => {
     await screen.findByTestId('project-create')
     fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'ocv5' } })
     fireEvent.change(screen.getByTestId('project-name'), { target: { value: 'V5 自用' } })
+    fireEvent.change(screen.getByTestId('builtin-execution-agent'), { target: { value: 'main' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('project-create-submit'))
     })
@@ -1151,7 +1153,7 @@ describe('项目管理', () => {
     await waitFor(() => {
       expect(createProject).toHaveBeenCalledWith(
         auth,
-        expect.objectContaining({ key: 'OCV5', name: 'V5 自用', description: null }),
+        expect.objectContaining({ key: 'OCV5', name: 'V5 自用', description: null, executionAgentId: 'main' }),
       )
     })
     await waitFor(() => {
