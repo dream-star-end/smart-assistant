@@ -1,5 +1,5 @@
 -- order-dependency: 0322_minimax_voices
--- 0323_media_studio.sql (commercial; OCV5-591, media studio OCV5-586)
+-- 0324_media_studio.sql (commercial; OCV5-591, media studio OCV5-586)
 -- Media studio: a project turns a brief into shots / lines / music, generates takes through the
 -- existing provider ledgers (Image 2, Muse, MiniMax, Grok) and composes a final cut. The studio's own
 -- charges (compose, music) go through studio_charges with ledger reason 'media_studio'.
@@ -10,7 +10,7 @@
 --     an expiring hold first (studio_quota_holds) and settles 'site' / 'u:<id>' usage afterwards.
 -- Retention: studio_events 180 days (AUDIT_RETENTION_POLICIES); everything else is user-owned data
 -- removed with the user (FK cascade) or by the studio GC (unadopted takes, soft-deleted projects).
--- Rollback: db/rollbacks/0323_media_studio.sql.
+-- Rollback: db/rollbacks/0324_media_studio.sql.
 
 -- compat: additive tables and a widened CHECK; old binaries never read or write them
 CREATE TABLE IF NOT EXISTS studio_projects (

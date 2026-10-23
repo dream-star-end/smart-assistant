@@ -1,5 +1,5 @@
 /**
- * OCV5-591 A1 media studio on real Postgres (0323_media_studio).
+ * OCV5-591 A1 media studio on real Postgres (0324_media_studio).
  *
  *   1. projects are user-scoped: another user's project is not found; optimistic rev; brief only
  *      while draft; budget never below spent + reserved; pause/resume/cancel; cancel and delete
@@ -138,7 +138,7 @@ async function liveHolds(): Promise<number> {
   return Number(r.rows[0]!.n)
 }
 
-describe('media studio store (0323)', () => {
+describe('media studio store (0324)', () => {
   test('projects are user-scoped with optimistic edits and status rules', async (t) => {
     if (skip(t)) return
     const store = new StudioStore(getPool())
@@ -227,6 +227,38 @@ describe('media studio store (0323)', () => {
     )
     assert.match(def.rows[0]!.d, /'media_studio'/)
     assert.match(def.rows[0]!.d, /'muse_media'/)
+  })
+
+  test('project pages never skip rows that share a millisecond or a timestamp', async (t) => {
+    if (skip(t)) return
+    const store = new StudioStore(getPool())
+    const a = await user()
+    const ids: string[] = []
+    for (const title of ['one', 'two', 'three'])
+      ids.push((await store.createProject(a, { title })).id)
+    // Codex Sol r1 P2: .123800 and .123400 collapse to the same millisecond; two rows tie exactly.
+    await query(
+      `UPDATE studio_projects SET updated_at='2026-10-23 01:02:03.123800+00' WHERE id=$1`,
+      [ids[0]],
+    )
+    await query(
+      `UPDATE studio_projects SET updated_at='2026-10-23 01:02:03.123400+00' WHERE id = ANY($1::uuid[])`,
+      [ids.slice(1)],
+    )
+    const seen: string[] = []
+    let before: string | undefined
+    for (let i = 0; i < 5; i++) {
+      const page = await store.listProjects(a, { limit: 1, before })
+      seen.push(...page.projects.map((p) => p.id))
+      if (!page.next) break
+      assert.equal('cursor' in page.projects[0]!, false)
+      before = page.next
+    }
+    assert.deepEqual([...seen].sort(), [...ids].sort())
+    assert.equal(seen[0], ids[0])
+    await assert.rejects(store.listProjects(a, { before: '2026-10-23T01:02:03.123Z' }), {
+      status: 400,
+    })
   })
 })
 
