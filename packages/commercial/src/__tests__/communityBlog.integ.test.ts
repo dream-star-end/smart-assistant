@@ -442,7 +442,7 @@ describe('经验分享 · 投稿预检（对话写博客）', () => {
     const author = await createUser('pre@example.com')
     const res = await request('/api/tutorials/precheck', { method: 'POST', token: author.token, json: okDraft })
     assert.equal(res.status, 200)
-    assert.equal(res.headers.get('cache-control'), 'private, no-store')
+    assert.equal(res.headers.get('cache-control'), 'no-store')
     assert.deepEqual(await res.json(), { issues: [], quota: { pendingLeft: 3, dailyLeft: 5 } })
     const rows = await query<{ n: string }>('SELECT count(*)::text AS n FROM community_tutorials')
     assert.equal(rows.rows[0]!.n, '0')

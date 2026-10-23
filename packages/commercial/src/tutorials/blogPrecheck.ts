@@ -114,8 +114,11 @@ export function splitSections(markdown: string): Section[] {
   return sections.filter((s) => s.text.trim().length > 0)
 }
 
-function where(section: Section): string {
-  return section.heading ? `「${section.heading}」一节` : '开头'
+/** 节标题本身可能含密钥或注入句：这种时候不回显标题，只给节序号（Codex R1 P1）。 */
+function where(section: Section, index: number): string {
+  if (!section.heading) return index === 0 ? '开头' : `第 ${index + 1} 节`
+  const safe = scanText(maskTutorialImageRefs(section.heading), 'heading').length === 0 && !detectPromptInjection(section.heading)
+  return safe ? `「${section.heading}」一节` : `第 ${index + 1} 节`
 }
 
 function charLength(value: string): number {
@@ -152,25 +155,29 @@ export function precheckBlogDraft(raw: Record<string, unknown>): BlogPrecheckIss
     issues.push({ code: 'category', level: 'block', field: 'category', message: '分类只能是 研究 / 编程 / 通用 之一' })
 
   // 泄密：标题、摘要各算一处；正文按节定位，同一种问题只报第一处。
-  const leakSeen = new Set<string>()
-  const pushLeaks = (text: string, field: BlogPrecheckField, at?: string) => {
-    for (const leak of scanText(maskTutorialImageRefs(text), field)) {
-      const key = `${field}:${leak.rule}`
-      if (leakSeen.has(key)) continue
-      leakSeen.add(key)
-      issues.push({
-        code: `leak_${leak.rule}`,
-        level: 'block',
-        field,
-        message: `有${LEAK_LABEL[leak.rule] ?? '敏感信息'}，公开内容里不能出现，删掉或打码`,
-        ...(at ? { where: at } : {}),
-      })
-    }
+  const pushLeak = (rule: TutorialLeakRule, field: BlogPrecheckField, at?: string) => {
+    issues.push({
+      code: `leak_${rule}`,
+      level: 'block',
+      field,
+      message: `有${LEAK_LABEL[rule] ?? '敏感信息'}，公开内容里不能出现，删掉或打码`,
+      ...(at ? { where: at } : {}),
+    })
+  }
+  const pushLeaks = (text: string, field: BlogPrecheckField) => {
+    for (const leak of scanText(maskTutorialImageRefs(text), field)) pushLeak(leak.rule, field)
   }
   pushLeaks(title, 'title')
   pushLeaks(summary, 'summary')
+  // 正文以整篇扫描为准（与投稿一致：有的规则要同一段文字里同时出现两个特征），再按节找第一处
+  // 单独命中的位置；只在跨节组合时才命中的规则不给位置（Codex R1 P2）。
   const sections = splitSections(body)
-  for (const section of sections) pushLeaks(section.text, 'bodyMarkdown', where(section))
+  for (const leak of scanText(maskTutorialImageRefs(body), 'bodyMarkdown')) {
+    const index = sections.findIndex((section) =>
+      scanText(maskTutorialImageRefs(section.text), 'bodyMarkdown').some((hit) => hit.rule === leak.rule),
+    )
+    pushLeak(leak.rule, 'bodyMarkdown', index >= 0 ? where(sections[index]!, index) : undefined)
+  }
 
   // 图片：只认本站上传的 tutorial-blob 图片；按节找出第一处站外或不合法的写法。
   let externalReported = false
@@ -185,7 +192,7 @@ export function precheckBlogDraft(raw: Record<string, unknown>): BlogPrecheckIss
           level: 'block',
           field: 'bodyMarkdown',
           message: '用了站外图片或不支持的图片写法；经验分享只显示本站上传的图片，改用对话里生成的图片或删掉',
-          where: where(section),
+          where: where(section, sections.indexOf(section)),
         })
       }
     }
@@ -205,8 +212,11 @@ export function precheckBlogDraft(raw: Record<string, unknown>): BlogPrecheckIss
   // 对审核者下指令：能投，但一律转人工，提前告诉作者。
   if (detectPromptInjection(`${title}\n${summary}`))
     issues.push({ code: 'reviewer_instruction', level: 'warn', field: 'title', message: REVIEWER_MESSAGE })
-  const hit = sections.find((section) => detectPromptInjection(section.text))
-  if (hit) issues.push({ code: 'reviewer_instruction', level: 'warn', field: 'bodyMarkdown', message: REVIEWER_MESSAGE, where: where(hit) })
+  const hit = sections.findIndex((section) => detectPromptInjection(section.text))
+  if (hit >= 0)
+    issues.push({ code: 'reviewer_instruction', level: 'warn', field: 'bodyMarkdown', message: REVIEWER_MESSAGE, where: where(sections[hit]!, hit) })
+  else if (detectPromptInjection(body))
+    issues.push({ code: 'reviewer_instruction', level: 'warn', field: 'bodyMarkdown', message: REVIEWER_MESSAGE })
   return issues
 }
 

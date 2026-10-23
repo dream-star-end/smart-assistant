@@ -228,7 +228,6 @@ export async function handlePrecheckCommunityTutorial(
     throw new HttpError(429, 'RATE_LIMITED', '检查太频繁，稍等一分钟再试')
   const body = await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)
   const draft = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {}
-  res.setHeader('Cache-Control', 'private, no-store')
   sendJson(res, 200, await precheckCommunityTutorial(user.id, draft))
 }
 
