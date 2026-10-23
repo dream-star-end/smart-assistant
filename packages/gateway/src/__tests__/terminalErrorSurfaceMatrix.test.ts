@@ -112,6 +112,12 @@ const SCENARIOS: readonly Scenario[] = [
     why: '余额不足重试多少次都一样,必须立刻给"去充值"CTA(重试反而多扣一次预扣)',
   },
   {
+    code: 'request_too_large',
+    sample: 'Request too large (max 20MB). Try with a smaller file.',
+    attempts: 1,
+    why: '资料完整保留，确定性超限不能原样自动重试或静默删媒体',
+  },
+  {
     code: 'context_too_long',
     sample: "prompt is too long: ran out of room in the model's context window",
     attempts: 1,

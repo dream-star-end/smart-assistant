@@ -120,6 +120,8 @@ import {
   errSummary,
   applyModelDefaultEffort,
 } from "./shared.js";
+import { BoxContextTransportError, restoreBoxContextRequest } from "./boxContextTransport.js";
+import { boxContextSummary } from "./boxContextMetrics.js";
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip, sendBoxUpstreamRefusal } from "./core.js";
@@ -143,6 +145,13 @@ import { dispatchTraceFallback, egressTraceFields } from "../egressTrace.js";
  *
  * 故意保留私有:只有本 handler 关心这个映射,core.ts 不用,shared.ts 不收。
  */
+function bodyRejectionSize(err: HttpError, bodyBytes: number): Record<string, unknown> {
+  const match = /^field '(messages|system|tools)' size ([0-9]+) exceeds ([0-9]+) bytes$/.exec(err.message);
+  return { ...(bodyBytes > 0 ? { bodyBytes } : {}), ...(match ? {
+    field: match[1], fieldBytes: Number(match[2]), limitBytes: Number(match[3]),
+  } : {}) };
+}
+
 function httpErrToReject(err: HttpError): ProxyRejectReason {
   if (err.status === 413) return "too_large";
   return "bad_body";
@@ -379,7 +388,8 @@ export function makeAnthropicProxyHandler(
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
     const isCountTokens =
       deps.allowCountTokens === true && url.pathname === "/v1/messages/count_tokens";
-    if (req.method !== "POST" || (url.pathname !== "/v1/messages" && !isCountTokens)) {
+    const isContextStage = url.pathname === "/v1/messages/context";
+    if (req.method !== "POST" || (url.pathname !== "/v1/messages" && !isCountTokens && !isContextStage)) {
       reqLog.warn("proxy_bad_path", { method: req.method, path: url.pathname });
       incrAnthropicProxyReject("bad_path");
       sendJsonError(res, 404, "NOT_FOUND", "endpoint not found", requestId);
@@ -552,7 +562,8 @@ export function makeAnthropicProxyHandler(
         enforcePreAuthByteCeiling(body, rawBodyBytes);
       } catch (err) {
         if (err instanceof HttpError) {
-          userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
+          userLog.warn("proxy_body_rejected", { status: err.status, code: err.code,
+            ...bodyRejectionSize(err, rawBodyBytes) });
           incrAnthropicProxyReject(httpErrToReject(err));
           sendJsonError(res, err.status, err.code, err.message, requestId);
           return;
@@ -572,7 +583,8 @@ export function makeAnthropicProxyHandler(
           return false;
         } catch (err) {
           if (err instanceof HttpError) {
-            userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
+            userLog.warn("proxy_body_rejected", { status: err.status, code: err.code,
+            ...bodyRejectionSize(err, rawBodyBytes) });
             incrAnthropicProxyReject(httpErrToReject(err));
             sendJsonError(res, err.status, err.code, err.message, requestId);
             return true;
@@ -581,6 +593,15 @@ export function makeAnthropicProxyHandler(
         }
       };
       if (!deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
+
+      // Stage must never reach an early external/Cursor paid branch. A model
+      // name is only an early rejection hint; the signed route is checked below.
+      const contextRequest = isContextStage || body.oc_context_transport !== undefined;
+      if (contextRequest && (identity.apiKey != null || !isBoxRouteModelName(body.model))) {
+        sendJsonError(res, 400, "BOX_CONTEXT_TRANSPORT_UNAVAILABLE",
+          "当前模型不支持完整历史分块传输。文件与对话已保留。", requestId);
+        return;
+      }
 
       // A non-streaming request is never a fresh paid model dispatch. Only
       // Box can use it to retrieve the exact prior round; reject it before
@@ -633,7 +654,7 @@ export function makeAnthropicProxyHandler(
       // 供错误文案 / 响应 `model` 回显使用,保证对外面不出现内部 id。Sand relay 编码
       // 时不透传 output_config/thinking,所以这里不需要剥离。**只在注入 cursorExternal
       // 的实例做**(容器 internal proxy 不认公开 id,行为零变化)。
-      if (deps.cursorExternal) {
+      if (deps.cursorExternal && !contextRequest) {
         const outputConfig = body.output_config;
         const requestedEffort =
           outputConfig !== null && typeof outputConfig === "object" && !Array.isArray(outputConfig)
@@ -974,6 +995,50 @@ export function makeAnthropicProxyHandler(
           ? await passClassRate(boxRateCfg, boxFallbackLimiter, "box")
           : await passClassRate(generalRateCfg, generalFallbackLimiter, "general");
         if (!passed) return;
+      }
+      // References only replace transport, not history authority. This is
+      // before switch compaction (which can itself bill), replay and preCheck.
+      if (contextRequest) {
+        if (gate?.authorityKind !== "bridge_signed"
+          || gate.verifiedSignedContextOwner !== "box-native-v1"
+          || byteBudget.id !== "box-native-v1" || !deps.boxContextTransport
+          || (!isContextStage && !body.oc_context_transport?.reference)) {
+          sendJsonError(res, 400, "BOX_CONTEXT_TRANSPORT_UNAVAILABLE",
+            "完整历史传输暂不可用，文件与对话已保留。", requestId);
+          return;
+        }
+        try {
+          const restored = await restoreBoxContextRequest({
+            store: deps.boxContextTransport, uid, containerId: containerIdBig,
+            body, budget: byteBudget, stage: isContextStage,
+          });
+          body = restored.body;
+          if (restored.reference) {
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json");
+            res.setHeader("Cache-Control", "no-store");
+            res.end(JSON.stringify(restored.reference));
+            return;
+          }
+          userLog.info("proxy_context_hydrated", {
+            wireBytes: rawBodyBytes, bodyBytes: restored.bytes, messages: body.messages.length,
+            ...boxContextSummary(body),
+          });
+        } catch (err) {
+          const code = err instanceof BoxContextTransportError ? err.code
+            : err instanceof HttpError ? err.code : "BOX_CONTEXT_STORE_UNAVAILABLE";
+          const status = err instanceof HttpError ? err.status
+            : /REF_(EXPIRED|INVALID)$/.test(code) ? 409
+              : code === "BOX_CONTEXT_TOO_LARGE" ? 413 : 503;
+          userLog.warn("proxy_context_transport_rejected", {
+            code, phase: isContextStage ? "stage" : "hydrate", bodyBytes: rawBodyBytes,
+          });
+          sendJsonError(res, status, code,
+            status === 413
+              ? "这轮资料暂时无法完整处理，文件和对话已保留。"
+              : "整理完整资料时暂未完成，文件和对话已保留。", requestId);
+          return;
+        }
       }
       // A chat whose login is at its switch line continues on the next login from a Haiku
       // compaction (its own billed request), not from a full cache rewrite. Applied before the

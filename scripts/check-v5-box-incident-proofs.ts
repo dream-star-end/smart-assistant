@@ -3653,7 +3653,7 @@ async function main(): Promise<void> {
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
-    ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
+    ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
       await proveIdleNoSummary(api, db),

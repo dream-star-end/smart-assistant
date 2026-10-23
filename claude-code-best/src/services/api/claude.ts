@@ -90,6 +90,7 @@ import {
   isNonCustomOpusModel,
 } from '../../utils/model/model.js'
 import { boxNativeRemoteContextOwnsHistory } from '../../utils/model/boxNativeRemoteContext.js'
+import { sendWithBoxContextTransport } from '../../utils/model/boxContextTransport.js'
 import {
   asSystemPrompt,
   type SystemPrompt,
@@ -882,15 +883,17 @@ export async function* executeNonStreamingRequest(
       )
 
       try {
-        return await anthropic.beta.messages.create(
-          {
-            ...adjustedParams,
-            model: normalizeModelStringForAPI(adjustedParams.model),
-          },
-          {
+        const finalParams = {
+          ...adjustedParams,
+          model: normalizeModelStringForAPI(adjustedParams.model),
+        }
+        return await sendWithBoxContextTransport(
+          anthropic, finalParams, retryOptions.signal,
+          (wire, remainingTimeoutMs) => anthropic.beta.messages.create(wire, {
             signal: retryOptions.signal,
-            timeout: fallbackTimeoutMs,
-          },
+            timeout: remainingTimeoutMs ?? fallbackTimeoutMs,
+          }),
+          { timeoutMs: fallbackTimeoutMs },
         )
       } catch (err) {
         // User aborts are not errors — re-throw immediately without logging
@@ -1920,17 +1923,15 @@ async function* queryModel(
         // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
         // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
         // since we handle tool input accumulation ourselves
-        const result = await anthropic.beta.messages
-          .create(
-            { ...params, stream: true },
-            {
-              signal,
-              ...(clientRequestId && {
-                headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
-              }),
-            },
-          )
-          .withResponse()
+        const result = await sendWithBoxContextTransport(
+          anthropic, { ...params, stream: true as const }, signal,
+          wire => anthropic.beta.messages.create(wire, {
+            signal,
+            ...(clientRequestId && {
+              headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
+            }),
+          }).withResponse(),
+        )
         queryCheckpoint('query_response_headers_received')
         streamRequestId = result.request_id
         streamResponse = result.response

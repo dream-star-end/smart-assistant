@@ -1,3 +1,4 @@
+import { FileBoxContextTransport } from "../http/proxy/boxContextTransport.js";
 import { startLogTimingReporter } from '../logging/logTimingReporter.js';
 /**
  * V5 egress 进程(独立 systemd 服务 openclaude-v5-egress)——
@@ -72,7 +73,7 @@ import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { resolveBoxCapacityPolicy } from "../http/proxy/boxCapacityPolicy.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
-import { createBoxReplayReader, createBoxReplayRecoveryWriter,
+import { boxReplayDirectory, createBoxReplayReader, createBoxReplayRecoveryWriter,
   createBoxReplayWriter } from "./boxReplaySetup.js";
 import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
 import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
@@ -539,7 +540,10 @@ export async function startEgress(): Promise<void> {
       log.error("box_stop_local_cleanup_failed"));
   }, 60_000);
   boxStopCleanupTimer.unref();
+  const contextDirectory = boxReplayDirectory(process.env.OC_PLATFORM_ROOT);
   const proxyHandler = makeAnthropicProxyHandler({
+    ...(contextDirectory ? { boxContextTransport:
+      new FileBoxContextTransport(contextDirectory + "/context-transport") } : {}),
     pgPool: getPool(),
     pricing,
     preCheckRedis,
@@ -718,7 +722,7 @@ export async function startEgress(): Promise<void> {
       });
       return;
     }
-    if (path === "/v1/messages") {
+    if (path === "/v1/messages" || path === "/v1/messages/context") {
       Promise.resolve(
         proxyHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {

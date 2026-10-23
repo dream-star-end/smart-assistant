@@ -421,6 +421,11 @@ export const proxyBodySchema = z
   .object({
     model: z.string().min(1).max(128),
     max_tokens: z.number().int().positive().max(200_000),
+    /** Private Box lossless transport; stripped before native/history handling. */
+    oc_context_transport: z.object({
+      version: z.literal(1),
+      reference: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    }).strict().optional(),
     messages: z.array(z.unknown()).min(1).max(MAX_MESSAGES_COUNT),
     system: z.union([z.string(), z.array(z.unknown())]).optional(),
     tools: z.array(z.unknown()).max(MAX_TOOLS_COUNT).optional(),
@@ -1788,6 +1793,8 @@ export interface AnthropicProxyDeps {
     switchCompaction?: Omit<import("./boxSwitchCompaction.js").BoxSwitchDeps,
       "pgPool" | "preCheckRedis" | "scheduler" | "endpoint" | "log">;
   };
+  /** Private, bounded data cache. Never grants model execution authority. */
+  boxContextTransport?: import("./boxContextTransport.js").BoxContextTransport;
   /** Read-only same-round capsule replay, independent of the Box launch flag. */
   boxReplay?: {
     lookup(args: { uid: bigint; canonicalModel: string; canonicalBody: ProxyBody;

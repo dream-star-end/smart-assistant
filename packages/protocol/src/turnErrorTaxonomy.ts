@@ -89,6 +89,7 @@ export const TURN_ERROR_TAXONOMY = {
   upstream_timeout: { retryable: true, automaticRecovery: true, cta: 'retry' },
   network_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   context_too_long: { retryable: false, cta: 'new_session' },
+  request_too_large: { retryable: false, cta: 'none' },
   bad_request: { retryable: false, cta: 'none' },
 
   // ── 引擎/平台执行 ────────────────────────────────────────
