@@ -8042,6 +8042,52 @@
       "coverageCommits": [
         "8a349801"
       ]
+    },
+    {
+      "id": "INC-20261024-CCB-TRANSCRIPT-INTEGRITY",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "个人765长图会话验证发现旧转录并发追加交错，冷恢复跳坏行可能丢失模型上下文；新写入统一互斥、保硬链接inode并自动从原生权威存档证明全部原字节后恢复。",
+      "rootFixCommit": "049a2531",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-607-native-transcript-integrity] PASS"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionFileIo.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/nativeTranscriptRecovery.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptReader.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptQueue.test.ts"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/ccbNativeRestoreArchive.integ.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalCcbTranscriptRestore.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerTranscriptRestore.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts"
+        }
+      ]
     }
   ]
 }
