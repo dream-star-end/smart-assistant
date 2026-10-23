@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 /**
  * SessionManager pending-persistence tracking unit tests.
  *
@@ -21,7 +22,6 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 
 import {
   RuntimeRecycleDrainingError,
@@ -72,7 +72,7 @@ function deferred<T>(): {
 
 type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
 
-class FakeTurnRunner extends EventEmitter {
+class FakeTurnRunner extends MinimalPrivacyRunner {
   lastActivityAt = Date.now();
   submitted: unknown[] = [];
   isRunning = false;
@@ -101,7 +101,9 @@ class FakeTurnRunner extends EventEmitter {
 
   clearSessionId(): void {}
 
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
 
   async waitForOutputDrain(): Promise<void> {}
 
@@ -109,6 +111,8 @@ class FakeTurnRunner extends EventEmitter {
     textOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
     requestId?: string,
   ): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     this.submitted.push(textOrBlocks);
     this.onSubmit(this, requestId);
   }

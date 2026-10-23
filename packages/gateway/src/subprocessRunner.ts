@@ -1,3 +1,4 @@
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { PassiveStageTiming } from './passiveStageTiming.js'
 import { fastServiceTierRoute } from '@openclaude/protocol'
 import {
@@ -300,6 +301,14 @@ export class SubprocessRunner extends EventEmitter {
   /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 里 INTELLIGENT_UI 段的指纹(没有 = false)。
    *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  private _promptPolicyFingerprint: string | undefined
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
+  assertPromptPrivacyStopped(): void {
+    if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
@@ -1604,9 +1613,12 @@ export class SubprocessRunner extends EventEmitter {
     //  a background sync on startup. All call the same idempotent reconcile.)
 
     // Build merged extra system prompt via structured prompt slots
+    const privacyEpoch = this._startEpoch
     this._promptIntelligentUi = undefined
+    this._promptPolicyFingerprint = undefined
     try {
       const promptResult = await buildPromptContext({
+        promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1645,7 +1657,6 @@ export class SubprocessRunner extends EventEmitter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
-      this._promptIntelligentUi = promptResult.intelligentUi ?? false
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {
@@ -1653,6 +1664,9 @@ export class SubprocessRunner extends EventEmitter {
         writeFileSync(path, mergedPrompt)
         out.extraPromptFile = path
       }
+      if (this.promptPolicy && privacyEpoch !== this._startEpoch) throw new Error("PROMPT_PRIVACY_SPAWN_STALE")
+      this._promptIntelligentUi = promptResult.intelligentUi ?? false
+      this._promptPolicyFingerprint = promptResult.promptPolicyFingerprint
       const mergedPromptSha256 = createHash('sha256').update(mergedPrompt).digest('hex')
       runnerLog.info('prompt_context_built', {
         sessionKey: this.opts.sessionKey,
@@ -1682,7 +1696,7 @@ export class SubprocessRunner extends EventEmitter {
         modelHintAppliedTotal.inc({ model_id: canonicalModelId, backend: 'ccb' })
       }
     } catch (err) {
-      if (this.opts.identityCompat?.assets) throw err
+      if (this.opts.identityCompat?.assets || this.promptPolicy) throw err
       runnerLog.warn(
         'failed to build extra prompt',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },

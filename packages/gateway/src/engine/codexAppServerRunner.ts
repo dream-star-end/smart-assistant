@@ -1,3 +1,7 @@
+import { readLatestCodexNativeHandoff, runnerShutdownTimeoutMs, waitForCloseWithin, killCodexProcessGroup } from './codexLifecycle.js'
+export { readLatestCodexNativeHandoff } from './codexLifecycle.js'
+import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
+import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 // Test-only override of the spawn used to launch `codex app-server`. See
@@ -11,17 +15,13 @@ export { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 import { EventEmitter } from 'node:events'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import {
-  createReadStream,
-  lstatSync,
   mkdtempSync,
-  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join, resolve } from 'node:path'
-import { createInterface } from 'node:readline'
+import { join } from 'node:path'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
@@ -171,45 +171,6 @@ const RUNNER_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const RUNNER_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 
 const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
-const CODEX_ROLLOUT_MAX_BYTES = 256 * 1024 * 1024
-
-export async function readLatestCodexNativeHandoff(
-  rolloutPath: string,
-  compactStartedAt: number,
-): Promise<NativeModelHandoffArtifact> {
-  if (!isAbsolute(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const canonical = realpathSync(rolloutPath)
-  if (canonical !== resolve(rolloutPath)) throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  const info = lstatSync(canonical)
-  if (!info.isFile() || info.isSymbolicLink() || info.size > CODEX_ROLLOUT_MAX_BYTES) {
-    throw new Error('CODEX_COMPACTION_PATH_INVALID')
-  }
-  let latest: { timestamp: number; message: string } | null = null
-  const lines = createInterface({
-    input: createReadStream(canonical, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  })
-  for await (const line of lines) {
-    if (!line.includes('"type":"compacted"')) continue
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (!parsed || typeof parsed !== 'object') continue
-    const row = parsed as Record<string, unknown>
-    if (row.type !== 'compacted' || !row.payload || typeof row.payload !== 'object') continue
-    const ts = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : Number.NaN
-    if (!Number.isFinite(ts) || ts + 5_000 < compactStartedAt) continue
-    const payload = row.payload as Record<string, unknown>
-    const message = typeof payload.message === 'string' ? payload.message.trim() : ''
-    if (!message || !Array.isArray(payload.replacement_history)) continue
-    if (!latest || ts >= latest.timestamp) latest = { timestamp: ts, message }
-  }
-  if (!latest) throw new Error('CODEX_NATIVE_COMPACTION_NOT_EXPORTED')
-  return { summaryText: latest.message, source: 'codex', compactStartedAt }
-}
 
 // ── turn/start 窄路径自动重试(turn-retry 批,2026-07-18)──────────────────
 // 只重试 **turn/start 请求本身被拒**的窄路径(app-server 明确 JSON-RPC application
@@ -219,42 +180,6 @@ export async function readLatestCodexNativeHandoff(
 /** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
-
-function runnerShutdownTimeoutMs(name: string, fallback: number): number {
-  const raw = Number(process.env[name])
-  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
-}
-
-function waitForCloseWithin(closePromise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    let done = false
-    const finish = (closed: boolean) => {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      resolve(closed)
-    }
-    const timer = setTimeout(() => finish(false), timeoutMs)
-    closePromise.then(() => finish(true))
-  })
-}
-
-function killCodexProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-  try {
-    if (typeof proc.pid === 'number' && proc.pid > 0) {
-      process.kill(-proc.pid, signal)
-      return
-    }
-  } catch {
-    // Fall back to the direct child if the detached process group is already
-    // gone or unavailable on this platform.
-  }
-  try {
-    proc.kill(signal)
-  } catch {
-    /* ignore */
-  }
-}
 
 const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
   'You are in implementation mode, not plan-only mode.',
@@ -610,6 +535,14 @@ export class CodexAppServerRunner extends EventEmitter {
   public effortLevel: string | undefined = undefined
   /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 里 INTELLIGENT_UI 段的指纹(没有 = false)。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  private _promptPolicyFingerprint: string | undefined
+  private promptPolicy: PromptPrivacyPolicy | undefined
+  get promptPolicyFingerprint(): string | undefined { return this._promptPolicyFingerprint }
+  assertPromptPrivacyStopped(): void {
+    if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
+  }
+  setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
@@ -915,7 +848,38 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitTurnStatus(this.pendingUserInputs.size > 0 ? 'waiting_for_user' : null)
   }
 
+  private compactPrivacyPreparing = false
   async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    if (!this.proc || !this.attached || !this.threadId) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
+    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction || this.compactPrivacyPreparing) throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
+    const sourceThread = this.threadId
+    let expectedGeneration = this._preheatGeneration
+    const assertCurrent = () => {
+      if (this._preheatGeneration !== expectedGeneration) throw new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED')
+    }
+    this.compactPrivacyPreparing = true
+    try {
+      return await withFreshPromptPrivacy(this, this.opts.sessionId, async () => {
+        if (this.threadId !== sourceThread) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_CHANGED')
+        if (!this.proc || !this.attached) {
+          const repo = this._currentRepoSnapshot()
+          const cwd = this._applyRepoBindingFromSnapshot(repo)
+          await this.ensureSpawned(repo, cwd)
+          assertCurrent()
+          await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
+            threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
+            ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+          })
+          assertCurrent()
+          this.attached = true
+        }
+        assertCurrent()
+        return this.compactCurrentThreadForHandoff()
+      }, { assertCurrent, beforeOwnedShutdown: () => { assertCurrent(); expectedGeneration++ } })
+    } finally { this.compactPrivacyPreparing = false }
+  }
+  private async compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
     if (!this.proc || !this.attached || !this.threadId) {
       throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
     }
@@ -963,6 +927,10 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
+    if (this.compactPrivacyPreparing) {
+      void this.shutdown()
+      return true
+    }
     // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
     // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
     // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close
@@ -1048,9 +1016,11 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       this.sessionDir = null
     }
+    const privacyGeneration = this._preheatGeneration
     const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
     try {
       const overrides = await buildCodexLaunchOverrides({
+        promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1072,8 +1042,8 @@ export class CodexAppServerRunner extends EventEmitter {
         frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
       })
+      if (privacyGeneration !== this._preheatGeneration) throw new Error('PROMPT_PRIVACY_SPAWN_STALE')
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
-      this._promptIntelligentUi = overrides.intelligentUiApplied
       // v3 hardening — see codexRunner.ts for rationale (token never in argv).
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
@@ -1083,6 +1053,8 @@ export class CodexAppServerRunner extends EventEmitter {
           mode: 0o600,
         })
       }
+      this._promptIntelligentUi = overrides.intelligentUiApplied
+      this._promptPolicyFingerprint = overrides.promptPolicyFingerprint
       this.sessionDir = dir
       this.cachedOverrides = overrides
       return overrides
@@ -1522,6 +1494,7 @@ export class CodexAppServerRunner extends EventEmitter {
         if (overrides) argvOverrides = overrides.argvOverrides
       }
     } catch (err) {
+      if (this.promptPolicy) throw err
       log.warn(
         'codex app-server launch overrides build failed; spawning without platform context',
         {
@@ -2473,6 +2446,7 @@ export class CodexAppServerRunner extends EventEmitter {
         } else {
           try {
             await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
               threadId: this.threadId,
               approvalPolicy: 'never',
               sandbox: 'danger-full-access',
@@ -2518,6 +2492,7 @@ export class CodexAppServerRunner extends EventEmitter {
               this.syncedPlatformGoal = null
               try {
                 await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                   threadId: fallback,
                   approvalPolicy: 'never',
                   sandbox: 'danger-full-access',

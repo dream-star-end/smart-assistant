@@ -2878,3 +2878,35 @@ test('Box terminal composition rejection: failing optional hook never duplicates
     assert.doesNotMatch(res.text(), /synthetic persistence failure|message_stop/)
   } finally { await f.relay.close() }
 })
+
+test('Cursor warm variants forward consent without claiming it applied, and replay only the active operation snapshot', async () => {
+  const previous = process.env.OC_CURSOR_SAND_OFFICIAL_CC
+  const dir = mkdtempSync(resolve(tmpdir(), 'oc-cursor-privacy-proof-'))
+  const policy = { schemaVersion: 1 as const, profile: { nickname: 'fixture-name', sessionId: 'scope-a' } }
+  try {
+    for (const official of ['0', '1']) {
+      process.env.OC_CURSOR_SAND_OFFICIAL_CC = official
+      const router = new CursorRoutingAdapter({ sessionKey: 'agent:main:webchat:dm:scope-a', sessionId: 'scope-a', agentId: 'main', agentBaseDir: dir,
+        config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: SAND_SELECTION })
+      const state = router as any
+      assert.equal(typeof router.setPromptPrivacy, 'function')
+      router.setPromptPrivacy!(policy)
+      assert.deepEqual(state.inner.runner.promptPolicy, policy)
+      assert.equal(router.promptPolicyFingerprint, undefined)
+      const old = state.inner
+      await old.shutdown()
+      state.inner = state.createInner(router.currentVariant)
+      assert.deepEqual(state.inner.runner.promptPolicy, policy)
+      router.clearPromptPrivacy()
+      assert.equal(state.inner.runner.promptPolicy, undefined)
+      await router.shutdown()
+    }
+    const native = new CursorRoutingAdapter({ sessionKey: 'agent:main:webchat:dm:scope-a', sessionId: 'scope-a', agentId: 'main', agentBaseDir: dir,
+      config: {} as never, model: 'cursor-fable-5.1-high', cursorCredentialSelection: NATIVE_SELECTION })
+    assert.equal(native.setPromptPrivacy, undefined)
+    await native.shutdown()
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, 'OC_CURSOR_SAND_OFFICIAL_CC')
+    else process.env.OC_CURSOR_SAND_OFFICIAL_CC = previous
+  }
+})

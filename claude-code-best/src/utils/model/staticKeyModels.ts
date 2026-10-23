@@ -174,12 +174,12 @@ export function isArkPlanKimiK3Model(model: string): boolean {
   return model.trim().toLowerCase() === 'kimi-k3-ark'
 }
 
-/** Moonshot 官方 Kimi For Coding 接入的模型:kimi-k3 / k3-256k。精确匹配,大小写/空白
+/** Moonshot 官方 Kimi For Coding 接入的模型:kimi-k3 / k3-256k / k3.1-pro。精确匹配,大小写/空白
  *  不敏感,与 protocol moonshot.matchesRoute 同口径。与 isArkPlanKimiModel(火山转售 k2.7)
- *  是两家上游。thinking 支持 enabled+budget 且 disabled 真生效(实测,同 qwen 语义)。 */
+ *  是两家上游。旧 K3 支持 disabled；K3.1 Pro 为 thinking-only，由 proxy 精确删 disabled。 */
 export function isMoonshotKimiK3Model(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'kimi-k3' || m === 'k3-256k'
+  return m === 'kimi-k3' || m === 'k3-256k' || m === 'k3.1-pro'
 }
 
 /** 阿里云百炼 Token Plan 正式 Qwen3.8 Max。精确匹配，避免 preview/未来家族型号
