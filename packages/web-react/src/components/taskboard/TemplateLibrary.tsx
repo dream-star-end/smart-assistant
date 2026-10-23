@@ -1,5 +1,5 @@
 import { Library } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AuthEpochStaleError } from '../../lib/api'
 import {
   type BoardAgent,
@@ -61,7 +61,11 @@ export function TemplateLibrary({
   const [busyId, setBusyId] = useState<string | null>(null)
   const [items, setItems] = useState<PipelineTemplate[] | null>(null)
   const [executionAgentId, setExecutionAgentId] = useState('')
-  useEffect(() => { setExecutionAgentId('') }, [projectId, open, auth])
+  const selectionOwner = useRef({ projectId, open, auth })
+  if (selectionOwner.current.projectId !== projectId || selectionOwner.current.open !== open || selectionOwner.current.auth !== auth) {
+    selectionOwner.current = { projectId, open, auth }
+    if (executionAgentId) setExecutionAgentId('')
+  }
   const [asDefault, setAsDefault] = useState(true)
   const [error, setError] = useState<string | null>(null)
 

@@ -1621,7 +1621,8 @@ function handleMove(
     return
   }
   if (!getActiveLease(db, ticket.id) && hasPendingTaskboardExecution(db, ticket.id)) {
-    return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+    sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+    return
   }
   const expectedVersion = requireExpectedVersion(body)
   if (expectedVersion !== ticket.version) {
@@ -1981,7 +1982,10 @@ function handleReady(
     recordActivity(db, current.id, actor, actorId, 'status_changed', 'status', current.status, 'ready')
     return result
   }).immediate()
-  if (!updated) return sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+  if (!updated) {
+    sendError(res, 409, '上一轮执行仍在收尾，请稍后重试', { code: 'active_execution' })
+    return
+  }
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -2361,12 +2365,18 @@ function handleStop(
   actor: Actor,
   ticket: Ticket,
 ): void {
-  if (actor !== 'human') return sendError(res, 403, 'forbidden', { code: 'forbidden' })
+  if (actor !== 'human') {
+    sendError(res, 403, 'forbidden', { code: 'forbidden' })
+    return
+  }
   const expectedVersion = requireExpectedVersion(body)
   const runId = asString(body.runId)
   if (!runId) throw new TaskboardValidationError('runId is required')
   const outcome = requestHumanRunStop(db, ticket.id, expectedVersion, runId)
-  if (outcome.kind === 'conflict') return sendError(res, 409, outcome.message, { code: outcome.code })
+  if (outcome.kind === 'conflict') {
+    sendError(res, 409, outcome.message, { code: outcome.code })
+    return
+  }
   if (outcome.kind === 'requested') outcome.control.requestStop()
   sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
 }

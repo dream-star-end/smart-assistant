@@ -100,7 +100,6 @@ function fixture(runTurn: (session: any, emit: (event: any) => void) => Promise<
     forgetResume: (key: string) => resumed.delete(key),
     getOrCreate: async (opts: any) => {
       if (live.has(opts.sessionKey)) return live.get(opts.sessionKey)
-      let session: any
       const runner: any = new EventEmitter()
       runner.model = opts.model ?? opts.agent.model
       runner.engineId = 'ccb'
@@ -110,7 +109,7 @@ function fixture(runTurn: (session: any, emit: (event: any) => void) => Promise<
       }
       runner.waitForOutputDrain = async () => {}
       runner.sendPermissionResponse = () => {}
-      session = {
+      const session: any = {
         sessionKey: opts.sessionKey,
         agentId: opts.agent.id,
         channel: opts.channel ?? 'delegate',
