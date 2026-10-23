@@ -125,10 +125,25 @@ export interface TimelineClip {
 export interface TimelineModel {
   total: number
   clips: TimelineClip[]
-  /** Voice / subtitle lines placed inside their shot's span (in order), null when unplaced. */
-  lines: Array<{ line: StudioLine; start: number; end: number; take: StudioTake | null }>
+  /**
+   * Voice / subtitle lines inside their shot's span, in order. With every line's real length known
+   * they sit where compose puts them (`placed`); otherwise they share the shot evenly. `fits` is
+   * false when the real lengths do not fit the shot (compose then asks the user).
+   */
+  lines: Array<{
+    line: StudioLine
+    start: number
+    end: number
+    take: StudioTake | null
+    placed: boolean
+    fits: boolean
+  }>
   music: StudioTake | null
 }
+
+/** Narration layout constants shared with compose (backend orchestrator/composeJob.ts). */
+export const LEAD_SEC = 0.15
+export const GAP_SEC = 0.3
 
 export function timeline(view: StudioProjectView): TimelineModel {
   const shots = [...view.shots].sort((a, b) => a.ordinal - b.ordinal)
@@ -148,17 +163,35 @@ export function timeline(view: StudioProjectView): TimelineModel {
   for (const [shotId, group] of grouped) {
     const clip = byShot.get(shotId)!
     const span = (clip.end - clip.start) / group.length
-    group.forEach((line, i) => {
-      const take =
+    const takes = group.map(
+      (line) =>
         (line.activeTakeId && view.takes.find((x) => x.id === line.activeTakeId)) ||
         takesOf(view, line.id, ['line']).find((x) => x.status === 'succeeded' && x.blobSha) ||
-        null
+        null,
+    )
+    const secs = takes.map((t) =>
+      t && typeof t.durationMs === 'number' && t.durationMs > 0 ? t.durationMs / 1000 : null,
+    )
+    if (secs.every((s): s is number => s !== null)) {
+      // Same layout as compose (OCV5-591 A2-1c): the first line LEAD_SEC in, then GAP_SEC apart.
+      const need = secs.reduce((t, s) => t + s, 0) + LEAD_SEC + GAP_SEC * (secs.length - 1)
+      const fits = need <= clip.end - clip.start + 0.01
+      let at = clip.start + LEAD_SEC
+      group.forEach((line, i) => {
+        lines.push({ line, start: at, end: at + secs[i]!, take: takes[i]!, placed: true, fits })
+        at += secs[i]! + GAP_SEC
+      })
+      continue
+    }
+    group.forEach((line, i) => {
       // Leave a small gap so neighbouring lines read as separate blocks.
       lines.push({
         line,
         start: clip.start + i * span + 0.15,
         end: clip.start + (i + 1) * span - 0.15,
-        take,
+        take: takes[i]!,
+        placed: false,
+        fits: true,
       })
     })
   }

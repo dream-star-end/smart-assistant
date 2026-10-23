@@ -5,6 +5,7 @@ import { assertAuthResponseCurrent, bearerHeaders, callWithRefresh } from '../ap
 import type { AuthSession } from '../types'
 import type { MusicEdit, MusicQuery, MusicSearchResult } from './music'
 import type {
+  ExportVariant,
   ProvidersView,
   StudioAspect,
   StudioAsset,
@@ -182,6 +183,16 @@ export const studioApi = {
       })
     ).track
   },
+  /**
+   * OCV5-593 FE-6: the film in another export format. The same format and inputs hand back that
+   * film (`reused`); otherwise the director re-composes it, free (`queued`; watch the project).
+   */
+  requestExport: (auth: AuthSession, projectId: string, variant: ExportVariant) =>
+    call<{ reused: true; takeId: string } | { queued: true }>(
+      auth,
+      `/projects/${encodeURIComponent(projectId)}/export`,
+      { method: 'POST', body: JSON.stringify(variant) },
+    ),
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -222,6 +233,10 @@ export function studioErrorText(err: unknown): string {
         return '这首曲子已经不在曲库里了，换一首吧'
       case 'STUDIO_ORCHESTRATOR_OFF':
         return '导演 agent 暂时没有运行'
+      case 'STUDIO_COMPOSE_OFF':
+        return '合成沙箱暂时没有运行'
+      case 'STUDIO_NOT_DONE':
+        return '成片完成后才能导出其他规格'
       case 'STUDIO_QUOTA':
         return '工作台存储空间已满'
       case 'ERR_INSUFFICIENT_CREDITS':

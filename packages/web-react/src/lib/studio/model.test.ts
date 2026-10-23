@@ -127,6 +127,53 @@ describe('timeline (OCV5-593)', () => {
     expect(tl.music?.id).toBe('m2')
   })
 
+  test('narration with known lengths sits where compose puts it; too long reads as not fitting (FE-6)', () => {
+    const line = (id: string, ordinal: number, takeId: string) => ({
+      id,
+      shotId: 's0',
+      ordinal,
+      speakerAssetId: null,
+      text: id,
+      emotion: null,
+      speed: null,
+      status: 'ready' as const,
+      activeTakeId: takeId,
+    })
+    const voiced = (id: string, ownerId: string, ms: number | null) =>
+      take({ id, ownerKind: 'line', ownerId, durationMs: ms })
+    const placed = timeline(
+      view({
+        shots: [shot(0, { spec: { durationSec: 6 } })],
+        lines: [line('a', 0, 'ta'), line('b', 1, 'tb')],
+        takes: [voiced('ta', 'a', 2000), voiced('tb', 'b', 1500)],
+      }),
+    )
+    expect(placed.lines.map((l) => [l.line.id, l.start, l.end, l.placed, l.fits])).toEqual([
+      ['a', 0.15, 2.15, true, true],
+      ['b', expect.closeTo(2.45), expect.closeTo(3.95), true, true],
+    ])
+    const tooLong = timeline(
+      view({
+        shots: [shot(0, { spec: { durationSec: 3 } })],
+        lines: [line('a', 0, 'ta'), line('b', 1, 'tb')],
+        takes: [voiced('ta', 'a', 2000), voiced('tb', 'b', 1500)],
+      }),
+    )
+    expect(tooLong.lines.every((l) => l.placed && !l.fits)).toBe(true)
+    // One length unknown: the shot is shared evenly, as before.
+    const unknown = timeline(
+      view({
+        shots: [shot(0, { spec: { durationSec: 6 } })],
+        lines: [line('a', 0, 'ta'), line('b', 1, 'tb')],
+        takes: [voiced('ta', 'a', 2000), voiced('tb', 'b', null)],
+      }),
+    )
+    expect(unknown.lines.map((l) => [l.start, l.end, l.placed])).toEqual([
+      [0.15, 2.85, false],
+      [3.15, 5.85, false],
+    ])
+  })
+
   test('a shot without a duration counts as 5 s; ruler steps scale with length', () => {
     expect(timeline(view({ shots: [shot(0, { spec: {} })] })).total).toBe(5)
     expect(rulerTicks(10)).toEqual([0, 2, 4, 6, 8, 10])

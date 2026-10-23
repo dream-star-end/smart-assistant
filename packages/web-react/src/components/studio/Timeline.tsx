@@ -119,8 +119,8 @@ export function Timeline(props: {
               take={l.take}
               left={pct(l.start, total)}
               width={pct(Math.max(0.3, l.end - l.start), total)}
-              color="var(--st-trk-voice)"
-              label={l.line.text}
+              color={l.fits ? 'var(--st-trk-voice)' : 'var(--st-amber)'}
+              label={l.fits ? l.line.text : `${l.line.text}（超出镜头时长，需改短或拆镜头）`}
             />
           ))}
         </div>

@@ -1,14 +1,32 @@
 // OCV5-593 FE-3 成片 (d08 / m05): the composed film on a cinema stage, its shots / voice / music
-// strip, the final QA, export (download of the composed file) and the project cost breakdown.
+// strip, the final QA, export (FE-6: each format's film, a free re-compose for a new one, the .srt),
+// the CC BY credits (d14) and the project cost breakdown.
 
-import { Check, CircleAlert, Clapperboard, Download, MapPin } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { Check, CircleAlert, Clapperboard, Download, MapPin, RefreshCw } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
+import { studioApi, studioErrorText } from '../../../lib/studio/api'
+import {
+  RESOLUTIONS,
+  SUBTITLE_MODES,
+  composingFilm,
+  creditsText,
+  filmFor,
+  finalFilms,
+  variantKey,
+  variantOf,
+} from '../../../lib/studio/final'
 import { formatCredits } from '../../../lib/studio/format'
 import { shotCard } from '../../../lib/studio/model'
-import type { StudioProjectView, StudioTake } from '../../../lib/studio/types'
+import type {
+  ExportResolution,
+  ExportSubtitles,
+  StudioProjectView,
+  StudioTake,
+} from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
+import { useToast } from '../../ui'
 import { MediaThumb } from '../MediaThumb'
 
 const KIND_LABEL: Record<StudioTake['ownerKind'], string> = {
@@ -81,28 +99,85 @@ export function FinalPage(props: {
   auth: AuthSession
   view: StudioProjectView
   onOpenBoard: () => void
+  onReload?: () => void
 }) {
   const { auth, view } = props
-  const finals = view.takes
-    .filter((t) => t.ownerKind === 'final' && t.status === 'succeeded' && t.blobSha)
-    .sort((a, b) => b.version - a.version)
-  const final = finals[0] ?? null
-  const url = useBlobUrl(auth, final?.blobSha)
+  const films = useMemo(() => finalFilms(view), [view])
+  const latest = films[0] ?? null
   const cards = useMemo(
     () => [...view.shots].sort((a, b) => a.ordinal - b.ordinal).map((s) => shotCard(view, s)),
     [view],
   )
   const costs = useMemo(() => costBreakdown(view.takes), [view.takes])
-  const [res, setRes] = useState<'1080p' | '720p' | 'vertical'>('1080p')
-  const [subs, setSubs] = useState<'burn' | 'srt' | 'none'>('burn')
-  const qa = (final?.qa ?? null) as Record<string, unknown> | null
+  // The picker starts on the newest film's own format (FE-6).
+  const [res, setRes] = useState<ExportResolution>(() => variantOf(latest).resolution)
+  const [subs, setSubs] = useState<ExportSubtitles>(() => variantOf(latest).subtitles)
+  const key = variantKey({ resolution: res, subtitles: subs })
+  /** Format → film the server said is current for it (an export answered `reused`). */
+  const [reused, setReused] = useState<Record<string, string>>({})
+  /** Format → newest film version when its re-compose was asked for. */
+  const [asked, setAsked] = useState<Record<string, number>>({})
+  const [busy, setBusy] = useState(false)
+  const toast = useToast()
+  const done = view.project.status === 'done'
+  // Once the film goes back to the director (e.g. new music), earlier answers are stale.
+  useEffect(() => {
+    if (!done) {
+      setReused({})
+      setAsked({})
+    }
+  }, [done])
+
+  const film = filmFor(films, key, reused[key], asked[key])
+  const composing = composingFilm(view, key)
+  const waiting = !film && (composing !== null || asked[key] !== undefined)
+  const shown = film ?? latest
+  const url = useBlobUrl(auth, shown?.blobSha)
+  const srtUrl = useBlobUrl(auth, film && subs === 'srt' ? film.final?.srtSha : null)
+  const qa = (shown?.qa ?? null) as Record<string, unknown> | null
   const totalSec = cards.reduce((s, c) => s + c.seconds, 0)
+  const credits = shown?.final?.credits ?? []
+  const creditsUrl = useMemo(() => {
+    if (!credits.length || typeof URL.createObjectURL !== 'function') return null
+    return URL.createObjectURL(
+      new Blob([creditsText(view.project.title, credits)], { type: 'text/plain;charset=utf-8' }),
+    )
+  }, [credits, view.project.title])
+  useEffect(
+    () => () => {
+      if (creditsUrl) URL.revokeObjectURL(creditsUrl)
+    },
+    [creditsUrl],
+  )
+  const base = `${view.project.title || 'studio'}-v${film?.version ?? 0}-${key}`
+
+  const exportFormat = async () => {
+    if (busy) return
+    setBusy(true)
+    const at = latest?.version ?? 0
+    try {
+      const out = await studioApi.requestExport(auth, view.project.id, {
+        resolution: res,
+        subtitles: subs,
+      })
+      if ('reused' in out) setReused((m) => ({ ...m, [key]: out.takeId }))
+      else {
+        setAsked((m) => ({ ...m, [key]: at }))
+        toast('正在按这个规格重新合成，免费', 'success')
+      }
+      props.onReload?.()
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <div className="st-final">
       <section className="st-final-main st-stage">
         <div className="st-row" style={{ gap: 10, flexWrap: 'wrap' }}>
-          <b className="st-review-title">成片{final ? ` v${final.version}` : ''}</b>
+          <b className="st-review-title">成片{shown ? ` v${shown.version}` : ''}</b>
           <span className="st-chip st-chip-dark tnum">
             {view.project.aspect} · {view.project.fps}fps · {totalSec.toFixed(1)}s
           </span>
@@ -114,7 +189,7 @@ export function FinalPage(props: {
           ) : null}
         </div>
         <div className="st-final-stage">
-          {final && url ? (
+          {shown && url ? (
             <video
               className="st-final-video"
               src={url}
@@ -202,71 +277,134 @@ export function FinalPage(props: {
               导出
             </div>
             <fieldset className="st-seg st-seg-full" aria-label="分辨率">
-              {(
-                [
-                  ['1080p', '1080p'],
-                  ['720p', '720p'],
-                  ['vertical', '竖屏 9:16'],
-                ] as const
-              ).map(([v, l]) => (
+              {RESOLUTIONS.map(([v, l]) => (
                 <button
                   key={v}
                   type="button"
                   aria-pressed={res === v}
                   onClick={() => setRes(v)}
-                  disabled={!final}
+                  disabled={!latest}
                 >
                   {l}
                 </button>
               ))}
             </fieldset>
             <fieldset className="st-seg st-seg-full" aria-label="字幕" style={{ marginTop: 8 }}>
-              {(
-                [
-                  ['burn', '字幕烧录'],
-                  ['srt', '.srt'],
-                  ['none', '无字幕'],
-                ] as const
-              ).map(([v, l]) => (
+              {SUBTITLE_MODES.map(([v, l]) => (
                 <button
                   key={v}
                   type="button"
                   aria-pressed={subs === v}
                   onClick={() => setSubs(v)}
-                  disabled={!final}
+                  disabled={!latest}
                 >
                   {l}
                 </button>
               ))}
             </fieldset>
-            {final && url ? (
+            {film && url && shown === film ? (
               <a
                 className="st-btn st-btn-primary st-btn-lg st-final-dl"
                 href={url}
-                download={`${view.project.title || 'studio'}-v${final.version}.mp4`}
+                download={`${base}.mp4`}
+                data-testid="final-download"
               >
                 <Download />
                 下载 mp4
               </a>
+            ) : latest && done && !film && !waiting ? (
+              <button
+                type="button"
+                className="st-btn st-btn-primary st-btn-lg st-final-dl"
+                onClick={() => void exportFormat()}
+                disabled={busy}
+                data-testid="final-export"
+              >
+                <RefreshCw />
+                {busy ? '正在提交…' : '按这个规格合成（免费）'}
+              </button>
             ) : (
               <button
                 type="button"
                 className="st-btn st-btn-primary st-btn-lg st-final-dl"
                 disabled
               >
-                <Download />
-                下载 mp4
+                {waiting ? <RefreshCw className="st-spin" /> : <Download />}
+                {waiting ? '正在按这个规格合成…' : '下载 mp4'}
               </button>
             )}
+            {film && subs === 'srt' && film.final?.srtSha ? (
+              srtUrl ? (
+                <a
+                  className="st-btn st-btn-lg st-final-dl"
+                  style={{ marginTop: 6 }}
+                  href={srtUrl}
+                  download={`${base}.srt`}
+                  data-testid="final-srt"
+                >
+                  <Download />
+                  下载 .srt 字幕
+                </a>
+              ) : null
+            ) : null}
             {/* User 2026-10-23 22:13: re-composing for another export format is free. */}
             <div className="st-cap" style={{ marginTop: 6 }} data-testid="export-free-note">
               切换规格（分辨率、竖屏、字幕方式）会重新合成一次，免费，不收任何费用。
             </div>
             <div className="st-cap" style={{ marginTop: 4 }} data-testid="export-format-note">
-              {res !== '1080p' || subs !== 'burn'
-                ? '换成这个规格需要重新合成一次（免费）；重新合成在导演 agent 上线后开放，现在下载的是已合成的版本。'
-                : '下载已合成的版本。'}
+              {film
+                ? '下载已合成的版本。'
+                : waiting
+                  ? '正在按这个规格重新合成（免费），好了会自动出现在这里。'
+                  : !latest
+                    ? '成片合成后可导出。'
+                    : done
+                      ? '这个规格还没合成过：点上方按钮免费重新合成一次。'
+                      : '成片完成后可按其他规格重新合成（免费）。'}
             </div>
+          </div>
+          <div data-testid="final-credits">
+            <div className="st-label" style={{ marginBottom: 8 }}>
+              署名
+            </div>
+            {!shown ? (
+              <div className="st-cap">成片合成后显示。</div>
+            ) : credits.length === 0 ? (
+              <div className="st-cap">这支片没有需要署名的素材。</div>
+            ) : (
+              <>
+                <ul className="st-final-credits">
+                  {credits.map((c) => (
+                    <li key={`${c.kind}:${c.title}:${c.attributionText}`}>
+                      <div className="st-row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                        <b>音乐 · {c.title || '（无标题）'}</b>
+                        {c.license ? <span className="st-chip">{c.license}</span> : null}
+                        <span className="st-chip st-chip-warn">必须署名</span>
+                      </div>
+                      <div className="st-cap" style={{ whiteSpace: 'pre-wrap', marginTop: 4 }}>
+                        {c.attributionText}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {creditsUrl ? (
+                  <a
+                    className="st-btn st-btn-sm"
+                    style={{ marginTop: 8 }}
+                    href={creditsUrl}
+                    download={`${view.project.title || 'studio'}-credits.txt`}
+                    data-testid="final-credits-txt"
+                  >
+                    <Download />
+                    下载 credits.txt
+                  </a>
+                ) : null}
+                <div className="st-cap" style={{ marginTop: 6 }}>
+                  发布这支片时，请把以上署名原样附上（CC BY
+                  协议要求）。写进片尾字幕会在后续版本支持。
+                </div>
+              </>
+            )}
           </div>
           <div>
             <div className="st-label" style={{ marginBottom: 8 }}>

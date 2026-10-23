@@ -82,6 +82,30 @@ export interface StudioTake {
   finishedAt: string | null
   /** Music takes only (OCV5-591 M1): licence snapshot and track card. */
   music?: { license: Record<string, unknown> | null; track: Record<string, unknown> | null } | null
+  /** The media's real length when known (OCV5-591 A2-1c-2); narration is placed by it. */
+  durationMs?: number | null
+  /** Final takes only (OCV5-591 A2-1c-2): export format, CC BY credits, the .srt beside the film. */
+  final?: {
+    variant: ExportVariant | null
+    variantKey: string | null
+    credits: FilmCredit[] | null
+    srtSha: string | null
+  } | null
+}
+
+export type ExportResolution = '1080p' | '720p' | 'vertical'
+export type ExportSubtitles = 'burn' | 'srt' | 'none'
+export interface ExportVariant {
+  resolution: ExportResolution
+  subtitles: ExportSubtitles
+}
+
+/** A CC BY item in a film and the attribution its licence asks for, verbatim. */
+export interface FilmCredit {
+  kind: 'music'
+  title: string
+  attributionText: string
+  license: string
 }
 
 export interface StudioEvent {

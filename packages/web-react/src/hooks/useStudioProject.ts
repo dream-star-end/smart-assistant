@@ -1,10 +1,12 @@
-// OCV5-593: one project's aggregate view. Polls every 3 s only while the project is planning /
-// running / composing and the tab is visible (sys.studio_event push replaces this in A2-1).
+// OCV5-593: one project's aggregate view. Reloads on a sys.studio_event push for this project
+// (FE-6) and, as the fallback, polls every 3 s while the project is planning / running /
+// composing (or a take is in flight) and the tab is visible.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { AuthEpochStaleError } from '../lib/api'
 import { StudioApiError, studioApi } from '../lib/studio/api'
+import { onStudioPush } from '../lib/studio/push'
 import { ACTIVE_STATUSES, type StudioProject, type StudioProjectView } from '../lib/studio/types'
 import type { AuthSession } from '../lib/types'
 
@@ -20,6 +22,9 @@ export function useStudioProject(auth: AuthSession, id: string) {
   const [state, setState] = useState<ProjectState>({ state: 'loading' })
   const seq = useRef(0)
   const inFlight = useRef(0)
+  /** A push arrived while a request was out: its answer may predate the change, so go again. */
+  const pushedDuring = useRef(false)
+  const reloadRef = useRef<() => Promise<void>>(async () => {})
 
   const reload = useCallback(async () => {
     const mine = ++seq.current
@@ -34,8 +39,13 @@ export function useStudioProject(auth: AuthSession, id: string) {
       else setState((cur) => (cur.state === 'ready' ? cur : { state: 'error', error: err }))
     } finally {
       inFlight.current -= 1
+      if (inFlight.current === 0 && pushedDuring.current) {
+        pushedDuring.current = false
+        void reloadRef.current()
+      }
     }
   }, [auth, id])
+  reloadRef.current = reload
 
   // A poll tick never starts a second request while one is still out (code r1 P1): on a network
   // slower than the poll period every response would otherwise be superseded and dropped.
@@ -46,6 +56,16 @@ export function useStudioProject(auth: AuthSession, id: string) {
   useEffect(() => {
     void reload()
   }, [reload])
+
+  useEffect(
+    () =>
+      onStudioPush((d) => {
+        if (d.projectId !== null && d.projectId !== id) return
+        if (inFlight.current > 0) pushedDuring.current = true
+        else void reload()
+      }),
+    [id, reload],
+  )
 
   // Also while any take is in flight (e.g. a voice being designed in a draft project, FE-4).
   const active =
