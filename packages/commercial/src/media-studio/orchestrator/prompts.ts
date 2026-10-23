@@ -61,6 +61,13 @@ export function framePrompt(shot: ShotSpecForPrompt, bible: BibleEntry[], aspect
   )
 }
 
+/** A redo after visual QA (A2-1b-1): what the judge said to avoid, appended to the prompt. */
+export function withAvoid(prompt: string, avoid: string[] | undefined, max = MAX_PROMPT): string {
+  if (!avoid?.length) return prompt
+  const tail = `\n避免：${avoid.map((a) => clip(a, 120)).join('；')}`
+  return clip(prompt, Math.max(0, max - tail.length)) + tail
+}
+
 /** Image-to-video motion prompt (the first frame already carries the look). */
 export function videoPrompt(shot: ShotSpecForPrompt): string {
   return clip(

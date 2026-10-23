@@ -665,6 +665,7 @@ import {
 } from "./grok/webSearchProxy.js";
 import {
   GROK_VISION_PATH,
+  grokRunMaxCost,
   makeGrokRunner,
   makeGrokVisionHandler,
   type GrokVisionHandler,
@@ -2521,6 +2522,13 @@ export async function registerCommercial(
       });
       // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
       if (studioHttp) {
+        const studioGrokCatalog = {
+          async assertFresh() {
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+            return cache.assertFresh();
+          },
+        };
         stopStudioOrchestrator = startStudioOrchestrator({
           cfg,
           pool: getPool(),
@@ -2531,16 +2539,12 @@ export async function registerCommercial(
             getPool,
             preCheckRedis,
             pricing,
-            catalog: {
-              async assertFresh() {
-                const cache = modelCatalogForProxy ?? peekModelCatalogCache();
-                if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
-                return cache.assertFresh();
-              },
-            },
+            catalog: studioGrokCatalog,
             loadUserModelAuthz,
             recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
           }),
+          // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
+          grokMaxCost: () => grokRunMaxCost(studioGrokCatalog),
         })?.stop;
       }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。

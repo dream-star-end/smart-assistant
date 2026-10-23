@@ -14,6 +14,7 @@ import type { MuseBridgeHub } from '../../muse/hub.js'
 import type { StudioHttpDeps } from '../http.js'
 import type { PlanVoice } from './plan.js'
 import { startStudioEventPump } from './push.js'
+import { qaConfigFromEnv } from './qa.js'
 import { makeOrchestratorApi } from './service.js'
 import { StudioWorker } from './worker.js'
 
@@ -25,6 +26,8 @@ export function startStudioOrchestrator(input: {
   museHub?: MuseBridgeHub
   /** OCV5-591 A2-1c-2: deliver a frame to this slot's connections of a user (userChatBridge). */
   push?: (userId: bigint, frame: unknown) => void
+  /** OCV5-591 A2-1b-1: worst-case credits of one user-billed Grok call (catalog price). */
+  grokMaxCost?: () => Promise<bigint | null>
 }): { stop: () => Promise<void> } | undefined {
   const { studio } = input
   if (!studio.providers) return undefined
@@ -37,7 +40,12 @@ export function startStudioOrchestrator(input: {
     if (!key) throw new Error('minimax media key missing')
     return await fetchSystemVoices(fetch, key)
   })
+  const qa = {
+    ...qaConfigFromEnv(process.env, !!input.grok),
+    ...(input.grokMaxCost ? { maxCost: input.grokMaxCost } : {}),
+  }
   const worker = new StudioWorker({
+    qa,
     pool: input.pool,
     blobs: studio.blobs,
     providers: studio.providers,
@@ -60,6 +68,7 @@ export function startStudioOrchestrator(input: {
       pool: input.pool,
       providers: studio.providers,
       ...(studio.compose ? { compose: studio.compose } : {}),
+      qa,
     },
   )
   worker.start()
@@ -70,6 +79,7 @@ export function startStudioOrchestrator(input: {
     owner: worker.owner,
     planner: input.grok ? 'grok' : 'missing',
     compose: studio.compose?.configured() ? 'sandbox' : 'missing',
+    qa: qa.enabled ? `on:${qa.bibleCandidates}` : 'off',
   })
   return {
     stop: async () => {

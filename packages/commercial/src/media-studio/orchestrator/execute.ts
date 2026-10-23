@@ -15,6 +15,7 @@ import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
 import { type ComposeRunnerLike, composePayload, failCompose, runCompose } from './compose.js'
 import { LeaseLostError, withLease } from './lease.js'
+import { buildModerationPrompt, moderationOutcome, parseModeration } from './moderation.js'
 import {
   PlanParseError,
   type PlanVoice,
@@ -22,6 +23,8 @@ import {
   buildPlanPrompt,
   parsePlan,
 } from './plan.js'
+import { type StudioQaDeps, qaGates } from './qa.js'
+import { failQa, runQa } from './runQa.js'
 
 export { LeaseLostError }
 
@@ -39,6 +42,8 @@ export interface ExecuteDeps {
   systemVoices: () => Promise<PlanVoice[]>
   /** OCV5-588 sandbox (OC_STUDIO_FFMPEG_IMAGE_ID); absent → compose waits (compose_pending). */
   compose?: ComposeRunnerLike
+  /** OCV5-591 A2-1b-1: visual QA (absent → takes are used as they come). */
+  qa?: StudioQaDeps
 }
 
 async function projectOf(pool: Pool, projectId: string) {
@@ -87,6 +92,73 @@ function estimatePlan(
   return total
 }
 
+/**
+ * Brief moderation (plan §1.6, platform-paid, stored per request id so a re-claim never re-asks).
+ * Returns false when the project stops here: a clear violation fails it; an unsure brief without
+ * visual QA to back it up returns it to draft so the user can change it.
+ */
+async function moderateBrief(
+  deps: ExecuteDeps,
+  task: StudioTask,
+  p: NonNullable<Awaited<ReturnType<typeof projectOf>>>,
+): Promise<boolean> {
+  const requestId = `${task.execRequestId}:mod`
+  const stored = await deps.pool.query<{ output: { text?: string } }>(
+    'SELECT output FROM studio_step_results WHERE request_id = $1',
+    [requestId],
+  )
+  let text = typeof stored.rows[0]?.output?.text === 'string' ? stored.rows[0].output.text : null
+  if (text === null && deps.grok) {
+    try {
+      text = (
+        await deps.grok({
+          userId: BigInt(p.user_id),
+          containerId: null,
+          requestId,
+          attempt: Math.max(0, task.attempts - 1),
+          prompt: buildModerationPrompt(p.brief),
+          billTo: 'platform',
+          onResult: async (r) => {
+            await deps.pool.query(
+              `INSERT INTO studio_step_results(request_id, user_id, task_id, output)
+               VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (request_id) DO NOTHING`,
+              [requestId, p.user_id, task.id, JSON.stringify({ text: r.text, model: r.model })],
+            )
+          },
+        })
+      ).text
+    } catch {
+      text = null // unavailable: decided below like an unsure verdict
+    }
+  }
+  const m = text === null ? { verdict: 'unavailable' as const, reason: '' } : parseModeration(text)
+  const outcome = moderationOutcome(m.verdict, deps.qa?.enabled === true)
+  if (outcome === 'plan') {
+    if (m.verdict !== 'pass') {
+      await appendStudioEvent(deps.pool, task.projectId, 'brief.moderation_deferred', {
+        message: '需求审核没能给出明确结论，之后每一版画面都会再做内容审核。',
+      })
+    }
+    return true
+  }
+  await withLease(deps.pool, task, async (c) => {
+    await finishStudioTask(c, task, { status: 'done', error: `brief moderation: ${m.verdict}` })
+    await c.query(
+      `UPDATE studio_projects SET status = $2, settings = settings || jsonb_build_object('moderation', $3::text),
+              rev = rev + 1, updated_at = NOW() WHERE id = $1 AND status = 'planning'`,
+      [task.projectId, outcome === 'fail' ? 'failed' : 'draft', m.verdict],
+    )
+    await appendStudioEvent(c, task.projectId, 'brief.moderation', {
+      verdict: m.verdict,
+      message:
+        outcome === 'fail'
+          ? `需求未通过内容审核${m.reason ? `：${m.reason}` : ''}，不能制作。`
+          : `需求可能不合规${m.reason ? `（${m.reason}）` : ''}，请修改后再开始。`,
+    })
+  })
+  return false
+}
+
 async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
   const p = await projectOf(deps.pool, task.projectId)
   if (!p) {
@@ -115,6 +187,9 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
     available: { ...available, voice: available.voice && voices.length > 0 },
     voices,
   }
+
+  // A2-1b-1: the brief is moderated before anything is planned or generated (D7).
+  if (!(await moderateBrief(deps, task, p))) return
 
   // A stored answer (an earlier attempt got it, then lost its lease) is reused, never re-asked.
   const stored = await deps.pool.query<{ output: { text?: string } }>(
@@ -287,6 +362,8 @@ async function adopt(
   takeId: string,
   sha: string | null,
   out: MediaResult,
+  /** A2-1b-1: QA judges this take first; runQa adopts it if it passes. */
+  gated = false,
 ): Promise<void> {
   const voiceId = typeof out.meta?.voiceId === 'string' ? out.meta.voiceId : null
   if (g.ownerKind === 'bible' && voiceId) {
@@ -300,6 +377,7 @@ async function adopt(
       message: '新音色已就绪，可以试听，也可以设为旁白。',
     })
   } else if (g.ownerKind === 'bible') {
+    if (gated) return
     await c.query(
       'UPDATE studio_assets SET blob_sha = $2, locked = TRUE WHERE id = $1 AND project_id = $3',
       [g.ownerId, sha, projectId],
@@ -308,10 +386,11 @@ async function adopt(
     // Only while the shot still waits for this video: not after the user chose another take, not
     // when a long line sent it to the user, not when a different first frame was picked since.
     // A declined video stays a finished version the user can choose.
+    if (gated) return
     const first = g.request.inputs?.find((i) => i.role === 'first_frame')?.blobSha ?? null
     await c.query(
       `UPDATE studio_shots s SET active_take_id = $2, status = 'ready', spec = s.spec - 'frameTakeId'
-        WHERE s.id = $1 AND s.project_id = $3 AND s.status = 'generating'
+        WHERE s.id = $1 AND s.project_id = $3 AND s.status IN ('generating', 'qa')
           AND (NOT s.spec ? 'frameTakeId'
                OR EXISTS (SELECT 1 FROM studio_takes f
                            WHERE f.id::text = s.spec->>'frameTakeId' AND f.blob_sha = $4))`,
@@ -464,11 +543,21 @@ async function runGen(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal):
         ref: { kind: 'take', id: g.takeId },
       })
     : null
+  // A2-1b-1: which takes QA judges before use; a gateable take QA does not judge says so.
+  const gates = qaGates(deps)
+  const gateable =
+    (g.ownerKind === 'bible' && !newVoice) ||
+    g.ownerKind === 'shot_frame' ||
+    g.ownerKind === 'shot_video'
+  const gated =
+    gateable && gates[g.ownerKind as 'bible' | 'shot_frame' | 'shot_video'] === true && !!stored
+  const skipped = gateable && !gated
   await withLease(deps.pool, task, async (c) => {
     await c.query(
       `UPDATE studio_takes
           SET status = 'succeeded', blob_sha = $2, cost_credits = $3, provider_ref = $4::jsonb,
-              model = $5, meta = meta || $6::jsonb, finished_at = NOW()
+              model = $5, meta = meta || $6::jsonb, finished_at = NOW(),
+              qa = CASE WHEN $7::jsonb IS NULL THEN qa ELSE $7::jsonb END
         WHERE id = $1`,
       [
         g.takeId,
@@ -480,9 +569,15 @@ async function runGen(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal):
           ...(result.meta ?? {}),
           ...(out?.durationMs ? { durationMs: out.durationMs } : {}),
         }),
+        skipped
+          ? JSON.stringify({
+              skipped: true,
+              reason: !deps.qa?.enabled ? 'off' : 'no_sandbox',
+            })
+          : null,
       ],
     )
-    await adopt(c, task.projectId, g, g.takeId, stored?.sha ?? null, result)
+    await adopt(c, task.projectId, g, g.takeId, stored?.sha ?? null, result, gated)
     await bookTaskCharge(c, task, result.costCredits, { release: true })
     await appendStudioEvent(c, task.projectId, 'take.succeeded', {
       ownerKind: g.ownerKind,
@@ -582,6 +677,12 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
         }
         await bookTaskCharge(c, task, 0n, { release: true })
       }
+      // A2-1b-1: a QA task releases its reservation (a charge from a lost earlier attempt is
+      // booked by reconcile()).
+      if (task.kind === 'qa') {
+        const booked = BigInt(String((task.payload as { booked?: unknown }).booked ?? '0'))
+        await bookTaskCharge(c, task, booked, { release: true })
+      }
       await finishStudioTask(c, task, { status: 'canceled', error: 'project is no longer active' })
     })
     return false
@@ -620,6 +721,10 @@ async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promi
   }
   if (task.kind === 'compose') {
     await failCompose(deps, task, e.code, e.message)
+    return
+  }
+  if (task.kind === 'qa') {
+    await failQa(deps, task, e)
     return
   }
   if (task.kind === 'gen') {
@@ -669,6 +774,7 @@ export async function executeTask(
     if (task.kind === 'plan') return await runPlan(deps, task)
     if (task.kind === 'gen') return await runGen(deps, task, signal)
     if (task.kind === 'compose') return await runCompose(deps, task)
+    if (task.kind === 'qa') return await runQa(deps, task)
     throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
   } catch (err) {
     // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.

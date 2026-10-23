@@ -361,6 +361,20 @@ export class GrokRunError extends Error {
 export type GrokRunner = (input: GrokRunInput) => Promise<GrokRunResult>;
 
 /**
+ * OCV5-591 A2-1b-1: the worst case of one user-billed run (the same estimate its precheck
+ * reserves), for the media studio's project budget. null when the catalog cannot price it.
+ */
+export async function grokRunMaxCost(catalog: GrokVisionCatalog): Promise<bigint | null> {
+  try {
+    const snapshot = await catalog.assertFresh();
+    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(GROK_VISION_MODEL));
+    return pricing ? estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Core of the vision proxy, callable without a container (OCV5-591 A0). Behaviour for the HTTP
  * route is unchanged: same admit → upstream → settle order, same error codes.
  */

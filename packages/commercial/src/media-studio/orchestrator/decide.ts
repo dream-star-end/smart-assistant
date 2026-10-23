@@ -26,6 +26,18 @@ export interface DTake {
   provider: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
   blobSha: string | null
+  /** OCV5-591 A2-1b-1: the take's QA outcome (null: not judged yet). */
+  qa?: DQa | null
+}
+
+export interface DQa {
+  passed: boolean
+  /** QA was not run for this take (switched off / no sandbox); it counts as usable. */
+  skipped: boolean
+  next: 'adopt' | 'redo' | 'handoff' | null
+  score: number | null
+  /** What a redo should avoid (the judge's issues). */
+  avoid: string[]
 }
 
 export interface DShot {
@@ -67,6 +79,12 @@ export interface DState {
   canCompose: boolean
   /** A compose task of this project is queued or leased. */
   composeQueued: boolean
+  /** OCV5-591 A2-1b-1: which owner kinds are QA'd before use (absent: none). */
+  qa?: { bible: boolean; shot_frame: boolean; shot_video: boolean }
+  /** Bible candidates per round (OC_STUDIO_BIBLE_CANDIDATES; default 1). */
+  bibleCandidates?: number
+  /** Takes with a queued / leased QA task. */
+  qaQueued?: string[]
 }
 
 export interface Dispatch {
@@ -77,6 +95,8 @@ export interface Dispatch {
   exclude: string[]
   /** Blob inputs, e.g. the bible images for a frame or the first frame for a video. */
   inputs: Array<{ role: 'reference' | 'first_frame'; blobSha: string }>
+  /** A redo after QA: what the new version should avoid (A2-1b-1). */
+  avoid?: string[]
 }
 
 export type Action =
@@ -90,6 +110,10 @@ export type Action =
   | { type: 'note_music_skipped' }
   /** Everything is ready: the director composes the film (A2-1c). */
   | { type: 'enqueue_compose' }
+  /** A finished take is judged before it is used (A2-1b-1). */
+  | { type: 'dispatch_qa'; takeId: string; ownerKind: DTake['ownerKind']; ownerId: string }
+  /** A bible image passed QA but is not locked yet (runQa normally locks it itself). */
+  | { type: 'lock_bible'; assetId: string; takeId: string }
 
 const BIBLE_KINDS = new Set(['character', 'scene', 'style'])
 
@@ -104,6 +128,31 @@ const failedProviders = (ts: DTake[]) => [
 ]
 
 /** A shot is done only when its adopted take is a succeeded video (plan r1 P1-3). */
+/** QA gates this owner kind. */
+function qaOn(s: DState, kind: DTake['ownerKind']): boolean {
+  return (
+    (kind === 'bible' || kind === 'shot_frame' || kind === 'shot_video') && s.qa?.[kind] === true
+  )
+}
+
+/** Usable: finished and, where QA gates it, passed (or QA was not run for it). */
+export function accepted(s: DState, t: DTake): boolean {
+  if (!ok(t)) return false
+  if (!qaOn(s, t.ownerKind)) return true
+  return t.qa?.passed === true || t.qa?.skipped === true
+}
+
+/** Finished, gated, and not judged yet. */
+function awaitingQa(s: DState, t: DTake): boolean {
+  return ok(t) && qaOn(s, t.ownerKind) && !t.qa
+}
+
+/** The newest judged take of an owner, if it was handed to the user and nothing came after it. */
+function latestJudged(ts: DTake[]): DTake | undefined {
+  const newest = [...ts].sort((a, b) => b.version - a.version)[0]
+  return newest?.qa && !newest.qa.skipped ? newest : undefined
+}
+
 export function shotDone(s: DState, shot: DShot): boolean {
   if (shot.status !== 'ready' || !shot.activeTakeId) return false
   const t = s.takes.find((x) => x.id === shot.activeTakeId)
@@ -127,6 +176,20 @@ export function decide(s: DState): Action[] {
   }
   let blocked = false // something can never finish without the user
   const adopted = new Set<string>()
+  const queuedQa = new Set(s.qaQueued ?? [])
+  /** Judge a finished take (counts against the in-flight budget like a generation). */
+  const judge = (t: DTake) => {
+    if (queuedQa.has(t.id)) return true
+    if (budget <= 0) return false
+    budget -= 1
+    queuedQa.add(t.id)
+    actions.push({ type: 'dispatch_qa', takeId: t.id, ownerKind: t.ownerKind, ownerId: t.ownerId })
+    return true
+  }
+  const avoidOf = (ts: DTake[]) => {
+    const last = latestJudged(ts)
+    return last?.qa?.next === 'redo' && last.qa.avoid.length ? { avoid: last.qa.avoid } : {}
+  }
 
   // 1) bible: every character / scene / style asset gets one locked image.
   const bible = s.assets.filter((a) => BIBLE_KINDS.has(a.kind))
@@ -134,17 +197,40 @@ export function decide(s: DState): Action[] {
     if (a.locked && a.blobSha) continue
     const ts = ownerTakes(s, 'bible', a.id)
     if (ts.some(live)) continue
+    // A2-1b-1: every candidate is judged first; the best passing one is locked.
+    const waiting = ts.filter((t) => awaitingQa(s, t))
+    if (waiting.length) {
+      for (const t of waiting) judge(t)
+      continue
+    }
+    if (qaOn(s, 'bible')) {
+      const best = ts
+        .filter((t) => accepted(s, t))
+        .sort((x, y) => (y.qa?.score ?? 0) - (x.qa?.score ?? 0) || y.version - x.version)[0]
+      if (best) {
+        actions.push({ type: 'lock_bible', assetId: a.id, takeId: best.id })
+        continue
+      }
+      if (latestJudged(ts)?.qa?.next === 'handoff') {
+        blocked = true
+        continue
+      }
+    }
     if (!s.canDispatch.image) {
       blocked = true
       continue
     }
-    dispatch({
-      ownerKind: 'bible',
-      ownerId: a.id,
-      op: 'image.generate',
-      exclude: failedProviders(ts),
-      inputs: [],
-    })
+    const n = qaOn(s, 'bible') ? Math.max(1, Math.min(2, s.bibleCandidates ?? 1)) : 1
+    for (let i = 0; i < n; i++) {
+      dispatch({
+        ownerKind: 'bible',
+        ownerId: a.id,
+        op: 'image.generate',
+        exclude: failedProviders(ts),
+        inputs: [],
+        ...avoidOf(ts),
+      })
+    }
   }
   const bibleReady = bible.every((a) => a.locked && a.blobSha)
   const refs = bible
@@ -161,12 +247,25 @@ export function decide(s: DState): Action[] {
     const frames = ownerTakes(s, 'shot_frame', shot.id)
     const videos = ownerTakes(s, 'shot_video', shot.id)
     if (frames.some(live) || videos.some(live)) continue
+    // A2-1b-1: a finished frame / video is judged before anything is built on it.
+    const waiting = [...frames, ...videos].filter((t) => awaitingQa(s, t))
+    if (waiting.length) {
+      if (waiting.map(judge).some(Boolean) && shot.status !== 'qa')
+        actions.push({ type: 'shot_status', shotId: shot.id, status: 'qa' })
+      continue
+    }
+    // The user's pick is theirs: it skips QA (plan §1.1).
     const picked = shot.frameTakeId
       ? frames.find((t) => t.id === shot.frameTakeId && ok(t))
       : undefined
-    const frame = picked ?? [...frames].filter(ok).sort((a, b) => b.version - a.version)[0]
+    const frame =
+      picked ?? [...frames].filter((t) => accepted(s, t)).sort((a, b) => b.version - a.version)[0]
     if (!frame) {
       if (!bibleReady) continue
+      if (latestJudged(frames)?.qa?.next === 'handoff') {
+        blocked = true
+        continue
+      }
       if (!s.canDispatch.image) {
         blocked = true
         continue
@@ -178,6 +277,7 @@ export function decide(s: DState): Action[] {
           op: 'image.generate',
           exclude: failedProviders(frames),
           inputs: refs,
+          ...avoidOf(frames),
         })
       ) {
         if (shot.status !== 'generating')
@@ -187,13 +287,19 @@ export function decide(s: DState): Action[] {
     }
     // No frame picked and a finished video exists → adopt the newest one (the executor adopts
     // only into the state it was dispatched for). A picked frame always gets its own video.
-    const usable = [...videos].filter(ok).sort((a, b) => b.version - a.version)[0]
+    const usable = [...videos]
+      .filter((t) => accepted(s, t))
+      .sort((a, b) => b.version - a.version)[0]
     if (usable && !shot.frameTakeId) {
       actions.push({ type: 'adopt_video', shotId: shot.id, takeId: usable.id })
       adopted.add(shot.id)
       continue
     }
     if (!s.canDispatch.video) {
+      blocked = true
+      continue
+    }
+    if (!shot.frameTakeId && latestJudged(videos)?.qa?.next === 'handoff') {
       blocked = true
       continue
     }
@@ -204,6 +310,7 @@ export function decide(s: DState): Action[] {
         op: 'video.from_image',
         exclude: failedProviders(videos),
         inputs: [{ role: 'first_frame', blobSha: frame.blobSha! }],
+        ...avoidOf(videos),
       })
     ) {
       if (shot.status !== 'generating')
@@ -241,7 +348,7 @@ export function decide(s: DState): Action[] {
   // 4) music: only an interface for now — note once that it is skipped (user decision).
   if (!s.canDispatch.music && !s.musicSkippedNoted) actions.push({ type: 'note_music_skipped' })
 
-  const dispatched = actions.some((a) => a.type === 'dispatch')
+  const dispatched = actions.some((a) => a.type === 'dispatch' || a.type === 'dispatch_qa')
   const allShots =
     s.shots.length > 0 && s.shots.every((sh) => shotDone(s, sh) || adopted.has(sh.id))
   const allLines = s.lines.every((l) => l.status === 'ready' && l.activeTakeId)

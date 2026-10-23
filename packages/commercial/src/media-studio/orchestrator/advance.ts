@@ -11,14 +11,33 @@ import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { reserveBudget } from './budget.js'
 import { DEFAULT_VARIANT } from './composeJob.js'
-import { type Action, type DState, type Dispatch, decide } from './decide.js'
-import { type BibleEntry, biblePrompt, framePrompt, videoPrompt } from './prompts.js'
+import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
+import { type BibleEntry, biblePrompt, framePrompt, videoPrompt, withAvoid } from './prompts.js'
+import { type StudioQaDeps, qaGates } from './qa.js'
 
 export interface AdvanceDeps {
   pool: Pool
   providers: ProviderRegistry
   /** OCV5-591 A2-1c: the compose sandbox; absent or unconfigured → compose_pending. */
   compose?: { configured(): boolean }
+  /** OCV5-591 A2-1b-1: visual QA (absent or disabled → takes are used as they come). */
+  qa?: StudioQaDeps
+}
+
+function dqa(raw: unknown): DQa | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const q = raw as Record<string, unknown>
+  const issues = Array.isArray(q.issues) ? q.issues : []
+  return {
+    passed: q.passed === true,
+    skipped: q.skipped === true,
+    next: q.next === 'adopt' || q.next === 'redo' || q.next === 'handoff' ? q.next : null,
+    score: typeof q.score === 'number' ? q.score : null,
+    avoid: issues
+      .map((i) => (i && typeof i === 'object' ? (i as { what?: unknown }).what : null))
+      .filter((w): w is string => typeof w === 'string')
+      .slice(0, 5),
+  }
 }
 
 const REPRESENTATIVE_OP: Record<'image' | 'video' | 'voice' | 'music', MediaOp> = {
@@ -91,13 +110,16 @@ export async function loadState(
       provider: string
       status: string
       blob_sha: string | null
+      qa: unknown
     }>(
-      `SELECT id::text AS id, owner_kind, owner_id::text AS owner_id, version, provider, status, blob_sha
+      `SELECT id::text AS id, owner_kind, owner_id::text AS owner_id, version, provider, status, blob_sha, qa
          FROM studio_takes WHERE project_id = $1`,
       [projectId],
     ),
-    client.query<{ kind: string; n: string }>(
-      `SELECT kind, COUNT(*)::text AS n FROM studio_tasks
+    client.query<{ kind: string; n: string; qa_takes: string[] | null }>(
+      `SELECT kind, COUNT(*)::text AS n,
+              array_agg(payload->>'takeId') FILTER (WHERE kind = 'qa') AS qa_takes
+         FROM studio_tasks
         WHERE project_id = $1 AND status IN ('queued', 'leased') GROUP BY kind`,
       [projectId],
     ),
@@ -105,7 +127,10 @@ export async function loadState(
   const user = { id: project.user_id }
   const can = (k: keyof typeof REPRESENTATIVE_OP) =>
     deps.providers.candidates(k, REPRESENTATIVE_OP[k], user, { includeOffline: true }).length > 0
-  const inflight = tasks.rows.filter((t) => t.kind === 'gen').reduce((s, t) => s + Number(t.n), 0)
+  // A2-1b-1: QA calls count against the in-flight budget like generations.
+  const inflight = tasks.rows
+    .filter((t) => t.kind === 'gen' || t.kind === 'qa')
+    .reduce((s, t) => s + Number(t.n), 0)
   const settings = project.settings ?? {}
   const narration = settings.narration as { voiceId?: unknown } | null | undefined
   const state: DState = {
@@ -138,11 +163,15 @@ export async function loadState(
       provider: t.provider,
       status: t.status as DState['takes'][number]['status'],
       blobSha: t.blob_sha,
+      qa: dqa(t.qa),
     })),
     narrationVoiceId: typeof narration?.voiceId === 'string' ? narration.voiceId : null,
     musicSkippedNoted: settings.musicSkippedNoted === true,
     canCompose: deps.compose?.configured() ?? false,
     composeQueued: tasks.rows.some((t) => t.kind === 'compose'),
+    qa: qaGates(deps),
+    bibleCandidates: deps.qa?.bibleCandidates ?? 1,
+    qaQueued: tasks.rows.flatMap((t) => (t.kind === 'qa' ? (t.qa_takes ?? []) : [])),
     canDispatch: {
       image: can('image'),
       video: can('video'),
@@ -174,20 +203,26 @@ function buildRequest(
 ): MediaRequest {
   const aspect = ctx.project.aspect
   const inputs = d.inputs.map((i) => ({ role: i.role, blobSha: i.blobSha }))
+  // A2-1b-1: a redo after QA carries what the judge said to avoid.
   if (d.ownerKind === 'bible') {
     const entry = ctx.bible.find((b) => b.id === d.ownerId)!
-    return { op: d.op, prompt: biblePrompt(entry, aspect), aspect }
+    return { op: d.op, prompt: withAvoid(biblePrompt(entry, aspect), d.avoid), aspect }
   }
   if (d.ownerKind === 'shot_frame') {
     const spec = ctx.specs.get(d.ownerId) ?? {}
-    return { op: d.op, prompt: framePrompt(spec, ctx.bible, aspect), aspect, inputs }
+    return {
+      op: d.op,
+      prompt: withAvoid(framePrompt(spec, ctx.bible, aspect), d.avoid),
+      aspect,
+      inputs,
+    }
   }
   if (d.ownerKind === 'shot_video') {
     const spec = ctx.specs.get(d.ownerId) ?? {}
     const dur = Number(spec.durationSec)
     return {
       op: d.op,
-      prompt: videoPrompt(spec),
+      prompt: withAvoid(videoPrompt(spec), d.avoid, 1000),
       aspect,
       inputs,
       ...(Number.isFinite(dur) ? { durationSec: dur } : {}),
@@ -302,6 +337,37 @@ export async function dispatchRequest(
   return 'queued'
 }
 
+/**
+ * One QA call for a finished take (A2-1b-1): reserve its worst case against the project budget
+ * (skipped when the catalog cannot price it; the call's own precheck still guards the user's
+ * credits, and the real charge is booked afterwards) and enqueue it once per take.
+ */
+async function dispatchQa(
+  client: PoolClient,
+  deps: AdvanceDeps,
+  projectId: string,
+  takeId: string,
+): Promise<'queued' | 'budget' | 'exists'> {
+  const est = (await deps.qa?.maxCost?.().catch(() => null)) ?? null
+  if (est !== null && !(await reserveBudget(client, projectId, est))) return 'budget'
+  const r = await enqueueStudioTask(client, {
+    projectId,
+    kind: 'qa',
+    idempotencyKey: `qa:${takeId}`,
+    payload: { takeId, booked: '0' },
+    reservedCredits: est ?? 0n,
+  })
+  if (!r.created && est !== null) {
+    // Already judged or judging: give the reservation back.
+    await client.query(
+      'UPDATE studio_projects SET reserved_credits = GREATEST(0, reserved_credits - $2) WHERE id = $1',
+      [projectId, est.toString()],
+    )
+    return 'exists'
+  }
+  return 'queued'
+}
+
 async function apply(
   client: PoolClient,
   deps: AdvanceDeps,
@@ -359,6 +425,25 @@ async function apply(
           return
         }
       }
+    } else if (a.type === 'dispatch_qa') {
+      if ((await dispatchQa(client, deps, id, a.takeId)) === 'budget') {
+        await client.query(
+          `UPDATE studio_projects SET status = 'paused', settings = settings || '{"pausedReason":"budget"}'::jsonb,
+                  rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+          [id],
+        )
+        await appendStudioEvent(client, id, 'budget.exhausted', {
+          message: '预算不够做质检了，已暂停。调高预算后点“继续”。',
+        })
+        return
+      }
+    } else if (a.type === 'lock_bible') {
+      await client.query(
+        `UPDATE studio_assets a SET blob_sha = t.blob_sha, locked = TRUE
+           FROM studio_takes t
+          WHERE a.id = $1 AND a.project_id = $3 AND NOT a.locked AND t.id = $2 AND t.blob_sha IS NOT NULL`,
+        [a.assetId, a.takeId, id],
+      )
     } else if (a.type === 'adopt_video') {
       await client.query(
         `UPDATE studio_shots SET active_take_id = $2, status = 'ready'

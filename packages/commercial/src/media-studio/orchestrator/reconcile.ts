@@ -5,6 +5,7 @@
 
 import type { Pool } from 'pg'
 
+import { grokCharged } from '../providers/charges.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
@@ -44,12 +45,13 @@ async function reconcileBatch(
       provider: string
       take_id: string
       booked: string
+      kind: string
     }>(
       `SELECT t.id::text AS id, t.project_id::text AS project_id, p.user_id::text AS user_id,
               t.exec_request_id AS exec, t.payload->>'providerId' AS provider, t.payload->>'takeId' AS take_id,
-              COALESCE(t.payload->>'booked', '0') AS booked
+              COALESCE(t.payload->>'booked', '0') AS booked, t.kind
          FROM studio_tasks t JOIN studio_projects p ON p.id = t.project_id
-        WHERE t.kind = 'gen' AND t.status IN ('done', 'failed', 'canceled')
+        WHERE t.kind IN ('gen', 'qa') AND t.status IN ('done', 'failed', 'canceled')
           AND t.updated_at > NOW() - make_interval(days => $1) AND p.deleted_at IS NULL
           AND t.id > $2::uuid
         ORDER BY t.id
@@ -58,18 +60,28 @@ async function reconcileBatch(
       [RECONCILE_LOOKBACK_DAYS, after, BATCH],
     )
     for (const r of rows.rows) {
-      const provider = deps.providers.get(r.provider)
-      if (!provider) continue
-      // A provider that cannot read its ledger now is retried on a later pass, never booked as 0.
-      const charged = await provider.chargedFor(BigInt(r.user_id), r.exec).catch(() => null)
+      // A2-1b-1: a QA task's charge is its Grok call; a generation's is its provider's ledger.
+      const provider = r.kind === 'gen' ? deps.providers.get(r.provider) : undefined
+      if (r.kind === 'gen' && !provider) continue
+      // A ledger that cannot be read now is retried on a later pass, never booked as 0.
+      const charged = provider
+        ? await provider.chargedFor(BigInt(r.user_id), r.exec).catch(() => null)
+        : await grokCharged(deps.pool, BigInt(r.user_id), r.exec).catch(() => null)
       if (charged === null || charged === BigInt(r.booked)) continue
       await bookTaskCharge(client, { id: r.id, projectId: r.project_id }, charged, {
         release: false,
       })
-      await client.query('UPDATE studio_takes SET cost_credits = $2 WHERE id = $1', [
-        r.take_id,
-        charged.toString(),
-      ])
+      if (r.kind === 'gen') {
+        await client.query('UPDATE studio_takes SET cost_credits = $2 WHERE id = $1', [
+          r.take_id,
+          charged.toString(),
+        ])
+      } else {
+        await client.query(
+          `UPDATE studio_takes SET qa = jsonb_set(qa, '{costCredits}', to_jsonb($2::text)) WHERE id = $1 AND qa IS NOT NULL`,
+          [r.take_id, charged.toString()],
+        )
+      }
       await appendStudioEvent(client, r.project_id, 'charge.reconciled', {
         takeId: r.take_id,
         costCredits: charged.toString(),
