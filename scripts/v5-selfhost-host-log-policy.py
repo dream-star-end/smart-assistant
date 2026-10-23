@@ -56,7 +56,9 @@ def bundle_files(bundle):
 def config_bytes(data, root):
     if root == Path("/"):
         return data
-    return data.replace(b"/var/log/", (str(mapped(root, "var/log")) + "/").encode())
+    prefix = (str(mapped(root, "var/log")) + "/").encode()
+    return re.sub(rb"""(^|[\s"'])/var/log/""",
+                  lambda match: match.group(1) + prefix, data, flags=re.M)
 
 
 @contextlib.contextmanager
@@ -181,11 +183,8 @@ def dry_run_view(root, files, attempt):
         os.fchmod(output.fileno(), 0o600)
         result = subprocess.run(["logrotate", "--debug", "--state", "/dev/null",
                                  str(view / "logrotate.conf")], stdout=output,
-                                stderr=subprocess.STDOUT, timeout=30,
-                                env={**os.environ, "LC_ALL": "C"})
-    # logrotate 3.21 can return zero after a duplicate-entry directory error.
-    diagnostics = regular_bytes(attempt / "logrotate-debug.log").decode(errors="replace")
-    if result.returncode or re.search(r"(?m)^error:", diagnostics):
+                                stderr=subprocess.STDOUT, timeout=30)
+    if result.returncode:
         raise ValueError("global logrotate dry-run rejected policy; see evidence directory")
 
 

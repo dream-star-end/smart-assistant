@@ -175,6 +175,8 @@ class HostLogPolicyTest(unittest.TestCase):
         self.assertIn("su root adm\nweekly\nrotate 4\n", text)
         self.assertEqual(text.count("include "), 1)
         self.assertNotIn("include /etc/logrotate.d", text)
+        self.assertEqual((view / "logrotate.d/sibling").read_bytes(),
+                         (self.root / "etc/logrotate.d/sibling").read_bytes())
         self.assertEqual({p.name for p in (view / "logrotate.d").iterdir()},
                          {"sibling", "openclaude-v5-selfhost", "openclaude-v5-selfhost-egress-watch"})
 
