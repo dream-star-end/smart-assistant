@@ -930,6 +930,10 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!this.proc || !this.attached || !this.threadId) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
     if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction || this.compactPrivacyPreparing) throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
     const sourceThread = this.threadId
+    let expectedGeneration = this._preheatGeneration
+    const assertCurrent = () => {
+      if (this._preheatGeneration !== expectedGeneration) throw new Error('CODEX_NATIVE_COMPACTION_INTERRUPTED')
+    }
     this.compactPrivacyPreparing = true
     try {
       return await withFreshPromptPrivacy(this, this.opts.sessionId, async () => {
@@ -938,15 +942,18 @@ export class CodexAppServerRunner extends EventEmitter {
           const repo = this._currentRepoSnapshot()
           const cwd = this._applyRepoBindingFromSnapshot(repo)
           await this.ensureSpawned(repo, cwd)
+          assertCurrent()
           await this.sendRequest('thread/resume', {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
             threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
             ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
           })
+          assertCurrent()
           this.attached = true
         }
+        assertCurrent()
         return this.compactCurrentThreadForHandoff()
-      })
+      }, { assertCurrent, beforeOwnedShutdown: () => { assertCurrent(); expectedGeneration++ } })
     } finally { this.compactPrivacyPreparing = false }
   }
   private async compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
@@ -997,6 +1004,10 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
+    if (this.compactPrivacyPreparing) {
+      void this.shutdown()
+      return true
+    }
     // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
     // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
     // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close

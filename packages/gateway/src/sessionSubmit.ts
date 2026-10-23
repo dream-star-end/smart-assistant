@@ -743,6 +743,13 @@ export async function submit(
     // 应用。CodexAppServerRunner 在 runTurn 顶部比对 route 签名,变化时自行
     // shutdown + respawn(spawn 期 -c 参数),这里只 stash,不参与下方
     // effort/model 的合并 shutdown。
+    // Freeze consent before changing desired runtime configuration. A failed metadata read
+    // must leave old desired values intact so a retry still knows it must restart the warm process.
+    const privacyRunner = session.runner
+    const assertSessionCurrent = () => {
+      if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_PRIVACY_OPERATION_CANCELLED')
+    }
+    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertSessionCurrent })
     const maybeSetCodexRoute = (session.runner as any).setCodexRoute
     if (typeof maybeSetCodexRoute === 'function') {
       maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
@@ -782,6 +789,7 @@ export async function submit(
         iuiApplied,
         await getDesiredIntelligentUi(session.sessionKey).catch(() => undefined),
       )
+    assertSessionCurrent()
     if (effortChanged) session.runner.setEffortLevel(desiredEffort)
     if (modelChanged) {
       session.runner.setModel(desiredModel)
@@ -811,7 +819,6 @@ export async function submit(
         opts?.serviceTier === 'fast' ? 'fast' : null,
         modelChanged ? desiredModel : session.runner.model,
       ) === 'restart'
-    const privacyChanged = await prepareRunnerPromptPrivacy(session.runner, session.peerId)
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
       try {
         await session.runner.shutdown()
@@ -1243,6 +1250,7 @@ export async function submit(
     const CHECK_INTERVAL = 15_000 // check every 15s
     const logicalTurnStartedAt = Date.now()
     let livenessTimer: NodeJS.Timeout | null = null
+    assertSessionCurrent()
     const livenessPromise = new Promise<never>((_, reject) => {
       livenessTimer = setInterval(() => {
         if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
@@ -2273,7 +2281,11 @@ export async function finishIdleUnderLock(
     writeSettledIdleOp(recoveryDir, { ...withIncarnationShutdown(recoveryDir, existingIdle), disposition: 'short' })
     return
   }
-  await refreshRunnerPromptPrivacy(session.runner, session.peerId)
+  const privacyRunner = session.runner
+  const assertIdleCurrent = () => {
+    if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_IDLE_PRIVACY_CANCELLED')
+  }
+  await refreshRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertIdleCurrent })
   try {
     const started = startIdleOp({
       dir: recoveryDir,
@@ -2371,7 +2383,8 @@ export async function finishIdleUnderLock(
       session._idleRunning = true
       session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
       try {
-        const settled = await runBoxIdleTurn(session.runner, {
+        assertIdleCurrent()
+        const settled = await runBoxIdleTurn(privacyRunner, {
           input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
           onEvent: () => {},
@@ -2412,7 +2425,8 @@ export async function finishIdleUnderLock(
               allowDispatch: false,
             })
             if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
-              const applied = await runBoxIdleTurn(session.runner, {
+              assertIdleCurrent()
+              const applied = await runBoxIdleTurn(privacyRunner, {
                 input: IDLE_COMPACT_PROMPT,
                 turnKey: step.op.idleTurnKey,
                 onEvent: () => {},
