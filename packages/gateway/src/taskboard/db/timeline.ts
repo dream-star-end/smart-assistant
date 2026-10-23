@@ -90,7 +90,7 @@ export function listTicketTimelinePage(
     for (const source of sources) {
       const rows = db
         .prepare(`SELECT id, created_at AS createdAt ${source.kind === 'run' ? ', json_array(status, finished_at, duration_ms, tokens_in, tokens_out, cost_usd, cost_imprecise, output_md IS NOT NULL) AS revision' : ''} FROM ${source.table}
-        WHERE ticket_id = @ticketId ${before ? `AND (created_at < @at OR (created_at = @at AND (@rank < @beforeRank OR (@rank = @beforeRank AND id < @id))))` : ''}
+        WHERE ticket_id = @ticketId ${before ? 'AND (created_at < @at OR (created_at = @at AND (@rank < @beforeRank OR (@rank = @beforeRank AND id < @id))))' : ''}
         ORDER BY created_at DESC, id DESC LIMIT @take`)
         .all({
           ticketId,

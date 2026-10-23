@@ -669,7 +669,7 @@ export function TicketDrawer({
   useEffect(() => {
     if (!open) return
     if (execution) hydrateResult(execution)
-    const pending = history.pendingRuns(execution?.id)[0]
+    const pending = historyStatus.initialized ? history.pendingRuns(execution?.id)[0] : undefined
     if (pending) hydrateResult(pending, true)
   }, [open, execution, hydrateResult, history, historyStatus])
 
