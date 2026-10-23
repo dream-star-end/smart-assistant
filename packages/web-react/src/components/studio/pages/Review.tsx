@@ -162,13 +162,23 @@ function ShotReview(props: {
     try {
       for (const d of ready) {
         let serverId = d.serverId
-        if (!serverId) {
+        let alreadySent = false
+        if (serverId) {
+          // Created earlier, maybe edited since (FE-7b r2): the server copy takes what it says now.
+          const { takeId: _take, ...fields } = draftToBody(d)
+          try {
+            await studioApi.updateAnnotation(auth, serverId, fields)
+          } catch (err) {
+            if (!(err instanceof StudioApiError && err.code === 'ANNOTATION_NOT_DRAFT')) throw err
+            alreadySent = true
+          }
+        } else {
           serverId = (await studioApi.createAnnotation(auth, view.project.id, draftToBody(d))).id
           const sid = serverId
           updateDrafts((cur) => cur.map((x) => (x.id === d.id ? { ...x, serverId: sid } : x)))
         }
         try {
-          await studioApi.annotationAction(auth, serverId, 'send')
+          if (!alreadySent) await studioApi.annotationAction(auth, serverId, 'send')
         } catch (err) {
           if (!(err instanceof StudioApiError && err.code === 'ANNOTATION_NOT_DRAFT')) throw err
         }

@@ -200,6 +200,12 @@ export const studioApi = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+  /** A draft's fields on the server (FE-7b r2: a retry sends what the draft says now). */
+  updateAnnotation: (auth: AuthSession, id: string, body: Omit<AnnotationBody, 'takeId'>) =>
+    call<{ ok: true }>(auth, `/annotations/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
   annotationAction: (auth: AuthSession, id: string, action: 'send' | 'apply' | 'reject') =>
     call<{ ok: true }>(auth, `/annotations/${encodeURIComponent(id)}/${action}`, {
       method: 'POST',

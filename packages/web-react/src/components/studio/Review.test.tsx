@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 
 const createAnnotation = vi.fn(async () => ({ id: 'srv1' }))
 const annotationAction = vi.fn(async () => ({ ok: true }))
+const updateAnnotation = vi.fn(async () => ({ ok: true }))
 vi.mock('../../lib/studio/api', () => ({
   studioApi: {
     blobTicket: vi.fn(async (_a: unknown, sha: string) => ({
@@ -12,6 +13,7 @@ vi.mock('../../lib/studio/api', () => ({
     })),
     createAnnotation: (...a: unknown[]) => createAnnotation(...(a as [])),
     annotationAction: (...a: unknown[]) => annotationAction(...(a as [])),
+    updateAnnotation: (...a: unknown[]) => updateAnnotation(...(a as [])),
   },
   studioErrorText: () => '出错了',
   StudioApiError: class StudioApiError extends Error {
@@ -182,9 +184,20 @@ describe('ReviewPage hand over to the agent (OCV5-593 FE-7b)', () => {
     await waitFor(() => expect(screen.getByTestId('hand-over')).toBeEnabled())
     const kept = JSON.parse(sessionStorage.getItem('oc.studio.annotationDrafts.p')!)
     expect(kept[0].serverId).toBe('srv1')
+    // Edited before the retry: the server copy is updated first, then sent (FE-7b r2).
+    fireEvent.click(screen.getByRole('button', { name: /^1/ }))
+    fireEvent.change(await screen.findByLabelText('批注说明'), {
+      target: { value: '眼睛看向左边' },
+    })
     fireEvent.click(screen.getByTestId('hand-over'))
     await waitFor(() => expect(annotationAction).toHaveBeenCalledTimes(2))
     expect(createAnnotation).toHaveBeenCalledTimes(1)
+    expect(updateAnnotation).toHaveBeenCalledWith(auth, 'srv1', {
+      kind: 'point',
+      tStartMs: 0,
+      geom: { x: 0.25, y: 0.25 },
+      text: '眼睛看向左边',
+    })
     await waitFor(() => expect(sessionStorage.getItem('oc.studio.annotationDrafts.p')).toBeNull())
   })
 
