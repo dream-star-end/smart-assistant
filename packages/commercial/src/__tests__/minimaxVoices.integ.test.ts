@@ -158,6 +158,52 @@ function deps(
 }
 
 describe('MiniMax media client (OCV5-589)', () => {
+  test('speech costCap: an upstream count above the reservation is charged at the cap (OCV5-591 A2-0)', async (t) => {
+    if (skip(t)) return
+    const alice = await user(10_000n)
+    const up = fakeUpstream({
+      '/v1/t2a_v2': () => ({
+        data: { audio: AUDIO_HEX },
+        extra_info: { usage_characters: 151 },
+        base_resp: { status_code: 0 },
+      }),
+    })
+    const d = deps(up.fetchImpl, ['male-qn-qingse'])
+    const out = await synthesizeSpeech(d, {
+      userId: alice,
+      containerId: null,
+      requestId: 'cap-1',
+      model: 'speech-2.8-turbo',
+      text: 'a'.repeat(50),
+      voiceId: 'male-qn-qingse',
+      format: 'mp3',
+      costCap: 3n,
+    })
+    // 151 chars would be 4 cents; the reservation caps it at 3.
+    assert.equal(out.settled.costCredits, 3n)
+    assert.equal(await credits(alice), 9_997n)
+    const row = (
+      await query<{ cost: string; notes: string | null }>(
+        `SELECT cost_credits::text AS cost, price_snapshot->>'notes' AS notes
+           FROM minimax_media_usage_records WHERE user_id=$1 AND request_id='cap-1'`,
+        [alice.toString()],
+      )
+    ).rows[0]!
+    assert.equal(row.cost, '3')
+    assert.match(row.notes ?? '', /capped from 4/)
+    // Without a cap the same count is charged in full.
+    const uncapped = await synthesizeSpeech(d, {
+      userId: alice,
+      containerId: null,
+      requestId: 'cap-2',
+      model: 'speech-2.8-turbo',
+      text: 'a'.repeat(50),
+      voiceId: 'male-qn-qingse',
+      format: 'mp3',
+    })
+    assert.equal(uncapped.settled.costCredits, 4n)
+  })
+
   test('speech voice access: system and own voices pass, others are 403 before upstream', async (t) => {
     if (skip(t)) return
     const alice = await user(10_000n)
