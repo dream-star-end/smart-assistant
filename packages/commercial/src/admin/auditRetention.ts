@@ -58,6 +58,8 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "agent_audit", column: "occurred_at", days: 90 },
   // OCV5-561 Muse job audit (prompt preview + outcome); rate limits only look back one day.
   { table: "muse_media_jobs", column: "queued_at", days: 180 },
+  // OCV5-591 media studio activity log / push source.
+  { table: "studio_events", column: "ts", days: 180 },
   { table: "agent_tool_rollup_reports", column: "created_at", days: 90 },
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },

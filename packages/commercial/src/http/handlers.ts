@@ -122,6 +122,7 @@ import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlane
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
+import type { StudioHttpDeps } from '../media-studio/http.js'
 
 export interface CommercialHttpDeps {
   literatureSetup?: LiteratureSetupService
@@ -131,6 +132,8 @@ export interface CommercialHttpDeps {
   mediaGeneration?: MediaGenerationService;
   /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
   museBridgeHttp?: MuseBridgeHttpHandler;
+  /** OCV5-591 media studio; undefined or disabled (→ 404) unless OC_STUDIO_ENABLED=1. */
+  studio?: StudioHttpDeps;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
