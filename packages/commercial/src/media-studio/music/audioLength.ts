@@ -108,14 +108,25 @@ function mp3Ms(b: Buffer): number | null {
     last = f.length
     pos += f.length
   }
-  // The walk must reach the end (code r1 P1): what may follow the last frame is an ID3v1 / APE tag
-  // or a cut-off final frame. Anything longer means lost sync mid-file, and the prefix is not the
-  // track's length: unknown.
-  const rest = b.length - pos
-  const tag = rest >= 128 && b.toString('ascii', b.length - 128, b.length - 125) === 'TAG' ? 128 : 0
-  const ape = b.indexOf('APETAGEX', pos, 'ascii')
-  const tail = ape >= 0 ? ape - pos : rest - tag
-  if (tail > last) return null
+  // The walk must reach the end (code r1 / r2 P1): only tags that sit at the end of the file, by
+  // their own structure, may follow the last frame — ID3v1 (the last 128 bytes) and an APEv2 tag
+  // before it (located from its footer's size) — plus at most a cut-off final frame. Anything else
+  // means lost sync mid-file, and the prefix is not the track's length: unknown.
+  const end = audioEnd(b)
+  if (end < pos || end - pos > last) return null
   // A Xing / Info (VBR header) frame is counted as one silent frame (~26 ms): close enough here.
   return frames >= 2 ? seconds * 1000 : null
+}
+
+/** Where the audio ends: before a trailing ID3v1 tag and an APEv2 tag found by its footer. */
+function audioEnd(b: Buffer): number {
+  let end = b.length
+  if (end >= 128 && b.toString('ascii', end - 128, end - 125) === 'TAG') end -= 128
+  if (end >= 32 && b.toString('ascii', end - 32, end - 24) === 'APETAGEX') {
+    // Footer: size (items + footer, no header) at +12, flags at +20 (bit 31: a header precedes).
+    const size = b.readUInt32LE(end - 32 + 12)
+    const header = b.readUInt32LE(end - 32 + 20) & 0x80000000 ? 32 : 0
+    if (size >= 32 && size + header <= end) end -= size + header
+  }
+  return end
 }
