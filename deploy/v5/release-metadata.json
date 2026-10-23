@@ -189,7 +189,8 @@
     "0318_commercial_box_gpt_6_astra_pro",
     "0319_commercial_muse_billing",
     "0322_minimax_voices",
-    "0324_media_studio"
+    "0324_media_studio",
+    "0325_media_studio_music"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

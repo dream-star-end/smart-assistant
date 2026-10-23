@@ -30,7 +30,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { access, mkdir, rename, rm, statfs } from 'node:fs/promises'
+import { access, mkdir, rename, rm, statfs, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import type { Pool, PoolClient } from 'pg'
@@ -118,6 +118,13 @@ async function exists(path: string): Promise<boolean> {
     return false
   }
 }
+
+/**
+ * Site-owned content with no user ref (OCV5-591 M1, 0325): the curated music catalog's audio and
+ * the snapshots that prove its licences. The GC never collects it while a catalog row points at it.
+ */
+const CATALOG_HOLDS =
+  'SELECT 1 FROM studio_music_catalog c WHERE c.blob_sha=b.sha256 OR c.evidence_sha=b.sha256'
 
 export class StudioBlobStore {
   private readonly userLimit: bigint
@@ -302,6 +309,65 @@ export class StudioBlobStore {
     }
   }
 
+  /**
+   * Site-owned write for the curated music catalog (OCV5-591 M1): audio and licence snapshots that
+   * belong to no user. Counted once on 'site' and checked against the disk floor; it carries no ref,
+   * so the caller inserts the catalog row that holds it within UNREFERENCED_GRACE_SECONDS (an
+   * offline import does both in one run). Returns the sha.
+   */
+  async putSite(content: Buffer, mime: string): Promise<string> {
+    if (!MIME_RE.test(mime)) throw new Error('invalid blob mime')
+    if (content.length === 0) throw new Error('empty blob')
+    const sha = createHash('sha256').update(content).digest('hex')
+    const finalPath = this.blobPath(sha)
+    await inTx(this.opts.pool, async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`studio-blob:${sha}`])
+      await client.query(
+        `INSERT INTO studio_quota(scope, limit_bytes) VALUES ('site', $1) ON CONFLICT (scope) DO NOTHING`,
+        [this.siteLimit.toString()],
+      )
+      const site = await client.query<{ used: string; lim: string }>(
+        `SELECT used_bytes::text AS used, limit_bytes::text AS lim FROM studio_quota
+         WHERE scope='site' FOR UPDATE`,
+      )
+      const physicalNew =
+        (await client.query('SELECT 1 FROM studio_blobs WHERE sha256=$1', [sha])).rowCount === 0
+      if (physicalNew) {
+        const held = await client.query<{ n: string }>(
+          'SELECT COALESCE(SUM(bytes),0)::text AS n FROM studio_quota_holds WHERE expires_at > clock_timestamp()',
+        )
+        const need = BigInt(content.length)
+        if (BigInt(site.rows[0]!.used) + BigInt(held.rows[0]!.n) + need > BigInt(site.rows[0]!.lim))
+          throw new StudioQuotaError('site')
+        if (
+          (await this.freeBytes(this.opts.root)) - BigInt(held.rows[0]!.n) - need <
+          this.diskFloor
+        )
+          throw new StudioQuotaError('disk')
+      }
+      if (!(await exists(finalPath))) {
+        const tmpDir = join(this.opts.root, 'tmp')
+        const tmp = join(tmpDir, randomUUID())
+        await mkdir(tmpDir, { recursive: true, mode: 0o750 })
+        await writeFile(tmp, content, { mode: 0o640, flag: 'wx' })
+        await mkdir(join(finalPath, '..'), { recursive: true, mode: 0o750 })
+        await rename(tmp, finalPath)
+      }
+      if (physicalNew) {
+        await client.query('INSERT INTO studio_blobs(sha256, bytes, mime) VALUES ($1, $2, $3)', [
+          sha,
+          content.length,
+          mime,
+        ])
+        await client.query(
+          `UPDATE studio_quota SET used_bytes = used_bytes + $1, updated_at = NOW() WHERE scope='site'`,
+          [content.length],
+        )
+      }
+    })
+    return sha
+  }
+
   /** Adds a ref to content the user already references (e.g. a take adopted as an asset). */
   async addRef(
     userId: bigint,
@@ -377,6 +443,7 @@ export class StudioBlobStore {
       `SELECT b.sha256 FROM studio_blobs b
        WHERE b.created_at < NOW() - make_interval(secs => $1)
          AND NOT EXISTS (SELECT 1 FROM studio_blob_refs r WHERE r.sha256=b.sha256)
+         AND NOT EXISTS (${CATALOG_HOLDS})
        LIMIT $2`,
       [UNREFERENCED_GRACE_SECONDS, Math.max(1, Math.min(5000, Math.trunc(batch)))],
     )
@@ -387,6 +454,7 @@ export class StudioBlobStore {
         const del = await client.query<{ bytes: string }>(
           `DELETE FROM studio_blobs b WHERE b.sha256=$1
              AND NOT EXISTS (SELECT 1 FROM studio_blob_refs r WHERE r.sha256=b.sha256)
+             AND NOT EXISTS (${CATALOG_HOLDS})
            RETURNING bytes::text AS bytes`,
           [sha],
         )
