@@ -38,26 +38,37 @@ export function __resetBlobTickets(): void {
   tickets.clear()
 }
 
+const RETRY_MIN_MS = 5_000
+const RETRY_MAX_MS = 60_000
+
 export function useBlobUrl(auth: AuthSession, sha: string | null | undefined): string | null {
-  const [url, setUrl] = useState<string | null>(null)
+  // The URL is tied to the sha it was issued for: after a sha change the old URL is never returned,
+  // so nothing (e.g. a waveform cache keyed by sha) can pair the new sha with old bytes (code r1 P1).
+  const [state, setState] = useState<{ sha: string; url: string } | null>(null)
   useEffect(() => {
     if (!sha) {
-      setUrl(null)
+      setState(null)
       return
     }
     let live = true
     let timer: number | undefined
+    let retryMs = RETRY_MIN_MS
     const load = () => {
       blobTicketUrl(auth, sha)
         .then((u) => {
           if (!live) return
-          setUrl(u)
+          retryMs = RETRY_MIN_MS
+          setState({ sha, url: u })
           const hit = tickets.get(key(auth, sha))
           const wait = Math.max(5_000, (hit?.expiresAt ?? 0) - RENEW_MARGIN_MS - Date.now())
           timer = window.setTimeout(load, wait)
         })
         .catch(() => {
-          if (live) setUrl(null)
+          if (!live) return
+          // Keep retrying with backoff: a renewal that fails while offline must not end the chain
+          // (code r1 P1). The last URL stays usable until it really expires.
+          timer = window.setTimeout(load, retryMs)
+          retryMs = Math.min(RETRY_MAX_MS, retryMs * 2)
         })
     }
     load()
@@ -66,5 +77,5 @@ export function useBlobUrl(auth: AuthSession, sha: string | null | undefined): s
       if (timer !== undefined) window.clearTimeout(timer)
     }
   }, [auth, sha])
-  return url
+  return state && state.sha === sha ? state.url : null
 }
