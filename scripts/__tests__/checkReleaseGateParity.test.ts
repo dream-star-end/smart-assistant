@@ -261,3 +261,65 @@ test("messages, file-presence tests and comments in build_master_release are not
   assert.deepEqual([...r.scripts], ["scripts/check-v5-d.ts"]);
   assert.deepEqual([...r.npm], ["npm run build --workspace packages/web-react"]);
 });
+
+test("red: a CI step that a PR may skip, or whose failure CI ignores, is not a run (Codex final4 r2 item 8)", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  const step = "      - name: callback payload hash WS proof\n        run: node scripts/check-v5-callback-payload-hash.mjs";
+  const job = "  offline-gates:\n    name: release-gates-offline\n    runs-on: ubuntu-latest\n";
+  const onPr = "on:\n  pull_request:\n    branches: [feat/v5-selfhost]\n  push:\n    branches: [feat/v5-selfhost]\n  workflow_dispatch:\n";
+  const stepWith = (extra: string) => (y: string) => y.replace(step, `${step}\n        ${extra}`);
+  const jobWith = (extra: string) => (y: string) => y.replace(job, `${job}    ${extra}\n`);
+  const onWith = (extra: string) => (y: string) => y.replace(onPr, extra);
+  const cases: [string, (y: string) => string][] = [
+    ["step if: false", stepWith("if: false")],
+    ["step if: ${{ false }}", stepWith("if: ${{ false }}")],
+    ["step if: push only", stepWith("if: github.event_name == 'push'")],
+    ["step if: failure()", stepWith("if: failure()")],
+    ["step if: always() && false", stepWith("if: always() && false")],
+    ["step continue-on-error: true", stepWith("continue-on-error: true")],
+    ["step continue-on-error: expression", stepWith("continue-on-error: ${{ true }}")],
+    ["step shell: python", stepWith("shell: python")],
+    ["step shell: bash {0} (no -e)", stepWith("shell: bash {0}")],
+    ["job if: false", jobWith("if: ${{ false }}")],
+    ["job continue-on-error", jobWith("continue-on-error: true")],
+    ["job defaults shell", jobWith("defaults:\n      run:\n        shell: sh {0}")],
+    ["job needs a skipped job", (y) => jobWith("needs: [never]")(y).replace("\njobs:\n", "\njobs:\n  never:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n")],
+    ["job needs an unknown job", jobWith("needs: nosuch")],
+    ["job runs-on windows", (y) => y.replace(job, job.replace("ubuntu-latest", "windows-latest"))],
+    ["workflow defaults shell", (y) => y.replace("\npermissions:\n", "\ndefaults:\n  run:\n    shell: pwsh\npermissions:\n")],
+    ["no pull_request trigger", onWith("on:\n  push:\n    branches: [feat/v5-selfhost]\n")],
+    ["pull_request into another branch", onWith("on:\n  pull_request:\n    branches: [main]\n")],
+    ["pull_request paths filter", onWith("on:\n  pull_request:\n    branches: [feat/v5-selfhost]\n    paths: [docs/**]\n")],
+    ["pull_request paths-ignore", onWith("on:\n  pull_request:\n    paths-ignore: ['scripts/**']\n")],
+    ["pull_request types filter", onWith("on:\n  pull_request:\n    types: [closed]\n")],
+    ["if: false through a YAML merge key", (y) => y.replace(job, `${job}    <<: {if: false}\n`)],
+  ];
+  const counted: string[] = [];
+  for (const [name, mutate] of cases) {
+    const input = real();
+    const before = input.workflows[wf]!;
+    input.workflows[wf] = mutate(before);
+    assert.notEqual(input.workflows[wf], before, `${name}: mutation applied`);
+    const p = check(input);
+    // other gates in the same job/workflow go uncounted too; every problem must be ci-missing
+    const ok = p.length > 0 && p.every((x) => x.kind === "ci-missing")
+      && p.some((x) => /callback-payload-hash.*not counted: /.test(x.message));
+    if (!ok) counted.push(name);
+  }
+  assert.deepEqual(counted, [], "cases still counted as a CI run");
+});
+
+test("a CI step that always runs and fails CI on error still counts", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  const step = "      - name: callback payload hash WS proof\n        run: node scripts/check-v5-callback-payload-hash.mjs";
+  for (const extra of ["if: always()", "if: ${{ success() }}", "if: '!cancelled()'", "continue-on-error: false", "shell: bash"]) {
+    const input = real();
+    input.workflows[wf] = input.workflows[wf]!.replace(step, `${step}\n        ${extra}`);
+    assert.deepEqual(check(input), [], extra);
+  }
+  const bare = real();
+  const before = bare.workflows[wf]!;
+  bare.workflows[wf] = before.replace("on:\n  pull_request:\n    branches: [feat/v5-selfhost]\n  push:\n    branches: [feat/v5-selfhost]\n  workflow_dispatch:\n", "on: [pull_request, push]\n");
+  assert.notEqual(bare.workflows[wf], before);
+  assert.deepEqual(check(bare), []);
+});

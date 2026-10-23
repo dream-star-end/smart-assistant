@@ -14,7 +14,9 @@
  *   manifest = deploy/v5/selfhost-release-gates.json;
  *   CI      = what the `run:` steps of .github/workflows/v5-selfhost-*.yml execute: same lexical
  *             command-position rule (an echo, a quoted string or a comment naming a gate is not a
- *             run), with `npm run <script>` followed through package.json.
+ *             run), with `npm run <script>` followed through package.json; a step a PR may skip
+ *             or whose failure CI ignores (if:, continue-on-error, shell, runner, needs, trigger
+ *             filters) is not counted (see workflowSteps).
  *
  * Problems (exit 1): a train gate missing from the manifest, a manifest gate the train no longer
  * runs, a manifest gate whose `ci` workflow does not run it, a gate with neither `ci` nor a
@@ -203,21 +205,100 @@ export function runsIn(commands: string[]): { scripts: Set<string>; npm: Set<str
   return { scripts, npm };
 }
 
-/** The `run:` steps of a workflow, joined (YAML comments, names and `if:` text excluded). */
-export function workflowRuns(yml: string): string {
-  const doc = parseYaml(yml) as { jobs?: Record<string, { steps?: { run?: unknown }[] }> } | null;
-  const runs: string[] = [];
-  for (const job of Object.values(doc?.jobs ?? {})) {
-    for (const step of job?.steps ?? []) if (typeof step?.run === "string") runs.push(step.run);
+/** The branch selfhost PRs target: a gate workflow must run on pull requests into it. */
+const PR_BASE = "feat/v5-selfhost";
+/** The only `if:` values that keep a job or step running whenever the PR workflow runs. Anything
+ * else (`false`, `${{ false }}`, `github.event_name == 'push'`, `failure()`, …) may skip it. */
+const RUNS_IF = /^(?:\$\{\{\s*)?(?:always|success|!\s*cancelled)\(\)(?:\s*\}\})?$/;
+
+type Yaml = Record<string, unknown>;
+export interface SkippedStep { where: string; why: string; run: string }
+const isMap = (v: unknown): v is Yaml => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** Why the workflow does not run on every pull request into PR_BASE, or null when it does.
+ * Filters (paths, paths-ignore, branches-ignore, types, branch globs) may skip a PR, so any filter
+ * other than `branches` listing PR_BASE literally counts as "may not run". */
+function prTriggerGap(on: unknown): string | null {
+  if (on === "pull_request" || (Array.isArray(on) && on.includes("pull_request"))) return null;
+  if (!isMap(on) || !("pull_request" in on)) return "on: has no pull_request trigger";
+  const pr = on.pull_request;
+  if (pr === null || pr === undefined) return null;
+  if (!isMap(pr)) return "on.pull_request is not a map";
+  const extra = Object.keys(pr).filter((k) => k !== "branches");
+  if (extra.length) return `on.pull_request filters by ${extra.join(", ")}`;
+  if (!("branches" in pr)) return null;
+  const b = pr.branches;
+  return b === PR_BASE || (Array.isArray(b) && b.includes(PR_BASE)) ? null : `on.pull_request.branches does not list ${PR_BASE}`;
+}
+
+/** Why a job or step may not run, or may fail without failing CI; null when it always runs and
+ * fails CI on a non-zero exit (bash -e: the runner default on Linux and for `shell: bash`). */
+function runGap(node: Yaml, level: "job" | "step"): string | null {
+  if ("if" in node && !(typeof node.if === "string" && RUNS_IF.test(node.if.trim()))) return `${level} if: ${String(node.if)}`;
+  if ("continue-on-error" in node && node["continue-on-error"] !== false) {
+    return `${level} continue-on-error: ${String(node["continue-on-error"])}`;
   }
-  return runs.join("\n");
+  const shell = level === "step" ? node.shell : isMap(node.defaults) && isMap(node.defaults.run) ? node.defaults.run.shell : undefined;
+  if (shell !== undefined && shell !== "bash") return `${level} shell: ${String(shell)}`;
+  if (level === "job" && !(typeof node["runs-on"] === "string" && node["runs-on"].startsWith("ubuntu-"))) {
+    return `job runs-on: ${JSON.stringify(node["runs-on"])} (default shell is bash only on ubuntu-*)`;
+  }
+  return null;
+}
+
+/** The `run:` steps of a workflow that really run on a pull request and fail CI when the command
+ * fails (YAML comments, names and `if:` text are never a run). A step is not counted when its
+ * workflow trigger, job or step may skip it or ignore its failure (Codex final4 r2 list item 8):
+ * an `if:` other than always()/success()/!cancelled(), continue-on-error other than false, a
+ * non-bash shell (step, job or workflow defaults), a non-ubuntu runner, a needed job that is not
+ * counted, or a pull_request trigger with filters. `skipped` says why, for the problem message. */
+export function workflowSteps(yml: string): { runs: string[]; skipped: SkippedStep[] } {
+  // merge keys on: `<<: *anchor` can carry an `if:`/continue-on-error into a job or step
+  const doc = parseYaml(yml, { merge: true }) as unknown;
+  const runs: string[] = [];
+  const skipped: SkippedStep[] = [];
+  const root = isMap(doc) ? doc : {};
+  const jobs = isMap(root.jobs) ? root.jobs : {};
+  const wfShell = isMap(root.defaults) && isMap(root.defaults.run) ? root.defaults.run.shell : undefined;
+  const wfGap = prTriggerGap(root.on) ?? (wfShell !== undefined && wfShell !== "bash" ? `workflow shell: ${String(wfShell)}` : null);
+  const jobGapMemo = new Map<string, string | null>();
+  const jobGap = (id: string, seen: Set<string>): string | null => {
+    if (jobGapMemo.has(id)) return jobGapMemo.get(id)!;
+    const job = jobs[id];
+    if (!isMap(job)) return `needs unknown job ${id}`;
+    if (seen.has(id)) return `needs cycle at ${id}`;
+    let gap = runGap(job, "job");
+    const needs = job.needs === undefined ? [] : Array.isArray(job.needs) ? job.needs : [job.needs];
+    for (const n of needs) {
+      if (gap) break;
+      const g = typeof n === "string" ? jobGap(n, new Set([...seen, id])) : "needs is not a job id";
+      if (g) gap = `needs ${String(n)} (${g})`;
+    }
+    jobGapMemo.set(id, gap);
+    return gap;
+  };
+  for (const [id, job] of Object.entries(jobs)) {
+    const steps = isMap(job) && Array.isArray(job.steps) ? job.steps : [];
+    steps.forEach((step: unknown, k) => {
+      if (!isMap(step) || typeof step.run !== "string") return;
+      const why = wfGap ?? jobGap(id, new Set()) ?? runGap(step, "step");
+      if (why) skipped.push({ where: `${id}/${typeof step.name === "string" ? step.name : `step ${k + 1}`}`, why, run: step.run });
+      else runs.push(step.run);
+    });
+  }
+  return { runs, skipped };
+}
+
+/** The counted `run:` steps of a workflow, joined (see workflowSteps). */
+export function workflowRuns(yml: string): string {
+  return workflowSteps(yml).runs.join("\n");
 }
 
 /** What each workflow's `run:` steps execute, `npm run x` followed through package.json
  * (cycle-safe) with the same command-position rule. */
 export function ciRuns(workflows: Record<string, string>, pkgScripts: Record<string, string>):
-  Record<string, { scripts: Set<string>; npm: Set<string> }> {
-  const out: Record<string, { scripts: Set<string>; npm: Set<string> }> = {};
+  Record<string, { scripts: Set<string>; npm: Set<string>; skipped: SkippedStep[] }> {
+  const out: Record<string, { scripts: Set<string>; npm: Set<string>; skipped: SkippedStep[] }> = {};
   for (const [file, yml] of Object.entries(workflows)) {
     const scripts = new Set<string>();
     const npm = new Set<string>();
@@ -231,8 +312,9 @@ export function ciRuns(workflows: Record<string, string>, pkgScripts: Record<str
         if (body !== undefined && !x.includes("--workspace") && !seen.has(name)) visit(body, new Set([...seen, name]));
       }
     };
-    visit(workflowRuns(yml), new Set());
-    out[file] = { scripts, npm };
+    const steps = workflowSteps(yml);
+    visit(steps.runs.join("\n"), new Set());
+    out[file] = { scripts, npm, skipped: steps.skipped };
   }
   return out;
 }
@@ -305,7 +387,9 @@ export function check(input: {
       if (runs === undefined) {
         problems.push({ kind: "ci-missing", message: `${gate.id}: workflow ${gate.ci} does not exist` });
       } else if (!(gate.script ? runs.scripts.has(key) : runs.npm.has(key))) {
-        problems.push({ kind: "ci-missing", message: `${gate.id}: ${gate.ci} does not run ${key}` });
+        const why = runs.skipped.filter((s) => s.run.includes(key)).map((s) => `${s.where}: ${s.why}`);
+        problems.push({ kind: "ci-missing", message: `${gate.id}: ${gate.ci} does not run ${key}`
+          + (why.length ? ` (not counted: ${why.join("; ")})` : "") });
       }
     } else if (!gate.ciExempt || gate.ciExempt.trim().length < 20) {
       problems.push({ kind: "ci-missing", message: `${gate.id}: no ci workflow and no written ciExempt reason` });
