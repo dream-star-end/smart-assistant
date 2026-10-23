@@ -28,7 +28,7 @@ test('Kimi 3.1 SQL preparation stays disabled, audited, repeatable and drift-ref
     assert.equal(await ensureKimi31Pricing(client, 765n), false)
     const state = await client.query("SELECT c.state,p.enabled,p.default_effort,p.input_per_mtok::text,p.output_per_mtok::text,p.cache_read_per_mtok::text,p.cache_write_per_mtok::text FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id=$1", [KIMI31_MODEL_ID])
     assert.deepEqual(state.rows, [{ state: 'staged', enabled: false, default_effort: 'max',
-      input_per_mtok: '914', output_per_mtok: '4569', cache_read_per_mtok: '92', cache_write_per_mtok: '0' }])
+      input_per_mtok: '609', output_per_mtok: '3046', cache_read_per_mtok: '61', cache_write_per_mtok: '0' }])
     const audit = await client.query("SELECT count(*)::int AS n FROM admin_audit WHERE action='pricing.create' AND target=$1", [`model:${KIMI31_MODEL_ID}`])
     assert.equal(audit.rows[0].n, 1)
     await client.query('SAVEPOINT price_drift')
