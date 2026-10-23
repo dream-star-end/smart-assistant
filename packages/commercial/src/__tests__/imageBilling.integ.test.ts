@@ -754,6 +754,7 @@ describe('Image 2 relay orchestration', () => {
     const tracker = redisTracker()
     const generated = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#aa33ee' } }).png().toBuffer()
     const upstreamModels: string[] = []
+    let upstreamFails = false
     const handler = makeCodexRelayHandler({
       identityRepo: repo(userId),
       db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
@@ -761,6 +762,7 @@ describe('Image 2 relay orchestration', () => {
       resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
       fetchImpl: (async (_url: string, init: RequestInit) => {
         upstreamModels.push((JSON.parse(String(init.body)) as { model: string }).model)
+        if (upstreamFails) return new Response('upstream down', { status: 500 })
         return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
       }) as unknown as typeof fetch,
       pgPool: getPool(),
@@ -796,6 +798,16 @@ describe('Image 2 relay orchestration', () => {
       assert.deepEqual(upstreamModels, ['gpt-image-2.5-sunburst', 'gpt-image-2.5-sunburst'])
       assert.equal(await modelRow(), 'gpt-image-2.5-sunburst', 'paid recovery keeps the model actually sent upstream')
       assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50', 'charged once')
+      // Codex Sol r1 P1: a recovery that fails upstream must not leave the edit default on the paid row.
+      await query(
+        `UPDATE image_generation_usage_records SET response_expires_at=NOW() - INTERVAL '1 minute'
+         WHERE user_id=$1 AND job_id=$2`,
+        [userId.toString(), jobId],
+      )
+      upstreamFails = true
+      assert.notEqual((await send()).status, 200)
+      assert.equal(await modelRow(), 'gpt-image-2.5-sunburst', 'a failed recovery keeps the paid model')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50', 'still charged once')
     } finally {
       await close(server)
     }

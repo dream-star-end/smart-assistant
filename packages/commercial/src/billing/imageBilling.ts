@@ -180,7 +180,10 @@ export async function reserveImageUsage(pool: Pool, args: {
        VALUES ($1,$2,$3,$4,$5,'reserved',$6,$7,$8)
        ON CONFLICT (user_id,request_id) DO UPDATE SET
          container_id=EXCLUDED.container_id,
-         model=EXCLUDED.model,
+         -- A paid row keeps the model it was charged for (Codex Sol r1 P1): recovery is bound to the
+         -- same input hash, which includes the model, and a failed recovery must not rewrite it.
+         model=CASE WHEN image_generation_usage_records.ledger_id IS NOT NULL
+                    THEN image_generation_usage_records.model ELSE EXCLUDED.model END,
          job_id=EXCLUDED.job_id,
          operation=EXCLUDED.operation,
          image_count=EXCLUDED.image_count,
@@ -297,8 +300,8 @@ export async function settleImageCharge(
       }
     }
     if (existing.rows[0]?.status === 'reserved' && existing.rows[0].ledger_id) {
-      // Paid-recovery path (ledger already written): still record the model actually sent,
-      // since a retry's reserve may have overwritten it with the edit default (OCV5-587 r1 P1).
+      // Paid-recovery path (ledger already written): record the model actually sent. reserve keeps
+      // the paid model and the input hash binds it, so this matches what was charged (OCV5-587 r1 P1).
       await client.query(
         `UPDATE image_generation_usage_records
          SET status='success', response_body=$1, response_content_type=$2,
