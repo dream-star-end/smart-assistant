@@ -349,7 +349,7 @@ describe("one throwaway test database per train (OCV5-557 item 1)", () => {
 test("Box refusal proof rejects successful, invalid, and timed-out bridge outcomes", () => {
   assert.equal(boxBridgeFailed({ kind: "rejected" }), true);
   for (const code of [1, 143, 255]) assert.equal(boxBridgeFailed({ kind: "resolved", code }), true);
-  for (const code of [0, -0, -1, 256, 512, 2 ** 32, 2 ** 53, undefined, null, "1", NaN, Infinity, 0.5]) {
+  for (const code of [0, -0, -1, 256, 512, 2 ** 32, 2 ** 53, undefined, null, "1", Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
     assert.equal(boxBridgeFailed({ kind: "resolved", code }), false, String(code));
   }
   assert.equal(boxBridgeFailed({ kind: "timeout" }), false);
