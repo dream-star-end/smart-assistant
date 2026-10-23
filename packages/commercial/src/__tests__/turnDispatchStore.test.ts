@@ -9,6 +9,7 @@ import { describe, test } from 'node:test'
 import {
   type Queryable,
   admitDispatch,
+  backfillDispatchTraceId,
   casToTerminal,
   heartbeatLease,
   touchDispatchLeaseOnLiveFrame,
@@ -241,5 +242,44 @@ describe('CAS helpers', () => {
       }),
       false,
     )
+  })
+})
+
+describe('turn_dispatches.trace_id (OCV5-599)', () => {
+  const TRACE = 'c'.repeat(32)
+
+  test('insert writes the frame trace as $15; absent trace writes NULL', async () => {
+    for (const [traceId, expected] of [[TRACE, TRACE], [undefined, null]] as const) {
+      const q = makeFakeQ({ existing: null })
+      await admitDispatch(asQ(q), { ...baseInput, ...(traceId ? { traceId } : {}) })
+      const insert = q.calls.find((c) => c.sql.includes('INSERT INTO turn_dispatches'))!
+      assert.match(insert.sql, /runtime_kind, trace_id\)/)
+      assert.equal(insert.params[14], expected)
+    }
+  })
+
+  test('takeover moves the row to the new trace, or keeps the old one when none is given', async () => {
+    for (const [traceId, expected] of [[TRACE, TRACE], [undefined, null]] as const) {
+      const q = makeFakeQ({
+        existing: rawRow({ status: 'admitted', lease_until: new Date(Date.now() - 1000) }),
+        onTakeover: () => rawRow({ lease_epoch: '2', owner_id: 'owner-me' }),
+      })
+      const r = await admitDispatch(asQ(q), { ...baseInput, ...(traceId ? { traceId } : {}) })
+      assert.equal(r.kind, 'admitted')
+      const upd = q.calls.find((c) => c.sql.includes('lease_epoch + 1'))!
+      assert.match(upd.sql, /trace_id = COALESCE\(\$6, trace_id\)/)
+      assert.equal(upd.params[5], expected)
+    }
+  })
+
+  test('backfill only fills an empty trace and reports whether it did', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = []
+    let rowCount = 1
+    const q = { async query(sql: string, params: unknown[] = []) { calls.push({ sql, params }); return { rows: [], rowCount } } }
+    assert.equal(await backfillDispatchTraceId(asQ(q), { dispatchId: 'd-1', traceId: TRACE }), true)
+    assert.match(calls[0]!.sql, /WHERE dispatch_id = \$1 AND trace_id IS NULL/)
+    assert.deepEqual(calls[0]!.params, ['d-1', TRACE])
+    rowCount = 0
+    assert.equal(await backfillDispatchTraceId(asQ(q), { dispatchId: 'd-1', traceId: TRACE }), false)
   })
 })
