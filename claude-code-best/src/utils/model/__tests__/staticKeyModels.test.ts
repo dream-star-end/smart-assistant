@@ -112,6 +112,9 @@ describe("isMoonshotKimiK3Model", () => {
   test("精确匹配官方 kimi-k3 / k3-256k，不扩放前后缀", () => {
     expect(isMoonshotKimiK3Model("kimi-k3")).toBe(true);
     expect(isMoonshotKimiK3Model(" K3-256K ")).toBe(true);
+    expect(isMoonshotKimiK3Model(" K3.1-PRO ")).toBe(true);
+    expect(isMoonshotKimiK3Model("k3.1-pro-highspeed")).toBe(false);
+    expect(isMoonshotKimiK3Model("kimi-k3.1")).toBe(false);
     expect(isMoonshotKimiK3Model("k3-256k-preview")).toBe(false);
     expect(isMoonshotKimiK3Model("kimi-k3-ark")).toBe(false);
   });
@@ -143,6 +146,7 @@ describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含
     expect(isCapabilityZeroStaticModel("kimi-k3-ark")).toBe(true);
     expect(isCapabilityZeroStaticModel("kimi-k3")).toBe(true);
     expect(isCapabilityZeroStaticModel("k3-256k")).toBe(true);
+    expect(isCapabilityZeroStaticModel("k3.1-pro")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.8-max")).toBe(true);
   });
   test("deepseek **不在**能力全关集(保留 effort=max 等默认路径能力)", () => {
@@ -170,6 +174,8 @@ describe("getStaticModelContextWindow", () => {
     expect(getStaticModelContextWindow("kimi-k2.7-code")).toBe(256_000);
     expect(getStaticModelContextWindow("kimi-k3-ark")).toBe(1_048_576);
     expect(getStaticModelContextWindow("kimi-k3")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("k3.1-pro")).toBe(1_048_576);
+    expect(modelSupportsThinking("k3.1-pro")).toBe(true);
     expect(getStaticModelContextWindow("k3-256k")).toBe(262_144);
     expect(getStaticModelContextWindow("qwen3.8-max")).toBe(983_616);
   });

@@ -89,6 +89,12 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(ms.matchesRoute('Kimi-K3'), true)
     assert.equal(ms.matchesRoute('k3-256k'), true)
     assert.equal(ms.matchesRoute('K3-256K'), true)
+    assert.equal(ms.matchesRoute('k3.1-pro'), true)
+    assert.equal(ms.matchesRoute('K3.1-PRO'), true)
+    for (const id of ['k3.1-pro-highspeed', 'k3.1-pro-preview', 'kimi-k3.1', 'k3.1']) {
+      assert.equal(ms.matchesRoute(id), false)
+      assert.equal(ms.canonicalizeForPricing(id), null)
+    }
     assert.equal(ms.matchesRoute('kimi-k3-preview'), false)
     assert.equal(ms.matchesRoute('k3-256k-preview'), false)
     assert.equal(ms.matchesRoute('k3-128k'), false)
@@ -128,6 +134,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('kimi-k3-ark')?.id, 'ark-k3')
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('k3-256k')?.id, 'moonshot')
+    assert.equal(findRouteProviderForModel('k3.1-pro')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('qwen3.8-max')?.id, 'bailian')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
@@ -183,7 +190,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
-    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3', 'k3-256k'])
+    assert.deepEqual([...getStaticProvider('moonshot').inboundModelIds], ['kimi-k3', 'k3-256k', 'k3.1-pro'])
     assert.deepEqual([...getStaticProvider('bailian').inboundModelIds], ['qwen3.8-max'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
@@ -234,6 +241,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'kimi-k3-ark',
       'kimi-k3',
       'k3-256k',
+      'k3.1-pro',
       'qwen3.8-max',
     ])
   })
@@ -291,6 +299,7 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(ms.canonicalizeForPricing('Kimi-K3'), 'kimi-k3')
     assert.equal(ms.canonicalizeForPricing('k3-256k'), 'k3-256k')
     assert.equal(ms.canonicalizeForPricing('K3-256K'), 'k3-256k')
+    assert.equal(ms.canonicalizeForPricing('K3.1-PRO'), 'k3.1-pro')
     assert.equal(ms.canonicalizeForPricing('k3-256k-preview'), null)
     assert.equal(ms.canonicalizeForPricing('kimi-k2.7-code'), null)
   })
@@ -412,6 +421,8 @@ describe('staticKeyProviders — strip / endpoint', () => {
     assert.equal(moonshot.stripBodyFields.includes('thinking'), false)
     assert.equal(moonshot.maxInputTokens, 1_048_576)
     assert.equal(moonshot.supportsVision, true)
+    assert.deepEqual(moonshot.stripDisabledThinkingModels, ['k3.1-pro'])
+    assert.equal(moonshot.stripDisabledThinking, undefined)
   })
   it('bailian qwen3.8-max 使用 Token Plan x-api-key、983616 窗口并保留 thinking', () => {
     const bailian = getStaticProvider('bailian')
