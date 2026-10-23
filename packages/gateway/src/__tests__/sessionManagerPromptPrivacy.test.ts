@@ -126,6 +126,8 @@ async function run(t: TestContext, opts: { applied?: string; failShutdown?: bool
     firstAttemptCalls = [...calls]
     calls.length = 0; metadataAvailable = true
     await attempt()
+  } else if (opts.interruptDuringMetadata) {
+    await sm.submit(session, 'hi', onEvent, 'low', 'grok-build', 'b'.repeat(32)).catch(error => { errors.push(String(error)) })
   } else await sm.submit(session, 'hi', () => {}).catch(() => {})
   await session.lock
   return { calls, frozen, firstAttemptCalls, errors, interruptedAtMetadata }
