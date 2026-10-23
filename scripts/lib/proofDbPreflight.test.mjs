@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { connectionFor, evaluate, readFactsRetryingTimeout, vetDsn } from "./proofDbPreflight.mjs";
+import { CONNECT_TIMEOUT_MS, READ_TIMEOUTS_MS, connectionFor, evaluate, readFactsRetryingTimeout, vetDsn } from "./proofDbPreflight.mjs";
 
 const healthy = {
   user: "test", database: "openclaude_test", serverVersion: "16.15",
@@ -105,4 +105,12 @@ test("a statement timeout is retried once with a longer budget; nothing else is 
   await assert.rejects(readFactsRetryingTimeout(seq(Object.assign(new Error("permission denied"), { code: "42501" }), healthy)),
     /permission denied/);
   assert.deepEqual(calls, [10_000]);
+});
+
+test("the shell wrapper's timeout covers the probe's worst case, retry included (Codex #1021 r1)", () => {
+  const wrapper = readFileSync(new URL("./v5-release-preflight.sh", import.meta.url), "utf8");
+  const m = /OC_V5_PREFLIGHT_PROOF_DSN="\$dsn" timeout (\d+) node "\$probe"/.exec(wrapper);
+  assert.ok(m, "wrapper runs the probe under timeout N");
+  const worstMs = READ_TIMEOUTS_MS.length * CONNECT_TIMEOUT_MS + READ_TIMEOUTS_MS.reduce((a, b) => a + b, 0);
+  assert.ok(Number(m[1]) * 1000 > worstMs, `timeout ${m[1]}s must exceed the probe's worst case ${worstMs / 1000}s`);
 });
