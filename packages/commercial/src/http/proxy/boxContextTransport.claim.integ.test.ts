@@ -13,14 +13,19 @@ test("OCV5-607 legacy handoff accepts a 17MiB restored history and never consume
     ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
   let url: URL;
   try { url = new URL(connectionString); } catch { throw new Error("loopback test database required"); }
-  assert.ok(url.hostname === "127.0.0.1" && url.port === "55432"
-    && url.pathname === "/openclaude_test", "loopback test database required");
+  assert.ok(["postgres:", "postgresql:"].includes(url.protocol)
+    && url.hostname === "127.0.0.1" && url.port === "55432"
+    && url.username === "test" && url.password === "test"
+    && url.pathname === "/openclaude_test" && url.search === "" && url.hash === "",
+  "loopback test database required");
   const pool = new Pool({ connectionString, max: 1 });
   const client = await pool.connect();
   const directory = await mkdtemp(path.join(tmpdir(), "g607-context-claim-"));
   try {
-    const where = await client.query("SELECT current_database() AS db,inet_server_port() AS port");
-    assert.ok(where.rows[0]?.db === "openclaude_test" && Number(where.rows[0]?.port) === 55432);
+    const where = await client.query("SELECT current_database() AS db");
+    assert.equal(where.rows.length, 1);
+    assert.equal(where.rows[0]?.db, "openclaude_test");
+    await client.query("SET search_path = pg_temp, pg_catalog");
     const ddl = await readFile(new URL("../../billing/boxBillingRecoveryTempSchema.sql", import.meta.url), "utf8");
     for (const statement of ddl.split(/;\s*(?:\r?\n|$)/)) {
       const sql = statement.replace(/^\s*--.*$/gm, "").trim();
