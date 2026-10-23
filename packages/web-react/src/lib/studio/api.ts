@@ -6,12 +6,15 @@ import type { AuthSession } from '../types'
 import type {
   ProvidersView,
   StudioAspect,
+  StudioAsset,
   StudioProject,
   StudioProjectPage,
   StudioProjectView,
 } from './types'
 
 export const STUDIO_API = '/api/studio'
+export const UPLOAD_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp']
+export const UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 
 export class StudioApiError extends Error {
   constructor(
@@ -88,6 +91,29 @@ export const studioApi = {
         { method: 'POST' },
       )
     ).project,
+  /** Reference upload (png / jpeg / webp, ≤ 25 MB); the server checks the bytes match the type. */
+  uploadAsset: async (auth: AuthSession, projectId: string, file: File) => {
+    if (!UPLOAD_IMAGE_TYPES.includes(file.type)) {
+      throw new StudioApiError(415, 'STUDIO_UNSUPPORTED_MEDIA', 'unsupported upload type')
+    }
+    if (file.size > UPLOAD_MAX_BYTES) {
+      throw new StudioApiError(413, 'STUDIO_UPLOAD_TOO_LARGE', 'upload exceeds 25 MB')
+    }
+    return (
+      await call<{ asset: StudioAsset }>(
+        auth,
+        `/projects/${encodeURIComponent(projectId)}/uploads`,
+        {
+          method: 'POST',
+          body: file,
+          headers: {
+            'content-type': file.type,
+            'x-filename': encodeURIComponent(file.name.slice(0, 200)),
+          },
+        },
+      )
+    ).asset
+  },
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -108,6 +134,10 @@ export function studioErrorText(err: unknown): string {
         return '项目当前的状态不能这样操作'
       case 'STUDIO_PROJECT_LIMIT':
         return '项目数量已达上限，先删除不需要的项目'
+      case 'STUDIO_UNSUPPORTED_MEDIA':
+        return '只支持 PNG、JPEG、WebP 图片'
+      case 'STUDIO_UPLOAD_TOO_LARGE':
+        return '图片不能超过 25 MB'
       case 'STUDIO_QUOTA':
         return '工作台存储空间已满'
       case 'ERR_INSUFFICIENT_CREDITS':

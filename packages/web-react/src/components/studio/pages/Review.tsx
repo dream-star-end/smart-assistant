@@ -663,7 +663,7 @@ function ShotReview(props: {
   )
 }
 
-function AnnotationBubble(props: {
+export function AnnotationBubble(props: {
   draft: AnnotationDraft
   index: number
   onText: (t: string) => void

@@ -10,6 +10,7 @@ import type { AuthSession } from '../../lib/types'
 import { StateView } from './StateViews'
 import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
+import { ImageStudioPage } from './pages/ImageStudio'
 import { ReviewPage } from './pages/Review'
 
 const STEPS: Array<[StudioPage, string]> = [
@@ -138,6 +139,13 @@ export function ProjectShell(props: {
           providers={props.providers}
           onOpenShot={(shot) => navigate({ kind: 'project', id: projectId, page: 'review', shot })}
           onOpenBrief={() => go('brief')}
+        />
+      ) : page === 'image' ? (
+        <ImageStudioPage
+          auth={auth}
+          view={state.view}
+          providers={props.providers}
+          onReload={reload}
         />
       ) : page === 'review' ? (
         <ReviewPage auth={auth} view={state.view} shotId={props.shot} onBack={() => go('board')} />
