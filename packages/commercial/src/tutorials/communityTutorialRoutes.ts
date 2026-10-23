@@ -46,6 +46,7 @@ import {
   storeTutorialImageUpload,
 } from './tutorialImages.js'
 import { tutorialModerationMode } from './tutorialModerationQueue.js'
+import { reviewCommunityTutorialRevision, reviseCommunityTutorial } from './tutorialRevisions.js'
 import { parseTutorialSessionId, TutorialTimelineError } from './tutorialTimeline.js'
 
 export { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES }
@@ -189,6 +190,16 @@ export async function handleGetCommunityTutorial(
   sendJson(res, 200, { tutorial: item })
 }
 
+/** 投稿与修改共用的字段校验。 */
+function markdownDraft(body: Record<string, unknown>) {
+  return {
+    title: text(body.title, 'title', 4, 100),
+    summary: text(body.summary, 'summary', 10, 280),
+    category: category(body.category),
+    bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
+  }
+}
+
 export async function handleSubmitCommunityTutorial(
   req: IncomingMessage,
   res: ServerResponse,
@@ -197,12 +208,7 @@ export async function handleSubmitCommunityTutorial(
   const user = await requireAuth(req, deps.jwtSecret)
   const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
   try {
-    const result = await submitCommunityTutorial(user.id, {
-      title: text(body.title, 'title', 4, 100),
-      summary: text(body.summary, 'summary', 10, 280),
-      category: category(body.category),
-      bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
-    })
+    const result = await submitCommunityTutorial(user.id, markdownDraft(body))
     sendJson(res, 201, { tutorial: result })
   } catch (error) {
     if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
@@ -387,6 +393,44 @@ export async function handleWithdrawCommunityTutorial(
   }
 }
 
+/**
+ * 作者修改已投稿的经验分享：待审 / 未通过的原地改后重审；已发布的进修改稿，审核通过前线上仍是旧版。
+ */
+export async function handleReviseCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const id = tutorialId(req, '/revise')
+  const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
+  try {
+    const result = await reviseCommunityTutorial(user.id, id, markdownDraft(body))
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 200, { tutorial: result })
+  } catch (error) {
+    if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
+      sendTutorialError(res, error)
+      return
+    }
+    throw mapTutorialError(error)
+  }
+}
+
+/** POST /api/tutorials/:id/withdraw | /revise（exact 路由之外的用户写操作）。 */
+export async function handleTutorialUserPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const path = (req.url ?? '').split('?')[0] ?? ''
+  if (path.endsWith('/revise')) {
+    await handleReviseCommunityTutorial(req, res, deps)
+    return
+  }
+  await handleWithdrawCommunityTutorial(req, res, deps)
+}
+
 export async function handleAdminPendingCommunityTutorials(
   req: IncomingMessage,
   res: ServerResponse,
@@ -481,19 +525,33 @@ export async function handleAdminReviewCommunityTutorial(
   if (rawNote.length > 2000) throw new HttpError(400, 'BAD_REQUEST', 'note too long')
   if (decision === 'reject' && !rawNote)
     throw new HttpError(400, 'BAD_REQUEST', '拒绝时必须填写理由')
+  // 列表给的 reviewToken：p:<正文版本>（稿件本身）或 r:<修改稿 id>（已发布帖的修改）。
+  const token = typeof body.reviewToken === 'string' ? body.reviewToken : null
+  const tokenMatch = token === null ? null : /^(p|r):([1-9]\d{0,18})$/.exec(token)
+  if (token !== null && !tokenMatch) throw new HttpError(400, 'BAD_REQUEST', 'invalid reviewToken')
+  const revisionId = tokenMatch?.[1] === 'r' ? tokenMatch[2]! : null
   try {
-    const result = await reviewCommunityTutorial({
-      id,
-      reviewerUserId: admin.id,
-      decision,
-      note: rawNote || null,
-    })
+    const result = revisionId
+      ? await reviewCommunityTutorialRevision({
+          publicationId: id,
+          revisionId,
+          reviewerUserId: admin.id,
+          decision,
+          note: rawNote || null,
+        })
+      : await reviewCommunityTutorial({
+          id,
+          reviewerUserId: admin.id,
+          decision,
+          note: rawNote || null,
+          expectedVersion: tokenMatch?.[1] === 'p' ? Number(tokenMatch[2]) : null,
+        })
     await writeAdminAuditBestEffort(
       { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
       'tutorial.review',
       `community_tutorial:${id}`,
       undefined,
-      { decision, note: rawNote || undefined, tutorial_id: id },
+      { decision, note: rawNote || undefined, tutorial_id: id, ...(revisionId ? { revision_id: revisionId } : {}) },
     )
     sendJson(res, 200, { ok: true, tutorial: { id, ...result } })
   } catch (error) {

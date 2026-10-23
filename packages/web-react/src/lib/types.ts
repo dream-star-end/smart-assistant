@@ -1398,6 +1398,31 @@ export type CommunityTutorialMine = {
   viewCount?: number;
   coverSha?: string | null;
   readMinutes?: number;
+  /** 正文版本：改过再审或修改通过时 +1。 */
+  contentVersion?: number;
+  /** 已发布帖最近一次修改（在审或没通过）；线上仍是旧版。 */
+  edit?: CommunityTutorialEdit | null;
+};
+
+export type CommunityTutorialEdit = {
+  id: string;
+  status: "pending" | "rejected";
+  needsHuman: boolean;
+  reviewNote: string | null;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+  createdAt: string;
+  reviewedAt: string | null;
+};
+
+/** 提交修改的结果：inplace = 稿件回到待审；pending = 已发布帖的修改在审，线上仍是旧版。 */
+export type CommunityTutorialReviseResult = {
+  id: string;
+  mode: "inplace" | "pending";
+  revisionId: string;
+  contentVersion: number;
 };
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
@@ -1502,6 +1527,10 @@ export type AdminBlogPost = CommunityTutorialPending & {
   imageCount?: number;
   bodyChars?: number;
   moderation?: BlogModeration | null;
+  /** 已发布帖的修改稿（内容是修改稿的，线上仍是旧版）。 */
+  editId?: string | null;
+  /** 审核时原样带回，作者中途改过服务端会拒绝（409）。 */
+  reviewToken?: string;
 };
 
 export type BlogModerationStats = {
@@ -1516,6 +1545,8 @@ export type BlogModerationRecord = BlogModeration & {
   title: string;
   authorName: string;
   postStatus: CommunityTutorialStatus;
+  /** 判的是已发布帖的一份修改稿。 */
+  revisionId?: string | null;
 };
 
 export type TutorialEvalSpec = {

@@ -15,6 +15,8 @@
  *        其余（置信度不够、注入特征、对审核者下指令、图片审不了） → uncertain（转人工）
  *      调用失败重试，满 MAX_ATTEMPTS 次 → error（转人工）。出错绝不自动通过。
  *   5. mode=on 才改稿件状态；mode=shadow 只记录，稿件一直在人工队列。
+ *   6. 已发布帖的修改稿（tutorialRevisions）走同一个作业：帖子是 approved 且有在审修改稿时，
+ *      审的是修改稿；通过就替换线上内容，驳回则线上旧版不变，拿不准转人工。
  *
  * 防注入：稿件以「不可信数据」框放在 user 消息里（框标记在稿件中被转义，无法提前闭合），
  * 判定口径写死在 system 里；只认固定字段的 JSON，字段缺失或越界一律转人工；作者看到的理由
@@ -45,6 +47,13 @@ import {
 import { assertTutorialPublishable } from './communityTutorials.js'
 import { notifyCommunityTutorialDecision } from './tutorialNotices.js'
 import { tutorialModerationMode } from './tutorialModerationQueue.js'
+import {
+  applyRevision,
+  assertRevisionPublishable,
+  getPendingRevision,
+  listRevisionImages,
+  rejectRevision,
+} from './tutorialRevisions.js'
 
 export { enqueueTutorialModeration, tutorialModerationMode } from './tutorialModerationQueue.js'
 export type { TutorialModerationMode } from './tutorialModerationQueue.js'
@@ -621,15 +630,23 @@ async function failExhaustedJobs(): Promise<number> {
       [TUTORIAL_MODERATION_MAX_ATTEMPTS],
     )
     const ids = exhausted.rows.map((row) => row.publication_id)
-    if (ids.length > 0) {
-      await client.query(
-        `UPDATE community_tutorials SET needs_human = true, updated_at = NOW()
-          WHERE id = ANY($1::bigint[]) AND status = 'pending'`,
-        [ids],
-      )
-    }
+    if (ids.length > 0) await sendToHumans(client, ids)
     return ids.length
   })
+}
+
+/** 作业不再审：在审的稿件和已发布帖在审的修改稿都转人工。 */
+async function sendToHumans(client: QueryRunner, ids: string[]): Promise<void> {
+  await client.query(
+    `UPDATE community_tutorials SET needs_human = true, updated_at = NOW()
+      WHERE id = ANY($1::bigint[]) AND status = 'pending'`,
+    [ids],
+  )
+  await client.query(
+    `UPDATE community_tutorial_revisions SET needs_human = true, updated_at = NOW()
+      WHERE publication_id = ANY($1::bigint[]) AND status = 'pending'`,
+    [ids],
+  )
 }
 
 type PostRow = {
@@ -639,7 +656,11 @@ type PostRow = {
   summary: string
   body_markdown: string
   author_user_id: string
+  content_version: number
 }
+
+/** 这次审的是什么：稿件本身（带正文版本），或已发布帖的一份修改稿。 */
+type Target = { kind: 'post'; version: number } | { kind: 'revision'; revisionId: string }
 
 type Usage = { inputTokens: number; outputTokens: number }
 
@@ -650,17 +671,25 @@ export async function runTutorialModerationJob(
   transport: ModerationTransport = platformModerationTransport(),
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<'pass' | 'reject' | 'uncertain' | 'error' | 'skipped' | 'retry' | 'lost'> {
-  const post = (
+  const row = (
     await query<PostRow>(
-      `SELECT status, kind, title, summary, body_markdown, author_user_id::text AS author_user_id
+      `SELECT status, kind, title, summary, body_markdown, author_user_id::text AS author_user_id, content_version
          FROM community_tutorials WHERE id = $1::bigint`,
       [job.publicationId],
     )
   ).rows[0]
-  if (!post || post.status !== 'pending' || post.kind !== 'markdown') {
+  const revision = row?.status === 'approved' && row.kind === 'markdown' ? await getPendingRevision(job.publicationId) : null
+  if (!row || row.kind !== 'markdown' || (row.status !== 'pending' && !revision)) {
     await finishJob(job, owner, 'done')
     return 'skipped'
   }
+  // 已发布帖：审的是修改稿的内容；线上旧版在结论落下前不动。
+  const post: PostRow = revision
+    ? { ...row, title: revision.title, summary: revision.summary, body_markdown: revision.bodyMarkdown }
+    : row
+  const target: Target = revision
+    ? { kind: 'revision', revisionId: revision.id }
+    : { kind: 'post', version: Number(row.content_version ?? 1) }
   const started = Date.now()
   const usage: Usage = { inputTokens: 0, outputTokens: 0 }
   let text: TextVerdict
@@ -674,16 +703,21 @@ export async function runTutorialModerationJob(
     text = evaluated.verdict
     usage.inputTokens += evaluated.inputTokens
     usage.outputTokens += evaluated.outputTokens
-    const blobs = await query<{ sha256: string; body: Buffer }>(
-      `SELECT b.sha256, b.body
-         FROM tutorial_blob_refs r JOIN tutorial_blobs b ON b.sha256 = r.sha256
-        WHERE r.publication_id = $1::bigint AND r.role LIKE 'image:%'
-        ORDER BY r.role`,
-      [job.publicationId],
-    )
-    if (blobs.rows.length > 0 && !tutorialVisionEnabled(env)) imagesUnreviewed = true
+    const blobs =
+      target.kind === 'revision'
+        ? await listRevisionImages(target.revisionId)
+        : (
+            await query<{ sha256: string; body: Buffer }>(
+              `SELECT b.sha256, b.body
+                 FROM tutorial_blob_refs r JOIN tutorial_blobs b ON b.sha256 = r.sha256
+                WHERE r.publication_id = $1::bigint AND r.role LIKE 'image:%'
+                ORDER BY r.role`,
+              [job.publicationId],
+            )
+          ).rows
+    if (blobs.length > 0 && !tutorialVisionEnabled(env)) imagesUnreviewed = true
     else {
-      for (const blob of blobs.rows) {
+      for (const blob of blobs) {
         const body = Buffer.isBuffer(blob.body) ? blob.body : Buffer.from(blob.body)
         const result = await evaluateTutorialImage({ sha256: blob.sha256, body }, transport)
         images.push(result.verdict)
@@ -699,7 +733,7 @@ export async function runTutorialModerationJob(
       await retryJob(job, owner)
       return 'retry'
     }
-    const applied = await settle(job, owner, post, {
+    const applied = await settle(job, owner, post, target, {
       verdict: 'error',
       decision: { verdict: 'uncertain', reason: null, adminNote: `AI 审核调用失败（${code}），转人工` },
       text: null,
@@ -713,7 +747,7 @@ export async function runTutorialModerationJob(
   }
   const injection = detectPromptInjection(`${post.title}\n${post.summary}\n${post.body_markdown}`)
   const decision = decideModeration({ text, images, injection, imagesUnreviewed })
-  const applied = await settle(job, owner, post, {
+  const applied = await settle(job, owner, post, target, {
     verdict: decision.verdict,
     decision,
     text,
@@ -760,11 +794,13 @@ function categoriesJson(text: TextVerdict | null): Record<string, unknown> {
 /**
  * 记录结论并（mode=on 时）落到稿件上，与作业收尾在同一事务：租约已被别人接走则整笔放弃。
  * 自动通过前按当前规则再扫一遍泄密（正文 + 图片 blob），扫出问题就改为转人工。
+ * 稿件本身只在正文版本没变时落结论；修改稿只在它仍在审时落（作者又改了就作废）。
  */
 async function settle(
   job: ClaimedJob,
   owner: string,
   post: PostRow,
+  target: Target,
   outcome: {
     verdict: 'pass' | 'reject' | 'uncertain' | 'error'
     decision: ModerationDecision
@@ -780,6 +816,7 @@ async function settle(
   const reason = outcome.decision.reason
   // 只有入队时与当前开关都是 on 才改稿件状态；中途切到 shadow 就按 shadow 处理（Codex R1 P1）。
   const mode: 'shadow' | 'on' = job.mode === 'on' && tutorialModerationMode() === 'on' ? 'on' : 'shadow'
+  const revisionId = target.kind === 'revision' ? target.revisionId : null
   const committed = await tx(async (client) => {
     if (!(await finishJob(job, owner, outcome.verdict === 'error' ? 'failed' : 'done', client))) return false
     let verdict = outcome.verdict
@@ -787,7 +824,8 @@ async function settle(
     let applied = false
     if (mode === 'on' && verdict === 'pass') {
       try {
-        await assertTutorialPublishable(job.publicationId, client)
+        if (revisionId) await assertRevisionPublishable(revisionId, client)
+        else await assertTutorialPublishable(job.publicationId, client)
       } catch {
         verdict = 'uncertain'
         adminNote = '自动通过前的泄密复扫命中，转人工'
@@ -808,26 +846,42 @@ async function settle(
         adminNote = '没有在职管理员可作系统审核人，转人工'
       }
     }
-    if (mode === 'on' && verdict === 'pass') {
-      const result = await client.query(
-        `UPDATE community_tutorials
-            SET status = 'approved', review_source = 'ai', reviewed_by = $2::bigint, review_note = NULL,
-                reviewed_at = NOW(), published_at = NOW(), needs_human = false, updated_at = NOW()
-          WHERE id = $1::bigint AND status = 'pending'`,
-        [job.publicationId, actor],
-      )
-      applied = result.rowCount === 1
+    if (mode === 'on' && verdict === 'pass' && actor) {
+      if (revisionId) {
+        applied = (await applyRevision(client, { revisionId, reviewerUserId: actor, source: 'ai', note: null })) !== null
+      } else {
+        const result = await client.query(
+          `UPDATE community_tutorials
+              SET status = 'approved', review_source = 'ai', reviewed_by = $2::bigint, review_note = NULL,
+                  reviewed_at = NOW(), published_at = NOW(), needs_human = false, updated_at = NOW()
+            WHERE id = $1::bigint AND status = 'pending' AND content_version = $3::integer`,
+          [job.publicationId, actor, target.kind === 'post' ? target.version : null],
+        )
+        applied = result.rowCount === 1
+      }
       if (applied) notice = 'approved'
-    } else if (mode === 'on' && verdict === 'reject') {
-      const result = await client.query(
-        `UPDATE community_tutorials
-            SET status = 'rejected', review_source = 'ai', reviewed_by = $3::bigint, review_note = $2,
-                reviewed_at = NOW(), published_at = NULL, needs_human = false, updated_at = NOW()
-          WHERE id = $1::bigint AND status = 'pending'`,
-        [job.publicationId, reason, actor],
-      )
-      applied = result.rowCount === 1
+    } else if (mode === 'on' && verdict === 'reject' && actor) {
+      if (revisionId) {
+        applied =
+          (await rejectRevision(client, { revisionId, reviewerUserId: actor, source: 'ai', note: reason ?? '' })) !== null
+      } else {
+        const result = await client.query(
+          `UPDATE community_tutorials
+              SET status = 'rejected', review_source = 'ai', reviewed_by = $3::bigint, review_note = $2,
+                  reviewed_at = NOW(), published_at = NULL, needs_human = false, updated_at = NOW()
+            WHERE id = $1::bigint AND status = 'pending' AND content_version = $4::integer`,
+          [job.publicationId, reason, actor, target.kind === 'post' ? target.version : null],
+        )
+        applied = result.rowCount === 1
+      }
       if (applied) notice = 'rejected'
+    } else if (revisionId) {
+      // 拿不准 / 出错 / shadow：修改稿转人工，线上旧版不动。
+      await client.query(
+        `UPDATE community_tutorial_revisions SET needs_human = true, updated_at = NOW()
+          WHERE id = $1::bigint AND status = 'pending'`,
+        [revisionId],
+      )
     } else {
       // 拿不准 / 出错 / shadow：转人工队列。
       await client.query(
@@ -840,8 +894,9 @@ async function settle(
       `INSERT INTO community_tutorial_moderations
          (publication_id, attempt, mode, verdict, applied, categories, images, reason, admin_note,
           injection, text_model, vision_model, prompt_version, input_tokens, output_tokens,
-          latency_ms, error_code)
-       VALUES ($1::bigint, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+          latency_ms, error_code, revision_id)
+       VALUES ($1::bigint, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+               $18::bigint)`,
       [
         job.publicationId,
         job.attempt,
@@ -860,6 +915,7 @@ async function settle(
         outcome.usage.outputTokens,
         outcome.latencyMs,
         outcome.errorCode,
+        revisionId,
       ],
     )
     return true
@@ -871,6 +927,7 @@ async function settle(
       title: post.title,
       decision: notice,
       reason,
+      ...(revisionId ? { revisionId } : { version: target.kind === 'post' ? target.version : 1 }),
     }).catch(() => {})
   }
   return committed
@@ -889,13 +946,7 @@ async function releaseQueuedJobsToHumans(): Promise<number> {
         RETURNING publication_id::text AS publication_id`,
     )
     const ids = released.rows.map((row) => row.publication_id)
-    if (ids.length > 0) {
-      await client.query(
-        `UPDATE community_tutorials SET needs_human = true, updated_at = NOW()
-          WHERE id = ANY($1::bigint[]) AND status = 'pending'`,
-        [ids],
-      )
-    }
+    if (ids.length > 0) await sendToHumans(client, ids)
     return ids.length
   })
 }

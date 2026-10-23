@@ -20,7 +20,7 @@ import type {
 import { cn } from "../../../lib/utils";
 import { Alert, Button, ListSkeleton, useToast } from "../../ui";
 import { BlogAvatar, BlogChips, BlogCover, BlogProse, type BlogImageSource } from "./BlogArticle";
-import { BlogEditor } from "./BlogEditor";
+import { BlogEditor, type BlogEditTarget } from "./BlogEditor";
 import { BlogMine } from "./BlogMine";
 import {
   BLOG_CATEGORIES,
@@ -33,7 +33,10 @@ import {
 
 const PUBLIC_SOURCE: BlogImageSource = { kind: "public" };
 
-type BlogView = { kind: "list" } | { kind: "editor"; seed?: BlogDraft; nonce?: number } | { kind: "mine" };
+type BlogView =
+  | { kind: "list" }
+  | { kind: "editor"; seed?: BlogDraft; nonce?: number; editing?: BlogEditTarget }
+  | { kind: "mine" };
 
 /** 从对话里的经验分享卡打开子视图（App → TutorialCenter → 这里）；nonce 变化执行一次。 */
 export type BlogViewRequest = { kind: "editor"; seed: BlogDraft; nonce: number } | { kind: "mine"; nonce: number };
@@ -105,11 +108,12 @@ export function CommunityBlog({
   if (view.kind === "editor" && auth) {
     return (
       <BlogEditor
-        key={view.nonce ?? 0}
+        key={view.editing ? `edit:${view.editing.id}` : (view.nonce ?? 0)}
         auth={auth}
         seed={view.seed}
+        editing={view.editing}
         aiReview={aiReview}
-        onBack={backToList}
+        onBack={view.editing ? () => setView({ kind: "mine" }) : backToList}
         onSubmitted={() => setView({ kind: "mine" })}
       />
     );
@@ -120,6 +124,7 @@ export function CommunityBlog({
         auth={auth}
         onBack={backToList}
         onWrite={(seed) => setView({ kind: "editor", seed })}
+        onEdit={(seed, editing) => setView({ kind: "editor", seed, editing })}
         onOpen={openDetail}
       />
     );

@@ -9,14 +9,19 @@ import {
 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../../lib/api";
-import { withdrawConsequence } from "../../../lib/tutorialStudio";
 import type { AuthSession, CommunityTutorialMine } from "../../../lib/types";
 import { cn } from "../../../lib/utils";
 import { Alert, Button, ListSkeleton, useConfirm, useToast } from "../../ui";
 import { BlogCover, type BlogImageSource } from "./BlogArticle";
+import type { BlogEditTarget } from "./BlogEditor";
 import {
   type BlogDraft,
+  type BlogEditStage,
   type BlogMineStage,
+  blogCanEdit,
+  blogEditChangeMessage,
+  blogEditSeed,
+  blogEditStage,
   blogFirstImageSha,
   blogMineStage,
   blogShortDate,
@@ -34,6 +39,16 @@ const STAGE_CHIP: Record<BlogMineStage, { label: string; className: string; icon
   takedown: { label: "已下架", className: "blog-chip-bad", icon: CircleX },
   draft: { label: "草稿", className: "", icon: Circle },
 };
+
+/** 撤回确认里的后果说明(经验分享的口径)。 */
+function withdrawConsequence(item: CommunityTutorialMine): string {
+  if (item.status === "approved") {
+    return item.edit?.status === "pending"
+      ? "这篇会从经验分享下线，读者将无法再打开；正在审核的修改也会作废。撤回后不能再修改，可以复制为新稿重新投稿。"
+      : "这篇会从经验分享下线，读者将无法再打开。撤回后不能再修改，可以复制为新稿重新投稿。";
+  }
+  return "这篇会退出审核。撤回后不能再修改，可以复制为新稿重新投稿。";
+}
 
 function submittedClock(iso: string): string {
   const date = new Date(iso);
@@ -76,15 +91,43 @@ function ReviewSteps() {
   );
 }
 
+/** 已发布帖的修改状态:线上仍是原版,修改在审或没通过。 */
+function EditNotice({ stage, item }: { stage: BlogEditStage; item: CommunityTutorialMine }) {
+  if (stage === "rejected") {
+    return (
+      <div className="mt-2.5 rounded-xl bg-danger-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
+        <b className="inline text-[13px]">修改未通过，线上仍是原版。原因：</b>
+        {item.edit?.reviewNote ?? "未说明"}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl bg-info-soft px-3 py-2.5 text-[13px] leading-[1.6] text-fg">
+      <span className={cn("blog-chip", stage === "ai" ? "blog-chip-info" : "blog-chip-warn")}>
+        {stage === "ai" ? (
+          <LoaderCircle size={12} aria-hidden className="animate-spin motion-reduce:animate-none" />
+        ) : (
+          <UserCheck size={12} aria-hidden />
+        )}
+        {stage === "ai" ? "修改审核中" : "修改待人工复核"}
+      </span>
+      <span>线上仍是原版，新版本审核通过后自动替换。</span>
+    </div>
+  );
+}
+
 export function BlogMine({
   auth,
   onBack,
   onWrite,
+  onEdit,
   onOpen,
 }: {
   auth: AuthSession;
   onBack: () => void;
   onWrite: (seed?: BlogDraft) => void;
+  /** 修改已投稿的帖子(待审 / 未通过 / 已发布)。 */
+  onEdit: (seed: BlogDraft, target: BlogEditTarget) => void;
   onOpen: (id: string) => void;
 }) {
   const toast = useToast();
@@ -95,6 +138,7 @@ export function BlogMine({
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const stagesRef = useRef(new Map<string, BlogMineStage>());
+  const editStagesRef = useRef(new Map<string, BlogEditStage | null>());
   const privateSource = useMemo<BlogImageSource>(() => ({ kind: "private", auth }), [auth]);
 
   const load = useCallback(
@@ -110,6 +154,12 @@ export function BlogMine({
           const message = before ? blogStageChangeMessage(item.title, before, after) : null;
           if (message) toast(message, after === "rejected" ? "info" : "success");
           stagesRef.current.set(item.id, after);
+          const editAfter = blogEditStage(item);
+          const editMessage = editStagesRef.current.has(item.id)
+            ? blogEditChangeMessage(item.title, editStagesRef.current.get(item.id) ?? null, editAfter)
+            : null;
+          if (editMessage) toast(editMessage, editAfter === "rejected" ? "info" : "success");
+          editStagesRef.current.set(item.id, editAfter);
         }
         setItems((current) => (cursor ? [...current, ...mine] : mine));
         setNextCursor(page.nextCursor);
@@ -127,7 +177,7 @@ export function BlogMine({
     void load(null);
   }, [load]);
 
-  const hasPending = items.some((item) => item.status === "pending");
+  const hasPending = items.some((item) => item.status === "pending" || item.edit?.status === "pending");
   useEffect(() => {
     if (!hasPending) return;
     const timer = window.setInterval(() => void load(null, true), POLL_MS);
@@ -137,7 +187,7 @@ export function BlogMine({
   const withdraw = async (item: CommunityTutorialMine) => {
     const ok = await confirm({
       title: "撤回这篇投稿？",
-      body: <p className="text-body text-muted">{withdrawConsequence(item.status)}</p>,
+      body: <p className="text-body text-muted">{withdrawConsequence(item)}</p>,
       confirmText: "撤回",
       danger: true,
     });
@@ -188,6 +238,8 @@ export function BlogMine({
         <div className="flex flex-col gap-3">
           {items.map((item) => {
             const stage = blogMineStage(item);
+            const editStage = blogEditStage(item);
+            const editable = blogCanEdit(item);
             const chip = STAGE_CHIP[stage];
             const Icon = chip.icon;
             const cover = { category: item.category, coverSha: item.coverSha ?? blogFirstImageSha(item.bodyMarkdown) };
@@ -235,14 +287,26 @@ export function BlogMine({
                       AI 没能确定这篇是否合规，已转给管理员复核，一般 24 小时内处理。
                     </div>
                   )}
+                  {editStage && <EditNotice stage={editStage} item={item} />}
                 </div>
-                <div className="ml-auto flex shrink-0 gap-2">
+                <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2">
                   {stage === "published" && (
                     <Button variant="secondary" size="sm" shape="pill" onClick={() => onOpen(item.id)}>
                       查看
                     </Button>
                   )}
-                  {(stage === "rejected" || stage === "withdrawn" || stage === "takedown") && (
+                  {editable && (
+                    <Button
+                      variant={stage === "rejected" || editStage === "rejected" ? "accent" : "secondary"}
+                      size="sm"
+                      shape="pill"
+                      disabled={busyId !== null}
+                      onClick={() => onEdit(blogEditSeed(item), { id: item.id, published: item.status === "approved" })}
+                    >
+                      <SquarePen size={14} aria-hidden /> {editStage === "rejected" ? "再改" : "修改"}
+                    </Button>
+                  )}
+                  {(stage === "withdrawn" || stage === "takedown") && (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -259,7 +323,7 @@ export function BlogMine({
                       复制为新稿
                     </Button>
                   )}
-                  {(stage === "ai" || stage === "human") && (
+                  {(stage === "ai" || stage === "human" || stage === "published") && (
                     <Button
                       variant="ghost"
                       size="sm"

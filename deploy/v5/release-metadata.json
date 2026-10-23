@@ -190,7 +190,8 @@
     "0320_community_blog",
     "0321_community_tutorial_moderation",
     "0322_selfhost_literature_captcha_requests",
-    "0323_turn_dispatches_trace_id"
+    "0323_turn_dispatches_trace_id",
+    "0326_community_tutorial_revisions"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

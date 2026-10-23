@@ -56,7 +56,9 @@ export class CommunityTutorialError extends Error {
       | 'TOO_LARGE'
       | 'BAD_BODY'
       | 'RATE_LIMITED'
-      | 'FEATURE_DISABLED',
+      | 'FEATURE_DISABLED'
+      | 'NOT_EDITABLE'
+      | 'STALE',
     message: string,
     readonly leakReport?: { leaks: Array<{ rule: string; field: string }> },
   ) {
@@ -125,9 +127,29 @@ export interface OwnTutorialRow {
   viewCount: number
   coverSha: string | null
   readMinutes: number
+  /** 正文版本：原地修改或修改稿通过时 +1；管理员审核带上它防止审到旧内容。 */
+  contentVersion: number
 }
 
-export interface OwnTutorialDetailRow extends OwnTutorialRow {
+/** 已发布帖最近一次修改（还在审或没通过）；线上仍是旧版。只在「我的投稿」里给作者看。 */
+export interface OwnTutorialEditRow {
+  id: string
+  status: 'pending' | 'rejected'
+  needsHuman: boolean
+  reviewNote: string | null
+  title: string
+  summary: string
+  category: CommunityTutorialCategory
+  bodyMarkdown: string
+  createdAt: string
+  reviewedAt: string | null
+}
+
+export interface OwnTutorialMineRow extends OwnTutorialRow {
+  edit: OwnTutorialEditRow | null
+}
+
+export interface OwnTutorialDetailRow extends OwnTutorialMineRow {
   sourceSessionId: string | null
 }
 
@@ -152,6 +174,10 @@ export interface AdminTutorialRow extends OwnTutorialRow {
   authorName: string
   imageCount: number
   bodyChars: number
+  /** 这一项是已发布帖的修改稿（线上仍是旧版）；标题、正文等都是修改稿的内容。 */
+  editId: string | null
+  /** 审核时原样带回：p:<正文版本> 或 r:<修改稿 id>；作者中途改过就拒绝旧结论。 */
+  reviewToken: string
   /** 最近一次 AI 审核记录；没有审核过为 null。 */
   moderation: TutorialModerationSummaryRow | null
 }
@@ -207,7 +233,7 @@ function splitPage<T extends { id: string }>(
   }
 }
 
-function assertNoMarkdownLeaks(bodyMarkdown: string): void {
+export function assertNoMarkdownLeaks(bodyMarkdown: string): void {
   const leaks = scanMarkdownBody(maskTutorialImageRefs(bodyMarkdown))
   if (leaks.length > 0) {
     throw new CommunityTutorialError('LEAKS_FOUND', '教程正文未通过安全扫描', leakReportPublic(leaks))
@@ -532,6 +558,7 @@ type OwnRowDb = {
   review_source: CommunityTutorialReviewSource | null
   view_count: string | number
   cover_sha: string | null
+  content_version: number
 }
 
 /** OwnRowDb 的列；表别名固定为 t。 */
@@ -539,7 +566,7 @@ const OWN_COLUMNS = `t.id::text AS id, t.title, t.summary, t.category, t.kind, t
             t.snapshot_json, t.source_session_id, t.sanitizer_version, t.status, t.review_note,
             t.created_at, t.reviewed_at, t.published_at,
             (t.status = 'pending' AND t.needs_human) AS needs_human, t.review_source,
-            t.view_count, ${COVER_SHA_SQL('t.body_markdown')} AS cover_sha`
+            t.view_count, ${COVER_SHA_SQL('t.body_markdown')} AS cover_sha, t.content_version`
 
 function mapOwnRow(row: OwnRowDb): OwnTutorialRow {
   return {
@@ -562,6 +589,45 @@ function mapOwnRow(row: OwnRowDb): OwnTutorialRow {
     viewCount: Number(row.view_count),
     coverSha: row.cover_sha,
     readMinutes: tutorialReadMinutes([...row.body_markdown].length),
+    contentVersion: Number(row.content_version ?? 1),
+  }
+}
+
+/** 已发布帖最近一次修改（非 direct）；只有它还在审或没通过才给出，已通过 / 作废的不算。 */
+const EDIT_COLUMN = `(SELECT to_jsonb(e) FROM (
+               SELECT r.id::text AS id, r.status, (r.status = 'pending' AND r.needs_human) AS needs_human,
+                      r.review_note, r.title, r.summary, r.category, r.body_markdown, r.created_at, r.reviewed_at
+                 FROM community_tutorial_revisions r
+                WHERE r.publication_id = t.id AND r.status <> 'direct' AND t.status = 'approved'
+                ORDER BY r.id DESC LIMIT 1
+             ) e WHERE e.status IN ('pending', 'rejected')) AS edit`
+
+type EditDb = {
+  id: string
+  status: 'pending' | 'rejected'
+  needs_human: boolean
+  review_note: string | null
+  title: string
+  summary: string
+  category: CommunityTutorialCategory
+  body_markdown: string
+  created_at: string
+  reviewed_at: string | null
+}
+
+function mapEdit(row: EditDb | null): OwnTutorialEditRow | null {
+  if (!row) return null
+  return {
+    id: row.id,
+    status: row.status,
+    needsHuman: row.needs_human,
+    reviewNote: row.review_note,
+    title: row.title,
+    summary: row.summary,
+    category: row.category,
+    bodyMarkdown: row.body_markdown,
+    createdAt: iso(row.created_at)!,
+    reviewedAt: iso(row.reviewed_at),
   }
 }
 
@@ -570,8 +636,8 @@ export async function getOwnCommunityTutorial(
   authorUserId: string,
   runner?: QueryRunner,
 ): Promise<OwnTutorialDetailRow | null> {
-  const result = await query<OwnRowDb>(
-    `SELECT ${OWN_COLUMNS}
+  const result = await query<OwnRowDb & { edit: EditDb | null }>(
+    `SELECT ${OWN_COLUMNS}, ${EDIT_COLUMN}
        FROM community_tutorials t
       WHERE t.id = $1::bigint AND t.author_user_id = $2::bigint`,
     [id, authorUserId],
@@ -581,6 +647,7 @@ export async function getOwnCommunityTutorial(
   if (!row) return null
   return {
     ...mapOwnRow(row),
+    edit: mapEdit(row.edit),
     refs: await listTutorialBlobRefs(row.id, runner),
     sourceSessionId: row.source_session_id,
   }
@@ -590,9 +657,9 @@ export async function listOwnCommunityTutorials(
   authorUserId: string,
   args: { cursor: TutorialCursor | null; limit: number },
   runner?: QueryRunner,
-): Promise<{ items: OwnTutorialRow[]; nextCursor: string | null }> {
-  const result = await query<OwnRowDb & { cursor_at: string }>(
-    `SELECT ${OWN_COLUMNS}, t.created_at::text AS cursor_at
+): Promise<{ items: OwnTutorialMineRow[]; nextCursor: string | null }> {
+  const result = await query<OwnRowDb & { cursor_at: string; edit: EditDb | null }>(
+    `SELECT ${OWN_COLUMNS}, ${EDIT_COLUMN}, t.created_at::text AS cursor_at
        FROM community_tutorials t
       WHERE t.author_user_id = $1::bigint
         AND ($2::timestamptz IS NULL OR (t.created_at, t.id) < ($2::timestamptz, $3::bigint))
@@ -602,7 +669,10 @@ export async function listOwnCommunityTutorials(
     runner,
   )
   const page = splitPage(result.rows, args.limit, (row) => row.cursor_at)
-  return { items: page.rows.map(mapOwnRow), nextCursor: page.nextCursor }
+  return {
+    items: page.rows.map((row) => ({ ...mapOwnRow(row), edit: mapEdit(row.edit) })),
+    nextCursor: page.nextCursor,
+  }
 }
 
 export async function listPendingCommunityTutorials(
@@ -640,6 +710,7 @@ export type AdminTutorialStatus = (typeof ADMIN_TUTORIAL_STATUSES)[number]
 /**
  * 管理端按状态列表。pending 按投稿时间正序（先来先审）；其它状态按处理时间倒序。
  * needsHuman 只对 pending 有意义：只看在等人工的那部分。
+ * pending 还并入已发布帖在审的修改稿（editId 非空，内容是修改稿的；线上仍是旧版）。
  */
 export async function listAdminCommunityTutorials(
   args: {
@@ -655,6 +726,8 @@ export async function listAdminCommunityTutorials(
   const pending = args.status === 'pending'
   // 非 pending 的排序键：处理时间，缺失（作者撤回、0320 前的行）时退到 updated_at。
   const orderKey = pending ? 't.created_at' : 'COALESCE(t.reviewed_at, t.updated_at)'
+  // 修改稿那一支的空列取稿件表同名列的类型（CASE WHEN false），UNION 两边类型一致。
+  const none = (column: string) => `CASE WHEN false THEN t.${column} END`
   const result = await query<
     OwnRowDb & {
       cursor_at: string
@@ -662,26 +735,55 @@ export async function listAdminCommunityTutorials(
       image_count: string
       body_chars: number
       moderation: ModerationDb | null
+      edit_id: string | null
     }
   >(
-    `SELECT ${OWN_COLUMNS}, ${orderKey}::text AS cursor_at,
-            COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name,
-            (SELECT count(*) FROM tutorial_blob_refs r
-              WHERE r.publication_id = t.id AND r.role LIKE 'image:%')::text AS image_count,
-            char_length(t.body_markdown) AS body_chars,
-            (SELECT to_jsonb(m) FROM (
-               SELECT verdict, mode, applied, categories, images, reason, admin_note, injection, created_at
-                 FROM community_tutorial_moderations
-                WHERE publication_id = t.id
-                ORDER BY id DESC LIMIT 1
-             ) m) AS moderation
-       FROM community_tutorials t
-       JOIN users u ON u.id = t.author_user_id
-      WHERE t.status = $1
-        AND (NOT $2::boolean OR t.needs_human)
-        AND ($6::text IS NULL OR t.kind = $6)
-        AND ($3::timestamptz IS NULL OR (${orderKey}, t.id) ${pending ? '>' : '<'} ($3::timestamptz, $4::bigint))
-      ORDER BY ${orderKey} ${pending ? 'ASC' : 'DESC'}, t.id ${pending ? 'ASC' : 'DESC'}
+    `WITH items AS (
+       SELECT ${OWN_COLUMNS}, ${orderKey} AS order_at,
+              COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name,
+              (SELECT count(*) FROM tutorial_blob_refs r
+                WHERE r.publication_id = t.id AND r.role LIKE 'image:%')::text AS image_count,
+              char_length(t.body_markdown) AS body_chars,
+              (SELECT to_jsonb(m) FROM (
+                 SELECT verdict, mode, applied, categories, images, reason, admin_note, injection, created_at
+                   FROM community_tutorial_moderations
+                  WHERE publication_id = t.id AND revision_id IS NULL
+                  ORDER BY id DESC LIMIT 1
+               ) m) AS moderation,
+              NULL::text AS edit_id
+         FROM community_tutorials t
+         JOIN users u ON u.id = t.author_user_id
+        WHERE t.status = $1
+          AND (NOT $2::boolean OR t.needs_human)
+          AND ($6::text IS NULL OR t.kind = $6)
+       UNION ALL
+       SELECT t.id::text AS id, r.title, r.summary, r.category, t.kind, r.body_markdown,
+              ${none('snapshot_json')}, ${none('source_session_id')}, ${none('sanitizer_version')},
+              'pending'::text AS status, ${none('review_note')}, r.created_at, ${none('reviewed_at')},
+              t.published_at, r.needs_human, ${none('review_source')}, t.view_count,
+              ${COVER_SHA_SQL('r.body_markdown')} AS cover_sha, t.content_version,
+              r.created_at AS order_at,
+              COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name,
+              (SELECT count(*) FROM community_tutorial_revision_images i WHERE i.revision_id = r.id)::text AS image_count,
+              char_length(r.body_markdown) AS body_chars,
+              (SELECT to_jsonb(m) FROM (
+                 SELECT verdict, mode, applied, categories, images, reason, admin_note, injection, created_at
+                   FROM community_tutorial_moderations
+                  WHERE revision_id = r.id
+                  ORDER BY id DESC LIMIT 1
+               ) m) AS moderation,
+              r.id::text AS edit_id
+         FROM community_tutorial_revisions r
+         JOIN community_tutorials t ON t.id = r.publication_id
+         JOIN users u ON u.id = t.author_user_id
+        WHERE $1 = 'pending' AND r.status = 'pending' AND t.status = 'approved'
+          AND (NOT $2::boolean OR r.needs_human)
+          AND ($6::text IS NULL OR t.kind = $6)
+     )
+     SELECT items.*, order_at::text AS cursor_at
+       FROM items
+      WHERE ($3::timestamptz IS NULL OR (order_at, id::bigint) ${pending ? '>' : '<'} ($3::timestamptz, $4::bigint))
+      ORDER BY order_at ${pending ? 'ASC' : 'DESC'}, id::bigint ${pending ? 'ASC' : 'DESC'}
       LIMIT $5`,
     [
       args.status,
@@ -701,6 +803,8 @@ export async function listAdminCommunityTutorials(
       imageCount: Number(row.image_count),
       bodyChars: row.body_chars,
       moderation: row.moderation ? mapModeration(row.moderation) : null,
+      editId: row.edit_id,
+      reviewToken: row.edit_id ? `r:${row.edit_id}` : `p:${Number(row.content_version ?? 1)}`,
     })),
     nextCursor: page.nextCursor,
   }
@@ -767,6 +871,8 @@ export interface TutorialModerationRecordRow extends TutorialModerationSummaryRo
   outputTokens: number | null
   latencyMs: number | null
   errorCode: string | null
+  /** 判的是已发布帖的一份修改稿；标题是修改稿的。 */
+  revisionId: string | null
 }
 
 /** 「AI 审核记录」：最新在前，游标 = (created_at, id)。 */
@@ -788,16 +894,18 @@ export async function listTutorialModerations(
       latency_ms: number | null
       error_code: string | null
       cursor_at: string
+      revision_id: string | null
     }
   >(
     `SELECT m.id::text AS id, m.publication_id::text AS publication_id, m.verdict, m.mode, m.applied,
             m.categories, m.images, m.reason, m.admin_note, m.injection, m.created_at,
             m.created_at::text AS cursor_at, m.text_model, m.vision_model, m.input_tokens,
-            m.output_tokens, m.latency_ms, m.error_code,
-            t.title, t.status AS post_status,
+            m.output_tokens, m.latency_ms, m.error_code, m.revision_id::text AS revision_id,
+            COALESCE(rv.title, t.title) AS title, t.status AS post_status,
             COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name
        FROM community_tutorial_moderations m
        JOIN community_tutorials t ON t.id = m.publication_id
+       LEFT JOIN community_tutorial_revisions rv ON rv.id = m.revision_id
        JOIN users u ON u.id = t.author_user_id
       WHERE ($1::timestamptz IS NULL OR (m.created_at, m.id) < ($1::timestamptz, $2::bigint))
       ORDER BY m.created_at DESC, m.id DESC
@@ -820,21 +928,29 @@ export async function listTutorialModerations(
       outputTokens: row.output_tokens,
       latencyMs: row.latency_ms,
       errorCode: row.error_code,
+      revisionId: row.revision_id,
     })),
     nextCursor: page.nextCursor,
   }
 }
 
+/** 撤回 / 下架时，还在审的修改稿在同一条语句里作废（不会再被审核通过换上线）。 */
 export async function withdrawCommunityTutorial(
   id: string,
   authorUserId: string,
   runner?: QueryRunner,
 ): Promise<void> {
   const result = await query<{ id: string }>(
-    `UPDATE community_tutorials
-        SET status = 'withdrawn', published_at = NULL, needs_human = false, updated_at = NOW()
-      WHERE id = $1::bigint AND author_user_id = $2::bigint AND status IN ('pending', 'approved', 'draft')
-      RETURNING id::text AS id`,
+    `WITH done AS (
+       UPDATE community_tutorials
+          SET status = 'withdrawn', published_at = NULL, needs_human = false, updated_at = NOW()
+        WHERE id = $1::bigint AND author_user_id = $2::bigint AND status IN ('pending', 'approved', 'draft')
+        RETURNING id
+     ), closed AS (
+       UPDATE community_tutorial_revisions SET status = 'withdrawn', needs_human = false, updated_at = NOW()
+        WHERE publication_id IN (SELECT id FROM done) AND status = 'pending'
+     )
+     SELECT id::text AS id FROM done`,
     [id, authorUserId],
     runner,
   )
@@ -856,7 +972,8 @@ export async function takedownCommunityTutorial(args: {
   note: string
 }): Promise<void> {
   const result = await query<{ id: string }>(
-    `UPDATE community_tutorials
+    `WITH done AS (
+     UPDATE community_tutorials
         SET status = 'takedown',
             published_at = NULL,
             review_note = $3,
@@ -866,7 +983,12 @@ export async function takedownCommunityTutorial(args: {
             needs_human = false,
             updated_at = NOW()
       WHERE id = $1::bigint AND status = 'approved'
-      RETURNING id::text AS id`,
+      RETURNING id
+     ), closed AS (
+       UPDATE community_tutorial_revisions SET status = 'withdrawn', needs_human = false, updated_at = NOW()
+        WHERE publication_id IN (SELECT id FROM done) AND status = 'pending'
+     )
+     SELECT id::text AS id FROM done`,
     [args.id, args.adminUserId, args.note],
   )
   if (result.rowCount === 1) return
@@ -921,6 +1043,8 @@ export async function reviewCommunityTutorial(args: {
   reviewerUserId: string
   decision: 'approve' | 'reject'
   note: string | null
+  /** 管理员看到的正文版本；作者在那之后改过就拒绝（STALE）。不传 = 不比对（旧客户端）。 */
+  expectedVersion?: number | null
 }): Promise<{ status: 'approved' | 'rejected'; publishedAt: string | null }> {
   const reviewed = await tx(async (client) => {
     if (args.decision === 'approve') await rescanBeforeReview(args.id, client)
@@ -931,6 +1055,7 @@ export async function reviewCommunityTutorial(args: {
       author_user_id: string
       title: string
       kind: CommunityTutorialKind
+      content_version: number
     }>(
       `UPDATE community_tutorials
           SET status = $2,
@@ -942,16 +1067,20 @@ export async function reviewCommunityTutorial(args: {
               published_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE NULL END,
               updated_at = NOW()
         WHERE id = $1::bigint AND status = 'pending'
-        RETURNING status, published_at, author_user_id::text AS author_user_id, title, kind`,
-      [args.id, status, args.note, args.reviewerUserId],
+          AND ($5::integer IS NULL OR content_version = $5::integer)
+        RETURNING status, published_at, author_user_id::text AS author_user_id, title, kind, content_version`,
+      [args.id, status, args.note, args.reviewerUserId, args.expectedVersion ?? null],
     )
     const row = result.rows[0]
     if (!row) {
-      const existing = await client.query<{ id: string }>(
-        'SELECT id::text AS id FROM community_tutorials WHERE id = $1::bigint',
+      const existing = await client.query<{ status: string; content_version: number }>(
+        'SELECT status, content_version FROM community_tutorials WHERE id = $1::bigint',
         [args.id],
       )
-      if (!existing.rows[0]) throw new CommunityTutorialError('NOT_FOUND', '教程投稿不存在')
+      const current = existing.rows[0]
+      if (!current) throw new CommunityTutorialError('NOT_FOUND', '教程投稿不存在')
+      if (current.status === 'pending')
+        throw new CommunityTutorialError('STALE', '作者刚修改过这篇，请刷新后按新内容再审')
       throw new CommunityTutorialError('NOT_PENDING', '该教程已经处理或撤回')
     }
     return row
@@ -964,6 +1093,7 @@ export async function reviewCommunityTutorial(args: {
       title: reviewed.title,
       decision: reviewed.status,
       reason: args.note,
+      version: reviewed.content_version,
     }).catch(() => {})
   }
   return { status: reviewed.status, publishedAt: iso(reviewed.published_at) }

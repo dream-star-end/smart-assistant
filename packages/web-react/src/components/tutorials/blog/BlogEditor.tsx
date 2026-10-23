@@ -14,6 +14,7 @@ import {
   Quote,
   Send,
   ShieldCheck,
+  SquarePen,
 } from "lucide-react";
 import { type ClipboardEvent, type DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../../lib/api";
@@ -33,6 +34,7 @@ import {
   applyToolbar,
   blogClock,
   blogDraftKey,
+  blogEditDraftKey,
   blogImageShas,
   blogReadMinutes,
   clearBlogDraft,
@@ -59,26 +61,35 @@ const AUTOSAVE_MS = 5_000;
 
 type Upload = { id: string; name: string; fromBytes: number; toBytes: number | null; percent: number };
 
+/** 修改已投稿的帖子:published = 已公开(审核通过前线上仍是旧版)。 */
+export type BlogEditTarget = { id: string; published: boolean };
+
 export function BlogEditor({
   auth,
   seed,
+  editing,
   aiReview,
   onBack,
   onSubmitted,
 }: {
   auth: AuthSession;
-  /** 「复制为新稿」带进来的内容;没有就恢复本地草稿。 */
+  /** 「复制为新稿」或「修改」带进来的内容;没有就恢复本地草稿。 */
   seed?: BlogDraft;
+  /** 有值 = 修改模式:提交走 revise,草稿存在这篇自己的 key 下。 */
+  editing?: BlogEditTarget;
   aiReview: boolean;
   onBack: () => void;
   onSubmitted: () => void;
 }) {
   const toast = useToast();
-  // 草稿只存本机;同一浏览器换账号时草稿跟浏览器走(内容不含任何凭据)。
-  const draftKey = blogDraftKey();
-  const [draft, setDraft] = useState<BlogDraft>(() => seed ?? loadBlogDraft(draftKey) ?? EMPTY_BLOG_DRAFT);
+  // 草稿只存本机;同一浏览器换账号时草稿跟浏览器走(内容不含任何凭据)。修改模式的草稿按稿件分开存,
+  // 不覆盖「写一篇经验」的新稿草稿;上次没提交的修改优先恢复。
+  const draftKey = editing ? blogEditDraftKey(editing.id) : blogDraftKey();
+  const [draft, setDraft] = useState<BlogDraft>(() =>
+    editing ? (loadBlogDraft(draftKey) ?? seed ?? EMPTY_BLOG_DRAFT) : (seed ?? loadBlogDraft(draftKey) ?? EMPTY_BLOG_DRAFT),
+  );
   const [savedAt, setSavedAt] = useState<Date | null>(() => {
-    const stored = seed ? null : loadBlogDraft(draftKey);
+    const stored = seed && !editing ? null : loadBlogDraft(draftKey);
     return stored ? new Date(stored.savedAt) : null;
   });
   const [mobileTab, setMobileTab] = useState<"edit" | "preview">("edit");
@@ -225,18 +236,27 @@ export function BlogEditor({
     setSubmitting(true);
     setError(null);
     try {
-      await api.submitCommunityTutorial(auth, {
+      const payload = {
         title: draft.title.trim(),
         summary: draft.summary.trim(),
         category: draft.category,
         bodyMarkdown: draft.bodyMarkdown.trim(),
-      });
+      };
+      if (editing) await api.reviseCommunityTutorial(auth, editing.id, payload);
+      else await api.submitCommunityTutorial(auth, payload);
       clearBlogDraft(draftKey);
       dirtyRef.current = false;
-      toast(aiReview ? "已提交，AI 审核通常 1 分钟内出结果" : "已提交，等待管理员审核", "success");
+      toast(
+        editing?.published
+          ? "修改已提交，审核通过后替换线上版本"
+          : aiReview
+            ? "已提交，AI 审核通常 1 分钟内出结果"
+            : "已提交，等待管理员审核",
+        "success",
+      );
       onSubmitted();
     } catch (cause) {
-      setError(apiErrorMessage(cause, "投稿失败，请稍后重试"));
+      setError(apiErrorMessage(cause, editing ? "提交修改失败，请稍后重试" : "投稿失败，请稍后重试"));
     } finally {
       setSubmitting(false);
     }
@@ -256,6 +276,11 @@ export function BlogEditor({
         >
           <ArrowLeft size={15} /> 返回
         </button>
+        {editing && (
+          <span className="inline-flex items-center gap-1.5 text-[13.5px] font-semibold text-fg">
+            <SquarePen size={15} aria-hidden /> 修改投稿
+          </span>
+        )}
         <div className="flex-1" />
         <div
           role="tablist"
@@ -284,6 +309,14 @@ export function BlogEditor({
           </span>
         )}
       </div>
+
+      {editing && (
+        <div className="border-b border-border bg-info-soft px-3.5 py-2 text-[12.5px] leading-[1.6] text-fg sm:px-6" role="note">
+          {editing.published
+            ? "这篇已经公开。提交修改后会重新审核，审核通过前读者看到的仍是原来的版本；没通过也不影响原文。"
+            : "提交修改后会重新审核。"}
+        </div>
+      )}
 
       <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-2">
         <section
@@ -455,7 +488,7 @@ export function BlogEditor({
           title={issue ?? undefined}
           onClick={() => void submit()}
         >
-          <Send size={15} /> 提交发布
+          <Send size={15} /> {editing ? "提交修改" : "提交发布"}
         </Button>
       </div>
     </div>

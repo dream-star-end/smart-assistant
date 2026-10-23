@@ -222,7 +222,7 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
           </dl>
           <ul className="oc-blog-chat-confirm-notes">
             <li>投稿后由 AI 审核：明确没问题的自动公开，拿不准的转站长复核，未通过会告诉你理由。</li>
-            <li>公开后所有人可见，不会被搜索引擎收录；随时可以在「我的投稿」撤回。</li>
+            <li>公开后所有人可见，不会被搜索引擎收录；随时可以在「我的投稿」修改（会重新审核）或撤回。</li>
           </ul>
           {submit.kind === "error" && <p className="oc-blog-chat-error" role="alert">{submit.message}</p>}
         </Modal>
