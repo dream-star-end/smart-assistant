@@ -2697,7 +2697,7 @@ export async function registerCommercial(
         },
         expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
       });
-      const delegateTraceHandler = makeDelegateTraceHandler({ pool, identityRepo });
+      const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
         runtimeRef: delegateEngineBillingRuntimeRef,

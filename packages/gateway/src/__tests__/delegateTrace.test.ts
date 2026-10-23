@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { test } from 'node:test'
-import { request } from 'undici'
+import type { request } from 'undici'
 import {
   mintDelegateTrace,
   cancelDelegateTraceWait,
@@ -94,7 +94,7 @@ test('Codex queued turns retain separate traces across await and a following tra
       _request: string,
       _policy: unknown,
       _retry: unknown,
-      traceId: string | undefined,
+      traceId: string | null,
     ) => {
       if (observed.length === 0) await barrier
       writeCodexDelegateContext({
@@ -102,7 +102,7 @@ test('Codex queued turns retain separate traces across await and a following tra
         agentId: 'coding-assistant',
         sessionKey: 'proof',
         depth: 0,
-        traceId,
+        traceId: traceId ?? undefined,
       })
       observed.push(verifyDelegateContextToken((await readFile(file, 'utf8')).trim())?.traceId)
     }

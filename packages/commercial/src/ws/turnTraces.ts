@@ -82,7 +82,8 @@ export function insertTurnTrace(pool: Pool, row: TurnTraceRow, timeoutMs?: numbe
         row.bundleRev ?? null,
         row.clientBuild ?? null,
       ];
-  return timeoutMs === undefined ? pool.query(text, values) : pool.query({ text, values, query_timeout: timeoutMs });
+  const query = { text, values, query_timeout: timeoutMs };
+  return timeoutMs === undefined ? pool.query(text, values) : pool.query(query);
 }
 
 export function recordTurnTrace(

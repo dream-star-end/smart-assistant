@@ -56,7 +56,7 @@ async function run(): Promise<void> {
   assert.equal(image.Id, IMAGE)
   if (!execute) {
     process.stdout.write(
-      JSON.stringify({
+      `${JSON.stringify({
         mode: 'read-only-preview',
         image: IMAGE,
         maxContainers: LIMIT,
@@ -67,7 +67,7 @@ async function run(): Promise<void> {
         memoryMiB: 128,
         userVolumes: 0,
         removesOnlyCreatedFullIds: true,
-      }) + '\n',
+      })}\n`,
     )
     return
   }
@@ -84,7 +84,7 @@ async function run(): Promise<void> {
   const persist = () =>
     writeFile(
       join(runDir, 'ledger.json'),
-      JSON.stringify(
+      `${JSON.stringify(
         {
           runId,
           uid: 765,
@@ -97,7 +97,7 @@ async function run(): Promise<void> {
         },
         null,
         2,
-      ) + '\n',
+      )}\n`,
       { mode: 0o600 },
     )
   const verify = async (container: Docker.Container) => {
@@ -110,10 +110,9 @@ async function run(): Promise<void> {
     const traceId = randomBytes(16).toString('hex')
     const code = `OCV5_605_DRILL_${event.toUpperCase().replace(/-/g, '_')}`
     const program =
-      `console.log(JSON.stringify({ts:new Date().toISOString(),level:'warn',traceId:${JSON.stringify(traceId)},code:${JSON.stringify(code)},msg:'synthetic OCV5-605 archive proof'}));` +
-      (oom
+      `console.log(JSON.stringify({ts:new Date().toISOString(),level:'warn',traceId:${JSON.stringify(traceId)},code:${JSON.stringify(code)},msg:'synthetic OCV5-605 archive proof'}));${oom
         ? 'const retained=[];setInterval(()=>retained.push(Buffer.alloc(8*1024*1024,1)),10);'
-        : "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);")
+        : "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000);"}`
     const container = await docker.createContainer({
       name: `ocv5-605-proof-${runId}-${event}`,
       Image: IMAGE,
@@ -255,7 +254,7 @@ async function run(): Promise<void> {
   await archiveAndRemove(oom, 'cgroup-oom')
   assert.equal(ledger.length, LIMIT)
   process.stdout.write(
-    JSON.stringify({
+    `${JSON.stringify({
       status: 'PASS',
       runDir,
       synthetic: true,
@@ -263,7 +262,7 @@ async function run(): Promise<void> {
       containers: ledger.length,
       results,
       counters: containerLogArchiveStats(),
-    }) + '\n',
+    })}\n`,
   )
 }
 
