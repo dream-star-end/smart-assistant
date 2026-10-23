@@ -164,6 +164,13 @@ export function VoicePage(props: {
           auth={auth}
           view={view}
           voiceReady={voice.state === 'ready'}
+          // Voice design / clone are reserved (user 2026-10-24 05:02): open only when a ready
+          // provider lists them (the server switch OC_STUDIO_VOICE_CUSTOM).
+          customOpen={voice.providers.some(
+            (p) =>
+              p.state === 'ready' &&
+              p.models.some((m) => m.ops.includes('voice.design') || m.ops.includes('voice.clone')),
+          )}
           onReload={props.onReload}
         />
         <div className="st-voice-spacer" />

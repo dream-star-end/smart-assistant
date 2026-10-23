@@ -25,7 +25,18 @@ const prov = (voice: 'ready' | 'unconfigured', music: 'ready' | 'unconfigured'):
       state: voice,
       providers:
         voice === 'ready'
-          ? [{ id: 'minimax-speech', label: 'MiniMax 语音', state: 'ready', models: [] }]
+          ? [
+              {
+                id: 'minimax-speech',
+                label: 'MiniMax 语音',
+                state: 'ready',
+                // Design / clone listed = the server switch is on (user 2026-10-24 05:02).
+                models: [
+                  { id: 'voice-design', label: '声音设计', ops: ['voice.design'] },
+                  { id: 'voice-clone', label: '快速复刻', ops: ['voice.clone'] },
+                ],
+              },
+            ]
           : [],
     },
     { kind: 'music', state: music, providers: [] },

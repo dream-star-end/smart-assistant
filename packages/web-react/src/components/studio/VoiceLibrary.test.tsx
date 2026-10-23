@@ -162,3 +162,14 @@ describe('VoiceLibrary (OCV5-593 FE-4)', () => {
     expect(screen.getByRole('button', { name: /上传克隆/ })).toBeDisabled()
   })
 })
+
+describe('VoiceLibrary reserved custom voices (user 2026-10-24 05:02)', () => {
+  test('design / clone show 即将开放 and stay closed; system voices are unaffected', () => {
+    render(
+      <VoiceLibrary auth={auth} view={base()} voiceReady customOpen={false} onReload={() => {}} />,
+    )
+    expect(screen.getByRole('button', { name: /一句话设计 · 即将开放/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /上传克隆 · 即将开放/ })).toBeDisabled()
+    expect(screen.getByTestId('voice-custom-soon')).toHaveTextContent('现在可以用系统音色')
+  })
+})

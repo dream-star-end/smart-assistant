@@ -312,9 +312,12 @@ export function VoiceLibrary(props: {
   auth: AuthSession
   view: StudioProjectView
   voiceReady: boolean
+  /** Voice design / clone are offered (reserved until the server opens them). Default: open. */
+  customOpen?: boolean
   onReload: () => Promise<void> | void
 }) {
   const toast = useToast()
+  const customOpen = props.customOpen ?? true
   const [dialog, setDialog] = useState<'design' | 'clone' | null>(null)
   const voices = props.view.assets.filter((a) => a.kind === 'voice')
   const narrator = voices.find((a) => a.locked) ?? null
@@ -332,7 +335,9 @@ export function VoiceLibrary(props: {
             还没有音色
           </div>
           <div className="st-cap">
-            开拍后导演 agent 会从系统音色里挑一个；也可以自己设计或复刻一个。
+            {customOpen
+              ? '开拍后导演 agent 会从系统音色里挑一个；也可以自己设计或复刻一个。'
+              : '开拍后导演 agent 会从系统音色里挑一个。'}
           </div>
         </div>
       ) : (
@@ -360,27 +365,34 @@ export function VoiceLibrary(props: {
           type="button"
           className="st-btn st-btn-sm"
           style={{ flex: 1 }}
-          disabled={!props.voiceReady}
+          disabled={!props.voiceReady || !customOpen}
           onClick={() => setDialog('design')}
         >
           <Wand2 />
-          一句话设计
+          {customOpen ? '一句话设计' : '一句话设计 · 即将开放'}
         </button>
         <button
           type="button"
           className="st-btn st-btn-sm"
           style={{ flex: 1 }}
-          disabled={!props.voiceReady}
+          disabled={!props.voiceReady || !customOpen}
           onClick={() => setDialog('clone')}
         >
           <Upload />
-          上传克隆
+          {customOpen ? '上传克隆' : '上传克隆 · 即将开放'}
         </button>
       </div>
-      <div className="st-cap">
-        每个新音色 {VOICE_PRICE_CREDITS}{' '}
-        积分起。克隆需要确认“本人声音或已获授权”，复刻的音色只在你自己的项目里可用。
-      </div>
+      {customOpen ? (
+        <div className="st-cap">
+          每个新音色 {VOICE_PRICE_CREDITS}{' '}
+          积分起。克隆需要确认“本人声音或已获授权”，复刻的音色只在你自己的项目里可用。
+        </div>
+      ) : (
+        <div className="st-cap" data-testid="voice-custom-soon">
+          自定义音色（一句话设计、上传克隆）即将开放；现在可以用系统音色，导演 agent
+          开拍时会挑一个合适的。
+        </div>
+      )}
       {dialog === 'design' ? (
         <DesignDialog
           auth={props.auth}

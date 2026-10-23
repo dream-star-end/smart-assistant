@@ -250,6 +250,8 @@ export function studioErrorText(err: unknown): string {
         return '这首曲子已经不在曲库里了，换一首吧'
       case 'STUDIO_ORCHESTRATOR_OFF':
         return '导演 agent 暂时没有运行'
+      case 'STUDIO_VOICE_CUSTOM_OFF':
+        return '自定义音色即将开放，现在可以用系统音色'
       case 'ANNOTATION_BUSY':
         return '这条批注正在执行或已经处理过了'
       case 'ANNOTATION_LIMIT':
