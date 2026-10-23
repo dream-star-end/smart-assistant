@@ -206,7 +206,7 @@ export function getLatestRunMetadata(db: TaskboardDb, ticketId: string): TicketR
   const columns = RUN_COLS.replace(/\boutput_md\b/, 'NULL AS output_md')
     .replace(/\bsummary\b/, 'NULL AS summary').replace(/\berror\b/, 'substr(error, 1, 160) AS error')
   const row = db.prepare(`SELECT ${columns} FROM tb_ticket_run
-    WHERE ticket_id = ? AND status <> 'skipped' ORDER BY created_at DESC, id DESC LIMIT 1`).get(ticketId) as RunRow | undefined
+    WHERE ticket_id = ? AND status <> 'skipped' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(ticketId) as RunRow | undefined
   return row ? mapRun(row) : null
 }
 
