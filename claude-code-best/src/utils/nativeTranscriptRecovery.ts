@@ -24,11 +24,13 @@ function canonical(value: unknown): string {
   return JSON.stringify(sort(value))
 }
 function parseFirst(source: string): { entry: Obj; raw: string } {
-  let depth = 0, inString = false, escape = false
+  let depth = 0
+  let inString = false
+  let escaped = false
   for (let i = 0; i < source.length; i++) {
     const c = source[i]
-    if (escape) { escape = false; continue }
-    if (inString) { if (c === '\\') escape = true; else if (c === '"') inString = false; continue }
+    if (escaped) { escaped = false; continue }
+    if (inString) { if (c === '\\') escaped = true; else if (c === '"') inString = false; continue }
     if (c === '"') inString = true
     else if (c === '{' || c === '[') depth++
     else if (c === '}' || c === ']') {
@@ -44,21 +46,22 @@ function readHead(source: string, start: number, byTool: Map<string, Obj>): Head
   const dataAt = source.indexOf('"data":"')
   if (messageAt < 0 || dataAt < messageAt) return undefined
   const headerRaw = source.slice(0, messageAt)
-  const header = object(JSON.parse(headerRaw.replace(/,$/, '') + '}'))
+  const header = object(JSON.parse(`${headerRaw.replace(/,$/, '')}}`))
   check(!['message', 'uuid', 'timestamp', 'toolUseResult', 'sourceToolAssistantUUID', 'sessionId'].some(key => Object.hasOwn(header, key)))
   if (header.type !== 'user' || header.isSidechain !== false || typeof header.parentUuid !== 'string') return undefined
   const prefix = source.slice(0, dataAt + '"data":'.length)
   const stack: string[] = []
-  let inString = false, escape = false
+  let inString = false
+  let escaped = false
   for (const c of prefix) {
-    if (escape) { escape = false; continue }
-    if (inString) { if (c === '\\') escape = true; else if (c === '"') inString = false; continue }
+    if (escaped) { escaped = false; continue }
+    if (inString) { if (c === '\\') escaped = true; else if (c === '"') inString = false; continue }
     if (c === '"') inString = true
     else if (c === '{' || c === '[') stack.push(c)
     else if (c === '}' || c === ']') { const open = stack.pop(); check((open === '{' && c === '}') || (open === '[' && c === ']')) }
   }
   check(!inString)
-  const stub = object(JSON.parse(prefix + 'null' + stack.reverse().map(c => c === '[' ? ']' : '}').join('')))
+  const stub = object(JSON.parse(`${prefix}null${stack.reverse().map(c => c === '[' ? ']' : '}').join('')}`))
   const message = object(stub.message)
   check(message.role === 'user' && Array.isArray(message.content) && message.content.length === 1)
   const block = object((message.content as unknown[])[0])
@@ -96,7 +99,9 @@ function singleImageData(message: unknown): string | undefined {
 /** Streaming preflight keeps only one JSONL row plus the parent index. */
 export async function transcriptNeedsRecovery(file: SessionReadHandle): Promise<boolean> {
   const { size } = await file.stat()
-  let position = 0, carry = Buffer.alloc(0), bad = false
+  let position = 0
+  let carry = Buffer.alloc(0)
+  let bad = false
   const nodes = new Map<string, { parent: unknown; sidechain: boolean; boundary: boolean }>()
   let liveSegment: Obj | undefined
   const line = (bytes: Buffer): void => {
@@ -130,7 +135,8 @@ export async function transcriptNeedsRecovery(file: SessionReadHandle): Promise<
     check(bytesRead > 0, 'CCB_TRANSCRIPT_SHORT_READ')
     position += bytesRead
     const bytes = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead)
-    let start = 0, at = bytes.indexOf(10)
+    let start = 0
+    let at = bytes.indexOf(10)
     while (at >= 0) { line(bytes.subarray(start, at)); start = at + 1; at = bytes.indexOf(10, start) }
     carry = bytes.subarray(start)
   }
@@ -150,11 +156,15 @@ export async function transcriptNeedsRecovery(file: SessionReadHandle): Promise<
 }
 
 export async function readNativeTranscriptArchive(socketPath: string, binding: CcbTranscriptRestoreBinding): Promise<CcbNativeTranscriptArchive> {
-  const parent = await lstat(dirname(socketPath)), socket = await lstat(socketPath)
+  const parent = await lstat(dirname(socketPath))
+  const socket = await lstat(socketPath)
   check(parent.isDirectory() && !parent.isSymbolicLink() && parent.uid === process.getuid?.() && (parent.mode & 0o777) === 0o700)
   check(socket.isSocket() && !socket.isSymbolicLink() && socket.uid === process.getuid?.() && (socket.mode & 0o777) === 0o600)
   const chunks: Buffer[] = []
-  let total = 0, count = 0, complete = false, carry = ''
+  let total = 0
+  let count = 0
+  let complete = false
+  let carry = ''
   await new Promise<void>((accept, reject) => {
     const req = request({ socketPath, path: '/restore', method: 'GET', timeout: 120000 }, res => {
       const rejectSafe = (): void => { req.destroy(); reject(new SessionFileIntegrityError('CCB_TRANSCRIPT_ARCHIVE_UNAVAILABLE')) }
@@ -197,7 +207,10 @@ export async function readNativeTranscriptArchive(socketPath: string, binding: C
 function provePartition(raw: Buffer, records: Candidate[]): { fragments: number; sha256: string } {
   check(records.length > 0 && records.length <= 4000 && records[0]!.start === 0)
   check(new Set(records.map(r => r.start)).size === records.length && records.reduce((n, r) => n + r.bytes.length, 0) === raw.length)
-  const cursor = new Int32Array(records.length), active: number[] = [], fragments: Fragment[] = [], failed = new Set<string>()
+  const cursor = new Int32Array(records.length)
+  const active: number[] = []
+  const fragments: Fragment[] = []
+  const failed = new Set<string>()
   const began = Date.now()
   let states = 0
   const visit = (offset: number, next: number, depth: number): boolean => {
@@ -206,12 +219,13 @@ function provePartition(raw: Buffer, records: Candidate[]): { fragments: number;
     if (next < records.length && records[next]!.start < offset) return false
     let forced = -1
     if (next < records.length && records[next]!.start === offset) { forced = next++; active.push(forced) }
-    const stateKey = offset + '|' + next + '|' + active.map(id => id + ':' + cursor[id]).join(',')
+    const stateKey = `${offset}|${next}|${active.map(id => `${id}:${cursor[id]}`).join(',')}`
     if (failed.has(stateKey)) { if (forced >= 0) active.pop(); return false }
     const cap = (next < records.length ? records[next]!.start : raw.length) - offset
     const choices: Array<{ id: number; length: number }> = []
     for (const id of forced >= 0 ? [forced] : active) {
-      const record = records[id]!, limit = Math.min(cap, record.bytes.length - cursor[id]!)
+      const record = records[id]!
+      const limit = Math.min(cap, record.bytes.length - cursor[id]!)
       let length = 0
       while (length < limit && raw[offset + length] === record.bytes[cursor[id]! + length]) length++
       if (length) choices.push({ id, length })
@@ -223,7 +237,9 @@ function provePartition(raw: Buffer, records: Candidate[]): { fragments: number;
         if (active.some(id => id !== choice.id && records[id]!.bytes[cursor[id]!] === raw[offset + cut])) lengths.push(cut)
       }
       for (const length of lengths) {
-        const id = choice.id, previous = cursor[id]!, activeAt = active.indexOf(id)
+        const id = choice.id
+        const previous = cursor[id]!
+        const activeAt = active.indexOf(id)
         cursor[id] = previous + length
         const completed = cursor[id] === records[id]!.bytes.length
         if (completed) active.splice(activeAt, 1)
@@ -258,15 +274,19 @@ export function recoverNativeTranscript(
   validateGraph: (entries: Obj[], authoritativeUuids: string[]) => void,
 ): { bytes: Buffer; sourceSha256: string; targetSha256: string; readCount: number; fragmentCount: number; fragmentManifestSha256: string; archiveSha256: string } {
   check(archive.version === 1 && canonical(archive.binding) === canonical(binding))
-  const sid = binding.nativeSessionId, text = raw.toString('utf8')
+  const sid = binding.nativeSessionId
+  const text = raw.toString('utf8')
   check(Buffer.from(text).equals(raw))
-  const byUuid = new Map<string, Obj>(), byTool = new Map<string, Obj>(), authority: string[] = []
+  const byUuid = new Map<string, Obj>()
+  const byTool = new Map<string, Obj>()
+  const authority: string[] = []
   for (let t = 0; t < archive.tapes.length; t++) {
     const tape = archive.tapes[t]!
     check(t === 0 || tape.anchorSeq > archive.tapes[t - 1]!.anchorSeq)
     check(tape.canonicalInput.sha256 === digest(tape.canonicalInput.modelText))
     for (let r = 0; r < tape.records.length; r++) {
-      const record = tape.records[r]!, native = object(record.payload)
+      const record = tape.records[r]!
+      const native = object(record.payload)
       check(record.sha256 === digest(JSON.stringify(native)) && (r === 0 || record.ordinal > tape.records[r - 1]!.ordinal))
       check(native.session_id === sid && native.parent_tool_use_id == null)
       // Other layouts keep their full native boundary in the archive, but
@@ -300,7 +320,9 @@ export function recoverNativeTranscript(
     }
   }
   check(byTool.size > 0)
-  const intact: Candidate[] = [], completeReads: Candidate[] = [], heads: Head[] = []
+  const intact: Candidate[] = []
+  const completeReads: Candidate[] = []
+  const heads: Head[] = []
   let lineByte = 0
   for (const line of text.split('\n')) {
     const lineBytes = Buffer.byteLength(line)
@@ -317,9 +339,11 @@ export function recoverNativeTranscript(
       const at = line.indexOf('{"parentUuid":', from)
       if (at < 0) break
       from = at + 1
-      const source = line.slice(at), start = lineByte + Buffer.byteLength(line.slice(0, at))
+      const source = line.slice(at)
+      const start = lineByte + Buffer.byteLength(line.slice(0, at))
       try {
-        const parsed = parseFirst(source), entry = parsed.entry
+        const parsed = parseFirst(source)
+        const entry = parsed.entry
         if (entry.sessionId === sid) {
           const end = start + Buffer.byteLength(parsed.raw)
           check(raw[end] === 10)
@@ -346,7 +370,9 @@ export function recoverNativeTranscript(
     })
   }
   const good = completeReads.filter(record => {
-    const entry = record.entry, block = readBlock(entry)!, native = byUuid.get(String(entry.uuid))
+    const entry = record.entry
+    const block = readBlock(entry)!
+    const native = byUuid.get(String(entry.uuid))
     return typeof block.tool_use_id === 'string' && ownsRead(entry, block.tool_use_id)
       && native && canonical(entry.message) === canonical(native.message)
       && canonical(entry.toolUseResult) === canonical(native.tool_use_result)
@@ -358,11 +384,14 @@ export function recoverNativeTranscript(
   const coveredTools = [...good.map(record => String(readBlock(record.entry)!.tool_use_id)), ...damagedHeads.map(head => head.toolId)]
   check(coveredTools.length === byTool.size && new Set(coveredTools).size === coveredTools.length)
   const templates = new Map<string, string[]>()
-  const templateKey = (path: string[], value: Obj): string => JSON.stringify(path) + '\0' + JSON.stringify(Object.keys(value).sort())
+  const templateKey = (path: string[], value: Obj): string => `${JSON.stringify(path)}\0${JSON.stringify(Object.keys(value).sort())}`
   const collect = (value: unknown, path: string[]): void => {
     if (Array.isArray(value)) { for (const item of value) collect(item, [...path, '[]']); return }
     if (value && typeof value === 'object') {
-      const v = value as Obj, key = templateKey(path, v), order = Object.keys(v), prior = templates.get(key)
+      const v = value as Obj
+      const key = templateKey(path, v)
+      const order = Object.keys(v)
+      const prior = templates.get(key)
       check(!prior || canonical(prior) === canonical(order))
       templates.set(key, order)
       for (const child of order) collect(v[child], [...path, child])
@@ -372,7 +401,8 @@ export function recoverNativeTranscript(
   const reorder = (value: unknown, path: string[]): unknown => {
     if (Array.isArray(value)) return value.map(v => reorder(v, [...path, '[]']))
     if (value && typeof value === 'object') {
-      const v = value as Obj, order = templates.get(templateKey(path, v))
+      const v = value as Obj
+      const order = templates.get(templateKey(path, v))
       check(order)
       return Object.fromEntries(order!.map(key => [key, reorder(v[key], [...path, key])]))
     }
@@ -381,13 +411,14 @@ export function recoverNativeTranscript(
   const records = [...intact, ...good]
   const uuidTimes = new Set<string>()
   for (const head of damagedHeads) {
-    const native = byTool.get(head.toolId)!, parent = localByUuid.get(head.header.parentUuid)
+    const native = byTool.get(head.toolId)!
+    const parent = localByUuid.get(head.header.parentUuid)
     check(parent?.type === 'assistant')
     const content = object(parent!.message).content
     check(Array.isArray(content) && content.some(block => {
       const b = object(block); return b.type === 'tool_use' && b.name === 'Read' && b.id === head.toolId
     }))
-    const mid = '"uuid":' + JSON.stringify(native.uuid) + ',"timestamp":'
+    const mid = `"uuid":${JSON.stringify(native.uuid)},"timestamp":`
     const middleAt = text.indexOf(mid)
     check(middleAt >= 0 && text.indexOf(mid, middleAt + 1) < 0)
     const time = /^("(?:[^"\\]|\\.)*"),"toolUseResult":/.exec(text.slice(middleAt + mid.length))
@@ -395,19 +426,22 @@ export function recoverNativeTranscript(
     const timestamp = JSON.parse(time![1]!) as unknown
     check(typeof timestamp === 'string' && Number.isFinite(Date.parse(timestamp)) && !uuidTimes.has(timestamp))
     uuidTimes.add(timestamp as string)
-    const foot = '"sourceToolAssistantUUID":' + JSON.stringify(head.header.parentUuid)
-    const footerAt = text.indexOf(foot), end = text.indexOf('\n', footerAt)
+    const foot = `"sourceToolAssistantUUID":${JSON.stringify(head.header.parentUuid)}`
+    const footerAt = text.indexOf(foot)
+    const end = text.indexOf('\n', footerAt)
     check(footerAt >= 0 && end >= 0 && text.indexOf(foot, footerAt + 1) < 0)
-    const footerRaw = text.slice(footerAt, end), footer = object(JSON.parse('{' + footerRaw))
+    const footerRaw = text.slice(footerAt, end)
+    const footer = object(JSON.parse(`{${footerRaw}`))
     check(!['parentUuid', 'isSidechain', 'promptId', 'type', 'message', 'uuid', 'timestamp', 'toolUseResult'].some(key => Object.hasOwn(footer, key)))
     check(footer.sessionId === sid && footer.sourceToolAssistantUUID === head.header.parentUuid)
-    const message = reorder(native.message, ['message']), result = reorder(native.tool_use_result, ['toolUseResult'])
+    const message = reorder(native.message, ['message'])
+    const result = reorder(native.tool_use_result, ['toolUseResult'])
     check(canonical(message) === canonical(native.message) && canonical(result) === canonical(native.tool_use_result))
-    const body = head.headerRaw + '"message":' + JSON.stringify(message) + ',' + mid + time![1] + ',"toolUseResult":' + JSON.stringify(result) + ',' + footerRaw
+    const body = `${head.headerRaw}"message":${JSON.stringify(message)},${mid}${time![1]},"toolUseResult":${JSON.stringify(result)},${footerRaw}`
     const entry = object(JSON.parse(body))
     check(entry.type === 'user' && entry.uuid === native.uuid && entry.parentUuid === head.header.parentUuid
       && canonical(entry.message) === canonical(message) && canonical(entry.toolUseResult) === canonical(result))
-    records.push({ kind: 'read', start: head.start, bytes: Buffer.from(body + '\n'), entry })
+    records.push({ kind: 'read', start: head.start, bytes: Buffer.from(`${body}\n`), entry })
   }
   records.sort((a, b) => a.start - b.start)
   check(records.every(record => record.bytes[record.bytes.length - 1] === 10))
@@ -418,7 +452,8 @@ export function recoverNativeTranscript(
   for (const record of graph) {
     const native = byUuid.get(String(record.entry.uuid))
     if (native) {
-      const localMessage = object(record.entry.message), nativeMessage = object(native.message)
+      const localMessage = object(record.entry.message)
+      const nativeMessage = object(native.message)
       check(record.entry.type === native.type && localMessage.role === nativeMessage.role)
       if (native.type === 'assistant') check(localMessage.id === nativeMessage.id)
       check(canonical(localMessage.content) === canonical(nativeMessage.content))
@@ -444,10 +479,12 @@ export function recoverNativeTranscript(
     const content = object(entry.message).content
     return Array.isArray(content) && content.some(block => block && typeof block === 'object' && !Array.isArray(block) && (block as Obj).type === 'tool_result')
   }
-  let previousInput = -1, previousNative = -1
+  let previousInput = -1
+  let previousNative = -1
   const seenInput = new Map<string, { index: number; digest: string }>()
   for (let t = 0; t < archive.tapes.length; t++) {
-    const tape = archive.tapes[t]!, needle = tape.canonicalInput.modelText
+    const tape = archive.tapes[t]!
+    const needle = tape.canonicalInput.modelText
     check(needle.length > 0)
     const known = seenInput.get(tape.canonicalInput.id)
     if (known) { check(known.digest === tape.canonicalInput.sha256); continue }

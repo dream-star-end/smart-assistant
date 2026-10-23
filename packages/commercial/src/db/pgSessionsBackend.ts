@@ -3056,7 +3056,7 @@ export async function readCcbNativeRestoreArchive(
 ): Promise<CcbNativeTranscriptArchive> {
   const fail = (): never => { throw new Error('CCB_TRANSCRIPT_ARCHIVE_INCOMPLETE'); };
   const seed = await pool.query<{ messages: unknown }>(
-    `SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+    "SELECT messages FROM client_sessions WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL",
     [binding.peerId, owner],
   );
   if (seed.rows.length !== 1) return fail();
@@ -3138,12 +3138,11 @@ export async function readCcbNativeRestoreArchive(
     if (replaced.has(header.tape_id) || header.materialization_status !== 'complete') continue;
     // Small SELECT per turn bounds the raw expansion to a single tape.
     const rows = await pool.query<HydratedTapeRow>(
-      `SELECT r.tape_id,t.tape_sha256,r.msg_id,r.ordinal,r.role,r.content_sha256,r.payload,
-              NULL::text AS waive_reason,false AS waiver_applied,'0'::text AS cost_credits,NULL::jsonb AS delegate_costs
-         FROM client_session_turn_tape_records r JOIN client_session_turn_tapes t
-           ON t.tape_id=r.tape_id AND t.session_id=r.session_id AND t.user_id=r.user_id
-        WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3
-        ORDER BY r.ordinal`, [binding.peerId, owner, header.tape_id]);
+      "SELECT r.tape_id,t.tape_sha256,r.msg_id,r.ordinal,r.role,r.content_sha256,r.payload, "
+      + "NULL::text AS waive_reason,false AS waiver_applied,'0'::text AS cost_credits,NULL::jsonb AS delegate_costs "
+      + "FROM client_session_turn_tape_records r JOIN client_session_turn_tapes t "
+      + "ON t.tape_id=r.tape_id AND t.session_id=r.session_id AND t.user_id=r.user_id "
+      + "WHERE r.session_id=$1 AND r.user_id=$2 AND r.tape_id=$3 ORDER BY r.ordinal", [binding.peerId, owner, header.tape_id]);
     if (rows.rows.length !== header.physical_count || header.physical_count < 1
       || rows.rows.reduce((n, row) => n + row.payload.length, 0) !== Number(header.payload_bytes)) return fail();
     const anchor = anchors.get(header.tape_id);

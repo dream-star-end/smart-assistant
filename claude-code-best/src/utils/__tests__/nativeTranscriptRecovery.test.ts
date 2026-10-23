@@ -21,7 +21,9 @@ function fixture(extraRoot = false): { raw: Buffer; archive: CcbNativeTranscript
   const graph: any[] = [input]
   const native: any[] = []
   for (let i = 0; i < 3; i++) {
-    const assistantId = uuid(10 + i), readId = uuid(20 + i), toolId = `read-${i}`
+    const assistantId = uuid(10 + i)
+    const readId = uuid(20 + i)
+    const toolId = `read-${i}`
     const assistant = { parentUuid: i ? uuid(19 + i) : uuid(1), isSidechain: false, type: 'assistant', message: { id: `msg-${i}`, role: 'assistant', model: 'fixture', content: [{ type: 'thinking', thinking: `original thought ${i}`, signature: `opaque-signature-${i}` }, { type: 'tool_use', id: toolId, name: 'Read', input: { file_path: `/synthetic/${i}.png` } }] }, uuid: assistantId, timestamp: time(1 + i * 2), userType: 'external', cwd: '/synthetic', sessionId: sid, version: 'fixture' }
     // data precedes media_type, matching FileReadTool's actual serializer.
     const message = { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolId, content: [{ type: 'image', source: { type: 'base64', data: png, media_type: 'image/png' } }] }] }
@@ -31,11 +33,12 @@ function fixture(extraRoot = false): { raw: Buffer; archive: CcbNativeTranscript
     native.push({ type: 'assistant', session_id: sid, parent_tool_use_id: null, uuid: assistantId, message: assistant.message })
     native.push({ type: 'user', session_id: sid, parent_tool_use_id: null, uuid: readId, message, tool_use_result: toolUseResult })
   }
-  const rows = graph.map(v => JSON.stringify(v) + '\n')
-  const a = rows[4]!, b = rows[6]!
+  const rows = graph.map(v => `${JSON.stringify(v)}\n`)
+  const a = rows[4]!
+  const b = rows[6]!
   const cutA = a.indexOf('"data":"') + '"data":"'.length + 23
   const cutB = b.indexOf('"data":"') + '"data":"'.length + 37
-  const raw = Buffer.from(rows[0]! + rows[1]! + rows[2]! + JSON.stringify(metadata) + '\n' + rows[3]! + a.slice(0, cutA) + rows[5]! + b.slice(0, cutB) + a.slice(cutA) + b.slice(cutB))
+  const raw = Buffer.from(`${rows[0]! + rows[1]! + rows[2]! + JSON.stringify(metadata)}\n${rows[3]!}${a.slice(0, cutA)}${rows[5]!}${b.slice(0, cutB)}${a.slice(cutA)}${b.slice(cutB)}`)
   const records = native.map((payload, ordinal) => {
     const reordered = reverseKeys(payload) as Record<string, unknown>
     return { ordinal, payload: reordered, sha256: sha(reordered) }
@@ -64,7 +67,8 @@ describe('lossless native transcript recovery', () => {
     expect(sha(raw.toString())).toBe(originalSha)
   })
   test('an unknown root field is retained in the original rather than silently discarded', () => {
-    const { raw, archive } = fixture(true), original = Buffer.from(raw)
+    const { raw, archive } = fixture(true)
+    const original = Buffer.from(raw)
     expect(() => recoverNativeTranscript(raw, binding, archive, () => {})).toThrow()
     expect(raw.equals(original)).toBe(true)
   })
@@ -91,10 +95,11 @@ describe('lossless native transcript recovery', () => {
 })
 
 function replaceRow(raw: Buffer, original: unknown, replacement: unknown[]): Buffer {
-  const text = raw.toString(), needle = JSON.stringify(original) + '\n'
+  const text = raw.toString()
+  const needle = `${JSON.stringify(original)}\n`
   const at = text.indexOf(needle)
   if (at < 0 || text.indexOf(needle, at + 1) >= 0) throw Error('FIXTURE_ROW_NOT_UNIQUE')
-  return Buffer.from(text.slice(0, at) + replacement.map(row => JSON.stringify(row) + '\n').join('') + text.slice(at + needle.length))
+  return Buffer.from(text.slice(0, at) + replacement.map(row => `${JSON.stringify(row)}\n`).join('') + text.slice(at + needle.length))
 }
 function nativeRecord(entry: any, ordinal: number): any {
   const payload = reverseKeys({ type: entry.type, session_id: sid, parent_tool_use_id: null, uuid: entry.uuid,
@@ -107,7 +112,8 @@ function ordinary(n: number, parent: string | null, type: 'user' | 'assistant', 
 }
 for (const toolName of ['Bash', 'mcp__fixture__image']) {
   test(`an intact ${toolName} result remains byte-exact alongside interleaved image Reads`, () => {
-    const f = fixture(), before = clone(f.expected[3])
+    const f = fixture()
+    const before = clone(f.expected[3])
     const assistant = ordinary(40, uuid(20), 'assistant', '', 2)
     assistant.message.content = [{ type: 'tool_use', id: 'other-tool', name: toolName, input: {} }]
     const result = ordinary(41, uuid(40), 'user', '', 2)
@@ -125,26 +131,28 @@ for (const toolName of ['Bash', 'mcp__fixture__image']) {
     f.archive.tapes[0]!.records.forEach((record, ordinal) => { record.ordinal = ordinal })
     f.archive.tapes[0]!.logicalRecordCount = f.archive.tapes[0]!.records.length
     const restored = recoverNativeTranscript(raw, binding, f.archive, entries => { expect(entries).toEqual(expected) })
-    expect(restored.bytes.toString().includes(JSON.stringify(result) + '\n')).toBe(true)
+    expect(restored.bytes.toString().includes(`${JSON.stringify(result)}\n`)).toBe(true)
   })
 }
 
 test('all complete metadata and future footer fields are kept without projection', () => {
-  const f = fixture(), metadata = { ...f.metadata, type: 'custom-title', customTitle: 'synthetic title', futureMetadata: { retained: true } }
+  const f = fixture()
+  const metadata = { ...f.metadata, type: 'custom-title', customTitle: 'synthetic title', futureMetadata: { retained: true } }
   let raw = replaceRow(f.raw, f.metadata, [metadata])
-  const read = f.expected[2], extended = { ...read, futureFooter: { retained: ['complete', 'original'] } }
+  const read = f.expected[2]
+  const extended = { ...read, futureFooter: { retained: ['complete', 'original'] } }
   raw = replaceRow(raw, read, [extended])
   const restored = recoverNativeTranscript(raw, binding, f.archive, () => {})
   const text = restored.bytes.toString()
-  expect(text.includes(JSON.stringify(metadata) + '\n')).toBe(true)
-  expect(text.includes(JSON.stringify(extended) + '\n')).toBe(true)
+  expect(text.includes(`${JSON.stringify(metadata)}\n`)).toBe(true)
+  expect(text.includes(`${JSON.stringify(extended)}\n`)).toBe(true)
 })
 
 test('repeated canonical user text is covered in native turn order without dropping either prompt', () => {
   const f = fixture()
   const user = ordinary(60, uuid(22), 'user', 'synthetic-only-user-input-607', 8)
   const assistant = ordinary(61, uuid(60), 'assistant', 'second turn result', 9)
-  const raw = Buffer.concat([f.raw, Buffer.from(JSON.stringify(user) + '\n' + JSON.stringify(assistant) + '\n')])
+  const raw = Buffer.concat([f.raw, Buffer.from(`${JSON.stringify(user)}\n${JSON.stringify(assistant)}\n`)])
   f.archive.tapes.push({ tapeId: 'second-tape', tapeSha256: sha('second-tape'), anchorSeq: 2,
     physicalRecordCount: 1, logicalRecordCount: 1,
     canonicalInput: { id: uuid(60), modelText: 'synthetic-only-user-input-607', sha256: sha('synthetic-only-user-input-607') },
@@ -155,17 +163,19 @@ test('repeated canonical user text is covered in native turn order without dropp
 
 for (const flip of ['type', 'message.role']) {
   test(`a native assistant ${flip} change cannot be accepted as the original model context`, () => {
-    const f = fixture(), local = ordinary(70, uuid(22), 'assistant', 'final assistant', 7)
+    const f = fixture()
+    const local = ordinary(70, uuid(22), 'assistant', 'final assistant', 7)
     f.archive.tapes[0]!.records.push(nativeRecord(local, 6))
     f.archive.tapes[0]!.logicalRecordCount++
     if (flip === 'type') local.type = 'user'; else local.message.role = 'user'
-    const raw = Buffer.concat([f.raw, Buffer.from(JSON.stringify(local) + '\n')])
+    const raw = Buffer.concat([f.raw, Buffer.from(`${JSON.stringify(local)}\n`)])
     expect(() => recoverNativeTranscript(raw, binding, f.archive, () => {})).toThrow()
   })
 }
 
 test('legitimate local usage and stop_reason changes preserve the whole local assistant', () => {
-  const f = fixture(), original = clone(f.expected[1])
+  const f = fixture()
+  const original = clone(f.expected[1])
   const local = { ...original, message: { ...original.message, usage: { input_tokens: 123, output_tokens: 45 }, stop_reason: 'tool_use' } }
   const raw = replaceRow(f.raw, original, [local])
   recoverNativeTranscript(raw, binding, f.archive, entries => {
@@ -176,9 +186,10 @@ test('legitimate local usage and stop_reason changes preserve the whole local as
 
 for (const cyclic of [false, true]) {
   test(`a complete non-native ${cyclic ? 'cycle is rejected' : 'dead branch is retained'}`, () => {
-    const f = fixture(), first = ordinary(80, cyclic ? uuid(81) : null, 'user', 'extra local branch', -2)
+    const f = fixture()
+    const first = ordinary(80, cyclic ? uuid(81) : null, 'user', 'extra local branch', -2)
     const second = ordinary(81, uuid(80), 'assistant', 'extra local result', -1)
-    let raw = Buffer.concat([f.raw, Buffer.from(JSON.stringify(first) + '\n' + JSON.stringify(second) + '\n')])
+    let raw = Buffer.concat([f.raw, Buffer.from(`${JSON.stringify(first)}\n${JSON.stringify(second)}\n`)])
     if (cyclic) {
       const input = clone(f.expected[0]); input.parentUuid = uuid(80)
       raw = replaceRow(raw, f.expected[0], [input])
@@ -194,29 +205,36 @@ for (const cyclic of [false, true]) {
 
 test('the managed loader automatically restores once, keeps every hard link, and persists a private byte receipt', async () => {
   const { mkdtemp, mkdir, writeFile, link, stat, readFile, readdir, rm, chmod } = await import('node:fs/promises')
-  const { tmpdir } = await import('node:os'), { join } = await import('node:path')
-  const { createServer } = await import('node:http'), { once } = await import('node:events')
-  const storage = await import('../sessionStorage.js'), io = await import('../sessionFileIo.js')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createServer } = await import('node:http')
+  const { once } = await import('node:events')
+  const storage = await import('../sessionStorage.js')
+  const io = await import('../sessionFileIo.js')
   const directory = await mkdtemp(join(tmpdir(), 'g607-auto-restore-'))
   const keys = ['CLAUDE_CONFIG_DIR', 'OPENCLAUDE_TRANSCRIPT_INTEGRITY', 'OPENCLAUDE_TRANSCRIPT_RECOVERY_SOCKET', 'OPENCLAUDE_TRANSCRIPT_RECOVERY_PEER', 'OPENCLAUDE_TRANSCRIPT_RECOVERY_AGENT']
   const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
-  const f = fixture(), archiveBytes = Buffer.from(JSON.stringify(f.archive)), socketPath = join(directory, 'restore.sock')
+  const f = fixture()
+  const archiveBytes = Buffer.from(JSON.stringify(f.archive))
+  const socketPath = join(directory, 'restore.sock')
   let calls = 0
   let frameMode: 'missing-end' | 'bad-sha' | 'good' = 'missing-end'
   const server = createServer((_req, res) => {
     calls++
     res.setHeader('content-type', 'application/x-ndjson')
     let chunks = 0
-    for (let offset = 0; offset < archiveBytes.length; offset += 4096) res.write(JSON.stringify({ index: chunks++, data: archiveBytes.subarray(offset, offset + 4096).toString('base64') }) + '\n')
+    for (let offset = 0; offset < archiveBytes.length; offset += 4096) res.write(`${JSON.stringify({ index: chunks++, data: archiveBytes.subarray(offset, offset + 4096).toString('base64') })}\n`)
     if (frameMode === 'missing-end') res.end()
-    else res.end(JSON.stringify({ complete: true, chunks, bytes: archiveBytes.length, sha256: frameMode === 'bad-sha' ? '0'.repeat(64) : createHash('sha256').update(archiveBytes).digest('hex') }) + '\n')
+    else res.end(`${JSON.stringify({ complete: true, chunks, bytes: archiveBytes.length, sha256: frameMode === 'bad-sha' ? '0'.repeat(64) : createHash('sha256').update(archiveBytes).digest('hex') })}\n`)
   })
   server.listen(socketPath); await once(server, 'listening'); await chmod(socketPath, 0o600)
   try {
     process.env.CLAUDE_CONFIG_DIR = directory; process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY = '1'
     process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_SOCKET = socketPath
     process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_PEER = binding.peerId; process.env.OPENCLAUDE_TRANSCRIPT_RECOVERY_AGENT = binding.agentId
-    const projects = join(directory, 'projects'), file = join(projects, 'cwd-a', `${sid}.jsonl`), alias = join(projects, 'cwd-b', `${sid}.jsonl`)
+    const projects = join(directory, 'projects')
+    const file = join(projects, 'cwd-a', `${sid}.jsonl`)
+    const alias = join(projects, 'cwd-b', `${sid}.jsonl`)
     await mkdir(join(projects, 'cwd-a'), { recursive: true, mode: 0o700 }); await mkdir(join(projects, 'cwd-b'), { mode: 0o700 })
     await writeFile(file, f.raw, { mode: 0o600 }); await link(file, alias)
     const inode = (await stat(file)).ino
@@ -236,7 +254,8 @@ test('the managed loader automatically restores once, keeps every hard link, and
     const restored = await readFile(file)
     expect(restored.length).toBe(f.raw.length)
     expect(restored.toString().trim().split('\n').map(row => JSON.parse(row)).filter(row => row.type !== 'queue-operation')).toEqual(f.expected)
-    const dirs = await readdir(join(projects, '.oc-transcript-integrity')), tx = join(projects, '.oc-transcript-integrity', dirs[0]!)
+    const dirs = await readdir(join(projects, '.oc-transcript-integrity'))
+    const tx = join(projects, '.oc-transcript-integrity', dirs[0]!)
     const receipt = JSON.parse(await readFile(join(tx, 'restore-receipt.json'), 'utf8'))
     expect(receipt.sourceSha256).toBe(createHash('sha256').update(f.raw).digest('hex'))
     expect(receipt.targetSha256).toBe(createHash('sha256').update(restored).digest('hex'))
@@ -246,7 +265,7 @@ test('the managed loader automatically restores once, keeps every hard link, and
     await storage.loadTranscriptFile(file)
     expect(calls).toBe(3)
     const next = ordinary(95, uuid(22), 'user', 'continue after automatic recovery', 10)
-    await io.appendSessionFile(alias, JSON.stringify(next) + '\n', { projectsDir: projects, sessionId: sid, requireKernelLock: true })
+    await io.appendSessionFile(alias, `${JSON.stringify(next)}\n`, { projectsDir: projects, sessionId: sid, requireKernelLock: true })
     const continued = await storage.loadTranscriptFile(file)
     expect(continued.messages.get(uuid(95) as any)).toEqual(next)
     expect(calls).toBe(3)
@@ -260,7 +279,7 @@ test('the managed loader automatically restores once, keeps every hard link, and
 
 test('invalid UTF-8 inside otherwise valid JSON enters recovery instead of silently changing model text', async () => {
   const { transcriptNeedsRecovery } = await import('../nativeTranscriptRecovery.js')
-  const valid = Buffer.from(JSON.stringify(ordinary(100, null, 'user', 'synthetic-original-text', 1)) + '\n')
+  const valid = Buffer.from(`${JSON.stringify(ordinary(100, null, 'user', 'synthetic-original-text', 1))}\n`)
   const invalid = Buffer.from(valid); invalid[invalid.indexOf(Buffer.from('original'))] = 0xff
   const handle = (bytes: Buffer): any => ({ stat: async () => ({ size: bytes.length }), read: async (target: Buffer, offset: number, length: number, position: number) => {
     const count = Math.min(length, bytes.length - position); bytes.copy(target, offset, position, position + count); return { bytesRead: count, buffer: target }
