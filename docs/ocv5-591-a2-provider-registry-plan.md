@@ -54,6 +54,7 @@ export interface MediaRequest {            // 各 op 的入参是判别联合，
 export interface MediaRunContext {
   userId: bigint
   execRequestId: string                    // studio:<task id>，重领不变（A1 方案 §3）
+  maxCostCredits: bigint                   // 本任务已原子预留的积分（A1 §4），适配器据此标记 overReservation
   signal: AbortSignal
   readInput(sha: string): Promise<Buffer>  // 只能读本人有引用的 blob（StudioBlobStore.open）
 }
@@ -109,17 +110,19 @@ interface ProviderRegistry {
   list(): MediaProvider[]
   get(id: string): MediaProvider | undefined
   candidates(kind: MediaKind, op: MediaOp, user: { id: string; role?: string },
-             opts?: { prefer?: string; exclude?: string[] }): MediaProvider[]  // 只返回 ready 的，按 priority
+             opts?: { prefer?: string; exclude?: string[]; includeOffline?: boolean }): MediaProvider[]
+             // 默认只返回 ready；includeOffline=true 时再追加 offline 的（plan r1 P1-2），见下
   describe(user): ProvidersView        // 给 HTTP 用的脱敏视图（§6）
 }
 ```
 
 - 构建时**永不抛错**：未知适配器类型、字段不合法、重复 id、key 读不了，都只 `warn` 一行（不含 key 内容）并把该条目标为 `disabled` / `unconfigured`；工作台其余能力照常可用。
-- `candidates()` 的顺序：`prefer` 指定的实例排第一（若 ready），其余按 `priority` 升序，再按 id 字典序，结果稳定可测。
+- `candidates()` 的顺序：`prefer` 指定的实例排第一，其余按 `priority` 升序，再按 id 字典序，结果稳定可测。
+- **可立即执行 vs 可排队（plan r1 P1-2）**：`offline` 只表示“本进程此刻不能执行”（例如本 slot 的 Muse bridge 不在线，另一个 slot 可能在线）。编排器派发任务时调用 `candidates(..., {includeOffline: true})`：先列全部 `ready`，再列 `offline`（各自按上面的顺序）。选中 `offline` 实例时照常入队，任务带上 `affinity()`（`muse`），由 A1 的亲和认领（只有 bridge 在线的 slot 认领）和 `affinity_deadline` 故障转移收敛；`unconfigured` / `disabled` 永远不会成为候选。默认调用（不带 `includeOffline`）只给“现在就能跑”的实例，供同步场景使用。
 - 四类能力都会出现在视图里，即使一个实例都没有（音乐默认就是这种情况）：该类状态为 `unconfigured`、reason `NO_PROVIDER`。
 
 ## 4. 配置
-- 新增 `OC_STUDIO_PROVIDERS`（可选，JSON 数组，长度 ≤ 32），在 `config.ts` 里用 zod 做外层校验（必须是数组、每项有 `id`/`adapter`），每项的具体字段由对应适配器的 `optionsSchema` 校验：
+- 新增 `OC_STUDIO_PROVIDERS`（可选，JSON 数组，长度 ≤ 32）。**`config.ts` 里只声明为不带任何约束的可选字符串（plan r1 P1-3）**：现有 `loadConfig()` 对 schema 失败直接抛 `ConfigError` 并阻断商业模块启动，所以 JSON 解析、数组/长度检查、每项字段校验全部放在注册表的 `parseProviderConfig()` 里做，失败只 warn 并降级（整串不是合法 JSON 数组 → 没有任何实例；单项不合法 → 只停用该项）。`OC_STUDIO_ENABLED` 关闭时注册表根本不构建，这个变量写成什么都不影响启动。每项的具体字段由对应适配器的 `optionsSchema` 校验：
 
 ```json
 [
@@ -147,7 +150,11 @@ interface ProviderRegistry {
 | `minimax-speech` | voice: tts（声明 design、clone 能力位） | OCV5-589 `synthesizeSpeech`，requestId = `voice:tts:<execRequestId>` | 沿用 minimax 媒体账本按字数比例计费；design/clone 本 PR 不接入 run（返回 `UNSUPPORTED_OP`），保留给后续 |
 
 - 适配器目录 `adapters/index.ts` 导出 `BUILTIN_ADAPTERS: AdapterFactory[]`。新增供应商的步骤写进本文 §8 和代码注释。
-- 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限（GPT 按 `IMAGE2_UNIT_COST × n`，Muse 按 `OC_MUSE_PRICE_*`，TTS 按 `calculateMiniMaxSpeechCost` 对本地字数的结果）。
+- 每个适配器的 `estimateMaxCost()` 用该 provider 现有定价函数取上限：GPT 按 `IMAGE2_UNIT_COST × n`（固定价），Muse 按 `OC_MUSE_PRICE_*`（按 job 固定价）。
+- **TTS 的上限（plan r1 P1-1）**：`synthesizeSpeech` 按上游返回的 `usage_characters` 结算，本地字数只是报价，不是上限。处理：
+  1. 预留按 `calculateMiniMaxSpeechCost({usageCharacters: 2 × 码点数 + 16})`：MiniMax 规则是汉字记 2、其余记 1（10-23 实测 14 字中文 → 上游 26，本地计数 26），所以 2 × 码点数覆盖全部字符都按最重的规则计，+16 兜住上游可能追加的停顿/标记字符；
+  2. 适配器在 `run()` 前确认 `estimateMaxCost(req) ≤ 调用方传入的预留额`，并把预留额作为 `ctx.maxCostCredits` 传入；结算后若实际扣费超过 `ctx.maxCostCredits`（上游计数规则变化等极端情况），结果带 `overReservation: true`，A2-1 必须在同一事务里把超出部分计入 spent 并把项目转为 `paused`（预算类 `needs_user`），不再派发新任务。单次超出量最多一句台词（≤ 500 字），不会连续突破；
+  3. 单测覆盖：英文 50 字符、上游 `usage_characters=51` → 预留足够；人为构造上游 `usage_characters` 超过预留 → `overReservation: true`。
 - 输出统一成 `MediaOutput[]`，由调用方（A2-1）写入 `StudioBlobStore`；适配器不碰工作台存储。
 
 ## 6. HTTP：`GET /api/studio/providers`
@@ -174,7 +181,9 @@ interface ProviderRegistry {
   - 默认配置：四类都出现；音乐 `unconfigured/NO_PROVIDER`；无 MiniMax key → 语音 `unconfigured/MISSING_KEY`；`OC_IMAGE2_ENABLED` 关 → `disabled/FEATURE_OFF`；bridge 离线 → `offline`。
   - `OC_STUDIO_PROVIDERS`：未知适配器、非法 id、重复 id、未知型号、`apiKey` 字面量 → 只 warn 不抛、该项不可用；`enabled:false`；`priority` 与 `prefer` 排序；`exclude`。
   - key 文件不可读 → `unconfigured/KEY_UNREADABLE`；**`describe()` 和全部 warn 文本里都不出现 key 内容和路径**（用哨兵字符串断言）。
-  - 适配器：gpt-image 透传 requestId、把 `IMAGE_DAILY_LIMIT` 映射为不可重试；muse 的 jobId 由 execRequestId 确定性导出且重领一致、失败 outcome 的 retryable 透传；minimax-speech 的 requestId 命名空间、design/clone 返回 `UNSUPPORTED_OP`；全部用注入的 fetch / 假 hub，不访问真实上游。
+  - `candidates()`：默认只给 ready；`includeOffline` 时 ready 在前、offline 在后；unconfigured/disabled 永不出现。
+- `OC_STUDIO_PROVIDERS` 写成非 JSON、非数组、超长、缺 adapter：`loadConfig()` 不抛错，注册表只 warn。
+- 适配器：gpt-image 透传 requestId、把 `IMAGE_DAILY_LIMIT` 映射为不可重试；muse 的 jobId 由 execRequestId 确定性导出且重领一致、失败 outcome 的 retryable 透传；minimax-speech 的 requestId 命名空间、design/clone 返回 `UNSUPPORTED_OP`；全部用注入的 fetch / 假 hub，不访问真实上游。
 - `studioHttp.test.ts` 增加 `/providers`：开关关 404、白名单外 404、正常返回结构。
 - 不新增 integ（没有 SQL 变化）。
 
