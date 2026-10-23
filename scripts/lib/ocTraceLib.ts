@@ -247,6 +247,17 @@ export function timeline(events: TraceEvent[]): TraceEvent[] {
   )
 }
 
+/** Client ids are caller-controlled: only the original unresolved input may match that field. */
+export function isRelatedLogEvent(
+  event: TraceEvent,
+  ids: Set<string>,
+  clientInput?: string,
+): boolean {
+  return Object.entries(event.ids).some(([key, id]) =>
+    key === 'clientTraceId' ? id === clientInput : key !== 'sessionKey' && ids.has(id),
+  )
+}
+
 /** The earliest event carrying an error code, else the earliest error-level event. */
 export function firstError(events: TraceEvent[]): TraceEvent | undefined {
   const t = timeline(events)
