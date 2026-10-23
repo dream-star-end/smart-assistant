@@ -29,6 +29,7 @@ import { getHostById as computePoolGetHostById } from '../compute-pool/queries.j
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
 import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
+import { dispatchStudioRoute } from '../media-studio/http.js'
 import { MUSE_BRIDGE_PREFIX } from '../muse/protocol.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
@@ -746,6 +747,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
     { method: ANY_METHOD, pathPrefix: MUSE_BRIDGE_PREFIX, handler: dispatchMuseBridgeRoute },
+    // OCV5-591 media studio (404 unless OC_STUDIO_ENABLED=1 and the user is allowed).
+    { method: ANY_METHOD, pathPrefix: '/api/studio/', handler: dispatchStudioRoute },
     // Session GoalState. Method/action semantics are centralized in the
     // dispatcher; ownership is rechecked against client_sessions in PG.
     {
@@ -1594,6 +1597,8 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/media-generation',
     // OCV5-561 Muse bridge; 404 unless OC_MUSE_BRIDGE_ENABLED=1.
     MUSE_BRIDGE_PREFIX,
+    // OCV5-591 media studio browser API.
+    '/api/studio/',
     // 会话目标(GoalState)REST 面。2026-07-17 事故:PR#76 只登了 routes 数组漏了
     // 本清单 → goal 全部 REST 404(GET 被前端当"无目标"吞,PUT 炸出 not found)。
     // 两处同步铁律由 routeOwnership.test.ts 契约测试锁死。

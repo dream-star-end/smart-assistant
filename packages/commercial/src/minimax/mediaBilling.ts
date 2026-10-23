@@ -1,32 +1,32 @@
-import type { Pool } from "pg";
+import type { Pool } from 'pg'
 
-import { spendTwoBucket } from "../billing/spend.js";
-import { resolveOrgBillingContext } from "../org/orgBilling.js";
-import type { MiniMaxMediaCostResult } from "./mediaPricing.js";
+import { spendTwoBucket } from '../billing/spend.js'
+import { resolveOrgBillingContext } from '../org/orgBilling.js'
+import type { MiniMaxMediaCostResult } from './mediaPricing.js'
 
 export interface MiniMaxMediaSettleInput {
-  userId: bigint;
-  containerId: bigint | null;
-  requestId: string;
-  cost: MiniMaxMediaCostResult;
-  upstreamTraceId?: string | null;
-  upstreamTaskId?: string | null;
-  upstreamFileId?: string | null;
-  outputMeta?: Record<string, unknown>;
+  userId: bigint
+  containerId: bigint | null
+  requestId: string
+  cost: MiniMaxMediaCostResult
+  upstreamTraceId?: string | null
+  upstreamTaskId?: string | null
+  upstreamFileId?: string | null
+  outputMeta?: Record<string, unknown>
 }
 
 export interface MiniMaxMediaSettleResult {
-  usageId: bigint;
-  ledgerId: bigint | null;
-  costCredits: bigint;
-  debitedCredits: bigint | null;
-  balanceAfter: bigint | null;
-  clamped: boolean;
-  replayed: boolean;
+  usageId: bigint
+  ledgerId: bigint | null
+  costCredits: bigint
+  debitedCredits: bigint | null
+  balanceAfter: bigint | null
+  clamped: boolean
+  replayed: boolean
 }
 
 function isUniqueViolation(err: unknown): boolean {
-  return Boolean(err && typeof err === "object" && (err as { code?: unknown }).code === "23505");
+  return Boolean(err && typeof err === 'object' && (err as { code?: unknown }).code === '23505')
 }
 
 /**
@@ -41,19 +41,19 @@ export async function settleMiniMaxMediaSuccess(
   pool: Pool,
   input: MiniMaxMediaSettleInput,
 ): Promise<MiniMaxMediaSettleResult> {
-  const client = await pool.connect();
+  const client = await pool.connect()
   try {
-    await client.query("BEGIN");
+    await client.query('BEGIN')
     // org 归属解析(0112 企业版):billing_enabled=true 的成员 → org 钱包为第 0 优先桶。
     // minimax_media_usage_records 无 org_id 列(0112 未加),org 归属经 credit_ledger.org_id
     // (org_wallet 流水)表达 —— §5 报表按 usage_records 聚合用量 / credit_ledger 聚合流水,
     // 媒体用量不进 /api/org/usage,故媒体侧无需 usage 表打戳。
-    const orgCtx = await resolveOrgBillingContext(client, input.userId);
-    let usageId: bigint;
-    let ledgerId: bigint | null = null;
-    let clamped = false;
-    let balanceAfter: bigint | null = null;
-    let debitedCredits: bigint | null = null;
+    const orgCtx = await resolveOrgBillingContext(client, input.userId)
+    let usageId: bigint
+    let ledgerId: bigint | null = null
+    let clamped = false
+    let balanceAfter: bigint | null = null
+    let debitedCredits: bigint | null = null
 
     try {
       const ins = await client.query<{ id: string }>(
@@ -81,24 +81,24 @@ export async function settleMiniMaxMediaSuccess(
           input.upstreamFileId ?? null,
           JSON.stringify(input.outputMeta ?? {}),
         ],
-      );
-      usageId = BigInt(ins.rows[0]!.id);
+      )
+      usageId = BigInt(ins.rows[0]!.id)
     } catch (err) {
       if (isUniqueViolation(err)) {
-        await client.query("ROLLBACK");
+        await client.query('ROLLBACK')
         const sel = await pool.query<{
-          id: string;
-          ledger_id: string | null;
-          cost_credits: string;
+          id: string
+          ledger_id: string | null
+          cost_credits: string
         }>(
           `SELECT id::text AS id, ledger_id::text AS ledger_id,
                   cost_credits::text AS cost_credits
              FROM minimax_media_usage_records
             WHERE user_id=$1 AND request_id=$2`,
           [input.userId.toString(), input.requestId],
-        );
-        if (sel.rowCount === 0) throw err;
-        const row = sel.rows[0]!;
+        )
+        if (sel.rowCount === 0) throw err
+        const row = sel.rows[0]!
         return {
           usageId: BigInt(row.id),
           ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
@@ -107,9 +107,9 @@ export async function settleMiniMaxMediaSuccess(
           balanceAfter: null,
           clamped: false,
           replayed: true,
-        };
+        }
       }
-      throw err;
+      throw err
     }
 
     if (input.cost.costCredits > 0n) {
@@ -117,26 +117,26 @@ export async function settleMiniMaxMediaSuccess(
       const spend = await spendTwoBucket(client, {
         userId: input.userId,
         amount: input.cost.costCredits,
-        reason: "minimax_media",
-        ref: { type: "minimax_media_usage_record", id: usageId.toString() },
+        reason: 'minimax_media',
+        ref: { type: 'minimax_media_usage_record', id: usageId.toString() },
         memo: `cost=${input.cost.costCredits}`,
         orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
         // 成员月度 org 预算(§17.4):随 orgId 一并传入,org 桶超限静默落个人桶。
         monthlyOrgBudget: orgCtx && orgCtx.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
-      });
-      clamped = spend.clamped;
-      balanceAfter = spend.totalAfter;
-      debitedCredits = spend.debited;
-      ledgerId = spend.primaryLedgerId;
+      })
+      clamped = spend.clamped
+      balanceAfter = spend.totalAfter
+      debitedCredits = spend.debited
+      ledgerId = spend.primaryLedgerId
       if (ledgerId !== null) {
-        await client.query(
-          "UPDATE minimax_media_usage_records SET ledger_id=$1 WHERE id=$2",
-          [ledgerId.toString(), usageId.toString()],
-        );
+        await client.query('UPDATE minimax_media_usage_records SET ledger_id=$1 WHERE id=$2', [
+          ledgerId.toString(),
+          usageId.toString(),
+        ])
       }
     }
 
-    await client.query("COMMIT");
+    await client.query('COMMIT')
     return {
       usageId,
       ledgerId,
@@ -145,15 +145,28 @@ export async function settleMiniMaxMediaSuccess(
       balanceAfter,
       clamped,
       replayed: false,
-    };
+    }
   } catch (err) {
     try {
-      await client.query("ROLLBACK");
+      await client.query('ROLLBACK')
     } catch {
       /* ignore */
     }
-    throw err;
+    throw err
   } finally {
-    client.release();
+    client.release()
   }
+}
+
+/**
+ * What a settled usage row actually debited: the sum of its ledger rows across buckets (a clamped
+ * settle debits less than cost_credits; a replay's settle result carries no debit). OCV5-591 A2-0.
+ */
+export async function miniMaxDebitedCredits(pool: Pool, usageId: bigint): Promise<bigint> {
+  const r = await pool.query<{ debited: string }>(
+    `SELECT COALESCE(-SUM(delta), 0)::text AS debited FROM credit_ledger
+      WHERE ref_type = 'minimax_media_usage_record' AND ref_id = $1`,
+    [usageId.toString()],
+  )
+  return BigInt(r.rows[0]?.debited ?? '0')
 }

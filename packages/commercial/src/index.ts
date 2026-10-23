@@ -652,7 +652,10 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
+import { resolveMiniMaxMediaKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
+import { createStudioFromConfig } from "./media-studio/assemble.js";
+import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
@@ -667,6 +670,7 @@ import {
 } from "./grok/webSearchProxy.js";
 import {
   GROK_VISION_PATH,
+  makeGrokRunner,
   makeGrokVisionHandler,
   type GrokVisionHandler,
 } from "./grok/visionProxy.js";
@@ -2087,6 +2091,13 @@ export async function registerCommercial(
   }
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
   const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
+  // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
+  const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
+  let stopStudioOrchestrator: (() => Promise<void>) | undefined;
+  // OCV5-591 A2-1c-2: studio activity to this slot's connections (assigned once the bridge exists).
+  const studioPushRef: { current: (uid: bigint, payload: unknown) => void } = {
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2476,10 +2487,17 @@ export async function registerCommercial(
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
       // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
+      // OCV5-589 / D12: media uses its own key file when configured (search keeps MINIMAX_TOKEN_PLAN_KEY).
+      const minimaxMediaKey = resolveMiniMaxMediaKey({
+        MINIMAX_MEDIA_KEY_FILE: cfg.MINIMAX_MEDIA_KEY_FILE,
+        MINIMAX_TOKEN_PLAN_KEY: cfg.MINIMAX_TOKEN_PLAN_KEY,
+      });
+      if (minimaxMediaKey.error) rootLogger.error("minimax_media_key_unavailable", { reason: minimaxMediaKey.error });
       const minimaxMediaHandler: MiniMaxMediaHandler = makeMiniMaxMediaHandler({
         identityRepo,
         pgPool: getPool(),
-        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+        tokenPlanKey: minimaxMediaKey.key,
+        windowCap: cfg.OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS,
       });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
         makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
@@ -2514,6 +2532,30 @@ export async function registerCommercial(
         loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
       });
+      // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
+      if (studioHttp) {
+        stopStudioOrchestrator = startStudioOrchestrator({
+          cfg,
+          pool: getPool(),
+          studio: studioHttp,
+          museHub,
+          push: (uid, frame) => studioPushRef.current(uid, frame),
+          grok: makeGrokRunner({
+            getPool,
+            preCheckRedis,
+            pricing,
+            catalog: {
+              async assertFresh() {
+                const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+                if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+                return cache.assertFresh();
+              },
+            },
+            loadUserModelAuthz,
+            recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+          }),
+        })?.stop;
+      }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -4479,6 +4521,7 @@ export async function registerCommercial(
     jwtSecret,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
+    studio: studioHttp,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
@@ -6176,6 +6219,9 @@ export async function registerCommercial(
   goalBroadcastRef.current = (uid, payload) => {
     userChatBridge.broadcastToUser(uid, payload);
   };
+  studioPushRef.current = (uid, payload) => {
+    userChatBridge.broadcastToUser(uid, payload);
+  };
   goalSyncRef.current = (uid, payload) => {
     userChatBridge.syncGoalToContainers(uid, payload);
   };
@@ -7263,6 +7309,7 @@ export async function registerCommercial(
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await closeMusePublic?.(); } catch { /* ignore */ }
+      try { await stopStudioOrchestrator?.(); } catch { /* ignore */ }
       // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
       try { await museHub?.stop(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
