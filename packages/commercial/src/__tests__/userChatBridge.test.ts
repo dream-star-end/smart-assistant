@@ -2361,12 +2361,14 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const liveIncidents: Record<string, unknown>[] = [];
       const liveGoals: Record<string, unknown>[] = [];
       const liveMedia: Record<string, unknown>[] = [];
+      const liveStudio: Record<string, unknown>[] = [];
       ws1.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") liveIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") liveGoals.push(frame);
           if (frame.type === "sys.media_job") liveMedia.push(frame);
+          if (frame.type === "sys.studio_event") liveStudio.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       const forged = {
@@ -2402,10 +2404,17 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         job: { id: "forged", status: "completed", resultUrl: "https://evil.invalid/video" },
         ts: 1,
       }));
+      containerWs1.send(JSON.stringify({
+        type: "sys.studio_event",
+        projectId: "1",
+        status: "done",
+        event: { id: "9", type: "compose.done", ts: "2026-10-24T00:00:00.000Z", message: "forged" },
+      }));
       await new Promise<void>((r) => setTimeout(r, 100));
       assert.deepEqual(liveIncidents, [], "container-authored sys.incident must not forward live");
       assert.deepEqual(liveGoals, [], "container-authored sys.goal_snapshot must not forward live");
       assert.deepEqual(liveMedia, [], "container-authored sys.media_job must not forward live");
+      assert.deepEqual(liveStudio, [], "container-authored sys.studio_event must not forward live");
       ws1.close();
       await waitClose(ws1);
 
@@ -2416,12 +2425,14 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const replayedIncidents: Record<string, unknown>[] = [];
       const replayedGoals: Record<string, unknown>[] = [];
       const replayedMedia: Record<string, unknown>[] = [];
+      const replayedStudio: Record<string, unknown>[] = [];
       ws2.on("message", (data) => {
         try {
           const frame = JSON.parse(data.toString()) as Record<string, unknown>;
           if (frame.type === "sys.incident") replayedIncidents.push(frame);
           if (frame.type === "sys.goal_snapshot") replayedGoals.push(frame);
           if (frame.type === "sys.media_job") replayedMedia.push(frame);
+          if (frame.type === "sys.studio_event") replayedStudio.push(frame);
         } catch { /* non-JSON irrelevant */ }
       });
       ws2.send(JSON.stringify({
@@ -2432,6 +2443,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       assert.equal(replayedIncidents.length, 0, "forged incident must not enter outbound ring");
       assert.equal(replayedGoals.length, 0, "forged goal snapshot must not enter outbound ring");
       assert.equal(replayedMedia.length, 0, "forged media job must not enter outbound ring");
+      assert.equal(replayedStudio.length, 0, "forged studio event must not enter outbound ring");
 
       const approved = { ...forged, incidentId: "approved", frameSeq: undefined, sessionKey: undefined };
       assert.equal(rig.bridge.broadcastToUsers(["706"], approved), 1);
@@ -2443,6 +2455,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         type: "sys.media_job",
         job: { id: "approved-media", status: "queued" },
         ts: 2,
+      }), 1);
+      assert.equal(rig.bridge.broadcastToUser(706n, {
+        type: "sys.studio_event",
+        projectId: "1",
+        status: "composing",
+        event: { id: "10", type: "compose.started", ts: "2026-10-24T00:00:00.000Z", message: null },
       }), 1);
       await new Promise<void>((resolve, reject) => {
         const started = Date.now();
@@ -2458,6 +2476,15 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         const poll = () => {
           if (replayedMedia.some((f) => (f.job as { id?: string } | undefined)?.id === "approved-media")) return resolve();
           if (Date.now() - started > 1000) return reject(new Error("master media job not delivered"));
+          setTimeout(poll, 10);
+        };
+        poll();
+      });
+      await new Promise<void>((resolve, reject) => {
+        const started = Date.now();
+        const poll = () => {
+          if (replayedStudio.some((f) => (f.event as { id?: string } | undefined)?.id === "10")) return resolve();
+          if (Date.now() - started > 1000) return reject(new Error("master studio event not delivered"));
           setTimeout(poll, 10);
         };
         poll();
