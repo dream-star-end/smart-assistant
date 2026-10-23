@@ -4435,11 +4435,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ensureDispatchHeartbeat();
         }
       }
-      // Pre-admitted cron/prompt lanes bypass browser admission; project their DB identity here.
-      // Keep the session guard: clientMessageId alone may belong to another session.
-      // This only enriches the current trace, without changing admission/billing/lease keys.
+      // Cron's pretracked record was projected at canonical registration, before preflight.
       if (
-        !persistUserRow &&
+        !persistUserRow && pretrackedEnrichment === undefined &&
         admittedThisFrame !== null &&
         traceId !== null &&
         admittedThisFrame.record.sessionId === peerId
@@ -4714,6 +4712,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // committed after finalCleanup, tracking synchronously claims the
               // row for strict admitted-only terminalization.
               admittedThisFrame = trackEnrichmentDispatch(admittedRecord);
+              // MIN1:受理成功后回填 turn_traces 的纯展示列(fire-and-forget,不动主链)。
+              if (traceId !== null) {
+                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
+                  traceId,
+                  dispatchId: d.dispatchId,
+                  requestId: d.billingRequestId,
+                  identity: admittedTraceIdentity(d),
+                });
+              }
               if (!isEnriching(admittedThisFrame)) {
                 admittedThisFrame = null;
                 return null;
@@ -4758,15 +4765,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
               // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
               ensureDispatchHeartbeat();
-              // MIN1:受理成功后回填 turn_traces 的纯展示列(fire-and-forget,不动主链)。
-              if (traceId !== null) {
-                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
-                  traceId,
-                  dispatchId: d.dispatchId,
-                  requestId: d.billingRequestId,
-                  identity: admittedTraceIdentity(d),
-                });
-              }
               break; // 继续 enrichment / forward
             }
             case "deduplicated": {
@@ -6166,6 +6164,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   clientBuild: clientBuildForConnection,
                 },
               );
+              // Cron is already admitted; project even if preflight later rejects or closes.
+              const cronTraceDispatch = isCronOriginDispatch ? pretrackedEnrichment?.record : undefined;
+              if (cronTraceDispatch !== undefined && cronTraceDispatch.sessionId === peerIdRaw &&
+                cronTraceDispatch.clientMessageId === (parsed as { clientMessageId?: unknown }).clientMessageId) {
+                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLogForFrame?.warn(msg, fields), {
+                  traceId: turnTraceIdForFrame, dispatchId: cronTraceDispatch.dispatchId,
+                  requestId: cronTraceDispatch.billingRequestId, identity: admittedTraceIdentity(cronTraceDispatch),
+                });
+                if (deps.pgPool) {
+                  const dispatchId = cronTraceDispatch.dispatchId;
+                  void backfillDispatchTraceId(deps.pgPool, { dispatchId, traceId: turnTraceIdForFrame }).catch((err) => {
+                    turnLogForFrame?.warn("user-chat-bridge: dispatch trace backfill failed", { dispatchId, err });
+                  });
+                }
+              }
               if (typeof peerIdRaw === "string" && peerIdRaw !== "") {
                 responseMilestoneTracker.begin({
                   traceId: turnTraceIdForFrame,

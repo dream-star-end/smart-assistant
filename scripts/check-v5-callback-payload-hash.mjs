@@ -26,6 +26,8 @@ const admittedExpected = [
   'OCV5-613 browser explicit butler',
   'OCV5-613 browser takeover preserves stored worker',
   'OCV5-613 cron-origin uses stored admitted identity without rewriting its frame',
+  'OCV5-613 cron preflight rejection retains stored admitted identity without forwarding',
+  'OCV5-613 late admitted closure retains stored identity without forwarding',
   'OCV5-613 rejected admission keeps its early trace and never invents admitted identity',
 ];
 const admittedTitle = 'OCV5-613 deploy proof: canonical trace uses admitted identity';

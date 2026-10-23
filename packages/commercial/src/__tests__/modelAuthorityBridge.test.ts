@@ -1309,6 +1309,120 @@ describe("OCV5-613 canonical identity follows the admitted dispatch", () => {
     }
   });
 
+  test("OCV5-613 cron preflight rejection retains stored admitted identity without forwarding", { timeout: 15_000 }, async () => {
+    const admissions: AdmitUserTurnInput[] = [];
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        if (/SELECT model_id FROM client_sessions/.test(sql)) return { rows: [{ model_id: "glm-5.2" }], rowCount: 1 };
+        if (/(INSERT INTO|UPDATE) turn_traces|UPDATE turn_dispatches|SELECT status FROM users|FROM github_session_workspaces|FROM turn_control_requests|FROM turn_recovery_jobs/.test(sql)) return { rows: [], rowCount: 1 };
+        throw new Error(`unexpected 613 rejected-preflight query: ${sql}`);
+      },
+    };
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, fenceFails: true, pgPool,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("fixture did not admit");
+        admitted.dispatch.agentId = "worker";
+        admitted.takeover = true;
+        return admitted;
+      },
+    });
+    let client: WebSocket | undefined;
+    let injection: ReturnType<UserChatBridgeHandler["injectCronOriginTurn"]> | undefined;
+    try {
+      client = await openClient(rig.port);
+      const frames = frameCollector(client);
+      await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+      injection = rig.bridge.injectCronOriginTurn({
+        uid: BigInt(UID), sessionId: "sess-613-cron-fenced", clientMessageId: "dlgcb-613-fenced",
+        agentId: "main", text: "613 rejected preflight projection proof",
+      });
+      assert.equal((await frames.next()).code, "MODEL_AUTHORITY_UNAVAILABLE");
+      assert.equal(admissions.length, 1);
+      assert.equal(admissions[0]!.agentId, "main");
+      const insert = queries.find((write) => /INSERT INTO turn_traces/.test(write.sql));
+      assert.ok(insert);
+      const links = queries.filter((write) => /SET dispatch_id = COALESCE/.test(write.sql));
+      assert.equal(links.length, 1, "healthy PG must project a pre-admitted turn before preflight rejection");
+      assert.deepEqual(links[0]!.params, [
+        insert.params[0], admissions[0]!.dispatchId, admissions[0]!.billingRequestId,
+        "worker", "agent:worker:webchat:dm:sess-613-cron-fenced",
+      ]);
+      assert.equal(rig.containerSeen.some((raw) => {
+        const frame = JSON.parse(raw);
+        return frame.type === "inbound.message" && frame.clientMessageId === "dlgcb-613-fenced";
+      }), false);
+      assert.deepEqual(rig.deferredPoolErrors, []);
+    } finally {
+      client?.terminate();
+      await stopRig(rig);
+      await injection;
+    }
+  });
+
+  test("OCV5-613 late admitted closure retains stored identity without forwarding", { timeout: 15_000 }, async () => {
+    const queries: Array<{ sql: string; params: unknown[] }> = [];
+    const pgPool = {
+      query: async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    const admissions: AdmitUserTurnInput[] = [];
+    let releaseAdmit: () => void = () => {};
+    const admitGate = new Promise<void>((resolve) => { releaseAdmit = resolve; });
+    const rig = await startRig({
+      attest: "yes", durableDispatch: true, pgPool,
+      admitUserTurn: async (input) => {
+        admissions.push(input);
+        await admitGate;
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("fixture did not admit");
+        admitted.dispatch.agentId = "worker";
+        admitted.takeover = true;
+        return admitted;
+      },
+    });
+    let client: WebSocket | undefined;
+    try {
+      client = await openClient(rig.port);
+      client.send(inboundFrame({ clientMessageId: "cm-613-closed", peer: { id: "sess-613-closed", kind: "dm" } }));
+      await waitFor(() => admissions.length === 1);
+      for (const container of rig.containerWss.clients) container.close(1011, "613 isolated close");
+      await waitFor(() => client!.readyState === WebSocket.CLOSED);
+      releaseAdmit();
+      await waitFor(() => queries.some((q) => q.params[2] === "bridge_closed_during_admission"));
+      assert.equal(admissions.length, 1);
+      const admission = admissions[0]!;
+      assert.equal(admission.agentId, "main");
+      const terminal = queries.filter((q) => /status = 'terminal'/.test(q.sql));
+      assert.equal(terminal.length, 1);
+      assert.equal(terminal[0]!.params[0], admission.dispatchId);
+      assert.equal(terminal[0]!.params[1], "executed_error");
+      assert.equal(terminal[0]!.params[2], "bridge_closed_during_admission");
+      const insert = queries.find((q) => /INSERT INTO turn_traces/.test(q.sql));
+      assert.ok(insert);
+      const links = queries.filter((q) => /SET dispatch_id = COALESCE/.test(q.sql));
+      assert.equal(links.length, 1, "healthy PG must project an admitted failure even when cleanup won the race");
+      assert.deepEqual(links[0]!.params, [
+        insert.params[0], admission.dispatchId, admission.billingRequestId,
+        "worker", "agent:worker:webchat:dm:sess-613-closed",
+      ]);
+      assert.equal(rig.containerSeen.some((raw) => {
+        const frame = JSON.parse(raw);
+        return frame.type === "inbound.message" && frame.clientMessageId === "cm-613-closed";
+      }), false, "closed bridge still never forwards the admitted turn");
+    } finally {
+      releaseAdmit();
+      client?.terminate();
+      await stopRig(rig);
+    }
+  });
+
   test("OCV5-613 rejected admission keeps its early trace and never invents admitted identity", { timeout: 15_000 }, async () => {
     let admissions = 0;
     const rig = await startRig({
