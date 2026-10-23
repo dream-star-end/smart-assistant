@@ -496,7 +496,7 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       [
         'args=()',
         'while (($#)); do case "$1" in',
-        '  --config|--s3-chunk-size|--max-transfer|--cutoff-mode) shift 2 ;;',
+        '  --config|--s3-chunk-size|--max-transfer|--cutoff-mode|-o) shift 2 ;;',
         '  -R|--files-only) shift ;;',
         '  *) args+=("$1"); shift ;;',
         'esac; done',
@@ -522,6 +522,7 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
         '\' "$B" "$key" ;;',
         '  deletefile) [[ -f "$B/$key" ]] || exit 4; rm -f -- "$B/$key" ;;',
         '  rcat) t="$STUB_DIR/rcat.$$"; cat > "$t" || exit 1; mkdir -p "$(dirname "$B/$key")"; mv "$t" "$B/$key" ;;',
+        '  backend) [[ "${args[1]}" == cleanup ]] || exit 2 ;;',
         '  *) exit 2 ;;',
         'esac',
       ].join('\n'),
@@ -585,6 +586,24 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       assert.deepEqual(objects('full'), [])
       assert.deepEqual(objects('core'), ['core-20261022T194000Z.dump.gpg'])
       assert.equal(existsSync(path.join(dir, 'state/r2.json')), false)
+      // the killed upload's parts are aborted right away, and were before it started (Codex r1 P1)
+      const log = rcloneLog()
+      const put = log.findIndex((l) => l.startsWith('rcat'))
+      const cleanups = log.flatMap((l, i) => (l.startsWith('backend cleanup') ? [i] : []))
+      assert.ok(cleanups.some((i) => i < put) && cleanups.some((i) => i > put), log.join('\n'))
+    })
+
+    test('a failing multipart cleanup stops every command before it writes', () => {
+      writeFileSync(path.join(dir, 'rclone_fail'), 'backend')
+      putObject('pg/full/full-20261018T131000Z.dump.gpg', 3000)
+      assert.equal(runR2(['precheck']).status, 1)
+      assert.equal(runR2(['full', 'full-20261025T131000Z.dump'], {}, 'a').status, 1)
+      assert.deepEqual(objects('full'), ['full-20261018T131000Z.dump.gpg'])
+      mkdirSync(path.join(dir, 'backups'))
+      const f = path.join(dir, 'backups/core-20261023T194000Z.dump')
+      writeFileSync(f, 'PGDMP-core')
+      assert.equal(runR2(['core', f]).status, 1)
+      assert.deepEqual(objects('core'), [])
     })
 
     test('a bucket total above the warning line after the upload exits 5', () => {
@@ -619,6 +638,18 @@ describe('off-host copies on R2 (V5SB_OFFSITE)', () => {
       const r = runR2(['precheck'])
       assert.equal(r.status, 3, r.out)
       assert.match(r.out, /precheck SKIP estimate=10080 > room=10000/)
+    })
+
+    test('real sizes do not overflow the estimate (Codex r1 P1)', () => {
+      // 8e9 x 24e9 does not fit 64-bit shell arithmetic
+      writeState(8_000_000_000, 20_000_000_000)
+      writeFileSync(path.join(dir, 'dbsize'), '24000000000')
+      const r = runR2(['precheck'], {
+        V5SB_R2_CAP_BYTES: '9500000000',
+        V5SB_R2_WARN_BYTES: '9000000000',
+      })
+      assert.equal(r.status, 3, r.out)
+      assert.match(r.out, /precheck SKIP estimate=10080000000 > room=9500000000/)
     })
 
     test('the old full copy does not count against the room (it is deleted first)', () => {

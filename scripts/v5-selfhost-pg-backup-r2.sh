@@ -16,6 +16,10 @@
 #         growth and skips when it would not fit. While uploading, a byte counter
 #         kills rclone before the object completes once it would pass the cap, and
 #         --max-transfer with a hard cutoff backs the counter up.
+#   Unfinished multipart uploads take space but are not listed as objects, so
+#   every command first aborts them (`rclone backend cleanup`, only this host
+#   writes the bucket and the backup lock serialises runs) and fails closed when
+#   that does not work; a killed or failed upload is cleaned up again at once.
 #   core  Upload, then keep the newest V5SB_R2_CORE_KEEP copies.
 # After every write a bucket total above V5SB_R2_WARN_BYTES (9e9) exits 5, so the
 # unit fails and alerts. First answer: raise V5SB_FULL_COMPRESS; if that is not
@@ -65,6 +69,13 @@ as_pg() {
 }
 
 rc() { "$RCLONE" --config "$RCLONE_CONF" "$@"; }
+
+# Abort every unfinished multipart upload in the bucket (their parts count
+# against the account but not in lsjson). max-age=1s: anything already pending
+# when a command starts is left over from an earlier killed or failed upload.
+abort_multipart() {
+  rc backend cleanup "$REMOTE" -o max-age=1s
+}
 
 encrypt() {
   GNUPGHOME="$GPG_HOME" "$GPG" --batch --quiet --no-tty --trust-model always \
@@ -152,7 +163,8 @@ estimate_full() { # <current db bytes>
   if [[ -z "$st" ]]; then echo "$FULL_EST_BYTES"; return; fi
   read -r b d c <<<"$st"
   if [[ "$c" != "$FULL_COMPRESS" ]]; then echo 0; return; fi
-  echo $(( b * $1 / d * 105 / 100 ))
+  # bytes x database bytes overflows 64-bit shell arithmetic at GB scale (Codex r1 P1).
+  python3 -c 'import sys; b, d, cur = map(int, sys.argv[1:]); print(b * cur * 105 // (d * 100))' "$b" "$d" "$1"
 }
 
 warn_check() { # after a write: exit 5 when the bucket total passed the warning line
@@ -169,13 +181,15 @@ warn_check() { # after a write: exit 5 when the bucket total passed the warning 
 
 cmd_precheck() {
   local inv others limit cur est
+  abort_multipart || { log "precheck: cannot abort unfinished uploads"; return 1; }
   inv=$(inventory) || { log "precheck: cannot list bucket"; return 1; }
   # The old full copies are deleted before the upload, so they do not count.
   others=$(( $(jget "$inv" total) - $(jget "$inv" fullBytes) ))
   limit=$(( CAP_BYTES - others ))
   cur=$(db_bytes) || { log "precheck: cannot read database size"; return 1; }
   [[ "$cur" =~ ^[0-9]+$ ]] || { log "precheck: bad database size: $cur"; return 1; }
-  est=$(estimate_full "$cur")
+  est=$(estimate_full "$cur") || { log "precheck: estimate failed"; return 1; }
+  [[ "$est" =~ ^[0-9]+$ ]] || { log "precheck: bad estimate: $est"; return 1; }
   if (( est > limit )); then
     log "precheck SKIP estimate=$est > room=$limit (cap $CAP_BYTES, other objects $others): raise V5SB_FULL_COMPRESS (now $FULL_COMPRESS)"
     return 3
@@ -189,6 +203,7 @@ cmd_full() {
   [[ "$name" =~ $FULL_RE ]] || die_usage "full: bad name: $name"
   cur=$(db_bytes) || { log "full: cannot read database size"; return 1; }
   [[ "$cur" =~ ^[0-9]+$ ]] || { log "full: bad database size: $cur"; return 1; }
+  abort_multipart || { log "full: cannot abort unfinished uploads"; return 1; }
   inv=$(inventory) || { log "full: cannot list bucket"; return 1; }
   # Delete old first: two full copies never fit next to each other.
   while IFS= read -r f; do
@@ -237,6 +252,10 @@ sys.exit(rc)
   rrc=$?
   set -e
   crc=${st[1]}
+  if (( crc != 0 || rrc != 0 || st[0] != 0 )); then
+    # the killed or failed upload leaves parts behind
+    abort_multipart || log "full: cleanup of unfinished uploads failed"
+  fi
   if (( crc == 3 )); then
     rc deletefile "$dest" 2>/dev/null || true
     log "full ABORT over cap: stream passed room=$limit; raise V5SB_FULL_COMPRESS (now $FULL_COMPRESS)"
@@ -273,6 +292,7 @@ cmd_core() {
   base=${file##*/}
   [[ "$base" =~ $CORE_RE && -f "$file" && ! -L "$file" ]] || die_usage "core: bad file: $file"
   size=$(stat -c %s -- "$file")
+  abort_multipart || { log "core: cannot abort unfinished uploads"; return 1; }
   inv=$(inventory) || { log "core: cannot list bucket"; return 1; }
   total=$(jget "$inv" total)
   # gpg adds a few hundred bytes; 1 % covers it.
@@ -287,6 +307,7 @@ cmd_core() {
   set -e
   if (( st[0] != 0 || st[1] != 0 )); then
     rc deletefile "$dest" 2>/dev/null || true
+    abort_multipart || log "core: cleanup of unfinished uploads failed"
     log "core FAILED gpg=${st[0]} rclone=${st[1]}"
     return 1
   fi
@@ -318,7 +339,7 @@ done
 case "$cmd" in
   usage) inventory; exit $? ;;
   precheck|full|core|discard-full) ;;
-  -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
   *) die_usage "usage: $0 precheck | full <name> | core <file> | discard-full <name> | usage" ;;
 esac
 [[ -n "$RECIPIENT" ]] || die_usage "V5SB_R2_GPG_RECIPIENT is not set"
