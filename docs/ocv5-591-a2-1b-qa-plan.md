@@ -9,7 +9,7 @@
 ### 1.1 什么时候质检
 - 镜头首帧（shot_frame）、镜头视频（shot_video）、设定图（bible 的 image 资产）生成成功后，**不再直接采用**，改为入队一个 `qa` 任务（payload `{takeId, target: 'frame' | 'clip' | 'bible'}`，幂等键 `qa:<takeId>`），镜头进入 `qa` 状态（设定图保持未锁定）。
 - 质检通过才采用：首帧通过后才派发视频；视频通过后镜头 `ready`（成为 active take）；设定图通过后锁定。
-- 质检关闭（`OC_STUDIO_QA=off`，或 Grok 未配置）→ 保持现在的行为（直接采用），take 的 `qa` 写 `{skipped: true, reason}`，事件 `qa.skipped` 说明原因。默认：Grok 已配置即开启。
+- 质检关闭（`OC_STUDIO_QA=off`，或 Grok 未配置）→ 保持现在的行为（直接采用），take 的 `qa` 写 `{skipped: true, reason}`，事件 `qa.skipped` 说明原因；此时没有画面审核，成片的 `qa.moderation` 为 `review`（成片页显示「待人工复核」），需求审核按 §1.6 的严格规则。默认：Grok 已配置即开启。
 - 用户手动选版本（`/takes/:id/select`）不经过质检；批注触发的重做（§2）照常质检。
 
 ### 1.2 质检输入：一张联系表
@@ -20,13 +20,16 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
 - 每格角上标编号（`F1…F4`、`R1…R3`），提示词里说明各编号是什么。联系表不落盘、不入 blob（只用于这一次调用），避免占用户配额。
 
 ### 1.3 评分与判定
-- 提示词要求**严格 JSON**：`{character, scene, action, artifacts, confidence, summary, issues: [{frame?, what}]}`。前四项和 `confidence` 都在 0–1；`summary` ≤ 200 字（中文，给用户看）。用 zod 校验，格式不对重问一次（同一请求 id 的下一次 attempt），仍不对 → 按「低置信度」处理。
-- 前端已经按这些字段显示（Review 页 `QA_ROWS`、`take.qa.score`），所以 take 的 `qa` 写：`{score, character, scene, action, artifacts, confidence, summary, issues, passed, model, attempt}`；`score` = 四项的最小值。
-- 通过：character ≥ 0.75、scene ≥ 0.7、action ≥ 0.7、artifacts ≥ 0.8，且 confidence ≥ 0.6。设定图只看 character（或 scene，按资产类型）和 artifacts。
+- 提示词要求**严格 JSON**：`{character, scene, action, artifacts, moderation, confidence, summary, issues: [{frame?, what}]}`。前四项和 `confidence` 都在 0–1；`moderation ∈ 'pass' | 'review' | 'block'`（画面内容审核：成人、血腥暴力、仇恨、真人冒用等，D7）；`summary` ≤ 200 字（中文，给用户看）。用 zod 校验，格式不对重问一次（同一请求 id 的下一次 attempt），仍不对 → 按「低置信度」处理。
+- 前端已经按这些字段显示（Review 页 `QA_ROWS`、`take.qa.score`、成片页 `moderation`），所以 take 的 `qa` 写：`{score, character, scene, action, artifacts, moderation, confidence, summary, issues, passed, model, attempt}`；`score` = 四项的最小值。
+- 通过：`moderation = 'pass'`，character ≥ 0.75、scene ≥ 0.7、action ≥ 0.7、artifacts ≥ 0.8，且 confidence ≥ 0.6。设定图只看 moderation、character（或 scene，按资产类型）和 artifacts。
+- **审核阻断**（plan r1 P1）：`moderation = 'block'` → 这一版不采用、**不自动重做**，镜头（或设定图）`needs_user`，项目 `awaiting_user`，事件写原因（用户可改需求 / 批注后重做）；`'review'` → 同样交给用户，不采用。成片的 `qa.moderation` = 所有采用镜头的审核结果都为 `pass` 时 `pass`，否则 `review`（A2-1c 的成片 QA 补这一项）。
 - 不通过 → 自动重做（同 owner 的新 take，`gen` 任务照常预留和扣费），提示词追加质检的 `issues` 作为「避免」项，换 seed；每个 owner 最多自动重做 **2 次**。
-- 交给用户（`needs_user`，镜头状态 `needs_user`，项目 `awaiting_user`）：
-  - 重做 2 次后分数仍没有超过之前最好的一次；
+- 交给用户（`needs_user`，镜头状态 `needs_user`，项目 `awaiting_user`）——满足任一条就交，镜头一定会离开 `qa`（plan r1 P1）：
+  - **达到重做上限**：第 3 次（原始 + 2 次重做）仍不通过，不论分数是否在提升；
+  - 提前停止：某次重做的分数没有超过之前最好的一次（不再浪费第二次重做）；
   - confidence < 0.6（含两次都解析失败）；
+  - 审核 `block` / `review`（见上）；
   - Grok 调用不可重试地失败（且没有备选）。
   事件写 `summary`，并给出最好的 2 个候选 take id，用户在 Review 页选版本或写批注。
 
@@ -43,7 +46,11 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
 - 设定图出 2 个候选择优（后端方案 §3）：**本 PR 不做**。每个设定图会多花一次图片生成（50 积分），默认改成 1 个候选 + 质检 + 不通过自动重做；以后如需要，作为可选项另做。
 
 ### 1.6 需求审核（D7，平台承担）
-- `start` 时在 Plan 之前加一步文字审核（Grok，`billTo: 'platform'`）：明显违规（成人、暴力血腥、仇恨、真人冒用等）→ 项目 `failed`，事件写原因；不确定 → 通过（视觉质检的 `moderation` 项再把关）。结果存 `studio_step_results`，重领不重复调用。
+- `start` 时在 Plan 之前加一步文字审核（Grok，`billTo: 'platform'`），输出 `{verdict: 'pass' | 'uncertain' | 'block', reason}`：
+  - `block` → 项目 `failed`，事件写原因；
+  - `uncertain` → 视觉质检开启时通过（每一版画面都会经过 §1.3 的 `moderation` 判定，`block` / `review` 不会被采用）；**视觉质检关闭时按 `block` 处理**（没有后续把关，plan r1 P1），事件说明“需求可能不合规，请修改后再开始”；
+  - Grok 不可用 → 视觉质检开启时通过并记事件；关闭时同 `uncertain`。
+  结果存 `studio_step_results`，重领不重复调用。
 
 ## 2. 批注与 Interpret（A2-1b-2）
 
@@ -68,8 +75,10 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
   | `adopt_take` | `{takeId}` | 选用已有的某一版（同 `/takes/:id/select`） |
 - 不在白名单、参数不合法、或目标不属于该项目 → 批注保持 `sent`，`interpretation = {op: null, explanation}`，界面显示「agent 没看懂，可以换个说法」。
 - `autonomy = 'max'` 且 confidence ≥ 0.8 → 直接执行；否则把 `interpretation` 写进批注，界面显示「agent 理解为 …」，等用户 apply / reject（后端方案 §3）。
-- 执行成功（新 take 生成并通过质检，或 adopt 完成）→ 批注 `applied`，`applied_take_id` 指向新 take；执行失败 → 保持 `sent` 并写原因。
-- 成片上的批注（target final）：按时间点找到对应镜头，再按上表处理；之后照 A2-1c 的规则重新合成（不收费）。
+- **一次性执行记录**（plan r1 P1）：自动执行和用户 apply 走同一个入口 `executeAnnotation`，先在一个事务里原子认领：`UPDATE studio_annotations SET interpretation = interpretation || {"execution": {"n": k, "state": "running", "taskKey": "annot:<id>:<k>"}} WHERE id = $1 AND status = 'sent' AND (interpretation->'execution' IS NULL OR interpretation->'execution'->>'state' = 'failed') RETURNING …`，只有认领成功的那一次才派发（同一事务里入队，生成任务的幂等键用 `annot:<id>:<k>`，不经过每次新建版本的 `dispatchRequest`，所以重复 apply / 自动执行与 apply 并发都只会派发一次、预留一次）。认领不到 → 409 `ANNOTATION_BUSY`（已在执行）。
+- `reject` 只在没有执行在跑时允许（同样的原子条件 `execution IS NULL OR state = 'failed'`），否则 409。
+- 执行完成（新 take 通过质检，或 adopt 完成）→ 批注 `applied`，`applied_take_id` 指向新 take，`execution.state = 'done'`；执行失败或新 take 交给了用户 → `execution.state = 'failed'` 并写原因，批注保持 `sent`，可以再次 apply（k + 1）。
+- **完成的项目上的批注**（target final 或任意目标，项目 `done`，plan r1 P1）：`interpret` 只读不改素材，所以执行器的门控对 `interpret` 放行 `done` 项目（其它任务仍按现有规则）；**执行时**（认领成功的同一事务里）把项目从 `done` 转回 `running`（`rev + 1`，事件 `project.reopened`，原因是这条批注），再派发重做；成片批注按时间点找到对应镜头再按上表处理。重做完成后照 A2-1c 的规则重新合成（不收费）。在途的导出合成按 A2-1c 已有的输入指纹复核处理：输入变了就不发布，导出按新输入重新入队。`adopt_take` 在 `done` 项目上同样先转回 `running` 再选版本（`selectTake` 对 `done` 的拒绝不变，批注执行走自己的事务）。Interpret 没给出可执行的指令时项目保持 `done`。
 
 ### 2.3 计费与限流
 - Interpret 平台承担，不占预算；每个项目同时最多 2 个 interpret 在跑，每用户每分钟 10 次（Grok runner 的 rateKey）。
@@ -81,7 +90,7 @@ Grok 视觉一次只收一张图（`visionProxy` 限 1 张、≤ 6 MB），所�
 
 ## 4. 测试
 - 单测：评分判定与阈值、JSON 解析与重问、联系表布局（尺寸 / 格数 / ≤ 6 MB）、decide 的 qa 分支、Interpret 白名单与参数校验、批注几何 / 时间校验、take → target 推导。
-- integ（CI，`.github/integ-tiers/pr-2.txt`，min-tests 相应上调）：假沙箱 + 假 Grok 跑通「首帧 → 质检通过 → 视频 → 质检通过 → ready」；不通过自动重做 2 次后交人且给出最好的两个候选；质检扣费进账本和项目 `spent`、重领不重复扣；预算不足暂停；质检关闭时直接采用；批注 draft → send → interpret → autonomy max 直接执行 / 否则等确认 → apply → applied；不在白名单 → 保持 sent；reject。
+- integ（CI，`.github/integ-tiers/pr-2.txt`，min-tests 相应上调）：假沙箱 + 假 Grok 跑通「首帧 → 质检通过 → 视频 → 质检通过 → ready」；不通过自动重做 2 次后交人且给出最好的两个候选；质检扣费进账本和项目 `spent`、重领不重复扣；预算不足暂停；质检关闭时直接采用；批注 draft → send → interpret → autonomy max 直接执行 / 否则等确认 → apply → applied；不在白名单 → 保持 sent；reject；**同一批注并发 apply 两次只派发一次、只预留一次**；执行中 reject → 409；**done 项目上的成片批注** → interpret 不被取消、执行时转回 running 并重新合成，在途导出按新输入重排；**重做上限**：三次都不通过（分数一直在升）→ needs_user；审核 block → 不采用、不重做、交人；质检关闭 + 需求审核 uncertain → 不开始。
 
 ## 5. 不在本步
 - 续接镜头用上一镜头尾帧；设定图 2 候选择优；片尾字幕署名（成片 end card）；导演自动选曲（M1-3）。
