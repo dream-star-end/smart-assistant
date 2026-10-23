@@ -14,13 +14,13 @@
 | PR | 内容 |
 |---|---|
 | **A0** 抽取 | ①（实现时修订，见下方“A0 ① 实现修订”）从 `http/internalCodexRelay.ts` 把 GPT 图片的预检、上游调用、结算抽成 `billing/image2Run.ts` 里的 `runImage2ForUser({userId, containerId: null, accountId, dispatcher, token, body, operation, model, requestId})`，relay 改为调用它，行为逐字节不变（这部分属于 egress surface，发布要带 `--egress`）；账号用 `pickCodexAccountForBinding(codexBindingAffinityKey(uid))` 选取。② 从 `grok/visionProxy.ts:382-566` 抽出 `runGrokResponsesForUser({userId, containerId: null, input: {text, images?}, model})` → `{text, usage}`，计费链路照旧（预检、journal、`settleDurableCodexBilling`），限流的 key 从容器改为“用户 + 容器或 studio”；HTTP handler 退化为一层薄包装。 |
-| **A1** 数据与存储 | 迁移 0323、`studio/store.ts`、内容寻址的 blob 存储和配额、任务队列（lease 加 epoch）、文件下发（ticket + Range）、`/api/studio/*` 的增删查骨架、开关和白名单 |
+| **A1** 数据与存储 | 迁移 0324、`studio/store.ts`、内容寻址的 blob 存储和配额、任务队列（lease 加 epoch）、文件下发（ticket + Range）、`/api/studio/*` 的增删查骨架、开关和白名单 |
 | **A2** 编排与步骤 | 状态机、provider 适配器（GPT、Muse、Grok 图、MiniMax 图/视频/语音、ElevenLabs、合成）、LLM 步骤（Plan、Prompt、Script、QA、Interpret）、预算守卫、批注转指令、`sys.studio_event` 推送 |
 | **A3** 容器入口 | `oc-studio` CLI 和 `/internal/v3/studio`：聊天里一句话开项目、查进度、批注 |
 
 **A0 ① 实现修订（2026-10-23）**：relay 的图片分支和容器请求强耦合（身份校验、绑定、header 透传、标注编辑、HTTP 流式回写），整体抽出再让 relay 回调，改动面全落在 egress surface 上，风险大于收益。实际做法：**relay 保持不动**（只给 4 个已有辅助函数加 `export`，无行为变化），新建 `billing/image2Run.ts` 的 `makeImage2Runner(deps)` → `runImage2ForUser({userId, requestId, prompt, model?, n?, size?, referenceImages?, signal?})`，按 relay 完全相同的顺序直接复用同一组计费原语：已完成缓存回放 → `reserveImageUsage`（每日上限、在途互斥）→ `preCheckExactCost` → 选账号/egress/token → attempt 行 → 上游（仅一次短 429 重试）→ 校验恰好 n 张 → `settleImageCharge`。账本、attempt、缓存行与容器流量一致，只是 `container_id IS NULL`。因 relay 未改，A0 发布不需要 `--egress`。已知约束：Image 2 每用户每日 10 张的上限对工作台同样生效，触顶时返回 `IMAGE_DAILY_LIMIT`，由 A2 编排降级到 Muse 图或转 `needs_user`。
 
-## 2. 数据模型（迁移 `0323_media_studio`，声明 `order-dependency: 0322_minimax_voices`）
+## 2. 数据模型（迁移 `0324_media_studio`，声明 `order-dependency: 0322_minimax_voices`；0323 预留给 OCV5-599 `turn_dispatches.trace_id`，该迁移进入商业树后依赖改为 0323）
 
 ```sql
 studio_projects(id uuid pk, user_id fk cascade, title, brief text ≤4000, reserved_credits bigint default 0, status
