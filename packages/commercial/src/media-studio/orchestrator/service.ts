@@ -6,6 +6,7 @@ import type { Pool, PoolClient } from 'pg'
 import { randomUUID } from 'node:crypto'
 
 import { HttpError } from '../../http/util.js'
+import { ComposeSpecError, type MusicEdit, validateMusicEdit } from '../compose/spec.js'
 import type { MediaRequest } from '../providers/types.js'
 import { STUDIO_MAX_TARGET_SEC, appendStudioEvent } from '../store.js'
 import { type AdvanceDeps, dispatchRequest } from './advance.js'
@@ -22,6 +23,14 @@ export interface OrchestratorApi {
   ): Promise<{ assetId: string }>
   /** Use a ready designed / cloned voice for the narration lines not voiced yet. */
   useVoiceForNarration(userId: string, assetId: string): Promise<{ projectId: string }>
+  /** OCV5-591 M1: use a catalog / library track as the project's music (a free music take). */
+  selectMusic(
+    userId: string,
+    projectId: string,
+    body: Record<string, unknown>,
+  ): Promise<{ queued: true }>
+  /** OCV5-591 M1: trim / place / loop / fades / ducking for the project's music. */
+  setMusicEdit(userId: string, projectId: string, body: Record<string, unknown>): Promise<MusicEdit>
   /** Advance soon, off the request path. */
   kick(projectId: string): void
 }
@@ -230,6 +239,75 @@ export function makeOrchestratorApi(
         return id
       })
       return { assetId }
+    },
+    async selectMusic(userId, projectId, body) {
+      if (!deps)
+        throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+      const providerId = str(body.providerId, 40)
+      const trackId = str(body.trackId, 36)
+      if (!providerId || !trackId)
+        throw new HttpError(400, 'BAD_REQUEST', 'providerId and trackId are required')
+      const source = deps.providers.get(providerId)
+      if (!source || source.kind !== 'music' || !source.search)
+        throw new HttpError(400, 'BAD_REQUEST', 'providerId is not a music source')
+      await inTx(pool, async (c) => {
+        const r = await c.query<{ status: string }>(
+          'SELECT status FROM studio_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE',
+          [projectId, userId],
+        )
+        const p = r.rows[0]
+        if (!p) throw notFound()
+        if (['done', 'canceled', 'failed'].includes(p.status))
+          throw new HttpError(409, 'STUDIO_BAD_TRANSITION', `cannot change a ${p.status} project`)
+        const outcome = await dispatchRequest(
+          c,
+          deps,
+          { id: projectId, userId },
+          {
+            ownerKind: 'music',
+            ownerId: projectId,
+            op: 'music.fetch',
+            exclude: [],
+            only: providerId,
+          },
+          { op: 'music.fetch', trackId },
+        )
+        if (outcome === 'no_provider')
+          throw new HttpError(409, 'STUDIO_MUSIC_UNAVAILABLE', 'this music source is not available')
+        if (outcome === 'budget')
+          throw new HttpError(409, 'STUDIO_BUDGET_TOO_LOW', 'the project is over its budget')
+        await appendStudioEvent(c, projectId, 'music.requested', {
+          providerId,
+          trackId,
+          message: '正在换配乐。',
+        })
+      })
+      kick(projectId)
+      return { queued: true }
+    },
+    async setMusicEdit(userId, projectId, body) {
+      let edit: MusicEdit
+      try {
+        edit = validateMusicEdit(body)
+      } catch (err) {
+        if (err instanceof ComposeSpecError) throw new HttpError(400, 'BAD_REQUEST', err.message)
+        throw err
+      }
+      const r = await pool.query(
+        `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicEdit', $3::jsonb),
+                rev = rev + 1, updated_at = NOW()
+          WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL AND status NOT IN ('done','canceled','failed')`,
+        [projectId, userId, JSON.stringify(edit)],
+      )
+      if (r.rowCount !== 1) {
+        const exists = await pool.query(
+          'SELECT 1 FROM studio_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL',
+          [projectId, userId],
+        )
+        if (!exists.rowCount) throw notFound()
+        throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'the project no longer takes edits')
+      }
+      return edit
     },
     async useVoiceForNarration(userId, assetId) {
       const projectId = await inTx(pool, async (c) => {

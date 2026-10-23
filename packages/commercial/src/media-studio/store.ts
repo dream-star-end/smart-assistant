@@ -138,6 +138,37 @@ async function inTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Prom
 export class StudioStore {
   constructor(private readonly pool: Pool) {}
 
+  /** My Music (OCV5-591 M1, 0325): the audio is already the user's blob (ref id = track id). */
+  async addUserTrack(
+    userId: string,
+    input: {
+      id: string
+      title: string
+      blobSha: string
+      mime: string
+      rights: Record<string, unknown>
+    },
+  ): Promise<{ id: string; title: string; blobSha: string; createdAt: string }> {
+    const r = await this.pool.query<{
+      id: string
+      title: string
+      blob_sha: string
+      created_at: Date
+    }>(
+      `INSERT INTO studio_user_tracks(id, user_id, title, blob_sha, mime, rights_statement)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       RETURNING id::text AS id, title, blob_sha, created_at`,
+      [input.id, userId, input.title, input.blobSha, input.mime, JSON.stringify(input.rights)],
+    )
+    const row = r.rows[0]!
+    return {
+      id: row.id,
+      title: row.title,
+      blobSha: row.blob_sha,
+      createdAt: row.created_at.toISOString(),
+    }
+  }
+
   async createProject(userId: string, input: Record<string, unknown>): Promise<ProjectRow> {
     const patch = validatePatch(input)
     return inTx(this.pool, async (client) => {

@@ -8,6 +8,10 @@
  *   DELETE /api/studio/projects/:id
  *   POST   /api/studio/projects/:id/pause|resume|cancel
  *   POST   /api/studio/projects/:id/uploads          raw body, Content-Type + Content-Length
+ *   GET    /api/studio/music/search?provider=&text=&moods=&genres=&bpmMin=&bpmMax=&minSec=&maxSec=&vocals=&cursor=
+ *   POST   /api/studio/music/tracks?title=&rights=own_or_licensed[&note=]   raw audio body (My Music)
+ *   POST   /api/studio/projects/:id/music            {providerId, trackId} → a free music take
+ *   PUT    /api/studio/projects/:id/music/edit       trim / place / loop / fades / ducking
  *   POST   /api/studio/blobs/:sha/ticket             → {url, expiresInSeconds}
  *   GET    /api/studio/blobs/:sha?ticket=            Range-capable
  *
@@ -29,7 +33,7 @@ import {
 import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from './blobs.js'
 import type { OrchestratorApi } from './orchestrator/service.js'
 import type { ProviderRegistry } from './providers/registry.js'
-import { MEDIA_KINDS } from './providers/types.js'
+import { MEDIA_KINDS, type MusicQuery } from './providers/types.js'
 import type { StudioStore } from './store.js'
 
 export const STUDIO_BROWSER_PREFIX = '/api/studio'
@@ -65,6 +69,52 @@ const PROJECT_RE = new RegExp(
 const TAKE_SELECT_RE = new RegExp(`^/takes/(${UUID})/select$`)
 const VOICE_NARRATION_RE = new RegExp(`^/assets/(${UUID})/narration$`)
 const BLOB_RE = /^\/blobs\/([0-9a-f]{64})(\/ticket)?$/
+const PROJECT_MUSIC_RE = new RegExp(`^/projects/(${UUID})/music(/edit)?$`)
+const MUSIC_AUDIO_TYPES = new Set(['audio/mpeg', 'audio/wav'])
+
+/** Music search query from the URL (OCV5-591 M1); bad numbers are refused, not ignored. */
+function musicQuery(params: URLSearchParams): MusicQuery {
+  const n = (k: string, lo: number, hi: number) => {
+    const v = params.get(k)
+    if (v === null || v === '') return undefined
+    const x = Number(v)
+    if (!Number.isFinite(x) || x < lo || x > hi)
+      throw new HttpError(400, 'BAD_REQUEST', `${k} must be ${lo}..${hi}`)
+    return x
+  }
+  const list = (k: string) => {
+    const v = params.get(k)
+    return v
+      ? v
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s && s.length <= 20)
+          .slice(0, 12)
+      : undefined
+  }
+  const vocals = params.get('vocals')
+  const text = params.get('text')?.slice(0, 100) || undefined
+  const moods = list('moods')
+  const genres = list('genres')
+  const bpmMin = n('bpmMin', 20, 300)
+  const bpmMax = n('bpmMax', 20, 300)
+  const minSec = n('minSec', 0, 1800)
+  const maxSec = n('maxSec', 0, 1800)
+  const limit = n('limit', 1, 50)
+  const cursor = params.get('cursor')?.slice(0, 32) || undefined
+  return {
+    ...(text ? { text } : {}),
+    ...(moods ? { moods } : {}),
+    ...(genres ? { genres } : {}),
+    ...(bpmMin !== undefined ? { bpmMin } : {}),
+    ...(bpmMax !== undefined ? { bpmMax } : {}),
+    ...(minSec !== undefined ? { minSec } : {}),
+    ...(maxSec !== undefined ? { maxSec } : {}),
+    ...(vocals === 'true' || vocals === 'false' ? { vocals: vocals === 'true' } : {}),
+    ...(limit !== undefined ? { limit } : {}),
+    ...(cursor ? { cursor } : {}),
+  }
+}
 
 function bodyRecord(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value))
@@ -122,7 +172,9 @@ export async function dispatchStudioRoute(
     const ticket = url.searchParams.get('ticket')
     if (!ticket) throw new HttpError(401, 'UNAUTHORIZED', 'blob ticket required')
     const userId = verifyBlobTicket(deps.jwtSecret, ticket, blob[1]!)
-    const file = await studio.blobs.open(BigInt(userId), blob[1]!)
+    const file =
+      (await studio.blobs.open(BigInt(userId), blob[1]!)) ??
+      (await studio.blobs.openCatalog(blob[1]!))
     if (!file) throw notFound()
     await sendBlobFile(req, res, file)
     return
@@ -133,7 +185,12 @@ export async function dispatchStudioRoute(
   const uid = user.id
 
   if (blob?.[2] && method === 'POST') {
-    if (!(await studio.blobs.open(BigInt(uid), blob[1]!))) throw notFound()
+    // The user's own content, or an active curated-catalog track (a preview; OCV5-591 M1).
+    if (
+      !(await studio.blobs.open(BigInt(uid), blob[1]!)) &&
+      !(await studio.blobs.openCatalog(blob[1]!))
+    )
+      throw notFound()
     const ticket = createBlobTicket(deps.jwtSecret, uid, blob[1]!)
     sendJson(res, 200, {
       url: `${STUDIO_BROWSER_PREFIX}/blobs/${blob[1]}?ticket=${encodeURIComponent(ticket)}`,
@@ -174,6 +231,89 @@ export async function dispatchStudioRoute(
     sendJson(res, 201, {
       project: await studio.store.createProject(uid, bodyRecord(await readJsonBody(req))),
     })
+    return
+  }
+
+  if (path === '/music/search' && method === 'GET') {
+    const id = url.searchParams.get('provider') ?? ''
+    const source = studio.providers?.get(id)
+    if (!source || source.kind !== 'music' || !source.search)
+      throw new HttpError(400, 'BAD_REQUEST', 'provider is not a music source')
+    if (source.status(user).state !== 'ready')
+      throw new HttpError(409, 'STUDIO_MUSIC_UNAVAILABLE', 'this music source is not available')
+    sendJson(res, 200, await source.search(user, musicQuery(url.searchParams)))
+    return
+  }
+  if (path === '/music/tracks' && method === 'POST') {
+    // My Music (0325): the uploader states they own the music or are licensed to use it.
+    if (url.searchParams.get('rights') !== 'own_or_licensed')
+      throw new HttpError(
+        400,
+        'MUSIC_RIGHTS_REQUIRED',
+        'confirm you own this music or are licensed to use it',
+      )
+    const title = (url.searchParams.get('title') ?? '').trim()
+    if (!title || title.length > 200)
+      throw new HttpError(400, 'BAD_REQUEST', 'title must be 1..200 chars')
+    const note = (url.searchParams.get('note') ?? '').trim().slice(0, 300)
+    const mime = String(req.headers['content-type'] ?? '')
+      .split(';', 1)[0]!
+      .trim()
+      .toLowerCase()
+    if (!MUSIC_AUDIO_TYPES.has(mime) || !UPLOAD_TYPES[mime])
+      throw new HttpError(415, 'STUDIO_UNSUPPORTED_MEDIA', 'upload an MP3 or WAV file')
+    const body = await readUpload(req)
+    if (!UPLOAD_TYPES[mime]!(body))
+      throw new HttpError(
+        415,
+        'STUDIO_UNSUPPORTED_MEDIA',
+        'the file is not the audio type it claims',
+      )
+    const trackId = randomUUID()
+    const stored = await studio.blobs
+      .put({
+        userId: BigInt(uid),
+        mime,
+        maxBytes: body.length,
+        source: body,
+        ref: { kind: 'upload', id: trackId },
+      })
+      .catch(mapStoreError)
+    const track = await studio.store
+      .addUserTrack(uid, {
+        id: trackId,
+        title,
+        blobSha: stored.sha,
+        mime,
+        rights: {
+          statement: 'own_or_licensed',
+          acceptedAt: new Date().toISOString(),
+          ...(note ? { note } : {}),
+        },
+      })
+      .catch(async (err) => {
+        // No row holds the audio then: give the bytes back instead of leaving an orphan ref.
+        await studio.blobs.dropRefs(BigInt(uid), { kind: 'upload', id: trackId }).catch(() => {})
+        throw err
+      })
+    sendJson(res, 201, { track })
+    return
+  }
+  const projectMusic = PROJECT_MUSIC_RE.exec(path)
+  if (
+    projectMusic &&
+    ((!projectMusic[2] && method === 'POST') || (projectMusic[2] && method === 'PUT'))
+  ) {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    const body = bodyRecord(await readJsonBody(req))
+    if (projectMusic[2]) {
+      sendJson(res, 200, {
+        musicEdit: await studio.orchestrator.setMusicEdit(uid, projectMusic[1]!, body),
+      })
+    } else {
+      sendJson(res, 202, await studio.orchestrator.selectMusic(uid, projectMusic[1]!, body))
+    }
     return
   }
 

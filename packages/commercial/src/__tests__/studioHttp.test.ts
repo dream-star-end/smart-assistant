@@ -18,6 +18,7 @@ import {
 import type { StudioBlobStore } from '../media-studio/blobs.js'
 import { type StudioHttpDeps, dispatchStudioRoute } from '../media-studio/http.js'
 import type { OrchestratorApi } from '../media-studio/orchestrator/service.js'
+import type { ProviderRegistry } from '../media-studio/providers/registry.js'
 import type { StudioStore } from '../media-studio/store.js'
 
 const SECRET = 'studio-test-secret-that-is-long-enough-123'
@@ -92,6 +93,7 @@ describe('dispatchStudioRoute', () => {
   let base = ''
   let enabled = true
   let orchestrator: OrchestratorApi | undefined
+  let providers: ProviderRegistry | undefined
   const calls: string[] = []
   let filePath = ''
   const fileBody = Buffer.from('0123456789')
@@ -108,6 +110,13 @@ describe('dispatchStudioRoute', () => {
     projectView: async (uid: string, id: string) =>
       uid === '247' && id === PROJECT ? { project: { id } } : null,
     projectOwned: async (uid: string) => uid === '247',
+    addUserTrack: async (
+      uid: string,
+      input: { id: string; title: string; rights: { statement: string } },
+    ) => {
+      calls.push(`track:${uid}:${input.title}:${input.rights.statement}`)
+      return { id: input.id, title: input.title }
+    },
     transition: async (uid: string, id: string, action: string) => {
       calls.push(`transition:${uid}:${action}`)
       return { id }
@@ -131,6 +140,7 @@ describe('dispatchStudioRoute', () => {
       return { sha: SHA, bytes: args.maxBytes, mime: args.mime, newForUser: true }
     },
     dropRefs: async () => 0,
+    openCatalog: async () => null,
   } as unknown as StudioBlobStore
 
   before(async () => {
@@ -143,6 +153,7 @@ describe('dispatchStudioRoute', () => {
         store,
         blobs,
         ...(orchestrator ? { orchestrator } : {}),
+        ...(providers ? { providers } : {}),
       }
       void dispatchStudioRoute(req, res, {} as never, { jwtSecret: SECRET, studio: deps }).catch(
         (error) => {
@@ -277,6 +288,8 @@ describe('dispatchStudioRoute', () => {
         return { projectId: PROJECT }
       },
       kick: (id) => void seen.push(`kick:${id}`),
+      selectMusic: async () => ({ queued: true as const }),
+      setMusicEdit: async () => ({}),
     }
     try {
       for (const r of [`/projects/${PROJECT}/start`, `/projects/${PROJECT}/approve`]) {
@@ -305,6 +318,110 @@ describe('dispatchStudioRoute', () => {
       )
       assert.equal(seen.length, 6)
     } finally {
+      orchestrator = undefined
+    }
+  })
+
+  it('music routes (OCV5-591 M1): search a source, pick a track, edit, upload to My Music', async () => {
+    const auth = await bearer('247')
+    const searched: unknown[] = []
+    const track = { id: 't1', title: 'Easy Lemon', metadata: { bpm: 'source', moods: 'guessed' } }
+    providers = {
+      get: (id: string) =>
+        id === 'music-catalog'
+          ? {
+              id,
+              kind: 'music',
+              status: () => ({ state: 'ready' }),
+              search: async (u: { id: string }, q: unknown) => {
+                searched.push([u.id, q])
+                return { tracks: [track], next: null }
+              },
+            }
+          : id === 'gpt-image'
+            ? { id, kind: 'image', status: () => ({ state: 'ready' }) }
+            : undefined,
+    } as unknown as ProviderRegistry
+    try {
+      const ok = await fetch(
+        `${base}/music/search?provider=music-catalog&text=snow&moods=${encodeURIComponent('宁静,温暖')}&bpmMin=60&vocals=false`,
+        { headers: { authorization: auth } },
+      )
+      assert.equal(ok.status, 200)
+      assert.deepEqual(await ok.json(), { tracks: [track], next: null })
+      assert.deepEqual(searched[0], [
+        '247',
+        { text: 'snow', moods: ['宁静', '温暖'], bpmMin: 60, vocals: false },
+      ])
+      for (const [q, status] of [
+        ['provider=gpt-image', 400],
+        ['provider=nope', 400],
+        ['provider=music-catalog&bpmMin=5', 400],
+      ] as const) {
+        assert.equal(
+          (await fetch(`${base}/music/search?${q}`, { headers: { authorization: auth } })).status,
+          status,
+          q,
+        )
+      }
+      assert.equal(
+        (
+          await fetch(`${base}/music/search?provider=music-catalog`, {
+            headers: { authorization: await bearer('3') },
+          })
+        ).status,
+        404,
+        'the access gate comes first',
+      )
+
+      const seen: string[] = []
+      orchestrator = {
+        selectMusic: async (uid: string, id: string, body: Record<string, unknown>) => {
+          seen.push(`select:${uid}:${id}:${body.providerId}:${body.trackId}`)
+          return { queued: true as const }
+        },
+        setMusicEdit: async (uid: string, id: string, body: Record<string, unknown>) => {
+          seen.push(`edit:${uid}:${id}:${body.inSec}`)
+          return { inSec: body.inSec as number }
+        },
+      } as unknown as OrchestratorApi
+      const pick = await fetch(`${base}/projects/${PROJECT}/music`, {
+        method: 'POST',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ providerId: 'music-catalog', trackId: 't1' }),
+      })
+      assert.equal(pick.status, 202)
+      const edit = await fetch(`${base}/projects/${PROJECT}/music/edit`, {
+        method: 'PUT',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ inSec: 8 }),
+      })
+      assert.deepEqual(await edit.json(), { musicEdit: { inSec: 8 } })
+      assert.deepEqual(seen, [`select:247:${PROJECT}:music-catalog:t1`, `edit:247:${PROJECT}:8`])
+
+      const mp3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(64)])
+      const up = (q: string, type = 'audio/mpeg', body: Buffer = mp3) =>
+        fetch(`${base}/music/tracks?${q}`, {
+          method: 'POST',
+          headers: {
+            authorization: auth,
+            'content-type': type,
+            'content-length': String(body.length),
+          },
+          body: new Uint8Array(body),
+        })
+      assert.equal((await up('title=demo')).status, 400, 'the rights statement is required')
+      assert.equal((await up('title=demo&rights=own_or_licensed', 'image/png')).status, 415)
+      assert.equal(
+        (await up('title=demo&rights=own_or_licensed', 'audio/mpeg', Buffer.from('not audio')))
+          .status,
+        415,
+      )
+      const created = await up('title=demo&rights=own_or_licensed&note=client%20contract')
+      assert.equal(created.status, 201)
+      assert.ok(calls.includes('track:247:demo:own_or_licensed'))
+    } finally {
+      providers = undefined
       orchestrator = undefined
     }
   })

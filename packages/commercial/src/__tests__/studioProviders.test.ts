@@ -116,7 +116,7 @@ const kindView = (r: ReturnType<typeof build>['registry'], kind: string) =>
   r.describe(USER).kinds.find((k) => k.kind === kind)!
 
 describe('default providers (no OC_STUDIO_PROVIDERS)', () => {
-  it('lists all four kinds; music has no provider; missing MiniMax key is "not configured"', () => {
+  it('lists all four kinds; music sources are off without their service; missing MiniMax key is "not configured"', () => {
     const { registry, warnings } = build(undefined)
     assert.deepEqual(
       registry.describe(USER).kinds.map((k) => [k.kind, k.state]),
@@ -127,8 +127,15 @@ describe('default providers (no OC_STUDIO_PROVIDERS)', () => {
         ['music', 'unconfigured'],
       ],
     )
-    assert.equal(kindView(registry, 'music').reason, 'NO_PROVIDER')
-    assert.deepEqual(kindView(registry, 'music').providers, [])
+    // OCV5-591 M1: the curated catalog and My Music are registered by default but off without the
+    // music service; there is still no default *generation* provider.
+    assert.deepEqual(
+      kindView(registry, 'music').providers.map((p) => [p.id, p.state, p.reason]),
+      [
+        ['music-catalog', 'disabled', 'FEATURE_OFF'],
+        ['music-mine', 'disabled', 'FEATURE_OFF'],
+      ],
+    )
     const voice = kindView(registry, 'voice').providers[0]!
     assert.equal(voice.state, 'unconfigured')
     assert.equal(voice.reason, 'MISSING_KEY')
@@ -344,6 +351,45 @@ describe('candidates', () => {
     )
     assert.equal(registry.get('muse-image')!.affinity(), 'muse')
     assert.equal(registry.get('gpt-image')!.affinity(), null)
+  })
+
+  it('music sources: ready with the music service, search passes through, still no generator (OCV5-591 M1)', async () => {
+    const asked: unknown[][] = []
+    const pool = {
+      query: async (sql: string, args: unknown[]) => {
+        asked.push([sql, args])
+        return { rows: [] }
+      },
+    }
+    const deps = fakeDeps({ music: { pool: pool as never, readCatalog: async () => null } })
+    const { registry } = build(undefined, deps)
+    assert.equal(kindView(registry, 'music').state, 'ready')
+    assert.deepEqual(
+      registry.candidates('music', 'music.fetch', USER).map((p) => p.id),
+      ['music-catalog', 'music-mine'],
+    )
+    assert.deepEqual(
+      registry.candidates('music', 'music.generate', USER, { includeOffline: true }),
+      [],
+    )
+    const out = await registry.get('music-catalog')!.search!(USER, {
+      text: '100%_x',
+      moods: ['宁静'],
+      bpmMin: 60,
+    })
+    assert.deepEqual(out, { tracks: [], next: null })
+    const [sql, args] = asked[0] as [string, unknown[]]
+    assert.match(sql, /FROM studio_music_catalog WHERE active AND/)
+    assert.equal(args[0], '%100\\%\\_x%', 'LIKE wildcards in the words match themselves')
+    assert.deepEqual(args[1], ['宁静'])
+    assert.equal(
+      registry.get('music-catalog')!.estimateMaxCost({ op: 'music.fetch', trackId: 'x' }),
+      0n,
+    )
+    // Off without the service: search refuses instead of pretending to find nothing.
+    assert.throws(() => build(undefined).registry.get('music-catalog')!.search!(USER, {}), {
+      code: 'PROVIDER_UNAVAILABLE',
+    })
   })
 
   it('music has no candidates by default', () => {

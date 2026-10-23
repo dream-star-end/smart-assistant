@@ -21,6 +21,7 @@ import {
   ComposeSpecError,
   buildCommand,
   peaksFromPcm,
+  validateMusicEdit,
 } from '../media-studio/compose/spec.js'
 
 const TEST_LOCK = inProcessHostLock()
@@ -34,6 +35,75 @@ const base = (over: Partial<ComposeSpec> = {}): ComposeSpec => ({
     { file: 's2.mp4', inSec: 1, outSec: 6 },
   ],
   ...over,
+})
+
+const MUSIC_BASE = {
+  width: 1280 as const,
+  height: 720 as const,
+  fps: 24 as const,
+  clips: [
+    { file: 'a.mp4', inSec: 0, outSec: 10 },
+    { file: 'b.mp4', inSec: 0, outSec: 10 },
+  ],
+  voice: [{ file: 'v.mp3', startSec: 1 }],
+}
+
+describe('compose music edit (OCV5-591 M1)', () => {
+  const graphOf = (music: Record<string, unknown>) => {
+    const cmd = buildCommand({
+      op: 'compose',
+      spec: { ...MUSIC_BASE, music: { file: 'm.mp3', ...music } } as never,
+    })
+    return cmd.argv[cmd.argv.indexOf('-filter_complex') + 1]!
+  }
+
+  test('without placement the graph is the A0 one', () => {
+    const g = graphOf({ gainDb: -6 })
+    assert.match(g, /volume=-6dB,afade=t=in:st=0:d=1,afade=t=out:st=17\.5:d=2\.5\[mus\]/)
+    assert.match(g, /attack=20:release=400/)
+  })
+
+  test('trims, loops with crossfades, places and fades the span; duck timing is applied', () => {
+    const g = graphOf({
+      inSec: 8,
+      outSec: 14,
+      startSec: 2,
+      endSec: 18,
+      loop: { crossfadeSec: 1 },
+      duck: { attackMs: 50, releaseMs: 800 },
+    })
+    assert.match(g, /atrim=start=8:end=14,asetpts=PTS-STARTPTS/)
+    // 16 s span from a 6 s part with 1 s crossfades → 3 copies, 2 crossfades
+    assert.match(g, /asplit=3\[mrep0\]\[mrep1\]\[mrep2\]/)
+    assert.equal((g.match(/acrossfade=d=1:c1=tri:c2=tri/g) ?? []).length, 2)
+    assert.match(
+      g,
+      /atrim=end=16,afade=t=in:st=0:d=1,afade=t=out:st=13\.5:d=2\.5,adelay=2000\|2000,apad\[mus\]/,
+    )
+    assert.match(g, /attack=50:release=800/)
+  })
+
+  test('a loop without crossfade concatenates; a short span is never looped', () => {
+    assert.match(graphOf({ outSec: 5, loop: {} }), /concat=n=4:v=0:a=1\[mloop\]/)
+    assert.doesNotMatch(graphOf({ outSec: 30, loop: {} }), /\[mrep0\]/)
+  })
+
+  test('refuses edits that cannot be cut', () => {
+    for (const [why, edit, re] of [
+      ['loop needs the part to repeat', { loop: {} }, /needs outSec/],
+      ['crossfade under half the part', { outSec: 3, loop: { crossfadeSec: 2 } }, /under half/],
+      ['at least 1 s of music', { startSec: 5, endSec: 5.5 }, /at least 1 s/],
+      ['unknown field', { tempo: 2 }, /not supported/],
+      ['duck attack range', { duck: { attackMs: 0 } }, /attackMs/],
+    ] as const) {
+      assert.throws(() => validateMusicEdit(edit), re, why)
+    }
+    assert.deepEqual(validateMusicEdit({ inSec: 1, outSec: 9, loop: { crossfadeSec: 0.5 } }), {
+      inSec: 1,
+      outSec: 9,
+      loop: { crossfadeSec: 0.5 },
+    })
+  })
 })
 
 describe('compose spec → argv (OCV5-588)', () => {

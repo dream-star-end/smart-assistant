@@ -197,6 +197,8 @@ function buildRequest(
 }
 
 const OWNER_TABLE: Record<string, string> = {
+  // A project's music take is owned by the project itself (OCV5-591 M1).
+  music: 'studio_projects',
   bible: 'studio_assets',
   shot_frame: 'studio_shots',
   shot_video: 'studio_shots',
@@ -227,15 +229,17 @@ export async function dispatchRequest(
   client: PoolClient,
   deps: AdvanceDeps,
   project: { id: string; userId: string },
-  d: Pick<Dispatch, 'ownerKind' | 'ownerId' | 'op' | 'exclude'>,
+  d: Pick<Dispatch, 'ownerKind' | 'ownerId' | 'op' | 'exclude'> & {
+    /** Only this provider (the source the user picked); no fallback to another one. */
+    only?: string
+  },
   req: MediaRequest,
 ): Promise<'queued' | 'budget' | 'no_provider'> {
   const ctx = { project: { id: project.id, user_id: project.userId } }
   const user = { id: project.userId }
-  const provider = deps.providers.candidates(kindOf(d.op), d.op, user, {
-    includeOffline: true,
-    exclude: d.exclude,
-  })[0]
+  const provider = deps.providers
+    .candidates(kindOf(d.op), d.op, user, { includeOffline: true, exclude: d.exclude })
+    .filter((p) => !d.only || p.id === d.only)[0]
   if (!provider) return 'no_provider'
   const est = provider.estimateMaxCost(req)
   if (!(await reserveBudget(client, ctx.project.id, est))) return 'budget'

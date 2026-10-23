@@ -15,6 +15,11 @@ import type { SystemVoice } from '../../../minimax/voices.js'
 import type { MuseBridgeHub } from '../../../muse/hub.js'
 
 export interface BuiltinAdapterDeps {
+  /** OCV5-591 M1 music sources: the catalog and user tracks live in Postgres, catalog audio is site-owned. */
+  music?: {
+    pool: Pool
+    readCatalog(sha: string): Promise<Buffer | null>
+  }
   /** Ledger reads for chargedFor (A2-1 deferred reconciliation). */
   pool?: Pool
   image2?: {

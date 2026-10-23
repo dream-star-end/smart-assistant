@@ -14,6 +14,8 @@ export const MEDIA_OPS = [
   'voice.design',
   'voice.clone',
   'music.generate',
+  // OCV5-591 M1: turn a chosen catalog / library track into a music take.
+  'music.fetch',
 ] as const
 export type MediaOp = (typeof MEDIA_OPS)[number]
 
@@ -68,6 +70,8 @@ export interface MediaRequest {
   resumeSnapshotId?: string
   /** voice.design / voice.clone: a label for the new voice. */
   label?: string
+  /** music.fetch: the track to take (catalog row or the user's own track). */
+  trackId?: string
   /** voice.clone: the uploader's statement that the sample is their own voice or authorized. */
   consent?: { statement: 'self_or_authorized'; acceptedAt: string }
 }
@@ -121,6 +125,50 @@ export class MediaProviderError extends Error {
   }
 }
 
+/** OCV5-591 M1 — what a music source can be searched by (MUSIC-PLAN §2). */
+export interface MusicQuery {
+  text?: string
+  moods?: string[]
+  genres?: string[]
+  bpmMin?: number
+  bpmMax?: number
+  minSec?: number
+  maxSec?: number
+  vocals?: boolean
+  limit?: number
+  cursor?: string
+}
+
+export interface MusicTrack {
+  id: string
+  title: string
+  artist: string
+  durationMs: number | null
+  bpm: number | null
+  moods: string[]
+  genres: string[]
+  vocals: boolean
+  license: 'CC0-1.0' | 'CC-BY-3.0' | 'CC-BY-4.0' | 'PIXABAY-CL' | 'USER-STATEMENT'
+  licenseUrl: string | null
+  attributionRequired: boolean
+  attributionText: string
+  landingUrl: string | null
+  /** Where the track came from (incompetech, openverse, user-upload, …). */
+  origin: string
+  /** Blob to preview (playable through a blob ticket). */
+  previewSha: string
+  /** How far BPM and moods can be trusted: from the source, measured by us, or our guess. */
+  metadata: {
+    bpm: 'source' | 'measured' | 'unknown'
+    moods: 'source' | 'guessed' | 'unknown'
+  }
+}
+
+export interface MusicSearchResult {
+  tracks: MusicTrack[]
+  next: string | null
+}
+
 export interface MediaProvider {
   /** Config instance id, e.g. `gpt-image`, `muse-video`. */
   readonly id: string
@@ -139,6 +187,8 @@ export interface MediaProvider {
   /** Credits actually debited for one execution id (0 when nothing was charged). */
   chargedFor(userId: bigint, execRequestId: string): Promise<bigint>
   run(ctx: MediaRunContext, req: MediaRequest): Promise<MediaResult>
+  /** Music sources only (OCV5-591 M1): search the source's tracks. */
+  search?(user: StudioUser, q: MusicQuery): Promise<MusicSearchResult>
 }
 
 /** Ops the provider can run for the given model (or any of its models). */

@@ -67,14 +67,96 @@ export interface ComposeSpec {
   grade?: 'none' | 'warm' | 'cool' | 'film'
   subtitles?: { file: string; burn: boolean }
   voice?: Array<{ file: string; startSec: number; gainDb?: number }>
-  music?: {
-    file: string
-    gainDb?: number
-    duckDb?: number
-    fadeInSec?: number
-    fadeOutSec?: number
-  }
+  music?: { file: string } & MusicEdit
   loudness?: { targetLufs: number }
+}
+
+/**
+ * How the project's music is cut into the film (OCV5-591 M1, MUSIC-PLAN §3). Every field is
+ * optional; with none of the placement / loop / duck-timing fields set the filter graph is exactly
+ * the A0 one (whole track from 0 s, fades at both ends, fixed ducking).
+ */
+export interface MusicEdit {
+  gainDb?: number
+  /** How far the music is pulled down under narration. */
+  duckDb?: number
+  fadeInSec?: number
+  fadeOutSec?: number
+  /** Where the music starts / ends in the film (seconds of the cut). */
+  startSec?: number
+  endSec?: number
+  /** Which part of the track is used (trim). */
+  inSec?: number
+  outSec?: number
+  /** Repeat the trimmed part until endSec, joining repeats with a crossfade. Needs outSec. */
+  loop?: { crossfadeSec?: number }
+  duck?: { attackMs?: number; releaseMs?: number }
+}
+
+const MUSIC_LOOP_MAX_REPEATS = 24
+
+/** Validates a music edit (also used by the HTTP API before it is stored). Returns a clean copy. */
+export function validateMusicEdit(raw: unknown): MusicEdit {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+    throw new ComposeSpecError('music edit must be an object')
+  const m = raw as Record<string, unknown>
+  const known = new Set([
+    'gainDb',
+    'duckDb',
+    'fadeInSec',
+    'fadeOutSec',
+    'startSec',
+    'endSec',
+    'inSec',
+    'outSec',
+    'loop',
+    'duck',
+    'file',
+  ])
+  for (const k of Object.keys(m))
+    if (!known.has(k)) throw new ComposeSpecError(`music.${k} is not supported`)
+  const out: MusicEdit = {}
+  const opt = (k: keyof MusicEdit, lo: number, hi: number) => {
+    if (m[k] !== undefined) (out as Record<string, number>)[k] = inRange(m[k], lo, hi, `music.${k}`)
+  }
+  opt('gainDb', -40, 6)
+  opt('duckDb', 0, 30)
+  opt('fadeInSec', 0, 10)
+  opt('fadeOutSec', 0, 10)
+  opt('startSec', 0, LIMITS.maxTotalSec)
+  opt('endSec', 0, LIMITS.maxTotalSec)
+  opt('inSec', 0, LIMITS.maxTotalSec)
+  opt('outSec', 0, LIMITS.maxTotalSec)
+  if (out.endSec !== undefined && out.endSec - (out.startSec ?? 0) < 1)
+    throw new ComposeSpecError('music must play for at least 1 s (endSec after startSec)')
+  if (out.outSec !== undefined && out.outSec - (out.inSec ?? 0) < 1)
+    throw new ComposeSpecError('music.outSec must be at least 1 s after inSec')
+  if (m.loop !== undefined) {
+    if (!m.loop || typeof m.loop !== 'object' || Array.isArray(m.loop))
+      throw new ComposeSpecError('music.loop must be an object')
+    if (out.outSec === undefined)
+      throw new ComposeSpecError('music.loop needs outSec (the part to repeat)')
+    const l = m.loop as Record<string, unknown>
+    const xf =
+      l.crossfadeSec === undefined ? 0 : inRange(l.crossfadeSec, 0, 5, 'music.loop.crossfadeSec')
+    if (xf * 2 >= out.outSec - (out.inSec ?? 0))
+      throw new ComposeSpecError('music.loop.crossfadeSec must be under half the looped part')
+    out.loop = { crossfadeSec: xf }
+  }
+  if (m.duck !== undefined) {
+    if (!m.duck || typeof m.duck !== 'object' || Array.isArray(m.duck))
+      throw new ComposeSpecError('music.duck must be an object')
+    const d = m.duck as Record<string, unknown>
+    out.duck = {
+      ...(d.attackMs !== undefined
+        ? { attackMs: Math.round(inRange(d.attackMs, 1, 2000, 'music.duck.attackMs')) }
+        : {}),
+      ...(d.releaseMs !== undefined
+        ? { releaseMs: Math.round(inRange(d.releaseMs, 10, 5000, 'music.duck.releaseMs')) }
+        : {}),
+    }
+  }
+  return out
 }
 
 export interface BuiltCommand {
@@ -111,6 +193,59 @@ const GRADES: Record<NonNullable<ComposeSpec['grade']>, string | null> = {
   warm: 'eq=saturation=1.06:gamma_r=1.04:gamma_b=0.97',
   cool: 'eq=saturation=1.02:gamma_r=0.97:gamma_b=1.05',
   film: 'eq=contrast=1.05:saturation=0.92,curves=preset=increase_contrast',
+}
+
+/**
+ * Music cut into the film: trim [inSec, outSec) of the track, repeat it (crossfaded) when looping,
+ * cut it to the span [startSec, endSec) of the film, fade both ends of that span and delay it to
+ * startSec. Every number comes from validateMusicEdit; nothing user-supplied reaches the graph raw.
+ */
+function musicPlacement(
+  input: number,
+  m: MusicEdit,
+  totalSec: number,
+  fadeIn: number,
+  fadeOut: number,
+): string[] {
+  const start = Math.min(m.startSec ?? 0, Math.max(0, totalSec - 1))
+  const end = Math.min(m.endSec ?? totalSec, totalSec)
+  const span = Math.max(1, end - start)
+  const graph: string[] = []
+  const trim = `atrim=start=${num(m.inSec ?? 0)}${m.outSec !== undefined ? `:end=${num(m.outSec)}` : ''},asetpts=PTS-STARTPTS`
+  graph.push(`[${input}:a:0]aresample=48000,${trim},volume=${num(m.gainDb ?? -8, 2)}dB[mtrim]`)
+  let body = 'mtrim'
+  if (m.loop && m.outSec !== undefined) {
+    const part = m.outSec - (m.inSec ?? 0)
+    const xf = m.loop.crossfadeSec ?? 0
+    const repeats = Math.min(
+      MUSIC_LOOP_MAX_REPEATS,
+      Math.max(1, Math.ceil((span - xf) / (part - xf))),
+    )
+    if (repeats > 1) {
+      const copies = Array.from({ length: repeats }, (_, i) => `mrep${i}`)
+      graph.push(`[mtrim]asplit=${repeats}${copies.map((c) => `[${c}]`).join('')}`)
+      if (xf > 0) {
+        let prev = copies[0]!
+        for (let i = 1; i < repeats; i++) {
+          const out = `mloop${i}`
+          graph.push(`[${prev}][${copies[i]}]acrossfade=d=${num(xf)}:c1=tri:c2=tri[${out}]`)
+          prev = out
+        }
+        body = prev
+      } else {
+        graph.push(`${copies.map((c) => `[${c}]`).join('')}concat=n=${repeats}:v=0:a=1[mloop]`)
+        body = 'mloop'
+      }
+    }
+  }
+  const fi = Math.min(fadeIn, span / 2)
+  const fo = Math.min(fadeOut, span / 2)
+  const delayMs = Math.round(start * 1000)
+  graph.push(
+    `[${body}]atrim=end=${num(span)},afade=t=in:st=0:d=${num(fi)},afade=t=out:st=${num(Math.max(0, span - fo))}:d=${num(fo)}` +
+      `${delayMs > 0 ? `,adelay=${delayMs}|${delayMs}` : ''},apad[mus]`,
+  )
+  return graph
 }
 
 export function buildCommand(op: ComposeOp): BuiltCommand {
@@ -280,11 +415,7 @@ function validateSpec(spec: ComposeSpec): void {
   }
   if (spec.music) {
     assertBasename(spec.music.file, 'music.file')
-    if (spec.music.gainDb !== undefined) inRange(spec.music.gainDb, -40, 6, 'music.gainDb')
-    if (spec.music.duckDb !== undefined) inRange(spec.music.duckDb, 0, 30, 'music.duckDb')
-    if (spec.music.fadeInSec !== undefined) inRange(spec.music.fadeInSec, 0, 10, 'music.fadeInSec')
-    if (spec.music.fadeOutSec !== undefined)
-      inRange(spec.music.fadeOutSec, 0, 10, 'music.fadeOutSec')
+    validateMusicEdit(spec.music)
   }
   if (spec.loudness) inRange(spec.loudness.targetLufs, -30, -10, 'loudness.targetLufs')
 }
@@ -372,17 +503,27 @@ function buildCompose(spec: ComposeSpec): BuiltCommand {
     const m = spec.music
     const fadeIn = m.fadeInSec ?? 1
     const fadeOut = m.fadeOutSec ?? 2.5
-    graph.push(
-      `[${input}:a:0]aresample=48000,volume=${num(m.gainDb ?? -8, 2)}dB,` +
-        `afade=t=in:st=0:d=${num(fadeIn)},afade=t=out:st=${num(Math.max(0, totalSec - fadeOut))}:d=${num(fadeOut)}[mus]`,
-    )
+    const placed =
+      m.startSec !== undefined ||
+      m.endSec !== undefined ||
+      m.inSec !== undefined ||
+      m.outSec !== undefined ||
+      m.loop
+    if (!placed) {
+      graph.push(
+        `[${input}:a:0]aresample=48000,volume=${num(m.gainDb ?? -8, 2)}dB,` +
+          `afade=t=in:st=0:d=${num(fadeIn)},afade=t=out:st=${num(Math.max(0, totalSec - fadeOut))}:d=${num(fadeOut)}[mus]`,
+      )
+    } else {
+      graph.push(...musicPlacement(input, m, totalSec, fadeIn, fadeOut))
+    }
     input += 1
     if (voiceBus) {
       const duck = m.duckDb ?? 12
       // Ducking: compress the music bed by the voice bus. ratio derived from the requested dB.
       graph.push('[vox]asplit=2[voxa][voxk]')
       graph.push(
-        `[mus][voxk]sidechaincompress=threshold=0.03:ratio=${num(Math.min(20, 1 + duck / 2), 2)}:attack=20:release=400[musd]`,
+        `[mus][voxk]sidechaincompress=threshold=0.03:ratio=${num(Math.min(20, 1 + duck / 2), 2)}:attack=${m.duck?.attackMs ?? 20}:release=${m.duck?.releaseMs ?? 400}[musd]`,
       )
       graph.push('[voxa][musd]amix=inputs=2:normalize=0:duration=longest[amix]')
       audio = 'amix'

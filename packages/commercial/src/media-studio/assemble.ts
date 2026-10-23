@@ -90,10 +90,18 @@ export async function createStudioFromConfig(
   }, STUDIO_GC_INTERVAL_MS)
   timer.unref?.()
   const warn = (msg: string) => log.warn('studio_provider_config', { detail: msg })
+  const deps = providerDeps(cfg, pool, services, warn)
+  deps.music = {
+    pool,
+    readCatalog: async (sha) => {
+      const file = await blobs.openCatalog(sha)
+      return file ? readFile(file.path) : null
+    },
+  }
   const providers = createProviderRegistry({
     entries: parseProviderConfig(cfg.OC_STUDIO_PROVIDERS, warn),
     factories: BUILTIN_ADAPTERS,
-    deps: providerDeps(cfg, pool, services, warn),
+    deps,
     warn,
   })
   return { access, store: new StudioStore(pool), blobs, providers }

@@ -15,6 +15,8 @@ import {
   type MediaResult,
   type MediaRunContext,
   type ModelInfo,
+  type MusicQuery,
+  type MusicSearchResult,
   type ProviderReason,
   type ProviderStatus,
   type StudioUser,
@@ -57,7 +59,10 @@ export const DEFAULT_PROVIDER_ENTRIES: readonly ProviderEntry[] = [
   { id: 'muse-image', adapter: 'muse-image', enabled: true, priority: 20 },
   { id: 'muse-video', adapter: 'muse-video', enabled: true, priority: 10 },
   { id: 'minimax-speech', adapter: 'minimax-speech', enabled: true, priority: 10 },
-  // Music: deliberately no default provider (user decision 2026-10-23 09:44).
+  // Music: no default *generation* provider (user decision 2026-10-23 09:44). The curated catalog and
+  // the user's own tracks are sources, not paid services (MUSIC-PLAN, approved 14:11).
+  { id: 'music-catalog', adapter: 'curated-catalog', enabled: true, priority: 10 },
+  { id: 'music-mine', adapter: 'user-library', enabled: true, priority: 20 },
 ]
 
 export type KeyResolution = { key: string } | { missing: 'MISSING_KEY' | 'KEY_UNREADABLE' }
@@ -74,6 +79,8 @@ export interface AdapterImpl {
     req: MediaRequest,
     model: ModelInfo,
   ): Promise<Omit<MediaResult, 'overReservation'>>
+  /** Music sources (OCV5-591 M1). */
+  search?(user: StudioUser, q: MusicQuery): Promise<MusicSearchResult>
 }
 
 export interface AdapterFactory<D = unknown> {
@@ -304,6 +311,19 @@ class ConfiguredProvider implements MediaProvider {
     }
     const out = await this.impl.run(ctx, req, model)
     return { ...out, overReservation: out.costCredits > ctx.maxCostCredits }
+  }
+  get search(): MediaProvider['search'] {
+    const impl = this.impl
+    if (!impl.search) return undefined
+    return (user, q) => {
+      if (this.status(user).state !== 'ready')
+        throw new MediaProviderError(
+          'PROVIDER_UNAVAILABLE',
+          false,
+          `media provider ${this.id} is not available`,
+        )
+      return impl.search!(user, q)
+    }
   }
 }
 

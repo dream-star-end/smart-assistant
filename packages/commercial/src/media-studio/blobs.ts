@@ -442,6 +442,24 @@ export class StudioBlobStore {
     return { path: this.blobPath(sha), bytes: Number(row.bytes), mime: row.mime, sha }
   }
 
+  /**
+   * Catalog audio (site-owned, OCV5-591 M1): resolves only a sha an *active* catalog row plays, so
+   * any studio user may preview it; retired tracks and licence snapshots are never served this way.
+   */
+  async openCatalog(
+    sha: string,
+  ): Promise<{ path: string; bytes: number; mime: string; sha: string } | null> {
+    if (!SHA_RE.test(sha)) return null
+    const r = await this.opts.pool.query<{ bytes: string; mime: string }>(
+      `SELECT b.bytes::text AS bytes, b.mime FROM studio_blobs b
+       WHERE b.sha256=$1 AND EXISTS (SELECT 1 FROM studio_music_catalog c WHERE c.blob_sha=$1 AND c.active)`,
+      [sha],
+    )
+    const row = r.rows[0]
+    if (!row) return null
+    return { path: this.blobPath(sha), bytes: Number(row.bytes), mime: row.mime, sha }
+  }
+
   /** Deletes unreferenced blobs (row + file) and expired holds. Returns blobs removed. */
   async gc(batch = 200): Promise<number> {
     await this.opts.pool.query('DELETE FROM studio_quota_holds WHERE expires_at <= NOW()')

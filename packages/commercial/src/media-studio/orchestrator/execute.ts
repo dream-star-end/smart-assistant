@@ -285,7 +285,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
 interface GenPayload {
   takeId: string
   providerId: string
-  ownerKind: 'bible' | 'shot_frame' | 'shot_video' | 'line'
+  ownerKind: 'bible' | 'shot_frame' | 'shot_video' | 'line' | 'music'
   ownerId: string
   request: MediaRequest
 }
@@ -376,6 +376,18 @@ async function adopt(
         }
       }
     }
+  } else if (g.ownerKind === 'music') {
+    // The project's soundtrack (OCV5-591 M1): the newest chosen track wins. Its licence snapshot is
+    // in the take's meta; the edit (trim, loop, fades, ducking) stays as the user set it.
+    await c.query(
+      `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicTakeId', $2::text),
+              rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+      [projectId, takeId],
+    )
+    await appendStudioEvent(c, projectId, 'music.selected', {
+      takeId,
+      message: '配乐换成了你选的曲子。',
+    })
   }
   // shot_frame: nothing to adopt — the next advance starts the video from it.
 }
