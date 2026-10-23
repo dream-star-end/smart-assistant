@@ -8698,7 +8698,15 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageIdentity.test.ts"
         }
+      ],
+      "coverageCommits": [
+        "f7bc6630",
+        "a466412d"
       ]
     }
   ]
