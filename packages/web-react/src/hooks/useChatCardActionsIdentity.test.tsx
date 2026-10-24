@@ -86,7 +86,7 @@ it('a successful card POST remains successful when token rotation happens while 
   vi.stubGlobal('fetch', fetcher)
   const { result } = renderHook(() => useChatCardActions(input))
   const actions = result.current.toolActions.communityBlog!
-  expect(await actions.submit!({ title: 'Fixture', summary: 'Fixture', category: 'general', bodyMarkdown: 'Fixture' })).toEqual({ id: 'committed-fixture' })
+  expect(await actions.submit!({ title: 'Fixture', summary: 'Fixture', category: 'general', bodyMarkdown: 'Fixture' })).toEqual({ id: 'committed-fixture', status: 'pending' })
   expect(fetcher).toHaveBeenCalledTimes(1)
   await expect(actions.submit!({ title: 'Again', summary: 'Fixture', category: 'general', bodyMarkdown: 'Fixture' })).rejects.toThrow()
   expect(fetcher).toHaveBeenCalledTimes(1)
