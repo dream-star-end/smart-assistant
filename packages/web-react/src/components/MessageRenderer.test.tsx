@@ -4231,7 +4231,7 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
 
 describe('system action authority in actual message history', () => {
   const id = 'b5be0795-e604-45ee-bd8b-a519324b5cf4'
-  const text = '```ui\n' + JSON.stringify({ type: 'system_action', proposalId: id }) + '\n```'
+  const text = ['```ui', JSON.stringify({ type: 'system_action', proposalId: id }), '```'].join('\n')
   function actionFixture() {
     const detail = { id, operationId: 'preferences.update', title: '更改通知', state: 'prepared' as const, executor: 'master' as const,
       createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 60000, result: null, previewHash: 'a'.repeat(64),

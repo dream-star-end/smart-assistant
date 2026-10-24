@@ -1,13 +1,14 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
+import type { SystemActionCardActions } from '../components/tool/context'
 import { IuiBlock } from '../components/iui/IuiBlock'
 import { ToolCardActionsContext } from '../components/tool/context'
 import { createMemoryAuthSession } from '../lib/authSession'
 import * as intelligentUi from '../lib/intelligentUi'
 import { useSystemActionCardActions } from './useSystemActionCardActions'
 const id = 'b5be0795-e604-45ee-bd8b-a519324b5cf4'
-const nonce = 'n'.repeat(43)
+const nonce = 'A'.repeat(43)
 function prepared() {
   return { id, operationId: 'preferences.update', title: '更改通知', state: 'prepared', executor: 'master',
     createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 60000, result: null, previewHash: 'a'.repeat(64),
@@ -25,8 +26,10 @@ it('a real native confirmation sheet closes on token refresh at the same identit
   const { auth, input } = setup()
   const fetcher = vi.fn<typeof fetch>(async url => reply(String(url).endsWith('/challenge') ? { detail: prepared(), nonce } : prepared()))
   vi.stubGlobal('fetch', fetcher)
+  let beforeRefresh: SystemActionCardActions | undefined
   function Harness() {
     const { systemActions } = useSystemActionCardActions(input)
+    beforeRefresh ??= systemActions
     return <ToolCardActionsContext.Provider value={{ systemActions }}><IuiBlock code={JSON.stringify({ type: 'system_action', proposalId: id })} /></ToolCardActionsContext.Provider>
   }
   render(<Harness />)
@@ -35,12 +38,16 @@ it('a real native confirmation sheet closes on token refresh at the same identit
   act(() => { auth.commitToken(0, 'fixture-access-b') })
   expect(auth.snapshot().epoch).toBe(0)
   await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  await expect(beforeRefresh!.confirm(id, { nonce, previewHash: 'a'.repeat(64) })).rejects.toThrow()
   expect(fetcher.mock.calls.some(([url]) => String(url).endsWith('/confirm'))).toBe(false)
 })
 it.each(['demo', 'signed-out'])('does not inject an approval provider for %s', mode => {
   const { input } = setup()
+  const fetcher = vi.fn<typeof fetch>()
+  vi.stubGlobal('fetch', fetcher)
   const { result } = renderHook(() => useSystemActionCardActions({ ...input, demo: mode === 'demo', userId: mode === 'signed-out' ? undefined : input.userId }))
   expect(result.current.systemActions).toBeUndefined()
+  expect(fetcher).not.toHaveBeenCalled()
 })
 it('succeeded receipts read and apply preferences once without issuing a preference write', async () => {
   const { input } = setup()
@@ -107,4 +114,45 @@ it('unmount invalidates an outstanding display read even if the auth object rema
   expect(applyIui).not.toHaveBeenCalled()
   expect(input.applyPreferences).not.toHaveBeenCalled()
   expect(input.onSyncError).not.toHaveBeenCalled()
+})
+it('the native explicit confirm posts once and synchronizes the committed preference receipt', async () => {
+  const { input } = setup()
+  const applyIui = vi.spyOn(intelligentUi, 'applyIntelligentUiSnapshot').mockImplementation(() => {})
+  let committed = false
+  const fetcher = vi.fn<typeof fetch>(async (url, opts) => {
+    const path = String(url)
+    const method = opts?.method ?? 'GET'
+    if (method === 'GET' && path === `/api/me/system-actions/${id}`) return reply(committed ? succeeded() : prepared())
+    if (method === 'POST' && path === `/api/auth/system-actions/${id}/challenge`) return reply({ detail: prepared(), nonce })
+    if (method === 'POST' && path === `/api/auth/system-actions/${id}/confirm`) {
+      const proof = JSON.parse(String(opts?.body))
+      expect(Object.keys(proof).sort()).toEqual(['deviceId', 'nonce', 'previewHash'])
+      expect(proof.nonce).toBe(nonce)
+      expect(proof.previewHash).toBe('a'.repeat(64))
+      expect(proof.deviceId).toMatch(/^[0-9a-f-]{36}$/i)
+      committed = true
+      return reply(succeeded())
+    }
+    if (method === 'GET' && path === '/api/me/preferences') {
+      expect(committed).toBe(true)
+      return reply({ prefs: { theme: 'auto', notify_email: false } })
+    }
+    throw new Error('Unexpected system-action fixture request')
+  })
+  vi.stubGlobal('fetch', fetcher)
+  function Harness() {
+    const { systemActions, preferencesRevision } = useSystemActionCardActions(input)
+    return <><output data-testid='preferences-revision'>{preferencesRevision}</output>
+      <ToolCardActionsContext.Provider value={{ systemActions }}><IuiBlock code={JSON.stringify({ type: 'system_action', proposalId: id })} /></ToolCardActionsContext.Provider></>
+  }
+  render(<Harness />)
+  fireEvent.click(await screen.findByRole('button', { name: '查看并确认' }))
+  fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: '确认执行' }))
+  await screen.findByText('已更新')
+  await waitFor(() => expect(screen.getByTestId('preferences-revision')).toHaveTextContent('1'))
+  expect(applyIui).toHaveBeenCalledOnce()
+  expect(input.applyPreferences).toHaveBeenCalledExactlyOnceWith({ theme: 'auto', notify_email: false })
+  expect(input.setTheme).toHaveBeenCalledExactlyOnceWith('system')
+  expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/confirm'))).toHaveLength(1)
+  expect(fetcher.mock.calls.some(([url, opts]) => String(url).includes('/refresh') || opts?.method === 'PATCH')).toBe(false)
 })
