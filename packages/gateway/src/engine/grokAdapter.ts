@@ -45,6 +45,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import { bindRouteTrace } from '../relayTrace.js'
 import {
   CREDIT_EXHAUSTED_DETAIL,
   runningCostFenForUsage,
@@ -402,9 +403,14 @@ interface GrokTurnContext {
   spawnGeneration: number
   firstStdoutTimer: NodeJS.Timeout | null
   launchSpec: GrokLaunchSpec | null
+  /** Ends this turn's route-token trace binding for the container relay (OCV5-580). */
+  releaseRelayTrace: (() => void) | null
 }
 
 function cleanupPromptDir(ctx: GrokTurnContext): void {
+  // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
+  ctx.releaseRelayTrace?.()
+  ctx.releaseRelayTrace = null
   const promptDir = ctx.promptDir
   if (!promptDir) return
   ctx.promptDir = null
@@ -527,6 +533,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       spawnGeneration: 0,
       firstStdoutTimer: null,
       launchSpec: null,
+      releaseRelayTrace: null,
     }
     this.active = ctx
     this.lastActivityAt = Date.now()
@@ -593,6 +600,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
@@ -673,6 +681,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
       ensureFastCatalog(bin, env, env.GROK_HOME)
     }
+    ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
   }
 

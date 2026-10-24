@@ -12,6 +12,7 @@ const sandbox = installDelegateSandbox()
  * Run: npx tsx --test packages/gateway/src/__tests__/delegateAsyncJobs.test.ts
  */
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { after, before, describe, it } from 'node:test'
 
 const PRODUCT_ENV = [
@@ -117,7 +118,7 @@ async function call(
   body: Record<string, unknown>,
   targetAgentId = 'coding-assistant',
   headers: Record<string, string> = {},
-  opts: { autoContext?: boolean } = {},
+  opts: { autoContext?: boolean; readBody?: () => Promise<string> } = {},
 ): Promise<{ status: number; body: any }> {
   const reqHeaders = { ...headers }
   if (
@@ -133,7 +134,7 @@ async function call(
     })
   }
   const req: any = { method: 'POST', headers: reqHeaders }
-  gw.readBody = async () => JSON.stringify(body)
+  gw.readBody = opts.readBody ?? (async () => JSON.stringify(body))
   let status = 0
   let raw = ''
   const res: any = {
@@ -602,5 +603,119 @@ describe('handleDelegateTask model override', () => {
     })
     assert.equal(result.kind, 'retryable_failure')
     assert.equal(result.code, 'NO_TRANSPORT')
+  })
+})
+
+describe('605 delegate trace boundaries', () => {
+  const parentTraceId = 'a'.repeat(32)
+  const childTraceId = 'b'.repeat(32)
+  const signed = () => ({ [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0, traceId: parentTraceId }) })
+
+  async function mintBarrier() {
+    let arrived!: () => void
+    let release!: (status: number) => void
+    let observed: any
+    let readyTimeout: ReturnType<typeof setTimeout>
+    const ready = new Promise<void>((resolve, reject) => {
+      arrived = () => { clearTimeout(readyTimeout); resolve() }
+      readyTimeout = setTimeout(() => reject(new Error('trace fixture did not receive mint request')), 4000)
+    })
+    const gate = new Promise<number>(resolve => { release = resolve })
+    const server = createServer(async (req, res) => {
+      if (req.url === '/internal/v3/marketplace/sync') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '765', profiles: [] } }))
+        return
+      }
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(Buffer.from(chunk))
+      observed = JSON.parse(Buffer.concat(chunks).toString())
+      arrived()
+      const status = await gate
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ traceId: childTraceId, parentTraceId: observed.parentTraceId }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as any).port}`
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'synthetic-proof-only'
+    process.env.OC_USER_ID = '765'
+    return { ready, release, observed: () => observed, close: async () => {
+      clearTimeout(readyTimeout)
+      release(503)
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    } }
+  }
+  async function drained(gw: any) {
+    const deadline = Date.now() + 2000
+    while (gw._activeDelegations !== 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.equal(gw._activeDelegations, 0)
+  }
+
+  it('parent Stop during mint cannot create a child and does not consume queue budget', async () => {
+    const gw = makeGateway()
+    gw.sessions.getByKey = (key: string) => key === PARENT_KEY ? { sessionKey: PARENT_KEY, channel: 'webchat', agentId: 'main', _teamModeTurn: true } : undefined
+    gw.sessions.interrupt = () => false
+    const mint = await mintBarrier()
+    try {
+      const pending = call(gw, 'handleDelegateTask', { goal: 'stop during mint' }, 'coding-assistant', signed())
+      await Promise.race([mint.ready, pending.then(() => { throw new Error('delegate returned before trace fixture') })])
+      assert.equal(gw._delegateQueueWaiters?.size ?? 0, 0)
+      assert.equal(gw._interruptDelegationsForParent(PARENT_KEY), true)
+      mint.release(200)
+      await pending
+      assert.equal(gw._created?.length ?? 0, 0)
+      assert.equal(gw._submitted?.length ?? 0, 0)
+      await drained(gw)
+    } finally { await mint.close() }
+  })
+
+  it('failed mint also rechecks async owner fence before spawn', async () => {
+    process.env.OC_DELEGATE_SM = '1'
+    const gw = makeGateway()
+    const mint = await mintBarrier()
+    try {
+      const response = await call(gw, 'handleDelegateTask', { goal: 'lose fence', async: true }, 'coding-assistant', signed())
+      await mint.ready
+      const snap = gw._delegateJobs.snapshotOf(response.body.jobId)
+      assert.equal(snap.parentTraceId, parentTraceId)
+      const paused = gw._delegateJobs.pauseForCutover(snap.id, { claimToken: snap.claimToken, fencingEpoch: snap.fencingEpoch, generation: 1, checkpointKind: 'none' })
+      assert.ok(paused)
+      mint.release(503)
+      await drained(gw)
+      assert.equal(gw._created?.length ?? 0, 0)
+      assert.equal(gw._submitted?.length ?? 0, 0)
+    } finally { await mint.close() }
+  })
+
+  it('canonical child reaches submit while parent remains frozen before delayed body read', async () => {
+    const gw = makeGateway()
+    const submit = gw.sessions.submit
+    let submittedTrace: unknown
+    gw.sessions.submit = (...args: any[]) => { submittedTrace = args[6]; return submit(...args) }
+    const headers = signed()
+    const mint = await mintBarrier()
+    try {
+      const pending = call(gw, 'handleDelegateTask', { goal: 'canonical trace' }, 'coding-assistant', headers, { readBody: async () => {
+        headers[DELEGATE_CONTEXT_HEADER] = issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0, traceId: 'c'.repeat(32) })
+        return JSON.stringify({ goal: 'canonical trace', parentTraceId: 'd'.repeat(32) })
+      } })
+      await Promise.race([mint.ready, pending.then(() => { throw new Error('delegate returned before trace fixture') })])
+      assert.equal(mint.observed().parentTraceId, parentTraceId)
+      mint.release(200)
+      const result = await pending
+      assert.equal(result.status, 200)
+      assert.equal(submittedTrace, childTraceId)
+    } finally { await mint.close() }
+  })
+
+  it('token expiring while body is read is still rejected before mint or spawn', async (t) => {
+    let now = Date.now()
+    t.mock.method(Date, 'now', () => now)
+    const gw = makeGateway()
+    const headers = { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0, traceId: parentTraceId, ttlMs: 1000 }) }
+    const response = await call(gw, 'handleDelegateTask', { goal: 'expired' }, 'coding-assistant', headers, { readBody: async () => { now += 1001; return JSON.stringify({ goal: 'expired' }) } })
+    assert.equal(response.status, 401)
+    assert.equal(gw._created?.length ?? 0, 0)
   })
 })

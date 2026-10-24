@@ -54,13 +54,14 @@ import {
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
-import { issueConsultTurnToken, issueDelegateContextToken } from '../delegateContext.js'
+import { writeCodexDelegateContext } from './codexDelegateContext.js'
 import {
   buildHermeticDenial,
   isHermeticExecutionMethod,
 } from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
+import { withCodexTurnTrace } from '../relayTrace.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -373,6 +374,7 @@ interface QueuedTurn {
   requestId?: string
   collabAgentPolicy?: CollabAgentPolicy
   queueTurn?: boolean
+  traceId?: string
   automaticRetryState?: AutomaticRetryState
 }
 
@@ -1112,26 +1114,15 @@ export class CodexAppServerRunner extends EventEmitter {
   /** The app-server process is long-lived. Advisor-mode parents mint a v2
    * turn token; changing origin turnKey forces a respawn so MCP env cannot
    * reread a later turn's file. */
-  private refreshDelegateContext(): void {
-    const file = this.cachedOverrides?.delegateContextFile
-    if (!file) return
-    const consult = this.consultTurnBinding
-    const token = consult
-      ? issueConsultTurnToken({
-          agentId: this.opts.agentId,
-          sessionKey: this.opts.sessionKey,
-          depth: this.opts.delegationDepth ?? 0,
-          turnKey: consult.turnKey,
-          turnIndex: consult.turnIndex,
-          collabMode: 'advisor',
-          configVersion: consult.configVersion,
-        })
-      : issueDelegateContextToken({
-          agentId: this.opts.agentId,
-          sessionKey: this.opts.sessionKey,
-          depth: this.opts.delegationDepth ?? 0,
-        })
-    writeFileSync(file, `${token}\n`, { mode: 0o600 })
+  private refreshDelegateContext(traceId?: string): void {
+    writeCodexDelegateContext({
+      file: this.cachedOverrides?.delegateContextFile,
+      agentId: this.opts.agentId,
+      sessionKey: this.opts.sessionKey,
+      depth: this.opts.delegationDepth ?? 0,
+      consultTurn: this.consultTurnBinding,
+      traceId,
+    })
   }
 
   /** Cleanup helper shared by `shutdown()` and the proc close handler so
@@ -1180,7 +1171,9 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
     queueTurn = false,
     automaticRetryState?: AutomaticRetryState,
+    traceId?: string | null,
   ): Promise<void> {
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
       this.spawnEmitted = true
@@ -1196,6 +1189,7 @@ export class CodexAppServerRunner extends EventEmitter {
         requestId,
         collabAgentPolicy,
         queueTurn,
+        traceId: turnTraceId,
         automaticRetryState,
       })
       void this.drain()
@@ -1352,6 +1346,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.requestId,
         turn.collabAgentPolicy,
         turn.automaticRetryState,
+        turn.traceId ?? null,
       )
       turn.resolve()
     } catch (err) {
@@ -2376,7 +2371,9 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
+    traceId?: string | null,
   ): Promise<void> {
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
     // Join speculative preparation; a failed warmup falls back to normal preparation.
@@ -2388,7 +2385,7 @@ export class CodexAppServerRunner extends EventEmitter {
         : delta?.type === 'thinking_delta' && delta.thinking?.length ? 'first_reasoning_delta' : null
       if (!stage || seenDeltas.has(stage) || message.session_id !== this.threadId) return
       seenDeltas.add(stage)
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage, elapsedMs: performance.now() - timingStartedAt })
     }
     this.on('message', observeFirstDelta)
@@ -2404,7 +2401,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const repoSnap = this._currentRepoSnapshot()
     let effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
-      traceId: this.opts.traceId,
+      traceId: turnTraceId,
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       pid: this.proc?.pid ?? null,
@@ -2458,10 +2455,10 @@ export class CodexAppServerRunner extends EventEmitter {
       }
       const reusedProcess = Boolean(this.proc && this.initialized && !this.staleProcGeneration)
       await this.ensureSpawned(repoSnap, effectiveCwd)
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'engine_ready', reusedProcess, elapsedMs: performance.now() - timingStartedAt })
       const threadStartedAt = performance.now()
-      this.refreshDelegateContext()
+      this.refreshDelegateContext(turnTraceId)
 
       // Each fresh app-server proc must explicitly attach a thread before
       // turn/start. `attached` is per-proc (cleared on close/error), so this
@@ -2558,7 +2555,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.emit('session_id', this.threadId)
       }
       this._preheatedSignature = null
-      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
         stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
@@ -2600,9 +2597,10 @@ export class CodexAppServerRunner extends EventEmitter {
 
         let tres: { turn?: { id?: string } } | undefined
         try {
-          log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+          log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
-          tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+          tres = (await withCodexTurnTrace(this.threadId, turnTraceId, () =>
+            this.sendRequest('turn/start', this.buildTurnStartParams(prompt)))) as
             | { turn?: { id?: string } }
             | undefined
         } catch (startErr) {
@@ -2680,7 +2678,7 @@ export class CodexAppServerRunner extends EventEmitter {
           throw startErr
         }
 
-        log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        log.info('codex_turn_timing', { traceId: turnTraceId, threadId: this.threadId,
           stage: 'turn_start_accepted', elapsedMs: performance.now() - timingStartedAt })
         const turnId = tres?.turn?.id
         if (typeof turnId !== 'string' || !turnId) {

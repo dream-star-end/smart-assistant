@@ -60,8 +60,9 @@ export function continuationPrompts(code) {
   if (!/^[A-Z]{4}[0-9]{4}$/.test(code)) throw new Error("Invalid continuation code");
   const id = crypto.randomUUID();
   return {
-    first: `R2-${id} 今天第一张采购单的编号是 PO-${code}。收到请回复「收到」。`,
-    second: `R2-${id}-2 今天第一张采购单的编号是多少？`,
+    // Agent memory is shared across sessions: each probe names its own purchase entity.
+    first: `采购批次 R2-${id} 的第一张采购单编号是 PO-${code}。收到请回复「收到」。`,
+    second: `采购批次 R2-${id} 的第一张采购单编号是多少？`,
   };
 }
 export function assertSameSession(first, second) {
