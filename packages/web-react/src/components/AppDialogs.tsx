@@ -4,7 +4,6 @@
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { AgentPicker } from "./AgentPicker";
 import { PendingPaymentRecovery } from "./payment/PendingPaymentRecovery";
 import { LazyBoundary } from "./ChunkErrorBoundary";
 import { DialogFallback } from "./DialogFallback";
@@ -13,7 +12,7 @@ import { uploadFilesToProject } from "../lib/projectFileUpload";
 import { normalizeManageTab } from "../lib/manageTabs";
 import { CHAT_CREATE_TEMPLATES } from "../lib/chatCreateTemplates";
 import { DEFAULT_AGENT } from "../lib/agents";
-import { lazy } from "react";
+import { lazy, useEffect, useState } from "react";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
@@ -33,6 +32,8 @@ import type { ProjectRoute } from "../hooks/useAppRoute";
 import type { Theme } from "../hooks/useTheme";
 import type { SettingsDestinationSection } from "../lib/productCapabilities";
 import type { ToastFn } from "./ui/Toast";
+
+const AgentPicker = lazy(() => import("./AgentPicker").then((m) => ({ default: m.AgentPicker })));
 
 const SettingsCenter = lazy(() =>
   import("./SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -342,8 +343,11 @@ export function AppDialogs({
   user,
   wsMessages,
 }: AppDialogsProps) {
+  const [pickerMounted, setPickerMounted] = useState(pickerOpen);
+  useEffect(() => { if (pickerOpen) setPickerMounted(true); }, [pickerOpen]);
   return (
     <>
+      {(pickerOpen || pickerMounted) && <LazyBoundary fallback={pickerOpen ? <DialogFallback /> : null}>
       <AgentPicker
         open={pickerOpen}
         current={agent}
@@ -405,6 +409,7 @@ export function AppDialogs({
           setChatError(null);
         }}
       />
+      </LazyBoundary>}
 
       {!demo && authed && auth && <PendingPaymentRecovery auth={auth} onPaid={refreshMe} />}
 
