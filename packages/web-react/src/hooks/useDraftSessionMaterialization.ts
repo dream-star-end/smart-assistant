@@ -5,7 +5,6 @@ import type { UseChatSocket } from './useChatSocket'
 import type { PreferenceEffort } from '../lib/modelPreferences'
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY } from '../lib/composerDraft'
 import { moveComposerAttachments } from '../components/Composer'
-import { writeTeamMode } from '../lib/teamMode'
 import { writeSessionEffort } from '../lib/sessionEffort'
 import { writeContextTier } from '../lib/sessionContextTier'
 import { writeSessionServiceTier } from '../lib/sessionServiceTier'
@@ -19,7 +18,6 @@ export function useDraftSessionMaterialization(args: {
   stopPreparing: () => void
   agentId: string
   modelId: string | undefined
-  teamMode: boolean
   promoteDraftCollab?: (sessionId: string) => void
   sessionEffort: PreferenceEffort | null | undefined
   contextTier: CursorContextTier
@@ -29,7 +27,7 @@ export function useDraftSessionMaterialization(args: {
   setActiveId: Dispatch<SetStateAction<string | undefined>>
 }): () => string | undefined {
   const { demo, userId, activeId, draftSessionId, stopPreparing, agentId, modelId,
-    teamMode, promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId } = args
+    promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId } = args
   return useCallback(() => {
     if (demo || !userId || activeId) return activeId
     stopPreparing()
@@ -37,7 +35,6 @@ export function useDraftSessionMaterialization(args: {
     const session: Session = { id, title: '新对话', ownerUserId: userId,
       updatedAt: new Date().toISOString(), messageCount: 0, ...(modelId ? { modelId } : {}) }
     promoteDraftCollab?.(id)
-    writeTeamMode(id, teamMode)
     if (sessionEffort !== undefined) writeSessionEffort(id, sessionEffort)
     writeContextTier(id, contextTier)
     writeSessionServiceTier(id, serviceTier)
@@ -50,5 +47,5 @@ export function useDraftSessionMaterialization(args: {
     setActiveId(id)
     return id
   }, [demo, userId, activeId, draftSessionId, stopPreparing, agentId, modelId,
-    teamMode, promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId])
+    promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId])
 }

@@ -15,7 +15,6 @@ import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
 import { findRewriteTarget } from "../lib/implicitFeedback";
 import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor } from "../lib/collaborationSend";
-import { writeTeamMode } from "../lib/teamMode";
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
@@ -220,12 +219,9 @@ export function useComposerSend({
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
           ...(sendProjectId ? { projectId: sendProjectId } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
-          // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
+          // 之后 default_model 变更/其它会话换模都不影响它。
           ...(modelId ? { modelId } : {}),
         };
-        // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
-        // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);

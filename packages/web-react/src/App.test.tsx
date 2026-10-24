@@ -792,7 +792,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     fireEvent.click(teamChoice())
     await waitFor(() => expect(teamChoice()).toHaveAttribute('aria-pressed', 'true'))
-    expect(localStorage.getItem('oc_v5_team_mode')).toBe('1')
+    expect(localStorage.getItem('oc_v5_team_mode')).toBeNull()
     await waitFor(() => {
       const put = fetchMock.mock.calls.find(
         ([url, init]) =>

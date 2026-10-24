@@ -22,7 +22,6 @@ import { resolveTutorialAction } from "../lib/tutorialActions";
 import type { TutorialCase } from "../lib/tutorialCaseCatalog";
 import type { Agent } from "../lib/agents";
 import type { AuthSession, Message, Session, User } from "../lib/types";
-import type { CollabMode } from "../lib/collaborationConfig";
 import type { ConfirmChoice, ConfirmOpts } from "../components/ui/ConfirmDialog";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import type { AuthMode } from "../components/AuthGate";
@@ -35,7 +34,6 @@ export type AppNavigationActionsInput = {
   activeId: string | undefined;
   agent: Agent;
   auth: AuthSession | null;
-  collabMode: CollabMode;
   promoteDraftCollab: (sessionId: string) => void;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
   contextTier: "300k" | "1m";
@@ -90,7 +88,6 @@ export function useAppNavigationActions({
   activeId,
   agent,
   auth,
-  collabMode,
   promoteDraftCollab,
   confirmDialog,
   contextTier,
@@ -142,7 +139,7 @@ export function useAppNavigationActions({
 }: AppNavigationActionsInput) {
   const ensureActiveSession = useDraftSessionMaterialization({
     demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
-    teamMode: collabMode === "team", promoteDraftCollab, sessionEffort, contextTier, serviceTier,
+    promoteDraftCollab, sessionEffort, contextTier, serviceTier,
     sockRef, setSessions, setActiveId,
   });
 

@@ -11,7 +11,6 @@ import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveSessionModel } from "../lib/modelPreferences";
 import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
-import { writeTeamMode } from "../lib/teamMode";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody, isStaleCollabEpoch } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
 import type { Agent } from "../lib/agents";
@@ -258,7 +257,6 @@ export function useSessionModelAndCollab({
       // Optimistic mode only; configVersion stays empty until the server returns it.
       setCollabUi((cur) => ({ ...cur, mode, advisorModel, configVersion: "" }));
       setTeamModeState(mode === "team");
-      writeTeamMode(activeId, mode === "team");
       setCollabSaveError(null);
       // useAuth.auth is null until authed; authRef always holds MemoryAuthSession.
       if (demo || !auth) return;
