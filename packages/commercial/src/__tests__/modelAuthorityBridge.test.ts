@@ -2834,7 +2834,7 @@ describe('OCV5-610 independent help sidecar', () => {
         assert.equal(scopes[0]!.sessionId, original!.sessionId)
         assert.equal(scopes[0]!.agentId, original!.agentId)
       }
-    } finally { client?.close(); await rig.close() }
+    } finally { client?.close(); await stopRig(rig) }
   })
 })
 
@@ -2848,5 +2848,5 @@ test('OCV5-610 binary JSON also strips forged help before reaching an old gatewa
     const frame = JSON.parse(rig.containerSeen.find(raw => raw.includes('synthetic-help-binary'))!)
     assert.equal(SYSTEM_HELP_BOOTSTRAP_FIELD in frame, false)
     assert.equal(frame.id, 'synthetic-help-binary')
-  } finally { client?.close(); await rig.close() }
+  } finally { client?.close(); await stopRig(rig) }
 })
