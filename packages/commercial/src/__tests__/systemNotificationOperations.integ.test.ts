@@ -42,7 +42,9 @@ async function fixture(t: import('node:test').TestContext, loseReply = false) {
     return r.rows[0].id as string
   }
   async function proposal(operation = 'notifications.read-all', args: unknown = {}) {
-    const action = await service.prepare(actor, operation, args, randomUUID()), detail = service.detail('765', action.id), deviceId = randomUUID()
+    const action = await service.prepare(actor, operation, args, randomUUID())
+    const detail = service.detail('765', action.id)
+    const deviceId = randomUUID()
     const { nonce } = service.challenge(principal, action.id, deviceId, detail.previewHash)
     return { id: action.id, proof: { nonce, deviceId, previewHash: detail.previewHash } }
   }
@@ -50,40 +52,49 @@ async function fixture(t: import('node:test').TestContext, loseReply = false) {
   return { pool, ledger, service, add, proposal, readIds }
 }
 test('read-all freezes only currently visible unread IDs and later arrivals remain unread', async t => {
-  const f = await fixture(t), own = await f.add(), broadcast = await f.add({ audience: 'all' })
+  const f = await fixture(t)
+  const own = await f.add()
+  const broadcast = await f.add({ audience: 'all' })
   await f.add({ userId: '8000000766' }); await f.add({ audience: 'all', created: '2020-01-01T00:00:00Z' }); await f.add({ expires: '2020-01-01T00:00:00Z' })
-  const p = await f.proposal(), later = await f.add()
+  const p = await f.proposal()
+  const later = await f.add()
   assert.equal((await f.service.confirm(principal, p.id, p.proof) as { state: string }).state, 'succeeded')
   assert.deepEqual(await f.readIds(), [own, broadcast]); assert(!(await f.readIds()).includes(later))
   assert.equal((await f.pool.query('SELECT count(*)::int AS n FROM system_action_receipts')).rows[0].n, 1)
 })
 test('single mark-read enforces own visibility and already-read remains an idempotent noop', async t => {
-  const f = await fixture(t), own = await f.add(), other = await f.add({ userId: '8000000766' })
+  const f = await fixture(t)
+  const own = await f.add()
+  const other = await f.add({ userId: '8000000766' })
   await assert.rejects(f.proposal('notifications.mark-read', { messageId: other }))
   for (let i = 0; i < 2; i++) { const p = await f.proposal('notifications.mark-read', { messageId: own }); assert.equal((await f.service.confirm(principal, p.id, p.proof) as { state: string }).state, 'succeeded') }
   assert.deepEqual(await f.readIds(), [own])
 })
 test('message version drift aborts the entire frozen batch and its receipt', async t => {
-  const f = await fixture(t); await f.add(); const changed = await f.add(), p = await f.proposal()
+  const f = await fixture(t); await f.add(); const changed = await f.add()
+  const p = await f.proposal()
   await f.pool.query("UPDATE inbox_messages SET body_md='Synthetic revised body' WHERE id=$1", [changed])
   assert.equal((await f.service.confirm(principal, p.id, p.proof) as { state: string }).state, 'failed')
   assert.deepEqual(await f.readIds(), [])
   assert.equal((await f.pool.query('SELECT count(*)::int AS n FROM system_action_receipts')).rows[0].n, 0)
 })
 for (const mutation of ['delete','expire']) test(`${mutation} of an approved message cannot leave partial read markers`, async t => {
-  const f = await fixture(t); await f.add(); const changed = await f.add(), p = await f.proposal()
+  const f = await fixture(t); await f.add(); const changed = await f.add()
+  const p = await f.proposal()
   await f.pool.query(mutation === 'delete' ? 'DELETE FROM inbox_messages WHERE id=$1' : "UPDATE inbox_messages SET expires_at=now()-interval '1 second' WHERE id=$1", [changed])
   assert.equal((await f.service.confirm(principal, p.id, p.proof) as { state: string }).state, 'failed')
   assert.deepEqual(await f.readIds(), [])
 })
 test('duplicate confirmation commits one inbox effect and one positive receipt', async t => {
-  const f = await fixture(t); const own = await f.add(), p = await f.proposal()
+  const f = await fixture(t); const own = await f.add()
+  const p = await f.proposal()
   await Promise.all([f.service.confirm(principal, p.id, p.proof), f.service.confirm(principal, p.id, p.proof)])
   assert.deepEqual(await f.readIds(), [own])
   assert.equal((await f.pool.query('SELECT count(*)::int AS n FROM system_action_receipts')).rows[0].n, 1)
 })
 test('lost COMMIT reply keeps unknown until this exact receipt restores success without another inbox write', async t => {
-  const f = await fixture(t, true); const own = await f.add(), p = await f.proposal()
+  const f = await fixture(t, true); const own = await f.add()
+  const p = await f.proposal()
   assert.equal((await f.service.confirm(principal, p.id, p.proof) as { state: string }).state, 'unknown')
   assert.deepEqual(await f.readIds(), [own])
   const readAt = (await f.pool.query('SELECT read_at::text AS value FROM inbox_message_reads')).rows[0].value

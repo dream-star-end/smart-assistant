@@ -10,7 +10,8 @@ const actor: SystemActor = { userId: '765', role: 'user', sessionId: 'synthetic-
 const messages = [{ id: '19', version: '12' }, { id: '20', version: '13' }]
 function fixture() {
   let authorized = true
-  const snapshots: Array<[string, string | null]> = [], writes: unknown[] = []
+  const snapshots: Array<[string, string | null]> = []
+  const writes: unknown[] = []
   const runner = { query: async () => { throw new Error('unexpected direct query in unit fixture') } }
   let writeFailure = false
   const registry = new SystemOperationRegistry(notificationOperations({
@@ -35,30 +36,35 @@ test('notification public schemas reject model-supplied uid, arbitrary URLs, ids
   assert.deepEqual(f.snapshots, [])
 })
 test('prepare freezes server-side IDs and sanitizes the own-account title without performing a write', async () => {
-  const f = fixture(), e = await f.execution('notifications.mark-read', { messageId: '19' })
+  const f = fixture()
+  const e = await f.execution('notifications.mark-read', { messageId: '19' })
   assert.deepEqual(f.snapshots, [['765', '19']])
   assert.deepEqual(e.args, { messages: [messages[0]], title: 'Synthetic notification' })
   assert.deepEqual(f.writes, [])
 })
 test('read-all preview and execution use only the prepared set with the same receipt runner', async () => {
-  const f = fixture(), e = await f.execution('notifications.read-all', {})
+  const f = fixture()
+  const e = await f.execution('notifications.read-all', {})
   const result = await f.registry.execute(actor, e)
   assert.equal(result.completion, 'done')
   assert.deepEqual(f.writes, [{ uid: '765', refs: messages }])
   assert.deepEqual(f.snapshots, [['765', null]]) // No re-query expanding all at execution time.
 })
 test('fresh account authorization prevents execution after prepare', async () => {
-  const f = fixture(), e = await f.execution('notifications.read-all', {})
+  const f = fixture()
+  const e = await f.execution('notifications.read-all', {})
   f.revoke(); await assert.rejects(f.registry.execute(actor, e), e => e instanceof SystemOperationRejected && e.code === 'FORBIDDEN')
   assert.deepEqual(f.writes, [])
 })
 test('frozen version drift and malformed shapes cannot execute', async () => {
-  const f = fixture(), e = await f.execution('notifications.read-all', {})
+  const f = fixture()
+  const e = await f.execution('notifications.read-all', {})
   await assert.rejects(f.registry.execute(actor, { ...e, expectedVersion: 'different' }))
   await assert.rejects(f.registry.execute(actor, { ...e, args: { messages, url: 'https://invalid.example/' } }))
   assert.deepEqual(f.writes, [])
 })
 test('business snapshot conflict remains a known no-effect conflict for the receipt transaction', async () => {
-  const f = fixture(), e = await f.execution('notifications.read-all', {})
+  const f = fixture()
+  const e = await f.execution('notifications.read-all', {})
   f.conflict(); await assert.rejects(f.registry.execute(actor, e), error => error instanceof SystemOperationRejected && error.code === 'CONFLICT')
 })

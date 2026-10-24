@@ -27,7 +27,8 @@ async function translate<T>(work: () => Promise<T>): Promise<T> {
   }
 }
 export function notificationOperations(deps: NotificationOperationDeps): SystemOperation[] {
-  const snapshot = deps.snapshot ?? snapshotInboxRead, write = deps.write ?? markApprovedInboxRead
+  const snapshot = deps.snapshot ?? snapshotInboxRead
+  const write = deps.write ?? markApprovedInboxRead
   const effect = deps.effect ?? withPgActionReceipt
   return [false, true].map<SystemOperation>(all => ({
     id: all ? 'notifications.read-all' : 'notifications.mark-read', title: all ? '将本次未读通知全部标为已读' : '将通知标为已读',
@@ -36,7 +37,7 @@ export function notificationOperations(deps: NotificationOperationDeps): SystemO
     input: all ? {} : { messageId: 'positive decimal notification ID' }, authorize: deps.authorize,
     prepare: async (actor, raw) => {
       const result = await translate(() => snapshot(actor.userId, all ? null : (raw as z.infer<typeof single>).messageId))
-      const args = { messages: result.messages, ...(all ? {} : { title: (result.title ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200) }) }
+      const args = { messages: result.messages, ...(all ? {} : { title: Array.from(result.title ?? '', char => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127 ? ' ' : char).join('').slice(0, 200) }) }
       return { args, resourceKey: `notifications:${actor.userId}`, expectedVersion: digest(args.messages), preview: {
         title: all ? '将本次未读通知全部标为已读' : '将通知标为已读', description: all ? `本次冻结 ${args.messages.length} 条通知；此后新增通知不在范围内。` : '仅修改下列通知的本人已读状态。',
         scope: '本人站内通知', before: [{ label: all ? '本次未读数量' : '通知标题', value: all ? String(args.messages.length) : args.title! }],
