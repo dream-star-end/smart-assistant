@@ -1,3 +1,6 @@
+import { AuthEpochStaleError } from '../lib/api/http';
+import { attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
+import { useAuthAccessGeneration } from './useAuthAccessGeneration';
 import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
@@ -148,8 +151,13 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const authRef = useRef<AuthSession>(createMemoryAuthSession(() => expiredUiRef.current()));
 
   const generation = useAuthAccessGeneration(authRef.current);
+  const validationAlive = useRef(true);
+  useEffect(() => {
+    validationAlive.current = true;
+    return () => { validationAlive.current = false; };
+  }, []);
   const validation = useRef<{
-    auth: AuthSession; epoch: number; generation: number;
+    auth: AuthSession; epoch: number; generation: number; pending: boolean;
     identity?: ResolvedIdentity | null;
     promise: Promise<{ me: User; identity: ResolvedIdentity | null }>;
   } | null>(null);
@@ -476,7 +484,56 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     } catch {
       /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
     }
-  }, [demo, authed]);
+  }, [demo, authed, commitMeUser]);
+
+  // A same-epoch refresh has no userId. Business callbacks stay disabled until /me
+  // verifies the exact new token; cleanup cancels only this consumer's commit.
+  useEffect(() => {
+    const session = auth;
+    if (demo || booting || !authed || !session || !session.snapshot().token || identityIsCurrent(account.identity, session, user?.id)) return;
+    const epoch = session.snapshot().epoch;
+    let flight = validation.current;
+    // Reuse an in-progress GET across its own 401 refresh. The whole task is
+    // bounded; each actual make still proves the exact token it used.
+    if (!flight || flight.auth !== session || flight.epoch !== epoch || (!flight.pending &&
+        (flight.generation !== generation || (flight.identity && !identityIsCurrent(flight.identity, session))))) {
+      let observedGeneration = generation;
+      const current = () => validationAlive.current && session === authRef.current && session.snapshot().epoch === epoch;
+      const verify = async () => {
+        for (let attempt = 0; ; attempt++) {
+          if (!current()) throw new AuthEpochStaleError();
+          try {
+            let identity: ResolvedIdentity | null = null;
+            const me = await api.getMe(session, value => { identity = value; }, value => { observedGeneration = value.generation; });
+            if (!current() || (identity && !identityIsCurrent(identity, session, me.id))) throw new AuthEpochStaleError();
+            return { me, identity };
+          } catch (error) {
+            if (!current() || attempt >= 1 || (!isAuthRecoveryTransient(error) && !(error instanceof AuthEpochStaleError))) throw error;
+            await new Promise<void>(resolve => setTimeout(resolve, AUTH_RECOVERY_BACKOFF_MS[attempt]));
+          }
+        }
+      };
+      const promise = verify().then(result => {
+        selected.identity = result.identity;
+        return result;
+      }).finally(() => { selected.pending = false; selected.generation = observedGeneration; });
+      const selected = { auth: session, epoch, generation, pending: true, promise, identity: undefined as ResolvedIdentity | null | undefined };
+      validation.current = flight = selected;
+    }
+    let cancelled = false;
+    void flight.promise.then(({ me, identity }) => {
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity && commitMeUser(me, identity)) {
+        setAuthError(null);
+        setAuthRecoveryAvailable(false);
+      }
+    }).catch(() => {
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch) {
+        setAuthError("登录状态暂未核验完成，请重试");
+        setAuthRecoveryAvailable(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [demo, booting, authed, auth, generation, account.identity, user?.id, commitMeUser]);
 
   return {
     auth,
