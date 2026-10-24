@@ -1,3 +1,4 @@
+import type { RuntimeInspection } from './dockerInspection.js';
 /**
  * Compute pool 共享类型。
  *
@@ -316,6 +317,8 @@ export interface AgentRunContainerResponse {
 
 /** /containers/:id/inspect 响应(简化,只回 master 关心的) */
 export interface AgentContainerInspect {
+  /** Optional actual metadata. Missing/invalid is unknown, never a readiness claim. */
+  runtimeInspection?: RuntimeInspection;
   id: string;
   state: "created" | "running" | "exited" | "dead" | "paused" | "restarting" | "removing";
   startedAt: string | null;

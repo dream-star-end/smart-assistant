@@ -1,3 +1,4 @@
+import { readDockerRuntimeInspection, readWireRuntimeInspection, type RuntimeInspection } from '../compute-pool/dockerInspection.js';
 /**
  * V3 Phase 3C — per-user openclaude-runtime container supervisor.
  *
@@ -1357,6 +1358,8 @@ export interface ProvisionedV3Container {
 
 /** getV3ContainerStatus 返回 */
 export interface V3ContainerStatus {
+  /** Internal actual inspect evidence only; no host ownership/RO assertion. */
+  runtimeInspection?: RuntimeInspection;
   containerId: number;
   userId: number;
   boundIp: string;
@@ -4110,6 +4113,7 @@ export async function getV3ContainerStatus(
     && row.host_uuid !== deps.selfHostId
     && deps.containerService !== undefined;
 
+  let runtimeInspection: RuntimeInspection | undefined;
   let state: V3ContainerStatus["state"];
   let image: string | undefined;
   let imageId: string | undefined;
@@ -4117,6 +4121,7 @@ export async function getV3ContainerStatus(
   try {
     if (useRemote) {
       const info = await deps.containerService!.inspect(row.host_uuid!, row.container_internal_id);
+      runtimeInspection = readWireRuntimeInspection(info.runtimeInspection, info.id, row.container_internal_id);
       state = info.state === "running" ? "running" : "stopped";
       // remote inspect:image(tag)/imageId/labels 均待 node-agent 契约扩展。ContainerInspect
       // 类型已在 containerService.ts 加可选 imageId/labels,但远端 backend 未回传前为 undefined
@@ -4130,6 +4135,7 @@ export async function getV3ContainerStatus(
         : undefined;
     } else {
       const info = await deps.docker.getContainer(row.container_internal_id).inspect();
+      runtimeInspection = readDockerRuntimeInspection(info, row.container_internal_id);
       const running = Boolean(info.State && info.State.Running);
       state = running ? "running" : "stopped";
       // Config.Image = 创建容器时的镜像名:tag(非 resolved sha),desired imageId 缺省时按 tag 回落比对。
@@ -4161,6 +4167,7 @@ export async function getV3ContainerStatus(
     state,
     hostId: row.host_uuid,
     lastWsActivity: row.last_ws_activity,
+    ...(runtimeInspection ? { runtimeInspection } : {}),
     ...(image ? { image } : {}),
     ...(imageId ? { imageId } : {}),
     ...(labels ? { labels } : {}),
