@@ -36,7 +36,7 @@
 
 `fen = ceil((input×inputPrice + output×outputPrice + cacheRead×readPrice + cacheWrite×writePrice) × composedMultiplier / 1,000,000)`。
 
-价格单位为分 / 百万 token；倍率实际通过 BigInt ×1000 运算、总和一次舍入。数据库 `cost_credits` 单位为**分**，前端 **100 分 = 1 积分**（`billing/calculator.ts:49`）。本票所有传输与比较使用分，展示才除以 100，避免把分误报成积分。
+重要纠正（08:06复核）：computeCostFen/calculator 的旧“分/100”注释不能代表现行产品展示。migration0269明确 cost_credits/credit_ledger shown 1:1 as 积分，当前 cards/ChatHeader/Sidebar 的 formatCredits 也仅做千分位，未除100。因此原始整数按1:1积分展示；本票基线为5与125积分。计算仍复用原BigInt算法，报价显示不修改任何价表/扣费。
 
 - `PricingCache.get()` 为当前价格权威；`/api/public/models` 的每千 token 展示价已经包含模型倍率，不可再乘一次。
 - 模型倍率与 agent 倍率复用 `composeMultiplier` / `getAgentCostMultiplier`；Fast 复用 `applyFastServiceTierPricing`；Cursor 复用 `cursorSettleMultiplier`。不另造价格表。
@@ -51,8 +51,10 @@
 - 22:24 UTC 第二次使用真实冷浏览器登录，响应用户为 **765**；无模型请求。桌面 1440×1000、手机 390×844 的现有模型菜单截图已取回同目录 `evidence/`。
 - 该登录返回的可用价格示例（积分 / 千 token，已含模型倍率）：GPT-6-Astra 输入 0.005980、输出 0.035980、读 0.000600、写 0；DeepSeek V4.1 Flash 输入 0.001120、输出 0.003370、读 0.000030、写 0。可见大上下文首轮风险与固定 cost_x 并非同一概念。
 - 22:33:42 UTC 共享等待脚本返回 FREE 后，仅使用本票新建会话 `webmvljtrqyyk9tkj` 实测。源 GPT-6-Luna 首轮输入 **200,453**、输出 7、缓存读写 0；切 GPT-6-Astra 时现有弹层只提示多模态降档，**没有预估积分或余额**。使用现有“直接切换”后同会话首轮输入 **208,841**、输出 7、缓存读写 0。
-- 源轮实扣 **5 分 = 0.05 积分**；切换后首轮 **125 分 = 1.25 积分**，为源轮 25 倍。按真实 price_snapshot 和 computeCostFen 重算，usage / committed journal / ledger 逐请求相等；合计 **130 分 = 1.30 积分**。精确用量/dispatch/ledger ID 见 `evidence/baseline-billing-audit.json`。
+- 源轮实扣 **5 积分**；切换后首轮 **125 积分**，为源轮 25 倍。按真实 price_snapshot 和 computeCostFen 重算，usage / committed journal / ledger 逐请求相等；合计 **130 积分**。精确用量/dispatch/ledger ID 见 `evidence/baseline-billing-audit.json`。
 - 真实浏览器证据：`evidence/baseline-turns.checkpoint.json`、`baseline-resume.json`；改前桌面/手机弹层截图 `desktop-before-switch-notice.png`、`mobile-before-switch-notice.png`。第一次大上下文脚本在等待选择器标签时因现有压缩弹层超时；失败原件保留，恢复脚本沿同一会话继续，没有重复发送源轮。
 - 额外 **8,388** 输入 token 的差异证明“上次调用计数”不能作为下一轮精确承诺；输出预测与上下文变化必须作为估计说明。当前 1 积分默认阈值会覆盖此实测场景。
 
 远端证据根：`/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g614-model-switch-cost/`。
+
+用户08:03已选B，08:06要求所有引擎复用现有切换提示并添加指定风险句子，详见PLAN。
