@@ -16,6 +16,7 @@ import {
   summarizeMessagesForIdle,
 } from '../../services/compact/compact.js'
 import { IDLE_COMPACT_INSTRUCTIONS, runIdleCompact } from '../../services/compact/idleRecover.js'
+import { buildIdleNativeFit } from '../../services/compact/idleNativeFit.js'
 import { getSessionId } from '../../bootstrap/state.js'
 import { loadConversationForResume } from '../../utils/conversationRecovery.js'
 import { flushSessionStorage, recordTranscript } from '../../utils/sessionStorage.js'
@@ -66,6 +67,7 @@ export const call: LocalCommandCall = async (args, context) => {
       const idleResult = await runIdleCompact({
         sessionId: getSessionId(),
         messages,
+        fit: await buildIdleNativeFit(messages, context.options.mainLoopModel),
         summarize: async (msgs) => summarizeMessagesForIdle(
           msgs,
           context,
