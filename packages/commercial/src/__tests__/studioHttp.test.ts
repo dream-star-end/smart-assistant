@@ -177,6 +177,35 @@ describe('dispatchStudioRoute', () => {
     )
   })
 
+  it('GET /providers: same gate; without a registry every kind reads as not configured (A2-0)', async () => {
+    enabled = false
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } }))
+        .status,
+      404,
+    )
+    enabled = true
+    assert.equal((await fetch(`${base}/providers`)).status, 401)
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('3') } })).status,
+      404,
+    )
+    const ok = await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } })
+    assert.equal(ok.status, 200)
+    const view = (await ok.json()) as {
+      kinds: Array<{ kind: string; state: string; reason?: string }>
+    }
+    assert.deepEqual(
+      view.kinds.map((k) => [k.kind, k.state, k.reason]),
+      [
+        ['image', 'unconfigured', 'NO_PROVIDER'],
+        ['video', 'unconfigured', 'NO_PROVIDER'],
+        ['voice', 'unconfigured', 'NO_PROVIDER'],
+        ['music', 'unconfigured', 'NO_PROVIDER'],
+      ],
+    )
+  })
+
   it('creates and reads projects; another user sees 404', async () => {
     const auth = await bearer('247')
     const created = await fetch(`${base}/projects`, {

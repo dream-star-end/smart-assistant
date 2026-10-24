@@ -27,6 +27,8 @@ import {
   verifyBlobTicket,
 } from './access.js'
 import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from './blobs.js'
+import type { ProviderRegistry } from './providers/registry.js'
+import { MEDIA_KINDS } from './providers/types.js'
 import type { StudioStore } from './store.js'
 
 export const STUDIO_BROWSER_PREFIX = '/api/studio'
@@ -36,6 +38,8 @@ export interface StudioHttpDeps {
   access: StudioAccess
   store: StudioStore
   blobs: StudioBlobStore
+  /** OCV5-591 A2-0; absent → every media kind reads as not configured. */
+  providers?: ProviderRegistry
 }
 
 const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
@@ -128,6 +132,22 @@ export async function dispatchStudioRoute(
       url: `${STUDIO_BROWSER_PREFIX}/blobs/${blob[1]}?ticket=${encodeURIComponent(ticket)}`,
       expiresInSeconds: BLOB_TICKET_TTL_SECONDS,
     })
+    return
+  }
+
+  if (path === '/providers' && method === 'GET') {
+    sendJson(
+      res,
+      200,
+      studio.providers?.describe(user) ?? {
+        kinds: MEDIA_KINDS.map((kind) => ({
+          kind,
+          state: 'unconfigured',
+          reason: 'NO_PROVIDER',
+          providers: [],
+        })),
+      },
+    )
     return
   }
 

@@ -674,6 +674,9 @@ export const commercialConfigSchema = z
     OC_STUDIO_FFMPEG_IMAGE_ID: z.string().trim().regex(/^sha256:[0-9a-f]{64}$/, "must be sha256:<64 hex>").optional(),
     /** OCV5-588: site-wide concurrent compose containers. Unset → 2. */
     OC_STUDIO_COMPOSE_CONCURRENCY: positiveInt(8),
+    /** OCV5-591 A2-0: media provider instances (JSON array). Deliberately unconstrained here: the
+     * studio registry parses it and only warns, so a typo can never block master boot. */
+    OC_STUDIO_PROVIDERS: z.string().optional(),
     /** OCV5-591 media studio. Off unless "1": /api/studio/* answers 404 and no worker runs. */
     OC_STUDIO_ENABLED: z
       .enum(["0", "1"])
