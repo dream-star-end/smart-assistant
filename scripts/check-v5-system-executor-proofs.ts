@@ -8,6 +8,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const scratch = mkdtempSync(join(tmpdir(), 'oc-v5-system-executor-proof-'))
 const proof = spawnSync(process.execPath, ['--import', 'tsx', '--test',
   'packages/storage/src/systemActions.test.ts',
+  'packages/storage/src/__tests__/authorityGeneration.test.ts',
+  'packages/storage/src/__tests__/userProfileAt.test.ts',
   'packages/commercial/src/__tests__/browserConfirmation.test.ts',
   'packages/commercial/src/__tests__/systemOperationService.test.ts',
   'packages/commercial/src/__tests__/preferenceOperations.test.ts',
