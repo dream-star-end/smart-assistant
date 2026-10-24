@@ -2122,6 +2122,7 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
               {err}
             </Alert>
           )}
+          <p className="text-meta leading-relaxed text-muted">画像保留供查阅。是否自动加载取决于当前运行环境；旧版仍可能加载标记内容，请在“偏好 → 隐私与助手”核验支持状态。此处保存不更改称呼授权。</p>
           <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}

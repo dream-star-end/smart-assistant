@@ -37,6 +37,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { effectivePromptPrivacy, type PromptPrivacyPolicy } from "@openclaude/protocol";
+import { getPreferences } from "../user/preferences.js";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
 import {
@@ -83,10 +85,12 @@ export interface PlatformSlotResponse {
 
 export interface PlatformPromptSlotsResponseBody {
   slots: PlatformSlotResponse[];
+  promptPolicy: PromptPrivacyPolicy;
 }
 
 export interface PlatformPromptSlotsHandlerDeps {
   identityRepo: ContainerIdentityRepo;
+  readPreferences?: typeof getPreferences;
   /**
    * MODEL_HINT 的**文案**权威(model_pricing.extra_system_prompt —— catalog 只管 execution,
    * 不持 prompt 文本)。**alias → canonical 不再由它负责**(见 deps.catalog)。
@@ -186,8 +190,11 @@ export function makePlatformPromptSlotsHandler(
     // 2) Parse ?model= query。空 / 缺省 → 不出 MODEL_HINT,合法。
     //    超长 → 静默截断;真实 model_id 远小于 cap。
     let modelId: string | undefined;
+    let sessionId: string | undefined;
     try {
       const url = new URL(req.url ?? "/", "http://internal");
+      const sid = url.searchParams.get("sessionId");
+      if (sid && sid.length <= 256) sessionId = sid;
       const raw = url.searchParams.get("model");
       if (raw !== null && raw.length > 0) {
         if (Buffer.byteLength(raw, "utf-8") > MAX_MODEL_QUERY_BYTES) {
@@ -278,7 +285,17 @@ export function makePlatformPromptSlotsHandler(
       model_query: modelId ? "present" : "absent",
     });
 
-    const body: PlatformPromptSlotsResponseBody = { slots };
+    // Identity-derived uid only. Missing/failed consent never reads the legacy profile.
+    let promptPolicy: PromptPrivacyPolicy = { schemaVersion: 1, profile: null };
+    try {
+      const { prefs } = await (deps.readPreferences ?? getPreferences)(String(containerUserId));
+      const profile = prefs.system_assistant_profile;
+      if (profile?.enabled === true) promptPolicy = effectivePromptPrivacy({ schemaVersion: 1, profile: { nickname: profile.nickname, sessionId: profile.sessionId } }, sessionId);
+    } catch {
+      // Privacy is fail-closed. Do not log any profile content or database error details here.
+      reqLog.warn("prompt_privacy_read_failed");
+    }
+    const body: PlatformPromptSlotsResponseBody = { slots, promptPolicy };
     const json = JSON.stringify(body);
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
