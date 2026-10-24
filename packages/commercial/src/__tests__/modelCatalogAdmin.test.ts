@@ -314,6 +314,7 @@ describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
       DURABLE_TURN_DISPATCH_CAPABILITY,
       // USER minimal consent + warm-runner policy refresh, attested by actual runtime.
       'prompt-privacy-v1',
+      'system-help-relay-v1',
     ]);
     assert.ok(meta.requiredMigrations.includes("0143_model_catalog"));
     assert.ok(meta.requiredMigrations.includes("0157_lossless_runtime_batches"));

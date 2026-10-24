@@ -4798,6 +4798,7 @@ describe('v5 release safety lanes', () => {
       'lossless-turn-tape-v2',
       'durable-turn-dispatch-v1',
       'prompt-privacy-v1',
+      'system-help-relay-v1',
     ])
     assert.ok(meta.capabilities.includes('durable-turn-dispatch-v1'))
     assert.ok(meta.requiredMigrations.includes('0170_durable_turn_dispatch'))

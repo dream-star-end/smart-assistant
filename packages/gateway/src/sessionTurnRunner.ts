@@ -1,3 +1,4 @@
+import { getSystemHelpRelay } from './systemHelpRelay.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
 import { consumeUnusedPreheat } from './speculativePreheat.js'
 /**
@@ -96,6 +97,7 @@ import { log } from './sessionManagerLog.js'
 import type { SessionManager, AgentSession } from './sessionManager.js'
 
 export interface TurnRunnerHost {
+  getByKey: SessionManager['getByKey']
   _awaitBoundedOutputDrain: SessionManager['_awaitBoundedOutputDrain']
   _dispatchPostTerminalRuntimeEvent: SessionManager['_dispatchPostTerminalRuntimeEvent']
   _forgetResumeEntry: SessionManager['_forgetResumeEntry']
@@ -412,6 +414,8 @@ export async function _runOneTurn(
       ...(session._currentTurnTraceId ? { traceId: session._currentTurnTraceId } : {}),
     })
 
+  let closeHelpAttempt: (() => void) | undefined
+  try {
   await new Promise<void>((resolve, reject) => {
     let settled = false
     const settle = (fn: () => void) => {
@@ -834,6 +838,7 @@ export async function _runOneTurn(
     // explicitly freezes the parser and claims the partial snapshot.
     let terminalPersistenceClaim: 'none' | 'complete' | 'partial' = 'none'
     const detach = () => {
+      closeHelpAttempt?.()
       if (detached) return
       detached = true
       if (session._persistActiveTurn === requestTerminalPersistence) {
@@ -1070,6 +1075,7 @@ export async function _runOneTurn(
       errorCode: string,
       waiveReason?: TurnWaiveReason,
     ): Promise<void> => {
+      closeHelpAttempt?.()
       // Record the terminal observation immediately, before a cooperative
       // interrupt can produce more engine events. Its global ordinal thus
       // reconstructs the exact live ordering after refresh.
@@ -2134,7 +2140,17 @@ export async function _runOneTurn(
     // 周期)并替换 stdout 路由目标 —— 旧 _currentMessageListener 的替换语义
     // (每 session 恒一个路由目标,旧 turn 闭包链自此可 GC)收进 adapter。
     // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
-    const submittedTurn = runner.submitTurn({
+    const capturedAbort = session._externalTurnAbort
+    try {
+      closeHelpAttempt = getSystemHelpRelay(this)?.openAttempt(session, session.sessionKey, () =>
+        this.getByKey(session.sessionKey) === session && session.runner === runner &&
+        session._currentTurnKey === turnKey && session._currentTurnTraceId === traceId &&
+        session._externalTurnAbort === capturedAbort && capturedAbort !== undefined && !capturedAbort.signal.aborted &&
+        !session._plannedTeardown && !session._replacing && !settled && !detached && requestedTerminal === null && turn?.finalized !== true)
+    } catch { getSystemHelpRelay(this)?.endAttempt(session) }
+    let submittedTurn: EngineTurnRun
+    try {
+    submittedTurn = runner.submitTurn({
       input: userTextOrBlocks,
       ...(queueTurn ? { queueTurn: true } : {}),
       requestId,
@@ -2168,6 +2184,7 @@ export async function _runOneTurn(
       sessionTotals: session,
       toolUseIdToName: session.toolUseIdToName,
     })
+    } catch (error) { detach(); throw error }
     // Capacity is released only after an actual engine submission; cancellation/admission
     // failures before this point keep the original unused-runner TTL.
     consumeUnusedPreheat(this, session)
@@ -2181,6 +2198,7 @@ export async function _runOneTurn(
 
     // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
     submittedTurn.submitted.catch((err) => {
+      closeHelpAttempt?.()
       const persistence =
         requestTerminalPersistence?.('crashed', String(err), 'RUNNER_CRASHED') ?? Promise.resolve()
       this._trackPersistence(persistence)
@@ -2194,6 +2212,7 @@ export async function _runOneTurn(
       settle(() => resolve())
     })
   })
+  } finally { closeHelpAttempt?.() }
 }
 
 export async function runOneTurnWithRetry(

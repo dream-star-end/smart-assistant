@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from './systemHelpEnvironment.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
@@ -241,6 +242,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
+  systemHelpContextFile?: string
   promptPolicy?: PromptPrivacyPolicy
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
@@ -494,6 +496,7 @@ export async function buildCodexLaunchOverrides(
       ...(isProjectSearchEnabled(process.env) ? { OC_PROJECT_CONTEXT: '1', OC_P5_PROJECT_SEARCH: '1' } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
+      ...systemHelpEnvironment(ctx.systemHelpContextFile, ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,

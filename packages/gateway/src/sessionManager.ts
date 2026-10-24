@@ -2112,6 +2112,7 @@ export class SessionManager {
        *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
        *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
       modelAuthority?: TurnModelAuthority
+      systemHelpBootstrap?: string
       /** Remaining spendable credits (fen) captured at master admission. */
       creditBudgetFen?: bigint
       /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层

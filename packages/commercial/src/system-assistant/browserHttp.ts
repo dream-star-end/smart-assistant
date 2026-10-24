@@ -4,8 +4,9 @@ import { z } from 'zod'
 import { SystemActionError } from '@openclaude/storage'
 import type { QueryRunner } from '../db/queries.js'
 import { requireAuth } from '../http/auth.js'
-import { HttpError, readJsonBody, sendJson } from '../http/util.js'
+import { HttpError, sendJson } from '../http/util.js'
 import { requireBrowserConfirmationPrincipal } from '../auth/browserConfirmation.js'
+import { readSystemActionBody } from './httpLifetime.js'
 import { SystemOperationRejected } from './operations.js'
 import type { SystemActionsService } from './service.js'
 
@@ -25,8 +26,8 @@ export interface SystemActionsBrowserHttpDeps {
   firstPartyOrigin: string | null
   runner: QueryRunner
 }
-export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDeps): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  return async (req, res) => {
+export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDeps): (req: IncomingMessage, res: ServerResponse, signal?: AbortSignal) => Promise<void> {
+  return async (req, res, signal) => {
     res.setHeader('Cache-Control', 'no-store')
     const path = new URL(req.url ?? '/', 'http://system-actions.invalid').pathname
     const read = readPath.exec(path)
@@ -44,7 +45,7 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
       if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'POST required')
       // Origin / Fetch Metadata / independent HttpOnly refresh proof are checked on every POST.
       const principal = await requireBrowserConfirmationPrincipal(req, deps)
-      const body = await readJsonBody(req, 16 * 1024)
+      const body = await readSystemActionBody(req, 16 * 1024, signal)
       const id = write![1]!
       const action = write![2]!
       if (action === 'deny') {
@@ -66,7 +67,7 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
         throw new HttpError(status, e.code, e.code === 'RECONCILIATION_REQUIRED' ? '执行结果待核对，请勿重复执行。' : '操作不可用或状态已变化，请刷新查看。')
       }
       if (e instanceof SystemOperationRejected) throw new HttpError(
-        e.code === 'FORBIDDEN' ? 403 : e.code === 'INVALID_INPUT' ? 400 : e.code === 'UNAVAILABLE' ? 503 : 409,
+        e.code === 'NOT_FOUND' ? 404 : e.code === 'FORBIDDEN' ? 403 : e.code === 'INVALID_INPUT' ? 400 : e.code === 'UNAVAILABLE' ? 503 : 409,
         e.code, '操作不可用或权限已变化，请刷新查看。')
       throw e
     }
