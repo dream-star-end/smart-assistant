@@ -1,0 +1,220 @@
+{
+  "usage": [
+    {
+      "id": 24963,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23116,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "cost_credits": 7,
+      "input_tokens": 2,
+      "output_tokens": 453,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 47741
+    },
+    {
+      "id": 24964,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23117,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "cost_credits": 1,
+      "input_tokens": 4,
+      "output_tokens": 819,
+      "cache_read_tokens": 47725,
+      "cache_write_tokens": 493
+    }
+  ],
+  "wallet": {
+    "credits": 35173,
+    "ledger_count": 1824,
+    "ledger_max_id": 23117
+  },
+  "user_id": 765,
+  "journals": [
+    {
+      "nonce": "01ff4cac24340ffd6ff0f557",
+      "state": "committed",
+      "usage_id": 24963,
+      "ledger_id": 23116,
+      "created_at": "2026-10-18T11:54:35.747346+00:00",
+      "native_cwd": "/tmp/ocv5-289-run-01ff4cac24340ffd6ff0f557",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "updated_at": "2026-10-18T11:55:04.332604+00:00",
+      "native_usage": {
+        "inputTokens": 2,
+        "outputTokens": 453,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 47741
+      },
+      "final_credits": 7,
+      "prompt_layout": "static-first-v1",
+      "box_account_id": "25",
+      "box_session_id": "0cd5975b-ec94-4274-9a88-9ebee08b929f",
+      "terminal_cli_pid": "295027",
+      "box_native_session_id": "e2143f99-8fe5-4231-bb02-ed7148c20f00"
+    },
+    {
+      "nonce": "e18acb34137ad91b4c072ced",
+      "state": "committed",
+      "usage_id": 24964,
+      "ledger_id": 23117,
+      "created_at": "2026-10-18T11:55:01.178759+00:00",
+      "native_cwd": "/tmp/ocv5-289-run-01ff4cac24340ffd6ff0f557",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "updated_at": "2026-10-18T11:55:22.307012+00:00",
+      "native_usage": {
+        "inputTokens": 4,
+        "outputTokens": 819,
+        "cacheReadTokens": 47725,
+        "cacheWriteTokens": 493
+      },
+      "final_credits": 1,
+      "prompt_layout": "static-first-v1",
+      "box_account_id": "25",
+      "box_session_id": "0cd5975b-ec94-4274-9a88-9ebee08b929f",
+      "terminal_cli_pid": "295701",
+      "box_native_session_id": "e2143f99-8fe5-4231-bb02-ed7148c20f00"
+    }
+  ],
+  "observed_at": "2026-10-18T11:58:42.709142+00:00",
+  "bucket_latest": [
+    {
+      "id": 20554,
+      "delta": -20,
+      "bucket": "period",
+      "org_id": null,
+      "created_at": "2026-10-06T01:13:28.795248+00:00",
+      "balance_after": 0
+    },
+    {
+      "id": 23117,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "balance_after": 35173
+    }
+  ],
+  "all_new_ledger": [
+    {
+      "id": 23116,
+      "delta": -7,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24963",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "balance_after": 35174
+    },
+    {
+      "id": 23117,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24964",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "balance_after": 35173
+    }
+  ],
+  "native_metadata": {
+    "source": "/home/box/.claude-account2/projects/-tmp-ocv5-289-run-01ff4cac24340ffd6ff0f557/e2143f99-8fe5-4231-bb02-ed7148c20f00.jsonl",
+    "native_session_id": "e2143f99-8fe5-4231-bb02-ed7148c20f00",
+    "successful_native_calls": 2,
+    "calls": [
+      {
+        "message_id": "msg_011Cg9f8vUfZkcgyVwSzZAxB",
+        "model": "claude-haiku-5-5",
+        "first_timestamp": "2026-10-18T11:54:48.773Z",
+        "row_count": 1,
+        "last_timestamp": "2026-10-18T11:54:48.773Z",
+        "usage": {
+          "input_tokens": 2,
+          "output_tokens": 453,
+          "cache_creation_input_tokens": 47741,
+          "cache_read_input_tokens": 0
+        }
+      },
+      {
+        "message_id": "msg_011Cg9fAieZseb2fxzW3AAjS",
+        "model": "claude-haiku-5-5",
+        "first_timestamp": "2026-10-18T11:55:12.506Z",
+        "row_count": 2,
+        "last_timestamp": "2026-10-18T11:55:15.413Z",
+        "usage": {
+          "input_tokens": 4,
+          "output_tokens": 819,
+          "cache_creation_input_tokens": 493,
+          "cache_read_input_tokens": 47725
+        }
+      }
+    ]
+  },
+  "base_wallet_before": {
+    "credits": 35181,
+    "ledger_max_id": 23115,
+    "ledger_count": 1822
+  },
+  "base_wallet_after_frozen": {
+    "observed_at": "2026-10-18T11:57:05.845683Z",
+    "credits": 35173,
+    "ledger_max_id": 23117,
+    "ledger_count": 1824
+  },
+  "independent_checks": [
+    {
+      "usage_id": 24963,
+      "exact_unrounded_credits": "6.194325000",
+      "expected_credits": 7,
+      "actual_credits": 7,
+      "formula_matches": true,
+      "cache_read_ratio": "0"
+    },
+    {
+      "usage_id": 24964,
+      "exact_unrounded_credits": "0.948775000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9896935008917091783833105222"
+    }
+  ],
+  "base_total_credits": 8,
+  "base_successful_supplier_calls": 2,
+  "profile_evidence_file": "billing-agent-box-profile-observer-r2.jsonl",
+  "profile_review": [
+    {
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "pid": 295032,
+      "profile": "account2"
+    },
+    {
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "pid": 295706,
+      "profile": "account2"
+    }
+  ]
+}

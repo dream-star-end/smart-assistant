@@ -1,0 +1,4 @@
+APPROVED
+
+非阻断:
+[P2] packages/gateway/src/engine/antigravityAdapter.ts:275、packages/gateway/src/engine/grokAdapter.ts:478 — 计时日志读取初始化的 `this.opts.model`，而 `setModel()` 更新的是 `this.currentModel`；复用适配器切换模型后，耗时会归到旧模型。建议捕获 `this.currentModel`。

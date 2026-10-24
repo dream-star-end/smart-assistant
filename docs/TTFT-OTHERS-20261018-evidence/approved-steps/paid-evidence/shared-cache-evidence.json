@@ -1,0 +1,95 @@
+{
+  "measured_at_utc": "2026-10-18",
+  "account": 765,
+  "path": "container-owned formal fresh local_catalog; no old turn authority/lease/dispatch",
+  "base": "67d13462edea57d43e71aae2a97d51efddcff831",
+  "source_heads": {
+    "step4": "eaa92a49f",
+    "step7": "d553e534b"
+  },
+  "body_bytes": 46753,
+  "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+  "prompt_bytes": 24820,
+  "ordered_slots": [
+    "ENV",
+    "INTELLIGENT_UI",
+    "AGENTS",
+    "MEMORY",
+    "TOOLS",
+    "MODEL_HINT"
+  ],
+  "platform_mcp_schema_count": 21,
+  "source_exports_equal": [
+    "base",
+    "step1",
+    "step2",
+    "step3",
+    "step4",
+    "step5",
+    "step6",
+    "step7"
+  ],
+  "calls": [
+    {
+      "arm": "warmup-base",
+      "requestId": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "status": 200,
+      "beganAt": 1792325025574,
+      "endedAt": 1792325027833,
+      "firstByteAt": 1792325026912,
+      "firstTextAt": 1792325027814,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 12672,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "baseline-base",
+      "requestId": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "status": 200,
+      "beganAt": 1792325029337,
+      "endedAt": 1792325030173,
+      "firstByteAt": 1792325029848,
+      "firstTextAt": 1792325030156,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "candidate-step4-step7",
+      "requestId": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "status": 200,
+      "beganAt": 1792325031698,
+      "endedAt": 1792325032312,
+      "firstByteAt": 1792325032081,
+      "firstTextAt": 1792325032294,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    }
+  ],
+  "normalized_ratio_formula": "cache_read / (uncached_input + cache_read + cache_write)",
+  "before_ratio": 0.9797979797979798,
+  "after_ratio": 0.9797979797979798,
+  "scope": "controlled complete platform-context/API-body comparison; remote slots and per-user catalog captured from765; isolated empty local persona/memory; no native CLI hidden system/default tool schemas or candidate backend webpage deployment",
+  "paid_native_calls_shared": 3,
+  "do_not_count_per_PR": true,
+  "billing_evidence": "H/g500-ttft-approved-20261018/paid-evidence/billing-agent-phase-audit-6calls.json"
+}

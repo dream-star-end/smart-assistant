@@ -1,0 +1,7 @@
+# 用户20:39验收口径修订，文档增量独立审查
+
+用户原话：缓存没有明显变坏就没关系。第1步Grok命中token不变（1152）、总输入仅+2token，属于噪声，按通过处理并在报告里写明；后续各步也按“无明显变差”判定，仍需附前后cached-token证据。
+
+此前67d13462edea57d43e71aae2a97d51efddcff831→fe691299ef8a84ea0dcd1e906e1f002332b1ecb4的全量diff审查已APPROVED，证据code-review-r3.txt。最新c93d14d9356e3213739fae3dcfd491ae4dab1a92相对fe691只改两份docs/ttft文档/JSON，产品代码不变。本次按仓库小改动一轮规则审此文档增量，连同此前全diff形成完整审查链，不将脚本参数错误的r4记录冒称真实审查通过。
+
+保留原始cache比例/旧strict false历史，只追加当前用户acceptance true，不虚构2token精确因果；商业不动，不merge/deploy，不再发模型请求。

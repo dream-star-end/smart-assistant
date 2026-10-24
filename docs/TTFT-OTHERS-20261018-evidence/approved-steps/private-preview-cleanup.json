@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-18T12:45:38.134864+00:00",
+  "processes": [
+    {
+      "pid": 1185126,
+      "result": "terminated_own_private_preview"
+    },
+    {
+      "pid": 1196118,
+      "result": "terminated_own_private_preview"
+    }
+  ],
+  "production_services_touched": false
+}

@@ -1,0 +1,4 @@
+{"mode":"others-preflight","at":1792326557549,"ws_error":true,"csp_error":false,"mixed_content":false,"blocked":true,"failed":true}
+{"mode":"others-preflight","at":1792326560476,"ws_error":true,"csp_error":false,"mixed_content":false,"blocked":true,"failed":true}
+{"mode":"others-preflight","at":1792326590244,"ws_error":true,"csp_error":false,"mixed_content":false,"blocked":true,"failed":true,"codes":["ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS"],"local_network":true,"secure_context":false,"cors":false,"permission":false}
+{"mode":"others-preflight","at":1792326592968,"ws_error":true,"csp_error":false,"mixed_content":false,"blocked":true,"failed":true,"codes":["ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS"],"local_network":true,"secure_context":false,"cors":false,"permission":false}

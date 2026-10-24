@@ -1,0 +1,5 @@
+REQUEST_CHANGES
+
+[P1] packages/commercial/src/http/proxy/shared.ts:2016 — 新增重试标记会进入 assistant 正文，并在历史重建时污染模型输入。复现：429 携带 Retry-After → CLI 输出合成 assistant 错误帧及错误 result → 下一次重试成功；实测最终 `completed.text`、`assistantSegments` 和 `buildHistoricalContextPrompt()` 输出均包含 `OC_RETRY_HINT_V1:...`。仅验证 CLI 原生 resume 无法覆盖此路径。
+
+非阻断：packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts:5082 新增 `Infinity` 用例实跑失败：期望 `failed`，实际 `completed`；sink 状态契约不含 `failed`，应修正断言并保留 `rate_limited` 错误码验证。

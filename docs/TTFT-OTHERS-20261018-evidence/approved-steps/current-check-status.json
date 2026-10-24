@@ -1,0 +1,1586 @@
+{
+  "schema_version": 2,
+  "observed_at": "2026-10-18T12:40:14.821342+00:00",
+  "repo": "dream-star-end/smart-assistant",
+  "scope": "selfhost; read-only GitHub/branch/review/status snapshot; no tests, model requests, runtime or routing mutations; no commercial connection",
+  "ci_source": "gh pr view --json headRefOid,statusCheckRollup, metadata; exact heads rechecked after collection",
+  "prs": [
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "chore/v5-selfhost-ocv5-502-ttft-step3",
+      "headRefOid": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 849,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932889/job/117676885473",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932866/job/117676885382",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885612",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932870/job/117676885401",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885583",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885493",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:39:19Z",
+          "status": "IN_PROGRESS",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885578",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885595",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885581",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885579",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932889/job/117676885318",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932866/job/117676885176",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885457",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:35:41Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932870/job/117676885242",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:36:36Z",
+          "status": "IN_PROGRESS",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/849",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-502-ttft-step3",
+        "local_head": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+        "configured_upstream": "origin/chore/v5-selfhost-ocv5-502-ttft-step3",
+        "local_upstream_tracking_head": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "pending": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [
+        "selfhost-typecheck",
+        "selfhost-gates",
+        "selfhost-gateway (unit 1/4)",
+        "selfhost-web-react",
+        "selfhost-gateway (unit 2/4)",
+        "selfhost-gateway (unit 3/4)",
+        "selfhost-gateway (unit 4/4)",
+        "selfhost-gateway (idle 1/3)",
+        "selfhost-gateway (idle 2/3)",
+        "selfhost-gateway (idle 3/3)",
+        "selfhost-commercial-unit (known-failures diff gate)",
+        "selfhost-watch-gate",
+        "selfhost-v5-ops",
+        "selfhost-web-react-browser"
+      ],
+      "head_recheck": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "perf/v5-selfhost-ocv5-503-ttft-step4",
+      "headRefOid": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 850,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:20:31Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032113/job/117671241214",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:18:12Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:18:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032090/job/117671241063",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:16:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:34:07Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447675",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:30:24Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:29:26Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032202/job/117671241537",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:17:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:38:33Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447709",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:35:07Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:05Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447536",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:18:15Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:34:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447696",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:30:49Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:29:03Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447605",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:19:20Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447542",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:14:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:37:03Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447681",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:34:11Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:24:48Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032113/job/117671240942",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:17:45Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:54Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032090/job/117671241283",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:22:01Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:15:22Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447331",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:12:00Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:25:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032202/job/117671241767",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:19:41Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/850",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-503-ttft-step4",
+        "local_head": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+        "configured_upstream": "origin/perf/v5-selfhost-ocv5-503-ttft-step4",
+        "local_upstream_tracking_head": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "success": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [],
+      "head_recheck": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "test/v5-selfhost-ocv5-504-ttft-step6",
+      "headRefOid": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 851,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937160/job/117676897447",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937087/job/117676897165",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897078",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937065/job/117676896954",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897223",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897175",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897206",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897196",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897227",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897158",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937160/job/117676897187",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937087/job/117676896977",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676896903",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937065/job/117676896826",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:35:44Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/851",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-504-ttft-step6",
+        "local_head": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+        "configured_upstream": "origin/test/v5-selfhost-ocv5-504-ttft-step6",
+        "local_upstream_tracking_head": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "pending": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [
+        "selfhost-typecheck",
+        "selfhost-gates",
+        "selfhost-gateway (unit 1/4)",
+        "selfhost-web-react",
+        "selfhost-gateway (unit 2/4)",
+        "selfhost-gateway (unit 3/4)",
+        "selfhost-gateway (unit 4/4)",
+        "selfhost-gateway (idle 1/3)",
+        "selfhost-gateway (idle 2/3)",
+        "selfhost-gateway (idle 3/3)",
+        "selfhost-commercial-unit (known-failures diff gate)",
+        "selfhost-watch-gate",
+        "selfhost-v5-ops",
+        "selfhost-web-react-browser"
+      ],
+      "head_recheck": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "perf/v5-selfhost-ocv5-505-ttft-step7",
+      "headRefOid": "59a40249e7536e3802052601cbc099864e288bc7",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 852,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:13:00Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035116/job/117671250044",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:10:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:28:00Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035121/job/117671250189",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:26:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:26:16Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462503",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:22:55Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:32:09Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035175/job/117671249997",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:24:50Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462448",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:15:50Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:25:55Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462488",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:22:52Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:18:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462455",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:15:24Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:39:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462468",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:29:22Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:50Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462481",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:17:33Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:21Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462545",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:16:02Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:21:43Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035116/job/117671250188",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:12:49Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:15:44Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035121/job/117671250060",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:14:51Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:13:11Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462273",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:09:29Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:33:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035175/job/117671250296",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:27:32Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/852",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-505-ttft-step7",
+        "local_head": "59a40249e7536e3802052601cbc099864e288bc7",
+        "configured_upstream": "origin/perf/v5-selfhost-ocv5-505-ttft-step7",
+        "local_upstream_tracking_head": "59a40249e7536e3802052601cbc099864e288bc7",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "success": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [],
+      "head_recheck": "59a40249e7536e3802052601cbc099864e288bc7",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "docs/v5-selfhost-ocv5-506-ttft-step5",
+      "headRefOid": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 853,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940550/job/117676906231",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940594/job/117676906274",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906442",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940546/job/117676906237",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906386",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906579",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906485",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906530",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906576",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906607",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940550/job/117676906086",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940594/job/117676906572",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906324",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:35:47Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940546/job/117676906050",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:39:28Z",
+          "status": "IN_PROGRESS",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/853",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-506-ttft-step5",
+        "local_head": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+        "configured_upstream": "origin/docs/v5-selfhost-ocv5-506-ttft-step5",
+        "local_upstream_tracking_head": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "pending": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [
+        "selfhost-typecheck",
+        "selfhost-gates",
+        "selfhost-gateway (unit 1/4)",
+        "selfhost-web-react",
+        "selfhost-gateway (unit 2/4)",
+        "selfhost-gateway (unit 3/4)",
+        "selfhost-gateway (unit 4/4)",
+        "selfhost-gateway (idle 1/3)",
+        "selfhost-gateway (idle 2/3)",
+        "selfhost-gateway (idle 3/3)",
+        "selfhost-commercial-unit (known-failures diff gate)",
+        "selfhost-watch-gate",
+        "selfhost-v5-ops",
+        "selfhost-web-react-browser"
+      ],
+      "head_recheck": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "fix/v5-selfhost-ocv5-500-ttft-step1",
+      "headRefOid": "fe691299ef8a84ea0dcd1e906e1f002332b1ecb4",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 860,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172854/job/117677670334",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:39:27Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172710/job/117677603300",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:39:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813769",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172716/job/117677603256",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:39:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813777",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813822",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813882",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813864",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813725",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813846",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172854/job/117677670531",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:39:27Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172710/job/117677603135",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:39:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172776/job/117677813462",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:40:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128172716/job/117677603453",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:39:08Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/860",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-500-ttft-step1",
+        "local_head": "fe691299ef8a84ea0dcd1e906e1f002332b1ecb4",
+        "configured_upstream": "origin/fix/v5-selfhost-ocv5-500-ttft-step1",
+        "local_upstream_tracking_head": "fe691299ef8a84ea0dcd1e906e1f002332b1ecb4",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "pending": 14
+      },
+      "current_head_failures": [],
+      "pending_check_names": [
+        "selfhost-typecheck",
+        "selfhost-gates",
+        "selfhost-gateway (unit 1/4)",
+        "selfhost-web-react",
+        "selfhost-gateway (unit 2/4)",
+        "selfhost-gateway (unit 3/4)",
+        "selfhost-gateway (unit 4/4)",
+        "selfhost-gateway (idle 1/3)",
+        "selfhost-gateway (idle 2/3)",
+        "selfhost-gateway (idle 3/3)",
+        "selfhost-commercial-unit (known-failures diff gate)",
+        "selfhost-watch-gate",
+        "selfhost-v5-ops",
+        "selfhost-web-react-browser"
+      ],
+      "head_recheck": "fe691299ef8a84ea0dcd1e906e1f002332b1ecb4",
+      "head_unchanged_during_snapshot": true
+    },
+    {
+      "baseRefName": "feat/v5-selfhost",
+      "headRefName": "fix/v5-selfhost-ocv5-501-ttft-step2",
+      "headRefOid": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+      "isDraft": true,
+      "mergedAt": null,
+      "number": 861,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926878/job/117676868426",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:35:36Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088617",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926875/job/117676868387",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:35:36Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:39:25Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926869/job/117676868824",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:37:22Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088687",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088387",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088562",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088675",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088641",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088669",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926878/job/117676868721",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:35:36Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926891/job/117677088650",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:36:40Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "0001-01-01T00:00:00Z",
+          "conclusion": "",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926875/job/117676868642",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:35:36Z",
+          "status": "QUEUED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:37:20Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127926869/job/117676868482",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:36:27Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/861",
+      "branch_consistency": {
+        "worktree": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2",
+        "local_head": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+        "configured_upstream": "origin/fix/v5-selfhost-ocv5-501-ttft-step2",
+        "local_upstream_tracking_head": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+        "tracking_divergence": "0\t0",
+        "worktree_clean": true,
+        "local_matches_current_pr_head": true,
+        "tracking_matches_current_pr_head": true,
+        "note": "PR head is current GitHub branch head; local upstream-tracking ref was read without fetch."
+      },
+      "check_summary": {
+        "pending": 12,
+        "success": 2
+      },
+      "current_head_failures": [],
+      "pending_check_names": [
+        "selfhost-typecheck",
+        "selfhost-gateway (unit 1/4)",
+        "selfhost-web-react",
+        "selfhost-gateway (unit 2/4)",
+        "selfhost-gateway (unit 3/4)",
+        "selfhost-gateway (unit 4/4)",
+        "selfhost-gateway (idle 1/3)",
+        "selfhost-gateway (idle 2/3)",
+        "selfhost-gateway (idle 3/3)",
+        "selfhost-commercial-unit (known-failures diff gate)",
+        "selfhost-v5-ops",
+        "selfhost-web-react-browser"
+      ],
+      "head_recheck": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+      "head_unchanged_during_snapshot": true
+    }
+  ],
+  "final_reviews": [
+    {
+      "step": 1,
+      "pr": 860,
+      "round": 2,
+      "head": "7b4aa0391f6f737cbc1f5eeed0b8969e66da8f43",
+      "matches_current_pr_head": false,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/code-review-r2.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/code-review-r2.txt.prompt"
+    },
+    {
+      "step": 1,
+      "pr": 860,
+      "round": 3,
+      "head": "fe691299ef8a84ea0dcd1e906e1f002332b1ecb4",
+      "matches_current_pr_head": true,
+      "verdict": null,
+      "exit_code": null,
+      "status": "running_or_pending",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/code-review-r3.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/code-review-r3.txt.prompt"
+    },
+    {
+      "step": 2,
+      "pr": 861,
+      "round": 3,
+      "head": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/code-review-r3.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/code-review-r3.txt.prompt"
+    },
+    {
+      "step": 3,
+      "pr": 849,
+      "round": 3,
+      "head": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step3/code-review-r3.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step3/code-review-r3.txt.prompt"
+    },
+    {
+      "step": 4,
+      "pr": 850,
+      "round": 3,
+      "head": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step4/code-review-r3.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step4/code-review-r3.txt.prompt"
+    },
+    {
+      "step": 5,
+      "pr": 853,
+      "round": 2,
+      "head": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step5/code-review-r2.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step5/code-review-r2.txt.prompt"
+    },
+    {
+      "step": 6,
+      "pr": 851,
+      "round": 2,
+      "head": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step6/code-review-r2.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step6/code-review-r2.txt.prompt"
+    },
+    {
+      "step": 7,
+      "pr": 852,
+      "round": 2,
+      "head": "59a40249e7536e3802052601cbc099864e288bc7",
+      "matches_current_pr_head": true,
+      "verdict": "APPROVED",
+      "exit_code": 0,
+      "status": "completed",
+      "verdict_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/code-review-r2.txt",
+      "prompt_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/code-review-r2.txt.prompt"
+    }
+  ],
+  "branch_upstream_all_consistent": true,
+  "local_checks": [
+    {
+      "step": 1,
+      "check": "relay-tests-corrected",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/relay-tests-corrected.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/relay-tests-corrected.log",
+      "log_bytes": 10715,
+      "safe_tail": [
+        "# tests 41",
+        "# suites 11",
+        "# pass 41",
+        "# fail 0",
+        "# cancelled 0",
+        "# skipped 0",
+        "# todo 0"
+      ]
+    },
+    {
+      "step": 1,
+      "check": "web-tests-final",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/web-tests-final.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/web-tests-final.log",
+      "log_bytes": 4423,
+      "safe_tail": [
+        "Test Files  2 passed (2)",
+        "Tests  64 passed (64)",
+        "Duration  44.49s (transform 23.19s, setup 1.60s, import 21.73s, tests 30.91s, environment 10.51s)"
+      ]
+    },
+    {
+      "step": 1,
+      "check": "typecheck-corrected",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/typecheck-corrected.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/typecheck-corrected.log",
+      "log_bytes": 0,
+      "safe_tail": []
+    },
+    {
+      "step": 1,
+      "check": "lint",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/lint.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step1/lint.log",
+      "log_bytes": 845,
+      "safe_tail": [
+        "✓ no new biome errors"
+      ]
+    },
+    {
+      "step": 2,
+      "check": "tests",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/tests.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/tests.log",
+      "log_bytes": 143532,
+      "safe_tail": [
+        "# tests 281",
+        "# suites 28",
+        "# pass 281",
+        "# fail 0",
+        "# cancelled 0",
+        "# skipped 0",
+        "# todo 0"
+      ]
+    },
+    {
+      "step": 2,
+      "check": "typecheck",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/typecheck.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/typecheck.log",
+      "log_bytes": 0,
+      "safe_tail": []
+    },
+    {
+      "step": 2,
+      "check": "lint",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/lint.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step2/lint.log",
+      "log_bytes": 824,
+      "safe_tail": [
+        "✓ no new biome errors"
+      ]
+    },
+    {
+      "step": 7,
+      "check": "tests-r2",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/tests-r2.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/tests-r2.log",
+      "log_bytes": 6599,
+      "safe_tail": [
+        "# tests 13",
+        "# suites 2",
+        "# pass 13",
+        "# fail 0",
+        "# cancelled 0",
+        "# skipped 0",
+        "# todo 0"
+      ]
+    },
+    {
+      "step": 7,
+      "check": "bench-r2",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/bench-r2.exit",
+      "log_source": null,
+      "log_bytes": null,
+      "result_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/bench-r2-result.json",
+      "stderr_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/bench-r2.err",
+      "stdout_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/bench-r2.json",
+      "result": {
+        "slots": 14,
+        "inputBytes": 68576,
+        "fixtureSha256": "5e9560fa912a8dc56fe951cd65a1fa4a05620a9f346c08fa1b9748d82f537d7d",
+        "results": [
+          {
+            "name": "legacy",
+            "version": "baseline",
+            "iterations": 1500,
+            "p50Ms": 0.0009119999995164108,
+            "p95Ms": 0.002898000000641332
+          },
+          {
+            "name": "legacy",
+            "version": "candidate",
+            "iterations": 1500,
+            "p50Ms": 0.0004929999995511025,
+            "p95Ms": 0.0016489999998157145
+          },
+          {
+            "name": "all",
+            "version": "baseline",
+            "iterations": 1500,
+            "p50Ms": 0.033697000000756816,
+            "p95Ms": 0.0608379999994213
+          },
+          {
+            "name": "all",
+            "version": "candidate",
+            "iterations": 1500,
+            "p50Ms": 0.003541999998560641,
+            "p95Ms": 0.012038999999276712
+          },
+          {
+            "name": "partial",
+            "version": "baseline",
+            "iterations": 1500,
+            "p50Ms": 2.1734829999986687,
+            "p95Ms": 56.93130099999871
+          },
+          {
+            "name": "partial",
+            "version": "candidate",
+            "iterations": 1500,
+            "p50Ms": 2.158226999999897,
+            "p95Ms": 46.728941000001214
+          }
+        ]
+      },
+      "note": "Existing run exited 0; benchmark JSON captured on stderr and copied to named result file. No benchmark was rerun."
+    },
+    {
+      "step": 7,
+      "check": "typecheck",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/typecheck.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/typecheck.log",
+      "log_bytes": 0,
+      "safe_tail": []
+    },
+    {
+      "step": 7,
+      "check": "lint",
+      "exit_code": 0,
+      "exit_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/lint.exit",
+      "log_source": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g500-ttft-approved-20261018/step7/lint.log",
+      "log_bytes": 192,
+      "safe_tail": [
+        "✓ no new biome errors"
+      ]
+    }
+  ],
+  "canonical": {
+    "path": "/opt/openclaude/openclaude-v5-selfhost",
+    "head": "16bce96f30c029208b4155db72f96f2d9d59d521",
+    "branch": "feat/v5-selfhost",
+    "merge_pr": 847,
+    "merge_pr_url": "https://github.com/dream-star-end/smart-assistant/pull/847",
+    "merged_at": "2026-10-18T12:16:15Z",
+    "note": "Independent task OCV5-499 merge; our 7 PRs remain open/draft/unmerged."
+  },
+  "live": {
+    "symlink": "/opt/openclaude/openclaude-v5-selfhost-live",
+    "release_path": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-67d13462e-20261018-091329",
+    "source_commit": "67d13462edea57d43e71aae2a97d51efddcff831",
+    "metadata_source": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-67d13462e-20261018-091329/.complete",
+    "active_master_pid": 280510,
+    "active_master_cwd": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-67d13462e-20261018-091329",
+    "active_master_cwd_matches_release": true,
+    "scope": "selfhost only; no runtime mutation"
+  },
+  "current_head_failure_total": 0,
+  "all_draft_open_unmerged": true,
+  "limitations": [
+    "CI states are a point-in-time snapshot; pending checks have not passed.",
+    "Local tracking refs were not fetched or mutated.",
+    "Step1 round2 approval applies to its recorded older head; round3 is pending unless a verdict file exists.",
+    "Old-head failures are excluded from current-head counts."
+  ]
+}

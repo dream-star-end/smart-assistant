@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-18T14:08:16.995169+00:00",
+  "relative_to": "TTFT-OTHERS-20261018-evidence",
+  "operation": "rename_only_no_content_change",
+  "entries": [
+    {
+      "original_relative_name": "approved-steps/step7/bench.json",
+      "archived_relative_name": "approved-steps/step7/bench-stdout.json.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_bytes": 0,
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "byte_identical": true,
+      "active_code": false,
+      "reason": "Empty raw benchmark stdout capture; retained as an archive, not an active JSON document. The parsed benchmark result is separately retained as step7/bench-r1-result.json."
+    },
+    {
+      "original_relative_name": "browser-probe-others-d.mjs",
+      "archived_relative_name": "browser-probe-others-d.mjs.txt",
+      "bytes": 19768,
+      "sha256": "f7d75167eebab56b5d1a8cb72794a3fa6d042cf0491f81cbe2fd1837f275bc04",
+      "after_bytes": 19768,
+      "after_sha256": "f7d75167eebab56b5d1a8cb72794a3fa6d042cf0491f81cbe2fd1837f275bc04",
+      "byte_identical": true,
+      "active_code": false,
+      "reason": "Historical browser sampling source archive, not active product or test code. Preserve original bytes rather than apply current source lint edits."
+    }
+  ]
+}
