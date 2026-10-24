@@ -109,16 +109,17 @@ it('a nested skill-eval payload is captured before loading its fixed client', as
   const sent = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))
   expect(sent.evals.cases[0]).toEqual({ id: 'fixture', prompt: 'Frozen prompt', assertions: ['Frozen assertion'] })
 })
-it.each(['eval', 'train', 'comment'])('a same-epoch token change during %s client loading cannot start a new paid request', async operation => {
+it.each(['eval', 'train', 'comment'])('a default same-epoch %s call keeps normal token rotation during client loading', async operation => {
   const auth = createMemoryAuthSession(() => {}, 'alice-a')
-  const fetcher = vi.fn<typeof fetch>()
+  const fetcher = vi.fn<typeof fetch>(async () => reply({ ok: true, runId: 'fixture-run' }))
   vi.stubGlobal('fetch', fetcher)
   const pending = operation === 'eval' ? api.startSkillEvalRun(auth, 'fixture')
     : operation === 'train' ? api.startSkillTrain(auth, 'fixture')
     : api.commentSkillDraft(auth, 'fixture-run', 'fixture', 'fixture')
   auth.commitToken(0, 'new-access-same-epoch')
-  await expect(pending).rejects.toThrow()
-  expect(fetcher).not.toHaveBeenCalled()
+  await expect(pending).resolves.toMatchObject({ ok: true })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get('Authorization')).toBe('Bearer new-access-same-epoch')
 })
 it('a default human client preserves its existing successful 401 replay after dispatch', async () => {
   const auth = createMemoryAuthSession(() => {}, 'alice-a')
@@ -146,4 +147,15 @@ it('a deferred tutorial image remains a Blob and preserves its existing failure 
   expect(text).toBe('fixture-image')
   fetcher.mockResolvedValueOnce(reply({}, 403))
   await expect(api.fetchTutorialImage(auth, 'a'.repeat(64))).rejects.toThrow('读取图片失败（403）')
+})
+
+it('an unguarded read after lazy loading tolerates a same-epoch access-token rotation', async () => {
+  const auth = createMemoryAuthSession(() => {}, 'alice-a')
+  const fetcher = vi.fn<typeof fetch>(async () => reply({ runs: [] }))
+  vi.stubGlobal('fetch', fetcher)
+  const pending = api.listSkillTrainRuns(auth)
+  auth.commitToken(0, 'alice-b')
+  expect(await pending).toEqual([])
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get('Authorization')).toBe('Bearer alice-b')
 })
