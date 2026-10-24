@@ -189,9 +189,7 @@ export function useChatCardActions({
         }).catch(error => { io = undefined; throw error; });
         const client = await io;
         assertCurrent();
-        const result = await Reflect.apply(client[key], null, args);
-        assertCurrent();
-        return result;
+        return Reflect.apply(client[key], null, args);
       }) as LegacyCardIo[K];
     }
     const verified = identityIsCurrent(identity, auth);

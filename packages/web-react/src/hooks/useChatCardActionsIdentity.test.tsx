@@ -67,3 +67,20 @@ it('the card callback freezes a draft before its own lazy IO module await', asyn
   await pending
   expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)).title).toBe('Frozen title')
 })
+
+it('a successful card POST remains successful when token rotation happens while reading its receipt', async () => {
+  const { auth, input } = setup()
+  const response = reply({})
+  vi.spyOn(response, 'json').mockImplementation(async () => {
+    auth.commitToken(0, 'alice-b')
+    return { tutorial: { id: 'committed-fixture', status: 'pending' } }
+  })
+  const fetcher = vi.fn<typeof fetch>(async () => response)
+  vi.stubGlobal('fetch', fetcher)
+  const { result } = renderHook(() => useChatCardActions(input))
+  const actions = result.current.toolActions.communityBlog!
+  expect(await actions.submit({ title: 'Fixture', summary: 'Fixture', category: 'general', bodyMarkdown: 'Fixture' })).toEqual({ id: 'committed-fixture' })
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  await expect(actions.submit({ title: 'Again', summary: 'Fixture', category: 'general', bodyMarkdown: 'Fixture' })).rejects.toThrow()
+  expect(fetcher).toHaveBeenCalledTimes(1)
+})
