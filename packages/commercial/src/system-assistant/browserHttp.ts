@@ -36,7 +36,7 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
       if (read) {
         if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'GET required')
         const user = await requireAuth(req, deps.jwtSecret)
-        const active = await deps.runner.query<{ role: string }>("SELECT role FROM users WHERE id=$1 AND status='active'", [user.id])
+        const active = await deps.runner.query<{ role: string }>("SELECT role FROM users WHERE id=$1 AND status='active' AND deleted_at IS NULL", [user.id])
         if (active.rows[0]?.role !== user.role) throw new HttpError(403, 'FORBIDDEN', '请重新登录后查看。')
         sendJson(res, 200, read[2] ? deps.service.result(user.id, read[1]!) : deps.service.detail(user.id, read[1]!))
         return
