@@ -909,7 +909,6 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     listGenerationRef.current += 1;
     listRefreshInflightRef.current = null;
     loadMoreInflightRef.current = false;
-    confirmedMetadata.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
