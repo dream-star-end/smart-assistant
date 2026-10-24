@@ -34,5 +34,5 @@ test('failed lazy load cannot grant an obsolete selection or lose valid offline 
   ).toEqual({ requestId: 'm-lazy-cost-2', choice: true })
   await expect(
     result.current({ ...input, requestId: 'm-lazy-cost-3' }, { interactive: false }),
-  ).rejects.toThrow('fixture chunk unavailable')
+  ).rejects.toMatchObject({ cause: { message: 'fixture chunk unavailable' } })
 })

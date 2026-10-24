@@ -122,7 +122,7 @@ export function createModelSwitchCostAuthorizer({
             title: notice?.title ?? '切换模型？',
             body: (
               <div className="space-y-3">
-                {q.requiresConfirmation ? (
+                {q.requiresConfirmation || q.targetCost !== null ? (
                   <ModelSwitchCostSummary quote={q} />
                 ) : (
                   <p className="text-sm text-muted">{SWITCH_COST_WARNING}</p>
