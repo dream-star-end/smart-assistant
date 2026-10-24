@@ -156,3 +156,38 @@ it('the native explicit confirm posts once and synchronizes the committed prefer
   expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/confirm'))).toHaveLength(1)
   expect(fetcher.mock.calls.some(([url, opts]) => String(url).includes('/refresh') || opts?.method === 'PATCH')).toBe(false)
 })
+it.each(['notifications.mark-read', 'notifications.read-all'])('synchronizes the native unread snapshot once for a succeeded %s receipt with GET only', async operationId => {
+  const { input } = setup()
+  const applyInboxUnreadCount = vi.fn()
+  const receipt = { ...succeeded(), operationId }
+  const fetcher = vi.fn<typeof fetch>(async url => reply(String(url) === '/api/me/messages/unread_count' ? { unread_count: 3 } : receipt))
+  vi.stubGlobal('fetch', fetcher)
+  const { result } = renderHook(() => useSystemActionCardActions({ ...input, applyInboxUnreadCount }))
+  await act(async () => { await result.current.systemActions!.getDetail(id) })
+  await waitFor(() => expect(result.current.inboxRevision).toBe(1))
+  expect(applyInboxUnreadCount).toHaveBeenCalledExactlyOnceWith(3)
+  expect(input.applyPreferences).not.toHaveBeenCalled()
+  expect(result.current.preferencesRevision).toBe(0)
+  await act(async () => { await result.current.systemActions!.getDetail(id) })
+  expect(applyInboxUnreadCount).toHaveBeenCalledTimes(1)
+  expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me/messages/unread_count')).toHaveLength(1)
+  expect(fetcher.mock.calls.every(([, opts]) => (opts?.method ?? 'GET') === 'GET')).toBe(true)
+})
+it('a delayed unread snapshot cannot update another identity and a failed sync leaves the receipt successful', async () => {
+  const { auth, input } = setup()
+  const applyInboxUnreadCount = vi.fn()
+  let resolveCount!: (response: Response) => void
+  const count = new Promise<Response>(resolve => { resolveCount = resolve })
+  const receipt = { ...succeeded(), operationId: 'notifications.read-all' }
+  const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/me/messages/unread_count' ? count : reply(receipt))
+  vi.stubGlobal('fetch', fetcher)
+  const { result } = renderHook(() => useSystemActionCardActions({ ...input, applyInboxUnreadCount }))
+  let actual: unknown
+  await act(async () => { actual = await result.current.systemActions!.getDetail(id) })
+  expect((actual as { state: string }).state).toBe('succeeded')
+  await waitFor(() => expect(fetcher.mock.calls.some(([url]) => String(url) === '/api/me/messages/unread_count')).toBe(true))
+  act(() => { auth.beginIdentity(); resolveCount(reply({ unread_count: 99 })) })
+  await act(async () => { await Promise.resolve() })
+  expect(applyInboxUnreadCount).not.toHaveBeenCalled()
+  expect(result.current.inboxRevision).toBe(0)
+})

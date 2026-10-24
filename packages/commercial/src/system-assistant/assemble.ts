@@ -1,3 +1,4 @@
+import { notificationOperations } from './notificationOperations.js'
 import { systemReadOperations } from './readOperations.js'
 /** Host-only composition. Enabled solely by the verified personal deployment. */
 import type { ContainerIdentityRepo } from '../auth/containerIdentity.js'
@@ -25,6 +26,7 @@ export function assembleSystemActions(deps: {
   const registry = new SystemOperationRegistry([
     ...preferenceOperations({ authorize, privacySupported: deps.privacySupported }),
     ...systemReadOperations({ authorize }),
+    ...notificationOperations({ authorize }),
   ])
   const runtime = openSystemActionsRuntime({ ...deps, registry })
   return { runtime, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
