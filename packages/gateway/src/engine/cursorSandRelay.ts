@@ -37,6 +37,8 @@ import {
   cursorSessionChecksum,
   cursorSessionTokenExpiryMs,
   isCursorMachineId,
+  parseTraceIdCandidate,
+  TRACE_ID_HEADER,
 } from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
 import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
@@ -1388,6 +1390,18 @@ export class CursorSandRelay {
   private readonly directStream: boolean
   private readonly boxResponses = new WeakMap<Response, CursorSandBoxConnection>()
   private readonly requestStats = { messages: 0, inferenceAttempts: 0, toolCorrections: 0, passthroughAttempts: 0 }
+  /** The running turn's canonical trace (OCV5-596). This relay serves one session, one turn at a time. */
+  private traceId: string | undefined
+
+  /** Set per turn by the adapter; an invalid value is dropped (trace is observation, not a credential). */
+  setTraceId(traceId: string | undefined): void {
+    const trace = traceId === undefined ? undefined : parseTraceIdCandidate(traceId)
+    this.traceId = trace?.ok ? trace.traceId : undefined
+  }
+
+  private traceFields(): { traceId?: string } {
+    return this.traceId ? { traceId: this.traceId } : {}
+  }
 
   /** Non-secret counters for an isolated live smoke; never exposes request bodies or tickets. */
   getRequestStats(): Readonly<{ messages: number; inferenceAttempts: number; toolCorrections: number; passthroughAttempts: number }> {
@@ -1456,7 +1470,7 @@ export class CursorSandRelay {
       }))
       return
     }
-    log.info('cursor sand relay passthrough', { model: String(body.model), stream: body.stream !== false })
+    log.info('cursor sand relay passthrough', { model: String(body.model), stream: body.stream !== false, ...this.traceFields() })
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       'anthropic-version': '2023-06-01',
@@ -1474,6 +1488,8 @@ export class CursorSandRelay {
         headers[name] = single
       }
     }
+    // Egress binds it at step 0 and never forwards it upstream (OCV5-569); never taken from the caller.
+    if (this.traceId) headers[TRACE_ID_HEADER] = this.traceId
     const upstream = await this.deps.fetchImpl(`${target.baseUrl}/v1/messages`, {
       method: 'POST',
       headers,
@@ -1514,7 +1530,7 @@ export class CursorSandRelay {
         const message = known
           ? `${this.upstreamLabel} inference failed: ${this.publicCode(raw)} (upstream produced no frames; try a smaller step)`
           : `${this.upstreamLabel} inference failed`
-        log.warn('cursor sand relay request failed', { error: raw, code: known ? raw : 'relay_error' })
+        log.warn('cursor sand relay request failed', { error: raw, code: known ? raw : 'relay_error', ...this.traceFields() })
         if (!res.headersSent) {
           // 504 names the failure class (gateway timeout) for logs/metrics;
           // CCB retries any 5xx the same way, so this does not change retry
@@ -1762,7 +1778,7 @@ export class CursorSandRelay {
         return { kind: 'rejected', status: 400, reason: message, written: true }
       }
       if (/^CURSOR_SAND_(?:SESSION|AUTH)_/.test(message)) {
-        log.warn('cursor sand credential rejected', { code: message, credentialKind: this.credentialKind })
+        log.warn('cursor sand credential rejected', { code: message, credentialKind: this.credentialKind, ...this.traceFields() })
         await terminal.notifyCatch(this.initialState(), message)
         res.statusCode = 401
         res.setHeader('content-type', 'application/json')
@@ -1787,6 +1803,7 @@ export class CursorSandRelay {
         status: upstream.status,
         body: safeRaw(bodyText),
         upstreamModel: opened.upstreamModel,
+        ...this.traceFields(),
       })
       const overflow = isCursorSandOverflow({ status: upstream.status, text: bodyText })
       const reason = overflow ? 'CURSOR_SAND_PROMPT_TOO_LONG' : `CURSOR_SAND_HTTP_${upstream.status}`
@@ -2029,6 +2046,7 @@ export class CursorSandRelay {
             elapsedMs: Date.now() - startedAt,
             sinceLastFrameMs: Date.now() - lastFrameAt,
             raw: error instanceof Error ? error.message : String(error),
+            ...this.traceFields(),
           })
           throw new Error(code)
         }

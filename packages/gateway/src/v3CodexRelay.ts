@@ -11,7 +11,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 
-import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
+import { CODEX_RELAY_PREFIX, TRACE_ID_HEADER } from '@openclaude/protocol'
+
+import { codexRelayTrace } from './relayTrace.js'
 
 export const V3_CODEX_RELAY_PREFIX = CODEX_RELAY_PREFIX
 export const V3_CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
@@ -81,8 +83,12 @@ function buildForwardHeaders(req: IncomingMessage, containerToken: string): Head
     // Never trust a caller-supplied private header; overwrite it below from
     // the original Authorization value observed on this loopback request.
     if (key === V3_CODEX_UPSTREAM_AUTH_HEADER) continue
+    // The turn trace comes only from the registry below (OCV5-580), never from the caller.
+    if (key === TRACE_ID_HEADER) continue
     appendHeader(headers, rawKey, rawValue)
   }
+  const traceId = codexRelayTrace(req.headers['x-codex-turn-metadata'])
+  if (traceId) headers.set(TRACE_ID_HEADER, traceId)
   headers.set('authorization', `Bearer ${containerToken}`)
   if (typeof upstreamAuthorization === 'string' && upstreamAuthorization.trim().length > 0) {
     headers.set(V3_CODEX_UPSTREAM_AUTH_HEADER, upstreamAuthorization)
