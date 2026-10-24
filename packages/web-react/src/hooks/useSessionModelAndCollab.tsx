@@ -10,7 +10,6 @@ import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCom
 import { writeTeamMode } from "../lib/teamMode";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody, isStaleCollabEpoch } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
-import { saveInitialCollaboration } from "../lib/collaborationSend";
 import type { Agent } from "../lib/agents";
 import type { AuthSession, PublicModel, Session } from "../lib/types";
 import type { ConfirmChoice, ConfirmOpts } from "../components/ui/ConfirmDialog";
@@ -332,7 +331,7 @@ export function useSessionModelAndCollab({
     [collabAsDefault, persistCollab],
   );
   // 切会话:服务端配置为权威。epoch 让慢 GET 不能覆盖后来的会话或用户点击。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: model/agent describe this promotion only; changing a model must not reload collaboration; socket and toast are stable
+  // biome-ignore lint/correctness/useExhaustiveDependencies: persistCollab captures the promoted draft on this session change; later picker/model changes must not reload collaboration
   useEffect(() => {
     const epoch = ++collabEpochRef.current;
     const promoted = promotedCollabRef.current;
@@ -360,24 +359,11 @@ export function useSessionModelAndCollab({
       // First send already attempted persistence. Do not replace its frozen
       // choice with an inherited default, including after a failed save.
       if (!intent.persist) return;
-      void (async () => {
-        const current = () => !isStaleCollabEpoch(epoch, collabEpochRef.current)
-          && collabAuth.snapshot().epoch === identityEpoch;
-        try {
-          const socket = sockRef.current;
-          if (!socket || !activeId) throw new Error("会话连接不可用");
-          const ensured = await socket.ensureServerSession(activeId, agent.id, "新对话");
-          if (!current()) return;
-          if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-          const doc = await saveInitialCollaboration(collabAuth, activeId, intent.state, intent.asDefault, identityEpoch);
-          if (doc && current()) applyCollabDoc(doc);
-        } catch (error) {
-          if (!current()) return;
-          const msg = apiErrorMessage(error, "协作配置保存失败，请重新选择后重试");
-          setCollabSaveError(msg);
-          toast(msg, "error");
-        }
-      })();
+      // This render still holds the promoted draft state. Use the same CAS,
+      // ensure-session, failure and identity handling as an explicit picker click.
+      void persistCollab(intent.state.mode, {
+        advisorModel: intent.state.advisorModel, asDefault: intent.asDefault,
+      });
       return;
     }
     void api
