@@ -144,20 +144,29 @@ export class ModelSwitchCostService {
       return null
     }
   }
-  private async price(raw: ModelPricing, agent: string, tier?: string): Promise<ModelPricing> {
-    let p = {
-      ...raw,
-      multiplier: composeMultiplier(
-        raw.multiplier,
-        await getAgentCostMultiplier(this.deps.pool, agent),
-      ),
-    }
-    p = applyFastServiceTierPricing(
-      { model: p.model_id, service_tier: tier === 'fast' ? 'priority' : undefined },
-      p,
-    ).pricing
-    const mul = cursorSettleMultiplier(p.model_id)
-    if (mul) p = { ...p, multiplier: composeMultiplier(p.multiplier, mul) }
+  private async price(
+    raw: ModelPricing,
+    agent: string,
+    engine: string,
+    tier?: string,
+  ): Promise<ModelPricing> {
+    let p = { ...raw }
+    // Match existing settlement branches; CCB/Cursor do not charge agent overrides.
+    if (engine === 'codex' || engine === 'grok')
+      p = {
+        ...p,
+        multiplier: composeMultiplier(
+          raw.multiplier,
+          await getAgentCostMultiplier(this.deps.pool, agent),
+        ),
+      }
+    if (engine === 'ccb')
+      p = applyFastServiceTierPricing(
+        { model: p.model_id, service_tier: tier === 'fast' ? 'priority' : undefined },
+        p,
+      ).pricing
+    const surcharge = engine === 'cursor' ? cursorSettleMultiplier(p.model_id) : null
+    if (surcharge) p = { ...p, multiplier: composeMultiplier(p.multiplier, surcharge) }
     return p
   }
   private matches(g: Grant | null, n: Grant): g is Grant {
@@ -234,9 +243,14 @@ export class ModelSwitchCostService {
         ? target.sourcePricing(ctx.sourceModel)
         : this.deps.pricing.get(ctx.sourceModel)
       : null
+    const fromEngine = rawSource
+      ? (target.sourceEngine?.(rawSource.model_id) ?? this.deps.sourceEngine?.(rawSource.model_id))
+      : null
     const [to, from, balance] = await Promise.all([
-      this.price(target.pricing, input.agentId, input.serviceTier),
-      rawSource ? this.price(rawSource, ctx.sourceAgent, undefined) : Promise.resolve(null),
+      this.price(target.pricing, input.agentId, target.engine, input.serviceTier),
+      rawSource && fromEngine
+        ? this.price(rawSource, ctx.sourceAgent, fromEngine)
+        : Promise.resolve(null),
       (this.deps.balance ?? readTotalSpendableBalance)(uid),
     ])
     const risk =

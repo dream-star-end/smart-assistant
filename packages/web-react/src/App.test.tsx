@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote} from '../browser-tests/model-switch-cost-fixture.mjs';
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
@@ -19,6 +20,9 @@ loadBeforeAll(preloadToolBody)
 loadBeforeAll(() =>
   Promise.all([
     prefetchMarkdownImpl(),
+    import('./lib/modelSwitchCostClient'),
+    import('./components/AgentPicker'),
+    import('./components/GoalDialog'),
     import('./components/Landing'),
     import('./components/SettingsCenter'),
     import('./components/ManageCenter'),
@@ -167,6 +171,7 @@ function routedFetch(over?: {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
+    if(method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init?.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
@@ -1572,8 +1577,9 @@ const OTHER_DETAIL = {
 function routedFetchTwoSessions() {
   // 路由用例全部基于「F5 后恢复登录」：模拟登录过的浏览器（oc_auth_hint），否则不发 refresh。
   setAuthHint()
-  return vi.fn(async (url: string) => {
+  return vi.fn(async (url: string,init?:RequestInit) => {
     const u = String(url)
+    if(init?.method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_OK
     if (u.includes('/api/public/models')) return okJson(MODELS)
     if (u.includes('/api/sessions/list')) return okJson(HIST_META_TWO)

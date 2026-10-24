@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote,fixtureExecutionModel} from "./model-switch-cost-fixture.mjs";
 import { createServer } from "node:http";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { extname, join, sep } from "node:path";
@@ -426,6 +427,12 @@ export function startPreviewServer(assetDir, options = {}) {
           unknown,
         });
         return;
+      }
+      if(req.method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+        const data=await readJson(req);
+        const sid=decodeURIComponent(path.split('/')[4]);
+        const previous=[...stats.inboundMessages].reverse().find(frame=>frame.peer?.id===sid);
+        sendJson(res,200,fixtureSwitchQuote(data,{sourceModel:fixtureExecutionModel(previous)??'glm-5.2'}));return;
       }
       if (path.startsWith("/api/")) {
         const method = req.method || "GET";

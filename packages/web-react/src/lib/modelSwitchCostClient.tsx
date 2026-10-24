@@ -13,6 +13,51 @@ import {
   type SwitchAuthorization,
   type ModelSwitchCostClientDeps,
 } from './modelSwitchCostTypes'
+function checkedQuote(value: unknown, requestId: string): ModelSwitchCostQuote {
+  const q = value as ModelSwitchCostQuote
+  const integer = (v: unknown) => typeof v === 'string' && /^\d{1,40}$/.test(v)
+  const range = (r: ModelSwitchCostQuote['targetCost']) =>
+    !!r &&
+    [r.lowCredits, r.expectedCredits, r.highCredits].every(integer) &&
+    BigInt(r.lowCredits) <= BigInt(r.expectedCredits) &&
+    BigInt(r.expectedCredits) <= BigInt(r.highCredits)
+  const prices = (p: ModelSwitchCostQuote['targetUnitPrice']) =>
+    !!p &&
+    [p.input, p.output, p.cacheRead, p.cacheWrite].every(
+      (v) => typeof v === 'string' && /^\d+(\.\d{1,3})?$/.test(v),
+    )
+  if (
+    !q ||
+    q.requestId !== requestId ||
+    !['exempt', 'estimate', 'risk'].includes(q.mode) ||
+    typeof q.targetModel !== 'string' ||
+    !q.targetModel ||
+    typeof q.targetName !== 'string' ||
+    typeof q.requiresConfirmation !== 'boolean' ||
+    typeof q.canConfirm !== 'boolean' ||
+    !Number.isSafeInteger(q.expiresAt) ||
+    q.expiresAt <= Date.now() ||
+    (q.mode === 'estimate' &&
+      (!Number.isSafeInteger(q.contextTokens) ||
+        q.contextTokens! <= 0 ||
+        !range(q.targetCost) ||
+        !range(q.currentCost))) ||
+    (q.mode === 'risk' &&
+      (q.contextTokens !== null ||
+        q.targetCost !== null ||
+        q.currentCost !== null ||
+        !prices(q.targetUnitPrice))) ||
+    (q.mode !== 'exempt' &&
+      (typeof q.balanceCredits !== 'string' || !/^[-]?\d{1,40}$/.test(q.balanceCredits))) ||
+    (q.requiresConfirmation &&
+      (q.mode === 'exempt' ||
+        typeof q.quoteToken !== 'string' ||
+        q.quoteToken.length === 0 ||
+        q.quoteToken.length > 4096))
+  )
+    throw new Error('费用信息无效，请重试')
+  return q
+}
 const number = (value: string | number) => String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 export function ModelSwitchCostSummary({ quote: q }: { quote: ModelSwitchCostQuote }) {
   return (
@@ -112,7 +157,7 @@ export function createModelSwitchCostAuthorizer({
           (valid?.authorization.requestId === input.requestId
             ? valid.authorization.consent
             : undefined)
-        let q = await api.modelSwitchCost(auth, input, { consent })
+        let q = checkedQuote(await api.modelSwitchCost(auth, input, { consent }), input.requestId)
         if (!current()) return null
         let choice: ConfirmChoice = true
         if (q.requiresConfirmation || opts.notice) {
@@ -138,7 +183,10 @@ export function createModelSwitchCostAuthorizer({
           if (choice === false || !current()) return null
           if (q.requiresConfirmation) {
             if (!q.quoteToken) return null
-            q = await api.modelSwitchCost(auth, input, { quoteToken: q.quoteToken })
+            q = checkedQuote(
+              await api.modelSwitchCost(auth, input, { quoteToken: q.quoteToken }),
+              input.requestId,
+            )
             if (!current() || q.requiresConfirmation) return null
           }
         }

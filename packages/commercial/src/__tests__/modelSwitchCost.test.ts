@@ -241,3 +241,47 @@ test('database failure is not converted into an exempt quote', async () => {
   })
   await assert.rejects(f.service.quote('765', f.request), /read failure/)
 })
+
+test('engine-specific estimation follows actual settlement, not a global agent surcharge', async () => {
+  const source = price('gpt-6-luna', 53, 265, 11, 64, '0.400')
+  const target = price('gpt-6-astra', 598, 3598, 60, 0)
+  const pricing = new PricingCache()
+  pricing._setForTests([source, target])
+  const pool = {
+    query: async (_sql: string, args: string[]) => ({
+      rows: [{ cost_multiplier: args[0].startsWith('source') ? '1000.000' : '2.000' }],
+    }),
+  } as unknown as Pool
+  for (const engine of ['ccb', 'codex']) {
+    const ctx: SwitchContext = {
+      revision: 1,
+      fingerprint: 'small-known',
+      sourceModel: source.model_id,
+      sourceAgent: 'source-ccb-quote-only',
+      tokens: 200453,
+      source: 'last-call',
+      warmRatio: 0,
+      outputs: [7],
+      calls: 1,
+      lastOutputTokens: 7,
+    }
+    const service = new ModelSwitchCostService({
+      pool,
+      pricing,
+      secret: 'fixture-secret',
+      balance: async () => 10000n,
+      readContext: async () => ctx,
+      sourceEngine: () => 'ccb',
+      resolveTarget: async () => ({ pricing: target, engine, contextWindow: 258400 }),
+    })
+    const quote = await service.quote('765', {
+      sessionId: 'fixture',
+      requestId: 'm-engine-prices',
+      targetModel: target.model_id,
+      agentId: `target-${engine}-quote-only`,
+    })
+    assert.equal(quote.targetUnitPrice?.input, engine === 'codex' ? '1196' : '598')
+    assert.equal(quote.currentCost?.expectedCredits, '6') // CCB cold write rate64, not its 1000x agent override.
+    assert.equal(quote.requiresConfirmation, true)
+  }
+})
