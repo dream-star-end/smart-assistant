@@ -52,6 +52,8 @@ export async function runStudioGc(deps: {
         AND t.owner_kind <> 'final'
         AND NOT EXISTS (SELECT 1 FROM studio_shots s WHERE s.active_take_id=t.id)
         AND NOT EXISTS (SELECT 1 FROM studio_lines l WHERE l.active_take_id=t.id)
+        AND NOT EXISTS (SELECT 1 FROM studio_assets a
+                         WHERE a.project_id=t.project_id AND a.blob_sha=t.blob_sha)
         AND EXISTS (SELECT 1 FROM studio_blob_refs r
                      WHERE r.user_id=p.user_id AND r.ref_kind='take' AND r.ref_id=t.id)
       LIMIT $1`,

@@ -655,6 +655,7 @@ import {
 import { resolveMiniMaxMediaKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
 import { createStudioFromConfig } from "./media-studio/assemble.js";
+import { startStudioOrchestrator } from "./media-studio/orchestrator/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
@@ -669,6 +670,7 @@ import {
 } from "./grok/webSearchProxy.js";
 import {
   GROK_VISION_PATH,
+  makeGrokRunner,
   makeGrokVisionHandler,
   type GrokVisionHandler,
 } from "./grok/visionProxy.js";
@@ -2090,7 +2092,8 @@ export async function registerCommercial(
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
   const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
   // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
-  const studioHttp = await createStudioFromConfig(cfg, getPool());
+  const studioHttp = await createStudioFromConfig(cfg, getPool(), { preCheckRedis, museHub });
+  let stopStudioOrchestrator: (() => Promise<void>) | undefined;
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2525,6 +2528,29 @@ export async function registerCommercial(
         loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
       });
+      // OCV5-591 A2-1: the studio's director agent plans with the same Grok core (platform-paid steps).
+      if (studioHttp) {
+        stopStudioOrchestrator = startStudioOrchestrator({
+          cfg,
+          pool: getPool(),
+          studio: studioHttp,
+          museHub,
+          grok: makeGrokRunner({
+            getPool,
+            preCheckRedis,
+            pricing,
+            catalog: {
+              async assertFresh() {
+                const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+                if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+                return cache.assertFresh();
+              },
+            },
+            loadUserModelAuthz,
+            recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+          }),
+        })?.stop;
+      }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -7275,6 +7301,7 @@ export async function registerCommercial(
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await closeMusePublic?.(); } catch { /* ignore */ }
+      try { await stopStudioOrchestrator?.(); } catch { /* ignore */ }
       // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
       try { await museHub?.stop(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }

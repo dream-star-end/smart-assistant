@@ -17,6 +17,7 @@ import {
 } from '../media-studio/access.js'
 import type { StudioBlobStore } from '../media-studio/blobs.js'
 import { type StudioHttpDeps, dispatchStudioRoute } from '../media-studio/http.js'
+import type { OrchestratorApi } from '../media-studio/orchestrator/service.js'
 import type { StudioStore } from '../media-studio/store.js'
 
 const SECRET = 'studio-test-secret-that-is-long-enough-123'
@@ -90,6 +91,7 @@ describe('dispatchStudioRoute', () => {
   let server: Server
   let base = ''
   let enabled = true
+  let orchestrator: OrchestratorApi | undefined
   const calls: string[] = []
   let filePath = ''
   const fileBody = Buffer.from('0123456789')
@@ -106,6 +108,10 @@ describe('dispatchStudioRoute', () => {
     projectView: async (uid: string, id: string) =>
       uid === '247' && id === PROJECT ? { project: { id } } : null,
     projectOwned: async (uid: string) => uid === '247',
+    transition: async (uid: string, id: string, action: string) => {
+      calls.push(`transition:${uid}:${action}`)
+      return { id }
+    },
     addUploadAsset: async (
       _uid: string,
       _p: string,
@@ -136,6 +142,7 @@ describe('dispatchStudioRoute', () => {
         access: studioAccess({ OC_STUDIO_ENABLED: enabled, OC_STUDIO_ALLOWED_UIDS: ['247'] }),
         store,
         blobs,
+        ...(orchestrator ? { orchestrator } : {}),
       }
       void dispatchStudioRoute(req, res, {} as never, { jwtSecret: SECRET, studio: deps }).catch(
         (error) => {
@@ -177,6 +184,35 @@ describe('dispatchStudioRoute', () => {
     )
   })
 
+  it('GET /providers: same gate; without a registry every kind reads as not configured (A2-0)', async () => {
+    enabled = false
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } }))
+        .status,
+      404,
+    )
+    enabled = true
+    assert.equal((await fetch(`${base}/providers`)).status, 401)
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('3') } })).status,
+      404,
+    )
+    const ok = await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } })
+    assert.equal(ok.status, 200)
+    const view = (await ok.json()) as {
+      kinds: Array<{ kind: string; state: string; reason?: string }>
+    }
+    assert.deepEqual(
+      view.kinds.map((k) => [k.kind, k.state, k.reason]),
+      [
+        ['image', 'unconfigured', 'NO_PROVIDER'],
+        ['video', 'unconfigured', 'NO_PROVIDER'],
+        ['voice', 'unconfigured', 'NO_PROVIDER'],
+        ['music', 'unconfigured', 'NO_PROVIDER'],
+      ],
+    )
+  })
+
   it('creates and reads projects; another user sees 404', async () => {
     const auth = await bearer('247')
     const created = await fetch(`${base}/projects`, {
@@ -198,6 +234,79 @@ describe('dispatchStudioRoute', () => {
       ).status,
       404,
     )
+  })
+
+  it('director routes (A2-1a): 503 while the orchestrator is off, then reach it as the caller', async () => {
+    const auth = await bearer('247')
+    const post = (p: string, body?: unknown, who = auth) =>
+      fetch(`${base}${p}`, {
+        method: 'POST',
+        headers: { authorization: who, 'content-type': 'application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    const TAKE = '22222222-3333-4444-8555-666666666666'
+    const ASSET = '33333333-4444-4555-8666-777777777777'
+    const routes = [
+      `/projects/${PROJECT}/start`,
+      `/projects/${PROJECT}/approve`,
+      `/projects/${PROJECT}/voices`,
+      `/takes/${TAKE}/select`,
+      `/assets/${ASSET}/narration`,
+    ]
+    orchestrator = undefined
+    for (const r of routes) {
+      const res = await post(r, {})
+      assert.equal(res.status, 503, r)
+      assert.equal(((await res.json()) as { error: string }).error, 'STUDIO_ORCHESTRATOR_OFF')
+    }
+
+    const seen: string[] = []
+    orchestrator = {
+      start: async (uid, id) => void seen.push(`start:${uid}:${id}`),
+      approve: async (uid, id) => void seen.push(`approve:${uid}:${id}`),
+      selectTake: async (uid, id) => {
+        seen.push(`select:${uid}:${id}`)
+        return { projectId: PROJECT }
+      },
+      createVoice: async (uid, id, body) => {
+        seen.push(`voice:${uid}:${id}:${body.mode}:${body.name}`)
+        return { assetId: ASSET }
+      },
+      useVoiceForNarration: async (uid, id) => {
+        seen.push(`narration:${uid}:${id}`)
+        return { projectId: PROJECT }
+      },
+      kick: (id) => void seen.push(`kick:${id}`),
+    }
+    try {
+      for (const r of [`/projects/${PROJECT}/start`, `/projects/${PROJECT}/approve`]) {
+        const res = await post(r)
+        assert.equal(res.status, 200, r)
+        assert.deepEqual(await res.json(), { project: { id: PROJECT } })
+      }
+      const voice = await post(`/projects/${PROJECT}/voices`, { mode: 'design', name: '旁白' })
+      assert.equal(voice.status, 201)
+      assert.deepEqual(await voice.json(), { assetId: ASSET })
+      assert.equal((await post(`/takes/${TAKE}/select`)).status, 200)
+      assert.equal((await post(`/assets/${ASSET}/narration`)).status, 200)
+      assert.equal((await post(`/projects/${PROJECT}/resume`)).status, 200)
+      assert.deepEqual(seen, [
+        `start:247:${PROJECT}`,
+        `approve:247:${PROJECT}`,
+        `voice:247:${PROJECT}:design:旁白`,
+        `select:247:${TAKE}`,
+        `narration:247:${ASSET}`,
+        `kick:${PROJECT}`,
+      ])
+      // Outside the allow-list the gate answers 404 before the orchestrator is touched.
+      assert.equal(
+        (await post(`/projects/${PROJECT}/start`, undefined, await bearer('3'))).status,
+        404,
+      )
+      assert.equal(seen.length, 6)
+    } finally {
+      orchestrator = undefined
+    }
   })
 
   it('issues a ticket only for a blob the user references, then serves byte ranges with it', async () => {

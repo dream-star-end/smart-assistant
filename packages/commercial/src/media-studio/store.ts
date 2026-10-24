@@ -28,6 +28,8 @@ export type StudioStatus =
 
 const TERMINAL: ReadonlySet<StudioStatus> = new Set(['done', 'failed', 'canceled'])
 const ASPECTS = new Set(['16:9', '9:16', '1:1'])
+/** OCV5-591 A2-1 plan §5.1: 40 shots × 10 s must always cover target × 1.3. */
+export const STUDIO_MAX_TARGET_SEC = 300
 
 export interface ProjectRow {
   id: string
@@ -85,7 +87,7 @@ function validatePatch(input: Record<string, unknown>): ProjectPatch {
     if (
       !Number.isInteger(input.targetSec) ||
       (input.targetSec as number) < 5 ||
-      (input.targetSec as number) > 600
+      (input.targetSec as number) > STUDIO_MAX_TARGET_SEC
     )
       throw bad('targetSec')
     out.targetSec = input.targetSec as number

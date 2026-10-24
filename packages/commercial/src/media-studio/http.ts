@@ -27,6 +27,9 @@ import {
   verifyBlobTicket,
 } from './access.js'
 import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from './blobs.js'
+import type { OrchestratorApi } from './orchestrator/service.js'
+import type { ProviderRegistry } from './providers/registry.js'
+import { MEDIA_KINDS } from './providers/types.js'
 import type { StudioStore } from './store.js'
 
 export const STUDIO_BROWSER_PREFIX = '/api/studio'
@@ -36,6 +39,10 @@ export interface StudioHttpDeps {
   access: StudioAccess
   store: StudioStore
   blobs: StudioBlobStore
+  /** OCV5-591 A2-0; absent → every media kind reads as not configured. */
+  providers?: ProviderRegistry
+  /** OCV5-591 A2-1; absent → start / approve / take selection answer 503. */
+  orchestrator?: OrchestratorApi
 }
 
 const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
@@ -52,7 +59,11 @@ const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
 
 const notFound = () => new HttpError(404, 'NOT_FOUND', 'not found')
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-const PROJECT_RE = new RegExp(`^/projects/(${UUID})(?:/(pause|resume|cancel|uploads))?$`)
+const PROJECT_RE = new RegExp(
+  `^/projects/(${UUID})(?:/(pause|resume|cancel|uploads|start|approve|voices))?$`,
+)
+const TAKE_SELECT_RE = new RegExp(`^/takes/(${UUID})/select$`)
+const VOICE_NARRATION_RE = new RegExp(`^/assets/(${UUID})/narration$`)
 const BLOB_RE = /^\/blobs\/([0-9a-f]{64})(\/ticket)?$/
 
 function bodyRecord(value: unknown): Record<string, unknown> {
@@ -131,6 +142,22 @@ export async function dispatchStudioRoute(
     return
   }
 
+  if (path === '/providers' && method === 'GET') {
+    sendJson(
+      res,
+      200,
+      studio.providers?.describe(user) ?? {
+        kinds: MEDIA_KINDS.map((kind) => ({
+          kind,
+          state: 'unconfigured',
+          reason: 'NO_PROVIDER',
+          providers: [],
+        })),
+      },
+    )
+    return
+  }
+
   if (path === '/projects' && method === 'GET') {
     const limit = url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined
     sendJson(
@@ -147,6 +174,21 @@ export async function dispatchStudioRoute(
     sendJson(res, 201, {
       project: await studio.store.createProject(uid, bodyRecord(await readJsonBody(req))),
     })
+    return
+  }
+
+  const narration = VOICE_NARRATION_RE.exec(path)
+  if (narration && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    sendJson(res, 200, await studio.orchestrator.useVoiceForNarration(uid, narration[1]!))
+    return
+  }
+  const takeSelect = TAKE_SELECT_RE.exec(path)
+  if (takeSelect && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    sendJson(res, 200, await studio.orchestrator.selectTake(uid, takeSelect[1]!))
     return
   }
 
@@ -174,7 +216,29 @@ export async function dispatchStudioRoute(
     return
   }
   if ((action === 'pause' || action === 'resume' || action === 'cancel') && method === 'POST') {
-    sendJson(res, 200, { project: await studio.store.transition(uid, projectId, action) })
+    const updated = await studio.store.transition(uid, projectId, action)
+    if (action === 'resume') studio.orchestrator?.kick(projectId)
+    sendJson(res, 200, { project: updated })
+    return
+  }
+  if (action === 'voices' && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    sendJson(
+      res,
+      201,
+      await studio.orchestrator.createVoice(uid, projectId, bodyRecord(await readJsonBody(req))),
+    )
+    return
+  }
+  if ((action === 'start' || action === 'approve') && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    if (action === 'start') await studio.orchestrator.start(uid, projectId)
+    else await studio.orchestrator.approve(uid, projectId)
+    const view = await studio.store.projectView(uid, projectId)
+    if (!view) throw notFound()
+    sendJson(res, 200, view)
     return
   }
   if (action === 'uploads' && method === 'POST') {

@@ -21,6 +21,7 @@ import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../d
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { HttpError } from '../http/util.js'
+import { miniMaxDebitedCredits } from '../minimax/mediaBilling.js'
 import {
   type MiniMaxClientDeps,
   cloneVoice,
@@ -158,6 +159,88 @@ function deps(
 }
 
 describe('MiniMax media client (OCV5-589)', () => {
+  test('miniMaxDebitedCredits: a clamped settle and its replay report the real debit (OCV5-591 A2-0)', async (t) => {
+    if (skip(t)) return
+    // Balance 1 passes the pre-check (10 local chars → 1 cent); upstream then bills 151 chars
+    // (4 cents), so the settle clamps the debit to the 1 credit left.
+    const poor = await user(1n)
+    const up = fakeUpstream({
+      '/v1/t2a_v2': () => ({
+        data: { audio: AUDIO_HEX },
+        extra_info: { usage_characters: 151 },
+        base_resp: { status_code: 0 },
+      }),
+    })
+    const d = deps(up.fetchImpl, ['male-qn-qingse'])
+    const args = {
+      userId: poor,
+      containerId: null,
+      requestId: 'clamp-1',
+      model: 'speech-2.8-turbo' as const,
+      text: 'a'.repeat(10),
+      voiceId: 'male-qn-qingse',
+      format: 'mp3' as const,
+    }
+    const first = await synthesizeSpeech(d, args)
+    assert.equal(first.settled.costCredits, 4n)
+    assert.equal(first.settled.debitedCredits, 1n)
+    assert.equal(await credits(poor), 0n)
+    assert.equal(await miniMaxDebitedCredits(getPool(), first.settled.usageId), 1n)
+    // The replay passes the balance pre-check again before reaching the settle replay.
+    await query('UPDATE users SET credits = 10 WHERE id = $1', [poor.toString()])
+    const replay = await synthesizeSpeech(d, args)
+    assert.equal(replay.settled.replayed, true)
+    assert.equal(replay.settled.debitedCredits, null)
+    assert.equal(await miniMaxDebitedCredits(getPool(), replay.settled.usageId), 1n)
+    assert.equal(await credits(poor), 10n, 'a replay never debits again')
+  })
+
+  test('speech costCap: an upstream count above the reservation is charged at the cap (OCV5-591 A2-0)', async (t) => {
+    if (skip(t)) return
+    const alice = await user(10_000n)
+    const up = fakeUpstream({
+      '/v1/t2a_v2': () => ({
+        data: { audio: AUDIO_HEX },
+        extra_info: { usage_characters: 151 },
+        base_resp: { status_code: 0 },
+      }),
+    })
+    const d = deps(up.fetchImpl, ['male-qn-qingse'])
+    const out = await synthesizeSpeech(d, {
+      userId: alice,
+      containerId: null,
+      requestId: 'cap-1',
+      model: 'speech-2.8-turbo',
+      text: 'a'.repeat(50),
+      voiceId: 'male-qn-qingse',
+      format: 'mp3',
+      costCap: 3n,
+    })
+    // 151 chars would be 4 cents; the reservation caps it at 3.
+    assert.equal(out.settled.costCredits, 3n)
+    assert.equal(await credits(alice), 9_997n)
+    const row = (
+      await query<{ cost: string; notes: string | null }>(
+        `SELECT cost_credits::text AS cost, price_snapshot->>'notes' AS notes
+           FROM minimax_media_usage_records WHERE user_id=$1 AND request_id='cap-1'`,
+        [alice.toString()],
+      )
+    ).rows[0]!
+    assert.equal(row.cost, '3')
+    assert.match(row.notes ?? '', /capped from 4/)
+    // Without a cap the same count is charged in full.
+    const uncapped = await synthesizeSpeech(d, {
+      userId: alice,
+      containerId: null,
+      requestId: 'cap-2',
+      model: 'speech-2.8-turbo',
+      text: 'a'.repeat(50),
+      voiceId: 'male-qn-qingse',
+      format: 'mp3',
+    })
+    assert.equal(uncapped.settled.costCredits, 4n)
+  })
+
   test('speech voice access: system and own voices pass, others are 403 before upstream', async (t) => {
     if (skip(t)) return
     const alice = await user(10_000n)
