@@ -92,6 +92,7 @@ const OrgCenter = lazy(() => import("./OrgCenter").then((m) => ({ default: m.Org
 
 export type AppDialogsProps = {
   preferencesRevision?: number;
+  inboxRevision?: number;
   activeId: string | undefined;
   activeSess: ChatSession | undefined;
   agent: Agent;
@@ -335,6 +336,7 @@ export function AppDialogs({
   shareOpen,
   subscribeOpenSignal,
   preferencesRevision,
+  inboxRevision,
   teamMode,
   theme,
   toast,
@@ -614,6 +616,8 @@ export function AppDialogs({
       {inboxMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <InboxDialog
+            key={`inbox:${user?.id ?? 'none'}:${auth?.snapshot().epoch ?? -1}`}
+            refreshRevision={inboxRevision}
             open={inboxOpen}
             auth={auth}
             onClose={() => setInboxOpen(false)}

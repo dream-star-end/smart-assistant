@@ -1,12 +1,12 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { SystemActionCardActions } from '../components/tool/context'
-import type { SystemActionsClient, ReceiptObserver } from '../lib/api/systemActionsApi'
+import type { SystemActionsClient } from '../lib/api/systemActionsApi'
 import { AuthEpochStaleError } from '../lib/api/http'
-import { applyIntelligentUiSnapshot } from '../lib/intelligentUi'
-import { extractPrefs, type PrefsView } from '../lib/modelPreferences'
+import type { PrefsView } from '../lib/modelPreferences'
 import type { AuthSession } from '../lib/types'
 import type { Theme } from './useTheme'
+import { useAuthAccessGeneration } from './useAuthAccessGeneration'
 
 const instanceIds = new WeakMap<AuthSession, number>()
 let nextInstanceId = 0
@@ -21,8 +21,9 @@ export function useSystemActionCardActions(input: {
   demo: boolean
   applyPreferences: (prefs: PrefsView) => void
   setTheme: (theme: Theme) => void
+  applyInboxUnreadCount?: (count: number) => void
   onSyncError: () => void
-}): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number } {
+}): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number; inboxRevision: number } {
   const { authRef, userId, demo } = input
   const auth = authRef.current
   const latest = useRef(input); latest.current = input
@@ -30,10 +31,8 @@ export function useSystemActionCardActions(input: {
   useLayoutEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const [deviceId] = useState(() => globalThis.crypto?.randomUUID?.() ?? null)
   const [preferencesRevision, setPreferencesRevision] = useState(0)
-  const subscribe = useCallback((listener: () => void) => typeof auth.subscribeAccessGeneration === 'function'
-    ? auth.subscribeAccessGeneration(listener) : () => {}, [auth])
-  const getGeneration = useCallback(() => typeof auth.getAccessGeneration === 'function' ? auth.getAccessGeneration() : -1, [auth])
-  const generation = useSyncExternalStore(subscribe, getGeneration, getGeneration)
+  const [inboxRevision, setInboxRevision] = useState(0)
+  const generation = useAuthAccessGeneration(auth)
   const epoch = auth.snapshot().epoch
   const systemActions = useMemo<SystemActionCardActions | undefined>(() => {
     if (demo || !userId || !deviceId || generation < 0 || typeof auth.subscribeAccessGeneration !== 'function' || !auth.snapshot().token) return undefined
@@ -43,36 +42,17 @@ export function useSystemActionCardActions(input: {
       const now = auth.snapshot()
       if (currentAuth() !== auth || now.epoch !== epoch || now.token !== captured.token || auth.getAccessGeneration() !== generation) throw new AuthEpochStaleError()
     }
-    const completed = new Set<string>()
-    const pending = new Map<string, Promise<void>>()
-    let tail = Promise.resolve()
     let client: Promise<SystemActionsClient> | undefined
-    const onReceipt: ReceiptObserver = (receipt, context) => {
-      if (receipt.operationId !== 'preferences.update' || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
-      const existing = pending.get(receipt.id)
-      if (existing) return existing
-      const work = tail.then(async () => {
-        context.assertCurrent()
-        const snap = await (await getClient()).getPreferencesSnapshot()
-        context.assertCurrent()
-        const prefs = extractPrefs(snap)
-        applyIntelligentUiSnapshot(snap)
-        latest.current.applyPreferences(prefs)
-        latest.current.setTheme(prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
-        setPreferencesRevision(n => n + 1)
-        completed.add(receipt.id)
-      })
-      pending.set(receipt.id, work)
-      work.then(() => pending.delete(receipt.id), () => pending.delete(receipt.id))
-      tail = work.catch(() => {})
-      return work
-    }
     function getClient(): Promise<SystemActionsClient> {
       assertCurrent()
       // The approval decoder/transport is not part of the first-screen preload graph.
-      client ??= import('../lib/api/systemActionsApi').then(({ createSystemActionsApi }) => {
+      client ??= import('../lib/api/systemActionsApi').then(({ createSystemActionsApi, createSystemReceiptObserver }) => {
         assertCurrent()
-        return createSystemActionsApi({ auth, currentAuth, deviceId: deviceId!, onReceipt,
+        return createSystemActionsApi({ auth, currentAuth, deviceId: deviceId!, onReceipt: createSystemReceiptObserver({
+          getClient,
+          onPreferences: (prefs, theme) => { latest.current.applyPreferences(prefs); latest.current.setTheme(theme); setPreferencesRevision(n => n + 1) },
+          onInbox: count => { latest.current.applyInboxUnreadCount?.(count); setInboxRevision(n => n + 1) },
+        }),
           onReceiptError: () => latest.current.onSyncError() })
       }).catch(error => { client = undefined; throw error })
       return client
@@ -86,5 +66,5 @@ export function useSystemActionCardActions(input: {
       reconcile: async id => (await getClient()).reconcile(id),
     }
   }, [auth, authRef, userId, demo, deviceId, epoch, generation])
-  return { systemActions, preferencesRevision }
+  return { systemActions, preferencesRevision, inboxRevision }
 }

@@ -1,3 +1,4 @@
+import type { SessionReadHandle } from './sessionFileIo.js'
 /**
  * Portable session storage utilities.
  *
@@ -715,6 +716,7 @@ function finalizeOutput(s: LoadState): void {
 export async function readTranscriptForLoad(
   filePath: string,
   fileSize: number,
+  verifiedHandle?: SessionReadHandle,
 ): Promise<{
   boundaryStartOffset: number
   postBoundaryBuf: Buffer
@@ -748,7 +750,8 @@ export async function readTranscriptForLoad(
   }
 
   const chunk = Buffer.allocUnsafe(CHUNK_SIZE)
-  const fd = await fsOpen(filePath, 'r')
+  const ownedHandle = verifiedHandle ? null : await fsOpen(filePath, 'r')
+  const fd = verifiedHandle ?? ownedHandle!
   try {
     let filePos = 0
     while (filePos < fileSize) {
@@ -758,7 +761,10 @@ export async function readTranscriptForLoad(
         Math.min(CHUNK_SIZE, fileSize - filePos),
         filePos,
       )
-      if (bytesRead === 0) break
+      if (bytesRead === 0) {
+        if (verifiedHandle) throw new Error('CCB_TRANSCRIPT_SHORT_READ')
+        break
+      }
       filePos += bytesRead
 
       const chunkOff = processStraddle(s, chunk, bytesRead)
@@ -780,7 +786,7 @@ export async function readTranscriptForLoad(
     }
     finalizeOutput(s)
   } finally {
-    await fd.close()
+    await ownedHandle?.close()
   }
 
   return {

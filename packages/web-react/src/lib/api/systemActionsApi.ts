@@ -1,3 +1,6 @@
+import { applyIntelligentUiSnapshot } from '../intelligentUi'
+import { extractPrefs, type PrefsView } from '../modelPreferences'
+import type { Theme } from '../../hooks/useTheme'
 import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser'
 import type { AuthSession, Preferences } from '../types'
 import { ApiError, AuthEpochStaleError, bearerHeaders, jsonOrThrow } from './http'
@@ -10,6 +13,7 @@ const EXECUTORS = new Set(['master', 'control', 'browser'])
 export type ReceiptObserver = (receipt: SystemActionSummary, context: { assertCurrent: () => void }) => void | Promise<void>
 export type SystemActionsClient = {
   getPreferencesSnapshot(): Promise<Preferences>
+  getInboxUnreadCountSnapshot(): Promise<number>
   getDetail(id: string): Promise<SystemActionDetail>
   getResult(id: string): Promise<SystemActionSummary>
   getConfirmation(id: string): Promise<{ detail: SystemActionDetail; nonce: string }>
@@ -111,6 +115,10 @@ export function createSystemActionsApi(options: {
       if (!object(value)) invalidResponse()
       return value
     }),
+    getInboxUnreadCountSnapshot: () => request('/api/me/messages/unread_count', value => {
+      if (!object(value) || !Number.isSafeInteger(value.unread_count) || (value.unread_count as number) < 0) invalidResponse()
+      return value.unread_count as number
+    }),
     async getConfirmation(id) {
       issued.delete(id)
       const fresh = await getDetail(id)
@@ -142,5 +150,42 @@ export function createSystemActionsApi(options: {
       assertCurrent(); issued.delete(id)
       return observe(await request(approvalPath(id, 'deny'), value => summary(value, id), {}))
     },
+  }
+}
+
+/** Loaded with the approval transport, outside the first-screen preload graph. */
+export function createSystemReceiptObserver(input: {
+  getClient: () => Promise<Pick<SystemActionsClient, 'getInboxUnreadCountSnapshot' | 'getPreferencesSnapshot'>>
+  onPreferences: (prefs: PrefsView, theme: Theme) => void
+  onInbox: (count: number) => void
+}): ReceiptObserver {
+  const completed = new Set<string>()
+  const pending = new Map<string, Promise<void>>()
+  let tail = Promise.resolve()
+  return (receipt, context) => {
+    const preferences = receipt.operationId === 'preferences.update'
+    const notifications = receipt.operationId === 'notifications.mark-read' || receipt.operationId === 'notifications.read-all'
+    if ((!preferences && !notifications) || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
+    const existing = pending.get(receipt.id)
+    if (existing) return existing
+    const work = tail.then(async () => {
+      context.assertCurrent()
+      if (notifications) {
+        const count = await (await input.getClient()).getInboxUnreadCountSnapshot()
+        context.assertCurrent()
+        input.onInbox(count)
+      } else {
+        const snap = await (await input.getClient()).getPreferencesSnapshot()
+        context.assertCurrent()
+        const prefs = extractPrefs(snap)
+        applyIntelligentUiSnapshot(snap)
+        input.onPreferences(prefs, prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
+      }
+      completed.add(receipt.id)
+    })
+    pending.set(receipt.id, work)
+    work.then(() => pending.delete(receipt.id), () => pending.delete(receipt.id))
+    tail = work.catch(() => {})
+    return work
   }
 }

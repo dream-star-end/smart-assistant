@@ -4,7 +4,7 @@ type GoalStartDeps = {
   isBusy: () => boolean;
   save: () => Promise<GoalStateSnapshot>;
   apply: (goal: GoalStateSnapshot) => void;
-  start: (goal: GoalStateSnapshot) => Promise<void>;
+  start: (goal: GoalStateSnapshot) => Promise<unknown>;
 };
 
 /** One explicit UI action, not a snapshot effect: loading/reconnecting never starts work.
@@ -23,7 +23,7 @@ export function createGoalStarter() {
       deps.apply(goal);
       if (goal.status !== "active" || wasBusy || deps.isBusy()) return;
       try {
-        await deps.start(goal);
+        if(await deps.start(goal)===false)throw new Error("费用确认已取消或发送未完成");
       } catch (error) {
         const reason = error instanceof Error ? error.message : "发送失败";
         throw new Error(`目标已保存，但未能启动：${reason}。可再次点击保存重试。`);

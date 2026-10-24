@@ -186,7 +186,7 @@ describe("F1b 剪贴板图片直接上传", () => {
 });
 
 describe("Composer 目标 chip", () => {
-  test("有可见目标时在输入框上方渲染 chip，点击打开对话框", () => {
+  test("有可见目标时在输入框上方渲染 chip，点击打开对话框", async () => {
     render(
       <Composer
         onSend={() => {}}
@@ -200,7 +200,7 @@ describe("Composer 目标 chip", () => {
     expect(chip).toHaveTextContent("迁移并验证");
     expect(chip).toHaveTextContent("已启用");
     fireEvent.click(chip);
-    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
   });
 
   test("保存响应把 goal 传入后 chip 立即出现；无目标不渲染", () => {

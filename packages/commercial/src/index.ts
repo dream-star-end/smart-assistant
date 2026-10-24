@@ -1,3 +1,5 @@
+import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
+import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
 import { assembleSystemActions } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
@@ -733,6 +735,7 @@ import {
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
 import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
@@ -2537,6 +2540,10 @@ export async function registerCommercial(
         getSigner: () => modelAuthoritySigner,
       });
       // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
+      const ccbTranscriptRestoreHandler = makeCcbTranscriptRestoreHandler({
+        identityRepo,
+        read: makeCcbTranscriptRestoreReader(getPool()),
+      });
       const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
         identityRepo,
         storage: dispatchAdmissionBackend,
@@ -2909,6 +2916,7 @@ export async function registerCommercial(
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
         }
+        if (path === CCB_TRANSCRIPT_RESTORE_PATH) return ccbTranscriptRestoreHandler(req, res, ctx);
         if (path === TURN_TAPE_STATE_PATH) {
           return turnTapeStateHandler(req, res, ctx);
         }
@@ -4406,6 +4414,7 @@ export async function registerCommercial(
     inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
     validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
   });
+  const modelSwitchCost = makeModelSwitchCostService({pool:getPool(),pricing,secret:jwtSecret}, loadUserModelAuthz);
   if (process.env.OC_SYSTEM_ACTIONS_ENABLED === '1') {
     if (runtimeChannel !== 'v5' || flavorIdentity.status !== 'ok' || flavorIdentity.flavor !== 'selfhost' || !v3Deps) {
       throw new Error('System actions require the verified personal Docker deployment');
@@ -4420,6 +4429,7 @@ export async function registerCommercial(
     });
   }
   const handler = createCommercialHandler({
+    modelSwitchCost,
     jwtSecret,
     systemActionsHttp: systemActions?.runtime.handleBrowser,
     mediaGeneration: mediaGenerationService,
@@ -5898,6 +5908,7 @@ export async function registerCommercial(
   };
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    modelSwitchCost,
     jwtSecret,
     issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
     promptQueueEnabled: isPromptQueueV1Enabled(),

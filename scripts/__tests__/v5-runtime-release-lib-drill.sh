@@ -307,18 +307,47 @@ cat > "$BUNSTUB" <<'BUNS'
 case "$1" in
   --version) echo "1.0.0-stub" ;;
   install) mkdir -p node_modules/leftpad; echo x > node_modules/leftpad/index.js ;;
-  run) [ "${2:-}" = build ] && { mkdir -p dist; echo 'NEW-CLI' > dist/cli.js; } ;;
+  run)
+    [ -z "${BUN_STUB_FAIL_BUILD:-}" ] || { echo 'unexpected rebuild' >&2; exit 1; }
+    [ "${2:-}" = build ] && {
+      if [ -f src/utils/sessionFileIo.ts ]; then
+        # 真正按 shim 的相对路径读取输入，旧扁平复制布局会在这里失败。
+        shared=src/utils/../../../packages/storage/src/sessionFileIo.ts
+        [ -f "$shared" ] && cmp -s "$shared" "$BUN_STUB_EXPECTED_SHARED" || exit 1
+      fi
+      mkdir -p dist; echo 'NEW-CLI' > dist/cli.js
+      [ ! -f src/utils/sessionFileIo.ts ] || cat "$shared" >> dist/cli.js
+    } ;;
 esac
 BUNS
 chmod +x "$BUNSTUB"; export OC_BUN_BIN="$BUNSTUB"
 # Part A:build_ccb_dist 直调 —— node_modules 落独立临时目录,不进 staging
-CCBSTG="$WORK/ccbA"; mkdir -p "$CCBSTG/claude-code-best"; echo 'src' > "$CCBSTG/claude-code-best/index.ts"
+CCBSTG="$WORK/ccbA"
+mkdir -p "$CCBSTG/claude-code-best/src/utils" "$CCBSTG/packages/storage/src"
+echo "export * from '../../../packages/storage/src/sessionFileIo.js'" > "$CCBSTG/claude-code-best/src/utils/sessionFileIo.ts"
+echo 'export const shared = "SHARED-LOCK-V1"' > "$CCBSTG/packages/storage/src/sessionFileIo.ts"
+CCBINPUT="$WORK/ccb-input"; cp -a "$CCBSTG" "$CCBINPUT"
+export BUN_STUB_EXPECTED_SHARED="$CCBSTG/packages/storage/src/sessionFileIo.ts"
 BV="$(oc_hotcfg_build_ccb_dist "$CCBSTG")"
 BV_VER="${BV%%$'\t'*}"; BV_KEY="${BV##*$'\t'}"
 chk "build_ccb_dist 回显 ver+ccbDistKey" "[ '$BV_VER' = '1.0.0-stub' ] && [[ '$BV_KEY' =~ ^[0-9a-f]{12}\$ ]]"
 chk "dist/cli.js 拷回 staging(新构建)" "grep -q NEW-CLI '$CCBSTG/claude-code-best/dist/cli.js'"
 chk "staging 不含 ccb node_modules(独立临时目录)" "[ ! -e '$CCBSTG/claude-code-best/node_modules' ]"
 chk "临时构建目录无残留(.ccbbuild-*)" "[ -z \"\$(find '$WORK' -maxdepth 1 -name '.ccbbuild-*' 2>/dev/null)\" ]"
+# 相同输入必须跳过 build；只改 shared、CCB 子树不变则必须重建且新字节进入 bundle。
+CCBPREV="$WORK/ccb-prev"; mkdir -p "$CCBPREV/claude-code-best"
+cp -a "$CCBSTG/claude-code-best/dist" "$CCBPREV/claude-code-best/dist"
+printf '{"ccbDistKey":"%s"}\n' "$BV_KEY" > "$CCBPREV/MANIFEST.json"
+CCBSAME="$WORK/ccb-same"; cp -a "$CCBINPUT" "$CCBSAME"
+SAME_BV="$(BUN_STUB_FAIL_BUILD=1 oc_hotcfg_build_ccb_dist "$CCBSAME" "$CCBPREV")"
+chk "相同共享输入命中缓存且不调用 build" "[ '$SAME_BV' = '$BV' ] && cmp -s '$CCBSAME/claude-code-best/dist/cli.js' '$CCBPREV/claude-code-best/dist/cli.js'"
+CCBCHANGED="$WORK/ccb-changed"; cp -a "$CCBINPUT" "$CCBCHANGED"
+echo 'export const shared = "SHARED-LOCK-V2"' > "$CCBCHANGED/packages/storage/src/sessionFileIo.ts"
+export BUN_STUB_EXPECTED_SHARED="$CCBCHANGED/packages/storage/src/sessionFileIo.ts"
+CHANGED_BV="$(oc_hotcfg_build_ccb_dist "$CCBCHANGED" "$CCBPREV")"
+CHANGED_KEY="${CHANGED_BV##*$'\t'}"
+chk "只改共享源码使 ccbDistKey 变化" "[ '$CHANGED_KEY' != '$BV_KEY' ]"
+chk "共享源码新字节进入重建 dist" "grep -q SHARED-LOCK-V2 '$CCBCHANGED/claude-code-best/dist/cli.js' && ! grep -q SHARED-LOCK-V2 '$CCBPREV/claude-code-best/dist/cli.js'"
 # Part B:finalize_release cache 命中 → 只硬链 root node_modules;旧 release ccb 内容/inode 不变
 IMGID="sha256:relimg"
 PREVREL="$OC_HOTCFG_RELEASES_ROOT/rel-prevccb0000"

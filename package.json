@@ -67,7 +67,7 @@
     "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run lint:migration-order && npm run lint:integ-tiers && npm run typecheck && npm run test",
     "check:test-retries": "tsx scripts/check-v5-test-retries.ts",
-    "test:ccb:box-context": "bun --cwd claude-code-best test src/utils/model/boxContextTransport.test.ts src/utils/__tests__/messages.test.ts"
+    "test:ccb:box-context": "bun --cwd claude-code-best test src/utils/model/boxContextTransport.test.ts src/utils/__tests__/messages.test.ts src/utils/__tests__/sessionFileIo.test.ts src/utils/__tests__/nativeTranscriptRecovery.test.ts src/utils/__tests__/sessionTranscriptReader.test.ts src/utils/__tests__/sessionTranscriptQueue.test.ts src/services/compact/idleNativeFit.test.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
