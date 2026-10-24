@@ -1,3 +1,4 @@
+import { readDockerRuntimeInspection, readWireRuntimeInspection } from './dockerInspection.js';
 /**
  * ContainerService — 多机容器编排门面。
  *
@@ -341,7 +342,9 @@ export class LocalDockerBackend {
     const labels = (rawLabels && typeof rawLabels === "object")
       ? (rawLabels as Record<string, string>)
       : undefined;
+    const runtimeInspection = readDockerRuntimeInspection(info, cid);
     return {
+      ...(runtimeInspection ? { runtimeInspection } : {}),
       id: info.Id ?? cid,
       state: normalized,
       startedAt: state.StartedAt ?? null,
@@ -503,7 +506,14 @@ export class RemoteNodeAgentBackend {
   }
 
   async inspect(hostId: string, cid: string): Promise<ContainerInspect> {
-    return this.withTarget(hostId, (t) => agentInspectContainer(t, cid));
+    return this.withTarget(hostId, async (t) => {
+      const info = await agentInspectContainer(t, cid);
+      const result = { ...info };
+      delete result.runtimeInspection;
+      const actual = readWireRuntimeInspection(info.runtimeInspection, info.id, cid);
+      if (actual) result.runtimeInspection = actual;
+      return result;
+    });
   }
 
   /**
