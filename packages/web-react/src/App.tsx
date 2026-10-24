@@ -546,7 +546,7 @@ export function App() {
     authError,
     authRecoveryAvailable,
     retryBoot,
-    clearAuth,
+    dismissAuthRecovery,
     booting,
     laneReady,
     login,
@@ -1814,7 +1814,7 @@ export function App() {
               window.location.assign("/");
               return;
             }
-            if (authRecoveryAvailable) clearAuth();
+            if (authRecoveryAvailable) dismissAuthRecovery();
             setAuthMode("login");
             setView("home");
           }}

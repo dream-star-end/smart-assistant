@@ -81,6 +81,7 @@ export type UseAuth = {
   authError: string | null;
   authRecoveryAvailable: boolean;
   retryBoot: () => void;
+  dismissAuthRecovery: () => void;
   /** 启动静默续期进行中（App 渲染极简 splash）。 */
   booting: boolean;
   /**
@@ -392,6 +393,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setAuthRecoveryAvailable(false);
     setBooting(true);
   }, []);
+  const dismissAuthRecovery = useCallback(() => {
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+  }, []);
   const accountSwitchReady = !!pendingAccount && pendingAccount.auth === authRef.current && identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id);
   const acceptAccountSwitch = useCallback(() => {
     if (!pendingAccount || pendingAccountRef.current !== pendingAccount || pendingAccount.auth !== authRef.current ||
@@ -554,6 +559,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     authError,
     authRecoveryAvailable,
     retryBoot,
+    dismissAuthRecovery,
     booting,
     laneReady,
     lane,
