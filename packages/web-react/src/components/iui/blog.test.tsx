@@ -313,7 +313,8 @@ describe("状态卡 / 链接卡只认服务端数据", () => {
 });
 
 test('a signed-in navigation-only blog capability opens a text editor without any upload or submission', () => {
-  const openEditor = vi.fn(), openMine = vi.fn()
+  const openEditor = vi.fn()
+  const openMine = vi.fn()
   const navigation: CommunityBlogActions = { postUrl: id => `https://example.test/${id}`, openPost: vi.fn(), openMine, openEditor }
   render(wrap(<IuiBlock code={block({ ...DRAFT, body: '只有文字的草稿。' })} />, navigation))
   fireEvent.click(screen.getByRole('button', { name: '在编辑器里改' }))

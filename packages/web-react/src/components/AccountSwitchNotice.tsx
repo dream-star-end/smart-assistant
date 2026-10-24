@@ -13,8 +13,8 @@ export function AccountSwitchNotice({ name, ready, onAccept, onRetry }: {
 }
 
 export function IdentityRecoveryNotice({ onRetry }: { onRetry: () => void }) {
-  return <div role="status" className="flex items-center justify-between gap-3 border-b border-border bg-surface px-4 py-2 text-body text-muted">
+  return <output className="flex items-center justify-between gap-3 border-b border-border bg-surface px-4 py-2 text-body text-muted">
     <span>登录状态暂未核验完成，核验后恢复操作权限。</span>
     <Button variant="secondary" size="sm" onClick={onRetry}>重新核验登录状态</Button>
-  </div>;
+  </output>;
 }
