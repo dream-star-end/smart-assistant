@@ -83,6 +83,21 @@ export async function readSwitchContext(
       [sessionId, owner],
     )
   ).rows
+  // Late delegate/continuation tapes may add model-visible history after the
+  // last parent call. Read only one small header, never child payloads.
+  const latest = (
+    await pool.query<{
+      tape_id: string
+      tape_sha256: string
+      parent_turn_key: string | null
+      continuation_of_turn_key: string | null
+    }>(
+      `SELECT tape_id,tape_sha256,parent_turn_key,continuation_of_turn_key
+     FROM client_session_turn_tapes /* model-switch-latest-tape */
+     WHERE session_id=$1 AND user_id=$2 ORDER BY created_at DESC,tape_id DESC LIMIT 1`,
+      [sessionId, owner],
+    )
+  ).rows[0]
   // Image-edit is a fixed-price external feature, not the ordinary chat model.
   const ordinary = tapes.filter((t) => t.usage?.model !== 'gpt-image-2')
   const executed = (t: (typeof tapes)[number]) =>
@@ -105,13 +120,23 @@ export async function readSwitchContext(
             [uid, sessionId],
           )
         ).rows[0]
-  const sourceModel =
+  let sourceModel =
     typeof sourceTape?.usage?.model === 'string'
       ? sourceTape.usage.model
       : (accepted?.model ?? null)
   const sourceAgent = sourceTape?.agent_id ?? accepted?.agent_id ?? 'main'
+  // A newer primary root racing the roots query invalidates even a same-model
+  // assertion; child/continuation models never replace the parent's model.
+  if (
+    !latest ||
+    (latest.tape_id !== tapes[0]?.tape_id &&
+      !latest.parent_turn_key &&
+      !latest.continuation_of_turn_key)
+  )
+    sourceModel = null
+
   if (!root && !sourceModel) {
-    if (!row.has_content && !row.archived) return { ...empty, revision }
+    if (!latest && !row.has_content && !row.archived) return { ...empty, revision }
     // A queue may already have admitted the first user row. Exclude exactly
     // this request; do not hydrate old tapes or unbounded legacy hot rows.
     const hot = (
@@ -121,7 +146,7 @@ export async function readSwitchContext(
         [sessionId, owner],
       )
     ).rows[0]
-    if (hot?.messages && !row.archived) {
+    if (!latest && hot?.messages && !row.archived) {
       try {
         const messages: unknown = JSON.parse(hot.messages)
         if (
@@ -154,6 +179,10 @@ export async function readSwitchContext(
       root?.tape_sha256,
       tapes[0]?.tape_id,
       tapes[0]?.tape_sha256,
+      latest?.tape_id,
+      latest?.tape_sha256,
+      latest?.parent_turn_key,
+      latest?.continuation_of_turn_key,
       accepted?.dispatch_id,
       sourceModel,
     ]),
@@ -164,7 +193,13 @@ export async function readSwitchContext(
       .slice(0, 5),
   }
   if (sourceModel === options.targetModel) return { ...base, source: 'unchanged' }
-  if (!root || root.status !== 'completed' || root.finalized_at === null || !newestIsOrdinary)
+  if (
+    !root ||
+    latest?.tape_id !== root.tape_id ||
+    root.status !== 'completed' ||
+    root.finalized_at === null ||
+    !newestIsOrdinary
+  )
     return base
   const active = (
     await pool.query<{ client_message_id: string }>(

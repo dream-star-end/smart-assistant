@@ -133,3 +133,30 @@ test('missing latest call snapshot cannot borrow an earlier small call', async (
   assert.equal(context.source, 'unknown')
   assert.equal(context.tokens, null)
 })
+
+test('late child and delegate continuation invalidate old small parent counts without replacing its model', async () => {
+  for (const kind of ['child', 'continuation']) {
+    const old = db([tape('2', 'cheap')])
+    const pool = {
+      query: async (sql: string, params: unknown[]) =>
+        sql.includes('model-switch-latest-tape')
+          ? {
+              rows: [
+                {
+                  tape_id: `late-${kind}`,
+                  tape_sha256: 'late',
+                  parent_turn_key: kind === 'child' ? 'parent' : null,
+                  continuation_of_turn_key: kind === 'continuation' ? 'parent' : null,
+                },
+              ],
+            }
+          : old.query(sql, params),
+    } as unknown as Pool
+    const context = await readSwitchContext(pool, '765', 'own', 'm-late-tape', {
+      targetModel: 'gpt-6-astra',
+    })
+    assert.equal(context.sourceModel, 'cheap')
+    assert.equal(context.source, 'unknown')
+    assert.equal(context.tokens, null)
+  }
+})
