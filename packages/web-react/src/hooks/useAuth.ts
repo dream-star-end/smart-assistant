@@ -1,3 +1,5 @@
+import { attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
+import { useAuthAccessGeneration } from './useAuthAccessGeneration';
 import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
@@ -67,6 +69,7 @@ export type UseAuth = {
   authRef: React.MutableRefObject<AuthSession>;
   authed: boolean;
   user: User | null;
+  resolvedIdentity: ResolvedIdentity | null;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   authLoading: boolean;
   authError: string | null;
@@ -110,7 +113,16 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // commit 都必须带起始 epoch，旧账号的晚到响应因此无法污染新身份。
   const expiredUiRef = useRef<() => void>(() => {});
   const [authed, setAuthed] = useState(false);
-  const [user, setUser] = useState<User | null>(opts.initialUser);
+  const [account, setAccount] = useState<{ user: User | null; identity: ResolvedIdentity | null }>({ user: opts.initialUser, identity: null });
+  const user = account.user;
+  const identityRef = useRef<ResolvedIdentity | null>(null);
+  const lastVerifiedUid = useRef<string | null>(null);
+  // A display setter never grants an identity. Revoke synchronously before React commits.
+  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
+    revokeResolvedIdentity(identityRef.current);
+    identityRef.current = null;
+    setAccount(previous => ({ user: typeof update === 'function' ? update(previous.user) : update, identity: null }));
+  }, []);
   const userRef = useRef(user);
   userRef.current = user;
   const [authLoading, setAuthLoading] = useState(false);
@@ -130,10 +142,30 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // invalid 消费者只触发一次 UI teardown。
   const authRef = useRef<AuthSession>(createMemoryAuthSession(() => expiredUiRef.current()));
 
+  const generation = useAuthAccessGeneration(authRef.current);
+  const validation = useRef<{
+    auth: AuthSession; epoch: number; generation: number;
+    identity?: ResolvedIdentity | null;
+    promise: Promise<{ me: User; identity: ResolvedIdentity | null }>;
+  } | null>(null);
+  const commitVerifiedUser = useCallback((nextUser: User, nextIdentity: ResolvedIdentity | null) => {
+    const session = authRef.current;
+    if (nextIdentity && !identityIsCurrent(nextIdentity, session, nextUser.id)) return false;
+    const previous = identityRef.current;
+    const identity = nextIdentity && identityIsCurrent(previous, session, nextUser.id) ? previous : nextIdentity;
+    if (previous !== identity) revokeResolvedIdentity(previous);
+    identityRef.current = identity;
+    if (identity) lastVerifiedUid.current = nextUser.id;
+    setAccount({ user: nextUser, identity });
+    return true;
+  }, []);
+  const resolvedIdentity = authed && user && identityIsCurrent(account.identity, authRef.current, user.id) ? account.identity : null;
+
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
-    teardownComposerDrafts(userRef.current?.id);
+    teardownComposerDrafts(lastVerifiedUid.current ?? userRef.current?.id);
+    lastVerifiedUid.current = null;
     // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();
@@ -146,8 +178,20 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setBooting(false);
     setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
     cbRef.current.onClearAuth();
-  }, []);
+  }, [setUser]);
   expiredUiRef.current = clearAuthState;
+
+  const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
+    const session = authRef.current;
+    if (identity && !identityIsCurrent(identity, session, me.id)) return false;
+    // A changed account must end the old socket/workspace before normal login.
+    // Do not silently adopt another UID at the old identity epoch.
+    if (identity && lastVerifiedUid.current && lastVerifiedUid.current !== me.id) {
+      session.expire(identity.epoch);
+      return false;
+    }
+    return commitVerifiedUser(me, identity);
+  }, [commitVerifiedUser]);
 
   const clearAuth = useCallback(() => {
     authRef.current.beginIdentity();
@@ -180,10 +224,11 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
         // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
         const res = await api.login(email, password, turnstileToken);
-        if (!session.commitToken(loginEpoch, res.accessToken)) return;
+        if (session !== authRef.current || !session.commitToken(loginEpoch, res.accessToken)) return;
+        const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+        if (!commitVerifiedUser(res.user, identity)) return;
         setAuthHint();
         setAuthed(true);
-        setUser(res.user);
         // lane 决策达成（cookie 已随登录响应 Set-Cookie 下发）：解锁 WS 连接前置。
         setLaneSignal({ lane: res.lane ?? null });
         cbRef.current.onLoginSuccess?.();
@@ -195,7 +240,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         if (session.snapshot().epoch === loginEpoch) setAuthLoading(false);
       }
     },
-    [],
+    [commitVerifiedUser],
   );
 
   // 启动静默续期：只有明确 invalid 才落到未登录；race/网络/5xx 保持 splash 并恢复。
@@ -247,9 +292,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
 
         let meAttempt = 0;
         while (!controller.signal.aborted && session.snapshot().epoch === bootEpoch) {
+          let actualAttempt: ReturnType<typeof captureIdentityAttempt> | null = null;
           try {
-            const me = await api.getMe(session);
-            if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
+            let identity: ResolvedIdentity | null = null;
+            const me = await api.getMe(session, value => { identity = value; }, value => { actualAttempt = value; });
+            if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
+            if (identity && !identityIsCurrent(identity, session, me.id)) continue;
             const prior = bootstrapMeFriction.current;
             if (prior) {
               reportClientFriction({
@@ -263,7 +311,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
               bootstrapMeFriction.current = null;
             }
             setAuthRecoveryAvailable(false);
-            setUser(me);
+            if (!commitMeUser(me, identity)) return;
             setAuthed(true);
             setLaneSignal({ lane: me.lane ?? null });
             // 静默续期成功 = 本浏览器确实登录过（标记可能因旧版本/清理丢失，这里补写）。
@@ -272,7 +320,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
             setBooting(false);
             return;
           } catch (error) {
-            if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
+            if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
+            if (actualAttempt && !attemptCurrent(actualAttempt, session)) continue;
             if (!isAuthRecoveryTransient(error)) {
               session.beginIdentity();
               clearAuthState();
@@ -309,7 +358,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     return () => {
       controller.abort();
     };
-  }, [booting, clearAuthState]);
+  }, [booting, clearAuthState, commitMeUser]);
 
   const retryBoot = useCallback(() => {
     setAuthError(null);
@@ -354,12 +403,13 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     bootstrapMeFriction.current = null;
     void cancelAuthRefresh(session);
     const res = await api.verifyEmail(email, code);
-    if (!session.commitToken(epoch, res.accessToken)) return;
+    if (session !== authRef.current || !session.commitToken(epoch, res.accessToken)) return;
+    const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+    if (!commitVerifiedUser(res.user, identity)) return;
     setAuthed(true);
-    setUser(res.user);
     setLaneSignal({ lane: res.lane ?? null });
     cbRef.current.onLoginSuccess?.();
-  }, []);
+  }, [commitVerifiedUser]);
   const resendVerification = useCallback(
     (email: string) =>
       api.resendVerification(email).then((r) => ({ emailSent: r.emailSent })),
@@ -395,18 +445,46 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     const session = authRef.current;
     const expectedEpoch = session.snapshot().epoch;
     try {
-      const me = await api.getMe(session);
-      if (session.snapshot().epoch === expectedEpoch) setUser(me);
+      let identity: ResolvedIdentity | null = null;
+      const me = await api.getMe(session, value => { identity = value; });
+      if (session === authRef.current && session.snapshot().epoch === expectedEpoch) commitMeUser(me, identity);
     } catch {
       /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
     }
-  }, [demo, authed]);
+  }, [demo, authed, commitMeUser]);
+
+  // A same-epoch refresh has no userId. Business callbacks stay disabled until /me
+  // verifies the exact new token; cleanup cancels only this consumer's commit.
+  useEffect(() => {
+    const session = authRef.current;
+    if (demo || booting || !authed || !session.snapshot().token || identityIsCurrent(account.identity, session, user?.id)) return;
+    const epoch = session.snapshot().epoch;
+    let flight = validation.current;
+    if (!flight || flight.auth !== session || flight.epoch !== epoch || flight.generation !== generation ||
+        (flight.identity && !identityIsCurrent(flight.identity, session))) {
+      let identity: ResolvedIdentity | null = null;
+      const promise: Promise<{ me: User; identity: ResolvedIdentity | null }> = api.getMe(session, value => { identity = value; }).then(me => {
+        selected.identity = identity;
+        return { me, identity };
+      });
+      const selected = { auth: session, epoch, generation, promise, identity: undefined as ResolvedIdentity | null | undefined };
+      validation.current = flight = selected;
+    }
+    let cancelled = false;
+    // A new consumer subscribes to the same generation's pending read; cleanup must
+    // not strand the capability. Failed reads stay cached until an explicit retry.
+    void flight.promise.then(({ me, identity }) => {
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity) commitMeUser(me, identity);
+    }).catch(() => { /* A transient read failure leaves the business capability unresolved. */ });
+    return () => { cancelled = true; };
+  }, [demo, booting, authed, auth, generation, account.identity, user?.id, commitMeUser]);
 
   return {
     auth,
     authRef,
     authed,
     user,
+    resolvedIdentity,
     setUser,
     authLoading,
     authError,

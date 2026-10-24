@@ -461,3 +461,11 @@ export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T
   assertAuthResponseCurrent(res);
   return body;
 }
+
+/** Local execution capability; never accepted from model/card JSON. */
+export type RequestExecutionGuard = { signal?: AbortSignal; assertCurrent: () => void }
+export function fetchWithExecutionGuard(input: RequestInfo | URL, init: RequestInit, guard?: RequestExecutionGuard): Promise<Response> {
+  guard?.assertCurrent()
+  if (guard?.signal?.aborted) throw new DOMException('aborted', 'AbortError')
+  return fetch(input, { ...init, ...(guard ? { signal: guard.signal } : {}) })
+}

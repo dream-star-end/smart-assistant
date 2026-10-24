@@ -1,3 +1,4 @@
+import { fetchWithExecutionGuard, type RequestExecutionGuard } from './api/http'
 import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol/browser'
 /**
  * Taskboard 前端类型 + `/api/board` 客户端。
@@ -1222,9 +1223,9 @@ function qs(query?: object): string {
   return s ? `?${s}` : ''
 }
 
-export function boardGet<T>(a: AuthSession, path: string): Promise<T> {
+export function boardGet<T>(a: AuthSession, path: string, guard?: RequestExecutionGuard): Promise<T> {
   return jsonOrThrow<T>(
-    callWithRefresh(a, (t) => fetch(path, { credentials: 'include', headers: bearerHeaders(t) })),
+    callWithRefresh(a, (t) => fetchWithExecutionGuard(path, { credentials: 'include', headers: bearerHeaders(t) }, guard)),
   )
 }
 
@@ -1233,15 +1234,16 @@ function boardSend<T>(
   path: string,
   method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   body?: unknown,
+  guard?: RequestExecutionGuard,
 ): Promise<T> {
   return jsonOrThrow<T>(
     callWithRefresh(a, (t) =>
-      fetch(path, {
+      fetchWithExecutionGuard(path, {
         method,
         credentials: 'include',
         headers: body === undefined ? bearerHeaders(t) : bearerHeaders(t, true),
         body: body === undefined ? undefined : JSON.stringify(body),
-      }),
+      }, guard),
     ),
   )
 }
@@ -1375,8 +1377,8 @@ export const taskboardApi = {
   listTickets: (a: AuthSession, query?: TicketListQuery) =>
     boardGet<ListPage<Ticket>>(a, `/api/board/tickets${qs(query)}`),
 
-  getTicket: (a: AuthSession, idOrIdent: string) =>
-    boardGet<TicketDetail>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`).then(
+  getTicket: (a: AuthSession, idOrIdent: string, guard?: RequestExecutionGuard) =>
+    boardGet<TicketDetail>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}`, guard).then(
       (b) => b.ticket,
     ),
 
@@ -1438,11 +1440,11 @@ export const taskboardApi = {
       reason,
     }),
 
-  approve: (a: AuthSession, idOrIdent: string, expectedVersion: number, close = false) =>
+  approve: (a: AuthSession, idOrIdent: string, expectedVersion: number, close = false, guard?: RequestExecutionGuard) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'approve'), 'POST', {
       expectedVersion,
       close,
-    }),
+    }, guard),
 
   reject: (
     a: AuthSession,
@@ -1450,12 +1452,13 @@ export const taskboardApi = {
     expectedVersion: number,
     reason: string,
     targetStageId?: string | null,
+    guard?: RequestExecutionGuard,
   ) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'reject'), 'POST', {
       expectedVersion,
       reason,
       targetStageId: targetStageId ?? null,
-    }),
+    }, guard),
 
   done: (a: AuthSession, idOrIdent: string, expectedVersion: number) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, ticketActionPath(idOrIdent, 'done'), 'POST', {

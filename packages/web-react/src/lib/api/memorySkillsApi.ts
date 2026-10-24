@@ -1,3 +1,5 @@
+import { withCardBusinessApi } from './cardBusinessLoader';
+import type { RequestExecutionGuard } from './http';
 /**
  * api: memory files and index, auto-dream reports and optimizer, cron, research library, skills (files, history, evals, training, drafts), community tutorials.
  *
@@ -6,32 +8,17 @@
  */
 import type {
   AuthSession,
-  CommunityBlogPrecheck,
   CommunityTutorialCategory,
-  CommunityTutorialDetail,
   CommunityTutorialDraft,
-  CommunityTutorialMine,
-  CommunityTutorialPage,
-  CommunityTutorialReviseResult,
-  CommunityTutorialSummary,
-  TutorialImageUpload,
   TutorialKind,
   TutorialSnapshotDraft,
-  TutorialSnapshotSubmitResult,
   CronCreateInput,
   CronJob,
   SkillDetail,
   ResearchLibraryDoc,
   ResearchLibraryUploadResult,
   SkillSummary,
-  SkillDraftDetail,
-  SkillDraftSummary,
-  SkillEvalGenJob,
-  SkillEvalRun,
   SkillEvalsFile,
-  SkillRunUsage,
-  SkillTrainRun,
-  SkillTrainStartResult,
   MemoryDocResponse,
   MemoryConflict,
   PutMemoryResult,
@@ -492,37 +479,11 @@ export const memorySkillsApi = {
 
   /** 评测用例 + 上次结果（GET /api/skills/:name/evals）。 */
   getSkillEvals: (a: AuthSession, name: string) =>
-    jsonOrThrow<{
-      evals: SkillEvalsFile | null;
-      parseErrors?: string[];
-      lastRun: {
-        runId: string;
-        finishedAt: number;
-        benchmark: SkillEvalRun["benchmark"];
-        usage: SkillRunUsage;
-      } | null;
-      writable: boolean;
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvals(a, name)),
 
   /** 保存评测用例（PUT /api/skills/:name/evals）。 */
   putSkillEvals: (a: AuthSession, name: string, evals: SkillEvalsFile) =>
-    jsonOrThrow<{ ok: boolean; evals: SkillEvalsFile }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals`, {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ evals }),
-        }),
-      ),
-    ),
+    { const frozen = structuredClone(evals); return withCardBusinessApi(a, undefined, client => client.putSkillEvals(a, name, frozen)); },
 
   /** 启动评测 run（POST /api/skills/:name/eval-run;消耗积分,调用前必须已过成本确认）。 */
   startSkillEvalRun: (
@@ -530,164 +491,59 @@ export const memorySkillsApi = {
     name: string,
     body?: { mode?: "baseline" | "draft"; trainRunId?: string },
   ) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/eval-run`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body ?? {}),
-        }),
-      ),
-    ),
+    { const frozen = body ? { ...body } : undefined; return withCardBusinessApi(a, undefined, client => client.startSkillEvalRun(a, name, frozen)); },
 
   /** 评测 run 状态（GET /api/skill-eval/:runId）。 */
   getSkillEvalRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ run: SkillEvalRun }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-eval/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.run),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvalRun(a, runId)),
 
   /** 启动 AI 生成评测用例 job（POST /api/skills/:name/evals/generate;消耗积分,调用前必须
    *  已过成本确认）。生成绝不落库,只回草稿由前端灌进编辑器。经 ApiError 抛:409=同技能已有
    *  生成/评测在跑;403=非自建技能;404=技能不存在。 */
   generateSkillEvals: (a: AuthSession, name: string) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals/generate`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.generateSkillEvals(a, name)),
 
   /** AI 生成 job 状态（GET /api/skill-eval-gen/:runId;直接回 job,cases 仅 done）。 */
   getSkillEvalGen: (a: AuthSession, runId: string) =>
-    jsonOrThrow<SkillEvalGenJob>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-eval-gen/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvalGen(a, runId)),
 
   /** 后台发布任务状态（GET /api/v5/release-jobs/:id;刷新后进度卡回源）。 */
   getReleaseJob: (a: AuthSession, id: string) =>
-    jsonOrThrow<Record<string, unknown>>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/v5/release-jobs/${encodeURIComponent(id)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getReleaseJob(a, id)),
 
   /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。
    *  响应可带 feedbackRefs(命中的差评真实使用记录条数;旧后端缺省)。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
-    jsonOrThrow<SkillTrainStartResult>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/train`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body ?? {}),
-        }),
-      ),
-    ),
+    { const frozen = body ? { ...body } : undefined; return withCardBusinessApi(a, undefined, client => client.startSkillTrain(a, name, frozen)); },
 
   /** 训练 run 列表（GET /api/skill-training，按 startedAt 降序）。
    *  用于页面刷新/服务重启后找回未完成或有草稿(diff_ready)的训练 run。 */
   listSkillTrainRuns: (a: AuthSession) =>
-    jsonOrThrow<{ runs: SkillTrainRun[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/skill-training", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.runs || []),
+    withCardBusinessApi(a, undefined, client => client.listSkillTrainRuns(a)),
 
   /** 训练 run 状态（GET /api/skill-training/:runId）。 */
   getSkillTrainRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ run: SkillTrainRun }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.run),
+    withCardBusinessApi(a, undefined, client => client.getSkillTrainRun(a, runId)),
 
   /** 放弃训练 run(DELETE,连同草稿一起清)。 */
   discardSkillTrainRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.discardSkillTrainRun(a, runId)),
 
   /** 草稿列表。 */
   listSkillDrafts: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ drafts: SkillDraftSummary[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}/drafts`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.drafts || []),
+    withCardBusinessApi(a, undefined, client => client.listSkillDrafts(a, runId)),
 
   /** 草稿详情(草稿+现版两个 diff 侧)。 */
   getSkillDraft: (a: AuthSession, runId: string, name: string) =>
-    jsonOrThrow<SkillDraftDetail>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}`,
-          {
-            credentials: "include",
-            headers: bearerHeaders(t),
-          },
-        ),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillDraft(a, runId, name)),
 
   /** 对草稿留评论 → AI 修订(消耗积分,UI 层须再次确认)。 */
   commentSkillDraft: (a: AuthSession, runId: string, name: string, comment: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}/comment`,
-          {
-            method: "POST",
-            credentials: "include",
-            headers: bearerHeaders(t, true),
-            body: JSON.stringify({ comment }),
-          },
-        ),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.commentSkillDraft(a, runId, name, comment)),
 
   /** 合并草稿到权威技能库(唯一写入)。 */
   mergeSkillTrainRun: (a: AuthSession, runId: string, name?: string) =>
-    jsonOrThrow<{ ok: boolean; results: Array<{ name: string; ok: boolean; error?: string }> }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}/merge`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(name ? { name } : {}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.mergeSkillTrainRun(a, runId, name)),
 
   // ── 教程工作室（公开目录 / 快照 / 管理评测） ────────────────────────────
 
@@ -698,132 +554,51 @@ export const memorySkillsApi = {
     limit?: number;
     /** 经验分享只列 markdown 投稿。 */
     kind?: TutorialKind | null;
-  }) => {
-    const qs = new URLSearchParams();
-    if (opts?.cursor) qs.set("cursor", opts.cursor);
-    if (opts?.query) qs.set("q", opts.query);
-    if (opts?.category) qs.set("category", opts.category);
-    if (opts?.kind) qs.set("kind", opts.kind);
-    if (opts?.limit) qs.set("limit", String(opts.limit));
-    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
-    return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
-      fetch(`/api/tutorials${suffix}`),
-    );
+  }) =>
+    { const frozen = opts ? { ...opts } : undefined;
+    return import('./cardBusinessApi').then(module => module.cardBusinessApi.listCommunityTutorials(frozen));
   },
 
   getCommunityTutorial: (id: string) =>
-    jsonOrThrow<{ tutorial: CommunityTutorialDetail }>(
-      fetch(`/api/tutorials/${encodeURIComponent(id)}`),
-    ).then((result) => result.tutorial),
+    import('./cardBusinessApi').then(module => module.cardBusinessApi.getCommunityTutorial(id)),
 
-  submitCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft) =>
-    jsonOrThrow<{ tutorial: { id: string; status: "pending"; createdAt: string } }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/tutorials", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => result.tutorial),
+  submitCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft, guard?: RequestExecutionGuard) => {
+    const frozen = { ...draft };
+    return withCardBusinessApi(a, guard, client => client.submitCommunityTutorial(a, frozen, guard));
+  },
 
   submitTutorialSnapshot: (a: AuthSession, draft: TutorialSnapshotDraft) =>
-    jsonOrThrow<TutorialSnapshotSubmitResult>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/tutorials/snapshots", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => ({
-      tutorial: { ...result.tutorial, kind: result.tutorial.kind ?? "snapshot" },
-      leakReport: result.leakReport ?? null,
-    })),
+    { const frozen = { ...draft, selectedArtifacts: draft.selectedArtifacts.map(item => ({ ...item })) };
+    return withCardBusinessApi(a, undefined, client => client.submitTutorialSnapshot(a, frozen));
+  },
 
   listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/mine${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.listMyCommunityTutorials(a, cursor)),
 
   /** 对话写博客的草稿卡预检：只读，和投稿同一套确定性检查（不含 AI 审核）。 */
-  precheckCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft) =>
-    jsonOrThrow<CommunityBlogPrecheck>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/tutorials/precheck", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ),
+  precheckCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft, guard?: RequestExecutionGuard) => {
+    const frozen = { ...draft };
+    return withCardBusinessApi(a, guard, client => client.precheckCommunityTutorial(a, frozen, guard));
+  },
 
   /** 我的某一篇投稿（作者本人）：状态、审核理由、正文。 */
-  getMyCommunityTutorial: (a: AuthSession, id: string) =>
-    jsonOrThrow<{ tutorial: CommunityTutorialMine }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/mine/${encodeURIComponent(id)}`, {
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ).then((result) => result.tutorial),
+  getMyCommunityTutorial: (a: AuthSession, id: string, guard?: RequestExecutionGuard) =>
+    withCardBusinessApi(a, guard, client => client.getMyCommunityTutorial(a, id, guard)),
 
   /** 经验分享图片上传：原始字节（前端已压成 webp），服务端按魔数复核并去元数据。 */
-  uploadTutorialImage: (a: AuthSession, file: Blob) =>
-    jsonOrThrow<{ image: TutorialImageUpload }>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/tutorials/images", {
-          method: "POST",
-          credentials: "include",
-          headers: { ...bearerHeaders(token), "Content-Type": file.type || "image/webp" },
-          body: file,
-        }),
-      ),
-    ).then((result) => result.image),
+  uploadTutorialImage: (a: AuthSession, file: Blob, guard?: RequestExecutionGuard) =>
+    withCardBusinessApi(a, guard, client => client.uploadTutorialImage(a, file, guard)),
 
   /** 作者/管理员读取未公开稿件里的图（编辑器预览、审核预览）；返回 Blob，调用方转 object URL。 */
-  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> => {
-    const res = await callWithRefresh(a, (token) =>
-      fetch(`/api/tutorials/images/${encodeURIComponent(sha256)}`, {
-        credentials: "include",
-        headers: bearerHeaders(token),
-      }),
-    );
-    if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
-    return res.blob();
-  },
+  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> =>
+    withCardBusinessApi(a, undefined, client => client.fetchTutorialImage(a, sha256)),
 
   /** 修改已投稿的经验分享：待审 / 未通过的改后重审；已发布的审核通过前线上仍是旧版。 */
   reviseCommunityTutorial: (a: AuthSession, id: string, draft: CommunityTutorialDraft) =>
-    jsonOrThrow<{ tutorial: CommunityTutorialReviseResult }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/${encodeURIComponent(id)}/revise`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => result.tutorial),
+    { const frozen = { ...draft };
+    return withCardBusinessApi(a, undefined, client => client.reviseCommunityTutorial(a, id, frozen));
+  },
 
   withdrawCommunityTutorial: (a: AuthSession, id: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/${encodeURIComponent(id)}/withdraw`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.withdrawCommunityTutorial(a, id)),
 }

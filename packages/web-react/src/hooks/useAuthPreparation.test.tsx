@@ -23,6 +23,8 @@ test('login starts preparation after lane decision before any chat hydration; ba
   expect(vi.mocked(api.prepareWorkspace).mock.calls[0][1]?.aborted).toBe(false)
   await act(async () => { await result.current.refreshMe() })
   expect(api.prepareWorkspace).toHaveBeenCalledTimes(1)
+  // A display-only legacy mock supplies no authenticated evidence.
+  expect(result.current.resolvedIdentity).toBeNull()
   act(() => result.current.clearAuth())
   expect(vi.mocked(api.prepareWorkspace).mock.calls[0][1]?.aborted).toBe(true)
 })
