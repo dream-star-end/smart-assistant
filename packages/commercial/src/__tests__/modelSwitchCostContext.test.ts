@@ -97,3 +97,39 @@ test('image feature does not become the chat source or an output prediction samp
   assert.deepEqual(ctx.outputs, [7])
   assert.equal(ctx.source, 'unknown')
 })
+
+test('missing latest call snapshot cannot borrow an earlier small call', async () => {
+  const old = db([tape('2', 'cheap')])
+  const pool = {
+    query: async (sql: string, params: unknown[]) =>
+      sql.includes('WITH tail')
+        ? {
+            rows: [
+              {
+                ordinal: 3,
+                payload: Buffer.from(
+                  JSON.stringify({ role: 'assistant', text: 'latest response with no counters' }),
+                ),
+              },
+              {
+                ordinal: 2,
+                payload: Buffer.from(
+                  JSON.stringify({
+                    role: 'assistant',
+                    _callUsage: {
+                      callId: 'old-call',
+                      usage: { inputTokens: 1000, outputTokens: 7 },
+                    },
+                  }),
+                ),
+              },
+            ],
+          }
+        : old.query(sql, params),
+  } as unknown as Pool
+  const context = await readSwitchContext(pool, '765', 'own', 'm-cost-test', {
+    targetModel: 'gpt-6-astra',
+  })
+  assert.equal(context.source, 'unknown')
+  assert.equal(context.tokens, null)
+})

@@ -1,3 +1,4 @@
+const balance = '10000'
 import { useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Composer } from '../src/components/Composer'
@@ -32,7 +33,7 @@ api.modelSwitchCost = async (_auth, input, proof) => {
     targetUnitPrice: { input: '598', output: '3598', cacheRead: '60', cacheWrite: '0' },
     balanceCredits: '10000',
     requiresConfirmation: confirmedId !== input.requestId,
-    canConfirm: balance!=="1",
+    canConfirm: balance !== '1',
     expiresAt: Date.now() + 300000,
     quoteToken: 'fixture-quote',
     ...(confirmedId === input.requestId ? { consent: 'fixture-consent' } : {}),
@@ -64,7 +65,8 @@ function Harness() {
   return (
     <TooltipProvider>
       <ToastProvider>
-        <button type="button"
+        <button
+          type="button"
           onClick={() => {
             mode = 'risk'
             confirmedId = ''
@@ -72,7 +74,8 @@ function Harness() {
         >
           risk fixture
         </button>
-        <button type="button"
+        <button
+          type="button"
           onClick={() => {
             mode = 'estimate'
             confirmedId = ''
@@ -80,9 +83,15 @@ function Harness() {
         >
           estimate fixture
         </button>
-        <button type="button" onClick={() => void select()}>select expensive</button>
-        <button type="button" onClick={() => setSession(session === 'A' ? 'B' : 'A')}>navigate</button>
-        <button type="button" onClick={() => setReply(true)}>quote message</button>
+        <button type="button" onClick={() => void select()}>
+          select expensive
+        </button>
+        <button type="button" onClick={() => setSession(session === 'A' ? 'B' : 'A')}>
+          navigate
+        </button>
+        <button type="button" onClick={() => setReply(true)}>
+          quote message
+        </button>
         <output data-testid="model">{model}</output>
         <output data-testid="sent">{sent}</output>
         <Composer
