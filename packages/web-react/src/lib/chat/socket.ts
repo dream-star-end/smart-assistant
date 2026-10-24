@@ -5540,6 +5540,7 @@ export class ChatSocket {
     contextTier?: InboundMessage["contextTier"];
     serviceTier?: InboundMessage["serviceTier"];
   }): Promise<boolean> {
+    const authorizationEpoch=this.deps.getAuthEpoch();
     let authorization=p.switchAuthorization;
     if(!authorization&&this.deps.authorizeSwitch&&p.model&&!p.imageEdit){
       authorization=await this.deps.authorizeSwitch({sessionId:p.sessId,requestId:mintMsgId(),targetModel:p.model,agentId:p.agentId,
@@ -5548,6 +5549,7 @@ export class ChatSocket {
       },{useCachedRequestId:true,allowOfflineQueue:true})??undefined;
       if(!authorization)return false;
     }
+    if(this.deps.getAuthEpoch()!==authorizationEpoch)return false;
     const sess = this.ensureSession(p.sessId, p.agentId);
     if (sess._recoveryStatus?.kind === "completed" || sess._recoveryStatus?.kind === "resumed") {
       sess._recoveryStatus = undefined;
