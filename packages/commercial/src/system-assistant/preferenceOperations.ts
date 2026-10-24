@@ -33,7 +33,7 @@ export interface PreferenceOperationDeps {
 function readablePreference(actor: SystemActor, key: string, value: unknown): unknown {
   if (key === 'system_assistant_profile' && value && typeof value === 'object') {
     const profile = value as { enabled?: unknown; sessionId?: unknown }
-    if (profile.enabled === true && profile.sessionId !== actor.sessionId) return { enabled: true, authorizedForCurrentSession: false }
+    if (profile.enabled !== true || profile.sessionId !== actor.sessionId) return { enabled: profile.enabled === true, authorizedForCurrentSession: false }
   }
   return value
 }

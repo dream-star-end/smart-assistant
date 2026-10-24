@@ -60,6 +60,16 @@ export const INTELLIGENT_UI_PROMPT =
 export const INPUT_PREDICTION_PROMPT =
   "输入预测已开启；首次生成预测前用 Bash 加载 `/run/oc/platform/current/bin/oc-system skill input-prediction`。";
 
+export type IntelligentUiSurface = "webchat" | "taskboard";
+
+export function buildIntelligentUiPrompt(options: { componentsEnabled: boolean; predictionEnabled: boolean; surface?: IntelligentUiSurface }): string | null {
+  const parts = [
+    ...(options.componentsEnabled ? [INTELLIGENT_UI_PROMPT] : []),
+    ...(options.surface !== "taskboard" && options.predictionEnabled ? [INPUT_PREDICTION_PROMPT] : []),
+  ];
+  return parts.length ? parts.join("\n\n") : null;
+}
+
 /**
  * platform-prompt-slots 用:给定 uid 算出该用户是否该拿到 INTELLIGENT_UI slot。
  * 读偏好失败 → 不下发(fail-soft:组件协议是增强,不是安全控制)。
@@ -68,11 +78,12 @@ export async function resolveIntelligentUiSlot(
   userId: number | bigint | string,
   deps: {
     env?: NodeJS.ProcessEnv;
+    surface?: IntelligentUiSurface;
     readPrefs?: (uid: string) => Promise<{ prefs: { intelligent_ui?: boolean; input_prediction?: boolean } }>;
   } = {},
 ): Promise<{ name: string; content: string } | null> {
   const iuiOn = isIntelligentUiServerEnabled(deps.env);
-  const predictOn = isInputPredictionServerEnabled(deps.env);
+  const predictOn = deps.surface !== "taskboard" && isInputPredictionServerEnabled(deps.env);
   if (!iuiOn && !predictOn) return null;
   const readPrefs =
     deps.readPrefs ??
@@ -81,10 +92,10 @@ export async function resolveIntelligentUiSlot(
       return getPreferences(uid);
     });
   const snap = await readPrefs(String(userId));
-  const parts = [
-    ...(iuiOn && intelligentUiPrefEnabled(snap.prefs) ? [INTELLIGENT_UI_PROMPT] : []),
-    ...(predictOn && inputPredictionPrefEnabled(snap.prefs) ? [INPUT_PREDICTION_PROMPT] : []),
-  ];
-  if (parts.length === 0) return null;
-  return { name: INTELLIGENT_UI_SLOT_NAME, content: parts.join("\n\n") };
+  const content = buildIntelligentUiPrompt({
+    componentsEnabled: iuiOn && intelligentUiPrefEnabled(snap.prefs),
+    predictionEnabled: predictOn && inputPredictionPrefEnabled(snap.prefs),
+    surface: deps.surface,
+  });
+  return content === null ? null : { name: INTELLIGENT_UI_SLOT_NAME, content };
 }

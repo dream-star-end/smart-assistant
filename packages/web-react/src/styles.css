@@ -2422,3 +2422,9 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .blog-figure-ph { display: grid; aspect-ratio: 16 / 9; border-radius: 14px; background: var(--skeleton); place-items: center; color: var(--faint); font-size: 13px; }
 .blog-meter { height: 6px; border-radius: 9px; background: var(--hover); overflow: hidden; }
 .blog-meter > i { display: block; height: 100%; border-radius: 9px; }
+
+
+/* Task results share the existing read-only IUI renderer; keep phone controls tappable. */
+@media (max-width: 767px) {
+  .oc-iui button { min-height: 44px; min-width: 44px; }
+}

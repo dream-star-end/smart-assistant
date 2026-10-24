@@ -37,7 +37,7 @@ process.env.OPENCLAUDE_HOME = testHome
   legacy.close()
 }
 
-const { getSessionsDb, insertUsageLog, loadSessionUsage } = await import('../sessionsDb.js')
+const { getSessionsDb, insertUsageLog, loadSessionUsage, loadSessionUsageModels } = await import('../sessionsDb.js')
 
 function entry(over: Partial<{
   id: string
@@ -114,5 +114,28 @@ describe('insertUsageLog', () => {
     assert.deepEqual(result, { status: 'inserted' })
     const rows = await loadSessionUsage('sess-b')
     assert.equal(rows[0]!.terminalStatus, 'reconciled')
+  })
+})
+
+describe('bounded actual session models', () => {
+  it('returns all recorded models in one indexed batch, with no defaults or unrelated sessions', async () => {
+    const db = await getSessionsDb()
+    const add = db.prepare(`INSERT INTO usage_log (id,session_id,agent_id,turn_index,model,timestamp) VALUES (?,?, 'main',?,?,?)`)
+    add.run('models-a1', 'models-a', 1, 'actual-a', 10)
+    add.run('models-a2', 'models-a', 2, 'actual-b', 20)
+    add.run('models-a3', 'models-a', 3, 'actual-a', 30)
+    add.run('models-b1', 'models-b', 1, 'actual-c', 5)
+    add.run('models-b2', 'models-b', 2, null, 6)
+    add.run('models-b3', 'models-b', 3, 'auto', 7)
+    add.run('models-b4', 'models-b', 4, '', 8)
+    add.run('models-other', 'models-unrelated', 1, 'must-not-return', 1)
+    const models = await loadSessionUsageModels(['models-b', 'models-a', 'models-a', 'models-empty'])
+    assert.deepEqual({ ...models }, { 'models-a': ['actual-a', 'actual-b'], 'models-b': ['actual-c'] })
+    assert.equal(models['models-unrelated'], undefined)
+    assert.deepEqual({ ...await loadSessionUsageModels([]) }, {})
+    assert.deepEqual({ ...await loadSessionUsageModels(Array.from({ length: 200 }, (_, i) => `absent-${i}`)) }, {})
+    await assert.rejects(loadSessionUsageModels(Array.from({ length: 201 }, (_, i) => `absent-${i}`)), RangeError)
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT session_id,model,MIN(timestamp) FROM usage_log WHERE session_id IN (?,?) AND model IS NOT NULL AND model<>'' AND model<>'auto' GROUP BY session_id,model ORDER BY session_id,MIN(timestamp),model`).all('models-a','models-b') as Array<{ detail: string }>
+    assert.ok(plan.some((row) => /SEARCH usage_log USING INDEX/.test(row.detail)), JSON.stringify(plan))
   })
 })

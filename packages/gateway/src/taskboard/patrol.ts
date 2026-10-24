@@ -1,3 +1,5 @@
+import { checkTaskboardStages, type TaskboardPreflight } from './stagePreflight.js'
+import { hasPendingTaskboardExecution } from './executionState.js'
 // Taskboard 统一 60s tick 引擎 + run 执行 + 状态推进。
 //
 // 设计意图:
@@ -50,7 +52,7 @@ import { getStage, listStages } from './db/pipelines.js'
 import { listRelations } from './db/relations.js'
 import {
   acquireLease,
-  getActiveLease,
+  archiveExpiredRunOutput,
   getRun,
   insertRun,
   listRuns,
@@ -69,7 +71,7 @@ import {
   hasSkippedRunToday,
   updateSettings,
 } from './db/settings.js'
-import { getTicket, listTickets, updateTicket } from './db/tickets.js'
+import { getTicket, listReadyStageIds, listTickets, updateTicket } from './db/tickets.js'
 import {
   type Actor,
   GUARDRAIL_DEFAULTS,
@@ -106,6 +108,7 @@ import { shouldPatrol } from './patrolWindow.js'
 import { renderPrompt } from './promptRender.js'
 import { summarizeRunOutput } from './runOutput.js'
 import { assertTransition } from './stateMachine.js'
+import { taskboardRunControls } from './runControl.js'
 
 const PRIORITY_RANK: Record<TicketPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 const TERMINAL = new Set(['done', 'canceled'])
@@ -196,6 +199,8 @@ export async function freezeStageProjectContext(opts: {
 }
 
 export interface PatrolDelegateInput {
+  /** Internal lifecycle owner; never read from HTTP request bodies. */
+  control?: import('./runControl.js').TaskboardRunControl
   agentId: string
   goal: string
   context?: string
@@ -212,6 +217,10 @@ export interface PatrolDelegateInput {
 }
 
 export interface PatrolDelegateResult {
+  /** Root-only text for summary extraction; output keeps every child result. */
+  summaryOutput?: string
+  usageIncludesDescendants?: boolean
+  cancelled?: boolean
   ok: boolean
   output: string
   error?: string
@@ -286,6 +295,7 @@ export function isRunUsageComplete(usage: RunUsageSnapshot): boolean {
 export const DEFAULT_USAGE_BACKFILL_DELAY_MS = 500
 
 export interface PatrolEngineOptions {
+  preflightStages?: TaskboardPreflight
   getDb: () => TaskboardDb
   delegate: PatrolDelegateFn
   now?: () => number
@@ -331,6 +341,7 @@ export function resetSharedPatrolState(): void {
 export class PatrolEngine {
   readonly slots: PatrolSlotCounter
   readonly idle: IdleBackoffState
+  private readonly preflightStages?: TaskboardPreflight
   private readonly getDb: () => TaskboardDb
   private readonly delegate: PatrolDelegateFn
   private readonly nowFn: () => number
@@ -345,6 +356,7 @@ export class PatrolEngine {
   private ticking = false
 
   constructor(opts: PatrolEngineOptions) {
+    this.preflightStages = opts.preflightStages
     this.getDb = opts.getDb
     this.delegate = opts.delegate
     this.nowFn = opts.now ?? Date.now
@@ -427,10 +439,13 @@ export class PatrolEngine {
 
   private async tickOnceInner(
     db: TaskboardDb,
-    at: Date,
-    now: number,
-    settings: TaskboardSettings,
+    initialAt: Date,
+    initialNow: number,
+    initialSettings: TaskboardSettings,
   ): Promise<TickReport> {
+    let at = initialAt
+    let now = initialNow
+    let settings = initialSettings
     const reaped = this.recoverExpired(db, now)
 
     const paused = checkPatrolPaused(settings)
@@ -447,6 +462,22 @@ export class PatrolEngine {
     }
 
     const stages = listPatrolEnabledStages(db)
+    const readyStages = new Set(listReadyStageIds(db))
+    const pendingStages = stages.filter((stage) => readyStages.has(stage.id))
+    const beforePreflight = this.nowFn()
+    const checks = await checkTaskboardStages(this.preflightStages, pendingStages)
+    const issuesByStage = new Map(pendingStages.map((stage, index) => [stage.id, checks[index]]))
+    now += Math.max(0, this.nowFn() - beforePreflight)
+    at = new Date(now)
+    settings = getSettings(db)
+    this.slots.setLimit(settings.maxConcurrentRuns)
+    if (settings.patrolPaused) return { reaped, paused: true, started: 0, skipped: 0, settled: 0 }
+    const freshBudget = checkDailyBudget(getUsage(db, now), settings, now)
+    if (!freshBudget.ok) {
+      emitGuardrailAlert(this.onAlert, freshBudget.alert)
+      updateSettings(db, { patrolPaused: true })
+      return { reaped, paused: true, started: 0, skipped: 0, settled: 0 }
+    }
     let started = 0
     let skipped = 0
     let settled = 0
@@ -499,6 +530,12 @@ export class PatrolEngine {
         continue
       }
       this.idle.recordBusy(stage.id, at)
+      const issue = issuesByStage.get(stage.id)
+      if (!issuesByStage.has(stage.id) || issue !== null) {
+        skipped += picked.runnable.length
+        this.log('taskboard stage is not executable', { stageId: stage.id, code: issue?.code ?? 'preflight_pending', message: issue?.message })
+        continue
+      }
 
       for (const ticket of picked.runnable) {
         if (started >= settings.maxRunsPerTick) break
@@ -612,7 +649,7 @@ export class PatrolEngine {
     if (countTicketStageRunsToday(db, ticket.id, stage.id, now) >= stage.maxRunsPerDay) {
       return 'daily_quota'
     }
-    if (getActiveLease(db, ticket.id, now)) return 'lease_held'
+    if (hasPendingTaskboardExecution(db, ticket.id)) return 'lease_held'
     const loop = checkStageLoop(ticket.stageLoopCount, settings.maxStageLoops, ticket.id, stage.id)
     if (!loop.ok) {
       emitGuardrailAlert(this.onAlert, loop.alert)
@@ -637,12 +674,15 @@ export class PatrolEngine {
         const current = getTicket(db, ticket.id)
         if (
           !current ||
+          hasPendingTaskboardExecution(db, ticket.id) ||
           current.status !== 'ready' ||
           current.version !== ticket.version ||
           current.stageId !== stage.id
         ) {
           return null
         }
+        const freshStage = getStage(db, stage.id)
+        if (!freshStage || JSON.stringify(freshStage) !== JSON.stringify(stage)) return null
         assertTransition({
           from: current.status,
           to: 'running',
@@ -685,7 +725,25 @@ export class PatrolEngine {
     const sessionKey = run.sessionKey ?? buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
     if (!run.sessionKey) updateRun(db, run.id, { sessionKey })
     const owner = run.leaseOwner
-
+    if (!owner || run.status !== 'running' || (run.leaseExpiresAt ?? 0) <= this.nowFn()) return
+    const control = taskboardRunControls.begin(run.id, ticket.id, owner, sessionKey)
+    let leaseLost = false
+    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
+    const renewTimer = setInterval(() => {
+      try {
+        if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
+          leaseLost = true
+          control.requestStop()
+          this.log('taskboard lease renewal lost', { runId: run.id, owner })
+        }
+      } catch (err) {
+        leaseLost = true
+        control.requestStop()
+        this.log('taskboard lease renewal failed', { runId: run.id, owner, err: String(err) })
+      }
+    }, this.leaseRenewIntervalMs)
+    renewTimer.unref?.()
+    try {
     const comments = listComments(db, ticket.id, { limit: 200, offset: 0 })
     const lastRun = latestSettledRun(db, ticket.id, run.id)
     const boardProject = getProject(db, ticket.projectId)
@@ -742,6 +800,10 @@ export class PatrolEngine {
     // 准备上下文是异步的:这段时间里单据可能被人或 agent 关单 / 受阻。不再是 running 就
     // 以 skipped(ticket_closed)结算本 run,不启动 agent(OCV5-414)。
     const live = getTicket(db, ticket.id)
+    if (control.signal.aborted) {
+      if (!leaseLost) await this.finishRun(db, ticket, stage, run, settings, { ok: false, output: '', error: 'USER_CANCELLED: stopped before execution', cancelled: true })
+      return
+    }
     if (!live || live.status !== 'running') {
       const at = this.nowFn()
       if (owner) {
@@ -772,27 +834,10 @@ export class PatrolEngine {
       return
     }
 
-    let leaseLost = !owner
-    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
-    const renewTimer = owner
-      ? setInterval(() => {
-          try {
-            if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
-              leaseLost = true
-              this.log('taskboard lease renewal lost', { runId: run.id, owner })
-            }
-          } catch (err) {
-            leaseLost = true
-            this.log('taskboard lease renewal failed', { runId: run.id, owner, err: String(err) })
-          }
-        }, this.leaseRenewIntervalMs)
-      : null
-    renewTimer?.unref?.()
-
-    try {
       let result: PatrolDelegateResult
       try {
         result = await this.delegate({
+          control,
           agentId,
           goal: prompt,
           toolsets: stage.toolsets,
@@ -823,10 +868,25 @@ export class PatrolEngine {
           error: err instanceof Error ? err.message : String(err),
         }
       }
-      if (leaseLost) return
+      if (leaseLost) {
+        await control.waitForDescendants(sessionKey)
+        this.archiveLateOutput(db, run, result.output ?? '')
+        return
+      }
+      await control.waitForDescendants(sessionKey)
       await this.finishRun(db, ticket, stage, run, settings, result)
     } finally {
-      if (renewTimer) clearInterval(renewTimer)
+      clearInterval(renewTimer)
+      await control.waitForDescendants(sessionKey)
+      taskboardRunControls.finish(control)
+    }
+  }
+
+  private archiveLateOutput(db: TaskboardDb, run: TicketRun, output: string): void {
+    const control = run.leaseOwner ? taskboardRunControls.get(run.id, run.ticketId, run.leaseOwner) : undefined
+    if (!control || control.rootSessionKey !== run.sessionKey) return
+    if (archiveExpiredRunOutput(db, run, output, this.nowFn())) {
+      this.log('taskboard late output archived without lease or ticket changes', { runId: run.id })
     }
   }
 
@@ -838,16 +898,19 @@ export class PatrolEngine {
     settings: TaskboardSettings,
     result: PatrolDelegateResult,
   ): Promise<void> {
-    const timedOut = result.timedOut === true
+    const cancelled = result.cancelled === true
+    const timedOut = !cancelled && result.timedOut === true
     const ok = result.ok && !timedOut && !result.error
     const output = result.output ?? ''
     const status = timedOut ? 'timeout' : ok ? 'succeeded' : 'failed'
-    const error = timedOut
+    const error = cancelled
+      ? (result.error?.startsWith('USER_CANCELLED:') ? result.error : `USER_CANCELLED: ${result.error ?? 'stopped by user'}`)
+      : timedOut
       ? (result.error ?? 'delegate timed out')
       : ok
         ? null
-        : (result.error ?? 'delegate failed')
-    const digested = summarizeRunOutput(output, { failed: !ok, error })
+        : (result.error?.startsWith('USER_CANCELLED:') ? `DELEGATE_FAILED: ${result.error}` : result.error ?? 'delegate failed')
+    const digested = summarizeRunOutput(result.summaryOutput ?? output, { failed: !ok, error })
 
     const sessionKey =
       run.sessionKey ??
@@ -904,12 +967,17 @@ export class PatrolEngine {
 
       const current = getTicket(db, ticket.id)
       if (!current || current.status !== 'running') return true
+      if (cancelled) {
+        this.transition(db, current, 'blocked', 'system', stage, { blockedReason: '用户停止本次执行' }, run)
+        return true
+      }
       if (ok) this.applySuccess(db, current, stage, settings, run)
       else this.applyFailure(db, current, stage, settings, error ?? 'failed', run)
       return true
     }).immediate()
 
     if (!settled) {
+      this.archiveLateOutput(db, run, output)
       this.log('taskboard stale result discarded:fence lost', { runId: run.id, owner })
       return
     }
@@ -933,7 +1001,7 @@ export class PatrolEngine {
         /* fail-soft */
       }
     }
-    if (!isRunUsageComplete(usage)) this.queueUsageBackfill(db, run.id, sessionKey)
+    if (!isRunUsageComplete(usage) && !result.usageIncludesDescendants) this.queueUsageBackfill(db, run.id, sessionKey)
   }
 
   private applySuccess(
@@ -1263,7 +1331,7 @@ export class PatrolEngine {
     result: PatrolDelegateResult,
   ): Promise<RunUsageSnapshot> {
     let usage = usageFromDelegateResult(result)
-    if (isRunUsageComplete(usage)) return usage
+    if (isRunUsageComplete(usage) || result.usageIncludesDescendants) return usage
     try {
       const looked = await this.lookupUsage(sessionKey)
       usage = mergeRunUsage(usage, looked)

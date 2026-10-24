@@ -1453,6 +1453,11 @@ export function isWebchatSessionKey(sessionKey: string | undefined): boolean {
   return parts[0] === 'agent' && parts[2] === 'webchat'
 }
 
+/** Only these session outputs are rendered by the web IUI renderer. Routing stays unchanged. */
+export function isWebRenderedIuiSessionKey(sessionKey: string | undefined): boolean {
+  return isWebchatSessionKey(sessionKey) || /^agent:[^:]+:taskboard:[^:]+:[^:]+:[^:]+$/.test(sessionKey ?? '')
+}
+
 /**
  * 容器从 master fetch 回来的单个 slot。`canonicalModelId` 仅 MODEL_HINT 出现,
  * gateway 把它透传到 PromptSlotApplied.meta.model_id —— 保持
@@ -1511,8 +1516,9 @@ export async function fetchPlatformSlotsFromMasterDetailed(
 
   let url = `${normalized}${PLATFORM_PROMPT_SLOTS_PATH}`
   const query = new URLSearchParams()
-  if (ctx.model) query.set("model", ctx.model)
-  if (ctx.sessionId) query.set("sessionId", ctx.sessionId)
+  if (ctx.model) query.set('model', ctx.model)
+  if (ctx.sessionId) query.set('sessionId', ctx.sessionId)
+  if (isWebRenderedIuiSessionKey(ctx.sessionKey) && !isWebchatSessionKey(ctx.sessionKey)) query.set('surface', 'taskboard')
   if (query.size) url += `?${query}`
 
   const controller = new AbortController()
@@ -1792,7 +1798,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),只对 webchat
   // 会话注入,插在上面记下的 iuiInsertAt(AGENTS 之前)。静态文案,位置固定利于缓存;
   // MODEL_HINT 仍在其后,模型补丁可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
-  if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
+  if (remotePlatformSlots !== null && isWebRenderedIuiSessionKey(ctx.sessionKey)) {
     const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
     if (iui) {
       slots.splice(iuiInsertAt, 0, { name: INTELLIGENT_UI_SLOT, content: iui.content })

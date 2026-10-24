@@ -36,7 +36,7 @@ beforeEach(() => {
 })
 
 let serial = 0
-async function run(t: TestContext, opts: { applied?: string; failShutdown?: boolean; stillAlive?: boolean; metadataFailure?: boolean }) {
+async function run(t: TestContext, opts: { applied?: string; failShutdown?: boolean; stillAlive?: boolean; metadataFailure?: boolean; interruptDuringMetadata?: boolean }) {
   const id = ++serial
   const dir = join(home, `fx-${id}`)
   await mkdir(dir, { recursive: true })
@@ -64,9 +64,10 @@ async function run(t: TestContext, opts: { applied?: string; failShutdown?: bool
   })
   const errors: string[] = []
   const onEvent = (event: { kind: string; error?: string }) => { if (event.kind === 'error') errors.push(String(event.error)) }
-  let metadataAvailable = false
+  let metadataAvailable = opts.interruptDuringMetadata === true
+  let interruptedAtMetadata = false
   let firstAttemptCalls: string[] | undefined
-  if (opts.metadataFailure) {
+  if (opts.metadataFailure || opts.interruptDuringMetadata) {
     // Exercise the post-admission warm runner gate, without an identity factory replacing this fixture.
     session._identityCreationOpts = undefined
     const { setV3MasterSinkSingleton } = await import('../v3MasterSink.js')
@@ -78,6 +79,13 @@ async function run(t: TestContext, opts: { applied?: string; failShutdown?: bool
         res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '765', profiles: [] } })); return
       }
       if (!req.url?.startsWith('/internal/v3/platform-prompt-slots')) { res.statusCode = 404; res.end(); return }
+      if (opts.interruptDuringMetadata) {
+        const abort = session._externalTurnAbort
+        assert.ok(abort, 'privacy await must already have the logical turn cancellation signal')
+        sm.interrupt(session.sessionKey, 'user')
+        assert.equal(abort.signal.aborted, true)
+        interruptedAtMetadata = true
+      }
       res.statusCode = metadataAvailable ? 200 : 503
       res.end(metadataAvailable ? JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }) : '')
     })
@@ -92,7 +100,7 @@ async function run(t: TestContext, opts: { applied?: string; failShutdown?: bool
       }
     })
     // Stop exactly at the model invocation boundary; engine/billing admission is covered independently.
-    t.mock.method(sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> }, 'runOneTurnWithRetry', async () => {
+    if (opts.metadataFailure) t.mock.method(sm as unknown as { runOneTurnWithRetry: (...args: unknown[]) => Promise<void> }, 'runOneTurnWithRetry', async () => {
       calls.push('submitTurn'); throw new Error('stop-at-model-boundary')
     })
     let model = 'fixture-old-model'
@@ -118,9 +126,11 @@ async function run(t: TestContext, opts: { applied?: string; failShutdown?: bool
     firstAttemptCalls = [...calls]
     calls.length = 0; metadataAvailable = true
     await attempt()
+  } else if (opts.interruptDuringMetadata) {
+    await sm.submit(session, 'hi', onEvent, 'low', 'grok-build', 'b'.repeat(32)).catch(error => { errors.push(String(error)) })
   } else await sm.submit(session, 'hi', () => {}).catch(() => {})
   await session.lock
-  return { calls, frozen, firstAttemptCalls, errors }
+  return { calls, frozen, firstAttemptCalls, errors, interruptedAtMetadata }
 }
 
 test('privacy withdrawal restarts even with IUI and prediction off, then uses the frozen off snapshot', { timeout: 15000 }, async t => {
@@ -158,4 +168,11 @@ test('failed privacy metadata leaves all warm desired configuration unchanged; r
   assert.ok(result.calls.includes('setTier'))
   assert.equal(result.calls.filter(call => call === 'shutdown').length, 1)
   assert.equal(result.calls.at(-1), 'submitTurn')
+})
+
+
+test('user interrupt during awaited privacy metadata cannot reach a model invocation', { timeout: 15000 }, async t => {
+  const result = await run(t, { applied: 'previous-private-policy', interruptDuringMetadata: true })
+  assert.equal(result.interruptedAtMetadata, true)
+  assert.equal(result.calls.includes('submitTurn'), false)
 })
