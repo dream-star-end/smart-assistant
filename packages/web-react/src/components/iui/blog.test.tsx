@@ -8,7 +8,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { CommunityTutorialMine } from "../../lib/types";
-import { type CommunityBlogActions, ChatInteractionContext, ToolCardActionsContext } from "../tool/context";
+import { type CommunityBlogActions, type CommunityBlogBusinessActions, ChatInteractionContext, ToolCardActionsContext } from "../tool/context";
 import { IuiBlock } from "./IuiBlock";
 import {
   __resetBlogChatForTests,
@@ -58,7 +58,7 @@ function mine(over: Partial<CommunityTutorialMine> = {}): CommunityTutorialMine 
   };
 }
 
-function actionsMock(over: Partial<CommunityBlogActions> = {}): CommunityBlogActions {
+function actionsMock(over: Partial<CommunityBlogBusinessActions> = {}): CommunityBlogBusinessActions {
   return {
     precheck: vi.fn(async () => ({ issues: [], quota: { pendingLeft: 3, dailyLeft: 5 } })),
     readContainerImage: vi.fn(async () => new Blob(["x"], { type: "image/png" })),
