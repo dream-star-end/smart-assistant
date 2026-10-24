@@ -144,3 +144,12 @@ test('an actual runtime support change blocks new profile grants but still permi
   assert.equal('state' in saved && saved.state, 'succeeded')
   assert.equal(f.writes(), 1)
 })
+
+test('withdrawn profile grants never disclose a retained nickname or session even to the old session', async t => {
+  const f = fixture(t, { system_assistant_profile: { enabled: false, nickname: 'Synthetic Private Name', sessionId: actor.sessionId } })
+  for (const sessionId of [actor.sessionId, 'synthetic-other-session']) {
+    const view = await f.registry.read({ ...actor, sessionId }, 'preferences.read', { keys: ['system_assistant_profile'] }) as { prefs: Record<string, unknown> }
+    assert.deepEqual(view.prefs.system_assistant_profile, { enabled: false, authorizedForCurrentSession: false })
+  }
+  assert.equal(f.writes(), 0)
+})

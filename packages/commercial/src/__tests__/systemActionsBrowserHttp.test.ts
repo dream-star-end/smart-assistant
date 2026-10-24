@@ -19,6 +19,7 @@ const secret = 'synthetic-system-actions-http-secret-only'
 async function fixture(t: import('node:test').TestContext, options: { executor?: SystemActionExecutor; owner?: string } = {}) {
   let effects = 0
   let active = true
+  let deleted = false
   const refresh = issueRefresh()
   const family = randomUUID()
   const access = await signAccess({ sub: '765', role: 'user' }, secret)
@@ -39,10 +40,10 @@ async function fixture(t: import('node:test').TestContext, options: { executor?:
     assert.ok(sql.trimStart().startsWith('SELECT '))
     if (sql.includes('refresh_tokens')) {
       assert.deepEqual(params, [refresh.hash, '765'])
-      return { rows: active ? [{ id: '765', role: 'user', refresh_session_id: '17', refresh_family_id: family }] : [] }
+      return { rows: active && !deleted ? [{ id: '765', role: 'user', refresh_session_id: '17', refresh_family_id: family }] : [] }
     }
     assert.deepEqual(params, ['765'])
-    return { rows: active ? [{ role: 'user' }] : [] }
+    return { rows: active && (!deleted || !sql.includes('deleted_at IS NULL')) ? [{ role: 'user' }] : [] }
   } } as unknown as QueryRunner
   const handle = makeSystemActionsBrowserHandler({ service, runner, jwtSecret: secret, firstPartyOrigin: origin })
   const server: Server = createServer((req, res) => { void handle(req, res).catch(e => {
@@ -72,7 +73,7 @@ async function fixture(t: import('node:test').TestContext, options: { executor?:
   }
   const read = `/api/me/system-actions/${proposal.id}`
   const write = `/api/auth/system-actions/${proposal.id}`
-  return { call, read, write, id: proposal.id, effects: () => effects, deactivate: () => { active = false } }
+  return { call, read, write, id: proposal.id, effects: () => effects, deactivate: () => { active = false }, softDelete: () => { deleted = true } }
 }
 test('only the real browser proof can approve; replay returns the original single effect and owner receipt', async t => {
   const f = await fixture(t)
@@ -134,5 +135,14 @@ test('an existing proposal belonging to a synthetic other owner is indistinguish
   const absent = await f.call(f.read.replace(f.id, randomUUID()))
   assert.equal(actual.status, 404); assert.deepEqual(actual.body, absent.body)
   assert.equal((await f.call(`${f.write}/deny`, {})).status, 404)
+  assert.equal(f.effects(), 0)
+})
+
+test('soft-deleted active accounts cannot read an existing proposal preview or result', async t => {
+  const f = await fixture(t)
+  assert.equal((await f.call(f.read)).status, 200)
+  f.softDelete()
+  assert.equal((await f.call(f.read)).status, 403)
+  assert.equal((await f.call(`${f.read}/result`)).status, 403)
   assert.equal(f.effects(), 0)
 })
