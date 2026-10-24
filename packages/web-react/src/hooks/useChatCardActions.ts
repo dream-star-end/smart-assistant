@@ -9,7 +9,7 @@ import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
-import type { ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
+import type { SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
 import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
@@ -53,6 +53,7 @@ export type ChatCardActionsInput = {
   /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
   communityBlogEnabled: boolean;
   demo: boolean;
+  systemActions?: SystemActionCardActions;
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
@@ -90,6 +91,7 @@ export function useChatCardActions({
   chipsProjectName,
   communityBlogEnabled,
   demo,
+  systemActions,
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
@@ -173,6 +175,7 @@ export function useChatCardActions({
       demo
         ? {}
         : {
+            systemActions,
             onOpenMemory: () => openManage("memory"),
             onOpenSkills: () => openManage("skills"),
             onOpenTasks: () => openManage("cron"),
@@ -230,7 +233,7 @@ export function useChatCardActions({
                 }
               : {}),
           },
-    [demo, openManage, setBoardOpen, communityBlogEnabled, openBlog],
+    [demo, systemActions, openManage, setBoardOpen, communityBlogEnabled, openBlog],
   );
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),

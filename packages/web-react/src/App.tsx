@@ -23,7 +23,6 @@ import {
 } from "@openclaude/protocol/browser";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
-import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
@@ -225,6 +224,7 @@ import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
 import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
+import { useSystemActionCardActions } from "./hooks/useSystemActionCardActions";
 import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
@@ -1426,6 +1426,15 @@ export function App() {
     },
     [openTutorial],
   );
+  const { systemActions, preferencesRevision } = useSystemActionCardActions({
+    authRef,
+    userId: user?.id,
+    demo,
+    applyPreferences: applyConversationPreferences,
+    setTheme,
+    onSyncError: () => toast("操作已完成，设置显示暂未同步，请重新打开设置。"),
+  });
+
   const {
     artifactInspect,
     cardCallbacks,
@@ -1435,6 +1444,7 @@ export function App() {
     stopTurn,
     toolActions,
   } = useChatCardActions({
+    systemActions,
     activeId,
     agent,
     authRef,
@@ -2634,6 +2644,7 @@ export function App() {
       </Sheet>
 
       <AppDialogs
+        preferencesRevision={preferencesRevision}
         activeId={activeId}
         activeSess={activeSess}
         agent={agent}

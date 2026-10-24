@@ -4228,3 +4228,39 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
   });
 });
+
+describe('system action authority in actual message history', () => {
+  const id = 'b5be0795-e604-45ee-bd8b-a519324b5cf4'
+  const text = ['```ui', JSON.stringify({ type: 'system_action', proposalId: id }), '```'].join('\n')
+  function actionFixture() {
+    const detail = { id, operationId: 'preferences.update', title: '更改通知', state: 'prepared' as const, executor: 'master' as const,
+      createdAt: Date.now(), updatedAt: Date.now(), expiresAt: Date.now() + 60000, result: null, previewHash: 'a'.repeat(64),
+      preview: { title: '更改通知', description: '后续通知', scope: '当前账号', before: [], after: [], consequences: [], price: { kind: 'none' as const, label: '无费用' }, destructive: false } }
+    return { identityKey: 'fixture-history-person', getDetail: vi.fn(async () => detail),
+      getConfirmation: vi.fn(async () => ({ detail, nonce: 'n'.repeat(43) })),
+      confirm: vi.fn(async () => detail), deny: vi.fn(async () => detail) }
+  }
+  test('read-only MessageList cannot inherit global approval actions', async () => {
+    const actions = actionFixture()
+    render(<ToolCardActionsContext.Provider value={{ systemActions: actions }}>
+      <MessageList messages={[mk('assistant', { text })]} sending={false} cb={{}} onRespondPermission={() => {}} readOnly />
+    </ToolCardActionsContext.Provider>)
+    await screen.findByText('只读记录')
+    expect(actions.getDetail).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
+  })
+  test('changing an already interactive message to read-only revokes its open sheet', async () => {
+    const actions = actionFixture()
+    const tree = (readOnly: boolean) => <ToolCardActionsContext.Provider value={{ systemActions: actions }}>
+      <MessageRenderer message={mk('assistant', { text })} sig='stable-history-row' isLast sending={false} inActiveTurn={false}
+        cb={{}} onRespondPermission={() => {}} readOnly={readOnly} />
+    </ToolCardActionsContext.Provider>
+    const view = render(tree(false))
+    fireEvent.click(await screen.findByRole('button', { name: '查看并确认' }))
+    await screen.findByRole('dialog')
+    view.rerender(tree(true))
+    await screen.findByText('只读记录')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(actions.confirm).not.toHaveBeenCalled()
+  })
+})

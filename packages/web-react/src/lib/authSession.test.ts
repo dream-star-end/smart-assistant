@@ -1,0 +1,42 @@
+import { expect, test, vi } from 'vitest'
+import { createMemoryAuthSession } from './authSession'
+
+test('refresh synchronously invalidates access observers while preserving epoch and legacy snapshot shape', () => {
+  const auth = createMemoryAuthSession(() => {}, 'fixture-a')
+  const observed: unknown[] = []
+  auth.subscribeAccessGeneration(() => observed.push({ ...auth.snapshot(), generation: auth.getAccessGeneration() }))
+  expect(auth.commitToken(0, 'fixture-b')).toBe(true)
+  expect(auth.snapshot()).toEqual({ token: 'fixture-b', epoch: 0 })
+  expect(observed).toEqual([{ token: 'fixture-b', epoch: 0, generation: 1 }])
+  expect(auth.commitToken(0, 'fixture-b')).toBe(true)
+  expect(auth.commitToken(99, 'stale-fixture')).toBe(false)
+  expect(auth.getAccessGeneration()).toBe(1)
+  expect(observed).toHaveLength(1)
+})
+test('identity boundaries invalidate even without a token and stale expiration cannot invalidate a newer login', () => {
+  const expired = vi.fn()
+  const auth = createMemoryAuthSession(expired, 'fixture-a')
+  expect(auth.beginIdentity()).toBe(1)
+  expect(auth.beginIdentity()).toBe(2)
+  expect(auth.getAccessGeneration()).toBe(2)
+  expect(auth.expire(1)).toBe(false)
+  expect(auth.expire(2)).toBe(true)
+  expect(auth.snapshot()).toEqual({ token: '', epoch: 3 })
+  expect(auth.getAccessGeneration()).toBe(3)
+  expect(auth.expire(2)).toBe(false)
+  expect(expired).toHaveBeenCalledTimes(1)
+})
+test('observer failures and unsubscribe cannot prevent other observers or expiration cleanup', () => {
+  const expired = vi.fn()
+  const auth = createMemoryAuthSession(expired, 'fixture-a')
+  const healthy = vi.fn()
+  auth.subscribeAccessGeneration(() => { throw new Error('synthetic observer failure') })
+  const unsubscribe = auth.subscribeAccessGeneration(healthy)
+  expect(() => auth.commitToken(0, 'fixture-b')).not.toThrow()
+  expect(healthy).toHaveBeenCalledTimes(1)
+  unsubscribe(); unsubscribe()
+  expect(() => auth.expire(0)).not.toThrow()
+  expect(healthy).toHaveBeenCalledTimes(1)
+  expect(expired).toHaveBeenCalledTimes(1)
+  expect(auth.getAccessGeneration()).toBe(2)
+})
