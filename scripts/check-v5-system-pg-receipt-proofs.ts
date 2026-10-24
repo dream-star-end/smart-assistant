@@ -1,4 +1,4 @@
-/** Twelve real private-PG receipt and exact inbox approval proofs. Never pass through a product credential environment. */
+/** Thirteen real private-PG receipt and exact inbox approval proofs. Never pass through a product credential environment. */
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -16,9 +16,9 @@ process.stdout.write(proof.stdout ?? '')
 process.stderr.write(proof.stderr ?? '')
 const output = proof.stdout ?? ''
 const count = (name: string): number => Number([...output.matchAll(new RegExp(`^# ${name}\\s+(\\d+)\\s*$`, 'gm'))].at(-1)?.[1] ?? -1)
-if (proof.error || proof.signal || proof.status !== 0 || !/^1\.\.12\s*$/m.test(output)
-  || count('tests') !== 12 || count('pass') !== 12 || ['fail', 'cancelled', 'skipped', 'todo'].some(name => count(name) !== 0)) {
-  console.error('[system-pg-receipt-proofs] FAIL: complete twelve-test plan and zero failures/cancellations/skips/todos required')
+if (proof.error || proof.signal || proof.status !== 0 || !/^1\.\.13\s*$/m.test(output)
+  || count('tests') !== 13 || count('pass') !== 13 || ['fail', 'cancelled', 'skipped', 'todo'].some(name => count(name) !== 0)) {
+  console.error('[system-pg-receipt-proofs] FAIL: complete thirteen-test plan and zero failures/cancellations/skips/todos required')
   process.exit(1)
 }
 console.log('[system-pg-receipt-proofs] PASS real atomic effect, lost COMMIT reply and exact positive reconciliation')

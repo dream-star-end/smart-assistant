@@ -125,3 +125,13 @@ test('receipt binding, fresh account status and historical ownership govern read
   try { await assert.rejects(getPgActionReceipt(binding, pool), e => e instanceof SystemOperationRejected && e.code === 'FORBIDDEN') }
   finally { await pool.query("UPDATE users SET role='user',status='active' WHERE id=765") }
 })
+
+test('receipt ACL hardens the actual migration owner without relying on a separately named application role', async () => {
+  const rows = await pool.query<{ privilege_type: string }>(`SELECT acl.privilege_type
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    CROSS JOIN LATERAL aclexplode(c.relacl) acl
+    WHERE n.nspname=current_schema() AND c.relname='system_action_receipts'
+      AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
+    ORDER BY acl.privilege_type`)
+  assert.deepEqual(rows.rows.map(row => row.privilege_type), ['INSERT','SELECT'])
+})
