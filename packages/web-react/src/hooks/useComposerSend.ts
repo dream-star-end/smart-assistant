@@ -52,6 +52,7 @@ export type ComposerSendInput = {
   newSessionInProject: (projectId: string) => void;
   preferenceEffort: PreferenceEffort | undefined;
   projectHome: ProjectRoute | null;
+  promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
@@ -97,6 +98,7 @@ export function useComposerSend({
   newSessionInProject,
   preferenceEffort,
   projectHome,
+  promoteDraftCollab,
   publicCfg,
   selectedSessionIdRef,
   sendImplicitRatingRef,
@@ -225,7 +227,7 @@ export function useComposerSend({
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
+        if (auth && agent.id === "main" && !recoveredAdvisor) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
@@ -241,16 +243,17 @@ export function useComposerSend({
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
-              const msg = apiErrorMessage(err, "协作配置保存失败");
-              setCollabSaveError(msg);
-              toast(msg, "error");
-              return;
-            }
+            const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
+            setCollabSaveError(msg);
+            toast(msg, "error");
+            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) return;
           }
         }
         setSessions((c) => [createdSession!, ...c]);
-        if (recoveryIsCurrent()) setActiveId(sessionId);
+        if (recoveryIsCurrent()) {
+          promoteDraftCollab(sessionId, latestCollab, false);
+          setActiveId(sessionId);
+        }
       }
       const sendCollab = sendCollabFields({
         ...latestCollab, agentId: agent.id,
@@ -380,6 +383,7 @@ export function useComposerSend({
       setSessions,
       setActiveId,
       applyCollabDoc,
+      promoteDraftCollab,
       toast,
       setDraftProject,
     ],

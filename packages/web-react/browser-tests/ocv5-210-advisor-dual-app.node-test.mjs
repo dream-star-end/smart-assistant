@@ -5,6 +5,7 @@
  * non-main isolation. Stub HTTP/WS is not a live model or ledger.
  */
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -56,11 +57,12 @@ function emptyLiveFrames() {
   };
 }
 
-function startFixture() {
+function startFixture({ defaultMode = "solo" } = {}) {
   const sessions = new Map();
   const sessionCollab = new Map();
-  let defaultCollab = collabDoc();
+  let defaultCollab = collabDoc({ defaultMode, session: { mode: defaultMode, advisorModel: null, configVersion: `v1:${defaultMode}:`, source: "default" } });
   const inbounds = [];
+  let writeStatus = 0;
   let seq = 0;
   let retryAnchorFailsLeft = 1;
   const user = {
@@ -163,6 +165,7 @@ function startFixture() {
       return json(200, doc);
     }
     if (path === "/api/collaboration-config" && method === "PUT") {
+      if (writeStatus) return json(writeStatus, { error: "fixture: collaboration save rejected" });
       if (data.sessionId && !sessions.has(data.sessionId)) return json(404, { error: "session not found" });
       const prev = (data.sessionId && sessionCollab.get(data.sessionId)) || defaultCollab;
       const mode = data.mode || "solo";
@@ -351,7 +354,7 @@ function startFixture() {
     });
   });
 
-  return { http, inbounds, sessions, sessionCollab };
+  return { http, inbounds, sessions, sessionCollab, setWriteStatus: status => { writeStatus = status; } };
 }
 
 async function bootPage(context, origin, bundle) {
@@ -364,7 +367,8 @@ async function bootPage(context, origin, bundle) {
   });
   await page.goto(origin);
   await page.addScriptTag({ content: bundle });
-  await page.getByRole("button", { name: /切换智能体/ }).waitFor();
+  try { await page.getByRole("button", { name: /切换智能体/ }).waitFor(); }
+  catch (error) { throw new Error(`${error.message}; page errors=${JSON.stringify(errors)}; body=${await page.locator("body").innerText()}`); }
   return { page, errors };
 }
 
@@ -559,4 +563,171 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await browser?.close();
     await new Promise((done) => http.close(done));
   }
+});
+
+async function buildCollabApp() {
+  return build({
+    entryPoints: [fileURLToPath(new URL("./goal-start-harness.tsx", import.meta.url))],
+    bundle: true, write: false, format: "iife", jsx: "automatic",
+    loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
+    alias: { "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)) },
+    define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
+    logLevel: "error",
+    plugins: process.env.OC_COLLAB_BASELINE ? [{
+      name: "collab-baseline",
+      setup(builder) {
+        builder.onLoad({ filter: /src\/(?:App\.tsx|hooks\/use(?:ComposerSend\.ts|SessionModelAndCollab\.tsx|AppNavigationActions\.tsx|DraftSessionMaterialization\.ts))$/ }, args => {
+          const path = args.path.slice(args.path.indexOf("packages/web-react/"));
+          return { contents: execFileSync("git", ["show", `${process.env.OC_COLLAB_BASELINE}:${path}`],
+            { cwd: fileURLToPath(new URL("../../..", import.meta.url)), encoding: "utf8" }), loader: "tsx" };
+        });
+      },
+    }] : [],
+  });
+}
+
+// Regression fixture keeps account defaults separate from each session override.
+// A single shared doc makes a missing first-send PUT look successful.
+test("team close persists solo through first send and reload", { timeout: 240_000 }, async (t) => {
+  const bundle = await buildCollabApp();
+  for (const entry of ["header", "picker", "goal", "github"]) await t.test(entry, async () => {
+  const fixture = startFixture({ defaultMode: "team" });
+  const { http, inbounds, sessionCollab } = fixture;
+  await new Promise(done => http.listen(0, "127.0.0.1", done));
+  const origin = `http://127.0.0.1:${http.address().port}`;
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    const { page, errors } = await bootPage(context, origin, bundle.outputFiles[0].text);
+    await page.getByRole("button", { name: "团队模式已开启", exact: true }).waitFor();
+    if (entry === "picker") {
+      await page.getByRole("button", { name: /切换智能体/ }).click();
+      await page.getByRole("button", { name: /主模型独立完成/ }).click();
+      await page.keyboard.press("Escape");
+      await page.getByRole("dialog").waitFor({ state: "hidden" });
+    } else {
+      await page.getByRole("button", { name: "团队模式已开启", exact: true }).click();
+      await page.getByRole("button", { name: "关闭团队模式", exact: true }).click();
+    }
+    if (entry === "goal" || entry === "github") {
+      const saved = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "PUT");
+      if (entry === "goal") {
+        await page.getByRole("button", { name: "更多选项", exact: true }).click();
+        await page.getByText("设定目标", { exact: true }).click();
+      } else await page.getByRole("button", { name: "关联 GitHub 仓库", exact: true }).first().click();
+      assert.equal((await saved).status(), 200, "materialization persists the same draft intent");
+      await page.keyboard.press("Escape");
+      await page.getByRole("dialog").waitFor({ state: "hidden" });
+    }
+    assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0);
+    await page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队首发回归");
+    await page.getByRole("button", { name: "发送", exact: true }).click();
+    await page.getByTestId("message-text").filter({ hasText: "关闭团队首发回归" }).waitFor();
+    const first = inbounds.at(-1);
+    assert.ok(first, "first frame reached the actual WS fixture");
+    assert.equal(first.teamMode, undefined);
+    assert.equal(first.collabMode, "solo");
+    assert.equal(sessionCollab.get(first.peer.id)?.session.mode, "solo", "explicit solo must be saved before activating the new session");
+    await page.getByRole("button", { name: "发送", exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0, "first-send GET must not reopen team");
+    await page.close();
+    const reopened = await bootPage(context, origin, bundle.outputFiles[0].text);
+    await reopened.page.getByRole("button", { name: /关闭团队首发回归/ }).click();
+    await reopened.page.getByRole("button", { name: /切换智能体/ }).click();
+    assert.equal(await reopened.page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
+    await reopened.page.keyboard.press("Escape");
+    await reopened.page.getByRole("dialog").waitFor({ state: "hidden" });
+    await reopened.page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队第二轮回归");
+    await reopened.page.getByRole("button", { name: "发送", exact: true }).click();
+    await reopened.page.getByTestId("message-text").filter({ hasText: "关闭团队第二轮回归" }).waitFor();
+    assert.equal(inbounds.at(-1).peer.id, first.peer.id);
+    assert.equal(inbounds.at(-1).collabMode, "solo");
+    assert.equal(inbounds.at(-1).teamMode, undefined);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(reopened.errors, []);
+    // The user's explicit account default is independent of this session's pick.
+    const defaults = await (await fetch(origin + "/api/collaboration-config")).json();
+    assert.equal(defaults.defaultMode, "team");
+    await context.close();
+  } finally {
+    await browser.close();
+    await new Promise(done => http.close(done));
+  }
+  });
+});
+
+test("legacy device team flag cannot activate team before account config arrives", { timeout: 120_000 }, async () => {
+  const bundle = await buildCollabApp();
+  const { http } = startFixture();
+  await new Promise(done => http.listen(0, "127.0.0.1", done));
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  let release;
+  const configGate = new Promise(done => { release = done; });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    await context.addInitScript(() => localStorage.setItem("oc_v5_team_mode", "1"));
+    await context.route("**/api/collaboration-config**", async route => {
+      if (route.request().method() === "GET") await configGate;
+      await route.continue();
+    });
+    const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
+    await page.getByRole("button", { name: /切换智能体/ }).click();
+    assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true", "a previous account's legacy flag must not select team while GET is pending");
+    const loaded = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "GET");
+    release();
+    await loaded;
+    assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "false");
+    assert.deepEqual(errors, []);
+    await context.close();
+  } finally {
+    release();
+    await browser.close();
+    await new Promise(done => http.close(done));
+  }
+});
+
+test("closing an existing team stays solo on save failure and can persist on explicit retry", { timeout: 180_000 }, async (t) => {
+  const bundle = await buildCollabApp();
+  for (const status of [409, 503]) await t.test(String(status), async () => {
+    const { http, inbounds, sessionCollab, setWriteStatus } = startFixture({ defaultMode: "team" });
+    await new Promise(done => http.listen(0, "127.0.0.1", done));
+    const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+    try {
+      const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+      const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
+      await page.getByRole("button", { name: "团队模式已开启", exact: true }).waitFor();
+      await page.getByPlaceholder(/和「全能助手」对话/).fill("已有团队会话");
+      await page.getByRole("button", { name: "发送", exact: true }).click();
+      await page.getByTestId("message-text").filter({ hasText: "已有团队会话" }).waitFor();
+      const sid = inbounds.at(-1).peer.id;
+      assert.equal(sessionCollab.get(sid)?.session.mode, "team");
+      setWriteStatus(status);
+      const rejected = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "PUT");
+      const reread = status === 409 ? page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "GET") : null;
+      await page.getByRole("button", { name: "团队模式已开启", exact: true }).click();
+      await page.getByRole("button", { name: "关闭团队模式", exact: true }).click();
+      assert.equal((await rejected).status(), status);
+      if (reread) await reread;
+      await page.getByRole("button", { name: /切换智能体/ }).click();
+      assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true", "a failed save or CAS reread must not reopen team");
+      assert.ok(await page.getByRole("dialog").getByText(status === 409 ? /配置已被更新/ : /fixture: collaboration save rejected/).count(), "persistence failure is visible");
+      setWriteStatus(0);
+      const saved = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "PUT");
+      await page.getByRole("button", { name: /主模型独立完成/ }).click();
+      assert.equal((await saved).status(), 200);
+      assert.equal(sessionCollab.get(sid)?.session.mode, "solo");
+      await page.keyboard.press("Escape");
+      await page.getByRole("dialog").waitFor({ state: "hidden" });
+      await page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队后续单人");
+      await page.getByRole("button", { name: "发送", exact: true }).click();
+      await page.getByTestId("message-text").filter({ hasText: "关闭团队后续单人" }).waitFor();
+      assert.equal(inbounds.at(-1).teamMode, undefined);
+      assert.equal(inbounds.at(-1).collabMode, "solo");
+      assert.deepEqual(errors, []);
+      await context.close();
+    } finally {
+      await browser.close();
+      await new Promise(done => http.close(done));
+    }
+  });
 });

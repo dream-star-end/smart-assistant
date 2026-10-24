@@ -36,6 +36,7 @@ export type AppNavigationActionsInput = {
   agent: Agent;
   auth: AuthSession | null;
   collabMode: CollabMode;
+  promoteDraftCollab: (sessionId: string) => void;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
   contextTier: "300k" | "1m";
   demo: boolean;
@@ -90,6 +91,7 @@ export function useAppNavigationActions({
   agent,
   auth,
   collabMode,
+  promoteDraftCollab,
   confirmDialog,
   contextTier,
   demo,
@@ -140,7 +142,7 @@ export function useAppNavigationActions({
 }: AppNavigationActionsInput) {
   const ensureActiveSession = useDraftSessionMaterialization({
     demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
-    teamMode: collabMode === "team", sessionEffort, contextTier, serviceTier,
+    teamMode: collabMode === "team", promoteDraftCollab, sessionEffort, contextTier, serviceTier,
     sockRef, setSessions, setActiveId,
   });
 

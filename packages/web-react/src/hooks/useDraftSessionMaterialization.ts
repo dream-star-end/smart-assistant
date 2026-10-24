@@ -20,6 +20,7 @@ export function useDraftSessionMaterialization(args: {
   agentId: string
   modelId: string | undefined
   teamMode: boolean
+  promoteDraftCollab?: (sessionId: string) => void
   sessionEffort: PreferenceEffort | null | undefined
   contextTier: CursorContextTier
   serviceTier: ServiceTier | null
@@ -28,13 +29,14 @@ export function useDraftSessionMaterialization(args: {
   setActiveId: Dispatch<SetStateAction<string | undefined>>
 }): () => string | undefined {
   const { demo, userId, activeId, draftSessionId, stopPreparing, agentId, modelId,
-    teamMode, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId } = args
+    teamMode, promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId } = args
   return useCallback(() => {
     if (demo || !userId || activeId) return activeId
     stopPreparing()
     const id = draftSessionId
     const session: Session = { id, title: '新对话', ownerUserId: userId,
       updatedAt: new Date().toISOString(), messageCount: 0, ...(modelId ? { modelId } : {}) }
+    promoteDraftCollab?.(id)
     writeTeamMode(id, teamMode)
     if (sessionEffort !== undefined) writeSessionEffort(id, sessionEffort)
     writeContextTier(id, contextTier)
@@ -48,5 +50,5 @@ export function useDraftSessionMaterialization(args: {
     setActiveId(id)
     return id
   }, [demo, userId, activeId, draftSessionId, stopPreparing, agentId, modelId,
-    teamMode, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId])
+    teamMode, promoteDraftCollab, sessionEffort, contextTier, serviceTier, sockRef, setSessions, setActiveId])
 }

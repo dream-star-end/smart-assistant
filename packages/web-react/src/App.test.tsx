@@ -791,7 +791,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       const put = fetchMock.mock.calls.find(
         ([url, init]) =>
           String(url).includes('/api/collaboration-config') &&
-          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT' &&
+          JSON.parse(String((init as RequestInit).body)).mode === 'team',
       )
       expect(put).toBeTruthy()
       expect(JSON.parse(String((put![1] as RequestInit).body))).toEqual(
@@ -1059,7 +1060,9 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     await waitFor(() => expect(screen.getAllByText('B 新消息').length).toBeGreaterThan(0))
     const ordinaryBPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
-    expect(ordinaryBPuts).toEqual([])
+    expect(ordinaryBPuts).toHaveLength(1)
+    expect(ordinaryBPuts[0]!.body).toEqual(expect.objectContaining({ mode: 'solo', sessionId: expect.any(String) }))
+    expect(ordinaryBPuts[0]!.body.asDefault).not.toBe(true)
     await openAgentPicker()
     expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
     fireEvent.click(teamChoice())
