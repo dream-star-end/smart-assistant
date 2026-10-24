@@ -1,3 +1,4 @@
+import { communityBlogBusinessActions, type CommunityBlogBusinessActions } from '../tool/context';
 /**
  * 对话写博客（经验分享，OCV5-577 跟进）的三个智能 UI 组件。
  *
@@ -44,7 +45,7 @@ function payloadOf(spec: BlogDraftSpec, body: string): CommunityBlogDraftPayload
 }
 
 /** 容器图片逐张读取、压缩、上传，换成 tutorial-blob 引用。onProgress(已完成, 总数)。 */
-async function uploadDraftImages(actions: CommunityBlogActions, body: string, onProgress: (done: number, total: number) => void): Promise<string> {
+async function uploadDraftImages(actions: CommunityBlogBusinessActions, body: string, onProgress: (done: number, total: number) => void): Promise<string> {
   const images = draftImages(body);
   const shas = new Map<string, string>();
   onProgress(0, images.length);
@@ -76,7 +77,8 @@ function useLatestVersion(draftId: string, version: number): number {
 }
 
 export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<BlogDraftSpec>) {
-  const { communityBlog: actions } = useToolCardActions();
+  const { communityBlog: navigation } = useToolCardActions();
+  const actions = communityBlogBusinessActions(navigation);
   const { sendUserText, busy, reason } = useChatInteraction();
   const latest = useLatestVersion(spec.draftId, spec.version);
   const superseded = latest > spec.version;
@@ -164,6 +166,10 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
     <Frame kind="blog_draft" title={`经验分享草稿 · v${spec.version}`} subtitle={subtitle} notes={notes} streaming={streaming} nested={nested} actions={status}>
       {spec.note && <p className="oc-blog-chat-note">本版改动：{spec.note}</p>}
       <DraftPreview spec={spec} />
+      {!actions && navigation && !readOnly && !streaming && <div className="oc-blog-chat-actions">
+        {images.length === 0 && <Button variant="secondary" onClick={() => navigation.openEditor(payloadOf(spec, spec.body))}>在编辑器里改</Button>}
+        <Button variant="ghost" onClick={navigation.openMine}>查看我的投稿</Button>
+      </div>}
       {laterSubmitted ? (
         <p className="oc-blog-chat-hint">这份草稿的 v{laterSubmitted.version} 已经投稿（稿件 #{laterSubmitted.id}），这一版不能再投。</p>
       ) : superseded ? (
@@ -361,7 +367,7 @@ const STOP_AFTER_MS = 30 * 60_000;
 
 type LoadState = { kind: "loading" } | { kind: "ok"; item: CommunityTutorialMine } | { kind: "missing" } | { kind: "error"; message: string };
 
-function useOwnTutorial(id: string, actions: CommunityBlogActions | undefined): { state: LoadState; stopped: boolean; refresh: () => void } {
+function useOwnTutorial(id: string, actions: CommunityBlogBusinessActions | undefined): { state: LoadState; stopped: boolean; refresh: () => void } {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [stopped, setStopped] = useState(false);
   const [nonce, setNonce] = useState(0);
@@ -452,7 +458,7 @@ function clock(iso: string | null): string {
 function BlogStatusView({ id, nested, readOnly }: { id: string; nested?: boolean; readOnly?: boolean }) {
   // 只读上下文（站内信、分享页）不查状态：稿件只对作者本人可见。
   const blogActions = useToolCardActions().communityBlog;
-  const actions = readOnly ? undefined : blogActions;
+  const actions = readOnly ? undefined : communityBlogBusinessActions(blogActions);
   const { sendUserText, busy } = useChatInteraction();
   const { state, stopped, refresh } = useOwnTutorial(id, actions);
   const [asked, setAsked] = useState(false);

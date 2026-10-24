@@ -216,17 +216,19 @@ export function useChatCardActions({
           },
         } : {}),
       } : {}),
-      ...(communityBlogEnabled && verified ? {
+      ...(communityBlogEnabled && auth.snapshot().token ? {
         communityBlog: {
-          precheck: (draft: BlogDraft) => defer('precheck')({ ...draft }),
-          readContainerImage: defer('readContainerImage'),
-          uploadImage: defer('uploadImage'),
-          submit: (draft: BlogDraft) => defer('submit')({ ...draft }),
-          getMine: defer('getMine'),
+          ...(verified ? {
+            precheck: (draft: BlogDraft) => defer('precheck')({ ...draft }),
+            readContainerImage: defer('readContainerImage'),
+            uploadImage: defer('uploadImage'),
+            submit: (draft: BlogDraft) => defer('submit')({ ...draft }),
+            getMine: defer('getMine'),
+          } : {}),
           postUrl: (id: string) => `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
-          openPost: (id: string) => { assertCurrent(); openBlog({ kind: "post", id }); },
-          openMine: () => { assertCurrent(); openBlog({ kind: "mine" }); },
-          openEditor: (seed: BlogDraft) => { assertCurrent(); openBlog({ kind: "editor", seed }); },
+          openPost: (id: string) => { if (authRef.current.snapshot().token) openBlog({ kind: "post", id }); },
+          openMine: () => { if (authRef.current.snapshot().token) openBlog({ kind: "mine" }); },
+          openEditor: (seed: BlogDraft) => { if (authRef.current.snapshot().token) openBlog({ kind: "editor", seed }); },
         },
       } : {}),
     };
