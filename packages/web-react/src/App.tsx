@@ -914,7 +914,6 @@ export function App() {
     setCollabSaveError,
     setCollabUi,
     setTeamMode,
-    setTeamModeState,
     teamMode,
   } = useSessionModelAndCollab({
     activeId,
@@ -1003,7 +1002,6 @@ export function App() {
     setMessages,
     setSessions,
     setStreamText,
-    setTeamModeState,
     sockRef,
     stopPreparing,
     stopRef,

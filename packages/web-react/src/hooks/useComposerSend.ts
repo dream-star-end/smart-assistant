@@ -73,7 +73,6 @@ export type ComposerSendInput = {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
   setStreamText: React.Dispatch<React.SetStateAction<string>>;
-  setTeamModeState: React.Dispatch<React.SetStateAction<boolean>>;
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
@@ -120,14 +119,13 @@ export function useComposerSend({
   setMessages,
   setSessions,
   setStreamText,
-  setTeamModeState,
   sockRef,
   stopPreparing,
   stopRef,
   toast,
   user,
 }: ComposerSendInput) {
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, setTeamModeState, sockRef, stopRef are App useState setter/useRef passed in, stable
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef are App useState setter/useRef passed in, stable
   const send = useCallback(
     async (
       text: string,
@@ -201,7 +199,6 @@ export function useComposerSend({
         update: (state, recovered) => {
           if (!recoveryIsCurrent()) return false;
           setCollabUi(state);
-          setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },

@@ -200,7 +200,6 @@ export function useSessionModelAndCollab({
 
   // Defaults belong to the authenticated server config. Legacy device keys are
   // unscoped across accounts and must never activate a more expensive mode.
-  const [teamMode, setTeamModeState] = useState(false);
   const [collabUi, setCollabUi] = useState<CollabUiState>(() => ({ ...EMPTY_COLLAB_UI }));
   const collabMode = collabUi.mode;
   const collabEpochRef = useRef(0);
@@ -209,7 +208,6 @@ export function useSessionModelAndCollab({
   const applyCollabDoc = useCallback((doc: Parameters<typeof docToUiState>[0]) => {
     const next = docToUiState(doc);
     setCollabUi(next);
-    setTeamModeState(next.mode === "team");
     setCollabSaveError(null);
   }, []);
   // A draft becomes a session through send, Goal, or GitHub. Carry the same
@@ -256,7 +254,6 @@ export function useSessionModelAndCollab({
       }
       // Optimistic mode only; configVersion stays empty until the server returns it.
       setCollabUi((cur) => ({ ...cur, mode, advisorModel, configVersion: "" }));
-      setTeamModeState(mode === "team");
       setCollabSaveError(null);
       // useAuth.auth is null until authed; authRef always holds MemoryAuthSession.
       if (demo || !auth) return;
@@ -270,7 +267,6 @@ export function useSessionModelAndCollab({
       const failSave = (msg: string) => {
         if (!keepCollabChoiceOnSaveFailure(mode)) {
           setCollabUi(previous);
-          setTeamModeState(previous.mode === "team");
         }
         setCollabSaveError(msg);
         toast(msg, "error");
@@ -307,7 +303,6 @@ export function useSessionModelAndCollab({
             if (!isCurrent()) return;
             if (keepCollabChoiceOnSaveFailure(mode)) {
               setCollabUi((cur) => ({ ...docToUiState(fresh), mode, advisorModel: null, configVersion: "" }));
-              setTeamModeState(mode === "team");
             } else applyCollabDoc(fresh);
             setCollabSaveError("配置已被更新，请确认后再选一次");
             toast("协作配置有更新，已重新读取，请再选一次", "error");
@@ -348,7 +343,6 @@ export function useSessionModelAndCollab({
       advisorConsultParents: cur.advisorConsultParents,
       advisorConsultParentReason: cur.advisorConsultParentReason,
     }));
-    setTeamModeState(intent?.state.mode === "team");
     setCollabAsDefault(false);
     // auth is null until login/boot getMe (useAuth). authRef always holds the
     // MemoryAuthSession, including the anonymous epoch-0 object — do not GET on it.
@@ -394,7 +388,6 @@ export function useSessionModelAndCollab({
     setCollabSaveError,
     setCollabUi,
     setTeamMode,
-    setTeamModeState,
-    teamMode,
+    teamMode: collabMode === "team",
   };
 }
