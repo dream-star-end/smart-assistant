@@ -802,3 +802,66 @@ sleep 60
     fx.cleanup()
   }
 })
+
+const preflightCapture = path.join(root, 'scripts/v5-preflight-capture.py')
+
+test('preflight capture preserves command output and failure status', () => {
+  const r = spawnSync('python3', [preflightCapture, '1', '1', 'bash', '-c', 'printf captured; exit 7'], { encoding: 'utf8', timeout: 5000 })
+  assert.equal(r.error, undefined)
+  assert.equal(r.status, 7)
+  assert.equal(r.stdout, 'captured')
+  assert.equal(r.stderr, '')
+})
+
+function originalProcessAlive(pid: number, ticks: string): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    return fields[19] === ticks && fields[0] !== 'Z'
+  } catch { return false }
+}
+
+function captureProcessGroup(mode: 'hang' | 'exit') {
+  const dir = mkdtempSync(path.join(tmpdir(), 'v5-preflight-capture-'))
+  const identities = path.join(dir, 'identities.jsonl')
+  const fixture = path.join(dir, 'fixture.py')
+  writeFileSync(fixture, `import os,sys,time,signal,json
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+child=os.fork()
+pid=os.getpid()
+stat=open('/proc/%d/stat'%pid).read()
+row={'pid':pid,'ticks':stat[stat.rfind(')')+2:].split()[19]}
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+os.write(fd,(json.dumps(row)+'\\n').encode());os.close(fd)
+if child:
+    while len(open(sys.argv[1]).readlines())<2: time.sleep(.01)
+    print('ready',flush=True)
+    if sys.argv[2]=='exit': sys.exit(0)
+while True: time.sleep(60)
+`)
+  const rows = () => existsSync(identities) ? readFileSync(identities, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as { pid: number; ticks: string }) : []
+  try {
+    const started = Date.now()
+    const r = spawnSync('python3', [preflightCapture, '1', '1', 'python3', fixture, identities, mode], { encoding: 'utf8', timeout: 6000 })
+    assert.equal(r.error, undefined, 'capture must not wait for descendant EOF')
+    assert.equal(r.status, mode === 'hang' ? 124 : 0, r.stderr)
+    assert.ok(Date.now() - started < (mode === 'hang' ? 4500 : 2500))
+    assert.equal(r.stdout, mode === 'hang' ? '' : 'ready\n')
+    assert.equal(rows().length, 2, 'both leader and descendant must have started')
+    // Allow signal delivery, without treating a reused PID as the fixture process.
+    for (let i = 0; i < 50 && rows().some(p => originalProcessAlive(p.pid, p.ticks)); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+    for (const p of rows()) assert.equal(originalProcessAlive(p.pid, p.ticks), false, `fixture process ${p.pid} survived group cleanup`)
+  } finally {
+    // A failing regression test may leave only its own recorded fixture alive.
+    for (const p of rows()) if (originalProcessAlive(p.pid, p.ticks)) { try { process.kill(p.pid, 'SIGKILL') } catch {} }
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('preflight capture kills TERM-ignoring leader and descendants at the original deadline', () => {
+  captureProcessGroup('hang')
+})
+
+test('preflight capture cleans a pipe-holding descendant after the leader exits first', () => {
+  captureProcessGroup('exit')
+})
