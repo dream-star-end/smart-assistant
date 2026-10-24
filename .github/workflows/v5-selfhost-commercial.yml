@@ -154,6 +154,20 @@ jobs:
             "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
             npm run test:commercial:unit:gate
 
+      - name: Prove committed system action receipts in private PG schema
+        id: system_pg_receipts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "OC_TEST_MUTEX_TIMEOUT=$OC_TEST_MUTEX_TIMEOUT" \
+            bash scripts/test-mutex.sh commercial 'node --import tsx scripts/check-v5-system-pg-receipt-proofs.ts' \
+            > system-pg-receipts.tap
+
       - name: Explain missing TAP
         if: always()
         shell: bash
@@ -175,6 +189,15 @@ jobs:
           # error (check:ci-parity contract): missing TAP must keep the job red.
           # The "Explain missing TAP" step above already surfaces the real cause
           # (e.g. npm ci ECONNRESET in run 33948677980 attempt 1) before this fails.
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload system PG receipt proof
+        if: always() && steps.system_pg_receipts.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-pg-receipts-tap
+          path: system-pg-receipts.tap
           if-no-files-found: error
           retention-days: 14
 

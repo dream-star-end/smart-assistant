@@ -288,3 +288,29 @@ for (const legacyVersion of [0, 1]) test(`a legacy private ledger (version ${leg
     inspect.close()
   } finally { store.close() }
 })
+
+test('positive exact receipt reconciles only unknown and never takes over a live executor', () => {
+  const fixture = setup(); const store = fixture.create()
+  try {
+    const proposal = store.prepare(input({ requestHash: systemActionRequestHash({ operation: 'fixture', setting: false }) }))
+    const claim = handle(store.confirm(USER, proposal.id, proof(store, proposal.id), 'fixture-executor'))
+    assert.match(claim.inputHash, /^[a-f0-9]{64}$/)
+    assert.match(claim.requestHash!, /^[a-f0-9]{64}$/)
+    assert.equal(store.unknownReceiptBinding(USER, proposal.id), null)
+    const binding = { id: claim.id, userId: claim.userId, sessionId: claim.sessionId, agentId: claim.agentId,
+      operationId: claim.operationId, operationVersion: claim.operationVersion, requestHash: claim.requestHash, inputHash: claim.inputHash }
+    throwsCode(() => store.reconcileUnknownFromReceipt(binding, { summary: 'done', completion: 'done' }), 'INVALID_PROOF')
+    assert.equal(store.get(USER, proposal.id).state, 'executing')
+    store.finish(claim, 'unknown', { summary: 'check receipt', completion: 'accepted' })
+    assert.deepEqual(store.unknownReceiptBinding(USER, proposal.id), binding)
+    for (const changed of [{ inputHash: 'f'.repeat(64) }, { requestHash: 'e'.repeat(64) }, { sessionId: 'different' }, { agentId: 'different' }, { operationVersion: 2 }]) {
+      throwsCode(() => store.reconcileUnknownFromReceipt({ ...binding, ...changed }, { summary: 'done', completion: 'done' }), 'INVALID_PROOF')
+      assert.equal(store.get(USER, proposal.id).state, 'unknown')
+    }
+    throwsCode(() => store.prepare(input({ idempotencyKey: 'still-blocked' })), 'RECONCILIATION_REQUIRED')
+    store.reconcileUnknownFromReceipt(binding, { summary: 'committed', completion: 'done' })
+    assert.equal(store.get(USER, proposal.id).state, 'succeeded')
+    assert.equal((materials(fixture.dbPath, proposal.id) as { sealed: unknown }).sealed, null)
+    store.prepare(input({ idempotencyKey: 'new-explicit-approval' }))
+  } finally { store.close() }
+})

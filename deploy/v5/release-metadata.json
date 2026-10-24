@@ -191,7 +191,8 @@
     "0321_community_tutorial_moderation",
     "0322_selfhost_literature_captcha_requests",
     "0323_turn_dispatches_trace_id",
-    "0326_community_tutorial_revisions"
+    "0326_community_tutorial_revisions",
+    "0327_system_action_receipts"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

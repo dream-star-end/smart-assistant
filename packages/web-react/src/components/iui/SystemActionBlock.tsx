@@ -129,6 +129,16 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
     } catch { if (scope.current === key) { setError('结果尚未核实，请刷新状态，勿重复执行。'); void refresh() } }
     finally { if (scope.current === key) setBusy(false) }
   }
+  async function reconcile() {
+    if (!actions?.reconcile || !allowed || busy || detail?.state !== 'unknown') return
+    const key = scopeKey
+    setBusy(true); setError('')
+    try {
+      const result = await actions.reconcile(proposalId)
+      if (scope.current === key && result.id === proposalId) setRecord({ scope: key, detail: { ...detail, ...result, preview: null } })
+    } catch { if (scope.current === key) setError('暂时无法核对结果，请稍后再试；不要重复执行。') }
+    finally { if (scope.current === key) setBusy(false) }
+  }
   async function deny() {
     if (!actions || !allowed || busy || detail?.state !== 'prepared') return
     const key = scopeKey
@@ -152,6 +162,7 @@ export function SystemActionBlock({ proposalId, readOnly = false }: { proposalId
         {detail?.state === 'unknown' && <p className="text-body text-muted">先核对实际结果，再决定下一步；请勿重复执行。</p>}
         {error && <p className="text-body text-muted" role="alert">{error}</p>}
         {allowed && <div className="flex flex-wrap justify-end gap-2">
+          {detail?.state === 'unknown' && actions?.reconcile && <Button variant="secondary" size="sm" className="oc-iui-btn" loading={busy} onClick={() => void reconcile()}>核对结果</Button>}
           {detail?.state === 'prepared' && !expired && <>
             <Button size="sm" variant="ghost" className="oc-iui-btn" disabled={busy} onClick={() => void deny()}>暂时不用</Button>
             <Button size="sm" variant="accent" className="oc-iui-btn is-primary" loading={busy} onClick={() => void openConfirmation()}>查看并确认</Button>

@@ -83,6 +83,7 @@ export function useSystemActionCardActions(input: {
       getConfirmation: async id => (await getClient()).getConfirmation(id),
       confirm: async (id, proof) => (await getClient()).confirm(id, proof),
       deny: async id => (await getClient()).deny(id),
+      reconcile: async id => (await getClient()).reconcile(id),
     }
   }, [auth, authRef, userId, demo, deviceId, epoch, generation])
   return { systemActions, preferencesRevision }

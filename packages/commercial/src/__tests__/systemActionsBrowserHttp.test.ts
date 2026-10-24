@@ -16,10 +16,12 @@ import { HttpError } from '../http/util.js'
 import type { QueryRunner } from '../db/queries.js'
 const origin = 'https://synthetic-browser.example'
 const secret = 'synthetic-system-actions-http-secret-only'
-async function fixture(t: import('node:test').TestContext, options: { executor?: SystemActionExecutor; owner?: string } = {}) {
+async function fixture(t: import('node:test').TestContext, options: { executor?: SystemActionExecutor; owner?: string; uncertain?: boolean } = {}) {
   let effects = 0
   let active = true
   let deleted = false
+  let receiptReady = false
+  let lookups = 0
   const refresh = issueRefresh()
   const family = randomUUID()
   const access = await signAccess({ sub: '765', role: 'user' }, secret)
@@ -32,9 +34,12 @@ async function fixture(t: import('node:test').TestContext, options: { executor?:
       title: '隔离通知设置', description: '只修改本测试的内存计数。', scope: '独立测试', before: [], after: [], destructive: false,
       consequences: ['不登录产品、不发送消息、不访问真实账号。'], price: { kind: 'none', label: '无费用' },
     } }),
-    execute: async () => { effects++; return { summary: '隔离操作完成', completion: 'done' } },
+    execute: async () => { effects++; if (options.uncertain) throw new Error('synthetic lost effect reply'); return { summary: '隔离操作完成', completion: 'done' } },
   }])
-  const service = new SystemActionsService(ledger, registry, randomUUID())
+  const service = new SystemActionsService(ledger, registry, randomUUID(), async binding => {
+    lookups++; assert.equal(binding.userId, '765'); assert.match(binding.requestHash!, /^[a-f0-9]{64}$/)
+    return receiptReady ? { summary: '已核对隔离回执', completion: 'done' } : null
+  })
   const proposal = await service.prepare({ userId: options.owner ?? '765', role: 'user', sessionId: 'synthetic-session', agentId: 'main' }, 'fixture.notification', { enabled: false }, randomUUID())
   const runner = { async query(sql: string, params: unknown[]) {
     assert.ok(sql.trimStart().startsWith('SELECT '))
@@ -73,7 +78,7 @@ async function fixture(t: import('node:test').TestContext, options: { executor?:
   }
   const read = `/api/me/system-actions/${proposal.id}`
   const write = `/api/auth/system-actions/${proposal.id}`
-  return { call, read, write, id: proposal.id, effects: () => effects, deactivate: () => { active = false }, softDelete: () => { deleted = true } }
+  return { call, read, write, id: proposal.id, effects: () => effects, lookups: () => lookups, publishReceipt: () => { receiptReady = true }, deactivate: () => { active = false }, softDelete: () => { deleted = true } }
 }
 test('only the real browser proof can approve; replay returns the original single effect and owner receipt', async t => {
   const f = await fixture(t)
@@ -145,4 +150,31 @@ test('soft-deleted active accounts cannot read an existing proposal preview or r
   assert.equal((await f.call(f.read)).status, 403)
   assert.equal((await f.call(`${f.read}/result`)).status, 403)
   assert.equal(f.effects(), 0)
+})
+test('receipt reconciliation requires an independent browser gesture and never calls the business executor', async t => {
+  const f = await fixture(t, { uncertain: true })
+  const detail = await f.call(f.read)
+  const input = { deviceId: randomUUID(), previewHash: detail.body.previewHash }
+  const challenge = await f.call<{ nonce: string }>(`${f.write}/challenge`, input)
+  assert.equal((await f.call(`${f.write}/confirm`, { ...input, nonce: challenge.body.nonce })).body.state, 'unknown')
+  assert.equal(f.effects(), 1)
+  assert.equal((await f.call(`${f.write}/reconcile`, {}, { cookie: false })).status, 403)
+  assert.equal((await f.call(`${f.write}/reconcile`, { result: { completion: 'done' } })).status, 400)
+  assert.equal(f.lookups(), 0)
+  assert.equal((await f.call(`${f.write}/reconcile`, {})).body.state, 'unknown')
+  f.publishReceipt()
+  assert.equal((await f.call(`${f.write}/reconcile`, {})).body.state, 'succeeded')
+  assert.equal((await f.call(`${f.write}/reconcile`, {})).body.state, 'succeeded')
+  assert.equal(f.lookups(), 2)
+  assert.equal(f.effects(), 1)
+})
+test('prepared, foreign and inactive records cannot invoke receipt reconciliation', async t => {
+  const own = await fixture(t)
+  assert.equal((await own.call(`${own.write}/reconcile`, {})).body.state, 'prepared')
+  assert.equal(own.lookups(), 0)
+  own.deactivate()
+  assert.equal((await own.call(`${own.write}/reconcile`, {})).status, 403)
+  const foreign = await fixture(t, { owner: '8000000000000000000' })
+  assert.equal((await foreign.call(`${foreign.write}/reconcile`, {})).status, 404)
+  assert.equal(foreign.lookups(), 0)
 })

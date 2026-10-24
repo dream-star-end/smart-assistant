@@ -15,6 +15,7 @@ export type SystemActionsClient = {
   getConfirmation(id: string): Promise<{ detail: SystemActionDetail; nonce: string }>
   confirm(id: string, proof: { nonce: string; previewHash: string }): Promise<SystemActionSummary>
   deny(id: string): Promise<SystemActionSummary>
+  reconcile(id: string): Promise<SystemActionSummary>
 }
 function invalidResponse(): never {
   throw new ApiError({ status: 502, code: 'SYSTEM_ACTION_INVALID_RESPONSE', message: '这项操作无法核验，请刷新状态。' })
@@ -69,7 +70,7 @@ export function createSystemActionsApi(options: {
     if (!UUID.test(id)) staleConfirmation()
     return `/api/me/system-actions/${encodeURIComponent(id)}${suffix}`
   }
-  function approvalPath(id: string, action: 'challenge' | 'confirm' | 'deny'): string {
+  function approvalPath(id: string, action: 'challenge' | 'confirm' | 'deny' | 'reconcile'): string {
     if (!UUID.test(id)) staleConfirmation()
     return `/api/auth/system-actions/${encodeURIComponent(id)}/${action}`
   }
@@ -132,6 +133,10 @@ export function createSystemActionsApi(options: {
       issued.delete(id)
       if (!expected || expected.nonce !== proof.nonce || expected.previewHash !== proof.previewHash || expected.expiresAt <= Date.now()) staleConfirmation()
       return observe(await request(approvalPath(id, 'confirm'), value => summary(value, id), { deviceId, nonce: proof.nonce, previewHash: proof.previewHash }))
+    },
+    async reconcile(id) {
+      assertCurrent(); issued.delete(id)
+      return observe(await request(approvalPath(id, 'reconcile'), value => summary(value, id), {}))
     },
     async deny(id) {
       assertCurrent(); issued.delete(id)

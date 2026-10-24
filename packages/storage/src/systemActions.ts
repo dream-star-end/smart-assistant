@@ -44,11 +44,16 @@ export interface SystemActionExecution {
   sessionId: string
   agentId: string
   executionNonce: string
+  /** Immutable request and frozen-input digests, never an execution grant. */
+  requestHash: string | null
+  inputHash: string
   args: unknown
   preview: SystemActionPreview
   quoteHash: string | null
   expectedVersion: string | null
 }
+export type SystemActionReceiptBinding = Pick<SystemActionExecution,
+  'id' | 'userId' | 'sessionId' | 'agentId' | 'operationId' | 'operationVersion' | 'requestHash' | 'inputHash'>
 interface Row {
   id: string; user_id: string; session_id: string; agent_id: string
   operation_id: string; operation_version: number; executor: SystemActionExecutor
@@ -98,6 +103,15 @@ function validatePreview(p: SystemActionPreview): void {
   if (p.price.kind === 'usage' && !p.price.rates?.length) throw new SystemActionError('INVALID_INPUT')
   for (const row of p.price.rates ?? []) { required(row.label, 500); content(row.value, 4000) }
   if (p.price.note !== undefined) content(p.price.note, 4000)
+}
+
+function validatedResult(result: SystemActionResult): SystemActionResult {
+  required(result.summary, 4000)
+  const safeResult: SystemActionResult = { summary: result.summary, completion: result.completion }
+  if (result.code !== undefined) { required(result.code, 200); safeResult.code = result.code }
+  if (result.effectReference !== undefined) { required(result.effectReference, 512); safeResult.effectReference = result.effectReference }
+  if (!['done','accepted','awaiting_user'].includes(result.completion)) throw new SystemActionError('INVALID_INPUT')
+  return safeResult
 }
 
 export class SystemActionStore {
@@ -271,7 +285,7 @@ export class SystemActionStore {
         executorId, this.now(), id, userId, r.approval_hash, proof.previewHash, this.now()).changes
       if (changed !== 1) throw new SystemActionError('CONFLICT')
       if (browser) return { browserGrant: nonce, action: this.summary(this.row(userId, id)) }
-      return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
+      return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, requestHash: r.request_hash, inputHash: r.input_hash, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
     }).immediate()
   }
   renewBrowserGrant(userId: string, id: string, deviceId: string): string {
@@ -295,7 +309,7 @@ export class SystemActionStore {
       const body = this.open(r)
       const nonce = randomBytes(32).toString('base64url')
       if (this.db.prepare("UPDATE system_actions SET state='executing',grant_hash=NULL,execution_hash=?,executor_id=?,updated_at=? WHERE id=? AND user_id=? AND state='approved_waiting_browser' AND grant_hash=? AND expires_at>?").run(digest(nonce), executorId, this.now(), id, userId, r.grant_hash, this.now()).changes !== 1) throw new SystemActionError('CONFLICT')
-      return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
+      return { id, userId, executorId, operationId: r.operation_id, operationVersion: r.operation_version, sessionId: r.session_id, agentId: r.agent_id, executionNonce: nonce, requestHash: r.request_hash, inputHash: r.input_hash, args: body.args, preview: body.preview, quoteHash: r.quote_hash, expectedVersion: r.expected_version }
     }).immediate()
   }
   deny(userId: string, id: string): SystemActionSummary {
@@ -309,15 +323,30 @@ export class SystemActionStore {
   }
   finish(handle: Pick<SystemActionExecution, 'id' | 'userId' | 'executorId' | 'executionNonce'>, state: 'succeeded' | 'failed' | 'unknown', result: SystemActionResult): SystemActionSummary {
     if (!['succeeded','failed','unknown'].includes(state)) throw new SystemActionError('INVALID_INPUT')
-    required(result.summary, 4000)
-    const safeResult: SystemActionResult = { summary: result.summary, completion: result.completion }
-    if (result.code !== undefined) { required(result.code, 200); safeResult.code = result.code }
-    if (result.effectReference !== undefined) { required(result.effectReference, 512); safeResult.effectReference = result.effectReference }
-    if (!['done','accepted','awaiting_user'].includes(result.completion)) throw new SystemActionError('INVALID_INPUT')
+    const safeResult = validatedResult(result)
     return this.db.transaction(() => {
       const r = this.row(handle.userId, handle.id)
       if (r.state !== 'executing' || r.executor_id !== handle.executorId || !sameHash(r.execution_hash, handle.executionNonce)) throw new SystemActionError('INVALID_PROOF')
       this.clearTerminal(r.id, r.user_id, state, safeResult)
+      return this.summary(this.row(r.user_id, r.id))
+    }).immediate()
+  }
+  /** Host-only positive receipt binding. Unknown rows have already discarded executable arguments. */
+  unknownReceiptBinding(userId: string, id: string): SystemActionReceiptBinding | null {
+    const r = this.row(userId, id)
+    if (r.state !== 'unknown' || !r.request_hash) return null
+    return { id: r.id, userId: r.user_id, sessionId: r.session_id, agentId: r.agent_id,
+      operationId: r.operation_id, operationVersion: r.operation_version, requestHash: r.request_hash, inputHash: r.input_hash }
+  }
+  /** Trusted receipt lookup only: no grant, rerun, current-value inference or live-executor takeover. */
+  reconcileUnknownFromReceipt(binding: SystemActionReceiptBinding, result: SystemActionResult): SystemActionSummary {
+    const safeResult = validatedResult(result)
+    return this.db.transaction(() => {
+      const r = this.row(binding.userId, binding.id)
+      if (r.state !== 'unknown' || !r.request_hash || r.request_hash !== binding.requestHash || r.input_hash !== binding.inputHash
+        || r.session_id !== binding.sessionId || r.agent_id !== binding.agentId || r.operation_id !== binding.operationId
+        || r.operation_version !== binding.operationVersion) throw new SystemActionError('INVALID_PROOF')
+      this.clearTerminal(r.id, r.user_id, 'succeeded', safeResult)
       return this.summary(this.row(r.user_id, r.id))
     }).immediate()
   }
