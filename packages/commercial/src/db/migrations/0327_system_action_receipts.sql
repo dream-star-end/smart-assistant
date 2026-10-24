@@ -14,10 +14,7 @@ CREATE TABLE IF NOT EXISTS system_action_receipts (
   committed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 CREATE INDEX IF NOT EXISTS system_action_receipts_owner ON system_action_receipts(user_id, committed_at);
--- compat: Only the new additive receipt table is granted/hardened; old binaries never name it and existing object privileges are unchanged.
-DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='openclaude_app') THEN
-    GRANT SELECT, INSERT ON system_action_receipts TO openclaude_app;
-    REVOKE UPDATE, DELETE, TRUNCATE ON system_action_receipts FROM openclaude_app;
-  END IF;
-END $$;
+-- compat: Only this new additive table is granted to the current migration owner; old objects are unchanged.
+GRANT SELECT, INSERT ON system_action_receipts TO CURRENT_USER;
+-- compat: Only this new additive table is hardened; application role is the same trusted owner used by the deployment migration.
+REVOKE UPDATE, DELETE, TRUNCATE ON system_action_receipts FROM CURRENT_USER;
