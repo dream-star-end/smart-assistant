@@ -269,8 +269,8 @@ export function useComposerSend({
         ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
         ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
       },{useCachedRequestId:true,allowOfflineQueue:true,
-        interactive:!target||selectedSessionIdRef.current===sessionId,
-        isCurrent:target?()=>recoveryIdentityIsCurrent()&&!!sockRef.current?.getSession(sessionId):recoveryIsCurrent}):undefined;
+        canPrompt:recoveryIsCurrent,
+        isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
       if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
       const materializedDraft =
         !createdSession && (

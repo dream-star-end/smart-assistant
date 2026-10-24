@@ -162,7 +162,7 @@ export function createModelSwitchCostAuthorizer({
         if (!current()) return null
         let choice: ConfirmChoice = true
         if (q.requiresConfirmation || opts.notice) {
-          if (opts.interactive === false) return null
+          if (opts.interactive === false || opts.canPrompt?.() === false) return null
           const notice = opts.notice
           choice = await confirmDialog({
             title: notice?.title ?? '切换模型？',
@@ -181,7 +181,7 @@ export function createModelSwitchCostAuthorizer({
             altText: notice?.altText,
             confirmDisabled: !q.canConfirm,
           })
-          if (choice === false || !current()) return null
+          if (choice === false || !current() || opts.canPrompt?.() === false) return null
           if (q.requiresConfirmation) {
             if (!q.quoteToken) return null
             q = checkedQuote(

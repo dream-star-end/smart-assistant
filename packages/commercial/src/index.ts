@@ -1,4 +1,5 @@
-import {ModelSwitchCostService,ModelSwitchCostError} from './billing/modelSwitchCost.js';
+import {makeModelSwitchCostTargetResolver} from './billing/modelSwitchCostTarget.js';
+import {ModelSwitchCostService} from './billing/modelSwitchCost.js';
 import { assembleSystemActions } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
@@ -4410,19 +4411,7 @@ export async function registerCommercial(
   const modelSwitchCost = new ModelSwitchCostService({
     pool:getPool(),pricing,secret:jwtSecret,
     sourceEngine:(id)=>peekModelCatalogCache()?.current().resolve(id)?.engine??null,
-    resolveTarget:async(uid,id)=>{
-      const catalog=peekModelCatalogCache();
-      if(!catalog)throw new ModelSwitchCostError('MODEL_SWITCH_UNAVAILABLE','模型价格暂不可用，请重试');
-      const snapshot=await catalog.assertFresh();const canonical=snapshot.aliasToCanonical(id);
-      const authz=await loadUserModelAuthz(BigInt(uid),snapshot.securityEpoch);
-      if(!snapshot.canUseModel(scopeFromAuthz(uid,authz),canonical))throw new ModelSwitchCostError('UNAUTHORIZED_MODEL','无权使用目标模型');
-      const descriptor=snapshot.resolve(canonical);const price=snapshot.billingPricingFor(canonical);
-      if(!descriptor||!price)throw new ModelSwitchCostError('MODEL_NOT_AVAILABLE','目标模型当前不可用');
-      return {pricing:price,engine:descriptor.engine,contextWindow:descriptor.contextWindow??0,
-        canonicalize:(model:string)=>snapshot.aliasToCanonical(model),
-        sourcePricing:(model:string)=>snapshot.billingPricingFor(snapshot.aliasToCanonical(model)),
-        sourceEngine:(model:string)=>snapshot.resolve(snapshot.aliasToCanonical(model))?.engine??null};
-    },
+    resolveTarget:makeModelSwitchCostTargetResolver(loadUserModelAuthz),
   });
   if (process.env.OC_SYSTEM_ACTIONS_ENABLED === '1') {
     if (runtimeChannel !== 'v5' || flavorIdentity.status !== 'ok' || flavorIdentity.flavor !== 'selfhost' || !v3Deps) {

@@ -42,3 +42,40 @@ test('bounded short fixture estimate remains below the mandatory warning thresho
   expect((await authorize(input))?.requestId).toBe(input.requestId)
   expect(confirmDialog).not.toHaveBeenCalled()
 })
+
+test('navigation preserves a submitted cheap task but never opens its fee prompt in another session', async () => {
+  const input = {
+    sessionId: 'A',
+    requestId: 'm-frozen-task',
+    targetModel: 'gpt-6-astra',
+    agentId: 'main',
+  }
+  for (const requiresConfirmation of [false, true]) {
+    let resolve!: (value: ReturnType<typeof fixtureSwitchQuote>) => void
+    vi.spyOn(api, 'modelSwitchCost').mockImplementation(
+      () =>
+        new Promise((r) => {
+          resolve = r
+        }),
+    )
+    const confirmDialog = vi.fn()
+    let selected = true
+    const authorize = createModelSwitchCostAuthorizer({
+      authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+      confirmDialog,
+      toast: vi.fn(),
+    })
+    const pending = authorize(input, { isCurrent: () => true, canPrompt: () => selected })
+    selected = false
+    resolve({
+      ...fixtureSwitchQuote(input),
+      requiresConfirmation,
+      ...(requiresConfirmation ? { quoteToken: 'fixture-quote' } : {}),
+    })
+    const result = await pending
+    if (requiresConfirmation) expect(result).toBeNull()
+    else expect(result?.requestId).toBe(input.requestId)
+    expect(confirmDialog).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+  }
+})

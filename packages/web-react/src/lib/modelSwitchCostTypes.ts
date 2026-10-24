@@ -17,6 +17,7 @@ export type AuthorizeSwitch = (
     useCachedRequestId?: boolean
     consent?: string
     isCurrent?: () => boolean
+    canPrompt?: () => boolean
   },
 ) => Promise<SwitchAuthorization | null>
 export interface ModelSwitchCostClientDeps {
