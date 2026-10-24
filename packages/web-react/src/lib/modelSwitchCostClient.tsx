@@ -67,7 +67,8 @@ export function ModelSwitchCostSummary({ quote: q }: { quote: ModelSwitchCostQuo
         <>
           <p className="font-medium text-foreground">无法预估本轮费用</p>
           <p>
-            当前引擎没有可靠的上下文计数，切换后第一轮可能明显更贵。确认后将使用 {q.targetName}。
+            当前输入或重建上下文缺少可靠计数，切换后第一轮可能明显更贵。确认后将使用 {q.targetName}
+            。
           </p>
           {q.targetUnitPrice ? (
             <p>

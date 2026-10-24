@@ -38,6 +38,8 @@ function db(
             },
           ],
         }
+      if (sql.includes('model-switch-history-shape'))
+        return { rows: [{ peak_tokens: '200460', has_unknown: false, has_shrunk: false }] }
       if (sql.includes('FROM client_session_turn_tapes')) return { rows: tapes }
       if (sql.includes('EXISTS(SELECT 1 FROM usage_records')) {
         assert.ok(sql.includes('u.model<>'))
@@ -156,6 +158,25 @@ test('late child and delegate continuation invalidate old small parent counts wi
       targetModel: 'gpt-6-astra',
     })
     assert.equal(context.sourceModel, 'cheap')
+    assert.equal(context.source, 'unknown')
+    assert.equal(context.tokens, null)
+  }
+})
+
+test('native shrink/compact and incomplete historical counters use B without hydrating history', async () => {
+  for (const shape of [
+    { peak_tokens: '900000', has_unknown: false, has_shrunk: false },
+    { peak_tokens: '200460', has_unknown: false, has_shrunk: true },
+    { peak_tokens: '200460', has_unknown: true, has_shrunk: false },
+  ]) {
+    const old = db([tape('2', 'cheap')])
+    const pool = {
+      query: async (sql: string, params: unknown[]) =>
+        sql.includes('model-switch-history-shape') ? { rows: [shape] } : old.query(sql, params),
+    } as unknown as Pool
+    const context = await readSwitchContext(pool, '765', 'own', 'm-compact-guard', {
+      targetModel: 'gpt-6-astra',
+    })
     assert.equal(context.source, 'unknown')
     assert.equal(context.tokens, null)
   }

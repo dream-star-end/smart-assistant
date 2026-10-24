@@ -226,6 +226,7 @@ export async function readSwitchContext(
   let lastOutputTokens = 0
   let warmRatio = 0
   let latestCall: string | null = null
+  let latestCallTotal: number | null = null
   const calls = new Set<string>()
   for (const record of records) {
     if (record.payload === null) {
@@ -258,10 +259,48 @@ export async function readSwitchContext(
       tokens = input + read + write
       lastOutputTokens = output
       latestCall = call.callId
+      latestCallTotal = count(call.usage.totalTokens) ?? tokens + output
       warmRatio = tokens ? (read + write) / tokens : 0
     }
   }
   if (tokens === null || !Number.isSafeInteger(tokens) || tokens <= 0) return base
+  // Historical aggregate usage is only an uncertainty sentinel, never the
+  // quoted context count. A native compact/reset can shrink the latest call
+  // while the lossless history rebuilt by another model remains much larger.
+  if (
+    latestCallTotal === null ||
+    !Number.isSafeInteger(latestCallTotal) ||
+    latestCallTotal < tokens
+  )
+    return base
+  const shape = (
+    await pool.query<{
+      peak_tokens: string | null
+      has_unknown: boolean | null
+      has_shrunk: boolean | null
+    }>(
+      `WITH headers AS ( /* model-switch-history-shape */
+       SELECT created_at,tape_id,status,finalized_at,
+         CASE WHEN jsonb_typeof(usage->'totalTokens')='number' AND (usage->>'totalTokens')~'^[0-9]+$'
+           THEN (usage->>'totalTokens')::numeric ELSE NULL END AS tokens
+       FROM client_session_turn_tapes WHERE session_id=$1 AND user_id=$2
+         AND parent_turn_key IS NULL AND continuation_of_turn_key IS NULL
+         AND (usage->>'model') IS DISTINCT FROM 'gpt-image-2'
+     ), ordered AS (
+       SELECT *,max(tokens) OVER(ORDER BY created_at,tape_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_peak FROM headers
+     ) SELECT max(tokens)::text AS peak_tokens,
+       bool_or(tokens IS NULL OR status<>'completed' OR finalized_at IS NULL) AS has_unknown,
+       bool_or(tokens<prior_peak) AS has_shrunk FROM ordered`,
+      [sessionId, owner],
+    )
+  ).rows[0]
+  if (
+    !shape?.peak_tokens ||
+    shape.has_unknown ||
+    shape.has_shrunk ||
+    BigInt(shape.peak_tokens) > BigInt(latestCallTotal)
+  )
+    return base
   return {
     ...base,
     tokens,
