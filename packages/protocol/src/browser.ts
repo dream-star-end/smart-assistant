@@ -50,11 +50,6 @@ export * from './upstreamRetryHint.js'
 
 export * from './promptPrivacy.js'
 export * from './systemActions.js'
-export type {
-  CcbTranscriptRestoreBinding,
-  CcbNativeRestoreRecord,
-  CcbNativeRestoreTape,
-  CcbNativeTranscriptArchive,
-} from './ccbTranscriptRestore.js'
+export * from './ccbTranscriptRestore.js'
 
 export * from './systemHelp.js'
