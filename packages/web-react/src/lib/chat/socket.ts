@@ -147,7 +147,9 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
+  StudioEventWire,
 } from "./frames";
+import { emitStudioPush } from "../studio/push";
 import { incidentStore } from "../incidentStore";
 import {
   type AutomaticTurnRecoverySnapshot,
@@ -2260,6 +2262,14 @@ export class ChatSocket {
         }
       }
 
+      // OCV5-593 FE-6: sys.studio_event is live-only too; whatever changed while the socket was
+      // down is picked up by reloading the open studio project.
+      try {
+        emitStudioPush(null);
+      } catch {
+        /* a studio listener failing must not break the socket open path */
+      }
+
       // 4s grace 主动 reconcile（§4 + S1 无条件对账）：等 replay 先赢，再 REST 补静默丢失。
       // 恒 arm（不再仅在有 in-flight 时）——即使本次重连没有 in-flight，也要对账当前选中会话，
       // 追回锁屏/死链期间静默丢失且 resume 覆盖不到的内容（用户报障②的另一半）。
@@ -2686,6 +2696,12 @@ export class ChatSocket {
       }
       case "sys.media_job": {
         this.deps.onMediaJob?.(f as MediaJobWire);
+        return;
+      }
+      case "sys.studio_event": {
+        // OCV5-593 FE-6: the open studio project reloads its view (useStudioProject).
+        const frame = f as StudioEventWire;
+        if (typeof frame.projectId === "string") emitStudioPush(frame.projectId);
         return;
       }
       case "sys.recovery_decision": {
