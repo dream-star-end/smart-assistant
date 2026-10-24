@@ -20,7 +20,7 @@ loadBeforeAll(() => Promise.all([prefetchMarkdownImpl(), preloadToolBody()]))
 beforeEach(() => { __resetIntelligentUiForTests({ pref: true }); __resetBlogChatForTests() })
 afterEach(() => { cleanup(); __resetIntelligentUiForTests(); __resetBlogChatForTests() })
 const draft = JSON.stringify({ type: 'blog_draft', draft_id: 'policy-test', version: 1, title: '分享经验', summary: '流程说明', category: '编程', body: '这是分享经验的正文。' })
-const fence = '```ui\n' + draft + '\n```'
+const fence = `\`\`\`ui\n${draft}\n\`\`\``
 const row = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({ id, role, text, ts: 1700000000000, ...extra })
 function fixture() {
   const read = vi.fn(() => new Promise<never>(() => {}))
