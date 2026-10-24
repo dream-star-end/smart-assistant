@@ -571,6 +571,7 @@ describe('通知抛异常不影响 run 收尾', () => {
     const { ticket } = seedAwaitReady(db)
     const delegate: PatrolDelegateFn = async () => ({ ok: true, output: '本阶段已完成。' })
     const eng = new PatrolEngine({
+      preflightStages: async (stages) => stages.map(() => null),
       getDb: () => db,
       delegate,
       now: () => WORK.getTime(),

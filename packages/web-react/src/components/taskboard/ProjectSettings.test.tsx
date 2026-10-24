@@ -62,3 +62,25 @@ describe("ProjectSettings workspaceSpec", () => {
     expect(screen.getByTestId("project-workspace-path")).toBeTruthy();
   });
 });
+
+
+test('new builtin stages require an explicit helper; empty projects need none', async () => {
+  const auth = createMemoryAuthSession(() => {}, 'tok')
+  const create = vi.fn(async (_input: unknown) => null)
+  render(<ToastProvider><ProjectSettings auth={auth} agents={[{ id: 'installed', name: '已装助手' }]}
+    current={null} mode="create" onCreate={create} onPatch={async () => null}
+    onArchive={async () => false} onUnarchive={async () => false} /></ToastProvider>)
+  fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'BIND' } })
+  fireEvent.change(screen.getByTestId('project-name'), { target: { value: '明确助手' } })
+  expect(screen.getByTestId('project-create-submit')).toBeDisabled()
+  expect(screen.getByTestId('builtin-execution-agent')).toHaveValue('')
+  fireEvent.change(screen.getByTestId('builtin-execution-agent'), { target: { value: 'installed' } })
+  fireEvent.click(screen.getByTestId('project-create-submit'))
+  await vi.waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ key: 'BIND', executionAgentId: 'installed', templateIds: undefined })))
+  create.mockClear()
+  for (const id of ['bug', 'feature', 'spike', 'chore']) fireEvent.click(screen.getByTestId(`project-template-builtin:${id}`))
+  expect(screen.queryByTestId('builtin-execution-agent')).toBeNull()
+  fireEvent.click(screen.getByTestId('project-create-submit'))
+  await vi.waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ templateIds: [] })))
+  expect(create.mock.calls[0]?.[0]).not.toHaveProperty('executionAgentId')
+})
