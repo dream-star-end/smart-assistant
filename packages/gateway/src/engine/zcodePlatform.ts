@@ -27,6 +27,7 @@ export interface ZcodePlatformArtifacts {
 export interface CreateZcodePlatformArtifactsInput {
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -89,6 +90,7 @@ export function createZcodePlatformArtifacts(
         `${issueDelegateContextToken({
           agentId: input.agentId,
           sessionKey: input.sessionKey,
+          traceId: input.traceId,
           depth: input.delegationDepth,
         })}\n`,
       )

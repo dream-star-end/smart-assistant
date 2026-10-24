@@ -157,6 +157,8 @@ export type DelegateJobWaitView =
 export type DelegateCreateMeta = {
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   queued?: boolean
   kind?: DelegateJobKind
   callback?: DelegateCallback
@@ -175,6 +177,8 @@ export type DelegateJobSnapshot = {
   state: DelegateJobState
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   failureClass?: DelegateFailureClass
   failureDetail?: string
   claimToken?: string
@@ -214,6 +218,8 @@ type JobEntry = {
   expiresAt: number | null
   sessionKey?: string
   parentSessionKey?: string
+  traceId?: string
+  parentTraceId?: string
   result: DelegateJobHttpResult | null
   waiters: Array<(view: DelegateJobWaitView) => void>
   state: DelegateJobState
@@ -411,6 +417,8 @@ export class DelegateJobStore {
       expiresAt: null,
       sessionKey: meta?.sessionKey,
       parentSessionKey: meta?.parentSessionKey,
+      traceId: meta?.traceId,
+      parentTraceId: meta?.parentTraceId,
       result: null,
       waiters: [],
       state: queued ? 'queued' : 'running',
@@ -707,6 +715,22 @@ export class DelegateJobStore {
     if (job.state === 'running' && job.ownerInstanceId === this.bootId) {
       draft.ownerLeaseUntil = now + this.leaseMs
     }
+    return this.commit(job, draft, false)
+  }
+
+  /** Bind observation identity only while the exact running owner still holds the job. */
+  bindTrace(
+    jobId: string,
+    trace: { traceId: string; parentTraceId?: string },
+    fence: { claimToken: string; fencingEpoch: number },
+  ): boolean {
+    const job = this.refreshJob(jobId)
+    if (!job || job.state !== 'running' || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) return false
+    if (job.traceId) return job.traceId === trace.traceId && job.parentTraceId === trace.parentTraceId
+    const draft = this.cloneEntry(job)
+    draft.traceId = trace.traceId
+    // Parent was frozen at enqueue; never replace it with a later session turn.
+    if (draft.parentTraceId !== trace.parentTraceId) return false
     return this.commit(job, draft, false)
   }
 
@@ -1037,6 +1061,8 @@ export class DelegateJobStore {
       createdAt: job.createdAt,
       lastActivityAt: job.lastActivityAt,
       parentSessionKey: job.parentSessionKey,
+      traceId: job.traceId,
+      parentTraceId: job.parentTraceId,
       parentEngine: job.parentEngine,
       notifyLane: job.notifyLane,
       notifyId: job.notifyId,
@@ -1061,6 +1087,8 @@ export class DelegateJobStore {
       agentId: job.agentId,
       state: job.state,
       sessionKey: job.sessionKey,
+      ...(job.traceId ? { traceId: job.traceId } : {}),
+      ...(job.parentTraceId ? { parentTraceId: job.parentTraceId } : {}),
       failureClass: job.failureClass,
       failureDetail: job.failureDetail,
       claimToken: job.claimToken,
@@ -1664,6 +1692,8 @@ export class DelegateJobStore {
       expiresAt: snap.expiresAt ?? null,
       sessionKey: snap.sessionKey,
       parentSessionKey: snap.parentSessionKey,
+      traceId: snap.traceId,
+      parentTraceId: snap.parentTraceId,
       result: snap.result ?? reconstructed,
       waiters: [],
       state: snap.state,
@@ -1719,6 +1749,8 @@ export class DelegateJobStore {
       state: row.state,
       sessionKey: row.sessionKey,
       parentSessionKey: row.parentSessionKey,
+      traceId: row.traceId,
+      parentTraceId: row.parentTraceId,
       failureClass: row.failureClass,
       failureDetail: row.failureDetail,
       claimToken: row.claimToken,
@@ -1882,6 +1914,8 @@ export class DelegateJobStore {
       expiresAt: snap.expiresAt ?? null,
       sessionKey: snap.sessionKey,
       parentSessionKey: snap.parentSessionKey,
+      traceId: snap.traceId,
+      parentTraceId: snap.parentTraceId,
       result: snap.result ?? reconstructed,
       waiters: [],
       state: snap.state,
@@ -1922,6 +1956,8 @@ export class DelegateJobStore {
       kind: job.kind,
       sessionKey: job.sessionKey,
       parentSessionKey: job.parentSessionKey,
+      traceId: job.traceId,
+      parentTraceId: job.parentTraceId,
       generation: job.generation,
       ownerInstanceId: job.ownerInstanceId,
       ownerLeaseUntil: job.ownerLeaseUntil,

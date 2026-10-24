@@ -468,6 +468,9 @@ import {
   makeDelegateEngineBillingHandler,
   type DelegateEngineBillingRuntime,
 } from "./http/internalDelegateEngineBilling.js";
+import { DELEGATE_TRACE_PATH, makeDelegateTraceHandler } from "./http/internalDelegateTrace.js";
+import { makeCommercialRuntimeStatus, type CommercialRuntimeStatus } from "./runtimeStatus.js";
+export type { CommercialRuntimeStatus } from "./runtimeStatus.js";
 import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
 import {
   applyAutoDreamPreferenceAction,
@@ -504,7 +507,6 @@ import {
   peekModelCatalogCache,
 } from "./billing/modelCatalogRuntime.js";
 import {
-  MASTER_CAPABILITIES,
   assertModelAuthorityCutoverFloor,
 } from "./runtimeCapabilities.js";
 import {
@@ -550,7 +552,6 @@ import {
   DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
 } from "./dispatch/turnDispatchReconciler.js";
 import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
-import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
@@ -887,35 +888,6 @@ function shouldAutoMigrate(
  * 经 RegisterCommercialResult 暴露给 gateway,gateway 仅在 /healthz 透传序列化。
  * 用作"控制面是否静默 / 容器·agent 运行时是否启用 / 灰度归属(channel)"的只读断言面。
  */
-export interface CommercialRuntimeStatus {
-  /** 运行时 channel 单一权威(OC_RUNTIME_CHANNEL),默认 "v3"。 */
-  channel: string;
-  /** 后台控制面 mutator 是否启用(v5 follower 恒为 false)。 */
-  controlPlaneEnabled: boolean;
-  /** 启动是否执行了共享 PG migration(COMMERCIAL_AUTO_MIGRATE)。 */
-  autoMigrate: boolean;
-  /** legacy agent 运行时(AGENT_IMAGE/docker)状态。 */
-  agentRuntime: "enabled" | "disabled";
-  /** v3 supervisor 容器运行时(OC_RUNTIME_IMAGE)状态。 */
-  containerRuntime: "enabled" | "disabled";
-  /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。live getter:反映 LeaderBundle 实时启停。 */
-  schedulers: string[];
-  /**
-   * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
-   * deploy 的四面 capability 守卫读 `/healthz` 的 `runtime.capabilities` 判断"这个 master
-   * 版本认不认模型权威协议",据此拒绝把不认的旧版本翻上来(方案 §7 步 5 兼容地板)。
-   * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
-   */
-  capabilities: string[];
-  /**
-   * P3 leader lease 归属(RFC-v5-dual-master-cohort D4)。healthz 只读断言面:
-   * state=ineligible(env kill-switch)|standby(有 env 资格但 desired 非本 slot)|
-   * acquiring|leader|fenced。env=1 不再等同 active leader(smoke 断言随之改为断言 state=leader)。
-   */
-  leadership: LeadershipStatus;
-  /** P3 lane 放量观测快照(evaluateLane 命中计数,详见 deploy/laneEvaluate.ts)。 */
-  laneMetrics: LaneMetricsSnapshot;
-}
 
 export interface RegisterCommercialResult {
   /**
@@ -2736,6 +2708,7 @@ export async function registerCommercial(
         },
         expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
       });
+      const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
         runtimeRef: delegateEngineBillingRuntimeRef,
@@ -3112,6 +3085,7 @@ export async function registerCommercial(
         if (isAutoDreamOptimizerInternalPath(path)) {
           return autoDreamOptimizerHandler(req, res, ctx, path);
         }
+        if (path === DELEGATE_TRACE_PATH) return delegateTraceHandler(req, res, ctx);
         if (isDelegateEngineBillingInternalPath(path)) {
           return delegateEngineBillingHandler(req, res, ctx, path);
         }
@@ -7165,25 +7139,15 @@ export async function registerCommercial(
     generation: null,
     leasePid: controlPlaneEnabled ? process.pid : null,
   });
-  const runtimeStatus: CommercialRuntimeStatus = {
+  const runtimeStatus = makeCommercialRuntimeStatus({
     channel: runtimeChannel,
     controlPlaneEnabled,
     autoMigrate: autoMigrateEffective,
     agentRuntime: agentRuntime ? "enabled" : "disabled",
     containerRuntime: v3Deps ? "enabled" : "disabled",
-    get schedulers(): string[] {
-      return schedulerRegistry.map((s) => s.name);
-    },
-    capabilities: [...MASTER_CAPABILITIES],
-    get leadership(): LeadershipStatus {
-      return leaderLease ? leaderLease.status() : legacyLeadership();
-    },
-    // P3 放量观测(RFC D1):lane_evaluations(请求次)+lane_users((generation,uid) 去重),
-    // operator 据此判断 promote N% 已覆盖多少活跃用户。只读快照,零成本。
-    get laneMetrics(): ReturnType<typeof getLaneMetricsSnapshot> {
-      return getLaneMetricsSnapshot();
-    },
-  };
+    schedulers: () => schedulerRegistry.map((s) => s.name),
+    leadership: () => leaderLease ? leaderLease.status() : legacyLeadership(),
+  });
   // fail-closed:非 leader 绝不允许 shared mutator 存活 —— 拦"gate 漏配让 follower 写共享现网"。
   // P3 MAJOR 5:判据从**静态 controlPlaneEnabled 改为实时 leadership**。原因:双 master 下两 slot 的
   // OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled 两 slot 都 true,`!controlPlaneEnabled` 恒 false

@@ -60,23 +60,16 @@ function retryPoolWrite(opts: {
   attempt(0);
 }
 
-export function recordTurnTrace(
-  pool: Pool | undefined,
-  warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
-  row: TurnTraceRow,
-): void {
-  if (!pool) return;
+/** Awaitable persistence seam; existing bridge callers retain fire-and-forget retries. */
+export function insertTurnTrace(pool: Pool, row: TurnTraceRow, timeoutMs?: number) {
   const version = controlPlaneIdentity();
-  retryPoolWrite({
-    delays: TURN_TRACE_WRITE_RETRY_DELAYS_MS,
-    retryOnEmpty: false,
-    run: () => pool.query(
+  const text =
       `INSERT INTO turn_traces
          (trace_id,user_id,session_key,agent_id,model,dispatch_id,request_id,
           control_plane_release,control_plane_commit,bundle_rev,client_build)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       ON CONFLICT (trace_id) DO NOTHING`,
-      [
+       ON CONFLICT (trace_id) DO NOTHING`;
+  const values = [
         row.traceId,
         row.userId.toString(),
         row.sessionKey,
@@ -88,8 +81,21 @@ export function recordTurnTrace(
         version.commit,
         row.bundleRev ?? null,
         row.clientBuild ?? null,
-      ],
-    ),
+      ];
+  const query = { text, values, query_timeout: timeoutMs };
+  return timeoutMs === undefined ? pool.query(text, values) : pool.query(query);
+}
+
+export function recordTurnTrace(
+  pool: Pool | undefined,
+  warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
+  row: TurnTraceRow,
+): void {
+  if (!pool) return;
+  retryPoolWrite({
+    delays: TURN_TRACE_WRITE_RETRY_DELAYS_MS,
+    retryOnEmpty: false,
+    run: () => insertTurnTrace(pool, row),
     onDone: (ok, err, attempts) => {
       if (ok) return;
       warn?.("turn-trace record failed", { err: String(err ?? "exhausted"), attempts });
