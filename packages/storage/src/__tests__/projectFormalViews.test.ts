@@ -52,7 +52,7 @@ async function seed(a: AuthorityPaths, label: string) {
   const memory = `---\nname: Synthetic ${label} memory\ndescription: Synthetic only\n---\nSynthetic ${label} body`
   await mkdir(a.projectMemoryDir(projectId), { recursive: true })
   await writeFile(a.projectMemoryFile(projectId, 'synthetic.md'), memory)
-  db.prepare(`INSERT INTO tb_project_memory_official(project_id,slug,content_sha256,file,event_id,updated_at) VALUES(?,?,?,?,?,?)`)
+  db.prepare('INSERT INTO tb_project_memory_official(project_id,slug,content_sha256,file,event_id,updated_at) VALUES(?,?,?,?,?,?)')
     .run(projectId, 'synthetic.md', hash(memory), 'synthetic.md', randomUUID(), 1)
   return { db, instructions, memory }
 }
@@ -68,8 +68,10 @@ test('explicit project paths validate IDs and filenames without creating the mis
   await assert.rejects(lstat(root), { code: 'ENOENT' })
 })
 test('readonly facade and frozen context use one explicit formal root without exposing writers or legacy fallback', async t => {
-  const a = await authority(), b = await authority()
-  const first = await seed(a, 'A'), second = await seed(b, 'B')
+  const a = await authority()
+  const b = await authority()
+  const first = await seed(a, 'A')
+  const second = await seed(b, 'B')
   first.db.close(); second.db.close()
   const before = await snapshot(b.root)
   const ledger = openProjectFormalReadonly(b); t.after(() => ledger.close())
@@ -127,7 +129,8 @@ test('WAL format is rejected before readonly open can create shared-memory sidec
   assert.deepEqual(await snapshot(a.root), before)
 })
 test('symlink ancestors and hardlink aliases are rejected rather than treated as independent formal storage', async () => {
-  const a = await authority(), b = await authority(); createDb(a).close()
+  const a = await authority()
+  const b = await authority() createDb(a).close()
   const alias = join(b.root, 'alias')
   await symlink(a.root, alias)
   assert.throws(() => openProjectFormalReadonly(createAuthorityPaths(alias)), /symlink/)
