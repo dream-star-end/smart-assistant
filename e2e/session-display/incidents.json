@@ -8208,7 +8208,8 @@
       "rootFixCommit": "6f345868",
       "coverageCommits": [
         "6f345868",
-        "e9a2c165"
+        "e9a2c165",
+        "0f5e6eca"
       ],
       "regressions": [
         {
@@ -8230,6 +8231,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
           "assertion": "solo first send stays queued when session creation fails and reconnect sends it once"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "first-send cost confirmation keeps the draft and commits solo only after acceptance"
         }
       ]
     }
