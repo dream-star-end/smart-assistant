@@ -81,7 +81,7 @@ export type CommunityBlogActions = Pick<CommunityBlogBusinessActions, BlogNaviga
 
 /** Navigation stays available while actual business I/O awaits verified identity. */
 export function communityBlogBusinessActions(actions?: CommunityBlogActions): CommunityBlogBusinessActions | undefined {
-  return actions && actions.precheck && actions.readContainerImage && actions.uploadImage && actions.submit && actions.getMine
+  return actions?.precheck && actions.readContainerImage && actions.uploadImage && actions.submit && actions.getMine
     ? actions as CommunityBlogBusinessActions : undefined;
 }
 

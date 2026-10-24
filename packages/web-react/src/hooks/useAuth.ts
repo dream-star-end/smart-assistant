@@ -386,7 +386,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     return () => {
       controller.abort();
     };
-  }, [booting, clearAuthState]);
+  }, [booting, commitMeUser]);
 
   const retryBoot = useCallback(() => {
     setAuthError(null);

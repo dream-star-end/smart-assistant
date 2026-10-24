@@ -16,7 +16,9 @@ it('a verified different UID suspends the old workspace but keeps valid credenti
     ? reply({ access_token: 'alice-a', user: wireUser('alice') })
     : String(url) === '/api/me' ? pendingMe.promise : reply({ accepted: true }))
   vi.stubGlobal('fetch', fetcher)
-  const onClearAuth = vi.fn(), onLogout = vi.fn(), onAccountSwitchPending = vi.fn()
+  const onClearAuth = vi.fn()
+  const onLogout = vi.fn()
+  const onAccountSwitchPending = vi.fn()
   const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth, onLogout, onAccountSwitchPending }))
   await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
   const original = view.result.current.resolvedIdentity
