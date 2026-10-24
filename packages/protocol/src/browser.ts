@@ -50,3 +50,5 @@ export * from './upstreamRetryHint.js'
 
 export * from './promptPrivacy.js'
 export * from './systemActions.js'
+
+export * from './systemHelp.js'

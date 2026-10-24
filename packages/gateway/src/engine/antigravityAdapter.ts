@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
 /**
@@ -404,6 +405,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       projectBound: Boolean(this.opts.projectId),
     })
     const projection = projectAntigravityPlatform({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
       credential: {
         accessToken: route.accessToken,
         accessTokenExpiresAt: route.accessTokenExpiresAt,
@@ -453,6 +455,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     const env: NodeJS.ProcessEnv = {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
       ...isolatedEnv,
       PATH: antigravitySpawnPath(projection.hostPathDir),
       HOME: projection.launchHome,

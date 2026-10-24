@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Experimental community ZCode CLI adapter (zcode.cjs 0.16.9; behaviour notes below were measured on 0.16.3).
@@ -1058,6 +1059,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     this.cleanupArtifacts(ctx)
     try {
       ctx.artifacts = createZcodePlatformArtifacts({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
       identityCompat: this.opts.identityCompat,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
@@ -1101,6 +1103,7 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     ctx.zcodeSessionId = this.nativeId
     if (this.nativeId) args.push('--resume', this.nativeId)
     const env: NodeJS.ProcessEnv = {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
       ...identityCompatEnvironment(this.opts.identityCompat),
       OC_AGENT_ID: this.opts.agentId,
       OPENCLAUDE_AGENT_ID: this.opts.agentId,

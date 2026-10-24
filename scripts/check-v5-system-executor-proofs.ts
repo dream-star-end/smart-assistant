@@ -19,6 +19,10 @@ const proof = spawnSync(process.execPath, ['--import', 'tsx', '--test',
   'packages/commercial/src/__tests__/systemHelpHttp.test.ts',
   'packages/commercial/src/__tests__/systemActionHttpLifetime.test.ts',
   'packages/commercial/src/__tests__/systemActionsAssembly.test.ts',
+  'packages/gateway/src/__tests__/systemHelpRelay.test.ts',
+  'packages/gateway/src/__tests__/systemHelpFrames.test.ts',
+  'packages/gateway/src/__tests__/systemHelpCli.test.ts',
+  'packages/gateway/src/__tests__/systemHelpTurnLifecycle.test.ts',
 ], { cwd: root, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: scratch, TMPDIR: scratch },
   stdio: 'inherit', timeout: 120_000 })
 if (proof.error || proof.signal || proof.status !== 0) {

@@ -1,3 +1,4 @@
+import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy } from './promptPrivacyRuntime.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
@@ -416,6 +417,7 @@ export async function submit(
      *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
      *  自取 `x-oc-local-catalog` token(方案 §3/§4),清位语义在 runner 内单一收口。 */
     modelAuthority?: TurnModelAuthority
+    systemHelpBootstrap?: string
     /** Remaining spendable credits (fen) captured at master admission. */
     creditBudgetFen?: bigint
     /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
@@ -591,6 +593,7 @@ export async function submit(
   let replayLifecycleStarted = false
   let unhandledTurnError: unknown | undefined
   const logicalTurnAbort = new AbortController()
+  let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
   if (queueTurn) {
     this._promptQueueExecutions.add(session)
@@ -1251,6 +1254,7 @@ export async function submit(
     const logicalTurnStartedAt = Date.now()
     let livenessTimer: NodeJS.Timeout | null = null
     assertSessionCurrent()
+    closeHelpLogical = getSystemHelpRelay(this)?.begin(session, opts?.systemHelpBootstrap)
     const livenessPromise = new Promise<never>((_, reject) => {
       livenessTimer = setInterval(() => {
         if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
@@ -1368,6 +1372,7 @@ export async function submit(
       throw err
     }
   } finally {
+    closeHelpLogical?.()
     clearRunnerPromptPrivacy(session.runner)
     if (
       consumingModelSwitch &&
@@ -1792,6 +1797,7 @@ export async function _getOrCreateExclusive(
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
+      systemHelpContextFile: systemHelpContextFile(this, opts.sessionKey),
       agentId: opts.agent.id,
       agentBaseDir: cwd,
       config: this.config,

@@ -1,3 +1,5 @@
+import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -173,7 +175,7 @@ import {
   isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
-import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
+import { systemHelpDispatchFields } from "../system-assistant/helpBridge.js";
 import {
   backfillDispatchTraceId,
   casAdmittedToAccepted,
@@ -971,6 +973,8 @@ async function resolveTurnExecution(
 
 export interface UserChatBridgeDeps {
   jwtSecret: string | Uint8Array;
+  /** Dedicated read/prepare help only; never a model lease or approval credential. */
+  issueSystemHelpBootstrap?: (scope: SystemHelpIdentityScope) => { token: string; expiresAt: number };
   /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
   promptQueueEnabled?: boolean;
   /** Internal queue preparation deadline; override only for focused tests. */
@@ -3101,6 +3105,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let attestState: "pending" | "ok" | "failed" = authorityOn ? "pending" : "ok";
     /** 容器 attest 是否携带 durable-turn-dispatch-v1:true 才走 dispatch 受理,否则 legacy。 */
     let containerHasDurableDispatch = false;
+    let containerHasSystemHelp = false;
     let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
     let cronOriginExecutor: CronOriginExecutor | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3182,6 +3187,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       containerChallenge = challenge;
       // capability 门:容器广播 durable-turn-dispatch-v1 才走 dispatch 受理(RFC §2.2)。
       containerHasDurableDispatch = caps.includes(DURABLE_TURN_DISPATCH_CAPABILITY);
+      containerHasSystemHelp = caps.includes(SYSTEM_HELP_CAPABILITY);
       attestState = "ok";
       if (containerHasDurableDispatch && deps.pgPool && recoveryExecutor === null) {
         recoveryExecutor = (job) => {
@@ -4153,32 +4159,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         : null;
       return cmid === null ? undefined : admittedDispatches.get(cmid);
     };
-    /** 帧注入 __oc_dispatch envelope(记录存在 + 签发基建就位才注)。mirror MODEL_AUTHORITY_FIELD。 */
-    const dispatchAuthorityField = (
-      record: AdmittedDispatch | undefined,
-    ): Record<string, unknown> => {
-      if (
-        record === undefined ||
-        authorityDeps === undefined ||
-        containerChallenge === null ||
-        containerId === undefined
-      ) {
-        return {};
-      }
-      return {
-        [DISPATCH_AUTHORITY_FIELD]: mintDispatchEnvelope(authorityDeps.signer, {
-          uid,
-          containerId,
-          sessionId: record.sessionId,
-          clientMessageId: record.clientMessageId,
-          dispatchId: record.dispatchId,
-          attemptNo: record.attemptNo,
-          payloadHash: record.requestHash,
-          billingRequestId: record.billingRequestId,
-          connectionChallenge: containerChallenge,
-        }),
-      };
-    };
+    /** Preserve the strict dispatch wire; help is a separate optional sidecar. */
+    const dispatchAuthorityField = (record: AdmittedDispatch | undefined): Record<string, unknown> =>
+      systemHelpDispatchFields({ record, signer: authorityDeps?.signer, uid, containerId,
+        connectionChallenge: containerChallenge, supported: containerHasSystemHelp,
+        issueBootstrap: deps.issueSystemHelpBootstrap, onUnavailable: () => log?.warn('system help unavailable for admitted turn'),
+      });
 
     const recordBillingRecovery = (
       requestId: string,
@@ -5240,6 +5226,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // traceId)。同步与 turnTraceIdForFrame 一起 set / 一起 null,codex IIFE / 非 codex
       // forwardInboundFrame 内的 log call 都用它,不必手写 uid/connId/traceId。
       let turnLogForFrame: Logger | null = null;
+      // Even old gateways must never receive a browser-authored help sidecar.
+      // Preserve the binary transport bit and leave non-JSON blobs unchanged.
+      if (isBinary) {
+        try {
+          const bytes = typeof data === 'string' ? Buffer.from(data) : Array.isArray(data) ? Buffer.concat(data) : Buffer.isBuffer(data) ? data : Buffer.from(data);
+          const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, SYSTEM_HELP_BOOTSTRAP_FIELD)) {
+            takeSystemHelpBootstrap(parsed);
+            passthroughData = Buffer.from(JSON.stringify(parsed), 'utf8');
+            passthroughLen = passthroughData.byteLength;
+          }
+        } catch { /* ordinary binary payloads retain their original transport */ }
+      }
       if (!isBinary) {
         let frameStr: string | null = null;
         if (typeof data === "string") frameStr = data;
@@ -5270,6 +5269,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (parsedObj.type === "inbound.goal_sync") {
               bridgeLog?.warn("user-chat-bridge: browser goal sync frame dropped");
               return;
+            }
+            if (Object.prototype.hasOwnProperty.call(parsedObj, SYSTEM_HELP_BOOTSTRAP_FIELD)) {
+              takeSystemHelpBootstrap(parsedObj);
+              const strippedStr = JSON.stringify(parsedObj);
+              passthroughData = Buffer.from(strippedStr, "utf8");
+              passthroughLen = Buffer.byteLength(strippedStr);
             }
             if (Object.prototype.hasOwnProperty.call(parsedObj, MODEL_AUTHORITY_FIELD)) {
               stripModelAuthorityField(parsedObj);

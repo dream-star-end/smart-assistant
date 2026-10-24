@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
@@ -578,6 +579,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     })
     const cwd = cwdDecision.cwd
     const platform = projectGrokPlatform({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
       identityCompat: this.opts.identityCompat,
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
@@ -618,6 +620,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
     }
     const env: NodeJS.ProcessEnv = {
+      ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port),
       ...isolatedEnv,
       PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
       OC_AGENT_ID: this.opts.agentId,
