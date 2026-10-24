@@ -72,7 +72,7 @@ it('ordinary completed cards retain their existing authenticated reads', async (
 })
 it('real readonly MessageRenderer renders the draft without inheriting business authority', async () => {
   const f = fixture()
-  render(<ToolCardActionsContext.Provider value={f.actions}><MessageRenderer m={row('draft', 'assistant', fence)} sig="readonly-draft" cb={{}} onRespondPermission={() => {}} readOnly /></ToolCardActionsContext.Provider>)
+  render(<ToolCardActionsContext.Provider value={f.actions}><MessageRenderer message={row('draft', 'assistant', fence)} sig="readonly-draft" isLast sending={false} inActiveTurn={false} cb={{}} onRespondPermission={() => {}} readOnly /></ToolCardActionsContext.Provider>)
   await screen.findByText('分享经验')
   expect(f.precheck).not.toHaveBeenCalled()
   expect(f.read).not.toHaveBeenCalled()
