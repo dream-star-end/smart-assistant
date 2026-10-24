@@ -1,3 +1,4 @@
+import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
@@ -556,15 +557,6 @@ function samePromptQueueDispatch(
     control.claimToken === request.claim.claimToken;
 }
 
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
-  const allow = new Set(allowed);
-  return Object.keys(value).every((key) => allow.has(key));
-}
 
 
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
