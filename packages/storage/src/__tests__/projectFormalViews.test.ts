@@ -130,7 +130,8 @@ test('WAL format is rejected before readonly open can create shared-memory sidec
 })
 test('symlink ancestors and hardlink aliases are rejected rather than treated as independent formal storage', async () => {
   const a = await authority()
-  const b = await authority() createDb(a).close()
+  const b = await authority()
+  createDb(a).close()
   const alias = join(b.root, 'alias')
   await symlink(a.root, alias)
   assert.throws(() => openProjectFormalReadonly(createAuthorityPaths(alias)), /symlink/)
