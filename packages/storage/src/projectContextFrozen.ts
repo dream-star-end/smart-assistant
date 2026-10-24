@@ -4,7 +4,7 @@
  * PROJECT_MEMORY slots and the persist writer. Do not re-read meta/ledger.
  */
 import { join } from 'node:path'
-import { loadProjectContext, type ProjectWorkspace } from './projectContext.js'
+import { loadProjectContext, loadProjectContextReadonly, type ProjectWorkspace } from './projectContext.js'
 import { ProjectMemoryDir } from './projectMemoryDir.js'
 import {
   officialManifestSha256,
@@ -19,6 +19,7 @@ import {
   verifySkillTree,
 } from './projectSkillLedger.js'
 import { paths } from './paths.js'
+import type { ProjectFormalReadSource } from './projectFormalLedger.js'
 import type { ProjectAsset } from './sessionsDb.js'
 
 export interface FrozenProjectSkill {
@@ -86,15 +87,21 @@ export async function loadFrozenProjectContext(opts: {
   workspaceCwd?: string | null
   cwdSource?: string | null
   db?: SqlDb | null
+  /** Explicit authority only; no fallback to legacy paths or opts.db. Owned by the caller. */
+  formal?: ProjectFormalReadSource
 }): Promise<FrozenProjectContext> {
-  const snap = await loadProjectContext(opts.boardProjectId)
-  const db = opts.db ?? null
+  const formal = opts.formal
+  if (formal && (!formal.paths || !formal.ledger)) throw new Error('Complete explicit formal source is required')
+  const locations = formal ? formal.paths : paths
+  const snap = formal ? await loadProjectContextReadonly(opts.boardProjectId, locations) : await loadProjectContext(opts.boardProjectId)
+  const formalSnapshot = formal?.ledger.snapshot(opts.boardProjectId)
+  const db = formal ? null : opts.db ?? null
   const { readFile } = await import('node:fs/promises')
-  const ledgerSkills = db ? new ProjectSkillLedger(db).listActive(opts.boardProjectId) : []
-  const fileMap = loadProjectSkillFileMap(opts.boardProjectId, db)
+  const ledgerSkills = formalSnapshot?.skills ?? (db ? new ProjectSkillLedger(db).listActive(opts.boardProjectId) : [])
+  const fileMap = formal ? new Map<string, ReadonlyMap<string, string>>() : loadProjectSkillFileMap(opts.boardProjectId, db)
   const names = ledgerSkills.length > 0 ? ledgerSkills.map((r) => r.name) : [...fileMap.keys()]
   const skills: FrozenProjectSkill[] = []
-  const overlayRoot = paths.projectSkillsDir(opts.boardProjectId)
+  const overlayRoot = locations.projectSkillsDir(opts.boardProjectId)
   for (const name of names) {
     const row = ledgerSkills.find((r) => r.name === name)
     const files =
@@ -123,12 +130,11 @@ export async function loadFrozenProjectContext(opts: {
   let officialMemory: FrozenOfficialMemory[] = []
   let officialMemoryIndex: string | null = null
   let officialMemoryManifestSha256: string | null = null
-  if (db) {
+  if (formalSnapshot || db) {
     try {
-      const ledger = new ProjectMemoryLedger(db)
-      const official = ledger.listOfficial(opts.boardProjectId)
+      const official = formalSnapshot?.official ?? new ProjectMemoryLedger(db!).listOfficial(opts.boardProjectId)
       officialMemoryManifestSha256 = officialManifestSha256(official)
-      const mem = new ProjectMemoryDir(opts.boardProjectId)
+      const mem = new ProjectMemoryDir(opts.boardProjectId, locations)
       for (const row of official) {
         if (row.deprecated) continue
         const got = await mem.readOfficial(row.slug, row.contentSha256)
@@ -150,7 +156,8 @@ export async function loadFrozenProjectContext(opts: {
         8 * 1024,
         80,
       )
-    } catch {
+    } catch (error) {
+      if (formal) throw error
       officialMemory = []
     }
   }
