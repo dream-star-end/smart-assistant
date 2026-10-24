@@ -41,7 +41,7 @@ export interface SystemOperation extends SystemOperationDescriptor {
 }
 /** Only throw this when no business side effect occurred. Ambiguous outcomes must remain unknown. */
 export class SystemOperationRejected extends Error {
-  constructor(readonly code: 'FORBIDDEN' | 'CONFLICT' | 'UNAVAILABLE' | 'INVALID_INPUT') { super(code) }
+  constructor(readonly code: 'FORBIDDEN' | 'CONFLICT' | 'UNAVAILABLE' | 'INVALID_INPUT' | 'NOT_FOUND') { super(code) }
 }
 export class SystemOperationRegistry {
   private readonly entries = new Map<string, SystemOperation>()

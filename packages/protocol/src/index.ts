@@ -71,3 +71,5 @@ export {
 export * from './ccbTranscriptRestore.js'
 export * from './promptPrivacy.js'
 export * from './systemActions.js'
+
+export * from './systemHelp.js'

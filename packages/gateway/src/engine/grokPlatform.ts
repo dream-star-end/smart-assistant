@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into official
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
@@ -79,6 +80,7 @@ export interface GrokPlatformProjection {
 }
 
 export interface GrokPlatformInput {
+  systemHelpContextFile?: string
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
@@ -143,6 +145,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
       OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
       OPENCLAUDE_SESSION_KEY: input.sessionKey,
+      ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
       OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,

@@ -21,3 +21,5 @@ packages/commercial/src/__tests__/permissionTimelineGet.integ.test.ts
 packages/commercial/src/__tests__/turnRecoveryRefusedDispatch.integ.test.ts
 
 packages/commercial/src/__tests__/preferencesConfirmed.integ.test.ts
+
+packages/commercial/src/__tests__/systemHelpActor.integ.test.ts

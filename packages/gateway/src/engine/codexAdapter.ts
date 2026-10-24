@@ -403,6 +403,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       kernelOverride ??
       new CodexAppServerRunner({
         sessionKey: opts.sessionKey,
+        systemHelpContextFile: opts.systemHelpContextFile,
         agentId: opts.agentId,
         cwd: opts.agentBaseDir,
         resumeSessionId: opts.resumeSessionId,

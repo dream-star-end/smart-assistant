@@ -26,6 +26,7 @@ describe('grok platform projection', () => {
       const projected = projectGrokPlatform({
         agentId: 'main',
         sessionKey: 'agent:main:webchat:dm:grok-platform-test',
+        systemHelpContextFile: '/synthetic/system-help-context.json',
         gatewayPort: 18790,
         gatewayToken: 'bearer-must-not-enter-config',
         delegationDepth: 0,
@@ -35,6 +36,7 @@ describe('grok platform projection', () => {
       assert.ok(projected.advertisedMcpTools.includes('present_task_approval'))
       assert.ok(projected.delegateContextFile)
       const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
+      assert.ok(raw.includes('OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE = "/synthetic/system-help-context.json"'))
       assert.match(raw, /\[shell_environment_policy\]/)
       assert.match(raw, /\[mcp_servers\."openclaude-memory"\]/)
       assert.equal(raw.includes('bearer-must-not-enter-config'), false)

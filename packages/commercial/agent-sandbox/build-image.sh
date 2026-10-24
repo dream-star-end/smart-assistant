@@ -519,7 +519,7 @@ if [ "${OC_INCLUDE_OFFICIAL_CLAUDE:-0}" = "1" ]; then
   RUNTIME_FEATURES="$RUNTIME_FEATURES official_claude_code_v1"
 fi
 if [ "${OC_EMBED_SOURCE:-1}" != "0" ]; then
-  RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1 lossless-turn-tape-v2 prompt-privacy-v1"
+  RUNTIME_FEATURES="$RUNTIME_FEATURES model_authority_v1 lossless-turn-tape-v2 prompt-privacy-v1 system-help-relay-v1"
 fi
 
 INPUT_DIGEST=""

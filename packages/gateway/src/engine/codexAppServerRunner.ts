@@ -229,6 +229,7 @@ const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
 // ───────────────────────────────────────────────
 
 export interface CodexAppServerRunnerOpts {
+  systemHelpContextFile?: string
   sessionKey: string
   agentId: string
   cwd: string
@@ -1020,6 +1021,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const dir = mkdtempSync(join(tmpdir(), 'oc-codex-app-'))
     try {
       const overrides = await buildCodexLaunchOverrides({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
         promptPolicy: this.promptPolicy,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
@@ -1597,6 +1599,7 @@ export class CodexAppServerRunner extends EventEmitter {
         ..._codexMemoryTurnEnv(this.opts.agentId, this.opts.sessionKey, {
           gatewayPort: this.opts.config?.gateway.port,
           contextFile: this.cachedOverrides?.delegateContextFile,
+          systemHelpContextFile: this.opts.systemHelpContextFile,
         }),
       },
     }) as ChildProcessWithoutNullStreams

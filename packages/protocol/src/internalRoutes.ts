@@ -55,6 +55,8 @@ export const PROMPT_QUEUE_DETAIL_PATH = '/internal/v5/prompt-queue/detail'
 export const PROMPT_QUEUE_CLAIM_PATH = '/internal/v5/prompt-queue/claim'
 
 // ── v3 容器→master 面 ──────────────────────────────────────────────────────
+/** Scoped read/prepare help uses the existing container-to-master control transport. */
+export const SYSTEM_ACTIONS_INTERNAL_PATH = '/internal/v3/system-actions'
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
 /** 识图后端(oc-figcheck):容器交图片+问题,master 调 Grok 4.7 并计费。 */
@@ -171,6 +173,12 @@ export const INTERNAL_ROUTES = [
     egressForwardException: true,
     selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
+  },
+  {
+    path: SYSTEM_ACTIONS_INTERNAL_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/systemHelpRelay.ts', 'commercial/src/system-assistant/internalHttp.ts'],
   },
   // ── v5:控制专用/egress 本地面 ──────────────────────────────────────────
   {

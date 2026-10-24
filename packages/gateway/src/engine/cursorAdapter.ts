@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /** First-class adapter for the pinned official Cursor Agent CLI.
  * Authentication remains exclusively inside the account-scoped oc-cursor
@@ -1356,6 +1357,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 }
 
 interface CursorMemoryMcpConfigInput {
+  systemHelpContextFile?: string
   identityCompat?: IdentityCompatRuntimeContext
   launch: McpMemoryLaunch
   tokenFile: string
@@ -1378,7 +1380,8 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     ...identityCompatEnvironment(input.identityCompat),
     ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
     OPENCLAUDE_SESSION_KEY: input.sessionKey,
-    OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
+    ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
     OPENCLAUDE_GATEWAY_TOKEN_FILE: input.tokenFile,
     OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.delegateContextFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
@@ -1442,10 +1445,11 @@ function buildCursorSpawnEnv(agentId: string, sessionKey: string): NodeJS.Proces
  *  into env — those live in the signed delegate-context file. */
 export function attachCursorGatewayRouting(
   env: NodeJS.ProcessEnv,
-  routing: { gatewayPort: number; contextFile: string },
+  routing: { gatewayPort: number; contextFile: string; systemHelpContextFile?: string },
 ): void {
   env.OPENCLAUDE_GATEWAY_PORT = String(routing.gatewayPort)
   env.OPENCLAUDE_DELEGATE_CONTEXT_FILE = routing.contextFile
+  env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE = routing.systemHelpContextFile ?? ''
   env.OPENCLAUDE_ENGINE = 'cursor'
   // Full gateway bearer stays in MCP child env only. Shell + async /delegate
   // authenticate with the signed context file, not the shared access token.
@@ -1986,6 +1990,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
       Object.assign(env, identityCompatEnvironment(this.opts.identityCompat), { OPENCLAUDE_AGENT_ID: this.opts.agentId })
+      Object.assign(env, systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway.port))
       if (this.opts.cursorCredentialSelection) {
         env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
         env.OPENCLAUDE_CURSOR_POOL_GENERATION = this.opts.cursorCredentialSelection.poolGeneration
@@ -2020,6 +2025,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         )
         chmodSync(contextFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
+        systemHelpContextFile: this.opts.systemHelpContextFile,
           identityCompat: this.opts.identityCompat,
           launch: mcpLaunch,
           tokenFile,
@@ -2040,6 +2046,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         attachCursorGatewayRouting(env, {
           gatewayPort: this.opts.config.gateway.port,
           contextFile,
+          systemHelpContextFile: this.opts.systemHelpContextFile,
         })
       }
 
