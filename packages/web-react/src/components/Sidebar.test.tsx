@@ -2099,3 +2099,31 @@ describe("Sidebar 项目归档/置顶（P2）", () => {
     expect(onArchiveProject).toHaveBeenCalledWith(expect.objectContaining({ id: "p-bbbb" }));
   });
 });
+
+
+it("OD-P1 sidebar filters foreign titles, previews and archived sessions across account changes", () => {
+  const mixed = [
+    session({ id: "alice-pinned", ownerUserId: "u1", title: "Alice private title", pinned: true, lastMessagePreview: "Alice secret preview" }),
+    session({ id: "alice-archived", ownerUserId: "u1", title: "Alice private archive", archived: true }),
+    session({ id: "bob-live", ownerUserId: "u2", title: "Bob private title", lastMessagePreview: "Bob secret preview" }),
+    session({ id: "bob-archived", ownerUserId: "u2", title: "Bob private archive", archived: true }),
+  ];
+  localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
+  localStorage.setItem("oc_v5_sidebar_archived_expanded:u2", "1");
+  const props = { sessions: mixed, user, onSelect: () => {}, onNew: () => {}, onRename: () => {}, onDelete: () => {} };
+  const view = render(<Sidebar {...props} />);
+  expect(screen.getByRole("button", { name: "Alice private title" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Alice private archive" })).toBeInTheDocument();
+  expect(screen.queryByText(/Bob private|Bob secret/)).toBeNull();
+  view.rerender(<Sidebar {...props} user={{ ...user, id: "u2" }} />);
+  expect(screen.getByRole("button", { name: "Bob private title" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Bob private archive" })).toBeInTheDocument();
+  expect(screen.queryByText(/Alice private|Alice secret/)).toBeNull();
+  view.rerender(<Sidebar {...props} user={null} />);
+  expect(screen.queryByText(/Alice private|Alice secret|Bob private|Bob secret/)).toBeNull();
+});
+
+it("OD-P1 demo owner stays visible under the same owner filter", () => {
+  renderSidebar({ user: { ...user, id: "demo" }, sessions: [session({ id: "demo-session", ownerUserId: "demo", title: "Demo visible" })] });
+  expect(screen.getByRole("button", { name: "Demo visible" })).toBeInTheDocument();
+});

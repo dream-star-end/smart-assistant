@@ -213,7 +213,7 @@ export type SidebarProps = {
 };
 
 export function Sidebar({
-  sessions,
+  sessions: incomingSessions,
   activeId,
   user,
   credits,
@@ -290,6 +290,10 @@ export function Sidebar({
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
   const coarse = useCoarsePointer();
   const userId = user?.id;
+  const sessions = useMemo(
+    () => userId ? incomingSessions.filter(session => session.ownerUserId === userId) : [],
+    [incomingSessions, userId],
+  );
   useEffect(() => {
     setArchivedExpanded(readArchivedExpanded(userId));
   }, [userId]);
