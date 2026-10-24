@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AuthSession, InboxMessage } from "../lib/types";
 import { createMemoryAuthSession } from "../lib/authSession";
@@ -271,3 +271,22 @@ test('a committed-action revision refreshes the existing open list using reads w
   expect(markInboxRead).not.toHaveBeenCalled()
   expect(markAllInboxRead).not.toHaveBeenCalled()
 })
+
+test("a delayed old page cannot append unread rows or overwrite counts after a confirmed operation refresh", async () => {
+  let resolvePage!: (value: { messages: InboxMessage[]; unread_count: number }) => void;
+  listInboxMessages.mockResolvedValueOnce({ messages: Array.from({ length: 30 }, (_, i) => mk(`first-${i}`)), unread_count: 31 })
+    .mockImplementationOnce(() => new Promise(resolve => { resolvePage = resolve; }))
+    .mockResolvedValueOnce({ messages: [mk("fresh", { read: true })], unread_count: 0 });
+  const props = { open: true, auth, onClose: () => {}, onUnreadChange: vi.fn() };
+  const view = render(<InboxDialog {...props} refreshRevision={0} />);
+  await screen.findByText("标题first-0");
+  fireEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+  await waitFor(() => expect(listInboxMessages).toHaveBeenCalledTimes(2));
+  view.rerender(<InboxDialog {...props} refreshRevision={1} />);
+  await screen.findByText("标题fresh");
+  await act(async () => { resolvePage({ messages: [mk("stale")], unread_count: 31 }); });
+  expect(screen.queryByText("标题stale")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /全部已读/ })).toBeDisabled();
+  expect(markInboxRead).not.toHaveBeenCalled();
+  expect(markAllInboxRead).not.toHaveBeenCalled();
+});

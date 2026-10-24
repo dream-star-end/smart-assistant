@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 import type { AuthSession } from "../lib/types";
 
@@ -17,7 +17,9 @@ const POLL_MS = 60_000;
  */
 export function useInbox(auth: AuthSession | null, enabled: boolean) {
   const [unreadCount, setUnreadCount] = useState(0);
-  const accessGeneration = auth?.getAccessGeneration?.() ?? -1;
+  const subscribe = useCallback((listener: () => void) => auth?.subscribeAccessGeneration?.(listener) ?? (() => {}), [auth]);
+  const getGeneration = useCallback(() => auth?.getAccessGeneration?.() ?? -1, [auth]);
+  const accessGeneration = useSyncExternalStore(subscribe, getGeneration, getGeneration);
   const authRef = useRef(auth);
   authRef.current = auth;
   // 代际守卫：登出/换号时 bump，丢弃旧登录态在途请求的迟到响应（防跨账号未读残留）。
@@ -30,7 +32,7 @@ export function useInbox(auth: AuthSession | null, enabled: boolean) {
     const accessAtStart = a.getAccessGeneration?.() ?? -1;
     try {
       const n = await api.getInboxUnreadCount(a);
-      if (genRef.current !== myGen || (a.getAccessGeneration?.() ?? -1) !== accessAtStart) return; // 期间登出/换号 → 丢弃旧代响应
+      if (authRef.current !== a || genRef.current !== myGen || (a.getAccessGeneration?.() ?? -1) !== accessAtStart) return; // 期间登出/换号 → 丢弃旧代响应
       setUnreadCount(n);
     } catch {
       /* 未读数失败：保留旧值，不打断 UI（下次轮询/可见性切换再试） */
