@@ -4497,7 +4497,7 @@ describe('v5 release safety lanes', () => {
       path.join(bin, 'ssh'),
       [
         '#!/bin/sh',
-        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then exec sleep 3; fi',
         'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
         'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
         'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
@@ -5127,7 +5127,7 @@ describe('v5 release safety lanes', () => {
       path.join(bin, 'ssh'),
       [
         '#!/bin/sh',
-        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then exec sleep 3; fi',
         'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
         'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
         'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
@@ -6105,7 +6105,7 @@ persist_selfhost_model_authority_cutover /not-used`,
 
     const bin = path.join(dir, 'bin')
     await mkdir(bin)
-    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nsleep 3\n')
+    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nexec sleep 3\n')
     await chmod(path.join(bin, 'ssh'), 0o755)
     const started = Date.now()
     const transportTimedOut = spawnSync(
