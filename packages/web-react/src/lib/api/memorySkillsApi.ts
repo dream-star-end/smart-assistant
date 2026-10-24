@@ -1,4 +1,4 @@
-import { loadCardBusinessApi } from './cardBusinessLoader';
+import { withCardBusinessApi } from './cardBusinessLoader';
 import type { RequestExecutionGuard } from './http';
 /**
  * api: memory files and index, auto-dream reports and optimizer, cron, research library, skills (files, history, evals, training, drafts), community tutorials.
@@ -8,18 +8,10 @@ import type { RequestExecutionGuard } from './http';
  */
 import type {
   AuthSession,
-  CommunityBlogPrecheck,
   CommunityTutorialCategory,
-  CommunityTutorialDetail,
   CommunityTutorialDraft,
-  CommunityTutorialMine,
-  CommunityTutorialPage,
-  CommunityTutorialReviseResult,
-  CommunityTutorialSummary,
-  TutorialImageUpload,
   TutorialKind,
   TutorialSnapshotDraft,
-  TutorialSnapshotSubmitResult,
   CronCreateInput,
   CronJob,
   SkillDetail,
@@ -700,102 +692,51 @@ export const memorySkillsApi = {
     limit?: number;
     /** 经验分享只列 markdown 投稿。 */
     kind?: TutorialKind | null;
-  }) => {
-    const qs = new URLSearchParams();
-    if (opts?.cursor) qs.set("cursor", opts.cursor);
-    if (opts?.query) qs.set("q", opts.query);
-    if (opts?.category) qs.set("category", opts.category);
-    if (opts?.kind) qs.set("kind", opts.kind);
-    if (opts?.limit) qs.set("limit", String(opts.limit));
-    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
-    return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
-      fetch(`/api/tutorials${suffix}`),
-    );
+  }) =>
+    { const frozen = opts ? { ...opts } : undefined;
+    return import('./cardBusinessApi').then(module => module.cardBusinessApi.listCommunityTutorials(frozen));
   },
 
   getCommunityTutorial: (id: string) =>
-    jsonOrThrow<{ tutorial: CommunityTutorialDetail }>(
-      fetch(`/api/tutorials/${encodeURIComponent(id)}`),
-    ).then((result) => result.tutorial),
+    import('./cardBusinessApi').then(module => module.cardBusinessApi.getCommunityTutorial(id)),
 
   submitCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft, guard?: RequestExecutionGuard) => {
     const frozen = { ...draft };
-    return loadCardBusinessApi(a, guard).then(client => client.submitCommunityTutorial(a, frozen, guard));
+    return withCardBusinessApi(a, guard, client => client.submitCommunityTutorial(a, frozen, guard));
   },
 
   submitTutorialSnapshot: (a: AuthSession, draft: TutorialSnapshotDraft) =>
-    jsonOrThrow<TutorialSnapshotSubmitResult>(
-      callWithRefresh(a, (token) =>
-        fetch("/api/tutorials/snapshots", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => ({
-      tutorial: { ...result.tutorial, kind: result.tutorial.kind ?? "snapshot" },
-      leakReport: result.leakReport ?? null,
-    })),
+    { const frozen = { ...draft, selectedArtifacts: draft.selectedArtifacts.map(item => ({ ...item })) };
+    return withCardBusinessApi(a, undefined, client => client.submitTutorialSnapshot(a, frozen));
+  },
 
   listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
-    jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/mine${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
-          credentials: "include",
-          headers: bearerHeaders(token),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.listMyCommunityTutorials(a, cursor)),
 
   /** 对话写博客的草稿卡预检：只读，和投稿同一套确定性检查（不含 AI 审核）。 */
   precheckCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft, guard?: RequestExecutionGuard) => {
     const frozen = { ...draft };
-    return loadCardBusinessApi(a, guard).then(client => client.precheckCommunityTutorial(a, frozen, guard));
+    return withCardBusinessApi(a, guard, client => client.precheckCommunityTutorial(a, frozen, guard));
   },
 
   /** 我的某一篇投稿（作者本人）：状态、审核理由、正文。 */
   getMyCommunityTutorial: (a: AuthSession, id: string, guard?: RequestExecutionGuard) =>
-    loadCardBusinessApi(a, guard).then(client => client.getMyCommunityTutorial(a, id, guard)),
+    withCardBusinessApi(a, guard, client => client.getMyCommunityTutorial(a, id, guard)),
 
   /** 经验分享图片上传：原始字节（前端已压成 webp），服务端按魔数复核并去元数据。 */
   uploadTutorialImage: (a: AuthSession, file: Blob, guard?: RequestExecutionGuard) =>
-    loadCardBusinessApi(a, guard).then(client => client.uploadTutorialImage(a, file, guard)),
+    withCardBusinessApi(a, guard, client => client.uploadTutorialImage(a, file, guard)),
 
   /** 作者/管理员读取未公开稿件里的图（编辑器预览、审核预览）；返回 Blob，调用方转 object URL。 */
-  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> => {
-    const res = await callWithRefresh(a, (token) =>
-      fetch(`/api/tutorials/images/${encodeURIComponent(sha256)}`, {
-        credentials: "include",
-        headers: bearerHeaders(token),
-      }),
-    );
-    if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
-    return res.blob();
-  },
+  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> =>
+    withCardBusinessApi(a, undefined, client => client.fetchTutorialImage(a, sha256)),
 
   /** 修改已投稿的经验分享：待审 / 未通过的改后重审；已发布的审核通过前线上仍是旧版。 */
   reviseCommunityTutorial: (a: AuthSession, id: string, draft: CommunityTutorialDraft) =>
-    jsonOrThrow<{ tutorial: CommunityTutorialReviseResult }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/${encodeURIComponent(id)}/revise`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify(draft),
-        }),
-      ),
-    ).then((result) => result.tutorial),
+    { const frozen = { ...draft };
+    return withCardBusinessApi(a, undefined, client => client.reviseCommunityTutorial(a, id, frozen));
+  },
 
   withdrawCommunityTutorial: (a: AuthSession, id: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (token) =>
-        fetch(`/api/tutorials/${encodeURIComponent(id)}/withdraw`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(token, true),
-          body: JSON.stringify({}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.withdrawCommunityTutorial(a, id)),
 }

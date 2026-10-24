@@ -220,10 +220,10 @@ export function useChatCardActions({
       } : {}),
       ...(communityBlogEnabled && verified ? {
         communityBlog: {
-          precheck: defer('precheck'),
+          precheck: (draft: BlogDraft) => defer('precheck')({ ...draft }),
           readContainerImage: defer('readContainerImage'),
           uploadImage: defer('uploadImage'),
-          submit: defer('submit'),
+          submit: (draft: BlogDraft) => defer('submit')({ ...draft }),
           getMine: defer('getMine'),
           postUrl: (id: string) => `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
           openPost: (id: string) => { assertCurrent(); openBlog({ kind: "post", id }); },

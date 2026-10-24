@@ -116,6 +116,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const [account, setAccount] = useState<{ user: User | null; identity: ResolvedIdentity | null }>({ user: opts.initialUser, identity: null });
   const user = account.user;
   const identityRef = useRef<ResolvedIdentity | null>(null);
+  const lastVerifiedUid = useRef<string | null>(null);
   // A display setter never grants an identity. Revoke synchronously before React commits.
   const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
     revokeResolvedIdentity(identityRef.current);
@@ -149,18 +150,22 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   } | null>(null);
   const commitVerifiedUser = useCallback((nextUser: User, nextIdentity: ResolvedIdentity | null) => {
     const session = authRef.current;
-    if (nextIdentity && !identityIsCurrent(nextIdentity, session, nextUser.id)) return;
+    if (nextIdentity && !identityIsCurrent(nextIdentity, session, nextUser.id)) return false;
     const previous = identityRef.current;
     const identity = nextIdentity && identityIsCurrent(previous, session, nextUser.id) ? previous : nextIdentity;
+    if (previous !== identity) revokeResolvedIdentity(previous);
     identityRef.current = identity;
+    if (identity) lastVerifiedUid.current = nextUser.id;
     setAccount({ user: nextUser, identity });
+    return true;
   }, []);
   const resolvedIdentity = authed && user && identityIsCurrent(account.identity, authRef.current, user.id) ? account.identity : null;
 
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
-    teardownComposerDrafts(userRef.current?.id);
+    teardownComposerDrafts(lastVerifiedUid.current ?? userRef.current?.id);
+    lastVerifiedUid.current = null;
     // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();
@@ -175,6 +180,18 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     cbRef.current.onClearAuth();
   }, [setUser]);
   expiredUiRef.current = clearAuthState;
+
+  const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
+    const session = authRef.current;
+    if (identity && !identityIsCurrent(identity, session, me.id)) return false;
+    // A changed account must end the old socket/workspace before normal login.
+    // Do not silently adopt another UID at the old identity epoch.
+    if (identity && lastVerifiedUid.current && lastVerifiedUid.current !== me.id) {
+      session.expire(identity.epoch);
+      return false;
+    }
+    return commitVerifiedUser(me, identity);
+  }, [commitVerifiedUser]);
 
   const clearAuth = useCallback(() => {
     authRef.current.beginIdentity();
@@ -209,9 +226,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         const res = await api.login(email, password, turnstileToken);
         if (session !== authRef.current || !session.commitToken(loginEpoch, res.accessToken)) return;
         const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+        if (!commitVerifiedUser(res.user, identity)) return;
         setAuthHint();
         setAuthed(true);
-        commitVerifiedUser(res.user, identity);
         // lane 决策达成（cookie 已随登录响应 Set-Cookie 下发）：解锁 WS 连接前置。
         setLaneSignal({ lane: res.lane ?? null });
         cbRef.current.onLoginSuccess?.();
@@ -293,7 +310,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
               bootstrapMeFriction.current = null;
             }
             setAuthRecoveryAvailable(false);
-            commitVerifiedUser(me, identity);
+            if (!commitMeUser(me, identity)) return;
             setAuthed(true);
             setLaneSignal({ lane: me.lane ?? null });
             // 静默续期成功 = 本浏览器确实登录过（标记可能因旧版本/清理丢失，这里补写）。
@@ -340,7 +357,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     return () => {
       controller.abort();
     };
-  }, [booting, clearAuthState, commitVerifiedUser]);
+  }, [booting, clearAuthState, commitMeUser]);
 
   const retryBoot = useCallback(() => {
     setAuthError(null);
@@ -387,8 +404,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     const res = await api.verifyEmail(email, code);
     if (session !== authRef.current || !session.commitToken(epoch, res.accessToken)) return;
     const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+    if (!commitVerifiedUser(res.user, identity)) return;
     setAuthed(true);
-    commitVerifiedUser(res.user, identity);
     setLaneSignal({ lane: res.lane ?? null });
     cbRef.current.onLoginSuccess?.();
   }, [commitVerifiedUser]);
@@ -429,11 +446,11 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     try {
       let identity: ResolvedIdentity | null = null;
       const me = await api.getMe(session, value => { identity = value; });
-      if (session === authRef.current && session.snapshot().epoch === expectedEpoch) commitVerifiedUser(me, identity);
+      if (session === authRef.current && session.snapshot().epoch === expectedEpoch) commitMeUser(me, identity);
     } catch {
       /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
     }
-  }, [demo, authed, commitVerifiedUser]);
+  }, [demo, authed, commitMeUser]);
 
   // A same-epoch refresh has no userId. Business callbacks stay disabled until /me
   // verifies the exact new token; cleanup cancels only this consumer's commit.
@@ -456,10 +473,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     // A new consumer subscribes to the same generation's pending read; cleanup must
     // not strand the capability. Failed reads stay cached until an explicit retry.
     void flight.promise.then(({ me, identity }) => {
-      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity) commitVerifiedUser(me, identity);
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity) commitMeUser(me, identity);
     }).catch(() => { /* A transient read failure leaves the business capability unresolved. */ });
     return () => { cancelled = true; };
-  }, [demo, booting, authed, generation, account.identity, user?.id, commitVerifiedUser]);
+  }, [demo, booting, authed, generation, account.identity, user?.id, commitMeUser]);
 
   return {
     auth,

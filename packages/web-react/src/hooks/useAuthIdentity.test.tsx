@@ -7,13 +7,14 @@ const reply = (value: unknown, status = 200) => new Response(JSON.stringify(valu
 const wireUser = (id: string) => ({ id, role: 'user', email: `${id}@example.invalid`, display_name: id })
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
-it('login binds its exact user; a new token with the old displayed user grants nothing until /me resolves', async () => {
+it('a new token with an old displayed user grants nothing; a verified different UID requires normal login', async () => {
   const pendingMe = deferred<Response>()
   const fetcher = vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
     ? reply({ access_token: 'alice-a', user: wireUser('alice') })
     : String(url) === '/api/me' ? pendingMe.promise : reply({ accepted: true }))
   vi.stubGlobal('fetch', fetcher)
-  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: () => {} }))
+  const onClearAuth = vi.fn()
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth }))
   await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
   const original = view.result.current.resolvedIdentity
   expect(identityIsCurrent(original, view.result.current.authRef.current, 'alice')).toBe(true)
@@ -22,9 +23,16 @@ it('login binds its exact user; a new token with the old displayed user grants n
   expect(view.result.current.resolvedIdentity).toBeNull()
   await waitFor(() => expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1))
   await act(async () => { pendingMe.resolve(reply({ user: wireUser('bob') })); await pendingMe.promise })
-  await waitFor(() => expect(view.result.current.resolvedIdentity?.userId).toBe('bob'))
-  expect(view.result.current.user?.id).toBe('bob')
+  await waitFor(() => expect(view.result.current.authed).toBe(false))
+  expect(view.result.current.user).toBeNull()
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  expect(onClearAuth).toHaveBeenCalledTimes(1)
   expect(identityIsCurrent(original, view.result.current.authRef.current)).toBe(false)
+  fetcher.mockImplementation(async url => String(url) === '/api/auth/login'
+    ? reply({ access_token: 'bob-login', user: wireUser('bob') }) : reply({ accepted: true }))
+  await act(async () => { await view.result.current.login('bob', 'fixture', 'fixture') })
+  expect(view.result.current.resolvedIdentity?.userId).toBe('bob')
+  expect(view.result.current.authed).toBe(true)
 })
 it('a stale /me cannot overwrite a subsequent login and a same-user fresh login creates a new capability', async () => {
   const pendingMe = deferred<Response>()

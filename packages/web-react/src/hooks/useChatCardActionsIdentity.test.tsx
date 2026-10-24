@@ -55,3 +55,15 @@ it('an unresolved displayed user never receives business callbacks and a current
   expect(await result.current.toolActions.communityBlog!.uploadImage(new Blob(['fixture']))).toEqual({ sha256: 'a'.repeat(64) })
   expect(fetcher).toHaveBeenCalledTimes(1)
 })
+
+it('the card callback freezes a draft before its own lazy IO module await', async () => {
+  const { input } = setup()
+  const fetcher = vi.fn<typeof fetch>(async () => reply({ tutorial: { id: 'fixture', status: 'pending' } }))
+  vi.stubGlobal('fetch', fetcher)
+  const { result } = renderHook(() => useChatCardActions(input))
+  const draft = { title: 'Frozen title', summary: 'fixture', category: 'general' as const, bodyMarkdown: 'fixture' }
+  const pending = result.current.toolActions.communityBlog!.submit(draft)
+  draft.title = 'Late mutation'
+  await pending
+  expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)).title).toBe('Frozen title')
+})

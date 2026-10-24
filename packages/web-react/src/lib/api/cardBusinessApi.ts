@@ -1,3 +1,4 @@
+import type { CommunityTutorialCategory, CommunityTutorialDetail, CommunityTutorialPage, CommunityTutorialReviseResult, CommunityTutorialSummary, TutorialKind, TutorialSnapshotDraft, TutorialSnapshotSubmitResult } from '../types'
 import type { AuthSession, CommunityBlogPrecheck, CommunityTutorialDraft, CommunityTutorialMine, TutorialImageUpload } from '../types'
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from '../connectors'
 import { bearerHeaders, callWithRefresh, fetchWithExecutionGuard, jsonOrThrow, type RequestExecutionGuard } from './http'
@@ -71,4 +72,82 @@ export const cardBusinessApi = {
         }, guard),
       ),
     ).then((result) => result.image),
+  listCommunityTutorials: (opts?: {
+    cursor?: string | null;
+    query?: string;
+    category?: CommunityTutorialCategory | null;
+    limit?: number;
+    /** 经验分享只列 markdown 投稿。 */
+    kind?: TutorialKind | null;
+  }) => {
+    const qs = new URLSearchParams();
+    if (opts?.cursor) qs.set("cursor", opts.cursor);
+    if (opts?.query) qs.set("q", opts.query);
+    if (opts?.category) qs.set("category", opts.category);
+    if (opts?.kind) qs.set("kind", opts.kind);
+    if (opts?.limit) qs.set("limit", String(opts.limit));
+    const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+    return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
+      fetch(`/api/tutorials${suffix}`),
+    );
+  },
+  getCommunityTutorial: (id: string) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialDetail }>(
+      fetch(`/api/tutorials/${encodeURIComponent(id)}`),
+    ).then((result) => result.tutorial),
+  submitTutorialSnapshot: (a: AuthSession, draft: TutorialSnapshotDraft) =>
+    jsonOrThrow<TutorialSnapshotSubmitResult>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/snapshots", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => ({
+      tutorial: { ...result.tutorial, kind: result.tutorial.kind ?? "snapshot" },
+      leakReport: result.leakReport ?? null,
+    })),
+  listMyCommunityTutorials: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<CommunityTutorialPage<CommunityTutorialMine>>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/mine${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> => {
+    const res = await callWithRefresh(a, (token) =>
+      fetch(`/api/tutorials/images/${encodeURIComponent(sha256)}`, {
+        credentials: "include",
+        headers: bearerHeaders(token),
+      }),
+    );
+    if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
+    return res.blob();
+  },
+  reviseCommunityTutorial: (a: AuthSession, id: string, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialReviseResult }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/${encodeURIComponent(id)}/revise`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.tutorial),
+  withdrawCommunityTutorial: (a: AuthSession, id: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/${encodeURIComponent(id)}/withdraw`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({}),
+        }),
+      ),
+    ),
 }

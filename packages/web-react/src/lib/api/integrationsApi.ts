@@ -1,4 +1,4 @@
-import { loadCardBusinessApi } from './cardBusinessLoader';
+import { withCardBusinessApi } from './cardBusinessLoader';
 import type { RequestExecutionGuard } from './http';
 /**
  * api: marketplace, inbox, GitHub link and repo selection, connectors (OAuth, declarative catalog), local plugins and managed plugin setups, Knowledge Planet automation.
@@ -603,11 +603,11 @@ export const integrationsApi = {
 
   /** 写操作确认完整详情（GET /api/connectors/confirmations/:id，服务端解密渲染）。 */
   getConnectorConfirmation: (a: AuthSession, id: string, guard?: RequestExecutionGuard) =>
-    loadCardBusinessApi(a, guard).then(client => client.getConnectorConfirmation(a, id, guard)),
+    withCardBusinessApi(a, guard, client => client.getConnectorConfirmation(a, id, guard)),
 
   /** 批准 / 拒绝写操作（POST /api/connectors/confirmations/:id/approve|deny）。 */
   decideConnectorConfirmation: (a: AuthSession, id: string, decision: "approve" | "deny", guard?: RequestExecutionGuard) =>
-    loadCardBusinessApi(a, guard).then(client => client.decideConnectorConfirmation(a, id, decision, guard)),
+    withCardBusinessApi(a, guard, client => client.decideConnectorConfirmation(a, id, decision, guard)),
 
   /** 重命名连接（PATCH /api/connectors/:id）。 */
   renameConnector: (a: AuthSession, id: string, displayName: string): Promise<void> =>
