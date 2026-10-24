@@ -11,6 +11,10 @@ export function useModelSwitchCost(deps: ModelSwitchCostClientDeps): AuthorizeSw
   return useCallback<AuthorizeSwitch>(async (input, opts) => {
     const auth = latest.current.authRef.current
     const epoch = auth.snapshot().epoch
+    const current = () =>
+      latest.current.authRef.current === auth &&
+      auth.snapshot().epoch === epoch &&
+      (opts?.isCurrent?.() ?? true)
     try {
       if (!instance.current) {
         const pending = import('../lib/modelSwitchCostClient').then((module) =>
@@ -26,12 +30,12 @@ export function useModelSwitchCost(deps: ModelSwitchCostClientDeps): AuthorizeSw
         })
       }
       const authorize = await instance.current
-      if (latest.current.authRef.current !== auth || auth.snapshot().epoch !== epoch) return null
+      if (!current()) return null
       return authorize(input, opts)
     } catch (error) {
+      if (!current()) return null
       if (opts?.interactive === false) throw error
-      if (opts?.allowOfflineQueue && auth.snapshot().epoch === epoch)
-        return { requestId: input.requestId, choice: true }
+      if (opts?.allowOfflineQueue) return { requestId: input.requestId, choice: true }
       latest.current.toast('费用确认暂不可用，请恢复网络后重试', 'error')
       return null
     }

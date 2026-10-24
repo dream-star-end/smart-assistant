@@ -62,13 +62,11 @@ test(
       })
       const input = page.getByRole('textbox', { name: '消息输入框' })
       await input.fill('keep this draft')
-      await page
-        .locator('input[type=file]')
-        .setInputFiles({
-          name: 'fixture.txt',
-          mimeType: 'text/plain',
-          buffer: Buffer.from('cost fixture'),
-        })
+      await page.locator('input[type=file]').setInputFiles({
+        name: 'fixture.txt',
+        mimeType: 'text/plain',
+        buffer: Buffer.from('cost fixture'),
+      })
       await page.getByText('fixture.txt', { exact: true }).waitFor()
       await page.getByRole('button', { name: 'quote message', exact: true }).click()
       await page.getByRole('button', { name: 'select expensive', exact: true }).click()
@@ -124,6 +122,25 @@ test(
       assert.equal(ids.length, 2)
       assert.notEqual(ids[0], ids[1])
       assert.equal(ids[0], first)
+      await page.getByRole('button', { name: 'new session fixture', exact: true }).click()
+      await input.fill('new session first message')
+      await page
+        .locator('input[type=file]')
+        .setInputFiles({
+          name: 'fixture.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('new file'),
+        })
+      await page.getByText('fixture.txt', { exact: true }).waitFor()
+      await input.press('Enter')
+      await page.getByRole('dialog').waitFor()
+      await page.getByRole('button', { name: '确认切换', exact: true }).click()
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid=sent]').textContent.split(',').length === 3,
+      )
+      await page.getByRole('button', { name: 'new session fixture', exact: true }).click()
+      assert.equal(await input.inputValue(), '')
+      assert.equal(await page.getByText('fixture.txt', { exact: true }).count(), 0)
       assert.deepEqual(errors, [])
       await context.close()
     } finally {

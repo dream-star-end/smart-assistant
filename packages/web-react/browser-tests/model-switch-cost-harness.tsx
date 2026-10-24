@@ -65,6 +65,9 @@ function Harness() {
   return (
     <TooltipProvider>
       <ToastProvider>
+        <button type="button" onClick={() => setSession('new')}>
+          new session fixture
+        </button>
         <button
           type="button"
           onClick={() => {
@@ -131,6 +134,10 @@ function Harness() {
             if (!permit) return false
             requests.push(permit.requestId)
             setSent(requests.join(','))
+            if (session === 'new') {
+              setSession('created')
+              await new Promise((resolve) => setTimeout(resolve, 30))
+            }
             return true
           }}
         />

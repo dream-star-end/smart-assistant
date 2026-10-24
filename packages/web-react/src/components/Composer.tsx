@@ -495,6 +495,10 @@ export function Composer({
         // A successful first send may promote the empty composer to its new
         // session. Clear only the submitted owner's unchanged stored draft.
         if(snapshot.draftKey&&readDraft(snapshot.draftKey)===snapshot.value)clearDraft(snapshot.draftKey);
+        if(snapshot.draftKey&&attachmentCache.get(snapshot.draftKey)===snapshot.attachments){
+          attachmentCache.set(snapshot.draftKey,[]);
+          for(const attachment of snapshot.attachments)revoke(attachment.previewUrl);
+        }
         return;
       }
       if(latestSubmitRef.current.revision!==snapshot.revision)return;
