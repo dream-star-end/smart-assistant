@@ -311,6 +311,7 @@ function requestToken(init?: RequestInit): string {
 
 async function openAgentPicker() {
   fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+  await screen.findByRole('button',{name:/队长切换为/})
 }
 
 function teamChoice() {
@@ -733,7 +734,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.click(plusTrigger)
     const goalItem = await screen.findByText('设定目标')
     fireEvent.click(goalItem)
-    fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
+    fireEvent.change(await screen.findByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })
     fireEvent.click(screen.getByRole('button', { name: '设置并开始' }))

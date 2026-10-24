@@ -268,7 +268,9 @@ export function useComposerSend({
         text:formatMessageReplyPrompt(text,replyTo),mediaCount:media?.length??0,
         ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
         ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
-      },{useCachedRequestId:true,allowOfflineQueue:true,isCurrent:recoveryIsCurrent}):undefined;
+      },{useCachedRequestId:true,allowOfflineQueue:true,
+        interactive:!target||selectedSessionIdRef.current===sessionId,
+        isCurrent:target?()=>recoveryIdentityIsCurrent()&&!!sockRef.current?.getSession(sessionId):recoveryIsCurrent}):undefined;
       if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
       const materializedDraft =
         !createdSession && (
