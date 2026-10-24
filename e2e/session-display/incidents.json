@@ -8199,6 +8199,33 @@
           "assertion": "[system-executor-proofs] PASS independent browser approval, original request replay and frozen executors"
         }
       ]
+    },
+    {
+      "id": "INC-20261024-TEAM-MODE-REBOUND",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "体验混合账号保存defaultMode=team，空态关闭后首发solo未落会话配置，后续GET继承团队默认造成回弹；Goal/GitHub提前物化有同类丢失；旧设备全局团队标记还可影响其它账号初态。实际App/Chromium在独立HTTP/WS fixture先红跑确认，未对体验账号写操作。",
+      "rootFixCommit": "6f345868e7962e42908b37c965e16c5cec126865",
+      "coverageCommits": [
+        "6f345868e7962e42908b37c965e16c5cec126865"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "team close persists solo through first send and reload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "legacy device team flag cannot activate team before account config arrives"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "closing an existing team stays solo on save failure and can persist on explicit retry"
+        }
+      ]
     }
   ]
 }
