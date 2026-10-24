@@ -13,6 +13,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
+import { clickSend, waitUntil } from "../../../scripts/lib/user-contract-browser.mjs";
 
 if (!process.env.OC_E2E_BROWSER) {
   const cached = "/usr/local/share/ms-playwright/chromium-1226/chrome-linux64/chrome";
@@ -59,6 +60,7 @@ function emptyLiveFrames() {
 
 function startFixture({ defaultMode = "solo" } = {}) {
   const sessions = new Map();
+  const goals = new Map();
   const sessionCollab = new Map();
   let defaultCollab = collabDoc({ defaultMode, session: { mode: defaultMode, advisorModel: null, configVersion: `v1:${defaultMode}:`, source: "default" } });
   const inbounds = [];
@@ -186,6 +188,20 @@ function startFixture({ defaultMode = "solo" } = {}) {
       if (data.sessionId) sessionCollab.set(data.sessionId, next);
       if (data.asDefault) defaultCollab = { ...next, session: next.session };
       return json(200, next);
+    }
+    const goalPath = path.match(/^\/api\/session-goals\/([^/]+)$/);
+    if (goalPath) {
+      const sessionId = goalPath[1];
+      if (method === "PUT") {
+        if (!sessions.has(sessionId)) return json(404, { error: "session not found" });
+        const goal = { sessionId, goalId: "11111111-1111-4111-8111-111111111111", objective: data.objective, status: "active",
+          tokenBudget: null, creditBudget: null, tokensUsed: 0, creditsUsed: "0", timeUsedSeconds: 0,
+          stateRevision: (goals.get(sessionId)?.stateRevision ?? 0) + 1, snapshotRevision: 1,
+          createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), statusChangedAt: new Date().toISOString() };
+        goals.set(sessionId, goal);
+        return json(200, { goal });
+      }
+      return json(200, { goal: goals.get(sessionId) ?? null });
     }
     const liveFrames = path.match(/^\/api\/sessions\/([^/]+)\/live-frames$/);
     if (liveFrames) return json(200, emptyLiveFrames());
@@ -586,6 +602,23 @@ async function buildCollabApp() {
   });
 }
 
+async function fixtureIdle(page) {
+  await page.waitForFunction(() => {
+    const send = document.querySelector('button[aria-label="发送"]');
+    return send && !send.disabled && !document.querySelector('button[aria-label="停止"]');
+  });
+}
+
+async function sendFixtureTurn(page, inbounds, text) {
+  await page.getByPlaceholder(/和「全能助手」对话/).fill(text);
+  // The shared helper uses a trusted click without Playwright's unrelated
+  // navigation barrier; completion is established from the real frame and UI.
+  await clickSend(page);
+  const frame = await waitUntil(() => inbounds.find(f => f.content?.text === text), 20_000, "fixture did not receive the actual turn");
+  await fixtureIdle(page);
+  return frame;
+}
+
 // Regression fixture keeps account defaults separate from each session override.
 // A single shared doc makes a missing first-send PUT look successful.
 test("team close persists solo through first send and reload", { timeout: 240_000 }, async (t) => {
@@ -614,16 +647,18 @@ test("team close persists solo through first send and reload", { timeout: 240_00
       if (entry === "goal") {
         await page.getByRole("button", { name: "更多选项", exact: true }).click();
         await page.getByText("设定目标", { exact: true }).click();
+        await page.getByPlaceholder("这次会话要达成什么？").fill("关闭团队首发回归");
+        await page.getByRole("button", { name: "设置并开始", exact: true }).click();
       } else await page.getByRole("button", { name: "关联 GitHub 仓库", exact: true }).first().click();
       assert.equal((await saved).status(), 200, "materialization persists the same draft intent");
       await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });
     }
     assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0);
-    await page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队首发回归");
-    await page.getByRole("button", { name: "发送", exact: true }).click();
-    await page.getByTestId("message-text").filter({ hasText: "关闭团队首发回归" }).waitFor();
-    const first = inbounds.at(-1);
+    const first = entry === "goal"
+      ? await waitUntil(() => inbounds.find(f => f.content?.text === "关闭团队首发回归"), 20_000, "goal did not start its actual first turn")
+      : await sendFixtureTurn(page, inbounds, "关闭团队首发回归");
+    await fixtureIdle(page);
     assert.ok(first, "first frame reached the actual WS fixture");
     assert.equal(first.teamMode, undefined);
     assert.equal(first.collabMode, "solo");
@@ -637,9 +672,7 @@ test("team close persists solo through first send and reload", { timeout: 240_00
     assert.equal(await reopened.page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
     await reopened.page.keyboard.press("Escape");
     await reopened.page.getByRole("dialog").waitFor({ state: "hidden" });
-    await reopened.page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队第二轮回归");
-    await reopened.page.getByRole("button", { name: "发送", exact: true }).click();
-    await reopened.page.getByTestId("message-text").filter({ hasText: "关闭团队第二轮回归" }).waitFor();
+    await sendFixtureTurn(reopened.page, inbounds, "关闭团队第二轮回归");
     assert.equal(inbounds.at(-1).peer.id, first.peer.id);
     assert.equal(inbounds.at(-1).collabMode, "solo");
     assert.equal(inbounds.at(-1).teamMode, undefined);
@@ -696,9 +729,7 @@ test("closing an existing team stays solo on save failure and can persist on exp
       const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
       const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
       await page.getByRole("button", { name: "团队模式已开启", exact: true }).waitFor();
-      await page.getByPlaceholder(/和「全能助手」对话/).fill("已有团队会话");
-      await page.getByRole("button", { name: "发送", exact: true }).click();
-      await page.getByTestId("message-text").filter({ hasText: "已有团队会话" }).waitFor();
+      await sendFixtureTurn(page, inbounds, "已有团队会话");
       const sid = inbounds.at(-1).peer.id;
       assert.equal(sessionCollab.get(sid)?.session.mode, "team");
       setWriteStatus(status);
@@ -718,9 +749,7 @@ test("closing an existing team stays solo on save failure and can persist on exp
       assert.equal(sessionCollab.get(sid)?.session.mode, "solo");
       await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });
-      await page.getByPlaceholder(/和「全能助手」对话/).fill("关闭团队后续单人");
-      await page.getByRole("button", { name: "发送", exact: true }).click();
-      await page.getByTestId("message-text").filter({ hasText: "关闭团队后续单人" }).waitFor();
+      await sendFixtureTurn(page, inbounds, "关闭团队后续单人");
       assert.equal(inbounds.at(-1).teamMode, undefined);
       assert.equal(inbounds.at(-1).collabMode, "solo");
       assert.deepEqual(errors, []);
