@@ -198,8 +198,25 @@ export function useChatCardActions({
             approve: defer('taskApprove'),
             reject: defer('taskReject'),
           },
-    [demo, openManage, setBoardOpen],
-  );
+        } : {}),
+      } : {}),
+      ...(communityBlogEnabled && auth.snapshot().token ? {
+        communityBlog: {
+          ...(verified ? {
+            precheck: (draft: BlogDraft) => defer('precheck')({ ...draft }),
+            readContainerImage: defer('readContainerImage'),
+            uploadImage: defer('uploadImage'),
+            submit: (draft: BlogDraft) => defer('submit')({ ...draft }),
+            getMine: defer('getMine'),
+          } : {}),
+          postUrl: (id: string) => `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
+          openPost: (id: string) => { if (authRef.current.snapshot().token) openBlog({ kind: "post", id }); },
+          openMine: () => { if (authRef.current.snapshot().token) openBlog({ kind: "mine" }); },
+          openEditor: (seed: BlogDraft) => { if (authRef.current.snapshot().token) openBlog({ kind: "editor", seed }); },
+        },
+      } : {}),
+    };
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
