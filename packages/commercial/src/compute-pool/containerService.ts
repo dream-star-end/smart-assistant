@@ -508,11 +508,9 @@ export class RemoteNodeAgentBackend {
   async inspect(hostId: string, cid: string): Promise<ContainerInspect> {
     return this.withTarget(hostId, async (t) => {
       const info = await agentInspectContainer(t, cid);
-      const result = { ...info };
-      delete result.runtimeInspection;
-      const actual = readWireRuntimeInspection(info.runtimeInspection, info.id, cid);
-      if (actual) result.runtimeInspection = actual;
-      return result;
+      const { runtimeInspection: rawInspection, ...result } = info;
+      const actual = readWireRuntimeInspection(rawInspection, info.id, cid);
+      return { ...result, ...(actual ? { runtimeInspection: actual } : {}) };
     });
   }
 
