@@ -87,8 +87,10 @@ export function SettingsCenter({
   feedbackContext,
   initialSection = "account",
   subscribeOpenSignal = 0,
+  preferencesRevision = 0,
 }: {
   activeSessionId?: string;
+  preferencesRevision?: number;
   open: boolean;
   auth: AuthSession | null;
   user: User | null;
@@ -171,7 +173,7 @@ export function SettingsCenter({
     return () => {
       alive = false;
     };
-  }, [open, demo, auth, needsPreferences, onPreferencesChange, prefsReloadTick]);
+  }, [open, demo, auth, needsPreferences, onPreferencesChange, prefsReloadTick, preferencesRevision]);
 
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {

@@ -1,8 +1,8 @@
+import { createMemoryAuthSession } from '../../../lib/authSession'
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../../lib/api'
-import type { AuthSession } from '../../../lib/types'
 import { prefetchMarkdownImpl } from '../../Markdown'
 import { loadBeforeAll } from '../../../test/moduleLoad'
 import { BlogProse } from './BlogArticle'
@@ -16,12 +16,8 @@ vi.mock('./blogLib', async (importOriginal) => {
   return { ...actual, compressBlogImage: async (file: Blob) => file }
 })
 
-const auth = {
-  snapshot: () => ({ token: 'token', epoch: 1 }),
-  beginIdentity: () => 1,
-  commitToken: () => true,
-  expire: () => true,
-} as AuthSession
+const auth = createMemoryAuthSession(() => {})
+auth.commitToken(auth.beginIdentity(), 'token')
 
 const TRACKER = 'https://tracker.test/pixel.png'
 
