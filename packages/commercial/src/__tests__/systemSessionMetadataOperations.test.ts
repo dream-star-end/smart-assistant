@@ -34,7 +34,7 @@ test('metadata schema rejects owner, runtime/model/project actions, empty patche
 })
 test('prepare snapshots only the owner namespace and freezes trimmed target values without writing', async () => {
   const f = fixture()
-  const e = await f.execution({ sessionId: 'target', patch: { title: '  Approved  ', pinned: true } })
+  const { prepared: e } = await f.registry.prepare(actor, 'sessions.metadata.update', { sessionId: 'target', patch: { title: '  Approved  ', pinned: true } })
   assert.deepEqual(f.reads, [{ owner: 'c:765', id: 'target' }])
   assert.deepEqual(e.args, { sessionId: 'target', patch: { title: 'Approved', pinned: true }, before: { title: 'Original', pinned: false }, version: '12' })
   assert.equal(e.resourceKey, 'session-metadata:765:target')
