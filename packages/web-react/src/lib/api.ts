@@ -1,3 +1,4 @@
+import { captureIdentityAttempt, resolveIdentity, type ResolvedIdentity } from './resolvedIdentity';
 import type {ModelSwitchCostRequest,ModelSwitchCostQuote} from '@openclaude/protocol/browser';
 export interface WorkspaceDraftHint {
   viewId: string
@@ -851,15 +852,23 @@ export const api = {
 
   /** 当前用户（GET /api/me，Bearer）。credits 为字符串大数，adaptUser 原样保留。
    *  P3 RFC D1：响应体附带 cohort `lane`（body 级优先，兼容嵌套在 user 内）；缺失=后端未部署=null。 */
-  getMe: (a: AuthSession) =>
-    jsonOrThrow<{ user: WireUser; lane?: string | null }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/me", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
+  getMe: (a: AuthSession, onIdentity?: (identity: ResolvedIdentity) => void) => {
+    let attempt: ReturnType<typeof captureIdentityAttempt> | undefined;
+    return jsonOrThrow<{ user: WireUser; lane?: string | null }>(
+      callWithRefresh(a, (t) => {
+        // GET may replay after refresh. Evidence belongs to the actual final attempt.
+        if (onIdentity) attempt = captureIdentityAttempt(a, t);
+        return fetch("/api/me", { credentials: "include", headers: bearerHeaders(t), cache: "no-store" });
+      }),
     ).then((r) => {
       const user = adaptUser(r.user);
+      if (onIdentity) {
+        if (!attempt) throw new AuthEpochStaleError();
+        onIdentity(resolveIdentity(attempt, user.id));
+      }
       return { ...user, lane: r.lane ?? user.lane ?? null };
-    }),
+    });
+  },
 
   /** 偏好快照（GET /api/me/preferences，Bearer）。 */
   getPreferences: (a: AuthSession) =>

@@ -536,6 +536,7 @@ export function App() {
   const {
     auth,
     authRef: authSessionRef,
+    resolvedIdentity,
     authed,
     user,
     authLoading,
@@ -1437,6 +1438,7 @@ export function App() {
   const { systemActions, preferencesRevision, inboxRevision } = useSystemActionCardActions({
     authRef,
     userId: user?.id,
+    identity: resolvedIdentity,
     demo,
     applyPreferences: applyConversationPreferences,
     applyInboxUnreadCount: inbox.applyUnreadCountSnapshot,
@@ -1454,6 +1456,7 @@ export function App() {
     stopTurn,
     toolActions,
   } = useChatCardActions({
+    identity: resolvedIdentity,
     systemActions,
     activeId,
     agent,

@@ -1,3 +1,5 @@
+import type { LegacyCardIo } from '../lib/legacyCardIo';
+import { assertResolvedIdentity, identityIsCurrent, type ResolvedIdentity } from '../lib/resolvedIdentity';
 /**
  * Chat turn and card actions: stop, media signing, permission response, feedback, tool actions, retry/continue and card callbacks
  *
@@ -9,7 +11,7 @@ import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
 import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
-import type { SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
+import type { ToolCardActions, SystemActionCardActions, ChatInteraction, ArtifactInspectTarget } from "../components/tool/context";
 import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
@@ -54,6 +56,7 @@ export type ChatCardActionsInput = {
   communityBlogEnabled: boolean;
   demo: boolean;
   systemActions?: SystemActionCardActions;
+  identity: ResolvedIdentity | null;
   loadExactUserMessage: (message: ChatMessage) => Promise<ChatMessage | null>;
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
@@ -92,6 +95,7 @@ export function useChatCardActions({
   communityBlogEnabled,
   demo,
   systemActions,
+  identity,
   loadExactUserMessage,
   messageFeedbackTriggerRef,
   newSession,
@@ -166,75 +170,69 @@ export function useChatCardActions({
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setMessageFeedback(ctx);
   }, []);
-  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮 + 连接器写操作确认卡的
-  // 鉴权动作）。稳定引用经 context 注入，不污染 ToolCard 数据契约。demo 无网络 → 不提供
-  //（按钮自动隐藏 / 确认卡降级纯展示）。authRef 是稳定 ref，不入依赖。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, setCollapsed are App useState setter/useRef passed in, stable
-  const toolActions = useMemo(
-    () =>
-      demo
-        ? {}
-        : {
-            systemActions,
-            onOpenMemory: () => openManage("memory"),
-            onOpenSkills: () => openManage("skills"),
-            onOpenTasks: () => openManage("cron"),
-            downloadLiteratureArtifact: (artifactId: string) =>
-              api.downloadLiteratureArtifact(authRef.current, artifactId),
-            literatureArtifactMeta: (artifactId: string) =>
-              api.literatureArtifactMeta(authRef.current, artifactId),
-            connectorConfirm: {
-              getDetail: (id: string) => api.getConnectorConfirmation(authRef.current, id),
-              decide: (id: string, decision: "approve" | "deny") =>
-                api.decideConnectorConfirmation(authRef.current, id, decision),
-            },
-            ...(TASKBOARD_ENABLED
-              ? {
-                  taskApproval: {
-                    getTicket: async (id: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.getTicket(authRef.current, id);
-                    },
-                    approve: async (id: string, expectedVersion: number) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.approve(authRef.current, id, expectedVersion);
-                    },
-                    reject: async (id: string, expectedVersion: number, reason: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.reject(authRef.current, id, expectedVersion, reason);
-                    },
-                  },
-                  onOpenTaskboard: () => {
-                    setCollapsed(false);
-                    setBoardOpen(true);
-                  },
-                }
-              : {}),
-            ...(communityBlogEnabled
-              ? {
-                  communityBlog: {
-                    precheck: (draft: BlogDraft) => api.precheckCommunityTutorial(authRef.current, draft),
-                    readContainerImage: async (path: string) => {
-                      const url = (await api.mediaSign(authRef.current, [path])).urls[path];
-                      if (!url) throw new Error("图片签名失败");
-                      const res = await fetch(url);
-                      if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
-                      return res.blob();
-                    },
-                    uploadImage: (image: Blob) => api.uploadTutorialImage(authRef.current, image),
-                    submit: (draft: BlogDraft) => api.submitCommunityTutorial(authRef.current, draft),
-                    getMine: (id: string) => api.getMyCommunityTutorial(authRef.current, id),
-                    postUrl: (id: string) =>
-                      `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
-                    openPost: (id: string) => openBlog({ kind: "post", id }),
-                    openMine: () => openBlog({ kind: "mine" }),
-                    openEditor: (seed: BlogDraft) => openBlog({ kind: "editor", seed }),
-                  },
-                }
-              : {}),
+  const cardAuth = authRef.current;
+  const toolActions = useMemo<ToolCardActions>(() => {
+    if (demo) return {};
+    const auth = cardAuth;
+    const assertCurrent = () => {
+      if (!identity) throw new Error("请等待登录状态核验完成");
+      assertResolvedIdentity(identity, authRef.current);
+    };
+    const guard = { assertCurrent };
+    let io: Promise<LegacyCardIo> | undefined;
+    function defer<K extends keyof LegacyCardIo>(key: K): LegacyCardIo[K] {
+      return (async (...args: unknown[]) => {
+        assertCurrent();
+        io ??= import('../lib/legacyCardIo').then(module => {
+          assertCurrent();
+          return module.createLegacyCardIo(auth, guard);
+        });
+        const client = await io;
+        assertCurrent();
+        const result = await Reflect.apply(client[key], null, args);
+        assertCurrent();
+        return result;
+      }) as LegacyCardIo[K];
+    }
+    const verified = identityIsCurrent(identity, auth);
+    return {
+      systemActions,
+      onOpenMemory: () => openManage("memory"),
+      onOpenSkills: () => openManage("skills"),
+      onOpenTasks: () => openManage("cron"),
+      downloadLiteratureArtifact: (id: string) => api.downloadLiteratureArtifact(authRef.current, id),
+      literatureArtifactMeta: (id: string) => api.literatureArtifactMeta(authRef.current, id),
+      ...(verified ? {
+        connectorConfirm: {
+          getDetail: defer('connectorDetail'),
+          decide: defer('connectorDecide'),
+        },
+      } : {}),
+      ...(TASKBOARD_ENABLED ? {
+        onOpenTaskboard: () => { setCollapsed(false); setBoardOpen(true); },
+        ...(verified ? {
+          taskApproval: {
+            getTicket: defer('taskGet'),
+            approve: defer('taskApprove'),
+            reject: defer('taskReject'),
           },
-    [demo, systemActions, openManage, setBoardOpen, communityBlogEnabled, openBlog],
-  );
+        } : {}),
+      } : {}),
+      ...(communityBlogEnabled && verified ? {
+        communityBlog: {
+          precheck: defer('precheck'),
+          readContainerImage: defer('readContainerImage'),
+          uploadImage: defer('uploadImage'),
+          submit: defer('submit'),
+          getMine: defer('getMine'),
+          postUrl: (id: string) => `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
+          openPost: (id: string) => { assertCurrent(); openBlog({ kind: "post", id }); },
+          openMine: () => { assertCurrent(); openBlog({ kind: "mine" }); },
+          openEditor: (seed: BlogDraft) => { assertCurrent(); openBlog({ kind: "editor", seed }); },
+        },
+      } : {}),
+    };
+  }, [demo, systemActions, identity, cardAuth, authRef, openManage, setCollapsed, setBoardOpen, communityBlogEnabled, openBlog]);
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
   // 但带上 reason 让交互块说清「演示模式仅供浏览」,而不是笼统的「此会话中不可交互」(misc-p3 D-08)。
