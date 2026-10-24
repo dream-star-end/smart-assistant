@@ -207,7 +207,7 @@ export async function readSwitchContext(
       | { callId?: unknown; usage?: Record<string, unknown> }
       | undefined
     if (!call) {
-      if (tokens === null && message.role === 'tool') return base
+      if (tokens === null) return base
       continue
     }
     if (typeof call.callId !== 'string' || !call.usage) return base
