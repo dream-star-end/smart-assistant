@@ -12,7 +12,7 @@ const fail = () => new Error('Profile control unavailable; outcome may be unknow
 const hash = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 type Options = Readonly<{
-  ledger: SystemActionStore; hostRoot: string; runtimeRoot: string; workerSha256: string; currentExecutorId: string
+  ledger: SystemActionStore; nodeExecutable?: string; hostRoot: string; runtimeRoot: string; workerSha256: string; currentExecutorId: string
   /** Trusted current account/role check, never passed into the worker. */
   authorizeActor(binding: Readonly<SystemActionReceiptBinding>): Promise<void>
   /** Trusted supervisor proof for the original host executor. Missing in-memory child data is not proof. */
@@ -55,13 +55,14 @@ export class ProfileControlBroker {
   private constructor(private readonly options: Options, private readonly entry: string, private readonly node: string) {}
   static async create(input: Options) {
     const options = Object.freeze({ ledger: input.ledger, hostRoot: input.hostRoot, runtimeRoot: input.runtimeRoot,
-      workerSha256: input.workerSha256, currentExecutorId: input.currentExecutorId, authorizeActor: input.authorizeActor,
+      workerSha256: input.workerSha256, nodeExecutable: input.nodeExecutable, currentExecutorId: input.currentExecutorId, authorizeActor: input.authorizeActor,
       executorProvenGone: input.executorProvenGone })
     if (process.platform !== 'linux' || !isAbsolute(options.hostRoot) || resolve(options.hostRoot) !== options.hostRoot || options.hostRoot === '/' || !options.currentExecutorId || options.currentExecutorId.length > 256) throw fail()
     await directory(options.hostRoot, true)
     await trustedAncestors(options.hostRoot)
     const entry = await artifact(options.runtimeRoot, options.workerSha256)
-    const node = await realpath(process.execPath)
+    if (options.nodeExecutable !== undefined && (!isAbsolute(options.nodeExecutable) || resolve(options.nodeExecutable) !== options.nodeExecutable)) throw fail()
+    const node = await realpath(options.nodeExecutable ?? process.execPath)
     await trustedAncestors(node)
     const stat = await lstat(node)
     if (!stat.isFile() || stat.uid !== 0 || (stat.mode & 0o022) !== 0) throw fail()

@@ -20,6 +20,12 @@ const runtime = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
 const buildHome = await mkdtemp(join(tmpdir(), 'oc-profile-worker-build-'))
 await promisify(execFile)(process.execPath, ['--import', 'tsx', join(runtime, 'scripts/build-v5-profile-control-worker.ts')],
   { cwd: runtime, env: { PATH: '/usr/bin:/bin', HOME: buildHome, TMPDIR: buildHome }, timeout: 30000 })
+// setup-node's hosted toolcache ancestor is writable. Copy the exact test Node into a private
+// trusted root and retain the production root-owner/ancestor checks instead of relaxing them.
+const trustedNode = join(buildHome, 'node')
+await copyFile(await import('node:fs/promises').then(fs => fs.realpath(process.execPath)), trustedNode)
+await chmod(trustedNode, 0o755)
+if (process.getuid?.() !== 0) await promisify(execFile)('/usr/bin/sudo', ['-n', '/usr/bin/chown', '0:0', trustedNode], { env: { PATH: '/usr/bin:/bin' }, timeout: 10000 })
 const builtFile = join(runtime, 'packages/storage/dist/profile-control-worker.mjs')
 const built = { file: builtFile, sha256: createHash('sha256').update(await readFile(builtFile)).digest('hex') }
 const baseText = 'Fixture base\r\n'
@@ -42,7 +48,7 @@ async function setup(authorizeActor: () => Promise<void> = async () => {}) {
   const handle = ledger.confirm('765', action.id, { nonce: ledger.issueChallenge('765', action.id, 'fixture-device', d.previewHash), previewHash: d.previewHash, deviceId: 'fixture-device' }, 'host-fixture')
   if (!('executionNonce' in handle)) throw new Error('Expected control')
   const record = ledger.controlRecoveryRecord('765', action.id)!
-  const options = { ledger, hostRoot, runtimeRoot, workerSha256: built.sha256, currentExecutorId: 'host-fixture', authorizeActor, executorProvenGone: async () => false }
+  const options = { ledger, nodeExecutable: trustedNode, hostRoot, runtimeRoot, workerSha256: built.sha256, currentExecutorId: 'host-fixture', authorizeActor, executorProvenGone: async () => false }
   const broker = await ProfileControlBroker.create(options)
   const request = { v: 1, jobId: randomUUID(), kind: 'publish-profile', token, binding: record.binding, text }
   return { root, hostRoot, runtimeRoot, entry, store, baseline, ledger, token, action, handle, record, options, broker, request }
@@ -102,7 +108,7 @@ test('worker ignores ambient NODE_OPTIONS, module/config paths and user hooks', 
 })
 test('EOF before GO has no business effect and creates no stage', async () => {
   const t = await setup()
-  const child = spawn(process.execPath, [t.entry, t.hostRoot], { cwd: t.runtimeRoot, env: { PATH: '/usr/bin:/bin', HOME: t.root, TMPDIR: t.root }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const child = spawn(trustedNode, [t.entry, t.hostRoot], { cwd: t.runtimeRoot, env: { PATH: '/usr/bin:/bin', HOME: t.root, TMPDIR: t.root }, stdio: ['pipe', 'pipe', 'pipe'] })
   const exit = new Promise<number | null>((r, reject) => { child.once('error', reject); child.once('close', r) })
   const lines = createInterface({ input: child.stdout })
   try {

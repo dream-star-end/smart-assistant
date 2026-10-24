@@ -17,3 +17,5 @@ parent按精确child handle监督直到实际close，结果与close均正常才�
 现有generation历史重放用例更新为重复原冻结intent仍返回原receipt，新增changed-version/body不能复用回执的拒绝断言；原来用同binding改输入的快捷返回已不符合本次冻结条件要求。没有降低测试门槛或增加timeout。
 
 真实formal container reader、TS/Go/各引擎native发现/所有旧写旁路及同代缓存仍为激活前后续；本片不能作为已完成全量保护的证据。
+
+CI使用setup-node的可写toolcache时，fixture将同一Node二进制复制到本次私有目录并以固定sudo chown设root owner；factory仅接受host配置的绝对nodeExecutable，仍核完整祖先及root owner，不让测试豁免或放宽生产检查。生产缺省仍process.execPath且同样校验。
