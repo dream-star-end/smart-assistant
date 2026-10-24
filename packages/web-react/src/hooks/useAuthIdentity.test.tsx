@@ -1,3 +1,4 @@
+import { createMemoryAuthSession } from '../lib/authSession'
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
 import { identityIsCurrent } from '../lib/resolvedIdentity'
@@ -100,4 +101,22 @@ it('a replacement effect subscribes to the same pending identity read after a di
   await act(async () => { pendingMe.resolve(reply({ user: wireUser('alice') })); await pendingMe.promise })
   await waitFor(() => expect(identityIsCurrent(view.result.current.resolvedIdentity, view.result.current.authRef.current, 'alice')).toBe(true))
   expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1)
+})
+
+it('an auth object replacement at identical epoch/generation revalidates instead of retaining an unavailable scope', async () => {
+  const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/auth/login'
+    ? reply({ access_token: 'alice-a', user: wireUser('alice') })
+    : String(url) === '/api/me' ? reply({ user: wireUser('alice') }) : reply({ accepted: true }))
+  vi.stubGlobal('fetch', fetcher)
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: () => {} }))
+  await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
+  const original = view.result.current.resolvedIdentity
+  const replacement = createMemoryAuthSession(() => {})
+  replacement.commitToken(replacement.beginIdentity(), 'alice-a')
+  expect(replacement.snapshot()).toEqual(view.result.current.authRef.current.snapshot())
+  expect(replacement.getAccessGeneration()).toBe(view.result.current.authRef.current.getAccessGeneration())
+  act(() => { view.result.current.authRef.current = replacement; view.rerender() })
+  await waitFor(() => expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1))
+  await waitFor(() => expect(identityIsCurrent(view.result.current.resolvedIdentity, replacement, 'alice')).toBe(true))
+  expect(identityIsCurrent(original, replacement)).toBe(false)
 })

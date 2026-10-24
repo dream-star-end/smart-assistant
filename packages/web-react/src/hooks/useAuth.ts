@@ -476,7 +476,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
       if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity) commitMeUser(me, identity);
     }).catch(() => { /* A transient read failure leaves the business capability unresolved. */ });
     return () => { cancelled = true; };
-  }, [demo, booting, authed, generation, account.identity, user?.id, commitMeUser]);
+  }, [demo, booting, authed, auth, generation, account.identity, user?.id, commitMeUser]);
 
   return {
     auth,
