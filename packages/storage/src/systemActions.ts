@@ -27,6 +27,8 @@ export interface PrepareSystemAction {
   executor: SystemActionExecutor
   resourceKey: string
   idempotencyKey: string
+  /** Stable original request digest, independent of the current resource snapshot. */
+  requestHash?: string
   args: unknown
   preview: SystemActionPreview
   quoteHash?: string
@@ -50,7 +52,7 @@ export interface SystemActionExecution {
 interface Row {
   id: string; user_id: string; session_id: string; agent_id: string
   operation_id: string; operation_version: number; executor: SystemActionExecutor
-  resource_key: string; idempotency_key: string; input_hash: string; preview_hash: string
+  resource_key: string; idempotency_key: string; request_hash: string | null; input_hash: string; preview_hash: string
   title: string; state: SystemActionState; created_at: number; updated_at: number; expires_at: number
   sealed: string | null; quote_hash: string | null; expected_version: string | null
   device_id: string | null; approval_hash: string | null; grant_hash: string | null
@@ -118,12 +120,13 @@ export class SystemActionStore {
       this.db.pragma('journal_mode = WAL')
       this.db.pragma('synchronous = FULL')
       this.db.pragma('secure_delete = ON')
-      const version = this.db.pragma('user_version', { simple: true }) as number
-      if (version !== 0 && version !== 1) throw new Error('Unsupported system action ledger version')
+      this.db.transaction(() => {
+        const version = this.db.pragma('user_version', { simple: true }) as number
+      if (![0, 1, 2].includes(version)) throw new Error('Unsupported system action ledger version')
       this.db.exec(`CREATE TABLE IF NOT EXISTS system_actions (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, agent_id TEXT NOT NULL,
         operation_id TEXT NOT NULL, operation_version INTEGER NOT NULL, executor TEXT NOT NULL,
-        resource_key TEXT NOT NULL, idempotency_key TEXT NOT NULL, input_hash TEXT NOT NULL, preview_hash TEXT NOT NULL,
+        resource_key TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_hash TEXT, input_hash TEXT NOT NULL, preview_hash TEXT NOT NULL,
         title TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','approved_waiting_browser','executing',${TERMINAL})),
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
         sealed TEXT, quote_hash TEXT, expected_version TEXT, device_id TEXT, approval_hash TEXT,
@@ -135,7 +138,14 @@ export class SystemActionStore {
       CREATE INDEX IF NOT EXISTS system_actions_actor_state ON system_actions(user_id,state,updated_at);
       CREATE INDEX IF NOT EXISTS system_actions_expiry ON system_actions(state,expires_at);
       CREATE INDEX IF NOT EXISTS system_actions_executor ON system_actions(executor_id,state);`)
-      if (version === 0) this.db.pragma('user_version = 1')
+      const columns = this.db.pragma('table_info(system_actions)') as { name: string }[]
+      if (!columns.some(column => column.name === 'request_hash')) {
+        // v0 may be a v1 table whose old process stopped before setting user_version.
+        if (version === 2) throw new Error('Invalid system action ledger schema')
+        this.db.exec('ALTER TABLE system_actions ADD COLUMN request_hash TEXT')
+      }
+      this.db.pragma('user_version = 2')
+      }).immediate()
       for (const suffix of ['-wal', '-shm']) if (existsSync(options.dbPath + suffix)) chmodSync(options.dbPath + suffix, 0o600)
     } catch (e) { this.db.close(); this.key.fill(0); throw e }
   }
@@ -175,9 +185,20 @@ export class SystemActionStore {
     return this.db.prepare(`UPDATE system_actions SET state='expired',sealed=NULL,approval_hash=NULL,grant_hash=NULL,execution_hash=NULL,updated_at=?
       WHERE state IN ('prepared','approved_waiting_browser') AND expires_at<=?`).run(this.now(), this.now()).changes
   }
+  /** Owner-scoped replay before recomputing a business preview. Does not authorize a new write. */
+  replayPrepared(userId: string, idempotencyKey: string, requestHash: string): SystemActionSummary | null {
+    required(userId); required(idempotencyKey)
+    if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new SystemActionError('INVALID_INPUT')
+    this.expire()
+    const existing = this.db.prepare('SELECT * FROM system_actions WHERE user_id=? AND idempotency_key=?').get(userId, idempotencyKey) as Row | undefined
+    if (!existing) return null
+    if (existing.request_hash !== requestHash) throw new SystemActionError('CONFLICT')
+    return this.summary(existing)
+  }
   prepare(input: PrepareSystemAction): SystemActionSummary {
     for (const v of [input.userId, input.sessionId, input.agentId, input.operationId, input.operationTitle, input.resourceKey, input.idempotencyKey]) required(v)
     if (!/^[1-9]\d{0,18}$/.test(input.userId) || !Number.isSafeInteger(input.operationVersion) || input.operationVersion < 1 || !['master','control','browser'].includes(input.executor)) throw new SystemActionError('INVALID_INPUT')
+    if (input.requestHash !== undefined && !/^[a-f0-9]{64}$/.test(input.requestHash)) throw new SystemActionError('INVALID_INPUT')
     validatePreview(input.preview)
     const body = { args: input.args, preview: input.preview }
     const inputHash = digest(canonical({ ...body, operationId: input.operationId, operationVersion: input.operationVersion,
@@ -188,7 +209,7 @@ export class SystemActionStore {
     return this.db.transaction(() => {
       const existing = this.db.prepare('SELECT * FROM system_actions WHERE user_id=? AND idempotency_key=?').get(input.userId, input.idempotencyKey) as Row | undefined
       if (existing) {
-        if (existing.input_hash !== inputHash) throw new SystemActionError('CONFLICT')
+        if (input.requestHash !== undefined ? existing.request_hash !== input.requestHash : existing.input_hash !== inputHash) throw new SystemActionError('CONFLICT')
         return this.summary(existing)
       }
       if (this.db.prepare("SELECT 1 FROM system_actions WHERE user_id=? AND resource_key=? AND state='unknown'").get(input.userId, digest(input.resourceKey))) throw new SystemActionError('RECONCILIATION_REQUIRED')
@@ -198,9 +219,9 @@ export class SystemActionStore {
       if (!Number.isSafeInteger(ttl) || ttl <= 0 || ttl > 3600000) throw new SystemActionError('INVALID_INPUT')
       const sealed = this.seal(body, { id, user_id: input.userId, input_hash: inputHash })
       this.db.prepare(`INSERT INTO system_actions (id,user_id,session_id,agent_id,operation_id,operation_version,executor,
-        resource_key,idempotency_key,input_hash,preview_hash,title,state,created_at,updated_at,expires_at,sealed,quote_hash,expected_version)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?,?,?,?,?,?)`).run(id, input.userId, input.sessionId, input.agentId, input.operationId,
-        input.operationVersion, input.executor, digest(input.resourceKey), input.idempotencyKey, inputHash, previewHash, input.operationTitle,
+        resource_key,idempotency_key,request_hash,input_hash,preview_hash,title,state,created_at,updated_at,expires_at,sealed,quote_hash,expected_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?,?,?,?,?,?)`).run(id, input.userId, input.sessionId, input.agentId, input.operationId,
+        input.operationVersion, input.executor, digest(input.resourceKey), input.idempotencyKey, input.requestHash ?? null, inputHash, previewHash, input.operationTitle,
         now, now, now + ttl, sealed, input.quoteHash ?? null, input.expectedVersion ?? null)
       return this.summary(this.row(input.userId, id))
     }).immediate()
@@ -306,4 +327,11 @@ export class SystemActionStore {
     return this.db.prepare("UPDATE system_actions SET state='unknown',sealed=NULL,approval_hash=NULL,grant_hash=NULL,execution_hash=NULL,result_json=?,updated_at=? WHERE state='executing' AND executor_id=?").run(result, this.now(), executorId).changes
   }
   close(): void { try { this.db.close() } finally { this.key.fill(0) } }
+}
+
+/** Hash request data only, never desired resource versions, quotes or generated previews. */
+export function systemActionRequestHash(value: unknown): string {
+  const serialized = canonical(value)
+  if (Buffer.byteLength(serialized) > MAX_BYTES) throw new SystemActionError('INVALID_INPUT')
+  return digest(serialized)
 }

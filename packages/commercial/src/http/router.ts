@@ -28,6 +28,7 @@ import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
+import { dispatchSystemActionsBrowserRoute } from '../system-assistant/browserHttp.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
 import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
 import { MUSE_BRIDGE_PREFIX } from '../muse/protocol.js'
@@ -761,6 +762,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       handler: (req, res) => dispatchGoalRoute(req, res, deps),
     },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
+    { method: ANY_METHOD, pathPrefix: '/api/me/system-actions/', handler: dispatchSystemActionsBrowserRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/auth/system-actions/', handler: dispatchSystemActionsBrowserRoute },
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
     { method: 'PATCH', path: '/api/me/preferences', handler: handlePatchMyPreferences },
     { method: 'GET', path: '/api/me/qq-binding', handler: handleGetMyQqBinding },
