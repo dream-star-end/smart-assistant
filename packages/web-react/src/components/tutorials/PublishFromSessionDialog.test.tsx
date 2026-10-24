@@ -3,7 +3,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../lib/api'
 import type { ChatMessage } from '../../lib/chat/model'
-import type { AuthSession, ProjectAsset } from '../../lib/types'
+import { createMemoryAuthSession } from '../../lib/authSession'
+import type { ProjectAsset } from '../../lib/types'
 import { MAX_TUTORIAL_ARTIFACT_BYTES } from '../../lib/tutorialStudio'
 import { PublishFromSessionDialog } from './PublishFromSessionDialog'
 import { prefetchMarkdownImpl } from '../Markdown'
@@ -32,12 +33,7 @@ vi.mock('../MessageRenderer', () => ({
   ),
 }))
 
-const auth = {
-  snapshot: () => ({ token: 'token', epoch: 1 }),
-  beginIdentity: () => 1,
-  commitToken: () => true,
-  expire: () => true,
-} as AuthSession
+const auth = createMemoryAuthSession(() => {}, 'token')
 
 const messages: ChatMessage[] = [
   { id: 'u1', role: 'user', text: '帮我整理这份公开数据', ts: 1 },
