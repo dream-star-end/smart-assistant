@@ -96,3 +96,46 @@ it('the fixed deferred draft API freezes its scalar payload before the chunk awa
   await pending
   expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)).title).toBe('Frozen title')
 })
+
+it('a nested skill-eval payload is captured before loading its fixed client', async () => {
+  const auth = createMemoryAuthSession(() => {}, 'alice-a')
+  const fetcher = vi.fn<typeof fetch>(async () => reply({ ok: true }))
+  vi.stubGlobal('fetch', fetcher)
+  const evals = { version: 1 as const, cases: [{ id: 'fixture', prompt: 'Frozen prompt', assertions: ['Frozen assertion'] }] }
+  const pending = api.putSkillEvals(auth, 'fixture', evals)
+  evals.cases[0]!.prompt = 'Late prompt'
+  evals.cases[0]!.assertions[0] = 'Late assertion'
+  await pending
+  const sent = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))
+  expect(sent.evals.cases[0]).toEqual({ id: 'fixture', prompt: 'Frozen prompt', assertions: ['Frozen assertion'] })
+})
+it.each(['eval', 'train', 'comment'])('a same-epoch token change during %s client loading cannot start a new paid request', async operation => {
+  const auth = createMemoryAuthSession(() => {}, 'alice-a')
+  const fetcher = vi.fn<typeof fetch>()
+  vi.stubGlobal('fetch', fetcher)
+  const pending = operation === 'eval' ? api.startSkillEvalRun(auth, 'fixture')
+    : operation === 'train' ? api.startSkillTrain(auth, 'fixture')
+    : api.commentSkillDraft(auth, 'fixture-run', 'fixture', 'fixture')
+  auth.commitToken(0, 'new-access-same-epoch')
+  await expect(pending).rejects.toThrow()
+  expect(fetcher).not.toHaveBeenCalled()
+})
+it('a default human client preserves its existing successful 401 replay after dispatch', async () => {
+  const auth = createMemoryAuthSession(() => {}, 'alice-a')
+  const fetcher = vi.fn<typeof fetch>(async (url, init) => String(url) === '/api/auth/refresh'
+    ? reply({ access_token: 'alice-b', access_exp: 9999999999, remember: false })
+    : new Headers(init?.headers).get('Authorization') === 'Bearer alice-a' ? reply({}, 401) : reply({ ok: true, runId: 'fixture-run' }))
+  vi.stubGlobal('fetch', fetcher)
+  expect(await api.startSkillTrain(auth, 'fixture')).toEqual({ ok: true, runId: 'fixture-run' })
+  expect(fetcher.mock.calls.filter(([url]) => String(url) !== '/api/auth/refresh')).toHaveLength(2)
+})
+it('a deferred tutorial image remains a Blob and preserves its existing failure message', async () => {
+  const auth = createMemoryAuthSession(() => {}, 'alice-a')
+  const fetcher = vi.fn<typeof fetch>(async () => new Response(new Blob(['fixture-image'])))
+  vi.stubGlobal('fetch', fetcher)
+  const image = await api.fetchTutorialImage(auth, 'a'.repeat(64))
+  expect(image).toBeInstanceOf(Blob)
+  expect(await image.text()).toBe('fixture-image')
+  fetcher.mockResolvedValueOnce(reply({}, 403))
+  await expect(api.fetchTutorialImage(auth, 'a'.repeat(64))).rejects.toThrow('读取图片失败（403）')
+})

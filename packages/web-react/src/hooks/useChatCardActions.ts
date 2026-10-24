@@ -186,7 +186,7 @@ export function useChatCardActions({
         io ??= import('../lib/legacyCardIo').then(module => {
           assertCurrent();
           return module.createLegacyCardIo(auth, guard);
-        });
+        }).catch(error => { io = undefined; throw error; });
         const client = await io;
         assertCurrent();
         const result = await Reflect.apply(client[key], null, args);

@@ -18,14 +18,7 @@ import type {
   ResearchLibraryDoc,
   ResearchLibraryUploadResult,
   SkillSummary,
-  SkillDraftDetail,
-  SkillDraftSummary,
-  SkillEvalGenJob,
-  SkillEvalRun,
   SkillEvalsFile,
-  SkillRunUsage,
-  SkillTrainRun,
-  SkillTrainStartResult,
   MemoryDocResponse,
   MemoryConflict,
   PutMemoryResult,
@@ -486,37 +479,11 @@ export const memorySkillsApi = {
 
   /** 评测用例 + 上次结果（GET /api/skills/:name/evals）。 */
   getSkillEvals: (a: AuthSession, name: string) =>
-    jsonOrThrow<{
-      evals: SkillEvalsFile | null;
-      parseErrors?: string[];
-      lastRun: {
-        runId: string;
-        finishedAt: number;
-        benchmark: SkillEvalRun["benchmark"];
-        usage: SkillRunUsage;
-      } | null;
-      writable: boolean;
-    }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvals(a, name)),
 
   /** 保存评测用例（PUT /api/skills/:name/evals）。 */
   putSkillEvals: (a: AuthSession, name: string, evals: SkillEvalsFile) =>
-    jsonOrThrow<{ ok: boolean; evals: SkillEvalsFile }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals`, {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ evals }),
-        }),
-      ),
-    ),
+    { const frozen = structuredClone(evals); return withCardBusinessApi(a, undefined, client => client.putSkillEvals(a, name, frozen)); },
 
   /** 启动评测 run（POST /api/skills/:name/eval-run;消耗积分,调用前必须已过成本确认）。 */
   startSkillEvalRun: (
@@ -524,164 +491,59 @@ export const memorySkillsApi = {
     name: string,
     body?: { mode?: "baseline" | "draft"; trainRunId?: string },
   ) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/eval-run`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body ?? {}),
-        }),
-      ),
-    ),
+    { const frozen = body ? { ...body } : undefined; return withCardBusinessApi(a, undefined, client => client.startSkillEvalRun(a, name, frozen)); },
 
   /** 评测 run 状态（GET /api/skill-eval/:runId）。 */
   getSkillEvalRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ run: SkillEvalRun }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-eval/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.run),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvalRun(a, runId)),
 
   /** 启动 AI 生成评测用例 job（POST /api/skills/:name/evals/generate;消耗积分,调用前必须
    *  已过成本确认）。生成绝不落库,只回草稿由前端灌进编辑器。经 ApiError 抛:409=同技能已有
    *  生成/评测在跑;403=非自建技能;404=技能不存在。 */
   generateSkillEvals: (a: AuthSession, name: string) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/evals/generate`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.generateSkillEvals(a, name)),
 
   /** AI 生成 job 状态（GET /api/skill-eval-gen/:runId;直接回 job,cases 仅 done）。 */
   getSkillEvalGen: (a: AuthSession, runId: string) =>
-    jsonOrThrow<SkillEvalGenJob>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-eval-gen/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillEvalGen(a, runId)),
 
   /** 后台发布任务状态（GET /api/v5/release-jobs/:id;刷新后进度卡回源）。 */
   getReleaseJob: (a: AuthSession, id: string) =>
-    jsonOrThrow<Record<string, unknown>>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/v5/release-jobs/${encodeURIComponent(id)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getReleaseJob(a, id)),
 
   /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。
    *  响应可带 feedbackRefs(命中的差评真实使用记录条数;旧后端缺省)。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
-    jsonOrThrow<SkillTrainStartResult>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skills/${encodeURIComponent(name)}/train`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body ?? {}),
-        }),
-      ),
-    ),
+    { const frozen = body ? { ...body } : undefined; return withCardBusinessApi(a, undefined, client => client.startSkillTrain(a, name, frozen)); },
 
   /** 训练 run 列表（GET /api/skill-training，按 startedAt 降序）。
    *  用于页面刷新/服务重启后找回未完成或有草稿(diff_ready)的训练 run。 */
   listSkillTrainRuns: (a: AuthSession) =>
-    jsonOrThrow<{ runs: SkillTrainRun[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/skill-training", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.runs || []),
+    withCardBusinessApi(a, undefined, client => client.listSkillTrainRuns(a)),
 
   /** 训练 run 状态（GET /api/skill-training/:runId）。 */
   getSkillTrainRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ run: SkillTrainRun }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.run),
+    withCardBusinessApi(a, undefined, client => client.getSkillTrainRun(a, runId)),
 
   /** 放弃训练 run(DELETE,连同草稿一起清)。 */
   discardSkillTrainRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.discardSkillTrainRun(a, runId)),
 
   /** 草稿列表。 */
   listSkillDrafts: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ drafts: SkillDraftSummary[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}/drafts`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.drafts || []),
+    withCardBusinessApi(a, undefined, client => client.listSkillDrafts(a, runId)),
 
   /** 草稿详情(草稿+现版两个 diff 侧)。 */
   getSkillDraft: (a: AuthSession, runId: string, name: string) =>
-    jsonOrThrow<SkillDraftDetail>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}`,
-          {
-            credentials: "include",
-            headers: bearerHeaders(t),
-          },
-        ),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.getSkillDraft(a, runId, name)),
 
   /** 对草稿留评论 → AI 修订(消耗积分,UI 层须再次确认)。 */
   commentSkillDraft: (a: AuthSession, runId: string, name: string, comment: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(
-          `/api/skill-training/${encodeURIComponent(runId)}/drafts/${encodeURIComponent(name)}/comment`,
-          {
-            method: "POST",
-            credentials: "include",
-            headers: bearerHeaders(t, true),
-            body: JSON.stringify({ comment }),
-          },
-        ),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.commentSkillDraft(a, runId, name, comment)),
 
   /** 合并草稿到权威技能库(唯一写入)。 */
   mergeSkillTrainRun: (a: AuthSession, runId: string, name?: string) =>
-    jsonOrThrow<{ ok: boolean; results: Array<{ name: string; ok: boolean; error?: string }> }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/skill-training/${encodeURIComponent(runId)}/merge`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(name ? { name } : {}),
-        }),
-      ),
-    ),
+    withCardBusinessApi(a, undefined, client => client.mergeSkillTrainRun(a, runId, name)),
 
   // ── 教程工作室（公开目录 / 快照 / 管理评测） ────────────────────────────
 
