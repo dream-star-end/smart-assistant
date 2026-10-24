@@ -306,6 +306,7 @@ function requestToken(init?: RequestInit): string {
 
 async function openAgentPicker() {
   fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+  await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
 function teamChoice() {
