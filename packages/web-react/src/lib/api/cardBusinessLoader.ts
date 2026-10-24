@@ -10,9 +10,5 @@ export async function withCardBusinessApi<T>(auth: AuthSession, guard: RequestEx
   const now = auth.snapshot()
   if (now.epoch !== used.epoch) throw new AuthEpochStaleError()
   guard?.assertCurrent()
-  const result = await invoke(module.cardBusinessApi)
-  // Default human clients retain their existing transparent refresh after dispatch.
-  if (auth.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError()
-  guard?.assertCurrent()
-  return result
+  return invoke(module.cardBusinessApi)
 }

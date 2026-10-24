@@ -154,49 +154,49 @@ export function useChatCardActions({
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setMessageFeedback(ctx);
   }, []);
-  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮 + 连接器写操作确认卡的
-  // 鉴权动作）。稳定引用经 context 注入，不污染 ToolCard 数据契约。demo 无网络 → 不提供
-  //（按钮自动隐藏 / 确认卡降级纯展示）。authRef 是稳定 ref，不入依赖。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, setCollapsed are App useState setter/useRef passed in, stable
-  const toolActions = useMemo(
-    () =>
-      demo
-        ? {}
-        : {
-            onOpenMemory: () => openManage("memory"),
-            onOpenSkills: () => openManage("skills"),
-            onOpenTasks: () => openManage("cron"),
-            downloadLiteratureArtifact: (artifactId: string) =>
-              api.downloadLiteratureArtifact(authRef.current, artifactId),
-            literatureArtifactMeta: (artifactId: string) =>
-              api.literatureArtifactMeta(authRef.current, artifactId),
-            connectorConfirm: {
-              getDetail: (id: string) => api.getConnectorConfirmation(authRef.current, id),
-              decide: (id: string, decision: "approve" | "deny") =>
-                api.decideConnectorConfirmation(authRef.current, id, decision),
-            },
-            ...(TASKBOARD_ENABLED
-              ? {
-                  taskApproval: {
-                    getTicket: async (id: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.getTicket(authRef.current, id);
-                    },
-                    approve: async (id: string, expectedVersion: number) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.approve(authRef.current, id, expectedVersion);
-                    },
-                    reject: async (id: string, expectedVersion: number, reason: string) => {
-                      const { taskboardApi } = await import("../lib/taskboard");
-                      return taskboardApi.reject(authRef.current, id, expectedVersion, reason);
-                    },
-                  },
-                  onOpenTaskboard: () => {
-                    setCollapsed(false);
-                    setBoardOpen(true);
-                  },
-                }
-              : {}),
+  const cardAuth = authRef.current;
+  const toolActions = useMemo<ToolCardActions>(() => {
+    if (demo) return {};
+    const auth = cardAuth;
+    const assertCurrent = () => {
+      if (!identity) throw new Error("请等待登录状态核验完成");
+      assertResolvedIdentity(identity, authRef.current);
+    };
+    const guard = { assertCurrent };
+    let io: Promise<LegacyCardIo> | undefined;
+    function defer<K extends keyof LegacyCardIo>(key: K): LegacyCardIo[K] {
+      return (async (...args: unknown[]) => {
+        assertCurrent();
+        io ??= import('../lib/legacyCardIo').then(module => {
+          assertCurrent();
+          return module.createLegacyCardIo(auth, guard);
+        }).catch(error => { io = undefined; throw error; });
+        const client = await io;
+        assertCurrent();
+        return Reflect.apply(client[key], null, args);
+      }) as LegacyCardIo[K];
+    }
+    const verified = identityIsCurrent(identity, auth);
+    return {
+      systemActions,
+      onOpenMemory: () => openManage("memory"),
+      onOpenSkills: () => openManage("skills"),
+      onOpenTasks: () => openManage("cron"),
+      downloadLiteratureArtifact: (id: string) => api.downloadLiteratureArtifact(authRef.current, id),
+      literatureArtifactMeta: (id: string) => api.literatureArtifactMeta(authRef.current, id),
+      ...(verified ? {
+        connectorConfirm: {
+          getDetail: defer('connectorDetail'),
+          decide: defer('connectorDecide'),
+        },
+      } : {}),
+      ...(TASKBOARD_ENABLED ? {
+        onOpenTaskboard: () => { setCollapsed(false); setBoardOpen(true); },
+        ...(verified ? {
+          taskApproval: {
+            getTicket: defer('taskGet'),
+            approve: defer('taskApprove'),
+            reject: defer('taskReject'),
           },
     [demo, openManage, setBoardOpen],
   );
