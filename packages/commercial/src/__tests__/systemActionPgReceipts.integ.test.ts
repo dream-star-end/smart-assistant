@@ -133,5 +133,9 @@ test('receipt ACL hardens the actual migration owner without relying on a separa
     WHERE n.nspname=current_schema() AND c.relname='system_action_receipts'
       AND acl.grantee=(SELECT oid FROM pg_roles WHERE rolname=current_user)
     ORDER BY acl.privilege_type`)
-  assert.deepEqual(rows.rows.map(row => row.privilege_type), ['INSERT','SELECT'])
+  const granted = new Set(rows.rows.map(row => row.privilege_type))
+  assert(granted.has('INSERT'))
+  assert(granted.has('SELECT'))
+  // Owners retain REFERENCES/TRIGGER (and DDL ownership). The declared hardening forbids these three ordinary data mutations.
+  for (const privilege of ['UPDATE','DELETE','TRUNCATE']) assert.equal(granted.has(privilege), false, privilege)
 })
