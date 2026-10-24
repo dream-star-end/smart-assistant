@@ -239,8 +239,6 @@ import { AppDialogs } from "./components/AppDialogs";
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
-const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
-const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const TutorialCenter = lazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
