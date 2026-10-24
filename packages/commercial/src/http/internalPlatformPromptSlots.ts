@@ -55,7 +55,7 @@ import { getLiteratureSkillConfig } from "../admin/literatureConfig.js";
 import { LITERATURE_SKILL_POINTER } from "../literatureSkill.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { CatalogSource } from "./internalModelCatalog.js";
-import { INTELLIGENT_UI_SLOT_NAME, resolveIntelligentUiSlot } from "../intelligentUi/index.js";
+import { INTELLIGENT_UI_SLOT_NAME, resolveIntelligentUiSlot, type IntelligentUiSurface } from "../intelligentUi/index.js";
 
 /** Container → master GET 这个 path 拿平台级 slot。挂在 plain 18791 self-host
  *  和 mTLS 18443 remote-host 同一个 listener,与 anthropicProxy / serverAuthored /
@@ -119,7 +119,7 @@ export interface PlatformPromptSlotsHandlerDeps {
    * 测试 hook:Intelligent UI slot(OCV5-361)。默认按总开关 + 该容器所属用户的偏好决定。
    * uid 只从容器身份推导,绝不从 query 取。
    */
-  resolveIntelligentUi?: (userId: number) => Promise<{ name: string; content: string } | null>;
+  resolveIntelligentUi?: (userId: number, options?: { surface?: IntelligentUiSurface }) => Promise<{ name: string; content: string } | null>;
 }
 
 /** Listener 路由层透传的容器请求 ctx(host + bound peer ip),与
@@ -190,9 +190,11 @@ export function makePlatformPromptSlotsHandler(
     // 2) Parse ?model= query。空 / 缺省 → 不出 MODEL_HINT,合法。
     //    超长 → 静默截断;真实 model_id 远小于 cap。
     let modelId: string | undefined;
+    let surface: IntelligentUiSurface | undefined;
     let sessionId: string | undefined;
     try {
       const url = new URL(req.url ?? "/", "http://internal");
+      if (url.searchParams.get("surface") === "taskboard") surface = "taskboard";
       const sid = url.searchParams.get("sessionId");
       if (sid && sid.length <= 256) sessionId = sid;
       const raw = url.searchParams.get("model");
@@ -268,7 +270,8 @@ export function makePlatformPromptSlotsHandler(
     // Intelligent UI(OCV5-361):总开关开 且 用户没关 → 下发组件协议。放在最后:
     // 容器侧按自己的 slot 顺序落位,这里的数组顺序不影响最终位置。
     try {
-      const iui = await (deps.resolveIntelligentUi ?? resolveIntelligentUiSlot)(containerUserId);
+      const resolveIui = deps.resolveIntelligentUi ?? resolveIntelligentUiSlot;
+      const iui = surface === "taskboard" ? await resolveIui(containerUserId, { surface }) : await resolveIui(containerUserId);
       if (iui && ALLOWED_SLOT_NAMES.has(iui.name)) slots.push(iui);
     } catch (err) {
       reqLog.warn("intelligent_ui_slot_failed", { err: errString(err) });

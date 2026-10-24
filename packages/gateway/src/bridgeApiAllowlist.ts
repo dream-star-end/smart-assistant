@@ -401,7 +401,7 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   },
   {
     label: '/api/board/tickets/:id/:action',
-    re: /^\/api\/board\/tickets\/[^/]+\/(ready|claim|advance|block|approve|reject|done|cancel|comment|patrol|move)$/,
+    re: /^\/api\/board\/tickets\/[^/]+\/(ready|claim|advance|block|approve|reject|done|cancel|comment|patrol|stop|move)$/,
     methods: M('POST'),
     proxyFromCommercial: true,
   },

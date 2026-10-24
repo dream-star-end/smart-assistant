@@ -18,12 +18,14 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
 import { type AgentsConfig, paths } from '@openclaude/storage'
 import { filterUserVisibleByAgentField } from '../agentVisibility.js'
-import { handleTaskboardApi, resolveTaskboardActor } from '../taskboard/http.js'
+import { handleTaskboardApi, resolveTaskboardActor, type TaskboardHttpContext } from '../taskboard/http.js'
 import type { WebhookRouter } from '../webhooks.js'
 import type { Gateway, GatewayDeps } from '../server.js'
 import { type HttpRoute, predicateRoute, regexRoute } from './routeTable.js'
 
 export interface WorkspaceApiRoutesIo {
+  preflightStages: NonNullable<TaskboardHttpContext['preflightStages']>
+  getRunSnapshots: NonNullable<TaskboardHttpContext['getRunSnapshots']>
   _getAgentsConfigUserView(): Promise<AgentsConfig>
   _handleTaskItem(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void>
   _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void>
@@ -198,7 +200,7 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|move)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|stop|move)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||
@@ -214,6 +216,8 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/),
     (io, req, res, url) => {
       handleTaskboardApi(req, res, {
+        preflightStages: io.preflightStages,
+        getRunSnapshots: (runs) => io.getRunSnapshots(runs),
         resolveActor: (r) =>
           resolveTaskboardActor(r, {
             jwtSecret: io.deps.config.gateway.accessToken,

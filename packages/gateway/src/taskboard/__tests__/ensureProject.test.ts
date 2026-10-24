@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
-import { createProject, deriveProjectKey, ensureProjectById, listPipelines, openTaskboardDb } from '../db/index.js'
+import { createProject, deriveProjectKey, ensureProjectById, listPipelines, listStages, updateStage, openTaskboardDb } from '../db/index.js'
 
 const ID_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const ID_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
@@ -27,6 +27,18 @@ describe('ensureProjectById', () => {
     assert.equal(project.key, 'V5')
     assert.deepEqual(project.workspaceSpec, { kind: 'isolated' })
     assert.ok(listPipelines(d, ID_A).length > 0)
+    for (const pipe of listPipelines(d, ID_A)) {
+      for (const stage of listStages(d, pipe.id).filter((s) => s.kind === 'ai')) {
+        assert.equal(stage.agentId, null)
+        assert.equal(stage.patrolEnabled, false)
+      }
+    }
+    const first = listStages(d, listPipelines(d, ID_A)[0]!.id)[0]!
+    updateStage(d, first.id, { agentId: 'chosen-later', model: 'explicit-model', patrolEnabled: true })
+    ensureProjectById(d, { id: ID_A, name: '重复进入' })
+    assert.equal(listStages(d, first.pipelineId)[0]!.agentId, 'chosen-later')
+    assert.equal(listStages(d, first.pipelineId)[0]!.model, 'explicit-model')
+    assert.equal(listStages(d, first.pipelineId)[0]!.patrolEnabled, true)
   })
 
   test('is idempotent: a second call returns the same row unchanged', () => {
