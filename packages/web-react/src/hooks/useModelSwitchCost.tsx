@@ -181,9 +181,10 @@ export function useModelSwitchCost({
         }
       })()
       flight.current.set(flightKey, work)
-      void work.finally(() => {
+      const clearFlight = () => {
         if (flight.current.get(flightKey) === work) flight.current.delete(flightKey)
-      })
+      }
+      void work.then(clearFlight, clearFlight)
       return work
     },
     [authRef, confirmDialog, toast],

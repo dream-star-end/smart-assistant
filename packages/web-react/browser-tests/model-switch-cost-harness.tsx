@@ -1,4 +1,4 @@
-const balance = '10000'
+let balance = '10000'
 import { useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Composer } from '../src/components/Composer'
@@ -31,7 +31,7 @@ api.modelSwitchCost = async (_auth, input, proof) => {
     currentCost:
       mode === 'risk' ? null : { lowCredits: '5', expectedCredits: '5', highCredits: '6' },
     targetUnitPrice: { input: '598', output: '3598', cacheRead: '60', cacheWrite: '0' },
-    balanceCredits: '10000',
+    balanceCredits: balance,
     requiresConfirmation: confirmedId !== input.requestId,
     canConfirm: balance !== '1',
     expiresAt: Date.now() + 300000,
@@ -68,6 +68,17 @@ function Harness() {
         <button
           type="button"
           onClick={() => {
+            balance = '1'
+            mode = 'estimate'
+            confirmedId = ''
+          }}
+        >
+          low balance fixture
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            balance = '10000'
             mode = 'risk'
             confirmedId = ''
           }}
@@ -101,10 +112,10 @@ function Harness() {
           }
           onCancelReply={() => setReply(false)}
           onUpload={async () => ({
-            type: 'file',
+            kind: 'file',
             url: '/fixture-file',
-            name: 'fixture.txt',
-            mime: 'text/plain',
+            filename: 'fixture.txt',
+            mimeType: 'text/plain',
           })}
           onSend={async (text) => {
             const permit = await authorize(

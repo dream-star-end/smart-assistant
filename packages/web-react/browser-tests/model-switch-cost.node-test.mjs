@@ -62,6 +62,14 @@ test(
       })
       const input = page.getByRole('textbox', { name: '消息输入框' })
       await input.fill('keep this draft')
+      await page
+        .locator('input[type=file]')
+        .setInputFiles({
+          name: 'fixture.txt',
+          mimeType: 'text/plain',
+          buffer: Buffer.from('cost fixture'),
+        })
+      await page.getByText('fixture.txt', { exact: true }).waitFor()
       await page.getByRole('button', { name: 'quote message', exact: true }).click()
       await page.getByRole('button', { name: 'select expensive', exact: true }).click()
       await page.getByText('切换后首次会话将重建全部上下文，价格较高', { exact: true }).waitFor()
@@ -76,6 +84,21 @@ test(
       await page.getByRole('button', { name: '取消', exact: true }).click()
       assert.equal(await input.inputValue(), 'keep this draft')
       assert.equal(await page.getByTestId('sent').innerText(), '')
+      assert.equal(await page.getByText('fixture.txt', { exact: true }).count(), 1)
+      assert.equal(await page.getByText('quoted message', { exact: true }).count(), 1)
+      await page.getByRole('button', { name: 'low balance fixture', exact: true }).click()
+      await page.getByRole('button', { name: 'select expensive', exact: true }).click()
+      await page.getByText('余额不足，请充值后重试或取消切换。', { exact: true }).waitFor()
+      assert.equal(
+        await page.getByRole('button', { name: '压缩并切换', exact: true }).isDisabled(),
+        true,
+      )
+      assert.equal(
+        await page.getByRole('button', { name: '直接切换', exact: true }).isDisabled(),
+        true,
+      )
+      await page.getByRole('button', { name: '取消', exact: true }).click()
+      assert.equal(await input.inputValue(), 'keep this draft')
       await page.getByRole('button', { name: 'risk fixture', exact: true }).click()
       await page.getByRole('button', { name: 'select expensive', exact: true }).click()
       await page.getByText('无法预估本轮费用', { exact: true }).waitFor()
