@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useAuthAccessGeneration } from "./useAuthAccessGeneration";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import type { AuthSession } from "../lib/types";
 
@@ -17,9 +18,7 @@ const POLL_MS = 60_000;
  */
 export function useInbox(auth: AuthSession | null, enabled: boolean) {
   const [unreadCount, setUnreadCount] = useState(0);
-  const subscribe = useCallback((listener: () => void) => auth?.subscribeAccessGeneration?.(listener) ?? (() => {}), [auth]);
-  const getGeneration = useCallback(() => auth?.getAccessGeneration?.() ?? -1, [auth]);
-  const accessGeneration = useSyncExternalStore(subscribe, getGeneration, getGeneration);
+  const accessGeneration = useAuthAccessGeneration(auth);
   const authRef = useRef(auth);
   authRef.current = auth;
   // 代际守卫：登出/换号时 bump，丢弃旧登录态在途请求的迟到响应（防跨账号未读残留）。
