@@ -40,7 +40,7 @@ test('per-user kernel flock serializes competing CAS updates, exactly one genera
   assert.equal(results.filter(r => r.status === 'rejected').length, 1)
   assert.ok(['one', 'two'].includes(await readFile((await readAuthorityGeneration(store)).paths.sharedUserMd, 'utf8')))
 })
-for (const phase of ['manifest-visible', 'manifest-durable'] as const) test(`${phase}: visible receipt stays unknown until trusted recovery completes durability without reapplying business data`, async () => {
+for (const phase of ['manifest-visible', 'manifest-durable', 'seal-prepared'] as const) test(`${phase}: visible receipt stays unknown until trusted recovery completes durability without reapplying business data`, async () => {
   const { store, base } = await setup()
   const action = binding()
   await assert.rejects(publishProfileGeneration(store, { baseManifestSha256: base.manifestSha256, expectedVersion: profileSnapshot('original profile').version, text: 'approved after crash', binding: action }, { faultAfter: phase }), /unknown/)
@@ -48,6 +48,7 @@ for (const phase of ['manifest-visible', 'manifest-durable'] as const) test(`${p
   await assert.rejects(findProfileGenerationReceipt(store, action))
   const state = join(store.hostRoot, 'u765/state')
   const manifestSha256 = sha(await readFile(join(state, 'current.json'), 'utf8'))
+  if (phase === 'seal-prepared') await assert.rejects(readFile(join(state, 'commits', `${manifestSha256}.json`)), { code: 'ENOENT' })
   const permit = { manifestSha256, parentManifestSha256: base.manifestSha256, binding: action, profileSha256: sha('approved after crash') }
   await assert.rejects(recoverProfileGeneration(store, { ...permit, binding: { ...action, inputHash: sha('wrong') } }), /unknown/)
   await assert.rejects(findProfileGenerationReceipt(store, action))
@@ -92,11 +93,11 @@ test('symlink and external hardlink payloads fail closed without repairing the t
   }
 })
 
-test('initial baseline interrupted after current rename can only recover with an exact authorized baseline permit', async () => {
+for (const faultAfter of ['manifest-visible', 'seal-prepared'] as const) test(`initial baseline interrupted at ${faultAfter} only recovers with an exact authorized baseline permit`, async () => {
   const hostRoot = await mkdtemp(join(tmpdir(), 'oc-authority-baseline-'))
   await chmod(hostRoot, 0o700)
   const store = { hostRoot, userId: '765' }
-  await assert.rejects(initializeAuthorityGeneration(store, 'baseline', { faultAfter: 'manifest-visible' }))
+  await assert.rejects(initializeAuthorityGeneration(store, 'baseline', { faultAfter }))
   await assert.rejects(readAuthorityGeneration(store))
   await assert.rejects(initializeAuthorityGeneration(store, 'replacement'))
   const manifestSha256 = sha(await readFile(join(hostRoot, 'u765/state/current.json'), 'utf8'))

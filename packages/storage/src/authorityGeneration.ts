@@ -21,7 +21,7 @@ export type AuthorityGeneration = Readonly<{
   /** Private verified snapshot, not a mutable on-disk writer. */
   manifest: Readonly<Manifest>
 }>
-export type GenerationFault = 'generation-durable' | 'manifest-visible' | 'manifest-durable' | 'seal-durable'
+export type GenerationFault = 'generation-durable' | 'manifest-visible' | 'manifest-durable' | 'seal-prepared' | 'seal-durable'
 /** Fixed fault names are solely a crash-test seam; no user callbacks/commands are accepted. */
 type TestFault = { faultAfter?: GenerationFault }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -144,19 +144,26 @@ export async function findProfileGenerationReceipt(store: AuthorityStore, expect
   if (!bytes(receipt.binding).equals(bytes(exact))) throw unknown()
   return receipt
 }
-async function atomicMetadata(state: string, name: string, value: Buffer) {
+async function atomicMetadata(state: string, name: string, value: Buffer, fault?: TestFault) {
   const temp = join(state, `.${name}-${randomUUID()}`)
   await writeFile(temp, value, { flag: 'wx', mode: 0o444 })
   await sync(temp)
+  if (fault) crash(fault, 'seal-prepared')
   await rename(temp, join(state, name))
 }
 function crash(fault: TestFault, phase: GenerationFault) { if (fault.faultAfter === phase) throw unknown() }
-async function sealCurrent(store: AuthorityStore, m: Manifest, sha: string) {
+async function sealCurrent(store: AuthorityStore, m: Manifest, sha: string, fault: TestFault = {}) {
   const loc = await locations(store)
   const proof = bytes({ version: 1, userId: store.userId, generation: m.generation, manifestSha256: sha })
   const history = join(loc.commits, `${sha}.json`)
-  try { await writeFile(history, proof, { flag: 'wx', mode: 0o444 }) } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST' || !(await regular(history, 1024)).equals(proof)) throw err
+  // Every publisher/recovery holds this uid's stable flock; never replace an observed proof.
+  let present = true
+  try { await lstat(history) } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; present = false }
+  if (present) {
+    if (!(await regular(history, 1024)).equals(proof)) throw unknown()
+  } else {
+    // A crash can only leave an unpublished temporary file, never a partial final seal.
+    await atomicMetadata(loc.commits, `${sha}.json`, proof, fault)
   }
   await sync(history)
   await sync(loc.commits)
@@ -182,7 +189,7 @@ async function publish(store: AuthorityStore, stage: string, manifest: Manifest,
   crash(fault, 'manifest-visible')
   await sync(loc.state)
   crash(fault, 'manifest-durable')
-  await sealCurrent(store, manifest, hash(raw))
+  await sealCurrent(store, manifest, hash(raw), fault)
   crash(fault, 'seal-durable')
 }
 async function stageDirectory(loc: Awaited<ReturnType<typeof locations>>, generation: string) {
@@ -303,7 +310,7 @@ export async function recoverBaselineAuthorityGeneration(store: AuthorityStore, 
     const current = await readCurrent(store, false)
     if (current.manifestSha256 !== permit.manifestSha256 || current.manifest.parent !== null || current.manifest.files.length !== 1 || current.manifest.files[0]?.path !== 'data/user.md') throw unknown()
     const history = await readdir(loc.commits)
-    if (history.some(name => name !== `${current.manifestSha256}.json`) || JSON.stringify(await readdir(loc.generations)) !== JSON.stringify([current.manifest.generation])) throw unknown()
+    if (history.some(name => name !== `${current.manifestSha256}.json` && !/^\.[0-9a-f]{64}\.json-[0-9a-f-]{36}$/.test(name)) || JSON.stringify(await readdir(loc.generations)) !== JSON.stringify([current.manifest.generation])) throw unknown()
     const profile = await regular(join(current.root, 'data/user.md'), 1048576)
     if (hash(profile) !== permit.profileSha256) throw unknown()
     await sync(join(current.root, 'data/user.md'))
