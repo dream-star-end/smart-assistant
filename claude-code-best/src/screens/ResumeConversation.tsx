@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../utils/sessionTransition.js'
 import { feature } from 'bun:bundle';
 import type { UUID } from 'crypto';
 import { dirname } from 'path';
@@ -212,6 +213,7 @@ export function ResumeConversation({
   }
 
   async function onSelect(log: LogOption) {
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
     setResuming(true);
     const resumeStart = performance.now();
 
@@ -258,6 +260,7 @@ export function ResumeConversation({
       }
 
       if (result.sessionId && !forkSession) {
+        if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
         switchSession(asSessionId(result.sessionId), log.fullPath ? dirname(log.fullPath) : null);
         await renameRecordingForSession();
         await resetSessionFilePointer();

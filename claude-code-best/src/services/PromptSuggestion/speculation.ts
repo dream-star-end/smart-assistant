@@ -41,7 +41,7 @@ import {
 } from '../../utils/messages.js'
 import { getClaudeTempDir } from '../../utils/permissions/filesystem.js'
 import { extractReadFilesFromMessages } from '../../utils/queryHelpers.js'
-import { getTranscriptPath } from '../../utils/sessionStorage.js'
+import { appendEntryToFile, getTranscriptPath } from '../../utils/sessionStorage.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -790,7 +790,9 @@ export async function acceptSpeculation(
       timestamp: new Date().toISOString(),
       timeSavedMs,
     }
-    void appendFile(getTranscriptPath(), jsonStringify(entry) + '\n', {
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
+      await appendEntryToFile(getTranscriptPath(), entry)
+    } else void appendFile(getTranscriptPath(), jsonStringify(entry) + '\n', {
       mode: 0o600,
     }).catch(() => {
       logForDebugging(
