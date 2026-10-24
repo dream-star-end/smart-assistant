@@ -237,6 +237,9 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
+const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
+const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const TutorialCenter = lazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
@@ -532,6 +535,10 @@ export function App() {
   const {
     auth,
     authRef: authSessionRef,
+    resolvedIdentity,
+    pendingAccount,
+    accountSwitchReady,
+    acceptAccountSwitch,
     authed,
     user,
     authLoading,
@@ -584,6 +591,15 @@ export function App() {
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
+    onAccountSwitchPending: () => {
+      setContainerPreviewUrl(null);
+      setSettingsOpen(false);
+      setMediaTasksOpen(false);
+      setLiveMediaJob(null);
+      setManageAutoAuthorizePluginSlug(null);
+      setOrgOpen(false);
+      setTutorialOpen(false);
+    },
     // 启动静默续期成功 → 直接恢复工作区。
     onBootAuthed: () => {
       imageByteCache.clear();
@@ -1657,6 +1673,9 @@ export function App() {
   if (!demo && booting) {
     return <BootSplash />;
   }
+  if (!demo && pendingAccount) return <LazyBoundary fallback={<SplashFallback />}>
+    <AccountSwitchNotice name={pendingAccount.displayName} ready={accountSwitchReady} onAccept={acceptAccountSwitch} onRetry={retryBoot} />
+  </LazyBoundary>;
   // A transient boot failure is not a logout. Surface the dedicated recovery
   // action immediately instead of hiding it behind the ordinary landing page.
   if (!demo && view === "home" && !authRecoveryAvailable && !desktopEnroll) {

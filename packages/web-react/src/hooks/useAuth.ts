@@ -50,6 +50,8 @@ export type UseAuthOptions = {
   onClearAuth: () => void;
   /** 登出独有的持久层收尾（清本 user 的 IndexedDB 命名空间等；仅非 demo 时调用）。 */
   onLogout?: () => void;
+  /** Hide private UI while retaining valid credentials for an explicit account switch. */
+  onAccountSwitchPending?: () => void;
   /** 启动静默续期成功 → 进工作区（App 侧 setView("app")）。 */
   onBootAuthed?: () => void;
   /**
@@ -67,6 +69,10 @@ export type UseAuth = {
   authRef: React.MutableRefObject<AuthSession>;
   authed: boolean;
   user: User | null;
+  resolvedIdentity: ResolvedIdentity | null;
+  pendingAccount: User | null;
+  accountSwitchReady: boolean;
+  acceptAccountSwitch: () => void;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   authLoading: boolean;
   authError: string | null;
@@ -110,7 +116,18 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // commit 都必须带起始 epoch，旧账号的晚到响应因此无法污染新身份。
   const expiredUiRef = useRef<() => void>(() => {});
   const [authed, setAuthed] = useState(false);
-  const [user, setUser] = useState<User | null>(opts.initialUser);
+  const [account, setAccount] = useState<{ user: User | null; identity: ResolvedIdentity | null }>({ user: opts.initialUser, identity: null });
+  const user = account.user;
+  const identityRef = useRef<ResolvedIdentity | null>(null);
+  const lastVerifiedUid = useRef<string | null>(null);
+  const [pendingAccount, setPendingAccount] = useState<{ user: User; identity: ResolvedIdentity; auth: AuthSession } | null>(null);
+  const pendingAccountRef = useRef(pendingAccount);
+  // A display setter never grants an identity. Revoke synchronously before React commits.
+  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
+    revokeResolvedIdentity(identityRef.current);
+    identityRef.current = null;
+    setAccount(previous => ({ user: typeof update === 'function' ? update(previous.user) : update, identity: null }));
+  }, []);
   const userRef = useRef(user);
   userRef.current = user;
   const [authLoading, setAuthLoading] = useState(false);
@@ -130,10 +147,34 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // invalid 消费者只触发一次 UI teardown。
   const authRef = useRef<AuthSession>(createMemoryAuthSession(() => expiredUiRef.current()));
 
+  const generation = useAuthAccessGeneration(authRef.current);
+  const validation = useRef<{
+    auth: AuthSession; epoch: number; generation: number;
+    identity?: ResolvedIdentity | null;
+    promise: Promise<{ me: User; identity: ResolvedIdentity | null }>;
+  } | null>(null);
+  const commitVerifiedUser = useCallback((nextUser: User, nextIdentity: ResolvedIdentity | null) => {
+    const session = authRef.current;
+    if (nextIdentity && !identityIsCurrent(nextIdentity, session, nextUser.id)) return false;
+    const previous = identityRef.current;
+    const identity = nextIdentity && identityIsCurrent(previous, session, nextUser.id) ? previous : nextIdentity;
+    if (previous !== identity) revokeResolvedIdentity(previous);
+    identityRef.current = identity;
+    if (identity) lastVerifiedUid.current = nextUser.id;
+    pendingAccountRef.current = null;
+    setPendingAccount(null);
+    setAccount({ user: nextUser, identity });
+    return true;
+  }, []);
+  const resolvedIdentity = authed && user && identityIsCurrent(account.identity, authRef.current, user.id) ? account.identity : null;
+
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
-    teardownComposerDrafts(userRef.current?.id);
+    teardownComposerDrafts(lastVerifiedUid.current ?? userRef.current?.id);
+    lastVerifiedUid.current = null;
+    pendingAccountRef.current = null;
+    setPendingAccount(null);
     // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();
@@ -148,6 +189,27 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     cbRef.current.onClearAuth();
   }, []);
   expiredUiRef.current = clearAuthState;
+
+  const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
+    const session = authRef.current;
+    if (identity && !identityIsCurrent(identity, session, me.id)) return false;
+    // Commit a suspended workspace before offering the verified new account.
+    // The token remains valid; auth=null stops the old WS without logging out.
+    if (identity && lastVerifiedUid.current && lastVerifiedUid.current !== me.id) {
+      revokeResolvedIdentity(identityRef.current);
+      identityRef.current = null;
+      setAccount(previous => ({ ...previous, identity: null }));
+      const pending = { user: me, identity, auth: session };
+      pendingAccountRef.current = pending;
+      setPendingAccount(pending);
+      setAuthed(false);
+      setLaneSignal(undefined);
+      setBooting(false);
+      cbRef.current.onAccountSwitchPending?.();
+      return false;
+    }
+    return commitVerifiedUser(me, identity);
+  }, [commitVerifiedUser]);
 
   const clearAuth = useCallback(() => {
     authRef.current.beginIdentity();
@@ -316,6 +378,19 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setAuthRecoveryAvailable(false);
     setBooting(true);
   }, []);
+  const accountSwitchReady = !!pendingAccount && pendingAccount.auth === authRef.current && identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id);
+  const acceptAccountSwitch = useCallback(() => {
+    if (!pendingAccount || pendingAccountRef.current !== pendingAccount || pendingAccount.auth !== authRef.current ||
+      !identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id)) return;
+    if (!commitVerifiedUser(pendingAccount.user, pendingAccount.identity)) return;
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+    setAuthed(true);
+    setLaneSignal({ lane: pendingAccount.user.lane ?? null });
+    setAuthHint();
+    cbRef.current.onLoginSuccess?.();
+    cbRef.current.onBootAuthed?.();
+  }, [pendingAccount, commitVerifiedUser]);
 
   // 其它同源 tab 主动登出：立即作废本 tab 的 epoch/token 和在飞 refresh，不等旧 access JWT
   // 自然过期；信号不携带任何 token。
@@ -407,6 +482,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     authRef,
     authed,
     user,
+    resolvedIdentity,
+    pendingAccount: pendingAccount?.user ?? null,
+    accountSwitchReady,
+    acceptAccountSwitch,
     setUser,
     authLoading,
     authError,
