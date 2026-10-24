@@ -57,7 +57,7 @@ export function ensureProjectById(
           name,
           ...(input.workspaceSpec ? { workspaceSpec: input.workspaceSpec } : {}),
         })
-        seedDefaultPipelines(db, created.id)
+        seedDefaultPipelines(db, created.id, undefined, { executionAgentId: null })
         return created
       })()
       return { project, created: true }

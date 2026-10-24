@@ -1,11 +1,7 @@
 // 默认流水线种子 — 四种单据类型各一条,幂等可重入。
 //
-// agentId 来自本实例 $OPENCLAUDE_HOME/agents.yaml(2026-08-16 核实):
-//   main / codex / hidden-reviewer / auditor / coding-assistant /
-//   explorer / general-assistant / office-assistant
-// hidden-reviewer 禁止绑到用户可见 stage(recon E16 / agentVisibility)。
-// 分工:定位根因与调研 → explorer;写代码 → coding-assistant;
-// 自验审查 → auditor;需求澄清 / 明确问题 / 结论汇总 → general-assistant。
+// 新内置 AI 阶段只绑定调用方显式选择的助手；未配置时保留空绑定且关闭巡检。
+// 旧阶段幂等跳过，不静默迁移已有助手/模型。
 //
 // 幂等:pipeline / stage 使用确定性 id(`${projectId}::${type}` /
 // `${projectId}::${type}::${ordinal}`),已存在则跳过,不覆盖用户改过的提示词。
@@ -27,13 +23,7 @@ import { TaskboardNotFound } from './schema.js'
 
 export const DEFAULT_PATROL_CRON = '*/30 9-19 * * 1-5'
 
-/**
- * 种子实际绑定的 agent。来源:$OPENCLAUDE_HOME/agents.yaml。
- *
- * 这些是阶段专用 agent,人设按「无人值守、禁止反问、固定移交结构」写。
- * 它们在 agents.yaml 里**不带 source**:带 source 的市场 agent 每次同步都会
- * 被打回默认模型绑定,阶段配置留不住。
- */
+/** Legacy role ids retained in the prompt definitions; not default executable bindings. */
 export const SEED_AGENT_IDS = {
   triage: 'stage-triage',
   diagnose: 'stage-diagnose',
@@ -403,12 +393,16 @@ export interface BuiltinPipelineTemplate {
 }
 
 /** 内置模板 = 种子流水线,同一份定义。id 形如 builtin:bug。 */
-export function listBuiltinPipelineTemplates(): BuiltinPipelineTemplate[] {
+export interface BuiltinExecutionOptions {
+  executionAgentId?: string | null
+}
+
+export function listBuiltinPipelineTemplates(options: BuiltinExecutionOptions = {}): BuiltinPipelineTemplate[] {
   return PIPELINES.map((pipe) => ({
     id: builtinTemplateId(pipe.type),
     ticketType: pipe.type,
     name: pipe.name,
-    stages: pipe.stages,
+    stages: pipe.stages.map((stage) => ({ ...stage, agentId: stage.kind === 'ai' ? options.executionAgentId?.trim() || null : null })),
     patrolCron: DEFAULT_PATROL_CRON,
     quietHoursStart: GUARDRAIL_DEFAULTS.quietHoursStart,
     quietHoursEnd: GUARDRAIL_DEFAULTS.quietHoursEnd,
@@ -417,9 +411,9 @@ export function listBuiltinPipelineTemplates(): BuiltinPipelineTemplate[] {
   }))
 }
 
-export function getBuiltinPipelineTemplate(idOrType: string): BuiltinPipelineTemplate | null {
+export function getBuiltinPipelineTemplate(idOrType: string, options: BuiltinExecutionOptions = {}): BuiltinPipelineTemplate | null {
   const type = parseBuiltinTemplateId(idOrType) ?? (idOrType as TicketType)
-  return listBuiltinPipelineTemplates().find((template) => template.ticketType === type) ?? null
+  return listBuiltinPipelineTemplates(options).find((template) => template.ticketType === type) ?? null
 }
 
 const LEGACY_PROMPT_HASHES_BEFORE_LAST_RUN_OUTPUT = new Set([
@@ -461,13 +455,15 @@ export function seedDefaultPipelines(
   db: TaskboardDb,
   projectId: string,
   types?: TicketType[],
+  options: BuiltinExecutionOptions = {},
 ): SeedResult {
   const project = db.prepare('SELECT id FROM tb_project WHERE id = ?').get(projectId) as
     | { id: string }
     | undefined
   if (!project) throw new TaskboardNotFound('project', projectId)
 
-  const selected = types?.length ? PIPELINES.filter((p) => types.includes(p.type)) : PIPELINES
+  const templates = listBuiltinPipelineTemplates(options)
+  const selected = types?.length ? templates.filter((p) => types.includes(p.ticketType)) : templates
 
   const result: SeedResult = {
     projectId,
@@ -480,7 +476,7 @@ export function seedDefaultPipelines(
 
   const seed = db.transaction(() => {
     for (const pipe of selected) {
-      const pid = pipelineSeedId(projectId, pipe.type)
+      const pid = pipelineSeedId(projectId, pipe.ticketType)
       if (getPipeline(db, pid)) {
         result.skippedPipelines += 1
       } else {
@@ -488,14 +484,14 @@ export function seedDefaultPipelines(
           id: pid,
           projectId,
           name: pipe.name,
-          ticketType: pipe.type,
+          ticketType: pipe.ticketType,
           isDefault: true,
         })
         result.createdPipelines += 1
       }
 
       pipe.stages.forEach((stage, ordinal) => {
-        const sid = stageSeedId(projectId, pipe.type, ordinal)
+        const sid = stageSeedId(projectId, pipe.ticketType, ordinal)
         if (getStage(db, sid)) {
           result.skippedStages += 1
           if (upgradeUnmodifiedSeedPrompt(db, sid, stage.promptTemplate)) {
@@ -519,7 +515,7 @@ export function seedDefaultPipelines(
           requireHumanAck: stage.requireHumanAck,
           effort: stage.effort,
           patrolCron: isAi ? DEFAULT_PATROL_CRON : null,
-          patrolEnabled: isAi,
+          patrolEnabled: isAi && !!stage.agentId,
           patrolTimezone: 'Asia/Shanghai',
           quietHoursStart: GUARDRAIL_DEFAULTS.quietHoursStart,
           quietHoursEnd: GUARDRAIL_DEFAULTS.quietHoursEnd,

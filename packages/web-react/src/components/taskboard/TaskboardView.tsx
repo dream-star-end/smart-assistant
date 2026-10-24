@@ -230,11 +230,20 @@ export function TaskboardView({
       const ok = await confirm({
         title: '单据正在执行',
         body: formatRunningRunMessage(runId),
-        confirmText: '取消并移动',
+        confirmText: '停止本次执行',
         cancelText: '先不移动',
         danger: true,
       })
       if (ok) return runMove(ticket, toStageId, { ...extras, cancelRunningRun: true })
+      return false
+    }
+    if (code === 'stop_pending') {
+      toast('已请求停止，收尾完成后请再次移动任务。', 'success')
+      void board.refresh()
+      return false
+    }
+    if (code === 'run_control_unavailable' || code === 'run_changed') {
+      toast(outcome.error instanceof Error ? outcome.error.message : '执行状态已变化，请稍后重试', 'error')
       return false
     }
     if (code === 'version_conflict') {
@@ -865,6 +874,7 @@ export function TaskboardView({
           <div className={desktop ? 'flex shrink-0 items-center gap-1' : 'hidden'}>
             <ProjectSettings
               auth={auth}
+              agents={board.agents}
               current={currentProject}
               mode={projectMode}
               onModeChange={setProjectMode}
@@ -903,6 +913,7 @@ export function TaskboardView({
             />
             <TemplateLibrary
               auth={auth}
+              agents={board.agents}
               projectId={board.projectId}
               onChanged={() => void board.reconcile()}
               open={templatesOpen}
@@ -1036,6 +1047,7 @@ export function TaskboardView({
         onTicketUpdated={board.replaceTicket}
         onDetailLoaded={setDetailTicket}
         onOpenSession={onOpenSession}
+        onConfigureStage={() => { setReviseOpen(false); onOpenTicket(null); setStageSettingsOpen(true) }}
       />
       {confirmEl}
       {promptEl}

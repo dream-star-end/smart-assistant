@@ -24,13 +24,16 @@ import {
   REVIEW_VERDICT_PASS,
   REVIEW_VERDICT_NEEDS_FIX,
   ADVISOR_AGENT_ID,
+  AGENT_MODEL_AUTO,
 } from '@openclaude/protocol'
 import {
   failureClassFromLocalExecutionCode,
   isDelegateTerminalState,
   type DelegateFailureClass,
 } from '@openclaude/protocol'
-import { mintDelegateTrace, registerDelegateTraceWait } from './delegateTrace.js'
+import { mintDelegateTrace, registerDelegateTraceWait, cancelDelegateTraceWait } from './delegateTrace.js'
+import { TaskboardCancelledError, taskboardRunControls, type TaskboardRunControl } from './taskboard/runControl.js'
+import { readTaskboardDelegateBody, TaskboardBodyTimeoutError } from './taskboard/delegateBody.js'
 import { classifyDelegateOutputError } from './errorClassify.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
 import type { AgentSession } from './sessionManager.js'
@@ -119,6 +122,8 @@ export interface DelegateRuntimeHost {
   _acquireDelegateGrokRoute: Gateway['_acquireDelegateGrokRoute']
   _activeDelegations: Gateway['_activeDelegations']
   _activeDelegationsByParent: Gateway['_activeDelegationsByParent']
+  _interruptDelegationsForParent: Gateway['_interruptDelegationsForParent']
+  _settlePendingPermissionsForStop: Gateway['_settlePendingPermissionsForStop']
   _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _admitDelegateCreate: Gateway['_admitDelegateCreate']
   _applyDelegateCapacityReject: Gateway['_applyDelegateCapacityReject']
@@ -291,6 +296,7 @@ export type DelegateTaskResult =
       message: string
       code?: LocalExecutionRejectCode
       failureClass?: DelegateFailureClass
+      cancelled?: boolean
       /** Capacity reject lost the race to claimQueued; job is already dispatched. */
       alreadyDispatched?: boolean
     }
@@ -301,6 +307,8 @@ export type DelegateTaskResult =
       output: string
       error?: string
       timedOut: boolean
+      cancelled?: boolean
+      actualModel?: string
       runId: string
       verdict?: ReviewVerdict
       /** 从内存 session 抄的用量。taskboard 回写 run;普通 delegate 可忽略。 */
@@ -464,9 +472,13 @@ export type ResolveDelegateParentResult = {
   workspaceMode: 'legacy' | 'isolated_v1'
   billingParentTurnKey?: string
   platformGoal?: GoalStateSnapshot | null
+  workspaceCwd?: string
+  projectId?: string | null
+  frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
 } | null
 
 export type ResolveDelegateParentArgs = {
+    taskboardControl?: TaskboardRunControl
     parentSessionKey?: unknown
     sourceAgent?: unknown
   }
@@ -478,7 +490,8 @@ export function _resolveDelegateParent(
   if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
   const parent = this.sessions.getByKey(args.parentSessionKey)
   if (!parent) return null
-  if (parent.channel !== 'webchat' && parent.channel !== 'delegate') return null
+  if (parent.channel !== 'webchat' && parent.channel !== 'delegate' &&
+      !(parent.channel === 'taskboard' && args.taskboardControl && taskboardRunControls.lookup(parent.sessionKey)?.control === args.taskboardControl)) return null
   if (
     typeof args.sourceAgent === 'string' &&
     args.sourceAgent &&
@@ -503,6 +516,7 @@ export function _resolveDelegateParent(
     // tape/anchor of its own.
     billingParentTurnKey: parent._billingParentTurnKey ?? parent._currentTurnKey,
     platformGoal: parent._platformGoal,
+    ...(args.taskboardControl ? { workspaceCwd: parent.workspaceCwd, projectId: parent.projectId, frozenProjectContext: parent.frozenProjectContext } : {}),
   }
 }
 
@@ -557,8 +571,14 @@ export async function handleDelegateTask(
   const contextHeader = req.headers[DELEGATE_CONTEXT_HEADER]
   const contextRaw = Array.isArray(contextHeader) ? contextHeader[0] : contextHeader
   const entryContext = typeof contextRaw === 'string' ? verifyDelegateContextToken(contextRaw) : null
+  const taskboardBinding = entryContext ? taskboardRunControls.lookup(entryContext.sessionKey) : undefined
+  if (taskboardBinding?.closed) return this.sendJson(res, 409, { error: 'USER_CANCELLED: task execution has finished', code: 'USER_CANCELLED', failure_class: 'cancelled' })
+  const taskboardControl = taskboardBinding?.control ?? undefined
+  let leavePending: (() => void) | undefined
+  try {
+    leavePending = taskboardControl?.enterPending(entryContext!.sessionKey)
   const parentTraceId = entryContext?.traceId
-  const body = await this.readBody(req)
+  const body = await readTaskboardDelegateBody(req, (request) => this.readBody(request), taskboardControl)
   let parsed: any
   try {
     parsed = JSON.parse(body)
@@ -638,7 +658,11 @@ export async function handleDelegateTask(
     : typeof sourceAgent === 'string'
       ? sourceAgent
       : undefined
+  if (!entryContext && parentSessionKey && taskboardRunControls.lookup(parentSessionKey)) {
+    return this.sendError(res, 403, 'taskboard delegation requires signed caller context')
+  }
   const identityProjection = await fetchIdentityCompatProjection()
+  taskboardControl?.assertOpen(parentSessionKey)
   const callerExecutionId =
     identityProjection && sourceAgentId
       ? resolveIdentityCompat(sourceAgentId, identityProjection).executionAgentId
@@ -688,6 +712,7 @@ export async function handleDelegateTask(
     ? this._resolveDelegateProgressTarget({ parentSessionKey, sourceAgent: sourceAgentId })?.target
     : undefined
   const runInput: RunDelegateInput = {
+    taskboardControl,
     allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
     targetAgentId,
     goal,
@@ -909,6 +934,13 @@ export async function handleDelegateTask(
   const result = await this._runDelegateTask(runInput)
   const mapped = this._delegateResultToHttp(result, targetAgentId)
   return this.sendJson(res, mapped.httpStatus, mapped.body)
+  } catch (err) {
+    if (err instanceof TaskboardBodyTimeoutError) return this.sendError(res, 408, err.message)
+    if (err instanceof TaskboardCancelledError) return this.sendJson(res, 409, { error: err.message, code: err.code, failure_class: 'cancelled' })
+    throw err
+  } finally {
+    leavePending?.()
+  }
 }
 
 export function _delegateResultToHttp(
@@ -1026,22 +1058,52 @@ export async function _runDelegateTask(
   input: RunDelegateInput,
 ): Promise<DelegateTaskResult> {
   let sessionSpawned = false
+  let leave: (() => void) | undefined
+  let detachStop: (() => void) | undefined
   try {
-    const result = await this._runDelegateTaskCore(input, {
-      onSessionSpawned: () => {
-        sessionSpawned = true
-      },
-    })
-    if (result.kind === 'completed' && input.resumable && input.sessionKey) {
-      return { ...result, sessionKey: input.sessionKey }
+    const binding = input.parentSessionKey ? taskboardRunControls.lookup(input.parentSessionKey) : undefined
+    if (binding?.closed) throw new TaskboardCancelledError()
+    const control = input.taskboardControl ?? binding?.control ?? undefined
+    if (control) {
+      input.taskboardControl = control
+      input.sessionKey ??= `agent:${input.targetAgentId}:delegate:${input.sourceAgent || 'system'}:${Date.now()}-${randomBytes(4).toString('hex')}`
+      const key = input.sessionKey
+      leave = control.enter(key, key === control.rootSessionKey ? undefined : input.parentSessionKey)
+      const stop = () => {
+        cancelDelegateTraceWait(this, key)
+        this._delegateQueueWaiters?.get(key)?.()
+        try { this._settlePendingPermissionsForStop(key) } catch (err) { this.log.warn('taskboard stop permission cleanup failed', { sessionKey: key, err: String(err) }) }
+        this._interruptDelegationsForParent(key)
+        if (this.sessions.getByKey(key)) this.sessions.interrupt(key, 'user')
+      }
+      control.signal.addEventListener('abort', stop, { once: true })
+      detachStop = () => control.signal.removeEventListener('abort', stop)
+      control.assertOpen()
     }
+    const result = await this._runDelegateTaskCore(input, {
+      onSessionSpawned: () => { sessionSpawned = true },
+    })
+    if (result.kind === 'completed' && control && input.sessionKey) {
+      control.recordResult({ executionId: result.runId, sessionKey: input.sessionKey, agentId: input.targetAgentId, actualModel: result.actualModel, output: result.output, error: result.error, cancelled: result.cancelled, tokensIn: result.tokensIn, tokensOut: result.tokensOut, costUsd: result.costUsd, costImprecise: result.costImprecise })
+    }
+    if (result.kind === 'completed' && input.resumable && input.sessionKey) return { ...result, sessionKey: input.sessionKey }
     return result
+  } catch (err) {
+    if (err instanceof TaskboardCancelledError) return { kind: 'rejected', httpStatus: 409, message: err.message, failureClass: 'cancelled', cancelled: true }
+    throw err
   } finally {
     if (input._leaseTimer) clearInterval(input._leaseTimer)
-    // 任何早退(rejected return 或 throw)都在这里归还 SM 预占的槽位/waiter;过闸后
-    // 预占已被消费(core 内清 flag),此调用为空操作 → 不会双重释放。
-    this._releasePreadmittedDelegateCapacity(input)
-    await this._completeDelegateResumeClaim(input, sessionSpawned)
+    try {
+      this._releasePreadmittedDelegateCapacity(input)
+      await this._completeDelegateResumeClaim(input, sessionSpawned)
+    } finally {
+      if (input.delegationGuardOwnerKey) {
+        this._hiddenDelegateGuard.resetForParent(input.delegationGuardOwnerKey)
+        this._memberDelegateGuard?.resetForParent(input.delegationGuardOwnerKey)
+      }
+      detachStop?.()
+      leave?.()
+    }
   }
 }
 
@@ -1050,6 +1112,8 @@ export async function _runDelegateTaskCore(
   input: RunDelegateInput,
   hooks?: { onSessionSpawned?: () => void },
 ): Promise<DelegateTaskResult> {
+  const cancelledBeforeSpawn: DelegateTaskResult = { kind: 'rejected', httpStatus: 409, message: 'USER_CANCELLED: stopped before model execution', failureClass: 'cancelled', cancelled: true }
+  input.taskboardControl?.assertOpen()
   const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
   let context = input.context
   let isReview = input.isReview === true
@@ -1136,10 +1200,10 @@ export async function _runDelegateTaskCore(
   // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。失败/超时的委派同样占额度:每次
   // 尝试都是全额计费的 delegate session。本闸先于资源闸排队:per-turn 额度等不出来 fail
   // fast、不占等待名额(保守偏置)。
-  const delegateGuardKey =
+  const delegateGuardKey = input.delegationGuardOwnerKey || (
     typeof parentSessionKey === 'string' && parentSessionKey
       ? parentSessionKey
-      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
+      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`)
   if (isTeamReviewExecution(targetAgentId)) {
     const hiddenLimit = resolveHiddenDelegationsPerTurn()
     if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
@@ -1174,7 +1238,9 @@ export async function _runDelegateTaskCore(
 
   // Find target agent
   const cfg = await this._getAgentsConfig()
+  input.taskboardControl?.assertOpen()
   const identityProjection = await fetchIdentityCompatProjection()
+  input.taskboardControl?.assertOpen()
   const targetIdentity = identityProjection
     ? resolveIdentityCompat(targetAgentId, identityProjection)
     : undefined
@@ -1236,7 +1302,10 @@ export async function _runDelegateTaskCore(
   // 被 spawn(方案 §3 要求的"创建 runner 前拒",测试 ④/⑤ 断言未 spawn)。
   // 审查委派:调用方 model 忽略,改用 gateway 按「≠ 队长 / ≠ panel 家族」选出的审查员型号
   // (选不出 → undefined → 沿用 hidden-reviewer 成员绑定)。
-  const requestedModel = isReview ? reviewerModelOverride : input.model
+  const taskboardDefault = input.modelPolicy === 'taskboard-stage-agent-auto' &&
+    delegatedAgent.model && delegatedAgent.model !== AGENT_MODEL_AUTO
+    ? delegatedAgent.model : undefined
+  const requestedModel = isReview ? reviewerModelOverride : input.model || taskboardDefault
   let execAgent = requestedModel ? { ...delegatedAgent, model: requestedModel } : delegatedAgent
   let delegateExec: LocalExecutionDecision | undefined
   // 默认(未显式指定 model、非 review)委派优先 grok-build;只在 selfhost 引擎本地豁免门
@@ -1261,6 +1330,7 @@ export async function _runDelegateTaskCore(
     }
   }
 
+  input.taskboardControl?.assertOpen()
   const sessionKey =
     input.sessionKey ?? `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
   this.log.info('delegate', {
@@ -1280,6 +1350,7 @@ export async function _runDelegateTaskCore(
   // 另开一张卡或(旧行为)整段丢弃。
   const nestedProgress = progressRouting?.nested === true
   const delegateParent = this._resolveDelegateParent({
+    taskboardControl: input.taskboardControl,
     parentSessionKey,
     sourceAgent,
   })
@@ -1288,7 +1359,7 @@ export async function _runDelegateTaskCore(
   // 随 usageAttribution → runner CLAUDE_CODE_EXTRA_METADATA env → master 计费点
   // 落 usage_records.mode='delegate' / parent_session_id / delegate_agent_id,
   // hidden-reviewer 与嵌套 delegate 同路径打标。
-  const parentClientSessionId = resolveDelegateParentClientSessionId({
+  const parentClientSessionId = input.taskboardControl?.rootSessionKey ?? resolveDelegateParentClientSessionId({
     progressPeerId: progressTarget?.peerId,
     parentRepoSessionId: delegateParent?.repoSessionId,
     parentSessionKey,
@@ -1436,6 +1507,12 @@ export async function _runDelegateTaskCore(
     delegateParent?.sessionKey,
     sessionKey,
   )
+  if (input.taskboardControl?.signal.aborted) {
+    unregisterDelegation?.()
+    this._delegateOwnerByRunId?.delete(progressRunId)
+    await input.taskboardControl.waitForDescendants(sessionKey)
+    return cancelledBeforeSpawn
+  }
   let queuedNoticeSent = false
   // 过闸即接管:预占槽位的释放责任从 input(早退 finally)转到本函数的 slotOpts 释放路径;
   // 'wait' 预占的 waiter 条目由 _waitForDelegateCapacity 自己的 finally 删除。
@@ -1535,6 +1612,22 @@ export async function _runDelegateTaskCore(
       drop: gate.status === 'queue_full',
     })
   }
+  const cancelPreparation = async (
+    route?: DelegateGrokRouteLease | null,
+    admission?: DelegateEngineBillingAdmission | null,
+  ): Promise<DelegateTaskResult> => {
+    try {
+      await input.taskboardControl?.waitForDescendants(sessionKey)
+      if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
+      if (route) await route.release()
+      return cancelledBeforeSpawn
+    } finally {
+      this._delegateOwnerByRunId?.delete(progressRunId)
+      this._releaseDelegateSlot(slotOpts)
+      unregisterDelegation?.()
+    }
+  }
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {
@@ -1636,7 +1729,7 @@ export async function _runDelegateTaskCore(
     const current = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
     if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
         current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
-    if (traceAborted || traceWait.isAborted() || this._shuttingDown) {
+    if (traceAborted || traceWait.isAborted() || this._shuttingDown || input.taskboardControl?.signal.aborted) {
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
@@ -1662,6 +1755,7 @@ export async function _runDelegateTaskCore(
     requestedModel,
     agentModel: execAgent.model,
   })
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
   if (grokDelegate) {
@@ -1679,6 +1773,7 @@ export async function _runDelegateTaskCore(
       sessionId: sessionKey,
       log: this.log,
     })
+    if (input.taskboardControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
     if (!acquired.ok && !requestedModel) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
@@ -1737,6 +1832,7 @@ export async function _runDelegateTaskCore(
   // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
   // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
   // 永远为空。CCB/GLM 走 anthropicProxy,不进这条。失败 fail-closed,禁止白跑。
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease)
   const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
   const engineReported = shouldAdmitDelegateEngineBilling({
     delegateEngine: delegateExec?.engine,
@@ -1790,6 +1886,7 @@ export async function _runDelegateTaskCore(
       }
     }
   }
+  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
   // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
   // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
   const durableTranscript: unknown[] = []
@@ -1799,6 +1896,7 @@ export async function _runDelegateTaskCore(
   let lastChildActivityAt = Date.now()
   const markChildActivity = () => {
     lastChildActivityAt = Date.now()
+    if (session?.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
   }
   let session: AgentSession
   let detachAncestorActivity: (() => void) | undefined
@@ -1813,10 +1911,10 @@ export async function _runDelegateTaskCore(
       peerId: sourceAgent || 'system',
       repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
       workspaceMode: delegateParent?.workspaceMode,
-      workspaceCwd: input.workspaceCwd,
-      projectId: input.projectId,
+      workspaceCwd: input.workspaceCwd ?? delegateParent?.workspaceCwd,
+      projectId: input.projectId ?? delegateParent?.projectId ?? undefined,
       runContext: input.runContext,
-      frozenProjectContext: input.frozenProjectContext,
+      frozenProjectContext: input.frozenProjectContext ?? delegateParent?.frozenProjectContext,
       // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
       parentSessionKey: delegateParent?.sessionKey,
       title: `[delegate] ${goal.slice(0, 40)}`,
@@ -1830,7 +1928,12 @@ export async function _runDelegateTaskCore(
           : {}),
       },
     })
+    if (input.taskboardControl?.signal.aborted) {
+      await this.sessions.destroySession(sessionKey)
+      return cancelPreparation(grokRouteLease, engineBillingAdmission)
+    }
     hooks?.onSessionSpawned?.()
+    if (session.channel === 'taskboard') session._taskboardLastActivityAt = lastChildActivityAt
     session._durableDelegateTranscript = durableTranscript
     session._durableDelegateRuntimeEvents = durableRuntimeEvents
     session._durableDelegateEngineBillings = durableEngineBillings
@@ -1917,6 +2020,13 @@ export async function _runDelegateTaskCore(
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`) + artifactDiscipline
 
+  const ownBaseline = input.taskboardControl ? {
+    input: session.totalInputTokens ?? 0,
+    output: session.totalOutputTokens ?? 0,
+    cost: (session.totalCostUSD ?? 0) > 0 || !(session.totalInputTokens || session.totalOutputTokens)
+      ? session.totalCostUSD ?? 0 : null,
+    imprecise: session.costImprecise === true,
+  } : undefined
   const _dlgRun = this._runLog.start({
     agentId: targetAgentId,
     sessionKey,
@@ -1926,6 +2036,7 @@ export async function _runDelegateTaskCore(
   let output = ''
   let error = ''
   let timedOut = false
+  let cancelled = false
   // P2 债C — review 委派结束时从审查输出解析出的结构化裁决(PASS/NEEDS_FIX);
   // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
   let verdict: ReviewVerdict | undefined
@@ -1948,6 +2059,12 @@ export async function _runDelegateTaskCore(
       reject(err)
     }, timeoutConfig.checkIntervalMs)
   })
+  if (input.taskboardControl?.signal.aborted) {
+    clearTimeoutTimer()
+    detachAncestorActivity?.()
+    await this.sessions.destroySession(sessionKey)
+    return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  }
   const submitPromise = this.sessions.submit(
     session,
     prompt,
@@ -2018,7 +2135,11 @@ export async function _runDelegateTaskCore(
       if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
       if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-        if (e.kind === 'error') error = e.error
+        if (e.kind === 'error') {
+          error = e.error
+          cancelled = e.errorCode === 'user_cancelled'
+          if (cancelled && input.taskboardControl?.rootSessionKey === sessionKey) input.taskboardControl.requestStop()
+        }
         if (streamProgress) emitProgress(progressBlock)
       }
     },
@@ -2169,6 +2290,7 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
+    await input.taskboardControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()
     if (engineBillingAdmission) {
@@ -2241,12 +2363,10 @@ export async function _runDelegateTaskCore(
     // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
     // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
     if (!input.resumable) {
-      this.sessions.destroySession(sessionKey).catch((err) =>
-        this.log.warn('delegate session destroy failed', {
-          sessionKey,
-          err: String(err),
-        }),
+      const destroy = this.sessions.destroySession(sessionKey).catch((err) =>
+        this.log.warn('delegate session destroy failed', { sessionKey, err: String(err) }),
       )
+      if (input.taskboardControl) await destroy
     }
   }
 
@@ -2434,6 +2554,10 @@ export async function _runDelegateTaskCore(
     ...session,
     engine: session.providerTag,
     isError: Boolean(error),
+  }).catch((err) => {
+    if (!input.taskboardControl) throw err
+    this.log.warn('taskboard reference price unavailable; preserving paid output', { sessionKey, err: String(err) })
+    return { costUsd: null, costImprecise: true }
   })
   return {
     kind: 'completed',
@@ -2444,14 +2568,16 @@ export async function _runDelegateTaskCore(
     output: output.trim(),
     error: error || undefined,
     timedOut,
+    cancelled,
+    actualModel: session.runner.model || session.model || undefined,
     runId: progressRunId,
     verdict,
     // destroySession 是 fire-and-forget,此时 session 对象还在内存,用量从这里抄。
     // usage_log 是 eventBus 异步,return 时多半还没落盘,不能只靠它。
-    tokensIn: session.totalInputTokens || null,
-    tokensOut: session.totalOutputTokens || null,
-    costUsd: priced.costUsd,
-    costImprecise: priced.costImprecise,
+    tokensIn: ownBaseline ? (session.totalInputTokens >= ownBaseline.input ? session.totalInputTokens - ownBaseline.input || null : null) : session.totalInputTokens || null,
+    tokensOut: ownBaseline ? (session.totalOutputTokens >= ownBaseline.output ? session.totalOutputTokens - ownBaseline.output || null : null) : session.totalOutputTokens || null,
+    costUsd: ownBaseline ? (priced.costUsd != null && ownBaseline.cost != null && priced.costUsd >= ownBaseline.cost ? priced.costUsd - ownBaseline.cost : null) : priced.costUsd,
+    costImprecise: priced.costImprecise || ownBaseline?.imprecise,
   }
 }
 
@@ -2468,6 +2594,9 @@ export async function _runTaskboardDelegate(
     goal: input.goal,
     context: input.context,
     sourceAgent: 'taskboard',
+    modelPolicy: 'taskboard-stage-agent-auto',
+    delegationGuardOwnerKey: `taskboard-run:${input.sessionKey}`,
+    taskboardControl: input.control,
     toolsets: input.toolsets ?? undefined,
     depth: 0,
     effort: input.effort ?? undefined,
@@ -2480,21 +2609,34 @@ export async function _runTaskboardDelegate(
     runContext: input.runContext,
     frozenProjectContext: input.frozenProjectContext,
   })
-  if (result.kind === 'rejected') {
-    return { ok: false, output: '', error: result.message }
+  await input.control?.waitForDescendants(input.sessionKey)
+  const children = input.control?.childResults() ?? []
+  const ownOutput = result.kind === 'completed' ? result.output : ''
+  const childOutput = children.map((child) => [
+    `### 子任务 · ${child.agentId}`,
+    `执行模型：${child.actualModel ?? '未记录'}${child.cancelled ? ' · 已停止' : child.error ? ' · 失败' : ' · 已完成'}`,
+    child.output,
+    child.error ? `执行说明：${child.error}` : '',
+  ].filter(Boolean).join('\n\n')).join('\n\n')
+  const output = childOutput ? `## 子任务执行记录\n\n${childOutput}\n\n---\n\n## 主任务结果\n\n${ownOutput}` : ownOutput
+  if (result.kind !== 'completed') {
+    return { ok: false, output, summaryOutput: ownOutput, error: result.message, cancelled: result.kind === 'rejected' && (result.cancelled === true || result.failureClass === 'cancelled'), usageIncludesDescendants: children.length > 0, costImprecise: true }
   }
-  if (result.kind === 'error') {
-    return { ok: false, output: '', error: result.message }
-  }
+  const members = [result, ...children]
+  const sumKnown = (field: 'tokensIn' | 'tokensOut' | 'costUsd') => members.every((member) => typeof member[field] === 'number')
+    ? members.reduce((sum, member) => sum + (member[field] as number), 0) : null
   return {
     ok: result.ok && !result.timedOut,
-    output: result.output,
+    summaryOutput: result.output,
+    usageIncludesDescendants: children.length > 0,
+    output,
     error: result.error,
     timedOut: result.timedOut,
-    tokensIn: result.tokensIn ?? null,
-    tokensOut: result.tokensOut ?? null,
-    costUsd: result.costUsd ?? null,
-    costImprecise: result.costImprecise ?? null,
+    cancelled: result.cancelled,
+    tokensIn: sumKnown('tokensIn'),
+    tokensOut: sumKnown('tokensOut'),
+    costUsd: sumKnown('costUsd'),
+    costImprecise: members.some((member) => member.costImprecise === true) || members.some((member) => member.costUsd == null),
   }
 }
 

@@ -1,3 +1,4 @@
+import type { TaskboardPreflight } from '../stagePreflight.js'
 /**
  * 巡检 tick 引擎。验收:建需求单 → 批准 → mock delegate 驱动 tick →
  * 自动走完多个 stage 到 waiting_human。库落 os.tmpdir(),不碰 ~/.openclaude,
@@ -77,6 +78,7 @@ function engine(
   db: TaskboardDb,
   delegate: PatrolDelegateFn,
   over: {
+    preflightStages?: TaskboardPreflight
     slots?: PatrolSlotCounter
     idle?: IdleBackoffState
     now?: () => number
@@ -90,6 +92,7 @@ function engine(
   } = {},
 ): PatrolEngine {
   return new PatrolEngine({
+    preflightStages: over.preflightStages ?? (async (stages) => stages.map(() => null)),
     getDb: () => db,
     delegate,
     now: over.now ?? (() => WORK.getTime()),
@@ -170,7 +173,7 @@ describe('端到端:需求单无人干预走到 waiting_human', () => {
   it('建单 → 批准 → 两轮 tick 自动推进需求澄清与方案设计', async () => {
     const db = freshDb()
     const project = createProject(db, { key: 'OCV5', name: 'V5 自用' })
-    seedDefaultPipelines(db, project.id)
+    seedDefaultPipelines(db, project.id, undefined, { executionAgentId: 'fixture-helper' })
     const pipeline = getDefaultPipeline(db, project.id, 'feature')
     assert.ok(pipeline)
     const stages = listStages(db, pipeline.id)
