@@ -10,6 +10,7 @@ import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCom
 import { writeTeamMode } from "../lib/teamMode";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody, isStaleCollabEpoch } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
+import { saveInitialCollaboration } from "../lib/collaborationSend";
 import type { Agent } from "../lib/agents";
 import type { AuthSession, PublicModel, Session } from "../lib/types";
 import type { ConfirmChoice, ConfirmOpts } from "../components/ui/ConfirmDialog";
@@ -365,15 +366,11 @@ export function useSessionModelAndCollab({
         try {
           const socket = sockRef.current;
           if (!socket || !activeId) throw new Error("会话连接不可用");
-          if (modelId) socket.setSessionModel(activeId, modelId);
           const ensured = await socket.ensureServerSession(activeId, agent.id, "新对话");
           if (!current()) return;
           if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
-          const doc = await api.putCollaborationConfig(collabAuth, collaborationPutBody({
-            sessionId: activeId, mode: intent.state.mode, advisorModel: intent.state.advisorModel,
-            expectedRev: intent.state.rev, asDefault: intent.asDefault,
-          }));
-          if (current()) applyCollabDoc(doc);
+          const doc = await saveInitialCollaboration(collabAuth, activeId, intent.state, intent.asDefault, identityEpoch);
+          if (doc && current()) applyCollabDoc(doc);
         } catch (error) {
           if (!current()) return;
           const msg = apiErrorMessage(error, "协作配置保存失败，请重新选择后重试");
