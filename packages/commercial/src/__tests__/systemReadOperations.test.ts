@@ -74,3 +74,24 @@ test('revoked current identity is rejected before any business read and the cata
   const catalog = await registry({}).catalog(actor)
   assert.equal(catalog.items.length, 7); assert.equal(catalog.items.every(item => item.effect === 'read'), true)
 })
+
+test('existing subscription reads distinguish effective expiry without mutating a still-active stored row', async () => {
+  const row = { id: 1n, userId: 765n, planCode: 'synthetic-sub', status: 'active' as const, periodStart: new Date(0), periodEnd: new Date(2000000), periodCredits: 50n }
+  let period = 50n
+  const r = registry({ getUserSubscription: async () => row,
+    getPlan: async code => { assert.equal(code, 'synthetic-sub'); return { code, name: '方案', priceCents: 100n, monthlyCredits: 200n, periodDays: 30, tier: 1, sortOrder: 99, enabled: true } },
+    getBalanceBreakdown: async () => ({ wallet: 100n, period, total: 100n + period }) })
+  const active = await r.read(actor, 'billing.subscription.get', {}) as { subscription: { status: string; period_start: string; period_credits: string; plan: Record<string, unknown> } }
+  assert.equal(active.subscription.status, 'active'); assert.equal(active.subscription.period_start, '1970-01-01T00:00:00.000Z')
+  assert.equal(active.subscription.plan.price_cents, '100'); assert.equal('sortOrder' in active.subscription.plan, false)
+  row.periodEnd = new Date(999999); period = 0n
+  const expired = await r.read(actor, 'billing.subscription.get', {}) as { subscription: { status: string; period_credits: string } }
+  assert.equal(expired.subscription.status, 'expired'); assert.equal(expired.subscription.period_credits, '0')
+  assert.equal(row.status, 'active'); assert.equal(row.periodCredits, 50n)
+})
+test('personal subscription plans retain account scope and exact decimal price without organization fields', async () => {
+  const r = registry({ listSubscriptionPlans: async () => [{ code: 'synthetic-user-plan', name: '个人方案', priceCents: 100n, monthlyCredits: 9007199254740993n, periodDays: 30, tier: 1, sortOrder: 99, enabled: true }] })
+  const result = await r.read(actor, 'billing.subscription.plans', {}) as { scope: string; plans: Record<string, unknown>[] }
+  assert.equal(result.scope, 'user'); assert.equal(result.plans[0]!.amount_scope, 'account'); assert.equal(result.plans[0]!.monthly_credits, '9007199254740993')
+  assert.equal('min_seats' in result.plans[0]!, false)
+})
