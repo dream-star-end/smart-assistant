@@ -4,7 +4,7 @@ type GoalStartDeps = {
   isBusy: () => boolean;
   save: () => Promise<GoalStateSnapshot>;
   apply: (goal: GoalStateSnapshot) => void;
-  start: (goal: GoalStateSnapshot) => Promise<void|boolean>;
+  start: (goal: GoalStateSnapshot) => Promise<unknown>;
 };
 
 /** One explicit UI action, not a snapshot effect: loading/reconnecting never starts work.
