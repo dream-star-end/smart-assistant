@@ -201,7 +201,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setBooting(false);
     setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
     cbRef.current.onClearAuth();
-  }, []);
+  }, [setUser]);
   expiredUiRef.current = clearAuthState;
 
   const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
@@ -256,10 +256,11 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
         // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
         const res = await api.login(email, password, turnstileToken);
-        if (!session.commitToken(loginEpoch, res.accessToken)) return;
+        if (session !== authRef.current || !session.commitToken(loginEpoch, res.accessToken)) return;
+        const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+        if (!commitVerifiedUser(res.user, identity)) return;
         setAuthHint();
         setAuthed(true);
-        setUser(res.user);
         // lane 决策达成（cookie 已随登录响应 Set-Cookie 下发）：解锁 WS 连接前置。
         setLaneSignal({ lane: res.lane ?? null });
         cbRef.current.onLoginSuccess?.();
@@ -271,7 +272,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
         if (session.snapshot().epoch === loginEpoch) setAuthLoading(false);
       }
     },
-    [],
+    [commitVerifiedUser],
   );
 
   // 启动静默续期：只有明确 invalid 才落到未登录；race/网络/5xx 保持 splash 并恢复。
@@ -323,9 +324,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
 
         let meAttempt = 0;
         while (!controller.signal.aborted && session.snapshot().epoch === bootEpoch) {
+          let actualAttempt: ReturnType<typeof captureIdentityAttempt> | null = null;
           try {
-            const me = await api.getMe(session);
-            if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
+            let identity: ResolvedIdentity | null = null;
+            const me = await api.getMe(session, value => { identity = value; }, value => { actualAttempt = value; });
+            if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
+            if (identity && !identityIsCurrent(identity, session, me.id)) continue;
             const prior = bootstrapMeFriction.current;
             if (prior) {
               reportClientFriction({
@@ -339,7 +343,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
               bootstrapMeFriction.current = null;
             }
             setAuthRecoveryAvailable(false);
-            setUser(me);
+            if (!commitMeUser(me, identity)) return;
             setAuthed(true);
             setLaneSignal({ lane: me.lane ?? null });
             // 静默续期成功 = 本浏览器确实登录过（标记可能因旧版本/清理丢失，这里补写）。
@@ -348,7 +352,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
             setBooting(false);
             return;
           } catch (error) {
-            if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
+            if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
+            if (actualAttempt && !attemptCurrent(actualAttempt, session)) continue;
             if (!isAuthRecoveryTransient(error)) {
               setAuthError("账号信息暂未核验完成，请重试");
               setAuthRecoveryAvailable(true);
@@ -449,12 +454,13 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     bootstrapMeFriction.current = null;
     void cancelAuthRefresh(session);
     const res = await api.verifyEmail(email, code);
-    if (!session.commitToken(epoch, res.accessToken)) return;
+    if (session !== authRef.current || !session.commitToken(epoch, res.accessToken)) return;
+    const identity = resolveIdentity(captureIdentityAttempt(session, res.accessToken), res.user.id);
+    if (!commitVerifiedUser(res.user, identity)) return;
     setAuthed(true);
-    setUser(res.user);
     setLaneSignal({ lane: res.lane ?? null });
     cbRef.current.onLoginSuccess?.();
-  }, []);
+  }, [commitVerifiedUser]);
   const resendVerification = useCallback(
     (email: string) =>
       api.resendVerification(email).then((r) => ({ emailSent: r.emailSent })),
@@ -490,8 +496,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     const session = authRef.current;
     const expectedEpoch = session.snapshot().epoch;
     try {
-      const me = await api.getMe(session);
-      if (session.snapshot().epoch === expectedEpoch) setUser(me);
+      let identity: ResolvedIdentity | null = null;
+      const me = await api.getMe(session, value => { identity = value; });
+      if (session === authRef.current && session.snapshot().epoch === expectedEpoch) commitMeUser(me, identity);
     } catch {
       /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
     }
