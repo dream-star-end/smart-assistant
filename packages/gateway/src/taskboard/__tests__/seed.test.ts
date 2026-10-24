@@ -14,7 +14,6 @@ import { listPipelines, listStages } from '../db/pipelines.js'
 import { createProject } from '../db/projects.js'
 import {
   DEFAULT_PATROL_CRON,
-  SEED_AGENT_IDS,
   listSeedStageNames,
   seedDefaultPipelines,
   stageSeedId,
@@ -43,7 +42,7 @@ describe('seedDefaultPipelines', () => {
   it('为四种类型各建默认流水线,阶段名与设计一致', () => {
     const db = freshDb()
     const project = createProject(db, { key: 'OCV5', name: 'V5' })
-    const result = seedDefaultPipelines(db, project.id)
+    const result = seedDefaultPipelines(db, project.id, undefined, { executionAgentId: 'fixture-helper' })
     assert.equal(result.createdPipelines, 4)
     assert.equal(result.skippedPipelines, 0)
     assert.equal(listPipelines(db, project.id).length, 4)
@@ -79,13 +78,7 @@ describe('seedDefaultPipelines', () => {
       stages.forEach((stage, i) => {
         assert.equal(stage.ordinal, i)
         if (stage.kind === 'ai') {
-          assert.ok(stage.agentId, `${stage.name} 必须绑 agent`)
-          assert.ok(
-            Object.values(SEED_AGENT_IDS).includes(
-              stage.agentId as (typeof SEED_AGENT_IDS)[keyof typeof SEED_AGENT_IDS],
-            ),
-          )
-          assert.notEqual(stage.agentId, 'hidden-reviewer')
+          assert.equal(stage.agentId, 'fixture-helper')
           assert.ok(stage.promptTemplate)
           assert.ok(stage.exitChecklist)
           assert.equal(stage.patrolEnabled, true)
@@ -115,28 +108,28 @@ describe('seedDefaultPipelines', () => {
 
     const bug = listPipelines(db, project.id).find((p) => p.ticketType === 'bug')
     const bugStages = listStages(db, bug!.id)
-    assert.equal(bugStages.find((s) => s.name === '复现确认')?.agentId, 'stage-triage')
-    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'stage-diagnose')
-    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'stage-implement')
-    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
+    assert.equal(bugStages.find((s) => s.name === '复现确认')?.agentId, 'fixture-helper')
+    assert.equal(bugStages.find((s) => s.name === '定位根因')?.agentId, 'fixture-helper')
+    assert.equal(bugStages.find((s) => s.name === '修复')?.agentId, 'fixture-helper')
+    assert.equal(bugStages.find((s) => s.name === '自验')?.agentId, 'fixture-helper')
 
     const feat = listPipelines(db, project.id).find((p) => p.ticketType === 'feature')
     const featStages = listStages(db, feat!.id)
-    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'stage-triage')
-    assert.equal(featStages.find((s) => s.name === '方案设计')?.agentId, 'stage-design')
-    assert.equal(featStages.find((s) => s.name === '实现')?.agentId, 'stage-implement')
-    assert.equal(featStages.find((s) => s.name === '自验+审查')?.agentId, 'stage-verify')
+    assert.equal(featStages.find((s) => s.name === '需求澄清')?.agentId, 'fixture-helper')
+    assert.equal(featStages.find((s) => s.name === '方案设计')?.agentId, 'fixture-helper')
+    assert.equal(featStages.find((s) => s.name === '实现')?.agentId, 'fixture-helper')
+    assert.equal(featStages.find((s) => s.name === '自验+审查')?.agentId, 'fixture-helper')
 
     const spike = listPipelines(db, project.id).find((p) => p.ticketType === 'spike')
     const spikeStages = listStages(db, spike!.id)
-    assert.equal(spikeStages.find((s) => s.name === '明确问题')?.agentId, 'stage-triage')
-    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'stage-research')
-    assert.equal(spikeStages.find((s) => s.name === '结论汇总')?.agentId, 'stage-report')
+    assert.equal(spikeStages.find((s) => s.name === '明确问题')?.agentId, 'fixture-helper')
+    assert.equal(spikeStages.find((s) => s.name === '检索调研')?.agentId, 'fixture-helper')
+    assert.equal(spikeStages.find((s) => s.name === '结论汇总')?.agentId, 'fixture-helper')
 
     const chore = listPipelines(db, project.id).find((p) => p.ticketType === 'chore')
     const choreStages = listStages(db, chore!.id)
-    assert.equal(choreStages.find((s) => s.name === '执行')?.agentId, 'stage-implement')
-    assert.equal(choreStages.find((s) => s.name === '自验')?.agentId, 'stage-verify')
+    assert.equal(choreStages.find((s) => s.name === '执行')?.agentId, 'fixture-helper')
+    assert.equal(choreStages.find((s) => s.name === '自验')?.agentId, 'fixture-helper')
     db.close()
   })
 
@@ -192,4 +185,29 @@ describe('seedDefaultPipelines', () => {
     )
     db.close()
   })
+})
+
+
+it('unconfigured builtin AI stages are inert and an explicit helper only affects new stages', () => {
+  const db = freshDb()
+  const pending = createProject(db, { key: 'PEND', name: '待配置' })
+  seedDefaultPipelines(db, pending.id)
+  for (const pipe of listPipelines(db, pending.id)) {
+    for (const stage of listStages(db, pipe.id).filter((s) => s.kind === 'ai')) {
+      assert.equal(stage.agentId, null)
+      assert.equal(stage.patrolEnabled, false)
+      assert.equal(stage.model, null)
+    }
+  }
+  const selected = createProject(db, { key: 'BIND', name: '明确助手' })
+  seedDefaultPipelines(db, selected.id, ['bug'], { executionAgentId: 'installed-helper' })
+  seedDefaultPipelines(db, selected.id, ['bug', 'spike'], { executionAgentId: 'another-helper' })
+  for (const pipe of listPipelines(db, selected.id)) {
+    for (const stage of listStages(db, pipe.id).filter((s) => s.kind === 'ai')) {
+      assert.equal(stage.agentId, pipe.ticketType === 'bug' ? 'installed-helper' : 'another-helper')
+      assert.equal(stage.patrolEnabled, true)
+      assert.equal(stage.model, null)
+    }
+  }
+  db.close()
 })

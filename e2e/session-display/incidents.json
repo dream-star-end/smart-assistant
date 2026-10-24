@@ -8055,7 +8055,9 @@
       "severity": "P2",
       "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
       "rootFixCommit": "1bb8a534",
-      "coverageCommits": ["892f3ed6"],
+      "coverageCommits": [
+        "892f3ed6"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -8105,6 +8107,33 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-prompt-privacy-proofs.ts",
           "assertion": "[prompt-privacy-proofs] PASS fresh consent, operation lifetime and stopped-process boundary"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261024-SYSTEM-PROFILE-READ",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "未上线候选默认Codex复审发现enabled=false的保留称呼可被显式跨会话读取；独立fixture复现。主控同时收紧软删除但active账号的提案预览/回执读取。未涉及真实用户数据、模型或费用。",
+      "rootFixCommit": "c0930c6c",
+      "coverageCommits": [
+        "c0930c6c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/preferenceOperations.test.ts",
+          "assertion": "withdrawn profile grants never disclose a retained nickname or session even to the old session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/systemActionsBrowserHttp.test.ts",
+          "assertion": "soft-deleted active accounts cannot read an existing proposal preview or result"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-system-executor-proofs.ts",
+          "assertion": "[system-executor-proofs] PASS independent browser approval, original request replay and frozen executors"
         }
       ]
     }
