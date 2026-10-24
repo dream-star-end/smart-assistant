@@ -1,10 +1,12 @@
+import { assembleSystemActions } from './system-assistant/assemble.js'
+import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
-import { HttpError } from './http/util.js';
+import { HttpError, sendJson } from './http/util.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
 import { setContentReviewAlerter } from '@openclaude/gateway'
 import { alertContentReview } from './admin/contentReviewAlert.js'
@@ -2159,6 +2161,7 @@ export async function registerCommercial(
   // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
   // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
   let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
+  let systemActions: ReturnType<typeof assembleSystemActions> | undefined;
 
   if (
     !options.skipInternalProxy &&
@@ -2890,6 +2893,10 @@ export async function registerCommercial(
       }
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
+        if (path === INTERNAL_SYSTEM_ACTIONS_PATH) {
+          if (!systemActions) { sendJson(res, 503, { error: { code: 'UNAVAILABLE', message: '系统操作尚未就绪。' } }); return Promise.resolve(); }
+          return systemActions.handleInternal(req, res, ctx);
+        }
         if (egressSplitEnabled && path === COST_EVENT_PATH) {
           return costEventHandler(req, res);
         }
@@ -4399,8 +4406,22 @@ export async function registerCommercial(
     inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
     validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
   });
+  if (process.env.OC_SYSTEM_ACTIONS_ENABLED === '1') {
+    if (runtimeChannel !== 'v5' || flavorIdentity.status !== 'ok' || flavorIdentity.flavor !== 'selfhost' || !v3Deps) {
+      throw new Error('System actions require the verified personal Docker deployment');
+    }
+    systemActions = assembleSystemActions({
+      stateParent: '/var/lib/openclaude-v5-selfhost',
+      jwtSecret,
+      firstPartyOrigin: process.env.COMMERCIAL_BASE_URL ?? '',
+      runner: getPool(),
+      identityRepo: createPgIdentityRepo(),
+      privacySupported: async userId => (await resolvePromptPrivacySupport(userId)).state === 'ready',
+    });
+  }
   const handler = createCommercialHandler({
     jwtSecret,
+    systemActionsHttp: systemActions?.runtime.handleBrowser,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
     goalStateService,
@@ -7151,6 +7172,7 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      systemActions?.runtime.closeAdmission();
       stopLogTiming();
       // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
       // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
@@ -7184,6 +7206,7 @@ export async function registerCommercial(
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
         await Promise.allSettled([
+          systemActions?.runtime.closeAndDrain(),
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
           literatureSetup.close(),
