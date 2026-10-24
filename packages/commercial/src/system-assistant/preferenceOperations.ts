@@ -1,3 +1,7 @@
+import type { SystemActionExecution } from '@openclaude/storage'
+import type { SystemActionResult } from '@openclaude/protocol'
+import type { QueryRunner } from '../db/queries.js'
+import { withPgActionReceipt } from './pgReceipts.js'
 /** Real preference operations reuse the manual setting validators and atomic writer. */
 import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
@@ -28,7 +32,8 @@ export interface PreferenceOperationDeps {
   backgroundApprovalReady?: (userId: string) => Promise<boolean>
   read?: (userId: string) => Promise<Snapshot>
   resolve?: (userId: string, raw: unknown) => Promise<PreferencesPatch>
-  write?: (userId: string, patch: unknown, version: string, role: SystemActor['role']) => Promise<unknown>
+  write?: (userId: string, patch: unknown, version: string, role: SystemActor['role'], runner: QueryRunner) => Promise<unknown>
+  effect?: (actor: SystemActor, execution: SystemActionExecution, work: (runner: QueryRunner) => Promise<SystemActionResult>) => Promise<SystemActionResult>
 }
 function readablePreference(actor: SystemActor, key: string, value: unknown): unknown {
   if (key === 'system_assistant_profile' && value && typeof value === 'object') {
@@ -55,6 +60,7 @@ export function preferenceOperations(deps: PreferenceOperationDeps): SystemOpera
   const read = deps.read ?? getVersionedPreferences
   const resolve = deps.resolve ?? resolvePreferencesPatch
   const write = deps.write ?? patchPreferences
+  const effect = deps.effect ?? withPgActionReceipt
   async function validate(actor: SystemActor, raw: unknown): Promise<PreferencesPatch> {
     const normalized = await translate(() => resolve(actor.userId, raw))
     if ((normalized.auto_dream_enabled === true || normalized.auto_optimizer_enabled === true) &&
@@ -101,8 +107,10 @@ export function preferenceOperations(deps: PreferenceOperationDeps): SystemOpera
     },
     execute: async (actor, execution) => {
       if (!execution.expectedVersion) throw new SystemOperationRejected('CONFLICT')
-      await translate(() => write(actor.userId, execution.args, execution.expectedVersion!, actor.role))
-      return { summary: '偏好已保存。', completion: 'done' }
+      return effect(actor, execution, async runner => {
+        await translate(() => write(actor.userId, execution.args, execution.expectedVersion!, actor.role, runner))
+        return { summary: '偏好已保存。', completion: 'done' }
+      })
     },
   }]
 }

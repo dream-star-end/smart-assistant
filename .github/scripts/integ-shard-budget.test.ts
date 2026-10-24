@@ -35,7 +35,7 @@ test("old pr-1 keeps 180000/3600 and its own max-minutes", () => {
   assert.equal(budget.fileTimeoutMs, DEFAULT_FILE_TIMEOUT_MS);
   assert.equal(budget.mutexTimeoutSeconds, DEFAULT_MUTEX_TIMEOUT_SECONDS);
   assert.equal(budget.maxMinutes, 30);
-  assert.equal(budget.minTests, 271);
+  assert.equal(budget.minTests, 289);
   assert.equal(budget.declaredNewFields, false);
 });
 

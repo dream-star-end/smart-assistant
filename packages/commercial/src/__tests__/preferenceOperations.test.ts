@@ -23,6 +23,7 @@ function fixture(t: import('node:test').TestContext, initial: Preferences = { in
   const registry = new SystemOperationRegistry(preferenceOperations({
     authorize: async a => { assert.equal(a.userId, '765'); if (!allowed) throw new SystemOperationRejected('FORBIDDEN') },
     privacySupported: async () => privacyReady,
+    effect: async (_actor, _execution, work) => work({ query: async () => { throw new Error('Unexpected PG use in isolated preference fixture') } }),
     backgroundApprovalReady: async () => brokerReady,
     read: async () => ({ prefs: { ...prefs }, version: String(version), updated_at: '2026-10-24T00:00:00Z' }),
     resolve: (uid, raw) => resolvePreferencesPatch(uid, raw, { feature: async () => ({ eligible, available: true }) }),

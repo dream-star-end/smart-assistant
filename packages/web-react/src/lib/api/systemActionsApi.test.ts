@@ -84,3 +84,13 @@ describe('first party system approval transport', () => {
     expect(fetcher).toHaveBeenCalledTimes(1)
   })
 })
+it.each(['401', 'lost-response'])('reconcile is one captured request on %s and never reexecutes or refreshes', async mode => {
+  const { client, fetcher } = setup()
+  if (mode === '401') fetcher.mockResolvedValueOnce(reply({ error: { code: 'UNAUTHORIZED', message: 'expired' } }, 401))
+  else fetcher.mockRejectedValueOnce(new Error('synthetic response loss'))
+  await expect(client.reconcile(id)).rejects.toThrow()
+  expect(fetcher).toHaveBeenCalledTimes(1)
+  expect(fetcher.mock.calls[0]?.[0]).toBe(`/api/auth/system-actions/${id}/reconcile`)
+  expect(fetcher.mock.calls[0]?.[1]?.method).toBe('POST')
+  expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({})
+})

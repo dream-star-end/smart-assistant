@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol/browser'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ToolCardActionsContext, type SystemActionCardActions } from '../tool/context'
@@ -93,4 +93,44 @@ describe('verified system action sheet', () => {
     await waitFor(() => expect(a.getDetail).toHaveBeenCalledTimes(3))
     expect(a.confirm).toHaveBeenCalledTimes(1)
   })
+})
+
+it('checks unknown receipts without submitting the business operation again', async () => {
+  const a = actions()
+  const unknown = { ...detail(), state: 'unknown' as const, preview: null, result: { summary: '等待核对', completion: 'accepted' as const } }
+  a.getDetail = vi.fn(async () => unknown)
+  a.reconcile = vi.fn().mockResolvedValueOnce(unknown).mockResolvedValueOnce({ ...unknown, state: 'succeeded', result: { summary: '已核对完成', completion: 'done' } })
+  render(view(a))
+  fireEvent.click(await screen.findByRole('button', { name: '核对结果' }))
+  await waitFor(() => expect(a.reconcile).toHaveBeenCalledTimes(1))
+  expect(screen.getByText('结果待核对')).toBeInTheDocument()
+  await waitFor(() => expect(screen.getByRole('button', { name: '核对结果' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: '核对结果' }))
+  await screen.findByText('已核对完成')
+  expect(a.reconcile).toHaveBeenCalledTimes(2)
+  expect(a.getConfirmation).not.toHaveBeenCalled()
+  expect(a.confirm).not.toHaveBeenCalled()
+  expect(a.deny).not.toHaveBeenCalled()
+})
+it.each([true, false])('receipt controls remain unavailable when readOnly=%s or no adapter exists', async readOnly => {
+  const a = actions()
+  a.getDetail = vi.fn(async () => ({ ...detail(), state: 'unknown' as const, preview: null }))
+  if (readOnly) a.reconcile = vi.fn()
+  render(view(a, code, { readOnly }))
+  await screen.findByText(readOnly ? '只读记录' : '结果待核对')
+  expect(screen.queryByRole('button', { name: '核对结果' })).not.toBeInTheDocument()
+})
+it('a receipt arriving after an identity change cannot update the replacement card', async () => {
+  const a = actions()
+  a.getDetail = vi.fn(async () => ({ ...detail(), state: 'unknown' as const, preview: null }))
+  let release!: (value: SystemActionSummary) => void
+  const pending = new Promise<SystemActionSummary>(resolve => { release = resolve })
+  a.reconcile = vi.fn(async () => pending)
+  const r = render(view(a))
+  fireEvent.click(await screen.findByRole('button', { name: '核对结果' }))
+  expect(screen.getByRole('button', { name: '核对结果' })).toBeDisabled()
+  a.identityKey = 'different-receipt-owner'
+  r.rerender(view(a))
+  await act(async () => { release({ ...detail(), state: 'succeeded', result: { summary: '旧身份回执不应显示', completion: 'done' } }); await pending })
+  expect(screen.queryByText('旧身份回执不应显示')).not.toBeInTheDocument()
 })

@@ -1,3 +1,4 @@
+import { getPgActionReceipt } from './pgReceipts.js'
 /** Explicit composition for host-only actions. No state is opened at import time. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join } from 'node:path'
@@ -55,7 +56,7 @@ export function openSystemActionsRuntime(deps: {
   try {
     const identity = currentSystemActionExecutor()
     persistSystemActionExecutor(root, identity)
-    const service = new SystemActionsService(ledger, deps.registry, identity.id)
+    const service = new SystemActionsService(ledger, deps.registry, identity.id, binding => getPgActionReceipt(binding, deps.runner))
     const browser = makeSystemActionsBrowserHandler({ service, runner: deps.runner, jwtSecret: deps.jwtSecret, firstPartyOrigin: origin })
     const recover = () => {
       if (!admission || closed) return

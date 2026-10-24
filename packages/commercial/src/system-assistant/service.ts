@@ -1,7 +1,7 @@
 /** Composition takes an explicit master-private ledger; importing this module creates no state. */
 import { createHash } from 'node:crypto'
-import { systemActionRequestHash, type SystemActionStore } from '@openclaude/storage'
-import type { SystemActionDetail, SystemActionSummary } from '@openclaude/protocol'
+import { systemActionRequestHash, type SystemActionStore, type SystemActionReceiptBinding } from '@openclaude/storage'
+import type { SystemActionDetail, SystemActionSummary, SystemActionResult } from '@openclaude/protocol'
 import type { BrowserConfirmationPrincipal } from '../auth/browserConfirmation.js'
 import { type SystemOperationRegistry, SystemOperationRejected, type SystemActor } from './operations.js'
 function boundDevice(principal: BrowserConfirmationPrincipal, deviceId: string): string {
@@ -12,7 +12,8 @@ export class SystemActionsService {
   private accepting = true
   private readonly inFlight = new Set<Promise<SystemActionSummary>>()
   /** Composition persists this new process-incarnation ID for a trusted supervisor to recover after proven exit. */
-  constructor(private readonly ledger: SystemActionStore, readonly registry: SystemOperationRegistry, readonly executorId: string) {
+  constructor(private readonly ledger: SystemActionStore, readonly registry: SystemOperationRegistry, readonly executorId: string,
+    private readonly lookupReceipt?: (binding: SystemActionReceiptBinding) => Promise<SystemActionResult | null>) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(executorId)) throw new Error('Invalid executor incarnation')
   }
   async drain(): Promise<void> {
@@ -32,6 +33,21 @@ export class SystemActionsService {
   }
   detail(userId: string, id: string): SystemActionDetail { return this.ledger.detail(userId, id) }
   result(userId: string, id: string): SystemActionSummary { return this.ledger.get(userId, id) }
+  /** First-party owner gesture only. A missing receipt never permits another business execution. */
+  async reconcile(userId: string, id: string): Promise<SystemActionSummary> {
+    const current = this.ledger.get(userId, id)
+    if (current.state !== 'unknown' || !this.lookupReceipt) return current
+    const binding = this.ledger.unknownReceiptBinding(userId, id)
+    if (!binding) return current
+    const result = await this.lookupReceipt(binding)
+    if (!result) return this.ledger.get(userId, id)
+    try { return this.ledger.reconcileUnknownFromReceipt(binding, result) }
+    catch (error) {
+      const latest = this.ledger.get(userId, id)
+      if (latest.state === 'succeeded') return latest
+      throw error
+    }
+  }
   challenge(principal: BrowserConfirmationPrincipal, id: string, deviceId: string, previewHash: string): { detail: SystemActionDetail; nonce: string } {
     const nonce = this.ledger.issueChallenge(principal.id, id, boundDevice(principal, deviceId), previewHash)
     return { detail: this.ledger.detail(principal.id, id), nonce }

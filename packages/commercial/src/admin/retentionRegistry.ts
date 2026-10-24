@@ -72,6 +72,8 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
  * (来自全表调研;新增此类表须显式补进本清单,反向门才放行。)
  */
 export const DURABLE_TABLES: readonly string[] = [
+  // OCV5-610: exact effect/idempotency evidence; lifetime follows user FK cascade, never age-swept.
+  "system_action_receipts",
   // OCV5-537(DAT-8):用户对单条响应的 👍/👎(含可选评论),随用户删除级联;是质量反馈信号,
   // 技能差评归因按 90 天窗口读取。体量小(个人版 331 行),不做时间 TTL。
   "response_rating",

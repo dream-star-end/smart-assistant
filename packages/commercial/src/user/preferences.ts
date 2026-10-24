@@ -35,7 +35,7 @@
 import { scanMemoryContent } from "@openclaude/storage";
 import { PLATFORM_REASONING_EFFORTS, hasPromptPrivacyControlCharacters } from "@openclaude/protocol";
 import { z } from "zod";
-import { query } from "../db/queries.js";
+import { query, type QueryRunner } from "../db/queries.js";
 
 // ─── zod schema ───────────────────────────────────────────────────────────
 
@@ -155,6 +155,7 @@ export async function patchPreferences(
   rawPatch: unknown,
   expectedVersion?: string,
   expectedRole?: "user" | "admin",
+  runner?: QueryRunner,
 ): Promise<PreferencesSnapshot> {
   if (expectedVersion !== undefined && expectedVersion !== 'missing' && !/^[1-9][0-9]{0,19}$/.test(expectedVersion)) {
     throw new PreferencesError('VALIDATION', 'invalid preference snapshot version');
@@ -241,6 +242,7 @@ export async function patchPreferences(
              updated_at = NOW()${conflictGuard}
        RETURNING prefs, updated_at`,
       params,
+      runner,
     );
   } catch (err) {
     if (err instanceof Error && /violates foreign key/i.test(err.message)) {

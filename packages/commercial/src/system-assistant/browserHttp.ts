@@ -12,7 +12,7 @@ import type { SystemActionsService } from './service.js'
 
 const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 const readPath = new RegExp(`^/api/me/system-actions/(${UUID})(/result)?$`)
-const writePath = new RegExp(`^/api/auth/system-actions/(${UUID})/(challenge|confirm|deny)$`)
+const writePath = new RegExp(`^/api/auth/system-actions/(${UUID})/(challenge|confirm|deny|reconcile)$`)
 const challengeSchema = z.object({ deviceId: z.string().uuid(), previewHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()
 const confirmSchema = challengeSchema.extend({ nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict()
 function parse<T>(schema: z.ZodType<T>, raw: unknown): T {
@@ -48,6 +48,11 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
       const body = await readSystemActionBody(req, 16 * 1024, signal)
       const id = write![1]!
       const action = write![2]!
+      if (action === 'reconcile') {
+        parse(z.object({}).strict(), body)
+        sendJson(res, 200, await deps.service.reconcile(principal.id, id))
+        return
+      }
       if (action === 'deny') {
         parse(z.object({}).strict(), body)
         sendJson(res, 200, deps.service.deny(principal, id))

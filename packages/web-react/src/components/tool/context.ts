@@ -22,6 +22,8 @@ export type SystemActionCardActions = {
   getConfirmation: (id: string) => Promise<{ detail: SystemActionDetail; nonce: string }>;
   confirm: (id: string, proof: { nonce: string; previewHash: string }) => Promise<SystemActionSummary>;
   deny: (id: string) => Promise<SystemActionSummary>;
+  /** Check a committed receipt only; never resubmit the business write. */
+  reconcile?: (id: string) => Promise<SystemActionSummary>;
   /** Native gestures are rendered by fixed, trusted adapters; never model-provided DOM/JS. */
   renderContinuation?: (id: string) => ReactNode;
 };
