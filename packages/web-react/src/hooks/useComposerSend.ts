@@ -1,3 +1,6 @@
+import type {AuthorizeSwitch} from './useModelSwitchCost';
+import {mintMsgId} from '../lib/chat/model';
+import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
  * Composer send pipeline: send, project start, media upload and image edit/comment actions
  *
@@ -34,6 +37,7 @@ import type { ToastFn } from "../components/ui/Toast";
 
 export type ComposerSendInput = {
   activeId: string | undefined;
+  authorizeSwitch?: AuthorizeSwitch;
   agent: Agent;
   applyCollabDoc: (doc: CollaborationConfigDoc) => void;
   auth: AuthSession | null;
@@ -79,6 +83,7 @@ export type ComposerSendInput = {
 
 export function useComposerSend({
   activeId,
+  authorizeSwitch,
   agent,
   applyCollabDoc,
   auth,
@@ -158,12 +163,12 @@ export function useComposerSend({
         ]);
         setStreamText("");
         setBusy(false);
-        return;
+        return true;
       }
 
       if (!user || !sockRef.current) {
         if (target) throw new Error("登录状态或会话连接不可用");
-        return;
+        return false;
       }
       const sendProjectId = target ? target.projectId : draftProjectRef.current;
       // 隐式负反馈（改写重发）：发送前用**当前会话**的现有消息判定「5min 内高相似改写」——
@@ -193,14 +198,14 @@ export function useComposerSend({
         parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
         isCurrent: recoveryIdentityIsCurrent,
         update: (state, recovered) => {
-          if (!recoveryIsCurrent()) return;
+          if (!recoveryIsCurrent()) return false;
           setCollabUi(state);
           setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },
       });
-      if (!recovery || !recoveryIdentityIsCurrent()) return;
+      if (!recovery || !recoveryIdentityIsCurrent()) return false;
       let latestCollab = recovery.state;
       const recoveredAdvisor = recovery.recoveredAdvisor;
       if (!originalSessionId) {
@@ -231,26 +236,24 @@ export function useComposerSend({
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
           if (!ensured) {
             toast("会话尚未创建成功，请检查网络后重试", "error");
-            return;
+            return false;
           }
           try {
             const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
-            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return false;
             if (recoveryIsCurrent()) applyCollabDoc(doc);
             latestCollab = docToUiState(doc);
           } catch (err) {
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
             if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
               const msg = apiErrorMessage(err, "协作配置保存失败");
               setCollabSaveError(msg);
               toast(msg, "error");
-              return;
+              return false;
             }
           }
         }
-        setSessions((c) => [createdSession!, ...c]);
-        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
         ...latestCollab, agentId: agent.id,
@@ -258,8 +261,17 @@ export function useComposerSend({
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
-        return;
+        return false;
       }
+      const authorization=!imageEdit&&modelId&&authorizeSwitch?await authorizeSwitch({
+        sessionId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,teamMode:sendCollab.teamMode,
+        text:formatMessageReplyPrompt(text,replyTo),mediaCount:media?.length??0,
+        ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
+        ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
+      },{useCachedRequestId:true,allowOfflineQueue:true,
+        canPrompt:recoveryIsCurrent,
+        isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
+      if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
       const materializedDraft =
         !createdSession && (
           sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
@@ -289,7 +301,8 @@ export function useComposerSend({
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
       const teamLeaderTurn = sendCollab.teamMode;
-      sockRef.current?.send({
+      const sent=await sockRef.current?.send({
+        ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,
         agentId: agent.id,
         text,
@@ -317,6 +330,8 @@ export function useComposerSend({
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if(sent===false)return false;
+      if(createdSession&&recoveryIsCurrent())setActiveId(sessionId);
       if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
         auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
         ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
@@ -355,6 +370,7 @@ export function useComposerSend({
           applyProject(1);
         }
       }
+      return true;
     },
     // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
     // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
@@ -362,6 +378,7 @@ export function useComposerSend({
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      authorizeSwitch,
       draftSessionId,
       stopPreparing,
       auth,

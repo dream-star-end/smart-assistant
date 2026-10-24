@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote,fixtureExecutionModel} from "./model-switch-cost-fixture.mjs";
 /**
  * Real App + two browser contexts against a shared loopback HTTP/WS fixture.
  * Proves collab select/refresh, cross-end preference change, frozen original
@@ -226,6 +227,12 @@ function startFixture() {
         row.messageCount = Math.max(row.messageCount, 1);
       }
       return json(200, { ok: true, updatedAt: Date.now() });
+    }
+    if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+      const sid=decodeURIComponent(path.split('/')[4]);
+      const executed=[...inbounds].reverse().find(frame=>frame.peer?.id===sid);
+      const row=sessions.get(sid);
+      return json(200,fixtureSwitchQuote(data,{empty:!executed&&!row?.messageCount,sourceModel:fixtureExecutionModel(executed)??row?.modelId??'glm-5.2'}));
     }
     if (path.startsWith("/api/")) return json(200, { ok: true });
     json(404, { error: "not found" });

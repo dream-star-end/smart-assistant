@@ -33,11 +33,13 @@ import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
-import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
+import { clearDraft, readDraft, draftExceedsStorage } from "../lib/composerDraft";
 import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
-import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
+import {STATUS_LABEL,goalNearBudget,visibleGoalOf,type GoalSetInput} from '../lib/goalPresentation';
+import {LazyBoundary} from './ChunkErrorBoundary';
+import {DialogFallback} from './DialogFallback';
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -76,6 +78,7 @@ const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 // 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。只是提示,加载失败(发版后的
 // 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
 const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
+const GoalDialog=lazy(()=>import('./GoalDialog').then(module=>({default:module.GoalDialog})));
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
@@ -194,7 +197,7 @@ export function Composer({
   prediction,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
-  onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
+  onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => unknown;
   busy?: boolean;
   /** The same send/stop control is settling an acknowledged Stop. */
   stopping?: boolean;
@@ -475,24 +478,46 @@ export function Composer({
     [revoke],
   );
 
-  // sendPrediction:只有发送按钮传 true。键盘 Enter 在空输入框里不发预测(防误发,先 Tab 填入再 Enter)。
+  const submittingRef=useRef(false);
+  const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
+  const previousSubmit=latestSubmitRef.current;
+  latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
+    (previousSubmit.value!==value||previousSubmit.attachments!==attachments||previousSubmit.draftKey!==draftKey||previousSubmit.replyTo!==replyTo?1:0)};
+  // Keep the draft until asynchronous fee confirmation has accepted this send.
   const submit = (sendPrediction = false) => {
-    // 生成中(busy)不再拒发:发送经 WS service 的"排队"路径(status=queued),本轮结束自动
-    // 发出(对标 ChatGPT/Claude),用户不再干等。并轨安全由 service 侧保证——排队项只在
-    // 本会话 _sendingInFlight 清除后才真正下发,绝不 mid-turn 并发送(见 socket.dispatchPayload)。
-    if (disabled || !canSend) return;
-    // 空输入框(没有附件、没有引用)时 canSend 只可能来自正在显示的整句预测:按钮发出这句。
+    if (disabled || !canSend || submittingRef.current) return;
     const typed = value.trim().length > 0 || doneMedia.length > 0;
     if (!typed && !sendPrediction) return;
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
-    onSend(text, doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
-    // 发出去的预测本地立刻作废:value 本来就是空的,不作废的话在父层换掉 prediction 之前再点一次会重复发送。
-    if (!typed && sendablePrediction) setDismissedPrediction(sendablePrediction);
-    setValue("");
-    if (draftKey) clearDraft(draftKey);
-    for (const a of attachments) revoke(a.previewUrl);
-    setAttachments([]);
-    onCancelReply?.();
+    const snapshot=latestSubmitRef.current;
+    submittingRef.current=true;
+    const finish=(sent:unknown)=>{
+      submittingRef.current=false;
+      if(sent===false)return;
+      if(latestSubmitRef.current.draftKey!==snapshot.draftKey){
+        // A successful first send may promote the empty composer to its new
+        // session. Clear only the submitted owner's unchanged stored draft.
+        if(snapshot.draftKey&&readDraft(snapshot.draftKey)===snapshot.value)clearDraft(snapshot.draftKey);
+        if(snapshot.draftKey&&attachmentCache.get(snapshot.draftKey)===snapshot.attachments){
+          attachmentCache.set(snapshot.draftKey,[]);
+          for(const attachment of snapshot.attachments)revoke(attachment.previewUrl);
+        }
+        return;
+      }
+      if(latestSubmitRef.current.revision!==snapshot.revision)return;
+      if (!typed && sendablePrediction) setDismissedPrediction(sendablePrediction);
+      setValue("");
+      if (draftKey) clearDraft(draftKey);
+      for (const a of attachments) revoke(a.previewUrl);
+      setAttachments([]);
+      onCancelReply?.();
+    };
+    try{
+      const sent=onSend(text,doneMedia.length?doneMedia:undefined,replyTo??undefined);
+      if(sent&&typeof (sent as Promise<unknown>).then==='function'){
+        void (sent as Promise<unknown>).then(finish,()=>{submittingRef.current=false;});
+      }else finish(sent);
+    }catch{ submittingRef.current=false; }
   };
 
   // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
@@ -1093,7 +1118,8 @@ export function Composer({
       </Dialog.Root>
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
-      {canGoal && onSetGoal && onGoalAction && (
+      {canGoal && onSetGoal && onGoalAction && goalOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
         <GoalDialog
           open={goalOpen}
           onOpenChange={setGoalOpen}
@@ -1101,6 +1127,7 @@ export function Composer({
           onSet={onSetGoal}
           onAction={onGoalAction}
         />
+        </LazyBoundary>
       )}
     </div>
   );
