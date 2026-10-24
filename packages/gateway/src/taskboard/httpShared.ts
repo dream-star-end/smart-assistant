@@ -37,7 +37,9 @@ export interface TaskboardHttpContext {
   isCommercialJwt?: (token: string) => boolean
   listAgents?: () => Promise<BoardAgent[]>
   /** Only database-resolved runs are accepted; no client supplied session keys. */
-  getRunSnapshots?: (runs: readonly TicketRun[]) => Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview' | 'stopRequested'>>>
+  getRunSnapshots?: (
+    runs: readonly TicketRun[],
+  ) => Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview' | 'stopRequested'>>>
   /**
    * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
    * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。
@@ -108,20 +110,49 @@ export function resolveProject(db: TaskboardDb, idOrKey: string) {
 }
 
 /** Enrich only the response window, with one batch lookup and no stored mutation. */
-export async function enrichTaskboardRuns(ctx: TaskboardHttpContext, runs: readonly TicketRun[]): Promise<TicketRun[]> {
-  let projected = [...runs]
-  if (ctx.getRunSnapshots && runs.length) {
+export async function enrichTaskboardRuns(
+  ctx: TaskboardHttpContext,
+  runs: readonly TicketRun[],
+): Promise<TicketRun[]> {
+  const activeControl = (run: TicketRun) => {
+    const control = taskboardRunControls.getActiveForTicket(run.ticketId)
+    return control?.runId === run.id && control.rootSessionKey === run.sessionKey
+      ? control
+      : undefined
+  }
+  // Capture all rows before the first asynchronous projection. A control may
+  // archive output and finish during that await; old payload must stay pending.
+  const pendingAtRead = new Map(
+    runs.map((run) => {
+      const control = activeControl(run)
+      return [run.id, { settling: !!control, stopped: control?.signal.aborted === true }] as const
+    }),
+  )
+  const projected: TicketRun[] = []
+  for (let index = 0; index < runs.length; index += 200) {
+    const batch = runs.slice(index, index + 200)
+    if (!ctx.getRunSnapshots) {
+      projected.push(...batch)
+      continue
+    }
     try {
-      const snapshots = await ctx.getRunSnapshots(runs)
-      projected = runs.map((run) => ({ ...run, ...snapshots[run.id] }))
+      const snapshots = await ctx.getRunSnapshots(batch)
+      projected.push(...batch.map((run) => ({ ...run, ...snapshots[run.id] })))
     } catch {
-      // Usage persistence may be briefly unavailable. Missing stays unrecorded.
-      projected = runs.map((run) => ({ ...run, actualModels: [] }))
+      projected.push(...batch.map((run) => ({ ...run, actualModels: [] })))
     }
   }
   return projected.map((run) => {
-    const control = taskboardRunControls.getActiveForTicket(run.ticketId)
-    const settling = !!control && control.runId === run.id && control.rootSessionKey === run.sessionKey
-    return { ...run, settling, stopRequested: settling ? control.signal.aborted : run.stopRequested === true }
+    const control = activeControl(run)
+    const captured = pendingAtRead.get(run.id)
+    const settling = captured?.settling === true || !!control
+    return {
+      ...run,
+      settling,
+      stopRequested:
+        captured?.stopped === true ||
+        control?.signal.aborted === true ||
+        run.stopRequested === true,
+    }
   })
 }
