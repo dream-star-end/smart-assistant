@@ -140,7 +140,7 @@ it('401 reads that rotate tokens cannot turn generation revalidation into an unb
   expect(view.result.current.resolvedIdentity).toBeNull()
   expect(clearAuthHint).not.toHaveBeenCalled()
 })
-it('verified balance updates preserve the capability; the display setter revokes it synchronously', async () => {
+it('verified balance and same-account display updates preserve the current proof', async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
     ? reply({ access_token: 'alice-a', user: wireUser('alice') })
     : String(url) === '/api/me' ? reply({ user: { ...wireUser('alice'), credits: '321' } }) : reply({ accepted: true })))
@@ -152,8 +152,9 @@ it('verified balance updates preserve the capability; the display setter revokes
   expect(view.result.current.resolvedIdentity).toBe(identity)
   act(() => {
     view.result.current.setUser(previous => previous && { ...previous, displayName: 'display only' })
-    expect(identityIsCurrent(identity, view.result.current.authRef.current)).toBe(false)
+    expect(identityIsCurrent(identity, view.result.current.authRef.current)).toBe(true)
   })
+  expect(view.result.current.resolvedIdentity).toBe(identity)
 })
 it('a replacement effect subscribes to the same pending identity read after a display-only update', async () => {
   const pendingMe = deferred<Response>()
@@ -187,4 +188,24 @@ it('an auth object replacement at identical epoch/generation revalidates instead
   await waitFor(() => expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1))
   await waitFor(() => expect(identityIsCurrent(view.result.current.resolvedIdentity, replacement, 'alice')).toBe(true))
   expect(identityIsCurrent(original, replacement)).toBe(false)
+})
+
+it('a display setter cannot grant another UID or revive a revoked proof when its id returns', async () => {
+  const pending = deferred<Response>()
+  vi.stubGlobal('fetch', vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
+    ? reply({ access_token: 'alice-a', user: wireUser('alice') }) : String(url) === '/api/me' ? pending.promise : reply({ accepted: true })))
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: vi.fn() }))
+  await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
+  const original = view.result.current.resolvedIdentity
+  act(() => {
+    view.result.current.setUser(previous => previous && { ...previous, id: 'unverified-display-id' })
+    expect(identityIsCurrent(original, view.result.current.authRef.current)).toBe(false)
+  })
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  act(() => { view.result.current.setUser(previous => previous && { ...previous, id: 'alice' }) })
+  expect(identityIsCurrent(original, view.result.current.authRef.current)).toBe(false)
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  await act(async () => { pending.resolve(reply({ user: wireUser('alice') })); await pending.promise })
+  await waitFor(() => expect(view.result.current.resolvedIdentity).not.toBeNull())
+  expect(view.result.current.resolvedIdentity).not.toBe(original)
 })

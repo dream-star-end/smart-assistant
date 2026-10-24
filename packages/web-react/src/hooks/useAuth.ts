@@ -125,14 +125,18 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const lastVerifiedUid = useRef<string | null>(null);
   const [pendingAccount, setPendingAccount] = useState<{ user: User; identity: ResolvedIdentity; auth: AuthSession } | null>(null);
   const pendingAccountRef = useRef(pendingAccount);
-  // A display setter never grants an identity. Revoke synchronously before React commits.
-  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
-    revokeResolvedIdentity(identityRef.current);
-    identityRef.current = null;
-    setAccount(previous => ({ user: typeof update === 'function' ? update(previous.user) : update, identity: null }));
-  }, []);
   const userRef = useRef(user);
   userRef.current = user;
+  // A display-only update keeps an existing current proof, never creates one.
+  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
+    const nextUser = typeof update === 'function' ? update(userRef.current) : update;
+    const previous = identityRef.current;
+    const identity = nextUser && identityIsCurrent(previous, authRef.current, nextUser.id) ? previous : null;
+    if (previous !== identity) revokeResolvedIdentity(previous);
+    identityRef.current = identity;
+    userRef.current = nextUser;
+    setAccount({ user: nextUser, identity });
+  }, []);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
@@ -171,6 +175,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     if (identity) lastVerifiedUid.current = nextUser.id;
     pendingAccountRef.current = null;
     setPendingAccount(null);
+    userRef.current = nextUser;
     setAccount({ user: nextUser, identity });
     return true;
   }, []);
