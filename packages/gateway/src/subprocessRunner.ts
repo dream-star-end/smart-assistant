@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from './systemHelpEnvironment.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { PassiveStageTiming } from './passiveStageTiming.js'
 import { fastServiceTierRoute } from '@openclaude/protocol'
@@ -767,7 +768,7 @@ export class SubprocessRunner extends EventEmitter {
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
           OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
-          OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
+          ...systemHelpEnvironment(this.opts.systemHelpContextFile, this.opts.config.gateway?.port),
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
           ...(this.delegateContextFile
