@@ -429,7 +429,7 @@ describe('流水线模板', () => {
       skippedPipelines: 0,
       skippedStages: 0,
     })
-    wrap(<TemplateLibrary auth={auth} projectId="p1" />)
+    wrap(<TemplateLibrary auth={auth} projectId="p1" agents={[{ id: 'main', name: '主助手' }]} />)
     fireEvent.click(screen.getByTestId('template-library-open'))
     expect(await screen.findByTestId('template-card-builtin:bug')).toHaveAttribute(
       'data-source',
@@ -438,6 +438,8 @@ describe('流水线模板', () => {
     expect(screen.getByTestId('template-card-builtin:bug')).toHaveTextContent('不可删除')
     expect(screen.queryByTestId('template-delete-builtin:bug')).not.toBeInTheDocument()
     expect(screen.getByTestId('template-delete-tpl-custom')).toBeInTheDocument()
+    expect(screen.getByTestId('template-apply-builtin:bug')).toBeDisabled()
+    fireEvent.change(screen.getByTestId('builtin-execution-agent'), { target: { value: 'main' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('template-apply-builtin:bug'))
     })
@@ -445,6 +447,7 @@ describe('流水线模板', () => {
       expect(apply).toHaveBeenCalledWith(auth, 'builtin:bug', {
         projectId: 'p1',
         asDefault: true,
+        executionAgentId: 'main',
       })
     })
   })

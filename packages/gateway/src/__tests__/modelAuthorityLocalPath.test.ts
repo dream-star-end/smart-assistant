@@ -922,6 +922,130 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   })
 
+  for (const scenario of [
+    { name: 'stage wins over agent', stage: 'deepseek-v4-flash', agent: 'grok-build', expected: 'deepseek-v4-flash', mint: 0, admits: 0 },
+    { name: 'agent default wins over grok preference', agent: 'deepseek-v4-flash', expected: 'deepseek-v4-flash', mint: 0, admits: 0 },
+    { name: 'explicit agent grok refuses route denial', agent: 'grok-build', denied: true, mint: 1, admits: 0 },
+    { name: 'auto retains grok routing', agent: 'auto', expected: 'grok-build', mint: 1, admits: 1 },
+    { name: 'auto retains route fallback', agent: 'auto', denied: true, expected: 'deepseek-v4-flash', mint: 1, admits: 0 },
+    { name: 'unavailable explicit model refuses before spawn', agent: 'deepseek-v4-flash', stage: 'retired-task-model', mint: 0, admits: 0 },
+    { name: 'explicit stage grok does not fall back', agent: 'deepseek-v4-flash', stage: 'grok-build', denied: true, mint: 1, admits: 0 },
+  ]) {
+    test(`taskboard model A: ${scenario.name}`, async () => {
+      installCatalog({ extraModels: GROK_ROWS })
+      await withFlags({ authority: true, exempt: true }, async () => {
+        const gw = makeDelegateGateway()
+        const getConfig = gw._getAgentsConfig
+        gw._getAgentsConfig = async () => {
+          const config = await getConfig()
+          return { ...config, agents: config.agents.map((agent: any) => agent.id === 'coding-assistant' ? { ...agent, model: scenario.agent } : agent) }
+        }
+        let minted = 0
+        const admits: any[] = []
+        const admit = gw._delegateEngineBilling.admit
+        gw._delegateEngineBilling.admit = async (input: any) => { admits.push(input); return admit(input) }
+        gw._acquireDelegateGrokRoute = async () => { minted += 1; return scenario.denied ? deniedMint() : okMint() }
+        const result = await gw._runTaskboardDelegate({ agentId: 'coding-assistant', goal: 'taskboard model policy fixture', model: scenario.stage, sessionKey: 'agent:coding-assistant:taskboard:fixture:stage:run', timeoutSec: 60 })
+        assert.equal(minted, scenario.mint)
+        assert.equal(admits.length, scenario.admits)
+        if (scenario.expected) {
+          assert.equal(result.ok, true, JSON.stringify(result))
+          assert.equal(gw.sessions.getOrCreateCalls, 1)
+          assert.equal(gw.sessions.getOrCreateArgs[0].model, scenario.expected)
+          assert.equal(gw.sessions.getOrCreateArgs[0].executionAuthority.canonicalModel, scenario.expected)
+          if (admits.length) assert.equal(admits[0].model, scenario.expected)
+        } else {
+          assert.equal(result.ok, false)
+          assert.equal(gw.sessions.getOrCreateCalls, 0)
+          assert.equal(admits.length, 0)
+        }
+      })
+    })
+  }
+
+  test('nine independent taskboard runs retain independent ordinary delegate guard owners', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      for (let i = 0; i < 9; i += 1) {
+        const result = await gw._runTaskboardDelegate({ agentId: 'coding-assistant', model: 'deepseek-v4-flash', goal: `independent task ${i}`, sessionKey: `agent:coding-assistant:taskboard:fixture:stage:run-${i}`, timeoutSec: 60 })
+        assert.equal(result.ok, true, JSON.stringify(result))
+      }
+      assert.equal(gw.sessions.getOrCreateCalls, 9)
+    })
+  })
+
+  function gatewayWithAgentModel(model: string): any {
+    const gw = makeDelegateGateway()
+    const original = gw._getAgentsConfig
+    gw._getAgentsConfig = async () => {
+      const config = await original()
+      return { ...config, agents: config.agents.map((agent: any) => agent.id === 'coding-assistant' ? { ...agent, model } : agent) }
+    }
+    return gw
+  }
+
+  function traceRoute(gw: any, denied = false) {
+    let minted = 0
+    const admits: Array<{ model: string; engine: string }> = []
+    const originalAdmit = gw._delegateEngineBilling.admit
+    gw._acquireDelegateGrokRoute = async () => { minted += 1; return denied ? deniedMint() : okMint() }
+    gw._delegateEngineBilling.admit = async (input: any) => {
+      admits.push({ model: input.model, engine: input.engine })
+      return originalAdmit(input)
+    }
+    return () => {
+      const opts = gw.sessions.getOrCreateArgs[0]
+      return { minted, admits, model: opts?.model, agentModel: opts?.agent?.model,
+        canonicalModel: opts?.executionAuthority?.canonicalModel, engine: opts?.executionAuthority?.engine,
+        grokRoute: gw.sessions.submitExtras[0]?.grokRoute ?? null }
+    }
+  }
+
+  test('ordinary HTTP cannot inject taskboard-only execution fields', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const observations: unknown[] = []
+      for (const forged of [false, true]) {
+        const gw = gatewayWithAgentModel('deepseek-v4-flash')
+        const trace = traceRoute(gw)
+        let captured: any
+        const original = gw._runDelegateTask.bind(gw)
+        gw._runDelegateTask = async (input: any) => { captured = { ...input }; return original(input) }
+        const response = await runDelegate(gw, 'coding-assistant', { goal: 'ordinary HTTP policy boundary', sourceAgent: 'main',
+          ...(forged ? { modelPolicy: 'taskboard-stage-agent-auto', delegationGuardOwnerKey: 'taskboard-run:forged', taskboardControl: { rootSessionKey: 'forged-root' } } : {}) })
+        assert.equal(response.status, 200, JSON.stringify(response.body))
+        assert.equal(captured.modelPolicy, undefined)
+        assert.equal(captured.delegationGuardOwnerKey, undefined)
+        assert.equal(captured.taskboardControl, undefined)
+        assert.equal(gw.sessions.getOrCreateArgs[0].channel, 'delegate')
+        assert.equal(gw.sessions.getOrCreateArgs[0].model, 'grok-build')
+        observations.push(trace())
+      }
+      assert.deepEqual(observations[1], observations[0])
+    })
+  })
+
+  for (const denied of [false, true]) {
+    test(`taskboard auto equals ordinary route, denied=${denied}`, async () => {
+      installCatalog({ extraModels: GROK_ROWS })
+      await withFlags({ authority: true, exempt: true }, async () => {
+        const ordinary = gatewayWithAgentModel('auto')
+        const taskboard = gatewayWithAgentModel('auto')
+        const ordinaryTrace = traceRoute(ordinary, denied)
+        const taskboardTrace = traceRoute(taskboard, denied)
+        const baseline = await runDelegate(ordinary, 'coding-assistant', { goal: 'ordinary auto reference', sourceAgent: 'main' })
+        const actual = await taskboard._runTaskboardDelegate({ agentId: 'coding-assistant', goal: 'taskboard auto equivalence',
+          sessionKey: `agent:coding-assistant:taskboard:auto:stage:${denied}`, timeoutSec: 60 })
+        assert.equal(baseline.status, 200, JSON.stringify(baseline.body))
+        assert.equal(actual.ok, true, JSON.stringify(actual))
+        assert.equal(ordinary.sessions.getOrCreateCalls, 1)
+        assert.equal(taskboard.sessions.getOrCreateCalls, 1)
+        assert.deepEqual(taskboardTrace(), ordinaryTrace())
+      })
+    })
+  }
+
   test('decideLocalExecution:preferredModels 排在 agent.model 之前,但不可路由时静默跳过', () => {
     const v = view([row('glm-5.2', 'ccb'), row('grok-build', 'grok')])
     const exempt = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv

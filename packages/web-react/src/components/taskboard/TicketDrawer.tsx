@@ -10,8 +10,10 @@ import {
   type Ticket,
   type TicketComment,
   type TicketPriority,
+  type TicketRun,
   type TimelineItem,
   assigneeLabel,
+  boardErrorCode,
   isVersionConflict,
   mergeTimelineSources,
   resolveOriginSessionId,
@@ -23,15 +25,44 @@ import type { AuthSession } from '../../lib/types'
 import { Markdown } from '../Markdown'
 import { Button, Field, IconButton, Input, ListSkeleton, Select, Sheet, useToast } from '../ui'
 import { LOCAL_COMMENT_ID_PREFIX, TicketTimeline } from './TicketTimeline'
+import { useTimelineHistory } from './timelineHistory'
 
 // Share reads from background, initial and post-write reconciliation. A slow
 // response may be shared, but its owner/version is checked before it is applied.
-function joinRead<T>(pending: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> {
+function joinRead<T>(
+  pending: Map<string, Promise<T>>,
+  key: string,
+  load: () => Promise<T>,
+): Promise<T> {
   const active = pending.get(key)
   if (active) return active
   const next = load().finally(() => pending.delete(key))
   pending.set(key, next)
   return next
+}
+
+function mergeExecution(items: TimelineItem[], execution: TicketRun | null): TimelineItem[] {
+  if (!execution) return items
+  const active =
+    execution.status === 'running' || execution.status === 'queued' || execution.settling === true
+  let found = false
+  const merged = items.map((item) => {
+    if (item.kind !== 'run' || item.run.id !== execution.id) return item
+    found = true
+    const terminal = item.run.status !== 'running' && item.run.status !== 'queued'
+    const actualModels = [
+      ...new Set([...(item.run.actualModels ?? []), ...(execution.actualModels ?? [])]),
+    ]
+    if (terminal) return { ...item, run: { ...item.run, actualModels } }
+    if (!active) return item // Full terminal output comes only from the timeline.
+    const preview =
+      (execution.preview?.lastActivityAt ?? 0) < (item.run.preview?.lastActivityAt ?? 0)
+        ? item.run.preview
+        : execution.preview
+    return { ...item, run: { ...item.run, ...execution, actualModels, preview } }
+  })
+  if (!found) merged.push({ kind: 'run', createdAt: execution.createdAt, run: execution })
+  return sortTimelineAsc(merged)
 }
 
 function TicketMarkdown({
@@ -100,6 +131,7 @@ export function TicketDrawer({
   onTicketUpdated,
   onDetailLoaded,
   onOpenSession,
+  onConfigureStage,
 }: {
   auth: AuthSession
   ticket: Ticket | null
@@ -120,8 +152,10 @@ export function TicketDrawer({
    */
   onDetailLoaded?: (ticket: Ticket) => void
   onOpenSession?: (sessionId: string) => void
+  onConfigureStage?: () => void
 }) {
   const toast = useToast()
+  const [descriptionOpen, setDescriptionOpen] = useState(desktop)
   const [detail, setDetail] = useState<Ticket | null>(null)
   const [stageName, setStageName] = useState<string | null>(null)
   const [detailStage, setDetailStage] = useState<PipelineStage | null>(null)
@@ -137,6 +171,9 @@ export function TicketDrawer({
   const [comment, setComment] = useState('')
   const [commenting, setCommenting] = useState(false)
   const [patrolling, setPatrolling] = useState(false)
+  const [execution, setExecution] = useState<TicketRun | null>(null)
+  const [executionNeedsSetup, setExecutionNeedsSetup] = useState(false)
+  const [stopState, setStopState] = useState<'requesting' | 'stopping' | null>(null)
 
   const ownerLookup = ticketRef || ticket?.identifier || ticket?.id || null
   const ownerGen = useRef(0)
@@ -150,8 +187,17 @@ export function TicketDrawer({
   openRef.current = open
   const belongsToOwner = (row: Ticket | null | undefined) =>
     !!row && !!ownerLookup && (row.id === ownerLookup || row.identifier === ownerLookup)
+  const [history, historyStatus] = useTimelineHistory(auth, ownerLookup)
+  const historyRef = useRef(history)
+  historyRef.current = history
+  const resultRequests = history.resultRequests
+  const [resultError, setResultError] = useState(false)
+  const scrollContainer = useRef<HTMLDivElement>(null)
   const paintedOwnerRef = useRef<string | null>(null)
-  if (paintedOwnerRef.current !== ownerLookup || (!open && paintedOwnerRef.current !== null)) {
+  const paintedOwner = open ? ownerLookup : null
+  if (paintedOwnerRef.current !== paintedOwner) {
+    setDescriptionOpen(desktop)
+    if (resultError) setResultError(false)
     if (detail) setDetail(null)
     if (timeline.length) setTimeline([])
     if (stageName) setStageName(null)
@@ -160,10 +206,17 @@ export function TicketDrawer({
     if (saving) setSaving(false)
     if (commenting) setCommenting(false)
     if (patrolling) setPatrolling(false)
-    paintedOwnerRef.current = open ? ownerLookup : null
+    if (execution) setExecution(null)
+    if (stopState) setStopState(null)
+    if (executionNeedsSetup) setExecutionNeedsSetup(false)
+    paintedOwnerRef.current = paintedOwner
   }
-  const current = belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
-    ? detail : belongsToOwner(ticket) ? ticket : null
+  const current =
+    belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
+      ? detail
+      : belongsToOwner(ticket)
+        ? ticket
+        : null
   const lookup = ownerLookup
   const commentingRef = useRef(commenting)
   commentingRef.current = commenting
@@ -171,18 +224,77 @@ export function TicketDrawer({
   currentRef.current = current
   const timelineRef = useRef(timeline)
   timelineRef.current = timeline
-  const currentStage = detailStage?.id === current?.stageId
-    ? detailStage
-    : stages.find((stage) => stage.id === current?.stageId) ?? null
-  const canStart = !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const executionRef = useRef(execution)
+  executionRef.current = execution
+  const activeExecution =
+    execution &&
+    (execution.status === 'running' || execution.status === 'queued' || execution.settling === true)
+      ? execution
+      : null
+  const applyExecution = useCallback((next: TicketRun | null | undefined) => {
+    if (next === undefined) return false
+    const previous = executionRef.current
+    const previousTerminal =
+      previous &&
+      next &&
+      previous.id === next.id &&
+      previous.status !== 'running' &&
+      previous.status !== 'queued'
+    const knownTerminal =
+      previousTerminal ||
+      (next &&
+        timelineRef.current.some(
+          (item) =>
+            item.kind === 'run' &&
+            item.run.id === next.id &&
+            item.run.status !== 'running' &&
+            item.run.status !== 'queued',
+        ))
+    if (next && knownTerminal && (next.status === 'running' || next.status === 'queued'))
+      return false
+    executionRef.current = next
+    setExecution(next)
+    if (!next || (next.status !== 'running' && next.status !== 'queued' && !next.settling))
+      setStopState(null)
+    else if (next.stopRequested) setStopState('stopping')
+    else if (previous?.id !== next.id) setStopState(null)
+    setTimeline((items) => mergeExecution(items, next))
+    return (
+      previous?.id !== next?.id ||
+      previous?.status !== next?.status ||
+      previous?.settling !== next?.settling
+    )
+  }, [])
+  const currentStage =
+    detailStage?.id === current?.stageId
+      ? detailStage
+      : (stages.find((stage) => stage.id === current?.stageId) ?? null)
+  const needsSetup = currentStage?.kind === 'ai' && (!currentStage.agentId || executionNeedsSetup)
+  const canRetry =
+    !needsSetup &&
+    !activeExecution &&
+    !!execution &&
+    !!current &&
+    execution.stageId === current.stageId &&
+    (current.status === 'blocked' ||
+      current.status === 'ready' ||
+      current.status === 'waiting_human') &&
+    currentStage?.kind === 'ai'
+  const canStart =
+    !needsSetup &&
+    !canRetry &&
+    !activeExecution &&
+    !!current &&
+    (current.status === 'ready' || current.status === 'waiting_human') &&
+    currentStage?.kind === 'ai'
   const reads = useMemo(() => {
     const details = new Map<string, ReturnType<typeof taskboardApi.getTicketDetail>>()
     const timelines = new Map<string, ReturnType<typeof taskboardApi.listTimeline>>()
     return {
       detail: (id: string) => joinRead(details, id, () => taskboardApi.getTicketDetail(auth, id)),
-      timeline: (id: string) => joinRead(timelines, id, () => taskboardApi.listTimeline(auth, id)),
+      timeline: (id: string) => joinRead(timelines, id, () => history.fetchLatest(id)),
     }
-  }, [auth])
+  }, [auth, history])
   const editingRef = useRef(false)
 
   const stageById = useMemo(() => {
@@ -231,10 +343,12 @@ export function TicketDrawer({
     setLoading(timelineRef.current.length === 0)
     const load = async () => {
       try {
-        const [fresh, runs] = await Promise.all([
-          reads.detail(requested),
-          taskboardApi.listRuns(auth, requested),
-        ])
+        const fresh = await reads.detail(requested)
+        if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
+        const runs =
+          fresh.execution !== undefined
+            ? { items: [] as TicketRun[], total: 0 }
+            : await taskboardApi.listRuns(auth, requested)
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         if (currentRef.current && fresh.ticket.version < currentRef.current.version) return
         currentRef.current = fresh.ticket
@@ -242,6 +356,7 @@ export function TicketDrawer({
         setStageName(fresh.stage?.name ?? null)
         setDetailStage(fresh.stage ?? null)
         onDetailLoadedRef.current?.(fresh.ticket)
+        applyExecution(fresh.execution !== undefined ? fresh.execution : (runs.items[0] ?? null))
         let items: TimelineItem[]
         try {
           items = await reads.timeline(requested)
@@ -259,7 +374,7 @@ export function TicketDrawer({
         }
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         if (currentRef.current?.version !== fresh.ticket.version || commentingRef.current) return
-        setTimeline(sortTimelineAsc(items))
+        setTimeline(mergeExecution(history.acceptLatest(items), executionRef.current))
       } catch (e) {
         if (e instanceof AuthEpochStaleError || cancelled || ownerGen.current !== gen) return
         toast(taskboardErrorMessage(e, '加载单据详情失败'), 'error')
@@ -271,7 +386,7 @@ export function TicketDrawer({
     return () => {
       cancelled = true
     }
-  }, [auth, lookup, open, reads, ticket?.version, toast])
+  }, [applyExecution, auth, lookup, open, reads, ticket?.version, toast, history])
 
   // Refresh only the open owner. Do not reload project metadata or blank the
   // timeline on a background tick. Visibility resume also catches comments.
@@ -281,6 +396,7 @@ export function TicketDrawer({
     const gen = ownerGen.current
     let stopped = false
     let inFlight = false
+    let resumeRequested = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let failures = 0
     let lastTimelineAt = Date.now()
@@ -291,8 +407,10 @@ export function TicketDrawer({
       inFlight = true
       try {
         const fresh = await reads.detail(requested)
-        if (!owned() || (currentRef.current && fresh.ticket.version < currentRef.current.version)) return
+        if (!owned() || (currentRef.current && fresh.ticket.version < currentRef.current.version))
+          return
         failures = 0
+        const executionChanged = applyExecution(fresh.execution)
         setStageName(fresh.stage?.name ?? null)
         setDetailStage(fresh.stage ?? null)
         const changed = fresh.ticket.version !== currentRef.current?.version
@@ -301,14 +419,23 @@ export function TicketDrawer({
           setDetail(fresh.ticket)
           onDetailLoadedRef.current?.(fresh.ticket)
         }
-        if (changed || forceTimeline || Date.now() - lastTimelineAt >= 15_000) {
+        if (changed || executionChanged || forceTimeline || Date.now() - lastTimelineAt >= 15_000) {
           const version = fresh.ticket.version
           const items = await reads.timeline(requested)
           if (!owned() || currentRef.current?.version !== version || commentingRef.current) return
-          setTimeline((cur) => sortTimelineAsc([
-            ...items,
-            ...cur.filter((item) => item.kind === 'comment' && item.comment.id.startsWith(LOCAL_COMMENT_ID_PREFIX)),
-          ]))
+          const accepted = history.acceptLatest(items)
+          setTimeline((cur) =>
+            mergeExecution(
+              [
+                ...accepted,
+                ...cur.filter(
+                  (item) =>
+                    item.kind === 'comment' && item.comment.id.startsWith(LOCAL_COMMENT_ID_PREFIX),
+                ),
+              ],
+              executionRef.current,
+            ),
+          )
           lastTimelineAt = Date.now()
         }
       } catch (e) {
@@ -316,23 +443,39 @@ export function TicketDrawer({
       } finally {
         inFlight = false
         if (owned() && visible()) {
-          const interval = currentRef.current?.status === 'running' ? 3_000 : 15_000
-          timer = setTimeout(() => void tick(), Math.min(60_000, interval * 2 ** failures))
+          const interval =
+            executionRef.current?.status === 'running' ||
+            executionRef.current?.status === 'queued' ||
+            executionRef.current?.settling
+              ? 2_000
+              : currentRef.current?.status === 'running'
+                ? 3_000
+                : 15_000
+          const resume = resumeRequested
+          resumeRequested = false
+          timer = setTimeout(
+            () => void tick(resume),
+            resume ? 0 : Math.min(60_000, interval * 2 ** failures),
+          )
         }
       }
     }
     const resume = () => {
       clearTimeout(timer)
-      if (visible()) void tick(true)
+      if (visible()) {
+        if (inFlight) resumeRequested = true
+        else void tick(true)
+      }
     }
-    timer = setTimeout(() => void tick(), currentRef.current?.status === 'running' ? 3_000 : 15_000)
+    // Initial detail metadata arrives after this effect; use the active cadence for the first follow-up.
+    timer = setTimeout(() => void tick(), 2_000)
     document.addEventListener('visibilitychange', resume)
     return () => {
       stopped = true
       clearTimeout(timer)
       document.removeEventListener('visibilitychange', resume)
     }
-  }, [lookup, open, reads])
+  }, [applyExecution, lookup, open, reads, history])
 
   const refreshAfterWrite = async (idOrIdent: string, gen: number) => {
     try {
@@ -360,7 +503,9 @@ export function TicketDrawer({
       setDetail(fresh.ticket)
       setStageName(fresh.stage?.name ?? null)
       setDetailStage(fresh.stage ?? null)
-      if (!commentingRef.current) setTimeline(sortTimelineAsc(items))
+      applyExecution(fresh.execution)
+      if (!commentingRef.current)
+        setTimeline(mergeExecution(history.acceptLatest(items), executionRef.current))
       onTicketUpdated(fresh.ticket)
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
@@ -435,6 +580,11 @@ export function TicketDrawer({
     try {
       const out = await taskboardApi.comment(auth, current.id, { body })
       if (ownerGen.current !== gen) return
+      history.acceptWrite({
+        kind: 'comment',
+        createdAt: out.comment.createdAt,
+        comment: out.comment,
+      })
       setTimeline((cur) =>
         cur.map((item) =>
           item.kind === 'comment' && item.comment.id === optimistic.id
@@ -454,12 +604,120 @@ export function TicketDrawer({
     }
   }
 
-  const runPatrol = async () => {
+  const hydrateResult = useCallback(
+    (run: TicketRun, reconcilePending = false): void => {
+      if (
+        !reconcilePending &&
+        (run.status === 'running' || run.status === 'queued' || run.settling)
+      )
+        return
+      if (resultRequests.size) return
+      const gen = ownerGen.current
+      const ticketId = currentRef.current?.id
+      const requestedOwner = ownerLookupRef.current
+      const present = history.fullRun(run.id)
+      if (
+        present ||
+        (!run.settling &&
+          run.status !== 'running' &&
+          run.status !== 'queued' &&
+          run.outputMd != null)
+      ) {
+        const full = present ?? run
+        history.acceptRun(full)
+        history.resultFailures.delete(run.id)
+        setResultError(history.resultFailures.size > 0)
+        return
+      }
+      const request = taskboardApi
+        .getRun(auth, run.id)
+        .then((full) => {
+          if (
+            ownerGen.current !== gen ||
+            historyRef.current !== history ||
+            full.ticketId !== ticketId ||
+            full.id !== run.id
+          )
+            return
+          setTimeline(mergeExecution(history.acceptRun(full), executionRef.current))
+          history.resultFailures.delete(run.id)
+          setResultError(history.resultFailures.size > 0)
+        })
+        .catch((error) => {
+          resultRequests.delete(run.id)
+          if (ownerGen.current !== gen || error instanceof AuthEpochStaleError) return
+          if (history.fullRun(run.id)) return
+          history.resultFailures.set(run.id, run)
+          setResultError(true)
+        })
+        .finally(() => {
+          if (resultRequests.get(run.id) === request) resultRequests.delete(run.id)
+          const latest = executionRef.current
+          if (
+            ownerGen.current !== gen &&
+            historyRef.current === history &&
+            ownerLookupRef.current === requestedOwner &&
+            latest?.id === run.id
+          )
+            hydrateResult(latest)
+        })
+      resultRequests.set(run.id, request)
+    },
+    [auth, history, resultRequests],
+  )
+
+  useEffect(() => {
+    if (!open) return
+    if (execution) hydrateResult(execution)
+    const pending = historyStatus.initialized ? history.pendingRuns(execution?.id)[0] : undefined
+    if (pending) hydrateResult(pending, true)
+  }, [open, execution, hydrateResult, history, historyStatus])
+
+  const loadEarlier = async () => {
+    if (!lookup) return
+    const gen = ownerGen.current
+    const scroller = scrollContainer.current
+    const anchor = scroller
+      ? [...scroller.querySelectorAll<HTMLElement>('[data-testid="ticket-timeline-group"]')].find(
+          (node) => node.getBoundingClientRect().bottom > scroller.getBoundingClientRect().top,
+        )
+      : undefined
+    const top = anchor?.getBoundingClientRect().top ?? 0
+    const height = scroller?.scrollHeight ?? 0
+    const scrollTop = scroller?.scrollTop ?? 0
+    try {
+      const items = await history.loadEarlier(lookup)
+      if (ownerGen.current !== gen) return
+      setTimeline(mergeExecution(items, executionRef.current))
+      requestAnimationFrame(() => {
+        if (!scroller || ownerGen.current !== gen) return
+        scroller.scrollTop = anchor?.isConnected
+          ? scroller.scrollTop + anchor.getBoundingClientRect().top - top
+          : scrollTop + scroller.scrollHeight - height
+      })
+    } catch (error) {
+      if (!(error instanceof AuthEpochStaleError) && ownerGen.current === gen)
+        toast(taskboardErrorMessage(error, '加载历史失败'), 'error')
+    }
+  }
+
+  const runPatrol = async (retry = false) => {
     if (!current) return
     const gen = ownerGen.current
     setPatrolling(true)
     try {
-      const out = await taskboardApi.patrol(auth, current.id, current.version)
+      let ready = current
+      if (retry && executionRef.current) hydrateResult(executionRef.current)
+      if (retry && current.status !== 'ready') {
+        ready = (await taskboardApi.ready(auth, current.id, current.version)).ticket
+        if (ownerGen.current !== gen) return
+        if (!currentRef.current || ready.version >= currentRef.current.version) {
+          currentRef.current = ready
+          setDetail(ready)
+          onTicketUpdated(ready)
+        }
+      }
+      const out = await taskboardApi.patrol(auth, ready.id, ready.version)
       if (ownerGen.current !== gen) return
       if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
         currentRef.current = out.ticket
@@ -477,9 +735,44 @@ export function TicketDrawer({
         void refreshAfterWrite(current.identifier, gen)
         return
       }
+      if (['stage_agent_unavailable', 'stage_model_unavailable'].includes(boardErrorCode(e) ?? ''))
+        setExecutionNeedsSetup(true)
       toast(taskboardErrorMessage(e, '启动巡检失败'), 'error')
     } finally {
       if (ownerGen.current === gen) setPatrolling(false)
+    }
+  }
+
+  const stopRun = async () => {
+    if (!current || !activeExecution || stopState) return
+    const gen = ownerGen.current
+    const requestedRunId = activeExecution.id
+    const stillOwnsRun = () =>
+      executionRef.current?.id === requestedRunId &&
+      (executionRef.current.status === 'running' ||
+        executionRef.current.status === 'queued' ||
+        executionRef.current.settling === true)
+    setStopState('requesting')
+    try {
+      const out = await taskboardApi.stopRun(auth, current.id, current.version, requestedRunId)
+      if (ownerGen.current !== gen || !stillOwnsRun()) return
+      if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
+        currentRef.current = out.ticket
+        setDetail(out.ticket)
+        onTicketUpdated(out.ticket)
+      }
+      setStopState(out.state === 'stopping' ? 'stopping' : null)
+      toast(
+        out.state === 'stopping' ? '已请求停止，正在保留输出并收尾' : '本次执行已结束',
+        'success',
+      )
+      void refreshAfterWrite(current.identifier, gen)
+    } catch (error) {
+      if (ownerGen.current !== gen || !stillOwnsRun()) return
+      setStopState(null)
+      if (error instanceof AuthEpochStaleError) return
+      toast(taskboardErrorMessage(error, '停止执行失败，请稍后重试'), 'error')
+      void refreshAfterWrite(current.identifier, gen)
     }
   }
 
@@ -517,6 +810,7 @@ export function TicketDrawer({
       {current ? (
         <div
           data-testid="ticket-drawer"
+          ref={scrollContainer}
           className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 pb-4 pt-1"
         >
           <div>
@@ -559,7 +853,9 @@ export function TicketDrawer({
                   </Field>
                 </div>
                 {editVersion !== null && editVersion !== current.version && (
-                  <output className="block text-caption text-warning">任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。</output>
+                  <output className="block text-caption text-warning">
+                    任务已被更新，当前草稿已保留。保存时会检查冲突；可放弃修改后重新编辑最新内容。
+                  </output>
                 )}
                 <div className="flex flex-wrap gap-1">
                   <Button
@@ -593,9 +889,19 @@ export function TicketDrawer({
 
           {!editing &&
             (current.body ? (
-              <details open={desktop} className="rounded-lg border border-border px-3 py-2">
-                <summary className="cursor-pointer text-caption font-medium text-muted">任务说明</summary>
-                <div className="mt-2"><TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown></div>
+              <details
+                open={descriptionOpen}
+                onToggle={(event) => setDescriptionOpen(event.currentTarget.open)}
+                className="rounded-lg border border-border px-3 py-2"
+              >
+                <summary className="flex min-h-11 cursor-pointer items-center text-caption font-medium text-muted">
+                  任务说明
+                </summary>
+                {descriptionOpen && (
+                  <div className="mt-2">
+                    <TicketMarkdown testId="ticket-body-md">{current.body}</TicketMarkdown>
+                  </div>
+                )}
               </details>
             ) : (
               <p className="text-meta text-faint">还没有描述</p>
@@ -608,6 +914,22 @@ export function TicketDrawer({
           )}
 
           {actions}
+          {needsSetup && (
+            <div className="rounded-lg border border-border bg-hover px-3 py-2 text-body">
+              <p>执行助手待配置，请先选择已安装且可用的助手。</p>
+              {onConfigureStage && (
+                <Button
+                  type="button"
+                  className="mt-2 min-h-11"
+                  variant="secondary"
+                  data-testid="ticket-configure-execution"
+                  onClick={onConfigureStage}
+                >
+                  配置执行助手
+                </Button>
+              )}
+            </div>
+          )}
 
           <div className="flex flex-wrap gap-1">
             {!editing && current.status !== 'done' && current.status !== 'canceled' && (
@@ -621,6 +943,37 @@ export function TicketDrawer({
                 改需求
               </Button>
             )}
+            {activeExecution && (
+              <Button
+                type="button"
+                size="sm"
+                variant="danger"
+                className="min-h-11"
+                data-testid="ticket-drawer-stop"
+                loading={stopState === 'requesting'}
+                disabled={stopState !== null}
+                onClick={() => void stopRun()}
+              >
+                {stopState === 'requesting'
+                  ? '请求停止…'
+                  : stopState === 'stopping'
+                    ? '停止处理中'
+                    : '停止本次执行'}
+              </Button>
+            )}
+            {canRetry && (
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                className="min-h-11"
+                loading={patrolling}
+                data-testid="ticket-drawer-retry"
+                onClick={() => void runPatrol(true)}
+              >
+                重新执行本阶段
+              </Button>
+            )}
             {canStart && (
               <Button
                 type="button"
@@ -628,6 +981,7 @@ export function TicketDrawer({
                 variant="secondary"
                 loading={patrolling}
                 data-testid="ticket-drawer-patrol"
+                className="min-h-11"
                 onClick={() => void runPatrol()}
               >
                 {current.status === 'waiting_human' ? '重新执行本阶段' : '开始执行'}
@@ -640,7 +994,9 @@ export function TicketDrawer({
                 size="sm"
                 data-testid="ticket-drawer-origin-session"
                 disabled={!originUsable}
-                title={originUsable ? undefined : '来源会话不在当前列表中，可能已删除或不是网页对话'}
+                title={
+                  originUsable ? undefined : '来源会话不在当前列表中，可能已删除或不是网页对话'
+                }
                 onClick={openOrigin}
               >
                 回到来源会话
@@ -648,6 +1004,47 @@ export function TicketDrawer({
             )}
           </div>
 
+          {historyStatus.initialized &&
+            (historyStatus.hasMore || !historyStatus.supported || historyStatus.error) && (
+              <div
+                className="flex flex-wrap items-center gap-2 text-caption text-muted"
+                data-testid="timeline-history-controls"
+              >
+                <span>
+                  {historyStatus.hasGap
+                    ? '有活动尚未载入'
+                    : historyStatus.supported
+                      ? '显示最近记录，可继续查看更早历史'
+                      : '历史可能尚未完整载入'}
+                </span>
+                {historyStatus.hasMore && (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="min-h-11"
+                    data-testid="timeline-load-earlier"
+                    loading={historyStatus.loading}
+                    onClick={() => void loadEarlier()}
+                  >
+                    {historyStatus.hasGap ? '加载缺失记录' : '加载更早记录'}
+                  </Button>
+                )}
+                {historyStatus.error && <output>{historyStatus.error}</output>}
+              </div>
+            )}
+          {resultError && (
+            <Button
+              type="button"
+              variant="ghost"
+              className="min-h-11"
+              data-testid="retry-run-result"
+              onClick={() => {
+                for (const failed of history.resultFailures.values()) hydrateResult(failed, true)
+              }}
+            >
+              完整结果暂未加载，点击重试
+            </Button>
+          )}
           <TicketTimeline
             items={timeline}
             loading={loading}

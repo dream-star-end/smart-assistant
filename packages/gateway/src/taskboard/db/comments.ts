@@ -97,3 +97,13 @@ export function listComments(
     .all(ticketId, limit, offset) as CommentRow[]
   return rows.map(mapComment)
 }
+
+
+/** Payloads for an already selected, bounded timeline window. */
+export function listCommentsByIdsForTicket(db: TaskboardDb, ticketId: string, ids: readonly string[]): TicketComment[] {
+  if (ids.length > 500) throw new RangeError('timeline payload window exceeds 500')
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(',')
+  const rows = db.prepare(`SELECT ${COMMENT_COLS} FROM tb_ticket_comment WHERE ticket_id = ? AND id IN (${placeholders})`).all(ticketId, ...ids) as CommentRow[]
+  return rows.map(mapComment)
+}

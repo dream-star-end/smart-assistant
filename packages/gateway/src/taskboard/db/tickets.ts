@@ -434,3 +434,8 @@ export function updateTicket(
   }
   return getTicket(db, id) as Ticket
 }
+
+/** Only IDs; readiness preflight never loads every pending ticket body. */
+export function listReadyStageIds(db: TaskboardDb): string[] {
+  return (db.prepare("SELECT DISTINCT stage_id FROM tb_ticket WHERE status = 'ready' AND stage_id IS NOT NULL").all() as { stage_id: string }[]).map((row) => row.stage_id)
+}

@@ -1050,7 +1050,12 @@ describe('任务面板项目范围切换', () => {
         // p2 模拟切换窗口里 columns.tickets 缺失：旧代码 collectInboxTickets / columns.flatMap 会抛。
         columns:
           pid === 'p2'
-            ? [{ stage: sampleStage({ pipelineId: 'pipe2' }), tickets: undefined as unknown as Ticket[] }]
+            ? [
+                {
+                  stage: sampleStage({ pipelineId: 'pipe2' }),
+                  tickets: undefined as unknown as Ticket[],
+                },
+              ]
             : [
                 {
                   stage: sampleStage(),
@@ -1122,6 +1127,7 @@ describe('项目管理', () => {
     let stored: ReturnType<typeof sampleProject>[] = []
     vi.spyOn(taskboardApi, 'listProjects').mockImplementation(async () => stored)
     mockEmptyBoard()
+    vi.spyOn(taskboardApi, 'listAgents').mockResolvedValue([{ id: 'main', name: '主助手' }])
     const createProject = vi
       .spyOn(taskboardApi, 'createProject')
       .mockImplementation(async (_a, body) => {
@@ -1144,6 +1150,8 @@ describe('项目管理', () => {
     await screen.findByTestId('project-create')
     fireEvent.change(screen.getByTestId('project-key'), { target: { value: 'ocv5' } })
     fireEvent.change(screen.getByTestId('project-name'), { target: { value: 'V5 自用' } })
+    await screen.findByRole('option', { name: '主助手' })
+    fireEvent.change(screen.getByTestId('builtin-execution-agent'), { target: { value: 'main' } })
     await act(async () => {
       fireEvent.click(screen.getByTestId('project-create-submit'))
     })
@@ -1151,7 +1159,12 @@ describe('项目管理', () => {
     await waitFor(() => {
       expect(createProject).toHaveBeenCalledWith(
         auth,
-        expect.objectContaining({ key: 'OCV5', name: 'V5 自用', description: null }),
+        expect.objectContaining({
+          key: 'OCV5',
+          name: 'V5 自用',
+          description: null,
+          executionAgentId: 'main',
+        }),
       )
     })
     await waitFor(() => {
@@ -1481,4 +1494,196 @@ describe('pickInitialProject', () => {
     expect(pickInitialProject([e2e], null)?.id).toBe('e2e')
     expect(pickInitialProject([{ ...testProj, archivedAt: 1 }, e2e], 'test')?.id).toBe('e2e')
   })
+})
+
+describe('modern result window ownership', () => {
+  const emptyPage = () => ({
+    window: 'latest-v1' as const,
+    items: [],
+    hasMore: false,
+    nextBefore: null,
+    head: 'fixture-revision',
+    unchanged: false,
+  })
+  test('reopening the same ticket retries a discarded full-result response and preserves old-created paid output', async () => {
+    const ticket = sampleTicket({ status: 'blocked' })
+    const execution = sampleRun({
+      status: 'failed',
+      outputMd: undefined,
+      createdAt: 1,
+      settling: false,
+      actualModels: ['actual-paid'],
+    })
+    vi.spyOn(taskboardApi, 'getTicketDetail').mockResolvedValue({
+      ticket,
+      pipeline: null,
+      stage: sampleStage(),
+      execution,
+    })
+    vi.spyOn(taskboardApi, 'listTimelinePage').mockImplementation(async () => emptyPage())
+    const listRuns = vi.spyOn(taskboardApi, 'listRuns')
+    let release!: (run: TicketRun) => void
+    const held = new Promise<TicketRun>((resolve) => {
+      release = resolve
+    })
+    const full = {
+      ...execution,
+      outputMd: 'OLD_CREATED_FULL_PAID_OUTPUT_END',
+      costUsd: 0.02,
+      costImprecise: true,
+    }
+    const getRun = vi
+      .spyOn(taskboardApi, 'getRun')
+      .mockReturnValueOnce(held)
+      .mockResolvedValue(full)
+    const ui = (open: boolean) => (
+      <ToastProvider>
+        <TooltipProvider>
+          <TicketDrawer
+            auth={auth}
+            ticket={ticket}
+            ticketRef={ticket.identifier}
+            open={open}
+            desktop
+            agents={[]}
+            stages={[sampleStage()]}
+            sessionIds={[]}
+            onClose={() => {}}
+            onReconcile={() => {}}
+            onTicketUpdated={() => {}}
+          />
+        </TooltipProvider>
+      </ToastProvider>
+    )
+    const view = render(ui(true))
+    await waitFor(() => expect(getRun).toHaveBeenCalledTimes(1))
+    view.rerender(ui(false))
+    view.rerender(ui(true))
+    await waitFor(() => expect(taskboardApi.getTicketDetail).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      release(full)
+      await held
+    })
+    expect(await screen.findByText('OLD_CREATED_FULL_PAID_OUTPUT_END')).toBeInTheDocument()
+    expect(getRun).toHaveBeenCalledTimes(2)
+    expect(listRuns).not.toHaveBeenCalled()
+    expect(screen.getByTestId('ticket-run-models')).toHaveTextContent('actual-paid')
+  })
+
+  test('an acknowledged comment survives an already in-flight older latest window', async () => {
+    const ticket = sampleTicket()
+    vi.spyOn(taskboardApi, 'getTicketDetail').mockResolvedValue({
+      ticket,
+      pipeline: null,
+      stage: sampleStage(),
+      execution: null,
+    })
+    let release!: (page: ReturnType<typeof emptyPage>) => void
+    const held = new Promise<ReturnType<typeof emptyPage>>((resolve) => {
+      release = resolve
+    })
+    const pages = vi
+      .spyOn(taskboardApi, 'listTimelinePage')
+      .mockResolvedValueOnce(emptyPage())
+      .mockReturnValueOnce(held)
+      .mockResolvedValue(emptyPage())
+    const saved = sampleComment({ id: 'server-saved', body: 'ACK_COMMENT_MUST_SURVIVE' })
+    vi.spyOn(taskboardApi, 'comment').mockResolvedValue({ ok: true, comment: saved })
+    renderDrawer(ticket)
+    await waitFor(() => expect(pages).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await waitFor(() => expect(pages).toHaveBeenCalledTimes(2))
+    fireEvent.change(screen.getByTestId('ticket-drawer-comment'), { target: { value: saved.body } })
+    fireEvent.click(screen.getByTestId('ticket-drawer-comment-submit'))
+    await waitFor(() => expect(taskboardApi.comment).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      release(emptyPage())
+      await held
+    })
+    expect(await screen.findByText(saved.body)).toBeInTheDocument()
+  })
+})
+
+test('an older settling result outside the latest window is hydrated after another run becomes current', async () => {
+  const ticket = sampleTicket({ status: 'running' })
+  const old = sampleRun({
+    id: 'older-paid',
+    status: 'timeout',
+    createdAt: 1,
+    outputMd: null,
+    settling: true,
+  })
+  let execution = old
+  vi.spyOn(taskboardApi, 'getTicketDetail').mockImplementation(async () => ({
+    ticket,
+    pipeline: null,
+    stage: sampleStage(),
+    execution,
+  }))
+  vi.spyOn(taskboardApi, 'listTimelinePage')
+    .mockResolvedValueOnce({
+      window: 'latest-v1',
+      items: [{ kind: 'run', createdAt: 1, run: old }],
+      head: 'rev1',
+      unchanged: false,
+      hasMore: true,
+      nextBefore: 'cursor',
+    })
+    .mockResolvedValue({
+      window: 'latest-v1',
+      items: [],
+      head: 'rev1',
+      unchanged: true,
+      hasMore: true,
+      nextBefore: 'cursor',
+    })
+  const getRun = vi
+    .spyOn(taskboardApi, 'getRun')
+    .mockResolvedValue({ ...old, settling: false, outputMd: 'OLD_OUTSIDE_WINDOW_PAID_END' })
+  renderDrawer(ticket)
+  await screen.findByTestId('ticket-run-settling')
+  expect(getRun).not.toHaveBeenCalled()
+  execution = sampleRun({ id: 'new-running', status: 'running', outputMd: null, settling: false })
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  expect(await screen.findByText('OLD_OUTSIDE_WINDOW_PAID_END')).toBeInTheDocument()
+  expect(getRun).toHaveBeenCalledWith(auth, old.id)
+  expect(screen.queryByTestId('ticket-run-settling')).not.toBeInTheDocument()
+  expect(screen.getByTestId('ticket-drawer-stop')).toBeEnabled()
+})
+
+test('nonempty paid output still settling is refreshed by exact old run id', async () => {
+  const ticket = sampleTicket({ status: 'running' })
+  const old = sampleRun({
+    id: 'settling-paid',
+    status: 'succeeded',
+    createdAt: 1,
+    outputMd: 'PAID_BODY_BEFORE_CONTROL_FINISH',
+    settling: true,
+  })
+  const current = sampleRun({ id: 'other-running', status: 'running', outputMd: null })
+  vi.spyOn(taskboardApi, 'getTicketDetail').mockResolvedValue({
+    ticket,
+    pipeline: null,
+    stage: sampleStage(),
+    execution: current,
+  })
+  vi.spyOn(taskboardApi, 'listTimelinePage').mockResolvedValue({
+    window: 'latest-v1',
+    items: [{ kind: 'run', createdAt: old.createdAt, run: old }],
+    head: 'fixture',
+    unchanged: false,
+    hasMore: false,
+    nextBefore: null,
+  })
+  const getRun = vi
+    .spyOn(taskboardApi, 'getRun')
+    .mockResolvedValue({ ...old, settling: false, outputMd: 'PAID_BODY_FINAL_END' })
+  renderDrawer(ticket)
+  expect(await screen.findByText('PAID_BODY_FINAL_END')).toBeInTheDocument()
+  expect(getRun).toHaveBeenCalledWith(auth, old.id)
+  expect(screen.queryByTestId('ticket-run-settling')).not.toBeInTheDocument()
 })

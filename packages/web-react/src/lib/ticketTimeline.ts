@@ -470,6 +470,18 @@ function normalizeRun(raw: unknown, index: number): TicketRun | null {
     outputMd: typeof row.outputMd === 'string' ? row.outputMd : null,
     error: typeof row.error === 'string' ? row.error : null,
     createdAt: createdAt ?? anchor,
+    stopRequested: row.stopRequested === true,
+    settling: row.settling === true,
+    actualModels: Array.isArray(row.actualModels)
+      ? [...new Set(row.actualModels.filter((model): model is string => typeof model === 'string' && model !== '' && model !== 'auto'))]
+      : undefined,
+    preview: row.preview && typeof row.preview === 'object' && typeof row.preview.text === 'string'
+      ? {
+          text: row.preview.text.slice(-4096),
+          toolNames: Array.isArray(row.preview.toolNames)
+            ? row.preview.toolNames.filter((name): name is string => typeof name === 'string').slice(-8).map((name) => name.slice(0, 64)) : [],
+          lastActivityAt: timeOf(row.preview.lastActivityAt),
+        } : undefined,
     contextSha256: typeof row.contextSha256 === 'string' ? row.contextSha256 : null,
     contextVersion:
       typeof row.contextVersion === 'number' && Number.isFinite(row.contextVersion)
