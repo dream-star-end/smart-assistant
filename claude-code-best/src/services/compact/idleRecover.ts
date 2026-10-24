@@ -19,7 +19,19 @@ const IDLE_TAIL_MAX_TOKENS = 40_000
 const IDLE_TAIL_MIN_TOKENS = 10_000
 const IDLE_TAIL_MIN_TEXT = 5
 
-export function outerHistoryNeedsCompact(messages: readonly unknown[]): boolean {
+export interface IdleNativeFit {
+  inputTokens: number
+  inputBudget: number
+}
+
+export function outerHistoryNeedsCompact(
+  messages: readonly unknown[],
+  fit?: IdleNativeFit,
+): boolean {
+  if (fit && Number.isSafeInteger(fit.inputTokens) && fit.inputTokens >= 0
+    && Number.isSafeInteger(fit.inputBudget) && fit.inputBudget > 0) {
+    return fit.inputTokens >= fit.inputBudget
+  }
   return JSON.stringify(messages).length / 4 >= IDLE_OUTER_TOKEN_FLOOR
 }
 
@@ -376,6 +388,7 @@ export async function applyIdleTranscript(input: {
 export async function resumeIdleSummary(input: {
   sessionId: string
   messages: readonly Message[]
+  fit?: IdleNativeFit
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
 }): Promise<{ path: string; file: IdleNativeFile; freshSummary: boolean } | undefined> {
@@ -391,7 +404,7 @@ export async function resumeIdleSummary(input: {
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
-  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages)) {
+  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages, input.fit)) {
     file = { ...file, applied: true }
     writeIdleNativeFile(path, file)
     return { path, file, freshSummary: false }
@@ -417,6 +430,7 @@ export async function resumeIdleSummary(input: {
 export async function runIdleCompact(input: {
   sessionId: string
   messages: Message[]
+  fit?: IdleNativeFit
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
   record: (
