@@ -216,7 +216,7 @@ export class ModelSwitchCostService {
       uid,
       input.sessionId,
       input.requestId,
-      { targetModel: canonical },
+      { targetModel: canonical, targetAgent: input.agentId },
     )
     const base: ModelSwitchCostQuote = {
       mode: 'exempt',
@@ -239,8 +239,9 @@ export class ModelSwitchCostService {
     }
     if (
       ctx.source === 'empty' ||
-      ctx.source === 'unchanged' ||
+      (ctx.source === 'unchanged' && ctx.sourceAgent === input.agentId) ||
       (ctx.sourceModel !== null &&
+        ctx.sourceAgent === input.agentId &&
         (target.canonicalize?.(ctx.sourceModel) ??
           this.deps.pricing.get(ctx.sourceModel)?.model_id ??
           ctx.sourceModel) === canonical)

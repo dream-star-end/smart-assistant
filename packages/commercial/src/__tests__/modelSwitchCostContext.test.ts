@@ -181,3 +181,15 @@ test('native shrink/compact and incomplete historical counters use B without hyd
     assert.equal(context.tokens, null)
   }
 })
+
+test('same model only takes the fast path for the same agent routing', async () => {
+  const context = await readSwitchContext(
+    db([tape('2', 'cheap')]),
+    '765',
+    'own',
+    'm-other-agent-context',
+    { targetModel: 'cheap', targetAgent: 'other-agent' },
+  )
+  assert.equal(context.source, 'last-call')
+  assert.equal(context.sourceAgent, 'main')
+})

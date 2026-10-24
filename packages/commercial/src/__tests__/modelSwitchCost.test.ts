@@ -297,3 +297,42 @@ test('unknown-count cheap waiver preserves free supported cache rates', () => {
   )
   assert.equal(switchPriceDominated(cheap, dear, 'codex', 'ccb'), false)
 })
+
+test('same model with a different expensive agent is not a same-route exemption', async () => {
+  const model = price('gpt-6-luna', 53, 265, 11, 64, '0.400')
+  const pricing = new PricingCache()
+  pricing._setForTests([model])
+  const pool = {
+    query: async (_sql: string, args: string[]) => ({
+      rows: [{ cost_multiplier: args[0] === 'main' ? '1.000' : '100.000' }],
+    }),
+  } as unknown as Pool
+  const service = new ModelSwitchCostService({
+    pool,
+    pricing,
+    secret: 'fixture-secret',
+    balance: async () => 10000n,
+    sourceEngine: () => 'codex',
+    resolveTarget: async () => ({ pricing: model, engine: 'codex', contextWindow: 258400 }),
+    readContext: async () => ({
+      revision: 1,
+      fingerprint: 'warm-parent',
+      sourceModel: model.model_id,
+      sourceAgent: 'main',
+      tokens: 200453,
+      source: 'last-call',
+      warmRatio: 1,
+      outputs: [7],
+      calls: 1,
+      lastOutputTokens: 7,
+    }),
+  })
+  const quote = await service.quote('765', {
+    sessionId: 'own',
+    requestId: 'm-other-agent-cost',
+    targetModel: model.model_id,
+    agentId: 'expensive-same-model-agent',
+  })
+  assert.equal(quote.requiresConfirmation, true)
+  assert.equal(quote.mode, 'estimate')
+})

@@ -32,7 +32,7 @@ export async function readSwitchContext(
   uid: string,
   sessionId: string,
   requestId: string,
-  options: { targetModel: string },
+  options: { targetModel: string; targetAgent?: string },
 ): Promise<SwitchContext> {
   const owner = `c:${uid}`
   const row = (
@@ -192,7 +192,11 @@ export async function readSwitchContext(
       .filter((n): n is number => n !== null)
       .slice(0, 5),
   }
-  if (sourceModel === options.targetModel) return { ...base, source: 'unchanged' }
+  if (
+    sourceModel === options.targetModel &&
+    (options.targetAgent === undefined || sourceAgent === options.targetAgent)
+  )
+    return { ...base, source: 'unchanged' }
   if (
     !root ||
     latest?.tape_id !== root.tape_id ||
@@ -289,7 +293,7 @@ export async function readSwitchContext(
      ), ordered AS (
        SELECT *,max(tokens) OVER(ORDER BY created_at,tape_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prior_peak FROM headers
      ) SELECT max(tokens)::text AS peak_tokens,
-       bool_or(tokens IS NULL OR status<>'completed' OR finalized_at IS NULL) AS has_unknown,
+       bool_or(tokens IS NULL OR tokens<=0 OR status<>'completed' OR finalized_at IS NULL) AS has_unknown,
        bool_or(tokens<prior_peak) AS has_shrunk FROM ordered`,
       [sessionId, owner],
     )
