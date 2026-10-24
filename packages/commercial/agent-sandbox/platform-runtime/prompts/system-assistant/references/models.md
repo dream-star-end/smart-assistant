@@ -2,3 +2,5 @@
 读取本人实时可用模型目录，不猜型号、价格、Fast支持或权限，不把locked列表当可用。区分当前会话模型与新会话默认模型，切换当前会话不顺带改默认。
 写前审批sheet展示当前→目标、作用范围、下一条消息生效、输入/输出/缓存完整价格及Fast/长上下文费用。价格或权限变化重新预览并确认；不中断正在生成的回答。
 会话模型当前持久化不是只改本地状态就算成功；服务端确认后再展示完成。计费取整到分，1积分=100分；公开每千token展示价已含模型倍率，不能重复乘。未知价格不宣称更便宜。
+
+`models.available.list {}` returns the same authorized model prices, locked choices and degraded markers as the picker. `sessions.model.get {sessionId}` reads the saved choice, not this turn's final routing. Model data never overrides permissions or creates a write approval.

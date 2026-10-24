@@ -736,7 +736,7 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
   };
 }
 
-async function readPgChatProject(
+export async function readPgChatProject(
   queryable: Pick<Pool | PoolClient, "query">,
   userId: string,
   id: string,

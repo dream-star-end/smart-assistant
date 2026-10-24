@@ -1,3 +1,5 @@
+import { modelReadOperations, type SystemModelReadSources } from './modelReadOperations.js'
+import { stateReadOperations, type SystemStateReadSources } from './stateReadOperations.js'
 import { notificationOperations } from './notificationOperations.js'
 import { systemReadOperations } from './readOperations.js'
 /** Host-only composition. Enabled solely by the verified personal deployment. */
@@ -20,6 +22,8 @@ export function assembleSystemActions(deps: {
   firstPartyOrigin: string
   runner: QueryRunner
   identityRepo: ContainerIdentityRepo
+  modelReads?: SystemModelReadSources
+  stateReads?: SystemStateReadSources
   privacySupported(userId: string): Promise<boolean>
 }) {
   const authorize = makeAuthorizeSystemActor(deps.runner)
@@ -27,6 +31,8 @@ export function assembleSystemActions(deps: {
     ...preferenceOperations({ authorize, privacySupported: deps.privacySupported }),
     ...systemReadOperations({ authorize }),
     ...notificationOperations({ authorize }),
+    ...modelReadOperations({ authorize, sources: deps.modelReads }),
+    ...stateReadOperations({ authorize, sources: deps.stateReads }),
   ])
   const runtime = openSystemActionsRuntime({ ...deps, registry })
   return { runtime, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
