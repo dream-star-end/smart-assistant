@@ -1,3 +1,4 @@
+import { useAuthAccessGeneration } from "../hooks/useAuthAccessGeneration";
 import {
   BarChart3,
   Bell,
@@ -12,7 +13,7 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../lib/api";
 import { INBOX_LEVEL_META, type InboxLevelTone } from "../lib/inboxLevels";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -168,9 +169,7 @@ export function InboxDialog({
   // 重试计数：递增以强制首屏拉取 effect 重跑。
   const [reloadTick, setReloadTick] = useState(0);
 
-  const subscribe = useCallback((listener: () => void) => auth?.subscribeAccessGeneration?.(listener) ?? (() => {}), [auth]);
-  const getGeneration = useCallback(() => auth?.getAccessGeneration?.() ?? -1, [auth]);
-  const accessGeneration = useSyncExternalStore(subscribe, getGeneration, getGeneration);
+  const accessGeneration = useAuthAccessGeneration(auth);
   const listIdentity = useMemo(() => ({ open, auth, tab, reloadTick, refreshRevision, accessGeneration }), [open, auth, tab, reloadTick, refreshRevision, accessGeneration]);
   const latestList = useRef(listIdentity);
   latestList.current = listIdentity;

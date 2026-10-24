@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { SystemActionCardActions } from '../components/tool/context'
 import type { SystemActionsClient, ReceiptObserver } from '../lib/api/systemActionsApi'
@@ -7,6 +7,7 @@ import { applyIntelligentUiSnapshot } from '../lib/intelligentUi'
 import { extractPrefs, type PrefsView } from '../lib/modelPreferences'
 import type { AuthSession } from '../lib/types'
 import type { Theme } from './useTheme'
+import { useAuthAccessGeneration } from './useAuthAccessGeneration'
 
 const instanceIds = new WeakMap<AuthSession, number>()
 let nextInstanceId = 0
@@ -32,10 +33,7 @@ export function useSystemActionCardActions(input: {
   const [deviceId] = useState(() => globalThis.crypto?.randomUUID?.() ?? null)
   const [preferencesRevision, setPreferencesRevision] = useState(0)
   const [inboxRevision, setInboxRevision] = useState(0)
-  const subscribe = useCallback((listener: () => void) => typeof auth.subscribeAccessGeneration === 'function'
-    ? auth.subscribeAccessGeneration(listener) : () => {}, [auth])
-  const getGeneration = useCallback(() => typeof auth.getAccessGeneration === 'function' ? auth.getAccessGeneration() : -1, [auth])
-  const generation = useSyncExternalStore(subscribe, getGeneration, getGeneration)
+  const generation = useAuthAccessGeneration(auth)
   const epoch = auth.snapshot().epoch
   const systemActions = useMemo<SystemActionCardActions | undefined>(() => {
     if (demo || !userId || !deviceId || generation < 0 || typeof auth.subscribeAccessGeneration !== 'function' || !auth.snapshot().token) return undefined
