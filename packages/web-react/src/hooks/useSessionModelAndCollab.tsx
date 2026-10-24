@@ -11,7 +11,7 @@ import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveSessionModel } from "../lib/modelPreferences";
 import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
-import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody, isStaleCollabEpoch } from "../lib/collaborationConfig";
+import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
 import type { Agent } from "../lib/agents";
 import type { AuthSession, PublicModel, Session } from "../lib/types";
@@ -262,6 +262,7 @@ export function useSessionModelAndCollab({
       if (demo || !auth) return;
       const collabAuth = auth;
       const identityEpoch = collabAuth.snapshot().epoch;
+      const isCurrent = () => epoch === collabEpochRef.current && collabAuth.snapshot().epoch === identityEpoch;
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
@@ -279,8 +280,7 @@ export function useSessionModelAndCollab({
         const title =
           sessions.find((session) => session.id === activeId)?.title || "新对话";
         const ensured = await sockRef.current.ensureServerSession(activeId, agent.id, title);
-        if (isStaleCollabEpoch(epoch, collabEpochRef.current)
-          || collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (!isCurrent()) return;
         if (!ensured) {
           failSave("会话尚未创建成功，请检查网络后重试");
           return;
@@ -297,17 +297,14 @@ export function useSessionModelAndCollab({
             asDefault,
           }),
         );
-        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (!isCurrent()) return;
         applyCollabDoc(doc);
       } catch (err) {
-        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (!isCurrent()) return;
         if (err instanceof ApiError && err.status === 409) {
           try {
             const fresh = await api.getCollaborationConfig(collabAuth, activeId);
-            if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (!isCurrent()) return;
             if (keepCollabChoiceOnSaveFailure(mode)) {
               setCollabUi((cur) => ({ ...docToUiState(fresh), mode, advisorModel: null, configVersion: "" }));
               setTeamModeState(mode === "team");
@@ -316,8 +313,7 @@ export function useSessionModelAndCollab({
             toast("协作配置有更新，已重新读取，请再选一次", "error");
             return;
           } catch (rereadErr) {
-            if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (!isCurrent()) return;
             failSave(apiErrorMessage(rereadErr, "协作配置冲突后重读失败"));
             return;
           }
@@ -327,17 +323,15 @@ export function useSessionModelAndCollab({
     },
     [authorizeSwitch,getSwitchOptions,activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
   );
-  const setTeamMode = useCallback(
-    (enabled: boolean) => {
-      void persistCollab(enabled ? "team" : "solo", { asDefault: collabAsDefault });
-    },
-    [collabAsDefault, persistCollab],
-  );
   const setCollabMode = useCallback(
     (mode: CollabMode) => {
       void persistCollab(mode, { asDefault: collabAsDefault });
     },
     [collabAsDefault, persistCollab],
+  );
+  const setTeamMode = useCallback(
+    (enabled: boolean) => setCollabMode(enabled ? "team" : "solo"),
+    [setCollabMode],
   );
   // 切会话:服务端配置为权威。epoch 让慢 GET 不能覆盖后来的会话或用户点击。
   // biome-ignore lint/correctness/useExhaustiveDependencies: persistCollab captures the promoted draft on this session change; later picker/model changes must not reload collaboration
@@ -347,24 +341,22 @@ export function useSessionModelAndCollab({
     promotedCollabRef.current = null;
     const intent = promoted && promoted.sessionId === activeId && promoted.auth === auth
       && promoted.identityEpoch === auth?.snapshot().epoch ? promoted : null;
-    const enabled = intent?.state.mode === "team";
-    setCollabUi((cur) => ({
+    setCollabUi((cur) => (intent?.state ?? {
       ...EMPTY_COLLAB_UI,
-      ...(intent?.state ?? {}),
       advisorModels: cur.advisorModels,
       advisorUnavailableReason: cur.advisorUnavailableReason,
       advisorConsultParents: cur.advisorConsultParents,
       advisorConsultParentReason: cur.advisorConsultParentReason,
     }));
-    setTeamModeState(enabled);
+    setTeamModeState(intent?.state.mode === "team");
     setCollabAsDefault(false);
     // auth is null until login/boot getMe (useAuth). authRef always holds the
     // MemoryAuthSession, including the anonymous epoch-0 object — do not GET on it.
     if (demo || !auth) return;
     const collabAuth = auth;
     const identityEpoch = collabAuth.snapshot().epoch;
+    const isCurrent = () => epoch === collabEpochRef.current && collabAuth.snapshot().epoch === identityEpoch;
     if (intent) {
-      setCollabUi(intent.state);
       // First send already attempted persistence. Do not replace its frozen
       // choice with an inherited default, including after a failed save.
       if (!intent.persist) return;
@@ -378,13 +370,11 @@ export function useSessionModelAndCollab({
     void api
       .getCollaborationConfig(collabAuth, activeId)
       .then((doc) => {
-        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (!isCurrent()) return;
         applyCollabDoc(doc);
       })
       .catch((err) => {
-        if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
-        if (collabAuth.snapshot().epoch !== identityEpoch) return;
+        if (!isCurrent()) return;
         setCollabSaveError(apiErrorMessage(err, "协作配置读取失败"));
       });
   }, [activeId, applyCollabDoc, auth, demo]);
