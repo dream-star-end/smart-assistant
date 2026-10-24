@@ -1,3 +1,4 @@
+import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
 import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
@@ -382,7 +383,7 @@ export type DispatchStatus = {
   serviceStarting: boolean;
 };
 
-type OfflineItem = {
+export type OfflineItem = {
   sessId: string;
   payload: InboundMessage;
   msgId: string;
@@ -6298,57 +6299,20 @@ export class ChatSocket {
       item.state = "persisting";
       this.setTransientNotice(sess.id, "正在发送…");
       if(this.deps.authorizeSwitch&&item.payload.model&&!item.payload.content.imageEdit){
-        void this.authorizeQueuedSwitch(item).then(ok=>{if(ok)this.persistAuthorizedDispatch(item);});
+        void authorizeQueuedModelSwitch(item,this.deps.authorizeSwitch,{
+          queue:this.offlineQueue,slots:this.dispatchSlots,sessions:this.sessions,
+          clear:(sid,id)=>this.clearPendingDispatch(sid,id),
+          notice:(sid,text)=>this.setTransientNotice(sid,text),
+          persist:this.deps.persistSession,notify:()=>this.scheduleNotify(),
+        }).then(ok=>{if(ok)this.persistAuthorizedDispatch(item);});
       }else this.persistAuthorizedDispatch(item);
     }
   }
 
-  private async authorizeQueuedSwitch(item:OfflineItem):Promise<boolean>{
-    const p=item.payload;
-    let permit:SwitchAuthorization|null;
-    try{permit=await this.deps.authorizeSwitch!({sessionId:item.sessId,requestId:item.msgId,targetModel:p.model!,agentId:p.agentId??'main',
-      text:formatMessageReplyPrompt(p.content.text??'',p.content.replyTo),mediaCount:p.content.media?.length??0,teamMode:p.teamMode,
-      ...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
-    },{interactive:false,consent:p.modelSwitchConsent});}catch{
-      if(this.offlineQueue.includes(item)&&item.state==='persisting'){
-        item.state='queued';if(this.dispatchSlots.get(item.sessId)===item.msgId)this.dispatchSlots.delete(item.sessId);
-        this.setTransientNotice(item.sessId,'费用信息暂不可用，消息已保留，恢复连接后重试');
-      }
-      return false;
-    }
-    if(!this.offlineQueue.includes(item)||item.state!=='persisting')return false;
-    if(permit){p.modelSwitchConsent=permit.consent;return true;}
-    const sess=this.sessions.get(item.sessId);
-    this.clearPendingDispatch(item.sessId,item.msgId);
-    if(this.dispatchSlots.get(item.sessId)===item.msgId)this.dispatchSlots.delete(item.sessId);
-    if(sess){
-      if(sess._activeClientMessageId===item.msgId){sess._sendingInFlight=false;sess._activeClientMessageId=undefined;}
-      sess._dispatchPaused=true;
-      const user=sess.messages.find(m=>m.id===item.msgId&&m.role==='user');
-      if(user){user.status='error';user._errorCode='MODEL_SWITCH_CONFIRMATION_REQUIRED';user._errorDetail='切换后的首轮费用需要重新确认，请点击重试';}
-      this.setTransientNotice(sess.id,'切换后的首轮费用需要重新确认，请点击重试');
-      this.deps.persistSession?.(sess.id);this.scheduleNotify();
-    }
-    return false;
-  }
-
   private persistAuthorizedDispatch(item:OfflineItem):void{
-    if(!this.offlineQueue.includes(item)||item.state!=='persisting')return;
-      const committed = this.deps.persistPendingDispatch?.(item.sessId, {
-        msgId: item.msgId,
-        payload: item.payload,
-        enqueuedAt: item.enqueuedAt,
-      });
-      if (committed) {
-        void committed.then(
-          () => this.sendPersistedDispatch(item),
-          () => this.handleDispatchJournalFailure(item),
-        );
-      } else {
-        // Unit/SSR adapters without persistence keep their existing in-memory
-        // behavior. Production always supplies persistPendingDispatch.
-        this.sendPersistedDispatch(item);
-      }
+    commitAuthorizedModelSwitchDispatch(item,this.offlineQueue,
+      ()=>this.deps.persistPendingDispatch?.(item.sessId,{msgId:item.msgId,payload:item.payload,enqueuedAt:item.enqueuedAt}),
+      ()=>this.sendPersistedDispatch(item),()=>this.handleDispatchJournalFailure(item));
   }
 
   private handleDispatchJournalFailure(item: OfflineItem): void {

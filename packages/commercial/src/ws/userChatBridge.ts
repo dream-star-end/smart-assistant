@@ -1,3 +1,5 @@
+import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
+export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
@@ -552,20 +554,6 @@ function samePromptQueueDispatch(
     control.claimToken === request.claim.claimToken;
 }
 
-function promptQueueDispositionForCode(
-  code: string,
-): "retryable" | "user_action_required" {
-  return /^(?:MODEL_SWITCH_|ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
-    ? "user_action_required"
-    : "retryable";
-}
-
-/** OCV5-391: what a refused scheduler replay does with its recovery job. A refusal the user has
- * to act on (retired or unauthorized model, credits, agent, invalid input) never succeeds by
- * waiting, so the job stops; anything else waits for the next attempt. */
-export function _recoveryRefusalAction(code: string): "pause" | "requeue" {
-  return promptQueueDispositionForCode(code) === "user_action_required" ? "pause" : "requeue";
-}
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -576,12 +564,6 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[])
   return Object.keys(value).every((key) => allow.has(key));
 }
 
-export function shouldRejectCodexTurnForG7(
-  hasActiveTurn: boolean,
-  isPromptQueueDispatch: boolean,
-): boolean {
-  return hasActiveTurn && !isPromptQueueDispatch;
-}
 
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
@@ -4304,30 +4286,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : "",
         replyTo,
       );
-      if (deps.modelSwitchCost && historyModel && !temporaryImageFeature && !clientMessageId) {
-        onReject?.('MODEL_SWITCH_REQUEST_ID_REQUIRED');
-        sendErrorFrame(userWs,'MODEL_SWITCH_REQUEST_ID_REQUIRED','请刷新页面后重试，以确认本轮费用',{peerId,retryable:false,action:'retry'});
+      const costRefusal = await checkModelSwitchFrame(deps.modelSwitchCost, uid.toString(), frameObj,
+        {sessionId:peerId,requestId:clientMessageId,targetModel:historyModel,text:currentUserText,temporaryImageFeature});
+      if (costRefusal) {
+        if (pretrackedEnrichment) terminalizeEnrichmentDispatch(pretrackedEnrichment,costRefusal.code);
+        onReject?.(costRefusal.code);
+        sendErrorFrame(userWs,costRefusal.code,costRefusal.message,{peerId,clientMessageId:clientMessageId??undefined,retryable:false,action:'retry'});
         return null;
-      }
-      if (deps.modelSwitchCost && historyModel && !temporaryImageFeature && clientMessageId) {
-        try {
-          const content=frameObj.content && typeof frameObj.content==='object' ? frameObj.content as Record<string,unknown> : {};
-          await deps.modelSwitchCost.assertAuthorized(uid.toString(),{
-            sessionId:peerId,requestId:clientMessageId,targetModel:historyModel,
-            agentId:typeof frameObj.agentId==='string'?frameObj.agentId:'main',
-            teamMode:frameObj.teamMode===true,text:currentUserText,
-            ...(isCursorContextTier(frameObj.contextTier)?{contextTier:frameObj.contextTier}:{}),
-            ...(frameObj.serviceTier==='fast'?{serviceTier:'fast' as const}:{}),
-            mediaCount:Array.isArray(content.media)?content.media.length:0,
-          },typeof frameObj.modelSwitchConsent==='string'?frameObj.modelSwitchConsent:undefined);
-        } catch (error) {
-          const code=error instanceof ModelSwitchCostError?error.code:'MODEL_SWITCH_UNAVAILABLE';
-          if(pretrackedEnrichment)terminalizeEnrichmentDispatch(pretrackedEnrichment,code);
-          onReject?.(code);
-          sendErrorFrame(userWs,code,error instanceof ModelSwitchCostError?error.message:'费用确认暂不可用，请重试',
-            {peerId,clientMessageId,retryable:false,action:'retry'});
-          return null;
-        }
       }
       const sendAdmissionAck = (): void => {
         if (clientMessageId === null) return;

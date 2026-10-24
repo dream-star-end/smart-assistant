@@ -1,3 +1,4 @@
+import type {AuthorizeSwitch} from '../../hooks/useModelSwitchCost';
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
 
@@ -59,7 +60,7 @@ test('cancel before send creates no user row or session',async()=>{
 test('silent refusal pauses one queued turn, releases its slot and lets a later explicit send proceed',async()=>{
  vi.useFakeTimers();vi.stubGlobal('WebSocket',FakeWS as unknown as typeof WebSocket);
  let allowed=false;
- const authorizeSwitch=vi.fn(async(input)=>allowed?{requestId:input.requestId,choice:true as const}:null);
+ const authorizeSwitch=vi.fn<AuthorizeSwitch>(async(input,_opts)=>allowed?{requestId:input.requestId,choice:true as const}:null);
  const sock=makeSocket({authorizeSwitch});sock.setGateReady(true);
  const ws=FakeWS.instances.at(-1)!;ws.handshake();ws.relayReady();
  await sock.sendMessage({sessId:'s1',agentId:'main',model:'gpt-6-astra',text:'first',switchAuthorization:{requestId:'m-cost-first',choice:true}});await flush();
