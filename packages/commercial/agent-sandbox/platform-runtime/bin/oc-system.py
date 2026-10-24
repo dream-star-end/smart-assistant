@@ -89,21 +89,22 @@ def arguments(options):
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(prog='oc-system', description='按需系统指南、只读状态与待用户确认的操作提议。')
-    commands = parser.add_subparsers(dest='command')
-    skill = commands.add_parser('skill', help='读取静态指南；不带topic读取总索引')
+    subparsers = parser.add_subparsers(dest='command')
+    skill = subparsers.add_parser("skill", help='读取静态指南；不带topic读取总索引')
     skill.add_argument('topic', nargs='?', default='index', choices=TOPICS)
-    catalog = commands.add_parser('catalog', help='只列出本人当前可用的固定操作')
+    catalog = subparsers.add_parser("catalog", help='只列出本人当前可用的固定操作')
     catalog.add_argument('--after')
     catalog.add_argument('--limit', type=int, choices=range(1, 51), default=20, metavar='1..50')
-    for name in ('read', 'prepare'):
-        operation = commands.add_parser(name, help='只读状态' if name == 'read' else '冻结提议；不执行写操作')
+    read = subparsers.add_parser("read", help='只读状态')
+    prepare = subparsers.add_parser("prepare", help='冻结提议；不执行写操作')
+    for name, operation in (('read', read), ('prepare', prepare)):
         operation.add_argument('operation')
         inputs = operation.add_mutually_exclusive_group()
         inputs.add_argument('--args', default='{}', help='操作参数JSON')
         inputs.add_argument('--args-file', help='从数据文件读取JSON；不执行文件')
         if name == 'prepare':
             operation.add_argument('--request-id', required=True, help='本次提议的唯一请求标识；断流重试复用同一值')
-    result = commands.add_parser('result', help='只读取本人提议的状态/脱敏回执')
+    result = subparsers.add_parser("result", help='只读取本人提议的状态/脱敏回执')
     result.add_argument('proposal')
     if not args or args == ['help']:
         parser.print_help()
