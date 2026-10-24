@@ -907,7 +907,7 @@ export function TicketDrawer({
               <p className="text-meta text-faint">还没有描述</p>
             ))}
 
-          {current.blockedReason && (
+          {current.status === 'blocked' && current.blockedReason && (
             <p className="rounded-lg bg-danger-soft px-3 py-2 text-body text-danger">
               受阻：{current.blockedReason}
             </p>
