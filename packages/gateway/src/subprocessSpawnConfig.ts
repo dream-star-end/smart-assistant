@@ -796,6 +796,8 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  /** Actual chat peer; sessionId below may be a delegated repository parent. */
+  peerId?: string
   /** Stable, attempt-refreshed opaque help context. Never contains the master signing key. */
   systemHelpContextFile?: string
   sessionKey: string

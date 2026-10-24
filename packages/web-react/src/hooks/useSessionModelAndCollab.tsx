@@ -1,3 +1,7 @@
+import {cursorModelSupportsContextTier,supportsFastServiceTier} from '@openclaude/protocol/browser';
+import {SWITCH_COST_WARNING,type AuthorizeSwitch} from './useModelSwitchCost';
+import {mintMsgId} from '../lib/chat/model';
+import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 /**
  * Active session model switching and collaboration mode (solo/team/advisor): selection, persistence and doc sync
  *
@@ -19,6 +23,8 @@ import type { ToastFn } from "../components/ui/Toast";
 
 export type SessionModelAndCollabInput = {
   activeId: string | undefined;
+  authorizeSwitch?: AuthorizeSwitch;
+  getSwitchOptions?:()=>Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>;
   agent: Agent;
   auth: AuthSession | null;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
@@ -41,6 +47,8 @@ export type SessionModelAndCollabInput = {
 
 export function useSessionModelAndCollab({
   activeId,
+  authorizeSwitch,
+  getSwitchOptions,
   agent,
   auth,
   confirmDialog,
@@ -101,6 +109,7 @@ export function useSessionModelAndCollab({
   // server-wins 盖回,重选即重试;服务端从未有值(NULL=从未显式选择,无"清除"流)则缺席
   // 不表态,本地意图保留 —— 两种失败面都可自愈。新会话行未建 404 同吞,由建行 PUT/建行后
   // 收敛 PATCH 落地。无活动会话(空会话态)仅更新选择器,作为下一会话意图。
+  const modelSelectionEpochRef=useRef(0);
   const activeModelSwitchSessionRef = useRef(activeId);
   activeModelSwitchSessionRef.current = activeId;
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelId, setModelSwitchPreparing, sockRef are App useState setter/useRef passed in, stable
@@ -108,8 +117,10 @@ export function useSessionModelAndCollab({
     async (id: string) => {
       if (id === modelId || modelSwitchPreparing) return;
       const sid = activeId;
+      const selectionEpoch=++modelSelectionEpochRef.current;
       const commit = (modelSwitchId?: string) => {
-        if (activeModelSwitchSessionRef.current === sid) setModelId(id);
+        if (activeModelSwitchSessionRef.current !== sid||modelSelectionEpochRef.current!==selectionEpoch) return;
+        setModelId(id);
         // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
         // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
         // 盖回,成功此前静默;压缩切换(prepareModelSwitch)带明确等待,给压缩语义文案。
@@ -141,43 +152,37 @@ export function useSessionModelAndCollab({
         const go = await confirmDialog({
           title: notice.title,
           body: <div className="space-y-2 text-sm text-muted" data-testid="fresh-session-switch-notice">
+            <p>{SWITCH_COST_WARNING}</p>
             {notice.paragraphs.map((text) => <p key={text}>{text}</p>)}
           </div>,
           confirmText: notice.confirmText,
           cancelText: notice.cancelText,
         });
-        if (go !== true) return;
+        if (go !== true||activeModelSwitchSessionRef.current!==sid||modelSelectionEpochRef.current!==selectionEpoch) return;
         nextSessionModelRef.current = id;
         handleNew();
         return;
       }
       const reason = modelSwitchCompactionReason(models, modelId, id, hasContent);
-      if (!reason || !modelId) {
-        commit();
-        return;
-      }
       const details = [
-        reason.visionDowngrade
-          ? "目标模型不支持当前会话的多模态上下文，图片等内容将转换为文字交接。"
-          : null,
-        reason.contextDowngrade
-          ? "目标模型的上下文窗口更短，需要先压缩当前会话。"
-          : null,
+        reason?.visionDowngrade ? "目标模型不支持当前会话的多模态上下文，图片等内容将转换为文字交接。" : null,
+        reason?.contextDowngrade ? "目标模型的上下文窗口更短，需要先压缩当前会话。" : null,
       ].filter((detail): detail is string => detail !== null);
-      const confirmed = await confirmDialog({
-        title: "切换模型？",
-        body: <div className="space-y-2 text-sm text-muted">
-          {details.map((detail) => <p key={detail}>{detail}</p>)}
+      const notice:ConfirmOpts|undefined=reason&&modelId?{
+        title:"切换模型？",
+        body:<div className="space-y-2 text-sm text-muted">
+          {details.map(detail=><p key={detail}>{detail}</p>)}
           <p>压缩并切换会用当前模型生成交接内容，原始记录不会删除。直接切换沿用原来的方式，不压缩，新模型可能看不到完整上下文。</p>
-        </div>,
-        confirmText: "压缩并切换",
-        altText: "直接切换",
-      });
-      if (confirmed === false) return;
-      if (confirmed === "alt") {
-        commit();
-        return;
-      }
+        </div>,confirmText:"压缩并切换",altText:"直接切换",
+      }:undefined;
+      const options=getSwitchOptions?.();
+      const authorization=authorizeSwitch?await authorizeSwitch({sessionId:activeId,requestId:mintMsgId(),targetModel:id,agentId:agent.id,teamMode:options?.teamMode,
+        ...(cursorModelSupportsContextTier(id)&&options?.contextTier?{contextTier:options.contextTier}:{}),
+        ...(supportsFastServiceTier(id)&&options?.serviceTier?{serviceTier:options.serviceTier}:{})},
+        {notice,primeNextTurn:true,isCurrent:()=>activeModelSwitchSessionRef.current===sid&&modelSelectionEpochRef.current===selectionEpoch}):undefined;
+      const confirmed=authorizeSwitch?authorization?.choice??false:notice?await confirmDialog({...notice,body:<>{SWITCH_COST_WARNING}{notice.body}</>}):true;
+      if(confirmed===false||activeModelSwitchSessionRef.current!==sid||modelSelectionEpochRef.current!==selectionEpoch)return;
+      if(!reason||!modelId||confirmed==='alt'){commit();return;}
       setModelSwitchPreparing(true);
       try {
         const switchId = await sockRef.current?.prepareModelSwitch(activeId, modelId, id);
@@ -189,7 +194,7 @@ export function useSessionModelAndCollab({
         setModelSwitchPreparing(false);
       }
     },
-    [demo, activeId, modelId, modelSwitchPreparing, models, sessions, setSessions, queueModelPatch, confirmDialog, toast, handleNew],
+    [authorizeSwitch,getSwitchOptions,agent.id,demo, activeId, modelId, modelSwitchPreparing, models, sessions, setSessions, queueModelPatch, confirmDialog, toast, handleNew],
   );
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;
@@ -241,6 +246,12 @@ export function useSessionModelAndCollab({
           ? (opts?.advisorModel ?? collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
           : null;
       const asDefault = opts?.asDefault === true;
+      if(!demo&&auth&&activeId&&modelId&&mode!==collabUi.mode&&authorizeSwitch){
+        const authorization=await authorizeSwitch({sessionId:activeId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,
+          ...(cursorModelSupportsContextTier(modelId)&&getSwitchOptions?.().contextTier?{contextTier:getSwitchOptions!().contextTier}:{}),
+          ...(supportsFastServiceTier(modelId)&&getSwitchOptions?.().serviceTier?{serviceTier:getSwitchOptions!().serviceTier}:{}),teamMode:mode==='team'}, {primeNextTurn:true,isCurrent:()=>activeModelSwitchSessionRef.current===activeId&&collabEpochRef.current===epoch});
+        if(!authorization)return;
+      }
       // Optimistic mode only; configVersion stays empty until the server returns it.
       setCollabUi((cur) => ({ ...cur, mode, advisorModel, configVersion: "" }));
       setTeamModeState(mode === "team");
@@ -307,7 +318,7 @@ export function useSessionModelAndCollab({
         failSave(apiErrorMessage(err, "协作配置保存失败"));
       }
     },
-    [activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
+    [authorizeSwitch,getSwitchOptions,activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
   );
   const setTeamMode = useCallback(
     (enabled: boolean) => {

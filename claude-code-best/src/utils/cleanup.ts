@@ -1,3 +1,6 @@
+import { unlink as unlinkSessionLink, lstat as lstatSessionLink } from 'node:fs/promises'
+import { basename } from 'node:path'
+import { withSessionFile, SessionFileIntegrityError } from './sessionFileIo.js'
 import * as fs from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -136,6 +139,17 @@ async function unlinkIfOld(
   cutoffDate: Date,
   fsImpl: FsOperations,
 ): Promise<boolean> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' && filePath.endsWith('.jsonl')) {
+    const sessionId = basename(filePath, '.jsonl')
+    return withSessionFile(filePath, { projectsDir: getProjectsDir(), sessionId, requireKernelLock: true }, false, async file => {
+      const identity = await file.stat()
+      if (Math.max(identity.mtimeMs, identity.atimeMs) >= cutoffDate.getTime()) return false
+      const link = await lstatSessionLink(filePath)
+      if (link.isSymbolicLink() || link.dev !== identity.dev || link.ino !== identity.ino) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED')
+      await unlinkSessionLink(filePath)
+      return true
+    })
+  }
   const stats = await fsImpl.stat(filePath)
   if (stats.mtime < cutoffDate) {
     await fsImpl.unlink(filePath)

@@ -28,6 +28,7 @@ export type ConfirmOpts = {
   altText?: string;
   /** 危险操作(删除类):确认钮红色。 */
   danger?: boolean;
+  confirmDisabled?: boolean;
 };
 
 export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, ReactNode] {
@@ -62,11 +63,11 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, Re
             {opts?.cancelText ?? "取消"}
           </Button>
           {opts?.altText ? (
-            <Button variant="secondary" onClick={() => settle("alt")}>
+            <Button variant="secondary" disabled={opts.confirmDisabled} onClick={() => settle("alt")}>
               {opts.altText}
             </Button>
           ) : null}
-          <Button variant={opts?.danger ? "danger" : "primary"} onClick={() => settle(true)}>
+          <Button variant={opts?.danger ? "danger" : "primary"} disabled={opts?.confirmDisabled} onClick={() => settle(true)}>
             {opts?.confirmText ?? "确定"}
           </Button>
         </>

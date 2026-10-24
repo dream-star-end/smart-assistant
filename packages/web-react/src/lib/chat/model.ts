@@ -56,6 +56,7 @@ export function isRetryingTurnStatus(
 export type ChatRoutingSnapshot = {
   model?: string;
   modelSwitchId?: string;
+  modelSwitchConsent?: string;
   teamMode?: boolean;
   collabMode?: "solo" | "advisor" | "team";
   advisorModel?: string;

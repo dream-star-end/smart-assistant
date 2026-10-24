@@ -65,6 +65,12 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
+  // OCV5-607: PG sessions backend 拆分；在同一只读事务内验证归属与完整原生存档，
+  // 仍由 pgSessionsBackend 委托并注入原 batch validators，不新增业务 SQL 入口。
+  "packages/commercial/src/db/pgCcbTranscriptRestore.ts",
+  // OCV5-614: bounded, SELECT-only PG metadata/exact-call reader. Billing delegates
+  // to this backend module; no history hydration or session mutation is introduced.
+  "packages/commercial/src/db/modelSwitchCostContextReader.ts",
   // OCV5-509: the refused-recovery card sweep, split out of pgSessionsBackend for its size cap;
   // it writes only through the backend card writer under the session row lock.
   "packages/commercial/src/db/refusedRecoveryCards.ts",

@@ -50,5 +50,7 @@ export * from './upstreamRetryHint.js'
 
 export * from './promptPrivacy.js'
 export * from './systemActions.js'
+export * from './ccbTranscriptRestore.js'
 
+export type { ModelSwitchCostRequest, ModelSwitchCostQuote, ModelSwitchCostRange, ModelSwitchCostAuthorization, ModelSwitchUnitPrice } from './modelSwitchCost.js'
 export * from './systemHelp.js'
