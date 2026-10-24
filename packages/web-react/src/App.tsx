@@ -25,7 +25,7 @@ import {
 } from "@openclaude/protocol/browser";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
-import { AuthGate, type AuthMode } from "./components/AuthGate";
+import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
@@ -235,6 +235,7 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
 const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const TutorialCenter = lazy(() =>
@@ -536,6 +537,7 @@ export function App() {
   const {
     auth,
     authRef: authSessionRef,
+    resolvedIdentity,
     authed,
     user,
     authLoading,
@@ -1437,6 +1439,7 @@ export function App() {
   const { systemActions, preferencesRevision, inboxRevision } = useSystemActionCardActions({
     authRef,
     userId: user?.id,
+    identity: resolvedIdentity,
     demo,
     applyPreferences: applyConversationPreferences,
     applyInboxUnreadCount: inbox.applyUnreadCountSnapshot,
@@ -1454,6 +1457,7 @@ export function App() {
     stopTurn,
     toolActions,
   } = useChatCardActions({
+    identity: resolvedIdentity,
     systemActions,
     activeId,
     agent,
@@ -1839,7 +1843,8 @@ export function App() {
       // 首页(Landing)固定深色,登录页跟随系统主题:系统浅色时直切会闪白。
       // 外层容器挂 animate-in(styles.css 的 fade-up 0.32s)把硬切柔化成整页淡入。
       <div className="h-full animate-in">
-        <AuthGate
+        <LazyBoundary fallback={<SplashFallback />}>
+          <AuthGate
           onLogin={login}
           onRegister={register}
           onVerifyEmail={verifyEmail}
@@ -1867,7 +1872,8 @@ export function App() {
           requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
           initialMode={authMode}
           resetToken={resetToken}
-        />
+          />
+        </LazyBoundary>
       </div>
     );
   }

@@ -1,3 +1,4 @@
+import { captureIdentityAttempt, resolveIdentity, revokeResolvedIdentity } from '../lib/resolvedIdentity'
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -18,7 +19,7 @@ const succeeded = () => ({ ...prepared(), state: 'succeeded', preview: null, res
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 function setup() {
   const auth = createMemoryAuthSession(() => {}, 'fixture-access-a')
-  return { auth, input: { authRef: { current: auth }, userId: '765', demo: false,
+  return { auth, input: { authRef: { current: auth }, userId: '765', identity: resolveIdentity(captureIdentityAttempt(auth, auth.snapshot().token), '765'), demo: false,
     applyPreferences: vi.fn(), setTheme: vi.fn(), onSyncError: vi.fn() } }
 }
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -239,10 +240,37 @@ it('auth object replacement changes provider identity even at the same uid/epoch
   const snapshot = input.authRef.current.snapshot()
   input.authRef.current = createMemoryAuthSession(() => {}, snapshot.token)
   view.rerender()
+  expect(view.result.current.systemActions).toBeUndefined()
+  // The replacement must resolve its own /me/login identity before receiving capabilities.
+  input.identity = resolveIdentity(captureIdentityAttempt(input.authRef.current, snapshot.token), '765')
+  view.rerender()
   expect(view.result.current.systemActions!.identityKey).not.toBe(old.identityKey)
   await expect(old.getDetail(id)).rejects.toThrow()
   expect(fetcher).not.toHaveBeenCalled()
   const current = view.result.current.systemActions!.identityKey
   view.rerender()
   expect(view.result.current.systemActions!.identityKey).toBe(current)
+})
+
+it('a new token paired with the old displayed user never creates a fresh approval provider', () => {
+  const { auth, input } = setup()
+  const view = renderHook(() => useSystemActionCardActions(input))
+  expect(view.result.current.systemActions).toBeDefined()
+  act(() => { auth.commitToken(0, 'new-token-unresolved-user') })
+  expect(view.result.current.systemActions).toBeUndefined()
+  view.rerender()
+  expect(view.result.current.systemActions).toBeUndefined()
+})
+
+it('a warmed client checks a synchronous identity revocation after the lazy-client await', async () => {
+  const { input } = setup()
+  const fetcher = vi.fn<typeof fetch>(async () => reply(prepared()))
+  vi.stubGlobal('fetch', fetcher)
+  const view = renderHook(() => useSystemActionCardActions(input))
+  const actions = view.result.current.systemActions!
+  await act(async () => { await actions.getDetail(id) })
+  const pending = actions.confirm(id, { nonce, previewHash: 'a'.repeat(64) })
+  revokeResolvedIdentity(input.identity)
+  await expect(pending).rejects.toThrow()
+  expect(fetcher.mock.calls.some(([url]) => String(url).endsWith('/confirm'))).toBe(false)
 })

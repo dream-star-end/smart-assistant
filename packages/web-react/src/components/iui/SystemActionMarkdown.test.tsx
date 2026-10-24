@@ -1,3 +1,4 @@
+import { captureIdentityAttempt, resolveIdentity } from '../../lib/resolvedIdentity'
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -17,7 +18,7 @@ const succeeded = () => ({ ...prepared(), state: 'succeeded', preview: null, res
 const reply = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } })
 function view(source: string, options: { readOnly?: boolean; live?: boolean; provider?: boolean } = {}) {
   const auth = createMemoryAuthSession(() => {}, 'fixture-access')
-  const input = { authRef: { current: auth }, userId: '765', demo: false, applyPreferences: vi.fn(), setTheme: vi.fn(), onSyncError: vi.fn() }
+  const input = { authRef: { current: auth }, userId: '765', identity: resolveIdentity(captureIdentityAttempt(auth, auth.snapshot().token), '765'), demo: false, applyPreferences: vi.fn(), setTheme: vi.fn(), onSyncError: vi.fn() }
   function Harness() {
     const { systemActions } = useSystemActionCardActions(input)
     return <ToolCardActionsContext.Provider value={{ systemActions: options.provider === false ? undefined : systemActions }}>
