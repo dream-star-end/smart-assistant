@@ -1,3 +1,4 @@
+import type { Dirent } from 'node:fs'
 /** Synthetic explicit roots only. Pure views never operate on the process HOME or a product account. */
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
@@ -16,7 +17,7 @@ async function rootPair() {
 async function snapshot(root: string): Promise<unknown[]> {
   const files: unknown[] = []
   async function visit(dir: string) {
-    let entries
+    let entries: Dirent[]
     try { entries = await readdir(dir, { withFileTypes: true }) } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
       throw error
@@ -91,7 +92,8 @@ test('readonly injection retains existing TTL, scan and cap logic without repair
   await writeFile(a.agentMemoryMd('main'), index)
   const before = await snapshot(a.root)
   const rendered = await new CoreMemoryView('main', a).renderForInjection(1000, 200, { today: '2026-10-24' })
-  assert(rendered?.includes('Missing'))
+  assert(rendered !== null)
+  assert(rendered.includes('Missing'))
   assert.equal(rendered.includes('Expired'), false)
   assert.equal(rendered.includes('orphan-must-not-be-injected'), false)
   assert.deepEqual(await snapshot(a.root), before)

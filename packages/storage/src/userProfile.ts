@@ -74,7 +74,7 @@ export async function readUserProfile(): Promise<{ text: string; version: string
   }
   const normalized = normalizeEol(raw)
   if (!normalized.includes('\n§\n')) {
-    return profileSnapshot(normalized)
+    return profileSnapshot(raw)
   }
   // 含 § → 锁内改写(幂等)。
   const release = await acquireFileLock(paths.sharedUserLock)
@@ -88,7 +88,7 @@ export async function readUserProfile(): Promise<{ text: string; version: string
     const curNorm = normalizeEol(cur)
     if (!curNorm.includes('\n§\n')) {
       // 别的进程已去 § → 直接用最新盘上内容。
-      return profileSnapshot(curNorm)
+      return profileSnapshot(cur)
     }
     const converted = deSection(curNorm)
     await atomicWrite(paths.sharedUserMd, converted)
