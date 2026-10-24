@@ -13,7 +13,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExt
 import { ApiError, apiErrorMessage } from "../../lib/api";
 import type { CommunityTutorialMine } from "../../lib/types";
 import { Markdown } from "../Markdown";
-import { type CommunityBlogActions, type CommunityBlogDraftPayload, chatInteractionUnavailableText, useChatInteraction, useToolCardActions } from "../tool/context";
+import { type CommunityBlogDraftPayload, chatInteractionUnavailableText, useChatInteraction, useToolCardActions } from "../tool/context";
 import { BlogChips, BlogCover } from "../tutorials/blog/BlogArticle";
 import { blogMineStage, blogReadMinutes, compressBlogImage } from "../tutorials/blog/blogLib";
 import { Button, Modal } from "../ui";

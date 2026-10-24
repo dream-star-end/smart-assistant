@@ -25,6 +25,7 @@ loadBeforeAll(() =>
     import('./components/GoalDialog'),
     import('./components/Landing'),
     import('./components/AuthGate'),
+    import('./components/AccountSwitchNotice'),
     import('./components/SettingsCenter'),
     import('./components/ManageCenter'),
     import('./components/MarketplaceCenter'),

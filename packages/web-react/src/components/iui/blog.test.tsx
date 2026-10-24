@@ -311,3 +311,15 @@ describe("状态卡 / 链接卡只认服务端数据", () => {
     expect(screen.getByText("经验分享稿件 #12")).toBeInTheDocument();
   });
 });
+
+test('a signed-in navigation-only blog capability opens a text editor without any upload or submission', () => {
+  const openEditor = vi.fn(), openMine = vi.fn()
+  const navigation: CommunityBlogActions = { postUrl: id => `https://example.test/${id}`, openPost: vi.fn(), openMine, openEditor }
+  render(wrap(<IuiBlock code={block({ ...DRAFT, body: '只有文字的草稿。' })} />, navigation))
+  fireEvent.click(screen.getByRole('button', { name: '在编辑器里改' }))
+  expect(openEditor).toHaveBeenCalledWith(expect.objectContaining({ bodyMarkdown: '只有文字的草稿。' }))
+  fireEvent.click(screen.getByRole('button', { name: '查看我的投稿' }))
+  expect(openMine).toHaveBeenCalledTimes(1)
+  expect(navigation.uploadImage).toBeUndefined()
+  expect(navigation.submit).toBeUndefined()
+})
