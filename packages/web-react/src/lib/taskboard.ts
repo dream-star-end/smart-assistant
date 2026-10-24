@@ -287,6 +287,12 @@ export interface PipelineStage {
 }
 
 export interface TicketRun {
+  /** Read-only response projection from actual usage/live runner; never persisted. */
+  actualModels?: string[]
+  stopRequested?: boolean
+  /** The owning promise tree is still settling, even after lease reaping. */
+  settling?: boolean
+  preview?: { text: string; toolNames: string[]; lastActivityAt: number | null }
   id: string
   ticketId: string
   stageId: string
@@ -421,6 +427,7 @@ export interface ProjectCreateInput {
   labels?: string[]
   /** 省略 = 种四条内置线；`[]` = 不种；非空 = 按 id 套用。 */
   templateIds?: string[]
+  executionAgentId?: string | null
 }
 
 export interface ProjectPatchInput {
@@ -510,6 +517,7 @@ export type TimelineItem =
 
 export interface TicketDetail {
   ticket: Ticket
+  execution?: TicketRun | null
   pipeline?: Pipeline | null
   stage?: PipelineStage | null
 }
@@ -1375,8 +1383,11 @@ export const taskboardApi = {
   getTicketDetail: (a: AuthSession, idOrIdent: string) =>
     boardGet<TicketDetail>(
       a,
-      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage' })}`,
+      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage,execution' })}`,
     ),
+
+  stopRun: (a: AuthSession, idOrIdent: string, expectedVersion: number, runId: string) =>
+    boardSend<{ ok: true; state: 'stopping' | 'terminal'; ticket: Ticket; run: TicketRun }>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}/stop`, 'POST', { expectedVersion, runId }),
 
   createTicket: (a: AuthSession, body: TicketCreateInput) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, '/api/board/tickets', 'POST', body),
@@ -1528,7 +1539,7 @@ export const taskboardApi = {
   deleteTemplate: (a: AuthSession, id: string) =>
     boardSend<{ ok: boolean }>(a, `/api/board/templates/${encodeURIComponent(id)}`, 'DELETE'),
 
-  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean }) =>
+  applyTemplate: (a: AuthSession, id: string, body: { projectId: string; asDefault?: boolean; executionAgentId?: string | null }) =>
     boardSend<ApplyTemplateResult>(
       a,
       `/api/board/templates/${encodeURIComponent(id)}/apply`,

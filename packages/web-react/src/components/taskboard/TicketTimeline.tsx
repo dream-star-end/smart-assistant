@@ -246,6 +246,7 @@ function SystemRun({
   stageName: string | null | undefined
   compact: boolean
 }) {
+  const cancelled = run.error?.startsWith('USER_CANCELLED:') === true
   const duration = formatDurationMs(run.durationMs)
   const costText = formatRunReferenceCost(run)
   const skip = skipReasonLabel(run.skipReason)
@@ -265,8 +266,8 @@ function SystemRun({
   return (
     <div className="flex min-w-0 flex-col gap-1.5" data-testid="ticket-run-detail">
       <div className="flex flex-wrap items-center gap-1.5">
-        <Badge tone={runStatusTone(run.status)} size="sm">
-          {RUN_STATUS_LABEL[run.status] ?? run.status}
+        <Badge tone={cancelled ? 'neutral' : runStatusTone(run.status)} size="sm">
+          {run.stopRequested && (run.status === 'running' || run.status === 'queued') ? '停止处理中' : cancelled ? '已停止' : RUN_STATUS_LABEL[run.status] ?? run.status}
         </Badge>
         <span className="text-body text-fg">{stageName || '未知阶段'}</span>
         <span className="text-caption text-faint">
@@ -276,6 +277,15 @@ function SystemRun({
       <p className="text-caption text-muted break-words">
         {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
+      {run.settling && run.status !== 'running' && run.status !== 'queued' && <p className="text-caption text-muted" data-testid="ticket-run-settling">执行仍在收尾，结果归档后可重试。</p>}
+      <p className="text-caption text-muted break-all" data-testid="ticket-run-models">执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}</p>
+      {run.status === 'running' && run.preview && (
+        <div className="rounded-lg border border-border bg-hover px-3 py-2" data-testid="ticket-run-preview">
+          <p className="text-caption text-muted">实时预览{run.preview.lastActivityAt ? ` · ${new Date(run.preview.lastActivityAt).toLocaleTimeString()}` : ''}</p>
+          {run.preview.toolNames.length > 0 && <p className="mt-1 break-words text-caption text-faint">工具：{run.preview.toolNames.join('、')}</p>}
+          {run.preview.text && <p className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-body">{run.preview.text}</p>}
+        </div>
+      )}
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
       {(run.contextSha256 || run.contextVersion != null) && (
         <details className="text-caption text-muted" data-testid="ticket-run-context">
@@ -296,7 +306,7 @@ function SystemRun({
         />
       )}
       {run.error && (
-        <p className="break-words whitespace-pre-wrap text-body text-danger">{run.error}</p>
+        <p className="break-words whitespace-pre-wrap text-body text-danger">{cancelled ? '本次执行已停止，已保留生成内容和已发生用量。' : run.error}</p>
       )}
     </div>
   )
