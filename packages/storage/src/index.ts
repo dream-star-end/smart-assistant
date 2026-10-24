@@ -42,4 +42,5 @@ export * from './indexPipeline.js'
 
 export * from './identityCompatRuntime.js'
 
+export * from './sessionFileIo.js'
 export * from './systemActions.js'

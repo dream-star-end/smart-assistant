@@ -1,6 +1,6 @@
 import { peekModelCatalogCache } from './modelCatalogRuntime.js'
 import { scopeFromAuthz, type UserModelAuthzLoader } from '../auth/userModelAuthz.js'
-import { ModelSwitchCostError, type ModelSwitchCostDeps } from './modelSwitchCost.js'
+import { ModelSwitchCostError, ModelSwitchCostService, type ModelSwitchCostDeps } from './modelSwitchCost.js'
 /** Authorization and both prices share the same fenced catalog snapshot. */
 export function makeModelSwitchCostTargetResolver(
   loadUserModelAuthz: UserModelAuthzLoader,
@@ -29,4 +29,15 @@ export function makeModelSwitchCostTargetResolver(
         snapshot.resolve(snapshot.aliasToCanonical(model))?.engine ?? null,
     }
   }
+}
+
+export function makeModelSwitchCostService(
+  deps: Pick<ModelSwitchCostDeps, 'pool' | 'pricing' | 'secret'>,
+  loadUserModelAuthz: UserModelAuthzLoader,
+) {
+  return new ModelSwitchCostService({
+    ...deps,
+    sourceEngine: id => peekModelCatalogCache()?.current().resolve(id)?.engine ?? null,
+    resolveTarget: makeModelSwitchCostTargetResolver(loadUserModelAuthz),
+  })
 }

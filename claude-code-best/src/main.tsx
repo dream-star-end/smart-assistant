@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from './utils/sessionTransition.js'
 // These side-effects must run before all other imports:
 // 1. profileCheckpoint marks entry before heavy module evaluation begins
 // 2. startMdmRawRead fires MDM subprocesses (plutil/reg query) so they run in
@@ -1433,6 +1434,7 @@ async function run(): Promise<CommanderCommand> {
       'File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)',
     )
     .action(async (prompt, options) => {
+      if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
       profileCheckpoint('action_handler_start');
 
       // --bare = one-switch minimal mode. Sets SIMPLE so all the existing
@@ -4107,6 +4109,7 @@ async function run(): Promise<CommanderCommand> {
           // New behavior: start local TUI with CCR engine
           // Mark that we're in remote mode for command visibility
           setIsRemoteMode(true);
+          if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
           switchSession(asSessionId(createdSession.id));
 
           // Get OAuth credentials for remote session

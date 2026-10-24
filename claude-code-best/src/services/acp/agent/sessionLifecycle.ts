@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../../../utils/sessionTransition.js'
 /**
  * Session-lifecycle methods for AcpAgent (excluding createSession, which
  * lives in ./createSessionMethod.ts), attached to the prototype via
@@ -47,6 +48,7 @@ async function getOrCreateSession(
     replay?: boolean
   },
 ): Promise<NewSessionResponse> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   const shouldReplay = params.replay !== false
   const existingSession = this.sessions.get(params.sessionId)
   if (existingSession) {
@@ -61,11 +63,16 @@ async function getOrCreateSession(
         params.sessionId,
         params.cwd,
       )
+      if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
       switchSession(
         params.sessionId as SessionId,
         resolved ? dirname(resolved.filePath) : null,
       )
       setOriginalCwd(params.cwd)
+      if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') {
+        existingSession.sessionProjectDir = resolved ? dirname(resolved.filePath) : null
+        await (await import('../../../utils/sessionStorage.js')).resetSessionFilePointer()
+      }
 
       if (shouldReplay) {
         await this.replaySessionHistory(params)
@@ -92,8 +99,10 @@ async function getOrCreateSession(
   const resolved = await resolveSessionFilePath(params.sessionId, params.cwd)
   const projectDir = resolved ? dirname(resolved.filePath) : null
 
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   switchSession(params.sessionId as SessionId, projectDir)
   setOriginalCwd(params.cwd)
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await (await import('../../../utils/sessionStorage.js')).resetSessionFilePointer()
 
   let initialMessages: Message[] | undefined
   if (resolved) {
@@ -113,7 +122,7 @@ async function getOrCreateSession(
       mcpServers: params.mcpServers ?? [],
       _meta: params._meta,
     },
-    { sessionId: params.sessionId, initialMessages },
+    { sessionId: params.sessionId, initialMessages, ...(process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ? { sessionProjectDir: projectDir } : {}) },
   )
 
   // Replay history to client if loaded. session/resume skips this block.

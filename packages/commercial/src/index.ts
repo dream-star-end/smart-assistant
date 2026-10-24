@@ -1,5 +1,6 @@
-import {makeModelSwitchCostTargetResolver} from './billing/modelSwitchCostTarget.js';
-import {ModelSwitchCostService} from './billing/modelSwitchCost.js';
+import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
+import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
+import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
 import { assembleSystemActions } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
@@ -2539,6 +2540,10 @@ export async function registerCommercial(
         getSigner: () => modelAuthoritySigner,
       });
       // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
+      const ccbTranscriptRestoreHandler = makeCcbTranscriptRestoreHandler({
+        identityRepo,
+        read: makeCcbTranscriptRestoreReader(getPool()),
+      });
       const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
         identityRepo,
         storage: dispatchAdmissionBackend,
@@ -2911,6 +2916,7 @@ export async function registerCommercial(
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
         }
+        if (path === CCB_TRANSCRIPT_RESTORE_PATH) return ccbTranscriptRestoreHandler(req, res, ctx);
         if (path === TURN_TAPE_STATE_PATH) {
           return turnTapeStateHandler(req, res, ctx);
         }
@@ -4408,11 +4414,7 @@ export async function registerCommercial(
     inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
     validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
   });
-  const modelSwitchCost = new ModelSwitchCostService({
-    pool:getPool(),pricing,secret:jwtSecret,
-    sourceEngine:(id)=>peekModelCatalogCache()?.current().resolve(id)?.engine??null,
-    resolveTarget:makeModelSwitchCostTargetResolver(loadUserModelAuthz),
-  });
+  const modelSwitchCost = makeModelSwitchCostService({pool:getPool(),pricing,secret:jwtSecret}, loadUserModelAuthz);
   if (process.env.OC_SYSTEM_ACTIONS_ENABLED === '1') {
     if (runtimeChannel !== 'v5' || flavorIdentity.status !== 'ok' || flavorIdentity.flavor !== 'selfhost' || !v3Deps) {
       throw new Error('System actions require the verified personal Docker deployment');
