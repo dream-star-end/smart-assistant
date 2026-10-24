@@ -1,3 +1,4 @@
+import { ProfileControlRejected, isProfileControlRejectionCode, type ProfileControlRejectionCode } from './profileControlRejection.js'
 /** Inert host-only supervisor. Not registered with any operation, HTTP route, user runtime or container. */
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -99,7 +100,10 @@ export class ProfileControlBroker {
         this.assertCurrent(record, false)
         const condition = parseProfileControlVersion(record.expectedVersion)!
         if (typeof text !== 'string' || Buffer.byteLength(text) > 1048576 || hash(Buffer.from(text, 'utf8')) !== condition.targetProfileSha256) throw fail()
-        await this.options.authorizeActor(record.binding)
+        try { await this.options.authorizeActor(record.binding) } catch {
+          this.assertCurrent(record, false)
+          throw new ProfileControlRejected('UNAVAILABLE') // No child has been created.
+        }
         this.assertCurrent(record, false)
         return await this.run(record, false, text)
       } finally { this.reserved.delete(key) }
@@ -141,6 +145,7 @@ export class ProfileControlBroker {
     const observation: ObservedChild = { executorId: record.executorId, token: record.expectedVersion, binding: record.binding, jobId: request.jobId, pid: child.pid, exited: false }
     if (!recovering) this.observed.set(key, observation) // Preserve the original execution stop proof during recovery.
     let result: ProfileGenerationReceipt | undefined
+    let rejected: ProfileControlRejectionCode | undefined
     let ready = false
     let go = false
     let problem = false
@@ -156,18 +161,25 @@ export class ProfileControlBroker {
         if (!reply || typeof reply !== 'object') throw fail()
         const value = reply as Record<string, unknown>
         if (value.v !== 1 || value.jobId !== request.jobId) throw fail()
-        if (value.type === 'ready' && exactKeys(value, ['v', 'jobId', 'type']) && !ready && !result) {
+        if (value.type === 'ready' && exactKeys(value, ['v', 'jobId', 'type']) && !ready && !result && !rejected) {
           ready = true
           this.assertCurrent(record, recovering)
           if (recovering) await this.stopped(record)
-          await this.options.authorizeActor(record.binding)
+          try { await this.options.authorizeActor(record.binding) } catch {
+            this.assertCurrent(record, recovering)
+            if (recovering || observation.exited || problem) throw fail()
+            child.stdin.write(`${JSON.stringify({ v: 1, jobId: request.jobId, type: 'cancel' })}\n`)
+            return
+          }
           this.assertCurrent(record, recovering)
           if (observation.exited || problem) throw fail()
           go = true
           child.stdin.write(`${JSON.stringify({ v: 1, jobId: request.jobId, type: 'go' })}\n`)
-        } else if (value.type === 'result' && exactKeys(value, ['v', 'jobId', 'type', 'receipt']) && !result && validReceipt(value.receipt, request.binding)) {
+        } else if (value.type === 'result' && exactKeys(value, ['v', 'jobId', 'type', 'receipt']) && !result && !rejected && validReceipt(value.receipt, request.binding)) {
           if (!go && (recovering || ready)) throw fail()
           result = value.receipt
+        } else if (value.type === 'rejected' && exactKeys(value, ['v', 'jobId', 'type', 'code']) && !recovering && !go && !result && !rejected && isProfileControlRejectionCode(value.code)) {
+          rejected = value.code
         } else throw fail()
       }).catch(stop)
     })
@@ -179,8 +191,10 @@ export class ProfileControlBroker {
     })
     await processing
     lines.close(); child.stdin.destroy()
-    if (problem || exit.code !== 0 || exit.signal !== null || !result) throw fail()
+    if (problem || exit.code !== 0 || exit.signal !== null) throw fail()
     this.assertCurrent(record, recovering)
+    if (rejected && !recovering && !go && !result) throw new ProfileControlRejected(rejected)
+    if (!result) throw fail()
     return result
   }
   async drain(): Promise<void> { this.closed = true; await Promise.allSettled([...this.jobs]) }
