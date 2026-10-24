@@ -2669,6 +2669,7 @@ export function MessageList({
       const bounds = processTimeBounds(renderItems, it);
       return (
         <ProcessDisclosure
+          readOnly={readOnly}
           sections={sections}
           onFirstTextPaint={cb.onFirstTextPaint}
           active={it.active}

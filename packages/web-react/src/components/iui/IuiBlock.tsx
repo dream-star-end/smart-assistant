@@ -1,3 +1,4 @@
+import { LegacyCardPolicyProvider } from './LegacyCardPolicy';
 /**
  * Intelligent UI(OCV5-361)—— ```ui 块入口:解析 → 校验 → 分派到原生组件。
  *
@@ -281,7 +282,9 @@ export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
     case "ok":
       return (
         <BlockBoundary resetKey={code} fallback={<BodyMarkdown text={safeMarkdown(outcome.spec)} />}>
-          {renderSpec(outcome.spec, outcome.notes, outcome.streaming, readOnly)}
+          <LegacyCardPolicyProvider readOnly={readOnly} live={!!live || outcome.streaming}>
+            {renderSpec(outcome.spec, outcome.notes, outcome.streaming, readOnly)}
+          </LegacyCardPolicyProvider>
         </BlockBoundary>
       );
   }
