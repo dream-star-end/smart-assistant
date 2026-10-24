@@ -21,8 +21,9 @@ export function useSystemActionCardActions(input: {
   demo: boolean
   applyPreferences: (prefs: PrefsView) => void
   setTheme: (theme: Theme) => void
+  applyInboxUnreadCount?: (count: number) => void
   onSyncError: () => void
-}): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number } {
+}): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number; inboxRevision: number } {
   const { authRef, userId, demo } = input
   const auth = authRef.current
   const latest = useRef(input); latest.current = input
@@ -30,6 +31,7 @@ export function useSystemActionCardActions(input: {
   useLayoutEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   const [deviceId] = useState(() => globalThis.crypto?.randomUUID?.() ?? null)
   const [preferencesRevision, setPreferencesRevision] = useState(0)
+  const [inboxRevision, setInboxRevision] = useState(0)
   const subscribe = useCallback((listener: () => void) => typeof auth.subscribeAccessGeneration === 'function'
     ? auth.subscribeAccessGeneration(listener) : () => {}, [auth])
   const getGeneration = useCallback(() => typeof auth.getAccessGeneration === 'function' ? auth.getAccessGeneration() : -1, [auth])
@@ -48,18 +50,27 @@ export function useSystemActionCardActions(input: {
     let tail = Promise.resolve()
     let client: Promise<SystemActionsClient> | undefined
     const onReceipt: ReceiptObserver = (receipt, context) => {
-      if (receipt.operationId !== 'preferences.update' || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
+      const preferences = receipt.operationId === 'preferences.update'
+      const notifications = receipt.operationId === 'notifications.mark-read' || receipt.operationId === 'notifications.read-all'
+      if ((!preferences && !notifications) || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
       const existing = pending.get(receipt.id)
       if (existing) return existing
       const work = tail.then(async () => {
         context.assertCurrent()
-        const snap = await (await getClient()).getPreferencesSnapshot()
-        context.assertCurrent()
-        const prefs = extractPrefs(snap)
-        applyIntelligentUiSnapshot(snap)
-        latest.current.applyPreferences(prefs)
-        latest.current.setTheme(prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
-        setPreferencesRevision(n => n + 1)
+        if (notifications) {
+          const count = await (await getClient()).getInboxUnreadCountSnapshot()
+          context.assertCurrent()
+          latest.current.applyInboxUnreadCount?.(count)
+          setInboxRevision(n => n + 1)
+        } else {
+          const snap = await (await getClient()).getPreferencesSnapshot()
+          context.assertCurrent()
+          const prefs = extractPrefs(snap)
+          applyIntelligentUiSnapshot(snap)
+          latest.current.applyPreferences(prefs)
+          latest.current.setTheme(prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
+          setPreferencesRevision(n => n + 1)
+        }
         completed.add(receipt.id)
       })
       pending.set(receipt.id, work)
@@ -86,5 +97,5 @@ export function useSystemActionCardActions(input: {
       reconcile: async id => (await getClient()).reconcile(id),
     }
   }, [auth, authRef, userId, demo, deviceId, epoch, generation])
-  return { systemActions, preferencesRevision }
+  return { systemActions, preferencesRevision, inboxRevision }
 }

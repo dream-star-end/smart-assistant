@@ -17,6 +17,7 @@ const POLL_MS = 60_000;
  */
 export function useInbox(auth: AuthSession | null, enabled: boolean) {
   const [unreadCount, setUnreadCount] = useState(0);
+  const accessGeneration = auth?.getAccessGeneration?.() ?? -1;
   const authRef = useRef(auth);
   authRef.current = auth;
   // 代际守卫：登出/换号时 bump，丢弃旧登录态在途请求的迟到响应（防跨账号未读残留）。
@@ -24,11 +25,12 @@ export function useInbox(auth: AuthSession | null, enabled: boolean) {
 
   const refreshUnread = useCallback(async () => {
     const a = authRef.current;
-    if (!a) return;
+    if (!a?.snapshot().token) return;
     const myGen = genRef.current;
+    const accessAtStart = a.getAccessGeneration?.() ?? -1;
     try {
       const n = await api.getInboxUnreadCount(a);
-      if (genRef.current !== myGen) return; // 期间登出/换号 → 丢弃旧代响应
+      if (genRef.current !== myGen || (a.getAccessGeneration?.() ?? -1) !== accessAtStart) return; // 期间登出/换号 → 丢弃旧代响应
       setUnreadCount(n);
     } catch {
       /* 未读数失败：保留旧值，不打断 UI（下次轮询/可见性切换再试） */
@@ -36,18 +38,21 @@ export function useInbox(auth: AuthSession | null, enabled: boolean) {
   }, []);
 
   useEffect(() => {
-    if (!enabled || !auth) {
+    if (!enabled || !auth || !auth.snapshot().token) {
       genRef.current++;
       setUnreadCount(0);
       return;
     }
-    void refreshUnread();
+    const refreshCurrent = () => {
+      if ((auth.getAccessGeneration?.() ?? -1) === accessGeneration) void refreshUnread();
+    };
+    refreshCurrent();
     const tick = () => {
-      if (document.visibilityState === "visible") void refreshUnread();
+      if (document.visibilityState === "visible") refreshCurrent();
     };
     const timer = window.setInterval(tick, POLL_MS);
     const onVis = () => {
-      if (document.visibilityState === "visible") void refreshUnread();
+      if (document.visibilityState === "visible") refreshCurrent();
     };
     document.addEventListener("visibilitychange", onVis);
     return () => {
@@ -55,7 +60,11 @@ export function useInbox(auth: AuthSession | null, enabled: boolean) {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [enabled, auth, refreshUnread]);
+  }, [enabled, auth, refreshUnread, accessGeneration]);
 
-  return { unreadCount, refreshUnread, setUnreadCount };
+  const applyUnreadCountSnapshot = useCallback((count: number) => {
+    genRef.current++; // Retire earlier poll responses before applying the confirmed operation's fresh GET.
+    setUnreadCount(count);
+  }, []);
+  return { unreadCount, refreshUnread, setUnreadCount, applyUnreadCountSnapshot };
 }

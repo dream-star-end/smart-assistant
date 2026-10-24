@@ -145,8 +145,10 @@ export function InboxDialog({
   auth,
   onClose,
   onUnreadChange,
+  refreshRevision = 0,
 }: {
   open: boolean;
+  refreshRevision?: number;
   auth: AuthSession | null;
   onClose: () => void;
   /** 标记已读后通知父层回拉未读真值，刷新顶栏铃铛红点。 */
@@ -176,7 +178,7 @@ export function InboxDialog({
 
   // 首屏 / 切 Tab / 重试：拉第一页（unread_only 跟随 Tab）。
   useEffect(() => {
-    if (!open || !auth) return;
+    if (!open || !auth || !auth.snapshot().token) return;
     let alive = true;
     setLoading(true);
     setErr(null);
@@ -200,7 +202,7 @@ export function InboxDialog({
     return () => {
       alive = false;
     };
-  }, [open, auth, tab, reloadTick]);
+  }, [open, auth, tab, reloadTick, refreshRevision]);
 
   const loadMore = useCallback(async () => {
     if (!auth || loadingMore) return;

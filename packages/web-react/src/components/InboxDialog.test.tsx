@@ -257,3 +257,17 @@ describe("InboxDialog", () => {
     expect(await screen.findByText("标题1")).toBeInTheDocument();
   });
 });
+
+test('a committed-action revision refreshes the existing open list using reads without marking new arrivals', async () => {
+  listInboxMessages.mockResolvedValueOnce({ messages: [mk('before')], unread_count: 1 })
+    .mockResolvedValueOnce({ messages: [mk('later')], unread_count: 1 })
+  const onUnreadChange = vi.fn()
+  const view = render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={onUnreadChange} refreshRevision={0} />)
+  await screen.findByText('标题before')
+  view.rerender(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={onUnreadChange} refreshRevision={1} />)
+  await screen.findByText('标题later')
+  expect(screen.queryByText('标题before')).not.toBeInTheDocument()
+  expect(listInboxMessages).toHaveBeenCalledTimes(2)
+  expect(markInboxRead).not.toHaveBeenCalled()
+  expect(markAllInboxRead).not.toHaveBeenCalled()
+})

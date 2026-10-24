@@ -1426,13 +1426,14 @@ export function App() {
     },
     [openTutorial],
   );
-  const { systemActions, preferencesRevision } = useSystemActionCardActions({
+  const { systemActions, preferencesRevision, inboxRevision } = useSystemActionCardActions({
     authRef,
     userId: user?.id,
     demo,
     applyPreferences: applyConversationPreferences,
+    applyInboxUnreadCount: inbox.applyUnreadCountSnapshot,
     setTheme,
-    onSyncError: () => toast("操作已完成，设置显示暂未同步，请重新打开设置。"),
+    onSyncError: () => toast("操作已完成，页面显示暂未同步，请手动刷新。"),
   });
 
   const {
@@ -2645,6 +2646,7 @@ export function App() {
 
       <AppDialogs
         preferencesRevision={preferencesRevision}
+        inboxRevision={inboxRevision}
         activeId={activeId}
         activeSess={activeSess}
         agent={agent}
