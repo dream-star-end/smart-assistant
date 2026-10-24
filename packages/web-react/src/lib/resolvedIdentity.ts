@@ -17,7 +17,7 @@ export function attemptCurrent(attempt: Attempt, auth: AuthSession): boolean {
 export function captureIdentityAttempt(auth: AuthSession, token: string): Attempt {
   const snapshot = auth.snapshot()
   const generation = typeof auth.getAccessGeneration === 'function' ? auth.getAccessGeneration() : -1
-  if (!Number.isSafeInteger(generation) || generation < 0 || typeof auth.subscribeAccessGeneration !== 'function') throw new TypeError('auth identity observation unavailable')
+  if (!Number.isSafeInteger(generation) || generation < 0 || typeof auth.subscribeAccessGeneration !== 'function') throw new Error('auth identity observation unavailable')
   if (!token || token !== snapshot.token) throw new AuthEpochStaleError()
   return { auth, token, epoch: snapshot.epoch, generation }
 }
@@ -25,7 +25,7 @@ export function captureIdentityAttempt(auth: AuthSession, token: string): Attemp
 /** Only login/verify or the authenticated /me response supplies userId. */
 export function resolveIdentity(attempt: Attempt, userId: string): ResolvedIdentity {
   if (!attemptCurrent(attempt, attempt.auth)) throw new AuthEpochStaleError()
-  if (typeof userId !== 'string' || !userId) throw new TypeError('invalid authenticated user identity')
+  if (typeof userId !== 'string' || !userId) throw new Error('invalid authenticated user identity')
   const identity = Object.freeze({ userId, epoch: attempt.epoch, generation: attempt.generation, sequence: ++nextSequence })
   proofs.set(identity, attempt)
   return identity
