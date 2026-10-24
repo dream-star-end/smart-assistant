@@ -94,6 +94,8 @@ jobs:
         run: npx --no-install tsx scripts/check-v5-system-approval-proofs.ts
       - name: fresh prompt privacy lifecycle proof
         run: npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts
+      - name: independent browser approval and frozen executor proof
+        run: npx --no-install tsx scripts/check-v5-system-executor-proofs.ts
       - name: session unavailable / data-safety rootfix contract gate
         run: npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts
       - name: oc-memory MCP bundle build

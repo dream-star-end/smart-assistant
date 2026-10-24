@@ -153,7 +153,12 @@ export async function getPreferences(userId: bigint | string): Promise<Preferenc
 export async function patchPreferences(
   userId: bigint | string,
   rawPatch: unknown,
+  expectedVersion?: string,
+  expectedRole?: "user" | "admin",
 ): Promise<PreferencesSnapshot> {
+  if (expectedVersion !== undefined && expectedVersion !== 'missing' && !/^[1-9][0-9]{0,19}$/.test(expectedVersion)) {
+    throw new PreferencesError('VALIDATION', 'invalid preference snapshot version');
+  }
   const parsed = PreferencesPatchSchema.safeParse(rawPatch);
   if (!parsed.success) {
     throw new PreferencesError(
@@ -198,14 +203,42 @@ export async function patchPreferences(
   // INSERT 路径:不存在的旧行,COALESCE 落到 '{}',语义同上
   const insertNewExpr = `('{}'::jsonb${unsetExpr}) || $2::jsonb`;
 
-  let r;
+  // A locked CTE protects an existing row from delete/reinsert between checking and writing.
+  // On absent-row races, ON CONFLICT checks the real conflicting tuple instead of overwriting it.
+  let prefix = '';
+  let values = `VALUES ($1, ${insertNewExpr}, NOW())`;
+  let conflictGuard = '';
+  if (expectedVersion !== undefined) {
+    params.push(expectedVersion);
+    const expected = `$${params.length}`;
+    prefix = `WITH current_preferences AS MATERIALIZED (
+      SELECT xmin::text AS version FROM user_preferences WHERE user_id=$1 FOR UPDATE
+    ) `;
+    values = `SELECT $1, ${insertNewExpr}, NOW() WHERE
+      (${expected}='missing' AND NOT EXISTS (SELECT 1 FROM current_preferences))
+      OR EXISTS (SELECT 1 FROM current_preferences WHERE version=${expected})`;
+    conflictGuard = ` WHERE user_preferences.xmin::text=${expected}`;
+  }
+  if (expectedRole !== undefined) {
+    if (expectedVersion === undefined || !['user', 'admin'].includes(expectedRole)) throw new PreferencesError('VALIDATION', 'confirmed preference mutation requires a version and role');
+    params.push(expectedRole);
+    const roleParam = `$${params.length}`;
+    // Lock the actor row for this same statement. Concurrent role/status changes
+    // serialize with the approved mutation, rather than racing a prior ACL read.
+    prefix = prefix.replace('WITH ', `WITH eligible_user AS MATERIALIZED (
+      SELECT id FROM users WHERE id=$1 AND status='active' AND deleted_at IS NULL AND role=${roleParam} FOR SHARE
+    ), `);
+    values = values.replace('WHERE\n      ', 'WHERE EXISTS (SELECT 1 FROM eligible_user) AND (\n      ') + ')';
+    conflictGuard += ' AND EXISTS (SELECT 1 FROM eligible_user)';
+  }
+  let r: { rows: { prefs: unknown; updated_at: Date }[] };
   try {
     r = await query<{ prefs: unknown; updated_at: Date }>(
-      `INSERT INTO user_preferences (user_id, prefs, updated_at)
-       VALUES ($1, ${insertNewExpr}, NOW())
+      `${prefix}INSERT INTO user_preferences (user_id, prefs, updated_at)
+       ${values}
        ON CONFLICT (user_id) DO UPDATE
          SET prefs = ${newPrefsExpr},
-             updated_at = NOW()
+             updated_at = NOW()${conflictGuard}
        RETURNING prefs, updated_at`,
       params,
     );
@@ -221,6 +254,7 @@ export async function patchPreferences(
   void exprParamIdx; // 仅供构造时计数
 
   const row = r.rows[0];
+  if (!row) throw new PreferencesError('CONFLICT', '偏好已变化，请重新查看并确认。');
   const verified = PreferencesSchema.safeParse(row.prefs);
   return {
     prefs: verified.success ? verified.data : {},
@@ -231,10 +265,39 @@ export async function patchPreferences(
 /** 偏好操作错误。`code` 决定 HTTP status:VALIDATION → 400,INTERNAL → 500。 */
 export class PreferencesError extends Error {
   constructor(
-    readonly code: "VALIDATION" | "INTERNAL",
+    readonly code: "VALIDATION" | "INTERNAL" | "CONFLICT" | "FORBIDDEN" | "UNAVAILABLE",
     message: string,
   ) {
     super(message);
     this.name = "PreferencesError";
   }
+}
+
+
+/** Pure read, with a database tuple version for the short-lived confirmed-action CAS. */
+export async function getVersionedPreferences(userId: string): Promise<PreferencesSnapshot & { version: string }> {
+  const r = await query<{ prefs: unknown; updated_at: Date; version: string }>(
+    'SELECT prefs, updated_at, xmin::text AS version FROM user_preferences WHERE user_id=$1', [userId]);
+  const row = r.rows[0];
+  if (!row) return { prefs: {}, updated_at: new Date().toISOString(), version: 'missing' };
+  const parsed = PreferencesSchema.safeParse(row.prefs);
+  return { prefs: parsed.success ? parsed.data : {}, updated_at: row.updated_at.toISOString(), version: row.version };
+}
+
+
+/** Shared business validation for manual settings and approved actions; preparation performs no mutation. */
+export async function resolvePreferencesPatch(userId: string, raw: unknown, deps: {
+  feature?: (userId: string) => Promise<{ eligible: boolean; available: boolean }>
+} = {}): Promise<PreferencesPatch> {
+  const parsed = PreferencesPatchSchema.safeParse(raw);
+  if (!parsed.success) throw new PreferencesError('VALIDATION', parsed.error.issues.map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '));
+  const { getAutoDreamFeature, normalizeAutoDreamPreferencePatch } = await import('./autoDream.js');
+  if (parsed.data.auto_dream_enabled === true || parsed.data.auto_optimizer_enabled === true) {
+    const feature = await (deps.feature ? deps.feature(userId) : getAutoDreamFeature(userId, true));
+    if (!feature.eligible) throw new PreferencesError('FORBIDDEN', 'Auto-Dream requires Max or above');
+    if (!feature.available) throw new PreferencesError('UNAVAILABLE', 'Auto-Dream model is unavailable');
+  }
+  const normalized = PreferencesPatchSchema.safeParse(normalizeAutoDreamPreferencePatch(parsed.data));
+  if (!normalized.success) throw new PreferencesError('INTERNAL', 'invalid normalized preference patch');
+  return normalized.data;
 }
