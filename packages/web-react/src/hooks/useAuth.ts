@@ -456,8 +456,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // A same-epoch refresh has no userId. Business callbacks stay disabled until /me
   // verifies the exact new token; cleanup cancels only this consumer's commit.
   useEffect(() => {
-    const session = authRef.current;
-    if (demo || booting || !authed || !session.snapshot().token || identityIsCurrent(account.identity, session, user?.id)) return;
+    const session = auth;
+    if (demo || booting || !authed || !session || !session.snapshot().token || identityIsCurrent(account.identity, session, user?.id)) return;
     const epoch = session.snapshot().epoch;
     let flight = validation.current;
     if (!flight || flight.auth !== session || flight.epoch !== epoch || flight.generation !== generation ||
