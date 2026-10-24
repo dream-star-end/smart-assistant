@@ -14,7 +14,7 @@ import { SystemOperationRegistry, type SystemActor } from '../system-assistant/o
 import { SystemActionsService } from '../system-assistant/service.js'
 import { getPgActionReceipt, withPgActionReceipt } from '../system-assistant/pgReceipts.js'
 import type { BrowserConfirmationPrincipal } from '../auth/browserConfirmation.js'
-const target = new URL(process.env.TEST_DATABASE_URL ?? '')
+const target = new URL(process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test')
 if (!['127.0.0.1','localhost'].includes(target.hostname) || !target.pathname.endsWith('_test')) throw new Error('isolated local test database required')
 const admin = new Pool({ connectionString: target.toString(), max: 1 })
 after(async () => { await admin.end() })
