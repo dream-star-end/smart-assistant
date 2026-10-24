@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote} from '../browser-tests/model-switch-cost-fixture.mjs';
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
@@ -19,6 +20,9 @@ loadBeforeAll(preloadToolBody)
 loadBeforeAll(() =>
   Promise.all([
     prefetchMarkdownImpl(),
+    import('./lib/modelSwitchCostClient'),
+    import('./components/AgentPicker'),
+    import('./components/GoalDialog'),
     import('./components/Landing'),
     import('./components/SettingsCenter'),
     import('./components/ManageCenter'),
@@ -167,6 +171,7 @@ function routedFetch(over?: {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
+    if(method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init?.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
@@ -729,7 +734,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.click(plusTrigger)
     const goalItem = await screen.findByText('设定目标')
     fireEvent.click(goalItem)
-    fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
+    fireEvent.change(await screen.findByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })
     fireEvent.click(screen.getByRole('button', { name: '设置并开始' }))
@@ -787,12 +792,13 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     fireEvent.click(teamChoice())
     await waitFor(() => expect(teamChoice()).toHaveAttribute('aria-pressed', 'true'))
-    expect(localStorage.getItem('oc_v5_team_mode')).toBe('1')
+    expect(localStorage.getItem('oc_v5_team_mode')).toBeNull()
     await waitFor(() => {
       const put = fetchMock.mock.calls.find(
         ([url, init]) =>
           String(url).includes('/api/collaboration-config') &&
-          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT' &&
+          JSON.parse(String((init as RequestInit).body)).mode === 'team',
       )
       expect(put).toBeTruthy()
       expect(JSON.parse(String((put![1] as RequestInit).body))).toEqual(
@@ -1060,7 +1066,9 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     })
     await waitFor(() => expect(screen.getAllByText('B 新消息').length).toBeGreaterThan(0))
     const ordinaryBPuts = collabPuts.filter((row) => row.token === 'tok-b').slice(putsBeforeRelease)
-    expect(ordinaryBPuts).toEqual([])
+    expect(ordinaryBPuts).toHaveLength(1)
+    expect(ordinaryBPuts[0]!.body).toEqual(expect.objectContaining({ mode: 'solo', sessionId: expect.any(String) }))
+    expect(ordinaryBPuts[0]!.body.asDefault).not.toBe(true)
     await openAgentPicker()
     expect(screen.getByLabelText(/同时设为新对话的默认协作方式/)).not.toBeChecked()
     fireEvent.click(teamChoice())
@@ -1573,8 +1581,9 @@ const OTHER_DETAIL = {
 function routedFetchTwoSessions() {
   // 路由用例全部基于「F5 后恢复登录」：模拟登录过的浏览器（oc_auth_hint），否则不发 refresh。
   setAuthHint()
-  return vi.fn(async (url: string) => {
+  return vi.fn(async (url: string,init?:RequestInit) => {
     const u = String(url)
+    if(init?.method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_OK
     if (u.includes('/api/public/models')) return okJson(MODELS)
     if (u.includes('/api/sessions/list')) return okJson(HIST_META_TWO)

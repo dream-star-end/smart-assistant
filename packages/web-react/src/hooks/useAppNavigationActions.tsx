@@ -22,7 +22,6 @@ import { resolveTutorialAction } from "../lib/tutorialActions";
 import type { TutorialCase } from "../lib/tutorialCaseCatalog";
 import type { Agent } from "../lib/agents";
 import type { AuthSession, Message, Session, User } from "../lib/types";
-import type { CollabMode } from "../lib/collaborationConfig";
 import type { ConfirmChoice, ConfirmOpts } from "../components/ui/ConfirmDialog";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import type { AuthMode } from "../components/AuthGate";
@@ -35,7 +34,7 @@ export type AppNavigationActionsInput = {
   activeId: string | undefined;
   agent: Agent;
   auth: AuthSession | null;
-  collabMode: CollabMode;
+  promoteDraftCollab: (sessionId: string) => void;
   confirmDialog: (opts: ConfirmOpts) => Promise<ConfirmChoice>;
   contextTier: "300k" | "1m";
   demo: boolean;
@@ -45,7 +44,7 @@ export type AppNavigationActionsInput = {
   messages: Message[];
   modelId: string | undefined;
   refreshMe: () => Promise<void>;
-  send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<void>;
+  send: (text: string, media?: { url?: string | undefined; base64?: string | undefined; mimeType?: string | undefined; filename?: string | undefined; hidden?: boolean | undefined; localSrc?: string | undefined; kind: "image" | "audio" | "video" | "file"; }[] | undefined, imageEdit?: { mode?: "annotated" | "outpaint" | undefined; maskIndex?: number | undefined; targetAspect?: "16:9" | "4:3" | "9:16" | "3:4" | "1:1" | undefined; clientJobId: string; sourceIndex: number; guideIndex: number; width: number; height: number; } | undefined, displayText?: string | undefined, replyTo?: { text: string; messageId: string; role: "user" | "assistant"; } | undefined, target?: { sessionId: string; projectId?: string | null | undefined; } | undefined) => Promise<unknown>;
   serviceTier: "fast" | null;
   sessionEffort: PreferenceEffort | null | undefined;
   setActiveId: React.Dispatch<React.SetStateAction<string | undefined>>;
@@ -89,7 +88,7 @@ export function useAppNavigationActions({
   activeId,
   agent,
   auth,
-  collabMode,
+  promoteDraftCollab,
   confirmDialog,
   contextTier,
   demo,
@@ -140,7 +139,7 @@ export function useAppNavigationActions({
 }: AppNavigationActionsInput) {
   const ensureActiveSession = useDraftSessionMaterialization({
     demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
-    teamMode: collabMode === "team", sessionEffort, contextTier, serviceTier,
+    promoteDraftCollab, sessionEffort, contextTier, serviceTier,
     sockRef, setSessions, setActiveId,
   });
 

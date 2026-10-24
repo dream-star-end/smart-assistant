@@ -1,3 +1,6 @@
+import type {AuthorizeSwitch} from './useModelSwitchCost';
+import {mintMsgId} from '../lib/chat/model';
+import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
  * Composer send pipeline: send, project start, media upload and image edit/comment actions
  *
@@ -12,7 +15,6 @@ import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
 import { findRewriteTarget } from "../lib/implicitFeedback";
 import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor } from "../lib/collaborationSend";
-import { writeTeamMode } from "../lib/teamMode";
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
@@ -34,6 +36,7 @@ import type { ToastFn } from "../components/ui/Toast";
 
 export type ComposerSendInput = {
   activeId: string | undefined;
+  authorizeSwitch?: AuthorizeSwitch;
   agent: Agent;
   applyCollabDoc: (doc: CollaborationConfigDoc) => void;
   auth: AuthSession | null;
@@ -52,6 +55,7 @@ export type ComposerSendInput = {
   newSessionInProject: (projectId: string) => void;
   preferenceEffort: PreferenceEffort | undefined;
   projectHome: ProjectRoute | null;
+  promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
@@ -69,7 +73,6 @@ export type ComposerSendInput = {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
   setStreamText: React.Dispatch<React.SetStateAction<string>>;
-  setTeamModeState: React.Dispatch<React.SetStateAction<boolean>>;
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
@@ -79,6 +82,7 @@ export type ComposerSendInput = {
 
 export function useComposerSend({
   activeId,
+  authorizeSwitch,
   agent,
   applyCollabDoc,
   auth,
@@ -97,6 +101,7 @@ export function useComposerSend({
   newSessionInProject,
   preferenceEffort,
   projectHome,
+  promoteDraftCollab,
   publicCfg,
   selectedSessionIdRef,
   sendImplicitRatingRef,
@@ -114,14 +119,13 @@ export function useComposerSend({
   setMessages,
   setSessions,
   setStreamText,
-  setTeamModeState,
   sockRef,
   stopPreparing,
   stopRef,
   toast,
   user,
 }: ComposerSendInput) {
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, setTeamModeState, sockRef, stopRef are App useState setter/useRef passed in, stable
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef are App useState setter/useRef passed in, stable
   const send = useCallback(
     async (
       text: string,
@@ -158,12 +162,12 @@ export function useComposerSend({
         ]);
         setStreamText("");
         setBusy(false);
-        return;
+        return true;
       }
 
       if (!user || !sockRef.current) {
         if (target) throw new Error("登录状态或会话连接不可用");
-        return;
+        return false;
       }
       const sendProjectId = target ? target.projectId : draftProjectRef.current;
       // 隐式负反馈（改写重发）：发送前用**当前会话**的现有消息判定「5min 内高相似改写」——
@@ -193,14 +197,13 @@ export function useComposerSend({
         parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
         isCurrent: recoveryIdentityIsCurrent,
         update: (state, recovered) => {
-          if (!recoveryIsCurrent()) return;
+          if (!recoveryIsCurrent()) return false;
           setCollabUi(state);
-          setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },
       });
-      if (!recovery || !recoveryIdentityIsCurrent()) return;
+      if (!recovery || !recoveryIdentityIsCurrent()) return false;
       let latestCollab = recovery.state;
       const recoveredAdvisor = recovery.recoveredAdvisor;
       if (!originalSessionId) {
@@ -213,44 +216,35 @@ export function useComposerSend({
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
           ...(sendProjectId ? { projectId: sendProjectId } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
-          // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
+          // 之后 default_model 变更/其它会话换模都不影响它。
           ...(modelId ? { modelId } : {}),
         };
-        // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
-        // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
+        if (auth && agent.id === "main" && !recoveredAdvisor) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
-          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-          if (!ensured) {
-            toast("会话尚未创建成功，请检查网络后重试", "error");
-            return;
-          }
           try {
+            const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
+            if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
             const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
-            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return false;
             if (recoveryIsCurrent()) applyCollabDoc(doc);
             latestCollab = docToUiState(doc);
           } catch (err) {
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
-              const msg = apiErrorMessage(err, "协作配置保存失败");
-              setCollabSaveError(msg);
-              toast(msg, "error");
-              return;
-            }
+            const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
+            setCollabSaveError(msg);
+            toast(msg, "error");
+            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) return false;
           }
         }
-        setSessions((c) => [createdSession!, ...c]);
-        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
         ...latestCollab, agentId: agent.id,
@@ -258,8 +252,17 @@ export function useComposerSend({
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
-        return;
+        return false;
       }
+      const authorization=!imageEdit&&modelId&&authorizeSwitch?await authorizeSwitch({
+        sessionId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,teamMode:sendCollab.teamMode,
+        text:formatMessageReplyPrompt(text,replyTo),mediaCount:media?.length??0,
+        ...(cursorModelSupportsContextTier(modelId)?{contextTier}:{}),
+        ...(serviceTier==='fast'&&supportsFastServiceTier(modelId)?{serviceTier}:{}),
+      },{useCachedRequestId:true,allowOfflineQueue:true,
+        canPrompt:recoveryIsCurrent,
+        isCurrent:()=>recoveryIdentityIsCurrent()&&(!originalSessionId||!!sockRef.current?.getSession(sessionId))}):undefined;
+      if(!imageEdit&&modelId&&authorizeSwitch&&!authorization)return false;
       const materializedDraft =
         !createdSession && (
           sessions.some((session) => session.id === sessionId && session.messageCount === 0) ||
@@ -289,7 +292,8 @@ export function useComposerSend({
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
       const teamLeaderTurn = sendCollab.teamMode;
-      sockRef.current?.send({
+      const sent=await sockRef.current?.send({
+        ...(authorization?{switchAuthorization:authorization}:{}),
         sessId: sessionId,
         agentId: agent.id,
         text,
@@ -317,6 +321,12 @@ export function useComposerSend({
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if(sent===false)return false;
+      // Fee confirmation keeps ownership of the draft until the send is accepted.
+      if (createdSession && recoveryIsCurrent()) {
+        promoteDraftCollab(sessionId, latestCollab, false);
+        setActiveId(sessionId);
+      }
       if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
         auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
         ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
@@ -355,6 +365,7 @@ export function useComposerSend({
           applyProject(1);
         }
       }
+      return true;
     },
     // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
     // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
@@ -362,6 +373,7 @@ export function useComposerSend({
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      authorizeSwitch,
       draftSessionId,
       stopPreparing,
       auth,
@@ -380,6 +392,7 @@ export function useComposerSend({
       setSessions,
       setActiveId,
       applyCollabDoc,
+      promoteDraftCollab,
       toast,
       setDraftProject,
     ],

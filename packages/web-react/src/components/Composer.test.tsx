@@ -322,7 +322,7 @@ describe("Composer 长文字数", () => {
 });
 
 describe("Composer goalOpenRequest", () => {
-  test("nonce 变化打开 GoalDialog", () => {
+  test("nonce 变化打开 GoalDialog", async () => {
     const { rerender } = render(
       <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} />,
     );
@@ -330,7 +330,7 @@ describe("Composer goalOpenRequest", () => {
     rerender(
       <Composer onSend={() => {}} onSetGoal={vi.fn()} onGoalAction={vi.fn()} goalOpenRequest={1} />,
     );
-    expect(screen.getByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText("这次会话要达成什么？")).toBeInTheDocument();
     expect(screen.getByText("会话目标")).toBeInTheDocument();
   });
 });

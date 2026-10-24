@@ -8111,6 +8111,69 @@
       ]
     },
     {
+      "id": "INC-20261024-CCB-TRANSCRIPT-INTEGRITY",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "个人765长图会话验证发现旧转录并发追加交错，冷恢复跳坏行可能丢失模型上下文；新写入统一互斥、保硬链接inode并自动从原生权威存档证明全部原字节后恢复。",
+      "rootFixCommit": "049a2531",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-607-lossless-context-transport] PASS"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionFileIo.test.ts",
+          "assertion": "inherited FD keeps the actual transcript inode locked after the acquire child exits"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/nativeTranscriptRecovery.test.ts",
+          "assertion": "proves every interleaved byte, preserves all values/signatures/metadata, and changes only ordering"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptReader.test.ts",
+          "assertion": "Snip can remove its own source and a large parent bridge without losing the retained chain"
+        },
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptQueue.test.ts",
+          "assertion": "producer admission, queue backpressure, metadata and tombstones all commit before terminal flush"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/ccbNativeRestoreArchive.integ.test.ts",
+          "assertion": "raw restore validates tenant authority, batched bytes, deferred input and administrative recovery without touching shared tables"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalCcbTranscriptRestore.test.ts",
+          "assertion": "restore uses real host/IP and bearer identity and never a caller-supplied UID"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerTranscriptRestore.test.ts",
+          "assertion": "an old start delayed before learning context cannot close the new generation socket"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts",
+          "assertion": "a private restore socket forwards only its fixed authority and preserves byte framing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageIdentity.test.ts",
+          "assertion": "private image evidence binds all 91 byte owners, preserves multiplicity and never contains raw metadata"
+        }
+      ],
+      "coverageCommits": [
+        "43f18ea0",
+        "3ccedbae"
+      ]
+    },
+    {
       "id": "INC-20261024-SYSTEM-PROFILE-READ",
       "occurredAt": "2026-10-24",
       "severity": "P1",
@@ -8134,6 +8197,45 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-system-executor-proofs.ts",
           "assertion": "[system-executor-proofs] PASS independent browser approval, original request replay and frozen executors"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261024-TEAM-MODE-REBOUND",
+      "occurredAt": "2026-10-24",
+      "severity": "P1",
+      "symptom": "体验混合账号保存defaultMode=team，空态关闭后首发solo未落会话配置，后续GET继承团队默认造成回弹；Goal/GitHub提前物化有同类丢失；旧设备全局团队标记还可影响其它账号初态。实际App/Chromium在独立HTTP/WS fixture先红跑确认，未对体验账号写操作。 未上线候选的额外session ensure失败路径曾吞掉solo首发；实际浏览器503红跑确认后已恢复离线队列与重连单次发送契约，无真实用户数据影响。",
+      "rootFixCommit": "6f345868",
+      "coverageCommits": [
+        "6f345868",
+        "e9a2c165",
+        "0f5e6eca"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "team close persists solo through first send and reload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "legacy device team flag cannot activate team before account config arrives"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "closing an existing team stays solo on save failure and can persist on explicit retry"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "solo first send stays queued when session creation fails and reconnect sends it once"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "first-send cost confirmation keeps the draft and commits solo only after acceptance"
         }
       ]
     }

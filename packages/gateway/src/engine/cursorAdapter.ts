@@ -1449,7 +1449,7 @@ export function attachCursorGatewayRouting(
 ): void {
   env.OPENCLAUDE_GATEWAY_PORT = String(routing.gatewayPort)
   env.OPENCLAUDE_DELEGATE_CONTEXT_FILE = routing.contextFile
-  env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE = routing.systemHelpContextFile ?? '' 
+  env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE = routing.systemHelpContextFile ?? ''
   env.OPENCLAUDE_ENGINE = 'cursor'
   // Full gateway bearer stays in MCP child env only. Shell + async /delegate
   // authenticate with the signed context file, not the shared access token.

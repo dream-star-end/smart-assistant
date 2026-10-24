@@ -1,3 +1,5 @@
+import { lstat as fsLstat, readdir as fsReaddir, mkdir as fsMkdir, link as fsLink } from 'node:fs/promises'
+import { withSessionFile, SessionFileIntegrityError } from '@openclaude/storage'
 /**
  * Make a Claude Code transcript resumable from the cwd we are about to spawn in.
  *
@@ -157,4 +159,47 @@ export function relocateCcbJsonlToCwd(opts: {
     })
     return undefined
   }
+}
+
+/** Managed CCB must establish inode authority before any native resume. An
+ * existence probe is deliberately insufficient: it only keeps the resume id. */
+export async function relocateCcbJsonlToCwdManaged(opts: {
+  innerId: string; cwd: string; claudeConfigDir?: string; env?: NodeJS.ProcessEnv
+}): Promise<CcbJsonlRelocation | undefined> {
+  const env = opts.env ?? process.env
+  const config = opts.claudeConfigDir ?? env.CLAUDE_CONFIG_DIR?.trim() ?? ''
+  if (!UUID_RE.test(opts.innerId) || !config) return undefined
+  const targetDir = ccbProjectDirForCwd(opts.cwd, config)
+  if (!targetDir) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_PATH_INVALID')
+  const projectsDir = join(config, 'projects')
+  const target = join(targetDir, `${opts.innerId}.jsonl`)
+  let dirs: import('node:fs').Dirent[]
+  try { dirs = await fsReaddir(projectsDir, { withFileTypes: true }) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+  const candidates: string[] = []
+  for (const dir of dirs) {
+    if (!dir.isDirectory() || dir.name.startsWith('.')) continue
+    const path = join(projectsDir, dir.name, `${opts.innerId}.jsonl`)
+    try { const s = await fsLstat(path); if (s.isSymbolicLink() || !s.isFile()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_PATH_INVALID'); candidates.push(path) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
+  if (!candidates.length) return undefined
+  const source = candidates.includes(target) ? target : candidates[0]!
+  return withSessionFile(source, { projectsDir, sessionId: opts.innerId, requireKernelLock: true }, false, async file => {
+    const identity = await file.stat()
+    for (const candidate of candidates) {
+      const other = await fsLstat(candidate)
+      if (other.isSymbolicLink() || other.dev !== identity.dev || other.ino !== identity.ino) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED')
+    }
+    if (identity.size === 0) return undefined
+    if (source === target) return { path: target, relocated: false }
+    await fsMkdir(targetDir, { recursive: true, mode: 0o700 })
+    const parent = await fsLstat(targetDir)
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== process.getuid?.()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_PATH_INVALID')
+    try { await fsLink(source, target) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED') }
+    const linked = await fsLstat(target)
+    if (linked.isSymbolicLink() || linked.dev !== identity.dev || linked.ino !== identity.ino) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED')
+    return { path: target, relocated: true, from: source.slice(0, -`/${opts.innerId}.jsonl`.length) }
+  })
 }

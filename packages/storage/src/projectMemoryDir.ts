@@ -27,6 +27,7 @@ import {
   memoryCalendarDate,
 } from './memoryTtl.js'
 import { paths } from './paths.js'
+import type { ProjectFileLocations } from './authorityPaths.js'
 import { BOARD_PROJECT_ID_RE } from './projectContext.js'
 
 export const PROJECT_MEMORY_INDEX_MAX_CHARS = 8 * 1024
@@ -103,32 +104,32 @@ export type ProjectCandidateWriteResult =
 export class ProjectMemoryDir {
   readonly boardProjectId: string
 
-  constructor(boardProjectId: string) {
+  constructor(boardProjectId: string, private readonly locations: ProjectFileLocations = paths) {
     this.boardProjectId = assertBoardId(boardProjectId)
   }
 
   officialDir(): string {
-    return paths.projectMemoryDir(this.boardProjectId)
+    return this.locations.projectMemoryDir(this.boardProjectId)
   }
 
   candidateDir(): string {
-    return paths.projectCandidateDir(this.boardProjectId)
+    return this.locations.projectCandidateDir(this.boardProjectId)
   }
 
   officialFile(slug: string): string {
-    return paths.projectMemoryFile(this.boardProjectId, assertProjectMemoryFile(slug))
+    return this.locations.projectMemoryFile(this.boardProjectId, assertProjectMemoryFile(slug))
   }
 
   candidateFile(file: string): string {
-    return paths.projectCandidateFile(this.boardProjectId, assertProjectMemoryFile(file))
+    return this.locations.projectCandidateFile(this.boardProjectId, assertProjectMemoryFile(file))
   }
 
   private lockPath(): string {
-    return paths.projectMemoryLock(this.boardProjectId)
+    return this.locations.projectMemoryLock(this.boardProjectId)
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    mkdirSync(paths.projectDir(this.boardProjectId), { recursive: true, mode: 0o700 })
+    mkdirSync(this.locations.projectDir(this.boardProjectId), { recursive: true, mode: 0o700 })
     const release = await acquireFileLock(this.lockPath())
     try {
       return await fn()

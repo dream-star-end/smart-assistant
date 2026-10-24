@@ -123,9 +123,11 @@ interface ShanghaiParts {
   second: string
 }
 
+let shanghaiPartsFormatter: Intl.DateTimeFormat | undefined
+
 function shanghaiParts(ms: number): ShanghaiParts | null {
   if (typeof ms !== 'number' || !Number.isFinite(ms)) return null
-  const parts = new Intl.DateTimeFormat('en-US', {
+  shanghaiPartsFormatter ??= new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
@@ -134,7 +136,8 @@ function shanghaiParts(ms: number): ShanghaiParts | null {
     minute: '2-digit',
     second: '2-digit',
     hourCycle: 'h23',
-  }).formatToParts(new Date(ms))
+  })
+  const parts = shanghaiPartsFormatter.formatToParts(new Date(ms))
   const pick = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((part) => part.type === type)?.value ?? ''
   return {
