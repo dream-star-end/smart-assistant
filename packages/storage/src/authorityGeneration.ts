@@ -1,3 +1,5 @@
+import { ProfileGenerationPreGoRejected } from './profileControlRejection.js'
+import { scanMemoryContent } from './memoryShared.js'
 /** Inert host-only prototype. No operation registration, legacy import, worker or container activation. */
 import { constants } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -251,8 +253,9 @@ export async function publishProfileGeneration(store: AuthorityStore, input: { b
     const previous = await findProfileGenerationReceipt(store, exact)
     if (previous) return validateProfileReceiptCondition(store, previous, { parentManifestSha256: input.baseManifestSha256,
       baseProfileVersion: input.expectedVersion, targetProfileSha256: hash(Buffer.from(input.text, 'utf8')) })
-    if (current.manifestSha256 !== input.baseManifestSha256) throw new Error('Authority generation conflict')
-    if (profileSnapshot((await regular(join(current.root, 'data/user.md'), 1048576)).toString('utf8')).version !== input.expectedVersion) throw unknown()
+    if (current.manifestSha256 !== input.baseManifestSha256) throw new ProfileGenerationPreGoRejected('CONFLICT')
+    if (profileSnapshot((await regular(join(current.root, 'data/user.md'), 1048576)).toString('utf8')).version !== input.expectedVersion) throw new ProfileGenerationPreGoRejected('CONFLICT')
+    if (!scanMemoryContent(input.text).ok) throw new ProfileGenerationPreGoRejected('INVALID_INPUT')
     await admission?.() // Stable uid flock is held, base CAS verified, and no staging/effect exists yet.
     const generation = randomUUID()
     const stage = await stageDirectory(loc, generation)

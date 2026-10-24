@@ -1,3 +1,4 @@
+import { ProfileGenerationPreGoRejected } from './profileControlRejection.js'
 /** Bundled into a fixed standalone ESM artifact. Data only; never imports a user's module or configuration. */
 import { createHash } from 'node:crypto'
 import { createInterface } from 'node:readline'
@@ -18,12 +19,16 @@ async function main() {
   const condition = parseProfileControlVersion(request.token)!
   if (request.kind === 'publish-profile' && createHash('sha256').update(request.text!, 'utf8').digest('hex') !== condition.targetProfileSha256) throw new Error('Unavailable')
   const send = (value: unknown) => new Promise<void>((resolve, reject) => { process.stdout.write(`${JSON.stringify(value)}\n`, e => e ? reject(e) : resolve()) })
+  let admitted = false
   const admission = async () => {
     await send({ v: 1, jobId: request.jobId, type: 'ready' })
     const next = await iterator.next()
     if (next.done) throw new Error('Unavailable')
     const reply = JSON.parse(next.value)
-    if (!exactKeys(reply, ['v', 'jobId', 'type']) || reply.v !== 1 || reply.jobId !== request.jobId || reply.type !== 'go') throw new Error('Unavailable')
+    if (!exactKeys(reply, ['v', 'jobId', 'type']) || reply.v !== 1 || reply.jobId !== request.jobId) throw new Error('Unavailable')
+    if (reply.type === 'cancel') throw new ProfileGenerationPreGoRejected('UNAVAILABLE')
+    if (reply.type !== 'go') throw new Error('Unavailable')
+    admitted = true
   }
   try {
     const store = { hostRoot, userId: request.binding.userId }
@@ -31,6 +36,9 @@ async function main() {
       ? await publishProfileGeneration(store, { binding: request.binding, baseManifestSha256: condition.parentManifestSha256, expectedVersion: condition.baseProfileVersion, text: request.text! }, {}, admission)
       : await recoverSelectedProfileGeneration(store, { binding: request.binding, expectedVersion: request.token }, admission)
     await send({ v: 1, jobId: request.jobId, type: 'result', receipt })
+  } catch (error) {
+    if (request.kind !== 'publish-profile' || admitted || !(error instanceof ProfileGenerationPreGoRejected)) throw error
+    await send({ v: 1, jobId: request.jobId, type: 'rejected', code: error.code })
   } finally { lines.close(); process.stdin.destroy() }
 }
 main().catch(() => { process.exitCode = 1; process.stdin.destroy() })
