@@ -601,6 +601,37 @@ describe('时间线合并', () => {
 })
 
 describe('TicketDrawer 详情', () => {
+  test.each([true, false])('重跑成功后不再把旧停止原因显示为当前受阻 desktop=%s', async (desktop) => {
+    const ticket = sampleTicket({ status: 'waiting_human', blockedReason: '用户停止本次执行' })
+    const stopped = sampleRun({
+      id: 'stopped-old',
+      status: 'failed',
+      skipReason: null,
+      error: 'USER_CANCELLED: 本轮已由用户停止。',
+      outputMd: 'EARLIER PAID OUTPUT',
+    })
+    const completed = sampleRun({
+      id: 'retry-new',
+      status: 'succeeded',
+      skipReason: null,
+      outputMd: 'LATEST RETRY RESULT',
+      createdAt: stopped.createdAt + 1000,
+    })
+    mockDrawerApis(ticket, [stopped, completed])
+    renderDrawer(ticket, { desktop })
+    expect(await screen.findByText('LATEST RETRY RESULT')).toBeInTheDocument()
+    expect(screen.queryByText('受阻：用户停止本次执行')).not.toBeInTheDocument()
+    expect(screen.getByText('EARLIER PAID OUTPUT')).toBeInTheDocument()
+    expect(screen.getByText('本次执行已停止，已保留生成内容和已发生用量。')).toBeInTheDocument()
+  })
+
+  test('当前仍受阻时保留原因提示', async () => {
+    const ticket = sampleTicket({ status: 'blocked', blockedReason: '用户停止本次执行' })
+    mockDrawerApis(ticket)
+    renderDrawer(ticket)
+    expect(await screen.findByText('受阻：用户停止本次执行')).toBeInTheDocument()
+  })
+
   test('来源会话：列表命中才打开，传入的是 Session.id 而不是 sessionKey', async () => {
     const ticket = sampleTicket({
       originSessionKey: 'agent:main:webchat:dm:webabc12345',
