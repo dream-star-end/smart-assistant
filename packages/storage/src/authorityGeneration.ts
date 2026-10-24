@@ -8,15 +8,10 @@ import { acquireAuthorityGenerationLock } from './authorityGenerationLock.js'
 import { profileSnapshot, writeUserProfileAt } from './userProfile.js'
 import type { SystemActionReceiptBinding } from './systemActions.js'
 import { parseProfileControlVersion, type ProfileControlCondition } from './profileControlVersion.js'
+import { binding, decodeReceipt, decodeManifest, type FileEntry, type Manifest, type ProfileGenerationReceipt } from './authorityGenerationCodec.js'
 
 export type AuthorityStore = Readonly<{ hostRoot: string; userId: string }>
-type FileEntry = { path: string; size: number; sha256: string }
-type Manifest = { version: 1; userId: string; generation: string; parent: string | null; files: FileEntry[] }
-export type ProfileGenerationReceipt = Readonly<{
-  binding: SystemActionReceiptBinding
-  generation: string
-  result: { version: string }
-}>
+export type { ProfileGenerationReceipt } from './authorityGenerationCodec.js'
 export type AuthorityGeneration = Readonly<{
   userId: string; generation: string; manifestSha256: string; paths: AuthorityPaths
   /** Private verified snapshot, not a mutable on-disk writer. */
@@ -76,31 +71,6 @@ async function sync(path: string) {
 async function createDirectory(path: string, mode: number) {
   await mkdir(path, { mode }).catch(err => { if (err.code !== 'EEXIST') throw err })
   await directory(path, mode === 0o700)
-}
-function binding(value: SystemActionReceiptBinding, userId: string): SystemActionReceiptBinding {
-  if (!value || value.userId !== userId || !UUID.test(value.id) || !SHA.test(value.inputHash) || (typeof value.requestHash !== 'string' || !SHA.test(value.requestHash)) || !Number.isSafeInteger(value.operationVersion) || value.operationVersion < 1) throw unknown()
-  for (const part of [value.sessionId, value.agentId, value.operationId]) if (typeof part !== 'string' || !part || part.length > 256 || part.includes('\0')) throw unknown()
-  return { id: value.id, userId, sessionId: value.sessionId, agentId: value.agentId, operationId: value.operationId, operationVersion: value.operationVersion, requestHash: value.requestHash, inputHash: value.inputHash }
-}
-function decodeReceipt(raw: Buffer, userId: string, id: string): ProfileGenerationReceipt {
-  const value = JSON.parse(raw.toString('utf8')) as ProfileGenerationReceipt
-  const exact = binding(value.binding, userId)
-  if (exact.id !== id || !UUID.test(value.generation) || !/^[0-9a-f]{16}$/.test(value.result?.version)) throw unknown()
-  if (!bytes({ binding: exact, generation: value.generation, result: { version: value.result.version } }).equals(raw)) throw unknown()
-  return Object.freeze({ binding: Object.freeze(exact), generation: value.generation, result: Object.freeze({ version: value.result.version }) })
-}
-function decodeManifest(raw: Buffer, userId: string): Manifest {
-  const m = JSON.parse(raw.toString('utf8')) as Manifest
-  if (m.version !== 1 || m.userId !== userId || !UUID.test(m.generation) || (m.parent !== null && !SHA.test(m.parent)) || !Array.isArray(m.files)) throw unknown()
-  const seen = new Set<string>()
-  for (const file of m.files) {
-    if (!file || (file.path !== 'data/user.md' && !/^receipts\/[0-9a-f-]{36}\.json$/.test(file.path)) || !Number.isSafeInteger(file.size) || file.size < 0 || file.size > (file.path === 'data/user.md' ? 1048576 : 65536) || !SHA.test(file.sha256) || seen.has(file.path)) throw unknown()
-    seen.add(file.path)
-  }
-  if (!bytes(m.files).equals(bytes(m.files.map(f => ({ path: f.path, size: f.size, sha256: f.sha256 }))))) throw unknown()
-  if (!seen.has('data/user.md') || !bytes(m.files.map(f => f.path)).equals(bytes([...seen].sort()))) throw unknown()
-  if (!bytes({ version: 1, userId, generation: m.generation, parent: m.parent, files: m.files }).equals(raw)) throw unknown()
-  return m
 }
 async function verifyTree(store: AuthorityStore, manifest: Manifest, stagingRoot?: string) {
   const loc = await locations(store)
