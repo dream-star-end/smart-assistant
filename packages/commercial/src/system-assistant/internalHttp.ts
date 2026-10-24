@@ -1,3 +1,4 @@
+import { SYSTEM_ACTIONS_INTERNAL_PATH } from '@openclaude/protocol'
 /** Container authentication + dedicated help grants. There is deliberately no execute/confirm command. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
@@ -10,7 +11,7 @@ import { resolveCurrentSystemHelpActor } from './helpActor.js'
 import { SystemHelpGrantError, type SystemHelpGrantSigner } from './helpGrant.js'
 import { SystemOperationRejected } from './operations.js'
 import type { SystemActionsService } from './service.js'
-export const INTERNAL_SYSTEM_ACTIONS_PATH = '/internal/v5/system-actions'
+export const INTERNAL_SYSTEM_ACTIONS_PATH = SYSTEM_ACTIONS_INTERNAL_PATH
 const token = z.string().min(1).max(4096)
 const operationId = z.string().regex(/^[a-z][a-z0-9.-]{1,99}$/)
 const command = z.discriminatedUnion('kind', [

@@ -91,7 +91,7 @@ test('a late old-grant failure cannot discard the fresh successor grant and neve
 test('master transport fixes its endpoint and identity, rejects redirects and size limits before I/O', async () => {
   let calls = 0
   const client = makeSystemHelpMasterClient({ OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:1234/ignored', OPENCLAUDE_V3_CONTAINER_TOKEN: 'synthetic-container-proof' }, async (url, init) => {
-    calls++; assert.equal(url, 'http://127.0.0.1:1234/internal/v5/system-actions'); assert.equal(init?.redirect, 'error')
+    calls++; assert.equal(url, 'http://127.0.0.1:1234/internal/v3/system-actions'); assert.equal(init?.redirect, 'error')
     assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer synthetic-container-proof')
     return new Response(JSON.stringify({ ok: true }))
   })!

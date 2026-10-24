@@ -1,3 +1,4 @@
+import { SYSTEM_ACTIONS_INTERNAL_PATH } from '@openclaude/protocol'
 /** Logical-turn help relay: opaque bootstrap only, never a master signing key or browser approval. */
 import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdtempSync, renameSync, writeFileSync } from 'node:fs'
@@ -130,7 +131,7 @@ export function makeSystemHelpMasterClient(env: NodeJS.ProcessEnv = process.env,
   try {
     const url = new URL(base)
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return undefined
-    endpoint = new URL('/internal/v5/system-actions', url).toString()
+    endpoint = new URL(SYSTEM_ACTIONS_INTERNAL_PATH, url).toString()
   } catch { return undefined }
   return async command => {
     let body: string
