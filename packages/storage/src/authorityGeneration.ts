@@ -4,9 +4,10 @@ import { createHash, randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, open, readdir, realpath, rename, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { createAuthorityPaths, type AuthorityPaths } from './authorityPaths.js'
-import { acquireKernelFileLock } from './kernelFileLock.js'
+import { acquireAuthorityGenerationLock } from './authorityGenerationLock.js'
 import { profileSnapshot, writeUserProfileAt } from './userProfile.js'
 import type { SystemActionReceiptBinding } from './systemActions.js'
+import { parseProfileControlVersion, type ProfileControlCondition } from './profileControlVersion.js'
 
 export type AuthorityStore = Readonly<{ hostRoot: string; userId: string }>
 type FileEntry = { path: string; size: number; sha256: string }
@@ -24,6 +25,8 @@ export type AuthorityGeneration = Readonly<{
 export type GenerationFault = 'generation-durable' | 'manifest-visible' | 'manifest-durable' | 'seal-prepared' | 'seal-durable'
 /** Fixed fault names are solely a crash-test seam; no user callbacks/commands are accepted. */
 type TestFault = { faultAfter?: GenerationFault }
+/** Trusted fixed worker IPC only, never a model-supplied hook or serialized callback. */
+export type GenerationAdmission = () => Promise<void>
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const SHA = /^[0-9a-f]{64}$/
 const hash = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
@@ -144,6 +147,37 @@ export async function findProfileGenerationReceipt(store: AuthorityStore, expect
   if (!bytes(receipt.binding).equals(bytes(exact))) throw unknown()
   return receipt
 }
+/** Verify the immutable generation that produced this receipt, even after later generations changed the profile. */
+async function validateProfileReceiptCondition(store: AuthorityStore, receipt: ProfileGenerationReceipt, condition: ProfileControlCondition) {
+  const loc = await locations(store)
+  const raw = await regular(join(loc.generations, receipt.generation, 'manifest.json'), 16777216)
+  const origin = decodeManifest(raw, store.userId)
+  const originHash = hash(raw)
+  if (origin.generation !== receipt.generation || origin.parent !== condition.parentManifestSha256) throw unknown()
+  if (!(await regular(join(loc.commits, `${originHash}.json`), 1024)).equals(bytes({ version: 1, userId: store.userId, generation: origin.generation, manifestSha256: originHash }))) throw unknown()
+  const root = await verifyTree(store, origin)
+  const original = decodeReceipt(await regular(join(root, 'receipts', `${receipt.binding.id}.json`), 65536), store.userId, receipt.binding.id)
+  if (!bytes(original).equals(bytes(receipt))) throw unknown()
+  const text = await regular(join(root, 'data/user.md'), 1048576)
+  if (hash(text) !== condition.targetProfileSha256 || profileSnapshot(text.toString('utf8')).version !== receipt.result.version) throw unknown()
+  const parentSeal = await regular(join(loc.commits, `${condition.parentManifestSha256}.json`), 1024)
+  const parent = JSON.parse(parentSeal.toString('utf8')) as { generation: string }
+  if (!UUID.test(parent.generation) || !parentSeal.equals(bytes({ version: 1, userId: store.userId, generation: parent.generation, manifestSha256: condition.parentManifestSha256 }))) throw unknown()
+  const parentRaw = await regular(join(loc.generations, parent.generation, 'manifest.json'), 16777216)
+  if (hash(parentRaw) !== condition.parentManifestSha256) throw unknown()
+  const parentRoot = await verifyTree(store, decodeManifest(parentRaw, store.userId))
+  if (profileSnapshot((await regular(join(parentRoot, 'data/user.md'), 1048576)).toString('utf8')).version !== condition.baseProfileVersion) throw unknown()
+  return receipt
+}
+/** Pure positive proof requires the original frozen condition, not the current profile's value. */
+export async function findProfileControlGenerationReceipt(store: AuthorityStore, expected: SystemActionReceiptBinding, expectedVersion: string) {
+  store = snapshotStore(store)
+  const exact = binding(expected, store.userId)
+  const condition = parseProfileControlVersion(expectedVersion)
+  if (!condition || exact.operationId !== 'memory.profile.update' || exact.operationVersion !== 1) throw unknown()
+  const receipt = await findProfileGenerationReceipt(store, exact)
+  return receipt ? validateProfileReceiptCondition(store, receipt, condition) : null
+}
 async function atomicMetadata(state: string, name: string, value: Buffer, fault?: TestFault) {
   const temp = join(state, `.${name}-${randomUUID()}`)
   await writeFile(temp, value, { flag: 'wx', mode: 0o444 })
@@ -211,7 +245,7 @@ export async function initializeAuthorityGeneration(store: AuthorityStore, profi
   const loc = identity(store)
   await directory(store.hostRoot, true)
   await createDirectory(loc.root, 0o700)
-  const lock = await acquireKernelFileLock(loc.lock)
+  const lock = await acquireAuthorityGenerationLock(loc.lock)
   try {
     await createDirectory(loc.state, 0o755)
     await createDirectory(loc.generations, 0o755)
@@ -234,19 +268,22 @@ export async function initializeAuthorityGeneration(store: AuthorityStore, profi
   } finally { await lock.release() }
 }
 /** Caller must supply an approval-verified binding. No public API or executor currently calls this inert primitive. */
-export async function publishProfileGeneration(store: AuthorityStore, input: { baseManifestSha256: string; expectedVersion: string; text: string; binding: SystemActionReceiptBinding }, fault: TestFault = {}): Promise<ProfileGenerationReceipt> {
+export async function publishProfileGeneration(store: AuthorityStore, input: { baseManifestSha256: string; expectedVersion: string; text: string; binding: SystemActionReceiptBinding }, fault: TestFault = {}, admission?: GenerationAdmission): Promise<ProfileGenerationReceipt> {
   store = snapshotStore(store)
   input = { baseManifestSha256: input.baseManifestSha256, expectedVersion: input.expectedVersion, text: input.text, binding: binding(input.binding, store.userId) }
   fault = { faultAfter: fault.faultAfter }
   if (!SHA.test(input.baseManifestSha256) || !/^[a-f0-9]{16}$/.test(input.expectedVersion) || typeof input.text !== 'string' || Buffer.byteLength(input.text) > 1048576) throw unknown()
   const exact = input.binding
   const loc = await locations(store)
-  const lock = await acquireKernelFileLock(loc.lock)
+  const lock = await acquireAuthorityGenerationLock(loc.lock)
   try {
     const current = await readCurrent(store, true)
     const previous = await findProfileGenerationReceipt(store, exact)
-    if (previous) return previous
+    if (previous) return validateProfileReceiptCondition(store, previous, { parentManifestSha256: input.baseManifestSha256,
+      baseProfileVersion: input.expectedVersion, targetProfileSha256: hash(Buffer.from(input.text, 'utf8')) })
     if (current.manifestSha256 !== input.baseManifestSha256) throw new Error('Authority generation conflict')
+    if (profileSnapshot((await regular(join(current.root, 'data/user.md'), 1048576)).toString('utf8')).version !== input.expectedVersion) throw unknown()
+    await admission?.() // Stable uid flock is held, base CAS verified, and no staging/effect exists yet.
     const generation = randomUUID()
     const stage = await stageDirectory(loc, generation)
     for (const file of current.manifest.files) await writeFile(join(stage, file.path), await regular(join(current.root, file.path), file.size), { flag: 'wx', mode: 0o600 })
@@ -262,16 +299,16 @@ export async function publishProfileGeneration(store: AuthorityStore, input: { b
   } finally { await lock.release() }
 }
 /** Recovery needs a trusted host authorization for the exact pending generation; it never chooses an orphan or reapplies data. */
-export async function recoverProfileGeneration(store: AuthorityStore, permit: { manifestSha256: string; parentManifestSha256: string; binding: SystemActionReceiptBinding; profileSha256: string }) {
+async function recoverGeneration(store: AuthorityStore, permit: { manifestSha256: string | null; parentManifestSha256: string; binding: SystemActionReceiptBinding; profileSha256: string; baseProfileVersion?: string }, admission?: GenerationAdmission) {
   store = snapshotStore(store)
-  permit = { manifestSha256: permit.manifestSha256, parentManifestSha256: permit.parentManifestSha256, binding: binding(permit.binding, store.userId), profileSha256: permit.profileSha256 }
-  if (![permit.manifestSha256, permit.parentManifestSha256, permit.profileSha256].every(v => SHA.test(v))) throw unknown()
+  permit = { manifestSha256: permit.manifestSha256, parentManifestSha256: permit.parentManifestSha256, binding: binding(permit.binding, store.userId), profileSha256: permit.profileSha256, baseProfileVersion: permit.baseProfileVersion }
+  if ((permit.manifestSha256 !== null && !SHA.test(permit.manifestSha256)) || ![permit.parentManifestSha256, permit.profileSha256].every(v => SHA.test(v)) || (permit.baseProfileVersion !== undefined && !/^[a-f0-9]{16}$/.test(permit.baseProfileVersion))) throw unknown()
   const loc = await locations(store)
-  const lock = await acquireKernelFileLock(loc.lock)
+  const lock = await acquireAuthorityGenerationLock(loc.lock)
   try {
     const current = await readCurrent(store, false)
     const exact = permit.binding
-    if (current.manifestSha256 !== permit.manifestSha256 || current.manifest.parent !== permit.parentManifestSha256) throw unknown()
+    if ((permit.manifestSha256 !== null && current.manifestSha256 !== permit.manifestSha256) || current.manifest.parent !== permit.parentManifestSha256) throw unknown()
     const proofRaw = await regular(join(loc.commits, `${permit.parentManifestSha256}.json`), 1024)
     const proof = JSON.parse(proofRaw.toString('utf8')) as { generation: string }
     if (!UUID.test(proof.generation) || !proofRaw.equals(bytes({ version: 1, userId: store.userId, generation: proof.generation, manifestSha256: permit.parentManifestSha256 }))) throw unknown()
@@ -279,12 +316,14 @@ export async function recoverProfileGeneration(store: AuthorityStore, permit: { 
     if (hash(parentRaw) !== permit.parentManifestSha256) throw unknown()
     const parentManifest = decodeManifest(parentRaw, store.userId)
     const parentRoot = await verifyTree(store, parentManifest)
+    if (permit.baseProfileVersion !== undefined && profileSnapshot((await regular(join(parentRoot, 'data/user.md'), 1048576)).toString('utf8')).version !== permit.baseProfileVersion) throw unknown()
     const inherited = current.manifest.files.filter(f => f.path.startsWith('receipts/') && f.path !== `receipts/${exact.id}.json`)
     const prior = parentManifest.files.filter(f => f.path.startsWith('receipts/'))
     if (!bytes(inherited).equals(bytes(prior)) || prior.some(f => f.path === `receipts/${exact.id}.json`)) throw unknown()
     const receipt = decodeReceipt(await regular(join(current.root, 'receipts', `${exact.id}.json`), 65536), store.userId, exact.id)
     const profile = await regular(join(current.root, 'data/user.md'), 1048576)
     if (!bytes(receipt.binding).equals(bytes(exact)) || receipt.generation !== current.manifest.generation || hash(profile) !== permit.profileSha256 || profileSnapshot(profile.toString('utf8')).version !== receipt.result.version) throw unknown()
+    await admission?.() // Only durability work follows GO; never reapply mutation or activate an orphan.
     // Validate all ancestors by exact inventory; no receipt is inherited from a mutable legacy root.
     await directory(parentRoot)
     for (const file of current.manifest.files) await sync(join(current.root, file.path))
@@ -299,13 +338,27 @@ export async function recoverProfileGeneration(store: AuthorityStore, permit: { 
   } finally { await lock.release() }
 }
 
+/** Original host permit still requires the independently known exact selected manifest. */
+export async function recoverProfileGeneration(store: AuthorityStore, permit: { manifestSha256: string; parentManifestSha256: string; binding: SystemActionReceiptBinding; profileSha256: string }) {
+  return recoverGeneration(store, permit)
+}
+/** Fixed control worker: derive the candidate only from selected current.json under the same uid lock. */
+export async function recoverSelectedProfileGeneration(store: AuthorityStore, input: { binding: SystemActionReceiptBinding; expectedVersion: string }, admission: GenerationAdmission) {
+  store = snapshotStore(store)
+  const exact = binding(input.binding, store.userId)
+  const condition = parseProfileControlVersion(input.expectedVersion)
+  if (!condition || exact.operationId !== 'memory.profile.update' || exact.operationVersion !== 1 || typeof admission !== 'function') throw unknown()
+  return recoverGeneration(store, { manifestSha256: null, parentManifestSha256: condition.parentManifestSha256,
+    baseProfileVersion: condition.baseProfileVersion, profileSha256: condition.targetProfileSha256, binding: exact }, admission)
+}
+
 /** Initial baseline has no business receipt. Only an independently authorized exact baseline permit can recover it. */
 export async function recoverBaselineAuthorityGeneration(store: AuthorityStore, permit: { manifestSha256: string; profileSha256: string }) {
   store = snapshotStore(store)
   permit = { manifestSha256: permit.manifestSha256, profileSha256: permit.profileSha256 }
   if (![permit.manifestSha256, permit.profileSha256].every(v => SHA.test(v))) throw unknown()
   const loc = await locations(store)
-  const lock = await acquireKernelFileLock(loc.lock)
+  const lock = await acquireAuthorityGenerationLock(loc.lock)
   try {
     const current = await readCurrent(store, false)
     if (current.manifestSha256 !== permit.manifestSha256 || current.manifest.parent !== null || current.manifest.files.length !== 1 || current.manifest.files[0]?.path !== 'data/user.md') throw unknown()

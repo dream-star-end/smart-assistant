@@ -28,7 +28,9 @@ test('publishes profile+exact receipt together, keeps old snapshot unchanged and
   assert.equal(await readFile(next.paths.sharedUserMd, 'utf8'), 'first approved')
   assert.deepEqual(await findProfileGenerationReceipt(store, action), first)
   await publishProfileGeneration(store, { baseManifestSha256: next.manifestSha256, expectedVersion: profileSnapshot('first approved').version, text: 'second approved', binding: binding() })
-  assert.deepEqual(await publishProfileGeneration(store, { baseManifestSha256: base.manifestSha256, expectedVersion: '0'.repeat(16), text: 'must not execute', binding: action }), first)
+  // Replaying the original frozen intent remains idempotent; changed conditions cannot reuse its receipt.
+  assert.deepEqual(await publishProfileGeneration(store, { baseManifestSha256: base.manifestSha256, expectedVersion: profileSnapshot('original profile').version, text: 'first approved', binding: action }), first)
+  await assert.rejects(publishProfileGeneration(store, { baseManifestSha256: base.manifestSha256, expectedVersion: '0'.repeat(16), text: 'must not execute', binding: action }), /unknown/)
   assert.equal(await readFile((await readAuthorityGeneration(store)).paths.sharedUserMd, 'utf8'), 'second approved')
   await assert.rejects(findProfileGenerationReceipt(store, { ...action, inputHash: sha('different') }), /unknown/)
 })
