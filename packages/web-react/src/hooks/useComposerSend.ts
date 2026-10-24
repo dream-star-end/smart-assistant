@@ -230,12 +230,10 @@ export function useComposerSend({
         if (auth && agent.id === "main" && !recoveredAdvisor) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
-          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-          if (!ensured) {
-            toast("会话尚未创建成功，请检查网络后重试", "error");
-            return;
-          }
           try {
+            const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+            if (collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
             const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
             if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
             if (recoveryIsCurrent()) applyCollabDoc(doc);

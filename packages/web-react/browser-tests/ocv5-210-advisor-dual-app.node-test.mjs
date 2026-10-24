@@ -65,6 +65,7 @@ function startFixture({ defaultMode = "solo" } = {}) {
   let defaultCollab = collabDoc({ defaultMode, session: { mode: defaultMode, advisorModel: null, configVersion: `v1:${defaultMode}:`, source: "default" } });
   const inbounds = [];
   let writeStatus = 0;
+  let sessionWriteStatus = 0;
   let seq = 0;
   let retryAnchorFailsLeft = 1;
   const user = {
@@ -218,6 +219,7 @@ function startFixture({ defaultMode = "solo" } = {}) {
       return json(200, detail);
     }
     if (/^\/api\/sessions\/[^/]+$/.test(path) && method === "PUT") {
+      if (sessionWriteStatus) return json(sessionWriteStatus, { error: "fixture session unavailable" });
       const id = path.split("/").at(-1);
       const now = Date.now();
       const prev = sessions.get(id);
@@ -370,7 +372,7 @@ function startFixture({ defaultMode = "solo" } = {}) {
     });
   });
 
-  return { http, inbounds, sessions, sessionCollab, setWriteStatus: status => { writeStatus = status; } };
+  return { http, inbounds, sessions, sessionCollab, setWriteStatus: status => { writeStatus = status; }, setSessionWriteStatus: status => { sessionWriteStatus = status; } };
 }
 
 async function bootPage(context, origin, bundle) {
@@ -581,8 +583,9 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
   }
 });
 
+let collabAppBundle;
 async function buildCollabApp() {
-  return build({
+  if (!collabAppBundle) collabAppBundle = build({
     entryPoints: [fileURLToPath(new URL("./goal-start-harness.tsx", import.meta.url))],
     bundle: true, write: false, format: "iife", jsx: "automatic",
     loader: { ".css": "empty", ".svg": "dataurl", ".png": "dataurl", ".jpg": "dataurl", ".webp": "dataurl" },
@@ -600,6 +603,7 @@ async function buildCollabApp() {
       },
     }] : [],
   });
+  return collabAppBundle;
 }
 
 async function fixtureIdle(page) {
@@ -621,9 +625,8 @@ async function sendFixtureTurn(page, inbounds, text) {
 
 // Regression fixture keeps account defaults separate from each session override.
 // A single shared doc makes a missing first-send PUT look successful.
-test("team close persists solo through first send and reload", { timeout: 240_000 }, async (t) => {
+for (const entry of ["header", "picker", "goal", "github"]) test(`team close persists solo through first send and reload (${entry})`, { timeout: 120_000 }, async () => {
   const bundle = await buildCollabApp();
-  for (const entry of ["header", "picker", "goal", "github"]) await t.test(entry, async () => {
   const fixture = startFixture({ defaultMode: "team" });
   const { http, inbounds, sessionCollab } = fixture;
   await new Promise(done => http.listen(0, "127.0.0.1", done));
@@ -651,7 +654,7 @@ test("team close persists solo through first send and reload", { timeout: 240_00
         await page.getByRole("button", { name: "设置并开始", exact: true }).click();
       } else await page.getByRole("button", { name: "关联 GitHub 仓库", exact: true }).first().click();
       assert.equal((await saved).status(), 200, "materialization persists the same draft intent");
-      await page.keyboard.press("Escape");
+      if (entry === "github") await page.keyboard.press("Escape");
       await page.getByRole("dialog").waitFor({ state: "hidden" });
     }
     assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0);
@@ -679,14 +682,13 @@ test("team close persists solo through first send and reload", { timeout: 240_00
     assert.deepEqual(errors, []);
     assert.deepEqual(reopened.errors, []);
     // The user's explicit account default is independent of this session's pick.
-    const defaults = await (await fetch(origin + "/api/collaboration-config")).json();
+    const defaults = await (await fetch(`${origin}/api/collaboration-config`)).json();
     assert.equal(defaults.defaultMode, "team");
     await context.close();
   } finally {
     await browser.close();
     await new Promise(done => http.close(done));
   }
-  });
 });
 
 test("legacy device team flag cannot activate team before account config arrives", { timeout: 120_000 }, async () => {
@@ -741,7 +743,8 @@ test("closing an existing team stays solo on save failure and can persist on exp
       if (reread) await reread;
       await page.getByRole("button", { name: /切换智能体/ }).click();
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true", "a failed save or CAS reread must not reopen team");
-      assert.ok(await page.getByRole("dialog").getByText(status === 409 ? /配置已被更新/ : /fixture: collaboration save rejected/).count(), "persistence failure is visible");
+      // apiErrorMessage deliberately replaces technical English with this user-facing fallback.
+      await page.getByRole("dialog").getByText(status === 409 ? /配置已被更新/ : /协作配置保存失败/).waitFor();
       setWriteStatus(0);
       const saved = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "PUT");
       await page.getByRole("button", { name: /主模型独立完成/ }).click();
@@ -759,4 +762,39 @@ test("closing an existing team stays solo on save failure and can persist on exp
       await new Promise(done => http.close(done));
     }
   });
+});
+
+test("solo first send stays queued when session creation fails and reconnect sends it once", { timeout: 120_000 }, async () => {
+  const bundle = await buildCollabApp();
+  const { http, inbounds, setSessionWriteStatus } = startFixture({ defaultMode: "team" });
+  await new Promise(done => http.listen(0, "127.0.0.1", done));
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    await context.addInitScript(() => { window.__realWebSocket = window.WebSocket; window.WebSocket = undefined; });
+    const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
+    await page.getByRole("button", { name: "团队模式已开启", exact: true }).click();
+    await page.getByRole("button", { name: "关闭团队模式", exact: true }).click();
+    setSessionWriteStatus(503);
+    const text = "session建行失败也必须保留我的首条消息";
+    await page.getByPlaceholder(/和「全能助手」对话/).fill(text);
+    await clickSend(page);
+    await page.getByTestId("queued-send-row").filter({ hasText: text }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0);
+    assert.equal(inbounds.length, 0, "offline queue must not pretend the turn reached a server");
+    setSessionWriteStatus(0);
+    await page.evaluate(() => { window.WebSocket = window.__realWebSocket; window.dispatchEvent(new Event("online")); });
+    const frame = await waitUntil(() => inbounds.find(f => f.content?.text === text), 20_000, "queued turn did not flush on reconnect");
+    assert.equal(frame.collabMode, "solo");
+    assert.equal(frame.teamMode, undefined);
+    await fixtureIdle(page);
+    await page.getByTestId("message-text").filter({ hasText: text }).waitFor();
+    assert.equal(inbounds.filter(f => f.content?.text === text).length, 1);
+    assert.equal(await page.getByTestId("queued-send-row").count(), 0);
+    assert.deepEqual(errors, []);
+    await context.close();
+  } finally {
+    await browser.close();
+    await new Promise(done => http.close(done));
+  }
 });
