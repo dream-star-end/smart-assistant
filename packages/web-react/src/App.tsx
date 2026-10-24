@@ -235,6 +235,7 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
 const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
@@ -2294,6 +2295,9 @@ export function App() {
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
+        {!demo && auth && authRecoveryAvailable && <LazyBoundary fallback={null}>
+          <IdentityRecoveryNotice onRetry={retryBoot} />
+        </LazyBoundary>}
 
         {!demo && repo.showBanner && repo.selection?.selected && (
           <RepoStatusBanner

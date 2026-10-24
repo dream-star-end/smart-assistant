@@ -86,20 +86,59 @@ it('a stale /me cannot overwrite a subsequent login and a same-user fresh login 
   expect(view.result.current.resolvedIdentity).toBeNull()
   expect(identityIsCurrent(current, view.result.current.authRef.current)).toBe(false)
 })
-it('failed /me leaves callbacks unresolved without a retry loop or clearing the displayed login', async () => {
+it('generation revalidation retries transient failures twice, then offers an explicit recovery without losing login', async () => {
   const fetcher = vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
     ? reply({ access_token: 'alice-a', user: wireUser('alice') })
     : String(url) === '/api/me' ? reply({ error: { code: 'INTERNAL', message: 'fixture' } }, 503) : reply({ accepted: true }))
   vi.stubGlobal('fetch', fetcher)
-  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: () => {} }))
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: vi.fn() }))
   await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
   act(() => { view.result.current.authRef.current.commitToken(1, 'alice-b') })
-  await waitFor(() => expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1))
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  await waitFor(() => expect(view.result.current.authRecoveryAvailable).toBe(true))
   view.rerender()
   expect(view.result.current.authed).toBe(true)
   expect(view.result.current.user?.id).toBe('alice')
   expect(view.result.current.resolvedIdentity).toBeNull()
-  expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1)
+  expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(2)
+  expect(clearAuthHint).not.toHaveBeenCalled()
+  fetcher.mockImplementation(async url => String(url) === '/api/auth/refresh'
+    ? reply({ access_token: 'alice-b', access_exp: 9999999999, remember: false })
+    : reply({ user: wireUser('alice') }))
+  act(() => { view.result.current.retryBoot() })
+  await waitFor(() => expect(identityIsCurrent(view.result.current.resolvedIdentity, view.result.current.authRef.current, 'alice')).toBe(true))
+  expect(view.result.current.authRecoveryAvailable).toBe(false)
+  expect(clearAuthHint).not.toHaveBeenCalled()
+})
+it('a transient generation check recovers automatically on its bounded second read', async () => {
+  let reads = 0
+  vi.stubGlobal('fetch', vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
+    ? reply({ access_token: 'alice-a', user: wireUser('alice') })
+    : String(url) === '/api/me' ? ++reads === 1 ? reply({}, 503) : reply({ user: wireUser('alice') }) : reply({ accepted: true })))
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: vi.fn() }))
+  await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
+  act(() => { view.result.current.authRef.current.commitToken(1, 'alice-b') })
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  await waitFor(() => expect(identityIsCurrent(view.result.current.resolvedIdentity, view.result.current.authRef.current, 'alice')).toBe(true))
+  expect(reads).toBe(2)
+})
+it('401 reads that rotate tokens cannot turn generation revalidation into an unbounded refresh loop', async () => {
+  let refreshes = 0
+  const fetcher = vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
+    ? reply({ access_token: 'alice-a', user: wireUser('alice') })
+    : String(url) === '/api/auth/refresh' ? reply({ access_token: `alice-refresh-${++refreshes}`, access_exp: 9999999999, remember: false })
+    : String(url) === '/api/me' ? reply({}, 401) : reply({ accepted: true }))
+  vi.stubGlobal('fetch', fetcher)
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: vi.fn() }))
+  await act(async () => { await view.result.current.login('fixture', 'fixture', 'fixture') })
+  act(() => { view.result.current.authRef.current.commitToken(1, 'alice-b') })
+  await waitFor(() => expect(view.result.current.authRecoveryAvailable).toBe(true))
+  view.rerender()
+  expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(4)
+  expect(refreshes).toBe(2)
+  expect(view.result.current.authed).toBe(true)
+  expect(view.result.current.resolvedIdentity).toBeNull()
+  expect(clearAuthHint).not.toHaveBeenCalled()
 })
 it('verified balance updates preserve the capability; the display setter revokes it synchronously', async () => {
   vi.stubGlobal('fetch', vi.fn(async (url: RequestInfo | URL) => String(url) === '/api/auth/login'
