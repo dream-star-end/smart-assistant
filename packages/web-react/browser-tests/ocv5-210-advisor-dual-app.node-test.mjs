@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote,fixtureExecutionModel} from "./model-switch-cost-fixture.mjs";
 /**
  * Real App + two browser contexts against a shared loopback HTTP/WS fixture.
  * Proves collab select/refresh, cross-end preference change, frozen original
@@ -247,6 +248,12 @@ function startFixture({ defaultMode = "solo" } = {}) {
         row.messageCount = Math.max(row.messageCount, 1);
       }
       return json(200, { ok: true, updatedAt: Date.now() });
+    }
+    if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+      const sid=decodeURIComponent(path.split('/')[4]);
+      const executed=[...inbounds].reverse().find(frame=>frame.peer?.id===sid);
+      const row=sessions.get(sid);
+      return json(200,fixtureSwitchQuote(data,{empty:!executed&&!row?.messageCount,sourceModel:fixtureExecutionModel(executed)??row?.modelId??'glm-5.2'}));
     }
     if (path.startsWith("/api/")) return json(200, { ok: true });
     json(404, { error: "not found" });
@@ -792,6 +799,75 @@ test("solo first send stays queued when session creation fails and reconnect sen
     assert.equal(inbounds.filter(f => f.content?.text === text).length, 1);
     assert.equal(await page.getByTestId("queued-send-row").count(), 0);
     assert.deepEqual(errors, []);
+    await context.close();
+  } finally {
+    await browser.close();
+    await new Promise(done => http.close(done));
+  }
+});
+
+test("first-send cost confirmation keeps the draft and commits solo only after acceptance", { timeout: 120_000 }, async () => {
+  const bundle = await buildCollabApp();
+  const { http, inbounds, sessionCollab } = startFixture({ defaultMode: "team" });
+  await new Promise(done => http.listen(0, "127.0.0.1", done));
+  const origin = `http://127.0.0.1:${http.address().port}`;
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    const { page, errors } = await bootPage(context, origin, bundle.outputFiles[0].text);
+    const quotes = [];
+    const approvedQuotes = new Set();
+    await page.route("**/api/me/sessions/*/model-switch-estimate", async route => {
+      const input = route.request().postDataJSON();
+      quotes.push(input);
+      const scope = JSON.stringify([input.sessionId, input.requestId, input.targetModel,
+        input.agentId, input.teamMode === true, input.text, input.mediaCount]);
+      if (input.quoteToken === "fixture-quote-615") approvedQuotes.add(scope);
+      // The real socket revalidates the acknowledged receipt before dispatch.
+      const confirmed = approvedQuotes.has(scope) &&
+        (input.quoteToken === "fixture-quote-615" || input.consent === "fixture-consent-615");
+      const quote = { ...fixtureSwitchQuote(input, { empty: false, sourceModel: "gpt-6-luna" }),
+        requiresConfirmation: !confirmed,
+        ...(confirmed ? { consent: "fixture-consent-615" } : { quoteToken: "fixture-quote-615" }),
+      };
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(quote) });
+    });
+    await page.getByRole("button", { name: "团队模式已开启", exact: true }).click();
+    await page.getByRole("button", { name: "关闭团队模式", exact: true }).click();
+    const text = "先确认首轮费用，再按我关闭后的单人模式发送";
+    await page.getByPlaceholder(/和「全能助手」对话/).fill(text);
+    await clickSend(page);
+    const confirm = page.getByRole("dialog");
+    await confirm.getByRole("button", { name: "确认切换", exact: true }).waitFor();
+    assert.equal(await confirm.count(), 1);
+    await confirm.getByRole("button", { name: "取消", exact: true }).click();
+    await confirm.waitFor({ state: "hidden" });
+    assert.equal(inbounds.length, 0, "cancelled cost consent must not send");
+    assert.equal(await page.getByTestId("queued-send-row").count(), 0);
+    assert.equal(await page.getByPlaceholder(/和「全能助手」对话/).inputValue(), text);
+    assert.equal(new URL(page.url()).pathname, "/", "cancelled consent must not promote the draft");
+    const cancelledRequestId = quotes[0].requestId;
+    await clickSend(page);
+    await confirm.getByRole("button", { name: "确认切换", exact: true }).click();
+    await confirm.waitFor({ state: "hidden" });
+    const frame = await waitUntil(() => inbounds.find(f => f.content?.text === text), 20_000, "confirmed cost consent did not send");
+    await fixtureIdle(page);
+    const accepted = quotes.find(q => q.quoteToken === "fixture-quote-615");
+    assert.ok(accepted, "the authoritative confirmation endpoint was called");
+    assert.notEqual(accepted.requestId, cancelledRequestId);
+    assert.equal(frame.clientMessageId, accepted.requestId);
+    assert.equal(frame.modelSwitchConsent, "fixture-consent-615");
+    assert.equal(frame.collabMode, "solo");
+    assert.equal(frame.teamMode, undefined);
+    assert.equal(inbounds.filter(f => f.content?.text === text).length, 1);
+    assert.equal(sessionCollab.get(frame.peer.id)?.session.mode, "solo");
+    await page.close();
+    const reopened = await bootPage(context, origin, bundle.outputFiles[0].text);
+    await reopened.page.getByRole("button", { name: new RegExp(text) }).click();
+    await reopened.page.getByRole("button", { name: /切换智能体/ }).click();
+    assert.equal(await reopened.page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
+    assert.deepEqual(errors, []);
+    assert.deepEqual(reopened.errors, []);
     await context.close();
   } finally {
     await browser.close();

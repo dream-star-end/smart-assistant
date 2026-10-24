@@ -1,3 +1,7 @@
+import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
+import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
+export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
+import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
 import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
@@ -385,6 +389,7 @@ export interface PromptQueueDispatchRequest {
       agentId: string;
       model?: string;
       modelSwitchId?: string;
+      modelSwitchConsent?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
       collabMode?: "solo" | "advisor" | "team";
@@ -465,10 +470,11 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "modelSwitchConsent", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
+  if (execution.modelSwitchConsent !== undefined && (typeof execution.modelSwitchConsent !== 'string' || execution.modelSwitchConsent.length>4096)) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
   if (
@@ -551,36 +557,7 @@ function samePromptQueueDispatch(
     control.claimToken === request.claim.claimToken;
 }
 
-function promptQueueDispositionForCode(
-  code: string,
-): "retryable" | "user_action_required" {
-  return /^(?:ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
-    ? "user_action_required"
-    : "retryable";
-}
 
-/** OCV5-391: what a refused scheduler replay does with its recovery job. A refusal the user has
- * to act on (retired or unauthorized model, credits, agent, invalid input) never succeeds by
- * waiting, so the job stops; anything else waits for the next attempt. */
-export function _recoveryRefusalAction(code: string): "pause" | "requeue" {
-  return promptQueueDispositionForCode(code) === "user_action_required" ? "pause" : "requeue";
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
-  const allow = new Set(allowed);
-  return Object.keys(value).every((key) => allow.has(key));
-}
-
-export function shouldRejectCodexTurnForG7(
-  hasActiveTurn: boolean,
-  isPromptQueueDispatch: boolean,
-): boolean {
-  return hasActiveTurn && !isPromptQueueDispatch;
-}
 
 /** 单方向 buffer 上限。超出 = 慢消费者 / 死循环 → close。 */
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
@@ -972,6 +949,7 @@ async function resolveTurnExecution(
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
+  modelSwitchCost?: ModelSwitchCostService;
   jwtSecret: string | Uint8Array;
   /** Dedicated read/prepare help only; never a model lease or approval credential. */
   issueSystemHelpBootstrap?: (scope: SystemHelpIdentityScope) => { token: string; expiresAt: number };
@@ -1745,6 +1723,7 @@ export async function lookupCronOriginSessionModel(
 export async function executeCronOriginInject(opts: {
   input: CronOriginInjectInput
   pgPool?: UserChatBridgeDeps["pgPool"]
+  modelSwitchCost?: ModelSwitchCostService;
   lookupSessionModel?: (
     sessionId: string,
     sessionUserId: string,
@@ -1757,7 +1736,7 @@ export async function executeCronOriginInject(opts: {
   executor?: CronOriginExecutor
   log?: Logger
 }): Promise<CronOriginInjectResult> {
-  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log } = opts;
+  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log, modelSwitchCost } = opts;
   if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
     return { kind: "failed", reason: "invalid_payload" };
   }
@@ -1780,6 +1759,11 @@ export async function executeCronOriginInject(opts: {
       sessionId: input.sessionId,
       err,
     });
+  }
+  if(modelSwitchCost && originModel){
+    try {await modelSwitchCost.assertAuthorized(input.uid.toString(),{sessionId:input.sessionId,requestId:input.clientMessageId,
+      targetModel:originModel,agentId:input.agentId||'main',text:input.text});}
+    catch(error){return {kind:'failed',reason:error instanceof ModelSwitchCostError?error.code:'MODEL_SWITCH_UNAVAILABLE'};}
   }
   const message = {
     id: input.clientMessageId,
@@ -4252,6 +4236,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       historyModel: string | null = typeof frameObj.model === "string" ? frameObj.model : null,
       recoveryJob?: ClaimedRecoveryJob,
       pretrackedEnrichment?: EnrichmentDispatchState,
+      temporaryImageFeature = false,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -4279,6 +4264,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : "",
         replyTo,
       );
+      const costRefusal = await checkModelSwitchFrame(deps.modelSwitchCost, uid.toString(), frameObj,
+        {sessionId:peerId,requestId:clientMessageId,targetModel:historyModel,text:currentUserText,temporaryImageFeature});
+      if (costRefusal) {
+        if (pretrackedEnrichment) terminalizeEnrichmentDispatch(pretrackedEnrichment,costRefusal.code);
+        onReject?.(costRefusal.code);
+        sendErrorFrame(userWs,costRefusal.code,costRefusal.message,{peerId,clientMessageId:clientMessageId??undefined,retryable:false,action:'retry'});
+        return null;
+      }
       const sendAdmissionAck = (): void => {
         if (clientMessageId === null) return;
         const idempotencyKey = typeof frameObj.idempotencyKey === "string"
@@ -4579,6 +4572,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(typeof frameObj.model === "string" && frameObj.model !== ""
             ? { model: frameObj.model }
             : {}),
+          ...(typeof frameObj.modelSwitchConsent === 'string' ? {modelSwitchConsent:frameObj.modelSwitchConsent} : {}),
           ...(typeof frameObj.modelSwitchId === "string"
             ? { modelSwitchId: frameObj.modelSwitchId }
             : {}),
@@ -6805,6 +6799,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityModelCapture,
               recoveryJob,
               pretrackedEnrichment,
+              true, // validated fixed-price image feature, not an ordinary model switch
             );
             // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
@@ -8607,6 +8602,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             content: request.item.content,
             ...(execution.model !== undefined ? { model: execution.model } : {}),
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
+            ...(execution.modelSwitchConsent !== undefined ? { modelSwitchConsent: execution.modelSwitchConsent } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.serviceTier !== undefined ? { serviceTier: execution.serviceTier } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
@@ -10650,6 +10646,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const executors = uidToCronOriginExecutors.get(input.uid.toString());
     if (!executors || executors.size === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
     return executeCronOriginInject({
+      modelSwitchCost:deps.modelSwitchCost,
       input,
       pgPool: deps.pgPool,
       admitUserTurn: deps.admitUserTurn,

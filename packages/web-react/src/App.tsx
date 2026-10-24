@@ -1,3 +1,5 @@
+import {useModelSwitchCost} from './hooks/useModelSwitchCost';
+import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
@@ -24,7 +26,6 @@ import {
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
-import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
@@ -238,6 +239,7 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const DesktopEnrollPage = lazy(() => import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const TutorialCenter = lazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
@@ -897,6 +899,10 @@ export function App() {
     setPaneSheetOpen(false);
   }, [activeId, boardOpen, projectHome]);
 
+  const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
+  const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
+  const getSwitchOptions=useCallback(()=>switchOptionsRef.current,[]);
+
   const {
     applyCollabDoc,
     collabAsDefault,
@@ -916,6 +922,8 @@ export function App() {
     teamMode,
   } = useSessionModelAndCollab({
     activeId,
+    authorizeSwitch,
+    getSwitchOptions,
     agent,
     auth,
     confirmDialog,
@@ -939,6 +947,7 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+  switchOptionsRef.current={teamMode:agent.id==='main'&&teamMode,contextTier,...(serviceTier==='fast'?{serviceTier}: {})};
 
   const { draftSessionId, stopPreparing } = useDraftPreparation({
     auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
@@ -961,6 +970,7 @@ export function App() {
     uploadMedia,
   } = useComposerSend({
     activeId,
+    authorizeSwitch,
     agent,
     applyCollabDoc,
     auth,
@@ -1115,6 +1125,7 @@ export function App() {
   // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
   const chat = useChatSocket({
     auth,
+    authorizeSwitch,
     ready: gate.ready,
     // cohort lane 就绪（P3 RFC D1）：与 gate.ready 正交的 WS 连接前置，防首连落错 slot。
     laneReady,
@@ -1866,7 +1877,7 @@ export function App() {
   }
 
   if (desktopEnroll && auth) {
-    return <DesktopEnrollPage auth={auth} />;
+    return <LazyBoundary fallback={<SplashFallback />}><DesktopEnrollPage auth={auth} /></LazyBoundary>;
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;

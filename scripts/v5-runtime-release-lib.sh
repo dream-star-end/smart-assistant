@@ -445,7 +445,7 @@ oc_hotcfg_install_deps_in_image() {
 # (node_modules 只活在临时目录,构建后即删),ccb 运行物只有自足的 dist/cli.js(§3.1)。
 # 临时目录取 staging 的兄弟目录(同文件系统,空间充足;避免 /tmp tmpfs 撑爆),函数退出前必删。
 oc_hotcfg_build_ccb_dist() {
-  local staging="$1" prev="${2:-}" bun ver ccb_build src_rows src_key
+  local staging="$1" prev="${2:-}" bun ver ccb_build ccb_work src_rows src_key shared_file shared_rows=""
   bun="$OC_BUN_BIN"
   [ -n "$bun" ] || { if [ -x "$HOME/.bun/bin/bun" ]; then bun="$HOME/.bun/bin/bun"; else bun="$(command -v bun || true)"; fi; }
   [ -n "$bun" ] && [ -x "$bun" ] || { oc_hotcfg__die "build_ccb_dist: 找不到 host bun(~/.bun/bin/bun 或 PATH)"; return 1; }
@@ -454,11 +454,19 @@ oc_hotcfg_build_ccb_dist() {
   # ── ccb dist 内容寻址缓存(2026-07-12 首启实证):bun build **不可复现**(同源同目录重建
   # bytes 都不同,内嵌时间戳类噪声)→ 若每次 deploy 都重建,release digest 恒变 = "只改
   # master/前端 → 零容器 churn"承诺失效(全量用户容器每次 deploy 被滚动)。
-  # 根治:key = digest(ccb 源子树 rows) + bun 版本;命中上一 release 的 MANIFEST.ccbDistKey
+  # key 含 CCB 子树、同一 staging 的共享锁源码、布局版本和 bun 版本;命中上一 release 的 MANIFEST.ccbDistKey
   # → **cp -a 真拷贝**其 dist(几 MB,不用硬链,零跨 release inode 共享)跳过 bun build。
   # 源变/bun 升版 → key 变 → 重建(容器滚动,正确)。
   src_rows="$(oc_hotcfg__file_rows "$staging/claude-code-best")" || return 1
-  src_key="$(printf '%s\0%s' "$(printf '%s\n' "$src_rows" | oc_hotcfg__digest_from_rows all)" "$ver" | sha256sum | cut -c1-12)"
+  # CCB 的相对重导出也是构建输入；只改共享实现时必须使旧 dist 缓存失效。
+  shared_file="$staging/packages/storage/src/sessionFileIo.ts"
+  if [ -e "$shared_file" ] || [ -L "$shared_file" ]; then
+    [ -f "$shared_file" ] && [ ! -L "$shared_file" ] \
+      || { oc_hotcfg__die "build_ccb_dist: 共享锁输入必须是 staging 内普通文件"; return 1; }
+    shared_rows="$(printf 'packages/storage/src/sessionFileIo.ts\t%s\t%s\t%s' \
+      "$(sha256sum "$shared_file" | cut -d' ' -f1)" "$(stat -c %s "$shared_file")" "$(stat -c %a "$shared_file")")"
+  fi
+  src_key="$(printf '%s\0%s\0%s\0%s' 'ccb-repo-layout-v1' "$(printf '%s\n' "$src_rows" | oc_hotcfg__digest_from_rows all)" "$shared_rows" "$ver" | sha256sum | cut -c1-12)"
   if [ -n "$prev" ] && [ -f "$prev/MANIFEST.json" ] && [ -d "$prev/claude-code-best/dist" ] \
      && [ "$(jq -r '.ccbDistKey // empty' "$prev/MANIFEST.json")" = "$src_key" ]; then
     oc_hotcfg__log "ccbDistKey 命中上一 release → cp -a 复用 dist(跳过 bun build,digest 幂等)"
@@ -470,18 +478,23 @@ oc_hotcfg_build_ccb_dist() {
   fi
   ccb_build="$(dirname "$staging")/.ccbbuild-$$.$RANDOM"
   rm -rf "$ccb_build"
-  # 拷 ccb 源到独立临时目录(不含 staging 的 node_modules —— B6 后 staging 本就无 ccb node_modules;防御性再清一遍)
-  cp -a "$staging/claude-code-best" "$ccb_build" \
+  # 保留仓库相对路径；共享源码只从本次 pinned staging 真拷贝，不读取其它树。
+  ccb_work="$ccb_build/claude-code-best"
+  mkdir -p "$ccb_build" && cp -a "$staging/claude-code-best" "$ccb_work" \
     || { oc_hotcfg__die "build_ccb_dist: cp ccb 源到临时目录失败"; rm -rf "$ccb_build"; return 1; }
-  rm -rf "$ccb_build/node_modules"
+  if [ -n "$shared_rows" ]; then
+    mkdir -p "$ccb_build/packages/storage/src" && cp -a "$shared_file" "$ccb_build/packages/storage/src/sessionFileIo.ts" \
+      || { oc_hotcfg__die "build_ccb_dist: cp 共享锁输入失败"; rm -rf "$ccb_build"; return 1; }
+  fi
+  rm -rf "$ccb_work/node_modules"
   # PATH 前置 bun 所在目录:`bun run build` 会经 shell 执行 package.json 的
   # "build": "bun run build.ts",嵌套调用按**名字**找 bun —— 非交互 ssh 的 PATH 不含
   # ~/.bun/bin(playbook §4.3 已知坑),只用绝对路径调外层不够(2026-07-12 首启实测
   # bash: bun: command not found exit 127)。
-  if ! ( cd "$ccb_build" && PATH="$(dirname "$bun"):$PATH" "$bun" install --ignore-scripts && PATH="$(dirname "$bun"):$PATH" "$bun" run build ) >&2; then
+  if ! ( cd "$ccb_work" && PATH="$(dirname "$bun"):$PATH" "$bun" install --ignore-scripts && PATH="$(dirname "$bun"):$PATH" "$bun" run build ) >&2; then
     oc_hotcfg__die "ccb bun install/build 失败"; rm -rf "$ccb_build"; return 1
   fi
-  [ -f "$ccb_build/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; rm -rf "$ccb_build"; return 1; }
+  [ -f "$ccb_work/dist/cli.js" ] || { oc_hotcfg__die "ccb dist/cli.js 未产出"; rm -rf "$ccb_build"; return 1; }
   # ── `await using` 泄漏门(2026-05-22 事故机制化)────────────────────────────
   # build.ts pin 了 target='node',让 Bun 把 Stage-3 Explicit Resource Management
   # (`using` / `await using`)降级成 ES2022 try/finally。若该 pin 被上游合并覆盖回
@@ -493,13 +506,13 @@ oc_hotcfg_build_ccb_dist() {
   # `--include='*.js'` 是必须的:source map(*.js.map)内嵌**原始**源码文本,里面
   # 本来就有 `await using`,扫进去会 100% 误报把部署门钉死(2026-07-26 实测踩到)。
   # 只有真正被 node 执行的 .js 才算。
-  if grep -rlE --include='*.js' '(^|[^A-Za-z0-9_$])await[[:space:]]+using[[:space:]]' "$ccb_build/dist" >/dev/null 2>&1; then
+  if grep -rlE --include='*.js' '(^|[^A-Za-z0-9_$])await[[:space:]]+using[[:space:]]' "$ccb_work/dist" >/dev/null 2>&1; then
     oc_hotcfg__die "ccb dist 残留 \`await using\`(容器 Node 22 会 SyntaxError):检查 claude-code-best/build.ts 的 target='node' 是否被改动"
     rm -rf "$ccb_build"; return 1
   fi
   # 只把 dist/ 拷回 staging(staging/claude-code-best 因此只含源 + dist,无 node_modules)
   rm -rf "$staging/claude-code-best/dist"
-  cp -a "$ccb_build/dist" "$staging/claude-code-best/dist" \
+  cp -a "$ccb_work/dist" "$staging/claude-code-best/dist" \
     || { oc_hotcfg__die "build_ccb_dist: dist 拷回 staging 失败"; rm -rf "$ccb_build"; return 1; }
   rm -rf "$ccb_build"
   printf '%s\t%s\n' "$ver" "$src_key"

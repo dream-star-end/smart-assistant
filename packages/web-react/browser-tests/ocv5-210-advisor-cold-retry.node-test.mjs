@@ -1,3 +1,4 @@
+import {fixtureSwitchQuote,fixtureExecutionModel} from "./model-switch-cost-fixture.mjs";
 /**
  * Cold-start precise retry of the original failed advisor turn.
  * Loopback HTTP/WS is not a live model or ledger. Fixture serves the current
@@ -343,6 +344,12 @@ function startFixture(opts = {}) {
         row.updatedAt = row.lastAt;
       }
       return json(200, { ok: true, updatedAt: Date.now() });
+    }
+    if(method==='POST'&&/^\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(path)){
+      const sid=decodeURIComponent(path.split('/')[4]);
+      const executed=[...inbounds].reverse().find(frame=>frame.peer?.id===sid);
+      const row=sessions.get(sid);
+      return json(200,fixtureSwitchQuote(data,{empty:!executed&&!row?.messageCount,sourceModel:fixtureExecutionModel(executed)??row?.modelId??'glm-5.2'}));
     }
     if (path.startsWith("/api/")) return json(200, { ok: true });
     json(404, { error: "not found" });

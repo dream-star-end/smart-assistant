@@ -126,6 +126,7 @@ import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 
 export interface CommercialHttpDeps {
+  modelSwitchCost?: import('../billing/modelSwitchCost.js').ModelSwitchCostService;
   /** Master-private system actions; absent until explicit composition has initialized the ledger. */
   systemActionsHttp?: (req: IncomingMessage, res: ServerResponse) => Promise<void>
   resolvePromptPrivacySupport?: (userId: string) => Promise<PromptPrivacySupport>;

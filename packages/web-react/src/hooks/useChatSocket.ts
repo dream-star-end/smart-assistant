@@ -1,3 +1,4 @@
+import type {AuthorizeSwitch,SwitchAuthorization} from './useModelSwitchCost';
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { ApiError, api } from "../lib/api";
@@ -86,6 +87,7 @@ export type UseChatSocket = {
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
+    switchAuthorization?:SwitchAuthorization;
     sessId: string;
     agentId: string;
     text: string;
@@ -101,7 +103,7 @@ export type UseChatSocket = {
     collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
     serviceTier?: InboundMessage["serviceTier"];
-  }) => void;
+  }) => unknown;
   stop: (sessId: string) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   retryMessage: (p: {
@@ -275,6 +277,7 @@ function userPayloadCacheKey(
 }
 
 export function useChatSocket(opts: {
+  authorizeSwitch?:AuthorizeSwitch;
   auth: AuthSession | null;
   /** gate.ready：容器 running —— WS 连接硬前置。*/
   ready: boolean;
@@ -324,6 +327,8 @@ export function useChatSocket(opts: {
   onRepoBindErrorRef.current = opts.onRepoBindError;
   const onMediaJobRef = useRef(opts.onMediaJob);
   onMediaJobRef.current = opts.onMediaJob;
+  const authorizeSwitchRef=useRef(opts.authorizeSwitch);
+  authorizeSwitchRef.current=opts.authorizeSwitch;
   const queueModelPatchRef = useRef(opts.queueModelPatch);
   queueModelPatchRef.current = opts.queueModelPatch;
   const permissionLookupAtRef = useRef(new Map<string, number>());
@@ -342,6 +347,7 @@ export function useChatSocket(opts: {
   const socketRef = useRef<ChatSocket | null>(null);
   if (!socketRef.current) {
     socketRef.current = new ChatSocket({
+      authorizeSwitch:(input,opts)=>authorizeSwitchRef.current?authorizeSwitchRef.current(input,opts):Promise.resolve({requestId:input.requestId,choice:true}),
       getToken: () => authRef.current?.snapshot().token ?? "",
       getAuthEpoch: () => authRef.current?.snapshot().epoch ?? -1,
       silentRefresh: async (expectedEpoch) => {
