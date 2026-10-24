@@ -1,8 +1,9 @@
+import { createMemoryAuthSession } from '../../../lib/authSession'
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../../lib/api'
-import type { AuthSession, CommunityTutorialMine, CommunityTutorialSummary } from '../../../lib/types'
+import type { CommunityTutorialMine, CommunityTutorialSummary } from '../../../lib/types'
 import { prefetchMarkdownImpl } from '../../Markdown'
 import { loadBeforeAll } from '../../../test/moduleLoad'
 import { CommunityBlog } from './CommunityBlog'
@@ -24,12 +25,8 @@ const post = (id: string, extra: Partial<CommunityTutorialSummary> = {}): Commun
   ...extra,
 })
 
-const auth = {
-  snapshot: () => ({ token: 'token', epoch: 1 }),
-  beginIdentity: () => 1,
-  commitToken: () => true,
-  expire: () => true,
-} as AuthSession
+const auth = createMemoryAuthSession(() => {})
+auth.commitToken(auth.beginIdentity(), 'token')
 
 const mine = (extra: Partial<CommunityTutorialMine>): CommunityTutorialMine => ({
   id: '21',

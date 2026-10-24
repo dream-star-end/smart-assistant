@@ -848,10 +848,12 @@ export function ProgressiveMarkdown({
   text,
   live = false,
   caret = false,
+  readOnly = false,
 }: {
   text: string;
   live?: boolean;
   caret?: boolean;
+  readOnly?: boolean;
 }) {
   const [visibleChars, setVisibleChars] = useState(LONG_MARKDOWN_STEP);
   // OCV5-421: 这条正文出生时在流式 → 一直按顶层块分段渲染(结构从挂载起不变,生成结束也不重挂)。
@@ -881,7 +883,7 @@ export function ProgressiveMarkdown({
           return (
             // 流式中的尾段不做无语言代码块的语言探测(同步跑全部语法,随长度平方增长);块一写完
             // 就进前段,按原规则高亮。
-            <Markdown key={key} bare signMedia live={live} caret={tail && caret && !hasLiveGap}
+            <Markdown readOnly={readOnly} key={key} bare signMedia live={live} caret={tail && caret && !hasLiveGap}
               autoDetectCode={!(live && tail)}>
               {chunk}
             </Markdown>
@@ -891,7 +893,7 @@ export function ProgressiveMarkdown({
     );
   } else {
     primaryView = (
-      <Markdown signMedia live={live} caret={caret && !hasLiveGap}>
+      <Markdown readOnly={readOnly} signMedia live={live} caret={caret && !hasLiveGap}>
         {primary}
       </Markdown>
     );
@@ -911,7 +913,7 @@ export function ProgressiveMarkdown({
         </button>
       )}
       {hasLiveGap && (
-        <Markdown signMedia live caret={caret}>
+        <Markdown readOnly={readOnly} signMedia live caret={caret}>
           {text.slice(liveTailStart)}
         </Markdown>
       )}
@@ -1112,12 +1114,12 @@ export function AssistantCard({
         {msg.text && !hasError && !isSyntheticEmptyNotice ? (
           <OptionsGroupProvider live={live}>
             {/* 流式光标由 Markdown(caret)内联注入到最后一个文本块末尾,不再落在正文下一行。 */}
-            <ProgressiveMarkdown text={msg.text} live={live} caret={live} />
+            <ProgressiveMarkdown text={msg.text} live={live} caret={live} readOnly={readOnly} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : hasError && presentedError?.bodyText ? (
           <OptionsGroupProvider>
-            <ProgressiveMarkdown text={presentedError.bodyText} />
+            <ProgressiveMarkdown text={presentedError.bodyText} readOnly={readOnly} />
             <OptionsGroupFooter />
           </OptionsGroupProvider>
         ) : live && !hasError && !ctx.activityInFooter ? (
