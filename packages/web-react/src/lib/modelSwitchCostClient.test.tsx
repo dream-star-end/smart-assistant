@@ -79,3 +79,27 @@ test('navigation preserves a submitted cheap task but never opens its fee prompt
     vi.restoreAllMocks()
   }
 })
+
+test('known insufficient balance does not silently authorize a low-cost switch', async () => {
+  const input = {
+    sessionId: 'own',
+    requestId: 'm-small-insufficient',
+    targetModel: 'gpt-6-astra',
+    agentId: 'main',
+  }
+  vi.spyOn(api, 'modelSwitchCost').mockResolvedValue({
+    ...fixtureSwitchQuote(input),
+    balanceCredits: '1',
+    canConfirm: false,
+  })
+  const confirmDialog = vi.fn()
+  const toast = vi.fn()
+  const authorize = createModelSwitchCostAuthorizer({
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
+    confirmDialog,
+    toast,
+  })
+  expect(await authorize(input, { allowOfflineQueue: true })).toBeNull()
+  expect(confirmDialog).not.toHaveBeenCalled()
+  expect(toast).toHaveBeenCalled()
+})

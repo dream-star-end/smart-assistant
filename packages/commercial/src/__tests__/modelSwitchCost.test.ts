@@ -336,3 +336,16 @@ test('same model with a different expensive agent is not a same-route exemption'
   assert.equal(quote.requiresConfirmation, true)
   assert.equal(quote.mode, 'estimate')
 })
+
+test('known insufficient funds block even a switch below the expensive-warning threshold', async () => {
+  const f = fixture()
+  f.context.tokens = 5000
+  f.setBalance(1n)
+  const quote = await f.service.quote('765', f.request)
+  assert.equal(quote.requiresConfirmation, false)
+  assert.equal(quote.canConfirm, false)
+  await assert.rejects(
+    f.service.assertAuthorized('765', f.request),
+    (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+  )
+})

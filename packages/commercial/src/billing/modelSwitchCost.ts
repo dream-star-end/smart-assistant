@@ -318,7 +318,7 @@ export class ModelSwitchCostService {
         currentCost,
         outputTokens: output[0],
         requiresConfirmation: needs,
-        canConfirm: !needs || balance >= BigInt(targetCost.highCredits),
+        canConfirm: balance >= BigInt(targetCost.highCredits),
       }
       if (!needs) return { quote }
     }
@@ -391,6 +391,11 @@ export class ModelSwitchCostService {
     consent?: string,
   ): Promise<void> {
     const q = await this.quote(uid, input, consent)
+    if (q.targetCost !== null && !q.canConfirm)
+      throw new ModelSwitchCostError(
+        'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+        '可用余额不足以覆盖切换后的首轮预估，请充值或取消切换',
+      )
     if (q.requiresConfirmation)
       throw new ModelSwitchCostError(
         q.canConfirm ? 'MODEL_SWITCH_CONFIRMATION_REQUIRED' : 'MODEL_SWITCH_INSUFFICIENT_BALANCE',

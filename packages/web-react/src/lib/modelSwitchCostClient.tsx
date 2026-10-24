@@ -84,7 +84,7 @@ export function ModelSwitchCostSummary({ quote: q }: { quote: ModelSwitchCostQuo
             目标模型：{q.targetName} · 当前上下文约 {number(q.contextTokens ?? 0)} tokens
           </p>
           <p className="font-medium text-foreground">
-            切换首轮约 {number(q.targetCost.expectedCredits)} 积分（
+            直接切换首轮约 {number(q.targetCost.expectedCredits)} 积分（
             {number(q.targetCost.lowCredits)}–{number(q.targetCost.highCredits)}）
           </p>
           {q.currentCost ? (
@@ -160,6 +160,11 @@ export function createModelSwitchCostAuthorizer({
             : undefined)
         let q = checkedQuote(await api.modelSwitchCost(auth, input, { consent }), input.requestId)
         if (!current()) return null
+        if (q.targetCost && !q.canConfirm && !q.requiresConfirmation && !opts.notice) {
+          if (opts.interactive !== false && opts.canPrompt?.() !== false)
+            toast('可用余额不足以覆盖切换后的首轮预估，请充值或取消切换', 'error')
+          return null
+        }
         let choice: ConfirmChoice = true
         if (q.requiresConfirmation || opts.notice) {
           if (opts.interactive === false || opts.canPrompt?.() === false) return null
