@@ -1,3 +1,4 @@
+import { createMemoryAuthSession } from "../src/lib/authSession";
 /**
  * OCV5-185 dual-browser QA harness.
  * Real PermissionCard + MessageList (MessageRenderer) + useChatSocket.
@@ -18,26 +19,9 @@ import {
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
 
 function makeAuth(token: string): AuthSession {
-  let epoch = 1;
-  let current = token;
-  return {
-    snapshot: () => ({ token: current, epoch }),
-    beginIdentity: () => {
-      epoch += 1;
-      current = "";
-      return epoch;
-    },
-    commitToken: (expected, next) => {
-      if (expected !== epoch) return false;
-      current = next;
-      return true;
-    },
-    expire: (expected) => {
-      if (expected !== epoch) return false;
-      current = "";
-      return true;
-    },
-  };
+  const auth = createMemoryAuthSession(() => {});
+  auth.commitToken(auth.beginIdentity(), token);
+  return auth;
 }
 
 function params() {

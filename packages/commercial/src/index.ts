@@ -1,4 +1,3 @@
-import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
 import { assembleSystemActions } from './system-assistant/assemble.js'
@@ -736,6 +735,7 @@ import {
   type CodexFinalizeHandle,
 } from "./billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import {makeModelSwitchCostService} from './billing/modelSwitchCostTarget.js';
 import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
 import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
 import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";

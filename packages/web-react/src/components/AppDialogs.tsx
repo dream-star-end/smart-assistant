@@ -12,7 +12,7 @@ import { uploadFilesToProject } from "../lib/projectFileUpload";
 import { normalizeManageTab } from "../lib/manageTabs";
 import { CHAT_CREATE_TEMPLATES } from "../lib/chatCreateTemplates";
 import { DEFAULT_AGENT } from "../lib/agents";
-import { lazy } from "react";
+import { lazy, useEffect, useState } from "react";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import type { Agent } from "../lib/agents";
 import type { PrefsView } from "../lib/modelPreferences";
@@ -33,7 +33,7 @@ import type { Theme } from "../hooks/useTheme";
 import type { SettingsDestinationSection } from "../lib/productCapabilities";
 import type { ToastFn } from "./ui/Toast";
 
-const AgentPicker = lazy(() => import("./AgentPicker").then(module => ({default:module.AgentPicker})));
+const AgentPicker = lazy(() => import("./AgentPicker").then((m) => ({ default: m.AgentPicker })));
 
 const SettingsCenter = lazy(() =>
   import("./SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -91,6 +91,7 @@ const MarketplaceCenter = lazy(() =>
 const OrgCenter = lazy(() => import("./OrgCenter").then((m) => ({ default: m.OrgCenter })));
 
 export type AppDialogsProps = {
+  preferencesRevision?: number;
   activeId: string | undefined;
   activeSess: ChatSession | undefined;
   agent: Agent;
@@ -333,6 +334,7 @@ export function AppDialogs({
   settingsSection,
   shareOpen,
   subscribeOpenSignal,
+  preferencesRevision,
   teamMode,
   theme,
   toast,
@@ -341,9 +343,11 @@ export function AppDialogs({
   user,
   wsMessages,
 }: AppDialogsProps) {
+  const [pickerMounted, setPickerMounted] = useState(pickerOpen);
+  useEffect(() => { if (pickerOpen) setPickerMounted(true); }, [pickerOpen]);
   return (
     <>
-      {pickerOpen && <LazyBoundary fallback={<DialogFallback />}>
+      {(pickerOpen || pickerMounted) && <LazyBoundary fallback={pickerOpen ? <DialogFallback /> : null}>
       <AgentPicker
         open={pickerOpen}
         current={agent}
@@ -414,6 +418,7 @@ export function AppDialogs({
       {settingsOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
+            preferencesRevision={preferencesRevision}
             activeSessionId={activeId}
             open={settingsOpen}
             initialSection={settingsSection}
