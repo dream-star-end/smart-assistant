@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { api } from './api'
 import { createMemoryAuthSession } from './authSession'
-import { assertResolvedIdentity, captureIdentityAttempt, identityIsCurrent, resolveIdentity, revokeResolvedIdentity, type ResolvedIdentity } from './resolvedIdentity'
+import { advanceResolvedIdentityEpoch, assertResolvedIdentity, captureIdentityAttempt, identityIsCurrent, resolveIdentity, revokeResolvedIdentity, type ResolvedIdentity } from './resolvedIdentity'
 import { taskboardApi } from './taskboard'
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const me = (id = 'alice') => ({ user: { id, role: 'user', email: `${id}@example.invalid` } })
@@ -158,4 +158,48 @@ it('an unguarded read after lazy loading tolerates a same-epoch access-token rot
   expect(await pending).toEqual([])
   expect(fetcher).toHaveBeenCalledTimes(1)
   expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get('Authorization')).toBe('Bearer alice-b')
+})
+
+
+it('OD-P1 epoch transfer preserves only the already verified uid/token and revokes the old proof', () => {
+  const expired = vi.fn()
+  const auth = createMemoryAuthSession(expired, 'bob-b')
+  const proof = resolveIdentity(captureIdentityAttempt(auth, 'bob-b'), 'bob')
+  const next = advanceResolvedIdentityEpoch(proof, auth)
+  expect(auth.snapshot()).toEqual({ token: 'bob-b', epoch: 1 })
+  expect(identityIsCurrent(proof, auth)).toBe(false)
+  expect(identityIsCurrent(next, auth, 'bob')).toBe(true)
+  expect(identityIsCurrent(next, auth, 'alice')).toBe(false)
+  expect(() => advanceResolvedIdentityEpoch(proof, auth)).toThrow()
+  expect(auth.snapshot()).toEqual({ token: 'bob-b', epoch: 1 })
+  expect(expired).not.toHaveBeenCalled()
+})
+it('OD-P1 forged, foreign-auth or stale proofs cannot advance an identity epoch', () => {
+  const auth = createMemoryAuthSession(() => {}, 'bob-b')
+  const other = createMemoryAuthSession(() => {}, 'bob-b')
+  const proof = resolveIdentity(captureIdentityAttempt(auth, 'bob-b'), 'bob')
+  expect(() => advanceResolvedIdentityEpoch({ ...proof }, auth)).toThrow()
+  expect(() => advanceResolvedIdentityEpoch(proof, other)).toThrow()
+  expect(auth.snapshot()).toEqual({ token: 'bob-b', epoch: 0 })
+  expect(other.snapshot()).toEqual({ token: 'bob-b', epoch: 0 })
+  auth.commitToken(0, 'bob-later')
+  expect(() => advanceResolvedIdentityEpoch(proof, auth)).toThrow()
+  expect(auth.snapshot()).toEqual({ token: 'bob-later', epoch: 0 })
+})
+it('OD-P1 explicit account acceptance never aborts a shared in-flight refresh', async () => {
+  const pending = deferred<Response>()
+  let signal: AbortSignal | null | undefined
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async (_url, init) => { signal = init?.signal; return pending.promise }))
+  const expired = vi.fn()
+  const auth = createMemoryAuthSession(expired, 'bob-b')
+  const proof = resolveIdentity(captureIdentityAttempt(auth, 'bob-b'), 'bob')
+  const flight = api.refresh(auth)
+  await vi.waitFor(() => expect(signal).toBeDefined())
+  const next = advanceResolvedIdentityEpoch(proof, auth)
+  expect(signal?.aborted).toBe(false)
+  pending.resolve(reply({ access_token: 'late-refresh', access_exp: 9999999999, remember: false }))
+  expect(await flight).toMatchObject({ kind: 'stale' })
+  expect(auth.snapshot()).toEqual({ token: 'bob-b', epoch: 1 })
+  expect(identityIsCurrent(next, auth, 'bob')).toBe(true)
+  expect(expired).not.toHaveBeenCalled()
 })

@@ -1,5 +1,5 @@
 import { AuthEpochStaleError } from '../lib/api/http';
-import { attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
+import { advanceResolvedIdentityEpoch, attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
 import { useAuthAccessGeneration } from './useAuthAccessGeneration';
 import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -406,7 +406,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const acceptAccountSwitch = useCallback(() => {
     if (!pendingAccount || pendingAccountRef.current !== pendingAccount || pendingAccount.auth !== authRef.current ||
       !identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id)) return;
-    if (!commitVerifiedUser(pendingAccount.user, pendingAccount.identity)) return;
+    const identity = advanceResolvedIdentityEpoch(pendingAccount.identity, authRef.current);
+    if (!commitVerifiedUser(pendingAccount.user, identity)) return;
     setAuthError(null);
     setAuthRecoveryAvailable(false);
     setAuthed(true);

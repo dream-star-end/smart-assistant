@@ -43,3 +43,14 @@ export function assertResolvedIdentity(identity: ResolvedIdentity, auth: AuthSes
 export function revokeResolvedIdentity(identity: ResolvedIdentity | null): void {
   if (identity) proofs.delete(identity)
 }
+
+/** Transfer an existing verified proof across an explicit account-switch boundary. */
+export function advanceResolvedIdentityEpoch(identity: ResolvedIdentity, auth: AuthSession): ResolvedIdentity {
+  const proof = proofs.get(identity)
+  if (!proof || !attemptCurrent(proof, auth)) throw new AuthEpochStaleError()
+  const epoch = auth.beginIdentity()
+  if (!auth.commitToken(epoch, proof.token)) throw new AuthEpochStaleError()
+  proofs.delete(identity)
+  // Same authenticated uid/token evidence; callers cannot supply a display uid.
+  return resolveIdentity({ ...proof, epoch, generation: auth.getAccessGeneration() }, identity.userId)
+}

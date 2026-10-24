@@ -527,7 +527,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
   const archivedFetchedRef = useRef(false);
-  const listRefreshInflightRef = useRef(false);
+  const listRefreshInflightRef = useRef<object | null>(null);
+  const listGenerationRef = useRef(0);
 
   const mapListMetas = useCallback(
     (metas: SessionMeta[]): Session[] => {
@@ -552,10 +553,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     async (opts?: { initial?: boolean; cancelled?: () => boolean }) => {
       if (demo || !auth || !user) return;
       if (listRefreshInflightRef.current && !opts?.initial) return;
-      listRefreshInflightRef.current = true;
+      const request = {};
+      const generation = listGenerationRef.current;
+      const isCurrent = () => generation === listGenerationRef.current && !opts?.cancelled?.();
+      listRefreshInflightRef.current = request;
       try {
         const metas = await api.listSessions(cbRef.current.authSession);
-        if (opts?.cancelled?.()) return;
+        if (!isCurrent()) return false;
         const server = mapListMetas(metas);
         setSessions((cur) => upsertSessions(cur, server, true));
         if (opts?.initial) {
@@ -565,8 +569,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       } catch {
         /* 列表失败：保留本地会话，不打断工作区 */
       } finally {
-        listRefreshInflightRef.current = false;
+        if (listRefreshInflightRef.current === request) listRefreshInflightRef.current = null;
       }
+      return isCurrent();
     },
     [demo, auth, user, mapListMetas],
   );
@@ -576,8 +581,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   useEffect(() => {
     if (demo || !auth || !user) return;
     let cancelled = false;
-    refreshSessionList({ initial: true, cancelled: () => cancelled }).finally(() => {
-      if (!cancelled) setServerListSettled(true);
+    refreshSessionList({ initial: true, cancelled: () => cancelled }).then(settled => {
+      if (settled && !cancelled) setServerListSettled(true);
     });
     return () => {
       cancelled = true;
@@ -588,19 +593,22 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // upsertSessions union 保住已 loadMore 的行，不重置分页游标。
   useEffect(() => {
     if (demo || !auth || !user) return;
+    let cancelled = false;
+    const refresh = () => refreshSessionList({ cancelled: () => cancelled });
     const tick = () => {
-      if (document.visibilityState === "visible") void refreshSessionList();
+      if (document.visibilityState === "visible") void refresh();
     };
     const timer = window.setInterval(tick, LIST_POLL_MS);
     const onVis = () => {
-      if (document.visibilityState === "visible") void refreshSessionList();
+      if (document.visibilityState === "visible") void refresh();
     };
     const onFocus = () => {
-      void refreshSessionList();
+      void refresh();
     };
     document.addEventListener("visibilitychange", onVis);
     window.addEventListener("focus", onFocus);
     return () => {
+      cancelled = true;
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("focus", onFocus);
@@ -808,6 +816,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       setHasMoreSessions(false);
       return;
     }
+    const generation = listGenerationRef.current;
     loadMoreInflightRef.current = true;
     setLoadingMoreSessions(true);
     try {
@@ -815,38 +824,45 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         limit: 50,
         before: nextCursorRef.current ?? oldest,
       });
+      if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
       setSessions((cur) => upsertSessions(cur, incoming, true));
       nextCursorRef.current = page.nextCursor;
       setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
       setLoadMoreError(false);
     } catch (e) {
+      if (generation !== listGenerationRef.current) return;
       // 失败不再把 hasMore 直接置 false（那会让更早的会话永远拉不到、用户以为「就这么多」，S-08）：
       // 保留 hasMore 允许重试，并暴露 loadMoreError 让侧栏给出「点击重试」。
       console.warn("listSessionsPage failed", e);
       setLoadMoreError(true);
     } finally {
-      loadMoreInflightRef.current = false;
-      setLoadingMoreSessions(false);
+      if (generation === listGenerationRef.current) {
+        loadMoreInflightRef.current = false;
+        setLoadingMoreSessions(false);
+      }
     }
   };
 
   const loadArchivedSessions = async () => {
     if (demo || !auth || !user || archivedFetchedRef.current) return;
+    const generation = listGenerationRef.current;
     archivedFetchedRef.current = true;
     setLoadingArchived(true);
     try {
       const page = await api.listSessionsPage(cbRef.current.authSession, {
         includeArchived: true,
       });
+      if (generation !== listGenerationRef.current) return;
       const incoming = mapListMetas(page.sessions);
       setSessions((cur) => upsertSessions(cur, incoming, true));
     } catch (e) {
+      if (generation !== listGenerationRef.current) return;
       archivedFetchedRef.current = false;
       console.warn("loadArchivedSessions failed", e);
       toast("无法加载已归档会话", "error");
     } finally {
-      setLoadingArchived(false);
+      if (generation === listGenerationRef.current) setLoadingArchived(false);
     }
   };
 
@@ -907,6 +923,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
   const reset = useCallback(() => {
+    listGenerationRef.current += 1;
+    listRefreshInflightRef.current = null;
+    loadMoreInflightRef.current = false;
     confirmedMetadata.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
