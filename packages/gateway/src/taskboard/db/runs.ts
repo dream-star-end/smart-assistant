@@ -538,3 +538,13 @@ export function getActiveLease(
   const row = findActiveLease(db, ticketId, now)
   return row ? mapRun(row) : null
 }
+
+
+/** Payloads for an already selected, bounded timeline window. */
+export function listRunsByIdsForTicket(db: TaskboardDb, ticketId: string, ids: readonly string[]): TicketRun[] {
+  if (ids.length > 500) throw new RangeError('timeline payload window exceeds 500')
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(',')
+  const rows = db.prepare(`SELECT ${RUN_COLS} FROM tb_ticket_run WHERE ticket_id = ? AND id IN (${placeholders})`).all(ticketId, ...ids) as RunRow[]
+  return rows.map(mapRun)
+}

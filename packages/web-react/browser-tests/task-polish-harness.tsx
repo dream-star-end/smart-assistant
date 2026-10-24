@@ -7,7 +7,7 @@ import { VirtualList } from '../src/components/sidebar/VirtualList'
 import { ToastProvider, TooltipProvider } from '../src/components/ui'
 import { ApiError } from '../src/lib/api'
 import { createMemoryAuthSession } from '../src/lib/authSession'
-import { taskboardApi, type Ticket, type PipelineStage, type TicketListQuery, type TicketRun } from '../src/lib/taskboard'
+import { taskboardApi, type Ticket, type PipelineStage, type TicketListQuery, type TicketRun, type TimelineItem } from '../src/lib/taskboard'
 import type { FlatItem } from '../src/components/sidebar/flattenItems'
 
 const control = window as unknown as Record<string, unknown>
@@ -150,5 +150,28 @@ function ExecutionDrawer() {
     agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}}
     onDetailLoaded={setRow} onTicketUpdated={setRow} />
 }
+function ResultHistoryDrawer() {
+  const [row, setRow] = useState(() => ticket(5, 'blocked'))
+  const [open, setOpen] = useState(true)
+  const [server] = useState(() => ({ newest: 520, reads: 0, earlier: [] as string[], fullReads: 0 }))
+  const record = (n: number): TimelineItem => ({ kind: 'activity', createdAt: 10000 + n * 600000, activity: { id: `activity-${n}`, ticketId: row.id, actor: 'system', actorId: 'system', action: `HISTORY_RECORD_${n}`, field: null, fromValue: null, toValue: null, runId: null, createdAt: 10000 + n * 600000 } })
+  const current = { id: 'old-created-paid', ticketId: row.id, stageId: stage.id, agentId: 'main', trigger: 'manual', status: 'failed', createdAt: 1, startedAt: 1, finishedAt: 2, outputMd: null, summary: null, settling: false, actualModels: ['actual-paid'], costUsd: null, costImprecise: true } as TicketRun
+  const output = `# 完整归档\n\n${'长结果内容。'.repeat(2000)}\n\nPAID_RESULT_END\n\n\`\`\`ui\n${JSON.stringify({ type: 'suggestions', items: ['历史只读操作'] })}\n\`\`\``
+  taskboardApi.getTicketDetail = async () => ({ ticket: row, stage, execution: current })
+  taskboardApi.listTimelinePage = async (_auth, _id, options = {}) => {
+    server.reads += 1
+    const head = `rev-${server.newest}`
+    const end = options.before ? Number(options.before) - 1 : server.newest
+    if (options.before) server.earlier.push(options.before)
+    const start = Math.max(1, end - 99)
+    return { window: 'latest-v1', items: options.ifHead === head ? [] : Array.from({ length: end - start + 1 }, (_, i) => record(start + i)), hasMore: start > 1, nextBefore: start > 1 ? String(start) : null, head, unchanged: options.ifHead === head }
+  }
+  taskboardApi.getRun = async () => { server.fullReads += 1; return { ...current, outputMd: output } }
+  taskboardApi.listRuns = async () => { throw new Error('Modern window must not load legacy runs') }
+  control.reopenHistory = () => setOpen(true)
+  control.historyStats = () => ({ reads: server.reads, earlier: server.earlier, fullReads: server.fullReads })
+  control.burstHistory = () => { server.newest = 670; document.dispatchEvent(new Event('visibilitychange')) }
+  return <TicketDrawer auth={auth} ticket={row} ticketRef={row.identifier} open={open} desktop={matchMedia('(min-width: 768px)').matches} agents={[]} stages={[stage]} sessionIds={[]} onClose={() => setOpen(false)} onReconcile={() => {}} onDetailLoaded={setRow} onTicketUpdated={setRow} />
+}
 const scenario = new URLSearchParams(location.search).get('scenario')
-createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : scenario === 'execution' ? <ExecutionDrawer /> : <Drawer />}</ToastProvider></TooltipProvider>)
+createRoot(document.getElementById('root')!).render(<TooltipProvider><ToastProvider>{scenario === 'list' ? <List /> : scenario === 'hidden' ? <HiddenSidebar /> : scenario === 'execution' ? <ExecutionDrawer /> : scenario === 'history' ? <ResultHistoryDrawer /> : <Drawer />}</ToastProvider></TooltipProvider>)

@@ -178,6 +178,19 @@ export PSQL_SLEEP=$STALL_SEC WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDG
 send --event rollback_start --severity critical --message x
 send --event tier1_skipped --severity warning --message y
 enq_net="$(grep -cE '^(psql|curl) ' "$TRACE" || true)"
+# Keep the first delivery inside the one-second budget; only the next record
+# observes time spent in the blocked DB. Real channel timeout/elapsed assertions stay.
+export WATCH_ALERT_TEST_CLOCK_BASE="$(/usr/bin/date +%s)" WATCH_ALERT_TEST_CLOCK_COUNTER="$C/clock-count"
+printf '0' >"$WATCH_ALERT_TEST_CLOCK_COUNTER"
+cat >"$C/bin/date" <<'CLOCK'
+#!/usr/bin/env bash
+if [[ "$#" == 1 && "$1" == +%s ]]; then
+  n="$(cat "$WATCH_ALERT_TEST_CLOCK_COUNTER")"; n=$((n+1))
+  printf '%s' "$n" >"$WATCH_ALERT_TEST_CLOCK_COUNTER"
+  if ((n <= 2)); then printf '%s\n' "$WATCH_ALERT_TEST_CLOCK_BASE"; else printf '%s\n' "$((WATCH_ALERT_TEST_CLOCK_BASE+2))"; fi
+else exec /usr/bin/date "$@"; fi
+CLOCK
+chmod 0755 "$C/bin/date"
 t0=$SECONDS; send --flush; t_flush=$((SECONDS - t0))
 left="$({ cat "$C"/state/alert-spool/*.json 2>/dev/null || true; } | jq -sc 'map(.pending) | sort')"
 # 入队不碰网络和库;flush 远早于替身睡醒就返回,说明是自己的超时/预算截断的。

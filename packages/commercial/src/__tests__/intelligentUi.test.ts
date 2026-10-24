@@ -10,6 +10,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildIntelligentUiPrompt,
   INPUT_PREDICTION_PROMPT,
   INTELLIGENT_UI_PROMPT,
   INTELLIGENT_UI_SLOT_NAME,
@@ -192,5 +193,26 @@ describe("协议文案", () => {
     assert.match(PREDICTION_PROTOCOL, /最后一个块/);
     assert.match(PREDICTION_PROTOCOL, /不是你的建议/);
     assert.ok(PREDICTION_PROTOCOL.trim().length > 0);
+  });
+});
+
+
+describe("taskboard component-only projection", () => {
+  test("uses the same uid preference and never includes input prediction", async () => {
+    const seen: string[] = [];
+    for (const input_prediction of [true, false]) {
+      const result = await resolveIntelligentUiSlot(765, { surface: "taskboard", env: {}, readPrefs: async (uid) => {
+        seen.push(uid); return { prefs: { intelligent_ui: true, input_prediction } };
+      } });
+      assert.deepEqual(result, { name: INTELLIGENT_UI_SLOT_NAME, content: INTELLIGENT_UI_PROMPT });
+    }
+    assert.deepEqual(seen, ["765", "765"]);
+    assert.equal(await resolveIntelligentUiSlot(765, { surface: "taskboard", env: {}, readPrefs: async () => ({ prefs: { intelligent_ui: false, input_prediction: true } }) }), null);
+    assert.equal(await resolveIntelligentUiSlot(765, { surface: "taskboard", env: { OC_INTELLIGENT_UI: "0", OC_INPUT_PREDICTION: "1" }, readPrefs: async () => { throw new Error("must not read when component surface is off"); } }), null);
+  });
+  test("preserves the exact existing webchat text and separators", () => {
+    assert.equal(buildIntelligentUiPrompt({ componentsEnabled: true, predictionEnabled: true }), `${INTELLIGENT_UI_PROMPT}\n\n${INPUT_PREDICTION_PROMPT}`);
+    assert.equal(buildIntelligentUiPrompt({ componentsEnabled: true, predictionEnabled: true, surface: "taskboard" }), INTELLIGENT_UI_PROMPT);
+    assert.equal(buildIntelligentUiPrompt({ componentsEnabled: false, predictionEnabled: true, surface: "taskboard" }), null);
   });
 });

@@ -1222,7 +1222,7 @@ function qs(query?: object): string {
   return s ? `?${s}` : ''
 }
 
-function boardGet<T>(a: AuthSession, path: string): Promise<T> {
+export function boardGet<T>(a: AuthSession, path: string): Promise<T> {
   return jsonOrThrow<T>(
     callWithRefresh(a, (t) => fetch(path, { credentials: 'include', headers: bearerHeaders(t) })),
   )
@@ -1503,6 +1503,12 @@ export const taskboardApi = {
     boardGet<{ items: TicketActivity[] }>(a, ticketActionPath(idOrIdent, 'activity')).then(
       (b) => b.items || [],
     ),
+
+  getRun: (a: AuthSession, id: string) =>
+    boardGet<{ run: TicketRun }>(a, `/api/board/runs/${encodeURIComponent(id)}`).then((body) => body.run),
+
+  listTimelinePage: (a: AuthSession, id: string, options: { before?: string; ifHead?: string } = {}) =>
+    import('./taskboardTimelinePage').then((module) => module.loadTimelinePage(a, id, options)),
 
   listTimeline: (a: AuthSession, idOrIdent: string) =>
     // 时间线接口默认只回最旧的 100 条，上限 500。忙的单据要看到最新评论，必须显式要满额。

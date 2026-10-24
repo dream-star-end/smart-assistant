@@ -1,5 +1,5 @@
 import { ArrowLeftRight, BadgeCheck, Flag, History, MessageSquare, Play } from 'lucide-react'
-import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, memo, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   RUN_STATUS_LABEL,
   RUN_TRIGGER_LABEL,
@@ -28,7 +28,7 @@ import {
 import { Markdown } from '../Markdown'
 import { Badge, Button, ListSkeleton } from '../ui'
 
-function TicketMarkdown({
+const TicketMarkdown = memo(function TicketMarkdown({
   children,
   testId,
 }: {
@@ -43,7 +43,7 @@ function TicketMarkdown({
       <Markdown readOnly>{children}</Markdown>
     </div>
   )
-}
+})
 
 /** 抽屉里乐观插入、还没拿到服务端回执的评论 id 前缀(见 TicketDrawer.submitComment)。 */
 export const LOCAL_COMMENT_ID_PREFIX = 'local-'
@@ -85,7 +85,8 @@ function dotClass(node: TicketTimelineNode): string {
   if (node.kind === 'run_start') return 'border-info bg-info-soft text-info'
   if (node.kind === 'run_end') {
     const status = node.run?.status
-    if (status === 'failed' || status === 'timeout') return 'border-danger bg-danger-soft text-danger'
+    if (status === 'failed' || status === 'timeout')
+      return 'border-danger bg-danger-soft text-danger'
     if (status === 'skipped') return 'border-warning bg-warning-soft text-warning'
     if (status === 'succeeded') return 'border-success bg-success-soft text-success'
     return 'border-info bg-info-soft text-info'
@@ -155,62 +156,60 @@ function stageText(
   return null
 }
 
-/** max-h-40 = 10rem = 160px。超过这个渲染高度才折叠。 */
-const COLLAPSE_MAX_PX = 160
+/** Bound the estimate too: long hidden results are never fully parsed on mount. */
+function isLongText(text: string): boolean {
+  return text.length > 1200 || isTimelineCommentLong(text.slice(0, 1200))
+}
 
-function MeasuredCollapse({
-  signature,
-  fallbackLong,
+function DeferredCollapse({
+  preview,
+  long,
   children,
-}: {
-  signature: string
-  fallbackLong: boolean
-  children: ReactNode
-}) {
-  const contentRef = useRef<HTMLDivElement>(null)
-  const [overflows, setOverflows] = useState(fallbackLong)
+}: { preview: string; long: boolean; children: ReactNode }) {
+  const contentId = useId()
   const [open, setOpen] = useState(false)
-
-  useEffect(() => {
-    setOpen(false)
-    const el = contentRef.current
-    if (!el) return
-    const measure = () => {
-      const height = el.scrollHeight
-      // jsdom 没有布局，scrollHeight 为 0，回落到按显示宽度估算。
-      setOverflows(height > 0 ? height > COLLAPSE_MAX_PX : fallbackLong)
-    }
-    measure()
-    if (typeof ResizeObserver !== 'function') return
-    const observer = new ResizeObserver(measure)
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [signature, fallbackLong])
-
-  const collapsed = overflows && !open
+  const [mounted, setMounted] = useState(false)
+  if (!long) return <>{children}</>
+  const prefix = preview
+    .slice(0, 320)
+    .replace(/[\uD800-\uDBFF]$/, '')
+    .replace(/```[\s\S]*$/, '')
+    .trim()
   return (
     <div className="min-w-0">
-      <div className={collapsed ? 'relative max-h-40 overflow-hidden' : 'relative min-w-0'}>
-        <div ref={contentRef}>{children}</div>
-        {collapsed && (
-          <div
-            aria-hidden
-            data-testid="ticket-comment-fade"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-elevated to-transparent md:from-sidebar"
-          />
+      <div id={contentId}>
+        {mounted && <div hidden={!open}>{children}</div>}
+        {!open && (
+          <div className="relative max-h-40 overflow-hidden">
+            <p
+              className="whitespace-pre-wrap text-body text-muted"
+              data-testid="ticket-result-preview"
+            >
+              {prefix || '内容较长，展开查看完整结果。'}
+            </p>
+            <div
+              aria-hidden
+              data-testid="ticket-comment-fade"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-8 bg-gradient-to-t from-elevated to-transparent md:from-sidebar"
+            />
+          </div>
         )}
       </div>
-      {overflows && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="ticket-comment-expand"
-          onClick={() => setOpen((value) => !value)}
-        >
-          {open ? '收起' : '展开'}
-        </Button>
-      )}
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="min-h-11"
+        data-testid="ticket-comment-expand"
+        aria-expanded={open}
+        aria-controls={contentId}
+        onClick={() => {
+          setMounted(true)
+          setOpen((value) => !value)
+        }}
+      >
+        {open ? '收起' : '展开'}
+      </Button>
     </div>
   )
 }
@@ -223,9 +222,9 @@ function CollapsibleMarkdown({
   testId?: string
 }) {
   return (
-    <MeasuredCollapse signature={body} fallbackLong={isTimelineCommentLong(body)}>
+    <DeferredCollapse preview={body} long={isLongText(body)}>
       <TicketMarkdown testId={testId}>{body}</TicketMarkdown>
-    </MeasuredCollapse>
+    </DeferredCollapse>
   )
 }
 
@@ -267,7 +266,11 @@ function SystemRun({
     <div className="flex min-w-0 flex-col gap-1.5" data-testid="ticket-run-detail">
       <div className="flex flex-wrap items-center gap-1.5">
         <Badge tone={cancelled ? 'neutral' : runStatusTone(run.status)} size="sm">
-          {run.stopRequested && (run.status === 'running' || run.status === 'queued') ? '停止处理中' : cancelled ? '已停止' : RUN_STATUS_LABEL[run.status] ?? run.status}
+          {run.stopRequested && (run.status === 'running' || run.status === 'queued')
+            ? '停止处理中'
+            : cancelled
+              ? '已停止'
+              : (RUN_STATUS_LABEL[run.status] ?? run.status)}
         </Badge>
         <span className="text-body text-fg">{stageName || '未知阶段'}</span>
         <span className="text-caption text-faint">
@@ -277,13 +280,35 @@ function SystemRun({
       <p className="text-caption text-muted break-words">
         {[duration ?? '耗时未记录', tokens ?? '用量未记录', costText].filter(Boolean).join(' · ')}
       </p>
-      {run.settling && run.status !== 'running' && run.status !== 'queued' && <p className="text-caption text-muted" data-testid="ticket-run-settling">执行仍在收尾，结果归档后可重试。</p>}
-      <p className="text-caption text-muted break-all" data-testid="ticket-run-models">执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}</p>
+      {run.settling && run.status !== 'running' && run.status !== 'queued' && (
+        <p className="text-caption text-muted" data-testid="ticket-run-settling">
+          执行仍在收尾，结果归档后可重试。
+        </p>
+      )}
+      <p className="text-caption text-muted break-all" data-testid="ticket-run-models">
+        执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}
+      </p>
       {run.status === 'running' && run.preview && (
-        <div className="rounded-lg border border-border bg-hover px-3 py-2" data-testid="ticket-run-preview">
-          <p className="text-caption text-muted">实时预览{run.preview.lastActivityAt ? ` · ${new Date(run.preview.lastActivityAt).toLocaleTimeString()}` : ''}</p>
-          {run.preview.toolNames.length > 0 && <p className="mt-1 break-words text-caption text-faint">工具：{run.preview.toolNames.join('、')}</p>}
-          {run.preview.text && <p className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-body">{run.preview.text}</p>}
+        <div
+          className="rounded-lg border border-border bg-hover px-3 py-2"
+          data-testid="ticket-run-preview"
+        >
+          <p className="text-caption text-muted">
+            实时预览
+            {run.preview.lastActivityAt
+              ? ` · ${new Date(run.preview.lastActivityAt).toLocaleTimeString()}`
+              : ''}
+          </p>
+          {run.preview.toolNames.length > 0 && (
+            <p className="mt-1 break-words text-caption text-faint">
+              工具：{run.preview.toolNames.join('、')}
+            </p>
+          )}
+          {run.preview.text && (
+            <p className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-body">
+              {run.preview.text}
+            </p>
+          )}
         </div>
       )}
       {skip && <p className="text-body text-warning">跳过：{skip}</p>}
@@ -306,7 +331,9 @@ function SystemRun({
         />
       )}
       {run.error && (
-        <p className="break-words whitespace-pre-wrap text-body text-danger">{cancelled ? '本次执行已停止，已保留生成内容和已发生用量。' : run.error}</p>
+        <p className="break-words whitespace-pre-wrap text-body text-danger">
+          {cancelled ? '本次执行已停止，已保留生成内容和已发生用量。' : run.error}
+        </p>
       )}
     </div>
   )
@@ -369,9 +396,7 @@ function NodeBody({
   }
   return (
     <div data-testid="ticket-timeline-item" data-kind={node.kind} className="min-w-0">
-      <p className="text-body text-fg break-words">
-        {activityText(node)}
-      </p>
+      <p className="text-body text-fg break-words">{activityText(node)}</p>
     </div>
   )
 }
@@ -420,10 +445,22 @@ function GroupHeader({
   )
 }
 
-function stackedCommentSignature(group: TicketTimelineGroup): string | null {
-  if (group.nodes.length < 2) return null
-  if (!group.nodes.every((node) => node.kind === 'comment' && node.comment)) return null
-  return group.nodes.map((node) => node.comment?.body ?? '').join('\n')
+function stackedCommentPreview(group: TicketTimelineGroup): { text: string; long: boolean } | null {
+  if (
+    group.nodes.length < 2 ||
+    !group.nodes.every((node) => node.kind === 'comment' && node.comment)
+  )
+    return null
+  let text = ''
+  let total = 0
+  let long = false
+  for (const node of group.nodes) {
+    const body = node.comment!.body
+    total += body.length + 1
+    long ||= isLongText(body)
+    if (text.length < 1200) text += `${text ? '\n' : ''}${body.slice(0, 1200 - text.length)}`
+  }
+  return { text, long: long || total > 1200 || isTimelineCommentLong(text) }
 }
 
 function GroupBodies({
@@ -435,11 +472,11 @@ function GroupBodies({
   stageById: Map<string, string>
   stageName: string | null
 }) {
-  const stacked = stackedCommentSignature(group)
+  const stacked = stackedCommentPreview(group)
   if (stacked) {
     return (
       <div className="mt-1 min-w-0">
-        <MeasuredCollapse signature={stacked} fallbackLong={isTimelineCommentLong(stacked)}>
+        <DeferredCollapse preview={stacked.text} long={stacked.long}>
           <div className="flex min-w-0 flex-col gap-2">
             {group.nodes.map((node) =>
               node.comment ? (
@@ -447,7 +484,7 @@ function GroupBodies({
               ) : null,
             )}
           </div>
-        </MeasuredCollapse>
+        </DeferredCollapse>
       </div>
     )
   }
@@ -477,11 +514,15 @@ function TimelineGroupView({
 }) {
   const head = group.nodes[0]
   if (!head) return null
-  const lineClass = isFirst && isLast ? 'hidden' : isFirst ? 'top-3 bottom-0' : isLast ? 'top-0 h-3' : 'inset-y-0'
+  const lineClass =
+    isFirst && isLast ? 'hidden' : isFirst ? 'top-3 bottom-0' : isLast ? 'top-0 h-3' : 'inset-y-0'
   return (
     <li data-testid="ticket-timeline-group" className="relative flex gap-3">
       <div className="relative w-6 shrink-0">
-        <span className={`absolute left-1/2 w-px -translate-x-1/2 bg-border ${lineClass}`} aria-hidden />
+        <span
+          className={`absolute left-1/2 w-px -translate-x-1/2 bg-border ${lineClass}`}
+          aria-hidden
+        />
         <span
           className={`relative z-10 mt-0.5 flex h-6 w-6 items-center justify-center rounded-full border ${dotClass(head)}`}
           title={kindLabel(head.kind)}
@@ -533,9 +574,7 @@ export function TicketTimeline({
   }, [items])
 
   const emptyText =
-    filter === 'all'
-      ? '还没有评论或动态。你可以在下方先写一条。'
-      : '这个筛选下还没有记录。'
+    filter === 'all' ? '还没有评论或动态。你可以在下方先写一条。' : '这个筛选下还没有记录。'
 
   return (
     <div
