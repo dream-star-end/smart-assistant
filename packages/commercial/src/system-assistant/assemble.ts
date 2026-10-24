@@ -37,3 +37,5 @@ export function assembleSystemActions(deps: {
   const runtime = openSystemActionsRuntime({ ...deps, registry })
   return { runtime, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
 }
+
+export type { SystemSessionReadBackend } from './stateReadOperations.js'

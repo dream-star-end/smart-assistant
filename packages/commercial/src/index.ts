@@ -1,8 +1,7 @@
 import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
-import type { SystemSessionReadBackend } from './system-assistant/stateReadOperations.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
-import { assembleSystemActions } from './system-assistant/assemble.js'
+import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
