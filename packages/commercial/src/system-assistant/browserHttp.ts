@@ -67,7 +67,7 @@ export function makeSystemActionsBrowserHandler(deps: SystemActionsBrowserHttpDe
         throw new HttpError(status, e.code, e.code === 'RECONCILIATION_REQUIRED' ? '执行结果待核对，请勿重复执行。' : '操作不可用或状态已变化，请刷新查看。')
       }
       if (e instanceof SystemOperationRejected) throw new HttpError(
-        e.code === 'FORBIDDEN' ? 403 : e.code === 'INVALID_INPUT' ? 400 : e.code === 'UNAVAILABLE' ? 503 : 409,
+        e.code === 'NOT_FOUND' ? 404 : e.code === 'FORBIDDEN' ? 403 : e.code === 'INVALID_INPUT' ? 400 : e.code === 'UNAVAILABLE' ? 503 : 409,
         e.code, '操作不可用或权限已变化，请刷新查看。')
       throw e
     }
