@@ -44,3 +44,6 @@ export * from './identityCompatRuntime.js'
 
 export * from './sessionFileIo.js'
 export * from './systemActions.js'
+
+export * from './authorityPaths.js'
+export * from './authorityViews.js'
