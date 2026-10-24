@@ -1,7 +1,7 @@
--- order-dependency: 0322_minimax_voices
--- Merge order: 0323 is reserved for turn_dispatches.trace_id (OCV5-599, selfhost first). This PR stays
--- draft until 0323 is in this tree; at that rebase the dependency above becomes 0323, so 0324 can never
--- be applied ahead of it (migrate.ts would then refuse the later 0323 as out-of-order).
+-- order-dependency: 0323_turn_dispatches_trace_id
+-- Merge order: 0323 (turn_dispatches.trace_id, OCV5-599, commercial PR #1066) must be merged and applied
+-- first: migrate.ts refuses a later 0323 once 0324 has run (out-of-order), and this declaration makes a
+-- run without 0323 fail closed before anything is applied. 0322_minimax_voices sorts before 0323.
 -- 0324_media_studio.sql (commercial; OCV5-591, media studio OCV5-586)
 -- Media studio: a project turns a brief into shots / lines / music, generates takes through the
 -- existing provider ledgers (Image 2, Muse, MiniMax, Grok) and composes a final cut. The studio's own
