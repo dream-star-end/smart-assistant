@@ -111,7 +111,7 @@ test('missing malformed wrong-model and user 1m descriptors cannot grant a large
   expect(await buildIdleNativeFit(messages, MODEL, {})).toBeUndefined()
   expect(await buildIdleNativeFit(messages, MODEL, { OC_MODEL_EXECUTION_DESCRIPTOR: '{' })).toBeUndefined()
   expect(await buildIdleNativeFit(messages, MODEL, envFor(1_000_000, 'box-claude-opus-5-5'))).toBeUndefined()
-  expect(await buildIdleNativeFit(messages, MODEL + '[1m]', envFor())).toBeUndefined()
+  expect(await buildIdleNativeFit(messages, `${MODEL}[1m]`, envFor())).toBeUndefined()
   expect(await buildIdleNativeFit(messages, MODEL, envFor(0))).toBeUndefined()
   const upperCase = await buildIdleNativeFit(messages, ' BOX-CLAUDE-HAIKU-5-5 ', envFor())
   expect(upperCase?.inputBudget).toBe(822000)
