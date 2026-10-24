@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { isStudioPath } from '../lib/studio/path'
 import { type ProductFeatureId, isProductFeatureId } from '../lib/productCapabilities'
 import { TICKET_TYPES, type TicketType } from '../lib/taskboard'
 import { type TutorialCaseId, parseTutorialCaseId } from '../lib/tutorialCaseId'
@@ -250,6 +251,8 @@ export type LocationRoute = {
   demo: boolean
   resetToken: string | undefined
   desktopEnroll: boolean
+  /** OCV5-593: /studio[/…] is the media studio's own full-page surface. */
+  studio: boolean
   routingEnabled: boolean
   panel: PanelParam | null
   tutorialCommunity: string | null
@@ -266,7 +269,8 @@ export function readLocationRoute(loc: { pathname: string; search: string }): Lo
   const resetToken =
     !demo && loc.pathname === '/reset-password' ? params.get('token') || undefined : undefined
   const desktopEnroll = !demo && loc.pathname === '/desktop/enroll'
-  const routingEnabled = !demo && !resetToken && !desktopEnroll
+  const studio = !demo && isStudioPath(loc.pathname)
+  const routingEnabled = !demo && !resetToken && !desktopEnroll && !studio
   const tutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null
   const tutorialCase = routingEnabled ? parseTutorialCase(params) : null
   return {
@@ -274,6 +278,7 @@ export function readLocationRoute(loc: { pathname: string; search: string }): Lo
     demo,
     resetToken,
     desktopEnroll,
+    studio,
     routingEnabled,
     panel: routingEnabled ? parsePanelParam(params) : null,
     tutorialCommunity,
