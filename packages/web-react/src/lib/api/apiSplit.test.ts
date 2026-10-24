@@ -19,5 +19,7 @@ test('api domain parts are disjoint and exposed on api by reference', () => {
     }
   }
   expect(seen.size).toBe(163)
-  expect(Object.keys(api)).toHaveLength(254)
+  // OCV5-614 adds the authenticated model-switch quote/confirm endpoint.
+  expect(api.modelSwitchCost).toBeTypeOf('function')
+  expect(Object.keys(api)).toHaveLength(255)
 })
