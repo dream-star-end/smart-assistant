@@ -249,6 +249,9 @@ export type AuthSnapshot = { token: string; epoch: number };
  */
 export type AuthSession = {
   snapshot: () => AuthSnapshot;
+  /** Changes on a new access token as well as identity changes; privileged UI subscribes to this fence. */
+  getAccessGeneration: () => number;
+  subscribeAccessGeneration: (listener: () => void) => () => void;
   /** 开始新身份边界（登录尝试/主动清理）：递增 epoch 并清 token，返回新 epoch。 */
   beginIdentity: () => number;
   /** 仅 expectedEpoch 仍为当前身份时写 token。 */

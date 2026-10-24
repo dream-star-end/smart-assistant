@@ -1,3 +1,4 @@
+import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBoundary";
 /**
  * P5 会话渲染入口。
  *
@@ -156,7 +157,11 @@ type RendererProps = {
   hostedPermission?: boolean;
 };
 
-export const MessageRenderer = memo(
+export function MessageRenderer(props: RendererProps) {
+  return <ReadOnlySystemActionsBoundary readOnly={props.readOnly ?? false}><MessageRendererInner {...props} /></ReadOnlySystemActionsBoundary>;
+}
+
+const MessageRendererInner = memo(
   function MessageRenderer({
     message,
     sig,
@@ -2918,6 +2923,7 @@ export function MessageList({
     event.stopPropagation();
   };
   return (
+    <ReadOnlySystemActionsBoundary readOnly={readOnly}>
     <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
     <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
@@ -3129,5 +3135,6 @@ export function MessageList({
     </div>
     </>
     </PermissionToolReopenContext.Provider>
+    </ReadOnlySystemActionsBoundary>
   );
 }

@@ -90,6 +90,7 @@ const MarketplaceCenter = lazy(() =>
 const OrgCenter = lazy(() => import("./OrgCenter").then((m) => ({ default: m.OrgCenter })));
 
 export type AppDialogsProps = {
+  preferencesRevision?: number;
   activeId: string | undefined;
   activeSess: ChatSession | undefined;
   agent: Agent;
@@ -332,6 +333,7 @@ export function AppDialogs({
   settingsSection,
   shareOpen,
   subscribeOpenSignal,
+  preferencesRevision,
   teamMode,
   theme,
   toast,
@@ -411,6 +413,7 @@ export function AppDialogs({
       {settingsOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
+            preferencesRevision={preferencesRevision}
             activeSessionId={activeId}
             open={settingsOpen}
             initialSection={settingsSection}
