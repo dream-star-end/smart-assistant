@@ -10,6 +10,7 @@ const EXECUTORS = new Set(['master', 'control', 'browser'])
 export type ReceiptObserver = (receipt: SystemActionSummary, context: { assertCurrent: () => void }) => void | Promise<void>
 export type SystemActionsClient = {
   getPreferencesSnapshot(): Promise<Preferences>
+  getInboxUnreadCountSnapshot(): Promise<number>
   getDetail(id: string): Promise<SystemActionDetail>
   getResult(id: string): Promise<SystemActionSummary>
   getConfirmation(id: string): Promise<{ detail: SystemActionDetail; nonce: string }>
@@ -110,6 +111,10 @@ export function createSystemActionsApi(options: {
     getPreferencesSnapshot: () => request('/api/me/preferences', value => {
       if (!object(value)) invalidResponse()
       return value
+    }),
+    getInboxUnreadCountSnapshot: () => request('/api/me/messages/unread_count', value => {
+      if (!object(value) || !Number.isSafeInteger(value.unread_count) || (value.unread_count as number) < 0) invalidResponse()
+      return value.unread_count as number
     }),
     async getConfirmation(id) {
       issued.delete(id)

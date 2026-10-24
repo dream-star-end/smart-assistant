@@ -12,7 +12,7 @@ import {
   TriangleAlert,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api, apiErrorMessage } from "../lib/api";
 import { INBOX_LEVEL_META, type InboxLevelTone } from "../lib/inboxLevels";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -145,8 +145,10 @@ export function InboxDialog({
   auth,
   onClose,
   onUnreadChange,
+  refreshRevision = 0,
 }: {
   open: boolean;
+  refreshRevision?: number;
   auth: AuthSession | null;
   onClose: () => void;
   /** 标记已读后通知父层回拉未读真值，刷新顶栏铃铛红点。 */
@@ -166,6 +168,14 @@ export function InboxDialog({
   // 重试计数：递增以强制首屏拉取 effect 重跑。
   const [reloadTick, setReloadTick] = useState(0);
 
+  const subscribe = useCallback((listener: () => void) => auth?.subscribeAccessGeneration?.(listener) ?? (() => {}), [auth]);
+  const getGeneration = useCallback(() => auth?.getAccessGeneration?.() ?? -1, [auth]);
+  const accessGeneration = useSyncExternalStore(subscribe, getGeneration, getGeneration);
+  const listIdentity = useMemo(() => ({ open, auth, tab, reloadTick, refreshRevision, accessGeneration }), [open, auth, tab, reloadTick, refreshRevision, accessGeneration]);
+  const latestList = useRef(listIdentity);
+  latestList.current = listIdentity;
+  const isCurrentList = useCallback(() => latestList.current === listIdentity && (auth?.getAccessGeneration?.() ?? -1) === listIdentity.accessGeneration, [auth, listIdentity]);
+
   // 关闭时复位到初始 Tab / 收起态，下次打开是干净状态。
   useEffect(() => {
     if (!open) {
@@ -176,8 +186,10 @@ export function InboxDialog({
 
   // 首屏 / 切 Tab / 重试：拉第一页（unread_only 跟随 Tab）。
   useEffect(() => {
-    if (!open || !auth) return;
+    if (!open || !auth || !auth.snapshot().token) return;
     let alive = true;
+    setLoadingMore(false);
+    setMarkingAll(false);
     setLoading(true);
     setErr(null);
     setMarkAllErr(null);
@@ -186,24 +198,24 @@ export function InboxDialog({
     api
       .listInboxMessages(auth, { limit: LIMIT, unreadOnly: tab === "unread" })
       .then((r) => {
-        if (!alive) return;
+        if (!alive || !isCurrentList()) return;
         setMessages(r.messages);
         setUnreadCount(r.unread_count);
         setHasMore(r.messages.length === LIMIT);
       })
       .catch((e) => {
-        if (alive) setErr(apiErrorMessage(e, "加载站内信失败"));
+        if (alive && isCurrentList()) setErr(apiErrorMessage(e, "加载站内信失败"));
       })
       .finally(() => {
-        if (alive) setLoading(false);
+        if (alive && isCurrentList()) setLoading(false);
       });
     return () => {
       alive = false;
     };
-  }, [open, auth, tab, reloadTick]);
+  }, [open, auth, tab, isCurrentList]);
 
   const loadMore = useCallback(async () => {
-    if (!auth || loadingMore) return;
+    if (!open || !auth?.snapshot().token || loading || loadingMore) return;
     setLoadingMore(true);
     setMoreErr(false);
     try {
@@ -218,16 +230,17 @@ export function InboxDialog({
         offset,
         unreadOnly: tab === "unread",
       });
+      if (!isCurrentList()) return;
       setMessages((cur) => [...cur, ...r.messages]);
       setUnreadCount(r.unread_count);
       setHasMore(r.messages.length === LIMIT);
     } catch {
       // 追加失败不炸整列表：保留已加载内容，按钮位就地转「重试」。
-      setMoreErr(true);
+      if (isCurrentList()) setMoreErr(true);
     } finally {
-      setLoadingMore(false);
+      if (isCurrentList()) setLoadingMore(false);
     }
-  }, [auth, loadingMore, messages.length, tab]);
+  }, [open, auth, loading, loadingMore, messages, tab, isCurrentList]);
 
   // 展开某条：单开手风琴；展开的是未读则单条标已读（乐观 + 成功后通知父层刷新红点）。
   const toggle = useCallback(
@@ -242,11 +255,11 @@ export function InboxDialog({
       setUnreadCount((c) => Math.max(0, c - 1));
       api
         .markInboxRead(auth, m.id)
-        .then(() => onUnreadChange())
+        .then(() => { if (isCurrentList()) onUnreadChange(); })
         // 失败不打断阅读：红点真值由下次轮询/重新拉取自然纠正。
         .catch(() => {});
     },
-    [expandedId, auth, onUnreadChange],
+    [expandedId, auth, onUnreadChange, isCurrentList],
   );
 
   const markAll = useCallback(async () => {
@@ -255,16 +268,17 @@ export function InboxDialog({
     setMarkAllErr(null);
     try {
       await api.markAllInboxRead(auth);
+      if (!isCurrentList()) return;
       setMessages((cur) => cur.map((m) => (m.read ? m : { ...m, read: true })));
       setUnreadCount(0);
       onUnreadChange();
     } catch (e) {
       // 全部已读失败：保持列表，红点不变，用户可再次点击重试。
-      setMarkAllErr(apiErrorMessage(e, "全部已读失败，请重试"));
+      if (isCurrentList()) setMarkAllErr(apiErrorMessage(e, "全部已读失败，请重试"));
     } finally {
-      setMarkingAll(false);
+      if (isCurrentList()) setMarkingAll(false);
     }
-  }, [auth, markingAll, unreadCount, onUnreadChange]);
+  }, [auth, markingAll, unreadCount, onUnreadChange, isCurrentList]);
 
   const retry = useCallback(() => setReloadTick((n) => n + 1), []);
 
