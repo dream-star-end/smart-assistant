@@ -403,11 +403,15 @@ const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n`]*$/;
 type UiFencesToMarkdownOptions = { systemActionReferences?: "preserve" | "plain" };
 /** Render-only: downgraded user text must not manufacture a new native UI fence. */
 function neutralizeUiFenceLanguagesForRender(text: string): string {
-  return text.replace(/(`{3,}|~{3,})([^\S\r\n]*)ui(?=\s|$)/gi, "$1$2json");
+  // Markdown decodes character references/backslash escapes in info strings. Encoded
+  // languages are deliberately plain here; no downgraded text may manufacture native UI.
+  return text.replace(/(`{3,}|~{3,})([^\r\n]*)/g, (whole, fence: string, info: string) =>
+    /^[ \t]*ui(?=\s|$)/i.test(info) || /[&\\]/.test(info) ? `${fence}json` : whole,
+  );
 }
 export function uiFencesToMarkdown(text: string, streaming = false, options: UiFencesToMarkdownOptions = {}): string {
   const rendering = options.systemActionReferences !== undefined;
-  if (rendering ? !/(`{3,}|~{3,})[ \t]*ui\b/i.test(text) : !text.includes("```ui") && !text.includes("~~~ui")) return text;
+  if (rendering ? !/`{3,}|~{3,}/.test(text) : !text.includes("```ui") && !text.includes("~~~ui")) return text;
   const lines = normalizeInlineUiFences(text).split("\n");
   const out: string[] = [];
   let i = 0;
@@ -426,7 +430,9 @@ export function uiFencesToMarkdown(text: string, streaming = false, options: UiF
     const closed = j < lines.length;
     if (lang !== "ui") {
       // 非 ui 围栏整段原样保留(里面即使出现 ```ui 也不是真的组件)。
-      out.push(...lines.slice(i, closed ? j + 1 : lines.length));
+      const block = lines.slice(i, closed ? j + 1 : lines.length);
+      if (rendering) block[0] = neutralizeUiFenceLanguagesForRender(block[0]!);
+      out.push(...block);
       i = closed ? j + 1 : lines.length;
       continue;
     }

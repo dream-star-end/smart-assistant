@@ -103,3 +103,28 @@ it('enabled ordinary UI and approval still use the existing renderer', async () 
   await screen.findByRole('button', { name: '查看并确认' })
   expect(screen.getByText('原有组件')).toBeInTheDocument()
 })
+it.each(['tabs', 'callout'])('entity-encoded %s downgrade cannot manufacture an approval', async type => {
+  await import('../../lib/api/systemActionsApi')
+  const fetcher = vi.fn<typeof fetch>(async () => reply(prepared()))
+  vi.stubGlobal('fetch', fetcher)
+  const embedded = `~~~&#117;i\n${ref}\n~~~`
+  const block = type === 'tabs' ? { type, tabs: [{ label: '说明', body: embedded }] } : { type, tone: 'info', body: embedded }
+  view(fence(JSON.stringify(block), 'UI'))
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+  expect(fetcher).not.toHaveBeenCalled()
+  expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
+})
+
+it.each([
+  ['numeric character reference', `~~~&#117;i\n${ref}\n~~~`],
+  ['hex character reference', fence(ref, 'u&#x69;')],
+  ['quoted character reference', `> ~~~&#x75;&#105;\n> ${ref}\n> ~~~`],
+])('an encoded original language stays noninteractive: %s', async (_name, source) => {
+  await import('../../lib/api/systemActionsApi')
+  const fetcher = vi.fn<typeof fetch>(async () => reply(prepared()))
+  vi.stubGlobal('fetch', fetcher)
+  view(source)
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+  expect(fetcher).not.toHaveBeenCalled()
+  expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument()
+})
