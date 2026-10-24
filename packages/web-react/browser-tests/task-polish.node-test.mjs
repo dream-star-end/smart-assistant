@@ -58,6 +58,7 @@ test('task polish user flows (real Chromium, isolated)', { timeout: 240_000 }, a
           assert.match(await page.getByTestId('ticket-list-page-range').textContent(), /1–50/)
           await page.getByTestId('ticket-list-page-next').click()
           await page.evaluate(() => window.shrink())
+          await page.waitForFunction(() => document.querySelectorAll('[data-testid="ticket-card"]').length === 7)
           assert.equal(await page.getByTestId('ticket-card').count(), 7)
           await page.evaluate(() => window.grow())
           await page.getByRole('button', { name: '任务 1', exact: true }).waitFor()

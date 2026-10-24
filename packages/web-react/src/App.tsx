@@ -167,11 +167,7 @@ import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
-import {
-  clearTeamModeForSession,
-  readTeamModeForSession,
-  writeTeamMode,
-} from "./lib/teamMode";
+import { clearTeamModeForSession } from "./lib/teamMode";
 import {
   type CollabMode,
   type CollabUiState,
@@ -912,13 +908,13 @@ export function App() {
     collabSaveError,
     collabUi,
     persistCollab,
+    promoteDraftCollab,
     selectModel,
     setCollabAsDefault,
     setCollabMode,
     setCollabSaveError,
     setCollabUi,
     setTeamMode,
-    setTeamModeState,
     teamMode,
   } = useSessionModelAndCollab({
     activeId,
@@ -979,6 +975,7 @@ export function App() {
     collabAsDefault,
     collabEpochRef,
     collabUi,
+    promoteDraftCollab,
     contextTier,
     demo,
     draftProjectId,
@@ -1006,7 +1003,6 @@ export function App() {
     setMessages,
     setSessions,
     setStreamText,
-    setTeamModeState,
     sockRef,
     stopPreparing,
     stopRef,
@@ -1035,7 +1031,7 @@ export function App() {
     activeId,
     agent,
     auth,
-    collabMode,
+    promoteDraftCollab,
     confirmDialog,
     contextTier,
     demo,

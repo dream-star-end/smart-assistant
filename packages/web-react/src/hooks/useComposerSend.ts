@@ -15,7 +15,6 @@ import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";
 import { findRewriteTarget } from "../lib/implicitFeedback";
 import { prepareAdvisorSend, saveInitialCollaboration, persistRecoveredAdvisor } from "../lib/collaborationSend";
-import { writeTeamMode } from "../lib/teamMode";
 import { writeSessionEffort } from "../lib/sessionEffort";
 import { writeContextTier } from "../lib/sessionContextTier";
 import { writeSessionServiceTier } from "../lib/sessionServiceTier";
@@ -56,6 +55,7 @@ export type ComposerSendInput = {
   newSessionInProject: (projectId: string) => void;
   preferenceEffort: PreferenceEffort | undefined;
   projectHome: ProjectRoute | null;
+  promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
@@ -73,7 +73,6 @@ export type ComposerSendInput = {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setSessions: React.Dispatch<React.SetStateAction<Session[]>>;
   setStreamText: React.Dispatch<React.SetStateAction<string>>;
-  setTeamModeState: React.Dispatch<React.SetStateAction<boolean>>;
   sockRef: React.RefObject<UseChatSocket | null>;
   stopPreparing: () => void;
   stopRef: React.RefObject<boolean>;
@@ -102,6 +101,7 @@ export function useComposerSend({
   newSessionInProject,
   preferenceEffort,
   projectHome,
+  promoteDraftCollab,
   publicCfg,
   selectedSessionIdRef,
   sendImplicitRatingRef,
@@ -119,14 +119,13 @@ export function useComposerSend({
   setMessages,
   setSessions,
   setStreamText,
-  setTeamModeState,
   sockRef,
   stopPreparing,
   stopRef,
   toast,
   user,
 }: ComposerSendInput) {
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, setTeamModeState, sockRef, stopRef are App useState setter/useRef passed in, stable
+  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef, collabEpochRef, draftProjectRef, selectedSessionIdRef, sendImplicitRatingRef, setBusy, setChatError, setCollabSaveError, setCollabUi, setMessages, setStreamText, sockRef, stopRef are App useState setter/useRef passed in, stable
   const send = useCallback(
     async (
       text: string,
@@ -200,7 +199,6 @@ export function useComposerSend({
         update: (state, recovered) => {
           if (!recoveryIsCurrent()) return false;
           setCollabUi(state);
-          setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },
@@ -218,27 +216,22 @@ export function useComposerSend({
           // 项目下新建：草稿建行即归属目标项目（侧栏首帧正确分组；服务端归属在下方首发收尾 PATCH）。
           ...(sendProjectId ? { projectId: sendProjectId } : {}),
           // 首发定格会话模型:当前有效模型(含空态显式选择)落为该会话的 per-session 选择,
-          // 之后 default_model 变更/其它会话换模都不影响它(与 teamMode 的会话级落地同理)。
+          // 之后 default_model 变更/其它会话换模都不影响它。
           ...(modelId ? { modelId } : {}),
         };
-        // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
-        // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
+        if (auth && agent.id === "main" && !recoveredAdvisor) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
-          const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
-          if (!ensured) {
-            toast("会话尚未创建成功，请检查网络后重试", "error");
-            return false;
-          }
           try {
+            const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
+            if (collabAuth.snapshot().epoch !== identityEpoch) return false;
+            if (!ensured) throw new Error("会话尚未创建成功，请检查网络后重试");
             const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
             if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return false;
             if (recoveryIsCurrent()) applyCollabDoc(doc);
@@ -246,12 +239,10 @@ export function useComposerSend({
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return false;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
-              const msg = apiErrorMessage(err, "协作配置保存失败");
-              setCollabSaveError(msg);
-              toast(msg, "error");
-              return false;
-            }
+            const msg = apiErrorMessage(err, "协作配置保存失败，请重新选择后重试");
+            setCollabSaveError(msg);
+            toast(msg, "error");
+            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) return false;
           }
         }
       }
@@ -331,7 +322,11 @@ export function useComposerSend({
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
       if(sent===false)return false;
-      if(createdSession&&recoveryIsCurrent())setActiveId(sessionId);
+      // Fee confirmation keeps ownership of the draft until the send is accepted.
+      if (createdSession && recoveryIsCurrent()) {
+        promoteDraftCollab(sessionId, latestCollab, false);
+        setActiveId(sessionId);
+      }
       if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
         auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
         ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
@@ -397,6 +392,7 @@ export function useComposerSend({
       setSessions,
       setActiveId,
       applyCollabDoc,
+      promoteDraftCollab,
       toast,
       setDraftProject,
     ],
