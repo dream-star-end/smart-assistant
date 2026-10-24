@@ -97,19 +97,27 @@ export function switchUnitPrice(p: ModelPricing): ModelSwitchUnitPrice {
   }
 }
 /** Only waive unknown-count confirmation when all input/cache possibilities and output are no dearer. */
-export function switchPriceDominated(to: ModelPricing, from: ModelPricing): boolean {
+export function switchPriceDominated(
+  to: ModelPricing,
+  from: ModelPricing,
+  toEngine?: string | null,
+  fromEngine?: string | null,
+): boolean {
+  const native = (engine: string | null | undefined) => engine === 'codex' || engine === 'grok'
+  const inputs = (p: ModelPricing, engine: string | null | undefined) =>
+    native(engine)
+      ? [p.input_per_mtok, p.cache_read_per_mtok]
+      : [p.input_per_mtok, p.cache_read_per_mtok, p.cache_write_per_mtok]
   const tm = multiplierToScaled(to.multiplier)
   const fm = multiplierToScaled(from.multiplier)
-  const target = [to.input_per_mtok, to.cache_read_per_mtok, to.cache_write_per_mtok].map(
-    (n) => n * tm,
+  // Native Codex/Grok have no cache-write category. Every supported zero rate
+  // is still a real possible free path and must not be discarded as missing.
+  const target = inputs(to, toEngine).map((n) => n * tm)
+  const original = inputs(from, fromEngine).map((n) => n * fm)
+  return (
+    target.reduce((a, b) => (a > b ? a : b)) <= original.reduce((a, b) => (a < b ? a : b)) &&
+    to.output_per_mtok * tm <= from.output_per_mtok * fm
   )
-  const original = [
-    from.input_per_mtok,
-    ...[from.cache_read_per_mtok, from.cache_write_per_mtok].filter((n) => n > 0n),
-  ].map((n) => n * fm)
-  const highest = target.reduce((a, b) => (a > b ? a : b))
-  const lowest = original.reduce((a, b) => (a < b ? a : b))
-  return highest <= lowest && to.output_per_mtok * tm <= from.output_per_mtok * fm
 }
 /** Scoped explicit consent; no price change, reservation, settlement or model routing. */
 export class ModelSwitchCostService {
@@ -268,7 +276,7 @@ export class ModelSwitchCostService {
       requiresConfirmation: true,
       canConfirm: balance > 0n,
     }
-    if (risk && from && switchPriceDominated(to, from))
+    if (risk && from && switchPriceDominated(to, from, target.engine, fromEngine))
       return { quote: { ...quote, mode: 'exempt', requiresConfirmation: false } }
     if (!risk && ctx.tokens !== null && from) {
       const output = outputPrediction(ctx.outputs, this.policy)

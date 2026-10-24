@@ -1,3 +1,4 @@
+import { switchPriceDominated } from '../billing/modelSwitchCost.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Pool } from 'pg'
@@ -284,4 +285,15 @@ test('engine-specific estimation follows actual settlement, not a global agent s
     assert.equal(quote.currentCost?.expectedCredits, '6') // CCB cold write rate64, not its 1000x agent override.
     assert.equal(quote.requiresConfirmation, true)
   }
+})
+
+test('unknown-count cheap waiver preserves free supported cache rates', () => {
+  const cheap = price('gpt-6-luna', 53, 265, 11, 64, '0.400')
+  const dear = price('gpt-6-astra', 598, 3598, 60, 0)
+  assert.equal(switchPriceDominated(cheap, dear, 'codex', 'codex'), true)
+  assert.equal(
+    switchPriceDominated(cheap, { ...dear, cache_read_per_mtok: 0n }, 'codex', 'codex'),
+    false,
+  )
+  assert.equal(switchPriceDominated(cheap, dear, 'codex', 'ccb'), false)
 })
