@@ -175,7 +175,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     lastVerifiedUid.current = null;
     pendingAccountRef.current = null;
     setPendingAccount(null);
-    // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
+    // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();
     bootstrapMeFriction.current = null;
@@ -336,8 +336,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
           } catch (error) {
             if (controller.signal.aborted || session.snapshot().epoch !== bootEpoch) return;
             if (!isAuthRecoveryTransient(error)) {
-              session.beginIdentity();
-              clearAuthState();
+              setAuthError("账号信息暂未核验完成，请重试");
+              setAuthRecoveryAvailable(true);
+              setBooting(false);
               return;
             }
             const prior = bootstrapMeFriction.current;
