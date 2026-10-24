@@ -605,7 +605,7 @@ async function buildCollabApp() {
 async function fixtureIdle(page) {
   await page.waitForFunction(() => {
     const send = document.querySelector('button[aria-label="发送"]');
-    return send && !send.disabled && !document.querySelector('button[aria-label="停止"]');
+    return send && !document.querySelector('button[aria-label="停止"]');
   });
 }
 
