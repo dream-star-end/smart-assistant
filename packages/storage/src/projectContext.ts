@@ -21,6 +21,7 @@ import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promise
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { acquireFileLock } from './memoryShared.js'
 import { paths } from './paths.js'
+import type { ProjectFileLocations } from './authorityPaths.js'
 import type { SqlDb } from './projectMemoryLedger.js'
 import {
   hashSkillTree,
@@ -299,12 +300,13 @@ function parseMeta(raw: string, boardProjectId: string): ProjectContextMeta {
   }
 }
 
-async function readMetaUnlocked(boardProjectId: string): Promise<ProjectContextMeta> {
+async function readMetaUnlocked(boardProjectId: string, locations: ProjectFileLocations = paths, strictRead = false): Promise<ProjectContextMeta> {
   const id = assertBoardId(boardProjectId)
   try {
-    const raw = await readFile(paths.projectMeta(id), 'utf8')
+    const raw = await readFile(locations.projectMeta(id), 'utf8')
     return parseMeta(raw, id)
-  } catch {
+  } catch (error) {
+    if (strictRead && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     return emptyMeta(id)
   }
 }
@@ -347,11 +349,14 @@ interface InstructionsFileRead {
 async function readInstructionsFileUnlocked(
   id: string,
   meta: ProjectContextMeta,
+  locations: ProjectFileLocations = paths,
+  strictRead = false,
 ): Promise<InstructionsFileRead> {
   let raw: string
   try {
-    raw = await readFile(paths.projectInstructionsFile(id), 'utf8')
-  } catch {
+    raw = await readFile(locations.projectInstructionsFile(id), 'utf8')
+  } catch (error) {
+    if (strictRead && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     return { status: 'absent', instructions: null, raw: null }
   }
   const trimmed = clipProjectInstructions(raw)
@@ -381,21 +386,24 @@ async function preserveInstructionsConflictUnlocked(
   return { ...meta, instructionsConflict: { file, sha256: sha, at } }
 }
 
+async function readProjectContextSnapshot(id: string, locations: ProjectFileLocations, strictRead: boolean): Promise<ProjectContextSnapshot> {
+  const meta = await readMetaUnlocked(id, locations, strictRead)
+  const file = await readInstructionsFileUnlocked(id, meta, locations, strictRead)
+  return { boardProjectId: id, version: meta.version, instructions: file.instructions,
+    skillOverlay: meta.contentManifest.skills.filter(s => s.active).map(s => s.name), meta, instructionsFileStatus: file.status }
+}
+
 export async function loadProjectContext(boardProjectId: string): Promise<ProjectContextSnapshot> {
   const id = assertBoardId(boardProjectId)
-  return withProjectLock(id, async () => {
-    const meta = await readMetaUnlocked(id)
-    const file = await readInstructionsFileUnlocked(id, meta)
-    return {
-      boardProjectId: id,
-      version: meta.version,
-      instructions: file.instructions,
-      skillOverlay: meta.contentManifest.skills.filter((s) => s.active).map((s) => s.name),
-      meta,
-      instructionsFileStatus: file.status,
-    }
-  })
+  return withProjectLock(id, () => readProjectContextSnapshot(id, paths, false))
 }
+
+/** Pure explicit-root read. No lock, directory creation, migration, repair or legacy fallback. */
+export async function loadProjectContextReadonly(boardProjectId: string, locations: ProjectFileLocations): Promise<ProjectContextSnapshot> {
+  if (!locations) throw new Error('Explicit project locations are required')
+  return readProjectContextSnapshot(assertBoardId(boardProjectId), locations, true)
+}
+
 
 export function skillOverlayManifestSha256(skills: readonly ProjectSkillManifestEntry[]): string {
   const active = skills
