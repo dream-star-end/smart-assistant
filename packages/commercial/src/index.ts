@@ -1,6 +1,7 @@
+import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
-import { assembleSystemActions } from './system-assistant/assemble.js'
+import { assembleSystemActions, type SystemSessionReadBackend } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
@@ -540,6 +541,7 @@ import {
 } from "@openclaude/storage";
 import {
   createPgSessionsBackend,
+  readPgChatProject,
   commitVisibleLosslessTurnPhaseA,
   _setAfterLosslessStageBatch,
   type AutomaticRecoveryDecision,
@@ -700,7 +702,7 @@ import {
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz, scopeFromAuthz } from "./auth/userModelAuthz.js";
-import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
+import { getProviderRoutingAvailability, getDegradedProviders } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
 import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
@@ -1402,6 +1404,7 @@ export async function registerCommercial(
   let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
   let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined;
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
+  let systemSessionReadBackend: SystemSessionReadBackend | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
@@ -1466,6 +1469,7 @@ export async function registerCommercial(
           recordRecoveryJobTerminalFriction(userId, sessionId, info),
       });
       setClientSessionsBackend(pgSessionsBackend);
+      systemSessionReadBackend = pgSessionsBackend;
       losslessTurnTapeStorage = pgSessionsBackend;
       dispatchAdmissionBackend = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
@@ -4426,12 +4430,14 @@ export async function registerCommercial(
       runner: getPool(),
       identityRepo: createPgIdentityRepo(),
       privacySupported: async userId => (await resolvePromptPrivacySupport(userId)).state === 'ready',
+      modelReads: { catalog: peekModelCatalogCache() ?? undefined, loadUserModelAuthz, getDegradedProviders },
+      stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readRuntimeStatus: makeSystemRuntimeStatusRead(v3Deps) },
     });
   }
   const handler = createCommercialHandler({
     modelSwitchCost,
     jwtSecret,
-    systemActionsHttp: systemActions?.runtime.handleBrowser,
+    ...systemActions?.http,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
     goalStateService,

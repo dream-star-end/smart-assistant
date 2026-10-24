@@ -675,6 +675,7 @@ export function App() {
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
+    applySessionMetadata,
     applySessionTerminal,
     reset: resetSessionList,
     serverListSettled,
@@ -1439,6 +1440,7 @@ export function App() {
     demo,
     applyPreferences: applyConversationPreferences,
     applyInboxUnreadCount: inbox.applyUnreadCountSnapshot,
+    applySessionMetadata,
     setTheme,
     onSyncError: () => toast("操作已完成，页面显示暂未同步，请手动刷新。"),
   });

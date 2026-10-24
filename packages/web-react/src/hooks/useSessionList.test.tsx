@@ -937,3 +937,56 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     );
   });
 });
+
+test("confirmed metadata refreshes sidebar and local socket title without issuing another write", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  const patch = vi.spyOn(api, "patchSessionMeta");
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved", pinned: true, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved", pinned: true });
+  expect(harness.socket.renameSession).toHaveBeenCalledExactlyOnceWith("webkeepme001", "Approved");
+  expect(harness.patchSessionTitle).not.toHaveBeenCalled();
+  expect(patch).not.toHaveBeenCalled();
+});
+test("a delayed list response cannot restore metadata older than a confirmed receipt snapshot", async () => {
+  const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+  const old = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+  vi.mocked(api.listSessions).mockImplementationOnce(() => old.promise);
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(2));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved", pinned: true, updatedAt: 3000 }));
+  await act(async () => old.resolve([meta("webkeepme001", "Old response")] as never));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved", pinned: true });
+});
+test("older display snapshots cannot overwrite a newer one and reset retires their version floor", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Newest", pinned: true, updatedAt: 4000 }));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Older", pinned: false, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")?.title).toBe("Newest");
+  expect(harness.socket.renameSession).toHaveBeenCalledTimes(1);
+  act(() => result.current.reset());
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "New identity", pinned: false, updatedAt: 2000 }));
+  expect(harness.socket.renameSession).toHaveBeenLastCalledWith("webkeepme001", "New identity");
+});
+
+test("a newer normal canonical page wins over the first delayed metadata snapshot", async () => {
+  const { result, harness } = await renderSessionList({ confirmResult: false, promptResult: null });
+  vi.spyOn(api,"listSessionsPage").mockResolvedValue({ sessions: [{ ...meta("webkeepme001","Newest page"), updatedAt: 4000 }], nextCursor: null } as never);
+  await act(async () => result.current.loadArchivedSessions());
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Delayed receipt", pinned: true, updatedAt: 3000 }));
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")?.title).toBe("Newest page");
+  expect(harness.socket.renameSession).not.toHaveBeenCalled();
+});
+test("a metadata watermark cannot make an older model payload pass the existing confirmed model floor", async () => {
+  const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+  vi.spyOn(api,"patchSessionModel").mockResolvedValue({ ok: true, updatedAt: 2500 } as never);
+  await act(async () => {
+    result.current.setSessions(current => current.map(session => session.id === "webkeepme001" ? { ...session, modelId: "confirmed-model" } : session));
+    result.current.queueModelPatch("webkeepme001","confirmed-model");
+  });
+  await waitFor(() => expect(api.patchSessionModel).toHaveBeenCalledTimes(1));
+  act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "Approved name", pinned: true, updatedAt: 3000 }));
+  vi.spyOn(api,"listSessionsPage").mockResolvedValue({ sessions: [{ ...meta("webkeepme001","Stale"), updatedAt: 1000, modelId: "stale-model" }], nextCursor: null } as never);
+  await act(async () => result.current.loadArchivedSessions());
+  expect(result.current.sessions.find(s => s.id === "webkeepme001")).toMatchObject({ title: "Approved name", pinned: true, modelId: "confirmed-model" });
+});

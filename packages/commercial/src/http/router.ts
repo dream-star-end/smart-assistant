@@ -1,3 +1,4 @@
+import { dispatchSessionMetadataRead } from './sessionMetadata.js'
 /**
  * T-16 — 商业化模块的 HTTP 路由器(无框架,基于 node:http)。
  *
@@ -1552,7 +1553,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'DELETE', path: '/api/me/github', handler: handleDeleteMyGithub },
     { method: 'GET', path: '/api/me/github/repos', handler: handleListMyGithubRepos },
     { method: 'GET', pathPrefix: '/api/me/github/repos/', handler: handleListMyGithubBranches },
-    { method: 'GET', pathPrefix: '/api/me/sessions/', handler: handleGetSessionGithubSelection },
+    { method: 'GET', pathPrefix: '/api/me/sessions/', handler: (req,res,ctx) => dispatchSessionMetadataRead(req,res,ctx,deps,handleGetSessionGithubSelection) },
     { method: 'PUT', pathPrefix: '/api/me/sessions/', handler: handlePutSessionGithubSelection },
     {
       method: 'DELETE',
