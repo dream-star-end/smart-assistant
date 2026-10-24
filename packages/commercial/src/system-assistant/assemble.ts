@@ -1,3 +1,4 @@
+import { systemReadOperations } from './readOperations.js'
 /** Host-only composition. Enabled solely by the verified personal deployment. */
 import type { ContainerIdentityRepo } from '../auth/containerIdentity.js'
 import type { QueryRunner } from '../db/queries.js'
@@ -20,7 +21,11 @@ export function assembleSystemActions(deps: {
   identityRepo: ContainerIdentityRepo
   privacySupported(userId: string): Promise<boolean>
 }) {
-  const registry = new SystemOperationRegistry(preferenceOperations({ authorize: makeAuthorizeSystemActor(deps.runner), privacySupported: deps.privacySupported }))
+  const authorize = makeAuthorizeSystemActor(deps.runner)
+  const registry = new SystemOperationRegistry([
+    ...preferenceOperations({ authorize, privacySupported: deps.privacySupported }),
+    ...systemReadOperations({ authorize }),
+  ])
   const runtime = openSystemActionsRuntime({ ...deps, registry })
   return { runtime, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
 }
