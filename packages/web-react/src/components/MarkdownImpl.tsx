@@ -446,7 +446,7 @@ export default function MarkdownImpl({
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
-              // Intelligent UI(OCV5-361):```ui 块 → 原生组件。开关关闭时上游已把 ui 围栏转成 Markdown,不会走到这里。
+              // Intelligent UI(OCV5-361):```ui 块 → 原生组件。关闭可选组件时仅保留完整严格的系统审批引用，其余围栏已转成 Markdown。
               if (lang === "ui")
                 return <IuiBlock code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} readOnly={readOnly} />;
               if (lang === "options")
@@ -572,7 +572,7 @@ export default function MarkdownImpl({
                 ? source
                 : iuiEnabled
                   ? normalizeInlineUiFences(source)
-                  : uiFencesToMarkdown(source, !!live),
+                  : uiFencesToMarkdown(source, !!live, { systemActionReferences: readOnly ? "plain" : "preserve" }),
             )
           : children}
       </ReactMarkdown>

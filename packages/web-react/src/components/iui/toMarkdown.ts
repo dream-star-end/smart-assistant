@@ -4,6 +4,7 @@
  * 四个用处:开关关闭时的渲染、消息复制、会话导出、组件渲染失败时的兜底。
  * 输出是普通 GFM(表格、列表、引用),任何 Markdown 阅读器都能读。
  */
+import { parseSystemActionReference } from "@openclaude/protocol/browser";
 import { isNextBlockCode } from "../../lib/nextBlock";
 import { normalizeInlineUiFences } from "../../lib/uiFence";
 import { biliToMarkdown } from "./biliMarkdown";
@@ -399,15 +400,25 @@ const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n`]*$/;
  * 整段 Markdown 里的 ```ui 围栏全部换成等价 Markdown;其它围栏(含其中的 ```ui 字样)不动。
  * `streaming` = 最后一个未闭合的 ui 围栏按半截处理(能转多少转多少);否则未闭合的也按完整处理。
  */
-export function uiFencesToMarkdown(text: string, streaming = false): string {
-  if (!text.includes("```ui") && !text.includes("~~~ui")) return text;
+type UiFencesToMarkdownOptions = { systemActionReferences?: "preserve" | "plain" };
+/** Render-only: downgraded user text must not manufacture a new native UI fence. */
+function neutralizeUiFenceLanguagesForRender(text: string): string {
+  // Markdown decodes character references/backslash escapes in info strings. Encoded
+  // languages are deliberately plain here; no downgraded text may manufacture native UI.
+  return text.replace(/(`{3,}|~{3,})([^\r\n]*)/g, (whole, fence: string, info: string) =>
+    /^[ \t]*ui(?=\s|$)/i.test(info) || /[&\\]/.test(info) ? `${fence}json` : whole,
+  );
+}
+export function uiFencesToMarkdown(text: string, streaming = false, options: UiFencesToMarkdownOptions = {}): string {
+  const rendering = options.systemActionReferences !== undefined;
+  if (rendering ? !/`{3,}|~{3,}/.test(text) : !text.includes("```ui") && !text.includes("~~~ui")) return text;
   const lines = normalizeInlineUiFences(text).split("\n");
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {
     const m = FENCE_OPEN.exec(lines[i]!);
     if (!m) {
-      out.push(lines[i]!);
+      out.push(rendering ? neutralizeUiFenceLanguagesForRender(lines[i]!) : lines[i]!);
       i += 1;
       continue;
     }
@@ -419,12 +430,19 @@ export function uiFencesToMarkdown(text: string, streaming = false): string {
     const closed = j < lines.length;
     if (lang !== "ui") {
       // 非 ui 围栏整段原样保留(里面即使出现 ```ui 也不是真的组件)。
-      out.push(...lines.slice(i, closed ? j + 1 : lines.length));
+      const block = lines.slice(i, closed ? j + 1 : lines.length);
+      if (rendering) block[0] = neutralizeUiFenceLanguagesForRender(block[0]!);
+      out.push(...block);
       i = closed ? j + 1 : lines.length;
       continue;
     }
     const body = lines.slice(i + 1, j).join("\n");
-    out.push(uiCodeToMarkdown(body, !closed && streaming));
+    if (options.systemActionReferences === "preserve" && parseSystemActionReference(body, closed)) {
+      out.push(...lines.slice(i, j + 1));
+    } else {
+      const markdown = uiCodeToMarkdown(body, !closed && streaming);
+      out.push(rendering ? neutralizeUiFenceLanguagesForRender(markdown) : markdown);
+    }
     i = closed ? j + 1 : lines.length;
   }
   return out.join("\n");
