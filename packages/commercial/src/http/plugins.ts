@@ -284,6 +284,8 @@ function setupMatch(
     : null
 }
 
+const LITERATURE_ARTIFACT_GONE = '文献 PDF 已过期或已被清理，请让助手用同一编号重新下载'
+
 export async function dispatchPluginsRoute(
   req: IncomingMessage,
   res: ServerResponse,
@@ -309,10 +311,22 @@ export async function dispatchPluginsRoute(
     res.setHeader('Pragma', 'no-cache')
     res.setHeader('X-Content-Type-Options', 'nosniff')
     if (method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Method not allowed')
-    const match = /^\/api\/plugins\/literature-db\/artifacts\/([A-Za-z0-9-]{16,128})$/.exec(path)
+    const match =
+      /^\/api\/plugins\/literature-db\/artifacts\/([A-Za-z0-9-]{16,128})(\/meta)?$/.exec(path)
     if (!match) throw new HttpError(400, 'INVALID_INPUT', 'Invalid literature artifact id')
     if (!deps.literatureArtifacts)
       throw new HttpError(503, 'UNAVAILABLE', 'Literature artifact store is unavailable')
+    if (match[2]) {
+      // Save-card metadata (OCV5-585): expiry only, no bytes; never marks the file as saved.
+      const meta = deps.literatureArtifacts.describe(userId, match[1]!)
+      if (!meta) throw new HttpError(404, 'LITERATURE_ARTIFACT_EXPIRED', LITERATURE_ARTIFACT_GONE)
+      sendJson(res, 200, {
+        expiresAt: new Date(meta.expiresAt).toISOString(),
+        bytes: meta.bytes,
+        saved: meta.saved,
+      })
+      return
+    }
     let found: ReturnType<NonNullable<typeof deps.literatureArtifacts>['read']> = null
     try {
       found = deps.literatureArtifacts.read(userId, match[1])
@@ -321,7 +335,7 @@ export async function dispatchPluginsRoute(
         throw new HttpError(429, 'CAPACITY', 'Literature artifact store is busy')
       throw error
     }
-    if (!found) throw new HttpError(404, 'NOT_FOUND', 'Literature artifact not found or expired')
+    if (!found) throw new HttpError(404, 'LITERATURE_ARTIFACT_EXPIRED', LITERATURE_ARTIFACT_GONE)
     const asciiFallback =
       found.filename
         .replace(/[^\x20-\x7e]/g, '_')

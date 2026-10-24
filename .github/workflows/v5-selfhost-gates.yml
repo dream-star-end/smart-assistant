@@ -259,6 +259,12 @@ jobs:
       - name: Workspace links (OCV5-549)
         run: bash scripts/v5-selfhost-workspace-links.test.sh
 
+      # OCV5-581:L0 只读发车预检。每项检查用最小故障红一次、修好绿一次;另验只读与接线顺序。
+      - name: L0 departure preflight (OCV5-581)
+        run: |
+          bash scripts/v5-release-preflight.test.sh
+          node --test scripts/lib/proofDbPreflight.test.mjs
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

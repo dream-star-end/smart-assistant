@@ -13,6 +13,8 @@ import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../..
 import type { Ticket } from "../../lib/taskboard";
 import type { ToolLike } from "./format";
 
+export type LiteratureArtifactMeta = { expiresAt: string; bytes: number; saved: boolean };
+
 export type ToolCardActions = {
   /** 打开记忆中心（memory / archival / session_search 类）。 */
   onOpenMemory?: () => void;
@@ -24,6 +26,8 @@ export type ToolCardActions = {
   onPaperAction?: (action: "download" | "citation", identifier: string) => void;
   /** 文献数据库插件 PDF 产物受鉴权下载（返回 Blob 触发浏览器保存）。 */
   downloadLiteratureArtifact?: (artifactId: string) => Promise<Blob>;
+  /** 文献 PDF 保存期限（OCV5-585）；已过期或已被清理时返回 null。 */
+  literatureArtifactMeta?: (artifactId: string) => Promise<LiteratureArtifactMeta | null>;
   /**
    * 连接器写操作确认卡（oc-connect，human-in-the-loop）：详情拉取 + 批准/拒绝。
    * 需登录鉴权（Bearer），由 App 绑定 authRef 注入；无 provider（demo/未登录）时

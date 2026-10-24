@@ -165,7 +165,9 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 
 用户安装并绑定「文献数据库」插件后，可用 `oc-plugin call literature-db search` 与 `oc-plugin call literature-db download` 检索和下载中英文文献全文：
 - **编号有效期 24 小时**：`search` 返回的 `documentId` 绑定当前用户与账号实例，有效期 24 小时。若下载报 `DOCUMENT_EXPIRED`（编号过期或校验失败），**必须先重新调用 `search` 获取新 `documentId` 再下载**，不要重放旧编号。
-- **串行限速下载**：下载多篇文献或遇到 `RATE_LIMITED` / `TIMEOUT` 时，**必须一篇一篇串行下载，每篇间隔 20-30 秒**，不要并发或紧挨着连续连打。
+- **PDF 暂存约 30 分钟**：`download` 成功后文件只在平台暂存约 30 分钟（服务重启也会丢失），要提醒用户及时在文献卡片上点「保存 PDF」。文件过期后用同一 `documentId` 重新 `download` 即可；同一篇重复 `download` 会直接复用已校验的文件。
+- **错误码**：`LITERATURE_ARTIFACT_CAPACITY` = 暂存已满（不是限流），先让用户保存已就绪的 PDF 或等较早的文件到期再下；`LITERATURE_NO_ACCESS` = 该篇不在订阅范围或机构通道拒绝访问，换一篇，账号无需重新绑定；`LITERATURE_UPSTREAM_RATE_LIMITED` = 文献源限流，等几分钟再试；`LITERATURE_UPSTREAM_CHALLENGE` = 人机验证/风控，不要自动重试；`LITERATURE_UPSTREAM_CHANGED` = 页面无法识别，**不是零结果**，可重试一次。
+- **串行下载**：下载多篇文献或遇到 `RATE_LIMITED`（账号正忙）/ `TIMEOUT` 时，**必须一篇一篇串行下载，每篇间隔 20-30 秒**，不要并发或紧挨着连续连打。
 
 ### B 站（哔哩哔哩）
 
