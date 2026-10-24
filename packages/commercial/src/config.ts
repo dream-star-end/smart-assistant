@@ -660,6 +660,10 @@ export const commercialConfigSchema = z
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
     */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /** OCV5-590 media studio music: root-only (0600) file holding the ElevenLabs API key. Unset → music unavailable. */
+    ELEVENLABS_API_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-590: studio music price per started minute (D6). Unset → 150. */
+    OC_STUDIO_MUSIC_CREDITS_PER_MINUTE: positiveInt(2000),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],
