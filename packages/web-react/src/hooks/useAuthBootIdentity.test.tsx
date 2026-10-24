@@ -1,22 +1,37 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
-import { afterEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { identityIsCurrent } from '../lib/resolvedIdentity'
 import { useAuth } from './useAuth'
-vi.mock('../lib/authHint', () => ({ hasAuthHint: () => true, setAuthHint: () => {}, clearAuthHint: () => {} }))
+import { clearAuthHint } from '../lib/authHint'
+vi.mock('../lib/authHint', () => ({ hasAuthHint: () => true, setAuthHint: () => {}, clearAuthHint: vi.fn() }))
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const refresh = () => reply({ access_token: 'alice-a', access_exp: 9999999999, remember: false })
+beforeEach(() => { vi.clearAllMocks() })
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
-it('a malformed current /me identity fails closed once instead of retrying the unchanged token indefinitely', async () => {
+it.each([17, '', null])('a malformed current /me id %j remains unbound and explicitly retryable without clearing credentials', async id => {
   const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/auth/refresh' ? refresh()
-    : String(url) === '/api/me' ? reply({ user: { id: 17, role: 'user' } }) : reply({ accepted: true }))
+    : String(url) === '/api/me' ? reply({ user: { id, role: 'user' } }) : reply({ accepted: true }))
   vi.stubGlobal('fetch', fetcher)
   const onClearAuth = vi.fn()
   const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth }))
   await waitFor(() => expect(view.result.current.booting).toBe(false))
   expect(view.result.current.authed).toBe(false)
   expect(view.result.current.resolvedIdentity).toBeNull()
-  expect(onClearAuth).toHaveBeenCalledTimes(1)
+  expect(onClearAuth).not.toHaveBeenCalled()
+  expect(clearAuthHint).not.toHaveBeenCalled()
+  expect(view.result.current.authRecoveryAvailable).toBe(true)
+  expect(view.result.current.authRef.current.snapshot()).toEqual({ token: 'alice-a', epoch: 0 })
   expect(fetcher.mock.calls.filter(([url]) => String(url) === '/api/me')).toHaveLength(1)
+  act(() => { view.result.current.dismissAuthRecovery() })
+  expect(view.result.current.authRecoveryAvailable).toBe(false)
+  expect(view.result.current.authRef.current.snapshot()).toEqual({ token: 'alice-a', epoch: 0 })
+  expect(clearAuthHint).not.toHaveBeenCalled()
+  fetcher.mockImplementation(async url => String(url) === '/api/auth/refresh' ? refresh() : reply({ user: { id: 'alice', role: 'user' } }))
+  act(() => { view.result.current.retryBoot() })
+  await waitFor(() => expect(view.result.current.authed).toBe(true))
+  expect(identityIsCurrent(view.result.current.resolvedIdentity, view.result.current.authRef.current, 'alice')).toBe(true)
+  expect(onClearAuth).not.toHaveBeenCalled()
+  expect(clearAuthHint).not.toHaveBeenCalled()
 })
 it('a stale /me during same-epoch token change rechecks the actual current attempt without clearing that identity', async () => {
   let release!: (response: Response) => void
@@ -38,4 +53,19 @@ it('a stale /me during same-epoch token change rechecks the actual current attem
   expect(identityIsCurrent(view.result.current.resolvedIdentity, view.result.current.authRef.current, 'alice')).toBe(true)
   expect(onClearAuth).not.toHaveBeenCalled()
   expect(reads).toBe(2)
+})
+
+it('a final me 401 is bounded and retryable, while only explicit invalid refresh clears credentials', async () => {
+  const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/auth/refresh' ? refresh() : reply({}, 401))
+  vi.stubGlobal('fetch', fetcher)
+  const onClearAuth = vi.fn()
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth }))
+  await waitFor(() => expect(view.result.current.authRecoveryAvailable).toBe(true))
+  expect(view.result.current.authRef.current.snapshot()).toEqual({ token: 'alice-a', epoch: 0 })
+  expect(onClearAuth).not.toHaveBeenCalled()
+  expect(clearAuthHint).not.toHaveBeenCalled()
+  fetcher.mockImplementation(async () => reply({ error: { code: 'INVALID_REFRESH', message: 'Invalid' } }, 401))
+  act(() => { view.result.current.retryBoot() })
+  await waitFor(() => expect(onClearAuth).toHaveBeenCalledTimes(1))
+  expect(clearAuthHint).toHaveBeenCalledTimes(1)
 })

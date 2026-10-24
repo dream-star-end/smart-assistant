@@ -79,7 +79,7 @@ export type CommunityBlogDraftPayload = {
   bodyMarkdown: string;
 };
 
-export type CommunityBlogActions = {
+export type CommunityBlogBusinessActions = {
   precheck: (draft: CommunityBlogDraftPayload) => Promise<CommunityBlogPrecheck>;
   /** 读容器里的图片文件（经媒体签名）。 */
   readContainerImage: (path: string) => Promise<Blob>;
@@ -92,6 +92,15 @@ export type CommunityBlogActions = {
   openMine: () => void;
   openEditor: (draft: CommunityBlogDraftPayload) => void;
 };
+
+type BlogNavigationKey = 'postUrl' | 'openPost' | 'openMine' | 'openEditor';
+export type CommunityBlogActions = Pick<CommunityBlogBusinessActions, BlogNavigationKey> & Partial<Omit<CommunityBlogBusinessActions, BlogNavigationKey>>;
+
+/** Navigation stays available while actual business I/O awaits verified identity. */
+export function communityBlogBusinessActions(actions?: CommunityBlogActions): CommunityBlogBusinessActions | undefined {
+  return actions?.precheck && actions.readContainerImage && actions.uploadImage && actions.submit && actions.getMine
+    ? actions as CommunityBlogBusinessActions : undefined;
+}
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});
 

@@ -1,4 +1,5 @@
-import { attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
+import { AuthEpochStaleError } from '../lib/api/http';
+import { advanceResolvedIdentityEpoch, attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
 import { useAuthAccessGeneration } from './useAuthAccessGeneration';
 import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -52,6 +53,8 @@ export type UseAuthOptions = {
   onClearAuth: () => void;
   /** 登出独有的持久层收尾（清本 user 的 IndexedDB 命名空间等；仅非 demo 时调用）。 */
   onLogout?: () => void;
+  /** Hide private UI while retaining valid credentials for an explicit account switch. */
+  onAccountSwitchPending?: () => void;
   /** 启动静默续期成功 → 进工作区（App 侧 setView("app")）。 */
   onBootAuthed?: () => void;
   /**
@@ -70,11 +73,15 @@ export type UseAuth = {
   authed: boolean;
   user: User | null;
   resolvedIdentity: ResolvedIdentity | null;
+  pendingAccount: User | null;
+  accountSwitchReady: boolean;
+  acceptAccountSwitch: () => void;
   setUser: React.Dispatch<React.SetStateAction<User | null>>;
   authLoading: boolean;
   authError: string | null;
   authRecoveryAvailable: boolean;
   retryBoot: () => void;
+  dismissAuthRecovery: () => void;
   /** 启动静默续期进行中（App 渲染极简 splash）。 */
   booting: boolean;
   /**
@@ -117,14 +124,20 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const user = account.user;
   const identityRef = useRef<ResolvedIdentity | null>(null);
   const lastVerifiedUid = useRef<string | null>(null);
-  // A display setter never grants an identity. Revoke synchronously before React commits.
-  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
-    revokeResolvedIdentity(identityRef.current);
-    identityRef.current = null;
-    setAccount(previous => ({ user: typeof update === 'function' ? update(previous.user) : update, identity: null }));
-  }, []);
+  const [pendingAccount, setPendingAccount] = useState<{ user: User; identity: ResolvedIdentity; auth: AuthSession } | null>(null);
+  const pendingAccountRef = useRef(pendingAccount);
   const userRef = useRef(user);
   userRef.current = user;
+  // A display-only update keeps an existing current proof, never creates one.
+  const setUser = useCallback<React.Dispatch<React.SetStateAction<User | null>>>((update) => {
+    const nextUser = typeof update === 'function' ? update(userRef.current) : update;
+    const previous = identityRef.current;
+    const identity = nextUser && identityIsCurrent(previous, authRef.current, nextUser.id) ? previous : null;
+    if (previous !== identity) revokeResolvedIdentity(previous);
+    identityRef.current = identity;
+    userRef.current = nextUser;
+    setAccount({ user: nextUser, identity });
+  }, []);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
@@ -143,8 +156,13 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const authRef = useRef<AuthSession>(createMemoryAuthSession(() => expiredUiRef.current()));
 
   const generation = useAuthAccessGeneration(authRef.current);
+  const validationAlive = useRef(true);
+  useEffect(() => {
+    validationAlive.current = true;
+    return () => { validationAlive.current = false; };
+  }, []);
   const validation = useRef<{
-    auth: AuthSession; epoch: number; generation: number;
+    auth: AuthSession; epoch: number; generation: number; pending: boolean;
     identity?: ResolvedIdentity | null;
     promise: Promise<{ me: User; identity: ResolvedIdentity | null }>;
   } | null>(null);
@@ -156,6 +174,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     if (previous !== identity) revokeResolvedIdentity(previous);
     identityRef.current = identity;
     if (identity) lastVerifiedUid.current = nextUser.id;
+    pendingAccountRef.current = null;
+    setPendingAccount(null);
+    userRef.current = nextUser;
     setAccount({ user: nextUser, identity });
     return true;
   }, []);
@@ -166,7 +187,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const clearAuthState = useCallback(() => {
     teardownComposerDrafts(lastVerifiedUid.current ?? userRef.current?.id);
     lastVerifiedUid.current = null;
-    // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效/boot /me 非瞬时失败）
+    pendingAccountRef.current = null;
+    setPendingAccount(null);
+    // 所有落到未登录态的路径（登出/多 tab 登出广播/refresh 明确失效）
     // 都经过这里：「登录过」标记一并作废，下次 boot 不再对已死的 cookie 发静默续期。
     clearAuthHint();
     bootstrapMeFriction.current = null;
@@ -184,10 +207,19 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
     const session = authRef.current;
     if (identity && !identityIsCurrent(identity, session, me.id)) return false;
-    // A changed account must end the old socket/workspace before normal login.
-    // Do not silently adopt another UID at the old identity epoch.
+    // Commit a suspended workspace before offering the verified new account.
+    // The token remains valid; auth=null stops the old WS without logging out.
     if (identity && lastVerifiedUid.current && lastVerifiedUid.current !== me.id) {
-      session.expire(identity.epoch);
+      revokeResolvedIdentity(identityRef.current);
+      identityRef.current = null;
+      setAccount(previous => ({ ...previous, identity: null }));
+      const pending = { user: me, identity, auth: session };
+      pendingAccountRef.current = pending;
+      setPendingAccount(pending);
+      setAuthed(false);
+      setLaneSignal(undefined);
+      setBooting(false);
+      cbRef.current.onAccountSwitchPending?.();
       return false;
     }
     return commitVerifiedUser(me, identity);
@@ -323,8 +355,9 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
             if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
             if (actualAttempt && !attemptCurrent(actualAttempt, session)) continue;
             if (!isAuthRecoveryTransient(error)) {
-              session.beginIdentity();
-              clearAuthState();
+              setAuthError("账号信息暂未核验完成，请重试");
+              setAuthRecoveryAvailable(true);
+              setBooting(false);
               return;
             }
             const prior = bootstrapMeFriction.current;
@@ -358,13 +391,31 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     return () => {
       controller.abort();
     };
-  }, [booting, clearAuthState, commitMeUser]);
+  }, [booting, commitMeUser]);
 
   const retryBoot = useCallback(() => {
     setAuthError(null);
     setAuthRecoveryAvailable(false);
     setBooting(true);
   }, []);
+  const dismissAuthRecovery = useCallback(() => {
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+  }, []);
+  const accountSwitchReady = !!pendingAccount && pendingAccount.auth === authRef.current && identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id);
+  const acceptAccountSwitch = useCallback(() => {
+    if (!pendingAccount || pendingAccountRef.current !== pendingAccount || pendingAccount.auth !== authRef.current ||
+      !identityIsCurrent(pendingAccount.identity, authRef.current, pendingAccount.user.id)) return;
+    const identity = advanceResolvedIdentityEpoch(pendingAccount.identity, authRef.current);
+    if (!commitVerifiedUser(pendingAccount.user, identity)) return;
+    setAuthError(null);
+    setAuthRecoveryAvailable(false);
+    setAuthed(true);
+    setLaneSignal({ lane: pendingAccount.user.lane ?? null });
+    setAuthHint();
+    cbRef.current.onLoginSuccess?.();
+    cbRef.current.onBootAuthed?.();
+  }, [pendingAccount, commitVerifiedUser]);
 
   // 其它同源 tab 主动登出：立即作废本 tab 的 epoch/token 和在飞 refresh，不等旧 access JWT
   // 自然过期；信号不携带任何 token。
@@ -460,22 +511,45 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     if (demo || booting || !authed || !session || !session.snapshot().token || identityIsCurrent(account.identity, session, user?.id)) return;
     const epoch = session.snapshot().epoch;
     let flight = validation.current;
-    if (!flight || flight.auth !== session || flight.epoch !== epoch || flight.generation !== generation ||
-        (flight.identity && !identityIsCurrent(flight.identity, session))) {
-      let identity: ResolvedIdentity | null = null;
-      const promise: Promise<{ me: User; identity: ResolvedIdentity | null }> = api.getMe(session, value => { identity = value; }).then(me => {
-        selected.identity = identity;
-        return { me, identity };
-      });
-      const selected = { auth: session, epoch, generation, promise, identity: undefined as ResolvedIdentity | null | undefined };
+    // Reuse an in-progress GET across its own 401 refresh. The whole task is
+    // bounded; each actual make still proves the exact token it used.
+    if (!flight || flight.auth !== session || flight.epoch !== epoch || (!flight.pending &&
+        (flight.generation !== generation || (flight.identity && !identityIsCurrent(flight.identity, session))))) {
+      let observedGeneration = generation;
+      const current = () => validationAlive.current && session === authRef.current && session.snapshot().epoch === epoch;
+      const verify = async () => {
+        for (let attempt = 0; ; attempt++) {
+          if (!current()) throw new AuthEpochStaleError();
+          try {
+            let identity: ResolvedIdentity | null = null;
+            const me = await api.getMe(session, value => { identity = value; }, value => { observedGeneration = value.generation; });
+            if (!current() || (identity && !identityIsCurrent(identity, session, me.id))) throw new AuthEpochStaleError();
+            return { me, identity };
+          } catch (error) {
+            if (!current() || attempt >= 1 || (!isAuthRecoveryTransient(error) && !(error instanceof AuthEpochStaleError))) throw error;
+            await new Promise<void>(resolve => setTimeout(resolve, AUTH_RECOVERY_BACKOFF_MS[attempt]));
+          }
+        }
+      };
+      const promise = verify().then(result => {
+        selected.identity = result.identity;
+        return result;
+      }).finally(() => { selected.pending = false; selected.generation = observedGeneration; });
+      const selected = { auth: session, epoch, generation, pending: true, promise, identity: undefined as ResolvedIdentity | null | undefined };
       validation.current = flight = selected;
     }
     let cancelled = false;
-    // A new consumer subscribes to the same generation's pending read; cleanup must
-    // not strand the capability. Failed reads stay cached until an explicit retry.
     void flight.promise.then(({ me, identity }) => {
-      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity) commitMeUser(me, identity);
-    }).catch(() => { /* A transient read failure leaves the business capability unresolved. */ });
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch && identity && commitMeUser(me, identity)) {
+        setAuthError(null);
+        setAuthRecoveryAvailable(false);
+      }
+    }).catch(() => {
+      if (!cancelled && session === authRef.current && session.snapshot().epoch === epoch) {
+        setAuthError("登录状态暂未核验完成，请重试");
+        setAuthRecoveryAvailable(true);
+      }
+    });
     return () => { cancelled = true; };
   }, [demo, booting, authed, auth, generation, account.identity, user?.id, commitMeUser]);
 
@@ -485,11 +559,15 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     authed,
     user,
     resolvedIdentity,
+    pendingAccount: pendingAccount?.user ?? null,
+    accountSwitchReady,
+    acceptAccountSwitch,
     setUser,
     authLoading,
     authError,
     authRecoveryAvailable,
     retryBoot,
+    dismissAuthRecovery,
     booting,
     laneReady,
     lane,
