@@ -138,6 +138,9 @@ export function makeCronOriginInjectHandler(
       sendError(res, 503, "NO_TRANSPORT", "no attested container bridge", requestId);
       return;
     }
+    if(result.reason.startsWith('MODEL_SWITCH_')){
+      sendError(res,409,result.reason,'origin model switch requires user confirmation',requestId);return;
+    }
     sendError(res, 503, "INJECT_FAILED", result.reason, requestId);
   };
 }

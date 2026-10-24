@@ -126,6 +126,7 @@ import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 
 export interface CommercialHttpDeps {
+  modelSwitchCost?: import('../billing/modelSwitchCost.js').ModelSwitchCostService;
   resolvePromptPrivacySupport?: (userId: string) => Promise<PromptPrivacySupport>;
   literatureSetup?: LiteratureSetupService
   literatureArtifacts?: LiteratureArtifactStore

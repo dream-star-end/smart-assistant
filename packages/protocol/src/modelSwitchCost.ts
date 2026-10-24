@@ -1,4 +1,4 @@
-/** Amounts on this wire are integer fen: 100 fen = one displayed credit. */
+/** Values use the existing chat/ledger unit, displayed 1:1 as 积分. */
 export interface ModelSwitchCostRequest {
   sessionId: string
   requestId: string
@@ -10,24 +10,30 @@ export interface ModelSwitchCostRequest {
   text?: string
   mediaCount?: number
 }
-export interface ModelSwitchCostRange {
-  lowFen: string
-  expectedFen: string
-  highFen: string
+export interface ModelSwitchCostAuthorization { requestId: string; consent?: string }
+export interface ModelSwitchCostRange { lowCredits: string; expectedCredits: string; highCredits: string }
+export interface ModelSwitchUnitPrice {
+  input: string
+  output: string
+  cacheRead: string
+  cacheWrite: string
 }
 export interface ModelSwitchCostQuote {
+  mode: 'exempt' | 'estimate' | 'risk'
   requestId: string
   targetModel: string
   targetName: string
   sourceModel: string | null
   sourceName: string | null
-  contextTokens: number
-  contextSource: 'last-call' | 'history-estimate' | 'empty'
-  outputTokens: number
+  contextTokens: number | null
+  contextSource: 'last-call' | 'unknown' | 'empty' | 'unchanged'
+  outputTokens: number | null
   sampleCount: number
-  targetCost: ModelSwitchCostRange
-  currentCost: ModelSwitchCostRange
-  balanceFen: string
+  targetCost: ModelSwitchCostRange | null
+  currentCost: ModelSwitchCostRange | null
+  /** Effective prices per million tokens, including current multipliers. */
+  targetUnitPrice: ModelSwitchUnitPrice | null
+  balanceCredits: string | null
   requiresConfirmation: boolean
   canConfirm: boolean
   expiresAt: number

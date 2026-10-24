@@ -1,3 +1,5 @@
+import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
+import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
  * v5 WS 对话引擎 —— ChatSocket。**渲染树之外的单例 service**（ref-based manager）：
  * 持有 ws + 全部连接/重连/游标/离线队列/计费归因可变状态；帧到达频率极高
@@ -299,6 +301,7 @@ export type LiveJournalObservation = {
 };
 
 export type ChatSocketDeps = {
+  authorizeSwitch?:AuthorizeSwitch;
   /** 当前内存态 access JWT（WS 子协议鉴权用）。*/
   getToken: () => string;
   /** AuthSession epoch；与 socket 自身生命周期 epoch 双重隔离。 */
@@ -5518,7 +5521,8 @@ export class ChatSocket {
   }
 
   // ═══════════════ 发送（inbound.message 构造 + 离线路由，§7/§10）═══════════════
-  sendMessage(p: {
+  async sendMessage(p: {
+    switchAuthorization?:SwitchAuthorization;
     sessId: string;
     agentId: string;
     text: string;
@@ -5534,7 +5538,15 @@ export class ChatSocket {
     collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
     serviceTier?: InboundMessage["serviceTier"];
-  }): void {
+  }): Promise<boolean> {
+    let authorization=p.switchAuthorization;
+    if(!authorization&&this.deps.authorizeSwitch&&p.model&&!p.imageEdit){
+      authorization=await this.deps.authorizeSwitch({sessionId:p.sessId,requestId:mintMsgId(),targetModel:p.model,agentId:p.agentId,
+        text:formatMessageReplyPrompt(p.text,p.replyTo),mediaCount:p.media?.length??0,teamMode:p.teamMode,
+        ...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
+      },{useCachedRequestId:true,allowOfflineQueue:true})??undefined;
+      if(!authorization)return false;
+    }
     const sess = this.ensureSession(p.sessId, p.agentId);
     if (sess._recoveryStatus?.kind === "completed" || sess._recoveryStatus?.kind === "resumed") {
       sess._recoveryStatus = undefined;
@@ -5557,6 +5569,7 @@ export class ChatSocket {
       : undefined;
     const routing: ChatRoutingSnapshot = {
       model: p.model,
+      ...(authorization?.consent?{modelSwitchConsent:authorization.consent}:{}),
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       teamMode: !!p.teamMode,
       ...(p.collabMode ? { collabMode: p.collabMode } : {}),
@@ -5596,6 +5609,7 @@ export class ChatSocket {
       ...(p.replyTo ? { replyToId: p.replyTo.messageId } : {}),
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
+      ...(authorization?.consent?{modelSwitchConsent:authorization.consent}:{}),
       ...(preparedSwitch ? { modelSwitchId: preparedSwitch.id } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
       ...(p.teamMode ? { teamMode: true } : {}),
@@ -5608,6 +5622,7 @@ export class ChatSocket {
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {
+      ...(authorization?{id:authorization.requestId}:{}),
       status: "sending",
       _media: media?.filter((m) => m.hidden !== true),
       // 重发走 dispatchPayload 会重新构帧,用剥离 localSrc 的版本(blob 不重发)。
@@ -5627,6 +5642,7 @@ export class ChatSocket {
     // server 历史 → 重开会话不留孤儿卡（reducer 回放路径无此行）。
     this.ensureGenPlaceholder(sess, p.imageEdit, false, userMsg.id);
     this.dispatchPayload(sess, userMsg, payload);
+    return true;
   }
 
   /** 本会话 turn 结束后继续派发其下一条已持久化消息。 */
@@ -5784,6 +5800,7 @@ export class ChatSocket {
         : {}),
       ...(routing.model ? { model: routing.model } : {}),
       ...(routing.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
+      ...(routing.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing.teamMode ? { teamMode: true } : {}),
       ...(routing.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
@@ -5946,17 +5963,16 @@ export class ChatSocket {
    * 单一发送收口**原地**重发（不新增气泡）；model/effort/teamMode 必须复用该次首发
    * 的 session routing 快照,不能被用户随后修改的偏好改变。
    */
-  retryMessage(p: {
+  async retryMessage(p: {
     sessId: string;
     msgId: string;
     agentId: string;
     /** Exact lazy-hydrated source for this dispatch only. It is deliberately
      * not assigned into the hot session or IndexedDB locator. */
     sourceOverride?: ChatMessage;
-  }): void {
+  }): Promise<void> {
     const sess = this.sessions.get(p.sessId);
     if (!sess) return;
-    sess._dispatchPaused = false;
     const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
     if (!userMsg || userMsg.status !== "error") return;
     const source = p.sourceOverride?.id === userMsg.id && p.sourceOverride.role === "user"
@@ -5964,7 +5980,6 @@ export class ChatSocket {
       : userMsg;
     // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
     const agentId = sess.agentId || p.agentId;
-    void this.ensureServerSessionOnce(sess, agentId);
     const replay = exactUserReplayPayload(source);
     // Historical rows written before message-level snapshots fall back to the session
     // snapshot; all new rows bind retry routing to the original user turn.
@@ -5972,6 +5987,18 @@ export class ChatSocket {
     // behind preciseRetryEligible (own _routing required). Only the manual user-bubble retry
     // (legacy send-failure rows) may still fall back to _lastRouting, and that path is preserved.
     const routing = normalizeRetiredRouting(source._routing ?? userMsg._routing ?? sess._lastRouting);
+    const terminal=this.isDispatchTerminalFailure(sess,userMsg);
+    const nextId=terminal?mintMsgId():userMsg.id;
+    if(this.deps.authorizeSwitch&&routing?.model&&!replay.imageEdit){
+      const permit=await this.deps.authorizeSwitch({sessionId:sess.id,requestId:nextId,targetModel:routing.model,agentId,
+        text:formatMessageReplyPrompt(replay.text,replay.replyTo),mediaCount:replay.media?.length??0,teamMode:routing.teamMode,
+        ...(routing.contextTier?{contextTier:routing.contextTier}:{}),...(routing.serviceTier?{serviceTier:routing.serviceTier}:{}),
+      },{consent:routing.modelSwitchConsent});
+      if(!permit||this.sessions.get(sess.id)!==sess||userMsg.status!=='error')return;
+      routing.modelSwitchConsent=permit.consent;
+    }
+    sess._dispatchPaused=false;
+    void this.ensureServerSessionOnce(sess,agentId);
     if (routing) {
       userMsg._routing = { ...routing };
       // Continuations belong to the retried turn, not to a later turn that last
@@ -5997,6 +6024,7 @@ export class ChatSocket {
         : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.modelSwitchId ? { modelSwitchId: routing.modelSwitchId } : {}),
+      ...(routing?.modelSwitchConsent ? { modelSwitchConsent:routing.modelSwitchConsent } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ...(routing?.collabMode ? { collabMode: routing.collabMode } : {}),
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
@@ -6012,9 +6040,9 @@ export class ChatSocket {
     //    并清掉旧轮残留的 durable dispatch status。
     //  - 其余 **resend-uncertain**(网络失败等,不确定是否已达 server):**复用旧 id + attempt 递增**,
     //    靠 gateway inbound 幂等去重防重复计费(dedup 保护),绝不铸新 id。
-    if (this.isDispatchTerminalFailure(sess, userMsg)) {
+    if (terminal) {
       const staleCmid = userMsg.id;
-      const freshId = mintMsgId();
+      const freshId = nextId;
       sess.messages = sess.messages.filter(
         (m) => !(m && m._clientMessageId === staleCmid && isDispatchTerminalRow(m)),
       );
@@ -6269,6 +6297,43 @@ export class ChatSocket {
       this.dispatchSlots.set(item.sessId, item.msgId);
       item.state = "persisting";
       this.setTransientNotice(sess.id, "正在发送…");
+      if(this.deps.authorizeSwitch&&item.payload.model&&!item.payload.content.imageEdit){
+        void this.authorizeQueuedSwitch(item).then(ok=>{if(ok)this.persistAuthorizedDispatch(item);});
+      }else this.persistAuthorizedDispatch(item);
+    }
+  }
+
+  private async authorizeQueuedSwitch(item:OfflineItem):Promise<boolean>{
+    const p=item.payload;
+    let permit:SwitchAuthorization|null;
+    try{permit=await this.deps.authorizeSwitch!({sessionId:item.sessId,requestId:item.msgId,targetModel:p.model!,agentId:p.agentId??'main',
+      text:formatMessageReplyPrompt(p.content.text??'',p.content.replyTo),mediaCount:p.content.media?.length??0,teamMode:p.teamMode,
+      ...(p.contextTier?{contextTier:p.contextTier}:{}),...(p.serviceTier?{serviceTier:p.serviceTier}:{}),
+    },{interactive:false,consent:p.modelSwitchConsent});}catch{
+      if(this.offlineQueue.includes(item)&&item.state==='persisting'){
+        item.state='queued';if(this.dispatchSlots.get(item.sessId)===item.msgId)this.dispatchSlots.delete(item.sessId);
+        this.setTransientNotice(item.sessId,'费用信息暂不可用，消息已保留，恢复连接后重试');
+      }
+      return false;
+    }
+    if(!this.offlineQueue.includes(item)||item.state!=='persisting')return false;
+    if(permit){p.modelSwitchConsent=permit.consent;return true;}
+    const sess=this.sessions.get(item.sessId);
+    this.clearPendingDispatch(item.sessId,item.msgId);
+    if(this.dispatchSlots.get(item.sessId)===item.msgId)this.dispatchSlots.delete(item.sessId);
+    if(sess){
+      if(sess._activeClientMessageId===item.msgId){sess._sendingInFlight=false;sess._activeClientMessageId=undefined;}
+      sess._dispatchPaused=true;
+      const user=sess.messages.find(m=>m.id===item.msgId&&m.role==='user');
+      if(user){user.status='error';user._errorCode='MODEL_SWITCH_CONFIRMATION_REQUIRED';user._errorDetail='切换后的首轮费用需要重新确认，请点击重试';}
+      this.setTransientNotice(sess.id,'切换后的首轮费用需要重新确认，请点击重试');
+      this.deps.persistSession?.(sess.id);this.scheduleNotify();
+    }
+    return false;
+  }
+
+  private persistAuthorizedDispatch(item:OfflineItem):void{
+    if(!this.offlineQueue.includes(item)||item.state!=='persisting')return;
       const committed = this.deps.persistPendingDispatch?.(item.sessId, {
         msgId: item.msgId,
         payload: item.payload,
@@ -6284,7 +6349,6 @@ export class ChatSocket {
         // behavior. Production always supplies persistPendingDispatch.
         this.sendPersistedDispatch(item);
       }
-    }
   }
 
   private handleDispatchJournalFailure(item: OfflineItem): void {

@@ -16,6 +16,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import {handleModelSwitchCost} from './modelSwitchCost.js'
 // Trace-id child binding on the HTTP request logger (V3 S12e CG9; OCV5-564: x-openclaude-trace-id,
 // x-trace-id alias). The WS bridge has its own connection trace flow.
 import { resolveRequestTrace } from './requestTrace.js'
@@ -747,6 +748,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/wx/live', handler: handleWechatLivePage },
     { method: 'GET', path: '/api/wechat/live', handler: handleWechatLiveSnapshot },
     { method: 'GET', path: '/api/me', handler: handleMe },
+    { method: 'POST', pathPrefix: '/api/me/sessions/', handler: (req,res) => handleModelSwitchCost(req,res,deps) },
     { method: ANY_METHOD, path: '/api/media-generation', handler: dispatchMediaGenerationRoute },
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).

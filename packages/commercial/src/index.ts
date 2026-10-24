@@ -1,3 +1,4 @@
+import {ModelSwitchCostService,ModelSwitchCostError} from './billing/modelSwitchCost.js';
 import { makePromptPrivacySupportResolver } from './user/promptPrivacySupport.js'
 import { getV3ContainerStatus } from './agent-sandbox/v3supervisor.js'
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
@@ -4399,7 +4400,25 @@ export async function registerCommercial(
     inspect: async userId => v3Deps ? getV3ContainerStatus(v3Deps, userId) : null,
     validatedReleasePath: v3Deps?.runtimeTuple?.releaseResolvedPath,
   });
+  const modelSwitchCost = new ModelSwitchCostService({
+    pool:getPool(),pricing,secret:jwtSecret,
+    sourceEngine:(id)=>peekModelCatalogCache()?.current().resolve(id)?.engine??null,
+    resolveTarget:async(uid,id)=>{
+      const catalog=peekModelCatalogCache();
+      if(!catalog)throw new ModelSwitchCostError('MODEL_SWITCH_UNAVAILABLE','模型价格暂不可用，请重试');
+      const snapshot=await catalog.assertFresh(),canonical=snapshot.aliasToCanonical(id);
+      const authz=await loadUserModelAuthz(BigInt(uid),snapshot.securityEpoch);
+      if(!snapshot.canUseModel(scopeFromAuthz(uid,authz),canonical))throw new ModelSwitchCostError('UNAUTHORIZED_MODEL','无权使用目标模型');
+      const descriptor=snapshot.resolve(canonical),price=snapshot.billingPricingFor(canonical);
+      if(!descriptor||!price)throw new ModelSwitchCostError('MODEL_NOT_AVAILABLE','目标模型当前不可用');
+      return {pricing:price,engine:descriptor.engine,contextWindow:descriptor.contextWindow??0,
+        canonicalize:(model:string)=>snapshot.aliasToCanonical(model),
+        sourcePricing:(model:string)=>snapshot.billingPricingFor(snapshot.aliasToCanonical(model)),
+        sourceEngine:(model:string)=>snapshot.resolve(snapshot.aliasToCanonical(model))?.engine??null};
+    },
+  });
   const handler = createCommercialHandler({
+    modelSwitchCost,
     jwtSecret,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
@@ -5877,6 +5896,7 @@ export async function registerCommercial(
   };
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    modelSwitchCost,
     jwtSecret,
     promptQueueEnabled: isPromptQueueV1Enabled(),
     // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).

@@ -1,3 +1,4 @@
+import type {ModelSwitchCostRequest,ModelSwitchCostQuote} from '@openclaude/protocol/browser';
 export interface WorkspaceDraftHint {
   viewId: string
   revision: number
@@ -631,6 +632,11 @@ function apiKeyFromWire(k: ApiKeyWire): ApiKeySummary {
 }
 
 export const api = {
+  async modelSwitchCost(auth:AuthSession,input:ModelSwitchCostRequest,proof?:{consent?:string;quoteToken?:string}):Promise<ModelSwitchCostQuote>{
+    return jsonOrThrow<ModelSwitchCostQuote>(await callWithRefresh(auth,token=>fetch(`/api/me/sessions/${encodeURIComponent(input.sessionId)}/model-switch-estimate`,{
+      method:'POST',credentials:'include',headers:{...bearerHeaders(token),'content-type':'application/json'},body:JSON.stringify({...input,...proof}),
+    })));
+  },
   // ── 鉴权 ───────────────────────────────────────────────────────────
 
   /**

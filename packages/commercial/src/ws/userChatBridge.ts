@@ -1,3 +1,4 @@
+import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -383,6 +384,7 @@ export interface PromptQueueDispatchRequest {
       agentId: string;
       model?: string;
       modelSwitchId?: string;
+      modelSwitchConsent?: string;
       effortLevel?: string | null;
       teamMode?: boolean;
       collabMode?: "solo" | "advisor" | "team";
@@ -463,10 +465,11 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "modelSwitchConsent", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
+  if (execution.modelSwitchConsent !== undefined && (typeof execution.modelSwitchConsent !== 'string' || execution.modelSwitchConsent.length>4096)) return null;
   if (execution.effortLevel !== undefined && execution.effortLevel !== null && typeof execution.effortLevel !== "string") return null;
   if (execution.teamMode !== undefined && typeof execution.teamMode !== "boolean") return null;
   if (
@@ -552,7 +555,7 @@ function samePromptQueueDispatch(
 function promptQueueDispositionForCode(
   code: string,
 ): "retryable" | "user_action_required" {
-  return /^(?:ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
+  return /^(?:MODEL_SWITCH_|ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
     ? "user_action_required"
     : "retryable";
 }
@@ -970,6 +973,7 @@ async function resolveTurnExecution(
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
+  modelSwitchCost?: ModelSwitchCostService;
   jwtSecret: string | Uint8Array;
   /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
   promptQueueEnabled?: boolean;
@@ -1741,6 +1745,7 @@ export async function lookupCronOriginSessionModel(
 export async function executeCronOriginInject(opts: {
   input: CronOriginInjectInput
   pgPool?: UserChatBridgeDeps["pgPool"]
+  modelSwitchCost?: ModelSwitchCostService;
   lookupSessionModel?: (
     sessionId: string,
     sessionUserId: string,
@@ -1753,7 +1758,7 @@ export async function executeCronOriginInject(opts: {
   executor?: CronOriginExecutor
   log?: Logger
 }): Promise<CronOriginInjectResult> {
-  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log } = opts;
+  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log, modelSwitchCost } = opts;
   if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
     return { kind: "failed", reason: "invalid_payload" };
   }
@@ -1776,6 +1781,11 @@ export async function executeCronOriginInject(opts: {
       sessionId: input.sessionId,
       err,
     });
+  }
+  if(modelSwitchCost && originModel){
+    try {await modelSwitchCost.assertAuthorized(input.uid.toString(),{sessionId:input.sessionId,requestId:input.clientMessageId,
+      targetModel:originModel,agentId:input.agentId||'main',text:input.text});}
+    catch(error){return {kind:'failed',reason:error instanceof ModelSwitchCostError?error.code:'MODEL_SWITCH_UNAVAILABLE'};}
   }
   const message = {
     id: input.clientMessageId,
@@ -4266,6 +4276,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       historyModel: string | null = typeof frameObj.model === "string" ? frameObj.model : null,
       recoveryJob?: ClaimedRecoveryJob,
       pretrackedEnrichment?: EnrichmentDispatchState,
+      temporaryImageFeature = false,
     ): Promise<Record<string, unknown> | null> => {
       const peer = frameObj.peer;
       const peerId =
@@ -4293,6 +4304,31 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : "",
         replyTo,
       );
+      if (deps.modelSwitchCost && historyModel && !temporaryImageFeature && !clientMessageId) {
+        onReject?.('MODEL_SWITCH_REQUEST_ID_REQUIRED');
+        sendErrorFrame(userWs,'MODEL_SWITCH_REQUEST_ID_REQUIRED','请刷新页面后重试，以确认本轮费用',{peerId,retryable:false,action:'retry'});
+        return null;
+      }
+      if (deps.modelSwitchCost && historyModel && !temporaryImageFeature && clientMessageId) {
+        try {
+          const content=frameObj.content && typeof frameObj.content==='object' ? frameObj.content as Record<string,unknown> : {};
+          await deps.modelSwitchCost.assertAuthorized(uid.toString(),{
+            sessionId:peerId,requestId:clientMessageId,targetModel:historyModel,
+            agentId:typeof frameObj.agentId==='string'?frameObj.agentId:'main',
+            teamMode:frameObj.teamMode===true,text:currentUserText,
+            ...(isCursorContextTier(frameObj.contextTier)?{contextTier:frameObj.contextTier}:{}),
+            ...(frameObj.serviceTier==='fast'?{serviceTier:'fast' as const}:{}),
+            mediaCount:Array.isArray(content.media)?content.media.length:0,
+          },typeof frameObj.modelSwitchConsent==='string'?frameObj.modelSwitchConsent:undefined);
+        } catch (error) {
+          const code=error instanceof ModelSwitchCostError?error.code:'MODEL_SWITCH_UNAVAILABLE';
+          if(pretrackedEnrichment)terminalizeEnrichmentDispatch(pretrackedEnrichment,code);
+          onReject?.(code);
+          sendErrorFrame(userWs,code,error instanceof ModelSwitchCostError?error.message:'费用确认暂不可用，请重试',
+            {peerId,clientMessageId,retryable:false,action:'retry'});
+          return null;
+        }
+      }
       const sendAdmissionAck = (): void => {
         if (clientMessageId === null) return;
         const idempotencyKey = typeof frameObj.idempotencyKey === "string"
@@ -4593,6 +4629,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(typeof frameObj.model === "string" && frameObj.model !== ""
             ? { model: frameObj.model }
             : {}),
+          ...(typeof frameObj.modelSwitchConsent === 'string' ? {modelSwitchConsent:frameObj.modelSwitchConsent} : {}),
           ...(typeof frameObj.modelSwitchId === "string"
             ? { modelSwitchId: frameObj.modelSwitchId }
             : {}),
@@ -6800,6 +6837,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               authorityModelCapture,
               recoveryJob,
               pretrackedEnrichment,
+              true, // validated fixed-price image feature, not an ordinary model switch
             );
             // null:attachMasterTurnState 已在内部拒轮(含 dispatch 终态化 + onReject);此处直接 return。
             if (enrichedParsed === null) return;
@@ -8602,6 +8640,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             content: request.item.content,
             ...(execution.model !== undefined ? { model: execution.model } : {}),
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
+            ...(execution.modelSwitchConsent !== undefined ? { modelSwitchConsent: execution.modelSwitchConsent } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
             ...(execution.serviceTier !== undefined ? { serviceTier: execution.serviceTier } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
@@ -10645,6 +10684,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const executors = uidToCronOriginExecutors.get(input.uid.toString());
     if (!executors || executors.size === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
     return executeCronOriginInject({
+      modelSwitchCost:deps.modelSwitchCost,
       input,
       pgPool: deps.pgPool,
       admitUserTurn: deps.admitUserTurn,

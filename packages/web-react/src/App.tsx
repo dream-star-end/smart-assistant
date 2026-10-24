@@ -1,3 +1,5 @@
+import {useModelSwitchCost} from './hooks/useModelSwitchCost';
+import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
 import { DialogFallback } from "./components/DialogFallback";
 import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
@@ -897,6 +899,10 @@ export function App() {
     setPaneSheetOpen(false);
   }, [activeId, boardOpen, projectHome]);
 
+  const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
+  const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
+  const getSwitchOptions=useCallback(()=>switchOptionsRef.current,[]);
+
   const {
     applyCollabDoc,
     collabAsDefault,
@@ -915,6 +921,8 @@ export function App() {
     teamMode,
   } = useSessionModelAndCollab({
     activeId,
+    authorizeSwitch,
+    getSwitchOptions,
     agent,
     auth,
     confirmDialog,
@@ -938,6 +946,7 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+  switchOptionsRef.current={teamMode:agent.id==='main'&&teamMode,contextTier,...(serviceTier==='fast'?{serviceTier}: {})};
 
   const { draftSessionId, stopPreparing } = useDraftPreparation({
     auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
@@ -960,6 +969,7 @@ export function App() {
     uploadMedia,
   } = useComposerSend({
     activeId,
+    authorizeSwitch,
     agent,
     applyCollabDoc,
     auth,
@@ -1112,6 +1122,7 @@ export function App() {
   // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
   const chat = useChatSocket({
     auth,
+    authorizeSwitch,
     ready: gate.ready,
     // cohort lane 就绪（P3 RFC D1）：与 gate.ready 正交的 WS 连接前置，防首连落错 slot。
     laneReady,
