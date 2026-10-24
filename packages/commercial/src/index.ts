@@ -4437,7 +4437,7 @@ export async function registerCommercial(
   const handler = createCommercialHandler({
     modelSwitchCost,
     jwtSecret,
-    systemActionsHttp: systemActions?.runtime.handleBrowser,
+    ...systemActions?.http,
     mediaGeneration: mediaGenerationService,
     museBridgeHttp,
     goalStateService,

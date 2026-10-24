@@ -1,3 +1,4 @@
+import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
 import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
 // pgSessionsBackend — master 会话权威六表的 **PostgreSQL 实现**(RFC-v5-sessions-pg,P2)。
@@ -12264,14 +12265,8 @@ export function createPgSessionsBackend(
 
     async renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
       const now = Date.now();
-      const row = (
-        await pool.query<{ updated_at: string }>(
-          `UPDATE client_sessions SET title = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-             WHERE id = $2 AND user_id = $3 AND deleted_at IS NULL RETURNING updated_at`,
-          [title, id, userId],
-        )
-      ).rows[0];
-      return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
+      const result = await withTx(pool, client => patchSessionMetadataInTx(client, id, userId, { title }));
+      return { ok: result.ok, updatedAt: result.ok ? result.updatedAt : now };
     },
 
     async setClientSessionModel(id: string, userId: string, modelId: string): Promise<{ ok: boolean; updatedAt: number }> {
@@ -12288,62 +12283,10 @@ export function createPgSessionsBackend(
       return { ok: !!row, updatedAt: row ? bigIntNum(row.updated_at, "updated_at") : now };
     },
 
-    async patchClientSessionMeta(
-      id: string,
-      userId: string,
-      patch: ClientSessionMetaPatch,
-    ): Promise<PatchClientSessionMetaResult> {
-      return withTx(pool, async (client) => {
-        const ownedSession = (
-          await client.query(
-            "SELECT 1 FROM client_sessions WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-            [id, userId],
-          )
-        ).rows[0];
-        if (!ownedSession) return { ok: false, error: "not_found" };
-        if (patch.projectId !== undefined && patch.projectId !== null) {
-          const owned = (
-            await client.query(
-              "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
-              [patch.projectId, userId],
-            )
-          ).rows[0];
-          if (!owned) return { ok: false, error: "project_not_found" };
-        }
-        const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
-        const params: unknown[] = [];
-        let n = 1;
-        if (patch.title !== undefined) {
-          sets.push(`title = $${n++}`);
-          params.push(patch.title);
-        }
-        if (patch.modelId !== undefined) {
-          sets.push(`model_id = $${n++}`);
-          params.push(patch.modelId);
-        }
-        if (patch.projectId !== undefined) {
-          sets.push(`project_id = $${n++}`);
-          params.push(patch.projectId);
-        }
-        if (patch.pinned !== undefined) {
-          sets.push(`pinned = $${n++}`);
-          params.push(patch.pinned ? 1 : 0);
-        }
-        if (patch.archived !== undefined) {
-          sets.push(`archived_at = $${n++}`);
-          params.push(patch.archived ? Date.now() : null);
-        }
-        params.push(id, userId);
-        const row = (
-          await client.query<{ updated_at: string }>(
-            `UPDATE client_sessions SET ${sets.join(", ")}
-              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL
-              RETURNING updated_at`,
-            params,
-          )
-        ).rows[0];
-        if (!row) return { ok: false, error: "not_found" };
-        return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
+    async patchClientSessionMeta(id: string, userId: string, patch: ClientSessionMetaPatch): Promise<PatchClientSessionMetaResult> {
+      return withTx(pool, async client => {
+        const result = await patchSessionMetadataInTx(client, id, userId, patch);
+        return result.ok ? { ok: true, updatedAt: result.updatedAt } : result;
       });
     },
 

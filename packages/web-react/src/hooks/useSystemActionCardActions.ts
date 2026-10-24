@@ -1,7 +1,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { SystemActionCardActions } from '../components/tool/context'
-import type { SystemActionsClient } from '../lib/api/systemActionsApi'
+import type { SystemActionsClient, SessionMetadataSnapshot } from '../lib/api/systemActionsApi'
 import { AuthEpochStaleError } from '../lib/api/http'
 import type { PrefsView } from '../lib/modelPreferences'
 import type { AuthSession } from '../lib/types'
@@ -22,6 +22,7 @@ export function useSystemActionCardActions(input: {
   applyPreferences: (prefs: PrefsView) => void
   setTheme: (theme: Theme) => void
   applyInboxUnreadCount?: (count: number) => void
+  applySessionMetadata?: (metadata: SessionMetadataSnapshot) => void
   onSyncError: () => void
 }): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number; inboxRevision: number } {
   const { authRef, userId, demo } = input
@@ -51,6 +52,7 @@ export function useSystemActionCardActions(input: {
         return createSystemActionsApi({ auth, currentAuth, deviceId: deviceId!, onReceipt: createSystemReceiptObserver({
           getClient,
           onPreferences: (prefs, theme) => { latest.current.applyPreferences(prefs); latest.current.setTheme(theme); setPreferencesRevision(n => n + 1) },
+          onSessionMetadata: metadata => { latest.current.applySessionMetadata?.(metadata) },
           onInbox: count => { latest.current.applyInboxUnreadCount?.(count); setInboxRevision(n => n + 1) },
         }),
           onReceiptError: () => latest.current.onSyncError() })

@@ -11,7 +11,9 @@ const NONCE = /^[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['prepared', 'approved_waiting_browser', 'executing', 'succeeded', 'failed', 'denied', 'expired', 'unknown'])
 const EXECUTORS = new Set(['master', 'control', 'browser'])
 export type ReceiptObserver = (receipt: SystemActionSummary, context: { assertCurrent: () => void }) => void | Promise<void>
+export interface SessionMetadataSnapshot { id: string; title: string; pinned: boolean; updatedAt: number }
 export type SystemActionsClient = {
+  getSessionMetadataSnapshot(id: string): Promise<SessionMetadataSnapshot>
   getPreferencesSnapshot(): Promise<Preferences>
   getInboxUnreadCountSnapshot(): Promise<number>
   getDetail(id: string): Promise<SystemActionDetail>
@@ -111,6 +113,13 @@ export function createSystemActionsApi(options: {
   const getResult = async (id: string) => observe(await request(actionPath(id, '/result'), value => summary(value, id)))
   return {
     getDetail, getResult,
+    getSessionMetadataSnapshot: id => {
+      if (!id || id.length > 160 || id.includes('\0')) invalidResponse()
+      return request(`/api/me/sessions/${encodeURIComponent(id)}/metadata`, value => {
+        if (!object(value) || value.id !== id || typeof value.title !== 'string' || typeof value.pinned !== 'boolean' || !Number.isSafeInteger(value.updatedAt) || (value.updatedAt as number) < 0) invalidResponse()
+        return { id, title: value.title, pinned: value.pinned, updatedAt: value.updatedAt as number }
+      })
+    },
     getPreferencesSnapshot: () => request('/api/me/preferences', value => {
       if (!object(value)) invalidResponse()
       return value
@@ -155,22 +164,30 @@ export function createSystemActionsApi(options: {
 
 /** Loaded with the approval transport, outside the first-screen preload graph. */
 export function createSystemReceiptObserver(input: {
-  getClient: () => Promise<Pick<SystemActionsClient, 'getInboxUnreadCountSnapshot' | 'getPreferencesSnapshot'>>
+  getClient: () => Promise<Pick<SystemActionsClient, 'getInboxUnreadCountSnapshot' | 'getPreferencesSnapshot' | 'getSessionMetadataSnapshot'>>
   onPreferences: (prefs: PrefsView, theme: Theme) => void
   onInbox: (count: number) => void
+  onSessionMetadata?: (metadata: SessionMetadataSnapshot) => void
 }): ReceiptObserver {
   const completed = new Set<string>()
   const pending = new Map<string, Promise<void>>()
   let tail = Promise.resolve()
   return (receipt, context) => {
+    const sessions = receipt.operationId === 'sessions.metadata.update'
     const preferences = receipt.operationId === 'preferences.update'
     const notifications = receipt.operationId === 'notifications.mark-read' || receipt.operationId === 'notifications.read-all'
-    if ((!preferences && !notifications) || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
+    if ((!preferences && !notifications && !sessions) || receipt.state !== 'succeeded' || completed.has(receipt.id)) return
     const existing = pending.get(receipt.id)
     if (existing) return existing
     const work = tail.then(async () => {
       context.assertCurrent()
-      if (notifications) {
+      if (sessions) {
+        const reference = receipt.result?.effectReference
+        if (typeof reference !== 'string' || !reference.startsWith('session:') || !input.onSessionMetadata) invalidResponse()
+        const metadata = await (await input.getClient()).getSessionMetadataSnapshot(reference.slice(8))
+        context.assertCurrent()
+        input.onSessionMetadata(metadata)
+      } else if (notifications) {
         const count = await (await input.getClient()).getInboxUnreadCountSnapshot()
         context.assertCurrent()
         input.onInbox(count)

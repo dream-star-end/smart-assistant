@@ -191,3 +191,41 @@ it('a delayed unread snapshot cannot update another identity and a failed sync l
   expect(applyInboxUnreadCount).not.toHaveBeenCalled()
   expect(result.current.inboxRevision).toBe(0)
 })
+
+it('a succeeded metadata receipt reads its typed target and applies once without another write', async () => {
+  const { input } = setup(); const applySessionMetadata = vi.fn()
+  const metadata = { id: 'target-session', title: 'Approved', pinned: true, updatedAt: 3000 }
+  const receipt = { ...succeeded(), operationId: 'sessions.metadata.update', result: { summary: 'Updated', completion: 'done', effectReference: 'session:target-session' } }
+  const fetcher = vi.fn<typeof fetch>(async url => reply(String(url) === '/api/me/sessions/target-session/metadata' ? metadata : receipt))
+  vi.stubGlobal('fetch',fetcher)
+  const { result } = renderHook(() => useSystemActionCardActions({ ...input, applySessionMetadata }))
+  await act(async () => { await result.current.systemActions!.getDetail(id) })
+  await waitFor(() => expect(applySessionMetadata).toHaveBeenCalledExactlyOnceWith(metadata))
+  await act(async () => { await result.current.systemActions!.getDetail(id) })
+  expect(applySessionMetadata).toHaveBeenCalledTimes(1)
+  expect(fetcher.mock.calls.every(([,opts]) => (opts?.method ?? 'GET') === 'GET')).toBe(true)
+})
+it('a delayed metadata read cannot update another identity', async () => {
+  const { auth, input } = setup(); const applySessionMetadata = vi.fn()
+  let resolve!: (response: Response) => void
+  const pending = new Promise<Response>(done => { resolve = done })
+  const receipt = { ...succeeded(), operationId: 'sessions.metadata.update', result: { summary: 'Updated', completion: 'done', effectReference: 'session:target-session' } }
+  const fetcher = vi.fn<typeof fetch>(async url => String(url).endsWith('/metadata') ? pending : reply(receipt))
+  vi.stubGlobal('fetch',fetcher)
+  const { result } = renderHook(() => useSystemActionCardActions({ ...input, applySessionMetadata }))
+  await act(async () => { await result.current.systemActions!.getDetail(id) })
+  await waitFor(() => expect(fetcher.mock.calls.some(([url]) => String(url).endsWith('/metadata'))).toBe(true))
+  await act(async () => { auth.beginIdentity(); resolve(reply({ id: 'target-session', title: 'Must not apply', pinned: true, updatedAt: 3000 })) })
+  expect(applySessionMetadata).not.toHaveBeenCalled()
+})
+it.each(['unavailable','wrong-target'])('metadata display %s preserves business success and applies no unverified snapshot', async failure => {
+  const { input } = setup(); const applySessionMetadata = vi.fn()
+  const receipt = { ...succeeded(), operationId: 'sessions.metadata.update', result: { summary: 'Updated', completion: 'done', effectReference: 'session:target-session' } }
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>(async url => String(url).endsWith('/metadata') ? failure === 'unavailable' ? reply({ error: 'unavailable' },503) : reply({ id: 'other-target', title: 'Wrong', pinned: true, updatedAt: 3000 }) : reply(receipt)))
+  const { result } = renderHook(() => useSystemActionCardActions({ ...input, applySessionMetadata }))
+  let actual: unknown
+  await act(async () => { actual = await result.current.systemActions!.getDetail(id) })
+  expect((actual as { state: string }).state).toBe('succeeded')
+  await waitFor(() => expect(input.onSyncError).toHaveBeenCalledTimes(1))
+  expect(applySessionMetadata).not.toHaveBeenCalled()
+})

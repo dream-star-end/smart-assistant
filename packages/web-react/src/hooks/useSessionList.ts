@@ -1,3 +1,4 @@
+import type { SessionMetadataSnapshot } from "../lib/api/systemActionsApi";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useToast } from "../components/ui";
 import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
@@ -192,6 +193,7 @@ export type UseSessionList = {
     projectId?: string | null,
     includeArchived?: boolean,
   ) => Promise<SessionSearchHit[]>;
+  applySessionMetadata: (metadata: SessionMetadataSnapshot) => void;
   applySessionTerminal: (
     sessId: string,
     terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
@@ -222,6 +224,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const { demo, auth, user, agentId, holdAutoSelect = false } = opts;
   // 回调/句柄经 ref 镜像：App 每渲染可能传新闭包，这里始终读最新版本而不进 useCallback
   // 依赖（保持 selectSession/newSession 依赖面与拆分前一致；useChatSocket persistRef 同款）。
+  const confirmedMetadata = useRef(new Map<string, SessionMetadataSnapshot>());
   const cbRef = useRef(opts);
   cbRef.current = opts;
   const toast = useToast();
@@ -530,8 +533,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     (metas: SessionMeta[]): Session[] => {
       if (!user) return [];
       return metas.map((m) => {
+        const payloadUpdatedAt = m.updatedAt;
+        const confirmed = confirmedMetadata.current.get(m.id);
+        if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, ...confirmed };
+        else confirmedMetadata.current.set(m.id, { id: m.id, title: m.title, pinned: m.pinned === true, updatedAt: m.updatedAt });
         const s = metaToSession(m, user.id);
-        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
+        if (s.modelId !== undefined && !modelPayloadFresh(m.id, payloadUpdatedAt)) {
           const { modelId: _stale, ...rest } = s;
           return rest;
         }
@@ -616,6 +623,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     autoSelectedRef.current = true;
     selectSession(sessions[0].id);
   }, [demo, auth, holdAutoSelect, activeId, sessions, selectSession]);
+
+  const applySessionMetadata = useCallback((metadata: SessionMetadataSnapshot) => {
+    if (!cbRef.current.user || cbRef.current.demo) return;
+    const previous = confirmedMetadata.current.get(metadata.id);
+    if (previous && previous.updatedAt > metadata.updatedAt) return;
+    confirmedMetadata.current.set(metadata.id, metadata);
+    setSessions(current => current.map(session => session.id === metadata.id
+      ? { ...session, title: metadata.title, pinned: metadata.pinned, updatedAt: new Date(metadata.updatedAt).toISOString() } : session));
+    cbRef.current.sockRef.current?.renameSession(metadata.id, metadata.title);
+  }, []);
 
   // rename 一次收口三个持有方:App state(侧栏)+ WS service/IndexedDB + 服务端 canonical。
   // 此前只改 App state → listSessions server-wins 下次直接盖回旧标题(纯本地幻觉)。
@@ -798,14 +815,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         limit: 50,
         before: nextCursorRef.current ?? oldest,
       });
-      const incoming = page.sessions.map((m) => {
-        const s = metaToSession(m, user.id);
-        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
-          const { modelId: _stale, ...rest } = s;
-          return rest;
-        }
-        return s;
-      });
+      const incoming = mapListMetas(page.sessions);
       setSessions((cur) => upsertSessions(cur, incoming, true));
       nextCursorRef.current = page.nextCursor;
       setHasMoreSessions(page.nextCursor != null && incoming.length > 0);
@@ -829,14 +839,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       const page = await api.listSessionsPage(cbRef.current.authSession, {
         includeArchived: true,
       });
-      const incoming = page.sessions.map((m) => {
-        const s = metaToSession(m, user.id);
-        if (s.modelId !== undefined && !modelPayloadFresh(m.id, m.updatedAt)) {
-          const { modelId: _stale, ...rest } = s;
-          return rest;
-        }
-        return s;
-      });
+      const incoming = mapListMetas(page.sessions);
       setSessions((cur) => upsertSessions(cur, incoming, true));
     } catch (e) {
       archivedFetchedRef.current = false;
@@ -904,6 +907,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
   const reset = useCallback(() => {
+    confirmedMetadata.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
@@ -943,6 +947,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     loadArchivedSessions,
     loadingArchived,
     searchSessionMessages,
+    applySessionMetadata,
     applySessionTerminal,
     reset,
     serverListSettled,

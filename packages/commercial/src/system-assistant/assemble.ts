@@ -1,3 +1,5 @@
+import { readSessionMetadata } from '../db/sessionMetadataApproval.js'
+import { sessionMetadataOperations } from './sessionMetadataOperations.js'
 import { modelReadOperations, type SystemModelReadSources } from './modelReadOperations.js'
 import { stateReadOperations, type SystemStateReadSources } from './stateReadOperations.js'
 import { notificationOperations } from './notificationOperations.js'
@@ -31,11 +33,12 @@ export function assembleSystemActions(deps: {
     ...preferenceOperations({ authorize, privacySupported: deps.privacySupported }),
     ...systemReadOperations({ authorize }),
     ...notificationOperations({ authorize }),
+    ...sessionMetadataOperations({ authorize, pgSessionsReady: deps.stateReads?.sessions !== undefined }),
     ...modelReadOperations({ authorize, sources: deps.modelReads }),
     ...stateReadOperations({ authorize, sources: deps.stateReads }),
   ])
   const runtime = openSystemActionsRuntime({ ...deps, registry })
-  return { runtime, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
+  return { runtime, http: { systemActionsHttp: runtime.handleBrowser, sessionMetadataRead: deps.stateReads?.sessions ? readSessionMetadata : undefined }, handleInternal: makeInternalSystemActionsHandler({ ...deps, service: runtime.service, grants: runtime.grants, track: runtime.track }) }
 }
 
 export type { SystemSessionReadBackend } from './stateReadOperations.js'
