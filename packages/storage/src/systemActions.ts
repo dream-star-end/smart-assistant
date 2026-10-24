@@ -3,6 +3,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, 
 import { chmodSync, existsSync, lstatSync, mkdirSync } from 'node:fs'
 import { dirname, isAbsolute } from 'node:path'
 import Database from 'better-sqlite3'
+import { parseProfileControlVersion } from './profileControlVersion.js'
 import type {
   SystemActionDetail, SystemActionExecutor, SystemActionPreview,
   SystemActionResult, SystemActionState, SystemActionSummary,
@@ -54,6 +55,13 @@ export interface SystemActionExecution {
 }
 export type SystemActionReceiptBinding = Pick<SystemActionExecution,
   'id' | 'userId' | 'sessionId' | 'agentId' | 'operationId' | 'operationVersion' | 'requestHash' | 'inputHash'>
+/** Host-only lineage projection. Never executable args, approval material or a grant. */
+export type SystemActionControlRecoveryRecord = Readonly<{
+  state: 'executing' | 'unknown' | 'succeeded'
+  executorId: string
+  expectedVersion: string
+  binding: Readonly<SystemActionReceiptBinding>
+}>
 interface Row {
   id: string; user_id: string; session_id: string; agent_id: string
   operation_id: string; operation_version: number; executor: SystemActionExecutor
@@ -337,6 +345,23 @@ export class SystemActionStore {
     if (r.state !== 'unknown' || !r.request_hash) return null
     return { id: r.id, userId: r.user_id, sessionId: r.session_id, agentId: r.agent_id,
       operationId: r.operation_id, operationVersion: r.operation_version, requestHash: r.request_hash, inputHash: r.input_hash }
+  }
+  /** Pure SELECT, including expired rows: callers must independently prove executor/child stop before recovery. */
+  controlRecoveryRecord(userId: string, id: string): SystemActionControlRecoveryRecord | null {
+    if (typeof userId !== 'string' || userId.length > 19 || typeof id !== 'string' || id.length !== 36 || !/^[1-9][0-9]*$/.test(userId) || (BigInt(userId) > 9223372036854775807n || BigInt(userId).toString() !== userId)
+      || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id)) return null
+    type RecoveryRow = Pick<Row, 'id' | 'user_id' | 'session_id' | 'agent_id' | 'operation_id' | 'operation_version'
+      | 'executor' | 'state' | 'executor_id' | 'request_hash' | 'input_hash' | 'expected_version'>
+    const r = this.db.prepare(`SELECT id,user_id,session_id,agent_id,operation_id,operation_version,executor,state,
+      executor_id,request_hash,input_hash,expected_version FROM system_actions WHERE id=? AND user_id=?`).get(id, userId) as RecoveryRow | undefined
+    if (!r || r.executor !== 'control' || r.operation_id !== 'memory.profile.update' || r.operation_version !== 1
+      || !['executing', 'unknown', 'succeeded'].includes(r.state) || !r.executor_id || r.executor_id.length > 256
+      || [...r.executor_id].some(char => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) || !r.request_hash || !/^[a-f0-9]{64}$/.test(r.request_hash)
+      || !/^[a-f0-9]{64}$/.test(r.input_hash) || !parseProfileControlVersion(r.expected_version)) return null
+    const binding = Object.freeze({ id: r.id, userId: r.user_id, sessionId: r.session_id, agentId: r.agent_id,
+      operationId: r.operation_id, operationVersion: r.operation_version, requestHash: r.request_hash, inputHash: r.input_hash })
+    return Object.freeze({ state: r.state as SystemActionControlRecoveryRecord['state'], executorId: r.executor_id,
+      expectedVersion: r.expected_version!, binding })
   }
   /** Trusted receipt lookup only: no grant, rerun, current-value inference or live-executor takeover. */
   reconcileUnknownFromReceipt(binding: SystemActionReceiptBinding, result: SystemActionResult): SystemActionSummary {
