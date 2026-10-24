@@ -677,7 +677,7 @@ for (const entry of ["header", "picker", "goal", "github"]) test(`team close per
     assert.equal(await page.getByRole("button", { name: "团队模式已开启", exact: true }).count(), 0, "first-send GET must not reopen team");
     await page.close();
     const reopened = await bootPage(context, origin, bundle.outputFiles[0].text);
-    await reopened.page.getByRole("button", { name: /关闭团队首发回归/ }).click();
+    await reopened.page.getByRole("button", { name: "关闭团队首发回归", exact: true }).click();
     await reopened.page.getByRole("button", { name: /切换智能体/ }).click();
     assert.equal(await reopened.page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
     await reopened.page.keyboard.press("Escape");

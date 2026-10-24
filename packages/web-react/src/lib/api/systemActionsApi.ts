@@ -162,12 +162,18 @@ export function createSystemActionsApi(options: {
   }
 }
 
+export interface SystemReceiptUiBindings {
+  applyPreferences: (prefs: PrefsView) => void
+  setTheme: (theme: Theme) => void
+  applyInboxUnreadCount?: (count: number) => void
+  applySessionMetadata?: (metadata: SessionMetadataSnapshot) => void
+}
 /** Loaded with the approval transport, outside the first-screen preload graph. */
 export function createSystemReceiptObserver(input: {
   getClient: () => Promise<Pick<SystemActionsClient, 'getInboxUnreadCountSnapshot' | 'getPreferencesSnapshot' | 'getSessionMetadataSnapshot'>>
-  onPreferences: (prefs: PrefsView, theme: Theme) => void
-  onInbox: (count: number) => void
-  onSessionMetadata?: (metadata: SessionMetadataSnapshot) => void
+  currentUi: () => SystemReceiptUiBindings
+  preferencesChanged: (update: (revision: number) => number) => void
+  inboxChanged: (update: (revision: number) => number) => void
 }): ReceiptObserver {
   const completed = new Set<string>()
   const pending = new Map<string, Promise<void>>()
@@ -183,20 +189,29 @@ export function createSystemReceiptObserver(input: {
       context.assertCurrent()
       if (sessions) {
         const reference = receipt.result?.effectReference
-        if (typeof reference !== 'string' || !reference.startsWith('session:') || !input.onSessionMetadata) invalidResponse()
+        if (typeof reference !== 'string' || !reference.startsWith('session:') || !input.currentUi().applySessionMetadata) invalidResponse()
         const metadata = await (await input.getClient()).getSessionMetadataSnapshot(reference.slice(8))
         context.assertCurrent()
-        input.onSessionMetadata(metadata)
+        const apply = input.currentUi().applySessionMetadata
+        if (!apply) invalidResponse()
+        apply(metadata)
       } else if (notifications) {
         const count = await (await input.getClient()).getInboxUnreadCountSnapshot()
         context.assertCurrent()
-        input.onInbox(count)
+        input.currentUi().applyInboxUnreadCount?.(count)
+        context.assertCurrent()
+        input.inboxChanged(revision => revision + 1)
       } else {
         const snap = await (await input.getClient()).getPreferencesSnapshot()
         context.assertCurrent()
         const prefs = extractPrefs(snap)
         applyIntelligentUiSnapshot(snap)
-        input.onPreferences(prefs, prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
+        context.assertCurrent()
+        input.currentUi().applyPreferences(prefs)
+        context.assertCurrent()
+        input.currentUi().setTheme(prefs.theme === 'auto' ? 'system' : prefs.theme ?? 'system')
+        context.assertCurrent()
+        input.preferencesChanged(revision => revision + 1)
       }
       completed.add(receipt.id)
     })

@@ -229,3 +229,20 @@ it.each(['unavailable','wrong-target'])('metadata display %s preserves business 
   await waitFor(() => expect(input.onSyncError).toHaveBeenCalledTimes(1))
   expect(applySessionMetadata).not.toHaveBeenCalled()
 })
+
+it('auth object replacement changes provider identity even at the same uid/epoch/generation and retires the old client', async () => {
+  const { input } = setup()
+  const fetcher = vi.fn<typeof fetch>(async () => { throw new Error('stale provider must not request') })
+  vi.stubGlobal('fetch',fetcher)
+  const view = renderHook(() => useSystemActionCardActions(input))
+  const old = view.result.current.systemActions!
+  const snapshot = input.authRef.current.snapshot()
+  input.authRef.current = createMemoryAuthSession(() => {}, snapshot.token)
+  view.rerender()
+  expect(view.result.current.systemActions!.identityKey).not.toBe(old.identityKey)
+  await expect(old.getDetail(id)).rejects.toThrow()
+  expect(fetcher).not.toHaveBeenCalled()
+  const current = view.result.current.systemActions!.identityKey
+  view.rerender()
+  expect(view.result.current.systemActions!.identityKey).toBe(current)
+})

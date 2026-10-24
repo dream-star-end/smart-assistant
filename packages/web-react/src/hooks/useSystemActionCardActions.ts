@@ -1,32 +1,21 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 import type { SystemActionCardActions } from '../components/tool/context'
-import type { SystemActionsClient, SessionMetadataSnapshot } from '../lib/api/systemActionsApi'
+import type { SystemActionsClient, SystemReceiptUiBindings } from '../lib/api/systemActionsApi'
 import { AuthEpochStaleError } from '../lib/api/http'
-import type { PrefsView } from '../lib/modelPreferences'
 import type { AuthSession } from '../lib/types'
-import type { Theme } from './useTheme'
 import { useAuthAccessGeneration } from './useAuthAccessGeneration'
 
-const instanceIds = new WeakMap<AuthSession, number>()
-let nextInstanceId = 0
-function instanceId(auth: AuthSession): number {
-  let id = instanceIds.get(auth)
-  if (id === undefined) { id = ++nextInstanceId; instanceIds.set(auth, id) }
-  return id
-}
+let nextProviderId = 0
 export function useSystemActionCardActions(input: {
   authRef: RefObject<AuthSession>
   userId: string | undefined
   demo: boolean
-  applyPreferences: (prefs: PrefsView) => void
-  setTheme: (theme: Theme) => void
-  applyInboxUnreadCount?: (count: number) => void
-  applySessionMetadata?: (metadata: SessionMetadataSnapshot) => void
   onSyncError: () => void
-}): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number; inboxRevision: number } {
+} & SystemReceiptUiBindings): { systemActions: SystemActionCardActions | undefined; preferencesRevision: number; inboxRevision: number } {
   const { authRef, userId, demo } = input
   const auth = authRef.current
+  const provider = useMemo(() => ({ auth, id: ++nextProviderId }), [auth])
   const latest = useRef(input); latest.current = input
   const alive = useRef(true)
   useLayoutEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
@@ -51,22 +40,22 @@ export function useSystemActionCardActions(input: {
         assertCurrent()
         return createSystemActionsApi({ auth, currentAuth, deviceId: deviceId!, onReceipt: createSystemReceiptObserver({
           getClient,
-          onPreferences: (prefs, theme) => { latest.current.applyPreferences(prefs); latest.current.setTheme(theme); setPreferencesRevision(n => n + 1) },
-          onSessionMetadata: metadata => { latest.current.applySessionMetadata?.(metadata) },
-          onInbox: count => { latest.current.applyInboxUnreadCount?.(count); setInboxRevision(n => n + 1) },
+          currentUi: () => latest.current,
+          preferencesChanged: setPreferencesRevision,
+          inboxChanged: setInboxRevision,
         }),
           onReceiptError: () => latest.current.onSyncError() })
       }).catch(error => { client = undefined; throw error })
       return client
     }
     return {
-      identityKey: `system:${instanceId(auth)}:${userId}:${epoch}:${generation}`,
+      identityKey: `system:${provider.id}:${userId}:${epoch}:${generation}`,
       getDetail: async id => (await getClient()).getDetail(id),
       getConfirmation: async id => (await getClient()).getConfirmation(id),
       confirm: async (id, proof) => (await getClient()).confirm(id, proof),
       deny: async id => (await getClient()).deny(id),
       reconcile: async id => (await getClient()).reconcile(id),
     }
-  }, [auth, authRef, userId, demo, deviceId, epoch, generation])
+  }, [auth, authRef, userId, demo, deviceId, epoch, generation, provider.id])
   return { systemActions, preferencesRevision, inboxRevision }
 }
