@@ -1,3 +1,4 @@
+import { useLegacyCardPolicy } from './LegacyCardPolicy';
 /**
  * 对话写博客（经验分享，OCV5-577 跟进）的三个智能 UI 组件。
  *
@@ -76,7 +77,9 @@ function useLatestVersion(draftId: string, version: number): number {
 }
 
 export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: BlockProps<BlogDraftSpec>) {
-  const { communityBlog: actions } = useToolCardActions();
+  const policy = useLegacyCardPolicy();
+  const { communityBlog: providedActions } = useToolCardActions();
+  const actions = policy.readOnly || policy.live ? undefined : providedActions;
   const { sendUserText, busy, reason } = useChatInteraction();
   const latest = useLatestVersion(spec.draftId, spec.version);
   const superseded = latest > spec.version;
@@ -452,7 +455,8 @@ function clock(iso: string | null): string {
 function BlogStatusView({ id, nested, readOnly }: { id: string; nested?: boolean; readOnly?: boolean }) {
   // 只读上下文（站内信、分享页）不查状态：稿件只对作者本人可见。
   const blogActions = useToolCardActions().communityBlog;
-  const actions = readOnly ? undefined : blogActions;
+  const policy = useLegacyCardPolicy();
+  const actions = readOnly || policy.readOnly || policy.live ? undefined : blogActions;
   const { sendUserText, busy } = useChatInteraction();
   const { state, stopped, refresh } = useOwnTutorial(id, actions);
   const [asked, setAsked] = useState(false);
@@ -559,7 +563,9 @@ function BlogStatusView({ id, nested, readOnly }: { id: string; nested?: boolean
 }
 
 function PublishedView({ item, nested }: { item: CommunityTutorialMine; nested?: boolean }) {
-  const { communityBlog: actions } = useToolCardActions();
+  const policy = useLegacyCardPolicy();
+  const { communityBlog: providedActions } = useToolCardActions();
+  const actions = policy.readOnly || policy.live ? undefined : providedActions;
   const [copied, setCopied] = useState(false);
   if (!actions) return null;
   const href = actions.postUrl(item.id);

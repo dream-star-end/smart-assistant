@@ -1,3 +1,4 @@
+import { useLegacyCardPolicy } from '../iui/LegacyCardPolicy';
 /**
  * 对话内任务单人工审批卡。展示与操作一律以用户浏览器身份 GET/POST /api/board
  * 为准;agent 工具参数只提供 id / 可选提问,不能伪造单据状态。
@@ -31,7 +32,9 @@ function isApprovable(status: TicketStatus): boolean {
 }
 
 export function TaskApprovalCard({ id, prompt }: { id: string; prompt?: string }) {
-  const { taskApproval, onOpenTaskboard } = useToolCardActions();
+  const policy = useLegacyCardPolicy();
+  const { taskApproval: providedActions, onOpenTaskboard } = useToolCardActions();
+  const taskApproval = policy.readOnly || policy.live ? undefined : providedActions;
   const { sendUserText, busy: chatBusy } = useChatInteraction();
   const [ticket, setTicket] = useState<Ticket | null>(null);
   const [loading, setLoading] = useState(() => !!taskApproval);

@@ -1,3 +1,4 @@
+import { useLegacyCardPolicy } from '../iui/LegacyCardPolicy';
 /**
  * oc-connect（应用连接器 CLI）的专属工具卡，重点是**写操作确认卡**（human-in-the-loop，
  * 安全关键）。
@@ -270,7 +271,9 @@ export function ConnectorConfirmCard({
   trigger: ConnectorConfirmTrigger;
   embedded?: boolean;
 }) {
-  const { connectorConfirm } = useToolCardActions();
+  const policy = useLegacyCardPolicy();
+  const { connectorConfirm: providedActions } = useToolCardActions();
+  const connectorConfirm = policy.readOnly || policy.live ? undefined : providedActions;
   const { sendUserText } = useChatInteraction();
   // 服务端权威详情（GET /api/connectors/confirmations/:id）：挂载即强制拉取，是**唯一**
   // 展示来源。CLI 只给了 id，别无可信内容。

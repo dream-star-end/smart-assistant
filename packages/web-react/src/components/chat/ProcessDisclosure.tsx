@@ -1043,8 +1043,8 @@ function groupNode(messages: readonly ChatMessage[], current: boolean): { Icon: 
 const shellToggleClass =
   "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
-function StageText({ message, live = false, onFirstTextPaint }: {
-  message: ChatMessage; live?: boolean; onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
+function StageText({ message, live = false, readOnly, onFirstTextPaint }: {
+  message: ChatMessage; live?: boolean; readOnly?: boolean; onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
 }) {
   // Same suppression as AssistantCard: an unpublished fallback must not
   // reappear just because the row was grouped into the process. The body
@@ -1062,7 +1062,7 @@ function StageText({ message, live = false, onFirstTextPaint }: {
       className="min-w-0"
     >
       <FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />
-      <ProgressiveMarkdown text={text} live={live} />
+      <ProgressiveMarkdown text={text} live={live} readOnly={readOnly} />
     </div>
   );
 }
@@ -1097,7 +1097,7 @@ function NarrativeDot() {
 }
 
 export function ProcessDisclosure<T>({
-  sections,
+  sections, readOnly,
   onFirstTextPaint,
   active,
   open,
@@ -1114,7 +1114,7 @@ export function ProcessDisclosure<T>({
   turnStartedAt,
   turnEndedAt,
 }: {
-  sections: ProcessSection<T>[];
+  sections: ProcessSection<T>[]; readOnly?: boolean;
   onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
   active: boolean;
   open: boolean;
@@ -1204,7 +1204,7 @@ export function ProcessDisclosure<T>({
         return (
           <div key={keyOf(item)} className="space-y-1">
             {rows.map((message) => (
-              <StageText key={message.id} message={message} live={isLive} onFirstTextPaint={onFirstTextPaint} />
+              <StageText key={message.id} message={message} live={isLive} readOnly={readOnly} onFirstTextPaint={onFirstTextPaint} />
             ))}
           </div>
         );
