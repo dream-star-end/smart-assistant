@@ -5,4 +5,4 @@
 
 称呼在“设置 → 偏好 → 隐私与助手”由本人填写并确认，仅授权的当前会话使用；默认关闭，不从邮箱或画像猜测。改称呼或撤回均先展示确认 sheet。user.md 保留供明确需要时按需查阅，旧 always 块不再自动全文注入。关闭后下一轮停止新注入；若暖 runner 无法刷新，本轮停止并提示重试。旧历史不能撤回，可新建会话去除旧历史。记忆使用其独立控制；外接客户端不在此设置范围内。预览只列本会话额外称呼，不展示整篇画像或平台提示词。
 
-`agent.status.get {}` reads the current account's subscription/container status and times without starting a container, showing Docker identifiers or returning raw host errors.
+`agent.status.get {}` inspects only the current v5 Docker container without starting it. It exposes observed state and last activity, never host addresses, Docker IDs, images or labels. Null means no currently observable active record, including possible recycling/migration; running is not chat-service readiness.

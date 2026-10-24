@@ -1,4 +1,4 @@
-import { getAgentStatus } from './agent/subscriptions.js'
+import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import type { SystemSessionReadBackend } from './system-assistant/stateReadOperations.js'
 import { assembleSystemActions } from './system-assistant/assemble.js'
 import { INTERNAL_SYSTEM_ACTIONS_PATH } from './system-assistant/internalHttp.js'
@@ -4423,7 +4423,7 @@ export async function registerCommercial(
       identityRepo: createPgIdentityRepo(),
       privacySupported: async userId => (await resolvePromptPrivacySupport(userId)).state === 'ready',
       modelReads: { catalog: peekModelCatalogCache() ?? undefined, loadUserModelAuthz, getDegradedProviders },
-      stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readStatus: getAgentStatus },
+      stateReads: { sessions: systemSessionReadBackend, readProject: (uid, id) => readPgChatProject(getPool(), uid, id), readRuntimeStatus: makeSystemRuntimeStatusRead(v3Deps) },
     });
   }
   const handler = createCommercialHandler({

@@ -26,7 +26,7 @@ test('available models use the fresh epoch and full grant/denial scope with unch
   const value = await f.registry.read(actor, 'models.available.list', {}) as { models: Array<Record<string, unknown>>; locked_models: unknown[] }
   assert.deepEqual(f.calls, [['fresh'],['authz',765n,37n]])
   assert.deepEqual(value.models.map(row => row.id), ['public-model','granted-model'])
-  assert(value.models.every(row => row.input_per_ktok_credits === 0.006 && row.degraded === true))
+  assert(value.models.every(row => row.input_per_ktok_credits === '0.006000' && row.degraded === true))
   assert.deepEqual(value.locked_models, [])
   assert.equal(JSON.stringify(value).includes('synthetic-upstream'), false)
   assert.equal('securityEpoch' in value, false)

@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import type { ChatProject, ClientSessionMeta } from '@openclaude/storage'
 import type { PgSessionsBackend } from '../db/pgSessionsBackend.js'
-import type { AgentStatusView } from '../agent/subscriptions.js'
+import type { V3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
 import { SystemOperationRejected, type SystemActor, type SystemOperation } from './operations.js'
 export type SystemSessionReadBackend = Readonly<Pick<PgSessionsBackend,
   'getClientSessionCollabParent' | 'getClientSessionWorkspaceMode' | 'listClientSessions' | 'searchClientSessions'
@@ -10,7 +10,7 @@ export type SystemSessionReadBackend = Readonly<Pick<PgSessionsBackend,
 export interface SystemStateReadSources {
   sessions?: SystemSessionReadBackend
   readProject(owner: string, id: string): Promise<ChatProject | null>
-  readStatus(userId: string): Promise<AgentStatusView>
+  readRuntimeStatus(userId: string): Promise<Pick<V3ContainerStatus, 'state' | 'lastWsActivity'> | null>
 }
 const sessionId = z.string().regex(/^[A-Za-z0-9_-]{8,50}$/)
 const projectId = z.string().regex(/^[A-Za-z0-9_-]{8,64}$/)
@@ -77,12 +77,10 @@ export function stateReadOperations(deps: { authorize(actor: SystemActor): Promi
       return { assets: (await required(b.listProjectAssets).call(b, owner(actor), args)).map(row => ({ id: row.id, projectId: row.projectId, source: row.source,
         sessionId: row.sessionId, name: row.name, mime: row.mime, sizeBytes: row.sizeBytes, digest: row.digest, pinned: row.pinned, createdAt: row.createdAt, updatedAt: row.updatedAt, versionCount: row.versionCount ?? 1 })) }
     }),
-    op('agent.status.get', '查看本人运行状态', 'account-privacy', empty, {}, async actor => {
-      const value = await sources().readStatus(actor.userId)
-      return { subscription: value.subscription ? { plan: value.subscription.plan, status: value.subscription.status, start_at: value.subscription.start_at.toISOString(),
-        end_at: value.subscription.end_at.toISOString(), auto_renew: value.subscription.auto_renew, last_renewed_at: value.subscription.last_renewed_at?.toISOString() ?? null } : null,
-        container: value.container ? { status: value.container.status, last_started_at: value.container.last_started_at?.toISOString() ?? null,
-          last_stopped_at: value.container.last_stopped_at?.toISOString() ?? null, volume_gc_at: value.container.volume_gc_at?.toISOString() ?? null } : null }
+    op('agent.status.get', '查看本人运行容器状态', 'account-privacy', empty, {}, async actor => {
+      const value = await sources().readRuntimeStatus(actor.userId)
+      return { scope: 'v5/docker', observed: value ? { state: value.state, lastActivityAt: value.lastWsActivity?.toISOString() ?? null } : null,
+        note: value ? '仅表示容器观察状态，不代表聊天服务已就绪。' : '暂时没有可确认的活动容器状态；此读取不会启动容器。' }
     }),
   ]
 }

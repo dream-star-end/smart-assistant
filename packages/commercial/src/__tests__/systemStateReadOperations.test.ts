@@ -26,8 +26,7 @@ function fixture() {
   }
   const registry = new SystemOperationRegistry(stateReadOperations({ authorize: async () => { if (!allowed) throw new SystemOperationRejected('FORBIDDEN') }, sources: {
     sessions, readProject: async (uid, id) => { calls.push(['project', uid, id]); return missing ? null : project },
-    readStatus: async uid => { calls.push(['status', uid]); return { subscription: null, container: { id: 'private-id', subscription_id: 'private-sub', docker_id: 'private-docker', docker_name: 'private-name', image: 'private-image',
-      status: 'running', last_started_at: new Date('2026-10-24T00:00:00Z'), last_stopped_at: null, volume_gc_at: null, last_error: 'private-error' } } },
+    readRuntimeStatus: async uid => { calls.push(['status', uid]); return missing ? null : { state: 'running', lastWsActivity: new Date('2026-10-24T00:00:00Z') } },
   } }))
   return { registry, calls, missing: () => { missing = true }, revoke: () => { allowed = false } }
 }
@@ -87,12 +86,16 @@ test('asset metadata omits URL, disk path and excerpt', async () => {
 })
 test('runtime status uses bare uid, ISO times and no Docker or raw error details', async () => {
   const f = fixture()
-  assert.deepEqual(await f.registry.read(actor, 'agent.status.get', {}), { subscription: null, container: { status: 'running', last_started_at: '2026-10-24T00:00:00.000Z', last_stopped_at: null, volume_gc_at: null } })
+  assert.deepEqual(await f.registry.read(actor, 'agent.status.get', {}), { scope: 'v5/docker', observed: { state: 'running', lastActivityAt: '2026-10-24T00:00:00.000Z' }, note: '仅表示容器观察状态，不代表聊天服务已就绪。' })
   assert.deepEqual(f.calls, [['status', '765']])
+  f.missing()
+  const missing = await f.registry.read(actor, 'agent.status.get', {}) as { observed: unknown; note: string }
+  assert.equal(missing.observed, null)
+  assert(missing.note.includes('不会启动容器'))
 })
 test('fresh authorization and absent PG authority fail closed without a hidden SQLite or direct-PG fallback', async () => {
   const f = fixture(); f.revoke()
   await assert.rejects(f.registry.read(actor, 'projects.list', {})); assert.deepEqual(f.calls, [])
-  const missing = new SystemOperationRegistry(stateReadOperations({ authorize: async () => {}, sources: { readProject: async () => { throw new Error('must not call direct PG without sessions authority') }, readStatus: async () => ({ subscription: null, container: null }) } }))
+  const missing = new SystemOperationRegistry(stateReadOperations({ authorize: async () => {}, sources: { readProject: async () => { throw new Error('must not call direct PG without sessions authority') }, readRuntimeStatus: async () => null } }))
   await assert.rejects(missing.read(actor, 'projects.get', { projectId: project.id }), error => error instanceof SystemOperationRejected && error.code === 'UNAVAILABLE')
 })
