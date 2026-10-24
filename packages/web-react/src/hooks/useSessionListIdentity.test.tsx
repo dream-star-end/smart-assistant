@@ -23,7 +23,8 @@ const callbacks = {
 };
 function renderList() {
   const auth = createMemoryAuthSession(() => {}, "alice-a");
-  return renderHook((props: { auth: AuthSession | null; user: User }) => useSessionList({ ...callbacks, ...props, authSession: auth }), { initialProps: { auth, user: alice } });
+  const initialProps: { auth: AuthSession | null; user: User } = { auth, user: alice };
+  return renderHook((props: typeof initialProps) => useSessionList({ ...callbacks, ...props, authSession: auth }), { initialProps });
 }
 
 it.each(["focus", "visibility", "poll"])("OD-P1 reset retires %s reads without unlocking a newer request", async trigger => {
