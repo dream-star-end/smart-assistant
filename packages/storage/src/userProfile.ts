@@ -25,6 +25,13 @@ function normalizeEol(s: string): string {
   return s.replace(/\r\n/g, '\n')
 }
 
+export type UserProfileSnapshot = { text: string; version: string }
+/** One version contract for both the legacy writer and the pure authority reader. */
+export function profileSnapshot(raw: string): UserProfileSnapshot {
+  const text = normalizeEol(raw)
+  return { text, version: sha16(text) }
+}
+
 /** 把存量 §-blob 去 § 化为 bullet 列表:每条 → 单行 `- ...`(内部换行压平成空格)。 */
 function deSection(s: string): string {
   return s
@@ -63,11 +70,11 @@ export async function readUserProfile(): Promise<{ text: string; version: string
   try {
     raw = await readFile(paths.sharedUserMd, 'utf-8')
   } catch {
-    return { text: '', version: sha16('') }
+    return profileSnapshot('')
   }
   const normalized = normalizeEol(raw)
   if (!normalized.includes('\n§\n')) {
-    return { text: normalized, version: sha16(normalized) }
+    return profileSnapshot(normalized)
   }
   // 含 § → 锁内改写(幂等)。
   const release = await acquireFileLock(paths.sharedUserLock)
@@ -81,11 +88,11 @@ export async function readUserProfile(): Promise<{ text: string; version: string
     const curNorm = normalizeEol(cur)
     if (!curNorm.includes('\n§\n')) {
       // 别的进程已去 § → 直接用最新盘上内容。
-      return { text: curNorm, version: sha16(curNorm) }
+      return profileSnapshot(curNorm)
     }
     const converted = deSection(curNorm)
     await atomicWrite(paths.sharedUserMd, converted)
-    return { text: converted, version: sha16(converted) }
+    return profileSnapshot(converted)
   } finally {
     await release()
   }
