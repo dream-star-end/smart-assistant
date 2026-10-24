@@ -1,8 +1,8 @@
-import { captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
+import { attemptCurrent, captureIdentityAttempt, resolveIdentity, identityIsCurrent, revokeResolvedIdentity, type ResolvedIdentity } from '../lib/resolvedIdentity';
 import { useAuthAccessGeneration } from './useAuthAccessGeneration';
 import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, AuthEpochStaleError, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
+import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { clearAuthHint, hasAuthHint, setAuthHint } from "../lib/authHint";
@@ -292,9 +292,10 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
 
         let meAttempt = 0;
         while (!controller.signal.aborted && session.snapshot().epoch === bootEpoch) {
+          let actualAttempt: ReturnType<typeof captureIdentityAttempt> | null = null;
           try {
             let identity: ResolvedIdentity | null = null;
-            const me = await api.getMe(session, value => { identity = value; });
+            const me = await api.getMe(session, value => { identity = value; }, value => { actualAttempt = value; });
             if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
             if (identity && !identityIsCurrent(identity, session, me.id)) continue;
             const prior = bootstrapMeFriction.current;
@@ -320,7 +321,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
             return;
           } catch (error) {
             if (controller.signal.aborted || session !== authRef.current || session.snapshot().epoch !== bootEpoch) return;
-            if (error instanceof AuthEpochStaleError && session.snapshot().token) continue;
+            if (actualAttempt && !attemptCurrent(actualAttempt, session)) continue;
             if (!isAuthRecoveryTransient(error)) {
               session.beginIdentity();
               clearAuthState();

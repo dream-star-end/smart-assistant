@@ -852,12 +852,15 @@ export const api = {
 
   /** 当前用户（GET /api/me，Bearer）。credits 为字符串大数，adaptUser 原样保留。
    *  P3 RFC D1：响应体附带 cohort `lane`（body 级优先，兼容嵌套在 user 内）；缺失=后端未部署=null。 */
-  getMe: (a: AuthSession, onIdentity?: (identity: ResolvedIdentity) => void) => {
+  getMe: (a: AuthSession, onIdentity?: (identity: ResolvedIdentity) => void, onAttempt?: (attempt: ReturnType<typeof captureIdentityAttempt>) => void) => {
     let attempt: ReturnType<typeof captureIdentityAttempt> | undefined;
     return jsonOrThrow<{ user: WireUser; lane?: string | null }>(
       callWithRefresh(a, (t) => {
         // GET may replay after refresh. Evidence belongs to the actual final attempt.
-        if (onIdentity) attempt = captureIdentityAttempt(a, t);
+        if (onIdentity || onAttempt) {
+          attempt = captureIdentityAttempt(a, t);
+          onAttempt?.(attempt);
+        }
         return fetch("/api/me", { credentials: "include", headers: bearerHeaders(t), cache: "no-store" });
       }),
     ).then((r) => {

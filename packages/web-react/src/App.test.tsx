@@ -292,7 +292,7 @@ async function loginViaUi(email = 'a@b.com') {
   // 启动静默续期期间是 splash(无 Landing):等 refresh 401 落定、Landing 出现再点。
   const landingLogin = await screen.findByRole('button', { name: '登录' })
   fireEvent.click(landingLogin) // Landing 登录 → AuthGate
-  fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: email } })
+  fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: email } })
   fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
   // 正常路径等公开配置（turnstile_bypass）就绪后提交；异常路径另有“点一次后自动恢复”用例。
   const submit = screen.getByRole('button', { name: '登录' })
@@ -437,7 +437,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: '登录' }))
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
 
     await waitFor(() => expect(configCalls).toBe(1))
@@ -1827,7 +1827,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(typeof pending?.starterPrompt).toBe('string')
     expect((pending?.starterPrompt ?? '').length).toBeGreaterThan(20)
 
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
     const submit = screen.getByRole('button', { name: '登录' })
     await waitFor(() => expect(submit).not.toBeDisabled())
@@ -1867,7 +1867,7 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     // 已有账号:注册表单「返回登录」改走登录(与注册成功后进入工作区是同一个消费点)
     fireEvent.click(screen.getByRole('button', { name: '返回登录' }))
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
     const submit = screen.getByRole('button', { name: '登录' })
     await waitFor(() => expect(submit).not.toBeDisabled())
