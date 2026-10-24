@@ -4,7 +4,6 @@
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-const AgentPicker = lazy(() => import("./AgentPicker").then(module => ({default:module.AgentPicker})));
 import { PendingPaymentRecovery } from "./payment/PendingPaymentRecovery";
 import { LazyBoundary } from "./ChunkErrorBoundary";
 import { DialogFallback } from "./DialogFallback";
@@ -33,6 +32,8 @@ import type { ProjectRoute } from "../hooks/useAppRoute";
 import type { Theme } from "../hooks/useTheme";
 import type { SettingsDestinationSection } from "../lib/productCapabilities";
 import type { ToastFn } from "./ui/Toast";
+
+const AgentPicker = lazy(() => import("./AgentPicker").then(module => ({default:module.AgentPicker})));
 
 const SettingsCenter = lazy(() =>
   import("./SettingsCenter").then((m) => ({ default: m.SettingsCenter })),

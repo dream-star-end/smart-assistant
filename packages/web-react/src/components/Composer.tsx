@@ -37,7 +37,9 @@ import { clearDraft, readDraft, draftExceedsStorage } from "../lib/composerDraft
 import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
-import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
+import {STATUS_LABEL,goalNearBudget,visibleGoalOf,type GoalSetInput} from '../lib/goalPresentation';
+import {LazyBoundary} from './ChunkErrorBoundary';
+import {DialogFallback} from './DialogFallback';
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -76,6 +78,7 @@ const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 // 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。只是提示,加载失败(发版后的
 // 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
 const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
+const GoalDialog=lazy(()=>import('./GoalDialog').then(module=>({default:module.GoalDialog})));
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
@@ -1115,7 +1118,8 @@ export function Composer({
       </Dialog.Root>
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
-      {canGoal && onSetGoal && onGoalAction && (
+      {canGoal && onSetGoal && onGoalAction && goalOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
         <GoalDialog
           open={goalOpen}
           onOpenChange={setGoalOpen}
@@ -1123,6 +1127,7 @@ export function Composer({
           onSet={onSetGoal}
           onAction={onGoalAction}
         />
+        </LazyBoundary>
       )}
     </div>
   );
