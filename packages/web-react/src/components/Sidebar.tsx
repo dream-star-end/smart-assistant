@@ -1,4 +1,5 @@
 import {
+  Clapperboard,
   Archive,
   BookOpen,
   Building2,
@@ -169,6 +170,8 @@ export type SidebarProps = {
   onOpenOrg?: () => void;
   onOpenBoard?: () => void;
   onOpenMediaTasks?: () => void;
+  /** OCV5-593: shown only when /api/studio/providers answers 200 for this account. */
+  onOpenStudio?: () => void;
   /** 「ChatGPT 直连」面板入口:仅管理员 / 白名单用户且服务端已开启时由 App 传入。 */
   onOpenChatGptProxy?: () => void;
   /** 「API 接入」入口:管理员由 App 传入(admin-only rollout),直达设置 api-access 分区。 */
@@ -253,6 +256,7 @@ export function Sidebar({
   onOpenOrg,
   onOpenBoard,
   onOpenMediaTasks,
+  onOpenStudio,
   onOpenChatGptProxy,
   onOpenApiAccess,
   boardActive,
@@ -573,6 +577,7 @@ export function Sidebar({
       onOpenOrg ||
       showAdmin ||
       onOpenMediaTasks ||
+      onOpenStudio ||
       onOpenChatGptProxy ||
       onOpenApiAccess ||
       onOpenAccount ||
@@ -1257,6 +1262,12 @@ export function Sidebar({
                   </a>
                 </DropdownMenuItem>
               )}
+              {onOpenStudio && (
+                <DropdownMenuItem data-product-control onSelect={onOpenStudio}>
+                  <Clapperboard size={16} className="shrink-0 text-muted" />
+                  媒体工作台
+                </DropdownMenuItem>
+              )}
               {onOpenMediaTasks && (
                 <DropdownMenuItem data-product-control onSelect={onOpenMediaTasks}>
                   <Film size={16} className="shrink-0 text-muted" />
@@ -1282,6 +1293,7 @@ export function Sidebar({
                   onOpenOrg ||
                   showAdmin ||
                   onOpenMediaTasks ||
+                  onOpenStudio ||
                   onOpenChatGptProxy ||
                   onOpenApiAccess) && <DropdownMenuSeparator />}
               {onOpenAccount && (

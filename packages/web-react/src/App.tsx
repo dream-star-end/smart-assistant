@@ -219,6 +219,7 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
+import { probeStudio } from "./hooks/useStudioProviders";
 import { useServerFeatures } from "./hooks/useServerFeatures";
 import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
@@ -247,6 +248,8 @@ const TutorialCenter = lazy(() =>
 const ContainerWebPreview = lazy(() =>
   import("./components/ContainerWebPreview").then((m) => ({ default: m.ContainerWebPreview })),
 );
+// OCV5-593 媒体工作台:/studio 整页独立界面,只有进入时才下载。
+const StudioApp = lazy(() => import("./components/studio/StudioApp").then((m) => ({ default: m.StudioApp })));
 const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
@@ -311,7 +314,7 @@ export function App() {
   // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
   // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
   const urlRoute = readLocationRoute(location);
-  const { params, demo, resetToken, desktopEnroll, routingEnabled } = urlRoute;
+  const { params, demo, resetToken, desktopEnroll, studio, routingEnabled } = urlRoute;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -440,6 +443,8 @@ export function App() {
   // 「ChatGPT 直连」入口门控:服务端 GET /api/chatgpt-proxy/access 明确 enabled 才显示(默认隐藏)。
   const [chatGptProxyEnabled, setChatGptProxyEnabled] = useState(false);
   const [chatGptProxyOpen, setChatGptProxyOpen] = useState(false);
+  // 「媒体工作台」入口门控(OCV5-593):GET /api/studio/providers 明确 200 才显示(默认隐藏)。
+  const [studioAvailable, setStudioAvailable] = useState(false);
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
@@ -1564,6 +1569,25 @@ export function App() {
     };
   }, [mediaGateEnabled]);
 
+  // 媒体工作台开放探测:登录后拉一次(按身份 epoch 缓存),失败一律视为未开放。
+  useEffect(() => {
+    if (demo || !user) {
+      setStudioAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    probeStudio(authRef.current)
+      .then((view) => {
+        if (!cancelled) setStudioAvailable(view !== null);
+      })
+      .catch(() => {
+        if (!cancelled) setStudioAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, user]);
+
   // ChatGPT 直连授权探测:登录后拉一次。与视频任务相反,这里默认隐藏、只有服务端明确
   // enabled:true 才显示入口 —— 未授权用户看不到任何代理信息。
   useEffect(() => {
@@ -1875,6 +1899,14 @@ export function App() {
     return <DesktopEnrollPage auth={auth} />;
   }
 
+  if (studio && auth) {
+    return (
+      <LazyBoundary fallback={<SplashFallback />}>
+        <StudioApp auth={auth} theme={theme} onCycleTheme={cycle} />
+      </LazyBoundary>
+    );
+  }
+
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
   // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
   // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
@@ -1951,6 +1983,7 @@ export function App() {
           },
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
+    onOpenStudio: !demo && studioAvailable ? () => window.location.assign("/studio") : undefined,
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
     // 「API 接入」:admin-only rollout(与后端 requireAdmin / strategy Layer 2 同门)。
     onOpenApiAccess: !demo && user?.role === "admin" ? () => openSettings("api-access") : undefined,
@@ -2114,6 +2147,7 @@ export function App() {
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
+          onOpenStudio={closeMobileThen(sidebarProps.onOpenStudio)}
           onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
           onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
           onLogout={closeMobileThen(sidebarProps.onLogout)}
