@@ -124,6 +124,7 @@ export interface AntigravityPlatformInput {
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -252,6 +253,7 @@ export function projectAntigravityPlatform(
       `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
+        traceId: input.traceId,
         depth: input.delegationDepth,
         consultTurn: input.consultTurn,
       })}\n`,

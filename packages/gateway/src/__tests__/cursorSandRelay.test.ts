@@ -1796,6 +1796,50 @@ test('relay passthrough without authority headers sends none (no empty/forged va
   }
 })
 
+test('OCV5-596: passthrough carries the turn trace set on the relay, never a caller one', async () => {
+  const captured: Headers[] = []
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    captured.push(new Headers(init?.headers))
+    return new Response('{"type":"message"}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const relay = new CursorSandRelay({
+    fetchImpl,
+    readApiKey: () => Buffer.from('crsr_test'),
+    passthrough: { baseUrl: 'http://proxy.internal:18892', authToken: 'container-bearer' },
+  })
+  const baseUrl = await relay.start()
+  const T1 = '0a1b2c3d4e5f60718293a4b5c6d7e8f9'
+  const send = () => fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-openclaude-trace-id': 'ffeeddccbbaa99887766554433221100' },
+    body: JSON.stringify({ model: 'glm-5.3-zai', stream: false, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+  }).then((r) => r.text())
+  try {
+    await send()
+    relay.setTraceId(T1)
+    await send()
+    relay.setTraceId('not-a-trace')
+    await send()
+    relay.setTraceId(undefined)
+    await send()
+    assert.deepEqual(captured.map((h) => h.get('x-openclaude-trace-id')), [null, T1, null, null])
+  } finally {
+    await relay.close()
+  }
+})
+
+test('OCV5-596: CursorSandAdapter hands the turn trace to its relay', () => {
+  const traces: Array<string | undefined> = []
+  const relay = { setTraceId: (t: string | undefined) => { traces.push(t) }, close: async () => {} }
+  const adapter = new CursorSandAdapter({
+    sessionKey: 'agent:main:test:sand-trace', agentId: 'main', agentBaseDir: process.cwd(),
+    config: {} as never, model: 'cursor-fable-5-high', cursorCredentialSelection: STABLE_SAND_SELECTION,
+  }, relay as never, () => { throw new Error('no submit') }, () => {})
+  adapter.setTraceId('0a1b2c3d4e5f60718293a4b5c6d7e8f9')
+  adapter.setTraceId(undefined)
+  assert.deepEqual(traces, ['0a1b2c3d4e5f60718293a4b5c6d7e8f9', undefined])
+})
+
 test('relay rejects non-Sand models with 400 (not 502) when no passthrough proxy exists', async () => {
   const relay = new CursorSandRelay({
     fetchImpl: async () => { throw new Error('unreachable') },

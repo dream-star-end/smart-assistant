@@ -165,3 +165,53 @@ describe("updateTurnTraceDispatch bounded retry (OCV5-57 B2)", () => {
     assert.equal(warns[0].fields?.attempts, 3);
   });
 });
+
+
+describe("OCV5-613 admitted canonical projection", () => {
+  it("overwrites wrong identity while keeping dispatch and request COALESCE", async () => {
+    let state = { agentId: "wrong", sessionKey: "agent:wrong:webchat:dm:p" };
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const pool = {
+      query: (sql: string, params: unknown[]) => {
+        calls.push({ sql, params });
+        if (/agent_id = [$]4/.test(sql) && /session_key = [$]5/.test(sql)) {
+          state = { agentId: params[3] as string, sessionKey: params[4] as string };
+        }
+        return Promise.resolve({ rowCount: 1 });
+      },
+    } as unknown as Pool;
+    updateTurnTraceDispatch(pool, undefined, {
+      traceId: "tr-613", dispatchId: "11111111-1111-4111-8111-111111111111", requestId: "br-613",
+      identity: { agentId: "worker", sessionKey: "agent:worker:webchat:dm:p" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!.sql, /COALESCE[(]dispatch_id, [$]2[)]/);
+    assert.match(calls[0]!.sql, /COALESCE[(]request_id, [$]3[)]/);
+    assert.deepEqual(state, { agentId: "worker", sessionKey: "agent:worker:webchat:dm:p" });
+    assert.deepEqual(calls[0]!.params.slice(0, 3), ["tr-613", "11111111-1111-4111-8111-111111111111", "br-613"]);
+  });
+
+  it("retries an empty UPDATE after the early INSERT lands, without blocking", async () => {
+    const calls: unknown[][] = [];
+    let exists = false;
+    const warns: string[] = [];
+    const pool = {
+      query: (_sql: string, params: unknown[]) => {
+        calls.push([...params]);
+        return Promise.resolve({ rowCount: exists ? 1 : 0 });
+      },
+    } as unknown as Pool;
+    const result = updateTurnTraceDispatch(pool, (msg) => warns.push(msg), {
+      traceId: "tr-613-late", dispatchId: "11111111-1111-4111-8111-111111111111", requestId: "br-613",
+      identity: { agentId: "main", sessionKey: "agent:main:webchat:dm:p" },
+    });
+    assert.equal(result, undefined);
+    assert.equal(calls.length, 1);
+    exists = true;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((params) => params[3] === "main" && params[4] === "agent:main:webchat:dm:p"));
+    assert.deepEqual(warns, []);
+  });
+});

@@ -2006,6 +2006,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
           `${issueParentCallerToken({
             agentId: this.opts.agentId,
             sessionKey: this.opts.sessionKey,
+            traceId: ctx.params.traceId,
             depth: this.opts.delegationDepth ?? 0,
             consultTurn: ctx.params.consultTurn && ctx.params.turnKey
               ? {

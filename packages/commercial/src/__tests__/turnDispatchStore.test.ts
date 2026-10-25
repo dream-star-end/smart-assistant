@@ -22,6 +22,7 @@ type Raw = Record<string, unknown>
 
 function rawRow(o: Partial<Raw> = {}): Raw {
   return {
+    trace_id: '60500000000000000000000000000001',
     dispatch_id: 'd-1',
     user_id: '42',
     session_id: 'sess-0001',

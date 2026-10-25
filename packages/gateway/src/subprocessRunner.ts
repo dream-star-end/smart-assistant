@@ -1209,8 +1209,10 @@ export class SubprocessRunner extends EventEmitter {
     _requestId?: string,
     authority?: TurnModelAuthority,
     turnKey?: string,
+    traceId?: string | null,
   ): Promise<void> {
-    const turnTiming = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
+    const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
+    const turnTiming = new PassiveStageTiming({ engine: 'ccb', traceId: turnTraceId,
       sessionKey: this.opts.sessionKey, model: this.opts.model },
       (fields) => runnerLog.info('engine_submit_timing', { ...fields, generation: this.spawnGeneration }))
     turnTiming.once('submit_received')
@@ -1288,7 +1290,7 @@ export class SubprocessRunner extends EventEmitter {
     if (!this.proc) await this.start()
     turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
-    this.refreshDelegateContext()
+    this.refreshDelegateContext(turnTraceId)
     const envUpdateLine = envUpdateVars
       ? _buildUpdateEnvStdinLine({
           ...envUpdateVars,
@@ -1934,7 +1936,7 @@ export class SubprocessRunner extends EventEmitter {
   }
 
   /** Refresh caller binding at the actual turn boundary, not process spawn. */
-  private refreshDelegateContext(): void {
+  private refreshDelegateContext(traceId?: string): void {
     if (!this.delegateContextFile) return
     const consult = this.consultTurnBinding
     const token = consult
@@ -1942,6 +1944,7 @@ export class SubprocessRunner extends EventEmitter {
           agentId: this.opts.agentId,
           sessionKey: this.opts.sessionKey,
           depth: this.opts.delegationDepth ?? 0,
+          traceId,
           turnKey: consult.turnKey,
           turnIndex: consult.turnIndex,
           collabMode: 'advisor',
@@ -1951,6 +1954,7 @@ export class SubprocessRunner extends EventEmitter {
           agentId: this.opts.agentId,
           sessionKey: this.opts.sessionKey,
           depth: this.opts.delegationDepth ?? 0,
+          traceId,
         })
     writeFileSync(this.delegateContextFile, `${token}\n`, { mode: 0o600 })
   }
