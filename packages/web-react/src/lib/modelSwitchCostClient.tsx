@@ -222,8 +222,7 @@ export function createModelSwitchCostAuthorizer({
         if (opts.interactive === false) throw error
         if (opts.allowOfflineQueue && unavailable && current())
           return { requestId: input.requestId, choice: true }
-        if (opts.interactive !== false && current())
-          toast(apiErrorMessage(error, '费用确认暂不可用，请重试'), 'error')
+        if (current()) toast(apiErrorMessage(error, '费用确认暂不可用，请重试'), 'error')
         return null
       }
     })()
