@@ -112,9 +112,15 @@ describe('dispatchStudioRoute', () => {
     projectOwned: async (uid: string) => uid === '247',
     addUserTrack: async (
       uid: string,
-      input: { id: string; title: string; rights: { statement: string } },
+      input: {
+        id: string
+        title: string
+        rights: { statement: string }
+        durationMs?: number | null
+      },
     ) => {
       calls.push(`track:${uid}:${input.title}:${input.rights.statement}`)
+      calls.push(`trackLen:${input.title}:${input.durationMs ?? null}`)
       return { id: input.id, title: input.title }
     },
     transition: async (uid: string, id: string, action: string) => {
@@ -480,6 +486,23 @@ describe('dispatchStudioRoute', () => {
       const created = await up('title=demo&rights=own_or_licensed&note=client%20contract')
       assert.equal(created.status, 201)
       assert.ok(calls.includes('track:247:demo:own_or_licensed'))
+      // M1 follow-up: the real length is read from the upload; unreadable bytes stay unknown.
+      assert.ok(calls.includes('trackLen:demo:null'))
+      const wav = Buffer.alloc(44 + 88_200) // 0.5 s of 44.1 kHz 16-bit stereo
+      wav.write('RIFF', 0, 'ascii')
+      wav.writeUInt32LE(36 + 88_200, 4)
+      wav.write('WAVEfmt ', 8, 'ascii')
+      wav.writeUInt32LE(16, 16)
+      wav.writeUInt16LE(1, 20)
+      wav.writeUInt16LE(2, 22)
+      wav.writeUInt32LE(44_100, 24)
+      wav.writeUInt32LE(176_400, 28)
+      wav.writeUInt16LE(4, 32)
+      wav.writeUInt16LE(16, 34)
+      wav.write('data', 36, 'ascii')
+      wav.writeUInt32LE(88_200, 40)
+      assert.equal((await up('title=wav&rights=own_or_licensed', 'audio/wav', wav)).status, 201)
+      assert.ok(calls.includes('trackLen:wav:500'))
     } finally {
       providers = undefined
       orchestrator = undefined
