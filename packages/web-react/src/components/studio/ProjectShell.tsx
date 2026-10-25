@@ -1,12 +1,15 @@
 // OCV5-593 project frame: breadcrumb, step tabs (需求 / 设定 / 镜头 / 配音 / 音乐 / 成片), credit pill.
 
-import { ChevronRight, Clapperboard, Coins } from 'lucide-react'
+import { ChevronRight, Clapperboard, Coins, Play } from 'lucide-react'
+import { useState } from 'react'
 
 import { useStudioProject } from '../../hooks/useStudioProject'
+import { studioApi, studioErrorText } from '../../lib/studio/api'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import type { StudioPage, StudioRoute } from '../../lib/studio/path'
 import type { ProvidersView } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
+import { useToast } from '../ui'
 import { StateView } from './StateViews'
 import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
@@ -45,6 +48,8 @@ export function ProjectShell(props: {
 }) {
   const { auth, projectId, page, navigate } = props
   const { state, reload, refresh, applyProject } = useStudioProject(auth, projectId)
+  const toast = useToast()
+  const [resuming, setResuming] = useState(false)
 
   if (state.state === 'loading') return <StateView kind="loading" />
   if (state.state === 'missing') {
@@ -71,6 +76,17 @@ export function ProjectShell(props: {
   const go = (p: StudioPage) => navigate({ kind: 'project', id: projectId, page: p })
   const openShot = (shot: string) =>
     navigate({ kind: 'project', id: projectId, page: 'review', shot })
+  const resume = async () => {
+    if (resuming || project.status !== 'paused') return
+    setResuming(true)
+    try {
+      applyProject(await studioApi.transition(auth, projectId, 'resume'))
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setResuming(false)
+    }
+  }
 
   return (
     <>
@@ -109,6 +125,19 @@ export function ProjectShell(props: {
             </a>
           ))}
         </nav>
+        {project.status === 'paused' ? (
+          <button
+            type="button"
+            className="st-btn st-btn-sm st-btn-primary"
+            data-testid="studio-topbar-resume"
+            disabled={resuming}
+            onClick={() => void resume()}
+            title="从暂停前的步骤继续"
+          >
+            <Play size={14} />
+            {resuming ? '继续中…' : '继续'}
+          </button>
+        ) : null}
         <div
           className={`st-credit${pct >= 85 ? ' warn' : ''}`}
           title={`已花费 ${formatCredits(project.spentCredits)} · 预留 ${formatCredits(project.reservedCredits)} · 预算 ${formatCredits(project.budgetCredits)}`}
@@ -144,6 +173,7 @@ export function ProjectShell(props: {
           providers={props.providers}
           onOpenShot={openShot}
           onOpenBrief={() => go('brief')}
+          onProject={applyProject}
         />
       ) : page === 'image' ? (
         <ImageStudioPage
@@ -167,6 +197,7 @@ export function ProjectShell(props: {
           view={state.view}
           providers={props.providers}
           onOpenShot={openShot}
+          onProject={applyProject}
         />
       ) : page === 'music' ? (
         <MusicPage
