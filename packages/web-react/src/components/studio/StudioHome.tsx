@@ -321,7 +321,7 @@ export function StudioHome(props: {
             style={{ marginTop: 14, color: 'var(--st-stage-faint)', gap: 6 }}
           >
             <Coins size={13} />
-            按实际生成扣积分，开拍前会先给出预估
+            按实际生成扣积分；导演写好分镜后先算出预估，超出预算会暂停问你
           </div>
         </div>
         <div className="st-home-collage" aria-hidden="true">

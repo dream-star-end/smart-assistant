@@ -159,6 +159,9 @@ export function BriefPage(props: {
 
   const awaitingReason =
     typeof project.settings.awaitingReason === 'string' ? project.settings.awaitingReason : null
+  // Set by the director when the storyboard is written (plan.ready); absent before that.
+  const estimate =
+    typeof project.settings.estimateCredits === 'string' ? project.settings.estimateCredits : null
   const canApprove =
     project.status === 'awaiting_user' &&
     (awaitingReason === 'approve_plan' || awaitingReason === 'budget')
@@ -472,8 +475,8 @@ export function BriefPage(props: {
               {starting ? '正在开拍…' : '全自动开始'}
             </button>
             <div className="st-cap" style={{ textAlign: 'center' }}>
-              开拍后导演 agent 会写分镜并开始生成。超出预算{' '}
-              {formatCredits(project.budgetCredits)} 时会自动暂停并问你。
+              开拍后导演 agent 会写分镜并开始生成。超出预算 {formatCredits(project.budgetCredits)}{' '}
+              时会自动暂停并问你。
             </div>
           </>
         ) : canApprove ? (
@@ -494,16 +497,24 @@ export function BriefPage(props: {
             </button>
             <div className="st-cap" style={{ textAlign: 'center' }}>
               {awaitingReason === 'budget'
-                ? '预估费用超过了当前预算，调高预算后再继续。'
-                : '分镜已写好，确认后导演 agent 开始生成镜头。'}
+                ? `预估 ${estimate ? formatCredits(estimate) : '—'} 积分，超过了当前预算，调高预算后再继续。`
+                : `分镜已写好，预估 ${estimate ? formatCredits(estimate) : '—'} 积分；确认后导演 agent 开始生成镜头。`}
             </div>
           </>
         ) : project.status === 'planning' ||
           project.status === 'running' ||
           project.status === 'composing' ? (
-          <div className="st-cap" style={{ textAlign: 'center' }}>
-            导演 agent 正在工作；超出预算 {formatCredits(project.budgetCredits)}{' '}
-            时会自动暂停并问你。
+          <div
+            className="st-cap"
+            style={{ textAlign: 'center' }}
+            data-testid="studio-progress-note"
+          >
+            {project.status === 'planning'
+              ? '导演 agent 正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。'
+              : estimate
+                ? `分镜预估 ${formatCredits(estimate)} 积分，导演 agent 正在生成。`
+                : '导演 agent 正在工作。'}
+            超出预算 {formatCredits(project.budgetCredits)} 时会自动暂停并问你。
           </div>
         ) : null}
         <div className="st-row" style={{ gap: 8 }}>
