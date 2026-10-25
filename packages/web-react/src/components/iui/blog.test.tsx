@@ -161,6 +161,24 @@ describe("发给 Agent 的话 / 本机记录 / Markdown", () => {
 });
 
 describe("草稿卡", () => {
+  test("本版改动在纸面内、不与 Frame 副标题重复；确认投稿操作区可见", async () => {
+    const actions = actionsMock();
+    render(wrap(<IuiBlock code={block({ ...DRAFT, note: "第一版" })} />, actions));
+    await screen.findByRole("button", { name: "确认投稿" });
+    const note = screen.getByText(/本版改动：第一版/);
+    expect(note.className).toContain("oc-blog-chat-note");
+    // 分类/时长只以 chip 出现一次（不再有 Frame subtitle「… · 约 N 分钟」；chip 文案是「编码」不是 CATEGORY_LABEL「编程」）
+    expect(screen.queryByText(/编码 · 约/)).toBeNull();
+    expect(screen.queryByText(/编程 · 约/)).toBeNull();
+    const chips = document.querySelector(".oc-blog-chat-chips");
+    expect(chips).not.toBeNull();
+    expect(chips!.textContent).toMatch(/编码/);
+    expect(chips!.textContent).toMatch(/约 \d+ 分钟/);
+    expect(note.compareDocumentPosition(chips!) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    expect(screen.getByTestId("blog-draft-actions")).toBeInTheDocument();
+  });
+
+
   test("自动预检（正文里的容器图片换成占位）；阻断问题禁用投稿，「修复」把修改点发给 Agent", async () => {
     const actions = actionsMock({
       precheck: vi.fn(async () => ({

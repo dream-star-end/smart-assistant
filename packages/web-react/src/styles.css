@@ -2338,3 +2338,129 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-mkt-legend i.is-price { background: var(--iui-c1); }
 .oc-mkt-legend i.is-avg { background: #e0a45e; }
 .oc-mkt-legend i.is-base { background: var(--muted); }
+
+/* ── 经验分享（OCV5-577）：阅读版式与卡片。颜色全部走 token，亮暗自动跟随。 ───────────── */
+.blog-chip { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--hover); color: var(--muted); white-space: nowrap; }
+.blog-chip-accent { background: var(--accent-soft); color: var(--accent); }
+.blog-chip-ok { background: var(--success-soft); color: var(--success); }
+.blog-chip-warn { background: var(--warning-soft); color: var(--warning); }
+.blog-chip-bad { background: var(--danger-soft); color: var(--danger); }
+.blog-chip-info { background: var(--info-soft); color: var(--info); }
+.blog-cover { position: relative; aspect-ratio: 16 / 9; background: #07111f center / cover no-repeat; display: grid; place-items: center; color: rgba(255, 255, 255, 0.8); overflow: hidden; }
+.blog-cover > .blog-chip { position: absolute; left: 12px; top: 12px; background: rgba(255, 255, 255, 0.9); color: #15151b; }
+.blog-prose .prose { font-size: 16.5px; line-height: 1.8; }
+.blog-prose.blog-prose-compact .prose { font-size: 15px; }
+.blog-prose .prose p { margin: 0 0 16px; }
+.blog-prose .prose h2 { font-size: 21px; margin: 34px 0 10px; }
+.blog-prose .prose pre { background: var(--code); border: 1px solid var(--border); border-radius: 14px; }
+.blog-prose .prose blockquote { margin: 18px 0; padding: 12px 16px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 12px 12px 0; color: var(--fg); font-size: 15px; }
+.blog-figure { margin: 22px 0; display: block; }
+/* ── 对话写博客：经验分享草稿卡 / 状态卡 / 链接卡（OCV5-577 跟进） ──
+   选择器用 .oc-iui … 两级，压过 .prose p / .prose h3 / .oc-iui p（否则 margin 被清零，
+   窄屏上「本版改动」与 BlogChips 会贴死甚至看起来叠字）。 */
+.oc-iui .oc-blog-chat-note { margin: 8px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--muted); }
+.oc-blog-chat-paper {
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
+  margin: 4px 16px 12px;
+  padding: 14px 20px 0;
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px var(--iui-line);
+  overflow: hidden;
+}
+/* 收起时给绝对定位的「展开全文」条留底，避免把 chips/标题盖住，也避免 fold 误挂到外层卡片底。 */
+.oc-blog-chat-paper:not(.is-expanded) { padding-bottom: 48px; }
+.oc-blog-chat-paper:not(.is-expanded) .oc-blog-chat-body { max-height: 300px; overflow: hidden; }
+.oc-blog-chat-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.oc-blog-chat-chips .blog-chip { max-width: 100%; }
+.oc-blog-chat-chips .blog-chip > svg { flex-shrink: 0; display: block; }
+.oc-iui .oc-blog-chat-title { margin: 10px 0 0; font-size: 18px; font-weight: 700; line-height: 1.4; color: var(--fg); }
+.oc-iui .oc-blog-chat-summary { margin: 6px 0 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.oc-blog-chat-body { font-size: 14.5px; }
+.oc-blog-chat-body .blog-figure { margin: 14px 0; }
+.oc-blog-chat-figure { display: block; width: 100%; max-height: 320px; border-radius: 10px; object-fit: contain; }
+.oc-blog-chat-fold { display: flex; justify-content: center; padding: 6px 0 10px; }
+.oc-blog-chat-paper:not(.is-expanded) .oc-blog-chat-fold {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1;
+  padding-top: 56px;
+  background: linear-gradient(to top, var(--iui-panel-in) 40%, transparent);
+}
+.oc-iui .oc-blog-chat-checking { display: flex; align-items: center; gap: 6px; margin: 0 16px 12px; font-size: 13px; color: var(--muted); }
+.oc-blog-chat-checking.is-error { color: var(--danger); flex-wrap: wrap; }
+.oc-iui .oc-blog-chat-pass { display: flex; gap: 8px; margin: 0 16px 12px; padding: 10px 14px; border-radius: 12px; background: var(--success-soft); font-size: 13px; color: var(--fg); }
+.oc-blog-chat-pass > svg { flex-shrink: 0; margin-top: 2px; color: var(--success); }
+.oc-blog-chat-pass-sub { color: var(--muted); }
+.oc-blog-chat-issues { margin: 0 16px 12px; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--iui-line); }
+.oc-blog-chat-issues > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px 8px 14px; border-bottom: 1px solid var(--iui-line); }
+.oc-blog-chat-issues-title { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--fg); }
+.oc-blog-chat-issues-title > svg { color: var(--warning); }
+.oc-blog-chat-issues ul { margin: 0; padding: 0; list-style: none; }
+.oc-blog-chat-issues li { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px 9px 14px; font-size: 13px; line-height: 1.6; color: var(--fg); }
+.oc-blog-chat-issues li + li { border-top: 1px solid var(--iui-line); }
+.oc-blog-chat-ico { flex-shrink: 0; margin-top: 3px; }
+.oc-blog-chat-ico.is-block { color: var(--danger); }
+.oc-blog-chat-ico.is-warn { color: var(--warning); }
+.oc-blog-chat-where { display: inline-block; margin-right: 6px; padding: 0 6px; border-radius: 6px; background: var(--hover); font-size: 11.5px; color: var(--muted); }
+.oc-blog-chat-fix { flex-shrink: 0; color: var(--accent); }
+/* 操作条在纸面外；相对定位 + 实底，避免被纸面绝对 fold 在部分 WebKit 上「逃逸」盖住。 */
+.oc-blog-chat-actions {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--iui-line);
+  background: var(--iui-panel);
+}
+.oc-blog-chat-actions.is-flat { padding: 4px 0 0; border-top: 0; background: transparent; }
+.oc-iui .oc-blog-chat-hint { margin: 0 16px 12px; font-size: 12.5px; line-height: 1.5; color: var(--faint); }
+.oc-blog-chat-hint.is-inline { margin: 0 0 0 auto; }
+.oc-iui .oc-blog-chat-error { margin: 0 16px 12px; font-size: 13px; color: var(--danger); }
+.oc-blog-chat-pad { display: flex; flex-direction: column; gap: 12px; padding: 0 16px 16px; }
+.oc-blog-chat-pad .oc-blog-chat-checking, .oc-blog-chat-pad .oc-blog-chat-hint, .oc-blog-chat-pad .oc-blog-chat-error { margin: 0; }
+.oc-blog-chat-muted { margin: 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.oc-blog-chat-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; padding: 0; list-style: none; font-size: 12.5px; color: var(--faint); }
+.oc-blog-chat-steps li { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.oc-blog-chat-steps li.is-done { color: var(--success); }
+.oc-blog-chat-steps li.is-cur { font-weight: 600; color: var(--accent); }
+.oc-blog-chat-step-line { width: 18px; height: 1px; background: var(--border-strong); }
+.oc-blog-chat-reason { padding: 10px 14px; border-radius: 12px; background: var(--danger-soft); font-size: 13px; line-height: 1.6; color: var(--fg); }
+.oc-blog-chat-link { display: flex; margin: 0 16px 12px; border-radius: 14px; box-shadow: inset 0 0 0 1px var(--iui-line); overflow: hidden; }
+.oc-blog-chat-cover { width: 220px; flex-shrink: 0; min-height: 140px; border-radius: 0; }
+.oc-blog-chat-link-title { margin-top: 8px; font-size: 16px; font-weight: 700; line-height: 1.4; color: var(--fg); }
+.oc-blog-chat-link-summary { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin: 4px 0 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.oc-blog-chat-url { margin-top: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--faint); }
+.oc-blog-chat-confirm { display: grid; grid-template-columns: 64px 1fr; gap: 6px 8px; margin: 0; font-size: 13.5px; }
+.oc-blog-chat-confirm dt { color: var(--faint); }
+.oc-blog-chat-confirm dd { margin: 0; color: var(--fg); }
+.oc-blog-chat-confirm-notes { margin: 12px 0 0; padding-left: 18px; list-style: disc; font-size: 12.5px; line-height: 1.6; color: var(--muted); }
+@media (max-width: 640px) {
+  .oc-blog-chat-paper { padding: 12px 14px 0; }
+  .oc-blog-chat-paper:not(.is-expanded) { padding-bottom: 48px; }
+  .oc-blog-chat-paper:not(.is-expanded) .oc-blog-chat-body { max-height: 220px; }
+  .oc-blog-chat-actions { flex-direction: column; align-items: stretch; }
+  .oc-blog-chat-actions > button { width: 100%; }
+  .oc-blog-chat-hint.is-inline { margin: 0; }
+  .oc-blog-chat-link { flex-direction: column; }
+  .oc-blog-chat-cover { width: auto; min-height: 140px; }
+}
+
+.blog-figure > span, .blog-figure > span > button { display: block; width: 100%; }
+.blog-figure-img { display: block; width: 100%; border-radius: 14px; border: 1px solid var(--border); }
+.blog-figcaption { display: block;  font-size: 12.5px; color: var(--faint); text-align: center; margin-top: 8px; }
+.blog-figure-ph { display: grid; aspect-ratio: 16 / 9; border-radius: 14px; background: var(--skeleton); place-items: center; color: var(--faint); font-size: 13px; }
+.blog-meter { height: 6px; border-radius: 9px; background: var(--hover); overflow: hidden; }
+.blog-meter > i { display: block; height: 100%; border-radius: 9px; }
+
+
+/* Task results share the existing read-only IUI renderer; keep phone controls tappable. */
+@media (max-width: 767px) {
+  .oc-iui button { min-height: 44px; min-width: 44px; }
+}
