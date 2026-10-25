@@ -96,6 +96,12 @@ export const studioApi = {
         { method: 'POST' },
       )
     ).project,
+  /** OCV5-593 FE-4: draft → planning (director agent). Returns the refreshed project view. */
+  start: (auth: AuthSession, id: string) =>
+    call<StudioProjectView>(auth, `/projects/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+  /** Confirm a waiting plan / raised budget (awaiting_user + approve_plan|budget). */
+  approve: (auth: AuthSession, id: string) =>
+    call<StudioProjectView>(auth, `/projects/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
   /** Upload (images by default, or audio for a clone sample; ≤ 25 MB); the server checks the bytes. */
   uploadAsset: async (
     auth: AuthSession,
@@ -250,6 +256,12 @@ export function studioErrorText(err: unknown): string {
         return '这首曲子已经不在曲库里了，换一首吧'
       case 'STUDIO_ORCHESTRATOR_OFF':
         return '导演 agent 暂时没有运行'
+      case 'STUDIO_BRIEF_REQUIRED':
+        return '请先写好影片需求再开拍'
+      case 'STUDIO_PROJECT_BUSY':
+        return '你还有另一个项目在拍，先等它完成或取消'
+      case 'STUDIO_TARGET_TOO_LONG':
+        return '目标时长太长了，请先调短'
       case 'STUDIO_VOICE_CUSTOM_OFF':
         return '自定义音色即将开放，现在可以用系统音色'
       case 'ANNOTATION_BUSY':
