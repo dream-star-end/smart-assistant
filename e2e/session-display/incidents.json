@@ -8246,7 +8246,8 @@
       "symptom": "OCV5-614 Grok 过度防御审计 N1/N2：费用服务暂不可用被当成确认拒绝，恢复任务暂停、客户端消息误标重新确认。D1/D2/D3 按用户 t965u 与 2026-10-25 START 已定体验口径收窄。隔离 fixture 证明旧协作冲突路径无法自动保存本次选择、新路径重读并重存一次；无生产写入，未声称真实用户资金损失。D4 因 alt 同样提交 quoteToken 铸 consent 按条件不改。",
       "rootFixCommit": "876514a7",
       "coverageCommits": [
-        "876514a7"
+        "876514a7",
+        "1380f14a"
       ],
       "regressions": [
         {
