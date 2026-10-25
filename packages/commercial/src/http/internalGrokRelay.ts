@@ -216,9 +216,11 @@ export function makeGrokRelayHandler(deps: {
       userId: BigInt(identity.userId),
     })
     if (!context || !GROK_RELAY_MODEL_IDS.has(context.modelId)) { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
+    // method + suffix are the ALLOWED pair checked above (fixed strings): they split inference from
+    // the CLI's models/settings/billing probes in the egress log. Never the route token or query.
     const stage = createPassiveRelayTiming(deps.logger, {
       engine: 'grok', requestId, ...egressTraceFields(req), uid: String(identity.userId),
-      model: context.modelId, slotId: context.slotId,
+      model: context.modelId, slotId: context.slotId, method, upstreamPath: suffix,
     }, receivedAt)
     stage('proxy_received')
     stage('route_ready')
