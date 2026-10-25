@@ -193,7 +193,8 @@
     "0324_media_studio",
     "0326_community_blog",
     "0327_community_tutorial_moderation",
-    "0328_community_tutorial_revisions"
+    "0328_community_tutorial_revisions",
+    "0329_media_studio_music"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

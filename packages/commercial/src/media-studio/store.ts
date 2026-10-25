@@ -28,6 +28,8 @@ export type StudioStatus =
 
 const TERMINAL: ReadonlySet<StudioStatus> = new Set(['done', 'failed', 'canceled'])
 const ASPECTS = new Set(['16:9', '9:16', '1:1'])
+/** OCV5-591 A2-1 plan §5.1: 40 shots × 10 s must always cover target × 1.3. */
+export const STUDIO_MAX_TARGET_SEC = 300
 
 export interface ProjectRow {
   id: string
@@ -85,7 +87,7 @@ function validatePatch(input: Record<string, unknown>): ProjectPatch {
     if (
       !Number.isInteger(input.targetSec) ||
       (input.targetSec as number) < 5 ||
-      (input.targetSec as number) > 600
+      (input.targetSec as number) > STUDIO_MAX_TARGET_SEC
     )
       throw bad('targetSec')
     out.targetSec = input.targetSec as number
@@ -135,6 +137,47 @@ async function inTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Prom
 
 export class StudioStore {
   constructor(private readonly pool: Pool) {}
+
+  /** My Music (OCV5-591 M1, 0329): the audio is already the user's blob (ref id = track id). */
+  async addUserTrack(
+    userId: string,
+    input: {
+      id: string
+      title: string
+      blobSha: string
+      mime: string
+      rights: Record<string, unknown>
+      /** Real length read from the upload (null when it cannot be read). */
+      durationMs?: number | null
+    },
+  ): Promise<{ id: string; title: string; blobSha: string; createdAt: string }> {
+    const r = await this.pool.query<{
+      id: string
+      title: string
+      blob_sha: string
+      created_at: Date
+    }>(
+      `INSERT INTO studio_user_tracks(id, user_id, title, blob_sha, mime, rights_statement, duration_ms)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       RETURNING id::text AS id, title, blob_sha, created_at`,
+      [
+        input.id,
+        userId,
+        input.title,
+        input.blobSha,
+        input.mime,
+        JSON.stringify(input.rights),
+        input.durationMs ?? null,
+      ],
+    )
+    const row = r.rows[0]!
+    return {
+      id: row.id,
+      title: row.title,
+      blobSha: row.blob_sha,
+      createdAt: row.created_at.toISOString(),
+    }
+  }
 
   async createProject(userId: string, input: Record<string, unknown>): Promise<ProjectRow> {
     const patch = validatePatch(input)
@@ -205,7 +248,7 @@ export class StudioStore {
   async projectView(userId: string, id: string): Promise<Record<string, unknown> | null> {
     const project = await this.getProject(userId, id)
     if (!project) return null
-    const [shots, lines, assets, takes, events] = await Promise.all([
+    const [shots, lines, assets, takes, events, annotations] = await Promise.all([
       this.pool.query(
         `SELECT id::text AS id, ordinal, spec, status, active_take_id::text AS "activeTakeId"
          FROM studio_shots WHERE project_id=$1 ORDER BY ordinal`,
@@ -226,13 +269,40 @@ export class StudioStore {
       this.pool.query(
         `SELECT id::text AS id, owner_kind AS "ownerKind", owner_id::text AS "ownerId", version, provider,
                 model, op, status, error_code AS "errorCode", cost_credits::text AS "costCredits", qa,
-                blob_sha AS "blobSha", created_at AS "createdAt", finished_at AS "finishedAt"
+                blob_sha AS "blobSha", created_at AS "createdAt", finished_at AS "finishedAt",
+                -- OCV5-591 M1: a music take carries its licence snapshot and track card for the UI;
+                -- other takes' meta (provider internals) stays server-side.
+                CASE WHEN owner_kind = 'music'
+                     THEN jsonb_build_object('license', meta->'license', 'track', meta->'track') END AS music,
+                -- OCV5-591 A2-1c-2: the media's real length (the timeline places narration by it, as compose
+                -- does); a malformed value is left out rather than failing the view.
+                CASE WHEN jsonb_typeof(meta->'durationMs') = 'number'
+                     THEN (meta->>'durationMs')::float8 END AS "durationMs",
+                -- OCV5-591 A2-1c-2: a film's export format, CC BY credits and soft-subtitle file (a film
+                -- still being composed has only the format it was asked for, in its inputs).
+                CASE WHEN owner_kind = 'final'
+                     THEN jsonb_build_object('variant', COALESCE(meta->'variant', inputs->'variant'),
+                                             'variantKey', meta->'variantKey',
+                                             'credits', meta->'credits', 'srtSha', meta->'srtSha') END AS final
          FROM studio_takes WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500`,
         [id],
       ),
       this.pool.query(
         `SELECT id::text AS id, ts, type, payload FROM studio_events
          WHERE project_id=$1 ORDER BY id DESC LIMIT 50`,
+        [id],
+      ),
+      // OCV5-591 A2-1b-2: what the agent understood and how running it went (no model internals).
+      this.pool.query(
+        `SELECT id::text AS id, target_kind AS "targetKind", target_id::text AS "targetId", take_id::text AS "takeId",
+                kind, t_start_ms AS "tStartMs", t_end_ms AS "tEndMs", geom, text, status,
+                CASE WHEN interpretation IS NULL THEN NULL ELSE jsonb_build_object(
+                  'op', interpretation->'op', 'explanation', interpretation->'explanation',
+                  'confidence', interpretation->'confidence',
+                  'state', interpretation->'execution'->'state', 'error', interpretation->'execution'->'error')
+                END AS interpretation,
+                applied_take_id::text AS "appliedTakeId", created_at AS "createdAt"
+           FROM studio_annotations WHERE project_id=$1 ORDER BY created_at DESC LIMIT 200`,
         [id],
       ),
     ])
@@ -243,6 +313,7 @@ export class StudioStore {
       assets: assets.rows,
       takes: takes.rows,
       events: events.rows,
+      annotations: annotations.rows,
     }
   }
 
@@ -336,7 +407,12 @@ export class StudioStore {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', `cannot resume a ${row.status} project`)
         const to = settings.resumeTo
         next =
-          to === 'planning' || to === 'running' || to === 'awaiting_user' || to === 'composing'
+          to === 'planning' ||
+          to === 'running' ||
+          to === 'awaiting_user' ||
+          to === 'composing' ||
+          // A compose that finished while paused (OCV5-591 A2-1c).
+          to === 'done'
             ? to
             : 'running'
         const { resumeTo: _drop, ...rest } = settings

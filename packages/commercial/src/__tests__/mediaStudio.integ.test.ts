@@ -11,10 +11,12 @@
  *      / disk-floor quota refuse without leaking a hold; an oversize stream aborts cleanly; dropRefs
  *      gives bytes back; gc removes unreferenced content and expired holds.
  *   4. the GC tick purges projects soft-deleted more than 7 days ago with their refs.
+ *   5. (0329) catalog audio and licence evidence are site-owned and kept while listed; licence rules
+ *      and the user-track rights statement are enforced by the schema.
  */
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { access, mkdtemp, readdir } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -28,6 +30,7 @@ import {
   StudioQuotaError,
 } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
+import { importCatalogEntries, parseCatalogManifest } from '../media-studio/music/catalogImport.js'
 import {
   claimStudioTasks,
   enqueueStudioTask,
@@ -589,5 +592,197 @@ describe('media studio blobs', () => {
     assert.equal(out.blobs, 1)
     assert.equal(await quota('site'), 0)
     await assert.rejects(access(blobs.blobPath(stored.sha)))
+  })
+})
+
+describe('media studio music catalog (0329, OCV5-591 M1)', () => {
+  async function catalogRow(over: Record<string, unknown> = {}) {
+    const root = await mkdtemp(path.join(tmpdir(), 'oc-studio-cat-'))
+    const blobs = blobStore(root)
+    const audio = await blobs.putSite(Buffer.from(`ID3 audio ${randomUUID()}`), 'audio/mpeg')
+    const evidence = await blobs.putSite(Buffer.from(`PNG snapshot ${randomUUID()}`), 'image/png')
+    const row = {
+      license: 'CC-BY-4.0',
+      attribution_required: true,
+      attribution_text: '"Snowfield" by Example, CC BY 4.0',
+      active: true,
+      retired_reason: null,
+      ...over,
+    }
+    const id = randomUUID()
+    await query(
+      `INSERT INTO studio_music_catalog(id, title, artist, source, source_track_id, landing_url, license,
+         license_url, attribution_required, attribution_text, duration_ms, bpm, moods, genres, blob_sha,
+         mime, evidence_sha, evidence, verified_at, verified_by, active, retired_reason)
+       VALUES ($1, 'Snowfield', 'Example', 'openverse', $2, 'https://example.org/t/1', $3,
+         'https://creativecommons.org/licenses/by/4.0/', $4, $5, 52000, 72, '{calm,warm}', '{piano}', $6,
+         'audio/mpeg', $7, '{"licenseTextSeen":"CC BY 4.0"}'::jsonb, NOW(), 'claude', $8, $9)`,
+      [
+        id,
+        id,
+        row.license,
+        row.attribution_required,
+        row.attribution_text,
+        audio,
+        evidence,
+        row.active,
+        row.retired_reason,
+      ],
+    )
+    return { id, blobs, audio, evidence }
+  }
+
+  test('catalog audio and evidence are site-owned: counted once, never collected while listed', async (t) => {
+    if (skip(t)) return
+    const { id, blobs, audio, evidence } = await catalogRow()
+    const site = await quota('site')
+    assert.ok(site > 0)
+    // The same content again is stored and counted once.
+    const content = await readFile(blobs.blobPath(audio))
+    assert.equal(await blobs.putSite(content, 'audio/mpeg'), audio)
+    assert.equal(await quota('site'), site)
+    await query("UPDATE studio_blobs SET created_at = NOW() - INTERVAL '2 hours'")
+    assert.equal(await blobs.gc(), 0, 'no user ref, but the catalog holds both blobs')
+    await query(
+      `UPDATE studio_music_catalog SET active = FALSE, retired_reason = 'source changed' WHERE id = $1`,
+      [id],
+    )
+    assert.equal(await blobs.gc(), 0, 'a retired row is still licence evidence')
+    await query('DELETE FROM studio_music_catalog WHERE id = $1', [id])
+    assert.equal(await blobs.gc(), 2)
+    await assert.rejects(access(blobs.blobPath(audio)))
+    await assert.rejects(access(blobs.blobPath(evidence)))
+    assert.equal(await quota('site'), 0)
+  })
+
+  test('licence rules are enforced by the schema', async (t) => {
+    if (skip(t)) return
+    await assert.rejects(
+      catalogRow({ attribution_text: '' }),
+      /check/i,
+      'CC BY needs its attribution text',
+    )
+    await assert.rejects(
+      catalogRow({ attribution_required: false }),
+      /check/i,
+      'CC BY always requires attribution',
+    )
+    await assert.rejects(
+      catalogRow({ license: 'CC0-1.0', attribution_required: true }),
+      /check/i,
+      'CC0 never requires attribution',
+    )
+    await assert.rejects(
+      catalogRow({ license: 'CC-BY-NC-4.0' }),
+      /check/i,
+      'non-commercial licences are refused',
+    )
+    await assert.rejects(catalogRow({ active: false }), /check/i, 'retiring needs a reason')
+    const ok = await catalogRow({
+      license: 'CC0-1.0',
+      attribution_required: false,
+      attribution_text: '',
+    })
+    assert.ok(ok.id)
+  })
+
+  test('re-importing an orphaned site blob restarts its grace period (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const blobs = blobStore(await mkdtemp(path.join(tmpdir(), 'oc-studio-orphan-')))
+    const content = Buffer.from('ID3 orphan from an earlier import')
+    const sha = await blobs.putSite(content, 'audio/mpeg')
+    await query(
+      "UPDATE studio_blobs SET created_at = NOW() - INTERVAL '2 hours' WHERE sha256 = $1",
+      [sha],
+    )
+    assert.equal(await blobs.putSite(content, 'audio/mpeg'), sha)
+    assert.equal(await blobs.gc(), 0, 'fresh again: the import has its full hour to list it')
+    await access(blobs.blobPath(sha))
+  })
+
+  test('importing verified tracks: once per track, refused when a file changed after verification', async (t) => {
+    if (skip(t)) return
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-studio-import-'))
+    const blobs = blobStore(await mkdtemp(path.join(tmpdir(), 'oc-studio-import-blobs-')))
+    const put = async (name: string, body: string) => {
+      await mkdir(path.join(dir, path.dirname(name)), { recursive: true })
+      await writeFile(path.join(dir, name), body)
+      return createHash('sha256').update(body).digest('hex')
+    }
+    const entry = async (id: string) => ({
+      source: 'incompetech',
+      sourceTrackId: id,
+      title: `Track ${id}`,
+      artist: 'Kevin MacLeod',
+      landingUrl: `https://incompetech.com/music/royalty-free/index.html?isrc=${id}`,
+      license: 'CC-BY-4.0',
+      licenseUrl: 'https://creativecommons.org/licenses/by/4.0/',
+      attributionText: `"Track ${id}" Kevin MacLeod (incompetech.com)`,
+      durationMs: 90000,
+      bpm: 82,
+      moods: ['宁静'],
+      mime: 'audio/mpeg',
+      audioPath: `tracks/${id}.mp3`,
+      audioSha: await put(`tracks/${id}.mp3`, `ID3 audio ${id}`),
+      evidencePath: `evidence/${id}.png`,
+      evidenceSha: await put(`evidence/${id}.png`, `PNG page ${id}`),
+      verifiedAt: '2026-10-23T06:56:16.472Z',
+      verifiedBy: 'claude',
+    })
+    const entries = parseCatalogManifest([await entry('A1'), await entry('B2')])
+    const first = await importCatalogEntries({ pool: getPool(), blobs, dir, entries })
+    assert.deepEqual(first, {
+      inserted: ['incompetech:A1', 'incompetech:B2'],
+      skipped: [],
+      failed: [],
+    })
+    const again = await importCatalogEntries({ pool: getPool(), blobs, dir, entries })
+    assert.deepEqual(again.skipped, ['incompetech:A1', 'incompetech:B2'])
+    const row = await query<{ required: boolean; text: string }>(
+      "SELECT attribution_required AS required, attribution_text AS text FROM studio_music_catalog WHERE source_track_id = 'A1'",
+    )
+    assert.deepEqual(row.rows[0], {
+      required: true,
+      text: '"Track A1" Kevin MacLeod (incompetech.com)',
+    })
+
+    const c3 = await entry('C3')
+    await writeFile(path.join(dir, c3.audioPath), 'swapped after verification')
+    const bad = await importCatalogEntries({
+      pool: getPool(),
+      blobs,
+      dir,
+      entries: parseCatalogManifest([c3]),
+    })
+    assert.equal(bad.failed[0]?.reason, 'audio file changed since it was verified')
+    // A symlink pointing outside the manifest dir is refused even when its hash matches (code r3 P1).
+    const outside = await mkdtemp(path.join(tmpdir(), 'oc-studio-outside-'))
+    await writeFile(path.join(outside, 'private.mp3'), 'ID3 audio D4')
+    const d4 = await entry('D4')
+    await rm(path.join(dir, d4.audioPath))
+    await symlink(path.join(outside, 'private.mp3'), path.join(dir, d4.audioPath))
+    const linked = await importCatalogEntries({
+      pool: getPool(),
+      blobs,
+      dir,
+      entries: parseCatalogManifest([d4]),
+    })
+    assert.equal(linked.failed[0]?.reason, 'file is outside the manifest dir')
+    const n = await query<{ n: string }>('SELECT COUNT(*)::text AS n FROM studio_music_catalog')
+    assert.equal(n.rows[0]!.n, '2')
+  })
+
+  test('a user track needs the rights statement', async (t) => {
+    if (skip(t)) return
+    const uid = await user()
+    const insert = (statement: unknown) =>
+      query(
+        `INSERT INTO studio_user_tracks(id, user_id, title, blob_sha, mime, rights_statement)
+         VALUES ($1, $2, 'demo', $3, 'audio/mpeg', $4::jsonb)`,
+        [randomUUID(), uid, 'a'.repeat(64), JSON.stringify(statement)],
+      )
+    await assert.rejects(insert({}), /check/i)
+    await assert.rejects(insert({ statement: 'yes' }), /check/i)
+    await insert({ statement: 'own_or_licensed', acceptedAt: '2026-10-23T00:00:00Z' })
   })
 })

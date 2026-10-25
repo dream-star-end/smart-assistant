@@ -1,3 +1,4 @@
+import { parseImageModelPolicy } from '../billing/imageModels.js'
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { Client } from 'pg'
@@ -744,6 +745,72 @@ describe('Image 2 relay orchestration', () => {
     }
   })
 
+  test('annotated edit with an explicit allowlisted model keeps that model through paid-cache recovery (OCV5-587 r1 P1)', async (t) => {
+    if (skip(t)) return
+    const userId = await user(100n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    const generated = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#aa33ee' } }).png().toBuffer()
+    const upstreamModels: string[] = []
+    let upstreamFails = false
+    const handler = makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        upstreamModels.push((JSON.parse(String(init.body)) as { model: string }).model)
+        if (upstreamFails) return new Response('upstream down', { status: 500 })
+        return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
+      }) as unknown as typeof fetch,
+      pgPool: getPool(),
+      preCheckRedis: tracker.redis,
+      image2Enabled: true,
+      imageModelPolicy: parseImageModelPolicy({ OC_IMAGE2_ALLOWED_MODELS: 'gpt-image-2,gpt-image-2.5-sunburst' } as NodeJS.ProcessEnv),
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    const jobId = 'e'.repeat(32)
+    const send = async () => fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/annotated-edits`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream',
+        'content-type': 'application/json',
+        'x-openclaude-image-job': jobId,
+      },
+      body: JSON.stringify({ ...(JSON.parse(await annotatedInput(jobId)) as object), model: 'gpt-image-2.5-sunburst' }),
+    })
+    const modelRow = async () => (await query<{ model: string }>(
+      'SELECT model FROM image_generation_usage_records WHERE user_id=$1 AND job_id=$2', [userId.toString(), jobId],
+    )).rows[0]!.model
+    try {
+      assert.equal((await send()).status, 200)
+      assert.equal(await modelRow(), 'gpt-image-2.5-sunburst')
+      await query(
+        `UPDATE image_generation_usage_records SET response_expires_at=NOW() - INTERVAL '1 minute'
+         WHERE user_id=$1 AND job_id=$2`,
+        [userId.toString(), jobId],
+      )
+      assert.equal((await send()).status, 200)
+      assert.deepEqual(upstreamModels, ['gpt-image-2.5-sunburst', 'gpt-image-2.5-sunburst'])
+      assert.equal(await modelRow(), 'gpt-image-2.5-sunburst', 'paid recovery keeps the model actually sent upstream')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50', 'charged once')
+      // Codex Sol r1 P1: a recovery that fails upstream must not leave the edit default on the paid row.
+      await query(
+        `UPDATE image_generation_usage_records SET response_expires_at=NOW() - INTERVAL '1 minute'
+         WHERE user_id=$1 AND job_id=$2`,
+        [userId.toString(), jobId],
+      )
+      upstreamFails = true
+      assert.notEqual((await send()).status, 200)
+      assert.equal(await modelRow(), 'gpt-image-2.5-sunburst', 'a failed recovery keeps the paid model')
+      assert.equal((await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])).rows[0]!.credits, '50', 'still charged once')
+    } finally {
+      await close(server)
+    }
+  })
+
   test('outpaint composites to the target aspect, charges 50 once, and replays cache', async (t) => {
     if (skip(t)) return
     const userId = await user(100n)
@@ -862,6 +929,59 @@ describe('Image 2 relay orchestration', () => {
     } finally {
       await close(server)
     }
+  })
+
+  test('native imagegen forwards an allowlisted gpt-image-2.5 model and records it; default policy rejects it unbilled (OCV5-587)', async (t) => {
+    if (skip(t)) return
+    const userId = await user(500n)
+    await addContainer(userId)
+    const tracker = redisTracker()
+    const generated = await sharp({ create: { width: 512, height: 512, channels: 3, background: '#cc6633' } }).png().toBuffer()
+    const upstreamModels: string[] = []
+    const mk = (policy?: ReturnType<typeof parseImageModelPolicy>) => makeCodexRelayHandler({
+      identityRepo: repo(userId),
+      db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
+      upstreamBaseUrl: 'https://example.test/v1',
+      resolveDispatcher: async () => ({ accountId: 53n, proxyId: 4n, dispatcher: {} as never }),
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        upstreamModels.push((JSON.parse(String(init.body)) as { model: string }).model)
+        return Response.json({ data: [{ b64_json: generated.toString('base64') }] })
+      }) as unknown as typeof fetch,
+      pgPool: getPool(), preCheckRedis: tracker.redis, image2Enabled: true,
+      ...(policy ? { imageModelPolicy: policy } : {}),
+    })
+    const post = async (handler: ReturnType<typeof makeCodexRelayHandler>, model: string) => {
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        return await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/images/generations`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream', 'content-type': 'application/json' },
+          body: JSON.stringify({ model, prompt: 'an orange fox', n: 1 }),
+        })
+      } finally {
+        await close(server)
+      }
+    }
+    const rejected = await post(mk(), 'gpt-image-2.5-flare')
+    assert.equal(rejected.status, 400, 'default policy keeps rejecting non gpt-image-2 models')
+    assert.equal(upstreamModels.length, 0, 'a rejected model never reaches upstream')
+    assert.equal((await query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM image_generation_usage_records WHERE user_id=$1', [userId.toString()],
+    )).rows[0]!.count, '0', 'nothing is reserved for a rejected model')
+
+    const allowed = parseImageModelPolicy({ OC_IMAGE2_ALLOWED_MODELS: 'gpt-image-2,gpt-image-2.5-flare' } as NodeJS.ProcessEnv)
+    const ok = await post(mk(allowed), 'gpt-image-2.5-flare')
+    assert.equal(ok.status, 200)
+    assert.deepEqual(upstreamModels, ['gpt-image-2.5-flare'], 'the allowlisted model is forwarded unchanged')
+    const row = (await query<{ model: string; cost_credits: string; status: string }>(
+      'SELECT model, cost_credits::text AS cost_credits, status FROM image_generation_usage_records WHERE user_id=$1', [userId.toString()],
+    )).rows
+    assert.deepEqual(row, [{ model: 'gpt-image-2.5-flare', cost_credits: '50', status: 'success' }], 'price stays 50/image whatever the model')
+    const memo = (await query<{ memo: string | null }>(
+      "SELECT memo FROM credit_ledger WHERE user_id=$1 AND reason='image_generation'", [userId.toString()],
+    )).rows.map((r) => r.memo)
+    assert.deepEqual(memo, ['gpt-image-2.5-flare native_image'])
   })
 
   test('native imagegen with insufficient balance never debits or calls upstream', async (t) => {
