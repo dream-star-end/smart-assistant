@@ -318,7 +318,7 @@ export class ModelSwitchCostService {
         currentCost,
         outputTokens: output[0],
         requiresConfirmation: needs,
-        canConfirm: balance >= BigInt(targetCost.highCredits),
+        canConfirm: balance >= BigInt(targetCost.expectedCredits),
       }
       if (!needs) return { quote }
     }
@@ -374,7 +374,7 @@ export class ModelSwitchCostService {
         '可用余额不足以覆盖首轮预估，请充值或取消切换',
       )
     const displayed = this.verify(quoteToken, 'quote')
-    if (!this.matches(displayed, grant) || displayed.balanceCredits !== grant.balanceCredits)
+    if (!this.matches(displayed, grant))
       throw new ModelSwitchCostError(
         'MODEL_SWITCH_QUOTE_CHANGED',
         '上下文或费用信息已变化，请重新确认',

@@ -2,6 +2,7 @@ import { formatMessageReplyPrompt } from '@openclaude/protocol/browser'
 import type { AuthorizeSwitch, SwitchAuthorization } from '../../hooks/useModelSwitchCost'
 import type { OfflineItem } from './socket'
 import type { ChatSession } from './model'
+import { ApiError, apiErrorMessage } from '../api'
 interface QueueCostDeps {
   queue: OfflineItem[]
   slots: Map<string, string>
@@ -18,7 +19,9 @@ export async function authorizeQueuedModelSwitch(
   deps: QueueCostDeps,
 ): Promise<boolean> {
   const p = item.payload
-  let permit: SwitchAuthorization | null
+  let permit: SwitchAuthorization | null = null
+  let refusalCode = 'MODEL_SWITCH_CONFIRMATION_REQUIRED'
+  let refusalMessage = '切换后的首轮费用需要重新确认，请点击重试'
   try {
     permit = await authorize(
       {
@@ -34,13 +37,26 @@ export async function authorizeQueuedModelSwitch(
       },
       { interactive: false, consent: p.modelSwitchConsent },
     )
-  } catch {
-    if (deps.queue.includes(item) && item.state === 'persisting') {
-      item.state = 'queued'
-      if (deps.slots.get(item.sessId) === item.msgId) deps.slots.delete(item.sessId)
-      deps.notice(item.sessId, '费用信息暂不可用，消息已保留，恢复连接后重试')
+  } catch (error) {
+    if (
+      error instanceof ApiError &&
+      error.status < 500 &&
+      error.code &&
+      error.code !== 'MODEL_SWITCH_UNAVAILABLE'
+    ) {
+      refusalCode = error.code
+      refusalMessage =
+        error.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE'
+          ? '可用余额不足以覆盖切换后的首轮预估，请充值后重试'
+          : apiErrorMessage(error, '发送未获授权，消息已保留，请重试')
+    } else {
+      if (deps.queue.includes(item) && item.state === 'persisting') {
+        item.state = 'queued'
+        if (deps.slots.get(item.sessId) === item.msgId) deps.slots.delete(item.sessId)
+        deps.notice(item.sessId, '费用信息暂不可用，消息已保留，恢复连接后重试')
+      }
+      return false
     }
-    return false
   }
   if (!deps.queue.includes(item) || item.state !== 'persisting') return false
   if (permit) {
@@ -59,10 +75,10 @@ export async function authorizeQueuedModelSwitch(
     const user = sess.messages.find((m) => m.id === item.msgId && m.role === 'user')
     if (user) {
       user.status = 'error'
-      user._errorCode = 'MODEL_SWITCH_CONFIRMATION_REQUIRED'
-      user._errorDetail = '切换后的首轮费用需要重新确认，请点击重试'
+      user._errorCode = refusalCode
+      user._errorDetail = refusalMessage
     }
-    deps.notice(sess.id, '切换后的首轮费用需要重新确认，请点击重试')
+    deps.notice(sess.id, refusalMessage)
     deps.persist?.(sess.id)
     deps.notify()
   }

@@ -160,6 +160,16 @@ export function createModelSwitchCostAuthorizer({
             : undefined)
         let q = checkedQuote(await api.modelSwitchCost(auth, input, { consent }), input.requestId)
         if (!current()) return null
+        if (
+          opts.interactive === false &&
+          !q.canConfirm &&
+          (q.targetCost !== null || q.requiresConfirmation)
+        )
+          throw new ApiError({
+            status: 409,
+            code: 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+            message: '可用余额不足以覆盖切换后的首轮预估，请充值或取消切换',
+          })
         if (q.targetCost && !q.canConfirm && !q.requiresConfirmation && !opts.notice) {
           if (opts.interactive !== false && opts.canPrompt?.() !== false)
             toast('可用余额不足以覆盖切换后的首轮预估，请充值或取消切换', 'error')
@@ -205,12 +215,14 @@ export function createModelSwitchCostAuthorizer({
         return authorization
       } catch (error) {
         const unavailable =
-          error instanceof TypeError || (error instanceof ApiError && error.status >= 500)
-        if (opts.interactive === false && unavailable) throw error
+          error instanceof TypeError ||
+          (error instanceof ApiError &&
+            (error.status >= 500 || error.code === 'MODEL_SWITCH_UNAVAILABLE'))
+        // Queued sends need the actual refusal code; null is reserved for consent/cancellation.
+        if (opts.interactive === false) throw error
         if (opts.allowOfflineQueue && unavailable && current())
           return { requestId: input.requestId, choice: true }
-        if (opts.interactive !== false && current())
-          toast(apiErrorMessage(error, '费用确认暂不可用，请重试'), 'error')
+        if (current()) toast(apiErrorMessage(error, '费用确认暂不可用，请重试'), 'error')
         return null
       }
     })()
