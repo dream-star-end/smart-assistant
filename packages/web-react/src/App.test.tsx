@@ -19,6 +19,8 @@ loadBeforeAll(preloadToolBody)
 loadBeforeAll(() =>
   Promise.all([
     prefetchMarkdownImpl(),
+    import('./components/AgentPicker'),
+    import('./components/GoalDialog'),
     import('./components/Landing'),
     import('./components/AuthGate'),
     import('./components/AccountSwitchNotice'),
@@ -289,7 +291,7 @@ async function loginViaUi(email = 'a@b.com') {
   // 启动静默续期期间是 splash(无 Landing):等 refresh 401 落定、Landing 出现再点。
   const landingLogin = await screen.findByRole('button', { name: '登录' })
   fireEvent.click(landingLogin) // Landing 登录 → AuthGate
-  fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: email } })
+  fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: email } })
   fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
   // 正常路径等公开配置（turnstile_bypass）就绪后提交；异常路径另有“点一次后自动恢复”用例。
   const submit = screen.getByRole('button', { name: '登录' })
@@ -308,6 +310,7 @@ function requestToken(init?: RequestInit): string {
 
 async function openAgentPicker() {
   fireEvent.click(await screen.findByRole('button', { name: /全能助手|切换智能体/ }))
+  await screen.findByRole('dialog', { name: '选择智能体' })
 }
 
 function teamChoice() {
@@ -433,7 +436,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: '登录' }))
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
 
     await waitFor(() => expect(configCalls).toBe(1))
@@ -733,7 +736,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     fireEvent.click(plusTrigger)
     const goalItem = await screen.findByText('设定目标')
     fireEvent.click(goalItem)
-    fireEvent.change(screen.getByPlaceholderText('这次会话要达成什么？'), {
+    fireEvent.change(await screen.findByPlaceholderText('这次会话要达成什么？'), {
       target: { value: '先设目标再执行' },
     })
     fireEvent.click(screen.getByRole('button', { name: '设置并开始' }))
@@ -796,7 +799,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       const put = fetchMock.mock.calls.find(
         ([url, init]) =>
           String(url).includes('/api/collaboration-config') &&
-          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT',
+          ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'PUT' &&
+          JSON.parse(String((init as RequestInit).body)).mode === 'team',
       )
       expect(put).toBeTruthy()
       expect(JSON.parse(String((put![1] as RequestInit).body))).toEqual(
@@ -1577,7 +1581,7 @@ const OTHER_DETAIL = {
 function routedFetchTwoSessions() {
   // 路由用例全部基于「F5 后恢复登录」：模拟登录过的浏览器（oc_auth_hint），否则不发 refresh。
   setAuthHint()
-  return vi.fn(async (url: string) => {
+  return vi.fn(async (url: string,init?:RequestInit) => {
     const u = String(url)
     if (u.includes('/api/auth/refresh')) return REFRESH_OK
     if (u.includes('/api/public/models')) return okJson(MODELS)
@@ -1822,7 +1826,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     expect(typeof pending?.starterPrompt).toBe('string')
     expect((pending?.starterPrompt ?? '').length).toBeGreaterThan(20)
 
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
     const submit = screen.getByRole('button', { name: '登录' })
     await waitFor(() => expect(submit).not.toBeDisabled())
@@ -1862,7 +1866,7 @@ describe('Aurora v5 — P7 最小路由', () => {
 
     // 已有账号:注册表单「返回登录」改走登录(与注册成功后进入工作区是同一个消费点)
     fireEvent.click(screen.getByRole('button', { name: '返回登录' }))
-    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(await screen.findByLabelText('邮箱'), { target: { value: 'a@b.com' } })
     fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
     const submit = screen.getByRole('button', { name: '登录' })
     await waitFor(() => expect(submit).not.toBeDisabled())
@@ -2058,12 +2062,11 @@ describe('Aurora v5 — 项目主页(P1 review)', () => {
     // 当前会话换到 Terra(B)；全局默认仍是首个模型 Sol(A)。
     const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
-    await screen.findAllByRole('menuitem')
     // Commercial keeps Terra in the collapsed "更多 GPT 模型" group (selfhost retired the family).
     const collapsedGroup = document.querySelector('[data-collapsed-group]')
     expect(collapsedGroup).toBeTruthy()
     if (collapsedGroup) fireEvent.click(collapsedGroup)
-    const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
+const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     await act(async () => {
       fireEvent.click(terra!)
     })
@@ -2111,4 +2114,73 @@ describe('Aurora v5 — 项目主页(P1 review)', () => {
     expect(screen.getByRole('tab', { name: /会话/ })).toHaveAttribute('aria-selected', 'true')
     expect(window.location.pathname).toBe('/p/p1/chats')
   }, 30000)
+})
+
+describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => {
+  function bootLoggedIn(featureCommunityBlog: boolean) {
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/public/config')) {
+        return okJson({
+          turnstile_site_key: '',
+          turnstile_bypass: true,
+          require_email_verified: false,
+          feature_remote_ssh: false,
+          feature_image2: false,
+          allow_registration: true,
+          feature_community_blog: featureCommunityBlog,
+        })
+      }
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    setAuthHint()
+    render(<App />)
+  }
+
+  test('已登录（静默续期）且开关打开：侧栏出现「经验分享」入口', async () => {
+    bootLoggedIn(true)
+    expect(await screen.findByTestId('blog-nav')).toBeInTheDocument()
+  })
+
+  test('未登录访客打开 tab=blog 深链：开关打开时进入经验分享', async () => {
+    window.history.replaceState({}, '', '/?panel=help&tab=blog')
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) {
+        return okJson({
+          turnstile_site_key: '',
+          turnstile_bypass: true,
+          require_email_verified: false,
+          feature_remote_ssh: false,
+          feature_image2: false,
+          allow_registration: true,
+          feature_community_blog: true,
+        })
+      }
+      if (u.includes('/api/tutorials')) return okJson({ tutorials: [], nextCursor: null, total: 0 })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '经验分享' })).toBeInTheDocument()
+    window.history.replaceState({}, '', '/')
+  })
+
+  test('已登录但开关关闭：没有「经验分享」入口', async () => {
+    bootLoggedIn(false)
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/public/config'))).toBe(true),
+    )
+    expect(screen.queryByTestId('blog-nav')).toBeNull()
+  })
 })

@@ -224,7 +224,8 @@ import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } fr
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
-import { useChatCardActions } from "./hooks/useChatCardActions";
+import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
+import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
 import { useAppNavigationActions } from "./hooks/useAppNavigationActions";
 import { useComposerSend } from "./hooks/useComposerSend";
@@ -353,6 +354,9 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
+  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在登录页加载，已登录与首页深链时另取一次。
+  const [signedInCommunityBlog, setSignedInCommunityBlog] = useState<boolean | null>(null);
+  const [blogRequest, setBlogRequest] = useState<BlogViewRequest | null>(null);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
@@ -1065,6 +1069,38 @@ export function App() {
     view,
   });
 
+  // 已登录（侧栏入口）或教程中心已打开（含匿名访客的 tab=blog 深链）时取一次；登录页与 demo 不多发请求。
+  const needCommunityBlogFlag = !demo && (authed || tutorialOpen);
+  useEffect(() => {
+    if (!needCommunityBlogFlag || signedInCommunityBlog !== null) return;
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((cfg) => {
+        if (!cancelled) setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [needCommunityBlogFlag, signedInCommunityBlog]);
+  const communityBlogEnabled =
+    !demo && (signedInCommunityBlog ?? publicCfg?.featureCommunityBlog === true);
+
+  const openBlog = useCallback(
+    (target: BlogOpenTarget) => {
+      openTutorial();
+      setTutorialTab("blog");
+      if (target.kind === "post") setTutorialCommunity(target.id);
+      setBlogRequest(target.kind === "post" ? null : { ...target, nonce: Date.now() });
+    },
+    [openTutorial],
+  );
+  useEffect(() => {
+    if (!tutorialOpen) setBlogRequest(null);
+  }, [tutorialOpen]);
+
+
   const {
     inbox,
     refreshMyAgents,
@@ -1420,10 +1456,12 @@ export function App() {
     chat,
     chipsBoardProjectId,
     chipsProjectName,
+    communityBlogEnabled,
     demo,
     loadExactUserMessage,
     messageFeedbackTriggerRef,
     newSession,
+    openBlog,
     openManage,
     openPane,
     openSettings,
@@ -1724,6 +1762,8 @@ export function App() {
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
               onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+              blogEnabled={communityBlogEnabled}
+              blogRequest={blogRequest}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
               stepIndex={tutorialStep}
@@ -1756,7 +1796,8 @@ export function App() {
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
-              auth={auth}
+              userId={user?.id ?? null}
+            auth={auth}
               onRequireLogin={() => {
                 setTutorialOpen(false);
                 setTutorialCommunity(null);
@@ -1900,6 +1941,14 @@ export function App() {
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
+    // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
+    onOpenBlog:
+      demo || !communityBlogEnabled
+        ? undefined
+        : () => {
+            openTutorial();
+            setTutorialTab("blog");
+          },
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
@@ -2061,6 +2110,7 @@ export function App() {
           onOpenManage={closeMobileThen(sidebarProps.onOpenManage)}
           onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
           onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
+          onOpenBlog={closeMobileThen(sidebarProps.onOpenBlog)}
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
@@ -2738,6 +2788,8 @@ export function App() {
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
             onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
+            blogEnabled={communityBlogEnabled}
+            blogRequest={blogRequest}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}
             stepIndex={tutorialStep}
@@ -2770,6 +2822,7 @@ export function App() {
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
+            userId={user?.id ?? null}
             auth={auth}
             onRequireLogin={() => {
               setAuthMode("login");

@@ -52,6 +52,7 @@ EXPECTED_SKILLS=(
   manage-taskboard
   ssh
   ths
+  blog-writer
 )
 
 # MIN_SECURITY_POLICY: applied to every release, independent of that release's
@@ -165,7 +166,7 @@ assert_structure() { # <baseline-dir>
     # Serving releases before 2026-09-05 sync (2887d6d4b) have no
     # multi-model-review in baseline; legacy mode allows only that extra gap.
     # New releases remain exact-manifest strict.
-    for skill in cursor-cli manage-taskboard ssh multi-model-review ths; do
+    for skill in cursor-cli manage-taskboard ssh multi-model-review ths blog-writer; do
       if [[ ! -e "$root/skills/$skill" ]]; then
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
@@ -188,7 +189,7 @@ assert_structure() { # <baseline-dir>
   for skill in "${EXPECTED_SKILLS[@]}"; do
     if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
       case "$skill" in
-        cursor-cli|manage-taskboard|ssh|multi-model-review|ths) continue ;;
+        cursor-cli|manage-taskboard|ssh|multi-model-review|ths|blog-writer) continue ;;
       esac
     fi
     assert_skill_inner "$root" "$skill"

@@ -252,6 +252,7 @@ import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
+import { startTutorialModerationScheduler } from "./tutorials/tutorialModeration.js";
 import {
   startProviderHealthScheduler,
   type ProviderHealthSchedulerHandle,
@@ -2087,6 +2088,7 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
   const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
   // OCV5-591 media studio. Off unless OC_STUDIO_ENABLED=1 (→ /api/studio/* 404, no GC tick).
