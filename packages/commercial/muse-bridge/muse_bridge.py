@@ -32,6 +32,7 @@ import errno
 import fcntl
 import getpass
 import hashlib
+import http.client
 import json
 import logging
 import logging.handlers
@@ -51,7 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.5.0"
+BRIDGE_VERSION = "0.5.1"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -66,7 +67,7 @@ DEFAULT_LIMITS = {
     "chunk_bytes": 4 * MIB,
     "source_max_bytes": 10 * MIB,
     "max_source_images": 4,
-    "source_chunk_bytes": 256 * 1024,
+    "source_chunk_bytes": 1 * MIB,
 }
 HARD_LIMITS = {
     "image_max_bytes": 50 * MIB,
@@ -92,6 +93,9 @@ HEARTBEAT_DEFAULT = 15
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
+# Per Range chunk against Hub/CDN short reads (prod 2026-10-26: 3 tries exhausted).
+SOURCE_CHUNK_ATTEMPTS = 8
+SOURCE_CHUNK_SLEEP_CAP = 8
 BACKOFF_MAX = 60
 # Jobs this bridge runs at once: the smaller of --max-concurrency and the master's hello
 # `max_concurrency` (a master that does not send it gets one, as before 0.4.0).
@@ -627,6 +631,31 @@ class CliRunner:
         return map_cli_outcome(code, out, err)
 
 
+
+def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes):
+    """Raise IOError on short read or Content-Range that does not match the request Range.
+
+    Retried by with_retries around get_source. A persistent mismatch still surfaces as
+    MUSE_SOURCE_FETCH_FAILED (retryable) after attempts are exhausted.
+    """
+    want = expect_bytes
+    if range_hdr:
+        m_req = re.match(r"bytes=(\d+)-(\d+)$", range_hdr.strip())
+        if not m_req:
+            raise IOError("invalid request Range %r" % range_hdr)
+        req_a, req_b = int(m_req.group(1)), int(m_req.group(2))
+        cr = (resp_headers.get("Content-Range") if resp_headers is not None else None) or ""
+        m_cr = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)$", cr.strip())
+        if not m_cr:
+            raise IOError("missing/invalid Content-Range: %r" % cr)
+        got_a, got_b = int(m_cr.group(1)), int(m_cr.group(2))
+        if got_a != req_a or got_b != req_b:
+            raise IOError("Content-Range mismatch: want bytes=%d-%d got %s" % (req_a, req_b, cr))
+        want = got_b - got_a + 1
+    if len(payload) != want:
+        raise IOError("short read: got %d want %d" % (len(payload), want))
+
+
 # --------------------------------------------------------------------------
 # HTTP client
 
@@ -638,7 +667,8 @@ class Client:
         self.session_id = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler())
 
-    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary=False):
+    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary=False,
+                 expect_bytes=None):
         url = self.server + API_PREFIX + path
         hdrs = {
             "Authorization": "Bearer " + self._token,
@@ -653,19 +683,31 @@ class Client:
         elif body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
+        if binary:
+            # Avoid CDN/gzip transforming Range bodies (Content-Length vs decoded length mismatch).
+            hdrs["Accept-Encoding"] = "identity"
         if headers:
             hdrs.update(headers)
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 status = resp.status
-                payload = resp.read()
+                resp_headers = resp.headers
+                try:
+                    payload = resp.read()
+                except http.client.IncompleteRead as e:
+                    raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         except urllib.error.HTTPError as e:
             status = e.code
             payload = e.read() if e.fp else b""
             resp_headers = e.headers
-        else:
-            resp_headers = resp.headers
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, http.client.IncompleteRead):
+                raise IOError("incomplete read (%d bytes)" % len(reason.partial or b"")) from e
+            raise
+        except http.client.IncompleteRead as e:
+            raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         # Only the master's own JSON errors mean "token rejected" / "superseded"; the same status
         # from a proxy or the CDN in front of it must not send the user off to rotate the token.
         if status in (401, 403, 409):
@@ -685,6 +727,8 @@ class Client:
         if status >= 400:
             raise IOError("HTTP %d %s" % (status, path.split("/")[1] if "/" in path else path))
         if binary:
+            if expect_bytes is not None:
+                _check_binary_body(payload, resp_headers, hdrs.get("Range"), expect_bytes)
             return payload
         if not payload:
             return None
@@ -711,11 +755,20 @@ class Client:
         return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
 
     def get_source(self, job, n, start, end):
-        """Bytes start..end (inclusive) of source image n of an acked job (0.5)."""
+        """Bytes start..end (inclusive) of source image n of an acked job (0.5).
+
+        Sends Accept-Encoding: identity and checks Content-Range + body length so a CDN
+        short read / IncompleteRead raises and is retried by fetch_sources.
+        """
+        want = end - start + 1
         return self._request(
             "GET", "/jobs/%s/sources/%d" % (job["id"], n),
-            headers={"X-Job-Nonce": job["nonce"], "Range": "bytes=%d-%d" % (start, end)},
-            timeout=60, binary=True,
+            headers={
+                "X-Job-Nonce": job["nonce"],
+                "Range": "bytes=%d-%d" % (start, end),
+                "Accept-Encoding": "identity",
+            },
+            timeout=60, binary=True, expect_bytes=want,
         )
 
     def put_chunk(self, job, idx, n, chunk):
@@ -731,7 +784,7 @@ class Client:
         return self._request("POST", "/jobs/%s/result" % job["id"], body, timeout=60)
 
 
-def with_retries(fn, attempts=3):
+def with_retries(fn, attempts=3, sleep_cap=None):
     for i in range(attempts):
         try:
             return fn()
@@ -740,7 +793,10 @@ def with_retries(fn, attempts=3):
         except Exception:
             if i == attempts - 1:
                 raise
-            time.sleep(2 ** i)
+            delay = 2 ** i
+            if sleep_cap is not None:
+                delay = min(delay, sleep_cap)
+            time.sleep(delay)
 
 
 # --------------------------------------------------------------------------
@@ -968,7 +1024,11 @@ class Bridge:
                 start = len(buf)
                 end = min(ref["bytes"], start + step) - 1
                 try:
-                    data = with_retries(lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e))
+                    data = with_retries(
+                        lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e),
+                        attempts=SOURCE_CHUNK_ATTEMPTS,
+                        sleep_cap=SOURCE_CHUNK_SLEEP_CAP,
+                    )
                 except (FatalAuth, JobGone):
                     raise
                 except Exception as e:
