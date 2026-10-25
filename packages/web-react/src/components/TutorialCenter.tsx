@@ -226,6 +226,7 @@ export function TutorialCenter({
   actionState,
   onRunAction,
   auth = null,
+  userId = null,
   onRequireLogin,
   activeSessionId = null,
   sessionMessages = [],
@@ -264,6 +265,7 @@ export function TutorialCenter({
   actionState: (feature: ProductCapability) => TutorialActionState;
   onRunAction: (feature: ProductCapability) => void;
   auth?: AuthSession | null;
+  userId?: string | null;
   onRequireLogin?: () => void;
   activeSessionId?: string | null;
   sessionMessages?: ChatMessage[];
@@ -628,6 +630,7 @@ export function TutorialCenter({
                 {mode === "blog" ? (
                   <CommunityBlog
                     auth={auth}
+                    userId={userId}
                     onRequireLogin={onRequireLogin}
                     detailId={communityId}
                     onDetailIdChange={onCommunityChange}

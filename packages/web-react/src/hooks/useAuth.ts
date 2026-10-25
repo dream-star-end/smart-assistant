@@ -11,6 +11,7 @@ import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { teardownComposerDrafts } from "../lib/composerDraft";
 import { useLaneGate } from "./useLaneGate";
+import { clearAllBlogLocalDrafts } from '../components/tutorials/blog/blogLib';
 
 const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 
@@ -185,6 +186,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 只改 React/chat 状态，不再 bump epoch；调用方必须先 beginIdentity，或来自 expire 的
   // 原子 bump。拆开可避免 invalid 路径重复递增。
   const clearAuthState = useCallback(() => {
+    clearAllBlogLocalDrafts();
     teardownComposerDrafts(lastVerifiedUid.current ?? userRef.current?.id);
     lastVerifiedUid.current = null;
     pendingAccountRef.current = null;

@@ -66,6 +66,7 @@ export type BlogEditTarget = { id: string; published: boolean };
 
 export function BlogEditor({
   auth,
+  userId,
   seed,
   editing,
   aiReview,
@@ -73,6 +74,8 @@ export function BlogEditor({
   onSubmitted,
 }: {
   auth: AuthSession;
+  /** 当前登录用户 id；本地草稿按账号隔离。 */
+  userId: string;
   /** 「复制为新稿」或「修改」带进来的内容;没有就恢复本地草稿。 */
   seed?: BlogDraft;
   /** 有值 = 修改模式:提交走 revise,草稿存在这篇自己的 key 下。 */
@@ -82,9 +85,9 @@ export function BlogEditor({
   onSubmitted: () => void;
 }) {
   const toast = useToast();
-  // 草稿只存本机;同一浏览器换账号时草稿跟浏览器走(内容不含任何凭据)。修改模式的草稿按稿件分开存,
+  // 草稿只存本机，并按 userId 隔离；修改模式的草稿按稿件分开存，
   // 不覆盖「写一篇经验」的新稿草稿;上次没提交的修改优先恢复。
-  const draftKey = editing ? blogEditDraftKey(editing.id) : blogDraftKey();
+  const draftKey = editing ? blogEditDraftKey(editing.id) : blogDraftKey(userId);
   const [draft, setDraft] = useState<BlogDraft>(() =>
     editing ? (loadBlogDraft(draftKey) ?? seed ?? EMPTY_BLOG_DRAFT) : (seed ?? loadBlogDraft(draftKey) ?? EMPTY_BLOG_DRAFT),
   );

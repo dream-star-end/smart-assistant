@@ -22,7 +22,7 @@ auth.commitToken(auth.beginIdentity(), 'token')
 const TRACKER = 'https://tracker.test/pixel.png'
 
 beforeEach(() => {
-  window.localStorage.removeItem('oc:blog-draft')
+  window.localStorage.removeItem('oc:blog-draft:u1')
   let n = 0
   URL.createObjectURL = vi.fn(() => `blob:local-${++n}`)
   URL.revokeObjectURL = vi.fn()
@@ -69,7 +69,7 @@ describe('编辑器一次插入多张图（Codex R1 P1）', () => {
       await new Promise((resolve) => setTimeout(resolve, call === 1 ? 20 : 0))
       return { sha256: String(call).repeat(64).slice(0, 64), mime: 'image/webp', bytes: 10, width: 4, height: 4 }
     })
-    render(<BlogEditor auth={auth} aiReview={false} onBack={() => {}} onSubmitted={() => {}} />)
+    render(<BlogEditor auth={auth} userId="u1" aiReview={false} onBack={() => {}} onSubmitted={() => {}} />)
     const input = document.querySelector<HTMLInputElement>('input[type="file"]')!
     const files = [
       new File([new Uint8Array(8)], 'a.png', { type: 'image/png' }),
@@ -92,7 +92,7 @@ describe('编辑器一次插入多张图（Codex R1 P1）', () => {
         resolveUpload = resolve
       }),
     )
-    const { unmount } = render(<BlogEditor auth={auth} aiReview={false} onBack={() => {}} onSubmitted={() => {}} />)
+    const { unmount } = render(<BlogEditor auth={auth} userId="u1" aiReview={false} onBack={() => {}} onSubmitted={() => {}} />)
     const input = document.querySelector<HTMLInputElement>('input[type="file"]')!
     await act(async () => {
       fireEvent.change(input, { target: { files: [new File([new Uint8Array(8)], 'a.png', { type: 'image/png' })] } })

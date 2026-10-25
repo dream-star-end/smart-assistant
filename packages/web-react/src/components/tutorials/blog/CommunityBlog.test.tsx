@@ -81,7 +81,7 @@ describe('经验分享', () => {
   })
 
   it('分类胶囊切换会带 category 重新查询', async () => {
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     expect(await screen.findByText('1')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '编码' }))
@@ -118,7 +118,7 @@ describe('经验分享', () => {
       ],
       nextCursor: null,
     })
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
     expect(await screen.findByText('AI 审核中')).toBeInTheDocument()
@@ -144,7 +144,7 @@ describe('经验分享', () => {
     })
     const revise = vi.spyOn(api, 'reviseCommunityTutorial').mockResolvedValue({ id: '2', mode: 'inplace', revisionId: '7', contentVersion: 2 })
     const submit = vi.spyOn(api, 'submitCommunityTutorial')
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
     fireEvent.click(await screen.findByRole('button', { name: '修改' }))
@@ -180,7 +180,7 @@ describe('经验分享', () => {
       nextCursor: null,
     })
     const revise = vi.spyOn(api, 'reviseCommunityTutorial').mockResolvedValue({ id: '6', mode: 'pending', revisionId: '10', contentVersion: 1 })
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
     expect(await screen.findByText('修改审核中')).toBeInTheDocument()
@@ -200,7 +200,7 @@ describe('经验分享', () => {
       nextCursor: null,
     })
     const withdraw = vi.spyOn(api, 'withdrawCommunityTutorial').mockResolvedValue({ ok: true })
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
     fireEvent.click(await screen.findByRole('button', { name: '撤回' }))
@@ -211,13 +211,13 @@ describe('经验分享', () => {
   })
 
   it('编辑器：没填够不提交，填好后提交并进入我的投稿', async () => {
-    window.localStorage.removeItem('oc:blog-draft')
+    window.localStorage.removeItem('oc:blog-draft:u1')
     const submit = vi.spyOn(api, 'submitCommunityTutorial').mockResolvedValue({
       id: '30',
       status: 'pending',
       createdAt: '2026-10-22T10:00:00.000Z',
     })
-    render(<CommunityBlog auth={auth} />)
+    render(<CommunityBlog auth={auth} userId="u1" />)
     await screen.findByText('经验 1')
     fireEvent.click(screen.getByRole('button', { name: /写一篇经验/ }))
     fireEvent.click(await screen.findByRole('button', { name: /提交发布/ }))

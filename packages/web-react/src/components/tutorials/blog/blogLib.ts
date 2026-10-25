@@ -213,8 +213,25 @@ export type BlogDraft = {
 
 export const EMPTY_BLOG_DRAFT: BlogDraft = { title: "", summary: "", category: "general", bodyMarkdown: "" };
 
-export function blogDraftKey(): string {
-  return "oc:blog-draft";
+/** 新稿本地草稿键：按账号隔离，避免同浏览器换号读到上一账号未投正文。 */
+export function blogDraftKey(userId: string): string {
+  return `oc:blog-draft:${userId}`;
+}
+
+/** 登出/换号时清掉本机经验分享草稿（含历史未隔离的共用键）。 */
+export function clearAllBlogLocalDrafts(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem("oc:blog-draft");
+    const keys: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (key && (key.startsWith("oc:blog-draft:") || key.startsWith("oc:blog-edit:"))) keys.push(key);
+    }
+    for (const key of keys) window.localStorage.removeItem(key);
+  } catch {
+    /* private mode */
+  }
 }
 
 export function loadBlogDraft(key: string): (BlogDraft & { savedAt: number }) | null {

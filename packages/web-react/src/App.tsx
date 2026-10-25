@@ -1796,7 +1796,8 @@ export function App() {
               }}
               caseActionLabel="登录后试用"
               onRunCase={runTutorialCase}
-              auth={auth}
+              userId={user?.id ?? null}
+            auth={auth}
               onRequireLogin={() => {
                 setTutorialOpen(false);
                 setTutorialCommunity(null);
@@ -2821,6 +2822,7 @@ export function App() {
             }}
             caseActionLabel="带着指令去对话"
             onRunCase={runTutorialCase}
+            userId={user?.id ?? null}
             auth={auth}
             onRequireLogin={() => {
               setAuthMode("login");

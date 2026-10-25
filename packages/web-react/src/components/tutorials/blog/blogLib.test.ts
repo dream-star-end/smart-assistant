@@ -5,6 +5,7 @@ import {
   applyToolbar,
   blogCanEdit,
   blogDraftKey,
+  clearAllBlogLocalDrafts,
   blogEditChangeMessage,
   blogEditDraftKey,
   blogEditSeed,
@@ -167,6 +168,18 @@ describe('blogLib · 修改已投稿', () => {
       bodyMarkdown: '修改后的正文',
     })
     expect(blogEditDraftKey('4')).toBe('oc:blog-edit:4')
-    expect(blogEditDraftKey('4')).not.toBe(blogDraftKey())
+    expect(blogEditDraftKey('4')).not.toBe(blogDraftKey('u1'))
   })
 })
+
+describe("clearAllBlogLocalDrafts", () => {
+  it("clears legacy and scoped draft keys", () => {
+    window.localStorage.setItem("oc:blog-draft", "legacy");
+    window.localStorage.setItem("oc:blog-draft:u1", "a");
+    window.localStorage.setItem("oc:blog-edit:9", "b");
+    clearAllBlogLocalDrafts();
+    expect(window.localStorage.getItem("oc:blog-draft")).toBeNull();
+    expect(window.localStorage.getItem("oc:blog-draft:u1")).toBeNull();
+    expect(window.localStorage.getItem("oc:blog-edit:9")).toBeNull();
+  });
+});
