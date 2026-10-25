@@ -10,6 +10,7 @@
 import { needsSignedSrc } from "../../lib/chat/media";
 import { MARKET_ALIASES, MARKET_VALIDATORS, type MarketSpec } from "./marketSchema";
 import { BILI_ALIASES, BILI_VALIDATORS, type BiliSpec } from "./biliSchema";
+import { BLOG_ALIASES, BLOG_VALIDATORS, type BlogSpec } from "./blogSchema";
 import { PLUGIN_ALIASES, PLUGIN_VALIDATORS, type PluginSpec } from "./pluginSchema";
 
 export type { IntradaySpec, KlineSpec, MarketSpec, QuoteSpec, StockListSpec } from "./marketSchema";
@@ -245,7 +246,8 @@ export type IuiSpec =
   | RouteSpec
   | MarketSpec
   | PluginSpec
-  | BiliSpec;
+  | BiliSpec
+  | BlogSpec;
 
 export type IuiType = IuiSpec["type"];
 
@@ -292,6 +294,10 @@ export const IUI_TYPES: readonly IuiType[] = [
   "bili_comments",
   "bili_danmaku",
   "bili_subtitle",
+  // OCV5-577 跟进：经验分享（对话写博客）组件（blogSchema.ts），只随 blog-writer 技能进上下文。
+  "blog_draft",
+  "blog_status",
+  "blog_published",
 ];
 
 export type ValidateResult =
@@ -1202,6 +1208,7 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   ...MARKET_VALIDATORS,
   ...PLUGIN_VALIDATORS,
   ...BILI_VALIDATORS,
+  ...BLOG_VALIDATORS,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -1248,6 +1255,7 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   ...MARKET_ALIASES,
   ...PLUGIN_ALIASES,
   ...BILI_ALIASES,
+  ...BLOG_ALIASES,
 };
 
 export function resolveType(raw: unknown): IuiType | null {

@@ -22,6 +22,7 @@ import {
   SquareKanban,
   Store,
   X,
+  PenLine,
 } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
@@ -164,6 +165,8 @@ export type SidebarProps = {
   onOpenManage?: () => void;
   onOpenMarketplace?: () => void;
   onOpenTutorial?: () => void;
+  /** 经验分享（OCV5-577）：一级入口，打开教程中心的「经验分享」页签。 */
+  onOpenBlog?: () => void;
   onOpenOrg?: () => void;
   onOpenBoard?: () => void;
   onOpenMediaTasks?: () => void;
@@ -216,7 +219,7 @@ export type SidebarProps = {
 };
 
 export function Sidebar({
-  sessions,
+  sessions: incomingSessions,
   activeId,
   user,
   credits,
@@ -249,6 +252,7 @@ export function Sidebar({
   onOpenManage,
   onOpenMarketplace,
   onOpenTutorial,
+  onOpenBlog,
   onOpenOrg,
   onOpenBoard,
   onOpenMediaTasks,
@@ -294,6 +298,10 @@ export function Sidebar({
   const [searchRemote, setSearchRemote] = useState<"idle" | "loading" | "empty" | "error">("idle");
   const coarse = useCoarsePointer();
   const userId = user?.id;
+  const sessions = useMemo(
+    () => userId ? incomingSessions.filter(session => session.ownerUserId === userId) : [],
+    [incomingSessions, userId],
+  );
   useEffect(() => {
     setArchivedExpanded(readArchivedExpanded(userId));
   }, [userId]);
@@ -1130,6 +1138,18 @@ export function Sidebar({
               className={boardActive ? "text-fg" : "text-faint"}
             />
             任务
+          </button>
+        )}
+        {onOpenBlog && (
+          <button
+            type="button"
+            data-product-control
+            data-testid="blog-nav"
+            onClick={onOpenBlog}
+            className="mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-[background-color,color,box-shadow] duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          >
+            <PenLine size={15} aria-hidden className="text-faint" />
+            经验分享
           </button>
         )}
       </div>

@@ -64,6 +64,9 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   // pruneProjectedLiveFrames is the dedicated DELETE path (not age-based TTL).
   client_session_live_frames: "pruneProjectedLiveFrames (db/liveTurnFrames.ts)",
   client_session_live_unit_checkpoints: "deleteLiveUnitCheckpoints via pruneProjectedLiveFrames (db/liveUnitCheckpoints.ts)",
+  // OCV5-591: a write deletes its own hold on settle; holds left by a crashed writer expire and are
+  // removed by the studio GC tick.
+  studio_quota_holds: "StudioBlobStore.gc (media-studio/blobs.ts)",
 };
 
 /**
@@ -147,6 +150,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "media_generation_job_inputs",
   "media_generation_jobs",
   "minimax_media_usage_records",
+  // OCV5-589: user-owned MiniMax voice ownership + clone consent; kept until the owner is deleted (FK cascade).
+  "minimax_voices",
   "model_aliases",
   "model_authority_deploy_state",
   "model_catalog",
@@ -184,6 +189,21 @@ export const DURABLE_TABLES: readonly string[] = [
   "sessions_store_migration_state",
   "skill_embedding_cache",
   "skill_search_log",
+  // OCV5-591 media studio: user-owned projects and their content; removed with the user (FK cascade),
+  // by project hard-delete, or by the studio GC (unadopted takes after 30 days). studio_charges is the
+  // studio's own charge index; credit_ledger stays the billing authority.
+  "studio_annotations",
+  "studio_assets",
+  "studio_blob_refs",
+  "studio_blobs",
+  "studio_charges",
+  "studio_lines",
+  "studio_projects",
+  "studio_quota",
+  "studio_shots",
+  "studio_step_results",
+  "studio_takes",
+  "studio_tasks",
   "subscription_plans",
   "system_settings",
   "topup_plans",
@@ -230,6 +250,13 @@ export const DURABLE_TABLES: readonly string[] = [
   "chat_projects",
   "client_session_live_streams",
   "community_tutorials",
+  // 0327 经验分享 AI 审核:作业(每篇一行)与判定记录,FK community_tutorials ON DELETE CASCADE,
+  // 随稿件离场;稿件本身无基于时间的清理。
+  "community_tutorial_moderation_jobs",
+  "community_tutorial_moderations",
+  // 0328 经验分享修改记录与修改稿图片：FK community_tutorials / 修改稿 ON DELETE CASCADE，随稿件离场。
+  "community_tutorial_revisions",
+  "community_tutorial_revision_images",
   "cursor_external_usage_audit",
   "inbox_message_audience_snapshots",
   "ocr_jobs",
@@ -247,6 +274,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "turn_tape_materialization_jobs",
   "turn_tape_settlement_jobs",
   "tutorial_blob_refs",
+  // 0326 经验分享图片上传者(FK tutorial_blobs/users ON DELETE CASCADE),随 blob 离场。
+  "tutorial_blob_uploads",
   "tutorial_blobs",
   "tutorial_case_specs",
   "tutorial_compass_notes",

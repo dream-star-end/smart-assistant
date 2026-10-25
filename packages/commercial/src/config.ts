@@ -660,6 +660,44 @@ export const commercialConfigSchema = z
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
     */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
+     * OCV5-589 / D12 (2026-10-23): root-only (0600) file holding the media-only MiniMax key. Set → the
+     * media proxy and the media studio read only this file (never falling back to MINIMAX_TOKEN_PLAN_KEY,
+     * which stays with web search). Unset → MINIMAX_TOKEN_PLAN_KEY as before.
+     */
+    MINIMAX_MEDIA_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-589: global soft cap on successful MiniMax media calls per rolling 5 hours. Unset → no cap. */
+    OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS: positiveInt(1_000_000),
+    /** OCV5-588 media studio: root for compose work dirs and studio blobs. */
+    OC_STUDIO_ROOT: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-588: exact image ID of openclaude/studio-ffmpeg (build-image.sh). Unset → compose unavailable. */
+    OC_STUDIO_FFMPEG_IMAGE_ID: z.string().trim().regex(/^sha256:[0-9a-f]{64}$/, "must be sha256:<64 hex>").optional(),
+    /** OCV5-588: site-wide concurrent compose containers. Unset → 2. */
+    OC_STUDIO_COMPOSE_CONCURRENCY: positiveInt(8),
+    /** OCV5-591 media studio. Off unless "1": /api/studio/* answers 404 and no worker runs. */
+    OC_STUDIO_ENABLED: z
+      .enum(["0", "1"])
+      .optional()
+      .transform((value) => value === "1"),
+    /** Decimal uids allowed into the studio besides admins (D13: only 247 at first). Unset or empty →
+     * admins only. uid 4 is always ignored in a list. The single token `all` opens it to every account. */
+    OC_STUDIO_ALLOWED_UIDS: z
+      .string()
+      .max(8192)
+      .optional()
+      .transform((value) =>
+        Object.freeze(
+          (value ?? "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean),
+        ),
+      )
+      .refine(
+        (values) =>
+          (values.length === 1 && values[0] === "all") || values.every((value) => /^\d+$/.test(value)),
+        "user ids must be decimal, or the single token all",
+      ),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],

@@ -151,7 +151,8 @@ type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
   readIdleOp: (dir: string, key: string, revision: string) => IdleOp | undefined;
   writeIdleOp: (dir: string, op: IdleOp) => void; writeIdleCandidate: (dir: string, candidate: unknown) => void;
   startIdleOp: (input: unknown) => { op: IdleOp }; writeIdleNative: (dir: string, native: unknown) => void;
-  idleHistoryStillBlocked: (input: { candidate: unknown; pending: unknown; recovered: unknown }) => boolean };
+  idleHistoryStillBlocked: (input: { candidate: unknown; pending: unknown; recovered: unknown }) => boolean;
+  setRuntimeIncarnationStartForTest: (ms: number | undefined) => void };
 type ReplayLookup = { kind: string; response?: Response;
   identity?: { state?: string; rootLaunchPermit?: boolean; invocationMode?: string } };
 type Db = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
@@ -2212,7 +2213,10 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     if (stuck !== "IDLE_HISTORY_PENDING" || api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
       || !api.idle.readPendingIdle(dir, "idle-stuck")) fail("IDLE_SETTLED_WITHOUT_EVIDENCE");
     // an op stranded by older code in a container that no longer exists: written before this
-    // runtime started, so that start is its shutdown evidence and the next submit settles it
+    // runtime started, so that start is its shutdown evidence and the next submit settles it.
+    // The start is pinned past the grace: the real one is PID 1's, and on a CI runner booted less than
+    // IDLE_STOPPED_GRACE_MS ago the grace was unmet, red by runner uptime (OCV5-583; OCV5-458 for the unit test).
+    api.idle.setRuntimeIncarnationStartForTest(Date.now() - api.idle.IDLE_STOPPED_GRACE_MS - 1_000);
     const stranded = "idle-stranded";
     const idleTurn = createHash("sha256").update(`${stranded}:${revision}`).digest("hex");
     api.idle.startIdleOp({ dir, sessionKey: stranded, sourceSessionId: who.sessionId, sourceTurnKey: sourceTurn,
@@ -2242,6 +2246,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       || api.idle.readPendingIdle(dir, lost) !== undefined || counters.submits !== submits) fail("IDLE_LOST_SOURCE_OP");
     return "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released";
   } finally {
+    api.idle.setRuntimeIncarnationStartForTest(undefined);
     await routes.close();
     rmSync(root, { recursive: true, force: true });
   }
@@ -2301,7 +2306,7 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
       "0229_turn_finalize_integrity.sql", "0230_chat_projects.sql", "0231_turn_tape_materialization_resilience.sql",
       "0233_client_session_list_archived_at.sql", "0239_turn_dispatch_shutdown_ctx.sql",
       "0240_client_session_last_read_at.sql", "0241_raise_last_read_watermark.sql", "0243_live_unit_checkpoints.sql",
-      "0246_chat_project_board_bind.sql");
+      "0246_chat_project_board_bind.sql", "0323_turn_dispatches_trace_id.sql");
     // columns and tables the backend's SQL reads that belong to migration chains outside this slice
     await pool.query(`CREATE TABLE agent_containers (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
         state TEXT NOT NULL, runtime_kind TEXT NOT NULL DEFAULT 'docker');
@@ -2682,7 +2687,7 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
   const outcome = await Promise.race([refused.bridge.then((exit) => `exit-${exit}`, () => "failed"),
     tick(30_000).then(() => "still-waiting")]);
   if (outcome !== "failed" || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
-    fail(`LARGE_LINE_WRITE_FAILURE_${outcome}`);
+    fail(`LARGE_LINE_WRITE_FAILURE_${outcome} ${refused.err().trim().split("\n").slice(-4).join(" | ").slice(-500)}`);
   }
   refused.stdin.end();
   if (!await gone(failing.readers)) fail("LARGE_LINE_REFUSED_HOST_LEFT_RUNNING");

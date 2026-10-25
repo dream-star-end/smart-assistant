@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
 import type { Pool } from 'pg'
 import sharp from 'sharp'
-import { truncateAllForTest, useDedicatedTestDatabase } from '../../__tests__/helpers/db.js'
+import { resetAndMigrateBefore, truncateAllForTest, useDedicatedTestDatabase } from '../../__tests__/helpers/db.js'
 import { getPool } from '../../db/index.js'
 import { runMigrations } from '../../db/migrate.js'
 import { query } from '../../db/queries.js'
@@ -282,40 +282,41 @@ test('an acknowledged-lost COMMIT retains quota and causes zero provider dispatc
 
 test('migration rollback refuses retained usage and an empty-table rollback can be reapplied', async (t) => {
   if (db.skipIfUnavailable(t)) return
-  await meter().beginPlatformUsage(begin())
-  const sql = await readFile(
-    new URL('../../db/rollbacks/0316_commercial_literature_captcha_requests.sql', import.meta.url),
-    'utf8',
-  )
-  const client = await getPool().connect()
+  // Exercise 0316 at its historical schema boundary. Additive migrations such as
+  // 0323 intentionally have no destructive rollback; keep their current-state
+  // guards intact instead of assuming every later migration has a rollback file.
   try {
-    // Later migrations must go first (each commits its own rollback); runMigrations below reapplies them.
-    const rollbacks = new URL('../../db/rollbacks/', import.meta.url)
-    for (const later of (await readdir(rollbacks))
-      .filter((f) => f > '0316_commercial_literature_captcha_requests.sql')
-      .sort()
-      .reverse()) {
-      await client.query(await readFile(new URL(later, rollbacks), 'utf8'))
+    await resetAndMigrateBefore('0317')
+    userId = await createUser()
+    await meter().beginPlatformUsage(begin())
+    const sql = await readFile(
+      new URL('../../db/rollbacks/0316_commercial_literature_captcha_requests.sql', import.meta.url),
+      'utf8',
+    )
+    const client = await getPool().connect()
+    try {
+      await assert.rejects(client.query(sql), /retained platform usage/)
+      await client.query('ROLLBACK')
+      assert.equal(
+        (await client.query("SELECT to_regclass('literature_captcha_requests')::text AS name"))
+          .rows[0].name,
+        'literature_captcha_requests',
+      )
+      await truncateAllForTest(['literature_captcha_requests'], client)
+      await client.query(sql)
+      assert.equal(
+        (await client.query("SELECT to_regclass('literature_captcha_requests') AS name")).rows[0]
+          .name,
+        null,
+      )
+    } finally {
+      await client.query('ROLLBACK')
+      client.release()
     }
-    await assert.rejects(client.query(sql), /retained platform usage/)
-    await client.query('ROLLBACK')
-    assert.equal(
-      (await client.query("SELECT to_regclass('literature_captcha_requests')::text AS name"))
-        .rows[0].name,
-      'literature_captcha_requests',
-    )
-    await truncateAllForTest(['literature_captcha_requests'], client)
-    await client.query(sql)
-    assert.equal(
-      (await client.query("SELECT to_regclass('literature_captcha_requests') AS name")).rows[0]
-        .name,
-      null,
-    )
   } finally {
-    await client.query('ROLLBACK')
-    client.release()
+    // Restore the current schema even if an assertion fails, before the next case.
+    await runMigrations()
   }
-  await runMigrations()
   await meter().beginPlatformUsage(begin())
 })
 

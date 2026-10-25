@@ -94,6 +94,8 @@ describe('community tutorials', () => {
       kind: 'markdown',
       authorName: '小明',
       publishedAt: reviewed.publishedAt,
+      coverSha: null,
+      readMinutes: 1,
     })
     const detail = await getPublishedCommunityTutorial(submitted.id)
     assert.equal(detail?.kind, 'markdown')
@@ -194,7 +196,10 @@ describe('community tutorials', () => {
     const admin = await createUser('admin@example.com', '管理员', 'admin')
     const ids: string[] = []
     for (let i = 1; i <= 5; i += 1) {
-      const submitted = await submitCommunityTutorial(author, draft(i))
+      // 分页覆盖要 5 篇同时在审，超过经验分享的默认频控（3 篇在审），这里放宽。
+      const submitted = await submitCommunityTutorial(author, draft(i), {
+        limits: { daily: 10, maxPending: 10 },
+      })
       ids.push(submitted.id)
     }
 

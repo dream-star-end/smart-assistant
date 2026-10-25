@@ -146,10 +146,16 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
+  entries.push(entry({ entryId: 60, modelId: "k3.1-pro", providerId: "moonshot",
+    upstreamModelId: "k3.1-pro", contextWindow: 1_048_576,
+    capabilityProfile: { supportsVision: true,
+      reasoning: { supported: ["low", "high", "max"], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: true } } }));
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
+    ["k3.1-pro", { ...price("k3.1-pro"), defaultEffort: "max" }],
   ]);
   // CCB 子 agent 默认钉是平台 aux 集第二成员;platformAuxModels 对所有声明成员 fail-closed。它与
   // 次级模型不同时夹具常驻它,auxState 只演练首位成员(deepseek)的缺失/禁用。2026-10-20 起二者同为
@@ -303,7 +309,7 @@ async function startRig(opts: {
           }
           if (/SELECT status FROM users WHERE id/.test(sql)) return { rows: [] };
           if (/FROM github_session_workspaces/.test(sql)) return { rows: [] };
-          if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) {
+          if (/(INSERT INTO|UPDATE) turn_traces/.test(sql) || /UPDATE turn_dispatches SET trace_id/.test(sql)) {
             traceWrites.push({ sql, params });
             return { rows: [], rowCount: 1 };
           }
@@ -747,6 +753,8 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     };
     assert.equal(await grab("user", "kimi-k3"), 512_000);
     assert.equal(await grab("admin", "kimi-k3"), 1_048_576);
+    assert.equal(await grab("user", "k3.1-pro"), 512_000);
+    assert.equal(await grab("admin", "k3.1-pro"), 1_048_576);
     // 未登记模型不受策略影响(哪个角色都拿机制窗口)
     assert.equal(await grab("user", "glm-5.2"), 200_000);
   });
@@ -1257,6 +1265,12 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
         assert.deepEqual(backfill[0]!.params, [
           traceInsert.params[0], admissions[0]!.dispatchId, admissions[0]!.billingRequestId,
         ]);
+        // OCV5-599: admitted before its trace existed, so turn_dispatches.trace_id is backfilled.
+        assert.equal(admissions[0]!.traceId, undefined);
+        await waitFor(() => rig.traceWrites.some((w) => /UPDATE turn_dispatches SET trace_id/.test(w.sql)));
+        const dispatchTrace = rig.traceWrites.filter((w) => /UPDATE turn_dispatches SET trace_id/.test(w.sql));
+        assert.equal(dispatchTrace.length, 1, "exactly one dispatch trace backfill");
+        assert.deepEqual(dispatchTrace[0]!.params, [admissions[0]!.dispatchId, traceInsert.params[0]]);
         assert.deepEqual(rig.deferredPoolErrors, []);
       } finally {
         client?.terminate();
@@ -1405,6 +1419,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
   test("无 completed 行 → 正常受理(admitUserTurn 被调用一次,不被 dedup 误伤)", async () => {
     let admitCalls = 0;
     let dispatchId: string | null = null;
+    let admitTraceId: string | null | undefined;
     let historyContext: Parameters<NonNullable<UserChatBridgeDeps["loadMasterSessionMessages"]>>[2] | null = null;
     const rig = await startRig({
       attest: "yes",
@@ -1412,6 +1427,7 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       admitUserTurn: async (input) => {
         admitCalls++;
         dispatchId = input.dispatchId;
+        admitTraceId = input.traceId;
         return fakeAdmittedDispatch(input);
       },
       loadMasterSessionMessages: async (_uid, _sessionId, context) => {
@@ -1458,6 +1474,10 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       const backfills = rig.traceWrites.filter((w) => /SET dispatch_id = COALESCE/.test(w.sql));
       assert.equal(backfills.length, 1);
       assert.equal(backfills[0]!.params[1], dispatchId);
+      // OCV5-599: the browser lane writes turn_dispatches.trace_id at admission (no backfill).
+      assert.equal(admitTraceId, backfills[0]!.params[0]);
+      assert.match(String(admitTraceId), /^[0-9a-f]{32}$/);
+      assert.equal(rig.traceWrites.filter((w) => /UPDATE turn_dispatches SET trace_id/.test(w.sql)).length, 0);
       ws.close();
     } finally {
       await stopRig(rig);
