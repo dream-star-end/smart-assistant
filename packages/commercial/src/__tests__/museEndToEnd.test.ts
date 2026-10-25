@@ -143,7 +143,7 @@ describe('muse end to end (bridge.py + master + oc-muse)', { timeout: 240_000 },
       ['-I', BRIDGE, '--state-dir', bridgeHome, '--cli', FAKE_CLI, 'run', '--server', base],
       {
         stdio: ['ignore', 'ignore', 'ignore'],
-        env: { ...process.env, FAKE_ARGV_LOG: join(work, 'argv.log') },
+        env: { ...process.env, TMPDIR: work, FAKE_ARGV_LOG: join(work, 'argv.log') },
       },
     )
     for (let i = 0; i < 100 && !hub.bridgeOnline(); i++)
@@ -211,6 +211,23 @@ describe('muse end to end (bridge.py + master + oc-muse)', { timeout: 240_000 },
         JSON.stringify(c),
       )
     }
+  })
+
+  it('3 MiB source travels through the real master refs route; chat rejects larger files', async () => {
+    const src = join(work, 'large.png')
+    const data = Buffer.concat([PNG, Buffer.alloc(3 * 1024 * 1024 - PNG.length)])
+    writeFileSync(src, data)
+    const r = await ocMuse(['image', 'large source edit', '--image', src, '--json'])
+    assert.equal(r.code, 0, r.stderr)
+    assert.equal(statSync(JSON.parse(r.stdout).files[0]).size, 4000)
+    const callsBefore = readFileSync(join(work, 'argv.log'), 'utf8')
+    writeFileSync(src, Buffer.concat([data, Buffer.from([0])]))
+    const rejected = await ocMuse(['image', 'too large', '--image', src])
+    assert.equal(rejected.code, 1)
+    const error = JSON.parse(rejected.stderr.trim().split('\n').pop()!)
+    assert.equal(error.code, 'MUSE_INVALID_INPUT')
+    assert.match(error.message, /3 MiB/)
+    assert.equal(readFileSync(join(work, 'argv.log'), 'utf8'), callsBefore)
   })
 
   it('video region error is reported as is, without retry', async () => {

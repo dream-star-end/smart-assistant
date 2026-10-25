@@ -42,7 +42,7 @@ AUTH_FILES = (
 OUT_DIR_ENV = "OC_MUSE_OUT_DIR"
 DEFAULT_OUT_DIR = Path("/home/agent/.openclaude/generated")
 TERMINAL = {"succeeded", "failed", "cancelled"}
-MAX_SOURCE_BYTES = 10 * 1024 * 1024
+MAX_SOURCE_BYTES = 3 * 1024 * 1024
 MAX_SOURCES = 4
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm"}
 
@@ -119,7 +119,7 @@ def read_sources(paths: list[str]) -> list[dict]:
         if not path.is_file():
             raise MuseFailure("MUSE_INVALID_INPUT", f"image file not found: {path}")
         if path.stat().st_size > MAX_SOURCE_BYTES:
-            raise MuseFailure("MUSE_INVALID_INPUT", f"image file exceeds 10 MiB: {path}")
+            raise MuseFailure("MUSE_INVALID_INPUT", f"image file exceeds 3 MiB: {path}")
         out.append({"base64": base64.b64encode(path.read_bytes()).decode("ascii")})
     return out
 
@@ -224,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("prompt", help="what to generate (any language)")
         p.add_argument("--orientation", choices=("square", "vertical", "landscape"))
         p.add_argument("--image", action="append", default=[], metavar="PATH",
-                       help="source image (repeatable, up to 4, png/jpg/webp ≤ 10 MiB)")
+                       help="source image (repeatable, up to 4, png/jpg/webp ≤ 3 MiB)")
         p.add_argument("--resume", metavar="SNAPSHOT_ID", help="continue from an earlier result's snapshot_id")
         p.add_argument("--json", action="store_true", help="print one JSON line instead of paths")
         p.add_argument("--timeout", type=int, default=None, help="seconds to wait for the result")

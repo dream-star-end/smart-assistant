@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.3.2"
+BRIDGE_VERSION = "0.5.0"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -86,6 +86,7 @@ ASPECT_RATIOS = ("4:5", "7:12", "9:16")
 IMAGE_FORMATS = ("png", "jpg", "jpeg", "webp")
 POLL_HOLD_DEFAULT = 25
 HEARTBEAT_DEFAULT = 15
+SOURCE_CHUNK_BYTES = 256 * 1024
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
@@ -301,6 +302,17 @@ def validate_job(job, limits):
         if len(sources) > limits["max_source_images"]:
             raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
         out["source_images"] = [_decode_source_image(item, limits, n) for n, item in enumerate(sources)]
+    refs = job.get("source_refs")
+    if refs is not None:
+        if not isinstance(refs, list) or len(refs) > limits["max_source_images"] or sources:
+            raise JobError("MUSE_INVALID_INPUT", "source_refs 格式错误或与内联源图冲突")
+        for n, ref in enumerate(refs):
+            if (not isinstance(ref, dict) or type(ref.get("n")) is not int or ref["n"] != n
+                    or type(ref.get("bytes")) is not int or not 0 < ref["bytes"] <= limits["source_max_bytes"]
+                    or not isinstance(ref.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+                    or ref.get("mime") not in ("image/png", "image/jpeg", "image/webp")):
+                raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 元数据非法" % n)
+        out["source_refs"] = refs
     snap = job.get("resume_snapshot_id")
     if snap is not None:
         if not isinstance(snap, str) or not SNAPSHOT_RE.match(snap):
@@ -596,7 +608,7 @@ class Client:
         self.session_id = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler())
 
-    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30):
+    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary_limit=None):
         url = self.server + API_PREFIX + path
         hdrs = {
             "Authorization": "Bearer " + self._token,
@@ -617,10 +629,10 @@ class Client:
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 status = resp.status
-                payload = resp.read()
+                payload = resp.read() if binary_limit is None else resp.read(binary_limit + 1)
         except urllib.error.HTTPError as e:
             status = e.code
-            payload = e.read() if e.fp else b""
+            payload = e.read(4096) if e.fp else b""
             resp_headers = e.headers
         else:
             resp_headers = resp.headers
@@ -640,6 +652,8 @@ class Client:
             return None
         if status >= 400:
             raise IOError("HTTP %d %s" % (status, path.split("/")[1] if "/" in path else path))
+        if binary_limit is not None:
+            return status, resp_headers, payload
         if not payload:
             return None
         return json.loads(payload.decode("utf-8"))
@@ -663,6 +677,17 @@ class Client:
 
     def heartbeat(self, job):
         return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
+
+    def source_chunk(self, job, ref, start, end):
+        status, headers, data = self._request(
+            "GET", "/jobs/%s/sources/%d" % (job["id"], ref["n"]),
+            headers={"X-Job-Nonce": job["nonce"], "Range": "bytes=%d-%d" % (start, end)},
+            timeout=20, binary_limit=end - start + 1,
+        )
+        expected = "bytes %d-%d/%d" % (start, end, ref["bytes"])
+        if status != 206 or headers.get("Content-Range") != expected or len(data) != end - start + 1:
+            raise IOError("源图分块响应不完整或范围不匹配")
+        return data
 
     def put_chunk(self, job, idx, n, chunk):
         self._request(
@@ -799,6 +824,7 @@ class Bridge:
                 hb.start()
             try:
                 job = validate_job(raw_job, limits)
+                self.download_sources(client, job, cancel)
                 log.info("任务 %s 开始：%s", job["id"], job["kind"])
                 contract = runner.run(job, out_dir, cancel)
                 files = collect_outputs(contract, os.path.join(out_dir, "media"), job["kind"], limits)
@@ -828,6 +854,35 @@ class Bridge:
         finally:
             hb_stop.set()
             shutil.rmtree(out_dir, ignore_errors=True)
+
+    def download_sources(self, client, job, cancel):
+        """Only called after ack; failed downloads are reported through the normal result path."""
+        if not job.get("source_refs"):
+            return
+        sources = []
+        for ref in job["source_refs"]:
+            data = bytearray()
+            for start in range(0, ref["bytes"], SOURCE_CHUNK_BYTES):
+                end = min(start + SOURCE_CHUNK_BYTES, ref["bytes"]) - 1
+                for attempt in range(3):
+                    if cancel.is_set() or self.stop.is_set():
+                        raise JobError("MUSE_CANCELLED", "源图下载已取消")
+                    try:
+                        chunk = client.source_chunk(job, ref, start, end)
+                        break
+                    except (FatalAuth, JobGone):
+                        raise
+                    except Exception:
+                        if attempt == 2:
+                            raise JobError("MUSE_INVALID_INPUT", "源图 %d 下载失败" % (ref["n"] + 1), True) from None
+                        cancel.wait(2 ** attempt)
+                data.extend(chunk)
+            if hashlib.sha256(data).hexdigest() != ref["sha256"] or sniff_mime(data[:16]) != ref["mime"]:
+                raise JobError("MUSE_INVALID_INPUT", "源图 %d 校验失败" % (ref["n"] + 1))
+            sources.append((bytes(data), MIME_EXT[ref["mime"]]))
+        if cancel.is_set() or self.stop.is_set():
+            raise JobError("MUSE_CANCELLED", "源图下载已取消")
+        job["source_images"] = sources
 
     def ack(self, client, job_ref):
         """First heartbeat for a new job. True only on a 200 from the master."""

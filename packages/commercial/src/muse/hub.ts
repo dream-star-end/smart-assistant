@@ -28,6 +28,7 @@ import {
   MuseError,
   type MuseJobSpec,
   type MuseKind,
+  type MuseSourceRef,
   QUEUE_MAX,
   QUEUE_WAIT_MS,
   SNAPSHOT_ID_RE,
@@ -36,6 +37,7 @@ import {
   normalizeBridgeFailure,
   perFileLimit,
   sniffMime,
+  supportsSourceRefs,
 } from './protocol.js'
 import type { MuseJobStatus, MuseStore } from './store.js'
 
@@ -70,6 +72,8 @@ interface HubJob {
   userId: string
   containerId: string | null
   spec: MuseJobSpec
+  sources: Array<{ data: Buffer; ref: MuseSourceRef }>
+  claimResponseBytes: number
   state: 'queued' | 'dispatched' | 'running' | 'done'
   nonce: string
   queuedAt: number
@@ -105,7 +109,8 @@ export interface MuseWireJob {
   aspect_ratio: string | null
   image_format: string | null
   timeout_secs: number
-  source_images: Array<{ base64: string }> | null
+  source_images?: Array<{ base64: string }> | null
+  source_refs?: MuseSourceRef[]
   resume_snapshot_id: string | null
   deadline_at: string
 }
@@ -254,7 +259,13 @@ export class MuseBridgeHub {
   /** A dispatched job could not be written to its poll response: it was never seen. */
   undeliverable(jobId: string): void {
     const job = this.jobs.get(jobId)
-    if (job && job === this.active && job.state === 'dispatched') this.requeue(job)
+    if (job && job === this.active && job.state === 'dispatched') {
+      this.log.warn('muse_job_undeliverable_requeued', {
+        jobId,
+        claimResponseBytes: job.claimResponseBytes,
+      })
+      this.requeue(job)
+    }
   }
 
   /** Ack (first heartbeat) and keep-alive. Throws 410 when the job/nonce is stale. */
@@ -273,6 +284,14 @@ export class MuseBridgeHub {
     }
     job.lastBeatAt = now
     return { cancel: false }
+  }
+
+  /** Source bytes are available only after the ack barrier, for this dispatch nonce. */
+  sourceFor(jobId: string, nonce: string, n: number): { data: Buffer; ref: MuseSourceRef } {
+    const job = this.requireRunning(jobId, nonce)
+    const source = Number.isSafeInteger(n) && n >= 0 ? job.sources[n] : undefined
+    if (!source) throw new MuseError(404, 'SOURCE_NOT_FOUND', 'source index out of range')
+    return source
   }
 
   async putChunk(
@@ -485,7 +504,20 @@ export class MuseBridgeHub {
       id,
       userId,
       containerId,
-      spec,
+      spec: { ...spec },
+      sources: (spec.source_images ?? []).map((base64, n) => {
+        const data = Buffer.from(base64, 'base64')
+        return {
+          data,
+          ref: {
+            n,
+            bytes: data.length,
+            sha256: createHash('sha256').update(data).digest('hex'),
+            mime: sniffMime(data)!,
+          },
+        }
+      }),
+      claimResponseBytes: 0,
       state: 'queued',
       nonce: randomUUID(),
       queuedAt: now,
@@ -581,9 +613,18 @@ export class MuseBridgeHub {
     const a = this.active
     if (a?.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
       if (a.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
+        this.log.warn('muse_job_ack_timeout_failed', {
+          jobId: a.id,
+          attempt: a.dispatchCount,
+          claimResponseBytes: a.claimResponseBytes,
+        })
         this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
       } else {
-        this.log.warn('muse_job_ack_timeout_requeued', { jobId: a.id, attempt: a.dispatchCount })
+        this.log.warn('muse_job_ack_timeout_requeued', {
+          jobId: a.id,
+          attempt: a.dispatchCount,
+          claimResponseBytes: a.claimResponseBytes,
+        })
         this.requeue(a)
       }
     } else if (a?.state === 'running') {
@@ -666,6 +707,7 @@ export class MuseBridgeHub {
     job.outcome = outcome
     job.finishedAt = this.now()
     job.spec = { ...job.spec, source_images: undefined }
+    job.sources = []
     if (this.active === job) this.active = null
     const qi = this.queue.indexOf(job)
     if (qi >= 0) this.queue.splice(qi, 1)
@@ -718,7 +760,7 @@ export class MuseBridgeHub {
 
   private wire(job: HubJob): MuseWireJob {
     const s = job.spec
-    return {
+    const wire: MuseWireJob = {
       id: job.id,
       nonce: job.nonce,
       kind: s.kind,
@@ -727,10 +769,18 @@ export class MuseBridgeHub {
       aspect_ratio: s.aspect_ratio ?? null,
       image_format: s.kind === 'image' ? (s.image_format ?? null) : null,
       timeout_secs: this.cliTimeoutSec[s.kind],
-      source_images: s.source_images?.length ? s.source_images.map((b) => ({ base64: b })) : null,
+      ...(supportsSourceRefs(this.session?.version ?? null)
+        ? { source_refs: job.sources.map(({ ref }) => ref) }
+        : {
+            source_images: s.source_images?.length
+              ? s.source_images.map((b) => ({ base64: b }))
+              : null,
+          }),
       resume_snapshot_id: s.resume_snapshot_id ?? null,
       deadline_at: new Date(job.deadlineAt).toISOString(),
     }
+    job.claimResponseBytes = Buffer.byteLength(JSON.stringify({ job: wire }))
+    return wire
   }
 }
 

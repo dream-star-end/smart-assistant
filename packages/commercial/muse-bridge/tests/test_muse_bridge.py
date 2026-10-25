@@ -50,6 +50,16 @@ class Pure(unittest.TestCase):
             j = {"id": "a", "kind": "image", "prompt": "x"}; j.update(extra)
             with self.assertRaises(mb.JobError, msg=str(extra)[:60]) as c: mb.validate_job(j, self.L)
             self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
+    def test_source_refs_validation(self):
+        ref = {"n": 0, "bytes": len(PNG), "sha256": hashlib.sha256(PNG).hexdigest(), "mime": "image/png"}
+        base = {"id": "refs", "kind": "image", "prompt": "x", "source_refs": [ref]}
+        self.assertEqual(mb.validate_job(base, self.L)["source_refs"], [ref])
+        for patch in ({"n": True}, {"n": 1}, {"bytes": 0}, {"bytes": self.L["source_max_bytes"] + 1},
+                      {"sha256": "bad"}, {"mime": "video/mp4"}):
+            with self.assertRaises(mb.JobError):
+                mb.validate_job(dict(base, source_refs=[dict(ref, **patch)]), self.L)
+        with self.assertRaises(mb.JobError):
+            mb.validate_job(dict(base, source_images=[{"base64": b64(PNG)}]), self.L)
     def test_upload_mapping(self):
         self.assertEqual(mb.map_upload_outcome(0, json.dumps({"image_ids": ["1", 2], "upload_count": 2}), "", 2), ["1", "2"])
         for rc, out, n in ((0, json.dumps({"image_ids": ["1"]}), 2), (0, json.dumps({"image_ids": ["a b"]}), 1),
@@ -199,6 +209,40 @@ class E2E(unittest.TestCase):
     def test_07d_never_mixes_legacy_and_subagent(self):
         for call in argv_lines(self.argvlog):
             self.assertFalse(any(x in call for x in LEGACY) and any(x in call for x in SUBAGENT), call)
+    def refs_job(self, jid, data=PNG, **kw):
+        mm.S.sources[(jid, 0)] = data
+        ref = {"n": 0, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mime": "image/png"}
+        return self.job(jid, source_refs=[ref], **kw)
+    def test_07e_large_refs_ack_then_download_with_retry(self):
+        jid = "large-refs"
+        mm.S.source_flaky[jid] = 1
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.refs_job(jid, PNG + b"x" * (3 * mb.MIB)), 30)
+        self.assertTrue(r["ok"], r)
+        self.assertLess(mm.S.claim_bytes[jid], 512)
+        gets = [r for r in mm.S.source_requests if r[0] == jid]
+        self.assertGreater(len(gets), 12)
+        self.assertTrue(all(r[3] for r in gets), "all downloads must follow ack")
+        self.assertEqual(gets[0][2], gets[1][2], "retry the failed range only")
+        calls = argv_lines(self.argvlog)[n0:]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--upload-only", calls[0])
+    def test_07f_download_failures_report_result_without_cli(self):
+        for failure in ("network", "sha", "short", "ignored-range"):
+            jid = "refs-fail-" + failure
+            if failure == "network": mm.S.source_flaky[jid] = 3
+            else: mm.S.source_bad[jid] = failure
+            n0 = len(argv_lines(self.argvlog))
+            r = self.res(self.refs_job(jid))
+            self.assertEqual(r["error_code"], "MUSE_INVALID_INPUT", failure)
+            self.assertEqual(r["retryable"], failure != "sha", failure)
+            self.assertEqual(len(argv_lines(self.argvlog)), n0, "failed source must not reach CLI")
+    def test_07g_no_download_without_ack(self):
+        jid = "refs-no-ack"
+        mm.S.ack_gone.add(jid)
+        self.refs_job(jid)
+        self.assertTrue(self.res(self.job("after-refs-no-ack"))["ok"])
+        self.assertFalse(any(r[0] == jid for r in mm.S.source_requests))
     def test_08_cancel_via_heartbeat(self):
         mm.S.cancel.add("c1"); t0 = time.time()
         r = self.res(self.job("c1", prompt="sleep"), 30)
