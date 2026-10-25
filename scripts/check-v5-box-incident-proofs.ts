@@ -1781,7 +1781,7 @@ async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
     const still = await api.waitReplay({ kind: "pending" }, async () => { polls++; return { kind: "pending" }; },
       { budgetMs, intervalMs, signal: new AbortController().signal, now: () => clock,
         sleep: async (ms) => { clock += ms; } });
-    if (still.kind !== "pending" || clock > budgetMs || polls !== Math.floor(budgetMs / intervalMs)) fail("REPLAY_WAIT_UNBOUNDED");
+    if (still.kind !== "pending" || clock > budgetMs || polls !== Math.floor(budgetMs / intervalMs) + 1) fail("REPLAY_WAIT_UNBOUNDED"); // OCV5-620 final lookup
     const gone = new AbortController();
     gone.abort();
     await api.waitReplay({ kind: "pending" }, async () => { polls = -1; return { kind: "ready" }; },
