@@ -128,6 +128,13 @@ describe('internal Grok relay', () => {
       assert.equal(response.status, 201)
       assert.equal(await response.text(), 'relay-ok')
       assert.deepEqual(stages.map(s => s.stage), ['proxy_received', 'route_ready', 'upstream_prepare_started', 'upstream_prepare_complete', 'fetch_started', 'headers_received', 'stream_complete'])
+      for (const s of stages) {
+        assert.equal(s.method, 'POST')
+        assert.equal(s.upstreamPath, '/chat/completions')
+      }
+      const logged = JSON.stringify(stages)
+      assert.ok(!logged.includes(ROUTE_TOKEN), 'route token never logged')
+      assert.ok(!logged.includes('stream=true'), 'query never logged')
       assert.equal(captured.url, `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/chat/completions?stream=true`)
       assert.equal(captured.headers?.get('authorization'), 'Bearer real-xai-oauth-token')
       assert.equal(captured.headers?.get('content-type'), 'application/json')
@@ -283,9 +290,11 @@ describe('internal Grok relay', () => {
 
   test('relays official CLI GET /billing (usage) while still fail-closed for other billing paths', async () => {
     const captured: string[] = []
+    const stages: Array<Record<string, unknown>> = []
     let contextCalls = 0
     const handler = makeGrokRelayHandler({
       identityRepo: repo(),
+      logger: { info: (_message, fields) => { stages.push(fields!) } },
       resolveContext: async () => {
         contextCalls += 1
         return { modelId: 'grok-build', accountId: 53n, slotId: 'slot-53' }
@@ -307,6 +316,12 @@ describe('internal Grok relay', () => {
       assert.equal(ok.status, 200)
       assert.deepEqual(captured, [`${GROK_OFFICIAL_UPSTREAM_BASE_URL}/billing?format=credits`])
       assert.equal(contextCalls, 1)
+      assert.ok(stages.length > 0)
+      for (const s of stages) {
+        assert.equal(s.method, 'GET')
+        assert.equal(s.upstreamPath, '/billing')
+      }
+      assert.ok(!JSON.stringify(stages).includes('format=credits'), 'query never logged')
 
       const blocked = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/billing`, {
         method: 'POST',
