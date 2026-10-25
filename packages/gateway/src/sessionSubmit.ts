@@ -2341,26 +2341,10 @@ export async function finishIdleUnderLock(
     writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
     return
   }
-  // OCV5-620: prepared summary that never received a matching apply receipt.
-  const applyStuckEarly = idleApplyStuckReason(recoveryDir, {
-    ...op,
-    ...(native?.summaryText && !op.summaryText ? { summaryText: native.summaryText } : {}),
-  })
-  if (applyStuckEarly) {
-    log.warn('box idle op abandoned', {
-      sessionKey: session.sessionKey,
-      revision: op.revision,
-      reason: applyStuckEarly,
-    })
-    clearIdleCandidate(recoveryDir, session.sessionKey)
-    writeSettledIdleOp(recoveryDir, {
-      ...op,
-      ...(native?.summaryText && !op.summaryText ? { summaryText: native.summaryText } : {}),
-      disposition: 'abandoned',
-      abandonReason: applyStuckEarly,
-    })
-    return
-  }
+  // OCV5-620: apply-stuck is NOT checked here (before apply). Op-file mtime
+  // reflects the last write, not when the summary became prepared, so an early
+  // check could discard a recoverable summary without ever trying to apply it
+  // (Codex r1 P1). It is checked only after an apply attempt, below.
   const accepted = idleSummaryAccepted(summaryProof, {
     sessionId: source.sessionId,
     idleTurnKey: op.idleTurnKey,
