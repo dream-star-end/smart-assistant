@@ -278,11 +278,19 @@ export async function synthesizeSpeech(
     format: AudioFormat
     voiceSetting?: unknown
     extra?: Record<string, unknown>
+    /**
+     * OCV5-591 A2-0: never charge more than this (the studio task's budget reservation). The
+     * upstream bills by its own character count, so the cap is enforced before settlement and the
+     * platform absorbs any excess. Container calls leave it unset (unchanged behaviour).
+     */
+    costCap?: bigint
   },
 ): Promise<{
   audio: Buffer
   format: AudioFormat
   usageCharacters: number | null
+  /** extra_info.audio_length (ms) when the upstream reports it. */
+  audioMs: number | null
   settled: Settled
 }> {
   const key = requireKey(deps)
@@ -313,11 +321,27 @@ export async function synthesizeSpeech(
     isObj(json) && isObj(json.extra_info) && typeof json.extra_info.usage_characters === 'number'
       ? json.extra_info.usage_characters
       : null
-  const cost = calculateMiniMaxSpeechCost({
+  const audioMs =
+    isObj(json) && isObj(json.extra_info) && typeof json.extra_info.audio_length === 'number'
+      ? json.extra_info.audio_length
+      : null
+  const priced = calculateMiniMaxSpeechCost({
     model: args.model,
     text: args.text,
     usageCharacters: usageCharacters ?? undefined,
   })
+  const cost =
+    args.costCap !== undefined && priced.costCredits > args.costCap
+      ? {
+          ...priced,
+          costCredits: args.costCap,
+          snapshot: {
+            ...priced.snapshot,
+            cost_credits: args.costCap.toString(),
+            notes: `capped from ${priced.costCredits} at the studio budget reservation`,
+          },
+        }
+      : priced
   const audio = hexToBuffer(audioHex)
   const settled = await settleMiniMaxMediaSuccess(deps.pool, {
     userId: args.userId,
@@ -332,7 +356,7 @@ export async function synthesizeSpeech(
     },
   })
   if (access.owned) await touchOwnedVoice(deps.pool, args.userId, args.voiceId).catch(() => {})
-  return { audio, format: args.format, usageCharacters, settled }
+  return { audio, format: args.format, usageCharacters, audioMs, settled }
 }
 
 function voiceCostWithPreview(
@@ -388,9 +412,7 @@ async function createVoiceOnce<T extends { voiceId: string; settled: Settled }>(
     consent: Record<string, unknown> | null
     plannedCost: MiniMaxMediaCostResult
   },
-  run: (
-    voiceId: string,
-  ) => Promise<{
+  run: (voiceId: string) => Promise<{
     cost: MiniMaxMediaCostResult
     traceId: string | null
     fileId?: string | null

@@ -17,6 +17,8 @@ import {
 } from '../media-studio/access.js'
 import type { StudioBlobStore } from '../media-studio/blobs.js'
 import { type StudioHttpDeps, dispatchStudioRoute } from '../media-studio/http.js'
+import type { OrchestratorApi } from '../media-studio/orchestrator/service.js'
+import type { ProviderRegistry } from '../media-studio/providers/registry.js'
 import type { StudioStore } from '../media-studio/store.js'
 
 const SECRET = 'studio-test-secret-that-is-long-enough-123'
@@ -90,6 +92,8 @@ describe('dispatchStudioRoute', () => {
   let server: Server
   let base = ''
   let enabled = true
+  let orchestrator: OrchestratorApi | undefined
+  let providers: ProviderRegistry | undefined
   const calls: string[] = []
   let filePath = ''
   const fileBody = Buffer.from('0123456789')
@@ -106,6 +110,23 @@ describe('dispatchStudioRoute', () => {
     projectView: async (uid: string, id: string) =>
       uid === '247' && id === PROJECT ? { project: { id } } : null,
     projectOwned: async (uid: string) => uid === '247',
+    addUserTrack: async (
+      uid: string,
+      input: {
+        id: string
+        title: string
+        rights: { statement: string }
+        durationMs?: number | null
+      },
+    ) => {
+      calls.push(`track:${uid}:${input.title}:${input.rights.statement}`)
+      calls.push(`trackLen:${input.title}:${input.durationMs ?? null}`)
+      return { id: input.id, title: input.title }
+    },
+    transition: async (uid: string, id: string, action: string) => {
+      calls.push(`transition:${uid}:${action}`)
+      return { id }
+    },
     addUploadAsset: async (
       _uid: string,
       _p: string,
@@ -125,6 +146,7 @@ describe('dispatchStudioRoute', () => {
       return { sha: SHA, bytes: args.maxBytes, mime: args.mime, newForUser: true }
     },
     dropRefs: async () => 0,
+    openCatalog: async () => null,
   } as unknown as StudioBlobStore
 
   before(async () => {
@@ -136,6 +158,8 @@ describe('dispatchStudioRoute', () => {
         access: studioAccess({ OC_STUDIO_ENABLED: enabled, OC_STUDIO_ALLOWED_UIDS: ['247'] }),
         store,
         blobs,
+        ...(orchestrator ? { orchestrator } : {}),
+        ...(providers ? { providers } : {}),
       }
       void dispatchStudioRoute(req, res, {} as never, { jwtSecret: SECRET, studio: deps }).catch(
         (error) => {
@@ -177,6 +201,35 @@ describe('dispatchStudioRoute', () => {
     )
   })
 
+  it('GET /providers: same gate; without a registry every kind reads as not configured (A2-0)', async () => {
+    enabled = false
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } }))
+        .status,
+      404,
+    )
+    enabled = true
+    assert.equal((await fetch(`${base}/providers`)).status, 401)
+    assert.equal(
+      (await fetch(`${base}/providers`, { headers: { authorization: await bearer('3') } })).status,
+      404,
+    )
+    const ok = await fetch(`${base}/providers`, { headers: { authorization: await bearer('247') } })
+    assert.equal(ok.status, 200)
+    const view = (await ok.json()) as {
+      kinds: Array<{ kind: string; state: string; reason?: string }>
+    }
+    assert.deepEqual(
+      view.kinds.map((k) => [k.kind, k.state, k.reason]),
+      [
+        ['image', 'unconfigured', 'NO_PROVIDER'],
+        ['video', 'unconfigured', 'NO_PROVIDER'],
+        ['voice', 'unconfigured', 'NO_PROVIDER'],
+        ['music', 'unconfigured', 'NO_PROVIDER'],
+      ],
+    )
+  })
+
   it('creates and reads projects; another user sees 404', async () => {
     const auth = await bearer('247')
     const created = await fetch(`${base}/projects`, {
@@ -198,6 +251,262 @@ describe('dispatchStudioRoute', () => {
       ).status,
       404,
     )
+  })
+
+  it('director routes (A2-1a): 503 while the orchestrator is off, then reach it as the caller', async () => {
+    const auth = await bearer('247')
+    const post = (p: string, body?: unknown, who = auth) =>
+      fetch(`${base}${p}`, {
+        method: 'POST',
+        headers: { authorization: who, 'content-type': 'application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    const TAKE = '22222222-3333-4444-8555-666666666666'
+    const ASSET = '33333333-4444-4555-8666-777777777777'
+    const routes = [
+      `/projects/${PROJECT}/start`,
+      `/projects/${PROJECT}/approve`,
+      `/projects/${PROJECT}/voices`,
+      `/takes/${TAKE}/select`,
+      `/assets/${ASSET}/narration`,
+      `/projects/${PROJECT}/annotations`,
+      `/annotations/${TAKE}/send`,
+    ]
+    orchestrator = undefined
+    for (const r of routes) {
+      const res = await post(r, {})
+      assert.equal(res.status, 503, r)
+      assert.equal(((await res.json()) as { error: string }).error, 'STUDIO_ORCHESTRATOR_OFF')
+    }
+
+    const seen: string[] = []
+    const notes: string[] = []
+    orchestrator = {
+      annotations: {
+        create: async (uid, id, body) => {
+          notes.push(`create:${uid}:${id}:${body.kind}:${body.text}`)
+          return { id: 'n1' }
+        },
+        update: async (uid, id, body) => void notes.push(`update:${uid}:${id}:${body.text}`),
+        remove: async (uid, id) => void notes.push(`remove:${uid}:${id}`),
+        send: async (uid, id) => void notes.push(`send:${uid}:${id}`),
+        apply: async (uid, id) => void notes.push(`apply:${uid}:${id}`),
+        reject: async (uid, id) => void notes.push(`reject:${uid}:${id}`),
+      },
+      start: async (uid, id) => void seen.push(`start:${uid}:${id}`),
+      approve: async (uid, id) => void seen.push(`approve:${uid}:${id}`),
+      selectTake: async (uid, id) => {
+        seen.push(`select:${uid}:${id}`)
+        return { projectId: PROJECT }
+      },
+      createVoice: async (uid, id, body) => {
+        seen.push(`voice:${uid}:${id}:${body.mode}:${body.name}`)
+        return { assetId: ASSET }
+      },
+      useVoiceForNarration: async (uid, id) => {
+        seen.push(`narration:${uid}:${id}`)
+        return { projectId: PROJECT }
+      },
+      kick: (id) => void seen.push(`kick:${id}`),
+      selectMusic: async () => ({ queued: true as const }),
+      setMusicEdit: async () => ({}),
+      requestExport: async (uid, id, body) => {
+        seen.push(`export:${uid}:${id}:${body.resolution}:${body.subtitles}`)
+        return body.resolution === '1080p'
+          ? { reused: true as const, takeId: 'fin1' }
+          : { queued: true as const }
+      },
+    }
+    try {
+      for (const r of [`/projects/${PROJECT}/start`, `/projects/${PROJECT}/approve`]) {
+        const res = await post(r)
+        assert.equal(res.status, 200, r)
+        assert.deepEqual(await res.json(), { project: { id: PROJECT } })
+      }
+      const voice = await post(`/projects/${PROJECT}/voices`, { mode: 'design', name: '旁白' })
+      assert.equal(voice.status, 201)
+      assert.deepEqual(await voice.json(), { assetId: ASSET })
+      assert.equal((await post(`/takes/${TAKE}/select`)).status, 200)
+      assert.equal((await post(`/assets/${ASSET}/narration`)).status, 200)
+      assert.equal((await post(`/projects/${PROJECT}/resume`)).status, 200)
+      // A2-1c export: a film for the same format is returned (200), another format is queued (202).
+      const reused = await post(`/projects/${PROJECT}/export`, {
+        resolution: '1080p',
+        subtitles: 'burn',
+      })
+      assert.equal(reused.status, 200)
+      assert.deepEqual(await reused.json(), { reused: true, takeId: 'fin1' })
+      assert.equal(
+        (await post(`/projects/${PROJECT}/export`, { resolution: 'vertical', subtitles: 'srt' }))
+          .status,
+        202,
+      )
+      seen.splice(seen.indexOf(`export:247:${PROJECT}:1080p:burn`), 2)
+      // A2-1b-2 annotations: a draft on the project, then its own routes.
+      const made = await post(`/projects/${PROJECT}/annotations`, { kind: 'text', text: '慢一点' })
+      assert.equal(made.status, 201)
+      assert.deepEqual(await made.json(), { id: 'n1' })
+      const auth247 = await bearer('247')
+      const call = (method: string, path: string, body?: unknown) =>
+        fetch(`${base}${path}`, {
+          method,
+          headers: { authorization: auth247, 'content-type': 'application/json' },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        })
+      assert.equal(
+        (await call('PATCH', `/annotations/${TAKE}`, { kind: 'text', text: '再慢' })).status,
+        200,
+      )
+      for (const act of ['send', 'apply', 'reject'])
+        assert.equal((await call('POST', `/annotations/${TAKE}/${act}`)).status, 200, act)
+      assert.equal((await call('DELETE', `/annotations/${TAKE}`)).status, 200)
+      assert.equal((await call('GET', `/annotations/${TAKE}/send`)).status, 404)
+      assert.deepEqual(notes, [
+        `create:247:${PROJECT}:text:慢一点`,
+        `update:247:${TAKE}:再慢`,
+        `send:247:${TAKE}`,
+        `apply:247:${TAKE}`,
+        `reject:247:${TAKE}`,
+        `remove:247:${TAKE}`,
+      ])
+      assert.deepEqual(seen, [
+        `start:247:${PROJECT}`,
+        `approve:247:${PROJECT}`,
+        `voice:247:${PROJECT}:design:旁白`,
+        `select:247:${TAKE}`,
+        `narration:247:${ASSET}`,
+        `kick:${PROJECT}`,
+      ])
+      // Outside the allow-list the gate answers 404 before the orchestrator is touched.
+      assert.equal(
+        (await post(`/projects/${PROJECT}/start`, undefined, await bearer('3'))).status,
+        404,
+      )
+      assert.equal(seen.length, 6)
+    } finally {
+      orchestrator = undefined
+    }
+  })
+
+  it('music routes (OCV5-591 M1): search a source, pick a track, edit, upload to My Music', async () => {
+    const auth = await bearer('247')
+    const searched: unknown[] = []
+    const track = { id: 't1', title: 'Easy Lemon', metadata: { bpm: 'source', moods: 'guessed' } }
+    providers = {
+      get: (id: string) =>
+        id === 'music-catalog'
+          ? {
+              id,
+              kind: 'music',
+              status: () => ({ state: 'ready' }),
+              search: async (u: { id: string }, q: unknown) => {
+                searched.push([u.id, q])
+                return { tracks: [track], next: null }
+              },
+            }
+          : id === 'gpt-image'
+            ? { id, kind: 'image', status: () => ({ state: 'ready' }) }
+            : undefined,
+    } as unknown as ProviderRegistry
+    try {
+      const ok = await fetch(
+        `${base}/music/search?provider=music-catalog&text=snow&moods=${encodeURIComponent('宁静,温暖')}&bpmMin=60&vocals=false`,
+        { headers: { authorization: auth } },
+      )
+      assert.equal(ok.status, 200)
+      assert.deepEqual(await ok.json(), { tracks: [track], next: null })
+      assert.deepEqual(searched[0], [
+        '247',
+        { text: 'snow', moods: ['宁静', '温暖'], bpmMin: 60, vocals: false },
+      ])
+      for (const [q, status] of [
+        ['provider=gpt-image', 400],
+        ['provider=nope', 400],
+        ['provider=music-catalog&bpmMin=5', 400],
+      ] as const) {
+        assert.equal(
+          (await fetch(`${base}/music/search?${q}`, { headers: { authorization: auth } })).status,
+          status,
+          q,
+        )
+      }
+      assert.equal(
+        (
+          await fetch(`${base}/music/search?provider=music-catalog`, {
+            headers: { authorization: await bearer('3') },
+          })
+        ).status,
+        404,
+        'the access gate comes first',
+      )
+
+      const seen: string[] = []
+      orchestrator = {
+        selectMusic: async (uid: string, id: string, body: Record<string, unknown>) => {
+          seen.push(`select:${uid}:${id}:${body.providerId}:${body.trackId}`)
+          return { queued: true as const }
+        },
+        setMusicEdit: async (uid: string, id: string, body: Record<string, unknown>) => {
+          seen.push(`edit:${uid}:${id}:${body.inSec}`)
+          return { inSec: body.inSec as number }
+        },
+      } as unknown as OrchestratorApi
+      const pick = await fetch(`${base}/projects/${PROJECT}/music`, {
+        method: 'POST',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ providerId: 'music-catalog', trackId: 't1' }),
+      })
+      assert.equal(pick.status, 202)
+      const edit = await fetch(`${base}/projects/${PROJECT}/music/edit`, {
+        method: 'PUT',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ inSec: 8 }),
+      })
+      assert.deepEqual(await edit.json(), { musicEdit: { inSec: 8 } })
+      assert.deepEqual(seen, [`select:247:${PROJECT}:music-catalog:t1`, `edit:247:${PROJECT}:8`])
+
+      const mp3 = Buffer.concat([Buffer.from('ID3'), Buffer.alloc(64)])
+      const up = (q: string, type = 'audio/mpeg', body: Buffer = mp3) =>
+        fetch(`${base}/music/tracks?${q}`, {
+          method: 'POST',
+          headers: {
+            authorization: auth,
+            'content-type': type,
+            'content-length': String(body.length),
+          },
+          body: new Uint8Array(body),
+        })
+      assert.equal((await up('title=demo')).status, 400, 'the rights statement is required')
+      assert.equal((await up('title=demo&rights=own_or_licensed', 'image/png')).status, 415)
+      assert.equal(
+        (await up('title=demo&rights=own_or_licensed', 'audio/mpeg', Buffer.from('not audio')))
+          .status,
+        415,
+      )
+      const created = await up('title=demo&rights=own_or_licensed&note=client%20contract')
+      assert.equal(created.status, 201)
+      assert.ok(calls.includes('track:247:demo:own_or_licensed'))
+      // M1 follow-up: the real length is read from the upload; unreadable bytes stay unknown.
+      assert.ok(calls.includes('trackLen:demo:null'))
+      const wav = Buffer.alloc(44 + 88_200) // 0.5 s of 44.1 kHz 16-bit stereo
+      wav.write('RIFF', 0, 'ascii')
+      wav.writeUInt32LE(36 + 88_200, 4)
+      wav.write('WAVEfmt ', 8, 'ascii')
+      wav.writeUInt32LE(16, 16)
+      wav.writeUInt16LE(1, 20)
+      wav.writeUInt16LE(2, 22)
+      wav.writeUInt32LE(44_100, 24)
+      wav.writeUInt32LE(176_400, 28)
+      wav.writeUInt16LE(4, 32)
+      wav.writeUInt16LE(16, 34)
+      wav.write('data', 36, 'ascii')
+      wav.writeUInt32LE(88_200, 40)
+      assert.equal((await up('title=wav&rights=own_or_licensed', 'audio/wav', wav)).status, 201)
+      assert.ok(calls.includes('trackLen:wav:500'))
+    } finally {
+      providers = undefined
+      orchestrator = undefined
+    }
   })
 
   it('issues a ticket only for a blob the user references, then serves byte ranges with it', async () => {

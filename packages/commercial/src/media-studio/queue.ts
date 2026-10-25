@@ -209,12 +209,33 @@ export async function retryStudioTask(
   return r.rowCount === 1
 }
 
-/** Cancels a project's queued tasks. Leased ones finish their in-flight upstream call (plan §4). */
+/**
+ * Cancels a project's queued tasks. Leased ones finish their in-flight upstream call (plan §4).
+ * Their budget reservations are released and their bound takes canceled in the same statement
+ * (OCV5-591 A2-1; a retried task's take may still say 'running'); any charge an earlier attempt
+ * still makes is booked by the reconciler.
+ */
 export async function cancelQueuedStudioTasks(db: Db, projectId: string): Promise<number> {
-  const r = await db.query(
-    `UPDATE studio_tasks SET status='canceled', updated_at=NOW()
-     WHERE project_id=$1 AND status='queued'`,
+  const r = await db.query<{ n: string }>(
+    `WITH old AS (
+       SELECT id, reserved_credits AS held, payload->>'takeId' AS take_id
+         FROM studio_tasks WHERE project_id=$1 AND status='queued' FOR UPDATE
+     ), c AS (
+       UPDATE studio_tasks t SET status='canceled', reserved_credits=0, updated_at=NOW()
+         FROM old WHERE t.id=old.id RETURNING old.held, old.take_id
+     ), tk AS (
+       UPDATE studio_takes SET status='canceled', finished_at=NOW()
+        WHERE project_id=$1 AND status IN ('queued','running')
+          AND id::text IN (SELECT take_id FROM c WHERE take_id IS NOT NULL)
+       RETURNING id
+     ), p AS (
+       UPDATE studio_projects
+          SET reserved_credits = GREATEST(0, reserved_credits - (SELECT COALESCE(SUM(held), 0) FROM c))
+        WHERE id=$1
+       RETURNING id
+     )
+     SELECT (SELECT COUNT(*) FROM c)::text AS n`,
     [projectId],
   )
-  return r.rowCount ?? 0
+  return Number(r.rows[0]?.n ?? 0)
 }

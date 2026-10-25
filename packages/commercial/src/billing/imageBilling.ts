@@ -1,4 +1,5 @@
 import type { Pool } from 'pg'
+import { DEFAULT_IMAGE_MODEL } from './imageModels.js'
 import { resolveOrgBillingContext } from '../org/orgBilling.js'
 import { spendTwoBucket } from './spend.js'
 import { InsufficientCreditsError } from './ledger.js'
@@ -131,6 +132,8 @@ export async function reserveImageUsage(pool: Pool, args: {
   /** Number of output images (native_image data plane bills 50×n). Default 1;
    * clamp [1,4] is the caller's responsibility (relay). Fixed 50/image. */
   imageCount?: number
+  /** Upstream model id (OCV5-587 allowlist); default gpt-image-2. Price is model-independent. */
+  model?: string
 }): Promise<{ alreadyCharged: boolean }> {
   const imageCount = args.imageCount ?? 1
   const costCredits = IMAGE2_UNIT_COST * BigInt(imageCount)
@@ -179,10 +182,14 @@ export async function reserveImageUsage(pool: Pool, args: {
     if (BigInt(daily.rows[0]?.count ?? '0') >= 10n) throw new ImageDailyLimitError()
     const inserted = await client.query<{ already_charged: boolean }>(
       `INSERT INTO image_generation_usage_records
-         (user_id,container_id,request_id,job_id,operation,status,image_count,cost_credits)
-       VALUES ($1,$2,$3,$4,$5,'reserved',$6,$7)
+         (user_id,container_id,request_id,job_id,operation,status,image_count,cost_credits,model)
+       VALUES ($1,$2,$3,$4,$5,'reserved',$6,$7,$8)
        ON CONFLICT (user_id,request_id) DO UPDATE SET
          container_id=EXCLUDED.container_id,
+         -- A paid row keeps the model it was charged for (Codex Sol r1 P1): recovery is bound to the
+         -- same input hash, which includes the model, and a failed recovery must not rewrite it.
+         model=CASE WHEN image_generation_usage_records.ledger_id IS NOT NULL
+                    THEN image_generation_usage_records.model ELSE EXCLUDED.model END,
          job_id=EXCLUDED.job_id,
          operation=EXCLUDED.operation,
          image_count=EXCLUDED.image_count,
@@ -197,7 +204,7 @@ export async function reserveImageUsage(pool: Pool, args: {
             AND image_generation_usage_records.response_expires_at <= NOW()
           )
        RETURNING ledger_id IS NOT NULL AS already_charged`,
-      [args.userId.toString(), args.containerId, args.requestId, args.jobId ?? null, args.operation, imageCount, costCredits.toString()],
+      [args.userId.toString(), args.containerId, args.requestId, args.jobId ?? null, args.operation, imageCount, costCredits.toString(), args.model ?? DEFAULT_IMAGE_MODEL],
     )
     if (inserted.rowCount !== 1) {
       const conflict = new Error('image request already exists') as Error & { code: string }
@@ -272,6 +279,8 @@ export async function settleImageCharge(
     operation: 'generation' | 'edit' | 'annotated_edit' | 'native_image'
     /** Output image count (native_image bills 50×n). Must match reserve. Default 1. */
     imageCount?: number
+    /** Model actually sent upstream (OCV5-587); recorded on the row and the ledger memo. */
+    model?: string
     responseBody: Buffer
     responseContentType?: string
   },
@@ -297,15 +306,18 @@ export async function settleImageCharge(
       }
     }
     if (existing.rows[0]?.status === 'reserved' && existing.rows[0].ledger_id) {
+      // Paid-recovery path (ledger already written): record the model actually sent. reserve keeps
+      // the paid model and the input hash binds it, so this matches what was charged (OCV5-587 r1 P1).
       await client.query(
         `UPDATE image_generation_usage_records
          SET status='success', response_body=$1, response_content_type=$2,
-             response_expires_at=NOW() + INTERVAL '24 hours', error_code=NULL, updated_at=NOW()
+             response_expires_at=NOW() + INTERVAL '24 hours', error_code=NULL, model=$4, updated_at=NOW()
          WHERE id=$3`,
         [
           args.responseBody,
           args.responseContentType ?? 'application/json; charset=utf-8',
           existing.rows[0].id,
+          args.model ?? DEFAULT_IMAGE_MODEL,
         ],
       )
       await client.query('COMMIT')
@@ -326,7 +338,7 @@ export async function settleImageCharge(
       amount: chargeAmount,
       reason: 'image_generation',
       ref: { type: 'image_generation', id: usageId.toString() },
-      memo: `gpt-image-2 ${args.operation}${(args.imageCount ?? 1) > 1 ? ` x${args.imageCount}` : ''}`,
+      memo: `${args.model ?? DEFAULT_IMAGE_MODEL} ${args.operation}${(args.imageCount ?? 1) > 1 ? ` x${args.imageCount}` : ''}`,
       orgId: orgCtx?.billingEnabled ? orgCtx.orgId : undefined,
       monthlyOrgBudget: orgCtx?.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
     })
@@ -338,6 +350,7 @@ export async function settleImageCharge(
        SET status='success', ledger_id=$1, response_body=$2, response_content_type=$3, completed_at=NOW(),
            response_expires_at=CASE WHEN operation='annotated_edit'
              THEN NOW() + INTERVAL '24 hours' ELSE NOW() + INTERVAL '1 hour' END,
+           model=$5,
            updated_at=NOW()
        WHERE id=$4`,
       [
@@ -345,6 +358,7 @@ export async function settleImageCharge(
         args.responseBody,
         args.responseContentType ?? 'application/json; charset=utf-8',
         usageId.toString(),
+        args.model ?? DEFAULT_IMAGE_MODEL,
       ],
     )
     await client.query('COMMIT')
