@@ -156,7 +156,7 @@ describe('StudioApp (OCV5-593)', () => {
     expect(await screen.findByText('分镜还没写')).toBeInTheDocument()
   })
 
-  test('brief page: model plan follows /providers and nothing ever asks a provider to generate', async () => {
+  test('brief page: model plan follows /providers and start is enabled for a draft with a brief', async () => {
     routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
     routes[`GET /api/studio/projects/${ID}`] = () => ({
       status: 200,
@@ -167,8 +167,64 @@ describe('StudioApp (OCV5-593)', () => {
     expect(screen.getByTestId('plan-voice')).toHaveTextContent('未配置')
     expect(screen.getByTestId('plan-video')).toHaveTextContent('Muse 暂时不可用')
     expect(screen.getByTestId('plan-image')).toHaveTextContent('GPT Image')
-    expect(screen.getByRole('button', { name: /全自动开始/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /全自动开始/ })).toBeEnabled()
     expect(calls.every((c) => c.method === 'GET')).toBe(true)
+  })
+
+  test('brief page: 全自动开始 posts /start and reloads the project view', async () => {
+    let status: StudioProject['status'] = 'draft'
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: {
+        project: project({ status }),
+        shots: [],
+        lines: [],
+        assets: [],
+        takes: [],
+        events: [],
+      },
+    })
+    routes[`POST /api/studio/projects/${ID}/start`] = () => {
+      status = 'planning'
+      return {
+        status: 200,
+        body: {
+          project: project({ status: 'planning' }),
+          shots: [],
+          lines: [],
+          assets: [],
+          takes: [],
+          events: [],
+        },
+      }
+    }
+    mount(`/studio/p/${ID}/brief`)
+    fireEvent.click(await screen.findByRole('button', { name: /全自动开始/ }))
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === 'POST' && c.path.endsWith('/start'))).toBe(true),
+    )
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /全自动开始/ })).not.toBeInTheDocument(),
+    )
+    expect(screen.getByText(/导演 agent 正在工作/)).toBeInTheDocument()
+  })
+
+  test('brief page: empty brief keeps start disabled', async () => {
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: {
+        project: project({ brief: '   ' }),
+        shots: [],
+        lines: [],
+        assets: [],
+        takes: [],
+        events: [],
+      },
+    })
+    mount(`/studio/p/${ID}/brief`)
+    expect(await screen.findByRole('button', { name: /全自动开始/ })).toBeDisabled()
   })
 
   test('a 409 is explained by its code and a rev conflict reloads the project', async () => {

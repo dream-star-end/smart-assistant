@@ -100,6 +100,8 @@ export function BriefPage(props: {
   const [briefText, setBriefText] = useState(project.brief)
   const [budget, setBudget] = useState(project.budgetCredits)
   const [saving, setSaving] = useState(false)
+  const [starting, setStarting] = useState(false)
+  const [approving, setApproving] = useState(false)
 
   useEffect(() => {
     if (!editing) setBriefText(project.brief)
@@ -128,6 +130,38 @@ export function BriefPage(props: {
       toast(studioErrorText(err), 'error')
     }
   }
+
+  const startFilming = async () => {
+    if (!draft || !project.brief.trim() || starting) return
+    setStarting(true)
+    try {
+      await studioApi.start(auth, project.id)
+      await props.onReload()
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const approvePlan = async () => {
+    if (approving) return
+    setApproving(true)
+    try {
+      await studioApi.approve(auth, project.id)
+      await props.onReload()
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setApproving(false)
+    }
+  }
+
+  const awaitingReason =
+    typeof project.settings.awaitingReason === 'string' ? project.settings.awaitingReason : null
+  const canApprove =
+    project.status === 'awaiting_user' &&
+    (awaitingReason === 'approve_plan' || awaitingReason === 'budget')
 
   const remove = async () => {
     const ok = await confirm({
@@ -424,20 +458,54 @@ export function BriefPage(props: {
         </div>
 
         <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="st-btn st-btn-agent st-btn-lg"
-          style={{ width: '100%' }}
-          disabled
-          title="导演 agent 上线后可用"
-        >
-          <Zap />
-          全自动开始
-        </button>
-        <div className="st-cap" style={{ textAlign: 'center' }}>
-          导演 agent 即将上线；现在可以先调整需求、规格和预算。超出预算{' '}
-          {formatCredits(project.budgetCredits)} 时会自动暂停并问你。
-        </div>
+        {draft ? (
+          <>
+            <button
+              type="button"
+              className="st-btn st-btn-agent st-btn-lg"
+              style={{ width: '100%' }}
+              disabled={starting || saving || !project.brief.trim()}
+              title={!project.brief.trim() ? '请先写好影片需求' : undefined}
+              onClick={() => void startFilming()}
+            >
+              <Zap />
+              {starting ? '正在开拍…' : '全自动开始'}
+            </button>
+            <div className="st-cap" style={{ textAlign: 'center' }}>
+              开拍后导演 agent 会写分镜并开始生成。超出预算{' '}
+              {formatCredits(project.budgetCredits)} 时会自动暂停并问你。
+            </div>
+          </>
+        ) : canApprove ? (
+          <>
+            <button
+              type="button"
+              className="st-btn st-btn-agent st-btn-lg"
+              style={{ width: '100%' }}
+              disabled={approving}
+              onClick={() => void approvePlan()}
+            >
+              <Zap />
+              {approving
+                ? '确认中…'
+                : awaitingReason === 'budget'
+                  ? '预算已够，继续生成'
+                  : '确认方案，继续生成'}
+            </button>
+            <div className="st-cap" style={{ textAlign: 'center' }}>
+              {awaitingReason === 'budget'
+                ? '预估费用超过了当前预算，调高预算后再继续。'
+                : '分镜已写好，确认后导演 agent 开始生成镜头。'}
+            </div>
+          </>
+        ) : project.status === 'planning' ||
+          project.status === 'running' ||
+          project.status === 'composing' ? (
+          <div className="st-cap" style={{ textAlign: 'center' }}>
+            导演 agent 正在工作；超出预算 {formatCredits(project.budgetCredits)}{' '}
+            时会自动暂停并问你。
+          </div>
+        ) : null}
         <div className="st-row" style={{ gap: 8 }}>
           {project.status === 'running' || project.status === 'planning' ? (
             <button
