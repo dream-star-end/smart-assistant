@@ -13,7 +13,6 @@ import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentit
 import { CODEX_RELAY_PREFIX, CODEX_UPSTREAM_AUTH_HEADER, makeCodexRelayHandler } from '../http/internalCodexRelay.js'
 import type { PreCheckRedis } from '../billing/preCheck.js'
 import {
-  ImageDailyLimitError,
   beginImageUpstreamAttempt,
   finishImageUpstreamAttempt,
   getCompletedImageUsage,
@@ -380,7 +379,7 @@ describe('Image 2 exact billing', () => {
     )).rows[0]!.count, '1')
   })
 
-  test('enforces the UTC daily limit atomically', async (t) => {
+  test('admits past the former UTC daily count of 10 (OCV5-619)', async (t) => {
     if (skip(t)) return
     const userId = await user()
     for (let i = 0; i < 10; i++) {
@@ -390,10 +389,13 @@ describe('Image 2 exact billing', () => {
         [userId.toString(), `done:${i}`],
       )
     }
-    await assert.rejects(
-      reserveImageUsage(getPool(), { userId, containerId: null, requestId: 'image:eleven', operation: 'generation' }),
-      ImageDailyLimitError,
-    )
+    const eleventh = await reserveImageUsage(getPool(), {
+      userId,
+      containerId: null,
+      requestId: 'image:eleven',
+      operation: 'generation',
+    })
+    assert.equal(eleventh.alreadyCharged, false)
   })
 })
 

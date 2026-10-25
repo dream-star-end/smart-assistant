@@ -5,7 +5,7 @@
  * HTTP streaming are all request-shaped. Studio jobs have no container and no
  * incoming request, so this runner drives the same billing journey directly:
  *
- *   completed-cache replay → reserveImageUsage (daily limit, in-flight guard)
+ *   completed-cache replay → reserveImageUsage (in-flight guard; no daily count cap, OCV5-619)
  *   → preCheckExactCost → account pick / egress / token → attempt rows
  *   → upstream (one short 429 retry) → validate n images → settleImageCharge
  *
