@@ -349,6 +349,12 @@
       "reason": "OCV5-538: Box CC reap() matched fifo readers with a readlink fork per host process (seconds under load), so bridge closes waited out the 2 s stop-exec timeout; root cause of the flaky OCV5-488 LARGE_LINE_CLOSE / LARGE_LINE_REFUSED_HOST_LEFT_RUNNING gate failures. Latent, no user report; the close window and the proof are unchanged. Unit test red without the fix.",
       "approvedBy": "user 2026-10-21 via 管家 「留意 OCV5-488 … 请查清为什么关闭慢，绝不能放宽这个检查」; cc3 full design authority 2026-10-20 20:26; Incident: none waiver per the rules (cc3-arch2 session)",
       "expiresAt": "2026-11-20"
+    },
+    {
+      "commit": "42f4b65a807ededc8c8bc0c0e30ac2ccd4591b65",
+      "reason": "Aurora sync of selfhost OCV5-577 PR-B openCodeGoAuthHeaders x-opencode-session (e4108c3e7). Production TEXT_HTTP on community blog AI moderation was Go 400 MissingSessionID with no DeepSeek fallback on 400. Fix is protocol header only; platformFlashFallback.test.ts asserts UUID session header and keeps Go-400-no-fallback. No new incident: proofPending baseline is full (19/19); raising it would weaken the gate.",
+      "approvedBy": "butler executor t977u 2026-10-25; user authorized fix AI moderation TEXT_HTTP; Incident: none because unit-covered selfhost port and proofPending baseline saturated",
+      "expiresAt": "2026-11-25"
     }
   ]
 }
