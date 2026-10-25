@@ -460,6 +460,20 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
     expect(p.message).toContain("内部错误");
     expect(JSON.stringify(p)).not.toContain("API Error");
   });
+
+  test("OCV5-620: BOX_REPLAY_PENDING → 软收尾文案,保留部分回答,不粉红硬失败", () => {
+    const detail =
+      'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+    const p = errorPresentation(
+      "engine_error",
+      "博客大纲已写完，正在排版。\n\n[turn failed: BOX_REPLAY_PENDING]",
+      detail,
+    );
+    expect(p.title).toBe("结果正在收尾");
+    expect(p.message).toContain("不会重复扣费");
+    expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+    expect(JSON.stringify(p)).not.toContain("任务执行失败");
+  });
 });
 
 
