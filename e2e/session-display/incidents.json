@@ -8238,6 +8238,43 @@
           "assertion": "first-send cost confirmation keeps the draft and commits solo only after acceptance"
         }
       ]
+    },
+    {
+      "id": "INC-20261025-SWITCH-COST-UX",
+      "occurredAt": "2026-10-25",
+      "severity": "P1",
+      "symptom": "OCV5-614 Grok 过度防御审计 N1/N2：费用服务暂不可用被当成确认拒绝，恢复任务暂停、客户端消息误标重新确认。D1/D2/D3 按用户 t965u 与 2026-10-25 START 已定体验口径收窄。隔离 fixture 证明旧协作冲突路径无法自动保存本次选择、新路径重读并重存一次；无生产写入，未声称真实用户资金损失。D4 因 alt 同样提交 quoteToken 铸 consent 按条件不改。",
+      "rootFixCommit": "876514a7",
+      "coverageCommits": [
+        "876514a7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostGuard.test.ts",
+          "assertion": "refusal pauses for confirmation while unavailable errors fail closed and requeue"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCostHttp.test.ts",
+          "assertion": "cost API returns 503 for unavailable pricing and preserves user-action statuses"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/modelSwitchCost.test.ts",
+          "assertion": "expected-cost boundary gates quote, confirmation and dispatch without relaxing consent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/modelSwitchCostDispatch.test.ts",
+          "assertion": "transient cost failure keeps queued payload and permits a later authorized retry"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-210-advisor-dual-app.node-test.mjs",
+          "assertion": "one collaboration conflict saves the clicked solo mode without asking again"
+        }
+      ]
     }
   ]
 }
