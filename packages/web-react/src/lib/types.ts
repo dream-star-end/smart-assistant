@@ -1369,6 +1369,9 @@ export type CommunityTutorialSummary = {
   authorName: string;
   publishedAt: string;
   kind?: TutorialKind;
+  /** 正文第一张图（封面）；没有图为 null。 */
+  coverSha?: string | null;
+  readMinutes?: number;
 };
 
 export type CommunityTutorialDetail = CommunityTutorialSummary & {
@@ -1392,13 +1395,36 @@ export type CommunityTutorialMine = {
   kind?: TutorialKind;
   snapshot?: TutorialSnapshotPayload | null;
   artifacts?: TutorialArtifact[];
+  /** pending 且在等人工（AI 拿不准、出错或审核关闭）。 */
+  needsHuman?: boolean;
+  reviewSource?: "human" | "ai" | null;
+  viewCount?: number;
+  coverSha?: string | null;
+  readMinutes?: number;
+  /** 正文版本：改过再审或修改通过时 +1。 */
+  contentVersion?: number;
+  /** 已发布帖最近一次修改（在审或没通过）；线上仍是旧版。 */
+  edit?: CommunityTutorialEdit | null;
+};
+
+export type CommunityTutorialEdit = {
+  id: string;
+  status: "pending" | "rejected";
+  needsHuman: boolean;
+  reviewNote: string | null;
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+  createdAt: string;
+  reviewedAt: string | null;
 };
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
   authorName: string;
   /** 审核时原样带回（p:<正文版本> / r:<修改稿 id>），作者中途改过服务端返回 409。 */
   reviewToken?: string;
-};;
+};
 
 export type CommunityTutorialReviseResult = {
   id: string;
@@ -1519,6 +1545,8 @@ export type BlogModerationRecord = BlogModeration & {
 export type CommunityTutorialPage<T> = {
   tutorials: T[];
   nextCursor: string | null;
+  /** 公开列表第一页带符合筛选的总篇数。 */
+  total?: number | null;
 };
 
 export type TutorialEvalSpec = {

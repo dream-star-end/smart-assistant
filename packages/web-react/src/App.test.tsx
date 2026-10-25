@@ -1,4 +1,3 @@
-import {fixtureSwitchQuote} from '../browser-tests/model-switch-cost-fixture.mjs';
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
@@ -20,7 +19,6 @@ loadBeforeAll(preloadToolBody)
 loadBeforeAll(() =>
   Promise.all([
     prefetchMarkdownImpl(),
-    import('./lib/modelSwitchCostClient'),
     import('./components/AgentPicker'),
     import('./components/GoalDialog'),
     import('./components/Landing'),
@@ -173,7 +171,6 @@ function routedFetch(over?: {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
-    if(method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init?.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
@@ -722,8 +719,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
     await screen.findAllByRole('menuitem')
-    // 573b7c88b (2026-09-22) retired the GPT-5.6 families on selfhost; nothing is collapsed by
-    // default any more, so the fixture's Terra row is directly in the menu.
+    // Commercial still serves the GPT-5.6 families: Terra/Luna live in the collapsed "更多 GPT 模型"
+    // group (selfhost retired them in 573b7c88b, so its copy of this case has no group to open).
+    const collapsed = document.querySelector('[data-collapsed-group]')
+    expect(collapsed).toBeTruthy()
+    if (collapsed) fireEvent.click(collapsed)
     const modelTarget = (await screen.findAllByRole('menuitem'))
       .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     expect(modelTarget).toBeTruthy()
@@ -1585,7 +1585,6 @@ function routedFetchTwoSessions() {
   setAuthHint()
   return vi.fn(async (url: string,init?:RequestInit) => {
     const u = String(url)
-    if(init?.method==='POST'&&/\/api\/me\/sessions\/[^/]+\/model-switch-estimate$/.test(u))return okJson(fixtureSwitchQuote(JSON.parse(String(init.body??'{}'))))
     if (u.includes('/api/auth/refresh')) return REFRESH_OK
     if (u.includes('/api/public/models')) return okJson(MODELS)
     if (u.includes('/api/sessions/list')) return okJson(HIST_META_TWO)
@@ -2065,7 +2064,11 @@ describe('Aurora v5 — 项目主页(P1 review)', () => {
     // 当前会话换到 Terra(B)；全局默认仍是首个模型 Sol(A)。
     const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
-    const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
+    // Commercial keeps Terra in the collapsed "更多 GPT 模型" group (selfhost retired the family).
+    const collapsedGroup = document.querySelector('[data-collapsed-group]')
+    expect(collapsedGroup).toBeTruthy()
+    if (collapsedGroup) fireEvent.click(collapsedGroup)
+const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     await act(async () => {
       fireEvent.click(terra!)
     })

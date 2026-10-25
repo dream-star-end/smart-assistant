@@ -6837,7 +6837,7 @@ smoke() {
   #   logLevelSync(2026-10-22 selfhost OCV5-559 第三阶段 P1:index.ts trackScheduler("logLevelSync","local"),
   #     每 5 秒读 system_settings.log_level 一行并调整本进程日志级别;纯进程内、不写库。名单与
   #     trackScheduler 同批更新)
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview tutorialModeration providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
   allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep cursorExternalApiOutbox logLevelSync"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
