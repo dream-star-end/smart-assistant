@@ -465,7 +465,7 @@ export function ImageStudioPage(props: {
           </div>
           <div>
             <div className="st-label" style={{ marginBottom: 8 }}>
-              模型 · agent 自动选择
+              模型 · Muse / GPT 可选（agent 自动选可用）
             </div>
             {imageKind.providers.length === 0 ? (
               <div className="st-card st-model-row" data-state="unconfigured">

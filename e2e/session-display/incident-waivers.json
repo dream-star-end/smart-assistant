@@ -361,6 +361,12 @@
       "reason": "OCV5-593 FE-4: Brief「全自动开始」was intentionally FE-disabled while director POST /start|/approve was already live (media-e2e draft→planning). Wire the button and approve path; not an incident fix. StudioApp unit covers enablement; raising proofPending baseline forbidden.",
       "approvedBy": "user widget t983s6206 「商业发」2026-10-25; butler executor fixing missing Incident trailer before merge (Codex r2 + Grok OD already APPROVED on content)",
       "expiresAt": "2026-11-25"
+    },
+    {
+      "commit": "2896189a60ccd5d283792f0afc63dadd6162bf59",
+      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Studio already dual gpt-image/muse-image; label-only clarify. Not an incident fix. image2Run integ admits 11th; ImageStudio unit. Raising proofPending baseline forbidden.",
+      "approvedBy": "user/steward t990u-t991u 2026-10-25 no GPT image daily limit + Muse/GPT optional; butler executor fixing missing Incident trailer on draft PR #1110 (no merge/ship)",
+      "expiresAt": "2026-11-25"
     }
   ]
 }
