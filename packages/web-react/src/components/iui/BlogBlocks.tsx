@@ -161,10 +161,9 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
   ) : (
     <span className="oc-iui-chip">未投稿</span>
   );
-  const subtitle = `${CATEGORY_LABEL[spec.category]} · 约 ${blogReadMinutes(spec.body)} 分钟${images.length > 0 ? ` · ${images.length} 张图` : ""}`;
+  // 分类/时长只放在纸面 BlogChips，避免 Frame subtitle 与纸面 chips 在窄屏叠字。
   return (
-    <Frame kind="blog_draft" title={`经验分享草稿 · v${spec.version}`} subtitle={subtitle} notes={notes} streaming={streaming} nested={nested} actions={status}>
-      {spec.note && <p className="oc-blog-chat-note">本版改动：{spec.note}</p>}
+    <Frame kind="blog_draft" title={`经验分享草稿 · v${spec.version}`} notes={notes} streaming={streaming} nested={nested} actions={status}>
       <DraftPreview spec={spec} />
       {!actions && navigation && !readOnly && !streaming && <div className="oc-blog-chat-actions">
         {images.length === 0 && <Button variant="secondary" onClick={() => navigation.openEditor(payloadOf(spec, spec.body))}>在编辑器里改</Button>}
@@ -175,14 +174,20 @@ export function BlogDraftBlock({ spec, notes, streaming, readOnly, nested }: Blo
       ) : superseded ? (
         <p className="oc-blog-chat-hint">下面有更新的版本（v{latest}），请在新版本上确认。</p>
       ) : !actions ? (
-        <p className="oc-blog-chat-hint">{readOnly ? "这是一份经验分享草稿。" : "在网页对话里登录后可以一键投稿；也可以复制 Markdown，到「经验分享 → 写一篇经验」粘贴。"}</p>
+        <p className="oc-blog-chat-hint">
+          {readOnly
+            ? "这是一份经验分享草稿。"
+            : navigation
+              ? "投稿按钮暂不可用（登录态还在确认）。可先复制 Markdown，到「经验分享 → 写一篇经验」粘贴；或稍候刷新后再试。"
+              : "在网页对话里登录后可以一键投稿；也可以复制 Markdown，到「经验分享 → 写一篇经验」粘贴。"}
+        </p>
       ) : (
         <>
           <Issues state={check} canAsk={canAsk} fixSent={fixSent} onFix={sendFix} onRetry={runCheck} />
           {submit.kind === "error" && <p className="oc-blog-chat-error" role="alert">{submit.message}</p>}
         </>
       )}
-      <div className="oc-blog-chat-actions">
+      <div className="oc-blog-chat-actions" data-testid="blog-draft-actions">
         {interactive && (
           <Button variant="accent" disabled={check.kind !== "ready" || blocking.length > 0 || working} onClick={() => setConfirmOpen(true)}>
             确认投稿
@@ -256,7 +261,10 @@ function DraftPreview({ spec }: { spec: BlogDraftSpec }) {
   );
   return (
     <div className={expanded ? "oc-blog-chat-paper is-expanded" : "oc-blog-chat-paper"}>
-      <BlogChips category={spec.category} minutes={blogReadMinutes(spec.body)} approx />
+      <div className="oc-blog-chat-chips">
+        <BlogChips category={spec.category} minutes={blogReadMinutes(spec.body)} approx />
+      </div>
+      {spec.note && <p className="oc-blog-chat-note">本版改动：{spec.note}</p>}
       <h3 className="oc-blog-chat-title">{spec.title}</h3>
       {spec.summary && <p className="oc-blog-chat-summary">{spec.summary}</p>}
       <div className="oc-blog-chat-body blog-prose">
