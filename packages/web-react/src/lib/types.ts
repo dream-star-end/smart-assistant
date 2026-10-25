@@ -318,6 +318,10 @@ export type PublicConfig = {
   featureRemoteSsh: boolean;
   featureImage2: boolean;
   allowRegistration: boolean;
+  /** 经验分享（OCV5-577）：图片上传与带图投稿是否开启。旧后端缺省 false。 */
+  featureCommunityBlog?: boolean;
+  /** 经验分享投稿是否先走 AI 自动审核（OC_TUTORIAL_AI_MODERATION=on）。 */
+  featureCommunityBlogAiReview?: boolean;
 };
 
 /**
@@ -1392,6 +1396,15 @@ export type CommunityTutorialMine = {
 
 export type CommunityTutorialPending = CommunityTutorialMine & {
   authorName: string;
+  /** 审核时原样带回（p:<正文版本> / r:<修改稿 id>），作者中途改过服务端返回 409。 */
+  reviewToken?: string;
+};;
+
+export type CommunityTutorialReviseResult = {
+  id: string;
+  mode: "inplace" | "pending";
+  revisionId: string;
+  contentVersion: number;
 };
 
 export type CommunityTutorialDraft = {
@@ -1438,6 +1451,69 @@ export type TutorialSnapshotSubmitResult = {
     sanitizerVersion?: string;
   };
   leakReport?: TutorialLeakReport | null;
+};
+
+export type CommunityBlogPrecheckIssue = {
+  code: string;
+  level: "block" | "warn";
+  field: string;
+  message: string;
+  where?: string;
+};
+
+export type CommunityBlogPrecheck = {
+  issues: CommunityBlogPrecheckIssue[];
+  quota: { pendingLeft: number; dailyLeft: number };
+};
+
+export type TutorialImageUpload = {
+  sha256: string;
+  mime: string;
+  bytes: number;
+  width: number;
+  height: number;
+};
+
+export type BlogModerationDimension = "violation" | "ad" | "leak" | "low_quality";
+
+/** 一次 AI 审核结论（PR-B）。 */
+export type BlogModeration = {
+  verdict: "pass" | "reject" | "uncertain" | "error";
+  mode: "shadow" | "on";
+  applied: boolean;
+  categories: Partial<
+    Record<BlogModerationDimension, { choice: string | null; confidence: number | null; yes: number | null }>
+  >;
+  images?: Array<{ sha256: string; violation: string | null; ad: string | null; confidence: number | null }>;
+  reason: string | null;
+  adminNote: string | null;
+  injection?: boolean;
+  createdAt: string;
+};
+
+/** 管理端「经验分享」列表行。 */
+export type AdminBlogPost = CommunityTutorialPending & {
+  imageCount?: number;
+  bodyChars?: number;
+  moderation?: BlogModeration | null;
+  /** 已发布帖的修改稿（内容是修改稿的，线上仍是旧版）。 */
+  editId?: string | null;
+};
+
+export type BlogModerationStats = {
+  mode: "off" | "shadow" | "on";
+  vision: boolean;
+  today: { autoApproved: number; autoRejected: number; toHuman: number };
+};
+
+export type BlogModerationRecord = BlogModeration & {
+  id: string;
+  publicationId: string;
+  title: string;
+  authorName: string;
+  postStatus: CommunityTutorialStatus;
+  /** 判的是已发布帖的一份修改稿。 */
+  revisionId?: string | null;
 };
 
 export type CommunityTutorialPage<T> = {

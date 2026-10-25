@@ -137,6 +137,9 @@ export const KIND_ICON_SOURCES = {
   bili_comments: "users",
   bili_danmaku: "chart-bar-big",
   bili_subtitle: "book-open",
+  blog_draft: "pen-line",
+  blog_status: "list-checks",
+  blog_published: "book-open",
 } as const satisfies Record<string, LucideName>;
 
 /** 组件内部控件用、别处没有引过的图标(同样走生成的形状数据,不进首屏)。 */

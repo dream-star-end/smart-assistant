@@ -190,7 +190,10 @@
     "0319_commercial_muse_billing",
     "0322_minimax_voices",
     "0323_turn_dispatches_trace_id",
-    "0324_media_studio"
+    "0324_media_studio",
+    "0326_community_blog",
+    "0327_community_tutorial_moderation",
+    "0328_community_tutorial_revisions"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -4,6 +4,8 @@
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
+import type { BlogDraft } from "../components/tutorials/blog/blogLib";
+import { tutorialHref } from "./useAppRoute";
 import { useCallback, useMemo } from "react";
 import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
@@ -38,6 +40,11 @@ function replyQuoteText(message: ChatMessage): string {
   return media.length > 0 ? "[附件]" : "";
 }
 
+export type BlogOpenTarget =
+  | { kind: "post"; id: string }
+  | { kind: "mine" }
+  | { kind: "editor"; seed: BlogDraft };
+
 export type ChatCardActionsInput = {
   activeId: string | undefined;
   agent: Agent;
@@ -50,6 +57,9 @@ export type ChatCardActionsInput = {
   messageFeedbackTriggerRef: React.RefObject<HTMLElement | null>;
   newSession: () => void;
   openManage: (tab: ManageTab) => void;
+  /** 经验分享开关（feature_community_blog）；关时对话卡只读。 */
+  communityBlogEnabled: boolean;
+  openBlog: (target: BlogOpenTarget) => void;
   openPane: (tab?: PaneTab | undefined, message?: ToolLike | null | undefined) => void;
   openSettings: (section?: SettingsDestinationSection) => void;
   regenerate: () => Promise<void>;
@@ -85,6 +95,8 @@ export function useChatCardActions({
   messageFeedbackTriggerRef,
   newSession,
   openManage,
+  communityBlogEnabled,
+  openBlog,
   openPane,
   openSettings,
   regenerate,
@@ -197,8 +209,37 @@ export function useChatCardActions({
                   },
                 }
               : {}),
+            ...(communityBlogEnabled && authRef.current.snapshot().token
+              ? {
+                  communityBlog: {
+                    precheck: (draft: BlogDraft) =>
+                      api.precheckCommunityTutorial(authRef.current, draft),
+                    readContainerImage: async (path: string) => {
+                      const url = (await api.mediaSign(authRef.current, [path])).urls[path];
+                      if (!url) throw new Error("图片签名失败");
+                      const res = await fetch(url);
+                      if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
+                      return res.blob();
+                    },
+                    uploadImage: (image: Blob) => api.uploadTutorialImage(authRef.current, image),
+                    submit: (draft: BlogDraft) => api.submitCommunityTutorial(authRef.current, draft),
+                    getMine: (id: string) => api.getMyCommunityTutorial(authRef.current, id),
+                    postUrl: (id: string) =>
+                      `${window.location.origin}${tutorialHref(window.location, null, null, id, { tab: "blog" })}`,
+                    openPost: (id: string) => {
+                      if (authRef.current.snapshot().token) openBlog({ kind: "post", id });
+                    },
+                    openMine: () => {
+                      if (authRef.current.snapshot().token) openBlog({ kind: "mine" });
+                    },
+                    openEditor: (seed: BlogDraft) => {
+                      if (authRef.current.snapshot().token) openBlog({ kind: "editor", seed });
+                    },
+                  },
+                }
+              : {}),
           },
-    [demo, openManage, setBoardOpen],
+    [demo, openManage, setBoardOpen, communityBlogEnabled, openBlog],
   );
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),

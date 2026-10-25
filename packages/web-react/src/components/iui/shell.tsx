@@ -447,6 +447,9 @@ const SKELETON_HEIGHT: Record<string, number> = {
   bili_comments: 320,
   bili_danmaku: 260,
   bili_subtitle: 300,
+  blog_draft: 420,
+  blog_status: 180,
+  blog_published: 220,
 };
 
 export function Skeleton({ kind }: { kind?: string }) {

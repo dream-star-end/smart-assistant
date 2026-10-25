@@ -1180,12 +1180,16 @@ export const api = {
       feature_remote_ssh: boolean;
       feature_image2: boolean;
       allow_registration: boolean;
+      feature_community_blog?: boolean;
+      feature_community_blog_ai_review?: boolean;
     }>(fetch("/api/public/config", { headers: { Accept: "application/json" } })).then((b) => ({
       turnstileSiteKey: b.turnstile_site_key,
       turnstileBypass: b.turnstile_bypass,
       requireEmailVerified: b.require_email_verified,
       featureRemoteSsh: b.feature_remote_ssh,
       featureImage2: b.feature_image2,
+      featureCommunityBlog: b.feature_community_blog === true,
+      featureCommunityBlogAiReview: b.feature_community_blog_ai_review === true,
       allowRegistration: b.allow_registration,
     })),
 

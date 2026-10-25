@@ -57,14 +57,19 @@ import {
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import {
+  handleAdminListCommunityTutorials,
+  handleAdminListTutorialModerations,
   handleAdminPendingCommunityTutorials,
+  handleAdminTutorialModerationStats,
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
   handleListOwnCommunityTutorials,
+  handlePrecheckCommunityTutorial,
   handleSubmitCommunityTutorial,
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
-  handleWithdrawCommunityTutorial,
+  handleUploadTutorialImage,
+  handleTutorialUserPost,
 } from '../tutorials/communityTutorialRoutes.js'
 import { handleGetTutorialBlob, handleGetTutorialEmbed } from '../tutorials/tutorialBlobRoutes.js'
 import {
@@ -871,10 +876,23 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/tutorials/mine',
       handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
     },
+    // 对话写博客的草稿卡预检：只读，不投稿。exact 路由，优先于下面的 POST 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/precheck',
+      handler: (req, res) => handlePrecheckCommunityTutorial(req, res, deps),
+    },
+    // 经验分享图片上传（原始字节）。exact 路由优先于下面的 POST `/api/tutorials/` 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/images',
+      handler: (req, res) => handleUploadTutorialImage(req, res, deps),
+    },
+    // 撤回 `/:id/withdraw` 与修改 `/:id/revise`。
     {
       method: 'POST',
       pathPrefix: '/api/tutorials/',
-      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
+      handler: (req, res) => handleTutorialUserPost(req, res, deps),
     },
     {
       method: 'GET',
@@ -895,6 +913,21 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/admin/tutorials/pending',
       handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials',
+      handler: (req, res) => handleAdminListCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderation-stats',
+      handler: (req, res) => handleAdminTutorialModerationStats(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderations',
+      handler: (req, res) => handleAdminListTutorialModerations(req, res, deps),
     },
     {
       method: 'GET',

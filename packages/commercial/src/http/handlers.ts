@@ -123,6 +123,8 @@ import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
 import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 import type { StudioHttpDeps } from '../media-studio/http.js'
+import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
+import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 
 export interface CommercialHttpDeps {
   literatureSetup?: LiteratureSetupService
@@ -1360,6 +1362,9 @@ export async function handleGetPublicConfig(
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,
     feature_image2: process.env.OC_IMAGE2_ENABLED === "true",
+    // OCV5-577 经验分享：默认关（未设 OC_COMMUNITY_BLOG_ENABLED / 非 1|true → false）
+    feature_community_blog: communityBlogEnabled(),
+    feature_community_blog_ai_review: tutorialModerationMode() === "on",
     // system_settings.allow_registration 透传给前端。关停时前端要:
     //   1) 在 register tab 展示 banner + disable 表单 + 不挂 Turnstile
     //   2) 在 login tab 隐藏"立即注册"导航链接(LDC SSO 按钮保留 — 老用户登录用)

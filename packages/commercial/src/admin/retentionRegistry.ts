@@ -250,6 +250,13 @@ export const DURABLE_TABLES: readonly string[] = [
   "chat_projects",
   "client_session_live_streams",
   "community_tutorials",
+  // 0327 经验分享 AI 审核:作业(每篇一行)与判定记录,FK community_tutorials ON DELETE CASCADE,
+  // 随稿件离场;稿件本身无基于时间的清理。
+  "community_tutorial_moderation_jobs",
+  "community_tutorial_moderations",
+  // 0328 经验分享修改记录与修改稿图片：FK community_tutorials / 修改稿 ON DELETE CASCADE，随稿件离场。
+  "community_tutorial_revisions",
+  "community_tutorial_revision_images",
   "cursor_external_usage_audit",
   "inbox_message_audience_snapshots",
   "ocr_jobs",
@@ -267,6 +274,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "turn_tape_materialization_jobs",
   "turn_tape_settlement_jobs",
   "tutorial_blob_refs",
+  // 0326 经验分享图片上传者(FK tutorial_blobs/users ON DELETE CASCADE),随 blob 离场。
+  "tutorial_blob_uploads",
   "tutorial_blobs",
   "tutorial_case_specs",
   "tutorial_compass_notes",

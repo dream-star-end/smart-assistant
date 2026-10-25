@@ -31,6 +31,7 @@ import {
   Mic,
   Monitor,
   Paperclip,
+  PenLine,
   Plug,
   Quote,
   Rocket,
@@ -87,6 +88,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import type { AuthSession } from "../lib/types";
 import { CASE_PRESENTATION, CaseArtwork } from "./tutorials/CaseArtwork";
 import { CommunityTutorials } from "./tutorials/CommunityTutorials";
+import { type BlogViewRequest, CommunityBlog } from "./tutorials/blog/CommunityBlog";
 import { CaseShowroom, ShowcaseDetail } from "./tutorials/CaseShowroom";
 import { showcaseById } from "../lib/tutorialShowcase";
 import { TutorialReplay } from "./tutorials/TutorialReplay";
@@ -102,7 +104,8 @@ import {
 import { HERO_SURFACE_CLASS } from "./tutorials/heroTheme";
 
 /** 教程中心一级页签。`showcase` 是默认态;后两者可经 `?panel=help&tab=` 深链(TU-17)。 */
-export type TutorialBrowseView = "showcase" | "start" | "cases";
+/** `blog` = 经验分享（OCV5-577），文章详情复用 communityId。 */
+export type TutorialBrowseView = "showcase" | "start" | "cases" | "blog";
 
 const ICONS: Record<string, LucideIcon> = {
   message: MessageCircle,
@@ -234,6 +237,8 @@ export function TutorialCenter({
   signatureWorkId: signatureWorkIdProp,
   onSignatureWorkChange,
   stepIndex = null,
+  blogEnabled = true,
+  blogRequest = null,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
@@ -265,11 +270,20 @@ export function TutorialCenter({
   sending?: boolean;
   sessionTitle?: string;
   sessionProjectId?: string | null;
+  /**
+   * 「经验分享」页签是否出现（OCV5-577）。App 按 /api/public/config 的 feature_community_blog 传入：
+   * 商业版默认关；关闭时页签隐藏，`tab=blog` 深链回落到案例展厅。缺省 true 只为 ui-preview 与旧测试。
+   */
+  blogEnabled?: boolean;
+  /** 对话里的经验分享卡请求打开「我的投稿」或带草稿的编辑器（nonce 变化即执行一次）。 */
+  blogRequest?: BlogViewRequest | null;
 }) {
-  const [communityOpen, setCommunityOpen] = useState(!!communityId);
+  // 经验分享的文章详情也走 communityId，但它属于 blog 页签，不打开教程工作室。
+  const [communityOpen, setCommunityOpen] = useState(!!communityId && browseViewProp !== "blog");
   // 页签与精选作品选中态:传了受控 prop 就以 prop 为准(App 镜像到 URL,TU-17),否则用内部 state。
   const [browseViewState, setBrowseViewState] = useState<TutorialBrowseView>("showcase");
-  const browseView = browseViewProp ?? browseViewState;
+  const requestedView = browseViewProp ?? browseViewState;
+  const browseView: TutorialBrowseView = !blogEnabled && requestedView === "blog" ? "showcase" : requestedView;
   const setBrowseView = (view: TutorialBrowseView) => {
     if (browseViewProp === undefined) setBrowseViewState(view);
     onBrowseViewChange?.(view);
@@ -283,7 +297,9 @@ export function TutorialCenter({
     onSignatureWorkChange?.(id);
   };
   const mode =
-    communityId || communityOpen
+    browseView === "blog" && !topicId && !caseId && !communityOpen
+      ? "blog"
+      : (communityId && requestedView !== "blog") || communityOpen
       ? "community"
       : topicId
         ? "features"
@@ -304,6 +320,7 @@ export function TutorialCenter({
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const tabStripRef = useRef<HTMLDivElement>(null);
   const detailRef = useRef<HTMLElement>(null);
   // 切视图 / 切篇回到顶部;带 `?step=` 深链打开功能教程时改为把目标步骤滚到顶并落焦点(TU-17),
   // 键盘 / 读屏用户从链接进来直接停在那一步;越界的 step 找不到节点,自然回退到顶部。
@@ -326,6 +343,13 @@ export function TutorialCenter({
     }, 0);
     return () => window.clearTimeout(timer);
   }, [mode, caseId, topicId, communityId, stepIndex]);
+
+  // 窄屏页签横滚:第四个「经验分享」默认在可视区外,切到它时滚进来。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mode 变化 = 当前页签变化,要在那之后重新定位
+  useEffect(() => {
+    const active = tabStripRef.current?.querySelector<HTMLElement>('[aria-current="page"]');
+    active?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [mode]);
 
   const feature = capabilityById(selectedTopicId);
   const topic = tutorialById(selectedTopicId);
@@ -360,11 +384,12 @@ export function TutorialCenter({
       setSignatureWorkIdState(null);
       return;
     }
-    if (communityId) setCommunityOpen(true);
+    // 请求的是 blog 页签时 communityId 是文章 id：开关关闭也不能把它当教程工作室打开。
+    if (communityId && requestedView !== "blog") setCommunityOpen(true);
     if (!topicId) return;
     const timer = window.setTimeout(() => setProgress(markTutorialRead(topicId)), 900);
     return () => window.clearTimeout(timer);
-  }, [open, topicId, communityId]);
+  }, [open, topicId, communityId, requestedView]);
 
   useEffect(
     () => () => {
@@ -384,7 +409,7 @@ export function TutorialCenter({
       .catch(() => {});
   };
 
-  const clearToBrowse = (view: "showcase" | "start" | "cases") => {
+  const clearToBrowse = (view: "showcase" | "start" | "cases" | "blog") => {
     setQuery("");
     setCommunityOpen(false);
     setBrowseView(view);
@@ -396,6 +421,7 @@ export function TutorialCenter({
   const showShowroom = () => clearToBrowse("showcase");
   const showStart = () => clearToBrowse("start");
   const showCases = () => clearToBrowse("cases");
+  const showBlog = () => clearToBrowse("blog");
   // 「功能参考」页签(审计 TU-01):26 篇功能参考此前在导航里没有入口,只能从快速上手的链接绕进去。
   const showFeatures = () => {
     setQuery("");
@@ -412,7 +438,9 @@ export function TutorialCenter({
   };
 
   const headerCopy =
-    mode === "showcase" && signatureWork
+    mode === "blog"
+      ? { title: "经验分享", subtitle: "来自真实用户的使用经验，审核后公开" }
+      : mode === "showcase" && signatureWork
       ? { title: signatureWork.title, subtitle: "精选作品 · 可交互 · 非完整会话回放" }
       : mode === "showcase" || (mode === "cases" && selectedShowcase)
         ? { title: "案例展厅", subtitle: "先看成果，再做一个你的版本" }
@@ -452,7 +480,7 @@ export function TutorialCenter({
           <header className="relative z-10 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2.5 border-b border-border/80 bg-surface/80 px-3 py-3 backdrop-blur-xl sm:px-5 lg:min-h-[68px] lg:flex-nowrap lg:py-2.5">
             <div className="order-1 flex min-w-0 flex-1 items-center gap-3 lg:w-[248px] lg:flex-none">
               <span className={cn("tut-mark flex size-10 shrink-0 items-center justify-center rounded-[14px] text-white", mode === "cases" ? "bg-accent" : "bg-grad-cta")}>
-                <GraduationCap size={19} />
+                {mode === "blog" ? <PenLine size={19} /> : <GraduationCap size={19} />}
               </span>
               <div className="min-w-0">
                 <Dialog.Title className="truncate text-[16px] font-semibold tracking-tight text-fg sm:text-[17px]">
@@ -465,7 +493,7 @@ export function TutorialCenter({
             </div>
 
             <nav aria-label="案例与帮助" className="order-3 flex min-w-0 basis-full items-center justify-between gap-2 lg:order-2 lg:basis-auto lg:flex-1 lg:justify-start">
-              <div className="no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto rounded-full border border-border/70 bg-hover p-1">
+              <div ref={tabStripRef} className="no-scrollbar flex min-w-0 items-center gap-0.5 overflow-x-auto rounded-full border border-border/70 bg-hover p-1">
                 <ViewTab active={mode === "showcase" || (mode === "cases" && Boolean(selectedShowcase))} onClick={showShowroom} icon={Sparkles}>
                   案例展厅
                 </ViewTab>
@@ -475,12 +503,18 @@ export function TutorialCenter({
                 <ViewTab active={mode === "features"} onClick={showFeatures} icon={BookOpen}>
                   功能参考
                 </ViewTab>
+                {blogEnabled && (
+                  <ViewTab active={mode === "blog"} onClick={showBlog} icon={PenLine}>
+                    经验分享
+                    <span className="rounded-full bg-accent px-1.5 text-[10px] font-bold leading-4 text-accent-fg">新</span>
+                  </ViewTab>
+                )}
               </div>
               {/* 「帮助与创作」走 DropdownMenu 原语(审计 TU-03):原生 <details> 没有外点 / Esc 关闭,
                   也没有 menu 语义与方向键;Radix 版本这些都自带,与全站其它下拉一致。 */}
               <DropdownMenu modal={false}>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" shape="pill" className="shrink-0 text-muted hover:text-fg">
+                  <Button variant="ghost" size="sm" shape="pill" className={cn("shrink-0 text-muted hover:text-fg", mode === "blog" && "max-sm:hidden")}>
                     帮助与创作 <ChevronDown size={13} />
                   </Button>
                 </DropdownMenuTrigger>
@@ -591,7 +625,15 @@ export function TutorialCenter({
                   Dialog.Content 上把 overflow-hidden 的对话框撑出隐藏溢出,scrollIntoView 会把 header
                   顶出视口(审计 TU-23)。 */}
               <main ref={detailRef} className="tutorial-detail relative min-h-0 flex-1 overflow-y-auto">
-                {mode === "community" ? (
+                {mode === "blog" ? (
+                  <CommunityBlog
+                    auth={auth}
+                    onRequireLogin={onRequireLogin}
+                    detailId={communityId}
+                    onDetailIdChange={onCommunityChange}
+                    request={blogRequest}
+                  />
+                ) : mode === "community" ? (
                   <CommunityTutorials
                     auth={auth}
                     onRequireLogin={onRequireLogin}

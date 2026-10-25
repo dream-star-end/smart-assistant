@@ -36,3 +36,6 @@ packages/commercial/src/__tests__/usageReport.integ.test.ts
 packages/commercial/src/__tests__/responseRatings.integ.test.ts
 packages/commercial/src/__tests__/usersStats.integ.test.ts
 packages/commercial/src/__tests__/geminiGoCatalog.integ.test.ts
+packages/commercial/src/__tests__/communityBlog.integ.test.ts
+packages/commercial/src/__tests__/tutorialModeration.integ.test.ts
+packages/commercial/src/__tests__/tutorialRevisions.integ.test.ts

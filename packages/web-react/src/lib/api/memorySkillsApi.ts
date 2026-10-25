@@ -37,7 +37,11 @@ import type {
   AutoDreamOptimizerState,
   MemoryFileContent,
   PutMemoryFileResult,
-} from "../types";
+  CommunityBlogPrecheck,
+  TutorialImageUpload,
+  CommunityTutorialReviseResult,
+  TutorialKind,
+} from "../types";;;
 import {
   callWithRefresh,
   assertAuthResponseCurrent,
@@ -692,12 +696,15 @@ export const memorySkillsApi = {
     query?: string;
     category?: CommunityTutorialCategory | null;
     limit?: number;
+    /** 经验分享只列 markdown 投稿。 */
+    kind?: TutorialKind | null;
   }) => {
     const qs = new URLSearchParams();
     if (opts?.cursor) qs.set("cursor", opts.cursor);
     if (opts?.query) qs.set("q", opts.query);
     if (opts?.category) qs.set("category", opts.category);
     if (opts?.limit) qs.set("limit", String(opts.limit));
+    if (opts?.kind) qs.set("kind", opts.kind);
     const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
     return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
       fetch(`/api/tutorials${suffix}`),
@@ -757,4 +764,66 @@ export const memorySkillsApi = {
         }),
       ),
     ),
+
+  /** 对话写博客的草稿卡预检：只读，和投稿同一套确定性检查（不含 AI 审核）。 */
+  precheckCommunityTutorial: (a: AuthSession, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<CommunityBlogPrecheck>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/precheck", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ),
+
+  /** 我的某一篇投稿（作者本人）：状态、审核理由、正文。 */
+  getMyCommunityTutorial: (a: AuthSession, id: string) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialMine }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/mine/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ).then((result) => result.tutorial),
+
+  /** 经验分享图片上传：原始字节（前端已压成 webp）。 */
+  uploadTutorialImage: (a: AuthSession, file: Blob) =>
+    jsonOrThrow<{ image: TutorialImageUpload }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/images", {
+          method: "POST",
+          credentials: "include",
+          headers: { ...bearerHeaders(token), "Content-Type": file.type || "image/webp" },
+          body: file,
+        }),
+      ),
+    ).then((result) => result.image),
+
+  /** 作者/管理员读取未公开稿件里的图；返回 Blob。 */
+  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> => {
+    const res = await callWithRefresh(a, (token) =>
+      fetch(`/api/tutorials/images/${encodeURIComponent(sha256)}`, {
+        credentials: "include",
+        headers: bearerHeaders(token),
+      }),
+    );
+    if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
+    return res.blob();
+  },
+
+  /** 修改已投稿的经验分享：待审 / 未通过的改后重审；已发布的审核通过前线上仍是旧版。 */
+  reviseCommunityTutorial: (a: AuthSession, id: string, draft: CommunityTutorialDraft) =>
+    jsonOrThrow<{ tutorial: CommunityTutorialReviseResult }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/tutorials/${encodeURIComponent(id)}/revise`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify(draft),
+        }),
+      ),
+    ).then((result) => result.tutorial),
 }
