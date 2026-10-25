@@ -8,7 +8,10 @@ class State:
         self.jobs = queue.Queue(); self.results = {}; self.chunks = {}; self.heartbeats = {}
         self.cancel = set(); self.session = None; self.hellos = 0; self.gone = set(); self.auth_fails = 0
         self.ack_gone = set(); self.ack_flaky = {}; self.hb_delay = {}; self.acked = set()
-        self.limits = {"chunk_bytes": 4 * 1024 * 1024}
+        self.limits = {"chunk_bytes": 4 * 1024 * 1024, "source_chunk_bytes": 64}
+        # 0.5 source references: jid -> [bytes]; GETs that fail (503) or come back corrupted; the
+        # order of acks and source GETs, to prove downloads only start after the ack.
+        self.sources = {}; self.src_flaky = {}; self.src_corrupt = set(); self.events = []
         self.max_concurrency = None; self.session_unknown = False; self.poll_errors = 0; self.polls = 0
         self.done = threading.Condition()
 S = State()
@@ -26,6 +29,24 @@ class H(BaseHTTPRequestHandler):
             self.body(); self.send(401, {"error": {"code": "UNAUTHORIZED", "message": "bridge token rejected"}}); return False
         return True
     def do_GET(self):
+        parts = self.path.split("/")
+        if self.path.startswith(P + "/jobs/") and len(parts) == 8 and parts[6] == "sources":
+            if not self.auth(): return
+            if self.headers.get("X-Muse-Bridge-Session") != S.session:
+                return self.send(409, {"error": {"code": "SUPERSEDED", "message": "superseded"}})
+            jid, n = parts[5], int(parts[7])
+            S.events.append(("src", jid, self.headers.get("Range")))
+            if jid not in S.acked or self.headers.get("X-Job-Nonce") != "n-" + jid: return self.send(410)
+            if S.src_flaky.get(jid, 0) > 0:
+                S.src_flaky[jid] -= 1; return self.send(503, {"error": "flaky"})
+            data = S.sources[jid][n]
+            a, b = self.headers.get("Range", "bytes=0-").split("=")[1].split("-")
+            a = int(a); b = min(int(b) if b else len(data) - 1, len(data) - 1)
+            body = data[a:b + 1]
+            if jid in S.src_corrupt: body = bytes([body[0] ^ 1]) + body[1:]
+            self.send_response(206); self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (a, b, len(data))); self.end_headers()
+            return self.wfile.write(body)
         self.send(404 if self.path != "/healthz" else 200, {"ok": True})
     def do_POST(self):
         if not self.path.startswith(P + "/"):  # like the master: 404 before authentication
@@ -57,6 +78,7 @@ class H(BaseHTTPRequestHandler):
                 S.ack_flaky[jid] -= 1; return self.send(503, {"error": "flaky"})
             if jid in S.hb_delay and jid in S.acked:
                 import time; time.sleep(S.hb_delay[jid]); return self.send(410)
+            if jid not in S.acked: S.events.append(("ack", jid))
             S.acked.add(jid)
             S.heartbeats[jid] = S.heartbeats.get(jid, 0) + 1
             return self.send(200, {"cancel": jid in S.cancel})

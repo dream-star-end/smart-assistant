@@ -5,6 +5,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 
+import { MUSE_SOURCE_FAILED_TEXT, isMuseSourceFailure } from '../providers/museFailures.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
@@ -458,10 +459,25 @@ async function apply(
         } else if (d.ownerKind === 'line') {
           await client.query(`UPDATE studio_lines SET status = 'failed' WHERE id = $1`, [d.ownerId])
         }
+        // Name the cause when the last try was Muse failing on the image it carries (OCV5-591).
+        const last = await client.query<{
+          provider: string
+          op: string
+          error_code: string | null
+        }>(
+          `SELECT provider, op, error_code FROM studio_takes
+            WHERE project_id = $1 AND owner_kind = $2 AND owner_id = $3 AND status = 'failed'
+            ORDER BY created_at DESC LIMIT 1`,
+          [id, d.ownerKind, d.ownerId],
+        )
+        const lf = last.rows[0]
         await appendStudioEvent(client, id, 'provider.exhausted', {
           ownerKind: d.ownerKind,
           ownerId: d.ownerId,
-          message: '可用的服务都试过了，这一步需要你看一下。',
+          message:
+            lf && isMuseSourceFailure(lf.provider, lf.op, lf.error_code)
+              ? `${MUSE_SOURCE_FAILED_TEXT}，其它服务也试过了。这一步需要你看一下，可以稍后再试一次。`
+              : '可用的服务都试过了，这一步需要你看一下。',
         })
         if (d.ownerKind === 'bible') {
           // Nothing marks an asset as stuck and every frame waits on it: hand the project over.

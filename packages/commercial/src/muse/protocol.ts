@@ -23,6 +23,8 @@ export const MUSE_LIMITS = Object.freeze({
   chunk_bytes: 4 * MIB,
   source_max_bytes: 10 * MIB,
   max_source_images: 4,
+  /** One Range request when a bridge >= 0.5 downloads a source image (GET …/sources/:n). */
+  source_chunk_bytes: 256 * 1024,
 })
 
 export const POLL_HOLD_SEC = 25
@@ -36,6 +38,18 @@ export const SOURCE_UPLOAD_EXTRA_MS = 120_000
 /** A dispatched job not acked within this window was never started: requeue it. */
 export const ACK_TIMEOUT_MS = 20_000
 export const MAX_DISPATCH_ATTEMPTS = 3
+/**
+ * Bridges from this version get source images by reference and download them after the ack
+ * (GET /jobs/:id/sources/:n); older bridges keep receiving them inline in the poll response.
+ * Multi-MB inline claims were never acked through the CDN in production (OCV5-591, 0 of 12).
+ */
+export const SOURCE_REFS_MIN_BRIDGE: readonly [number, number, number] = [0, 5, 0]
+/**
+ * Total decoded source bytes per job while the connected bridge is older than 0.5 (inline only).
+ * Production claims of 3.1–3.9 MB were acked 0 of 12 times and a 217 KB one on its third
+ * dispatch; this keeps an inline claim under ~0.7 MB. Bridges >= 0.5 are not limited by it.
+ */
+export const INLINE_SOURCE_MAX_BYTES = 512 * 1024
 export const HEARTBEAT_LOST_MS = 60_000
 export const BRIDGE_ONLINE_MS = 60_000
 /** Defaults for the personal edition (one bridge slot); commercial overrides them through config. */
@@ -66,6 +80,7 @@ export const BRIDGE_ERROR_CODES: ReadonlySet<string> = new Set([
   'MUSE_INVALID_INPUT',
   'MUSE_CANCELLED',
   'MUSE_BRIDGE_LOST',
+  'MUSE_SOURCE_FETCH_FAILED',
 ])
 
 const ALLOWED_MIME: Record<MuseKind, ReadonlySet<string>> = {
@@ -197,6 +212,32 @@ export function parseSubmission(raw: unknown): MuseJobSpec {
     ...(sources.length ? { source_images: sources } : {}),
     ...(v.resume_snapshot_id ? { resume_snapshot_id: v.resume_snapshot_id } : {}),
   }
+}
+
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+
+/**
+ * True when a bridge of this version downloads source images itself: SemVer >= 0.5.0. A
+ * pre-release of 0.5.0 (0.5.0-rc.1) precedes 0.5.0 and stays inline; anything unparseable too.
+ * Same rule as the personal edition (#1102).
+ */
+export function bridgeFetchesSources(version: string | null): boolean {
+  const m = SEMVER_RE.exec(version ?? '')
+  if (!m) return false
+  const pre = m[4]
+  if (pre?.split('.').some((id) => /^0\d+$/.test(id))) return false
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])]
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== SOURCE_REFS_MIN_BRIDGE[i]) return v[i]! > SOURCE_REFS_MIN_BRIDGE[i]!
+  }
+  return pre === undefined
+}
+
+/** Decoded size of canonical base64 (parseSubmission and the studio adapter only produce that). */
+export function base64DecodedBytes(b64: string): number {
+  const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0
+  return (b64.length / 4) * 3 - pad
 }
 
 export function jobDeadlineMs(spec: MuseJobSpec): number {

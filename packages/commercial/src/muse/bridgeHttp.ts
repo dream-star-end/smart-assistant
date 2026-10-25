@@ -3,6 +3,7 @@
 //   POST /api/muse-bridge/v1/hello
 //   POST /api/muse-bridge/v1/poll                         (long-poll, ≤ POLL_HOLD_SEC)
 //   POST /api/muse-bridge/v1/jobs/:id/heartbeat           (first one = ack barrier)
+//   GET  /api/muse-bridge/v1/jobs/:id/sources/:n          (bridge >= 0.5, after the ack; Range)
 //   PUT  /api/muse-bridge/v1/jobs/:id/files/:idx/chunks/:n
 //   POST /api/muse-bridge/v1/jobs/:id/result
 //
@@ -85,6 +86,24 @@ async function readJson(req: IncomingMessage, maxBytes: number): Promise<Record<
     throw new MuseError(400, 'INVALID_JSON', 'body must be an object')
   }
   return v as Record<string, unknown>
+}
+
+/**
+ * One `bytes=a-b` / `bytes=a-` range within `size`; null for no Range header. Anything else
+ * (several ranges, suffix ranges, out of bounds) is 416: the bridge only ever asks for one.
+ */
+export function parseByteRange(
+  header: string | undefined,
+  size: number,
+): { start: number; end: number } | null {
+  if (header === undefined) return null
+  const m = /^bytes=(\d+)-(\d*)$/.exec(header.trim())
+  const start = m ? Number(m[1]) : Number.NaN
+  const end = m && m[2] !== '' ? Math.min(Number(m[2]), size - 1) : size - 1
+  if (!m || !Number.isSafeInteger(start) || start >= size || end < start) {
+    throw new MuseError(416, 'RANGE_NOT_SATISFIABLE', 'range not satisfiable')
+  }
+  return { start, end }
 }
 
 function sendErr(res: ServerResponse, err: MuseError, requestId: string): void {
@@ -221,6 +240,26 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           return
         }
         sendJson(res, 200, { job })
+        return
+      }
+
+      const src = /^\/jobs\/([^/]+)\/sources\/(\d+)$/.exec(sub)
+      if (src && method === 'GET') {
+        if (!JOB_ID_RE.test(src[1]!)) throw new MuseError(404, 'NOT_FOUND', 'not found')
+        const nonce = String(req.headers['x-job-nonce'] ?? '')
+        const source = deps.hub.source(src[1]!, nonce, Number(src[2]))
+        const size = source.data.length
+        const range = parseByteRange(req.headers.range, size)
+        const body = range ? source.data.subarray(range.start, range.end + 1) : source.data
+        res.statusCode = range ? 206 : 200
+        res.setHeader('Content-Type', 'application/octet-stream')
+        res.setHeader('Content-Length', String(body.length))
+        res.setHeader('Accept-Ranges', 'bytes')
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('X-Source-Sha256', source.sha256)
+        res.setHeader('X-Source-Bytes', String(size))
+        if (range) res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${size}`)
+        res.end(body)
         return
       }
 

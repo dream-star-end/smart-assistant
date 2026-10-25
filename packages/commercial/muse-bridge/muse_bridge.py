@@ -21,6 +21,7 @@ Source images (image editing, image-to-video) take two CLI calls, because
 --conversation-json as {"image": id} items ahead of the text.
 
 Protocol: POST /api/muse-bridge/v1/{hello,poll}, POST /jobs/<id>/heartbeat,
+GET /jobs/<id>/sources/<n> (0.5: source images by reference, fetched after the ack),
 PUT /jobs/<id>/files/<idx>/chunks/<n>, POST /jobs/<id>/result.
 See DESIGN-20261022-muse-media.md §3.
 """
@@ -50,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.4.0"
+BRIDGE_VERSION = "0.5.0"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -65,6 +66,7 @@ DEFAULT_LIMITS = {
     "chunk_bytes": 4 * MIB,
     "source_max_bytes": 10 * MIB,
     "max_source_images": 4,
+    "source_chunk_bytes": 256 * 1024,
 }
 HARD_LIMITS = {
     "image_max_bytes": 50 * MIB,
@@ -74,6 +76,7 @@ HARD_LIMITS = {
     "chunk_bytes": 8 * MIB,
     "source_max_bytes": 20 * MIB,
     "max_source_images": 8,
+    "source_chunk_bytes": 4 * MIB,
 }
 
 DEFAULT_TIMEOUT = {"image": 120, "video": 300}
@@ -258,6 +261,22 @@ class JobError(Exception):
         return body
 
 
+def _check_source_ref(item, limits, n):
+    if not isinstance(item, dict) or item.get("n") != n:
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 格式错误" % n)
+    size = item.get("bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 大小非法" % n)
+    if size > limits["source_max_bytes"]:
+        raise JobError("MUSE_INVALID_INPUT", "源图 %d 超过 %d MiB" % (n + 1, limits["source_max_bytes"] // MIB))
+    sha = item.get("sha256")
+    if not isinstance(sha, str) or not re.match(r"^[0-9a-f]{64}$", sha):
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] sha256 非法" % n)
+    if item.get("mime") not in ("image/png", "image/jpeg", "image/webp"):
+        raise JobError("MUSE_INVALID_INPUT", "源图只支持 png/jpg/webp")
+    return {"n": n, "bytes": size, "sha256": sha, "mime": item["mime"]}
+
+
 def _decode_source_image(item, limits, n):
     if not isinstance(item, dict) or not isinstance(item.get("base64"), str):
         raise JobError("MUSE_INVALID_INPUT", "source_images[%d] 格式错误" % n)
@@ -314,6 +333,16 @@ def validate_job(job, limits):
         if len(sources) > limits["max_source_images"]:
             raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
         out["source_images"] = [_decode_source_image(item, limits, n) for n, item in enumerate(sources)]
+    refs = job.get("source_refs")
+    if refs is not None:
+        # 0.5: the master sends references instead of inline data; fetched after the ack.
+        if sources:
+            raise JobError("MUSE_INVALID_INPUT", "source_images 与 source_refs 不能同时出现")
+        if not isinstance(refs, list) or not refs:
+            raise JobError("MUSE_INVALID_INPUT", "source_refs 必须是非空数组")
+        if len(refs) > limits["max_source_images"]:
+            raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
+        out["source_refs"] = [_check_source_ref(item, limits, n) for n, item in enumerate(refs)]
     snap = job.get("resume_snapshot_id")
     if snap is not None:
         if not isinstance(snap, str) or not SNAPSHOT_RE.match(snap):
@@ -609,7 +638,7 @@ class Client:
         self.session_id = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler())
 
-    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30):
+    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary=False):
         url = self.server + API_PREFIX + path
         hdrs = {
             "Authorization": "Bearer " + self._token,
@@ -655,6 +684,8 @@ class Client:
             return None
         if status >= 400:
             raise IOError("HTTP %d %s" % (status, path.split("/")[1] if "/" in path else path))
+        if binary:
+            return payload
         if not payload:
             return None
         return json.loads(payload.decode("utf-8"))
@@ -678,6 +709,14 @@ class Client:
 
     def heartbeat(self, job):
         return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
+
+    def get_source(self, job, n, start, end):
+        """Bytes start..end (inclusive) of source image n of an acked job (0.5)."""
+        return self._request(
+            "GET", "/jobs/%s/sources/%d" % (job["id"], n),
+            headers={"X-Job-Nonce": job["nonce"], "Range": "bytes=%d-%d" % (start, end)},
+            timeout=60, binary=True,
+        )
 
     def put_chunk(self, job, idx, n, chunk):
         self._request(
@@ -879,6 +918,8 @@ class Bridge:
                 hb.start()
             try:
                 job = validate_job(raw_job, limits)
+                if job.get("source_refs"):
+                    job["source_images"] = self.fetch_sources(client, job_ref, job["source_refs"], limits, cancel)
                 log.info("任务 %s 开始：%s", job["id"], job["kind"])
                 contract = runner.run(job, out_dir, cancel)
                 files = collect_outputs(contract, os.path.join(out_dir, "media"), job["kind"], limits)
@@ -910,6 +951,40 @@ class Bridge:
             self._track(runner, False)
             hb_stop.set()
             shutil.rmtree(out_dir, ignore_errors=True)
+
+    def fetch_sources(self, client, job_ref, refs, limits, cancel):
+        """Download every referenced source image in Range chunks; [(data, ext)] like inline ones.
+
+        A download that keeps failing ends the job with a normal (retryable) result instead of
+        leaving it to the master's timeouts. JobGone (the master reassigned the job) propagates.
+        """
+        step = limits["source_chunk_bytes"]
+        out = []
+        for ref in refs:
+            buf = bytearray()
+            while len(buf) < ref["bytes"]:
+                if cancel.is_set():
+                    raise JobError("MUSE_CANCELLED", "任务已被取消")
+                start = len(buf)
+                end = min(ref["bytes"], start + step) - 1
+                try:
+                    data = with_retries(lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e))
+                except (FatalAuth, JobGone):
+                    raise
+                except Exception as e:
+                    raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 下载失败：%s" % (ref["n"] + 1, redact(str(e), 120)),
+                                   retryable=True)
+                if not data or len(data) != end - start + 1:
+                    raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 下载长度不符" % (ref["n"] + 1), retryable=True)
+                buf += data
+            data = bytes(buf)
+            if hashlib.sha256(data).hexdigest() != ref["sha256"]:
+                raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 校验失败" % (ref["n"] + 1), retryable=True)
+            mime = sniff_mime(data[:16])
+            if mime != ref["mime"]:
+                raise JobError("MUSE_INVALID_INPUT", "源图 %d 类型与声明不符" % (ref["n"] + 1))
+            out.append((data, MIME_EXT[mime]))
+        return out
 
     def ack(self, client, job_ref):
         """First heartbeat for a new job. True only on a 200 from the master."""

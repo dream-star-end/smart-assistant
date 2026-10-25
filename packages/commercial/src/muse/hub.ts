@@ -26,6 +26,7 @@ import {
   BRIDGE_ONLINE_MS,
   DONE_RETAIN_MS,
   HEARTBEAT_LOST_MS,
+  INLINE_SOURCE_MAX_BYTES,
   JOB_DEADLINE_MS,
   JOB_ID_RE,
   MAX_DISPATCH_ATTEMPTS,
@@ -39,6 +40,8 @@ import {
   QUEUE_WAIT_MS,
   SNAPSHOT_ID_RE,
   SOURCE_UPLOAD_EXTRA_MS,
+  base64DecodedBytes,
+  bridgeFetchesSources,
   jobDeadlineMs,
   mimeAllowed,
   normalizeBridgeFailure,
@@ -101,6 +104,17 @@ interface HubJob {
   outcome: Outcome | null
   finishedAt: number
   waiters: Set<() => void>
+  /** Decoded source images, built on the first by-reference dispatch; dropped at finish. */
+  sources: MuseSource[] | null
+  /** Size of the last poll response that carried this job (logged when it is never acked). */
+  claimResponseBytes: number
+}
+
+/** A source image as a bridge >= 0.5 downloads it. */
+export interface MuseSource {
+  data: Buffer
+  sha256: string
+  mime: string
 }
 
 export interface MuseJobView {
@@ -125,7 +139,10 @@ export interface MuseWireJob {
   aspect_ratio: string | null
   image_format: string | null
   timeout_secs: number
+  /** Inline sources, for bridges older than 0.5 (null when there are none or they go by reference). */
   source_images: Array<{ base64: string }> | null
+  /** Bridges >= 0.5: download each with GET /jobs/:id/sources/:n after the ack. */
+  source_refs?: Array<{ n: number; bytes: number; sha256: string; mime: string }>
   resume_snapshot_id: string | null
   deadline_at: string
 }
@@ -357,6 +374,19 @@ export class MuseBridgeHub {
   undeliverable(jobId: string): void {
     const job = this.jobs.get(jobId)
     if (job && this.active.get(jobId) === job && job.state === 'dispatched') this.requeue(job)
+  }
+
+  /**
+   * One source image of an acked job, for a bridge >= 0.5 (GET /jobs/:id/sources/:n). Counts as a
+   * sign of life, like a heartbeat. Throws 410 when the job/nonce is stale or not acked yet.
+   */
+  source(jobId: string, nonce: string, n: number): MuseSource {
+    const job = this.requireRunning(jobId, nonce)
+    const all = this.sourcesOf(job)
+    const src = Number.isInteger(n) && n >= 0 ? all[n] : undefined
+    if (!src) throw new MuseError(404, 'NOT_FOUND', 'no such source image')
+    job.lastBeatAt = this.now()
+    return src
   }
 
   /** Ack (first heartbeat) and keep-alive. Throws 410 when the job/nonce is stale. */
@@ -606,6 +636,19 @@ export class MuseBridgeHub {
     if (!this.bridgeOnline()) {
       throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
     }
+    const version = this.session?.version ?? null
+    if (spec.source_images?.length && !bridgeFetchesSources(version)) {
+      // An older bridge only receives sources inline in the poll response, and large ones never
+      // get through to it: refuse now instead of failing a minute later as MUSE_BRIDGE_LOST.
+      const total = spec.source_images.reduce((n, b) => n + base64DecodedBytes(b), 0)
+      if (total > INLINE_SOURCE_MAX_BYTES) {
+        throw new MuseError(
+          413,
+          'MUSE_SOURCE_TOO_LARGE',
+          `source images total ${Math.ceil(total / 1024)} KiB; the connected Muse bridge (${version ?? 'unknown version'}) takes at most ${INLINE_SOURCE_MAX_BYTES / 1024} KiB until it is upgraded to 0.5`,
+        )
+      }
+    }
     // Reserve the queue slot, the per-account slot, the rate count and the credits synchronously,
     // before any await, so concurrent submissions cannot all pass the checks.
     if (this.queue.length + this.reservedTotal >= this.queueMax) {
@@ -737,6 +780,8 @@ export class MuseBridgeHub {
       outcome: null,
       finishedAt: 0,
       waiters: new Set(),
+      sources: null,
+      claimResponseBytes: 0,
     }
     this.jobs.set(id, job)
     this.queue.push(job)
@@ -850,9 +895,18 @@ export class MuseBridgeHub {
     for (const a of [...this.active.values()]) {
       if (a.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
         if (a.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
+          this.log.warn('muse_job_never_acked', {
+            jobId: a.id,
+            attempts: a.dispatchCount,
+            claimResponseBytes: a.claimResponseBytes,
+          })
           this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
         } else {
-          this.log.warn('muse_job_ack_timeout_requeued', { jobId: a.id, attempt: a.dispatchCount })
+          this.log.warn('muse_job_ack_timeout_requeued', {
+            jobId: a.id,
+            attempt: a.dispatchCount,
+            claimResponseBytes: a.claimResponseBytes,
+          })
           this.requeue(a)
         }
       } else if (a.state === 'running') {
@@ -988,6 +1042,7 @@ export class MuseBridgeHub {
     job.outcome = outcome
     job.finishedAt = this.now()
     job.spec = { ...job.spec, source_images: undefined }
+    job.sources = null
     this.active.delete(job.id)
     const qi = this.queue.indexOf(job)
     if (qi >= 0) {
@@ -1060,7 +1115,9 @@ export class MuseBridgeHub {
 
   private wire(job: HubJob): MuseWireJob {
     const s = job.spec
-    return {
+    const byRef =
+      Boolean(s.source_images?.length) && bridgeFetchesSources(this.session?.version ?? null)
+    const w: MuseWireJob = {
       id: job.id,
       nonce: job.nonce,
       kind: s.kind,
@@ -1069,10 +1126,38 @@ export class MuseBridgeHub {
       aspect_ratio: s.aspect_ratio ?? null,
       image_format: s.kind === 'image' ? (s.image_format ?? null) : null,
       timeout_secs: this.cliTimeoutSec[s.kind],
-      source_images: s.source_images?.length ? s.source_images.map((b) => ({ base64: b })) : null,
+      source_images:
+        s.source_images?.length && !byRef ? s.source_images.map((b) => ({ base64: b })) : null,
+      ...(byRef
+        ? {
+            source_refs: this.sourcesOf(job).map((src, n) => ({
+              n,
+              bytes: src.data.length,
+              sha256: src.sha256,
+              mime: src.mime,
+            })),
+          }
+        : {}),
       resume_snapshot_id: s.resume_snapshot_id ?? null,
       deadline_at: new Date(job.deadlineAt).toISOString(),
     }
+    job.claimResponseBytes = Buffer.byteLength(JSON.stringify({ job: w }))
+    return w
+  }
+
+  /** The job's source images, decoded once (submissions were validated as png/jpeg/webp). */
+  private sourcesOf(job: HubJob): MuseSource[] {
+    if (!job.sources) {
+      job.sources = (job.spec.source_images ?? []).map((b64) => {
+        const data = Buffer.from(b64, 'base64')
+        return {
+          data,
+          sha256: createHash('sha256').update(data).digest('hex'),
+          mime: sniffMime(data.subarray(0, 16)) ?? 'application/octet-stream',
+        }
+      })
+    }
+    return job.sources
   }
 }
 
