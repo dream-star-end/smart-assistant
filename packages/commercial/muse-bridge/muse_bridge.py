@@ -66,7 +66,7 @@ DEFAULT_LIMITS = {
     "chunk_bytes": 4 * MIB,
     "source_max_bytes": 10 * MIB,
     "max_source_images": 4,
-    "source_chunk_bytes": 1 * MIB,
+    "source_chunk_bytes": 256 * 1024,
 }
 HARD_LIMITS = {
     "image_max_bytes": 50 * MIB,
@@ -92,8 +92,6 @@ HEARTBEAT_DEFAULT = 15
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
-# Each Range request of a source download (0.5) gets this many tries before the job fails.
-SOURCE_FETCH_ATTEMPTS = 4
 BACKOFF_MAX = 60
 # Jobs this bridge runs at once: the smaller of --max-concurrency and the master's hello
 # `max_concurrency` (a master that does not send it gets one, as before 0.4.0).
@@ -970,8 +968,7 @@ class Bridge:
                 start = len(buf)
                 end = min(ref["bytes"], start + step) - 1
                 try:
-                    data = with_retries(lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e),
-                                        attempts=SOURCE_FETCH_ATTEMPTS)
+                    data = with_retries(lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e))
                 except (FatalAuth, JobGone):
                     raise
                 except Exception as e:

@@ -24,7 +24,7 @@ export const MUSE_LIMITS = Object.freeze({
   source_max_bytes: 10 * MIB,
   max_source_images: 4,
   /** One Range request when a bridge >= 0.5 downloads a source image (GET …/sources/:n). */
-  source_chunk_bytes: 1 * MIB,
+  source_chunk_bytes: 256 * 1024,
 })
 
 export const POLL_HOLD_SEC = 25
@@ -214,15 +214,24 @@ export function parseSubmission(raw: unknown): MuseJobSpec {
   }
 }
 
-/** True when a bridge of this version downloads source images itself (>= 0.5.0). */
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+
+/**
+ * True when a bridge of this version downloads source images itself: SemVer >= 0.5.0. A
+ * pre-release of 0.5.0 (0.5.0-rc.1) precedes 0.5.0 and stays inline; anything unparseable too.
+ * Same rule as the personal edition (#1102).
+ */
 export function bridgeFetchesSources(version: string | null): boolean {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version ?? '')
+  const m = SEMVER_RE.exec(version ?? '')
   if (!m) return false
+  const pre = m[4]
+  if (pre?.split('.').some((id) => /^0\d+$/.test(id))) return false
   const v = [Number(m[1]), Number(m[2]), Number(m[3])]
   for (let i = 0; i < 3; i++) {
     if (v[i] !== SOURCE_REFS_MIN_BRIDGE[i]) return v[i]! > SOURCE_REFS_MIN_BRIDGE[i]!
   }
-  return true
+  return pre === undefined
 }
 
 /** Decoded size of canonical base64 (parseSubmission and the studio adapter only produce that). */

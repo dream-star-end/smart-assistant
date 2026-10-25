@@ -107,7 +107,7 @@ interface HubJob {
   /** Decoded source images, built on the first by-reference dispatch; dropped at finish. */
   sources: MuseSource[] | null
   /** Size of the last poll response that carried this job (logged when it is never acked). */
-  claimBytes: number
+  claimResponseBytes: number
 }
 
 /** A source image as a bridge >= 0.5 downloads it. */
@@ -781,7 +781,7 @@ export class MuseBridgeHub {
       finishedAt: 0,
       waiters: new Set(),
       sources: null,
-      claimBytes: 0,
+      claimResponseBytes: 0,
     }
     this.jobs.set(id, job)
     this.queue.push(job)
@@ -898,14 +898,14 @@ export class MuseBridgeHub {
           this.log.warn('muse_job_never_acked', {
             jobId: a.id,
             attempts: a.dispatchCount,
-            claimBytes: a.claimBytes,
+            claimResponseBytes: a.claimResponseBytes,
           })
           this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge never acknowledged the job'))
         } else {
           this.log.warn('muse_job_ack_timeout_requeued', {
             jobId: a.id,
             attempt: a.dispatchCount,
-            claimBytes: a.claimBytes,
+            claimResponseBytes: a.claimResponseBytes,
           })
           this.requeue(a)
         }
@@ -1141,7 +1141,7 @@ export class MuseBridgeHub {
       resume_snapshot_id: s.resume_snapshot_id ?? null,
       deadline_at: new Date(job.deadlineAt).toISOString(),
     }
-    job.claimBytes = Buffer.byteLength(JSON.stringify({ job: w }))
+    job.claimResponseBytes = Buffer.byteLength(JSON.stringify({ job: w }))
     return w
   }
 

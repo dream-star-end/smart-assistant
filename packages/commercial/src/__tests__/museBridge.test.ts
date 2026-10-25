@@ -163,9 +163,21 @@ describe('muse protocol', () => {
 
 describe('muse source references (OCV5-591 ref-A)', () => {
   it('only bridges >= 0.5.0 fetch sources themselves', () => {
-    for (const v of ['0.5.0', '0.5.1', '0.6.0', '1.0.0', '0.10.0', '0.5.0-rc1'])
+    for (const v of ['0.5.0', '0.5.0+build.1', '0.5.1', '0.5.1-rc.1', '0.6.0', '1.0.0', '0.10.0'])
       assert.equal(bridgeFetchesSources(v), true, v)
-    for (const v of [null, '', '0.4.0', '0.4.9', '0.3.2', 'x', '0.5'])
+    for (const v of [
+      null,
+      '',
+      '0.4.0',
+      '0.4.9',
+      '0.3.2',
+      'x',
+      '0.5',
+      '0.5.0-rc.1',
+      '0.5.0-01',
+      '00.5.0',
+      '0.5.1-01',
+    ])
       assert.equal(bridgeFetchesSources(v), false, String(v))
   })
   it('decoded size of canonical base64', () => {
@@ -341,7 +353,7 @@ describe('muse hub', () => {
     logged.stop()
     const sizes = warns
       .filter(([m]) => m === 'muse_job_ack_timeout_requeued' || m === 'muse_job_never_acked')
-      .map(([m, meta]) => [m, meta.claimBytes])
+      .map(([m, meta]) => [m, meta.claimResponseBytes])
     assert.equal(sizes.length, 3)
     assert.equal(sizes[2]![0], 'muse_job_never_acked')
     for (const [, n] of sizes) assert.ok(typeof n === 'number' && n > 1300, String(n))
