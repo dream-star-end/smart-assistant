@@ -2,6 +2,7 @@
 //
 //   POST /api/muse-bridge/v1/hello
 //   POST /api/muse-bridge/v1/poll                         (long-poll, ≤ POLL_HOLD_SEC)
+//   GET  /api/muse-bridge/v1/jobs/:id/sources/:n         (after ack; supports Range)
 //   POST /api/muse-bridge/v1/jobs/:id/heartbeat           (first one = ack barrier)
 //   PUT  /api/muse-bridge/v1/jobs/:id/files/:idx/chunks/:n
 //   POST /api/muse-bridge/v1/jobs/:id/result
@@ -18,6 +19,7 @@
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { parseByteRange } from '@openclaude/gateway'
 
 import { REQUEST_ID_HEADER, ensureRequestId, sendJson, setSecurityHeaders } from '../http/util.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
@@ -213,6 +215,29 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           return
         }
         sendJson(res, 200, { job })
+        return
+      }
+
+      const sourceMatch = /^\/jobs\/([^/]+)\/sources\/(\d+)$/.exec(sub)
+      if (method === 'GET' && sourceMatch && JOB_ID_RE.test(sourceMatch[1]!)) {
+        const { data, ref } = deps.hub.sourceFor(
+          sourceMatch[1]!,
+          String(req.headers['x-job-nonce'] ?? ''),
+          Number(sourceMatch[2]),
+        )
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('Accept-Ranges', 'bytes')
+        const range = parseByteRange(req.headers.range, data.length)
+        if (req.headers.range !== undefined && !range) {
+          res.setHeader('Content-Range', `bytes */${data.length}`)
+          throw new MuseError(416, 'INVALID_RANGE', 'source range is not satisfiable')
+        }
+        const body = range ? data.subarray(range.start, range.end + 1) : data
+        if (range) res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${data.length}`)
+        res.setHeader('Content-Type', ref.mime)
+        res.setHeader('Content-Length', body.length)
+        res.statusCode = range ? 206 : 200
+        res.end(body)
         return
       }
 
