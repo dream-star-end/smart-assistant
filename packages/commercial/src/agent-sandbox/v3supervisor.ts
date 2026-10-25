@@ -720,6 +720,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "ssh",
   // OCV5-383：同花顺行情插件（plugin.json + SKILL.md + scripts/ths.py + references/）。
   "ths",
+  // OCV5-577 跟进：对话写经验分享草稿（SKILL.md + references/ui-blog.md）。
+  "blog-writer",
 ] as const;
 
 /**

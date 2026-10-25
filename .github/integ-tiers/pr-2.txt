@@ -33,3 +33,4 @@ packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts
 packages/commercial/src/__tests__/admissionRestartRecovery.integ.test.ts
 packages/commercial/src/plugins/literatureDb/platformUsage.integ.test.ts
 packages/commercial/src/plugins/literatureDb/accounts.integ.test.ts
+packages/commercial/src/__tests__/kimi31Catalog.integ.test.ts

@@ -117,9 +117,13 @@ function forbidTaskboardEntryImport(): Plugin {
  * tailwind-merge 的 JS;ProcessDisclosure / lineDiff / agentNames 也只是 rolldown 借来的块名,装的是
  * 聊天卡片、工具摘要和 chat/model·render,首屏渲染离不开,不移出。改为让 protocol 可摇树(见下方
  * rolldownOptions.treeshake)→ 460.6KB,余 10.5KB,阈值不动。每次构建打印一行当前体量与余量。
+ * 2026-10-25 P-1(用户拍板「上调或告警后再发」):商业 staging 官方构建硬拒 gzip 460.6KB >
+ * 460.0KB(FIRST_SCREEN_GZIP_BUDGET=471040),来自 #1095 OD 收窄合入后的入口闭包。不改告警
+ * (硬拒语义保留、其它门禁不动);按既有公式「实测上取整到 10KB」上调阈值:
+ * ceil(460.6/10)*10 = 470.0KB = 481280(~9.4KB 余量)。可逆:改回常量即恢复。
  * 纯函数与单测在 src/lib/firstScreenBudget。
  */
-const FIRST_SCREEN_GZIP_BUDGET = 471040;
+const FIRST_SCREEN_GZIP_BUDGET = 481280;
 
 function firstScreenBudget(): Plugin {
   return {

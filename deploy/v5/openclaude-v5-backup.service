@@ -9,9 +9,9 @@
 [Unit]
 Description=OpenClaude v5 file-level backup (sessions.db + config + env)
 After=network.target
-# 失败走统一 timer alert template(与 pg-backup 同惯例;template 未部署时 systemd silent skip,
-# 后续补 template 时此引用立即生效)。
-OnFailure=v3-timer-failure-alert@openclaude-v5-backup.service
+# 失败使用随 v5 部署的告警模板:企微 critical fan-out + uid 1 站内信。
+# 模板与 monitor/daily/baseline 共用,不可引用未安装的 v3 模板。
+OnFailure=openclaude-v5-alert-fail@%n.service
 
 [Service]
 Type=oneshot

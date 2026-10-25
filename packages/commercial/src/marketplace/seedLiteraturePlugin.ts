@@ -40,7 +40,7 @@ const OFFICIAL_OUTCOME_EXAMPLES = [
 const OFFICIAL_HUMAN_MD =
   '平台官方只读插件。安装后在设置页输入你的解忧图书馆会员账号完成私有绑定，账号密码与登录会话全链路使用平台密钥加密保存，绝不进入模型上下文、终端日志或用户容器。' +
   '插件在平台服务端通过受控 HTTP 通道检索中文（万方）与英文（Nature/Springer）文献数据库，下载的 PDF 全文先在隔离工作线程完成结构校验，再发布为绑定当前用户与账号实例的短期平台文件编号，仅可由当前登录用户在浏览器中下载保存。' +
-  'search 返回的 documentId 有效期为 24 小时；若编号过期（报 DOCUMENT_EXPIRED），请先重新调用 search 获取新编号后再 download。需要下载多篇文献或遇到 RATE_LIMITED 时，请一篇一篇串行下载，每篇间隔 20-30 秒。'
+  'search 返回的 documentId 有效期为 24 小时；若编号过期（报 DOCUMENT_EXPIRED），请先重新调用 search 获取新编号后再 download。下载得到的 PDF 在平台暂存约 30 分钟，请及时在文献卡片上保存；过期后可用同一编号重新下载。需要下载多篇文献或遇到 RATE_LIMITED 时，请一篇一篇串行下载，每篇间隔 20-30 秒。'
 
 interface LocatedVersion {
   id: string

@@ -2171,7 +2171,7 @@ describe('v5 release safety lanes', () => {
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
-  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review/ths gaps', async () => {
+  test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review/ths/blog-writer gaps', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-'))
     dirs.push(dir)
     const release = path.join(dir, 'release')
@@ -2185,6 +2185,7 @@ describe('v5 release safety lanes', () => {
     await rm(path.join(baseline, 'skills/ssh'), { recursive: true })
     await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
     await rm(path.join(baseline, 'skills/ths'), { recursive: true })
+    await rm(path.join(baseline, 'skills/blog-writer'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
     const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
@@ -4672,7 +4673,7 @@ describe('v5 release safety lanes', () => {
       path.join(bin, 'ssh'),
       [
         '#!/bin/sh',
-        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then exec sleep 3; fi',
         'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
         'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
         'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
@@ -5300,7 +5301,7 @@ describe('v5 release safety lanes', () => {
       path.join(bin, 'ssh'),
       [
         '#!/bin/sh',
-        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then exec sleep 3; fi',
         'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
         'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
         'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
@@ -6331,7 +6332,7 @@ persist_selfhost_model_authority_cutover /not-used`,
 
     const bin = path.join(dir, 'bin')
     await mkdir(bin)
-    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nsleep 3\n')
+    await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nexec sleep 3\n')
     await chmod(path.join(bin, 'ssh'), 0o755)
     const started = Date.now()
     const transportTimedOut = spawnSync(
@@ -7356,6 +7357,27 @@ describe('v5 host monitor independent atomic installer', () => {
 })
 
 describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
+  test('every deploy/v5 OnFailure= names a template shipped in deploy/v5', async () => {
+    const dir = path.join(root, 'deploy/v5')
+    let checked = 0
+    for (const name of await readdir(dir)) {
+      if (!/\.(service|timer|socket|path|target)$/.test(name)) continue
+      const source = await readFile(path.join(dir, name), 'utf8')
+      for (const match of source.matchAll(/^OnFailure=(.+)$/gm)) {
+        for (const target of match[1].trim().split(/\s+/)) {
+          const template = target.includes('@')
+            ? `${target.split('@')[0]}@.service`
+            : target.endsWith('.service')
+              ? target
+              : `${target}.service`
+          assert.ok(existsSync(path.join(dir, template)), `${name}: ${target} needs ${template}`)
+          checked++
+        }
+      }
+    }
+    assert.ok(checked > 0, 'deploy/v5 failure targets must be checked')
+  })
+
   // 三个探针根治的是"静默失败"这一整类。背景:异地容灾 v5-dr-sync/v5-dr-volumes 连败
   // 43 小时无人知晓,根因是这两个单元的 OnFailure= 是空的。逐个单元补 OnFailure 只能救
   // 已知的那几个,新单元照样漏 —— 所以改成"本机存在任何 failed 单元"就报。

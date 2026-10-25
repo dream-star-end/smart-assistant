@@ -14,6 +14,7 @@ import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
 import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
 import { IntradayBlock, KlineBlock, QuoteBlock, StockListBlock } from "./MarketBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
+import { BlogDraftBlock, BlogPublishedBlock, BlogStatusBlock } from "./BlogBlocks";
 import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, BiliVideoBlock, BiliVideosBlock } from "./BiliBlocks";
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
@@ -34,7 +35,7 @@ import { BodyMarkdown, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "kline", "intraday"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "kline", "intraday", "blog_draft", "blog_status", "blog_published"]);
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -143,6 +144,12 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <BiliDanmakuBlock spec={spec} {...p} />;
     case "bili_subtitle":
       return <BiliSubtitleBlock spec={spec} {...p} />;
+    case "blog_draft":
+      return <BlogDraftBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "blog_status":
+      return <BlogStatusBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "blog_published":
+      return <BlogPublishedBlock spec={spec} {...p} readOnly={readOnly} />;
   }
 }
 
@@ -217,6 +224,11 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0 || spec.density.length > 0;
     case "bili_subtitle":
       return spec.lines.length > 0;
+    case "blog_draft":
+      return spec.body.length > 0;
+    case "blog_status":
+    case "blog_published":
+      return spec.id.length > 0;
   }
 }
 

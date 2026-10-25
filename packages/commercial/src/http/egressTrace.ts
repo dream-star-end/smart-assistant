@@ -10,7 +10,8 @@
  *     `bad-header`),**单独计数,不从分母里消失**(计数在 egress health JSON 的 traceBinding 里)。
  * 非法值只记原因、不记原值(防日志注入,与 parseTraceIdCandidate 的约定一致)。
  * 这个头只在受控端点之间传:proxy 与各 relay 发往上游的请求头都是白名单,不会带出去(测试锁住)。
- * 派发归因(turn_dispatches 查库)仍照旧作兜底;turn_dispatches.trace_id 列另起一单。
+ * 派发归因(turn_dispatches 查库)仍照旧作兜底;头缺失时 proxy 用 turn_dispatches.trace_id(0323,
+ * OCV5-599)把请求挂回回合 trace(dispatchTraceFallback)。
  */
 import type { IncomingMessage } from 'node:http'
 import { TRACE_ID_HEADER, parseTraceIdCandidate } from '@openclaude/protocol'
@@ -61,6 +62,18 @@ export function bindEgressTrace(req: IncomingMessage, route: EgressTurnRoute): E
  */
 export function egressTraceFields(req: IncomingMessage): EgressTraceFields | Record<string, never> {
   return bound.get(req) ?? {}
+}
+
+/**
+ * Plan §7.4 fallback: the dispatch row's trace, used only when step 0 bound no trace (no or bad
+ * header, or the request did not pass step 0). A bound header always wins; null means nothing to log.
+ */
+export function dispatchTraceFallback(
+  fields: EgressTraceFields | Record<string, never>,
+  dispatchTraceId: string | null | undefined,
+): string | null {
+  if ('traceId' in fields && fields.traceId !== null) return null
+  return dispatchTraceId ? dispatchTraceId : null
 }
 
 /** Counts since process start, `{ "<route>": { bound, "no-header", ... } }`, for the health JSON. */

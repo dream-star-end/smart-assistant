@@ -52,6 +52,7 @@ EXPECTED_SKILLS=(
   manage-taskboard
   ssh
   ths
+  blog-writer
 )
 
 # MIN_SECURITY_POLICY: applied to every release, independent of that release's
@@ -165,7 +166,7 @@ assert_structure() { # <baseline-dir>
     # Serving releases before 2026-09-05 sync (2887d6d4b) have no
     # multi-model-review in baseline; legacy mode allows only that extra gap.
     # New releases remain exact-manifest strict.
-    for skill in cursor-cli manage-taskboard ssh multi-model-review ths; do
+    for skill in cursor-cli manage-taskboard ssh multi-model-review ths blog-writer; do
       if [[ ! -e "$root/skills/$skill" ]]; then
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
@@ -188,7 +189,7 @@ assert_structure() { # <baseline-dir>
   for skill in "${EXPECTED_SKILLS[@]}"; do
     if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
       case "$skill" in
-        cursor-cli|manage-taskboard|ssh|multi-model-review|ths) continue ;;
+        cursor-cli|manage-taskboard|ssh|multi-model-review|ths|blog-writer) continue ;;
       esac
     fi
     assert_skill_inner "$root" "$skill"
@@ -385,6 +386,8 @@ usage:
   v5-baseline-security.sh harden-release <absolute-release-root>
   v5-baseline-security.sh check-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh harden-release-legacy-cursor <absolute-release-root>
+  v5-baseline-security.sh check-structure-release <absolute-release-root>
+  v5-baseline-security.sh check-structure-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh check-dir <absolute-baseline-dir>
   v5-baseline-security.sh harden-dir <absolute-baseline-dir>
   v5-baseline-security.sh write-manifest <absolute-release-root> <40-hex-sourceCommit>
@@ -419,6 +422,21 @@ case "$mode" in
   check-dir)
     [[ $# == 0 ]] || usage
     check_baseline "${path%/}"
+    ;;
+  # OCV5-581 L0 departure preflight: the structure half of check-release / its legacy variant
+  # (top level, exact skill manifest, per-skill whitelist, no special nodes). Read-only: find/stat
+  # only. Ownership and modes are left out on purpose, because harden-release-legacy-cursor fixes
+  # those before it checks; a structure mismatch is what harden cannot fix (seq365, 2026-10-22).
+  check-structure-release)
+    [[ $# == 0 ]] || usage
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
+    ;;
+  check-structure-release-legacy-cursor)
+    [[ $# == 0 ]] || usage
+    ALLOW_LEGACY_BASELINE_GAPS=1
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s legacy\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
     ;;
   harden-dir)
     [[ $# == 0 ]] || usage

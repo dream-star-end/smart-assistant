@@ -26,6 +26,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import { getStaticProvider } from "@openclaude/protocol";
+import { applyModelDefaultEffort } from "../http/proxy/shared.js";
 import {
   selectUpstreamRoute,
   validateUpstreamConfig,
@@ -218,7 +219,7 @@ describe("selectUpstreamRoute", () => {
     }
   });
   test("kimi-k3 / k3-256k → static/moonshot；相似前后缀不误路由", () => {
-    for (const model of ["kimi-k3", "k3-256k"]) {
+    for (const model of ["kimi-k3", "k3-256k", "k3.1-pro"]) {
       const route = selectUpstreamRoute(model);
       assert.equal(route.kind, "static");
       if (route.kind === "static") assert.equal(route.provider.id, "moonshot");
@@ -681,7 +682,7 @@ describe("pickUpstream — Moonshot kimi-k3 / k3-256k", () => {
   }
 
   test("两模型均走 x-api-key/direct dispatcher；保留 thinking，strip first-party 字段", async () => {
-    for (const model of ["kimi-k3", "k3-256k"]) {
+    for (const model of ["kimi-k3", "k3-256k", "k3.1-pro"]) {
       const session = await moonshotSession(model);
       const headers: Record<string, string> = { "anthropic-beta": "strip-me" };
       const requestBody = {
@@ -721,6 +722,53 @@ describe("pickUpstream — Moonshot kimi-k3 / k3-256k", () => {
     }
     for (const effort of ["medium", "xhigh", "ultra"]) {
       assert.equal(cleanse(effort), undefined);
+    }
+  });
+});
+
+describe("Kimi 3.1 Pro exact thinking-only transport", () => {
+  async function sessionFor(model: string) {
+    const sched = makeScheduler({});
+    const result = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { moonshot: "TEST-KEY" } },
+      bodyFor(model), selectUpstreamRoute(model, { providerId: "moonshot", upstreamModelId: model }), log);
+    assert.equal(result.ok, true);
+    if (!result.ok) throw new Error("test session unavailable");
+    assert.equal(result.session.upstreamModel, model);
+    return result.session;
+  }
+  test("only new standard strips disabled; both old K3 models preserve it", async () => {
+    for (const model of ["kimi-k3", "k3-256k", "k3.1-pro"]) {
+      const session = await sessionFor(model);
+      const body = { ...bodyFor(model), thinking: { type: "disabled" } };
+      session.applyUpstreamAuth({}, body, log);
+      assert.deepEqual(body.thinking, model === "k3.1-pro" ? undefined : { type: "disabled" });
+    }
+  });
+  test("catalog ID, native tool/image history and explicit effort survive auth", async () => {
+    const session = await sessionFor("k3.1-pro");
+    const messages = [
+      { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "fixture" } }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "fixture", signature: "fixture-signature" },
+        { type: "tool_use", id: "call-611", name: "probe", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-611", content: "unpredictable-result" }] },
+    ];
+    const tools = [{ name: "probe", description: "test", input_schema: { type: "object" } }];
+    const body = { ...bodyFor("k3.1-pro"), tools, messages,
+      thinking: { type: "enabled", budget_tokens: 1024 } } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+    applyModelDefaultEffort(body, "max");
+    session.applyUpstreamAuth({}, body, log);
+    assert.equal(body.model, "k3.1-pro");
+    assert.deepEqual(body.output_config, { effort: "max" });
+    assert.equal(body.tools, tools);
+    assert.equal(body.messages, messages);
+    assert.equal(session.sanitizeMessages(messages, "k3.1-pro", log), messages);
+    assert.deepEqual(body.thinking, { type: "enabled", budget_tokens: 1024 });
+    for (const effort of ["low", "high"]) {
+      const explicit = { ...bodyFor("k3.1-pro"), output_config: { effort } };
+      applyModelDefaultEffort(explicit, "max");
+      session.applyUpstreamAuth({}, explicit, log);
+      assert.deepEqual(explicit.output_config, { effort });
     }
   });
 });
