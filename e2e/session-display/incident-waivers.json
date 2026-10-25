@@ -355,6 +355,12 @@
       "reason": "Aurora sync of selfhost OCV5-577 PR-B openCodeGoAuthHeaders x-opencode-session (e4108c3e7). Production TEXT_HTTP on community blog AI moderation was Go 400 MissingSessionID with no DeepSeek fallback on 400. Fix is protocol header only; platformFlashFallback.test.ts asserts UUID session header and keeps Go-400-no-fallback. No new incident: proofPending baseline is full (19/19); raising it would weaken the gate.",
       "approvedBy": "butler executor t977u 2026-10-25; user authorized fix AI moderation TEXT_HTTP; Incident: none because unit-covered selfhost port and proofPending baseline saturated",
       "expiresAt": "2026-11-25"
+    },
+    {
+      "commit": "d97caaa43472913a1aaa5254fe3e65a79acdccaa",
+      "reason": "OCV5-593 FE-4: Brief「全自动开始」was intentionally FE-disabled while director POST /start|/approve was already live (media-e2e draft→planning). Wire the button and approve path; not an incident fix. StudioApp unit covers enablement; raising proofPending baseline forbidden.",
+      "approvedBy": "user widget t983s6206 「商业发」2026-10-25; butler executor fixing missing Incident trailer before merge (Codex r2 + Grok OD already APPROVED on content)",
+      "expiresAt": "2026-11-25"
     }
   ]
 }
