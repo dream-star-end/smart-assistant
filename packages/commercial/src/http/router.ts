@@ -29,6 +29,7 @@ import { getHostById as computePoolGetHostById } from '../compute-pool/queries.j
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
 import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
+import { dispatchStudioRoute } from '../media-studio/http.js'
 import { MUSE_BRIDGE_PREFIX } from '../muse/protocol.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
@@ -56,14 +57,19 @@ import {
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import {
+  handleAdminListCommunityTutorials,
+  handleAdminListTutorialModerations,
   handleAdminPendingCommunityTutorials,
+  handleAdminTutorialModerationStats,
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
   handleListOwnCommunityTutorials,
+  handlePrecheckCommunityTutorial,
   handleSubmitCommunityTutorial,
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
-  handleWithdrawCommunityTutorial,
+  handleUploadTutorialImage,
+  handleTutorialUserPost,
 } from '../tutorials/communityTutorialRoutes.js'
 import { handleGetTutorialBlob, handleGetTutorialEmbed } from '../tutorials/tutorialBlobRoutes.js'
 import {
@@ -746,6 +752,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
     // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
     { method: ANY_METHOD, pathPrefix: MUSE_BRIDGE_PREFIX, handler: dispatchMuseBridgeRoute },
+    // OCV5-591 media studio (404 unless OC_STUDIO_ENABLED=1 and the user is allowed).
+    { method: ANY_METHOD, pathPrefix: '/api/studio/', handler: dispatchStudioRoute },
     // Session GoalState. Method/action semantics are centralized in the
     // dispatcher; ownership is rechecked against client_sessions in PG.
     {
@@ -868,10 +876,23 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/tutorials/mine',
       handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
     },
+    // 对话写博客的草稿卡预检：只读，不投稿。exact 路由，优先于下面的 POST 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/precheck',
+      handler: (req, res) => handlePrecheckCommunityTutorial(req, res, deps),
+    },
+    // 经验分享图片上传（原始字节）。exact 路由优先于下面的 POST `/api/tutorials/` 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/images',
+      handler: (req, res) => handleUploadTutorialImage(req, res, deps),
+    },
+    // 撤回 `/:id/withdraw` 与修改 `/:id/revise`。
     {
       method: 'POST',
       pathPrefix: '/api/tutorials/',
-      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
+      handler: (req, res) => handleTutorialUserPost(req, res, deps),
     },
     {
       method: 'GET',
@@ -892,6 +913,21 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/admin/tutorials/pending',
       handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials',
+      handler: (req, res) => handleAdminListCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderation-stats',
+      handler: (req, res) => handleAdminTutorialModerationStats(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderations',
+      handler: (req, res) => handleAdminListTutorialModerations(req, res, deps),
     },
     {
       method: 'GET',
@@ -1594,6 +1630,8 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/media-generation',
     // OCV5-561 Muse bridge; 404 unless OC_MUSE_BRIDGE_ENABLED=1.
     MUSE_BRIDGE_PREFIX,
+    // OCV5-591 media studio browser API.
+    '/api/studio/',
     // 会话目标(GoalState)REST 面。2026-07-17 事故:PR#76 只登了 routes 数组漏了
     // 本清单 → goal 全部 REST 404(GET 被前端当"无目标"吞,PUT 炸出 not found)。
     // 两处同步铁律由 routeOwnership.test.ts 契约测试锁死。

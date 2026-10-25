@@ -3,8 +3,17 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { requireAuth } from '../http/auth.js'
-import { HttpError, clientIpOf, readJsonBody, sendJson, userAgentOf } from '../http/util.js'
 import {
+  HttpError,
+  clientIpOf,
+  readBinaryBody,
+  readJsonBody,
+  sendJson,
+  userAgentOf,
+} from '../http/util.js'
+import {
+  ADMIN_TUTORIAL_STATUSES,
+  type AdminTutorialStatus,
   COMMUNITY_TUTORIAL_CATEGORIES,
   COMMUNITY_TUTORIAL_MAX_PAGE_SIZE,
   COMMUNITY_TUTORIAL_PAGE_SIZE,
@@ -13,23 +22,49 @@ import {
   decodeTutorialCursor,
   getOwnCommunityTutorial,
   getPublishedCommunityTutorial,
+  getTutorialModerationStats,
+  listAdminCommunityTutorials,
   listOwnCommunityTutorials,
   listPendingCommunityTutorials,
   listPublishedCommunityTutorials,
+  listTutorialModerations,
+  recordCommunityTutorialView,
   reviewCommunityTutorial,
   submitCommunityTutorial,
   submitSnapshotTutorial,
   takedownCommunityTutorial,
   withdrawCommunityTutorial,
 } from './communityTutorials.js'
+import { precheckCommunityTutorial, takeBlogPrecheckToken } from './blogPrecheck.js'
 import { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES } from './snapshotSanitizer.js'
+import {
+  TUTORIAL_IMAGE_MAX_BYTES,
+  TutorialImageError,
+  communityBlogEnabled,
+  getTutorialImageForViewer,
+  prepareTutorialImage,
+  storeTutorialImageUpload,
+} from './tutorialImages.js'
+import { tutorialModerationMode } from './tutorialModerationQueue.js'
+import { reviewCommunityTutorialRevision, reviseCommunityTutorial } from './tutorialRevisions.js'
 import { parseTutorialSessionId, TutorialTimelineError } from './tutorialTimeline.js'
 
 export { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES }
 
+/**
+ * Markdown 投稿的 JSON 上限。正文最多 50000 字，中文按 UTF-8 3 字节约 150KB，再加 JSON
+ * 转义余量；默认的 64KiB 会把长篇中文投稿 413 掉。
+ */
+export const COMMUNITY_TUTORIAL_MAX_BODY_BYTES = 256 * 1024
+
 type TutorialRouteDeps = { jwtSecret: string | Uint8Array }
 
 function mapTutorialError(error: unknown): HttpError {
+  if (error instanceof TutorialImageError) {
+    if (error.code === 'RATE_LIMITED') return new HttpError(429, error.code, error.message)
+    if (error.code === 'TOO_LARGE') return new HttpError(413, error.code, error.message)
+    return new HttpError(400, error.code, error.message)
+  }
   if (error instanceof TutorialTimelineError) {
     if (error.code === 'NOT_FOUND') return new HttpError(404, error.code, error.message)
     if (error.code === 'SESSION_OPEN_TURN') return new HttpError(409, error.code, error.message)
@@ -48,7 +83,9 @@ function mapTutorialError(error: unknown): HttpError {
   ) {
     return new HttpError(400, error.code, error.message)
   }
-  if (error.code === 'NOT_FOUND') return new HttpError(404, error.code, error.message)
+  if (error.code === 'NOT_FOUND' || error.code === 'FEATURE_DISABLED')
+    return new HttpError(404, error.code, error.message)
+  if (error.code === 'RATE_LIMITED') return new HttpError(429, error.code, error.message)
   return new HttpError(409, error.code, error.message)
 }
 
@@ -115,15 +152,20 @@ export async function handleListCommunityTutorials(
   const { cursor, limit } = pageArgs(req)
   const q = url.searchParams.get('q')?.trim() ?? ''
   if (q.length > 100) throw new HttpError(400, 'BAD_REQUEST', 'q too long')
+  const kind = url.searchParams.get('kind') || null
+  if (kind !== null && kind !== 'markdown' && kind !== 'snapshot')
+    throw new HttpError(400, 'BAD_REQUEST', 'kind must be markdown|snapshot')
   try {
     const page = await listPublishedCommunityTutorials({
       cursor,
       limit,
       category: optionalCategory(url.searchParams.get('category')),
       query: q || null,
+      kind,
     })
     res.setHeader('Cache-Control', 'public, max-age=30')
-    sendJson(res, 200, { tutorials: page.items, nextCursor: page.nextCursor })
+    res.setHeader('X-Robots-Tag', 'noindex')
+    sendJson(res, 200, { tutorials: page.items, nextCursor: page.nextCursor, total: page.total })
   } catch (error) {
     throw mapTutorialError(error)
   }
@@ -136,9 +178,26 @@ export async function handleGetCommunityTutorial(
   const id = tutorialId(req)
   const item = await getPublishedCommunityTutorial(id)
   if (!item) throw new HttpError(404, 'NOT_FOUND', '教程不存在或尚未上线')
+  try {
+    await recordCommunityTutorialView(id)
+  } catch {
+    // 阅读数只是展示用，写失败不影响读者。
+  }
   // 撤回/下架必须即时生效，详情不能被浏览器或 CDN 继续复用旧 approved DTO。
   res.setHeader('Cache-Control', 'no-store')
+  // quick tunnel 域名随机，经验分享不进搜索引擎。
+  res.setHeader('X-Robots-Tag', 'noindex')
   sendJson(res, 200, { tutorial: item })
+}
+
+/** 投稿与修改共用的字段校验。 */
+function markdownDraft(body: Record<string, unknown>) {
+  return {
+    title: text(body.title, 'title', 4, 100),
+    summary: text(body.summary, 'summary', 10, 280),
+    category: category(body.category),
+    bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
+  }
 }
 
 export async function handleSubmitCommunityTutorial(
@@ -147,14 +206,9 @@ export async function handleSubmitCommunityTutorial(
   deps: TutorialRouteDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
-  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
   try {
-    const result = await submitCommunityTutorial(user.id, {
-      title: text(body.title, 'title', 4, 100),
-      summary: text(body.summary, 'summary', 10, 280),
-      category: category(body.category),
-      bodyMarkdown: text(body.bodyMarkdown, 'bodyMarkdown', 40, 50000),
-    })
+    const result = await submitCommunityTutorial(user.id, markdownDraft(body))
     sendJson(res, 201, { tutorial: result })
   } catch (error) {
     if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
@@ -163,6 +217,24 @@ export async function handleSubmitCommunityTutorial(
     }
     throw mapTutorialError(error)
   }
+}
+
+/**
+ * 投稿预检（对话写博客的草稿卡）：和投稿同样的确定性检查，只读、不入队、不调用模型。
+ * 字段不合法不报 400，而是作为问题列出来，草稿卡据此提示要改什么。
+ */
+export async function handlePrecheckCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  if (!communityBlogEnabled()) throw new HttpError(404, 'FEATURE_DISABLED', '经验分享未开启')
+  if (!takeBlogPrecheckToken(user.id))
+    throw new HttpError(429, 'RATE_LIMITED', '检查太频繁，稍等一分钟再试')
+  const body = await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)
+  const draft = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>) : {}
+  sendJson(res, 200, await precheckCommunityTutorial(user.id, draft))
 }
 
 function optionalBodyMarkdown(value: unknown): string | undefined {
@@ -231,12 +303,75 @@ export async function handleGetOwnCommunityTutorial(
   sendJson(res, 200, { tutorial: item })
 }
 
+/** 经验分享图片上传：原始字节，Content-Type 声明格式，服务端按魔数复核并去元数据。 */
+export async function handleUploadTutorialImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  if (!communityBlogEnabled()) throw new HttpError(404, 'FEATURE_DISABLED', '经验分享未开启')
+  const body = await readBinaryBody(req, TUTORIAL_IMAGE_MAX_BYTES)
+  try {
+    const image = await prepareTutorialImage(body, req.headers['content-type'])
+    await storeTutorialImageUpload(user.id, image)
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 201, {
+      image: {
+        sha256: image.sha256,
+        mime: image.mime,
+        bytes: image.body.length,
+        width: image.width,
+        height: image.height,
+      },
+    })
+  } catch (error) {
+    throw mapTutorialError(error)
+  }
+}
+
+/**
+ * 作者预览 / 管理员复核读图（未公开的稿件也能看）。不区分不存在与无权，一律 404。
+ * 前端带 Bearer fetch 后转 blob URL；公开读取仍走 /api/tutorial-embeds。
+ */
+export async function handleGetTutorialImage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const match = (req.url ?? '').match(/^\/api\/tutorials\/images\/([a-f0-9]{64})(?:\?|$)/)
+  if (!match?.[1]) throw new HttpError(400, 'BAD_REQUEST', 'invalid image id')
+  let isAdmin = false
+  if (user.role === 'admin') {
+    await requireAdminVerifyDb(req, deps.jwtSecret)
+    isAdmin = true
+  }
+  const image = await getTutorialImageForViewer({ sha256: match[1], userId: user.id, isAdmin })
+  if (!image) throw new HttpError(404, 'NOT_FOUND', 'image not found')
+  res.statusCode = 200
+  res.setHeader('Content-Type', image.mime)
+  res.setHeader('Content-Length', String(image.body.length))
+  res.setHeader('Content-Disposition', `inline; filename="${match[1].slice(0, 12)}"`)
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.setHeader('X-Robots-Tag', 'noindex')
+  res.end(image.body)
+}
+
 export async function handleTutorialUserGet(
   req: IncomingMessage,
   res: ServerResponse,
   deps: TutorialRouteDeps,
 ): Promise<void> {
   const path = (req.url ?? '').split('?')[0] ?? ''
+  if (path.startsWith('/api/tutorials/images/')) {
+    await handleGetTutorialImage(req, res, deps)
+    return
+  }
   if (path.startsWith('/api/tutorials/mine/')) {
     await handleGetOwnCommunityTutorial(req, res, deps)
     return
@@ -258,6 +393,44 @@ export async function handleWithdrawCommunityTutorial(
   }
 }
 
+/**
+ * 作者修改已投稿的经验分享：待审 / 未通过的原地改后重审；已发布的进修改稿，审核通过前线上仍是旧版。
+ */
+export async function handleReviseCommunityTutorial(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const id = tutorialId(req, '/revise')
+  const body = (await readJsonBody(req, COMMUNITY_TUTORIAL_MAX_BODY_BYTES)) as Record<string, unknown>
+  try {
+    const result = await reviseCommunityTutorial(user.id, id, markdownDraft(body))
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 200, { tutorial: result })
+  } catch (error) {
+    if (error instanceof CommunityTutorialError && error.code === 'LEAKS_FOUND') {
+      sendTutorialError(res, error)
+      return
+    }
+    throw mapTutorialError(error)
+  }
+}
+
+/** POST /api/tutorials/:id/withdraw | /revise（exact 路由之外的用户写操作）。 */
+export async function handleTutorialUserPost(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  const path = (req.url ?? '').split('?')[0] ?? ''
+  if (path.endsWith('/revise')) {
+    await handleReviseCommunityTutorial(req, res, deps)
+    return
+  }
+  await handleWithdrawCommunityTutorial(req, res, deps)
+}
+
 export async function handleAdminPendingCommunityTutorials(
   req: IncomingMessage,
   res: ServerResponse,
@@ -269,6 +442,69 @@ export async function handleAdminPendingCommunityTutorials(
     const page = await listPendingCommunityTutorials(args)
     res.setHeader('Cache-Control', 'private, no-store')
     sendJson(res, 200, { tutorials: page.items, nextCursor: page.nextCursor })
+  } catch (error) {
+    throw mapTutorialError(error)
+  }
+}
+
+/** 管理端按状态列表：`?status=pending|approved|rejected|takedown|withdrawn[&needsHuman=1]`。 */
+export async function handleAdminListCommunityTutorials(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const status = url.searchParams.get('status') ?? 'pending'
+  if (!(ADMIN_TUTORIAL_STATUSES as readonly string[]).includes(status))
+    throw new HttpError(400, 'BAD_REQUEST', `status must be ${ADMIN_TUTORIAL_STATUSES.join('|')}`)
+  const needsHuman = url.searchParams.get('needsHuman') === '1'
+  const kind = url.searchParams.get('kind') || null
+  if (kind !== null && kind !== 'markdown' && kind !== 'snapshot')
+    throw new HttpError(400, 'BAD_REQUEST', 'kind must be markdown|snapshot')
+  const args = pageArgs(req)
+  try {
+    const page = await listAdminCommunityTutorials({
+      status: status as AdminTutorialStatus,
+      needsHuman,
+      kind,
+      ...args,
+    })
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 200, { tutorials: page.items, nextCursor: page.nextCursor })
+  } catch (error) {
+    throw mapTutorialError(error)
+  }
+}
+
+/** 管理端页头：审核模式与今天的自动处理计数。 */
+export async function handleAdminTutorialModerationStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const stats = await getTutorialModerationStats()
+  res.setHeader('Cache-Control', 'private, no-store')
+  sendJson(res, 200, {
+    mode: tutorialModerationMode(),
+    vision: process.env.OC_TUTORIAL_MODERATION_VISION?.trim().toLowerCase() !== 'off',
+    ...stats,
+  })
+}
+
+/** 「AI 审核记录」列表。 */
+export async function handleAdminListTutorialModerations(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const args = pageArgs(req)
+  try {
+    const page = await listTutorialModerations(args)
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 200, { moderations: page.items, nextCursor: page.nextCursor })
   } catch (error) {
     throw mapTutorialError(error)
   }
@@ -289,19 +525,34 @@ export async function handleAdminReviewCommunityTutorial(
   if (rawNote.length > 2000) throw new HttpError(400, 'BAD_REQUEST', 'note too long')
   if (decision === 'reject' && !rawNote)
     throw new HttpError(400, 'BAD_REQUEST', '拒绝时必须填写理由')
+  // 列表给的 reviewToken：p:<正文版本>（稿件本身）或 r:<修改稿 id>（已发布帖的修改）。必填：没有它就
+  // 无法确认管理员看到的就是现在的内容（作者可能刚改过）；旧页面要刷新后再审。
+  const token = typeof body.reviewToken === 'string' ? body.reviewToken : ''
+  const tokenMatch = /^(p|r):([1-9]\d{0,18})$/.exec(token)
+  if (!tokenMatch) throw new HttpError(400, 'BAD_REQUEST', '审核页面版本过旧，请刷新后再审')
+  const revisionId = tokenMatch[1] === 'r' ? tokenMatch[2]! : null
   try {
-    const result = await reviewCommunityTutorial({
-      id,
-      reviewerUserId: admin.id,
-      decision,
-      note: rawNote || null,
-    })
+    const result = revisionId
+      ? await reviewCommunityTutorialRevision({
+          publicationId: id,
+          revisionId,
+          reviewerUserId: admin.id,
+          decision,
+          note: rawNote || null,
+        })
+      : await reviewCommunityTutorial({
+          id,
+          reviewerUserId: admin.id,
+          decision,
+          note: rawNote || null,
+          expectedVersion: Number(tokenMatch[2]),
+        })
     await writeAdminAuditBestEffort(
       { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
       'tutorial.review',
       `community_tutorial:${id}`,
       undefined,
-      { decision, note: rawNote || undefined, tutorial_id: id },
+      { decision, note: rawNote || undefined, tutorial_id: id, ...(revisionId ? { revision_id: revisionId } : {}) },
     )
     sendJson(res, 200, { ok: true, tutorial: { id, ...result } })
   } catch (error) {

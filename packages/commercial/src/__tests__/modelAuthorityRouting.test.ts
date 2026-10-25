@@ -323,7 +323,7 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
   });
 
   test("moonshot 机制 ceiling = vision=true / efforts=[low,high,max]", () => {
-    for (const model of ["kimi-k3", "k3-256k"]) {
+    for (const model of ["kimi-k3", "k3-256k", "k3.1-pro"]) {
       const ceiling = providerCapabilityCeiling(selectUpstreamRoute(model));
       assert.equal(ceiling.supportsVision, true);
       assert.deepEqual([...(ceiling.efforts ?? [])], ["low", "high", "max"]);

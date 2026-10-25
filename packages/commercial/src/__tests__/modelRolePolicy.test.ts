@@ -38,6 +38,10 @@ describe('projectContextWindowForRole — 纯函数契约', () => {
   test('kimi-k3:admin 1M 原样,user 收窄 500k(512000)', () => {
     assert.equal(projectContextWindowForRole('kimi-k3', 1_048_576, 'admin'), 1_048_576)
     assert.equal(projectContextWindowForRole('kimi-k3', 1_048_576, 'user'), 512_000)
+    assert.equal(projectContextWindowForRole('k3.1-pro', 1_048_576, 'admin'), 1_048_576)
+    assert.equal(projectContextWindowForRole('k3.1-pro', 1_048_576, 'user'), 512_000)
+    assert.equal(projectContextWindowForRole('k3.1-pro', 200_000, 'user'), 200_000)
+    assert.equal(projectContextWindowForRole('k3.1-pro', null, 'user'), null)
   })
   test('登记上限只收窄不放大:机制窗口 < 上限 → 原样', () => {
     // 若未来 kimi-k3 机制窗口被下调到 500k 以下,登记表不得把它放大回去。
@@ -98,6 +102,7 @@ function price(modelId: string, over: Partial<ModelCatalogPricing> = {}): ModelC
 function snapshotWith(): ModelCatalogSnapshot {
   const entries = [
     entry({ entryId: 1, modelId: 'kimi-k3' }),
+    entry({ entryId: 3, modelId: 'k3.1-pro', upstreamModelId: 'k3.1-pro' }),
     entry({ entryId: 2, modelId: 'glm-5.2', providerId: 'ark', contextWindow: 1_000_000 }),
   ]
   return new ModelCatalogSnapshot({
@@ -105,6 +110,7 @@ function snapshotWith(): ModelCatalogSnapshot {
     aliases: new Map(),
     pricing: new Map([
       ['kimi-k3', price('kimi-k3')],
+      ['k3.1-pro', price('k3.1-pro', { defaultEffort: 'max' })],
       ['glm-5.2', price('glm-5.2', { sortOrder: 84 })],
     ]),
     securityEpoch: 7n,
@@ -121,6 +127,8 @@ describe('listForUser — 角色分档窗口投影', () => {
     const byIdUser = new Map(snap.listForUser(userScope).map((r) => [r.modelId, r]))
     assert.equal(byIdAdmin.get('kimi-k3')?.contextWindow, 1_048_576)
     assert.equal(byIdUser.get('kimi-k3')?.contextWindow, 512_000)
+    assert.equal(byIdAdmin.get('k3.1-pro')?.contextWindow, 1_048_576)
+    assert.equal(byIdUser.get('k3.1-pro')?.contextWindow, 512_000)
     assert.equal(byIdAdmin.get('glm-5.2')?.contextWindow, 1_000_000)
     assert.equal(byIdUser.get('glm-5.2')?.contextWindow, 1_000_000)
   })
@@ -139,5 +147,6 @@ describe('listForUser — 角色分档窗口投影', () => {
 
   test('resolve() 不受角色投影影响(机制描述符保持 1M)', () => {
     assert.equal(snap.resolve('kimi-k3')?.contextWindow, 1_048_576)
+    assert.equal(snap.resolve('k3.1-pro')?.contextWindow, 1_048_576)
   })
 })

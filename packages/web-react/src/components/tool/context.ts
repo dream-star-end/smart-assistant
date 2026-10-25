@@ -9,9 +9,12 @@
  * 由上层 App/MessageRenderer 注入，不污染 props，也不引入第二套传参机制。
  */
 import { createContext, useContext } from "react";
+import type { CommunityTutorialCategory, CommunityTutorialMine, CommunityBlogPrecheck } from "../../lib/types";
 import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 import type { Ticket } from "../../lib/taskboard";
 import type { ToolLike } from "./format";
+
+export type LiteratureArtifactMeta = { expiresAt: string; bytes: number; saved: boolean };
 
 export type ToolCardActions = {
   /** 打开记忆中心（memory / archival / session_search 类）。 */
@@ -24,6 +27,8 @@ export type ToolCardActions = {
   onPaperAction?: (action: "download" | "citation", identifier: string) => void;
   /** 文献数据库插件 PDF 产物受鉴权下载（返回 Blob 触发浏览器保存）。 */
   downloadLiteratureArtifact?: (artifactId: string) => Promise<Blob>;
+  /** 文献 PDF 保存期限（OCV5-585）；已过期或已被清理时返回 null。 */
+  literatureArtifactMeta?: (artifactId: string) => Promise<LiteratureArtifactMeta | null>;
   /**
    * 连接器写操作确认卡（oc-connect，human-in-the-loop）：详情拉取 + 批准/拒绝。
    * 需登录鉴权（Bearer），由 App 绑定 authRef 注入；无 provider（demo/未登录）时
@@ -44,7 +49,42 @@ export type ToolCardActions = {
   };
   /** 打开任务面板(可选定位到 identifier)。 */
   onOpenTaskboard?: (identifier?: string) => void;
+  /**
+   * 对话写博客（经验分享草稿卡，OCV5-577）：全部走用户浏览器登录态；
+   * Agent 没有任何投稿能力。开关关闭、demo、未登录时不注入，草稿卡降级为只读预览。
+   */
+  communityBlog?: CommunityBlogActions;
 };
+
+export type CommunityBlogDraftPayload = {
+  title: string;
+  summary: string;
+  category: CommunityTutorialCategory;
+  bodyMarkdown: string;
+};
+
+export type CommunityBlogBusinessActions = {
+  precheck: (draft: CommunityBlogDraftPayload) => Promise<CommunityBlogPrecheck>;
+  /** 读容器里的图片文件（经媒体签名）。 */
+  readContainerImage: (path: string) => Promise<Blob>;
+  uploadImage: (image: Blob) => Promise<{ sha256: string }>;
+  submit: (draft: CommunityBlogDraftPayload) => Promise<{ id: string }>;
+  getMine: (id: string) => Promise<CommunityTutorialMine>;
+  /** 文章的站内链接（与经验分享详情页「复制链接」同一写法）。 */
+  postUrl: (id: string) => string;
+  openPost: (id: string) => void;
+  openMine: () => void;
+  openEditor: (draft: CommunityBlogDraftPayload) => void;
+};
+
+type BlogNavigationKey = 'postUrl' | 'openPost' | 'openMine' | 'openEditor';
+export type CommunityBlogActions = Pick<CommunityBlogBusinessActions, BlogNavigationKey> & Partial<Omit<CommunityBlogBusinessActions, BlogNavigationKey>>;
+
+/** Navigation stays available while actual business I/O awaits verified identity. */
+export function communityBlogBusinessActions(actions?: CommunityBlogActions): CommunityBlogBusinessActions | undefined {
+  return actions?.precheck && actions.readContainerImage && actions.uploadImage && actions.submit && actions.getMine
+    ? actions as CommunityBlogBusinessActions : undefined;
+}
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});
 

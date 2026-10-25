@@ -97,10 +97,19 @@ export async function listTutorialBlobRefs(
 }
 
 export async function gcOrphanTutorialBlobs(runner?: QueryRunner): Promise<number> {
+  // 经验分享的图片先上传、后投稿绑定：未绑定期间没有 ref，30 天内上传过的不能当孤儿删掉。
+  // 修改稿的图片记在 community_tutorial_revision_images（不进 refs），也不是孤儿。
   const result = await query(
     `DELETE FROM tutorial_blobs b
       WHERE NOT EXISTS (
         SELECT 1 FROM tutorial_blob_refs r WHERE r.sha256 = b.sha256
+      )
+        AND NOT EXISTS (
+        SELECT 1 FROM community_tutorial_revision_images i WHERE i.sha256 = b.sha256
+      )
+        AND NOT EXISTS (
+        SELECT 1 FROM tutorial_blob_uploads u
+         WHERE u.sha256 = b.sha256 AND u.created_at > NOW() - INTERVAL '30 days'
       )`,
     [],
     runner,

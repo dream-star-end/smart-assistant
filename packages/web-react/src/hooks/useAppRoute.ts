@@ -197,8 +197,11 @@ export function parseTutorialCase(sp: URLSearchParams): TutorialCaseId | null {
   return parseTutorialCaseId(sp.get('case'))
 }
 
-/** 教程中心一级页签里需要进 URL 的两个：案例展厅是默认态，不写参数。 */
-export type TutorialTab = 'start' | 'cases'
+/**
+ * 教程中心一级页签里需要进 URL 的：案例展厅是默认态，不写参数。`blog` = 经验分享（OCV5-577），
+ * 它的文章详情复用 `community=<id>`（与 tab=blog 同在才算经验分享，否则仍是教程工作室）。
+ */
+export type TutorialTab = 'start' | 'cases' | 'blog'
 /**
  * 精选作品 id（`planet` / `gravity`）。只取轻量的 `tutorialSignatureWorkIds`，**不要**改回 import
  * `tutorialSignatureWorks`：它会把 tutorialCaseCatalog 拖进入口静态闭包，撞 first-screen-budget 门
@@ -212,9 +215,11 @@ const TUTORIAL_WORK_IDS: ReadonlySet<string> = new Set<string>(SIGNATURE_WORK_ID
 /** `?panel=help&tab=` → 一级页签；非 help / 与 community·case·topic·work 同在 / 未知值返回 null。 */
 export function parseTutorialTab(sp: URLSearchParams): TutorialTab | null {
   if (parsePanelParam(sp) !== 'help') return null
+  const v = sp.get('tab')
+  // 经验分享：文章详情带 community=<id>，页签仍是 blog。
+  if (v === 'blog') return parseTutorialCase(sp) || parseTutorialTopic(sp) ? null : 'blog'
   if (parseTutorialCommunity(sp) || parseTutorialCase(sp) || parseTutorialTopic(sp)) return null
   if (parseTutorialWork(sp)) return null
-  const v = sp.get('tab')
   return v === 'start' || v === 'cases' ? v : null
 }
 
@@ -343,6 +348,7 @@ export function withPanelParams(
     next.set('community', communityId)
     next.delete('case')
     next.delete('topic')
+    if (extras?.tab === 'blog') next.set('tab', 'blog')
   } else if (panel === 'help' && caseId) {
     next.set('case', caseId)
     next.delete('topic')
@@ -361,7 +367,8 @@ export function withPanelParams(
     next.delete('community')
     if (panel === 'help') {
       if (extras?.work && TUTORIAL_WORK_IDS.has(extras.work)) next.set('work', extras.work)
-      else if (extras?.tab === 'start' || extras?.tab === 'cases') next.set('tab', extras.tab)
+      else if (extras?.tab === 'start' || extras?.tab === 'cases' || extras?.tab === 'blog')
+        next.set('tab', extras.tab)
     }
   }
   return next

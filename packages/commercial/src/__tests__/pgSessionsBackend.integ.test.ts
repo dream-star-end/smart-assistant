@@ -51,8 +51,10 @@ import {
   casAdmittedToAccepted,
   casAdmittedToRejecting,
   casToManualReconcile,
+  backfillDispatchTraceId,
   casToTerminal,
   getDispatch,
+  getDispatchByBillingRequestId,
   resolveManualReconcile,
   scanOpenSessionGone,
 } from "../dispatch/turnDispatchStore.js";
@@ -113,6 +115,7 @@ const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_ch
 const MIGRATION_0237_PROJECT_ASSETS = path.resolve(here, "../db/migrations/0237_project_assets.sql");
 // OCV5-380 (selfhost P2): archive / pin / template / delete manifest on chat_projects.
 const MIGRATION_0302_CHAT_PROJECT_WORKSPACE = path.resolve(here, "../db/migrations/0302_chat_project_workspace.sql");
+const MIGRATION_0323 = path.resolve(here, "../db/migrations/0323_turn_dispatches_trace_id.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -292,6 +295,7 @@ before(async () => {
     ALTER TABLE chat_projects
       ADD COLUMN IF NOT EXISTS is_research_default BOOLEAN NOT NULL DEFAULT FALSE;
   `);
+  await pool.query(await readFile(MIGRATION_0323, { encoding: "utf8" }));
   migration0176EscapedNulBackfill = (
     await pool.query<NonNullable<typeof migration0176EscapedNulBackfill>>(
       `SELECT physical_record_count, logical_record_count, record_payload_bytes::text
@@ -8258,6 +8262,110 @@ function browserVisibleTimeline(messages: MessageLike[]): MessageLike[] {
   return messages.filter((message) =>
     message._timelineAuxiliary === undefined && message.role !== "runtime-event");
 }
+
+describe("turn_dispatches.trace_id (0323, OCV5-599)", () => {
+  const UID = 9n;
+  const TRACE_A = "a".repeat(32);
+  const TRACE_B = "b".repeat(32);
+
+  function admitInput(sessionId: string, clientMessageId: string, over: Record<string, unknown> = {}) {
+    return {
+      uid: UID,
+      sessionUserId: "c:9",
+      sessionId,
+      clientMessageId,
+      agentId: "main",
+      model: "gpt-5.6-sol",
+      requestHash: "t".repeat(64),
+      billingRequestId: `brq-${clientMessageId}`,
+      dispatchId: randomUUID(),
+      ownerId: "conn-A",
+      message: { id: clientMessageId, role: "user", text: "hi", ts: 1_783_950_000_000 } as MessageLike & { id: string },
+      ...over,
+    };
+  }
+
+  async function traceOf(dispatchId: string): Promise<string | null> {
+    const r = await pool.query<{ trace_id: string | null }>(
+      "SELECT trace_id FROM turn_dispatches WHERE dispatch_id = $1",
+      [dispatchId],
+    );
+    assert.equal(r.rowCount, 1);
+    return r.rows[0]!.trace_id;
+  }
+
+  maybe("admit writes the frame trace; a takeover moves the row to the new owner's trace", async () => {
+    const first = await backend.admitUserTurn(admitInput("s-trace-1", "cm-trace-1", {
+      traceId: TRACE_A,
+      // Lease already expired, so the next admit of the same turn takes it over.
+      now: Date.now() - 10 * 60_000,
+    }));
+    assert.equal(first.kind, "admitted");
+    if (first.kind !== "admitted") return;
+    assert.equal(await traceOf(first.dispatch.dispatchId), TRACE_A);
+
+    const taken = await backend.admitUserTurn(admitInput("s-trace-1", "cm-trace-1", {
+      traceId: TRACE_B,
+      ownerId: "conn-B",
+    }));
+    assert.equal(taken.kind, "admitted");
+    if (taken.kind !== "admitted") return;
+    assert.equal(taken.takeover, true);
+    assert.equal(taken.dispatch.dispatchId, first.dispatch.dispatchId);
+    assert.equal(await traceOf(first.dispatch.dispatchId), TRACE_B);
+    // The egress fallback lookup returns it.
+    const byBilling = await getDispatchByBillingRequestId(pool, "brq-cm-trace-1");
+    assert.equal(byBilling?.dispatchId, first.dispatch.dispatchId);
+    assert.equal(byBilling?.traceId, TRACE_B);
+  });
+
+  maybe("admit without a trace stores NULL; the lane backfill sets it once and keeps it", async () => {
+    const admitted = await backend.admitUserTurn(admitInput("s-trace-2", "cm-trace-2"));
+    assert.equal(admitted.kind, "admitted");
+    if (admitted.kind !== "admitted") return;
+    const dispatchId = admitted.dispatch.dispatchId;
+    assert.equal(await traceOf(dispatchId), null);
+    assert.equal(await backfillDispatchTraceId(pool, { dispatchId, traceId: TRACE_A }), true);
+    assert.equal(await traceOf(dispatchId), TRACE_A);
+    assert.equal(await backfillDispatchTraceId(pool, { dispatchId, traceId: TRACE_B }), false);
+    assert.equal(await traceOf(dispatchId), TRACE_A);
+  });
+
+  maybe("old binaries' turn_dispatches writes and reads still work after 0323", async () => {
+    // Seed the session and its user row through the current code path.
+    const seeded = await backend.admitUserTurn(admitInput("s-trace-3", "cm-trace-3-seed", { traceId: TRACE_A }));
+    assert.equal(seeded.kind, "admitted");
+    // Pre-0323 admit INSERT, verbatim (no trace_id column).
+    const oldDispatchId = randomUUID();
+    const past = new Date(Date.now() - 10 * 60_000);
+    await pool.query(
+      `INSERT INTO turn_dispatches
+         (dispatch_id, user_id, session_id, client_message_id, agent_id, model,
+          request_hash, billing_request_id, attempt_no, status,
+          owner_id, lease_epoch, lease_until, anchor_seq, admitted_at, last_attempt_at,
+          agent_container_id, runtime_kind)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'admitted',$9,1,$10,$11,$12,$12,$13,$14)`,
+      [oldDispatchId, UID.toString(), "s-trace-3", "cm-trace-3-old", "main", null, "t".repeat(64),
+        "brq-cm-trace-3-old", "conn-old", past, null, past, null, null],
+    );
+    assert.equal(await traceOf(oldDispatchId), null);
+    // Pre-0323 takeover UPDATE, verbatim: leaves trace_id alone.
+    await backfillDispatchTraceId(pool, { dispatchId: oldDispatchId, traceId: TRACE_A });
+    const took = await pool.query(
+      `UPDATE turn_dispatches
+          SET owner_id = $2, lease_epoch = lease_epoch + 1, lease_until = $3,
+              last_attempt_at = $4
+        WHERE dispatch_id = $1 AND lease_epoch = $5 AND status = 'admitted'`,
+      [oldDispatchId, "conn-old-2", new Date(Date.now() + 60_000), new Date(), "1"],
+    );
+    assert.equal(took.rowCount, 1);
+    assert.equal(await traceOf(oldDispatchId), TRACE_A);
+    // The read path (unchanged column list) maps both rows.
+    const read = await getDispatch(pool, oldDispatchId);
+    assert.equal(read?.ownerId, "conn-old-2");
+    assert.equal(read?.leaseEpoch, 2);
+  });
+});
 
 describe("pgSessionsBackend direct turn timeline", () => {
   maybe("timeline keeps a late legacy cost patched only onto the finalized tape anchor", async () => {

@@ -134,7 +134,7 @@ import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
 import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
-import { egressTraceFields } from "../egressTrace.js";
+import { dispatchTraceFallback, egressTraceFields } from "../egressTrace.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -1589,7 +1589,12 @@ export function makeAnthropicProxyHandler(
       // 判「未计费」发免单卡)。故:反查抛错(DB 抖动)→ 503 可重试拒绝;反查无行(签名 id 却查不到
       // dispatch,硬不一致)→ 409 拒绝。绝不 `.catch(()=>null)` 降级。legacy / 非 dispatch 请求
       // (gate 无 billingRequestId)才走 null 跳过。
-      let dispatchIdentity: { dispatchId: string; attemptNo: number; sessionId: string } | null = null;
+      let dispatchIdentity: {
+        dispatchId: string;
+        attemptNo: number;
+        sessionId: string;
+        traceId?: string | null;
+      } | null = null;
       const rejectDispatchFailClosed = async (
         status: number,
         code: string,
@@ -1630,6 +1635,12 @@ export function makeAnthropicProxyHandler(
             "dispatch_row_missing",
           );
           return;
+        }
+        // Plan §7.4: the header bound at egress step 0 wins; without one, link this request to the
+        // owning dispatch's trace (turn_dispatches.trace_id, 0323) so oc-trace can still find it.
+        const dispatchTraceId = dispatchTraceFallback(egressTraceFields(req), dispatchIdentity.traceId);
+        if (dispatchTraceId !== null) {
+          userLog.info("proxy_trace_from_dispatch", { dispatchId: dispatchIdentity.dispatchId, dispatchTraceId });
         }
       }
 

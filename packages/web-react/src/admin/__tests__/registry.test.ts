@@ -15,18 +15,18 @@ const EXPECTED: Record<string, string[]> = {
   财务与商业: ["ledger", "orders", "pricing", "plans", "org", "modelGrants"],
   用户声音与体验: ["feedback", "autoDreamFindings", "productFriction"],
   用户触达: ["inbox"],
-  内容运营: ["marketplace", "tutorials"],
+  内容运营: ["marketplace", "blog", "tutorials"],
   系统配置: ["literature", "settings"],
   运行与事故: ["health", "alerts", "selfheal"],
   审计与安全: ["contentReviews", "audit"],
 };
 
 describe("registry 完整性", () => {
-  test("恰好 26 个页面，key 无重复", () => {
-    expect(adminPages).toHaveLength(26);
+  test("恰好 27 个页面，key 无重复", () => {
+    expect(adminPages).toHaveLength(27);
     const keys = adminPages.map((p) => p.key);
-    expect(new Set(keys).size).toBe(26);
-    expect(adminTabKeys.size).toBe(26);
+    expect(new Set(keys).size).toBe(27);
+    expect(adminTabKeys.size).toBe(27);
   });
 
   test("每个 key 都存在且分组正确", () => {
@@ -44,8 +44,8 @@ describe("registry 完整性", () => {
     expect(adminGroups.map((g) => g.group)).toEqual(ADMIN_GROUP_ORDER);
     const flat = adminGroups.flatMap((g) => g.pages.map((p) => p.key));
     expect(flat).toEqual(Object.values(EXPECTED).flat());
-    expect(flat).toHaveLength(26);
-    expect(new Set(flat).size).toBe(26);
+    expect(flat).toHaveLength(27);
+    expect(new Set(flat).size).toBe(27);
   });
 
   test("每页有标题/描述/图标/懒组件", () => {
