@@ -31,7 +31,25 @@ class Pure(unittest.TestCase):
         with self.assertRaises(mb.JobError) as c:
             mb.validate_job({"id": "v", "kind": "video", "prompt": "x", "image_format": "png"}, self.L)
         self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
+    def test_check_binary_body_ok_and_short_and_bad_cr(self):
+        class H(dict):
+            def get(self, k, default=None):
+                return dict.get(self, k, default)
+        payload = b"x" * 10
+        ok_h = H({"Content-Range": "bytes 0-9/100"})
+        mb._check_binary_body(payload, ok_h, "bytes=0-9", 10)
+        with self.assertRaises(IOError) as c:
+            mb._check_binary_body(payload[:5], ok_h, "bytes=0-9", 10)
+        self.assertIn("short read", str(c.exception))
+        bad_h = H({"Content-Range": "bytes 1-10/100"})
+        with self.assertRaises(IOError) as c2:
+            mb._check_binary_body(payload, bad_h, "bytes=0-9", 10)
+        self.assertIn("Content-Range mismatch", str(c2.exception))
+        with self.assertRaises(IOError) as c3:
+            mb._check_binary_body(payload, H({}), "bytes=0-9", 10)
+        self.assertIn("Content-Range", str(c3.exception))
     def test_source_refs_validation(self):
+
         sha = hashlib.sha256(PNG).hexdigest()
         ref = {"n": 0, "bytes": len(PNG), "sha256": sha, "mime": "image/png"}
         job = mb.validate_job({"id": "r", "kind": "video", "prompt": "x", "source_images": None, "source_refs": [ref]}, self.L)
@@ -289,16 +307,28 @@ class E2E(unittest.TestCase):
         mm.S.src_flaky["ref2"] = 2
         r = self.res(self.ref_job("ref2", WEBP), 40)
         self.assertTrue(r["ok"], r)
+    def test_07f2_short_read_retried_then_ok(self):
+        # CDN/CF short body with matching Content-Range: bridge must retry, not fail once.
+        mm.S.src_short["ref2s"] = 2
+        r = self.res(self.ref_job("ref2s", WEBP), 60)
+        self.assertTrue(r["ok"], r)
     def test_07g_source_download_failure_is_a_result(self):
         n0 = len(argv_lines(self.argvlog))
         mm.S.src_flaky["ref3"] = 99
-        r = self.res(self.ref_job("ref3", WEBP), 40)
+        # 8 chunk attempts with capped backoff can take ~40s+ of sleep alone.
+        r = self.res(self.ref_job("ref3", WEBP), 120)
         self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
         self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
     def test_07h_source_checksum_mismatch(self):
         mm.S.src_corrupt.add("ref4")
         r = self.res(self.ref_job("ref4", WEBP), 40)
         self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+    def test_07i_content_range_mismatch_is_fetch_failed(self):
+        n0 = len(argv_lines(self.argvlog))
+        mm.S.src_bad_cr.add("ref5")
+        r = self.res(self.ref_job("ref5", WEBP), 120)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
     def test_07d_never_mixes_legacy_and_subagent(self):
         for call in argv_lines(self.argvlog):
             self.assertFalse(any(x in call for x in LEGACY) and any(x in call for x in SUBAGENT), call)
