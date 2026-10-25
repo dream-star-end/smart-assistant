@@ -147,8 +147,8 @@ export async function reserveImageUsage(pool: Pool, args: {
          ORDER BY response_expires_at ASC LIMIT 100
        )`,
     )
-    // Serialize quota admission per user. This makes the UTC daily check and
-    // one-in-flight insert a single decision even across master/egress nodes.
+    // Serialize admission per user so stale cleanup + one-in-flight insert stay
+    // a single decision across master/egress nodes (no daily count cap, OCV5-619).
     await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [args.userId.toString()])
     await client.query(
       `UPDATE image_generation_usage_records
@@ -169,14 +169,8 @@ export async function reserveImageUsage(pool: Pool, args: {
         WHERE a.usage_id=stale.id AND a.outcome='pending'`,
       [args.userId.toString()],
     )
-    const daily = await client.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM image_generation_usage_records
-       WHERE user_id=$1 AND (status='success' OR ledger_id IS NOT NULL)
-         AND request_id<>$2
-         AND completed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`,
-      [args.userId.toString(), args.requestId],
-    )
-    if (BigInt(daily.rows[0]?.count ?? '0') >= 10n) throw new ImageDailyLimitError()
+    // OCV5-619 (2026-10-25): no per-user daily Image 2 count cap. Credits / in-flight
+    // advisory lock still gate admission; ImageDailyLimitError kept for wire compat only.
     const inserted = await client.query<{ already_charged: boolean }>(
       `INSERT INTO image_generation_usage_records
          (user_id,container_id,request_id,job_id,operation,status,image_count,cost_credits)
