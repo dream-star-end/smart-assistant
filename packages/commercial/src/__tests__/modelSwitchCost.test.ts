@@ -204,23 +204,58 @@ test('B uses null counts/costs, effective prices and explicit scoped risk consen
   f.context.source = 'last-call'
   await assert.rejects(f.service.assertAuthorized('765', f.request, c.consent), confirmation)
 })
-test('displayed balance is rechecked when confirming, fresh balance gates dispatch', async () => {
-  const f = fixture()
-  f.context.tokens = null
-  f.context.source = 'unknown'
-  const q = await f.service.quote('765', f.request)
-  f.setBalance(9000n)
-  await assert.rejects(
-    f.service.confirm('765', f.request, q.quoteToken!),
-    (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_QUOTE_CHANGED',
-  )
-  const fresh = await f.service.quote('765', f.request)
-  const c = await f.service.confirm('765', f.request, fresh.quoteToken!)
-  f.setBalance(0n)
-  await assert.rejects(
-    f.service.assertAuthorized('765', f.request, c.consent),
-    (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
-  )
+test('balance changes that still cover the estimate do not invalidate confirmation', async () => {
+  for (const mode of ['estimate', 'risk']) {
+    const f = fixture()
+    if (mode === 'risk') {
+      f.context.tokens = null
+      f.context.source = 'unknown'
+    }
+    const q = await f.service.quote('765', f.request)
+    f.setBalance(9000n)
+    const c = await f.service.confirm('765', f.request, q.quoteToken!)
+    assert.ok(c.consent)
+    await f.service.assertAuthorized('765', f.request, c.consent)
+    f.setBalance(0n)
+    await assert.rejects(
+      f.service.assertAuthorized('765', f.request, c.consent),
+      (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+    )
+    await assert.rejects(
+      f.service.confirm('765', f.request, q.quoteToken!),
+      (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+    )
+  }
+})
+test('expected-cost boundary gates quote, confirmation and dispatch without relaxing consent', async () => {
+  for (const tokens of [200453, 5000]) {
+    const f = fixture()
+    f.context.tokens = tokens
+    const shown = await f.service.quote('765', f.request)
+    const expected = BigInt(shown.targetCost!.expectedCredits)
+    assert.ok(expected < BigInt(shown.targetCost!.highCredits))
+    f.setBalance(expected)
+    const q = await f.service.quote('765', f.request)
+    assert.equal(q.canConfirm, true)
+    assert.equal(q.targetCost!.highCredits, shown.targetCost!.highCredits)
+    let consent: string | undefined
+    if (q.requiresConfirmation) {
+      await assert.rejects(f.service.assertAuthorized('765', f.request), confirmation)
+      consent = (await f.service.confirm('765', f.request, shown.quoteToken!)).consent
+    }
+    await f.service.assertAuthorized('765', f.request, consent)
+    f.setBalance(expected - 1n)
+    assert.equal((await f.service.quote('765', f.request)).canConfirm, false)
+    await assert.rejects(
+      f.service.assertAuthorized('765', f.request, consent),
+      (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+    )
+    if (shown.quoteToken)
+      await assert.rejects(
+        f.service.confirm('765', f.request, shown.quoteToken),
+        (e) => e instanceof ModelSwitchCostError && e.code === 'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+      )
+  }
 })
 test('new/empty and actual same model do not ask, attachments require B', async () => {
   const f = fixture()

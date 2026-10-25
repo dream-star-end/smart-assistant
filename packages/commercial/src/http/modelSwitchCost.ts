@@ -71,7 +71,13 @@ export async function handleModelSwitchCost(
   } catch (e) {
     if (e instanceof ModelSwitchCostError)
       throw new HttpError(
-        e.code === 'UNAUTHORIZED_MODEL' ? 403 : e.code === 'MODEL_NOT_AVAILABLE' ? 404 : 409,
+        e.code === 'MODEL_SWITCH_UNAVAILABLE'
+          ? 503
+          : e.code === 'UNAUTHORIZED_MODEL'
+            ? 403
+            : e.code === 'MODEL_NOT_AVAILABLE'
+              ? 404
+              : 409,
         e.code,
         e.message,
       )

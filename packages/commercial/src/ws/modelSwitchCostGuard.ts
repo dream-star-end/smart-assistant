@@ -48,12 +48,25 @@ export async function checkModelSwitchFrame(
   }
 }
 
+const userActionRequiredCodes = new Set([
+  'MODEL_SWITCH_CONFIRMATION_REQUIRED',
+  'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+  'MODEL_SWITCH_QUOTE_CHANGED',
+  'MODEL_SWITCH_REQUEST_ID_REQUIRED',
+  'ERR_INSUFFICIENT_CREDITS',
+  'INSUFFICIENT_CREDITS',
+  'MODEL_NOT_AVAILABLE',
+  'UNAUTHORIZED_MODEL',
+  'UNRESOLVED_AGENT_MODEL',
+  'AGENT_NOT_FOUND',
+  'INVALID_REQUEST',
+  'INVALID_BIND_PAYLOAD',
+  'INVALID_SESSION_ID',
+  'ERR_FRAME_TOO_BIG',
+])
+
 export function promptQueueDispositionForCode(code: string): 'retryable' | 'user_action_required' {
-  return /^(?:MODEL_SWITCH_|ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(
-    code,
-  )
-    ? 'user_action_required'
-    : 'retryable'
+  return userActionRequiredCodes.has(code) ? 'user_action_required' : 'retryable'
 }
 
 /** OCV5-391: what a refused scheduler replay does with its recovery job. A refusal the user has

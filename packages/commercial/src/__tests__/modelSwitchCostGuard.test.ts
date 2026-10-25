@@ -71,7 +71,7 @@ test('authority target, formatted input and consent reach the one shared service
     'fixture-consent',
   ])
 })
-test('refusal and unavailable errors fail closed; queues and recovery pause for confirmation', async () => {
+test('refusal pauses for confirmation while unavailable errors fail closed and requeue', async () => {
   for (const thrown of [
     new ModelSwitchCostError('MODEL_SWITCH_CONFIRMATION_REQUIRED', 'confirm'),
     new Error('db'),
@@ -83,7 +83,38 @@ test('refusal and unavailable errors fail closed; queues and recovery pause for 
     } as unknown as ModelSwitchCostService
     const refusal = await checkModelSwitchFrame(service, '765', {}, input)
     assert.ok(refusal?.code.startsWith('MODEL_SWITCH_'))
-    assert.equal(promptQueueDispositionForCode(refusal!.code), 'user_action_required')
-    assert.equal(_recoveryRefusalAction(refusal!.code), 'pause')
+    const needsAction = thrown instanceof ModelSwitchCostError
+    assert.equal(
+      promptQueueDispositionForCode(refusal!.code),
+      needsAction ? 'user_action_required' : 'retryable',
+    )
+    assert.equal(_recoveryRefusalAction(refusal!.code), needsAction ? 'pause' : 'requeue')
+  }
+})
+
+test('only explicit user-action codes pause recovery', () => {
+  for (const code of [
+    'MODEL_SWITCH_CONFIRMATION_REQUIRED',
+    'MODEL_SWITCH_INSUFFICIENT_BALANCE',
+    'MODEL_SWITCH_QUOTE_CHANGED',
+    'MODEL_SWITCH_REQUEST_ID_REQUIRED',
+    'UNAUTHORIZED_MODEL',
+    'MODEL_NOT_AVAILABLE',
+    'UNRESOLVED_AGENT_MODEL',
+    'AGENT_NOT_FOUND',
+    'INVALID_REQUEST',
+    'ERR_FRAME_TOO_BIG',
+    'ERR_INSUFFICIENT_CREDITS',
+    'INSUFFICIENT_CREDITS',
+  ]) {
+    assert.equal(_recoveryRefusalAction(code), 'pause', code)
+  }
+  for (const code of [
+    'MODEL_SWITCH_UNAVAILABLE',
+    'MODEL_SWITCH_FUTURE_TRANSIENT',
+    'MODEL_NOT_AVAILABLE_LATER',
+    'INVALID_FUTURE_TRANSIENT',
+  ]) {
+    assert.equal(_recoveryRefusalAction(code), 'requeue', code)
   }
 })

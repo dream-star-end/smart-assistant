@@ -302,14 +302,17 @@ export function useSessionModelAndCollab({
             const fresh = await api.getCollaborationConfig(collabAuth, activeId);
             if (!isCurrent()) return;
             if (keepCollabChoiceOnSaveFailure(mode)) {
-              setCollabUi((cur) => ({ ...docToUiState(fresh), mode, advisorModel: null, configVersion: "" }));
+              setCollabUi({ ...docToUiState(fresh), mode, advisorModel: null, configVersion: "" });
+              const saved = await api.putCollaborationConfig(collabAuth, collaborationPutBody({
+                sessionId: activeId, mode, advisorModel: null, expectedRev: fresh.rev, asDefault,
+              }));
+              if (!isCurrent()) return;
+              applyCollabDoc(saved);
             } else applyCollabDoc(fresh);
-            setCollabSaveError("配置已被更新，请确认后再选一次");
-            toast("协作配置有更新，已重新读取，请再选一次", "error");
             return;
           } catch (rereadErr) {
             if (!isCurrent()) return;
-            failSave(apiErrorMessage(rereadErr, "协作配置冲突后重读失败"));
+            failSave(apiErrorMessage(rereadErr, "协作配置更新后保存失败"));
             return;
           }
         }

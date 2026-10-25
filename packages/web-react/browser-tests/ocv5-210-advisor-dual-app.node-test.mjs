@@ -700,7 +700,7 @@ for (const entry of ["header", "picker", "goal", "github"]) test(`team close per
 
 test("legacy device team flag cannot activate team before account config arrives", { timeout: 120_000 }, async () => {
   const bundle = await buildCollabApp();
-  const { http } = startFixture();
+  const { http, inbounds } = startFixture();
   await new Promise(done => http.listen(0, "127.0.0.1", done));
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
   let release;
@@ -715,9 +715,15 @@ test("legacy device team flag cannot activate team before account config arrives
     const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
     await page.getByRole("button", { name: /切换智能体/ }).click();
     assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true", "a previous account's legacy flag must not select team while GET is pending");
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog").waitFor({ state: "hidden" });
+    await sendFixtureTurn(page, inbounds, "GET未返回也可发送");
+    assert.equal(inbounds.at(-1).collabMode, "solo");
+    assert.equal(inbounds.at(-1).teamMode, undefined);
     const loaded = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "GET");
     release();
     await loaded;
+    await page.getByRole("button", { name: /切换智能体/ }).click();
     assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "false");
     assert.deepEqual(errors, []);
     await context.close();
@@ -751,7 +757,7 @@ test("closing an existing team stays solo on save failure and can persist on exp
       await page.getByRole("button", { name: /切换智能体/ }).click();
       assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true", "a failed save or CAS reread must not reopen team");
       // apiErrorMessage deliberately replaces technical English with this user-facing fallback.
-      await page.getByRole("dialog").getByText(status === 409 ? /配置已被更新/ : /协作配置保存失败/).waitFor();
+      await page.getByRole("dialog").getByText(status === 409 ? /协作配置更新后保存失败/ : /协作配置保存失败/).waitFor();
       setWriteStatus(0);
       const saved = page.waitForResponse(r => r.url().includes("/api/collaboration-config") && r.request().method() === "PUT");
       await page.getByRole("button", { name: /主模型独立完成/ }).click();
@@ -868,6 +874,49 @@ test("first-send cost confirmation keeps the draft and commits solo only after a
     assert.equal(await reopened.page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
     assert.deepEqual(errors, []);
     assert.deepEqual(reopened.errors, []);
+    await context.close();
+  } finally {
+    await browser.close();
+    await new Promise(done => http.close(done));
+  }
+});
+
+
+test("one collaboration conflict saves the clicked solo mode without asking again", { timeout: 120_000 }, async () => {
+  const bundle = await buildCollabApp();
+  const { http, inbounds, sessionCollab } = startFixture({ defaultMode: "team" });
+  await new Promise(done => http.listen(0, "127.0.0.1", done));
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
+    const { page, errors } = await bootPage(context, `http://127.0.0.1:${http.address().port}`, bundle.outputFiles[0].text);
+    await page.getByRole("button", { name: "团队模式已开启", exact: true }).waitFor();
+    await sendFixtureTurn(page, inbounds, "冲突前团队会话");
+    const sid = inbounds.at(-1).peer.id;
+    const puts = [];
+    await context.route("**/api/collaboration-config**", async route => {
+      if (route.request().method() === "PUT") {
+        puts.push(route.request().postDataJSON());
+        if (puts.length === 1) {
+          const fresh = sessionCollab.get(sid);
+          sessionCollab.set(sid, { ...fresh, rev: fresh.rev + 1 });
+          await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "conflict" }) });
+          return;
+        }
+      }
+      await route.continue();
+    });
+    await page.getByRole("button", { name: "团队模式已开启", exact: true }).click();
+    await page.getByRole("button", { name: "关闭团队模式", exact: true }).click();
+    await waitUntil(() => sessionCollab.get(sid)?.session.mode === "solo", 10_000, "clicked mode was not saved after conflict");
+    assert.equal(puts.length, 2);
+    assert.equal(puts[1].expectedRev, puts[0].expectedRev + 1);
+    assert.equal(puts[1].mode, "solo");
+    assert.equal(await page.getByText(/再选一次/).count(), 0);
+    await sendFixtureTurn(page, inbounds, "冲突后直接发送");
+    assert.equal(inbounds.at(-1).collabMode, "solo");
+    assert.equal(inbounds.at(-1).teamMode, undefined);
+    assert.deepEqual(errors, []);
     await context.close();
   } finally {
     await browser.close();
