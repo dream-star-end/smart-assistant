@@ -17,6 +17,7 @@ const doc = (mode: CollabMode, rev: number): CollaborationConfigDoc => ({
 function setup() {
   const input = {
     activeId: 'own',
+    modelId: undefined,
     auth: createMemoryAuthSession(() => {}, 'fixture'),
     agent: { id: 'main', name: 'Main', description: '' },
     demo: false,
