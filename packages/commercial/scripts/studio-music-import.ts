@@ -6,7 +6,7 @@
  *
  * Paths in the manifest are relative to its directory. Blobs go under OC_STUDIO_ROOT (default
  * /var/lib/openclaude-v5/studio). Production runs only as a manual migration step after a release
- * that carries 0325 (commercial release needs the user's approval).
+ * that carries 0329 (commercial release needs the user's approval).
  */
 import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'

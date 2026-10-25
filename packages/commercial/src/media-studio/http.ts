@@ -254,7 +254,7 @@ export async function dispatchStudioRoute(
     return
   }
   if (path === '/music/tracks' && method === 'POST') {
-    // My Music (0325): the uploader states they own the music or are licensed to use it.
+    // My Music (0329): the uploader states they own the music or are licensed to use it.
     if (url.searchParams.get('rights') !== 'own_or_licensed')
       throw new HttpError(
         400,

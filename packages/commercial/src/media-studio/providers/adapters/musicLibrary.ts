@@ -1,5 +1,5 @@
 // OCV5-591 M1 — music sources under the shared provider interface (user decision 2026-10-23 14:11,
-// MUSIC-PLAN): the curated royalty-free catalog (0325, every track hand-verified) and the user's own
+// MUSIC-PLAN): the curated royalty-free catalog (0329, every track hand-verified) and the user's own
 // tracks. Both answer search() and run `music.fetch`, which turns a chosen track into a music take:
 // the audio becomes the user's blob (ref on the take) and the licence snapshot rides in the take's
 // meta. Neither charges anything. AI generation stays an empty `music.generate` slot.

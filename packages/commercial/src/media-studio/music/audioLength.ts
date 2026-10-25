@@ -3,7 +3,7 @@
 // length feeds the music search filters, the editor and compose; BPM needs audio analysis and
 // stays unknown for uploads.
 
-/** Longest length the 0325 CHECK accepts (30 min); anything else is stored as unknown. */
+/** Longest length the 0329 CHECK accepts (30 min); anything else is stored as unknown. */
 const MAX_MS = 1_800_000
 
 export function audioDurationMs(mime: string, b: Buffer): number | null {

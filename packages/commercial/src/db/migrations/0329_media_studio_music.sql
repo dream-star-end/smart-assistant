@@ -1,5 +1,5 @@
--- order-dependency: 0324_media_studio
--- 0325_media_studio_music.sql (commercial; OCV5-591 M1, media studio music sources)
+-- order-dependency: 0328_community_tutorial_revisions
+-- 0329_media_studio_music.sql (commercial; OCV5-591 M1, media studio music sources)
 -- Music sources under the studio provider registry (user decision 2026-10-23 14:11, MUSIC-PLAN):
 --   * studio_music_catalog: the site-wide curated royalty-free library. Every row was verified by
 --     hand: licence, attribution and a snapshot of the source page (evidence_sha) are stored with it.
@@ -11,7 +11,7 @@
 -- and the FKs below (ON DELETE RESTRICT) refuse to drop such a blob.
 -- Retention: catalog rows are site data kept as licence evidence; user tracks are user-owned data
 -- removed with the user (FK cascade).
--- Rollback: db/rollbacks/0325_media_studio_music.sql.
+-- Rollback: db/rollbacks/0329_media_studio_music.sql.
 
 -- compat: additive tables; old binaries never read or write them
 CREATE TABLE IF NOT EXISTS studio_music_catalog (

@@ -120,7 +120,7 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /**
- * Site-owned content with no user ref (OCV5-591 M1, 0325): the curated music catalog's audio and
+ * Site-owned content with no user ref (OCV5-591 M1, 0329): the curated music catalog's audio and
  * the snapshots that prove its licences. The GC never collects it while a catalog row points at it.
  */
 const CATALOG_HOLDS =

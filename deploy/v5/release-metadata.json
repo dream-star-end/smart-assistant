@@ -191,10 +191,11 @@
     "0322_minimax_voices",
     "0323_turn_dispatches_trace_id",
     "0324_media_studio",
-    "0325_media_studio_music",
+    "0329_media_studio_music",
     "0326_community_blog",
     "0327_community_tutorial_moderation",
-    "0328_community_tutorial_revisions"
+    "0328_community_tutorial_revisions",
+    "0329_media_studio_music"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

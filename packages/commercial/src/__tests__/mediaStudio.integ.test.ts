@@ -11,7 +11,7 @@
  *      / disk-floor quota refuse without leaking a hold; an oversize stream aborts cleanly; dropRefs
  *      gives bytes back; gc removes unreferenced content and expired holds.
  *   4. the GC tick purges projects soft-deleted more than 7 days ago with their refs.
- *   5. (0325) catalog audio and licence evidence are site-owned and kept while listed; licence rules
+ *   5. (0329) catalog audio and licence evidence are site-owned and kept while listed; licence rules
  *      and the user-track rights statement are enforced by the schema.
  */
 import assert from 'node:assert/strict'
@@ -595,7 +595,7 @@ describe('media studio blobs', () => {
   })
 })
 
-describe('media studio music catalog (0325, OCV5-591 M1)', () => {
+describe('media studio music catalog (0329, OCV5-591 M1)', () => {
   async function catalogRow(over: Record<string, unknown> = {}) {
     const root = await mkdtemp(path.join(tmpdir(), 'oc-studio-cat-'))
     const blobs = blobStore(root)

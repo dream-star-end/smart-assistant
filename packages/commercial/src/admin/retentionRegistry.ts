@@ -198,7 +198,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "studio_blobs",
   "studio_charges",
   "studio_lines",
-  // OCV5-591 M1 (0325): the curated music catalog is site data kept as licence evidence (rows are
+  // OCV5-591 M1 (0329): the curated music catalog is site data kept as licence evidence (rows are
   // retired, not deleted); studio_user_tracks is user-owned music removed with the user (FK cascade).
   "studio_music_catalog",
   "studio_projects",

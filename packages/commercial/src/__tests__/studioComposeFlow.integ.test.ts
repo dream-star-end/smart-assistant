@@ -1,5 +1,5 @@
 /**
- * OCV5-591 A2-1c compose on real Postgres (0324/0325), with a fake sandbox:
+ * OCV5-591 A2-1c compose on real Postgres (0324/0329), with a fake sandbox:
  *
  *   1. when every shot and line is ready the director queues one compose and the project composes;
  *      the run stores the film as a free final take (QA, credits, the user's own ref), the project

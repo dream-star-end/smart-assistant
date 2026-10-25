@@ -1,4 +1,4 @@
-// OCV5-591 M1 — import hand-verified tracks into the curated music catalog (0325). The manifest is
+// OCV5-591 M1 — import hand-verified tracks into the curated music catalog (0329). The manifest is
 // written by the verification run (music-catalog/CHECKLIST.md): every entry names its audio file
 // and the snapshot of its source page together with their SHA-256, so a file that changed after it
 // was verified is refused. Audio and snapshot become site-owned blobs (putSite); the row is inserted
