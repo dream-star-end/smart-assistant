@@ -31,6 +31,26 @@ class Pure(unittest.TestCase):
         with self.assertRaises(mb.JobError) as c:
             mb.validate_job({"id": "v", "kind": "video", "prompt": "x", "image_format": "png"}, self.L)
         self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
+    def test_source_refs_validation(self):
+        sha = hashlib.sha256(PNG).hexdigest()
+        ref = {"n": 0, "bytes": len(PNG), "sha256": sha, "mime": "image/png"}
+        job = mb.validate_job({"id": "r", "kind": "video", "prompt": "x", "source_images": None, "source_refs": [ref]}, self.L)
+        self.assertEqual(job["source_refs"], [ref]); self.assertNotIn("source_images", job)
+        bad = [
+            {"source_images": [{"base64": b64(PNG)}], "source_refs": [ref]},
+            {"source_refs": []},
+            {"source_refs": [dict(ref, n=1)]},
+            {"source_refs": [dict(ref, bytes=0)]},
+            {"source_refs": [dict(ref, bytes=True)]},
+            {"source_refs": [dict(ref, bytes=self.L["source_max_bytes"] + 1)]},
+            {"source_refs": [dict(ref, sha256="ab")]},
+            {"source_refs": [dict(ref, mime="image/gif")]},
+            {"source_refs": [ref] * (self.L["max_source_images"] + 1)},
+        ]
+        for extra in bad:
+            with self.assertRaises(mb.JobError, msg=str(extra)[:80]) as c:
+                mb.validate_job(dict({"id": "r", "kind": "video", "prompt": "x"}, **extra), self.L)
+            self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
     def test_two_step_argv(self):
         job = mb.validate_job({"id": "e", "kind": "image", "prompt": "make it blue", "image_format": "png",
                                "source_images": [{"base64": b64(PNG)}, {"base64": b64(WEBP)}],
@@ -251,6 +271,34 @@ class E2E(unittest.TestCase):
         self.assertEqual(gen[gen.index("--resume-from-snapshot-id") + 1], "5421fa39-fc25:v6485l")
         conv = json.loads(gen[gen.index("--conversation-json") + 1])
         self.assertEqual(conv, [{"image": "1518875720082600"}, {"text": "same fox, new scene"}])
+    def ref_job(self, jid, data, **kw):
+        mm.S.sources[jid] = [data]
+        ref = {"n": 0, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mime": "image/webp"}
+        return self.job(jid, kind="video", prompt="the fox starts running", source_images=None, source_refs=[ref], **kw)
+    def test_07e_image_to_video_by_reference(self):
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.ref_job("ref1", WEBP))
+        self.assertTrue(r["ok"], r)
+        ev = [e for e in mm.S.events if e[1] == "ref1"]
+        self.assertEqual(ev[0], ("ack", "ref1"), "no source download before the ack")
+        # 64-byte Range requests (mock hello limits), in order, covering the whole file.
+        self.assertEqual([e[2] for e in ev[1:]], ["bytes=0-63", "bytes=64-%d" % (len(WEBP) - 1)])
+        calls = argv_lines(self.argvlog)[n0:]
+        self.assertEqual(len(calls), 2); self.assertIn("--upload-only", calls[0])
+    def test_07f_source_download_retried(self):
+        mm.S.src_flaky["ref2"] = 2
+        r = self.res(self.ref_job("ref2", WEBP), 40)
+        self.assertTrue(r["ok"], r)
+    def test_07g_source_download_failure_is_a_result(self):
+        n0 = len(argv_lines(self.argvlog))
+        mm.S.src_flaky["ref3"] = 99
+        r = self.res(self.ref_job("ref3", WEBP), 40)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
+    def test_07h_source_checksum_mismatch(self):
+        mm.S.src_corrupt.add("ref4")
+        r = self.res(self.ref_job("ref4", WEBP), 40)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
     def test_07d_never_mixes_legacy_and_subagent(self):
         for call in argv_lines(self.argvlog):
             self.assertFalse(any(x in call for x in LEGACY) and any(x in call for x in SUBAGENT), call)

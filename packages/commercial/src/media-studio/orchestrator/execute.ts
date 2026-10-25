@@ -8,6 +8,7 @@ import type { Pool, PoolClient } from 'pg'
 
 import type { GrokRunner, GrokVisionUsage } from '../../grok/visionProxy.js'
 import type { StudioBlobStore } from '../blobs.js'
+import { MUSE_SOURCE_FAILED_TEXT, isMuseSourceFailure } from '../providers/museFailures.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import { MediaProviderError, type MediaRequest, type MediaResult } from '../providers/types.js'
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
@@ -639,7 +640,9 @@ async function failGen(
       ownerId: g.ownerId,
       takeId: g.takeId,
       code: e.code,
-      message: `${g.providerId} 失败（${e.code}），会自动换下一个可用的服务。`,
+      message: isMuseSourceFailure(g.providerId, g.request.op, e.code)
+        ? `${MUSE_SOURCE_FAILED_TEXT}（${e.code}），会自动换下一个可用的服务。`
+        : `${g.providerId} 失败（${e.code}），会自动换下一个可用的服务。`,
     })
     await finishStudioTask(c, task, { status: 'failed', error: `${e.code}: ${e.message}` })
   })

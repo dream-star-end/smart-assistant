@@ -9,9 +9,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 
-import { makeMuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
+import type { Logger } from '../logging/logger.js'
+import { makeMuseBridgeHttpHandler, parseByteRange } from '../muse/bridgeHttp.js'
 import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
-import { MuseError, parseAllowedUids, parseSubmission } from '../muse/protocol.js'
+import {
+  INLINE_SOURCE_MAX_BYTES,
+  MuseError,
+  base64DecodedBytes,
+  bridgeFetchesSources,
+  parseAllowedUids,
+  parseSubmission,
+} from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
 const TOKEN = `mbr_${'x'.repeat(43)}`
@@ -82,6 +90,7 @@ function makeHub(
   clock: { t: number },
   root: string,
   rate = { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+  logger?: Logger,
 ) {
   return new MuseBridgeHub({
     store,
@@ -90,8 +99,24 @@ function makeHub(
     rate,
     cliTimeoutSec: { image: 120, video: 300 },
     now: () => clock.t,
+    ...(logger ? { logger } : {}),
   })
 }
+
+/** A logger that records warnings (msg + meta). */
+function captureLogger(warns: Array<[string, Record<string, unknown>]>): Logger {
+  const l = {
+    child: () => l,
+    debug: () => {},
+    info: () => {},
+    error: () => {},
+    warn: (msg: string, meta?: Record<string, unknown>) => warns.push([msg, meta ?? {}]),
+  }
+  return l as unknown as Logger
+}
+
+/** A PNG-signed buffer of exactly n bytes (the hub only sniffs the magic number). */
+const pngOf = (n: number) => Buffer.concat([PNG.subarray(0, 8), Buffer.alloc(n - 8, 3)])
 
 const flush = () => new Promise((r) => setImmediate(r))
 
@@ -133,6 +158,40 @@ describe('muse protocol', () => {
       resume_snapshot_id: 'abc:v1',
     })
     assert.equal(ok.source_images?.length, 1)
+  })
+})
+
+describe('muse source references (OCV5-591 ref-A)', () => {
+  it('only bridges >= 0.5.0 fetch sources themselves', () => {
+    for (const v of ['0.5.0', '0.5.1', '0.6.0', '1.0.0', '0.10.0', '0.5.0-rc1'])
+      assert.equal(bridgeFetchesSources(v), true, v)
+    for (const v of [null, '', '0.4.0', '0.4.9', '0.3.2', 'x', '0.5'])
+      assert.equal(bridgeFetchesSources(v), false, String(v))
+  })
+  it('decoded size of canonical base64', () => {
+    for (const n of [1, 2, 3, 4, 1000, 524_288]) {
+      assert.equal(base64DecodedBytes(Buffer.alloc(n, 9).toString('base64')), n)
+    }
+  })
+  it('byte ranges: none, a-b, a-, clamped end; anything else 416', () => {
+    assert.equal(parseByteRange(undefined, 10), null)
+    assert.deepEqual(parseByteRange('bytes=0-3', 10), { start: 0, end: 3 })
+    assert.deepEqual(parseByteRange('bytes=4-', 10), { start: 4, end: 9 })
+    assert.deepEqual(parseByteRange('bytes=8-99', 10), { start: 8, end: 9 })
+    for (const bad of [
+      'bytes=10-',
+      'bytes=5-2',
+      'bytes=-3',
+      'bytes=0-1,4-5',
+      'items=0-1',
+      'bytes=a-b',
+    ]) {
+      assert.throws(
+        () => parseByteRange(bad, 10),
+        (e: MuseError) => e.status === 416,
+        bad,
+      )
+    }
   })
 })
 
@@ -261,6 +320,109 @@ describe('muse hub', () => {
     const v = await hub.view('3', id, 0)
     assert.equal(v?.status, 'failed')
     assert.equal(v?.error?.code, 'MUSE_BRIDGE_LOST')
+  })
+
+  it('the ack-timeout and give-up logs carry the claim size (OCV5-591)', async () => {
+    const warns: Array<[string, Record<string, unknown>]> = []
+    const logged = makeHub(store, clock, root, undefined, captureLogger(warns))
+    const sid = logged.hello('1', '0.4.0')
+    await logged.submit('3', null, {
+      kind: 'video',
+      prompt: 'x',
+      source_images: [pngOf(1000).toString('base64')],
+    })
+    for (let i = 0; i < 3; i++) {
+      const job = (await logged.poll(sid, 50))!
+      assert.ok(job.source_images)
+      clock.t += 21_000
+      logged.checkSession(sid)
+      logged.tick()
+    }
+    logged.stop()
+    const sizes = warns
+      .filter(([m]) => m === 'muse_job_ack_timeout_requeued' || m === 'muse_job_never_acked')
+      .map(([m, meta]) => [m, meta.claimBytes])
+    assert.equal(sizes.length, 3)
+    assert.equal(sizes[2]![0], 'muse_job_never_acked')
+    for (const [, n] of sizes) assert.ok(typeof n === 'number' && n > 1300, String(n))
+  })
+
+  it('bridges < 0.5 get sources inline; >= 0.5 get references and download them after the ack', async () => {
+    const src = pngOf(2000)
+    const spec = { kind: 'video' as const, prompt: 'cat', source_images: [src.toString('base64')] }
+    const oldSid = hub.hello('1', '0.4.0')
+    await hub.submit('3', null, spec)
+    const inline = (await hub.poll(oldSid, 50))!
+    assert.deepEqual(inline.source_images, [{ base64: src.toString('base64') }])
+    assert.equal(inline.source_refs, undefined)
+    // A 0.5 bridge says hello: the dispatched job goes back to the queue and comes out by reference.
+    const sid = hub.hello('1', '0.5.0')
+    const byRef = (await hub.poll(sid, 50))!
+    assert.equal(byRef.id, inline.id)
+    assert.equal(byRef.source_images, null)
+    assert.deepEqual(byRef.source_refs, [
+      { n: 0, bytes: 2000, sha256: sha(src), mime: 'image/png' },
+    ])
+    assert.ok(JSON.stringify({ job: byRef }).length < 1000)
+    // Not before the ack, never for a stale nonce, never out of range.
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+    hub.heartbeat(byRef.id, byRef.nonce)
+    assert.throws(
+      () => hub.source(byRef.id, inline.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 1),
+      (e: MuseError) => e.status === 404,
+    )
+    clock.t += 50_000
+    const got = hub.source(byRef.id, byRef.nonce, 0)
+    assert.ok(got.data.equals(src))
+    assert.equal(got.sha256, sha(src))
+    // The download counts as a sign of life: 50 s after the ack plus 50 s more is not "lost".
+    clock.t += 50_000
+    hub.tick()
+    assert.equal((await hub.view('3', byRef.id, 0))?.status, 'running')
+    // Gone once the job is finished.
+    await hub.result(byRef.id, byRef.nonce, {
+      ok: false,
+      error_code: 'MUSE_SOURCE_FETCH_FAILED',
+      retryable: true,
+    })
+    const v = await hub.view('3', byRef.id, 0)
+    assert.equal(v?.error?.code, 'MUSE_SOURCE_FETCH_FAILED')
+    assert.equal(v?.error?.retryable, true)
+    assert.throws(
+      () => hub.source(byRef.id, byRef.nonce, 0),
+      (e: MuseError) => e.status === 410,
+    )
+  })
+
+  it('large inline sources are refused up front only while the bridge is older than 0.5', async () => {
+    const big = {
+      kind: 'video' as const,
+      prompt: 'x',
+      source_images: [pngOf(INLINE_SOURCE_MAX_BYTES + 1).toString('base64')],
+    }
+    const atCap = {
+      kind: 'video' as const,
+      prompt: 'x',
+      source_images: [pngOf(INLINE_SOURCE_MAX_BYTES).toString('base64')],
+    }
+    for (const version of ['0.4.0', null]) {
+      hub.hello('1', version)
+      await assert.rejects(
+        hub.submit('3', null, big),
+        (e: MuseError) =>
+          e.status === 413 && e.code === 'MUSE_SOURCE_TOO_LARGE' && /0\.5/.test(e.message),
+      )
+    }
+    assert.ok(await hub.submit('3', null, atCap))
+    hub.hello('1', '0.5.0')
+    assert.ok(await hub.submit('3', null, big))
   })
 
   it('a poll response that could not be written puts the job back', async () => {
@@ -606,5 +768,43 @@ describe('muse bridge http', () => {
     assert.equal(res.status, 200)
     assert.equal((await hub.view('3', job.id, 0))?.status, 'succeeded')
     assert.equal((await post('/jobs/../../etc/heartbeat', {}, hdr)).status, 404)
+  })
+
+  it('GET sources (bridge 0.5): 410 before the ack, whole file, a Range slice, 416, 404', async () => {
+    const sid = (await post('/hello', { bridge_version: '0.5.0' })).json.session_id
+    const hdr = { 'x-muse-bridge-session': sid }
+    const src = pngOf(3000)
+    await hub.submit('3', null, {
+      kind: 'video',
+      prompt: 'x',
+      source_images: [src.toString('base64')],
+    })
+    const job = (await post('/poll', {}, hdr)).json.job
+    assert.equal(job.source_images, null)
+    assert.equal(job.source_refs[0].sha256, sha(src))
+    const get = (n: number, extra: Record<string, string> = {}, nonce = job.nonce) =>
+      fetch(`${base}/jobs/${job.id}/sources/${n}`, {
+        headers: { authorization: `Bearer ${TOKEN}`, ...hdr, 'x-job-nonce': nonce, ...extra },
+      })
+    assert.equal((await get(0)).status, 410)
+    assert.equal(
+      (await post(`/jobs/${job.id}/heartbeat`, { job_nonce: job.nonce }, hdr)).status,
+      200,
+    )
+    assert.equal((await get(0, {}, 'stale')).status, 410)
+    const whole = await get(0)
+    assert.equal(whole.status, 200)
+    assert.equal(whole.headers.get('x-source-sha256'), sha(src))
+    assert.ok(Buffer.from(await whole.arrayBuffer()).equals(src))
+    const part = await get(0, { range: 'bytes=1000-1999' })
+    assert.equal(part.status, 206)
+    assert.equal(part.headers.get('content-range'), 'bytes 1000-1999/3000')
+    assert.ok(Buffer.from(await part.arrayBuffer()).equals(src.subarray(1000, 2000)))
+    assert.equal((await get(0, { range: 'bytes=3000-' })).status, 416)
+    assert.equal((await get(1)).status, 404)
+    const noSession = await fetch(`${base}/jobs/${job.id}/sources/0`, {
+      headers: { authorization: `Bearer ${TOKEN}`, 'x-job-nonce': job.nonce },
+    })
+    assert.equal(noSession.status, 400)
   })
 })
