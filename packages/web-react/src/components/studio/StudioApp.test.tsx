@@ -140,6 +140,9 @@ describe('StudioApp (OCV5-593)', () => {
     expect(await screen.findByText('一句话，拍一支片。')).toBeInTheDocument()
     expect(await screen.findByText('还没有项目')).toBeInTheDocument()
     expect(screen.getByText('配乐（未配置）')).toBeInTheDocument()
+    // 全自动 runs plan → generation without a stop; the estimate comes with the storyboard.
+    expect(screen.getByText(/导演写好分镜后先算出预估，超出预算会暂停问你/)).toBeInTheDocument()
+    expect(screen.queryByText(/开拍前会先给出预估/)).not.toBeInTheDocument()
 
     fireEvent.change(screen.getByLabelText('影片需求'), {
       target: { value: '拍一条 30 秒的冬日红狐短片。纪录片质感' },
@@ -207,7 +210,43 @@ describe('StudioApp (OCV5-593)', () => {
     await waitFor(() =>
       expect(screen.queryByRole('button', { name: /全自动开始/ })).not.toBeInTheDocument(),
     )
-    expect(screen.getByText(/导演 agent 正在工作/)).toBeInTheDocument()
+    expect(screen.getByTestId('studio-progress-note')).toHaveTextContent(
+      '导演 agent 正在写分镜（通常一分钟内），写好后会显示镜头和预估费用。',
+    )
+  })
+
+  test('brief page: the storyboard estimate is shown while running and when asking to approve', async () => {
+    let view: Partial<StudioProject> = {
+      status: 'running',
+      settings: { estimateCredits: '456' },
+    }
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: { project: project(view), shots: [], lines: [], assets: [], takes: [], events: [] },
+    })
+    mount(`/studio/p/${ID}/brief`)
+    expect(await screen.findByTestId('studio-progress-note')).toHaveTextContent(
+      '分镜预估 456 积分，导演 agent 正在生成。',
+    )
+    cleanup()
+    view = {
+      status: 'awaiting_user',
+      settings: { estimateCredits: '456', awaitingReason: 'approve_plan' },
+    }
+    mount(`/studio/p/${ID}/brief`)
+    expect(
+      await screen.findByText('分镜已写好，预估 456 积分；确认后导演 agent 开始生成镜头。'),
+    ).toBeInTheDocument()
+    cleanup()
+    view = {
+      status: 'awaiting_user',
+      settings: { estimateCredits: '2400', awaitingReason: 'budget' },
+    }
+    mount(`/studio/p/${ID}/brief`)
+    expect(
+      await screen.findByText('预估 2,400 积分，超过了当前预算，调高预算后再继续。'),
+    ).toBeInTheDocument()
   })
 
   test('brief page: empty brief keeps start disabled', async () => {
