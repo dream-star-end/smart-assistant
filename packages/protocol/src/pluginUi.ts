@@ -70,6 +70,15 @@ export const PLUGIN_UI_COMPONENTS: readonly PluginUiComponentSet[] = Object.free
     doc: 'references/ui-feishu.md',
     types: ['feishu_events', 'feishu_doc'],
   },
+  {
+    // 平台内置的经验分享（OCV5-577 跟进）：不是第三方插件，但同样按需加载，只随 blog-writer 技能进上下文。
+    plugin: 'community-blog',
+    displayName: '经验分享',
+    author: 'model',
+    skill: 'blog-writer',
+    doc: 'references/ui-blog.md',
+    types: ['blog_draft', 'blog_status', 'blog_published'],
+  },
 ])
 
 /** 组件类型 → 所属插件；通用组件返回 null。 */

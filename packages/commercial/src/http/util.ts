@@ -247,6 +247,28 @@ async function readRawBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Pro
 }
 
 /**
+ * 原始字节 body(图片上传等)。Content-Length 声明超限时不读就拒;实际字节超限同样 413。
+ * 没有默认上限,调用方必须按路由语义显式给出。
+ */
+export async function readBinaryBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new HttpError(413, "PAYLOAD_TOO_LARGE", `request body exceeds ${maxBytes} bytes`);
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      throw new HttpError(413, "PAYLOAD_TOO_LARGE", `request body exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/**
  * 安全 JSON body 读取,带大小上限。默认 64KB 挡 DoS;仅确有大载荷语义的路由
  * (目前只有市场发布:正文+bundle)显式传更大的 maxBytes,不放大全局攻击面。
  */
