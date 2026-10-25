@@ -19,6 +19,11 @@ export async function waitForBoxReplay<T extends { kind: string }>(first: T,
     if (opts.signal.aborted) break;
     current = await lookup();
   }
+  // OCV5-620: one last lookup after the wait loop so a settle/ready that
+  // lands in the final interval is not discarded as BOX_REPLAY_PENDING.
+  if (current.kind === "pending" && !opts.signal.aborted) {
+    current = await lookup();
+  }
   return current;
 }
 

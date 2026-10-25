@@ -40,6 +40,8 @@ import {
   boxTurnMayIdle,
   currentIdleSource,
   idleAbandonReason,
+  idleApplyStuckReason,
+  idleCandidateAgedOut,
   idleOpSettled,
   idleProofWaitMs,
   pruneIdleOps,
@@ -188,6 +190,23 @@ async function settleStrandedIdleOp(
   op: IdleOp,
   recoveryDir: string,
 ): Promise<void> {
+  // OCV5-620: apply-stuck settles even when a summary is prepared (that case
+  // is intentionally excluded from idleAbandonReason).
+  const evidenced = withIncarnationShutdown(recoveryDir, op)
+  const applyStuck = idleApplyStuckReason(recoveryDir, evidenced)
+  if (applyStuck) {
+    log.warn('box idle op abandoned', {
+      sessionKey: session.sessionKey,
+      revision: op.revision,
+      reason: applyStuck,
+    })
+    writeSettledIdleOp(recoveryDir, {
+      ...evidenced,
+      disposition: 'abandoned',
+      abandonReason: applyStuck,
+    })
+    return
+  }
   if (op.summaryText || readIdleNative(recoveryDir, op.sourceSessionId, op.revision)?.summaryText)
     return
   const idleProof = await fetchBoxIdleProof({
@@ -196,7 +215,6 @@ async function settleStrandedIdleOp(
   })
   // Same authoritative evidence as a live op; a missing native file alone
   // does not prove nothing was sent. Otherwise only the operator reset exits.
-  const evidenced = withIncarnationShutdown(recoveryDir, op)
   const reason = idleAbandonReason(evidenced, idleProof)
   if (!reason) return
   log.warn('box idle op abandoned', {
@@ -2255,7 +2273,21 @@ export async function finishIdleUnderLock(
     await settleStrandedIdleOp(session, pending, recoveryDir)
     return
   }
-  if (proof.status !== 'terminal' && proof.status !== 'terminal_set') return
+  if (proof.status !== 'terminal' && proof.status !== 'terminal_set') {
+    // OCV5-620: source proof stayed non-terminal; age out the candidate so
+    // submit is not blocked forever, and settle any apply-stuck pending op.
+    const stuckCand = readIdleCandidate(recoveryDir, session.sessionKey)
+    if (stuckCand && idleCandidateAgedOut(stuckCand)) {
+      log.warn('box idle candidate aged out', {
+        sessionKey: session.sessionKey,
+        createdAt: stuckCand.createdAt,
+        proofStatus: proof.status,
+      })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      if (pending) await settleStrandedIdleOp(session, pending, recoveryDir)
+    }
+    return
+  }
   // Dispatch gate: a new op is created only when the leaf says the real
   // context needs it (or OC_BOX_IDLE_COMPACT_ALWAYS=1). An op that already
   // exists for this revision is always driven to settlement.
@@ -2307,6 +2339,26 @@ export async function finishIdleUnderLock(
     })
     clearIdleCandidate(recoveryDir, session.sessionKey)
     writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+    return
+  }
+  // OCV5-620: prepared summary that never received a matching apply receipt.
+  const applyStuckEarly = idleApplyStuckReason(recoveryDir, {
+    ...op,
+    ...(native?.summaryText && !op.summaryText ? { summaryText: native.summaryText } : {}),
+  })
+  if (applyStuckEarly) {
+    log.warn('box idle op abandoned', {
+      sessionKey: session.sessionKey,
+      revision: op.revision,
+      reason: applyStuckEarly,
+    })
+    clearIdleCandidate(recoveryDir, session.sessionKey)
+    writeSettledIdleOp(recoveryDir, {
+      ...op,
+      ...(native?.summaryText && !op.summaryText ? { summaryText: native.summaryText } : {}),
+      disposition: 'abandoned',
+      abandonReason: applyStuckEarly,
+    })
     return
   }
   const accepted = idleSummaryAccepted(summaryProof, {
@@ -2485,6 +2537,20 @@ export async function finishIdleUnderLock(
     } finally {
       session._idleRunning = false
       session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
+    }
+  }
+  // OCV5-620: after apply attempts, age out a still-unsettled prepared summary.
+  const applyStuckFinal = idleApplyStuckReason(recoveryDir, step.op)
+  if (applyStuckFinal) {
+    log.warn('box idle op abandoned', {
+      sessionKey: session.sessionKey,
+      revision: step.op.revision,
+      reason: applyStuckFinal,
+    })
+    clearIdleCandidate(recoveryDir, session.sessionKey)
+    step = {
+      ...step,
+      op: { ...step.op, disposition: 'abandoned', abandonReason: applyStuckFinal },
     }
   }
   writeSettledIdleOp(recoveryDir, step.op)
