@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { resolveMiniMaxMediaKey } from '../minimax/mediaKey.js'
+import { mediaProxyKey, resolveMiniMaxMediaKey } from '../minimax/mediaKey.js'
 
 describe('resolveMiniMaxMediaKey (OCV5-589 / D12)', () => {
   const env = (v: Record<string, string>) => v as NodeJS.ProcessEnv
@@ -54,3 +54,29 @@ describe('resolveMiniMaxMediaKey (OCV5-589 / D12)', () => {
   })
 })
 
+describe('mediaProxyKey (selfhost media proxy wiring)', () => {
+  test('unset file keeps the token plan key; a bad file logs a reason and yields no key', () => {
+    const logged: unknown[] = []
+    const log = { error: (msg: string, meta?: unknown) => void logged.push([msg, meta]) }
+    assert.equal(mediaProxyKey({ MINIMAX_TOKEN_PLAN_KEY: 'tp' }, log), 'tp')
+    assert.equal(mediaProxyKey({}, log), undefined)
+    assert.deepEqual(logged, [])
+    const key = mediaProxyKey(
+      { MINIMAX_MEDIA_KEY_FILE: '/k', MINIMAX_TOKEN_PLAN_KEY: 'tp' },
+      log,
+      () => 'mk-1\n',
+    )
+    assert.equal(key, 'mk-1')
+    const none = mediaProxyKey(
+      { MINIMAX_MEDIA_KEY_FILE: '/k', MINIMAX_TOKEN_PLAN_KEY: 'tp' },
+      log,
+      () => {
+        throw new Error('ENOENT secret-ish')
+      },
+    )
+    assert.equal(none, undefined)
+    assert.equal(logged.length, 1)
+    assert.equal((logged[0] as [string])[0], 'minimax_media_key_unavailable')
+    assert.ok(!JSON.stringify(logged).includes('secret-ish'))
+  })
+})
