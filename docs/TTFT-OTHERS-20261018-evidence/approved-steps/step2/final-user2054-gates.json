@@ -1,0 +1,52 @@
+{
+  "observed_at": "2026-10-18T14:02:48.140004+00:00",
+  "head": "8fb6a8be9c4a01e1cce730a969b9ff934bbd4346",
+  "working_tree_clean": true,
+  "product_source_unchanged_since": "f6d6079a82805a1efa0957df411725b3cc7aaad7",
+  "only_changed_since_runtime_suite": [
+    "docs/plans/OCV5-501-ttft-step2.md",
+    "docs/ttft/OCV5-501-validation.md",
+    "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+    "scripts/ocv5-501/official-cli-retry-hint.mjs"
+  ],
+  "runtime_related_tests": {
+    "head": "f6d6079a82805a1efa0957df411725b3cc7aaad7",
+    "passed": 403
+  },
+  "changed_resolver_test_rerun_passed": 20,
+  "checks": {
+    "tests-user2054-pinned": 0,
+    "resolver-postfix-user2054": 0,
+    "types-postfix-user2054": 0,
+    "lint-lintfinal-user2054": 0,
+    "official-cli-lintfinal-user2054": 0,
+    "isolated-lintfinal-user2054": 0
+  },
+  "reviews": {
+    "user2054-r1": "APPROVED",
+    "user2054-r2": "APPROVED",
+    "user2054-r3": "APPROVED"
+  },
+  "latest_cli_source_sha256": "a1774f1540a06a42aefbc0237ef119e702b1c1d31f0d7c583f286546d33c12e3",
+  "source_binding_manifest": "paid-evidence/final-source-export-manifest.json",
+  "real_shared_api_usage": {
+    "base": {
+      "I": 256,
+      "R": 12416,
+      "W": 0
+    },
+    "candidate": {
+      "I": 256,
+      "R": 12416,
+      "W": 0
+    },
+    "shared_calls_including_warmup": 3,
+    "not_multiplied_by_pr": true
+  },
+  "latest_head_ci": {
+    "head": "8fb6a8be9c4a01e1cce730a969b9ff934bbd4346",
+    "success": 14,
+    "snapshot": "final-ci-status-user2054.json",
+    "observed_at": "2026-10-18T14:08:06.936333+00:00"
+  }
+}

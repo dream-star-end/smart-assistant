@@ -1,0 +1,3 @@
+{"failed_at":"2026-10-18T10:32:06.056Z","phase":"deepseek-a_round_2","error_name":"Error","safe_error_code":"paint_timeout","sent":6,"completed":6}
+{"failed_at":"2026-10-18T10:37:01.539Z","phase":"kimi-1m-b_round_1","error_name":"TimeoutError","safe_error_code":"observer_timeout","sent":5,"completed":4}
+{"failed_at":"2026-10-18T10:40:16.423Z","phase":"kimi-c_select_model","error_name":"Error","safe_error_code":"selector_not_unique","sent":4,"completed":4}

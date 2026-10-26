@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "written_at": "2026-10-18T12:41:18.407543+00:00",
+  "scope": "Read-only metadata analysis of an already completed user 765 Grok turn from candidate frontend; backend remains live 67d. No new model request, service, configuration, routing, or code mutation.",
+  "turn": {
+    "user_id": 765,
+    "session_id": "webmvdt2e7fkvqfuq",
+    "client_message_id": "m-mvdt2nmt-3-sav8",
+    "dispatch_id": "866d1514-04e6-4d32-ba47-699bf42f8216",
+    "trace_id": "b2624e27f8744ffee56349ad8df71f42",
+    "billing_request_id": "0b49402ba260fda1c18e4ea40d690834",
+    "model": "grok-build",
+    "runtime_container_id": 1063,
+    "runtime_source_commit": "67d13462edea57d43e71aae2a97d51efddcff831",
+    "attempt_no": 1
+  },
+  "evidence_basis": {
+    "observation_window_utc": "2026-10-18T12:33Z through 12:36Z",
+    "database": "openclaude_v5_selfhost",
+    "database_query_mode": "SELECT only, exact trace/dispatch/request and user 765; output metadata allowlist only",
+    "master_log": "/var/log/openclaude-v5-selfhost.log; exact IDs filtered, parsed JSON metadata only",
+    "egress_log": "/var/log/openclaude-v5-selfhost-egress.log; exact IDs filtered, parsed JSON metadata only",
+    "container_log": "docker logs oc-v5-u765 --since 2026-10-18T12:32:30Z --until 2026-10-18T12:33:45Z; exact trace/session filtered; timing and event allowlist only",
+    "source_code": "live 67d13462e Grok adapter and internalGrokRelay; unpublished timing changes excluded"
+  },
+  "dispatch": {
+    "source": "turn_dispatches",
+    "admitted_at_utc": "2026-10-18T12:32:36.307Z",
+    "accepted_at_utc": "2026-10-18T12:32:36.940Z",
+    "admitted_to_accepted_ms": 633,
+    "terminal_at_utc": "2026-10-18T12:33:36.897Z",
+    "status": "terminal",
+    "outcome": "completed",
+    "failure_code": null,
+    "attempt_no": 1
+  },
+  "runtime_timing": {
+    "master_inbound": {
+      "source": "master exact-trace inbound turn start",
+      "at_utc": "2026-10-18T12:32:36.244Z"
+    },
+    "gateway_to_submit": {
+      "source": "container turn_pipeline_timing",
+      "at_utc": "2026-10-18T12:32:37.249Z",
+      "elapsed_ms": 309.861874
+    },
+    "submit_lock_acquired": {
+      "source": "container turn_pipeline_timing",
+      "at_utc": "2026-10-18T12:32:37.332Z",
+      "elapsed_since_submit_start_ms": 83.580739
+    },
+    "memory_barrier_acquired": {
+      "source": "container turn_pipeline_timing",
+      "at_utc": "2026-10-18T12:32:37.427Z",
+      "elapsed_since_submit_start_ms": 177.968915
+    },
+    "context_ready": {
+      "source": "container turn_pipeline_timing",
+      "at_utc": "2026-10-18T12:32:37.531Z",
+      "elapsed_since_submit_start_ms": 282.395818
+    },
+    "prompt_context_timing": {
+      "source": "container prompt_context_timing, exact session key",
+      "at_utc": "2026-10-18T12:32:37.814Z",
+      "elapsed_ms": 251.415775
+    },
+    "prompt_context_built": {
+      "source": "container prompt_context_built, exact session key",
+      "at_utc": "2026-10-18T12:32:37.817Z",
+      "backend": "grok",
+      "master_inbound_to_built_ms": 1573
+    },
+    "runtime_total": {
+      "source": "turn_traces",
+      "elapsed_ms": 59730,
+      "observed_at_utc": "2026-10-18T12:33:37.273Z"
+    }
+  },
+  "first_visible": {
+    "first_thinking_frame": {
+      "source": "product_friction_events FIRST_THINKING_FRAME; existing server milestone",
+      "latency_ms": 40515,
+      "persisted_at_utc": "2026-10-18T12:33:16.758138Z"
+    },
+    "first_text_frame": {
+      "source": "product_friction_events FIRST_TEXT_FRAME; existing server milestone",
+      "latency_ms": 59383,
+      "persisted_at_utc": "2026-10-18T12:33:36.306699Z"
+    },
+    "first_text_paint": {
+      "source": "product_friction_events FIRST_TEXT_PAINT; baseline browser probe",
+      "latency_ms": 61140,
+      "persisted_at_utc": "2026-10-18T12:33:36.911439Z",
+      "limitation": "Existing probe does not establish physical paint or isolate React rendering latency."
+    },
+    "turn_trace_first_visible": {
+      "source": "turn_traces",
+      "kind": "thinking",
+      "persisted_at_utc": "2026-10-18T12:33:16.758852Z",
+      "limitation": "Database NOW persistence anchor; not precise upstream or browser frame timestamp."
+    },
+    "thinking_to_text_ms": 18868,
+    "prompt_built_to_first_thinking_persistence_anchor_ms": 38941.852,
+    "interval_limitation": "Prompt-to-first-thinking uses database persistence anchor and log wall time, so it is approximate; do not equate it to provider-only TTFT."
+  },
+  "journal": {
+    "source": "request_finalize_journal",
+    "created_at_utc": "2026-10-18T12:32:36.904800Z",
+    "updated_at_utc": "2026-10-18T12:33:36.801212Z",
+    "state": "committed",
+    "failure_code": null,
+    "limitation": "Grok creates billing journal early; created_at is not upstream fetch start."
+  },
+  "route_context": {
+    "source": "grok_route_contexts, exact user/container/time metadata selection",
+    "account_id": 24,
+    "slot_id": "86177972-fc6f-4eda-9ae2-1914402569fb",
+    "kind": "bridge",
+    "created_at_utc": "2026-10-18T12:32:36.680315Z",
+    "last_used_at_utc": "2026-10-18T12:33:36.357600Z",
+    "expires_at_utc": "2026-10-18T12:33:36.448495Z",
+    "status": "expired",
+    "limitation": "Mutable last_used_at is not first relay/fetch time. Expired state observed after successful terminal is consistent with turn cleanup, not proof of route failure."
+  },
+  "usage": {
+    "source": "usage_records",
+    "id": 24971,
+    "status": "success",
+    "created_at_utc": "2026-10-18T12:33:36.559079Z",
+    "input_tokens": 21385,
+    "output_tokens": 1541,
+    "cache_read_tokens": 1152,
+    "cache_write_tokens": 0,
+    "cost_credits": 16
+  },
+  "safe_negative_evidence": {
+    "resume_no_stdout_retry_warning_for_exact_session_in_window": false,
+    "failure_code": null,
+    "attempt_no": 1,
+    "limitation": "Absence of this warning does not prove absence of all internal provider retry or queue behavior."
+  },
+  "conclusions": [
+    "Master accepted the turn within 0.633s of admission and prompt construction completed 1.573s after inbound. The 40s delay was not explained by gateway submit locks, memory barrier, or prompt assembly.",
+    "The long unpartitioned segment is after prompt construction and before first thinking, covering Grok CLI startup/catalog/auth/relay/provider queue and model behavior. Existing live markers cannot separate these components.",
+    "First thinking-to-first-text adds 18.868s on the same server milestone clock. This is stream behavior before the frontend renders正文.",
+    "The completed n=1 candidate-frontend observation is not a controlled causal comparison with the earlier 13.7s baseline. No frontend regression or supplier-only bottleneck is established."
+  ],
+  "unavailable_precise_boundaries": [
+    "Grok CLI spawn timestamp correlated to trace",
+    "First CLI stdout correlated to trace",
+    "Grok relay request entry/fetch start/response headers/first byte correlated to trace",
+    "Provider queue and thinking internals"
+  ],
+  "prohibited_inferences": [
+    "Do not present unpublished Step1 timing as live evidence.",
+    "Do not treat billing journal creation, route last_used_at, or database persistence NOW as upstream fetch start.",
+    "Do not infer provider-only TTFT or physical paint from the composite intervals."
+  ]
+}

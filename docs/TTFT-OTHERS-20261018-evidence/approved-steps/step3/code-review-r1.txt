@@ -1,0 +1,3 @@
+APPROVED
+
+非阻断：[P2] scripts/ocv5-502/enableSelfhost765.sh:24 — 第16行 source 会切换到 canonical；从任务 worktree 用相对路径启动时，此处会在 canonical 下寻找尚未合入的 Python 文件而失败。建议在 source 前保存脚本自身的绝对目录。

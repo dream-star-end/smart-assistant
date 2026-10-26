@@ -1,0 +1,29 @@
+{
+  "at": "2026-10-18T10:52:33.878135+00:00",
+  "state": {
+    "phase": "stable",
+    "active_slot": "A",
+    "candidate_slot": null,
+    "candidate_release": null
+  },
+  "health": {
+    "ok": true,
+    "instance": "v5-selfhost-sg",
+    "slot": "A",
+    "deps": {
+      "sessionsDb": "ok",
+      "pg": "ok",
+      "redis": "ok"
+    }
+  },
+  "version": {
+    "tag": "v5-67d13462e",
+    "builtAt": "2026-10-18T09:27:00Z",
+    "commit": "67d13462e"
+  },
+  "live": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-67d13462e-20261018-091329",
+  "canonical": "67d13462edea57d43e71aae2a97d51efddcff831",
+  "canonical_dirty": false,
+  "env_key_count": 121,
+  "commercial_production_accessed": false
+}

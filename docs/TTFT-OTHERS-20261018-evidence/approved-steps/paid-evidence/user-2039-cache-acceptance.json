@@ -1,0 +1,48 @@
+{
+  "recorded_at": "2026-10-18T12:40:52.511183+00:00",
+  "user_instruction_local_minute": "2026-10-18 20:39 Asia/Taipei",
+  "source": "Parent relay of latest user instruction at20:39",
+  "frozen_audit_file": "billing-agent-phase-audit-final.json",
+  "frozen_audit_sha256": "4ac7d6b40bcdd62bfdcac4d97b7e5946eeb5de234c4955e8c8a2b98556a3e20f",
+  "historical_strict_gate": {
+    "decision": "pending_not_passed",
+    "preserved_unchanged": true
+  },
+  "current_user_acceptance": {
+    "accepted_as_noise": true,
+    "decision": "pass_for_observed_Grok_pair_under_current_user_criterion",
+    "basis": "Grok cache-read remains1152 tokens; candidate native input is2 tokens longer. User accepts this ratio variation as noise.",
+    "future_criterion": "后续无明显变差"
+  },
+  "original_cache_values": {
+    "baseline_native_input_inclusive_cached": 22535,
+    "baseline_cache_read": 1152,
+    "candidate_native_input_inclusive_cached": 22537,
+    "candidate_cache_read": 1152,
+    "baseline_ratio": "0.05112047925449301087197692478",
+    "candidate_ratio": "0.05111594267205040599902382748",
+    "change_percentage_points": "-0.00045365824426048729530973000",
+    "observed_ratio_nondecreasing": false,
+    "strict_no_decline_gate": "pending_not_passed",
+    "comparability_limit": "Absolute cache-read remains1152; native input is2 tokens longer. Report this decrease exactly, without asserting frontend caused prefix corruption. No extra paid call is authorized."
+  },
+  "billing_unchanged": {
+    "new_successful_provider_model_calls": 9,
+    "combined_successful_provider_model_calls": 29,
+    "original_zero_fee_glm429_provider_rejections": 3,
+    "combined_evidenced_provider_model_attempts": 32,
+    "new_cost_credits": 46,
+    "combined_cost_credits": 221,
+    "frozen_wallet_after": {
+      "credits": 35135,
+      "ledger_count": 1831,
+      "ledger_max_id": 23124
+    }
+  },
+  "actions": {
+    "model_requests_sent": 0,
+    "billing_mutations": 0,
+    "product_changes": 0,
+    "frozen_audit_modified": false
+  }
+}

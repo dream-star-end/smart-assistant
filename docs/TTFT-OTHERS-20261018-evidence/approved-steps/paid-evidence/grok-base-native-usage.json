@@ -1,0 +1,27 @@
+{
+  "observed_at": "2026-10-18T12:06:49.933496+00:00",
+  "model": "grok-build",
+  "web_session_id": "webmvdry99ipkhmay",
+  "native_session_id": "01a14ee3-4c58-71a0-9c85-71df93138815",
+  "native_run_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815",
+  "usage_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815/usage.json",
+  "updatedAt": "2026-10-18T12:01:35.629705967+00:00",
+  "turns": [
+    {
+      "turnNumber": 1,
+      "endedAt": "2026-10-18T12:01:35.629705967+00:00",
+      "inputTokens": 22535,
+      "outputTokens": 791,
+      "cachedReadTokens": 1152,
+      "cacheCreationTokens": 0,
+      "reasoningTokens": 410,
+      "totalTokens": 23326,
+      "modelCalls": 1,
+      "primaryModelId": "grok-4.7-build"
+    }
+  ],
+  "events_loop_started": {
+    "None": 1
+  },
+  "events_loop_started_total": 1
+}

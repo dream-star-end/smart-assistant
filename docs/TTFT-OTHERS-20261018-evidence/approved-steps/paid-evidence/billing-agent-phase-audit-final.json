@@ -1,0 +1,1304 @@
+{
+  "usage": [
+    {
+      "id": 24963,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23116,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "session_id": "webmvdrpb3kkfxlzl",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "cost_credits": 7,
+      "input_tokens": 2,
+      "output_tokens": 453,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 47741,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24964,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23117,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "session_id": "webmvdrpb3kkfxlzl",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "cost_credits": 1,
+      "input_tokens": 4,
+      "output_tokens": 819,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 47725,
+      "cache_write_tokens": 493,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24965,
+      "model": "grok-build",
+      "price": {
+        "multiplier": "2.000",
+        "input_per_mtok": "250",
+        "output_per_mtok": "1500",
+        "cache_read_per_mtok": "25",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23118,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "session_id": "oceng-5cdb8862194c2cd776d9c6adc9ed1bd92cca21f103857744",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "cost_credits": 14,
+      "input_tokens": 21383,
+      "output_tokens": 791,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24966,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23119,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 2,
+      "input_tokens": 12672,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    },
+    {
+      "id": 24967,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23120,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    },
+    {
+      "id": 24968,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23121,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    },
+    {
+      "id": 24969,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23122,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:31:33.949753+00:00",
+      "request_id": "d2e95148305171db0973b3052d2a3add",
+      "session_id": "webmvdt0dlqo3ishq",
+      "dispatch_id": "a07fc289-1dbe-4be7-a0b7-60be27234fc6",
+      "cost_credits": 3,
+      "input_tokens": 2,
+      "output_tokens": 339,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 34577,
+      "cache_write_tokens": 13163,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24970,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23123,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:32:20.54412+00:00",
+      "request_id": "6db261ec08e5b85c9bde419dde9faa5b",
+      "session_id": "webmvdt0dlqo3ishq",
+      "dispatch_id": "e3d36cbd-253e-4412-9481-25db75d1a4e1",
+      "cost_credits": 1,
+      "input_tokens": 4,
+      "output_tokens": 562,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 47724,
+      "cache_write_tokens": 379,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24971,
+      "model": "grok-build",
+      "price": {
+        "multiplier": "2.000",
+        "input_per_mtok": "250",
+        "output_per_mtok": "1500",
+        "cache_read_per_mtok": "25",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23124,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:33:36.559079+00:00",
+      "request_id": "0b49402ba260fda1c18e4ea40d690834",
+      "session_id": "oceng-a015aeaeab2acd04f876a6c78e502a646e0cf3e6a6333819",
+      "dispatch_id": "866d1514-04e6-4d32-ba47-699bf42f8216",
+      "cost_credits": 16,
+      "input_tokens": 21385,
+      "output_tokens": 1541,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    }
+  ],
+  "wallet": {
+    "credits": 35135,
+    "ledger_count": 1831,
+    "ledger_max_id": 23124
+  },
+  "user_id": 765,
+  "journals": [
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24963,
+      "ledger_id": 23116,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:35.747346+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "updated_at": "2026-10-18T11:55:04.332604+00:00",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "failure_code": null,
+      "final_credits": 7
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24964,
+      "ledger_id": 23117,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:01.178759+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "updated_at": "2026-10-18T11:55:22.307012+00:00",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "grok-build",
+      "state": "committed",
+      "source": "codex_bridge",
+      "usage_id": 24965,
+      "ledger_id": 23118,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:17.735878+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "updated_at": "2026-10-18T12:01:35.883491+00:00",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "failure_code": null,
+      "final_credits": 14
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24966,
+      "ledger_id": 23119,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:46.500041+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "updated_at": "2026-10-18T12:03:47.931139+00:00",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 2
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24967,
+      "ledger_id": 23120,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:49.401377+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "updated_at": "2026-10-18T12:03:50.190489+00:00",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24968,
+      "ledger_id": 23121,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:51.748359+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "updated_at": "2026-10-18T12:03:52.338326+00:00",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24969,
+      "ledger_id": 23122,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:31:12.771232+00:00",
+      "request_id": "d2e95148305171db0973b3052d2a3add",
+      "updated_at": "2026-10-18T12:31:49.633351+00:00",
+      "dispatch_id": "a07fc289-1dbe-4be7-a0b7-60be27234fc6",
+      "failure_code": null,
+      "final_credits": 3
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24970,
+      "ledger_id": 23123,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:31:44.881432+00:00",
+      "request_id": "6db261ec08e5b85c9bde419dde9faa5b",
+      "updated_at": "2026-10-18T12:32:20.746062+00:00",
+      "dispatch_id": "e3d36cbd-253e-4412-9481-25db75d1a4e1",
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "grok-build",
+      "state": "committed",
+      "source": "codex_bridge",
+      "usage_id": 24971,
+      "ledger_id": 23124,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:32:36.9048+00:00",
+      "request_id": "0b49402ba260fda1c18e4ea40d690834",
+      "updated_at": "2026-10-18T12:33:36.801212+00:00",
+      "dispatch_id": "866d1514-04e6-4d32-ba47-699bf42f8216",
+      "failure_code": null,
+      "final_credits": 16
+    }
+  ],
+  "dispatches": [
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdrpb3kkfxlzl",
+      "admitted_at": "2026-10-18T11:54:19.866+00:00",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "terminal_at": "2026-10-18T11:54:56.42+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrpfuc-1-53no",
+      "billing_request_id": "18684327a8c158d08ae4c2475d698216"
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdrpb3kkfxlzl",
+      "admitted_at": "2026-10-18T11:55:00.113+00:00",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "terminal_at": "2026-10-18T11:55:22.392+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrqb2y-3-uysz",
+      "billing_request_id": "72c5760b5f51597ea9b78578f95a75e0"
+    },
+    {
+      "model": "grok-build",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdry99ipkhmay",
+      "admitted_at": "2026-10-18T12:01:17.448+00:00",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "terminal_at": "2026-10-18T12:01:36.087+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrye30-1-pisa",
+      "billing_request_id": "cf33dfdbe6aadb349f611556a9b39a64"
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdt0dlqo3ishq",
+      "admitted_at": "2026-10-18T12:30:57.339+00:00",
+      "dispatch_id": "a07fc289-1dbe-4be7-a0b7-60be27234fc6",
+      "terminal_at": "2026-10-18T12:31:34.619+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdt0jfx-1-7b0u",
+      "billing_request_id": "1cceb3e4b6ad56373820ae227c913f84"
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdt0dlqo3ishq",
+      "admitted_at": "2026-10-18T12:31:41.445+00:00",
+      "dispatch_id": "e3d36cbd-253e-4412-9481-25db75d1a4e1",
+      "terminal_at": "2026-10-18T12:32:20.822+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdt1hao-1-guj8",
+      "billing_request_id": "01f4bf4908f7fd41d302690a6a1096c9"
+    },
+    {
+      "model": "grok-build",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdt2e7fkvqfuq",
+      "admitted_at": "2026-10-18T12:32:36.307+00:00",
+      "dispatch_id": "866d1514-04e6-4d32-ba47-699bf42f8216",
+      "terminal_at": "2026-10-18T12:33:36.897+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdt2nmt-3-sav8",
+      "billing_request_id": "0b49402ba260fda1c18e4ea40d690834"
+    }
+  ],
+  "observed_at": "2026-10-18T12:38:56.640962+00:00",
+  "bucket_latest": [
+    {
+      "id": 20554,
+      "delta": -20,
+      "bucket": "period",
+      "org_id": null,
+      "created_at": "2026-10-06T01:13:28.795248+00:00",
+      "balance_after": 0
+    },
+    {
+      "id": 23124,
+      "delta": -16,
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T12:33:36.559079+00:00",
+      "balance_after": 35135
+    }
+  ],
+  "all_new_ledger": [
+    {
+      "id": 23116,
+      "delta": -7,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24963",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "balance_after": 35174
+    },
+    {
+      "id": 23117,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24964",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "balance_after": 35173
+    },
+    {
+      "id": 23118,
+      "delta": -14,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24965",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "balance_after": 35159
+    },
+    {
+      "id": 23119,
+      "delta": -2,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24966",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "balance_after": 35157
+    },
+    {
+      "id": 23120,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24967",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "balance_after": 35156
+    },
+    {
+      "id": 23121,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24968",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "balance_after": 35155
+    },
+    {
+      "id": 23122,
+      "delta": -3,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24969",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:31:33.949753+00:00",
+      "balance_after": 35152
+    },
+    {
+      "id": 23123,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24970",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:32:20.54412+00:00",
+      "balance_after": 35151
+    },
+    {
+      "id": 23124,
+      "delta": -16,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24971",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:33:36.559079+00:00",
+      "balance_after": 35135
+    }
+  ],
+  "window_since": "2026-10-18T11:49:30Z",
+  "window_until": "2026-10-18T12:38:56.640962+00:00",
+  "wallet_before": {
+    "at": "2026-10-18T11:49:30.244257+00:00",
+    "user_id": 765,
+    "credits": 35181,
+    "ledger_max_id": 23115,
+    "ledger_count": 1822
+  },
+  "buckets_before": [
+    {
+      "id": 20554,
+      "bucket": "period",
+      "org_id": null,
+      "delta": -20,
+      "balance_after": 0,
+      "created_at": "2026-10-06T01:13:28.795248+00:00"
+    },
+    {
+      "id": 23115,
+      "bucket": "wallet",
+      "org_id": null,
+      "delta": -1,
+      "balance_after": 35181,
+      "created_at": "2026-10-18T10:43:10.59786+00:00"
+    }
+  ],
+  "box_native": [
+    {
+      "arm": "baseline",
+      "source": "/home/box/.claude-account2/projects/-tmp-ocv5-289-run-01ff4cac24340ffd6ff0f557/e2143f99-8fe5-4231-bb02-ed7148c20f00.jsonl",
+      "native_session_id": "e2143f99-8fe5-4231-bb02-ed7148c20f00",
+      "successful_native_calls": 2,
+      "calls": [
+        {
+          "message_id": "msg_011Cg9f8vUfZkcgyVwSzZAxB",
+          "model": "claude-haiku-5-5",
+          "first_timestamp": "2026-10-18T11:54:48.773Z",
+          "row_count": 1,
+          "last_timestamp": "2026-10-18T11:54:48.773Z",
+          "usage": {
+            "input_tokens": 2,
+            "output_tokens": 453,
+            "cache_creation_input_tokens": 47741,
+            "cache_read_input_tokens": 0
+          }
+        },
+        {
+          "message_id": "msg_011Cg9fAieZseb2fxzW3AAjS",
+          "model": "claude-haiku-5-5",
+          "first_timestamp": "2026-10-18T11:55:12.506Z",
+          "row_count": 2,
+          "last_timestamp": "2026-10-18T11:55:15.413Z",
+          "usage": {
+            "input_tokens": 4,
+            "output_tokens": 819,
+            "cache_creation_input_tokens": 493,
+            "cache_read_input_tokens": 47725
+          }
+        }
+      ]
+    },
+    {
+      "arm": "candidate-step1",
+      "source": "/home/box/.claude-account2/projects/-tmp-ocv5-289-run-6f6fcbf801dc47512530d275/5f0d00e2-7293-4249-a47e-102d96969a8c.jsonl",
+      "native_session_id": "5f0d00e2-7293-4249-a47e-102d96969a8c",
+      "successful_native_calls": 2,
+      "calls": [
+        {
+          "message_id": "msg_011Cg9hvyjdyseS2csdYY1aJ",
+          "model": "claude-haiku-5-5",
+          "first_timestamp": "2026-10-18T12:31:26.784Z",
+          "row_count": 1,
+          "last_timestamp": "2026-10-18T12:31:26.784Z",
+          "usage": {
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 13163,
+            "cache_read_input_tokens": 34577,
+            "output_tokens": 339
+          }
+        },
+        {
+          "message_id": "msg_011Cg9hyGUmSjBMm5eWehdix",
+          "model": "claude-haiku-5-5",
+          "first_timestamp": "2026-10-18T12:31:56.123Z",
+          "row_count": 2,
+          "last_timestamp": "2026-10-18T12:31:58.622Z",
+          "usage": {
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 379,
+            "cache_read_input_tokens": 47724,
+            "output_tokens": 562
+          }
+        }
+      ]
+    }
+  ],
+  "grok_native": [
+    {
+      "arm": "baseline",
+      "observed_at": "2026-10-18T12:06:49.933496+00:00",
+      "model": "grok-build",
+      "web_session_id": "webmvdry99ipkhmay",
+      "native_session_id": "01a14ee3-4c58-71a0-9c85-71df93138815",
+      "native_run_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815",
+      "usage_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815/usage.json",
+      "updatedAt": "2026-10-18T12:01:35.629705967+00:00",
+      "turns": [
+        {
+          "turnNumber": 1,
+          "endedAt": "2026-10-18T12:01:35.629705967+00:00",
+          "inputTokens": 22535,
+          "outputTokens": 791,
+          "cachedReadTokens": 1152,
+          "cacheCreationTokens": 0,
+          "reasoningTokens": 410,
+          "totalTokens": 23326,
+          "modelCalls": 1,
+          "primaryModelId": "grok-4.7-build"
+        }
+      ],
+      "events_loop_started": {
+        "None": 1
+      },
+      "events_loop_started_total": 1
+    },
+    {
+      "arm": "candidate-step1",
+      "web_session_id": "webmvdt2e7fkvqfuq",
+      "native_session_id": "01a14f00-6a54-7250-8758-6f1dd6bfe578",
+      "native_run_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578",
+      "usage_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578/usage.json",
+      "events_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578/events.jsonl",
+      "turns": [
+        {
+          "turnNumber": 1,
+          "endedAt": "2026-10-18T12:33:36.298003039+00:00",
+          "inputTokens": 22537,
+          "outputTokens": 1541,
+          "cachedReadTokens": 1152,
+          "cacheCreationTokens": 0,
+          "reasoningTokens": 1196,
+          "totalTokens": 24078,
+          "modelCalls": 1,
+          "primaryModelId": "grok-4.7-build"
+        }
+      ],
+      "events_loop_started_total": 1
+    }
+  ],
+  "api_controlled_results": [
+    {
+      "arm": "warmup-base",
+      "requestId": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "status": 200,
+      "beganAt": 1792325025574,
+      "endedAt": 1792325027833,
+      "firstByteAt": 1792325026912,
+      "firstTextAt": 1792325027814,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 12672,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "baseline-base",
+      "requestId": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "status": 200,
+      "beganAt": 1792325029337,
+      "endedAt": 1792325030173,
+      "firstByteAt": 1792325029848,
+      "firstTextAt": 1792325030156,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "candidate-step4-step7",
+      "requestId": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "status": 200,
+      "beganAt": 1792325031698,
+      "endedAt": 1792325032312,
+      "firstByteAt": 1792325032081,
+      "firstTextAt": 1792325032294,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    }
+  ],
+  "browser_sent": [
+    {
+      "label": "box-restored-base",
+      "round": 1,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792324459848,
+      "clientMessageId": "m-mvdrpfuc-1-53no",
+      "sessionId": "webmvdrpb3kkfxlzl"
+    },
+    {
+      "label": "box-restored-base",
+      "round": 2,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792324500030,
+      "clientMessageId": "m-mvdrqb2y-3-uysz",
+      "sessionId": "webmvdrpb3kkfxlzl"
+    },
+    {
+      "label": "grok-step6-base",
+      "round": 1,
+      "model": "grok-build",
+      "ws_sent_at": 1792324877356,
+      "clientMessageId": "m-mvdrye30-1-pisa",
+      "sessionId": "webmvdry99ipkhmay"
+    },
+    {
+      "label": "box-step1-frontend",
+      "round": 1,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792326657309,
+      "clientMessageId": "m-mvdt0jfx-1-7b0u",
+      "sessionId": "webmvdt0dlqo3ishq"
+    },
+    {
+      "label": "box-step1-frontend",
+      "round": 2,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792326700957,
+      "clientMessageId": "m-mvdt1hao-1-guj8",
+      "sessionId": "webmvdt0dlqo3ishq"
+    },
+    {
+      "label": "grok-step1-head",
+      "round": 1,
+      "model": "grok-build",
+      "ws_sent_at": 1792326756265,
+      "clientMessageId": "m-mvdt2nmt-3-sav8",
+      "sessionId": "webmvdt2e7fkvqfuq"
+    }
+  ],
+  "browser_zero_send_failures": [
+    {
+      "failed_at": "2026-10-18T11:50:26.124Z",
+      "phase": "box-restored-base_round_1",
+      "error_name": "Error",
+      "safe_error_code": "send_timeout",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T11:58:07.539Z",
+      "phase": "ui_login",
+      "error_name": "Error",
+      "safe_error_code": null,
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:18:44.501Z",
+      "phase": "box-step1-frontend_round_1",
+      "error_name": "Error",
+      "safe_error_code": "send_timeout",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:22:12.038Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:24:45.061Z",
+      "phase": "ui_login",
+      "error_name": "Error",
+      "safe_error_code": null,
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:28:03.921Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:29:22.875Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:29:55.653Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    }
+  ],
+  "zero_send_failures_really_zero": true,
+  "independent_price_checks": [
+    {
+      "usage_id": 24963,
+      "unrounded_credits": "6.194325000",
+      "expected_credits": 7,
+      "actual_credits": 7,
+      "formula_matches": true,
+      "cache_read_ratio": "0"
+    },
+    {
+      "usage_id": 24964,
+      "unrounded_credits": "0.948775000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9896935008917091783833105222"
+    },
+    {
+      "usage_id": 24965,
+      "unrounded_credits": "13.12210000",
+      "expected_credits": 14,
+      "actual_credits": 14,
+      "formula_matches": true,
+      "cache_read_ratio": "0.05112047925449301087197692478"
+    },
+    {
+      "usage_id": 24966,
+      "unrounded_credits": "1.419938000",
+      "expected_credits": 2,
+      "actual_credits": 2,
+      "formula_matches": true,
+      "cache_read_ratio": "0"
+    },
+    {
+      "usage_id": 24967,
+      "unrounded_credits": "0.066594000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9797979797979797979797979798"
+    },
+    {
+      "usage_id": 24968,
+      "unrounded_credits": "0.066594000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9797979797979797979797979798"
+    },
+    {
+      "usage_id": 24969,
+      "unrounded_credits": "2.160845000",
+      "expected_credits": 3,
+      "actual_credits": 3,
+      "formula_matches": true,
+      "cache_read_ratio": "0.7242469942608185664613966738"
+    },
+    {
+      "usage_id": 24970,
+      "unrounded_credits": "0.806015000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9920385806639366412372419814"
+    },
+    {
+      "usage_id": 24971,
+      "unrounded_credits": "15.37310000",
+      "expected_credits": 16,
+      "actual_credits": 16,
+      "formula_matches": true,
+      "cache_read_ratio": "0.05111594267205040599902382748"
+    }
+  ],
+  "settlement_chains": [
+    {
+      "usage_id": 24963,
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "18684327a8c158d08ae4c2475d698216"
+    },
+    {
+      "usage_id": 24964,
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "72c5760b5f51597ea9b78578f95a75e0"
+    },
+    {
+      "usage_id": 24965,
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "cf33dfdbe6aadb349f611556a9b39a64"
+    },
+    {
+      "usage_id": 24966,
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": null
+    },
+    {
+      "usage_id": 24967,
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": null
+    },
+    {
+      "usage_id": 24968,
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": null
+    },
+    {
+      "usage_id": 24969,
+      "request_id": "d2e95148305171db0973b3052d2a3add",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "1cceb3e4b6ad56373820ae227c913f84"
+    },
+    {
+      "usage_id": 24970,
+      "request_id": "6db261ec08e5b85c9bde419dde9faa5b",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "01f4bf4908f7fd41d302690a6a1096c9"
+    },
+    {
+      "usage_id": 24971,
+      "request_id": "0b49402ba260fda1c18e4ea40d690834",
+      "journal_matches": true,
+      "ledger_matches": true,
+      "dispatch_matches_or_legal_local_catalog": true,
+      "outer_dispatch_billing_request_id": "0b49402ba260fda1c18e4ea40d690834"
+    }
+  ],
+  "total_credits": 46,
+  "ledger_delta": -46,
+  "wallet_reconciles": true,
+  "ledger_count_delta_reconciles": true,
+  "all_usage_ids_accounted_for": true,
+  "bucket_balance_continuity": [
+    {
+      "ledger_id": 23116,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23117,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23118,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23119,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23120,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23121,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23122,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23123,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    },
+    {
+      "ledger_id": 23124,
+      "bucket": "wallet",
+      "org_id": null,
+      "matches_prior_balance_plus_delta": true
+    }
+  ],
+  "new_provider_failures": {
+    "aborted_journals": [],
+    "failed_usage": [],
+    "noncompleted_dispatches": []
+  },
+  "counting": {
+    "original_successful_provider_model_calls": 20,
+    "original_api_calls": 10,
+    "original_grok_calls": 7,
+    "original_antigravity_relay_calls": 3,
+    "original_glm429_provider_rejections": 3,
+    "original_box_local_no_launch_failures": 3,
+    "new_successful_box_native_calls": 4,
+    "new_successful_grok_native_calls": 2,
+    "new_successful_api_raw_calls": 3,
+    "new_successful_provider_model_calls": 9,
+    "new_success_budget": 10,
+    "new_remaining": 1,
+    "combined_successful_provider_model_calls": 29,
+    "combined_evidenced_provider_model_attempts": 32,
+    "browser_zero_send_failure_records_new_phase": 8,
+    "scope": "Native successful modelCalls plus explicitly evidenced upstream GLM429 rejections; excludes original Box local no-launch failures, zero-send UI/preflight failures, and telemetry/auth. No independent socket-level count is claimed."
+  },
+  "original_local_no_launch_requests": [
+    "6191a4b9044681a170d2ac323ffdaa09",
+    "b9587d987a050673344d4979c7781e8d",
+    "39a4319f5a53dc18572c192d68fb175f"
+  ],
+  "original_glm429_requests": [
+    "a7732aa58c72873dbd89758d01bd75dc",
+    "91dd3aaa280df31c56a2c2aa155206fc",
+    "c0c0d1f328045bd5d22b4f11d979fd4d"
+  ],
+  "original_total_credits": 175,
+  "combined_total_credits": 221,
+  "original_evidence_directory": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308/g498-ttft-others-20261018",
+  "grok_cache_comparison": {
+    "baseline_native_input_inclusive_cached": 22535,
+    "baseline_cache_read": 1152,
+    "candidate_native_input_inclusive_cached": 22537,
+    "candidate_cache_read": 1152,
+    "baseline_ratio": "0.05112047925449301087197692478",
+    "candidate_ratio": "0.05111594267205040599902382748",
+    "change_percentage_points": "-0.00045365824426048729530973000",
+    "observed_ratio_nondecreasing": false,
+    "strict_no_decline_gate": "pending_not_passed",
+    "comparability_limit": "Absolute cache-read remains1152; native input is2 tokens longer. Report this decrease exactly, without asserting frontend caused prefix corruption. No extra paid call is authorized."
+  },
+  "grok_native_normalization_checks": [
+    {
+      "arm": "baseline",
+      "usage_id": 24965,
+      "model_calls": 1,
+      "loop_started": 1,
+      "call_counters_match": true,
+      "input_normalizes": true,
+      "output_matches": true,
+      "cache_read_matches": true
+    },
+    {
+      "arm": "candidate-step1",
+      "usage_id": 24971,
+      "model_calls": 1,
+      "loop_started": 1,
+      "call_counters_match": true,
+      "input_normalizes": true,
+      "output_matches": true,
+      "cache_read_matches": true
+    }
+  ],
+  "box_native_vector_checks": [
+    {
+      "arm": "baseline",
+      "native_message_id": "msg_011Cg9f8vUfZkcgyVwSzZAxB",
+      "matched_usage_ids": [
+        24963
+      ],
+      "exactly_one_match": true
+    },
+    {
+      "arm": "baseline",
+      "native_message_id": "msg_011Cg9fAieZseb2fxzW3AAjS",
+      "matched_usage_ids": [
+        24964
+      ],
+      "exactly_one_match": true
+    },
+    {
+      "arm": "candidate-step1",
+      "native_message_id": "msg_011Cg9hvyjdyseS2csdYY1aJ",
+      "matched_usage_ids": [
+        24969
+      ],
+      "exactly_one_match": true
+    },
+    {
+      "arm": "candidate-step1",
+      "native_message_id": "msg_011Cg9hyGUmSjBMm5eWehdix",
+      "matched_usage_ids": [
+        24970
+      ],
+      "exactly_one_match": true
+    }
+  ],
+  "box_cache_comparison": [
+    {
+      "round": 1,
+      "baseline_usage_id": 24963,
+      "candidate_usage_id": 24969,
+      "baseline_input": 2,
+      "baseline_cache_read": 0,
+      "baseline_cache_write": 47741,
+      "candidate_input": 2,
+      "candidate_cache_read": 34577,
+      "candidate_cache_write": 13163,
+      "baseline_ratio": "0",
+      "candidate_ratio": "0.7242469942608185664613966738",
+      "observed_ratio_nondecreasing": true
+    },
+    {
+      "round": 2,
+      "baseline_usage_id": 24964,
+      "candidate_usage_id": 24970,
+      "baseline_input": 4,
+      "baseline_cache_read": 47725,
+      "baseline_cache_write": 493,
+      "candidate_input": 4,
+      "candidate_cache_read": 47724,
+      "candidate_cache_write": 379,
+      "baseline_ratio": "0.9896935008917091783833105222",
+      "candidate_ratio": "0.9920385806639366412372419814",
+      "observed_ratio_nondecreasing": true
+    }
+  ],
+  "box_actual_profile": "account2",
+  "box_profile_evidence": [
+    "billing-agent-box-profile-observer-r2.jsonl",
+    "billing-agent-box-profile-observer-r5.jsonl"
+  ],
+  "provider_identity_limit": "Static API account_id/api_key_id NULL is expected local_catalog attribution. Catalog entry240 configures deepseek/deepseek-flash; no per-request served-provider/key-member identity is persisted for this primary route.",
+  "evidence_applicability": [
+    {
+      "scope": "Step1 frontend Box native pair",
+      "files": [
+        "billing-agent-box-base-audit.json",
+        "billing-agent-box-candidate-audit.json",
+        "billing-agent-box-profile-observer-r2.jsonl",
+        "billing-agent-box-profile-observer-r5.jsonl"
+      ],
+      "finding": "Same actualaccount2 profile; observed per-round cache ratios nondecreasing. Natural generated history differs; no causal cache-improvement claim."
+    },
+    {
+      "scope": "Step1 frontend Grok native pair",
+      "files": [
+        "grok-base-native-usage.json",
+        "grok-head-native-usage.json"
+      ],
+      "finding": "modelCalls andloop_started both1 per arm. Exact cache ratio slightly declines withinput+2; strict cache gate pending."
+    },
+    {
+      "scope": "Shared controlled API tested Step4/Step7 exports",
+      "files": [
+        "cache-results.jsonl",
+        "billing-agent-phase-audit-6calls.json"
+      ],
+      "finding": "46753byte full bodies identicalSHA, cached ratio97.97979798% for base/head; excludes native CLI hidden system/tools/persona/memory."
+    },
+    {
+      "scope": "Step6 zero-send menu/default validation",
+      "finding": "No additional paid Step6 native call in this audit; no Step6-specific native cache before/after claim."
+    }
+  ],
+  "all_accounting_checks_pass": true
+}
