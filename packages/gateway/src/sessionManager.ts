@@ -775,11 +775,12 @@ export function scheduleSessionOutputAssetCollection(opts: {
   traceId?: string
   chatProjectId?: string | null
 }): void {
-  if (!opts.userId || !opts.assistantText) return
+  // OCV5-625: still scan workspace/sessions/<id> when the turn text has no generated/ paths.
+  if (!opts.userId) return
   void collectSessionOutputAssets({
     userId: opts.userId,
     sessionId: opts.sessionId,
-    assistantText: opts.assistantText,
+    assistantText: opts.assistantText || '',
     ...(opts.chatProjectId !== undefined ? { chatProjectId: opts.chatProjectId } : {}),
   }).catch((err) => {
     log.warn(
