@@ -31,6 +31,7 @@ import errno
 import fcntl
 import getpass
 import hashlib
+import http.client
 import json
 import logging
 import logging.handlers
@@ -50,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.5.0"
+BRIDGE_VERSION = "0.5.1"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -86,10 +87,13 @@ ASPECT_RATIOS = ("4:5", "7:12", "9:16")
 IMAGE_FORMATS = ("png", "jpg", "jpeg", "webp")
 POLL_HOLD_DEFAULT = 25
 HEARTBEAT_DEFAULT = 15
-SOURCE_CHUNK_BYTES = 256 * 1024
+SOURCE_CHUNK_BYTES = 1 * MIB
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
+# Per Range chunk against Hub/CDN short reads (aurora c271af109 / prod 2026-10-26: 3 tries exhausted).
+SOURCE_CHUNK_ATTEMPTS = 8
+SOURCE_CHUNK_SLEEP_CAP = 8
 BACKOFF_MAX = 60
 LOG_MAX_BYTES = 5 * MIB
 
@@ -597,6 +601,34 @@ class CliRunner:
         return map_cli_outcome(code, out, err)
 
 
+
+def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, expected_content_range=None):
+    """Raise IOError on short read or Content-Range that does not match the request Range.
+
+    Retried by download_sources around source_chunk. A persistent mismatch still surfaces as
+    MUSE_INVALID_INPUT (retryable download failure) after attempts are exhausted.
+    Personal API keeps download_sources/source_chunk names (aurora uses fetch_sources/get_source).
+    """
+    want = expect_bytes
+    if range_hdr:
+        m_req = re.match(r"bytes=(\d+)-(\d+)$", range_hdr.strip())
+        if not m_req:
+            raise IOError("invalid request Range %r" % range_hdr)
+        req_a, req_b = int(m_req.group(1)), int(m_req.group(2))
+        cr = (resp_headers.get("Content-Range") if resp_headers is not None else None) or ""
+        if expected_content_range is not None and cr != expected_content_range:
+            raise IOError("Content-Range mismatch: want %s got %s" % (expected_content_range, cr))
+        m_cr = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)$", cr.strip())
+        if not m_cr:
+            raise IOError("missing/invalid Content-Range: %r" % cr)
+        got_a, got_b = int(m_cr.group(1)), int(m_cr.group(2))
+        if got_a != req_a or got_b != req_b:
+            raise IOError("Content-Range mismatch: want bytes=%d-%d got %s" % (req_a, req_b, cr))
+        want = got_b - got_a + 1
+    if len(payload) != want:
+        raise IOError("short read: got %d want %d" % (len(payload), want))
+
+
 # --------------------------------------------------------------------------
 # HTTP client
 
@@ -623,19 +655,31 @@ class Client:
         elif body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
+        if binary_limit is not None:
+            # Avoid CDN/gzip transforming Range bodies (Content-Length vs decoded length mismatch).
+            hdrs["Accept-Encoding"] = "identity"
         if headers:
             hdrs.update(headers)
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 status = resp.status
-                payload = resp.read() if binary_limit is None else resp.read(binary_limit + 1)
+                resp_headers = resp.headers
+                try:
+                    payload = resp.read() if binary_limit is None else resp.read(binary_limit + 1)
+                except http.client.IncompleteRead as e:
+                    raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         except urllib.error.HTTPError as e:
             status = e.code
             payload = e.read(4096) if e.fp else b""
             resp_headers = e.headers
-        else:
-            resp_headers = resp.headers
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, http.client.IncompleteRead):
+                raise IOError("incomplete read (%d bytes)" % len(reason.partial or b"")) from e
+            raise
+        except http.client.IncompleteRead as e:
+            raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         # Only the master's own JSON errors mean "token rejected" / "superseded"; the same status
         # from a proxy or the CDN in front of it must not send the user off to rotate the token.
         if status in (401, 403, 409):
@@ -679,14 +723,26 @@ class Client:
         return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
 
     def source_chunk(self, job, ref, start, end):
+        """Bytes start..end (inclusive) of source image ref of an acked job (0.5).
+
+        Sends Accept-Encoding: identity and checks Content-Range + body length so a CDN
+        short read / IncompleteRead raises and is retried by download_sources.
+        """
+        want = end - start + 1
+        range_hdr = "bytes=%d-%d" % (start, end)
         status, headers, data = self._request(
             "GET", "/jobs/%s/sources/%d" % (job["id"], ref["n"]),
-            headers={"X-Job-Nonce": job["nonce"], "Range": "bytes=%d-%d" % (start, end)},
-            timeout=20, binary_limit=end - start + 1,
+            headers={
+                "X-Job-Nonce": job["nonce"],
+                "Range": range_hdr,
+                "Accept-Encoding": "identity",
+            },
+            timeout=60, binary_limit=want,
         )
         expected = "bytes %d-%d/%d" % (start, end, ref["bytes"])
-        if status != 206 or headers.get("Content-Range") != expected or len(data) != end - start + 1:
-            raise IOError("源图分块响应不完整或范围不匹配")
+        if status != 206:
+            raise IOError("源图分块 HTTP %d（期望 206）" % status)
+        _check_binary_body(data, headers, range_hdr, want, expected_content_range=expected)
         return data
 
     def put_chunk(self, job, idx, n, chunk):
@@ -702,7 +758,7 @@ class Client:
         return self._request("POST", "/jobs/%s/result" % job["id"], body, timeout=60)
 
 
-def with_retries(fn, attempts=3):
+def with_retries(fn, attempts=3, sleep_cap=None):
     for i in range(attempts):
         try:
             return fn()
@@ -711,7 +767,10 @@ def with_retries(fn, attempts=3):
         except Exception:
             if i == attempts - 1:
                 raise
-            time.sleep(2 ** i)
+            delay = 2 ** i
+            if sleep_cap is not None:
+                delay = min(delay, sleep_cap)
+            time.sleep(delay)
 
 
 # --------------------------------------------------------------------------
@@ -864,7 +923,7 @@ class Bridge:
             data = bytearray()
             for start in range(0, ref["bytes"], SOURCE_CHUNK_BYTES):
                 end = min(start + SOURCE_CHUNK_BYTES, ref["bytes"]) - 1
-                for attempt in range(3):
+                for attempt in range(SOURCE_CHUNK_ATTEMPTS):
                     if cancel.is_set() or self.stop.is_set():
                         raise JobError("MUSE_CANCELLED", "源图下载已取消")
                     try:
@@ -873,9 +932,10 @@ class Bridge:
                     except (FatalAuth, JobGone):
                         raise
                     except Exception:
-                        if attempt == 2:
+                        if attempt == SOURCE_CHUNK_ATTEMPTS - 1:
                             raise JobError("MUSE_INVALID_INPUT", "源图 %d 下载失败" % (ref["n"] + 1), True) from None
-                        cancel.wait(2 ** attempt)
+                        delay = min(2 ** attempt, SOURCE_CHUNK_SLEEP_CAP)
+                        cancel.wait(delay)
                 data.extend(chunk)
             if hashlib.sha256(data).hexdigest() != ref["sha256"] or sniff_mime(data[:16]) != ref["mime"]:
                 raise JobError("MUSE_INVALID_INPUT", "源图 %d 校验失败" % (ref["n"] + 1))

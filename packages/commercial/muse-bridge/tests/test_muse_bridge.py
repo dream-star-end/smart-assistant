@@ -31,6 +31,28 @@ class Pure(unittest.TestCase):
         with self.assertRaises(mb.JobError) as c:
             mb.validate_job({"id": "v", "kind": "video", "prompt": "x", "image_format": "png"}, self.L)
         self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
+    def test_check_binary_body_ok_and_short_and_bad_cr(self):
+        class H(dict):
+            def get(self, k, default=None):
+                return dict.get(self, k, default)
+        payload = b"x" * 10
+        ok_h = H({"Content-Range": "bytes 0-9/100"})
+        mb._check_binary_body(payload, ok_h, "bytes=0-9", 10)
+        with self.assertRaises(IOError) as c:
+            mb._check_binary_body(payload[:5], ok_h, "bytes=0-9", 10)
+        self.assertIn("short read", str(c.exception))
+        bad_h = H({"Content-Range": "bytes 1-10/100"})
+        with self.assertRaises(IOError) as c2:
+            mb._check_binary_body(payload, bad_h, "bytes=0-9", 10)
+        self.assertIn("Content-Range mismatch", str(c2.exception))
+        with self.assertRaises(IOError) as c3:
+            mb._check_binary_body(payload, H({}), "bytes=0-9", 10)
+        self.assertIn("Content-Range", str(c3.exception))
+        expected = "bytes 0-9/100"
+        mb._check_binary_body(payload, ok_h, "bytes=0-9", 10, expected_content_range=expected)
+        with self.assertRaises(IOError) as c4:
+            mb._check_binary_body(payload, ok_h, "bytes=0-9", 10, expected_content_range="bytes 0-9/999")
+        self.assertIn("Content-Range mismatch", str(c4.exception))
     def test_two_step_argv(self):
         job = mb.validate_job({"id": "e", "kind": "image", "prompt": "make it blue", "image_format": "png",
                                "source_images": [{"base64": b64(PNG)}, {"base64": b64(WEBP)}],
@@ -217,26 +239,50 @@ class E2E(unittest.TestCase):
         jid = "large-refs"
         mm.S.source_flaky[jid] = 1
         n0 = len(argv_lines(self.argvlog))
-        r = self.res(self.refs_job(jid, PNG + b"x" * (3 * mb.MIB)), 30)
+        payload = PNG + b"x" * (3 * mb.MIB)
+        r = self.res(self.refs_job(jid, payload), 30)
         self.assertTrue(r["ok"], r)
         self.assertLess(mm.S.claim_bytes[jid], 512)
         gets = [r for r in mm.S.source_requests if r[0] == jid]
-        self.assertGreater(len(gets), 12)
+        # 1MiB chunks over ~3MiB → ≥3 ranges; +1 flaky retry on first range.
+        expect_min = (len(payload) + mb.SOURCE_CHUNK_BYTES - 1) // mb.SOURCE_CHUNK_BYTES
+        self.assertGreaterEqual(len(gets), expect_min + 1)
         self.assertTrue(all(r[3] for r in gets), "all downloads must follow ack")
         self.assertEqual(gets[0][2], gets[1][2], "retry the failed range only")
+        self.assertTrue(gets[0][2].startswith("bytes="), gets[0][2])
         calls = argv_lines(self.argvlog)[n0:]
         self.assertEqual(len(calls), 2)
         self.assertIn("--upload-only", calls[0])
     def test_07f_download_failures_report_result_without_cli(self):
         for failure in ("network", "sha", "short", "ignored-range"):
             jid = "refs-fail-" + failure
-            if failure == "network": mm.S.source_flaky[jid] = 3
-            else: mm.S.source_bad[jid] = failure
+            if failure == "network":
+                # Exhaust SOURCE_CHUNK_ATTEMPTS (was 3; harden raised to 8).
+                mm.S.source_flaky[jid] = mb.SOURCE_CHUNK_ATTEMPTS
+            else:
+                mm.S.source_bad[jid] = failure
             n0 = len(argv_lines(self.argvlog))
-            r = self.res(self.refs_job(jid))
+            # 8 chunk attempts with capped backoff can take ~40s+ of sleep alone.
+            r = self.res(self.refs_job(jid), 120)
             self.assertEqual(r["error_code"], "MUSE_INVALID_INPUT", failure)
             self.assertEqual(r["retryable"], failure != "sha", failure)
             self.assertEqual(len(argv_lines(self.argvlog)), n0, "failed source must not reach CLI")
+    def test_07f2_short_read_retried_then_ok(self):
+        # CDN/CF short body with matching Content-Range: bridge must retry, not fail once.
+        jid = "refs-short-ok"
+        mm.S.source_short[jid] = 2
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.refs_job(jid), 60)
+        self.assertTrue(r["ok"], r)
+        self.assertGreater(len(argv_lines(self.argvlog)), n0)
+    def test_07i_content_range_mismatch_is_fetch_failed(self):
+        jid = "refs-bad-cr"
+        mm.S.source_bad_cr.add(jid)
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.refs_job(jid), 120)
+        self.assertEqual(r["error_code"], "MUSE_INVALID_INPUT")
+        self.assertTrue(r["retryable"])
+        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
     def test_07g_no_download_without_ack(self):
         jid = "refs-no-ack"
         mm.S.ack_gone.add(jid)
