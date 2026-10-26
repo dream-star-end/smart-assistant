@@ -8717,6 +8717,28 @@
         "f7bc6630",
         "a466412d"
       ]
+    },
+    {
+      "id": "INC-20261026-MUSE-SOURCE-CHUNK-256K",
+      "occurredAt": "2026-10-26",
+      "severity": "P1",
+      "symptom": "商业 uid 1931 工作台 video.from_image（~2.3 MB 首帧）三条 Muse 任务全部 MUSE_SOURCE_FETCH_FAILED（incomplete read 232289 bytes），镜头失败、项目暂停。master hello 下发 source_chunk_bytes 256 KiB（4b655cfa1），覆盖了 bridge 0.5.1 的 1 MiB 默认分片，#1113 的 CDN 短读加固实际未生效：Caddy 里所有 Range GET 都是 262144 字节，单个分片连试 8 次后放弃。",
+      "rootFixCommit": "9b64bbc4",
+      "coverageCommits": [
+        "d00e35bc"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/museBridge.test.ts",
+          "assertion": "hello source_chunk_bytes is never below the bridge default and within its hard limit"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "hello source_chunk_bytes is never below the bridge default and within its hard limit"
+        }
+      ]
     }
   ]
 }
