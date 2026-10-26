@@ -600,11 +600,8 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
   // P2b T4 (docs/ARCH_P2B_FUND_ENTRY_GATES.md F4): a parent-key waiver and a child-key waiver both
   // match the same delegate usage row (turn_key = child, parent_turn_key = parent) but take
   // different turn-billing locks. The usage may be refunded at most once.
-  // F4 is CONFIRMED by this test (2026-10-26: 200 refunded for a 100 debit). It stays a todo so it
-  // keeps running and reporting until the refund fix lands; the fix PR removes the todo.
-  test('P2b T4: concurrent parent-key and child-key waivers refund one delegate usage at most once', {
-    todo: 'F4 confirmed: double refund; fix pending review',
-  }, async (t) => {
+  // F4 was confirmed by this test before the per-user waiver lock (200 refunded for a 100 debit).
+  test('P2b T4: concurrent parent-key and child-key waivers refund one delegate usage at most once', async (t) => {
     if (skipIfNoPg(t)) return
     const { userId } = await createUsers(1_000n)
     for (let i = 0; i < 8; i++) {
