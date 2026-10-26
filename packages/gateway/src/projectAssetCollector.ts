@@ -2,7 +2,8 @@
  * 会话产出物自动归集 + 上传参考资料 excerpt 提取。
  *
  * 产出物:扫助手正文里的 `/home/agent/.openclaude/generated/...` 绝对路径,
- * 登记为 source='output' 的项目资产。失败不得影响回合收口。
+ * 以及会话 cwd `workspace/sessions/<id>/` 下的顶层文件（复制进 generated/session-ws/
+ * 后再登记，以符合 containerPath 白名单）。登记为 source='output'。失败不得影响回合收口。
  *
  * 容器里(有 master 地址与容器令牌)必须登记到 master:容器自己的 sessions
  * 后端是本地 SQLite,界面读的是 master 的 PG,登记在本地等于没登记。项目
@@ -17,10 +18,12 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import {
   appendFile,
+  copyFile,
   link,
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -49,6 +52,11 @@ export const PROJECT_ASSET_TURN_COLLECT_MAX = 5
 /** Outputs above this are registered by source path only, without a version copy. */
 export const OUTPUT_VERSION_COPY_MAX_BYTES = 50 * 1024 * 1024
 const GENERATED_PREFIX = '/home/agent/.openclaude/generated/'
+/** Session-isolated agent cwd (Write tool default). Not in the asset path allowlist. */
+const WORKSPACE_SESSIONS_PREFIX = '/home/agent/.openclaude/workspace/sessions/'
+/** Promoted copies of workspace session files live here so register stays on generated/. */
+const GENERATED_SESSION_WS_REL = 'session-ws/'
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const COPY_CHUNK_BYTES = 1024 * 1024
 const EXCERPT_PARSE_TIMEOUT_MS = 8_000
 const EXCERPT_TEXT_BYTES_MAX = 16 * 1024
@@ -95,6 +103,95 @@ export function extractGeneratedOutputPaths(text: string): string[] {
     seen.add(parsed)
     out.push(parsed)
     if (out.length >= PROJECT_ASSET_TURN_COLLECT_MAX) break
+  }
+  return out
+}
+
+/** Absolute container path for one session's isolated workspace cwd. */
+export function sessionWorkspaceContainerDir(sessionId: string): string | null {
+  if (!SESSION_ID_RE.test(sessionId)) return null
+  return `${WORKSPACE_SESSIONS_PREFIX}${sessionId}`
+}
+
+/**
+ * Copy (or hardlink) top-level regular files from workspace/sessions/<id>/ into
+ * generated/session-ws/<id>/ so they can be registered under the generated/
+ * containerPath allowlist. Returns generated absolute paths (deduped, capped).
+ * OCV5-625: Write-tool outputs land in session cwd, not generated/.
+ */
+export async function promoteSessionWorkspaceOutputs(
+  sessionId: string,
+  roots: OutputVersionRoots = defaultOutputRoots(),
+  opts?: { max?: number },
+): Promise<string[]> {
+  const max = opts?.max ?? PROJECT_ASSET_TURN_COLLECT_MAX
+  if (max <= 0) return []
+  const containerDir = sessionWorkspaceContainerDir(sessionId)
+  if (!containerDir) return []
+  const wsRoot = roots.workspaceSessions ?? WORKSPACE_SESSIONS_PREFIX.slice(0, -1)
+  const sessionFsDir = join(wsRoot, sessionId)
+  let names: string[]
+  try {
+    names = await readdir(sessionFsDir)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return []
+    log.warn('session workspace readdir failed', { sessionId }, err)
+    return []
+  }
+  let rootReal: string
+  try {
+    rootReal = await realpath(wsRoot)
+  } catch {
+    return []
+  }
+  const out: string[] = []
+  for (const name of names) {
+    if (out.length >= max) break
+    if (!name || name.startsWith('.')) continue
+    if (name.includes('/') || name.includes('\\') || name.includes('..')) continue
+    const abs = join(sessionFsDir, name)
+    let st
+    try {
+      st = await lstat(abs)
+    } catch {
+      continue
+    }
+    if (!st.isFile() || st.isSymbolicLink()) continue
+    let real: string
+    try {
+      real = await realpath(abs)
+    } catch {
+      continue
+    }
+    if (!real.startsWith(rootReal + sep)) {
+      log.warn('session workspace file resolves outside sessions root, skipped', { sessionId, name })
+      continue
+    }
+    const destRel = `${GENERATED_SESSION_WS_REL}${sessionId}/${name}`
+    const destFs = join(roots.generated, destRel)
+    try {
+      await mkdir(dirname(destFs), { recursive: true })
+      try {
+        await link(real, destFs)
+      } catch (linkErr) {
+        const code = (linkErr as { code?: string }).code
+        if (code === 'EEXIST') {
+          /* already promoted; refresh bytes if source newer — overwrite via copy */
+          await copyFile(real, destFs)
+        } else if (code === 'EXDEV') {
+          await copyFile(real, destFs)
+        } else {
+          throw linkErr
+        }
+      }
+    } catch (err) {
+      log.warn('promote session workspace file failed', { sessionId, name }, err)
+      continue
+    }
+    const containerPath = `${GENERATED_PREFIX}${destRel}`
+    const parsed = parseProjectAssetContainerPath(containerPath)
+    if (!parsed) continue
+    out.push(parsed)
   }
   return out
 }
@@ -205,6 +302,8 @@ export interface OutputVersionRoots {
   generated: string
   /** Content-addressed store, the same directory uploads land in (served by /api/media). */
   cas: string
+  /** Real directory behind `/home/agent/.openclaude/workspace/sessions/` (test seam). */
+  workspaceSessions?: string
 }
 
 export interface CapturedOutputVersion {
@@ -489,7 +588,21 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
   if (viaMaster) {
     await flushOutputAssetSpool(opts).catch((err) => log.warn('output asset spool flush failed', {}, err))
   }
-  const paths = extractGeneratedOutputPaths(opts.assistantText)
+  const fromText = extractGeneratedOutputPaths(opts.assistantText)
+  const remaining = Math.max(0, PROJECT_ASSET_TURN_COLLECT_MAX - fromText.length)
+  const fromWorkspace =
+    remaining > 0
+      ? await promoteSessionWorkspaceOutputs(opts.sessionId, opts.outputRoots ?? defaultOutputRoots(), {
+          max: remaining,
+        })
+      : []
+  const seen = new Set(fromText)
+  const paths = [...fromText]
+  for (const p of fromWorkspace) {
+    if (seen.has(p)) continue
+    seen.add(p)
+    paths.push(p)
+  }
   if (paths.length === 0) return
   const items: OutputAssetItem[] = []
   for (const containerPath of paths) {
