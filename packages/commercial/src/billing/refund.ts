@@ -219,6 +219,11 @@ export async function applyTurnWaiver(
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    // One waiver per user at a time. The turn lock below only covers this turnKey, but the
+    // debit query also matches delegate children by parent_turn_key, so a parent-key and a
+    // child-key waiver can select the same usage row. Under READ COMMITTED the later one must
+    // read debits only after the earlier one committed its refund rows (P2b F4).
+    await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('oc_waiver_user:' || $1::text, 0))`, [uid])
     await lockTurnBillingKeys(client, input.userId, [input.turnKey])
     const waiver = await ensurePendingTurnWaiverInTransaction(client, input)
 
