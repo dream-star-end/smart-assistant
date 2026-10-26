@@ -9026,27 +9026,22 @@
         },
         {
           "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: overlapping acquires serialize"
+        },
+        {
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/login.integ.test.ts",
           "assertion": "reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE"
         },
         {
-          "layer": "unit",
+          "layer": "integration",
           "path": "packages/commercial/src/__tests__/login.integ.test.ts",
           "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/auth/login.ts",
-          "assertion": "REFRESH_ROTATION_GRACE_SECONDS_DEFAULT = 45"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/api/http.ts",
-          "assertion": "return withCrossTabRefreshLock(async (): Promise<RefreshOutcome> => {"
         }
       ],
       "proofPending": {
-        "reason": "OCV5-622 unit+integ cover grace widen + cross-tab lock; browser BootSplash dual-tab live proof deferred to post-ride canary",
+        "reason": "OCV5-622 covered by unit BC lock + commercial login.integ mid/over-grace; browser dual-tab BootSplash live proof deferred to post-ride canary",
         "since": "2026-10-26"
       }
     }

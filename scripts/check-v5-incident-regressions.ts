@@ -68,7 +68,10 @@ const SELFHOST_PROOF_DEBT_CEILING = 63;
  *     核对(账号 25 生命周期 ready、账号池写入 ≥1、真实 box-claude 回合),记在事故 proofPending 里。
  *     补上 proof 后同步调低。
  */
-const SELFHOST_PROOF_PENDING_BASELINE = 2;
+// 2026-10-26 OCV5-622: office refresh-grace / cross-tab lock is unit+integ proven;
+// dual-tab BootSplash live proof needs post-ride canary on personal office session
+// (browser harness cannot yet drive two real tabs against live auth cookies).
+const SELFHOST_PROOF_PENDING_BASELINE = 3;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {
