@@ -75,6 +75,11 @@ describe('classifyRunError', () => {
     assert.equal(r.code, 'context_too_long')
   })
 
+  it('context_too_long: Antigravity stdin limit refusal is not an internal error', () => {
+    const r = classifyRunError('ANTIGRAVITY_PROMPT_TOO_LARGE: 371964 bytes > 307200')
+    assert.equal(r.code, 'context_too_long')
+  })
+
   it('context_too_long: CCB canonical prompt-too-long success envelope', () => {
     const raw = JSON.stringify({
       subtype: 'success',
