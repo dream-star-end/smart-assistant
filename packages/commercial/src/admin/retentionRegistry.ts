@@ -145,6 +145,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "media_generation_job_inputs",
   "media_generation_jobs",
   "minimax_media_usage_records",
+  // OCV5-589: user-owned MiniMax voice ownership + clone consent; kept until the owner is deleted (FK cascade).
+  "minimax_voices",
   "model_aliases",
   "model_authority_deploy_state",
   "model_catalog",

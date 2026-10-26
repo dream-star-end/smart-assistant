@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 
 import type { Logger } from '../logging/logger.js'
 import { makeMuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
-import { MuseBridgeHub, type MuseWireJob } from '../muse/hub.js'
+import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
 import { MuseError, parseAllowedUids, parseSubmission, supportsSourceRefs } from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
@@ -219,6 +219,48 @@ describe('muse hub', () => {
       assert.equal(entry.msg, attempt === 3 ? 'muse_job_ack_timeout_failed' : 'muse_job_ack_timeout_requeued')
       assert.equal(entry.meta.claimResponseBytes, Buffer.byteLength(JSON.stringify({ job })))
     }
+  })
+
+  it('deterministic job ids make submission idempotent (OCV5-591 A0)', async () => {
+    await online()
+    const id = deterministicMuseJobId('studio:task-1')
+    assert.match(id, /^mj_[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    assert.equal(deterministicMuseJobId('studio:task-1'), id)
+    assert.notEqual(deterministicMuseJobId('studio:task-2'), id)
+    const first = await hub.submit('3', null, { kind: 'image', prompt: 'fox' }, { jobId: id })
+    assert.equal(first, id)
+    const again = await hub.submit('3', null, { kind: 'image', prompt: 'fox' }, { jobId: id })
+    assert.equal(again, id)
+    assert.equal(store.rows.size, 1, 'a retried submission never inserts or queues a second job')
+    // The id is known only in the database (another process admitted it): still no second job.
+    const otherProcess = makeHub(store, clock, root)
+    otherProcess.hello('1', '0.3.0')
+    assert.equal(
+      await otherProcess.submit('3', null, { kind: 'image', prompt: 'fox' }, { jobId: id }),
+      id,
+    )
+    assert.equal(store.rows.size, 1)
+    otherProcess.stop()
+    await assert.rejects(
+      hub.submit('3', null, { kind: 'image', prompt: 'x' }, { jobId: 'mj_not-a-uuid' }),
+      (e: unknown) => e instanceof MuseError && e.code === 'MUSE_INVALID_INPUT',
+    )
+  })
+
+  it('a concurrent duplicate insert of the same id returns the existing job (23505)', async () => {
+    await online()
+    const id = deterministicMuseJobId('studio:race')
+    const orig = store.insertJob.bind(store)
+    let first = true
+    store.insertJob = async (r) => {
+      if (first) {
+        first = false
+        await orig(r)
+        throw Object.assign(new Error('duplicate key'), { code: '23505' })
+      }
+      return orig(r)
+    }
+    assert.equal(await hub.submit('3', null, { kind: 'image', prompt: 'fox' }, { jobId: id }), id)
   })
 
   it('refuses when offline, not allowed, busy, or rate limited', async () => {

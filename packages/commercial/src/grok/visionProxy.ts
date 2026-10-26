@@ -48,7 +48,7 @@ import {
   releasePreCheck,
   type PreCheckRedis,
 } from "../billing/preCheck.js";
-import { abortInflightJournal, startInflightJournal } from "../billing/proxyBilling.js";
+import { abortInflightJournal, readJournalForTakeover, startInflightJournal } from "../billing/proxyBilling.js";
 import { query } from "../db/queries.js";
 import { classifyGrokRelayStatus } from "../http/internalGrokRelay.js";
 import {
@@ -140,6 +140,7 @@ export interface GrokVisionHandlerDeps {
   settleDurableCodexBillingFn?: typeof settleDurableCodexBilling;
   abortInflightJournalFn?: typeof abortInflightJournal;
   releasePreCheckFn?: typeof releasePreCheck;
+  readJournalForTakeoverFn?: typeof readJournalForTakeover;
 }
 
 export type GrokVisionHandler = (
@@ -330,19 +331,365 @@ async function defaultRecordStatus(accountId: bigint, statusCode: number): Promi
   );
 }
 
-export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHandler {
-  const log = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
+/** Result of one Grok Responses call made by master on behalf of a user (OCV5-591 A0). */
+export interface GrokRunResult {
+  text: string;
+  model: string;
+  usage: GrokVisionUsage;
+  requestId: string;
+}
+
+export interface GrokRunInput {
+  userId: bigint;
+  /** null for master-side callers (media studio); the vision HTTP route passes the container. */
+  containerId: bigint | null;
+  /**
+   * Stable billing request id. The vision route mints a fresh one per call; the studio passes its
+   * task execution id so a retried step settles idempotently on usage_records (user, request_id).
+   */
+  requestId: string;
+  /**
+   * Execution attempt for a stable requestId (studio: the task's claim count). A failed attempt
+   * leaves its journal row aborted and that id can never be admitted again, so attempt N ≥ 1
+   * bills under `<requestId>~<N>` (Codex code r1 P1). A caller that persisted a result through
+   * onResult settles it with resettleGrokRun under the id onResult reported, never by re-running.
+   */
+  attempt?: number;
+  prompt: string;
+  image?: { mediaType: VisionMediaType; data: string };
+  /**
+   * "user" (default): authorized model, precheck, journal, settle at the grok-build price.
+   * "platform": platform-paid master step (no precheck/journal/ledger). Only reachable from master
+   * code — the HTTP route always uses "user".
+   */
+  billTo?: "user" | "platform";
+  /** Called after a successful upstream answer and before settlement (studio persists it first). */
+  onResult?: (result: { text: string; usage: GrokVisionUsage; model: string; requestId: string }) => Promise<void>;
+  /** Rate-limit key; defaults to the container id, or `studio:<userId>` without a container. */
+  rateKey?: string;
+  /** The HTTP route counts the rate limit before reading the body; it sets this to avoid counting twice. */
+  skipRateLimit?: boolean;
+  logger?: Logger;
+}
+
+export class GrokRunError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "GrokRunError";
+  }
+}
+
+export type GrokRunner = (input: GrokRunInput) => Promise<GrokRunResult>;
+
+/**
+ * OCV5-591 A2-1b-1: the worst case of one user-billed run (the same estimate its precheck
+ * reserves), for the media studio's project budget. null when the catalog cannot price it.
+ */
+export async function grokRunMaxCost(catalog: GrokVisionCatalog): Promise<bigint | null> {
+  try {
+    const snapshot = await catalog.assertFresh();
+    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(GROK_VISION_MODEL));
+    return pricing ? estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Core of the vision proxy, callable without a container (OCV5-591 A0). Behaviour for the HTTP
+ * route is unchanged: same admit → upstream → settle order, same error codes.
+ */
+export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" | "newRequestId">): GrokRunner {
   const pickAccountId = deps.pickAccountId ?? defaultPickAccountId;
   const freshToken = deps.freshToken ?? ((id: bigint) => getFreshGrokAccessToken(id));
   const requestFn = deps.requestFn ?? ((url, init) => undiciRequest(url, init));
   const recordStatus = deps.recordStatus ?? defaultRecordStatus;
-  const newRequestId = deps.newRequestId ?? (() => randomBytes(16).toString("hex"));
   const now = deps.now ?? Date.now;
   const runPreCheck = deps.preCheckWithCostFn ?? preCheckWithCost;
   const runStartJournal = deps.startInflightJournalFn ?? startInflightJournal;
   const runSettle = deps.settleDurableCodexBillingFn ?? settleDurableCodexBilling;
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal;
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck;
+  const runReadJournal = deps.readJournalForTakeoverFn ?? readJournalForTakeover;
+  const baseLog = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
+
+  return async function run(input: GrokRunInput): Promise<GrokRunResult> {
+    const reqLog = input.logger ?? baseLog;
+    const { userId, containerId } = input;
+    const billTo = input.billTo ?? "user";
+    const rateKey = input.rateKey ?? (containerId !== null ? String(containerId) : `studio:${userId}`);
+    if (!input.skipRateLimit && !allowVision(rateKey, now())) {
+      reqLog.warn("rate_limited", { rateKey });
+      throw new GrokRunError(429, "RATE_LIMITED", "grok vision rate limit exceeded");
+    }
+    const attempt = input.attempt ?? 0;
+    if (!Number.isSafeInteger(attempt) || attempt < 0 || attempt > 9999) {
+      throw new GrokRunError(400, "BAD_BODY", "attempt must be an integer in 0..9999");
+    }
+    const billingRequestId = attempt === 0 ? input.requestId : `${input.requestId}~${attempt}`;
+    if (billingRequestId.length < 1 || billingRequestId.length > 128) {
+      throw new GrokRunError(400, "BAD_BODY", "request id must be 1..128 chars");
+    }
+    if (input.prompt.length < 1 || input.prompt.length > MAX_PROMPT_CHARS) {
+      throw new GrokRunError(400, "BAD_BODY", "prompt must be 1..8000 chars");
+    }
+    if (input.image) {
+      const bytes = Buffer.from(input.image.data, "base64");
+      if (bytes.length === 0 || bytes.length > GROK_VISION_MAX_IMAGE_BYTES) {
+        throw new GrokRunError(413, "IMAGE_TOO_LARGE", "image exceeds the vision size limit");
+      }
+      if (sniffMediaType(bytes) !== input.image.mediaType) {
+        throw new GrokRunError(400, "BAD_IMAGE", "image bytes do not match the declared media type");
+      }
+    }
+
+    // ── admit: nothing is sent upstream before the price is frozen, the user
+    // is authorized for the model, credits are reserved and the journal row exists.
+    let snapshot: ModelCatalogSnapshot;
+    try {
+      snapshot = await deps.catalog.assertFresh();
+    } catch {
+      throw new GrokRunError(503, "GROK_VISION_CATALOG_UNAVAILABLE", "model catalog unavailable");
+    }
+    const canonical = snapshot.aliasToCanonical(GROK_VISION_MODEL);
+    let upstreamModel: string;
+    try {
+      const descriptor = snapshot.resolve(canonical);
+      if (!descriptor || descriptor.engine !== "grok") throw new Error("not a grok model");
+      upstreamModel = grokExecutionUpstream(canonical, descriptor.upstreamModelId);
+    } catch {
+      throw new GrokRunError(503, "GROK_VISION_MODEL_UNAVAILABLE", "vision model is not available");
+    }
+
+    const reservation = { userId: userId.toString(), requestId: billingRequestId };
+    const engineSessionId = deriveEngineSessionId(
+      containerId !== null ? `vision:${userId}:${containerId}` : `studio:${userId}`,
+    );
+    let abandon: (reason: string) => Promise<void> = async () => {};
+    if (billTo === "user") {
+      let scope;
+      try {
+        scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
+      } catch {
+        throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
+      }
+      if (!snapshot.canUseModel(scope, canonical)) {
+        throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "vision model is not available to this user");
+      }
+      const pricing = snapshot.billingPricingFor(canonical);
+      if (!pricing) {
+        throw new GrokRunError(503, "GROK_VISION_PRICING_UNAVAILABLE", "vision model pricing unavailable");
+      }
+      let precheck: Awaited<ReturnType<typeof preCheckWithCost>>;
+      try {
+        precheck = await runPreCheck(deps.preCheckRedis, {
+          userId,
+          requestId: billingRequestId,
+          maxCost: estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing),
+        });
+      } catch (err) {
+        if (err instanceof InsufficientCreditsError) {
+          throw new GrokRunError(402, "INSUFFICIENT_CREDITS", "insufficient credits for image understanding");
+        }
+        throw err;
+      }
+      let admitted: boolean;
+      try {
+        admitted = await runStartJournal(deps.getPool(), {
+          requestId: billingRequestId,
+          userId,
+          containerId,
+          model: canonical,
+          precheckCredits: precheck.maxCost,
+          ctxJson: {
+            agentId: "vision",
+            source: GROK_VISION_JOURNAL_SOURCE,
+            billingPricing: serializeBillingPricing(pricing),
+            // Nested so settle does not treat these as a bridge_signed stamp.
+            catalogGeneration: {
+              billingRevision: snapshot.billingRevision,
+              executionRevision: snapshot.executionRevision,
+              securityEpoch: snapshot.securityEpoch.toString(),
+            },
+            upstreamModelId: upstreamModel,
+            engineSessionId,
+          },
+        });
+      } catch (err) {
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        throw err;
+      }
+      if (!admitted) {
+        // The request id already has a journal row. Until that row is terminal another call with
+        // this id still owns the reservation (inflight, or finalizing before its charge lands),
+        // and the precheck above re-wrote that same reservation: releasing it here would drop the
+        // running call's hold on the balance (Codex #1130 r1/r2 P1). Release only for a missing
+        // or terminal row; any other or unreadable state is left to the running call or the TTL.
+        const state = await runReadJournal(deps.getPool(), billingRequestId).then(
+          (row) => row?.state ?? null,
+          () => "unknown",
+        );
+        if (state === null || state === "committed" || state === "aborted") {
+          await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        }
+        throw new GrokRunError(409, "GROK_VISION_JOURNAL_CONFLICT", "billing journal conflict");
+      }
+      abandon = async (reason: string): Promise<void> => {
+        await runAbort(deps.getPool(), billingRequestId, reason, "INTERNAL_ERROR").catch((err) => {
+          // The row stays inflight; the journal reconciler times it out and
+          // releases the reservation. Nothing has been charged.
+          reqLog.error("grok_vision_abandon_failed", {
+            billingRequestId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+      };
+    }
+
+    const startedAt = now();
+    let answer: string;
+    let usage: GrokVisionUsage;
+    let accessToken: Buffer | null = null;
+    try {
+      const accountId = await pickAccountId().catch(() => null);
+      if (accountId === null) {
+        throw new GrokRunError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
+      }
+      accessToken = await freshToken(accountId);
+      const upstream = await requestFn(GROK_VISION_UPSTREAM, {
+        method: "POST",
+        dispatcher: directEgressDispatcher(),
+        headersTimeout: UPSTREAM_TIMEOUT_MS,
+        bodyTimeout: UPSTREAM_TIMEOUT_MS,
+        headers: grokVisionHeaders(accessToken, canonical),
+        body: input.image
+          ? grokVisionBody({ upstreamModel, mediaType: input.image.mediaType, data: input.image.data, prompt: input.prompt })
+          : grokTextBody({ upstreamModel, prompt: input.prompt }),
+      });
+      const text = await upstream.body.text();
+      void recordStatus(accountId, upstream.statusCode).catch(() => {});
+      if (upstream.statusCode >= 400) {
+        reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
+        throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
+      }
+      let json: unknown;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned invalid JSON");
+      }
+      answer = textFromGrokVisionResponse(json);
+      if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
+      const metered = usageFromGrokVisionResponse(json);
+      if (!metered) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no usage");
+      usage = metered;
+    } catch (err) {
+      await abandon("grok_vision_upstream_failed");
+      if (err instanceof GrokRunError) {
+        reqLog.warn("grok_vision_failed", { code: err.code, status: err.status });
+        throw err;
+      }
+      const name = err instanceof Error ? err.name : "";
+      if (name === "TimeoutError" || name === "HeadersTimeoutError" || name === "BodyTimeoutError") {
+        reqLog.warn("grok_vision_timeout");
+        throw new GrokRunError(504, "GROK_UPSTREAM_TIMEOUT", "grok vision timed out");
+      }
+      reqLog.warn("grok_vision_upstream_error", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream unreachable");
+    } finally {
+      accessToken?.fill(0);
+    }
+
+    if (input.onResult) {
+      try {
+        await input.onResult({ text: answer, usage, model: canonical, requestId: billingRequestId });
+      } catch (err) {
+        // The answer could not be persisted: do not settle a result the caller cannot use.
+        await abandon("grok_run_result_persist_failed");
+        throw err;
+      }
+    }
+
+    if (billTo === "user") {
+      // ── settle. The answer is only returned once the charge is durably
+      // recorded; an unsettled call leaves the journal inflight for the
+      // reconciler (reservation released, no usage row) and returns an error.
+      await settleGrokRun(deps, runSettle, reqLog, userId, {
+        requestId: billingRequestId,
+        engineSessionId,
+        durationMs: Math.max(0, now() - startedAt),
+        usage,
+      });
+    }
+    return { text: answer, model: canonical, usage, requestId: billingRequestId };
+  };
+}
+
+async function settleGrokRun(
+  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing">,
+  runSettle: typeof settleDurableCodexBilling,
+  reqLog: Logger,
+  userId: bigint,
+  frame: { requestId: string; engineSessionId: string; durationMs: number; usage: GrokVisionUsage },
+): Promise<void> {
+  try {
+    const outcome = await runSettle(
+      { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog },
+      userId,
+      { requestId: frame.requestId, engineSessionId: frame.engineSessionId, status: "success", durationMs: frame.durationMs, usage: frame.usage },
+    );
+    if (outcome === "waived") throw new Error("settlement waived");
+  } catch (err) {
+    reqLog.error("grok_vision_settle_failed", {
+      billingRequestId: frame.requestId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    throw new GrokRunError(502, "GROK_VISION_BILLING_FAILED", "image understanding could not be billed");
+  }
+}
+
+/**
+ * Settle a previously persisted Grok step again (studio reclaim after a crash between
+ * onResult and settle). Idempotent on usage_records (user, request_id).
+ */
+export async function resettleGrokRun(
+  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing" | "logger" | "settleDurableCodexBillingFn">,
+  input: { userId: bigint; containerId: bigint | null; requestId: string; usage: GrokVisionUsage; durationMs: number },
+): Promise<void> {
+  const log = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
+  const engineSessionId = deriveEngineSessionId(
+    input.containerId !== null ? `vision:${input.userId}:${input.containerId}` : `studio:${input.userId}`,
+  );
+  await settleGrokRun(deps, deps.settleDurableCodexBillingFn ?? settleDurableCodexBilling, log, input.userId, {
+    requestId: input.requestId,
+    engineSessionId,
+    durationMs: input.durationMs,
+    usage: input.usage,
+  });
+}
+
+/** Text-only Responses body (studio planning / prompt / interpret steps). */
+export function grokTextBody(input: { upstreamModel: string; prompt: string }): string {
+  return JSON.stringify({
+    model: input.upstreamModel,
+    input: [{ role: "user", content: [{ type: "input_text", text: input.prompt }] }],
+    reasoning: { effort: "low" },
+    max_output_tokens: MAX_OUTPUT_TOKENS,
+    store: false,
+  });
+}
+
+export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHandler {
+  const log = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
+  const newRequestId = deps.newRequestId ?? (() => randomBytes(16).toString("hex"));
+  const run = makeGrokRunner(deps);
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -369,14 +716,14 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
     const userId = BigInt(verified.userId);
     const containerId = BigInt(verified.containerId);
 
-    if (!allowVision(String(verified.containerId), now())) {
+    let image: { mediaType: VisionMediaType; data: string };
+    let prompt: string;
+    // Rate limit before reading the body, exactly as before the extraction.
+    if (!allowVision(String(verified.containerId), (deps.now ?? Date.now)())) {
       reqLog.warn("rate_limited", { containerId: String(verified.containerId) });
       sendError(res, 429, "RATE_LIMITED", "grok vision rate limit exceeded", requestId);
       return;
     }
-
-    let image: { mediaType: VisionMediaType; data: string };
-    let prompt: string;
     try {
       const raw = await readJsonBody(req, MAX_BODY_BYTES);
       const parsed = VisionRequestSchema.safeParse(raw);
@@ -393,192 +740,25 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
       }
       throw err;
     }
-    const bytes = Buffer.from(image.data, "base64");
-    if (bytes.length === 0 || bytes.length > GROK_VISION_MAX_IMAGE_BYTES) {
-      sendError(res, 413, "IMAGE_TOO_LARGE", "image exceeds the vision size limit", requestId);
-      return;
-    }
-    if (sniffMediaType(bytes) !== image.mediaType) {
-      sendError(res, 400, "BAD_IMAGE", "image bytes do not match the declared media type", requestId);
-      return;
-    }
-
-    // ── admit: nothing is sent upstream before the price is frozen, the user
-    // is authorized for the model, credits are reserved and the journal row exists.
-    let snapshot: ModelCatalogSnapshot;
     try {
-      snapshot = await deps.catalog.assertFresh();
-    } catch {
-      sendError(res, 503, "GROK_VISION_CATALOG_UNAVAILABLE", "model catalog unavailable", requestId);
-      return;
-    }
-    let scope;
-    try {
-      scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
-    } catch {
-      sendError(res, 503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable", requestId);
-      return;
-    }
-    const canonical = snapshot.aliasToCanonical(GROK_VISION_MODEL);
-    let upstreamModel: string;
-    try {
-      const descriptor = snapshot.resolve(canonical);
-      if (!descriptor || descriptor.engine !== "grok") throw new Error("not a grok model");
-      upstreamModel = grokExecutionUpstream(canonical, descriptor.upstreamModelId);
-    } catch {
-      sendError(res, 503, "GROK_VISION_MODEL_UNAVAILABLE", "vision model is not available", requestId);
-      return;
-    }
-    if (!snapshot.canUseModel(scope, canonical)) {
-      sendError(res, 403, "GROK_VISION_NOT_AUTHORIZED", "vision model is not available to this user", requestId);
-      return;
-    }
-    const pricing = snapshot.billingPricingFor(canonical);
-    if (!pricing) {
-      sendError(res, 503, "GROK_VISION_PRICING_UNAVAILABLE", "vision model pricing unavailable", requestId);
-      return;
-    }
-
-    const billingRequestId = newRequestId();
-    const reservation = { userId: userId.toString(), requestId: billingRequestId };
-    let precheck: Awaited<ReturnType<typeof preCheckWithCost>>;
-    try {
-      precheck = await runPreCheck(deps.preCheckRedis, {
+      const result = await run({
         userId,
-        requestId: billingRequestId,
-        maxCost: estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing),
+        containerId,
+        requestId: newRequestId(),
+        prompt,
+        image,
+        billTo: "user",
+        rateKey: String(verified.containerId),
+        logger: reqLog,
+        skipRateLimit: true,
       });
+      sendJson(res, 200, { text: result.text, model: result.model });
     } catch (err) {
-      if (err instanceof InsufficientCreditsError) {
-        sendError(res, 402, "INSUFFICIENT_CREDITS", "insufficient credits for image understanding", requestId);
+      if (err instanceof GrokRunError) {
+        sendError(res, err.status, err.code, err.message, requestId);
         return;
       }
       throw err;
     }
-    const engineSessionId = deriveEngineSessionId(`vision:${userId}:${containerId}`);
-    let admitted = false;
-    try {
-      admitted = await runStartJournal(deps.getPool(), {
-        requestId: billingRequestId,
-        userId,
-        containerId,
-        model: canonical,
-        precheckCredits: precheck.maxCost,
-        ctxJson: {
-          agentId: "vision",
-          source: GROK_VISION_JOURNAL_SOURCE,
-          billingPricing: serializeBillingPricing(pricing),
-          // Nested so settle does not treat these as a bridge_signed stamp.
-          catalogGeneration: {
-            billingRevision: snapshot.billingRevision,
-            executionRevision: snapshot.executionRevision,
-            securityEpoch: snapshot.securityEpoch.toString(),
-          },
-          upstreamModelId: upstreamModel,
-          engineSessionId,
-        },
-      });
-    } finally {
-      if (!admitted) await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
-    }
-    if (!admitted) {
-      sendError(res, 409, "GROK_VISION_JOURNAL_CONFLICT", "billing journal conflict", requestId);
-      return;
-    }
-
-    const abandon = async (reason: string): Promise<void> => {
-      await runAbort(deps.getPool(), billingRequestId, reason, "INTERNAL_ERROR").catch((err) => {
-        // The row stays inflight; the journal reconciler times it out and
-        // releases the reservation. Nothing has been charged.
-        reqLog.error("grok_vision_abandon_failed", {
-          billingRequestId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
-      await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
-    };
-
-    const startedAt = now();
-    let answer: string;
-    let usage: GrokVisionUsage;
-    let accessToken: Buffer | null = null;
-    try {
-      const accountId = await pickAccountId().catch(() => null);
-      if (accountId === null) {
-        throw new HttpError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
-      }
-      accessToken = await freshToken(accountId);
-      const upstream = await requestFn(GROK_VISION_UPSTREAM, {
-        method: "POST",
-        dispatcher: directEgressDispatcher(),
-        headersTimeout: UPSTREAM_TIMEOUT_MS,
-        bodyTimeout: UPSTREAM_TIMEOUT_MS,
-        headers: grokVisionHeaders(accessToken, canonical),
-        body: grokVisionBody({ upstreamModel, mediaType: image.mediaType, data: image.data, prompt }),
-      });
-      const text = await upstream.body.text();
-      void recordStatus(accountId, upstream.statusCode).catch(() => {});
-      if (upstream.statusCode >= 400) {
-        reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
-        throw new HttpError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
-      }
-      let json: unknown;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new HttpError(502, "GROK_BAD_RESPONSE", "grok vision returned invalid JSON");
-      }
-      answer = textFromGrokVisionResponse(json);
-      if (!answer) throw new HttpError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
-      const metered = usageFromGrokVisionResponse(json);
-      if (!metered) throw new HttpError(502, "GROK_BAD_RESPONSE", "grok vision returned no usage");
-      usage = metered;
-    } catch (err) {
-      await abandon("grok_vision_upstream_failed");
-      if (err instanceof HttpError) {
-        reqLog.warn("grok_vision_failed", { code: err.code, status: err.status });
-        sendError(res, err.status, err.code, err.message, requestId);
-        return;
-      }
-      const name = err instanceof Error ? err.name : "";
-      if (name === "TimeoutError" || name === "HeadersTimeoutError" || name === "BodyTimeoutError") {
-        reqLog.warn("grok_vision_timeout");
-        sendError(res, 504, "GROK_UPSTREAM_TIMEOUT", "grok vision timed out", requestId);
-        return;
-      }
-      reqLog.warn("grok_vision_upstream_error", {
-        err: err instanceof Error ? err.message : String(err),
-      });
-      sendError(res, 502, "GROK_UPSTREAM_ERROR", "grok vision upstream unreachable", requestId);
-      return;
-    } finally {
-      accessToken?.fill(0);
-    }
-
-    // ── settle. The answer is only returned once the charge is durably
-    // recorded; an unsettled call leaves the journal inflight for the
-    // reconciler (reservation released, no usage row) and returns an error.
-    try {
-      const outcome = await runSettle(
-        { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog },
-        userId,
-        {
-          requestId: billingRequestId,
-          engineSessionId,
-          status: "success",
-          durationMs: Math.max(0, now() - startedAt),
-          usage,
-        },
-      );
-      if (outcome === "waived") throw new Error("settlement waived");
-    } catch (err) {
-      reqLog.error("grok_vision_settle_failed", {
-        billingRequestId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-      sendError(res, 502, "GROK_VISION_BILLING_FAILED", "image understanding could not be billed", requestId);
-      return;
-    }
-    sendJson(res, 200, { text: answer, model: canonical });
   };
 }
