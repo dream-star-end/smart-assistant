@@ -34,9 +34,29 @@ async function fixture(t: import('node:test').TestContext, mode: 'normal' | 'los
  INSERT INTO users VALUES(765,'user','active',NULL);
  CREATE TABLE client_sessions(id text PRIMARY KEY,user_id text,title text,pinned int DEFAULT 0,updated_at bigint DEFAULT 100,deleted_at bigint,model_id text DEFAULT 'synthetic-model',project_id text,archived_at bigint,messages jsonb DEFAULT '[]');
  CREATE TABLE chat_projects(id text PRIMARY KEY,user_id text,deleted_at bigint);
+ CREATE TABLE project_assets(
+   id text PRIMARY KEY,
+   user_id text NOT NULL,
+   project_id text,
+   source text NOT NULL,
+   session_id text,
+   name text NOT NULL,
+   url text,
+   container_path text,
+   mime text,
+   size_bytes bigint,
+   digest text,
+   excerpt text,
+   pinned boolean NOT NULL DEFAULT false,
+   created_at bigint NOT NULL DEFAULT 0,
+   updated_at bigint NOT NULL DEFAULT 0,
+   deleted_at bigint
+ );
  INSERT INTO client_sessions(id,user_id,title) VALUES('target','c:765','Original'),('other','c:8000000766','Foreign'),('deleted','c:765','Deleted');
  UPDATE client_sessions SET deleted_at=1 WHERE id='deleted';
- INSERT INTO chat_projects VALUES('project','c:765',NULL);`)
+ INSERT INTO chat_projects VALUES('project','c:765',NULL);
+ INSERT INTO project_assets(id,user_id,project_id,source,session_id,name,container_path,created_at,updated_at)
+   VALUES('asset-orphan','c:765',NULL,'output','target','orphan.html','/tmp/orphan.html',100,100);`)
  await pool.query(readFileSync(new URL('../db/migrations/0327_system_action_receipts.sql', import.meta.url), 'utf8'))
  setPoolOverride(pool)
  const ledger = new SystemActionStore({ dbPath: join(mkdtempSync(join(tmpdir(), 'oc-session-meta-ledger-')), 'ledger.sqlite'), key: randomBytes(32) })
@@ -111,6 +131,9 @@ test('legacy mixed metadata remains one transaction with project validation and 
   assert.equal(ok.ok, true); await client.query('COMMIT')
   const current = await f.row()
   assert.equal(current.title, 'Mixed'); assert.equal(current.pinned, 1); assert.equal(current.model_id, 'synthetic-next'); assert.equal(current.project_id, 'project'); assert(current.archived_at)
+  // OCV5-624: session-scoped assets follow the session into the new project
+  const assets = await client.query("SELECT project_id FROM project_assets WHERE id='asset-orphan'")
+  assert.equal(assets.rows[0].project_id, 'project')
   await client.query('BEGIN')
   const bad = await patchSessionMetadataInTx(client, 'target', 'c:765', { title: 'Must not apply', projectId: 'missing' })
   assert.deepEqual(bad, { ok: false, error: 'project_not_found' }); await client.query('ROLLBACK')
