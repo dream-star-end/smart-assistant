@@ -21,6 +21,7 @@ Source images (image editing, image-to-video) take two CLI calls, because
 --conversation-json as {"image": id} items ahead of the text.
 
 Protocol: POST /api/muse-bridge/v1/{hello,poll}, POST /jobs/<id>/heartbeat,
+GET /jobs/<id>/sources/<n> (0.5: source images by reference, fetched after the ack),
 PUT /jobs/<id>/files/<idx>/chunks/<n>, POST /jobs/<id>/result.
 See DESIGN-20261022-muse-media.md §3.
 """
@@ -51,7 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.5.1"
+BRIDGE_VERSION = "0.5.2"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -66,6 +67,7 @@ DEFAULT_LIMITS = {
     "chunk_bytes": 4 * MIB,
     "source_max_bytes": 10 * MIB,
     "max_source_images": 4,
+    "source_chunk_bytes": 1 * MIB,
 }
 HARD_LIMITS = {
     "image_max_bytes": 50 * MIB,
@@ -75,6 +77,7 @@ HARD_LIMITS = {
     "chunk_bytes": 8 * MIB,
     "source_max_bytes": 20 * MIB,
     "max_source_images": 8,
+    "source_chunk_bytes": 4 * MIB,
 }
 
 DEFAULT_TIMEOUT = {"image": 120, "video": 300}
@@ -87,14 +90,21 @@ ASPECT_RATIOS = ("4:5", "7:12", "9:16")
 IMAGE_FORMATS = ("png", "jpg", "jpeg", "webp")
 POLL_HOLD_DEFAULT = 25
 HEARTBEAT_DEFAULT = 15
-SOURCE_CHUNK_BYTES = 1 * MIB
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
-# Per Range chunk against Hub/CDN short reads (aurora c271af109 / prod 2026-10-26: 3 tries exhausted).
+# Per Range chunk against Hub/CDN short reads (prod 2026-10-26: 3 tries exhausted).
 SOURCE_CHUNK_ATTEMPTS = 8
 SOURCE_CHUNK_SLEEP_CAP = 8
+# 0.5.2: a Range body cut short in transit keeps what arrived and the next request resumes after
+# it, so a relay that drops ~11% of every response still converges (prod 2026-10-26 uid 1931:
+# 1 MiB ranges came through as 930222 bytes on 8 tries in a row). Such reads are not failed
+# attempts; this caps them per source image so a path that trickles bytes still ends.
+SOURCE_SHORT_READS_MAX = 64
 BACKOFF_MAX = 60
+# Jobs this bridge runs at once: the smaller of --max-concurrency and the master's hello
+# `max_concurrency` (a master that does not send it gets one, as before 0.4.0).
+MAX_CONCURRENCY_HARD = 16
 LOG_MAX_BYTES = 5 * MIB
 
 URL_RE = re.compile(r"https?://\S+")
@@ -114,6 +124,10 @@ class Blocked(FatalAuth):
 
 class JobGone(Exception):
     """Master no longer knows this job (410): drop it."""
+
+
+class SessionLost(Exception):
+    """The master no longer knows this session (it restarted): say hello again."""
 
 
 class StopRequested(Exception):
@@ -213,6 +227,12 @@ def effective_limits(server_limits=None):
     return {k: _clamp_limit(server_limits, k) for k in DEFAULT_LIMITS}
 
 
+def effective_slots(server_value, local_max):
+    """Jobs to run at once: the master's offer (1 when absent or invalid), never above local_max."""
+    offered = server_value if isinstance(server_value, int) and not isinstance(server_value, bool) else 1
+    return max(1, min(offered, local_max, MAX_CONCURRENCY_HARD))
+
+
 def sniff_mime(head):
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -248,6 +268,22 @@ class JobError(Exception):
         body = {"ok": False, "error_code": self.code, "error_message": self.message, "retryable": self.retryable}
         body.update({k: v for k, v in self.extra.items() if v is not None})
         return body
+
+
+def _check_source_ref(item, limits, n):
+    if not isinstance(item, dict) or item.get("n") != n:
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 格式错误" % n)
+    size = item.get("bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 大小非法" % n)
+    if size > limits["source_max_bytes"]:
+        raise JobError("MUSE_INVALID_INPUT", "源图 %d 超过 %d MiB" % (n + 1, limits["source_max_bytes"] // MIB))
+    sha = item.get("sha256")
+    if not isinstance(sha, str) or not re.match(r"^[0-9a-f]{64}$", sha):
+        raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] sha256 非法" % n)
+    if item.get("mime") not in ("image/png", "image/jpeg", "image/webp"):
+        raise JobError("MUSE_INVALID_INPUT", "源图只支持 png/jpg/webp")
+    return {"n": n, "bytes": size, "sha256": sha, "mime": item["mime"]}
 
 
 def _decode_source_image(item, limits, n):
@@ -307,16 +343,18 @@ def validate_job(job, limits):
             raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
         out["source_images"] = [_decode_source_image(item, limits, n) for n, item in enumerate(sources)]
     refs = job.get("source_refs")
+    if refs == []:
+        # 0.5.2: the personal master sends an empty list for a job without sources; same as absent.
+        refs = None
     if refs is not None:
-        if not isinstance(refs, list) or len(refs) > limits["max_source_images"] or sources:
-            raise JobError("MUSE_INVALID_INPUT", "source_refs 格式错误或与内联源图冲突")
-        for n, ref in enumerate(refs):
-            if (not isinstance(ref, dict) or type(ref.get("n")) is not int or ref["n"] != n
-                    or type(ref.get("bytes")) is not int or not 0 < ref["bytes"] <= limits["source_max_bytes"]
-                    or not isinstance(ref.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
-                    or ref.get("mime") not in ("image/png", "image/jpeg", "image/webp")):
-                raise JobError("MUSE_INVALID_INPUT", "source_refs[%d] 元数据非法" % n)
-        out["source_refs"] = refs
+        # 0.5: the master sends references instead of inline data; fetched after the ack.
+        if sources:
+            raise JobError("MUSE_INVALID_INPUT", "source_images 与 source_refs 不能同时出现")
+        if not isinstance(refs, list) or not refs:
+            raise JobError("MUSE_INVALID_INPUT", "source_refs 必须是非空数组")
+        if len(refs) > limits["max_source_images"]:
+            raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
+        out["source_refs"] = [_check_source_ref(item, limits, n) for n, item in enumerate(refs)]
     snap = job.get("resume_snapshot_id")
     if snap is not None:
         if not isinstance(snap, str) or not SNAPSHOT_RE.match(snap):
@@ -602,12 +640,13 @@ class CliRunner:
 
 
 
-def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, expected_content_range=None):
+def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, allow_short=False):
     """Raise IOError on short read or Content-Range that does not match the request Range.
 
-    Retried by download_sources around source_chunk. A persistent mismatch still surfaces as
-    MUSE_INVALID_INPUT (retryable download failure) after attempts are exhausted.
-    Personal API keeps download_sources/source_chunk names (aurora uses fetch_sources/get_source).
+    allow_short: a body shorter than the range is a prefix the caller resumes after (0.5.2).
+
+    Retried by with_retries around get_source. A persistent mismatch still surfaces as
+    MUSE_SOURCE_FETCH_FAILED (retryable) after attempts are exhausted.
     """
     want = expect_bytes
     if range_hdr:
@@ -616,8 +655,6 @@ def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, expected_
             raise IOError("invalid request Range %r" % range_hdr)
         req_a, req_b = int(m_req.group(1)), int(m_req.group(2))
         cr = (resp_headers.get("Content-Range") if resp_headers is not None else None) or ""
-        if expected_content_range is not None and cr != expected_content_range:
-            raise IOError("Content-Range mismatch: want %s got %s" % (expected_content_range, cr))
         m_cr = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)$", cr.strip())
         if not m_cr:
             raise IOError("missing/invalid Content-Range: %r" % cr)
@@ -625,8 +662,16 @@ def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, expected_
         if got_a != req_a or got_b != req_b:
             raise IOError("Content-Range mismatch: want bytes=%d-%d got %s" % (req_a, req_b, cr))
         want = got_b - got_a + 1
-    if len(payload) != want:
+    if len(payload) > want or (len(payload) < want and not allow_short):
         raise IOError("short read: got %d want %d" % (len(payload), want))
+
+
+class ShortRead(IOError):
+    """A binary body cut short in transit; .partial holds the bytes that did arrive (0.5.2)."""
+
+    def __init__(self, partial, status, headers):
+        super().__init__("incomplete read (%d bytes)" % len(partial))
+        self.partial, self.status, self.headers = partial, status, headers
 
 
 # --------------------------------------------------------------------------
@@ -640,7 +685,8 @@ class Client:
         self.session_id = None
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler())
 
-    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary_limit=None):
+    def _request(self, method, path, body=None, raw=None, headers=None, timeout=30, binary=False,
+                 expect_bytes=None):
         url = self.server + API_PREFIX + path
         hdrs = {
             "Authorization": "Bearer " + self._token,
@@ -655,7 +701,7 @@ class Client:
         elif body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
-        if binary_limit is not None:
+        if binary:
             # Avoid CDN/gzip transforming Range bodies (Content-Length vs decoded length mismatch).
             hdrs["Accept-Encoding"] = "identity"
         if headers:
@@ -666,12 +712,14 @@ class Client:
                 status = resp.status
                 resp_headers = resp.headers
                 try:
-                    payload = resp.read() if binary_limit is None else resp.read(binary_limit + 1)
+                    payload = resp.read()
                 except http.client.IncompleteRead as e:
+                    if binary:
+                        raise ShortRead(e.partial or b"", status, resp_headers) from e
                     raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         except urllib.error.HTTPError as e:
             status = e.code
-            payload = e.read(4096) if e.fp else b""
+            payload = e.read() if e.fp else b""
             resp_headers = e.headers
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", None)
@@ -692,12 +740,16 @@ class Client:
                 raise Blocked(describe_foreign(status, resp_headers, payload, url))
         if status == 410:
             raise JobGone()
+        if status == 400 and master_error_code(payload) == "SESSION_UNKNOWN":
+            raise SessionLost("master 不再认识本会话（可能已重启），重新连接")
         if status == 204:
             return None
         if status >= 400:
             raise IOError("HTTP %d %s" % (status, path.split("/")[1] if "/" in path else path))
-        if binary_limit is not None:
-            return status, resp_headers, payload
+        if binary:
+            if expect_bytes is not None:
+                _check_binary_body(payload, resp_headers, hdrs.get("Range"), expect_bytes)
+            return payload
         if not payload:
             return None
         return json.loads(payload.decode("utf-8"))
@@ -722,28 +774,30 @@ class Client:
     def heartbeat(self, job):
         return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
 
-    def source_chunk(self, job, ref, start, end):
-        """Bytes start..end (inclusive) of source image ref of an acked job (0.5).
+    def get_source(self, job, n, start, end):
+        """Bytes start..end (inclusive) of source image n of an acked job (0.5).
 
         Sends Accept-Encoding: identity and checks Content-Range + body length so a CDN
-        short read / IncompleteRead raises and is retried by download_sources.
+        short read / IncompleteRead raises and is retried by fetch_sources.
         """
         want = end - start + 1
         range_hdr = "bytes=%d-%d" % (start, end)
-        status, headers, data = self._request(
-            "GET", "/jobs/%s/sources/%d" % (job["id"], ref["n"]),
-            headers={
-                "X-Job-Nonce": job["nonce"],
-                "Range": range_hdr,
-                "Accept-Encoding": "identity",
-            },
-            timeout=60, binary_limit=want,
-        )
-        expected = "bytes %d-%d/%d" % (start, end, ref["bytes"])
-        if status != 206:
-            raise IOError("源图分块 HTTP %d（期望 206）" % status)
-        _check_binary_body(data, headers, range_hdr, want, expected_content_range=expected)
-        return data
+        try:
+            return self._request(
+                "GET", "/jobs/%s/sources/%d" % (job["id"], n),
+                headers={
+                    "X-Job-Nonce": job["nonce"],
+                    "Range": range_hdr,
+                    "Accept-Encoding": "identity",
+                },
+                timeout=60, binary=True, expect_bytes=want,
+            )
+        except ShortRead as e:
+            # 0.5.2: same checks as a whole body; the prefix that arrived is returned for resuming.
+            if e.status != 206 or not e.partial:
+                raise IOError(str(e)) from e
+            _check_binary_body(e.partial, e.headers, range_hdr, want, allow_short=True)
+            return e.partial
 
     def put_chunk(self, job, idx, n, chunk):
         self._request(
@@ -778,19 +832,29 @@ def with_retries(fn, attempts=3, sleep_cap=None):
 
 
 class Bridge:
-    def __init__(self, paths, cli):
+    def __init__(self, paths, cli, max_concurrency=1):
         self.paths = paths
         self.cli = cli
-        self.runner = CliRunner(cli)
+        self.max_concurrency = max(1, min(int(max_concurrency), MAX_CONCURRENCY_HARD))
         self.stop = threading.Event()
-        self.in_job = False
         self.cli_version = cli_version(cli)
+        # Held while a worker polls or runs a job. Workers of an ended session keep their job
+        # (and slot) until it finishes, so a reconnect never pushes the total above the local cap.
+        self.slots = threading.BoundedSemaphore(self.max_concurrency)
+        self._runners = set()
+        self._runners_lock = threading.Lock()
+
+    def _track(self, runner, add):
+        with self._runners_lock:
+            (self._runners.add if add else self._runners.discard)(runner)
 
     def request_stop(self, *_):
         self.stop.set()
-        if self.in_job:
-            self.runner.kill()
-        else:
+        with self._runners_lock:
+            runners = list(self._runners)
+        for runner in runners:
+            runner.kill()
+        if not runners:
             raise StopRequested()
 
     def serve(self):
@@ -828,15 +892,67 @@ class Bridge:
         hold = int(hello.get("poll_hold_sec") or POLL_HOLD_DEFAULT)
         heartbeat = max(5, min(30, int(hello.get("heartbeat_sec") or HEARTBEAT_DEFAULT)))
         limits = effective_limits(hello.get("limits"))
-        while not self.stop.is_set():
-            resp = client.poll(hold)
-            if not resp or not resp.get("job"):
-                continue
-            self.in_job = True
-            try:
-                self.handle_job(client, resp["job"], limits, heartbeat)
-            finally:
-                self.in_job = False
+        workers = effective_slots(hello.get("max_concurrency"), self.max_concurrency)
+        if workers > 1:
+            log.info("并发 %d 路", workers)
+        ended = threading.Event()
+        reasons = []
+
+        def end(reason):
+            if not reasons:
+                reasons.append(reason)
+            ended.set()
+
+        def worker():
+            backoff = 1
+            while not self.stop.is_set() and not ended.is_set():
+                if not self.slots.acquire(timeout=1):
+                    continue
+                delay = 0
+                try:
+                    if self.stop.is_set() or ended.is_set():
+                        return
+                    resp = client.poll(hold)
+                    backoff = 1
+                    if resp and resp.get("job"):
+                        self.handle_job(client, resp["job"], limits, heartbeat)
+                except (FatalAuth, SessionLost) as e:
+                    # Session-wide: a reconnect (or exit) is the only way forward.
+                    end(e)
+                    return
+                except Exception as e:
+                    # One slot's network trouble must not drop the session: a new hello would make
+                    # the master fail every job the other slots are running.
+                    delay = min(BACKOFF_MAX, backoff) * random.uniform(0.8, 1.2)
+                    log.warning("轮询失败：%s；%.0f 秒后重试", redact(str(e), 200), delay)
+                    backoff = min(BACKOFF_MAX, backoff * 2)
+                finally:
+                    self.slots.release()
+                if delay and self.stop.wait(delay):
+                    return
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+        try:
+            while not ended.wait(1):
+                if self.stop.is_set():
+                    break
+        except StopRequested:
+            self.stop.set()
+        ended.set()
+        if self.stop.is_set():
+            # Let slots that were running a job report it (MUSE_BRIDGE_LOST) before the process
+            # exits; idle long-polls are simply abandoned.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and any(t.is_alive() for t in threads):
+                with self._runners_lock:
+                    busy = bool(self._runners)
+                if not busy:
+                    break
+                time.sleep(0.2)
+            raise StopRequested()
+        raise reasons[0] if reasons else IOError("会话结束")
 
     def handle_job(self, client, raw_job, limits, heartbeat_sec):
         started = time.monotonic()
@@ -847,7 +963,6 @@ class Bridge:
         # One runner per job: a heartbeat still in flight when this job ends can only ever kill
         # this job's process, never the next job's.
         runner = CliRunner(self.cli)
-        self.runner = runner
 
         def stop_job():
             if hb_stop.is_set():
@@ -869,6 +984,9 @@ class Bridge:
         # Ack barrier: start nothing until the master confirmed this exact job/nonce. Without
         # the confirmation the master may requeue the job with a new nonce, so running it
         # here could produce a second, duplicate generation.
+        # Stopping: leave the job un-acked; the master requeues it.
+        if self.stop.is_set():
+            return
         if not jid or not self.ack(client, job_ref):
             log.info("任务 %s 未获确认，放弃（不执行）", jid)
             return
@@ -877,13 +995,15 @@ class Bridge:
         os.chmod(out_dir, 0o700)
         hb = None
         kind = raw_job.get("kind") if isinstance(raw_job, dict) else None
+        self._track(runner, True)
         try:
             if jid:
                 hb = threading.Thread(target=beat, daemon=True)
                 hb.start()
             try:
                 job = validate_job(raw_job, limits)
-                self.download_sources(client, job, cancel)
+                if job.get("source_refs"):
+                    job["source_images"] = self.fetch_sources(client, job_ref, job["source_refs"], limits, cancel)
                 log.info("任务 %s 开始：%s", job["id"], job["kind"])
                 contract = runner.run(job, out_dir, cancel)
                 files = collect_outputs(contract, os.path.join(out_dir, "media"), job["kind"], limits)
@@ -906,43 +1026,62 @@ class Bridge:
                 body = e.result()
                 log.info("任务 %s 失败：%s（%s）%.0f 秒", jid, e.code, kind, time.monotonic() - started)
             if jid:
+                # The runner stays tracked until the result is posted, so a stop waits for it.
                 try:
                     with_retries(lambda: client.result(job_ref, body))
                 except JobGone:
                     log.info("任务 %s 在 master 侧已失效，结果丢弃", jid)
         finally:
+            self._track(runner, False)
             hb_stop.set()
             shutil.rmtree(out_dir, ignore_errors=True)
 
-    def download_sources(self, client, job, cancel):
-        """Only called after ack; failed downloads are reported through the normal result path."""
-        if not job.get("source_refs"):
-            return
-        sources = []
-        for ref in job["source_refs"]:
-            data = bytearray()
-            for start in range(0, ref["bytes"], SOURCE_CHUNK_BYTES):
-                end = min(start + SOURCE_CHUNK_BYTES, ref["bytes"]) - 1
-                for attempt in range(SOURCE_CHUNK_ATTEMPTS):
-                    if cancel.is_set() or self.stop.is_set():
-                        raise JobError("MUSE_CANCELLED", "源图下载已取消")
-                    try:
-                        chunk = client.source_chunk(job, ref, start, end)
-                        break
-                    except (FatalAuth, JobGone):
-                        raise
-                    except Exception:
-                        if attempt == SOURCE_CHUNK_ATTEMPTS - 1:
-                            raise JobError("MUSE_INVALID_INPUT", "源图 %d 下载失败" % (ref["n"] + 1), True) from None
-                        delay = min(2 ** attempt, SOURCE_CHUNK_SLEEP_CAP)
-                        cancel.wait(delay)
-                data.extend(chunk)
-            if hashlib.sha256(data).hexdigest() != ref["sha256"] or sniff_mime(data[:16]) != ref["mime"]:
-                raise JobError("MUSE_INVALID_INPUT", "源图 %d 校验失败" % (ref["n"] + 1))
-            sources.append((bytes(data), MIME_EXT[ref["mime"]]))
-        if cancel.is_set() or self.stop.is_set():
-            raise JobError("MUSE_CANCELLED", "源图下载已取消")
-        job["source_images"] = sources
+    def fetch_sources(self, client, job_ref, refs, limits, cancel):
+        """Download every referenced source image in Range chunks; [(data, ext)] like inline ones.
+
+        A download that keeps failing ends the job with a normal (retryable) result instead of
+        leaving it to the master's timeouts. JobGone (the master reassigned the job) propagates.
+        """
+        step = limits["source_chunk_bytes"]
+        out = []
+        for ref in refs:
+            buf = bytearray()
+            failures = 0
+            short_reads = 0
+            while len(buf) < ref["bytes"]:
+                if cancel.is_set():
+                    raise JobError("MUSE_CANCELLED", "任务已被取消")
+                start = len(buf)
+                end = min(ref["bytes"], start + step) - 1
+                try:
+                    data = client.get_source(job_ref, ref["n"], start, end)
+                except (FatalAuth, JobGone):
+                    raise
+                except Exception as e:
+                    failures += 1
+                    if failures >= SOURCE_CHUNK_ATTEMPTS:
+                        raise JobError("MUSE_SOURCE_FETCH_FAILED",
+                                       "源图 %d 下载失败：%s" % (ref["n"] + 1, redact(str(e), 120)), retryable=True)
+                    cancel.wait(min(2 ** (failures - 1), SOURCE_CHUNK_SLEEP_CAP))
+                    continue
+                if not data or len(data) > end - start + 1:
+                    raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 下载长度不符" % (ref["n"] + 1), retryable=True)
+                # Progress (a whole range, or the prefix of one cut short): never a failed attempt.
+                failures = 0
+                if len(data) < end - start + 1:
+                    short_reads += 1
+                    if short_reads > SOURCE_SHORT_READS_MAX:
+                        raise JobError("MUSE_SOURCE_FETCH_FAILED",
+                                       "源图 %d 下载失败：传输反复被截断" % (ref["n"] + 1), retryable=True)
+                buf += data
+            data = bytes(buf)
+            if hashlib.sha256(data).hexdigest() != ref["sha256"]:
+                raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 校验失败" % (ref["n"] + 1), retryable=True)
+            mime = sniff_mime(data[:16])
+            if mime != ref["mime"]:
+                raise JobError("MUSE_INVALID_INPUT", "源图 %d 类型与声明不符" % (ref["n"] + 1))
+            out.append((data, MIME_EXT[mime]))
+        return out
 
     def ack(self, client, job_ref):
         """First heartbeat for a new job. True only on a 200 from the master."""
@@ -1044,7 +1183,7 @@ def daemonize():
     return True
 
 
-def run_bridge(paths, cli, foreground):
+def run_bridge(paths, cli, foreground, max_concurrency=1):
     lock_fd = acquire_lock(paths)
     if lock_fd is None:
         if foreground:
@@ -1053,10 +1192,11 @@ def run_bridge(paths, cli, foreground):
     os.umask(0o077)
     write_private(paths["pid"], str(os.getpid()))
     setup_logging(paths, foreground)
-    bridge = Bridge(paths, cli)
+    bridge = Bridge(paths, cli, max_concurrency)
     signal.signal(signal.SIGTERM, bridge.request_stop)
     signal.signal(signal.SIGINT, bridge.request_stop)
-    log.info("bridge %s 启动，pid %d，server %s", BRIDGE_VERSION, os.getpid(), server_host(read_server(paths)))
+    log.info("bridge %s 启动，pid %d，server %s，本地并发上限 %d", BRIDGE_VERSION, os.getpid(),
+             server_host(read_server(paths)), bridge.max_concurrency)
     try:
         return bridge.serve()
     except StopRequested:
@@ -1157,6 +1297,8 @@ def self_check(paths, cli, verbose=True):
 
 
 def cmd_start(args, paths, foreground):
+    if not 1 <= args.max_concurrency <= MAX_CONCURRENCY_HARD:
+        raise SystemExit("--max-concurrency 必须在 1 到 %d 之间" % MAX_CONCURRENCY_HARD)
     ensure_state_dir(paths)
     if args.server:
         write_private(paths["server"], normalize_server(args.server) + "\n")
@@ -1174,7 +1316,7 @@ def cmd_start(args, paths, foreground):
             print("自检未通过，没有启动。确认无误可加 --force 强制启动。")
             return 1
     if foreground:
-        return run_bridge(paths, args.cli, True)
+        return run_bridge(paths, args.cli, True, args.max_concurrency)
     sys.stdout.flush()
     sys.stderr.flush()
     if not daemonize():
@@ -1186,7 +1328,7 @@ def cmd_start(args, paths, foreground):
                 return 0
         print("bridge 没能启动，请看日志 %s" % paths["log"])
         return 1
-    code = run_bridge(paths, args.cli, False)
+    code = run_bridge(paths, args.cli, False, args.max_concurrency)
     os._exit(code)
 
 
@@ -1274,6 +1416,8 @@ def main(argv=None):
         sp = sub.add_parser(name)
         sp.add_argument("--server")
         sp.add_argument("--force", action="store_true")
+        sp.add_argument("--max-concurrency", dest="max_concurrency", type=int, default=1,
+                        help="最多同时跑几个任务（1-%d）；实际还受服务端下发的上限约束" % MAX_CONCURRENCY_HARD)
     sub.add_parser("stop")
     sub.add_parser("status")
     sp = sub.add_parser("check")
