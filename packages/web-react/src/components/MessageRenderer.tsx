@@ -2953,7 +2953,7 @@ export function MessageList({
     ) : null}
     {find ? (
       <div
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2"
+        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 bg-bg/95 px-5 py-2"
         onKeyDown={stopFindKeys}
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}
@@ -2978,9 +2978,12 @@ export function MessageList({
           }}
           className="min-w-0 flex-1"
         />
-        <span className="shrink-0 text-caption tabular-nums text-muted">
-          {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
-        </span>
+        {/* OCV5-628:还没输入时不报「无匹配」。 */}
+        {findQuery.trim() ? (
+          <span className="shrink-0 text-caption tabular-nums text-muted" data-testid="find-count">
+            {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
+          </span>
+        ) : null}
         <IconButton
           shape="square"
           size="sm"
@@ -3024,6 +3027,33 @@ export function MessageList({
         >
           <X size={16} />
         </IconButton>
+        {/* OCV5-628:查找只覆盖已加载的消息。云端还有更早的页时如实说明范围,并给一个显式的
+            「搜更早」(与历史顶部的「查看更早历史记录」同一条 requestOlderArchive,不因滚动或输入
+            自动发请求);加载完 messages 变化,命中自动重算。单独一行,窄屏不挤输入框。 */}
+        {findQuery.trim() && hasOlderHistory ? (
+          <div
+            className="flex basis-full items-center justify-between gap-2 text-caption text-muted"
+            data-testid="find-scope-hint"
+          >
+            <span className="min-w-0">
+              {findMatchesList.length === 0 ? "已加载部分无匹配，" : ""}更早的记录还没加载，不在查找范围内
+            </span>
+            <button
+              type="button"
+              onKeyDown={stopFindKeys}
+              onClick={requestOlderArchive}
+              disabled={Boolean(archive?.loading) || archiveQueued}
+              aria-busy={Boolean(archive?.loading) || archiveQueued}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11"
+            >
+              {archive?.loading || archiveQueued
+                ? <><Spinner size={12} /> 加载中…</>
+                : archive?.error
+                  ? <span className="text-danger">加载失败，点击重试</span>
+                  : "搜更早"}
+            </button>
+          </div>
+        ) : null}
       </div>
     ) : null}
     <div
