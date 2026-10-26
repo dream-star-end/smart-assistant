@@ -865,8 +865,18 @@ export async function settleUsageAndLedger(
     const spends = args.status === "success" && settledCostCredits > 0n;
     // P2b F8: take the wallet row locks before INSERT usage_records. That INSERT's user_id foreign
     // key share-locks the users row; taking FOR UPDATE only afterwards (in spendTwoBucket) let two
-    // concurrent settles of one user deadlock on the lock upgrade.
-    if (spends) await lockSpendRows(client, { userId: args.userId, orgId: spendOrgId });
+    // concurrent settles of one user deadlock on the lock upgrade. Its org_id foreign key also
+    // locks the stamped org, so that row goes first (orgs → users): FOR UPDATE when the org pays,
+    // the same strength lockSpendRows takes, otherwise the KEY SHARE the INSERT would take.
+    if (spends) {
+      if (orgCtx) {
+        await client.query(
+          `SELECT 1 FROM orgs WHERE id = $1::bigint ${spendOrgId === undefined ? "FOR KEY SHARE" : "FOR UPDATE"}`,
+          [orgCtx.orgId],
+        );
+      }
+      await lockSpendRows(client, { userId: args.userId, orgId: spendOrgId });
+    }
     let usageId: bigint;
     let ledgerId: bigint | null = null;
     let clamped = false;
