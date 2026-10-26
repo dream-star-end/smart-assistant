@@ -549,6 +549,13 @@ describe("引擎/路由内部码不外露(t1049u)", () => {
     expect(prose.detail).toBe("[turn failed: model overloaded]");
   });
 
+  test("单行合法部分回答以环境变量名开头或含字节对比 → 仍作 bodyText 保留(Codex r1)", () => {
+    for (const answer of ["OPENAI_API_KEY: 用于配置 API 密钥。", "缓冲区为 4096 bytes > 1024 bytes，所以需要扩容。"]) {
+      const p = errorPresentation("engine_error", answer, "upstream disconnected");
+      expect(p.bodyText).toBe(answer);
+    }
+  });
+
   test("多行合法部分回答提到环境变量名 → 仍作 bodyText 保留", () => {
     const answer = "先设置 OPENAI_API_KEY:\n然后重启服务。";
     const p = errorPresentation("engine_error", answer, "CURSOR_SAND_DOWNSTREAM_CLOSED");

@@ -668,14 +668,9 @@ const BYTE_COMPARISON_RE = /\b\d+\s*bytes?\s*[<>]=?\s*\d+/i;
 
 function looksLikeInternalError(value: string | undefined): boolean {
   if (!value) return false;
-  // 单行且以内部码开头(`CODE: …` / 单独一个码)或含字节对比:适配器抛出的错误原文,不是模型回答。
-  // 多行正文不按码判,免得把提到环境变量名的合法部分回答藏掉。
-  const singleLine = !value.trim().includes("\n");
   return (
     /^\s*[\[{]/.test(value) ||
-    /MODEL_AUTHORITY_INVALID|API Error|"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(/i.test(value) ||
-    (singleLine &&
-      (/^\s*(?:[A-Za-z]*Error:\s*)?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?::|\s*$)/.test(value) || BYTE_COMPARISON_RE.test(value)))
+    /MODEL_AUTHORITY_INVALID|API Error|"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(/i.test(value)
   );
 }
 
