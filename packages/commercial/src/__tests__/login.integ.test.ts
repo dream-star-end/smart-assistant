@@ -860,7 +860,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
   test("reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE", async (t) => {
     if (skipIfNoPg(t)) return;
     const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
-    delete process.env.REFRESH_ROTATION_GRACE_SECONDS; // force default 45
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = ""; // force default 45 (!raw)
     try {
       for (const ageSec of [11, 40] as const) {
         const email = `paula-midgrace-${ageSec}@example.com`;
@@ -902,7 +902,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         assert.ok(typeof r2.refresh_token === "string" && r2.refresh_token.length > 0);
       }
     } finally {
-      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
       else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
     }
   });
@@ -910,7 +910,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
   test("reuse rotated refresh at 50s (default grace=45) → still theft", async (t) => {
     if (skipIfNoPg(t)) return;
     const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
-    delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
     try {
       await setupUser("paula-overgrace@example.com", "paula overgrace password");
       const lr = await login(
@@ -960,7 +960,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
           err instanceof RefreshError && err.code === "INVALID_REFRESH",
       );
     } finally {
-      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
       else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
     }
   });
@@ -1019,7 +1019,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
       );
       assert.equal(theftFired, true, "grace=0 must disable race window entirely");
     } finally {
-      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
       else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
     }
   });
