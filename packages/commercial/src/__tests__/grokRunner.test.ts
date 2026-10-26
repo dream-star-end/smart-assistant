@@ -21,7 +21,14 @@ import {
 
 // OCV5-591 A0: the vision proxy core is callable from master without a container.
 
-function harness(opts: { upstream?: { statusCode: number; text: string } } = {}) {
+function harness(
+  opts: {
+    upstream?: { statusCode: number; text: string }
+    upstreams?: Array<{ statusCode: number; text: string }>
+    admit?: (requestId: string) => boolean
+    onAbort?: (requestId: string) => void
+  } = {},
+) {
   const events: string[] = []
   const bodies: string[] = []
   const settled: Array<{ userId: bigint; frame: any }> = []
@@ -36,10 +43,11 @@ function harness(opts: { upstream?: { statusCode: number; text: string } } = {})
     requestFn: async (_url, init) => {
       events.push('upstream')
       bodies.push(init.body)
-      const up = opts.upstream ?? {
-        statusCode: 200,
-        text: JSON.stringify(grokVisionUpstreamPayload()),
-      }
+      const up = opts.upstreams?.shift() ??
+        opts.upstream ?? {
+          statusCode: 200,
+          text: JSON.stringify(grokVisionUpstreamPayload()),
+        }
       return { statusCode: up.statusCode, body: { text: async () => up.text } }
     },
     recordStatus: async () => {},
@@ -55,14 +63,15 @@ function harness(opts: { upstream?: { statusCode: number; text: string } } = {})
     }) as any,
     startInflightJournalFn: (async (_p: unknown, ctx: any) => {
       events.push(`journal:${ctx.containerId === null ? 'null' : String(ctx.containerId)}`)
-      return true
+      return opts.admit ? opts.admit(ctx.requestId) : true
     }) as any,
     settleDurableCodexBillingFn: (async (_d: unknown, userId: bigint, frame: any) => {
       events.push('settle')
       settled.push({ userId, frame })
       return 'committed'
     }) as any,
-    abortInflightJournalFn: (async () => {
+    abortInflightJournalFn: (async (_p: unknown, requestId: string) => {
+      opts.onAbort?.(requestId)
       events.push('abort')
       return true
     }) as any,
@@ -154,6 +163,37 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
         e instanceof GrokRunError && e.code === 'GROK_UPSTREAM_ERROR' && e.status === 502,
     )
     assert.ok(h.events.includes('abort'))
+  })
+
+  it("a failed attempt's aborted journal never blocks the next attempt (Codex code r1 P1)", async () => {
+    const journal = new Map<string, 'inflight' | 'aborted'>()
+    const ok = { statusCode: 200, text: JSON.stringify(grokVisionUpstreamPayload()) }
+    const h = harness({
+      upstreams: [{ statusCode: 503, text: 'busy' }, ok],
+      // Real startInflightJournal semantics: INSERT … ON CONFLICT (request_id) DO NOTHING.
+      admit: (id) => {
+        if (journal.has(id)) return false
+        journal.set(id, 'inflight')
+        return true
+      },
+      onAbort: (id) => journal.set(id, 'aborted'),
+    })
+    const base = { userId: 7n, containerId: null, requestId: 'studio:task-3', prompt: 'x' }
+    await assert.rejects(h.run(base), { code: 'GROK_UPSTREAM_ERROR' })
+    assert.equal(journal.get('studio:task-3'), 'aborted')
+    await assert.rejects(h.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
+    let persisted = ''
+    const out = await h.run({
+      ...base,
+      attempt: 1,
+      onResult: async (r) => {
+        persisted = r.requestId
+      },
+    })
+    assert.equal(out.requestId, 'studio:task-3~1')
+    assert.equal(persisted, 'studio:task-3~1')
+    assert.equal(h.settled.at(-1)!.frame.requestId, 'studio:task-3~1')
+    await assert.rejects(h.run({ ...base, attempt: -1 }), { code: 'BAD_BODY' })
   })
 
   it('resettleGrokRun settles a persisted step idempotently by request id', async () => {
