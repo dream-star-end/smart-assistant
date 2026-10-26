@@ -8276,6 +8276,40 @@
           "assertion": "one collaboration conflict saves the clicked solo mode without asking again"
         }
       ]
+    },
+    {
+      "id": "INC-20261026-REFRESH-GRACE",
+      "occurredAt": "2026-10-26",
+      "severity": "P1",
+      "symptom": "个人版体验-办公：登录后新标签/慢网打开裸首页掉登录。refresh rotate 后旧 oc_rt 超过默认 10s race grace（实测 ~11.6s）被判 theft 整族吊销清 cookie。OCV5-622：grace 默认 45s + 跨 tab refresh 单飞；超 grace / fingerprint 不一致仍 theft。",
+      "rootFixCommit": "c71a59be",
+      "coverageCommits": [
+        "c71a59be",
+        "3bf0f487",
+        "68e5d8b7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel late joiner waits — holder answers busy; overlapping acquires serialize"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 11s/40s (default grace=45) → REFRESH_RACE; 50s → still theft"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/auth/login.ts",
+          "assertion": "REFRESH_ROTATION_GRACE_SECONDS default 45 with env override; theft path unchanged"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api/http.ts",
+          "assertion": "refresh network call wrapped in withCrossTabRefreshLock"
+        }
+      ]
     }
   ]
 }
