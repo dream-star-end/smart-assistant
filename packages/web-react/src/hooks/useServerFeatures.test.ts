@@ -20,7 +20,8 @@ describe("useServerFeatures", () => {
     const a = renderHook(() => useServerFeatures(auth, false));
     expect(a.result.current).toEqual(SERVER_FEATURES_OFF);
     await waitFor(() => expect(a.result.current.chips).toBe(true));
-    expect(a.result.current).toEqual({ chips: true, recipeSchedule: false, unfiledSuggest: true });
+    // OCV5-630 added timelineShadow; absent from the body, so it parses as off.
+    expect(a.result.current).toEqual({ chips: true, recipeSchedule: false, unfiledSuggest: true, timelineShadow: false });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(String((fetchMock.mock.calls[0] as unknown[])[0])).toBe("/api/features");
 
