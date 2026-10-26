@@ -51,6 +51,7 @@ export function ChatHeader({
   onSelectModel,
   onLockedSelect,
   modelsLoading,
+  onCancelModelSwitch,
   effortSupported,
   effortActive,
   onSelectEffort,
@@ -92,6 +93,8 @@ export function ChatHeader({
   onSelectModel?: (id: string) => void;
   onLockedSelect?: (info: LockedSelectInfo) => void;
   modelsLoading?: boolean;
+  /** 压缩切换进行中时提供，放弃等待并保留原模型。 */
+  onCancelModelSwitch?: () => void;
   /** 当前执行模型支持的思考档位（空/省略 = 模型不暴露档位,菜单内不渲染档位区块）。 */
   effortSupported?: readonly string[];
   /** 当前生效思考档（null/undefined = 跟随模型默认）。 */
@@ -366,6 +369,7 @@ export function ChatHeader({
               onSelectServiceTier={onSelectServiceTier}
               open={modelPickerOpen}
               onOpenChange={onModelPickerOpenChange}
+              onCancelSwitch={onCancelModelSwitch}
             />
           )}
         </div>

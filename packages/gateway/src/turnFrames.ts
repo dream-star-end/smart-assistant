@@ -306,6 +306,9 @@ export function _inheritOutboundRouting(out: OutboundMessage & { _userId?: strin
  * `taskboard`,若只排除 `delegate`,default 用户会把 stageId 误当成 peerId 放进
  * 侧栏。内部委派同样不是用户聊天会话。
  */
+/** Matches the client's 16-minute prepare wait with margin. */
+const MODEL_SWITCH_FAILURE_REPLAY_MS = 30 * 60_000
+
 /** Replay a prepared native model-switch onto a reconnecting socket.
  *  Ring `peekReplay(fromSeq=0)` is intentionally no_buffer to avoid
  *  duplicate assistant deltas; this control frame is idempotent by requestId. */
@@ -319,10 +322,34 @@ export function preparedModelSwitchCatchupFrame(
       state: 'preparing' | 'prepared' | 'consuming'
       expiresAt?: number
     }
+    _modelSwitchFailure?: {
+      id: string
+      sourceModel: string
+      targetModel: string
+      errorCode: string
+      message: string
+      at: number
+    }
   },
   now = Date.now(),
 ): Record<string, unknown> | null {
   const transition = session._modelSwitchTransition
+  const failure = session._modelSwitchFailure
+  if (!transition && failure && now - failure.at < MODEL_SWITCH_FAILURE_REPLAY_MS) {
+    // The client matches by requestId, so replaying a failure it already
+    // received (or never asked about) is a no-op.
+    return {
+      type: 'outbound.model_switch.prepared',
+      requestId: failure.id,
+      sessionKey: session.sessionKey,
+      sourceModel: failure.sourceModel,
+      targetModel: failure.targetModel,
+      status: 'failed',
+      errorCode: failure.errorCode,
+      message: failure.message,
+      ts: now,
+    }
+  }
   if (!transition || transition.state !== 'prepared') return null
   if (typeof transition.expiresAt === 'number' && now >= transition.expiresAt) return null
   return {

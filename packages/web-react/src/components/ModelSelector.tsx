@@ -266,6 +266,7 @@ export function ModelSelector({
   onSelectServiceTier,
   open,
   onOpenChange,
+  onCancelSwitch,
 }: {
   models: PublicModel[]
   lockedModels?: LockedPublicModel[]
@@ -292,6 +293,8 @@ export function ModelSelector({
   onSelectServiceTier?: (tier: ServiceTier | null) => void
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  /** 压缩切换进行中时给出：trigger 此时禁用，这是放弃等待、保留原模型的唯一入口。 */
+  onCancelSwitch?: () => void
 }) {
   const selected = models.find((m) => m.id === selectedId)
   const selectedCursor = cursorPickerDef(models.find((m) => m.id === selectedId) ?? (selectedId ? { id: selectedId } : null))
@@ -1110,6 +1113,16 @@ export function ModelSelector({
             {renderPickerBody('menu')}
           </DropdownMenuContent>
         </DropdownMenu>
+      )}
+      {onCancelSwitch && (
+        <button
+          type="button"
+          data-testid="model-switch-cancel"
+          onClick={onCancelSwitch}
+          className="min-h-11 shrink-0 rounded-xl px-2 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          取消
+        </button>
       )}
       {confirmLongContextEl}
     </>
