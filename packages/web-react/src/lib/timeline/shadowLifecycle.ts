@@ -234,14 +234,18 @@ export function lastShadowFor(entry: ShadowEntry): ShadowObservation | undefined
 }
 
 // ── OCV5-630 content-free report (only when the server switch turned shadow on) ──
-// One bounded product-friction event per sampled observation, throttled per
-// session × entry × outcome and capped per page so the shared 30 req/min
-// client-errors budget is never spent on this. Never identities or text: only
-// the entry, the mismatch shape counts and the total time.
+// One bounded product-friction event per sampled observation. client-errors is
+// rate limited per IP (30 req/min) and shared with real error reports, so this
+// stays far below it whatever the session count: at most one report every
+// 30 s per page (≤2/min), at most one per session × entry × outcome per
+// 5 minutes, and at most 40 per page. Never identities or text: only the
+// entry, the mismatch shape counts and the total time.
 const REPORT_WINDOW_MS = 5 * 60_000;
+const MIN_REPORT_GAP_MS = 30_000;
 const PAGE_REPORT_CAP = 40;
 const COUNT_CAP = 9_999;
 const lastReportAt = new Map<string, number>();
+let lastAnyReportAt: number | undefined;
 let pageReports = 0;
 let reporter: (signal: ClientFrictionSignal) => void = (signal) => {
   reportClientFriction(signal);
@@ -270,8 +274,11 @@ function maybeReport(observation: ShadowObservation): void {
   const key = `${observation.sessionId ?? "-"}|${observation.entry}|${observation.mismatchCount > 0 ? "m" : "ok"}`;
   const now = Date.now();
   const last = lastReportAt.get(key);
-  if ((last !== undefined && now - last < REPORT_WINDOW_MS) || pageReports >= PAGE_REPORT_CAP) return;
+  if (last !== undefined && now - last < REPORT_WINDOW_MS) return;
+  if (lastAnyReportAt !== undefined && now - lastAnyReportAt < MIN_REPORT_GAP_MS) return;
+  if (pageReports >= PAGE_REPORT_CAP) return;
   lastReportAt.set(key, now);
+  lastAnyReportAt = now;
   pageReports += 1;
   try {
     reporter(shadowReportSignal(observation));
@@ -292,6 +299,7 @@ export function resetShadowStatsForTests(): void {
   lastObservation = undefined;
   lastByEntry.clear();
   lastReportAt.clear();
+  lastAnyReportAt = undefined;
   pageReports = 0;
   serverShadow = false;
   setShadowReporterForTests(null);
