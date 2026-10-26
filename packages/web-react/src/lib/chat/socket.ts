@@ -10,6 +10,7 @@
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
+import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import {
   applyCostCharged,
@@ -3881,6 +3882,21 @@ export class ChatSocket {
   private flushAbandonedModelSwitches(): void {
     for (const [requestId, sessionKey] of this.abandonedModelSwitches) {
       this.cancelPreparedModelSwitch(requestId, sessionKey);
+    }
+  }
+
+
+  /** 用户放弃等待：撤回该会话在途的压缩切换，保留原模型。 */
+  cancelPendingModelSwitches(sessId: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const sessionKey = safeSessionKeyForAgent(sessId, sess.agentId);
+    for (const [id, pending] of this.pendingModelSwitches) {
+      if (pending.sessId !== sessionKey) continue;
+      clearTimeout(pending.timer);
+      this.pendingModelSwitches.delete(id);
+      this.cancelPreparedModelSwitch(id, sessionKey);
+      pending.reject(new Error(MODEL_SWITCH_CANCELLED_MESSAGE));
     }
   }
 
