@@ -1,5 +1,7 @@
 // Muse image / video through the in-process bridge hub. Submission is idempotent: the job id is
-// derived from the execution id, so a re-leased task finds its original job (A1 plan §3).
+// derived from the execution id, so a re-leased task finds its original job (A1 plan §3). A failed
+// job is final for its id, so a later run of the same execution moves on to the next id of its
+// attempt chain instead of replaying that failure (INC-20261026-STUDIO-MUSE-RETRY-REPLAY).
 
 import { createHash } from 'node:crypto'
 
@@ -23,6 +25,14 @@ const STUDIO_MUSE_NAMESPACE = '6f1d2c4e-8a35-4b7e-9c10-3d5e7f9a1b2c'
 export const museJobIdFor = (execRequestId: string) =>
   `mj_${uuidV5(execRequestId, STUDIO_MUSE_NAMESPACE)}`
 
+/** Upper bound of Muse jobs one execution may submit (a task is claimed at most MAX_TASK_CLAIMS times). */
+export const MUSE_JOBS_PER_EXECUTION = 8
+/** Job n of an execution's attempt chain: the first keeps museJobIdFor(exec), later ones `exec~n`. */
+export const museAttemptJobIdFor = (execRequestId: string, n: number) =>
+  museJobIdFor(n === 0 ? execRequestId : `${execRequestId}~${n}`)
+const museChainJobIds = (execRequestId: string) =>
+  Array.from({ length: MUSE_JOBS_PER_EXECUTION }, (_, n) => museAttemptJobIdFor(execRequestId, n))
+
 const WAIT_SLICE_MS = 25_000
 const ORIENTATION = { '16:9': 'landscape', '9:16': 'vertical', '1:1': 'square' } as const
 
@@ -39,7 +49,7 @@ function museImpl(kind: 'image' | 'video', deps: BuiltinAdapterDeps): AdapterImp
     affinity: () => 'muse',
     async chargedFor(_userId, execRequestId) {
       if (!deps.pool) return 0n
-      return ledgerDebited(deps.pool, 'muse_media_job', [museJobIdFor(execRequestId)])
+      return ledgerDebited(deps.pool, 'muse_media_job', museChainJobIds(execRequestId))
     },
     async run(ctx, req) {
       if (!muse) throw new MediaProviderError('PROVIDER_UNAVAILABLE', false, 'Muse is not enabled')
@@ -63,7 +73,20 @@ function museImpl(kind: 'image' | 'video', deps: BuiltinAdapterDeps): AdapterImp
       if (req.op === 'video.extend' && !req.resumeSnapshotId) {
         throw new MediaProviderError('INVALID_REQUEST', false, 'video.extend needs a snapshot')
       }
-      const jobId = museJobIdFor(ctx.execRequestId)
+      // The first job of the chain that is not finished-without-a-result: a queued, running or
+      // succeeded one is this run's own job (a re-lease resumes it, a success is never redone).
+      let chosen: string | null = null
+      for (const id of museChainJobIds(ctx.execRequestId)) {
+        const prior = await muse.hub.view(uid, id, 0)
+        if (!prior || (prior.status !== 'failed' && prior.status !== 'cancelled')) {
+          chosen = id
+          break
+        }
+      }
+      if (chosen === null) {
+        throw new MediaProviderError('MUSE_TOO_MANY_ATTEMPTS', false, 'every Muse attempt failed')
+      }
+      const jobId = chosen
       try {
         await muse.hub.submit(uid, null, spec, { jobId })
       } catch (err) {
