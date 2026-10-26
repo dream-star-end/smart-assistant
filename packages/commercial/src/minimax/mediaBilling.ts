@@ -1,6 +1,6 @@
 import type { Pool } from 'pg'
 
-import { spendTwoBucket } from '../billing/spend.js'
+import { lockSpendRows, spendTwoBucket } from '../billing/spend.js'
 import { resolveOrgBillingContext } from '../org/orgBilling.js'
 import type { MiniMaxMediaCostResult } from './mediaPricing.js'
 
@@ -54,6 +54,15 @@ export async function settleMiniMaxMediaSuccess(
     let clamped = false
     let balanceAfter: bigint | null = null
     let debitedCredits: bigint | null = null
+    // P2b P6 (OCV5-631), same as F8 in settleUsageAndLedger: take the wallet row locks before the
+    // INSERT. Its user_id foreign key share-locks the users row; taking FOR UPDATE only afterwards
+    // (in spendTwoBucket) let two concurrent settles of one user deadlock on the lock upgrade.
+    if (input.cost.costCredits > 0n) {
+      await lockSpendRows(client, {
+        userId: input.userId,
+        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
+      })
+    }
 
     try {
       const ins = await client.query<{ id: string }>(

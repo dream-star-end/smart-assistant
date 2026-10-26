@@ -22,6 +22,8 @@
 
 其它调用 `settleUsageAndLedger` 的结算变体（同一事务形状，不单列）：`codexFinalizer.ts:303`、`zcodeCatalogSettle.ts:139`、`cursorExternalSettle.ts:337`、`antigravitySettle.ts:139`、`boxBillingRecovery.ts:142`、`plugins/knowledgePlanetAutomationScheduler.ts:849`。自带事务并调用 `spendTwoBucket` 的：`imageBilling.ts:273-318`、`minimax/mediaBilling.ts:44-117`。试点只取主对话回合一条结算路径（§9.4），这些变体留在 P6 逐个对照。
 
+**P6 对照结果（OCV5-631，2026-10-27，个人版）**：`minimax/mediaBilling.ts` 与 F8 同形（先 INSERT `minimax_media_usage_records`，其 user_id 外键对 users 取 KEY SHARE，再在 `spendTwoBucket` 里 FOR UPDATE）——T6（同一用户 8 笔不同 request 并发媒体结算）稳定 40P01；已改为扣费时在 INSERT 前先 `lockSpendRows`（媒体表无 org_id 列，只有 users 外键），T6 转绿。`imageBilling.ts` 的 `settleImageCharge` 结算事务里不 INSERT 引用 users 的行，锁序是「图片行 → 钱包」，且同一用户同时只有一张在飞的图（`uq_image_usage_one_inflight`），不改；T8（对话 ×4 + 媒体 ×4 + 生图结算同一用户并发）固定混跑不死锁、余额 = 流水。测试在 `settleUsageConcurrent.integ.test.ts`。商业版另批。
+
 不属于资金的相邻写入（核对后排除）：`dispatch/turnDispatchStore.ts:217-221` 只锁派发行；`http/internalTurnObservation.ts:111-138` 单条 CTE 写 `turn_runtime_observations` + `turn_traces`，单语句原子，不动钱。
 
 ## 2. 不变量（每条路径的验收口径）
@@ -48,7 +50,7 @@
 | F5 | 持锁期间另取连接池连接 | `getPlan()` 走根池（`subscription.ts:109-115`），在事务内调用于 `orders.ts:956,969`、`subscription.ts:362,414`；`enqueueAlert` 走池（`org/orgProvision.ts:80,117`） | 高并发履约时池耗尽而行锁不放；外层事务回滚但告警已提交 | 改为传 `client`；单独 PR |
 | F6 | 请求日志（journal）不在结算事务内 | `proxyBilling.ts:475`→`:305-319` 认领、`:555`→`:328-361` 终结，各自 autocommit；终结失败只记日志（`:563`） | 结算已提交、终结失败 → journal 停在 `finalizing`，靠对账器回收（本次未核对账器） | P2b 补核对账器覆盖；不改 |
 | F7 | 过期/取消订单的支付回调回“success”且不加款 | `http/payment.ts:~470-486`、`orders.ts:1010` | 用户在订单过期后完成支付：钱到账、积分未到，靠告警人工处理 | 产品决策项，登记不改 |
-| F8 | 同一用户并发扣费/豁免会死锁（40P01） | `usage_records.user_id`（`db/migrations/0002_init_billing.sql:56`）和 `turn_waivers.user_id`（`0167:78`）都外键引用 users：INSERT 先拿 users 行 `FOR KEY SHARE`，之后 `spend.ts:247` / `refund.ts:321` 要同一行 `FOR UPDATE`，两笔并发都卡在升级上 | T5 复现：同一用户 8 笔不同 request 并发结算，2026-10-26 一次运行里 7 笔被 PG 判死锁中止、只提交 1 笔。中止的那笔整体回滚，余额和流水仍一致，但这一笔没扣上费、没留 usage 行。个人版近 15 天日志里结算死锁 0 次（只有 2 次 tapeJobScheduler 的）；商业版没查（本线不碰 kl-mirror） | **已修（个人版，2026-10-26 管家批准）**：新增 `billing/spend.ts` `lockSpendRows`，作为 orgs → org_subscriptions → users 三步取锁的唯一实现；`spendTwoBucket` 改为调用它，`settleUsageAndLedger` 在 INSERT usage_records 之前（仅在要扣费时）先调一次。登记的锁序不变，INSERT 时已持有更强的 users 锁。T5 收紧为 8 笔全部成功。没有加 40P01 重试，因为根因已消除。豁免侧由 F4 的按用户锁串行；`imageBilling`、`minimax/mediaBilling` 自带事务的变体没改（不在试点链路），P6 时对照。商业版另批 |
+| F8 | 同一用户并发扣费/豁免会死锁（40P01） | `usage_records.user_id`（`db/migrations/0002_init_billing.sql:56`）和 `turn_waivers.user_id`（`0167:78`）都外键引用 users：INSERT 先拿 users 行 `FOR KEY SHARE`，之后 `spend.ts:247` / `refund.ts:321` 要同一行 `FOR UPDATE`，两笔并发都卡在升级上 | T5 复现：同一用户 8 笔不同 request 并发结算，2026-10-26 一次运行里 7 笔被 PG 判死锁中止、只提交 1 笔。中止的那笔整体回滚，余额和流水仍一致，但这一笔没扣上费、没留 usage 行。个人版近 15 天日志里结算死锁 0 次（只有 2 次 tapeJobScheduler 的）；商业版没查（本线不碰 kl-mirror） | **已修（个人版，2026-10-26 管家批准）**：新增 `billing/spend.ts` `lockSpendRows`，作为 orgs → org_subscriptions → users 三步取锁的唯一实现；`spendTwoBucket` 改为调用它，`settleUsageAndLedger` 在 INSERT usage_records 之前（仅在要扣费时）先调一次。登记的锁序不变，INSERT 时已持有更强的 users 锁。T5 收紧为 8 笔全部成功。没有加 40P01 重试，因为根因已消除。豁免侧由 F4 的按用户锁串行；`imageBilling`、`minimax/mediaBilling` 自带事务的变体在 P6（OCV5-631）对照：media 同形已修，image 无此形不改，见 §2 变体说明。商业版另批 |
 
 ## 4. 目标规则（§4.3 落地，到试点/P6 才执行）
 
