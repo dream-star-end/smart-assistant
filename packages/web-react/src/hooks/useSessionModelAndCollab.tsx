@@ -10,7 +10,8 @@ import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
  */
 import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveSessionModel } from "../lib/modelPreferences";
-import { MODEL_SWITCH_CANCELLED_MESSAGE, freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
+import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
+import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../lib/chat/modelSwitchCostDispatch";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
 import type { Agent } from "../lib/agents";

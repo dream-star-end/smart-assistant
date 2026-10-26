@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { ChatSocket } from './socket'
-import { MODEL_SWITCH_CANCELLED_MESSAGE } from '../modelSwitch'
+import { MODEL_SWITCH_CANCELLED_MESSAGE } from './modelSwitchCostDispatch'
 
 class FakeWS {
   static instances: FakeWS[] = []

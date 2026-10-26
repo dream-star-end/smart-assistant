@@ -1,5 +1,4 @@
-import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch} from './modelSwitchCostDispatch';
-import { MODEL_SWITCH_CANCELLED_MESSAGE } from '../modelSwitch';
+import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch,MODEL_SWITCH_CANCELLED_MESSAGE} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
 import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 /**
@@ -3873,22 +3872,13 @@ export class ChatSocket {
     }
   }
 
-  /** 用户放弃等待：撤回该会话在途的压缩切换，保留原模型。 */
   cancelPendingModelSwitches(sessId: string): void {
     const sess = this.sessions.get(sessId);
-    if (!sess) return;
-    const sessionKey = safeSessionKeyForAgent(sessId, sess.agentId);
-    for (const [id, pending] of this.pendingModelSwitches) {
-      if (pending.sessId !== sessionKey) continue;
-      clearTimeout(pending.timer);
-      this.pendingModelSwitches.delete(id);
-      this.cancelPreparedModelSwitch(id, sessionKey);
-      pending.reject(new Error(MODEL_SWITCH_CANCELLED_MESSAGE));
-    }
+    if (sess) this.rejectPendingModelSwitches(MODEL_SWITCH_CANCELLED_MESSAGE, true, safeSessionKeyForAgent(sessId, sess.agentId));
   }
 
-  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean): void {
-    for (const [id, pending] of this.pendingModelSwitches) {
+  private rejectPendingModelSwitches(message: string, canSendCancellation: boolean, onlySessionKey?: string): void {
+    for (const [id, pending] of [...this.pendingModelSwitches].filter(([, p]) => !onlySessionKey || p.sessId === onlySessionKey)) {
       clearTimeout(pending.timer);
       if (canSendCancellation) this.cancelPreparedModelSwitch(id, pending.sessId);
       else this.abandonedModelSwitches.set(id, pending.sessId);

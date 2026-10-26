@@ -1,9 +1,6 @@
 import { cursorModelById } from '@openclaude/protocol/browser'
 import type { PublicModel } from './types'
 
-/** 用户在「切换中…」时点取消：在途压缩切换撤回，保留原模型。 */
-export const MODEL_SWITCH_CANCELLED_MESSAGE = '已取消切换，仍保留原模型'
-
 export type ModelSwitchCompactionReason = {
   visionDowngrade: boolean
   contextDowngrade: boolean
