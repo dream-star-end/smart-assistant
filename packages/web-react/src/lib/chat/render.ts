@@ -587,6 +587,7 @@ const ERROR_LABELS: Record<string, string> = {
   upstream_timeout: "模型响应超时",
   network_error: "网络异常，请重试",
   context_too_long: "会话内容超出模型上限",
+  request_too_large: "资料暂未处理完成",
   bad_request: "请求无法处理",
   // ── 引擎/平台执行 ──
   engine_error: "任务执行失败",
@@ -718,6 +719,39 @@ export type ErrorPresentation = {
   waived: boolean;
 };
 
+/** Only the old SDK's complete fixed diagnostic may bypass a stale error card. */
+export function isLegacyRequestTooLargeDiagnostic(code: string | undefined, text?: string): boolean {
+  return typeof code === "string" && code.length > 0
+    && normalizeTurnErrorCode(code) === "engine_error"
+    && typeof text === "string"
+    && /^Request too large \(max 20MB\)\. (?:Try with a smaller file\.|Double press esc to go back and try with a smaller file\.)$/i.test(text.trim());
+}
+
+/** Carry only a safe legacy request ID; never replace a committed snapshot. */
+export function carryLegacySizeRequestReferences(current: ChatMessage[], cached: readonly ChatMessage[]): ChatMessage[] {
+  if (!Array.isArray(cached)) return current;
+  const references = new Map<string, Set<string>>();
+  for (const row of cached) {
+    if (!row || row.role !== "assistant" || typeof row._clientMessageId !== "string" || !row._clientMessageId.trim() || !isLegacyRequestTooLargeDiagnostic(row._errorCode, row.text)) continue;
+    const ids = references.get(row._clientMessageId) ?? new Set<string>();
+    for (const detail of [row._errorDetail, row._errorCardSnapshot?.disposition === "card" ? row._errorCardSnapshot.detail : undefined]) {
+      const ref = typeof detail === "string" ? requestReference(detail) : undefined;
+      if (ref) ids.add(ref);
+    }
+    references.set(row._clientMessageId, ids);
+  }
+  let changed = false;
+  const result = current.map((row) => {
+    if (!row || row.role !== "assistant" || typeof row._clientMessageId !== "string" || !row._clientMessageId.trim() || !isLegacyRequestTooLargeDiagnostic(row._errorCode, row.text)) return row;
+    if (requestReference(row._errorDetail, row._errorCardSnapshot?.disposition === "card" ? row._errorCardSnapshot.detail : undefined)) return row;
+    const ids = references.get(row._clientMessageId);
+    if (!ids || ids.size !== 1) return row;
+    changed = true;
+    return { ...row, _errorDetail: [row._errorDetail, `请求 ID：${[...ids][0]}`].filter(Boolean).join("\n") };
+  });
+  return changed ? result : current;
+}
+
 /** Render-time privacy/UX boundary for both new and already-persisted errors. */
 export function errorPresentation(
   code: string | undefined,
@@ -808,6 +842,11 @@ export function errorPresentation(
       waived: false,
     };
   }
+  // Old tapes used ENGINE_ERROR for the SDK's fixed size diagnostic.
+  // Reclassify only that exact diagnostic; keep genuine partial answers.
+  if (isLegacyRequestTooLargeDiagnostic(normalized, text)) {
+    return errorPresentation("request_too_large", text, detail, false);
+  }
   // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
   // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
   // 仅 detail 是内部串,应落到下方 R6 分支保住部分回答(detail 交由 sanitizeErrorDetail 脱敏)。
@@ -825,9 +864,16 @@ export function errorPresentation(
   // 现在:仅当 text 正是**该码已知友好文案**或**白名单服务端 message**时原样作正文;否则切出尾部终止
   // 器,前半段若是合法部分回答 → 进 bodyText(AssistantCard 正常 Markdown 渲染)、红卡正文用按码文案;
   // 终止器/内部串按 R7 守卫决定去留,detail 一律过 sanitizeErrorDetail。
-  const t = text?.trim() ?? "";
+  // A size diagnostic is not a partial model answer. Preserve any genuine
+  // earlier answer, but do not render the old fixed-English SDK hint beneath it.
+  const diagnostic = /(?:^|\n)\s*(?:Request too large \([^\n)]*\)\. (?:Try with a smaller file\.|Double press esc to go back and try with a smaller file\.)|本轮资料未能完整处理，文件和对话均已保留。)\s*$/i;
+  const t = normalized === "request_too_large"
+    ? (text?.trim() ?? "").replace(diagnostic, "").trim()
+    : text?.trim() ?? "";
   const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
-  const safeDetail = sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
+  const safeDetail = normalized === "request_too_large"
+    ? (ref ? `请求 ID：${ref}` : undefined)
+    : sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
   // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
   // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。
   const isRaw = !t || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
@@ -846,7 +892,8 @@ export function errorPresentation(
   const { body: preTerminator, terminator } = splitTrailingTerminator(t);
   const partialAnswer = preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
   // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
-  const detailOut = safeDetail ?? (terminator || undefined);
+  const detailOut = normalized === "request_too_large"
+    ? safeDetail : safeDetail ?? (terminator || undefined);
   return {
     title: errorLabel(normalized),
     message: byCode,

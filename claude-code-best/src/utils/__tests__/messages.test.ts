@@ -1,3 +1,4 @@
+import { getRequestTooLargeErrorMessage, getPdfInvalidErrorMessage } from '../../services/api/errors.js'
 import { describe, expect, test } from 'bun:test'
 import {
   deriveShortMessageId,
@@ -953,5 +954,34 @@ describe('computeMessageStructureKey + updateMessageLookupsIncremental: progress
     expect(arr).toHaveLength(1)
     expect(arr![0].uuid).toBe('00000000-0000-0000-0000-000000000002')
     expect((arr![0].data as BashProgress).elapsedTimeSeconds).toBe(4)
+  })
+})
+
+
+describe('request size recovery retains original media', () => {
+  const media = [
+    { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'aGVsbG8=' } },
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0xLjQ=' } },
+  ] as any
+  const typesAfter = (diagnostic: string) => {
+    const user = createUserMessage({ isMeta: true, content: media })
+    const before = JSON.stringify(user)
+    const output = normalizeMessagesForAPI([
+      user, createAssistantAPIErrorMessage({ content: diagnostic }),
+    ])
+    expect(JSON.stringify(user)).toBe(before)
+    return output.flatMap((m: any) =>
+      m.type === 'user' && Array.isArray(m.message?.content)
+        ? m.message.content.map((b: any) => b.type) : [])
+  }
+  test('a size error keeps every image and PDF for automatic lossless transport', () => {
+    const types = typesAfter(getRequestTooLargeErrorMessage())
+    expect(types).toContain('image')
+    expect(types).toContain('document')
+  })
+  test('the existing damaged PDF rule still only removes the damaged media type', () => {
+    const types = typesAfter(getPdfInvalidErrorMessage())
+    expect(types).toContain('image')
+    expect(types).not.toContain('document')
   })
 })

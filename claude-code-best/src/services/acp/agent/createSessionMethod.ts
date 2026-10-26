@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from '../../../utils/sessionTransition.js'
 /**
  * AcpAgent.prototype.createSession implementation, attached via Object.assign.
  * Extracted from sessionLifecycle.ts to keep that module under the 500-line
@@ -66,8 +67,10 @@ async function createSession(
     forceNewId?: boolean
     sessionId?: string
     initialMessages?: Message[]
+    sessionProjectDir?: string | null
   } = {},
 ): Promise<NewSessionResponse> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   enableConfigs()
 
   const sessionId = opts.sessionId ?? randomUUID()
@@ -77,11 +80,15 @@ async function createSession(
   // analytics, and cost tracking use the ACP session ID.
   // Preserve the projectDir set by getOrCreateSession so that
   // getSessionProjectDir() continues to resolve correctly.
-  const currentProjectDir = getSessionProjectDir()
+  const currentProjectDir = process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1'
+    ? opts.sessionProjectDir ?? null
+    : getSessionProjectDir()
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   switchSession(sessionId as SessionId, currentProjectDir)
 
   // Set CWD for the session
   setOriginalCwd(cwd)
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await (await import('../../../utils/sessionStorage.js')).resetSessionFilePointer()
   const previousProcessCwd = process.cwd()
   let processCwdChanged = false
   try {
@@ -261,6 +268,7 @@ async function createSession(
       cancelled: false,
       cancelGeneration: 0,
       cwd,
+      ...(process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1' ? { sessionProjectDir: currentProjectDir } : {}),
       modes,
       models,
       configOptions,

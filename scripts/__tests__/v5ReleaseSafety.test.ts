@@ -4440,7 +4440,7 @@ describe('v5 release safety lanes', () => {
 
     // 门必须排在 dist 拷回 staging 之前,否则坏产物已经进 release 了。
     assert.ok(
-      body.indexOf('oc_hotcfg__die "ccb dist 残留') < body.indexOf('cp -a "$ccb_build/dist"'),
+      body.indexOf('oc_hotcfg__die "ccb dist 残留') < body.indexOf('cp -a "$ccb_work/dist"'),
       'await-using 门必须在 dist 拷回 staging 之前执行',
     )
   })

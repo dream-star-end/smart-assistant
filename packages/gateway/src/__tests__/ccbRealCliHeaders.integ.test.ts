@@ -124,16 +124,18 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
   // Host tsx is root, and /var/lib/docker is mode 750, so uid 1000 cannot open the
   // checkout path. This CLI aborts --dangerously-skip-permissions at euid 0 (setup.ts).
   // Bind-mount the same checkout where others can traverse, then drop to uid 1000.
+  // The whole repo, not just claude-code-best: CCB source imports the shared transcript lock
+  // from ../../../packages/storage (OCV5-607), so the monorepo layout must stay intact.
   const dropRoot = process.getuid?.() === 0;
   let view: string | undefined;
   if (dropRoot) {
     chownSync(home, 1000, 1000);
     view = join(tmpdir(), `ocv5-296-ccb-view-${randomBytes(3).toString("hex")}`);
     mkdirSync(view);
-    const mounted = spawnSync("mount", ["--bind", CCB, view], { encoding: "utf8" });
+    const mounted = spawnSync("mount", ["--bind", ROOT, view], { encoding: "utf8" });
     if (mounted.status !== 0) throw new Error(`bind mount failed: ${mounted.stderr}`);
   }
-  const runtimeTree = view ?? CCB;
+  const runtimeTree = view ? join(view, "claude-code-best") : CCB;
   const cliPath = join(runtimeTree, "src/entrypoints/cli.tsx");
 
   const hits: Array<{ authority?: string; lease?: string; trace?: string; hasToolMark: boolean; bytes: number }> = [];

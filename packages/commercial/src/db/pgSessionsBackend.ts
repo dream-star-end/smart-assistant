@@ -1,3 +1,5 @@
+import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
+import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
 // pgSessionsBackend — master 会话权威六表的 **PostgreSQL 实现**(RFC-v5-sessions-pg,P2)。
 //
 // 为什么在 commercial 而不在 storage:pg 依赖已在 commercial(storage 侧只用最小结构类型
@@ -2562,7 +2564,7 @@ function tapeAnchor(
   };
 }
 
-type HydratedTapeRow = {
+export type HydratedTapeRow = {
   tape_id: string;
   tape_sha256: string;
   waive_reason: string | null;
@@ -2917,7 +2919,7 @@ function hydrateTapeRecord(
   );
 }
 
-type HydratedRuntimeBatchDescriptor = {
+export type HydratedRuntimeBatchDescriptor = {
   batchId: string;
   logicalCount: number;
   manifestSha256: string;
@@ -3044,6 +3046,13 @@ function expandHydratedRuntimeBatch(
     messages,
     descriptor: { batchId: row.msg_id, logicalCount, manifestSha256 },
   };
+}
+
+/** Raw continuity uses the same immutable batch validators as normal tape reads. */
+export function readCcbNativeRestoreArchive(pool: Pool | PoolClient, owner: string,
+  binding: CcbTranscriptRestoreBinding): Promise<CcbNativeTranscriptArchive> {
+  return readCcbNativeRestoreArchiveFromDb(pool, owner, binding,
+    row => expandHydratedRuntimeBatch(hydrateTapeRecordContent(row, {}, false, true), row, {}));
 }
 
 // ── Direct immutable-tape reads ─────────────────────────────────────────────
@@ -14060,3 +14069,5 @@ export async function lookupLeaseCallbackSession(
   );
   return other.rows.length ? "foreign" : "gone";
 }
+
+export type { MessageLike };

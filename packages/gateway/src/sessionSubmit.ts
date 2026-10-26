@@ -1799,6 +1799,7 @@ export async function _getOrCreateExclusive(
         )
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
+      peerId: opts.peerId,
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
       agentBaseDir: cwd,

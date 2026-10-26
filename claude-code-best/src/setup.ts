@@ -1,3 +1,4 @@
+import { flushBeforeSessionChange } from './utils/sessionTransition.js'
 /* eslint-disable custom-rules/no-process-exit */
 
 import { feature } from 'bun:bundle'
@@ -65,6 +66,7 @@ export async function setup(
   worktreePRNumber?: number,
   messagingSocketPath?: string,
 ): Promise<void> {
+  if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
   logForDiagnosticsNoPII('info', 'setup_started')
 
   // Check for Node.js version < 18
@@ -80,6 +82,7 @@ export async function setup(
 
   // Set custom session ID if provided
   if (customSessionId) {
+    if (process.env.OPENCLAUDE_TRANSCRIPT_INTEGRITY === '1') await flushBeforeSessionChange()
     switchSession(asSessionId(customSessionId))
   }
 

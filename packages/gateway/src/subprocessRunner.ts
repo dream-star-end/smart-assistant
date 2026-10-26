@@ -1,3 +1,4 @@
+import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { PassiveStageTiming } from './passiveStageTiming.js'
 import { fastServiceTierRoute } from '@openclaude/protocol'
 import {
@@ -25,7 +26,7 @@ import {
   waitForCloseWithin,
 } from './processGroupShutdown.js'
 import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
-import { relocateCcbJsonlToCwd } from './engine/ccbTranscriptRelocate.js'
+import { relocateCcbJsonlToCwd, relocateCcbJsonlToCwdManaged } from './engine/ccbTranscriptRelocate.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
 import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
@@ -154,6 +155,11 @@ export type CcbSpawnForTests = (opts: SpawnOpts) => ChildProcessWithoutNullStrea
 let ccbSpawnForTests: CcbSpawnForTests | null = null
 export function __setCcbSpawnForTests(fn: CcbSpawnForTests | null): void {
   ccbSpawnForTests = fn
+}
+
+let transcriptRestoreSocketFactory = createCcbTranscriptRestoreSocket
+export function __setCcbTranscriptRestoreSocketFactoryForTests(fn: typeof createCcbTranscriptRestoreSocket | null): void {
+  transcriptRestoreSocketFactory = fn ?? createCcbTranscriptRestoreSocket
 }
 
 export function isCcbAdvisorHermeticProfile(opts: {
@@ -290,6 +296,7 @@ export class SubprocessRunner extends EventEmitter {
   private static STABLE_UPTIME_MS = 5 * 60_000
   /** True once we force-killed due to stderr overflow; prevents double-kill. */
   private overflowKilled = false
+  private transcriptRestoreSocket: CcbTranscriptRestoreSocket | null = null
   private sessionDir: string | null = null
   private advisorHomeDir: string | null = null
   private advisorConfigDir: string | null = null
@@ -483,12 +490,20 @@ export class SubprocessRunner extends EventEmitter {
     try {
       await started
     } finally {
+      if (!this.proc && this._startPromise === started) {
+        this.starting = false
+        this._boundRepoBinding = null
+      }
       if (this._startPromise === started) this._startPromise = null
     }
   }
 
   private async _startInternal(): Promise<void> {
     const epoch = this._startEpoch
+    let generationRestoreSocket: CcbTranscriptRestoreSocket | null = null
+    let restoreSocketTransferred = false
+    try {
+
     if (this.proc || this.starting) return
     // ── Crash-loop gate ──
     // If the previous crash(es) pushed _backoffUntil into the future, refuse to
@@ -626,6 +641,7 @@ export class SubprocessRunner extends EventEmitter {
       throw err
     }
 
+    if (epoch !== this._startEpoch) return
     const restrictedMemorySources = isV3ContainerRuntime()
     // Claude Code resolves `--resume <uuid>` ONLY under
     // `$CLAUDE_CONFIG_DIR/projects/<sanitize(cwd)>/`. Our resume-map probe
@@ -640,7 +656,9 @@ export class SubprocessRunner extends EventEmitter {
     const spawnCwd = learningContext.workingDir ?? effectiveAddDir
     const backendType = this.opts.config.terminal?.type ?? 'local'
     if (this.currentSessionId && !this.opts.hermeticNoTools && backendType === 'local') {
-      const relocation = relocateCcbJsonlToCwd({ innerId: this.currentSessionId, cwd: spawnCwd })
+      const relocation = isV3ContainerRuntime() && harness === 'ccb'
+        ? await relocateCcbJsonlToCwdManaged({ innerId: this.currentSessionId, cwd: spawnCwd })
+        : relocateCcbJsonlToCwd({ innerId: this.currentSessionId, cwd: spawnCwd })
       if (relocation?.relocated) {
         runnerLog.info('resume transcript relocated for spawn cwd', {
           sessionKey: this.opts.sessionKey,
@@ -649,6 +667,20 @@ export class SubprocessRunner extends EventEmitter {
           cwd: spawnCwd,
         })
       }
+    }
+    if (epoch !== this._startEpoch) return
+    const previousRestoreSocket = this.transcriptRestoreSocket
+    if (previousRestoreSocket) {
+      await previousRestoreSocket.close()
+      if (this.transcriptRestoreSocket === previousRestoreSocket) this.transcriptRestoreSocket = null
+    }
+    if (epoch !== this._startEpoch) return
+    if (isV3ContainerRuntime() && harness === 'ccb' && this.currentSessionId && this.opts.peerId && !this.opts.hermeticNoTools) {
+      generationRestoreSocket = await transcriptRestoreSocketFactory({
+        peerId: this.opts.peerId, agentId: this.opts.agentId, nativeSessionId: this.currentSessionId,
+      })
+      if (epoch !== this._startEpoch) return
+      this.transcriptRestoreSocket = generationRestoreSocket
     }
     let args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
@@ -799,7 +831,12 @@ export class SubprocessRunner extends EventEmitter {
           // 「自动记忆」写入器会另起一份私有 memory store,与平台记忆分裂 → 关掉它。
           // gate = isV3ContainerRuntime()(与上方 restrictedMemorySources 同一权威),
           // 个人版(宿主单进程)行为不动。
-          ...(isV3ContainerRuntime() ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' } : {}),
+          ...(generationRestoreSocket ? {
+            OPENCLAUDE_TRANSCRIPT_RECOVERY_SOCKET: generationRestoreSocket.socketPath,
+            OPENCLAUDE_TRANSCRIPT_RECOVERY_PEER: this.opts.peerId!,
+            OPENCLAUDE_TRANSCRIPT_RECOVERY_AGENT: this.opts.agentId,
+          } : {}),
+          ...(isV3ContainerRuntime() ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', ...(harness === 'ccb' ? { OPENCLAUDE_TRANSCRIPT_INTEGRITY: '1' } : {}) } : {}),
           // 远程执行目标:kind='remote' 时让 CCB RemoteExecutor 启用 ssh mux 分支。
           // 空串 = 本地执行(默认);OC_REMOTE_* 其余变量仅在 remote 分支设。
           // 容器里 ctl.sock 的真实路径是宿主侧 /run/ccb-ssh/u<uid>/h<hid>/ctl.sock,
@@ -852,6 +889,7 @@ export class SubprocessRunner extends EventEmitter {
       // OCV5-570: only a CCB whose upstream is egress gets the turn's internal trace header.
       this.spawnedUpstreamIsEgress = _ccbUpstreamIsEgress(spawnOpts.env as NodeJS.ProcessEnv)
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+      if (epoch !== this._startEpoch) return
       timing.once('spawn_requested')
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
       timing.once('spawned')
@@ -956,7 +994,9 @@ export class SubprocessRunner extends EventEmitter {
       this.emit('stderr', chunk)
     })
 
+    const restoreSocket = generationRestoreSocket
     proc.on('exit', (code, signal) => {
+      if (restoreSocket) { void restoreSocket.close().catch(() => {}); if (this.transcriptRestoreSocket === restoreSocket) this.transcriptRestoreSocket = null }
       // shutdown() may have reached its terminal post-SIGKILL deadline and a
       // later submit may already own a new proc. A delayed exit from the old
       // process must not mark the new turn crashed or reset its binding.
@@ -1008,6 +1048,8 @@ export class SubprocessRunner extends EventEmitter {
       pendingExitInfo = { code, signal, crashed }
       forwardDrainedExit()
     })
+    restoreSocketTransferred = true
+
 
     proc.on('error', (err) => {
       if (this.proc !== proc) {
@@ -1032,7 +1074,14 @@ export class SubprocessRunner extends EventEmitter {
       this._recordCrash({ startError: err instanceof Error ? err.message : String(err) })
       throw err
     }
-  }
+
+    } finally {
+      if (!restoreSocketTransferred && generationRestoreSocket) {
+        if (this.transcriptRestoreSocket === generationRestoreSocket) this.transcriptRestoreSocket = null
+        await generationRestoreSocket.close().catch(() => {})
+      }
+    }
+}
 
   /**
    * Bump the crash counter and compute the next backoff window.

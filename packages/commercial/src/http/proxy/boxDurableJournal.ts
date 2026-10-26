@@ -1,3 +1,4 @@
+import { deriveBoxImageIdentity } from './boxImageIdentity.js';
 /** Box invocation fence on the existing request_finalize_journal.ctx JSONB.
  * No schema change. This is deliberately stricter than HTTP idempotency: an
  * identical body in one signed turn remains ambiguous and is never re-run. */
@@ -1166,6 +1167,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         fallbackAlias = deriveBoxFallbackAlias(input.uid, input.canonicalBody);
       } catch { throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID"); }
     }
+    const imageIdentity = input.canonicalBody ? deriveBoxImageIdentity(input.canonicalBody) : undefined;
     const native = input.nativeClaim;
     if (native && (!/^[A-Za-z0-9_-]{1,64}$/.test(native.ownerRequestId)
       || native.ownerRequestId === input.requestId
@@ -1311,6 +1313,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxReplayFingerprint: input.fingerprint.replayFingerprint,
         ...(fallbackAlias ? { boxFallbackAlias: fallbackAlias } : {}),
         boxRequestHash: input.fingerprint.requestHash,
+        ...(imageIdentity ? { boxImageIdentity: imageIdentity } : {}),
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
         ...(input.invocationMode === "detached_tool"
@@ -2071,6 +2074,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     const fallbackAlias = view.fallbackAlias;
     const priorContextHash = view.priorContextHash;
     const nextContextHash = view.nextContextHash;
+    const imageIdentity = deriveBoxImageIdentity(view.effectiveBody);
     // Rolling compatibility (OCV5-300): a chain handed off on the opaque-alias
     // release keeps resolving against that exact catalog variant.
     let boundCatalog = view.catalog;
@@ -2257,6 +2261,7 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(ctx.boxReplayRequired === true ? { boxReplayRequired: true } : {}),
              boxRequestHash: fingerprint.requestHash,
              boxContextHash: nextContextHash,
+             boxImageIdentity: imageIdentity,
              boxParentResumeRevision: durableRevision,
              ...(nativeSessionId === undefined ? {} : {
                boxNativeSessionId: nativeSessionId,
