@@ -348,6 +348,12 @@ export interface GatewayDeps {
    * 仅影响 Cache-Control 头的计算;ETag/304、路径白名单、SPA 回退逻辑两模式共用。
    */
   staticMode?: 'vanilla' | 'spa'
+  /**
+   * 资产池根(OCV5-632,X-P1-1 PR-a):`<pool>/assets/` 存放历次发版的内容哈希资产。仅 'spa' 生效:
+   * `/assets/*` 在 webRoot 未命中时回落到这里,旧标签页懒加载上一版 chunk 不再 404。
+   * 未设 = 与之前完全一致。由 cli launcher 从 OC_V5_WEB_ASSETS_POOL 注入(仅 v5 通道)。
+   */
+  webAssetsPool?: string
   channelFactories?: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter>
   /** V3 2H: 商业化模块挂载点(undefined = 未启用)。由 cli launcher 在 COMMERCIAL_ENABLED=1 时注入。 */
   commercial?: CommercialHook
