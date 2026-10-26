@@ -244,6 +244,38 @@ describe("ChatHeader compact navigation", () => {
   });
 });
 
+describe("ChatHeader 新版本 pill(OCV5-626)", () => {
+  it("updateAvailable=false 或缺 onReloadForUpdate 时不渲染", () => {
+    renderHeader({ onReloadForUpdate: vi.fn() });
+    expect(screen.queryByTestId("update-pill")).toBeNull();
+    cleanup();
+    renderHeader({ updateAvailable: true });
+    expect(screen.queryByTestId("update-pill")).toBeNull();
+  });
+
+  it("可见时落在模型行(窄屏整宽那一行),不挤右侧图标组;点一下回调刷新", () => {
+    const onReloadForUpdate = vi.fn();
+    renderHeader({ updateAvailable: true, onReloadForUpdate, onOpenFind: vi.fn() });
+    const pill = screen.getByRole("button", { name: "有新版本，点击刷新页面" });
+    const row = screen.getByTestId("chat-model-row");
+    expect(row).toContainElement(pill);
+    expect(row).not.toContainElement(screen.getByRole("button", { name: "会话内查找" }));
+    // 窄屏两字短文案 + 桌面全称都在 DOM,由断点切换;44px 命中区在透明外层 button 上。
+    expect(pill.textContent).toContain("新版本");
+    expect(pill.textContent).toContain("有新版本 · 刷新");
+    expect(pill).toHaveClass("min-h-11", "ml-auto");
+    fireEvent.click(pill);
+    expect(onReloadForUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("没有模型列表时也渲染模型行来承载 pill", () => {
+    render(
+      <ChatHeader agent={MAIN_AGENT} onAgentClick={() => {}} updateAvailable onReloadForUpdate={vi.fn()} />,
+    );
+    expect(screen.getByTestId("chat-model-row")).toContainElement(screen.getByTestId("update-pill"));
+  });
+});
+
 describe("ChatHeader 未分类会话的项目建议", () => {
   it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议", () => {
     const onAccept = vi.fn();

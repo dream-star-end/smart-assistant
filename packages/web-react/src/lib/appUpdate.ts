@@ -30,6 +30,12 @@
  *  S2 形态校验:双端 id 均 8-32 hex 且不等才动作;dev 无 meta → 恒 inert。
  *  全程只用本地 now(),不掺服务器时间戳(跨时钟域红线)。
  *
+ * ── 顶栏 pill(OCV5-626,不打扰的手动出口)────────────────────────────────────
+ *  形态校验通过且版本不一致的那一刻就亮,不等安全点也不等 5min:用户忙着时静默软刷
+ *  一直推迟,原先只能等横幅,期间撞上旧 chunk 才知道发了版。pill 只是给一个随手可点的
+ *  reloadNow() 入口,不改上面任何自动刷新规则;横幅出现时让位,「稍后」收起横幅后回到 pill,
+ *  版本一致或已开始刷新时熄灭。
+ *
  * 刻意不做 reload 冷却:谱系硬顶已限总次数(≤MAX),再加"两次刷之间等 10min"只会
  * 拖延真正需要的第二次刷新(快速修复版发布后用户被迫干等),弊大于利。
  */
@@ -66,6 +72,9 @@ export class AppUpdateGovernor {
   private lastActivityAt: number;
   private bannerVisible = false;
   private bannerDismissedFor: string | null = null;
+  /** 最近一帧确认的不一致目标(形态合法);版本一致即清空。pill 的唯一依据。 */
+  private mismatchTarget: string | null = null;
+  private pillVisible = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private reloaded = false;
   /** 本页所处 reload 谱系的已刷次数(构造时从 URL 读一次,之后只增不减)。 */
@@ -95,10 +104,16 @@ export class AppUpdateGovernor {
 
   /** 服务端握手帧入口。非法/缺失一律 no-op(S2)。 */
   onServerBuild(raw: unknown): void {
+    this.handleServerBuild(raw);
+    this.syncPill();
+  }
+
+  private handleServerBuild(raw: unknown): void {
     const server = typeof raw === "string" && BUILD_ID_RE.test(raw) ? raw : null;
     if (!server || this.reloaded) return;
     const client = this.deps.getClientBuild();
     if (!client || !BUILD_ID_RE.test(client)) return; // dev / meta 缺失 → inert
+    this.mismatchTarget = server === client ? null : server;
     if (server === client) {
       // 已是最新(典型:成功软刷后的下一帧)。清空 pending + 清 URL 谱系标记(谱系完成,
       // 地址栏归位;此后自发 reload 从 0 重新计,因为已经是对的版本了)。
@@ -132,6 +147,7 @@ export class AppUpdateGovernor {
     if (this.reloaded) return;
     this.reloaded = true;
     this.stopTimer();
+    this.syncPill();
     this.deps.reload();
   }
 
@@ -146,6 +162,7 @@ export class AppUpdateGovernor {
     return () => this.listeners.delete(fn);
   };
   getBannerVisible = (): boolean => this.bannerVisible;
+  getPillVisible = (): boolean => this.pillVisible;
 
   // ── 内部 ──
 
@@ -183,6 +200,7 @@ export class AppUpdateGovernor {
       return;
     }
     this.reloaded = true;
+    this.syncPill();
     this.deps.reload();
   };
 
@@ -200,6 +218,23 @@ export class AppUpdateGovernor {
   private setBanner(visible: boolean): void {
     if (this.bannerVisible === visible) return;
     this.bannerVisible = visible;
+    this.pillVisible = this.derivePill();
+    this.emit();
+  }
+
+  /** 只在 pill 可见性真的变了时通知(横幅变化已由 setBanner 一并通知)。 */
+  private syncPill(): void {
+    const next = this.derivePill();
+    if (next === this.pillVisible) return;
+    this.pillVisible = next;
+    this.emit();
+  }
+
+  private derivePill(): boolean {
+    return this.mismatchTarget !== null && !this.bannerVisible && !this.reloaded;
+  }
+
+  private emit(): void {
     for (const fn of this.listeners) fn();
   }
 
