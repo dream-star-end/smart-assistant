@@ -48,6 +48,15 @@ class Pure(unittest.TestCase):
         with self.assertRaises(IOError) as c3:
             mb._check_binary_body(payload, H({}), "bytes=0-9", 10)
         self.assertIn("Content-Range", str(c3.exception))
+    def test_heartbeat_timeout_fits_the_master_lost_window(self):
+        # 0.5.3: two hung heartbeats in a row (relay dropped the replies) must still leave a sign of
+        # life inside the master's 60 s lost-contact window; 0.5.2 used 20 s (2 x (15 + 20) = 70 s).
+        self.assertLess(2 * (mb.HEARTBEAT_DEFAULT + mb.HEARTBEAT_TIMEOUT_SEC), 60)
+        seen = {}
+        c = mb.Client("https://master.example", "tok")
+        c._request = lambda method, path, body=None, **kw: seen.update(path=path, timeout=kw.get("timeout"))
+        c.heartbeat({"id": "j1", "nonce": "n1"})
+        self.assertEqual(seen, {"path": "/jobs/j1/heartbeat", "timeout": mb.HEARTBEAT_TIMEOUT_SEC})
     def test_source_refs_validation(self):
 
         sha = hashlib.sha256(PNG).hexdigest()
