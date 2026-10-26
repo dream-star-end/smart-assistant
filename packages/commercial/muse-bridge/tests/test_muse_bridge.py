@@ -54,9 +54,11 @@ class Pure(unittest.TestCase):
         ref = {"n": 0, "bytes": len(PNG), "sha256": sha, "mime": "image/png"}
         job = mb.validate_job({"id": "r", "kind": "video", "prompt": "x", "source_images": None, "source_refs": [ref]}, self.L)
         self.assertEqual(job["source_refs"], [ref]); self.assertNotIn("source_images", job)
+        # 0.5.2: the personal master sends source_refs [] for a job without sources (same as absent).
+        empty = mb.validate_job({"id": "r", "kind": "image", "prompt": "x", "source_refs": []}, self.L)
+        self.assertNotIn("source_refs", empty); self.assertNotIn("source_images", empty)
         bad = [
             {"source_images": [{"base64": b64(PNG)}], "source_refs": [ref]},
-            {"source_refs": []},
             {"source_refs": [dict(ref, n=1)]},
             {"source_refs": [dict(ref, bytes=0)]},
             {"source_refs": [dict(ref, bytes=True)]},
@@ -312,6 +314,19 @@ class E2E(unittest.TestCase):
         mm.S.src_short["ref2s"] = 2
         r = self.res(self.ref_job("ref2s", WEBP), 60)
         self.assertTrue(r["ok"], r)
+    def test_07f3_every_range_cut_short_resumes_after_partial(self):
+        # Prod 2026-10-26 uid 1931: every range arrived as ~88.7% of its bytes, 8 tries in a row.
+        # 0.5.1 threw the prefix away and asked for the same range again; 0.5.2 keeps it.
+        mm.S.src_cut["ref2c"] = 0.887
+        payload = WEBP + b"c" * 400
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.ref_job("ref2c", payload), 60)
+        self.assertTrue(r["ok"], r)
+        self.assertGreater(len(argv_lines(self.argvlog)), n0, "the CLI ran with the source")
+        starts = [int(e[2].split("=")[1].split("-")[0]) for e in mm.S.events if e[0] == "src" and e[1] == "ref2c"]
+        self.assertEqual(starts, sorted(set(starts)), "each request resumes after the bytes already held")
+        self.assertEqual(starts[0], 0)
+
     def test_07g_source_download_failure_is_a_result(self):
         n0 = len(argv_lines(self.argvlog))
         mm.S.src_flaky["ref3"] = 99
