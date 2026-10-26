@@ -203,11 +203,13 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
     await assert.rejects(h.run({ ...base, attempt: -1 }), { code: 'BAD_BODY' })
   })
 
-  it('a journal conflict never releases the reservation of a call still in flight (Codex #1130 r1 P1)', async () => {
+  it('a journal conflict never releases the reservation of a call still in flight (Codex #1130 r1/r2 P1)', async () => {
     const base = { userId: 7n, containerId: null, requestId: 'studio:task-4', prompt: 'x' }
-    const inflight = harness({ admit: () => false, journalState: () => 'inflight' })
-    await assert.rejects(inflight.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
-    assert.deepEqual(inflight.events, ['precheck', 'journal:null'])
+    for (const state of ['inflight', 'finalizing']) {
+      const running = harness({ admit: () => false, journalState: () => state })
+      await assert.rejects(running.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
+      assert.deepEqual(running.events, ['precheck', 'journal:null'], state)
+    }
     const unreadable = harness({
       admit: () => false,
       journalState: () => {
@@ -216,7 +218,7 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
     })
     await assert.rejects(unreadable.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
     assert.ok(!unreadable.events.includes('release'))
-    for (const state of ['aborted', null]) {
+    for (const state of ['committed', 'aborted', null]) {
       const ended = harness({ admit: () => false, journalState: () => state })
       await assert.rejects(ended.run(base), { code: 'GROK_VISION_JOURNAL_CONFLICT' })
       assert.deepEqual(ended.events, ['precheck', 'journal:null', 'release'])

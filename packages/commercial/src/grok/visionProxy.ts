@@ -524,15 +524,16 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         throw err;
       }
       if (!admitted) {
-        // The request id already has a journal row. An inflight row is another call with this id
-        // still running, and the precheck above re-wrote that call's reservation (same id):
-        // releasing it here would drop the running call's hold on the balance (Codex #1130 r1
-        // P1). Only release when no inflight row owns it; an unreadable state is left to the TTL.
+        // The request id already has a journal row. Until that row is terminal another call with
+        // this id still owns the reservation (inflight, or finalizing before its charge lands),
+        // and the precheck above re-wrote that same reservation: releasing it here would drop the
+        // running call's hold on the balance (Codex #1130 r1/r2 P1). Release only for a missing
+        // or terminal row; any other or unreadable state is left to the running call or the TTL.
         const state = await runReadJournal(deps.getPool(), billingRequestId).then(
           (row) => row?.state ?? null,
           () => "unknown",
         );
-        if (state !== "inflight" && state !== "unknown") {
+        if (state === null || state === "committed" || state === "aborted") {
           await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
         }
         throw new GrokRunError(409, "GROK_VISION_JOURNAL_CONFLICT", "billing journal conflict");
