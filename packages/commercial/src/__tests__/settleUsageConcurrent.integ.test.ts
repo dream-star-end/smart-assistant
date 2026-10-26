@@ -348,4 +348,59 @@ describe("P6 自带事务计费变体 — 同一用户并发 (OCV5-631)", () => 
     const led = await query<{ s: string }>("SELECT COALESCE(SUM(delta),0)::text AS s FROM credit_ledger WHERE user_id=$1", [uid.toString()]);
     assert.equal(BigInt(led.rows[0].s), -expected);
   });
+
+  // Codex r1 P1:媒体结算在同一事务里调两次 lockSpendRows(预锁 + spendTwoBucket),而 lockSpendRows 的
+  // org 锁带 status='active'。A 首次取锁时 org 恰被停用 → 跳过 org、只锁 users;org 随即恢复,B 锁住 org
+  // 后等 A 的 users;A 进 spendTwoBucket 再锁 org → 等 B,users→orgs 逆序成环(40P01)。修法同 F8:
+  // 预锁前先不带 status 条件锁住计费 org 行。这里按该时序把 A、B 交错起来:A 在首次锁 users 后放行
+  // 「恢复 org → B 结算」,等到有后端在等锁(修前是 B 等 users,修后是恢复语句等 A 的 org 行)再继续。
+  test("T9 media:org 在两次取锁之间停用又恢复,同一用户的两笔结算都成功 (Codex r1 P1)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("p6-t9@example.com", 1000n);
+    const o = await query<{ id: string }>(
+      "INSERT INTO orgs(name, credits) VALUES ('p6-t9-org', 1000) RETURNING id::text AS id",
+    );
+    const oid = o.rows[0].id;
+    await query("INSERT INTO org_memberships(org_id, user_id, billing_enabled) VALUES ($1, $2, true)", [oid, uid.toString()]);
+    const pool = getPool();
+    const settle = (p: typeof pool, requestId: string) =>
+      settleMiniMaxMediaSuccess(p, { userId: uid, containerId: null, requestId, cost: MEDIA_COST(70n) })
+        .then(() => "ok", (err: { code?: string }) => err.code ?? "error");
+    let b: Promise<string> | undefined;
+    let userLocks = 0;
+    const poolA = {
+      connect: async () => {
+        const c = await pool.connect();
+        return {
+          release: () => c.release(),
+          query: async (sql: string, args?: unknown[]) => {
+            const result = await c.query(sql, args);
+            if (sql.includes("JOIN orgs o ON o.id = m.org_id")) {
+              await pool.query("UPDATE orgs SET status = 'suspended' WHERE id = $1", [oid]);
+            }
+            if (sql.includes("FROM users WHERE id = $1 FOR UPDATE") && ++userLocks === 1) {
+              b = pool.query("UPDATE orgs SET status = 'active' WHERE id = $1", [oid]).then(() => settle(pool, "p6-t9-b"));
+              const deadline = Date.now() + 10_000;
+              for (;;) {
+                const w = await pool.query<{ c: string }>(
+                  "SELECT COUNT(*)::text AS c FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                );
+                if (w.rows[0].c !== "0") break;
+                assert.ok(Date.now() < deadline, "no backend ever waited on a lock");
+                await new Promise((r) => setTimeout(r, 20));
+              }
+            }
+            return result;
+          },
+        };
+      },
+    } as unknown as typeof pool;
+    const a = await settle(poolA, "p6-t9-a");
+    assert.deepEqual([a, await b], ["ok", "ok"]);
+    const led = await query<{ s: string }>(
+      "SELECT COALESCE(SUM(delta), 0)::text AS s FROM credit_ledger WHERE user_id = $1 OR org_id = $2",
+      [uid.toString(), oid],
+    );
+    assert.equal(led.rows[0].s, "-140");
+  });
 });
