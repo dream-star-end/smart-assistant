@@ -649,6 +649,7 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
+import { mediaProxyKey } from "./minimax/mediaKey.js";
 import { createMuseFromConfig } from "./muse/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
 import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
@@ -2397,13 +2398,12 @@ export async function registerCommercial(
       // OC_PROJECT_CONTEXT and OC_P5_PROJECT_SEARCH are on.
       const projectSearchHandler: InternalProjectSearchHandler =
         makeInternalProjectSearchHandler({ identityRepo });
-      // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
-      // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
-      // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
+      // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax key 调多模态 API 并记账;key 只在 master,
+      // 不注入容器,鉴权同 anthropicProxy 双因子。OCV5-589/D12:设了 MINIMAX_MEDIA_KEY_FILE 就只用该文件(搜索不变)。
       const minimaxMediaHandler: MiniMaxMediaHandler = makeMiniMaxMediaHandler({
         identityRepo,
         pgPool: getPool(),
-        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+        tokenPlanKey: mediaProxyKey(cfg),
       });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
         makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });

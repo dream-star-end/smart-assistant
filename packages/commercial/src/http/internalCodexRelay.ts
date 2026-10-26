@@ -62,6 +62,7 @@ import {
   reserveImageUsage,
   settleImageCharge,
 } from '../billing/imageBilling.js'
+import { IMAGE_MODEL_RE, parseImageModelPolicy, type ImageModelPolicy } from '../billing/imageModels.js'
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
 import { codexRequestTiming, codexResponseTiming, codexBodyTiming } from './codexRelayTiming.js'
@@ -160,6 +161,8 @@ export interface CodexRelayDeps {
   preCheckRedis?: PreCheckRedis
   onImageCharge?: (userId: bigint, payload: { costCredits: string; balanceAfter: string | null }) => void
   image2Enabled?: boolean
+  /** GPT image model allowlist (OCV5-587); parsed from env when omitted. */
+  imageModelPolicy?: ImageModelPolicy
 }
 
 function sendJsonError(
@@ -426,14 +429,14 @@ class ImageUpstreamError extends Error {
 /** 把上游图片端点的失败归类成一个稳定、不泄漏原文的机器码,交给 gateway 本地化成
  * 人话文案(见 server.ts 图片编辑错误分支)。原始 body 从不透传给用户 —— 只依据其中
  * 的粗粒度关键词判类。5xx / 429 归为瞬时可重试;4xx 归为"请求被拒"的确定性失败。 */
-type ImageUpstreamFailureCode =
+export type ImageUpstreamFailureCode =
   | 'IMAGE_UPSTREAM_FAILED'
   | 'IMAGE_UPSTREAM_RATE_LIMITED'
   | 'IMAGE_UPSTREAM_REJECTED_FORMAT'
   | 'IMAGE_UPSTREAM_REJECTED_IMAGE'
   | 'IMAGE_UPSTREAM_REJECTED_MODERATION'
   | 'IMAGE_UPSTREAM_REJECTED'
-function classifyImageUpstreamFailure(status: number, bytes: Buffer): ImageUpstreamFailureCode {
+export function classifyImageUpstreamFailure(status: number, bytes: Buffer): ImageUpstreamFailureCode {
   if (status === 429) return 'IMAGE_UPSTREAM_RATE_LIMITED'
   if (status >= 500) return 'IMAGE_UPSTREAM_FAILED'
   let body = ''
@@ -460,7 +463,7 @@ export function image429RetryDelayMs(headers: Headers): number | null {
   return Number.isFinite(ms) && ms >= 0 && ms <= 2_000 ? Math.max(100, ms) : null
 }
 
-async function waitForImageRetry(ms: number, signal: AbortSignal): Promise<void> {
+export async function waitForImageRetry(ms: number, signal: AbortSignal): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     if (signal.aborted) return reject(new DOMException('image request aborted', 'AbortError'))
     const onAbort = () => {
@@ -577,7 +580,7 @@ async function spoolBailianCodexResponseBody(req: IncomingMessage): Promise<{
   }
 }
 
-async function readBoundedResponseBody(response: Response, maxBytes = 64 * 1024 * 1024): Promise<Buffer> {
+export async function readBoundedResponseBody(response: Response, maxBytes = 64 * 1024 * 1024): Promise<Buffer> {
   const length = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(length) && length > maxBytes) throw new Error('image response body too large')
   if (!response.body) return Buffer.alloc(0)
@@ -668,29 +671,32 @@ function clampImageCount(raw: unknown): number {
 /**
  * Normalize a native imagegen request (POST /images/generations|edits) for the
  * metered data plane. Unlike the annotated internal endpoint, the model owns
- * the request; we only enforce model=gpt-image-2, clamp n into [1,4] so billing
+ * the request; we only enforce that the model is in the allowlist (OCV5-587,
+ * default gpt-image-2) and forward it unchanged, clamp n into [1,4] so billing
  * is bounded (50×n), and derive a content digest used as the idempotency key
  * (codex has no stable x-request-id — an identical retry hashes the same and
  * replays the cached result instead of re-charging).
  */
-async function normalizeNativeImageRequest(
+export async function normalizeNativeImageRequest(
   body: Buffer,
   contentType: string | undefined,
-): Promise<{ body: BodyInit; contentType: string | null; imageCount: number; digest: Buffer }> {
+  policy: ImageModelPolicy,
+): Promise<{ body: BodyInit; contentType: string | null; imageCount: number; digest: Buffer; model: string }> {
+  const unsupported = () => new Error(`only model=${[...policy.allowed].join('|')} is supported`)
   if ((contentType ?? '').toLowerCase().includes('application/json')) {
     const parsed = JSON.parse(body.toString('utf8')) as Record<string, unknown>
-    if (parsed.model !== 'gpt-image-2') throw new Error('only model=gpt-image-2 is supported')
+    if (typeof parsed.model !== 'string' || !policy.allowed.has(parsed.model)) throw unsupported()
+    const model = parsed.model
     const imageCount = clampImageCount(parsed.n)
-    parsed.model = 'gpt-image-2'
     parsed.n = imageCount
     const digest = createHash('sha256').update('native\0json\0', 'utf8').update(stableStringify(parsed), 'utf8').digest()
-    return { body: JSON.stringify(parsed), contentType: 'application/json', imageCount, digest }
+    return { body: JSON.stringify(parsed), contentType: 'application/json', imageCount, digest, model }
   }
   const form = await new Response(new Uint8Array(body), { headers: { 'content-type': contentType ?? '' } }).formData()
   const models = form.getAll('model')
-  if (models.length !== 1 || models[0] !== 'gpt-image-2') throw new Error('only model=gpt-image-2 is supported')
+  if (models.length !== 1 || typeof models[0] !== 'string' || !policy.allowed.has(models[0])) throw unsupported()
+  const model = models[0]
   const imageCount = clampImageCount(form.get('n'))
-  form.set('model', 'gpt-image-2')
   form.set('n', String(imageCount))
   // Digest over sorted (field, value) pairs + file bytes — boundary-independent,
   // so two logically identical multipart retries hash the same. Blobs are
@@ -706,7 +712,7 @@ async function normalizeNativeImageRequest(
     if (typeof val === 'string') hash.update(val, 'utf8')
     else hash.update(Buffer.from(await val.arrayBuffer()))
   }
-  return { body: form, contentType: null, imageCount, digest: hash.digest() }
+  return { body: form, contentType: null, imageCount, digest: hash.digest(), model }
 }
 
 type AnnotatedImageRequest = {
@@ -718,6 +724,8 @@ type AnnotatedImageRequest = {
   // annotated 携带用户 mask;outpaint 无 mask,改带 outpaint.aspect(relay 合成)。
   maskBase64?: string
   outpaint?: { aspect: OutpaintAspect }
+  /** Optional explicit model (OCV5-587); must be in the relay allowlist. */
+  model?: string
 }
 
 export function parseAnnotatedImageRequest(body: Buffer): AnnotatedImageRequest {
@@ -730,6 +738,7 @@ export function parseAnnotatedImageRequest(body: Buffer): AnnotatedImageRequest 
     || (value.width ?? 0) < 1 || (value.height ?? 0) < 1
     || (value.width ?? 0) * (value.height ?? 0) > 16_777_216
     || typeof value.sourceBase64 !== 'string'
+    || (value.model !== undefined && (typeof value.model !== 'string' || !IMAGE_MODEL_RE.test(value.model)))
   ) {
     throw new Error('invalid annotated image request')
   }
@@ -804,6 +813,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
   })
   const fetchImpl = deps.fetchImpl ?? fetch
   const image2Enabled = deps.image2Enabled ?? process.env.OC_IMAGE2_ENABLED === 'true'
+  const imageModelPolicy = deps.imageModelPolicy ?? parseImageModelPolicy(process.env, (msg) => log.warn(msg))
   const imageAttempts = new Map<string, number[]>()
   let activeImageHeavyWork = 0
 
@@ -914,6 +924,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           nativeNormalized = await normalizeNativeImageRequest(
             await readBoundedBody(req),
             typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined,
+            imageModelPolicy,
           )
         } catch (err) {
           sendJsonError(res, 400, 'INVALID_IMAGE_REQUEST', err instanceof Error ? err.message : 'invalid image request', requestId)
@@ -965,6 +976,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           userId: BigInt(identity.userId), containerId: identity.containerId,
           requestId: preflightImageRequestId, jobId: preflightJobId,
           operation: preflightOperation, imageCount: preflightImageCount,
+          model: nativeNormalized?.model ?? imageModelPolicy.editDefault,
         })
         didInsertImageReservation = true
         if (!imageUsage.alreadyCharged) {
@@ -1143,6 +1155,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let imageRequestContentType: string | null = null
     let imageRequestId: string | null = null
     let imageOperation: 'annotated_edit' | 'native_image' | null = null
+    // Native requests carry their own (allowlisted) model; annotated edits may name
+    // one explicitly, otherwise the configured edit default (OCV5-587).
+    let imageModel: string = nativeNormalized?.model ?? imageModelPolicy.editDefault
     let annotatedJob: ImageEditJob | null = null
     let annotatedPrepared: Awaited<ReturnType<typeof prepareImageEdit>> | null = null
     let outpaintPrepared: Awaited<ReturnType<typeof prepareImageOutpaint>> | null = null
@@ -1204,6 +1219,10 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         if (isAnnotatedImageRequest) {
           const input = parseAnnotatedImageRequest(await readBoundedBody(req, 80 * 1024 * 1024))
           if (input.jobId !== preflightJobId) throw new Error('annotated image job id mismatch')
+          if (input.model !== undefined && !imageModelPolicy.allowed.has(input.model)) {
+            throw new Error(`only model=${[...imageModelPolicy.allowed].join('|')} is supported`)
+          }
+          imageModel = input.model ?? imageModelPolicy.editDefault
           const source = await decodeValidatedImageBase64(input.sourceBase64)
           if (!source) throw new Error('source is not a valid image')
           const normalizedSource = await sharp(source).rotate().png().toBuffer({ resolveWithObject: true })
@@ -1222,7 +1241,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           let preparedApi: string
           if (input.outpaint) {
             const inputHash = createHash('sha256')
-              .update('gpt-image-2\0outpaint\0', 'utf8')
+              .update(`${imageModel}\0outpaint\0`, 'utf8')
               .update(`${input.outpaint.aspect}\0`, 'utf8')
               .update(`${input.width}x${input.height}\0`, 'utf8')
               .update(input.prompt.trim(), 'utf8')
@@ -1251,7 +1270,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
               || maskMeta.format !== 'png'
             ) throw new Error('source and mask dimensions differ')
             const inputHash = createHash('sha256')
-              .update('gpt-image-2\0annotated_edit\0', 'utf8')
+              .update(`${imageModel}\0annotated_edit\0`, 'utf8')
               .update(`${input.width}x${input.height}\0`, 'utf8')
               .update(input.prompt.trim(), 'utf8')
               .update('\0', 'utf8')
@@ -1291,7 +1310,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
             .png()
             .toBuffer()
           imageRequestBody = JSON.stringify({
-            model: 'gpt-image-2',
+            model: imageModel,
             prompt: input.prompt.trim(),
             n: 1,
             size: preparedApi,
@@ -1542,6 +1561,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           jobId: annotatedJob?.jobId ?? null,
           operation: imageOperation!,
           imageCount: preflightImageCount,
+          model: imageModel,
           responseBody,
         })
         if (imageReservation) {
