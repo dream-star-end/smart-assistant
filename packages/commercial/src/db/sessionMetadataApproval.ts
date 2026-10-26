@@ -42,6 +42,17 @@ export async function patchSessionMetadataInTx(runner: QueryRunner, id: string, 
   if (expectedXmin !== undefined) { params.push(expectedXmin); cas = ` AND xmin::text=$${params.length}` }
   const written = await query<Row>(`UPDATE client_sessions SET ${sets.join(',')} WHERE id=$${idParam} AND user_id=$${idParam + 1} AND deleted_at IS NULL${cas} RETURNING ${fields}`, params, runner)
   if (!written.rows[0]) { if (expectedXmin !== undefined) throw new SessionMetadataConflict(); return { ok: false, error: 'not_found' } }
+  // OCV5-624: rehome session-scoped project_assets with the session's new project.
+  if (patch.projectId !== undefined) {
+    await query(
+      `UPDATE project_assets
+          SET project_id = $1,
+              updated_at = GREATEST(updated_at + 1, (floor(EXTRACT(EPOCH FROM clock_timestamp())*1000))::BIGINT)
+        WHERE user_id = $2 AND session_id = $3 AND deleted_at IS NULL`,
+      [patch.projectId, owner, id],
+      runner,
+    )
+  }
   const fresh = snapshot(written.rows[0])
   return { ok: true, updatedAt: fresh.updatedAt, version: fresh.version }
 }

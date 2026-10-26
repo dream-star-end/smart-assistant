@@ -749,3 +749,47 @@ describe('searchChatProjectAssets(project_search)', () => {
     assert.equal(latest[0]?.digest, DIGEST_B)
   })
 })
+
+
+describe('OCV5-624 move session rehomes project_assets', () => {
+  beforeEach(clearTables)
+
+  it('patchClientSessionMeta(projectId) updates assets that still point at null/old project', async () => {
+    const proj = await createChatProject(USER, { name: 'MoveHome' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    await upsertClientSession(baseSession('sess-move-out'))
+    const orphan = await createProjectAsset(USER, {
+      source: 'output',
+      name: 'pomodoro.html',
+      containerPath: '/home/agent/.openclaude/generated/pomodoro.html',
+      sessionId: 'sess-move-out',
+    })
+    assert.equal(orphan.ok, true)
+    if (!orphan.ok) return
+    assert.equal(orphan.asset.projectId, null)
+    assert.equal((await listProjectAssets(USER, { projectId: null })).some((a) => a.id === orphan.asset.id), true)
+    assert.equal((await listProjectAssets(USER, { projectId: proj.project.id })).length, 0)
+
+    const moved = await patchClientSessionMeta('sess-move-out', USER, { projectId: proj.project.id })
+    assert.equal(moved.ok, true)
+    const inProj = await listProjectAssets(USER, { projectId: proj.project.id })
+    assert.equal(inProj.length, 1)
+    assert.equal(inProj[0]!.id, orphan.asset.id)
+    assert.equal(inProj[0]!.projectId, proj.project.id)
+    assert.equal((await listProjectAssets(USER, { projectId: null })).some((a) => a.id === orphan.asset.id), false)
+
+    const other = await createChatProject(USER, { name: 'OtherHome' })
+    assert.equal(other.ok, true)
+    if (!other.ok) return
+    const rem = await patchClientSessionMeta('sess-move-out', USER, { projectId: other.project.id })
+    assert.equal(rem.ok, true)
+    assert.equal((await listProjectAssets(USER, { projectId: proj.project.id })).length, 0)
+    assert.deepEqual((await listProjectAssets(USER, { projectId: other.project.id })).map((a) => a.id), [orphan.asset.id])
+
+    const ungroup = await patchClientSessionMeta('sess-move-out', USER, { projectId: null })
+    assert.equal(ungroup.ok, true)
+    assert.deepEqual((await listProjectAssets(USER, { projectId: null })).map((a) => a.id), [orphan.asset.id])
+    assert.equal((await listProjectAssets(USER, { projectId: other.project.id })).length, 0)
+  })
+})
