@@ -5,7 +5,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/staticAssetsPool.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -38,7 +38,7 @@ afterEach(() => {
 })
 
 /** webRoot(当前版本)+ 资产池,各放若干文件。 */
-function fixture(): { webRoot: string; pool: string } {
+function fixture(): { webRoot: string; pool: string; base: string } {
   const base = mkdtempSync(join(tmpdir(), 'oc-assets-pool-'))
   tmpDirs.push(base)
   const webRoot = join(base, 'dist')
@@ -52,7 +52,7 @@ function fixture(): { webRoot: string; pool: string } {
   writeFileSync(join(pool, 'assets', 'Settings-old.js'), 'previous release chunk')
   writeFileSync(join(pool, 'assets', 'shared.js'), 'pool shared (older copy)')
   writeFileSync(join(pool, 'assets', 'Settings-old.js.map'), '{"sourcesContent":["SECRET"]}')
-  return { webRoot, pool }
+  return { webRoot, pool, base }
 }
 
 /** 只借原型方法(同 staticFileCache.test.ts),手工注入 deps 与缓存 Map。 */
@@ -70,39 +70,63 @@ function get(h: ThisParameterType<typeof serveWebStatic>, path: string): { serve
 }
 
 describe('staticFileCandidates', () => {
-  const opts = { webRoot: '/srv/dist', staticMode: 'spa' as const, assetsPool: '/srv/pool' }
-
-  it('spa /assets: webRoot first, then the pool', () => {
-    assert.deepEqual(staticFileCandidates('/assets/a-1.js', opts), [
-      '/srv/dist/assets/a-1.js',
-      '/srv/pool/assets/a-1.js',
+  it('spa /assets: webRoot first, then the pool when the pooled file really exists there', () => {
+    const { webRoot, pool } = fixture()
+    const opts = { webRoot, staticMode: 'spa' as const, assetsPool: pool }
+    assert.deepEqual(staticFileCandidates('/assets/Settings-old.js', opts), [
+      join(webRoot, 'assets', 'Settings-old.js'),
+      join(pool, 'assets', 'Settings-old.js'),
     ])
+    assert.deepEqual(staticFileCandidates('/assets/missing-1.js', opts), [join(webRoot, 'assets', 'missing-1.js')])
   })
 
   it('no pool configured, a non-/assets path, or vanilla mode: webRoot only (unchanged)', () => {
-    assert.deepEqual(staticFileCandidates('/assets/a-1.js', { ...opts, assetsPool: undefined }), [
-      '/srv/dist/assets/a-1.js',
+    const { webRoot, pool } = fixture()
+    const opts = { webRoot, staticMode: 'spa' as const, assetsPool: pool }
+    assert.deepEqual(staticFileCandidates('/assets/Settings-old.js', { ...opts, assetsPool: undefined }), [
+      join(webRoot, 'assets', 'Settings-old.js'),
     ])
-    assert.deepEqual(staticFileCandidates('/index.html', opts), ['/srv/dist/index.html'])
-    assert.deepEqual(staticFileCandidates('/sw.js', opts), ['/srv/dist/sw.js'])
-    assert.deepEqual(staticFileCandidates('/assets/a-1.js', { ...opts, staticMode: 'vanilla' }), [
-      '/srv/dist/assets/a-1.js',
+    assert.deepEqual(staticFileCandidates('/index.html', opts), [join(webRoot, 'index.html')])
+    assert.deepEqual(staticFileCandidates('/assets/Settings-old.js', { ...opts, staticMode: 'vanilla' }), [
+      join(webRoot, 'assets', 'Settings-old.js'),
     ])
   })
 
-  it('spa /assets/*.map is always 404 (null); vanilla keeps serving it as before', () => {
-    assert.equal(staticFileCandidates('/assets/a-1.js.map', opts), null)
-    assert.equal(staticFileCandidates('/assets/a-1.css.MAP', opts), null)
+  it('spa: any .map is null, also after normalising (trailing slash, ..); vanilla keeps serving it', () => {
+    const opts = { webRoot: '/srv/dist', staticMode: 'spa' as const }
+    for (const path of ['/assets/a-1.js.map', '/assets/a-1.css.MAP', '/assets/a-1.js.map/', '/assets/x/../a-1.js.map', '/a.map']) {
+      assert.equal(staticFileCandidates(path, opts), null, path)
+    }
     assert.deepEqual(staticFileCandidates('/assets/a-1.js.map', { ...opts, staticMode: 'vanilla' }), [
       '/srv/dist/assets/a-1.js.map',
     ])
   })
 
-  it('never escapes webRoot or the pool assets dir', () => {
+  it('never escapes webRoot or the pool assets dir by path', () => {
+    const { webRoot, pool } = fixture()
+    const opts = { webRoot, staticMode: 'spa' as const, assetsPool: pool }
     assert.deepEqual(staticFileCandidates('/assets/../../../etc/passwd', opts), [])
-    // 前缀相同的兄弟目录(/srv/pool/assets-evil)不算池内。
-    assert.deepEqual(staticFileCandidates('/assets/../assets-evil/x.js', opts), [
-      '/srv/dist/assets-evil/x.js',
+    // 前缀相同的兄弟目录(<pool>/assets-evil)不算池内;webRoot 侧沿用原有包含语义。
+    mkdirSync(join(pool, 'assets-evil'))
+    writeFileSync(join(pool, 'assets-evil', 'x.js'), 'evil')
+    assert.deepEqual(staticFileCandidates('/assets/../assets-evil/x.js', opts), [join(webRoot, 'assets-evil', 'x.js')])
+  })
+
+  it('never escapes the pool through a symlink (Codex r1 P1)', () => {
+    const { webRoot, pool, base } = fixture()
+    const opts = { webRoot, staticMode: 'spa' as const, assetsPool: pool }
+    mkdirSync(join(pool, 'assets-evil'))
+    writeFileSync(join(pool, 'assets-evil', 'private.txt'), 'PRIVATE')
+    writeFileSync(join(base, 'secret.txt'), 'SECRET')
+    symlinkSync(join(pool, 'assets-evil'), join(pool, 'assets', 'escape'))
+    symlinkSync(join(base, 'secret.txt'), join(pool, 'assets', 'leak.js'))
+    assert.deepEqual(staticFileCandidates('/assets/escape/private.txt', opts), [join(webRoot, 'assets', 'escape', 'private.txt')])
+    assert.deepEqual(staticFileCandidates('/assets/leak.js', opts), [join(webRoot, 'assets', 'leak.js')])
+    // 池内互指的符号链接照常可用。
+    symlinkSync(join(pool, 'assets', 'Settings-old.js'), join(pool, 'assets', 'alias.js'))
+    assert.deepEqual(staticFileCandidates('/assets/alias.js', opts), [
+      join(webRoot, 'assets', 'alias.js'),
+      join(pool, 'assets', 'alias.js'),
     ])
   })
 })
@@ -136,6 +160,18 @@ describe('serveWebStatic with an assets pool (spa)', () => {
     const h = host({ webRoot, staticMode: 'spa', webAssetsPool: pool })
     assert.equal(get(h, '/assets/main-new.js.map').served, false)
     assert.equal(get(h, '/assets/Settings-old.js.map').served, false)
+    // Codex r1 P1:尾斜杠曾绕过拦截(resolve 会去掉它再读盘)。
+    assert.equal(get(h, '/assets/main-new.js.map/').served, false)
+    assert.equal(get(host({ webRoot, staticMode: 'spa' }), '/assets/main-new.js.map/').served, false)
+  })
+
+  it('a symlink inside the pool cannot serve a file from outside it', () => {
+    const { webRoot, pool, base } = fixture()
+    writeFileSync(join(base, 'secret.txt'), 'SECRET')
+    symlinkSync(join(base, 'secret.txt'), join(pool, 'assets', 'leak.js'))
+    const { served, res } = get(host({ webRoot, staticMode: 'spa', webAssetsPool: pool }), '/assets/leak.js')
+    assert.equal(served, false)
+    assert.equal(res.body.toString().includes('SECRET'), false)
   })
 
   it('without a pool: unchanged — current files and SPA navigation still served, old chunk not', () => {

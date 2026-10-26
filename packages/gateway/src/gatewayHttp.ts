@@ -340,8 +340,8 @@ export function _handleHttpAfterCommercial(
 /**
  * 静态 web UI(含 /admin 302 与 SPA 回退)。true = 已响应;false = 交给调用方 404。
  * 自 _handleHttpAfterCommercial 原样抽出以便单测(OCV5-632);在原逻辑上只多两件事,
- * 规则都在 staticFileCandidates:spa 下 /assets/* 在 webRoot 未命中时回落资产池,
- * spa 下 /assets/*.map 一律 404。未配置资产池时与抽出前逐字一致。
+ * 规则都在 staticFileCandidates:spa 下 /assets/* 在 webRoot 未命中时回落资产池(按真实路径
+ * 判包含),spa 下 .map 一律 404(路径归一后判)。未配置资产池时除 .map 外与抽出前逐字一致。
  */
 export function serveWebStatic(
   this: Pick<GatewayHttpHost, 'deps' | '_serveStaticCached'>,
