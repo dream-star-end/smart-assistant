@@ -21,9 +21,12 @@ const serverSrc = readGatewaySource()
 const routeSrc = readFileSync(join(here, '../routes/appConfig.ts'), 'utf8')
 
 describe('GET /api/features', () => {
-  it('body shape: { features: { chips, recipeSchedule, unfiledSuggest } } from env', () => {
+  it('body shape: { features: { chips, recipeSchedule, unfiledSuggest, timelineShadow } } from env', () => {
     const body = { features: readServerFeatures({ OC_P5_CHIPS: 'on', OC_P5_RECIPE_SCHEDULE: 'TRUE' }) }
-    assert.deepEqual(body, { features: { chips: true, recipeSchedule: true, unfiledSuggest: false } })
+    // OCV5-630 added timelineShadow to SERVER_FEATURE_ENV; unset here, so it reads off.
+    assert.deepEqual(body, {
+      features: { chips: true, recipeSchedule: true, unfiledSuggest: false, timelineShadow: false },
+    })
     assert.deepEqual(JSON.parse(JSON.stringify(body)), body)
   })
 
