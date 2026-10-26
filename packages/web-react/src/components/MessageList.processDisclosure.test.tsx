@@ -731,7 +731,10 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("最终回答在外面").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("延迟加载的最终回答留在外面，过程里的延迟行仍会挂上读取入口", async () => {
+  // OCV5-627: 行为有意改变(原用例断言收起态也挂隐藏读取入口,见 5dbcec5bf):收起的过程不再
+  // 下载 >1 MiB 定位桩,展开后才挂读取入口;最终回答在外面,照旧直接取。
+  test("延迟加载的最终回答留在外面；过程里的延迟行收起时不取，展开后才挂读取入口", async () => {
+    const onFetchTapeRecordPayload = vi.fn(() => new Promise<ChatMessage[] | null>(() => {}));
     const messages: ChatMessage[] = [
       row("u", "user", "看记录", { status: "replied" }),
       row("stage", "assistant", "可见阶段", { _clientMessageId: "u" }),
@@ -755,15 +758,24 @@ describe("MessageList Manus 过程披露", () => {
         _recordOrdinal: 9,
       }),
     ];
-    const view = renderList(messages);
+    const view = renderList(messages, { cb: { onFetchTapeRecordPayload } });
     await waitFor(() => {
-      expect(screen.getAllByText(/真实/).length).toBeGreaterThanOrEqual(2);
+      expect(screen.getAllByText(/真实/).length).toBeGreaterThanOrEqual(1);
     });
     expect(screen.queryByText("deferred-hidden-tool")).not.toBeInTheDocument();
-    const outside = screen.getAllByText(/真实/).filter((node) => !node.closest("[data-testid=process-disclosure]"));
-    expect(outside.length).toBeGreaterThanOrEqual(1);
+    const fetchedOrdinals = () => onFetchTapeRecordPayload.mock.calls.map((call) => (call as unknown[])[1]);
+    expect(fetchedOrdinals()).toEqual([9]);
+    expect(screen.queryByTestId("process-deferred-hydrate")).toBeNull();
+    for (const node of screen.getAllByText(/真实/)) {
+      expect(node.closest("[data-testid=process-disclosure]")).toBeNull();
+    }
 
     fireEvent.click(screen.getByTestId("process-toggle"));
+    await waitFor(() => {
+      expect(fetchedOrdinals()).toContain(4);
+    });
+    const inside = screen.getAllByText(/真实/).filter((node) => node.closest("[data-testid=process-disclosure]"));
+    expect(inside.length).toBeGreaterThanOrEqual(1);
     const hydrated = messages.map((message) =>
       message.id === "mid" ? { ...message, _payloadDeferred: undefined, text: "水合后的阶段说明" } : message,
     );
@@ -773,7 +785,7 @@ describe("MessageList Manus 过程披露", () => {
         messages={hydrated}
         sending={false}
         sessionId="session-a"
-        cb={{}}
+        cb={{ onFetchTapeRecordPayload }}
         onRespondPermission={() => {}}
       />,
     );
