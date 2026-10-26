@@ -4410,3 +4410,24 @@ describe("P2b entry freeze: user-chat-bridge account status", () => {
     });
   }
 });
+
+// P2b entry freeze B8 (docs/ARCH_P2B_FUND_ENTRY_GATES.md §6.3/§6.4): the bridge does not check the
+// Origin header today. The bearer token travels in the WebSocket subprotocol, not a cookie, so a
+// cross-site page cannot ride an ambient session. Frozen as a known gap; enforcing Origin is a
+// separate product/security change and flips this case.
+describe("P2b entry freeze: user-chat-bridge Origin", () => {
+  test("known gap: a foreign Origin with a valid bearer subprotocol is accepted", async () => {
+    const rig = await startRig();
+    try {
+      const containerOpen = waitNextContainerSocket(rig);
+      const ws = new WebSocket(`ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`, ["bearer", await makeJwt("903")], {
+        origin: "https://evil.example",
+      });
+      await containerOpen;
+      assert.equal(ws.readyState, WebSocket.OPEN);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+});
