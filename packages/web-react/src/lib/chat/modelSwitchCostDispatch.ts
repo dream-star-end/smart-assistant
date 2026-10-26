@@ -98,3 +98,6 @@ export function commitAuthorizedModelSwitchDispatch(
   if (committed) void committed.then(ready, failed)
   else ready()
 }
+
+/** 用户在「切换中…」时点取消：在途压缩切换撤回，保留原模型。 */
+export const MODEL_SWITCH_CANCELLED_MESSAGE = '已取消切换，仍保留原模型'

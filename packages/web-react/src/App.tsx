@@ -920,6 +920,7 @@ export function App() {
 
   const {
     applyCollabDoc,
+    cancelModelSwitch,
     collabAsDefault,
     collabEpochRef,
     collabMode,
@@ -2262,7 +2263,10 @@ export function App() {
           selectedModelId={modelId}
           onSelectModel={selectModel}
           onLockedSelect={demo ? undefined : handleLockedSelect}
-          modelsLoading={modelsLoading || modelSwitchPreparing}
+          // 已有模型列表时的后台重拉不锁选择器、不显示「切换中…」：拉取无超时，
+          // 弱网下会一直挂着，看起来就是切模型卡死。
+          modelsLoading={(modelsLoading && models.length === 0) || modelSwitchPreparing}
+          onCancelModelSwitch={modelSwitchPreparing ? cancelModelSwitch : undefined}
           effortSupported={effortSupported}
           effortActive={effortActive}
           onSelectEffort={demo ? undefined : setSessionEffort}

@@ -121,7 +121,10 @@ const PATTERNS: Array<{
     // Match that canonical text as well as structured proxy/Codex variants so
     // the gateway can retire the poisoned native resume instead of retrying it
     // forever as an upstream outage.
-    re: /PROMPT_TOO_LONG|\bprompt is too long\b|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
+    // ANTIGRAVITY_PROMPT_TOO_LARGE: the adapter refused a prompt that still
+    // exceeds the CLI stdin limit after history was trimmed to fit, i.e. the
+    // current message itself is too long for this model.
+    re: /PROMPT_TOO_LONG|\bANTIGRAVITY_PROMPT_TOO_LARGE\b|\bprompt is too long\b|ran out of room in the model(?:'|’)s context window|context window (?:was )?(?:exceeded|too long)/i,
     code: 'context_too_long',
     message: '上下文长度超过模型上限',
   },

@@ -505,3 +505,61 @@ describe("legacy size card compatibility stays exact", () => {
     expect(view.detail).toBe(`请求 ID：${requestId}`);
   });
 });
+
+describe("引擎/路由内部码不外露(t1049u)", () => {
+  const raw = "ANTIGRAVITY_PROMPT_TOO_LARGE: 371964 bytes > 307200";
+
+  test("旧 tape:Antigravity 超限 ENGINE_ERROR 原文 → 上下文超限人话,原文不进正文/详情", () => {
+    const p = errorPresentation("ENGINE_ERROR", raw, raw);
+    expect(p.title).toBe("会话内容超出模型上限");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("context_too_long"));
+    expect(p.bodyText).toBeUndefined();
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toMatch(/ANTIGRAVITY|bytes|307200/);
+  });
+
+  test("新 tape:context_too_long + 原文 detail → 详情只留请求 ID", () => {
+    const requestId = "0123456789abcdef0123456789abcdef";
+    const p = errorPresentation("context_too_long", "", `${raw} request id: ${requestId}`);
+    expect(p.title).toBe("会话内容超出模型上限");
+    expect(p.detail).toBe(`请求 ID：${requestId}`);
+  });
+
+  test("其它适配器内部码(无正文失败轮,text == detail)→ 通用人话,不当部分回答", () => {
+    for (const code of [
+      "CURSOR_SAND_SESSION_EXPIRED",
+      "MODEL_SWITCH_IN_PROGRESS: session busy",
+      "Error: GROK_ROUTE_REQUIRED: missing master-owned route",
+      "engine reported an error",
+    ]) {
+      const p = errorPresentation("ENGINE_ERROR", code, code);
+      expect(p.title).toBe("任务执行失败");
+      expect(p.bodyText).toBeUndefined();
+      expect(p.message).toContain("你的消息已保留");
+      expect(p.message).not.toContain(code);
+      if (/_/.test(code)) expect(JSON.stringify(p)).not.toContain(code.replace(/^Error: /, "").split(":")[0]);
+    }
+  });
+
+  test("终止器里夹内部码 → 详情脱敏;纯 prose 终止器仍保留(回归)", () => {
+    const p = errorPresentation("upstream_failed", "[turn failed: ZCODE_RELAY_MISSING]", undefined);
+    expect(p.detail).toBeUndefined();
+    expect(JSON.stringify(p)).not.toContain("ZCODE_RELAY_MISSING");
+    const prose = errorPresentation("upstream_failed", "[turn failed: model overloaded]", undefined);
+    expect(prose.detail).toBe("[turn failed: model overloaded]");
+  });
+
+  test("单行合法部分回答以环境变量名开头或含字节对比 → 仍作 bodyText 保留(Codex r1)", () => {
+    for (const answer of ["OPENAI_API_KEY: 用于配置 API 密钥。", "缓冲区为 4096 bytes > 1024 bytes，所以需要扩容。"]) {
+      const p = errorPresentation("engine_error", answer, "upstream disconnected");
+      expect(p.bodyText).toBe(answer);
+    }
+  });
+
+  test("多行合法部分回答提到环境变量名 → 仍作 bodyText 保留", () => {
+    const answer = "先设置 OPENAI_API_KEY:\n然后重启服务。";
+    const p = errorPresentation("engine_error", answer, "CURSOR_SAND_DOWNSTREAM_CLOSED");
+    expect(p.bodyText).toBe(answer);
+    expect(p.detail).toBeUndefined();
+  });
+});
