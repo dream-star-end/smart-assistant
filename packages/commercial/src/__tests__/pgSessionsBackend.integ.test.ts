@@ -796,6 +796,43 @@ describe("pgSessionsBackend contract", () => {
     assert.ok(searched.results.some((result) => result.sessionId === sessionId));
   });
 
+  maybe("OCV5-624 会话移入/移出项目时 project_assets 跟随(已删与他人会话的不动)", async () => {
+    await backend.upsertClientSession(mkSession({ id: "s-624", userId: "u-1" }));
+    await backend.upsertClientSession(mkSession({ id: "s-624-other", userId: "u-1" }));
+    const created = await backend.createChatProject("u-1", { name: "迁入" });
+    assert.equal(created.ok, true);
+    if (!created.ok) return;
+    const asset = (id: string, sessionId: string, deletedAt: number | null) =>
+      pool.query(
+        `INSERT INTO project_assets (id, user_id, project_id, source, session_id, name, container_path, created_at, updated_at, deleted_at)
+         VALUES ($1, 'u-1', NULL, 'output', $2, $1, '/workspace/' || $1, 1, 1, $3)`,
+        [id, sessionId, deletedAt],
+      );
+    // project_assets has no FK to client_sessions, so the per-test reset does not clear it.
+    try {
+      await asset("a-624-live", "s-624", null);
+      await asset("a-624-deleted", "s-624", 5);
+      await asset("a-624-other", "s-624-other", null);
+      const projectOf = async () =>
+        Object.fromEntries(
+          (await pool.query<{ id: string; project_id: string | null }>(
+            "SELECT id, project_id FROM project_assets WHERE id LIKE 'a-624-%'",
+          )).rows.map((r) => [r.id, r.project_id]),
+        );
+
+      assert.equal((await backend.patchClientSessionMeta("s-624", "u-1", { projectId: created.project.id })).ok, true);
+      assert.deepEqual(await projectOf(), { "a-624-live": created.project.id, "a-624-deleted": null, "a-624-other": null });
+
+      assert.equal((await backend.patchClientSessionMeta("s-624", "u-1", { pinned: true })).ok, true);
+      assert.equal((await projectOf())["a-624-live"], created.project.id, "不改 projectId 的 patch 不动资产");
+
+      assert.equal((await backend.patchClientSessionMeta("s-624", "u-1", { projectId: null })).ok, true);
+      assert.deepEqual(await projectOf(), { "a-624-live": null, "a-624-deleted": null, "a-624-other": null });
+    } finally {
+      await pool.query("DELETE FROM project_assets WHERE id LIKE 'a-624-%'");
+    }
+  });
+
   maybe("chat_projects CRUD + 删项目只解绑会话 + list 派生 runState", async () => {
     await backend.upsertClientSession(mkSession({ id: "s-proj-1" }));
     const created = await backend.createChatProject("u-1", { name: "  工作  ", color: "blue" });
