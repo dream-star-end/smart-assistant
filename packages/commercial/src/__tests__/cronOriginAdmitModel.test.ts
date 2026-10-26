@@ -79,6 +79,7 @@ function fakeAdmitted(input: AdmitUserTurnInput): AdmitUserTurnResult {
     workspaceMode: "legacy",
     takeover: false,
     dispatch: {
+      traceId: input.traceId ?? null,
       dispatchId: input.dispatchId,
       userId: input.uid,
       sessionId: input.sessionId,

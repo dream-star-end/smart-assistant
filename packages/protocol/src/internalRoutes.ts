@@ -93,6 +93,7 @@ export const AUTO_DREAM_OPTIMIZER_SETTLE_PATH = '/internal/v3/auto-dream/settle'
 export const AUTO_DREAM_OPTIMIZER_ABANDON_PATH = '/internal/v3/auto-dream/abandon'
 export const AUTO_DREAM_OPTIMIZER_FINDINGS_PATH = '/internal/v3/auto-dream/findings'
 export const AUTO_DREAM_OPTIMIZER_ACTION_PATH = '/internal/v3/auto-dream/action'
+export const DELEGATE_TRACE_PATH = '/internal/v3/delegate/trace'
 export const DELEGATE_ENGINE_BILLING_ADMIT_PATH = '/internal/v3/delegate/engine-billing/admit'
 export const DELEGATE_ENGINE_BILLING_SETTLE_PATH = '/internal/v3/delegate/engine-billing/settle'
 export const DELEGATE_ENGINE_BILLING_ABANDON_PATH = '/internal/v3/delegate/engine-billing/abandon'
@@ -436,6 +437,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/autoDreamOptimizerClient.ts', 'commercial/src/http/internalAutoDreamOptimizer.ts'],
+  },
+  {
+    path: DELEGATE_TRACE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/delegateTrace.ts', 'commercial/src/http/internalDelegateTrace.ts'],
   },
   {
     path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
