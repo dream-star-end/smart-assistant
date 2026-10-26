@@ -57,8 +57,14 @@ export async function settleMiniMaxMediaSuccess(
     // P2b P6 (OCV5-631), same as F8 in settleUsageAndLedger: take the wallet row locks before the
     // INSERT. Its user_id foreign key share-locks the users row; taking FOR UPDATE only afterwards
     // (in spendTwoBucket) let two concurrent settles of one user deadlock on the lock upgrade.
+    // lockSpendRows only locks the org while it is active and runs twice in this transaction, so
+    // lock the paying org row first regardless of status, as F8 does: an org suspended and resumed
+    // between the two calls would otherwise be locked after users (users → orgs, 40P01).
     const spendOrgId = orgCtx?.billingEnabled ? orgCtx.orgId : undefined
     if (input.cost.costCredits > 0n) {
+      if (spendOrgId !== undefined) {
+        await client.query('SELECT 1 FROM orgs WHERE id = $1::bigint FOR UPDATE', [spendOrgId])
+      }
       await lockSpendRows(client, { userId: input.userId, orgId: spendOrgId })
     }
 
