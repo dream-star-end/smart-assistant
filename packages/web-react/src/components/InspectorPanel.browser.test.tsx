@@ -3,8 +3,8 @@
  * 窗口显示地址 / 标题 / 截图,操作记录可切换、可进步骤详情;不在顶层轮里的浏览器步退回步骤页。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { loadBeforeAll } from "../test/moduleLoad";
 import { InspectorPanelContent, PANE_TAB_STORAGE_KEY } from "./InspectorPanel";
@@ -134,6 +134,74 @@ describe("浏览器页", () => {
     );
     await browserReady();
     expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveTextContent("3");
+  });
+
+  describe("大截图定位桩由面板自己补取(OCV5-629:收起的过程不再替面板预取)", () => {
+    // 只留第一轮:浏览器步在最新一轮里。b1 / b2 是 >1 MiB 的定位桩(序号 3 / 4),b3 仍是普通行。
+    const stub = (id: string, ordinal: number): ChatMessage =>
+      ({ id, role: "tool", text: "", ts: TS, _payloadDeferred: true, _turnTapeId: "tape-1", _recordOrdinal: ordinal }) as ChatMessage;
+    function stubbed(ids: Record<string, number> = { b1: 3, b2: 4 }) {
+      const full = session().slice(0, 6);
+      const messages = full.map((m) => (m.id in ids ? stub(m.id, ids[m.id] as number) : m));
+      const fetch = vi.fn(async (_tape: string, ordinal: number) => {
+        const hit = full.find((m) => ids[m.id] === ordinal);
+        return hit ? [hit] : null;
+      });
+      return { messages, fetch };
+    }
+    const ordinals = (fetch: ReturnType<typeof stubbed>["fetch"]) => fetch.mock.calls.map((call) => call[1]).sort();
+
+    test("冷加载停在「浏览器」页且这一轮浏览器步全是定位桩:先给读取态、不退回产出,补取后列出", async () => {
+      localStorage.setItem(PANE_TAB_STORAGE_KEY, "browser");
+      const { messages, fetch } = stubbed({ b1: 3, b2: 4, b3: 5 });
+      render(<InspectorPanelContent messages={messages} deferredLoader={{ fetch }} onClose={() => {}} />);
+      expect(screen.getByTestId("browser-hydrating")).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveAttribute("aria-selected", "true");
+      await browserReady();
+      expect(screen.queryByTestId("browser-hydrating")).toBeNull();
+      expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveTextContent("3");
+      expect(screen.getAllByTestId("browser-log-row")).toHaveLength(3);
+      expect(ordinals(fetch)).toEqual([3, 4, 5]);
+    });
+
+    test("停在产出页:后台补取完成后「浏览器」分区计入大截图步", async () => {
+      const { messages, fetch } = stubbed();
+      render(<InspectorPanelContent messages={messages} deferredLoader={{ fetch }} onClose={() => {}} />);
+      await screen.findByTestId(/^outputs-(view|empty)$/);
+      await waitFor(() => expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveTextContent("3"));
+      expect(screen.getByRole("tab", { name: /产出/ })).toHaveAttribute("aria-selected", "true");
+      expect(ordinals(fetch)).toEqual([3, 4]);
+    });
+
+    test("补取失败:每条只取一次、重渲染不重取;取完仍没有浏览器步就退回产出", async () => {
+      localStorage.setItem(PANE_TAB_STORAGE_KEY, "browser");
+      const { messages } = stubbed({ b1: 3, b2: 4, b3: 5 });
+      const fetch = vi.fn(async () => null);
+      const { rerender } = render(<InspectorPanelContent messages={messages} deferredLoader={{ fetch }} onClose={() => {}} />);
+      await screen.findByTestId(/^outputs-(view|empty)$/);
+      expect(screen.queryByTestId("browser-hydrating")).toBeNull();
+      expect(screen.queryByRole("tab", { name: /浏览器/ })).toBeNull();
+      expect(fetch).toHaveBeenCalledTimes(3);
+      rerender(<InspectorPanelContent messages={[...messages]} deferredLoader={{ fetch }} onClose={() => {}} />);
+      await screen.findByTestId(/^outputs-(view|empty)$/);
+      expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    test("步骤页正在自取的那一条不重复发起,其余定位桩照常补取", async () => {
+      const { messages, fetch } = stubbed();
+      render(
+        <InspectorPanelContent
+          messages={messages}
+          request={{ tab: "steps", message: messages[2], nonce: 1 }}
+          deferredLoader={{ fetch }}
+          onClose={() => {}}
+        />,
+      );
+      await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(ordinals(fetch)).toEqual([3, 4]);
+    });
   });
 
   test("不在顶层轮里的浏览器步(子任务等)退回步骤详情", () => {
