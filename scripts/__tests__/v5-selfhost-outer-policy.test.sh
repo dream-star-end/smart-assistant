@@ -133,6 +133,7 @@ release_policy_keep_failed() { trace "KEEP:$3"; return "$3"; }
 release_policy_finalize_forward() { trace UNEXPECTED_FINALIZE; return 97; }
 oc_hotcfg_gc() { trace UNEXPECTED_GC; return 97; }
 wo_gc_buckets() { trace UNEXPECTED_GC; return 97; }
+web_assets_pool_gc() { trace UNEXPECTED_GC; return 97; }
 egress_slot_unit() { printf 'fixture-egress-%s.%s' "$1" "$2"; }
 # cmd_cutover's external master-GC script must never resolve to a real script.
 # The caller body is unchanged: its SCRIPT_DIR dependency is sandbox-owned.
