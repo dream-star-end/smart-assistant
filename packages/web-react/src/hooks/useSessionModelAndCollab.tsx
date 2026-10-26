@@ -246,11 +246,44 @@ export function useSessionModelAndCollab({
           ? (opts?.advisorModel ?? collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
           : null;
       const asDefault = opts?.asDefault === true;
-      if(!demo&&auth&&activeId&&modelId&&mode!==collabUi.mode&&authorizeSwitch){
-        const authorization=await authorizeSwitch({sessionId:activeId,requestId:mintMsgId(),targetModel:modelId,agentId:agent.id,
-          ...(cursorModelSupportsContextTier(modelId)&&getSwitchOptions?.().contextTier?{contextTier:getSwitchOptions!().contextTier}:{}),
-          ...(supportsFastServiceTier(modelId)&&getSwitchOptions?.().serviceTier?{serviceTier:getSwitchOptions!().serviceTier}:{}),teamMode:mode==='team'}, {primeNextTurn:true,isCurrent:()=>activeModelSwitchSessionRef.current===activeId&&collabEpochRef.current===epoch});
-        if(!authorization)return;
+      // Leaving team must not wait on model-switch cost consent. The chip「关闭团队模式」
+      // previously called authorizeSwitch(teamMode:false) against the remembered solo
+      // model while the last turn ran as Astra; canceling "切换模型?" aborted before
+      // optimistic UI, so the session stayed on team/Astra (OCV5-623 / UX C01).
+      // Entering team (or other upgrades) still primes consent; the next solo send
+      // authorizes on its own frame.
+      const leavingTeam = collabUi.mode === "team" && mode !== "team";
+      if (
+        !demo &&
+        auth &&
+        activeId &&
+        modelId &&
+        mode !== collabUi.mode &&
+        authorizeSwitch &&
+        !leavingTeam
+      ) {
+        const authorization = await authorizeSwitch(
+          {
+            sessionId: activeId,
+            requestId: mintMsgId(),
+            targetModel: modelId,
+            agentId: agent.id,
+            ...(cursorModelSupportsContextTier(modelId) && getSwitchOptions?.().contextTier
+              ? { contextTier: getSwitchOptions!().contextTier }
+              : {}),
+            ...(supportsFastServiceTier(modelId) && getSwitchOptions?.().serviceTier
+              ? { serviceTier: getSwitchOptions!().serviceTier }
+              : {}),
+            teamMode: mode === "team",
+          },
+          {
+            primeNextTurn: true,
+            isCurrent: () =>
+              activeModelSwitchSessionRef.current === activeId &&
+              collabEpochRef.current === epoch,
+          },
+        );
+        if (!authorization) return;
       }
       // Optimistic mode only; configVersion stays empty until the server returns it.
       setCollabUi((cur) => ({ ...cur, mode, advisorModel, configVersion: "" }));

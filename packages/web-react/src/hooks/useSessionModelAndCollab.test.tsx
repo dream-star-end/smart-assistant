@@ -110,3 +110,44 @@ test('a newer click fences the old conflict reread before it can retry', async (
   expect(put).toHaveBeenCalledTimes(2)
   expect(f.result.current.collabUi.configVersion).toBe('v3:team')
 })
+
+
+test('leaving team skips model-switch consent so「关闭团队模式」cannot abort to Astra (OCV5-623)', async () => {
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('team', 1))
+  const put = vi.spyOn(api, 'putCollaborationConfig').mockResolvedValue(doc('solo', 2))
+  const authorizeSwitch = vi.fn(async () => null)
+  const f = setup()
+  f.rerender({
+    ...f.input,
+    modelId: 'gpt-6.1-sol',
+    authorizeSwitch,
+    sessions: [{ id: 'own', title: 't', ownerUserId: 'u', updatedAt: '', messageCount: 1 }],
+  } as SessionModelAndCollabInput)
+  await waitFor(() => expect(f.result.current.collabUi.rev).toBe(1))
+  expect(f.result.current.collabMode).toBe('team')
+  await act(() => f.result.current.setTeamMode(false))
+  expect(authorizeSwitch).not.toHaveBeenCalled()
+  expect(put).toHaveBeenCalledTimes(1)
+  expect(put.mock.calls[0][1]).toMatchObject({ sessionId: 'own', mode: 'solo' })
+  expect(f.result.current.collabMode).toBe('solo')
+  expect(f.result.current.teamMode).toBe(false)
+})
+
+test('entering team still asks model-switch consent (OCV5-623)', async () => {
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  const put = vi.spyOn(api, 'putCollaborationConfig').mockResolvedValue(doc('team', 2))
+  const authorizeSwitch = vi.fn(async () => null)
+  const f = setup()
+  f.rerender({
+    ...f.input,
+    modelId: 'gpt-6.1-sol',
+    authorizeSwitch,
+    sessions: [{ id: 'own', title: 't', ownerUserId: 'u', updatedAt: '', messageCount: 1 }],
+  } as SessionModelAndCollabInput)
+  await waitFor(() => expect(f.result.current.collabUi.rev).toBe(1))
+  await act(() => f.result.current.setTeamMode(true))
+  expect(authorizeSwitch).toHaveBeenCalledTimes(1)
+  expect(authorizeSwitch.mock.calls[0][0]).toMatchObject({ teamMode: true, targetModel: 'gpt-6.1-sol' })
+  expect(put).not.toHaveBeenCalled()
+  expect(f.result.current.collabMode).toBe('solo')
+})
