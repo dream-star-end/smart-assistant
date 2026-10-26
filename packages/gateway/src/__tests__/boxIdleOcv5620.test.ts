@@ -4,7 +4,9 @@
  * Does not weaken idleAbandonReason's "prepared summary never abandoned" rule.
  */
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { utimesSync } from 'node:fs'
+import { createServer, type Server } from 'node:http'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,10 +22,17 @@ import {
   idleOpSettled,
   readIdleCandidate,
   readIdleOp,
+  readPendingIdle,
   writeIdleCandidate,
   writeIdleOp,
   type IdleOp,
 } from '../boxIdleCompact.js'
+import { SessionManager } from '../sessionManager.js'
+
+const finish = (SessionManager.prototype as unknown as {
+  finishIdleUnderLock: (this: object, session: object, source: { sessionId: string; turnKey: string },
+    recoveryDir?: string) => Promise<void>
+}).finishIdleUnderLock
 
 const revision = 'ab'.repeat(32)
 const sourceTurn = 'cd'.repeat(32)
@@ -135,5 +144,61 @@ describe('OCV5-620 idle apply-stuck (pure)', () => {
     const read = readIdleCandidate(dir, sessionKey)
     assert.equal(read?.createdAt, createdAt)
     assert.equal(idleCandidateAgedOut(read!, Date.now()), true)
+  })
+})
+
+/** Local proof endpoint answering every lookup with the same body. */
+async function pendingProofServer() {
+  const server: Server = createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status: 'pending', reason: 'unsettled' }))
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('no port')
+  const keys = ['ANTHROPIC_BASE_URL', 'OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN',
+    'OC_BOX_IDLE_PROOF_WAIT_MS'] as const
+  const before = keys.map((key) => process.env[key])
+  process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${address.port}/`
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = process.env.ANTHROPIC_BASE_URL
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.test-token'
+  process.env.OC_BOX_IDLE_PROOF_WAIT_MS = '0'
+  return async () => {
+    keys.forEach((key, i) => { if (before[i] === undefined) delete process.env[key]; else process.env[key] = before[i] })
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+}
+
+describe('OCV5-620 finishIdleUnderLock with a source proof that stays pending', () => {
+  test('a pending op still settles once apply-stuck after the candidate already aged out (Codex r1 P1)', async () => {
+    const dir = await tempDir()
+    const close = await pendingProofServer()
+    try {
+      const op = stuckOp()
+      writeIdleOp(dir, op)
+      const path = join(dir, 'idle-ops', encodeURIComponent(sessionKey), `${revision}.json`)
+      const age = (ms: number) => { const t = (Date.now() - ms) / 1000; utimesSync(path, t, t) }
+      age(IDLE_APPLY_STUCK_MS - 60_000)
+      writeIdleCandidate(dir, { v: 1, sessionKey, sessionId, turnKey: sourceTurn,
+        createdAt: Date.now() - IDLE_CANDIDATE_STUCK_MS - 60_000 })
+      const session = { sessionKey, runner: new EventEmitter() }
+      const source = { sessionId, turnKey: sourceTurn }
+
+      await finish.call({}, session, source, dir)
+      assert.equal(readIdleCandidate(dir, sessionKey), undefined, 'aged-out candidate cleared')
+      assert.equal(idleOpSettled(readIdleOp(dir, sessionKey, revision)!), false, 'op not stuck yet')
+
+      age(IDLE_APPLY_STUCK_MS + 60_000)
+      await finish.call({}, session, source, dir)
+      const settled = readIdleOp(dir, sessionKey, revision)!
+      assert.equal(settled.disposition, 'abandoned')
+      assert.equal(settled.abandonReason, 'idle_apply_stuck')
+      assert.equal(readPendingIdle(dir, sessionKey), undefined)
+    } finally {
+      await close()
+    }
   })
 })

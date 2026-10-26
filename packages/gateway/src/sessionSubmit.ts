@@ -2285,8 +2285,12 @@ export async function finishIdleUnderLock(
         proofStatus: proof.status,
       })
       clearIdleCandidate(recoveryDir, session.sessionKey)
-      if (pending) await settleStrandedIdleOp(session, pending, recoveryDir)
     }
+    // Once no candidate holds it, a pending op settles on its own evidence on
+    // every call, not only the one that aged the candidate out (Codex r1 P1:
+    // an op that became apply-stuck later stayed pending forever).
+    if (pending && !readIdleCandidate(recoveryDir, session.sessionKey))
+      await settleStrandedIdleOp(session, pending, recoveryDir)
     return
   }
   // Dispatch gate: a new op is created only when the leaf says the real
