@@ -56,7 +56,7 @@ export interface IdleOp {
    * never saw it after the grace window, or an operator reset replaced the
    * native session). Both settle the op. */
   disposition?: 'short' | 'abandoned'
-  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'operator_reset'
+  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'idle_apply_stuck' | 'operator_reset'
   /** Epoch ms when this process shut the CCB runner down after its idle turn
    * ended without a result (shutdown() returned). From then on that child
    * cannot send a compact request. */
@@ -367,6 +367,11 @@ export function advanceIdleOp(input: {
 /** After the idle CCB runner was shut down, egress must have seen any
  * request it sent within this window; a later `not_found` proves nothing was. */
 export const IDLE_STOPPED_GRACE_MS = 120_000
+/** OCV5-620: prepared summary+artifact without a matching receiptDigest longer
+ * than this → abandon as idle_apply_stuck so submit is not pinned forever. */
+export const IDLE_APPLY_STUCK_MS = 600_000
+/** OCV5-620: an idle candidate whose source proof never becomes terminal. */
+export const IDLE_CANDIDATE_STUCK_MS = 900_000
 /** Settled op files kept per session (newest by mtime). */
 export const IDLE_OPS_KEEP = 3
 
@@ -397,6 +402,30 @@ export function idleAbandonReason(op: IdleOp, idleProof: IdleProofResponse,
   if (idleProof.status === 'not_found' && typeof op.runnerKilledAt === 'number'
     && now - op.runnerKilledAt >= IDLE_STOPPED_GRACE_MS) return 'idle_turn_never_sent'
   return undefined
+}
+
+/**
+ * OCV5-620 (uid4 apply-stuck): a prepared summary + assembled artifact that
+ * never got a matching loader receipt. idleAbandonReason deliberately skips
+ * ops with summaryText (prepared summaries are not abandoned as turn_failed);
+ * this separate path ages them out by op-file mtime so IDLE_HISTORY_PENDING
+ * cannot pin the session forever. Healthy idle still settles via receipt.
+ */
+export function idleApplyStuckReason(dir: string, op: IdleOp,
+  now: number = Date.now()): 'idle_apply_stuck' | undefined {
+  if (idleOpSettled(op) || !op.summaryText || !op.artifact) return undefined
+  if (op.receiptDigest === op.artifact.digest) return undefined
+  const written = mtimeOf(opPath(dir, op))
+  if (written <= 0 || now - written < IDLE_APPLY_STUCK_MS) return undefined
+  return 'idle_apply_stuck'
+}
+
+/** True when a candidate has been waiting longer than IDLE_CANDIDATE_STUCK_MS. */
+export function idleCandidateAgedOut(candidate: IdleSourceCandidate,
+  now: number = Date.now()): boolean {
+  const t = candidate.createdAt
+  return typeof t === 'number' && Number.isSafeInteger(t) && t > 0
+    && now - t >= IDLE_CANDIDATE_STUCK_MS
 }
 
 /**

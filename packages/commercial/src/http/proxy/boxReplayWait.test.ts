@@ -20,8 +20,19 @@ test("the wait is bounded by its budget and keeps the pending answer", async () 
   const out = await waitForBoxReplay<R>({ kind: "pending" }, async () => { lookups++; return { kind: "pending" }; },
     { budgetMs: 10_000, intervalMs: 3_000, signal: new AbortController().signal, ...c });
   assert.equal(out.kind, "pending");
-  assert.equal(lookups, 3);
+  // loop: 3 sleeps @3s while now+interval<=deadline, then OCV5-620 final lookup
+  assert.equal(lookups, 4);
   assert.ok(c.now() <= 10_000);
+});
+
+test("OCV5-620: a ready that lands on the final post-budget lookup is preferred", async () => {
+  const c = clock();
+  const seq: R[] = [{ kind: "pending" }, { kind: "pending" }, { kind: "pending" }, { kind: "ready" }];
+  let lookups = 0;
+  const out = await waitForBoxReplay<R>({ kind: "pending" }, async () => { lookups++; return seq.shift()!; },
+    { budgetMs: 10_000, intervalMs: 3_000, signal: new AbortController().signal, ...c });
+  assert.equal(out.kind, "ready");
+  assert.equal(lookups, 4);
 });
 
 test("non-pending results and a gone client never wait", async () => {

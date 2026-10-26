@@ -674,6 +674,11 @@ function looksLikeInternalError(value: string | undefined): boolean {
   );
 }
 
+/** OCV5-620: end-of-turn 409 BOX_REPLAY_PENDING after work/charge — not a hard failure. */
+function isBoxReplayPendingDetail(...values: Array<string | undefined>): boolean {
+  return values.some((v) => typeof v === "string" && /BOX_REPLAY_PENDING/.test(v));
+}
+
 /**
  * 「查看详情」detail 统一守卫(Codex 审计 R7)。新 tape 码(model_capacity 等)可能携带 Codex 的
  * JSON errorDetail;若无条件透传就会绕过 engine_error 特判直接进 <pre> 外泄。规则:
@@ -836,6 +841,23 @@ export function errorPresentation(
   // Reclassify only that exact diagnostic; keep genuine partial answers.
   if (isLegacyRequestTooLargeDiagnostic(normalized, text)) {
     return errorPresentation("request_too_large", text, detail, false);
+  }
+  // OCV5-620 (#dc9288ca): BOX_REPLAY_PENDING means the prior Box call is still
+  // settling / billing-gated — work and charge may already be done. Prefer a
+  // soft card (keep any partial answer) over pink「任务执行失败」.
+  if (isBoxReplayPendingDetail(text, detail)) {
+    const rawText = text?.trim() ?? "";
+    const { body: preTerminator } = splitTrailingTerminator(rawText);
+    const partialAnswer =
+      preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+    return {
+      title: "结果正在收尾",
+      message:
+        "远端结果仍在确认中。已生成的内容已保留；稍后刷新即可看到完整结果，不会重复扣费。",
+      ...(partialAnswer ? { bodyText: partialAnswer } : {}),
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: false,
+    };
   }
   // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
   // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
