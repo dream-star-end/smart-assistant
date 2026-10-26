@@ -426,6 +426,34 @@ describe("settleUsageAndLedger — org 打戳与扣费桶", () => {
     assert.equal(led.rows[0].org_id, null);
   });
 
+  test("P2b F8: billing_enabled=false 成员结算与该成员经办的 org 充值并发,两边都成功(无 orgs/users 锁环)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("m-f8@x.com", 100_000n);
+    const orgId = await makeOrg(0n);
+    await addMember(orgId, uid, "admin", false);
+    for (let i = 0; i < 10; i++) {
+      const order = await createOrgTopupOrder({ orgId, operatorUserId: uid, amountCents: 100n });
+      const [settled, paid] = await Promise.allSettled([
+        settleUsageAndLedger(getPool(), {
+          userId: BigInt(uid),
+          accountId: null,
+          requestId: `req-org-f8-${i}`,
+          model: "test-model",
+          usage: usage(),
+          snapshotJson: "{}",
+          costCredits: 10n,
+          status: "success",
+          sessionId: null,
+        }),
+        markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 100n }),
+      ]);
+      assert.equal(settled.status, "fulfilled", `iteration ${i}: ${settled.status === "rejected" ? String(settled.reason) : ""}`);
+      assert.equal(paid.status, "fulfilled", `iteration ${i}: ${paid.status === "rejected" ? String(paid.reason) : ""}`);
+    }
+    assert.equal(await userCredits(uid), 100_000n - 100n);
+    assert.equal(await orgCredits(orgId), 1000n);
+  });
+
   test("非成员:org_id NULL,纯个人扣费", async (t) => {
     if (skipIfNoPg(t)) return;
     const uid = await createUser("loner@x.com", 1000n);

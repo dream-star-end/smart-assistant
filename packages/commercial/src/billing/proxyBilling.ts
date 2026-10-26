@@ -38,7 +38,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
-import { spendTwoBucket } from "./spend.js";
+import { spendTwoBucket, lockSpendRows } from "./spend.js";
 import { resolveBoardProjectAttribution } from "./boardProjectAttribution.js";
 import { lockTurnBillingKeys } from "./turnLock.js";
 import { resolveOrgBillingContext } from "../org/orgBilling.js";
@@ -861,6 +861,22 @@ export async function settleUsageAndLedger(
     // 打戳 usage_records.org_id(**与扣费桶解耦**:只看成员是否在 org,无论钱从哪个桶扣);
     // billing_enabled=true 才让 org 钱包参与扣费(下面 spendTwoBucket 传 orgId)。
     const orgCtx = await resolveOrgBillingContext(client, args.userId);
+    const spendOrgId = orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined;
+    const spends = args.status === "success" && settledCostCredits > 0n;
+    // P2b F8: take the wallet row locks before INSERT usage_records. That INSERT's user_id foreign
+    // key share-locks the users row; taking FOR UPDATE only afterwards (in spendTwoBucket) let two
+    // concurrent settles of one user deadlock on the lock upgrade. Its org_id foreign key also
+    // locks the stamped org, so that row goes first (orgs → users): FOR UPDATE when the org pays,
+    // the same strength lockSpendRows takes, otherwise the KEY SHARE the INSERT would take.
+    if (spends) {
+      if (orgCtx) {
+        await client.query(
+          `SELECT 1 FROM orgs WHERE id = $1::bigint ${spendOrgId === undefined ? "FOR KEY SHARE" : "FOR UPDATE"}`,
+          [orgCtx.orgId],
+        );
+      }
+      await lockSpendRows(client, { userId: args.userId, orgId: spendOrgId });
+    }
     let usageId: bigint;
     let ledgerId: bigint | null = null;
     let clamped = false;
@@ -961,7 +977,7 @@ export async function settleUsageAndLedger(
       }
       throw err;
     }
-    if (args.status === "success" && settledCostCredits > 0n) {
+    if (spends) {
       // 双钱包扣费收口（0096）：先扣 period_credits 期内桶再扣 users.credits 持久钱包，
       // 各桶 FOR UPDATE 行锁串行化、按桶各写一条 credit_ledger（balance_after=该桶扣后值）。
       // 余额 < cost：不回滚 stream(已发字节回不来)，clamp 到总可用；status 仍 'success'，
@@ -976,7 +992,7 @@ export async function settleUsageAndLedger(
         memo: `cost=${settledCostCredits}`,
         // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时
         // spendTwoBucket 内 FOR UPDATE 会再兜底 fail-open 降级个人桶。
-        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
+        orgId: spendOrgId,
         // 成员月度 org 预算(§17.4):随 orgId 一并传入,org 桶超限静默落个人桶。
         monthlyOrgBudget: orgCtx && orgCtx.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
       });

@@ -48,7 +48,7 @@
 | F5 | 持锁期间另取连接池连接 | `getPlan()` 走根池（`subscription.ts:109-115`），在事务内调用于 `orders.ts:956,969`、`subscription.ts:362,414`；`enqueueAlert` 走池（`org/orgProvision.ts:80,117`） | 高并发履约时池耗尽而行锁不放；外层事务回滚但告警已提交 | 改为传 `client`；单独 PR |
 | F6 | 请求日志（journal）不在结算事务内 | `proxyBilling.ts:475`→`:305-319` 认领、`:555`→`:328-361` 终结，各自 autocommit；终结失败只记日志（`:563`） | 结算已提交、终结失败 → journal 停在 `finalizing`，靠对账器回收（本次未核对账器） | P2b 补核对账器覆盖；不改 |
 | F7 | 过期/取消订单的支付回调回“success”且不加款 | `http/payment.ts:~470-486`、`orders.ts:1010` | 用户在订单过期后完成支付：钱到账、积分未到，靠告警人工处理 | 产品决策项，登记不改 |
-| F8 | 同一用户并发扣费/豁免会死锁（40P01） | `usage_records.user_id`（`db/migrations/0002_init_billing.sql:56`）和 `turn_waivers.user_id`（`0167:78`）都外键引用 users：INSERT 先拿 users 行 `FOR KEY SHARE`，之后 `spend.ts:247` / `refund.ts:321` 要同一行 `FOR UPDATE`，两笔并发都卡在升级上 | T5 复现：同一用户 8 笔不同 request 并发结算，2026-10-26 一次运行里 7 笔被 PG 判死锁中止、只提交 1 笔。中止的那笔整体回滚，余额和流水仍一致，但这一笔没扣上费、没留 usage 行。个人版近 15 天日志里结算死锁 0 次（只有 2 次 tapeJobScheduler 的）；商业版没查（本线不碰 kl-mirror） | 实际锁序比登记的多了一步“先拿 users KEY SHARE”。可选：在 INSERT 前先锁 users 行，或在调用方对 40P01 重试。属行为改动，单独 PR |
+| F8 | 同一用户并发扣费/豁免会死锁（40P01） | `usage_records.user_id`（`db/migrations/0002_init_billing.sql:56`）和 `turn_waivers.user_id`（`0167:78`）都外键引用 users：INSERT 先拿 users 行 `FOR KEY SHARE`，之后 `spend.ts:247` / `refund.ts:321` 要同一行 `FOR UPDATE`，两笔并发都卡在升级上 | T5 复现：同一用户 8 笔不同 request 并发结算，2026-10-26 一次运行里 7 笔被 PG 判死锁中止、只提交 1 笔。中止的那笔整体回滚，余额和流水仍一致，但这一笔没扣上费、没留 usage 行。个人版近 15 天日志里结算死锁 0 次（只有 2 次 tapeJobScheduler 的）；商业版没查（本线不碰 kl-mirror） | **已修（个人版，2026-10-26 管家批准）**：新增 `billing/spend.ts` `lockSpendRows`，作为 orgs → org_subscriptions → users 三步取锁的唯一实现；`spendTwoBucket` 改为调用它，`settleUsageAndLedger` 在 INSERT usage_records 之前（仅在要扣费时）先调一次。登记的锁序不变，INSERT 时已持有更强的 users 锁。T5 收紧为 8 笔全部成功。没有加 40P01 重试，因为根因已消除。豁免侧由 F4 的按用户锁串行；`imageBilling`、`minimax/mediaBilling` 自带事务的变体没改（不在试点链路），P6 时对照。商业版另批 |
 
 ## 4. 目标规则（§4.3 落地，到试点/P6 才执行）
 
@@ -133,7 +133,7 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 | B1 | `packages/gateway/src/__tests__/authJwtFreeze.test.ts`：gateway `verifyJwt` 10 条冻结用例 | 本 PR，本地 10/10 |
 | B2 | 本文件：资金证据矩阵、缺口、隔离审计、入口登记 | 本 PR，待评审 |
 | B3 | `payment.integ.test.ts` 清 Redis 前拒绝 6379（§5 隔离缺口） | 本 PR |
-| T1–T5 | 资金原子性测试：T1 订单写到 orders→paid 时注入故障，整体回滚（`orders.integ.test.ts`）；T2 过期器与回调并发，两种结局都观察到（同上）；T3 管理员调账并发正/负，以及冻结 F2“重复提交记两次”（`ledger.integ.test.ts`）；T4 父子键并发豁免（`turnWaiver.integ.test.ts`，证实 F4；F4 修复后绿）；T5 同一用户不同 request 并发扣费（`settleUsageConcurrent.integ.test.ts`，只允许 40P01 失败，即 F8，已提交部分守恒） | T1/T2/T3/T5 绿；T4 在 F4 修复后转绿 |
+| T1–T5 | 资金原子性测试：T1 订单写到 orders→paid 时注入故障，整体回滚（`orders.integ.test.ts`）；T2 过期器与回调并发，两种结局都观察到（同上）；T3 管理员调账并发正/负，以及冻结 F2“重复提交记两次”（`ledger.integ.test.ts`）；T4 父子键并发豁免（`turnWaiver.integ.test.ts`，证实 F4；F4 修复后绿）；T5 同一用户不同 request 并发扣费（`settleUsageConcurrent.integ.test.ts`；F8 修复后要求全部成功） | T1/T2/T3/T5 绿；T4 在 F4 修复后转绿 |
 | B4–B7 | 入口冻结测试补缺（见 6.4） | `p2bEntryFreeze.test.ts` 7 条 + `userChatBridge.test.ts` 3 条 |
 | B8 | Origin“冻结不查”（bridge） | `userChatBridge.test.ts` 1 条 |
 | 登记表入库 | 把 6.2/6.3 落成机器可读的 `arch/entry-registry.json`（每条路由：校验器、查库、Origin、失败行为、负责人），配生成与 `--check` | 后续 PR（护栏变更单独 PR） |
