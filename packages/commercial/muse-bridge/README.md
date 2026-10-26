@@ -37,6 +37,11 @@ python3 muse_bridge.py start --server https://<个人版域名>
 - 个人版端的接口（`/api/muse-bridge/v1/*`）随 OCV5-561 实现。上线后由管理员签发 token，用户在 Muse VM 里执行 `set-token` 和 `start`。
 - 视频可以正常使用（02:34 实测：约 40 秒出一条 10 秒 mp4，约 10.7 MB）。生成超时默认 300 秒，上限 600 秒。只有 Muse 真正返回 `video_not_available` 时才报 `MUSE_VIDEO_REGION_BLOCKED`，不重试。
 
+## 0.5.3：心跳请求超时 20 秒 → 8 秒（2026-10-27）
+
+- VM 出口经中继、偶尔丢响应时，一次心跳最多卡 8 秒，下一次心跳照常发出。
+- 连续两次心跳都丢，仍能在 master 的失联窗口内留下一次存活信号，不会在上传中途被判 MUSE_BRIDGE_LOST。
+
 ## 0.5.2：源图下载断点续传（2026-10-26）
 
 - 个人版与商业版用同一个 bridge 文件（用户 2026-10-26 决定）。

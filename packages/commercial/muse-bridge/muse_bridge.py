@@ -52,7 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.5.2"
+BRIDGE_VERSION = "0.5.3"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -90,6 +90,12 @@ ASPECT_RATIOS = ("4:5", "7:12", "9:16")
 IMAGE_FORMATS = ("png", "jpg", "jpeg", "webp")
 POLL_HOLD_DEFAULT = 25
 HEARTBEAT_DEFAULT = 15
+# 0.5.3: one heartbeat request may take at most this long. Behind a relay that drops replies
+# (commercial Muse VM, 2026-10-26: "Remote end closed connection without response") a hung beat
+# held the job's heartbeat thread for 20 s, so two of them plus the 15 s interval (70 s) already
+# exceeded the master's lost-contact window and the job failed MUSE_BRIDGE_LOST mid-upload.
+# With 8 s, two lost beats in a row still leave a sign of life inside 60 s.
+HEARTBEAT_TIMEOUT_SEC = 8
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
@@ -772,7 +778,8 @@ class Client:
         return self._request("POST", "/poll", {}, timeout=hold + 15)
 
     def heartbeat(self, job):
-        return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
+        return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]},
+                             timeout=HEARTBEAT_TIMEOUT_SEC)
 
     def get_source(self, job, n, start, end):
         """Bytes start..end (inclusive) of source image n of an acked job (0.5).
