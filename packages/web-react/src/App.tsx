@@ -391,6 +391,8 @@ export function App() {
   const [bannersExpanded, setBannersExpanded] = useState(false);
   // UpdateBanner 自己订阅 governor,这里再订一份只为把它算进横幅栈的条数。
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
+  // 版本不一致即亮的顶栏 pill(OCV5-626);横幅出现时 governor 自己把它熄掉。
+  const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
   // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
@@ -2294,6 +2296,8 @@ export function App() {
           paneOpen={paneShown}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
+          updateAvailable={!demo && updatePillVisible}
+          onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
         />
         {!demo && auth && authRecoveryAvailable && <LazyBoundary fallback={null}>
           <IdentityRecoveryNotice onRetry={retryBoot} />
