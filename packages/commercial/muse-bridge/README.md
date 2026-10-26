@@ -32,24 +32,7 @@ python3 muse_bridge.py start --server https://<个人版域名>
 
 `try` 的其它选项：`--orientation square|vertical|landscape`、`--aspect-ratio 4:5|7:12|9:16`、`--format png|jpg|webp`（只限图片）、`--timeout 秒`。
 
-## 0.5.0：先确认任务，再下载源图（2026-10-25）
-
-新版 master 根据 hello 的 `bridge_version` 协商：≥ 0.5.0 的 poll 只含
-`source_refs: [{n, bytes, sha256, mime}]`，不带 base64；旧版或缺省版本仍收到内联
-`source_images`。0.5.0 bridge 也继续接受旧 master 的内联任务。
-
-bridge 先用 heartbeat 完成 ack，再从 `GET /api/muse-bridge/v1/jobs/:id/sources/:n`
-下载源图（原有 Bearer token、`X-Muse-Bridge-Session`、`X-Job-Nonce`）。每段 256 KiB，
-用 Range 请求，失败最多尝试 3 次；范围、长度、整图 SHA-256 和图片类型通过后才执行
-`--upload-only`。下载/校验失败正常上报 `MUSE_INVALID_INPUT`，网络下载失败标记可重试。
-源图只在 running 时可下载，完成、取消或旧 nonce 返回 410；下标越界 404、非法 Range 416。
-源字节在 finish 清理，响应不缓存。ack 超时日志的 `claimResponseBytes` 是 `{job}` JSON 的 UTF-8 字节数。
-
-聊天 `oc-muse --image` 每张上限 **3 MiB**，保护旧 bridge 尚未升级的窗口；bridge 协议
-每张 10 MiB 的能力保留。需要同时升级 master 与 VM bridge，引用路径才会启用；token 不用换。
-个人版保持单任务，不包含商业 0.4 的并发/计费扩展。商业同步时须将引用下载移入其并发 worker。
-
-## 当前能力
+## 当前状态（2026-10-22）
 
 - 个人版端的接口（`/api/muse-bridge/v1/*`）随 OCV5-561 实现。上线后由管理员签发 token，用户在 Muse VM 里执行 `set-token` 和 `start`。
 - 视频可以正常使用（02:34 实测：约 40 秒出一条 10 秒 mp4，约 10.7 MB）。生成超时默认 300 秒，上限 600 秒。只有 Muse 真正返回 `video_not_available` 时才报 `MUSE_VIDEO_REGION_BLOCKED`，不重试。

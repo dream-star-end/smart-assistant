@@ -48,11 +48,27 @@ class Pure(unittest.TestCase):
         with self.assertRaises(IOError) as c3:
             mb._check_binary_body(payload, H({}), "bytes=0-9", 10)
         self.assertIn("Content-Range", str(c3.exception))
-        expected = "bytes 0-9/100"
-        mb._check_binary_body(payload, ok_h, "bytes=0-9", 10, expected_content_range=expected)
-        with self.assertRaises(IOError) as c4:
-            mb._check_binary_body(payload, ok_h, "bytes=0-9", 10, expected_content_range="bytes 0-9/999")
-        self.assertIn("Content-Range mismatch", str(c4.exception))
+    def test_source_refs_validation(self):
+
+        sha = hashlib.sha256(PNG).hexdigest()
+        ref = {"n": 0, "bytes": len(PNG), "sha256": sha, "mime": "image/png"}
+        job = mb.validate_job({"id": "r", "kind": "video", "prompt": "x", "source_images": None, "source_refs": [ref]}, self.L)
+        self.assertEqual(job["source_refs"], [ref]); self.assertNotIn("source_images", job)
+        bad = [
+            {"source_images": [{"base64": b64(PNG)}], "source_refs": [ref]},
+            {"source_refs": []},
+            {"source_refs": [dict(ref, n=1)]},
+            {"source_refs": [dict(ref, bytes=0)]},
+            {"source_refs": [dict(ref, bytes=True)]},
+            {"source_refs": [dict(ref, bytes=self.L["source_max_bytes"] + 1)]},
+            {"source_refs": [dict(ref, sha256="ab")]},
+            {"source_refs": [dict(ref, mime="image/gif")]},
+            {"source_refs": [ref] * (self.L["max_source_images"] + 1)},
+        ]
+        for extra in bad:
+            with self.assertRaises(mb.JobError, msg=str(extra)[:80]) as c:
+                mb.validate_job(dict({"id": "r", "kind": "video", "prompt": "x"}, **extra), self.L)
+            self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
     def test_two_step_argv(self):
         job = mb.validate_job({"id": "e", "kind": "image", "prompt": "make it blue", "image_format": "png",
                                "source_images": [{"base64": b64(PNG)}, {"base64": b64(WEBP)}],
@@ -72,16 +88,6 @@ class Pure(unittest.TestCase):
             j = {"id": "a", "kind": "image", "prompt": "x"}; j.update(extra)
             with self.assertRaises(mb.JobError, msg=str(extra)[:60]) as c: mb.validate_job(j, self.L)
             self.assertEqual(c.exception.code, "MUSE_INVALID_INPUT")
-    def test_source_refs_validation(self):
-        ref = {"n": 0, "bytes": len(PNG), "sha256": hashlib.sha256(PNG).hexdigest(), "mime": "image/png"}
-        base = {"id": "refs", "kind": "image", "prompt": "x", "source_refs": [ref]}
-        self.assertEqual(mb.validate_job(base, self.L)["source_refs"], [ref])
-        for patch in ({"n": True}, {"n": 1}, {"bytes": 0}, {"bytes": self.L["source_max_bytes"] + 1},
-                      {"sha256": "bad"}, {"mime": "video/mp4"}):
-            with self.assertRaises(mb.JobError):
-                mb.validate_job(dict(base, source_refs=[dict(ref, **patch)]), self.L)
-        with self.assertRaises(mb.JobError):
-            mb.validate_job(dict(base, source_images=[{"base64": b64(PNG)}]), self.L)
     def test_upload_mapping(self):
         self.assertEqual(mb.map_upload_outcome(0, json.dumps({"image_ids": ["1", 2], "upload_count": 2}), "", 2), ["1", "2"])
         for rc, out, n in ((0, json.dumps({"image_ids": ["1"]}), 2), (0, json.dumps({"image_ids": ["a b"]}), 1),
@@ -118,6 +124,13 @@ class Pure(unittest.TestCase):
         self.assertEqual(code(0, "not json"), ("MUSE_BAD_OUTPUT", False))
         self.assertEqual(code(0, json.dumps({"ok": True, "media_paths": []})), ("MUSE_BAD_OUTPUT", False))
         self.assertEqual(code(0, "log line\n" + json.dumps({"ok": True, "media_paths": ["/a"]})), "OK")
+    def test_effective_slots(self):
+        self.assertEqual(mb.effective_slots(None, 10), 1, "a master that offers nothing gets one")
+        self.assertEqual(mb.effective_slots(10, 3), 3)
+        self.assertEqual(mb.effective_slots(2, 10), 2)
+        self.assertEqual(mb.effective_slots(64, 64), mb.MAX_CONCURRENCY_HARD)
+        for bad in (0, -1, True, "5", 2.5):
+            self.assertEqual(mb.effective_slots(bad, 10), 1, repr(bad))
     def test_server_limits_clamped(self):
         l = mb.effective_limits({"video_max_bytes": 10 ** 12, "chunk_bytes": "x", "max_files": 2})
         self.assertEqual(l["video_max_bytes"], mb.HARD_LIMITS["video_max_bytes"]); self.assertEqual(l["chunk_bytes"], 4 * mb.MIB)
@@ -138,6 +151,52 @@ class Pure(unittest.TestCase):
             mb.CliRunner("/nonexistent/cli").run({"id": "t", "kind": "image", "prompt": "x", "timeout_secs": 30}, tempfile.mkdtemp(), threading.Event())
         self.assertEqual(c.exception.code, "MUSE_CLI_MISSING")
 
+class Concurrent(unittest.TestCase):
+    """0.4.0: several jobs at once when both the master (hello max_concurrency) and --max-concurrency allow."""
+    @classmethod
+    def setUpClass(cls):
+        mm.S.max_concurrency = 3
+        cls.srv = mm.start(); cls.url = "http://127.0.0.1:%d" % cls.srv.server_port
+        cls.home = tempfile.mkdtemp(); os.chmod(cls.home, 0o700)
+        with open(os.path.join(cls.home, "token"), "w") as f: f.write(mm.TOKEN)
+        mm.S.session = None
+        cls.proc = subprocess.Popen([sys.executable, "-I", BRIDGE, "--state-dir", cls.home, "--cli", FAKE, "run",
+                                     "--server", cls.url, "--max-concurrency", "3"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(50):
+            if mm.S.session: break
+            time.sleep(0.2)
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.send_signal(signal.SIGTERM); cls.proc.wait(30)
+        # The mock's job queue is shared by every test class: let this bridge's in-flight polls
+        # (hold 2 s) expire so none of them takes the next class's first job.
+        time.sleep(3)
+        mm.S.max_concurrency = None; mm.S.session = None
+    def job(self, jid, prompt):
+        mm.S.jobs.put({"id": jid, "nonce": "n-" + jid, "kind": "image", "prompt": prompt}); return jid
+    def test_1_three_slots_run_in_parallel(self):
+        t0 = time.monotonic()
+        jids = [self.job("par%d" % i, "slow") for i in range(3)]
+        for jid in jids:
+            r = mm.wait_result(jid, 40); self.assertIsNotNone(r, jid); self.assertTrue(r["ok"], r)
+        # Each fake generation sleeps 6 s: one at a time would need 18 s.
+        self.assertLess(time.monotonic() - t0, 14)
+    def test_2_one_slot_poll_error_keeps_the_session(self):
+        hellos = mm.S.hellos; mm.S.poll_errors = 2
+        r = mm.wait_result(self.job("perr1", "ok"), 40); self.assertIsNotNone(r); self.assertTrue(r["ok"], r)
+        self.assertEqual(mm.S.hellos, hellos, "a 502 on one poll must not trigger a new hello")
+    def test_3_unknown_session_says_hello_again(self):
+        hellos = mm.S.hellos; mm.S.session_unknown = True
+        for _ in range(50):
+            if mm.S.hellos > hellos: break
+            time.sleep(0.2)
+        self.assertGreater(mm.S.hellos, hellos)
+        # The real master answers the old session's pending polls with nothing at hello; this mock
+        # does not, so let them expire (hold 2 s) before queueing the next job.
+        time.sleep(3)
+        r = mm.wait_result(self.job("after-hello", "ok"), 40); self.assertIsNotNone(r); self.assertTrue(r["ok"], r)
+
 class E2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -145,7 +204,9 @@ class E2E(unittest.TestCase):
         cls.home = tempfile.mkdtemp(); os.chmod(cls.home, 0o700)
         with open(os.path.join(cls.home, "token"), "w") as f: f.write(mm.TOKEN)
         cls.argvlog = os.path.join(cls.home, "argv.log")
-        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog)
+        # Own temp dir: other classes' bridges share /tmp, and test_10 must see only this one's jobs.
+        cls.tmp = os.path.join(cls.home, "tmp"); os.mkdir(cls.tmp, 0o700)
+        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog, TMPDIR=cls.tmp)
         open(cls.argvlog, "w").close()
         cls.proc = subprocess.Popen([sys.executable, "-I", BRIDGE, "--state-dir", cls.home, "--cli", FAKE, "run", "--server", cls.url],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
@@ -228,67 +289,49 @@ class E2E(unittest.TestCase):
         self.assertEqual(gen[gen.index("--resume-from-snapshot-id") + 1], "5421fa39-fc25:v6485l")
         conv = json.loads(gen[gen.index("--conversation-json") + 1])
         self.assertEqual(conv, [{"image": "1518875720082600"}, {"text": "same fox, new scene"}])
+    def ref_job(self, jid, data, **kw):
+        mm.S.sources[jid] = [data]
+        ref = {"n": 0, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mime": "image/webp"}
+        return self.job(jid, kind="video", prompt="the fox starts running", source_images=None, source_refs=[ref], **kw)
+    def test_07e_image_to_video_by_reference(self):
+        n0 = len(argv_lines(self.argvlog))
+        r = self.res(self.ref_job("ref1", WEBP))
+        self.assertTrue(r["ok"], r)
+        ev = [e for e in mm.S.events if e[1] == "ref1"]
+        self.assertEqual(ev[0], ("ack", "ref1"), "no source download before the ack")
+        # 64-byte Range requests (mock hello limits), in order, covering the whole file.
+        self.assertEqual([e[2] for e in ev[1:]], ["bytes=0-63", "bytes=64-%d" % (len(WEBP) - 1)])
+        calls = argv_lines(self.argvlog)[n0:]
+        self.assertEqual(len(calls), 2); self.assertIn("--upload-only", calls[0])
+    def test_07f_source_download_retried(self):
+        mm.S.src_flaky["ref2"] = 2
+        r = self.res(self.ref_job("ref2", WEBP), 40)
+        self.assertTrue(r["ok"], r)
+    def test_07f2_short_read_retried_then_ok(self):
+        # CDN/CF short body with matching Content-Range: bridge must retry, not fail once.
+        mm.S.src_short["ref2s"] = 2
+        r = self.res(self.ref_job("ref2s", WEBP), 60)
+        self.assertTrue(r["ok"], r)
+    def test_07g_source_download_failure_is_a_result(self):
+        n0 = len(argv_lines(self.argvlog))
+        mm.S.src_flaky["ref3"] = 99
+        # 8 chunk attempts with capped backoff can take ~40s+ of sleep alone.
+        r = self.res(self.ref_job("ref3", WEBP), 120)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
+    def test_07h_source_checksum_mismatch(self):
+        mm.S.src_corrupt.add("ref4")
+        r = self.res(self.ref_job("ref4", WEBP), 40)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+    def test_07i_content_range_mismatch_is_fetch_failed(self):
+        n0 = len(argv_lines(self.argvlog))
+        mm.S.src_bad_cr.add("ref5")
+        r = self.res(self.ref_job("ref5", WEBP), 120)
+        self.assertEqual((r["ok"], r["error_code"], r["retryable"]), (False, "MUSE_SOURCE_FETCH_FAILED", True))
+        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
     def test_07d_never_mixes_legacy_and_subagent(self):
         for call in argv_lines(self.argvlog):
             self.assertFalse(any(x in call for x in LEGACY) and any(x in call for x in SUBAGENT), call)
-    def refs_job(self, jid, data=PNG, **kw):
-        mm.S.sources[(jid, 0)] = data
-        ref = {"n": 0, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mime": "image/png"}
-        return self.job(jid, source_refs=[ref], **kw)
-    def test_07e_large_refs_ack_then_download_with_retry(self):
-        jid = "large-refs"
-        mm.S.source_flaky[jid] = 1
-        n0 = len(argv_lines(self.argvlog))
-        payload = PNG + b"x" * (3 * mb.MIB)
-        r = self.res(self.refs_job(jid, payload), 30)
-        self.assertTrue(r["ok"], r)
-        self.assertLess(mm.S.claim_bytes[jid], 512)
-        gets = [r for r in mm.S.source_requests if r[0] == jid]
-        # 1MiB chunks over ~3MiB → ≥3 ranges; +1 flaky retry on first range.
-        expect_min = (len(payload) + mb.SOURCE_CHUNK_BYTES - 1) // mb.SOURCE_CHUNK_BYTES
-        self.assertGreaterEqual(len(gets), expect_min + 1)
-        self.assertTrue(all(r[3] for r in gets), "all downloads must follow ack")
-        self.assertEqual(gets[0][2], gets[1][2], "retry the failed range only")
-        self.assertTrue(gets[0][2].startswith("bytes="), gets[0][2])
-        calls = argv_lines(self.argvlog)[n0:]
-        self.assertEqual(len(calls), 2)
-        self.assertIn("--upload-only", calls[0])
-    def test_07f_download_failures_report_result_without_cli(self):
-        for failure in ("network", "sha", "short", "ignored-range"):
-            jid = "refs-fail-" + failure
-            if failure == "network":
-                # Exhaust SOURCE_CHUNK_ATTEMPTS (was 3; harden raised to 8).
-                mm.S.source_flaky[jid] = mb.SOURCE_CHUNK_ATTEMPTS
-            else:
-                mm.S.source_bad[jid] = failure
-            n0 = len(argv_lines(self.argvlog))
-            # 8 chunk attempts with capped backoff can take ~40s+ of sleep alone.
-            r = self.res(self.refs_job(jid), 120)
-            self.assertEqual(r["error_code"], "MUSE_INVALID_INPUT", failure)
-            self.assertEqual(r["retryable"], failure != "sha", failure)
-            self.assertEqual(len(argv_lines(self.argvlog)), n0, "failed source must not reach CLI")
-    def test_07f2_short_read_retried_then_ok(self):
-        # CDN/CF short body with matching Content-Range: bridge must retry, not fail once.
-        jid = "refs-short-ok"
-        mm.S.source_short[jid] = 2
-        n0 = len(argv_lines(self.argvlog))
-        r = self.res(self.refs_job(jid), 60)
-        self.assertTrue(r["ok"], r)
-        self.assertGreater(len(argv_lines(self.argvlog)), n0)
-    def test_07i_content_range_mismatch_is_fetch_failed(self):
-        jid = "refs-bad-cr"
-        mm.S.source_bad_cr.add(jid)
-        n0 = len(argv_lines(self.argvlog))
-        r = self.res(self.refs_job(jid), 120)
-        self.assertEqual(r["error_code"], "MUSE_INVALID_INPUT")
-        self.assertTrue(r["retryable"])
-        self.assertEqual(len(argv_lines(self.argvlog)), n0, "CLI must not run without its source")
-    def test_07g_no_download_without_ack(self):
-        jid = "refs-no-ack"
-        mm.S.ack_gone.add(jid)
-        self.refs_job(jid)
-        self.assertTrue(self.res(self.job("after-refs-no-ack"))["ok"])
-        self.assertFalse(any(r[0] == jid for r in mm.S.source_requests))
     def test_08_cancel_via_heartbeat(self):
         mm.S.cancel.add("c1"); t0 = time.time()
         r = self.res(self.job("c1", prompt="sleep"), 30)
@@ -317,8 +360,8 @@ class E2E(unittest.TestCase):
     def test_10_tempdirs_cleaned(self):
         import glob
         # the result is posted before the job dir is removed, so give cleanup a moment
-        for _ in range(30):
-            left = glob.glob(os.path.join(tempfile.gettempdir(), "muse-job-*"))
+        for _ in range(100):
+            left = glob.glob(os.path.join(self.tmp, "muse-job-*"))
             if not left: break
             time.sleep(0.1)
         self.assertEqual(left, [])

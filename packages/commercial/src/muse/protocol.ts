@@ -61,6 +61,8 @@ export const BRIDGE_ERROR_CODES: ReadonlySet<string> = new Set([
   'MUSE_TIMEOUT',
   'MUSE_FILE_TOO_LARGE',
   'MUSE_INVALID_INPUT',
+  // Bridge >= 0.5.1 (commercial base): a source image that could not be downloaded after the ack.
+  'MUSE_SOURCE_FETCH_FAILED',
   'MUSE_CANCELLED',
   'MUSE_BRIDGE_LOST',
 ])
