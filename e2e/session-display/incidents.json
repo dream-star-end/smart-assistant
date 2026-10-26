@@ -8286,30 +8286,45 @@
       "coverageCommits": [
         "c71a59be",
         "3bf0f487",
-        "68e5d8b7"
+        "68e5d8b7",
+        "79eef834"
       ],
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
-          "assertion": "BroadcastChannel late joiner waits — holder answers busy; overlapping acquires serialize"
+          "assertion": "BroadcastChannel: late joiner waits — holder answers busy (Codex P1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: release during claim settle does not hang waiter (Codex r2 P1)"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/login.integ.test.ts",
-          "assertion": "reuse rotated refresh at 11s/40s (default grace=45) → REFRESH_RACE; 50s → still theft"
+          "assertion": "reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/auth/login.ts",
-          "assertion": "REFRESH_ROTATION_GRACE_SECONDS default 45 with env override; theft path unchanged"
+          "assertion": "REFRESH_ROTATION_GRACE_SECONDS_DEFAULT = 45"
         },
         {
           "layer": "unit",
           "path": "packages/web-react/src/lib/api/http.ts",
-          "assertion": "refresh network call wrapped in withCrossTabRefreshLock"
+          "assertion": "return withCrossTabRefreshLock(async (): Promise<RefreshOutcome> => {"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "OCV5-622 unit+integ cover grace widen + cross-tab lock; browser BootSplash dual-tab live proof deferred to post-ride canary",
+        "since": "2026-10-26"
+      }
     }
   ]
 }
