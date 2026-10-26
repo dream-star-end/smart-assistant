@@ -325,6 +325,12 @@
       "reason": "OCV5-538: Box CC reap() matched fifo readers with a readlink fork per host process (seconds under load), so bridge closes waited out the 2 s stop-exec timeout; root cause of the flaky OCV5-488 LARGE_LINE_CLOSE / LARGE_LINE_REFUSED_HOST_LEFT_RUNNING gate failures. Latent, no user report; the close window and the proof are unchanged. Unit test red without the fix.",
       "approvedBy": "user 2026-10-21 via 管家 「留意 OCV5-488 … 请查清为什么关闭慢，绝不能放宽这个检查」; cc3 full design authority 2026-10-20 20:26; Incident: none waiver per the rules (cc3-arch2 session)",
       "expiresAt": "2026-11-20"
+    },
+    {
+      "commit": "a05e6277a3bf1f89a8a63bbcdd9ce797cd0f10c7",
+      "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Cherry-picked from aurora 2896189a6 onto selfhost without image2Run/ImageStudio (paths absent). Not an incident fix.",
+      "approvedBy": "user/steward t1006u-t1007u 2026-10-26 media reverse-sync + full two-tree sync Batch0; standing personal green→merge OK after Grok OD",
+      "expiresAt": "2026-11-26"
     }
   ]
 }
