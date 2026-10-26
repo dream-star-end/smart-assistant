@@ -51,6 +51,7 @@ import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
+import { bindRouteTrace } from '../relayTrace.js'
 import {
   ANTIGRAVITY_PREAMBLE,
   cleanupAntigravityLaunch,
@@ -156,6 +157,8 @@ interface TurnContext {
   pendingResult: Record<string, unknown> | null
   resultTimer: NodeJS.Timeout | null
   keepalive: NodeJS.Timeout | null
+  /** Ends this turn's route-token trace binding for the container relay (OCV5-595). */
+  releaseRelayTrace: (() => void) | null
   sawOutput: boolean
   terminal: boolean
   procClosed: boolean
@@ -336,6 +339,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       pendingResult: null,
       resultTimer: null,
       keepalive: null,
+      releaseRelayTrace: null,
       sawOutput: false,
       terminal: false,
       procClosed: false,
@@ -480,6 +484,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.cleanupLaunch(ctx)
       return
     }
+    ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnChild(ctx, { bin: this.cliBin(), args, env, cwd: cwdDecision.cwd, line })
   }
 
@@ -998,6 +1003,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private cleanupLaunch(ctx: TurnContext): void {
+    // Every caller is the end of the turn's process, so its relay requests stop naming this turn too.
+    ctx.releaseRelayTrace?.()
+    ctx.releaseRelayTrace = null
     const projection = ctx.projection
     if (!projection) return
     ctx.projection = null
