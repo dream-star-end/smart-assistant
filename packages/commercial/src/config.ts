@@ -651,6 +651,12 @@ export const commercialConfigSchema = z
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
     */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
+     * OCV5-589 / D12 (2026-10-23): root-only (0600) file holding the media-only MiniMax key. Set → the
+     * media proxy reads only this file (never falling back to MINIMAX_TOKEN_PLAN_KEY, which stays with
+     * web search). Unset → MINIMAX_TOKEN_PLAN_KEY as before.
+     */
+    MINIMAX_MEDIA_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],
