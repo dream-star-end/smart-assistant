@@ -1107,7 +1107,7 @@ describe("MessageList 失败轮单一错误出口", () => {
           recoveryChild,
           mk("assistant", {
             id: "a-manual-recovery-final-error",
-            text: "恢复轮最终错误正文应显示",
+            text: "RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW",
             _clientMessageId: recoveryChild.id,
             _errorCode: "codex_route_unavailable",
           }),
@@ -1120,7 +1120,7 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(screen.getByText("你是什么模型")).toBeInTheDocument();
     expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
     expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
-    expect(screen.getByText("恢复轮最终错误正文应显示")).toBeInTheDocument();
+    expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
   });
 });
@@ -1154,10 +1154,10 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
 
   test("继续轮自己失败：只显示继续轮的真实失败卡", () => {
     renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({ status: "error" }),
-      mk("assistant", { id: "a-child-error", text: "继续轮真实失败正文", _clientMessageId: "u-continue-child",
+      mk("assistant", { id: "a-child-error", text: "CHILD_REAL_FAILURE", _clientMessageId: "u-continue-child",
         _errorCode: "codex_route_unavailable" })]);
     expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
-    expect(screen.getByText("继续轮真实失败正文")).toBeInTheDocument();
+    expect(screen.getByText("CHILD_REAL_FAILURE")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toBeInTheDocument();
   });
 
