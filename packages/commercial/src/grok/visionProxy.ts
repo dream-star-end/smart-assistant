@@ -48,7 +48,7 @@ import {
   releasePreCheck,
   type PreCheckRedis,
 } from "../billing/preCheck.js";
-import { abortInflightJournal, startInflightJournal } from "../billing/proxyBilling.js";
+import { abortInflightJournal, readJournalForTakeover, startInflightJournal } from "../billing/proxyBilling.js";
 import { query } from "../db/queries.js";
 import { classifyGrokRelayStatus } from "../http/internalGrokRelay.js";
 import {
@@ -140,6 +140,7 @@ export interface GrokVisionHandlerDeps {
   settleDurableCodexBillingFn?: typeof settleDurableCodexBilling;
   abortInflightJournalFn?: typeof abortInflightJournal;
   releasePreCheckFn?: typeof releasePreCheck;
+  readJournalForTakeoverFn?: typeof readJournalForTakeover;
 }
 
 export type GrokVisionHandler = (
@@ -413,6 +414,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
   const runSettle = deps.settleDurableCodexBillingFn ?? settleDurableCodexBilling;
   const runAbort = deps.abortInflightJournalFn ?? abortInflightJournal;
   const runReleasePreCheck = deps.releasePreCheckFn ?? releasePreCheck;
+  const runReadJournal = deps.readJournalForTakeoverFn ?? readJournalForTakeover;
   const baseLog = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
 
   return async function run(input: GrokRunInput): Promise<GrokRunResult> {
@@ -495,7 +497,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         }
         throw err;
       }
-      let admitted = false;
+      let admitted: boolean;
       try {
         admitted = await runStartJournal(deps.getPool(), {
           requestId: billingRequestId,
@@ -517,10 +519,22 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
             engineSessionId,
           },
         });
-      } finally {
-        if (!admitted) await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+      } catch (err) {
+        await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        throw err;
       }
       if (!admitted) {
+        // The request id already has a journal row. An inflight row is another call with this id
+        // still running, and the precheck above re-wrote that call's reservation (same id):
+        // releasing it here would drop the running call's hold on the balance (Codex #1130 r1
+        // P1). Only release when no inflight row owns it; an unreadable state is left to the TTL.
+        const state = await runReadJournal(deps.getPool(), billingRequestId).then(
+          (row) => row?.state ?? null,
+          () => "unknown",
+        );
+        if (state !== "inflight" && state !== "unknown") {
+          await runReleasePreCheck(deps.preCheckRedis, reservation).catch(() => {});
+        }
         throw new GrokRunError(409, "GROK_VISION_JOURNAL_CONFLICT", "billing journal conflict");
       }
       abandon = async (reason: string): Promise<void> => {

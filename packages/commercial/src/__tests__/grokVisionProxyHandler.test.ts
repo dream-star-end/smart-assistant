@@ -110,6 +110,8 @@ function harness(opts: {
       events.push("release");
       calls.release.push(handle);
     }) as any,
+    // A conflicting row here belongs to no running call (the route mints a fresh id per request).
+    readJournalForTakeoverFn: (async () => null) as any,
   });
   const run = async (body: unknown = BODY, method = "POST", auth = TOKEN) => {
     const { res, json } = visionRes();
