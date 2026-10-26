@@ -57,11 +57,9 @@ export async function settleMiniMaxMediaSuccess(
     // P2b P6 (OCV5-631), same as F8 in settleUsageAndLedger: take the wallet row locks before the
     // INSERT. Its user_id foreign key share-locks the users row; taking FOR UPDATE only afterwards
     // (in spendTwoBucket) let two concurrent settles of one user deadlock on the lock upgrade.
+    const spendOrgId = orgCtx?.billingEnabled ? orgCtx.orgId : undefined
     if (input.cost.costCredits > 0n) {
-      await lockSpendRows(client, {
-        userId: input.userId,
-        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
-      })
+      await lockSpendRows(client, { userId: input.userId, orgId: spendOrgId })
     }
 
     try {
@@ -129,7 +127,7 @@ export async function settleMiniMaxMediaSuccess(
         reason: 'minimax_media',
         ref: { type: 'minimax_media_usage_record', id: usageId.toString() },
         memo: `cost=${input.cost.costCredits}`,
-        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
+        orgId: spendOrgId,
         // 成员月度 org 预算(§17.4):随 orgId 一并传入,org 桶超限静默落个人桶。
         monthlyOrgBudget: orgCtx && orgCtx.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
       })
