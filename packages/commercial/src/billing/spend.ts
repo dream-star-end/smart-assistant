@@ -170,26 +170,26 @@ function normOrgId(orgId: bigint | number | string): string {
   return orgId;
 }
 
-/**
- * 在调用方既有事务内执行扣费（clamp 到可用总额，不抛余额不足）。
- *
- * 桶与锁序（全局单向 orgs → org_subscriptions → users → user_subscriptions）：
- *   0a) （orgId 存在时）`SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`。
- *       无行 → 静默跳过 org 两桶（降级纯个人两桶,fail-open）。
- *   0b) （org 参与时）`SELECT period_credits FROM org_subscriptions WHERE org_id=$1 AND
- *       status='active' AND period_end>NOW() FOR UPDATE`（过期未轮转不可花,谓词同个人期内桶）。
- *   1) `SELECT credits FROM users FOR UPDATE`（持久钱包）。
- *   2) `SELECT period_credits FROM user_subscriptions WHERE status='active' AND period_end>NOW() FOR UPDATE`。
- * 扣费顺序 org_period → org_wallet → period → wallet；各桶分别写 credit_ledger（balance_after=该桶
- * 扣后值,org 两桶行带 org_id + user_id=消费成员）。
- */
-export async function spendTwoBucket(
-  client: PoolClient,
-  input: SpendTwoBucketInput,
-): Promise<SpendTwoBucketResult> {
-  if (input.amount <= 0n) throw new TypeError(`amount must be > 0, got ${input.amount}`);
-  const uid = normUid(input.userId);
+export interface SpendRowLocks {
+  orgId: string | null;
+  orgParticipates: boolean;
+  orgCredits: bigint;
+  orgSubId: string | null;
+  orgPeriod: bigint;
+  wallet: bigint;
+}
 
+/**
+ * 按全局锁序 orgs → org_subscriptions → users 锁住一次扣费要动的钱包行，并读出当前值。
+ * spendTwoBucket 用它取锁；settleUsageAndLedger 在 INSERT usage_records **之前**先调一次（P2b F8）：
+ * usage_records.user_id 外键让 INSERT 先拿 users 行 FOR KEY SHARE，若之后才 FOR UPDATE，同一用户的
+ * 两笔并发结算会卡在锁升级上互相死锁（40P01）。同一事务里再调一次只会重读，不会再等锁。
+ */
+export async function lockSpendRows(
+  client: PoolClient,
+  input: { userId: bigint | number | string; orgId?: bigint | number | string },
+): Promise<SpendRowLocks> {
+  const uid = normUid(input.userId);
   // 0a) （org 桶）锁 org 钱包 —— **锁序最前**。org 不存在/非 active → 不参与(orgParticipates=false),
   //     降级为纯个人两桶(fail-open:流已交付必须记账)。
   let orgId: string | null = null;
@@ -224,6 +224,43 @@ export async function spendTwoBucket(
     orgPeriod = osRow.rows[0] ? BigInt(osRow.rows[0].period_credits) : 0n;
   }
 
+  // 1) 锁钱包（持久）
+  const wRow = await client.query<{ credits: string }>(
+    "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
+    [uid],
+  );
+  if (wRow.rows.length === 0) throw new TypeError(`user not found: ${uid}`);
+  const wallet = BigInt(wRow.rows[0].credits);
+
+  return { orgId, orgParticipates, orgCredits, orgSubId, orgPeriod, wallet };
+}
+
+/**
+ * 在调用方既有事务内执行扣费（clamp 到可用总额，不抛余额不足）。
+ *
+ * 桶与锁序（全局单向 orgs → org_subscriptions → users → user_subscriptions）：
+ *   0a) （orgId 存在时）`SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`。
+ *       无行 → 静默跳过 org 两桶（降级纯个人两桶,fail-open）。
+ *   0b) （org 参与时）`SELECT period_credits FROM org_subscriptions WHERE org_id=$1 AND
+ *       status='active' AND period_end>NOW() FOR UPDATE`（过期未轮转不可花,谓词同个人期内桶）。
+ *   1) `SELECT credits FROM users FOR UPDATE`（持久钱包）。
+ *   2) `SELECT period_credits FROM user_subscriptions WHERE status='active' AND period_end>NOW() FOR UPDATE`。
+ * 扣费顺序 org_period → org_wallet → period → wallet；各桶分别写 credit_ledger（balance_after=该桶
+ * 扣后值,org 两桶行带 org_id + user_id=消费成员）。
+ */
+export async function spendTwoBucket(
+  client: PoolClient,
+  input: SpendTwoBucketInput,
+): Promise<SpendTwoBucketResult> {
+  if (input.amount <= 0n) throw new TypeError(`amount must be > 0, got ${input.amount}`);
+  const uid = normUid(input.userId);
+
+  // 0a/0b/1) orgs → org_subscriptions → users（见 lockSpendRows）。
+  const { orgId, orgParticipates, orgCredits, orgSubId, orgPeriod, wallet } = await lockSpendRows(client, {
+    userId: uid,
+    orgId: input.orgId,
+  });
+
   // 0c) 成员月度 org 预算钳制（§17.4）。budget 非 null 且 org 参与时:
   //     org 两桶总可用额 = min(org 资金, max(0, budget - 本自然月已用))。
   //     SUM 走 0118 idx_cl_org_user_time(org_id,user_id,created_at),在本 tx 内点查
@@ -243,13 +280,6 @@ export async function spendTwoBucket(
     }
   }
 
-  // 1) 锁钱包（持久）
-  const wRow = await client.query<{ credits: string }>(
-    "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
-    [uid],
-  );
-  if (wRow.rows.length === 0) throw new TypeError(`user not found: ${uid}`);
-  const wallet = BigInt(wRow.rows[0].credits);
 
   // 2) 锁期内桶（**仅 active 且未过期**的订阅）。已过期但 sweeper 未轮转的行不计入可用——
   //    否则到期后到 sweeper 跑之间会留下"继续花旧套餐/加量包额度"的窗口（钱安全）。
