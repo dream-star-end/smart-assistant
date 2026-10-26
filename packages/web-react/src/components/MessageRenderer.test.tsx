@@ -3739,6 +3739,60 @@ describe("MessageList 会话内查找", () => {
     opener.remove();
     scroller.remove();
   });
+
+  test("OCV5-628:还没输入时不报「无匹配」，输入后才出计数", () => {
+    render(
+      <MessageList
+        messages={[mk("user", { id: "f628-u1", text: "苹果派", status: "sent" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        find={{ onClose: vi.fn() }}
+      />,
+    );
+    expect(screen.queryByTestId("find-count")).toBeNull();
+    expect(screen.queryByText("无匹配")).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), { target: { value: "香蕉" } });
+    expect(screen.getByTestId("find-count")).toHaveTextContent("无匹配");
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), { target: { value: "  " } });
+    expect(screen.queryByTestId("find-count")).toBeNull();
+  });
+
+  test("OCV5-628:云端还有更早记录时如实说明查找范围，「搜更早」走显式归档分页，输入本身不发请求", async () => {
+    const onLoadOlder = vi.fn(async () => {});
+    const props = {
+      messages: [mk("user", { id: "f628-u2", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      find: { onClose: vi.fn() },
+    };
+    const { rerender } = render(
+      <MessageList {...props} archive={{ hasMore: true, loading: false, error: false, onLoadOlder }} />,
+    );
+    const box = screen.getByRole("textbox", { name: "在会话中查找" });
+    expect(screen.queryByTestId("find-scope-hint")).toBeNull();
+
+    fireEvent.change(box, { target: { value: "香蕉" } });
+    const hint = screen.getByTestId("find-scope-hint");
+    expect(hint).toHaveTextContent("已加载部分无匹配");
+    expect(hint).toHaveTextContent("更早的记录还没加载，不在查找范围内");
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    fireEvent.click(within(hint).getByRole("button", { name: "搜更早" }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+
+    // 有命中时仍说明范围，但不再说「无匹配」。
+    fireEvent.change(box, { target: { value: "苹果" } });
+    expect(screen.getByTestId("find-count")).toHaveTextContent("1/1");
+    expect(screen.getByTestId("find-scope-hint")).not.toHaveTextContent("无匹配");
+
+    // 加载中按钮原位禁用；已到最早记录后提示消失。
+    rerender(<MessageList {...props} archive={{ hasMore: true, loading: true, error: false, onLoadOlder }} />);
+    expect(within(screen.getByTestId("find-scope-hint")).getByRole("button", { name: /加载中/ })).toBeDisabled();
+    rerender(<MessageList {...props} archive={{ hasMore: false, loading: false, error: false, onLoadOlder }} />);
+    expect(screen.queryByTestId("find-scope-hint")).toBeNull();
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
 });
 
 
