@@ -37,6 +37,15 @@ python3 muse_bridge.py start --server https://<个人版域名>
 - 个人版端的接口（`/api/muse-bridge/v1/*`）随 OCV5-561 实现。上线后由管理员签发 token，用户在 Muse VM 里执行 `set-token` 和 `start`。
 - 视频可以正常使用（02:34 实测：约 40 秒出一条 10 秒 mp4，约 10.7 MB）。生成超时默认 300 秒，上限 600 秒。只有 Muse 真正返回 `video_not_available` 时才报 `MUSE_VIDEO_REGION_BLOCKED`，不重试。
 
+## 0.5.2：源图下载断点续传（2026-10-26）
+
+- 个人版与商业版用同一个 bridge 文件（用户 2026-10-26 决定）。
+- 源图分块下载时，若传输途中响应体被截断（例如 VM 出口经中继，只收到约 89%），0.5.2 会保留已收到的部分，从断点继续请求剩余字节，而不是丢掉整块重下。
+  - 有进展的截断不计入 8 次失败重试；每张源图最多 64 次截断，防止无限循环。
+  - 状态码必须是 206、Content-Range 必须与请求一致；整张图下载完仍校验 sha256 与格式。
+- master 对无源图的任务发 `source_refs: []` 时，按“没有源图”处理。
+- `--max-concurrency`、master 重启后自动重新 hello、单个 slot 轮询失败不断开会话，均与 0.5.1 相同。
+
 ## 它怎么调用 media-generation
 
 - **只有文字**：执行一次 `--media-subagent-output-type image|video --conversation-json '[{"text":…}]' --output-dir … --timeout-secs …`。
