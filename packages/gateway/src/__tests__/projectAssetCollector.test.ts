@@ -53,3 +53,63 @@ describe('resolveUploadExcerptPath', () => {
     assert.equal(resolveUploadExcerptPath('/api/media/nope.pdf', null), null)
   })
 })
+
+import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+const {
+  promoteSessionWorkspaceOutputs,
+  sessionWorkspaceContainerDir,
+} = await import('../projectAssetCollector.js')
+
+describe('sessionWorkspaceContainerDir', () => {
+  it('accepts webchat session ids', () => {
+    assert.equal(
+      sessionWorkspaceContainerDir('webmvosf7p0p5zx6p'),
+      '/home/agent/.openclaude/workspace/sessions/webmvosf7p0p5zx6p',
+    )
+  })
+  it('rejects path-like ids', () => {
+    assert.equal(sessionWorkspaceContainerDir('../etc'), null)
+    assert.equal(sessionWorkspaceContainerDir('a/b'), null)
+    assert.equal(sessionWorkspaceContainerDir('short'), null)
+  })
+})
+
+describe('promoteSessionWorkspaceOutputs', () => {
+  it('copies top-level workspace files into generated/session-ws/<id>/', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-ws-out-'))
+    const generated = join(root, 'generated')
+    const workspaceSessions = join(root, 'sessions')
+    const sid = 'webmvosf7p0p5zx6p'
+    await mkdir(join(workspaceSessions, sid), { recursive: true })
+    await mkdir(generated, { recursive: true })
+    await writeFile(join(workspaceSessions, sid, 'hello.txt'), 'hello regress 1026')
+    await writeFile(join(workspaceSessions, sid, '.hidden'), 'nope')
+    await mkdir(join(workspaceSessions, sid, 'subdir'))
+    await writeFile(join(workspaceSessions, sid, 'subdir', 'nested.txt'), 'skip')
+    await symlink(join(workspaceSessions, sid, 'hello.txt'), join(workspaceSessions, sid, 'link.txt'))
+
+    const paths = await promoteSessionWorkspaceOutputs(sid, { generated, cas: join(root, 'cas'), workspaceSessions })
+    assert.deepEqual(paths, [
+      `/home/agent/.openclaude/generated/session-ws/${sid}/hello.txt`,
+    ])
+    const promoted = await import('node:fs/promises').then((fs) =>
+      fs.readFile(join(generated, 'session-ws', sid, 'hello.txt'), 'utf8'),
+    )
+    assert.equal(promoted, 'hello regress 1026')
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('returns [] when session cwd missing', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oc-ws-miss-'))
+    const paths = await promoteSessionWorkspaceOutputs('webmissing0000001', {
+      generated: join(root, 'generated'),
+      cas: join(root, 'cas'),
+      workspaceSessions: join(root, 'sessions'),
+    })
+    assert.deepEqual(paths, [])
+    await rm(root, { recursive: true, force: true })
+  })
+})
