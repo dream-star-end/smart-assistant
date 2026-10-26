@@ -406,10 +406,11 @@ describe("P2b 订单履约原子性", () => {
         userId: uid, planCode: "plan-10",
         nowFn: () => new Date(Date.now() - 30 * 60 * 1000),
       });
-      const [paid] = await Promise.allSettled([
+      const [paid, expirer] = await Promise.allSettled([
         markOrderPaid({ orderNo: order.order_no, callbackPayload: { i } }),
         expirePendingOrders(),
       ]);
+      assert.equal(expirer.status, "fulfilled", String(expirer.status === "rejected" && expirer.reason));
       const status = (await getOrderByNo(order.order_no))?.status;
       const credits = (await query<{ credits: string }>(
         "SELECT credits::text AS credits FROM users WHERE id=$1", [uid])).rows[0].credits;
