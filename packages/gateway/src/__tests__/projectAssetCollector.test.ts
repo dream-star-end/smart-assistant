@@ -54,7 +54,7 @@ describe('resolveUploadExcerptPath', () => {
   })
 })
 
-import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, symlink, rm, readFile, lstat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -99,6 +99,51 @@ describe('promoteSessionWorkspaceOutputs', () => {
       fs.readFile(join(generated, 'session-ws', sid, 'hello.txt'), 'utf8'),
     )
     assert.equal(promoted, 'hello regress 1026')
+    await rm(root, { recursive: true, force: true })
+  })
+
+
+  it('does not follow dest symlink when refreshing promoted copy', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'promote-symlink-'))
+    const sid = 'webmvosf7p0p5zx6p'
+    const generated = join(root, 'generated')
+    const workspaceSessions = join(root, 'sessions')
+    const outside = join(root, 'outside.txt')
+    await writeFile(outside, 'SECRET-OUTSIDE')
+    await mkdir(join(workspaceSessions, sid), { recursive: true })
+    await mkdir(join(generated, 'session-ws', sid), { recursive: true })
+    await writeFile(join(workspaceSessions, sid, 'report.txt'), 'workspace-report')
+    await symlink(outside, join(generated, 'session-ws', sid, 'report.txt'))
+
+    const paths = await promoteSessionWorkspaceOutputs(sid, {
+      generated,
+      cas: join(root, 'cas'),
+      workspaceSessions,
+    })
+    assert.deepEqual(paths, [`/home/agent/.openclaude/generated/session-ws/${sid}/report.txt`])
+    assert.equal(await readFile(outside, 'utf8'), 'SECRET-OUTSIDE')
+    const destSt = await lstat(join(generated, 'session-ws', sid, 'report.txt'))
+    assert.equal(destSt.isSymbolicLink(), false)
+    assert.equal(await readFile(join(generated, 'session-ws', sid, 'report.txt'), 'utf8'), 'workspace-report')
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('prefers not-yet-promoted files so later turns can register new outputs under the cap', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'promote-cap-'))
+    const sid = 'webmvosf7p0p5zx6p'
+    const generated = join(root, 'generated')
+    const workspaceSessions = join(root, 'sessions')
+    await mkdir(join(workspaceSessions, sid), { recursive: true })
+    for (const name of ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt']) {
+      await writeFile(join(workspaceSessions, sid, name), name)
+    }
+    const roots = { generated, cas: join(root, 'cas'), workspaceSessions }
+    const first = await promoteSessionWorkspaceOutputs(sid, roots, { max: 5 })
+    assert.equal(first.length, 5)
+    await writeFile(join(workspaceSessions, sid, 'f.txt'), 'f-new')
+    const second = await promoteSessionWorkspaceOutputs(sid, roots, { max: 5 })
+    assert.ok(second.includes(`/home/agent/.openclaude/generated/session-ws/${sid}/f.txt`))
+    assert.equal(await readFile(join(generated, 'session-ws', sid, 'f.txt'), 'utf8'), 'f-new')
     await rm(root, { recursive: true, force: true })
   })
 

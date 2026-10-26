@@ -144,11 +144,19 @@ export async function promoteSessionWorkspaceOutputs(
   } catch {
     return []
   }
-  const out: string[] = []
+  let generatedReal: string
+  try {
+    await mkdir(roots.generated, { recursive: true })
+    generatedReal = await realpath(roots.generated)
+  } catch {
+    return []
+  }
+
+  type Cand = { name: string; real: string; mtimeMs: number; alreadyPromoted: boolean; destFs: string; destRel: string }
+  const cands: Cand[] = []
   for (const name of names) {
-    if (out.length >= max) break
     if (!name || name.startsWith('.')) continue
-    if (name.includes('/') || name.includes('\\') || name.includes('..')) continue
+    if (name.includes('/') || name.includes(String.fromCharCode(92)) || name.includes('..')) continue
     const abs = join(sessionFsDir, name)
     let st
     try {
@@ -156,7 +164,8 @@ export async function promoteSessionWorkspaceOutputs(
     } catch {
       continue
     }
-    if (!st.isFile() || st.isSymbolicLink()) continue
+    // Skip symlinks at the source (lstat: isSymbolicLink true even when target is a file).
+    if (st.isSymbolicLink() || !st.isFile()) continue
     let real: string
     try {
       real = await realpath(abs)
@@ -169,31 +178,88 @@ export async function promoteSessionWorkspaceOutputs(
     }
     const destRel = `${GENERATED_SESSION_WS_REL}${sessionId}/${name}`
     const destFs = join(roots.generated, destRel)
+    let alreadyPromoted = false
     try {
-      await mkdir(dirname(destFs), { recursive: true })
-      try {
-        await link(real, destFs)
-      } catch (linkErr) {
-        const code = (linkErr as { code?: string }).code
-        if (code === 'EEXIST') {
-          /* already promoted; refresh bytes if source newer — overwrite via copy */
-          await copyFile(real, destFs)
-        } else if (code === 'EXDEV') {
-          await copyFile(real, destFs)
-        } else {
-          throw linkErr
-        }
+      const dstSt = await lstat(destFs)
+      // Treat only a regular file as "already promoted"; a dangling/hostile symlink is not.
+      alreadyPromoted = dstSt.isFile() && !dstSt.isSymbolicLink()
+    } catch {
+      alreadyPromoted = false
+    }
+    cands.push({ name, real, mtimeMs: st.mtimeMs, alreadyPromoted, destFs, destRel })
+  }
+
+  // Prefer not-yet-promoted so later turns can register new files under the per-turn cap;
+  // among equals, newer mtime first. Already-promoted fill remaining slots (re-register / rehome).
+  cands.sort((a, b) => {
+    if (a.alreadyPromoted !== b.alreadyPromoted) return a.alreadyPromoted ? 1 : -1
+    return b.mtimeMs - a.mtimeMs
+  })
+
+  const out: string[] = []
+  for (const c of cands) {
+    if (out.length >= max) break
+    try {
+      await mkdir(dirname(c.destFs), { recursive: true })
+      // Ensure dest parent stays under generated (no symlink escape via parent).
+      const destParentReal = await realpath(dirname(c.destFs))
+      if (!destParentReal.startsWith(generatedReal + sep) && destParentReal !== generatedReal) {
+        log.warn('promote dest parent outside generated, skipped', { sessionId, name: c.name })
+        continue
       }
+      await materializePromotedCopy(c.real, c.destFs)
     } catch (err) {
-      log.warn('promote session workspace file failed', { sessionId, name }, err)
+      log.warn('promote session workspace file failed', { sessionId, name: c.name }, err)
       continue
     }
-    const containerPath = `${GENERATED_PREFIX}${destRel}`
+    const containerPath = `${GENERATED_PREFIX}${c.destRel}`
     const parsed = parseProjectAssetContainerPath(containerPath)
     if (!parsed) continue
     out.push(parsed)
   }
   return out
+}
+
+/**
+ * Place source bytes at destFs without following a pre-existing dest symlink
+ * (copyFile would otherwise overwrite the symlink target outside generated/).
+ */
+async function materializePromotedCopy(srcReal: string, destFs: string): Promise<void> {
+  try {
+    const dstSt = await lstat(destFs)
+    if (dstSt.isSymbolicLink() || !dstSt.isFile()) {
+      await rm(destFs, { force: true })
+    }
+  } catch (err) {
+    if ((err as { code?: string }).code !== 'ENOENT') throw err
+  }
+  const tmp = `${destFs}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
+  try {
+    try {
+      await link(srcReal, tmp)
+    } catch (linkErr) {
+      const code = (linkErr as { code?: string }).code
+      if (code === 'EXDEV' || code === 'EEXIST') {
+        await copyFile(srcReal, tmp)
+      } else {
+        throw linkErr
+      }
+    }
+    // rename replaces a regular file atomically; if a symlink reappeared, unlink first.
+    try {
+      await rename(tmp, destFs)
+    } catch (renErr) {
+      const code = (renErr as { code?: string }).code
+      if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+        await rm(destFs, { force: true })
+        await rename(tmp, destFs)
+      } else {
+        throw renErr
+      }
+    }
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
+  }
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
