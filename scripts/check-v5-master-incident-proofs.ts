@@ -60,6 +60,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/museBridge.test.ts',
     cases: ['hello source_chunk_bytes is never below the bridge default and within its hard limit'],
   },
+  {
+    incident: 'INC-20261026-STUDIO-MUSE-RETRY-REPLAY', slug: 'inc-20261026-studio-muse-retry-replay', db: false,
+    file: 'packages/commercial/src/__tests__/studioProviders.test.ts',
+    cases: ['muse: a retry after a failed job submits the next job of the chain, never replays the failure (INC-20261026-STUDIO-MUSE-RETRY-REPLAY)'],
+  },
 ]
 
 function fail(message: string): never {

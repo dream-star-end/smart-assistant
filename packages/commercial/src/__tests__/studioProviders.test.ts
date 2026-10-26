@@ -13,7 +13,12 @@ import {
   type BuiltinAdapterDeps,
 } from '../media-studio/providers/adapters/index.js'
 import { speechCharBound } from '../media-studio/providers/adapters/minimaxSpeech.js'
-import { museJobIdFor, uuidV5 } from '../media-studio/providers/adapters/muse.js'
+import {
+  MUSE_JOBS_PER_EXECUTION,
+  museAttemptJobIdFor,
+  museJobIdFor,
+  uuidV5,
+} from '../media-studio/providers/adapters/muse.js'
 import {
   type AdapterFactory,
   createProviderRegistry,
@@ -21,6 +26,7 @@ import {
   resolveEntryKey,
 } from '../media-studio/providers/registry.js'
 import { MediaProviderError, type MediaRunContext } from '../media-studio/providers/types.js'
+import type { MuseJobStatus } from '../muse/store.js'
 
 const SENTINEL_KEY = 'sk-SENTINEL-do-not-leak-0123456789'
 const SENTINEL_PATH = '/secret/path/sentinel-key-file'
@@ -475,19 +481,116 @@ describe('adapters', () => {
     })
   })
 
+  // A hub whose jobs exist only once submitted, each ending in the status the test scripts for it.
+  function scriptedMuse(
+    deps: ReturnType<typeof fakeDeps>,
+    outcome: (jobId: string) => MuseJobStatus,
+  ) {
+    const jobs = new Map<string, MuseJobStatus>()
+    const submitted: string[] = []
+    deps.muse!.hub.submit = async (_u, _c, _spec, opts) => {
+      const id = opts!.jobId!
+      if (!jobs.has(id)) {
+        submitted.push(id)
+        jobs.set(id, outcome(id))
+      }
+      return id
+    }
+    deps.muse!.hub.view = async (_u, jobId) => {
+      const status = jobs.get(jobId)
+      if (status === undefined) return null
+      return {
+        job_id: jobId,
+        kind: 'video',
+        status,
+        ...(status === 'succeeded'
+          ? {
+              files: [{ idx: 0, filename: 'a.mp4', mime: 'video/mp4', bytes: 3, sha256: 'x' }],
+              charged_credits: '50',
+            }
+          : {}),
+        ...(status === 'failed'
+          ? {
+              error: {
+                code: 'MUSE_SOURCE_FETCH_FAILED',
+                message: 'f',
+                retryable: true,
+                upstream_error_code: null,
+              },
+            }
+          : {}),
+      }
+    }
+    return { jobs, submitted }
+  }
+
   it('muse: failed outcome keeps its retryable flag', async () => {
     const deps = fakeDeps()
-    deps.muse!.hub.view = async (_u, jobId) => ({
-      job_id: jobId,
-      kind: 'video',
-      status: 'failed',
-      error: { code: 'MUSE_TIMEOUT', message: 't', retryable: true, upstream_error_code: null },
-    })
+    scriptedMuse(deps, () => 'failed')
     const p = build(undefined, deps).registry.get('muse-video')!
     await assert.rejects(p.run(ctx(), { op: 'video.from_text', prompt: 'x' }), {
-      code: 'MUSE_TIMEOUT',
+      code: 'MUSE_SOURCE_FETCH_FAILED',
       retryable: true,
     })
+  })
+
+  it('muse: a retry after a failed job submits the next job of the chain, never replays the failure (INC-20261026-STUDIO-MUSE-RETRY-REPLAY)', async () => {
+    const deps = fakeDeps()
+    const exec = ctx().execRequestId
+    const { jobs, submitted } = scriptedMuse(deps, (id) =>
+      id === museAttemptJobIdFor(exec, 2) ? 'succeeded' : 'failed',
+    )
+    const p = build(undefined, deps).registry.get('muse-video')!
+    const req = { op: 'video.from_text' as const, prompt: 'x' }
+    await assert.rejects(p.run(ctx(), req), { code: 'MUSE_SOURCE_FETCH_FAILED' })
+    await assert.rejects(p.run(ctx(), req), { code: 'MUSE_SOURCE_FETCH_FAILED' })
+    const out = await p.run(ctx(), req)
+    assert.deepEqual(
+      submitted,
+      [0, 1, 2].map((n) => museAttemptJobIdFor(exec, n)),
+    )
+    assert.equal(submitted[0], museJobIdFor(exec), 'the first job keeps the pre-chain id')
+    assert.equal(out.providerRef?.id, museAttemptJobIdFor(exec, 2))
+    // A later run (a re-lease after the success) reuses the succeeded job: nothing new, no second charge.
+    await p.run(ctx(), req)
+    assert.equal(submitted.length, 3)
+    // A running job is resumed, not replaced.
+    jobs.clear()
+    submitted.length = 0
+    jobs.set(museAttemptJobIdFor(exec, 0), 'running')
+    deps.muse!.hub.view = (async (_u: string, jobId: string) =>
+      jobs.has(jobId) ? { job_id: jobId, kind: 'video', status: jobs.get(jobId)! } : null) as never
+    let resumed = ''
+    deps.muse!.hub.submit = async (_u, _c, _s, opts) => {
+      resumed = opts!.jobId!
+      throw Object.assign(new Error('stop here'), { code: 'STOP' })
+    }
+    await assert.rejects(p.run(ctx(), req), { code: 'STOP' })
+    assert.equal(resumed, museAttemptJobIdFor(exec, 0))
+  })
+
+  it('muse: the chain is bounded and chargedFor sums every job of it', async () => {
+    const deps = fakeDeps()
+    scriptedMuse(deps, () => 'failed')
+    const asked: string[][] = []
+    deps.pool = {
+      async query(_sql: string, params: unknown[]) {
+        asked.push(params[1] as string[])
+        return { rows: [{ debited: '50' }] }
+      },
+    } as never
+    const p = build(undefined, deps).registry.get('muse-video')!
+    const req = { op: 'video.from_text' as const, prompt: 'x' }
+    for (let n = 0; n < MUSE_JOBS_PER_EXECUTION; n++) {
+      await assert.rejects(p.run(ctx(), req), { code: 'MUSE_SOURCE_FETCH_FAILED' })
+    }
+    await assert.rejects(p.run(ctx(), req), { code: 'MUSE_TOO_MANY_ATTEMPTS', retryable: false })
+    assert.equal(await p.chargedFor(7n, ctx().execRequestId), 50n)
+    const exec = ctx().execRequestId
+    assert.deepEqual(
+      asked.at(-1),
+      Array.from({ length: MUSE_JOBS_PER_EXECUTION }, (_, n) => museAttemptJobIdFor(exec, n)),
+    )
   })
 
   it('uuidV5 matches the RFC 4122 test vector', () => {
