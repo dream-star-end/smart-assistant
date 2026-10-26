@@ -37,6 +37,11 @@ import { resetTestSchemaForTest } from "./helpers/db.js";
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const TEST_REDIS_URL = process.env.TEST_REDIS_URL ?? "redis://127.0.0.1:56379/0";
+// This suite flushdb()s the Redis it is given. 6379 (also the port of a URL without one) is the
+// default service Redis on dev hosts, so refuse it instead of wiping it on a misset env (P2b §5).
+if ((new URL(TEST_REDIS_URL).port || "6379") === "6379") {
+  throw new Error("payment.integ: TEST_REDIS_URL points at port 6379; use the test Redis (default 56379)");
+}
 const REQUIRE_TEST_DB = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 
 const JWT_SECRET = "p".repeat(64);
