@@ -35,8 +35,12 @@ export const JOB_DEADLINE_MS = Object.freeze({ image: 180_000, video: 390_000 })
 export const SOURCE_UPLOAD_EXTRA_MS = 120_000
 /** A dispatched job not acked within this window was never started: requeue it. */
 export const ACK_TIMEOUT_MS = 20_000
-export const MAX_DISPATCH_ATTEMPTS = 3
-export const HEARTBEAT_LOST_MS = 60_000
+// A bridge behind a relay that drops some responses (commercial Muse VM, 2026-10-26: poll replies,
+// heartbeat and result replies lost) needs more slack before a job is given up as MUSE_BRIDGE_LOST:
+// 5 dispatches (was 3) before "never acknowledged", 120 s without a sign of life (was 60 s) before
+// "lost contact during the job". A bridge that is really gone is noticed up to a minute later.
+export const MAX_DISPATCH_ATTEMPTS = 5
+export const HEARTBEAT_LOST_MS = 120_000
 export const BRIDGE_ONLINE_MS = 60_000
 export const QUEUE_MAX = 3
 export const QUEUE_WAIT_MS = 240_000
