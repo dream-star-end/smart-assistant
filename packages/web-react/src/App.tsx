@@ -201,6 +201,7 @@ import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage, ApiError } from "./lib/api";
 import { uploadFilesToProject } from "./lib/projectFileUpload";
 import { reportClientFriction } from "./lib/clientFriction";
+import { setTimelineLifecycleServerShadow } from "./lib/timeline/shadowLifecycle";
 import {
   effectiveEffortModelId,
   effortForModel,
@@ -817,6 +818,10 @@ export function App() {
 
   // 服务端功能开关（GET /api/features；读不到 = 全关，demo 不读）。
   const serverFeatures = useServerFeatures(demo ? null : auth, demo);
+  // OCV5-630:服务端开关 → 时间线投影器 shadow 观测与上报(本地显式覆盖仍优先);登出/换号读回 off。
+  useEffect(() => {
+    setTimelineLifecycleServerShadow(serverFeatures.timelineShadow);
+  }, [serverFeatures.timelineShadow]);
   const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
   useEffect(() => {
     setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
