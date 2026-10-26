@@ -3,6 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { api, ApiError } from '../lib/api'
 import { createMemoryAuthSession } from '../lib/authSession'
 import type { CollaborationConfigDoc, CollabMode } from '../lib/collaborationConfig'
+import type { AuthorizeSwitch } from '../lib/modelSwitchCostTypes'
 import {
   useSessionModelAndCollab,
   type SessionModelAndCollabInput,
@@ -115,7 +116,7 @@ test('a newer click fences the old conflict reread before it can retry', async (
 test('leaving team skips model-switch consent so「关闭团队模式」cannot abort to Astra (OCV5-623)', async () => {
   vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('team', 1))
   const put = vi.spyOn(api, 'putCollaborationConfig').mockResolvedValue(doc('solo', 2))
-  const authorizeSwitch = vi.fn(async () => null)
+  const authorizeSwitch = vi.fn(async (_input: Parameters<AuthorizeSwitch>[0], _opts?: Parameters<AuthorizeSwitch>[1]) => null)
   const f = setup()
   f.rerender({
     ...f.input,
@@ -136,7 +137,7 @@ test('leaving team skips model-switch consent so「关闭团队模式」cannot a
 test('entering team still asks model-switch consent (OCV5-623)', async () => {
   vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
   const put = vi.spyOn(api, 'putCollaborationConfig').mockResolvedValue(doc('team', 2))
-  const authorizeSwitch = vi.fn(async () => null)
+  const authorizeSwitch = vi.fn(async (_input: Parameters<AuthorizeSwitch>[0], _opts?: Parameters<AuthorizeSwitch>[1]) => null)
   const f = setup()
   f.rerender({
     ...f.input,
