@@ -12,7 +12,13 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import type { Logger } from '../logging/logger.js'
 import { makeMuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
-import { MuseError, parseAllowedUids, parseSubmission, supportsSourceRefs } from '../muse/protocol.js'
+import {
+  MAX_DISPATCH_ATTEMPTS,
+  MuseError,
+  parseAllowedUids,
+  parseSubmission,
+  supportsSourceRefs,
+} from '../muse/protocol.js'
 import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 
 const TOKEN = `mbr_${'x'.repeat(43)}`
@@ -210,13 +216,13 @@ describe('muse hub', () => {
     hub = makeHub(store, clock, root, undefined, logger)
     const sid = hub.hello('1', '0.5.0')
     await hub.submit('3', null, { kind: 'image', prompt: '红狐', source_images: [PNG.toString('base64')] })
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt++) {
       const job = (await hub.poll(sid, 50))!
       clock.t += 21_000
       hub.checkSession(sid)
       hub.tick()
       const entry = entries[attempt - 1]!
-      assert.equal(entry.msg, attempt === 3 ? 'muse_job_ack_timeout_failed' : 'muse_job_ack_timeout_requeued')
+      assert.equal(entry.msg, attempt === MAX_DISPATCH_ATTEMPTS ? 'muse_job_ack_timeout_failed' : 'muse_job_ack_timeout_requeued')
       assert.equal(entry.meta.claimResponseBytes, Buffer.byteLength(JSON.stringify({ job })))
     }
   })
@@ -301,14 +307,16 @@ describe('muse hub', () => {
     assert.deepEqual(store.running, [first.id])
   })
 
-  it('gives up after three un-acked dispatches', async () => {
+  it('gives up after five un-acked dispatches, not before (relay drops poll replies)', async () => {
     const sid = await online()
     const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
-    for (let i = 0; i < 3; i++) {
-      assert.ok(await hub.poll(sid, 50))
+    assert.equal(MAX_DISPATCH_ATTEMPTS, 5)
+    for (let i = 0; i < 5; i++) {
+      assert.ok(await hub.poll(sid, 50), `dispatch ${i + 1}`)
       clock.t += 21_000
       hub.checkSession(sid)
       hub.tick()
+      if (i < 4) assert.notEqual((await hub.view('3', id, 0))?.status, 'failed', `alive after ${i + 1}`)
     }
     const v = await hub.view('3', id, 0)
     assert.equal(v?.status, 'failed')
@@ -327,7 +335,12 @@ describe('muse hub', () => {
 
   it('lost heartbeat and deadline fail the running job', async () => {
     const a = await runningJob()
+    // 61 s of silence is tolerated (relay-dropped heartbeats); 121 s is lost contact.
     clock.t += 61_000
+    hub.checkSession((hub as any).session.id)
+    hub.tick()
+    assert.equal((await hub.view('3', a.id, 0))?.status, 'running', 'still running after 61 s')
+    clock.t += 60_000
     hub.checkSession((hub as any).session.id)
     hub.tick()
     assert.equal((await hub.view('3', a.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')
