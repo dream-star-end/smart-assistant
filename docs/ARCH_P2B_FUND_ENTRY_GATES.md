@@ -29,7 +29,7 @@
 对四条路径统一要求，测试按这几条写：
 
 1. **全有或全无**：同一工作单元内的余额列、`credit_ledger` 行、业务行（orders / usage_records / turn_waivers）要么一起提交，要么一起不存在。
-2. **账实相符**：每个桶 `balance_after` 等于该桶提交后的余额；同一工作单元每动一个桶恰好一条账本行。
+2. **账实相符**：每条账本行的 `balance_after` 等于写这条流水时该桶的余额，同一桶在本工作单元内的流水 `delta` 之和等于该桶的净变化，最后一条的 `balance_after` 等于提交后的余额。一个桶可能有多条流水，例如订阅发放在旧余额和新额度都大于零时，先写一条清零、再写一条发放（`billing/subscription.ts:275,288`）。
 3. **幂等**：同一幂等键重复请求（顺序或并发）只产生一次余额变化与一组账本行，第二次返回与第一次一致的结果。
 4. **余额非负**：扣费路径任何并发交错下 `users.credits`、`orgs.credits`、`period_credits` 不为负（今天靠 `spend.ts:277-291` 截断 + 行锁；截断差额记 `clamped`，不追收）。
 5. **锁序**：按 orgs → org_subscriptions → users → user_subscriptions；订单路径以 orders 行打头，退款/结算以咨询锁打头。

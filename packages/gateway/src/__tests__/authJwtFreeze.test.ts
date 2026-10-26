@@ -22,8 +22,8 @@ function forge(header: unknown, payload: unknown, secret = SECRET): string {
 }
 
 test('freeze: a signed token with a future exp is accepted', () => {
-  const token = signJwt({ userId: 'u1', exp: now() + 3600 }, SECRET)
-  assert.deepEqual(verifyJwt(token, SECRET), { userId: 'u1', exp: now() + 3600 })
+  const exp = now() + 3600
+  assert.deepEqual(verifyJwt(signJwt({ userId: 'u1', exp }, SECRET), SECRET), { userId: 'u1', exp })
 })
 
 test('freeze: an expired token is rejected', () => {
@@ -60,8 +60,8 @@ test('freeze: a payload changed after signing is rejected', () => {
 })
 
 test('freeze: userId is not required; a signed payload without it is returned as-is', () => {
-  const token = forge({ alg: 'HS256', typ: 'JWT' }, { exp: now() + 60 })
-  assert.deepEqual(verifyJwt(token, SECRET), { exp: now() + 60 })
+  const exp = now() + 60
+  assert.deepEqual(verifyJwt(forge({ alg: 'HS256', typ: 'JWT' }, { exp }), SECRET), { exp })
 })
 
 test('freeze: malformed tokens and a signed non-JSON body are rejected', () => {
