@@ -123,7 +123,7 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 | 跨用途令牌 | 容器 token ↔ 用户 JWT 双向有（`containerIdentity.test.ts:399-421`） | B6 已补：个人 gateway JWT（`{userId,exp}`，同密钥）被 `verifyAccess` 拒；API key 被容器 token 解析器和 `verifyAccess` 拒 |
 | 过期令牌 | `jwt.test.ts:42`、`jwtSync.test.ts:144`、`http.integ.test.ts:326` | gateway `verifyJwt` 已补（B1） |
 | DB 读失败 | 无（`requireAdminVerifyDb` fail-closed、bridge fail-open，均无测试） | B7 已补：`requireAdminVerifyDb` DB 报错 → 拒绝（fail-closed）；bridge 状态查询报错 → 放行（fail-open，冻结为已知缺口） |
-| 错误 Origin | 仅 `containerPreviewBridge.test.ts:126` | B8 未做，**待评审定口径**：其它 7 条路径今天不查 Origin（令牌走子协议/头，不靠 cookie），要不要把“不查”冻结成测试由评审决定 |
+| 错误 Origin | 仅 `containerPreviewBridge.test.ts:126` | B8 已补（按 2026-10-26 管家口径“冻结不查”）：`userChatBridge.test.ts` 用外站 Origin 加有效 bearer 子协议，照样连通，冻结为已知缺口。其余不查 Origin 的路径中，voice 与 bridge 同一机制（子协议 bearer），#4–#8 靠 cookie 作用域、mTLS 或源 IP 断言；改成强制校验 Origin 另开票 |
 | gateway：无 exp 接受 / `exp:0` 接受 / `alg:none` 头 + 有效 HMAC 接受 / 标准空签名 `alg:none` 拒绝 | 无 | **已补**（B1，前三条标“P4b flips”） |
 
 ## 7. 交付批次与退出
@@ -135,7 +135,7 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 | B3 | `payment.integ.test.ts` 清 Redis 前拒绝 6379（§5 隔离缺口） | 本 PR |
 | T1–T5 | 资金原子性测试：T1 订单写到 orders→paid 时注入故障，整体回滚（`orders.integ.test.ts`）；T2 过期器与回调并发，两种结局都观察到（同上）；T3 管理员调账并发正/负，以及冻结 F2“重复提交记两次”（`ledger.integ.test.ts`）；T4 父子键并发豁免（`turnWaiver.integ.test.ts`，证实 F4；F4 修复后绿）；T5 同一用户不同 request 并发扣费（`settleUsageConcurrent.integ.test.ts`，只允许 40P01 失败，即 F8，已提交部分守恒） | T1/T2/T3/T5 绿；T4 在 F4 修复后转绿 |
 | B4–B7 | 入口冻结测试补缺（见 6.4） | `p2bEntryFreeze.test.ts` 7 条 + `userChatBridge.test.ts` 3 条 |
-| B8 | Origin 冻结口径 | 待评审 |
+| B8 | Origin“冻结不查”（bridge） | `userChatBridge.test.ts` 1 条 |
 | 登记表入库 | 把 6.2/6.3 落成机器可读的 `arch/entry-registry.json`（每条路由：校验器、查库、Origin、失败行为、负责人），配生成与 `--check` | 后续 PR（护栏变更单独 PR） |
 
 P2b 退出 = 本设计评审批准 + T1–T5 全绿 + B1/B4–B8 全绿。F4 修复后 T4 已绿。在此之前试点计费部分只读观测（§9.4）。
