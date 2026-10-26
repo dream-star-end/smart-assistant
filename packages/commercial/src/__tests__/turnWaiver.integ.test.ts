@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 
 import { settleUsageAndLedger } from '../billing/proxyBilling.js'
-import { applyTurnWaiver } from '../billing/refund.js'
+import { applyTurnWaiver, ensurePendingTurnWaiver } from '../billing/refund.js'
 import { lockTurnBillingKeys } from '../billing/turnLock.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
@@ -595,5 +595,49 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
       [userId.toString()],
     )
     assert.equal(waivers.rows[0]!.distinct_receipts, '1')
+  })
+
+  // P2b T4 (docs/ARCH_P2B_FUND_ENTRY_GATES.md F4): a parent-key waiver and a child-key waiver both
+  // match the same delegate usage row (turn_key = child, parent_turn_key = parent) but take
+  // different turn-billing locks. The usage may be refunded at most once.
+  // F4 was confirmed by this test before the per-user waiver lock (200 refunded for a 100 debit).
+  test('P2b T4: concurrent parent-key and child-key waivers refund one delegate usage at most once', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1_000n)
+    for (let i = 0; i < 8; i++) {
+      const parentTurnKey = `${i}`.padStart(2, '0').repeat(32)
+      const childTurnKey = `c${i}`.repeat(32)
+      const usage = await query<{ id: string }>(
+        `INSERT INTO usage_records
+           (user_id,mode,model,price_snapshot,cost_credits,request_id,status,
+            turn_key,parent_turn_key,input_tokens,output_tokens)
+         VALUES ($1,'chat','test','{}'::jsonb,100,$2,'success',$3,$4,1,1)
+         RETURNING id::text AS id`,
+        [userId.toString(), `p2b-t4-${i}`, childTurnKey, parentTurnKey],
+      )
+      await query(
+        `INSERT INTO credit_ledger (user_id,delta,balance_after,reason,bucket,ref_type,ref_id,memo)
+         VALUES ($1,-100,900,'chat','wallet','usage_record',$2,'p2b t4 debit')`,
+        [userId.toString(), usage.rows[0]!.id],
+      )
+      await query('UPDATE users SET credits=credits-100 WHERE id=$1', [userId.toString()])
+      // Same order as the waive route (http/internalTurnWaive.ts): the pending fence commits
+      // first, then applyTurnWaiver runs. Both fences exist before the two applies race.
+      await ensurePendingTurnWaiver(getPool(), { userId, turnKey: parentTurnKey, reason: 'idle_timeout' })
+      await ensurePendingTurnWaiver(getPool(), { userId, turnKey: childTurnKey, reason: 'idle_timeout' })
+      const settled = await Promise.allSettled([
+        applyTurnWaiver(getPool(), { userId, turnKey: parentTurnKey, reason: 'idle_timeout' }),
+        applyTurnWaiver(getPool(), { userId, turnKey: childTurnKey, reason: 'idle_timeout' }),
+      ])
+      for (const r of settled) if (r.status === 'rejected') throw r.reason
+      const refunded = await query<{ total: string }>(
+        `SELECT COALESCE(SUM(delta),0)::text AS total FROM credit_ledger
+          WHERE user_id=$1 AND reason='refund' AND ref_type='usage_record' AND ref_id=$2`,
+        [userId.toString(), usage.rows[0]!.id],
+      )
+      assert.equal(refunded.rows[0]!.total, '100', `iteration ${i}: usage refunded exactly once`)
+    }
+    const wallet = await query<{ credits: string }>('SELECT credits::text AS credits FROM users WHERE id=$1', [userId.toString()])
+    assert.equal(wallet.rows[0]!.credits, '1000')
   })
 })
