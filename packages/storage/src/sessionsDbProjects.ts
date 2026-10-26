@@ -967,6 +967,16 @@ export async function _sqlitePatchClientSessionMeta(
       )
       .get(...params, id, userId) as { updated_at: number } | undefined
     if (!row) return { ok: false, error: 'not_found' }
+    // OCV5-624 / UX C02: outputs registered while the session was ungrouped (or in
+    // another project) keep project_assets.project_id frozen at create time. Moving
+    // the session must rehome those rows or ProjectHome stays empty and search
+    // still labels them「未分类」.
+    if (patch.projectId !== undefined) {
+      db.prepare(
+        `UPDATE project_assets SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+          WHERE user_id = ? AND session_id = ? AND deleted_at IS NULL`,
+      ).run(patch.projectId, now, userId, id)
+    }
     return { ok: true, updatedAt: row.updated_at }
   })
   return txn()
