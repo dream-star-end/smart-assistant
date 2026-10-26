@@ -117,12 +117,12 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 
 | 用例 | 现状 | 本 PR |
 |---|---|---|
-| 降权后旧令牌 | 仅 `/api/admin/*` 有（`adminRouteGate.integ.test.ts:199`、`blockedForUser.integ.test.ts:382`） | 未补：`/api/me/api-keys*`、73 条仅 JWT 用户路由（B4） |
-| 封禁账户 | admin、login、refresh 有；WS bridge 无（桩永远返回 active，`userChatBridge.test.ts:919,2851`） | 未补（B5） |
-| 跨用途令牌 | 容器 token ↔ 用户 JWT 双向有（`containerIdentity.test.ts:399-421`） | 未补：API key 打 internal、个人 gateway JWT 打商业路由（B6） |
+| 降权后旧令牌 | 仅 `/api/admin/*` 有（`adminRouteGate.integ.test.ts:199`、`blockedForUser.integ.test.ts:382`） | B4 已补（`p2bEntryFreeze.test.ts`）：`requireAdmin` 只信 JWT、不读库（冻结为已知缺口，`/api/me/api-keys*` 用它）；`requireAdminVerifyDb` 降权、封禁、删号拒绝，活跃放行。73 条仅 JWT 用户路由的“封禁后 15 分钟内仍有效”属于同一机制（`verifyAccess` 不查库），不逐条复制 |
+| 封禁账户 | admin、login、refresh 有；WS bridge 无（桩永远返回 active，`userChatBridge.test.ts:919,2851`） | B5 已补（`userChatBridge.test.ts` “P2b entry freeze”）：banned → close 1008 `account inactive` 且不连容器；缺行放行（已知缺口） |
+| 跨用途令牌 | 容器 token ↔ 用户 JWT 双向有（`containerIdentity.test.ts:399-421`） | B6 已补：个人 gateway JWT（`{userId,exp}`，同密钥）被 `verifyAccess` 拒；API key 被容器 token 解析器和 `verifyAccess` 拒 |
 | 过期令牌 | `jwt.test.ts:42`、`jwtSync.test.ts:144`、`http.integ.test.ts:326` | gateway `verifyJwt` 已补（B1） |
-| DB 读失败 | 无（`requireAdminVerifyDb` fail-closed、bridge fail-open，均无测试） | 未补（B7） |
-| 错误 Origin | 仅 `containerPreviewBridge.test.ts:126` | 其它路径今天不查 Origin，冻结为“不查”需评审确认口径（B8） |
+| DB 读失败 | 无（`requireAdminVerifyDb` fail-closed、bridge fail-open，均无测试） | B7 已补：`requireAdminVerifyDb` DB 报错 → 拒绝（fail-closed）；bridge 状态查询报错 → 放行（fail-open，冻结为已知缺口） |
+| 错误 Origin | 仅 `containerPreviewBridge.test.ts:126` | B8 未做，**待评审定口径**：其它 7 条路径今天不查 Origin（令牌走子协议/头，不靠 cookie），要不要把“不查”冻结成测试由评审决定 |
 | gateway：无 exp 接受 / `exp:0` 接受 / `alg:none` 头 + 有效 HMAC 接受 / 标准空签名 `alg:none` 拒绝 | 无 | **已补**（B1，前三条标“P4b flips”） |
 
 ## 7. 交付批次与退出
@@ -133,7 +133,8 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 | B2 | 本文件：资金证据矩阵、缺口、隔离审计、入口登记 | 本 PR，待评审 |
 | B3 | `payment.integ.test.ts` 清 Redis 前拒绝 6379（§5 隔离缺口） | 本 PR |
 | T1–T5 | 资金原子性测试补缺：T1 订单履约写中途失败整体回滚；T2 过期器与回调并发；T3 管理员调账并发与重复提交（冻结“今天会记两次”）；T4 父子键并发豁免（证实/证伪 F4）；T5 同一用户不同 request 并发扣费余额不为负 | 下一 PR（需测试集群 55432、过测试锁） |
-| B4–B8 | 入口冻结测试补缺（见 6.4） | 后续 PR |
+| B4–B7 | 入口冻结测试补缺（见 6.4） | `p2bEntryFreeze.test.ts` 7 条 + `userChatBridge.test.ts` 3 条 |
+| B8 | Origin 冻结口径 | 待评审 |
 | 登记表入库 | 把 6.2/6.3 落成机器可读的 `arch/entry-registry.json`（每条路由：校验器、查库、Origin、失败行为、负责人），配生成与 `--check` | 后续 PR（护栏变更单独 PR） |
 
 P2b 退出 = 本设计评审批准 + T1–T5 全绿 + B1/B4–B8 全绿。在此之前试点计费部分只读观测（§9.4）。
