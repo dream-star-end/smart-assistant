@@ -52,7 +52,15 @@ function peerWinsRace(
 function waitForRelease(
   releaseWaiters: Array<() => void>,
   timeoutMs: number,
+  /** Snapshot of releaseEpoch when this acquire last observed the lock as held. */
+  epochAtStart: number,
+  getEpoch: () => number,
 ): Promise<void> {
+  // Holder may have released during our claim settle window before we registered
+  // a waiter — do not sleep the full HOLD_TIMEOUT (BootSplash hang, Codex r2 P1).
+  if (getEpoch() !== epochAtStart) {
+    return Promise.resolve();
+  }
   return new Promise<void>((resolve) => {
     const timer = setTimeout(() => resolve(), timeoutMs);
     releaseWaiters.push(() => {
@@ -85,6 +93,8 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
   let ts = Date.now();
   let holding = false;
   let lostOrBusy = false;
+  /** Bumps on every peer release (even with zero waiters) so early release is not missed. */
+  let releaseEpoch = 0;
   const releaseWaiters: Array<() => void> = [];
 
   const post = (type: LockMessage["type"], stamp: number) => {
@@ -119,6 +129,7 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
     } else if (data.type === "busy") {
       lostOrBusy = true;
     } else if (data.type === "release") {
+      releaseEpoch += 1;
       const waiters = releaseWaiters.splice(0, releaseWaiters.length);
       for (const w of waiters) w();
     }
@@ -128,6 +139,7 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
   try {
     for (;;) {
       lostOrBusy = false;
+      const epochAtClaim = releaseEpoch;
       ts = Date.now();
       try {
         post("claim", ts);
@@ -136,7 +148,12 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
       }
       await sleep(CLAIM_WAIT_MS);
       if (lostOrBusy) {
-        await waitForRelease(releaseWaiters, HOLD_TIMEOUT_MS);
+        await waitForRelease(
+          releaseWaiters,
+          HOLD_TIMEOUT_MS,
+          epochAtClaim,
+          () => releaseEpoch,
+        );
         continue;
       }
 
@@ -144,6 +161,7 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
       // because listeners were not ready) see busy and yield; we re-check.
       holding = true;
       lostOrBusy = false;
+      const epochAtHold = releaseEpoch;
       try {
         post("busy", ts);
       } catch {
@@ -158,7 +176,12 @@ export async function withBroadcastClaim<T>(run: () => Promise<T>): Promise<T> {
         } catch {
           /* ignore */
         }
-        await waitForRelease(releaseWaiters, HOLD_TIMEOUT_MS);
+        await waitForRelease(
+          releaseWaiters,
+          HOLD_TIMEOUT_MS,
+          epochAtHold,
+          () => releaseEpoch,
+        );
         continue;
       }
 

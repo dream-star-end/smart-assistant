@@ -203,3 +203,38 @@ test("BroadcastChannel: overlapping acquires serialize", async () => {
   expect([a, b].sort()).toEqual([1, 2]);
   expect(maxConcurrent).toBe(1);
 });
+
+test("BroadcastChannel: release during claim settle does not hang waiter (Codex r2 P1)", async () => {
+  installFakeBroadcastChannel();
+  vi.stubGlobal("navigator", {});
+
+  let aStarted!: () => void;
+  const aEntered = new Promise<void>((r) => {
+    aStarted = r;
+  });
+  let releaseA!: () => void;
+  const aHold = new Promise<void>((r) => {
+    releaseA = r;
+  });
+
+  const jobA = withBroadcastClaim(async () => {
+    aStarted();
+    await aHold;
+    return "a";
+  });
+
+  await aEntered;
+  // B claims while A holds → receives busy. Release A inside B's claim settle
+  // window (before B registers a release waiter). B must not wait HOLD_TIMEOUT.
+  const jobBPromise = withBroadcastClaim(async () => "b");
+  await new Promise((r) => setTimeout(r, 20)); // B in CLAIM_WAIT after busy
+  releaseA();
+  const started = Date.now();
+  const [a, b] = await Promise.all([jobA, jobBPromise]);
+  const elapsed = Date.now() - started;
+  expect(a).toBe("a");
+  expect(b).toBe("b");
+  // CLAIM_WAIT is 60ms; full hang was ~35s. Allow generous headroom under load.
+  expect(elapsed).toBeLessThan(3_000);
+});
+
