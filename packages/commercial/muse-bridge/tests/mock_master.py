@@ -10,7 +10,7 @@ class State:
         self.ack_gone = set(); self.ack_flaky = {}; self.hb_delay = {}; self.acked = set()
         self.limits = {"chunk_bytes": 4 * 1024 * 1024}
         self.sources = {}; self.nonces = {}; self.source_requests = []; self.claim_bytes = {}
-        self.source_flaky = {}; self.source_bad = {}
+        self.source_flaky = {}; self.source_bad = {}; self.source_short = {}; self.source_bad_cr = set()
         self.done = threading.Condition()
 S = State()
 class H(BaseHTTPRequestHandler):
@@ -48,8 +48,16 @@ class H(BaseHTTPRequestHandler):
         bad = S.source_bad.get(jid)
         if bad == "sha": body = b"x" * len(body)
         if bad == "short": body = body[:-1]
+        cr_a, cr_b = start, end
+        if jid in S.source_bad_cr:
+            # Persistent wrong Content-Range (does not match request Range).
+            cr_a, cr_b = start + 1, end + 1
+        if S.source_short.get(jid, 0) > 0:
+            S.source_short[jid] -= 1
+            # Correct Content-Range but truncated body → bridge short-read path.
+            body = body[: max(1, len(body) // 2)]
         self.send_response(200 if bad == "ignored-range" else 206)
-        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(data)))
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (cr_a, cr_b, len(data)))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers(); self.wfile.write(body)
     def do_POST(self):
