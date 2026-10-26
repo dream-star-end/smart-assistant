@@ -25,6 +25,7 @@ import {
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
 import { classifyRunError } from '../errorClassify.js'
+import { renderHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
 import type { EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { TurnSummary } from '../engine/engineEvents.js'
@@ -570,6 +571,44 @@ describe('AntigravityAdapter', () => {
       assert.equal(summary?.isError, true)
       assert.equal(summary?.errorKind, 'auth')
       assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_AUTH_REQUIRED/)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('trims injected history to the stdin envelope instead of refusing the turn', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      // History sized to the builder's budget on its own; quotes double under
+      // the stdin JSON encoding and the platform context adds more on top.
+      const entry = (i: number) => ({ role: i % 2 ? 'Assistant' : 'User', text: `turn-${i} ${'"'.repeat(250)}${'q'.repeat(250)}` })
+      const transcript = Array.from({ length: 300 }, (_, i) => entry(i))
+      const input = renderHistoricalContextJsonPrompt(transcript, 'latest question')
+      assert.ok(Buffer.byteLength(input, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
+      assert.ok(Buffer.byteLength(JSON.stringify(input), 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES)
+      const { summary } = await runTurn(h, 'tool-success.ndjson', { input })
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      const cap = JSON.parse(await readFile(h.capture, 'utf8'))
+      assert.ok(Buffer.byteLength(cap.stdin, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
+      const prompt = JSON.parse(cap.stdin.trim()).message.content as string
+      assert.match(prompt, /latest question/)
+      assert.match(prompt, /turn-299 /, 'the newest history is kept')
+      assert.doesNotMatch(prompt, /turn-0 /, 'the oldest history is dropped')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('refuses a current message that alone exceeds the stdin limit, classified as context too long', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const input = renderHistoricalContextJsonPrompt([{ role: 'User', text: 'hi' }], 'x'.repeat(ANTIGRAVITY_MAX_PROMPT_BYTES))
+      const { summary } = await runTurn(h, 'tool-success.ndjson', { input })
+      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_PROMPT_TOO_LARGE/)
+      assert.equal(classifyRunError(summary?.errorDetail).code, 'context_too_long')
+      assert.equal(existsSync(h.capture), false)
     } finally {
       await h.restore()
     }

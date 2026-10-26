@@ -663,11 +663,20 @@ function requestReference(...values: Array<string | undefined>): string | undefi
   return undefined;
 }
 
+/** 引擎/路由内部码(ANTIGRAVITY_PROMPT_TOO_LARGE、CURSOR_SAND_SESSION_EXPIRED …)与字节对比。 */
+const INTERNAL_CODE_RE = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/;
+const BYTE_COMPARISON_RE = /\b\d+\s*bytes?\s*[<>]=?\s*\d+/i;
+
 function looksLikeInternalError(value: string | undefined): boolean {
   if (!value) return false;
+  // 单行且以内部码开头(`CODE: …` / 单独一个码)或含字节对比:适配器抛出的错误原文,不是模型回答。
+  // 多行正文不按码判,免得把提到环境变量名的合法部分回答藏掉。
+  const singleLine = !value.trim().includes("\n");
   return (
     /^\s*[\[{]/.test(value) ||
-    /MODEL_AUTHORITY_INVALID|API Error|"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(/i.test(value)
+    /MODEL_AUTHORITY_INVALID|API Error|"(?:error|errors|status|code)"\s*:|\bat\s+\S+\s*\(/i.test(value) ||
+    (singleLine &&
+      (/^\s*(?:[A-Za-z]*Error:\s*)?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?::|\s*$)/.test(value) || BYTE_COMPARISON_RE.test(value)))
   );
 }
 
@@ -679,6 +688,7 @@ function isBoxReplayPendingDetail(...values: Array<string | undefined>): boolean
 /**
  * 「查看详情」detail 统一守卫(Codex 审计 R7)。新 tape 码(model_capacity 等)可能携带 Codex 的
  * JSON errorDetail;若无条件透传就会绕过 engine_error 特判直接进 <pre> 外泄。规则:
+ *   - 内部码 / 字节对比(任意位置,含终止器内)→ 脱敏,只保留可提取的请求 ID;
  *   - 终止器短 prose([turn failed: …] / [error] …)是可读排查线索 → 保留;
  *   - JSON 信封 / 堆栈 / 内部串(looksLikeInternalError)→ 脱敏,只保留可提取的请求 ID;
  *   - 其余普通说明(白名单服务端 message 亦属此类,非内部串)→ 原样保留(不受影响)。
@@ -686,8 +696,9 @@ function isBoxReplayPendingDetail(...values: Array<string | undefined>): boolean
 function sanitizeErrorDetail(detail: string | undefined): string | undefined {
   const d = detail?.trim();
   if (!d) return undefined;
-  if (/^\[(?:turn failed|error)\b/i.test(d)) return d;
-  if (looksLikeInternalError(d)) {
+  const internalCode = INTERNAL_CODE_RE.test(d) || BYTE_COMPARISON_RE.test(d);
+  if (!internalCode && /^\[(?:turn failed|error)\b/i.test(d)) return d;
+  if (internalCode || looksLikeInternalError(d)) {
     const ref = requestReference(d);
     return ref ? `请求 ID：${ref}` : undefined;
   }
@@ -762,6 +773,13 @@ export function errorPresentation(
   let normalized = normalizeTurnErrorCode(code);
   if (/MODEL_AUTHORITY_INVALID|MODEL_AUTHORITY_EXPIRED/i.test(`${code ?? ""}\n${text ?? ""}\n${detail ?? ""}`)) {
     normalized = "model_authority_expired";
+  }
+  // 网关已把 Antigravity 超限归为 context_too_long;旧 tape 里它仍是 ENGINE_ERROR + 原文。
+  if (
+    (normalized === "engine_error" || normalized === "upstream_failed") &&
+    /\bANTIGRAVITY_PROMPT_TOO_LARGE\b/.test(`${text ?? ""}\n${detail ?? ""}`)
+  ) {
+    normalized = "context_too_long";
   }
   const waiverEligible = WAIVED_ERROR_CODES.has(normalized);
   const ref = requestReference(detail, text);
@@ -876,7 +894,9 @@ export function errorPresentation(
     : sanitizeErrorDetail(detail); // R7:统一守卫 _errorDetail(JSON/堆栈脱敏,保留请求 ID)
   // [turn failed …] / [error] … 是 tape 终止器(以 [ 开头,已被 looksLikeInternalError 命中),显式列出
   // 仅为可读;serverMsgOk = 该码白名单且 message 过展示守卫(必非 [ 开头,故与 raw 互斥)。
-  const isRaw = !t || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
+  // 无正文的失败轮,tape 把 errorDetail 原样写进 text:正文 == detail 时它是诊断,不是部分回答。
+  const echoesDetail = !!t && t === detail?.trim();
+  const isRaw = !t || echoesDetail || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
   const sem = turnErrorSemantics(normalized);
   const serverMsgOk = sem.allowPublicServerMessage === true && isDisplayableServerMessage(t);
   const keepText = !isRaw && (t === byCode || serverMsgOk);
@@ -890,10 +910,10 @@ export function errorPresentation(
   }
   // R6:切出尾部终止器,前半段若是合法部分回答(非空、非内部串) → 作 bodyText 正常渲染,红卡在其下方。
   const { body: preTerminator, terminator } = splitTrailingTerminator(t);
-  const partialAnswer = preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+  const partialAnswer = preTerminator && !echoesDetail && !looksLikeInternalError(preTerminator) ? preTerminator : "";
   // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
   const detailOut = normalized === "request_too_large"
-    ? safeDetail : safeDetail ?? (terminator || undefined);
+    ? safeDetail : safeDetail ?? sanitizeErrorDetail(terminator);
   return {
     title: errorLabel(normalized),
     message: byCode,
