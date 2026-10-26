@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, statSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 
 /**
  * P0-Web 前端构建目录热切换(OCV5-489)的 webRoot 决策。
@@ -43,4 +43,13 @@ export function resolveV5WebRoot(opts: {
     return fallback(`no overlay pointer at ${pointer}`)
   }
   return { webRoot: pointer, overlay: true, reason: `overlay pointer ${pointer}` }
+}
+
+/**
+ * 资产池根(OC_V5_WEB_ASSETS_POOL,OCV5-632)。只接受绝对路径,其它一律视为未配置 →
+ * 静态服务与之前完全一致。目录是否存在不在这里判:池缺失只是回落不命中,照常 404。
+ */
+export function resolveV5WebAssetsPool(raw: string | undefined): string | undefined {
+  const value = raw?.trim()
+  return value && isAbsolute(value) ? value : undefined
 }
