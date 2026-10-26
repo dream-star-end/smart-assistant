@@ -200,6 +200,13 @@ function expectedOf(m: ChatMessage) {
   return { recordId: m.id, role: m.role, ...(m._payloadSha256 ? { contentSha256: m._payloadSha256 } : {}) };
 }
 
+/** 可按需取正文的 tool 定位桩的身份键(tape + 序号 + id);取不了的返回 null。 */
+function toolLocatorKey(m: ChatMessage): string | null {
+  if (m._payloadDeferred !== true || m.role !== "tool" || !m.id) return null;
+  if (typeof m._turnTapeId !== "string" || typeof m._recordOrdinal !== "number") return null;
+  return `${m._turnTapeId}:${m._recordOrdinal}:${m.id}`;
+}
+
 /** 定位桩 → 完整工具消息(先 peek 页面缓存,没有再取);不是定位桩原样返回。 */
 function useHydratedTool(message: ToolLike, loader?: DeferredPayloadLoader): Hydrated {
   const m = message as ChatMessage;
@@ -687,29 +694,6 @@ export function InspectorPanelContent({
   const [browserFocus, setBrowserFocus] = useState<string | null>(() =>
     request?.tab === "browser" ? (idOf(request.message) ?? null) : null,
   );
-  // 大记录定位桩没有命令和输出,认不出是浏览器步:换成请求带来的完整消息,或页面缓存里已取到的正文。
-  const clicked = request?.message as ChatMessage | undefined;
-  const browserTurns = useMemo(
-    () =>
-      workTurns.map((t) => ({
-        ...t,
-        steps: t.steps.map((m) =>
-          m._payloadDeferred === true
-            ? (clicked?._payloadDeferred !== true && sameMessage(clicked, m) ? clicked : peekRecord(m, deferredLoader)) ?? m
-            : m,
-        ),
-      })),
-    [workTurns, clicked, deferredLoader],
-  );
-  const viewedTurn = browserTurns[outputsIndex];
-  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
-  const browserCount = useMemo(
-    () => (viewedTurn ? viewedTurn.steps.filter((m) => isBrowserStepMessage(m)).length : 0),
-    [viewedTurn, version],
-  );
-
-  const view: PaneTab =
-    (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0) ? "outputs" : tab;
   const latest = steps.at(-1)?.message ?? null;
   // 首次挂载带着请求(面板 / 底部抽屉刚打开)时和后续请求一样:运行中点开最新那张卡就跟随。
   const [follow, setFollow] = useState(
@@ -722,7 +706,89 @@ export function InspectorPanelContent({
     const id = idOf(m);
     return (id ? steps.find((s) => s.message.id === id)?.message : undefined) ?? m;
   };
-  const shown: ToolLike | null = view === "steps" ? (follow ? latest : resolveSelected(selected)) : null;
+  // 「步骤」页只覆盖 plan / browser 的回退,tab === "steps" 时 view 必是 steps。
+  const stepShown: ToolLike | null = tab === "steps" ? (follow ? latest : resolveSelected(selected)) : null;
+
+  // 大记录定位桩没有命令和输出,认不出是浏览器步:换成请求带来的完整消息,或页面缓存里已取到的正文。
+  const clicked = request?.message as ChatMessage | undefined;
+  const clickedFull = (m: ChatMessage) => (clicked?._payloadDeferred !== true && sameMessage(clicked, m) ? clicked : null);
+  // OCV5-629:收起的过程不再替面板预取 >1 MiB 定位桩(OCV5-627),带大截图的浏览器步只剩定位桩。面板开着时
+  // 自己补取当前查看轮里缺正文的 tool 定位桩:每条只取一次(失败不自动重试,不循环),走同一 deferredLoader
+  // (生产里按记录身份共享任务与页面缓存),取回的正文留在本面板用于认浏览器步;只在面板卸载时中止。
+  // 「步骤」页正在自取的那一条由 StepDetail 负责,这里不重复发起。
+  const loaderRef = useRef(deferredLoader);
+  loaderRef.current = deferredLoader;
+  const probeRef = useRef<{ controller: AbortController; started: Set<string>; records: Map<string, ChatMessage | null> } | null>(null);
+  const [probeVersion, setProbeVersion] = useState(0);
+  const probedRecord = (m: ChatMessage): ChatMessage | null => {
+    const key = toolLocatorKey(m);
+    return (key && probeRef.current?.records.get(key)) || null;
+  };
+  const stepShownId = idOf(stepShown);
+  const probeTargets = (workTurns[outputsIndex]?.steps ?? []).filter((m) => {
+    const key = toolLocatorKey(m);
+    if (!key || m.id === stepShownId || clickedFull(m)) return false;
+    if (probeRef.current?.records.has(key)) return false;
+    return !peekRecord(m, deferredLoader);
+  });
+  const probeKey = probeTargets.map((m) => toolLocatorKey(m)).join("|");
+  const browserProbing = probeTargets.length > 0 && !!deferredLoader?.fetch;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: probeKey 已覆盖目标集合;loader 经 ref 读,避免每次渲染新对象触发重取
+  useEffect(() => {
+    const fetchRecord = loaderRef.current?.fetch;
+    if (!fetchRecord || probeTargets.length === 0) return;
+    probeRef.current ??= { controller: new AbortController(), started: new Set(), records: new Map() };
+    const probe = probeRef.current;
+    for (const m of probeTargets) {
+      const key = toolLocatorKey(m);
+      if (!key || probe.started.has(key)) continue;
+      probe.started.add(key);
+      fetchRecord(m._turnTapeId as string, m._recordOrdinal as number, expectedOf(m), probe.controller.signal)
+        .then(
+          (records) => pickRecord(records, m),
+          () => null,
+        )
+        .then((record) => {
+          if (probe.controller.signal.aborted) return;
+          probe.records.set(key, record);
+          setProbeVersion((n) => n + 1);
+        });
+    }
+  }, [probeKey]);
+  // 卸载时中止并丢弃(StrictMode 的模拟卸载后,重挂会重新补取,不会停在一个已中止的探针上)。
+  useEffect(
+    () => () => {
+      probeRef.current?.controller.abort();
+      probeRef.current = null;
+    },
+    [],
+  );
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: probeVersion 是补取正文到达的信号(正文在 ref 里)
+  const browserTurns = useMemo(
+    () =>
+      workTurns.map((t) => ({
+        ...t,
+        steps: t.steps.map((m) =>
+          m._payloadDeferred === true ? (clickedFull(m) ?? peekRecord(m, deferredLoader) ?? probedRecord(m) ?? m) : m,
+        ),
+      })),
+    [workTurns, clicked, deferredLoader, probeVersion],
+  );
+  const viewedTurn = browserTurns[outputsIndex];
+  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
+  const browserCount = useMemo(
+    () => (viewedTurn ? viewedTurn.steps.filter((m) => isBrowserStepMessage(m)).length : 0),
+    [viewedTurn, version],
+  );
+  // 停在「浏览器」页而这一轮的大记录还在补取:先给读取态,不退回产出(取完仍没有浏览器步再退回)。
+  const browserPending = tab === "browser" && browserCount === 0 && browserProbing;
+
+  const view: PaneTab =
+    (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0 && !browserPending)
+      ? "outputs"
+      : tab;
+  const shown: ToolLike | null = view === "steps" ? stepShown : null;
   const index = shown ? steps.findIndex((s) => sameMessage(s.message, shown)) : -1;
   const following = follow && running && !!latest;
 
@@ -781,7 +847,7 @@ export function InspectorPanelContent({
   const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
-    ...(browserCount > 0 ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
+    ...(browserCount > 0 || browserPending ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
     { value: "steps", label: <span>步骤{count(steps.length)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
@@ -831,6 +897,11 @@ export function InspectorPanelContent({
           ) : (
             <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
           )
+        ) : view === "browser" && browserPending ? (
+          <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted" data-testid="browser-hydrating">
+            <Spinner size={13} className="text-accent" />
+            正在读取这一轮的浏览器记录…
+          </div>
         ) : view === "browser" ? (
           <Suspense fallback={<OutputsFallback />}>
             <BrowserView
