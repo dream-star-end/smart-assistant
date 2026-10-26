@@ -1,12 +1,27 @@
 // OCV5-593 导演 agent panel (d04): what the agent is doing, the "需要你" candidates, activity,
 // budget, and the instruction box (enabled when the orchestrator ships, A2-1).
+// Pause resume CTA lives here too: the default project route is the board, and users see
+// "已暂停" in this panel — the Brief-only 继续 button was easy to miss.
 
-import { Check, CircleAlert, Hand, ImageIcon, RefreshCw, Send, Sparkles, Zap } from 'lucide-react'
+import {
+  Check,
+  CircleAlert,
+  Hand,
+  ImageIcon,
+  Play,
+  RefreshCw,
+  Send,
+  Sparkles,
+  Zap,
+} from 'lucide-react'
+import { useState } from 'react'
 
+import { studioApi, studioErrorText } from '../../lib/studio/api'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import { type ShotCardModel, eventText, eventTone } from '../../lib/studio/model'
-import type { StudioProjectView } from '../../lib/studio/types'
+import type { StudioProject, StudioProjectView } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
+import { useToast } from '../ui'
 import { MediaThumb } from './MediaThumb'
 
 const STATUS_LINE: Record<string, string> = {
@@ -33,10 +48,27 @@ export function AgentPanel(props: {
   view: StudioProjectView
   cards: ShotCardModel[]
   onOpenShot: (shotId: string) => void
+  /** Apply a project row after pause/resume (board / voice default surfaces). */
+  onProject?: (project: StudioProject) => void
 }) {
   const { project, events, takes } = props.view
   const needs = props.cards.filter((c) => c.tone === 'needs')
   const pct = budgetPercent(project.spentCredits, project.reservedCredits, project.budgetCredits)
+  const toast = useToast()
+  const [resuming, setResuming] = useState(false)
+
+  const resume = async () => {
+    if (!props.onProject || resuming || project.status !== 'paused') return
+    setResuming(true)
+    try {
+      props.onProject(await studioApi.transition(props.auth, project.id, 'resume'))
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setResuming(false)
+    }
+  }
+
   return (
     <aside className="st-panel st-agent-panel" aria-label="导演 agent">
       <div className="st-row st-agent-head">
@@ -48,7 +80,14 @@ export function AgentPanel(props: {
           <div className="st-cap st-row" style={{ gap: 6 }}>
             <span
               className="st-dot"
-              style={{ color: project.status === 'running' ? 'var(--success)' : 'var(--faint)' }}
+              style={{
+                color:
+                  project.status === 'running'
+                    ? 'var(--success)'
+                    : project.status === 'paused'
+                      ? 'var(--warn, #c48a00)'
+                      : 'var(--faint)',
+              }}
             />
             {STATUS_LINE[project.status] ?? project.status}
           </div>
@@ -62,6 +101,27 @@ export function AgentPanel(props: {
         ) : null}
       </div>
       <div className="st-agent-body">
+        {project.status === 'paused' && props.onProject ? (
+          <div className="st-needs" data-testid="studio-paused-resume">
+            <div className="st-row" style={{ gap: 8 }}>
+              <span className="st-chip st-chip-warn">已暂停</span>
+              <b style={{ fontSize: 13 }}>生成已停下</b>
+            </div>
+            <div className="st-cap" style={{ marginTop: 6, color: 'var(--muted)' }}>
+              点继续会从暂停前的步骤接着跑；镜头审阅不受影响。
+            </div>
+            <button
+              type="button"
+              className="st-btn st-btn-sm st-btn-primary"
+              style={{ marginTop: 10 }}
+              disabled={resuming}
+              onClick={() => void resume()}
+            >
+              <Play size={14} />
+              {resuming ? '继续中…' : '继续'}
+            </button>
+          </div>
+        ) : null}
         {needs.map((c) => {
           const options = takes
             .filter(

@@ -291,4 +291,33 @@ describe('StudioApp (OCV5-593)', () => {
     mount('/studio/nope')
     expect(await screen.findByText('页面不存在')).toBeInTheDocument()
   })
+
+  test('paused board (default route) exposes 继续 in the topbar and agent panel', async () => {
+    let status: StudioProject['status'] = 'paused'
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: {
+        project: project({ status }),
+        shots: [],
+        lines: [],
+        assets: [],
+        takes: [],
+        events: [],
+      },
+    })
+    routes[`POST /api/studio/projects/${ID}/resume`] = () => {
+      status = 'running'
+      return { status: 200, body: { project: project({ status: 'running', rev: 2 }) } }
+    }
+    // Default project URL is the board — where the bug showed only「已暂停」+「需要你」.
+    mount(`/studio/p/${ID}`)
+    expect(await screen.findByTestId('studio-topbar-resume')).toBeInTheDocument()
+    expect(await screen.findByTestId('studio-paused-resume')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('studio-topbar-resume'))
+    await waitFor(() =>
+      expect(calls.some((c) => c.method === 'POST' && c.path.endsWith('/resume'))).toBe(true),
+    )
+  })
+
 })

@@ -11,6 +11,7 @@ import { type ShotCardModel, shotCard, takesOf, timeline } from '../../../lib/st
 import type {
   ProvidersView,
   StudioLine,
+  StudioProject,
   StudioProjectView,
   StudioTake,
 } from '../../../lib/studio/types'
@@ -122,6 +123,7 @@ export function VoicePage(props: {
   providers: ProvidersView
   onOpenShot: (shotId: string) => void
   onReload: () => Promise<void> | void
+  onProject?: (project: StudioProject) => void
 }) {
   const { auth, view } = props
   const voice = kindView(props.providers, 'voice')
@@ -249,7 +251,13 @@ export function VoicePage(props: {
           onSelect={props.onOpenShot}
         />
       </div>
-      <AgentPanel auth={auth} view={view} cards={cards} onOpenShot={props.onOpenShot} />
+      <AgentPanel
+        auth={auth}
+        view={view}
+        cards={cards}
+        onOpenShot={props.onOpenShot}
+        onProject={props.onProject}
+      />
     </div>
   )
 }

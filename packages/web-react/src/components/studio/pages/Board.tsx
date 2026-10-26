@@ -6,7 +6,12 @@ import { useMemo, useState } from 'react'
 import { kindView } from '../../../hooks/useStudioProviders'
 import { formatCredits } from '../../../lib/studio/format'
 import { type ShotCardModel, shotCard, timeline } from '../../../lib/studio/model'
-import type { ProvidersView, StudioProjectView, StudioTake } from '../../../lib/studio/types'
+import type {
+  ProvidersView,
+  StudioProject,
+  StudioProjectView,
+  StudioTake,
+} from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
 import { AgentPanel } from '../AgentPanel'
 import { MediaThumb } from '../MediaThumb'
@@ -29,6 +34,7 @@ export function BoardPage(props: {
   providers: ProvidersView
   onOpenShot: (shotId: string) => void
   onOpenBrief: () => void
+  onProject?: (project: StudioProject) => void
 }) {
   const { auth, view } = props
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
@@ -55,11 +61,13 @@ export function BoardPage(props: {
               <Sparkles size={14} />
             </span>
             <span style={{ flex: 1, minWidth: 0 }} className="st-cap">
-              {needs
-                ? `${needs} 个镜头需要你`
-                : view.project.status === 'running'
-                  ? '正在生成镜头'
-                  : '导演 agent'}
+              {view.project.status === 'paused'
+                ? '已暂停'
+                : needs
+                  ? `${needs} 个镜头需要你`
+                  : view.project.status === 'running'
+                    ? '正在生成镜头'
+                    : '导演 agent'}
             </span>
             <span className="st-cap tnum">
               {formatCredits(view.project.spentCredits)} /{' '}
@@ -172,7 +180,13 @@ export function BoardPage(props: {
           onSelect={props.onOpenShot}
         />
       </div>
-      <AgentPanel auth={auth} view={view} cards={cards} onOpenShot={props.onOpenShot} />
+      <AgentPanel
+        auth={auth}
+        view={view}
+        cards={cards}
+        onOpenShot={props.onOpenShot}
+        onProject={props.onProject}
+      />
     </div>
   )
 }
