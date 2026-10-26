@@ -2,7 +2,8 @@
  * 会话产出物自动归集 + 上传参考资料 excerpt 提取。
  *
  * 产出物:扫助手正文里的 `/home/agent/.openclaude/generated/...` 绝对路径,
- * 登记为 source='output' 的项目资产。失败不得影响回合收口。
+ * 以及会话 cwd `workspace/sessions/<id>/` 下的顶层文件（复制进 generated/session-ws/
+ * 后再登记，以符合 containerPath 白名单）。登记为 source='output'。失败不得影响回合收口。
  *
  * 容器里(有 master 地址与容器令牌)必须登记到 master:容器自己的 sessions
  * 后端是本地 SQLite,界面读的是 master 的 PG,登记在本地等于没登记。项目
@@ -17,10 +18,12 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import {
   appendFile,
+  copyFile,
   link,
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -49,6 +52,11 @@ export const PROJECT_ASSET_TURN_COLLECT_MAX = 5
 /** Outputs above this are registered by source path only, without a version copy. */
 export const OUTPUT_VERSION_COPY_MAX_BYTES = 50 * 1024 * 1024
 const GENERATED_PREFIX = '/home/agent/.openclaude/generated/'
+/** Session-isolated agent cwd (Write tool default). Not in the asset path allowlist. */
+const WORKSPACE_SESSIONS_PREFIX = '/home/agent/.openclaude/workspace/sessions/'
+/** Promoted copies of workspace session files live here so register stays on generated/. */
+const GENERATED_SESSION_WS_REL = 'session-ws/'
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{8,64}$/
 const COPY_CHUNK_BYTES = 1024 * 1024
 const EXCERPT_PARSE_TIMEOUT_MS = 8_000
 const EXCERPT_TEXT_BYTES_MAX = 16 * 1024
@@ -97,6 +105,161 @@ export function extractGeneratedOutputPaths(text: string): string[] {
     if (out.length >= PROJECT_ASSET_TURN_COLLECT_MAX) break
   }
   return out
+}
+
+/** Absolute container path for one session's isolated workspace cwd. */
+export function sessionWorkspaceContainerDir(sessionId: string): string | null {
+  if (!SESSION_ID_RE.test(sessionId)) return null
+  return `${WORKSPACE_SESSIONS_PREFIX}${sessionId}`
+}
+
+/**
+ * Copy (or hardlink) top-level regular files from workspace/sessions/<id>/ into
+ * generated/session-ws/<id>/ so they can be registered under the generated/
+ * containerPath allowlist. Returns generated absolute paths (deduped, capped).
+ * OCV5-625: Write-tool outputs land in session cwd, not generated/.
+ */
+export async function promoteSessionWorkspaceOutputs(
+  sessionId: string,
+  roots: OutputVersionRoots = defaultOutputRoots(),
+  opts?: { max?: number },
+): Promise<string[]> {
+  const max = opts?.max ?? PROJECT_ASSET_TURN_COLLECT_MAX
+  if (max <= 0) return []
+  const containerDir = sessionWorkspaceContainerDir(sessionId)
+  if (!containerDir) return []
+  const wsRoot = roots.workspaceSessions ?? WORKSPACE_SESSIONS_PREFIX.slice(0, -1)
+  const sessionFsDir = join(wsRoot, sessionId)
+  let names: string[]
+  try {
+    names = await readdir(sessionFsDir)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return []
+    log.warn('session workspace readdir failed', { sessionId }, err)
+    return []
+  }
+  let rootReal: string
+  try {
+    rootReal = await realpath(wsRoot)
+  } catch {
+    return []
+  }
+  let generatedReal: string
+  try {
+    await mkdir(roots.generated, { recursive: true })
+    generatedReal = await realpath(roots.generated)
+  } catch {
+    return []
+  }
+
+  type Cand = { name: string; real: string; mtimeMs: number; alreadyPromoted: boolean; destFs: string; destRel: string }
+  const cands: Cand[] = []
+  for (const name of names) {
+    if (!name || name.startsWith('.')) continue
+    if (name.includes('/') || name.includes(String.fromCharCode(92)) || name.includes('..')) continue
+    const abs = join(sessionFsDir, name)
+    let st
+    try {
+      st = await lstat(abs)
+    } catch {
+      continue
+    }
+    // Skip symlinks at the source (lstat: isSymbolicLink true even when target is a file).
+    if (st.isSymbolicLink() || !st.isFile()) continue
+    let real: string
+    try {
+      real = await realpath(abs)
+    } catch {
+      continue
+    }
+    if (!real.startsWith(rootReal + sep)) {
+      log.warn('session workspace file resolves outside sessions root, skipped', { sessionId, name })
+      continue
+    }
+    const destRel = `${GENERATED_SESSION_WS_REL}${sessionId}/${name}`
+    const destFs = join(roots.generated, destRel)
+    let alreadyPromoted = false
+    try {
+      const dstSt = await lstat(destFs)
+      // Treat only a regular file as "already promoted"; a dangling/hostile symlink is not.
+      alreadyPromoted = dstSt.isFile() && !dstSt.isSymbolicLink()
+    } catch {
+      alreadyPromoted = false
+    }
+    cands.push({ name, real, mtimeMs: st.mtimeMs, alreadyPromoted, destFs, destRel })
+  }
+
+  // Prefer not-yet-promoted so later turns can register new files under the per-turn cap;
+  // among equals, newer mtime first. Already-promoted fill remaining slots (re-register / rehome).
+  cands.sort((a, b) => {
+    if (a.alreadyPromoted !== b.alreadyPromoted) return a.alreadyPromoted ? 1 : -1
+    return b.mtimeMs - a.mtimeMs
+  })
+
+  const out: string[] = []
+  for (const c of cands) {
+    if (out.length >= max) break
+    try {
+      await mkdir(dirname(c.destFs), { recursive: true })
+      // Ensure dest parent stays under generated (no symlink escape via parent).
+      const destParentReal = await realpath(dirname(c.destFs))
+      if (!destParentReal.startsWith(generatedReal + sep) && destParentReal !== generatedReal) {
+        log.warn('promote dest parent outside generated, skipped', { sessionId, name: c.name })
+        continue
+      }
+      await materializePromotedCopy(c.real, c.destFs)
+    } catch (err) {
+      log.warn('promote session workspace file failed', { sessionId, name: c.name }, err)
+      continue
+    }
+    const containerPath = `${GENERATED_PREFIX}${c.destRel}`
+    const parsed = parseProjectAssetContainerPath(containerPath)
+    if (!parsed) continue
+    out.push(parsed)
+  }
+  return out
+}
+
+/**
+ * Place source bytes at destFs without following a pre-existing dest symlink
+ * (copyFile would otherwise overwrite the symlink target outside generated/).
+ */
+async function materializePromotedCopy(srcReal: string, destFs: string): Promise<void> {
+  try {
+    const dstSt = await lstat(destFs)
+    if (dstSt.isSymbolicLink() || !dstSt.isFile()) {
+      await rm(destFs, { force: true })
+    }
+  } catch (err) {
+    if ((err as { code?: string }).code !== 'ENOENT') throw err
+  }
+  const tmp = `${destFs}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
+  try {
+    try {
+      await link(srcReal, tmp)
+    } catch (linkErr) {
+      const code = (linkErr as { code?: string }).code
+      if (code === 'EXDEV' || code === 'EEXIST') {
+        await copyFile(srcReal, tmp)
+      } else {
+        throw linkErr
+      }
+    }
+    // rename replaces a regular file atomically; if a symlink reappeared, unlink first.
+    try {
+      await rename(tmp, destFs)
+    } catch (renErr) {
+      const code = (renErr as { code?: string }).code
+      if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+        await rm(destFs, { force: true })
+        await rename(tmp, destFs)
+      } else {
+        throw renErr
+      }
+    }
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
+  }
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -205,6 +368,8 @@ export interface OutputVersionRoots {
   generated: string
   /** Content-addressed store, the same directory uploads land in (served by /api/media). */
   cas: string
+  /** Real directory behind `/home/agent/.openclaude/workspace/sessions/` (test seam). */
+  workspaceSessions?: string
 }
 
 export interface CapturedOutputVersion {
@@ -489,7 +654,21 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
   if (viaMaster) {
     await flushOutputAssetSpool(opts).catch((err) => log.warn('output asset spool flush failed', {}, err))
   }
-  const paths = extractGeneratedOutputPaths(opts.assistantText)
+  const fromText = extractGeneratedOutputPaths(opts.assistantText)
+  const remaining = Math.max(0, PROJECT_ASSET_TURN_COLLECT_MAX - fromText.length)
+  const fromWorkspace =
+    remaining > 0
+      ? await promoteSessionWorkspaceOutputs(opts.sessionId, opts.outputRoots ?? defaultOutputRoots(), {
+          max: remaining,
+        })
+      : []
+  const seen = new Set(fromText)
+  const paths = [...fromText]
+  for (const p of fromWorkspace) {
+    if (seen.has(p)) continue
+    seen.add(p)
+    paths.push(p)
+  }
   if (paths.length === 0) return
   const items: OutputAssetItem[] = []
   for (const containerPath of paths) {
