@@ -189,5 +189,7 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
   ensure_env_kv "$V5_ENV" OC_V5_WEB_OVERLAY_ROOT "$WEB_OVERLAY_ROOT"
+  # OCV5-633:master 在 spa 模式 /assets 未命中时回落的资产池根(网关只认绝对路径;master 重启生效)。
+  ensure_env_kv "$V5_ENV" OC_V5_WEB_ASSETS_POOL "$WEB_ASSETS_POOL"
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }

@@ -54,7 +54,7 @@ test('actual cmd_deploy passes captured A through lease master runtime payload e
  const f=fixture(t);f.git('checkout','-q',f.A);writeFileSync(join(f.dir,'env'),'');symlinkSync(f.repo,join(f.dir,'live'));
  const source=[fn(d,'cmd_deploy'),fn(d,'start_runtime_release_bg'),fn(d,'collect_runtime_release_bg'),expected(),fn(m,'build_master_release'),fn(d,'build_platform_bundle').replace('build_platform_bundle()','production_platform_bundle()')].join('\n');
  const body=[platformStubs,'DRY=1; ALLOW_DIRTY=0; PLATFORM_FROM_HEAD=1; RELEASE_POLICY_RESUME=0','V5_ENV="$TEST_ROOT/env"; MASTER_LIVE_LINK="$TEST_ROOT/live"; MASTER_RELEASES_ROOT="$TEST_ROOT/releases"',
- 'preflight_common() { :; }; explain_dirty_semantics() { :; }; ensure_selfhost_env_keys() { :; }; assert_env_key_drift() { :; }',
+ 'preflight_common() { :; }; explain_dirty_semantics() { :; }; ensure_selfhost_env_keys() { :; }; assert_env_key_drift() { :; }; seed_web_assets_pool_from_live() { :; }',
  // These policy boundaries are spies; the policy suite exercises their implementations.
  'release_policy_bind_official_train_request() { echo "$1" > "$TEST_ROOT/bind"; [[ "$1" == "$A" ]]; }',
  'cutover_adopt_inflight_request() { echo "$1" > "$TEST_ROOT/adopt"; [[ "$1" == "$A" ]]; }',

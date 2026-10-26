@@ -199,6 +199,11 @@ WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-
 source "$SCRIPT_DIR/v5-web-overlay-lib.sh"
 # shellcheck source=scripts/v5-selfhost-p0-web-lib.sh
 source "$SCRIPT_DIR/v5-selfhost-p0-web-lib.sh"
+# /assets 资产池(OCV5-633,X-P1-1):master 在 spa 模式 /assets 未命中 webRoot 时回落 <pool>/assets
+# (网关侧 PR-a #1146)。--deploy 切流前播种 live 资产,cutover 收尾按保护集 GC,--smoke 验回落面。
+WEB_ASSETS_POOL="${OC_V5_WEB_ASSETS_POOL:-/opt/openclaude/openclaude-v5-selfhost-assets}"
+# shellcheck source=scripts/v5-web-assets-pool-lib.sh
+source "$SCRIPT_DIR/v5-web-assets-pool-lib.sh"
 BOOT_SCRIPT_DIR="${BOOT_SCRIPT_DIR:-${BREAKGLASS_ROOT}/boot}"
 # 看护 timer 执行的是这个安装目录里的 watch.sh,不是 release(OCV5-404)。
 V5_WATCH_DIR="${V5_WATCH_DIR:-/opt/openclaude/v5-selfhost-watch}"
@@ -2009,6 +2014,50 @@ $out
   esac
 }
 
+# OCV5-633:切流前把此刻 live 正在 serve 的前端资产(P0-Web 指针 webroot 或 release dist)加法同步进
+# 资产池。切流后仍开着旧版的标签页懒加载的正是这一份;新 release 的资产由它自己的 webRoot 提供,
+# 下次发版它成为 live 时再被播种。同步失败中止本次发布(live 未动);池所在盘可用 <1GiB 或找不到
+# live 资产目录则跳过并告警(只是回到无池现状,不阻断发版)。
+seed_web_assets_pool_from_live() {
+  local live src avail_kb out
+  log "── /assets 资产池播种(live 前端资产 → $WEB_ASSETS_POOL/assets;加法,排除 .map)──"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 同步 live webroot 的 assets → $WEB_ASSETS_POOL/assets(加法,无删除)"
+    return 0
+  fi
+  live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  if ! src="$(wap_live_assets_dir "$WEB_OVERLAY_ROOT" "$live" 2>&1)"; then
+    log "  ⚠ 找不到 live 前端资产目录($src),跳过播种(旧标签页懒加载仍可能 404)"
+    return 0
+  fi
+  mkdir -p -- "$WEB_ASSETS_POOL" || die "建不了资产池根 $WEB_ASSETS_POOL。live 未动。"
+  avail_kb="$(df -Pk -- "$WEB_ASSETS_POOL" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ "$avail_kb" =~ ^[0-9]+$ ]] && ((avail_kb < 1048576)); then
+    log "  ⚠ 资产池所在盘可用 <1GiB,跳过播种(仅告警)"
+    return 0
+  fi
+  out="$(wap_sync "$WEB_ASSETS_POOL" "$src" 2>&1)" \
+    || die "资产池播种失败:$out。live 未动。补救: 检查 $WEB_ASSETS_POOL 的权限与磁盘后重发。"
+  log "  ✓ 已播种 $src($out)"
+}
+
+# OCV5-633 cutover 收尾(仅告警,不回滚):保护集 = 保留的 rel-*(含新 live)+ .prev-release +
+# 各 P0-Web 桶 current 指向的 webroot;只删池内不在保护集且超过 14 天未被播种的文件。
+web_assets_pool_gc() {
+  local r b prev
+  local -a dirs=()
+  for r in "$MASTER_RELEASES_ROOT"/rel-*; do
+    [[ -d "$r/packages/web-react/dist/assets" ]] && dirs+=("$r/packages/web-react/dist/assets")
+  done
+  prev="$(cat -- "$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
+  [[ "$prev" == /* ]] && dirs+=("$prev/packages/web-react/dist/assets")
+  for b in "$WEB_OVERLAY_ROOT"/rel-*; do
+    [[ -L "$b/current" ]] && dirs+=("$b/current/assets")
+  done
+  echo "── /assets 资产池 GC(保护集 ${#dirs[@]} 个目录;只删非保护且 >14 天)──"
+  wap_gc "$WEB_ASSETS_POOL" 14 "${dirs[@]}"
+}
+
 cmd_deploy() {
   local sha dirty
   if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
@@ -2054,6 +2103,7 @@ $dirty
   [[ -L "$MASTER_LIVE_LINK" ]] \
     || die "缺 live symlink $MASTER_LIVE_LINK。本 --deploy 假定首次翻转已完成。
 补救: --cutover --release=<已有 rel-*> 完成首次翻转,或跑应急 restore-worktree-units.sh。"
+  seed_web_assets_pool_from_live
 
   ensure_node_modules
   install_aux_units
@@ -3025,6 +3075,8 @@ cmd_cutover() {
     || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
   wo_gc_buckets "$WEB_OVERLAY_ROOT" "$MASTER_RELEASES_ROOT" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ P0-Web overlay 桶 GC 失败(仅告警,不回滚)"
+  web_assets_pool_gc 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ /assets 资产池 GC 失败(仅告警,不回滚)"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 

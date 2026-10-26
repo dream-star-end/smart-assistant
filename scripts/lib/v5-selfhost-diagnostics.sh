@@ -53,6 +53,19 @@ cmd_smoke() {
     die "GET / oc-build=$got_build 不等于 ${dist_html} 的 $expected_build。补救: 确认 live 指向本次 release 后 restart master。"
   fi
   log "  ✓ GET / 返回 SPA index.html(oc-build=${got_build:-present} src=${dist_html})"
+  # OCV5-633 /assets 资产池回落面:live 含回落代码(PR-a #1146)且 env 已配资产池时,池里一个当前
+  # webRoot 没有的 chunk 经 master 必须 200。回退到更早的 release 或池里暂无此类文件则跳过。
+  local pool_root="" live_assets="" probe=""
+  pool_root="$(oc_hotcfg_env_get "$V5_ENV" OC_V5_WEB_ASSETS_POOL 2>/dev/null || true)"
+  if [[ -n "$pool_root" && -n "$live_root" ]] \
+    && grep -q 'webAssetsPool' "$live_root/packages/gateway/src/server.ts" 2>/dev/null; then
+    live_assets="$(wap_live_assets_dir "$WEB_OVERLAY_ROOT" "$live_root" 2>/dev/null || true)"
+    probe="$(wap_fallback_probe "http://127.0.0.1:${V5_PORT}" "$pool_root" "$live_assets" 2>&1)" \
+      || die "/assets 资产池回落面失败:$probe。补救: 确认 master 带 OC_V5_WEB_ASSETS_POOL 重启(journalctl -u $V5_UNIT 里应有 'gateway: /assets fallback pool')。"
+    log "  ✓ /assets 资产池回落面:$probe"
+  else
+    log "  - /assets 资产池回落面:跳过(env 未配资产池,或 live 早于回落代码)"
+  fi
   assert_ssh_rule_before_drop
   assert_personal_alive
   log "  ✓ 个人版 $PERSONAL_UNIT 仍 active 且 :$PERSONAL_PORT 仍 200"
