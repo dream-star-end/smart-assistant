@@ -2481,6 +2481,8 @@ export function MessageList({
   visibleKeysRef.current = visibleItems.map(itemKey);
   if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
     const eager = new Set(visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey));
+    // 过程里的定位桩只在该过程(或阶段详情)展开、行真正挂上时才用到这张表;收起态不挂行,
+    // 也就不取(OCV5-627)。
     for (const item of visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS)) {
       if (item.kind !== "process") continue;
       for (const message of item.members) {
@@ -2659,8 +2661,6 @@ export function MessageList({
           (message.role === "assistant" || message.role === "user") &&
           (message.text ?? "").toLowerCase().includes(needle)
         );
-      const eager = eagerPayloadKeysRef.current?.has(it.key) === true
-        || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
       const explicit = disclosureValues[it.key];
       // Absent means the default: open while this turn is still running,
       // closed once it has finished. A click stores true or false and is not
@@ -2683,7 +2683,6 @@ export function MessageList({
           renderItem={renderItem}
           keyOf={renderItemKey}
           messagesOf={itemMessages}
-          eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
           lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
