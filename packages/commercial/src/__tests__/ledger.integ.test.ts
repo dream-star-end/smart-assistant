@@ -228,3 +228,56 @@ describe("listLedger 分页", () => {
     assert.equal(top3[2].ref_id, "2");
   });
 });
+
+// P2b 资金原子性 T3(docs/ARCH_P2B_FUND_ENTRY_GATES.md):管理员调账的并发与重复提交。
+describe("P2b adminAdjust 并发与重复提交", () => {
+  test("T3 并发正向调账:余额等于总和,每笔一条流水,balance_after 串成连续的链", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const adminId = await createUser("p2b-t3-admin@example.com", 0n, "admin");
+    const uid = await createUser("p2b-t3-up@example.com", 0n);
+    await Promise.all(Array.from({ length: 10 }, (_, i) => adminAdjust(uid, 10n, `p2b up ${i}`, adminId)));
+    assert.equal(await readCredits(uid), 100n);
+    const rows = await query<{ balance_after: string }>(
+      "SELECT balance_after::text AS balance_after FROM credit_ledger WHERE user_id = $1 ORDER BY id",
+      [uid.toString()],
+    );
+    assert.deepEqual(rows.rows.map((r) => r.balance_after), ["10", "20", "30", "40", "50", "60", "70", "80", "90", "100"]);
+    const audit = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM admin_audit WHERE admin_id = $1", [adminId.toString()]);
+    assert.equal(audit.rows[0].cnt, "10");
+  });
+
+  test("T3 并发负向调账:余额不为负,超额的那几笔整笔拒绝且不留流水/审计", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const adminId = await createUser("p2b-t3-admin2@example.com", 0n, "admin");
+    const uid = await createUser("p2b-t3-down@example.com", 100n);
+    const results = await Promise.allSettled(
+      Array.from({ length: 5 }, (_, i) => adminAdjust(uid, -30n, `p2b down ${i}`, adminId)),
+    );
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(ok, 3);
+    assert.equal(rejected.length, 2);
+    for (const r of rejected) assert.ok(r.status === "rejected" && r.reason instanceof InsufficientCreditsError);
+    assert.equal(await readCredits(uid), 10n);
+    const ledger = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1", [uid.toString()]);
+    assert.equal(ledger.rows[0].cnt, "3");
+    const audit = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM admin_audit WHERE admin_id = $1", [adminId.toString()]);
+    assert.equal(audit.rows[0].cnt, "3");
+  });
+
+  test("T3 冻结缺口 F2:同一调账重复提交今天会记两次(加幂等键的修复 PR 翻转本用例)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const adminId = await createUser("p2b-t3-admin3@example.com", 0n, "admin");
+    const uid = await createUser("p2b-t3-dup@example.com", 0n);
+    const ref = { type: "p2b", id: "same-request" };
+    await adminAdjust(uid, 50n, "p2b retry", adminId, ref);
+    await adminAdjust(uid, 50n, "p2b retry", adminId, ref);
+    assert.equal(await readCredits(uid), 100n);
+    const ledger = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1", [uid.toString()]);
+    assert.equal(ledger.rows[0].cnt, "2");
+  });
+});

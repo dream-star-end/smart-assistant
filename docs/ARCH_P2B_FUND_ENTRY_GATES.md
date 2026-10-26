@@ -44,10 +44,11 @@
 | F1 | 余额列无 DB 级非负约束 | `0001:22`、`0111:30` | 任一新写入点绕过 `spend.ts:278` / `ledger.ts:154` / `admin/orgs.ts:236` 的应用层检查 | 先加 `NOT VALID` CHECK 观测，单独 PR；不在 P2b |
 | F2 | 管理员/组织调账无幂等键 | `ledger.ts:128-201`、`admin/orgs.ts:228` | 管理端提交超时后重试，同一笔调账记两次 | 管理端请求带 `Idempotency-Key`，账本加部分唯一索引；单独 PR |
 | F3 | 账本请求唯一索引对现行扣费不生效 | `0009:18-20` 只覆盖 `ref_type='request'`；现行扣费写 `ref_type='usage_record'`（`proxyBilling.ts:973`） | 结算幂等完全依赖 `uniq_ur_user_request`；若将来有路径只写账本不写 usage_records，就没有兜底 | 登记为事实；P6 搬 billing 时把索引条件与现行形态对齐 |
-| F4 | 退款逐 usage 去重无唯一索引 | `refund.ts:256-263`（`turn_key=$2 OR parent_turn_key=$2` + `NOT EXISTS`）；咨询锁按 `input.turnKey`（`:222`），另有 lineage 锁（`:242`） | 父键与子键两个豁免并发、且 lineage 不同（或为空）时，两边持不同锁，可能对同一 usage 各退一次。**待证实**：子回合键能否被独立豁免 | 先写并发测试 T4 证实或证伪；证实后加 `credit_ledger` 退款部分唯一索引 |
+| F4 | 退款逐 usage 去重无唯一索引 | `refund.ts:256-263`（`turn_key=$2 OR parent_turn_key=$2` + `NOT EXISTS`）；咨询锁按 `input.turnKey`（`:222`），另有 lineage 锁（`:242`） | **已由 T4 证实（2026-10-26）**：按豁免路由的真实顺序（先提交 pending 围栏 `http/internalTurnWaive.ts:231`，再 `applyTurnWaiver`），父键与子键两个豁免并发时，同一条 100 积分的 usage 被退了 200。两边都已有 pending 行，不再 INSERT，所以不会触发 F8 的死锁；后到的一方等 users 行锁，拿到锁后用的是锁前读到的旧 debit 列表。路由只校验 turnKey 格式和容器身份，所以子键能进来；**gateway 实际会不会提交子键豁免未核实** | 修复是资金写路径行为改动，需评审批准后单独 PR。候选做法：按用户加豁免咨询锁，并在锁后再读 debit；或者给 `credit_ledger` 加退款部分唯一索引兜底。T4 暂以 `todo` 保留（照常运行并报告，不阻断），修复 PR 去掉 todo |
 | F5 | 持锁期间另取连接池连接 | `getPlan()` 走根池（`subscription.ts:109-115`），在事务内调用于 `orders.ts:956,969`、`subscription.ts:362,414`；`enqueueAlert` 走池（`org/orgProvision.ts:80,117`） | 高并发履约时池耗尽而行锁不放；外层事务回滚但告警已提交 | 改为传 `client`；单独 PR |
 | F6 | 请求日志（journal）不在结算事务内 | `proxyBilling.ts:475`→`:305-319` 认领、`:555`→`:328-361` 终结，各自 autocommit；终结失败只记日志（`:563`） | 结算已提交、终结失败 → journal 停在 `finalizing`，靠对账器回收（本次未核对账器） | P2b 补核对账器覆盖；不改 |
 | F7 | 过期/取消订单的支付回调回“success”且不加款 | `http/payment.ts:~470-486`、`orders.ts:1010` | 用户在订单过期后完成支付：钱到账、积分未到，靠告警人工处理 | 产品决策项，登记不改 |
+| F8 | 同一用户并发扣费/豁免会死锁（40P01） | `usage_records.user_id`（`db/migrations/0002_init_billing.sql:56`）和 `turn_waivers.user_id`（`0167:78`）都外键引用 users：INSERT 先拿 users 行 `FOR KEY SHARE`，之后 `spend.ts:247` / `refund.ts:321` 要同一行 `FOR UPDATE`，两笔并发都卡在升级上 | T5 复现：同一用户 8 笔不同 request 并发结算，2026-10-26 一次运行里 7 笔被 PG 判死锁中止、只提交 1 笔。中止的那笔整体回滚，余额和流水仍一致，但这一笔没扣上费、没留 usage 行。个人版近 15 天日志里结算死锁 0 次（只有 2 次 tapeJobScheduler 的）；商业版没查（本线不碰 kl-mirror） | 实际锁序比登记的多了一步“先拿 users KEY SHARE”。可选：在 INSERT 前先锁 users 行，或在调用方对 40P01 重试。属行为改动，单独 PR |
 
 ## 4. 目标规则（§4.3 落地，到试点/P6 才执行）
 
@@ -132,9 +133,9 @@ v5-dev 实测（2026-10-26 08:15Z，`ss -ltnp` 只读）：
 | B1 | `packages/gateway/src/__tests__/authJwtFreeze.test.ts`：gateway `verifyJwt` 10 条冻结用例 | 本 PR，本地 10/10 |
 | B2 | 本文件：资金证据矩阵、缺口、隔离审计、入口登记 | 本 PR，待评审 |
 | B3 | `payment.integ.test.ts` 清 Redis 前拒绝 6379（§5 隔离缺口） | 本 PR |
-| T1–T5 | 资金原子性测试补缺：T1 订单履约写中途失败整体回滚；T2 过期器与回调并发；T3 管理员调账并发与重复提交（冻结“今天会记两次”）；T4 父子键并发豁免（证实/证伪 F4）；T5 同一用户不同 request 并发扣费余额不为负 | 下一 PR（需测试集群 55432、过测试锁） |
+| T1–T5 | 资金原子性测试：T1 订单写到 orders→paid 时注入故障，整体回滚（`orders.integ.test.ts`）；T2 过期器与回调并发，两种结局都观察到（同上）；T3 管理员调账并发正/负，以及冻结 F2“重复提交记两次”（`ledger.integ.test.ts`）；T4 父子键并发豁免（`turnWaiver.integ.test.ts`，证实 F4，`todo`）；T5 同一用户不同 request 并发扣费（`settleUsageConcurrent.integ.test.ts`，只允许 40P01 失败，即 F8，已提交部分守恒） | T1/T2/T3/T5 绿；T4 红并标 todo（F4 待修） |
 | B4–B7 | 入口冻结测试补缺（见 6.4） | `p2bEntryFreeze.test.ts` 7 条 + `userChatBridge.test.ts` 3 条 |
 | B8 | Origin 冻结口径 | 待评审 |
 | 登记表入库 | 把 6.2/6.3 落成机器可读的 `arch/entry-registry.json`（每条路由：校验器、查库、Origin、失败行为、负责人），配生成与 `--check` | 后续 PR（护栏变更单独 PR） |
 
-P2b 退出 = 本设计评审批准 + T1–T5 全绿 + B1/B4–B8 全绿。在此之前试点计费部分只读观测（§9.4）。
+P2b 退出 = 本设计评审批准 + T1–T5 全绿 + B1/B4–B8 全绿。**目前 T4 因 F4 不能全绿**：F4 修复经评审批准、T4 去掉 todo 变绿之后才算满足。在此之前试点计费部分只读观测（§9.4）。

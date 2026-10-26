@@ -361,3 +361,73 @@ describe("expirePendingOrders", () => {
     assert.equal(spaid?.status, "paid");
   });
 });
+
+// P2b 资金原子性（docs/ARCH_P2B_FUND_ENTRY_GATES.md T1/T2）。故障用测试库里的临时触发器注入：
+// 真 PG 在履约写完 users/credit_ledger 之后、orders→paid 那条 UPDATE 上报错，不改产品代码。
+describe("P2b 订单履约原子性", () => {
+  test("T1 orders→paid 写失败:余额、流水、订单状态整体回滚;去掉故障后重试正常入账一次", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const uid = await makeUser("p2b-t1@example.com", 0n);
+    const { order } = await createPendingOrder({ userId: uid, planCode: "plan-10" });
+    await query(`CREATE FUNCTION p2b_fail_paid() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'p2b injected failure'; END $$`);
+    try {
+      await query(`CREATE TRIGGER p2b_fail_paid BEFORE UPDATE ON orders FOR EACH ROW
+        WHEN (NEW.status = 'paid') EXECUTE FUNCTION p2b_fail_paid()`);
+      await assert.rejects(
+        markOrderPaid({ orderNo: order.order_no, callbackPayload: { status: "OD" } }),
+        /p2b injected failure/,
+      );
+    } finally {
+      await query("DROP TRIGGER IF EXISTS p2b_fail_paid ON orders");
+      await query("DROP FUNCTION IF EXISTS p2b_fail_paid()");
+    }
+    const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
+    assert.equal(u.rows[0].credits, "0", "users.credits rolled back");
+    const l = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid]);
+    assert.equal(l.rows[0].cnt, "0", "ledger row rolled back");
+    assert.equal((await getOrderByNo(order.order_no))?.status, "pending");
+
+    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: { status: "OD" } });
+    assert.equal(r.newlyPaid, true);
+    const u2 = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid]);
+    assert.equal(u2.rows[0].credits, "1000");
+    const l2 = await query<{ cnt: string }>("SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid]);
+    assert.equal(l2.rows[0].cnt, "1");
+  });
+
+  test("T2 过期器与支付回调并发:要么 paid 且只入账一次,要么 expired 且分文未动", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const seen = new Set<string>();
+    for (let i = 0; i < 12; i++) {
+      const uid = await makeUser(`p2b-t2-${i}@example.com`, 0n);
+      // expires_at 已过但仍 pending:过期器和回调都有资格动这张单
+      const { order } = await createPendingOrder({
+        userId: uid, planCode: "plan-10",
+        nowFn: () => new Date(Date.now() - 30 * 60 * 1000),
+      });
+      const [paid] = await Promise.allSettled([
+        markOrderPaid({ orderNo: order.order_no, callbackPayload: { i } }),
+        expirePendingOrders(),
+      ]);
+      const status = (await getOrderByNo(order.order_no))?.status;
+      const credits = (await query<{ credits: string }>(
+        "SELECT credits::text AS credits FROM users WHERE id=$1", [uid])).rows[0].credits;
+      const ledger = (await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id=$1", [uid])).rows[0].cnt;
+      seen.add(String(status));
+      if (status === "paid") {
+        assert.equal(paid.status, "fulfilled");
+        assert.equal(credits, "1000");
+        assert.equal(ledger, "1");
+      } else {
+        assert.equal(status, "expired");
+        assert.equal(paid.status, "rejected");
+        assert.ok(paid.status === "rejected" && paid.reason instanceof InvalidOrderStateError);
+        assert.equal(credits, "0");
+        assert.equal(ledger, "0");
+      }
+    }
+    t.diagnostic(`outcomes: ${[...seen].sort().join(",")}`);
+  });
+});
