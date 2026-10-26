@@ -43,7 +43,7 @@ function forbidden(err: unknown): boolean {
 }
 
 describe("B4 admin gates: JWT-only requireAdmin vs DB-checked requireAdminVerifyDb", () => {
-  test("known gap: requireAdmin trusts the JWT role and never reads the DB (/api/me/api-keys* use it)", async () => {
+  test("known gap: requireAdmin trusts the JWT role and never reads the DB", async () => {
     queried.length = 0;
     onQuery = async () => { throw new Error("must not be called"); };
     assert.equal((await requireAdmin(await adminReq(), SECRET)).role, "admin");
