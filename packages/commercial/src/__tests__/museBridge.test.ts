@@ -14,6 +14,7 @@ import { makeMuseBridgeHttpHandler, parseByteRange } from '../muse/bridgeHttp.js
 import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
 import {
   INLINE_SOURCE_MAX_BYTES,
+  MUSE_LIMITS,
   MuseError,
   base64DecodedBytes,
   bridgeFetchesSources,
@@ -158,6 +159,21 @@ describe('muse protocol', () => {
       resume_snapshot_id: 'abc:v1',
     })
     assert.equal(ok.source_images?.length, 1)
+  })
+  // INC-20261026-MUSE-SOURCE-CHUNK-256K: hello overrides the bridge defaults, so a smaller master
+  // value silently undid the 1 MiB Range chunk of the CDN short-read hardening (bridge 0.5.1).
+  it('hello source_chunk_bytes is never below the bridge default and within its hard limit', () => {
+    const py = readFileSync(new URL('../../muse-bridge/muse_bridge.py', import.meta.url), 'utf8')
+    const limit = (block: string): number => {
+      const body = py.match(new RegExp(`^${block} = \\{([^}]*)\\}`, 'm'))?.[1] ?? ''
+      const m = body.match(/"source_chunk_bytes":\s*(\d+)\s*\*\s*MIB/)
+      assert.ok(m, `${block}.source_chunk_bytes not found in muse_bridge.py`)
+      return Number(m[1]) * 1024 * 1024
+    }
+    const sent = MUSE_LIMITS.source_chunk_bytes
+    // Explicit messages: a message-less assert.ok makes node re-read the source and hangs under tsx.
+    assert.ok(sent >= limit('DEFAULT_LIMITS'), `hello ${sent} < bridge default ${limit('DEFAULT_LIMITS')}`)
+    assert.ok(sent <= limit('HARD_LIMITS'), `hello ${sent} > bridge hard limit ${limit('HARD_LIMITS')}`)
   })
 })
 

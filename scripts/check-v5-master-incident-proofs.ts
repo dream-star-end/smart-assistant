@@ -55,6 +55,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
       'a seed racing a human write cannot overwrite it (checked under the lock)',
     ],
   },
+  {
+    incident: 'INC-20261026-MUSE-SOURCE-CHUNK-256K', slug: 'inc-20261026-muse-source-chunk-256k', db: false,
+    file: 'packages/commercial/src/__tests__/museBridge.test.ts',
+    cases: ['hello source_chunk_bytes is never below the bridge default and within its hard limit'],
+  },
 ]
 
 function fail(message: string): never {
