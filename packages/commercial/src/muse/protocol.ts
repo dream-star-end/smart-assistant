@@ -24,7 +24,7 @@ export const MUSE_LIMITS = Object.freeze({
   source_max_bytes: 10 * MIB,
   max_source_images: 4,
   /** One Range request when a bridge >= 0.5 downloads a source image (GET …/sources/:n). */
-  source_chunk_bytes: 256 * 1024,
+  source_chunk_bytes: 1 * MIB,
 })
 
 export const POLL_HOLD_SEC = 25
