@@ -245,3 +245,49 @@ describe("settleUsageAndLedger — 并发幂等 (BINV-3)", () => {
     assert.equal(ur.rows[0].c, "1", "usage 必须只有 1 行");
   });
 });
+
+// P2b 资金原子性 T5(docs/ARCH_P2B_FUND_ENTRY_GATES.md):同一用户、不同 request 并发扣费,总额超过余额。
+// 已知缺口 F8:usage_records.user_id 的外键让 INSERT 先拿 users 行 KEY SHARE,随后 spendTwoBucket 要同一行
+// FOR UPDATE,两笔并发互相等待 → PG 判死锁(40P01)中止其中一笔,该笔整体回滚、不扣费。本用例冻结这一现状:
+// 失败只允许是 40P01;已提交的那些满足余额非负、流水与实扣一致、usage 行数一致。修 F8 的 PR 收紧为“全部成功”。
+describe("settleUsageAndLedger — 不同 request 并发扣费 (P2b T5)", () => {
+  test("8 笔并发、总额 1600 > 余额 1000:只有 40P01 失败;已提交部分余额不为负,流水 = 实扣", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("p2b-t5@example.com", 1000n);
+    const acctId = await createClaudeAccount("p2b-t5-acct");
+    const settled = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, i) =>
+        settleUsageAndLedger(getPool(), {
+          userId: uid,
+          accountId: acctId,
+          requestId: `p2b-t5-req-${i}`,
+          model: "test-model",
+          usage: makeUsage(),
+          snapshotJson: SNAPSHOT_JSON,
+          costCredits: 200n,
+          status: "success",
+          sessionId: null,
+        }),
+      ),
+    );
+    const committed = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    for (const r of settled) {
+      if (r.status === "rejected") assert.equal((r.reason as { code?: string }).code, "40P01", String(r.reason));
+    }
+    t.diagnostic(`committed=${committed.length} deadlocked=${settled.length - committed.length}`);
+    assert.ok(committed.length >= 1);
+
+    const debited = committed.reduce((sum, r) => sum + (r.debitedCredits ?? 0n), 0n);
+    const u = await query<{ credits: string }>("SELECT credits::text AS credits FROM users WHERE id=$1", [uid.toString()]);
+    assert.equal(BigInt(u.rows[0].credits), 1000n - debited);
+    assert.ok(BigInt(u.rows[0].credits) >= 0n);
+    const led = await query<{ delta: string; balance_after: string }>(
+      "SELECT delta::text AS delta, balance_after::text AS balance_after FROM credit_ledger WHERE user_id=$1",
+      [uid.toString()],
+    );
+    assert.equal(led.rows.reduce((sum, r) => sum + BigInt(r.delta), 0n), -debited);
+    for (const r of led.rows) assert.ok(BigInt(r.balance_after) >= 0n, `balance_after ${r.balance_after} >= 0`);
+    const ur = await query<{ c: string }>("SELECT COUNT(*)::text AS c FROM usage_records WHERE user_id=$1", [uid.toString()]);
+    assert.equal(ur.rows[0].c, String(committed.length), "deadlocked settles leave no usage row");
+  });
+});
