@@ -4353,3 +4353,60 @@ describe("userChatBridge — first_visible persist is not permanently suppressed
     }
   });
 });
+
+// P2b entry freeze (docs/ARCH_P2B_FUND_ENTRY_GATES.md §6.3 #1, B5/B7): the bridge's account status
+// check as it behaves today. Non-active status closes the socket before any container connection;
+// a missing row and a failed status query both let the connection through (fail-open is a
+// documented availability trade-off in ws/userChatBridge.ts). A change to either flips its case.
+describe("P2b entry freeze: user-chat-bridge account status", () => {
+  function statusPool(status: () => Promise<{ status: string }[]>): UserChatBridgeDeps["pgPool"] {
+    return {
+      query: async (sql: unknown) => {
+        const text = typeof sql === "string" ? sql : String((sql as { text?: unknown })?.text ?? "");
+        if (/SELECT status FROM users WHERE id/.test(text)) {
+          const rows = await status();
+          return { rows, rowCount: rows.length };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    } as UserChatBridgeDeps["pgPool"];
+  }
+  const billingStubs = {
+    preCheckRedis: {
+      async atomicReserve() { return { ok: true as const, locked: 0n, needed: 0n }; },
+      async releaseReservation() { return true; },
+    } as UserChatBridgeDeps["preCheckRedis"],
+    pricing: { get() { return null; } } as unknown as UserChatBridgeDeps["pricing"],
+  };
+
+  test("banned account: close 1008 'account inactive', no container connection", async () => {
+    const rig = await startRig({ pgPool: statusPool(async () => [{ status: "banned" }]), ...billingStubs });
+    try {
+      const ws = openClient(rig.gatewayPort, await makeJwt("901"));
+      const closed = await waitClose(ws);
+      assert.equal(closed.code, 1008);
+      assert.equal(closed.reason, "account inactive");
+      assert.equal(rig.containerSockets.length, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  for (const [name, status] of [
+    ["known gap: missing users row is let through", async () => []],
+    ["known gap: status query failure is let through (fail-open)", async () => { throw new Error("db down"); }],
+  ] as const) {
+    test(name, async () => {
+      const rig = await startRig({ pgPool: statusPool(status), ...billingStubs });
+      try {
+        const containerOpen = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, await makeJwt("902"));
+        await containerOpen;
+        assert.equal(ws.readyState, WebSocket.OPEN);
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
+    });
+  }
+});
