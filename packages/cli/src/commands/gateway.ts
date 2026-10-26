@@ -6,6 +6,7 @@ import {
   makeV3WechatOutboundAdapter,
   makeV3QqbotOutboundAdapter,
   readV3WechatOutboundConfig,
+  resolveV5WebAssetsPool,
   resolveV5WebRoot,
   type CommercialHook,
 } from '@openclaude/gateway'
@@ -111,18 +112,25 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   //   - 其它(默认 v3/personal): packages/web/public(vanilla)+ 'vanilla' 模式,行为不变。
   //   - v5 且配了 OC_V5_WEB_OVERLAY_ROOT:若本 release 有 P0-Web overlay 指针则 serve 指针
   //     (OCV5-489,前端热切换不重启 master);否则同上用 release dist。
+  //   - v5 且配了 OC_V5_WEB_ASSETS_POOL(绝对路径):/assets/* 在 webRoot 未命中时回落资产池
+  //     (OCV5-632,发版后旧标签页的懒加载 chunk 不再 404);未配置 = 行为不变。
   const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
   let webRoot = isV5Channel
     ? resolve(here, '../../../web-react/dist')
     : resolve(here, '../../../web/public')
+  let webAssetsPool: string | undefined
   if (isV5Channel) {
+    // v5 静态面的两个 env 决策共用这一次读取。
+    const v5WebEnv = process.env
     const decision = resolveV5WebRoot({
       releaseDist: webRoot,
       releaseRoot: resolve(here, '../../../..'),
-      overlayRoot: process.env.OC_V5_WEB_OVERLAY_ROOT,
+      overlayRoot: v5WebEnv.OC_V5_WEB_OVERLAY_ROOT,
     })
     webRoot = decision.webRoot
     log.info(`gateway: web root ${decision.overlay ? 'overlay' : 'release'} (${decision.reason})`)
+    webAssetsPool = resolveV5WebAssetsPool(v5WebEnv.OC_V5_WEB_ASSETS_POOL)
+    if (webAssetsPool) log.info(`gateway: /assets fallback pool ${webAssetsPool}`)
   }
   const staticMode: 'vanilla' | 'spa' = isV5Channel ? 'spa' : 'vanilla'
 
@@ -227,6 +235,6 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     console.log('[cli] v3 qqbot outbound adapter wired (container mode)')
   }
 
-  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, channelFactories, commercial })
+  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, webAssetsPool, channelFactories, commercial })
   await gw.start()
 }
