@@ -944,6 +944,23 @@ function assertNoProductionDangerSwitches(env: Record<string, string | undefined
 }
 
 /**
+ * Proxy flags read per request, not part of the loadConfig snapshot: the supervisor and the box test
+ * harnesses flip them at runtime. llm-proxy reads them here, through the env authority
+ * (P3 pilot S1b), instead of from process.env.
+ */
+export function proxyRuntimeFlags(env: Record<string, string | undefined> = process.env): {
+  providerHealthEnforce: boolean;
+  boxModelApi: boolean;
+  boxToolBridge: boolean;
+} {
+  return {
+    providerHealthEnforce: env.OC_PROVIDER_HEALTH_ENFORCE === "1",
+    boxModelApi: env.OC_BOX_MODEL_API === "1",
+    boxToolBridge: env.OC_BOX_TOOL_BRIDGE === "1",
+  };
+}
+
+/**
  * 从给定的 env 对象解析配置。
  * 默认从 process.env 读;测试可显式传入。
  *
