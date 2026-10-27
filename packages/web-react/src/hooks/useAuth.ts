@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
 import { createMemoryAuthSession } from "../lib/authSession";
-import { clearAuthHint, hasAuthHint, setAuthHint } from "../lib/authHint";
+import { clearAuthHint, hasAuthHint, setAuthHint, subscribeAuthHintSet } from "../lib/authHint";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { AuthSession, User } from "../lib/types";
 import { teardownComposerDrafts } from "../lib/composerDraft";
@@ -14,6 +14,9 @@ import { useLaneGate } from "./useLaneGate";
 import { clearAllBlogLocalDrafts } from '../components/tutorials/blog/blogLib';
 
 const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
+
+/** 已登录的页面被服务端判失效（refresh 明确 invalid，不是主动登出）时给用户的一句话（OCV5-636）。 */
+export const SESSION_EXPIRED_MESSAGE = "登录状态已失效，请重新登录";
 
 function waitForRecovery(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -54,6 +57,12 @@ export type UseAuthOptions = {
   onClearAuth: () => void;
   /** 登出独有的持久层收尾（清本 user 的 IndexedDB 命名空间等；仅非 demo 时调用）。 */
   onLogout?: () => void;
+  /**
+   * 本页原本已登录、被服务端判失效（REST/WS 续期明确 invalid）时，在 onClearAuth 之后调用：
+   * App 据此直接给登录表单 + SESSION_EXPIRED_MESSAGE，而不是静默落到营销首页。启动续期失败
+   * （本页从未登录）、主动登出、其它 tab 的登出广播都不触发。
+   */
+  onSessionExpired?: () => void;
   /** Hide private UI while retaining valid credentials for an explicit account switch. */
   onAccountSwitchPending?: () => void;
   /** 启动静默续期成功 → 进工作区（App 侧 setView("app")）。 */
@@ -121,6 +130,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // commit 都必须带起始 epoch，旧账号的晚到响应因此无法污染新身份。
   const expiredUiRef = useRef<() => void>(() => {});
   const [authed, setAuthed] = useState(false);
+  const authedRef = useRef(authed);
+  authedRef.current = authed;
   const [account, setAccount] = useState<{ user: User | null; identity: ResolvedIdentity | null }>({ user: opts.initialUser, identity: null });
   const user = account.user;
   const identityRef = useRef<ResolvedIdentity | null>(null);
@@ -140,6 +151,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setAccount({ user: nextUser, identity });
   }, []);
   const [authLoading, setAuthLoading] = useState(false);
+  const authLoadingRef = useRef(authLoading);
+  authLoadingRef.current = authLoading;
   const [authError, setAuthError] = useState<string | null>(null);
   const [authRecoveryAvailable, setAuthRecoveryAvailable] = useState(false);
   const bootstrapMeFriction = useRef<{ id: string; attempts: number } | null>(null);
@@ -147,6 +160,8 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 从未登录过的浏览器（无 oc_auth_hint）也跳过：它没有 HttpOnly refresh cookie，
   // boot 必发 /api/auth/refresh 只会得到 400（控制台红错）；直接落未登录态看首页。
   const [booting, setBooting] = useState(!demo && !resetToken && hasAuthHint());
+  const bootingRef = useRef(booting);
+  bootingRef.current = booting;
   // cohort lane 决策信号（P3 RFC D1）：undefined=决策进行中；{lane}=已拿到 auth 响应
   // （lane 为 string 或 null——字段缺失=后端未部署=向后兼容仍算已决策）。login/boot 成功时置，
   // clearAuth 复位。laneReady 由 useLaneGate 据此 + authed + 3s 兜底派生。
@@ -204,7 +219,15 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     setLaneSignal(undefined); // lane 决策复位：下次认证重新走 laneReady 闸
     cbRef.current.onClearAuth();
   }, [setUser]);
-  expiredUiRef.current = clearAuthState;
+  // AuthSession.expire 的 UI 收尾。本页原本已登录 = 用户正在用时被踢（OCV5-636：体验官只看到
+  // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。
+  expiredUiRef.current = () => {
+    const wasAuthed = authedRef.current;
+    clearAuthState();
+    if (!wasAuthed) return;
+    setAuthError(SESSION_EXPIRED_MESSAGE);
+    cbRef.current.onSessionExpired?.();
+  };
 
   const commitMeUser = useCallback((me: User, identity: ResolvedIdentity | null) => {
     const session = authRef.current;
@@ -429,6 +452,19 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
       clearAuthState();
     });
   }, [demo, clearAuthState]);
+
+  // 其它同源 tab 登录 / 续期成功（OCV5-636）：refresh cookie 全浏览器共享，本 tab 若停在未登录态
+  // （掉登录后留下的旧标签），直接重走启动静默续期回到工作区；成功/失败语义与 F5 完全一致。
+  // 已登录、启动中、登录提交中、等待确认换号、重置密码链接都不打扰。
+  useEffect(() => {
+    if (demo || resetToken) return;
+    return subscribeAuthHintSet(() => {
+      if (authedRef.current || bootingRef.current || authLoadingRef.current || pendingAccountRef.current) return;
+      setAuthError(null);
+      setAuthRecoveryAvailable(false);
+      setBooting(true);
+    });
+  }, [demo, resetToken]);
 
   // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
   const register = useCallback(

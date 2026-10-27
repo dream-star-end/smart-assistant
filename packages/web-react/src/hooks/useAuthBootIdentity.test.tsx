@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { identityIsCurrent } from '../lib/resolvedIdentity'
 import { useAuth } from './useAuth'
 import { clearAuthHint } from '../lib/authHint'
-vi.mock('../lib/authHint', () => ({ hasAuthHint: () => true, setAuthHint: () => {}, clearAuthHint: vi.fn() }))
+vi.mock('../lib/authHint', () => ({ hasAuthHint: () => true, setAuthHint: () => {}, clearAuthHint: vi.fn(), subscribeAuthHintSet: () => () => {} }))
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const refresh = () => reply({ access_token: 'alice-a', access_exp: 9999999999, remember: false })
 beforeEach(() => { vi.clearAllMocks() })
