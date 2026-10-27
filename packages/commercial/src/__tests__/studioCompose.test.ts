@@ -215,6 +215,24 @@ describe('compose spec → argv (OCV5-588)', () => {
     assert.equal(cmd.argv[0], 'ffmpeg')
   })
 
+  test('the film audio reaches the encoder as fltp 48 kHz stereo, never negotiated (INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT)', () => {
+    // prod 2026-10-27 c6f0a9f2: mono 32 kHz narration made ffmpeg's graph rebuild fail with
+    // "Cannot select channel layout ... format_out" once the AAC encoder was open.
+    const voice = [{ file: 'l0.mp3', startSec: 0.15 }, { file: 'l1.mp3', startSec: 5 }]
+    const music = { file: 'm.mp3', gainDb: -8, duckDb: 12 }
+    for (const extra of [{ voice }, { music }, { voice, music }]) {
+      const cmd = buildCommand({ op: 'compose', spec: base(extra) })
+      const graph = cmd.argv[cmd.argv.indexOf('-filter_complex') + 1]!
+      const last = graph.split(';').find((f) => f.endsWith('[aout]'))
+      assert.ok(last, `no [aout] chain for ${Object.keys(extra).join('+')}`)
+      assert.ok(
+        last.endsWith(',aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]'),
+        `the audio output format is not pinned for ${Object.keys(extra).join('+')}: ${last}`,
+      )
+      assert.equal(cmd.argv[cmd.argv.indexOf('-map', cmd.argv.indexOf('-map') + 1) + 1], '[aout]')
+    }
+  })
+
   test('fade transitions shorten the timeline by the overlaps', () => {
     const cmd = buildCommand({
       op: 'compose',

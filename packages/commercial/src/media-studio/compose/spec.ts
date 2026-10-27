@@ -288,6 +288,9 @@ function boundThreads(cmd: BuiltCommand): BuiltCommand {
 
 const ENCODER_THREADS = 4
 
+/** The film's audio as the AAC encoder receives it, whatever the narration and music files are. */
+export const AUDIO_OUT_FORMAT = 'sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo'
+
 function buildUnbounded(op: ComposeOp): BuiltCommand {
   switch (op.op) {
     case 'probe':
@@ -582,8 +585,13 @@ function buildCompose(spec: ComposeSpec): BuiltCommand {
   }
   if (audio) {
     const lufs = spec.loudness?.targetLufs ?? -16
+    // The output format is pinned: ffmpeg rebuilds the graph when a later input's first frame
+    // arrives, and by then the AAC encoder is open with the first build's layout. Left to
+    // negotiation, mono 32 kHz narration made that rebuild fail ("Cannot select channel layout
+    // ... format_out", INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT).
     graph.push(
-      `[${audio}]atrim=end=${num(totalSec)},loudnorm=I=${num(lufs, 1)}:TP=-1.5:LRA=11,aresample=48000[aout]`,
+      `[${audio}]atrim=end=${num(totalSec)},loudnorm=I=${num(lufs, 1)}:TP=-1.5:LRA=11,aresample=48000,` +
+        `aformat=${AUDIO_OUT_FORMAT}[aout]`,
     )
     audio = 'aout'
   }
