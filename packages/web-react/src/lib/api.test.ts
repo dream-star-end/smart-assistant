@@ -482,7 +482,8 @@ test('repeated REFRESH_RACE is bounded and degrades to transient, never expiry',
   const { session, expireCount } = makeSession('tok-old')
   const pending = api.refresh(session)
   await vi.advanceTimersByTimeAsync(5_000)
-  await expect(pending).resolves.toMatchObject({ kind: 'transient', epoch: 0 })
+  // superseded: the whole ladder never saw the new cookie — this browser's copy was replaced (OCV5-638).
+  await expect(pending).resolves.toMatchObject({ kind: 'transient', epoch: 0, superseded: true })
   expect(refreshCalls).toBe(6)
   expect(expireCount()).toBe(0)
   expect(reports).toEqual([expect.objectContaining({
@@ -533,7 +534,9 @@ test('refresh friction keeps one correlation through admin/WS recovery', async (
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
   const { session } = makeSession('tok-old')
-  await expect(api.refresh(session, 0, 'admin_auth')).resolves.toMatchObject({ kind: 'transient' })
+  const transient = await api.refresh(session, 0, 'admin_auth')
+  expect(transient).toMatchObject({ kind: 'transient' })
+  expect(transient).not.toHaveProperty('superseded')
   await vi.advanceTimersByTimeAsync(500)
   await expect(api.refresh(session, 0, 'ws_auth')).resolves.toMatchObject({ kind: 'success' })
 
