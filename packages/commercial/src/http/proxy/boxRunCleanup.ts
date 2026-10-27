@@ -28,6 +28,33 @@ def clear_memory(parent):
   os.fsync(fd)
  finally:os.close(fd)
  os.rmdir('memory',dir_fd=parent)
+def clear_session(parent,name):
+ # OCV5-645: Claude Code spills an over-50k or image tool result to
+ # <session>/tool-results/, the tree boxNativeGcFile.ts removes (same rules).
+ st=os.stat(name,dir_fd=parent,follow_symlinks=False)
+ if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid():raise SystemExit(126)
+ fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  got=os.fstat(fd)
+  if (got.st_dev,got.st_ino)!=(st.st_dev,st.st_ino):raise SystemExit(126)
+  kids=os.listdir(fd)
+  if kids not in ([],['tool-results']):raise SystemExit(126)
+  if kids:
+   tfd=os.open('tool-results',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+   try:
+    if os.fstat(tfd).st_uid!=os.getuid():raise SystemExit(126)
+    files=os.listdir(tfd)
+    if len(files)>1024:raise SystemExit(126)
+    for item in files:
+     seen=os.stat(item,dir_fd=tfd,follow_symlinks=False)
+     if not stat.S_ISREG(seen.st_mode) or seen.st_uid!=os.getuid() or seen.st_nlink!=1:raise SystemExit(126)
+    for item in files:os.unlink(item,dir_fd=tfd)
+    os.fsync(tfd)
+   finally:os.close(tfd)
+   os.rmdir('tool-results',dir_fd=fd)
+  os.fsync(fd)
+ finally:os.close(fd)
+ os.rmdir(name,dir_fd=parent)
 def private_file(dfd,name):
  st=os.stat(name,dir_fd=dfd,follow_symlinks=False)
  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:
@@ -57,11 +84,14 @@ if keep=='0':
  except FileNotFoundError:history=None
  if history is not None:
   try:
-   pattern=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl(?:\.part)?')
+   uuid=r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+   pattern=re.compile(uuid+r'\.jsonl(?:\.part)?')
    for name in sorted(os.listdir(history)):
     # OCV5-509: Claude Code's auto-memory folder (*.md only) went to every run
     # project; refusing it left each cleanup pending and retried forever.
     if name=='memory':clear_memory(history);continue
+    # OCV5-645: a recovered run has no native pointer, so it always lands here.
+    if re.fullmatch(uuid,name):clear_session(history,name);continue
     if not pattern.fullmatch(name):raise SystemExit(126)
     private_file(history,name)
     os.unlink(name,dir_fd=history)
