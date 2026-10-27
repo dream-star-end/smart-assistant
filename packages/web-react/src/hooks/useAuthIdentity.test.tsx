@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { identityIsCurrent } from '../lib/resolvedIdentity'
 import { useAuth } from './useAuth'
 import { clearAuthHint, setAuthHint } from '../lib/authHint'
-vi.mock('../lib/authHint', () => ({ hasAuthHint: () => false, setAuthHint: vi.fn(), clearAuthHint: vi.fn() }))
+vi.mock('../lib/authHint', () => ({ hasAuthHint: () => false, setAuthHint: vi.fn(), clearAuthHint: vi.fn(), subscribeAuthHintSet: () => () => {} }))
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const wireUser = (id: string) => ({ id, role: 'user', email: `${id}@example.invalid`, display_name: id })
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }

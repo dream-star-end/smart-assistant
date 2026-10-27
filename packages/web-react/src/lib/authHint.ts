@@ -7,7 +7,8 @@
  * 跳过 refresh 直接未登录态。
  *
  * 写入：登录成功 / boot 静默续期成功。清除：登出（本 tab 或其它 tab 的登出广播）、
- * refresh 明确失效（INVALID_REFRESH/VALIDATION 落到未登录态）。
+ * refresh 明确失效（INVALID_REFRESH/VALIDATION 落到未登录态）。其它 tab 写入时，未登录的
+ * tab 经 subscribeAuthHintSet 重新静默续期。
  * localStorage 不可用时全部 fail-open（读作"登录过"），绝不能把已登录用户误判成匿名访客。
  */
 const AUTH_HINT_KEY = "oc_auth_hint";
@@ -34,4 +35,18 @@ export function clearAuthHint(): void {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * 其它同源 tab 写入标记（登录 / 静默续期成功）时回调（OCV5-636）。cookie 罐全浏览器共享，
+ * 停在未登录态的 tab 据此重新静默续期，不再一直停在营销首页。storage 事件只发给其它 tab，
+ * 且值不变不发，所以本 tab 自己的写入、已是 "1" 时的重复写入都不会触发。
+ */
+export function subscribeAuthHintSet(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === AUTH_HINT_KEY && event.newValue === "1") listener();
+  };
+  window.addEventListener("storage", onStorage);
+  return () => window.removeEventListener("storage", onStorage);
 }
