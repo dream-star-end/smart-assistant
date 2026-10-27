@@ -354,6 +354,7 @@ export function AppDialogs({
         open={pickerOpen}
         current={agent}
         auth={demo ? null : auth}
+        knownAgents={myAgents}
         teamMode={teamMode}
         collabMode={collabMode}
         advisorModels={collabUi.advisorModels}

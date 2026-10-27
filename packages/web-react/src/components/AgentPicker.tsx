@@ -1,4 +1,4 @@
-import { Check, KeyRound, Loader2, ShieldCheck, Store, Users } from 'lucide-react'
+import { Check, KeyRound, ShieldCheck, Store, Users } from 'lucide-react'
 import { useEffect, useId, useState } from 'react'
 import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol/browser'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
@@ -48,10 +48,13 @@ export function AgentPicker({
   onCollabModeChange,
   onAdvisorModelChange,
   onOpenPluginAuth,
+  knownAgents,
 }: {
   open: boolean
   current: Agent
   auth: AuthSession | null
+  /** App 登录后已拉到的智能体目录:打开即按它排版,后台重拉只就地更新(OCV5-639)。 */
+  knownAgents?: readonly Agent[]
   teamMode?: boolean
   collabMode?: 'solo' | 'advisor' | 'team'
   advisorModels?: Array<{ id: string; label: string; engine: string }>
@@ -91,7 +94,11 @@ export function AgentPicker({
   const advisorDisabledReason = advisorBlocked
     ? advisorBlockReason
     : advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON
-  const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
+  // 打开时网格先空着、预设卡异步长出来,弹层(垂直居中)会整体上移半行,点「同时设为默认」的手落到
+  // 第一张预设卡上(OCV5-639,体验官误选科研助手)。有 App 已拉到的目录就直接用它排版。
+  const [agents, setAgents] = useState<Agent[]>(() =>
+    knownAgents?.some((a) => !a.isDefault) ? [...knownAgents] : [MAIN_AGENT],
+  )
   const [loading, setLoading] = useState(false)
   const advisorSelectId = useId()
 
@@ -125,13 +132,8 @@ export function AgentPicker({
       description="全能助手与官方预设助手开箱即用，更多智能体可从市场安装。"
       className="max-w-2xl"
     >
-      {/* 已有列表时的重拉只给一行轻提示;首次加载(网格还空着)改在网格位置放骨架卡(见下),避免先空后跳(C-33)。 */}
-      {loading && others.length > 0 && (
-        <div className="mb-2 flex items-center gap-2 text-meta text-faint">
-          <Loader2 size={13} className="animate-spin" /> 加载你的智能体…
-        </div>
-      )}
-
+      {/* 已有列表时后台重拉不插提示行(插在最上面会把整块往下推,数据回来又弹回去,OCV5-639);
+          首次加载(网格还空着)在网格位置放骨架卡(见下),避免先空后跳(C-33)。 */}
       {/* 全能助手(默认)—— featured 整块占满宽度,团队模式开关为其内嵌页脚 */}
       <div
         className={cn(
@@ -330,8 +332,9 @@ export function AgentPicker({
       </div>
 
       {/* 其它已安装 agent + 市场入口 —— 2 列均匀网格 */}
-      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-        {loading && others.length === 0 && <ListSkeleton variant="card" rows={2} className="contents" />}
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2" aria-busy={loading || undefined}>
+        {/* 4 = 官方预设数:骨架和到达后的卡片占同样的行数,网格不长高。 */}
+        {loading && others.length === 0 && <ListSkeleton variant="card" rows={4} className="contents" />}
         {others.map((a) => {
           const active = a.id === current.id
           const unavailable = a.ready === false
