@@ -135,9 +135,12 @@ export function makeOrchestratorApi(
         )
         const p = r.rows[0]
         if (!p) throw notFound()
+        // compose_failed: the user asks the director to compose the film again (free). Nothing
+        // retried it and no page offered it, so a failed compose left the project stuck unless a
+        // note was written (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY).
         if (
           p.status !== 'awaiting_user' ||
-          (p.reason !== 'approve_plan' && p.reason !== 'budget')
+          (p.reason !== 'approve_plan' && p.reason !== 'budget' && p.reason !== 'compose_failed')
         ) {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'nothing to approve')
         }
@@ -158,7 +161,8 @@ export function makeOrchestratorApi(
           [projectId],
         )
         await appendStudioEvent(c, projectId, 'project.approved', {
-          message: '方案已确认，开始生成。',
+          message:
+            p.reason === 'compose_failed' ? '重新合成成片（不收费）。' : '方案已确认，开始生成。',
         })
       })
       kick(projectId)

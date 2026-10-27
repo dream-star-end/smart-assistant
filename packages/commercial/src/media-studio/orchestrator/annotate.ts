@@ -29,6 +29,8 @@ export interface ShotRedo {
   frame: number
   video: number
   delta?: string
+  /** A video-only redo's change, added to the video prompt (regenerate_video). */
+  videoDelta?: string
   edit?: {
     source: string
     reference: string | null
@@ -56,7 +58,12 @@ const nextVersion = async (c: PoolClient, ownerKind: string, ownerId: string) =>
 
 /** The ids an instruction changes (to keep one execution per target). */
 async function touches(c: PoolClient, projectId: string, i: Interpretation): Promise<string[]> {
-  if (i.op === 'regenerate_shot' || i.op === 'edit_frame' || i.op === 'retime_shot')
+  if (
+    i.op === 'regenerate_shot' ||
+    i.op === 'regenerate_video' ||
+    i.op === 'edit_frame' ||
+    i.op === 'retime_shot'
+  )
     return [i.args.shotId]
   if (i.op === 'change_line') return [i.args.lineId]
   if (i.op === 'swap_voice')
@@ -133,11 +140,16 @@ export async function executeAnnotation(
         video: await nextVersion(c, 'shot_video', shotId),
         ...extra,
       }
+      // A video-only redo keeps the first frame on screen (the adopted video's, else the newest
+      // accepted one): it is pinned as the shot's frame, so the new video is made from it and no
+      // other frame is generated or picked (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME).
+      const keep = from === 'video' ? await currentFrameTake(c, shotId) : null
       const r = await c.query(
         `UPDATE studio_shots SET status = 'generating', active_take_id = NULL,
                 spec = (spec - 'frameTakeId') || jsonb_build_object('redo', $2::jsonb)
+                       || CASE WHEN $4::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('frameTakeId', $4::text) END
           WHERE id = $1 AND project_id = $3`,
-        [shotId, JSON.stringify(redo), projectId],
+        [shotId, JSON.stringify(redo), projectId, keep],
       )
       if (!r.rowCount) throw new AnnotationRunError('target_gone')
       targets.push({ kind: 'shot', id: shotId, minVideo: redo.video })
@@ -160,6 +172,12 @@ export async function executeAnnotation(
         throw new AnnotationRunError('target_gone')
     } else if (i.op === 'regenerate_shot') {
       await redoShot(i.args.shotId, 'frame', { delta: i.args.promptDelta })
+    } else if (i.op === 'regenerate_video') {
+      await redoShot(
+        i.args.shotId,
+        'video',
+        i.args.promptDelta ? { videoDelta: i.args.promptDelta } : {},
+      )
     } else if (i.op === 'edit_frame') {
       const source = await currentFrame(c, i.args.shotId)
       if (!source) throw new AnnotationRunError('target_gone')
@@ -268,12 +286,29 @@ async function failExecution(c: PoolClient, projectId: string, annotationId: str
 }
 
 /** The shot's current first frame: its adopted video's, else its newest usable frame. */
+/** The finished frame take behind currentFrame (null when there is none). */
+async function currentFrameTake(c: PoolClient, shotId: string): Promise<string | null> {
+  const sha = await currentFrame(c, shotId)
+  if (!sha) return null
+  const r = await c.query<{ id: string }>(
+    `SELECT id::text AS id FROM studio_takes
+      WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND blob_sha = $2 AND status = 'succeeded'
+      ORDER BY version DESC LIMIT 1`,
+    [shotId, sha],
+  )
+  return r.rows[0]?.id ?? null
+}
+
 async function currentFrame(c: PoolClient, shotId: string): Promise<string | null> {
   const r = await c.query<{ sha: string | null }>(
     `SELECT COALESCE(
        (SELECT v.inputs->'inputs'->0->>'blobSha' FROM studio_shots s JOIN studio_takes v ON v.id = s.active_take_id
          WHERE s.id = $1 AND v.owner_kind = 'shot_video'
            AND v.inputs->'inputs'->0->>'role' = 'first_frame'),
+       -- A shot being redone has no adopted video: the frame pinned for it (a user's pick, or an
+       -- earlier video-only redo) is the one on screen, so a retry keeps it (code r1 P1).
+       (SELECT f.blob_sha FROM studio_shots s JOIN studio_takes f ON f.id::text = s.spec->>'frameTakeId'
+         WHERE s.id = $1 AND f.owner_kind = 'shot_frame' AND f.status = 'succeeded' AND f.blob_sha IS NOT NULL),
        (SELECT f.blob_sha FROM studio_takes f
          WHERE f.owner_kind = 'shot_frame' AND f.owner_id = $1 AND f.status = 'succeeded' AND f.blob_sha IS NOT NULL
            AND (f.qa IS NULL OR (f.qa->>'passed')::boolean IS TRUE OR (f.qa->>'skipped')::boolean IS TRUE)

@@ -124,6 +124,24 @@ export function FinalPage(props: {
   const [busy, setBusy] = useState(false)
   const toast = useToast()
   const done = view.project.status === 'done'
+  // The director's own compose failed (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY): nothing retries
+  // it by itself, so the page offers it (approve hands the film back to the director, free).
+  const composeFailed =
+    view.project.status === 'awaiting_user' &&
+    view.project.settings?.awaitingReason === 'compose_failed'
+  const [retrying, setRetrying] = useState(false)
+  const retryCompose = async () => {
+    setRetrying(true)
+    try {
+      await studioApi.approve(auth, view.project.id)
+      toast('已让导演 agent 重新合成成片，免费', 'success')
+      props.onReload?.()
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setRetrying(false)
+    }
+  }
   // Once the film goes back to the director (e.g. new music), earlier answers are stale.
   useEffect(() => {
     if (!done) {
@@ -197,6 +215,28 @@ export function FinalPage(props: {
   return (
     <div className="st-final">
       <section className="st-final-main st-stage">
+        {composeFailed ? (
+          <div
+            role="alert"
+            className="st-row"
+            style={{ gap: 10, flexWrap: 'wrap', marginBottom: 10 }}
+            data-testid="compose-failed"
+          >
+            <span className="st-chip st-chip-dark">
+              <CircleAlert />
+              成片没有合成成功，没有扣费
+            </span>
+            <button
+              type="button"
+              className="st-btn st-btn-sm st-glass"
+              disabled={retrying}
+              onClick={() => void retryCompose()}
+            >
+              <RefreshCw size={14} />
+              {retrying ? '正在交给导演…' : '重新合成'}
+            </button>
+          </div>
+        ) : null}
         <div className="st-row" style={{ gap: 10, flexWrap: 'wrap' }}>
           <b className="st-review-title">成片{shown ? ` v${shown.version}` : ''}</b>
           <span className="st-chip st-chip-dark tnum">

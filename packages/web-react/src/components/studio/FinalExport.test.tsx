@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 const requestExport = vi.fn()
+const approve = vi.fn()
 vi.mock('../../lib/studio/api', () => ({
   studioApi: {
     blobTicket: vi.fn(async (_a: unknown, sha: string) => ({
@@ -10,6 +11,7 @@ vi.mock('../../lib/studio/api', () => ({
       expiresInSeconds: 900,
     })),
     requestExport: (...args: unknown[]) => requestExport(...args),
+    approve: (...args: unknown[]) => approve(...args),
   },
   studioErrorText: () => '出错了',
   StudioApiError: class StudioApiError extends Error {
@@ -77,7 +79,10 @@ function view(takes: StudioTake[], status = 'done'): StudioProjectView {
   }
 }
 
-beforeEach(() => requestExport.mockReset())
+beforeEach(() => {
+  requestExport.mockReset()
+  approve.mockReset()
+})
 afterEach(cleanup)
 
 describe('final page export (OCV5-593 FE-6)', () => {
@@ -336,5 +341,27 @@ describe('final page credits (OCV5-593 FE-6, d14)', () => {
   test('a film without CC BY material says so', () => {
     render(<FinalPage auth={auth} view={view([film({})])} onOpenBoard={() => {}} />)
     expect(screen.getByTestId('final-credits')).toHaveTextContent('这支片没有需要署名的素材')
+  })
+})
+
+describe('a failed director compose (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)', () => {
+  test('the final page says the compose failed, free, and 重新合成 hands it back to the director', async () => {
+    approve.mockResolvedValue({})
+    const reload = vi.fn()
+    const v = view([film({ status: 'failed', blobSha: null, version: 2 })], 'awaiting_user')
+    ;(v.project as { settings: Record<string, unknown> }).settings = { awaitingReason: 'compose_failed' }
+    render(<FinalPage auth={auth} view={v} onOpenBoard={() => {}} onReload={reload} />)
+    const banner = screen.getByTestId('compose-failed')
+    expect(banner).toHaveTextContent('成片没有合成成功，没有扣费')
+    fireEvent.click(screen.getByRole('button', { name: /重新合成/ }))
+    await waitFor(() => expect(approve).toHaveBeenCalledWith(auth, 'p'))
+    await waitFor(() => expect(reload).toHaveBeenCalled())
+  })
+
+  test('nothing is offered while the film is fine or waiting on something else', () => {
+    const v = view([film({})], 'awaiting_user')
+    ;(v.project as { settings: Record<string, unknown> }).settings = { awaitingReason: 'needs_user' }
+    render(<FinalPage auth={auth} view={v} onOpenBoard={() => {}} />)
+    expect(screen.queryByTestId('compose-failed')).toBeNull()
   })
 })

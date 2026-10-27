@@ -8810,6 +8810,87 @@
           "assertion": "after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"
         }
       ]
+    },
+    {
+      "id": "INC-20261027-STUDIO-REGENERATE-REDOES-FRAME",
+      "occurredAt": "2026-10-27",
+      "severity": "P2",
+      "symptom": "商业 uid 247 工作台项目 c6f0a9f2 批注 4e7b3a76「首帧画面保持不变…只把这个镜头的视频…重新生成一次」被解读为 regenerate_shot（释义「保留当前首帧」），先重做首帧 v3 扣 50 积分再出视频：批注指令白名单只有一种重做镜头的方式，且总是重画首帧（2026-10-25 起的 G5 跟进项）。",
+      "rootFixCommit": "f1ae808f",
+      "coverageCommits": [
+        "ffe82d15"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/studioAnnotations.integ.test.ts",
+          "assertion": "keeping the first frame redoes only the video, from the frame on screen (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/studioInterpret.test.ts",
+          "assertion": "keeping the first frame has its own op; regenerate_shot says it redraws the frame (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "keeping the first frame redoes only the video, from the frame on screen (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261027-STUDIO-ADOPT-WRONG-TAKE",
+      "occurredAt": "2026-10-27",
+      "severity": "P2",
+      "symptom": "商业 uid 247 工作台项目 c6f0a9f2 批注 05424048 写在已采用的视频 v1（QA 0.62）上「这个镜头就用现在这个版本」，被解读为 adopt_take v2（QA 0.40）——若执行会换上更差的版本：批注解读提示只列「takeId vN」，不标批注所在版本与当前采用版本，模型把「现在这个」当成最新版本。",
+      "rootFixCommit": "fb69653e",
+      "coverageCommits": [
+        "aa42e2b1"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/studioInterpret.test.ts",
+          "assertion": "the version the note is on and the one in use are marked (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/studioAnnotations.integ.test.ts",
+          "assertion": "the interpreter is told which version the note is on and which is in use (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "the version the note is on and the one in use are marked (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "商业 uid 247 工作台项目 c6f0a9f2 导演合成 COMPOSE_FAILED（06:33Z）后停在 awaiting_user/compose_failed：后端不自动重试、前端没有任何页面处理该状态（导演面板还显示「有镜头需要你看一下」），事件文案「可以稍后让导演 agent 再试」没有入口，只能靠写批注让 agent 重开项目。",
+      "rootFixCommit": "52b04df9",
+      "coverageCommits": [
+        "cf738f5e"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/studioComposeFlow.integ.test.ts",
+          "assertion": "after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/studio/FinalExport.test.tsx",
+          "assertion": "the final page says the compose failed, free, and 重新合成 hands it back to the director"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)"
+        }
+      ]
     }
   ]
 }

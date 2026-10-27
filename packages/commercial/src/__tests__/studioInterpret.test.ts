@@ -40,6 +40,8 @@ describe('Interpret (OCV5-591 A2-1b-2)', () => {
   it('accepts each whitelisted op with ids from this project', () => {
     const cases: Array<[string, unknown]> = [
       ['regenerate_shot', { shotId: 's1', promptDelta: '尾巴白色' }],
+      ['regenerate_video', { shotId: 's1', promptDelta: '动作慢一点' }],
+      ['regenerate_video', { shotId: 's1' }],
       [
         'edit_frame',
         { shotId: 's1', region: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 }, instruction: '尾巴改成白色' },
@@ -103,6 +105,34 @@ describe('Interpret (OCV5-591 A2-1b-2)', () => {
       '图中红框',
     ])
       assert.ok(p.includes(s), s)
+  })
+})
+
+describe('Interpret: keep-the-frame and which version (INC-20261027)', () => {
+  it('keeping the first frame has its own op; regenerate_shot says it redraws the frame (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)', () => {
+    const p = buildInterpretPrompt(ctx, false)
+    assert.ok(p.includes('regenerate_video {shotId'), 'regenerate_video is offered')
+    assert.ok(p.includes('首帧不变，只重做这个镜头的视频'), 'regenerate_video keeps the frame')
+    assert.ok(p.includes('重画首帧再重做视频，首帧会变'), 'regenerate_shot says the frame changes')
+    assert.ok(p.includes('不改首帧、只重做视频或动作时用 regenerate_video'), 'the rule is spelled out')
+    const i = parseInterpretation(answer({ op: 'regenerate_video', args: { shotId: 's1', promptDelta: '' } }), ctx)
+    assert.equal(i.op, 'regenerate_video', 'an empty change is no change, not a refusal')
+  })
+
+  it('the version the note is on and the one in use are marked (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)', () => {
+    const p = buildInterpretPrompt(
+      {
+        ...ctx,
+        takes: [
+          { id: 'v2', ownerKind: 'shot_video', version: 2 },
+          { id: 'v1', ownerKind: 'shot_video', version: 1, annotated: true, adopted: true },
+        ],
+      },
+      false,
+    )
+    assert.ok(p.includes('takeId=v1 shot_video v1（批注所在版本）（当前采用）'), 'v1 is marked')
+    assert.ok(p.includes('takeId=v2 shot_video v2\n'), 'v2 is not marked')
+    assert.ok(p.includes('「这个 / 现在这个 / 当前这版」指批注所在版本'), '"this version" is defined')
   })
 })
 

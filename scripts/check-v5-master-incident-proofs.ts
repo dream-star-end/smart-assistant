@@ -75,6 +75,21 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/studioOrchestrator.integ.test.ts',
     cases: ["after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"],
   },
+  {
+    incident: 'INC-20261027-STUDIO-REGENERATE-REDOES-FRAME', slug: 'inc-20261027-studio-regenerate-redoes-frame', db: true,
+    file: 'packages/commercial/src/__tests__/studioAnnotations.integ.test.ts',
+    cases: ['keeping the first frame redoes only the video, from the frame on screen (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)'],
+  },
+  {
+    incident: 'INC-20261027-STUDIO-ADOPT-WRONG-TAKE', slug: 'inc-20261027-studio-adopt-wrong-take', db: false,
+    file: 'packages/commercial/src/__tests__/studioInterpret.test.ts',
+    cases: ['the version the note is on and the one in use are marked (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)'],
+  },
+  {
+    incident: 'INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY', slug: 'inc-20261027-studio-compose-failed-no-retry', db: true,
+    file: 'packages/commercial/src/__tests__/studioComposeFlow.integ.test.ts',
+    cases: ['after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)'],
+  },
 ]
 
 function fail(message: string): never {

@@ -108,7 +108,7 @@ async function context(
   a: AnnotationRow,
   take: { owner_kind: string; owner_id: string } | null,
 ): Promise<InterpretContext> {
-  const [shots, lines, takes] = await Promise.all([
+  const [shots, lines, takes, inUse] = await Promise.all([
     deps.pool.query<{ id: string; ordinal: number; spec: Record<string, unknown> }>(
       'SELECT id::text AS id, ordinal, spec FROM studio_shots WHERE project_id = $1 ORDER BY ordinal',
       [a.project_id],
@@ -125,7 +125,17 @@ async function context(
           [a.project_id, take.owner_id],
         )
       : Promise.resolve({ rows: [] as Array<{ id: string; owner_kind: string; version: number }> }),
+    // What the owner uses now: a shot's adopted video or picked frame, a line's voice.
+    take
+      ? deps.pool.query<{ id: string | null }>(
+          `SELECT active_take_id::text AS id FROM studio_shots WHERE id = $1
+           UNION ALL SELECT spec->>'frameTakeId' FROM studio_shots WHERE id = $1
+           UNION ALL SELECT active_take_id::text FROM studio_lines WHERE id = $1`,
+          [take.owner_id],
+        )
+      : Promise.resolve({ rows: [] as Array<{ id: string | null }> }),
   ])
+  const adoptedIds = new Set(inUse.rows.flatMap((r) => (r.id ? [r.id] : [])))
   let start = 0
   const str = (v: unknown) => (typeof v === 'string' ? v : undefined)
   const shotRows = shots.rows.map((s) => {
@@ -168,7 +178,13 @@ async function context(
     shots: shotRows,
     lines: lines.rows.map((l) => ({ id: l.id, shotId: l.shot_id, text: l.text })),
     voices: voices.map((v) => ({ voiceId: v.voiceId, name: v.name })),
-    takes: takes.rows.map((t) => ({ id: t.id, ownerKind: t.owner_kind, version: t.version })),
+    takes: takes.rows.map((t) => ({
+      id: t.id,
+      ownerKind: t.owner_kind,
+      version: t.version,
+      ...(t.id === a.take_id ? { annotated: true } : {}),
+      ...(adoptedIds.has(t.id) ? { adopted: true } : {}),
+    })),
   }
 }
 

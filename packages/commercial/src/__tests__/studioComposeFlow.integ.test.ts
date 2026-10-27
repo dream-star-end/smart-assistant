@@ -429,6 +429,40 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
     )
   })
 
+  test('after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)', async (t) => {
+    if (skip(t)) return
+    // prod 2026-10-27 c6f0a9f2: COMPOSE_FAILED left the project at awaiting_user/compose_failed with
+    // no way back but writing a note.
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    s.runner.fail = Object.assign(new Error('ffmpeg exited 1'), { code: 'COMPOSE_FAILED' })
+    await runOne(s.exec)
+    assert.deepEqual(
+      [(await project(s.p.id)).status, (await project(s.p.id)).reason],
+      ['awaiting_user', 'compose_failed'],
+    )
+    s.runner.fail = null
+    await s.api.approve(s.uid, s.p.id)
+    assert.deepEqual(
+      [(await project(s.p.id)).status, (await project(s.p.id)).reason],
+      ['running', null],
+      'the film goes back to the director',
+    )
+    await advanceProject(s.advanceDeps, s.p.id)
+    assert.equal((await project(s.p.id)).status, 'composing')
+    await runOne(s.exec)
+    const all = await finals(s.p.id)
+    assert.deepEqual(
+      all.map((f) => `${f.status} ${f.cost}`),
+      ['failed 0', 'succeeded 0'],
+      'composed again, nothing charged',
+    )
+    const after = await project(s.p.id)
+    assert.deepEqual([after.status, after.spent], ['done', '0'])
+    // Only a waiting project can be approved: a second click does nothing.
+    await assert.rejects(s.api.approve(s.uid, s.p.id), (e: { status?: number }) => e.status === 409)
+  })
+
   test('changing the music edit after done sends the film back to the director', async (t) => {
     if (skip(t)) return
     const s = await setup()

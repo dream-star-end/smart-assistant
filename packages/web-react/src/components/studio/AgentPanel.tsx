@@ -50,7 +50,9 @@ export function AgentPanel(props: {
               className="st-dot"
               style={{ color: project.status === 'running' ? 'var(--success)' : 'var(--faint)' }}
             />
-            {STATUS_LINE[project.status] ?? project.status}
+            {project.status === 'awaiting_user' && project.settings?.awaitingReason === 'compose_failed'
+              ? '成片没有合成成功，可以在成片页重新合成'
+              : (STATUS_LINE[project.status] ?? project.status)}
           </div>
         </div>
         <span style={{ flex: 1 }} />
