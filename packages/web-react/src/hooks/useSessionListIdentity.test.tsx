@@ -7,7 +7,7 @@ import type { AuthSession, SessionMeta, User } from "../lib/types";
 import { useAuth } from "./useAuth";
 import { useSessionList } from "./useSessionList";
 
-vi.mock("../lib/authHint", () => ({ hasAuthHint: () => false, setAuthHint: vi.fn(), clearAuthHint: vi.fn() }));
+vi.mock("../lib/authHint", () => ({ hasAuthHint: () => false, setAuthHint: vi.fn(), clearAuthHint: vi.fn(), subscribeAuthHintSet: () => () => {} }));
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 function deferred<T>() {
   let resolve!: (value: T) => void;

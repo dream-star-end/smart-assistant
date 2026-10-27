@@ -92,9 +92,13 @@ function refreshStateFor(a: AuthSession, epoch: number): RefreshState {
 async function refreshAttempt(signal: AbortSignal): Promise<RawRefreshOutcome> {
   let res: Response;
   try {
+    // keepalive（OCV5-636）：refresh 在途时页面被关/跳走/F5，普通 fetch 会被取消，但服务端已轮换
+    // oc_rt —— Set-Cookie 丢失后浏览器一直带旧 token，45s 宽限一过就被判 theft 整族吊销（所有
+    // tab 一起掉登录）。keepalive 让请求在文档卸载后照常完成，新 cookie 仍落进 cookie 罐。
     res = await fetch("/api/auth/refresh", {
       method: "POST",
       credentials: "include",
+      keepalive: true,
       headers: { Accept: "application/json" },
       signal,
     });

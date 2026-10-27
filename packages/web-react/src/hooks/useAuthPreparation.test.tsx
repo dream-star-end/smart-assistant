@@ -3,7 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest'
 import { api } from '../lib/api'
 import type { User } from '../lib/types'
 import { useAuth } from './useAuth'
-vi.mock('../lib/authHint', () => ({ hasAuthHint: () => false, setAuthHint: () => {}, clearAuthHint: () => {} }))
+vi.mock('../lib/authHint', () => ({ hasAuthHint: () => false, setAuthHint: () => {}, clearAuthHint: () => {}, subscribeAuthHintSet: () => () => {} }))
 vi.mock('../lib/api', async importOriginal => {
   const actual = await importOriginal<typeof import('../lib/api')>()
   return { ...actual, api: { ...actual.api,

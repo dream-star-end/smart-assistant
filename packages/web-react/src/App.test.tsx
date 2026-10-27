@@ -479,6 +479,37 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const refreshCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/auth/refresh'))
     expect(refreshCall).toBeTruthy()
     expect((refreshCall![1] as RequestInit).credentials).toBe('include')
+    // OCV5-636：页面在 refresh 途中卸载也要让轮换后的 Set-Cookie 落地。
+    expect((refreshCall![1] as RequestInit).keepalive).toBe(true)
+  })
+
+  test('用着用着被判失效：直接给登录表单 +「登录状态已失效」，不静默落到营销首页（OCV5-636）', async () => {
+    let refreshCalls = 0
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        // 启动续期成功；之后同一 cookie 被服务端判 theft（整族吊销）。
+        return refreshCalls === 1
+          ? REFRESH_OK
+          : errJson(401, { error: { code: 'INVALID_REFRESH', message: 'refresh token invalid or expired' } })
+      }
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me/preferences')) return errJson(401, { error: { code: 'UNAUTHORIZED', message: 'expired' } })
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    setAuthHint()
+    render(<App />)
+    expect(await screen.findByText('登录状态已失效，请重新登录')).toBeInTheDocument()
+    expect(screen.getByLabelText('邮箱')).toBeInTheDocument()
+    expect(refreshCalls).toBeGreaterThanOrEqual(2)
+    expect(screen.queryByRole('button', { name: '免费开始' })).not.toBeInTheDocument()
   })
 
   test('boot transient refresh failure stays in recovery and does not flash the login page', async () => {
