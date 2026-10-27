@@ -268,6 +268,7 @@ import {
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
+import { foldSyntheticServiceRestartTape } from "./serviceRestartLiveFold.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
@@ -4040,6 +4041,13 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   } catch (err) {
     throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
   }
+  // OCV5-646: a boot-recovery SERVICE_RESTART tape carries no process; fold
+  // what this dispatch already streamed before finalize retires its frames.
+  rawPayload = await foldSyntheticServiceRestartTape(pool, {
+    sessionId: request.sessionId,
+    userId,
+    tapeId: request.tapeId,
+  }, rawPayload);
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });

@@ -854,9 +854,17 @@ export function errorPresentation(
     };
   }
   if (normalized === "service_restart") {
+    // OCV5-646: master folds what the dispatch streamed into the restart tape;
+    // the answer it holds stays above the card. A bare tape carries only the
+    // errorDetail (or the code) as text, which is not an answer.
+    const body = text?.trim() ?? "";
+    const partialAnswer = !body || body === detail?.trim() || body === code?.trim()
+      ? ""
+      : partialAnswerBody(body);
     return {
       title: "任务已中断",
       message: "此前已生成的过程已完整保留。你可以从现有进度继续；本轮未计费，如已扣除，积分已原路退回。",
+      ...(partialAnswer ? { bodyText: partialAnswer } : {}),
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
       waived: true,
     };

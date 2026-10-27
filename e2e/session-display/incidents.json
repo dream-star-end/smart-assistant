@@ -8358,6 +8358,45 @@
           "assertion": "OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡"
         }
       ]
+    },
+    {
+      "id": "INC-20261028-RESTART-LIVE-FOLD",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "t1134u：发「怎么根治」后浏览器里看到了流式正文和工具过程，换终端/浏览器再打开这一轮为空。会话 webmvqm6jl6964ekm（k3.1-pro，非 Box），dispatch d70edbec 在 403 后挂起，13:52Z 发版重启时 gateway boot recovery 只用 inbox 字段合成 SERVICE_RESTART crashed tape（text 空），master finalize 把流翻成 tape、读路径不再读帧，每小时的 pruneProjectedLiveFrames 随后删帧，新端 hydrate 只剩合成错误行。修：master 物化这种合成 tape 前用该 dispatch 自己的 live 帧折回正文/思考/工具；前端 SERVICE_RESTART 行把折回的正文作部分回答显示。挂起不结算（G-C）与已删帧会话的补救不在本条（CONTINUE-20261028-box-terminal-verify §4–§6）。",
+      "rootFixCommit": "e36fa3b9",
+      "coverageCommits": [
+        "3d3f39f1",
+        "5cf81015",
+        "9599479a"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-646-restart-tape-fold] PASS — a boot-recovery SERVICE_RESTART tape keeps the answer and tool steps the dispatch streamed, after its live frames are pruned"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-646 boot-recovery SERVICE_RESTART tape keeps the streamed answer after prune"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/serviceRestartLiveFold.test.ts",
+          "assertion": "materialized records keep the answer, the restart code and the billing anchor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "OCV5-646 SERVICE_RESTART 带折回的部分回答 → bodyText;裸合成行(text=detail / 码)无 bodyText"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "OCV5-646 重启中断轮换端打开:折回的部分回答照常显示，仍不出错误卡"
+        }
+      ]
     }
   ]
 }
