@@ -18,7 +18,7 @@ import {
   imageByteCache,
 } from "../../lib/chat/imageBytes";
 import { ImageEditActionsContext } from "./imageEditActions";
-import { Media, MediaSignProvider, SignedFileCard, ZoomableImage } from "./media";
+import { Media, MediaSignProvider, SignedFileCard, SignedVideo, ZoomableImage } from "./media";
 import { loadBeforeAll } from "../../test/moduleLoad";
 
 // 点开图片后断言查看器内容:懒加载的 ImageViewer 先在用例窗口外取好(src/test/moduleLoad.ts)。
@@ -416,6 +416,38 @@ describe("用户气泡媒体缩略图:/api/media 收口签名管线(iOS/CF 下 4
     const img = await screen.findByAltText("图.png");
     expect(img.getAttribute("src")).toBe("blob:local-preview");
     expect(sign).not.toHaveBeenCalled(); // 本地字节在手,无需签名/网络
+  });
+});
+
+describe("聊天视频页内播放、不自动播放(P0 鸿蒙原生浏览器起播后按钮失效)", () => {
+  // 没有 playsinline 时移动端浏览器一播放就交给系统全屏 / 浮窗播放器,退出后页面按钮点不动。
+  const signedVideo = async (container: HTMLElement) => {
+    await waitFor(() => expect(container.querySelector("video")?.getAttribute("src")).toBe("/api/media-signed?t=v1"));
+    return container.querySelector("video") as HTMLVideoElement;
+  };
+
+  test("气泡附件视频(MediaItem)带 playsinline、无 autoplay", async () => {
+    const media: MediaRef[] = [{ kind: "video", url: "/api/media/clip.mp4" }];
+    const { container } = render(
+      <MediaSignProvider sign={makeSignMock()}>
+        <Media media={media} />
+      </MediaSignProvider>,
+    );
+    const video = await signedVideo(container);
+    expect(video.hasAttribute("playsinline")).toBe(true);
+    expect(video.hasAttribute("autoplay")).toBe(false);
+  });
+
+  test("markdown 内联成片(SignedVideo)丢弃透传的 autoPlay,playsInline 关不掉", async () => {
+    const { container } = render(
+      <MediaSignProvider sign={makeSignMock()}>
+        <SignedVideo src="/home/agent/.openclaude/generated/film.mp4" autoPlay playsInline={false} />
+      </MediaSignProvider>,
+    );
+    const video = await signedVideo(container);
+    expect(video.hasAttribute("playsinline")).toBe(true);
+    expect(video.hasAttribute("autoplay")).toBe(false);
+    expect(video.autoplay).toBe(false);
   });
 });
 
