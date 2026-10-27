@@ -122,3 +122,49 @@ test("OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything 
     assert.equal(existsSync(`${project}/memory/nested`), true);
   } finally { f.close(); rmSync(root, { recursive: true, force: true }); }
 });
+
+test("OCV5-645 a session tool-results tree in a run project is cleaned, anything else under it still refused", () => {
+  const f = fixture();
+  const root = `/tmp/ocv5-645-projects-${randomBytes(8).toString("hex")}`;
+  const project = `${root}/${f.cwd.replaceAll("/", "-")}`;
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const run = () => {
+    const request = makeBoxRunCleanup(f.nonce, false);
+    const script = request.args[2]!.replace("/home/box/.claude/projects/", `${root}/`);
+    return spawnSync(request.command, ["-I", "-c", script, ...request.args.slice(3)],
+      { cwd: request.cwd, env: { ...process.env, ...request.environment },
+        encoding: "utf8", timeout: 5000 });
+  };
+  const build = (extra: (tree: string) => void) => {
+    rmSync(project, { recursive: true, force: true });
+    mkdirSync(project, { recursive: true, mode: 0o700 });
+    writeFileSync(`${project}/${sid}.jsonl`, "history\n", { mode: 0o600 });
+    // the exact tree Claude Code 2.1.288 writes for a large or image tool result
+    mkdirSync(`${project}/${sid}/tool-results`, { recursive: true, mode: 0o755 });
+    writeFileSync(`${project}/${sid}/tool-results/mcp-image-1.png`, "png", { mode: 0o644 });
+    writeFileSync(`${project}/${sid}/tool-results/toolu_A.txt`, "private 50k result", { mode: 0o644 });
+    extra(`${project}/${sid}/tool-results`);
+  };
+  try {
+    writeFileSync(`${f.cwd}/stdout.jsonl`, "private model output", { mode: 0o600 });
+    writeFileSync(`${f.cwd}/stderr.log`, "private stderr", { mode: 0o600 });
+    build(() => {});
+    const cleaned = run();
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    assert.equal(cleaned.stdout.trim(), "clean");
+    assert.equal(existsSync(`${project}/${sid}`), false);
+    assert.equal(existsSync(`${project}/${sid}.jsonl`), false);
+    assert.equal(run().status, 0, "idempotent");
+    // a nested folder, a link, or a sibling of tool-results is not the CLI's: refused, nothing removed
+    for (const bad of [
+      (tree: string) => mkdirSync(`${tree}/nested`),
+      (tree: string) => symlinkSync(`${root}/decoy`, `${tree}/link.png`),
+      (tree: string) => mkdirSync(`${tree}/../other`),
+    ]) {
+      build(bad);
+      assert.equal(run().status, 126);
+      assert.equal(existsSync(`${project}/${sid}/tool-results/mcp-image-1.png`), true);
+      assert.equal(existsSync(`${project}/${sid}.jsonl`), true);
+    }
+  } finally { f.close(); rmSync(root, { recursive: true, force: true }); }
+});

@@ -1046,6 +1046,37 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
   });
 
+  test("OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡", () => {
+    render(
+      <MessageList
+        messages={[
+          { ...failedUser, status: "sent" },
+          mk("assistant", {
+            id: "a-held-source-with-answer",
+            _clientMessageId: failedUser.id,
+            _errorCode: "engine_error",
+            _errorHeldForRecovery: true,
+            text: "HELD_SOURCE_PARTIAL_ANSWER\n\n[turn failed: BOX_REPLAY_PENDING]",
+          }),
+          mk("user", {
+            id: "u-held-recovery-child",
+            text: "↻ 自动从断点继续",
+            _isAutoRetry: true,
+            _automaticRecovery: true,
+            _recoveryOfClientMessageId: failedUser.id,
+          }),
+        ]}
+        sending={false}
+        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn() }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("HELD_SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
+    expect(screen.queryByText("↻ 自动从断点继续")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+  });
+
   test("手动恢复子行不渲染，只靠血缘字段也能隐藏", () => {
     const recoveryChild = mk("user", {
       id: "u-manual-recovery-child",

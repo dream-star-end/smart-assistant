@@ -47,6 +47,7 @@ import {
   CONTINUE_PROMPT,
   defaultCollapsed,
   errorPresentation,
+  isErrorCardHeld,
   isLegacyRequestTooLargeDiagnostic,
   isLive,
   isSealedDispatchFailure,
@@ -947,7 +948,9 @@ export function AssistantCard({
   const recoveredStep = useContext(RecoveredStepContext);
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
-  if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
+  // OCV5-645: waiting for the automatic recovery holds the error card, not the row — a partial
+  // answer the model already wrote stays visible; only a held row with nothing to show is skipped.
+  const errorCardHeld = isErrorCardHeld(msg);
   const hasError = !!msg._errorCode;
   const legacySize = isLegacyRequestTooLargeDiagnostic(msg._errorCode, msg.text);
   const effectiveCode = legacySize ? "request_too_large" : msg._errorCode;
@@ -963,6 +966,7 @@ export function AssistantCard({
         dispatchOutcome: msg._dispatchOutcome,
       })
     : null;
+  if (errorCardHeld && !presentedError?.bodyText) return null;
   const isSyntheticEmptyNotice =
     !hasError && (msg.text ?? "").trim() === "本轮未能产出可见回复，已结束，可重试或继续";
 
@@ -1186,7 +1190,7 @@ export function AssistantCard({
         )}
 
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
-        {isUserCancelled ? (
+        {errorCardHeld ? null : isUserCancelled ? (
           <output
             className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
             aria-label="已停止生成"

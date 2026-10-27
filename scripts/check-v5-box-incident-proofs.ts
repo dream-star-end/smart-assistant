@@ -3710,7 +3710,7 @@ async function main(): Promise<void> {
     await proveMixedCallTurnCut(api), await (await import("./lib/boxCapacityHeldProof.js")).proveCapacityHeldReleased(CANDIDATE), // OCV5-649 (file-size ratchet): [ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
-    await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
+    await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api), await (await import("./lib/boxRunCleanupProof.js")).proveRunCleanupToolResults(CANDIDATE), // OCV5-645 (file-size ratchet): [ocv5-645-run-cleanup-tool-results] PASS — a recovered run whose CLI wrote a session tool-results tree finishes its privacy cleanup instead of retrying it forever, and any other folder there stays refused
     ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
