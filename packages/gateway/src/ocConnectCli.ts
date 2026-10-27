@@ -68,7 +68,7 @@ interface CliSurface {
 
 /** Browser Plugins live only on the oc-plugin surface; oc-connect points there instead of to rebinding. */
 const BROWSER_PLUGIN_POINTER =
-  '浏览器插件（微博、知乎、知识星球、B 站账号 bili-account 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。'
+  '浏览器插件（微博、知识星球、文献数据库）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。'
 
 const CONNECTOR_SURFACE: CliSurface = {
   program: 'oc-connect',
@@ -90,7 +90,7 @@ const PLUGIN_SURFACE: CliSurface = {
   rpcSurface: 'plugins',
   listKey: 'plugins',
   catalogKey: 'plugins',
-  emptyListText: '当前没有可调用的插件。请先在 AI 市场安装，并在需要时完成账户授权。',
+  emptyListText: '当前没有可调用的插件。请在管理中心 → 插件连接账号；尚未安装的插件可从 AI 市场安装。',
   emptyCatalogText: '暂无已安装且可用的插件。',
   listTitle: '可调用的插件:',
   catalogTitle: '已安装且可用的插件:',
@@ -123,9 +123,9 @@ function usage(surface: CliSurface): string {
     plugin
       ? '  call <plugin> <action> [options]        调用插件操作(params 从 stdin 读 JSON)'
       : '  call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)',
-    ...(plugin
-      ? []
-      : ['  describe <provider> [<action>]          查看操作列表,或某个操作的完整说明与参数结构']),
+    plugin
+      ? '  describe <plugin> [<action>]          查看操作说明与参数结构'
+      : '  describe <provider> [<action>]        查看操作说明与参数结构',
     '',
     'Options (call):',
     plugin
@@ -428,7 +428,8 @@ async function cmdDescribe(
   if (resp?.kind === 'error') return formatCallResponse(resp, provider, {}, () => {}, ctx.surface)
   if (resp?.kind !== 'describe')
     return { exitCode: 1, stdout: '', stderr: `${ctx.surface.program}: CONNECTOR_UNEXPECTED_RESPONSE\n` }
-  const mark = resp.readOnly ? '[只读]' : '[写·需确认]'
+  const mark = resp.readOnly ? '[只读]' : resp.writeMode === 'account_preapproval'
+    ? '[写·账号免确认]' : resp.writeMode === 'disabled' ? '[写·已关闭]' : '[写·需确认]'
   const description = authorBlock(strOrUndef(resp.description) ?? '(作者未提供说明)')
   const params = resp.params && typeof resp.params === 'object' ? resp.params : {}
   return ok(
@@ -633,7 +634,7 @@ async function runOcCapabilityCli(
     if (command === 'call') {
       return await cmdCall(positional, flags, { transport, readStdin, writeOut, surface })
     }
-    if (command === 'describe' && surface.rpcSurface === 'connectors') {
+    if (command === 'describe') {
       return await cmdDescribe(positional, flags, { transport, readStdin, writeOut, surface })
     }
     return usageError(`unknown command '${command}'\n${help}`, surface)

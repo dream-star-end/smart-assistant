@@ -1,3 +1,4 @@
+import { assertPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * service — 连接器执行编排(RPC/handlers 共用):
  *   - executeConnectionAction:dispatch 前重查(§2)→ 解密凭据 →(feishu 惰性刷新)
@@ -58,6 +59,7 @@ export async function executeConnectionAction(opts: {
   // dispatch 前重查(每次发出第三方请求前)
   const row = await getActiveConnection(opts.connectionId, opts.userId, deps.pool)
   if (!row) throw new ConnectorError('CONNECTION_NOT_FOUND', 'connection not active')
+  assertPluginAvailable(row.provider)
   if (opts.expectedRevision !== null && row.revision !== opts.expectedRevision) {
     throw new ConnectorError('REVISION_MISMATCH', 'connection rebound since proposal')
   }

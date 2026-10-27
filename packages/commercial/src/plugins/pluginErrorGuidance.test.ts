@@ -278,7 +278,7 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     retrySafe: 'no',
     requiresReauth: false,
     sideEffect: 'none',
-    nextAction: '先用 oc-connect describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
+    nextAction: '先用 oc-plugin describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
     message: '参数不符合该操作的参数结构',
   },
   UPSTREAM_AUTH_FAILED: {

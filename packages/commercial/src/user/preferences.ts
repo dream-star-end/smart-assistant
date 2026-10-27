@@ -1,3 +1,4 @@
+import { isPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * V3 Phase 2 Task 2G — 用户偏好(`user_preferences` 表)读写。
  *
@@ -120,6 +121,11 @@ export interface PreferencesSnapshot {
 
 // ─── DB ops ───────────────────────────────────────────────────────────────
 
+/** Drop retired opt-ins from readback so a later toggle cannot resubmit stale product choices. */
+function visiblePreferences(prefs: Preferences): Preferences {
+  return prefs.enabled_plugins ? { ...prefs, enabled_plugins: prefs.enabled_plugins.filter(isPluginAvailable) } : prefs;
+}
+
 /**
  * 读 user_preferences 行;不存在 → 返回 `{ prefs: {}, updated_at: <now> }`。
  *
@@ -137,7 +143,7 @@ export async function getPreferences(userId: bigint | string): Promise<Preferenc
   // DB 里存的可能被外部直接 UPDATE 过 → 仍跑一次 schema 兜底,过滤掉非法字段。
   const parsed = PreferencesSchema.safeParse(row.prefs);
   return {
-    prefs: parsed.success ? parsed.data : {},
+    prefs: visiblePreferences(parsed.success ? parsed.data : {}),
     updated_at: row.updated_at.toISOString(),
   };
 }
@@ -168,6 +174,8 @@ export async function patchPreferences(
     );
   }
   const patch = parsed.data;
+  if (patch.enabled_plugins?.some((slug) => !isPluginAvailable(slug)))
+    throw new PreferencesError('VALIDATION', '不能启用已下架的插件');
 
   // 拆 set / unset
   const setPart: Record<string, unknown> = {};
@@ -259,7 +267,7 @@ export async function patchPreferences(
   if (!row) throw new PreferencesError('CONFLICT', '偏好已变化，请重新查看并确认。');
   const verified = PreferencesSchema.safeParse(row.prefs);
   return {
-    prefs: verified.success ? verified.data : {},
+    prefs: visiblePreferences(verified.success ? verified.data : {}),
     updated_at: row.updated_at.toISOString(),
   };
 }
@@ -283,7 +291,7 @@ export async function getVersionedPreferences(userId: string): Promise<Preferenc
   const row = r.rows[0];
   if (!row) return { prefs: {}, updated_at: new Date().toISOString(), version: 'missing' };
   const parsed = PreferencesSchema.safeParse(row.prefs);
-  return { prefs: parsed.success ? parsed.data : {}, updated_at: row.updated_at.toISOString(), version: row.version };
+  return { prefs: visiblePreferences(parsed.success ? parsed.data : {}), updated_at: row.updated_at.toISOString(), version: row.version };
 }
 
 
@@ -293,6 +301,8 @@ export async function resolvePreferencesPatch(userId: string, raw: unknown, deps
 } = {}): Promise<PreferencesPatch> {
   const parsed = PreferencesPatchSchema.safeParse(raw);
   if (!parsed.success) throw new PreferencesError('VALIDATION', parsed.error.issues.map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '));
+  if (parsed.data.enabled_plugins?.some((slug) => !isPluginAvailable(slug)))
+    throw new PreferencesError('VALIDATION', '不能启用已下架的插件');
   const { getAutoDreamFeature, normalizeAutoDreamPreferencePatch } = await import('./autoDream.js');
   if (parsed.data.auto_dream_enabled === true || parsed.data.auto_optimizer_enabled === true) {
     const feature = await (deps.feature ? deps.feature(userId) : getAutoDreamFeature(userId, true));

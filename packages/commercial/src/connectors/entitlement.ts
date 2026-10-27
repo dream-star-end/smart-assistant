@@ -1,3 +1,4 @@
+import { assertPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * 连接器安装/绑定/执行授权的服务端单一权威。
  *
@@ -68,6 +69,7 @@ function assertExecutableState(row: EntitlementRow | null): asserts row is Entit
   ) {
     throw new ConnectorError('RELINK_REQUIRED', 'connector version is not executable')
   }
+  assertPluginAvailable(row.slug)
 }
 
 /** 新绑定/OAuth 起点及回调最终写入：market connector 必须精确安装当前 version+hash。 */

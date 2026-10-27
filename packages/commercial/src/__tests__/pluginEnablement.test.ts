@@ -212,3 +212,30 @@ describe('容器 RPC 的启用开关', () => {
     assert.deepEqual((await rpc(handler, '/v3/plugins/state', { slug: 'ths' })).body, { kind: 'state', slug: 'ths', enabled: true })
   })
 })
+
+
+test('/v3/plugins/describe routes managed schema and errors through the canonical plugin surface', async () => {
+  let disabled = false
+  const handler = makeConnectorsRpcHandler({
+    identityRepo: okRepo, pool: emptyPool, log: () => {},
+    pluginFacade: {
+      catalog: async () => [], list: async () => [], classifyTarget: async () => 'managed-browser',
+      actionEffect: async () => { throw new Error('must not execute') },
+      call: async () => { throw new Error('must not execute') },
+      proposeWrite: async () => { throw new Error('must not execute') },
+      executeConfirmedWrite: async () => { throw new Error('must not execute') },
+      describe: async (input) => {
+        assert.deepEqual(input, { userId: 7, targetId: '41', actionId: 'get_self' })
+        if (disabled) throw new PluginRuntimeFacadeError('PLUGIN_DISABLED')
+        return { kind: 'describe', provider: 'weibo', action: 'get_self', description: '当前账号', readOnly: true, params: { type: 'object' } }
+      },
+    },
+  })
+  const request = { connectionId: '41', action: 'get_self' }
+  assert.deepEqual((await rpc(handler, '/v3/plugins/describe', request)).body,
+    { kind: 'describe', provider: 'weibo', action: 'get_self', description: '当前账号', readOnly: true, params: { type: 'object' } })
+  disabled = true
+  const response = await rpc(handler, '/v3/plugins/describe', request)
+  assert.equal(response.body.code, 'PLUGIN_DISABLED')
+  assert.match(String(response.body.nextAction), /管理中心/)
+})

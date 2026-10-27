@@ -1,3 +1,4 @@
+import { isPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * 声明式连接器 · 前端 REST 子路由(挂在 dispatchConnectorsRoute 的 `declarative` 段下)。
  *
@@ -234,7 +235,7 @@ async function handleList(
   const user = await requireAuth(req, deps.jwtSecret)
   const rows = await listDeclarativeConnections(Number(user.id), pool)
   sendJson(res, 200, {
-    connections: rows.map((r) => ({
+    connections: rows.filter((r) => isPluginAvailable(r.slug)).map((r) => ({
       id: r.id,
       slug: r.slug,
       displayName: r.displayName,

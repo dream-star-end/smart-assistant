@@ -1,3 +1,4 @@
+import { assertPluginAvailable, configurePluginCatalog } from '../plugins/catalogPolicy.js'
 /**
  * Idempotent version-controlled publication of the official Bilibili account Plugin (OCV5-402).
  *
@@ -210,7 +211,8 @@ export async function seedBiliAccountPlugin(input: {
   env?: NodeJS.ProcessEnv
 }): Promise<SeedBiliAccountPluginResult> {
   const env = input.env ?? process.env
-  assertFlavorIdentity({ env })
+  configurePluginCatalog(assertFlavorIdentity({ env }))
+  assertPluginAvailable(BILI_ACCOUNT_PLUGIN_SLUG)
   if (input.functionalVerified !== true)
     throw new Error('Bilibili account Plugin requires live functional verification')
   let located = await locateVersion()

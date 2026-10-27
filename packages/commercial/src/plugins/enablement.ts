@@ -1,3 +1,4 @@
+import { isPluginAvailable } from './catalogPolicy.js'
 /**
  * 插件启用状态（OCV5-383）：管理中心 → 插件 一级列表的启用开关。
  *
@@ -57,6 +58,6 @@ export async function disabledPluginSet(userId: bigint | string | number): Promi
 }
 
 export const isPluginDisabled: PluginDisabledCheck = async (userId, slug) =>
-  (await disabledPluginSet(userId)).has(slug)
+  !isPluginAvailable(slug) || (await disabledPluginSet(userId)).has(slug)
 
 export const PREFS_PLUGIN_ENABLEMENT: PluginEnablement = { disabledSet: disabledPluginSet }
