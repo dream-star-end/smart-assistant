@@ -35,6 +35,8 @@ import {
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   collectTurnStatusRecordTurnIds,
+  isErrorCardHeld,
+  isErrorCardHeldWithAnswer,
   isErrorCardSupersededByTurnStatus,
   messageKind,
   safeMessageSignature,
@@ -2194,9 +2196,11 @@ export function MessageList({
         // 已经提交的卡不许因自动恢复子轮再被藏掉；没提交的中间态仍隐藏。
         // 用户手动「从断点继续」后，这张卡已被处理，随之收起（OCV5-307）。
         (m._errorCardSnapshot?.disposition !== "card" ||
-          manuallyContinuedSourceIds.has(m._clientMessageId))
+          manuallyContinuedSourceIds.has(m._clientMessageId)) &&
+        // OCV5-645: a held row keeps its partial answer on screen; AssistantCard hides only the card.
+        !isErrorCardHeldWithAnswer(m)
       ) &&
-      !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
+      !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
@@ -2236,7 +2240,7 @@ export function MessageList({
           typeof message._clientMessageId === "string" &&
           message._clientMessageId.length > 0 &&
           (message._turnStatusRecord === true ||
-            (message.role === "assistant" && !!message._errorCode)),
+            (message.role === "assistant" && !!message._errorCode && !isErrorCardHeld(message))),
       )
       .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
   );

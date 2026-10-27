@@ -476,6 +476,61 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
   });
 });
 
+describe("OCV5-645 失败轮部分回答按整体结构判断内部串", () => {
+  const T = "\n\n[turn failed: BOX_REPLAY_PENDING]";
+  const pending = 'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+  // btd-02:长任务最终答复的常见写法,旧的全文子串判断丢掉了后四种。
+  const answers = [
+    "博客大纲已写完，正在排版。",
+    '已修好接口，返回示例：\n```json\n{ "status": "ok", "code": 0 }\n```',
+    "[README.md](./README.md) 已更新，共改 3 处。",
+    "根因在 at handler (src/api.ts:42) 的空指针，已修。",
+    "上游偶发 API Error 已加重试。",
+  ];
+
+  test("结果正在收尾:带 JSON / 栈帧引用 / 链接开头的答复仍作 bodyText", () => {
+    for (const answer of answers) {
+      const p = errorPresentation("engine_error", answer + T, pending);
+      expect(p.title).toBe("结果正在收尾");
+      expect(p.bodyText).toBe(answer);
+      expect(p.detail).toBeUndefined();
+    }
+  });
+
+  test("engine_error:同样的答复不再整段换成内部错误卡", () => {
+    for (const answer of answers) {
+      const p = errorPresentation("engine_error", `${answer}\n\n[turn failed: upstream disconnected]`, undefined);
+      expect(p.bodyText).toBe(answer);
+      expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    }
+  });
+
+  test("尾部 CCB API Error 信封切掉,不进正文", () => {
+    const p = errorPresentation("engine_error", `第一步已完成。\n\n${pending}${T}`, pending);
+    expect(p.bodyText).toBe("第一步已完成。");
+    expect(JSON.stringify(p)).not.toContain("previous Box call");
+  });
+
+  test("整段是 JSON / API Error 信封 / 堆栈时仍不外泄", () => {
+    const overloaded = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+    for (const raw of [
+      overloaded,
+      `${overloaded}\n\n[turn failed: upstream disconnected]`,
+      '{\n  "error": {\n    "type": "overloaded_error"\n  }\n}',
+      "TypeError: Cannot read properties of undefined (reading 'id')\n    at run (/srv/app.js:1:2)\n    at /srv/main.js:9:1",
+    ]) {
+      const p = errorPresentation("engine_error", raw, undefined);
+      expect(p.bodyText).toBeUndefined();
+      expect(p.message).toContain("内部错误");
+      expect(JSON.stringify(p)).not.toMatch(/overloaded_error|Cannot read|srv\/app/);
+    }
+    const soft = errorPresentation("engine_error", `${pending}${T}`, pending);
+    expect(soft.title).toBe("结果正在收尾");
+    expect(soft.bodyText).toBeUndefined();
+    expect(JSON.stringify(soft)).not.toContain("previous Box call");
+  });
+});
+
 
 describe("大请求完整资料错误", () => {
   const old = "Request too large (max 20MB). Try with a smaller file.";

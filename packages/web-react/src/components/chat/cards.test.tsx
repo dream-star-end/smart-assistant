@@ -142,6 +142,27 @@ describe("AssistantCard 预期错误视觉语义", () => {
   });
 });
 
+describe("OCV5-645 等自动恢复时只藏错误卡", () => {
+  test("挂起且无冻结快照:已有部分回答照常渲染,不出错误卡与重发按钮", () => {
+    renderErr(errMsg({
+      _errorCode: "engine_error",
+      _clientMessageId: "u1",
+      _errorHeldForRecovery: true,
+      text: '长任务已完成，返回示例：\n```json\n{ "status": "ok" }\n```\n\n[turn failed: BOX_REPLAY_PENDING]',
+    }), { onRegenerate: vi.fn() });
+    expect(screen.getByText("长任务已完成，返回示例：")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
+  });
+
+  test("挂起且没有部分回答:整行不渲染(回归)", () => {
+    renderErr(errMsg({ _errorCode: "engine_error", _errorHeldForRecovery: true,
+      text: "[turn failed: BOX_REPLAY_PENDING]" }), {});
+    expect(screen.queryByTestId("assistant-row")).toBeNull();
+  });
+});
+
 describe("消息引用动作与已发送引用块", () => {
   test("助手消息提供 44px 触控引用动作并回传原消息", () => {
     const onQuote = vi.fn();

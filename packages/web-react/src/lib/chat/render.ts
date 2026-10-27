@@ -674,6 +674,56 @@ function looksLikeInternalError(value: string | undefined): boolean {
   );
 }
 
+const STACK_FRAME_LINE = /^\s*at\s+(?:.+\s\()?\S+:\d+(?::\d+)?\)?\s*$/;
+const ERROR_HEADER_LINE = /^\s*(?:Uncaught\s+)?(?:[A-Za-z_$][\w$.]*)?(?:Error|Exception)\b/;
+const API_ERROR_START = /^\s*API Error:?\s*\d{3}\b/;
+
+function isJsonContainer(value: string): boolean {
+  if (!/^\s*[\[{]/.test(value)) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** `API Error: 409 {…}`:CCB 把上游错误写进助手正文的信封(一行,或状态码后整段 JSON)。 */
+function isApiErrorEnvelope(value: string): boolean {
+  const m = /^\s*API Error:?\s*\d{3}\b([\s\S]*)$/.exec(value);
+  if (!m) return false;
+  const rest = m[1].trim();
+  return !rest.includes("\n") || isJsonContainer(rest);
+}
+
+/** 整段正文是内部串:整段 JSON、整段 API Error 信封,或每一行都是 JSON 行 / API Error 行 / 栈帧(有栈帧时含错误首行)。 */
+function isInternalErrorBody(body: string): boolean {
+  if (isJsonContainer(body) || isApiErrorEnvelope(body)) return true;
+  const lines = body.split("\n").filter((line) => line.trim());
+  const framed = lines.some((line) => STACK_FRAME_LINE.test(line));
+  return lines.length > 0 && lines.every((line) =>
+    isJsonContainer(line) || API_ERROR_START.test(line) || STACK_FRAME_LINE.test(line)
+    || (framed && ERROR_HEADER_LINE.test(line)));
+}
+
+/**
+ * OCV5-645:失败轮里模型已写出的部分回答。切掉尾部 tape 终止器和 CCB 的 `API Error:` 信封后,
+ * 只在剩下的**整段**是内部串时才丢。长任务的正常答复常带 JSON 片段、代码、栈帧引用、以 `[`
+ * 开头的 markdown 链接,旧的全文子串判断(looksLikeInternalError)会把整段答复连同这些一起丢掉。
+ * detail 仍走 sanitizeErrorDetail 的子串守卫(R7),不受影响。
+ */
+function partialAnswerBody(text: string | undefined): string {
+  let body = splitTrailingTerminator(text?.trim() ?? "").body;
+  for (;;) {
+    const lines = body.split("\n");
+    let at = lines.length - 1;
+    while (at >= 0 && !API_ERROR_START.test(lines[at])) at--;
+    if (at < 0 || !isApiErrorEnvelope(lines.slice(at).join("\n"))) break;
+    body = lines.slice(0, at).join("\n").trim();
+  }
+  return body && !isInternalErrorBody(body) ? body : "";
+}
+
 /** OCV5-620: end-of-turn 409 BOX_REPLAY_PENDING after work/charge — not a hard failure. */
 function isBoxReplayPendingDetail(...values: Array<string | undefined>): boolean {
   return values.some((v) => typeof v === "string" && /BOX_REPLAY_PENDING/.test(v));
@@ -846,10 +896,7 @@ export function errorPresentation(
   // settling / billing-gated — work and charge may already be done. Prefer a
   // soft card (keep any partial answer) over pink「任务执行失败」.
   if (isBoxReplayPendingDetail(text, detail)) {
-    const rawText = text?.trim() ?? "";
-    const { body: preTerminator } = splitTrailingTerminator(rawText);
-    const partialAnswer =
-      preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+    const partialAnswer = partialAnswerBody(text);
     return {
       title: "结果正在收尾",
       message:
@@ -862,7 +909,8 @@ export function errorPresentation(
   // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
   // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
   // 仅 detail 是内部串,应落到下方 R6 分支保住部分回答(detail 交由 sanitizeErrorDetail 脱敏)。
-  if (normalized === "engine_error" && looksLikeInternalError(text)) {
+  // OCV5-645:text 里切得出部分回答(partialAnswerBody)时也落到 R6,不因答复里带 JSON/栈帧就整段丢。
+  if (normalized === "engine_error" && looksLikeInternalError(text) && !partialAnswerBody(text)) {
     return {
       title: ERROR_LABELS.engine_error,
       message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
@@ -903,8 +951,8 @@ export function errorPresentation(
     };
   }
   // R6:切出尾部终止器,前半段若是合法部分回答(非空、非内部串) → 作 bodyText 正常渲染,红卡在其下方。
-  const { body: preTerminator, terminator } = splitTrailingTerminator(t);
-  const partialAnswer = preTerminator && !echoesDetail && !looksLikeInternalError(preTerminator) ? preTerminator : "";
+  const { terminator } = splitTrailingTerminator(t);
+  const partialAnswer = echoesDetail ? "" : partialAnswerBody(t);
   // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
   const detailOut = normalized === "request_too_large"
     ? safeDetail : safeDetail ?? sanitizeErrorDetail(terminator);
@@ -952,6 +1000,21 @@ export function commitErrorCardSnapshot(
     ...(presented.detail ? { detail: presented.detail } : {}),
   };
   return "card";
+}
+
+/** 等自动恢复决定时挂起的错误卡(freezeErrorCardSnapshots 打的 _errorHeldForRecovery,尚未提交快照)。 */
+export function isErrorCardHeld(message: ChatMessage): boolean {
+  return message._errorHeldForRecovery === true && message._errorCardSnapshot?.disposition !== "card";
+}
+
+/**
+ * OCV5-645:挂起的只是错误卡,不是这一行。模型已写出的部分回答照常显示(AssistantCard 只藏卡);
+ * 否则恢复子轮拿不到结果时,用户连已生成的正文都看不到,快照只在本机,换设备后一直藏着。
+ */
+export function isErrorCardHeldWithAnswer(message: ChatMessage): boolean {
+  return isErrorCardHeld(message) && !!errorPresentation(
+    message._errorCode, message.text, message._errorDetail, message.usage?.waived === true,
+  ).bodyText;
 }
 
 export function freezeErrorCardSnapshots(
