@@ -45,10 +45,18 @@ def clear_session(parent,name):
     if os.fstat(tfd).st_uid!=os.getuid():raise SystemExit(126)
     files=os.listdir(tfd)
     if len(files)>1024:raise SystemExit(126)
+    idents={}
     for item in files:
      seen=os.stat(item,dir_fd=tfd,follow_symlinks=False)
      if not stat.S_ISREG(seen.st_mode) or seen.st_uid!=os.getuid() or seen.st_nlink!=1:raise SystemExit(126)
-    for item in files:os.unlink(item,dir_fd=tfd)
+     idents[item]=(seen.st_dev,seen.st_ino,seen.st_size)
+    def same(item):
+     now=os.stat(item,dir_fd=tfd,follow_symlinks=False)
+     return stat.S_ISREG(now.st_mode) and now.st_uid==os.getuid() and now.st_nlink==1 and (now.st_dev,now.st_ino,now.st_size)==idents[item]
+    if sorted(os.listdir(tfd))!=sorted(files) or os.listdir(fd)!=['tool-results'] or not all(same(item) for item in files):raise SystemExit(126)
+    for item in files:
+     if not same(item):raise SystemExit(126)
+     os.unlink(item,dir_fd=tfd)
     os.fsync(tfd)
    finally:os.close(tfd)
    os.rmdir('tool-results',dir_fd=fd)

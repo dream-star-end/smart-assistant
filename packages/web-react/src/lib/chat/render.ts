@@ -674,9 +674,13 @@ function looksLikeInternalError(value: string | undefined): boolean {
   );
 }
 
-const STACK_FRAME_LINE = /^\s*at\s+(?:.+\s\()?\S+:\d+(?::\d+)?\)?\s*$/;
-const ERROR_HEADER_LINE = /^\s*(?:Uncaught\s+)?(?:[A-Za-z_$][\w$.]*)?(?:Error|Exception)\b/;
-const API_ERROR_START = /^\s*API Error:?\s*\d{3}\b/;
+/** CCB 把上游错误写进助手正文的行:`API Error: 409 {…}` / `API Error: Connection error.` / `API Error (…) · Retrying`。 */
+const API_ERROR_LINE = /^\s*API Error\s*(?::|\()/i;
+/**
+ * 行首就是内部标记的一行(代码块、行内代码之外):`{`、不是 markdown 链接的 `[`、API Error 行、栈帧
+ * (`at x (…)` / `at async x (…)` / `at /a.js:1:2`)、JSON 错误键、MODEL_AUTHORITY_INVALID。
+ */
+const INTERNAL_LINE = /^\s*(?:\{|\[(?!.*\]\()|API Error\s*(?::|\()|at\s+(?:async\s+)?(?:new\s+)?\S+(?:\s*\(|:\d+))|"(?:error|errors|status|code)"\s*:|MODEL_AUTHORITY_INVALID/i;
 
 function isJsonContainer(value: string): boolean {
   if (!/^\s*[\[{]/.test(value)) return false;
@@ -688,40 +692,48 @@ function isJsonContainer(value: string): boolean {
   }
 }
 
-/** `API Error: 409 {…}`:CCB 把上游错误写进助手正文的信封(一行,或状态码后整段 JSON)。 */
+/** API Error 信封:一行,或 `API Error: [状态码]` 后跟整段 JSON。 */
 function isApiErrorEnvelope(value: string): boolean {
-  const m = /^\s*API Error:?\s*\d{3}\b([\s\S]*)$/.exec(value);
-  if (!m) return false;
-  const rest = m[1].trim();
-  return !rest.includes("\n") || isJsonContainer(rest);
+  if (!API_ERROR_LINE.test(value)) return false;
+  return !value.trim().includes("\n") || isJsonContainer(value.replace(/^\s*API Error\s*:?\s*(?:\d{3}\b)?/i, ""));
 }
 
-/** 整段正文是内部串:整段 JSON、整段 API Error 信封,或每一行都是 JSON 行 / API Error 行 / 栈帧(有栈帧时含错误首行)。 */
-function isInternalErrorBody(body: string): boolean {
-  if (isJsonContainer(body) || isApiErrorEnvelope(body)) return true;
-  const lines = body.split("\n").filter((line) => line.trim());
-  const framed = lines.some((line) => STACK_FRAME_LINE.test(line));
-  return lines.length > 0 && lines.every((line) =>
-    isJsonContainer(line) || API_ERROR_START.test(line) || STACK_FRAME_LINE.test(line)
-    || (framed && ERROR_HEADER_LINE.test(line)));
+/** 代码块和行内代码之外的非空行(模型引用的代码、JSON、栈帧不算它自己的内部串)。 */
+function linesOutsideCode(body: string): string[] {
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (const line of body.split("\n")) {
+    const mark = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (mark && (fence === null || (mark[0] === fence[0] && mark.length >= fence.length))) {
+      fence = fence === null ? mark : null;
+      continue;
+    }
+    if (fence !== null) continue;
+    const prose = line.replace(/`[^`\n]*`/g, "");
+    if (prose.trim()) out.push(prose);
+  }
+  return out;
 }
 
 /**
- * OCV5-645:失败轮里模型已写出的部分回答。切掉尾部 tape 终止器和 CCB 的 `API Error:` 信封后,
- * 只在剩下的**整段**是内部串时才丢。长任务的正常答复常带 JSON 片段、代码、栈帧引用、以 `[`
- * 开头的 markdown 链接,旧的全文子串判断(looksLikeInternalError)会把整段答复连同这些一起丢掉。
- * detail 仍走 sanitizeErrorDetail 的子串守卫(R7),不受影响。
+ * OCV5-645:失败轮里模型已写出的部分回答。先切掉尾部 tape 终止器和 CCB 的 `API Error` 信封。
+ * 旧的全文子串判断(looksLikeInternalError)没命中的照旧保留;命中时,只要代码块 / 行内代码之外
+ * 还有正文、且这些行没有一行以内部标记开头,就仍是答复 —— 长任务的正常答复常在句中提到
+ * `API Error`、`at handler (…)`,带 JSON 代码块,或以 markdown 链接开头,旧判断会把整段答复丢掉。
+ * 比基线只多放过这一类,JSON / 信封 / 栈帧本身照旧不进正文。detail 仍走 sanitizeErrorDetail(R7)。
  */
 function partialAnswerBody(text: string | undefined): string {
   let body = splitTrailingTerminator(text?.trim() ?? "").body;
   for (;;) {
     const lines = body.split("\n");
     let at = lines.length - 1;
-    while (at >= 0 && !API_ERROR_START.test(lines[at])) at--;
+    while (at >= 0 && !API_ERROR_LINE.test(lines[at])) at--;
     if (at < 0 || !isApiErrorEnvelope(lines.slice(at).join("\n"))) break;
     body = lines.slice(0, at).join("\n").trim();
   }
-  return body && !isInternalErrorBody(body) ? body : "";
+  if (!body || !looksLikeInternalError(body)) return body;
+  const prose = linesOutsideCode(body);
+  return prose.length > 0 && !prose.some((line) => INTERNAL_LINE.test(line)) ? body : "";
 }
 
 /** OCV5-620: end-of-turn 409 BOX_REPLAY_PENDING after work/charge — not a hard failure. */

@@ -518,11 +518,16 @@ describe("OCV5-645 失败轮部分回答按整体结构判断内部串", () => {
       `${overloaded}\n\n[turn failed: upstream disconnected]`,
       '{\n  "error": {\n    "type": "overloaded_error"\n  }\n}',
       "TypeError: Cannot read properties of undefined (reading 'id')\n    at run (/srv/app.js:1:2)\n    at /srv/main.js:9:1",
+      // Codex r1:无状态码的信封、异步栈帧
+      'API Error: {"error":{"message":"overloaded_error internal diagnostic"}}\n\n[turn failed: upstream disconnected]',
+      "TypeError: fetch failed\n    at async Promise.all (index 0)\n    at run (/srv/app.js:1:2)\n\n[turn failed: upstream disconnected]",
+      // 前面有一句话也不行:代码块之外有一行以内部标记开头,整段仍按内部串处理(同基线)
+      "请求失败：\n    at TLSWrap.onStreamRead (node:internal/stream_base_commons:217:20) {\n  errno: -104,\n  code: 'ECONNRESET'\n}",
     ]) {
-      const p = errorPresentation("engine_error", raw, undefined);
+      const p = errorPresentation("engine_error", raw, raw);
       expect(p.bodyText).toBeUndefined();
       expect(p.message).toContain("内部错误");
-      expect(JSON.stringify(p)).not.toMatch(/overloaded_error|Cannot read|srv\/app/);
+      expect(JSON.stringify(p)).not.toMatch(/overloaded_error|Cannot read|fetch failed|srv\/app|ECONNRESET/);
     }
     const soft = errorPresentation("engine_error", `${pending}${T}`, pending);
     expect(soft.title).toBe("结果正在收尾");
