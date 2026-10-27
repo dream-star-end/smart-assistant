@@ -935,7 +935,7 @@
     "master",
     "egress"
    ],
-   "note": "pure platform-envelope builder the proxy calls in egress (P3 pilot S1)"
+   "note": "platform-envelope builder the proxy calls in egress; imports only node:crypto, still reads process.env (baselined R3-env) (P3 pilot S1)"
   },
   "provider-ops": {
    "layer": "L3",
