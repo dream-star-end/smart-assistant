@@ -3661,7 +3661,7 @@ async function main(): Promise<void> {
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
-    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
+    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database), await (await import("./lib/serviceRestartFoldProof.js")).proveRestartTapeFold(CANDIDATE, api.tape, (run) => withSessionsBackend(api, database, run))]; // OCV5-646 (file-size ratchet): [ocv5-646-restart-tape-fold] PASS — a boot-recovery SERVICE_RESTART tape keeps the answer and tool steps the dispatch streamed, after its live frames are pruned
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
