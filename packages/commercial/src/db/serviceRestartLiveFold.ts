@@ -165,6 +165,11 @@ export function applyServiceRestartFold(
  * Reads the frames of the tape's own dispatch attempt (header columns, not the
  * payload) and folds them. A journal over the byte cap keeps the synthetic
  * payload; query errors propagate like any other prepare read (retryable).
+ *
+ * Only frames journaled by Phase A (visible_at, written once and always before
+ * any prepare) count: persistGatewayLiveFrame accepts frames until the tape is
+ * finalized, so a straggler between two prepare attempts would otherwise change
+ * the record set and trip the immutable record identity check on retry.
  */
 export async function foldSyntheticServiceRestartTape(
   q: Pool | PoolClient,
@@ -173,17 +178,18 @@ export async function foldSyntheticServiceRestartTape(
 ): Promise<unknown> {
   if (!isSyntheticServiceRestartPayload(raw)) return raw;
   const header = (
-    await q.query<{ dispatch_id: string | null; attempt_no: number | null }>(
-      `SELECT dispatch_id::text,attempt_no
+    await q.query<{ dispatch_id: string | null; attempt_no: number | null; visible_at: string | null }>(
+      `SELECT dispatch_id::text,attempt_no,visible_at::text
          FROM client_session_turn_tapes
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
       [tape.sessionId, tape.userId, tape.tapeId],
     )
   ).rows[0];
-  if (!header?.dispatch_id || header.attempt_no === null) return raw;
+  if (!header?.dispatch_id || header.attempt_no === null || header.visible_at === null) return raw;
   const streamFilter = `s.dispatch_id=$1::uuid AND s.attempt_no=$2
-            AND s.session_id=$3 AND s.user_id=$4 AND s.source='gateway'`;
-  const params = [header.dispatch_id, header.attempt_no, tape.sessionId, tape.userId];
+            AND s.session_id=$3 AND s.user_id=$4 AND s.source='gateway'
+            AND f.created_at <= to_timestamp($5::bigint / 1000.0)`;
+  const params = [header.dispatch_id, header.attempt_no, tape.sessionId, tape.userId, header.visible_at];
   const size = await q.query<{ bytes: string }>(
     `SELECT COALESCE(SUM(octet_length(f.payload)),0)::text AS bytes
        FROM client_session_live_streams s

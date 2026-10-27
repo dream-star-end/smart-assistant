@@ -35,6 +35,8 @@ import {
   _setAfterLosslessStageBatch,
   _setPhaseASqlObserver,
   _resetAutomaticRecoveryReconcileSkipsForTest,
+  _prepareLosslessTurnTapeOutsideLocks,
+  _stagePreparedLosslessTurnRecords,
   LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
@@ -8039,6 +8041,48 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.deepEqual(bare.map((row) => row.role), ["assistant"]);
     assert.equal(bare[0]!.payload.text, "任务因服务重启中断，此前已生成的过程已完整保留");
     assert.equal(bare[0]!.payload._isError, true);
+
+    // Codex r1: a straggler frame between two prepare attempts must not change
+    // the record set (immutable record identity on retry). Phase A pins the cut.
+    const lateSession = "s-ocv5-646-late";
+    const lateCmid = "cm-ocv5-646-late";
+    await backend.upsertClientSession(mkSession({ id: lateSession, userId: CUSER }));
+    const lateAdmit = await backend.admitUserTurn(admitInput({ sessionId: lateSession, clientMessageId: lateCmid }));
+    assert.equal(lateAdmit.kind, "admitted");
+    const lateDispatch = (lateAdmit as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+    const lateKey = `agent:main:webchat:dm:${lateSession}`;
+    const lateFrame = (frameSeq: number, blocks: Array<Record<string, unknown>>) =>
+      persistGatewayLiveFrame(pool, {
+        uid: UID, sessionId: lateSession, clientMessageId: lateCmid, agentContainerId: 1, sessionKey: lateKey,
+        frameSeq,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: lateKey, frameSeq, clientMessageId: lateCmid,
+          peer: { id: lateSession, kind: "dm" }, blocks }),
+      });
+    await lateFrame(1, [{ kind: "tool_use", blockId: "tu-a", toolName: "Bash", inputPreview: "ls" }]);
+    await lateFrame(2, [{ kind: "text", text: "先看目录。", messageId: "m1" }]);
+    const lateTape = restartTape(lateSession, lateCmid, lateDispatch, "f".repeat(64));
+    for (const part of lateTape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, { dispatchId: lateDispatch, attemptNo: 1 });
+    }
+    await backend.finalizeLosslessTurnTape(CUSER, lateTape.finalize, { materialize: false });
+    const format = (await pool.query<{ f: number }>(
+      `SELECT record_storage_format AS f FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [lateSession, CUSER, lateTape.finalize.tapeId],
+    )).rows[0]!.f as 2 | 3;
+    const first = await _prepareLosslessTurnTapeOutsideLocks(pool, CUSER, lateTape.finalize, format);
+    assert.ok(first);
+    await _stagePreparedLosslessTurnRecords(pool, CUSER, lateTape.finalize, first);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await lateFrame(3, [{ kind: "tool_use", blockId: "tu-b", toolName: "Read", inputPreview: "late" }]);
+    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, lateTape.finalize)).applied, "finalized");
+    const lateRecords = await pool.query<{ msg_id: string; role: string }>(
+      `SELECT msg_id,role FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 ORDER BY ordinal`,
+      [lateSession, CUSER, lateTape.finalize.tapeId],
+    );
+    assert.deepEqual(lateRecords.rows.map((row) => row.msg_id), first.turn.records.map((record) => record.id));
+    assert.deepEqual(lateRecords.rows.map((row) => row.role), ["tool", "assistant"]);
   });
 
   maybe("SERVICE_RESTART sentinel + late completed 清 failure_code; late crash 写真实码", async () => {
