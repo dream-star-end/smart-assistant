@@ -14,7 +14,7 @@
  *   6) preCheckWithCost(estimated_input + max_output)
  *   7) pickUpstream(scheduler.pick + refresh / 静态 key 合成 session)
  *   8) startInflightJournal(case (c) release ownership 在这里 fail-only)
- *   9) makeFinalizer(从此 release 唯一调用点 = finalize)
+ *   9) settlement.handOff → makeFinalizer(从此 release 唯一调用点 = finalize;此前出口都走 settlement.abort())
  *
  * 步骤 10-11(upstream round-trip)切到 proxy/core.ts 的 runUpstreamRoundTrip。
  *
@@ -33,12 +33,10 @@ import {
   type ProxyIdentity,
 } from "../../auth/proxyIdentity.js";
 import {
-  preCheckWithCost,
-  releasePreCheck,
   InsufficientCreditsError,
 } from "../../billing/preCheck.js";
+import { openSettlementUnit, type SettlementUnit } from "../../billing/settlementUnit.js";
 import {
-  makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
 import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
@@ -1421,20 +1419,20 @@ export function makeAnthropicProxyHandler(
         }
       }
       const totalMaxCost = estimateMaxCostBothSides(inputTokens, body.max_tokens, pricing);
-      let pre;
+      let settlement: SettlementUnit;
       try {
         // 走 preCheckWithCost(已知 maxCost,跳过 estimateMaxCost 重算)。
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
         // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
         // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
         stageTiming("precheck_started");
-        pre = await preCheckWithCost(deps.preCheckRedis, {
+        settlement = await openSettlementUnit(deps.preCheckRedis, {
           userId: uid,
           requestId,
           maxCost: totalMaxCost,
           ...(route.kind === "box"
             ? { ttlSeconds: BOX_TOOL_MAX_WALL_MS / 1000 + 300 } : {}),
-        });
+        }, userLog);
       } catch (err) {
         if (err instanceof InsufficientCreditsError) {
           userLog.warn("proxy_insufficient_credits", {
@@ -1454,6 +1452,9 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      // P3 pilot S2: the reservation is one unit of work. Until settlement.handOff below, every exit
+      // path calls settlement.abort() (releases once); after hand-off the finalizer owns the release.
+      const pre = settlement.reserved;
       stageTiming("precheck_complete");
       if (pre.capped) {
         incrPrecheckCapped(body.model);
@@ -1512,9 +1513,7 @@ export function makeAnthropicProxyHandler(
       stageTiming("upstream_prepare_complete");
       if (!pickRes.ok) {
         // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         switch (pickRes.error.kind) {
           case "pool_busy":
             userLog.warn("proxy_account_pool_busy", { msg: pickRes.error.err.message });
@@ -1668,9 +1667,7 @@ export function makeAnthropicProxyHandler(
       ): Promise<void> => {
         await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         incrAnthropicProxyReject(rejectKey);
         sendJsonError(res, status, code, message, requestId);
       };
@@ -1764,7 +1761,7 @@ export function makeAnthropicProxyHandler(
       } catch (err) {
         await releaseUpstreamSession(deps.scheduler, session, { kind: "client_error" }, userLog);
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        await settlement.abort();
         userLog.error("verification_sponsorship_admission_failed", { err: errSummary(err) });
         sendJsonError(res, 503, "VERIFICATION_SPONSORSHIP_UNAVAILABLE", "billing verification unavailable", requestId);
         return;
@@ -1828,9 +1825,7 @@ export function makeAnthropicProxyHandler(
             userLog,
           );
           session.zeroizeSecrets();
-          await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-            userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-          });
+          await settlement.abort();
           userLog.warn("proxy_request_id_conflict");
           incrAnthropicProxyReject("request_id_conflict");
           sendJsonError(
@@ -1850,9 +1845,7 @@ export function makeAnthropicProxyHandler(
           userLog,
         );
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
-          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
-        });
+        await settlement.abort();
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         recordUserImpactBestEffort({
           conditionKey: "ops.monitor:svc_v5", userId: uid, requestId,
@@ -1862,7 +1855,7 @@ export function makeAnthropicProxyHandler(
         return;
       }
 
-      // 9) 装 finalizer(从此 release 唯一调用点 = finalize)
+      // 9) 装 finalizer(settlement.handOff;从此 release 唯一调用点 = finalize)
       //
       // 归因四元组(sessionId/mode/parentSessionId/delegateAgentId)由
       // extractUsageAttribution(body.metadata) 算一次,sessionId 既作为 finalize
@@ -1876,7 +1869,7 @@ export function makeAnthropicProxyHandler(
       if (body.metadata?.user_id !== undefined) {
         body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
       }
-      const finalize = makeFinalizer(
+      const finalize = settlement.handOff(
         {
           pgPool: deps.pgPool,
           preCheckRedis: deps.preCheckRedis,
@@ -1894,8 +1887,6 @@ export function makeAnthropicProxyHandler(
           slotId: session.slotId,
           model: body.model,
           pricing,
-          precheckCredits: pre.maxCost,
-          preCheckReservation: pre.reservation,
           log: userLog,
           sessionId,
           // delegate 子会话计费归因(mode='delegate' + 父客户端会话 + 目标 agent);
