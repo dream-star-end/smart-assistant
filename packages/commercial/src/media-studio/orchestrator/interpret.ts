@@ -81,8 +81,17 @@ export interface InterpretContext {
   }>
   lines: Array<{ id: string; shotId: string | null; text: string }>
   voices: Array<{ voiceId: string; name: string }>
-  /** Finished takes the user could adopt instead (the annotated owner's versions). */
-  takes: Array<{ id: string; ownerKind: string; version: number }>
+  /**
+   * Finished takes the user could adopt instead (the annotated owner's versions): which one the
+   * annotation is on and which one is in use now are marked, so "this version" is never guessed.
+   */
+  takes: Array<{
+    id: string
+    ownerKind: string
+    version: number
+    annotated?: boolean
+    adopted?: boolean
+  }>
 }
 
 export function buildInterpretPrompt(ctx: InterpretContext, withImage: boolean): string {
@@ -115,7 +124,13 @@ export function buildInterpretPrompt(ctx: InterpretContext, withImage: boolean):
     .slice(0, 30)
     .map((v) => `- voiceId=${v.voiceId}：${v.name}`)
     .join('\n')
-  const takes = ctx.takes.map((t) => `- takeId=${t.id} ${t.ownerKind} v${t.version}`).join('\n')
+  const takes = ctx.takes
+    .map(
+      (t) =>
+        `- takeId=${t.id} ${t.ownerKind} v${t.version}` +
+        `${t.annotated ? '（批注所在版本）' : ''}${t.adopted ? '（当前采用）' : ''}`,
+    )
+    .join('\n')
   return [
     '你是影片导演的助手。用户在作品上留了一条批注，把它变成下面白名单里的一条指令。',
     `批注位置：${where}${mark}${ctx.shotId ? `，对应 shotId=${ctx.shotId}` : ''}`,
@@ -123,7 +138,8 @@ export function buildInterpretPrompt(ctx: InterpretContext, withImage: boolean):
     shots && `镜头：\n${shots}`,
     lines && `台词：\n${lines}`,
     voices && `可用的系统音色：\n${voices}`,
-    takes && `可选用的已有版本：\n${takes}`,
+    takes &&
+      `可选用的已有版本：\n${takes}\n批注里说「这个 / 现在这个 / 当前这版」指批注所在版本，不是最新的版本。`,
     '指令白名单（只能选一个；id 只能用上面列出的）：',
     'regenerate_shot {shotId, promptDelta 重画时要加的描述 ≤100 字}（重画首帧再重做视频，首帧会变）；',
     'regenerate_video {shotId, promptDelta? 视频要加的描述 ≤100 字}（首帧不变，只重做这个镜头的视频）；',
