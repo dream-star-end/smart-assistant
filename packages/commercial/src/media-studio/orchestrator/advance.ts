@@ -254,9 +254,12 @@ function buildRequest(
   if (d.ownerKind === 'shot_video') {
     const spec = ctx.specs.get(d.ownerId) ?? {}
     const dur = Number(spec.durationSec)
+    // A video-only redo from an annotation keeps its change on every retry and fallback.
+    const videoDelta = ((spec.redo ?? null) as ShotRedo | null)?.videoDelta
+    const base = videoPrompt(spec)
     return {
       op: d.op,
-      prompt: withAvoid(videoPrompt(spec), d.avoid, 1000),
+      prompt: withAvoid(videoDelta ? `${base}\n修改要求：${videoDelta}` : base, d.avoid, 1000),
       aspect,
       inputs,
       ...(Number.isFinite(dur) ? { durationSec: dur } : {}),

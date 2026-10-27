@@ -6,6 +6,7 @@ import { z } from 'zod'
 
 export const INTERPRET_OPS = [
   'regenerate_shot',
+  'regenerate_video',
   'edit_frame',
   'retime_shot',
   'change_line',
@@ -27,6 +28,7 @@ const region = z.object({
 })
 const ARGS = {
   regenerate_shot: z.object({ shotId: z.string(), promptDelta: z.string().min(1).max(300) }),
+  regenerate_video: z.object({ shotId: z.string(), promptDelta: z.string().max(300).optional() }),
   edit_frame: z.object({ shotId: z.string(), region, instruction: z.string().min(1).max(300) }),
   retime_shot: z.object({
     shotId: z.string(),
@@ -39,6 +41,7 @@ const ARGS = {
 
 export type InterpretArgs = {
   regenerate_shot: z.infer<typeof ARGS.regenerate_shot>
+  regenerate_video: z.infer<typeof ARGS.regenerate_video>
   edit_frame: z.infer<typeof ARGS.edit_frame>
   retime_shot: z.infer<typeof ARGS.retime_shot>
   change_line: z.infer<typeof ARGS.change_line>
@@ -122,7 +125,9 @@ export function buildInterpretPrompt(ctx: InterpretContext, withImage: boolean):
     voices && `可用的系统音色：\n${voices}`,
     takes && `可选用的已有版本：\n${takes}`,
     '指令白名单（只能选一个；id 只能用上面列出的）：',
-    'regenerate_shot {shotId, promptDelta 重画时要加的描述 ≤100 字}；',
+    'regenerate_shot {shotId, promptDelta 重画时要加的描述 ≤100 字}（重画首帧再重做视频，首帧会变）；',
+    'regenerate_video {shotId, promptDelta? 视频要加的描述 ≤100 字}（首帧不变，只重做这个镜头的视频）；',
+    '用户说保留 / 不改首帧、只重做视频或动作时用 regenerate_video，不要用 regenerate_shot。',
     'edit_frame {shotId, region {x,y,w,h} 0–1, instruction 框内要怎么改 ≤100 字}（局部修改首帧）；',
     `retime_shot {shotId, durationSec ${MIN_SHOT_SEC}–${MAX_SHOT_SEC}}；`,
     'change_line {lineId, text 新台词 ≤200 字}；swap_voice {voiceId}（只能用上面的系统音色）；adopt_take {takeId}。',
