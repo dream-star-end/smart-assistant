@@ -15,6 +15,14 @@ import { resolveToolStatus } from "../tool/status";
 
 export type PaneStep = { message: ChatMessage; turnIndex: number };
 
+/**
+ * 「一步」的唯一口径:一次顶层工具调用。右栏步骤列表 / 本轮「N 步」与聊天过程条「已执行 N 个步骤」
+ * 都按它数(OCV5-640);思考、计划、子任务、问答只进过程条的分类小计,不算步。
+ */
+export function isPaneStep(message: ChatMessage): boolean {
+  return message.role === "tool";
+}
+
 export type PaneTurn = {
   /** 本轮 user 消息的 id;会话开头没有 user 消息的那段为 "start"。 */
   key: string;
@@ -42,7 +50,7 @@ export function collectPaneSteps(messages: readonly ChatMessage[]): { turns: Pan
       turns.push(current);
     }
     current.rows.push(m);
-    if (m.role !== "tool") continue;
+    if (!isPaneStep(m)) continue;
     const step = { message: m, turnIndex: turns.length - 1 };
     current.steps.push(step);
     steps.push(step);
