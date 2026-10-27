@@ -25,6 +25,7 @@
 
 import { apiKeyPoolConfiguredServices, apiKeyPoolHasMembers, selectApiKey } from "../../account-pool/apiKeyPool.js";
 import { rootLogger } from "../../logging/logger.js";
+import { proxyRuntimeFlags } from "../../config.js";
 import { ensureRequestId, setSecurityHeaders } from "../util.js";
 import {
   IdentityError,
@@ -774,7 +775,7 @@ export function makeAnthropicProxyHandler(
       // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
       // OCV5-482:主 provider 降级但声明了健康的回落上游 → 不 503,下面选路由时直接走回落上游。
       let healthFallback: StaticRouteFallback | undefined;
-      if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
+      if (proxyRuntimeFlags().providerHealthEnforce) {
         // provider 归属:catalog 判定生效时以 catalog 的 provider_id 为准(数据驱动);
         // legacy 期仍走 matchesRoute 推断。
         const providerId = gate
@@ -971,7 +972,7 @@ export function makeAnthropicProxyHandler(
         routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
         containerId: containerIdBig,
         externalApiKey: identity.apiKey != null,
-        transportConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+        transportConfigured: proxyRuntimeFlags().boxModelApi && deps.boxModel !== undefined,
       }) === "box-native-v1"
         ? PROXY_BYTE_BUDGET_BOX_NATIVE_V1
         : PROXY_BYTE_BUDGET_LEGACY;
@@ -1176,7 +1177,7 @@ export function makeAnthropicProxyHandler(
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
         apiKeyPoolConfigured: poolWiring.apiKeyPoolConfigured,
-        boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+        boxConfigured: proxyRuntimeFlags().boxModelApi && deps.boxModel !== undefined,
       });
       if (cfgErr) {
         if (cfgErr.kind === "box_not_configured") {
@@ -1208,7 +1209,7 @@ export function makeAnthropicProxyHandler(
           return;
         }
         const unsupported = runWithVerifiedProxyByteBudget(byteBudget, () => validateBoxRequest(body,
-          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true,
+          proxyRuntimeFlags().boxToolBridge && deps.boxModel?.toolBridgeReady === true,
           boxPrepared));
         if (unsupported) {
           userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
