@@ -8366,7 +8366,8 @@
       "symptom": "t1134u：发「怎么根治」后浏览器里看到了流式正文和工具过程，换终端/浏览器再打开这一轮为空。会话 webmvqm6jl6964ekm（k3.1-pro，非 Box），dispatch d70edbec 在 403 后挂起，13:52Z 发版重启时 gateway boot recovery 只用 inbox 字段合成 SERVICE_RESTART crashed tape（text 空），master finalize 把流翻成 tape、读路径不再读帧，每小时的 pruneProjectedLiveFrames 随后删帧，新端 hydrate 只剩合成错误行。修：master 物化这种合成 tape 前用该 dispatch 自己的 live 帧折回正文/思考/工具；前端 SERVICE_RESTART 行把折回的正文作部分回答显示。挂起不结算（G-C）与已删帧会话的补救不在本条（CONTINUE-20261028-box-terminal-verify §4–§6）。",
       "rootFixCommit": "e36fa3b9",
       "coverageCommits": [
-        "3d3f39f1"
+        "3d3f39f1",
+        "5cf81015"
       ],
       "regressions": [
         {
