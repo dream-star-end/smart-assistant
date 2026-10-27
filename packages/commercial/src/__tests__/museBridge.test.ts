@@ -14,6 +14,7 @@ import { makeMuseBridgeHttpHandler, parseByteRange } from '../muse/bridgeHttp.js
 import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse/hub.js'
 import {
   INLINE_SOURCE_MAX_BYTES,
+  MAX_DISPATCH_ATTEMPTS,
   MUSE_LIMITS,
   MuseError,
   base64DecodedBytes,
@@ -336,14 +337,16 @@ describe('muse hub', () => {
     assert.deepEqual(store.running, [first.id])
   })
 
-  it('gives up after three un-acked dispatches', async () => {
+  it('gives up after five un-acked dispatches, not before (relay drops poll replies)', async () => {
     const sid = await online()
     const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
-    for (let i = 0; i < 3; i++) {
-      assert.ok(await hub.poll(sid, 50))
+    assert.equal(MAX_DISPATCH_ATTEMPTS, 5)
+    for (let i = 0; i < 5; i++) {
+      assert.ok(await hub.poll(sid, 50), `dispatch ${i + 1}`)
       clock.t += 21_000
       hub.checkSession(sid)
       hub.tick()
+      if (i < 4) assert.notEqual((await hub.view('3', id, 0))?.status, 'failed', `alive after ${i + 1}`)
     }
     const v = await hub.view('3', id, 0)
     assert.equal(v?.status, 'failed')
@@ -359,9 +362,9 @@ describe('muse hub', () => {
       prompt: 'x',
       source_images: [pngOf(1000).toString('base64')],
     })
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < MAX_DISPATCH_ATTEMPTS; i++) {
       const job = (await logged.poll(sid, 50))!
-      assert.ok(job.source_images)
+      assert.ok(job.source_images, `dispatch ${i + 1}`)
       clock.t += 21_000
       logged.checkSession(sid)
       logged.tick()
@@ -370,8 +373,8 @@ describe('muse hub', () => {
     const sizes = warns
       .filter(([m]) => m === 'muse_job_ack_timeout_requeued' || m === 'muse_job_never_acked')
       .map(([m, meta]) => [m, meta.claimResponseBytes])
-    assert.equal(sizes.length, 3)
-    assert.equal(sizes[2]![0], 'muse_job_never_acked')
+    assert.equal(sizes.length, MAX_DISPATCH_ATTEMPTS)
+    assert.equal(sizes[MAX_DISPATCH_ATTEMPTS - 1]![0], 'muse_job_never_acked')
     for (const [, n] of sizes) assert.ok(typeof n === 'number' && n > 1300, String(n))
   })
 
@@ -465,7 +468,12 @@ describe('muse hub', () => {
 
   it('lost heartbeat and deadline fail the running job', async () => {
     const a = await runningJob()
+    // 61 s of silence is tolerated (relay-dropped heartbeats); 121 s is lost contact.
     clock.t += 61_000
+    hub.checkSession((hub as any).session.id)
+    hub.tick()
+    assert.equal((await hub.view('3', a.id, 0))?.status, 'running', 'still running after 61 s')
+    clock.t += 60_000
     hub.checkSession((hub as any).session.id)
     hub.tick()
     assert.equal((await hub.view('3', a.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')

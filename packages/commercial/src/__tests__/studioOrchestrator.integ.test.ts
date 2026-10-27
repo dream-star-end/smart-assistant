@@ -29,6 +29,7 @@ import { query } from '../db/queries.js'
 import { StudioBlobStore } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
 import { advanceProject, dispatchRequest } from '../media-studio/orchestrator/advance.js'
+import { makeOrchestratorApi } from '../media-studio/orchestrator/service.js'
 import {
   type ExecuteDeps,
   LeaseLostError,
@@ -490,6 +491,55 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       [shotId],
     )
     assert.deepEqual(s2.rows[0], { status: 'ready', active: video.rows[0]!.id })
+  })
+
+  test("after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)", async (t) => {
+    if (skip(t)) return
+    // prod 2026-10-27 c6f0a9f2: Muse (the only video provider) failed one video of a shot; the user
+    // picked the first frame and the shot was handed straight back with provider.exhausted.
+    const vid = new FakeProvider('vid', 'video')
+    vid.fail = new MediaProviderError('UPSTREAM_REJECTED', false, 'lost')
+    const d = await deps(new FakeProvider('img', 'image'), vid)
+    const p = await runningProject(1)
+    const shotId = await shotWithFrame(d, p)
+    await runOne(d)
+    await advanceProject(d, p.id) // no other video provider: the shot goes to the user
+    await advanceProject(d, p.id) // and with it the project
+    const handed = await query<{ status: string; reason: string | null; shot: string }>(
+      `SELECT p.status, p.settings->>'awaitingReason' AS reason, s.status AS shot
+         FROM studio_projects p JOIN studio_shots s ON s.project_id = p.id WHERE p.id = $1`,
+      [p.id],
+    )
+    assert.deepEqual(handed.rows[0], { status: 'awaiting_user', reason: 'needs_user', shot: 'needs_user' })
+    const callsBefore = vid.calls
+
+    vid.fail = null
+    const frame = await query<{ id: string }>(
+      "SELECT id::text AS id FROM studio_takes WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND status = 'succeeded'",
+      [shotId],
+    )
+    const api = makeOrchestratorApi(getPool(), () => {}, d)
+    await api.selectTake(p.userId, frame.rows[0]!.id)
+    await advanceProject(d, p.id)
+    const queued = await query<{ provider: string; version: number; status: string }>(
+      `SELECT provider, version, status FROM studio_takes
+        WHERE owner_kind = 'shot_video' AND owner_id = $1 ORDER BY version`,
+      [shotId],
+    )
+    assert.deepEqual(
+      queued.rows.map((r) => `${r.provider} v${r.version} ${r.status}`),
+      ['vid v1 failed', 'vid v2 queued'],
+      'the pick must dispatch a new video on the provider that failed before',
+    )
+    await runOne(d)
+    assert.equal(vid.calls, callsBefore + 1, 'the retried video ran on the same provider')
+    await advanceProject(d, p.id)
+    const done = await query<{ status: string; active: string | null }>(
+      `SELECT s.status, t.status AS active FROM studio_shots s LEFT JOIN studio_takes t ON t.id = s.active_take_id
+        WHERE s.id = $1`,
+      [shotId],
+    )
+    assert.deepEqual(done.rows[0], { status: 'ready', active: 'succeeded' }, 'the retried video is adopted')
   })
 
   test('an unexpected executor error is retried, then closes the task with its charge booked (code r1 P1)', async (t) => {

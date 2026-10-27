@@ -462,9 +462,18 @@ export function makeOrchestratorApi(
           )
         } else if (t.owner_kind === 'shot_frame') {
           // A frame is only the start of a new video (plan r1 P1-3): the shot goes back to work.
+          // The pick is the user's retry: like an annotation's redo it opens a new video window
+          // (redo.video = next version), so a provider that failed this shot's earlier videos is
+          // tried again instead of excluded for good — the only video provider (Muse) once failed
+          // left the shot unable to ever get a video (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED).
           await c.query(
-            `UPDATE studio_shots SET status = 'generating', active_take_id = NULL,
-                    spec = jsonb_set(spec, '{frameTakeId}', to_jsonb($2::text)) WHERE id = $1`,
+            `UPDATE studio_shots
+                SET status = 'generating', active_take_id = NULL,
+                    spec = jsonb_set(spec, '{frameTakeId}', to_jsonb($2::text))
+                      || jsonb_build_object('redo', COALESCE(spec->'redo', '{"frame":0}'::jsonb)
+                           || jsonb_build_object('video', (SELECT COALESCE(MAX(version), 0) + 1 FROM studio_takes
+                                                            WHERE owner_kind = 'shot_video' AND owner_id = $1)))
+              WHERE id = $1`,
             [t.owner_id, takeId],
           )
         } else if (t.owner_kind === 'line') {
