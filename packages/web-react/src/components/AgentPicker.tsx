@@ -397,17 +397,24 @@ export function AgentPicker({
               </div>
             )
           }
+          // 目录重拉在途时卡片照常占位但先不接受点选(Codex r1):打开时用的是 App 缓存的目录,那张卡
+          // 可能已被卸载或变成不可用;选中会立刻关窗,重拉结果随之作废,错选纠正不回来。
           return (
             <button
               type="button"
               data-product-feature={PRODUCT_CAPABILITIES.agents.id}
               key={a.id}
-              onClick={() => onPick(a)}
+              aria-disabled={loading || undefined}
+              onClick={() => {
+                if (!loading) onPick(a)
+              }}
               className={cn(
                 'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                 active
                   ? 'border-accent bg-accent-soft'
-                  : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
+                  : loading
+                    ? 'cursor-progress border-border bg-surface'
+                    : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
               )}
             >
               <AgentAvatar agent={a} className="size-10 rounded-lg shadow-sm" iconSize={19} />

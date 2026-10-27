@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { MAIN_AGENT, agentFromApiRow } from "../lib/agents";
@@ -293,5 +293,40 @@ describe("AgentPicker 加载骨架", () => {
     resolve([...READINESS_ROWS, { id: "office-agent", slug: "office-agent", name: "办公助手", description: "", installed: true }]);
     expect(await screen.findByRole("button", { name: /办公助手/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /科研助手/ })).toBeInTheDocument();
+  });
+
+  // Codex r1:缓存目录里的卡可能已被卸载 / 变不可用;重拉回来前点选会立刻关窗,错选纠正不回来。
+  it("重拉在途时缓存目录的卡只占位不接受点选;回来后按新目录点选", async () => {
+    let resolve!: (rows: unknown[]) => void;
+    listMyAgents.mockReturnValue(
+      new Promise<unknown[]>((r) => {
+        resolve = r;
+      }),
+    );
+    const onPick = vi.fn();
+    const office = { id: "office-agent", slug: "office-agent", name: "办公助手", description: "", installed: true };
+    const coder = { id: "code-agent", slug: "code-agent", name: "编程助手", description: "", installed: true };
+    render(
+      <AgentPicker
+        open
+        current={MAIN_AGENT}
+        auth={auth}
+        knownAgents={[READINESS_ROWS[0], office, coder].map(agentFromApiRow)}
+        onClose={() => {}}
+        onPick={onPick}
+      />,
+    );
+    const stale = screen.getByRole("button", { name: /办公助手/ });
+    expect(stale).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(stale);
+    expect(onPick).not.toHaveBeenCalled();
+    // 服务端:办公助手已卸载,编程助手仍在。
+    resolve([READINESS_ROWS[0], coder]);
+    await waitFor(() => expect(screen.queryByRole("button", { name: /办公助手/ })).toBeNull());
+    const fresh = screen.getByRole("button", { name: /编程助手/ });
+    expect(fresh).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(fresh);
+    expect(onPick).toHaveBeenCalledTimes(1);
+    expect(onPick).toHaveBeenCalledWith(expect.objectContaining({ id: "code-agent" }));
   });
 });
