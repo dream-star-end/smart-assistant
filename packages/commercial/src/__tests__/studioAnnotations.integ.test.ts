@@ -389,6 +389,28 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.ok(gens[0]!.request.prompt?.includes('修改要求：动作慢一点'), 'the change is in the video prompt')
   })
 
+  test('the interpreter is told which version the note is on and which is in use (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)', async (t) => {
+    if (skip(t)) return
+    // prod 2026-10-27 c6f0a9f2: a note on the adopted v1 saying "就用现在这个版本" was read as v2.
+    const s = await setup()
+    const v2 = await s.take('shot_video', s.shot, 2, 'video/mp4', { passed: false, score: 0.4 })
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.video.id,
+      kind: 'box',
+      geom: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
+      text: '这个镜头就用现在这个版本，不用重做。',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('adopt_take', { takeId: s.video.id }))
+    await runOne(s.exec)
+    const prompt = String(s.grok.calls[0]?.prompt ?? '')
+    assert.ok(
+      prompt.includes(`takeId=${s.video.id} shot_video v1（批注所在版本）（当前采用）`),
+      'the annotated, adopted v1 is marked',
+    )
+    assert.ok(prompt.includes(`takeId=${v2.id} shot_video v2\n`), 'v2 carries no mark')
+  })
+
   test('an edit is dispatched as image.edit of the current frame with the marked frame as reference', async (t) => {
     if (skip(t)) return
     const s = await setup()

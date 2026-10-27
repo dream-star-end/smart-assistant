@@ -119,6 +119,21 @@ describe('Interpret: keep-the-frame and which version (INC-20261027)', () => {
     assert.equal(i.op, 'regenerate_video', 'an empty change is no change, not a refusal')
   })
 
+  it('the version the note is on and the one in use are marked (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)', () => {
+    const p = buildInterpretPrompt(
+      {
+        ...ctx,
+        takes: [
+          { id: 'v2', ownerKind: 'shot_video', version: 2 },
+          { id: 'v1', ownerKind: 'shot_video', version: 1, annotated: true, adopted: true },
+        ],
+      },
+      false,
+    )
+    assert.ok(p.includes('takeId=v1 shot_video v1（批注所在版本）（当前采用）'), 'v1 is marked')
+    assert.ok(p.includes('takeId=v2 shot_video v2\n'), 'v2 is not marked')
+    assert.ok(p.includes('「这个 / 现在这个 / 当前这版」指批注所在版本'), '"this version" is defined')
+  })
 })
 
 describe('annotation fields (OCV5-591 A2-1b-2)', () => {
