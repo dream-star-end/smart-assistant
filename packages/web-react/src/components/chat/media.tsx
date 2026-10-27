@@ -460,9 +460,13 @@ export function SignedImg(
   );
 }
 
-/** markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。 */
+/**
+ * markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。
+ * 聊天视频一律页内播放、只在用户点播放时开始(P0 鸿蒙原生浏览器):没有 playsInline 时移动端浏览器
+ * 一播放就交给系统全屏 / 浮窗播放器,退出后页面按钮点不动。playsInline 放在 rest 之后,调用方关不掉。
+ */
 export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string }) {
-  const { src, ...rest } = props;
+  const { src, autoPlay: _autoPlay, ...rest } = props;
   const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
   if (!resolved) {
     return (
@@ -472,7 +476,7 @@ export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> &
     );
   }
   // biome-ignore lint/a11y/useMediaCaption: 模型生成媒体无字幕轨
-  return <video src={resolved} controls onError={onError} className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} />;
+  return <video src={resolved} controls onError={onError} className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} playsInline />;
 }
 
 /** markdown 行内 <audio>：容器路径签名后渲染。 */
@@ -801,7 +805,7 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
   if (item.kind === "video") {
     return (
       // biome-ignore lint/a11y/useMediaCaption: 用户/模型上传媒体无字幕轨
-      <video src={url} controls onError={onError} className="max-h-72 max-w-full rounded-lg border border-border" />
+      <video src={url} controls playsInline onError={onError} className="max-h-72 max-w-full rounded-lg border border-border" />
     );
   }
   if (item.kind === "audio") {

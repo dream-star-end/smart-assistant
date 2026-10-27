@@ -71,6 +71,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     cases: ['the film audio reaches the encoder as fltp 48 kHz stereo, never negotiated (INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT)'],
   },
   {
+    incident: 'INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED', slug: 'inc-20261027-studio-retry-provider-excluded', db: true,
+    file: 'packages/commercial/src/__tests__/studioOrchestrator.integ.test.ts',
+    cases: ["after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"],
+  },
+  {
     incident: 'INC-20261027-STUDIO-REGENERATE-REDOES-FRAME', slug: 'inc-20261027-studio-regenerate-redoes-frame', db: true,
     file: 'packages/commercial/src/__tests__/studioAnnotations.integ.test.ts',
     cases: ['keeping the first frame redoes only the video, from the frame on screen (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)'],

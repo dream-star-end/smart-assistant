@@ -8785,6 +8785,33 @@
       ]
     },
     {
+      "id": "INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "商业 uid 247 工作台项目 c6f0a9f2 镜头 1 的批注重做视频 take 602ab0e8 偶发 MUSE_BRIDGE_LOST（08:05Z）后，用户「采用首帧」（08:08:53Z）当秒 provider.exhausted、未发起任何视频任务：decide 的 failedProviders 排除该镜头历史上所有失败过的 provider，视频唯一的 Muse 一次失败后被永久排除，「采用首帧 / 再试一次」都无法重做视频。uid 1931 项目 9eb1deca（3 镜头视频均在 bridge 0.5.2 前 MUSE_SOURCE_FETCH_FAILED）无法继续也是此因。",
+      "rootFixCommit": "dc13a07a",
+      "coverageCommits": [
+        "e55ec3de"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/studioOrchestrator.integ.test.ts",
+          "assertion": "after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/studioDecide.test.ts",
+          "assertion": "a failed provider is excluded only inside its retry window; the user pick opens a new one (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)"
+        }
+      ]
+    },
+    {
       "id": "INC-20261027-STUDIO-REGENERATE-REDOES-FRAME",
       "occurredAt": "2026-10-27",
       "severity": "P2",
