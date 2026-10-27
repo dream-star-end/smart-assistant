@@ -8328,7 +8328,8 @@
       "symptom": "报障 #a9f49bcf：Box Claude 长任务（~74 分钟）HTTP 200 后 BOX_EXEC_REMOTE_EXIT → BOX_TOOL_TERMINAL_UNPROVEN，回合以 ENGINE_ERROR / BOX_REPLAY_PENDING 收尾，扣费齐但已流出的助手正文不展示，只剩「结果正在收尾」。该 trace 不在个人版数据里（btd-01），按代码静态还原同类回合（CONTINUE-20261027-box-terminal-display §3/§4）。本条只修三处：F1 失败轮部分回答按全文子串判内部串，带 JSON/栈帧引用/以 [ 开头的正常答复整段被丢（改为整体结构判断，detail 守卫不变）；F2 有自动恢复子行时源错误行连正文整行被藏（改为只藏错误卡）；G3 恢复成功的 run 无 native pointer、keep=0 隐私清理不认 <session>/tool-results/，126 后无限重试（按 boxNativeGcFile 规则放行）。请求内 20 秒证明窗口（G1）与恢复正文回写（G2）不在本条。",
       "rootFixCommit": "48022f40",
       "coverageCommits": [
-        "5f0be34a"
+        "5f0be34a",
+        "ab2658d1"
       ],
       "regressions": [
         {
