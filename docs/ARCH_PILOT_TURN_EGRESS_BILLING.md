@@ -44,7 +44,7 @@
 | `billing`（L3） | 64 | 10 | `R2-scope` 23、`R2-same-layer` 16、`R3-special-case` 16 |
 | `dispatch`（L3） | 15 | 0 | `R2-same-layer` 6、`R2-scope` 6 |
 
-`llm-proxy` 的 42 处 `R3-billing-sql` **不在试点链路上**（2026-10-27 逐文件核对更正）：`boxDurableJournal.ts` 38 + `boxHoldRelease.ts` 3 = 41 条 `UPDATE request_finalize_journal`（Box 路由 journal 状态；规则把 journal 表写入也计为 billing-sql），`boxSwitchCompaction.ts` 1 条 `UPDATE usage_records`，全部属于 Box 路由。试点链路在 `llm-proxy` 里没有计费表写入——钱的写入在 `billing/proxyBilling` 的单事务里；`llm-proxy` 只做编排：`index.ts` 用 `preCheckWithCost` 预留、在 6 处分别 `releasePreCheck` 释放，并挂 `proxyBilling` 的 finalizer。试点的 `app/settlement` 收的是这段编排（见 §5 S2），不是这 42 处；Box journal 的 42 处不在试点范围。
+`llm-proxy` 基线里登记的 42 处 `R3-billing-sql`（按 `arch/violations-baseline.json`；检查器当前在该目录共扫到 46 处，另 4 处在 `testing/boxContextTransportClaim.ts`，同属 Box 测试桩）**不在试点链路上**（2026-10-27 逐文件核对更正）：`boxDurableJournal.ts` 38 + `boxHoldRelease.ts` 3 = 41 条 `UPDATE request_finalize_journal`（Box 路由 journal 状态；规则把 journal 表写入也计为 billing-sql），`boxSwitchCompaction.ts` 1 条 `UPDATE usage_records`，全部属于 Box 路由。试点链路在 `llm-proxy` 里没有计费表写入——钱的写入在 `billing/proxyBilling` 的单事务里；`llm-proxy` 只做编排：`index.ts` 用 `preCheckWithCost` 预留、在 5 处分别 `releasePreCheck` 释放，并挂 `proxyBilling` 的 finalizer。试点的 `app/settlement` 收的是这段编排（见 §5 S2），不是这 42 处；Box journal 的 42 处不在试点范围。
 
 ## 5. 切片
 
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | **S0** | 本文 + `oc-trace` 把链路追到计费终点：`usage_records` → `credit_ledger`（按 usage id 只读；debit/退款都挂在 usage 上）；`--drill N --model ID` 只看一条链路 | 否（只读） | 本 PR |
 | S1 | 链路上非计费的分层：`llm-proxy` 的 `R3-env` / `R2-upward` / `R2-scope`（试点文件范围内），走公开 API，不改路由策略 | 否 | 待 S0 评审 |
-| S2 | `app/settlement` 工作单元：把试点链路的预留 → finalize → 释放生命周期收成一个单元，替代 `index.ts` 里分散的 6 处 `releasePreCheck`；`billing` 内部事务与锁序不动，F1/F2/F3/F5/F6/F7 不夹带（管家 2026-10-27 拍板 A） | 编排层（不改 billing 写入） | P2b 设计已批（Grok OD 2026-10-27） |
+| S2 | `app/settlement` 工作单元：把试点链路的预留 → finalize → 释放生命周期收成一个单元，替代 `index.ts` 里分散的 5 处 `releasePreCheck`；`billing` 内部事务与锁序不动，F1/F2/F3/F5/F6/F7 不夹带（管家 2026-10-27 拍板 A） | 编排层（不改 billing 写入） | P2b 设计已批（Grok OD 2026-10-27） |
 | S3 | 发布后 7 天同口径复测（成功率、TTFT、60 s、违规数），写试点报告（分层是否可行、护栏误报、搬家成本） | 否 | S2 发布后 |
 
 ## 6. 退出（§9.4，原样）
