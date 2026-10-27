@@ -65,6 +65,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/studioProviders.test.ts',
     cases: ['muse: a retry after a failed job submits the next job of the chain, never replays the failure (INC-20261026-STUDIO-MUSE-RETRY-REPLAY)'],
   },
+  {
+    incident: 'INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT', slug: 'inc-20261027-studio-compose-channel-layout', db: false,
+    file: 'packages/commercial/src/__tests__/studioCompose.test.ts',
+    cases: ['the film audio reaches the encoder as fltp 48 kHz stereo, never negotiated (INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT)'],
+  },
 ]
 
 function fail(message: string): never {
