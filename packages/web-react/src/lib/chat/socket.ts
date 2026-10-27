@@ -3885,8 +3885,6 @@ export class ChatSocket {
     }
   }
 
-
-  /** 用户放弃等待：撤回该会话在途的压缩切换，保留原模型。 */
   cancelPendingModelSwitches(sessId: string): void {
     const sess = this.sessions.get(sessId);
     if (sess) this.rejectPendingModelSwitches(MODEL_SWITCH_CANCELLED_MESSAGE, true, safeSessionKeyForAgent(sessId, sess.agentId));
