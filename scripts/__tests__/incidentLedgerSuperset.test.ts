@@ -519,7 +519,7 @@ describe("incident selfhost edition", () => {
         return ["--edition=selfhost"];
       },
       pass: true,
-      reason: /proofPending 1\/3/,
+      reason: /proofPending 1\/2/,
     },
     {
       name: "new proofPending incidents up to the selfhost baseline pass",
@@ -527,12 +527,11 @@ describe("incident selfhost edition", () => {
         f.manifest.incidents[0].regressions.pop();
         f.manifest.incidents[0].proofPending = { reason: "selfhost cannot run its proof", since: "2026-10-11" };
         f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-SECOND" });
-        f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-THIRD" });
         debt(f, {});
         return ["--edition=selfhost"];
       },
       pass: true,
-      reason: /proofPending 3\/3/,
+      reason: /proofPending 2\/2/,
     },
     {
       name: "one more new proofPending incident than the selfhost baseline fails",
@@ -541,12 +540,11 @@ describe("incident selfhost edition", () => {
         f.manifest.incidents[0].proofPending = { reason: "selfhost cannot run its proof", since: "2026-10-11" };
         f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-SECOND" });
         f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-THIRD" });
-        f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-FOURTH" });
         debt(f, {});
         return ["--edition=selfhost"];
       },
       pass: false,
-      reason: /个人版 proofPending 事故 4 条 > 基线 3/,
+      reason: /个人版 proofPending 事故 3 条 > 基线 2/,
     },
     {
       name: "a listed incident that has proof must leave the list",

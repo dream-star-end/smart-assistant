@@ -63,7 +63,7 @@ function startServer(dir) {
         }
         res.writeHead(200, { "content-type": "application/json", "set-cookie": `oc_rt=rt-${issued}; Path=/; HttpOnly; SameSite=Lax` });
         res.end(JSON.stringify({ access_token: `at-${issued}`, access_exp: Date.now() + 600_000, remember: true }));
-      }, 300);
+      }, 1000);
       return;
     }
     res.writeHead(204); res.end();
@@ -90,7 +90,13 @@ for (const lock of ["web-locks", "broadcast-channel"]) {
       await tab.waitForFunction(() => typeof window.__refresh === "function");
       assert.equal(await tab.evaluate(() => typeof navigator.locks?.request), lock === "web-locks" ? "function" : "undefined");
     }
-    const outcomes = await Promise.all(tabs.map((tab) => tab.evaluate(() => window.__refresh())));
+    // Both tabs start at one wall-clock instant (same machine, same clock), so the race does not
+    // depend on how soon CI schedules the second evaluate (Codex r1 P2).
+    const startAt = Date.now() + 500;
+    const outcomes = await Promise.all(tabs.map((tab) => tab.evaluate(async (at) => {
+      await new Promise((go) => setTimeout(go, Math.max(0, at - Date.now())));
+      return window.__refresh();
+    }, startAt)));
     assert.deepEqual(seen.filter((s) => !s.current), [], `a tab presented a rotated oc_rt: ${JSON.stringify(seen)}`);
     assert.deepEqual(outcomes, ["success", "success"]);
     assert.deepEqual(seen.map((s) => s.presented), [0, 1]);
