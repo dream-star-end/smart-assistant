@@ -1,8 +1,8 @@
+import { isPluginAvailable } from '../../plugins/catalogPolicy.js'
 /**
- * 默认连接器注册表(seed 源)。boss 默认集:Notion 已就绪(static-token);飞书/企微/钉钉
- * (token-exchange)、GitHub、QQ邮箱(imap-smtp)、WPS(hmac)随各自引擎能力就绪逐个加入。
- *
- * seed 机制(declarativeSeed.ts)遍历本表 → 建 listing+version → reviewer 编译签名成 exec_contract。
+ * 内置工件身份注册表：保留历史精确 hash，供验签和其它部署使用。
+ * 实际 seed / 用户目录必须用 availableDefaultConnectors()；selfhost 只提供 GitHub。
+ * seed 机制(declarativeSeed.ts)遍历有效默认集 → 建 listing+version → reviewer 编译签名。
  */
 
 import { feishuDefault } from './feishu.js'
@@ -16,6 +16,11 @@ export const DEFAULT_CONNECTORS: readonly DefaultConnector[] = [
   feishuDefault,
   githubDefault,
 ]
+
+/** Effective defaults follow the deployment product catalog; historic artifact identities stay verifiable. */
+export function availableDefaultConnectors(): readonly DefaultConnector[] {
+  return DEFAULT_CONNECTORS.filter((item) => isPluginAvailable(item.spec.id))
+}
 
 /** 官方预装身份的服务端单一权威；前端只读响应字段，绝不自行按 slug 推断。 */
 export const DEFAULT_CONNECTOR_SLUGS = DEFAULT_CONNECTORS.map((d) => d.spec.id)

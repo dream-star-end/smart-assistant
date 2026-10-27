@@ -44,6 +44,7 @@ export type ConnectorErrorCode =
   | 'WRITE_DISABLED'
   /** 用户在 管理中心 → 插件 把这个插件停用了（OCV5-383）。 */
   | 'PLUGIN_DISABLED'
+  | 'PLUGIN_UNAVAILABLE'
   // OAuth
   | 'OAUTH_STATE_MISMATCH'
   | 'OAUTH_EXCHANGE_FAILED'
@@ -77,6 +78,7 @@ function defaultHttpStatus(code: ConnectorRpcErrorCode): number {
     case 'VALIDATION_FAILED':
     case 'OAUTH_STATE_MISMATCH':
       return 400
+    case 'PLUGIN_UNAVAILABLE':
     case 'PROVIDER_UNKNOWN':
     case 'ACTION_UNKNOWN':
     case 'CONNECTION_NOT_FOUND':

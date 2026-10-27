@@ -1,3 +1,4 @@
+import { isPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * handlers — 用户管理 API(设计终稿 §7;router.ts 以 ANY_METHOD 挂
  * `/api/connectors`(精确)+ `/api/connectors/`(前缀)两行,method/子路由
@@ -303,9 +304,9 @@ async function handleCatalog(
   const userId = Number(user.id)
   const pool = getPool()
 
-  const providers = Object.values(CONNECTOR_PROVIDERS).map(providerWire)
+  const providers = Object.values(CONNECTOR_PROVIDERS).filter((p) => isPluginAvailable(p.id)).map(providerWire)
   const rows = await listConnections(userId, pool)
-  const connections: Array<Record<string, unknown>> = rows.map(connectionWire)
+  const connections: Array<Record<string, unknown>> = rows.filter((row) => isPluginAvailable(row.provider)).map(connectionWire)
 
   // github 虚拟连接(§4;id='github',DELETE 走既有 revoke 语义)
   const gh = await pool.query<{ login: string; linked_at: Date }>(
@@ -341,6 +342,7 @@ async function handleBind(
   const userId = Number(user.id)
   const pool = getPool()
 
+  if (!isPluginAvailable(providerId)) throw new HttpError(404, 'NOT_FOUND', '插件已下架')
   if (!isDbProvider(providerId) || providerId === 'feishu') {
     // feishu 走 oauth/start;github 走现有 OAuth
     throw new HttpError(400, 'UNSUPPORTED_PROVIDER', 'provider does not support form bind')
@@ -476,6 +478,7 @@ async function handleOauthStart(
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
   const userId = Number(user.id)
+  if (!isPluginAvailable(providerId)) throw new HttpError(404, 'NOT_FOUND', '插件已下架')
   if (providerId !== 'feishu') {
     throw new HttpError(400, 'UNSUPPORTED_PROVIDER', 'only feishu supports BYOA oauth')
   }
@@ -534,7 +537,7 @@ async function handleOauthCallback(
     [stateHash],
   )
   const provider = probe.rows[0]?.provider
-  if (!provider) {
+  if (!provider || !isPluginAvailable(provider)) {
     ctx.log.warn('connector_oauth_state_unknown', {})
     sendRedirect(res, connectorErrorRedirect('STATE_MISMATCH'))
     return

@@ -12,6 +12,7 @@ Usage: oc-plugin <command> [options]
 Commands:
   list                                    列出当前可调用的插件目标与操作
   catalog [query]                         列出已安装的可用插件(可选关键词搜索)
+  describe <plugin> [<action>]           查看操作说明与参数结构
   call <plugin> <action> [options]        调用插件操作(params 从 stdin 读 JSON)
 
 Options (call):

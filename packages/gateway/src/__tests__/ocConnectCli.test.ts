@@ -146,7 +146,7 @@ describe('oc-connect list', () => {
     assert.match(r.stdout, /put_file\s+\[写·需确认\]\s+上传文件/)
     assert.match(
       r.stdout.trimEnd().split('\n').at(-1) ?? '',
-      /^提示：浏览器插件（.*bili-account.*）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。$/,
+      /^提示：浏览器插件（微博、知识星球、文献数据库）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。$/,
     )
   })
 
@@ -156,7 +156,7 @@ describe('oc-connect list', () => {
     assert.equal(r.exitCode, 0)
     assert.equal(
       r.stdout,
-      '当前未绑定任何 API 插件账号。浏览器插件（微博、知乎、知识星球、B 站账号 bili-account 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。两处都没有时，请告知用户前往 管理中心 → 插件 绑定后重试。\n',
+      '当前未绑定任何 API 插件账号。浏览器插件（微博、知识星球、文献数据库）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。两处都没有时，请告知用户前往 管理中心 → 插件 绑定后重试。\n',
     )
   })
 })

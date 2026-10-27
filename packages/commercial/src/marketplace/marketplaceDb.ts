@@ -1,3 +1,4 @@
+import { availablePluginSlugs, isMarketplaceArtifactAvailable, isPluginAvailable } from '../plugins/catalogPolicy.js'
 import {
   type MarketplaceCapabilityInstallOutcome,
   type MarketplaceCapabilityRef,
@@ -595,6 +596,8 @@ async function publishSkillVersionInternal(
   allowOfficialKnowledgePlanetSeed: boolean,
 ): Promise<{ versionId: string }> {
   const kind: ArtifactKind = input.kind ?? 'skill'
+  if (!isMarketplaceArtifactAvailable(kind, input.slug))
+    throw new MarketplaceError('NOT_INSTALLABLE', '插件已下架')
   const pluginType = marketplacePluginType(kind, input.pluginType)
   const requirements =
     kind === 'agent' ? capabilityRequirementsFromManifest(input.manifest, input.slug) : []
@@ -1483,11 +1486,12 @@ export async function listApprovedForSearch(
               AND v.exec_revoked_at IS NULL
             ))
             AND ($1::text IS NULL OR l.kind = $1)
+            AND ($3::text[] IS NULL OR l.kind <> 'connector' OR l.slug = ANY($3::text[]))
             AND ${orgVisibleFrag('l', 2)}
       ORDER BY l.featured_rank ASC NULLS LAST, us.users_n DESC NULLS LAST,
                ic.n DESC NULLS LAST, v.id DESC
       LIMIT ${SEARCH_CATALOG_CAP + 1}`,
-    [kind ?? null, callerOrgId],
+    [kind ?? null, callerOrgId, availablePluginSlugs()],
   )
   if (r.rows.length > SEARCH_CATALOG_CAP) {
     // eslint-disable-next-line no-console
@@ -1513,6 +1517,7 @@ export async function listApprovedForSearch(
     listVerifiedRuntimePluginContracts(runtimeVersionIds, pool),
   ])
   for (const x of r.rows) {
+    if (!isMarketplaceArtifactAvailable(x.kind, x.slug)) continue
     // lifecycle 列只是快筛；公开目录必须经过与 bind/execute 相同的工件 hash、策略、
     // key 与签名权威校验。批量读取避免目录上限 500 条时产生 N+1。
     if (
@@ -1720,7 +1725,7 @@ export async function getListingDetail(
     [slug, callerOrgId],
   )
   const x = r.rows[0]
-  if (!x) return null
+  if (!x || !isMarketplaceArtifactAvailable(x.kind, x.slug)) return null
   let connectorContract: ListingDetail['connectorContract'] = null
   let verifiedRuntimeExecContractHash: string | null = null
   if (x.kind === 'connector') {
@@ -1873,6 +1878,8 @@ async function verifyLockedInstallTarget(
   if (listing.kind === 'agent' && !marketplaceAgentsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
   if (listing.kind !== 'connector') return
+  if (!isPluginAvailable(version.slug))
+    throw new MarketplaceError('NOT_INSTALLABLE', '插件已下架')
   if (!marketplaceConnectorsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
   if (isDefaultConnectorSlug(version.slug) && opts.allowPreinstalledConnector !== true)
@@ -2613,6 +2620,7 @@ async function getAgentCapabilityReadinessBatch(
     const currentTargetVisible = row.listing_org_id === null || row.listing_org_id === activeOrgId
     let currentTargetInstallable =
       currentTargetVisible &&
+      isMarketplaceArtifactAvailable(row.kind, row.slug) &&
       row.listing_state === 'active' &&
       row.current_version_id !== null &&
       row.current_artifact_hash !== null &&
@@ -2644,6 +2652,7 @@ async function getAgentCapabilityReadinessBatch(
     const capabilityInstalled = selectedVersionId !== null
     let artifactReady =
       capabilityInstalled &&
+      isMarketplaceArtifactAvailable(row.kind, row.slug) &&
       (usingPreinstalled || row.install_artifact_hash === selectedArtifactHash) &&
       selectedStatus === 'approved' &&
       row.listing_state === 'active'
@@ -2762,7 +2771,7 @@ export async function getInstallableVersionTarget(
     [versionId, callerOrgId],
   )
   const row = r.rows[0]
-  if (!row) return null
+  if (!row || !isMarketplaceArtifactAvailable(row.kind, row.slug)) return null
   if (row.kind === 'agent' && !marketplaceAgentsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
   if (row.kind === 'connector') {
@@ -3059,7 +3068,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   const agentsOk = marketplaceAgentsEnabled()
   const connectorsOk = marketplaceConnectorsEnabled()
   return r.rows
-    .filter((x) => (agentsOk || x.kind !== 'agent') && (connectorsOk || x.kind !== 'connector'))
+    .filter((x) => isMarketplaceArtifactAvailable(x.kind, x.slug) && (agentsOk || x.kind !== 'agent') && (connectorsOk || x.kind !== 'connector'))
     .map((x) => ({
       slug: x.slug,
       kind: x.kind as ArtifactKind,

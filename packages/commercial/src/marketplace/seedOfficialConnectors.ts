@@ -1,3 +1,5 @@
+import { assertPluginAvailable, configurePluginCatalog } from '../plugins/catalogPolicy.js'
+import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
 /**
  * 平台官方**市场**连接器的发布 seed(OCV5-402,首个是 `bili`)。只上 AI 市场、不预装。
  *
@@ -162,6 +164,8 @@ export interface SeedOfficialConnectorOptions {
 export async function seedOfficialMarketConnector(
   opts: SeedOfficialConnectorOptions,
 ): Promise<OfficialConnectorSeedReport> {
+  configurePluginCatalog(assertFlavorIdentity())
+  assertPluginAvailable(opts.slug)
   const official = OFFICIAL_MARKET_CONNECTORS.find((c) => c.slug === opts.slug)
   if (official === undefined) throw new Error(`unknown official connector ${opts.slug}`)
 
