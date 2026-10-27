@@ -294,6 +294,22 @@ export async function persistGatewayLiveFrame(
           )
         ).rows[0] ?? null
       : null;
+    // OCV5-646: the master folds this stream into a boot-recovery
+    // SERVICE_RESTART tape at prepare. Phase A of that tape commits under this
+    // same dispatch row lock, so a frame that reaches here after it would make
+    // two prepare attempts fold different frames (immutable record identity
+    // conflict on retry). The turn is already terminal; drop it.
+    if (dispatch && finalizedTape === null) {
+      const restartCut = await client.query(
+        `SELECT 1 FROM client_session_turn_tapes
+          WHERE dispatch_id=$1::uuid AND attempt_no=$2 AND finalized_at IS NULL
+            AND visible_at IS NOT NULL AND status='crashed'
+            AND visible_head->>'errorCode'='SERVICE_RESTART'
+          LIMIT 1`,
+        [dispatch.dispatch_id, dispatch.attempt_no],
+      );
+      if ((restartCut.rowCount ?? 0) > 0) return { streamKey, live: false };
+    }
 
     const stream = await client.query(
       `INSERT INTO client_session_live_streams

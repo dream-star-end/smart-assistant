@@ -716,6 +716,20 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(p.title).toBe("任务已中断");
     expect(p.message).toContain("此前已生成的过程已完整保留");
   });
+  test("OCV5-646 SERVICE_RESTART 带折回的部分回答 → bodyText;裸合成行(text=detail / 码)无 bodyText", () => {
+    const detail = "任务因服务重启中断，此前已生成的过程已完整保留";
+    const folded = errorPresentation(
+      "SERVICE_RESTART",
+      "要根治，不能只加一次重试。\n\nFailed to authenticate. API Error: 403 model authority missing or invalid",
+      detail,
+    );
+    expect(folded.title).toBe("任务已中断");
+    expect(folded.waived).toBe(true);
+    // 流式时用户看到的 403 句也照原样保留，不是合成文案。
+    expect(folded.bodyText?.startsWith("要根治，不能只加一次重试。")).toBe(true);
+    expect(errorPresentation("SERVICE_RESTART", detail, detail).bodyText).toBeUndefined();
+    expect(errorPresentation("SERVICE_RESTART", "SERVICE_RESTART", undefined).bodyText).toBeUndefined();
+  });
   test("isDispatchLostCode", () => {
     expect(isDispatchLostCode("dispatch_lost")).toBe(true);
     expect(isDispatchLostCode("SERVICE_RESTART")).toBe(true);

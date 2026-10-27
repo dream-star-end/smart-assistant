@@ -950,6 +950,21 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
+  test("OCV5-646 重启中断轮换端打开:折回的部分回答照常显示，仍不出错误卡", () => {
+    renderErr(errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _errorDetail: "任务因服务重启中断，此前已生成的过程已完整保留",
+      text: "要根治，不能只加一次重试。",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+    }), {
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.getByText("要根治，不能只加一次重试。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {
     render(
       <AssistantCard
