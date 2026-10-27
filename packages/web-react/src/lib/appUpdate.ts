@@ -25,8 +25,11 @@
  *     新标签页见同一目标直接横幅,省掉那 MAX 次无用刷新(多 tab/重开的观感风暴收敛)。
  *     storage 没了 → 退回纯谱系封顶(每条谱系仍 ≤ MAX 次)。
  * ── 安全点(与存储无关)────────────────────────────────────────────────────
+ *  S0 页面隐藏(OCV5-635):可见页一律不自动刷 —— 阅读、滚轮滚动都不产生输入事件,只靠
+ *     「30s 无输入」挡不住读到一半被整页刷掉。可见时只亮顶栏 pill,也不按 5min 升级横幅;
+ *     切到后台后由下面的 5s 重估在后台完成软刷,用户回来已是新版本。
  *  S1 无在飞 turn(_sendingInFlight 探针)+ 无草稿附件 + 距用户输入 ≥30s;不安全每 5s
- *     重估,挂起 >5min 出横幅;探针抛错按 busy(保守)。
+ *     重估,隐藏且挂起 >5min 出横幅;探针抛错按 busy(保守)。
  *  S2 形态校验:双端 id 均 8-32 hex 且不等才动作;dev 无 meta → 恒 inert。
  *  全程只用本地 now(),不掺服务器时间戳(跨时钟域红线)。
  *
@@ -61,6 +64,8 @@ export type AppUpdateDeps = {
   /** 写 reload 谱系计数,返回是否**写入并读回成功**(生产=history.replaceState + 读回)。
    *  返回 false = 无法持久化谱系 → 一次都不自动刷(fail-safe)。 */
   writeLineage: (n: number) => boolean;
+  /** 页面是否隐藏(生产=document.visibilityState === "hidden")。S0:只在隐藏时自动软刷。 */
+  isHidden: () => boolean;
 };
 
 export class AppUpdateGovernor {
@@ -181,6 +186,14 @@ export class AppUpdateGovernor {
     // 谱系不可写 → 无法保证封顶 → 一次都不自动刷(fail-safe)。
     if (!this.lineageWritable) {
       this.showBanner(target);
+      return;
+    }
+
+    // S0 页面可见 → 不自动刷,只靠 pill;隐藏后由本重估接手。挂起计时从「隐藏且被挡」才开始算,
+    // 免得前台读了很久、一切到后台就立刻出横幅。
+    if (!this.deps.isHidden()) {
+      this.pendingSince = now;
+      this.timer = setTimeout(this.check, RECHECK_MS);
       return;
     }
 
@@ -357,6 +370,7 @@ export const appUpdate = new AppUpdateGovernor({
   storage: typeof window === "undefined" ? null : probeLocalStorage(),
   readLineage: () => (typeof window === "undefined" ? 0 : readLineageFromUrl(window.location.hash)),
   writeLineage: writeLineageToUrl,
+  isHidden: () => typeof document !== "undefined" && document.visibilityState === "hidden",
 });
 
 if (typeof window !== "undefined") {

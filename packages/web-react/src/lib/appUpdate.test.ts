@@ -53,6 +53,9 @@ function make(over?: Partial<AppUpdateDeps> & { storage?: Storage | null; lineag
     now: () => Date.now(),
     storage,
     ...urlLineage(box),
+    // OCV5-635 起自动软刷只发生在页面隐藏时;下面的安全点/谱系用例都是在测这种情况。
+    // 可见页的行为单列在「前台可见页」一组。
+    isHidden: () => true,
     ...over,
   });
   return { gov, reload, storage, box };
@@ -407,6 +410,65 @@ describe("顶栏 pill(OCV5-626:版本不一致即亮,不等安全点)", () => {
     gov.onServerBuild(SERVER);
     gov.onServerBuild(CLIENT);
     expect(seen).toEqual([true, false]);
+  });
+});
+
+describe("前台可见页(OCV5-635:不静默整页刷新,只亮 pill)", () => {
+  it("可见、空闲、不忙:再久也不自动刷、不出横幅,pill 一直亮", () => {
+    const { gov, reload, box } = make({ isHidden: () => false });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(reload).not.toHaveBeenCalled();
+    expect(box.n).toBe(0);
+    expect(gov.getBannerVisible()).toBe(false);
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("切到后台后由 5s 重估接手:空闲且不忙即软刷一次,谱系 +1", () => {
+    let hidden = false;
+    const { gov, reload, box } = make({ isHidden: () => hidden });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(reload).not.toHaveBeenCalled();
+    hidden = true;
+    vi.advanceTimersByTime(6_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(box.n).toBe(1);
+  });
+
+  it("前台读了很久再切后台但正忙:挂起计时从隐藏起算,隐藏满 5min 才出横幅", () => {
+    let hidden = false;
+    const { gov, reload } = make({ isHidden: () => hidden });
+    gov.registerBusyProbe(() => true);
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(30 * 60_000);
+    hidden = true;
+    vi.advanceTimersByTime(60_000);
+    expect(gov.getBannerVisible()).toBe(false);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(gov.getBannerVisible()).toBe(true);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("可见时点 pill(reloadNow)照常立即刷新", () => {
+    const { gov, reload } = make({ isHidden: () => false });
+    gov.onServerBuild(SERVER);
+    gov.reloadNow();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("谱系到顶 / 不可写这类必须人工处理的情况,可见页照样出横幅", () => {
+    const maxed = make({ isHidden: () => false, lineage: { n: 2 } });
+    passIdle();
+    maxed.gov.onServerBuild(SERVER);
+    expect(maxed.gov.getBannerVisible()).toBe(true);
+    const unwritable = make({ isHidden: () => false, writeLineage: () => false });
+    passIdle();
+    unwritable.gov.onServerBuild(SERVER);
+    expect(unwritable.gov.getBannerVisible()).toBe(true);
   });
 });
 
