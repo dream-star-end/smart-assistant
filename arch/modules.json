@@ -114,7 +114,10 @@
     "master",
     "egress"
    ],
-   "note": "→ config registry (P3)"
+   "note": "→ config registry (P3)",
+   "authorities": [
+    "env"
+   ]
   },
   "platform-auth-crypto": {
    "layer": "L2",
@@ -370,7 +373,8 @@
    "allow": [
     "identity",
     "catalog",
-    "accounts"
+    "accounts",
+    "provider-ops"
    ]
   },
   "catalog": {
@@ -433,7 +437,8 @@
     "catalog",
     "accounts",
     "billing",
-    "dispatch"
+    "dispatch",
+    "provider-ops"
    ]
   },
   "compute-pool": {
@@ -538,7 +543,8 @@
    ],
    "note": "cross-domain admin queries move to app-admin (L4)",
    "allow": [
-    "identity"
+    "identity",
+    "provider-ops"
    ]
   },
   "goal": {
@@ -893,6 +899,62 @@
    "scope": [
     "browser"
    ]
+  },
+  "platform-http": {
+   "layer": "L1",
+   "match": [
+    "packages/commercial/src/http/util.ts",
+    "packages/commercial/src/http/egressTrace.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "pure HTTP plumbing the proxy uses in both processes: request ids, security headers, body readers, egress trace header (P3 pilot S1)"
+  },
+  "platform-ratelimit": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/middleware/rateLimit.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "allow": [
+    "platform-pg"
+   ],
+   "note": "Redis/PG rate limiter the proxy calls in egress (P3 pilot S1)"
+  },
+  "platform-envelope": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/platform/platformEnvelopeBuilder.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "pure platform-envelope builder the proxy calls in egress (P3 pilot S1)"
+  },
+  "provider-ops": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/admin/providerHealthGate.ts",
+    "packages/commercial/src/admin/providerHealth.ts",
+    "packages/commercial/src/admin/providerQuotaCircuit.ts",
+    "packages/commercial/src/admin/metrics.ts",
+    "packages/commercial/src/admin/durableMetricRollups.ts",
+    "packages/commercial/src/admin/observabilityIdentity.ts",
+    "packages/commercial/src/admin/auditRedact.ts",
+    "packages/commercial/src/selfheal/userImpact.ts",
+    "packages/commercial/src/selfheal/redact.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "provider health/quota gates, proxy counters and user-impact records: admin-owned, but the proxy calls them in egress (P3 pilot S1)"
   }
  }
 }
