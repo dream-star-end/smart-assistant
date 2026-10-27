@@ -599,6 +599,12 @@ export function App() {
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
+    // 用着用着被服务端判失效（OCV5-636）：onClearAuth 已收尾并回首页，这里改为直接给登录表单，
+    // useAuth 同时写入「登录状态已失效」提示；地址栏深链保留，重新登录后回到原会话。
+    onSessionExpired: () => {
+      setAuthMode("login");
+      setView("app");
+    },
     onAccountSwitchPending: () => {
       setContainerPreviewUrl(null);
       setSettingsOpen(false);
