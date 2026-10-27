@@ -12,6 +12,9 @@ class State:
         # 0.5 source references: jid -> [bytes]; GETs that fail (503) or come back corrupted; the
         # order of acks and source GETs, to prove downloads only start after the ack.
         self.sources = {}; self.src_flaky = {}; self.src_corrupt = set(); self.src_short = {}; self.src_bad_cr = set(); self.events = []
+        # jid -> fraction: every source response announces the full Content-Length, sends that share,
+        # then drops the connection (prod 2026-10-26: ~88.7% of each range arrived).
+        self.src_cut = {}
         self.max_concurrency = None; self.session_unknown = False; self.poll_errors = 0; self.polls = 0
         self.done = threading.Condition()
 S = State()
@@ -53,7 +56,14 @@ class H(BaseHTTPRequestHandler):
                 # Correct Content-Range but truncated body → bridge short-read path.
                 body = body[: max(1, len(body) // 2)]
             self.send_response(206); self.send_header("Content-Length", str(len(body)))
-            self.send_header("Content-Range", "bytes %d-%d/%d" % (cr_a, cr_b, len(data))); self.end_headers()
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (cr_a, cr_b, len(data)))
+            cut = S.src_cut.get(jid)
+            if cut is not None:
+                self.send_header("Connection", "close"); self.end_headers()
+                self.wfile.write(body[: max(1, int(len(body) * cut))]); self.wfile.flush()
+                self.close_connection = True
+                return
+            self.end_headers()
             return self.wfile.write(body)
         self.send(404 if self.path != "/healthz" else 200, {"ok": True})
     def do_POST(self):

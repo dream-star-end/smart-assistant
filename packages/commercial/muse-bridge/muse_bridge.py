@@ -52,7 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.5.1"
+BRIDGE_VERSION = "0.5.3"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -90,12 +90,23 @@ ASPECT_RATIOS = ("4:5", "7:12", "9:16")
 IMAGE_FORMATS = ("png", "jpg", "jpeg", "webp")
 POLL_HOLD_DEFAULT = 25
 HEARTBEAT_DEFAULT = 15
+# 0.5.3: one heartbeat request may take at most this long. Behind a relay that drops replies
+# (commercial Muse VM, 2026-10-26: "Remote end closed connection without response") a hung beat
+# held the job's heartbeat thread for 20 s, so two of them plus the 15 s interval (70 s) already
+# exceeded the master's lost-contact window and the job failed MUSE_BRIDGE_LOST mid-upload.
+# With 8 s, two lost beats in a row still leave a sign of life inside 60 s.
+HEARTBEAT_TIMEOUT_SEC = 8
 # The master requeues an un-acked job after 20 s; 3 tries 2 s apart finish well inside that.
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
 # Per Range chunk against Hub/CDN short reads (prod 2026-10-26: 3 tries exhausted).
 SOURCE_CHUNK_ATTEMPTS = 8
 SOURCE_CHUNK_SLEEP_CAP = 8
+# 0.5.2: a Range body cut short in transit keeps what arrived and the next request resumes after
+# it, so a relay that drops ~11% of every response still converges (prod 2026-10-26 uid 1931:
+# 1 MiB ranges came through as 930222 bytes on 8 tries in a row). Such reads are not failed
+# attempts; this caps them per source image so a path that trickles bytes still ends.
+SOURCE_SHORT_READS_MAX = 64
 BACKOFF_MAX = 60
 # Jobs this bridge runs at once: the smaller of --max-concurrency and the master's hello
 # `max_concurrency` (a master that does not send it gets one, as before 0.4.0).
@@ -338,6 +349,9 @@ def validate_job(job, limits):
             raise JobError("MUSE_INVALID_INPUT", "源图最多 %d 张" % limits["max_source_images"])
         out["source_images"] = [_decode_source_image(item, limits, n) for n, item in enumerate(sources)]
     refs = job.get("source_refs")
+    if refs == []:
+        # 0.5.2: the personal master sends an empty list for a job without sources; same as absent.
+        refs = None
     if refs is not None:
         # 0.5: the master sends references instead of inline data; fetched after the ack.
         if sources:
@@ -632,8 +646,10 @@ class CliRunner:
 
 
 
-def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes):
+def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes, allow_short=False):
     """Raise IOError on short read or Content-Range that does not match the request Range.
+
+    allow_short: a body shorter than the range is a prefix the caller resumes after (0.5.2).
 
     Retried by with_retries around get_source. A persistent mismatch still surfaces as
     MUSE_SOURCE_FETCH_FAILED (retryable) after attempts are exhausted.
@@ -652,8 +668,16 @@ def _check_binary_body(payload, resp_headers, range_hdr, expect_bytes):
         if got_a != req_a or got_b != req_b:
             raise IOError("Content-Range mismatch: want bytes=%d-%d got %s" % (req_a, req_b, cr))
         want = got_b - got_a + 1
-    if len(payload) != want:
+    if len(payload) > want or (len(payload) < want and not allow_short):
         raise IOError("short read: got %d want %d" % (len(payload), want))
+
+
+class ShortRead(IOError):
+    """A binary body cut short in transit; .partial holds the bytes that did arrive (0.5.2)."""
+
+    def __init__(self, partial, status, headers):
+        super().__init__("incomplete read (%d bytes)" % len(partial))
+        self.partial, self.status, self.headers = partial, status, headers
 
 
 # --------------------------------------------------------------------------
@@ -696,6 +720,8 @@ class Client:
                 try:
                     payload = resp.read()
                 except http.client.IncompleteRead as e:
+                    if binary:
+                        raise ShortRead(e.partial or b"", status, resp_headers) from e
                     raise IOError("incomplete read (%d bytes)" % len(e.partial or b"")) from e
         except urllib.error.HTTPError as e:
             status = e.code
@@ -752,7 +778,8 @@ class Client:
         return self._request("POST", "/poll", {}, timeout=hold + 15)
 
     def heartbeat(self, job):
-        return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]}, timeout=20)
+        return self._request("POST", "/jobs/%s/heartbeat" % job["id"], {"job_nonce": job["nonce"]},
+                             timeout=HEARTBEAT_TIMEOUT_SEC)
 
     def get_source(self, job, n, start, end):
         """Bytes start..end (inclusive) of source image n of an acked job (0.5).
@@ -761,15 +788,23 @@ class Client:
         short read / IncompleteRead raises and is retried by fetch_sources.
         """
         want = end - start + 1
-        return self._request(
-            "GET", "/jobs/%s/sources/%d" % (job["id"], n),
-            headers={
-                "X-Job-Nonce": job["nonce"],
-                "Range": "bytes=%d-%d" % (start, end),
-                "Accept-Encoding": "identity",
-            },
-            timeout=60, binary=True, expect_bytes=want,
-        )
+        range_hdr = "bytes=%d-%d" % (start, end)
+        try:
+            return self._request(
+                "GET", "/jobs/%s/sources/%d" % (job["id"], n),
+                headers={
+                    "X-Job-Nonce": job["nonce"],
+                    "Range": range_hdr,
+                    "Accept-Encoding": "identity",
+                },
+                timeout=60, binary=True, expect_bytes=want,
+            )
+        except ShortRead as e:
+            # 0.5.2: same checks as a whole body; the prefix that arrived is returned for resuming.
+            if e.status != 206 or not e.partial:
+                raise IOError(str(e)) from e
+            _check_binary_body(e.partial, e.headers, range_hdr, want, allow_short=True)
+            return e.partial
 
     def put_chunk(self, job, idx, n, chunk):
         self._request(
@@ -1018,24 +1053,33 @@ class Bridge:
         out = []
         for ref in refs:
             buf = bytearray()
+            failures = 0
+            short_reads = 0
             while len(buf) < ref["bytes"]:
                 if cancel.is_set():
                     raise JobError("MUSE_CANCELLED", "任务已被取消")
                 start = len(buf)
                 end = min(ref["bytes"], start + step) - 1
                 try:
-                    data = with_retries(
-                        lambda s=start, e=end: client.get_source(job_ref, ref["n"], s, e),
-                        attempts=SOURCE_CHUNK_ATTEMPTS,
-                        sleep_cap=SOURCE_CHUNK_SLEEP_CAP,
-                    )
+                    data = client.get_source(job_ref, ref["n"], start, end)
                 except (FatalAuth, JobGone):
                     raise
                 except Exception as e:
-                    raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 下载失败：%s" % (ref["n"] + 1, redact(str(e), 120)),
-                                   retryable=True)
-                if not data or len(data) != end - start + 1:
+                    failures += 1
+                    if failures >= SOURCE_CHUNK_ATTEMPTS:
+                        raise JobError("MUSE_SOURCE_FETCH_FAILED",
+                                       "源图 %d 下载失败：%s" % (ref["n"] + 1, redact(str(e), 120)), retryable=True)
+                    cancel.wait(min(2 ** (failures - 1), SOURCE_CHUNK_SLEEP_CAP))
+                    continue
+                if not data or len(data) > end - start + 1:
                     raise JobError("MUSE_SOURCE_FETCH_FAILED", "源图 %d 下载长度不符" % (ref["n"] + 1), retryable=True)
+                # Progress (a whole range, or the prefix of one cut short): never a failed attempt.
+                failures = 0
+                if len(data) < end - start + 1:
+                    short_reads += 1
+                    if short_reads > SOURCE_SHORT_READS_MAX:
+                        raise JobError("MUSE_SOURCE_FETCH_FAILED",
+                                       "源图 %d 下载失败：传输反复被截断" % (ref["n"] + 1), retryable=True)
                 buf += data
             data = bytes(buf)
             if hashlib.sha256(data).hexdigest() != ref["sha256"]:
