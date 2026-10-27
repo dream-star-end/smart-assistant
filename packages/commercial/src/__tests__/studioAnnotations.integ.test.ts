@@ -350,6 +350,45 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.ok(gens[0]!.request.prompt?.includes('修改要求：尾巴白色'))
   })
 
+  test('keeping the first frame redoes only the video, from the frame on screen (INC-20261027-STUDIO-REGENERATE-REDOES-FRAME)', async (t) => {
+    if (skip(t)) return
+    // prod 2026-10-27 c6f0a9f2: "首帧画面保持不变…只重新生成视频" became regenerate_shot and a new
+    // first frame was generated and charged (50) before the video.
+    const s = await setup()
+    const newer = await s.take('shot_frame', s.shot, 2, 'image/png')
+    await query(`UPDATE studio_takes SET inputs = $2::jsonb WHERE id = $1`, [
+      s.video.id,
+      JSON.stringify({ inputs: [{ role: 'first_frame', blobSha: s.frame.sha }] }),
+    ])
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.video.id,
+      kind: 'box',
+      geom: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
+      text: '首帧画面保持不变，只把视频重新生成一次，动作慢一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('regenerate_video', { shotId: s.shot, promptDelta: '动作慢一点' }))
+    await runOne(s.exec)
+    assert.equal((await annotation(id)).interpretation?.execution?.state, 'running')
+    const shot = (
+      await query<{ redo: unknown; frame: string | null }>(
+        `SELECT spec->'redo' AS redo, spec->>'frameTakeId' AS frame FROM studio_shots WHERE id = $1`,
+        [s.shot],
+      )
+    ).rows[0]!
+    assert.deepEqual(shot, { redo: { frame: 0, video: 2, videoDelta: '动作慢一点' }, frame: s.frame.id })
+    await advanceProject(s.advanceDeps, s.p.id)
+    const gens = await genTasks(s.p.id)
+    assert.deepEqual(
+      gens.map((g) => g.key),
+      [`gen:shot_video:${s.shot}:v2`],
+      'only a video is made: no new first frame',
+    )
+    assert.deepEqual(gens[0]!.request.inputs, [{ role: 'first_frame', blobSha: s.frame.sha }])
+    assert.notEqual(gens[0]!.request.inputs?.[0]?.blobSha, newer.sha, 'not the newer frame')
+    assert.ok(gens[0]!.request.prompt?.includes('修改要求：动作慢一点'), 'the change is in the video prompt')
+  })
+
   test('an edit is dispatched as image.edit of the current frame with the marked frame as reference', async (t) => {
     if (skip(t)) return
     const s = await setup()
