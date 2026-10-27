@@ -8320,6 +8320,44 @@
         "reason": "OCV5-622 covered by unit BC lock + commercial login.integ mid/over-grace; browser dual-tab BootSplash live proof deferred to post-ride canary",
         "since": "2026-10-26"
       }
+    },
+    {
+      "id": "INC-20261027-BOX-TERMINAL-DISPLAY",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "报障 #a9f49bcf：Box Claude 长任务（~74 分钟）HTTP 200 后 BOX_EXEC_REMOTE_EXIT → BOX_TOOL_TERMINAL_UNPROVEN，回合以 ENGINE_ERROR / BOX_REPLAY_PENDING 收尾，扣费齐但已流出的助手正文不展示，只剩「结果正在收尾」。该 trace 不在个人版数据里（btd-01），按代码静态还原同类回合（CONTINUE-20261027-box-terminal-display §3/§4）。本条只修三处：F1 失败轮部分回答按全文子串判内部串，带 JSON/栈帧引用/以 [ 开头的正常答复整段被丢（改为整体结构判断，detail 守卫不变）；F2 有自动恢复子行时源错误行连正文整行被藏（改为只藏错误卡）；G3 恢复成功的 run 无 native pointer、keep=0 隐私清理不认 <session>/tool-results/，126 后无限重试（按 boxNativeGcFile 规则放行）。请求内 20 秒证明窗口（G1）与恢复正文回写（G2）不在本条。",
+      "rootFixCommit": "48022f40",
+      "coverageCommits": [
+        "5f0be34a",
+        "ab2658d1"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-645-run-cleanup-tool-results] PASS — a recovered run whose CLI wrote a session tool-results tree finishes its privacy cleanup instead of retrying it forever, and any other folder there stays refused"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunCleanup.test.ts",
+          "assertion": "OCV5-645 a session tool-results tree in a run project is cleaned, anything else under it still refused"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "结果正在收尾:带 JSON / 栈帧引用 / 链接开头的答复仍作 bodyText"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "整段是 JSON / API Error 信封 / 堆栈时仍不外泄"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡"
+        }
+      ]
     }
   ]
 }
