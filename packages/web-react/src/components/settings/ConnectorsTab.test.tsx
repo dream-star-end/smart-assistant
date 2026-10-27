@@ -3044,3 +3044,46 @@ test('文献市场回跳不将已保存但runtime未启用的账号误报为登�
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   expect(mockedPluginRevoke).not.toHaveBeenCalled()
 })
+
+
+describe('插件连接简化', () => {
+  test('GitHub has OAuth primary and PAT fallback even when declarative default wins directory merge', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry({ slug: 'github', label: 'GitHub' })] })
+    mockedGithubStart.mockResolvedValue({ authorizeUrl: 'https://github.com/login/oauth', state: 's' })
+    render(<ConnectorsTab auth={auth} />)
+    fireEvent.click(await screen.findByRole('button', { name: '连接「GitHub」' }))
+    await waitFor(() => expect(mockedGithubStart).toHaveBeenCalledWith(auth))
+    expect(mockedDeclBind).not.toHaveBeenCalled()
+    expect(vi.mocked(api.patchPreferences)).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '使用 GitHub 访问令牌' }))
+    expect(await screen.findByRole('dialog')).toHaveTextContent('访问令牌')
+  })
+
+  test('v1 failure leaves declarative and local sources accessible with visible degradation', async () => {
+    mockedGetConnectors.mockRejectedValueOnce(new Error('v1 unavailable'))
+    mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry({ slug: 'github', label: 'GitHub' })] })
+    vi.mocked(api.getLocalPlugins).mockResolvedValue({ plugins: [{ ...THS_PLUGIN, defaultEnabled: true }] })
+    render(<ConnectorsTab auth={auth} />)
+    expect(await screen.findByText('同花顺行情')).toBeInTheDocument()
+    expect(screen.getByTestId('connectors-degraded')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '连接「GitHub」' }))
+    expect(await screen.findByRole('dialog')).toHaveTextContent('访问令牌')
+  })
+
+  test('unknown preferences disable switches and direct connection, retry restores real disabled state', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    vi.mocked(api.getPreferences).mockRejectedValueOnce(new Error('prefs unavailable'))
+    render(<ConnectorsTab auth={auth} />)
+    expect(await screen.findByText('暂时读不到插件启用状态，恢复后才能修改开关。')).toBeInTheDocument()
+    for (const toggle of screen.getAllByRole('switch')) expect(toggle).toBeDisabled()
+    expect(screen.queryByRole('button', { name: '连接「GitHub」' })).not.toBeInTheDocument()
+    expect(vi.mocked(api.patchPreferences)).not.toHaveBeenCalled()
+    vi.mocked(api.getPreferences).mockResolvedValue({ prefs: { disabled_plugins: ['github'] } })
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(screen.getByRole('switch', { name: '启用「GitHub」' })).toBeEnabled())
+    expect(screen.getByRole('switch', { name: '启用「GitHub」' })).not.toBeChecked()
+    expect(screen.queryByRole('button', { name: '连接「GitHub」' })).not.toBeInTheDocument()
+  })
+})

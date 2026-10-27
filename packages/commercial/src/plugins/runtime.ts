@@ -1,3 +1,4 @@
+import { assertPluginAvailable, availablePluginSlugs, isPluginAvailable } from './catalogPolicy.js'
 import type { Pool } from 'pg'
 import { canonicalDigestHex } from '../connectors/canonicalJson.js'
 import {
@@ -411,6 +412,7 @@ export class PluginRuntimeFacade {
     )
     if (verified.pluginType !== 'managed-browser' || verified.slug !== row.provider)
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
+    assertPluginAvailable(verified.slug)
     if ((await this.opts.pluginEnablement?.disabledSet(userId))?.has(verified.slug))
       throw new PluginRuntimeFacadeError(
         'PLUGIN_DISABLED',
@@ -549,6 +551,7 @@ export class PluginRuntimeFacade {
         WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
           AND i.artifact_hash = v.artifact_hash
           AND l.kind = 'connector'
+          AND ($3::text[] IS NULL OR l.slug = ANY($3::text[]))
           AND l.plugin_type IN ('sandboxed-local','managed-browser')
           AND l.state = 'active' AND v.status = 'approved'
           AND l.current_approved_version_id = v.id
@@ -557,7 +560,7 @@ export class PluginRuntimeFacade {
                OR v.description ILIKE '%' || $2 || '%')
         ORDER BY v.name ASC, v.id DESC
         LIMIT 100`,
-      [userId, needle],
+      [userId, needle, availablePluginSlugs()],
     )
     return rows.rows
   }
@@ -565,7 +568,7 @@ export class PluginRuntimeFacade {
   async catalog(userId: number, query?: string): Promise<RuntimePluginCatalogEntry[]> {
     const installed = await this.installedCurrentCatalog(userId, query)
     const disabled = (await this.opts.pluginEnablement?.disabledSet(userId)) ?? null
-    const rows = disabled ? installed.filter((row) => !disabled.has(row.slug)) : installed
+    const rows = installed.filter((row) => isPluginAvailable(row.slug) && !disabled?.has(row.slug))
     const verified = await listVerifiedRuntimePluginContracts(
       rows.map((row) => Number(row.id)),
       this.pool,
@@ -632,10 +635,11 @@ export class PluginRuntimeFacade {
          JOIN marketplace_skill_listings l ON l.slug = t.slug
          LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
         WHERE l.kind = 'connector'
+          AND ($2::text[] IS NULL OR l.slug = ANY($2::text[]))
           AND l.plugin_type IN ('sandboxed-local','managed-browser')
         ORDER BY COALESCE(cv.name, iv.name) ASC, t.slug ASC
         LIMIT 100`,
-      [userId],
+      [userId, availablePluginSlugs()],
     )
     const versionIds = [
       ...new Set(
@@ -655,7 +659,7 @@ export class PluginRuntimeFacade {
         )
         .map((item) => String(item.versionId)),
     )
-    const catalog: RuntimePluginManagementEntry[] = rows.rows.map((row) => {
+    const catalog: RuntimePluginManagementEntry[] = rows.rows.filter((row) => isPluginAvailable(row.slug)).map((row) => {
       const installed = verified.get(Number(row.installed_id))
       const latest = row.latest_id ? verified.get(Number(row.latest_id)) : undefined
       const installedTrusted =
@@ -722,7 +726,7 @@ export class PluginRuntimeFacade {
         ORDER BY c.created_at DESC`,
       [userId],
     )
-    const accounts: RuntimePluginManagementAccount[] = accountRows.rows.map((row) => {
+    const accounts: RuntimePluginManagementAccount[] = accountRows.rows.filter((row) => isPluginAvailable(row.provider)).map((row) => {
       const plugin = bySlug.get(row.provider)
       const writeControl = plugin
         ? writeControlFor(
@@ -800,16 +804,18 @@ export class PluginRuntimeFacade {
         ORDER BY c.created_at DESC`,
       [userId],
     )
+    const availableAccounts = accounts.rows.filter((row) => isPluginAvailable(row.provider))
     const verified = await listVerifiedRuntimePluginContracts(
-      accounts.rows.map((row) => Number(row.connector_version_id)),
+      availableAccounts.map((row) => Number(row.connector_version_id)),
       this.pool,
       { env: this.opts.env },
     )
     const managedTargets: RuntimePluginTargetEntry[] = []
-    for (const row of accounts.rows) {
+    for (const row of availableAccounts) {
       const item = verified.get(Number(row.connector_version_id))
       if (
         !item ||
+        !isPluginAvailable(item.slug) ||
         item.pluginType !== 'managed-browser' ||
         !this.supportsManagedRuntime(item) ||
         (isLiteratureHttpIdentity(item) && !enabledCatalogVersionIds.has(row.connector_version_id))
@@ -838,6 +844,43 @@ export class PluginRuntimeFacade {
       })
     }
     return [...managedTargets, ...localTargets]
+  }
+
+  /** Inspect the same verified target used by call, without sending an upstream request. */
+  async describe(input: { userId: number; targetId: string; actionId: string }): Promise<{
+    kind: 'describe'
+    provider: string
+    action: string
+    description: string
+    readOnly: boolean
+    params: Record<string, unknown>
+    writeMode?: 'disabled' | 'confirm_each' | 'account_preapproval'
+  }> {
+    const local = /^plugin:(\d{1,16})$/.exec(input.targetId)
+    let verified: VerifiedRuntimePluginContract
+    let row: PluginAccountRow | undefined
+    if (local) {
+      if (!isSafeDbId(local[1]!)) throw new PluginRuntimeFacadeError('BAD_REQUEST')
+      verified = await loadVerifiedRuntimePluginContract(Number(local[1]), this.pool, { env: this.opts.env })
+      if (verified.pluginType !== 'sandboxed-local' || !this.opts.localRuntime)
+        throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE')
+      await assertRuntimePluginInstallEntitlement(input.userId, verified, this.pool, { requireCurrent: true })
+      if ((await this.opts.pluginEnablement?.disabledSet(input.userId))?.has(verified.slug))
+        throw new PluginRuntimeFacadeError('PLUGIN_DISABLED')
+    } else {
+      const target = await this.loadManagedTarget(input.userId, input.targetId)
+      verified = target.verified
+      row = target.row
+    }
+    const action = verified.contract.actions.find((item) => item.id === input.actionId)
+    if (!action) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
+    const control = row ? writeControlFor(verified.slug, verified.contract.actions, row) : null
+    return {
+      kind: 'describe', provider: verified.slug, action: action.id,
+      description: actionProjection(action, verified.slug).description, readOnly: action.effect === 'read', params: action.params,
+      ...(control ? { writeMode: !control.enabled ? 'disabled' as const :
+        control.preapproval.enabled ? 'account_preapproval' as const : 'confirm_each' as const } : {}),
+    }
   }
 
   async actionEffect(input: {

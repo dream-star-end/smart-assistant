@@ -172,6 +172,7 @@ const pluginDeps = {
   transport: async (op: string) => {
     if (op === 'list') return { plugins: [{ id: 'p1', provider: 'demo' }] }
     if (op === 'catalog') return { plugins: [] }
+    if (op === 'describe') return { kind: 'describe', readOnly: true, description: 'demo read', params: { type: 'object' } }
     return { kind: 'result', result: { ok: true } }
   },
 }
@@ -526,11 +527,13 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     list: connectProbe(['list'], true),
     catalog: connectProbe(['catalog'], true),
     call: connectProbe(['call', 'demo', 'read', '--account', 'p1'], true),
-    // The dispatcher is shared with oc-connect; describe exists only on the connectors surface.
+    // plugin-arch adds the same on-demand schema operation to the canonical Plugin surface.
     describe: async () => {
-      const result = await runOcPluginCli(['describe', 'demo'], pluginDeps)
-      assert.notEqual(result.exitCode, 0, 'oc-plugin describe unexpectedly succeeded')
-      assert.match(result.stderr, /unknown command 'describe'/)
+      const result = await runOcPluginCli(['describe', 'demo', 'read', '--account', 'p1'], pluginDeps)
+      assert.equal(result.exitCode, 0, result.stderr)
+      assert.match(result.stdout, /demo read/)
+      assert.match(result.stdout, /"type": "object"/)
+      assert.match(result.stdout, /oc-plugin call demo read/)
     },
   },
   'oc-poster': {

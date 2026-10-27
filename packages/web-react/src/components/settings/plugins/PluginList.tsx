@@ -21,6 +21,7 @@ export type PluginRowModel = {
   tone: StatusTone
   runtime: PluginEntry['runtime']
   enabled: boolean
+  enablementKnown?: boolean
 }
 
 function RuntimeIcon({ runtime }: { runtime: PluginEntry['runtime'] }) {
@@ -44,10 +45,12 @@ export function PluginRow({
   busy,
   onOpen,
   onToggle,
+  onConnect,
 }: {
   row: PluginRowModel
   busy?: boolean
   onOpen: () => void
+  onConnect?: () => void
   onToggle: (enabled: boolean) => void
 }) {
   return (
@@ -63,14 +66,15 @@ export function PluginRow({
           <span className="truncate text-body font-medium text-fg">{row.label}</span>
           <span className={cn('flex items-center gap-1.5 text-meta', row.enabled ? 'text-muted' : 'text-faint')}>
             <StatusDot tone={row.enabled ? row.tone : 'neutral'} />
-            <span className="truncate">{row.enabled ? row.status : '已停用'}</span>
+            <span className="truncate">{row.enablementKnown === false ? '启用状态暂不可用' : row.enabled ? row.status : '已停用'}</span>
           </span>
         </span>
         <ChevronRight size={16} className="shrink-0 text-faint" aria-hidden />
       </button>
+      {onConnect && <Button size="sm" variant="secondary" onClick={onConnect} aria-label={`连接「${row.label}」`}>连接</Button>}
       <Switch
         aria-label={`启用「${row.label}」`}
-        checked={row.enabled}
+        checked={row.enablementKnown !== false && row.enabled}
         disabled={busy}
         onCheckedChange={onToggle}
         className="mr-1"
@@ -97,8 +101,8 @@ export function PluginDetailBar({
         <ArrowLeft size={15} strokeWidth={1.75} aria-hidden /> 插件
       </Button>
       <span className="ml-auto text-meta text-faint">{RUNTIME_LABEL[row.runtime]}</span>
-      <span className="text-meta text-muted">{row.enabled ? '已启用' : '已停用'}</span>
-      <Switch aria-label={`启用「${row.label}」`} checked={row.enabled} disabled={busy} onCheckedChange={onToggle} />
+      <span className="text-meta text-muted">{row.enablementKnown === false ? '状态未知' : row.enabled ? '已启用' : '已停用'}</span>
+      <Switch aria-label={`启用「${row.label}」`} checked={row.enablementKnown !== false && row.enabled} disabled={busy} onCheckedChange={onToggle} />
     </div>
   )
 }

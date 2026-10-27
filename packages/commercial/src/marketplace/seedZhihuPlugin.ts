@@ -1,3 +1,4 @@
+import { assertPluginAvailable, configurePluginCatalog } from '../plugins/catalogPolicy.js'
 /** Idempotent version-controlled publication of the official Zhihu Plugin. */
 
 import { skillContentHash } from '@openclaude/storage'
@@ -311,7 +312,8 @@ export async function seedZhihuPlugin(input: {
   expectedScope?: OfficialManagedBrowserTransitionScope
   beforeListingOpen?: (target: { versionId: string }) => Promise<void>
 }): Promise<SeedZhihuPluginResult> {
-  assertFlavorIdentity({ env: input.env ?? process.env })
+  configurePluginCatalog(assertFlavorIdentity({ env: input.env ?? process.env }))
+  assertPluginAvailable(ZHIHU_PLUGIN_SLUG)
   if (input.functionalVerified !== true)
     throw new Error('Zhihu Plugin requires live functional verification')
   const env = input.env ?? process.env

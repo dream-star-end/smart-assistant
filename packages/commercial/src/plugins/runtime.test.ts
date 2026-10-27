@@ -661,3 +661,29 @@ describe('Plugin runtime facade', () => {
     )
   })
 })
+
+
+describe('Plugin runtime describe', () => {
+  test('returns action schema and account write mode through the existing verified target loader', async () => {
+    const facade = new PluginRuntimeFacade({ pool: { query: async () => { throw new Error('unexpected query') } } as never, redis: null })
+    const schema = { type: 'object', required: ['text'], properties: { text: { type: 'string' } } }
+    const row = { plugin_write_enabled: false }
+    const requests: unknown[] = []
+    const target = facade as unknown as { loadManagedTarget: (userId: number, targetId: string) => Promise<unknown> }
+    target.loadManagedTarget = async (userId, targetId) => {
+      requests.push({ userId, targetId })
+      return { row, verified: { slug: 'weibo', contract: { actions: [
+        { id: 'create_post', effect: 'write', description: '发布微博', params: schema },
+      ] } } }
+    }
+    const detail = await facade.describe({ userId: 7, targetId: '41', actionId: 'create_post' })
+    assert.deepEqual(requests, [{ userId: 7, targetId: '41' }])
+    assert.deepEqual(detail, { kind: 'describe', provider: 'weibo', action: 'create_post', description: '发布微博',
+      readOnly: false, params: schema, writeMode: 'disabled' })
+    await assert.rejects(facade.describe({ userId: 7, targetId: '41', actionId: 'unknown' }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'BAD_REQUEST')
+    target.loadManagedTarget = async () => { throw new PluginRuntimeFacadeError('PLUGIN_DISABLED') }
+    await assert.rejects(facade.describe({ userId: 7, targetId: '41', actionId: 'create_post' }),
+      (error: unknown) => error instanceof PluginRuntimeFacadeError && error.code === 'PLUGIN_DISABLED')
+  })
+})

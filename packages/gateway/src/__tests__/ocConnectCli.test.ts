@@ -146,7 +146,7 @@ describe('oc-connect list', () => {
     assert.match(r.stdout, /put_file\s+\[写·需确认\]\s+上传文件/)
     assert.match(
       r.stdout.trimEnd().split('\n').at(-1) ?? '',
-      /^提示：浏览器插件（.*bili-account.*）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。$/,
+      /^提示：浏览器插件（微博、知识星球、文献数据库）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。$/,
     )
   })
 

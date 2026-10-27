@@ -588,7 +588,7 @@ const ROWS: Record<string, Row> = {
     retrySafe: 'no',
     requiresReauth: false,
     message: '参数不符合该操作的参数结构',
-    nextAction: '先用 oc-connect describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
+    nextAction: '先用 oc-plugin describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
   },
   UPSTREAM_AUTH_FAILED: {
     retrySafe: 'after_reauth',
@@ -608,6 +608,12 @@ const ROWS: Record<string, Row> = {
     requiresReauth: false,
     message: '结果超过单次返回上限',
     nextAction: '缩小查询范围、减少条数或分批读取后重试，不要原样重放',
+  },
+  PLUGIN_UNAVAILABLE: {
+    message: '此插件已下架，无法连接或调用。',
+    retrySafe: 'no',
+    requiresReauth: false,
+    nextAction: '请在管理中心 → 插件中选择当前支持的应用。',
   },
   PLUGIN_DISABLED: {
     retrySafe: 'no',

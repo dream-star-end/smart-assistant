@@ -1,3 +1,4 @@
+import { assertPluginAvailable, isPluginAvailable } from '../plugins/catalogPolicy.js'
 /**
  * rpc — 容器 → master 连接器 RPC(照 literatureProxy 范式,设计终稿 §7)。
  *
@@ -85,6 +86,7 @@ const PLUGIN_STATE_PATH = '/v3/plugins/state'
 const PLUGIN_LIST_PATH = '/v3/plugins/list'
 const PLUGIN_CALL_PATH = '/v3/plugins/call'
 const PLUGIN_CATALOG_PATH = '/v3/plugins/catalog'
+const PLUGIN_DESCRIBE_PATH = '/v3/plugins/describe'
 
 /** call body 上限:put_file contentBase64 ≤6MB + JSON 包装余量。 */
 const MAX_CALL_BODY_BYTES = 8 * 1024 * 1024
@@ -246,11 +248,8 @@ async function checkRedisWindow(
 
 const EMPTY_SET: ReadonlySet<string> = new Set()
 
-async function assertPluginEnabled(
-  deps: ConnectorsRpcDeps,
-  userId: number,
-  slug: string,
-): Promise<void> {
+async function assertPluginEnabled(deps: ConnectorsRpcDeps, userId: number, slug: string): Promise<void> {
+  assertPluginAvailable(slug)
   if ((await deps.pluginEnablement?.disabledSet(userId))?.has(slug))
     throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
 }
@@ -286,7 +285,7 @@ export interface ConnectorsRpcDeps {
     | 'proposeWrite'
     | 'executeConfirmedWrite'
   > &
-    Partial<Pick<PluginRuntimeFacade, 'targetProvider'>>
+    Partial<Pick<PluginRuntimeFacade, 'targetProvider' | 'describe'>>
 }
 
 /**
@@ -403,7 +402,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         if (typeof slug !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug))
           throw new ConnectorError('BAD_REQUEST', 'slug required')
         const disabled = await deps.pluginEnablement?.disabledSet(userId)
-        sendEnvelope(res, { kind: 'state', slug, enabled: !disabled?.has(slug) })
+        sendEnvelope(res, { kind: 'state', slug, enabled: isPluginAvailable(slug) && !disabled?.has(slug) })
         return
       }
       if (path === LIST_PATH || path === PLUGIN_LIST_PATH) {
@@ -422,9 +421,9 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         })
         return
       }
-      if (path === DESCRIBE_PATH) {
+      if (path === DESCRIBE_PATH || path === PLUGIN_DESCRIBE_PATH) {
         const body = parseDescribeBody(await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES))
-        await handleDescribe(res, userId, pool, deps, body)
+        await handleDescribe(res, userId, pool, deps, body, path === PLUGIN_DESCRIBE_PATH)
         return
       }
       if (path === CATALOG_PATH || path === PLUGIN_CATALOG_PATH) {
@@ -481,6 +480,7 @@ async function handleList(
   const declIds = new Set(declConns.map((c) => c.id))
   const declEntries: Array<Record<string, unknown>> = []
   for (const c of declConns) {
+    if (!isPluginAvailable(c.slug)) continue
     let actions: Array<{ id: string; description: string; readOnly: boolean }> = []
     try {
       if (c.connectorVersionId) {
@@ -509,7 +509,7 @@ async function handleList(
   const rows = await listConnections(userId, pool)
   const connections: Array<Record<string, unknown>> = []
   for (const row of rows) {
-    if (declIds.has(row.id)) continue
+    if (declIds.has(row.id) || !isPluginAvailable(row.provider)) continue
     const decl = getProviderDecl(row.provider)
     connections.push({
       id: row.id, // 字符串化 bigint(契约)
@@ -543,14 +543,14 @@ async function handleList(
     })
   }
   // 已停用的插件不出现在 Agent 可调用的列表里（OCV5-383）。
-  const enabledConnections = connections.filter((c) => !disabled.has(String(c.provider)))
+  const enabledConnections = connections.filter((c) => isPluginAvailable(String(c.provider)) && !disabled.has(String(c.provider)))
   if (!pluginSurface) {
     sendEnvelope(res, { connections: enabledConnections })
     return
   }
-  const runtimePlugins: RuntimePluginTargetEntry[] = (
-    pluginFacade ? await pluginFacade.list(userId) : []
-  ).filter((p) => !disabled.has(p.provider))
+  const runtimePlugins: RuntimePluginTargetEntry[] = (pluginFacade ? await pluginFacade.list(userId) : []).filter(
+    (p) => isPluginAvailable(p.provider) && !disabled.has(p.provider),
+  )
   sendEnvelope(res, {
     plugins: [
       ...enabledConnections.map((connection) => ({
@@ -603,7 +603,7 @@ async function handleCatalog(
         pluginType: 'declarative-http' as const,
         accountMode: 'required' as const,
       })),
-      ...runtimePlugins,
+      ...runtimePlugins.filter((p) => isPluginAvailable(p.slug) && !disabled.has(p.slug)),
     ],
   })
 }
@@ -661,7 +661,17 @@ async function handleDescribe(
   pool: Pool,
   deps: ConnectorsRpcDeps,
   body: DescribeBody,
+  pluginSurface = false,
 ): Promise<void> {
+  if (pluginSurface && deps.pluginFacade?.describe &&
+      await deps.pluginFacade.classifyTarget(userId, body.connectionId) !== null) {
+    try {
+      sendEnvelope(res, await deps.pluginFacade.describe({ userId, targetId: body.connectionId, actionId: body.action }))
+    } catch (error) {
+      mapPluginRpcError(error, deps.log ?? (() => {}))
+    }
+    return
+  }
   if (body.connectionId === GITHUB_VIRTUAL_CONNECTION_ID) {
     await assertPluginEnabled(deps, userId, 'github')
     const decl = requireAction('github', body.action)
@@ -858,6 +868,45 @@ async function handleDeclarativeCall(
     summary: prop.summary,
     expiresAt: prop.expiresAt.toISOString(),
   })
+}
+
+function mapPluginRpcError(error: unknown, log: RpcLog): never {
+  if (error instanceof ConnectorError) throw error
+  const code = (error as { code?: unknown })?.code
+  const original = error instanceof Error ? error.message : String(error)
+  if (code === 'LEASE_BUSY' || code === 'RUNTIME_BUSY')
+    throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
+  if (code === 'TARGET_NOT_FOUND' || code === 'ACCOUNT_NOT_FOUND')
+    throw new ConnectorError('CONNECTION_NOT_FOUND', 'Plugin target not found')
+  if (
+    code === 'TARGET_STALE' ||
+    code === 'RELINK_REQUIRED' ||
+    code === 'ACCOUNT_STALE' ||
+    code === 'NOT_INSTALLED' ||
+    code === 'EXEC_REVOKED' ||
+    code === 'POLICY_STALE'
+  )
+    throw new ConnectorError('RELINK_REQUIRED', 'Plugin target is no longer executable')
+  if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'INVALID_INPUT' || code === 'ACTION_NOT_FOUND')
+    throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
+  if (code === 'WRITE_DISABLED')
+    throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')
+  if (code === 'PLUGIN_DISABLED')
+    throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
+  if (code === 'WRITE_REQUIRES_CONFIRMATION')
+    throw new ConnectorError('BAD_REQUEST', 'Plugin write confirmation is required')
+  if (typeof code === 'string' && isPluginPassthroughErrorCode(code)) {
+    log('warn', 'plugin_runtime_error', { code, err: original })
+    throw new ConnectorError(code, resolvePluginErrorGuidance({ code }).message)
+  }
+  log('warn', 'plugin_runtime_unmapped', {
+    code: typeof code === 'string' ? code : 'INTERNAL',
+    err: original,
+  })
+  throw new ConnectorError(
+    'CONNECTION_ERROR',
+    resolvePluginErrorGuidance({ code: 'CONNECTION_ERROR' }).message,
+  )
 }
 
 async function handleCall(

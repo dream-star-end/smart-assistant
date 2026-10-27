@@ -1,7 +1,8 @@
+import { loadPluginManagement } from '../../lib/pluginManagementLoader'
 import { Plug, Store } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
-import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
+import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type LocalPlugin, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
 import { Alert, Button, EmptyState, ListSkeleton, PanelHeader, useConfirm, useToast } from '../ui'
 import { managedPluginProvider } from '../../lib/managedPluginProviders'
@@ -14,17 +15,7 @@ import { DisabledNote, LocalPluginDetail, PluginDetailBar, PluginRow, type Plugi
 import { RuntimePluginCard } from './plugins/RuntimePluginCard'
 import { type CardNotice, type UnifiedConnection, errText } from './plugins/shared'
 
-/**
- * 应用连接器 Tab：统一展示 **v1 手写 provider** + **声明式 connector** 两套后端。
- * 同一列表里按 slug 去重（同 slug 两边都有 → 只显示声明式版，因其是权威且带
- * allowlist+pin）。绑定/解绑按卡片 system 路由：
- *   - v1：formFields 弹层（token/basic）· BYOA OAuth 整页跳转 · github 复用账号 OAuth；
- *   - 声明式：requiredBindSources 驱动的 DeclarativeBindDialog。
- *
- * v1 目录（GET /api/connectors）是硬依赖，失败 → 整体报错；声明式（catalog +
- * connections）是增量，任一失败各自降级为空，**绝不阻断 v1 现有能力**。任何变更后
- * 整体 reload，不做本地乐观拼接。
- */
+/** Plugin settings consume one loader; adapters remain responsible for credential-specific setup. */
 export function ConnectorsTab({
   auth,
   onOpenMarketplace,
@@ -49,6 +40,7 @@ export function ConnectorsTab({
   const [err, setErr] = useState<string | null>(null)
   /** 增量目录（声明式 / 运行时 Plugin）降级为空 —— 列表不完整这件事必须对用户可见（M-20）。 */
   const [degraded, setDegraded] = useState(false)
+  const [preferencesKnown, setPreferencesKnown] = useState(false)
   const [cardNotice, setCardNotice] = useState<CardNotice | null>(null)
   /** 打开 v1 绑定弹层的 provider（github 不走弹层，直接跳 OAuth）。 */
   const [bindFor, setBindFor] = useState<ConnectorProvider | null>(null);
@@ -83,38 +75,23 @@ export function ConnectorsTab({
     let alive = true;
     setErr(null);
     setDegraded(false)
-    // 声明式是增量：各自 catch 降级为空，永不 reject 到 Promise.all；只有 v1 会阻断。
-    // 降级不再只写 console：卡片少一半时用户分不清「没装」还是「没读到」，
-    // 列表顶部给一条 info 提示 + 重试（承接 manage 审计 M-20）。
-    const managementP: Promise<DeclarativeManagementResponse> = api
-      .getDeclarativeManagement(auth)
-      .catch((e) => {
-        console.warn('[connectors] 管理聚合加载失败，降级仅显示 v1 连接器', e)
-        if (alive) setDegraded(true)
-        return { connectors: [], connections: [] }
-      })
-    const runtimeP: Promise<PluginManagementResponse> = api.getPluginManagement(auth).catch((e) => {
-      console.warn('[plugins] 运行时 Plugin 管理加载失败，降级显示现有连接器', e)
-      if (alive) setDegraded(true)
-      return { catalog: [], accounts: [] }
-    })
-    // 本机插件与启用状态是叠加信息：读失败不报错、不降级提示（列表照常，开关按「全部启用」显示）。
-    const localP = api.getLocalPlugins(auth).catch(() => ({ plugins: [] as LocalPlugin[] }))
-    const prefsP = api.getPreferences(auth).catch(() => null)
-    Promise.all([api.getConnectors(auth), managementP, runtimeP, localP, prefsP])
-      .then(([d, managed, runtime, local, prefs]) => {
+    setPreferencesKnown(false)
+    loadPluginManagement(api, auth)
+      .then((result) => {
         if (!alive) return
-        setLocalPlugins(Array.isArray(local?.plugins) ? local.plugins : [])
-        setStoredDisabled(new Set(disabledPluginsOf(prefs)))
-        setOptedIn(new Set(enabledPluginsOf(prefs)))
-        setData(d)
-        setManagement(managed.connectors)
-        setDeclConnections(managed.connections)
-        setRuntimeCatalog(runtime.catalog)
-        setRuntimeAccounts(runtime.accounts)
+        setLocalPlugins(result.local)
+        setStoredDisabled(new Set(disabledPluginsOf(result.preferences)))
+        setOptedIn(new Set(enabledPluginsOf(result.preferences)))
+        setPreferencesKnown(result.preferencesKnown)
+        setDegraded(result.degraded)
+        setData(result.v1)
+        setManagement(result.declarative.connectors)
+        setDeclConnections(result.declarative.connections)
+        setRuntimeCatalog(result.runtime.catalog)
+        setRuntimeAccounts(result.runtime.accounts)
       })
       .catch((e) => {
-        // 仅 v1 会 reject 到此（声明式已各自 catch 降级）。
+        // 所有插件来源都失败时才显示整页错误。
         if (alive) setErr(errText(e, "暂时读不到你的插件，请稍后重试。"));
       })
       .finally(() => {
@@ -125,7 +102,7 @@ export function ConnectorsTab({
     };
   }, [auth]);
 
-  /** 整表读不到时的可重入重试（v1 目录是硬依赖，失败即空白，必须给出口）。 */
+  /** 目录或偏好读失败时的重试。 */
   const retry = useCallback(() => {
     setLoading(true)
     reload()
@@ -172,30 +149,20 @@ export function ConnectorsTab({
 
   const startBind = useCallback(
     (u: UnifiedProvider) => {
-      if (u.system === "declarative") {
-        if (u.management.canBind && u.decl) setBindDeclFor(u.decl);
-        return;
+      if (u.slug === 'github' && data?.providers.some((p) => p.id === 'github')) {
+        api.startGithubOAuth(auth)
+          .then((r) => { window.location.href = r.authorizeUrl })
+          .catch((e) => setCardNotice({ slug: u.slug, tone: 'danger', text: errText(e, '发起 GitHub 授权失败') }))
+        return
       }
-      const p = u.v1;
-      if (p.id === "github") {
-        // GitHub 复用现有账号 OAuth 绑定入口（v1 只读，凭据权威在 github_links）。
-        api
-          .startGithubOAuth(auth)
-          .then((r) => {
-            window.location.href = r.authorizeUrl;
-          })
-          .catch((e) =>
-            setCardNotice({
-              slug: p.id,
-              tone: "danger",
-              text: errText(e, "发起 GitHub 授权失败"),
-            }),
-          );
-        return;
+      if (u.system === 'declarative') {
+        if (u.management.canBind && u.decl) setBindDeclFor(u.decl)
+        return
       }
+      const p = u.v1
       setBindFor(p);
     },
-    [auth],
+    [auth, data],
   );
 
   useEffect(() => {
@@ -238,20 +205,20 @@ export function ConnectorsTab({
         })
         return
       }
-      const bindable =
+      const bindable = providerCard.slug !== 'github' && (
         providerCard.system === 'v1'
           ? // GitHub v1 绑定是整页跳转 OAuth —— 不在用户没点「绑定」时自动离开页面。
             providerCard.slug !== 'github'
-          : providerCard.management.canBind && !!providerCard.decl
+          : providerCard.management.canBind && !!providerCard.decl)
       if (bindable) {
         startBind(providerCard)
         return
       }
       setCardNotice({
         slug: providerCard.slug,
-        tone: providerCard.system === 'v1' ? 'success' : 'warning',
+        tone: providerCard.slug === 'github' || providerCard.system === 'v1' ? 'success' : 'warning',
         text:
-          providerCard.system === 'v1'
+          providerCard.slug === 'github' || providerCard.system === 'v1'
             ? `点「绑定」即可连接${providerCard.label}账号。`
             : `${providerCard.label}当前不可用，请稍后重试。`,
       })
@@ -576,11 +543,13 @@ export function ConnectorsTab({
       tone: e?.tone ?? 'neutral',
       runtime: e?.runtime ?? 'api',
       enabled: !disabled.has(key),
+      enablementKnown: preferencesKnown,
     }
   }
 
   /** 启用开关：乐观更新，PATCH 偏好失败就回滚并提示。 */
   const setEnabled = async (key: string, label: string, enabled: boolean) => {
+    if (!preferencesKnown) return
     const prev = storedDisabled
     const prevOptedIn = optedIn
     const next = new Set(prev)
@@ -611,12 +580,23 @@ export function ConnectorsTab({
 
   const renderRow = (key: string) => {
     const row = rowOf(key)
+    const card = allCards.find((item) => item.key === key)
+    const canConnect = preferencesKnown && row.enabled && card && !card.connected && (
+      card.kind === 'provider'
+        ? card.u.slug === 'github' && data?.providers.some((p) => p.id === 'github') ||
+          card.u.system === 'v1' || card.u.management.canBind
+        : card.plugin.installedCurrent && card.plugin.available)
     return (
       <PluginRow
         key={key}
         row={row}
-        busy={toggling === key}
+        busy={!preferencesKnown || toggling === key}
         onOpen={() => setSelected(key)}
+        onConnect={canConnect ? () => {
+          setSelected(key)
+          if (card.kind === 'provider') startBind(card.u)
+          else { setSetupRuntimeAccountId(null); setSetupRuntimeFor(card.plugin) }
+        } : undefined}
         onToggle={(on) => void setEnabled(key, row.label, on)}
       />
     )
@@ -686,6 +666,7 @@ export function ConnectorsTab({
 
   const renderProviderCard = (card: Extract<CatalogCard, { kind: 'provider' }>) => {
     const u = card.u
+    const githubOauth = u.slug === 'github' && data?.providers.some((p) => p.id === 'github')
     const management = u.system === 'declarative' ? u.management : undefined
     return (
       <ProviderCard
@@ -704,7 +685,9 @@ export function ConnectorsTab({
         notice={noticeFor(u.slug)}
         onDismissNotice={dismissNotice}
         onBind={() => startBind(u)}
-        canBind={management ? management.canBind : true}
+        canBind={githubOauth || (management ? management.canBind : true)}
+        onBindToken={githubOauth && u.system === 'declarative' && u.management.canBind && u.decl
+          ? () => setBindDeclFor(u.decl) : undefined}
         management={management}
         onOpenMarketplace={onOpenMarketplace}
         onUpdate={management ? () => updateMarketConnector(management) : undefined}
@@ -715,6 +698,12 @@ export function ConnectorsTab({
       />
     )
   }
+
+  const preferencesNotice = !loading && !preferencesKnown ? (
+    <Alert tone="info" density="compact" action={<Button size="sm" variant="secondary" onClick={retry}>重试</Button>}>
+      暂时读不到插件启用状态，恢复后才能修改开关。
+    </Alert>
+  ) : null
 
   const dialogs = (
     <>
@@ -782,10 +771,11 @@ export function ConnectorsTab({
       <div className="flex flex-col px-4 pb-4 pt-3" data-testid="plugin-detail">
         <PluginDetailBar
           row={row}
-          busy={toggling === selected}
+          busy={!preferencesKnown || toggling === selected}
           onBack={() => setSelected(null)}
           onToggle={(on) => void setEnabled(selected, row.label, on)}
         />
+        {preferencesNotice}
         {!row.enabled && <DisabledNote label={row.label} />}
         {selectedLocal ? (
           <LocalPluginDetail plugin={selectedLocal} onAskInChat={onAskInChat} />
@@ -835,6 +825,7 @@ export function ConnectorsTab({
           </Alert>
         )}
 
+        {preferencesNotice}
         {/* 增量目录降级：卡片少一半时说清是「读不到」而不是「没装」，并给重试（M-20）。 */}
         {degraded && !loading && (
           <Alert
