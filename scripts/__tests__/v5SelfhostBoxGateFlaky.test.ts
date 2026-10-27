@@ -271,6 +271,9 @@ rc=0; master_gate_retryable cron fake_gate || rc=$?; echo rc=$rc; tsum_finish 1`
     assert.ok(staging > admission, "before the staging tree, the archive and the dependencies");
     assert.ok(boxGates > staging, "the Box-gate wait stays: the host can turn busy during the build");
     assert.match(body.slice(admission, admission + 200), /\|\| die /, "still busy after the limit: give up, nothing built");
+    // OCV5-648 (P2): the train's own runtime build starts only after admission, so admission never waits on it.
+    const bg = body.indexOf('start_runtime_release_bg "$full_sha"');
+    assert.ok(bg > admission && bg < staging, "runtime bg build starts between admission and the candidate");
   });
 
   test("without a train id the attempt logs still land on disk", (t) => {

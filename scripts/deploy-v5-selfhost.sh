@@ -1529,6 +1529,7 @@ build_runtime_release() {
 # 后台段的输出落独立日志,收尾时整段回放,保持 train 日志可读;结果经结果文件回传父 shell。
 # 父 shell 无论成功失败退出,EXIT 清理都会先等后台段结束(不留在飞写 runtime-releases 的进程)。
 # 父进程被直接杀掉(不走 EXIT)时:后台段继承了发布锁 fd 8,锁会一直持有到它结束,不会有第二趟发布并发写。
+# OCV5-648(P2):cmd_deploy 不再自己起后台段,由 build_master_release 在发车准入通过后起(准入不等本列车自己)。
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
 RUNTIME_BG_RESULT=""
@@ -2117,7 +2118,8 @@ $dirty
   selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"; assert_fix_trailers "$sha"  # L0 在 begin 之后:拒绝即 deploy 上报的失败,worker 不重发(OCV5-581)
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
-  start_runtime_release_bg "$sha"
+  # P2(OCV5-648):后台 runtime 构建由 build_master_release 在发车准入通过之后起,准入不再等本列车自己的构建。
+  MASTER_RUNTIME_BG_AFTER_ADMISSION=1
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
   if [[ "$DRY" != 1 ]]; then
