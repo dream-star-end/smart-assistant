@@ -8761,6 +8761,28 @@
           "assertion": "muse: a retry after a failed job submits the next job of the chain, never replays the failure (INC-20261026-STUDIO-MUSE-RETRY-REPLAY)"
         }
       ]
+    },
+    {
+      "id": "INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "商业 uid 247 工作台项目 c6f0a9f2（3 镜头 + 旁白、无配乐）全部镜头就绪后自动合成失败：compose take 943768db COMPOSE_FAILED，ffmpeg exited 1「Cannot select channel layout for the link between filters Parsed_aresample_36 and format_out_0_1 … Error while processing the decoded data for stream #5:0」。生产 ffmpeg 镜像（5.1.9）同 argv 同输入稳定复现：最后一句 mono 32 kHz 配音首帧触发滤镜图重建时 AAC 编码器已按首轮布局打开，输出链未钉死格式无法协商。无配乐的片子都合不成，导致配乐 / 导出 / 批注全部无法进行。",
+      "rootFixCommit": "ec3258c9",
+      "coverageCommits": [
+        "22ec7699"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/studioCompose.test.ts",
+          "assertion": "the film audio reaches the encoder as fltp 48 kHz stereo, never negotiated (INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "the film audio reaches the encoder as fltp 48 kHz stereo, never negotiated (INC-20261027-STUDIO-COMPOSE-CHANNEL-LAYOUT)"
+        }
+      ]
     }
   ]
 }
