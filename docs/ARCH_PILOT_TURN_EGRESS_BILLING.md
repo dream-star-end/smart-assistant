@@ -52,7 +52,7 @@
 |---|---|---|---|
 | **S0** | 本文 + `oc-trace` 把链路追到计费终点：`usage_records` → `credit_ledger`（按 usage id 只读；debit/退款都挂在 usage 上）；`--drill N --model ID` 只看一条链路 | 否（只读） | 本 PR |
 | S1 | 链路上非计费的分层：`llm-proxy` 的 `R3-env` / `R2-upward` / `R2-scope`（试点文件范围内），走公开 API，不改路由策略 | 否 | 待 S0 评审 |
-| S2 | `app/settlement` 工作单元：把试点链路的预留 → finalize → 释放生命周期收成一个单元，替代 `index.ts` 里分散的 5 处 `releasePreCheck`；`billing` 内部事务与锁序不动，F1/F2/F3/F5/F6/F7 不夹带（管家 2026-10-27 拍板 A） | 编排层（不改 billing 写入） | P2b 设计已批（Grok OD 2026-10-27） |
+| S2 | `app/settlement` 工作单元：把试点链路的预留 → finalize → 释放生命周期收成一个单元，替代 `index.ts` 里分散的 5 处 `releasePreCheck`；`billing` 内部事务与锁序不动，F1/F2/F3/F5/F6/F7 不夹带（管家 2026-10-27 拍板 A） | 编排层（不改 billing 写入） | 设计未批；S2 范围已由管家拍板 A，本切片不实施 |
 | S3 | 发布后 7 天同口径复测（成功率、TTFT、60 s、违规数），写试点报告（分层是否可行、护栏误报、搬家成本） | 否 | S2 发布后 |
 
 ## 6. 退出（§9.4，原样）
