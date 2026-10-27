@@ -808,7 +808,8 @@ describe("pgSessionsBackend contract", () => {
          VALUES ($1, 'u-1', NULL, 'output', $2, $1, '/workspace/' || $1, 1, 1, $3)`,
         [id, sessionId, deletedAt],
       );
-    // project_assets has no FK to client_sessions, so the per-test reset does not clear it.
+    // Neither project_assets nor chat_projects is reached by the per-test session reset, so clean
+    // both here; a leftover project would break the next case's project count (Codex r1 P1).
     try {
       await asset("a-624-live", "s-624", null);
       await asset("a-624-deleted", "s-624", 5);
@@ -830,6 +831,8 @@ describe("pgSessionsBackend contract", () => {
       assert.deepEqual(await projectOf(), { "a-624-live": null, "a-624-deleted": null, "a-624-other": null });
     } finally {
       await pool.query("DELETE FROM project_assets WHERE id LIKE 'a-624-%'");
+      await pool.query("UPDATE client_sessions SET project_id = NULL WHERE project_id = $1", [created.project.id]);
+      await pool.query("DELETE FROM chat_projects WHERE id = $1", [created.project.id]);
     }
   });
 
