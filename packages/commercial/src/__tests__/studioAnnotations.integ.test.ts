@@ -389,6 +389,38 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.ok(gens[0]!.request.prompt?.includes('修改要求：动作慢一点'), 'the change is in the video prompt')
   })
 
+  test('a second video-only redo keeps the pinned frame, not a newer one (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    // After a regenerate_video whose video failed: no adopted video, frame v1 pinned, a newer v2 exists.
+    const s = await setup()
+    const newer = await s.take('shot_frame', s.shot, 2, 'image/png')
+    await query(
+      `UPDATE studio_shots SET status = 'needs_user', active_take_id = NULL,
+              spec = spec || jsonb_build_object('frameTakeId', $2::text, 'redo', '{"frame":0,"video":2}'::jsonb)
+        WHERE id = $1`,
+      [s.shot, s.frame.id],
+    )
+    await query(`UPDATE studio_projects SET status = 'awaiting_user', settings = settings || '{"awaitingReason":"needs_user"}'::jsonb WHERE id = $1`, [s.p.id])
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'box',
+      geom: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
+      text: '首帧不变，再试一次视频',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('regenerate_video', { shotId: s.shot }))
+    await runOne(s.exec)
+    const pinned = (
+      await query<{ frame: string | null }>(`SELECT spec->>'frameTakeId' AS frame FROM studio_shots WHERE id = $1`, [s.shot])
+    ).rows[0]!.frame
+    assert.equal(pinned, s.frame.id, 'still frame v1')
+    await advanceProject(s.advanceDeps, s.p.id)
+    const gens = await genTasks(s.p.id)
+    assert.deepEqual(gens.map((g) => g.key), [`gen:shot_video:${s.shot}:v2`])
+    assert.deepEqual(gens[0]!.request.inputs, [{ role: 'first_frame', blobSha: s.frame.sha }], 'from v1')
+    assert.notEqual(gens[0]!.request.inputs?.[0]?.blobSha, newer.sha)
+  })
+
   test('the interpreter is told which version the note is on and which is in use (INC-20261027-STUDIO-ADOPT-WRONG-TAKE)', async (t) => {
     if (skip(t)) return
     // prod 2026-10-27 c6f0a9f2: a note on the adopted v1 saying "就用现在这个版本" was read as v2.

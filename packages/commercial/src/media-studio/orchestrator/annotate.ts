@@ -305,6 +305,10 @@ async function currentFrame(c: PoolClient, shotId: string): Promise<string | nul
        (SELECT v.inputs->'inputs'->0->>'blobSha' FROM studio_shots s JOIN studio_takes v ON v.id = s.active_take_id
          WHERE s.id = $1 AND v.owner_kind = 'shot_video'
            AND v.inputs->'inputs'->0->>'role' = 'first_frame'),
+       -- A shot being redone has no adopted video: the frame pinned for it (a user's pick, or an
+       -- earlier video-only redo) is the one on screen, so a retry keeps it (code r1 P1).
+       (SELECT f.blob_sha FROM studio_shots s JOIN studio_takes f ON f.id::text = s.spec->>'frameTakeId'
+         WHERE s.id = $1 AND f.owner_kind = 'shot_frame' AND f.status = 'succeeded' AND f.blob_sha IS NOT NULL),
        (SELECT f.blob_sha FROM studio_takes f
          WHERE f.owner_kind = 'shot_frame' AND f.owner_id = $1 AND f.status = 'succeeded' AND f.blob_sha IS NOT NULL
            AND (f.qa IS NULL OR (f.qa->>'passed')::boolean IS TRUE OR (f.qa->>'skipped')::boolean IS TRUE)
