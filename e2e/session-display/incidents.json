@@ -9006,12 +9006,12 @@
       "occurredAt": "2026-10-26",
       "severity": "P1",
       "symptom": "个人版体验-办公：登录后新标签/慢网打开裸首页掉登录。refresh rotate 后旧 oc_rt 超过默认 10s race grace（实测 ~11.6s）被判 theft 整族吊销清 cookie。OCV5-622：grace 默认 45s + 跨 tab refresh 单飞；超 grace / fingerprint 不一致仍 theft。",
-      "rootFixCommit": "c71a59be",
+      "rootFixCommit": "54b327ff",
       "coverageCommits": [
-        "c71a59be",
-        "3bf0f487",
-        "68e5d8b7",
-        "79eef834"
+        "54b327ff",
+        "918bb1a9",
+        "bc475202",
+        "4eb76a42"
       ],
       "regressions": [
         {
