@@ -7950,6 +7950,97 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(row!.failureCode, "SERVICE_RESTART");
   });
 
+  // OCV5-646 (t1134u): the turn streamed an answer and tool steps, then a
+  // gateway restart staged the inbox-only SERVICE_RESTART tape (text ''). The
+  // records must carry what was streamed, and survive the frame prune.
+  maybe("OCV5-646 boot-recovery SERVICE_RESTART tape keeps the streamed answer after prune", async () => {
+    const restartTape = (sessionId: string, clientMessageId: string, dispatchId: string, turnKey: string) =>
+      buildTape({
+        agentId: "main",
+        sessionId,
+        turnIndex: 1,
+        clientMessageId,
+        status: "crashed",
+        turnKey,
+        createdAt: 1_783_950_170_000,
+        text: "",
+        errorCode: "SERVICE_RESTART",
+        errorDetail: "任务因服务重启中断，此前已生成的过程已完整保留",
+        dispatchId,
+        attemptNo: 1,
+      });
+    const finalizeRestart = async (sessionId: string, clientMessageId: string, turnKey: string,
+      frames: Array<Record<string, unknown>>) => {
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+      const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+      assert.equal(admit.kind, "admitted");
+      const dispatchId = (admit as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+      const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+      for (const [index, frame] of frames.entries()) {
+        const frameSeq = index + 1;
+        await persistGatewayLiveFrame(pool, {
+          uid: UID,
+          sessionId,
+          clientMessageId,
+          agentContainerId: 1,
+          sessionKey,
+          frameSeq,
+          payload: JSON.stringify({ sessionKey, frameSeq, clientMessageId, peer: { id: sessionId, kind: "dm" }, ...frame }),
+        });
+      }
+      const tape = restartTape(sessionId, clientMessageId, dispatchId, turnKey);
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, { dispatchId, attemptNo: 1 });
+      }
+      assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "finalized");
+      const records = await pool.query<{ role: string; payload: Buffer }>(
+        `SELECT role,payload FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 ORDER BY ordinal`,
+        [sessionId, CUSER, tape.finalize.tapeId],
+      );
+      return records.rows.map((row) => ({
+        role: row.role,
+        payload: JSON.parse(Buffer.from(row.payload).toString("utf8")) as Record<string, unknown>,
+      }));
+    };
+    const message = (blocks: Array<Record<string, unknown>>) => ({ type: "outbound.message", blocks });
+
+    const sessionId = "s-ocv5-646-fold";
+    const records = await finalizeRestart(sessionId, "cm-ocv5-646-fold", "d".repeat(64), [
+      message([{ kind: "thinking", text: "先核对故障", messageId: "m1" }]),
+      message([{ kind: "text", text: "要根治，", messageId: "m1" }]),
+      message([{ kind: "text", text: "不能只加一次重试。", messageId: "m1" }]),
+      message([{ kind: "tool_use", blockId: "tu-1", toolName: "Bash", inputJson: { command: "ls" }, inputPreview: "ls" }]),
+      { type: "outbound.permission_request", requestId: "perm-1", toolName: "Bash" },
+      message([{ kind: "tool_result", toolUseBlockId: "tu-1", toolName: "Bash", output: "a.ts" }]),
+      message([{ kind: "tool_use", blockId: "tu-2", toolName: "Read", inputPreview: "b.ts" }]),
+    ]);
+    assert.deepEqual(records.map((row) => row.role), ["thinking", "tool", "tool", "assistant"]);
+    const answer = records.at(-1)!.payload;
+    assert.equal(answer.text, "要根治，不能只加一次重试。");
+    assert.equal(answer._errorCode, "SERVICE_RESTART");
+    assert.equal(records[1]!.payload.output, "a.ts");
+    assert.equal(records[2]!.payload.partial, true);
+
+    await pruneProjectedLiveFrames(pool, { batchSize: 100 });
+    const left = await pool.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
+    );
+    assert.equal(left.rows[0]!.n, "0");
+    const timeline = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    const shown = (timeline!.messages as MessageLike[]).find((m) => m.role === "assistant" && m._errorCode === "SERVICE_RESTART");
+    assert.equal(shown?.text, "要根治，不能只加一次重试。");
+
+    // No frames: the synthetic row is materialized exactly as before.
+    const bare = await finalizeRestart("s-ocv5-646-bare", "cm-ocv5-646-bare", "e".repeat(64), []);
+    assert.deepEqual(bare.map((row) => row.role), ["assistant"]);
+    assert.equal(bare[0]!.payload.text, "任务因服务重启中断，此前已生成的过程已完整保留");
+    assert.equal(bare[0]!.payload._isError, true);
+  });
+
   maybe("SERVICE_RESTART sentinel + late completed 清 failure_code; late crash 写真实码", async () => {
     for (const [tapeStatus, expectedCode] of [
       ["completed", null],
