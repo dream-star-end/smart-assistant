@@ -16,6 +16,8 @@ const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 
 /** 已登录的页面被服务端判失效（refresh 明确 invalid，不是主动登出）时给用户的一句话（OCV5-636）。 */
 export const SESSION_EXPIRED_MESSAGE = "登录状态已失效，请重新登录";
+/** 启动续期两轮都撞 REFRESH_RACE（本浏览器的 cookie 已被别处续期替换）时的一句话（OCV5-638）。 */
+export const SESSION_SUPERSEDED_MESSAGE = "登录状态已在其他页面更新，本页没能接上，请重新登录";
 
 function waitForRecovery(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -218,11 +220,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     cbRef.current.onClearAuth();
   }, [setUser]);
   // AuthSession.expire 的 UI 收尾。本页原本已登录 = 用户正在用时被踢（OCV5-636：体验官只看到
-  // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。启动续期判定本浏览器
-  // 凭证已被替换（OCV5-638）同样提示：用户上一刻还是登录的。
-  const supersededBootRef = useRef(false);
+  // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。启动时已经告诉过用户
+  // 「本页没能接上」（OCV5-638）、随后重试被服务端判失效，同样提示，不静默落到营销首页。
+  const supersededSeenRef = useRef(false);
   expiredUiRef.current = () => {
-    const wasAuthed = authedRef.current || supersededBootRef.current;
+    const wasAuthed = authedRef.current || supersededSeenRef.current;
+    supersededSeenRef.current = false;
     clearAuthState();
     if (!wasAuthed) return;
     setAuthError(SESSION_EXPIRED_MESSAGE);
@@ -336,16 +339,12 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
           refreshAttempt += 1;
           if (outcome.superseded) supersededFlights += 1;
           if (refreshAttempt >= 2) {
-            // 两轮都是 REFRESH_RACE 阶梯耗尽（OCV5-638）：不是网络问题，本浏览器的 cookie 已被换掉、
-            // 不会自愈；继续重试（含用户按「重试」/F5）只会撞到服务端宽限期满被判盗用，转圈约 45 秒
-            // 后无提示落到营销首页。直接结束会话，打开登录表单说明原因。
-            if (supersededFlights >= 2) {
-              supersededBootRef.current = true;
-              session.expire(bootEpoch);
-              supersededBootRef.current = false;
-              return;
-            }
-            setAuthError("登录状态恢复失败，请检查网络后重试");
+            // 两轮都是 REFRESH_RACE 阶梯耗尽（OCV5-638）：不是网络问题——本浏览器带的 cookie 已被别处
+            // 续期换掉，新 cookie 没落地。以前照样说「请检查网络」，用户一再重试 / F5，撞到服务端宽限
+            // 期满被判盗用后静默落到营销首页。改说实话、请用户重新登录；不结束会话、不清「登录过」
+            // 标记：迟到的 keepalive 续期仍可能把新 cookie 写进来（Codex r1），「重试」/ F5 照样能接上。
+            if (supersededFlights >= 2) supersededSeenRef.current = true;
+            setAuthError(supersededFlights >= 2 ? SESSION_SUPERSEDED_MESSAGE : "登录状态恢复失败，请检查网络后重试");
             setAuthRecoveryAvailable(true);
             setBooting(false);
             return;

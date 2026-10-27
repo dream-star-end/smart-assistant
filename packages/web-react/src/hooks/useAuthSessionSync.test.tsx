@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { SESSION_EXPIRED_MESSAGE, useAuth } from './useAuth'
+import { SESSION_EXPIRED_MESSAGE, SESSION_SUPERSEDED_MESSAGE, useAuth } from './useAuth'
 
 // OCV5-636: the refresh cookie is shared by every tab, so a tab left on the signed-out landing
 // must rejoin when another tab signs in, and a tab kicked mid-use must say so instead of
@@ -88,10 +88,11 @@ it('an in-page server invalidation reports the expiry; boot failure and explicit
   expect(onSessionExpired).toHaveBeenCalledTimes(1)
 })
 
-// OCV5-638: two boots in a row ran the whole REFRESH_RACE ladder without ever seeing a new cookie —
-// this browser's refresh cookie was replaced by an earlier rotation whose Set-Cookie never landed.
-// Retrying only spins until the server's grace window ends and revokes the family as theft.
-it('a boot whose refresh cookie was superseded stops after two race ladders and asks to sign in again', async () => {
+// OCV5-638: both boot rounds ran the whole REFRESH_RACE ladder without ever seeing a new cookie — this
+// browser's refresh cookie was replaced by a rotation whose Set-Cookie has not landed. Say so instead of
+// blaming the network, but keep the session recoverable: a late keepalive response may still land the
+// new cookie (Codex r1), so the hint stays and 「重试」/F5 can still pick it up.
+it('a boot whose cookie was superseded asks to sign in again but keeps retry and F5 able to recover', async () => {
   vi.useFakeTimers()
   const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/auth/refresh' ? race() : reply({ ok: true }))
   vi.stubGlobal('fetch', fetcher)
@@ -103,14 +104,44 @@ it('a boot whose refresh cookie was superseded stops after two race ladders and 
   await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
   expect(view.result.current.booting).toBe(false)
   expect(view.result.current.authed).toBe(false)
-  expect(view.result.current.authError).toBe(SESSION_EXPIRED_MESSAGE)
-  expect(view.result.current.authRecoveryAvailable).toBe(false)
-  expect(onClearAuth).toHaveBeenCalledTimes(1)
-  expect(onSessionExpired).toHaveBeenCalledTimes(1)
+  expect(view.result.current.authError).toBe(SESSION_SUPERSEDED_MESSAGE)
+  expect(view.result.current.authRecoveryAvailable).toBe(true)
+  expect(onClearAuth).not.toHaveBeenCalled()
   expect(refreshCalls(fetcher)).toBe(12)
-  expect(localStorage.getItem('oc_auth_hint')).toBeNull()
+  expect(localStorage.getItem('oc_auth_hint')).toBe('1')
+  // Nothing keeps hammering the stale cookie toward the server's theft window on its own.
   await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
   expect(refreshCalls(fetcher)).toBe(12)
+
+  // The late cookie landed: 「重试恢复登录状态」 signs the page in.
+  fetcher.mockImplementation(async url => String(url) === '/api/auth/refresh' ? refreshOk()
+    : String(url) === '/api/me' ? reply({ user: { id: 'alice', role: 'user' } }) : reply({ ok: true }))
+  act(() => { view.result.current.retryBoot() })
+  await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+  expect(view.result.current.authed).toBe(true)
+  expect(view.result.current.authError).toBeNull()
+  expect(onSessionExpired).not.toHaveBeenCalled()
+})
+
+it('a retry after the superseded notice that the server rejects shows the expiry notice, not a silent landing', async () => {
+  vi.useFakeTimers()
+  const fetcher = vi.fn<typeof fetch>(async url => String(url) === '/api/auth/refresh' ? race() : reply({ ok: true }))
+  vi.stubGlobal('fetch', fetcher)
+  localStorage.setItem('oc_auth_hint', '1')
+  const onClearAuth = vi.fn()
+  const onSessionExpired = vi.fn()
+  const view = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth, onSessionExpired }))
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
+  expect(view.result.current.authError).toBe(SESSION_SUPERSEDED_MESSAGE)
+  // Past the grace window the server revokes the family as theft.
+  fetcher.mockImplementation(async url => String(url) === '/api/auth/refresh' ? invalid() : reply({ ok: true }))
+  act(() => { view.result.current.retryBoot() })
+  await act(async () => { await vi.advanceTimersByTimeAsync(100) })
+  expect(view.result.current.booting).toBe(false)
+  expect(view.result.current.authError).toBe(SESSION_EXPIRED_MESSAGE)
+  expect(onClearAuth).toHaveBeenCalledTimes(1)
+  expect(onSessionExpired).toHaveBeenCalledTimes(1)
+  expect(localStorage.getItem('oc_auth_hint')).toBeNull()
 })
 
 it('one race ladder followed by a network failure keeps the network recovery path', async () => {
