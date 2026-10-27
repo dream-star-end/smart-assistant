@@ -25,7 +25,10 @@ type State = { failed: boolean; stale: boolean };
  * reject → Suspense 把错误重抛且无人接住 → 整个 App 白屏。
  *
  * 捕获后给出**可恢复出口**而非白屏:
- *  - stale-chunk(发版换哈希)→「已发布新版本」+ 一键刷新(location.reload 强制重取新 index.html);
+ *  - 动态 import 失败 →「页面需要刷新」+ 一键刷新(location.reload 强制重取新 index.html)。
+ *    文案不断言「已发布新版本」:断网/弱网同样落在这一支(isChunkLoadError 按报错文本识别,分不出
+ *    原因);发版导致的情况已由顶栏「新版本」pill(OCV5-626)与 /assets 资产池回落(OCV5-632/633)
+ *    大幅减少(OCV5-634,FINDINGS X-P1-2);
  *  - 其它渲染错误 → 通用「加载出错」+ 刷新(同样给出口,好过白屏)。
  *
  * 这些中心是**条件挂载**(open 时才 mount,关闭即卸载),故关闭再打开会重建本边界、自动重置
@@ -58,11 +61,11 @@ export class ChunkErrorBoundary extends Component<Props, State> {
         {/* alertdialog 已含 alert 语义(读屏只播报一次),内层不再叠 role=alert。 */}
         <div className="flex max-w-sm flex-col items-center gap-3 text-center">
           <p id="chunk-error-boundary-title" className="text-title font-medium text-fg">
-            {this.state.stale ? "已发布新版本" : "此页面加载出错"}
+            {this.state.stale ? "页面需要刷新" : "此页面加载出错"}
           </p>
           <p className="text-body leading-relaxed text-muted">
             {this.state.stale
-              ? "页面已更新，刷新后即可继续使用。"
+              ? "可能刚发布了新版本，或网络波动导致部分页面没有加载下来。刷新即可继续。"
               : "请检查网络后刷新；若刚发版也请刷新。"}
           </p>
           {/* 走 Button 原语:这是整页白屏的唯一出口,裸 <button> 在触屏上只有 ~36px 命中区,
