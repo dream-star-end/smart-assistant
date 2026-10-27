@@ -2008,6 +2008,17 @@ describe("invariant 1 — release ownership 4 阶段铁律", () => {
     assert.equal(h.preCheckSpy.reserveCalls.length, 1);
   });
 
+  // (a2) pick throws an error nothing classifies → the outer finally releases the reservation (it
+  // used to wait for the TTL); scheduler.release still not called (no session yet).
+  test("(a2) scheduler.pick 抛未分类异常 → 预留仍释放 1 次,不 scheduler.release", async () => {
+    const h = buildHarness();
+    h.schedulerSpy.setPickError(new Error("unclassified pick failure"));
+    await h.run(minBody()).catch(() => undefined);
+    assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+    assert.equal(h.preCheckSpy.releaseCalls.length, 1, "stage (a2): 应释放 preCheck 1 次");
+    assert.equal(h.schedulerSpy.releaseCalls.length, 0, "stage (a2): 不应调用 scheduler.release");
+  });
+
   // (b1) refresh RefreshError(account_not_found) → kind="failure"
   // 触发方式:expires_at 已过期 + refreshDeps 配置好,但 fakePool 没有 claudeAccount
   // → getTokenForUse 返 null → RefreshError("account_not_found")
