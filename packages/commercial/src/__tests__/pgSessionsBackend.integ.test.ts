@@ -8042,8 +8042,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(bare[0]!.payload.text, "任务因服务重启中断，此前已生成的过程已完整保留");
     assert.equal(bare[0]!.payload._isError, true);
 
-    // Codex r1: a straggler frame between two prepare attempts must not change
-    // the record set (immutable record identity on retry). Phase A pins the cut.
+    // Codex r1/r2: a straggler frame between two prepare attempts must not
+    // change the record set (immutable record identity on retry). Frames that
+    // reach the dispatch row lock after Phase A are dropped.
     const lateSession = "s-ocv5-646-late";
     const lateCmid = "cm-ocv5-646-late";
     await backend.upsertClientSession(mkSession({ id: lateSession, userId: CUSER }));
@@ -8064,18 +8065,35 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     for (const part of lateTape.parts) {
       await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, { dispatchId: lateDispatch, attemptNo: 1 });
     }
-    await backend.finalizeLosslessTurnTape(CUSER, lateTape.finalize, { materialize: false });
+    // as gateway buildLosslessTurnTapeRequests sends the boot-recovery tape
+    const lateFinalize = {
+      ...lateTape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${lateSession}-main-t1`,
+        engineBillings: [],
+        text: "",
+        ts: 1_783_950_170_000,
+        errorCode: "SERVICE_RESTART",
+      },
+    };
+    await backend.finalizeLosslessTurnTape(CUSER, lateFinalize, { materialize: false });
     const format = (await pool.query<{ f: number }>(
       `SELECT record_storage_format AS f FROM client_session_turn_tapes
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
       [lateSession, CUSER, lateTape.finalize.tapeId],
     )).rows[0]!.f as 2 | 3;
-    const first = await _prepareLosslessTurnTapeOutsideLocks(pool, CUSER, lateTape.finalize, format);
+    const first = await _prepareLosslessTurnTapeOutsideLocks(pool, CUSER, lateFinalize, format);
     assert.ok(first);
-    await _stagePreparedLosslessTurnRecords(pool, CUSER, lateTape.finalize, first);
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await _stagePreparedLosslessTurnRecords(pool, CUSER, lateFinalize, first);
     await lateFrame(3, [{ kind: "tool_use", blockId: "tu-b", toolName: "Read", inputPreview: "late" }]);
-    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, lateTape.finalize)).applied, "finalized");
+    const lateCount = await pool.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.dispatch_id=$1::uuid`,
+      [lateDispatch],
+    );
+    assert.equal(lateCount.rows[0]!.n, "2");
+    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, lateFinalize)).applied, "finalized");
     const lateRecords = await pool.query<{ msg_id: string; role: string }>(
       `SELECT msg_id,role FROM client_session_turn_tape_records
         WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 ORDER BY ordinal`,
