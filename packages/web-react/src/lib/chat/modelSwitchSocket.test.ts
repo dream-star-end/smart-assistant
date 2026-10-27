@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
 import { ChatSocket } from './socket'
+import { MODEL_SWITCH_CANCELLED_MESSAGE } from '../modelSwitch'
 
 class FakeWS {
   static instances: FakeWS[] = []
@@ -161,5 +162,46 @@ describe('native model switch socket transaction', () => {
     const prepared = socket.prepareModelSwitch('s1', 'glm-5.3', 'gpt-5.6-sol')
     socket.stop()
     await expect(prepared).rejects.toThrow('连接已断开，未切换模型')
+  })
+
+  test('user cancel rejects the pending preparation at once and withdraws it on the gateway', async () => {
+    vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket)
+    const socket = makeSocket()
+    socket.setGateReady(true)
+    const ws = FakeWS.instances.at(-1)!
+    ws.open()
+    socket.ensureSession('s1', 'main')
+    socket.ensureSession('s2', 'main')
+
+    const prepared = socket.prepareModelSwitch('s1', 'glm-5.3', 'gpt-5.6-sol')
+    const other = socket.prepareModelSwitch('s2', 'glm-5.3', 'gpt-5.6-sol')
+    const frames = () => ws.sent.map((raw) => JSON.parse(raw))
+    const control = frames().find(
+      (frame) => frame.type === 'control.session.prepare_model_switch' && frame.sessionKey === 'agent:main:webchat:dm:s1',
+    )
+    socket.cancelPendingModelSwitches('s1')
+    await expect(prepared).rejects.toThrow(MODEL_SWITCH_CANCELLED_MESSAGE)
+    expect(frames()).toContainEqual({
+      type: 'control.session.cancel_model_switch',
+      sessionKey: 'agent:main:webchat:dm:s1',
+      requestId: control.requestId,
+    })
+    // A late prepared frame for the cancelled request is ignored; other sessions keep waiting.
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: 'outbound.model_switch.prepared',
+        requestId: control.requestId,
+        sessionKey: control.sessionKey,
+        sourceModel: 'glm-5.3',
+        targetModel: 'gpt-5.6-sol',
+        status: 'completed',
+      }),
+    })
+    let otherSettled = false
+    other.then(() => { otherSettled = true }, () => { otherSettled = true })
+    await Promise.resolve()
+    expect(otherSettled).toBe(false)
+    socket.stop()
+    await other.catch(() => {})
   })
 })

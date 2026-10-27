@@ -87,3 +87,48 @@ test('preparedModelSwitchCatchupFrame emits only a live prepared generation', ()
   transition.state = 'preparing'
   assert.equal(preparedModelSwitchCatchupFrame(session, 1_000), null)
 })
+
+test('preparedModelSwitchCatchupFrame replays a recent failure so a reconnecting client stops waiting', () => {
+  const session = {
+    sessionKey: 'agent:main:webchat:dm:s1',
+    _modelSwitchFailure: {
+      id: 'model-switch:failed',
+      sourceModel: 'antigravity-gemini-3.8-flash',
+      targetModel: 'box-api-claude-sonnet-5-5',
+      errorCode: 'MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE',
+      message: '上下文压缩失败，仍保留原模型',
+      at: 1_000,
+    },
+  }
+  assert.deepEqual(preparedModelSwitchCatchupFrame(session, 2_000), {
+    type: 'outbound.model_switch.prepared',
+    requestId: 'model-switch:failed',
+    sessionKey: 'agent:main:webchat:dm:s1',
+    sourceModel: 'antigravity-gemini-3.8-flash',
+    targetModel: 'box-api-claude-sonnet-5-5',
+    status: 'failed',
+    errorCode: 'MODEL_SWITCH_NATIVE_COMPACTION_UNAVAILABLE',
+    message: '上下文压缩失败，仍保留原模型',
+    ts: 2_000,
+  })
+  assert.equal(preparedModelSwitchCatchupFrame(session, 1_000 + 30 * 60_000), null)
+  // A newer attempt in flight owns the catch-up.
+  assert.equal(
+    preparedModelSwitchCatchupFrame(
+      {
+        ...session,
+        _modelSwitchTransition: { id: 'model-switch:new', sourceModel: 'a', targetModel: 'b', state: 'preparing' as const },
+      },
+      2_000,
+    ),
+    null,
+  )
+})
+
+test('structural: prepare_model_switch answers catalog models instead of dropping them, and records failures', () => {
+  const startIdx = serverSrc.indexOf("} else if ((frame as any).type === 'control.session.prepare_model_switch') {")
+  const endIdx = serverSrc.indexOf("} else if ((frame as any).type === 'control.session.compact') {", startIdx)
+  const body = serverSrc.slice(startIdx, endIdx)
+  assert.equal(/ALLOWED_INBOUND_MODELS\.has/.test(body), false, 'the baked allowlist drops box-api-claude-* switches with no reply')
+  assert.match(body, /session\._modelSwitchFailure = \{/)
+})

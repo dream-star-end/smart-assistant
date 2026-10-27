@@ -216,6 +216,16 @@ export interface AgentSession {
     summaryInjected?: boolean
     expiresAt?: number
   }
+  /** Last failed prepare, replayed on reconnect so a phone that dropped its
+   *  socket mid-compaction still learns the switch failed. */
+  _modelSwitchFailure?: {
+    id: string
+    sourceModel: string
+    targetModel: string
+    errorCode: string
+    message: string
+    at: number
+  }
   _lastNativeCompactionSummary?: string
   /** Signed context owner for the turn that currently holds session.lock. */
   _boxContextOwner?: string

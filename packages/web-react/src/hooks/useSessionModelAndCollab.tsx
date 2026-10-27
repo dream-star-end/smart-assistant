@@ -6,7 +6,7 @@
  */
 import { useEffect, useRef, useCallback, useState } from "react";
 import { resolveSessionModel } from "../lib/modelPreferences";
-import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
+import { MODEL_SWITCH_CANCELLED_MESSAGE, freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
 import { readTeamModeForSession, writeTeamMode } from "../lib/teamMode";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody, isStaleCollabEpoch } from "../lib/collaborationConfig";
 import { api, ApiError, apiErrorMessage } from "../lib/api";
@@ -101,6 +101,7 @@ export function useSessionModelAndCollab({
   // server-wins 盖回,重选即重试;服务端从未有值(NULL=从未显式选择,无"清除"流)则缺席
   // 不表态,本地意图保留 —— 两种失败面都可自愈。新会话行未建 404 同吞,由建行 PUT/建行后
   // 收敛 PATCH 落地。无活动会话(空会话态)仅更新选择器,作为下一会话意图。
+  const modelSwitchSessionRef = useRef<string | undefined>(undefined);
   const activeModelSwitchSessionRef = useRef(activeId);
   activeModelSwitchSessionRef.current = activeId;
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelId, setModelSwitchPreparing, sockRef are App useState setter/useRef passed in, stable
@@ -179,13 +180,16 @@ export function useSessionModelAndCollab({
         return;
       }
       setModelSwitchPreparing(true);
+      modelSwitchSessionRef.current = activeId;
       try {
         const switchId = await sockRef.current?.prepareModelSwitch(activeId, modelId, id);
         if (!switchId) throw new Error("模型切换准备失败");
         commit(switchId);
       } catch (error) {
-        toast(error instanceof Error ? error.message : "上下文压缩失败，仍保留原模型", "error");
+        const message = error instanceof Error ? error.message : "上下文压缩失败，仍保留原模型";
+        toast(message, message === MODEL_SWITCH_CANCELLED_MESSAGE ? "info" : "error");
       } finally {
+        modelSwitchSessionRef.current = undefined;
         setModelSwitchPreparing(false);
       }
     },
@@ -355,7 +359,14 @@ export function useSessionModelAndCollab({
       });
   }, [activeId, applyCollabDoc, auth, demo]);
 
+
+  const cancelModelSwitch = useCallback(() => {
+    const sid = modelSwitchSessionRef.current;
+    if (sid) sockRef.current?.cancelPendingModelSwitches(sid);
+  }, [sockRef]);
+
   return {
+    cancelModelSwitch,
     applyCollabDoc,
     collabAsDefault,
     collabEpochRef,

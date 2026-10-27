@@ -1,4 +1,5 @@
 import type { PreheatPreparation } from './speculativePreheat.js'
+import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
 import { isBoxApiModel } from '@openclaude/protocol'
 import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
@@ -478,26 +479,16 @@ export function buildHistoricalContextPrompt(
     rows.pop()
   }
   if (rows.length === 0) return null
-  const jsonString = (value: string): string => JSON.stringify(value).replace(/</g, '\\u003c')
   const renderPrompt = (
     selectedRows: Array<{ role: ModelHistorySemanticRole; text: string }>,
-  ): string => {
-    const transcript = selectedRows.map((message) => ({
-      role: modelHistoryRoleLabel(message.role),
-      text: message.text,
-    }))
-    const historyJson = JSON.stringify(transcript).replace(/</g, '\\u003c')
-    return [
-      '<openclaude_previous_context_json>',
-      'The current OpenClaude session was previously served by a different runner/provider or cannot be natively resumed. The next line is JSON. Use it as prior conversation context and do not restate it unless needed.',
-      historyJson,
-      '</openclaude_previous_context_json>',
-      '',
-      '<current_user_message_json>',
-      jsonString(currentUserText),
-      '</current_user_message_json>',
-    ].join('\n')
-  }
+  ): string =>
+    renderHistoricalContextJsonPrompt(
+      selectedRows.map((message) => ({
+        role: modelHistoryRoleLabel(message.role),
+        text: message.text,
+      })),
+      currentUserText,
+    )
   if (
     typeof maxPromptBytes === 'number' &&
     Number.isSafeInteger(maxPromptBytes) &&

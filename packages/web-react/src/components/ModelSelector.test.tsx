@@ -677,6 +677,17 @@ describe('ModelSelector 切换中态', () => {
     expect(screen.queryByTestId('model-trigger-loading')).toBeNull()
   })
 
+  it('切换中给出「取消」入口(trigger 被禁用,这是唯一出口);未提供时不渲染', () => {
+    const onCancel = vi.fn()
+    const { rerender } = render(
+      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} loading onCancelSwitch={onCancel} />,
+    )
+    fireEvent.click(screen.getByTestId('model-switch-cancel'))
+    expect(onCancel).toHaveBeenCalledTimes(1)
+    rerender(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    expect(screen.queryByTestId('model-switch-cancel')).toBeNull()
+  })
+
   it('loading 且列表为空 → 仍显示「加载模型…」,不显示「切换中」', () => {
     render(<ModelSelector models={[]} selectedId={undefined} onSelect={() => {}} loading />)
     const trigger = screen.getByRole('button', { name: '选择对话模型' })

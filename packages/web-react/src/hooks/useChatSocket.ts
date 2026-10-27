@@ -83,6 +83,7 @@ export type UseChatSocket = {
   /** 会话级模型选择(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步,与 rename 同构)。*/
   setSessionModel: (sessId: string, modelId: string, modelSwitchId?: string) => void;
   prepareModelSwitch: (sessId: string, sourceModel: string, targetModel: string) => Promise<string>;
+  cancelPendingModelSwitches: (sessId: string) => void;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -783,6 +784,10 @@ export function useChatSocket(opts: {
       socket.prepareModelSwitch(sessId, sourceModel, targetModel),
     [socket],
   );
+  const cancelPendingModelSwitches = useCallback(
+    (sessId: string) => socket.cancelPendingModelSwitches(sessId),
+    [socket],
+  );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
@@ -1167,6 +1172,7 @@ export function useChatSocket(opts: {
       renameSession,
       setSessionModel,
       prepareModelSwitch,
+      cancelPendingModelSwitches,
       switchAgent,
       send,
       stop,
@@ -1210,6 +1216,7 @@ export function useChatSocket(opts: {
       renameSession,
       setSessionModel,
       prepareModelSwitch,
+      cancelPendingModelSwitches,
       switchAgent,
       send,
       stop,

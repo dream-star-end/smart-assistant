@@ -59,8 +59,9 @@ import {
 } from './turnDispatchInbox.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
-import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import type { Gateway } from './server.js'
+
+const MODEL_SWITCH_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
 
 export interface WsConnectionHost {
   _activeTurnReplaysServed: Gateway['_activeTurnReplaysServed']
@@ -649,8 +650,13 @@ export function handleWsConnection(
           typeof requestId !== 'string' ||
           typeof sourceModel !== 'string' ||
           typeof targetModel !== 'string' ||
-          !ALLOWED_INBOUND_MODELS.has(sourceModel) ||
-          !ALLOWED_INBOUND_MODELS.has(targetModel)
+          // Not the baked ALLOWED_INBOUND_MODELS: it drifts from the catalog
+          // (box-api-claude-* are missing), and a silently dropped request
+          // left the picker on 切换中… for 16 minutes. The source must equal
+          // the session's model; the target is only recorded here and is
+          // admitted by the turn's model authority when it is used.
+          !MODEL_SWITCH_MODEL_ID_RE.test(sourceModel) ||
+          !MODEL_SWITCH_MODEL_ID_RE.test(targetModel)
         )
           return
         const session = this.sessions.getByKey(sessionKey)
@@ -708,9 +714,8 @@ export function handleWsConnection(
           if (code === 'MODEL_SWITCH_PREPARE_FAILED') {
             this.log.error('model switch prepare failed', { sessionKey }, err as Error)
           }
-          reply({
+          const failure = {
             sourceModel: session.model ?? session.runner.model ?? '',
-            status: 'failed',
             errorCode: code,
             message:
               code === 'MODEL_SWITCH_SESSION_BUSY'
@@ -718,7 +723,9 @@ export function handleWsConnection(
                 : code === 'MODEL_SWITCH_SOURCE_CHANGED'
                   ? '会话当前模型已变化，请刷新后重试'
                   : '上下文压缩失败，仍保留原模型',
-          })
+          }
+          session._modelSwitchFailure = { id: requestId, targetModel, at: Date.now(), ...failure }
+          reply({ ...failure, status: 'failed' })
         }
       } else if ((frame as any).type === 'control.session.compact') {
         // Compact: send a compaction request to the agent as a user message

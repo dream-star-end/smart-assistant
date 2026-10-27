@@ -50,6 +50,7 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
+import { fitHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import {
   ANTIGRAVITY_PREAMBLE,
@@ -435,8 +436,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       admittedTokenExpiresAt: route.accessTokenExpiresAt,
       cliTokenFileExpiry: projection.cliTokenFileExpiry,
     })
-    const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
-    const line = `${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`
+    const platformContent = await this.composePlatformContent(repoSnapshot, projection.advertisedMcpTools, cwdDecision)
+    const stdinLine = (input: string): string =>
+      `${JSON.stringify({ event: 'user', message: { content: assemblePrompt(platformContent, input, this.platformGoal) } })}\n`
+    const input = promptText(ctx.params.input)
+    // Injected history is sized without this envelope; drop its oldest
+    // entries here rather than refuse a turn that can still run.
+    const fitted = fitHistoricalContextJsonPrompt(
+      input,
+      (candidate) => Buffer.byteLength(stdinLine(candidate), 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES,
+    )
+    if (fitted && fitted.dropped > 0) {
+      log.warn('antigravity injected history trimmed to the stdin limit', {
+        sessionKey: this.opts.sessionKey,
+        traceId: ctx.params.traceId,
+        droppedEntries: fitted.dropped,
+      })
+    }
+    const line = stdinLine(fitted?.prompt ?? input)
     if (Buffer.byteLength(line, 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES) {
       throw new Error(`ANTIGRAVITY_PROMPT_TOO_LARGE: ${Buffer.byteLength(line, 'utf8')} bytes > ${ANTIGRAVITY_MAX_PROMPT_BYTES}`)
     }
@@ -574,13 +591,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     })
   }
 
-  private async composePrompt(
-    params: TurnParams,
+  private async composePlatformContent(
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
     availableMcpTools: string[],
     cwdDecision: ReturnType<typeof decideEngineCwd>,
   ): Promise<string> {
-    const input = promptText(params.input)
     try {
       const platform = await buildPromptContext({
         agentId: this.opts.agentId,
@@ -612,14 +627,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         prompt_bytes: Buffer.byteLength(platform.content || '', 'utf8'),
         prompt_sha256: createHash('sha256').update(platform.content || '', 'utf8').digest('hex').slice(0, 12),
       })
-      return assemblePrompt(platform.content || '', input, this.platformGoal)
+      return platform.content || ''
     } catch {
       if (this.opts.identityCompat?.assets) throw new Error('COMPAT_CONFIG_CONFLICT: identity prompt assembly failed')
       let persona = ''
       if (this.opts.persona) {
         try { persona = readFileSync(this.opts.persona, 'utf8').trim() } catch { persona = '' }
       }
-      return assemblePrompt(persona, input, this.platformGoal)
+      return persona
     }
   }
 
