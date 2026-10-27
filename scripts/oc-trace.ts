@@ -3,6 +3,7 @@
  *
  *   npx tsx scripts/oc-trace.ts <traceId | dispatchId | requestId> [--verbose] [--json]
  *   npx tsx scripts/oc-trace.ts --drill 20      the 20 latest failed dispatches: first error + seconds
+ *   npx tsx scripts/oc-trace.ts --drill 20 --model <id>   the same, for one model's turns only
  *
  * Root on v5-dev only. Database access is the local postgres role over the Unix socket (peer auth;
  * no DSN or password anywhere) in a read-only session with a 5 s statement timeout; every query is
@@ -147,7 +148,7 @@ function collect(seed: Iterable<string>, query: typeof psql, deadline: number): 
     )
     q(
       'usage_records',
-      `SELECT request_id, dispatch_id, attempt_no, status, model, cost_credits, error_msg IS NOT NULL AS has_error, created_at
+      `SELECT id, request_id, dispatch_id, attempt_no, status, model, cost_credits, error_msg IS NOT NULL AS has_error, created_at
          FROM usage_records WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[]) ORDER BY created_at, request_id`,
     )
     q(
@@ -168,6 +169,28 @@ function collect(seed: Iterable<string>, query: typeof psql, deadline: number): 
     if (ids.size === before) break
     if (round === 3) incomplete.push('database-closure-incomplete')
   }
+  // The chain's billing end (pilot, plan §9.4): ledger rows written for these usage rows. Debits and
+  // refunds both reference the usage row id; ledger ids never seed id discovery.
+  const usageIds = (rows.usage_records ?? [])
+    .map((r) => r.id ?? '')
+    .filter((id) => /^\d+$/.test(id))
+  if (usageIds.length) {
+    const remaining = Math.min(5000, deadline - Date.now())
+    if (remaining <= 0) incomplete.push('trace-deadline')
+    else
+      try {
+        const r = query(
+          `SELECT id AS ledger_id, ref_id AS usage_id, reason, bucket, created_at
+             FROM credit_ledger WHERE ref_type = 'usage_record' AND ref_id = ANY(:'uids'::text[]) ORDER BY created_at, id LIMIT ${ROW_CAP + 1}`,
+          { uids: asArray(usageIds) },
+          remaining,
+        )
+        if (r.length > ROW_CAP) truncated.push('credit_ledger')
+        rows.credit_ledger = r.slice(0, ROW_CAP)
+      } catch {
+        incomplete.push('credit_ledger:database-read-failed')
+      }
+  }
   return { ids, rows, truncated, incomplete }
 }
 
@@ -184,6 +207,7 @@ function mergeFound(previous: Found, next: Found): Found {
     usage_records: ['request_id', 'attempt_no', 'created_at'],
     turn_upstream_performance: ['request_id', 'dispatch_id', 'observed_at'],
     turn_runtime_observations: ['event_id'],
+    credit_ledger: ['ledger_id'],
   }
   const rows = { ...previous.rows }
   for (const [source, incoming] of Object.entries(next.rows) as [
@@ -389,11 +413,13 @@ function print(r: Awaited<ReturnType<typeof trace>>, verbose: boolean) {
   console.log(redactText(out.join('\n'), 1 << 20))
 }
 
-async function drill(n: number, json: boolean) {
+async function drill(n: number, json: boolean, model = '') {
+  // --model narrows the drill to one chain (pilot, plan §9.4: one provider's turns)
   const rows = psql(
     `SELECT dispatch_id, failure_code FROM turn_dispatches WHERE terminal_at IS NOT NULL AND (outcome IN ('crashed', 'executed_error', 'not_accepted') OR (failure_code IS NOT NULL AND failure_code <> 'USER_CANCELLED'))
+        AND (:'model' = '' OR model = :'model')
       ORDER BY terminal_at DESC LIMIT :n`,
-    { n: String(n) },
+    { n: String(n), model },
   )
   const results = []
   for (const r of rows) {
@@ -432,11 +458,18 @@ async function main() {
   const argv = process.argv.slice(2)
   const json = argv.includes('--json')
   const di = argv.indexOf('--drill')
-  if (di >= 0) return drill(Math.min(100, Math.max(1, Number(argv[di + 1] ?? 20) || 20)), json)
+  const mi = argv.indexOf('--model')
+  const model = mi >= 0 ? (argv[mi + 1] ?? '') : ''
+  if (model && !/^[0-9A-Za-z._-]{1,64}$/.test(model)) {
+    console.error(`not a model id: ${JSON.stringify(model)}`)
+    process.exit(2)
+  }
+  if (di >= 0)
+    return drill(Math.min(100, Math.max(1, Number(argv[di + 1] ?? 20) || 20)), json, model)
   const id = argv.find((a) => !a.startsWith('--'))
   if (!id) {
     console.error(
-      'usage: oc-trace.ts <traceId|dispatchId|requestId> [--verbose] [--json] | --drill N',
+      'usage: oc-trace.ts <traceId|dispatchId|requestId> [--verbose] [--json] | --drill N [--model ID]',
     )
     process.exit(2)
   }
