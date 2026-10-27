@@ -218,9 +218,11 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     cbRef.current.onClearAuth();
   }, [setUser]);
   // AuthSession.expire 的 UI 收尾。本页原本已登录 = 用户正在用时被踢（OCV5-636：体验官只看到
-  // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。
+  // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。启动续期判定本浏览器
+  // 凭证已被替换（OCV5-638）同样提示：用户上一刻还是登录的。
+  const supersededBootRef = useRef(false);
   expiredUiRef.current = () => {
-    const wasAuthed = authedRef.current;
+    const wasAuthed = authedRef.current || supersededBootRef.current;
     clearAuthState();
     if (!wasAuthed) return;
     setAuthError(SESSION_EXPIRED_MESSAGE);
@@ -307,6 +309,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
     const bootEpoch = session.snapshot().epoch;
     void (async () => {
       let refreshAttempt = 0;
+      let supersededFlights = 0;
       while (!controller.signal.aborted && session.snapshot().epoch === bootEpoch) {
         const outcome = await api.refresh(session, bootEpoch);
         if (controller.signal.aborted) return;
@@ -331,7 +334,17 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
           }
           const localBackoff = AUTH_RECOVERY_BACKOFF_MS[Math.min(refreshAttempt, AUTH_RECOVERY_BACKOFF_MS.length - 1)];
           refreshAttempt += 1;
+          if (outcome.superseded) supersededFlights += 1;
           if (refreshAttempt >= 2) {
+            // 两轮都是 REFRESH_RACE 阶梯耗尽（OCV5-638）：不是网络问题，本浏览器的 cookie 已被换掉、
+            // 不会自愈；继续重试（含用户按「重试」/F5）只会撞到服务端宽限期满被判盗用，转圈约 45 秒
+            // 后无提示落到营销首页。直接结束会话，打开登录表单说明原因。
+            if (supersededFlights >= 2) {
+              supersededBootRef.current = true;
+              session.expire(bootEpoch);
+              supersededBootRef.current = false;
+              return;
+            }
             setAuthError("登录状态恢复失败，请检查网络后重试");
             setAuthRecoveryAvailable(true);
             setBooting(false);

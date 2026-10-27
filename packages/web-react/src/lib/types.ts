@@ -292,7 +292,9 @@ export type RefreshOutcome =
   | { kind: "invalid"; epoch: number }
   // throttled=true 表示限频早返(nextAllowedAt 未到,本次没发真实网络请求):不是新的失败
   // 证据,消费方不得计入重试次数,只补睡 retryAfterMs(两层时钟亚毫秒错位的收口语义)。
-  | { kind: "transient"; epoch: number; retryAfterMs: number; throttled?: boolean }
+  // superseded=true 表示整段 REFRESH_RACE 阶梯都没等到新 cookie:跨 tab 锁内仍撞 race,说明本浏览器
+  // 带的 refresh cookie 已被更早一次续期换掉、新 cookie 没落地,不会自愈(OCV5-638)。
+  | { kind: "transient"; epoch: number; retryAfterMs: number; throttled?: boolean; superseded?: boolean }
   | { kind: "stale"; epoch: number };
 
 /** 注册（POST /api/auth/register，201）。 */

@@ -36,7 +36,7 @@ type RawRefreshOutcome =
   | { kind: "success"; result: RefreshResult; raceObserved?: boolean }
   | { kind: "invalid"; raceObserved?: boolean }
   | { kind: "race" }
-  | { kind: "transient"; retryAfterMs: number; raceObserved?: boolean };
+  | { kind: "transient"; retryAfterMs: number; raceObserved?: boolean; superseded?: boolean };
 
 export type RefreshSurface = "auth" | "admin_auth" | "ws_auth";
 
@@ -162,7 +162,7 @@ async function refreshWithRaceRetry(signal: AbortSignal): Promise<RawRefreshOutc
     outcome = await refreshAttempt(signal);
   }
   return outcome.kind === "race"
-    ? { kind: "transient", retryAfterMs: 0, raceObserved: true }
+    ? { kind: "transient", retryAfterMs: 0, raceObserved: true, superseded: true }
     : raceObserved
       ? { ...outcome, raceObserved: true }
       : outcome;
@@ -267,7 +267,9 @@ export function refreshAuth(
       a.snapshot().token,
     );
     state.friction = { id, code, attempts, surface: prior?.surface ?? surface };
-    return { kind: "transient", epoch: expectedEpoch, retryAfterMs };
+    return raw.kind === "transient" && raw.superseded
+      ? { kind: "transient", epoch: expectedEpoch, retryAfterMs, superseded: true }
+      : { kind: "transient", epoch: expectedEpoch, retryAfterMs };
     });
   }).finally(() => {
     if (timeout) clearTimeout(timeout);
