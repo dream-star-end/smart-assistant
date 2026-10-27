@@ -540,6 +540,9 @@ export function makeAnthropicProxyHandler(
       return;
     }
     let releaseSlot: () => void = sharedSlot;
+    // Set once credits are reserved. The finally below aborts it: a no-op once an exit path has
+    // released it or the finalizer owns it, so it only acts when an exception escaped in between.
+    let openedSettlement: SettlementUnit | undefined;
 
     try {
       // 4) 读 + parse + 校验 body.
@@ -1434,6 +1437,7 @@ export function makeAnthropicProxyHandler(
           ...(route.kind === "box"
             ? { ttlSeconds: BOX_TOOL_MAX_WALL_MS / 1000 + 300 } : {}),
         }, userLog);
+        openedSettlement = settlement;
       } catch (err) {
         if (err instanceof InsufficientCreditsError) {
           userLog.warn("proxy_insufficient_credits", {
@@ -1988,6 +1992,9 @@ export function makeAnthropicProxyHandler(
       });
     } finally {
       releaseSlot();
+      // An exception between reserve and hand-off (e.g. pickUpstream throwing an error it does not
+      // classify) used to leave the reservation until its TTL expired.
+      await openedSettlement?.abort();
     }
   };
 }
