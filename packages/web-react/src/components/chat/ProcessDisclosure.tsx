@@ -32,7 +32,7 @@ import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimings
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn } from "../../lib/utils";
-import { toolChangedFileCount } from "./workPane";
+import { isPaneStep, toolChangedFileCount } from "./workPane";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -958,11 +958,13 @@ function earliestRunningSince(messages: readonly ChatMessage[], turnStartedAt: n
   return since;
 }
 
+// 与右栏「N 步」同口径(OCV5-640):只数工具调用。以前思考、计划、子任务也各算一步,同一轮聊天写
+// 「已执行 28 个步骤」、面板写「17 步」;那些种类仍在分类小计里露出。
 function stepItemCount<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): number {
   let count = 0;
   for (const section of sections) {
     if (section.narrative) continue;
-    for (const item of section.items) if (firstCounted(messagesOf(item))) count += 1;
+    for (const item of section.items) count += messagesOf(item).filter(isPaneStep).length;
   }
   return count;
 }

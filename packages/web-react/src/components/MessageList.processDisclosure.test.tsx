@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
+import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
 import { preloadToolBody } from "./tool/lazyToolBody";
@@ -2513,4 +2514,43 @@ test("OCV5-525: hidden next tail leaves the task summary visible outside the ste
   view.rerender(<MessageList processDisclosure messages={JSON.parse(JSON.stringify(rows))} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
   expect(await screen.findByText("方案已复核，修改已推送。")).toBeInTheDocument();
   expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+});
+
+// OCV5-640：同一轮聊天写「已执行 28 个步骤」、右栏写「17 步」。两处都只数工具调用；思考 / 子任务只进分类小计。
+test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只数工具调用", () => {
+  const messages = [
+    row("u1", "user", "核对库存", { status: "replied" }),
+    row("think-1", "thinking", "先看目录", { _clientMessageId: "u1" }),
+    row("bash-1", "tool", "终端", {
+      _clientMessageId: "u1",
+      toolName: "Bash",
+      inputJson: { command: "ls stock" },
+      _completed: true,
+      output: "a.csv",
+    }),
+    row("think-2", "thinking", "再读文件", { _clientMessageId: "u1" }),
+    row("child-1", "agent-group", "已经结束的子任务", {
+      _clientMessageId: "u1",
+      _completed: true,
+      _delegateStatus: "ok",
+      _delegate: true,
+    }),
+    row("read-1", "tool", "读取", {
+      _clientMessageId: "u1",
+      toolName: "Read",
+      inputJson: { file_path: "stock/a.csv" },
+      _completed: true,
+      output: "sku,qty",
+    }),
+    row("think-3", "thinking", "整理结论", { _clientMessageId: "u1" }),
+    row("answer-1", "assistant", "库存正常", { _clientMessageId: "u1" }),
+  ];
+  renderList(messages);
+  const panelSteps = collectPaneSteps(messages).turns[0]?.steps.length;
+  expect(panelSteps).toBe(2);
+  expect(screen.getByTestId("process-title")).toHaveTextContent(`已执行 ${panelSteps} 个步骤`);
+  // 思考和子任务没有消失，仍在分类小计里。
+  const tally = screen.getByTestId("process-tally");
+  expect(within(tally).getByTitle("思考 3")).toBeInTheDocument();
+  expect(within(tally).getByTitle("子任务 1")).toBeInTheDocument();
 });
