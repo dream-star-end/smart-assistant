@@ -117,6 +117,21 @@ describe('decide (OCV5-591 A2-1a)', () => {
     assert.deepEqual(d.dispatch.exclude, ['gpt-image'])
   })
 
+  it('a failed provider is excluded only inside its retry window; the user pick opens a new one (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)', () => {
+    const failed = take({ id: 'v1', ownerKind: 'shot_video', version: 1, provider: 'muse-video', status: 'failed', blobSha: null })
+    const shot = { id: 's0', ordinal: 0, status: 'generating' as const, activeTakeId: null, frameTakeId: 'f1' }
+    const videoDispatch = (s: DState) => {
+      const d = decide(s).find((a) => a.type === 'dispatch' && a.dispatch.ownerKind === 'shot_video')
+      assert.ok(d && d.type === 'dispatch', 'a video is dispatched')
+      return d.dispatch
+    }
+    // Automatic retries within one window still skip the provider that just failed.
+    assert.deepEqual(videoDispatch(state({ shots: [shot], takes: [take({ id: 'f1' }), failed] })).exclude, ['muse-video'])
+    // After the pick (redo.video = 2) the earlier failure no longer excludes the only video provider.
+    const picked = state({ shots: [{ ...shot, redo: { frame: 0, video: 2 } }], takes: [take({ id: 'f1' }), failed] })
+    assert.deepEqual(videoDispatch(picked).exclude, [], 'the failed provider is tried again')
+  })
+
   it('a shot is done only with an adopted succeeded video (a frame never counts)', () => {
     const frameOnly = state({
       shots: [{ id: 's0', ordinal: 0, status: 'ready', activeTakeId: 'f1', frameTakeId: null }],
