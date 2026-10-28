@@ -8891,6 +8891,65 @@
           "assertion": "after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)"
         }
       ]
+    },
+    {
+      "id": "INC-20261028-BOX-TERMINAL-UNPROVEN",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "2026-10-27 商业续跑叶 414e8b6b 停在 continuation_unknown：终态证明读失败后，坏的 stop.ready 握手或只能 stat 的 terminal.json 让存活探针在扫 /proc 之前退出，boxRunAbsent 一次都没写下，叶在 inflight 约 96 分钟。可读的 worker_complete 仍只走原证明路径，不能记成成功。",
+      "rootFixCommit": "1953f2a1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunLiveness.test.ts",
+          "assertion": "a bad stop.ready handshake does not block the process scan"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunLiveness.test.ts",
+          "assertion": "a stat-only terminal.json plus a bad stop.ready does not skip the process scan"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "stat-only terminal.json and a bad stop.ready still close a gone run on two real looks after restart"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "a stop.ready exit 125 does not block two real absences, and one absence stays pending"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "a live process stays pending when terminal.json only stats and stop.ready is not a handshake"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "an unreadable liveness probe stays pending and is logged apart from alive or absent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "a restarted worker closes immediately when the persisted absence boot changed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "BOX_TOOL_TERMINAL_UNPROVEN stops once through the bounded echo path and does not complete the chain"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-terminal-unproven-probe.ts",
+          "assertion": "[inc-20261028-box-terminal-unproven-probe] PASS — a stat-only terminal.json and a bad stop.ready do not skip the real process scan, and a live process stays alive"
+        }
+      ]
     }
   ]
 }
