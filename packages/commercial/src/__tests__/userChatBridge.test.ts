@@ -4569,6 +4569,40 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     userId: uid, sessionId: SESSION, clientMessageId: CMID, status: "accepted", outcome: null,
   });
 
+  test("两个在线标签共享 WS、各收到会话帧和快照,同一帧仅落库一次", async () => {
+    const { rig, persisted } = await linkRig(acceptedRow("1207"));
+    try {
+      const first = await connect(rig, "1207");
+      const second = openClient(rig.gatewayPort, await makeJwt("1207"));
+      const received: Record<string, unknown>[][] = [[], []];
+      for (const [index, socket] of [first.ws, second].entries()) {
+        socket.on("message", (data) => received[index]!.push(JSON.parse(String(data))));
+      }
+      await new Promise<void>((resolve) => second.once("open", resolve));
+      await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2);
+      const hello = JSON.stringify({ type: "inbound.hello", peers: [{ peerId: SESSION, agentId: "main", lastFrameSeq: 999 }] });
+      first.ws.send(hello);
+      second.send(hello);
+      await waitFor(() => rig.containerSeen.filter((entry) => JSON.parse(String(entry.data)).type === "inbound.hello").length === 2);
+      first.container.send(frame(1));
+      first.container.send(JSON.stringify({ type: "outbound.turn_status", peer: { id: SESSION, kind: "dm" }, status: null, marker: "shared-status" }));
+      first.container.send(JSON.stringify({ type: "outbound.prompt_queue.snapshot", owner: { clientSessionId: SESSION }, items: [], marker: "shared-queue" }));
+      await waitFor(() => persisted.length === 1 && received.every((frames) =>
+        frames.some((value) => value.frameSeq === 1) &&
+        frames.some((value) => value.marker === "shared-status") &&
+        frames.some((value) => value.marker === "shared-queue")));
+      assert.equal(rig.containerSockets.length, 1);
+      assert.deepEqual(persisted, [1]);
+      for (const frames of received) {
+        assert.equal(frames.filter((value) => value.frameSeq === 1).length, 1);
+        assert.equal(frames.filter((value) => value.marker === "shared-status").length, 1);
+        assert.equal(frames.filter((value) => value.marker === "shared-queue").length, 1);
+      }
+      first.ws.close();
+      second.close();
+    } finally { await stopRig(rig); }
+  });
+
   test("drain 到期仍在跑 → 容器 WS 不关、断线期帧继续落库;isFinal 后收尾", async () => {
     const { rig, persisted, renewals } = await linkRig(acceptedRow("1201"));
     try {
