@@ -594,6 +594,7 @@ const ERROR_LABELS: Record<string, string> = {
   internal_error: "服务内部错误",
   auth_error: "认证状态异常",
   platform_credential_expired: "平台临时凭证已过期",
+  box_capacity_held: "上一轮仍在收尾",
   service_restart: "服务重启，本轮已中断",
   session_persist_unavailable: "消息暂未安全送达",
   session_deleted: "会话已删除",

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxRemoteCleanupWorker } from "./boxRemoteCleanupWorker.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BoxExecTransport } from "./boxExecTransport.js";
 
 const candidate = { requestId: "box-final", uid: 3n, accountId: 20n,
   runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
@@ -588,6 +589,52 @@ test("OCV5-488 the journal's refusal keeps the run pending and releases nothing"
     assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 }, code);
     assert.deepEqual(f.released, [], code);
   }
+});
+
+// OCV5-649 (10-28 commercial uid 4, account 79): the look passed a response
+// cap the real transport refuses before sending, so closeAbsent never closed a
+// run in production and a gone run held its session for the full 4h15m.
+test("OCV5-649 the liveness look passes the real transport argument check", async () => {
+  const sequence: string[] = [];
+  const frame = (value: unknown, flag = 0): Buffer => {
+    const raw = Buffer.from(JSON.stringify(value));
+    const out = Buffer.alloc(5 + raw.length);
+    out[0] = flag;
+    out.writeUInt32BE(raw.length, 1);
+    raw.copy(out, 5);
+    return out;
+  };
+  const reply = (...parts: Buffer[]): Response => new Response(new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(Buffer.concat(parts)); controller.close(); } }), { status: 200 });
+  const exec = new BoxExecTransport({ execUrl: "https://box.example.test/connect.exec.v1.ExecService/Exec",
+    execToken: "synthetic-exec", networkToken: "synthetic-network" }, async (_url, init) => {
+    const args = (JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString("utf8")) as
+      { args: string[] }).args;
+    if (args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
+      sequence.push("proof-read");
+      return reply(frame({ exitEvent: { exitCode: 1 } }), frame({}, 2));
+    }
+    sequence.push("look");
+    return reply(frame({ stdoutEvent: { data: `absent ${BOOT}\n` } }), frame({ exitEvent: {} }), frame({}, 2));
+  }, async () => {});
+  const probe = { requestId: "box-gone", uid: 4n, accountId: 79n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false };
+  const worker = new BoxRemoteCleanupWorker({
+    holds: { recordRunAbsence: async () => { sequence.push("record"); return null; },
+      clearRunAbsence: async () => { sequence.push("clear"); } } as never,
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async () => { throw new Error("no proof exists"); },
+      markToolChainStoppedFailure: async () => { throw new Error("no proof exists"); },
+      markRunExpiredUnproven: async () => { throw new Error("first look only records"); },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); } } as never,
+    resolver: { resolve: async () => ({ accountId: 79n, exec,
+      dispose: async () => { sequence.push("dispose"); } }) as never } as never,
+  });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(sequence, ["proof-read", "look", "record", "dispose"]);
 });
 
 // OCV5-488 (10-17 commercial uid 4): its container was rebuilt at 07:53 while
