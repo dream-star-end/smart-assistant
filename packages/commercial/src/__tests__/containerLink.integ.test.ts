@@ -10,6 +10,7 @@ import type { Pool } from "pg";
 import { createUserChatBridge, type UserChatBridgeDeps } from "../ws/userChatBridge.js";
 import { resolveContainerLinkEndpoint } from "../ws/containerLinkEndpoint.js";
 import { recordContainerLinkGap, scanContainerLinkCarriers } from "../ws/containerLinkRecoveryStore.js";
+import { createLogger } from "../logging/logger.js";
 
 const restoredDispatch = "22222222-2222-4222-8222-222222222222";
 const restoredKey = `dispatch:${restoredDispatch}:1`;
@@ -60,10 +61,13 @@ async function recoveryRig(client: Client, receive: (ws: WebSocket, frame: Recor
   });
   await client.query("UPDATE agent_containers SET port=$1", [(server.address() as { port: number }).port]);
   const persisted: number[] = [];
+  const events: string[] = [];
   let activity = 0;
   const bridge = createUserChatBridge({
     jwtSecret: "rebuild-only-fixture-secret-32-bytes",
-    containerLinkEnabled: true, containerLinkHeartbeatMs: 20,
+    logger: createLogger({ out: line => events.push(line) }),
+    // Real PG and low-priority shared hosts cannot promise a 60ms liveness window.
+    containerLinkEnabled: true, containerLinkHeartbeatMs: 500,
     containerLinkRecovery: { spacingMs: 1, retryMs: 1, maxAttempts: 3 },
     resolveContainerEndpoint: async () => { throw new Error("recovery must never provision"); },
     resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(client, "v5", uid, cid),
@@ -80,7 +84,7 @@ async function recoveryRig(client: Client, receive: (ws: WebSocket, frame: Recor
     },
     ...extra,
   });
-  return { bridge, sockets, persisted, activity: () => activity,
+  return { bridge, sockets, persisted, events, activity: () => activity,
     stop: async () => { await bridge.shutdown(); for (const socket of sockets) socket.terminate(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 
@@ -152,6 +156,7 @@ test("startup rebuild without browser replays PG cursor and renews accepted; tra
     await eventually(() => rig.persisted.length === 1);
     await eventually(async () => (await client.query("SELECT lease_until > NOW() AS renewed FROM turn_dispatches")).rows[0].renewed);
     assert.deepEqual(hellos, [0]);
+    assert.equal(rig.bridge.containerLinkSnapshots!().length, 1, rig.events.join("\n"));
     assert.equal(rig.bridge.containerLinkSnapshots!()[0]!.subscribers, 0);
     assert.equal(rig.activity(), 0);
     rig.sockets[0]!.terminate();
@@ -193,7 +198,7 @@ test("vanished container is neither provisioned nor retried and restored admitte
     await client.query("UPDATE turn_dispatches SET status='admitted'");
     await rig.bridge.rebuildContainerLinks!();
     await eventually(() => hellos === 1);
-    await new Promise(resolve => setTimeout(resolve, 80));
+    await eventually(() => rig.events.filter(line => JSON.parse(line).msg === "container-link: heartbeat").length >= 2);
     assert.equal((await client.query("SELECT lease_until < NOW() AS expired FROM turn_dispatches")).rows[0].expired, true);
     await client.query("UPDATE agent_containers SET state='vanished'");
     rig.sockets[0]!.terminate();
