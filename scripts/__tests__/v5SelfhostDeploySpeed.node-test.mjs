@@ -14,14 +14,14 @@ function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(
 const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy.sh'),'utf8');
 const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
  const env={PATH:process.env.PATH,HOME:dir,TMPDIR:dir,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',LC_ALL:'C.UTF-8'};
  const git=(...a)=>execFileSync('git',['-C',repo,...a],{env,encoding:'utf8'}).trim();
- for(const p of['packages/web-react/src','packages/protocol/src','packages/mcp-memory/src','packages/gateway/src','scripts'])mkdirSync(join(repo,p),{recursive:true});
- const files={'packages/web-react/src/App.tsx':'app-1\n','packages/protocol/src/frames.ts':'p-1\n','packages/mcp-memory/src/toolNames.ts':'t-1\n','packages/gateway/src/x.ts':'g-1\n','package-lock.json':'{"l":1}\n','package.json':'{}\n','scripts/v5-selfhost-master-release-lib.sh':'# lib-1\n'};
+ for(const p of['packages/web-react/src','packages/protocol/src','packages/mcp-memory/src','packages/gateway/src','scripts/lib'])mkdirSync(join(repo,p),{recursive:true});
+ const files={'packages/web-react/src/App.tsx':'app-1\n','packages/protocol/src/frames.ts':'p-1\n','packages/mcp-memory/src/toolNames.ts':'t-1\n','packages/gateway/src/x.ts':'g-1\n','package-lock.json':'{"l":1}\n','package.json':'{}\n','scripts/v5-selfhost-master-release-lib.sh':'# lib-1\n','scripts/lib/v5-selfhost-prewarm.sh':'# prewarm-1\n'};
  execFileSync('git',['init','-q',repo],{env});git('config','user.name','t');git('config','user.email','t@example.invalid');
  for(const[k,v]of Object.entries(files))writeFileSync(join(repo,k),v);git('add','.');git('commit','-qm','base');
  const commit=(path,content)=>{writeFileSync(join(repo,path),content);git('commit','-qam','c '+path);return git('rev-parse','HEAD');};
@@ -45,7 +45,7 @@ test('web dist key changes with every web build input and ignores unrelated back
  const f=fixture(t);const k0=key(f,f.base);assert.match(k0,/^[0-9a-f]{64}$/);
  const gw=f.commit('packages/gateway/src/x.ts','g-2\n');assert.equal(key(f,gw),k0,'gateway-only change must keep the key');
  let prev=k0;
- for(const p of['packages/web-react/src/App.tsx','packages/protocol/src/frames.ts','packages/mcp-memory/src/toolNames.ts','package-lock.json','package.json','scripts/v5-selfhost-master-release-lib.sh']){
+ for(const p of['packages/web-react/src/App.tsx','packages/protocol/src/frames.ts','packages/mcp-memory/src/toolNames.ts','package-lock.json','package.json','scripts/v5-selfhost-master-release-lib.sh','scripts/lib/v5-selfhost-prewarm.sh']){
   const sha=f.commit(p,'changed '+p+'\n');const k=key(f,sha);assert.notEqual(k,prev,p+' must change the key');prev=k;
  }
  assert.equal(bash(f,webLib,'master_web_dist_key 0000000000000000000000000000000000000000').status===0,false,'unknown sha must not produce a key');

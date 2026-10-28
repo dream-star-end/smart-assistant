@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/v5-lease-lib.sh
 source "$SCRIPT_DIR/v5-lease-lib.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 # OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
 # shellcheck source=scripts/v5-selfhost-autorecover.sh
 source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
@@ -334,6 +335,9 @@ dispatch_train() {
     exec 8>&-; return 0
   fi
 
+  # 持官方锁阻止新预热准入;停净专用预热 cgroup 后才允许 planned 入库。
+  prewarm_quiesce "$LEASE_DEPLOY_LOCK" || { wlog "预热未停净,下 tick 重试"; exec 8>&-; return 0; }
+
   # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)。
   # OCV5-439:落后时在 deploy.lock 内自动快进;不能快进就告警、不覆盖、不发车。
   local head; head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD)"
@@ -601,5 +605,6 @@ main() {
   dispatch_train
   deliver_outbox
   flush_task_spool
+  prewarm_idle_tick || wlog "预热调度失败(不影响列车/投递)"
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -772,7 +772,7 @@ write_master_version_json() { # <staging> <short-sha>
 #   packages/protocol 整棵 tree(@openclaude/protocol 依赖)
 #   packages/mcp-memory/src(web-react 唯一越包相对 import:mcp-memory/src/toolNames)
 #   根 package-lock.json / package.json(依赖版本)
-#   本文件自身(构建步骤一变就作废所有旧 key)
+#   本文件与 selfhost prewarm 库(任一构建步骤改变即作废旧 key)
 #   node --version
 #   构建进程环境里会进产物的变量:VITE_*(Vite 编译期内联)、NODE_ENV、BROWSERSLIST*
 # donor 必须是完整封存的 release:.complete 结构合法、根 0:0 且不可组/他写、release_artifact_digest
@@ -787,6 +787,7 @@ WEB_DIST_KEY_PATHS=(
   package-lock.json
   package.json
   scripts/v5-selfhost-master-release-lib.sh
+  scripts/lib/v5-selfhost-prewarm.sh
 )
 
 master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 → rc=1(调用方照常构建)
@@ -813,6 +814,17 @@ web_dist_digest() { # <dist-dir> → stdout 64-hex(相对路径 + 内容;拒绝�
 
 # stdout 只打印可复用 dist 的 release 绝对路径;找不到 rc=1。日志走 stderr。
 # 候选:live 优先,其次最近的已封存 rel-*(最多 8 份);拒绝 .poisoned / 缺 .complete / 记录不符 / 摘要不符。
+copy_verified_web_dist() { # <donor-root> <staging-root>; freeze evidence BEFORE verification/copy.
+  local donor="$1" staging="$2" expected got
+  [[ ! -e "$staging/packages/web-react/dist" && ! -L "$staging/packages/web-react/dist" ]] || return 1
+  expected="$(jq -er .distDigest "$donor/$WEB_DIST_REUSE_RECORD")" || return 1
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  web_dist_donor_sealed "$donor" || return 1
+  cp -a -- "$donor/packages/web-react/dist" "$staging/packages/web-react/dist" || return 1
+  got="$(web_dist_digest "$staging/packages/web-react/dist")" || return 1
+  [[ "$got" == "$expected" ]]
+}
+
 web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改动
   local rel="$1" marker schema commit art root_uid root_gid root_mode got
   marker="$rel/.complete"
@@ -829,6 +841,7 @@ web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改�
 
 find_web_dist_donor() { # <key>
   local key="$1" cand rec rkey rdigest got live=""
+  if declare -F prewarm_web_donor >/dev/null && prewarm_web_donor "$key"; then return 0; fi
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
   if [[ -L "$MASTER_LIVE_LINK" ]]; then
     live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -1165,10 +1178,9 @@ build_master_release() {
   fi
   if [[ -n "$web_donor" ]]; then
     mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
-    if [[ -e "$staging/packages/web-react/dist" ]] \
-      || ! cp -a -- "$web_donor/packages/web-react/dist" "$staging/packages/web-react/dist"; then
+    if ! copy_verified_web_dist "$web_donor" "$staging"; then
       cleanup_master_staging
-      die "复用 web dist 失败(donor=$web_donor)"
+      die "复用 web dist 失败或复制后的摘要不符(donor=$web_donor)"
     fi
     MASTER_FRONTEND_MODE="reused"
   else

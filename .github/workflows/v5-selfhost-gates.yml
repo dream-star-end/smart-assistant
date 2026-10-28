@@ -95,6 +95,12 @@ jobs:
       - name: Kernel unit tests
         run: npm run test:kernel
 
+      - name: Selfhost tip prewarm and artifact reuse regressions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sqlite3 jq rsync
+          sudo node --test scripts/__tests__/v5SelfhostPrewarm.node-test.mjs scripts/__tests__/v5SelfhostDeploySpeed.node-test.mjs scripts/__tests__/selfhostSourcePin.node-test.mjs
+
       - name: P2 trace propagation and durable evidence (OCV5-605)
         run: |
           npx tsx --test packages/gateway/src/__tests__/delegateContext.test.ts packages/gateway/src/__tests__/delegateTrace.test.ts packages/gateway/src/__tests__/delegateTraceDurable.test.ts packages/gateway/src/__tests__/delegateAsyncJobs.test.ts packages/gateway/src/__tests__/ccbTraceHeader.test.ts
