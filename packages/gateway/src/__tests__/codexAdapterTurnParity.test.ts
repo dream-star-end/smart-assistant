@@ -1797,7 +1797,7 @@ for (const outcome of ['overflow', 'stop', 'shutdown']) {
       if (req.method !== 'thread/compact/start') return;
       p.respondTo(req.id, {});
       p.notify('turn/started', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'inProgress' } });
-      if (cancelled) setImmediate(() => h.adapter.interrupt('user'));
+      if (cancelled) setImmediate(() => h.adapter.interrupt());
       else if (outcome === 'shutdown') setImmediate(() => { void h.adapter.shutdown(); });
       else p.notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'failed', error: { message: 'context window exceeded' } } });
     };

@@ -12,8 +12,9 @@ export function parseCcbContextObservation(raw: unknown): ContextObservation | n
     return { kind: 'context_pressure', pressure: { engine, scope, dimension, level, usedRatio } }
   }
   if (event.kind === 'context_compacted' && Value.Check(ContextCompaction, event.compaction)) {
+    if (event.compaction.strategy !== 'file_reference') return null
     const { engine, scope, strategy, beforeBytes, afterBytes, droppedEntries } = event.compaction
-    if (engine !== 'claude-code' || scope !== 'native_context' || strategy !== 'file_reference' || droppedEntries !== 0) return null
+    if (engine !== 'claude-code' || scope !== 'native_context' || droppedEntries !== 0) return null
     return { kind: 'context_compacted', compaction: { engine, scope, strategy, beforeBytes, afterBytes, droppedEntries } }
   }
   return null
