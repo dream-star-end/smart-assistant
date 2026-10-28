@@ -1,5 +1,5 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { contextBytePressure } from '@openclaude/protocol'
+import { writeContextReference } from './contextReference.js'
 import type { EngineContentEvent } from './engineEvents.js'
 import { fitHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
 
@@ -17,12 +17,8 @@ export async function prepareBoundedPrompt(opts: {
   const bytes = (input: string): number => Buffer.byteLength(opts.serialize(input), 'utf8')
   const beforeBytes = bytes(opts.input)
   const usedRatio = beforeBytes / opts.maxBytes
-  if (usedRatio >= 0.8) {
-    opts.onEvent({ kind: 'context_pressure', pressure: {
-      engine: opts.engine, scope: 'launch_prompt', dimension: 'transport_bytes',
-      level: usedRatio >= 1 ? 'critical' : 'warning', usedRatio,
-    } })
-  }
+  const pressure = contextBytePressure(opts.engine, 'launch_prompt', usedRatio)
+  if (pressure) opts.onEvent(pressure)
   if (beforeBytes <= opts.maxBytes) return opts.serialize(opts.input)
 
   const fitted = fitHistoricalContextJsonPrompt(opts.input, (input) => bytes(input) <= opts.maxBytes)
@@ -36,8 +32,8 @@ export async function prepareBoundedPrompt(opts: {
   } else {
     // Keep the complete input (including any injected history), not a clipped
     // preview. mkdtemp + exclusive create cannot overwrite workspace files.
-    const dir = await mkdtemp(join(opts.cwd, '.openclaude-context-'))
-    const file = join(dir, 'input.txt')
+    const reference = await writeContextReference(opts.cwd, opts.input, 'input.txt')
+    const file = reference.file
     input = [
       'The complete input for this turn is stored in the UTF-8 file below because it exceeds the launch transport limit.',
       `Input file: ${JSON.stringify(file)}`,
@@ -48,9 +44,8 @@ export async function prepareBoundedPrompt(opts: {
       if (bytes(input) > opts.maxBytes) {
         throw new Error('PAYLOAD_TOO_LARGE: platform prompt envelope exceeds the launch byte budget')
       }
-      await writeFile(file, opts.input, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     } catch (error) {
-      await rm(dir, { recursive: true, force: true })
+      await reference.remove()
       throw error
     }
     strategy = 'file_reference'

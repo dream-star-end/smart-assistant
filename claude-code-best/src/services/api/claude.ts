@@ -89,7 +89,7 @@ import {
   getSmallFastModel,
   isNonCustomOpusModel,
 } from '../../utils/model/model.js'
-import { boxNativeRemoteContextOwnsHistory } from '../../utils/model/boxNativeRemoteContext.js'
+import { BOX_NATIVE_CONTEXT_MODELS, boxNativeRemoteContextOwnsHistory } from '../../utils/model/boxNativeRemoteContext.js'
 import { sendWithBoxContextTransport } from '../../utils/model/boxContextTransport.js'
 import {
   asSystemPrompt,
@@ -1331,14 +1331,12 @@ async function* queryModel(
     messagesForAPI = stripAdvisorBlocks(messagesForAPI)
   }
 
-  // Strip excess media items before making the API call.
-  // The API rejects requests with >100 media items but returns a confusing error.
-  // Rather than erroring (which is hard to recover from in Cowork/CCD), we
-  // silently drop the oldest media items to stay within the limit.
-  messagesForAPI = stripExcessMediaItems(
-    messagesForAPI,
-    API_MAX_MEDIA_PER_REQUEST,
-  )
+  // Ordinary platform requests retain media until the final byte fitter can
+  // preserve it as files. Other providers and Box retain their existing policy.
+  if (!process.env.OPENCLAUDE_SESSION_KEY || getAPIProvider() !== 'firstParty' ||
+    BOX_NATIVE_CONTEXT_MODELS.includes(options.model) || !toolSchemas.some(t => t.name === 'Read')) {
+    messagesForAPI = stripExcessMediaItems(messagesForAPI, API_MAX_MEDIA_PER_REQUEST)
+  }
 
   // OpenAI-compatible provider: delegate to the OpenAI adapter layer
   // after shared preprocessing (message normalization, tool filtering,
