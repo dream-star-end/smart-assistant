@@ -1,3 +1,4 @@
+import { parseCcbContextObservation } from './ccbContextObservation.js'
 /**
  * CcbMessageParser — parses stream-json output from CCB subprocess
  * and emits structured SessionStreamEvent events.
@@ -788,6 +789,11 @@ export class CcbMessageParser {
     //     CCB raw status string is **not** transparently forwarded — only the
     //     mapped values cross the protocol boundary.
     if (msg.type === 'system') {
+      if (raw.subtype === 'context_observation') {
+        const observation = parseCcbContextObservation(raw.observation)
+        if (observation) this.onEvent(observation)
+        return
+      }
       if (raw.subtype === 'compact_boundary') {
         this.sawCompactBoundary = true
         const meta = raw.compact_metadata

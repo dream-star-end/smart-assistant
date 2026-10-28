@@ -1,3 +1,7 @@
+import { createCcbBudgetFetch } from './requestBodyBudget.js'
+import { BOX_NATIVE_CONTEXT_MODELS } from '../../utils/model/boxNativeRemoteContext.js'
+import { getCwd } from '../../utils/cwd.js'
+import { enqueueSdkEvent } from '../../utils/sdkEventQueue.js'
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
 import type { GoogleAuth } from 'google-auth-library'
@@ -360,7 +364,13 @@ function buildFetch(
   source: string | undefined,
 ): ClientOptions['fetch'] {
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
-  const inner = fetchOverride ?? globalThis.fetch
+  const inner = createCcbBudgetFetch(fetchOverride ?? globalThis.fetch, {
+    enabled: () => !!process.env.OPENCLAUDE_SESSION_KEY && getAPIProvider() === 'firstParty',
+    remoteOwnsHistory: model => BOX_NATIVE_CONTEXT_MODELS.includes(model),
+    cwd: getCwd,
+    sessionId: getSessionId,
+    onEvent: observation => enqueueSdkEvent({ type: 'system', subtype: 'context_observation', observation }),
+  })
   // Only send to the first-party API — Bedrock/Vertex/Foundry don't log it
   // and unknown headers risk rejection by strict proxies (inc-4029 class).
   const injectClientRequestId =

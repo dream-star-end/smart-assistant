@@ -13,10 +13,16 @@ export type ContextPressure = Static<typeof ContextPressure>
 /** A completed context transformation. file_reference is not a summary. */
 export const ContextCompaction = Type.Object({
   engine: Type.String(),
-  scope: Type.Literal('launch_prompt'),
+  scope: Type.Union([Type.Literal('launch_prompt'), Type.Literal('native_context')]),
   strategy: Type.Union([Type.Literal('history_suffix'), Type.Literal('file_reference')]),
   beforeBytes: Type.Integer({ minimum: 0 }),
   afterBytes: Type.Integer({ minimum: 0 }),
   droppedEntries: Type.Integer({ minimum: 0 }),
 })
 export type ContextCompaction = Static<typeof ContextCompaction>
+
+export type ContextObservation =
+  | { kind: 'context_pressure'; pressure: ContextPressure }
+  | { kind: 'context_compacted'; compaction: ContextCompaction }
+
+export { contextBytePressure } from './contextBytePressure.js'

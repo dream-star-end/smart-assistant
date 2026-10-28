@@ -1,26 +1,9 @@
 // Pure display formatters — leaf-safe (no Ink). Width-aware truncation lives in ./truncate.ts.
 
 import { getRelativeTimeFormat, getTimeZone } from './intl.js'
+import { formatFileSize } from './formatFileSize.js'
 
-/**
- * Formats a byte count to a human-readable string (KB, MB, GB).
- * @example formatFileSize(1536) → "1.5KB"
- */
-export function formatFileSize(sizeInBytes: number): string {
-  const kb = sizeInBytes / 1024
-  if (kb < 1) {
-    return `${sizeInBytes} bytes`
-  }
-  if (kb < 1024) {
-    return `${kb.toFixed(1).replace(/\.0$/, '')}KB`
-  }
-  const mb = kb / 1024
-  if (mb < 1024) {
-    return `${mb.toFixed(1).replace(/\.0$/, '')}MB`
-  }
-  const gb = mb / 1024
-  return `${gb.toFixed(1).replace(/\.0$/, '')}GB`
-}
+export { formatFileSize }
 
 /**
  * Formats milliseconds as seconds with 1 decimal place (e.g. `1234` → `"1.2s"`).
