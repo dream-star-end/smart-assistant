@@ -177,10 +177,10 @@ export function modelLabel(m: PublicModel): string {
   return typeof dn === 'string' && dn.trim() ? dn : m.id
 }
 
-function CostMark({ model }: { model?: { cost_x?: number } }) {
+function CostMark({ model, lead }: { model?: { cost_x?: number }; lead?: boolean }) {
   const label = modelCostLabel(model)
   if (!label) return null
-  return <span className="text-caption font-normal text-faint">{label}</span>
+  return <span className="shrink-0 text-caption font-normal text-faint">{lead ? `· ${label}` : label}</span>
 }
 
 function promoLabelOf(model: { promo_label?: unknown } | undefined): string | undefined {
@@ -327,6 +327,7 @@ export function ModelSelector({
   const selectedCursor = cursorPickerDef(models.find((m) => m.id === selectedId) ?? (selectedId ? { id: selectedId } : null))
   const selectedContext = contextFamilyByModelId(selectedId)
   const selectedDegraded = selected ? isDegraded(selected) : false
+  const costLabel = modelCostLabel(selected)
   const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId)
   const leaderModel = resolveTeamLeaderModel(models, teamLeaderModelId, lockedModels)
   const engineLabel = teamEngineLabel(models, teamLeaderModelId, lockedModels)
@@ -1011,7 +1012,9 @@ export function ModelSelector({
             ? `团队模式固定由队长模型 ${engineLabel} 执行与计费，关闭团队模式后可切换模型`
             : selectedDegraded
               ? '当前模型暂不可用，点击更换'
-              : undefined
+              : costLabel
+                ? `费用倍率 ${costLabel}：约为基准模型的 ${costLabel.slice(0, -1)} 倍，数字越小越省积分`
+                : undefined
       }
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
@@ -1058,7 +1061,7 @@ export function ModelSelector({
           </span>
         )
       )}
-      <CostMark model={teamEngineActive ? leaderModel : selected} />
+      <CostMark model={teamEngineActive ? leaderModel : selected} lead />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
       {!teamEngineActive && <ChevronDown size={14} className="shrink-0 text-faint" />}
     </button>

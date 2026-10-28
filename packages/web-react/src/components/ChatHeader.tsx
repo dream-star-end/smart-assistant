@@ -13,10 +13,11 @@ import {
   Search,
   Share2,
   ShieldCheck,
+  User,
   Users,
   Wallet,
 } from "lucide-react";
-import { useRef, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -63,12 +64,10 @@ export function ChatHeader({
   onSelectServiceTier,
   modelPickerOpen,
   onModelPickerOpenChange,
-  teamModeActive,
+  collabMode,
   teamLeaderModelId,
-  onDisableTeamMode,
-  advisorModeActive,
   advisorModelLabel,
-  onDisableAdvisorMode,
+  onCollabSolo,
   credits,
   onOpenBilling,
   sidebarCollapsed,
@@ -80,6 +79,7 @@ export function ChatHeader({
   onShare,
   onTogglePane,
   paneOpen = false,
+  paneOutputs = 0,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -115,19 +115,17 @@ export function ChatHeader({
   modelPickerOpen?: boolean;
   onModelPickerOpenChange?: (v: boolean) => void;
   /**
-   * 团队模式已开启且当前会话是 main（队长引擎覆盖生效）。true 时 agent 名旁显示
-   * 「团队模式」chip（点击弹说明 + 关闭入口），并让 ModelSelector 切换到如实的
-   * 队长引擎显示态。条件由 App 的 teamMode 单一状态推导，此处不持第二份状态。
+   * 当前会话实际生效的协作方式(只对 main 生效;省略 = 不适用,如其它智能体 / demo)。模型行常显一枚 chip:
+   * 单人(点开换智能体与协作方式)、顾问 / 团队(点开说明 + 关闭)。团队时 ModelSelector 切到如实的
+   * 队长引擎显示态。由 App 的协作配置单一状态推导,此处不持第二份状态。
    */
-  teamModeActive?: boolean;
+  collabMode?: "solo" | "advisor" | "team";
   /** 服务端 /api/public/models 下发的权威队长模型 id；省略时退回协议默认。 */
   teamLeaderModelId?: string;
-  /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
-  onDisableTeamMode?: () => void;
-  advisorModeActive?: boolean;
   /** Frozen advisor model id from server config, not the chat model selector. */
   advisorModelLabel?: string | null;
-  onDisableAdvisorMode?: () => void;
+  /** 顾问 / 团队 → 单人(省略则 chip 弹层不渲染关闭按钮)。 */
+  onCollabSolo?: () => void;
   /** 账户余额（积分字符串大数，来自 /api/me）。省略 / null 不渲染 pill。 */
   credits?: string | null;
   /** 点击 balance-pill 打开计费面板（省略则 pill 不可点）。 */
@@ -143,9 +141,14 @@ export function ChatHeader({
   onOpenFind?: () => void;
   /** 打开「分享会话」(长图 + 文字,OCV5-369;省略则不渲染,如 demo)。窄屏收进「更多操作」菜单。 */
   onShare?: () => void;
-  /** 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。手机上入口在过程摘要行。 */
+  /**
+   * 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。默认收起:收起时只在这一轮
+   * 有产出时出「产出 N」(手机进「⋯」),展开时给收起键(UI-2a)。
+   */
   onTogglePane?: () => void;
   paneOpen?: boolean;
+  /** 最新一轮的产出数(与产出页同源)。 */
+  paneOutputs?: number;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -160,11 +163,13 @@ export function ChatHeader({
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   const showUpdatePill = updateAvailable && !!onReloadForUpdate;
-  // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
-  // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
-  const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
-  const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
+  // 顾问 / 团队说明弹层的受控开关：点「关闭…模式」需要主动收起弹层（chip 随
+  // collabMode 翻成单人一起换掉,不控 open 会留下无锚点的浮层）。
+  const [collabPopoverOpen, setCollabPopoverOpen] = useState(false);
+  const team = collabMode === "team";
   const engineLabel = teamEngineLabel(models ?? [], teamLeaderModelId, lockedModels);
+  const showOutputs = !!onTogglePane && !paneOpen && paneOutputs > 0;
+  const projectName = projectBreadcrumb?.chatName;
   // toast 落在顶栏实测下沿之下(手机顶栏两行时也不压住模型行)。
   const headerRef = useRef<HTMLElement>(null);
   useToastAnchor(headerRef);
@@ -239,19 +244,19 @@ export function ChatHeader({
         </span>
         <ChevronDown size={15} className="hidden shrink-0 text-faint sm:block" />
       </button>
-      {projectBreadcrumb?.chatName ? (
-        // 所在项目:窄屏也显示(截断),点开项目本身,而不是管理中心。
+      {projectName ? (
+        // 所在项目:点开项目本身,而不是管理中心。手机顶栏只留 ☰ · 标题 · ⋯,项目收进「⋯」(UI-2a)。
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
-          aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
-          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-lg px-1.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[14rem] sm:px-2 sm:py-1"
-          title={`所在项目：${projectBreadcrumb.chatName}`}
+          aria-label={`所在项目：${projectName}，点击打开项目`}
+          className="hidden min-w-0 max-w-[14rem] shrink items-center gap-1 rounded-lg px-2 py-1 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:inline-flex"
+          title={`所在项目：${projectName}`}
         >
           <FolderOpen size={13} aria-hidden className="shrink-0" />
-          <span className="truncate">{projectBreadcrumb.chatName}</span>
+          <span className="truncate">{projectName}</span>
         </button>
       ) : projectSuggestion ? (
         <span
@@ -280,94 +285,72 @@ export function ChatHeader({
           </button>
         </span>
       ) : null}
-      {(teamModeActive || advisorModeActive || (models && onSelectModel) || showUpdatePill) && (
+      {(collabMode || (models && onSelectModel) || showUpdatePill) && (
         <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
           {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
-          {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
-              点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
-          {advisorModeActive && (
-            <Popover open={advisorPopoverOpen} onOpenChange={setAdvisorPopoverOpen}>
+          {/* 协作方式常显(UI-2a):单人也写出来,不让人猜走的是哪种。仅 main 会话(collabMode 有值)显示。
+              OCV5-307:44px 命中区留在透明 button 上,可见的是内层细胶囊。 */}
+          {collabMode === "solo" ? (
+            <button
+              type="button"
+              data-product-feature={PRODUCT_CAPABILITIES.agents.id}
+              onClick={onAgentClick}
+              aria-label="协作方式：单人，点击更换"
+              title="单人：当前模型独立完成。点开可换成顾问或团队"
+              className={collabHit}
+            >
+              <span className="flex items-center gap-1 rounded-full border border-border px-2.5 py-1 text-caption font-medium leading-none text-muted transition-colors group-hover:bg-hover group-hover:text-fg">
+                <User size={11} className="shrink-0" />
+                单人
+              </span>
+            </button>
+          ) : collabMode ? (
+            <Popover open={collabPopoverOpen} onOpenChange={setCollabPopoverOpen}>
               <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
-                  aria-label="顾问模式已开启"
-                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
-                >
-                  {/* OCV5-307:44px 命中区留在透明 button 上,可见的是内层细胶囊 —— 原先整颗 44px 高的色块显得笨重。 */}
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
-                    <ShieldCheck size={11} className="shrink-0" />
-                    <span className="sm:hidden">顾问</span>
-                    <span className="hidden sm:inline">顾问模式</span>
-                    {advisorModelLabel ? (
-                      <span className="hidden max-w-[8rem] truncate sm:inline" title={advisorModelLabel}>
-                        · {advisorModelLabel}
-                      </span>
-                    ) : null}
-                  </span>
-                </button>
+                {team ? (
+                  <button
+                    type="button"
+                    data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
+                    aria-label="团队模式已开启"
+                    className={collabHit}
+                  >
+                    {/* 窄屏两字；sm+ 仍用全称，桌面既有断言不红。 */}
+                    <ModeChip icon={<Users size={11} className="shrink-0" />} short="团队" full="团队模式" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
+                    aria-label="顾问模式已开启"
+                    className={collabHit}
+                  >
+                    <ModeChip icon={<ShieldCheck size={11} className="shrink-0" />} short="顾问" full="顾问模式" detail={advisorModelLabel} />
+                  </button>
+                )}
               </PopoverTrigger>
               <PopoverContent>
-                <p className="text-[12.5px] leading-relaxed text-muted">
-                  顾问模式已开启：主模型不切换
-                  {advisorModelLabel ? `；本回合固定使用 ${advisorModelLabel}` : ""}
-                  。主模型可以向顾问提问；建议必须自行验证，不能替代审批或正式审查。咨询按实际顾问型号计费，不承诺更省。
+                <p className="text-meta leading-relaxed text-muted">
+                  {team
+                    ? `团队模式已开启：队长引擎为 ${engineLabel}（计费高于默认模型），需要时会请你已安装的智能体分工，分出去的部分按各自的模型计费。`
+                    : `顾问模式已开启：主模型不切换${advisorModelLabel ? `；本回合固定使用 ${advisorModelLabel}` : ""}。主模型可以向顾问提问；建议必须自行验证，不能替代审批或正式审查。咨询按实际顾问型号计费，不承诺更省。`}
                 </p>
-                {onDisableAdvisorMode && (
+                {onCollabSolo && (
                   <Button
                     data-product-control
                     size="sm"
                     variant="secondary"
                     className="mt-2.5 w-full"
                     onClick={() => {
-                      setAdvisorPopoverOpen(false);
-                      onDisableAdvisorMode();
+                      setCollabPopoverOpen(false);
+                      onCollabSolo();
                     }}
                   >
-                    关闭顾问模式
+                    {team ? "关闭团队模式" : "关闭顾问模式"}
                   </Button>
                 )}
               </PopoverContent>
             </Popover>
-          )}
-          {teamModeActive && (
-            <Popover open={teamPopoverOpen} onOpenChange={setTeamPopoverOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
-                  aria-label="团队模式已开启"
-                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
-                >
-                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
-                    <Users size={11} className="shrink-0" />
-                    {/* 窄屏给「团队」二字；sm+ 仍用全称，桌面既有断言不红。 */}
-                    <span className="sm:hidden">团队</span>
-                    <span className="hidden sm:inline">团队模式</span>
-                  </span>
-                </button>
-              </PopoverTrigger>
-              <PopoverContent>
-                <p className="text-[12.5px] leading-relaxed text-muted">
-                  团队模式已开启：队长引擎为 {engineLabel}（计费高于默认模型），并会按需委派已安装智能体协作、按对应模型计费。
-                </p>
-                {onDisableTeamMode && (
-                  <Button
-                    data-product-control
-                    size="sm"
-                    variant="secondary"
-                    className="mt-2.5 w-full"
-                    onClick={() => {
-                      setTeamPopoverOpen(false);
-                      onDisableTeamMode();
-                    }}
-                  >
-                    关闭团队模式
-                  </Button>
-                )}
-              </PopoverContent>
-            </Popover>
-          )}
+          ) : null}
           {models && onSelectModel && (
             <ModelSelector
               models={models}
@@ -376,7 +359,7 @@ export function ChatHeader({
               onSelect={onSelectModel}
               onLockedSelect={onLockedSelect}
               loading={modelsLoading}
-              teamEngineActive={teamModeActive}
+              teamEngineActive={team}
               teamLeaderModelId={teamLeaderModelId}
               effortSupported={effortSupported}
               effortActive={effortActive}
@@ -435,8 +418,8 @@ export function ChatHeader({
             <Share2 size={18} />
           </IconButton>
         )}
-        {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
-        {onShare && (
+        {/* 窄屏顶栏放不下的入口并入「更多」菜单,功能按视口降级而不是消失(C-12):分享、产出(UI-2a)、所在项目。 */}
+        {(onShare || showOutputs || projectName) && (
           <div className="sm:hidden">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -445,10 +428,24 @@ export function ChatHeader({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem data-product-control onSelect={onShare}>
-                  <Share2 size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">分享</span>
-                </DropdownMenuItem>
+                {showOutputs && (
+                  <DropdownMenuItem data-product-control onSelect={onTogglePane}>
+                    <PanelRight size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">产出 {paneOutputs}</span>
+                  </DropdownMenuItem>
+                )}
+                {onShare && (
+                  <DropdownMenuItem data-product-control onSelect={onShare}>
+                    <Share2 size={16} className="shrink-0 text-muted" />
+                    <span className="flex-1">分享</span>
+                  </DropdownMenuItem>
+                )}
+                {projectName && (
+                  <DropdownMenuItem data-product-control="project-breadcrumb" onSelect={onOpenProjectScope}>
+                    <FolderOpen size={16} className="shrink-0 text-muted" />
+                    <span className="min-w-0 flex-1 truncate">所在项目：{projectName}</span>
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -468,6 +465,7 @@ export function ChatHeader({
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"
+            title={`余额 ${formatCredits(credits)} 积分`}
             className={`flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-full border px-2 py-1 text-meta font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
               low
                 ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
@@ -475,28 +473,64 @@ export function ChatHeader({
             } disabled:cursor-default`}
           >
             <Wallet size={13} className="shrink-0" />
-            {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
-            <span className="hidden sm:inline">{formatCredits(credits)}</span>
+            {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。余额带单位(UI-2a)。 */}
+            <span className="hidden sm:inline">{formatCredits(credits)} 积分</span>
           </button>
         )}
-        {onTogglePane && (
+        {/* 详情面板默认收起(UI-2a):收起时只在这一轮有产出时出「产出 N」;展开时给收起键。手机在「⋯」里。 */}
+        {onTogglePane && paneOpen ? (
           <IconButton
             data-product-control
             data-testid="detail-pane-toggle"
             onClick={onTogglePane}
-            aria-label="详情面板"
-            aria-pressed={paneOpen}
-            title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
+            aria-label="收起详情面板"
+            aria-pressed
+            title={`收起详情面板 (${modKeyLabel()}\\)`}
             shape="square"
             className="hidden sm:flex"
           >
-            {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
+            <PanelRightClose size={18} />
           </IconButton>
-        )}
+        ) : showOutputs ? (
+          <button
+            type="button"
+            data-product-control
+            data-testid="detail-pane-toggle"
+            onClick={onTogglePane}
+            aria-pressed={false}
+            title={`这一轮有 ${paneOutputs} 个产出，打开详情面板查看 (${modKeyLabel()}\\)`}
+            className={cn(collabHit, "hidden sm:flex")}
+          >
+            <span className="flex items-center gap-1.5 rounded-full border border-border px-2.5 py-1 text-meta font-medium leading-none text-muted transition-colors group-hover:bg-hover group-hover:text-fg">
+              <PanelRight size={13} className="shrink-0" />
+              产出 {paneOutputs}
+            </span>
+          </button>
+        ) : null}
       </div>
     </header>
   );
 }
+
+/** 顾问 / 团队的可见细胶囊(窄屏两字,sm+ 全称;顾问在 sm+ 带冻结型号)。 */
+function ModeChip({ icon, short, full, detail }: { icon: ReactNode; short: string; full: string; detail?: string | null }) {
+  return (
+    <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+      {icon}
+      <span className="sm:hidden">{short}</span>
+      <span className="hidden sm:inline">{full}</span>
+      {detail ? (
+        <span className="hidden max-w-[8rem] truncate sm:inline" title={detail}>
+          · {detail}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+/** 顶栏细胶囊的 44px 透明命中区(协作方式、产出 N)。 */
+const collabHit =
+  "group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]";
 
 /** 顶栏角标：站内信 danger、会话未读 accent。count 缺省或 ≤0 不占位。 */
 function HeaderCountBadge({

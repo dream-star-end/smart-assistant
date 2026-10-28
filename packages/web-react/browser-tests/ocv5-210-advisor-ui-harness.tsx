@@ -116,9 +116,8 @@ function Harness() {
         models={MODELS}
         selectedModelId={mainModel}
         onSelectModel={setMainModel}
-        advisorModeActive={collab.mode === "advisor" && agentId === "main"}
+        collabMode={agentId === "main" ? collab.mode : undefined}
         advisorModelLabel={collab.advisorModel}
-        teamModeActive={collab.mode === "team" && agentId === "main"}
       />
       <button type="button" data-testid="open-picker" onClick={() => setOpen(true)}>
         打开智能体选择器

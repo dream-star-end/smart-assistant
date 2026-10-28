@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { DETAIL_PANE_WIDTH } from "../components/InspectorPanel";
+import { DETAIL_PANE_WIDTH } from "./useDetailPane";
 import { useResizableWidth } from "./useResizableWidth";
 
 afterEach(() => {
