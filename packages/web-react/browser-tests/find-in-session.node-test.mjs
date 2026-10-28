@@ -41,13 +41,14 @@ function sourceEvidence() {
       "baselines/87d4554-MessageRenderer.tsx": pinnedHash,
     },
     harnessSha256: sha256(readFileSync(new URL("./find-in-session-harness.tsx", import.meta.url))),
+    pendingFenceSha256: sha256(readFileSync(new URL("./find-pending-fence.ts", import.meta.url))),
     collectorSha256: sha256(readFileSync(new URL("./find-in-session-collector.mjs", import.meta.url))),
     testSha256: sha256(readFileSync(fileURLToPath(import.meta.url))),
   };
 }
 
-function snapshot(page) {
-  return page.evaluate(() => {
+function snapshot(page, cancelAction = null) {
+  return page.evaluate((action) => {
     const scrollerEl = document.querySelector("[data-testid=find-chat-scroll]");
     const list = document.querySelector("[data-testid=timeline-short-list]");
     const toolbar = document.querySelector("[aria-label='在会话中查找']")?.closest("div");
@@ -75,7 +76,7 @@ function snapshot(page) {
     const stickyBar = toolbarEl?.getBoundingClientRect();
     const viewTop = stickyBar && stickyBar.height > 0 ? stickyBar.bottom : (view?.top ?? 0);
     const visible = !!(row && view && row.height > 0 && row.bottom > viewTop + 1 && row.top >= viewTop - 1 && row.top < view.bottom - 1);
-    return {
+    const result = {
       key,
       text: current?.textContent ?? "",
       findPin: list?.getAttribute("data-find-pin") || "",
@@ -102,7 +103,34 @@ function snapshot(page) {
       toolbar: stickyBar ? { top: stickyBar.top, bottom: stickyBar.bottom, height: stickyBar.height } : (bar ? { top: bar.top, bottom: bar.bottom, height: bar.height } : null),
       visible,
     };
-  });
+    // Capture the pending precondition in the same browser turn as the action.
+    // Fixture setters commit synchronously; release before observing cancellation
+    // so a missing product cancellation can still align and fail no-rejump.
+    if (action) {
+      switch (action) {
+        case "session": window.__findPage.setSessionId("sess-2"); break;
+        case "close": window.__findPage.closeFind(); break;
+        case "sending": window.__findPage.setSending(true); break;
+        case "unmount": window.__findPage.setMounted(false); break;
+        case "replace": window.__findPage.replaceNeedle("FIND_NEEDLE_B"); break;
+        default: throw new Error(`Unknown cancellation action: ${action}`);
+      }
+      window.__findPage.releaseFence();
+    }
+    return result;
+  }, cancelAction);
+}
+
+async function cancelPending(page, action, key = "m250") {
+  const atAction = await snapshot(page, action);
+  assert.equal(atAction.findPin, key, `${action} must arrive while pending`);
+  assert.equal(atAction.visible, false, `${action} must precede alignment`);
+  assert.equal(atAction.wheelFence, true);
+  return atAction;
+}
+
+async function armCancelGesture(page, type) {
+  await page.evaluate((eventType) => { window.__findReleaseOn = eventType; }, type);
 }
 
 function record(rows, scene, expected, actual, events, pass, failReason, phase) {
@@ -288,6 +316,16 @@ async function installGestureObserver(page) {
       return !!(node && t instanceof Node && node.contains(t));
     };
     const onEvt = (e) => {
+      const current = document.querySelector("[data-find-current]");
+      const row = current?.getBoundingClientRect();
+      const view = s.getBoundingClientRect();
+      let toolbar = document.querySelector("[aria-label='在会话中查找']");
+      while (toolbar && toolbar !== s) {
+        const pos = getComputedStyle(toolbar).position;
+        if (pos === "sticky" || pos === "fixed") break;
+        toolbar = toolbar.parentElement;
+      }
+      const top = toolbar && toolbar !== s ? toolbar.getBoundingClientRect().bottom : view.top;
       window.__findGestureEvents.push({
         type: e.type,
         trusted: e.isTrusted,
@@ -297,10 +335,17 @@ async function installGestureObserver(page) {
         pin: document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") || "",
         top: s.scrollTop,
         fence: window.__findPage.wheelFence,
+        visible: !!(row && row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1),
       });
+      if (window.__findReleaseOn === e.type) {
+        window.__findReleaseOn = null;
+        queueMicrotask(() => window.__findPage.releaseFence());
+      }
     };
-    s.addEventListener("wheel", onEvt, { passive: true });
-    s.addEventListener("touchmove", onEvt, { passive: true });
+    // Capture before the production cancellation listener updates the pin.
+    s.addEventListener("wheel", onEvt, { passive: true, capture: true });
+    s.addEventListener("touchmove", onEvt, { passive: true, capture: true });
+    s.addEventListener("pointerdown", onEvt, { passive: true, capture: true });
   });
 }
 
@@ -478,46 +523,45 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         await waitFindReady(page, "1/1");
         await installGestureObserver(page);
         const wantType = gesture === "wheel" ? "wheel" : "touchmove";
-        let pending = null;
-        let ev = null;
-        let gest = [];
-        for (let attempt = 0; attempt < 4 && !ev; attempt += 1) {
-          await page.evaluate(() => {
-            const el = document.querySelector("[data-testid=find-chat-scroll]");
-            if (el) el.scrollTop = el.scrollHeight;
-          });
-          await page.waitForTimeout(40);
-          await takeGestureEvents(page);
-          const point = await findChromePoint(page, where);
-          await page.mouse.move(point.x, point.y);
-          await page.mouse.wheel(0, -120);
-          events.wheels = (events.wheels || 0) + 1;
-          await page.keyboard.press("Enter");
-          events.enters = (events.enters || 0) + 1;
-          pending = await snapshot(page);
-          if (!(pending.findPin === "m250" && pending.visible !== true && pending.following === false && pending.wheelFence === true)) continue;
-          if (gesture === "wheel") {
-            await page.mouse.wheel(0, -240);
-            events.wheels += 1;
-          } else {
-            await dispatchTouchMove(page, point);
-            events.touchmoves = (events.touchmoves || 0) + 1;
-          }
-          // Playwright wheel dispatch can resolve before the DOM event reaches our observer.
-          // Wait for delivery, not for the pin/trust assertions below to become true.
-          await page.waitForFunction((type) =>
-            (window.__findGestureEvents || []).some((e) =>
-              e.type === type && (type !== "wheel" || e.deltaY === -240)),
-          wantType, { timeout: 4000 });
-          gest = await takeGestureEvents(page);
-          ev = [...gest].reverse().find((e) =>
-            e.type === wantType
-            && e.trusted === true
-            && e.inToolbar === true
-            && e.pin === "m250"
-            && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
+        await page.evaluate(() => {
+          const el = document.querySelector("[data-testid=find-chat-scroll]");
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+        await takeGestureEvents(page);
+        const point = await findChromePoint(page, where);
+        await page.mouse.move(point.x, point.y);
+        await page.mouse.wheel(0, -120);
+        events.wheels = (events.wheels || 0) + 1;
+        await page.waitForFunction(() =>
+          (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.deltaY === -120),
+        null, { timeout: 4000 });
+        await takeGestureEvents(page);
+        await holdFence(page);
+        await page.keyboard.press("Enter");
+        events.enters = (events.enters || 0) + 1;
+        const pending = await waitPending(page, "m250");
+        await armCancelGesture(page, wantType);
+        if (gesture === "wheel") {
+          await page.mouse.wheel(0, -240);
+          events.wheels += 1;
+        } else {
+          await dispatchTouchMove(page, point);
+          events.touchmoves = (events.touchmoves || 0) + 1;
         }
-        pending = pending || await snapshot(page);
+        // Wait for event delivery, never retry a failed pending precondition.
+        await page.waitForFunction((type) =>
+          (window.__findGestureEvents || []).some((e) =>
+            e.type === type && (type !== "wheel" || e.deltaY === -240)),
+        wantType, { timeout: 4000 });
+        const gest = await takeGestureEvents(page);
+        const ev = [...gest].reverse().find((e) =>
+          e.type === wantType
+          && e.trusted === true
+          && e.inToolbar === true
+          && e.pin === "m250"
+          && e.visible === false
+          && e.fence === true
+          && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
         pending.pageErrors = errors.length;
         const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
         record(rows, pendingId, { findPin: "m250", visible: false, following: false }, pending, events, pendingOk,
@@ -706,38 +750,22 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           await installGestureObserver(page);
           await page.getByTestId("find-chat-scroll").hover();
           const sessionBefore = await page.getByTestId("session").textContent();
-          // holdFence only marks the fence; any scroll in the meantime arms the 200 ms quiet timer,
-          // and on a slow runner the jump could land before the wheel arrived (OCV5-457). Count an
-          // attempt only when the wheel reached the page while the jump was still pending, as
-          // runToolbarCancel does.
-          let pending = null;
-          let ev = null;
-          for (let attempt = 0; attempt < 4 && !ev; attempt += 1) {
-            await page.evaluate(() => {
-              const el = document.querySelector("[data-testid=find-chat-scroll]");
-              if (el) el.scrollTop = el.scrollHeight;
-            });
-            // Past the 200 ms quiet window: the reset's scroll must not arm a timer that ends the
-            // fresh fence before the jump is captured pending.
-            await page.waitForTimeout(250);
-            await takeGestureEvents(page);
-            await holdFence(page);
-            events.wheels += 1;
-            await page.getByRole("button", { name: "下一处" }).click();
-            events.clicks += 1;
-            await waitPin(page, "m250");
-            pending = await snapshot(page);
-            if (!(pending.findPin === "m250" && pending.visible !== true && pending.wheelFence === true)) continue;
-            await page.mouse.wheel(0, -240);
-            events.wheels += 1;
-            await page.waitForFunction(() =>
-              (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.deltaY === -240),
-            null, { timeout: 4000 });
-            const gest = await takeGestureEvents(page);
-            // The DOM pin attribute lags a landed jump by one render; the scroll position does not.
-            ev = [...gest].reverse().find((e) => e.type === "wheel" && e.deltaY === -240 && e.pin === "m250"
-              && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
-          }
+          await waitFindReady(page, "1/1");
+          await holdFence(page);
+          await page.getByRole("button", { name: "下一处" }).click();
+          events.clicks += 1;
+          const pending = await waitPending(page, "m250");
+          await takeGestureEvents(page);
+          await armCancelGesture(page, "wheel");
+          await page.mouse.wheel(0, -240);
+          events.wheels += 1;
+          await page.waitForFunction(() =>
+            (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.deltaY === -240),
+          null, { timeout: 4000 });
+          const gest = await takeGestureEvents(page);
+          const ev = [...gest].reverse().find((e) => e.type === "wheel" && e.deltaY === -240
+            && e.trusted === true && e.pin === "m250" && e.visible === false && e.fence === true
+            && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
           pending.pageErrors = errors.length;
           const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
           record(rows, "pending-positive-m250", {
@@ -778,10 +806,15 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           const x = box.x + box.width - Math.min(6, gutter / 2);
           const y = box.y + metrics.height * 0.7;
           await page.mouse.move(x, y);
+          await takeGestureEvents(page);
+          await armCancelGesture(page, "pointerdown");
           await page.mouse.down();
           await page.mouse.move(x, y - 50, { steps: 6 });
           await page.mouse.up();
           events.drags += 1;
+          const drag = (await takeGestureEvents(page)).find((e) => e.type === "pointerdown");
+          assert.ok(drag?.trusted && drag.pin === "m250" && !drag.visible && drag.fence,
+            "scrollbar drag must arrive before pending alignment");
           await waitPinCleared(page);
           await page.waitForTimeout(280);
           const afterDrag = await snapshot(page);
@@ -803,6 +836,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           await typeNeedle(page, "FIND_NEEDLE_MID");
           events.keys += 15;
           await waitFindReady(page, "1/1");
+          await installGestureObserver(page);
           await holdFence(page);
           await page.getByRole("button", { name: "下一处" }).tap();
           events.taps += 1;
@@ -829,6 +863,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           assert.equal(pending.visible, false);
           const box = await page.getByTestId("find-chat-scroll").boundingBox();
           const client = await page.context().newCDPSession(page);
+          await armCancelGesture(page, "touchmove");
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
             touchPoints: [{ x: box.x + 80, y: box.y + 200, id: 1 }],
@@ -842,6 +877,9 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
             touchPoints: [],
           });
           events.touchmoves += 1;
+          const touch = (await takeGestureEvents(page)).find((e) => e.type === "touchmove");
+          assert.ok(touch?.trusted && touch.pin === "m250" && !touch.visible && touch.fence,
+            "touchmove must arrive before pending alignment");
           await page.waitForFunction(() =>
             document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
           null, { timeout: 4000 });
@@ -940,7 +978,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           assert.equal(pending.findPin, "m0");
           assert.equal(pending.visible, false);
           const scrollBefore = pending.scrollTop;
-          await page.evaluate(() => window.__findPage.replaceNeedle("FIND_NEEDLE_B"));
+          await cancelPending(page, "replace", "m0");
           events.replaces += 1;
           await page.waitForFunction(() => document.querySelector("[data-testid=needle]")?.textContent === "FIND_NEEDLE_B");
           await page.waitForFunction(() =>
@@ -1008,12 +1046,13 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           await pendingMidtail(page, events);
           const sessionBefore = await page.getByTestId("session").textContent();
           assert.equal(sessionBefore, "sess-1");
-          await page.evaluate(() => window.__findPage.setSessionId("sess-2"));
+          await cancelPending(page, "session");
           await page.waitForFunction(() => document.querySelector("[data-testid=session]")?.textContent === "sess-2");
+          await page.waitForTimeout(280);
           const afterSession = await snapshot(page);
           afterSession.pageErrors = errors.length;
-          record(rows, "session-switch-cancels-pin", { findPin: "", sessionId: "sess-2" }, afterSession, events,
-            afterSession.sessionId === "sess-2" && afterSession.findPin === "",
+          record(rows, "session-switch-cancels-pin", { findPin: "", sessionId: "sess-2", visible: false }, afterSession, events,
+            afterSession.sessionId === "sess-2" && afterSession.findPin === "" && !(afterSession.key === "m250" && afterSession.visible),
             `pin=${afterSession.findPin} session=${afterSession.sessionId}`);
           assert.equal(afterSession.findPin, "");
           assert.notEqual(afterSession.key === "m250" && afterSession.visible, true);
@@ -1028,8 +1067,9 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         const events = { clicks: 0, keys: 0 };
         try {
           await pendingMidtail(page, events);
-          await page.evaluate(() => window.__findPage.closeFind());
+          await cancelPending(page, "close");
           await page.waitForFunction(() => !document.querySelector("[aria-label='在会话中查找']"));
+          await page.waitForTimeout(280);
           const afterClose = await snapshot(page);
           afterClose.pageErrors = errors.length;
           record(rows, "close-cancels-pin", { findOpen: false, findPin: "" }, afterClose, events,
@@ -1048,10 +1088,11 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         const events = { clicks: 0, keys: 0 };
         try {
           await pendingMidtail(page, events);
-          await page.evaluate(() => window.__findPage.setSending(true));
+          await cancelPending(page, "sending");
           await page.waitForFunction(() =>
             document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === "",
           );
+          await page.waitForTimeout(280);
           const afterSending = await snapshot(page);
           afterSending.pageErrors = errors.length;
           record(rows, "sending-cancels-pin", { findPin: "" }, afterSending, events,
@@ -1069,11 +1110,12 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         const events = { clicks: 0, keys: 0 };
         try {
           await pendingMidtail(page, events);
-          await page.evaluate(() => window.__findPage.setMounted(false));
+          await cancelPending(page, "unmount");
           await page.getByTestId("list-unmounted").waitFor();
           await page.evaluate(() => window.__findPage.setMounted(true));
           await page.getByRole("textbox", { name: "在会话中查找" }).waitFor();
           await page.waitForFunction(() => document.querySelector("[data-testid=timeline-short-list]"));
+          await page.waitForTimeout(280);
           const afterUnmount = await snapshot(page);
           afterUnmount.pageErrors = errors.length;
           record(rows, "unmount-no-rejump", { listMounted: true, visible: false }, afterUnmount, events,

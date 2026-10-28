@@ -147,3 +147,25 @@ fixture adapters. They are not a production soak. Existing concurrency tests
 now use bounded ready/release events instead of fixed sleeps, preserving their
 lock and ordering assertions. The complete cutover fixture has a separate 45s
 bound for real digest/history/fsync IO; it adds no retry.
+
+## CI follow-up — pending find-navigation fixture window
+
+Exact-head CI on cc1174f36 exposed browser failures in the existing OCV5-188
+pending-find cancellation cases. The captured pending m250 row was already
+visible and wheelFence was false; session-switch and unmount cases also lost
+the pending window across browser RPCs. No web product code changed in P4.
+Investigate the fixture's manual holdFence versus the production 200ms quiet
+release, then make the pending setup deterministic with an explicit bounded
+hold/release lifecycle. Retain real trusted gestures, all visibility/pin and
+post-release no-rejump assertions, and the unchanged production controller.
+No skip, relaxed assertion, longer product timeout or retry may hide this red.
+Run relevant local unit/typecheck/lint only; browser/full validation stays CI.
+Review this follow-up plan before code and the new delta after commit/push.
+
+CI follow-up plan review: APPROVED (independent gpt-6-astra/xhigh reviewer).
+Use separate manual/native fence ownership; release the manual hold as soon as
+the real cancellation event arrives or the requested fixture state commits,
+never after waiting for pin expiry. Capture pending pin/visibility at that action.
+Remove the existing four-attempt preparation loops, preserve native quiet timing
+and the product's 1200ms alignment budget, and keep collector results consistent
+with the no-rejump assertions. Add focused adapter lifecycle unit coverage.
