@@ -129,6 +129,7 @@ import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./box
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
+import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { isBoxReplayRejection } from "./boxToolUnknownObserver.js";
 import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
@@ -1157,6 +1158,7 @@ export function makeAnthropicProxyHandler(
         if (boxPrepared.classification === "reject") {
           // OCV5-317: the raw 409 reached only container logs and the request
           // shape was lost. Log roles and block types of the tail, no content.
+          recordBoxContinuationRejection("admission", boxPrepared.rejectCode ?? "BOX_PREPARED_REJECT");
           userLog.warn("proxy_box_continuation_rejected", {
             code: boxPrepared.rejectCode ?? "BOX_PREPARED_REJECT",
             tail: boxRequestTailShape(body),

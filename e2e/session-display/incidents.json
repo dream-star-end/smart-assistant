@@ -5370,6 +5370,21 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxPublishedResults.test.ts",
           "assertion": "OCV5-302 recovery reads the published result in chunks when it hashes to the journal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResultSemantics.test.ts",
+          "assertion": "result representation is compared semantically, without changing the published hash"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResultSemantics.test.ts",
+          "assertion": "unknown shapes cannot hide known content, ID or error contradictions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResultSemantics.test.ts",
+          "assertion": "unknown shape warnings and rejection reasons are bounded and durably observable"
         }
       ]
     },
