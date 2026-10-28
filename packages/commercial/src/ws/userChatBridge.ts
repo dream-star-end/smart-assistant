@@ -1,5 +1,15 @@
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
 import { sendHelloOpenDispatchSnapshot } from "./helloOpenDispatchSnapshot.js";
+import {
+  createHeadlessRegistry,
+  createOpenStreamBook,
+  tryEnterHeadless,
+  checkHeadlessDispatchStreams,
+  headlessKey,
+  dispatchStreamKey,
+  type HeadlessConsumer,
+  type HeadlessEndCause,
+} from './dispatchHeadlessConsumer.js';
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
@@ -700,129 +710,21 @@ export class ContainerUnreadyError extends Error {
   }
 }
 
-/** 测试 / 2I-2 metrics 回调:单事件钩子。 */
-export interface BridgeMetricSink {
-  /** 一条用户帧已转发到容器(bytes 是 raw 字节数,含 binary)。 */
-  onUserFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
-  /** 一条容器帧已转发到用户。 */
-  onContainerFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
-  /**
-   * Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧 的间隔。
-   * 每个 bridge session 至多触发一次(若用户从未发帧,则不触发)。
-   * kind 透 endpoint.coldStart(undefined → "warm",见 ResolveContainerEndpoint 漏标说明)。
-   */
-  onTtft?(uid: bigint, kind: "cold" | "warm", seconds: number): void;
-  /** 当前任意一侧 buffered bytes 取最大值上报(用于 prometheus gauge)。 */
-  onBufferedBytes?(uid: bigint, side: "user_to_container" | "container_to_user", bytes: number): void;
-  /** 桥关闭时单次,拿到本次会话总字节数 / 时长 / closeCode。 */
-  onClose?(stats: {
-    uid: bigint;
-    connId: string;
-    durationMs: number;
-    closeCode: number;
-    closeReason: string;
-    bytesUserToContainer: number;
-    bytesContainerToUser: number;
-    cause: BridgeCloseCause;
-  }): void;
-}
+import {
+  CONTAINER_ATTEST_FRAME_TYPE,
+  type BridgeMetricSink,
+  type BridgeCloseCause,
+  type BridgeModelAuthorityDeps,
+  type ModelCheckerHandle,
+} from "./userChatBridgeTypes.js";
+export type {
+  BridgeMetricSink,
+  BridgeCloseCause,
+  BridgeModelAuthorityDeps,
+  ModelCheckerHandle,
+} from "./userChatBridgeTypes.js";
+export { CONTAINER_ATTEST_FRAME_TYPE } from "./userChatBridgeTypes.js";
 
-/** 桥关闭的根因分类(供 metrics / 日志诊断)。 */
-export type BridgeCloseCause =
-  | "client_close"           // 用户主动 close
-  | "container_close"        // 容器主动 close
-  | "container_error"        // 容器 socket 错(ECONNREFUSED 等)
-  | "container_unready"      // ensureRunning throw ContainerUnreadyError
-  | "auth_failed"            // JWT 验证失败
-  | "frame_too_big"          // 单帧超过 maxFrameBytes
-  | "binary_unsupported"     // (保留,默认放行 binary)
-  | "backpressure"           // buffer 超 maxBufferedBytes
-  | "internal_error"         // 兜底
-  | "shutdown";              // server.shutdown()
-
-// ---------- 模型执行权威(方案 §2 / §7 步 4)---------------------------------
-
-/**
- * bridge 侧的模型权威签发装配(docs/V5_MODEL_AUTHORITY_PLAN.md)。
- *
- * **注入即开启**(index.ts 只在 flag `OC_MODEL_AUTHORITY=1` 时构造并注入):
- *   - 未注入 → bridge 完全走旧路径(不签发、不注入、不做 attestation 门),零行为变化;
- *   - 注入   → ①每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
- *              有界 + 超时;超时/不支持 → 拒连接 + 触发 stale recycle);
- *              ②每条 forward 的 inbound.message 先 strip 客户端同名字段,再注入
- *              master 签名的 `__oc_model_authority`;
- *              ③codex 计费链的 isCodex 判定改用 **descriptor.engine**(与签发同源,
- *              不再是 baked 的 gpt-* 前缀集合)。
- *
- * fail-closed 边界:catalog 快照 unknown / epoch fence 失败 / 模型不可路由 → **拒帧**,
- * 绝不「降级为不带 envelope 转发」—— 那会让容器回落 baked 判定,而 master 这边可能已按
- * 另一套语义预扣,正是本批次要消灭的计费/执行分裂。
- */
-export interface BridgeModelAuthorityDeps {
-  /** master 独占私钥的签发器(公钥 keyring 由 supervisor 注入容器 env)。 */
-  signer: AuthoritySigner;
-  /** ModelExecutionCatalog 快照缓存(epoch fence 的执行体)。 */
-  catalog: ModelCatalogCache;
-  /**
-   * 容器不支持 attestation(旧 release / 旧 env)→ 触发 stale recycle,让用户下次连接
-   * 拿到带 keyring 的新容器。未注入 → 只拒连接不 recycle(测试/降级)。
-   */
-  recycleContainer?: (containerId: number, reason: string) => void;
-  /** 等待容器 attestation 的上限(默认 10s)。 */
-  attestTimeoutMs?: number;
-  /**
-   * **签发边界的 epoch 直读**(代码审 R1 MAJOR-2)。默认 = billing/modelCatalog
-   * `readSecurityEpoch()`(单行 SELECT,无时间缓存,与 fence 同一权威源)。
-   *
-   * 为什么签发边界要**再读一次**:`resolveTurnExecution` 的 fence 发生在 turn 起手,
-   * 但从那里走到"签票"之间还隔着 route / acquire / preCheck / journal / 历史消息装配
-   * 好几个 await —— 安全写(disable 模型 / 撤销授权 / 改价 / bump epoch)完全可能落在
-   * 这中间。只在早期 fence 一次,等于用一个**已经过时的快照**签出一张长命票据
-   * (lease TTL = 50min),把"安全变更立刻生效"的承诺打穿。
-   *
-   * 测试注入用。
-   */
-  readSecurityEpoch?: () => Promise<bigint>;
-  /**
-   * keyring 覆盖普查(R3-M7 轮换步骤② 的 gate)。缺省 = 进程级单例
-   * `ws/authorityKeyCensus.authorityKeyCensus`。测试注入以隔离。
-   */
-  census?: AuthorityKeyCensus;
-}
-
-/**
- * 0049 grants checker 的连接级 handle(**epoch 联动版**,代码审 R1 BLOCKER-1)。
- *
- * 旧形态的洞:checker 每 GRANTS_REFRESH_INTERVAL_MS(30s)刷一次,**刷新失败永久保留旧
- * checker**。撤销授权后:
- *   - CCB 有 egress 的每请求授权兜底(proxy 里重查 role+grants);
- *   - **codex 根本不经 /v1/messages egress** → 唯一的授权闸就是本 checker。
- * 于是「撤权 → 30s 窗口(或 DB 抖动时的**无限**窗口)内旧连接照签票、照执行」。
- *
- * 修法(与 catalog 同一条 fence 语义):
- *   - grants 快照带 **epoch 戳**(= 读 grants 之前观察到的 DB security epoch 的下界);
- *   - 0144 起任何 grant 写(含 DELETE)都 bump epoch;
- *   - 每个 turn 在 catalog epoch fence **之后**比对:checker.epoch < 权威 epoch → 说明
- *     期间发生过安全写(可能就是撤权)→ `reloadAtLeast(权威 epoch)` 同步重载并**重新判定**;
- *   - 重载失败 / 达不到目标 epoch → **拒帧**(禁止 keep-LKG 放行)。
- *
- * 「放宽」与「收窄」两条路分开:周期 refresh 失败仍 keep-LKG(新授权晚点生效可以忍),
- * 收窄面(reloadAtLeast)一律 fail-closed。
- */
-export interface ModelCheckerHandle {
-  /** 已绑定本连接 uid+DB role+grants+fenced visibility 的 sync 判定闭包。 */
-  isAllowed: (modelId: string) => boolean;
-  /** 当前 grants 快照的 epoch 下界(0 = 尚未观察到任何 epoch,视作最陈旧)。 */
-  epoch: () => bigint;
-  /** 周期刷新(放宽面):失败保留上次成功快照,不抛。 */
-  refresh: () => Promise<void>;
-  /** 严格重载到 ≥ want(收窄面):失败或达不到 → 抛,调用方**必须拒帧**。 */
-  reloadAtLeast: (want: bigint) => Promise<void>;
-}
-
-/** 容器 attestation 帧 type —— 与 gateway `modelAuthority.CONTAINER_ATTEST_FRAME_TYPE` 同值
- *  (两包不互相 import,parity 由 modelAuthorityBridge.test.ts 锁定)。 */
-export const CONTAINER_ATTEST_FRAME_TYPE = "outbound.control.container_attest";
 
 /** 等待容器 attestation 的默认上限。容器 open 后立刻发 attest,10s 已是极宽松的上限。 */
 const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
@@ -1489,42 +1391,6 @@ function readDispatchDrainMs(): number {
   return Math.min(n, MAX_DISPATCH_DRAIN_MS);
 }
 
-/**
- * UXE-A1 — headless consumer。drain 到期时本连接若仍看得到 open dispatch 的容器流
- * (admitted/accepted,未见 isFinal、PG 未终态),不关容器 WS,转 headless:继续消费帧 →
- * 照常落 client_session_live_frames(落帧即续 lease)、续 admitted 心跳、走终态/计费路径;
- * 同 uid+容器的在线桥落了同一条流的帧即接管(本桥退出)。
- *
- * 资源边界(drain 120s 上限的原意):只有 open dispatch 才 headless;寿命上限默认 90min
- * (= reconciler accepted stuck floor,到点交给 reconciler);进程内并发上限默认 256,
- * 超了降级为现状(drain 到期即关)。env 非法 → 缺省;LIMIT=0 关闭 headless。
- */
-const DEFAULT_DISPATCH_HEADLESS_MAX_MS = 90 * 60_000;
-const DEFAULT_DISPATCH_HEADLESS_LIMIT = 256;
-const DEFAULT_DISPATCH_HEADLESS_CHECK_MS = 30_000;
-function readPositiveEnvMs(key: string, fallback: number, min: number): number {
-  const raw = process.env[key];
-  if (!raw) return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= min ? Math.trunc(n) : fallback;
-}
-function readDispatchHeadlessMaxMs(): number {
-  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_MAX_MS", DEFAULT_DISPATCH_HEADLESS_MAX_MS, 50);
-}
-function readDispatchHeadlessCheckMs(): number {
-  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_CHECK_MS", DEFAULT_DISPATCH_HEADLESS_CHECK_MS, 50);
-}
-function readDispatchHeadlessLimit(): number {
-  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_LIMIT", DEFAULT_DISPATCH_HEADLESS_LIMIT, 0);
-}
-
-/**
- * PR2 v1.0.66 — 32-hex per-turn 标识,master 生成且**强制覆写** client 提供的值。
- *
- * 设计契约:client (浏览器) 不应也无法预测此 id;若 client 把别的 turn 的
- * requestId 塞进 inbound.message 试图错关 inflight 行 → master 直接覆写,
- * 防伪造。容器侧只在 inbound→outbound.codex_billing 透传,不验证。
- */
 function ensureRequestIdServerSide(): string {
   return randomBytes(16).toString("hex");
 }
@@ -2433,27 +2299,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return open;
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
-  // UXE-A1:浏览器已走、仍替 open dispatch 消费容器流的桥。key = `${uid}:${containerId}`。
-  // 在线桥落了同一条流的帧 → release 该流;headless 桥流清空即收尾(关它的容器 WS)。
-  interface HeadlessConsumer {
-    streams: ReadonlySet<string>;
-    release(streamKey: string): void;
-    end(cause: BridgeCloseCause): void;
-  }
-  const headlessConsumers = new Map<string, Set<HeadlessConsumer>>();
-  let headlessActive = 0;
-  // shutdown 之后不再起 headless:正在 drain 的桥已 unregister,shutdown 踢不到它,
-  // drain 到期若再转 headless 就会在进程关停后继续占着容器 WS。
-  let headlessShutdown = false;
-  // 正在 drain 的桥的完成判定;shutdown 后 open 流不再续 drain,逐个重判一次(与改动前同:
-  // receipt 已放下 admitted 记录的 drain 立即收尾)。
-  const drainingChecks = new Set<() => void>();
-  const headlessKey = (uidKey: bigint, cid: number): string => `${uidKey.toString()}:${cid}`;
-  const noteLiveStreamCovered = (uidKey: bigint, cid: number, streamKey: string): void => {
-    const consumers = headlessConsumers.get(headlessKey(uidKey, cid));
-    if (!consumers) return;
-    for (const consumer of [...consumers]) consumer.release(streamKey);
-  };
+  const headlessRegistry = createHeadlessRegistry();
+  const noteLiveStreamCovered = headlessRegistry.noteLiveStreamCovered;
   const uidToRecoveryExecutors = new Map<
     string,
     Set<(job: ClaimedRecoveryJob) => void>
@@ -3930,37 +3777,24 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const hasPreTransferDispatchWork = (): boolean =>
       preparationInFlight > 0 || enrichmentDispatches.size > 0;
 
-    // UXE-A1:本连接容器流里还在跑的 dispatch(sessionId + clientMessageId)。receipt 之后
-    // admittedDispatches 就放下了记录,但回合仍在出帧 —— drain/headless 靠这张表决定要不要留着
-    // 容器 WS。只在能 headless 时记(有 pgPool 做终态权威 + 有 containerId 做接管键)。
-    //   openDispatchStreams:见过帧、未见 isFinal、PG 未判终态。
-    //   closedDispatchStreams:已 isFinal / PG 终态 / 被在线桥接管 → 迟到帧不再重开。
     const headlessCapable = deps.pgPool !== undefined && containerId !== undefined;
-    const openDispatchStreams = new Map<string, { sessionId: string; clientMessageId: string }>();
-    const closedDispatchStreams = new Set<string>();
     let headless: HeadlessConsumer | null = null;
     let headlessCheckTimer: ReturnType<typeof setInterval> | null = null;
-    const dispatchStreamKey = (sessionId: string, clientMessageId: string): string =>
-      `${sessionId}\u0000${clientMessageId}`;
-    const hasOpenDispatchStreams = (): boolean => !headlessShutdown && openDispatchStreams.size > 0;
+    const openDispatchStreams = createOpenStreamBook({
+      capable: headlessCapable,
+      isShutdown: () => headlessRegistry.shutdown,
+      onClose: () => checkDrainComplete(),
+    });
+    const hasOpenDispatchStreams = (): boolean => openDispatchStreams.hasOpen();
     const closeDispatchStream = (key: string): void => {
-      closedDispatchStreams.add(key);
-      if (openDispatchStreams.delete(key)) checkDrainComplete();
+      openDispatchStreams.close(key);
     };
     const noteDispatchStreamFrame = (
       sessionId: string,
       clientMessageId: string,
       isFinal: boolean,
     ): void => {
-      if (!headlessCapable) return;
-      const key = dispatchStreamKey(sessionId, clientMessageId);
-      if (isFinal) {
-        closeDispatchStream(key);
-        return;
-      }
-      // headless 期不再认领新流:那是别的回合,归在线桥。
-      if (headless !== null || closedDispatchStreams.has(key)) return;
-      openDispatchStreams.set(key, { sessionId, clientMessageId });
+      openDispatchStreams.noteFrame(sessionId, clientMessageId, isFinal, headless !== null);
     };
 
     /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
@@ -9842,7 +9676,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // 进 drain 路径(只有 user 主动 close + 有 codex inflight 才会)
       drainCause = triggerCause;
-      drainingChecks.add(checkDrainComplete);
+      headlessRegistry.addDrainingCheck(checkDrainComplete);
       detachUserSide(triggerCause);
       bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
@@ -9882,78 +9716,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       finalCleanup(drainCause ?? "client_close");
     }
 
-    /**
-     * UXE-A1:drain 到期仍有 open dispatch 流 → 留着容器 WS 当 headless consumer。
-     * drainTimer 换成寿命上限 timer,所以 cleanup() 的 drain 抢占语义(container_close/
-     * error/shutdown/force 立即 final)原样适用;流清空走 checkDrainComplete 收尾。
-     */
-    function enterHeadless(): boolean {
-      if (
-        headlessShutdown ||
-        !headlessCapable ||
-        !hasOpenDispatchStreams() ||
-        containerWs.readyState !== WebSocket.OPEN
-      ) return false;
-      const limit = readDispatchHeadlessLimit();
-      if (headlessActive >= limit) {
-        bridgeLog?.warn("user-chat-bridge: headless limit reached, closing at drain timeout", {
-          limit,
-          ux_headless_active: headlessActive,
-          openStreams: openDispatchStreams.size,
-        });
-        return false;
-      }
-      const key = headlessKey(uid, containerId!);
-      const consumer: HeadlessConsumer = {
-        streams: new Set(openDispatchStreams.keys()),
-        release: (streamKey) => closeDispatchStream(streamKey),
-        end: (endCause) => cleanup(endCause, true),
-      };
-      // 同容器更早的 headless 桥若只盯着本桥也在盯的流,它已多余(容器对两条 WS 同发)。
-      const peers = headlessConsumers.get(key);
-      for (const older of peers ? [...peers] : []) {
-        if ([...older.streams].every((s) => openDispatchStreams.has(s))) older.end("client_close");
-      }
-      let set = headlessConsumers.get(key);
-      if (!set) { set = new Set(); headlessConsumers.set(key, set); }
-      set.add(consumer);
-      headless = consumer;
-      headlessActive += 1;
-      const maxMs = readDispatchHeadlessMaxMs();
-      drainTimer = setTimeout(() => expireDrain("user-chat-bridge: headless max lifetime"), maxMs);
-      drainTimer.unref?.();
-      headlessCheckTimer = setInterval(() => { void checkHeadlessStreams(); }, readDispatchHeadlessCheckMs());
-      headlessCheckTimer.unref?.();
-      bridgeLog?.info("user-chat-bridge: enter headless", {
-        openStreams: openDispatchStreams.size,
+    const enterHeadless = (): boolean =>
+      tryEnterHeadless({
+        registry: headlessRegistry,
+        streams: openDispatchStreams,
+        capable: headlessCapable,
+        containerWs,
+        uid,
+        containerId: containerId!,
+        bridgeLog,
         admittedCount: admittedDispatches.size,
         inflightCount: inflightCodexTurns.size,
-        maxMs,
-        ux_headless_active: headlessActive,
-      });
-      void checkHeadlessStreams();
-      return true;
-    }
-
-    /** PG 是终态权威:流对应的 dispatch 已终态 / 转人工 / 不存在 → 放下(帧没等到 isFinal 也收尾)。 */
-    async function checkHeadlessStreams(): Promise<void> {
-      const pool = deps.pgPool;
-      if (!pool || headless === null) return;
-      for (const [key, stream] of [...openDispatchStreams]) {
-        try {
-          const row = await getDispatchByLogicalKey(pool, {
-            userId: uid,
-            sessionId: stream.sessionId,
-            clientMessageId: stream.clientMessageId,
+        closeStream: closeDispatchStream,
+        cleanup: (cause: HeadlessEndCause, force) => cleanup(cause, force),
+        expireDrain,
+        setDrainTimer: (timer) => { drainTimer = timer; },
+        setCheckTimer: (timer) => { headlessCheckTimer = timer; },
+        setHeadless: (c) => { headless = c; },
+        checkStreams: async () => {
+          const pool = deps.pgPool;
+          if (!pool) return;
+          await checkHeadlessDispatchStreams({
+            pool, uid, streams: openDispatchStreams, headless, bridgeLog,
+            closeStream: closeDispatchStream,
           });
-          if (row === null || row.status === "terminal" || row.status === "manual_reconcile") {
-            closeDispatchStream(key);
-          }
-        } catch (err) {
-          bridgeLog?.warn("user-chat-bridge: headless dispatch check failed", { err });
-        }
-      }
-    }
+        },
+      });
 
     /**
      * billing settle(inflightCodexTurns→0)或 dispatch 记录清空(dropAdmittedDispatch)时调,
@@ -10539,7 +10327,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function finalCleanup(finalCause: BridgeCloseCause): void {
       if (cleaned) return;
       cleaned = true;
-      drainingChecks.delete(checkDrainComplete);
+      headlessRegistry.removeDrainingCheck(checkDrainComplete);
       cause = finalCause;
       if (drainTimer !== null) {
         clearTimeout(drainTimer);
@@ -10557,16 +10345,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         headlessCheckTimer = null;
       }
       if (headless !== null) {
-        const key = headlessKey(uid, containerId!);
-        const set = headlessConsumers.get(key);
-        if (set?.delete(headless)) {
-          headlessActive -= 1;
-          if (set.size === 0) headlessConsumers.delete(key);
-        }
+        headlessRegistry.unregister(headlessKey(uid, containerId!), headless);
         bridgeLog?.info("user-chat-bridge: exit headless", {
           finalCause,
           openStreams: openDispatchStreams.size,
-          ux_headless_active: headlessActive,
+          ux_headless_active: headlessRegistry.active,
         });
         headless = null;
       }
@@ -10710,13 +10493,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     if (frontendBuildTimer) clearInterval(frontendBuildTimer);
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
-    headlessShutdown = true;
-    for (const check of [...drainingChecks]) check();
+    headlessRegistry.beginShutdown();
     registry.closeAll(reason);
     // headless 桥已 unregister,registry 踢不到它们。
-    for (const set of [...headlessConsumers.values()]) {
-      for (const consumer of [...set]) consumer.end("shutdown");
-    }
+    headlessRegistry.endAll("shutdown");
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
