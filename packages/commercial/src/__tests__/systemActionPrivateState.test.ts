@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build } from 'esbuild'
 import { SystemActionStore } from '../../../storage/src/systemActions.js'
 import { ensureSystemActionDirectory, loadOrCreateSystemActionKey } from '../system-assistant/privateState.js'
 import { currentSystemActionExecutor, observeSystemActionExecutor, persistSystemActionExecutor, recoverStoppedSystemActionExecutors } from '../system-assistant/executorIdentity.js'
@@ -49,19 +51,23 @@ test('unsafe directories and key symlinks cannot become secret providers', () =>
   assert.throws(() => loadOrCreateSystemActionKey(state))
   assert.equal(readFileSync(external, 'utf8'), 'unrelated fixture')
 })
-test('two independent starters publish one complete key atomically', { timeout: 30_000 }, async t => {
+test('two independent starters publish one complete key atomically', { timeout: 60_000 }, async t => {
   const directory = root()
   const worker = join(directory, 'key-starter.mjs')
-  const source = new URL('../system-assistant/privateState.ts', import.meta.url).href
+  const compiled = join(directory, 'private-state.mjs')
+  // Compile the production module once; both independent Node processes still
+  // race its real key publication path after the READY/GO barrier.
+  await build({ entryPoints: [fileURLToPath(new URL('../system-assistant/privateState.ts', import.meta.url))], bundle: true, platform: 'node', format: 'esm', target: 'node20', outfile: compiled, logLevel: 'silent' })
   writeFileSync(worker, `import { createHash } from 'node:crypto';
-    import { loadOrCreateSystemActionKey } from ${JSON.stringify(source)};
+    import { loadOrCreateSystemActionKey } from ${JSON.stringify(pathToFileURL(compiled).href)};
     process.once('message', root => {
       try { const key=loadOrCreateSystemActionKey(root);const digest=createHash('sha256').update(key).digest('hex');key.fill(0);process.send({digest}); }
       catch { process.send({error:true});process.exitCode=1; }
       process.disconnect();
     });process.send({ready:true});`)
   function start() {
-    const child = spawn(process.execPath, ['--import', 'tsx', worker], { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+    const child = spawn(process.execPath, [worker], { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'inherit', 'ipc'] })
+    const stopped = new Promise<void>(resolve => child.once('close', () => resolve()))
     let ready!: () => void
     let failedToStart!: (error: Error) => void
     const readiness = new Promise<void>((resolve, reject) => { ready = resolve; failedToStart = reject })
@@ -72,21 +78,32 @@ test('two independent starters publish one complete key atomically', { timeout: 
         if (data.ready) { ready(); return }
         if (!data.error && data.digest && /^[a-f0-9]{64}$/.test(data.digest)) digest = data.digest
       })
-      child.once('error', () => { const error = new Error('synthetic key starter failed'); failedToStart(error); reject(error) })
-      child.once('exit', code => {
+      child.once('error', cause => { const error = new Error('synthetic key starter failed to spawn or communicate', { cause }); failedToStart(error); reject(error) })
+      child.once('exit', (code, signal) => {
         if (code === 0 && digest) resolve(digest)
-        else { const error = new Error('synthetic key starter failed'); failedToStart(error); reject(error) }
+        else { const error = new Error(`synthetic key starter failed: status=${code} signal=${signal} digestReceived=${digest !== null}`); failedToStart(error); reject(error) }
       })
     })
-    return { child, readiness, result, begin: () => child.send(directory) }
+    // Observe early startup failures immediately; the original promises below
+    // still reject the test, including a zero exit without a complete result.
+    void readiness.catch(() => {})
+    void result.catch(() => {})
+    return { child, stopped, readiness, result, begin: () => child.send(directory) }
   }
   const starters = [start(), start()]
-  t.after(() => { for (const { child } of starters) if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM') })
+  t.after(async () => {
+    for (const { child } of starters) if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+    await Promise.all(starters.map(s => s.stopped))
+  })
   const [results] = await Promise.all([
     Promise.all(starters.map(s => s.result)),
     Promise.all(starters.map(s => s.readiness)).then(() => { for (const starter of starters) starter.begin() }),
   ])
   assert.ok(results[0] === results[1], 'both processes must use the same stable key')
+  const reopened = loadOrCreateSystemActionKey(directory)
+  try {
+    assert.equal(createHash('sha256').update(reopened).digest('hex'), results[0], 'the parent must reopen the same complete published key')
+  } finally { reopened.fill(0) }
 })
 test('the current process has a durable verified incarnation and is observed live', () => {
   const directory = root()
