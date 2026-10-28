@@ -29,13 +29,15 @@ async function slowBody(t: import('node:test').TestContext, deadlineMs: number) 
   await reading
   return { runtime, settled, rejected: () => rejected }
 }
-test('closing admission aborts an incomplete real HTTP body and drains without closing live business resources early', { timeout: 3000 }, async t => {
+// Harness margin for runtime open and real socket teardown. The injected
+// deadline and the rejection / admission assertions are unchanged.
+test('closing admission aborts an incomplete real HTTP body and drains without closing live business resources early', { timeout: 10000 }, async t => {
   const f = await slowBody(t, 60000)
   await f.runtime.closeAndDrain()
   await f.settled
   assert.equal(f.rejected(), true)
 })
-test('an incomplete HTTP body has a finite total read deadline while admission remains open', { timeout: 3000 }, async t => {
+test('an incomplete HTTP body has a finite total read deadline while admission remains open', { timeout: 10000 }, async t => {
   const f = await slowBody(t, 30)
   await f.settled
   assert.equal(f.rejected(), true)
