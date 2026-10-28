@@ -3033,7 +3033,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
           executeAdmittedTurn(encoded, false, "recovery", undefined, job);
         };
-
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
         cronOriginExecutor = async (payload) => {
@@ -3078,7 +3077,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return receipt;
         };
-
       }
       if (unregisterExecutors === null && (recoveryExecutor || cronOriginExecutor)) {
         unregisterExecutors = registerBridgeExecutors(uid, containerWs,

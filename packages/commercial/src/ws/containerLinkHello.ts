@@ -23,7 +23,6 @@ export class ContainerLinkHello {
         if (replay.afterSeq === 0 && replay.activeMessageIds.length > 0) {
           peer.resumeActiveTurnCandidateMessageIds = replay.activeMessageIds;
         }
-        this.registered.add(sessionKey);
       }
       result.push(peer);
     }
@@ -31,6 +30,12 @@ export class ContainerLinkHello {
     // No browser inFlight hints reach the container's synthetic-terminal path.
     return { type: "inbound.hello", peers: result };
   }
+  committed(hello: { peers: Peer[] }): void {
+    for (const peer of hello.peers) {
+      this.registered.add(inboundSessionKey({ agentId: peer.agentId, channel: "webchat", peer: { id: peer.peerId, kind: "dm" } }));
+    }
+  }
+
 }
 
 /** Explicit persisted cursor seam for later PG-driven link reconstruction. No startup scan here. */

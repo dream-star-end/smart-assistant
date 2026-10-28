@@ -222,9 +222,14 @@ class ContainerLink {
     this.sendingBytes += bytes;
     const work = (this.sending ?? Promise.resolve()).then(async () => {
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
-      if (helloPeers !== null) data = Buffer.from(JSON.stringify(await this.hello.prepare(helloPeers)));
+      const prepared = helloPeers === null ? null : await this.hello.prepare(helloPeers);
+      if (prepared) data = Buffer.from(JSON.stringify(prepared));
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
-      this.ws!.send(data, opts ?? {}, cb);
+      await new Promise<void>((resolve, reject) => {
+        this.ws!.send(data, opts ?? {}, (error) => error ? reject(error) : resolve());
+      });
+      if (prepared) this.hello.committed(prepared);
+      cb?.();
     }).catch((error: Error) => { cb?.(error); this.stop(error); }).finally(() => {
       this.sendingBytes -= bytes;
       if (this.sending === work) this.sending = null;

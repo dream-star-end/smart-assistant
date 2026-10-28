@@ -215,7 +215,7 @@ test("RF-step3: hello uses persisted link cursor once, preserves bind ordering a
     const bind = send(b, {type: "inbound.control.session_repo_bind", sessionId: "session"});
     const second = send(b, hello);
     await Promise.resolve();
-    assert.deepEqual(physical.sent, [], "bind cannot overtake link hello while PG cursor is loading");
+    assert.equal(physical.sent.length, 0, "bind cannot overtake link hello while PG cursor is loading");
     release();
     await Promise.all([first, bind, second]);
     assert.equal(reads, 1);
@@ -234,5 +234,34 @@ test("RF-step3: first link without persisted frames requests the PG open turn, n
     getContainerLinkHandle(socket)!.activate();
     await new Promise<void>((resolve, reject) => socket.send(wire({type: "inbound.hello", peers: [{peerId: "s", inFlight: true, inFlightClientMessageId: "wrong"}]}), {}, (err) => err ? reject(err) : resolve()));
     assert.deepEqual(physical.sent[0]!.peers, [{peerId: "s", agentId: "main", lastFrameSeq: 0, resumeActiveTurnCandidateMessageIds: ["pg-turn"]}]);
+  } finally { await registry.shutdown(); }
+});
+
+
+test("RF-step3: closing the first tab during cursor lookup does not suppress another tab's missing-frame replay", async () => {
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  const registry = new ContainerLinkRegistry({ query: async () => {
+    reads++;
+    await barrier;
+    return { rows: [{after_seq: "12", active_message_ids: []}], rowCount: 1 };
+  } } as unknown as Queryable);
+  const physical = new Transport();
+  try {
+    const a = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    const b = await registry.attach(1n, 7, () => { throw new Error("second dial"); });
+    getContainerLinkHandle(a)!.activate(); getContainerLinkHandle(b)!.activate();
+    const hello = wire({type: "inbound.hello", peers: [{peerId: "session", agentId: "main", lastFrameSeq: 900}]});
+    const first = new Promise<Error | undefined>((resolve) => a.send(hello, {}, resolve));
+    while (reads === 0) await Promise.resolve();
+    a.terminate();
+    const second = new Promise<void>((resolve, reject) => b.send(hello, {}, (error) => error ? reject(error) : resolve()));
+    release();
+    assert.match((await first)!.message, /closed/);
+    await second;
+    assert.equal(reads, 2, "cancelled hello never committed link registration");
+    assert.equal(physical.sent.length, 1);
+    assert.equal(physical.sent[0]!.peers[0].lastFrameSeq, 12, "13..20 remain eligible for container replay");
   } finally { await registry.shutdown(); }
 });
