@@ -92,7 +92,7 @@ test('cutover refuses before survivor/mutation and does not compensate idle fail
   const deploy = readFileSync(path.join(root, 'scripts/deploy-v5-selfhost.sh'), 'utf8')
   const body = deploy.match(/^cmd_cutover\(\) \{[\s\S]*?\n\}/m)?.[0]
   assert.ok(body)
-  const check = body.indexOf('cutover_wait_for_user_idle || return 1')
+  const check = body.indexOf('selfhost_wait_idle_or_defer 600 "$rel" || return $?')
   assert.ok(check > body.indexOf('write_prev_release_file "$prev_val"'))
   assert.ok(check < body.indexOf('cutover_persist_phase "pre-install"'))
   assert.ok(check < body.indexOf('cutover_arm_survivor "$backup"'))
@@ -180,7 +180,7 @@ test('an early claimed train keeps its exact source when shared HEAD advances du
   const start = deploy.indexOf('  ensure_model_authority\n', deploy.indexOf('cmd_deploy()'))
   const end = deploy.indexOf('  build_master_release "$sha"', start)
   assert.ok(start > 0 && end > start)
-  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\n`
+  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\n  fi\n`
   const a = 'a'.repeat(40)
   const b = 'b'.repeat(40)
   for (const active of [0, 1]) {
@@ -191,6 +191,8 @@ ensure_model_authority() { :; }
 assert_env_key_drift() { :; }
 lease_train_begin() { echo "CLAIM:$1"; }
 selfhost_release_preflight() { echo "L0:$1"; }
+selfhost_wait_idle_or_defer() { [[ "$1" == 0 ]]; }
+selfhost_idle_retry_load() { return 1; }
 assert_fix_trailers() { :; }
 assert_p0_web_overlay_contained() { :; }
 log() { :; }

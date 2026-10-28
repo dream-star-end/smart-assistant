@@ -85,6 +85,15 @@ jobs:
           INCIDENT_LEDGER_BASE_REF: ${{ steps.base.outputs.ref }}
         run: npx tsx scripts/check-incident-ledger-superset.ts
 
+      - name: Retry waste and Go cache terminal contracts (P6)
+        run: |
+          node --test scripts/lib/user-contract-go-cache.test.mjs scripts/lib/go-cache-turn.test.mjs
+          node --test scripts/lib/go-responses-sse-trace.test.mjs
+          bash scripts/test-mutex.sh commercial 'node --import tsx --test scripts/__tests__/goResponsesProbe.test.ts'
+          # Receipt trust is intentionally root-only, matching the production deploy owner.
+          sudo env PATH="$PATH" node --test scripts/__tests__/selfhostRetryWaste.node-test.mjs
+          INVOCATION_ID=p6-inherited-service-fixture bash scripts/v5-lease-center-selftest.sh
+
       - name: Gate script tests
         run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts scripts/__tests__/archMeasure.node-test.mjs scripts/__tests__/kernelReleaseClosure.test.ts scripts/__tests__/protocolBrowserEntry.test.ts scripts/__tests__/ocTrace.test.ts scripts/__tests__/ocTraceChain.test.ts
 

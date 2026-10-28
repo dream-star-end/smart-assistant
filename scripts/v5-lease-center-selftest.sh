@@ -20,6 +20,10 @@ assert_eq() { [[ "$1" == "$2" ]] && ok "$3 ($1)" || bad "$3: got '$1' want '$2'"
 mkdir -p "$T/run" "$T/lib" "$T/logs" "$T/bin" "$T/releases"
 # OCV5-420:测试夹具不得触发宿主上的自动恢复动作。
 export OC_V5_AUTORECOVER=off
+# P6: admission probes use private host fixtures, never the machine running CI.
+mkdir -p "$T/host-proc" "$T/host-locks"
+echo '1.00 1 1 1/1 1' > "$T/loadavg"
+export MASTER_GATE_LOADAVG="$T/loadavg" MASTER_GATE_PROC_ROOT="$T/host-proc" MASTER_GATE_TEST_LOCK_DIR="$T/host-locks"
 export OC_V5_LEASE_DB="$T/lib/lease.db"
 export OC_V5_LEASE_LOCK="$T/run/lease-db.lock"
 export OC_V5_LEASE_WORKER_LOCK="$T/run/lease-worker.lock"
@@ -36,6 +40,9 @@ export OC_V5_LEASE_TRAIN_PLANNED_STALE_SECONDS=1
 export OC_V5_LEASE_CUTOVER_GRACE_FILE="$T/run/cutover-grace-until"
 export OC_USER_ID=3
 unset OC_SESSION_KEY OC_V5_LEASE_CALLBACK_URL
+# A CI runner may itself be a systemd service. This fixture uses setsid and must
+# never inherit the runner's service identity or create a real transient unit.
+unset INVOCATION_ID
 
 # 假仓库:origin(bare)+ 工作树,3 个 commit:c0(已上线) c1 c2
 git init -q --bare "$T/origin.git"
@@ -113,6 +120,14 @@ reset_db; set_live "$C0" committed
 "$LEASE" register --resource deploy:selfhost --mode ride --sha "$C1" --ticket OCV5-901 --owner s1 >/dev/null
 "$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-902 --owner s2 >/dev/null
 assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='registered';")" 2 "两条 registered"
+# Busy worker does not create a planned train, acquire deploy.lock, or fail rides.
+echo '20.00 1 1 1/1 1' > "$T/loadavg"
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(starts)" 0 "busy host does not spawn"
+assert_eq "$(q 'SELECT COUNT(*) FROM train;')" 0 "busy host creates no train"
+assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='registered';")" 2 "busy rides remain registered"
+[[ ! -e "$OC_V5_SELFHOST_DEPLOY_LOCK" ]] && ok "busy worker never opens deploy.lock" || bad "busy worker touched deploy.lock"
+echo '1.00 1 1 1/1 1' > "$T/loadavg"
 FAKE_DEPLOY_SLEEP=2 "$WORKER" >/dev/null 2>&1 & FAKE_DEPLOY_SLEEP=2 "$WORKER" >/dev/null 2>&1 & wait
 assert_eq "$(starts)" 1 "并发 tick 只发一班"
 wait_train_done || bad "train 未在时限内终态"
@@ -168,6 +183,20 @@ assert_eq "$(comments OCV5-908)" 1 "面板恰 1 条失败评论"
 sleep 1.1; "$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-909 --owner s2 >/dev/null
 "$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 2 "新 ride(人工决定)→ 允许再发一班"
 wait_train_done || true; kill_stubs
+
+echo "═══ P6 typed busy retries; a later deterministic gate failure still stops retries ═══"
+reset_db; set_live "$C0" committed; echo fail >"$T/fake-deploy.mode"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-912 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1; wait_train_done || bad "P6 first train did not finish"
+q "UPDATE train SET reason='user-idle-deferred' WHERE status='failed';"
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(starts)" 2 "typed idle failure schedules same pending ride again"
+assert_eq "$(q 'SELECT status FROM lease;')" registered "idle deferral keeps ride registered"
+wait_train_done || bad "P6 second train did not finish"
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(starts)" 2 "newer gate failure is not bypassed by older idle deferral"
+assert_eq "$(q 'SELECT status FROM lease;')" failed "later genuine failure still fails ride"
+kill_stubs
 
 echo "═══ T4 deploy.lock 被外部持有 → 不发车;桩只切 symlink 未 committed → 不结算、下班不发 ═══"
 reset_db; set_live "$C0" committed; echo commit >"$T/fake-deploy.mode"

@@ -14,7 +14,7 @@ import { boxBridgeFailed, boxBridgeOutcome } from "../lib/boxBridgeFailureProof.
 import { gateLoadScale, scaledMs } from "../lib/gateLoadScale.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-const lib = readFileSync(path.join(root, "scripts/v5-selfhost-master-release-lib.sh"), "utf8");
+const lib = `${readFileSync(path.join(root, "scripts/lib/v5-selfhost-host-idle.sh"), "utf8")}\n${readFileSync(path.join(root, "scripts/v5-selfhost-master-release-lib.sh"), "utf8")}`;
 const summaryLib = readFileSync(path.join(root, "scripts/lib/v5-selfhost-train-summary.sh"), "utf8");
 
 function fn(name: string): string {
@@ -26,7 +26,7 @@ const vars = (() => {
   const a = lib.indexOf("MASTER_BOX_GATE_LOAD_MAX=8");
   const b = lib.indexOf('MASTER_GATE_DB_STAGING=""', a);
   assert.ok(a > 0 && b > a);
-  return lib.slice(a, b + 'MASTER_GATE_DB_STAGING=""'.length);
+  return lib.slice(a, b + 'MASTER_GATE_DB_STAGING=""'.length).split("\n").filter((line) => /^MASTER_/.test(line) || /^ {2}'/.test(line) || line === ")").join("\n");
 })();
 const fns = ["master_gate_base_dsn", "master_gate_load1", "master_gate_load_scale", "master_gate_busy_reason",
   "master_gate_wait_host_idle", "master_gate_attempt_log", "master_gate_flaky_signature", "master_gate_first_failure",
