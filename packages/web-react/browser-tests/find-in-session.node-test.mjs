@@ -532,10 +532,13 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         await page.mouse.move(point.x, point.y);
         await page.mouse.wheel(0, -120);
         events.wheels = (events.wheels || 0) + 1;
+        // Synchronize the sole trusted upward warm-up before Enter. Its DOM
+        // delta is evidence, not the identity of this delivery handshake.
         await page.waitForFunction(() =>
-          (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.deltaY === -120),
+          (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.trusted && e.deltaY < 0),
         null, { timeout: 4000 });
-        await takeGestureEvents(page);
+        const warmup = (await takeGestureEvents(page)).find((e) => e.type === "wheel" && e.trusted && e.deltaY < 0);
+        events.warmupDeltaY = warmup.deltaY;
         await holdFence(page);
         await page.keyboard.press("Enter");
         events.enters = (events.enters || 0) + 1;

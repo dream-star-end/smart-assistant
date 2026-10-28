@@ -169,3 +169,11 @@ never after waiting for pin expiry. Capture pending pin/visibility at that actio
 Remove the existing four-attempt preparation loops, preserve native quiet timing
 and the product's 1200ms alignment budget, and keep collector results consistent
 with the no-rejump assertions. Add focused adapter lifecycle unit coverage.
+
+CI follow-up R3 plan review: APPROVED. On 7b47f9f06 all original pending,
+session/unmount and real gesture cancellation failures pass. Only mobile toolbar
+warm-up waits fail before Enter (enters=0, touchmoves=0); the new delivery filter
+assumed DOM delta equals raw CDP -120. Synchronize the single trusted upward
+warm-up after clearing its queue and record its actual delta. Exact -240 and all
+trusted/toolbar/pin/visibility cancellation assertions remain unchanged. Mobile
+delta conversion is currently an inference, to be checked in the next CI log.
