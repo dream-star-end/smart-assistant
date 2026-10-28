@@ -25,7 +25,10 @@ export class CodexNativeContext {
   private automatic = new Map<string, number | undefined>()
   private completedItems = new Set<string>()
 
-  constructor(private readonly emit: (event: ContextObservation) => void) {}
+  constructor(
+    private readonly emit: (event: ContextObservation) => void,
+    private readonly status?: (value: 'compacting' | null) => void,
+  ) {}
 
   get running(): boolean { return this.pending !== undefined }
 
@@ -131,6 +134,7 @@ export class CodexNativeContext {
     const completed = new Promise<void>((resolve) => {
       this.pending = { threadId: measured.threadId, itemCompleted: false, resolve, reject: rejectWait }
     })
+    this.status?.('compacting')
     const timer = setTimeout(() => rejectWait(new Error('Native context compaction timed out')), opts.timeoutMs)
     timer.unref?.()
     try {
@@ -147,6 +151,7 @@ export class CodexNativeContext {
       this.retired = this.pending ? { threadId: this.pending.threadId, turnId: this.pending.turnId } : undefined
       this.pending = undefined
       releaseTrace()
+      this.status?.(null)
     }
   }
 }

@@ -326,7 +326,7 @@ export function assertPromptQueueRunnerAdmission(
 }
 
 export class CodexAppServerRunner extends EventEmitter {
-  private nativeContext = new CodexNativeContext((event) => this.emit('context_observation', event))
+  private nativeContext = new CodexNativeContext((event) => this.emit('context_observation', event), (status) => this.emitTurnStatus(status))
   private threadId: string | null
   private proc: ChildProcessWithoutNullStreams | null = null
   private nextRequestId = 0

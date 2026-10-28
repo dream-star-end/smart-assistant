@@ -86,6 +86,7 @@ test('high native water compacts before the next input, waits beyond ACK, and pr
   const running = h.host.runTurn('exact newest user input', 'request-2')
   await compactAck
   assert.deepEqual(requests.map((r) => r.method), ['thread/compact/start'])
+  assert.deepEqual(h.messages.filter((m) => m.subtype === 'status').map((m) => m.status), ['compacting'])
   const compaction = { turnId: 'compact-turn', item: { id: 'compact-2', type: 'contextCompaction' } }
   h.feed('turn/started', { turn: { id: 'compact-turn', status: 'inProgress' } })
   h.feed('item/started', compaction)
@@ -95,6 +96,7 @@ test('high native water compacts before the next input, waits beyond ACK, and pr
   h.feed('turn/completed', { turn: { id: 'compact-turn', status: 'completed' } })
   await running
   assert.deepEqual(requests.map((r) => r.method), ['thread/compact/start', 'turn/start'])
+  assert.deepEqual(h.messages.filter((m) => m.subtype === 'status').map((m) => m.status), ['compacting', null])
   assert.equal(requests[1]!.params.threadId, 'thread-1')
   assert.equal(requests[1]!.params.input[0].text, 'exact newest user input')
   assert.equal(h.observations.filter((e) => e.kind === 'context_compacted').length, 1)
