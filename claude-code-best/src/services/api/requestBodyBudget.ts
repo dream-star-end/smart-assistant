@@ -1,8 +1,6 @@
 import { createHash } from 'node:crypto'
-import {
-  contextBytePressure,
-  type ContextObservation,
-} from '../../../../packages/protocol/src/contextPressure.js'
+import type { ContextObservation } from '../../../../packages/protocol/src/contextPressure.js'
+import { contextBytePressure } from '../../../../packages/protocol/src/contextBytePressure.js'
 import { writeContextReference } from '../../../../packages/gateway/src/engine/contextReference.js'
 
 // Mirror the ordinary proxy envelope; the offline regression compares these
@@ -43,7 +41,20 @@ async function reference(opts: Options, content: string | Uint8Array, extension:
 }
 
 function refText(file: string, size: number, description: string): string {
-  return `[Full ${description} preserved in workspace file ${JSON.stringify(file)} (${size} bytes). Use Read for images, paged Read for PDFs, and bounded Read/Bash for text or JSON before relying on omitted details. This is a file reference, not a summary.]`
+  return `[Full ${description} preserved in workspace file ${JSON.stringify(file)} (${size} bytes). Use Read for images and paged Read for PDFs before relying on omitted details. This is a file reference, not a summary.]`
+}
+
+// Read paginates by lines, so an original long line or JSONL message may not
+// fit even limit=1. Keep the raw original AND a lossless view of short JSON
+// string fragments. Four lines are <=24.6KB even with worst-case escaping.
+async function textReference(opts: Options, content: string, extension: string, description: string): Promise<string> {
+  const file = await reference(opts, content, extension)
+  const lines: string[] = []
+  for (let offset = 0; offset < content.length; offset += 1024) {
+    lines.push(JSON.stringify(content.slice(offset, offset + 1024)))
+  }
+  const pages = await reference(opts, lines.join('\n'), 'read-pages.jsonl')
+  return `[Full ${description} preserved in workspace file ${JSON.stringify(file)} (${Buffer.byteLength(content)} bytes). Readable view: ${JSON.stringify(pages)}; ${lines.length} lines of JSON string fragments. Use Read on the view with offset=1, limit=4, then offset=5, limit=4, etc. JSON-decode each line and concatenate without separators to recover exact original text. Always set offset and limit; the raw file may contain oversized single lines. This is a lossless file reference, not a summary.]`
 }
 
 function countMedia(items: unknown[]): number {
@@ -99,8 +110,7 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
     const value = target[field]
     if (typeof value !== 'string' || Buffer.byteLength(value) < OLD_ATTACHMENT_BYTES) return
     candidates.push({ index, media: false, size: bytes(value), replace: async () => {
-      const file = await reference(opts, value, 'txt')
-      target[field] = refText(file, Buffer.byteLength(value), 'text')
+      target[field] = await textReference(opts, value, 'txt', 'text')
     } })
   }
   const visit = (blocks: unknown[], index: number) => {
@@ -163,8 +173,8 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
     // Use the original wire JSON, not the modified projection, as the archive.
     const history = (JSON.parse(raw) as { messages: Json[] }).messages.slice(0, latestUser)
     const content = history.map(m => JSON.stringify(m)).join('\n')
-    const file = await reference(opts, content, 'jsonl')
-    messages = [{ role: 'user', content: refText(file, Buffer.byteLength(content), 'earlier conversation (one original message per JSON line)') }, ...messages.slice(latestUser)]
+    const note = await textReference(opts, content, 'jsonl', 'earlier conversation (one original message per JSON line)')
+    messages = [{ role: 'user', content: note }, ...messages.slice(latestUser)]
     body.messages = messages
     mediaCount = countMedia(messages)
     bodyBytes = bytes(body)

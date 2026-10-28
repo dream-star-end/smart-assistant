@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { readFileInRange } from '../../utils/readFileInRange.ts'
 import { CCB_REQUEST_BYTE_LIMITS, createCcbBudgetFetch, prepareCcbRequestBody, RequestBodyBudgetError } from './requestBodyBudget.ts'
 import { PROXY_BYTE_BUDGET_LEGACY } from '../../../../packages/commercial/src/http/proxy/shared.ts'
 import { BOX_API_MODEL_IDS } from '../../../../packages/protocol/src/boxApiModels.ts'
@@ -203,4 +204,28 @@ test('more than 100 small media items retain file references instead of being si
   const files = paths(wire.messages)
   assert.equal(files.length, 5)
   for (let i = 0; i < 5; i++) assert.deepEqual(await readFile(files[i]), originals[i])
+})
+
+
+test('Read-only tools can page lossless references for huge single lines and JSONL messages', async t => {
+  const h = await harness(t)
+  // Include lone surrogates/CRLF/BOM as well as astral/CJK text: JSON fragments
+  // must round-trip even when a UTF-16 pair is split at the chunk boundary.
+  const original = '\ufeff' + '中😀\r\n\u0000\ud800'.repeat(900_000)
+  for (const messages of [[user('x'.repeat(9 * MIB))], [user(original), assistant('remembered'), user('continue')]]) {
+    const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload(messages)), h.opts))
+    const note = allText(wire.messages).find(v => v.includes('Readable view:'))
+    const pageFile = JSON.parse(note.match(/Readable view: ("[^"\n]+")/)[1])
+    const expected = messages.length === 1 ? messages[0].content : messages.slice(0, -1).map(m => JSON.stringify(m)).join('\n')
+    const lines = (await readFile(pageFile, 'utf8')).split('\n')
+    assert.equal(lines.map(line => JSON.parse(line)).join(''), expected)
+    assert.ok(lines.every(line => Buffer.byteLength(line) <= 6146))
+    for (const offset of [0, Math.floor(lines.length / 2), lines.length - 1]) {
+      // Same line-reader used by Read when offset/limit are supplied.
+      const page = await readFileInRange(pageFile, offset, 4)
+      assert.ok(Buffer.byteLength(page.content) < 25_000)
+      assert.equal(page.content, lines.slice(offset, offset + 4).join('\n'))
+    }
+    assert.match(note, /offset=1, limit=4/)
+  }
 })

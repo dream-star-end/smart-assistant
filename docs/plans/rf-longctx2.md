@@ -1,6 +1,6 @@
 # Ordinary CCB request bytes and attachment references (W2 slice 2)
 
-Depends on #1201 (`d4138dbe2`); personal branch only. No Box context/journal, billing, or deployment changes.
+Depends on #1201 (`d4138dbe2`); personal branch only. No Box context/journal or billing changes; no deployment performed.
 
 ## Evidence and cause
 
@@ -21,7 +21,7 @@ The fitter evaluates actual UTF-8 JSON body and field bytes, plus message/media 
 
 The old 100-media filter is bypassed only for ordinary platform first-party requests with Read available, so it cannot silently remove media before the file fitter sees it. The fitter preserves the same 100-item limit by references instead. No server limit is raised.
 
-Budget thresholds/events are extracted from #1201 `engine/boundedPrompt.ts` into `protocol/contextPressure.ts`. Both launch and native request fitting use that implementation. Private reference IO is extracted into `engine/contextReference.ts` and reused by Antigravity and CCB (source import, bundled with CCB). The helper remains in the engine layer instead of creating an unapproved same-layer gateway→storage dependency. No architecture exemption is added.
+Budget thresholds/events are extracted from #1201 `engine/boundedPrompt.ts` into dependency-free `protocol/contextBytePressure.ts`, re-exported by `contextPressure.ts`. Both launch and native request fitting use that implementation. Private reference IO is extracted into `engine/contextReference.ts` and reused by Antigravity and CCB (source import, bundled with CCB). The helper remains in the engine layer instead of creating an unapproved same-layer gateway→storage dependency. No architecture exemption is added.
 
 Content-addressed reference keys include workspace, native session, extension and original bytes. Private directories/files are 0700/0600; a unique temporary directory is written completely then atomically renamed. Existing references are checked for exact content, including concurrent writers. The same input reuses a file across retries, multiple turns and process restarts. Files remain with the workspace because native history may still reference them; lifecycle deletion/GC is a later task.
 
@@ -34,6 +34,11 @@ Content-addressed reference keys include workspace, native session, extension an
 
 ## Verification and remaining work
 
-Offline regression fixtures include >20MB mixed images/PDFs, four consecutive requests in one native session, exact original bytes and permissions, old/current nested tool media, CJK/escaping, thousands of small messages, current oversized PDF/text, preserved tool pairs, 100+ media, warning/event order, IO failure/abort, immutable Box bypass and protocol/parser routing. Tests run in CI's existing context budget step; local tests obey train priority and the gateway mutex. No real paid model rounds.
+Offline regression fixtures include >20MB mixed images/PDFs, four consecutive requests in one native session, exact original bytes and permissions, old/current nested tool media, CJK/escaping, thousands of small messages, current oversized PDF/text, preserved tool pairs, 100+ media, warning/event order, IO failure/abort, immutable Box bypass and protocol/parser routing. Tests run in CI's existing context budget step; every local heavy command runs through the management `rf-heavy.sh` wrapper, which waits for trains and serializes low-priority work. No real paid model rounds.
 
 Validation results and the exact pushed head are recorded in CONTINUE. This slice does not claim full W2 completion: Codex/Grok native token watermarks/compaction, Box's separately owned transport/native history, tool-less oversized summaries, reference GC, durable observation replay/frontend presentation, and seven production days without oversize failures remain to be verified or implemented by their owners.
+
+## Review 1 resolution
+
+- Accepted P1 (isolated CCB release build). `oc_hotcfg_build_ccb_dist` now copies and hashes the exact shared runtime inputs from the pinned staging tree, with layout key v2. The shared pressure function has only type imports, avoiding a TypeBox runtime dependency outside the isolated CCB node_modules. A focused fixture uses the real isolation/cache function and an esbuild-only Bun stand-in to bundle the fitter in a dependency-free temporary tree, check cache reuse, and invalidate for each changed shared input. It does not run a full CCB build or deploy.
+- Accepted P1 (Read-only long single lines). Every text/history reference now also provides a lossless JSON-string-fragment view with <=1024 UTF-16 units per line. The note gives explicit Read `offset`/`limit=4`; even worst-case escaped output stays below 25KB for four lines. Raw originals remain intact. Tests reconstruct all fragments exactly and exercise the actual Read line reader on first/middle/last pages, including 9MiB single-line text, CJK, CRLF, BOM, astral text and lone surrogates. No Bash tool is required.

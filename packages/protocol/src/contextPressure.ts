@@ -25,15 +25,4 @@ export type ContextObservation =
   | { kind: 'context_pressure'; pressure: ContextPressure }
   | { kind: 'context_compacted'; compaction: ContextCompaction }
 
-/** Shared by launch prompts and serialized native requests. */
-export function contextBytePressure(
-  engine: string,
-  scope: ContextPressure['scope'],
-  usedRatio: number,
-): ContextObservation | undefined {
-  if (usedRatio < 0.8) return undefined
-  return { kind: 'context_pressure', pressure: {
-    engine, scope, dimension: 'transport_bytes',
-    level: usedRatio >= 1 ? 'critical' : 'warning', usedRatio,
-  } }
-}
+export { contextBytePressure } from './contextBytePressure.js'
