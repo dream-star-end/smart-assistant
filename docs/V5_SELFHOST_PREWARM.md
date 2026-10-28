@@ -55,6 +55,55 @@ gates, master sealing, E1 and smoke (including G1) still run.
 `OC_V5_FORCE_WEB_BUILD=1` retains its normal meaning. Runtime image rebuild is not required.
 Exhausting the prewarm allowance only loses the optional speedup: the train still builds normally.
 
-Draft rollout only: **DO NOT MERGE — 待真 Grok OD / 管家**. Wait for the current tip train to be live;
-the steward schedules integration **P2 → P5 → P1**. The expected ~10 minute saving is a hypothesis;
-measure cache hits and train summaries after an approved rollout. This PR does not deploy it.
+## Hit and fallback evidence
+
+`scripts/__tests__/v5SelfhostPrewarm.node-test.mjs` exercises the ordinary runtime builder and the
+frontend block extracted from `build_master_release`, using real receipt/seal/digest checks and
+private Git archives. Only external build work (Docker inspection, flavor authorization, runtime
+finalization and npm compilation) uses fixtures. No deploy entrypoint or production service runs.
+
+| Input/state | Expected consumer result |
+| --- | --- |
+| Exact runtime receipt and verified artifact | Adopt private runtime; cold finalizer is never called |
+| Missing runtime receipt, changed image/source/capabilities, corrupt bytes, failed adoption | Ordinary archive/prune/finalizer runs exactly once with pinned committed source |
+| Cold runtime finalizer fails after a miss | Fail the build; no retry or false hit; live pointer unchanged |
+| Verified private web donor | Copy verified bytes; record `reused` and the private donor; no npm build |
+| Backend-only commit with identical web inputs | Web reuse still hits despite the new commit SHA |
+| Missing/malformed web record, corrupt dist/full seal, changed build environment, force build | Official frontend command runs exactly once; record `built` and empty donor |
+| Corruption while copying an accepted web donor | Remove staging and fail; no cold retry; live pointer unchanged |
+
+These are deterministic branch-coverage results, **not a production hit-rate sample**. Runtime
+keys bind the exact SHA and image/toolchain/recipe; web keys bind content, recipes and build
+environment. A runtime miss and web hit on the same train can therefore be correct. A ready
+`attempt.json` proves preparation, not subsequent consumption; it is overwritten for later
+attempts and is not a historical counter. Admission refusal consumes no build attempt.
+
+For an approved rollout, the steward can collect evidence read-only from existing train logs,
+`<trainId>.summary.json` and each retained master release's `.web-dist-reuse.json`. Fix a time
+window and retain one row per train: train ID, target SHA, final/exit status, runtime result, web
+result and donor, and phase durations. Include failed trains; never rerun a train to improve a rate.
+
+- Runtime: `runtime prewarm hit (full digest reverified)` confirms a consumed prewarm artifact.
+  An observed ordinary finalizer/build result after lookup is a miss, even when the cold build
+  fails. A failure before lookup is `not-reached`; missing/truncated background logs are `unknown`.
+  `cache.runtimeRelease` in the summary describes ordinary finalized-release reuse, so it must
+  not be counted as a prewarm hit.
+- Web: `mode=reused` is a prewarm hit only when the recorded donor is the private
+  `artifact-cache/web-<key>` bucket (or the configured cache root). A `rel-*` donor is ordinary
+  release reuse. `mode=built` is a cold result. Preserve explicit force-build rows separately.
+  A selected donor followed by a copy failure is `failed-copy`, not a successful hit; preserve
+  the log when staging cleanup leaves no reuse record. Unreached or unverifiable cases stay
+  `not-reached` or `unknown`.
+- Report runtime hits / resolved runtime lookups and private-web hits / resolved eligible web
+  selections, with the numerator, denominator and unknown/not-reached/forced counts beside each
+  rate. Resolved cold failures and failed copies remain in their denominators. Report ordinary
+  web reuse separately. A zero denominator is `N/A`, never 0% or 100%.
+- Pair those rows with prewarm journal outcomes (`ready`, `partial`, `failed`, admission refusal)
+  and train phase durations. Attempt success rate, artifact consumption rate and total elapsed
+  time answer different questions; none alone proves the expected ~10 minute saving.
+
+No production sample was collected by this follow-up: hit rate and elapsed-time benefit remain
+unmeasured. PR #1190 was already merged by another session at 2026-10-28 07:21:12 UTC when this
+follow-up inspected GitHub. Its original head had 21/21 successful checks and no outstanding
+review threads. This follow-up changes tests/docs only; its PR stays draft, **DO NOT MERGE**.
+Further integration, rides and rollout remain with the steward after the required acceptance.
