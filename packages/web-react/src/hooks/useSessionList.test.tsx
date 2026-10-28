@@ -160,6 +160,9 @@ describe("useSessionList 删除会话（不可逆）", () => {
     expect(ask.confirmText).toBe("删除");
     expect(String(ask.body)).toContain("待删除的会话");
     expect(String(ask.body)).toContain("不可恢复");
+    // 中文标点(UI-SPEC §6 #22:「,不可恢复」中英混用)。
+    expect(ask.title).toBe("删除该会话？");
+    expect(String(ask.body)).toContain("都将删除，不可恢复。");
   });
 
   test("用户取消 → 本地、IndexedDB、服务端一处都不动", async () => {
@@ -196,6 +199,20 @@ describe("useSessionList 删除会话（不可逆）", () => {
     expect(harness.deleteSession.mock.calls[0][1]).toBe("webdropme001");
   });
 
+  // UI-SPEC §6 #22:删除成功没有任何回执,行消失分不清是删了还是没刷新出来。
+  test("服务端删除成功 → 给出成功提示", async () => {
+    const { result } = await renderSessionList({
+      confirmResult: true,
+      promptResult: null,
+      withToasts: true,
+    });
+    const target = result.current.sessions.find((s) => s.id === "webdropme001")!;
+    await act(async () => {
+      await result.current.deleteSessionConfirm(target);
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("已删除「待删除的会话」");
+  });
+
   test("删掉的是当前活动会话时通知上层清空聊天区，并清掉选中态", async () => {
     const { result, harness } = await renderSessionList({
       confirmResult: true,
@@ -227,6 +244,7 @@ describe("useSessionList 删除会话（不可逆）", () => {
       await result.current.deleteSessionConfirm(target);
     });
     expect(screen.getByRole("alert").textContent).toContain("删除失败");
+    expect(screen.queryByRole("status")).toBeNull();
     await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(before));
     await waitFor(() =>
       expect(result.current.sessions.map((s) => s.id)).toContain("webdropme001"),
@@ -743,9 +761,24 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     await act(async () => {
       await result.current.batchUpdateSessions(["webdropme001"], "delete");
     });
-    expect(harness.confirmCalls[0]?.title).toContain("1 条");
+    expect(harness.confirmCalls[0]?.title).toBe("删除 1 条会话？");
     expect(result.current.sessions.map((s) => s.id)).toContain("webdropme001");
     expect(batch).not.toHaveBeenCalled();
+  });
+
+  test("batchUpdateSessions 删除成功 → 给出条数回执", async () => {
+    const batch = vi.spyOn(api, "batchSessions").mockResolvedValue({ ok: true, updated: 2 });
+    const { result } = await renderSessionList({
+      confirmResult: true,
+      promptResult: null,
+      withToasts: true,
+    });
+    await act(async () => {
+      await result.current.batchUpdateSessions(["webdropme001", "webkeepme001"], "delete");
+    });
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(result.current.sessions).toEqual([]);
+    expect(screen.getByRole("status")).toHaveTextContent("已删除 2 条会话");
   });
 
   test("batchUpdateSessions 归档乐观更新，失败回滚", async () => {

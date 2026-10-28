@@ -104,7 +104,7 @@ describe("Sidebar 管理中心入口副标题", () => {
 // ── 会话列表本体 ───────────────────────────────────────────────────────────────
 // 之前本文件的 5 条用例全跑在 sessions: [] 上:列表渲染、选中态、改名/删除入口、
 // 搜索过滤**一条都没被覆盖**,而这些是侧栏唯一的日常用途,删除还是不可逆动作
-// (useSessionList 的确认文案:「本地与云端记录都将删除,不可恢复」)。
+// (useSessionList 的确认文案:「本地与云端记录都将删除，不可恢复」)。
 // 断言的是用户可见事实,不锁 class/DOM 排列。
 function session(over: Partial<Session> & { id: string }): Session {
   return {
@@ -753,8 +753,8 @@ describe("Sidebar 会话状态点", () => {
 
     const runImgs = leadImgs("正在跑");
     expect(runImgs).toHaveLength(1);
-    // 运行中 = info 色细线旋转环（形状与实心点可辨，不只靠颜色，SIDEBAR-R1）。
-    expect(runImgs[0]).toHaveClass("border-info", "oc-session-running");
+    // 运行中 = 细线旋转环（形状与实心点可辨，不只靠颜色，SIDEBAR-R1）；颜色走 --status-running 别名（UI-0 状态表）。
+    expect(runImgs[0]).toHaveClass("border-status-running", "oc-session-running");
     expect(runImgs[0]).toHaveAttribute("data-dot-kind", "running");
     expect(runImgs[0]).toHaveAccessibleName("运行中");
     expect(
@@ -768,20 +768,20 @@ describe("Sidebar 会话状态点", () => {
 
     const unreadImgs = leadImgs("未读完成");
     expect(unreadImgs).toHaveLength(1);
-    // 未读 = accent 实心点（「有新结果未看」的通用语汇，SIDEBAR-R1）。
-    expect(unreadImgs[0]).toHaveClass("bg-accent");
+    // 未读 = 实心点，与运行中同色调（「有新结果未看」的通用语汇，SIDEBAR-R1；UI-SPEC §4.3）。
+    expect(unreadImgs[0]).toHaveClass("bg-status-running");
     expect(unreadImgs[0]).toHaveAttribute("data-dot-kind", "unread");
     expect(unreadImgs[0]).toHaveAccessibleName("未读");
     expect(screen.getAllByRole("img", { name: "未读" })).toHaveLength(1);
 
     const errImgs = leadImgs("崩了");
     expect(errImgs).toHaveLength(1);
-    expect(errImgs[0]).toHaveClass("bg-danger");
+    expect(errImgs[0]).toHaveClass("bg-status-failed");
     expect(errImgs[0]).toHaveAccessibleName("出错");
 
     const rstImgs = leadImgs("被重启");
     expect(rstImgs).toHaveLength(1);
-    expect(rstImgs[0]).toHaveClass("bg-warning");
+    expect(rstImgs[0]).toHaveClass("bg-status-attention");
     expect(rstImgs[0]).toHaveAccessibleName("服务重启中断，可继续");
 
     const idleRow = screen.getByRole("button", { name: "从没跑过" }).closest("div")!;
@@ -1358,7 +1358,7 @@ describe("Sidebar 运行中置顶", () => {
     expect(sessionTitlesInList()).toEqual(["乙的运行", "甲的空闲", "default 运行"]);
   });
 
-  it("折叠项目行显示同款闪烁蓝点与运行中数量；展开后提示消失、会话点仍在", () => {
+  it("折叠项目行显示同款运行中旋转环与运行中数量；展开后提示消失、会话点仍在", () => {
     const projects = [project({ id: "p-work", name: "工作", sessionCount: 3 })];
     const sessions = [
       session({ id: "s-run-a", title: "跑着 A", projectId: "p-work", updatedAt: iso(11), runState: "running" }),
@@ -1378,7 +1378,7 @@ describe("Sidebar 运行中置顶", () => {
     expect(collapsedBtn.querySelector("[data-project-running='2']")).toHaveTextContent("2");
     const collapsedDot = collapsedBtn.querySelector("[role='img']");
     expect(collapsedDot).toHaveAccessibleName("运行中");
-    expect(collapsedDot).toHaveClass("border-info", "oc-session-running");
+    expect(collapsedDot).toHaveClass("border-status-running", "oc-session-running");
 
     rerender(
       <Sidebar
@@ -1397,11 +1397,11 @@ describe("Sidebar 运行中置顶", () => {
     const expandedBtn = screen.getByRole("button", { name: /工作/ });
     expect(expandedBtn.querySelector("[data-project-running]")).toBeNull();
     expect(screen.getByRole("button", { name: "跑着 A" })).toBeInTheDocument();
-    expect(leadImgs("跑着 A")[0]).toHaveClass("border-info", "oc-session-running");
+    expect(leadImgs("跑着 A")[0]).toHaveClass("border-status-running", "oc-session-running");
     expect(sessionTitlesInList()).toEqual(["跑着 A", "跑着 B", "空闲"]);
   });
 
-  it("折叠的 default 组有运行中时同样给出蓝点与数量", () => {
+  it("折叠的 default 组有运行中时同样给出运行中标记与数量", () => {
     renderSidebar({
       sessions: [
         session({ id: "s-run", title: "default 跑", runState: "running" }),

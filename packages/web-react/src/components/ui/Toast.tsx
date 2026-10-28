@@ -1,9 +1,11 @@
 import { CheckCircle2, Info, TriangleAlert, X } from "lucide-react";
 import {
   createContext,
+  type RefObject,
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -30,6 +32,8 @@ export type ToastTone = "success" | "error" | "info";
 export type ToastOptions = {
   actionLabel?: string;
   onAction?: () => void;
+  /** 追踪号。不进正文,收进「复制追踪号」按钮;message 尾部的「（追踪号 …）」会自动剥出来放这里。 */
+  traceId?: string;
 };
 
 export type ToastFn = (message: string, tone?: ToastTone, options?: ToastOptions) => void;
@@ -37,6 +41,7 @@ export type ToastFn = (message: string, tone?: ToastTone, options?: ToastOptions
 type ToastItem = {
   id: number;
   message: string;
+  traceId?: string;
   tone: ToastTone;
   actionLabel?: string;
   onAction?: () => void;
@@ -47,6 +52,75 @@ type ToastItem = {
 };
 
 const MAX_ERROR_TOASTS = 3;
+
+/**
+ * apiErrorMessage / withReqId 给未知错误烙在尾部的「（追踪号 …）」(lib/api.ts REQ_ID_SUFFIX_RE)。
+ * 跟踪号是给反馈和排障用的,不是给用户读的:正文只留人话,号码收进复制按钮(UI-SPEC §1.1 C6)。
+ * 全仓几十处 `toast(apiErrorMessage(e, …), "error")` 不必逐个改。
+ */
+const TRACE_SUFFIX_RE = /\s*[（(]\s*[追跟]踪号[\s:：]*([^）)\s]+)\s*[）)]\s*$/;
+
+export function splitTraceId(message: string): { text: string; traceId?: string } {
+  const m = TRACE_SUFFIX_RE.exec(message);
+  if (!m || m.index === 0) return { text: message };
+  return { text: message.slice(0, m.index), traceId: m[1] };
+}
+
+/** 轨道与顶栏下沿之间的间距(px)。 */
+const TOAST_GAP_PX = 8;
+
+/**
+ * 顶栏把自己的实测下沿登记成 toast 轨道的顶距(--oc-toast-top),toast 就落在顶栏下面、不压住它。
+ * 手机顶栏会折成两行(模型行 basis-full),固定的 4rem 正好压住第二行;高度变化(换行、横竖屏)
+ * 由 ResizeObserver 跟上。卸载时撤掉,回落到 styles.css 的默认值。
+ */
+export function useToastAnchor(ref: RefObject<HTMLElement | null>) {
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const publish = () => {
+      const bottom = Math.ceil(el.getBoundingClientRect().bottom);
+      root.style.setProperty("--oc-toast-top", `${bottom + TOAST_GAP_PX}px`);
+    };
+    publish();
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      root.style.removeProperty("--oc-toast-top");
+    };
+  }, [ref]);
+}
+
+/** 「复制追踪号」。剪贴板不可用(非安全上下文)时把号码直接亮出来,反馈时仍然拿得到。 */
+function TraceIdButton({ traceId }: { traceId: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "shown">("idle");
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  if (state === "shown") {
+    return <span className="shrink-0 select-all font-mono text-caption opacity-80">{traceId}</span>;
+  }
+  return (
+    <button
+      type="button"
+      title={`追踪号 ${traceId}`}
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(traceId);
+          setState("copied");
+          window.clearTimeout(timer.current);
+          timer.current = window.setTimeout(() => setState("idle"), 1400);
+        } catch {
+          setState("shown");
+        }
+      }}
+      className="shrink-0 rounded-md px-2 py-1 text-meta font-medium opacity-80 outline-none transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg [@media(hover:none)]:min-h-11"
+    >
+      {state === "copied" ? "已复制" : "复制追踪号"}
+    </button>
+  );
+}
 
 const ToastContext = createContext<ToastFn | null>(null);
 
@@ -96,6 +170,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     // tone 的默认值在体内取(而非默认参数):options 排在它后面,默认参数不能在必填/可选参数之前。
     (message, toneArg, options) => {
       if (!message) return;
+      const split = splitTraceId(message);
+      const traceId = options?.traceId ?? split.traceId;
       const tone = toneArg ?? "info";
       const id = ++seq.current;
       const actionable = Boolean(options?.actionLabel && options?.onAction);
@@ -103,7 +179,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       setItems((cur) => {
         const item: ToastItem = {
           id,
-          message,
+          message: split.text,
+          traceId,
           tone,
           actionLabel: actionable ? options?.actionLabel : undefined,
           onAction: actionable ? options?.onAction : undefined,
@@ -144,11 +221,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={toast}>
       {children}
       {/* 顶部居中堆叠，pointer-events 仅落在卡片上，不挡下层交互。
-          顶距走 styles.css 的 --oc-toast-top(默认 4rem),不再写死 top-16:轨道要压在 ChatHeader
-          下沿,而头部高度是另一处文件定的,两处各写各的会在头部改高时压上去或悬空(shell 审计 S-20)。 */}
+          顶距走 --oc-toast-top:有顶栏时是顶栏实测下沿(useToastAnchor),否则取 styles.css 的默认值。
+          不再写死 top-16(shell 审计 S-20),也不再自带安全区内边距(实测下沿已经包含)。 */}
       <div
         data-toast-rail
-        className="pointer-events-none fixed inset-x-0 top-[var(--oc-toast-top,4rem)] z-[100] flex flex-col items-center gap-2 px-3 header-safe-t"
+        className="pointer-events-none fixed inset-x-0 top-[var(--oc-toast-top)] z-[100] flex flex-col items-center gap-2 px-3"
       >
         {items.map((t) => {
           const s = TONE_STYLE[t.tone];
@@ -178,6 +255,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             >
               <span className="shrink-0">{s.icon}</span>
               <span className="min-w-0 flex-1 break-words">{t.message}</span>
+              {t.traceId && <TraceIdButton traceId={t.traceId} />}
               {t.actionLabel && (
                 <button
                   type="button"

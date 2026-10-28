@@ -147,10 +147,10 @@ export function ProjectRow({
           data-project-running={runningCount}
           title={`${runningCount} 个运行中`}
           aria-label={`${runningCount} 个运行中`}
-          className="flex shrink-0 items-center gap-1 rounded-full bg-info-soft px-1.5 py-px"
+          className="flex shrink-0 items-center gap-1 rounded-full bg-status-running/10 px-1.5 py-px"
         >
           <SessionStatusDot running />
-          <span className="tabular-nums text-caption text-info">{runningCount}</span>
+          <span className="tabular-nums text-caption text-status-running">{runningCount}</span>
         </span>
       )}
       <span className="tabular-nums text-caption text-faint">{count}</span>
