@@ -234,6 +234,7 @@ const MessageRendererInner = memo(
             cb={cb}
             failurePresentedBelow={failurePresentedBelow}
             readOnly={readOnly}
+            awaitingReply={sending && isLast}
           />
         );
       case "assistant":
