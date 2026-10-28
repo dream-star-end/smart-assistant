@@ -15,6 +15,7 @@ const read = (p: string) => readFileSync(join(ROOT, p), 'utf8')
 const data = inputs(ROOT)
 const sha = 'a'.repeat(40)
 const repository = 'owner/selfhost'
+const repositoryId = 4321
 const identity: Identity = { repository, sourceSha: sha,
   sourceRef: `${QUEUE_REF}pr-123-${sha}`, runId: 1234, runAttempt: 2 }
 const outcomes = Object.fromEntries(data.gates.map(id => [
@@ -23,9 +24,15 @@ const outcomes = Object.fromEntries(data.gates.map(id => [
 const good = () => makeReceipt(identity, data, outcomes)
 const run = (): Run => ({ id: identity.runId, run_attempt: identity.runAttempt, head_sha: sha,
   head_branch: identity.sourceRef.replace('refs/heads/', ''), path: WORKFLOW, event: 'merge_group',
-  status: 'completed', conclusion: 'success', repository: { full_name: repository },
-  head_repository: { full_name: repository } })
+  status: 'completed', conclusion: 'success', repository: { id: repositoryId, full_name: repository },
+  head_repository: { id: repositoryId, full_name: repository } })
 const artifactName = `selfhost-gate-receipt-${sha}-${identity.runAttempt}`
+const artifact = () => ({ id: 987, name: artifactName, expired: false, size_in_bytes: 1024,
+  workflow_run: { id: identity.runId, repository_id: repositoryId, head_repository_id: repositoryId,
+    head_sha: sha, head_branch: run().head_branch } })
+const certificate = () => ({ buildTrigger: 'merge_group',
+  runInvocationURI: `https://github.com/${repository}/actions/runs/${identity.runId}/attempts/${identity.runAttempt}` })
+const verified = (cert: unknown = certificate()) => [{ verificationResult: { signature: { certificate: cert } } }]
 const zip = (body: string, filename = 'receipt.json') => execFileSync('python3', ['-c', `
 import io, sys, zipfile
 b = io.BytesIO()
@@ -75,39 +82,64 @@ test('GitHub run must itself be an exact successful selfhost merge-group attempt
     { event: 'push' }, { event: 'pull_request' }, { status: 'in_progress' },
     { conclusion: 'failure' }, { conclusion: 'cancelled' }, { conclusion: 'skipped' },
     { head_branch: 'gh-readonly-queue/feat/v5-aurora-rewrite/pr-123' },
-    { repository: { full_name: 'other/repo' } }, { head_repository: { full_name: 'fork/repo' } },
+    { repository: { id: repositoryId, full_name: 'other/repo' } },
+    { head_repository: { id: repositoryId, full_name: 'fork/repo' } },
+    { repository: { id: 0, full_name: repository } },
+    { head_repository: { id: repositoryId + 1, full_name: repository } },
     { id: -1 }, { run_attempt: 0 },
   ]) assert.throws(() => validateRun({ ...run(), ...change }, repository, sha))
 })
 
+test('identity rejects dot-segment repositories and invalid or empty queue refs', () => {
+  for (const repo of ['../selfhost', 'owner/..', 'owner/.']) {
+    assert.throws(() => makeReceipt({ ...identity, repository: repo }, data, outcomes), repo)
+  }
+  for (const suffix of ['', '../pr-1', '.hidden', 'pr-1/../pr-2', 'pr-1//nested', 'pr-1/', 'pr-1.', 'pr-1.lock']) {
+    assert.throws(() => makeReceipt({ ...identity, sourceRef: `${QUEUE_REF}${suffix}` }, data, outcomes), suffix)
+  }
+})
+
 test('archive reader rejects wrong paths and oversized expanded content', () => {
   assert.equal(extractReceipt(zip('receipt')).toString(), 'receipt')
+  assert.equal(extractReceipt(zip('x'.repeat(32 * 1024))).length, 32 * 1024)
   for (const name of ['../receipt.json', '/receipt.json', 'other.json']) {
     assert.throws(() => extractReceipt(zip('{}', name)))
   }
   assert.throws(() => extractReceipt(zip('x'.repeat(33 * 1024))))
+  assert.throws(() => extractReceipt(zip('x'.repeat(32 * 1024 + 1))))
   assert.throws(() => extractReceipt(Buffer.from('not zip')))
   assert.throws(() => extractReceipt(Buffer.alloc(129 * 1024)))
+  const encrypted = zip('{}')
+  encrypted.writeUInt16LE(encrypted.readUInt16LE(6) | 1, 6)
+  const central = encrypted.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]))
+  assert.ok(central > 0, 'ZIP fixture must have a central directory')
+  encrypted.writeUInt16LE(encrypted.readUInt16LE(central + 8) | 1, central + 8)
+  assert.throws(() => extractReceipt(encrypted))
 })
 
 function mockGithub(overrides: { receipt?: unknown; signatureFails?: boolean; run?: Run;
-  fresh?: Run; artifacts?: unknown; apiFails?: boolean } = {}): { gh: Gh; calls: string[][] } {
+  fresh?: Run; artifacts?: unknown; apiFails?: boolean; attestation?: unknown;
+  archive?: Buffer; runs?: unknown } = {}): { gh: Gh; calls: string[][] } {
   const calls: string[][] = []
   const gh: Gh = args => {
     calls.push(args)
     if (overrides.apiFails) throw new Error('timeout')
     if (args[0] === 'attestation') {
-      assert.deepEqual(args, attestationArgs(args[2]!, identity))
+      // Independent contract: do not derive the expectation from the production helper.
+      assert.deepEqual(args, ['attestation', 'verify', args[2], '--hostname', 'github.com',
+        '--repo', repository, '--signer-workflow', `${repository}/${WORKFLOW}`,
+        '--signer-digest', sha, '--source-digest', sha, '--source-ref', identity.sourceRef,
+        '--deny-self-hosted-runners', '--predicate-type', 'https://slsa.dev/provenance/v1', '--format', 'json'])
       assert.deepEqual(JSON.parse(readFileSync(args[2]!, 'utf8')), good())
       if (overrides.signatureFails) throw new Error('bad signature')
-      return Buffer.from('verified')
+      return Buffer.from(JSON.stringify('attestation' in overrides ? overrides.attestation : verified()))
     }
     const path = args.at(-1)!
     let result: unknown
-    if (path.includes('/workflows/')) result = { workflow_runs: [overrides.run ?? run()] }
+    if (path.includes('/workflows/')) result = overrides.runs ?? { workflow_runs: [overrides.run ?? run()] }
     else if (path.includes('/artifacts?')) result = overrides.artifacts ?? { total_count: 1,
-      artifacts: [{ id: 987, name: artifactName, expired: false, size_in_bytes: 1024 }] }
-    else if (path.endsWith('/zip')) return zip(JSON.stringify(overrides.receipt ?? good()))
+      artifacts: [artifact()] }
+    else if (path.endsWith('/zip')) return overrides.archive ?? zip(JSON.stringify(overrides.receipt ?? good()))
     else result = overrides.fresh ?? run()
     return Buffer.from(JSON.stringify(result))
   }
@@ -121,6 +153,75 @@ test('fetch validates downloaded bytes AND signature identity; leaves no accepta
   assert.equal(calls.filter(c => c[0] === 'attestation').length, 1)
   assert.ok(calls[0]!.at(-1)!.includes(`head_sha=${sha}&event=merge_group`))
   assert.deepEqual(readdirSync(dir), [])
+})
+
+test('certificate run, attempt and event must match even after gh exits successfully', t => {
+  const dir = fixture(t)
+  for (const attestation of [null, {}, [], 'verified', verified(null), verified({}),
+    verified({ ...certificate(), buildTrigger: 'pull_request' }),
+    verified({ ...certificate(), runInvocationURI: certificate().runInvocationURI.replace('/1234/', '/5678/') }),
+    verified({ ...certificate(), runInvocationURI: certificate().runInvocationURI.replace('/attempts/2', '/attempts/1') }),
+    verified({ ...certificate(), runInvocationURI: `${certificate().runInvocationURI}/extra` }),
+    verified({ ...certificate(), runInvocationURI: certificate().runInvocationURI.replace(repository, 'fork/selfhost') }),
+    [{ verificationResult: { statement: { predicate: certificate() } } }],
+    [...verified(), ...verified({ ...certificate(), buildTrigger: 'push' })],
+  ]) {
+    const { gh, calls } = mockGithub({ attestation })
+    assert.throws(() => fetchReceipt(ROOT, repository, sha, dir, gh))
+    assert.deepEqual(readdirSync(dir), [])
+    assert.equal(calls.at(-1)![0], 'attestation', 'reject before final API recheck')
+  }
+})
+
+test('artifact metadata is tied to the authenticated workflow run before downloading', t => {
+  const dir = fixture(t)
+  const changes = [
+    { id: 0 }, { id: Number.MAX_SAFE_INTEGER + 1 }, { size_in_bytes: 0 }, { size_in_bytes: 131073 },
+    { name: `${artifactName}-other` }, { expired: 'false' }, { workflow_run: undefined },
+    ...Object.entries({ id: identity.runId + 1, repository_id: repositoryId + 1,
+      head_repository_id: repositoryId + 1, head_sha: 'b'.repeat(40), head_branch: 'main' })
+      .map(([key, value]) => ({ workflow_run: { ...artifact().workflow_run, [key]: value } })),
+  ]
+  for (const change of changes) {
+    const { gh, calls } = mockGithub({ artifacts: { total_count: 1, artifacts: [{ ...artifact(), ...change }] } })
+    assert.throws(() => fetchReceipt(ROOT, repository, sha, dir, gh))
+    assert.equal(calls.length, 2, 'invalid metadata must not download or invoke verification')
+    assert.deepEqual(readdirSync(dir), [])
+  }
+})
+
+test('missing or ambiguous run pages and malformed downloads fail without acceptance state', t => {
+  const dir = fixture(t)
+  for (const override of [
+    { runs: {} }, { runs: { workflow_runs: [] } }, { runs: { workflow_runs: [run(), run()] } },
+    { runs: { workflow_runs: { 0: run() } } }, { archive: zip('invalid JSON') },
+    { archive: Buffer.from('invalid zip') },
+    { fresh: { ...run(), repository: { id: repositoryId + 1, full_name: repository },
+      head_repository: { id: repositoryId + 1, full_name: repository } } },
+  ]) {
+    assert.throws(() => fetchReceipt(ROOT, repository, sha, dir, mockGithub(override).gh))
+    assert.deepEqual(readdirSync(dir), [])
+  }
+  assert.deepEqual(attestationArgs('/tmp/receipt.json', identity).slice(-2), ['--format', 'json'])
+})
+
+test('archive reader rejects duplicate, directory, symlink and special-device entries', () => {
+  for (const kind of ['duplicate', 'directory', 'symlink', 'device']) {
+    const bytes = execFileSync('python3', ['-c', `
+import io, stat, sys, zipfile, warnings
+warnings.simplefilter('ignore', UserWarning)
+b = io.BytesIO()
+with zipfile.ZipFile(b, 'w') as z:
+    f = zipfile.ZipInfo('receipt.json')
+    f.create_system = 3
+    f.external_attr = {'directory': stat.S_IFDIR, 'symlink': stat.S_IFLNK,
+                       'device': stat.S_IFCHR, 'duplicate': stat.S_IFREG}[sys.argv[1]] << 16
+    z.writestr(f, '{}')
+    if sys.argv[1] == 'duplicate': z.writestr('receipt.json', '{}')
+sys.stdout.buffer.write(b.getvalue())
+`, kind])
+    assert.throws(() => extractReceipt(bytes), kind)
+  }
 })
 
 test('missing/malformed evidence, verifier errors and rerun races never return acceptance', t => {
@@ -197,6 +298,38 @@ test -z "$MASTER_GATE_RECEIPT_SHA"
 `, dir)
     assert.equal(result.status, 0, result.stderr)
     assert.ok(!result.stdout.includes('SHOULD_NOT_RUN'))
+  }
+})
+
+test('prepare accepts a verified CLI hit then drops every gate on a later failed or disabled lookup', t => {
+  const dir = fixture(t)
+  for (const next of ['off', 'failed-with-output', 'malformed']) {
+    const result = bash(`
+mlog() { :; }
+tsum_note() { echo "NOTE $1=$2"; }
+MASTER_GATE_TMPDIR=${quote(dir)}
+OC_SELFHOST_GATE_RECEIPTS=1
+timeout() { printf '%s' ${quote(JSON.stringify(good()))}; }
+master_gate_receipt_prepare ${quote(dir)} ${sha}
+test "$MASTER_GATE_RECEIPT_SHA" = ${sha}
+test "$MASTER_GATE_RECEIPT_IDS" = ${quote(data.gates.join('\n'))}
+master_gate_receipt_has watch-gate ${sha}
+! master_gate_receipt_has box-success-recovery ${sha}
+! master_gate_receipt_has watch ${sha}
+${next === 'off' ? 'OC_SELFHOST_GATE_RECEIPTS=0'
+  : next === 'failed-with-output' ? `timeout() { printf '%s' ${quote(JSON.stringify(good()))}; return 1; }`
+    : 'timeout() { echo broken-json; }'}
+master_gate_receipt_prepare ${quote(dir)} ${'b'.repeat(40)}
+test -z "$MASTER_GATE_RECEIPT_SHA"
+test -z "$MASTER_GATE_RECEIPT_IDS"
+! master_gate_receipt_has watch-gate ${sha}
+! master_gate_receipt_has watch-gate ${'b'.repeat(40)}
+`, dir)
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /NOTE gateReceipt.run=1234\/2/)
+    assert.match(result.stdout, /NOTE gateEvidence.watch-gate=merge-queue-receipt/)
+    assert.match(result.stdout, /NOTE gateEvidence.box-success-recovery=local/)
+    assert.match(result.stdout, /NOTE gateEvidence.watch-gate=local/)
   }
 })
 

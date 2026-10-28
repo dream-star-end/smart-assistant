@@ -27,10 +27,10 @@ jobs:
           node-version: '20'
           cache: npm
       - run: npm ci
-      - run: npx tsx --test scripts/__tests__/selfhostGateReceipt.test.ts scripts/__tests__/checkReleaseGateParity.test.ts
+      - run: npx tsx --test scripts/__tests__/selfhostGateReceipt.test.ts scripts/__tests__/selfhostGateReceiptCli.test.ts scripts/__tests__/checkReleaseGateParity.test.ts
       - run: npx tsx scripts/check-release-gate-parity.ts
       - name: Receipt typecheck
-        run: npx tsc --noEmit --strict --skipLibCheck --esModuleInterop --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 scripts/lib/selfhostGateReceipt.ts scripts/v5-selfhost-gate-receipts.ts scripts/__tests__/selfhostGateReceipt.test.ts
+        run: npx tsc --noEmit --strict --skipLibCheck --esModuleInterop --allowImportingTsExtensions --module NodeNext --moduleResolution NodeNext --target ES2022 scripts/lib/selfhostGateReceipt.ts scripts/v5-selfhost-gate-receipts.ts scripts/__tests__/selfhostGateReceipt.test.ts scripts/__tests__/selfhostGateReceiptCli.test.ts
       - run: bash -n scripts/lib/v5-selfhost-gate-receipts.sh scripts/v5-selfhost-master-release-lib.sh
 
   gates:

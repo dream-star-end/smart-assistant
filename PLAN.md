@@ -148,3 +148,31 @@ remain separate activation prerequisites, not claimed by mock tests.
 Contract references: [gh verified JSON](https://cli.github.com/manual/gh_attestation_verify),
 [Fulcio certificate extensions](https://github.com/sigstore/sigstore-go/blob/main/pkg/fulcio/certificate/extensions.go),
 [Actions artifact API](https://docs.github.com/en/rest/actions/artifacts#list-workflow-run-artifacts).
+
+
+### Deepen implementation and validation
+
+- Plan review `train-p8-deepen-plan-review-r1.txt`: APPROVED, gpt-6-astra/xhigh.
+- Certificate checks use the flat `verificationResult.signature.certificate` fields from
+  verified gh JSON. Every returned verification must bind the exact run/attempt and
+  merge_group trigger; payload/predicate lookalikes do not count.
+- Run repository IDs are required positive safe integers; artifact run ID, head SHA/ref
+  and both repository IDs must match. Final run recheck also preserves repository ID.
+- Archive boundaries include exactly 32 KiB accepted, one byte over rejected, and rejection
+  of encrypted, duplicate, directory, symlink and device entries. No paths are extracted.
+- New CLI tests execute the actual issue/fetch entrypoint with a tiny temporary git fixture
+  and a local fake gh process. They cover exact checkout/event, failed or masked gates,
+  create-once output, redaction, real subprocess timeout, signature failure and old attempt.
+  Shell tests cover a successful preparation followed by disabled/malformed/failed lookup,
+  empty state, host-gate nonacceptance, summary evidence and original local failure propagation.
+- Red/green evidence: the new repository/ref, artifact-run and special-file tests fail on
+  the previous implementation. Final focused suite: **55 passed, 0 failed, 0 skipped**.
+  Full summary suite, strict scoped tsc, changed-file Biome, shell syntax and parity all PASS.
+  Manifest/parity remain unchanged from 35326165f; policy/train shell unchanged from 02907d209.
+- During validation, explicit assertion messages fixed expensive Node 20/tsx default assertion
+  source inspection on invalid metadata; conditions remain identical. A test-only fake-gh
+  newline escaping bug and a test fixture union type were fixed, not retried or waived.
+- Logs are task-owned `H/train-p8-deepen-{tests-final,summary,typecheck,lint,parity,syntax}.log`.
+  No shared test lock, heavy suite, dependency installation or production mutation occurred.
+- Supported real gh/attestation acceptance, actual merge_group drill and gate-policy approval
+  remain required before any activation. This change does not claim those prerequisites passed.

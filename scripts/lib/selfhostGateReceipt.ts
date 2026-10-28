@@ -11,7 +11,7 @@ export const BASE_REF = 'refs/heads/feat/v5-selfhost'
 export const QUEUE_REF = 'refs/heads/gh-readonly-queue/feat/v5-selfhost/'
 const SCHEMA = 'oc.v5.selfhost.gate-receipt/1'
 const SHA = /^[0-9a-f]{40}$/
-const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+const REPO = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.{1,2}$)[A-Za-z0-9_.-]+$/
 const MAX_JSON = 32 * 1024
 const MAX_ZIP = 128 * 1024
 
@@ -44,8 +44,8 @@ export interface Run {
   event: string
   status: string
   conclusion: string | null
-  repository: { full_name: string }
-  head_repository: { full_name: string }
+  repository: { id: number; full_name: string }
+  head_repository: { id: number; full_name: string }
 }
 
 export function inputs(root: string): Inputs {
@@ -55,10 +55,10 @@ export function inputs(root: string): Inputs {
   const policy = JSON.parse(bytes(POLICY).toString())
   assert.equal(manifest.schema, 'oc.v5.selfhost.release-gates/1')
   assert.equal(policy.schema, 'oc.v5.selfhost.gate-receipt-policy/1')
-  assert.ok(Array.isArray(policy.gates) && policy.gates.length > 0)
+  assert.ok(Array.isArray(policy.gates) && policy.gates.length > 0, 'nonempty gate policy required')
   assert.equal(new Set(policy.gates).size, policy.gates.length)
   for (const id of policy.gates) {
-    assert.ok(typeof id === 'string' && /^[a-z][a-z0-9-]+$/.test(id))
+    assert.ok(typeof id === 'string' && /^[a-z][a-z0-9-]+$/.test(id), 'invalid gate ID')
     const gate = manifest.gates.find((g: { id: string }) => g.id === id)
     assert.ok(gate?.script && !gate.stage && gate.ci, 'only build gates with existing CI')
   }
@@ -69,9 +69,11 @@ export function inputs(root: string): Inputs {
 function validIdentity(i: Identity): void {
   assert.match(i.repository, REPO)
   assert.match(i.sourceSha, SHA)
-  assert.ok(i.sourceRef.startsWith(QUEUE_REF) && /^[A-Za-z0-9/_.-]+$/.test(i.sourceRef))
-  assert.ok(Number.isSafeInteger(i.runId) && i.runId > 0)
-  assert.ok(Number.isSafeInteger(i.runAttempt) && i.runAttempt > 0)
+  assert.ok(i.sourceRef.startsWith(QUEUE_REF) && /^[A-Za-z0-9/_.-]+$/.test(i.sourceRef), 'invalid queue ref')
+  assert.ok(i.sourceRef.split('/').every(part => part.length > 0 && !part.startsWith('.')
+    && !part.endsWith('.') && !part.endsWith('.lock') && !part.includes('..')), 'invalid git ref segment')
+  assert.ok(Number.isSafeInteger(i.runId) && i.runId > 0, 'invalid run ID')
+  assert.ok(Number.isSafeInteger(i.runAttempt) && i.runAttempt > 0, 'invalid run attempt')
 }
 
 export function makeReceipt(i: Identity, data: Inputs,
@@ -91,6 +93,8 @@ export function validateRun(run: Run, repository: string, sha: string): Identity
   validIdentity(identity)
   assert.equal(run.repository.full_name, repository)
   assert.equal(run.head_repository.full_name, repository)
+  assert.ok(Number.isSafeInteger(run.repository.id) && run.repository.id > 0, 'invalid repository ID')
+  assert.equal(run.head_repository.id, run.repository.id)
   assert.equal(run.head_sha, sha)
   assert.equal(run.path, WORKFLOW)
   assert.equal(run.event, 'merge_group')
@@ -122,11 +126,24 @@ export function attestationArgs(path: string, i: Identity): string[] {
   return ['attestation', 'verify', path, '--hostname', 'github.com', '--repo', i.repository,
     '--signer-workflow', `${i.repository}/${WORKFLOW}`, '--signer-digest', i.sourceSha,
     '--source-digest', i.sourceSha, '--source-ref', i.sourceRef, '--deny-self-hosted-runners',
-    '--predicate-type', 'https://slsa.dev/provenance/v1']
+    '--predicate-type', 'https://slsa.dev/provenance/v1', '--format', 'json']
+}
+
+function validateAttestation(output: Buffer, i: Identity): void {
+  const verified: unknown = JSON.parse(output.toString())
+  assert.ok(Array.isArray(verified) && verified.length > 0, 'missing verified attestations')
+  for (const result of verified) {
+    // These are OIDC-derived certificate fields, not the user-controlled predicate or receipt.
+    // gh has already verified the signature, subject bytes and all attestationArgs constraints.
+    const cert = result?.verificationResult?.signature?.certificate
+    assert.equal(cert?.runInvocationURI,
+      `https://github.com/${i.repository}/actions/runs/${i.runId}/attempts/${i.runAttempt}`)
+    assert.equal(cert?.buildTrigger, 'merge_group')
+  }
 }
 
 export function extractReceipt(zip: Buffer): Buffer {
-  assert.ok(zip.length <= MAX_ZIP)
+  assert.ok(zip.length <= MAX_ZIP, 'receipt archive too large')
   // Read one bounded regular entry into memory; never extract paths or execute downloaded code.
   const result = spawnSync('python3', ['-c', `
 import io, stat, sys, zipfile
@@ -135,7 +152,9 @@ entries = z.infolist()
 assert len(entries) == 1
 f = entries[0]
 assert f.filename == 'receipt.json' and f.file_size <= ${MAX_JSON}
-assert not f.is_dir() and not stat.S_ISLNK(f.external_attr >> 16)
+assert not f.is_dir() and not (f.flag_bits & 1)
+# ZIP writers may omit the Unix type bits; when present they must identify a regular file.
+assert stat.S_IFMT(f.external_attr >> 16) in (0, stat.S_IFREG)
 sys.stdout.buffer.write(z.read(f))
 `], { input: zip, timeout: 5000, killSignal: 'SIGKILL', maxBuffer: MAX_JSON,
     stdio: ['pipe', 'pipe', 'pipe'] })
@@ -152,6 +171,7 @@ export function fetchReceipt(root: string, repository: string, sha: string, scra
   const prefix = `repos/${repository}/actions`
   // No waiting for CI while holding a release lock. An unavailable or unfinished run is a miss.
   const runs = api(`${prefix}/workflows/${WORKFLOW.split('/').at(-1)}/runs?head_sha=${sha}&event=merge_group&per_page=1`)
+  assert.ok(Array.isArray(runs.workflow_runs) && runs.workflow_runs.length === 1, 'expected one latest run')
   const run: Run = runs.workflow_runs[0]
   const identity = validateRun(run, repository, sha)
   const name = `selfhost-gate-receipt-${sha}-${identity.runAttempt}`
@@ -161,9 +181,14 @@ export function fetchReceipt(root: string, repository: string, sha: string, scra
   const artifact = artifacts.artifacts[0]
   assert.equal(artifact.name, name)
   assert.equal(artifact.expired, false)
-  assert.ok(Number.isSafeInteger(artifact.id) && artifact.id > 0)
+  assert.ok(Number.isSafeInteger(artifact.id) && artifact.id > 0, 'invalid artifact ID')
   assert.ok(Number.isSafeInteger(artifact.size_in_bytes) && artifact.size_in_bytes > 0
-    && artifact.size_in_bytes <= MAX_ZIP)
+    && artifact.size_in_bytes <= MAX_ZIP, 'invalid artifact size')
+  assert.equal(artifact.workflow_run.id, identity.runId)
+  assert.equal(artifact.workflow_run.head_sha, sha)
+  assert.equal(artifact.workflow_run.head_branch, run.head_branch)
+  assert.equal(artifact.workflow_run.repository_id, run.repository.id)
+  assert.equal(artifact.workflow_run.head_repository_id, run.head_repository.id)
   const bytes = extractReceipt(gh(['api', '--hostname', 'github.com',
     `${prefix}/artifacts/${artifact.id}/zip`], MAX_ZIP))
   const receipt: unknown = JSON.parse(bytes.toString())
@@ -172,10 +197,12 @@ export function fetchReceipt(root: string, repository: string, sha: string, scra
   try {
     const file = join(dir, 'receipt.json')
     writeFileSync(file, bytes, { flag: 'wx', mode: 0o600 })
-    gh(attestationArgs(file, identity))
+    validateAttestation(gh(attestationArgs(file, identity)), identity)
     // Reject a rerun that changed the attempt or invalidated success while we downloaded/verified.
-    const fresh = validateRun(api(`${prefix}/runs/${identity.runId}`), repository, sha)
+    const freshRun: Run = api(`${prefix}/runs/${identity.runId}`)
+    const fresh = validateRun(freshRun, repository, sha)
     assert.deepEqual(fresh, identity)
+    assert.equal(freshRun.repository.id, run.repository.id)
     return receipt
   } finally {
     rmSync(dir, { recursive: true, force: true })
