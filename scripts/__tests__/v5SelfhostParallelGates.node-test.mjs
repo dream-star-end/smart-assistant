@@ -47,6 +47,13 @@ mlog() { echo "$*" >&2; }
 ${['master_gate_load1', 'master_gate_attempt_log', 'master_gate_first_failure'].map(fn).join('\n')}
 tsum_init
 trap 'rc=$?; reap_master_build_jobs; tsum_finish "$rc"' EXIT
+await_file() {
+  local began="$SECONDS"
+  until [[ -f "$1" ]]; do
+    (( SECONDS - began < 10 )) || return 1
+    sleep .01
+  done
+}
 event() { printf '%s\n' "$*" >>"$EVENTS"; }
 `;
 }
@@ -191,6 +198,204 @@ while :; do sleep .05; done
   assert.equal(await exited, 143);
   assert.deepEqual(events(f), ['started', 'done', 'cleanup']);
 });
+
+test('admission summary keeps the exact budget sample even if load changes immediately', (t) => {
+  const f = fixture(t);
+  const r = run(f, `
+master_gate_load1() { cat "$MASTER_GATE_LOADAVG"; echo 8.00 >"$MASTER_GATE_LOADAVG"; }
+echo 0.00 >"$MASTER_GATE_LOADAVG"
+task() { event ran; }
+master_build_job_start sample task
+master_build_jobs_wait
+`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(events(f), ['ran']);
+  assert.equal(notes(f)['job.sample.load1'], '0.00');
+  assert.equal(notes(f)['job.sample.slots'], '3');
+  assert.match(notes(f)['job.sample.pgid'], /^[1-9][0-9]*$/);
+  assert.equal(notes(f)['job.sample.tmpdir'], join(f.dir, 'tmp/sample'));
+});
+
+for (const load of ['8.00', '99.00', 'garbage', '-1', 'NaN']) {
+  test(`load ${load}: timeout latches failure and cannot admit after recovery`, (t) => {
+    const f = fixture(t, load);
+    const r = run(f, `
+MASTER_GATE_IDLE_TIMEOUT_S=0
+task() { event forbidden; }
+if master_build_job_start blocked task; then exit 90; fi
+echo '0.00 0 0 1/1 1' >"$MASTER_GATE_LOADAVG"
+if master_build_job_start later task; then exit 91; fi
+event rejected
+`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(events(f), ['rejected']);
+    assert.equal(notes(f)['job.blocked.admissionFailure'], 'admission-timeout');
+    assert.equal(notes(f)['job.blocked.admissionWaitSec'], '0');
+    assert.equal(notes(f)['job.blocked.pgid'], undefined);
+  });
+}
+
+for (const budget of ['return 2', 'echo 99', 'echo invalid']) {
+  test(`unverifiable slot budget (${budget}) admits nothing`, (t) => {
+    const f = fixture(t);
+    const r = run(f, `
+master_build_job_limit() { ${budget}; }
+MASTER_GATE_IDLE_TIMEOUT_S=0
+task() { event forbidden; }
+if master_build_job_start blocked task; then exit 90; fi
+event rejected
+`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(events(f), ['rejected']);
+    assert.equal(notes(f)['job.blocked.admissionFailure'], 'admission-timeout');
+  });
+}
+
+for (const kind of ['log', 'tmpdir']) {
+  test(`${kind} setup failure blocks later admission and drains already admitted work`, (t) => {
+    const f = fixture(t);
+    const r = run(f, `
+task() { event started; await_file "$EVENTS.release"; test -d "$TMPDIR"; event done; }
+master_build_job_start owned task
+await_file "$EVENTS"
+${kind === 'log' ? 'master_gate_attempt_log() { return 1; }' : 'mkdir "$MASTER_GATE_TMPDIR/blocked"'}
+if master_build_job_start blocked task; then exit 90; fi
+${kind === 'log' ? fn('master_gate_attempt_log') : 'rmdir "$MASTER_GATE_TMPDIR/blocked"'}
+if master_build_job_start later task; then touch "$EVENTS.release"; exit 91; fi
+touch "$EVENTS.release"
+reap_master_build_jobs
+event cleanup
+`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(events(f), ['started', 'done', 'cleanup']);
+    assert.equal(notes(f)['job.blocked.admissionFailure'], `${kind}-setup`);
+    assert.equal(notes(f)['job.owned.rc'], '0');
+  });
+}
+
+test('rising load drains existing work, lowers new admission to two, then pauses at eight until recovery', (t) => {
+  const f = fixture(t);
+  const r = run(f, `
+master_gate_load1() {
+  local load rest
+  read -r load rest <"$MASTER_GATE_LOADAVG"
+  touch "$EVENTS.sample-$load-\${#MASTER_BUILD_JOB_PIDS[@]}"
+  printf '%s' "$load"
+}
+task() {
+  local id="\${TMPDIR##*/}"
+  event "start $id"
+  touch "$EVENTS.started-$id"
+  await_file "$EVENTS.release-$id"
+  event "end $id"
+}
+for id in j0 j1 j2; do master_build_job_start "$id" task; done
+for id in j0 j1 j2; do await_file "$EVENTS.started-$id"; done
+(
+  await_file "$EVENTS.sample-4.00-3"
+  touch "$EVENTS.release-j0"
+  await_file "$EVENTS.sample-4.00-2"
+  test ! -e "$EVENTS.started-j3"
+  touch "$EVENTS.release-j1"
+  await_file "$EVENTS.started-j3"
+  await_file "$EVENTS.sample-8.00-2"
+  touch "$EVENTS.release-j2" "$EVENTS.release-j3"
+  await_file "$EVENTS.sample-8.00-0"
+  test ! -e "$EVENTS.started-j4"
+  echo '0.00 0 0 1/1 1' >"$MASTER_GATE_LOADAVG"
+  touch "$EVENTS.release-j4"
+) & controller=$!
+echo '4.00 0 0 1/1 1' >"$MASTER_GATE_LOADAVG"
+master_build_job_start j3 task
+await_file "$EVENTS.started-j3"
+echo '8.00 0 0 1/1 1' >"$MASTER_GATE_LOADAVG"
+master_build_job_start j4 task
+master_build_jobs_wait
+wait "$controller"
+event drained
+`);
+  assert.equal(r.status, 0, r.stderr);
+  const lines = events(f);
+  assert.ok(lines.indexOf('start j3') > lines.indexOf('end j1'), lines.join('\n'));
+  assert.ok(lines.indexOf('start j4') > lines.indexOf('end j2'), lines.join('\n'));
+  assert.ok(lines.indexOf('start j4') > lines.indexOf('end j3'), lines.join('\n'));
+  for (const id of ['j0', 'j1', 'j2', 'j3', 'j4']) assert.equal(notes(f)[`job.${id}.rc`], '0');
+  assert.equal(notes(f)['job.j3.slots'], '2');
+  assert.equal(notes(f)['job.j4.slots'], '3');
+  assert.equal(lines.at(-1), 'drained');
+});
+
+test('private TMPDIRs keep identical filenames isolated until both workers finish', (t) => {
+  const f = fixture(t);
+  const r = run(f, `
+task() {
+  local id="\${TMPDIR##*/}" other
+  [[ "$id" == a ]] && other=b || other=a
+  printf '%s' "$id" >"$TMPDIR/shared-name"
+  touch "$EVENTS.ready-$id"
+  await_file "$EVENTS.ready-$other"
+  [[ "$(cat "$TMPDIR/shared-name")" == "$id" ]]
+  [[ "$MASTER_GATE_TMPDIR" == "$TMPDIR" ]]
+  event "$id verified"
+}
+master_build_job_start a task
+master_build_job_start b task
+master_build_jobs_wait
+rm -rf "$MASTER_GATE_TMPDIR"
+event cleanup
+`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(events(f).slice(0, 2).sort(), ['a verified', 'b verified']);
+  assert.equal(events(f).at(-1), 'cleanup');
+  assert.notEqual(notes(f)['job.a.tmpdir'], notes(f)['job.b.tmpdir']);
+  assert.ok(!existsSync(join(f.dir, 'tmp')));
+});
+
+for (const monitor of ['+m', '-m']) {
+  test(`successful shell with surviving command and failed ps probe retains TMPDIR (set ${monitor})`, (t) => {
+    const f = fixture(t);
+    const r = run(f, `
+set ${monitor}
+before="$-"
+ps() {
+  if [[ ! -f "$EVENTS.probe-ok" ]]; then
+    touch "$EVENTS.probe-failed"
+    return 1
+  fi
+  command ps "$@"
+}
+task() {
+  (
+    event descendant-started
+    touch "$EVENTS.ready"
+    await_file "$EVENTS.release"
+    test -d "$TMPDIR"
+    event descendant-done
+  ) &
+  await_file "$EVENTS.ready"
+  return 0
+}
+(
+  await_file "$EVENTS.probe-failed"
+  test -d "$MASTER_GATE_TMPDIR/survivor"
+  event probe-recovered
+  touch "$EVENTS.probe-ok" "$EVENTS.release"
+) & controller=$!
+master_build_job_start survivor task
+[[ "$before" == "$-" ]]
+master_build_jobs_wait
+wait "$controller"
+rm -rf "$MASTER_GATE_TMPDIR"
+event cleanup
+`);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(events(f), ['descendant-started', 'probe-recovered', 'descendant-done', 'cleanup']);
+    assert.equal(notes(f)['job.survivor.workerRc'], '0');
+    assert.equal(notes(f)['job.survivor.rc'], '0');
+    assert.match(notes(f)['job.survivor.drainSec'], /^[0-9]+$/);
+    assert.match(r.stderr, /pgid=.*TMPDIR 保留/);
+  });
+}
 
 // Execute the real build's entire C/D + Box section with fake gate executables.
 // No real gate, database, runtime/frontend build, release or shared lock is run.

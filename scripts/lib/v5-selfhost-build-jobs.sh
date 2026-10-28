@@ -10,9 +10,8 @@ MASTER_BUILD_JOB_FAILED=0
 # The runtime build is already admitted by P2. C and D share this extra budget:
 # up to three jobs below load1=4, two below 8, none at/above 8 (or unreadable).
 # Recheck on every launch; never kill work already admitted when load rises.
-master_build_job_limit() {
-  local load
-  load="$(master_gate_load1)"
+master_build_job_limit() { # <load sample>, also used verbatim in admission evidence
+  local load="$1"
   if [[ -z "$load" ]]; then printf 0; return; fi
   awk -v l="$load" -v max="$MASTER_BOX_GATE_LOAD_MAX" \
     'BEGIN { print l >= max ? 0 : (l >= max / 2 ? 2 : 3) }'
@@ -31,10 +30,19 @@ master_build_job_group_running() { # <owned pgid>
 }
 
 master_build_job_collect() { # <array index>, called only after the child has exited
-  local i="$1" rc=0 id elapsed
+  local i="$1" rc=0 id elapsed drain_start draining=0
   id="${MASTER_BUILD_JOB_IDS[i]}"
   wait "${MASTER_BUILD_JOB_PIDS[i]}" || rc=$?
-  while master_build_job_group_running "${MASTER_BUILD_JOB_PIDS[i]}"; do sleep .1; done
+  tsum_note "job.$id.workerRc" "$rc" 2>/dev/null || :
+  drain_start="$SECONDS"
+  while master_build_job_group_running "${MASTER_BUILD_JOB_PIDS[i]}"; do
+    if [[ "$draining" == 0 ]]; then
+      mlog "  [$id] worker rc=$rc; 等待存活命令/进程组探测恢复(pgid=${MASTER_BUILD_JOB_PIDS[i]},TMPDIR 保留)"
+      draining=1
+    fi
+    sleep .1
+  done
+  tsum_note "job.$id.drainSec" "$((SECONDS - drain_start))" 2>/dev/null || :
   elapsed=$(( $(date +%s) - MASTER_BUILD_JOB_STARTS[i] ))
   mlog "  [$id] rc=$rc elapsed=${elapsed}s log=${MASTER_BUILD_JOB_LOGS[i]}"
   cat -- "${MASTER_BUILD_JOB_LOGS[i]}" >&2 || rc=1
@@ -57,30 +65,41 @@ master_build_jobs_poll() {
   [[ "$MASTER_BUILD_JOB_FAILED" == 0 ]]
 }
 
+master_build_job_reject() { # <id> <reason>; setup failures also poison future admission
+  MASTER_BUILD_JOB_FAILED=1
+  tsum_note "job.$1.admissionFailure" "$2" 2>/dev/null || :
+  mlog "✗ [$1] 未启动: $2"
+  return 1
+}
+
 master_build_job_start() { # <phase id> <function>, function has explicit failure returns
   local id="$1"; shift
-  local began="$SECONDS" limit log job_tmp i monitor=0
+  local began="$SECONDS" limit load log job_tmp i monitor=0
   while :; do
     master_build_jobs_poll || return 1
-    limit="$(master_build_job_limit)"
+    load="$(master_gate_load1)"
+    # A broken budget calculation is never interpreted as free capacity.
+    if ! limit="$(master_build_job_limit "$load")" || [[ ! "$limit" =~ ^[023]$ ]]; then limit=0; fi
     if (( ${#MASTER_BUILD_JOB_PIDS[@]} < limit )); then break; fi
     if (( SECONDS - began >= MASTER_GATE_IDLE_TIMEOUT_S )); then
-      mlog "✗ [$id] 负载/任务槽等待超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s,未启动(load1=$(master_gate_load1))"
-      MASTER_BUILD_JOB_FAILED=1
+      tsum_note "job.$id.admissionWaitSec" "$((SECONDS - began))" 2>/dev/null || :
+      tsum_note "job.$id.load1" "${load:-unreadable}" 2>/dev/null || :
+      master_build_job_reject "$id" admission-timeout
       return 1
     fi
     sleep 1
   done
-  log="$(master_gate_attempt_log "$id" 1)" || return 1
+  tsum_note "job.$id.admissionWaitSec" "$((SECONDS - began))" 2>/dev/null || :
+  tsum_note "job.$id.load1" "$load" 2>/dev/null || :
+  log="$(master_gate_attempt_log "$id" 1)" || { master_build_job_reject "$id" log-setup; return 1; }
   job_tmp="$MASTER_GATE_TMPDIR/$id"
-  mkdir -- "$job_tmp" || return 1
+  mkdir -- "$job_tmp" || { master_build_job_reject "$id" tmpdir-setup; return 1; }
   # Sparse arrays: reuse a free slot only after its old child has been waited.
   i=0
   while [[ -n "${MASTER_BUILD_JOB_PIDS[i]:-}" ]]; do i=$((i + 1)); done
   MASTER_BUILD_JOB_IDS[i]="$id"
   MASTER_BUILD_JOB_LOGS[i]="$log"
   MASTER_BUILD_JOB_STARTS[i]="$(date +%s)"
-  tsum_note "job.$id.load1" "$(master_gate_load1)" 2>/dev/null || :
   tsum_note "job.$id.slots" "$limit" 2>/dev/null || :
   mlog "  [$id] 后台启动(最多 $limit 路 C/D),日志 $log"
   # Bash assigns this async subshell pgid=$!. Restore the caller's monitor mode
@@ -97,6 +116,8 @@ master_build_job_start() { # <phase id> <function>, function has explicit failur
   ) >"$log" 2>&1 &
   MASTER_BUILD_JOB_PIDS[i]=$!
   [[ "$monitor" == 1 ]] || set +m
+  tsum_note "job.$id.pgid" "${MASTER_BUILD_JOB_PIDS[i]}" 2>/dev/null || :
+  tsum_note "job.$id.tmpdir" "$job_tmp" 2>/dev/null || :
   return 0
 }
 
