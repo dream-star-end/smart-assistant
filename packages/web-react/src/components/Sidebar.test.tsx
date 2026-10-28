@@ -754,7 +754,7 @@ describe("Sidebar 会话状态点", () => {
     const runImgs = leadImgs("正在跑");
     expect(runImgs).toHaveLength(1);
     // 运行中 = 细线旋转环（形状与实心点可辨，不只靠颜色，SIDEBAR-R1）；颜色走 --status-running 别名（UI-0 状态表）。
-    expect(runImgs[0]).toHaveClass("border-status-running", "oc-session-running");
+    expect(runImgs[0]).toHaveClass("border-status-running", "border-r-transparent", "oc-session-running");
     expect(runImgs[0]).toHaveAttribute("data-dot-kind", "running");
     expect(runImgs[0]).toHaveAccessibleName("运行中");
     expect(

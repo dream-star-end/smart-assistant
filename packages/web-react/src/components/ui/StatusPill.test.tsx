@@ -41,7 +41,8 @@ describe("StatusPill 点形态", () => {
       "ring-status-attention/20",
     );
     const ring = screen.getByRole("img", { name: "运行中" });
-    expect(ring).toHaveClass("border-status-running", "oc-session-running");
+    // 缺口(透明右边框)是「在转」的唯一视觉线索,不能被颜色类合并掉。
+    expect(ring).toHaveClass("border-status-running", "border-r-transparent", "oc-session-running");
     expect(ring).not.toHaveClass("bg-status-running");
   });
 

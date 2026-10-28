@@ -78,7 +78,9 @@ export function StatusPill({
   const text = label ?? spec?.label;
   const dot =
     mark === "ring"
-      ? cn("size-2.5 rounded-full border-[1.5px] border-r-transparent oc-session-running", BORDER[tone])
+      ? // 透明右边框必须排在颜色类之后:tailwind-merge 让后写的 border-color 吃掉先写的 border-r-color,
+        // 缺口没了,旋转就看不出来。
+        cn("size-2.5 rounded-full border-[1.5px] oc-session-running", BORDER[tone], "border-r-transparent")
       : cn(
           "rounded-full",
           size === "md" ? "size-[7px]" : "size-1.5",
