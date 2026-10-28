@@ -4627,7 +4627,10 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
       const hello = JSON.stringify({type: "inbound.hello", peers: [{peerId: SESSION, agentId: "main", lastFrameSeq: 1}]});
       second.send(hello);
-      await waitHelloForwarded(rig, hello);
+      await waitFor(() => rig.containerSeen.some((entry) => {
+        const wire = JSON.parse(String(entry.data));
+        return wire.type === "inbound.hello" && wire.peers?.[0]?.peerId === SESSION;
+      }));
       first.container.send(frame(2));
       await waitFor(() => persisted.includes(2));
       let received: { frameSeq?: number };

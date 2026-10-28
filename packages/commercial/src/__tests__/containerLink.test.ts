@@ -3,6 +3,9 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { WebSocket } from "ws";
 import { ContainerLinkRegistry, getContainerLinkHandle } from "../ws/containerLink.js";
+import { registerBridgeExecutors, availableExecutors, type RecoveryExecutor } from "../ws/bridgeExecutorRegistration.js";
+import { registerBridgeTransport } from "../ws/containerLinkTransport.js";
+import type { CronOriginExecutor } from "../ws/userChatBridge.js";
 import { containerLinkEnabled, hasBrowserActivity } from "../ws/containerLinkPolicy.js";
 import { CONTAINER_ATTEST_FRAME_TYPE } from "../ws/userChatBridgeTypes.js";
 import type { Queryable } from "../dispatch/turnDispatchStore.js";
@@ -148,4 +151,88 @@ test("RF-link: defaults and subscriber activity distinguish selfhost, rollback a
   assert.equal(hasBrowserActivity(false, WebSocket.OPEN), true);
   assert.equal(hasBrowserActivity(true, WebSocket.OPEN), false, "background link cannot keep idleSweep active");
   assert.equal(hasBrowserActivity(false, WebSocket.CLOSED), false);
+});
+
+
+test("RF-step3: one stable executor and control transport across tabs, detach and shutdown", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  const maps = { recovery: new Map<string, Set<RecoveryExecutor>>(), origin: new Map<string, Set<CronOriginExecutor>>() };
+  const transports = new Map<string, Set<WebSocket>>();
+  try {
+    const [a, b] = await Promise.all([1, 2].map(() => registry.attach(1n, 7, () => physical as unknown as WebSocket)));
+    const calls: string[] = [];
+    for (const [i, socket] of [a, b].entries()) {
+      getContainerLinkHandle(socket)!.activate();
+      registerBridgeTransport(1n, socket, transports);
+      registerBridgeExecutors(1n, socket, {
+        recovery: () => { calls.push(`recovery-${i}`); },
+        origin: () => { calls.push(`origin-${i}`); return { kind: "not_claimed" }; },
+      }, maps);
+    }
+    assert.equal(maps.recovery.get("1")!.size, 1);
+    assert.equal(maps.origin.get("1")!.size, 1);
+    assert.equal(transports.get("1")!.size, 1);
+    const executor = [...maps.origin.get("1")!][0]!;
+    await executor({} as Parameters<CronOriginExecutor>[0]);
+    getContainerLinkHandle(a)!.detach();
+    a.terminate();
+    assert.equal([...maps.origin.get("1")!][0], executor, "detach keeps the same link executor");
+    await executor({} as Parameters<CronOriginExecutor>[0]);
+    assert.deepEqual(calls, ["origin-0", "origin-1"]);
+    for (const socket of transports.get("1")!) socket.send(wire({type: "inbound.goal_sync", goal: {}}));
+    assert.equal(physical.sent.length, 1, "one goal/control send per physical transport");
+    getContainerLinkHandle(b)!.detach();
+    assert.equal(availableExecutors(maps.recovery.get("1")).length, 0, "step4 wakeup is not implemented");
+    assert.deepEqual(await executor({} as Parameters<CronOriginExecutor>[0]), {kind: "not_claimed"});
+    await registry.shutdown();
+    assert.equal(maps.origin.size, 0);
+    assert.equal(maps.recovery.size, 0);
+    assert.equal(transports.size, 0);
+  } finally { await registry.shutdown(); }
+});
+
+test("RF-step3: hello uses persisted link cursor once, preserves bind ordering and strips tab terminal hints", async () => {
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  const queryPool = { query: async () => {
+    reads++;
+    await barrier;
+    return { rows: [{after_seq: "12", active_message_ids: ["running-id"]}], rowCount: 1 };
+  } } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const a = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    const b = await registry.attach(1n, 7, () => { throw new Error("second dial"); });
+    getContainerLinkHandle(a)!.activate(); getContainerLinkHandle(b)!.activate();
+    const hello = {type: "inbound.hello", peers: [{peerId: "session", agentId: "main", lastFrameSeq: 999,
+      inFlight: true, inFlightClientMessageId: "stale-tab-turn", resumeActiveTurnCandidateMessageIds: ["stale-tab-turn"]}]};
+    const send = (socket: WebSocket, frame: unknown) => new Promise<void>((resolve, reject) =>
+      socket.send(wire(frame), {binary: false}, (error) => error ? reject(error) : resolve()));
+    const first = send(a, hello);
+    const bind = send(b, {type: "inbound.control.session_repo_bind", sessionId: "session"});
+    const second = send(b, hello);
+    await Promise.resolve();
+    assert.deepEqual(physical.sent, [], "bind cannot overtake link hello while PG cursor is loading");
+    release();
+    await Promise.all([first, bind, second]);
+    assert.equal(reads, 1);
+    assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.hello", "inbound.control.session_repo_bind", "inbound.hello"]);
+    assert.deepEqual(physical.sent[0]!.peers, [{peerId: "session", agentId: "main", lastFrameSeq: 12}]);
+    assert.deepEqual(physical.sent[2]!.peers, [{peerId: "session", agentId: "main", lastFrameSeq: -1}], "second tab refreshes snapshots without container ring replay");
+  } finally { await registry.shutdown(); }
+});
+
+test("RF-step3: first link without persisted frames requests the PG open turn, not the tab's guessed turn", async () => {
+  const queryPool = { query: async () => ({ rows: [{after_seq: null, active_message_ids: ["pg-turn"]}], rowCount: 1 }) } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    await new Promise<void>((resolve, reject) => socket.send(wire({type: "inbound.hello", peers: [{peerId: "s", inFlight: true, inFlightClientMessageId: "wrong"}]}), {}, (err) => err ? reject(err) : resolve()));
+    assert.deepEqual(physical.sent[0]!.peers, [{peerId: "s", agentId: "main", lastFrameSeq: 0, resumeActiveTurnCandidateMessageIds: ["pg-turn"]}]);
+  } finally { await registry.shutdown(); }
 });

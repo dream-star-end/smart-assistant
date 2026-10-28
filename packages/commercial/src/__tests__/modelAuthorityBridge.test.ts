@@ -247,6 +247,7 @@ async function startRig(opts: {
   keyIds?: "real" | "legacy" | "stale";
   /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
   durableDispatch?: boolean;
+  containerLinkEnabled?: boolean;
   systemHelp?: boolean;
   issueSystemHelpBootstrap?: UserChatBridgeDeps['issueSystemHelpBootstrap'];
   /** M7 专用:容器不回 dispatch receipt，让 admitted lease 保持在 bridge drain map。 */
@@ -525,6 +526,7 @@ async function startRig(opts: {
         };
 
   const bridge = createUserChatBridge({
+    containerLinkEnabled: opts.containerLinkEnabled,
     jwtSecret: JWT_SECRET,
     issueSystemHelpBootstrap: opts.issueSystemHelpBootstrap,
     ...(opts.loadAgentModelResolver ? { loadAgentModelResolver: opts.loadAgentModelResolver } : {}),
@@ -2850,3 +2852,27 @@ test('OCV5-610 binary JSON also strips forged help before reaching an old gatewa
     assert.equal(frame.id, 'synthetic-help-binary')
   } finally { client?.close(); await stopRig(rig) }
 })
+
+
+test("RF-step3: attested tabs share the same executor through owner detach", async () => {
+  const rig = await startRig({
+    containerLinkEnabled: true,
+    attest: "yes",
+    durableDispatch: true,
+    admitUserTurn: async () => { throw new Error("no turn expected"); },
+  });
+  try {
+    const a = await openClient(rig.port);
+    await waitFor(() => rig.bridge._testGetCronOriginExecutor(String(UID)) !== null);
+    const executor = rig.bridge._testGetCronOriginExecutor(String(UID));
+    const b = await openClient(rig.port);
+    await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2);
+    assert.equal(rig.bridge._testGetCronOriginExecutor(String(UID)), executor);
+    const closed = new Promise<void>((resolve) => a.once("close", () => resolve()));
+    a.close();
+    await closed;
+    await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
+    assert.equal(rig.bridge._testGetCronOriginExecutor(String(UID)), executor);
+    b.close();
+  } finally { await stopRig(rig); }
+});

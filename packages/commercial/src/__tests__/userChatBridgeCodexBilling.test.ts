@@ -469,6 +469,7 @@ function makeCaptureLogger(): { log: Logger; logs: CapturedLog[] } {
 }
 
 async function startRig(opts: {
+  containerLinkEnabled?: boolean;
   userBalance?: bigint;
   periodCredits?: bigint | null;
   acquireResult?: "account" | "legacy" | "throw" | "stale";
@@ -555,6 +556,7 @@ async function startRig(opts: {
 
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
+    containerLinkEnabled: opts.containerLinkEnabled,
     resolveContainerEndpoint,
     containerConnectTimeoutMs: 1500,
     heartbeatIntervalMs: 0, // 测试关心跳
@@ -3595,4 +3597,33 @@ describe("userChatBridge / 模型执行权威 — 签发边界 epoch 重读(MAJO
     assert.deepEqual(states, ["aborted", "inflight"]);
     ws.close();
   });
+});
+
+
+test("RF-step3: two online tabs share transport and bill one frame once after the sending tab detaches", async () => {
+  const rig = await startRig({ containerLinkEnabled: true, userBalance: 1_000_000n });
+  try {
+    const opened = waitNextContainerSocket(rig);
+    const token = await makeJwt("11");
+    const a = openClient(rig.gatewayPort, token);
+    await waitOpen(a);
+    const container = await opened;
+    const b = openClient(rig.gatewayPort, token);
+    await waitOpen(b);
+    await waitUntil(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2);
+    const incoming = waitContainerNextFrame(container);
+    a.send(JSON.stringify({type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "shared billing"}));
+    const sent = JSON.parse((await incoming).data);
+    const detached = new Promise<void>((resolve) => a.once("close", () => resolve()));
+    a.close();
+    await detached;
+    const charged = waitJsonFrameOfType(b, "outbound.cost_charged");
+    container.send(JSON.stringify({type: "outbound.codex_billing", requestId: sent.requestId,
+      turnKey: "cd".repeat(32), engineSessionId: ENGINE_SID, status: "success", usage: {input_tokens: 100, output_tokens: 200}}));
+    assert.equal((await charged).requestId, sent.requestId);
+    assert.equal(rig.containerSockets.length, 1);
+    assert.equal(usageInserts(rig).length, 1);
+    assert.equal(rig.binding.acquireCalls, 1);
+    b.close();
+  } finally { await stopRig(rig); }
 });
