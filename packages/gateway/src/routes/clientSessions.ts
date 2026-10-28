@@ -1,3 +1,4 @@
+import { isClientMessageId } from '@openclaude/protocol'
 /**
  * Client session HTTP routes (/api/sessions/*), moved verbatim out of
  * Gateway._handleHttpAfterCommercial (FINDINGS §7 step 2a, OCV5-465) following
@@ -768,6 +769,16 @@ export function handleClientSessionsHttp(
         .catch(() => io.sendJson(res, 500, { error: 'live units read failed' }))
       return true
     }
+    const afterSeqRaw = url.searchParams.get('afterSeq')
+    const afterSeq = afterSeqRaw === null ? 0 : Number(afterSeqRaw)
+    const clientMessageId = url.searchParams.get('dispatch') ?? undefined
+    const streamKey = url.searchParams.get('streamKey') ?? undefined
+    if (!Number.isSafeInteger(afterSeq) || afterSeq < 0 ||
+      (clientMessageId !== undefined && !isClientMessageId(clientMessageId)) ||
+      (streamKey !== undefined && !/^dispatch:[0-9a-f-]{36}:[1-9][0-9]*$/i.test(streamKey))) {
+      io.sendJson(res, 400, { error: 'invalid session snapshot cursor' })
+      return true
+    }
     const afterRaw = url.searchParams.get('after')
     const limitRaw = url.searchParams.get('limit')
     const seekRaw = url.searchParams.get('seek')
@@ -785,7 +796,7 @@ export function handleClientSessionsHttp(
       io.sendJson(res, 400, { error: 'invalid live frame cursor' })
       return true
     }
-    readClientSessionLiveFrames(sessId, userId, after, limit, { seekTail })
+    readClientSessionLiveFrames(sessId, userId, after, limit, { seekTail, afterSeq, clientMessageId, streamKey })
       .then((page) =>
         page ? io.sendJson(res, 200, page) : io.sendJson(res, 404, { error: 'not found' }),
       )
