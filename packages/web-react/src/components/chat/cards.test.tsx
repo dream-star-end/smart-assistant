@@ -15,6 +15,7 @@ import {
   GoalCard,
   type RenderCtx,
   ThinkingCard,
+  TurnStatusCard,
   UserCard,
 } from "./cards";
 import { prefetchMarkdownImpl } from "../Markdown";
@@ -1455,5 +1456,42 @@ describe("UserCard 用户自己停止的待发消息(OCV5-421)", () => {
     expect(label.parentElement!.className).toContain("text-faint");
     fireEvent.click(screen.getByRole("button", { name: /重新发送/ }));
     expect(onRetrySend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TurnStatusCard 文案与账本一致(t1133)", () => {
+  const status = (partial: Partial<ChatMessage>): ChatMessage => ({
+    id: "turn-status:d1",
+    role: "system",
+    text: "",
+    ts: 1,
+    _turnStatusRecord: true,
+    _dispatchTerminal: true,
+    _clientMessageId: "u1",
+    ...partial,
+  } as ChatMessage);
+
+  test("t1133 SERVICE_RESTART 状态卡无 turn waiver → 不称未计费/已退回", () => {
+    render(<TurnStatusCard msg={status({ _errorCode: "SERVICE_RESTART" })} cb={{}} currentTurn={false} />);
+    const card = screen.getByRole("status");
+    expect(card).toHaveTextContent("任务已中断");
+    expect(card).toHaveTextContent("按实际用量计费");
+    expect(card.textContent).not.toMatch(/未计费|原路退回|免单/);
+  });
+
+  test("SERVICE_RESTART 状态卡有真实 turn waiver → 已免单、已退回", () => {
+    render(
+      <TurnStatusCard
+        msg={status({ _errorCode: "SERVICE_RESTART", usage: { waived: true } })}
+        cb={{}}
+        currentTurn={false}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("原路退回");
+  });
+
+  test("dispatch_lost 状态卡仍说已确认未计费", () => {
+    render(<TurnStatusCard msg={status({ _errorCode: "DISPATCH_LOST" })} cb={{}} currentTurn={false} />);
+    expect(screen.getByRole("status")).toHaveTextContent("已确认未计费");
   });
 });

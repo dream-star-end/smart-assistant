@@ -710,11 +710,21 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(p.message).toContain("未能开始处理");
     expect(p.message).toContain("未计费");
   });
-  test("errorPresentation SERVICE_RESTART(大小写归一)→ 免单 tone", () => {
+  test("errorPresentation SERVICE_RESTART(大小写归一)→ 任务已中断，保留过程", () => {
     const p = errorPresentation("SERVICE_RESTART", "", undefined);
-    expect(p.waived).toBe(true);
     expect(p.title).toBe("任务已中断");
     expect(p.message).toContain("此前已生成的过程已完整保留");
+  });
+  test("t1133 SERVICE_RESTART 无 turn waiver → 不称未计费/已退回，按实际用量计费", () => {
+    const p = errorPresentation("SERVICE_RESTART", "", undefined);
+    expect(p.waived).toBe(false);
+    expect(p.message).not.toMatch(/未计费|原路退回|免单/);
+    expect(p.message).toContain("按实际用量计费");
+  });
+  test("t1133 SERVICE_RESTART 有真实 turn waiver(usage.waived)→ 才说已免单、已退回", () => {
+    const p = errorPresentation("SERVICE_RESTART", "", undefined, true);
+    expect(p.waived).toBe(true);
+    expect(p.message).toContain("原路退回");
   });
   test("OCV5-646 SERVICE_RESTART 带折回的部分回答 → bodyText;裸合成行(text=detail / 码)无 bodyText", () => {
     const detail = "任务因服务重启中断，此前已生成的过程已完整保留";
@@ -724,7 +734,7 @@ describe("durable failure status 渲染 (RFC §5)", () => {
       detail,
     );
     expect(folded.title).toBe("任务已中断");
-    expect(folded.waived).toBe(true);
+    expect(folded.waived).toBe(false);
     // 流式时用户看到的 403 句也照原样保留，不是合成文案。
     expect(folded.bodyText?.startsWith("要根治，不能只加一次重试。")).toBe(true);
     expect(errorPresentation("SERVICE_RESTART", detail, detail).bodyText).toBeUndefined();
