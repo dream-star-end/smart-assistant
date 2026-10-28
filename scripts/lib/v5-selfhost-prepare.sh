@@ -121,6 +121,7 @@ selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lo
   local sha="$1"
   tsum_mark A.flip-lock-wait 2>/dev/null || :
   acquire_selfhost_deploy_lock
+  prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "prewarm did not stop; flip refused"
   selfhost_prepare_assert_tip "$sha"
   [[ "$(source_commit)" == "$sha" ]] \
     || die "canonical HEAD changed; prepared candidate refused at flip"

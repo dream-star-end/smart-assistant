@@ -14,6 +14,7 @@ import sys
 
 DEFAULT_DB = "/var/lib/openclaude-v5-selfhost/lease.db"
 DEFAULT_LOCK = "/run/openclaude-v5-selfhost/deploy.lock"
+DEFAULT_PREPARE_LOCK = "/run/openclaude-v5-selfhost/prepare.lock"
 RETRY = "先运行 wait-for-trains.sh --self <会话名>，待 FREE 后重试。"
 
 
@@ -53,12 +54,33 @@ def proc_identity(pid):
     return int(fields[1]), fields[19]  # ppid, starttime (PID reuse fence)
 
 
-def owns_train(trains, grants, lock_info):
-    """Prove ancestry AND the executor's actual inherited exclusive flock.
+def exclusive_flock(executor, number, lock_info):
+    if lock_info is None:
+        return False
+    try:
+        fd = os.stat(f"/proc/{executor}/fd/{number}")
+        if (fd.st_dev, fd.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+            return False
+        for line in Path(f"/proc/{executor}/fdinfo/{number}").read_text().splitlines():
+            fields = line.split()
+            if (len(fields) == 9 and fields[0] == "lock:"
+                    and fields[2:5] == ["FLOCK", "ADVISORY", "WRITE"]
+                    and fields[6].rsplit(":", 1)[-1] == str(fd.st_ino)
+                    and fields[7:] == ["0", "EOF"]):
+                return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def owns_train(trains, grants, lock_info, allow_prepare=False):
+    """Prove ancestry AND the executor's actual exclusive deploy/artifact flock.
 
     The callback proof scrubs env and detaches its child, but retains ancestry.
-    Never trust HELD/train-id/owner environment claims or acquire/unlock fd 8.
+    Never trust HELD/train-id/owner environment claims or acquire/unlock owner fds.
     fdinfo records the OFD lock even when the worker originally acquired it.
+    Prepare ownership is accepted only while the caller holds shared deploy
+    admission: it cannot bypass a different executor's exclusive deploy lock.
     """
     if len(trains) != 1 or grants or lock_info is None:
         return False
@@ -74,16 +96,12 @@ def owns_train(trains, grants, lock_info):
             pid = parent
         if executor not in ancestors:
             return False
-        fd = os.stat(f"/proc/{executor}/fd/8")
-        if (fd.st_dev, fd.st_ino) != (lock_info.st_dev, lock_info.st_ino):
-            return False
-        for line in Path(f"/proc/{executor}/fdinfo/8").read_text().splitlines():
-            fields = line.split()
-            if (len(fields) == 9 and fields[0] == "lock:"
-                    and fields[2:5] == ["FLOCK", "ADVISORY", "WRITE"]
-                    and fields[6].rsplit(":", 1)[-1] == str(fd.st_ino)
-                    and fields[7:] == ["0", "EOF"]):
-                return proc_identity(executor)[1] == ancestors[executor]
+        owned = exclusive_flock(executor, 8, lock_info)
+        if not owned and allow_prepare and status == "building":
+            path = os.environ.get("OC_V5_SELFHOST_PREPARE_LOCK") or DEFAULT_PREPARE_LOCK
+            info = local_file(path, bool(os.environ.get("OC_V5_SELFHOST_PREPARE_LOCK")))
+            owned = exclusive_flock(executor, 9, info)
+        return owned and proc_identity(executor)[1] == ancestors[executor]
     except (OSError, ValueError, IndexError):
         pass
     return False
@@ -97,7 +115,7 @@ def main():
         lock = os.environ.get("OC_V5_SELFHOST_DEPLOY_LOCK") or DEFAULT_LOCK
         lock_info = local_file(lock, bool(os.environ.get("OC_V5_SELFHOST_DEPLOY_LOCK")))
         trains, grants = read_state()
-        if require_owner and owns_train(trains, grants, lock_info):
+        if owns_train(trains, grants, lock_info, allow_prepare=not require_owner):
             return 0
         if require_owner or trains or grants:
             reason = (f"train={trains[0][0]}({trains[0][1]})" if trains else

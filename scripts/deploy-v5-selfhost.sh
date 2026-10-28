@@ -506,8 +506,8 @@ maybe_acquire_selfhost_deploy_lock() {
         return 0  # prepare first; selfhost_prepared_enter_flip owns the deploy lock later
       fi
       acquire_selfhost_deploy_lock
-      case "$MODE" in deploy|bootstrap|build-master-only) selfhost_prepare_lock ;; esac
       prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "预热未停净,拒绝发布"
+      case "$MODE" in deploy|bootstrap|build-master-only) selfhost_prepare_lock ;; esac
       ;;
   esac
 }

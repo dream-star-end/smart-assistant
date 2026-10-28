@@ -38,7 +38,7 @@ build_runtime_release() {
   mkdir -p "$raw" "$staging"
   git -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
     || { rm -rf "$raw" "$staging"; die "git archive 失败"; }
-  rsync -a --exclude-from="$EXCLUDES" "$raw/" "$staging/" \
+  rsync -a --exclude-from="$raw/packages/commercial/agent-sandbox/runtime-src-excludes.txt" "$raw/" "$staging/" \
     || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
   rm -rf "$raw"
   write_flavor_manifest "$staging" selfhost "$sha" \

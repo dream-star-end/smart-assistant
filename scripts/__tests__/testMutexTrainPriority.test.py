@@ -50,10 +50,13 @@ class TrainPriority(unittest.TestCase):
             db.executescript(ddl)
         self.deploy = self.root / "deploy.lock"
         self.deploy.touch()
+        self.prepare = self.root / "prepare.lock"
+        self.prepare.touch()
         self.sentinel = self.root / "executed"
         self.env = {
             "PATH": os.environ["PATH"], "HOME": str(self.root),
             "OC_V5_LEASE_DB": str(self.db), "OC_V5_SELFHOST_DEPLOY_LOCK": str(self.deploy),
+            "OC_V5_SELFHOST_PREPARE_LOCK": str(self.prepare),
             "OC_TEST_MUTEX_LOCK_DIR": str(self.root / "locks"), "OC_TEST_MUTEX_TIMEOUT": "20",
             "TEST_SENTINEL": str(self.sentinel),
         }
@@ -241,19 +244,26 @@ class TrainPriority(unittest.TestCase):
         script.write_text('''import fcntl, os, sqlite3, subprocess, sys, time
 lock = os.environ["OC_V5_SELFHOST_DEPLOY_LOCK"]
 variant = sys.argv[1]
+preparing = variant.startswith("prepare:")
+if preparing:
+    variant = variant.split(":", 1)[1]
+    lock = os.environ["OC_V5_SELFHOST_PREPARE_LOCK"]
+number = 9 if preparing else 8
 if variant == "inherited":
     while os.getppid() == int(sys.argv[3]): time.sleep(0.02)
 else:
     fd = os.open(lock, os.O_RDWR)
-    os.dup2(fd, 8)
-    fcntl.flock(8, fcntl.LOCK_EX)
+    os.dup2(fd, number)
+    fcntl.flock(number, fcntl.LOCK_EX)
 if variant == "wrong-inode":
-    os.dup2(8, 7)
+    os.dup2(number, 7)
     wrong = os.open(lock + ".wrong", os.O_CREAT | os.O_RDWR, 0o600)
-    os.dup2(wrong, 8)
-    fcntl.flock(8, fcntl.LOCK_EX)
+    os.dup2(wrong, number)
+    fcntl.flock(number, fcntl.LOCK_EX)
 elif variant == "no-flock":
-    fcntl.flock(8, fcntl.LOCK_UN)
+    fcntl.flock(number, fcntl.LOCK_UN)
+elif variant == "shared":
+    fcntl.flock(number, fcntl.LOCK_SH)
 with sqlite3.connect(os.environ["OC_V5_LEASE_DB"]) as db:
     db.execute("UPDATE train SET executor_pid=?", (os.getpid(),))
 if variant == "sibling":
@@ -316,6 +326,58 @@ subprocess.Popen([*sys.argv[1:], str(os.getpid())], pass_fds=(8,))
         self.until(lambda: "被占" in log.read_text(), "train proof bypassed its mutex")
         self.assertIsNone(proc.poll())
         handle.close()
+        self.assertEqual(proc.wait(timeout=8), 23, log.read_text())
+
+    def run_prepare_owner(self, variant="valid"):
+        return subprocess.run(self.owner_launcher("prepare:" + variant), env=self.env,
+                              cwd=self.root, capture_output=True, text=True, timeout=15)
+
+    def test_preparing_train_detached_callback_runs_with_real_artifact_flock(self):
+        self.train("building")
+        result = self.run_prepare_owner()
+        self.assertEqual(result.returncode, 23, result.stderr)
+
+    def test_prepare_owner_requires_exclusive_correct_artifact_and_building_state(self):
+        self.train("building")
+        for variant in ("wrong-inode", "no-flock", "shared"):
+            with self.subTest(variant=variant):
+                self.assert_refused(self.run_prepare_owner(variant))
+        for state in ("planned", "cutover", "recovery_required"):
+            with self.subTest(state=state):
+                with self.database() as db:
+                    db.execute("UPDATE train SET status=?", (state,))
+                self.assert_refused(self.run_prepare_owner())
+
+    def test_prepare_owner_cannot_bypass_other_deploy_holder_or_grant(self):
+        self.train("building")
+        held = self.lock(self.deploy)
+        self.assert_refused(self.run_prepare_owner())
+        held.close()
+        self.lease("granted")
+        self.assert_refused(self.run_prepare_owner())
+
+    def test_prepare_owner_requires_deploy_admission_path(self):
+        self.train("building")
+        self.deploy.unlink()
+        self.assert_refused(self.run_prepare_owner(), 2)
+
+    def test_external_sibling_cannot_borrow_prepare_owner(self):
+        self.train("building")
+        log = self.root / "prepare-owner.log"
+        proc = self.start(self.owner_launcher("prepare:sibling"), log)
+        self.until((self.root / "owner-ready").exists, "prepare owner not ready")
+        self.assert_refused(self.run_mutex())
+        (self.root / "owner-release").touch()
+        self.assertEqual(proc.wait(timeout=8), 0, log.read_text())
+
+    def test_prepare_callback_still_waits_for_family_mutex(self):
+        self.train("building")
+        held = self.lock(self.root / "locks/oc-test-commercial-proof.lock")
+        log = self.root / "prepare-callback.log"
+        proc = self.start(self.owner_launcher("prepare:valid"), log)
+        self.until(lambda: "被占" in log.read_text(), "prepare proof bypassed family mutex")
+        self.assertIsNone(proc.poll())
+        held.close()
         self.assertEqual(proc.wait(timeout=8), 23, log.read_text())
 
     def test_arguments_exit_code_and_watchdog_are_preserved(self):

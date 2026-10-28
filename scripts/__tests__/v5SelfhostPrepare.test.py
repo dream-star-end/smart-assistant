@@ -57,6 +57,7 @@ class Prepared(unittest.TestCase):
             fn('source_commit'), fn('selfhost_lock_py'), fn('proc_starttime_of'),
             fn('acquire_selfhost_deploy_lock'), fn('selfhost_lock_holder_info'),
             'release_policy_mutation_barrier() { :; }; selfhost_backup_lock_holder() { return 1; }',
+            'prewarm_quiesce() { ! flock -n "$SELFHOST_DEPLOY_LOCK" true || die quiesce-without-deploy-lock; [[ "${FAIL_QUIESCE:-0}" == 0 ]]; }',
             'master_web_dist_key() { echo web-inputs; }',
             'selfhost_release_preflight() { [[ "${LOW_SPACE:-0}" == 0 ]] || die low-build-space; }',
             'docker() { printf "sha256:%064d\\n" 1; }',
@@ -345,6 +346,12 @@ rpf_check_proof_db() { :; }; rpf_check_disk() { :; }; master_gate_base_dsn() { :
 rpf_report() { :; }; rpf_summary() { :; }
 ''' + f'selfhost_release_preflight {target} prepared')
         self.assertIn('ok:source-pin', (self.t / 'l0').read_text())
+
+    def test_flip_refuses_unquiesced_prewarmer_before_live_mutation(self):
+        self.prepare()
+        self.bash('FAIL_QUIESCE=1; selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertFalse((self.t / 'live-write').exists())
+        self.assertTrue(self.receipt.exists())
 
     def test_each_failed_gate_never_publishes_and_explicit_retry_rebuilds(self):
         for flag, reached in [('FAIL_BUILD', ['master']),
