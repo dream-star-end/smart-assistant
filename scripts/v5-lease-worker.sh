@@ -19,6 +19,7 @@ source "$SCRIPT_DIR/v5-lease-lib.sh"
 # OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
 # shellcheck source=scripts/v5-selfhost-autorecover.sh
 source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-host-idle.sh"
 
 WORKER_LOCK="${OC_V5_LEASE_WORKER_LOCK:-/run/openclaude-v5-selfhost/lease-worker.lock}"
 WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
@@ -296,6 +297,11 @@ dispatch_train() {
   lease_deploy_process_running && { wlog "外部 deploy 进程在跑,不发车"; return 0; }
   lease_in_cutover_grace && { wlog "cutover grace 窗口,不发车"; return 0; }
 
+  # P6: one snapshot before even acquiring deploy.lock; no 900s locked wait on a busy host.
+  local busy
+  busy="$(master_gate_busy_reason)" || busy="host admission unreadable"
+  [[ -z "$busy" ]] || { wlog "主机繁忙,保持排队不发车: $busy"; return 0; }
+
   git -C "$LEASE_REPO_ROOT" fetch -q origin "$LEASE_BRANCH" 2>/dev/null || true
   tip="$(lease_remote_tip)" || { wlog "读不到 origin tip"; return 0; }
   # target 必须 ⊇ 所有 pending want_sha
@@ -313,14 +319,17 @@ dispatch_train() {
              ORDER BY t.seq DESC LIMIT 1;")"
   if [[ -n "$lastf" ]]; then
     IFS=$'\t' read -r ftid ffin freason flog <<<"$lastf"
-    local rid
-    while read -r rid; do
-      [[ -n "$rid" ]] || continue
-      transition_with_outbox "$rid" registered failed "train $ftid(target ${tip:0:12})failed,同 target 不自动重发" \
-        "$(lease_body_failed "$rid" "列车 $ftid 失败: $freason" "${flog:-无日志}(target ${tip:0:12} 仍是分支 tip;修复后 push 新 tip 或人工放行后再 register)")"
-    done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")
-    pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
-    [[ "$pending" -gt 0 ]] || { wlog "tip ${tip:0:12} 上一班 $ftid 已 failed 且无新 ride,不发车"; return 0; }
+    # Only the latest deploy-reported failure may defer. Never look past a later gate failure.
+    if [[ "$freason" != user-idle-deferred ]]; then
+      local rid
+      while read -r rid; do
+        [[ -n "$rid" ]] || continue
+        transition_with_outbox "$rid" registered failed "train $ftid(target ${tip:0:12})failed,同 target 不自动重发" \
+          "$(lease_body_failed "$rid" "列车 $ftid 失败: $freason" "${flog:-无日志}(target ${tip:0:12} 仍是分支 tip;修复后 push 新 tip 或人工放行后再 register)")"
+      done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")
+      pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
+      [[ "$pending" -gt 0 ]] || { wlog "tip ${tip:0:12} 上一班 $ftid 已 failed 且无新 ride,不发车"; return 0; }
+    fi
   fi
   # 取 deploy.lock(fd 8,与 deploy 脚本同一把;取到就持有并传给执行器继承)
   mkdir -p "$(dirname "$LEASE_DEPLOY_LOCK")" 2>/dev/null || true

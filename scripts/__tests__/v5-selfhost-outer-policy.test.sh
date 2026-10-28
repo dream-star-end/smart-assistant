@@ -71,6 +71,8 @@ EXTRACT
 export OC_HOTCFG_PLATFORM_ROOT="$WORK/platform" OC_HOTCFG_RELEASES_ROOT="$WORK/runtime" OC_HOTCFG_ENV_FILE="$WORK/tuple.env" OC_HOTCFG_HISTORY="$WORK/history"
 export LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1
 source "$RUNTIME_LIB"
+# cmd_cutover now delegates its E3 idle boundary through this production helper.
+source "$SCRIPT_DIR/lib/v5-selfhost-idle-retry.sh"
 for file in "$WORK/functions/"*.sh; do source "$file"; done
 
 # Transparent observer: exact Bash-declared real function body, name alone is

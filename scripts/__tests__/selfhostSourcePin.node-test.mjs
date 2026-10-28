@@ -58,6 +58,7 @@ test('actual cmd_deploy passes captured A through lease master runtime payload e
  // These policy boundaries are spies; the policy suite exercises their implementations.
  'release_policy_bind_official_train_request() { echo "$1" > "$TEST_ROOT/bind"; [[ "$1" == "$A" ]]; }',
  'cutover_adopt_inflight_request() { echo "$1" > "$TEST_ROOT/adopt"; [[ "$1" == "$A" ]]; }',
+ 'selfhost_wait_idle_or_defer() { [[ "$1" == 0 ]]; }; selfhost_idle_retry_load() { return 1; }',
  'selfhost_release_preflight() { echo "$1" > "$TEST_ROOT/preflight"; [[ "$1" == "$A" ]]; }',
  'docker() { :; }; ensure_node_modules() { :; }; install_aux_units() { :; }; refresh_ccb_proxy_path() { :; }; ensure_model_authority() { :; }',
  'lease_train_begin() { echo "$1" > "$TEST_ROOT/lease"; git -C "$REPO_ROOT" checkout -q "$B"; }',

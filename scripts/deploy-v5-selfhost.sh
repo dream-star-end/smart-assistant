@@ -193,6 +193,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
 source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
+source "$SCRIPT_DIR/lib/v5-selfhost-idle-retry.sh"
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -2115,10 +2116,12 @@ $dirty
     sha="$(source_commit)"
     lease_train_begin "$sha"
   fi
+  selfhost_wait_idle_or_defer 0 || return $?
   selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"; assert_fix_trailers "$sha"  # L0 在 begin 之后:拒绝即 deploy 上报的失败,worker 不重发(OCV5-581)
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
   # P2(OCV5-648):后台 runtime 构建由 build_master_release 在发车准入通过之后起,准入不再等本列车自己的构建。
+  if ! selfhost_idle_retry_load "$sha"; then
   MASTER_RUNTIME_BG_AFTER_ADMISSION=1
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
@@ -2130,6 +2133,12 @@ $dirty
   collect_runtime_release_bg "$sha"
   tsum_mark P.platform-bundle 2>/dev/null || :
   build_platform_bundle "$sha"
+  fi
+  # Consume before attempting cutover: only a fresh E3 busy timeout can reissue it.
+  if [[ "$DRY" != 1 ]]; then
+    release_policy_lock_is_owned || return 86
+    selfhost_idle_retry_data clear || die "无法消费空闲重试记录"
+  fi
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
   DEPLOY_BUILT_SOURCE_COMMIT="$sha"
@@ -2860,7 +2869,7 @@ cmd_cutover() {
     cutover_clog "  .prev-release=$prev_val"
   fi
   tsum_mark E3.wait-idle 2>/dev/null || :
-  cutover_wait_for_user_idle || return 1
+  selfhost_wait_idle_or_defer 600 "$rel" || return $?
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
     cutover_persist_phase "pre-install"
@@ -3066,12 +3075,7 @@ cmd_cutover() {
   # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
   # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
   # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
-  bash "$SCRIPT_DIR/v5-release-gc.sh" \
-    "$MASTER_RELEASES_ROOT" 3 \
-    "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
-    "$MASTER_RELEASES_ROOT/.prev-release" \
-    "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \
-    '' '' '' 2>&1 | sed 's/^/  /' \
+  selfhost_master_gc 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
   oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"

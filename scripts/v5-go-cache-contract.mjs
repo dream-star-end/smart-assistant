@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto'
 // Prints TAP only; never prints credentials, tokens or response bodies.
 import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
-import WebSocket from 'ws'
+import { goCacheTurn, waitGoCacheUsage } from './lib/go-cache-turn.mjs'
 import { GO_CACHE_MODEL, assessGoCache, goCachePrompts } from './lib/user-contract-go-cache.mjs'
 import { tapResult } from './lib/user-contract.mjs'
 
@@ -48,52 +48,6 @@ async function api(token, path, init = {}) {
   return r.json()
 }
 
-function turn(token, peer, model, cmid, text) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${base.replace(/^http/, 'ws')}/ws/user-chat-bridge`, [
-      'bearer',
-      token,
-    ])
-    let done = false
-    const timer = setTimeout(() => finish(new Error('turn did not complete')), TURN_TIMEOUT)
-    function finish(error) {
-      if (done) return
-      done = true
-      clearTimeout(timer)
-      ws.close()
-      error ? reject(error) : resolve()
-    }
-    ws.on('open', () =>
-      ws.send(
-        JSON.stringify({
-          type: 'inbound.message',
-          channel: 'webchat',
-          peer: { id: peer, kind: 'dm' },
-          agentId: 'main',
-          clientMessageId: cmid,
-          content: { text },
-          model,
-          ts: Date.now(),
-        }),
-      ),
-    )
-    ws.on('message', (raw) => {
-      let f
-      try {
-        f = JSON.parse(String(raw))
-      } catch {
-        return
-      }
-      if (f?.peer?.id !== peer || f.clientMessageId !== cmid) return
-      if (f.error || ['outbound.error', 'outbound.turn_error', 'error'].includes(f.type))
-        finish(new Error(`turn failed: ${f.error?.code ?? f.code ?? f.type}`))
-      else if (f.type === 'outbound.message' && f.isFinal === true) finish()
-    })
-    ws.on('error', () => finish(new Error('chat socket error')))
-    ws.on('close', () => finish(new Error('chat socket closed before the final message')))
-  })
-}
-
 try {
   const model = GO_CACHE_MODEL
   const password = readFileSync(passwordFile, 'utf8').trim()
@@ -119,16 +73,15 @@ try {
     }),
   })
   const prompts = goCachePrompts(nonce)
-  for (const [i, text] of prompts.entries())
-    await turn(token, peer, model, `m-g432-${nonce}-${i + 1}`, text)
-  // Usage is written when each request finalizes; give the last one a bounded moment.
-  let verdict
-  for (let i = 0; i < 30; i++) {
-    const usage = await api(token, '/api/me/usage?sessions_limit=20')
-    verdict = assessGoCache((usage.sessions?.rows ?? []).find((r) => r.session_id === peer))
-    if (verdict.ok || !/billed requests|no usage row/.test(verdict.reason)) break
-    await new Promise((r) => setTimeout(r, 1_000))
+  let row
+  for (const [i, text] of prompts.entries()) {
+    await goCacheTurn({ base, token, peer, model, cmid: `m-g432-${nonce}-${i + 1}`, text, timeout: TURN_TIMEOUT })
+    row = await waitGoCacheUsage(async () => {
+      const usage = await api(token, '/api/me/usage?sessions_limit=20')
+      return (usage.sessions?.rows ?? []).find((r) => r.session_id === peer)
+    }, i + 1)
   }
+  const verdict = assessGoCache(row)
   console.log(
     `# go-cache model=${model} session=${peer} requests=${verdict.requests} prompt=${verdict.prompt} cache_read=${verdict.read} cache_write=${verdict.write} ratio=${verdict.ratio}`,
   )

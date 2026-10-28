@@ -178,13 +178,9 @@ sweep_stale_master_gate_tmpdirs() {
 #   - 每次跑门前按负载算等待倍数 clamp(load1/8, 1, 3) 传给门,写进 summary;
 #   - 门失败时只看门自己打印的 [gate-failure] 行:全部在白名单里才重跑一次,两次日志都留,重跑写进 summary。
 # 门的断言、计数都不在这里;倍数只放大门里的等待预算,上限 3 倍。
-MASTER_BOX_GATE_LOAD_MAX=8          # 16 核的一半(用户 2026-10-21 定),不读环境变量
 MASTER_GATE_LOAD_SCALE_MAX=3        # 同上
 MASTER_GATE_IDLE_TIMEOUT_S="${MASTER_GATE_IDLE_TIMEOUT_S:-900}"
 MASTER_GATE_IDLE_POLL_S="${MASTER_GATE_IDLE_POLL_S:-15}"
-MASTER_GATE_LOADAVG="${MASTER_GATE_LOADAVG:-/proc/loadavg}"
-MASTER_GATE_TEST_LOCK_DIR="${MASTER_GATE_TEST_LOCK_DIR:-/var/lock}"
-MASTER_GATE_PROC_ROOT="${MASTER_GATE_PROC_ROOT:-/proc}"
 MASTER_GATE_ATTEMPT_DIR="${MASTER_GATE_ATTEMPT_DIR:-}"
 MASTER_GATE_LOAD_SCALE=1
 # 门打印的 [gate-failure] 行(去掉前缀后)整行匹配其一才算已知假失败。
@@ -209,12 +205,7 @@ master_gate_base_dsn() {
   printf '%s' "${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}"
 }
 
-master_gate_load1() {
-  local a="" rest=""
-  read -r a rest <"$MASTER_GATE_LOADAVG" 2>/dev/null || a=""
-  [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$a"
-  return 0
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-idle.sh"
 
 # 等待倍数 = clamp(load1/8, 1, 3),两位小数;读不到负载按 1。
 master_gate_load_scale() {
@@ -223,40 +214,6 @@ master_gate_load_scale() {
   if [[ -z "$l" ]]; then printf '1.00'; return 0; fi
   awk -v l="$l" -v d="$MASTER_BOX_GATE_LOAD_MAX" -v m="$MASTER_GATE_LOAD_SCALE_MAX" \
     'BEGIN { s = l / d; if (s < 1) s = 1; if (s > m) s = m; printf "%.2f", s }'
-}
-
-# 主机不空闲的原因(空闲时什么都不打印):负载、被持有的 test-mutex 锁、npm test 类进程。
-# 锁只用 flock -n 试探后立即放开,不新建锁文件;进程只读 /proc/<pid>/cmdline,不 pgrep/pkill。
-master_gate_busy_reason() {
-  local l f name rc pid cmd reasons=() args=()
-  l="$(master_gate_load1)"
-  if [[ -z "$l" ]]; then
-    reasons+=("load1=unreadable")
-  elif awk -v l="$l" -v m="$MASTER_BOX_GATE_LOAD_MAX" 'BEGIN { exit !(l >= m) }'; then
-    reasons+=("load1=$l>=$MASTER_BOX_GATE_LOAD_MAX")
-  fi
-  for f in "$MASTER_GATE_TEST_LOCK_DIR"/oc-test-*.lock; do
-    [[ -f "$f" && ! -L "$f" ]] || continue
-    rc=0
-    flock -n -E 75 "$f" true 2>/dev/null || rc=$?
-    [[ "$rc" == 75 ]] || continue
-    name="${f##*/oc-test-}"
-    reasons+=("test-mutex:${name%.lock}")
-  done
-  for f in "$MASTER_GATE_PROC_ROOT"/[0-9]*/cmdline; do
-    pid="${f%/cmdline}"
-    pid="${pid##*/}"
-    [[ "$pid" != "$$" && "$pid" != "${BASHPID:-}" ]] || continue
-    args=()
-    mapfile -d '' -t args <"$f" 2>/dev/null || continue
-    (( ${#args[@]} > 0 )) || continue
-    cmd=" ${args[*]} "
-    if [[ "$cmd" =~ [[:space:]/]npm(-cli\.js)?[[:space:]]+(test|run[[:space:]]+(test|check:v5)[^[:space:]]*)[[:space:]] ]]; then
-      reasons+=("pid$pid:${BASH_REMATCH[0]//[[:space:]]/ }")
-    fi
-  done
-  (( ${#reasons[@]} == 0 )) || printf '%s' "${reasons[*]:0:6}"
-  return 0
 }
 
 master_gate_wait_host_idle() { # <why> → rc 1 when still busy after MASTER_GATE_IDLE_TIMEOUT_S
@@ -710,25 +667,31 @@ find_master_release_donor() { # <staging-lock>
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-release-preflight.sh"
 
 selfhost_release_preflight() { # <target-sha>
-  local target="$1" live from=""
+  local target="$1" live from="" attempt
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
   if [[ -n "$live" && -f "$live/.complete" ]]; then
     from="$(jq -r '.sourceCommit // empty' "$live/.complete" 2>/dev/null || true)"
   fi
-  mlog "── L0 发车预检(只读:不建库、不加锁、不写标记;OCV5-581)target=${target:0:12} ──"
-  rpf_reset
-  rpf_check_source_pin "$REPO_ROOT" "$target"
-  rpf_check_workspace_links "$REPO_ROOT" 1
-  rpf_check_migrations "$REPO_ROOT" "$from" "$target"
-  rpf_check_proof_db "$REPO_ROOT" gate-db "$(master_gate_base_dsn)"
-  rpf_check_disk "$RPF_MIN_FREE_KB" "$live" "$MASTER_RELEASES_ROOT" "${OC_HOTCFG_RELEASES_ROOT:-$MASTER_RELEASES_ROOT}" "${TMPDIR:-/tmp}"
+  mlog "── L0 发车预检(只读检查;locked deploy 磁盘不足可 GC 一次;OCV5-581/P6)target=${target:0:12} ──"
+  for attempt in 1 2; do
+    rpf_reset
+    rpf_check_source_pin "$REPO_ROOT" "$target"
+    rpf_check_workspace_links "$REPO_ROOT" 1
+    rpf_check_migrations "$REPO_ROOT" "$from" "$target"
+    rpf_check_proof_db "$REPO_ROOT" gate-db "$(master_gate_base_dsn)"
+    rpf_check_disk "$RPF_MIN_FREE_KB" "$live" "$MASTER_RELEASES_ROOT" "${OC_HOTCFG_RELEASES_ROOT:-$MASTER_RELEASES_ROOT}" "${TMPDIR:-/tmp}"
+    if [[ "$attempt" == 1 ]] && declare -F selfhost_preflight_disk_recover >/dev/null && selfhost_preflight_disk_recover; then
+      continue
+    fi
+    break
+  done
   tsum_note preflight "$(rpf_summary)" 2>/dev/null || :
   if rpf_report >&2; then
     mlog "  ✓ L0 发车预检通过"
   elif [[ "${DRY:-0}" == 1 ]]; then
     mlog "  [dry-run] L0 发车预检未通过;正式发车会在这里拒绝"
   else
-    die "L0 发车预检未通过:上面每条 ✗ 都要先处理(只读检查,未构建、live 未改)。"
+    die "L0 发车预检未通过:上面每条 ✗ 都要先处理(未构建、live 未改)。"
   fi
 }
 
@@ -1787,7 +1750,8 @@ SQL
 # OCV5-513: wait after the build, before arming recovery or changing live units.
 # This is an idle snapshot, not an admission fence; new arrivals can still race.
 cutover_wait_for_user_idle() {
-  local counts started=$SECONDS deadline=$((SECONDS + 600))
+  local timeout="${1:-600}" counts started=$SECONDS
+  local deadline=$((SECONDS + timeout))
   if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
     [[ "${PG_DB:-}" == openclaude_v5_selfhost ]] || { cutover_clog "  ✗ --allow-inflight 仅用于 selfhost"; return 1; }
     if [[ "$DRY" != 1 ]]; then
@@ -1824,8 +1788,8 @@ COMMIT;")"; then
     cutover_clog "  idle snapshot UTC=$(date -u +%FT%TZ) open_dispatches=${counts%|*} unclassified_journals=${counts#*|} elapsed=$((SECONDS - started))s"
     [[ "$counts" == '0|0' ]] && return 0
     if (( SECONDS >= deadline )); then
-      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"
-      return 1
+      cutover_clog "  ✗ 等待空闲 ${timeout}s 超时;拒绝切换,旧 master 继续运行"
+      return 75  # typed busy; query/permission failures remain rc=1
     fi
     sleep 5
   done

@@ -165,6 +165,11 @@ def worker_case(c, allow, systemd):
         ctl.chmod(0o755)
         c.env.update(INVOCATION_ID='private-fixture', PATH=str(bin_dir)+':'+c.env['PATH'])
     f.fm.need(register(c, allow).returncode == 0, 'actual worker registration')
+    admission = args_file.parent/'admission'
+    admission.mkdir()
+    (admission/'loadavg').write_text('1.00 1 1 1/1 1\n')
+    c.env.update(MASTER_GATE_LOADAVG=str(admission/'loadavg'),
+                 MASTER_GATE_PROC_ROOT=str(admission), MASTER_GATE_TEST_LOCK_DIR=str(admission))
     result = f.run(['bash', str(SCRIPTS/'v5-lease-worker.sh')], c.env)
     f.fm.need(result.returncode == 0, 'actual worker failed: '+result.stderr)
     for _ in range(40):
