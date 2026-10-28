@@ -4,8 +4,12 @@
 
 /* ── Design tokens exposed to Tailwind (utilities like bg-bg, text-fg…) ── */
 @theme {
+  /* 中文回退:苹果 / Windows 照旧先命中 PingFang / 雅黑;鸿蒙、小米、安卓和 Linux 没有这两款时
+     依次落到 HarmonyOS Sans / MiSans / 思源黑体(商业重度用户在鸿蒙浏览器上,UI-SPEC §1.0)。
+     不引入网络中文字体(体积太大);Inter 仍排第一,只负责拉丁字母和数字。 */
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
-    "PingFang SC", "Microsoft YaHei", sans-serif;
+    "PingFang SC", "Microsoft YaHei", "HarmonyOS Sans SC", "MiSans", "Noto Sans SC",
+    "Source Han Sans SC", sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
 
   --color-bg: var(--bg);
@@ -111,6 +115,17 @@
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* 状态色别名的工具类(bg-status-running / text-status-failed …,UI-SPEC §4.1 / §4.3)。
+   用 inline:工具类直接引用 var(--status-*),在使用处求值 —— 营销页这类局部换肤容器里
+   也取到容器自己的状态色,不会继承根上已经算好的值。 */
+@theme inline {
+  --color-status-running: var(--status-running);
+  --color-status-attention: var(--status-attention);
+  --color-status-done: var(--status-done);
+  --color-status-failed: var(--status-failed);
+  --color-status-idle: var(--status-idle);
+}
+
 /* ── Light (default) — Aurora: airy near-white canvas, ink primary,
    violet interactive accent, soft pastel gradient reserved for brand moments ── */
 :root {
@@ -169,6 +184,13 @@
      自定义属性在声明处求值后再继承,写 var(--muted) 会把浅色值带进深色容器。 */
   --shine-base: #51515c;
   --shine-peak: #a9a9b3;
+  /* 状态语义别名(UI-SPEC §4.3,lib/ui/statusTone.ts):组件只写别名,换视觉方向时只改这里的指向。
+     每套主题都要写一遍:自定义属性在声明处求值,只写在 :root 会把浅色值带进局部换肤容器。 */
+  --status-running: var(--accent);
+  --status-attention: var(--warning);
+  --status-done: var(--success);
+  --status-failed: var(--danger);
+  --status-idle: var(--faint);
 }
 
 /* ── Dark — Aurora: deep near-black, inverted ink (light) primary,
@@ -215,6 +237,12 @@
   --aurora: linear-gradient(135deg, #5e50a8 0%, #4a5aa0 45%, #a05878 100%);
   /* same robust endpoints as light — a brand CTA fill needn't invert per theme */
   --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+  /* 状态语义别名:同 :root。 */
+  --status-running: var(--accent);
+  --status-attention: var(--warning);
+  --status-done: var(--success);
+  --status-failed: var(--danger);
+  --status-idle: var(--faint);
 }
 
 * { box-sizing: border-box; }
@@ -223,11 +251,12 @@ html, body { height: 100%; margin: 0; }
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
    末个有效值生效)。iOS Safari 截图/地址栏/键盘显隐时 100dvh 与 visual viewport
    offset 仍会短暂抖动,React 侧用 visualViewport 写入 CSS var 作最终权威。 */
-/* 顶部 toast 轨道的顶距(components/ui/Toast.tsx `top-[var(--oc-toast-top,4rem)]`)。
-   取值 = ChatHeader 的最小高度 min-h-14(3.5rem)+ 0.5rem 呼吸空间;安全区内边距由轨道自己的
-   header-safe-t 再叠一层。原先 Toast.tsx 写死 top-16,与头部高度两处各写各的(shell 审计 S-20):
-   头部改高度时改这里一处即可,不要再去 Toast.tsx 里改 top-*。 */
-:root { --oc-toast-top: 4rem; }
+/* 顶部 toast 轨道的顶距(components/ui/Toast.tsx `top-[var(--oc-toast-top)]`)。
+   有顶栏时由顶栏实测下沿写入(Toast.tsx useToastAnchor):手机顶栏会折成两行,固定值会压住第二行
+   (UI-SPEC §1.1 C6)。这里是没有顶栏登记时的默认值 = 原来的 4rem 顶距 + 轨道原有的
+   header-safe-t 内边距(0.625rem + 安全区),位置与改动前一致。原先 Toast.tsx 写死 top-16,
+   与头部高度两处各写各的(shell 审计 S-20),不要再去 Toast.tsx 里改 top-*。 */
+:root { --oc-toast-top: calc(4.625rem + env(safe-area-inset-top, 0px)); }
 #root {
   position: fixed;
   top: var(--oc-visual-offset-top, 0px);
@@ -440,6 +469,8 @@ body {
 @media (prefers-reduced-motion: no-preference) {
   .oc-orbit::after { animation: spin 1.1s linear infinite; }
   .oc-orbit-core { animation: oc-breathe 1.8s var(--ease-standard) infinite; }
+  /* StatusPill 的「进行中」圆点(状态表 breathe),与过程外壳的呼吸点同一节奏。 */
+  .oc-status-breathe { animation: oc-breathe 1.8s var(--ease-standard) infinite; }
   .oc-step-node-live { animation: oc-node-halo 1.8s var(--ease-standard) infinite; }
   .oc-step-enter { animation: oc-step-in 0.36s var(--ease-spring) both; }
   .oc-reveal { animation: oc-reveal 0.24s var(--ease-emphasized-decel) both; }
@@ -542,6 +573,12 @@ body {
   --skeleton: #252920;
   --code: #080907;
   --grad-cta: linear-gradient(125deg, #d5ff84 0%, #b4f04e 100%);
+  /* 状态语义别名:同 :root(指向本容器自己的语义色)。 */
+  --status-running: var(--accent);
+  --status-attention: var(--warning);
+  --status-done: var(--success);
+  --status-failed: var(--danger);
+  --status-idle: var(--faint);
   /* Tailwind v4 会把 @theme 中的 --color-* 优化成已解析值；仅覆盖底层
      --primary/--surface 不足以让工具类换肤，因此营销页同步覆盖编译后 token。 */
   --color-bg: #090a08;

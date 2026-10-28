@@ -363,10 +363,15 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     render(<><div role="alert" aria-label="连接状态">连接中…</div><ToastProvider><App /></ToastProvider></>)
     fireEvent.click(await screen.findByRole('button', { name: '接受邀请' }))
 
-    const alert = (await screen.findByText('接受组织邀请失败（追踪号 req-org-invite）')).closest('[role="alert"]')
+    const alert = (await screen.findByText('接受组织邀请失败')).closest('[role="alert"]')
     expect(alert).toBeInTheDocument()
     expect(alert).toHaveAttribute('aria-live', 'assertive')
-    expect(alert).toHaveTextContent('接受组织邀请失败（追踪号 req-org-invite）')
+    // 追踪号不进正文,收进「复制追踪号」按钮(UI-0 Toast,UI-SPEC §1.1 C6)。
+    expect(alert).not.toHaveTextContent('req-org-invite')
+    expect(within(alert as HTMLElement).getByRole('button', { name: '复制追踪号' })).toHaveAttribute(
+      'title',
+      '追踪号 req-org-invite',
+    )
     expect(alert).not.toHaveTextContent('database unavailable')
     expect(document.body).not.toHaveTextContent('database unavailable')
     expect(screen.getByRole('alert', { name: '连接状态' })).toHaveTextContent('连接中…')

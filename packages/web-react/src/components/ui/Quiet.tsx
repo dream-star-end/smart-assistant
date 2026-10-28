@@ -1,7 +1,9 @@
 import type { LucideIcon } from "lucide-react";
 import { createContext, type HTMLAttributes, type ReactNode, useContext } from "react";
+import type { SemanticTone } from "../../lib/ui/statusTone";
 import { cn } from "../../lib/utils";
 import { Select, type SelectOption } from "./Select";
+import { StatusPill } from "./StatusPill";
 
 /**
  * 「安静表面」:管理中心(OCV5-344 第 3 轮)的工作面语言 —— 层级靠字号、对齐与留白,
@@ -24,25 +26,25 @@ export function useQuiet() {
   return useContext(QuietContext);
 }
 
+/** 旧的色板式 tone(Badge / Alert 的色名)。新代码直接用 StatusPill 的语义色调。 */
 export type StatusTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info";
 
-const DOT: Record<StatusTone, string> = {
-  neutral: "bg-faint",
-  accent: "bg-accent",
-  success: "bg-success",
-  warning: "bg-warning",
-  danger: "bg-danger",
-  info: "bg-info",
+/**
+ * 色板 → 状态语义色调。info 是提示语气、不是状态,按「颜色只留给状态」归中性(UI-SPEC §2)。
+ * 其余五个与 --status-* 别名的取值一一对应,颜色不变。
+ */
+const PALETTE_TONE: Record<StatusTone, SemanticTone> = {
+  neutral: "idle",
+  accent: "running",
+  success: "done",
+  warning: "attention",
+  danger: "failed",
+  info: "idle",
 };
 
-/** 6px 状态圆点。纯装饰(aria-hidden),状态词必须以文字出现在旁边。 */
+/** 6px 状态圆点。纯装饰(aria-hidden),状态词必须以文字出现在旁边。StatusPill 的薄封装。 */
 export function StatusDot({ tone = "neutral", className }: { tone?: StatusTone; className?: string }) {
-  return (
-    <span
-      aria-hidden="true"
-      className={cn("inline-block size-1.5 shrink-0 rounded-full", DOT[tone], className)}
-    />
-  );
+  return <StatusPill tone={PALETTE_TONE[tone]} decorative className={className} />;
 }
 
 /**

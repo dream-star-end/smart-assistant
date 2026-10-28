@@ -2692,7 +2692,7 @@ await check("T33 当前微博账号重新扫码登录不会先解绑旧连接", 
   }
   await connectors.getByRole("button", { name: "账号「我的微博」的更多操作" }).click();
   await page.getByRole("menu").getByRole("menuitem", { name: "重新扫码登录" }).click();
-  const confirmation = page.getByRole("dialog").filter({ hasText: "重新登录「微博」?" });
+  const confirmation = page.getByRole("dialog").filter({ hasText: "重新登录「微博」？" });
   await confirmation.getByText(/新扫码成功前会保留当前登录状态/).waitFor({ state: "visible" });
   await confirmation.getByText(/写入能力和免逐次确认/).waitFor({ state: "visible" });
   await confirmation.getByRole("button", { name: "重新扫码登录" }).click();
