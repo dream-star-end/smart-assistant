@@ -7,7 +7,7 @@
  * touches (typed from the class itself).
  */
 import { randomBytes } from 'node:crypto'
-import { type InboundFrame, isClientMessageId } from '@openclaude/protocol'
+import { type InboundFrame, isClientMessageId, withUserError } from '@openclaude/protocol'
 import type { WebSocket } from 'ws'
 import { removeSendToAgentIntent } from './sendToAgentIntentStore.js'
 import type { DelegateJobSnapshot } from './delegateJobs.js'
@@ -90,11 +90,11 @@ export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: st
   this.log.warn('model_authority.rejected', { code, detail })
   try {
     ws.send(
-      JSON.stringify({
+      JSON.stringify(withUserError({
         type: 'error',
         code: 'MODEL_AUTHORITY_REJECTED',
         error: 'model authority rejected',
-      }),
+      })),
     )
   } catch { /* ws may already be closed */ }
 }

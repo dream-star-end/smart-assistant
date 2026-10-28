@@ -1,3 +1,5 @@
+import type { AutomaticRetryStatus } from './userErrorTypes.js'
+
 /**
  * Turn 错误语义单一权威表(2026-07-18 turn-retry 批,Codex 设计审 v3 PASS)。
  *
@@ -7,8 +9,7 @@
  * 词表缺失→裸串直达用户)。本表收敛为唯一权威:
  *
  *   - **这里只放跨端稳定语义**:retryable / cta / allowPublicServerMessage /
- *     expected / waivable。**中文文案不进 protocol**(标题/正文留在前端,按
- *     本表 key 派生;gateway 的 provider 原文识别正则留在 errorClassify,
+ *     expected / waivable。**展示目录在 userErrorCatalog**(文案/建议动作按本表 key 派生;gateway 的 provider 原文识别正则留在 errorClassify,
  *     server-only)。三方靠契约测试锁 key 集合同源,不靠 import 同一份文案。
  *   - gateway 发出的一切 turn 级错误码(outbound.error.code、tape _errorCode、
  *     bridge error 帧 code)归一化后必须 ∈ 本表;新增码先加表再发帧。
@@ -35,6 +36,7 @@ export type TurnErrorCta =
  * An omitted list is an older backend; an empty list proves absence only for
  * terminal source rows returned in that same snapshot. No request payload. */
 export interface AutomaticTurnRecoverySnapshot {
+  retryStatus?: AutomaticRetryStatus
   sourceClientMessageId: string
   rootClientMessageId: string
   clientMessageId: string

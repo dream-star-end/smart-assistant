@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /** Loopback-only model-facing surface. It accepts no approval or execution command. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { SystemHelpRelayError, type SystemHelpRelay } from './systemHelpRelay.js'
@@ -6,7 +7,7 @@ function json(res: ServerResponse, code: number, body: unknown): void {
   res.statusCode = code
   res.setHeader('content-type', 'application/json; charset=utf-8')
   res.setHeader('cache-control', 'no-store')
-  res.end(JSON.stringify(body))
+  res.end(JSON.stringify(withUserError(body, code)))
 }
 export async function handleSystemHelpLocal(req: IncomingMessage, res: ServerResponse, relay: SystemHelpRelay | undefined): Promise<void> {
   const peer = req.socket.remoteAddress

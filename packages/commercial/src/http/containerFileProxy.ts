@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * v3 file proxy — HOST → 容器 /api/file & /api/media/* 的反向代理。
  *
@@ -731,9 +732,9 @@ function sendJsonError(
     "Cache-Control": "no-store",
   });
   res.end(
-    JSON.stringify({
+    JSON.stringify(withUserError({
       error: { code, message, request_id: requestId },
-    }),
+    }, status)),
   );
 }
 
