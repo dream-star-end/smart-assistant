@@ -15,6 +15,7 @@ export interface SessionSnapshotOptions {
 export const SESSION_SNAPSHOT_MAX_BYTES = 1024 * 1024
 
 type Queryable = Pick<PoolClient, 'query'>
+type SnapshotFact = { record_id: string; frame_seq: string; payload: Buffer }
 type Dispatch = {
   dispatch_id: string; client_message_id: string; agent_id: string
   status: string; outcome: string | null; attempt_no: number
@@ -104,7 +105,7 @@ export async function buildSessionSnapshot(
   let latestStatus: Record<string, unknown> | null = null
   let before: [string, string] | null = null
   while (!latestStatus || !snapshot.usage) {
-    const facts = await q.query<{ record_id: string; frame_seq: string; payload: Buffer }>(
+    const facts: { rows: SnapshotFact[] } = await q.query<SnapshotFact>(
       `/* session-snapshot-facts */
        SELECT record_id::text,frame_seq,payload FROM client_session_live_frames
         WHERE stream_key=$1 AND ($2::bigint IS NULL OR (frame_seq,record_id)<($2::bigint,$3::bigint))
