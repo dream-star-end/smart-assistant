@@ -4,6 +4,7 @@ import { SERVICE_TIERS } from './serviceTiers.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
 import { SysMediaJob } from './mediaGeneration.js'
+import { ContextPressure, ContextCompaction } from './contextPressure.js'
 import { AUTOMATIC_TURN_RETRY_MAX } from './turnErrorTaxonomy.js'
 
 // ───────────────────────────────────────────────
@@ -1383,6 +1384,28 @@ export const SysContextRebuilt = Type.Object({
 })
 export type SysContextRebuilt = Static<typeof SysContextRebuilt>
 
+// Gateway observations: additive WS/ring frames, never billing or content blocks.
+const ContextObservationRouting = Type.Object({
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  agentId: Type.String(),
+  ts: Type.Optional(Type.Number()),
+  traceId: Type.Optional(TraceIdString),
+})
+export const SessionContextPressure = Type.Intersect([
+  ContextObservationRouting,
+  ContextPressure,
+  Type.Object({ type: Type.Literal('session.context_pressure') }),
+])
+export type SessionContextPressure = Static<typeof SessionContextPressure>
+export const SysContextCompacted = Type.Intersect([
+  ContextObservationRouting,
+  ContextCompaction,
+  Type.Object({ type: Type.Literal('sys.context_compacted') }),
+])
+export type SysContextCompacted = Static<typeof SysContextCompacted>
+
 // ───────────────────────────────────────────────
 // V5 自愈体系(RFC-v5-selfheal-ops §5)— 运维事故用户推送
 // ───────────────────────────────────────────────
@@ -1493,6 +1516,8 @@ export const AnyFrame = Type.Union([
   OutboundCallUsage,
   PromptQueueSnapshot,
   SysContextRebuilt,
+  SessionContextPressure,
+  SysContextCompacted,
   SysIncident,
   SysGoalSnapshot,
   SysMediaJob,

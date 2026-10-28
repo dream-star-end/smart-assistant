@@ -9,6 +9,7 @@
  * generation), modelAuthority / dispatchAuthority (signature verification) and losslessTurnTape.
  */
 export * from './frames.js'
+export * from './contextPressure.js'
 export * from './liveUnits.js'
 export * from './timelineLifecycle.js'
 export * from './goalState.js'
