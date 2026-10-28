@@ -835,8 +835,10 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
         name: "Bash", arguments: faults.pendingArguments ?? { value: "x" } }));
     }
-    if (args.length === 5 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
-      // the keeper is asked to stop: a CLI still waiting for tool results stops, one that already exited does not
+    if (args.length === 5 && args[2]?.includes("signal.pidfd_send_signal")
+      && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
+      // Match the keeper script, not just its nonce/epoch shape: the liveness probe has the same five arguments.
+      // A CLI still waiting for tool results stops; one that already exited does not.
       count.stop++;
       if (faults.real?.proofReason === undefined && !faults.real?.stopIgnored) stopped.add(args[3]!);
       return reply("stop-requested\n");
