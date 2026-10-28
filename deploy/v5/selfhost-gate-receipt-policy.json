@@ -1,0 +1,13 @@
+{
+  "schema": "oc.v5.selfhost.gate-receipt-policy/1",
+  "gates": [
+    "delegate-billing-requestid",
+    "callback-payload-hash",
+    "cron-submit-boundary",
+    "prompt-privacy-lifecycle",
+    "system-approval-fencing",
+    "system-executor-fencing",
+    "session-unavailable-rootfix",
+    "watch-gate"
+  ]
+}

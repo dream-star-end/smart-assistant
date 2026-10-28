@@ -176,7 +176,9 @@ for mode in deploy prewarm-artifacts; do
 done
 check "cmd_deploy starts the recorder" bash -c "sed -n '/^cmd_deploy() {/,/^}/p' '$DEPLOY' | grep -qE '^  tsum_init '"
 # OCV5-557: the retryable gates run as `if ! master_gate_retryable <gate> <command> ...`.
-gates="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*if ! (\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" |master_gate_retryable )')"
+# P8 (d024e44e0): receipt guards precede the same local command. Count that exact shape too;
+# the one-mark-per-gate assertion below is unchanged (15 gates / 15 marks).
+gates="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*if ! ((master_gate_receipt_has [a-z-]+ "\$full_sha" && ! )?\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" |master_gate_retryable )')"
 cmarks="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*tsum_mark C\.')"
 check "one C.* mark per fixed gate ($gates gates, $cmarks marks)" test "$gates" -ge 10 -a "$gates" = "$cmarks"
 for p in A B D P.mcp-bundle P.seal P.runtime-wait P.platform-bundle E1 E2 E2.apply E3.prep E3.wait-idle E3.units E4 F.prewarm F.C1-C3 F.G1 F.S1 G X.compensate; do

@@ -181,6 +181,10 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
   let offCandidate = "";
   let schemaOwned = false;
   const cleanupErrors: string[] = [];
+  let failedBeforeCleanup = false;
+  const traceFailureCleanup = (stage: string) => {
+    if (failedBeforeCleanup) console.error(`[idle-fixture] cleanup ${stage}`);
+  };
   let serverClose: (() => Promise<void>) | undefined;
   let adapterShutdown: (() => Promise<void>) | undefined;
   let adminEnd: (() => Promise<void>) | undefined;
@@ -1717,6 +1721,18 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       }
     }
   } catch (error) {
+    failedBeforeCleanup = true;
+    // Cleanup can block before the final report is written. Preserve source
+    // locations without printing error messages, request bodies or credentials.
+    console.error("[idle-fixture] failure before cleanup", {
+      mode,
+      kind: error instanceof assert.AssertionError ? "AssertionError" : "error",
+      locations: error instanceof Error
+        ? [...(error.stack ?? "").split("\n").filter((line) => /^\s+at /.test(line)).join("\n")
+          .matchAll(/([A-Za-z0-9_-]+\.[cm]?[jt]sx?):(\d+):(\d+)/g)]
+          .slice(0, 8).map((match) => `${match[1]}:${match[2]}:${match[3]}`)
+        : [],
+    });
     report.failure = error instanceof Error ? { message: error.message, stack: error.stack } : String(error);
     throw error;
   } finally {
@@ -1731,6 +1747,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     restoreLocalAuth?.();
     releaseHeldCommits();
     if (adapterShutdown) {
+      traceFailureCleanup("adapter");
       const shutdown = adapterShutdown();
       const timed = await Promise.race([
         shutdown.then(() => "down", (error) => `shutdown:${error instanceof Error ? error.message : String(error)}`),
@@ -1738,9 +1755,16 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       ]);
       if (timed !== "down") cleanupErrors.push(String(timed));
     }
-    if (serverClose) await serverClose();
-    if (poolEnd) await poolEnd().catch(() => undefined);
+    if (serverClose) {
+      traceFailureCleanup("http");
+      await serverClose();
+    }
+    if (poolEnd) {
+      traceFailureCleanup("pool");
+      await poolEnd().catch(() => undefined);
+    }
     if (schemaOwned) {
+      traceFailureCleanup("schema");
       const pg = (await import("pg")).default;
       const admin = new pg.Pool({ connectionString: TEST_DB, max: 1 });
       try {
@@ -1753,6 +1777,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       await admin.end();
     }
     if (redisQuit) {
+      traceFailureCleanup("redis");
       try { await redisQuit(); }
       catch (error) { cleanupErrors.push(`redis-quit: ${error instanceof Error ? error.message : String(error)}`); }
     }
@@ -1762,7 +1787,10 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       rmSync(join(candidate, "claude-code-best/node_modules"), { force: true });
       rmSync(candidate, { recursive: true, force: true });
     }
-    if (adminEnd) await adminEnd().catch(() => undefined);
+    if (adminEnd) {
+      traceFailureCleanup("admin");
+      await adminEnd().catch(() => undefined);
+    }
     rmSync(HOME, { recursive: true, force: true });
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, `ocv5-296-idle-${mode}-r23-${SCHEMA.slice(-6)}-raw.json`);
