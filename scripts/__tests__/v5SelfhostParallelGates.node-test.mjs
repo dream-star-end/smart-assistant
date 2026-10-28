@@ -148,6 +148,32 @@ if master_build_jobs_wait; then exit 99; fi
   assert.equal(notes(f)['job.signalled.rc'], '143');
 });
 
+test('a terminated worker shell retains ownership until its surviving command exits', (t) => {
+  const f = fixture(t);
+  const r = run(f, `
+task() {
+  /bin/bash -c 'echo descendant-started >>"$EVENTS"; touch "$EVENTS.ready";
+    until test -f "$EVENTS.signalled"; do sleep .01; done
+    sleep .2; test -d "$TMPDIR"; echo descendant-done >>"$EVENTS"; touch "$EVENTS.done"'
+}
+before="$-"
+master_build_job_start signalled task
+[[ "$-" == "$before" ]] || exit 98
+until [[ -f "$EVENTS.ready" ]]; do sleep .01; done
+worker="\${MASTER_BUILD_JOB_PIDS[0]}"
+kill -TERM "$worker"
+touch "$EVENTS.signalled"
+reap_master_build_jobs
+event cleanup
+until [[ -f "$EVENTS.done" ]]; do sleep .01; done
+[[ "$MASTER_BUILD_JOB_FAILED" == 1 ]]
+[[ "\${#MASTER_BUILD_JOB_PIDS[@]}" == 0 ]]
+`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(events(f), ['descendant-started', 'descendant-done', 'cleanup']);
+  assert.equal(notes(f)['job.signalled.rc'], '143');
+});
+
 test('parent TERM exit drains its workers before EXIT cleanup', async (t) => {
   const f = fixture(t);
   const child = spawn('/bin/bash', ['-Eeuo', 'pipefail', '-c', `${prelude(f)}

@@ -18,10 +18,23 @@ master_build_job_limit() {
     'BEGIN { print l >= max ? 0 : (l >= max / 2 ? 2 : 3) }'
 }
 
+# Each job has its own process group. A dead shell can leave a live foreground
+# command behind; keep that group owned until all its non-zombie members exit.
+# Probe failures stay conservative. Zombies cannot write and cannot be reaped
+# by this parent after their original parent has died.
+master_build_job_group_running() { # <owned pgid>
+  local rows rc=0
+  kill -0 -- "-$1" 2>/dev/null || return 1
+  rows="$(ps -eo pgid=,stat=)" || return 0
+  awk -v pgid="$1" '$1 == pgid && $2 !~ /^[ZX]/ { alive=1 } END { exit !alive }' <<<"$rows" || rc=$?
+  [[ "$rc" != 1 ]]
+}
+
 master_build_job_collect() { # <array index>, called only after the child has exited
   local i="$1" rc=0 id elapsed
   id="${MASTER_BUILD_JOB_IDS[i]}"
   wait "${MASTER_BUILD_JOB_PIDS[i]}" || rc=$?
+  while master_build_job_group_running "${MASTER_BUILD_JOB_PIDS[i]}"; do sleep .1; done
   elapsed=$(( $(date +%s) - MASTER_BUILD_JOB_STARTS[i] ))
   mlog "  [$id] rc=$rc elapsed=${elapsed}s log=${MASTER_BUILD_JOB_LOGS[i]}"
   cat -- "${MASTER_BUILD_JOB_LOGS[i]}" >&2 || rc=1
@@ -46,7 +59,7 @@ master_build_jobs_poll() {
 
 master_build_job_start() { # <phase id> <function>, function has explicit failure returns
   local id="$1"; shift
-  local began="$SECONDS" limit log job_tmp i
+  local began="$SECONDS" limit log job_tmp i monitor=0
   while :; do
     master_build_jobs_poll || return 1
     limit="$(master_build_job_limit)"
@@ -70,14 +83,20 @@ master_build_job_start() { # <phase id> <function>, function has explicit failur
   tsum_note "job.$id.load1" "$(master_gate_load1)" 2>/dev/null || :
   tsum_note "job.$id.slots" "$limit" 2>/dev/null || :
   mlog "  [$id] 后台启动(最多 $limit 路 C/D),日志 $log"
+  # Bash assigns this async subshell pgid=$!. Restore the caller's monitor mode
+  # immediately; disable it inside the worker so its commands share that group.
+  [[ "$-" == *m* ]] && monitor=1
+  set -m
   (
     # Inherited deploy traps must never release a lease or remove staging here.
     trap - EXIT ERR
+    set +m
     MASTER_GATE_TMPDIR="$job_tmp"
     export TMPDIR="$job_tmp"
     "$@"
   ) >"$log" 2>&1 &
   MASTER_BUILD_JOB_PIDS[i]=$!
+  [[ "$monitor" == 1 ]] || set +m
   return 0
 }
 
