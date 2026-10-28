@@ -160,7 +160,10 @@ test('dry-run and OC_V5_SERIAL_RUNTIME_BUILD=1 keep the serial in-place build',t
 
 test('cmd_deploy wires the bg runtime build around build_master_release and the EXIT trap reaps it',()=>{
  const cd=fn(d,'cmd_deploy');
- assert.ok(cd.indexOf('start_runtime_release_bg "$sha"')>=0&&cd.indexOf('start_runtime_release_bg "$sha"')<cd.indexOf('build_master_release "$sha"'));
+ // OCV5-648 (P2): build_master_release starts the bg build right after admission; cmd_deploy only opts in.
+ assert.doesNotMatch(cd,/^\s+start_runtime_release_bg /m,'cmd_deploy must not start the bg build before admission');
+ const optIn=cd.indexOf('MASTER_RUNTIME_BG_AFTER_ADMISSION=1');
+ assert.ok(optIn>=0&&optIn<cd.indexOf('build_master_release "$sha"'));
  assert.ok(cd.indexOf('collect_runtime_release_bg "$sha"')>cd.indexOf('build_master_release "$sha"')&&cd.indexOf('collect_runtime_release_bg "$sha"')<cd.indexOf('build_platform_bundle "$sha"'));
  assert.doesNotMatch(cd,/^\s+build_runtime_release "\$sha"/m);
  const cleanup=fn(d,'cleanup_selfhost_deploy');assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
@@ -180,4 +183,35 @@ test('if the parent is killed outright (no EXIT trap), the bg build keeps holdin
  assert.ok(existsSync(join(f.dir,'bg-done')),'bg build must run to completion');
  spawnSync('sleep',['0.3']);
  const free=spawnSync('flock',['-n',lock,'true']);assert.equal(free.status,0,'lock is released once the bg build exits');
+});
+
+// OCV5-648 (P2): admission no longer waits on the train's own runtime build; the deterministic non-Box gates
+// overlap the build; the Box gates (and the load-scaled ccb-mcp gate) still run only after it (OCV5-557).
+test('P2: bg build starts after admission; non-Box gates overlap it; Box gates and ccb-mcp run after await',()=>{
+ const b=fn(m,'build_master_release');
+ const at=s=>{const i=b.indexOf(s);assert.ok(i>=0,s);assert.equal(b.indexOf(s,i+1),-1,`once: ${s}`);return i;};
+ const admission=at('master_gate_wait_host_idle admission');
+ const start=at('    start_runtime_release_bg "$full_sha"');
+ assert.match(b.slice(start-120,start),/if \[\[ "\$\{MASTER_RUNTIME_BG_AFTER_ADMISSION:-0\}" == 1 \]\]; then\n$/,'only when cmd_deploy opts in');
+ assert.ok(admission<start&&start<at('mkdir -p -- "$staging"'),'after admission, before the candidate is built');
+ const wait=at('    await_runtime_release_bg\n');
+ const idle=at('master_gate_wait_host_idle box-gates');
+ const db=at('master_gate_db_create "$staging"');
+ const drop=at('  master_gate_db_drop\n');
+ assert.ok(wait<idle&&idle<db&&db<drop);
+ const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
+ const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.ccb-mcp']);
+ assert.equal(marks.length,15,`same 15 gates: ${marks.map(x=>x[0]).join(' ')}`);
+ for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
+ // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)
+ const boxMark=at('  tsum_mark C.box-success-recovery ');assert.ok(boxMark<wait&&wait-boxMark<400);
+ for(const[n,i]of marks){
+  if(after.has(n))assert.ok(i>=boxMark,`${n} must run after the runtime build has finished`);
+  else assert.ok(i<boxMark,`${n} overlaps the runtime build`);
+ }
+ // every Box gate and the ccb-mcp gate command is after the await; every DB gate is between create and drop
+ for(const g of['check-v5-box-success-recovery.ts','check-v5-box-continuation.ts','check-v5-box-incident-proofs.ts','check-v5-ccb-mcp-availability.ts'])
+  for(const x of b.matchAll(new RegExp(g.replaceAll('.','\\.'),'g')))assert.ok(x.index>idle,g);
+ for(const x of b.matchAll(/TEST_DATABASE_URL="\$MASTER_GATE_DB_URL"/g))assert.ok(x.index>db&&x.index<drop);
+ assert.ok(at('  tsum_mark C.ccb-mcp ')>drop&&at('  tsum_mark C.ccb-mcp ')<at('\n  cleanup_master_gate_tmpdir\n'));
 });

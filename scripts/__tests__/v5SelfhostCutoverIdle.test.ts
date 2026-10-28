@@ -194,13 +194,12 @@ selfhost_release_preflight() { echo "L0:$1"; }
 assert_fix_trailers() { :; }
 assert_p0_web_overlay_contained() { :; }
 log() { :; }
-start_runtime_release_bg() { echo "RUNTIME:$1"; }
-build_master_release() { echo "MASTER:$1"; }
+build_master_release() { echo "MASTER:$1 BG:\${MASTER_RUNTIME_BG_AFTER_ADMISSION:-0}"; }
 ${actual}`], { encoding: 'utf8' })
     assert.equal(r.status, 0, r.stderr)
     const expected = active ? a : b
-    assert.match(r.stdout, new RegExp(`RUNTIME:${expected}`))
-    assert.match(r.stdout, new RegExp(`MASTER:${expected}`))
+    // OCV5-648 (P2): build_master_release starts the runtime bg build from its own $1 after admission
+    assert.match(r.stdout, new RegExp(`MASTER:${expected} BG:1`))
     // OCV5-581: L0 checks the same exact source the build uses, after the claim and before the build
     assert.match(r.stdout, new RegExp(`L0:${expected}[\\s\\S]*MASTER:${expected}`))
     if (!active) assert.match(r.stdout, new RegExp(`CLAIM:${b}[\\s\\S]*L0:${b}`))

@@ -931,6 +931,10 @@ build_master_release() {
   # Box 门前那次等待保留(构建期间可能又忙起来),通常立即通过。
   master_gate_wait_host_idle admission \
     || die "发车准入:主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s,未建候选(live 未改)"
+  # P2(OCV5-648):后台 runtime 构建在准入之后才起。先起的话它把 load1 推到 20+,准入等的就是本列车自己。
+  if [[ "${MASTER_RUNTIME_BG_AFTER_ADMISSION:-0}" == 1 ]]; then
+    start_runtime_release_bg "$full_sha"
+  fi
 
   mkdir -p -- "$MASTER_RELEASES_ROOT"
   chown 0:0 -- "$MASTER_RELEASES_ROOT"
@@ -991,81 +995,14 @@ build_master_release() {
     die "无法创建发布门私有 TMPDIR(${MASTER_GATE_TMP_PREFIX}.$$.*)"
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
-  tsum_mark C.box-success-recovery 2>/dev/null || :
-  # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。
-  if declare -F await_runtime_release_bg >/dev/null; then
-    t0="$(date +%s)"
-    await_runtime_release_bg
-    tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
-  fi
-  if ! master_gate_wait_host_idle box-gates; then
-    cleanup_master_staging
-    die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
-  fi
-  if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
-    cleanup_master_staging
-    die "建本班列车独立测试库失败(live 未改)"
-  fi
-  mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-success-recovery.ts"
-  fi
-  # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
-  # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
-  # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
-  master_gate_box_success_recovery() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
-  }
-  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
-    cleanup_master_staging
-    die "pinned Box success recovery behavioral gate 失败"
-  fi
-  tsum_mark C.box-continuation 2>/dev/null || :
-  mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-continuation.ts"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
-      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
-    cleanup_master_staging
-    die "pinned Box multitool continuation gate 失败"
-  fi
-  tsum_mark C.box-incident-proofs 2>/dev/null || :
-  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
-  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
-  fi
-  # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
-  master_gate_box_incident_proofs() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-        npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
-  }
-  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
-    cleanup_master_staging
-    die "pinned Box incident proofs gate (OCV5-488) 失败"
-  fi
-  master_gate_db_drop
+  # P2(OCV5-648):确定性的非 Box 门(不连本班列车测试库,没有按负载放大的等待预算)和后台 runtime 构建
+  # 并行跑,省掉 Box 门前那段空等(约 5.5 分钟)。Box 门和按负载放大等待的 ccb-mcp 门仍在构建结束、
+  # 主机空闲之后才跑(OCV5-557)。门的集合、命令和 pinned staging 都没变,只换了先后。
   tsum_mark C.cursor-sand 2>/dev/null || :
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
     cleanup_master_staging
     die "pinned Cursor Sand InferenceService contract gate 失败"
-  fi
-  tsum_mark C.ccb-mcp 2>/dev/null || :
-  mlog "  CCB MCP availability contract gate @ pinned staging"
-  master_gate_ccb_mcp() {
-    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
-        npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
-  }
-  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
-    cleanup_master_staging
-    die "pinned CCB MCP availability contract gate 失败"
   fi
   tsum_mark C.delegate-billing 2>/dev/null || :
   mlog "  delegate engine billing requestId contract gate @ pinned staging"
@@ -1146,6 +1083,76 @@ build_master_release() {
       --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
     cleanup_master_staging
     die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+  fi
+  tsum_mark C.box-success-recovery 2>/dev/null || :
+  # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。
+  if declare -F await_runtime_release_bg >/dev/null; then
+    t0="$(date +%s)"
+    await_runtime_release_bg
+    tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
+  fi
+  if ! master_gate_wait_host_idle box-gates; then
+    cleanup_master_staging
+    die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
+  fi
+  if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
+    cleanup_master_staging
+    die "建本班列车独立测试库失败(live 未改)"
+  fi
+  mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-success-recovery.ts"
+  fi
+  # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
+  # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
+  # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
+  master_gate_box_success_recovery() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+  }
+  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
+    cleanup_master_staging
+    die "pinned Box success recovery behavioral gate 失败"
+  fi
+  tsum_mark C.box-continuation 2>/dev/null || :
+  mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-continuation.ts"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
+    cleanup_master_staging
+    die "pinned Box multitool continuation gate 失败"
+  fi
+  tsum_mark C.box-incident-proofs 2>/dev/null || :
+  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
+  fi
+  # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
+  master_gate_box_incident_proofs() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
+  }
+  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
+    cleanup_master_staging
+    die "pinned Box incident proofs gate (OCV5-488) 失败"
+  fi
+  master_gate_db_drop
+  tsum_mark C.ccb-mcp 2>/dev/null || :
+  mlog "  CCB MCP availability contract gate @ pinned staging"
+  master_gate_ccb_mcp() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
+        npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
+  }
+  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
+    cleanup_master_staging
+    die "pinned CCB MCP availability contract gate 失败"
   fi
   cleanup_master_gate_tmpdir
 

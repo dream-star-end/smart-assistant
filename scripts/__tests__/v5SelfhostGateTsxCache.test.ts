@@ -42,7 +42,8 @@ function fixture(t: { after(fn: () => void): void }): string {
 
 describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
   test("every gate in the staging block runs with the private TMPDIR, and the dir is removed after", () => {
-    const a = lib.indexOf('mlog "  Box success recovery behavioral gate');
+    // OCV5-648 (P2): the non-Box gates run first (beside the runtime build), so the block starts at the first gate mark.
+    const a = lib.indexOf("\n  tsum_mark C.", lib.indexOf("build_master_release() {"));
     const b = lib.indexOf('web_key="$(master_web_dist_key');
     assert.ok(a > 0 && b > a);
     const block = lib.slice(a, b);
