@@ -69,6 +69,7 @@ const db = `
   sqlite3 "$OC_V5_LEASE_DB" 'CREATE TABLE train(resource TEXT,status TEXT); CREATE TABLE lease(resource TEXT,status TEXT);'
 `;
 const mode = `
+  export OC_V5_LEASE_DB="$T/lease.db"
   DRY=0; MODE=prewarm-artifacts; INVOCATION_ID=fixture; LEASE_TARGET_SHA="$SHA"
   ${fn(deploy, "selfhost_lock_py")}
   systemctl() { [[ "$1" == show ]] && echo "$$"; }
@@ -165,8 +166,10 @@ test("actual warm entry builds archived web A outside deploy lock, defers Docker
       echo '<meta name="oc-build" content="abcdef123456">' > packages/web-react/dist/index.html
       cp packages/web-react/src/marker packages/web-react/dist/pin.txt
     }
-    cmd_prewarm_artifacts
-    jq -e '.done != true and .retryAfter > 0' "$T/cache/attempt.json" >/dev/null
+    rc=0; cmd_prewarm_artifacts || rc=$?
+    test "$rc" = 73
+    prewarm_cleanup_invocation "$rc" || :
+    jq -e '.status == "partial" and .runtimeExitCode == 73 and .exitCode == 73 and .retryAfter > 0' "$T/cache/attempt.json" >/dev/null
     test -e "$T/finalizer-called"; test ! -e "$T/docker-run"; test ! -e "$T/official"; test ! -e "$T/master"
     key="$(master_web_dist_key "$SHA")"; bucket="$(find_web_dist_donor "$key")"
     test "$(cat "$bucket/packages/web-react/dist/pin.txt")" = pinned-A
@@ -217,7 +220,11 @@ test("idle tick launches nice bounded cgroup for pushed tip, never on read failu
     grep -qx -- '--property=KillMode=control-group' "$T/spawn"
     grep -qx -- '--property=RuntimeMaxSec=20min' "$T/spawn"
     grep -qx -- "--target-sha=$SHA" "$T/spawn"
-    rm "$T/spawn"; prewarm_note_done "$T/cache" "$SHA"; prewarm_idle_tick; test ! -e "$T/spawn"
+    rm "$T/spawn"
+    prewarm_attempt_begin "$T/cache" "$SHA"
+    PREWARM_RUNTIME_STATUS=ready; PREWARM_WEB_STATUS=ready
+    prewarm_cleanup_invocation 0
+    prewarm_idle_tick; test ! -e "$T/spawn"
     rm "$T/cache/attempt.json"; mv "$LEASE_DB" "$T/old.db"; prewarm_idle_tick; test ! -e "$T/spawn"
   `));
 });
@@ -261,6 +268,7 @@ test("budget watchdog cancels its own job before a partial artifact can be publi
       echo cancelled >"$T/cancelled"
       kill -KILL -- -"$$"
     }
+    docker() { echo "$IMAGE"; }
     build_runtime_release() { touch "$T/build-started"; sleep 120 & wait; }
     cmd_prewarm_artifacts
     echo BAD >"$T/published"
@@ -269,6 +277,11 @@ test("budget watchdog cancels its own job before a partial artifact can be publi
   assert.equal(readFileSync(join(f.dir, "cancelled"), "utf8").trim(), "cancelled");
   assert.equal(existsSync(join(f.dir, "cache/runtime.json")), false);
   assert.equal(existsSync(join(f.dir, "published")), false);
+  const attempt = JSON.parse(readFileSync(join(f.dir, "cache/attempt.json"), "utf8"));
+  assert.equal(attempt.status, "running");
+  assert.equal(attempt.attempt, 1);
+  assert.equal(attempt.exitCode, null);
+  assert.ok(attempt.retryAfter > attempt.startedAt);
 });
 
 test("ordinary runtime builder consumes warm evidence without executing the cold finalizer", (t) => {
@@ -280,5 +293,197 @@ test("ordinary runtime builder consumes warm evidence without executing the cold
     build_runtime_release "$SHA"
     test "$BUILT_RUNTIME_RELEASE" = "$T/official/rel-0123456789ab"
     test ! -e "$T/cold"
+  `));
+});
+
+const webBuild = `
+  find_master_release_donor() { return 1; }
+  npm() {
+    if [[ "$1" == ci ]]; then mkdir node_modules; return 0; fi
+    mkdir -p packages/web-react/dist
+    echo '<meta name="oc-build" content="abcdef123456">' > packages/web-react/dist/index.html
+    cp packages/web-react/src/marker packages/web-react/dist/pin.txt
+  }
+`;
+const webFixture = `
+  key="$(master_web_dist_key "$SHA")"; bucket="$T/cache/web-$key"
+  mkdir -p "$bucket/packages/web-react/dist" "$T/staging/packages/web-react"
+  echo '<meta name="oc-build" content="abcdef123456">' > "$bucket/packages/web-react/dist/index.html"
+  echo original > "$bucket/packages/web-react/dist/pin.txt"
+  write_web_dist_reuse_record "$bucket" "$key" built "$SHA"
+  digest="$(release_artifact_digest "$bucket")"
+  jq -n --arg sha "$SHA" --arg digest "$digest" \
+    '{schemaVersion:2,sourceCommit:$sha,artifactSha256:$digest}' > "$bucket/.complete"
+`;
+
+test("retry accounting bounds failures and interrupted attempts, cools down, and resets only for a new SHA", (t) => {
+  const f = fixture(t);
+  ok(run(f, `
+    test_epoch=1000; date() { [[ "$*" == +%s ]]; echo "$test_epoch"; }
+    test "$(prewarm_attempt_next "$T/cache" "$SHA")" = 1
+    prewarm_attempt_begin "$T/cache" "$SHA"
+    jq -e '.attempt == 1 and .status == "running" and .exitCode == null and .retryAfter == 2800' "$T/cache/attempt.json"
+    if prewarm_attempt_next "$T/cache" "$SHA"; then exit 1; fi
+    PREWARM_RUNTIME_STATUS=failed; PREWARM_RUNTIME_RC=47
+    rc=0; prewarm_cleanup_invocation 47 || rc=$?; test "$rc" = 47
+    jq -e '.status == "failed" and .exitCode == 47 and .runtimeExitCode == 47' "$T/cache/attempt.json"
+    test_epoch=2799; if prewarm_attempt_next "$T/cache" "$SHA"; then exit 1; fi
+    test_epoch=2800; prewarm_attempt_begin "$T/cache" "$SHA"
+    jq -e '.attempt == 2 and .retryAfter == 6400' "$T/cache/attempt.json"
+    # No finish: model a SIGKILL/restart. Durable running still counts as an attempt.
+    test_epoch=6400; prewarm_attempt_begin "$T/cache" "$SHA"
+    test_epoch=999999; if prewarm_attempt_next "$T/cache" "$SHA"; then exit 1; fi
+    test "$(prewarm_attempt_next "$T/cache" ${"b".repeat(40)})" = 1
+    prewarm_cleanup_invocation 9 || :
+    prewarm_attempt_begin "$T/cache" ${"b".repeat(40)}
+    PREWARM_RUNTIME_STATUS=ready; PREWARM_WEB_STATUS=ready; prewarm_cleanup_invocation 0
+    if prewarm_attempt_next "$T/cache" ${"b".repeat(40)}; then exit 1; fi
+    jq -e '.attempt == 1 and .status == "ready" and .exitCode == 0' "$T/cache/attempt.json"
+    # A legacy record upgrades once; malformed schema-2 state never resets the budget.
+    jq -n --arg sha "$SHA" '{sha:$sha,done:true}' > "$T/cache/attempt.json"
+    test "$(prewarm_attempt_next "$T/cache" "$SHA")" = 1
+    for json in '{' '[]' '{"schema":2}' '{"schema":2,"sha":"${"b".repeat(40)}","attempt":-1}' '{} {}'; do
+      echo "$json" > "$T/cache/attempt.json"
+      if prewarm_attempt_next "$T/cache" "$SHA"; then exit 1; fi
+    done
+    rm "$T/cache/attempt.json"; ln -s "$T/missing" "$T/cache/attempt.json"
+    if prewarm_attempt_next "$T/cache" "$SHA"; then exit 1; fi
+  `));
+});
+
+test("service admission rechecks retry budget, post-lock DB/policy and failed host probes before any build", (t) => {
+  for (const refusal of [
+    'master_gate_busy_reason() { return 41; }',
+    'master_gate_busy_reason() { echo busy; }',
+    'release_policy_context_present() { return 0; }',
+    'prewarm_idle_db() { if [[ -e "$T/db-seen" ]]; then return 1; fi; touch "$T/db-seen"; }',
+    'prewarm_attempt_begin "$T/cache" "$SHA"; PREWARM_ATTEMPT_CACHE=""',
+    'prewarm_attempt_begin "$T/cache" "$SHA"; PREWARM_ATTEMPT=3; PREWARM_RETRY_AFTER=0; prewarm_attempt_save failed 8; PREWARM_ATTEMPT_CACHE=""',
+  ]) {
+    const f = fixture(t);
+    ok(run(f, `${db}${mode}
+      build_runtime_release() { touch "$T/build"; }
+      ${refusal}
+      before="$(cat "$T/cache/attempt.json" 2>/dev/null || true)"
+      cmd_prewarm_artifacts
+      test ! -e "$T/build"; test ! -e "$T/cache/.work"
+      test "$(cat "$T/cache/attempt.json" 2>/dev/null || true)" = "$before"
+    `));
+  }
+});
+
+test("failed runtime builder cannot publish; web success keeps real failure and EXIT removes partial files", (t) => {
+  const f = fixture(t);
+  const r = run(f, `${db}${mode}${webBuild}
+    docker() { echo "$IMAGE"; }
+    build_runtime_release() { mkdir -p "$OC_HOTCFG_RELEASES_ROOT/.staging-failed"; touch "$OC_HOTCFG_RELEASES_ROOT/.staging-failed/partial"; return 47; }
+    prewarm_runtime_publish() { echo BAD > "$T/publish-after-failure"; }
+    cmd_prewarm_artifacts
+  `);
+  assert.equal(r.status, 47, r.stderr);
+  const record = JSON.parse(readFileSync(join(f.dir, "cache/attempt.json"), "utf8"));
+  assert.equal(record.status, "partial");
+  assert.equal(record.runtimeExitCode, 47);
+  assert.equal(record.exitCode, 47);
+  assert.equal(record.web, "ready");
+  for (const path of ["cache/runtime", "cache/runtime.json", "cache/.work", "publish-after-failure", "official"]) {
+    assert.equal(existsSync(join(f.dir, path)), false, path);
+  }
+});
+
+test("web failure retains verified private runtime; next admitted attempt reuses it and reports ready", (t) => {
+  const f = fixture(t);
+  const setup = `${mode}
+    docker() { echo "$IMAGE"; }
+    build_runtime_release() { echo BAD > "$T/rebuilt"; return 49; }
+  `;
+  const r = run(f, `${db}${setup}${runtimeFixture}
+    find_master_release_donor() { return 1; }
+    npm() { return 61; }
+    cmd_prewarm_artifacts
+  `);
+  assert.equal(r.status, 73, r.stderr);
+  const statePath = join(f.dir, "cache/attempt.json");
+  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(state.status, "partial");
+  assert.equal(state.runtime, "ready");
+  assert.equal(state.exitCode, 73);
+  assert.equal(existsSync(join(f.dir, "cache/.work")), false);
+  assert.equal(existsSync(join(f.dir, "cache/runtime.json")), true);
+  // Advance only the fixture's retry deadline; production uses real elapsed time.
+  writeFileSync(statePath, JSON.stringify({ ...state, retryAfter: 0 }));
+  const retry = run(f, `${setup}${webBuild} cmd_prewarm_artifacts`);
+  ok(retry);
+  const ready = JSON.parse(readFileSync(statePath, "utf8"));
+  assert.equal(ready.status, "ready", retry.stderr);
+  assert.equal(ready.attempt, 2);
+  assert.equal(ready.exitCode, 0);
+  assert.equal(existsSync(join(f.dir, "rebuilt")), false);
+  assert.equal(existsSync(join(f.dir, "official")), false);
+  assert.equal(existsSync(join(f.dir, "cache/.work")), false);
+});
+
+test("runtime publication validates source, capability, manifest and MCP before minting a receipt", (t) => {
+  const f = fixture(t);
+  ok(run(f, `${runtimeFixture}
+    rm "$T/cache/runtime.json"
+    cp "$rel/MANIFEST.json" "$T/original-manifest"
+    for field in sourceCommit capabilities; do
+      jq --arg field "$field" 'if $field == "sourceCommit" then .sourceCommit = "${"b".repeat(40)}" else .capabilities = ["wrong"] end' "$T/original-manifest" > "$rel/MANIFEST.json"
+      if prewarm_runtime_publish "$SHA" "$IMAGE" "$rel"; then exit 1; fi
+      test ! -e "$T/cache/runtime.json"
+    done
+    cp "$T/original-manifest" "$rel/MANIFEST.json"
+    echo changed > "$rel/packages/mcp-memory/dist/oc-memory.cjs"
+    if prewarm_runtime_publish "$SHA" "$IMAGE" "$rel"; then exit 1; fi
+    test ! -e "$T/cache/runtime.json"
+    rm "$rel/packages/mcp-memory/dist/oc-memory.cjs"
+    oc_hotcfg_build_manifest "$rel" 1 "$SHA" 1.3.14 deps ccb test-cap >/dev/null
+    if prewarm_runtime_publish "$SHA" "$IMAGE" "$rel"; then exit 1; fi
+    test ! -e "$T/cache/runtime.json"
+  `));
+});
+
+test("runtime and web reject digest commands that print the expected digest but fail", (t) => {
+  const f = fixture(t);
+  ok(run(f, `${runtimeFixture}${webFixture}
+    expected="$(jq -r .artifactSha256 "$T/cache/runtime.json")"
+    original_digest="$(declare -f release_artifact_digest)"
+    release_artifact_digest() { echo "$expected"; return 44; }
+    if prewarm_runtime_donor "$SHA" "$IMAGE" test-cap; then exit 1; fi
+    test ! -e "$T/official"
+    eval "$original_digest"
+    expected="$(jq -r .distDigest "$bucket/$WEB_DIST_REUSE_RECORD")"
+    web_dist_digest() { echo "$expected"; return 44; }
+    if prewarm_web_donor "$key"; then exit 1; fi
+    if copy_verified_web_dist "$bucket" "$T/staging"; then exit 1; fi
+    # Empty digest record + failed empty digest used to pass a string-only comparison.
+    jq '.distDigest = ""' "$bucket/$WEB_DIST_REUSE_RECORD" > "$T/record"
+    mv "$T/record" "$bucket/$WEB_DIST_REUSE_RECORD"
+    digest="$(release_artifact_digest "$bucket")"
+    jq --arg digest "$digest" '.artifactSha256=$digest' "$bucket/.complete" > "$T/seal"
+    mv "$T/seal" "$bucket/.complete"
+    web_dist_digest() { return 44; }
+    if prewarm_web_donor "$key"; then exit 1; fi
+  `));
+});
+
+test("web copy rejects corruption and donor mutation after lookup using frozen verified evidence", (t) => {
+  const f = fixture(t);
+  ok(run(f, `${webFixture}
+    test "$(prewarm_web_donor "$key")" = "$bucket"
+    cp() { command cp "$@"; echo corrupted > "$T/staging/packages/web-react/dist/pin.txt"; }
+    if copy_verified_web_dist "$bucket" "$T/staging"; then exit 1; fi
+    rm -rf "$T/staging/packages/web-react/dist"
+    cp() {
+      echo mutated > "$bucket/packages/web-react/dist/pin.txt"
+      write_web_dist_reuse_record "$bucket" "$key" built "$SHA"
+      command cp "$@"
+    }
+    if copy_verified_web_dist "$bucket" "$T/staging"; then exit 1; fi
+    rm -rf "$T/staging/packages/web-react/dist"; unset -f cp
+    # A donor changed between lookup and copy is rejected by the full seal before copying.
+    if copy_verified_web_dist "$bucket" "$T/staging"; then exit 1; fi
+    test ! -e "$T/staging/packages/web-react/dist"
   `));
 });

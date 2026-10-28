@@ -229,7 +229,7 @@ own_instance_present() {
 cleanup_selfhost_deploy() {
   local exit_rc=$?
   if [[ "${MODE:-}" == prewarm-artifacts ]]; then
-    prewarm_cleanup_invocation
+    prewarm_cleanup_invocation "$exit_rc" || :
     return "$exit_rc"
   fi
   tsum_finish "$exit_rc" 2>/dev/null || :

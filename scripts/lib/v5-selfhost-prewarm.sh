@@ -6,6 +6,11 @@
 PREWARM_WATCHDOG_PID=""
 PREWARM_WORK=""
 PREWARM_RUNTIME_BUILD=0
+PREWARM_ATTEMPT_CACHE=""
+PREWARM_PHASE=admission
+PREWARM_RUNTIME_STATUS=pending
+PREWARM_RUNTIME_RC=0
+PREWARM_WEB_STATUS=pending
 
 prewarm_cache_root() { printf '%s' "${OC_V5_SELFHOST_PREWARM_CACHE:-/var/lib/openclaude-v5-selfhost/artifact-cache}"; }
 prewarm_unit() { # Different test locks cannot address the real service.
@@ -16,6 +21,54 @@ prewarm_trusted_dir() {
   [[ -d "$1" && ! -L "$1" ]] || return 1
   read -r uid gid mode < <(stat -c '%u %g %a' -- "$1") || return 1
   [[ "$uid:$gid" == 0:0 && $((8#$mode & 8#22)) == 0 ]]
+}
+
+prewarm_skip() { echo "prewarm: admission refused ($1)" >&2; }
+
+prewarm_attempt_next() { # <cache> <sha>; stdout next attempt, or fail closed (also used under guard).
+  local cache="$1" sha="$2" now
+  [[ ! -e "$cache" && ! -L "$cache" ]] || prewarm_trusted_dir "$cache" || return 1
+  [[ -e "$cache/attempt.json" || -L "$cache/attempt.json" ]] || { echo 1; return 0; }
+  [[ -f "$cache/attempt.json" && ! -L "$cache/attempt.json" ]] || return 1
+  now="$(date +%s)" || return 1
+  jq -ser --arg sha "$sha" --argjson now "$now" '
+    def uint: type == "number" and . >= 0 and . == floor;
+    if length != 1 then error("invalid attempt record") else .[0] end |
+    if type != "object" or (.sha | type) != "string" then error("invalid attempt record")
+    elif (.sha | test("^[0-9a-f]{40}$") | not) then error("invalid SHA")
+    # Upgrade the old unbounded SHA-only record once; it is not schema-2 evidence.
+    elif .schema == null and (has("done") or has("retryAfter")) then 1
+    elif .schema != 2 or (.attempt | uint | not) or .attempt < 1 or .attempt > 3
+      or (.retryAfter | uint | not) then error("invalid attempt record")
+    elif (.status != "running" and .status != "failed" and .status != "partial" and .status != "ready") then error("invalid status")
+    elif .sha != $sha then 1
+    elif .status == "ready" or .attempt >= 3 or $now < .retryAfter then empty
+    else .attempt + 1 end' "$cache/attempt.json" 2>/dev/null
+}
+
+prewarm_attempt_save() { # <status> <exit-code|null>; one atomic, bounded diagnostic record.
+  local status="$1" rc="$2" ended=null
+  [[ "$status" == running ]] || ended="$(date +%s)" || return 1
+  jq -n --arg sha "$PREWARM_SHA" --argjson attempt "$PREWARM_ATTEMPT" \
+    --argjson start "$PREWARM_STARTED" --argjson after "$PREWARM_RETRY_AFTER" \
+    --argjson end "$ended" --arg status "$status" --arg phase "$PREWARM_PHASE" \
+    --arg runtime "$PREWARM_RUNTIME_STATUS" --argjson runtimeRC "$PREWARM_RUNTIME_RC" \
+    --arg web "$PREWARM_WEB_STATUS" --argjson rc "$rc" \
+    '{schema:2,sha:$sha,attempt:$attempt,retryAfter:$after,startedAt:$start,endedAt:$end,
+      status:$status,phase:$phase,runtime:$runtime,runtimeExitCode:$runtimeRC,web:$web,exitCode:$rc}' \
+    >"$PREWARM_ATTEMPT_CACHE/attempt.json.tmp" || return 1
+  mv -f "$PREWARM_ATTEMPT_CACHE/attempt.json.tmp" "$PREWARM_ATTEMPT_CACHE/attempt.json"
+}
+
+prewarm_attempt_begin() { # caller holds guard; interrupted attempts already consume their allowance.
+  local cache="$1" sha="$2"
+  PREWARM_ATTEMPT="$(prewarm_attempt_next "$cache" "$sha")" || return 1
+  PREWARM_SHA="$sha"; PREWARM_STARTED="$(date +%s)" || return 1
+  PREWARM_RETRY_AFTER=$((PREWARM_STARTED + 1800 * PREWARM_ATTEMPT))
+  PREWARM_PHASE=runtime; PREWARM_RUNTIME_STATUS=running; PREWARM_RUNTIME_RC=0; PREWARM_WEB_STATUS=pending
+  PREWARM_ATTEMPT_CACHE="$cache"
+  prewarm_attempt_save running null || { PREWARM_ATTEMPT_CACHE=""; return 1; }
+  echo "prewarm: attempt=$PREWARM_ATTEMPT/3 sha=${sha:0:12} retryAfter=$PREWARM_RETRY_AFTER" >&2
 }
 
 prewarm_idle_db() { # Read-only, missing/corrupt/locked DB is NOT idle; never creates a DB.
@@ -46,15 +99,13 @@ prewarm_idle_tick() {
   lease_release_policy_held && return 0
   lease_in_cutover_grace && return 0
   lease_deploy_process_running && return 0
-  local tip cache stamp now unit
+  local tip cache unit
   # Do not build an unpushed/local head. A failed fetch cannot warm a stale remote ref.
   git -C "$LEASE_REPO_ROOT" fetch -q origin "$LEASE_BRANCH" || return 0
   tip="$(lease_remote_tip)" || return 0
   [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || return 0
-  cache="$(prewarm_cache_root)"; now="$(date +%s)"
-  if jq -e --arg sha "$tip" 'select(.sha == $sha and .done == true)' "$cache/attempt.json" >/dev/null 2>&1; then return 0; fi
-  stamp="$(jq -r --arg sha "$tip" 'select(.sha == $sha) | .retryAfter' "$cache/attempt.json" 2>/dev/null || true)"
-  [[ "$stamp" =~ ^[0-9]+$ ]] && (( now < stamp )) && return 0
+  cache="$(prewarm_cache_root)"
+  prewarm_attempt_next "$cache" "$tip" >/dev/null || return 0
   unit="$(prewarm_unit "$LEASE_DEPLOY_LOCK")"
   # No inherited worker/deploy/DB fds. A running same-name unit prevents duplicate warmers.
   systemd-run --quiet --collect --unit="$unit" --property=Nice=15 --property=CPUWeight=1 \
@@ -63,7 +114,8 @@ prewarm_idle_tick() {
     --setenv=OC_V5_SELFHOST_DEPLOY_LOCK="$LEASE_DEPLOY_LOCK" \
     --setenv=OC_V5_SELFHOST_PREWARM_CACHE="$cache" \
     --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    "$DEPLOY_BIN" --prewarm-artifacts --target-sha="$tip" </dev/null >/dev/null 2>&1 || true
+    "$DEPLOY_BIN" --prewarm-artifacts --target-sha="$tip" </dev/null >/dev/null 2>&1 \
+    || echo "prewarm: service start unavailable for ${tip:0:12}" >&2
 }
 
 prewarm_budget_ok() { # <free-KiB> <free-inodes> <path>; statvfs failure is fatal to speculation.
@@ -104,19 +156,20 @@ prewarm_runtime_key() { # exact tip + immutable toolchain + actual recipe, no se
 }
 
 prewarm_verify_runtime() { # <root> <sha> <caps> <full-artifact-digest>
-  local rel="$1" sha="$2" caps="$3" digest="$4" want
+  local rel="$1" sha="$2" caps="$3" digest="$4" want got
   prewarm_trusted_dir "$rel" || return 1
   [[ -f "$rel/MANIFEST.json" && ! -L "$rel/MANIFEST.json" && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
   want="$(printf '%s' "$caps" | tr ' ' '\n' | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')" || return 1
   jq -e --arg sha "$sha" --argjson caps "$want" \
     '.sourceCommit == $sha and ((.capabilities | sort) == $caps)' "$rel/MANIFEST.json" >/dev/null || return 1
-  [[ "$(release_artifact_digest "$rel")" == "$digest" ]] || return 1
+  got="$(release_artifact_digest "$rel")" || return 1
+  [[ "$got" == "$digest" ]] || return 1
   oc_hotcfg_verify_manifest_sampled "$rel" 64 || return 1
   oc_hotcfg_assert_runtime_mcp_cjs "$rel"
 }
 
-prewarm_runtime_donor() { # <sha> <image> <caps>; stdout only official adopted path
-  local sha="$1" image="$2" caps="$3" cache key name digest rel target stage
+prewarm_runtime_receipt() { # <sha> <image>; stdout validated name + digest (no adoption).
+  local sha="$1" image="$2" cache key name digest
   cache="$(prewarm_cache_root)"
   prewarm_trusted_dir "$cache" || return 1
   [[ -f "$cache/runtime.json" && ! -L "$cache/runtime.json" ]] || return 1
@@ -124,10 +177,29 @@ prewarm_runtime_donor() { # <sha> <image> <caps>; stdout only official adopted p
   name="$(jq -er --arg k "$key" 'select(.schema == 1 and .key == $k) | .name' "$cache/runtime.json")" || return 1
   [[ "$name" =~ ^rel-[0-9a-f]{12}$ ]] || return 1
   digest="$(jq -er .artifactSha256 "$cache/runtime.json")" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s %s\n' "$name" "$digest"
+}
+
+prewarm_private_runtime_ready() {
+  local receipt name digest cache
+  receipt="$(prewarm_runtime_receipt "$1" "$2")" || return 1
+  read -r name digest <<<"$receipt"
+  cache="$(prewarm_cache_root)"
+  prewarm_trusted_dir "$cache/runtime" || return 1
+  prewarm_verify_runtime "$cache/runtime/$name" "$1" "$3" "$digest"
+}
+
+prewarm_runtime_donor() { # <sha> <image> <caps>; stdout only official adopted path
+  local sha="$1" image="$2" caps="$3" cache receipt name digest rel target stage
+  receipt="$(prewarm_runtime_receipt "$sha" "$image")" || return 1
+  read -r name digest <<<"$receipt"
+  cache="$(prewarm_cache_root)"
   rel="$cache/runtime/$name"; target="$OC_HOTCFG_RELEASES_ROOT/$name"
   if [[ -e "$target" || -L "$target" ]]; then
     prewarm_verify_runtime "$target" "$sha" "$caps" "$digest" || return 1
   else
+    prewarm_trusted_dir "$cache/runtime" || return 1
     prewarm_verify_runtime "$rel" "$sha" "$caps" "$digest" || return 1
     # Train owns deploy.lock and has stopped the warmer. Never expose a partial rel-* on EXDEV.
     mkdir -p "$OC_HOTCFG_RELEASES_ROOT" || return 1
@@ -142,47 +214,68 @@ prewarm_runtime_donor() { # <sha> <image> <caps>; stdout only official adopted p
 }
 
 prewarm_runtime_publish() { # only called for a private, successfully finalized runtime artifact
-  local sha="$1" image="$2" rel="$3" cache key digest name
+  local sha="$1" image="$2" rel="$3" cache key digest name caps
   cache="$(prewarm_cache_root)"; name="$(basename "$rel")"
   [[ "$rel" == "$cache/runtime/$name" && "$name" =~ ^rel-[0-9a-f]{12}$ ]] || return 1
   prewarm_recipe_matches "$sha" || return 1
   key="$(prewarm_runtime_key "$sha" "$image")" || return 1
   digest="$(release_artifact_digest "$rel")" || return 1
+  caps="$(runtime_caps_from_metadata "$sha")" || return 1
+  prewarm_verify_runtime "$rel" "$sha" "$caps" "$digest" || return 1
   jq -n --arg key "$key" --arg name "$name" --arg digest "$digest" \
     '{schema:1,key:$key,name:$name,artifactSha256:$digest}' >"$cache/runtime.json.tmp" || return 1
   mv -f "$cache/runtime.json.tmp" "$cache/runtime.json"
 }
 
 prewarm_web_donor() { # same web key, dist digest and full seal as ordinary release donors
-  local key="$1" cand rec digest
+  local key="$1" cand rec digest got
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
   cand="$(prewarm_cache_root)/web-$key"; rec="$cand/$WEB_DIST_REUSE_RECORD"
   prewarm_trusted_dir "$cand" || return 1
   [[ -f "$rec" && ! -L "$rec" ]] || return 1
   jq -e --arg s "$WEB_DIST_REUSE_SCHEMA" --arg k "$key" '.schema == $s and .key == $k' "$rec" >/dev/null || return 1
   digest="$(jq -er .distDigest "$rec")" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
   grep -q 'name="oc-build"' "$cand/packages/web-react/dist/index.html" || return 1
-  [[ "$(web_dist_digest "$cand/packages/web-react/dist")" == "$digest" ]] || return 1
+  got="$(web_dist_digest "$cand/packages/web-react/dist")" || return 1
+  [[ "$got" == "$digest" ]] || return 1
   web_dist_donor_sealed "$cand" || return 1
   printf '%s\n' "$cand"
 }
 
 prewarm_cleanup_invocation() {
+  local rc="${1:-$?}" status=failed cache="$PREWARM_ATTEMPT_CACHE"
   if [[ -n "$PREWARM_WATCHDOG_PID" ]]; then
     kill "$PREWARM_WATCHDOG_PID" 2>/dev/null || true
     wait "$PREWARM_WATCHDOG_PID" 2>/dev/null || true
     PREWARM_WATCHDOG_PID=""
   fi
   # This exact workspace is assigned only after admission and the exclusive prewarm guard.
-  if [[ -n "$PREWARM_WORK" ]]; then rm -rf -- "$PREWARM_WORK"; PREWARM_WORK=""; fi
-}
-
-prewarm_note_done() {
-  jq -n --arg sha "$2" '{sha:$sha,done:true}' >"$1/attempt.json.tmp" && mv -f "$1/attempt.json.tmp" "$1/attempt.json"
+  if [[ -n "$PREWARM_WORK" ]]; then
+    rm -rf -- "$PREWARM_WORK" || echo 'prewarm: scratch cleanup failed' >&2
+    PREWARM_WORK=""
+  fi
+  if [[ -n "$cache" ]]; then
+    if [[ "$PREWARM_PHASE" == runtime && "$PREWARM_RUNTIME_STATUS" == running ]]; then
+      PREWARM_RUNTIME_STATUS=failed; PREWARM_RUNTIME_RC="$rc"
+    fi
+    if [[ "$PREWARM_PHASE" == web && "$PREWARM_WEB_STATUS" == running ]]; then PREWARM_WEB_STATUS=failed; fi
+    # Retain only a runtime verified in THIS invocation, including when web failed later.
+    if [[ "$PREWARM_RUNTIME_STATUS" != ready ]]; then
+      rm -rf -- "$cache/runtime" "$cache/runtime.json" || echo 'prewarm: runtime cleanup failed' >&2
+    fi
+    rm -f -- "$cache/runtime.json.tmp" "$cache/attempt.json.tmp" || true
+    if [[ "$rc" == 0 && "$PREWARM_RUNTIME_STATUS:$PREWARM_WEB_STATUS" == ready:ready ]]; then status=ready
+    elif [[ "$PREWARM_RUNTIME_STATUS" == ready || "$PREWARM_WEB_STATUS" == ready ]]; then status=partial; fi
+    prewarm_attempt_save "$status" "$rc" || echo 'prewarm: outcome write failed; running attempt remains counted' >&2
+    echo "prewarm: outcome=$status phase=$PREWARM_PHASE runtime=$PREWARM_RUNTIME_STATUS runtime_rc=$PREWARM_RUNTIME_RC web=$PREWARM_WEB_STATUS exit=$rc" >&2
+    PREWARM_ATTEMPT_CACHE=""
+  fi
+  return "$rc"
 }
 
 cmd_prewarm_artifacts() {
-  local sha="${LEASE_TARGET_SHA:-}" cache unit db key donor staging bucket digest pid runtime_ready=0
+  local sha="${LEASE_TARGET_SHA:-}" cache unit db key donor staging bucket digest pid busy image caps
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "prewarm requires exact target SHA"
   [[ "$DRY" != 1 ]] || { log "[dry-run] prewarm $sha (private cache only)"; return 0; }
   [[ "${OC_V5_SELFHOST_PREWARM:-1}" == 1 && -n "${INVOCATION_ID:-}" ]] || return 0
@@ -190,36 +283,37 @@ cmd_prewarm_artifacts() {
   pid="$(systemctl show --property=MainPID --value "$unit.service")" || return 0
   [[ "$pid" == "$$" ]] || die "prewarm only runs in its own dedicated service"
   prewarm_recipe_matches "$sha" || { log "prewarm: driver differs from tip; wait for canonical alignment"; return 0; }
-  [[ "$(git -C "$REPO_ROOT" rev-parse refs/remotes/origin/feat/v5-selfhost)" == "$sha" ]] || return 0
+  [[ "$(git -C "$REPO_ROOT" rev-parse refs/remotes/origin/feat/v5-selfhost)" == "$sha" ]] \
+    || { prewarm_skip stale-tip; return 0; }
   db="${OC_V5_LEASE_DB:-/var/lib/openclaude-v5-selfhost/lease.db}"
-  prewarm_idle_db "$db" || return 0
+  prewarm_idle_db "$db" || { prewarm_skip lease-db; return 0; }
   # Guard -> short nonblocking official-lock probe; never hold official lock during a build.
   selfhost_lock_py prepare "$SELFHOST_DEPLOY_LOCK.prewarm" "$SELFHOST_DEPLOY_LOCK_DIR"
   exec 9<>"$SELFHOST_DEPLOY_LOCK.prewarm"
-  flock -n 9 || return 0
+  flock -n 9 || { prewarm_skip prewarm-guard; return 0; }
   selfhost_lock_py prepare "$SELFHOST_DEPLOY_LOCK" "$SELFHOST_DEPLOY_LOCK_DIR"
   exec 8<>"$SELFHOST_DEPLOY_LOCK"
-  if ! flock -n 8; then exec 8>&-; return 0; fi
-  if ! prewarm_idle_db "$db" || release_policy_context_present; then exec 8>&-; return 0; fi
+  if ! flock -n 8; then exec 8>&-; prewarm_skip deploy-lock; return 0; fi
+  if ! prewarm_idle_db "$db" || release_policy_context_present; then
+    exec 8>&-; prewarm_skip lease-or-policy; return 0
+  fi
   exec 8>&-
-  [[ -z "$(master_gate_busy_reason)" ]] || return 0
+  busy="$(master_gate_busy_reason)" || { prewarm_skip host-probe-failed; return 0; }
+  [[ -z "$busy" ]] || { prewarm_skip host-busy; return 0; }
   cache="$(prewarm_cache_root)"
+  prewarm_attempt_next "$cache" "$sha" >/dev/null || { prewarm_skip retry-policy; return 0; }
   [[ ! -L "$cache" ]] || die "prewarm cache cannot be a symlink"
   ( umask 077; mkdir -p "$cache" )
   prewarm_trusted_dir "$cache" || die "untrusted prewarm cache"
   PREWARM_WORK="$cache/.work"
   rm -rf -- "$PREWARM_WORK" # stale scratch from this dedicated service only; no official releases
   mkdir -m 0700 "$PREWARM_WORK"
-  # One speculative runtime and one web bucket at most. Old private runtime can never be live.
-  rm -rf -- "$cache/runtime" "$cache/runtime.json" "$cache/runtime.json.tmp"
-  key="$(master_web_dist_key "$sha")" || return 0
+  key="$(master_web_dist_key "$sha")" || { prewarm_skip web-key; return 0; }
   for bucket in "$cache"/web-*; do
     [[ "$bucket" == "$cache/web-$key" ]] || rm -rf -- "$bucket"
   done
   prewarm_budget_ok $((12*1024*1024)) 500000 "$cache" || { log "prewarm: disk/inode budget unavailable"; return 0; }
-  jq -n --arg sha "$sha" --argjson after "$(( $(date +%s) + 1800 ))" \
-    '{sha:$sha,retryAfter:$after}' >"$cache/attempt.json.tmp"
-  mv -f "$cache/attempt.json.tmp" "$cache/attempt.json"
+  prewarm_attempt_begin "$cache" "$sha" || die 'prewarm attempt accounting failed'
   # At 9 GiB, cancel with 1 GiB slack above the train's 8 GiB floor. No production PID lookup.
   (
     while prewarm_budget_ok $((9*1024*1024)) 300000 "$cache"; do sleep 1 || break; done
@@ -231,21 +325,35 @@ cmd_prewarm_artifacts() {
   mkdir -p "$TMPDIR"
   # The normal builder is used unchanged below its cache entry. NEVER launch a Docker install
   # from speculation: killing a Docker client does not prove its daemon-owned container stopped.
-  if (
-    trap - EXIT
-    PREWARM_RUNTIME_BUILD=1
-    OC_HOTCFG_RELEASES_ROOT="$cache/runtime"
-    oc_hotcfg_install_deps_in_image() { mlog "prewarm: cold runtime deps deferred to train"; return 75; }
-    build_runtime_release "$sha"
-    prewarm_runtime_publish "$sha" "$RUNTIME_IMAGE_ID" "$BUILT_RUNTIME_RELEASE"
-  ); then
-    runtime_ready=1
+  image="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" || die 'prewarm image inspect failed'
+  caps="$(runtime_caps_from_metadata "$sha")" || die 'prewarm capabilities unavailable'
+  if prewarm_private_runtime_ready "$sha" "$image" "$caps"; then
+    PREWARM_RUNTIME_STATUS=ready
+    log 'prewarm: retaining verified private runtime for web retry'
   else
-    log "prewarm: runtime unavailable; ordinary train build remains authoritative"
+    # One speculative runtime at most; never remove official releases.
+    rm -rf -- "$cache/runtime" "$cache/runtime.json" "$cache/runtime.json.tmp"
+    if (
+      trap - EXIT
+      PREWARM_RUNTIME_BUILD=1
+      OC_HOTCFG_RELEASES_ROOT="$cache/runtime"
+      # shellcheck disable=SC2317 # Called indirectly by the shared finalizer.
+      oc_hotcfg_install_deps_in_image() { mlog "prewarm: cold runtime deps deferred to train"; return 75; }
+      build_runtime_release "$sha" || exit "$?"
+      prewarm_runtime_publish "$sha" "$RUNTIME_IMAGE_ID" "$BUILT_RUNTIME_RELEASE"
+    ); then
+      PREWARM_RUNTIME_STATUS=ready
+    else
+      PREWARM_RUNTIME_RC=$?; PREWARM_RUNTIME_STATUS=failed
+      rm -rf -- "$cache/runtime" "$cache/runtime.json" "$cache/runtime.json.tmp"
+      log "prewarm: runtime failed rc=$PREWARM_RUNTIME_RC; ordinary train build remains authoritative"
+    fi
   fi
+  PREWARM_PHASE=web; PREWARM_WEB_STATUS=running
+  prewarm_attempt_save running null || die 'prewarm phase accounting failed'
   if prewarm_web_donor "$key" >/dev/null 2>&1; then
-    if [[ "$runtime_ready" == 1 ]]; then prewarm_note_done "$cache" "$sha"; fi
-    return 0
+    PREWARM_WEB_STATUS=ready
+    return "$PREWARM_RUNTIME_RC"
   fi
   staging="$PREWARM_WORK/web-source"
   mkdir -p "$staging"
@@ -274,6 +382,8 @@ cmd_prewarm_artifacts() {
     '{schemaVersion:2,sourceCommit:$sha,artifactSha256:$digest}' >"$bucket/.complete"
   rm -rf -- "$cache/web-$key"
   mv -T "$bucket" "$cache/web-$key"
-  if [[ "$runtime_ready" == 1 ]]; then prewarm_note_done "$cache" "$sha"; fi
-  log "prewarm: web ready, runtime_ready=$runtime_ready for ${sha:0:12}; train must reverify and run all gates"
+  prewarm_web_donor "$key" >/dev/null || die 'prewarm published web verification failed'
+  PREWARM_WEB_STATUS=ready
+  log "prewarm: web ready, runtime=$PREWARM_RUNTIME_STATUS for ${sha:0:12}; train must reverify and run all gates"
+  return "$PREWARM_RUNTIME_RC"
 }

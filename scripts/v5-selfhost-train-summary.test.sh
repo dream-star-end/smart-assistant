@@ -149,7 +149,7 @@ for mode in deploy prewarm-artifacts; do
       source "$1"
       note() { printf "%s\n" "$*" >>"$TRACE"; }
       tsum_finish() { note "finish:$1"; }
-      prewarm_cleanup_invocation() { note prewarm; }
+      prewarm_cleanup_invocation() { note "prewarm:$1"; }
       release_policy_enabled() { note policy; return 1; }
       release_policy_abort_unexposed() { note abort; }
       reap_runtime_release_bg() { note reap; }
@@ -162,7 +162,7 @@ for mode in deploy prewarm-artifacts; do
     ' _ "$T/cleanup.sh" "$code"
     rc=$?
     check "$mode EXIT cleanup preserves status $code" test "$rc" = "$code"
-    expected=prewarm
+    expected="prewarm:$code"
     if [[ "$mode" == deploy ]]; then
       expected="finish:$code"
       if [[ "$code" != 86 ]]; then
