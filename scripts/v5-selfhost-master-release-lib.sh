@@ -30,6 +30,7 @@ SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-su
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
 
 mlog() { echo "$*" >&2; }
 
@@ -899,6 +900,8 @@ master_note_architecture() { # <report.json>
 
 build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
+  MASTER_GATE_RECEIPT_IDS=""
+  MASTER_GATE_RECEIPT_SHA=""
   BUILT_MASTER_RELEASE=""
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
@@ -995,6 +998,7 @@ build_master_release() {
     die "无法创建发布门私有 TMPDIR(${MASTER_GATE_TMP_PREFIX}.$$.*)"
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
+  master_gate_receipt_prepare "$staging" "$full_sha"
   # P2(OCV5-648):确定性的非 Box 门(不连本班列车测试库,没有按负载放大的等待预算)和后台 runtime 构建
   # 并行跑,省掉 Box 门前那段空等(约 5.5 分钟)。Box 门和按负载放大等待的 ccb-mcp 门仍在构建结束、
   # 主机空闲之后才跑(OCV5-557)。门的集合、命令和 pinned staging 都没变,只换了先后。
@@ -1006,43 +1010,43 @@ build_master_release() {
   fi
   tsum_mark C.delegate-billing 2>/dev/null || :
   mlog "  delegate engine billing requestId contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
+  if ! master_gate_receipt_has delegate-billing-requestid "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
     cleanup_master_staging
     die "pinned delegate engine billing requestId contract gate 失败"
   fi
   tsum_mark C.callback-ws 2>/dev/null || :
   mlog "  callback payload hash WS proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
+  if ! master_gate_receipt_has callback-payload-hash "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
     cleanup_master_staging
     die "pinned callback payload hash WS proof 失败"
   fi
   tsum_mark C.cron-submit 2>/dev/null || :
   mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
+  if ! master_gate_receipt_has cron-submit-boundary "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
     cleanup_master_staging
     die "pinned cron submit durability boundary gate 失败"
   fi
   tsum_mark C.prompt-privacy 2>/dev/null || :
   mlog "  fresh prompt privacy lifecycle proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
+  if ! master_gate_receipt_has prompt-privacy-lifecycle "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
     cleanup_master_staging
     die "pinned prompt privacy lifecycle proof 失败"
   fi
   tsum_mark C.system-approval 2>/dev/null || :
   mlog "  durable system approval fencing proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
+  if ! master_gate_receipt_has system-approval-fencing "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
     cleanup_master_staging
     die "pinned system approval fencing proof failed"
   fi
   tsum_mark C.system-executor 2>/dev/null || :
   mlog "  independent browser approval and frozen executor proof @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
+  if ! master_gate_receipt_has system-executor-fencing "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
     cleanup_master_staging
     die "pinned system executor fencing proof failed"
   fi
   tsum_mark C.session-rootfix 2>/dev/null || :
   mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
+  if ! master_gate_receipt_has session-unavailable-rootfix "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
     cleanup_master_staging
     die "pinned session unavailable / data-safety rootfix contract gate 失败"
   fi
@@ -1079,7 +1083,7 @@ build_master_release() {
     cleanup_master_staging
     die "新候选缺 scripts/v5-selfhost-watch-gate.sh"
   fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
+  if ! master_gate_receipt_has watch-gate "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
       --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
     cleanup_master_staging
     die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"

@@ -83,3 +83,18 @@ DO NOT MERGE — 待真 Grok OD / 管家
   [provenance action](https://github.com/actions/attest-build-provenance/tree/v2).
   Current host gh 2.45 has no attestation command; live cryptographic acceptance cannot be proven
   locally until that activation prerequisite is met. Mocked unit tests must not be called a live drill.
+
+## Draft implementation evidence (2026-10-28)
+
+- Design review: `train-p8-plan-review-xhigh-r1.txt` = APPROVED; recorded model gpt-6-astra/xhigh.
+- Producer and signer are separate GitHub-hosted jobs. Download/upload/attestation actions are
+  pinned to full commits. Verifier also pins signer digest to the exact candidate SHA.
+- Acceptance is all-or-nothing; at most one latest merge-group run is considered, and its current
+  attempt is checked again after signature verification. Each gh call is capped at 15 seconds,
+  total lookup at 100 seconds. This is additional latency on an enabled but unavailable service;
+  the default disabled path performs no lookup. Artifacts are bounded (128 KiB ZIP / 32 KiB JSON).
+- Local focused run: 46 tests passed, 0 failed/skipped (receipt, parity, TMPDIR/cache, source-pin).
+  Scoped strict TypeScript, changed-file Biome, shell syntax and unchanged 18-gate parity passed.
+  No existing assertion was changed or removed; full application suites remain CI-owned.
+- Live GitHub signature acceptance and an actual merge-group drill remain activation prerequisites;
+  local mocks prove rejection/fallback and command policy, not cryptographic signing by GitHub.
