@@ -210,7 +210,7 @@ describe("useSessionList 删除会话（不可逆）", () => {
     await act(async () => {
       await result.current.deleteSessionConfirm(target);
     });
-    expect(screen.getByRole("status")).toHaveTextContent("已删除「待删除的会话」");
+    expect(screen.getByRole("status").textContent).toContain("已删除「待删除的会话」");
   });
 
   test("删掉的是当前活动会话时通知上层清空聊天区，并清掉选中态", async () => {
@@ -778,7 +778,7 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     });
     expect(batch).toHaveBeenCalledTimes(1);
     expect(result.current.sessions).toEqual([]);
-    expect(screen.getByRole("status")).toHaveTextContent("已删除 2 条会话");
+    expect(screen.getByRole("status").textContent).toContain("已删除 2 条会话");
   });
 
   test("batchUpdateSessions 归档乐观更新，失败回滚", async () => {
