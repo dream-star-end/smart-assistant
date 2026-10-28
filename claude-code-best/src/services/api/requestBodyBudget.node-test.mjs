@@ -46,11 +46,12 @@ test('>20MB history with multiple images/PDFs keeps exact attachments and contin
   const originals = [Buffer.alloc(3 * MIB, 1), Buffer.alloc(3 * MIB, 2), Buffer.alloc(3 * MIB, 3), Buffer.alloc(8 * MIB, 4)]
   const history = [user([text('Keep the original engineering decision: use 42.'), ...originals.map((b, i) => media(b, i === 3 ? 'application/pdf' : 'image/png'))]), assistant([text('Decision acknowledged')])]
   const originalJson = JSON.stringify(history)
+  const nativeHistory = [...history]
   const currentImage = Buffer.alloc(100_000, 5)
   let firstPaths
   for (let turn = 0; turn < 4; turn++) {
     const current = user([text(`Question ${turn}: 根据原始 PDF 和图，继续 "42" 😀`), media(currentImage, 'image/png')])
-    const raw = JSON.stringify(payload([...history, current]))
+    const raw = JSON.stringify(payload([...nativeHistory, current]))
     assert.ok(Buffer.byteLength(raw) > 20_000_000)
     const result = await h.fetch('https://offline.invalid/v1/messages?beta=true', { method: 'POST', headers: { 'content-length': String(Buffer.byteLength(raw)) }, body: raw })
     assert.equal(result.status, 200)
@@ -67,6 +68,8 @@ test('>20MB history with multiple images/PDFs keeps exact attachments and contin
       assert.equal((await stat(join(files[i], '..'))).mode & 0o777, 0o700)
     }
     assert.equal(h.sent.at(-1).headers.get('content-length'), null)
+    // A real continuation carries every preceding user/assistant turn forward.
+    nativeHistory.push(current, assistant(`Answer ${turn}: decision remains 42`))
   }
   assert.equal(JSON.stringify(history), originalJson, 'native source history stays unchanged')
   assert.equal((await readdir(h.cwd)).length, 4)
