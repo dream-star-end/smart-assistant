@@ -214,7 +214,7 @@ test('Read-only tools can page lossless references for huge single lines and JSO
   const h = await harness(t)
   // Include lone surrogates/CRLF/BOM as well as astral/CJK text: JSON fragments
   // must round-trip even when a UTF-16 pair is split at the chunk boundary.
-  const original = '\ufeff' + '中😀\r\n\u0000\ud800'.repeat(900_000)
+  const original = `\ufeff${'中😀\r\n\u0000\ud800'.repeat(900_000)}`
   for (const messages of [[user('x'.repeat(9 * MIB))], [user(original), assistant('remembered'), user('continue')]]) {
     const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload(messages)), h.opts))
     const note = allText(wire.messages).find(v => v.includes('Readable view:'))
