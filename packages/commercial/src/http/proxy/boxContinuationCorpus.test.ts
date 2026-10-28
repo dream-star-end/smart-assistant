@@ -67,6 +67,18 @@ for (const fixture of fixtures) {
           const staged = compileBoxCliSyntheticTurn(body as ProxyBody, {
             cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`, cliVersion: "2.1.280", resumeToolResults: true });
           assert.ok(staged.snapshotJsonl.includes("tool_result"));
+          const replay = staged.snapshotJsonl + staged.stdinJsonl;
+          const current = body.messages.at(-1) as { content: Array<{
+            type: string; text?: string; source?: { data: string } }> };
+          for (const block of current.content) {
+            if (block.type === "text") {
+              assert.ok(replay.includes(JSON.stringify(block.text).slice(1, -1)),
+                "fresh restage must retain the complete trailing user text or image caption");
+            } else if (block.type === "document") {
+              assert.ok(replay.includes('"type":"document"') && replay.includes(block.source!.data),
+                "fresh restage must retain the PDF attachment bytes");
+            }
+          }
         }
         assert.deepEqual(fixture.body, before, "comparison must not mutate replay identity");
       } else if (fixture.stage === "decoder") {

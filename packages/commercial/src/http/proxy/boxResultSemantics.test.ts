@@ -62,7 +62,7 @@ test("unknown shape warnings and rejection reasons are bounded and durably obser
     assert.ok(durable.some((item) => item.labels.kind === "echo:compatible:envelope" && item.sampleCount > 0));
     assert.ok(durable.some((item) => item.labels.kind === "echo:rejected:BOX_TOOL_ECHO_CONTENT_MISMATCH"));
   } finally {
-    if (previous === undefined) delete process.env.OC_DURABLE_METRIC_ROLLUPS;
+    if (previous === undefined) Reflect.deleteProperty(process.env, "OC_DURABLE_METRIC_ROLLUPS");
     else process.env.OC_DURABLE_METRIC_ROLLUPS = previous;
   }
 });
