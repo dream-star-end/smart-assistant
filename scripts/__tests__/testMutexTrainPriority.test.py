@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """P5: real SQLite/flock/process behavior, wholly inside a temporary workspace."""
 import fcntl
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
@@ -20,6 +21,18 @@ SPEC.loader.exec_module(PRIORITY)
 
 
 class TrainPriority(unittest.TestCase):
+    @contextmanager
+    def database(self):
+        # sqlite3.Connection's context manager commits but does NOT close.
+        # Close deterministically: otherwise live WAL pages can repair the
+        # deliberately corrupted main file and turn that fixture into a valid DB.
+        db = sqlite3.connect(self.db)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="test-train-priority-")
         self.addCleanup(self.tmp.cleanup)
@@ -33,7 +46,7 @@ class TrainPriority(unittest.TestCase):
         # Use the real lease schema; just extract its DDL, never source/init a host DB.
         lib = (ROOT / "scripts/v5-lease-lib.sh").read_text()
         ddl = lib.split("<<'SQL'\n", 1)[1].split("\nSQL", 1)[0]
-        with sqlite3.connect(self.db) as db:
+        with self.database() as db:
             db.executescript(ddl)
         self.deploy = self.root / "deploy.lock"
         self.deploy.touch()
@@ -46,12 +59,12 @@ class TrainPriority(unittest.TestCase):
         }
 
     def train(self, status, pid=None, resource="deploy:selfhost"):
-        with sqlite3.connect(self.db) as db:
+        with self.database() as db:
             db.execute("""INSERT INTO train(id,resource,target_sha,status,owner,executor_pid,created_at,updated_at)
                 VALUES('tr-fixture', ?, ?, ?, 'fixture', ?, 'now','now')""", (resource, "a" * 40, status, pid))
 
     def lease(self, status, mode="drive", resource="deploy:selfhost"):
-        with sqlite3.connect(self.db) as db:
+        with self.database() as db:
             db.execute("""INSERT INTO lease(id,resource,mode,status,owner,owner_uid,created_at,updated_at)
                 VALUES('ls-fixture',?,?,?,'fixture','fixture','now','now')""", (resource, mode, status))
 
@@ -98,7 +111,7 @@ class TrainPriority(unittest.TestCase):
     def test_all_open_train_states_refuse_before_lock_or_command(self):
         for state in ("planned", "building", "cutover", "recovery_required"):
             with self.subTest(state=state):
-                with sqlite3.connect(self.db) as db:
+                with self.database() as db:
                     db.execute("DELETE FROM train")
                 self.train(state)
                 before = self.db.read_bytes()
@@ -110,7 +123,7 @@ class TrainPriority(unittest.TestCase):
         for state, resource in (("committed", "deploy:selfhost"), ("failed", "deploy:selfhost"),
                                 ("building", "deploy:other")):
             with self.subTest(state=state, resource=resource):
-                with sqlite3.connect(self.db) as db:
+                with self.database() as db:
                     db.execute("DELETE FROM train")
                 self.train(state, resource=resource)
                 result = self.run_mutex("exit 17")
@@ -121,7 +134,7 @@ class TrainPriority(unittest.TestCase):
         self.assert_refused(self.run_mutex())
         for state in ("registered", "done", "revoked", "cancelled", "failed", "satisfied"):
             with self.subTest(state=state):
-                with sqlite3.connect(self.db) as db:
+                with self.database() as db:
                     db.execute("UPDATE lease SET status=?", (state,))
                 result = self.run_mutex("exit 0")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -139,7 +152,7 @@ class TrainPriority(unittest.TestCase):
         self.db.write_text("not SQLite")
         self.assert_refused(self.run_mutex(), 2)
         self.db.unlink()
-        with sqlite3.connect(self.db) as db:
+        with self.database() as db:
             db.execute("CREATE TABLE wrong_schema(id)")
         self.assert_refused(self.run_mutex(), 2)
 
@@ -210,7 +223,7 @@ class TrainPriority(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=8), 19, log.read_text())
         self.assertFalse((self.root / "locks/oc-test-fixture.lock.holder").exists())
         deploy.close()
-        with sqlite3.connect(self.db) as db:
+        with self.database() as db:
             db.execute("UPDATE train SET status='committed'")
         self.assertEqual(self.run_mutex("exit 0").returncode, 0)
 
