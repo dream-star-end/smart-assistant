@@ -79,7 +79,7 @@ for (const marker of [
   'classifyTurnDispatchReceipt(receipt, rec)',
   'if (disposition === "rejected")',
   'if (!acceptEnrichmentReceipt(rec)) return;',
-  'getExecutors: () => uidToCronOriginExecutors.get(input.uid.toString()) ?? []',
+  'getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()))',
   'if (admit.kind === "already_owned") return { kind: "in_flight" };',
   'forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord)',
 ]) {

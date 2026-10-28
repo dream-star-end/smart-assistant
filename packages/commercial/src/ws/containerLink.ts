@@ -1,3 +1,4 @@
+import { ContainerLinkHello } from "./containerLinkHello.js";
 /**
  * Master owns one physical WS per (uid, containerId). Bridge handles retain
  * their existing authorization and billing closures; each incoming frame has
@@ -5,6 +6,7 @@
  * This adapter is deliberately temporary until browser ingress moves out of
  * userChatBridge. No billing journal or container protocol is migrated here.
  */
+import { ContainerLinkExecutors } from "./bridgeExecutorRegistration.js";
 import { EventEmitter } from "node:events";
 import { WebSocket, type RawData } from "ws";
 import { getDispatchByLogicalKey, type Queryable } from "../dispatch/turnDispatchStore.js";
@@ -101,6 +103,7 @@ class ContainerLink {
   stopping = false;
   readonly ready: Promise<void>;
   readonly consumers = new Set<ContainerLinkHandle>();
+  readonly executors = new ContainerLinkExecutors();
   transportAliveAt = 0;
   private readonly abort = new AbortController();
   private readonly routes = new Map<string, ContainerLinkHandle>();
@@ -111,12 +114,38 @@ class ContainerLink {
   private timer: ReturnType<typeof setInterval> | null = null;
   private tickWork: Promise<void> | null = null;
   private pingSeq = 0;
+  private readonly hello: ContainerLinkHello;
+  private unmountTransport: (() => void) | null = null;
+  private transportOwner(): ContainerLinkHandle | undefined {
+    return [...this.consumers].find((h) => h.active && !h.detached && !h.disposed)
+      ?? [...this.consumers].find((h) => h.active && !h.disposed);
+  }
+  registerTransport(map: Map<string, Set<WebSocket>>): void {
+    if (this.unmountTransport) return;
+    const link = this;
+    const transport = {
+      get readyState() { return link.stopping ? WebSocket.CLOSED : link.ws?.readyState ?? WebSocket.CONNECTING; },
+      send(data: RawData, opts?: { binary?: boolean }, callback?: (err?: Error) => void) {
+        const owner = link.transportOwner();
+        if (!owner) throw new Error("container link closed");
+        link.send(owner, data, opts, callback);
+      },
+    } as WebSocket;
+    const key = String(this.uid);
+    let set = map.get(key);
+    if (!set) { set = new Set(); map.set(key, set); }
+    set.add(transport);
+    this.unmountTransport = () => { set.delete(transport); if (!set.size) map.delete(key); };
+  }
+  private sending: Promise<void> | null = null;
+  private sendingBytes = 0;
 
   constructor(
     readonly uid: bigint, readonly containerId: number,
     private readonly registry: ContainerLinkRegistry,
     create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>,
   ) {
+    this.hello = new ContainerLinkHello(registry.pool, uid, containerId);
     this.ready = Promise.resolve().then(() => create(this.abort.signal)).then((ws) => {
       this.ws = ws;
       // Also cover an async tunnel factory resolving after shutdown.
@@ -183,7 +212,29 @@ class ContainerLink {
         if (typeof peer?.peerId === "string" && !this.sessions.has(peer.peerId)) this.sessions.set(peer.peerId, handle);
       }
     }
-    this.ws!.send(data, opts ?? {}, cb);
+    const helloPeers = frame?.type === "inbound.hello" && Array.isArray(frame.peers) ? frame.peers : null;
+    if (helloPeers === null && this.sending === null) { this.ws!.send(data, opts ?? {}, cb); return; }
+    const bytes = Buffer.byteLength(Buffer.isBuffer(data) ? data : String(data));
+    if (this.sendingBytes + bytes > this.registry.maxBufferedBytes) {
+      const error = new Error("container link send backpressure");
+      cb?.(error); this.stop(error); return;
+    }
+    this.sendingBytes += bytes;
+    const work = (this.sending ?? Promise.resolve()).then(async () => {
+      if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
+      const prepared = helloPeers === null ? null : await this.hello.prepare(helloPeers);
+      if (prepared) data = Buffer.from(JSON.stringify(prepared));
+      if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
+      await new Promise<void>((resolve, reject) => {
+        this.ws!.send(data, opts ?? {}, (error) => error ? reject(error) : resolve());
+      });
+      if (prepared) this.hello.committed(prepared);
+      cb?.();
+    }).catch((error: Error) => { cb?.(error); this.stop(error); }).finally(() => {
+      this.sendingBytes -= bytes;
+      if (this.sending === work) this.sending = null;
+    });
+    this.sending = work;
   }
   private receive(data: RawData, binary: boolean): void {
     if (this.stopping) return;
@@ -208,7 +259,7 @@ class ContainerLink {
       }
       return;
     }
-    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.peer?.id ?? frame?.sessionKey;
+    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.clientSessionId ?? frame?.owner?.peer?.id ?? frame?.sessionKey;
     const cmid = frame?.clientMessageId;
     let owner = typeof frame?.grantId === "string" ? this.routes.get(`grant:${frame.grantId}`) : undefined;
     owner ??= typeof frame?.dispatchId === "string" ? this.routes.get(`dispatch:${frame.dispatchId}:${frame.attemptNo}`) : undefined;
@@ -273,6 +324,7 @@ class ContainerLink {
   release(handle: ContainerLinkHandle): void {
     if (handle.disposed) return;
     handle.disposed = true;
+    this.executors.release(handle);
     handle.streams.clear();
     handle.pendingPing = null;
     this.consumers.delete(handle);
@@ -284,6 +336,9 @@ class ContainerLink {
   stop(error?: Error): void {
     if (this.stopping) return;
     this.stopping = true;
+    this.executors.close();
+    this.unmountTransport?.();
+    this.unmountTransport = null;
     if (this.timer) clearInterval(this.timer);
     this.abort.abort();
     // Preserve error-before-close: bridge cleanup keeps live Grok route leases
@@ -299,7 +354,7 @@ class ContainerLink {
     this.queued = [];
     this.queuedBytes = 0;
   }
-  async drain(): Promise<void> { await Promise.allSettled([this.ready, this.tickWork]); }
+  async drain(): Promise<void> { await Promise.allSettled([this.ready, this.tickWork, this.sending]); }
   snapshot(): ContainerLinkSnapshot {
     return { uid: String(this.uid), containerId: this.containerId,
       subscribers: [...this.consumers].filter((h) => !h.detached).length,
@@ -321,7 +376,10 @@ export class ContainerLinkRegistry {
     this.heartbeatMs = opts?.heartbeatMs ?? 30_000;
     this.maxBufferedBytes = opts?.maxBufferedBytes ?? 4 * 1024 * 1024;
   }
-  async connect(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
+  connect(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
+    return this.attach(uid, cid, create);
+  }
+  async attach(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
     if (this.stopping) throw new Error("container link registry shutting down");
     const key = `${uid}:${cid}`;
     let link = this.links.get(key);
