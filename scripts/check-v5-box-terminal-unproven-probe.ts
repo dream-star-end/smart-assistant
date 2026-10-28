@@ -4,16 +4,17 @@
  * Runs the product liveness script (the PROBE inside makeBoxRunLiveness)
  * against this machine's /proc. A stop.ready that is not the keeper's
  * handshake, and a terminal.json that can only be stat'd, must not skip
- * that scan and must not be reported as a terminal proof. worker_complete
- * stays with the proof reader. This process does not open a journal,
- * settle billing, or replay a request.
+ * that scan and must not be reported as a terminal proof. A worker_complete
+ * the proof reader would accept is terminal; a wrong epoch or a loose mode
+ * stays absent. This process does not open a journal, settle billing, or
+ * replay a request.
  *
  * deploy-v5.sh runs it from the pinned candidate archive, beside the other
  * Box gates, with no database.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { makeBoxRunLiveness, parseBoxRunLiveness } from "../packages/commercial/src/http/proxy/boxRunLiveness.js";
 
 export const BOX_TERMINAL_UNPROVEN_PROBE_PASS =
@@ -23,8 +24,8 @@ function fail(message: string): never {
   throw new Error(`[box-terminal-unproven-probe] ${message}`);
 }
 
-function look(nonce: string): { state: "alive" | "absent"; boot: string } {
-  const request = makeBoxRunLiveness(nonce);
+function classify(nonce: string, leaseEpoch?: string) {
+  const request = makeBoxRunLiveness(nonce, undefined, leaseEpoch);
   const out = spawnSync(request.command, request.args, {
     cwd: request.cwd,
     env: request.environment,
@@ -34,9 +35,14 @@ function look(nonce: string): { state: "alive" | "absent"; boot: string } {
   if (out.status !== 0) {
     fail(`probe exit ${String(out.status)} stdout=${JSON.stringify(out.stdout)} stderr=${JSON.stringify(out.stderr)}`);
   }
-  if (out.stdout.startsWith("terminal ")) fail("stat-only terminal.json was treated as a proof");
   const parsed = parseBoxRunLiveness(out.stdout);
-  if (!parsed || parsed.state === "terminal") fail(`unusable stdout ${JSON.stringify(out.stdout)}`);
+  if (!parsed) fail(`unusable stdout ${JSON.stringify(out.stdout)}`);
+  return parsed;
+}
+
+function look(nonce: string): { state: "alive" | "absent"; boot: string } {
+  const parsed = classify(nonce);
+  if (parsed.state === "terminal") fail("stat-only terminal.json was treated as a proof");
   return parsed;
 }
 
@@ -83,6 +89,45 @@ async function main(): Promise<void> {
   const missing = look(nonce);
   if (missing.state !== "absent" || missing.boot !== boot) {
     fail(`gone directories: ${missing.state} ${missing.boot}`);
+  }
+  const provedNonce = randomBytes(12).toString("hex");
+  const provedEpoch = "b".repeat(32);
+  const provedRun = `/tmp/ocv5-289-run-${provedNonce}`;
+  const provedProof = `/tmp/ocv5-289-proof-${provedNonce}`;
+  mkdirSync(provedRun, { mode: 0o700 });
+  mkdirSync(provedProof, { mode: 0o700 });
+  chmodSync(provedRun, 0o700);
+  chmodSync(provedProof, 0o700);
+  try {
+    const record = {
+      cliPid: 123, keeperPid: 456, leaseEpoch: provedEpoch,
+      reason: "worker_complete", revision: 1, runNonce: provedNonce,
+    };
+    const marker = `${provedProof}/terminal.json`;
+    writeFileSync(marker, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    chmodSync(marker, 0o600);
+    const proved = classify(provedNonce, provedEpoch);
+    if (proved.state !== "terminal" || proved.boot !== boot) {
+      fail(`expected terminal ${boot}, got ${proved.state} ${proved.boot}`);
+    }
+    const staleEpoch = classify(provedNonce, "c".repeat(32));
+    if (staleEpoch.state !== "absent" || staleEpoch.boot !== boot) {
+      fail(`old epoch blocked the scan: ${staleEpoch.state} ${staleEpoch.boot}`);
+    }
+    chmodSync(marker, 0o644);
+    const loose = classify(provedNonce, provedEpoch);
+    if (loose.state !== "absent" || loose.boot !== boot) {
+      fail(`loose mode was not absent: ${loose.state} ${loose.boot}`);
+    }
+    writeFileSync(marker, "{}\n", { mode: 0o600 });
+    chmodSync(marker, 0o600);
+    const malformed = classify(provedNonce, provedEpoch);
+    if (malformed.state !== "absent" || malformed.boot !== boot) {
+      fail(`malformed proof was not absent: ${malformed.state} ${malformed.boot}`);
+    }
+  } finally {
+    rmSync(provedRun, { recursive: true, force: true });
+    rmSync(provedProof, { recursive: true, force: true });
   }
   process.stdout.write(`${BOX_TERMINAL_UNPROVEN_PROBE_PASS}\n`);
 }

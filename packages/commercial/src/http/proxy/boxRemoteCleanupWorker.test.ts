@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { BoxRemoteCleanupWorker } from "./boxRemoteCleanupWorker.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 
@@ -901,6 +901,132 @@ test("a restarted worker closes immediately when the persisted absence boot chan
   assert.deepEqual(released, [{ requestId: "box-parked", accountId: 79n,
     shape: "unbilled_leaf", rebooted: true }]);
   assert.equal(sequence[0], "record:" + other);
+});
+
+function provedRunDirs() {
+  const nonce = randomBytes(12).toString("hex");
+  const run = `/tmp/ocv5-289-run-${nonce}`;
+  const proof = `/tmp/ocv5-289-proof-${nonce}`;
+  mkdirSync(run, { mode: 0o700 });
+  mkdirSync(proof, { mode: 0o700 });
+  chmodSync(run, 0o700);
+  chmodSync(proof, 0o700);
+  return { nonce, proof, remove: () => {
+    rmSync(run, { recursive: true, force: true });
+    rmSync(proof, { recursive: true, force: true });
+  } };
+}
+
+function writeWorkerComplete(proof: string, nonce: string, leaseEpoch: string) {
+  writeFileSync(`${proof}/terminal.json`, JSON.stringify({
+    cliPid: 123, keeperPid: 456, leaseEpoch, reason: "worker_complete", revision: 1, runNonce: nonce,
+  }) + NL, { mode: 0o600 });
+  chmodSync(`${proof}/terminal.json`, 0o600);
+}
+
+/** The proof reader errors, so this tick enters closeAbsent while the
+ * recovery writer (complete) must not run. Keeper stop and the liveness
+ * probe are the real scripts. */
+function failedReadRealWorker(dirs: { nonce: string }, store: { seen: AbsenceMark },
+  sequence: string[], closes: unknown[], released: unknown[]) {
+  const epoch = "b".repeat(32);
+  return new BoxRemoteCleanupWorker({
+    staleResumeProofWaitMs: 0,
+    holds: {
+      recordRunAbsence: async (args: { boot: string; requestId: string }) => {
+        assert.equal(args.requestId, "box-proved");
+        sequence.push("record");
+        const prior = store.seen;
+        if (!store.seen) store.seen = { v: 1, atMs: Date.now(), boot: args.boot };
+        return prior;
+      },
+      clearRunAbsence: async () => { sequence.push("clear"); store.seen = null; },
+    } as never,
+    onProcessAbsentClosed: (closed) => { released.push(closed); },
+    journal: {
+      listStoppedFailureProbeCandidates: async () => [{
+        requestId: "box-proved", uid: 3n, accountId: 20n,
+        runNonce: dirs.nonce, leaseEpoch: epoch, linked: true,
+        staleResume: { phase: "continuation_unknown", unknownForMs: 21 * 60_000 },
+      }],
+      claimStoppedFailureProbe: async () => true,
+      recordStaleResumeStop: async () => { sequence.push("intent"); return true; },
+      markFirstRoundStoppedFailure: async () => { throw new Error("no keeper proof"); },
+      markToolChainStoppedFailure: async () => { sequence.push("stopped-CAS");
+        throw new Error("no keeper proof"); },
+      complete: async () => { sequence.push("complete"); throw new Error("must not complete"); },
+      completeToolChain: async () => { sequence.push("complete-chain");
+        throw new Error("must not complete chain"); },
+      markRunExpiredUnproven: async (args: unknown) => {
+        sequence.push("absent-close");
+        closes.push(args);
+        return { action: "closed", shape: "unbilled_leaf", priorBoxState: "unknown", ancestors: 0 };
+      },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); },
+    } as never,
+    resolver: { resolve: async () => ({ accountId: 20n, exec: {
+      run: async (request: { command: string; args: string[]; cwd?: string;
+        environment?: Record<string, string> }) => {
+        const last = request.args.at(-1) ?? "";
+        if (last.startsWith("/tmp/ocv5-289-proof-")) {
+          sequence.push("proof-read");
+          throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
+        }
+        sequence.push(request.args[2]?.includes("boot_id") ? "look" : "keeper-stop");
+        return runRealExec(request);
+      },
+      dispose: async () => { sequence.push("dispose"); },
+    } }) as never } as never,
+  });
+}
+
+test("a valid worker_complete is not absence-closed when the proof read fails across two workers", async () => {
+  const dirs = provedRunDirs();
+  writeWorkerComplete(dirs.proof, dirs.nonce, "b".repeat(32));
+  const store: { seen: AbsenceMark } = { seen: null };
+  const sequence: string[] = [];
+  const closes: unknown[] = [];
+  const released: unknown[] = [];
+  try {
+    const first = failedReadRealWorker(dirs, store, sequence, closes, released);
+    assert.deepEqual(await first.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+    assert.equal(sequence.includes("look"), true, sequence.join(">"));
+    assert.equal(sequence.includes("record"), false, sequence.join(">"));
+    assert.equal(sequence.includes("absent-close"), false, sequence.join(">"));
+    assert.equal(sequence.includes("complete"), false);
+    assert.equal(sequence.includes("complete-chain"), false);
+    assert.equal(closes.length, 0);
+    assert.deepEqual(released, []);
+    const second = failedReadRealWorker(dirs, store, sequence, closes, released);
+    assert.deepEqual(await second.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+    assert.equal(sequence.includes("record"), false, sequence.join(">"));
+    assert.equal(closes.length, 0, "a restarted worker must not expire a proved run");
+    assert.equal(sequence.includes("complete"), false);
+    assert.deepEqual(released, []);
+  } finally { dirs.remove(); }
+});
+
+test("an older lease epoch still closes on two real looks and does not block the scan", async () => {
+  const dirs = provedRunDirs();
+  writeWorkerComplete(dirs.proof, dirs.nonce, "c".repeat(32));
+  const store: { seen: AbsenceMark } = { seen: null };
+  const sequence: string[] = [];
+  const closes: unknown[] = [];
+  const released: unknown[] = [];
+  try {
+    const first = failedReadRealWorker(dirs, store, sequence, closes, released);
+    assert.deepEqual(await first.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+    assert.ok(store.seen, "the first absence is persisted");
+    assert.equal(closes.length, 0);
+    const second = failedReadRealWorker(dirs, store, sequence, closes, released);
+    assert.deepEqual(await second.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+    assert.equal((closes[0] as { cause: string }).cause, "box_process_absent");
+    assert.equal(sequence.includes("complete"), false);
+    assert.equal(sequence.includes("complete-chain"), false);
+    assert.equal(released.length, 1);
+  } finally { dirs.remove(); }
 });
 
 test("an unreadable liveness probe stays pending and is logged apart from alive or absent", async () => {

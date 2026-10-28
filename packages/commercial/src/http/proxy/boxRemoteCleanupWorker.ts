@@ -236,8 +236,9 @@ export class BoxRemoteCleanupWorker {
    * stoppable. Look at the Box. Nothing of the run on two looks, a minute
    * apart or across a reboot, closes it the way an expired run is closed.
    * A stat-only terminal.json and a bad stop.ready are not proof and do not
-   * skip the scan. alive, an injected terminal line, or an unreadable probe
-   * keeps it pending exactly as before. */
+   * skip the scan. A proof the reader would accept for this lease epoch is
+   * terminal and is not an absence. alive, an injected terminal line, or an
+   * unreadable probe keeps it pending exactly as before. */
   private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
     target: BoxResolvedTarget): Promise<boolean> {
     const journal = this.deps.journal;
@@ -249,7 +250,8 @@ export class BoxRemoteCleanupWorker {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await Promise.race([
-        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd),
+        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd,
+          candidate.leaseEpoch),
           { timeoutMs: 10_000, maxResponseBytes: 256 }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("BOX_RUN_LIVENESS_TIMEOUT")), 10_500);
