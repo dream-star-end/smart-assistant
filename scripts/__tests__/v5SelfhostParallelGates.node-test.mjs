@@ -36,6 +36,7 @@ function prelude(f) {
   return `
 source ${q(join(root, 'scripts/lib/v5-selfhost-build-jobs.sh'))}
 source ${q(join(root, 'scripts/lib/v5-selfhost-train-summary.sh'))}
+source ${q(join(root, 'scripts/lib/v5-selfhost-gate-receipts.sh'))}
 MASTER_GATE_TMPDIR=${q(join(f.dir, 'tmp'))}
 MASTER_GATE_LOADAVG=${q(join(f.dir, 'load'))}
 MASTER_GATE_ATTEMPT_DIR=${q(join(f.dir, 'logs'))}
@@ -403,7 +404,14 @@ event cleanup
 
 // Execute the real build's entire C/D + Box section with fake gate executables.
 // No real gate, database, runtime/frontend build, release or shared lock is run.
-function wireFixture(f, failure = '') {
+const receiptPhases = {
+  'C.session-rootfix': 'session-unavailable-rootfix', 'C.watch-gate': 'watch-gate',
+  'C.delegate-billing': 'delegate-billing-requestid', 'C.callback-ws': 'callback-payload-hash',
+  'C.cron-submit': 'cron-submit-boundary', 'C.prompt-privacy': 'prompt-privacy-lifecycle',
+  'C.system-approval': 'system-approval-fencing', 'C.system-executor': 'system-executor-fencing',
+};
+
+function wireFixture(f, failure = '', receipt = 'miss', badDonor = false) {
   const runner = `#!/bin/bash
 set -eu
 id="\${TMPDIR##*/}"
@@ -415,7 +423,7 @@ case "$*" in
 esac
 printf 'start %s %s %s\\n' "$id" "$PWD" "$TMPDIR" >>"$EVENTS"
 touch "$EVENTS.started-$id"
-if [[ "$id" == C.session-rootfix || "$id" == C.watch-gate || "$id" == D ]]; then
+if [[ ${q(receipt)} != hit && ( "$id" == C.session-rootfix || "$id" == C.watch-gate || "$id" == D ) ]]; then
   until [[ -f "$EVENTS.started-C.session-rootfix" && -f "$EVENTS.started-C.watch-gate" && -f "$EVENTS.started-D" ]]; do sleep .01; done
 fi
 if [[ "$id" == ${q(failure || 'never')} ]]; then echo '[gate-failure] fixture failed'; exit 17; fi
@@ -437,6 +445,9 @@ MASTER_GATE_DB_URL='fixture-private-database'
 MASTER_GATE_LOAD_SCALE=1
 WEB_DIST_REUSE_RECORD=.web-dist-reuse.json
 master_web_dist_key() { :; }
+${badDonor ? `master_web_dist_key() { echo ${'a'.repeat(64)}; }
+find_web_dist_donor() { echo fixture-donor; }
+copy_verified_web_dist() { event donor-rejected; touch "$EVENTS.started-D"; return 1; }` : ''}
 write_web_dist_reuse_record() { event web-record; }
 master_note_architecture() { test -s "$1"; event architecture-read; }
 master_gate_wait_host_idle() { event "idle $1"; }
@@ -447,8 +458,10 @@ cleanup_master_gate_tmpdir() { event tmp-cleanup; }
 cleanup_master_staging() { reap_master_build_jobs; event cleanup; }
 die() { echo "$*" >&2; exit 73; }
 # Runtime waits until a C job starts: overlap is proven without elapsed-time assumptions.
-(until [[ -f "$EVENTS.started-C.session-rootfix" ]]; do sleep .01; done; event runtime-done) & rt=$!
+(until [[ -f "$EVENTS.started-D" ]]; do sleep .01; done; event runtime-done) & rt=$!
 await_runtime_release_bg() { wait "$rt"; event runtime-awaited; }
+${receipt === 'miss' ? '' : `MASTER_GATE_RECEIPT_IDS=${q(Object.values(receiptPhases).join('\n'))}
+MASTER_GATE_RECEIPT_SHA=${q((receipt === 'hit' ? 'a' : 'b').repeat(40))}`}
 run_gates() {
 ${gates}
 event "seal $MASTER_FRONTEND_MODE"
@@ -506,6 +519,43 @@ for (const failure of ['C.session-rootfix', 'D', 'C.architecture']) {
     assert.ok(!lines.some((l) => l.startsWith('start C.box-') || l.startsWith('seal ')), lines.join('\n'));
     assert.match(readFileSync(notes(f)[`job.${failure}.log`], 'utf8'), /fixture failed/);
     assert.equal(notes(f)[`job.${failure}.rc`], '1');
+    assert.equal(lines.at(-1), 'cleanup');
+  });
+}
+
+for (const receipt of ['hit', 'wrong-sha']) {
+  test(`production wiring: receipt ${receipt} preserves local host gates and parent evidence`, (t) => {
+    const f = fixture(t);
+    const r = run(f, wireFixture(f, '', receipt));
+    assert.equal(r.status, 0, r.stderr);
+    const lines = events(f);
+    const ids = lines.filter((l) => l.startsWith('start ')).map((l) => l.split(' ')[1]);
+    for (const [phase, gate] of Object.entries(receiptPhases)) {
+      assert.equal(ids.includes(phase), receipt !== 'hit', phase);
+      // Worker-local notes would be lost; final summary proves parent ownership.
+      assert.equal(notes(f)[`gateEvidence.${gate}`], receipt === 'hit' ? 'merge-queue-receipt' : 'local');
+    }
+    const local = ['D', 'C.cursor-sand', 'C.host-log-policy', 'C.architecture'];
+    for (const phase of local) assert.ok(ids.includes(phase), phase);
+    assert.equal(ids.length, receipt === 'hit' ? 8 : 16);
+    const awaited = lines.indexOf('runtime-awaited');
+    for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
+    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.ccb-mcp']) {
+      assert.ok(lines.findIndex((l) => l.startsWith(`start ${phase} `)) > awaited, phase);
+    }
+    assert.equal(lines.at(-1), 'seal built');
+  });
+}
+
+for (const badDonor of [false, true]) {
+  test(`production wiring: receipt hit cannot bypass ${badDonor ? 'donor verification' : 'local gate'} failure`, (t) => {
+    const f = fixture(t);
+    const r = run(f, wireFixture(f, badDonor ? '' : 'C.architecture', 'hit', badDonor));
+    assert.equal(r.status, 73, r.stderr);
+    const lines = events(f);
+    assert.ok(!lines.some((l) => l.startsWith('start C.box-') || l.startsWith('seal ')), lines.join('\n'));
+    if (badDonor) assert.ok(lines.includes('donor-rejected'));
+    assert.equal(notes(f)[`job.${badDonor ? 'D' : 'C.architecture'}.rc`], '1');
     assert.equal(lines.at(-1), 'cleanup');
   });
 }

@@ -90,7 +90,7 @@ test('build_master_release reuses a matching dist instead of running the web bui
  // Extract just the frontend section of build_master_release and run it against a staging dir.
  const bmr=fn(m,'build_master_release');
  // P3 moves the same reuse/build contract into the scheduled D worker.
- const section=block(bmr,/^  master_job_frontend\(\) \{/m,/^  local job$/m);
+ const section=block(bmr,/^  master_job_frontend\(\) \{/m,/^  local job\b/m);
  const body=['staging="$TEST_ROOT/staging"; full_sha='+q(f.base)+'; mkdir -p "$staging/packages/web-react"','cleanup_master_staging() { :; }',
   'npm() { echo NPM_BUILD_RAN >&2; return 99; }',
   'MASTER_GATE_TMPDIR="$TEST_ROOT"',section,'master_job_frontend || die frontend-failed','echo "mode=$MASTER_FRONTEND_MODE"; cat "$staging/.web-dist-reuse.json"'].join('\n');
