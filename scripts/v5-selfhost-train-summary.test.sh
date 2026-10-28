@@ -137,8 +137,43 @@ check "guarded call site without the lib: runs silently" test "$out" = body
 sites="$(grep -hE '^\s*tsum_(init|mark|finish|note)\b' "$DEPLOY" "$MLIB")"
 check "every call site is guarded (2>/dev/null || :)" bash -c "! printf '%s\n' \"\$1\" | grep -vE ' 2>/dev/null \|\| :\$'" _ "$sites"
 check "deploy sources the lib" grep -qE '^source "\$SCRIPT_DIR/lib/v5-selfhost-train-summary\.sh"' "$DEPLOY"
-check "EXIT cleanup calls tsum_finish right after reading the exit code" \
-  bash -c "grep -A1 -F '  local exit_rc=\$?' '$DEPLOY' | grep -qF '  tsum_finish \"\$exit_rc\" 2>/dev/null || :'"
+# P1 (a3bd7741e): prewarm now exits through private cleanup before train recording.
+# Exercise the actual function: ordinary deploy still records the original status first,
+# including owner loss; prewarm must never call the recorder or production cleanup.
+sed -n '/^cleanup_selfhost_deploy() {/,/^}/p' "$DEPLOY" >"$T/cleanup.sh"
+for mode in deploy prewarm-artifacts; do
+  for code in 0 7 86; do
+    trace="$T/cleanup-$mode-$code.log"
+    env -i PATH="$PATH" HOME="$T" MODE="$mode" TRACE="$trace" bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      note() { printf "%s\n" "$*" >>"$TRACE"; }
+      tsum_finish() { note "finish:$1"; }
+      prewarm_cleanup_invocation() { note prewarm; }
+      release_policy_enabled() { note policy; return 1; }
+      release_policy_abort_unexposed() { note abort; }
+      reap_runtime_release_bg() { note reap; }
+      lease_train_on_exit() { note "lease:$1"; }
+      cleanup_master_staging() { note master; }
+      cleanup_cutover_unit_snap() { note units; }
+      p0web_cleanup_build() { note web; }
+      trap cleanup_selfhost_deploy EXIT
+      exit "$2"
+    ' _ "$T/cleanup.sh" "$code"
+    rc=$?
+    check "$mode EXIT cleanup preserves status $code" test "$rc" = "$code"
+    expected=prewarm
+    if [[ "$mode" == deploy ]]; then
+      expected="finish:$code"
+      if [[ "$code" != 86 ]]; then
+        expected+=$'\npolicy'
+        [[ "$code" == 0 ]] || expected+=$'\nabort'
+        expected+=$'\nreap\nlease:'"$code"$'\nmaster\nunits\nweb'
+      fi
+    fi
+    check "$mode EXIT cleanup $code has only its ordered effects" test "$(cat "$trace")" = "$expected"
+  done
+done
 check "cmd_deploy starts the recorder" bash -c "sed -n '/^cmd_deploy() {/,/^}/p' '$DEPLOY' | grep -qE '^  tsum_init '"
 # OCV5-557: the retryable gates run as `if ! master_gate_retryable <gate> <command> ...`.
 gates="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB" | grep -cE '^\s*if ! (\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" |master_gate_retryable )')"
