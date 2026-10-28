@@ -484,6 +484,11 @@ export function isPlatedAssistantMessage(message: {
   return message.role === "assistant" && messageHasDisplayBody(message);
 }
 
+/** 「已发送 N」计时:一分钟内按秒,之后按分钟。 */
+function formatSentElapsed(secs: number): string {
+  return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)} 分钟`;
+}
+
 export function computeTypingLabel(p: {
   name: string;
   secs: number;
@@ -495,6 +500,10 @@ export function computeTypingLabel(p: {
   kitchenStickyHint?: string;
   /** True once this turn has plated assistant text. Never fall back to 「思考中」. */
   hasPlated?: boolean;
+  /** Chat transport state; anything but "connected" means no frame can arrive. */
+  transport?: ChatStatusClass;
+  /** Hello snapshot: frames may have been missed while no browser was attached. */
+  detached?: boolean;
 }): { text: string; cls: string } {
   const {
     name,
@@ -505,17 +514,34 @@ export function computeTypingLabel(p: {
     progressHint = "",
     kitchenStickyHint = "",
     hasPlated = false,
+    transport = "connected",
+    detached = false,
   } = p;
   if (turnStatus === "compacting") {
     return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: "compacting" };
   }
   // 引擎冷启动阶段(gateway 权威发射):模型尚未开始推理,如实告知在启动/恢复,
   // 避免 20-40s 冷启动被误标成「思考中/深度思考中」。
-  if (turnStatus === "engine_starting") {
+  // 启动态只在帧仍在流动时可信:断线/切后台期间收不到 gateway 的清态帧,超过 STALE_WARN_MS
+  // 无新数据就落到下方诚实文案,不再宣称「正在启动引擎 (1184s)」(INC-20261028-STALE-ENGINE-STARTING)。
+  const startupFresh = silenceMs < STALE_WARN_MS && !detached;
+  if (turnStatus === "engine_starting" && startupFresh) {
     return { text: `${name} 正在启动引擎${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
   }
-  if (turnStatus === "engine_resuming") {
+  if (turnStatus === "engine_resuming" && startupFresh) {
     return { text: `${name} 正在恢复会话${secs >= 3 ? ` (${secs}s)` : ""}…`, cls: "engine-starting" };
+  }
+  if (transport !== "connected" && silenceMs >= STALE_WARN_MS) {
+    return {
+      text: `${name} 连接已断开，正在重连…回合可能仍在后台运行 (已发送 ${formatSentElapsed(secs)})`,
+      cls: "stale-danger",
+    };
+  }
+  if (detached) {
+    return {
+      text: `${name} 后台运行中，断线期间的过程可能未同步，完成后将显示完整答复 (已发送 ${formatSentElapsed(secs)})`,
+      cls: "stale-warn",
+    };
   }
   if (silenceMs >= STALE_DANGER_MS) {
     const sil = Math.round(silenceMs / 1000);

@@ -589,6 +589,25 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._turnStatus).toBeNull();
   });
 
+  test("INC-20261028-STALE-ENGINE-STARTING: hello detached 快照记录时刻并补起算点", () => {
+    const s = sess();
+    s._turnStartedAt = null;
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    applyTurnStatus(s, turnStatusFrame({ status: null, meta: { detached: true, since: 1_793_188_004_000 } }));
+    expect(s._turnStatus).toBeNull();
+    expect(s._turnDetachedAt).toEqual(expect.any(Number));
+    expect(s._turnStartedAt).toBe(1_793_188_004_000);
+    expect(s._lastFrameAt! <= s._turnDetachedAt!).toBe(true);
+  });
+
+  test("无 meta.detached 的普通 turn_status 不标 detached、不改起算点", () => {
+    const s = sess();
+    s._turnStartedAt = 123;
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    expect(s._turnDetachedAt).toBeUndefined();
+    expect(s._turnStartedAt).toBe(123);
+  });
+
   test("清态 null 帧丢失时,首个内容帧兜底清 engine_*(防启动态粘住)", () => {
     const s = sess();
     s._sendingInFlight = true;

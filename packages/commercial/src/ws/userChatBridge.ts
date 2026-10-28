@@ -194,6 +194,7 @@ import {
   HELLO_LIVE_CATCHUP_MAX_BYTES,
   liveCatchupSendDecision,
   readOpenDispatchLiveFramePayloadsAfterSeq,
+  readOpenDispatchEngineReady,
   noteProducerFenceDrop,
   shouldForwardLiveFrameToBrowser,
 } from "../db/liveTurnFrames.js";
@@ -2100,6 +2101,33 @@ function isPermanentLiveFrameConflict(error: unknown): boolean {
     error !== null &&
     (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
   );
+}
+
+/**
+ * INC-20261028-STALE-ENGINE-STARTING — hello snapshot for an open
+ * (admitted/accepted) dispatch. status:null when persisted frames prove the
+ * engine got past startup, else engine_starting; meta.since = admitted_at.
+ * Sent only to the hello's own userWs (other tabs may not be on this turn).
+ */
+export function _openDispatchTurnStatusSnapshotFrame(input: {
+  peerId: string;
+  agentId: string;
+  clientMessageId: string;
+  engineReady: boolean;
+  admittedAt: Date;
+  now?: number;
+}): Record<string, unknown> {
+  const safeId = input.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
+  return {
+    type: "outbound.turn_status",
+    sessionKey: `agent:${input.agentId || "main"}:webchat:dm:${safeId}`,
+    channel: "webchat",
+    peer: { id: input.peerId, kind: "dm" },
+    clientMessageId: input.clientMessageId,
+    status: input.engineReady ? null : "engine_starting",
+    meta: { detached: true, since: input.admittedAt.getTime() },
+    ts: input.now ?? Date.now(),
+  };
 }
 
 /**
@@ -5646,7 +5674,34 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       sessionId: peerId,
                       clientMessageId,
                     });
-                    if (row === null || row.status !== "terminal") continue;
+                    if (row === null) continue;
+                    if (row.status === "admitted" || row.status === "accepted") {
+                      // INC-20261028-STALE-ENGINE-STARTING:断线超过 drain 后容器帧既不落库也
+                      // 无法回放,标签页可能还停在断线前的 engine_starting。按已落库证据给本条
+                      // userWs 一个权威阶段快照;meta.detached 告知中间过程可能缺失。
+                      const engineReady = await readOpenDispatchEngineReady(pgPool, {
+                        dispatchId: row.dispatchId,
+                        attemptNo: row.attemptNo,
+                      });
+                      if (userWs.readyState !== WebSocket.OPEN) continue;
+                      try {
+                        userWs.send(JSON.stringify(_openDispatchTurnStatusSnapshotFrame({
+                          peerId,
+                          agentId: row.agentId,
+                          clientMessageId,
+                          engineReady,
+                          admittedAt: row.admittedAt,
+                        })));
+                        bridgeLog?.info("user-chat-bridge: hello open dispatch status snapshot sent", {
+                          uid: uidStr,
+                          sessionId: peerId,
+                          clientMessageId,
+                          engineReady,
+                        });
+                      } catch { /* 发不出就静默降级 */ }
+                      continue;
+                    }
+                    if (row.status !== "terminal") continue;
                     let reconcile: "turn_completed" | "interrupted" | null = null;
                     if (row.outcome === "completed") {
                       reconcile = "turn_completed";

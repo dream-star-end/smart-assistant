@@ -9,6 +9,7 @@ import { ToolCardPolishProbe } from "./tool-card-polish-probe";
 import {
   StrictMode,
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -50,7 +51,7 @@ import {
   type StoredPendingDispatch,
   type StoredSession,
 } from "../src/lib/persist";
-import type { ChatMessage } from "../src/lib/chat/model";
+import { type ChatMessage, isTurnDetached } from "../src/lib/chat/model";
 import type { MediaRef } from "../src/lib/chat/frames";
 import type { User } from "../src/lib/types";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
@@ -216,6 +217,10 @@ declare global {
       pushEngineStartupStatus: (status: "engine_starting" | "engine_resuming") => void;
       /** Push the gateway model-thinking keepalive (working, detail=thinking) or its null reset. */
       pushModelThinking: (active: boolean) => void;
+      /** Shift the in-flight turn's clock back by ms (page backgrounded, no frames). */
+      ageTurnClock: (ms: number) => void;
+      /** Push the bridge hello snapshot for an open dispatch (meta.detached). */
+      pushDetachedSnapshot: (status: null | "engine_starting") => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
       /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
@@ -466,6 +471,8 @@ window.__replayDrive = {
   pushWaitingForUserStatus: () => {},
   pushEngineStartupStatus: () => {},
   pushModelThinking: () => {},
+  ageTurnClock: () => {},
+  pushDetachedSnapshot: () => {},
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
@@ -1847,8 +1854,17 @@ const replaySocket = new ChatSocket({
 });
 replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "replay 会话");
 
+/** ageTurnClock mutates session timestamps in place; this re-renders the probe. */
+const REPLAY_RERENDER_EVENT = "replay-rerender";
+
 function ReplayTimelineProbe() {
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const [, setRerender] = useState(0);
+  useEffect(() => {
+    const onRerender = () => setRerender((n) => n + 1);
+    window.addEventListener(REPLAY_RERENDER_EVENT, onRerender);
+    return () => window.removeEventListener(REPLAY_RERENDER_EVENT, onRerender);
+  }, []);
   const snap = useSyncExternalStore(replaySocket.subscribe, replaySocket.getSnapshot);
   void snap.version;
   const session = snap.sessions.get(REPLAY_SESSION_ID);
@@ -1869,6 +1885,8 @@ function ReplayTimelineProbe() {
         turnActivity={sending ? {
           startedAt: session?._turnStartedAt ?? null,
           lastFrameAt: session?._lastFrameAt,
+          transport: snap.status.cls,
+          detached: session ? isTurnDetached(session) : false,
           // 与 App.tsx turnActivity 同源:working detail(含模型思考态)走 progressHint。
           progressHint: session?._turnProgressHint,
           turnStatus: session?._turnStatus ?? null,
@@ -2055,6 +2073,29 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         channel: "webchat",
         peer: { id: REPLAY_SESSION_ID, kind: "dm" },
         status,
+      });
+    },
+    ageTurnClock: (ms) => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("回合计时回拨前没有真实在途 turn");
+      }
+      if (session._turnStartedAt != null) session._turnStartedAt -= ms;
+      if (session._lastFrameAt !== undefined) session._lastFrameAt -= ms;
+      window.dispatchEvent(new Event(REPLAY_RERENDER_EVENT));
+    },
+    pushDetachedSnapshot: (status) => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("hello 快照注入前没有真实在途 turn");
+      }
+      live().deliver({
+        type: "outbound.turn_status",
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+        status,
+        meta: { detached: true, since: session._turnStartedAt ?? Date.now() },
       });
     },
     pushModelThinking: (active) => {

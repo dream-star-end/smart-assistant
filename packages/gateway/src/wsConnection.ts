@@ -61,7 +61,7 @@ import {
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
-import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
 
 const MODEL_SWITCH_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
@@ -1028,12 +1028,17 @@ export async function autoResumeFromHello(
     //   - 长 compact + 长断网 + ring 满:replay 拿不回 compact_start,这里兜底
     //   - runner 已停:不发(turn 已结束,前端会收到 ring 里的 isFinal 或者
     //     紧跟着的 turn-interrupted isFinal,自行清空 UI 状态)
+    //   - runner 在跑且 phase 为 null 也发(status:null):启动态的清态帧可能
+    //     发生在无浏览器连接期间,不补发前端会一直停在「正在启动引擎」
+    //     (INC-20261028-STALE-ENGINE-STARTING)
     // 单 ws send(只给本次 hello 的 client 看,不是所有 peerKey),与下方
     // synthetic isFinal 同模式 —— 不走 deliver(),避免把同一帧再 ring + 广播。
-    // biome-ignore lint/complexity/useOptionalChain: moved verbatim from server.ts (OCV5-483); pre-existing there
-    if (session && session.runner.isRunning && session.currentTurnStatus != null) {
+    const resendPhase = session
+      ? _helloTurnStatusResendPhase(session.runner.isRunning, session.currentTurnStatus)
+      : undefined
+    if (resendPhase !== undefined) {
       try {
-        const phase = session.currentTurnStatus
+        const phase = resendPhase
         // retrying 补发展平为 status:'retrying' + 平级 retry(前端按 retry.retryAt
         // 重算剩余倒计时,不从完整 delayMs 重头显示);compacting/null 照旧。
         const turnStatusFrame = JSON.stringify({
@@ -1047,7 +1052,7 @@ export async function autoResumeFromHello(
         ws.send(turnStatusFrame)
         this.log.info('auto-resume rebroadcast turn_status', {
           sessionKey,
-          status: typeof phase === 'object' ? phase.status : phase,
+          status: phase && typeof phase === 'object' ? phase.status : phase,
         })
       } catch {}
     }

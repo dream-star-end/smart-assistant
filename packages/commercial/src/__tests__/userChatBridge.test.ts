@@ -2839,6 +2839,9 @@ function rawDispatchRow(input: {
 function helloTerminalBillingTrio(opts: {
   row?: Record<string, unknown> | null;
   lookups?: unknown[][];
+  /** Rows for readOpenDispatchEngineReady (persisted head of the open stream). */
+  readyScanRows?: Array<{ payload: Buffer | null }>;
+  readyScans?: unknown[][];
   beforeTurnDispatchLookup?: () => Promise<void>;
 }): Pick<UserChatBridgeDeps, "pgPool" | "preCheckRedis" | "pricing"> {
   const lookups = opts.lookups ?? [];
@@ -2850,6 +2853,11 @@ function helloTerminalBillingTrio(opts: {
           : String((sql as { text?: unknown })?.text ?? "");
         if (/SELECT status FROM users WHERE id/.test(text)) {
           return { rows: [{ status: "active" }], rowCount: 1 };
+        }
+        if (/open-dispatch-engine-ready/.test(text)) {
+          opts.readyScans?.push(params ?? []);
+          const rows = opts.readyScanRows ?? [];
+          return { rows, rowCount: rows.length };
         }
         if (/FROM turn_dispatches/.test(text) && /client_message_id/.test(text)) {
           if (opts.beforeTurnDispatchLookup) await opts.beforeTurnDispatchLookup();
@@ -2901,6 +2909,8 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     containerId: number;
     row?: Record<string, unknown> | null;
     lookups?: unknown[][];
+    readyScanRows?: Array<{ payload: Buffer | null }>;
+    readyScans?: unknown[][];
     beforeTurnDispatchLookup?: () => Promise<void>;
   }): Promise<{
     rig: TestRig;
@@ -2912,6 +2922,8 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
       row: opts.row,
       lookups,
       beforeTurnDispatchLookup: opts.beforeTurnDispatchLookup,
+      readyScanRows: opts.readyScanRows,
+      readyScans: opts.readyScans,
     });
     const portRef = { p: 0 };
     const rig = await startRig({
@@ -3055,20 +3067,29 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
-  test("hello + inFlight + 非 terminal(accepted) → 不发补帧", async () => {
-    const uid = "804";
-    const peerId = "peerAccepted";
-    const clientMessageId = "cm-accepted";
+  // INC-20261028-STALE-ENGINE-STARTING:断线超过 drain 后容器帧不落库,标签页停在
+  // engine_starting。hello 对 open dispatch 按已落库证据下发权威阶段快照,只打本条 userWs。
+  async function helloOpenDispatchSnapshot(opts: {
+    uid: string;
+    status: "accepted" | "admitted";
+    readyScanRows: Array<{ payload: Buffer | null }>;
+  }): Promise<{ frame: Record<string, unknown>; readyScans: unknown[][]; admittedAt: Date }> {
+    const peerId = `peerOpen${opts.uid}`;
+    const clientMessageId = `cm-open-${opts.uid}`;
+    const row = rawDispatchRow({
+      userId: opts.uid,
+      sessionId: peerId,
+      clientMessageId,
+      status: opts.status,
+      outcome: null,
+    });
+    const readyScans: unknown[][] = [];
     const { rig, ws } = await openHelloRig({
-      uid,
-      containerId: 804,
-      row: rawDispatchRow({
-        userId: uid,
-        sessionId: peerId,
-        clientMessageId,
-        status: "accepted",
-        outcome: null,
-      }),
+      uid: opts.uid,
+      containerId: Number(opts.uid),
+      row,
+      readyScanRows: opts.readyScanRows,
+      readyScans,
     });
     try {
       const fc = frameCollector(ws);
@@ -3077,23 +3098,64 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         peers: [{
           peerId,
           agentId: "main",
-          lastFrameSeq: 0,
+          lastFrameSeq: 3,
           inFlight: true,
           inFlightClientMessageId: clientMessageId,
         }],
       });
       ws.send(helloFrame);
       await waitHelloForwarded(rig, helloFrame);
-      const got = await Promise.race([
-        nextBusinessFrame(fc),
-        new Promise<null>((r) => setTimeout(() => r(null), 250)),
-      ]);
-      assert.equal(got, null, `非 terminal 不得发补帧(收到 ${JSON.stringify(got)})`);
+      const frame = await nextBusinessFrame(fc);
+      assert.equal(frame.peer && (frame.peer as { id?: unknown }).id, peerId);
+      assert.equal(frame.clientMessageId, clientMessageId);
+      assert.equal(frame.sessionKey, `agent:main:webchat:dm:${peerId}`);
+      return { frame, readyScans, admittedAt: row.admitted_at as Date };
     } finally {
       ws.close();
       await waitClose(ws);
       await stopRig(rig);
     }
+  }
+
+  const startupFrame = (status: string) =>
+    ({ payload: Buffer.from(JSON.stringify({ type: "outbound.turn_status", status })) });
+
+  test("hello + inFlight + accepted + 已落库就绪证据(thinking) → turn_status null + detached", async () => {
+    const { frame, readyScans, admittedAt } = await helloOpenDispatchSnapshot({
+      uid: "806",
+      status: "accepted",
+      readyScanRows: [
+        { payload: Buffer.from(JSON.stringify({ type: "sys.context_rebuilt" })) },
+        startupFrame("engine_starting"),
+        { payload: Buffer.from(JSON.stringify({ type: "outbound.message", blocks: [{ kind: "thinking", text: "I" }] })) },
+      ],
+    });
+    assert.equal(frame.type, "outbound.turn_status");
+    assert.equal(frame.status, null);
+    assert.notEqual(frame.isFinal, true, "open dispatch 不得补 isFinal");
+    assert.deepEqual(frame.meta, { detached: true, since: admittedAt.getTime() });
+    assert.equal(readyScans.length, 1);
+    assert.equal(readyScans[0]![0], "dispatch:d-hello-terminal:1");
+  });
+
+  test("hello + inFlight + accepted + 只有启动帧 → engine_starting + since + detached", async () => {
+    const { frame, admittedAt } = await helloOpenDispatchSnapshot({
+      uid: "807",
+      status: "accepted",
+      readyScanRows: [startupFrame("engine_starting"), startupFrame("engine_starting")],
+    });
+    assert.equal(frame.type, "outbound.turn_status");
+    assert.equal(frame.status, "engine_starting");
+    assert.deepEqual(frame.meta, { detached: true, since: admittedAt.getTime() });
+  });
+
+  test("hello + inFlight + admitted + 超大帧(内容) → 视为已就绪", async () => {
+    const { frame } = await helloOpenDispatchSnapshot({
+      uid: "808",
+      status: "admitted",
+      readyScanRows: [startupFrame("engine_starting"), { payload: null }],
+    });
+    assert.equal(frame.status, null);
   });
 
   test("hello 没有 inFlightClientMessageId → 不查 PG、不发帧", async () => {

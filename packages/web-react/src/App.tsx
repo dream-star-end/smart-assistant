@@ -151,7 +151,7 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaJobWire } from "./lib/chat/frames";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
-import type { ChatMessage } from "./lib/chat/model";
+import { type ChatMessage, isTurnDetached } from "./lib/chat/model";
 import {
   exactUserReplayPayload,
   interruptedContinuationTarget,
@@ -1396,6 +1396,8 @@ export function App() {
       dispatch,
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
+      transport: chat.status.cls,
+      detached: isTurnDetached(activeSess),
       progressHint: activeSess._turnProgressHint,
       hasPlated: wsMessages.some((m) =>
         isPlatedAssistantMessage(m) &&
@@ -1417,7 +1419,7 @@ export function App() {
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
     };
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
-  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus]);
+  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus, chat.status.cls]);
 
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
