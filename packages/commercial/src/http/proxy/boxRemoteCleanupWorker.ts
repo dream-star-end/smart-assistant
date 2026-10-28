@@ -234,13 +234,17 @@ export class BoxRemoteCleanupWorker {
   /** OCV5-488 (10-17 commercial account 79, three handoff leaves held for
    * 78 min with no CLI left): no proof, and the run is not stale or not
    * stoppable. Look at the Box. Nothing of the run on two looks, a minute
-   * apart or across a reboot, closes it the way an expired run is closed;
-   * alive, terminal or unreadable keeps it pending exactly as before. */
+   * apart or across a reboot, closes it the way an expired run is closed.
+   * A stat-only terminal.json and a bad stop.ready are not proof and do not
+   * skip the scan. alive, an injected terminal line, or an unreadable probe
+   * keeps it pending exactly as before. */
   private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
     target: BoxResolvedTarget): Promise<boolean> {
     const journal = this.deps.journal;
     const holds = this.deps.holds;
     if (!holds || !journal.markRunExpiredUnproven) return false;
+    const watched = { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString() };
     let seen: BoxRunLiveness | null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -252,13 +256,25 @@ export class BoxRemoteCleanupWorker {
         }),
       ]);
       seen = parseBoxRunLiveness(result.stdout);
-    } catch { return false; }
-    finally { if (timer) clearTimeout(timer); }
-    if (!seen || seen.state === "terminal") return false;
+    } catch (error) {
+      workerLog.warn("box_run_liveness", { ...watched, outcome: "probe_failed",
+        ...probeFailureTag(error) });
+      return false;
+    } finally { if (timer) clearTimeout(timer); }
+    if (!seen || seen.state === "terminal") {
+      // A parsed terminal line still belongs to the proof reader. An unparsed
+      // line proves nothing. Neither one is an absence.
+      workerLog.warn("box_run_liveness", { ...watched,
+        outcome: seen?.state === "terminal" ? "terminal" : "probe_failed",
+        ...(seen ? {} : { reason: "unparsed" }) });
+      return false;
+    }
     if (seen.state === "alive") {
+      workerLog.warn("box_run_liveness", { ...watched, outcome: "alive", boot: seen.boot });
       await holds.clearRunAbsence(candidate);
       return false;
     }
+    workerLog.warn("box_run_liveness", { ...watched, outcome: "absent", boot: seen.boot });
     const first = await holds.recordRunAbsence({ ...candidate, boot: seen.boot });
     if (!first) {
       workerLog.warn("box_run_absent_seen", { requestId: candidate.requestId,

@@ -93,25 +93,53 @@ test("OCV5-488 a child left in the CLI's session keeps the run alive in any cwd"
   }
 });
 
-test("OCV5-488 a stop.ready that is not the keeper's handshake proves nothing", () => {
+test("a bad stop.ready handshake does not block the process scan", async () => {
+  const NL = String.fromCharCode(10);
   const { nonce, proof, remove } = runDirs();
+  const keeper = spawn("/usr/bin/python3", ["-I", "-c", "import time" + NL + "while True:time.sleep(.1)",
+    "--proof-dir", proof], { cwd: "/tmp", stdio: "ignore" });
   try {
-    for (const body of ["not json\n", `${JSON.stringify({ runNonce: "c".repeat(24), cliPid: 4242 })}\n`,
-      `${JSON.stringify({ runNonce: nonce, cliPid: "4242" })}\n`]) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    const bodies = [
+      "not json" + NL,
+      JSON.stringify({ runNonce: "c".repeat(24), cliPid: 4242 }) + NL,
+      JSON.stringify({ runNonce: nonce, cliPid: "4242" }) + NL,
+    ];
+    for (const body of bodies) {
       writeFileSync(`${proof}/stop.ready`, body, { mode: 0o600 });
       const out = probe(nonce);
-      assert.notEqual(out.status, 0, body);
-      assert.equal(out.parsed, null, body);
+      assert.equal(out.status, 0, body);
+      assert.deepEqual(out.parsed, { state: "alive", boot: BOOT }, body);
     }
-  } finally { remove(); }
+    keeper.kill("SIGKILL");
+    await exited(keeper);
+    for (const body of ["not json" + NL, JSON.stringify({ runNonce: nonce, cliPid: "4242" }) + NL]) {
+      writeFileSync(`${proof}/stop.ready`, body, { mode: 0o600 });
+      assert.deepEqual(probe(nonce).parsed, { state: "absent", boot: BOOT }, body);
+    }
+  } finally {
+    if (keeper.exitCode === null) keeper.kill("SIGKILL");
+    remove();
+  }
 });
 
-test("OCV5-488 a terminal proof is reported as such, and gone directories are absent", () => {
+test("a stat-only terminal.json plus a bad stop.ready does not skip the process scan", async () => {
+  const NL = String.fromCharCode(10);
   const { nonce, proof, remove } = runDirs();
+  const keeper = spawn("/usr/bin/python3", ["-I", "-c", "import time" + NL + "while True:time.sleep(.1)",
+    "--proof-dir", proof], { cwd: "/tmp", stdio: "ignore" });
   try {
-    writeFileSync(`${proof}/terminal.json`, "{}\n", { mode: 0o600 });
-    assert.deepEqual(probe(nonce).parsed, { state: "terminal", boot: BOOT });
-  } finally { remove(); }
+    writeFileSync(`${proof}/terminal.json`, "{}" + NL, { mode: 0o644 });
+    writeFileSync(`${proof}/stop.ready`, "not json" + NL, { mode: 0o600 });
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(probe(nonce).parsed, { state: "alive", boot: BOOT });
+    keeper.kill("SIGKILL");
+    await exited(keeper);
+    assert.deepEqual(probe(nonce).parsed, { state: "absent", boot: BOOT });
+  } finally {
+    if (keeper.exitCode === null) keeper.kill("SIGKILL");
+    remove();
+  }
   // 10-17: the run and proof directories themselves were gone
   assert.deepEqual(probe(nonce).parsed, { state: "absent", boot: BOOT });
 });

@@ -12,9 +12,10 @@
  * escapes this, as it escapes the supervisor's own group kill; a route A CLI
  * runs no local tools (they run in the user's container), so the model cannot
  * start one.
- * `absent`: no such process and no terminal proof. A stop.ready that is
- * present but not the keeper's exact handshake proves nothing (exit 125). `terminal`: the keeper's
- * proof exists, which the proof reader owns. Anything unreadable exits
+ * `absent`: no such process. A stop.ready that is missing or not the
+ * keeper's exact handshake proves nothing and does not skip the scan. A
+ * terminal.json that can only be stat'd is not a proof; worker_complete stays
+ * with the proof reader. Anything unreadable, including the boot id, exits
  * non-zero and proves nothing. The boot id lets the caller tell "gone since
  * the last look" from "the Box rebooted". Nothing is signalled or removed. */
 import type { BoxCcExecRequest } from "@openclaude/gateway";
@@ -30,10 +31,6 @@ proof='/tmp/ocv5-289-proof-'+nonce
 with open('/proc/sys/kernel/random/boot_id') as f:boot=f.read().strip()
 if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',boot):
  raise SystemExit(125)
-try:os.stat(proof+'/terminal.json',follow_symlinks=False)
-except FileNotFoundError:pass
-else:
- print('terminal '+boot);raise SystemExit(0)
 uid=os.getuid()
 mine=set()
 pid=os.getpid()
@@ -53,10 +50,10 @@ try:
 except FileNotFoundError:pass
 else:
  try:ready=json.loads(raw)
- except ValueError:raise SystemExit(125)
- if (not isinstance(ready,dict) or ready.get('runNonce')!=nonce
-     or type(ready.get('cliPid')) is not int or ready['cliPid']<2):raise SystemExit(125)
- sids.add(ready['cliPid'])
+ except ValueError:ready=None
+ if (isinstance(ready,dict) and ready.get('runNonce')==nonce
+     and type(ready.get('cliPid')) is int and ready['cliPid']>=2):
+  sids.add(ready['cliPid'])
 mark=nonce.encode()
 for name in os.listdir('/proc'):
  if not name.isdigit() or int(name) in mine:continue
@@ -77,6 +74,8 @@ for name in os.listdir('/proc'):
  except (FileNotFoundError,ProcessLookupError):continue
 print('absent '+boot)`;
 
+/** `terminal` is accepted so an injected or older line still defers to the
+ * proof reader. This probe no longer prints it from a stat of terminal.json. */
 export type BoxRunLiveness = { state: "alive" | "absent" | "terminal"; boot: string };
 
 /** `cliCwd` is the run's native CLI cwd when it differs from its own run
