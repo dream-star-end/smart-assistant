@@ -459,7 +459,6 @@ export function handleNotification(
   if (
     (method === 'item/started' || method === 'item/completed') &&
     _isContextCompactionItem(p.item) &&
-    p.threadId === this.threadId &&
     this.currentTurnCompleter
   ) {
     this.nativeContext.automaticItem(method, p, this.threadId)
@@ -1429,7 +1428,6 @@ export function emitResult(
 
 /** Existing billing delta calculation, shared with the native compact turn. */
 function handleTokenUsage(this: CodexNotificationHost, p: Record<string, unknown>): void {
-  if (typeof p.threadId === 'string' && p.threadId !== this.threadId) return
   this.nativeContext.observeUsage(this.threadId, p)
   // Schema: ThreadTokenUsageUpdatedNotification — { threadId, turnId,
   // tokenUsage: { last, total, modelContextWindow? } }. Both `last` and
