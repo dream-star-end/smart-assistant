@@ -15,7 +15,7 @@
     "packages/web-react/browser-tests/run.mjs": 4185,
     "packages/web-react/src/components/MessageRenderer.tsx": 3165,
     "packages/web-react/src/lib/chat/reducer.ts": 3300,
-    "packages/web-react/src/lib/chat/socket.ts": 6645,
+    "packages/web-react/src/lib/chat/socket.ts": 6408,
     "packages/web/public/modules/main.js": 3733,
     "packages/web/public/modules/messages.js": 3663,
     "packages/web/public/modules/websocket.js": 4841,
