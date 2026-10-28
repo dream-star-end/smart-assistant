@@ -503,17 +503,21 @@ describe('ModelSelector GPT/Kimi 上下文档', () => {
     { id: 'kimi-k3', display_name: 'Kimi K3', cost_x: 3.2 },
   ]
 
-  it('触发器显示 GPT 家族名并带 xN', () => {
+  it('触发器显示 GPT 家族名并带倍率', () => {
     render(<ModelSelector models={MODELS} selectedId="gpt-6.1-sol" onSelect={() => {}} />)
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
     expect(trigger.textContent).toContain('GPT-6.1-Sol')
-    expect(trigger.textContent).toContain('x11.3')
+    expect(trigger.textContent).toContain('11.3×')
   })
 
-  it('trigger 保留 CostMark', () => {
-    render(<ModelSelector models={MODELS} selectedId="gpt-6.1-sol" onSelect={() => {}} />)
+  // UI-2a:胶囊写成「名称 · 0.5×」,悬停说明倍率是什么(原先「x11.3」没有任何解释)。
+  it('trigger 保留 CostMark,写成「· N×」并带倍率说明', () => {
+    render(<ModelSelector models={MODELS} selectedId="glm-5.3" onSelect={() => {}} />)
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
-    expect(trigger.textContent).toContain('x11.3')
+    expect(trigger.textContent).toContain('GLM-5.3')
+    expect(trigger.textContent).toContain('· 0.5×')
+    expect(trigger.textContent).not.toContain('x0.5')
+    expect(trigger).toHaveAttribute('title', expect.stringContaining('约为基准模型的 0.5 倍'))
   })
 
   it('菜单收成 Kimi K3 一行，1M 开关改写 canonical id', async () => {

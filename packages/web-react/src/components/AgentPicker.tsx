@@ -91,9 +91,10 @@ export function AgentPicker({
   // OCV5-477: with no advisor model to pick, clicking 顾问 could only send a save the server
   // rejects. Disable it and say why instead.
   const advisorDisabled = advisorBlocked || advisorModels.length === 0
-  const advisorDisabledReason = advisorBlocked
-    ? advisorBlockReason
-    : advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON
+  // 服务端「没有可用顾问」的原因是工程口径(「顾问引擎尚未完成无工具证明」「catalog …」),体验官看不懂(UI-2a):
+  // 卡片上写人话,原句只放悬停提示。父引擎不支持的原因本来就是人话,照旧直接显示。
+  const advisorDisabledReason = advisorBlocked ? advisorBlockReason : ADVISOR_UNAVAILABLE_REASON
+  const advisorDisabledTitle = advisorBlocked ? advisorBlockReason : advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON
   // 打开时网格先空着、预设卡异步长出来,弹层(垂直居中)会整体上移半行,点「同时设为默认」的手落到
   // 第一张预设卡上(OCV5-639,体验官误选科研助手)。有 App 已拉到的目录就直接用它排版。
   const [agents, setAgents] = useState<Agent[]>(() =>
@@ -192,8 +193,8 @@ export function AgentPicker({
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">单人</span>
-                <span className="mt-0.5 block text-[11px] leading-snug">主模型独立完成</span>
+                <span className="flex items-center gap-1 text-meta font-semibold">单人</span>
+                <span className="mt-0.5 block text-caption leading-snug">主模型独立完成</span>
               </button>
               <button
                 type="button"
@@ -201,7 +202,7 @@ export function AgentPicker({
                 data-product-control
                 aria-pressed={mode === 'advisor'}
                 disabled={advisorDisabled}
-                title={advisorDisabled ? advisorDisabledReason : undefined}
+                title={advisorDisabled ? advisorDisabledTitle : undefined}
                 onClick={() => {
                   if (advisorDisabled) return
                   onCollabModeChange('advisor')
@@ -213,11 +214,11 @@ export function AgentPicker({
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                <span className="flex items-center gap-1 text-meta font-semibold">
                   <ShieldCheck size={13} />
                   顾问
                 </span>
-                <span className="mt-0.5 block text-[11px] leading-snug">
+                <span className="mt-0.5 block text-caption leading-snug">
                   {advisorDisabled ? advisorDisabledReason : ADVISOR_ENABLED_HINT}
                 </span>
               </button>
@@ -234,26 +235,26 @@ export function AgentPicker({
                     : "border-border bg-surface text-muted hover:border-border-strong",
                 )}
               >
-                <span className="flex items-center gap-1 text-[12.5px] font-semibold">
+                <span className="flex items-center gap-1 text-meta font-semibold">
                   <Users size={13} />
                   团队
                 </span>
                 {/* 审计 C-32:副标题不再手抄内部代号,引擎展示名与下方说明 / ModelSelector 同源
-                    (@openclaude/protocol DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME)。 */}
-                <span className="mt-0.5 block text-[11px] leading-snug">
-                  队长切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 并委派已安装智能体
+                    (@openclaude/protocol DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME)。UI-2a:「委派已安装智能体」改说人话。 */}
+                <span className="mt-0.5 block text-caption leading-snug">
+                  队长切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}，需要时请其他智能体分工
                 </span>
               </button>
             </div>
             {mode === 'team' && (
-              <span className="text-[11.5px] leading-snug text-muted">
-                开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
+              <span className="text-caption leading-snug text-muted">
+                由 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 带队（计费高于默认模型），需要时把子任务交给你已安装的智能体，分出去的部分按各自的模型计费。
               </span>
             )}
             {mode === 'advisor' && (
               <div className="flex flex-col gap-1.5">
                 {advisorModels.length > 0 ? (
-                  <label htmlFor={advisorSelectId} className="text-[11.5px] leading-snug text-muted">
+                  <label htmlFor={advisorSelectId} className="text-caption leading-snug text-muted">
                     顾问型号
                     {/* 合并取舍(发布预演 t-1279):控件沿用 ui/Select(审计 C-33,设计系统同构、jsdom 可测),
                         语义取 canonical OCV5-223 —— 已配置的顾问不在可用列表时不再静默回退到第一项,
@@ -289,11 +290,11 @@ export function AgentPicker({
                     />
                   </label>
                 ) : (
-                  <span className="text-[11.5px] leading-snug text-warning">
-                    {advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON}
+                  <span className="text-caption leading-snug text-warning" title={advisorUnavailableReason}>
+                    {ADVISOR_UNAVAILABLE_REASON}
                   </span>
                 )}
-                <span className="text-[11.5px] leading-snug text-muted">
+                <span className="text-caption leading-snug text-muted">
                   顾问只出主意，不能改文件、跑命令或再派人。主模型必须用证据验证建议后再交付。咨询按实际顾问型号计费，不承诺更省。
                 </span>
               </div>
@@ -301,7 +302,7 @@ export function AgentPicker({
             {onAsDefaultChange && (
               // 保持原生 checkbox(App.test / ocv5-210 真浏览器用例按 checkbox 契约 check/isChecked),
               // 只把控件尺寸与触控行高对齐设计系统(C-33)。
-              <label className="flex items-center gap-2 text-[11.5px] text-muted [@media(hover:none)]:min-h-11">
+              <label className="flex items-center gap-2 text-caption text-muted [@media(hover:none)]:min-h-11">
                 <input
                   type="checkbox"
                   checked={!!asDefault}
@@ -313,7 +314,7 @@ export function AgentPicker({
               </label>
             )}
             {collabSaveError && (
-              <span className="text-[11.5px] leading-snug text-danger">{collabSaveError}</span>
+              <span className="text-caption leading-snug text-danger">{collabSaveError}</span>
             )}
           </div>
         ) : onToggleTeamMode ? (
@@ -322,8 +323,8 @@ export function AgentPicker({
               <span className="flex items-center gap-1.5 text-meta font-semibold text-fg">
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
-              <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
-                开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
+              <span className="mt-0.5 text-caption leading-snug text-muted">
+                由 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 带队（计费高于默认模型），需要时把子任务交给你已安装的智能体，分出去的部分按各自的模型计费。
               </span>
             </span>
             <Switch

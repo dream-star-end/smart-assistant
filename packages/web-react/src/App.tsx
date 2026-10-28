@@ -89,18 +89,7 @@ import {
   type ChatInteraction,
 } from "./components/tool/context";
 import { isBrowserStepMessage } from "./components/tool/browserDetect";
-import {
-  DETAIL_PANE_WIDTH,
-  type DeferredPayloadLoader,
-  InspectorPanel,
-  InspectorPanelContent,
-  type PaneRequest,
-  type PaneTab,
-  paneRequestForSession,
-  readDetailPaneOpen,
-  writeDetailPaneOpen,
-} from "./components/InspectorPanel";
-import type { ToolLike } from "./components/tool/format";
+import { DetailPane, useDetailPane } from "./hooks/useDetailPane";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { BootSplash } from "./components/BootSplash";
@@ -135,8 +124,7 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
-import { useResizableWidth } from "./hooks/useResizableWidth";
+import { useMdViewport } from "./hooks/useMdViewport";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRatings";
@@ -402,38 +390,12 @@ export function App() {
   const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
-  // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
   const isMdViewport = useMdViewport();
-  const isWideViewport = useWideViewport();
   // 侧栏抽屉只属于窄屏:拉宽到 md 时 CSS(md:hidden)藏起了它，但 Radix 模态仍开着，
   // 下一次点输入框只会关掉这个看不见的抽屉(#1240「首次点击无响应」)。跨过 md 即关。
   useEffect(() => {
     if (isMdViewport) setMobileNavOpen(false);
   }, [isMdViewport]);
-  const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
-  const [paneSheetOpen, setPaneSheetOpen] = useState(false);
-  const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
-  const [paneActive, setPaneActive] = useState<ToolLike | null>(null);
-  const paneWidth = useResizableWidth(DETAIL_PANE_WIDTH);
-  const setPaneOpen = useCallback((open: boolean) => {
-    setPaneOpenState(open);
-    writeDetailPaneOpen(open);
-  }, []);
-  const paneToggleRef = useRef<(() => void) | null>(null);
-  // 请求记下发起时的会话(openPane 引用稳定,不随会话变):切会话后旧请求不再交给新面板。
-  const activeIdRef = useRef<string | null>(null);
-  const isWideRef = useRef(isWideViewport);
-  isWideRef.current = isWideViewport;
-  /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
-  const openPane = useCallback(
-    (tab?: PaneTab, message?: ToolLike | null) => {
-      setPaneRequest({ tab, message, nonce: Date.now(), sessionId: activeIdRef.current });
-      if (isWideRef.current) setPaneOpen(true);
-      else setPaneSheetOpen(true);
-    },
-    [setPaneOpen],
-  );
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(urlRoute.panel === "settings");
@@ -933,15 +895,6 @@ export function App() {
   });
   const sidebarWidth = useSidebarWidth();
 
-  // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
-  // 展示与当前消息流无关的陈旧内容。宽屏面板的开合是用户偏好,保留;窄屏抽屉收起。
-  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId / boardOpen / projectHome 是「换了上下文」的触发信号
-  useEffect(() => {
-    setPaneRequest(null);
-    setPaneActive(null);
-    setPaneSheetOpen(false);
-  }, [activeId, boardOpen, projectHome]);
-
   const authorizeSwitch=useModelSwitchCost({authRef,confirmDialog,toast});
   const switchOptionsRef=useRef<Partial<Pick<ModelSwitchCostRequest,'teamMode'|'contextTier'|'serviceTier'>>>({});
   const getSwitchOptions=useCallback(()=>switchOptionsRef.current,[]);
@@ -1237,22 +1190,8 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
-  activeIdRef.current = activeId ?? null;
-  // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
-  const paneAvailable =
-    !boardOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
-  const paneRequestHere = paneRequestForSession(paneRequest, activeId);
-  const paneInline = paneAvailable && isWideViewport && paneOpen;
-  const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
-  const togglePane = () => {
-    if (paneShown) {
-      if (isWideViewport) setPaneOpen(false);
-      else setPaneSheetOpen(false);
-      return;
-    }
-    openPane();
-  };
-  paneToggleRef.current = paneAvailable && !demo ? togglePane : null;
+  // 详情面板(右侧第三栏):默认收起,有产出时顶栏出「产出 N」(hooks/useDetailPane)。
+  const pane = useDetailPane({ activeId, inChat: !boardOpen && !projectHome, demo, messages: wsMessages, version: chat.version });
   const inflightDelegates = useInflightDelegates({
     sessionId: !demo && activeId ? activeId : null,
     messages: wsMessages,
@@ -1313,14 +1252,14 @@ export function App() {
         setFindOpen(true);
       }
       if (action === "pane") {
-        if (!inWorkspace || !paneToggleRef.current) return;
+        if (!inWorkspace || !pane.toggleRef.current) return;
         e.preventDefault();
-        paneToggleRef.current();
+        pane.toggleRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length, setBoardOpen]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length, setBoardOpen, pane.toggleRef]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -1524,7 +1463,7 @@ export function App() {
     newSession,
     openBlog,
     openManage,
-    openPane,
+    openPane: pane.openPane,
     openSettings,
     regenerate,
     send,
@@ -1546,11 +1485,6 @@ export function App() {
     stoppedTurnRef,
     toast,
   });
-  // 详情面板里点开大记录(>1 MiB 定位桩)时,与聊天区共用同一套正文取数与页面缓存。
-  const paneDeferredLoader = useMemo<DeferredPayloadLoader>(
-    () => ({ peek: cardCallbacks.onPeekTapeRecordPayload, fetch: cardCallbacks.onFetchTapeRecordPayload }),
-    [cardCallbacks],
-  );
 
   const composerReplyTo =
     messageReplyTarget && messageReplyTarget.sessionId === activeId
@@ -2087,7 +2021,7 @@ export function App() {
     <ArtifactInspectContext.Provider value={artifactInspect}>
     {/* tools T-18:详情面板当前查看的那条 tool 消息 → 源卡片选中态。与 open 回调分开成独立 context,
         面板开合只重渲消费它的 ToolCard,不打穿 MessageList 的 sig-memo(tool/context.ts 注释)。 */}
-    <ArtifactInspectActiveContext.Provider value={paneShown ? paneActive : null}>
+    <ArtifactInspectActiveContext.Provider value={pane.activeTool}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -2095,7 +2029,9 @@ export function App() {
       chatProjects={projects}
       userId={user?.id}
     >
-    <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
+    {/* overflow-clip 而不是 hidden:hidden 的盒子仍可被程序化滚动,输入框 focus() 时内容若瞬时伸出底边,
+        浏览器会把整个外壳滚上去 ~11px(侧栏 logo 被裁、用户滚不回来);clip 不是滚动容器,滚不动(UI-2a)。 */}
+    <div className="flex h-full min-h-0 overflow-clip bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
@@ -2324,17 +2260,11 @@ export function App() {
           onSelectServiceTier={demo ? undefined : setServiceTier}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
-          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
-          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
-          teamModeActive={!demo && teamMode && agent.id === "main"}
-          onDisableTeamMode={() => setTeamMode(false)}
-          advisorModeActive={!demo && collabMode === "advisor" && agent.id === "main"}
-          advisorModelLabel={
-            collabMode === "advisor" && agent.id === "main"
-              ? collabUi.advisorModel
-              : undefined
-          }
-          onDisableAdvisorMode={() => setCollabMode("solo")}
+          // 协作方式常显:与 send 的生效条件同构(只对 main 生效,见上方 send 的 agent.id === "main"
+          // 判定)——顶栏所见 = 实际所发。
+          collabMode={!demo && agent.id === "main" ? collabMode : undefined}
+          advisorModelLabel={collabUi.advisorModel}
+          onCollabSolo={() => setCollabMode("solo")}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : () => openSettings()}
           sidebarCollapsed={collapsed}
@@ -2344,8 +2274,9 @@ export function App() {
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
           onShare={demo ? undefined : () => setShareOpen(true)}
-          onTogglePane={paneAvailable && !demo ? togglePane : undefined}
-          paneOpen={paneShown}
+          onTogglePane={pane.toggle}
+          paneOpen={pane.shown}
+          paneOutputs={pane.outputs}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
           updateAvailable={!demo && updatePillVisible}
@@ -2694,50 +2625,16 @@ export function App() {
         )}
       </main>
 
-      {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
-          更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
-      {paneInline && (
-        <InspectorPanel
-          key={activeId ?? "demo"}
-          messages={wsMessages}
-          version={chat.version}
-          running={wsSending}
-          request={paneRequestHere}
-          deferredLoader={paneDeferredLoader}
-          focusNonce={paneRequestHere?.nonce}
-          onClose={() => setPaneOpen(false)}
-          onActiveChange={setPaneActive}
-          width={paneWidth.width}
-          resizing={paneWidth.resizing}
-          widthMin={DETAIL_PANE_WIDTH.min}
-          widthMax={DETAIL_PANE_WIDTH.max}
-          onResizeStart={paneWidth.onResizeStart}
-          onResizeKeyDown={paneWidth.onResizeKeyDown}
-        />
-      )}
-      <Sheet
-        open={paneAvailable && paneSheetOpen && !isWideViewport}
-        onOpenChange={(o) => {
-          if (!o) setPaneSheetOpen(false);
-        }}
-        side="bottom"
-        srTitle="详情面板"
-      >
-        {paneSheetOpen && (
-          <div className="flex h-[80dvh] min-h-0 flex-col">
-            <InspectorPanelContent
-              key={activeId ?? "demo"}
-              messages={wsMessages}
-              version={chat.version}
-              running={wsSending}
-              request={paneRequestHere}
-              deferredLoader={paneDeferredLoader}
-              onClose={() => setPaneSheetOpen(false)}
-              onActiveChange={setPaneActive}
-            />
-          </div>
-        )}
-      </Sheet>
+      {/* 详情面板(右侧第三栏):宽屏内联 aside,更窄贴底 Sheet。任务看板 / 项目主页占据 main 时不渲染。 */}
+      <DetailPane
+        pane={pane}
+        sessionKey={activeId ?? "demo"}
+        messages={wsMessages}
+        version={chat.version}
+        running={wsSending}
+        peek={cardCallbacks.onPeekTapeRecordPayload}
+        fetch={cardCallbacks.onFetchTapeRecordPayload}
+      />
 
       <AppDialogs
         preferencesRevision={preferencesRevision}
