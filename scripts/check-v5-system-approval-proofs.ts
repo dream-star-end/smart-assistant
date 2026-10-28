@@ -55,9 +55,11 @@ process.once('message', m => {
 });
 `)
 async function runPair(mode: 'race' | 'stress', args: Record<string, unknown>) {
+  let timedOut = false
   const workers = ['proof-a', 'proof-b'].map(owner => {
-    const child = spawn(process.execPath, ['--import', 'tsx', workerPath], { cwd: ROOT, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+    const child = spawn(process.execPath, ['--import', 'tsx', workerPath], { cwd: ROOT, stdio: ['ignore', 'ignore', 'inherit', 'ipc'] })
     children.push(child)
+    let phase = 'starting'
     let ready!: () => void
     let result!: (v: { ok: boolean; code?: string }) => void
     let rejectReady!: (e: Error) => void
@@ -65,15 +67,30 @@ async function runPair(mode: 'race' | 'stress', args: Record<string, unknown>) {
     const readyPromise = new Promise<void>((r, reject) => { ready = r; rejectReady = reject })
     const resultPromise = new Promise<{ ok: boolean; code?: string }>((r, reject) => { result = r; rejectResult = reject })
     const exitPromise = new Promise<void>((r, reject) => {
-      const fail = () => { const e = new Error('isolated approval executor failed'); rejectReady(e); rejectResult(e); reject(e) }
-      child.once('error', fail)
-      child.once('exit', code => { if (code === 0) r(); else fail() })
+      const fail = (status: number | null, signal: NodeJS.Signals | null, cause?: NodeJS.ErrnoException) => {
+        console.error('[system-approval-proofs] FAIL', JSON.stringify({
+          mode, owner, phase, status, signal, timedOut, error: cause?.message ?? null, code: cause?.code ?? null,
+        }))
+        const e = new Error('isolated approval executor failed')
+        rejectReady(e); rejectResult(e); reject(e)
+      }
+      child.once('error', error => fail(null, null, error))
+      child.once('exit', (code, signal) => { if (code === 0 && phase === 'result') r(); else fail(code, signal) })
     })
-    child.on('message', (v: { type: string; ok: boolean; code?: string }) => { if (v.type === 'ready') ready(); if (v.type === 'result') result(v) })
+    // A worker can fail before later phases are awaited. Observe all rejections immediately;
+    // the original promises still reject at their awaits and the gate remains fatal.
+    for (const pending of [readyPromise, resultPromise, exitPromise]) void pending.catch(() => {})
+    child.on('message', (v: { type: string; ok: boolean; code?: string }) => {
+      if (v.type === 'ready') { phase = 'ready'; ready() }
+      if (v.type === 'result') { phase = 'result'; result(v) }
+    })
     child.send({ dbPath, key: key.toString('base64'), input, effects: effectPath, mode, owner, ...args })
     return { child, readyPromise, resultPromise, exitPromise }
   })
-  const deadline = setTimeout(() => { for (const { child } of workers) if (child.exitCode === null) child.kill('SIGTERM') }, 30000)
+  const deadline = setTimeout(() => {
+    timedOut = true
+    for (const { child } of workers) if (child.exitCode === null) child.kill('SIGTERM')
+  }, 30000)
   try {
     await Promise.all(workers.map(w => w.readyPromise))
     for (const w of workers) w.child.send({ type: 'go' })
