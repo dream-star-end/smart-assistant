@@ -665,6 +665,30 @@ describe('AntigravityAdapter', () => {
     }
   })
 
+  test('ending during context preparation never spawns a late CLI', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const events: EngineEvent[] = []
+      const run = h.adapter.submitTurn({
+        input: 'x'.repeat(2 * ANTIGRAVITY_MAX_PROMPT_BYTES),
+        onEvent: (event) => {
+          events.push(event)
+          if (event.kind === 'context_pressure') run.end()
+        },
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.equal(await run.summary, null)
+      await h.adapter.waitForOutputDrain()
+      assert.equal(existsSync(h.capture), false)
+      assert.equal(events.some((e) => e.kind === 'context_compacted'), false)
+    } finally {
+      await h.restore()
+    }
+  })
+
   test('ordinary prompts do not create context artifacts or compaction observations', async () => {
     const h = await harness()
     try {

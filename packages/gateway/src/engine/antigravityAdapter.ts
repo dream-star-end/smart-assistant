@@ -453,8 +453,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       maxBytes: ANTIGRAVITY_MAX_PROMPT_BYTES,
       cwd: cwdDecision.cwd,
       engine: this.engineId,
-      onEvent: ctx.params.onEvent,
+      onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
     })
+    // Context-file IO can outlive the logical turn. Never launch a paid CLI
+    // after end()/shutdown has already retired this turn during preparation.
+    if (ctx.terminal || ctx.abandoned) {
+      this.cleanupLaunch(ctx)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      return
+    }
 
     const isolatedEnv = buildCodexEnv()
     for (const key of Object.keys(isolatedEnv)) {
