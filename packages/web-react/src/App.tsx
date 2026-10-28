@@ -66,6 +66,8 @@ import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
 import { TurnCostReminder } from "./components/chat/TurnCostReminder";
+import { BackgroundTurnBanner } from "./components/chat/BackgroundTurnBanner";
+import { useBackgroundTurn } from "./hooks/useBackgroundTurn";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -1562,6 +1564,9 @@ export function App() {
   const queuedOutgoing = wsMessages.filter(
     (message) => message.role === "user" && message.status === "queued",
   );
+  // B4a: honest "this turn is still running" banner + soft confirm before a 继续-style send.
+  const backgroundTurn = useBackgroundTurn({ chat, sess: activeSess, enabled: !demo && !gated,
+    queuedCount: queuedOutgoing.length, compact: !isMdViewport, confirm: confirmDialog });
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -1934,7 +1939,8 @@ export function App() {
   if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
   if (!demo && gate.phase.kind === "dormant") activeBannerKinds.push("dormant");
   if (!demo && updateBannerVisible) activeBannerKinds.push("update");
-  if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
+  if (backgroundTurn.notice && isMdViewport) activeBannerKinds.push("turn");
+  if (!demo && !gated && activeSess?._turnCostReminderCredits && !backgroundTurn.notice) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
@@ -2517,8 +2523,8 @@ export function App() {
               className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
             />
           )}
-          {/* 以下五条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
-              发送失败 > 连接状态 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
+          {/* 以下六条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
+              发送失败 > 连接状态 > 本轮运行 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
           {showBanner("error") && chatError && (
             <ErrorBanner
               error={chatError}
@@ -2554,6 +2560,7 @@ export function App() {
               </Alert>
             </div>
           )}
+          {showBanner("turn") && backgroundTurn.notice && <BackgroundTurnBanner notice={backgroundTurn.notice} />}
           {showBanner("dormant") && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
@@ -2601,7 +2608,7 @@ export function App() {
           )}
           <Composer
             onSend={(text, media, replyTo) =>
-              send(text, media, undefined, undefined, replyTo)
+              backgroundTurn.guardSend(text, media, () => send(text, media, undefined, undefined, replyTo))
             }
             busy={sending}
             stopping={activeSess?._recoveryStatus?.kind === "stopping"}
@@ -2628,6 +2635,8 @@ export function App() {
                     {connBanner.text}
                   </Alert>
                 </div>
+              ) : backgroundTurn.notice && !isMdViewport ? (
+                <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
             placeholder={`和「${agent.name}」对话…`}

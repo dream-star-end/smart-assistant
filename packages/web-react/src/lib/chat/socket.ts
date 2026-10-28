@@ -1404,7 +1404,7 @@ export class ChatSocket {
       this.reconcileSession(sessId);
       this.setTransientNotice(
         sessId,
-        "较长时间未收到新内容，已自动核对服务端记录；可继续等待，或停止后重新发送。",
+        "较长时间未收到新内容，已自动核对服务端记录；本轮可能仍在运行，可以继续等待。",
       );
       this.resetThinkingSafety(sessId); // 复检后恢复默认 10min 窗口(仅首窗被 turn_state_unknown 缩短)
     }, delayMs);
