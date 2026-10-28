@@ -85,8 +85,10 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
   [[ "${OC_V5_SKIP_TRAILER_GATE:-0}" != 1 ]] || die "prepare requires the trailer gate"
   selfhost_prepare_lock
   selfhost_prepared_state init "$sha" || die "cannot initialize trusted prepared state"
-  selfhost_prepared_state prune "$sha" || die "cannot invalidate stale prepared receipts"
+  # Validate after waiting for the artifact lock and before deleting any receipt:
+  # a delayed request for an old SHA must not invalidate a newer ready candidate.
   selfhost_prepare_assert_tip "$sha"
+  selfhost_prepared_state prune "$sha" || die "cannot invalidate stale prepared receipts"
   selfhost_prepare_identity "$sha"
   if [[ -e "$SELFHOST_PREPARED_ROOT/$sha.json" ]]; then
     if selfhost_prepared_load "$sha"; then
@@ -163,7 +165,7 @@ selfhost_prepared_gc() { # <command...>; subshell owns the GC artifact lock unti
       exec 9<>"$SELFHOST_PREPARE_LOCK"
       flock -n 9 || { log "  GC deferred: prepare is running"; exit 0; }
     fi
-    if [[ -e "$SELFHOST_PREPARED_ROOT" ]]; then
+    if [[ -e "$SELFHOST_PREPARED_ROOT" || -L "$SELFHOST_PREPARED_ROOT" ]]; then
       # A read error also defers GC. No prepared evidence may disappear underneath flip.
       local rc=0 tip
       tip="$(git -C "$REPO_ROOT" ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \

@@ -112,3 +112,38 @@ now removes both real trailer calls. Ahead-of-HEAD preparation is admitted only
 for an available exact remote tip with byte-identical controller/guard definitions.
 Cold L0 admission runs after the receipt lookup, so cached flip needs no second
 8 GiB reservation. Add behavioral cases for all three R1 P1 reproductions.
+
+## P4 deepen — 2026-10-28
+
+Incremental base: `f10e912d70d44e1c176ef003215ad7900cb67e60` (21/21 CI green).
+Keep the existing design and draft PR; no integration or production actions.
+
+- Verify the requested remote tip before pruning receipts. A delayed prepare for
+  an obsolete SHA must not delete a ready receipt belonging to the current tip.
+  Keep that check inside the artifact mutex, including after waiting for it.
+- Treat a dangling prepared-root symlink as unreadable state and defer GC,
+  preserving the same fail-closed behavior as other untrusted prepared paths.
+- Add isolated behavioral failure tests for master/runtime/platform preparation,
+  interrupted publishers and inherited artifact locks, same-SHA reuse/recovery,
+  rejected identities, partial receipts and conservative GC. All git origins,
+  locks, artifacts and process signaling belong to the test fixture.
+- Exercise actual cutover/compensation functions with private filesystem and
+  host-I/O fakes: E1/E2 refusal, idle refusal, post-mutation rollback failure,
+  recovery evidence, stay policy and successful receipt consumption. Assert
+  exact pointer/backup/receipt outcomes rather than source-text presence.
+- Preserve the release gates and assertions. Run only affected unit tests plus
+  typecheck/lint/trailers locally; use wait-for-trains before any shared test lock.
+  Full suites remain CI's responsibility. Commit/push, then run the required
+  H/codex-review.sh with gpt-6-astra/xhigh and record results in CONTINUE.
+
+Incremental plan review: APPROVED (independent gpt-6-astra/xhigh reviewer).
+
+Incremental local evidence: prepare 28/28, prepared cutover 11/11, recovery 16/16,
+stay 31/31 and rollback 34/34. The two new production regressions fail against
+the unchanged f10e912d7 library and pass against the current library. Cutover
+tests execute the real digest, migration/idle decisions, joint tuple saga,
+compensation and stay functions; host/DB/service/survivor APIs remain private
+fixture adapters. They are not a production soak. Existing concurrency tests
+now use bounded ready/release events instead of fixed sleeps, preserving their
+lock and ordering assertions. The complete cutover fixture has a separate 45s
+bound for real digest/history/fsync IO; it adds no retry.
