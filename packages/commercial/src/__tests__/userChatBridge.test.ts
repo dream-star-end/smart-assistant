@@ -4675,7 +4675,7 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
       const elapsed = (await closedAt) - t0;
       assert.ok(elapsed >= 80, `应等满 drain 窗口,实测 ${elapsed}ms`);
     } finally {
-      delete process.env.OC_DISPATCH_HEADLESS_LIMIT;
+      process.env.OC_DISPATCH_HEADLESS_LIMIT = undefined;
       await stopRig(rig);
     }
   });
