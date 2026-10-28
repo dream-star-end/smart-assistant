@@ -189,21 +189,25 @@ test('if the parent is killed outright (no EXIT trap), the bg build keeps holdin
 // overlap the build; the Box gates (and the load-scaled ccb-mcp gate) still run only after it (OCV5-557).
 test('P2: bg build starts after admission; non-Box gates overlap it; Box gates and ccb-mcp run after await',()=>{
  const b=fn(m,'build_master_release');
- const at=s=>{const i=b.indexOf(s);assert.ok(i>=0,s);assert.equal(b.indexOf(s,i+1),-1,'once: '+s);return i;};
- const admission=at('master_gate_wait_host_idle admission'),start=at('    start_runtime_release_bg "$full_sha"');
+ const at=s=>{const i=b.indexOf(s);assert.ok(i>=0,s);assert.equal(b.indexOf(s,i+1),-1,`once: ${s}`);return i;};
+ const admission=at('master_gate_wait_host_idle admission');
+ const start=at('    start_runtime_release_bg "$full_sha"');
  assert.match(b.slice(start-120,start),/if \[\[ "\$\{MASTER_RUNTIME_BG_AFTER_ADMISSION:-0\}" == 1 \]\]; then\n$/,'only when cmd_deploy opts in');
  assert.ok(admission<start&&start<at('mkdir -p -- "$staging"'),'after admission, before the candidate is built');
- const wait=at('    await_runtime_release_bg\n'),idle=at('master_gate_wait_host_idle box-gates'),db=at('master_gate_db_create "$staging"'),drop=at('  master_gate_db_drop\n');
+ const wait=at('    await_runtime_release_bg\n');
+ const idle=at('master_gate_wait_host_idle box-gates');
+ const db=at('master_gate_db_create "$staging"');
+ const drop=at('  master_gate_db_drop\n');
  assert.ok(wait<idle&&idle<db&&db<drop);
- const marks=[...b.matchAll(/^  tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
+ const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
  const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.ccb-mcp']);
- assert.equal(marks.length,15,'same 15 gates: '+marks.map(x=>x[0]).join(' '));
+ assert.equal(marks.length,15,`same 15 gates: ${marks.map(x=>x[0]).join(' ')}`);
  for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
  // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)
  const boxMark=at('  tsum_mark C.box-success-recovery ');assert.ok(boxMark<wait&&wait-boxMark<400);
  for(const[n,i]of marks){
-  if(after.has(n))assert.ok(i>=boxMark,n+' must run after the runtime build has finished');
-  else assert.ok(i<boxMark,n+' overlaps the runtime build');
+  if(after.has(n))assert.ok(i>=boxMark,`${n} must run after the runtime build has finished`);
+  else assert.ok(i<boxMark,`${n} overlaps the runtime build`);
  }
  // every Box gate and the ccb-mcp gate command is after the await; every DB gate is between create and drop
  for(const g of['check-v5-box-success-recovery.ts','check-v5-box-continuation.ts','check-v5-box-incident-proofs.ts','check-v5-ccb-mcp-availability.ts'])
