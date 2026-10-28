@@ -500,10 +500,6 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       '--disable-slash-commands',
     ]
     if (this.nativeId) args.push('--conversation', this.nativeId)
-    if (ctx.abandoned) {
-      this.cleanupLaunch(ctx)
-      return
-    }
     ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnChild(ctx, { bin: this.cliBin(), args, env, cwd: cwdDecision.cwd, line })
   }
