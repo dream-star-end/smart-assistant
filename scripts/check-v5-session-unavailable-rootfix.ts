@@ -1114,3 +1114,40 @@ await runTapProof({
 console.log(
   '[codex-capacity-retry] PASS — INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE executed at-capacity classify and 3-attempt silent retry on throw and resolved shapes',
 )
+
+// OCV5-655: run real catalog/emitter/switch gates with synthetic runners, no paid turns.
+// Exact leaves prevent a removed engine, filtered test or skipped assertion from passing proof.
+const PRESENTATION_CONTRACT_LEAVES = [
+  'every catalog error has safe Chinese copy, known actions and a valid wire envelope',
+  'display aliases do not modify billing or automatic recovery policy',
+  'HTTP and WS envelopes preserve all legacy fields and never interpolate raw errors',
+  'retry presentation distinguishes queued, accepted, exhausted and unknown legacy limits',
+  'real HTTP error emitter adds public copy without changing guidance or internal identifiers',
+  'bridge rejection keeps routing and retry denial while adding safe catalog metadata',
+  'accepted recovery status uses persisted actual limit and has no prompt or internal request id',
+  ...['ccb', 'codex', 'grok', 'cursor', 'zcode', 'antigravity'].flatMap((from) =>
+    ['ccb', 'codex', 'grok', 'cursor', 'zcode', 'antigravity'].map((to) =>
+      `engine matrix ${from} -> ${to}: isolate state, retain text/image/tool history, no notice flood`)),
+]
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: [
+    'packages/protocol/src/__tests__/userErrorCatalog.test.ts',
+    'packages/commercial/src/__tests__/userErrorPresentation.test.ts',
+    'packages/gateway/src/__tests__/modelSwitchMatrix.test.ts',
+  ],
+  expected: PRESENTATION_CONTRACT_LEAVES,
+  label: 'user-errors-engine-switch',
+  timeoutMs: 120_000,
+})
+console.log('[user-errors-engine-switch] PASS — INC-20261028-ERRORS-ENGINE-SWITCH executed all 43 catalog, emitter and six-engine switch leaves without paid calls')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityAdapter.test.ts'],
+  expected: ['multimodal switch history fits the actual stdin envelope and retains the current text'],
+  namePattern: '^multimodal switch history fits the actual stdin envelope',
+  label: 'multimodal-history-envelope',
+  timeoutMs: 120_000,
+})
+console.log('[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming')

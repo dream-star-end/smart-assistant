@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -1370,7 +1371,7 @@ export class Gateway {
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(body))
+    res.end(JSON.stringify(withUserError(body, code)))
   }
   private sendSessionReadFailure(
     res: ServerResponse,

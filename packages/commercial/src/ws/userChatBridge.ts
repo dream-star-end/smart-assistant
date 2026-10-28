@@ -1,4 +1,7 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
+import { sendErrorFrame } from './userErrorFrames.js';
+import { withUserError } from '@openclaude/protocol';
 import { sendHelloOpenDispatchSnapshot } from "./helloOpenDispatchSnapshot.js";
 import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapshot } from "./containerLink.js";
 import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
@@ -1886,31 +1889,6 @@ function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
 const SESSION_DELETED_WIRE_MESSAGE =
   "This conversation was deleted. Start a new one; retrying here will not bring it back.";
 
-function sendErrorFrame(
-  ws: WebSocket,
-  code: string,
-  message: string,
-  turn?: {
-    peerId?: string | null;
-    clientMessageId?: string | null;
-    retryable?: boolean;
-    action?: string;
-  },
-): void {
-  if (ws.readyState !== WebSocket.OPEN) return;
-  try {
-    ws.send(JSON.stringify({
-      type: "error",
-      code,
-      message,
-      ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
-      ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
-      ...(turn?.retryable === false || turn?.retryable === true ? { retryable: turn.retryable } : {}),
-      ...(turn?.action ? { action: turn.action } : {}),
-    }));
-  }
-  catch { /* client gone */ }
-}
 
 function sendSessionDeletedFrame(
   ws: WebSocket,
@@ -4676,6 +4654,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   broadcastToUser(uid, {
                     type: "outbound.ack",
                     admitted: true,
+                    retryStatus: recoveryJobStatus(recoveryJob, "scheduled"),
                     ...(idempotencyKey ? { idempotencyKey } : {}),
                     peer: { id: peerId, kind: "dm" },
                     clientMessageId,
@@ -8363,6 +8342,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     dispatchId: rec.dispatchId,
                     dispatchAttemptNo: rec.attemptNo,
                     expectedDispatchLeaseEpoch: rec.leaseEpoch,
+                  }).then((accepted) => {
+                    if (accepted) broadcastToUser(uid, recoveryRunningFrame(rec.recoveryJob!));
                   }).catch(() => {});
                   dropAdmittedDispatch(rec.clientMessageId);
                 } else {
@@ -8580,7 +8561,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
+        masterOnlyFrameType === "sys.recovery_status" || masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
         // OCV5-591 A2-1c-2: studio activity is master-authored only.
         masterOnlyFrameType === "sys.studio_event"
       ) {
@@ -10506,7 +10487,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     }
     if (!set || set.size === 0) return 0;
     let text: string;
-    try { text = JSON.stringify(payload); }
+    try { text = JSON.stringify(withUserError(payload)); }
     catch (err) {
       log?.warn("user-chat-bridge: broadcastToUser stringify failed", {
         uid: uid.toString(), err,

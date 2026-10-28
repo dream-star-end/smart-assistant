@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * Gateway WebSocket connection: connection lifecycle, hello auto-resume, stop, delivery and stamped/status frames
  *
@@ -227,7 +228,7 @@ export function handleWsConnection(
       try {
         frame = JSON.parse(raw.toString()) as InboundFrame
       } catch {
-        ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
+        ws.send(JSON.stringify(withUserError({ type: 'error', error: 'invalid json' })))
         return
       }
       // Client-side application-level ping. Echo a pong (preserving the
@@ -735,7 +736,7 @@ export function handleWsConnection(
         if (!sessionKey) return
         const session = this.sessions.getByKey(sessionKey)
         if (!session) {
-          ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
+          ws.send(JSON.stringify(withUserError({ type: 'error', error: 'session not found' })))
           return
         }
         this.log.info('compact session', { sessionKey })
@@ -776,14 +777,14 @@ export function handleWsConnection(
         } catch (err: any) {
           // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
           this.log.error('compact session failed', { sessionKey }, err)
-          ws.send(JSON.stringify({ type: 'error', error: '上下文压缩失败，请稍后重试' }))
+          ws.send(JSON.stringify(withUserError({ type: 'error', error: '上下文压缩失败，请稍后重试' })))
         }
       }
     } catch (err: any) {
       this.log.error('ws-message unhandled error', undefined, err)
       try {
         // E5 — 同上:err.message 可能含内部路径/栈,只回受控文案。
-        ws.send(JSON.stringify({ type: 'error', error: '服务内部错误，请稍后重试' }))
+        ws.send(JSON.stringify(withUserError({ type: 'error', error: '服务内部错误，请稍后重试' })))
       } catch {
         /* ws may already be closed */
       }
@@ -1444,7 +1445,8 @@ export function deliver(
   // (rather than only `_userId`)means CG7 doesn't have to revisit this
   // strip site every time it adds a new private field. Keeping stripped
   // values locally lets WS branch still route per-user.
-  const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+  const { wire: strippedWire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+  const wire = withUserError(strippedWire)
   if (wire.type === 'outbound.message' || wire.type === 'outbound.error') {
     const sessionKey =
       typeof (wire as { sessionKey?: unknown }).sessionKey === 'string'

@@ -40,4 +40,14 @@ describe('historical context JSON prompt', () => {
     assert.equal(fitHistoricalContextJsonPrompt('plain message', () => false), null)
     assert.deepEqual(fitHistoricalContextJsonPrompt('plain message', () => true), { prompt: 'plain message', dropped: 0 })
   })
+
+  test('fits prepended history without dropping or truncating the following current blocks', () => {
+    const tail = '\n\nquestion about the attached file\n\n[image: /uploads/picture.png]'
+    const prompt = renderHistoricalContextJsonPrompt(rows, '') + tail
+    const expected = renderHistoricalContextJsonPrompt(rows.slice(2), '') + tail
+    const fitted = fitHistoricalContextJsonPrompt(prompt, (c) => Buffer.byteLength(c) <= Buffer.byteLength(expected))
+    assert.deepEqual(fitted, { prompt: expected, dropped: 2 })
+    assert.deepEqual(fitHistoricalContextJsonPrompt(prompt, (c) => c === tail), { prompt: tail, dropped: rows.length })
+    assert.equal(fitHistoricalContextJsonPrompt(prompt, () => false), null)
+  })
 })

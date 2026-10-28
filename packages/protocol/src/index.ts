@@ -29,6 +29,7 @@ export * from './chatgptProxy.js'
 export * from './internalRoutes.js'
 export * from './toolFailureAudit.js'
 export * from './turnErrorTaxonomy.js'
+export * from './userErrorCatalog.js'
 export * from './marketplaceArtifact.js'
 export * from './activeContent.js'
 export * from './modelHistory.js'
@@ -76,3 +77,4 @@ export {
 } from './boxGptWebModels.js'
 
 export * from './ccbTranscriptRestore.js'
+export * from './automaticRetryStatus.js'

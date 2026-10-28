@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * Project memory REST: list / create / promote / reject / deprecate.
  * Promote/reject/deprecate require resolveTaskboardActor === 'human'.
@@ -19,7 +20,7 @@ import { getProject, getProjectByKey } from './db/projects.js'
 
 function sendJson(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
+  res.end(JSON.stringify(withUserError(body, code)))
 }
 
 function sendError(
