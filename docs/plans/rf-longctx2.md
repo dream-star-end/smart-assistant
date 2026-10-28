@@ -1,6 +1,6 @@
 # Ordinary CCB request bytes and attachment references (W2 slice 2)
 
-Depends on #1201 (`d4138dbe2`); personal branch only. No Box context/journal or billing changes; no deployment performed.
+Includes the now-merged #1201 foundation; rebased onto personal tip `2689942a2`. Personal branch only. No Box context/journal or billing changes; no deployment performed.
 
 ## Evidence and cause
 
@@ -17,7 +17,7 @@ Read-only selfhost evidence, collected 2026-10-28 UTC:
 
 `services/api/client.ts` wraps the SDK fetch after serialization. Enabled for platform sessions (`OPENCLAUDE_SESSION_KEY`) using the first-party Anthropic-shaped transport: ordinary OAuth/static-key routes, including static providers proxied by the platform. It covers streaming, non-stream fallback and compact/auxiliary calls using that client. Direct OpenAI/Gemini/Grok adapters, standalone CCB without a platform session and every exact Box native model retain their existing paths. Box is bypassed before byte events, mutation and IO; its transport/journal owners are untouched.
 
-The fitter evaluates actual UTF-8 JSON body and field bytes, plus message/media counts. Old large image/PDF blocks become complete binary workspace file references, including nested tool-result media. Fresh attachments remain inline when they fit; a current attachment/text/tool result that alone exhausts the envelope can be referenced intact. Tool IDs, error flags, active tool pairs and thinking signatures are preserved. If old conversation text/count alone is too large, the complete old-turn prefix is saved as JSONL and referenced; the current user turn and active tool chain stay together. Native transcript and master history are never overwritten. This is deferred access to exact source data, **not a model-generated semantic summary or a guarantee that the model reads every file**.
+The fitter evaluates actual UTF-8 JSON body and field bytes, plus the media count. Old large image/PDF blocks become complete binary workspace file references, including nested tool-result media. If the request still exceeds its budget after old media is referenced, the complete old-turn prefix is saved as JSONL before considering current attachments. The archive note becomes a text block in the retained current user message, keeping the existing role sequence and active tool chain together. Fresh attachments remain inline when this retained turn fits; a current attachment/text/tool result that still exhausts the envelope can be referenced intact. Tool IDs, error flags, active tool pairs and thinking signatures are preserved. There is no separate message-count cutoff: 2201 short messages totaling 90,227 bytes pass through unchanged. Native transcript and master history are never overwritten. This is deferred access to exact source data, **not a model-generated semantic summary or a guarantee that the model reads every file**.
 
 The old 100-media filter is bypassed only for ordinary platform first-party requests with Read available, so it cannot silently remove media before the file fitter sees it. The fitter preserves the same 100-item limit by references instead. No server limit is raised.
 

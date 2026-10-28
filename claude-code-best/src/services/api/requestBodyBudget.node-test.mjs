@@ -18,6 +18,11 @@ const media = (data, mime) => ({ type: mime === 'application/pdf' ? 'document' :
 const payload = messages => ({ model: 'claude-sonnet-4-5', tools, messages, stream: true, max_tokens: 1000 })
 const allText = messages => messages.flatMap(m => typeof m.content === 'string' ? [m.content] : m.content.flatMap(b => b.type === 'text' ? [b.text] : b.type === 'tool_result' ? (typeof b.content === 'string' ? [b.content] : b.content.filter(c => c.type === 'text').map(c => c.text)) : []))
 const paths = messages => allText(messages).flatMap(t => [...t.matchAll(/workspace file ("[^"\n]+") \(/g)].map(m => JSON.parse(m[1])))
+function assertAlternatingRoles(messages) {
+  for (let i = 1; i < messages.length; i++) {
+    assert.notEqual(messages[i].role, messages[i - 1].role, `adjacent messages ${i - 1}/${i} must alternate roles`)
+  }
+}
 function assertFits(raw) {
   const body = JSON.parse(raw)
   assert.ok(Buffer.byteLength(raw) < CCB_REQUEST_BYTE_LIMITS.body)
@@ -106,20 +111,72 @@ test('long text history archives complete turns and preserves the exact active t
   const history = Array.from({ length: 100 }, (_, i) => [user(`decision${i}:${'中文\n"😀'.repeat(8000)}`), assistant('acknowledged')]).flat()
   const current = [user('continue from the early decisions'), assistant([{ type: 'tool_use', id: 'pending', name: 'Read', input: { file_path: 'current' } }]), user([{ type: 'tool_result', tool_use_id: 'pending', content: 'small current result' }])]
   const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload([...history, ...current])), h.opts))
-  assert.deepEqual(wire.messages.slice(1), current)
+  assertAlternatingRoles(wire.messages)
+  assert.equal(wire.messages.length, current.length)
+  assert.deepEqual(wire.messages[0].content.slice(1), [text(current[0].content)])
+  assert.deepEqual(wire.messages.slice(1), current.slice(1))
   const file = paths(wire.messages)[0]
   assert.deepEqual((await readFile(file, 'utf8')).split('\n').map(line => JSON.parse(line)), history)
 })
 
-test('thousands of small turns remain bounded without dropping original messages', async t => {
+test('2201 short messages stay byte-identical without observations or file IO', async t => {
   const h = await harness(t)
   const history = Array.from({ length: 1100 }, (_, i) => [user(`remember ${i}`), assistant(`ack ${i}`)]).flat()
   const current = user('recall 0 and 1099')
-  const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload([...history, current])), h.opts))
-  assert.equal(wire.messages.length, 2)
-  assert.deepEqual(wire.messages[1], current)
-  assert.deepEqual((await readFile(paths(wire.messages)[0], 'utf8')).split('\n').map(line => JSON.parse(line)), history)
+  const body = payload([...history, current])
+  assert.equal(Buffer.byteLength(JSON.stringify(body.messages)), 90_227)
+  const raw = JSON.stringify(body)
+  const result = await prepareCcbRequestBody(raw, h.opts)
+  const wire = assertFits(result)
+  assertAlternatingRoles(wire.messages)
+  assert.equal(result, raw)
+  assert.equal(wire.messages.length, 2201)
+  assert.deepEqual(h.events, [])
+  assert.deepEqual(await readdir(h.cwd), [])
 })
+
+for (const mime of ['image/png', 'application/pdf']) {
+  test(`archives 3 million CJK characters before considering the current 50KB ${mime}`, async t => {
+    const h = await harness(t)
+    const history = [user('中'.repeat(3_000_000)), assistant('remembered')]
+    const current = user([text('analyze this attachment'), media(Buffer.alloc(50_000, 9), mime)])
+    const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload([...history, current])), h.opts))
+    const attachment = wire.messages.at(-1).content.at(-1)
+    assert.equal(attachment.type, current.content[1].type, 'current media must remain inline after history fits')
+    assert.deepEqual(attachment, current.content[1])
+    assertAlternatingRoles(wire.messages)
+    assert.equal(wire.messages.length, 1)
+    assert.deepEqual(wire.messages[0].content.slice(1), current.content)
+    const files = paths(wire.messages)
+    assert.equal(files.length, 1, 'only historical conversation needs a reference')
+    assert.deepEqual((await readFile(files[0], 'utf8')).split('\n').map(line => JSON.parse(line)), history)
+    assert.deepEqual(h.events.map(e => e.kind), ['context_pressure', 'context_compacted'])
+  })
+}
+
+for (const kind of ['pdf', 'text', 'tool_result']) {
+  test(`retained oversized ${kind} still fits after archive without losing the history reference`, async t => {
+    const h = await harness(t)
+    const history = [user('earlier decision'), assistant('acknowledged')]
+    const original = kind === 'pdf' ? Buffer.alloc(7 * MIB, 7) : 'x'.repeat(9 * MIB)
+    const current = kind === 'pdf' ? [user([media(original, 'application/pdf')])] : kind === 'text' ? [user(original)] : [
+      user('run'), assistant([{ type: 'tool_use', id: 'active', name: 'Bash', input: {} }]),
+      user([{ type: 'tool_result', tool_use_id: 'active', content: original, is_error: true }]),
+    ]
+    const wire = assertFits(await prepareCcbRequestBody(JSON.stringify(payload([...history, ...current])), h.opts))
+    assertAlternatingRoles(wire.messages)
+    assert.equal(wire.messages.length, current.length)
+    const files = paths(wire.messages)
+    assert.equal(files.length, 2, 'history note must survive current-content replacement')
+    assert.deepEqual((await readFile(files[0], 'utf8')).split('\n').map(line => JSON.parse(line)), history)
+    assert.deepEqual(await readFile(files[1]), Buffer.from(original))
+    if (kind === 'tool_result') {
+      assert.deepEqual(wire.messages[1], current[1])
+      assert.equal(wire.messages[2].content[0].tool_use_id, 'active')
+      assert.equal(wire.messages[2].content[0].is_error, true)
+    }
+  })
+}
 
 test('single oversized current PDF and tool output use complete file references', async t => {
   const h = await harness(t)

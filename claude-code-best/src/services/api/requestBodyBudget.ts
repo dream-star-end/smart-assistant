@@ -12,7 +12,6 @@ export const CCB_REQUEST_BYTE_LIMITS = {
   tools: 2 * 1024 * 1024,
 } as const
 const OLD_ATTACHMENT_BYTES = 256 * 1024
-const MAX_MESSAGES = 2000
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8')
 type Json = Record<string, unknown>
 const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v)
@@ -86,7 +85,7 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
     messageBytes / CCB_REQUEST_BYTE_LIMITS.messages, fixedRatio)
   const pressure = contextBytePressure('claude-code', 'native_context', ratio())
   if (pressure) opts.onEvent(pressure)
-  const fits = () => ratio() < 1 && messages.length <= MAX_MESSAGES && mediaCount <= 100
+  const fits = () => ratio() < 1 && mediaCount <= 100
   opts.signal?.throwIfAborted()
   // Tool-less compact/auxiliary calls cannot resolve file references. Preserve
   // their original contents; an impossible envelope is rejected before fetch.
@@ -137,11 +136,15 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
       }
     }
   }
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i]!
-    if (Array.isArray(m.content)) visit(m.content, i)
-    else replaceText(m, 'content', i)
+  const collectCandidates = () => {
+    candidates.length = 0
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i]!
+      if (Array.isArray(m.content)) visit(m.content, i)
+      else replaceText(m, 'content', i)
+    }
   }
+  collectCandidates()
   let changed = false
   const apply = async (candidate: Candidate) => {
     opts.signal?.throwIfAborted()
@@ -163,7 +166,7 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
       used.add(c)
     }
   }
-  for (const c of candidates.filter(c => c.media)) {
+  for (const c of candidates.filter(c => c.media && c.index < latestUser)) {
     if (fits()) break
     if (!used.has(c)) { await apply(c); used.add(c) }
   }
@@ -174,12 +177,25 @@ export async function prepareCcbRequestBody(raw: string, opts: Options): Promise
     const history = (JSON.parse(raw) as { messages: Json[] }).messages.slice(0, latestUser)
     const content = history.map(m => JSON.stringify(m)).join('\n')
     const note = await textReference(opts, content, 'jsonl', 'earlier conversation (one original message per JSON line)')
-    messages = [{ role: 'user', content: note }, ...messages.slice(latestUser)]
+    messages = messages.slice(latestUser)
+    const current = messages[0]!
+    current.content = [{ type: 'text', text: note }, ...(Array.isArray(current.content)
+      ? current.content : [{ type: 'text', text: current.content }])]
     body.messages = messages
     mediaCount = countMedia(messages)
     bodyBytes = bytes(body)
     messageBytes = bytes(messages)
     changed = true
+    // The retained user may now have blocks instead of a string. Rebuild both
+    // indices and replacement targets so later fitting preserves the note.
+    latestUser = 0
+    collectCandidates()
+  }
+  // Only reference current media if the request still cannot fit after history
+  // archival; otherwise retain the exact media blocks for this model call.
+  for (const c of candidates.filter(c => c.media && c.index >= latestUser)) {
+    if (fits()) break
+    await apply(c)
   }
   // Single oversized current text/tool output can also be read in chunks.
   // Candidate targets still point into the retained current turn after archive.
