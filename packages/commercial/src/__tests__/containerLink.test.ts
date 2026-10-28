@@ -19,7 +19,7 @@ class Transport extends EventEmitter {
   terminate(): void { this.readyState = WebSocket.CLOSED; this.emit("close"); }
   push(frame: unknown): void { this.emit("message", Buffer.from(JSON.stringify(frame)), false); }
 }
-const pool = { query: async () => ({ rows: [], rowCount: 0 }) } as Queryable;
+const pool = { query: async () => ({ rows: [], rowCount: 0 }) } as unknown as Queryable;
 const wire = (value: unknown): Buffer => Buffer.from(JSON.stringify(value));
 
 test("RF-link: concurrent dial is singleflight; attestation, grants, billing, receipt each reach correct consumer", async () => {
@@ -75,6 +75,49 @@ test("RF-link: two tabs with the same ping id receive only their own restored po
     assert.deepEqual(gotB, [{type: "pong", id: "collision"}]);
     physical.push({type: "pong", id: physical.sent[0]!.id});
     assert.deepEqual(gotA, [{type: "pong", id: "collision"}]);
+  } finally { await registry.shutdown(); }
+});
+
+test("RF-link: model switch control response returns to its requesting tab", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  try {
+    const a = await registry.connect(1n, 1, () => physical as unknown as WebSocket);
+    const b = await registry.connect(1n, 1, () => { throw new Error("must attach"); });
+    const gotA: unknown[] = [], gotB: unknown[] = [];
+    a.on("message", (data) => gotA.push(JSON.parse(String(data))));
+    b.on("message", (data) => gotB.push(JSON.parse(String(data))));
+    getContainerLinkHandle(a)!.activate(); getContainerLinkHandle(b)!.activate();
+    const sessionKey = "agent:main:webchat:dm:session-b";
+    b.send(wire({type: "control.session.prepare_model_switch", requestId: "switch-b", sessionKey}));
+    const response = {type: "outbound.model_switch.prepared", requestId: "switch-b", sessionKey, status: "completed"};
+    physical.push(response);
+    assert.deepEqual(gotA, []);
+    assert.deepEqual(gotB, [response]);
+    const sessionResponse = {type: "outbound.control", sessionKey};
+    physical.push(sessionResponse);
+    assert.deepEqual(gotA, []);
+    assert.deepEqual(gotB, [response, sessionResponse]);
+  } finally { await registry.shutdown(); }
+});
+
+test("RF-link: every bridge receives transport error before close, including reentrant cleanup", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  try {
+    const sockets = await Promise.all([1, 2].map(() => registry.connect(1n, 1, () => physical as unknown as WebSocket)));
+    const events = sockets.map(() => [] as string[]);
+    for (const [i, socket] of sockets.entries()) {
+      socket.on("error", (error) => {
+        events[i]!.push(error.message);
+        socket.terminate(); // userChatBridge cleanup releases its own handle
+      });
+      socket.on("close", () => events[i]!.push("close"));
+      getContainerLinkHandle(socket)!.activate();
+    }
+    physical.emit("error", new Error("transport error"));
+    assert.deepEqual(events, [["transport error", "close"], ["transport error", "close"]]);
+    assert.deepEqual(registry.snapshots(), []);
   } finally { await registry.shutdown(); }
 });
 

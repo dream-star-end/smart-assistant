@@ -130,7 +130,7 @@ class ContainerLink {
       ws.on("message", (data, binary) => this.receive(data, binary));
       ws.on("error", (err) => {
         this.registry.log?.warn?.("container-link: transport error", { uid: String(uid), containerId, err });
-        this.stop();
+        this.stop(err);
       });
       ws.on("close", () => this.stop());
       this.timer = setInterval(() => { void this.tick(); }, registry.heartbeatMs);
@@ -163,6 +163,8 @@ class ContainerLink {
   }
   send(handle: ContainerLinkHandle, data: RawData, opts?: { binary?: boolean }, cb?: (err?: Error) => void): void {
     const frame = parse(data, opts?.binary === true);
+    if (typeof frame?.requestId === "string") this.routes.set(`request:${frame.requestId}`, handle);
+    if (typeof frame?.sessionKey === "string") this.sessions.set(frame.sessionKey, handle);
     if (frame?.type === "ping") {
       const wireId = `container-link:${++this.pingSeq}`;
       handle.pendingPing = { wireId, originalId: frame.id };
@@ -174,7 +176,6 @@ class ContainerLink {
         this.sessions.set(session, handle);
         if (typeof cmid === "string") handle.noteStream(session, cmid);
       }
-      if (typeof frame.requestId === "string") this.routes.set(`request:${frame.requestId}`, handle);
       const grantId = frame.__oc_prompt_queue_grant?.grantId;
       if (typeof grantId === "string") this.routes.set(`grant:${grantId}`, handle);
     } else if (frame?.type === "inbound.hello" && Array.isArray(frame.peers)) {
@@ -197,8 +198,9 @@ class ContainerLink {
     }
     if (frame?.type === "pong") {
       for (const handle of this.consumers) {
-        if (handle.pendingPing?.wireId !== frame.id) continue;
-        const { originalId } = handle.pendingPing;
+        const pending = handle.pendingPing;
+        if (!pending || pending.wireId !== frame.id) continue;
+        const { originalId } = pending;
         handle.pendingPing = null;
         const restored = { ...frame };
         if (originalId === undefined) delete restored.id;
@@ -208,7 +210,7 @@ class ContainerLink {
       }
       return;
     }
-    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.peer?.id;
+    const session = frame?.peer?.id ?? frame?.sessionId ?? frame?.owner?.peer?.id ?? frame?.sessionKey;
     const cmid = frame?.clientMessageId;
     let owner = typeof frame?.grantId === "string" ? this.routes.get(`grant:${frame.grantId}`) : undefined;
     owner ??= typeof frame?.dispatchId === "string" ? this.routes.get(`dispatch:${frame.dispatchId}:${frame.attemptNo}`) : undefined;
@@ -281,11 +283,18 @@ class ContainerLink {
     handle.emit("close", 1000, Buffer.from("container link detached"));
     if (this.consumers.size === 0) this.stop();
   }
-  stop(): void {
+  stop(error?: Error): void {
     if (this.stopping) return;
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.abort.abort();
+    // Preserve error-before-close: bridge cleanup keeps live Grok route leases
+    // on transport errors, whereas an explicit container close is terminal.
+    if (error) {
+      for (const handle of [...this.consumers]) {
+        if (handle.listenerCount("error") > 0) handle.emit("error", error);
+      }
+    }
     this.ws?.terminate();
     for (const handle of [...this.consumers]) this.release(handle);
     this.registry.remove(this);

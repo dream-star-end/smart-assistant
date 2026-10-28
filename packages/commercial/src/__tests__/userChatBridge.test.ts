@@ -713,8 +713,6 @@ describe("userChatBridge — durable outbound frame ordering", () => {
 
   test("a permanent live-frame conflict skips one frame without closing or poisoning later seqs", async () => {
     const persisted: number[] = [];
-    const renewals: unknown[][] = [];
-    row.agent_container_id = "77";
     const portRef = { value: 0 };
     const rig = await startRig({
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 83 }),
@@ -4547,6 +4545,8 @@ describe("RF-link singleton transport for open dispatch streams", () => {
 
   async function linkRig(row: Record<string, unknown>) {
     const persisted: number[] = [];
+    const renewals: unknown[][] = [];
+    row.agent_container_id = "77";
     const portRef = { value: 0 };
     const rig = await startRig({
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
