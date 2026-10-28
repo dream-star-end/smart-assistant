@@ -492,6 +492,22 @@ describe("sealed failure tape skips BOX_REPLAY_PENDING soft copy", () => {
     expect(p.waived).toBe(false);
   });
 
+  test("sealed crash preserves Markdown before a directly appended API error", () => {
+    const markdown = [
+      "可以压，已经压好了。",
+      "",
+      "```ui",
+      "{\"type\":\"next\",\"text\":\"插入后是第3章，帮我改一下章号\"}",
+      "```",
+    ].join("\n");
+    const apiError = `${detail.slice(0, -1)},\"request_id\":\"bc37bc74b82fa8b7606a18461cdd7fa4\"}`;
+    const p = errorPresentation("ENGINE_ERROR", `${markdown}${apiError}`, detail, false, sealed);
+    expect(p.title).toBe("任务执行失败");
+    expect(p.bodyText).toBe(markdown);
+    expect(p.bodyText).not.toContain("API Error: 409");
+    expect(p.detail).toBe("请求 ID：bc37bc74b82fa8b7606a18461cdd7fa4");
+  });
+
   test("executed_error, not_accepted, and mixed-case crashed also skip the soft card", () => {
     for (const dispatchOutcome of ["executed_error", "not_accepted", "CRASHED"]) {
       const p = errorPresentation("ENGINE_ERROR", partial, detail, false, {
