@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   type LiveFrameInput,
+  type SessionSnapshot,
   type LiveUnitState,
   type LiveUnitsPage,
   type ReduceLiveFramesOptions,
@@ -149,6 +150,7 @@ export interface ClientSessionLiveFrame {
 }
 
 export interface ClientSessionLiveFramePage {
+  snapshot?: SessionSnapshot | null;
   frames: ClientSessionLiveFrame[];
   nextCursor: string | null;
   hasMore: boolean;
@@ -163,6 +165,7 @@ export interface ClientSessionLiveFramePage {
 export type ReadClientSessionLiveFramesOptions = {
   /** Opt-in last-page read. after=0 still pages forward unless this is set. */
   seekTail?: boolean;
+  readSnapshot?: (client: PoolClient) => Promise<SessionSnapshot | null>;
 };
 
 /** Hot GET live-frames only reads live streams of in-flight dispatches. */
@@ -797,6 +800,7 @@ export async function readClientSessionLiveFrames(
       // 客户端据此识别"两次水合之间发生的 live→tape 切换"(含断连期间完成的
       // turn),一次性布尔标记对那种场景是盲的(codex 审计 blocker)。
       tapeProjectionVersion,
+      ...(options?.readSnapshot ? { snapshot: await options.readSnapshot(client) } : {}),
     };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 }
