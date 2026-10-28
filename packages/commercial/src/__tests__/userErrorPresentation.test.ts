@@ -45,7 +45,7 @@ test('accepted recovery status uses persisted actual limit and has no prompt or 
   assert.equal(frame.peer.id, 's');
   assert.ok(Value.Check(SysRecoveryStatus, frame));
   assert.doesNotMatch(JSON.stringify(frame), /PRIVATE PROMPT/);
-  delete job.request._automaticRecoveryRetryLimit;
+  Reflect.deleteProperty(job.request, '_automaticRecoveryRetryLimit');
   assert.equal(recoveryRunningFrame(job).retryStatus.maxAttempts, undefined);
 });
 

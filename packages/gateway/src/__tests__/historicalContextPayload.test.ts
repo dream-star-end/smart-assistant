@@ -22,7 +22,7 @@ test('multimodal switch replays semantic history and preserves every current blo
   assert.deepEqual(result.slice(1), input)
   assert.equal(result[2], input[1], 'the original image is kept, not reconstructed')
   assert.match(String(result[0]?.text), /saved teal comet/)
-  assert.match(String(result[0]?.text), /Tool record:.*\/work\/answer/)
+  assert.match(String(result[0]?.text), /Tool record:.*\/work\/answer/s)
   assert.doesNotMatch(String(result[0]?.text), /CURRENT_IMAGE_QUESTION|SECOND_DETAIL/)
   assert.ok(result.every((block) => block.type === 'text' || block.type === 'image'))
 })

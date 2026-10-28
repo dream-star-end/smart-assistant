@@ -154,6 +154,14 @@ jobs:
             "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
             npm run test:commercial:unit:gate
 
+      - name: Automatic recovery presentation (targeted PG)
+        shell: bash
+        run: |
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 npx --no-install tsx --test --test-name-pattern="finalize schedules completed-error checkpoint|OCV5-317 finalize|OCV5-322 empty|silent liveness recovery" packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts' | tee recovery-presentation.tap
+          # All five selected cases must execute against this job's private service DB.
+          grep -qx '# pass 5' recovery-presentation.tap
+          grep -qx '# fail 0' recovery-presentation.tap
+
       - name: Prove committed system action receipts in private PG schema
         id: system_pg_receipts
         shell: bash
