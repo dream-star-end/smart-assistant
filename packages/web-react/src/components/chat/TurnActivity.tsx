@@ -17,7 +17,7 @@ import {
   type RecoveryStatusState,
   type TurnStatusState,
 } from "../../lib/chat/model";
-import { computeTypingLabel, MODEL_THINKING_WORKING_DETAIL } from "../../lib/chat/pure";
+import { type ChatStatusClass, computeTypingLabel, MODEL_THINKING_WORKING_DETAIL } from "../../lib/chat/pure";
 import type { DispatchStatus } from "../../lib/chat/socket";
 import { cn } from "../../lib/utils";
 
@@ -33,6 +33,10 @@ export type TurnActivityInfo = {
   startedAt: number | null;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
   lastFrameAt?: number;
+  /** Chat transport state (chat.status.cls); "connected" when absent. */
+  transport?: ChatStatusClass;
+  /** Hello snapshot marked this turn detached and no newer frame has arrived. */
+  detached?: boolean;
   /** Cursor keepalive working-detail；展示前会收成中文动作标签，卡住时由 silenceMs 盖过。 */
   progressHint?: string;
   /** This turn already has plated assistant text. Footer must not say 「思考中」. */
@@ -152,6 +156,8 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       secs,
       silenceMs,
       turnStatus: info.turnStatus,
+      transport: info.transport,
+      detached: info.detached,
     }));
   } else if (info.turnStatus === "compacting") {
     // 压缩上下文（即便团队模式）：computeTypingLabel 产出「正在压缩上下文 (Xs)」。
@@ -172,6 +178,8 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
       progressHint: info.progressHint,
       kitchenStickyHint: kitchenStickyRef.current,
       hasPlated: info.hasPlated === true,
+      transport: info.transport,
+      detached: info.detached,
     }));
   }
 
@@ -205,7 +213,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
 }
 
 /** 文案里每秒变化的经过秒数段,形如 ` (12s)` / ` (40s · 35s 无新数据)`(computeTypingLabel 产出)。 */
-const ELAPSED_RE = /\s*\(\d+s(?:\s*·\s*\d+s 无新数据)?\)/g;
+const ELAPSED_RE = /\s*\((?:已发送 )?\d+(?:s| 分钟)(?:\s*·\s*\d+s 无新数据)?\)/g;
 
 export type ActivityTextSegment = { text: string; elapsed: boolean };
 

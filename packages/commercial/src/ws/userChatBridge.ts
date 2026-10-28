@@ -1,4 +1,5 @@
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
+import { sendHelloOpenDispatchSnapshot } from "./helloOpenDispatchSnapshot.js";
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
@@ -5646,7 +5647,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       sessionId: peerId,
                       clientMessageId,
                     });
-                    if (row === null || row.status !== "terminal") continue;
+                    if (row === null) continue;
+                    if (await sendHelloOpenDispatchSnapshot(pgPool, userWs, row, { uid: uidStr, peerId, clientMessageId }, bridgeLog)) continue;
+                    if (row.status !== "terminal") continue;
                     let reconcile: "turn_completed" | "interrupted" | null = null;
                     if (row.outcome === "completed") {
                       reconcile = "turn_completed";

@@ -8427,6 +8427,51 @@
           "assertion": "'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot"
         }
       ]
+    },
+    {
+      "id": "INC-20261028-STALE-ENGINE-STARTING",
+      "occurredAt": "2026-10-28",
+      "severity": "P2",
+      "symptom": "商业（2026-10-28）：uid 4 会话 webmvrwwrwvsh1rvi 用 k3.1-pro 发「请再核实一下」后手机 10 秒即断线切后台，引擎 19 秒已就绪、回合在后台持续跑（>30 分钟联网核查），切回时活动行仍显示「全能助手 正在启动引擎 (1184s)…」，用户以为启动卡死。根因：①bridge 在最后一个浏览器断开 60s drain 后关容器 WS，断线期间帧不落库也无法回放，startup 清态帧丢失；②computeTypingLabel 的 engine_* 分支在任何静默判断之前返回；③hello 不给 open dispatch 下发权威阶段，容器 hello 补发也跳过 null。",
+      "rootFixCommit": "6edf026e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T74 stale engine starting after resume shows an honest label; detached snapshot then live frame"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/pure.test.ts",
+          "assertion": "transport down + stale → 连接已断开,计时按已发送分钟"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
+          "assertion": "INC-20261028-STALE-ENGINE-STARTING: 切回时启动态已过期 → 不显示正在启动引擎 (1184s)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261028-STALE-ENGINE-STARTING: hello detached 快照记录时刻并补起算点"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "hello + inFlight + accepted + 已落库就绪证据(thinking) → turn_status null + detached"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+          "assertion": "hello + inFlight + accepted + 只有启动帧 → engine_starting + since + detached"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/helloTurnStatusResend.test.ts",
+          "assertion": "running turn past startup (phase null) re-sends status:null"
+        }
+      ]
     }
   ]
 }
