@@ -252,7 +252,9 @@ export class BoxRemoteCleanupWorker {
       const result = await Promise.race([
         target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd,
           candidate.leaseEpoch),
-          { timeoutMs: 10_000, maxResponseBytes: 256 }),
+          // OCV5-649: the transport refuses a cap below 1024 before sending;
+          // 256 made every look fail locally, so no run was ever closed here.
+          { timeoutMs: 10_000, maxResponseBytes: 1024 }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("BOX_RUN_LIVENESS_TIMEOUT")), 10_500);
         }),
