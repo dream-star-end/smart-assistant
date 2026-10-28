@@ -357,6 +357,16 @@ export function useChatSocket(opts: {
         return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
+      readSessionSnapshot: async (sessId, query) => {
+        const a = authRef.current;
+        if (!a) throw new Error("signed out");
+        const { limit, ...snapshot } = query;
+        return (await api.getSessionLiveFrames(a, sessId, "0", limit ?? 200, { snapshot })).snapshot;
+      },
+      readLiveFramePayload: (sessId, ref) => {
+        const a = authRef.current;
+        return a ? api.getLiveFramePayload(a, sessId, ref) : Promise.reject(new Error("signed out"));
+      },
       lookupPermissionPrompts: (sessId, requestIds) => {
         const now = Date.now();
         const last = permissionLookupAtRef.current.get(sessId) ?? 0;

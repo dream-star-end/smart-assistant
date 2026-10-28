@@ -125,11 +125,6 @@ export type FrameEffects = {
    */
   deferTapeCommitFinal?: (sessId: string, frame: OutboundMessageWire) => boolean;
   /**
-   * reconcile 'turn_state_unknown'(RFC §4):server 无法判定在飞 turn 终态。**绝不清发送态**,
-   * 由 socket 把该会话 thinking-safety 定时降至 60s(默认 10min),尽快复检服务端权威态。
-   */
-  onTurnStateUnknown?: (sessId: string) => void;
-  /**
    * 立即把会话快照落 IndexedDB（断点续传游标 durable）。resume_failed 推进游标后必须
    * 同步落地：否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环。
    * turn 收尾（isFinal）也落一次保证 reload 不丢已完成轮。
@@ -1608,9 +1603,8 @@ export function applyOutboundMessage(
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
   // negative proof)。此时**绝不清 _sendingInFlight** —— turn 可能仍在服务端执行,静默清态正是
-  // 本 RFC 要根治的丢 turn 症状。改为:① 立即 REST 全量对账拉回权威态
-  // (含 durable dispatch 状态行);② 请 socket 把 thinking-safety 定时降至 60s(默认
-  // 10min),尽快让用户看到真实终态或经核验的错误状态。
+  // 本 RFC 要根治的丢 turn 症状。改为立即对账拉回权威态(含 durable dispatch 状态行);
+  // 随 hello 下发的会话快照同样给出该回合的权威状态。
   // markFrameReceived 计活(server 确在应答),但不触碰 turn 生命周期。到达此处已过 cross-turn
   // 守卫:frame.clientMessageId 要么命中 active、要么本地无 active/legacy 无 id,均安全放行。
   if (!frame.isFinal && frame.meta?.reconcile === "turn_state_unknown") {
@@ -1618,7 +1612,6 @@ export function applyOutboundMessage(
     const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
     else effects.forceSync?.(sess.id);
-    effects.onTurnStateUnknown?.(sess.id);
     return;
   }
 
@@ -1713,15 +1706,12 @@ export function applyOutboundMessage(
     // live 尾巴之前到达。此处若立即收口,resetReplyTracker 把截止戳定在本帧 server ts,随后到达的
     // 尾巴帧(ts 更早)全被 stale 守卫丢弃 → 本轮显示「已完成」但正文停在半句,约 1s 后 REST 对账才补齐。
     // 本轮仍在流式时交给 socket 宽限等待真 final;hello/reconciler 的 reconcile 不带该来源,行为不变。
-    // OCV5-427:刷新/重连后本轮正经 active_turn_replay_start 重读,尾巴排在成百上千条积压重放帧之后,
-    // 宽限期内等不到 → 不等,立即收口并走下方 onFinal 的精确 REST 对账(tape 已提交,历史即完整)。
     if (
       frame.meta?.reconcile === "turn_completed" &&
       frame.meta?.reconcileSource === "tape_commit" &&
       frameCmid &&
       frameCmid === active &&
       sess._sendingInFlight &&
-      sess._resumeReplayClientMessageId !== frameCmid &&
       effects.deferTapeCommitFinal?.(sess.id, frame) === true
     ) {
       return;
@@ -2556,7 +2546,11 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       sess._turnStartedAt = frame.meta.since;
     }
   }
-  if (frame.meta?.credits) sess._turnCredits = { ...frame.meta.credits };
+  const clientMessageId = sess._activeClientMessageId;
+  if (frame.meta?.credits && clientMessageId &&
+    (frame.clientMessageId === undefined || frame.clientMessageId === clientMessageId)) {
+    sess._turnCredits = { clientMessageId, ...frame.meta.credits, receivedAt: Date.now() };
+  }
 }
 
 // ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════
@@ -3066,11 +3060,15 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     if (seen.size > 512) seen.delete(seen.values().next().value!);
   }
   applyTurnCostReminder(sess, requestId, add);
-  if (sess._sendingInFlight && add !== null) {
+  const activeCmid = sess._activeClientMessageId;
+  if (sess._sendingInFlight && activeCmid && add !== null) {
+    const previous = sess._turnCredits?.clientMessageId === activeCmid ? sess._turnCredits : undefined;
     let settled = add;
-    try { settled += BigInt(sess._turnCredits?.settled ?? "0"); } catch { /* old local state */ }
+    try { settled += BigInt(previous?.settled ?? "0"); } catch { /* old local state */ }
+    const now = Date.now();
     sess._turnCredits = {
-      settled: settled.toString(), requests: (sess._turnCredits?.requests ?? 0) + 1, asOf: Date.now(),
+      clientMessageId: activeCmid, settled: settled.toString(), requests: (previous?.requests ?? 0) + 1,
+      asOf: now, receivedAt: now,
     };
   }
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。

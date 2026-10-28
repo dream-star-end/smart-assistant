@@ -87,6 +87,22 @@ function sess(id = "s1", agentId = "main") {
   return s;
 }
 type AnyFrame = Record<string, unknown>;
+function sessionSnapshotFrame(sessId: string, over: Record<string, unknown>) {
+  return JSON.stringify({
+    type: "outbound.session_snapshot", channel: "webchat", peer: { id: sessId, kind: "dm" },
+    snapshot: {
+      v: 1, sessionId: sessId, dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
+      engineReady: null, turnStatus: null, reconcile: null, pendingPermissions: { items: [], completeness: "complete" },
+      usage: null, credits: null, frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 1, ...over,
+    },
+  });
+}
+const snapshotDispatch = (clientMessageId: string) => ({
+  id: "77777777-7777-4777-8777-777777777777", clientMessageId, agentId: "main", status: "accepted",
+  outcome: null, attempt: 1, since: 5, acceptedAt: 6, terminalAt: null,
+});
+const snapshotFlush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+
 function msgFrame(over: AnyFrame): OutboundMessageWire {
   return {
     type: "outbound.message",
@@ -5881,11 +5897,13 @@ describe("ChatSocket interrupted continuation", () => {
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
+      type: "outbound.resume_failed",
       sessionKey,
       channel: "webchat",
       peer: { id: sessId, kind: "dm" },
-      clientMessageId,
+      from: 1_914,
+      to: 0,
+      reason: "no_buffer",
     }) });
     const livePayload = {
       type: "outbound.message",
@@ -8751,104 +8769,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(restored[0]!.bashTail).toBeUndefined();
   });
 
-  test("hello names every trailing user-row candidate and ignores only an image placeholder", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 4 },
-        { id: "m-user-1", role: "user", text: "running", ts: now - 3, status: "sent" },
-        { id: "m-placeholder", role: "system", text: "", ts: now - 2, _genPlaceholder: {
-          jobId: "a".repeat(32), aspect: 1, status: "running", startedAt: now - 2,
-        } },
-        { id: "m-user-2", role: "user", text: "queued", ts: now - 1, status: "queued" },
-      ],
-      createdAt: now - 4,
-      lastAt: now - 1,
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-1", "m-user-2"]);
-    sock.stop();
-  });
-
-  test("hello never advertises an exact turn already fenced by user Stop", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 3 },
-        { id: "m-user-stopped", role: "user", text: "stopped", ts: now - 2, status: "sent" },
-        { id: "m-user-running", role: "user", text: "running", ts: now - 1, status: "sent" },
-      ],
-      createdAt: now - 3,
-      lastAt: now - 1,
-      _cancelledAutomaticRecoveryIds: { "m-user-stopped": true },
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(hello.peers[0].resumeActiveTurnCandidateMessageIds).toEqual(["m-user-running"]);
-
-    const restored = sock.sessions.get("s1")!;
-    restored._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-stopped",
-    }) });
-    expect(restored._lastFrameSeqByKey["agent:main:webchat:dm:s1"]).toBe(42);
-    expect(sock.isSessionBusy("s1")).toBe(false);
-    sock.stop();
-  });
-
-  test("hello keeps the oldest lock-owner candidate when a queued user block exceeds 32 rows", () => {
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-old", role: "assistant", text: "old", ts: now - 100 },
-        ...Array.from({ length: 35 }, (_, i) => ({
-          id: `m-user-${i}`,
-          role: "user" as const,
-          text: `queued ${i}`,
-          ts: now - 35 + i,
-          status: i === 0 ? "sent" as const : "queued" as const,
-        })),
-      ],
-      createdAt: now - 100,
-      lastAt: now,
-    });
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    const hello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    const candidates = hello.peers[0].resumeActiveTurnCandidateMessageIds as string[];
-    expect(candidates).toHaveLength(32);
-    expect(candidates[0]).toBe("m-user-0");
-    expect(candidates.slice(1)).toEqual(Array.from({ length: 31 }, (_, i) => `m-user-${i + 4}`));
-    sock.stop();
-  });
-
-  test("shell miss → REST user row → verified active replay resets only then restores the full prefix", () => {
+  test("shell miss → REST user row subscribes once → cursor_reset snapshot rebuilds the full prefix", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn();
     const persistSession = vi.fn();
@@ -8858,7 +8779,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     const initialHello = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.hello");
-    expect(initialHello.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    expect(initialHello.peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: false, lastFrameSeq: 0 });
 
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.resume_failed",
@@ -8873,44 +8794,30 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(syncSession).toHaveBeenCalledTimes(1);
 
     const user = { id: "m-user-running", role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage;
-    sock.applyServerMessages("s1", "main", [user], true, 1);
-    const targeted = ws.sent
-      .map((raw) => JSON.parse(raw))
-      .filter((frame) => frame.type === "inbound.hello")
-      .at(-1);
-    expect(targeted.peers[0]).toMatchObject({
-      peerId: "s1",
-      inFlight: false,
-      lastFrameSeq: 42,
-      resumeActiveTurnCandidateMessageIds: ["m-user-running"],
-    });
     const helloCount = ws.sent.filter((raw) => raw.includes('"inbound.hello"')).length;
+    sock.applyServerMessages("s1", "main", [user], true, 1);
     sock.applyServerMessages("s1", "main", [user], true, 1);
     expect(ws.sent.filter((raw) => raw.includes('"inbound.hello"'))).toHaveLength(helloCount);
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-running",
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch("m-user-running"),
+      streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+      lastFrameSeq: 10, nextAfterSeq: 10, gap: { reason: "cursor_reset" },
+      frames: [{ recordId: "1", frameSeq: 10, payload: JSON.parse(JSON.stringify(msgFrame({
+        frameSeq: 10, ts: 10, clientMessageId: "m-user-running", blocks: [{ kind: "text", text: "prefix restored" }],
+      }))) }],
     }) });
+    await snapshotFlush();
     const active = sock.sessions.get("s1")!;
-    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
     expect(active._activeClientMessageId).toBe("m-user-running");
-
-    ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 10,
-      ts: 10,
-      blocks: [{ kind: "text", text: "prefix restored" }],
-    })) });
+    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(10);
     expect(active.messages.some((m) => m.role === "assistant" && m.text === "prefix restored")).toBe(true);
     expect(active.messages.find((m) => m.role === "assistant")?._clientMessageId).toBe("m-user-running");
     expect(persistSession).toHaveBeenCalledWith("s1");
     sock.stop();
   });
 
-  test("a replay-start already in flight cannot resurrect the exact turn after user Stop", async () => {
+  test("a snapshot already in flight cannot resurrect or rewind the exact turn after user Stop", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn(async () => true);
     const sock = makeSocket({ syncSession });
@@ -8933,16 +8840,19 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(active._cancelledAutomaticRecoveryIds?.[clientMessageId]).toBe(true);
     expect(sock.isSessionBusy("s1")).toBe(true);
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId,
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(clientMessageId),
+      streamKey: "dispatch:77777777-7777-4777-8777-777777777777:1",
+      lastFrameSeq: 41, nextAfterSeq: 41, gap: { reason: "cursor_reset" },
+      frames: [{ recordId: "1", frameSeq: 41, payload: JSON.parse(JSON.stringify(msgFrame({
+        frameSeq: 41, ts: 41, clientMessageId, blocks: [{ kind: "text", text: "replayed after Stop" }],
+      }))) }],
     }) });
+    await snapshotFlush();
     expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
     expect(active._activeClientMessageId).toBe(clientMessageId);
     expect(active._localTeardownAt).toBe(teardownAt);
+    expect(active.messages.some((message) => message.text === "replayed after Stop")).toBe(false);
     expect(sock.isSessionBusy("s1")).toBe(true);
 
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
@@ -8969,7 +8879,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("a user Stop fence does not block a different exact active-turn replay", () => {
+  test("a user Stop fence does not block a different open dispatch from the snapshot", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.ensureSession("s1", "main");
@@ -8978,16 +8888,13 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     ws.open();
     const active = sock.sessions.get("s1")!;
     active._cancelledAutomaticRecoveryIds = { "m-user-stopped": true };
-    active._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 42 };
 
-    ws.onmessage?.({ data: JSON.stringify({
-      type: "outbound.active_turn_replay_start",
-      sessionKey: "agent:main:webchat:dm:s1",
-      channel: "webchat",
-      peer: { id: "s1", kind: "dm" },
-      clientMessageId: "m-user-new",
-    }) });
-    expect(active._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(0);
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: snapshotDispatch("m-user-stopped") }) });
+    await snapshotFlush();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: snapshotDispatch("m-user-new") }) });
+    await snapshotFlush();
     expect(active._activeClientMessageId).toBe("m-user-new");
     expect(sock.isSessionBusy("s1")).toBe(true);
     sock.stop();
@@ -11605,15 +11512,8 @@ describe("OCV5-427 resume replay catch-up", () => {
     _activeClientMessageId: running,
   });
   const hellos = (ws: FakeWS) => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.hello");
-  const replayStart = () => JSON.stringify({
-    type: "outbound.active_turn_replay_start",
-    sessionKey: key,
-    channel: "webchat",
-    peer: { id: "s1", kind: "dm" },
-    clientMessageId: running,
-  });
 
-  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again", () => {
+  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello subscribes the running turn once and the REST sync does not ask again", () => {
     FakeWS.instances = [];
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({ syncSession: vi.fn() });
@@ -11623,16 +11523,16 @@ describe("OCV5-427 resume replay catch-up", () => {
     ws.open();
     const first = hellos(ws);
     expect(first).toHaveLength(1);
-    expect(first[0].peers[0]).toMatchObject({ peerId: "s1", lastFrameSeq: 1134, resumeActiveTurnCandidateMessageIds: [running] });
+    expect(first[0].peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 1134, inFlightClientMessageId: running });
 
     // REST history has only the running user row: before OCV5-427 this sent a second hello naming the same turn.
     sock.applyServerMessages("s1", "main", [{ id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage], true, 1);
     expect(hellos(ws)).toHaveLength(1);
 
-    // Later registration hellos on the same page keep the cheap cursor replay.
+    // A registration hello (repo bind) never reports the running turn.
     sock.sendRepoBind("s1", "main", 1);
     const later = hellos(ws).at(-1);
-    expect(later.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    expect(later.peers[0]).toEqual({ peerId: "s1", agentId: "main", inFlight: false, lastFrameSeq: 1134 });
     sock.stop();
     vi.unstubAllGlobals();
   });
@@ -11654,7 +11554,6 @@ describe("OCV5-427 resume replay catch-up", () => {
     }));
     ws.onmessage?.({ data: delta(1, "A") });
     ws.onmessage?.({ data: delta(2, "B") });
-    ws.onmessage?.({ data: replayStart() });
     const beforeReplay = notify.mock.calls.length;
     ws.onmessage?.({ data: delta(1, "A") });
     ws.onmessage?.({ data: delta(2, "B") });
@@ -11675,9 +11574,8 @@ describe("OCV5-427 resume replay catch-up", () => {
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
     expect(hellos(ws)).toHaveLength(1);
-    ws.onmessage?.({ data: replayStart() });
     ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 7, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
+      frameSeq: 1135, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
     })) });
     expect(sock.sessions.get("s1")!._sendingInFlight).toBeFalsy();
     sock.applyServerMessages("s1", "main", [
@@ -11741,49 +11639,4 @@ describe("OCV5-427 resume replay catch-up", () => {
     vi.unstubAllGlobals();
   });
 
-  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", () => {
-    const s = sess();
-    s._sendingInFlight = true;
-    s._activeClientMessageId = running;
-    s._resumeReplayClientMessageId = running;
-    const deferTapeCommitFinal = vi.fn(() => true);
-    const forceSync = vi.fn();
-    const onFinal = vi.fn();
-    const completion = msgFrame({
-      isFinal: true,
-      clientMessageId: running,
-      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
-    });
-    applyOutboundMessage(s, completion, { deferTapeCommitFinal, forceSync, onFinal });
-    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
-    expect(s._sendingInFlight).toBe(false);
-    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: running });
-
-    // Without a resume replay the OCV5-424 grace for the live tail stays.
-    const live = sess();
-    live._sendingInFlight = true;
-    live._activeClientMessageId = running;
-    applyOutboundMessage(live, completion, { deferTapeCommitFinal, forceSync: vi.fn(), onFinal: vi.fn() });
-    expect(deferTapeCommitFinal).toHaveBeenCalledTimes(1);
-    expect(live._sendingInFlight).toBe(true);
-  });
-
-  test("the resume replay marker is set by replay_start and cleared by the turn's final", () => {
-    FakeWS.instances = [];
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket({ syncSession: vi.fn() });
-    sock.ensureSession("s1", "main");
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    ws.onmessage?.({ data: replayStart() });
-    const s = sock.sessions.get("s1")!;
-    expect(s._resumeReplayClientMessageId).toBe(running);
-    ws.onmessage?.({ data: JSON.stringify(msgFrame({
-      frameSeq: 5, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: "done", messageId: "srv-s1-main-t1-s0" }],
-    })) });
-    expect(s._resumeReplayClientMessageId).toBeUndefined();
-    sock.stop();
-    vi.unstubAllGlobals();
-  });
 });

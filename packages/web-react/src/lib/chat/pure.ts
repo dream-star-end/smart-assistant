@@ -42,22 +42,10 @@ export const PROBE_TIMEOUT_VISIBILITY_MS = 1500;
  *  往往来不及在 1.5s 内回来，探活会 close(4000) 把刚活的链路掐掉，横幅闪「已断线」。*/
 export const VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS = 10_000;
 export const PROBE_TIMEOUT_KEEPALIVE_MS = 10000;
-/** 连接"确认存活"窗口：最近这段时间内收到过 pong 或任意帧即视为链路仍活。thinking-safety
- *  超时判定据此分流——未确认存活=静默死链→强制重连而非误报本轮超时（见 socket.resetThinkingSafety）。*/
-export const LIVENESS_CONFIRM_MS = 45_000;
 /** REST 对账去抖：同一会话 5s 内至多触发一次 syncSession（切回前台/重连成功都会打）。*/
 export const SYNC_DEBOUNCE_MS = 5000;
-/** "近期有过 in-flight"的会话窗口：切回/重连时对账这些会话，追回锁屏期静默丢失的帧。*/
-export const RECENT_INFLIGHT_WINDOW_MS = 15 * 60_000;
 /** keepalive 心跳间隔（websocket.js:2113）。*/
 export const KEEPALIVE_INTERVAL_MS = 30_000;
-/** THINKING_SAFETY 兜底：10min 无新帧才杀 turn（websocket.js:274）。*/
-export const THINKING_SAFETY_MS = 10 * 60_000;
-/** reconcile 'turn_state_unknown' 后临时缩短的 thinking-safety 复检间隔(RFC §4)：server 无法
- *  判定在飞 turn 终态时,把默认 10min 首窗降到 60s,尽快 REST 复检拉回终态/error projection。*/
-export const TURN_STATE_UNKNOWN_SAFETY_MS = 60_000;
-/** 重连后等 replay 先赢，再 REST reconcile 的 grace（websocket.js:284）。*/
-export const RECONNECT_RECONCILE_GRACE_MS = 4000;
 /** reconnect 后延迟启动 drain，让 hello/resume isFinal 先到（websocket.js:2104）。*/
 /** drain 单条 isFinal 安全网（不再当失败判定，只提示，websocket.js:1411）。*/
 export const DRAIN_ISFINAL_SAFETY_MS = 120_000;

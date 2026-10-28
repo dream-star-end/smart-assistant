@@ -66,6 +66,22 @@ import {
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  isOpenSnapshotDispatch,
+  isSessionSnapshot,
+  isSnapshotFenced,
+  mayClaimSnapshotDispatch,
+  SNAPSHOT_ACK_TIMEOUT_MS,
+  SNAPSHOT_MAX_PAGES,
+  SNAPSHOT_PAGE_LIMIT,
+  snapshotFrameRecords,
+  snapshotIsStale,
+  snapshotLeadAgent,
+  snapshotQuery,
+  snapshotWatchTargets,
+  type SessionSnapshot,
+  type SnapshotQuery,
+} from "./sessionSnapshot";
+import {
   freezeErrorCardSnapshots,
   carryLegacySizeRequestReferences,
   isDispatchLostCode,
@@ -103,7 +119,6 @@ import {
   emptyTurnNoticeText,
   isPlatedAssistantMessage,
   KEEPALIVE_INTERVAL_MS,
-  LIVENESS_CONFIRM_MS,
   OFFLINE_LATCH_GRACE_MS,
   frameSeqKey,
   getFrameSeqCursor,
@@ -111,8 +126,6 @@ import {
   PROBE_TIMEOUT_KEEPALIVE_MS,
   PROBE_TIMEOUT_VISIBILITY_MS,
   VISIBILITY_PROBE_GRACE_AFTER_OPEN_MS,
-  RECENT_INFLIGHT_WINDOW_MS,
-  RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
   isRecoveryControlUserTurn,
@@ -122,8 +135,6 @@ import {
   REPORT_EXEMPT_TURN_ERR_CODES,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
-  THINKING_SAFETY_MS,
-  TURN_STATE_UNKNOWN_SAFETY_MS,
   VISIBILITY_RECONNECT_COOLDOWN_MS,
   WS_CLOSE_CODE_STALLED,
 } from "./pure";
@@ -141,7 +152,7 @@ import type {
   OutboundMessageWire,
   OutboundPermissionRequestWire,
   OutboundPermissionSettledWire,
-  OutboundActiveTurnReplayStartWire,
+  OutboundSessionSnapshotWire,
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundTurnUsageWire,
@@ -355,6 +366,11 @@ export type ChatSocketDeps = {
   persistSessionModel?: (sessId: string, modelId: string) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** HTTP face of the session snapshot (live-frames `snapshot`): B3 fallback,
+   * paging past a WS snapshot page, and recovery-grace verification. */
+  readSessionSnapshot?: (sessId: string, query: SnapshotQuery) => Promise<SessionSnapshot | null | undefined>;
+  /** Exact bytes of one oversized journal frame (snapshot gap `byte_limit`). */
+  readLiveFramePayload?: (sessId: string, ref: { recordId: string; sha256?: string }) => Promise<{ payload: unknown }>;
   /** Bounded requestId lookup when a permission snapshot page is truncated. */
   lookupPermissionPrompts?: (sessId: string, requestIds: string[]) => void;
   /** Exact outbound journal. Production waits for one committed row before
@@ -874,13 +890,9 @@ export class ChatSocket {
   private pingNonce = 0;
   private pendingPing: { id: number; ws: WebSocket; timeoutId: ReturnType<typeof setTimeout>; label: string } | null = null;
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
-  /** 最近一次收到 pong 的时刻（连接 liveness 判定：近 45s 内有 pong = 链路确认存活）。*/
-  private lastPongAt = 0;
 
-  // ── thinking-safety（§6）──
-  private thinkingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
-   * 会话级 transient 软提示（"较长时间未收到新内容…"）。**刻意不进 s.messages、不落 IndexedDB**：
+   * 会话级 transient 软提示（"正在发送…"等）。**刻意不进 s.messages、不落 IndexedDB**：
    * toStored 是显式字段白名单、从不读它 → 天然不持久化，刷新即消失，绝不与 server 恢复的真实
    * 内容同屏矛盾（旧实现把超时提示 addMessage 落库 → reload 后与真内容打架，用户报障②的一半）。
    * 渲染经 getTransientNotice 快照读回；set/clear 都 scheduleNotify 让 UI 及时更新。
@@ -944,13 +956,14 @@ export class ChatSocket {
     timer: ReturnType<typeof setTimeout> | null;
     inFlight: boolean;
   }>();
-  /** Active candidate sets and idle cursor registrations attempted on this WS.
-   * History can arrive after the initial shell hello; each identity gets one
-   * successful targeted hello. A server-reset idle cursor is a new identity,
-   * while repeating the same snapshot cannot cause a resume_failed/sync loop. */
-  private readonly activeReplayAttemptKeys = new Set<string>();
-  /** First hello of this page lifetime has gone out (OCV5-427: exact-turn replay on page load only). */
-  private pageHelloSent = false;
+  /** Sessions this WS has subscribed with a hello. Each subscription is answered by
+   * one `outbound.session_snapshot`; a session loaded later subscribes once. */
+  private readonly subscribedSessions = new Set<string>();
+  /** Last snapshot (WS or HTTP) or stamped frame per session: the B3 hello ack. */
+  private readonly snapshotAckAt = new Map<string, number>();
+  private readonly wsSnapshotAt = new Map<string, number>();
+  private readonly snapshotHttpInFlight = new Set<string>();
+  private snapshotWatchTimer: ReturnType<typeof setTimeout> | null = null;
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
   getActiveSessionId(): string | undefined {
@@ -964,7 +977,6 @@ export class ChatSocket {
    *  收口判据必须只看这批会话——用全量 sessions 判会让任意一条注水残留的
    *  in-flight（其 turn 早已在服务端收尾、本 tab 永不再收到终态帧）永久钉死横幅。*/
   private restoreBannerOwners: Set<string> | null = null;
-  private reconnectReconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── durable dispatch journal / per-session FIFO ──
   offlineQueue: OfflineItem[] = [];
@@ -1239,13 +1251,11 @@ export class ChatSocket {
     this.clearReconnectTimers();
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
-    if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
+    if (this.snapshotWatchTimer) clearTimeout(this.snapshotWatchTimer);
     // 取消挂起的 rAF 合并渲染(避免 teardown 后再 flush + dangling timer)。
     this.clearNotifyTimers();
     this.notifyScheduled = false;
     this.notifyThrottled = false;
-    for (const t of this.thinkingTimers.values()) clearTimeout(t);
-    this.thinkingTimers.clear();
     for (const t of this.reconcileTimers.values()) clearTimeout(t);
     this.reconcileTimers.clear();
     for (const t of this.tapeCommitFinalTimers.values()) clearTimeout(t);
@@ -1364,82 +1374,6 @@ export class ChatSocket {
       }
     }, timeoutMs);
     this.pendingPing = { id, ws, timeoutId, label };
-  }
-
-  // ═══════════════ thinking-safety（§6，S3 重构）═══════════════
-  //
-  // 旧实现：10min 无帧 → 发 stop + clearSendingState + addMessage 一条持久"超时"消息。三重
-  // 后果：① clearSendingState 关死重连 reconcile / hello inFlight / resume 补帧三条自愈路径；
-  // ② 持久"超时"消息落库，刷新后与 server 恢复的真实内容同屏矛盾；③ 移动端锁屏后 WS 静默
-  // 死亡、定时器解冻抢先触发，误报"本轮无响应（超时）"（用户报障②）。
-  //
-  // 新实现按"连接是否确认存活"分流，turn 生死交给 server 权威判定，绝不再自动 stop / 落库：
-  //  (a) 连接未确认存活（锁屏静默死链）→ 不动 in-flight、不发 stop、不插消息，强制重连
-  //      （重连成功后 onopen 自动走 REST 对账 S1），并重新 arm 下一轮监控；
-  //  (b) 连接确认存活但 10min 无帧 → 只挂会话级 transient 软提示（不入 messages / 不落盘），
-  //      继续 arm 观察。用户可继续等待或手动停止后重发。
-  private resetThinkingSafety(sessId: string, delayMs: number = THINKING_SAFETY_MS): void {
-    const existing = this.thinkingTimers.get(sessId);
-    if (existing) clearTimeout(existing);
-    const tid = setTimeout(() => {
-      this.thinkingTimers.delete(sessId);
-      const s = this.sessions.get(sessId);
-      if (!s || !s._sendingInFlight) return;
-      const sinceLastFrame = Date.now() - (s._lastFrameAt || 0);
-      // liveness 复检阈值 = 本次 arm 的窗口(delayMs):默认 10min 时行为不变;turn_state_unknown
-      // 缩短到 60s 时,必须用 60s 作阈值,否则「首窗 60s 内有旧帧」永远命中 <10min 而反复 reschedule
-      // → 缩短彻底失效(60s 复检拉不回终态)。窗口内有新帧=turn 仍在产出 → 只是慢,reschedule。
-      if (s._lastFrameAt && sinceLastFrame < delayMs) {
-        this.resetThinkingSafety(sessId); // 复检通过后恢复默认 10min 窗口
-        return;
-      }
-      // (a) 连接未确认存活 → 强制重连自愈（不误报），重新 arm。
-      if (!this.isConnectionLive()) {
-        this.forceReconnectForLiveness();
-        this.resetThinkingSafety(sessId);
-        return;
-      }
-      // (b) 连接活但久无帧 → 主动去抖对账服务端记录(追回 WS 静默漏掉、resume 覆盖不到的内容;
-      //     若该轮其实已在服务端收尾,对账会拉回真实内容并清发送态),再挂 transient 软提示,
-      //     保持 _sendingInFlight 不变、继续 arm。turn 生死仍交给 server 权威,绝不自动 stop。
-      this.reconcileSession(sessId);
-      this.setTransientNotice(
-        sessId,
-        "较长时间未收到新内容，已自动核对服务端记录；本轮可能仍在运行，可以继续等待。",
-      );
-      this.resetThinkingSafety(sessId); // 复检后恢复默认 10min 窗口(仅首窗被 turn_state_unknown 缩短)
-    }, delayMs);
-    this.thinkingTimers.set(sessId, tid);
-  }
-
-  /**
-   * 连接是否"确认存活"：ws 处于 OPEN，且最近 LIVENESS_CONFIRM_MS 内收到过 pong 或任意帧。
-   * 未确认存活 = 静默死链（移动端锁屏典型态：readyState 仍显 OPEN 但收发都断）。
-   */
-  private isConnectionLive(): boolean {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== 1) return false;
-    const now = Date.now();
-    if (this.lastPongAt > 0 && now - this.lastPongAt < LIVENESS_CONFIRM_MS) return true;
-    for (const s of this.sessions.values()) {
-      if (s._lastFrameAt && now - s._lastFrameAt < LIVENESS_CONFIRM_MS) return true;
-    }
-    return false;
-  }
-
-  /** 静默死链自愈：OPEN 则 close（触发 onclose→reconnect），否则直接 connect。重连成功走 S1 对账。*/
-  private forceReconnectForLiveness(): void {
-    const ws = this.ws;
-    if (ws && ws.readyState === 1) {
-      try {
-        ws.close(WS_CLOSE_CODE_STALLED, "liveness reconnect");
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
-    this.clearReconnectTimers();
-    this.connect();
   }
 
   // ═══════════════ 上下文重建提示（context_rebuilt，热尾巴/归档）═══════════════
@@ -1740,7 +1674,7 @@ export class ChatSocket {
     const decision = this.restoreExitDecision(sess, attempt);
     if (!decision) return false;
     if (decision.clearSending && sess._sendingInFlight) {
-      this.clearSendingState(sess, { clearThinking: true });
+      this.clearSendingState(sess);
     }
     if (decision.kind === "completed") {
       this.clearContinuousReconcile(sess.id, true);
@@ -1832,38 +1766,11 @@ export class ChatSocket {
     );
   }
 
-  /**
-   * 无条件对账"当前选中会话 + 近期有过 in-flight 的会话"（切回前台 / 重连成功后调）。
-   * syncSession = REST getSession + server-wins 合并，幂等无副作用；追回锁屏/死链期间
-   * WS 静默丢失、resume 覆盖不到的内容。
-   */
-  private reconcileVisibleAndInFlight(): void {
-    const now = Date.now();
-    const active = this.activeSessionId;
-    if (active && this.sessions.has(active)) this.reconcileSession(active);
-    for (const [id, s] of this.sessions) {
-      if (id === active) continue;
-      const recentInFlight =
-        !!s._sendingInFlight ||
-        (typeof s._turnStartedAt === "number" && s._turnStartedAt > 0 && now - s._turnStartedAt < RECENT_INFLIGHT_WINDOW_MS) ||
-        (typeof s._lastFrameAt === "number" && now - s._lastFrameAt < RECENT_INFLIGHT_WINDOW_MS) ||
-        (typeof s._localTeardownAt === "number" && now - s._localTeardownAt < RECENT_INFLIGHT_WINDOW_MS);
-      if (recentInFlight) this.reconcileSession(id);
-    }
-  }
-
-  private clearThinkingSafety(sessId: string): void {
-    const t = this.thinkingTimers.get(sessId);
-    if (t) {
-      clearTimeout(t);
-      this.thinkingTimers.delete(sessId);
-    }
-  }
-
   /** A closed transport cannot deliver the admission ACK. Requeue only turns
    * that were physically sent; a `persisting` turn retains its single commit
    * attempt and will decide against whichever connection is current when it
-   * settles. */
+   * settles. The row stays 「发送中」: it already left, the replay re-sends the
+   * same idempotent payload and never waits behind another turn. */
   private resetUnadmittedDispatchesForReplay(): void {
     const touched = new Set<string>();
     for (const item of this.offlineQueue) {
@@ -1871,15 +1778,10 @@ export class ChatSocket {
       item.state = "queued";
       touched.add(item.sessId);
       const sess = this.sessions.get(item.sessId);
-      const message = sess?.messages.find(
-        (candidate) => candidate.role === "user" && candidate.id === item.msgId,
-      );
-      if (message) message.status = "queued";
       if (sess?._activeClientMessageId === item.msgId) {
         sess._sendingInFlight = false;
         sess._activeClientMessageId = undefined;
         clearTurnTiming(sess);
-        this.clearThinkingSafety(sess.id);
       }
     }
     if (touched.size === 0) return;
@@ -1932,6 +1834,22 @@ export class ChatSocket {
     return true;
   }
 
+  /** Claim one exact server turn as this browser's in-flight turn. */
+  private beginTurn(sess: ChatSession, clientMessageId: string, agentId?: string, startedAt = Date.now()): void {
+    sess._streamingAssistant = null;
+    sess._streamingThinking = null;
+    sess._blockIdToMsgId = new Map();
+    sess._agentSwitchedAt = null;
+    sess._localTeardownAt = undefined;
+    sess._sendingInFlight = true;
+    sess._activeClientMessageId = clientMessageId;
+    sess._activeAgentId = agentId || sess.agentId;
+    sess._turnStartedAt = startedAt;
+    sess._pendingCostCredits = "0";
+    sess._lastFinaledAssistantId = null;
+    sess._lastFinaledAt = 0;
+  }
+
   /** Admission occupies the FIFO slot; only container evidence confirms delivery. */
   private confirmDispatchAdmission(sessId: string, clientMessageId: string, accepted = true): boolean {
     const sess = this.sessions.get(sessId);
@@ -1960,25 +1878,9 @@ export class ChatSocket {
       sess._preparedModelSwitch = undefined;
       changed = true;
     }
-    const alreadyInFlight = sess._sendingInFlight;
-    if (!alreadyInFlight) {
+    if (!sess._sendingInFlight) {
       changed = true;
-      sess._streamingAssistant = null;
-      sess._streamingThinking = null;
-      sess._blockIdToMsgId = new Map();
-      sess._agentSwitchedAt = null;
-      sess._localTeardownAt = undefined;
-      sess._sendingInFlight = true;
-      sess._activeClientMessageId = clientMessageId;
-      sess._activeAgentId =
-        typeof pending?.payload.agentId === "string" && pending.payload.agentId
-          ? pending.payload.agentId
-          : sess.agentId;
-      sess._turnStartedAt = Date.now();
-      sess._pendingCostCredits = "0";
-      sess._lastFinaledAssistantId = null;
-      sess._lastFinaledAt = 0;
-      this.resetThinkingSafety(sessId);
+      this.beginTurn(sess, clientMessageId, pending?.payload.agentId);
     }
     this.clearTransientNotice(sess.id);
     if (changed) this.scheduleNotify();
@@ -1999,7 +1901,6 @@ export class ChatSocket {
     opts: {
       clearTiming?: boolean;
       resetTracker?: boolean;
-      clearThinking?: boolean;
       persist?: boolean;
     } = {},
   ): void {
@@ -2009,7 +1910,6 @@ export class ChatSocket {
     if (opts.clearTiming !== false) clearTurnTiming(sess);
     if (opts.resetTracker !== false) resetReplyTracker(sess);
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
-    if (opts.clearThinking) this.clearThinkingSafety(sess.id);
     if (opts.persist !== false) this.deps.persistSession?.(sess.id);
     // stop / 超时 / 错误清 in-flight 后,若有生成中排队的消息 → 顺序发出。
     this.kickQueuedDrainIfIdle();
@@ -2020,11 +1920,7 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
-        if (sess._resumeReplayClientMessageId === (frame.clientMessageId ?? clientMessageId)) {
-          sess._resumeReplayClientMessageId = undefined;
-        }
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
-        this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         const settlement = sess._stopSettlement;
         if (
@@ -2090,10 +1986,7 @@ export class ChatSocket {
             sess._recoveryStatus = { kind: "resumed" };
           }
         }
-        if (sess._sendingInFlight) {
-          this.resetThinkingSafety(sess.id);
-          this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
-        }
+        if (sess._sendingInFlight) this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
@@ -2115,11 +2008,6 @@ export class ChatSocket {
         } else {
           this.startContinuousReconcile(sessId, undefined, context);
         }
-      },
-      onTurnStateUnknown: (sessId) => {
-        // 在飞 turn 终态未知:把 thinking-safety 首窗降至 60s(仍不清发送态),尽快 REST 复检。
-        const s = this.sessions.get(sessId);
-        if (s?._sendingInFlight) this.resetThinkingSafety(sessId, TURN_STATE_UNKNOWN_SAFETY_MS);
       },
       persistSession: (sessId) => this.deps.persistSession?.(sessId),
       onAuthControlError: () => {
@@ -2148,7 +2036,7 @@ export class ChatSocket {
     this.setStatus("连接中…", "connecting");
     this.relayReady = false; // 新连接:relay 未确认,待 sys.relay_ready
     this.masterOwnsAutomaticRecovery = false;
-    this.activeReplayAttemptKeys.clear();
+    this.subscribedSessions.clear();
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     const url = `${proto}${location.host}${WS_PATH}`;
     // 鉴权 = Sec-WebSocket-Protocol 子协议 ['bearer', token]（非 ?token= 非 header）。
@@ -2161,6 +2049,7 @@ export class ChatSocket {
     }
     this.ws = ws;
     ws.onopen = () => {
+      const reconnected = this.everOpened;
       this.reconnectAttempts = 0;
       this.isBrowserOnline = true;
       this.pendingBrowserOfflineAt = 0;
@@ -2234,27 +2123,9 @@ export class ChatSocket {
         }
       }
 
-      // 4s grace 主动 reconcile（§4 + S1 无条件对账）：等 replay 先赢，再 REST 补静默丢失。
-      // 恒 arm（不再仅在有 in-flight 时）——即使本次重连没有 in-flight，也要对账当前选中会话，
-      // 追回锁屏/死链期间静默丢失且 resume 覆盖不到的内容（用户报障②的另一半）。
-      {
-        const reconnectAt = Date.now();
-        const reconcileSet = this.reconnectInFlightSet ? new Set(this.reconnectInFlightSet) : new Set<string>();
-        if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
-        this.reconnectReconcileTimer = setTimeout(() => {
-          this.reconnectReconcileTimer = null;
-          if (this.ws !== ws || ws.readyState !== 1) return; // 按 ws 实例校验，防旧 timer 误 reconcile 新连接
-          // 断流 in-flight 会话先标 _liveStreamBroken（UI 提示），再统一走对账拉回。
-          for (const sessId of reconcileSet) {
-            const s = this.sessions.get(sessId);
-            if (s?._sendingInFlight && (!s._lastFrameAt || s._lastFrameAt < reconnectAt)) {
-              s._liveStreamBroken = true;
-            }
-          }
-          this.reconcileVisibleAndInFlight();
-        }, RECONNECT_RECONCILE_GRACE_MS);
-      }
-
+      // 重连期间可能有别的设备在选中会话里收尾了回合：hello 快照只管 open dispatch，
+      // 历史读一次即可。首连的历史由会话打开时的读入口负责。
+      if (reconnected && this.activeSessionId) this.reconcileSession(this.activeSessionId);
       this.scheduleNotify();
     };
 
@@ -2274,12 +2145,15 @@ export class ChatSocket {
       }
       // pong 必须先于一切 session handler（无 peer/frameSeq）。
       if (f.type === "pong") {
-        this.lastPongAt = Date.now(); // 连接 liveness 信号（thinking-safety 分流据此判活）
         if (this.pendingPing && this.pendingPing.ws === ws && this.pendingPing.id === (f as { id?: number }).id) {
           clearTimeout(this.pendingPing.timeoutId);
           this.pendingPing = null;
         }
         return;
+      }
+      const stamped = f as { peer?: { id?: unknown }; frameSeq?: unknown };
+      if (typeof stamped.peer?.id === "string" && typeof stamped.frameSeq === "number") {
+        this.snapshotAckAt.set(stamped.peer.id, Date.now());
       }
       if (this.bufferStampedFrameDuringDurableHydration(f)) return;
       const firstTextPaint = f.type === "outbound.message"
@@ -2327,10 +2201,6 @@ export class ChatSocket {
         clearTimeout(this.reconnectInFlightTimer);
         this.reconnectInFlightTimer = null;
         this.reconnectInFlightSet = null;
-      }
-      if (this.reconnectReconcileTimer) {
-        clearTimeout(this.reconnectReconcileTimer);
-        this.reconnectReconcileTimer = null;
       }
       if (this.everOpened) this.setStatus("已断线", "disconnected");
       else this.setStatus("连接中…", "connecting");
@@ -2464,10 +2334,6 @@ export class ChatSocket {
 
   private dispatch(f: OutboundWire): void {
     switch (f.type) {
-      case "outbound.session_snapshot":
-        confirmSnapshotDelivery(this.sessions.get(f.peer.id), f.snapshot.dispatch);
-        this.scheduleNotify();
-        return;
       case "outbound.message": {
         const frame = f as OutboundMessageWire;
         const sess = this.resolveSession(frame.peer?.id);
@@ -2512,13 +2378,8 @@ export class ChatSocket {
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
           applyOutboundError(sess, frame, this.effects());
-          // 释放 peer slot(恢复子轮要占同一 slot);红卡若被延后,thinking-safety 只重置不清——
-          // 软状态仍需「后端死了也能兜底收口」。
+          // 释放 peer slot(恢复子轮要占同一 slot)。红卡若被延后,由恢复宽限按快照收口。
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
-          if (ownsActiveTurn) {
-            if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
-            else this.clearThinkingSafety(sess.id);
-          }
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
           // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
           this.dismissStaleRestoreBanner();
@@ -2540,10 +2401,6 @@ export class ChatSocket {
             activeClientMessageId === frame.clientMessageId;
           applyLegacyBridgeError(sess, frame, this.effects());
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
-          if (ownsActiveTurn) {
-            if (this.pendingRecoveryErrors.has(sess.id)) this.resetThinkingSafety(sess.id);
-            else this.clearThinkingSafety(sess.id);
-          }
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
           // 红卡被延后时本轮仍是软在飞状态，owner 未清，横幅不会被误摘。
           this.dismissStaleRestoreBanner();
@@ -2575,25 +2432,11 @@ export class ChatSocket {
         }
         return;
       }
-      case "outbound.active_turn_replay_start": {
-        const frame = f as OutboundActiveTurnReplayStartWire;
-        const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
-        if (!sess || !isClientMessageId(frame.clientMessageId)) return;
-        // A reconnect hello can race an exact user Stop while the gateway is
-        // still settling that turn. Never let its already-in-flight replay
-        // acknowledgement revoke the browser-owned cancellation fence.
-        if (sess._cancelledAutomaticRecoveryIds?.[frame.clientMessageId] === true) return;
-        // Only this direct, server-verified boundary may move an agent-scoped
-        // cursor backwards. The following replay contains exclusively frames
-        // after that exact turn's server-owned baseSeq.
-        this.noteAuthoritativeFrameSeqReset(sess, frame);
-        resetFrameSeqCursor(sess, frame);
-        sess._activeClientMessageId = frame.clientMessageId;
-        sess._resumeReplayClientMessageId = frame.clientMessageId;
-        sess._sendingInFlight = true;
-        sess._localTeardownAt = undefined;
-        sess._liveStreamBroken = false;
-        this.deps.persistSession?.(sess.id);
+      case "outbound.session_snapshot": {
+        const frame = f as OutboundSessionSnapshotWire;
+        if (typeof frame.peer?.id === "string" && isSessionSnapshot(frame.snapshot)) {
+          void this.applySessionSnapshot(frame.peer.id, frame.snapshot, { via: "ws", requestedAt: Date.now() });
+        }
         return;
       }
       case "outbound.resume_failed": {
@@ -2757,21 +2600,7 @@ export class ChatSocket {
         return;
       }
       default:
-        if ((f as { type?: unknown }).type === "outbound.permission_hello_scan") {
-          const frame = f as {
-            truncated?: unknown;
-            rowLimited?: unknown;
-            uncoveredSessionIds?: unknown;
-          };
-          const uncovered = Array.isArray(frame.uncoveredSessionIds)
-            ? frame.uncoveredSessionIds.filter((id): id is string => typeof id === "string")
-            : [];
-          const active = this.activeSessionId;
-          if (active && (frame.truncated === true || frame.rowLimited === true || uncovered.includes(active))) {
-            this.deps.syncSession?.(active);
-          }
-        }
-        // pong 已先处理；其余 v5 webchat 不消费。
+        // pong 已先处理；权限补发的截断由快照 completeness 说明；其余 v5 webchat 不消费。
         return;
     }
   }
@@ -2836,7 +2665,7 @@ export class ChatSocket {
     if (!owns) return false;
 
     this.finishDispatch(sessId, clientMessageId);
-    this.clearSendingState(sess, { clearThinking: true });
+    this.clearSendingState(sess);
     const user = sess.messages.find((m) => m.role === "user" && m.id === clientMessageId);
     if (user) user.status = "sent";
     void this.deps.syncSession?.(sessId, { clientMessageId });
@@ -2917,22 +2746,8 @@ export class ChatSocket {
     }
     // Claim the turn so live frames stamped with this cmid project normally
     // and TurnActivity mounts; the soft hint replaces the terminal card.
-    const alreadyActive =
-      sess._sendingInFlight && sess._activeClientMessageId === clientMessageId;
-    if (!alreadyActive) {
-      sess._streamingAssistant = null;
-      sess._streamingThinking = null;
-      sess._blockIdToMsgId = new Map();
-      sess._agentSwitchedAt = null;
-      sess._localTeardownAt = undefined;
-      sess._sendingInFlight = true;
-      sess._activeClientMessageId = clientMessageId;
-      sess._activeAgentId = recovery.agentId || sess.agentId;
-      sess._turnStartedAt = Date.now();
-      sess._pendingCostCredits = "0";
-      sess._lastFinaledAssistantId = null;
-      sess._lastFinaledAt = 0;
-      this.resetThinkingSafety(sessId);
+    if (!sess._sendingInFlight || sess._activeClientMessageId !== clientMessageId) {
+      this.beginTurn(sess, clientMessageId, recovery.agentId);
     }
     this.dispatchSlots.set(sessId, clientMessageId);
     sess._turnStatus = {
@@ -3086,7 +2901,7 @@ export class ChatSocket {
         this.materializePendingRecoveryError(sessId, "decision_timeout");
       }
     }
-    const timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
+    const timer = setTimeout(() => this.verifyDeferredRecovery(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
     this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false, masterOwned });
     this.stashProblemCardSourceCode(sessId, clientMessageId, paint.normalized);
     if (!masterOwned) setTimeout(() => void this.autoRecoverTerminalTurn(sessId, clientMessageId), 0);
@@ -3107,7 +2922,7 @@ export class ChatSocket {
       if (matchesPending && pending) {
         clearTimeout(pending.timer);
         pending.decided = true;
-        pending.timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "adoption_timeout"), RECOVERY_ADOPTION_GRACE_MS);
+        pending.timer = setTimeout(() => this.verifyDeferredRecovery(sessId, "adoption_timeout"), RECOVERY_ADOPTION_GRACE_MS);
       }
       // 软状态仍在(延后路径)或本轮仍在飞:用权威 attempt 刷新文案;不凭裁决伪造 in-flight。
       if (sess._sendingInFlight && (matchesPending || sess._activeClientMessageId === frame.sourceClientMessageId)) {
@@ -3167,8 +2982,32 @@ export class ChatSocket {
     }
   }
 
+  /**
+   * 恢复宽限到点(OD1):以快照里的 dispatch 为准。恢复子轮还在跑 → 软状态属实,再等一个
+   * 宽限;读不到快照(离线)同样再等;服务端没有在跑的恢复 → 按「不会恢复」画卡,
+   * 「重试中」不能永远挂着。
+   */
+  private verifyDeferredRecovery(sessId: string, cause: "decision_timeout" | "adoption_timeout"): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    if (!this.deps.readSessionSnapshot) {
+      this.materializePendingRecoveryError(sessId, cause);
+      return;
+    }
+    void this.fetchSessionSnapshot(sessId, { verifyOnly: true }).then((snap) => {
+      if (this.pendingRecoveryErrors.get(sessId) !== pending) return;
+      const d = snap?.dispatch;
+      if (snap === undefined || (!!d && d.clientMessageId !== pending.clientMessageId &&
+        (isOpenSnapshotDispatch(d) || d.status === "rejecting"))) {
+        pending.timer = setTimeout(() => this.verifyDeferredRecovery(sessId, cause), RECOVERY_ADOPTION_GRACE_MS);
+        return;
+      }
+      this.materializePendingRecoveryError(sessId, cause);
+    });
+  }
+
   /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。
-   * 宽限超时不准画卡：软状态继续等真正的裁决。点停也不补错误卡。 */
+   * 点停不补错误卡。 */
   private materializePendingRecoveryError(
     sessId: string,
     cause: ProblemCardMaterializeCause,
@@ -3176,10 +3015,6 @@ export class ChatSocket {
   ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
-    if (cause === "decision_timeout" || cause === "adoption_timeout") {
-      clearTimeout(pending.timer);
-      return;
-    }
     clearTimeout(pending.timer);
     this.pendingRecoveryErrors.delete(sessId);
     const sess = this.sessions.get(sessId);
@@ -3192,7 +3027,6 @@ export class ChatSocket {
         sess._sendingInFlight = false;
         sess._activeClientMessageId = undefined;
         sess._turnStatus = null;
-        this.clearThinkingSafety(sessId);
         this.kickQueuedDrainIfIdle();
       }
       this.deps.persistSession?.(sessId);
@@ -3212,8 +3046,7 @@ export class ChatSocket {
     }
     const painted = paintDeferredTerminalError(sess, pending.paint, this.effects());
     if (wasActive && !sess._sendingInFlight) {
-      // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
-      this.clearThinkingSafety(sessId);
+      // painter 已清 in-flight;补齐 socket 侧收尾(排队消息续发)。
       this.kickQueuedDrainIfIdle();
     }
     this.deps.persistSession?.(sessId);
@@ -3424,7 +3257,7 @@ export class ChatSocket {
     }
     this.finishDispatch(sessId, clientMessageId);
     if (sess._activeClientMessageId === clientMessageId) {
-      this.clearSendingState(sess, { clearThinking: true, persist: false });
+      this.clearSendingState(sess, { persist: false });
     }
     sess.messages = sess.messages.filter((message, index) =>
       index !== userIndex &&
@@ -3505,112 +3338,40 @@ export class ChatSocket {
   }
 
   /**
-   * 构造 hello 帧。includeInFlight：
-   *  - true（onopen 默认，reconnect 语义）：带 _sendingInFlight，gateway autoResumeFromHello
-   *    据此对断流 in-flight peer 推合成中断 isFinal。
-   *  - false（bind 前的注册刷新）：所有 peer 强制 inFlight=false —— 纯 peer 注册副作用，
-   *    绝不触发任何 synthetic 中断（对齐 v3 _buildHelloFrame includeInFlight=false）。
+   * hello = 订阅（sessions, afterSeq）。每个会话的首个 peer 是快照流所在的 agent，带
+   * lastStreamKey 与同一 sessionKey 的游标；服务端对每个订阅回一份权威快照。
+   * includeInFlight=false 用于纯注册（仓库绑定前、晚加载的会话），不上报在飞回合。
    */
-  private activeTurnReplayCandidates(sess: ChatSession): string[] {
-    const newestFirst: string[] = [];
-    let oldestValid: string | undefined;
-    let validCount = 0;
-    for (let i = sess.messages.length - 1; i >= 0; i--) {
-      const message = sess.messages[i];
-      if (message?._genPlaceholder) continue;
-      if (message?.role !== "user") break;
-      if (!isClientMessageId(message.id)) continue;
-      if (sess._cancelledAutomaticRecoveryIds?.[message.id] === true) continue;
-      validCount++;
-      oldestValid = message.id;
-      // The lock owner is normally the oldest user in a contiguous queued
-      // block. Preserve it separately, then spend the remaining bounded hint
-      // budget on the newest rows for queue/drain races.
-      if (newestFirst.length < 31) newestFirst.push(message.id);
-    }
-    if (validCount > 31 && oldestValid) return [oldestValid, ...newestFirst.reverse()];
-    return newestFirst.reverse();
-  }
-
-  private composeHelloFrame(
-    includeInFlight = true,
-    onlySessionId?: string,
-    requireFreshRegistration = false,
-  ): { data: string; attemptKeys: string[] } {
-    const peers: Array<{
-      peerId: string;
-      agentId: string;
-      inFlight: boolean;
-      lastFrameSeq: number;
-      resumeActiveTurnCandidateMessageIds?: string[];
-      inFlightClientMessageId?: string;
-    }> = [];
-    const attemptKeys: string[] = [];
-    for (const [pid, s] of this.sessions) {
+  private composeHelloFrame(includeInFlight = true, onlySessionId?: string): { data: string; sessionIds: string[] } {
+    const peers: Array<Record<string, unknown>> = [];
+    const sessionIds: string[] = [];
+    // The server answers at most 8 sessions (in-flight first): the selected one goes next.
+    const ordered = [...this.sessions].sort(([a], [b]) => Number(b === this.activeSessionId) - Number(a === this.activeSessionId));
+    for (const [pid, s] of ordered) {
       if (onlySessionId && pid !== onlySessionId) continue;
+      sessionIds.push(pid);
+      const query = snapshotQuery(s, this.deps.defaultAgentId);
+      const lead = snapshotLeadAgent(s, this.deps.defaultAgentId);
+      const agents = new Map<string, number>([[lead, query.afterSeq]]);
       const safeId = String(pid).replace(/[^a-zA-Z0-9_-]/g, "_");
-      const emitted = new Set<string>();
-      const pushPeer = (agentId: string, lastFrameSeq: number) => {
-        const aid = agentId || s.agentId || this.deps.defaultAgentId || "main";
-        if (emitted.has(aid)) return;
-        emitted.add(aid);
-        const historyCandidates = this.activeTurnReplayCandidates(s);
-        // OCV5-427: a restored in-flight turn is keyed by the turn itself, so
-        // the page-load hello and the registration hello after the REST sync
-        // are the same attempt and only the first goes out. Only the very
-        // first hello of the page asks for the exact turn from its start;
-        // later sockets on the same page keep the cheap cursor replay.
-        const runningTurn = historyCandidates.length === 0 &&
-          s._sendingInFlight &&
-          isClientMessageId(s._activeClientMessageId) &&
-          s._cancelledAutomaticRecoveryIds?.[s._activeClientMessageId] !== true
-          ? s._activeClientMessageId
-          : undefined;
-        const keyCandidates = runningTurn ? [runningTurn] : historyCandidates;
-        const candidates = runningTurn && this.pageHelloSent ? [] : keyCandidates;
-        // An idle session can be loaded after this socket's initial hello.
-        // Its persisted cursor still needs server arbitration before the next
-        // turn, even though completed history has no active replay candidate.
-        const attemptKey = keyCandidates.length > 0
-          ? `${pid}:${aid}:${keyCandidates.join(",")}`
-          : `${pid}:${aid}:idle-cursor:${lastFrameSeq}`;
-        const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
-        const hasFreshCandidates = candidates.length > 0 && fresh;
-        if (requireFreshRegistration && !fresh) return;
-        // OCV5-430: an idle-cursor registration exists only for a session this
-        // socket has not registered yet. Once any hello on this socket carried
-        // this session, re-registering it after the turn settled just makes the
-        // gateway resend frames of the finished turn from a stale cursor.
-        if (
-          requireFreshRegistration &&
-          keyCandidates.length === 0 &&
-          [...this.activeReplayAttemptKeys].some((key) => key.startsWith(`${pid}:${aid}:`))
-        ) return;
-        if (fresh) attemptKeys.push(attemptKey);
-        const emitInFlight = includeInFlight && !!s._sendingInFlight;
-        peers.push({
-          peerId: pid,
-          agentId: aid,
-          inFlight: emitInFlight,
-          lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0,
-          ...(hasFreshCandidates ? { resumeActiveTurnCandidateMessageIds: candidates } : {}),
-          // RFC §4:在飞 turn 身份随 hello 上报,服务端据此绑定 reconcile 到具体 clientMessageId。
-          ...(emitInFlight && isClientMessageId(s._activeClientMessageId)
-            ? { inFlightClientMessageId: s._activeClientMessageId }
-            : {}),
-        });
-      };
-      const byKey = s._lastFrameSeqByKey;
-      if (byKey && typeof byKey === "object") {
-        for (const [key, seq] of Object.entries(byKey)) {
-          const m = key.match(/^agent:([^:]+):webchat:dm:(.+)$/);
-          if (!m || m[2] !== safeId) continue;
-          pushPeer(m[1], seq);
-        }
+      for (const [key, seq] of Object.entries(s._lastFrameSeqByKey ?? {})) {
+        const m = key.match(/^agent:([^:]+):webchat:dm:(.+)$/);
+        if (m && m[2] === safeId && !agents.has(m[1]) && Number.isFinite(seq)) agents.set(m[1], seq);
       }
       const defAgent = s.agentId || this.deps.defaultAgentId || "main";
-      const defKey = safeSessionKeyForAgent(s.id, defAgent);
-      pushPeer(defAgent, byKey && Number.isFinite(byKey[defKey]) ? byKey[defKey] : 0);
+      if (!agents.has(defAgent)) agents.set(defAgent, 0);
+      const inFlight = includeInFlight && !!s._sendingInFlight;
+      for (const [agentId, lastFrameSeq] of agents) {
+        peers.push({
+          peerId: pid,
+          agentId,
+          inFlight,
+          lastFrameSeq,
+          // RFC §4:在飞 turn 身份随 hello 上报,快照按它精确取 dispatch。
+          ...(inFlight && query.dispatch ? { inFlightClientMessageId: query.dispatch } : {}),
+          ...(agentId === lead && query.streamKey ? { lastStreamKey: query.streamKey } : {}),
+        });
+      }
     }
     return {
       data: JSON.stringify({
@@ -3621,25 +3382,198 @@ export class ChatSocket {
           document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined,
         peers,
       }),
-      attemptKeys,
+      sessionIds,
     };
   }
 
-  private buildHelloFrame(includeInFlight = true, onlySessionId?: string): string {
-    return this.composeHelloFrame(includeInFlight, onlySessionId).data;
+  private sendHelloFrame(includeInFlight = true, onlySessionId?: string): boolean {
+    const hello = this.composeHelloFrame(includeInFlight, onlySessionId);
+    const sent = this.safeWsSend(hello.data);
+    if (sent) for (const id of hello.sessionIds) this.subscribedSessions.add(id);
+    return sent;
   }
 
-  private sendHelloFrame(
-    includeInFlight = true,
-    onlySessionId?: string,
-    requireFreshRegistration = false,
-  ): boolean {
-    const hello = this.composeHelloFrame(includeInFlight, onlySessionId, requireFreshRegistration);
-    if (requireFreshRegistration && hello.attemptKeys.length === 0) return false;
-    const sent = this.safeWsSend(hello.data);
-    if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
-    if (sent) this.pageHelloSent = true;
-    return sent;
+  /** A session loaded after this socket's hello subscribes once; its snapshot follows. */
+  private subscribeSession(sessId: string): void {
+    if (this.subscribedSessions.has(sessId) || this.ws?.readyState !== 1) return;
+    this.sendHelloFrame(false, sessId);
+  }
+
+  // ═══════════════ 权威快照 + afterSeq 增量（唯一恢复入口）═══════════════
+  /**
+   * WS hello 的 `outbound.session_snapshot` 与 HTTP live-frames 的 `snapshot` 只走这里：
+   * 先按快照认领 open dispatch，再把这条流 afterSeq 之后的帧（含 HTTP 续页、超大帧）
+   * 一次并进同一个 frameSeq reducer（cursor_reset 时按流重建本回合），最后以最新一页的
+   * 状态头对齐 turnStatus / 用量 / 积分 / 终态 / 待决权限。HTTP 结果若晚于 WS 的新证据，
+   * 帧照常合并，状态头作废（B3 §4 R2/R5）。
+   */
+  private applySessionSnapshot(
+    sessId: string,
+    snap: SessionSnapshot,
+    ctx: { via: "ws" | "http"; requestedAt: number },
+  ): Promise<void> {
+    const sess = this.sessions.get(sessId);
+    if (!sess || snap.sessionId !== sessId) return Promise.resolve();
+    const fresh = ctx.via === "ws" || ((sess._lastFrameAt ?? 0) <= ctx.requestedAt &&
+      (this.wsSnapshotAt.get(sessId) ?? 0) <= ctx.requestedAt);
+    const now = Date.now();
+    this.snapshotAckAt.set(sessId, now);
+    if (ctx.via === "ws") this.wsSnapshotAt.set(sessId, now);
+    const lifecycle = this.lifecycleEpoch;
+    const current = () => this.sessions.get(sessId) === sess && this.lifecycleEpoch === lifecycle;
+    return this.runDurableLiveFrameHydration(sessId, async () => {
+      if (!current()) return;
+      confirmSnapshotDelivery(sess, snap.dispatch);
+      const d = snap.dispatch;
+      const rebuild = snap.gap?.reason === "cursor_reset";
+      if (fresh && isOpenSnapshotDispatch(d) && mayClaimSnapshotDispatch(sess, d) && (rebuild || !snapshotIsStale(sess, snap))) {
+        if (!this.confirmDispatchAdmission(sessId, d.clientMessageId, d.acceptedAt != null)) {
+          this.beginTurn(sess, d.clientMessageId, d.agentId);
+          this.dispatchSlots.set(sessId, d.clientMessageId);
+        }
+        sess._turnStartedAt = d.since;
+      }
+      const pages = isSnapshotFenced(sess, d)
+        ? { last: snap, records: [], degraded: false }
+        : await this.readSnapshotPages(sess, snap);
+      if (!current()) return;
+      if (pages.records.length > 0) {
+        this.applyDurableLiveFrames(sessId, pages.records, rebuild && d ? [d.clientMessageId] : []);
+      }
+      const last = pages.last;
+      if (last.streamKey && last.dispatch) {
+        sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
+      }
+      if (pages.degraded) sess._liveJournalDegraded = true;
+      this.applySnapshotHead(sess, last, fresh);
+      this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
+    });
+  }
+
+  /** `readHistory=false` from inside a history read itself (legacy live-frames pages). */
+  private applySnapshotHead(sess: ChatSession, snap: SessionSnapshot, fresh: boolean, readHistory = true): void {
+    // Pending prompts are idempotent by requestId and fenced by the settled set.
+    for (const item of snap.pendingPermissions.items) this.dispatch(item as unknown as OutboundWire);
+    const d = snap.dispatch;
+    const own = fresh && !!d && sess._sendingInFlight && sess._activeClientMessageId === d.clientMessageId &&
+      !snapshotIsStale(sess, snap);
+    let needsHistory = snap.pendingPermissions.completeness !== "complete" || snap.gap?.reason === "tape";
+    if (own && isOpenSnapshotDispatch(d) && !isSnapshotFenced(sess, d)) {
+      confirmDispatchDelivery(sess, d.clientMessageId, d.acceptedAt != null);
+      sess._turnStartedAt = d.since;
+      const peer = { id: sess.id, kind: "dm" as const };
+      if (snap.usage) {
+        applyTurnUsage(sess, {
+          type: "outbound.turn_usage", sessionKey: safeSessionKeyForAgent(sess.id, d.agentId || "main"), channel: "webchat",
+          peer, clientMessageId: d.clientMessageId, usage: snap.usage.usage,
+        });
+      }
+      if (snap.turnStatus) applyTurnStatus(sess, snap.turnStatus as unknown as OutboundTurnStatusWire);
+      if (snap.credits) sess._turnCredits = { clientMessageId: d.clientMessageId, ...snap.credits, receivedAt: Date.now() };
+    } else if (own && (d.status === "terminal" || d.status === "manual_reconcile")) {
+      if (snap.reconcile) {
+        // Same terminal as the hello reconcile; its exact sync reads the tape.
+        applyOutboundMessage(sess, {
+          type: "outbound.message", channel: "webchat", peer: { id: sess.id, kind: "dm" },
+          clientMessageId: d.clientMessageId, blocks: [], isFinal: true,
+          meta: { reconcile: snap.reconcile, clientMessageId: d.clientMessageId }, ts: snap.asOf,
+        } as OutboundMessageWire, this.effects());
+        needsHistory = false;
+      } else {
+        // not_accepted / executed_error: the failure is shown from history (fail-visible).
+        needsHistory = true;
+      }
+    }
+    if (needsHistory && readHistory) void this.deps.syncSession?.(sess.id, d ? { clientMessageId: d.clientMessageId } : undefined);
+  }
+
+  /** afterSeq 续页：hasMore 走 HTTP 下一页，byte_limit 读那一帧的原始字节再推进游标。 */
+  private async readSnapshotPages(
+    sess: ChatSession,
+    first: SessionSnapshot,
+  ): Promise<{ last: SessionSnapshot; records: DurableLiveFrame[]; degraded: boolean }> {
+    const records: DurableLiveFrame[] = [];
+    let page = first;
+    for (let pages = 1; ; pages++) {
+      records.push(...snapshotFrameRecords(page));
+      try {
+        const gap = page.gap;
+        let afterSeq = page.nextAfterSeq;
+        if (gap?.reason === "byte_limit" && gap.recordId && typeof gap.frameSeq === "number" && page.streamKey) {
+          const exact = await this.deps.readLiveFramePayload?.(sess.id, {
+            recordId: gap.recordId, ...(gap.sha256 ? { sha256: gap.sha256 } : {}),
+          });
+          if (!exact) return { last: page, records, degraded: true };
+          records.push({
+            recordId: gap.recordId, streamKey: page.streamKey, source: "gateway",
+            clientMessageId: page.dispatch?.clientMessageId ?? null, payload: exact.payload,
+          });
+          afterSeq = gap.frameSeq;
+        }
+        if (!page.hasMore || !page.streamKey) return { last: page, records, degraded: false };
+        const read = this.deps.readSessionSnapshot;
+        if (!read || pages >= SNAPSHOT_MAX_PAGES) return { last: page, records, degraded: true };
+        const next = await read(sess.id, {
+          afterSeq, streamKey: page.streamKey, limit: SNAPSHOT_PAGE_LIMIT,
+          ...(page.dispatch ? { dispatch: page.dispatch.clientMessageId } : {}),
+        });
+        // A new dispatch replaced the stream: its own snapshot (next hello / frames) takes over.
+        if (!isSessionSnapshot(next) || next.streamKey !== page.streamKey) {
+          return { last: page, records, degraded: !next };
+        }
+        page = next;
+      } catch {
+        return { last: page, records, degraded: true };
+      }
+    }
+  }
+
+  /** B3：visible / online 后 8s 内某会话既没有快照也没有带序号的帧，就走 HTTP 拿同一份快照。 */
+  private armSnapshotWatchdog(): void {
+    if (!this.deps.readSessionSnapshot) return;
+    const triggeredAt = Date.now();
+    if (this.snapshotWatchTimer) clearTimeout(this.snapshotWatchTimer);
+    this.snapshotWatchTimer = setTimeout(() => {
+      this.snapshotWatchTimer = null;
+      for (const sessId of snapshotWatchTargets(this.sessions, this.activeSessionId)) {
+        if ((this.snapshotAckAt.get(sessId) ?? 0) < triggeredAt) void this.fetchSessionSnapshot(sessId, { retry: true });
+      }
+    }, SNAPSHOT_ACK_TIMEOUT_MS);
+  }
+
+  /**
+   * HTTP 面的同一份快照，并按同一入口应用。同一会话同时最多一个请求。resolve 值：
+   * 快照 / null（后端没有快照）/ undefined（请求失败或已有请求在飞）。verifyOnly 不带
+   * dispatch 提示（服务端回最新 open dispatch，即恢复子轮），只读不应用。
+   */
+  private fetchSessionSnapshot(
+    sessId: string,
+    opts: { retry?: boolean; verifyOnly?: boolean } = {},
+  ): Promise<SessionSnapshot | null | undefined> {
+    const read = this.deps.readSessionSnapshot;
+    const sess = this.sessions.get(sessId);
+    if (!read || !sess || this.snapshotHttpInFlight.has(sessId)) return Promise.resolve(undefined);
+    this.snapshotHttpInFlight.add(sessId);
+    const requestedAt = Date.now();
+    const lifecycle = this.lifecycleEpoch;
+    return Promise.resolve()
+      .then(() => read(sessId, opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId)))
+      .then((snap) => {
+        this.snapshotHttpInFlight.delete(sessId);
+        if (lifecycle !== this.lifecycleEpoch) return undefined;
+        if (!isSessionSnapshot(snap)) return null;
+        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt });
+        return snap;
+      }, () => {
+        this.snapshotHttpInFlight.delete(sessId);
+        if (opts.retry && lifecycle === this.lifecycleEpoch) {
+          setTimeout(() => {
+            if (lifecycle === this.lifecycleEpoch) void this.fetchSessionSnapshot(sessId);
+          }, SNAPSHOT_ACK_TIMEOUT_MS);
+        }
+        return undefined;
+      });
   }
 
   private startWsAuthRecovery(): void {
@@ -3763,6 +3697,7 @@ export class ChatSocket {
     if (this.wsAuthRefreshInFlight) return;
     this.reconnectAttempts = 0;
     this.clearReconnectTimers();
+    this.armSnapshotWatchdog();
     if (this.ws && this.ws.readyState < 2) return;
     this.connect();
   }
@@ -3771,8 +3706,9 @@ export class ChatSocket {
     if (!this.deps.getToken()) return;
     if (!this.isBrowserOnline) return;
     if (this.wsAuthRefreshInFlight) return;
+    this.armSnapshotWatchdog();
     if (!this.ws || this.ws.readyState >= 2) {
-      // 已断/关闭 → 重连（带 cooldown 去抖）。重连成功后 onopen 会做 S1 对账。
+      // 已断/关闭 → 重连（带 cooldown 去抖）。重连后 hello 快照对齐状态，8s 内没有就走 HTTP。
       const now = Date.now();
       if (now - this.lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return;
       this.lastVisibilityReconnectAt = now;
@@ -3790,9 +3726,6 @@ export class ChatSocket {
     ) {
       this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
     }
-    // S1：切回前台无条件 REST 对账当前选中 + 近期 in-flight 会话——WS 探活只能发现死连接，
-    // 追不回锁屏期间已在服务端生成的内容；对账才能拉回并覆盖本地陈旧态。
-    this.reconcileVisibleAndInFlight();
   }
 
   /** 主动 bump epoch（登出/换号时由 hook 调，作废在飞续期）。*/
@@ -3930,9 +3863,9 @@ export class ChatSocket {
     }
     this.pruneProblemCardState(sessId);
     this.lastSyncAt.delete(sessId);
-    for (const key of this.activeReplayAttemptKeys) {
-      if (key.startsWith(`${sessId}:`)) this.activeReplayAttemptKeys.delete(key);
-    }
+    this.subscribedSessions.delete(sessId);
+    this.snapshotAckAt.delete(sessId);
+    this.wsSnapshotAt.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -3970,8 +3903,9 @@ export class ChatSocket {
     this.pendingRecoveryErrors.clear();
     this.reportedProblemCards.clear();
     this.problemCardSourceCodes.clear();
-    this.activeReplayAttemptKeys.clear();
-    this.pageHelloSent = false;
+    this.subscribedSessions.clear();
+    this.snapshotAckAt.clear();
+    this.wsSnapshotAt.clear();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
@@ -4056,6 +3990,7 @@ export class ChatSocket {
       updatedAt: s.updatedAt,
       _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
       _lastFrameSeq: s._lastFrameSeq,
+      ...(s._snapshotStream ? { _snapshotStream: { ...s._snapshotStream } } : {}),
       ...(s._sendingInFlight ? { _sendingInFlight: true } : {}),
       ...(s._sendingInFlight && isClientMessageId(s._activeClientMessageId)
         ? { _activeClientMessageId: s._activeClientMessageId }
@@ -4156,6 +4091,9 @@ export class ChatSocket {
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
     s._lastFrameSeq = stored._lastFrameSeq;
+    if (typeof stored._snapshotStream?.streamKey === "string" && typeof stored._snapshotStream.agentId === "string") {
+      s._snapshotStream = { ...stored._snapshotStream };
+    }
     s._maxSeq = stored._maxSeq;
     s._historyRevision = stored._historyRevision;
     if (typeof stored._archivedThroughSeq === "number") s._archivedThroughSeq = stored._archivedThroughSeq;
@@ -4319,10 +4257,7 @@ export class ChatSocket {
       clientMessageId: isClientMessageId(paint.clientMessageId) ? paint.clientMessageId : cmid,
       ...(typeof paint.traceId === "string" ? { traceId: paint.traceId } : {}),
     };
-    const timer = setTimeout(
-      () => this.materializePendingRecoveryError(s.id, "decision_timeout"),
-      RECOVERY_DECISION_GRACE_MS,
-    );
+    const timer = setTimeout(() => this.verifyDeferredRecovery(s.id, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
     if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
     this.pendingRecoveryErrors.set(s.id, {
       paint: restored,
@@ -4585,14 +4520,9 @@ export class ChatSocket {
     // no terminal assistant row follows it, adopt it so the source red card is
     // hidden and「模型繁忙，正在重试中（n/10）」shows, same as the live path.
     if (this.masterOwnsAutomaticRecovery) this.adoptPendingAutomaticRecoveryFromHistory(s);
-    // Login/reload can open WS before REST history arrives. If that initial
-    // shell hello may not include this session at all. Register idle cursors
-    // too: otherwise a cached high cursor survives a gateway restart and
-    // swallows the next turn's low-numbered output on this still-open socket.
-    // Active candidates retain their separate exact-turn replay identity.
-    if (full && this.ws && this.ws.readyState === 1) {
-      this.sendHelloFrame(false, sessId, true);
-    }
+    // A session loaded after this socket's hello subscribes now; its snapshot
+    // (and the server's cursor arbitration for a stale idle cursor) follows.
+    if (full) this.subscribeSession(sessId);
   }
 
   applyPermissionPromptSnapshot(
@@ -4642,6 +4572,7 @@ export class ChatSocket {
         checkpoint?.lastDurableFrameSeqBySessionKey ?? [],
       );
       let sawTapeProjection = false;
+      let latestSnapshot: SessionSnapshot | undefined;
       let maxTapeProjectionVersion: number | undefined;
       let frameCount = 0;
       let degraded = false;
@@ -4667,6 +4598,7 @@ export class ChatSocket {
             throw error;
           }
           pagesRead += 1;
+          if (isSessionSnapshot(page.snapshot)) latestSnapshot = page.snapshot;
           sawTapeProjection ||= page.hasTapeProjection === true;
           if (typeof page.tapeProjectionVersion === "number") {
             maxTapeProjectionVersion = Math.max(
@@ -4761,6 +4693,7 @@ export class ChatSocket {
               }
             } else if (isDurableFramesPage(raw)) {
               const firstPage = raw as DurableLiveFramePage;
+              if (isSessionSnapshot(firstPage.snapshot)) latestSnapshot = firstPage.snapshot;
               sawTapeProjection ||= firstPage.hasTapeProjection === true;
               if (typeof firstPage.tapeProjectionVersion === "number") {
                 maxTapeProjectionVersion = Math.max(
@@ -4834,6 +4767,11 @@ export class ChatSocket {
         typeof maxTapeProjectionVersion !== "number" &&
         sawTapeProjection && checkpoint?.sawTapeProjection !== true;
       const sess = this.sessions.get(sessId);
+      // New device / REST read: the page's snapshot head aligns the state after its frames.
+      if (sess && latestSnapshot) {
+        this.snapshotAckAt.set(sessId, Date.now());
+        this.applySnapshotHead(sess, latestSnapshot, true, false);
+      }
       const activeCmid = sess?._activeClientMessageId;
       const noLiveOwner = !activeCmid || !currentLiveOwners.has(activeCmid);
       const emptyInFlightBubble = !!sess?._sendingInFlight && noLiveOwner &&
@@ -5263,7 +5201,7 @@ export class ChatSocket {
       if (s._sendingInFlight && s._activeClientMessageId === cmid) {
         // 显式收口活跃轮:与 isFinal / error 收尾同一 clearSendingState 路径(清计时/tracker/
         // thinking-safety + persist + kick drain),避免发送态永挂。
-        this.clearSendingState(s, { clearThinking: true });
+        this.clearSendingState(s);
       }
       const stopSettlement = s._stopSettlement;
       if (stopSettlement?.clientMessageId === cmid && stopSettlement.controlId) {
@@ -6202,7 +6140,7 @@ export class ChatSocket {
       this.clearContinuousReconcile(sess.id);
       this.finishDispatch(sess.id, item.clientMessageId);
       sess._stopSettlement = undefined;
-      this.clearSendingState(sess, { clearThinking: true });
+      this.clearSendingState(sess);
     } else if (item.requestId) {
       // Our own durable answer is a settlement too: a stale hello catch-up
       // must not re-open this prompt after full-sync dropped the card.
@@ -6264,6 +6202,8 @@ export class ChatSocket {
       if (sess._sendingInFlight && sess._activeClientMessageId !== item.msgId) continue;
       this.dispatchSlots.set(item.sessId, item.msgId);
       item.state = "persisting";
+      // Claimed = being sent. 「待发送」只留给真正排在别的回合后面的消息。
+      this.setUserRowStatus(item, "sending");
       this.setTransientNotice(sess.id, "正在发送…");
       if(this.deps.authorizeSwitch&&item.payload.model&&!item.payload.content.imageEdit){
         void authorizeQueuedModelSwitch(item,this.deps.authorizeSwitch,{
@@ -6293,20 +6233,16 @@ export class ChatSocket {
     if (!this.offlineQueue.includes(item) || item.state !== "persisting") return;
     if (
       !this.ws || this.ws.readyState !== 1 || !this.relayReady ||
-      this.dispatchSlots.get(item.sessId) !== item.msgId
+      this.dispatchSlots.get(item.sessId) !== item.msgId ||
+      !this.safeWsSend(JSON.stringify(item.payload))
     ) {
       item.state = "queued";
-      return;
-    }
-    if (!this.safeWsSend(JSON.stringify(item.payload))) {
-      item.state = "queued";
+      this.setUserRowStatus(item, "queued");
       return;
     }
     item.state = "awaiting_admission";
     const sess = this.sessions.get(item.sessId);
     if (!sess) return;
-    const user = sess.messages.find((message) => message.role === "user" && message.id === item.msgId);
-    if (user) user.status = "sending";
     // Correlation identity is safe before admission and lets a terminal frame
     // that omits its optional clientMessageId still bind to this exact turn.
     // Submit itself must enter the "replying" affordance: waiting for admission
@@ -6321,12 +6257,20 @@ export class ChatSocket {
       sess._turnStartedAt = Date.now();
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
-      this.resetThinkingSafety(sess.id);
     }
     if (journalCommitted) this.clearTransientNotice(sess.id);
     else this.setTransientNotice(sess.id, "正在确认发送…");
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
+  }
+
+  private setUserRowStatus(item: OfflineItem, status: "queued" | "sending"): void {
+    const user = this.sessions.get(item.sessId)?.messages.find(
+      (message) => message.role === "user" && message.id === item.msgId,
+    );
+    if (!user || user.status === status) return;
+    user.status = status;
+    this.scheduleNotify();
   }
 
   /** Pull a not-yet-sent message back into the composer and drop it from the queue. */
@@ -6568,7 +6512,7 @@ export class ChatSocket {
     } else {
       if (activeClientMessageId) this.finishDispatch(sess.id, activeClientMessageId);
       this.dispatchSlots.delete(sess.id);
-      this.clearSendingState(sess, { clearThinking: true });
+      this.clearSendingState(sess);
       sess._recoveryStatus = { kind: "completed" };
     }
     this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
@@ -6696,7 +6640,7 @@ export class ChatSocket {
       if (!sess.messages.some((m) => m && m._isAutoRetry && m._idem === idem)) continue;
       if (!sess._sendingInFlight) return;
       this.finishDispatch(sess.id, sess._activeClientMessageId);
-      this.clearSendingState(sess, { clearTiming: false, resetTracker: false, clearThinking: true });
+      this.clearSendingState(sess, { clearTiming: false, resetTracker: false });
       this.scheduleNotify();
       return;
     }

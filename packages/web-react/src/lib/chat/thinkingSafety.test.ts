@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
-import { THINKING_SAFETY_MS } from "./pure";
+import { KEEPALIVE_INTERVAL_MS, PROBE_TIMEOUT_KEEPALIVE_MS } from "./pure";
 
 /**
- * S3 thinking-safety 重构 + transient 软提示 + 发送失败重试的行为测试。
+ * 长时间无帧不再本地猜测 + transient 软提示 + 发送失败重试的行为测试。
  *
- * 覆盖（对应任务红线要求）：
- *  - liveness 分流：连接死链 → 强制重连、不误报/不插消息；连接活 + 超帧 → transient 软提示；
+ * 覆盖：
+ *  - 久无帧：回合生死只看服务端快照，本地不发 stop、不插消息、不清 in-flight、不挂软提示；
+ *  - 死链由 keepalive 探活发现 → 重连，未受理 turn 回队列重放，行保持「发送中」；
  *  - transient 不入 messages、不落 IndexedDB（toStored 不含它）；
  *  - transient 清除时机（用户手动停止）；
  *  - retryMessage 复用原 payload 原地重发（不新增气泡、保留附件）。
@@ -85,7 +86,7 @@ function admitLatest(sock: ChatSocket, ws: FakeWS, sessId = "s1"): void {
   }) });
 }
 
-describe("thinking-safety liveness 分流（S3）", () => {
+describe("久无帧不再本地猜测（快照是唯一裁决）", () => {
   afterEach(() => {
     FakeWS.instances = [];
     FakeWS.autoPong = true;
@@ -93,12 +94,11 @@ describe("thinking-safety liveness 分流（S3）", () => {
     vi.useRealTimers();
   });
 
-  test("连接活 + 10min 无帧 → transient 软提示（不发 stop、不插消息、不清 in-flight）", () => {
+  test("连接活 + 长时间无帧 → 不发 stop、不插消息、不清 in-flight、不挂软提示", () => {
     vi.useFakeTimers();
-    FakeWS.autoPong = true; // keepalive 有 pong → 连接确认存活
+    FakeWS.autoPong = true;
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const persistSession = vi.fn();
-    const sock = makeSocket({ persistSession });
+    const sock = makeSocket();
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
@@ -107,23 +107,19 @@ describe("thinking-safety liveness 分流（S3）", () => {
     const s = sock.sessions.get("s1")!;
     const msgCountBefore = s.messages.length;
 
-    vi.advanceTimersByTime(THINKING_SAFETY_MS + 2000);
+    vi.advanceTimersByTime(30 * 60_000);
 
-    const notice = sock.getTransientNotice("s1");
-    expect(notice?.text).toContain("较长时间未收到新内容");
-    // B4:不再引导「停止后重新发送」——那会打断已付费的回合再付一轮。
-    expect(notice?.text).toContain("本轮可能仍在运行，可以继续等待");
-    expect(notice?.text).not.toMatch(/停止后重新发送|重新发送|重发/);
-    expect(s._sendingInFlight).toBe(true); // in-flight 未被清（turn 生死交给 server）
-    expect(s.messages.length).toBe(msgCountBefore); // 没有插入任何消息
-    expect(s.messages.some((m) => m._emptyTurn)).toBe(false);
-    expect(anySent((d) => d.includes("inbound.control.stop"))).toBe(false); // 未自动 stop
+    expect(sock.getTransientNotice("s1")).toBeNull();
+    expect(s._sendingInFlight).toBe(true);
+    expect(s.messages.length).toBe(msgCountBefore);
+    expect(anySent((d) => d.includes("inbound.control.stop"))).toBe(false);
+    expect(FakeWS.instances).toHaveLength(1);
     sock.stop();
   });
 
-  test("连接死链 → 强制重连并把未受理 turn 安全回队列（无 stop / 无空轮消息 / 无 transient）", () => {
+  test("死链由 keepalive 探活发现 → 重连，未受理 turn 回队列重放且仍显示发送中", () => {
     vi.useFakeTimers();
-    FakeWS.autoPong = false; // keepalive 无 pong → 链路未确认存活（死链）
+    FakeWS.autoPong = false;
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.setGateReady(true);
@@ -131,17 +127,15 @@ describe("thinking-safety liveness 分流（S3）", () => {
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
     const s = sock.sessions.get("s1")!;
 
-    vi.advanceTimersByTime(THINKING_SAFETY_MS + 5000);
+    vi.advanceTimersByTime(KEEPALIVE_INTERVAL_MS + PROBE_TIMEOUT_KEEPALIVE_MS + 5000);
 
-    // 死链下：绝不产生"本轮无响应/超时"这类误报；未收到 durable admission 的
-    // exact payload 回到 journal 队列，待新连接 relay-ready 后重放。
     expect(s.messages.some((m) => m._emptyTurn)).toBe(false);
     expect(anySent((d) => d.includes("inbound.control.stop"))).toBe(false);
     expect(sock.getTransientNotice("s1")).toBeNull();
     expect(s._sendingInFlight).toBeFalsy();
-    expect(s.messages.find((message) => message.role === "user")?.status).toBe("queued");
+    expect(s.messages.find((message) => message.role === "user")?.status).toBe("sending");
     expect(sock.offlineQueue.filter((item) => item.sessId === "s1")).toHaveLength(1);
-    expect(FakeWS.instances.length).toBeGreaterThan(1); // 死链已触发 close→reconnect
+    expect(FakeWS.instances.length).toBeGreaterThan(1);
     sock.stop();
   });
 });
@@ -154,24 +148,23 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     vi.useRealTimers();
   });
 
-  test("transient 不进 messages、不进 toStored（不落盘）", () => {
+  /** 本地 journal 写入未完成时，pump 认领后挂「正在发送…」软提示。 */
+  function sendingNotice() {
     vi.useFakeTimers();
-    FakeWS.autoPong = true;
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
+    const sock = makeSocket({ persistPendingDispatch: () => new Promise<void>(() => {}) });
     sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
+    FakeWS.instances.at(-1)!.open();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
-    admitLatest(sock, ws);
+    return sock;
+  }
 
-    vi.advanceTimersByTime(THINKING_SAFETY_MS + 2000);
-    expect(sock.getTransientNotice("s1")).not.toBeNull(); // 已设置
-
+  test("transient 不进 messages、不进 toStored（不落盘）", () => {
+    const sock = sendingNotice();
+    expect(sock.getTransientNotice("s1")?.text).toBe("正在发送…");
     const stored = sock.toStored("s1")!;
-    expect(JSON.stringify(stored)).not.toContain("较长时间未收到新内容"); // 序列化不含它
+    expect(JSON.stringify(stored)).not.toContain("正在发送…");
     expect((stored as Record<string, unknown>)._transientNotice).toBeUndefined();
-    expect(stored.messages.some((m) => m._emptyTurn)).toBe(false);
     sock.stop();
   });
 
@@ -210,24 +203,11 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
   });
 
   test("用户手动停止 → 清除 transient 软提示", () => {
-    vi.useFakeTimers();
-    FakeWS.autoPong = true;
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
-    admitLatest(sock, ws);
-    vi.advanceTimersByTime(THINKING_SAFETY_MS + 2000);
+    const sock = sendingNotice();
     expect(sock.getTransientNotice("s1")).not.toBeNull();
-
     sock.stopTurn("s1");
     expect(sock.getTransientNotice("s1")).toBeNull();
-    // Stop is a durable control now: keep the turn visibly busy until Master
-    // confirms the exact request reached a terminal state.
-    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(true);
-    expect(sock.sessions.get("s1")!._recoveryStatus?.kind).toBe("stopping");
+    sock.stop();
   });
 });
 

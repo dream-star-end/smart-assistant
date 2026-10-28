@@ -707,19 +707,16 @@ export type ChatSession = {
   _turnStatus?: TurnStatusState | null;
   /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
   _turnDetachedAt?: number;
+  /** Stream of the last applied session snapshot. Hello / HTTP report it with the
+   * matching sessionKey cursor so the server returns only frames after it. */
+  _snapshotStream?: { streamKey: string; agentId: string };
+  /** Actual-debit projection for one client message; retain its settled value after final. */
+  _turnCredits?: { clientMessageId: string; settled: string; requests: number; asOf: number; receivedAt: number };
   /** Live one-line progress from outbound.turn_status status=working. Session
    *  memory only — not a message row, not written to persist snapshots. */
   _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
-  /**
-   * Turn whose live frames this browser is re-reading through an
-   * `outbound.active_turn_replay_start` backlog (reload / reconnect). Its
-   * tape-commit completion settles at once from REST instead of waiting for a
-   * live tail that is still queued behind the replay (OCV5-427). Session
-   * memory only — not written to persist snapshots.
-   */
-  _resumeReplayClientMessageId?: string;
   /**
    * Browser-only stop settlement fence. A successful online Stop stays busy
    * until this exact turn reaches a terminal frame and the authoritative REST
@@ -806,8 +803,6 @@ export type ChatSession = {
   _turnCostSeenRequestIds?: Set<string>;
   /** Session-wide replay fence for cost badges, retained across turn boundaries. */
   _costChargedSeenRequestIds?: Set<string>;
-  /** Same actual-debit projection as SessionSnapshot.credits. */
-  _turnCredits?: { settled: string; requests: number; asOf: number };
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
