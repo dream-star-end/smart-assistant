@@ -31,6 +31,7 @@ SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-su
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-build-jobs.sh"
 
 mlog() { echo "$*" >&2; }
 
@@ -39,6 +40,7 @@ mlog() { echo "$*" >&2; }
 cleanup_master_staging() {
   local candidate canon root_canon parent parent_dev root_dev st_dev st_ino
   local live_canon worktree_canon
+  reap_master_build_jobs
   # 门的临时测试库、临时目录跟 staging 同生命周期:所有失败路径(含 EXIT trap)都经过这里。
   # 测试库要用 staging 里的 node_modules/pg 删,所以排在删 staging 之前。
   master_gate_db_drop
@@ -1022,95 +1024,192 @@ build_master_release() {
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
   master_gate_receipt_prepare "$staging" "$full_sha"
-  # P2(OCV5-648):确定性的非 Box 门(不连本班列车测试库,没有按负载放大的等待预算)和后台 runtime 构建
-  # 并行跑,省掉 Box 门前那段空等(约 5.5 分钟)。Box 门和按负载放大等待的 ccb-mcp 门仍在构建结束、
-  # 主机空闲之后才跑(OCV5-557)。门的集合、命令和 pinned staging 都没变,只换了先后。
-  tsum_mark C.cursor-sand 2>/dev/null || :
-  mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
-    cleanup_master_staging
-    die "pinned Cursor Sand InferenceService contract gate 失败"
-  fi
-  tsum_mark C.delegate-billing 2>/dev/null || :
-  mlog "  delegate engine billing requestId contract gate @ pinned staging"
-  if ! master_gate_receipt_has delegate-billing-requestid "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
-    cleanup_master_staging
-    die "pinned delegate engine billing requestId contract gate 失败"
-  fi
-  tsum_mark C.callback-ws 2>/dev/null || :
-  mlog "  callback payload hash WS proof @ pinned staging"
-  if ! master_gate_receipt_has callback-payload-hash "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
-    cleanup_master_staging
-    die "pinned callback payload hash WS proof 失败"
-  fi
-  tsum_mark C.cron-submit 2>/dev/null || :
-  mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
-  if ! master_gate_receipt_has cron-submit-boundary "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
-    cleanup_master_staging
-    die "pinned cron submit durability boundary gate 失败"
-  fi
-  tsum_mark C.prompt-privacy 2>/dev/null || :
-  mlog "  fresh prompt privacy lifecycle proof @ pinned staging"
-  if ! master_gate_receipt_has prompt-privacy-lifecycle "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned prompt privacy lifecycle proof 失败"
-  fi
-  tsum_mark C.system-approval 2>/dev/null || :
-  mlog "  durable system approval fencing proof @ pinned staging"
-  if ! master_gate_receipt_has system-approval-fencing "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned system approval fencing proof failed"
-  fi
-  tsum_mark C.system-executor 2>/dev/null || :
-  mlog "  independent browser approval and frozen executor proof @ pinned staging"
-  if ! master_gate_receipt_has system-executor-fencing "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
-    cleanup_master_staging
-    die "pinned system executor fencing proof failed"
-  fi
-  tsum_mark C.session-rootfix 2>/dev/null || :
-  mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
-  if ! master_gate_receipt_has session-unavailable-rootfix "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
-    cleanup_master_staging
-    die "pinned session unavailable / data-safety rootfix contract gate 失败"
-  fi
-  tsum_mark C.host-log-policy 2>/dev/null || :
-  mlog "  host log policy filesystem/logrotate gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-host-log-policy.test.sh ); then
-    cleanup_master_staging
-    die "pinned host log policy filesystem/logrotate gate 失败"
-  fi
+  # P3: C/D share up to three load-budgeted slots; Box/ccb-mcp stay isolated.
+  # Keep literal commands in these nested functions: parity/incident gates inspect this body.
+  tsum_mark C.parallel 2>/dev/null || :
+  MASTER_BUILD_JOB_FAILED=0
+  master_job_cursor_sand() {
+    mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
+      mlog "pinned Cursor Sand InferenceService contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_delegate_billing() {
+    mlog "  delegate engine billing requestId contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
+      mlog "pinned delegate engine billing requestId contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_callback_ws() {
+    mlog "  callback payload hash WS proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
+      mlog "pinned callback payload hash WS proof 失败"
+      return 1
+    fi
+  }
+  master_job_cron_submit() {
+    mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
+      mlog "pinned cron submit durability boundary gate 失败"
+      return 1
+    fi
+  }
+  master_job_prompt_privacy() {
+    mlog "  fresh prompt privacy lifecycle proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-prompt-privacy-proofs.ts ); then
+      mlog "pinned prompt privacy lifecycle proof 失败"
+      return 1
+    fi
+  }
+  master_job_system_approval() {
+    mlog "  durable system approval fencing proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
+      mlog "pinned system approval fencing proof failed"
+      return 1
+    fi
+  }
+  master_job_system_executor() {
+    mlog "  independent browser approval and frozen executor proof @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-executor-proofs.ts ); then
+      mlog "pinned system executor fencing proof failed"
+      return 1
+    fi
+  }
+  master_job_session_rootfix() {
+    mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
+      mlog "pinned session unavailable / data-safety rootfix contract gate 失败"
+      return 1
+    fi
+  }
+  master_job_host_log_policy() {
+    mlog "  host log policy filesystem/logrotate gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-host-log-policy.test.sh ); then
+      mlog "pinned host log policy filesystem/logrotate gate 失败"
+      return 1
+    fi
+  }
   # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
   # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
   # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
-  tsum_mark C.architecture 2>/dev/null || :
-  mlog "  architecture guardrails (report period) @ pinned staging"
-  if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
-    cleanup_master_staging
-    die "新候选缺 scripts/check-architecture.ts"
-  fi
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
-      --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
-    cleanup_master_staging
-    die "pinned architecture guardrails 失败(检查器 fail-closed)"
-  fi
-  master_note_architecture "$MASTER_GATE_TMPDIR/architecture.json"
+  master_job_architecture() {
+    mlog "  architecture guardrails (report period) @ pinned staging"
+    if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
+      mlog "新候选缺 scripts/check-architecture.ts"
+      return 1
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
+        --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+      mlog "pinned architecture guardrails 失败(检查器 fail-closed)"
+      return 1
+    fi
+  }
   # OCV5-404:committed 后会把本 release 的 watch.sh 装到宿主,所以它的判定逻辑与停用/重新武装
   # 行为必须先在 pinned staging 上过一遍。测试只写 mktemp 目录,不碰宿主标记与安装副本。
   # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
   # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
   # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
-  tsum_mark C.watch-gate 2>/dev/null || :
-  mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
-  # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
-  if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
+  master_job_watch_gate() {
+    mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
+    # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
+    if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
+      mlog "新候选缺 scripts/v5-selfhost-watch-gate.sh"
+      return 1
+    fi
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
+        --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
+      mlog "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+      return 1
+    fi
+  }
+  master_job_frontend() {
+    t0="$(date +%s)"
+    web_key="$(master_web_dist_key "$full_sha" || true)"
+    web_donor=""
+    if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
+      web_donor="$(find_web_dist_donor "$web_key" || true)"
+    fi
+    if [[ -n "$web_donor" ]]; then
+      mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
+      if ! copy_verified_web_dist "$web_donor" "$staging"; then
+        mlog "复用 web dist 失败或复制后的摘要不符(donor=$web_donor)"
+        return 1
+      fi
+      MASTER_FRONTEND_MODE="reused"
+    else
+      [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
+      mlog "  web-react official build @ staging(不碰工作树 dist)"
+      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
+        mlog "staging web-react 构建失败"
+        return 1
+      fi
+      MASTER_FRONTEND_MODE="built"
+    fi
+    t1="$(date +%s)"
+    MASTER_FRONTEND_ELAPSED_S="$((t1 - t0))"
+    mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s mode=$MASTER_FRONTEND_MODE"
+    [[ -f "$staging/packages/web-react/dist/index.html" ]] || {
+      mlog "构建后缺 staging dist/index.html"
+      return 1
+    }
+    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$staging/packages/web-react/dist/index.html" \
+      | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
+    [[ -n "$build_id" ]] || {
+      mlog "staging dist/index.html 缺 oc-build meta"
+      return 1
+    }
+    mlog "  dist oc-build=$build_id"
+    if ! write_web_dist_reuse_record "$staging" "$web_key" "$MASTER_FRONTEND_MODE" "$full_sha" "$web_donor"; then
+      mlog "写 $WEB_DIST_REUSE_RECORD 失败"
+      return 1
+    fi
+
+    printf '%s %s\n' "$MASTER_FRONTEND_MODE" "$MASTER_FRONTEND_ELAPSED_S" >"$MASTER_GATE_TMPDIR/frontend.result"
+  }
+
+  local job job_id job_fn gate_id
+  for job in \
+    C.session-rootfix:master_job_session_rootfix:session-unavailable-rootfix \
+    C.watch-gate:master_job_watch_gate:watch-gate \
+    D:master_job_frontend \
+    C.cursor-sand:master_job_cursor_sand \
+    C.delegate-billing:master_job_delegate_billing:delegate-billing-requestid \
+    C.callback-ws:master_job_callback_ws:callback-payload-hash \
+    C.cron-submit:master_job_cron_submit:cron-submit-boundary \
+    C.prompt-privacy:master_job_prompt_privacy:prompt-privacy-lifecycle \
+    C.system-approval:master_job_system_approval:system-approval-fencing \
+    C.system-executor:master_job_system_executor:system-executor-fencing \
+    C.host-log-policy:master_job_host_log_policy \
+    C.architecture:master_job_architecture \
+  ; do
+    IFS=: read -r job_id job_fn gate_id <<<"$job"
+    # Receipt decisions write summary evidence only in the parent. A hit never
+    # bypasses a prior worker failure; all local jobs still meet the final barrier.
+    if ! master_build_jobs_poll; then
+      cleanup_master_staging
+      die "pinned C/D 并行任务失败(收据不能绕过已失败任务)"
+    fi
+    if [[ -n "$gate_id" ]] && master_gate_receipt_has "$gate_id" "$full_sha"; then continue; fi
+    if ! master_build_job_start "$job_id" "$job_fn"; then
+      cleanup_master_staging
+      die "pinned C/D 并行任务失败或负载预算超时"
+    fi
+  done
+  if ! master_build_jobs_wait; then
     cleanup_master_staging
-    die "新候选缺 scripts/v5-selfhost-watch-gate.sh"
+    die "pinned C/D 并行任务失败(逐项退出码与日志见上)"
   fi
-  if ! master_gate_receipt_has watch-gate "$full_sha" && ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
-      --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
+  # Only the parent writes the summary; never source/eval a worker's result.
+  local frontend_extra
+  if ! read -r MASTER_FRONTEND_MODE MASTER_FRONTEND_ELAPSED_S frontend_extra <"$MASTER_GATE_TMPDIR/D/frontend.result" \
+    || [[ ! "$MASTER_FRONTEND_MODE" =~ ^(built|reused)$ || ! "$MASTER_FRONTEND_ELAPSED_S" =~ ^[0-9]+$ || -n "$frontend_extra" ]]; then
     cleanup_master_staging
-    die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+    die "frontend 结果缺失/非法"
   fi
+  tsum_note frontendElapsedSec "$MASTER_FRONTEND_ELAPSED_S" 2>/dev/null || :
+  master_note_architecture "$MASTER_GATE_TMPDIR/C.architecture/architecture.json"
   tsum_mark C.box-success-recovery 2>/dev/null || :
   # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。
   if declare -F await_runtime_release_bg >/dev/null; then
@@ -1182,48 +1281,6 @@ build_master_release() {
     die "pinned CCB MCP availability contract gate 失败"
   fi
   cleanup_master_gate_tmpdir
-
-  tsum_mark D 2>/dev/null || :
-  t0="$(date +%s)"
-  web_key="$(master_web_dist_key "$full_sha" || true)"
-  web_donor=""
-  if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
-    web_donor="$(find_web_dist_donor "$web_key" || true)"
-  fi
-  if [[ -n "$web_donor" ]]; then
-    mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
-    if ! copy_verified_web_dist "$web_donor" "$staging"; then
-      cleanup_master_staging
-      die "复用 web dist 失败或复制后的摘要不符(donor=$web_donor)"
-    fi
-    MASTER_FRONTEND_MODE="reused"
-  else
-    [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
-    mlog "  web-react official build @ staging(不碰工作树 dist)"
-    if ! ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
-      cleanup_master_staging
-      die "staging web-react 构建失败"
-    fi
-    MASTER_FRONTEND_MODE="built"
-  fi
-  t1="$(date +%s)"
-  MASTER_FRONTEND_ELAPSED_S="$((t1 - t0))"
-  mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s mode=$MASTER_FRONTEND_MODE"
-  [[ -f "$staging/packages/web-react/dist/index.html" ]] || {
-    cleanup_master_staging
-    die "构建后缺 staging dist/index.html"
-  }
-  build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$staging/packages/web-react/dist/index.html" \
-    | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
-  [[ -n "$build_id" ]] || {
-    cleanup_master_staging
-    die "staging dist/index.html 缺 oc-build meta"
-  }
-  mlog "  dist oc-build=$build_id"
-  if ! write_web_dist_reuse_record "$staging" "$web_key" "$MASTER_FRONTEND_MODE" "$full_sha" "$web_donor"; then
-    cleanup_master_staging
-    die "写 $WEB_DIST_REUSE_RECORD 失败"
-  fi
 
   tsum_mark P.mcp-bundle 2>/dev/null || :
   # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,

@@ -233,6 +233,8 @@ cleanup_selfhost_deploy() {
     prewarm_cleanup_invocation "$exit_rc" || :
     return "$exit_rc"
   fi
+  # P3: no lease/train release or staging cleanup while our C/D workers still run.
+  reap_master_build_jobs
   tsum_finish "$exit_rc" 2>/dev/null || :
   # Owner loss forbids successor state/holder writes from this invocation.
   [[ "$exit_rc" == 86 ]] && return 86

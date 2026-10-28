@@ -89,9 +89,11 @@ test('build_master_release reuses a matching dist instead of running the web bui
  const f=fixture(t);const k=key(f,f.base);const live=release(f,'rel-live',{key:k});symlinkSync(live,join(f.dir,'live'));
  // Extract just the frontend section of build_master_release and run it against a staging dir.
  const bmr=fn(m,'build_master_release');
- const section=block(bmr,/^  t0="\$\(date \+%s\)"\n  web_key=/m,/^  # openclaude-memory MCP server/m);
+ // P3 moves the same reuse/build contract into the scheduled D worker.
+ const section=block(bmr,/^  master_job_frontend\(\) \{/m,/^  local job\b/m);
  const body=['staging="$TEST_ROOT/staging"; full_sha='+q(f.base)+'; mkdir -p "$staging/packages/web-react"','cleanup_master_staging() { :; }',
-  'npm() { echo NPM_BUILD_RAN >&2; return 99; }',section,'echo "mode=$MASTER_FRONTEND_MODE"; cat "$staging/.web-dist-reuse.json"'].join('\n');
+  'npm() { echo NPM_BUILD_RAN >&2; return 99; }',
+  'MASTER_GATE_TMPDIR="$TEST_ROOT"',section,'master_job_frontend || die frontend-failed','echo "mode=$MASTER_FRONTEND_MODE"; cat "$staging/.web-dist-reuse.json"'].join('\n');
  const out=bash(f,webLib,body);const s=ok(out);
  assert.match(s,/mode=reused/);assert.doesNotMatch(out.stderr,/NPM_BUILD_RAN/);
  const rec=JSON.parse(s.slice(s.indexOf('{')));assert.equal(rec.key,k);assert.equal(rec.mode,'reused');assert.equal(rec.donor,live);
@@ -166,7 +168,9 @@ test('cmd_deploy wires the bg runtime build around build_master_release and the 
  assert.ok(optIn>=0&&optIn<cd.indexOf('build_master_release "$sha"'));
  assert.ok(cd.indexOf('collect_runtime_release_bg "$sha"')>cd.indexOf('build_master_release "$sha"')&&cd.indexOf('collect_runtime_release_bg "$sha"')<cd.indexOf('build_platform_bundle "$sha"'));
  assert.doesNotMatch(cd,/^\s+build_runtime_release "\$sha"/m);
- const cleanup=fn(d,'cleanup_selfhost_deploy');assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
+ const cleanup=fn(d,'cleanup_selfhost_deploy');
+ assert.ok(cleanup.indexOf('reap_master_build_jobs')<cleanup.indexOf('lease_train_on_exit'),'C/D drained before train/lock release');
+ assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
 });
 
 test('if the parent is killed outright (no EXIT trap), the bg build keeps holding the deploy lock fd until it finishes',async t=>{
@@ -201,7 +205,11 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
  assert.ok(wait<idle&&idle<db&&db<drop);
  const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
  const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.ccb-mcp']);
- assert.equal(marks.length,15,`same 15 gates: ${marks.map(x=>x[0]).join(' ')}`);
+ // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
+ assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
+ const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
+ assert.equal(queued.length,11);assert.equal(new Set(queued).size,11);
+ assert.ok(at('  if ! master_build_jobs_wait;')<wait,'C/D drained before runtime/Box barrier');
  for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
  // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)
  const boxMark=at('  tsum_mark C.box-success-recovery ');assert.ok(boxMark<wait&&wait-boxMark<400);

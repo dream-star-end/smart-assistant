@@ -242,7 +242,14 @@ test('missing/malformed evidence, verifier errors and rerun races never return a
 
 const shell = read('scripts/lib/v5-selfhost-gate-receipts.sh')
 const master = read('scripts/v5-selfhost-master-release-lib.sh')
-const guards = [...master.matchAll(/ {2}if ! master_gate_receipt_has ([a-z-]+) "\$full_sha" && ! \([\s\S]*?\n {2}fi/g)]
+// P3 moves P8's receipt decision to parent admission; workers never write summary notes.
+const receiptJobs = [...master.matchAll(/^ {4}(C\.[a-z-]+):(master_job_\w+):([a-z-]+) \\$/gm)]
+const admission = master.match(/^ {4}IFS=: read -r job_id job_fn gate_id[\s\S]*?^ {2}done/m)![0]
+function jobFunction(name: string) {
+  const body = master.match(new RegExp(`^ {2}${name}\\(\\) \\{[\\s\\S]*?^ {2}\\}`, 'm'))
+  assert.ok(body, name)
+  return body[0]
+}
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
 function bash(body: string, dir: string) {
   return spawnSync('bash', ['-eu', '-o', 'pipefail', '-c', `${shell}\n${body}`], {
@@ -252,10 +259,10 @@ function bash(body: string, dir: string) {
   })
 }
 
-test('all real train guard blocks rerun misses, propagate failure, and accept verified evidence', t => {
+test('all real parent admissions rerun misses, propagate failure, and accept verified evidence', t => {
   const dir = fixture(t)
-  assert.deepEqual(guards.map(m => m[1]).sort(), [...data.gates].sort())
-  for (const guard of guards) {
+  assert.deepEqual(receiptJobs.map(m => m[3]).sort(), [...data.gates].sort())
+  for (const job of receiptJobs) {
     for (const state of ['miss', 'hit', 'wrong-sha']) {
       for (const rc of [0, 41]) {
         const setup = `
@@ -266,11 +273,17 @@ die() { exit 42; }
 npx() { echo LOCAL; return ${rc}; }
 node() { echo LOCAL; return ${rc}; }
 bash() { echo LOCAL; return ${rc}; }
+master_build_jobs_poll() { return 0; }
+master_build_job_start() { shift; "$@"; }
 full_sha=${sha}
 staging=${quote(dir)}
 MASTER_GATE_TMPDIR=${quote(dir)}
+mkdir -p "$staging/scripts"
+touch "$staging/scripts/v5-selfhost-watch-gate.sh"
 ${state === 'miss' ? '' : `MASTER_GATE_RECEIPT_IDS=${quote(data.gates.join('\n'))}\nMASTER_GATE_RECEIPT_SHA=${state === 'hit' ? sha : 'b'.repeat(40)}`}
-${guard[0]}
+${jobFunction(job[2]!)}
+for job in ${quote(`${job[1]}:${job[2]}:${job[3]}`)}; do
+${admission}
 echo COMPLETE`
         const result = bash(setup, dir)
         assert.equal(result.status, state === 'hit' || rc === 0 ? 0 : 42, result.stderr)
@@ -357,7 +370,9 @@ test('producer, train and policy agree; host gates remain local and parity cover
       : gate.script.endsWith('.mjs') ? `node ${gate.script}`
       : `bash ${gate.script} --log-dir "$RUNNER_TEMP/watch-gate"`
     assert.equal(step.run, command)
-    assert.ok(guards.find(m => m[1] === id)![0].includes(gate.script))
+    const queued = receiptJobs.find(m => m[3] === id)
+    assert.ok(queued, id)
+    assert.ok(jobFunction(queued[2]!).includes(gate.script))
   }
   for (const host of ['box-success-recovery', 'box-continuation', 'box-incident-proofs', 'ccb-mcp-availability',
     'cursor-sand-inference', 'host-log-policy', 'architecture', 'web-react-production-build',
