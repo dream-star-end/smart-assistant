@@ -487,3 +487,125 @@ test("web copy rejects corruption and donor mutation after lookup using frozen v
     test ! -e "$T/staging/packages/web-react/dist"
   `));
 });
+
+// Exercise the caller after rejection, not just the cache predicate. Expensive compilers are
+// fixture stubs; archive/prune, receipt validation, adoption and selection are production code.
+const coldRuntime = `
+  DRY=0
+  docker() { [[ "$1 $2" == 'image inspect' ]]; echo "$IMAGE"; }
+  write_flavor_manifest() { [[ "$2" == selfhost && "$3" == "$SHA" ]]; echo '{}' >"$1/flavor.manifest.json"; }
+  oc_hotcfg_finalize_release() {
+    echo called >>"$T/cold-calls"
+    [[ "$2" == "$IMAGE" && "$3" == "$SHA" && "$5" == test-cap ]] || return 91
+    test "$(cat "$1/packages/protocol/src/marker")" = protocol || return 92
+    command mv -T "$1" "$OC_HOTCFG_RELEASES_ROOT/rel-fedcba987654" || return 93
+    echo "$OC_HOTCFG_RELEASES_ROOT/rel-fedcba987654"
+  }
+  ln -s "$T/unchanged-live" "$MASTER_LIVE_LINK"
+`;
+for (const [reason, invalidate] of [
+  ["missing receipt", 'rm "$T/cache/runtime.json"'],
+  ["different image", `IMAGE=sha256:${"b".repeat(64)}`],
+  ["different source", `jq '.sourceCommit = "${"b".repeat(40)}"' "$rel/MANIFEST.json" >"$T/manifest"; mv "$T/manifest" "$rel/MANIFEST.json"`],
+  ["different capabilities", `jq '.capabilities = ["other-cap"]' "$rel/MANIFEST.json" >"$T/manifest"; mv "$T/manifest" "$rel/MANIFEST.json"`],
+  ["corrupted bytes", 'echo corrupt >"$rel/packages/mcp-memory/dist/oc-memory.cjs"'],
+  ["failed adoption", 'mv() { return 51; }'],
+]) {
+  test(`ordinary runtime fallback builds pinned source once after ${reason}`, (t) => {
+    const f = fixture(t);
+    f.put("packages/protocol/src/marker", "dirty-protocol");
+    const r = run(f, `${runtimeFixture}${coldRuntime}
+      ${invalidate}
+      build_runtime_release "$SHA"
+      test "$(wc -l <"$T/cold-calls")" = 1
+      test "$BUILT_RUNTIME_RELEASE" = "$T/official/rel-fedcba987654"
+      test "$(cat "$BUILT_RUNTIME_RELEASE/packages/protocol/src/marker")" = protocol
+      test "$(readlink "$MASTER_LIVE_LINK")" = "$T/unchanged-live"
+      test ! -e "$T/official/rel-0123456789ab"
+      test -z "$(find "$T/official" -maxdepth 1 -name '.staging*' -print)"
+    `);
+    ok(r);
+    assert.doesNotMatch(r.stderr, /runtime prewarm hit/);
+  });
+}
+
+test("ordinary runtime failure after a prewarm miss stays fatal without retry or live change", (t) => {
+  const f = fixture(t);
+  const r = run(f, `${coldRuntime}
+    oc_hotcfg_finalize_release() { echo called >>"$T/cold-calls"; return 58; }
+    build_runtime_release "$SHA"
+    touch "$T/accepted"
+  `);
+  assert.equal(r.status, 73, r.stderr);
+  assert.match(r.stderr, /release finalize/);
+  assert.doesNotMatch(r.stderr, /runtime prewarm hit/);
+  assert.equal(readFileSync(join(f.dir, "cold-calls"), "utf8"), "called\n");
+  assert.equal(existsSync(join(f.dir, "accepted")), false);
+  ok(run(f, 'test "$(readlink "$MASTER_LIVE_LINK")" = "$T/unchanged-live"'));
+});
+
+const master = readFileSync(join(root, "scripts/v5-selfhost-master-release-lib.sh"), "utf8");
+const frontend = fn(master, "build_master_release").match(
+  /^ {2}t0="\$\(date \+%s\)"\n {2}web_key=[\s\S]*?(?=^ {2}tsum_mark P\.mcp-bundle)/m,
+);
+assert.ok(frontend, "production frontend block");
+const trainFrontend = `
+  staging="$T/staging"; full_sha="$SHA"
+  git -C "$REPO_ROOT" archive "$SHA" | tar -x -C "$staging"
+  ln -s "$T/unchanged-live" "$MASTER_LIVE_LINK"
+  cleanup_master_staging() { echo cleaned >>"$T/cleanup"; rm -rf "$staging"; }
+  npm() {
+    echo called >>"$T/web-calls"
+    [[ "$*" == 'run build --workspace packages/web-react' && "$NODE_OPTIONS" == --max-old-space-size=4096 ]] || return 91
+    mkdir -p packages/web-react/dist
+    echo '<meta name="oc-build" content="abcdef123456">' >packages/web-react/dist/index.html
+    cp packages/web-react/src/marker packages/web-react/dist/pin.txt
+  }
+`;
+for (const [reason, invalidate, expectedMode] of [
+  ["verified private donor", ":", "reused"],
+  ["backend-only new SHA", 'full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"', "reused"],
+  ["missing record", 'rm "$bucket/$WEB_DIST_REUSE_RECORD"', "built"],
+  ["malformed record", 'echo broken >"$bucket/$WEB_DIST_REUSE_RECORD"', "built"],
+  ["corrupted dist", 'echo corrupt >"$bucket/packages/web-react/dist/pin.txt"', "built"],
+  ["invalid full seal", 'echo changed >"$bucket/extra-file"', "built"],
+  ["changed build environment", "export VITE_PREWARM_FIXTURE=changed", "built"],
+  ["explicit force build", "OC_V5_FORCE_WEB_BUILD=1", "built"],
+]) {
+  test(`ordinary frontend ${expectedMode} with ${reason}`, (t) => {
+    const f = fixture(t);
+    f.put("packages/gateway/src/marker", "backend-only");
+    f.git("add", "."); f.git("commit", "-qm", "backend only");
+    f.put("packages/web-react/src/marker", "dirty-B");
+    ok(run(f, `${webFixture}${trainFrontend}
+      ${invalidate}
+      ${frontend[0]}
+      test "$MASTER_FRONTEND_MODE" = ${expectedMode}
+      test "$(readlink "$MASTER_LIVE_LINK")" = "$T/unchanged-live"
+      test ! -e "$T/cleanup"
+    `));
+    const reused = expectedMode === "reused";
+    assert.equal(existsSync(join(f.dir, "web-calls")), !reused);
+    if (!reused) assert.equal(readFileSync(join(f.dir, "web-calls"), "utf8"), "called\n");
+    assert.equal(readFileSync(join(f.dir, "staging/packages/web-react/dist/pin.txt"), "utf8").trim(), reused ? "original" : "pinned-A");
+    const record = JSON.parse(readFileSync(join(f.dir, "staging/.web-dist-reuse.json"), "utf8"));
+    assert.equal(record.mode, expectedMode);
+    assert.equal(record.sourceCommit, reason === "backend-only new SHA" ? f.git("rev-parse", "HEAD") : f.sha);
+    if (reused) assert.equal(dirname(record.donor), join(f.dir, "cache"));
+    else assert.equal(record.donor, "");
+  });
+}
+
+test("frontend copy corruption cleans staging and fails without cold build or live change", (t) => {
+  const f = fixture(t);
+  const r = run(f, `${webFixture}${trainFrontend}
+    cp() { command cp "$@"; echo corrupt >"$staging/packages/web-react/dist/pin.txt"; }
+    ${frontend[0]}
+    touch "$T/accepted"
+  `);
+  assert.equal(r.status, 73, r.stderr);
+  assert.match(r.stderr, /复用 web dist 失败/);
+  assert.equal(readFileSync(join(f.dir, "cleanup"), "utf8"), "cleaned\n");
+  for (const path of ["staging", "accepted", "web-calls"]) assert.equal(existsSync(join(f.dir, path)), false, path);
+  ok(run(f, 'test "$(readlink "$MASTER_LIVE_LINK")" = "$T/unchanged-live"'));
+});
