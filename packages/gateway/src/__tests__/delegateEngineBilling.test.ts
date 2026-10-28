@@ -54,6 +54,133 @@ describe('shouldAdmitDelegateEngineBilling', () => {
 })
 
 describe('createDelegateEngineBillingClient', () => {
+  it('persists terminal abandon before POST and recovers it after a client restart', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-abandon-')), 'queue.json')
+    const requestId = '9'.repeat(32)
+    const first = createDelegateEngineBillingClient({
+      env: ENV, queuePath, startupRecovery: false, retryMs: 3_600_000,
+      fetcher: (async () => {
+        const queue = JSON.parse(await readFile(queuePath, 'utf8'))
+        assert.deepEqual(queue.pendingAbandons, [requestId], 'intent must precede HTTP')
+        return response(503, { error: { code: 'MASTER_UNAVAILABLE' } })
+      }) as never,
+    })
+    await assert.rejects(() => first.abandon(requestId), /MASTER_UNAVAILABLE/)
+    assert.deepEqual(JSON.parse(await readFile(queuePath, 'utf8')).pendingAbandons, [requestId])
+    const posts: string[] = []
+    const restarted = createDelegateEngineBillingClient({
+      env: ENV, queuePath,
+      fetcher: (async (url: string, options: { body: string }) => {
+        assert.ok(url.endsWith('/abandon'))
+        posts.push(JSON.parse(options.body).requestId)
+        return response(200, { abandoned: true })
+      }) as never,
+    })
+    // Constructor recovery and this drain serialize on the same queue.
+    await restarted.retryPending?.()
+    assert.deepEqual(posts, [requestId])
+    assert.deepEqual(JSON.parse(await readFile(queuePath, 'utf8')).pendingAbandons, [])
+    await restarted.retryPending?.()
+    assert.deepEqual(posts, [requestId], 'acknowledged intent must not be posted again')
+  })
+
+  it('keeps failed abandon retries while preserving pending usage and consult receipts', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-abandon-mixed-')), 'queue.json')
+    const requestId = '8'.repeat(32)
+    const billing = { requestId: '7'.repeat(32), engineSessionId: 'engine', status: 'success', durationMs: 1 }
+    const receipt = { requestId: '6'.repeat(32), at: 1 }
+    await writeFile(queuePath, JSON.stringify({ schemaVersion: 1, pending: [billing], settledReceipts: [receipt] }))
+    let available = false
+    const posts: string[] = []
+    const client = createDelegateEngineBillingClient({
+      env: ENV, queuePath, startupRecovery: false, retryMs: 3_600_000,
+      fetcher: (async (url: string) => {
+        posts.push(new URL(url).pathname.split('/').pop()!)
+        return available ? response(200, { ok: true }) : response(503, { error: { code: 'UNAVAILABLE' } })
+      }) as never,
+    })
+    await assert.rejects(() => client.abandon(requestId), /UNAVAILABLE/)
+    // Receipt projection must not erase unrelated abandon/usage intents.
+    await client.projectConsults?.({ projectOneReceipt: () => 'done' } as never)
+    await assert.rejects(() => client.retryPending!(), /RECOVERY_PENDING/)
+    const pending = JSON.parse(await readFile(queuePath, 'utf8'))
+    assert.deepEqual(pending.pending, [billing])
+    assert.deepEqual(pending.pendingAbandons, [requestId])
+    assert.deepEqual(pending.settledReceipts, [])
+    available = true
+    await client.retryPending?.()
+    assert.deepEqual(posts, ['abandon', 'settle', 'abandon', 'settle', 'abandon'])
+    const drained = JSON.parse(await readFile(queuePath, 'utf8'))
+    assert.deepEqual(drained.pending, [])
+    assert.deepEqual(drained.pendingAbandons, [])
+  })
+
+  it('late usage supersedes a queued abandon without losing either request on concurrent writes', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-abandon-usage-')), 'queue.json')
+    const requestId = '5'.repeat(32)
+    const otherId = '4'.repeat(32)
+    const billing = { requestId, engineSessionId: 'engine', status: 'success' as const, durationMs: 1 }
+    let available = false
+    const posts: Array<{ path: string; id: string }> = []
+    const client = createDelegateEngineBillingClient({
+      env: ENV, queuePath, startupRecovery: false, retryMs: 3_600_000,
+      fetcher: (async (url: string, options: { body: string }) => {
+        posts.push({ path: new URL(url).pathname.split('/').pop()!, id: JSON.parse(options.body).requestId })
+        return available ? response(200, { ok: true }) : response(503, { error: { code: 'UNAVAILABLE' } })
+      }) as never,
+    })
+    await assert.rejects(() => client.abandon(requestId), /UNAVAILABLE/)
+    const writes = await Promise.allSettled([client.settle(billing), client.abandon(otherId)])
+    assert.ok(writes.every((result) => result.status === 'rejected'))
+    await client.abandon(requestId)
+    const queued = JSON.parse(await readFile(queuePath, 'utf8'))
+    assert.deepEqual(queued.pending, [billing])
+    assert.deepEqual(queued.pendingAbandons, [otherId])
+    available = true
+    posts.length = 0
+    await client.retryPending?.()
+    assert.deepEqual(posts, [{ path: 'settle', id: requestId }, { path: 'abandon', id: otherId }])
+  })
+
+  it('successful late settle removes its abandon intent and preserves unrelated intents', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-abandon-settled-')), 'queue.json')
+    const requestId = '3'.repeat(32)
+    const otherId = '2'.repeat(32)
+    await writeFile(queuePath, JSON.stringify({ schemaVersion: 1, pending: [], pendingAbandons: [requestId, otherId] }))
+    const posts: string[] = []
+    const client = createDelegateEngineBillingClient({
+      env: ENV, queuePath, startupRecovery: false,
+      fetcher: (async (_url: string, options: { body: string }) => {
+        posts.push(JSON.parse(options.body).requestId)
+        return response(200, { ok: true })
+      }) as never,
+    })
+    await client.settle({ requestId, engineSessionId: 'engine', status: 'success', durationMs: 1 })
+    assert.deepEqual(JSON.parse(await readFile(queuePath, 'utf8')).pendingAbandons, [otherId])
+    await client.retryPending?.()
+    assert.deepEqual(posts, [requestId, otherId])
+  })
+
+  it('recovery never abandons a request with durable usage even when its settle fails', async () => {
+    const queuePath = join(await mkdtemp(join(tmpdir(), 'oc-dlg-abandon-conflict-')), 'queue.json')
+    const requestId = '1'.repeat(32)
+    const billing = { requestId, engineSessionId: 'engine', status: 'success', durationMs: 1 }
+    await writeFile(queuePath, JSON.stringify({ schemaVersion: 1, pending: [billing], pendingAbandons: [requestId] }))
+    const posts: string[] = []
+    const client = createDelegateEngineBillingClient({
+      env: ENV, queuePath, startupRecovery: false, retryMs: 3_600_000,
+      fetcher: (async (url: string) => {
+        posts.push(new URL(url).pathname.split('/').pop()!)
+        return response(503, { error: { code: 'UNAVAILABLE' } })
+      }) as never,
+    })
+    await assert.rejects(() => client.retryPending!(), /RECOVERY_PENDING/)
+    assert.deepEqual(posts, ['settle'])
+    const queued = JSON.parse(await readFile(queuePath, 'utf8'))
+    assert.deepEqual(queued.pending, [billing])
+    assert.deepEqual(queued.pendingAbandons, [])
+  })
+
   it('fails closed when the master channel env is missing', async () => {
     const client = createDelegateEngineBillingClient({ env: {} })
     await assert.rejects(
