@@ -176,3 +176,33 @@ Contract references: [gh verified JSON](https://cli.github.com/manual/gh_attesta
   No shared test lock, heavy suite, dependency installation or production mutation occurred.
 - Supported real gh/attestation acceptance, actual merge_group drill and gate-policy approval
   remain required before any activation. This change does not claim those prerequisites passed.
+
+
+## CI follow-up: idle seam failure obscured by teardown (2026-10-28)
+
+The deepen head 51d1007af passed 21 CI checks, but selfhost-gateway idle 3/3
+(job 122694083684, run 40652018481) reached the existing 20 minute timeout.
+Its last test output at 07:52:56 UTC is adapterShutdown called from the fixture's
+finally block; cancellation occurred at 08:06:00 UTC. The fixture records the
+first failure only in an in-memory report and writes the report after unbounded
+HTTP/PG cleanup. The available log therefore cannot distinguish the original
+failure from a cleanup hang. No retry has been requested.
+
+Plan, before any diagnostic code change:
+
+1. Add narrow failure-only diagnostics in the idle integration fixture. Log the
+   mode, error type and stack frame locations (never the error message, request
+   bodies, environment values, credentials or connection strings) before cleanup.
+   Name cleanup stages before awaiting them only when the test already failed.
+   Keep the original error and every assertion, deadline and cleanup operation.
+2. Commit/push and audit this diagnostic-only diff with gpt-6-astra/xhigh. Let the
+   existing full CI run unchanged; do not run the integration fixture locally,
+   increase its timeout, skip assertions, add retries or change runtime code.
+3. Use that evidence to identify the actual failure and cleanup blocker. Make a
+   separately explained minimal fix only after its cause is established; retain
+   all semantic coverage and obtain code review and green CI before integration.
+4. Train waiting continues independently. No ready, merge or ride before the
+   normal wait-for-trains FREE result and all applicable current-head CI green.
+
+Scope: personal task branch, PLAN.md and gateway test fixture diagnostics only.
+No commercial runtime/queue, new worktree, dependency install or shared tests.
