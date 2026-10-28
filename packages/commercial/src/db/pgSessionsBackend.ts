@@ -12424,6 +12424,16 @@ export function createPgSessionsBackend(
           )
         ).rows[0];
         if (!row) return { ok: false, error: "not_found" };
+        // OCV5-624: project_assets.project_id is stamped at create; rehome the session's assets
+        // with it, or the new project's home stays empty and search still files them as 未分类.
+        if (patch.projectId !== undefined) {
+          await client.query(
+            `UPDATE project_assets
+                SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $2 AND session_id = $3 AND deleted_at IS NULL`,
+            [patch.projectId, userId, id],
+          );
+        }
         return { ok: true, updatedAt: bigIntNum(row.updated_at, "updated_at") };
       });
     },
