@@ -257,6 +257,9 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       assert.ok(text.includes('# HELP container_ensure_duration_seconds'))
       assert.ok(text.includes('# HELP ws_bridge_ttft_seconds'))
       assert.ok(text.includes('# HELP oc_v3_sink_persist_total'))
+      // OCV5-653: additive Box compatibility and rejection counters.
+      assert.ok(text.includes('# HELP box_continuation_shape_compatible_total'))
+      assert.ok(text.includes('# HELP box_continuation_rejected_total'))
       // gauges(2)
       assert.ok(text.includes('# HELP account_pool_health'))
       assert.ok(text.includes('# HELP agent_containers_running'))
@@ -265,8 +268,8 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        19,
-        `HELP 行总数 = 19 (5 v1 counter + 9 v3 + 2 gauge + securityEventWriteFailures + implicitRatingOverridden), got ${helpCount}`,
+        21,
+        `HELP 行总数 = 21 (原19系列 + 2 Box continuation counter), got ${helpCount}`,
       )
     })
   })
