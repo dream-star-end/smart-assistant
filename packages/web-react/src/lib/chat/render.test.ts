@@ -476,6 +476,70 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
   });
 });
 
+describe("sealed failure tape skips BOX_REPLAY_PENDING soft copy", () => {
+  const detail =
+    'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+  const partial = "博客大纲已写完，正在排版。\n\n[turn failed: BOX_REPLAY_PENDING]";
+  const sealed = { turnTapeComplete: true as const, dispatchOutcome: "crashed" };
+
+  test("sealed crashed ENGINE_ERROR keeps the partial answer and the engine_error card", () => {
+    const p = errorPresentation("ENGINE_ERROR", partial, detail, false, sealed);
+    expect(p.title).toBe(errorLabel("engine_error"));
+    expect(p.title).not.toBe("结果正在收尾");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    expect(p.message).not.toMatch(/仍在确认|稍后刷新|不会重复扣费/);
+    expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+    expect(p.waived).toBe(false);
+  });
+
+  test("executed_error, not_accepted, and mixed-case crashed also skip the soft card", () => {
+    for (const dispatchOutcome of ["executed_error", "not_accepted", "CRASHED"]) {
+      const p = errorPresentation("ENGINE_ERROR", partial, detail, false, {
+        turnTapeComplete: true,
+        dispatchOutcome,
+      });
+      expect(p.title).toBe("任务执行失败");
+      expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+      expect(p.waived).toBe(false);
+    }
+  });
+
+  test("missing outcome, an open tape, or a non-error outcome stays on the soft card", () => {
+    const contexts = [
+      undefined,
+      {},
+      { turnTapeComplete: true },
+      { dispatchOutcome: "crashed" },
+      { turnTapeComplete: false, dispatchOutcome: "crashed" },
+      { turnTapeComplete: true, dispatchOutcome: "running" },
+      { turnTapeComplete: true, dispatchOutcome: "completed" },
+      { turnTapeComplete: true, dispatchOutcome: "interrupted" },
+    ];
+    for (const context of contexts) {
+      const p = errorPresentation("ENGINE_ERROR", partial, detail, false, context);
+      expect(p.title).toBe("结果正在收尾");
+      expect(p.message).toContain("不会重复扣费");
+      expect(p.bodyText).toBe("博客大纲已写完，正在排版。");
+      expect(p.waived).toBe(false);
+    }
+  });
+
+  test("a sealed crash with an empty body is only the failure card", () => {
+    const p = errorPresentation("ENGINE_ERROR", "", detail, false, sealed);
+    expect(p.title).toBe("任务执行失败");
+    expect(p.message).toBe(friendlyBridgeErrorMessage("engine_error"));
+    expect(p.message).not.toMatch(/仍在确认|稍后刷新|不会重复扣费|完整结果/);
+    expect(p.bodyText).toBeUndefined();
+    expect(p.waived).toBe(false);
+  });
+
+  test("waiverApplied does not turn a sealed engine_error into a waived card", () => {
+    const p = errorPresentation("ENGINE_ERROR", partial, detail, true, sealed);
+    expect(p.waived).toBe(false);
+    expect(p.title).toBe("任务执行失败");
+  });
+});
+
 
 describe("大请求完整资料错误", () => {
   const old = "Request too large (max 20MB). Try with a smaller file.";

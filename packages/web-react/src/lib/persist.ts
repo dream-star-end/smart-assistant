@@ -31,6 +31,8 @@ import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { repairPostFinalProcessOrder } from "./chat/order";
 import {
   collapsedAnchorTerminalKind,
+  isSealedDispatchFailure,
+  isStaleSoftBoxReplaySnapshot,
   isTurnTapeProcessControl,
 } from "./chat/render";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
@@ -1143,6 +1145,9 @@ function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage
     if (typeof row._errorCode !== "string" || row._errorCode.length === 0) return row;
     if (typeof row._clientMessageId !== "string") return row;
     const snap = snaps.get(row._clientMessageId);
+    // A sealed failure is not still resolving. Do not bring the soft
+    // "结果正在收尾" promise back onto that row. Other snapshots stay put.
+    if (snap && isSealedDispatchFailure(row) && isStaleSoftBoxReplaySnapshot(snap)) return row;
     return snap ? { ...row, _errorCardSnapshot: snap } : row;
   });
 }
@@ -1915,7 +1920,11 @@ function mergeLocalClientFields(
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
   serverMsg = carryRecoverySkippedNotice(serverMsg, localMsg);
   // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
-  if (localMsg._errorCardSnapshot && !serverMsg._errorCardSnapshot) {
+  if (
+    localMsg._errorCardSnapshot &&
+    !serverMsg._errorCardSnapshot &&
+    !(isSealedDispatchFailure(serverMsg) && isStaleSoftBoxReplaySnapshot(localMsg._errorCardSnapshot))
+  ) {
     serverMsg = { ...serverMsg, _errorCardSnapshot: localMsg._errorCardSnapshot };
   }
   // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: the Phase-A fallback is stamped

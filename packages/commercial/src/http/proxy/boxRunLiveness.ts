@@ -12,27 +12,62 @@
  * escapes this, as it escapes the supervisor's own group kill; a route A CLI
  * runs no local tools (they run in the user's container), so the model cannot
  * start one.
- * `absent`: no such process and no terminal proof. A stop.ready that is
- * present but not the keeper's exact handshake proves nothing (exit 125). `terminal`: the keeper's
- * proof exists, which the proof reader owns. Anything unreadable exits
- * non-zero and proves nothing. The boot id lets the caller tell "gone since
- * the last look" from "the Box rebooted". Nothing is signalled or removed. */
+ * `absent`: no such process. A stop.ready that is missing or not the
+ * keeper's exact handshake proves nothing and does not skip the scan. A
+ * terminal.json is `terminal` only when the same secure read and exact
+ * schema as the proof reader accept it for this nonce and lease epoch. A
+ * stat, a wrong epoch, a loose mode, or a malformed body does not skip the
+ * scan. Anything unreadable, including the boot id, exits non-zero and
+ * proves nothing. The boot id lets the caller tell "gone since the last
+ * look" from "the Box rebooted". Nothing is signalled or removed. */
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 
-const PROBE = String.raw`import json,os,re,sys
-if len(sys.argv) not in (2,3):raise SystemExit(126)
+const PROBE = String.raw`import json,os,re,stat,sys
+if len(sys.argv) not in (2,3,4):raise SystemExit(126)
 nonce=sys.argv[1]
 if not re.fullmatch(r'[a-f0-9]{24}',nonce):raise SystemExit(126)
 run='/tmp/ocv5-289-run-'+nonce
-cli=sys.argv[2] if len(sys.argv)==3 else run
-if not re.fullmatch(r'/tmp/ocv5-289-run-[a-f0-9]{24}',cli):raise SystemExit(126)
+rest=sys.argv[2:]
+cli=run
+epoch=''
+if rest and re.fullmatch(r'/tmp/ocv5-289-run-[a-f0-9]{24}',rest[0]):
+ cli=rest.pop(0)
+if rest and re.fullmatch(r'[a-f0-9]{32}',rest[0]):
+ epoch=rest.pop(0)
+if rest or not re.fullmatch(r'/tmp/ocv5-289-run-[a-f0-9]{24}',cli):raise SystemExit(126)
 proof='/tmp/ocv5-289-proof-'+nonce
 with open('/proc/sys/kernel/random/boot_id') as f:boot=f.read().strip()
 if not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',boot):
  raise SystemExit(125)
-try:os.stat(proof+'/terminal.json',follow_symlinks=False)
-except FileNotFoundError:pass
-else:
+def pidok(n):
+ return type(n) is int and 1<=n<=(1<<53)-1
+def legal():
+ if not epoch:return False
+ try:directory=os.open(proof,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except OSError:return False
+ try:
+  st=os.fstat(directory)
+  if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:return False
+  fd=os.open('terminal.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+  try:
+   st=os.fstat(fd)
+   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or not 1<=st.st_size<=512:return False
+   raw=os.read(fd,513)
+   if len(raw)!=st.st_size or not raw.endswith(b'\n'):return False
+  finally:os.close(fd)
+  data=json.loads(raw)
+  if type(data) is not dict:return False
+  keys=','.join(sorted(data))
+  if not (data.get('runNonce')==nonce and data.get('leaseEpoch')==epoch and pidok(data.get('keeperPid')) and pidok(data.get('cliPid'))):return False
+  if keys=='cliPid,keeperPid,leaseEpoch,reason,revision,runNonce':
+   return data.get('reason') in ('worker_complete','keeper_stopped') and type(data.get('revision')) is int and data['revision']==1
+  code=data.get('workerExitCode')
+  return (keys=='cliPid,keeperPid,leaseEpoch,reason,revision,runNonce,workerExitCode'
+   and data.get('reason')=='worker_failed' and type(data.get('revision')) is int and data['revision']==2
+   and type(code) is int and code!=0 and -255<=code<=255)
+ except (OSError,ValueError):return False
+ finally:os.close(directory)
+if legal():
  print('terminal '+boot);raise SystemExit(0)
 uid=os.getuid()
 mine=set()
@@ -53,10 +88,10 @@ try:
 except FileNotFoundError:pass
 else:
  try:ready=json.loads(raw)
- except ValueError:raise SystemExit(125)
- if (not isinstance(ready,dict) or ready.get('runNonce')!=nonce
-     or type(ready.get('cliPid')) is not int or ready['cliPid']<2):raise SystemExit(125)
- sids.add(ready['cliPid'])
+ except ValueError:ready=None
+ if (isinstance(ready,dict) and ready.get('runNonce')==nonce
+     and type(ready.get('cliPid')) is int and ready['cliPid']>=2):
+  sids.add(ready['cliPid'])
 mark=nonce.encode()
 for name in os.listdir('/proc'):
  if not name.isdigit() or int(name) in mine:continue
@@ -77,18 +112,26 @@ for name in os.listdir('/proc'):
  except (FileNotFoundError,ProcessLookupError):continue
 print('absent '+boot)`;
 
+/** `terminal` is a proof the reader would accept for the lease epoch passed
+ * in. A stat of terminal.json does not print it. An injected line still
+ * defers to the proof reader. */
 export type BoxRunLiveness = { state: "alive" | "absent" | "terminal"; boot: string };
 
 /** `cliCwd` is the run's native CLI cwd when it differs from its own run
- * directory (journal boxNativeCliCwd), as for the keeper stop. */
-export function makeBoxRunLiveness(runNonce: string, cliCwd?: string): BoxCcExecRequest {
+ * directory (journal boxNativeCliCwd), as for the keeper stop. `leaseEpoch`
+ * stays optional so a caller without one still scans. closeAbsent passes the
+ * candidate epoch: an older proof must not block absence. */
+export function makeBoxRunLiveness(runNonce: string, cliCwd?: string,
+  leaseEpoch?: string): BoxCcExecRequest {
   if (!/^[a-f0-9]{24}$/.test(runNonce)
-    || (cliCwd !== undefined && !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(cliCwd))) {
+    || (cliCwd !== undefined && !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(cliCwd))
+    || (leaseEpoch !== undefined && !/^[a-f0-9]{32}$/.test(leaseEpoch))) {
     throw new Error("BOX_RUN_LIVENESS_ID_INVALID");
   }
   const native = cliCwd !== undefined && cliCwd !== `/tmp/ocv5-289-run-${runNonce}`;
   return { command: "/usr/bin/python3", args: ["-I", "-c", PROBE, runNonce,
-    ...(native ? [cliCwd] : [])],
+    ...(native ? [cliCwd] : []),
+    ...(leaseEpoch !== undefined ? [leaseEpoch] : [])],
     cwd: "/tmp", environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } };
 }
 

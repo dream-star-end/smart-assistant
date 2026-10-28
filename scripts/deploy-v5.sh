@@ -4116,6 +4116,11 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts); then
+    echo "✗ pinned box terminal-unproven liveness probe failed" >&2
+    rm -rf "$box_cand"; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1
+  fi
   if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
       -u OC_V5_PROOF_TEST_DATABASE_URL \
       npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then

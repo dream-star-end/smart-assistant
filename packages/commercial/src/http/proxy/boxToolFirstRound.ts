@@ -124,6 +124,9 @@ export async function runBoxToolFirstRound(input: {
    * session. Anything else keeps the fail-closed unknown path. */
   stopRejectedRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
     runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
+  /** Bound for the one stop after BOX_TOOL_TERMINAL_UNPROVEN. The stop keeps
+   * running after this; the request does not. */
+  terminalUnprovenStopWaitMs?: number;
   /** Test seam; production reads the keeper proof from the Box. */
   readTerminalProof?: typeof readBoxTerminalProof;
 }): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
@@ -689,6 +692,23 @@ export async function runBoxToolFirstRound(input: {
       }
     }
     if (launchAttempted) await unknown("first_round_unknown");
+    if (launchAttempted && admitted && target && deps.stopRejectedRun
+      && error instanceof BoxToolFirstRoundError
+      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN") {
+      // Same explicit stop as a rejected stream, once, and bounded. A keeper
+      // proof is settled by that stop path. This catch does not call complete.
+      const stop = deps.stopRejectedRun;
+      const identity = { requestId: input.requestId, uid: input.uid,
+        accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch };
+      const waitMs = deps.terminalUnprovenStopWaitMs ?? 25_000;
+      const observed = Promise.resolve().then(() => stop(identity)).then(() => {}, () => {});
+      let stopTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([observed, new Promise<void>((resolve) => {
+          stopTimer = setTimeout(resolve, waitMs);
+        })]);
+      } finally { if (stopTimer) clearTimeout(stopTimer); }
+    }
     if ((!admitted || prestartClosed) && target) {
       await closeBounded(target, "prestart_dispose").catch(() => {});
     }

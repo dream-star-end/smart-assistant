@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { runBoxToolFirstRound } from "./boxToolFirstRound.js";
+import { runBoxToolFirstRound, BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxNativeHistoryBasis } from "./boxNativeHistory.js";
@@ -70,6 +70,7 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
+  terminalProof?: "worker_complete" | "keeper_stopped";
   failAssetStage?: number; failInputStage?: number;
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
@@ -150,11 +151,13 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       }
       if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
         sequence.push("proof-read");
+        const reason = options.terminalProof ?? "worker_complete";
         return { stdout: JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
-          reason: "worker_complete", revision: 1 }) + "\n",
+          reason, revision: 1 }) + "\n",
         stderrBytes: 0, exitCode: 0 as const };
       }
+
       if (args[2]?.includes("if kind=='attachment':")) {
         sequence.push("transcript-read");
         return { stdout: `${JSON.stringify({ records: options.transcriptRecords ?? [] })}\n`,
@@ -1125,4 +1128,25 @@ test("tool task keeps its exact context across confirmed missing egress and auth
   assert.equal(f.launches, 1);
   assert.match(f.emitted.join(""), /direct answer/);
   assert.equal(JSON.stringify(f.input.canonicalBody), before);
+});
+
+test("BOX_TOOL_TERMINAL_UNPROVEN stops the launched run once within a bound and does not complete it", async () => {
+  const f = fixture({ directFinal: true, terminalProof: "keeper_stopped" });
+  let stops = 0;
+  let release!: () => void;
+  const hung = new Promise<"pending">((resolve) => { release = () => resolve("pending"); });
+  const deps = { ...f.deps, terminalUnprovenStopWaitMs: 40,
+    stopRejectedRun: async () => { stops++; return hung; } };
+  const started = Date.now();
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => error instanceof BoxToolFirstRoundError
+      && error.code === "BOX_TOOL_TERMINAL_UNPROVEN");
+  assert.equal(stops, 1);
+  assert.ok(Date.now() - started < 2_000, "a hanging stop does not hold the request");
+  assert.equal(f.sequence.includes("terminal-journal"), false);
+  assert.equal(f.sequence.includes("durable-handoff"), false);
+  assert.ok(f.sequence.includes("unknown"));
+  assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+  release();
+  await hung;
 });
