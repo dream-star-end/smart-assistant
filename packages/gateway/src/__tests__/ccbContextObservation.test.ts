@@ -17,7 +17,7 @@ const compacted: ContextObservation = { kind: 'context_compacted', compaction: {
 
 test('CCB SDK observations reach existing routed frames without becoming content or billing', () => {
   const events: SessionStreamEvent[] = []
-  const parser = new CcbMessageParser({ toolUseIdToName: new Map(), onEvent: e => events.push(e), onFinish: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 } })
+  const parser = new CcbMessageParser({ toolUseIdToName: new Map(), onEvent: e => events.push(e), onFinish: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 } })
   for (const observation of [pressure, compacted]) {
     parser.parse({ type: 'system', subtype: 'context_observation', observation } as unknown as SdkMessage)
   }
