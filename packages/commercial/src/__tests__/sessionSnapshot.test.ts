@@ -215,3 +215,14 @@ describe('PG session snapshot transport contract', () => {
     }
   })
 })
+
+test('persisted container replay gap remains visible with zero frames in both HTTP and WS snapshots', async () => {
+  const gap = { reason: 'sequence_gap', afterSeq: 0, beforeSeq: 90 }
+  await db.query("UPDATE client_session_live_streams SET provenance=jsonb_build_object('containerLinkGap',$1::jsonb)", [JSON.stringify(gap)])
+  const snapshot = await readSessionSnapshot(pool, '3', sessionId)
+  assert.deepEqual(snapshot?.gap, gap)
+  assert.deepEqual(snapshot?.frames, [])
+  const response = await http()
+  assert.deepEqual(response.body.snapshot.gap, gap)
+  assert.equal(response.body.snapshot.lastFrameSeq, null)
+})
