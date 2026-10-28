@@ -8515,7 +8515,15 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "[user-errors-engine-switch] PASS — INC-20261028-ERRORS-ENGINE-SWITCH executed all 43 catalog, emitter and six-engine switch leaves without paid calls"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming"
         }
+      ],
+      "coverageCommits": [
+        "44dc8f39"
       ]
     }
   ]
