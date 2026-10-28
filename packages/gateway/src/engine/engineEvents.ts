@@ -22,6 +22,8 @@ import type { UpstreamRetryHint } from '@openclaude/protocol'
  */
 import type {
   CallTokenUsageSnapshot,
+  ContextPressure,
+  ContextCompaction,
   DurableCodexBilling,
   DurableRuntimeEvent,
   OutboundContentBlock,
@@ -190,6 +192,8 @@ export interface EngineFinalMeta {
  * 之外的全部变体,形状逐字段不变 —— server.ts 的 outbound 分发逻辑零改动。
  */
 export type EngineContentEvent =
+  | { kind: 'context_pressure'; pressure: ContextPressure }
+  | { kind: 'context_compacted'; compaction: ContextCompaction }
   | { kind: 'block'; block: OutboundContentBlock }
   | { kind: 'usage'; usage: TurnTokenUsageSnapshot }
   | { kind: 'call_usage'; call: CallTokenUsageSnapshot }

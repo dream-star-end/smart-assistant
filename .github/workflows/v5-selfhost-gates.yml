@@ -92,6 +92,10 @@ jobs:
       - name: Kernel unit tests
         run: npm run test:kernel
 
+      - name: Context launch budgets (offline)
+        run: |
+          npx tsx --test --test-concurrency=1 packages/protocol/src/__tests__/contextPressure.test.ts packages/gateway/src/__tests__/boundedPrompt.test.ts packages/gateway/src/__tests__/contextObservationFrames.test.ts packages/gateway/src/__tests__/antigravityAdapter.test.ts
+
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
 

@@ -19,6 +19,8 @@ import {
   type OutboundTurnStatus,
   type OutboundTurnUsage,
   type SysContextRebuilt,
+  type SessionContextPressure,
+  type SysContextCompacted,
   isClientMessageId,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
@@ -1412,6 +1414,8 @@ export type DeliverOut = | OutboundMessage
     | OutboundTurnUsage
     | OutboundCallUsage
     | SysContextRebuilt
+    | SessionContextPressure
+    | SysContextCompacted
 
 /**
  * Outbound frame egress — WS broadcast + outboundRing + optional adapter fan-out.
@@ -1481,7 +1485,9 @@ export function deliver(
     wire.type === 'outbound.turn_status' ||
     wire.type === 'outbound.turn_usage' ||
     wire.type === 'outbound.call_usage' ||
-    wire.type === 'sys.context_rebuilt'
+    wire.type === 'sys.context_rebuilt' ||
+    wire.type === 'session.context_pressure' ||
+    wire.type === 'sys.context_compacted'
   if (adapter && !isSideband) {
     adapter
       .send(wire as OutboundMessage)
@@ -1522,6 +1528,7 @@ export function deliver(
     // review/嵌套委派以 >15 帧/s 刷进度帧,不分级时 2 分钟就冲穿整个 ring。
     const blocks = (wire as { blocks?: Array<{ kind?: string }> }).blocks
     const isProgressFrame =
+      wire.type === 'session.context_pressure' ||
       wire.type === 'outbound.turn_status' ||
       wire.type === 'outbound.turn_usage' ||
       wire.type === 'outbound.call_usage' ||
