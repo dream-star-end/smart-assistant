@@ -2849,6 +2849,7 @@ function helloTerminalBillingTrio(opts: {
   readyScanRows?: Array<{ payload: Buffer | null }>;
   readyScans?: unknown[][];
   beforeTurnDispatchLookup?: () => Promise<void>;
+  beforeSnapshotRead?: () => Promise<void>;
 }): Pick<UserChatBridgeDeps, "pgPool" | "preCheckRedis" | "pricing"> {
   const lookups = opts.lookups ?? [];
   return {
@@ -2866,6 +2867,7 @@ function helloTerminalBillingTrio(opts: {
           return { rows: [{ status: "active" }], rowCount: 1 };
         }
         if (/session-snapshot-owner/.test(text)) {
+          await opts.beforeSnapshotRead?.();
           return { rows: [{ as_of: String(Date.now()) }], rowCount: 1 };
         }
         if (/open-dispatch-engine-ready/.test(text)) {
@@ -4553,7 +4555,7 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     blocks: [{ kind: "text", text: `t${frameSeq}` }],
   });
 
-  async function linkRig(row: Record<string, unknown>) {
+  async function linkRig(row: Record<string, unknown>, beforeSnapshotRead?: () => Promise<void>) {
     const persisted: number[] = [];
     const renewals: unknown[][] = [];
     row.agent_container_id = "77";
@@ -4562,7 +4564,7 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
       persistOutboundFrame: async (input) => { persisted.push(input.frameSeq); },
       containerLinkHeartbeatMs: 50,
-      ...helloTerminalBillingTrio({ row, linkRenewals: renewals }),
+      ...helloTerminalBillingTrio({ row, linkRenewals: renewals, beforeSnapshotRead }),
     });
     portRef.value = rig.containerPort;
     return { rig, persisted, renewals };
@@ -4623,8 +4625,14 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     }
   });
 
-  test("重连 attach 原链路,同一 live 帧只有一次落库并送达新订阅者", async () => {
-    const { rig, persisted } = await linkRig(acceptedRow("1203"));
+  test("重连 attach 原链路：慢 PG 快照不阻塞 hello、续租与单次落帧", async () => {
+    let releaseSnapshot!: () => void;
+    const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    let snapshotReading = false;
+    const { rig, persisted, renewals } = await linkRig(acceptedRow("1203"), async () => {
+      snapshotReading = true;
+      await snapshotGate;
+    });
     try {
       const first = await connect(rig, "1203");
       first.container.send(frame(1));
@@ -4633,11 +4641,20 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       await waitClose(first.ws);
       const second = openClient(rig.gatewayPort, await makeJwt("1203"));
       const frames = frameCollector(second);
+      const snapshots: Array<{ sessionId: string; dispatch: { clientMessageId: string; status: string } }> = [];
+      second.on("message", (data) => {
+        const wire = JSON.parse(String(data));
+        if (wire.type === "outbound.session_snapshot") snapshots.push(wire.snapshot);
+      });
       await new Promise<void>((r) => second.once("open", r));
       await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
       const hello = JSON.stringify({type: "inbound.hello", peers: [{peerId: SESSION, agentId: "main", lastFrameSeq: 1}]});
       second.send(hello);
       await waitHelloForwarded(rig, hello);
+      await waitFor(() => snapshotReading);
+      assert.equal(snapshots.length, 0, "hello 已转发，PG 尚未放行时不发快照");
+      const renewalsBefore = renewals.length;
+      await waitFor(() => renewals.length > renewalsBefore);
       first.container.send(frame(2));
       await waitFor(() => persisted.includes(2));
       let received: { frameSeq?: number };
@@ -4645,10 +4662,16 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       assert.equal(rig.containerSockets.length, 1);
       assert.deepEqual(persisted, [1, 2]);
       assert.equal(first.container.readyState, WebSocket.OPEN);
+      assert.equal(snapshots.length, 0, "快照仍挂起时 live 帧照常送达");
+      releaseSnapshot();
+      await waitFor(() => snapshots.length === 1);
+      assert.equal(snapshots[0]!.sessionId, SESSION);
+      assert.equal(snapshots[0]!.dispatch.clientMessageId, CMID);
+      assert.equal(snapshots[0]!.dispatch.status, "accepted");
       first.container.send(frame(3, true));
       await waitFor(() => persisted.includes(3));
       second.close();
-    } finally { await stopRig(rig); }
+    } finally { releaseSnapshot(); await stopRig(rig); }
   });
 
   test("没有 open dispatch 流 → user close 立即关容器 WS(行为不变)", async () => {
