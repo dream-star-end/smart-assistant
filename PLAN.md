@@ -52,13 +52,15 @@ not a measured result of this draft.
    build children retain artifact protection until reaped.
 7. GC: selfhost cutover GC takes the artifact mutex nonblocking; if a prepare is
    running or an unconsumed prepared receipt exists, defer artifact GC (log why).
-   Avoid modifying shared/commercial GC implementation. Consumed receipts are
-   removed under the artifact mutex; the deploy lock protects their artifacts
+   Avoid modifying shared/commercial GC implementation. Successfully flipped receipts are
+   removed under the artifact mutex (matching the exact master path); the deploy lock protects their artifacts
    until the existing saga commits/compensates. Invalid/stale receipts are removed
    under that same mutex; artifacts are left to normal GC, never eagerly deleted.
 8. Move mutable setup (`ensure_selfhost_env_keys`, auxiliary units/proxy,
    model-authority, asset pool seeding) to the locked path. Re-run live-dependent
-   preflight, L0, trailer and P0 overlay checks at flip. Preparation checks the
+   preflight, trailer and P0 overlay checks at flip. L0 runs before preparation;
+   its build-space admission is not repeated after consuming that space. E2 still
+   rechecks the live migration gap under the lock. Preparation checks the
    trailer gate and build admission before expensive work. Use the pinned staging
    validator for platform seeds. Do not modify gate lists or parity coverage.
 9. Failure: before receipt publication, no reusable candidate; before live mutation,
@@ -97,3 +99,5 @@ not a measured result of this draft.
 - P7: sealing/marker hashes stay authoritative if seal/cache optimizations change.
 - Full CI and real-host soak/performance measurement remain pending steward review;
   this session must not run a production prepare, flip or large build.
+
+Plan review: APPROVED (independent Codex plan reviewer, 2026-10-28).

@@ -65,8 +65,12 @@ echo "$$ $*" >>"$T/deploy-starts.log"
 train=""; target=""
 for a in "$@"; do case "$a" in --lease-train=*) train="${a#*=}";; --target-sha=*) target="${a#*=}";; esac; done
 mode="$(cat "$T/fake-deploy.mode" 2>/dev/null || echo commit)"
-# 持锁(fd 8 继承)期间 sleep 一下模拟构建
+# P4: worker must not pass the flip lock into preparation.
+[[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-0}" != 1 && ! -e /proc/$$/fd/8 ]] || exit 98
+flock -n "$OC_V5_SELFHOST_DEPLOY_LOCK" true || exit 98
+# 模拟锁外构建,之后执行器自己拿 flip 锁。
 [[ "$mode" == hang ]] || sleep "${FAKE_DEPLOY_SLEEP:-1}"
+exec 8>"$OC_V5_SELFHOST_DEPLOY_LOCK"; flock 8
 case "$mode" in
   commit)
     rel="$T/releases/rel-$target"; mkdir -p "$rel"; jq -cn --arg s "$target" '{sourceCommit:$s}' >"$rel/.complete"

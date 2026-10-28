@@ -194,6 +194,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
+source "$SCRIPT_DIR/lib/v5-selfhost-prepare.sh"       # P4: lock-free prepare, locked flip
 source "$SCRIPT_DIR/lib/v5-selfhost-backup-lock.sh"     # OCV5-600: selfhost_backup_lock_holder
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
@@ -243,7 +244,7 @@ cleanup_selfhost_deploy() {
   if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
     rollback_restore_prev_if_unchanged || true
   fi
-  # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
+  # 后台 runtime release 先收尾再释放锁/train;split prepare 子进程继承 artifact fd 9。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
   if declare -F lease_train_on_exit >/dev/null 2>&1; then lease_train_on_exit "$exit_rc" || true; fi
@@ -501,8 +502,15 @@ maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
     deploy|bootstrap|build-master-only|cutover|rollback)
       [[ "$DRY" == 1 ]] && return 0
+      if [[ "$MODE" == deploy && "$PLATFORM_FROM_HEAD" == 1 && "$RELEASE_POLICY_RESUME" == 0 ]]; then
+        return 0  # prepare first; selfhost_prepared_enter_flip owns the deploy lock later
+      fi
       acquire_selfhost_deploy_lock
+<<<<<<< HEAD
       prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "预热未停净,拒绝发布"
+=======
+      case "$MODE" in deploy|bootstrap|build-master-only) selfhost_prepare_lock ;; esac
+>>>>>>> ea74cbe3e (feat(selfhost): prepare sealed train artifacts before the flip lock)
       ;;
   esac
 }
@@ -516,8 +524,13 @@ usage() {
 
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
   --bootstrap           仅首次安装。本机已有 live symlink / env 时请改用 --deploy
+<<<<<<< HEAD
   --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
   --prewarm-artifacts   idle worker 专用:锁外预热 tip 制品,不建列车/不切 live
+=======
+  --deploy              --platform-from-head 时先无锁 prepare、再持锁 flip;否则保持旧锁边界。构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
+  --prepare             --target-sha=SHA: 无 deploy.lock 构建并封存三面制品;不登记列车、不改 live
+>>>>>>> ea74cbe3e (feat(selfhost): prepare sealed train artifacts before the flip lock)
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
   --rollback            退回 .prev-release 及它当时的运行四元组(一次一步;不跑迁移、不回滚 schema;
@@ -578,7 +591,11 @@ for arg in "$@"; do
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
+<<<<<<< HEAD
     --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--prewarm-artifacts|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
+=======
+    --preflight|--bootstrap|--deploy|--prepare|--smoke|--status|--build-master-only|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
+>>>>>>> ea74cbe3e (feat(selfhost): prepare sealed train artifacts before the flip lock)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -609,8 +626,13 @@ fi
   && die "--release= 只能与 --cutover 同用"
 [[ -n "$LEASE_TRAIN_ID" && "$MODE" != "deploy" ]] \
   && die "--lease-train= 只能与 --deploy 同用"
+<<<<<<< HEAD
 [[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "p0-web" && "$MODE" != "prewarm-artifacts" ]] \
   && die "--target-sha= 只能与 --deploy/--p0-web/--prewarm-artifacts 同用"
+=======
+[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "prepare" && "$MODE" != "p0-web" ]] \
+  && die "--target-sha= 只能与 --deploy、--prepare 或 --p0-web 同用"
+>>>>>>> ea74cbe3e (feat(selfhost): prepare sealed train artifacts before the flip lock)
 [[ "$DRY" == 1 && "$MODE" == p0-web* ]] && die "--p0-web* 没有 dry-run(构建在锁外、切换可秒级回退)"
 [[ -n "$LEASE_TRAIN_ID" && -z "$LEASE_TARGET_SHA" ]] && die "--lease-train= 必须同时给 --target-sha="
 [[ -z "$LEASE_TARGET_SHA" || "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--target-sha= 必须是 40 位 sha"
@@ -632,7 +654,7 @@ fi
 
 if [[ "$DRY" != 1 ]]; then
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
+    deploy|prepare|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
       if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
         release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
       fi ;;
@@ -1490,13 +1512,50 @@ build_platform_bundle() {
   log "  ✓ platform bundle rev=$BUILT_BUNDLE_REV"
 }
 
+<<<<<<< HEAD
+=======
+build_runtime_release() {
+  local sha="$1" caps nonce raw staging prev image_id
+  log "── build runtime release(git archive + prune + finalize) ──"
+  caps="$(runtime_caps_from_metadata "$sha")" \
+    || die "读 release-metadata.json runtimeCapabilities 失败"
+  image_id="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" \
+    || die "inspect runtime 镜像失败"
+  RUNTIME_IMAGE_ID="$image_id"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] git archive $sha → prune --exclude-from=$EXCLUDES → oc_hotcfg_finalize_release"
+    BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-dryrunrelease"
+    return 0
+  fi
+  prev="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_RELEASE || true)"
+  nonce="$(openssl rand -hex 8)"
+  raw="$OC_HOTCFG_RELEASES_ROOT/.raw-$nonce"
+  staging="$OC_HOTCFG_RELEASES_ROOT/.staging-$nonce"
+  mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
+  rm -rf "$raw" "$staging"
+  mkdir -p "$raw" "$staging"
+  git -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
+    || { rm -rf "$raw" "$staging"; die "git archive 失败"; }
+  rsync -a --exclude-from="$raw/packages/commercial/agent-sandbox/runtime-src-excludes.txt" "$raw/" "$staging/" \
+    || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
+  rm -rf "$raw"
+  write_flavor_manifest "$staging" selfhost "$sha" \
+    || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
+  BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
+    || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
+  BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
+  [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] \
+    || die "release 目录非法: $BUILT_RUNTIME_RELEASE"
+  log "  ✓ runtime release=$BUILT_RUNTIME_RELEASE"
+}
+>>>>>>> ea74cbe3e (feat(selfhost): prepare sealed train artifacts before the flip lock)
 
 # ── runtime release 与 master release 并行构建(2026-10-08 devflow-opt)──
 # 两者都只读 pinned SHA 的 git archive,写各自独立的 staging(runtime: $OC_HOTCFG_RELEASES_ROOT,
 # master: $MASTER_RELEASES_ROOT),互不依赖;实测串行时 runtime 段约 3.5 分钟。
 # 后台段的输出落独立日志,收尾时整段回放,保持 train 日志可读;结果经结果文件回传父 shell。
 # 父 shell 无论成功失败退出,EXIT 清理都会先等后台段结束(不留在飞写 runtime-releases 的进程)。
-# 父进程被直接杀掉(不走 EXIT)时:后台段继承了发布锁 fd 8,锁会一直持有到它结束,不会有第二趟发布并发写。
+# 父进程被直接杀掉时:后台段继承 artifact fd 9(split)或发布 fd 8(legacy),保护持续到它结束。
 # OCV5-648(P2):cmd_deploy 不再自己起后台段,由 build_master_release 在发车准入通过后起(准入不等本列车自己)。
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
@@ -2029,6 +2088,7 @@ web_assets_pool_gc() {
 
 cmd_deploy() {
   local sha dirty
+  local SELFHOST_SPLIT_PREPARED=0
   if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
     local recovery_rc=0
     release_policy_recover_forward || recovery_rc=$?
@@ -2061,32 +2121,47 @@ $dirty
     log "$dirty"
   fi
   sha="$(source_commit)"
+  if [[ "$PLATFORM_FROM_HEAD" == 1 && "$DRY" != 1 ]]; then
+    lease_train_begin "$sha"
+    selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
+    assert_fix_trailers "$sha"
+    selfhost_prepare_candidate "$sha"
+    selfhost_prepared_enter_flip "$sha"
+    preflight_common  # mutable live dependencies may have changed while preparing
+  fi
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
   cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
-  ensure_selfhost_env_keys
+  [[ "$SELFHOST_SPLIT_PREPARED" == 1 ]] || ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \
     || die "缺 live symlink $MASTER_LIVE_LINK。本 --deploy 假定首次翻转已完成。
 补救: --cutover --release=<已有 rel-*> 完成首次翻转,或跑应急 restore-worktree-units.sh。"
-  seed_web_assets_pool_from_live
-
-  ensure_node_modules
-  install_aux_units
-  refresh_ccb_proxy_path
-  ensure_model_authority
-  assert_env_key_drift
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+    seed_web_assets_pool_from_live
+    ensure_node_modules
+    install_aux_units
+    refresh_ccb_proxy_path
+    ensure_model_authority
+    assert_env_key_drift
+  fi
   if [[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 ]]; then
     sha="$(source_commit)"
     lease_train_begin "$sha"
   fi
-  selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"; assert_fix_trailers "$sha"  # L0 在 begin 之后:拒绝即 deploy 上报的失败,worker 不重发(OCV5-581)
+  # Split prepare already ran L0; its build-space admission is not a flip-space requirement.
+  # Live migration/overlay/source checks still run under the flip lock.
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+    selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
+  fi
+  assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
   # P2(OCV5-648):后台 runtime 构建由 build_master_release 在发车准入通过之后起,准入不再等本列车自己的构建。
+  if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
   MASTER_RUNTIME_BG_AFTER_ADMISSION=1
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
@@ -2099,6 +2174,7 @@ $dirty
   tsum_mark P.platform-bundle 2>/dev/null || :
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
+  fi
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
   DEPLOY_BUILT_SOURCE_COMMIT="$sha"
   CUTOVER_JOINT=1
@@ -2750,6 +2826,16 @@ cmd_cutover() {
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
   assert_master_release_tsx_selfcheck "$rel"
+  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
+    # E1 has verified the sealed candidate before the first live setup write.
+    ensure_selfhost_env_keys
+    seed_web_assets_pool_from_live
+    ensure_node_modules
+    install_aux_units
+    refresh_ccb_proxy_path
+    ensure_model_authority
+    assert_env_key_drift
+  fi
   cutover_clog "  Box success recovery 已在 build_master_release 封存前执行;已封存 rel 的切流与回退不再依赖该脚本"
   expected_build="$(dist_oc_build "$rel")"
   cutover_clog "  dist oc-build=$expected_build"
@@ -3029,19 +3115,22 @@ cmd_cutover() {
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
   fi
+  if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
+    selfhost_prepared_complete "$head" "$rel" || cutover_clog "  ⚠ prepared receipt cleanup deferred"
+  fi
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
   # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
   # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
   # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
   # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
-  bash "$SCRIPT_DIR/v5-release-gc.sh" \
+  selfhost_prepared_gc bash "$SCRIPT_DIR/v5-release-gc.sh" \
     "$MASTER_RELEASES_ROOT" 3 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
     "$MASTER_RELEASES_ROOT/.prev-release" \
     "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \
     '' '' '' 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
-  oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
+  selfhost_prepared_gc oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
   wo_gc_buckets "$WEB_OVERLAY_ROOT" "$MASTER_RELEASES_ROOT" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ P0-Web overlay 桶 GC 失败(仅告警,不回滚)"
@@ -3055,6 +3144,7 @@ case "$MODE" in
   preflight) cmd_preflight ;;
   bootstrap) cmd_bootstrap ;;
   deploy) cmd_deploy ;;
+  prepare) cmd_prepare ;;
   build-master-only) cmd_build_master_only ;;
   cutover) cmd_cutover ;;
   rollback) cmd_rollback ;;
