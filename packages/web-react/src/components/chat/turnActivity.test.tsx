@@ -86,6 +86,32 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(after).not.toContain("执行操作");
   });
 
+  test("INC-20261028-STALE-ENGINE-STARTING: 切回时启动态已过期 → 不显示正在启动引擎 (1184s)", () => {
+    const now = Date.now();
+    renderTA({ startedAt: now - 1_184_000, lastFrameAt: now - 1_163_000, turnStatus: "engine_starting" });
+    const text = screen.getByLabelText("生成中").textContent ?? "";
+    expect(text).not.toContain("正在启动引擎");
+    expect(text).toContain("无新数据");
+  });
+
+  test("切回且连接未恢复 → 连接已断开,已发送计时不进读屏", () => {
+    const now = Date.now();
+    renderTA({
+      startedAt: now - 1_184_000,
+      lastFrameAt: now - 1_163_000,
+      turnStatus: "engine_starting",
+      transport: "connecting",
+    });
+    const node = screen.getByLabelText("生成中");
+    expect(node.textContent ?? "").toContain("连接已断开");
+    expect(node.querySelector("[data-elapsed]")?.textContent ?? "").toContain("已发送 19 分钟");
+  });
+
+  test("hello detached 快照 → 后台运行中", () => {
+    renderTA({ startedAt: Date.now() - 600_000, lastFrameAt: Date.now(), turnStatus: null, detached: true });
+    expect(screen.getByLabelText("生成中").textContent ?? "").toContain("后台运行中");
+  });
+
   test("engine_resuming → 正在恢复会话(长等待也不升级成深度思考)", () => {
     renderTA({ startedAt: Date.now() - 35_000, turnStatus: "engine_resuming" });
     const text = screen.getByLabelText("生成中").textContent ?? "";

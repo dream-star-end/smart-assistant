@@ -2536,6 +2536,14 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     sess._turnStatus = null;
     sess._turnProgressHint = undefined;
   }
+  // INC-20261028-STALE-ENGINE-STARTING: bridge hello 快照 —— 断线期间可能丢帧,下一条真实帧
+  // 到达(_lastFrameAt 越过此刻)即失效。新设备无本地计时时以 dispatch admitted_at 起算。
+  if (frame.meta?.detached === true) {
+    sess._turnDetachedAt = Date.now();
+    if (sess._turnStartedAt == null && typeof frame.meta.since === "number") {
+      sess._turnStartedAt = frame.meta.since;
+    }
+  }
 }
 
 // ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════

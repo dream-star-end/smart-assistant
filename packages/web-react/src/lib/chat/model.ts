@@ -677,6 +677,8 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
+  _turnDetachedAt?: number;
   /** Live one-line progress from outbound.turn_status status=working. Session
    *  memory only — not a message row, not written to persist snapshots. */
   _turnProgressHint?: string;
@@ -849,6 +851,11 @@ export function updateMessageText(msg: ChatMessage, newText: string): void {
   msg.text = newText;
 }
 
+/** Hello detached snapshot still current: no frame has landed since it arrived. */
+export function isTurnDetached(sess: Pick<ChatSession, "_turnDetachedAt" | "_lastFrameAt">): boolean {
+  return sess._turnDetachedAt !== undefined && (sess._lastFrameAt ?? 0) <= sess._turnDetachedAt;
+}
+
 /** turn 收尾清理（isFinal / stop / stuck 共用）。*/
 export function clearTurnTiming(sess: ChatSession): void {
   sess._turnStartedAt = null;
@@ -856,6 +863,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
   sess._turnProgressHint = undefined;
+  sess._turnDetachedAt = undefined;
   sess._liveTurnUsage = undefined;
   sess._turnCostCredits = "0";
   sess._turnCostSeenRequestIds = new Set();

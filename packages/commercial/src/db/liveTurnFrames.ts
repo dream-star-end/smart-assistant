@@ -478,6 +478,48 @@ export function liveCatchupSendDecision(
   return "send";
 }
 
+/** Head frames scanned for engine-ready evidence; startup emits only a few. */
+const OPEN_DISPATCH_READY_SCAN_FRAMES = 16;
+/** Startup frames are tiny; anything larger is content and counts as evidence. */
+const OPEN_DISPATCH_READY_SCAN_MAX_FRAME_BYTES = 4096;
+
+function isStartupOnlyLiveFrame(payload: Buffer): boolean {
+  try {
+    const frame = JSON.parse(payload.toString("utf8")) as { type?: unknown; status?: unknown };
+    if (frame.type === "sys.context_rebuilt") return true;
+    return frame.type === "outbound.turn_status" &&
+      (frame.status === "engine_starting" || frame.status === "engine_resuming");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * INC-20261028-STALE-ENGINE-STARTING — does the persisted head of one open
+ * dispatch's live stream prove the engine got past startup? Any frame other
+ * than context_rebuilt / engine_starting / engine_resuming is evidence. The
+ * caller scopes the dispatch to uid+session (getDispatchByLogicalKey).
+ */
+export async function readOpenDispatchEngineReady(
+  q: Pick<Pool, "query">,
+  input: { dispatchId: string; attemptNo: number },
+): Promise<boolean> {
+  const res = await q.query<{ payload: Buffer | null }>(
+    `/* open-dispatch-engine-ready */
+     SELECT CASE WHEN octet_length(f.payload) <= $2 THEN f.payload END AS payload
+       FROM client_session_live_frames f
+      WHERE f.stream_key = $1
+      ORDER BY f.frame_seq ASC
+      LIMIT $3`,
+    [
+      `dispatch:${input.dispatchId}:${input.attemptNo}`,
+      OPEN_DISPATCH_READY_SCAN_MAX_FRAME_BYTES,
+      OPEN_DISPATCH_READY_SCAN_FRAMES,
+    ],
+  );
+  return res.rows.some((row) => row.payload == null || !isStartupOnlyLiveFrame(row.payload));
+}
+
 /**
  * Hello/reconnect catch-up: exact stamped payloads for the current open
  * dispatch of one uid+session, after the client's wire frameSeq cursor.

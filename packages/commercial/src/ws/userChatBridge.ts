@@ -1,4 +1,5 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { sendHelloOpenDispatchSnapshot } from "./helloOpenDispatchSnapshot.js";
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -5666,7 +5667,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       sessionId: peerId,
                       clientMessageId,
                     });
-                    if (row === null || row.status !== "terminal") continue;
+                    if (row === null) continue;
+                    if (await sendHelloOpenDispatchSnapshot(pgPool, userWs, row, { uid: uidStr, peerId, clientMessageId }, bridgeLog)) continue;
+                    if (row.status !== "terminal") continue;
                     let reconcile: "turn_completed" | "interrupted" | null = null;
                     if (row.outcome === "completed") {
                       reconcile = "turn_completed";

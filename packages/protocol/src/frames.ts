@@ -1257,6 +1257,15 @@ const _turnStatusCommon = {
   // V3 S12e — 与 outbound.message / outbound.codex_billing 同 trace 语义,
   // 标记触发本帧的 turn。dispatchInbound stamp,仅观察用。
   traceId: Type.Optional(TraceIdString),
+  // INC-20261028-STALE-ENGINE-STARTING — only on the bridge's hello snapshot for
+  // an open dispatch: frames may have been missed while no browser was attached.
+  // since = dispatch admitted_at (epoch ms).
+  meta: Type.Optional(
+    Type.Object({
+      detached: Type.Literal(true),
+      since: Type.Optional(Type.Integer({ minimum: 0 })),
+    }),
+  ),
 } as const
 /** 当前 turn 的非流式阶段。null = 回到普通流式 / 空闲态。
  *  受控判别联合(turn-retry 批):retry 元数据只在 status='retrying' 分支
