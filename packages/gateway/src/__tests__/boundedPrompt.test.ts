@@ -24,7 +24,7 @@ test('50 MiB history is fitted using encoded bytes and preserves the exact curre
   assert.ok(!prompt.includes('0:'))
   assert.equal(JSON.parse(prompt.split('\n')[6]!), '继续处理 "最后一个任务" 😀')
   const done = events.find((e) => e.kind === 'context_compacted')
-  assert.ok(done?.kind === 'context_compacted' && done.compaction.droppedEntries === 198)
+  assert.ok(done?.kind === 'context_compacted' && done.compaction.strategy === 'history_suffix' && done.compaction.droppedEntries === 198)
 })
 
 test('pressure is measured before dispatch at 80 percent, with no false compaction', async () => {

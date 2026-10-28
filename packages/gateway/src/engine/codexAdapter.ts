@@ -483,6 +483,10 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       const turn = this._routeTurn
       turn?.parser.captureRuntimeEvent(payload, 'codex-jsonrpc')
     })
+    this.kernel.on('context_observation', (event: import('@openclaude/protocol').ContextObservation) => {
+      const turn = this._routeTurn
+      if (turn && this._activeTurn === turn && !turn.parser.finalized) turn.onEvent(event)
+    })
     this.kernel.on('usage', (usage: TurnTokenUsageSnapshot) => {
       this.emit('activity')
       const turn = this._activeTurn
