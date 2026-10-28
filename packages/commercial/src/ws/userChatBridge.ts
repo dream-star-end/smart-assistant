@@ -1,4 +1,7 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { containerLinkSnapshotSession } from "./containerLinkHello.js";
+import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
+import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
 import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
 import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
@@ -2123,9 +2126,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       : DISPATCH_LEASE_HEARTBEAT_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
-  const createContainerSocket = deps.createContainerSocket
-    ?? ((host, port, _signal) =>
-        new WebSocket(`ws://${host}:${port}/ws`, { perMessageDeflate: false, maxPayload: maxFrameBytes }));
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
@@ -2358,7 +2358,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const key = uid.toString();
     if (recoveryDrainRunning.has(key)) return;
     const executors = uidToRecoveryExecutors.get(key);
-    const executor = executors && [...executors][0];
+    const executor = availableExecutors(executors)[0];
     if (!executor) return;
     recoveryDrainRunning.add(key);
     try {
@@ -2373,7 +2373,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         leaseMs: recoveryLeaseMs,
       });
       for (const job of jobs) {
-        const liveExecutor = [...(uidToRecoveryExecutors.get(key) ?? [])][0];
+        const liveExecutor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
         if (!liveExecutor) {
           await releaseRecoveryForTransportWait(deps.pgPool, job);
           continue;
@@ -2734,38 +2734,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const connectAbort = new AbortController();
         let containerWs: WebSocket;
         try {
-          const dial = async (signal: AbortSignal): Promise<WebSocket> => {
-            let openedSocket: WebSocket;
-            if (endpoint.desktop) {
-              const { getDesktopTunnelRegistry } = await import("./desktopTunnelRegistry.js");
-              openedSocket = getDesktopTunnelRegistry().openWs(endpoint.desktop.containerId, "/ws") as unknown as WebSocket;
-            } else if (endpoint.tunnel) {
-              if (!deps.createTunnelContainerSocket) {
-                // 部署级配置漏注 — 给 4503 让前端别死循环重连(会上报 alert 由 ensureRunning 路径)
-                log?.error("user-chat-bridge: tunnel endpoint but factory not injected", {
-                  uid: uid.toString(),
-                  hostId: endpoint.tunnel.hostId,
-                  containerInternalId: endpoint.tunnel.containerInternalId,
-                });
-                sendErrorFrame(ws, "ERR_INTERNAL", "tunnel not configured");
-                try { ws.close(CLOSE_BRIDGE.INTERNAL, "tunnel not configured"); } catch { /* */ }
-                throw new Error("tunnel not configured");
-              }
-              openedSocket = await deps.createTunnelContainerSocket(
-                endpoint.tunnel,
-                endpoint.port,
-                signal,
-                // S12e CG4:connection-level trace 透传,headers 写 X-Connection-Trace-Id
-                connId,
-              );
-            } else {
-              openedSocket = createContainerSocket(endpoint.host, endpoint.port, signal);
-            }
-            return openedSocket;
-          };
-          containerWs = links && endpoint.containerId !== undefined
-            ? await links.connect(uid, endpoint.containerId, dial)
-            : await dial(connectAbort.signal);
+          containerWs = await attachContainerTransport({
+            uid, endpoint, links, deps, maxFrameBytes, signal: connectAbort.signal, connId,
+          });
         } catch (err) {
           log?.error("user-chat-bridge: container socket factory failed", {
             uid: uid.toString(),
@@ -2987,6 +2958,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let containerHasDurableDispatch = false;
     let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
     let cronOriginExecutor: CronOriginExecutor | null = null;
+    let unregisterExecutors: (() => void) | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
     const attestQueue: Array<{
       data: RawData;
@@ -3072,24 +3044,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
           executeAdmittedTurn(encoded, false, "recovery", undefined, job);
         };
-        const key = uid.toString();
-        let executors = uidToRecoveryExecutors.get(key);
-        if (!executors) {
-          executors = new Set();
-          uidToRecoveryExecutors.set(key, executors);
-        }
-        executors.add(recoveryExecutor);
-        void drainDurableRecoveryForUser(uid);
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
         cronOriginExecutor = async (payload) => {
           const registered = cronOriginExecutor;
-          const candidates = uidToCronOriginExecutors.get(uid.toString());
           if (
             cleaned ||
             userDetached ||
-            registered === null ||
-            !candidates?.has(registered)
+            registered === null
           ) {
             return { kind: "not_claimed" };
           }
@@ -3126,13 +3088,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return receipt;
         };
-        const key = uid.toString();
-        let executors = uidToCronOriginExecutors.get(key);
-        if (!executors) {
-          executors = new Set();
-          uidToCronOriginExecutors.set(key, executors);
-        }
-        executors.add(cronOriginExecutor);
+      }
+      if (unregisterExecutors === null && (recoveryExecutor || cronOriginExecutor)) {
+        unregisterExecutors = registerBridgeExecutors(uid, containerWs,
+          { recovery: recoveryExecutor, origin: cronOriginExecutor },
+          { recovery: uidToRecoveryExecutors, origin: uidToCronOriginExecutors });
+        void drainDurableRecoveryForUser(uid);
       }
       if (attestTimer !== null) {
         clearTimeout(attestTimer);
@@ -5376,21 +5337,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
 
-          // Phase 0.4 — inbound.hello → bridge ring replay.
-          //
-          // Each peer in the hello carries `lastFrameSeq` (last outbound seq
-          // the tab successfully processed). We peekReplay against the
-          // bridge-layer ring; if it satisfies, push the missed frames over
-          // userWs. If it can't, emit `outbound.resume_failed` so the client
-          // escalates to REST sync (matches personal-master server.ts
-          // autoResumeFromHello envelope verbatim — same shape as what the
-          // container would have emitted).
-          //
-          // We do NOT return here: hello must still reach the container so
-          // its embedded gateway registers `bridge.containerWs` into
-          // `clientsByPeer` for live delivery. Container's own peekReplay
-          // may also fire — duplicate frames are deduped client-side via
-          // the frameSeq cursor in websocket.js handleOutbound.
+          // Browser hello registers master subscribers and serves durable catchup.
+          // ContainerLink replaces its replay hints with the shared PG cursor;
+          // flag-off retains the legacy container hello contract.
           if (
             parsed !== null &&
             typeof parsed === "object" &&
@@ -9197,7 +9146,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             durableStampedFrame.payload,
           );
         }
-        const sessionId = durableStampedFrame?.sessionId ?? null;
+        const sessionId = durableStampedFrame?.sessionId ?? (linkHandle ? containerLinkSnapshotSession(data, isBinary) : null);
         const recipients: WebSocket[] = [];
         const seenRecipients = new Set<WebSocket>();
         const addRecipient = (ws: WebSocket): void => {
@@ -9313,12 +9262,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     containerWs.on("open", () => {
       clearTimeout(connectTimer);
-      {
-        const key = uid.toString();
-        let set = uidToContainerWs.get(key);
-        if (!set) { set = new Set(); uidToContainerWs.set(key, set); }
-        set.add(containerWs);
-      }
+      registerBridgeTransport(uid, containerWs, uidToContainerWs);
       bridgeLog?.debug("user-chat-bridge: container connected", {
         host: endpoint.host, port: endpoint.port,
       });
@@ -10188,24 +10132,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
-      if (recoveryExecutor !== null) {
-        const key = uid.toString();
-        const executors = uidToRecoveryExecutors.get(key);
-        if (executors) {
-          executors.delete(recoveryExecutor);
-          if (executors.size === 0) uidToRecoveryExecutors.delete(key);
-        }
-        recoveryExecutor = null;
-      }
-      if (cronOriginExecutor !== null) {
-        const key = uid.toString();
-        const executors = uidToCronOriginExecutors.get(key);
-        if (executors) {
-          executors.delete(cronOriginExecutor);
-          if (executors.size === 0) uidToCronOriginExecutors.delete(key);
-        }
-        cronOriginExecutor = null;
-      }
+      unregisterExecutors?.();
+      unregisterExecutors = null;
+      recoveryExecutor = null;
+      cronOriginExecutor = null;
     }
 
     /**
@@ -10517,15 +10447,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }
 
   async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
-    const executors = uidToCronOriginExecutors.get(input.uid.toString());
-    if (!executors || executors.size === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
+    const executors = availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()));
+    if (executors.length === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
     return executeCronOriginInject({
       input,
       pgPool: deps.pgPool,
       admitUserTurn: deps.admitUserTurn,
       // Resolve after admission so a bridge removed while PG was awaited is
       // never retained as a stale executor closure.
-      getExecutors: () => uidToCronOriginExecutors.get(input.uid.toString()) ?? [],
+      getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString())),
       log,
     });
   }

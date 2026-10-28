@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Client } from "pg";
+import { readContainerLinkReplay } from "../ws/containerLinkHello.js";
 import { renewContainerLinkLease } from "../ws/containerLinkStore.js";
 import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import { getTestDatabaseUrlForTempTables } from "./helpers/db.js";
@@ -34,5 +35,27 @@ test("ContainerLink renews admitted/accepted only, fenced by user/carrier/attemp
     }
     await client.query("UPDATE turn_dispatches SET status='accepted', terminal_at=NOW()");
     assert.equal(await renewContainerLinkLease(client, 42n, 7, row), false);
+  } finally { await client.end(); }
+});
+
+
+test("ContainerLink replay cursor is scoped to the persisted user, container and session", async () => {
+  const client = new Client({ connectionString: getTestDatabaseUrlForTempTables(), connectionTimeoutMillis: 1500 });
+  await client.connect();
+  try {
+    await client.query(`CREATE TEMP TABLE client_session_live_streams (stream_key text, user_id text, session_id text);
+      CREATE TEMP TABLE client_session_live_frames (stream_key text, source text, agent_container_id bigint, session_key text, frame_seq bigint);
+      CREATE TEMP TABLE turn_dispatches (user_id bigint, agent_container_id bigint, session_id text, client_message_id text, status text, terminal_at timestamptz, admitted_at timestamptz)`);
+    await client.query(`INSERT INTO client_session_live_streams VALUES ('mine','c:42','s'),('other','c:43','s');
+      INSERT INTO client_session_live_frames VALUES ('mine','gateway',7,'agent:main:webchat:dm:s',12),
+        ('other','gateway',7,'agent:main:webchat:dm:s',99),('mine','gateway',8,'agent:main:webchat:dm:s',88);
+      INSERT INTO turn_dispatches VALUES (42,7,'s','open-turn','accepted',NULL,NOW()),
+        (42,7,'s','done-turn','terminal',NOW(),NOW()),(43,7,'s','other-turn','accepted',NULL,NOW())`);
+    assert.deepEqual(await readContainerLinkReplay(client, 42n, 7, 's', 'agent:main:webchat:dm:s'), {
+      afterSeq: 12, activeMessageIds: ['open-turn'],
+    });
+    assert.deepEqual(await readContainerLinkReplay(client, 42n, 7, 'new-session', 'agent:main:webchat:dm:new-session'), {
+      afterSeq: 0, activeMessageIds: [],
+    });
   } finally { await client.end(); }
 });
