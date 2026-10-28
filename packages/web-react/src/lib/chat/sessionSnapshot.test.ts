@@ -298,8 +298,10 @@ describe("B3：hello 没完成时 8s 内走 HTTP 快照", () => {
     other._activeClientMessageId = "m-run-2";
     sock.notifyTabVisible();
     await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS - 1);
+    await flush();
     expect(readSessionSnapshot).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
+    await flush();
     expect(readSessionSnapshot).toHaveBeenCalledWith("s1", snapshotQuery(s, "main"));
     expect(readSessionSnapshot).toHaveBeenCalledWith("s2", { afterSeq: 0, dispatch: "m-run-2" });
     resolve(openSnapshot({ frames: [record(1, "seen over http")], nextAfterSeq: 1 }));
@@ -329,11 +331,14 @@ describe("B3：hello 没完成时 8s 内走 HTTP 快照", () => {
     const { sock } = boot({ readSessionSnapshot }, false);
     sock.notifyNetworkOnline();
     await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
     expect(readSessionSnapshot).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
     expect(readSessionSnapshot).toHaveBeenCalledTimes(2);
     sock.notifyTabVisible();
     await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS * 3);
+    await flush();
     expect(readSessionSnapshot).toHaveBeenCalledTimes(2);
     sock.stop();
   });
@@ -344,11 +349,15 @@ describe("B3：hello 没完成时 8s 内走 HTTP 快照", () => {
     const { sock, ws, s } = boot({ readSessionSnapshot });
     pushSnapshot(ws, openSnapshot({ turnStatus: detachedStatus(null) }));
     await flush();
+    await vi.advanceTimersByTimeAsync(10);
     sock.notifyTabVisible();
     await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
     expect(readSessionSnapshot).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10);
     ws.push({ type: "outbound.turn_status", sessionKey: SK, channel: "webchat", peer, clientMessageId: CMID, status: "compacting", frameSeq: 3 });
-    resolve(openSnapshot({ turnStatus: detachedStatus("engine_starting") }));
+    // Watermark above the local cursor: only R2 (newer live evidence) can reject this head.
+    resolve(openSnapshot({ turnStatus: detachedStatus("engine_starting"), lastFrameSeq: 5 }));
     await flush();
     expect(s._turnStatus).toBe("compacting");
     sock.stop();
@@ -609,5 +618,61 @@ describe("snapshot recovery preserves container delivery truth", () => {
     } finally {
       sock.stop();
     }
+  });
+});
+
+describe("没有本地猜测：在飞回合只由快照裁定", () => {
+  test("an IndexedDB-restored in-flight turn is decided by HTTP when no hello snapshot arrives in 8s", async () => {
+    vi.useFakeTimers();
+    const readSessionSnapshot = vi.fn(async () => openSnapshot({
+      dispatch: dispatchRow({ status: "terminal", outcome: "completed" }), reconcile: "turn_completed", turnStatus: null,
+    }));
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ readSessionSnapshot, syncSession });
+    sock.loadStored({
+      id: "s1", agentId: "main", title: "", createdAt: 1, lastAt: 1,
+      messages: [{ id: CMID, role: "user", text: "q", ts: 1, status: "sent" }],
+      _sendingInFlight: true, _activeClientMessageId: CMID,
+    });
+    expect(syncSession).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
+    expect(readSessionSnapshot).toHaveBeenCalledWith("s1", { afterSeq: 0, dispatch: CMID });
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
+  test("the server has no dispatch for the turn the hello named: it is not running", async () => {
+    const syncSession = vi.fn(async () => true);
+    const { sock, s } = boot({ syncSession });
+    pushSnapshot(FakeWS.instances.at(-1)!, openSnapshot());
+    await flush();
+    expect(s._sendingInFlight).toBe(true);
+    // Reconnect with the turn in flight; the snapshot answers with no dispatch for it.
+    FakeWS.instances.at(-1)!.close(1006, "");
+    await vi.advanceTimersByTimeAsync(60_000);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    expect(hellos(ws)[0]!.peers[0]).toMatchObject({ inFlightClientMessageId: CMID });
+    syncSession.mockClear();
+    pushSnapshot(ws, snapshot());
+    await flush();
+    expect(s._sendingInFlight).toBe(false);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: CMID });
+    sock.stop();
+  });
+
+  test("forceSync reads history once and retries a failed read once", async () => {
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws } = boot({ syncSession });
+    ws.push({ type: "outbound.resume_failed", sessionKey: SK, channel: "webchat", peer, from: 9, to: 0, reason: "no_buffer" });
+    await flush();
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    sock.stop();
   });
 });

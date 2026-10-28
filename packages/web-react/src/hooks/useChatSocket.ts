@@ -129,7 +129,7 @@ export type UseChatSocket = {
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
   setGoalState: (sessId: string, goal: ChatSession["goalState"]) => void;
-  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非持久，随 version 快照读回）。*/
+  /** 会话级 transient 软提示（"正在发送…"等，非持久，随 version 快照读回）。*/
   getTransientNotice: (sessId: string | undefined) => { text: string; ts: number } | null;
   respondPermission: (p: {
     sessId: string;
@@ -529,7 +529,6 @@ export function useChatSocket(opts: {
             (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
           );
           if (!isCurrent()) return false;
-          sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
         } catch {

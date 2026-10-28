@@ -281,15 +281,6 @@ function isLiveJournalAbort(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 }
 
-/** Successful-but-still-in-flight restore polls. A healthy live turn either
- * gets a WS `onLiveFrame` (exits immediately) or keeps a live owner (we only
- * drop the recovery chrome, not sending). 8 attempts / 45s is enough to
- * distinguish "tape already finished" from "first frames still landing"
- * without leaving the composer on Stop forever. */
-export const RESTORE_RECONCILE_MAX_ATTEMPTS = 8;
-export const RESTORE_RECONCILE_MAX_MS = 45_000;
-/** Empty-journal poll delays: 1s → 2s → 5s → 10s cap. */
-export const EMPTY_JOURNAL_POLL_DELAYS_MS = [1000, 2000, 5000, 10_000] as const;
 /** Background journal rebuild bounds. 24 pages × 500 frames = 12k frames;
  * 30s wall clock covers a slow first page without silent infinite paging. */
 export const LIVE_JOURNAL_MAX_PAGES = 24;
@@ -307,14 +298,6 @@ export const UNPUBLISHED_TAPE_RETRY_MAX_MS = 15 * 60_000;
 export const RECOVERY_DECISION_GRACE_MS = 20_000;
 /** 裁决 scheduled:true 之后等 `outbound.ack{recovery}` 领养的宽限(drain 1s 轮询 + 容器准入)。*/
 export const RECOVERY_ADOPTION_GRACE_MS = 30_000;
-
-export type LiveJournalObservation = {
-  frameCount: number;
-  liveClientMessageIds: Set<string>;
-  hasTapeProjection: boolean;
-  tapeProjectionVersion?: number;
-  degraded?: boolean;
-};
 
 export type ChatSocketDeps = {
   authorizeSwitch?:AuthorizeSwitch;
@@ -901,15 +884,10 @@ export class ChatSocket {
   /** Page-lifetime exact-turn dedupe. Historical hydration/replay never populates this set. */
   private readonly firstTextPaintTraceIds = new Set<string>();
 
-  // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
-  /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
+  // ── 历史读（重连后选中会话一次；forceSync 一次）──
+  /** 同会话历史读去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
   private readonly lastSyncAt = new Map<string, number>();
-  private readonly reconcileAttempts = new Map<string, number>();
-  private readonly reconcileInFlight = new Set<string>();
-  private readonly reconcileRunTokens = new Map<string, symbol>();
-  private readonly reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly tapeCommitFinalTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly reconcileClientMessageIds = new Map<string, string>();
   /** REST live-journal hydration is serialized per session. Stamped WS frames
    * are held until the immutable snapshot has rebuilt the process rows, then
    * released through the same frameSeq reducer so REST/WS overlap is exact. */
@@ -940,11 +918,6 @@ export class ChatSocket {
       consumedAuthoritativeResetEpoch: number;
     }>;
   }>();
-  /** Last successful/degraded live-frames page observation, used by the
-   * restore state machine to decide exit vs 1s live cadence vs empty backoff. */
-  private readonly lastLiveJournalObservation = new Map<string, LiveJournalObservation>();
-  private readonly reconcileStartedAt = new Map<string, number>();
-  private readonly emptyJournalBackoffIndex = new Map<string, number>();
   /** Phase-A final-only projections retry until exact Phase-B records publish,
    * a permanent failure is reported, or the bounded page-lifetime expires. */
   private readonly unpublishedTapeRetries = new Map<string, {
@@ -962,6 +935,8 @@ export class ChatSocket {
   /** Last snapshot (WS or HTTP) or stamped frame per session: the B3 hello ack. */
   private readonly snapshotAckAt = new Map<string, number>();
   private readonly wsSnapshotAt = new Map<string, number>();
+  /** In-flight cmid the last hello named per session: its snapshot answers for exactly that turn. */
+  private readonly helloAskedCmid = new Map<string, string>();
   private readonly snapshotHttpInFlight = new Set<string>();
   private snapshotWatchTimer: ReturnType<typeof setTimeout> | null = null;
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
@@ -1256,17 +1231,8 @@ export class ChatSocket {
     this.clearNotifyTimers();
     this.notifyScheduled = false;
     this.notifyThrottled = false;
-    for (const t of this.reconcileTimers.values()) clearTimeout(t);
-    this.reconcileTimers.clear();
     for (const t of this.tapeCommitFinalTimers.values()) clearTimeout(t);
     this.tapeCommitFinalTimers.clear();
-    this.reconcileInFlight.clear();
-    this.reconcileRunTokens.clear();
-    this.reconcileAttempts.clear();
-    this.reconcileClientMessageIds.clear();
-    this.reconcileStartedAt.clear();
-    this.emptyJournalBackoffIndex.clear();
-    this.lastLiveJournalObservation.clear();
     this.durableLiveJournalCheckpoints.clear();
     for (const state of this.unpublishedTapeRetries.values()) {
       if (state.timer) clearTimeout(state.timer);
@@ -1431,14 +1397,9 @@ export class ChatSocket {
     this.scheduleNotify();
   }
 
-  /** 对单会话触发 syncSession（去抖：同会话 SYNC_DEBOUNCE_MS 内至多一次）。*/
+  /** 对单会话触发一次历史读（去抖：同会话 SYNC_DEBOUNCE_MS 内至多一次）。*/
   private reconcileSession(sessId: string): void {
     if (!this.deps.syncSession) return;
-    const sess = this.sessions.get(sessId);
-    if (sess?._reconciling || sess?._liveStreamBroken) {
-      this.startContinuousReconcile(sessId);
-      return;
-    }
     const now = Date.now();
     const last = this.lastSyncAt.get(sessId) || 0;
     if (now - last < SYNC_DEBOUNCE_MS) return;
@@ -1450,189 +1411,19 @@ export class ChatSocket {
     void this.deps.syncSession(sessId);
   }
 
-  private clearContinuousReconcile(sessId: string, completed = false): void {
-    const timer = this.reconcileTimers.get(sessId);
-    if (timer) clearTimeout(timer);
-    this.reconcileTimers.delete(sessId);
-    this.reconcileInFlight.delete(sessId);
-    this.reconcileRunTokens.delete(sessId);
-    this.reconcileAttempts.delete(sessId);
-    this.reconcileClientMessageIds.delete(sessId);
-    this.reconcileStartedAt.delete(sessId);
-    this.emptyJournalBackoffIndex.delete(sessId);
-    const sess = this.sessions.get(sessId);
-    if (!sess) return;
-    sess._reconciling = false;
-    sess._liveStreamBroken = false;
-    if (completed && sess._recoveryStatus?.kind !== "stopping") {
-      sess._recoveryStatus = { kind: "completed" };
-    }
-    this.deps.persistSession?.(sessId);
-  }
-
-  private scheduleContinuousReconcile(sessId: string, delay: number): void {
-    if (this.reconcileTimers.has(sessId) || this.reconcileInFlight.has(sessId)) return;
-    const timer = setTimeout(() => {
-      this.reconcileTimers.delete(sessId);
-      this.runContinuousReconcile(sessId);
-    }, delay);
-    this.reconcileTimers.set(sessId, timer);
-  }
-
-  private startContinuousReconcile(
-    sessId: string,
-    errorCode?: string,
-    context?: { clientMessageId?: string },
-  ): void {
-    const sess = this.sessions.get(sessId);
-    if (!sess || !this.deps.syncSession) return;
-    if (isClientMessageId(context?.clientMessageId)) {
-      this.reconcileClientMessageIds.set(sessId, context.clientMessageId);
-    }
-    sess._reconciling = true;
-    if (!this.reconcileStartedAt.has(sessId)) {
-      this.reconcileStartedAt.set(sessId, Date.now());
-    }
-    if (sess._recoveryStatus?.kind !== "stopping") {
-      const attempt = this.reconcileAttempts.get(sessId) ?? 0;
-      sess._recoveryStatus = attempt > 0
-        ? { kind: "retrying", attempt, ...(errorCode ? { errorCode } : {}) }
-        : { kind: "waiting-service", ...(errorCode ? { errorCode } : {}) };
-    }
-    this.deps.persistSession?.(sessId);
-    this.scheduleNotify();
-    // The first authoritative check is immediate; only failures/backoff use a
-    // timer. Besides reducing visible recovery latency, this preserves the
-    // existing forceSync contract for callers that just received a replay
-    // miss or authoritative reconcile marker.
-    this.runContinuousReconcile(sessId);
-  }
-
-  private runContinuousReconcile(sessId: string): void {
-    const sess = this.sessions.get(sessId);
-    const syncSession = this.deps.syncSession;
-    if (!sess?._reconciling || !syncSession || this.reconcileInFlight.has(sessId)) return;
-    this.reconcileInFlight.add(sessId);
-    const runToken = Symbol(sessId);
-    this.reconcileRunTokens.set(sessId, runToken);
-    const attempt = (this.reconcileAttempts.get(sessId) ?? 0) + 1;
-    this.reconcileAttempts.set(sessId, attempt);
-    if (sess._recoveryStatus?.kind !== "stopping") {
-      sess._recoveryStatus = { kind: attempt === 1 ? "waiting-service" : "retrying", attempt };
-      this.scheduleNotify();
-    }
-    const exactClientMessageId = this.reconcileClientMessageIds.get(sessId) ?? sess._activeClientMessageId;
-    const context = isClientMessageId(exactClientMessageId)
-      ? { clientMessageId: exactClientMessageId }
-      : undefined;
-    void Promise.resolve(syncSession(sessId, context)).then(
-      (synced) => {
-        if (this.reconcileRunTokens.get(sessId) !== runToken) return;
-        this.reconcileRunTokens.delete(sessId);
-        this.reconcileInFlight.delete(sessId);
-        const current = this.sessions.get(sessId);
-        if (!current?._reconciling) return;
-        if (synced === true && this.finishRestoreIfReady(current, attempt)) {
-          return;
-        }
-        if (synced === true && !current._sendingInFlight && !current._stopSettlement) {
-          this.clearContinuousReconcile(sessId, true);
-          this.scheduleNotify();
-          return;
-        }
-        // Healthy REST: live journal stays on a 1s cadence so a broken WS does
-        // not look stale. Empty journal (completed tape / no live owner) uses
-        // 1s → 2s → 5s → 10s instead of a 1s death-poll. Failures still back off.
-        const delay = synced === true
-          ? this.nextSuccessfulReconcileDelayMs(sessId)
-          : Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5)));
-        if (current._recoveryStatus?.kind !== "stopping") {
-          if (current._liveUnitsPackApplied) {
-            current._recoveryStatus = { kind: "resumed" };
-          } else {
-            current._recoveryStatus = {
-              kind: "retrying",
-              attempt,
-              ...(synced === true ? {} : { errorCode: "sync_failed" }),
-            };
-          }
-        }
-        this.deps.persistSession?.(sessId);
-        this.scheduleNotify();
-        this.scheduleContinuousReconcile(sessId, delay);
-      },
-      () => {
-        if (this.reconcileRunTokens.get(sessId) !== runToken) return;
-        this.reconcileRunTokens.delete(sessId);
-        this.reconcileInFlight.delete(sessId);
-        const current = this.sessions.get(sessId);
-        if (!current?._reconciling) return;
-        if (current._recoveryStatus?.kind !== "stopping") {
-          current._recoveryStatus = { kind: "retrying", attempt, errorCode: "sync_failed" };
-        }
-        this.scheduleNotify();
-        this.scheduleContinuousReconcile(
-          sessId,
-          Math.min(30_000, 1000 * (2 ** Math.min(attempt - 1, 5))),
-        );
-      },
-    );
-  }
-
   /**
-   * Test/harness hook: record the latest live-frames observation so the
-   * restore loop can distinguish an active journal from an empty tape cutover.
+   * forceSync：一次权威历史读（tape 正文 / 终态卡），失败 8s 后再读一次。回合是否还在跑
+   * 只看快照，这里不轮询。
    */
-  noteLiveJournalObservation(sessId: string, observation: {
-    frameCount: number;
-    liveClientMessageIds: Iterable<string>;
-    hasTapeProjection: boolean;
-    tapeProjectionVersion?: number;
-    degraded?: boolean;
-  }): void {
-    this.lastLiveJournalObservation.set(sessId, {
-      frameCount: observation.frameCount,
-      liveClientMessageIds: new Set(observation.liveClientMessageIds),
-      hasTapeProjection: observation.hasTapeProjection,
-      ...(observation.tapeProjectionVersion !== undefined
-        ? { tapeProjectionVersion: observation.tapeProjectionVersion }
-        : {}),
-      ...(observation.degraded ? { degraded: true } : {}),
-    });
-  }
-
-  private sessionHasVisibleTurnBody(sess: ChatSession): boolean {
-    const cmid = sess._activeClientMessageId;
-    return sess.messages.some((message) => {
-      if (!isPlatedAssistantMessage(message)) return false;
-      if (cmid && message._clientMessageId !== cmid) return false;
-      if (!isServerAuthoredRow(message)) return false;
-      return true;
-    });
-  }
-
-  /**
-   * 超时兜底用的松弛终态判定:终态行可能不带本轮 _clientMessageId(tape fallback
-   * 只在 anchor 带 cmid 时携带),严格判定会让 finishRestore 永远等不到退出。
-   * 位置约束防回归 27344ba55:只认**本轮 user 行之后**、且不属于其他轮
-   * (_clientMessageId/_turnOwnerId 缺失或等于本轮)的可见服务端正文;
-   * 上一轮遗留的无主行都在 user 行之前,不会被误认。
-   */
-  private sessionHasLooseTurnBodyAfterActiveUser(sess: ChatSession): boolean {
-    const cmid = sess._activeClientMessageId;
-    if (!cmid) return false;
-    const userIndex = sess.messages.findIndex(
-      (message) => message.role === "user" && (message.id === cmid || message._clientMessageId === cmid),
-    );
-    if (userIndex < 0) return false;
-    return sess.messages.slice(userIndex + 1).some((message) => {
-      if (message.role !== "assistant" && message.role !== "thinking" && message.role !== "tool") {
-        return false;
-      }
-      if (message._clientMessageId !== undefined && message._clientMessageId !== cmid) return false;
-      if (message._turnOwnerId !== undefined && message._turnOwnerId !== cmid) return false;
-      if (!isServerAuthoredRow(message)) return false;
-      return messageHasVisibleBody(message);
+  private syncHistory(sessId: string, context?: { clientMessageId?: string }, retry = true): void {
+    const sync = this.deps.syncSession;
+    if (!sync) return;
+    const lifecycle = this.lifecycleEpoch;
+    void Promise.resolve().then(() => sync(sessId, context)).then((ok) => ok !== false, () => false).then((ok) => {
+      if (ok || !retry || lifecycle !== this.lifecycleEpoch) return;
+      setTimeout(() => {
+        if (lifecycle === this.lifecycleEpoch) this.syncHistory(sessId, context, false);
+      }, SNAPSHOT_ACK_TIMEOUT_MS);
     });
   }
 
@@ -1645,95 +1436,6 @@ export class ChatSocket {
     });
     if (assistants.length === 0) return true;
     return assistants.every((message) => !messageHasVisibleBody(message));
-  }
-
-  private nextSuccessfulReconcileDelayMs(sessId: string): number {
-    const obs = this.lastLiveJournalObservation.get(sessId);
-    const sess = this.sessions.get(sessId);
-    const cmid = sess?._activeClientMessageId;
-    const hasLiveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
-    const hasFrames = (obs?.frameCount ?? 0) > 0;
-    if (hasLiveOwner || hasFrames) {
-      this.emptyJournalBackoffIndex.delete(sessId);
-      return 1000;
-    }
-    const idx = this.emptyJournalBackoffIndex.get(sessId) ?? 0;
-    const delay = EMPTY_JOURNAL_POLL_DELAYS_MS[Math.min(idx, EMPTY_JOURNAL_POLL_DELAYS_MS.length - 1)]!;
-    this.emptyJournalBackoffIndex.set(sessId, idx + 1);
-    return delay;
-  }
-
-  /**
-   * Restore must have an exit. Returns true when this poll finished the loop.
-   * A still-live owner only drops recovery chrome (resumed). Only a visible
-   * server body for THIS turn (or units that prove it finished) may clear
-   * sending; session-level tape projection is not that proof.
-   */
-  private finishRestoreIfReady(sess: ChatSession, attempt: number): boolean {
-    if (sess._stopSettlement) return false;
-    const decision = this.restoreExitDecision(sess, attempt);
-    if (!decision) return false;
-    if (decision.clearSending && sess._sendingInFlight) {
-      this.clearSendingState(sess);
-    }
-    if (decision.kind === "completed") {
-      this.clearContinuousReconcile(sess.id, true);
-    } else {
-      this.clearContinuousReconcile(sess.id, false);
-      if (sess._recoveryStatus?.kind !== "stopping") {
-        sess._recoveryStatus = { kind: "resumed" };
-      }
-      this.deps.persistSession?.(sess.id);
-    }
-    this.scheduleNotify();
-    return true;
-  }
-
-  private restoreExitDecision(
-    sess: ChatSession,
-    attempt: number,
-  ): { clearSending: boolean; kind: "completed" | "resumed" } | null {
-    const obs = this.lastLiveJournalObservation.get(sess.id);
-    const cmid = sess._activeClientMessageId;
-    const liveOwner = !!(cmid && obs?.liveClientMessageIds.has(cmid));
-    const hasVisible = this.sessionHasVisibleTurnBody(sess);
-
-    if (sess._liveUnitsPackApplied) {
-      const hasProcess = sess.messages.some((message) => {
-        if (!message._liveUnit && message.role !== "agent-group" && message.role !== "thinking" && message.role !== "tool" && message.role !== "plan") {
-          return false;
-        }
-        if (cmid && message._clientMessageId !== cmid && message._turnOwnerId !== cmid) {
-          return false;
-        }
-        return true;
-      });
-      if (hasProcess || liveOwner) {
-        return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
-      }
-    }
-    // 对账成功且服务端已有可见正文,且当前 turn 已不是 live owner。
-    if (hasVisible && !liveOwner) {
-      return { clearSending: true, kind: "completed" };
-    }
-    // Session-level hasTapeProjection is true whenever ANY prior turn was
-    // taped. A newly admitted turn (empty live journal before the first
-    // plated assistant text, or a 401 on live-frames) must keep in-flight.
-    // thinking/tool are kitchen, not plated — they must not clear sending.
-    const startedAt = this.reconcileStartedAt.get(sess.id) ?? Date.now();
-    if (attempt >= RESTORE_RECONCILE_MAX_ATTEMPTS || Date.now() - startedAt >= RESTORE_RECONCILE_MAX_MS) {
-      if (sess._sendingInFlight && !hasVisible) {
-        // 兜底退出:整个对账窗口内都没有 live owner,但本轮 user 行之后已有可见
-        // 服务端正文(终态行不带 cmid 的 tape fallback)→ 本轮实际已终态,不能让
-        // 「思考中」永挂。窗口内(未超时)仍走上面的严格判定,防过早消失。
-        if (!liveOwner && this.sessionHasLooseTurnBodyAfterActiveUser(sess)) {
-          return { clearSending: true, kind: "completed" };
-        }
-        return { clearSending: false, kind: "resumed" };
-      }
-      return { clearSending: !liveOwner, kind: liveOwner ? "resumed" : "completed" };
-    }
-    return null;
   }
 
   /**
@@ -1980,12 +1682,6 @@ export class ChatSocket {
         }
       },
       onLiveFrame: (sess) => {
-        if (sess._reconciling) {
-          this.clearContinuousReconcile(sess.id);
-          if (sess._recoveryStatus?.kind !== "stopping") {
-            sess._recoveryStatus = { kind: "resumed" };
-          }
-        }
         if (sess._sendingInFlight) this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
@@ -2006,7 +1702,7 @@ export class ChatSocket {
         if (this.sessions.get(sessId)?._stopSettlement?.phase === "sync") {
           this.syncSessionAndSettleStop(sessId, context);
         } else {
-          this.startContinuousReconcile(sessId, undefined, context);
+          this.syncHistory(sessId, context);
         }
       },
       persistSession: (sessId) => this.deps.persistSession?.(sessId),
@@ -2435,7 +2131,9 @@ export class ChatSocket {
       case "outbound.session_snapshot": {
         const frame = f as OutboundSessionSnapshotWire;
         if (typeof frame.peer?.id === "string" && isSessionSnapshot(frame.snapshot)) {
-          void this.applySessionSnapshot(frame.peer.id, frame.snapshot, { via: "ws", requestedAt: Date.now() });
+          const asked = this.helloAskedCmid.get(frame.peer.id);
+          this.helloAskedCmid.delete(frame.peer.id);
+          void this.applySessionSnapshot(frame.peer.id, frame.snapshot, { via: "ws", requestedAt: Date.now(), asked });
         }
         return;
       }
@@ -3342,9 +3040,13 @@ export class ChatSocket {
    * lastStreamKey 与同一 sessionKey 的游标；服务端对每个订阅回一份权威快照。
    * includeInFlight=false 用于纯注册（仓库绑定前、晚加载的会话），不上报在飞回合。
    */
-  private composeHelloFrame(includeInFlight = true, onlySessionId?: string): { data: string; sessionIds: string[] } {
+  private composeHelloFrame(
+    includeInFlight = true,
+    onlySessionId?: string,
+  ): { data: string; sessionIds: string[]; asked: Map<string, string> } {
     const peers: Array<Record<string, unknown>> = [];
     const sessionIds: string[] = [];
+    const asked = new Map<string, string>();
     // The server answers at most 8 sessions (in-flight first): the selected one goes next.
     const ordered = [...this.sessions].sort(([a], [b]) => Number(b === this.activeSessionId) - Number(a === this.activeSessionId));
     for (const [pid, s] of ordered) {
@@ -3361,6 +3063,7 @@ export class ChatSocket {
       const defAgent = s.agentId || this.deps.defaultAgentId || "main";
       if (!agents.has(defAgent)) agents.set(defAgent, 0);
       const inFlight = includeInFlight && !!s._sendingInFlight;
+      if (inFlight && query.dispatch) asked.set(pid, query.dispatch);
       for (const [agentId, lastFrameSeq] of agents) {
         peers.push({
           peerId: pid,
@@ -3383,14 +3086,21 @@ export class ChatSocket {
         peers,
       }),
       sessionIds,
+      asked,
     };
   }
 
   private sendHelloFrame(includeInFlight = true, onlySessionId?: string): boolean {
     const hello = this.composeHelloFrame(includeInFlight, onlySessionId);
     const sent = this.safeWsSend(hello.data);
-    if (sent) for (const id of hello.sessionIds) this.subscribedSessions.add(id);
-    return sent;
+    if (!sent) return false;
+    for (const id of hello.sessionIds) {
+      this.subscribedSessions.add(id);
+      const cmid = hello.asked.get(id);
+      if (cmid) this.helloAskedCmid.set(id, cmid);
+      else this.helloAskedCmid.delete(id);
+    }
+    return true;
   }
 
   /** A session loaded after this socket's hello subscribes once; its snapshot follows. */
@@ -3410,7 +3120,7 @@ export class ChatSocket {
   private applySessionSnapshot(
     sessId: string,
     snap: SessionSnapshot,
-    ctx: { via: "ws" | "http"; requestedAt: number },
+    ctx: { via: "ws" | "http"; requestedAt: number; asked?: string },
   ): Promise<void> {
     const sess = this.sessions.get(sessId);
     if (!sess || snap.sessionId !== sessId) return Promise.resolve();
@@ -3445,20 +3155,39 @@ export class ChatSocket {
         sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
       }
       if (pages.degraded) sess._liveJournalDegraded = true;
-      this.applySnapshotHead(sess, last, fresh);
+      this.applySnapshotHead(sess, last, fresh, true, ctx.asked);
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();
     });
   }
 
-  /** `readHistory=false` from inside a history read itself (legacy live-frames pages). */
-  private applySnapshotHead(sess: ChatSession, snap: SessionSnapshot, fresh: boolean, readHistory = true): void {
+  /**
+   * `readHistory=false` from inside a history read itself (legacy live-frames pages).
+   * `asked` is the in-flight cmid the request named: the server prefers that exact dispatch,
+   * so a different answer means it has no dispatch for that turn and the turn is not running.
+   */
+  private applySnapshotHead(
+    sess: ChatSession,
+    snap: SessionSnapshot,
+    fresh: boolean,
+    readHistory = true,
+    asked?: string,
+  ): void {
     // Pending prompts are idempotent by requestId and fenced by the settled set.
     for (const item of snap.pendingPermissions.items) this.dispatch(item as unknown as OutboundWire);
     const d = snap.dispatch;
     const own = fresh && !!d && sess._sendingInFlight && sess._activeClientMessageId === d.clientMessageId &&
       !snapshotIsStale(sess, snap);
     let needsHistory = snap.pendingPermissions.completeness !== "complete" || snap.gap?.reason === "tape";
+    let historyCmid = d?.clientMessageId;
+    if (fresh && asked && d?.clientMessageId !== asked && !sess._stopSettlement &&
+      sess._sendingInFlight && sess._activeClientMessageId === asked) {
+      // Not shown as completed: whatever exists of it comes from history.
+      this.finishDispatch(sess.id, asked);
+      this.clearSendingState(sess);
+      needsHistory = true;
+      historyCmid = asked;
+    }
     if (own && isOpenSnapshotDispatch(d) && !isSnapshotFenced(sess, d)) {
       confirmDispatchDelivery(sess, d.clientMessageId, d.acceptedAt != null);
       sess._turnStartedAt = d.since;
@@ -3485,7 +3214,7 @@ export class ChatSocket {
         needsHistory = true;
       }
     }
-    if (needsHistory && readHistory) void this.deps.syncSession?.(sess.id, d ? { clientMessageId: d.clientMessageId } : undefined);
+    if (needsHistory && readHistory) void this.deps.syncSession?.(sess.id, historyCmid ? { clientMessageId: historyCmid } : undefined);
   }
 
   /** afterSeq 续页：hasMore 走 HTTP 下一页，byte_limit 读那一帧的原始字节再推进游标。 */
@@ -3557,13 +3286,14 @@ export class ChatSocket {
     this.snapshotHttpInFlight.add(sessId);
     const requestedAt = Date.now();
     const lifecycle = this.lifecycleEpoch;
+    const query = opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId);
     return Promise.resolve()
-      .then(() => read(sessId, opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId)))
+      .then(() => read(sessId, query))
       .then((snap) => {
         this.snapshotHttpInFlight.delete(sessId);
         if (lifecycle !== this.lifecycleEpoch) return undefined;
         if (!isSessionSnapshot(snap)) return null;
-        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt });
+        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt, asked: query.dispatch });
         return snap;
       }, () => {
         this.snapshotHttpInFlight.delete(sessId);
@@ -3843,7 +3573,6 @@ export class ChatSocket {
       this.controlPersistRetryTimers.delete(item.controlId);
       void this.deps.deletePendingControl?.(sessId, item.controlId).catch(() => {});
     }
-    this.clearContinuousReconcile(sessId);
     this.clearUnpublishedTapeRetry(sessId);
     this.durableLiveJournalCheckpoints.delete(sessId);
     const safeId = String(sessId).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -3866,6 +3595,7 @@ export class ChatSocket {
     this.subscribedSessions.delete(sessId);
     this.snapshotAckAt.delete(sessId);
     this.wsSnapshotAt.delete(sessId);
+    this.helloAskedCmid.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -3885,12 +3615,6 @@ export class ChatSocket {
     this.transientNotices.clear();
     this.firstTextPaintTraceIds.clear();
     this.lastSyncAt.clear();
-    for (const timer of this.reconcileTimers.values()) clearTimeout(timer);
-    this.reconcileTimers.clear();
-    this.reconcileAttempts.clear();
-    this.reconcileInFlight.clear();
-    this.reconcileRunTokens.clear();
-    this.reconcileClientMessageIds.clear();
     this.durableLiveJournalCheckpoints.clear();
     this.authoritativeFrameSeqResetEpochBySessionKey.clear();
     for (const state of this.unpublishedTapeRetries.values()) {
@@ -3906,6 +3630,7 @@ export class ChatSocket {
     this.subscribedSessions.clear();
     this.snapshotAckAt.clear();
     this.wsSnapshotAt.clear();
+    this.helloAskedCmid.clear();
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
@@ -4120,8 +3845,6 @@ export class ChatSocket {
           : undefined;
       s._turnStartedAt = typeof stored._turnStartedAt === "number" ? stored._turnStartedAt : Date.now();
       s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
-      s._reconciling = true;
-      s._recoveryStatus = { kind: "waiting-service" };
     }
     s._dispatchPaused = stored._dispatchPaused === true;
     s._cancelledAutomaticRecoveryIds =
@@ -4211,12 +3934,8 @@ export class ChatSocket {
     // so register the repaired session first.  A clean second load remains a
     // zero-write fast path because the repair is idempotent.
     if (repairedStoredOrder) this.deps.persistSession?.(stored.id);
-    if (
-      restoredExactInFlight &&
-      storedControls.every((item) => item.controlKind !== "stop" || item.fenceOnly === true)
-    ) {
-      this.startContinuousReconcile(stored.id);
-    }
+    // The hello snapshot decides a restored in-flight turn; without it within 8s, HTTP does.
+    if (restoredExactInFlight) this.armSnapshotWatchdog();
     if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
     this.scheduleNotify();
   }
@@ -4574,7 +4293,6 @@ export class ChatSocket {
       let sawTapeProjection = false;
       let latestSnapshot: SessionSnapshot | undefined;
       let maxTapeProjectionVersion: number | undefined;
-      let frameCount = 0;
       let degraded = false;
       const startedAt = Date.now();
       let pagesRead = 0;
@@ -4615,7 +4333,6 @@ export class ChatSocket {
               }
             }
           }
-          frameCount += page.frames.length;
           if (stage) {
             stage.push(...page.frames);
           } else if (page.frames.length > 0) {
@@ -4674,7 +4391,6 @@ export class ChatSocket {
                   });
                 }
               }
-              frameCount = Math.max(frameCount, raw.throughFrameSeq ?? raw.units.length);
               const sessForUnits = this.sessions.get(sessId);
               if (sessForUnits) {
                 sessForUnits._liveUnitsPackApplied = true;
@@ -4709,7 +4425,6 @@ export class ChatSocket {
                   resetOwnerIds.add(frame.clientMessageId);
                 }
               }
-              frameCount += stagedFrames.length;
               if (firstPage.nextCursor) cursor = firstPage.nextCursor;
               if (firstPage.hasMore) await readPages(stagedFrames);
               this.applyDurableLiveFrames(
@@ -4798,15 +4513,6 @@ export class ChatSocket {
         }
       }
 
-      this.noteLiveJournalObservation(sessId, {
-        frameCount,
-        liveClientMessageIds: currentLiveOwners,
-        hasTapeProjection: sawTapeProjection || checkpoint?.sawTapeProjection === true,
-        ...(typeof maxTapeProjectionVersion === "number"
-          ? { tapeProjectionVersion: maxTapeProjectionVersion }
-          : {}),
-        degraded,
-      });
       if (sess) {
         sess._liveJournalDegraded = degraded;
         this.scheduleNotify();
@@ -5828,7 +5534,7 @@ export class ChatSocket {
         isCurrent: () => !expected || ownsPending(),
       });
       if (synced === false) {
-        if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        if (ownsPending()) this.syncHistory(sessId, { clientMessageId });
         return;
       }
       if (expected && !ownsPending()) return;
@@ -5841,7 +5547,7 @@ export class ChatSocket {
         message.role === "assistant" && !!message._errorCode && isServerAuthoredRow(message) &&
         (clientMessageId === undefined || message._clientMessageId === clientMessageId));
       if (!error) {
-        if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        if (ownsPending()) this.syncHistory(sessId, { clientMessageId });
         return;
       }
       if (sess._dispatchPaused) { decline(); return; }
@@ -5863,8 +5569,8 @@ export class ChatSocket {
       else decline();
       this.deps.persistSession?.(sess.id);
     } catch {
-      // A failed read is not a terminal decision; normal reconciliation retries.
-      if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+      // A failed read is not a terminal decision; the history read retries once.
+      if (ownsPending()) this.syncHistory(sessId, { clientMessageId });
     } finally {
       this.automaticRecoveryPending.delete(pendingKey);
     }
@@ -6137,7 +5843,6 @@ export class ChatSocket {
       return;
     }
     if (item.controlKind === "stop") {
-      this.clearContinuousReconcile(sess.id);
       this.finishDispatch(sess.id, item.clientMessageId);
       sess._stopSettlement = undefined;
       this.clearSendingState(sess);

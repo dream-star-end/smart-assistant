@@ -61,9 +61,7 @@ import {
 } from "./reducer";
 import {
   ChatSocket,
-  EMPTY_JOURNAL_POLL_DELAYS_MS,
   LIVE_JOURNAL_MAX_PAGES,
-  RESTORE_RECONCILE_MAX_ATTEMPTS,
   UNPUBLISHED_TAPE_RETRY_MAX_MS,
   automaticTurnRecoveryTarget,
   exactUserReplayPayload,
@@ -4133,12 +4131,11 @@ describe("service_restart 合成 final：无在途流 → 不生成 phantom 中�
 });
 
 describe("applyResumeFailed (§4 layer 3)", () => {
-  test("advances cursor to server currentLast, flags broken, forces sync", () => {
+  test("advances cursor to server currentLast and forces sync", () => {
     const s = sess();
     const forceSync = vi.fn();
     applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 42, reason: "buffer_miss" } as never, { forceSync });
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
-    expect(s._liveStreamBroken).toBe(true);
     expect(forceSync).toHaveBeenCalledWith("s1");
   });
 });
@@ -6468,21 +6465,15 @@ describe("ChatSocket interrupted continuation", () => {
       _activeClientMessageId: clientMessageId,
       _turnStartedAt: now,
     });
+    expect(syncSession).not.toHaveBeenCalled();
+    await syncSession();
 
-    await vi.waitFor(() => {
-      expect(resetLists.length).toBeGreaterThan(0);
-      expect(sock.sessions.get(sessId)?._reconciling).toBe(false);
-    });
     const session = sock.sessions.get(sessId)!;
     expect(resetLists[0]).toEqual([clientMessageId]);
     expect(resetLists.slice(1).every((ids) => ids.length === 0)).toBe(true);
     expect(session.messages.find((message) => message.id === "stale-local-retired")).toBeUndefined();
     expect(session.messages.some((message) => message.text === "retired stream answer")).toBe(true);
     expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(syncSession).toHaveBeenCalledTimes(1);
     sock.stop();
   });
 
@@ -7338,13 +7329,13 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
-  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and keeps reconciling", async () => {
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and reads again", async () => {
     const { sock, session, user } = deferredErrorFixture("s-legacy-read-fail", { masterOwns: false });
     const sync = vi.fn(async () => false);
     (sock as any).deps.syncSession = sync;
     await (sock as any).autoRecoverTerminalTurn(session.id, user.id);
+    await vi.advanceTimersByTimeAsync(8_000);
     expect(sync.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(session._reconciling).toBe(true);
     expect(session._sendingInFlight).toBe(true);
     expect(errorCards(session)).toHaveLength(0);
     sock.stop();
@@ -9201,359 +9192,6 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("restored exact in-flight turn retries REST with backoff until authority completes it", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      if (syncSession.mock.calls.length === 1) return false;
-      const session = sock.sessions.get("s1")!;
-      session._sendingInFlight = false;
-      session._activeClientMessageId = undefined;
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-old", role: "user", text: "long task", ts: now - 20 * 60_000, status: "sent" }],
-      createdAt: now - 20 * 60_000,
-      lastAt: now - 20 * 60_000,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-old",
-      _turnStartedAt: now - 20 * 60_000,
-    });
-    const session = sock.sessions.get("s1")!;
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    expect(session._recoveryStatus).toMatchObject({ kind: "retrying", errorCode: "sync_failed" });
-
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("successful active journal sync stays on a one-second live cadence", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 2,
-        liveClientMessageIds: ["u-live"],
-        hasTapeProjection: false,
-      });
-      if (syncSession.mock.calls.length === 3) {
-        const session = sock.sessions.get("s1")!;
-        session._sendingInFlight = false;
-        session._activeClientMessageId = undefined;
-      }
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-live", role: "user", text: "long task", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-live",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    // Active journal (live owner + frames) stays at 1s so a broken-WS client
-    // does not look stale. Empty journals use backoff; see the sibling test.
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(syncSession).toHaveBeenCalledTimes(3);
-    expect(sock.sessions.get("s1")?._reconciling).toBe(false);
-    sock.stop();
-  });
-
-  test("empty journal without a live owner backs off instead of 1s death-polling", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-empty", role: "user", text: "done turn", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-empty",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[1] - EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(3);
-    sock.stop();
-  });
-
-  test("empty journal with session-level tape projection keeps 思考中", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-tape", role: "user", text: "new turn", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-tape",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._reconciling).toBe(true);
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(EMPTY_JOURNAL_POLL_DELAYS_MS[0]);
-    expect(syncSession).toHaveBeenCalledTimes(2);
-    expect(session._sendingInFlight).toBe(true);
-    sock.stop();
-  });
-
-  test("visible server-authored body after reconcile exits restore", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      session.messages.push({
-        id: "srv-a1",
-        role: "assistant",
-        text: "已经写完的答复",
-        ts: Date.now(),
-        _source: "server",
-        _clientMessageId: "u-vis",
-      });
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-vis", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-vis",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._reconciling).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("thinking-only kitchen after reconcile does not count as plated body", async () => {
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      session.messages.push({
-        id: "srv-t1",
-        role: "thinking",
-        text: "先想清楚再写",
-        ts: Date.now(),
-        _source: "server",
-        _clientMessageId: "u-kit",
-      });
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 1,
-        liveClientMessageIds: [],
-        hasTapeProjection: false,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-kit", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-kit",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    expect(session._sendingInFlight).toBe(true);
-    sock.stop();
-  });
-
-  test("restore attempt cap exits even when journal metadata never arrives", async () => {
-    vi.useFakeTimers();
-    const syncSession = vi.fn(async () => true);
-    const sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-cap", role: "user", text: "orphan", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-cap",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    expect(syncSession).toHaveBeenCalledTimes(1);
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    const session = sock.sessions.get("s1")!;
-    expect(syncSession.mock.calls.length).toBeLessThanOrEqual(RESTORE_RECONCILE_MAX_ATTEMPTS);
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._recoveryStatus?.kind).toBe("resumed");
-    sock.stop();
-  });
-
-  test("cap exit clears 思考中 when a cmid-less terminal body follows the active user row", async () => {
-    // 终态行(tape fallback)可能不带本轮 _clientMessageId。窗口内严格判定不认它
-    // (防过早消失),但打满对账窗口后必须以它为退出,否则「思考中」永挂。
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      const session = sock.sessions.get("s1")!;
-      if (!session.messages.some((m) => m.id === "srv-fallback")) {
-        session.messages.push({
-          id: "srv-fallback",
-          role: "assistant",
-          text: "终态正文(fallback 不带 cmid)",
-          ts: Date.now(),
-          _source: "server",
-        });
-      }
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [{ id: "u-loose", role: "user", text: "please", ts: now, status: "sent" }],
-      createdAt: now,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-loose",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    // 窗口内:严格判定不认 cmid-less 行,「思考中」保持。
-    expect(session._sendingInFlight).toBe(true);
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(false);
-    expect(session._recoveryStatus?.kind).toBe("completed");
-    sock.stop();
-  });
-
-  test("prior-turn cmid-less body before the active user row keeps 思考中 at the cap", async () => {
-    // 27344ba55 的初衷:上一轮遗留的无主正文不能证明本轮已完成 —— 松弛判定
-    // 有位置约束(必须在本轮 user 行之后),之前的行打满窗口也不触发退出。
-    vi.useFakeTimers();
-    let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s1", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
-    sock = makeSocket({ syncSession });
-    const now = Date.now();
-    sock.loadStored({
-      id: "s1",
-      agentId: "main",
-      title: "s1",
-      messages: [
-        { id: "srv-prev", role: "assistant", text: "上一轮的回复", ts: now - 60_000, _source: "server" },
-        { id: "u-next", role: "user", text: "new turn", ts: now, status: "sent" },
-      ],
-      createdAt: now - 60_000,
-      lastAt: now,
-      _sendingInFlight: true,
-      _activeClientMessageId: "u-next",
-      _turnStartedAt: now,
-    });
-
-    await Promise.resolve();
-    const session = sock.sessions.get("s1")!;
-    for (let i = 0; i < RESTORE_RECONCILE_MAX_ATTEMPTS; i++) {
-      await vi.advanceTimersByTimeAsync(10_000);
-    }
-    expect(session._reconciling).toBe(false);
-    expect(session._sendingInFlight).toBe(true);
-    expect(session._recoveryStatus?.kind).toBe("resumed");
-    sock.stop();
-  });
-
   test("late admission ACK cannot revive a stopped turn", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -10996,14 +10634,7 @@ describe("openDispatch hydrate restores in-flight", () => {
   test("prior-turn tape + empty live journal does not hide 思考中 for the new turn", async () => {
     vi.useFakeTimers();
     let sock!: ChatSocket;
-    const syncSession = vi.fn(async () => {
-      sock.noteLiveJournalObservation("s-open-2", {
-        frameCount: 0,
-        liveClientMessageIds: [],
-        hasTapeProjection: true,
-      });
-      return true;
-    });
+    const syncSession = vi.fn(async () => true);
     sock = makeSocket({ syncSession });
     const now = Date.now();
     sock.loadStored({
@@ -11033,7 +10664,8 @@ describe("openDispatch hydrate restores in-flight", () => {
     const session = sock.sessions.get("s-open-2")!;
     expect(session._sendingInFlight).toBe(true);
     expect(session._activeClientMessageId).toBe("m-open-2");
-    expect(session._reconciling).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(session._sendingInFlight).toBe(true);
     sock.stop();
   });
 });

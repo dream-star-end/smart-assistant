@@ -117,7 +117,7 @@ export type FrameEffects = {
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportTurnError?: (p: { code: string; message: string; traceId?: string; sessionId?: string }) => void;
-  /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
+  /** resume_failed / reconcile：游标已推进后，读一次权威历史。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
    * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
@@ -3008,7 +3008,6 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
   } else {
     advanceFrameSeqCursorTo(sess, frame, frameTo); // 推游标到 server currentLast（防 reload 死循环，配 dbPut）
   }
-  sess._liveStreamBroken = true;
   effects.persistSession?.(sess.id); // 立即落地仲裁后的游标（dbPut 写点；防 reload 死循环）
   effects.forceSync?.(sess.id);
 }

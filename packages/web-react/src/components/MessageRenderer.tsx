@@ -1562,7 +1562,7 @@ export function MessageList({
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot };
   /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
   turnActivity?: TurnActivityInfo | null;
-  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
+  /** 会话级 transient 软提示（"正在发送…"等，非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
   /** 已有部分消息可见，但 canonical history 仍在加载。Journal 水合不再占用此位。 */
   historyLoading?: boolean;

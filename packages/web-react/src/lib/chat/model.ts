@@ -761,10 +761,6 @@ export type ChatSession = {
   /** Client-only rejection feedback survives a placeholder preceding history hydration. */
   _recoveryRejectedNotices?: Record<string, { code: string; notice: string }>;
   _isFirstTurnAfterReady?: boolean;
-  _liveStreamBroken?: boolean;
-  /** Exact restored/disconnected turn is being reconciled with REST authority.
-   * Attempts and wall-clock are capped (see RESTORE_RECONCILE_MAX_*). */
-  _reconciling?: boolean;
   /** Single low-cognition user-visible recovery/control state. */
   _recoveryStatus?: RecoveryStatusState;
   /** master 自动重试的真实进度,按根消息归并(lib/chat/retryStatus.ts)。只用于展示。 */
