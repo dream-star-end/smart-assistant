@@ -652,6 +652,8 @@ function MessageActions({
 // ═══════════════ user ═══════════════
 // 只标注**过渡态**与失败:「已回复」是每条历史用户消息的终态,助手回复本身就是证据,再标一遍
 // 只剩噪音;「已读」同理。「已送达」保留 —— 它只在当前在飞轮出现,告诉用户服务端已受理。
+// status=sent 不足以说明这一点:停止、服务重启中断、重复受理、自动恢复源轮都把行落定成 sent,
+// 回复开始后的软重试 / 停止收尾也会把 read 写回 sent。所以「已送达」另由调用方给 awaitingReply。
 const USER_STATUS_LABEL: Record<string, string> = {
   sending: "发送中",
   queued: "还在等上一项",
@@ -689,6 +691,7 @@ export function UserCard({
   cb,
   failurePresentedBelow = false,
   readOnly = false,
+  awaitingReply = false,
 }: {
   msg: ChatMessage;
   cb?: CardCallbacks;
@@ -696,6 +699,8 @@ export function UserCard({
   failurePresentedBelow?: boolean;
   /** 只读面(教程回放 / 后台会话查看器):不出「编辑」「引用」这类会写回 Composer 的动作。 */
   readOnly?: boolean;
+  /** 这一轮还在进行,且这条消息下面还没有任何内容。只有这时 sent 才显示「已送达」。 */
+  awaitingReply?: boolean;
 }) {
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
@@ -703,7 +708,7 @@ export function UserCard({
   const cancelledByUser = status === "error" && msg._sendCancelled === true;
   const statusLabel = cancelledByUser
     ? (msg._errorDetail || "发送已取消")
-    : status ? USER_STATUS_LABEL[status] : undefined;
+    : status && (status !== "sent" || awaitingReply) ? USER_STATUS_LABEL[status] : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
