@@ -88,6 +88,8 @@ jobs:
       - name: Retry waste and Go cache terminal contracts (P6)
         run: |
           node --test scripts/lib/user-contract-go-cache.test.mjs scripts/lib/go-cache-turn.test.mjs
+          node --test scripts/lib/go-responses-sse-trace.test.mjs
+          bash scripts/test-mutex.sh commercial 'node --import tsx --test scripts/__tests__/goResponsesProbe.test.ts'
           # Receipt trust is intentionally root-only, matching the production deploy owner.
           sudo env PATH="$PATH" node --test scripts/__tests__/selfhostRetryWaste.node-test.mjs
           INVOCATION_ID=p6-inherited-service-fixture bash scripts/v5-lease-center-selftest.sh
