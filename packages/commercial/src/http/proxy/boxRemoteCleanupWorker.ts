@@ -246,15 +246,26 @@ export class BoxRemoteCleanupWorker {
     try {
       const result = await Promise.race([
         target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd),
-          { timeoutMs: 10_000, maxResponseBytes: 256 }),
+          // OCV5-649: the transport refuses a cap below 1024 before sending;
+          // 256 made every look fail locally, so no run was ever closed here.
+          { timeoutMs: 10_000, maxResponseBytes: 1024 }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("BOX_RUN_LIVENESS_TIMEOUT")), 10_500);
         }),
       ]);
       seen = parseBoxRunLiveness(result.stdout);
-    } catch { return false; }
+    } catch (error) {
+      workerLog.warn("box_run_liveness_unreadable", { requestId: candidate.requestId,
+        accountId: candidate.accountId.toString(), ...probeFailureTag(error) });
+      return false;
+    }
     finally { if (timer) clearTimeout(timer); }
-    if (!seen || seen.state === "terminal") return false;
+    if (!seen) {
+      workerLog.warn("box_run_liveness_unreadable", { requestId: candidate.requestId,
+        accountId: candidate.accountId.toString(), reason: "BOX_RUN_LIVENESS_MALFORMED" });
+      return false;
+    }
+    if (seen.state === "terminal") return false;
     if (seen.state === "alive") {
       await holds.clearRunAbsence(candidate);
       return false;

@@ -3967,6 +3967,7 @@ const _BRIDGE_ERROR_MESSAGES = {
   engine_error: '任务执行时遇到内部错误，你的消息已保留，可以直接重试。',
   internal_error: '服务遇到内部错误，你的消息已保留，请重试。',
   auth_error: '认证状态异常，本轮未正常完成，请重新尝试。',
+  box_capacity_held: '上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。',
   platform_credential_expired: '平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。',
   service_restart: '服务正在更新，本轮已中断，请重试。',
   session_persist_unavailable: '消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。',

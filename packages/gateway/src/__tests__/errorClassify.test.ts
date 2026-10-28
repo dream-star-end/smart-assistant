@@ -11,13 +11,21 @@ import {
   classifyDelegateOutputError,
   classifyRunError,
 } from '../errorClassify.js'
+import { _tapeErrorCodeForGenericFailure } from '../sessionManager.js'
+import { _buildEngineErrorFrame } from '../turnFrames.js'
 
 describe('classifyRunError', () => {
-  it('Box local slot 409 is not a model-capacity or upstream retry', () => {
-    const raw = 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"}}'
-    const classified = classifyRunError(raw)
-    assert.equal(classified.code, 'unknown')
-    assert.equal(supportsAutomaticTurnRecovery(classified.code), false)
+  it('OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and is never auto-recovered', () => {
+    // The exact production terminal (commercial uid 4, 10-28 trace 5adf074e).
+    const raw = JSON.stringify({ subtype: 'success',
+      result: 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"},"request_id":"065f563d454c692b1f828fd3d36d49c3"}' })
+    assert.equal(classifyRunError(raw).code, 'box_capacity_held')
+    const frame = _buildEngineErrorFrame({ sessionKey: 'sk', channel: 'webchat',
+      peer: { id: 'u4', kind: 'dm' } }, { kind: 'error', error: raw })
+    assert.equal(frame.code, 'box_capacity_held')
+    assert.equal(_tapeErrorCodeForGenericFailure(raw), 'box_capacity_held')
+    assert.equal(supportsAutomaticTurnRecovery(frame.code), false)
+    assert.equal(supportsAutomaticTurnRecovery(_tapeErrorCodeForGenericFailure(raw)), false)
   })
   it('model_config_changed_retry_turn: production model-authority 409', () => {
     const raw =

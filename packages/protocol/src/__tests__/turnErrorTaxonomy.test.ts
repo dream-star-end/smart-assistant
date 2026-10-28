@@ -28,6 +28,7 @@ describe('automatic turn recovery policy', () => {
       'codex_billing', // billing admission result is not a model continuation proof
       'project_context_unavailable', // held before dispatch until the master answers; user retries
       'platform_credential_expired', // OCV5-556: replay reuses the dead launch credential; the next message gets a fresh one
+      'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot
     ])
     const actual = Object.entries(TURN_ERROR_TAXONOMY)
       .filter(([, semantics]) =>
@@ -54,6 +55,7 @@ describe('automatic turn recovery policy', () => {
     for (const code of [
       'auth_error',
       'platform_credential_expired',
+      'box_capacity_held',
       'insufficient_credits',
       'context_too_long',
       'bad_request',

@@ -32,6 +32,7 @@ export type ClassifiedErrorCode =
   | 'bad_request'
   | 'auth_error'
   | 'platform_credential_expired'
+  | 'box_capacity_held'
   | 'unknown'
 
 export interface ClassifiedError {
@@ -82,6 +83,15 @@ const PATTERNS: Array<{
     re: /\bANTIGRAVITY_CREDENTIAL_EXPIRED\b|oauth2: token expired|refresh token is not set/i,
     code: 'platform_credential_expired',
     message: '平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。',
+  },
+  // OCV5-649: the Box proxy's admission refused the turn (409, no model call)
+  // because the session's Box slot is still held. Left unknown it became tape
+  // ENGINE_ERROR / wire upstream_failed, both auto-recovered, so each recovery
+  // waited on the same hold again (commercial uid 4, 10-28: three in a row).
+  {
+    re: /\bBOX_CAPACITY_HELD\b/,
+    code: 'box_capacity_held',
+    message: '上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。',
   },
   // OCV5-556: the Antigravity relay route of a turn lapsed (404
   // ANTIGRAVITY_ROUTE_EXPIRED), or the CLI ended "successfully" right after an
