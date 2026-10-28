@@ -3105,7 +3105,13 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
       });
       ws.send(helloFrame);
       await waitHelloForwarded(rig, helloFrame);
-      const frame = await nextBusinessFrame(fc);
+      // 有界等待:快照缺失时必须红,不能把测试挂死。
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 2000)),
+      ]);
+      assert.ok(got, "open dispatch 的 hello 必须收到权威 turn_status 快照");
+      const frame = got;
       assert.equal(frame.peer && (frame.peer as { id?: unknown }).id, peerId);
       assert.equal(frame.clientMessageId, clientMessageId);
       assert.equal(frame.sessionKey, `agent:main:webchat:dm:${peerId}`);
