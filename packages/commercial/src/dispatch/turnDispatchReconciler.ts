@@ -232,6 +232,7 @@ export interface TurnDispatchReconcilerDeps {
   pool: Pool
   /** Supported ACKed intent must be proven/requeued before the financial failure verdict. */
   recoverInterruptedAdmission?: (dispatchId: string) => Promise<boolean>
+  containerLinkEnabled?: boolean
   /** 测试注入;默认 rootLogger.child({ subsys: 'turnDispatchReconciler' })(OCV5-567) */
   log?: Logger
   container: {
@@ -1089,6 +1090,7 @@ async function closeVisibleOrphans(
       if (
         cached?.kind === 'ok' &&
         (cached.state === 'sink_staged' ||
+          (deps.containerLinkEnabled === true && cached.state === 'running') ||
           ((cached.state === 'queued' || cached.state === 'running') && age < HARD_CAP_AGE_MS))
       ) {
         skippedLive++
@@ -1104,7 +1106,10 @@ async function closeVisibleOrphans(
       admittedAtMs: row.admitted_at.getTime(),
     })
     const scanLastFrameAtMs = row.last_frame_at ? row.last_frame_at.getTime() : null
+    const cachedEngine = dispatchStates.get(JSON.stringify([row.dispatch_id, row.attempt_no]))
     const action = classifyVisibleOrphan({
+      lastEngineAliveAtMs: deps.containerLinkEnabled === true && cachedEngine?.kind === 'ok' &&
+        (cachedEngine.state === 'running' || cachedEngine.state === 'sink_staged') ? nowMs : null,
       tapeVisibleAt: row.tape_visible_at === null ? null : Number(row.tape_visible_at),
       tapePartCount: row.tape_part_count,
       tapePartsRows: Number(row.tape_parts_rows ?? '0'),
@@ -1137,11 +1142,12 @@ async function closeVisibleOrphans(
           skippedLive++
           continue
         }
-        if (probe.state === 'sink_staged' || age < HARD_CAP_AGE_MS) {
+        if (probe.state === 'sink_staged' || age < HARD_CAP_AGE_MS ||
+            (deps.containerLinkEnabled === true && probe.state === 'running')) {
           skippedLive++
           continue
         }
-        // Exact running >=6h retains the existing hard cap, never a queued CAS.
+        // Flag off retains the legacy running hard cap, never a queued CAS.
       } else if (row.container_running !== false) {
         // Unknown/non-live typed state cannot prove an active carrier dead.
         // Independent carrier-dead evidence keeps its old interrupt path.
