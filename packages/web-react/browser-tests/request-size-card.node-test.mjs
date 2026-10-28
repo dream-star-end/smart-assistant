@@ -131,14 +131,16 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
                 else await page.getByText("资料暂未处理完成", { exact: true }).waitFor();
                 const body = await page.locator("body").innerText();
                 assert.equal(await page.getByText("资料暂未处理完成", { exact: true }).count(), 1);
-                assert.match(body, /文件和对话均已保留/);
+                // W3:卡片正文用错误目录的人话(request_too_large → size)。
+                assert.match(body, /请精简消息或分批提交文件/);
                 assert.doesNotMatch(body, /Request too large|max 20MB|内部错误/);
                 if (shape !== "legacy") assert.ok(body.includes(partial));
                 if (shape === "legacy-frozen") {
                   assert.ok(!body.includes(cachedTitle));
-                  const details = page.locator("details").filter({ hasText: cachedId });
+                  // W3:请求 ID 在收起的「技术详情」里,展开后可见。
+                  const details = page.getByTestId("error-tech-details").filter({ hasText: cachedId });
                   assert.equal(await details.count(), 1, "cached request ID must survive the display projection");
-                  await details.locator("summary").click();
+                  await page.getByRole("alert").getByRole("button", { name: /技术详情/ }).click();
                   const detail = await details.innerText();
                   assert.ok(detail.includes(`请求 ID：${cachedId}`));
                   assert.doesNotMatch(detail, /Request too large|max 20MB|内部错误/);

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
+import { claimProblemCardReport, problemCardReportKey } from "../lib/chat/problemCardReportGuard";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
 import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
@@ -402,6 +403,8 @@ export function useChatSocket(opts: {
         }, authRef.current?.snapshot().token);
       },
       reportProblemCard: (p) => {
+        // 刷新 / 重连 / 多标签页不重复报同一张卡(W3)。
+        if (!claimProblemCardReport(problemCardReportKey(p))) return;
         reportClientFriction({
           surface: "chat",
           stage: "problem_card",
