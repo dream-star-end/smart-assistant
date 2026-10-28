@@ -813,14 +813,21 @@ export function TurnStatusCard({
   cb: CardCallbacks;
   currentTurn: boolean;
 }) {
-  const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
+  // A status record carries no ledger fact. SERVICE_RESTART has no waiver path,
+  // so only a real waiver marker may turn its copy into a refund (t1133).
+  const presented = errorPresentation(
+    msg._errorCode, "", msg._errorDetail,
+    normalizeTurnErrorCode(msg._errorCode) !== "service_restart" || msg.usage?.waived === true,
+  );
   const retryTarget = msg._clientMessageId
     ? cb.resolveRetryTarget?.(msg._clientMessageId)
     : undefined;
   return (
     <div className="rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3 animate-in" role="status">
       <div className="flex items-start gap-2.5">
-        <ShieldCheck size={16} className="mt-0.5 shrink-0 text-warning" />
+        {presented.waived
+          ? <ShieldCheck size={16} className="mt-0.5 shrink-0 text-warning" />
+          : <AlertTriangle size={16} className="mt-0.5 shrink-0 text-warning" />}
         <div className="min-w-0 flex-1">
           <div className="text-body font-medium text-fg">{presented.title}</div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted">{presented.message}</div>

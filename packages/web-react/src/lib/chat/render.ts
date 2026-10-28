@@ -22,7 +22,7 @@ import type { BashTail, ChatMessage, ChildBlock } from "./model";
 import { friendlyBridgeErrorMessage, insufficientCreditsCopy, isSilentTurnErrorCode, problemCardPresentation } from "./pure";
 
 /**
- * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
+ * dispatch 终态错误码(受理未执行 = 未计费;服务重启中断按账本:只有真实 turn waiver 才说已退款)。归一化小写。
  * 这些是 **server 权威的稳定协议码**:`dispatch_lost`/`dispatch_not_accepted` 由 reconciler 铸在
  * durable dispatch status 上;`service_restart` 由 gateway 写在**不可变 tape**(boot recovery synthetic
  * crashed)里 —— 不可变行无法回填 master 标记,故按稳定协议码识别(非脆弱的内部 failureCode 枚举)。
@@ -840,10 +840,11 @@ export function errorPresentation(
   }
   const waiverEligible = WAIVED_ERROR_CODES.has(normalized);
   const ref = requestReference(detail, text);
-  // durable turn dispatch failure-status 文案。三者恒免单 tone(waived:true → 温和
-  // ShieldCheck 卡):dispatch_lost / dispatch_not_accepted = 受理成功但从未开始执行(durable
-  // not_accepted 证明,未计费);service_restart = 服务重启掐断，但 master 的
-  // durable live-frame journal 保留此前所有已展示过程。
+  // durable turn dispatch failure-status 文案。dispatch_lost / dispatch_not_accepted 恒免单 tone
+  // (waived:true → 温和 ShieldCheck 卡):受理成功但从未开始执行(durable not_accepted 证明,未计费)。
+  // service_restart = 服务重启掐断，master 的 durable live-frame journal 保留此前所有已展示过程;
+  // 中断前已 committed 的请求照常扣费，且 TurnWaiveReason 没有 service_restart —— 只有该轮真有
+  // turn waiver(usage.waived)时才能说已退款(t1133:卡片称已退回，账本 1359 积分未退)。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
   if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
@@ -864,10 +865,12 @@ export function errorPresentation(
       : partialAnswerBody(body);
     return {
       title: "任务已中断",
-      message: "此前已生成的过程已完整保留。你可以从现有进度继续；本轮未计费，如已扣除，积分已原路退回。",
+      message: waiverApplied
+        ? "此前已生成的过程已完整保留。你可以从现有进度继续；本轮已免单，已扣积分已原路退回。"
+        : "此前已生成的过程已完整保留。你可以从现有进度继续；中断前已完成的部分按实际用量计费。",
       ...(partialAnswer ? { bodyText: partialAnswer } : {}),
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
-      waived: true,
+      waived: waiverApplied,
     };
   }
   if (waiverEligible && waiverApplied) {
