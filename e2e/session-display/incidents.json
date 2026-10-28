@@ -9000,6 +9000,51 @@
           "assertion": "'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot"
         }
       ]
+    },
+    {
+      "id": "INC-20261026-REFRESH-GRACE",
+      "occurredAt": "2026-10-26",
+      "severity": "P1",
+      "symptom": "个人版体验-办公：登录后新标签/慢网打开裸首页掉登录。refresh rotate 后旧 oc_rt 超过默认 10s race grace（实测 ~11.6s）被判 theft 整族吊销清 cookie。OCV5-622：grace 默认 45s + 跨 tab refresh 单飞；超 grace / fingerprint 不一致仍 theft。",
+      "rootFixCommit": "f365e6d0",
+      "coverageCommits": [
+        "f365e6d0",
+        "0f6080bc",
+        "58c428fd",
+        "9381c484"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/refresh-cross-tab.node-test.mjs",
+          "assertion": "INC-20261026-REFRESH-GRACE: two tabs refreshing together never present a rotated oc_rt"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: late joiner waits — holder answers busy (Codex P1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: release during claim settle does not hang waiter (Codex r2 P1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/refreshCrossTabLock.test.ts",
+          "assertion": "BroadcastChannel: overlapping acquires serialize"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse rotated refresh at 50s (default grace=45) → still theft"
+        }
+      ]
     }
   ]
 }

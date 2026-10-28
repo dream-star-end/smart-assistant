@@ -6,6 +6,7 @@
  */
 import type { AuthSession, RefreshOutcome, RefreshResult } from "../types";
 import { reportClientFriction } from "../clientFriction";
+import { withCrossTabRefreshLock } from "../refreshCrossTabLock";
 
 /**
  * v5 商业版前端网络层。
@@ -59,8 +60,9 @@ export const refreshStates = new WeakMap<AuthSession, RefreshState>();
 
 const authResponseFences = new WeakMap<Response, { session: AuthSession; epoch: number }>();
 
-// 本 tab 内所有会写 oc_rt 的调用按发起顺序落地。跨 tab 的 refresh 冲突由后端
-// REFRESH_RACE 协议处理；主动 logout 另有 token-free 广播让其它 tab 立即撤退。
+// 本 tab 内所有会写 oc_rt 的调用按发起顺序落地。跨 tab refresh 另走
+// withCrossTabRefreshLock（Web Locks / BroadcastChannel）；后端 REFRESH_RACE
+// 仍是安全网。主动 logout 另有 token-free 广播让其它 tab 立即撤退。
 let authCookieMutationTail: Promise<void> = Promise.resolve();
 
 export function withAuthCookieMutation<T>(run: () => Promise<T>): Promise<T> {
@@ -197,6 +199,9 @@ export function refreshAuth(
 
   const flight = withAuthCookieMutation(async (): Promise<RefreshOutcome> => {
     // 排队不计入 refresh 自身网络期限；login/logout 队首也各自有同样的 30s 上限。
+    // Cross-tab lock wraps only the network rotate so sibling tabs wait for
+    // Set-Cookie before their own refresh (OCV5-622).
+    return withCrossTabRefreshLock(async (): Promise<RefreshOutcome> => {
     timeout = setTimeout(
       () => controller.abort(new DOMException("refresh timeout", "TimeoutError")),
       REFRESH_TIMEOUT_MS,
@@ -263,6 +268,7 @@ export function refreshAuth(
     );
     state.friction = { id, code, attempts, surface: prior?.surface ?? surface };
     return { kind: "transient", epoch: expectedEpoch, retryAfterMs };
+    });
   }).finally(() => {
     if (timeout) clearTimeout(timeout);
     if (state.flight === flight) state.flight = null;

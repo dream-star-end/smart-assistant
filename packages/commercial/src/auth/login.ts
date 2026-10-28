@@ -113,9 +113,11 @@ export class RefreshError extends Error {
  * 新 cookie 可 retry,实际仍然拿不到 access token。这是 OAuth 2.1 实现里
  * 常见的折衷,叫 "reuse interval" 或 "rotation grace window"。
  *
- * 默认 10s 足够覆盖正常多 tab silent refresh race;可由 env 调。
+ * 默认 45s：覆盖慢网 BootSplash + 多 tab 打开（实测 ~11.6s 误判 theft）。
+ * 仍可由 env REFRESH_ROTATION_GRACE_SECONDS 覆盖；theft 检测本身不削弱。
+ * 取 30–60 中间值 45：给 CF/慢 boot 留余量，又远小于典型 refresh TTL。
  */
-const REFRESH_ROTATION_GRACE_SECONDS_DEFAULT = 10;
+const REFRESH_ROTATION_GRACE_SECONDS_DEFAULT = 45;
 function rotationGraceSeconds(): number {
   const raw = process.env.REFRESH_ROTATION_GRACE_SECONDS;
   if (!raw) return REFRESH_ROTATION_GRACE_SECONDS_DEFAULT;

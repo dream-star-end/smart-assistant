@@ -855,8 +855,118 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     assert.equal(theftRows.length, 0, "race must not produce any theft-marked rows");
   });
 
+  // OCV5-622:默认 grace=45 后，rotate 后 11s / 40s 同 fingerprint 复用仍走 race
+  // （覆盖办公号实测 ~11.6s 误判 theft）；超 grace 仍 theft。
+  test("reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = ""; // force default 45 (!raw)
+    try {
+      for (const ageSec of [11, 40] as const) {
+        const email = `paula-midgrace-${ageSec}@example.com`;
+        await setupUser(email, "paula midgrace password");
+        const lr = await login(
+          { email, password: "paula midgrace password", turnstile_token: "tok" },
+          { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
+        );
+        const oldRaw = lr.refresh_token;
+        const r1 = await refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        });
+        await query(
+          "UPDATE refresh_tokens SET revoked_at = NOW() - make_interval(secs => $2) WHERE token_hash = $1",
+          [refreshTokenHash(oldRaw), ageSec],
+        );
+        let theftFired = false;
+        await assert.rejects(
+          refresh(oldRaw, {
+            jwtSecret: JWT_SECRET,
+            remoteIp: "10.1.2.3",
+            userAgent: "race-test-ua",
+            onTheftDetected: () => {
+              theftFired = true;
+            },
+          }),
+          (err: unknown) =>
+            err instanceof RefreshError && err.code === "REFRESH_RACE",
+        );
+        assert.equal(theftFired, false, `age=${ageSec}s must stay race under default grace=45`);
+        // live sibling still usable
+        const r2 = await refresh(r1.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        });
+        assert.ok(typeof r2.refresh_token === "string" && r2.refresh_token.length > 0);
+      }
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  test("reuse rotated refresh at 50s (default grace=45) → still theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    try {
+      await setupUser("paula-overgrace@example.com", "paula overgrace password");
+      const lr = await login(
+        {
+          email: "paula-overgrace@example.com",
+          password: "paula overgrace password",
+          turnstile_token: "tok",
+        },
+        {
+          jwtSecret: JWT_SECRET,
+          turnstileBypass: true,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        },
+      );
+      const oldRaw = lr.refresh_token;
+      const r1 = await refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        userAgent: "race-test-ua",
+      });
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+        [refreshTokenHash(oldRaw)],
+      );
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+          onTheftDetected: () => {
+            theftFired = true;
+          },
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "age=50s must still theft under default grace=45");
+      await assert.rejects(
+        refresh(r1.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
   // R2 finding 加固:grace 窗口内但 UA/IP 不一致 → 视作攻击者从异地 replay,
-  // 仍走 theft 路径。哪怕攻击者抢在 10s 内复用,只要 fingerprint 不匹配,
+  // 仍走 theft 路径。哪怕攻击者抢在 grace 内复用,只要 fingerprint 不匹配,
   // family 就被砍。
   test("reuse INSIDE grace 但 UA/IP 不一致 → theft (fingerprint mismatch)", async (t) => {
     if (skipIfNoPg(t)) return;
@@ -909,7 +1019,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
       );
       assert.equal(theftFired, true, "grace=0 must disable race window entirely");
     } finally {
-      if (prev === undefined) delete process.env.REFRESH_ROTATION_GRACE_SECONDS;
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
       else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
     }
   });
