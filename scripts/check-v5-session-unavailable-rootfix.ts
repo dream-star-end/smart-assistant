@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
+import { createProofTsxCache } from './lib/proofTsxCache.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -707,6 +708,8 @@ function assertSelectedTap(tap: string, expected: readonly string[], label: stri
   assert.equal((tap.match(/^# duration_ms [0-9.]+\r?$/gm) ?? []).length, 1, `${label}: missing TAP completion summary`)
 }
 
+const proofTsxCache = createProofTsxCache()
+
 async function runTapProof(opts: {
   fromRoot: string
   files: readonly string[]
@@ -736,6 +739,7 @@ async function runTapProof(opts: {
   if (opts.namePattern) args.push(`--test-name-pattern=${opts.namePattern}`)
   args.push(...opts.files.map((rel) => join(opts.fromRoot, rel)))
   try {
+    proofTsxCache.linkInto(env.TMPDIR)
     const tap = await new Promise<string>((resolveProof, rejectProof) => {
       const child = spawn(process.execPath, args, {
         cwd: opts.fromRoot,

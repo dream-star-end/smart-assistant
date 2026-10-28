@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { createProofTsxCache } from "../lib/proofTsxCache.js";
 
 // OCV5-357: release gates in staging must not share (or grow) the global tsx compile cache.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -187,6 +188,97 @@ test -z "$MASTER_GATE_TMPDIR" && echo cleared`,
       assert.doesNotMatch(r.stdout, /unexpected-shared-prune/);
       assert.equal(readFileSync(old, "utf8"), "warm-cache");
       assert.equal(existsSync(path.join(dir, "releases")), false);
+    }
+  });
+});
+
+describe("rootfix proof transform reuse", () => {
+  const loader = path.join(root, "node_modules/tsx/dist/loader.mjs");
+  const cacheName = `tsx-${process.geteuid?.()}`;
+
+  test("reuses transforms across isolated proof dirs, invalidates edited source, and only cleans owned paths", (t) => {
+    const dir = fixture(t);
+    const cache = createProofTsxCache(dir);
+    t.after(cache.cleanup);
+    const src = path.join(dir, "value.ts");
+    const entry = path.join(dir, "entry.ts");
+    writeFileSync(src, "export const value: number = 1;\n");
+    writeFileSync(entry, 'import { value } from "./value.ts";\nimport { tmpdir } from "node:os";\nconsole.log(JSON.stringify({value, tmp: tmpdir(), home: process.env.HOME, state: process.env.OPENCLAUDE_HOME}));\n');
+    const runProof = (name: string) => {
+      const proof = path.join(dir, name);
+      for (const sub of ["tmp", "home", "state"]) mkdirSync(path.join(proof, sub), { recursive: true });
+      const tmp = path.join(proof, "tmp");
+      cache.linkInto(tmp);
+      const result = spawnSync(process.execPath, ["--import", loader, entry], {
+        encoding: "utf8",
+        env: { PATH: process.env.PATH, TMPDIR: tmp, HOME: path.join(proof, "home"), OPENCLAUDE_HOME: path.join(proof, "state") },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const output = JSON.parse(result.stdout);
+      assert.equal(output.tmp, tmp);
+      assert.equal(output.home, path.join(proof, "home"));
+      assert.equal(output.state, path.join(proof, "state"));
+      const target = realpathSync(path.join(tmp, cacheName));
+      rmSync(proof, { recursive: true });
+      assert.ok(existsSync(target), "per-proof cleanup must leave sibling proofs' cache intact");
+      return { value: output.value, target };
+    };
+    const first = runProof("first");
+    assert.equal(first.value, 1);
+    const entries = () => readdirSync(first.target).filter((name) => /^\d+-[a-f0-9]+$/.test(name));
+    const compiled = entries();
+    assert.ok(compiled.length >= 2, "entry and imported source must be cached");
+    const old = Date.now() / 1000 - 3600;
+    for (const name of compiled) utimesSync(path.join(first.target, name), old, old);
+    const mtimes = compiled.map((name) => statSync(path.join(first.target, name)).mtimeMs);
+    assert.deepEqual(runProof("second"), first);
+    assert.deepEqual(compiled.map((name) => statSync(path.join(first.target, name)).mtimeMs), mtimes,
+      "cache hits must not recompile and rewrite the same transforms");
+    writeFileSync(src, "export const value: number = 2;\n");
+    assert.equal(runProof("changed").value, 2, "source changes cannot reuse stale code");
+    assert.ok(entries().length > compiled.length);
+    const unrelated = path.join(dir, cacheName);
+    mkdirSync(unrelated);
+    writeFileSync(path.join(unrelated, "keep"), "unrelated");
+    cache.cleanup();
+    cache.cleanup();
+    assert.equal(existsSync(first.target), false);
+    assert.equal(readFileSync(path.join(unrelated, "keep"), "utf8"), "unrelated");
+    assert.throws(() => cache.linkInto(dir), /already closed/);
+  });
+
+  test("separate invocations never share caches and an existing proof entry is not overwritten", (t) => {
+    const dir = fixture(t);
+    const a = createProofTsxCache(dir);
+    const b = createProofTsxCache(dir);
+    t.after(a.cleanup);
+    t.after(b.cleanup);
+    const one = path.join(dir, "one");
+    const two = path.join(dir, "two");
+    mkdirSync(one);
+    mkdirSync(two);
+    a.linkInto(one);
+    b.linkInto(two);
+    const target = realpathSync(path.join(one, cacheName));
+    assert.notEqual(target, realpathSync(path.join(two, cacheName)));
+    assert.throws(() => b.linkInto(one), { code: "EEXIST" });
+    assert.equal(realpathSync(path.join(one, cacheName)), target);
+  });
+
+  test("process exit cleans the cache on success and on an uncaught proof failure", (t) => {
+    const dir = fixture(t);
+    const helper = path.join(root, "scripts/lib/proofTsxCache.ts");
+    for (const fail of [false, true]) {
+      const parent = path.join(dir, String(fail));
+      mkdirSync(parent);
+      const program = path.join(dir, `exit-${fail}.mts`);
+      writeFileSync(program, `import { createProofTsxCache } from ${JSON.stringify(helper)};\ncreateProofTsxCache(${JSON.stringify(parent)});\n${fail ? 'throw new Error("proof-failed");' : ''}\n`);
+      const result = spawnSync(process.execPath, ["--import", loader, program], {
+        encoding: "utf8", env: { PATH: process.env.PATH, TMPDIR: dir },
+      });
+      assert.equal(result.status, fail ? 1 : 0, result.stderr);
+      if (fail) assert.match(result.stderr, /proof-failed/);
+      assert.deepEqual(readdirSync(parent), []);
     }
   });
 });
