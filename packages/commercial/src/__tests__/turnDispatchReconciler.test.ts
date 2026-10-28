@@ -2352,6 +2352,31 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
       assertNoDestructive(pool)
     })
 
+    test(`RF-link running after 6h remains live acceptedPage=${acceptedPage}`, async () => {
+      _resetVisibleOrphanScanOffset()
+      const now = Date.now()
+      const row = rowAt(now, 6 * 3_600_000)
+      const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+      let probes = 0
+      const counts = await runReconcileTick({
+        pool: pool as unknown as Pool,
+        containerLinkEnabled: true,
+        now: () => now,
+        listCarrierDeadDispatchIds: async () => [],
+        container: {
+          ...noContainer,
+          getDispatchState: async () => {
+            probes++
+            return { kind: 'ok', state: 'running' }
+          },
+        },
+      })
+      assert.equal(probes, 1)
+      assert.equal(counts.visibleOrphans, 0)
+      assert.equal(counts.visibleOrphansSkippedLive, 1)
+      assertNoDestructive(pool)
+    })
+
     test('queued hard-cap waits for durable next-tick GET; first acceptedPage=' +
       acceptedPage, async () => {
       _resetVisibleOrphanScanOffset()

@@ -270,3 +270,15 @@ describe("firstVisibleAtMsForDispatch (OCV5-57 B2)", () => {
     assert.equal(firstVisibleAtMsForDispatch([exact], { ...d, sessionId: sid }), 5_000);
   });
 });
+
+test("RF-link: exact live engine resets 6h quiet clock without any PG frames", () => {
+  const nowMs = HARD_CAP_AGE_MS * 2;
+  const evidence = {
+    tapeVisibleAt: null, tapePartCount: null, tapePartsRows: 0,
+    lastFrameAtMs: null, firstVisibleAtMs: null, acceptedOrAdmittedAtMs: 0,
+    containerRunning: true, nowMs,
+  };
+  assert.equal(classifyVisibleOrphan({ ...evidence, lastEngineAliveAtMs: nowMs }), "skip");
+  assert.equal(classifyVisibleOrphan({ ...evidence, lastEngineAliveAtMs: nowMs - ENGINE_DEAD_QUIET_MS }), "fence_hard_cap");
+  assert.equal(classifyVisibleOrphan(evidence), "fence_hard_cap", "legacy / no positive engine evidence");
+});

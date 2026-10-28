@@ -28,3 +28,5 @@ packages/commercial/src/__tests__/systemNotificationOperations.integ.test.ts
 
 # OCV5-610: nine isolated owned metadata CAS/receipt/HTTP/legacy transaction proofs
 packages/commercial/src/__tests__/systemSessionMetadataOperations.integ.test.ts
+# RF-link: detached dispatch leases cannot revive another attempt or terminal turn
+packages/commercial/src/__tests__/containerLink.integ.test.ts
