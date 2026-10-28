@@ -224,10 +224,10 @@ export async function patchPreferences(
   };
 }
 
-/** 偏好操作错误。`code` 决定 HTTP status:VALIDATION → 400,INTERNAL → 500。 */
+/** 偏好操作错误。`code` 决定 HTTP status:VALIDATION → 400,FORBIDDEN → 403,UNAVAILABLE → 503,INTERNAL → 500。 */
 export class PreferencesError extends Error {
   constructor(
-    readonly code: "VALIDATION" | "INTERNAL",
+    readonly code: "VALIDATION" | "INTERNAL" | "CONFLICT" | "FORBIDDEN" | "UNAVAILABLE",
     message: string,
   ) {
     super(message);
