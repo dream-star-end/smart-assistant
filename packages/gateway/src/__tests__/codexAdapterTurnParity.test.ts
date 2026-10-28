@@ -1766,8 +1766,9 @@ test('native context observations cross the Codex adapter only during their live
   assert.equal(h.events.length, before);
 });
 
-for (const cancelled of [false, true]) {
-  test(`native compact shutdown preserves the first terminal classification and late usage (Stop=${cancelled})`, async () => {
+for (const outcome of ['overflow', 'stop', 'shutdown']) {
+  test(`native compact shutdown preserves the first terminal classification and late usage (${outcome})`, async () => {
+    const cancelled = outcome === 'stop';
     const h = makeHarness();
     const first = beginTurn(h, { requestId: 'native-first' });
     await waitForRequest(h, 'turn/start');
@@ -1797,6 +1798,7 @@ for (const cancelled of [false, true]) {
       p.respondTo(req.id, {});
       p.notify('turn/started', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'inProgress' } });
       if (cancelled) setImmediate(() => h.adapter.interrupt('user'));
+      else if (outcome === 'shutdown') setImmediate(() => { void h.adapter.shutdown(); });
       else p.notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'failed', error: { message: 'context window exceeded' } } });
     };
     const next = beginTurn(h, { requestId: 'native-next', input: 'must not be submitted' });
@@ -1805,7 +1807,7 @@ for (const cancelled of [false, true]) {
     assert.equal(result?.usage.inputTokens, 100);
     assert.equal(h.billing.length, 1);
     assert.equal(h.billing[0]?.terminalCode, cancelled ? 'USER_CANCELLED' : 'CODEX_ERROR');
-    if (!cancelled) assert.ok(h.events.some((e) => e.kind === 'error' && e.errorClass === 'context_too_long'));
+    if (outcome === 'overflow') assert.ok(h.events.some((e) => e.kind === 'error' && e.errorClass === 'context_too_long'));
     assert.equal(p.written.filter((r) => r.method === 'turn/start').length, 1);
     assert.equal(h.events.filter((e) => e.kind === 'context_compacted').length, 0);
   });

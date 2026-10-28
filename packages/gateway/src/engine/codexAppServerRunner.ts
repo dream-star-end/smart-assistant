@@ -1182,6 +1182,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // Same transient-shutdown semantics as CodexRunner: kill the current
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
+    const preserveNativeUsage = this.nativeContext.running
     this.shuttingDown = true
     this.nativeContext.abort(new Error('Native context compaction interrupted'))
     this._preheatGeneration++
@@ -1299,7 +1300,7 @@ export class CodexAppServerRunner extends EventEmitter {
     //
     // Native preflight has no user turn completer: after stdout drains its
     // caller emits the original failure/Stop with this still-unconsumed usage.
-    if (!this.nativeContext.running) {
+    if (!preserveNativeUsage) {
       this.activeTurnTotal = null
       this.currentTurnUsage = null
     }
