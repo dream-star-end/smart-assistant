@@ -9000,6 +9000,25 @@
           "assertion": "'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot"
         }
       ]
+    },
+    {
+      "id": "INC-20261028-BOX-SEALED-PARTIAL-ANSWER",
+      "occurredAt": "2026-10-28",
+      "severity": "P1",
+      "symptom": "已封口的 Box crashed tape 中，最后一条 assistant 记录可能是合法 Markdown 后直接拼接 API Error: 409 {\"error\":{\"code\":\"BOX_REPLAY_PENDING\",...}}。旧逻辑既不识别这种尾部终止器，又在拆分前把整段判定为内部错误，导致合法部分回答没有显示（生产 crashed tape ordinal 657：应保留正文、尾部 API Error 不进入正文）。",
+      "rootFixCommit": "9cb4f3aa",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "sealed crash preserves Markdown before a directly appended API error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/render.test.ts",
+          "assertion": "sealed crashed ENGINE_ERROR keeps the partial answer and the engine_error card"
+        }
+      ]
     }
   ]
 }
