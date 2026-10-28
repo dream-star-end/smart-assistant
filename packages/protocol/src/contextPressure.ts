@@ -11,14 +11,19 @@ export const ContextPressure = Type.Object({
 export type ContextPressure = Static<typeof ContextPressure>
 
 /** A completed context transformation. file_reference is not a summary. */
-export const ContextCompaction = Type.Object({
+export const ContextCompaction = Type.Union([Type.Object({
   engine: Type.String(),
   scope: Type.Union([Type.Literal('launch_prompt'), Type.Literal('native_context')]),
   strategy: Type.Union([Type.Literal('history_suffix'), Type.Literal('file_reference')]),
   beforeBytes: Type.Integer({ minimum: 0 }),
   afterBytes: Type.Integer({ minimum: 0 }),
   droppedEntries: Type.Integer({ minimum: 0 }),
-})
+}), Type.Object({
+  engine: Type.String(),
+  scope: Type.Literal('native_context'),
+  strategy: Type.Literal('native_summary'),
+  beforeTokens: Type.Optional(Type.Integer({ minimum: 0 })),
+})])
 export type ContextCompaction = Static<typeof ContextCompaction>
 
 export type ContextObservation =

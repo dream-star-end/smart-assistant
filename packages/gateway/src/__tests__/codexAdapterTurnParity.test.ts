@@ -1745,3 +1745,23 @@ test('draft isolated workspace preheat survives authoritative first-send creatio
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('native context observations cross the Codex adapter only during their live turn', async () => {
+  const h = makeHarness();
+  const turn = beginTurn(h);
+  await waitForRequest(h, 'turn/start');
+  const tokenUsage = { modelContextWindow: 1000, last: { totalTokens: 850, inputTokens: 800, outputTokens: 50 }, total: { totalTokens: 50000, inputTokens: 49000, outputTokens: 1000 } };
+  h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage });
+  const item = { id: 'native-compact', type: 'contextCompaction' };
+  h.proc().notify('item/started', { threadId: 'thr-new-1', turnId: 'internal-1', item });
+  h.proc().notify('item/completed', { threadId: 'thr-new-1', turnId: 'internal-1', item });
+  assert.deepEqual(h.events.filter((e) => e.kind === 'context_pressure' || e.kind === 'context_compacted'), [
+    { kind: 'context_pressure', pressure: { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.85 } },
+    { kind: 'context_compacted', compaction: { engine: 'codex', scope: 'native_context', strategy: 'native_summary', beforeTokens: 850 } },
+  ]);
+  h.proc().notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'turn-1', status: 'completed' } });
+  await turn.summary;
+  const before = h.events.length;
+  h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage });
+  assert.equal(h.events.length, before);
+});

@@ -24,3 +24,12 @@ test('pressure is registered in the protocol event catalog', () => {
   assert.ok(GATEWAY_EVENT_TYPES.includes('session.context_pressure'))
   assert.ok(Value.Check(GatewayEvent, { ...pressure, type: 'session.context_pressure', sessionKey: 's', agentId: 'main', id: 'event-id', timestamp: 1, schemaVersion: 1 }))
 })
+
+test('native summaries add a token branch without inventing byte measurements', () => {
+  const frame = { ...routing, type: 'sys.context_compacted', engine: 'codex', scope: 'native_context', strategy: 'native_summary' }
+  assert.ok(Value.Check(SysContextCompacted, frame))
+  assert.ok(Value.Check(AnyFrame, { ...frame, beforeTokens: 800000 }))
+  assert.equal(Value.Check(SysContextCompacted, { ...frame, scope: 'launch_prompt' }), false)
+  assert.equal(Value.Check(SysContextCompacted, { ...frame, beforeTokens: -1 }), false)
+  assert.equal(Value.Check(SysContextCompacted, { ...frame, strategy: 'file_reference' }), false)
+})

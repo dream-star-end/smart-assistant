@@ -1,5 +1,6 @@
 import { readLatestCodexNativeHandoff, runnerShutdownTimeoutMs, waitForCloseWithin, killCodexProcessGroup } from './codexLifecycle.js'
 export { readLatestCodexNativeHandoff } from './codexLifecycle.js'
+import { CodexNativeContext } from './codexNativeContext.js'
 import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
@@ -325,6 +326,7 @@ export function assertPromptQueueRunnerAdmission(
 }
 
 export class CodexAppServerRunner extends EventEmitter {
+  private nativeContext = new CodexNativeContext((event) => this.emit('context_observation', event))
   private threadId: string | null
   private proc: ChildProcessWithoutNullStreams | null = null
   private nextRequestId = 0
@@ -594,6 +596,7 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.opts.model
   }
   setModel(model: string | undefined): void {
+    if (this.opts.model !== model) this.nativeContext.reset()
     this.opts.model = model
   }
 
@@ -928,6 +931,11 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
+    if (this.nativeContext.running) {
+      this.pendingStartInterrupt = true
+      this.nativeContext.abort(new Error('Native context compaction interrupted'))
+      return true
+    }
     if (this.compactPrivacyPreparing) {
       void this.shutdown()
       return true
@@ -1175,6 +1183,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
     this.shuttingDown = true
+    this.nativeContext.abort(new Error('Native context compaction interrupted'))
     this._preheatGeneration++
     this._preheatPromise = null
     this._preheatedSignature = null
@@ -1747,6 +1756,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private failAllPending(reason: string): void {
+    this.nativeContext.abort(new Error(reason))
     for (const [, p] of this.pending) {
       p.reject(new Error(reason))
     }
@@ -1766,7 +1776,7 @@ export class CodexAppServerRunner extends EventEmitter {
    * has already updated `activeTurnTotal` and the parser buffers. */
   private emitForcedShutdownResult(reason: string): void {
     if (this.forcedShutdownResultEmitted) return
-    if (!this.currentTurnCompleter && this.activeTurnId === null) return
+    if (!this.currentTurnCompleter && this.activeTurnId === null && !this.nativeContext.running) return
     this.forcedShutdownResultEmitted = true
     const turnUsage = this.consumeActiveTurnUsage()
     const usage = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
@@ -2537,6 +2547,7 @@ export class CodexAppServerRunner extends EventEmitter {
         stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
+      this.nativeContext.beginTurn()
       // ── attempt 循环 ──────────────────────────────────────────────────
       // 仅「turn/start 请求本身被拒」的窄路径可循环重试(shouldRetryTurnStart 门)。
       // 一旦 turn/start 成功返回 turn.id,turn 进入执行,后续任何失败(status=
@@ -2545,6 +2556,17 @@ export class CodexAppServerRunner extends EventEmitter {
       for (;;) {
         // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
         this.resetAttemptState()
+        if (!this.pendingStartInterrupt) {
+          await this.nativeContext.compactIfNeeded({
+            threadId: this.threadId, traceId: turnTraceId,
+            timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
+            send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
+            drainFailure: async () => {
+              if (this.shuttingDown) await this.outputDrainPromise
+              else await this.recycleProcKeepQueue('native-context-compaction-failed')
+            },
+          })
+        }
 
         // Set up the completion box BEFORE turn/start so a fast turn/completed
         // notification (rare but possible) doesn't slip past us.
