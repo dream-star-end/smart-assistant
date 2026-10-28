@@ -124,6 +124,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // OpenViking B1 context view: metadata of the user's own memory sources and live
+    // turn policy (no content, session key or turnId). Read-only.
+    label: '/api/agents/:id/memory/context',
+    re: /^\/api\/agents\/[A-Za-z0-9_-]+\/memory\/context$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     // memdir 单条记忆文件 CRUD。:file 用 [^/]+(容器 handler 再过 basename+MEMORY_FILE_RE
     // 双保险,拒 `..`/非法名),桥门不比 handler 更松。操作用户自己容器卷内的记忆文件,故 proxy。
     label: '/api/agents/:id/memory/files/:file',
