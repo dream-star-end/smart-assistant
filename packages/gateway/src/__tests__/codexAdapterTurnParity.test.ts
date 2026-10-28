@@ -1765,3 +1765,48 @@ test('native context observations cross the Codex adapter only during their live
   h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage });
   assert.equal(h.events.length, before);
 });
+
+for (const cancelled of [false, true]) {
+  test(`native compact shutdown preserves the first terminal classification and late usage (Stop=${cancelled})`, async () => {
+    const h = makeHarness();
+    const first = beginTurn(h, { requestId: 'native-first' });
+    await waitForRequest(h, 'turn/start');
+    const tokens = (n: number) => ({ totalTokens: n, inputTokens: n, outputTokens: 0 });
+    h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage: {
+      modelContextWindow: 1000, last: tokens(900), total: tokens(1000),
+    } });
+    h.proc().notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'turn-1', status: 'completed' } });
+    await first.submitted;
+    await first.summary;
+    h.events.length = 0;
+    h.billing.length = 0;
+    const p = h.proc() as FakeCodexProc & { exitCode: number | null; signalCode: string | null };
+    p.exitCode = null;
+    p.signalCode = null;
+    p.kill = () => {
+      p.killed = true;
+      setImmediate(() => {
+        p.notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'native-fail', tokenUsage: {
+          modelContextWindow: 1000, last: tokens(100), total: tokens(1100),
+        } });
+        p.emit('close', 0, 'SIGTERM');
+      });
+    };
+    p.onRequest = (req) => {
+      if (req.method !== 'thread/compact/start') return;
+      p.respondTo(req.id, {});
+      p.notify('turn/started', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'inProgress' } });
+      if (cancelled) setImmediate(() => h.adapter.interrupt('user'));
+      else p.notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'failed', error: { message: 'context window exceeded' } } });
+    };
+    const next = beginTurn(h, { requestId: 'native-next', input: 'must not be submitted' });
+    const result = await next.summary;
+    await next.submitted;
+    assert.equal(result?.usage.inputTokens, 100);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0]?.terminalCode, cancelled ? 'USER_CANCELLED' : 'CODEX_ERROR');
+    if (!cancelled) assert.ok(h.events.some((e) => e.kind === 'error' && e.errorClass === 'context_too_long'));
+    assert.equal(p.written.filter((r) => r.method === 'turn/start').length, 1);
+    assert.equal(h.events.filter((e) => e.kind === 'context_compacted').length, 0);
+  });
+}

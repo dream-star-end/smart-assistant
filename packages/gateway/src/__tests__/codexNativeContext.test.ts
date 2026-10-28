@@ -205,3 +205,27 @@ test('failed compaction drains late usage before releasing its internal turn ide
   h.feed('turn/completed', { turn: { id: 'drain-compact', status: 'completed' } })
   assert.equal(h.host.activeTurnId, null)
 })
+
+test('a bounded shutdown returning before stdout close cannot finalize native compaction', async () => {
+  const h = harness()
+  h.record(usage(900, 1000))
+  let close!: () => void
+  h.host.outputDrainPromise = new Promise<void>((resolve) => { close = resolve })
+  let recycled!: () => void
+  const recycling = new Promise<void>((resolve) => { recycled = resolve })
+  h.host.recycleProcKeepQueue = async () => { recycled() }
+  h.host.sendRequest = async () => {
+    h.feed('turn/started', { turn: { id: 'slow-close' } })
+    h.feed('turn/completed', { turn: { id: 'slow-close', status: 'failed', error: { message: 'context window exceeded' } } })
+    return {}
+  }
+  const running = h.host.runTurn('unsent', 'slow-close-request')
+  await recycling
+  assert.equal(h.messages.filter((m) => m.type === 'result').length, 0)
+  h.feed('thread/tokenUsage/updated', { turnId: 'slow-close', tokenUsage: usage(100, 1100) })
+  close()
+  await running
+  const result = h.messages.find((m) => m.type === 'result')
+  assert.equal(result.usage.total_tokens, 100)
+  assert.equal(result.errorClass, 'context_too_long')
+})

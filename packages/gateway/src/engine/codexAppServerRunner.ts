@@ -1297,10 +1297,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // every prior turn's tokens. Resetting our baseline would over-bill the
     // first turn after a respawn by the entire thread total.
     //
-    // The proc close handler emits a usage-bearing forced result before it
-    // rejects the completer, so killed-turn tokens are billed to this turn.
-    this.activeTurnTotal = null
-    this.currentTurnUsage = null
+    // Native preflight has no user turn completer: after stdout drains its
+    // caller emits the original failure/Stop with this still-unconsumed usage.
+    if (!this.nativeContext.running) {
+      this.activeTurnTotal = null
+      this.currentTurnUsage = null
+    }
     this.resetCallUsageAttribution()
     // Tear down the per-spawn launch overrides so the next post-shutdown
     // submit() rebuilds against a fresh sessionDir. Re-using a stale
@@ -1776,7 +1778,7 @@ export class CodexAppServerRunner extends EventEmitter {
    * has already updated `activeTurnTotal` and the parser buffers. */
   private emitForcedShutdownResult(reason: string): void {
     if (this.forcedShutdownResultEmitted) return
-    if (!this.currentTurnCompleter && this.activeTurnId === null && !this.nativeContext.running) return
+    if (!this.currentTurnCompleter && this.activeTurnId === null) return
     this.forcedShutdownResultEmitted = true
     const turnUsage = this.consumeActiveTurnUsage()
     const usage = turnUsage ? _codexUsageToAnthropicShape(turnUsage) : undefined
@@ -2562,8 +2564,9 @@ export class CodexAppServerRunner extends EventEmitter {
             timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
             send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
             drainFailure: async () => {
-              if (this.shuttingDown) await this.outputDrainPromise
-              else await this.recycleProcKeepQueue('native-context-compaction-failed')
+              const drained = this.outputDrainPromise
+              if (!this.shuttingDown) await this.recycleProcKeepQueue('native-context-compaction-failed')
+              await drained
             },
           })
         }
