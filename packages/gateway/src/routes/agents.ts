@@ -113,6 +113,7 @@ export interface AgentRoutesIo {
     agentId: string,
     url: URL,
   ): Promise<void>
+  handleMemoryContext(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void>
   handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void>
   handleSkillItem(
     req: IncomingMessage,
@@ -166,6 +167,16 @@ export const AGENT_ROUTES: readonly HttpRoute<AgentRoutesIo>[] = [
     (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/usage$/),
     (io, req, res, url, memoryUsageMatch) => {
       io.handleMemoryUsage(req, res, memoryUsageMatch[1], url).catch((err) =>
+        io.sendInternalError(res, err),
+      )
+      return true
+    },
+  ),
+  regexRoute(
+    '/api/agents/:1/memory/context',
+    (_req, url) => url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/),
+    (io, req, res, _url, memoryContextMatch) => {
+      io.handleMemoryContext(req, res, memoryContextMatch[1]).catch((err) =>
         io.sendInternalError(res, err),
       )
       return true

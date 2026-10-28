@@ -35,6 +35,7 @@ import {
 import { isHiddenSystemAgentId } from './agentVisibility.js'
 import type { CronJob } from './cron.js'
 import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
+import { buildMemoryContextView } from './contextFacade.js'
 import type { SessionManager } from './sessionManager.js'
 import {
   AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
@@ -417,6 +418,19 @@ export async function handleMemoryUsage(
   const rawDays = Number(url.searchParams.get('days') ?? '30')
   const days = Number.isInteger(rawDays) ? Math.max(1, Math.min(90, rawDays)) : 30
   this.sendJson(res, 200, await getMemoryUsageDashboard({ agentId, days }))
+}
+
+// GET /api/agents/:id/memory/context → OpenViking B1 façade view: which context
+// sources the gateway grants this agent's panel and live turns (metadata only).
+export async function handleMemoryContext(
+  this: AgentHandlersHost,
+  req: IncomingMessage,
+  res: ServerResponse,
+  agentId: string,
+): Promise<void> {
+  if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+  if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+  this.sendJson(res, 200, await buildMemoryContextView(agentId))
 }
 
 // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.

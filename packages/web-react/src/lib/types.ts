@@ -1096,6 +1096,34 @@ export type MemoryUsageDashboard = {
   }>;
 };
 
+/** 上下文读取结果（GET .../memory/context）：只有来源元信息，不含正文。 */
+export type MemoryContextRead =
+  | {
+      status: "ready";
+      sources: Array<{
+        kind: "core-index" | "project-memory";
+        locator: string;
+        bytes: number;
+        sourceVersion: string;
+        expires: string[];
+      }>;
+    }
+  | { status: "unavailable"; reason: string };
+
+/** OpenViking B1 网关门面视图：面板与进行中的对话各自能读到哪些记忆来源。 */
+export type MemoryContextView = {
+  facade: "enabled" | "disabled";
+  cli: "cli_lease_blocked";
+  mode: "legacy" | "formal";
+  panel: MemoryContextRead;
+  turns: Array<{
+    startedAt: number;
+    projectBound: boolean;
+    memoryPolicy: { allowed: boolean; reason: string };
+    context: MemoryContextRead;
+  }>;
+};
+
 /** GET .../memory/files/:file 响应：正文 + 乐观锁 version（sha256 前 16 位）。 */
 export type MemoryFileContent = { content: string; version: string };
 

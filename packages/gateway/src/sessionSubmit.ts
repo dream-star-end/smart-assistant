@@ -1,5 +1,5 @@
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
-import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy } from './promptPrivacyRuntime.js'
+import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
  * Session submit path: submit, getOrCreate / exclusive create, idle finish, external turns, resume-id resolution
  *
@@ -108,6 +108,7 @@ import { resolveExecutionModel } from './server.js'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import type { TurnModelAuthority, UsageAttributionTag } from './subprocessRunner.js'
 import { startMemoryTurnPolicyLease } from './memoryTurnPolicyLease.js'
+import { contextAuthorities, type ContextTurnHandle } from './contextAuthority.js'
 import { finalizeEfficiencyTurn, prepareEfficiencyTurnNote } from './agentEfficiencyGuard.js'
 import { log } from './sessionManagerLog.js'
 import {
@@ -608,6 +609,7 @@ export async function submit(
   let memoryTurnBarrier: KernelFileLock | undefined
   let memoryTurnPolicy: MemoryTurnPolicyDecision | undefined
   let memoryTurnPolicyLease: { stop: () => Promise<void> } | undefined
+  let contextTurn: ContextTurnHandle | undefined
   let replayLifecycleStarted = false
   let unhandledTurnError: unknown | undefined
   const logicalTurnAbort = new AbortController()
@@ -909,6 +911,16 @@ export async function submit(
         })
       },
     })
+    // OpenViking B1: in-process context authority for this turn (gateway callers only).
+    contextTurn = contextAuthorities.beginTurn({
+      sessionId: session.sessionKey,
+      agentId: session.agentId,
+      chatProjectId: session.turnChatProjectId ?? null,
+      memoryPolicy: memoryTurnPolicy,
+      promptPrivacyFingerprint: (privacyRunner as PromptPrivacyRunner).promptPolicyFingerprint,
+      identity: admission.context,
+    })
+    logicalTurnAbort.signal.addEventListener('abort', () => contextTurn?.rotate(), { once: true })
     session.currentAssistantBuf = ''
     // Reset activity baseline so idle timeout measures from turn start, not last stdout
     session.runner.lastActivityAt = Date.now()
@@ -1407,6 +1419,7 @@ export async function submit(
         err: String(err),
       })
     })
+    contextTurn?.end()
     await memoryTurnPolicyLease?.stop().catch((err) => {
       log.warn('memory turn policy cleanup failed', {
         sessionKey: session.sessionKey,

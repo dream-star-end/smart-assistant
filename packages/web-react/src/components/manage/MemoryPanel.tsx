@@ -11,9 +11,12 @@ import type {
   AutoDreamMemoryChange,
   AutoDreamReportResponse,
   MemoryFileMeta,
+  MemoryContextRead,
+  MemoryContextView,
   MemoryIndexResponse,
   MemoryUsageDashboard,
 } from "../../lib/types";
+import { formatBytes } from "../../lib/chat/download";
 import { type AutoDreamFeatureView, extractAutoDreamFeature } from "../../lib/modelPreferences";
 import { cn } from "../../lib/utils";
 import { AgentProjectPreview } from "./AgentProjectPreview";
@@ -1025,6 +1028,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
               text={indexText}
             />
           )}
+          <MemoryContextDisclosure auth={auth} agentId={agentId} />
         </div>
       )}
 
@@ -1053,6 +1057,131 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             toast("记忆已创建", "success");
           }}
         />
+      )}
+    </div>
+  );
+}
+
+const MEMORY_POLICY_LABEL: Record<string, string> = {
+  on_demand_session: "需要时查阅记忆",
+  on_demand_core: "只查阅核心记忆",
+  explicit_continuity: "按你的要求延续之前的内容",
+  explicit_ignore: "按你的要求不参考历史记忆",
+  trusted_cron: "定时任务，可以查阅记忆",
+  inherited_parent_allow: "沿用上级对话的设置，可以查阅记忆",
+  inherited_parent_core: "沿用上级对话的设置，只查阅核心记忆",
+  inherited_parent_deny: "沿用上级对话的设置，不参考历史记忆",
+  clean_default: "不参考历史记忆",
+};
+
+const CONTEXT_REASON_LABEL: Record<string, string> = {
+  disabled: "未开启",
+  policy_denied: "这一轮不读取记忆",
+  authority_unavailable: "对话已结束或设置刚变化，请刷新",
+  scope_changed: "范围刚变化，请刷新",
+  source_changed: "记忆刚更新，请刷新",
+  source_unavailable: "暂时读不到",
+  expired: "记忆已过期",
+  unsafe: "内容未通过安全检查",
+};
+
+function contextReadText(read: MemoryContextRead): string {
+  if (read.status !== "ready") return CONTEXT_REASON_LABEL[read.reason] ?? "暂时读不到";
+  if (!read.sources.length) return "还没有可用的记忆";
+  return read.sources
+    .map((s) => `${s.kind === "core-index" ? "记忆索引" : "项目记忆"}（${formatBytes(s.bytes)}）`)
+    .join("、");
+}
+
+/**
+ * 网关上下文门面的只读视图（OpenViking B1）：智能体此刻能读到哪些记忆来源，
+ * 以及进行中的对话按什么规则使用记忆。展开时才请求，失败只影响这一块。
+ */
+function MemoryContextDisclosure({ auth, agentId }: { auth: AuthSession; agentId: string }) {
+  const [open, setOpen] = useState(false);
+  const [view, setView] = useState<MemoryContextView | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    void reloadKey;
+    if (!open) return;
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    api
+      .getMemoryContext(auth, agentId)
+      .then((d) => {
+        if (alive) setView(d);
+      })
+      .catch((e) => {
+        if (alive) setErr(apiErrorMessage(e, "暂时无法查看"));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, auth, agentId, reloadKey]);
+
+  return (
+    <div>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="-ml-3 gap-1 font-normal text-muted"
+      >
+        <ChevronRight size={13} aria-hidden="true" className={cn("transition-transform", open && "rotate-90")} />
+        智能体现在能用到哪些记忆
+      </Button>
+      {open && (
+        <section
+          aria-label="记忆使用情况"
+          aria-busy={loading}
+          className="mt-1.5 flex flex-col gap-1.5 rounded-lg bg-code px-3 py-2.5 text-caption leading-relaxed text-fg"
+        >
+          {err ? (
+            <p className="text-muted">{err}</p>
+          ) : !view ? (
+            <p className="text-muted">正在读取…</p>
+          ) : view.facade === "disabled" ? (
+            <p className="text-muted">这项查看功能没有开启。</p>
+          ) : (
+            <>
+              <p>可读取：{contextReadText(view.panel)}</p>
+              {view.turns.length === 0 ? (
+                <p className="text-muted">现在没有进行中的对话。</p>
+              ) : (
+                <ul className="flex flex-col gap-1">
+                  {view.turns.map((t, i) => (
+                    <li key={`${t.startedAt}-${i}`}>
+                      进行中的对话（<TimeAgo value={t.startedAt} />
+                      开始{t.projectBound ? "，已绑定项目" : ""}）：
+                      {MEMORY_POLICY_LABEL[t.memoryPolicy.reason] ??
+                        (t.memoryPolicy.allowed ? "可以查阅记忆" : "不参考历史记忆")}
+                      ；{contextReadText(t.context)}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+          <div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-3 font-normal text-muted"
+              disabled={loading}
+              onClick={() => setReloadKey((k) => k + 1)}
+            >
+              刷新
+            </Button>
+          </div>
+        </section>
       )}
     </div>
   );

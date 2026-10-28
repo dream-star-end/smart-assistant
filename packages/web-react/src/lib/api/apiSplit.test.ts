@@ -18,8 +18,10 @@ test('api domain parts are disjoint and exposed on api by reference', () => {
       expect(api[key as keyof typeof api], `api.${key}`).toBe(obj[key as keyof typeof obj])
     }
   }
-  expect(seen.size).toBe(163)
+  expect(seen.size).toBe(164)
   // OCV5-614 adds the authenticated model-switch quote/confirm endpoint.
   expect(api.modelSwitchCost).toBeTypeOf('function')
-  expect(Object.keys(api)).toHaveLength(255)
+  // OpenViking B1 adds memorySkillsApi.getMemoryContext.
+  expect(api.getMemoryContext).toBeTypeOf('function')
+  expect(Object.keys(api)).toHaveLength(256)
 })
