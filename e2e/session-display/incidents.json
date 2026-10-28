@@ -8488,6 +8488,35 @@
           "assertion": "running turn past startup (phase null) re-sends status:null"
         }
       ]
+    },
+    {
+      "id": "INC-20261028-ERRORS-ENGINE-SWITCH",
+      "occurredAt": "2026-10-28",
+      "severity": "P1",
+      "symptom": "W3 用户反馈 t1048u/t1049u 与体验官 X-P2-6/X-P2-2：错误原码/内部 ID 外露，自动恢复实际短预算 3 却只有旧 max=10 元数据；无 prepared handoff 的带附件跨引擎首轮因只接受 string 而跳过历史，native resume 丢失期间历史键每轮变化导致重建灰条重复。服务端新增安全展示目录和实际重试状态，并补齐 multimodal 历史与 episode 提示去重。UI 接入另由 FE-errors 完成。",
+      "rootFixCommit": "fb7a72b4",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/userErrorCatalog.test.ts",
+          "assertion": "every catalog error has safe Chinese copy, known actions and a valid wire envelope"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/historicalContextPayload.test.ts",
+          "assertion": "multimodal switch replays semantic history and preserves every current block in order"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "actual settled-tools retry budget is 3 while legacy max remains 10"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[user-errors-engine-switch] PASS — INC-20261028-ERRORS-ENGINE-SWITCH executed all 43 catalog, emitter and six-engine switch leaves without paid calls"
+        }
+      ]
     }
   ]
 }
