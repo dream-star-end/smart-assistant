@@ -1256,6 +1256,13 @@ export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngine
 // 来源:CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
 // (cli/print.ts:2214 + services/compact/compact.ts:414,763,819,1106)
 // ───────────────────────────────────────────────
+export const DispatchCredits = Type.Object({
+  settled: Type.String({ pattern: '^[0-9]+$', maxLength: 40 }),
+  requests: Type.Integer({ minimum: 0 }),
+  asOf: Type.Integer({ minimum: 0 }),
+})
+export type DispatchCredits = Static<typeof DispatchCredits>
+
 const _turnStatusCommon = {
   type: Type.Literal('outbound.turn_status'),
   sessionKey: Type.String(),
@@ -1271,6 +1278,7 @@ const _turnStatusCommon = {
     Type.Object({
       detached: Type.Literal(true),
       since: Type.Optional(Type.Integer({ minimum: 0 })),
+      credits: Type.Optional(DispatchCredits),
     }),
   ),
 } as const
@@ -1334,6 +1342,58 @@ export const OutboundTurnUsage = Type.Object({
   traceId: Type.Optional(TraceIdString),
 })
 export type OutboundTurnUsage = Static<typeof OutboundTurnUsage>
+
+/** Transport-independent PG snapshot. afterSeq belongs to streamKey, never to
+ * the legacy HTTP record-id cursor. Missing data is explicit; null dispatch
+ * alone is not evidence that a client's in-flight turn completed. */
+export const SessionSnapshot = Type.Object({
+  v: Type.Literal(1),
+  sessionId: Type.String(),
+  dispatch: Type.Union([Type.Null(), Type.Object({
+    id: Type.String(),
+    clientMessageId: Type.String(),
+    agentId: Type.String(),
+    status: Type.Union(['admitted', 'accepted', 'rejecting', 'terminal', 'manual_reconcile'].map(s => Type.Literal(s))),
+    outcome: Type.Union([Type.String(), Type.Null()]),
+    attempt: Type.Integer({ minimum: 1 }),
+    since: Type.Integer(),
+    acceptedAt: Type.Union([Type.Integer(), Type.Null()]),
+    terminalAt: Type.Union([Type.Integer(), Type.Null()]),
+  })]),
+  streamKey: Type.Union([Type.String(), Type.Null()]),
+  lastFrameSeq: Type.Union([Type.Integer(), Type.Null()]),
+  lastFrameAt: Type.Union([Type.Integer(), Type.Null()]),
+  engineReady: Type.Union([Type.Boolean(), Type.Null()]),
+  turnStatus: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
+  reconcile: Type.Union([Type.Literal('turn_completed'), Type.Literal('interrupted'), Type.Null()]),
+  pendingPermissions: Type.Object({
+    items: Type.Array(Type.Record(Type.String(), Type.Unknown())),
+    completeness: Type.Union([Type.Literal('complete'), Type.Literal('truncated'), Type.Literal('unavailable')]),
+  }),
+  usage: Type.Union([Type.Null(), Type.Object({ frameSeq: Type.Integer(), usage: TurnTokenUsageSnapshot })]),
+  credits: Type.Union([DispatchCredits, Type.Null()]),
+  frames: Type.Array(Type.Object({
+    recordId: Type.String(), frameSeq: Type.Integer(), payload: Type.Unknown(),
+  })),
+  nextAfterSeq: Type.Integer({ minimum: 0 }),
+  hasMore: Type.Boolean(),
+  gap: Type.Union([Type.Null(), Type.Object({
+    reason: Type.Union(['page_limit', 'byte_limit', 'cursor_reset', 'sequence_gap', 'tape'].map(s => Type.Literal(s))),
+    afterSeq: Type.Optional(Type.Integer()),
+    beforeSeq: Type.Optional(Type.Integer()),
+    recordId: Type.Optional(Type.String()),
+    sha256: Type.Optional(Type.String()),
+    frameSeq: Type.Optional(Type.Integer()),
+  })]),
+  asOf: Type.Integer({ minimum: 0 }),
+})
+export type SessionSnapshot = Static<typeof SessionSnapshot>
+
+export const OutboundSessionSnapshot = Type.Object({
+  type: Type.Literal('outbound.session_snapshot'),
+  channel: Type.String(), peer: Peer, snapshot: SessionSnapshot,
+})
+export type OutboundSessionSnapshot = Static<typeof OutboundSessionSnapshot>
 
 // Exact per-model-call usage for the cards named by targetIds. This is a
 // progress sideband; the same snapshot is embedded into the immutable turn
@@ -1537,6 +1597,7 @@ export const AnyFrame = Type.Union([
   OutboundExternalEngineBilling,
   OutboundTurnStatus,
   OutboundTurnUsage,
+  OutboundSessionSnapshot,
   OutboundCallUsage,
   PromptQueueSnapshot,
   SysContextRebuilt,

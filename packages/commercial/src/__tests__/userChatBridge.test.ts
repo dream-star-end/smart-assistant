@@ -244,6 +244,7 @@ async function nextBusinessFrame(fc: { next: () => Promise<string> }): Promise<R
     try {
       const parsed = JSON.parse(s) as Record<string, unknown>;
       if (typeof parsed?.type === "string" && (parsed.type as string).startsWith("sys.")) continue;
+      if (parsed.type === "outbound.session_snapshot") continue; // Covered by sessionSnapshot.test.ts.
       return parsed;
     } catch {
       /* 非 JSON(binary 透传等)不属于业务 JSON 断言目标,跳过 */
@@ -2848,10 +2849,12 @@ function helloTerminalBillingTrio(opts: {
   readyScanRows?: Array<{ payload: Buffer | null }>;
   readyScans?: unknown[][];
   beforeTurnDispatchLookup?: () => Promise<void>;
+  beforeSnapshotRead?: () => Promise<void>;
 }): Pick<UserChatBridgeDeps, "pgPool" | "preCheckRedis" | "pricing"> {
   const lookups = opts.lookups ?? [];
   return {
     pgPool: {
+      async connect() { return { query: this.query, release() {} }; },
       query: async (sql: unknown, params?: unknown[]) => {
         const text = typeof sql === "string"
           ? sql
@@ -2863,6 +2866,10 @@ function helloTerminalBillingTrio(opts: {
         if (/SELECT status FROM users WHERE id/.test(text)) {
           return { rows: [{ status: "active" }], rowCount: 1 };
         }
+        if (/session-snapshot-owner/.test(text)) {
+          await opts.beforeSnapshotRead?.();
+          return { rows: [{ as_of: String(Date.now()) }], rowCount: 1 };
+        }
         if (/open-dispatch-engine-ready/.test(text)) {
           opts.readyScans?.push(params ?? []);
           const rows = opts.readyScanRows ?? [];
@@ -2871,8 +2878,10 @@ function helloTerminalBillingTrio(opts: {
         if (/FROM turn_dispatches/.test(text) && /client_message_id/.test(text)) {
           if (opts.beforeTurnDispatchLookup) await opts.beforeTurnDispatchLookup();
           lookups.push(params ?? []);
-          return opts.row
-            ? { rows: [opts.row], rowCount: 1 }
+          const row = opts.row && (params?.[2] === opts.row.client_message_id ||
+            ["admitted", "accepted", "rejecting"].includes(String(opts.row.status))) ? opts.row : null;
+          return row
+            ? { rows: [row], rowCount: 1 }
             : { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 0 };
@@ -3173,7 +3182,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     assert.equal(frame.status, null);
   });
 
-  test("hello 没有 inFlightClientMessageId → 不查 PG、不发帧", async () => {
+  test("hello 没有 inFlightClientMessageId → 查询当前回合，不伪造旧终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "805";
     const { rig, ws } = await openHelloRig({
@@ -3202,7 +3211,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `无 inFlight 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "无 inFlightClientMessageId 不得查 turn_dispatches");
+      assert.equal(lookups.length, lookupsBefore + 1, "新设备必须查询当前 open dispatch");
     } finally {
       ws.close();
       await waitClose(ws);
@@ -3339,7 +3348,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
-  test("hello + 超长 clientMessageId(>200) → 不查 PG、不发帧", async () => {
+  test("hello + 超长 clientMessageId(>200) → 当作缺省：不拿它查库、不伪造终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "809";
     const peerId = "peerLongId";
@@ -3376,7 +3385,10 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `超长 id 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "超长 clientMessageId 不得查 turn_dispatches");
+      assert.ok(
+        lookups.slice(lookupsBefore).every((args) => !JSON.stringify(args).includes(clientMessageId)),
+        "超长 clientMessageId 不得进入任何查询参数",
+      );
     } finally {
       ws.close();
       await waitClose(ws);
@@ -4543,7 +4555,7 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     blocks: [{ kind: "text", text: `t${frameSeq}` }],
   });
 
-  async function linkRig(row: Record<string, unknown>) {
+  async function linkRig(row: Record<string, unknown>, beforeSnapshotRead?: () => Promise<void>) {
     const persisted: number[] = [];
     const renewals: unknown[][] = [];
     row.agent_container_id = "77";
@@ -4552,7 +4564,7 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
       persistOutboundFrame: async (input) => { persisted.push(input.frameSeq); },
       containerLinkHeartbeatMs: 50,
-      ...helloTerminalBillingTrio({ row, linkRenewals: renewals }),
+      ...helloTerminalBillingTrio({ row, linkRenewals: renewals, beforeSnapshotRead }),
     });
     portRef.value = rig.containerPort;
     return { rig, persisted, renewals };
@@ -4647,8 +4659,14 @@ describe("RF-link singleton transport for open dispatch streams", () => {
     }
   });
 
-  test("重连 attach 原链路,同一 live 帧只有一次落库并送达新订阅者", async () => {
-    const { rig, persisted } = await linkRig(acceptedRow("1203"));
+  test("重连 attach 原链路：慢 PG 快照不阻塞 hello、续租与单次落帧", async () => {
+    let releaseSnapshot!: () => void;
+    const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    let snapshotReading = false;
+    const { rig, persisted, renewals } = await linkRig(acceptedRow("1203"), async () => {
+      snapshotReading = true;
+      await snapshotGate;
+    });
     try {
       const first = await connect(rig, "1203");
       first.container.send(frame(1));
@@ -4657,6 +4675,11 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       await waitClose(first.ws);
       const second = openClient(rig.gatewayPort, await makeJwt("1203"));
       const frames = frameCollector(second);
+      const snapshots: Array<{ sessionId: string; dispatch: { clientMessageId: string; status: string } }> = [];
+      second.on("message", (data) => {
+        const wire = JSON.parse(String(data));
+        if (wire.type === "outbound.session_snapshot") snapshots.push(wire.snapshot);
+      });
       await new Promise<void>((r) => second.once("open", r));
       await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
       const hello = JSON.stringify({type: "inbound.hello", peers: [{peerId: SESSION, agentId: "main", lastFrameSeq: 1}]});
@@ -4665,6 +4688,10 @@ describe("RF-link singleton transport for open dispatch streams", () => {
         const wire = JSON.parse(String(entry.data));
         return wire.type === "inbound.hello" && wire.peers?.[0]?.peerId === SESSION;
       }));
+      await waitFor(() => snapshotReading);
+      assert.equal(snapshots.length, 0, "hello 已转发，PG 尚未放行时不发快照");
+      const renewalsBefore = renewals.length;
+      await waitFor(() => renewals.length > renewalsBefore);
       first.container.send(frame(2));
       await waitFor(() => persisted.includes(2));
       let received: { frameSeq?: number };
@@ -4672,10 +4699,16 @@ describe("RF-link singleton transport for open dispatch streams", () => {
       assert.equal(rig.containerSockets.length, 1);
       assert.deepEqual(persisted, [1, 2]);
       assert.equal(first.container.readyState, WebSocket.OPEN);
+      assert.equal(snapshots.length, 0, "快照仍挂起时 live 帧照常送达");
+      releaseSnapshot();
+      await waitFor(() => snapshots.length === 1);
+      assert.equal(snapshots[0]!.sessionId, SESSION);
+      assert.equal(snapshots[0]!.dispatch.clientMessageId, CMID);
+      assert.equal(snapshots[0]!.dispatch.status, "accepted");
       first.container.send(frame(3, true));
       await waitFor(() => persisted.includes(3));
       second.close();
-    } finally { await stopRig(rig); }
+    } finally { releaseSnapshot(); await stopRig(rig); }
   });
 
   test("没有 open dispatch 流 → user close 立即关容器 WS(行为不变)", async () => {

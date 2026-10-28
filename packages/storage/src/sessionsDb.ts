@@ -1,3 +1,4 @@
+import type { SessionSnapshot } from '@openclaude/protocol';
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
@@ -5122,6 +5123,7 @@ export interface ReadArchivedMessagesResult {
  * The cursor is an append-only record id; callers can keep paging until
  * `hasMore=false` without any total-content cap. */
 export interface ClientSessionLiveFramePage {
+  snapshot?: SessionSnapshot | null
   frames: Array<{
     recordId: string
     streamKey: string
@@ -5293,7 +5295,7 @@ async function _sqliteReadClientSessionLiveFrames(
   userId: string,
   _afterRecordId = 0,
   _limit = 200,
-  _options?: { seekTail?: boolean },
+  _options?: { seekTail?: boolean; afterSeq?: number; clientMessageId?: string; streamKey?: string },
 ): Promise<ClientSessionLiveFramePage | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
