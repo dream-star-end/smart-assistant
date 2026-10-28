@@ -97,24 +97,32 @@ export async function buildSessionSnapshot(
   snapshot.lastFrameSeq = stream?.frame_seq == null ? null : Number(stream.frame_seq)
   snapshot.lastFrameAt = stream?.created_at?.getTime() ?? null
 
-  // Filter in PG before LIMIT: a usage frame remains authoritative even if
-  // hundreds of content frames followed it. BYTEA is decoded, never queried
-  // with JSONB operators directly. Only small sidebands are materialized.
-  const facts = await q.query<{ frame_seq: string; payload: Buffer }>(
-    `/* session-snapshot-facts */
-     SELECT DISTINCT ON (kind) kind, frame_seq, payload FROM (
-       SELECT frame_seq,payload,
-         CASE WHEN octet_length(payload)<=65536 THEN convert_from(payload,'UTF8')::jsonb->>'type' END AS kind
-         FROM client_session_live_frames WHERE stream_key=$1
-     ) f WHERE kind IN ('outbound.turn_status','outbound.turn_usage')
-     ORDER BY kind,frame_seq DESC`, [streamKey],
-  )
+  // BYTEA can contain JSON strings that PostgreSQL JSONB cannot represent
+  // (e.g. escaped NUL / lone surrogates). Narrow by wire-type bytes, then
+  // JSON.parse and verify the top-level type in JS. Page past false positives
+  // such as nested objects; never cap the latest-usage search at 64 tail frames.
   let latestStatus: Record<string, unknown> | null = null
-  for (const fact of facts.rows) {
-    const payload = JSON.parse(fact.payload.toString('utf8')) as Record<string, unknown>
-    if (payload.type === 'outbound.turn_usage') {
-      snapshot.usage = { frameSeq: Number(fact.frame_seq), usage: payload.usage as TurnTokenUsageSnapshot }
-    } else latestStatus = payload
+  let before: [string, string] | null = null
+  while (!latestStatus || !snapshot.usage) {
+    const facts = await q.query<{ record_id: string; frame_seq: string; payload: Buffer }>(
+      `/* session-snapshot-facts */
+       SELECT record_id::text,frame_seq,payload FROM client_session_live_frames
+        WHERE stream_key=$1 AND ($2::bigint IS NULL OR (frame_seq,record_id)<($2::bigint,$3::bigint))
+          AND octet_length(payload)<=65536
+          AND (position($4::bytea IN payload)>0 OR position($5::bytea IN payload)>0)
+        ORDER BY frame_seq DESC,record_id DESC LIMIT 64`,
+      [streamKey, before?.[0] ?? null, before?.[1] ?? null,
+        Buffer.from('"outbound.turn_status"'), Buffer.from('"outbound.turn_usage"')],
+    )
+    for (const fact of facts.rows) {
+      const payload = JSON.parse(fact.payload.toString('utf8')) as Record<string, unknown>
+      if (!snapshot.usage && payload.type === 'outbound.turn_usage') {
+        snapshot.usage = { frameSeq: Number(fact.frame_seq), usage: payload.usage as TurnTokenUsageSnapshot }
+      } else if (!latestStatus && payload.type === 'outbound.turn_status') latestStatus = payload
+    }
+    if (facts.rows.length < 64) break
+    const last = facts.rows[facts.rows.length - 1]!
+    before = [last.frame_seq, last.record_id]
   }
   if (row.status === 'admitted' || row.status === 'accepted') {
     snapshot.engineReady = await readOpenDispatchEngineReady(q, { dispatchId: row.dispatch_id, attemptNo: row.attempt_no })

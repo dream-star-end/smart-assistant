@@ -32,7 +32,7 @@ const id = '00000000-0000-4000-8000-000000000001'
 const streamKey = `dispatch:${id}:1`
 const sessionId = 'session-snapshot'
 const cmid = 'cm-snapshot'
-const backend = createPgSessionsBackend(pool)
+const backend = createPgSessionsBackend(pool, { expectedGeneration: 1 })
 
 before(async () => {
   setClientSessionsBackend(backend)
@@ -161,6 +161,19 @@ describe('PG session snapshot transport contract', () => {
     assert.equal(snapshot.usage?.frameSeq, 2)
     assert.equal(snapshot.turnStatus?.status, null)
     assert.deepEqual(snapshot.credits, { settled: '0', requests: 0, asOf: now })
+  })
+  test('legal JSON with escaped NUL or lone surrogate never breaks recovery; nested type is not usage', async () => {
+    await frame(1, { type: 'outbound.turn_usage', usage: { totalTokens: 7 } })
+    await frame(2, { type: 'outbound.turn_status', status: 'working' })
+    for (let seq = 3; seq < 70; seq++) {
+      await frame(seq, { type: 'outbound.message', text: '\u0000\ud800', nested: { type: 'outbound.turn_usage' } })
+    }
+    const snapshot = (await http()).body.snapshot
+    assert.equal(snapshot.usage?.frameSeq, 1)
+    assert.equal(snapshot.usage?.usage.totalTokens, 7)
+    assert.equal(snapshot.turnStatus?.status, 'working')
+    assert.equal(snapshot.frames.length, 69)
+    assert.deepEqual((await hello()).find(f => f.type === 'outbound.session_snapshot')!.snapshot, snapshot)
   })
   test('missing/deleted/other-user sessions never expose dispatch, frames or billing', async () => {
     await credits()
