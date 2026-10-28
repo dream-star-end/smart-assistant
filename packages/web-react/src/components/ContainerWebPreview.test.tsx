@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import type { ContainerPreviewClientMessage } from '@openclaude/protocol/containerPreview'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { createMemoryAuthSession } from '../lib/authSession'
 import type { AuthSession } from '../lib/types'
@@ -1040,5 +1040,18 @@ describe('ContainerWebPreview audit fixes', () => {
     // 鼠标停下来后照旧 3s 收起。
     act(() => vi.advanceTimersByTime(3_001))
     expect(screen.queryByRole('button', { name: '关闭网页预览' })).not.toBeInTheDocument()
+  })
+})
+
+describe('ContainerWebPreview dialog teardown', () => {
+  const restoredFocus = vi.fn()
+
+  afterAll(() => {
+    expect(restoredFocus).toHaveBeenCalledOnce()
+  })
+
+  test('finishes real FocusScope restoration before leaving the jsdom realm', () => {
+    render(<PreviewHarness />)
+    screen.getByRole('dialog').addEventListener('focusScope.autoFocusOnUnmount', restoredFocus)
   })
 })

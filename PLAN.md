@@ -206,3 +206,34 @@ Plan, before any diagnostic code change:
 
 Scope: personal task branch, PLAN.md and gateway test fixture diagnostics only.
 No commercial runtime/queue, new worktree, dependency install or shared tests.
+
+
+## Post-merge web-react cleanup correction (2026-10-28)
+
+PR #1189 merged as d4bf84dc1605 after its 22 applicable PR checks passed. The
+subsequent push web-react job 122710970245/run 40657182272 passed all 5716 tests
+in 419 files, but correctly failed on one unhandled jsdom Event type error from
+Radix FocusScope's deferred unmount callback, attributed to
+ContainerWebPreview.test.tsx. The existing afterEach restores real timers and
+unmounts synchronously, then can leave the jsdom realm before Radix's zero-delay
+focus restoration runs. This is a test cleanup defect, not an obsolete assertion.
+Ride remains blocked until this is corrected and full CI is green.
+
+Plan:
+1. In this task's existing worktree/branch, fast-forward to the merged personal
+   selfhost commit (no new worktree or dependency install); open a small follow-up
+   personal PR because #1189 is already merged.
+2. Preserve all existing tests and timer behavior. Make the file's afterEach await
+   one real event-loop turn inside act after cleanup, so the actual Radix unmount
+   callback finishes within its jsdom realm. Do not stub FocusScope, suppress
+   errors, add retries, relax assertions or increase any timeout.
+3. Add a focused regression observing the real dialog's
+   focusScope.autoFocusOnUnmount event and asserting at the suite's afterAll that
+   teardown has completed. First run it against the old cleanup to demonstrate
+   red; then apply the lifecycle fix and run this file through the normal web-react
+   test mutex. Before lock acquisition, the usual wait-for-trains must return FREE.
+   Only this related unit file locally; full web-react remains CI-owned.
+4. Run scoped lint/typecheck and fix-trailers, commit/push, obtain gpt-6-astra/xhigh
+   code APPROVED and full green CI. Merge the personal correction only after fresh
+   FREE, then register ordinary ride for the corrected merged SHA. Keep receipt
+   consumption OFF. No commercial queue/runtime or other-session interference.
