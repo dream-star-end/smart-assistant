@@ -252,6 +252,8 @@ export function isDeliverableShot(path: string): boolean {
 
 /** 地址栏显示:主机 + 路径(去掉协议、`www.`、末尾斜杠);解析不了按原样截断。 */
 export function displayAddress(url: string): { host: string; path: string } {
+  // 浏览器刚打开、还没导航时停在 about:blank:解析出来 host 为空、路径是 "blank",地址栏和操作记录都写成「blank」。
+  if (url.trim().toLowerCase() === "about:blank") return { host: "空白页", path: "" };
   try {
     const u = new URL(url);
     const path = `${u.pathname === "/" ? "" : u.pathname}${u.search}`;

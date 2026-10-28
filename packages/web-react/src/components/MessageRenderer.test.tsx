@@ -259,7 +259,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
   });
 
   test("user：气泡 + 状态角标", () => {
-    renderMsg(mk("user", { text: "提问", status: "sent" }));
+    renderMsg(mk("user", { text: "提问", status: "sent" }), { sending: true });
     expect(screen.getByText("提问")).toBeInTheDocument();
     expect(screen.getByText("已送达")).toBeInTheDocument();
   });
@@ -4311,5 +4311,36 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
     expect(screen.queryAllByRole("button", { name: "更多操作" })
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
+  });
+});
+// 「已送达」= 服务端已受理、回复还没开始。sent 同时也是停止 / 服务重启中断 / 重复受理 / 自动恢复源轮的
+// 落定态,REST 对账、自动重试软状态、停止收尾都会把一条早已出过回复的用户行写回 sent;标签若只看
+// status,就会在已回复或已结束的消息下反复冒出来又消失。
+describe("「已送达」只属于在飞且还没有回复的那一轮", () => {
+  const list = (messages: ChatMessage[], sending: boolean) => (
+    <MessageList messages={messages} sending={sending} cb={{}} onRespondPermission={() => {}} />
+  );
+
+  test("回复开始后用户行被写回 sent(自动重试软状态 / 停止收尾):不再冒出「已送达」", () => {
+    const user = mk("user", { id: "u1", text: "长任务", status: "sent" });
+    const view = render(list([user], true));
+    expect(screen.getByText("已送达")).toBeInTheDocument();
+    const reply = mk("assistant", { id: "a1", text: "开始处理", _clientMessageId: "u1" });
+    view.rerender(list([{ ...user, status: "read" }, reply], true));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+    view.rerender(list([{ ...user, status: "sent" }, reply], true));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+    view.rerender(list([{ ...user, status: "sent" }, reply], false));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+  });
+
+  test("已结束的轮落定为 sent(服务重启中断 / 回复前就停止):历史消息下不显示「已送达」", () => {
+    render(list([
+      mk("user", { id: "u1", text: "第一问", status: "sent" }),
+      mk("assistant", { id: "a1", text: "部分回答", _clientMessageId: "u1" }),
+      mk("user", { id: "u2", text: "第二问", status: "sent" }),
+    ], false));
+    expect(screen.getByText("第二问")).toBeInTheDocument();
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
   });
 });

@@ -429,8 +429,11 @@ describe("UserCard 状态标签(M-09)", () => {
     expect(screen.queryByText("已回复")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "read" })} cb={{}} />);
     expect(screen.queryByText("已读")).toBeNull();
-    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
+    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} awaitingReply />);
     expect(screen.getByText("已送达")).toBeInTheDocument();
+    // sent 也是停止 / 中断 / 恢复源轮的落定态:不在等回复时不标「已送达」。
+    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
+    expect(screen.queryByText("已送达")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "sending" })} cb={{}} />);
     expect(screen.getByText("发送中")).toBeInTheDocument();
     rerender(<UserCard msg={userMsg({ status: "queued", text: "等一下再发" })} cb={{}} />);

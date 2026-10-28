@@ -43,6 +43,12 @@ function renderList(
   );
 }
 
+/** 展开外壳和每一组步骤,让过程里的每一行都渲染出来。 */
+function expandAllProcess() {
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+}
+
 function settledTurn(): ChatMessage[] {
   return [
     row("u1", "user", "做一版库存看板", { status: "replied" }),
@@ -517,10 +523,11 @@ describe("MessageList Manus 过程披露", () => {
         output: "User has approved your plan.",
       }),
     ]);
-    expect(screen.getAllByText("退出计划模式").length).toBeGreaterThan(0);
+    expandAllProcess();
+    expect(within(screen.getByTestId("process-disclosure")).getAllByText("退出计划模式").length).toBeGreaterThan(0);
   });
 
-  test("没有配对问答卡的 AskUserQuestion 工具行照常显示（不同 tool_use id 不算配对）", () => {
+  test("没有配对问答卡的 AskUserQuestion 工具行不被丢掉，作为一步留在过程里（不同 tool_use id 不算配对）", () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
       row("ask-card", "permission", "另一个问题？", {
@@ -541,7 +548,72 @@ describe("MessageList Manus 过程披露", () => {
         output: "User has answered your questions.",
       }),
     ]);
-    expect(screen.getAllByText("向用户提问").length).toBeGreaterThan(0);
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expandAllProcess();
+    expect(within(screen.getByTestId("process-disclosure")).getAllByText("向用户提问").length).toBeGreaterThan(0);
+  });
+
+  // 已回答的问答卡是客户端本机的卡:换设备 / 刷新后没有它,durable 重放的 owner reset 也会丢掉已回答的卡,
+  // 只剩 server tape 里的工具行。工具行本身从来不是作答入口,不能因为工具名像「提问」就挂到过程外面。
+  test("问答卡已不在(换设备 / 重放丢掉已回答的卡):AskUserQuestion / ExitPlanMode 工具行收进过程", () => {
+    renderList([
+      row("u", "user", "上线吧", { status: "replied" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git status" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        blockId: "toolu_ask",
+        _completed: true,
+        inputJson: { questions: [{ question: "怎么处理？", options: [{ label: "现在合并并部署" }] }] },
+        output: 'User has answered your questions: "怎么处理？"="现在合并并部署".',
+      }),
+      row("plan-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_plan",
+        _completed: true,
+        inputJson: { plan: "# LONE_PLAN" },
+        output: "User has approved your plan.",
+      }),
+      row("final", "assistant", "已合并", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expect(screen.queryByText("退出计划模式")).not.toBeInTheDocument();
+    expect(screen.getByText("已合并")).toBeInTheDocument();
+    expandAllProcess();
+    const process = within(screen.getByTestId("process-disclosure"));
+    expect(process.getAllByText("向用户提问").length).toBeGreaterThan(0);
+    expect(process.getAllByText("退出计划模式").length).toBeGreaterThan(0);
+  });
+
+  test("提问还在等回答、配对的卡不在时:过程标题说在等你,不说「正在使用向用户提问」", () => {
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          row("u", "user", "帮我定方案", { status: "read" }),
+          row("ask-tool", "tool", "", {
+            _clientMessageId: "u",
+            toolName: "AskUserQuestion",
+            blockId: "call_cursor_ask",
+            inputJson: { questions: [{ question: "选哪个？", options: [{ label: "A" }] }] },
+          }),
+        ]}
+        sending
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待你回答");
   });
 
   // OCV5-307:已回答的提问是这一轮的一个步骤,收进过程作为常显步骤;待审批 / 后台子任务仍在顶层。
