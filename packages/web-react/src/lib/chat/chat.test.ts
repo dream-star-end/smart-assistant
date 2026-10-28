@@ -11145,7 +11145,7 @@ describe("OCV5-427 resume replay catch-up", () => {
   });
   const hellos = (ws: FakeWS) => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.hello");
 
-  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello subscribes the running turn once and the REST sync does not ask again", () => {
+  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again", () => {
     FakeWS.instances = [];
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({ syncSession: vi.fn() });
@@ -11193,6 +11193,45 @@ describe("OCV5-427 resume replay catch-up", () => {
     ws.onmessage?.({ data: delta(3, "C") });
     expect(notify.mock.calls.length).toBeGreaterThan(beforeReplay);
     expect(s.messages.find((m) => m.id === "srv-s1-main-t1-s0")?.text).toBe("ABC");
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", async () => {
+    // The resume replay is now the snapshot catch-up of the running turn's stream.
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let releasePage!: (page: unknown) => void;
+    const readSessionSnapshot = vi.fn(() => new Promise((resolve) => { releasePage = resolve; }));
+    const syncSession = vi.fn(async () => true);
+    const sock = makeSocket({ syncSession, readSessionSnapshot } as never);
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const streamKey = "dispatch:77777777-7777-4777-8777-777777777777:1";
+    const record = (frameSeq: number, text: string, isFinal = false) => ({
+      recordId: String(frameSeq), frameSeq,
+      payload: JSON.parse(JSON.stringify(msgFrame({ frameSeq, clientMessageId: running, isFinal, blocks: [{ kind: "text", text }] }))),
+    });
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(running), streamKey, lastFrameSeq: 2, nextAfterSeq: 1, hasMore: true,
+      gap: { reason: "cursor_reset" }, frames: [record(1, "partial")],
+    }) });
+    await snapshotFlush();
+    // The tape-commit completion overtakes the replayed tail.
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      isFinal: true, clientMessageId: running, meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+    })) });
+    const s = sock.sessions.get("s1")!;
+    syncSession.mockClear();
+    releasePage(JSON.parse(sessionSnapshotFrame("s1", {
+      dispatch: snapshotDispatch(running), streamKey, lastFrameSeq: 2, nextAfterSeq: 2, frames: [record(2, " done", true)],
+    })).snapshot);
+    await snapshotFlush();
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.some((m) => m.role === "assistant" && m.text === "partial done")).toBe(true);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: running });
     sock.stop();
     vi.unstubAllGlobals();
   });

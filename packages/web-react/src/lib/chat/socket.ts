@@ -2696,7 +2696,7 @@ export class ChatSocket {
       if (this.pendingRecoveryErrors.get(sessId) !== pending) return;
       const d = snap?.dispatch;
       if (snap === undefined || (!!d && d.clientMessageId !== pending.clientMessageId &&
-        (isOpenSnapshotDispatch(d) || d.status === "rejecting"))) {
+        (d.status === "admitted" || d.status === "accepted" || d.status === "rejecting"))) {
         pending.timer = setTimeout(() => this.verifyDeferredRecovery(sessId, cause), RECOVERY_ADOPTION_GRACE_MS);
         return;
       }
@@ -3147,15 +3147,20 @@ export class ChatSocket {
         ? { last: snap, records: [], degraded: false }
         : await this.readSnapshotPages(sess, snap);
       if (!current()) return;
+      const running = sess._sendingInFlight ? sess._activeClientMessageId : undefined;
       if (pages.records.length > 0) {
         this.applyDurableLiveFrames(sessId, pages.records, rebuild && d ? [d.clientMessageId] : []);
       }
+      // A final among the frames settles the turn like a live final: one history read for its tape.
+      const settled = running && !(sess._sendingInFlight && sess._activeClientMessageId === running) ? running : undefined;
       const last = pages.last;
       if (last.streamKey && last.dispatch) {
         sess._snapshotStream = { streamKey: last.streamKey, agentId: last.dispatch.agentId || "main" };
       }
       if (pages.degraded) sess._liveJournalDegraded = true;
-      this.applySnapshotHead(sess, last, fresh, true, ctx.asked);
+      if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
+        void this.deps.syncSession?.(sessId, { clientMessageId: settled });
+      }
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();
     });
@@ -3165,6 +3170,7 @@ export class ChatSocket {
    * `readHistory=false` from inside a history read itself (legacy live-frames pages).
    * `asked` is the in-flight cmid the request named: the server prefers that exact dispatch,
    * so a different answer means it has no dispatch for that turn and the turn is not running.
+   * Returns whether it started a history read (directly or through the reconcile final).
    */
   private applySnapshotHead(
     sess: ChatSession,
@@ -3172,7 +3178,7 @@ export class ChatSocket {
     fresh: boolean,
     readHistory = true,
     asked?: string,
-  ): void {
+  ): boolean {
     // Pending prompts are idempotent by requestId and fenced by the settled set.
     for (const item of snap.pendingPermissions.items) this.dispatch(item as unknown as OutboundWire);
     const d = snap.dispatch;
@@ -3207,14 +3213,15 @@ export class ChatSocket {
           type: "outbound.message", channel: "webchat", peer: { id: sess.id, kind: "dm" },
           clientMessageId: d.clientMessageId, blocks: [], isFinal: true,
           meta: { reconcile: snap.reconcile, clientMessageId: d.clientMessageId }, ts: snap.asOf,
-        } as OutboundMessageWire, this.effects());
-        needsHistory = false;
-      } else {
-        // not_accepted / executed_error: the failure is shown from history (fail-visible).
-        needsHistory = true;
+        } as unknown as OutboundMessageWire, this.effects());
+        return true;
       }
+      // not_accepted / executed_error: the failure is shown from history (fail-visible).
+      needsHistory = true;
     }
-    if (needsHistory && readHistory) void this.deps.syncSession?.(sess.id, historyCmid ? { clientMessageId: historyCmid } : undefined);
+    if (!needsHistory || !readHistory) return false;
+    void this.deps.syncSession?.(sess.id, historyCmid ? { clientMessageId: historyCmid } : undefined);
+    return true;
   }
 
   /** afterSeq 续页：hasMore 走 HTTP 下一页，byte_limit 读那一帧的原始字节再推进游标。 */
@@ -3286,7 +3293,7 @@ export class ChatSocket {
     this.snapshotHttpInFlight.add(sessId);
     const requestedAt = Date.now();
     const lifecycle = this.lifecycleEpoch;
-    const query = opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId);
+    const query: SnapshotQuery = opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId);
     return Promise.resolve()
       .then(() => read(sessId, query))
       .then((snap) => {
