@@ -1,3 +1,4 @@
+import { configurePluginCatalog } from './plugins/catalogPolicy.js';
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { readCcbNativeRestoreArchive } from './db/pgSessionsBackend.js';
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
@@ -1319,6 +1320,7 @@ export async function registerCommercial(
   // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
   assertModelAuthorityCutoverFloor();
   const flavorIdentity = assertFlavorIdentity();
+  configurePluginCatalog(flavorIdentity);
   const cursorExternalOutboxDir =
     flavorIdentity.status === "ok"
       ? cursorExternalApiOutboxDirForFlavor(flavorIdentity.flavor)
@@ -2833,9 +2835,7 @@ export async function registerCommercial(
           }
         };
       }
-      // 声明式**默认连接器**(notion/feishu/github)的幂等 seed —— 走完整 securityApprove 审计
-      // 路径落 security_approved,catalog 才有可绑连接器、用户/agent 才发现得到。无此调用则生产
-      // 目录为空(整套端到端不成立)。fire-and-forget,失败只 log 不阻断启动;幂等,重启可反复跑。
+      // 有效默认集(selfhost 仅 GitHub)经完整 securityApprove 审计；幂等异步 seed，失败仅记录。
       void (async () => {
         try {
           const seeded = await seedDefaultConnectors(getPool());

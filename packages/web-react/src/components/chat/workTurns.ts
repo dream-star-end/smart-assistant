@@ -6,6 +6,7 @@
  * 轮也是一轮,产出页要能翻到它。
  */
 import type { ChatMessage } from "../../lib/chat/model";
+import { isPaneStep } from "./workPane";
 
 export type WorkTurn = {
   /** 本轮 user 消息 id;会话开头没有 user 消息的那段为 "start"。 */
@@ -33,7 +34,7 @@ export function collectWorkTurns(messages: readonly ChatMessage[]): WorkTurn[] {
       turns.push(current);
     }
     current.rows.push(m);
-    if (m.role === "tool") current.steps.push(m);
+    if (isPaneStep(m)) current.steps.push(m);
   }
   // 还没有任何回应的轮(刚发出)留着:运行中要能看到「这一轮」。开头那段只在有内容时才算。
   return turns.filter((t) => t.key !== "start" || t.rows.length > 0);

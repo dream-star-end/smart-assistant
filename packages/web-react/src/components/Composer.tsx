@@ -78,6 +78,9 @@ const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
+// 已经盖进输入框的预填(按对象认,跨卸载重挂保留;见预填 effect)。
+const appliedPrefills = new WeakSet<{ text: string; nonce: number }>();
+
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("audio/")) return "audio";
@@ -310,9 +313,14 @@ export function Composer({
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
   const [dismissedPrediction, setDismissedPrediction] = useState<string | null>(null);
+  // 删字时不叠预测(OCV5-642):框里留着上一轮发过的那句时,每按一次 Backspace 补全都把删掉的尾巴
+  // 用浅色字补回来,整句纹丝不动;删空后又冒出整句预测 —— 看起来就是「草稿删不掉」。
+  // 最后一次编辑是删除、之后没再改过 → 不显示任何预测。
+  const [deletedTo, setDeletedTo] = useState<{ key: string | undefined; value: string } | null>(null);
+  const afterDelete = deletedTo !== null && deletedTo.key === draftKey && deletedTo.value === value;
   const nextPrediction = prediction?.next?.text ?? null;
   const ghostRest =
-    !prediction || disabled || composing || (value !== "" && !caretAtEnd)
+    !prediction || disabled || composing || afterDelete || (value !== "" && !caretAtEnd)
       ? null
       : value === ""
         ? !busy && attachments.length === 0 && !replyTo && nextPrediction && nextPrediction !== dismissedPrediction
@@ -380,12 +388,14 @@ export function Composer({
   // 不会与正常输入竞争;文本可改可删,发送权始终在用户)。
   // 用 layout effect:切会话与预填同一次点击时，预填必须在首个提交帧就盖住目标会话的旧草稿；
   // passive effect 在 React 19 下会晚于绘制，先闪一帧旧草稿(OCV5-355,composer-draft #9)。
+  // 每个预填只用一次(OCV5-642):App 里的 prefill 一直不清空,输入框随视图切换(项目主页 / 任务板 ↔
+  // 对话)卸载重挂时会把上次「编辑重发」等的文字再盖一遍,成了删过又回来的「上一轮草稿」。
   useLayoutEffect(() => {
-    if (!prefill) return;
+    if (!prefill || appliedPrefills.has(prefill)) return;
+    appliedPrefills.add(prefill);
     setValue(prefill.text);
     requestAnimationFrame(() => ref.current?.focus());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefill?.nonce]);
+  }, [prefill, setValue]);
 
   useEffect(() => {
     if (!replyTo) return;
@@ -709,6 +719,8 @@ export function Composer({
               onChange={(e) => {
                 setValue(e.target.value);
                 setCaretAtEnd(e.target.selectionEnd === e.target.value.length);
+                const inputType = (e.nativeEvent as InputEvent).inputType ?? "";
+                setDeletedTo(inputType.startsWith("delete") ? { key: draftKey, value: e.target.value } : null);
               }}
               onSelect={(e) => {
                 const el = e.currentTarget;
@@ -756,8 +768,9 @@ export function Composer({
                   onCancelReply();
                   return;
                 }
-                // Esc 收起整句预测(不在生成中才会显示,不和全局「停止生成」抢键)。
-                if (e.key === "Escape" && value === "" && ghostRest && !e.nativeEvent.isComposing) {
+                // Esc 收起整句预测(不在生成中才会显示,不和全局「停止生成」抢键)。空框按 Backspace 同样
+                // 收起:浅色整句像一段删不掉的旧草稿(OCV5-642)。
+                if ((e.key === "Escape" || e.key === "Backspace") && value === "" && ghostRest && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   setDismissedPrediction(ghostRest);
                   return;

@@ -1,3 +1,4 @@
+import { assertPluginAvailable } from './catalogPolicy.js'
 import { type JieyouAccountState, parseJieyouAccountState } from './literatureDb/accountState.js'
 import { LITERATURE_PLUGIN_ARTIFACT_HASH } from './literatureDb/builtinArtifact.js'
 import {
@@ -666,6 +667,7 @@ export async function assertRuntimePluginInstallEntitlement(
   runner: QueryRunner,
   opts: { requireCurrent?: boolean; allowUnlisted?: boolean } = {},
 ): Promise<void> {
+  assertPluginAvailable(verified.slug)
   const installed = await runner.query(
     `SELECT 1
        FROM marketplace_installs i

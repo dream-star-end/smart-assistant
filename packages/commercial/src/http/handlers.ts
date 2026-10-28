@@ -1696,6 +1696,8 @@ export async function handlePatchMyPreferences(
     });
   } catch (err) {
     if (err instanceof PreferencesError) {
+      if (err.code === 'FORBIDDEN') throw new HttpError(403, 'AUTO_DREAM_MAX_REQUIRED', err.message);
+      if (err.code === 'UNAVAILABLE') throw new HttpError(503, 'AUTO_DREAM_UNAVAILABLE', err.message);
       if (err.code === "VALIDATION") {
         throw new HttpError(400, "INVALID_PREFERENCES", err.message);
       }

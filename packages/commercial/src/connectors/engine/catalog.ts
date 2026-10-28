@@ -1,3 +1,5 @@
+import { isPluginAvailable } from '../../plugins/catalogPolicy.js'
+import { canonicalSha256Hex } from '../spec/canonical.js'
 /**
  * 声明式连接器目录与管理聚合。
  *
@@ -6,8 +8,7 @@
  */
 import type { Pool } from 'pg'
 import {
-  DEFAULT_CONNECTOR_ARTIFACT_HASHES,
-  DEFAULT_CONNECTOR_SLUGS,
+  availableDefaultConnectors,
   isDefaultConnectorArtifact,
 } from '../defaults/index.js'
 import { listPlatformOauthAppSlugs } from '../platformOauthApps.js'
@@ -86,12 +87,13 @@ export async function listDeclarativeCatalog(
           )
         )
       ORDER BY v.slug`,
-    [userId, DEFAULT_CONNECTOR_SLUGS, DEFAULT_CONNECTOR_ARTIFACT_HASHES],
+    [userId, availableDefaultConnectors().map((d) => d.spec.id), availableDefaultConnectors().map((d) => canonicalSha256Hex(d.spec))],
   )
   const q = opts.query?.trim().toLowerCase()
   const catalog: CatalogEntry[] = []
   let provisionedSlugs: Set<string> | null = null
   for (const row of rows.rows) {
+    if (!isPluginAvailable(row.slug)) continue
     try {
       const meta = await loadVerifiedContractWithMeta(Number(row.id), pool)
       const entry = projectContract(meta, row.name, row.description)
@@ -206,12 +208,13 @@ export async function listDeclarativeManagement(
        LEFT JOIN marketplace_skill_versions iv ON iv.id = ai.version_id
        LEFT JOIN binding_count bc ON bc.slug = w.slug
       ORDER BY w.slug`,
-    [userId, DEFAULT_CONNECTOR_SLUGS],
+    [userId, availableDefaultConnectors().map((d) => d.spec.id)],
   )
 
   let provisionedSlugs: Set<string> | null = null
   const connectors: ManagementConnectorEntry[] = []
   for (const row of rows.rows) {
+    if (!isPluginAvailable(row.slug)) continue
     const official =
       row.latest_artifact_hash !== null &&
       isDefaultConnectorArtifact(row.slug, row.latest_artifact_hash)
@@ -279,7 +282,7 @@ export async function listDeclarativeManagement(
   }
 
   const connectionRows = await listDeclarativeConnections(userId, pool)
-  const connections = connectionRows.map((r) => ({
+  const connections = connectionRows.filter((r) => isPluginAvailable(r.slug)).map((r) => ({
     id: r.id,
     slug: r.slug,
     displayName: r.displayName,

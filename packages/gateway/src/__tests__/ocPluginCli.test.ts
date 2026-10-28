@@ -176,3 +176,46 @@ describe('oc-plugin shared CLI surface', () => {
     assert.doesNotMatch(shell, /OPENCLAUDE_V3_CONTAINER_TOKEN=/)
   })
 })
+
+
+describe('oc-plugin describe', () => {
+  test('uses the same plugin target resolver and returns signed schema without reading stdin', async () => {
+    const calls: Array<{ op: string; body: unknown }> = []
+    const result = await runOcPluginCli(['describe', 'weibo', 'create_post'], {
+      readStdin: async () => { throw new Error('describe must not read credentials or params') },
+      transport: async (op, body) => {
+        calls.push({ op, body })
+        return op === 'list'
+          ? { plugins: [{ id: '41', provider: 'weibo', displayName: '微博账号' }] }
+          : { kind: 'describe', provider: 'weibo', action: 'create_post', description: '发布微博', readOnly: false,
+              writeMode: 'account_preapproval', params: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } } }
+      },
+    })
+    assert.equal(result.exitCode, 0)
+    assert.deepEqual(calls, [{ op: 'list', body: {} }, { op: 'describe', body: { connectionId: '41', action: 'create_post' } }])
+    assert.match(result.stdout, /账号免确认/)
+    assert.match(result.stdout, /"required"/)
+    assert.match(result.stdout, /oc-plugin call weibo create_post/)
+  })
+
+  test('multiple accounts require explicit selection, and explicit targets use plugins describe', async () => {
+    const result = await runOcPluginCli(['describe', 'github', 'search_issues'], {
+      transport: async (op) => {
+        assert.equal(op, 'list')
+        return { plugins: [{ id: 'github', provider: 'github' }, { id: 'decl:42', provider: 'github' }] }
+      },
+    })
+    assert.equal(result.exitCode, 2)
+    assert.match(result.stderr, /--account github/)
+    assert.match(result.stderr, /--account decl:42/)
+    const explicit = await runOcPluginCli(['describe', 'github', 'search_issues', '--account', 'decl:42'], {
+      transport: async (op, body) => {
+        assert.equal(op, 'describe')
+        assert.deepEqual(body, { connectionId: 'decl:42', action: 'search_issues' })
+        return { kind: 'error', code: 'PLUGIN_UNAVAILABLE', message: '此插件已下架，无法连接或调用。' }
+      },
+    })
+    assert.equal(explicit.exitCode, 1)
+    assert.match(explicit.stderr, /已下架/)
+  })
+})

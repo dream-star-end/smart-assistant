@@ -19,6 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PLUGIN_UI_COMPONENTS, type PluginUiComponentSet, parsePluginManifest, pluginUiOwner, pluginUiTypes } from "@openclaude/protocol";
+import { SELFHOST_PLUGIN_SLUGS } from "../plugins/catalogPolicy.js";
 import { INPUT_PREDICTION_PROMPT, INTELLIGENT_UI_PROMPT } from "../intelligentUi/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +48,7 @@ function frontmatter(md: string): string {
 
 const modelSets = PLUGIN_UI_COMPONENTS.filter((s) => s.author === "model");
 const cliSets = PLUGIN_UI_COMPONENTS.filter((s) => s.author === "cli");
+const activeAppPlugins: ReadonlySet<string> = new Set(SELFHOST_PLUGIN_SLUGS);
 
 describe("登记表本身", () => {
   test("插件名、类型都不重复；至少覆盖同花顺、微博、知乎、飞书", () => {
@@ -113,9 +115,12 @@ describe("3. 模型写的插件组件：定义按需读取", () => {
       assert.match(doc, /没有该协议时不要写这些块/);
     });
 
-    test(`${set.plugin}：技能 SKILL.md 指向定义文件，但不内联任何插件组件定义`, () => {
+    test(`${set.plugin}：技能只指向在售应用的定义，且不内联任何插件组件定义`, () => {
       const skill = readFileSync(join(SKILLS, set.skill, "SKILL.md"), "utf8");
-      assert.ok(skill.includes(`\`${set.doc}\``), `${set.skill}/SKILL.md does not point at ${set.doc}`);
+      // The renderer/registry retains old-message types. The five-app skill must not rediscover retired apps.
+      const retiredApp = set.skill === "app-connectors" && !activeAppPlugins.has(set.plugin);
+      assert.equal(skill.includes(`\`${set.doc}\``), !retiredApp,
+        `${set.skill}/SKILL.md ${retiredApp ? "must not advertise retired" : "must point at"} ${set.doc}`);
       for (const t of pluginUiTypes()) assert.ok(!mentions(skill, t), `${set.skill}/SKILL.md inlines plugin type ${t}`);
     });
   }

@@ -182,3 +182,50 @@ describe("Composer 输入预测", () => {
     expect(ta.value).toBe("");
   });
 });
+
+// OCV5-642:体验官「输入框残留上一轮草稿，Backspace 清不掉」。框里那句恰好也是补全候选:每删一个字,
+// 浅色补全就把删掉的尾巴补回来,整句看着纹丝不动;删空后又冒出浅色整句预测。
+describe("Composer 删除时不叠预测(OCV5-642)", () => {
+  const backspaceTo = (ta: HTMLElement, value: string) =>
+    fireEvent.input(ta, { target: { value, selectionStart: value.length, selectionEnd: value.length }, inputType: "deleteContentBackward" });
+
+  test("按 Backspace 删字后不再把删掉的尾巴用浅色补回来;再打字补全照常", async () => {
+    render(<Composer onSend={() => {}} prediction={prediction} />);
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "加上木星", selectionStart: 4, selectionEnd: 4 } });
+    expect(await screen.findByTestId("composer-prediction")).toHaveTextContent("的四颗伽利略卫星");
+    backspaceTo(ta, "加上木");
+    expect(ta.value).toBe("加上木");
+    expect(screen.queryByTestId("composer-prediction")).toBeNull();
+    backspaceTo(ta, "");
+    // 删空了也不冒整句预测:用户刚把框清掉。
+    expect(screen.queryByTestId("composer-prediction")).toBeNull();
+    expect(ta).toHaveAttribute("placeholder");
+    fireEvent.input(ta, { target: { value: "加上", selectionStart: 2, selectionEnd: 2 }, inputType: "insertText" });
+    expect(await screen.findByTestId("composer-prediction")).toHaveTextContent("木星的四颗伽利略卫星");
+  });
+
+  test("空输入框按 Backspace 收起浅色整句预测(和 Esc 一样)", async () => {
+    render(<Composer onSend={() => {}} prediction={prediction} />);
+    const ta = screen.getByLabelText("消息输入框");
+    await screen.findByTestId("composer-prediction");
+    fireEvent.keyDown(ta, { key: "Backspace" });
+    expect(screen.queryByTestId("composer-prediction")).toBeNull();
+    expect(screen.getByRole("button", { name: "发送" })).toBeDisabled();
+  });
+
+  test("同一个预填只盖一次:输入框卸载重挂(切到项目主页再回来)不会把删掉的旧文字再填回去", async () => {
+    const prefill = { text: "上一轮要编辑重发的那句", nonce: 1 };
+    const first = render(<Composer onSend={() => {}} prefill={prefill} />);
+    const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
+    expect(ta.value).toBe("上一轮要编辑重发的那句");
+    fireEvent.change(ta, { target: { value: "" } });
+    first.unmount();
+    render(<Composer onSend={() => {}} prefill={prefill} />);
+    expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("");
+    cleanup();
+    // 新的预填(新对象)照常生效。
+    render(<Composer onSend={() => {}} prefill={{ text: "新的预填", nonce: 2 }} />);
+    expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("新的预填");
+  });
+});

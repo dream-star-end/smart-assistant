@@ -1,3 +1,4 @@
+import { isPluginAvailable } from './catalogPolicy.js'
 /**
  * 本机插件目录（OCV5-383）：随平台基线下发、在用户容器里运行的插件（如同花顺行情 ths）。
  *
@@ -50,7 +51,7 @@ export function loadLocalPluginManifests(baselineDir: string = localBaselineDir(
   for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
     const m = readManifest(join(baselineDir, 'skills', name, 'plugin.json'))
     // 清单里的 name 必须与目录名一致：容器启动器按目录名找它。
-    if (m && m.name === name) out.push(m)
+    if (m && m.name === name && isPluginAvailable(name)) out.push(m)
   }
   return out
 }

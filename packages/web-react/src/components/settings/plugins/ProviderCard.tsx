@@ -41,6 +41,7 @@ export function ProviderCard({
   notice,
   onDismissNotice,
   onBind,
+  onBindToken,
   canBind = true,
   management,
   onOpenMarketplace,
@@ -59,6 +60,7 @@ export function ProviderCard({
   notice: CardNotice | null
   onDismissNotice: () => void
   onBind: () => void
+  onBindToken?: () => void
   canBind?: boolean
   management?: DeclarativeManagementConnector
   onOpenMarketplace?: () => void
@@ -104,6 +106,7 @@ export function ProviderCard({
   const uninstallBlocked = (management?.connectionCount ?? 0) > 0
   return (
     <section data-connector-card={slug} className={CONNECTOR_SECTION}>
+      {onBindToken && <Button variant="ghost" size="sm" onClick={onBindToken}>使用 GitHub 访问令牌</Button>}
       <ConnectorHead
         label={label}
         status={status}

@@ -1,3 +1,4 @@
+import { configurePluginCatalog } from '../plugins/catalogPolicy.js'
 /**
  * 默认连接器 seed:把 DEFAULT_CONNECTORS 落成 security_approved 的 marketplace listing+version。
  *
@@ -12,7 +13,7 @@ import { getPool } from '../db/index.js'
 import { assertFlavorIdentity } from '../flavor/assertFlavor.js'
 import { tx } from '../db/queries.js'
 import { approveMarketplaceConnectorVersionWithRunner } from '../marketplace/connectorReview.js'
-import { DEFAULT_CONNECTORS } from './defaults/index.js'
+import { availableDefaultConnectors } from './defaults/index.js'
 import { canonicalSha256Hex } from './spec/canonical.js'
 
 const SEED_AUTHOR_EMAIL = 'connectors-seed-author@system.openclaude'
@@ -67,7 +68,7 @@ export interface SeedResult {
 export async function ensureConnectorSeedPrincipals(
   pool: Pool = getPool(),
 ): Promise<{ author: number; reviewer: number }> {
-  assertFlavorIdentity()
+  configurePluginCatalog(assertFlavorIdentity())
   const author = await ensureSystemUser(SEED_AUTHOR_EMAIL, 'user', pool)
   const reviewer = await ensureSystemUser(SEED_REVIEWER_EMAIL, 'admin', pool)
   return { author, reviewer }
@@ -78,7 +79,7 @@ export async function seedDefaultConnectors(pool: Pool = getPool()): Promise<See
   const seeded: string[] = []
   const skipped: string[] = []
 
-  for (const [index, d] of DEFAULT_CONNECTORS.entries()) {
+  for (const [index, d] of availableDefaultConnectors().entries()) {
     const slug = d.spec.id
     const raw = JSON.stringify(d.spec)
     const specHash = canonicalSha256Hex(d.spec)

@@ -1,3 +1,5 @@
+import { ConnectorError } from '../connectors/errors.js'
+import { isPluginAvailable } from '../plugins/catalogPolicy.js'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import { LiteratureError } from '../plugins/literatureDb/errors.js'
@@ -297,6 +299,9 @@ export async function dispatchPluginsRoute(
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
   const path = url.pathname
   const method = req.method ?? 'GET'
+  const setupProvider = /^\/api\/plugins\/([^/]+)\/setup(?:\/|$)/.exec(path)?.[1]
+  if (setupProvider && !isPluginAvailable(setupProvider) && method !== 'DELETE')
+    throw new HttpError(404, 'NOT_FOUND', '插件已下架')
 
   if (
     path === '/api/plugins/literature-db/setup' ||
