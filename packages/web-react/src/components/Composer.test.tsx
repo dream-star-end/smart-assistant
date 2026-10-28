@@ -176,6 +176,22 @@ describe("Composer 生成中排队发送", () => {
     expect(screen.getByRole("status")).toHaveTextContent("已加入队列，本轮结束后发送");
   });
 
+  test("onSend 返回 false(如软确认选了「先不发」)→ 不提示已入队,草稿保留", async () => {
+    const onSend = vi.fn(async () => false);
+    render(
+      <ToastProvider>
+        <Composer busy onSend={onSend} onStop={() => {}} />
+      </ToastProvider>,
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "继续" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "排队发送" }));
+    });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox")).toHaveValue("继续");
+    expect(screen.queryByText("已加入队列，本轮结束后发送")).toBeNull();
+  });
+
   test("busy 但空正文 / stopping 态不出现排队按钮", () => {
     const { rerender } = render(<Composer busy onSend={() => {}} onStop={() => {}} />);
     expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
