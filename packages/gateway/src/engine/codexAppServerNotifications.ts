@@ -61,6 +61,7 @@ import { log } from './codexAppServerRunner.js'
 import type { CodexAppServerRunner } from './codexAppServerRunner.js'
 
 export interface CodexNotificationHost {
+  nativeContext: CodexAppServerRunner['nativeContext']
   _handleChatgptAuthTokensRefresh: CodexAppServerRunner['_handleChatgptAuthTokensRefresh']
   activeTurnId: CodexAppServerRunner['activeTurnId']
   activeTurnTotal: CodexAppServerRunner['activeTurnTotal']
@@ -428,6 +429,12 @@ export function handleNotification(
   if (!params || typeof params !== 'object') return
   const p = params as Record<string, unknown>
   const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
+  const native = this.nativeContext.notification(method, p)
+  if (native === 'usage') {
+    handleTokenUsage.call(this, p)
+    return
+  }
+  if (native === 'handled') return
 
   if (
     this.pendingNativeCompaction &&
@@ -454,6 +461,7 @@ export function handleNotification(
     _isContextCompactionItem(p.item) &&
     this.currentTurnCompleter
   ) {
+    this.nativeContext.automaticItem(method, p, this.threadId)
     this.handleContextCompactionItem(method, p.item)
     return
   }
@@ -745,42 +753,7 @@ export function handleNotification(
     return
   }
   if (method === 'thread/tokenUsage/updated') {
-    // Schema: ThreadTokenUsageUpdatedNotification — { threadId, turnId,
-    // tokenUsage: { last, total, modelContextWindow? } }. Both `last` and
-    // `total` are TokenUsageBreakdown (cachedInputTokens, inputTokens,
-    // outputTokens, reasoningOutputTokens, totalTokens).
-    //
-    // Strategy (per Codex review v2): use `total` for idempotent snapshots
-    // — it's monotonically growing across the thread, so overwriting our
-    // activeTurnTotal on every notification is safe even if codex emits
-    // duplicate frames. Per-turn delta = activeTurnTotal − priorTurnTotal
-    // is computed at turn/completed time, decoupling notification-frame
-    // count from the billed amount.
-    const tu = p.tokenUsage as Record<string, unknown> | undefined
-    if (!tu) return
-    const total = _coerceTokenBreakdown(tu.total)
-    const duplicateTotal =
-      this.activeTurnTotal !== null && this.sameTokenBreakdown(this.activeTurnTotal, total)
-    const last = _coerceTokenBreakdown(tu.last)
-    this.recordCallUsageSnapshot(last, duplicateTotal)
-    // Bootstrap baseline on the FIRST notification of a fresh runner
-    // instance attached to a thread with prior history (e.g. server hot-
-    // reload mid-conversation, sessionManager constructs a new
-    // CodexAppServerRunner with resumeSessionId). Without this, priorTurnTotal
-    // would be null and the next turn's delta = full thread total → massive
-    // over-bill. `tokenUsage.last` is "tokens used by the most recent LLM
-    // call", so `total - last` ≈ "everything before this most recent call"
-    // ≈ correct baseline IF this is the first call of the turn. Multi-call
-    // turns whose runner happens to be constructed mid-turn (essentially
-    // impossible given current sessionManager wiring) would undercount;
-    // accepted defensive trade-off.
-    if (this.priorTurnTotal === null && this.activeTurnTotal === null) {
-      this.priorTurnTotal = _subtractTokenBreakdown(total, last)
-    }
-    this.activeTurnTotal = total
-    const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
-    const delta = _subtractTokenBreakdown(total, baseline)
-    if (delta.totalTokens > 0) this.emit('usage', _codexTurnUsageSnapshot(delta))
+    handleTokenUsage.call(this, p)
     return
   }
   if (method === 'account/rateLimits/updated') {
@@ -1451,4 +1424,45 @@ export function emitResult(
     ...(opts.errorClass ? { errorClass: opts.errorClass } : {}),
   }
   this.emit('message', msg)
+}
+
+/** Existing billing delta calculation, shared with the native compact turn. */
+function handleTokenUsage(this: CodexNotificationHost, p: Record<string, unknown>): void {
+  this.nativeContext.observeUsage(this.threadId, p)
+  // Schema: ThreadTokenUsageUpdatedNotification — { threadId, turnId,
+  // tokenUsage: { last, total, modelContextWindow? } }. Both `last` and
+  // `total` are TokenUsageBreakdown (cachedInputTokens, inputTokens,
+  // outputTokens, reasoningOutputTokens, totalTokens).
+  //
+  // Strategy (per Codex review v2): use `total` for idempotent snapshots
+  // — it's monotonically growing across the thread, so overwriting our
+  // activeTurnTotal on every notification is safe even if codex emits
+  // duplicate frames. Per-turn delta = activeTurnTotal − priorTurnTotal
+  // is computed at turn/completed time, decoupling notification-frame
+  // count from the billed amount.
+  const tu = p.tokenUsage as Record<string, unknown> | undefined
+  if (!tu) return
+  const total = _coerceTokenBreakdown(tu.total)
+  const duplicateTotal =
+    this.activeTurnTotal !== null && this.sameTokenBreakdown(this.activeTurnTotal, total)
+  const last = _coerceTokenBreakdown(tu.last)
+  this.recordCallUsageSnapshot(last, duplicateTotal)
+  // Bootstrap baseline on the FIRST notification of a fresh runner
+  // instance attached to a thread with prior history (e.g. server hot-
+  // reload mid-conversation, sessionManager constructs a new
+  // CodexAppServerRunner with resumeSessionId). Without this, priorTurnTotal
+  // would be null and the next turn's delta = full thread total → massive
+  // over-bill. `tokenUsage.last` is "tokens used by the most recent LLM
+  // call", so `total - last` ≈ "everything before this most recent call"
+  // ≈ correct baseline IF this is the first call of the turn. Multi-call
+  // turns whose runner happens to be constructed mid-turn (essentially
+  // impossible given current sessionManager wiring) would undercount;
+  // accepted defensive trade-off.
+  if (this.priorTurnTotal === null && this.activeTurnTotal === null) {
+    this.priorTurnTotal = _subtractTokenBreakdown(total, last)
+  }
+  this.activeTurnTotal = total
+  const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
+  const delta = _subtractTokenBreakdown(total, baseline)
+  if (delta.totalTokens > 0) this.emit('usage', _codexTurnUsageSnapshot(delta))
 }
