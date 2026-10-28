@@ -3346,7 +3346,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
-  test("hello + 超长 clientMessageId(>200) → 不查 PG、不发帧", async () => {
+  test("hello + 超长 clientMessageId(>200) → 当作缺省：不拿它查库、不伪造终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "809";
     const peerId = "peerLongId";
@@ -3383,7 +3383,10 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `超长 id 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "超长 clientMessageId 不得查 turn_dispatches");
+      assert.ok(
+        lookups.slice(lookupsBefore).every((args) => !JSON.stringify(args).includes(clientMessageId)),
+        "超长 clientMessageId 不得进入任何查询参数",
+      );
     } finally {
       ws.close();
       await waitClose(ws);

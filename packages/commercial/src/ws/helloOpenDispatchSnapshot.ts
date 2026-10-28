@@ -38,7 +38,6 @@ export async function sendHelloSessionSnapshots(
     if (seen.size >= 8) break
     seen.add(peer.peerId)
     const cmid = peer.inFlightClientMessageId
-    if (cmid !== undefined && (typeof cmid !== 'string' || cmid.length > 200 || !isClientMessageId(cmid))) continue
     const clientMessageId = peer.inFlight === true && typeof cmid === 'string' && cmid.length <= 200 && isClientMessageId(cmid)
       ? cmid : undefined
     try {
