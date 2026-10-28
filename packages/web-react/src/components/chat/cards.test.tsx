@@ -1421,3 +1421,92 @@ describe("UserCard 用户自己停止的待发消息(OCV5-421)", () => {
     expect(onRetrySend).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("sealed crashed tape does not keep 结果正在收尾", () => {
+  const detail =
+    'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"}}';
+  const partial = "博客大纲已写完，正在排版。\n\n[turn failed: BOX_REPLAY_PENDING]";
+  const soft = {
+    disposition: "card" as const,
+    tone: "yellow" as const,
+    title: "结果正在收尾",
+    message: "远端结果仍在确认中。已生成的内容已保留；稍后刷新即可看到完整结果，不会重复扣费。",
+  };
+
+  test("a frozen soft snapshot on a sealed crash rerenders as the engine_error card and keeps the partial answer", () => {
+    renderErr(errMsg({
+      _errorCode: "ENGINE_ERROR",
+      text: partial,
+      _errorDetail: detail,
+      _turnTapeComplete: true,
+      _dispatchOutcome: "crashed",
+      _errorCardSnapshot: soft,
+    }), {});
+    expect(screen.getByRole("alert")).toHaveTextContent("任务执行失败");
+    expect(screen.getByRole("alert")).toHaveTextContent("任务执行时遇到内部错误，你的消息已保留，可以直接重试。");
+    expect(screen.getByText("博客大纲已写完，正在排版。")).toBeInTheDocument();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+    expect(screen.queryByText(/仍在确认|稍后刷新|不会重复扣费/)).toBeNull();
+  });
+
+  test("a sealed crash with no snapshot and an empty body shows only the failure card", () => {
+    renderErr(errMsg({
+      _errorCode: "ENGINE_ERROR",
+      text: "",
+      _errorDetail: detail,
+      _turnTapeComplete: true,
+      _dispatchOutcome: "crashed",
+    }), {});
+    expect(screen.getByRole("alert")).toHaveTextContent("任务执行失败");
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+    expect(screen.queryByText(/仍在确认|稍后刷新|不会重复扣费|完整结果/)).toBeNull();
+    expect(screen.queryByText("博客大纲已写完，正在排版。")).toBeNull();
+  });
+
+  test("an unsealed frozen soft card and an unrelated sealed snapshot stay as first painted", () => {
+    const { unmount } = render(
+      <AssistantCard
+        msg={errMsg({
+          _errorCode: "ENGINE_ERROR",
+          text: partial,
+          _errorDetail: detail,
+          _errorCardSnapshot: soft,
+        })}
+        ctx={ERR_CTX}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByText("结果正在收尾")).toBeInTheDocument();
+    expect(screen.getByText(/不会重复扣费/)).toBeInTheDocument();
+    unmount();
+
+    renderErr(errMsg({
+      _errorCode: "ENGINE_ERROR",
+      text: partial,
+      _errorDetail: detail,
+      _turnTapeComplete: true,
+      _dispatchOutcome: "crashed",
+      _errorCardSnapshot: {
+        disposition: "card",
+        tone: "red",
+        title: "任务执行失败",
+        message: "第一次看到的失败说明，不可改写。",
+      },
+    }), {});
+    expect(screen.getByText("第一次看到的失败说明，不可改写。")).toBeInTheDocument();
+    expect(screen.queryByText(/不会重复扣费/)).toBeNull();
+  });
+
+  test("a completed tape with no error code does not become a failure card or a success conclusion", () => {
+    renderErr(errMsg({
+      _errorCode: undefined,
+      text: "正文里出现 BOX_REPLAY_PENDING 只是记录，不是结论。",
+      _turnTapeComplete: true,
+      _dispatchOutcome: "completed",
+    }), {});
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+    expect(screen.queryByText("任务执行失败")).toBeNull();
+    expect(screen.getByText("正文里出现 BOX_REPLAY_PENDING 只是记录，不是结论。")).toBeInTheDocument();
+  });
+});

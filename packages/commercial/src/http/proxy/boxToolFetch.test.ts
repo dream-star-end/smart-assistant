@@ -7,6 +7,7 @@ import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { prepareBoxContinuation, BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
+import { BoxToolContinuationError } from "./boxToolContinuation.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -702,6 +703,40 @@ test("OCV5-313 the stop wait is bounded and a late or failing stop is still obse
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(unhandled, []);
   } finally { process.off("unhandledRejection", onUnhandled); }
+});
+
+test("BOX_TOOL_TERMINAL_UNPROVEN stops once through the bounded echo path and does not complete the chain", async () => {
+  let completes = 0;
+  let release!: () => void;
+  const hung = new Promise<string>((resolve) => { release = () => resolve("pending"); });
+  const calls: string[] = [];
+  const target = { accountId: 25n,
+    exec: { run: async () => ({ stdout: "clean" + String.fromCharCode(10), stderrBytes: 0, exitCode: 0 as const }) },
+    dispose: async () => {} };
+  const base = journal() as unknown as Record<string, unknown>;
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { ...base, completeToolChain: async () => { completes++; } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    echoStopWaitMs: 40,
+    publishResume: (async () => ({ claim: { runNonce: "e".repeat(24),
+      leaseEpoch: "f".repeat(32), accountId: 25n, spoolOffset: 1, roundNo: 2 },
+    target, access: {} })) as never,
+    runContinuation: (async () => {
+      calls.push("continuation");
+      throw new BoxToolContinuationError("BOX_TOOL_TERMINAL_UNPROVEN");
+    }) as never,
+    stopRejectedRun: (async () => { calls.push("stop"); return hung; }) as never });
+  const started = Date.now();
+  const response = await service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_TERMINAL_UNPROVEN/);
+  assert.deepEqual(calls, ["continuation", "stop"]);
+  assert.ok(Date.now() - started < 2_000, "the request does not wait out a hanging stop");
+  assert.equal(completes, 0);
+  release();
+  await hung;
 });
 
 test("OCV5-313 other continuation failures do not request a stop", async () => {

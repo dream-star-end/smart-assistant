@@ -758,12 +758,43 @@ export function carryLegacySizeRequestReferences(current: ChatMessage[], cached:
   return changed ? result : current;
 }
 
+/** Title of the OCV5-620 soft card. A sealed failure must not keep this promise. */
+export const BOX_REPLAY_PENDING_SOFT_TITLE = "结果正在收尾";
+
+export type BoxReplayPresentationContext = {
+  /** `_turnTapeComplete` on the row being rendered. */
+  turnTapeComplete?: boolean;
+  /** Dispatch header status. Only an error terminal skips the soft card. */
+  dispatchOutcome?: string | null;
+};
+
+/**
+ * Sealed lossless tape whose dispatch outcome is a failure terminal
+ * (`crashed` / `executed_error` / `not_accepted`). `completed` and
+ * `interrupted` stay on the soft card when the detail still says the Box
+ * call is resolving.
+ */
+export function isSealedDispatchFailure(
+  message: { _turnTapeComplete?: boolean; _dispatchOutcome?: string | null } | null | undefined,
+): boolean {
+  return message?._turnTapeComplete === true
+    && collapsedAnchorTerminalKind(message._dispatchOutcome) === "error";
+}
+
+/** Only a frozen soft title may be recomputed, and only on a sealed failure. */
+export function isStaleSoftBoxReplaySnapshot(
+  snapshot: ChatMessage["_errorCardSnapshot"] | null | undefined,
+): boolean {
+  return snapshot?.disposition === "card" && snapshot.title === BOX_REPLAY_PENDING_SOFT_TITLE;
+}
+
 /** Render-time privacy/UX boundary for both new and already-persisted errors. */
 export function errorPresentation(
   code: string | undefined,
   text: string | undefined,
   detail: string | undefined,
   waiverApplied = false,
+  context?: BoxReplayPresentationContext,
 ): ErrorPresentation {
   let normalized = normalizeTurnErrorCode(code);
   if (/MODEL_AUTHORITY_INVALID|MODEL_AUTHORITY_EXPIRED/i.test(`${code ?? ""}\n${text ?? ""}\n${detail ?? ""}`)) {
@@ -841,13 +872,22 @@ export function errorPresentation(
   // OCV5-620 (#dc9288ca): BOX_REPLAY_PENDING means the prior Box call is still
   // settling / billing-gated — work and charge may already be done. Prefer a
   // soft card (keep any partial answer) over pink「任务执行失败」.
-  if (isBoxReplayPendingDetail(text, detail)) {
+  // A sealed failure tape is the crashed record itself, not a call still
+  // resolving. Skip the "refresh for the full result" promise and use the
+  // normal failure card. Open tapes and non-error outcomes stay soft.
+  if (
+    isBoxReplayPendingDetail(text, detail) &&
+    !isSealedDispatchFailure({
+      _turnTapeComplete: context?.turnTapeComplete,
+      _dispatchOutcome: context?.dispatchOutcome,
+    })
+  ) {
     const rawText = text?.trim() ?? "";
     const { body: preTerminator } = splitTrailingTerminator(rawText);
     const partialAnswer =
       preTerminator && !looksLikeInternalError(preTerminator) ? preTerminator : "";
     return {
-      title: "结果正在收尾",
+      title: BOX_REPLAY_PENDING_SOFT_TITLE,
       message:
         "远端结果仍在确认中。已生成的内容已保留；稍后刷新即可看到完整结果，不会重复扣费。",
       ...(partialAnswer ? { bodyText: partialAnswer } : {}),
@@ -921,12 +961,16 @@ export function errorPresentation(
 /**
  * 第一次看到这条错误时写死展示。已有快照则原样返回，禁止按新错误码重算。
  * 静默终态写 `silent`，渲染器不出错误卡。
+ * 窄例外：已封口失败行上标题仍是「结果正在收尾」的快照按当前谓词重算。
+ * 未封口记录和其他标题保持不可变。
  */
 export function commitErrorCardSnapshot(
   message: ChatMessage,
   messageOverride?: string,
 ): "card" | "silent" | undefined {
-  if (message._errorCardSnapshot) return message._errorCardSnapshot.disposition;
+  const replaceStaleSoft =
+    isSealedDispatchFailure(message) && isStaleSoftBoxReplaySnapshot(message._errorCardSnapshot);
+  if (message._errorCardSnapshot && !replaceStaleSoft) return message._errorCardSnapshot.disposition;
   if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return undefined;
   if (isSilentTurnErrorCode(message._errorCode)) {
     message._errorCardSnapshot = { disposition: "silent" };
@@ -937,6 +981,10 @@ export function commitErrorCardSnapshot(
     message.text,
     message._errorDetail,
     message.usage?.waived === true,
+    {
+      turnTapeComplete: message._turnTapeComplete,
+      dispatchOutcome: message._dispatchOutcome,
+    },
   );
   const tone: "red" | "yellow" =
     presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
@@ -980,6 +1028,12 @@ export function freezeErrorCardSnapshots(
     }
     if (message._errorCardSnapshot?.disposition === "card") {
       message._errorHeldForRecovery = undefined;
+      // The soft title may already have been committed while the call still
+      // looked open. Once this same row is a sealed failure, recompute that
+      // one title. Every other card stays frozen.
+      if (isSealedDispatchFailure(message) && isStaleSoftBoxReplaySnapshot(message._errorCardSnapshot)) {
+        commitErrorCardSnapshot(message);
+      }
       continue;
     }
     if (

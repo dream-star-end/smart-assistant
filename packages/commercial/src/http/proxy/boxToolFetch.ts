@@ -10,7 +10,7 @@ import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
-import { runBoxToolContinuation } from "./boxToolContinuation.js";
+import { runBoxToolContinuation, BoxToolContinuationError } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { makeBoxNativeGcDelete, parseBoxNativeGcResult } from "./boxNativeGcFile.js";
 import { prepareBoxContinuation, preparedMatchesBody,
@@ -593,8 +593,13 @@ export class BoxToolFetch {
               // OCV5-328 / OCV5-377: a stream the decoder rejects (e.g. a model
               // safety stop) is as undeliverable as a rejected echo; stop the
               // run instead of holding the slot.
+              // A final whose keeper never proved worker_complete holds the
+              // slot the same way a rejected echo does. Stop once, bounded.
+              // This is not success: completeToolChain stays on the proof path.
               if (error instanceof BoxToolResultEchoError
-                || error instanceof BoxCliToolHandoffError) {
+                || error instanceof BoxCliToolHandoffError
+                || (error instanceof BoxToolContinuationError
+                  && error.code === "BOX_TOOL_TERMINAL_UNPROVEN")) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;
