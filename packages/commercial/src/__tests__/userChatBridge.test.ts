@@ -77,6 +77,8 @@ interface TestRig {
 
 async function startRig(opts: {
   resolve?: ResolveContainerEndpoint;
+  containerLinkEnabled?: boolean;
+  containerLinkHeartbeatMs?: number;
   maxPerUser?: number;
   maxFrameBytes?: number;
   maxBufferedBytes?: number;
@@ -122,6 +124,8 @@ async function startRig(opts: {
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
     resolveContainerEndpoint: (uid) => rig.resolveImpl!(uid),
+    containerLinkEnabled: opts.containerLinkEnabled,
+    containerLinkHeartbeatMs: opts.containerLinkHeartbeatMs,
     maxPerUser: opts.maxPerUser,
     maxFrameBytes: opts.maxFrameBytes,
     maxBufferedBytes: opts.maxBufferedBytes,
@@ -709,6 +713,8 @@ describe("userChatBridge — durable outbound frame ordering", () => {
 
   test("a permanent live-frame conflict skips one frame without closing or poisoning later seqs", async () => {
     const persisted: number[] = [];
+    const renewals: unknown[][] = [];
+    row.agent_container_id = "77";
     const portRef = { value: 0 };
     const rig = await startRig({
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 83 }),
@@ -2839,6 +2845,7 @@ function rawDispatchRow(input: {
 function helloTerminalBillingTrio(opts: {
   row?: Record<string, unknown> | null;
   lookups?: unknown[][];
+  linkRenewals?: unknown[][];
   /** Rows for readOpenDispatchEngineReady (persisted head of the open stream). */
   readyScanRows?: Array<{ payload: Buffer | null }>;
   readyScans?: unknown[][];
@@ -2851,6 +2858,10 @@ function helloTerminalBillingTrio(opts: {
         const text = typeof sql === "string"
           ? sql
           : String((sql as { text?: unknown })?.text ?? "");
+        if (/container_link_heartbeat/.test(text)) {
+          opts.linkRenewals?.push(params ?? []);
+          return { rows: [], rowCount: 1 };
+        }
         if (/SELECT status FROM users WHERE id/.test(text)) {
           return { rows: [{ status: "active" }], rowCount: 1 };
         }
@@ -4500,21 +4511,19 @@ describe("P2b entry freeze: user-chat-bridge Origin", () => {
   });
 });
 
-// UXE-A1(t1198u):浏览器断开超过 drain 后,open dispatch 的容器流不再随 drain 关掉 ——
-// bridge 转 headless 继续落帧(落帧即续 lease),直到 isFinal / PG 终态 / 在线桥接管。
-describe("UXE-A1 headless consumer for open dispatch streams", () => {
+// RF-link replaces A1: one container transport persists across browser detach/attach.
+describe("RF-link singleton transport for open dispatch streams", () => {
   const ENV_KEYS = [
     "DRAIN_BILLING_MS",
     "OC_DISPATCH_DRAIN_MS",
-    "OC_DISPATCH_HEADLESS_CHECK_MS",
-    "OC_DISPATCH_HEADLESS_LIMIT",
+    "OC_CONTAINER_LINK",
   ] as const;
   const saved = new Map<string, string | undefined>();
   before(() => {
     for (const key of ENV_KEYS) saved.set(key, process.env[key]);
     process.env.DRAIN_BILLING_MS = "50";
     process.env.OC_DISPATCH_DRAIN_MS = "100";
-    process.env.OC_DISPATCH_HEADLESS_CHECK_MS = "50";
+    process.env.OC_CONTAINER_LINK = "1";
   });
   after(() => {
     for (const key of ENV_KEYS) {
@@ -4536,16 +4545,17 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     blocks: [{ kind: "text", text: `t${frameSeq}` }],
   });
 
-  async function headlessRig(row: Record<string, unknown>) {
+  async function linkRig(row: Record<string, unknown>) {
     const persisted: number[] = [];
     const portRef = { value: 0 };
     const rig = await startRig({
       resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
       persistOutboundFrame: async (input) => { persisted.push(input.frameSeq); },
-      ...helloTerminalBillingTrio({ row }),
+      containerLinkHeartbeatMs: 50,
+      ...helloTerminalBillingTrio({ row, linkRenewals: renewals }),
     });
     portRef.value = rig.containerPort;
-    return { rig, persisted };
+    return { rig, persisted, renewals };
   }
 
   async function connect(rig: TestRig, uid: string): Promise<{ ws: WebSocket; container: WebSocket }> {
@@ -4560,7 +4570,7 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
   });
 
   test("drain 到期仍在跑 → 容器 WS 不关、断线期帧继续落库;isFinal 后收尾", async () => {
-    const { rig, persisted } = await headlessRig(acceptedRow("1201"));
+    const { rig, persisted, renewals } = await linkRig(acceptedRow("1201"));
     try {
       const { ws, container } = await connect(rig, "1201");
       container.send(frame(1));
@@ -4571,6 +4581,8 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
       await waitClose(ws);
       await new Promise<void>((resolve) => setTimeout(resolve, 400)); // > drain 100ms
       assert.equal(containerClosed, false, "open dispatch 的容器流不得随 drain 关闭");
+      assert.ok(renewals.length >= 2, "no output for 400ms still renews accepted lease");
+      assert.equal(rig.bridge.containerLinkSnapshots!()[0]?.subscribers, 0);
       container.send(frame(2));
       await waitFor(() => persisted.includes(2));
       container.send(frame(3, true));
@@ -4581,9 +4593,9 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     }
   });
 
-  test("没等到 isFinal,PG 判终态 → headless 收尾", async () => {
+  test("没等到 isFinal,PG 判终态 → 链路收尾", async () => {
     const row = acceptedRow("1202");
-    const { rig, persisted } = await headlessRig(row);
+    const { rig, persisted } = await linkRig(row);
     try {
       const { ws, container } = await connect(rig, "1202");
       container.send(frame(1));
@@ -4601,31 +4613,36 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     }
   });
 
-  test("重连的在线桥落了同一条流 → headless 桥放手,新桥继续", async () => {
-    const { rig, persisted } = await headlessRig(acceptedRow("1203"));
+  test("重连 attach 原链路,同一 live 帧只有一次落库并送达新订阅者", async () => {
+    const { rig, persisted } = await linkRig(acceptedRow("1203"));
     try {
       const first = await connect(rig, "1203");
       first.container.send(frame(1));
       await waitFor(() => persisted.includes(1));
-      let firstClosed = false;
-      first.container.once("close", () => { firstClosed = true; });
       first.ws.close();
-      await new Promise<void>((resolve) => setTimeout(resolve, 400));
-      assert.equal(firstClosed, false);
-
-      const second = await connect(rig, "1203");
-      second.container.send(frame(2));
-      await waitFor(() => firstClosed, 3000);
-      assert.ok(persisted.includes(2));
-      assert.equal(second.container.readyState, WebSocket.OPEN, "接管方的容器 WS 保持");
-      second.ws.close();
-    } finally {
-      await stopRig(rig);
-    }
+      await waitClose(first.ws);
+      const second = openClient(rig.gatewayPort, await makeJwt("1203"));
+      const frames = frameCollector(second);
+      await new Promise<void>((r) => second.once("open", r));
+      await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
+      const hello = JSON.stringify({type: "inbound.hello", peers: [{peerId: SESSION, agentId: "main", lastFrameSeq: 1}]});
+      second.send(hello);
+      await waitHelloForwarded(rig, hello);
+      first.container.send(frame(2));
+      await waitFor(() => persisted.includes(2));
+      let received: { frameSeq?: number };
+      do { received = JSON.parse(await frames.next()); } while (received.frameSeq !== 2);
+      assert.equal(rig.containerSockets.length, 1);
+      assert.deepEqual(persisted, [1, 2]);
+      assert.equal(first.container.readyState, WebSocket.OPEN);
+      first.container.send(frame(3, true));
+      await waitFor(() => persisted.includes(3));
+      second.close();
+    } finally { await stopRig(rig); }
   });
 
   test("没有 open dispatch 流 → user close 立即关容器 WS(行为不变)", async () => {
-    const { rig } = await headlessRig(acceptedRow("1204"));
+    const { rig } = await linkRig(acceptedRow("1204"));
     try {
       const { ws, container } = await connect(rig, "1204");
       const closed = new Promise<void>((resolve) => container.once("close", () => resolve()));
@@ -4636,8 +4653,8 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     }
   });
 
-  test("drain 中 shutdown → drain 到期不再转 headless(容器 WS 照旧关闭)", async () => {
-    const { rig, persisted } = await headlessRig(acceptedRow("1206"));
+  test("接管后 shutdown → 所有链路与心跳有序关闭", async () => {
+    const { rig, persisted } = await linkRig(acceptedRow("1206"));
     let stopped = false;
     try {
       const { ws, container } = await connect(rig, "1206");
@@ -4662,9 +4679,9 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     }
   });
 
-  test("OC_DISPATCH_HEADLESS_LIMIT=0 → drain 到期照旧关闭", async () => {
-    process.env.OC_DISPATCH_HEADLESS_LIMIT = "0";
-    const { rig, persisted } = await headlessRig(acceptedRow("1205"));
+  test("OC_CONTAINER_LINK=0 → 恢复旧 bridge 关闭行为", async () => {
+    process.env.OC_CONTAINER_LINK = "0";
+    const { rig, persisted } = await linkRig(acceptedRow("1205"));
     try {
       const { ws, container } = await connect(rig, "1205");
       container.send(frame(1));
@@ -4673,9 +4690,10 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
       const t0 = Date.now();
       ws.close();
       const elapsed = (await closedAt) - t0;
-      assert.ok(elapsed >= 80, `应等满 drain 窗口,实测 ${elapsed}ms`);
+      assert.ok(elapsed < 1000, `accepted stream no longer retains a transport: ${elapsed}ms`);
+      assert.deepEqual(rig.bridge.containerLinkSnapshots!(), []);
     } finally {
-      process.env.OC_DISPATCH_HEADLESS_LIMIT = undefined;
+      process.env.OC_CONTAINER_LINK = "1";
       await stopRig(rig);
     }
   });

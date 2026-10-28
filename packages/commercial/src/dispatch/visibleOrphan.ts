@@ -24,6 +24,9 @@ export interface VisibleOrphanEvidence {
   tapePartCount: number | null;
   tapePartsRows: number;
   lastFrameAtMs: number | null;
+  /** Positive exact-attempt engine probe, independent of browser/frame delivery.
+   * A transport pong or dispatch lease alone is not engine evidence. */
+  lastEngineAliveAtMs?: number | null;
   acceptedOrAdmittedAtMs: number;
   containerRunning: boolean;
   nowMs: number;
@@ -107,9 +110,11 @@ export function firstVisibleAtMsForDispatch(
 }
 
 export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphanAction {
-  const quietMs = row.lastFrameAtMs === null
-    ? row.nowMs - row.acceptedOrAdmittedAtMs
-    : Math.max(0, row.nowMs - row.lastFrameAtMs);
+  const lastAliveAt = Math.max(
+    row.lastFrameAtMs ?? row.acceptedOrAdmittedAtMs,
+    row.lastEngineAliveAtMs ?? row.acceptedOrAdmittedAtMs,
+  );
+  const quietMs = Math.max(0, row.nowMs - lastAliveAt);
   const ageMs = row.nowMs - row.acceptedOrAdmittedAtMs;
   if (row.tapeVisibleAt !== null) return "converge_only";
   const partsComplete =

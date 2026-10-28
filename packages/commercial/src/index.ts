@@ -1,3 +1,4 @@
+import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
 import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
@@ -5913,7 +5914,9 @@ export async function registerCommercial(
     })();
   };
 
+  const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
+    containerLinkEnabled: containerLinkOn,
     modelSwitchCost,
     jwtSecret,
     issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
@@ -6666,6 +6669,7 @@ export async function registerCommercial(
           },
         });
         const reconcilerDeps = {
+          containerLinkEnabled: containerLinkOn,
           pool: getPool(),
           container,
           stuckThresholdMs,

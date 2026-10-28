@@ -88,6 +88,9 @@ export const INITIAL_SWEEP_BATCH_LIMIT = 20;
  * 命中 `idx_turn_dispatches_open` (open 状态 partial index) 与 terminal_at;
  * `$containerCol` 为 agent_containers 行别名/列名,`$minParam` 为分钟数占位符。
  */
+// last_ws_activity is browser-subscriber activity (ContainerLink heartbeats do
+// not update it). Open dispatches protect running work separately; once terminal,
+// a link without subscribers does not prevent the ordinary idle cutoff.
 export function recentTurnPredicate(containerIdExpr: string, minParam: string): string {
   return `NOT EXISTS (
               SELECT 1 FROM turn_dispatches td
