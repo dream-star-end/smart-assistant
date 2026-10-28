@@ -23,6 +23,9 @@ test('every catalog error has safe Chinese copy, known actions and a valid wire 
 
 test('display aliases do not modify billing or automatic recovery policy', () => {
   assert.equal(getUserError('PROMPT_TOO_LARGE').code, 'context_too_long')
+  assert.equal(getUserError('ANTIGRAVITY_PROMPT_TOO_LARGE').code, 'context_too_long')
+  assert.equal(getUserError('BOX_CONTEXT_TOO_LARGE').code, 'request_too_large')
+  assert.equal(getUserError('ANTIGRAVITY_CREDENTIAL_EXPIRED').code, 'platform_credential_expired')
   assert.equal(getUserError('DISPATCH_NOT_ACCEPTED').code, 'durable_dispatch_unavailable')
   assert.equal(getUserError('RUNNER_ERROR').code, 'runner_crashed')
   assert.deepEqual(turnErrorSemantics('PROMPT_TOO_LARGE'), { retryable: false, cta: 'none' })

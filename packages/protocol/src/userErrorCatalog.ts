@@ -92,6 +92,20 @@ const CTA_ACTIONS: Record<TurnErrorCta, readonly UserErrorAction[]> = {
   refresh: ['refresh'], switch_model: ['switch_model'], relogin: ['relogin'],
   new_session: ['new_session'], none: [],
 }
+const HTTP_COPY: Record<string, Copy> = {
+  invalid_credentials: ['auth', '邮箱或密码不正确，请检查后重新输入。', ['edit_message', 'relogin']],
+  email_not_verified: ['auth', '邮箱还未验证，请完成邮箱验证后再登录。', ['relogin']],
+  turnstile_failed: ['input', '安全验证未通过，请刷新页面后再试。', ['refresh']],
+  email_domain_blocked: ['permission', '暂不支持这个邮箱域名，请换一个邮箱或联系管理员。', ['edit_message', 'contact_admin']],
+  weak_password: ['input', '密码强度不够，请按页面要求设置更安全的密码。', ['edit_message']],
+  model_switch_insufficient_balance: ['billing', '可用积分不足，暂时无法完成模型切换。请补充积分或联系管理员。', ['topup', 'contact_admin']],
+  model_switch_in_progress: ['state', '模型正在切换，请等待切换完成后再发送消息。', ['wait']],
+  model_switch_expired: ['conflict', '这次模型切换确认已过期，请重新选择模型。', ['switch_model']],
+  model_switch_stale: ['conflict', '会话状态已变化，请重新选择模型并确认切换。', ['switch_model']],
+  model_switch_failed: ['model', '模型切换未完成，请重新选择模型；如果持续失败，请联系管理员。', ['switch_model', 'contact_admin']],
+  model_authority_rejected: ['model', '本轮模型配置未通过校验，请重新选择模型后发送。', ['switch_model', 'contact_admin']],
+  provision_timeout: ['connection', '运行环境启动超时，请稍后重试；如果持续失败，请联系管理员。', ['wait', 'contact_admin']],
+}
 function entry(code: string, copy: Copy, retryable = false): UserError {
   return { code, category: copy[0], retryable, userMessageKey: `errors.${code}`, message: copy[1], actions: copy[2] }
 }
@@ -104,7 +118,7 @@ export const USER_ERROR_ACTION_LABELS: Record<UserErrorAction, string> = {
 
 export const USER_ERROR_CATALOG: Readonly<Record<string, UserError>> = Object.freeze({
   ...Object.fromEntries(Object.entries(HTTP_ERROR_GROUPS).flatMap(([category, codes]) =>
-    codes.map((code) => [code, entry(code, GROUP_COPY[category as UserErrorCategory])]))),
+    codes.map((code) => [code, entry(code, HTTP_COPY[code] ?? GROUP_COPY[category as UserErrorCategory])]))),
   ...Object.fromEntries((Object.keys(TURN_ERROR_TAXONOMY) as TurnErrorCode[]).map((code) => {
     const semantics = turnErrorSemantics(code)
     const [category, message] = TURN_COPY[code]
@@ -127,8 +141,12 @@ export const USER_ERROR_CATALOG: Readonly<Record<string, UserError>> = Object.fr
 /** Display-only aliases; deliberately do not change normalizeTurnErrorCode's recovery/billing semantics. */
 const DISPLAY_ALIASES: Record<string, string> = {
   prompt_too_large: 'context_too_long', prompt_too_long: 'context_too_long',
+  antigravity_prompt_too_large: 'context_too_long',
   context_length_exceeded: 'context_too_long', max_context_length: 'context_too_long',
   payload_too_large: 'request_too_large', body_too_large: 'request_too_large',
+  body_field_too_large: 'request_too_large', box_context_too_large: 'request_too_large',
+  antigravity_credential_expired: 'platform_credential_expired',
+  antigravity_route_expired: 'upstream_failed', antigravity_error_step: 'upstream_failed',
   dispatch_not_accepted: 'durable_dispatch_unavailable', codex_unavailable: 'codex_route_unavailable',
 }
 export function getUserError(rawCode: unknown): UserError {

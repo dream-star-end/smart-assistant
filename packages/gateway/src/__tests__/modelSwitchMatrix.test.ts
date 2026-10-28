@@ -38,7 +38,8 @@ for (const engine of engines) {
     const adapter = new CcbAdapter(opts, runner as unknown as SubprocessRunner)
     Object.defineProperty(adapter, 'engineId', { value: engine })
     Object.assign(adapter.capabilities, {
-      historyMode: engine === 'antigravity' ? 'stateless-replay' : 'native-resume',
+      // All six production adapters currently advertise native-resume.
+      historyMode: 'native-resume',
       maxPromptBytes: 96 * 1024,
     })
     runners.set(adapter, runner)
@@ -116,7 +117,7 @@ for (const from of engines) for (const to of engines) {
     assert.match(String(inputs[0][0]?.text), /TOOL_MARKER/)
     assert.equal(inputs[0][2], image)
     assert.match(String(inputs[1]), /HISTORY_MARKER/)
-    assert.equal(notices.length, from === to && to === 'antigravity' ? 0 : 1)
+    assert.equal(notices.length, 1)
     assert.equal(target.toolUseIdToName.size, 0)
   })
 }

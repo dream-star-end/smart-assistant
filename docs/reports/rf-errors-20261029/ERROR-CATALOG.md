@@ -1,6 +1,6 @@
 # 用户错误盘点与展示契约
 
-基于任务 worktree 的 AST 静态盘点：602 个 literal 候选错误码，含大小写别名。完整位置见 public-error-inventory.json；原始候选含埋点/扫描规则，见 error-inventory.json。目录以 protocol/turnErrorTaxonomy 的回合语义为权威，不改自动恢复或计费策略。
+基于任务 worktree 的 AST 静态盘点：602 个 literal 候选错误码，含大小写别名。完整位置见任务交接目录 rf-errors/public-error-inventory.json；原始候选（含埋点/扫描规则）保存在同目录 error-inventory.json。目录以 protocol/turnErrorTaxonomy 的回合语义为权威，不改自动恢复或计费策略。
 
 ## 覆盖与边界
 
@@ -11,6 +11,12 @@
 - 单回合耗尽/暂停持久卡新增 _userError；UI 正文与动作需消费此字段。
 - UserError={code,category,retryable,userMessageKey,message,actions}；actions 是展示提示，不构成副作用重试授权。
 - longctx 键：context_too_long / request_too_large。PROMPT_TOO_LARGE 等仅在展示别名层归一，不改变旧错误 taxonomy。
+
+## 容器原始异常与统一语义码
+
+CCB 的 `src/services/api/errors.ts` 输出自然语言/API Error 文本（包括 Prompt is too long），`src/constants/errorIds.ts` 是内部诊断 ID，不作为展示目录键。容器 gateway/errorClassify.ts 先把这些文本及引擎异常归一到 turn taxonomy；目录覆盖全部 taxonomy 键。未经归一的未知供应商异常仍用安全通用提示，原文只保留诊断字段。
+
+展示层额外认出既有分类器中的精确前缀：ANTIGRAVITY_PROMPT_TOO_LARGE → context_too_long；BODY_FIELD_TOO_LARGE / BOX_CONTEXT_TOO_LARGE → request_too_large；ANTIGRAVITY_CREDENTIAL_EXPIRED → platform_credential_expired；ANTIGRAVITY_ROUTE_EXPIRED / ANTIGRAVITY_ERROR_STEP → upstream_failed。这些别名不修改重试和计费分类器。
 
 ## 逐码位置
 
