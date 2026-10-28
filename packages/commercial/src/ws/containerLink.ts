@@ -202,9 +202,7 @@ class ContainerLink {
         if (!pending || pending.wireId !== frame.id) continue;
         const { originalId } = pending;
         handle.pendingPing = null;
-        const restored = { ...frame };
-        if (originalId === undefined) delete restored.id;
-        else restored.id = originalId;
+        const restored = { ...frame, id: originalId };
         handle.emit("message", Buffer.from(JSON.stringify(restored)), false);
         return;
       }

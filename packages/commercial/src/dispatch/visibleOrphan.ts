@@ -110,10 +110,8 @@ export function firstVisibleAtMsForDispatch(
 }
 
 export function classifyVisibleOrphan(row: VisibleOrphanEvidence): VisibleOrphanAction {
-  const lastAliveAt = Math.max(
-    row.lastFrameAtMs ?? row.acceptedOrAdmittedAtMs,
-    row.lastEngineAliveAtMs ?? row.acceptedOrAdmittedAtMs,
-  );
+  const lastFrameOrAdmission = row.lastFrameAtMs ?? row.acceptedOrAdmittedAtMs;
+  const lastAliveAt = Math.max(lastFrameOrAdmission, row.lastEngineAliveAtMs ?? lastFrameOrAdmission);
   const quietMs = Math.max(0, row.nowMs - lastAliveAt);
   const ageMs = row.nowMs - row.acceptedOrAdmittedAtMs;
   if (row.tapeVisibleAt !== null) return "converge_only";

@@ -2352,10 +2352,10 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
       assertNoDestructive(pool)
     })
 
-    test('RF-link running after 6h remains live acceptedPage=' + acceptedPage, async () => {
+    test(`RF-link running after 6h remains live acceptedPage=${acceptedPage}`, async () => {
       _resetVisibleOrphanScanOffset()
-      const now = Date.now(),
-        row = rowAt(now, 6 * 3_600_000)
+      const now = Date.now()
+      const row = rowAt(now, 6 * 3_600_000)
       const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
       let probes = 0
       const counts = await runReconcileTick({

@@ -29,7 +29,8 @@ test("RF-link: concurrent dial is singleflight; attestation, grants, billing, re
   const dial = async () => { dials++; return physical as unknown as WebSocket; };
   try {
     const [one, two] = await Promise.all([registry.connect(1n, 7, dial), registry.connect(1n, 7, dial)]);
-    const a: Record<string, any>[] = [], b: Record<string, any>[] = [];
+    const a: Record<string, any>[] = [];
+    const b: Record<string, any>[] = [];
     one.on("message", (data) => a.push(JSON.parse(String(data))));
     two.on("message", (data) => b.push(JSON.parse(String(data))));
     getContainerLinkHandle(one)!.activate();
@@ -63,7 +64,8 @@ test("RF-link: two tabs with the same ping id receive only their own restored po
   try {
     const a = await registry.connect(1n, 1, () => physical as unknown as WebSocket);
     const b = await registry.connect(1n, 1, () => { throw new Error("must attach"); });
-    const gotA: unknown[] = [], gotB: unknown[] = [];
+    const gotA: unknown[] = [];
+    const gotB: unknown[] = [];
     a.on("message", (data) => gotA.push(JSON.parse(String(data))));
     b.on("message", (data) => gotB.push(JSON.parse(String(data))));
     getContainerLinkHandle(a)!.activate(); getContainerLinkHandle(b)!.activate();
@@ -84,7 +86,8 @@ test("RF-link: model switch control response returns to its requesting tab", asy
   try {
     const a = await registry.connect(1n, 1, () => physical as unknown as WebSocket);
     const b = await registry.connect(1n, 1, () => { throw new Error("must attach"); });
-    const gotA: unknown[] = [], gotB: unknown[] = [];
+    const gotA: unknown[] = [];
+    const gotB: unknown[] = [];
     a.on("message", (data) => gotA.push(JSON.parse(String(data))));
     b.on("message", (data) => gotB.push(JSON.parse(String(data))));
     getContainerLinkHandle(a)!.activate(); getContainerLinkHandle(b)!.activate();
