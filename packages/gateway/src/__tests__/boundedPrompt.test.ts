@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { getUserError } from '@openclaude/protocol'
 import { prepareBoundedPrompt } from '../engine/boundedPrompt.js'
 import type { EngineContentEvent } from '../engine/engineEvents.js'
 import { renderHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
@@ -54,7 +55,9 @@ test('an oversized platform envelope still fails honestly and removes only its u
   const events: EngineContentEvent[] = []
   try {
     await assert.rejects(prepareBoundedPrompt({ input: 'x'.repeat(5000), serialize: (s) => serialize('p'.repeat(4096) + s), maxBytes: 4096, cwd, engine: 'antigravity', onEvent: (e) => events.push(e) }), (error: Error) => {
-      assert.equal(classifyRunError(error.message).code, 'request_too_large')
+      const code = classifyRunError(error.message).code
+      assert.equal(code, 'request_too_large')
+      assert.equal(getUserError(code).userMessageKey, 'errors.request_too_large')
       return true
     })
     assert.equal(events.some((e) => e.kind === 'context_compacted'), false)
