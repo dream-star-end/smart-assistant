@@ -189,13 +189,15 @@ trap 'rc=$?; reap_master_build_jobs; event cleanup; exit "$rc"' EXIT
 task() { event started; sleep .2; event done; }
 master_build_job_start slow task
 while :; do sleep .05; done
-`], { env: f.env, stdio: 'ignore' });
+`], { env: f.env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
   t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
   const exited = new Promise((resolve) => child.once('exit', resolve));
   for (let i = 0; i < 200 && !existsSync(f.env.EVENTS); i++) await new Promise((r) => setTimeout(r, 10));
   assert.ok(existsSync(f.env.EVENTS));
   child.kill('SIGTERM');
-  assert.equal(await exited, 143);
+  assert.equal(await exited, 143, stderr);
   assert.deepEqual(events(f), ['started', 'done', 'cleanup']);
 });
 
