@@ -4,6 +4,7 @@
  */
 
 import type { AuthoritySigner } from "./authoritySigner.js";
+import type { AuthorityKeyCensus } from "./authorityKeyCensus.js";
 import type { ModelCatalogCache } from "../billing/modelCatalog.js";
 
 export interface BridgeMetricSink {
