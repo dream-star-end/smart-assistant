@@ -165,6 +165,8 @@ test("displayAddress", () => {
   expect(displayAddress("https://www.example.com/")).toEqual({ host: "example.com", path: "" });
   expect(displayAddress("http://127.0.0.1:8765/demo.html?x=1")).toEqual({ host: "127.0.0.1:8765", path: "/demo.html?x=1" });
   expect(displayAddress("not a url")).toEqual({ host: "not a url", path: "" });
+  // 浏览器刚开、还没导航时停在 about:blank:URL 解析出空 host + 路径 "blank",面板曾把它写成「blank」。
+  expect(displayAddress("about:blank")).toEqual({ host: "空白页", path: "" });
 });
 
 test("isBrowserStepMessage(首屏判定)与完整解析同口径", () => {
