@@ -223,6 +223,7 @@ for (const load of ['8.00', '99.00', 'garbage', '-1', 'NaN']) {
     const f = fixture(t, load);
     const r = run(f, `
 MASTER_GATE_IDLE_TIMEOUT_S=0
+sleep() { event forbidden-sleep; return 1; }
 task() { event forbidden; }
 if master_build_job_start blocked task; then exit 90; fi
 echo '0.00 0 0 1/1 1' >"$MASTER_GATE_LOADAVG"
@@ -232,7 +233,8 @@ event rejected
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(events(f), ['rejected']);
     assert.equal(notes(f)['job.blocked.admissionFailure'], 'admission-timeout');
-    assert.equal(notes(f)['job.blocked.admissionWaitSec'], '0');
+    // A zero budget forbids retry sleep; sampling itself can cross a wall-clock second.
+    assert.match(notes(f)['job.blocked.admissionWaitSec'], /^[0-9]+$/);
     assert.equal(notes(f)['job.blocked.pgid'], undefined);
   });
 }
