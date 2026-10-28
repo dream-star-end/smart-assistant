@@ -39,7 +39,9 @@ not a measured result of this draft.
 5. Tip validity: fetch/verify remote selfhost tip at preparation entry, completion
    and again under deploy.lock before any live mutation. A different tip rejects
    the prepared candidate, even if the old SHA remains an ancestor. Check local
-   HEAD too before flip (worker owns canonical ff). No implicit re-pin; a stale
+   HEAD too before flip (worker owns canonical ff). Prepare may be ahead of HEAD;
+   its target commit must be available locally and its controller/guard files must
+   match the running checkout, otherwise refresh canonical before preparing. No implicit re-pin; a stale
    train terminates without production writes and a later train prepares new tip.
    Once a flip has passed this boundary, finish that pinned operation rather than
    interrupting a partially mutated saga because a later merge arrives.
@@ -58,8 +60,10 @@ not a measured result of this draft.
    under that same mutex; artifacts are left to normal GC, never eagerly deleted.
 8. Move mutable setup (`ensure_selfhost_env_keys`, auxiliary units/proxy,
    model-authority, asset pool seeding) to the locked path. Re-run live-dependent
-   preflight, trailer and P0 overlay checks at flip. L0 runs before preparation;
-   its build-space admission is not repeated after consuming that space. E2 still
+   preflight, trailer and P0 overlay checks at flip. L0 runs on a cache miss before building; a reusable receipt has already passed
+   it. Its build-space admission is not repeated after consuming that space.
+   Prepared L0 pins the immutable git object rather than requiring current HEAD;
+   remote-tip/controller equivalence is verified immediately before it. E2 still
    rechecks the live migration gap under the lock. Preparation checks the
    trailer gate and build admission before expensive work. Use the pinned staging
    validator for platform seeds. Do not modify gate lists or parity coverage.
@@ -101,3 +105,10 @@ not a measured result of this draft.
   this session must not run a production prepare, flip or large build.
 
 Plan review: APPROVED (independent Codex plan reviewer, 2026-10-28).
+
+R1 code review fixes: update both legacy/split env-drift wiring and the balanced
+idle-test snippet without changing their assertions; the parity mutation fixture
+now removes both real trailer calls. Ahead-of-HEAD preparation is admitted only
+for an available exact remote tip with byte-identical controller/guard definitions.
+Cold L0 admission runs after the receipt lookup, so cached flip needs no second
+8 GiB reservation. Add behavioral cases for all three R1 P1 reproductions.

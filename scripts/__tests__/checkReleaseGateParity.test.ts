@@ -195,11 +195,12 @@ function inCmdDeploy(deploy: string, change: (body: string) => string): string {
   return deploy.slice(0, start) + change(deploy.slice(start, end)) + deploy.slice(end);
 }
 
+// P4 has cold-prepare and locked/legacy calls: mutate every call to test genuine absence.
 test("red: the deploy-stage trailer gate is no longer really called (Codex final r1)", () => {
   const cases: [string, (d: string) => string][] = [
-    ["call removed, mentions kept", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', "true"))],
-    ["call only in a comment", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', 'true # assert_fix_trailers "$sha"'))],
-    ["call only echoed", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', 'echo assert_fix_trailers "$sha"'))],
+    ["call removed, mentions kept", (d) => inCmdDeploy(d, (b) => b.replaceAll('assert_fix_trailers "$sha"', "true"))],
+    ["call only in a comment", (d) => inCmdDeploy(d, (b) => b.replaceAll('assert_fix_trailers "$sha"', 'true # assert_fix_trailers "$sha"'))],
+    ["call only echoed", (d) => inCmdDeploy(d, (b) => b.replaceAll('assert_fix_trailers "$sha"', 'echo assert_fix_trailers "$sha"'))],
     ["function no longer runs the gate", (d) => d.replace(/"\$FIX_TRAILER_GATE" --repo/, "true --repo")],
     ["variable points elsewhere", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, 'FIX_TRAILER_GATE="$SCRIPT_DIR/other.sh"')],
     // Codex fresh r3: a decoy assignment in a heredoc, and a later reassignment

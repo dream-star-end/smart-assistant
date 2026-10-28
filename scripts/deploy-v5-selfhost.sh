@@ -2123,7 +2123,6 @@ $dirty
   sha="$(source_commit)"
   if [[ "$PLATFORM_FROM_HEAD" == 1 && "$DRY" != 1 ]]; then
     lease_train_begin "$sha"
-    selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"
     assert_fix_trailers "$sha"
     selfhost_prepare_candidate "$sha"
     selfhost_prepared_enter_flip "$sha"
@@ -2134,13 +2133,13 @@ $dirty
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
   cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
-  [[ "$SELFHOST_SPLIT_PREPARED" == 1 ]] || ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \
     || die "缺 live symlink $MASTER_LIVE_LINK。本 --deploy 假定首次翻转已完成。
 补救: --cutover --release=<已有 rel-*> 完成首次翻转,或跑应急 restore-worktree-units.sh。"
   if [[ "$SELFHOST_SPLIT_PREPARED" != 1 ]]; then
+    ensure_selfhost_env_keys
     seed_web_assets_pool_from_live
     ensure_node_modules
     install_aux_units

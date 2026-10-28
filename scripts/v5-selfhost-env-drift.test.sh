@@ -106,8 +106,8 @@ out="$(bash "$DRIFT" --env "$E.9" --template "$TEMPLATE")" && [[ "$out" == "ENV_
 grep -qF 'source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"' "$DEPLOY" \
   && awk '/^assert_env_key_drift\(\) \{/{f=1} f {print} f && /^}/{exit}' "$ENVLIB" \
     | grep -qF 'bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV"' \
-  && awk '/^cmd_deploy\(\) \{/{f=1} f && /^  ensure_selfhost_env_keys$/{e=NR} f && /^  ensure_model_authority$/{m=NR} f && /^  assert_env_key_drift$/{d=NR} f && /^}/{exit} END{exit !(e && m && d && d>e && d>m)}' "$DEPLOY" \
-  && ok "W1 --deploy 在 ensure_selfhost_env_keys 与 ensure_model_authority 补齐之后才跑漂移检查" || bad "W1 --deploy 漂移检查位置不对"
+  && awk '/^(cmd_deploy|cmd_cutover)\(\) \{/{f=1;e=m=d=0} f && /^[[:space:]]+ensure_selfhost_env_keys$/{e=NR} f && /^[[:space:]]+ensure_model_authority$/{m=NR} f && /^[[:space:]]+assert_env_key_drift$/{d=NR} f && /^}/{if (!(e && m && d && d>e && d>m)) bad=1; n++; f=0} END{exit !(n==2 && !bad)}' "$DEPLOY" \
+  && ok "W1 legacy deploy 与 prepared cutover 都在 env/model 补齐之后才跑漂移检查" || bad "W1 --deploy 漂移检查位置不对"
 
 echo "env drift tests: $pass passed, $fail failed"
 [[ "$fail" == 0 ]]

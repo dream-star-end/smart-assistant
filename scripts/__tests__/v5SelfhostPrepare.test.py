@@ -55,6 +55,7 @@ class Prepared(unittest.TestCase):
             fn('acquire_selfhost_deploy_lock'), fn('selfhost_lock_holder_info'),
             'release_policy_mutation_barrier() { :; }; selfhost_backup_lock_holder() { return 1; }',
             'master_web_dist_key() { echo web-inputs; }',
+            'selfhost_release_preflight() { [[ "${LOW_SPACE:-0}" == 0 ]] || die low-build-space; }',
             'docker() { printf "sha256:%064d\\n" 1; }',
             # Isolate expensive builders, but exercise actual orchestration and receipt IO.
             'build_master_release() {',
@@ -136,6 +137,59 @@ wait "$first"
         self.assertTrue(self.receipt.exists())
         self.prepare()
         self.assertEqual((self.t / 'events').read_text().splitlines().count('build'), 1)
+
+    def test_prepares_remote_tip_ahead_of_head_while_previous_flip_holds_lock(self):
+        old = self.sha
+        self.advance()
+        self.sha = self.git('rev-parse', 'HEAD')
+        self.git('reset', '-q', '--hard', old)
+        self.bash(f'SHA={self.sha}; LEASE_TARGET_SHA="$SHA"\n' + '''
+preflight_common() { :; }; assert_fix_trailers() { :; }
+(exec 8>"$SELFHOST_DEPLOY_LOCK"; flock 8; touch "$T/locked"; sleep 1) & holder=$!
+while [[ ! -e "$T/locked" ]]; do sleep .01; done
+cmd_prepare
+wait "$holder"
+''')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), old)
+        self.assertEqual(json.loads(self.receipt.read_text())['sourceCommit'], self.sha)
+
+    def test_controller_change_requires_refresh_even_when_tip_object_exists(self):
+        old = self.sha
+        (self.repo / 'scripts').mkdir()
+        (self.repo / 'scripts/deploy-v5-selfhost.sh').write_text('# new controller\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'controller')
+        self.git('push', '-q', 'origin', 'HEAD')
+        target = self.git('rev-parse', 'HEAD')
+        self.git('reset', '-q', '--hard', old)
+        result = self.bash(f'selfhost_prepare_candidate {target}', ok=False)
+        self.assertIn('changes the build controller', result.stderr)
+        self.assertFalse((self.t / 'events').exists())
+
+    def test_receipt_reuse_needs_no_second_build_space_admission(self):
+        self.prepare()
+        self.bash('LOW_SPACE=1; selfhost_prepare_candidate "$SHA"; selfhost_prepared_enter_flip "$SHA"')
+        self.assertEqual((self.t / 'events').read_text().splitlines().count('build'), 1)
+        self.bash('selfhost_prepare_lock; selfhost_prepared_state remove "$SHA"; selfhost_prepare_unlock')
+        self.bash('LOW_SPACE=1; selfhost_prepare_candidate "$SHA"', ok=False)
+        self.assertFalse(self.receipt.exists())
+
+    def test_actual_l0_accepts_immutable_prepare_pin_ahead_of_head(self):
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.git('reset', '-q', '--hard', self.sha)
+        source = (ROOT / 'scripts/v5-selfhost-master-release-lib.sh').read_text()
+        actual = re.search(r'^selfhost_release_preflight\(\) \{.*?^\}', source, re.M | re.S)[0]
+        self.script += '\n' + actual
+        self.bash('''
+MASTER_LIVE_LINK="$T/live"; RPF_MIN_FREE_KB=1
+mlog() { :; }; rpf_reset() { :; }; rpf_add() { echo "$1:$2" >>"$T/l0"; }
+rpf_check_source_pin() { die unexpectedly-requires-head; }
+rpf_check_workspace_links() { :; }; rpf_check_migrations() { :; }
+rpf_check_proof_db() { :; }; rpf_check_disk() { :; }; master_gate_base_dsn() { :; }
+rpf_report() { :; }; rpf_summary() { :; }
+''' + f'selfhost_release_preflight {target} prepared')
+        self.assertIn('ok:source-pin', (self.t / 'l0').read_text())
 
     def test_failed_gate_never_publishes(self):
         self.bash('FAIL_BUILD=1; selfhost_prepare_candidate "$SHA"', ok=False)

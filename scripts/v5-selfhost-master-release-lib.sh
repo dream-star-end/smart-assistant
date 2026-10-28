@@ -710,7 +710,7 @@ find_master_release_donor() { # <staging-lock>
 # shellcheck source=scripts/lib/v5-release-preflight.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-release-preflight.sh"
 
-selfhost_release_preflight() { # <target-sha>
+selfhost_release_preflight() { # <target-sha> [prepared: immutable source may be ahead of HEAD]
   local target="$1" live from=""
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
   if [[ -n "$live" && -f "$live/.complete" ]]; then
@@ -718,7 +718,17 @@ selfhost_release_preflight() { # <target-sha>
   fi
   mlog "── L0 发车预检(只读:不建库、不加锁、不写标记;OCV5-581)target=${target:0:12} ──"
   rpf_reset
-  rpf_check_source_pin "$REPO_ROOT" "$target"
+  if [[ "${2:-head}" == prepared ]]; then
+    # selfhost_prepare_assert_tip already verified the exact remote tip/controller.
+    # A prebuild is allowed ahead of canonical HEAD; archive/object identity is its pin.
+    if [[ "$target" =~ ^[0-9a-f]{40}$ ]] && git -C "$REPO_ROOT" cat-file -e "$target^{commit}"; then
+      rpf_add ok source-pin "prepared immutable source ${target:0:12}"
+    else
+      rpf_add fail source-pin "prepared source is not an available commit"
+    fi
+  else
+    rpf_check_source_pin "$REPO_ROOT" "$target"
+  fi
   rpf_check_workspace_links "$REPO_ROOT" 1
   rpf_check_migrations "$REPO_ROOT" "$from" "$target"
   rpf_check_proof_db "$REPO_ROOT" gate-db "$(master_gate_base_dsn)"

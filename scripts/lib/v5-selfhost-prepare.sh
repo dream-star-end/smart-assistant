@@ -32,8 +32,14 @@ selfhost_prepare_assert_tip() { # <sha>; no ref update, live state or canonical 
     || die "cannot verify selfhost remote tip; prepared candidate refused"
   [[ "$tip" == "$sha"$'\t'refs/heads/feat/v5-selfhost ]] \
     || die "selfhost tip changed; discard prepared $sha and prepare the new tip"
-  [[ "$(source_commit)" == "$sha" ]] \
-    || die "canonical HEAD changed; prepared candidate refused"
+  git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" \
+    || die "prepared source object missing; fetch the selfhost tip first"
+  # Ahead-of-HEAD preparation may use this controller only when its build/guard
+  # definitions are byte-identical to the target. Gate scripts themselves execute
+  # from the pinned archive. Controller changes require refreshing the checkout.
+  git -C "$REPO_ROOT" diff --quiet "$sha" -- scripts/deploy-v5-selfhost.sh \
+    scripts/v5-selfhost-master-release-lib.sh scripts/v5-runtime-release-lib.sh scripts/lib \
+    || die "prepared source changes the build controller; refresh canonical before preparing"
 }
 
 selfhost_prepare_identity() { # must run with artifact mutex held
@@ -91,6 +97,9 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
     selfhost_prepared_state remove "$sha" || die "cannot invalidate rejected receipt"
     die "prepared candidate damaged or inputs changed; receipt invalidated, run prepare again"
   fi
+  # L0 build-space admission runs only when a build is needed. A valid sealed
+  # receipt already passed it; flip does not allocate another candidate tree.
+  selfhost_release_preflight "$sha" prepared
   MASTER_RUNTIME_BG_AFTER_ADMISSION=1
   build_master_release "$sha"
   [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "prepared master is not sealed"
@@ -111,6 +120,8 @@ selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lo
   tsum_mark A.flip-lock-wait 2>/dev/null || :
   acquire_selfhost_deploy_lock
   selfhost_prepare_assert_tip "$sha"
+  [[ "$(source_commit)" == "$sha" ]] \
+    || die "canonical HEAD changed; prepared candidate refused at flip"
   # Never hold deploy.lock waiting behind a long preparation: fail and retry later.
   selfhost_lock_py prepare "$SELFHOST_PREPARE_LOCK" "$SELFHOST_DEPLOY_LOCK_DIR"
   exec 9<>"$SELFHOST_PREPARE_LOCK"
@@ -129,7 +140,6 @@ cmd_prepare() {
   PLATFORM_FROM_HEAD=1
   selfhost_prepare_assert_tip "$LEASE_TARGET_SHA"
   preflight_common
-  selfhost_release_preflight "$LEASE_TARGET_SHA"
   assert_fix_trailers "$LEASE_TARGET_SHA"
   selfhost_prepare_candidate "$LEASE_TARGET_SHA"
   log "✓ prepared source=$LEASE_TARGET_SHA; live untouched"
