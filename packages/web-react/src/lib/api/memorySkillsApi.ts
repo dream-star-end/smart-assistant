@@ -23,6 +23,7 @@ import type {
   MemoryConflict,
   PutMemoryResult,
   MemoryIndexResponse,
+  MemoryContextView,
   MemoryUsageDashboard,
   AutoDreamReportResponse,
   AutoDreamOptimizerState,
@@ -129,6 +130,17 @@ export const memorySkillsApi = {
           `/api/agents/${encodeURIComponent(agentId)}/memory/usage?days=${Math.max(1, Math.min(90, Math.floor(days)))}`,
           { credentials: "include", headers: bearerHeaders(t) },
         ),
+      ),
+    ),
+
+  /** 智能体当前能用到的记忆来源（GET /api/agents/:id/memory/context；只读元信息，展开时才取）。 */
+  getMemoryContext: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<MemoryContextView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/context`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
       ),
     ),
 

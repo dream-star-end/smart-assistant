@@ -38,6 +38,18 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
       match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
     samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
   },
+  AGENT_ROUTES: (() => {
+    const agents = LEGACY_HTTP_DISPATCH.AGENT_ROUTES
+    const at = agents.routes.findIndex((r) => r.id === '/api/agents/:1/memory/usage') + 1
+    // OpenViking B1 façade view (gateway-only), right after memory/usage.
+    const memoryContext = { id: '/api/agents/:1/memory/context', line: 0, calls: ['handleMemoryContext', 'sendInternalError'],
+      match: (_req: { method?: string }, url: URL) => /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/context$/.test(url.pathname) }
+    return {
+      ...agents,
+      routes: [...agents.routes.slice(0, at), memoryContext, ...agents.routes.slice(at)],
+      samples: [...agents.samples, '/api/agents/a/memory/context', '/api/agents/aaa/memory/context'],
+    }
+  })(),
 }
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 
