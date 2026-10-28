@@ -2143,7 +2143,8 @@ export async function appendRecoveryGiveUpTerminalCard(
     id: `m-recovery-giveup-${input.rootClientMessageId}`,
     role: "assistant",
     text,
-    _userError: getUserError(input.reason === "retry_exhausted" ? "automatic_retry_exhausted" : "automatic_retry_paused"),
+    _userError: getUserError(input.reason === "retry_exhausted" ? "automatic_retry_exhausted"
+      : input.reason === "recovery_refused" ? "automatic_retry_refused" : "automatic_retry_paused"),
     ts: Date.now(),
     // status:"completed" 是前端把用户角标从「已发送」翻成「已回复」的唯一谓词
     // (web/modules/messages.js _deriveUserMsgStatus);缺了它这张卡等于没发。
@@ -2436,7 +2437,6 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       automatic: true,
       rootClientMessageId,
       attempt: semanticRecoveryAttempt,
-      retryLimit,
       max: AUTOMATIC_TURN_RETRY_MAX,
       ...(shouldResetNativeSessionForRecovery({
         errorCode,
@@ -2447,6 +2447,8 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   };
   const request: Record<string, unknown> = {
     type: "inbound.message",
+    // Presentation metadata stays outside the strict recovery admission envelope.
+    _automaticRecoveryRetryLimit: retryLimit,
     idempotencyKey: identity.idempotencyKey,
     channel: "webchat",
     peer: { id: input.sessionId, kind: "dm" },
@@ -8840,7 +8842,7 @@ async function readAutomaticRecoveriesForSession(
     `SELECT source_client_message_id,root_client_message_id,
             request_json->>'clientMessageId' AS client_message_id,
             error_code,recovery_mode,semantic_recovery_attempt,status,
-            request_json->'content'->'recovery'->'retryLimit' AS retry_limit
+            request_json->'_automaticRecoveryRetryLimit' AS retry_limit
        FROM turn_recovery_jobs
       WHERE user_id=$1::bigint AND session_id=$2
         AND status IN ('queued','leased','sent','forwarded')

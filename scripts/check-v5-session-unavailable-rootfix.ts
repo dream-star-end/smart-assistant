@@ -1145,3 +1145,13 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[user-errors-engine-switch] PASS — INC-20261028-ERRORS-ENGINE-SWITCH executed all 43 catalog, emitter and six-engine switch leaves without paid calls')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/antigravityAdapter.test.ts'],
+  expected: ['multimodal switch history fits the actual stdin envelope and retains the current text'],
+  namePattern: '^multimodal switch history fits the actual stdin envelope',
+  label: 'multimodal-history-envelope',
+  timeoutMs: 120_000,
+})
+console.log('[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming')

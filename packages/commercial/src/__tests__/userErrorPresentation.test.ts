@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { Value } from '@sinclair/typebox/value';
+import { SysRecoveryStatus } from '@openclaude/protocol';
 import { describe, test } from 'node:test';
 import type { ServerResponse } from 'node:http';
 import { WebSocket } from 'ws';
@@ -35,14 +37,15 @@ test('bridge rejection keeps routing and retry denial while adding safe catalog 
 test('accepted recovery status uses persisted actual limit and has no prompt or internal request id', () => {
   const job = { sessionId: 's', sourceClientMessageId: 'm-source', rootClientMessageId: 'm-root',
     semanticRecoveryAttempt: 2, request: { clientMessageId: 'm-recover-opaque',
-      content: { text: 'PRIVATE PROMPT', recovery: { max: 10, retryLimit: 3 } } },
+      _automaticRecoveryRetryLimit: 3, content: { text: 'PRIVATE PROMPT', recovery: { max: 10 } } },
   } as unknown as ClaimedRecoveryJob;
   assert.equal(recoveryJobStatus(job, 'scheduled').state, 'scheduled');
   const frame = recoveryRunningFrame(job);
   assert.equal(frame.retryStatus.message, '正在自动重试（2/3）。');
   assert.equal(frame.peer.id, 's');
+  assert.ok(Value.Check(SysRecoveryStatus, frame));
   assert.doesNotMatch(JSON.stringify(frame), /PRIVATE PROMPT/);
-  job.request.content = { recovery: { max: 10 } };
+  delete job.request._automaticRecoveryRetryLimit;
   assert.equal(recoveryRunningFrame(job).retryStatus.maxAttempts, undefined);
 });
 

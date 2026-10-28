@@ -119,6 +119,9 @@ export const USER_ERROR_CATALOG: Readonly<Record<string, UserError>> = Object.fr
   automatic_retry_paused: entry('automatic_retry_paused', ['execution',
     '自动重试已暂停，任务没有继续取得进展。请确认已有结果，再换模型、重新发送或联系管理员。',
     ['switch_model', 'retry', 'contact_admin']]),
+  automatic_retry_refused: entry('automatic_retry_refused', ['execution',
+    '自动重试未能开始执行。请确认已有结果，再换模型、重新发送或联系管理员。',
+    ['switch_model', 'retry', 'contact_admin']]),
 })
 
 /** Display-only aliases; deliberately do not change normalizeTurnErrorCode's recovery/billing semantics. */
@@ -137,7 +140,8 @@ export function getUserError(rawCode: unknown): UserError {
 }
 
 /** Add a presentation envelope without changing any legacy field, prompt or billing payload. */
-export function withUserError<T>(body: T, httpStatus?: number): T & { userError?: UserError } {
+export function withUserError<T>(body: T, httpStatus?: number): T & { userError?: UserError }
+export function withUserError(body: unknown, httpStatus?: number): unknown {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body
   const record = body as Record<string, unknown>
   const isErrorFrame = record.type === 'error' || record.type === 'outbound.error'

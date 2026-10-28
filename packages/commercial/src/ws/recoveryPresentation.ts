@@ -4,8 +4,8 @@ import type { ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js';
 
 /** Old queued jobs predate the actual limit field: omit N instead of claiming 10. */
 export function recoveryJobStatus(job: ClaimedRecoveryJob, state: 'scheduled' | 'running') {
-  const content = job.request.content as { recovery?: { retryLimit?: number } } | undefined;
-  return automaticRetryStatus(state, job.semanticRecoveryAttempt, content?.recovery?.retryLimit);
+  const limit = job.request._automaticRecoveryRetryLimit;
+  return automaticRetryStatus(state, job.semanticRecoveryAttempt, typeof limit === 'number' ? limit : undefined);
 }
 
 export function recoveryRunningFrame(job: ClaimedRecoveryJob) {

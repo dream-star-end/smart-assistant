@@ -9,6 +9,8 @@
 2. **灰条反复出现**：native resume 丢失期间，历史键随着上一轮新增回复而变化，旧逻辑每次注入都触发 context rebuilt。新增 session episode 标记：首次真正注入且提示成功后置位，有效 native resume 恢复后清除。同一次 fallback 的后续回合继续获得最新历史，但不反复提示。新建引擎会话自然重新拥有一次提示额度。stateless 常规 replay 和 provider gap delta 保持静默。
 3. **重试上限显示失真**：调度器已有 settled-tools / empty continuation 短预算 3，通用预算 10；旧 request recovery.max 固定 10。保留所有旧字段与预算策略，只新增 retryLimit/retryStatus。没有持久化实际上限的旧 job 省略 N，不伪报 10。master admission 仅 scheduled；持久化容器 receipt 的 CAS 成功后才 running。
 
+4. **Antigravity 最终信封转义膨胀**（R1 审查复现）：引擎将多模态 blocks 拼成文本，历史之后仍有当前消息；旧裁剪器只识别严格八行，因此双重 JSON 转义超限后无法删去旧历史。裁剪器现在识别前置历史并完整保留后续当前 blocks，通过实际 adapter + 假 CLI stdin 捕获验证。Antigravity 自身既有的 binary 不支持提示仍有效，本票不声称为该引擎增加了视觉能力。
+
 ## 已有保护与未发现需修改的部分
 
 - `getOrCreateImpl` 按引擎隔离 native resume id；跨引擎旧 runner 先 shutdown，新会话重置成本基线、tool-use map 和目标运行态。
@@ -30,7 +32,7 @@
 | zcode | 待跑 | 待跑 | 待跑 | 待跑 | 待跑 | 待跑 |
 | antigravity | 待跑 | 待跑 | 待跑 | 待跑 | 待跑 | 待跑 |
 
-矩阵控制台名含具体 from/to，任何缺失或 skip 不能算通过。43 个目录/出口/矩阵断言已接入既有 session-unavailable rootfix proof 入口，CI 会核对完整叶子集合；没有新增门禁豁免。
+矩阵控制台名含具体 from/to，任何缺失或 skip 不能算通过。43 个目录/出口/矩阵断言与 1 个 Antigravity 实际信封用例已接入既有 session-unavailable rootfix proof 入口，CI 会核对完整叶子集合；没有新增门禁豁免。
 
 ## 当前验证状态
 截至 2026-10-28 17:44 UTC：部署队列 BUSY；尚未执行任何测试、类型检查或 CI。以上是代码调查与待验证改动，不是通过报告。上线后用户灰条频次与真实供应商切换验收由管理会话安排；本票不发布、不跑付费回合。

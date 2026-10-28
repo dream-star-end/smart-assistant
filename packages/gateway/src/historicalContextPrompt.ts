@@ -58,7 +58,7 @@ export function fitHistoricalContextJsonPrompt(
   if (fits(prompt)) return { prompt, dropped: 0 }
   const lines = prompt.split('\n')
   if (
-    lines.length !== 8 ||
+    lines.length < 8 ||
     lines[0] !== OPEN ||
     lines[1] !== NOTE ||
     lines[3] !== CLOSE ||
@@ -77,10 +77,14 @@ export function fitHistoricalContextJsonPrompt(
     return null
   }
   if (!Array.isArray(transcript) || typeof currentUserText !== 'string') return null
+  // Multimodal inputs prepend history as a text block. Text-only adapters
+  // concatenate the remaining current blocks after it; keep that exact tail
+  // while fitting history against their final transport envelope.
+  const tail = prompt.slice(lines.slice(0, 8).join('\n').length)
   const render = (start: number): string =>
-    start >= transcript.length
+    (start >= transcript.length
       ? currentUserText
-      : renderHistoricalContextJsonPrompt(transcript.slice(start), currentUserText)
+      : renderHistoricalContextJsonPrompt(transcript.slice(start), currentUserText)) + tail
   // Fewer entries never render larger, so the smallest fitting start is the
   // longest fitting suffix. start=0 is already known not to fit.
   let lo = 1
