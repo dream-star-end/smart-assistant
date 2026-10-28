@@ -16,7 +16,7 @@ import {
   Users,
   Wallet,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -34,6 +34,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  useToastAnchor,
 } from "./ui";
 
 /** 快捷键修饰键按平台显示:Mac 系 ⌘,其余 Ctrl(C-24:Windows/Linux 用户此前看到的是 Mac 符号)。 */
@@ -161,8 +162,12 @@ export function ChatHeader({
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
   const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
   const engineLabel = teamEngineLabel(models ?? []);
+  // toast 落在顶栏实测下沿之下(手机顶栏两行时也不压住模型行)。
+  const headerRef = useRef<HTMLElement>(null);
+  useToastAnchor(headerRef);
   return (
     <header
+      ref={headerRef}
       className="flex min-h-14 shrink-0 flex-wrap items-center gap-1 px-2 pb-2 header-safe-t sm:flex-nowrap sm:px-3 sm:pb-2.5"
       data-product-entry-scope="chat-header"
     >

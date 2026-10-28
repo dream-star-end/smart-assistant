@@ -43,6 +43,7 @@ export {
 } from "./Input";
 export { ListSkeleton } from "./ListSkeleton";
 export { Modal } from "./Modal";
+export { Notice, collapseRepeats, type NoticeAction, type NoticeProps } from "./Notice";
 export { Pagination } from "./Pagination";
 export { EmptyState, Panel, PanelHeader } from "./Panel";
 export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
@@ -61,6 +62,7 @@ export {
   useQuiet,
 } from "./Quiet";
 export { SectionNav, type SectionNavItem } from "./SectionNav";
+export { StatusPill, type StatusPillProps } from "./StatusPill";
 export { Select, type SelectOption, type SelectProps } from "./Select";
 export { ProjectScopeSelect } from "./ProjectScopeSelect";
 export {
@@ -83,6 +85,6 @@ export {
   type DateInput,
   type TimeAgoProps,
 } from "./TimeAgo";
-export { ToastProvider, useToast, type ToastTone } from "./Toast";
+export { ToastProvider, useToast, useToastAnchor, type ToastTone } from "./Toast";
 export { Toolbar, type ToolbarProps } from "./Toolbar";
 export { Tooltip, TooltipProvider } from "./Tooltip";

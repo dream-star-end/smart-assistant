@@ -664,9 +664,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   };
 
   const deleteSessionConfirm = async (s: Session) => {
+    const title = s.title || "新对话";
     const ok = await cbRef.current.confirmDialog({
-      title: "删除该会话?",
-      body: `「${s.title || "新对话"}」的本地与云端记录都将删除,不可恢复。`,
+      title: "删除该会话？",
+      body: `「${title}」的本地与云端记录都将删除，不可恢复。`,
       confirmText: "删除",
       danger: true,
     });
@@ -698,8 +699,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         console.warn("deleteSession failed", e);
         toast("删除失败，该会话仍保留在云端，已刷新列表", "error");
         void refreshSessionList();
+        return;
       }
     }
+    // 删除成功要有回执(UI-SPEC §6 #22):行从侧栏消失不等于删掉了,云端失败时上面另有错误提示。
+    toast(`已删除「${title}」`, "success");
   };
 
   const patchSessionMetaOptimistic = async (
@@ -759,7 +763,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     if (unique.length === 0) return;
     if (action === "delete") {
       const ok = await cbRef.current.confirmDialog({
-        title: `删除 ${unique.length} 条会话?`,
+        title: `删除 ${unique.length} 条会话？`,
         body: `将删除 ${unique.length} 条会话的本地与云端记录，不可恢复。`,
         confirmText: "删除",
         danger: true,
@@ -785,7 +789,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       cbRef.current.onActiveSessionDeleted();
     }
     if (demo) {
-      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+      if (action === "delete") {
+        for (const id of unique) forgetSessionLocal(id);
+        toast(`已删除 ${unique.length} 条会话`, "success");
+      }
       return;
     }
     try {
@@ -794,7 +801,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         action,
         ...(action === "move" ? { projectId: projectId ?? null } : {}),
       });
-      if (action === "delete") for (const id of unique) forgetSessionLocal(id);
+      if (action === "delete") {
+        for (const id of unique) forgetSessionLocal(id);
+        toast(`已删除 ${unique.length} 条会话`, "success");
+      }
     } catch (e) {
       setSessions((c) => {
         const map = new Map(c.map((s) => [s.id, s]));

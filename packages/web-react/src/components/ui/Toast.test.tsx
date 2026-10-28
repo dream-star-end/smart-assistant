@@ -2,8 +2,9 @@ import '@testing-library/jest-dom/vitest'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { useRef } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ToastProvider, useToast } from './Toast'
+import { ToastProvider, splitTraceId, useToast, useToastAnchor } from './Toast'
 
 afterEach(() => {
   cleanup()
@@ -31,7 +32,7 @@ function Probe({ onReady }: { onReady: (fn: ReturnType<typeof useToast>) => void
 }
 
 describe('Toast 轨道(shell 审计 S-20:顶距与头部高度解耦)', () => {
-  it('轨道顶距走 --oc-toast-top 变量,不再写死 top-16;变量本身定义在 styles.css', () => {
+  it('轨道顶距走 --oc-toast-top 变量,不再写死 top-16;默认值定义在 styles.css', () => {
     render(
       <ToastProvider>
         <span>子树</span>
@@ -39,11 +40,32 @@ describe('Toast 轨道(shell 审计 S-20:顶距与头部高度解耦)', () => {
     )
     const rail = document.querySelector('[data-toast-rail]') as HTMLElement
     expect(rail).not.toBeNull()
-    expect(rail.className).toContain('top-[var(--oc-toast-top,4rem)]')
+    expect(rail.className).toContain('top-[var(--oc-toast-top)]')
     expect(rail.className).not.toMatch(/\btop-16\b/)
-    // 变量的唯一定义处在 styles.css:Toast.tsx 只消费、不定义。两处钉在一起,值漂移即转红。
+    // 安全区已经算进顶距(顶栏实测下沿本就包含;默认值里显式加),轨道不再自带 header-safe-t。
+    expect(rail.className).not.toContain('header-safe-t')
+    // 默认值的唯一定义处在 styles.css:= 原 4rem 顶距 + 原轨道内边距(0.625rem + 安全区),位置不变。
     const css = readFileSync(locateStylesheet(), 'utf8')
-    expect(css).toMatch(/--oc-toast-top:\s*4rem;/)
+    expect(css).toMatch(/--oc-toast-top:\s*calc\(4\.625rem \+ env\(safe-area-inset-top, 0px\)\);/)
+  })
+
+  it('顶栏登记实测下沿:toast 落在顶栏下面(手机两行顶栏也不压住),卸载后回落默认值', () => {
+    let height = 100
+    function Header() {
+      const ref = useRef<HTMLElement>(null)
+      useToastAnchor(ref)
+      return <header ref={ref}>顶栏</header>
+    }
+    const spy = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockImplementation(() => ({ bottom: height }) as DOMRect)
+    const root = document.documentElement
+    const { unmount } = render(<Header />)
+    expect(root.style.getPropertyValue('--oc-toast-top')).toBe('108px')
+    height = 64
+    unmount()
+    expect(root.style.getPropertyValue('--oc-toast-top')).toBe('')
+    spy.mockRestore()
   })
 
   it('error 用 alert/assertive 打断朗读;success / info 用 status/polite', () => {
@@ -125,5 +147,60 @@ describe('Toast 轨道(shell 审计 S-20:顶距与头部高度解耦)', () => {
     })
     expect(screen.queryByRole('status')).toBeNull()
     expect(screen.getByRole('alert').getAttribute('data-auto-dismiss')).toBeNull()
+  })
+})
+
+describe('Toast 追踪号(UI-SPEC §1.1 C6:跟踪号不进正文)', () => {
+  it('apiErrorMessage 尾部的「（追踪号 …）」剥出来,正文只留人话', () => {
+    expect(splitTraceId('协作配置保存失败，请重新选择后重试（追踪号 5bb64a20b6）')).toEqual({
+      text: '协作配置保存失败，请重新选择后重试',
+      traceId: '5bb64a20b6',
+    })
+    expect(splitTraceId('保存失败(跟踪号: req-1)')).toEqual({ text: '保存失败', traceId: 'req-1' })
+    expect(splitTraceId('保存失败')).toEqual({ text: '保存失败' })
+    // 只有号码没有正文时不剥,免得剩一条空提示。
+    expect(splitTraceId('（追踪号 abc）')).toEqual({ text: '（追踪号 abc）' })
+  })
+
+  it('错误提示正文不含号码,「复制追踪号」复制原号码', async () => {
+    const writeText = vi.fn(async () => {})
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    let toast: ReturnType<typeof useToast> = () => {}
+    render(
+      <ToastProvider>
+        <Probe onReady={(fn) => (toast = fn)} />
+      </ToastProvider>,
+    )
+    act(() => {
+      toast('协作配置保存失败（追踪号 5bb64a20b6）', 'error')
+    })
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('协作配置保存失败')
+    expect(alert.textContent).not.toContain('5bb64a20b6')
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '复制追踪号' }))
+    })
+    expect(writeText).toHaveBeenCalledWith('5bb64a20b6')
+    expect(screen.getByRole('button', { name: '已复制' })).toBeInTheDocument()
+    Reflect.deleteProperty(navigator, 'clipboard')
+  })
+
+  it('options.traceId 同样只进按钮;剪贴板不可用(非安全上下文)时直接亮出号码', async () => {
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
+    let toast: ReturnType<typeof useToast> = () => {}
+    render(
+      <ToastProvider>
+        <Probe onReady={(fn) => (toast = fn)} />
+      </ToastProvider>,
+    )
+    act(() => {
+      toast('导出失败', 'error', { traceId: 'tr-9' })
+    })
+    expect(screen.getByRole('alert').textContent).not.toContain('tr-9')
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '复制追踪号' }))
+    })
+    expect(screen.getByRole('alert')).toHaveTextContent('tr-9')
+    Reflect.deleteProperty(navigator, 'clipboard')
   })
 })
