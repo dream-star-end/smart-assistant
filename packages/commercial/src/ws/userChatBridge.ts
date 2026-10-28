@@ -2442,6 +2442,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }
   const headlessConsumers = new Map<string, Set<HeadlessConsumer>>();
   let headlessActive = 0;
+  // shutdown 之后不再起 headless:正在 drain 的桥已 unregister,shutdown 踢不到它,
+  // drain 到期若再转 headless 就会在进程关停后继续占着容器 WS。
+  let headlessShutdown = false;
   const headlessKey = (uidKey: bigint, cid: number): string => `${uidKey.toString()}:${cid}`;
   const noteLiveStreamCovered = (uidKey: bigint, cid: number, streamKey: string): void => {
     const consumers = headlessConsumers.get(headlessKey(uidKey, cid));
@@ -9882,6 +9885,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      */
     function enterHeadless(): boolean {
       if (
+        headlessShutdown ||
         !headlessCapable ||
         !hasOpenDispatchStreams() ||
         containerWs.readyState !== WebSocket.OPEN
@@ -10701,6 +10705,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     if (frontendBuildTimer) clearInterval(frontendBuildTimer);
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
+    headlessShutdown = true;
     registry.closeAll(reason);
     // headless 桥已 unregister,registry 踢不到它们。
     for (const set of [...headlessConsumers.values()]) {

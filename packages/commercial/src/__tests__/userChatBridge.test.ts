@@ -4636,6 +4636,32 @@ describe("UXE-A1 headless consumer for open dispatch streams", () => {
     }
   });
 
+  test("drain 中 shutdown → drain 到期不再转 headless(容器 WS 照旧关闭)", async () => {
+    const { rig, persisted } = await headlessRig(acceptedRow("1206"));
+    let stopped = false;
+    try {
+      const { ws, container } = await connect(rig, "1206");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      const closed = new Promise<void>((resolve) => container.once("close", () => resolve()));
+      ws.close();
+      await waitClose(ws);
+      await rig.bridge.shutdown(); // 桥仍在 drain(100ms),已 unregister
+      stopped = true;
+      await Promise.race([
+        closed,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("container WS left open after shutdown")), 3000)),
+      ]);
+    } finally {
+      if (stopped) {
+        await new Promise<void>((r) => rig.containerWss.close(() => r()));
+        await new Promise<void>((r) => rig.gateway.close(() => r()));
+      } else {
+        await stopRig(rig);
+      }
+    }
+  });
+
   test("OC_DISPATCH_HEADLESS_LIMIT=0 → drain 到期照旧关闭", async () => {
     process.env.OC_DISPATCH_HEADLESS_LIMIT = "0";
     const { rig, persisted } = await headlessRig(acceptedRow("1205"));
