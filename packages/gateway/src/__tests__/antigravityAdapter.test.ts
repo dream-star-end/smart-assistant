@@ -27,6 +27,7 @@ import { resetEnvFactsCache } from '../envProbe.js'
 import { routeRelayTrace } from '../relayTrace.js'
 import { classifyRunError } from '../errorClassify.js'
 import { renderHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
+import { buildHistoricalContextPayload } from '../historicalContextPayload.js'
 import type { EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { TurnSummary } from '../engine/engineEvents.js'
@@ -152,7 +153,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
 async function runTurn(
   h: Harness,
   fixture: string,  // name under FIXTURES, or an absolute path
-  extra: { stderr?: string; input?: string } = {},
+  extra: { stderr?: string; input?: Parameters<AntigravityAdapter['submitTurn']>[0]['input'] } = {},
 ): Promise<{ summary: TurnSummary | null; events: EngineEvent[]; sessionIds: string[] }> {
   process.env.FAKE_AGY_FIXTURE = path.isAbsolute(fixture) ? fixture : path.join(FIXTURES, fixture)
   if (extra.stderr) {
@@ -626,6 +627,29 @@ describe('AntigravityAdapter', () => {
       assert.match(prompt, /latest question/)
       assert.match(prompt, /turn-299 /, 'the newest history is kept')
       assert.doesNotMatch(prompt, /turn-0 /, 'the oldest history is dropped')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('multimodal switch history fits the actual stdin envelope and retains the current text', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const history = [{ role: 'assistant', text: '"'.repeat(120000) },
+        { role: 'assistant', text: 'LATEST_HISTORY' }]
+      const input = buildHistoricalContextPayload(history, [
+        { type: 'text', text: 'CURRENT_ATTACHMENT_QUESTION' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
+      ], ANTIGRAVITY_MAX_PROMPT_BYTES)
+      assert.ok(Array.isArray(input))
+      const { summary } = await runTurn(h, 'tool-success.ndjson', { input })
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      const cap = JSON.parse(await readFile(h.capture, 'utf8'))
+      assert.ok(Buffer.byteLength(cap.stdin, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
+      const prompt = JSON.parse(cap.stdin.trim()).message.content as string
+      assert.match(prompt, /CURRENT_ATTACHMENT_QUESTION/)
+      assert.match(prompt, /LATEST_HISTORY/)
     } finally {
       await h.restore()
     }

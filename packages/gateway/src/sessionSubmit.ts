@@ -1,3 +1,4 @@
+import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
@@ -443,7 +444,7 @@ export async function submit(
      *  (server.ts)发 sys.context_rebuilt 提示帧(boss 硬指标 3:引擎无法原生续接、
      *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
      *  submit 不传 → 无用户可见提示。gateway-authored 决策,不进 engine event 流。 */
-    emitContextRebuilt?: (info: { messageCount: number }) => void
+    emitContextRebuilt?: (info: { messageCount: number; reason?: 'engine-switch' | 'native-resume-loss' }) => void
     /** Active-turn reconnect lifecycle for one validated webchat user row.
      * Hooks are isolated from turn correctness: SessionManager logs and
      * ignores hook failures and always releases session.lock. */
@@ -1130,6 +1131,7 @@ export async function submit(
       session._contextRebuildNotice = 'native-resume-loss'
       providerResumeId = undefined
     }
+    if (providerResumeId) session._contextRebuildNoticeSent = false
     const nativeHandoff =
       consumingModelSwitch &&
       transition &&
@@ -1148,7 +1150,7 @@ export async function submit(
                 opts?.modelAuthority?.executionDescriptor.contextWindow ??
                 (session.providerTag === 'codex' ? null : undefined),
               engine: session.providerTag,
-              currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+              currentUserText: session.currentUserText ?? '',
               ...(opts?.replayLifecycle?.clientMessageId
                 ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
                 : {}),
@@ -1196,25 +1198,18 @@ export async function submit(
                 opts?.modelAuthority?.executionDescriptor.contextWindow ??
                 (session.providerTag === 'codex' ? null : undefined),
               engine: session.providerTag,
-              currentUserText: typeof userTextOrBlocks === 'string' ? userTextOrBlocks : '',
+              currentUserText: session.currentUserText ?? '',
               ...(opts?.replayLifecycle?.clientMessageId
                 ? { excludeClientMessageId: opts.replayLifecycle.clientMessageId }
                 : {}),
             })) ?? [],
           )
-        const hasHistoricalContextRows =
-          historyMessages && typeof userTextOrBlocks === 'string'
-            ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks) !== null
-            : false
-        const historicalPrompt =
-          historyMessages && typeof userTextOrBlocks === 'string'
-            ? buildHistoricalContextPrompt(
-                historyMessages,
-                userTextOrBlocks,
-                undefined,
-                session.runner.capabilities.maxPromptBytes,
-              )
-            : null
+        const hasHistoricalContextRows = historyMessages
+          ? buildHistoricalContextPayload(historyMessages, userTextOrBlocks) !== null
+          : false
+        const historicalPrompt = historyMessages
+          ? buildHistoricalContextPayload(historyMessages, userTextOrBlocks, session.runner.capabilities.maxPromptBytes)
+          : null
         if (historicalPrompt) {
           runnerPayload = historicalPrompt
           session._historicalContextInjected = true
@@ -1235,10 +1230,14 @@ export async function submit(
           const shouldNotifyContextRebuilt = !providerGapDelta && shouldEmitContextRebuilt({
             historyMode: session.runner.capabilities.historyMode,
             reason: session._contextRebuildNotice,
+            alreadyNotified: session._contextRebuildNoticeSent,
           })
           if (shouldNotifyContextRebuilt) {
             try {
-              opts?.emitContextRebuilt?.({ messageCount: injectedCount })
+              if (opts?.emitContextRebuilt) {
+                opts.emitContextRebuilt({ messageCount: injectedCount, reason: session._contextRebuildNotice ?? 'native-resume-loss' })
+                session._contextRebuildNoticeSent = true
+              }
             } catch (emitErr) {
               log.warn(
                 'emit sys.context_rebuilt failed',

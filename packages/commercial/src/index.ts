@@ -1,5 +1,6 @@
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
+import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
 import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
@@ -6068,12 +6069,7 @@ export async function registerCommercial(
         });
       });
     }
-    const payload = {
-      type: "sys.recovery_decision",
-      peer: { id: sessionId, kind: "dm" },
-      ...verdict,
-      ts: Date.now(),
-    };
+    const payload = recoveryDecisionFrame(sessionId, verdict);
     // Phase B runs on the leader slot only; the user's WS may live on the
     // other slot. Same dual-master fan-out as outbound.cost_charged.
     if (dualMasterEnabled) {

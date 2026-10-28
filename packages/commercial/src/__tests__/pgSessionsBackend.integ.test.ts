@@ -1,3 +1,5 @@
+import { automaticRetryStatus, InboundMessage } from '@openclaude/protocol';
+import { Value } from '@sinclair/typebox/value';
 // pgSessionsBackend 集成 + 并发契约测试(RFC-v5-sessions-pg §9)。
 //
 // 需 PG fixture(openclaude_test，与其它 integ 同库)。为不污染共享 public schema，本套件在
@@ -6876,6 +6878,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       sourceClientMessageId, rootClientMessageId: sourceClientMessageId,
       clientMessageId: jobs.rows[0]!.request_json.clientMessageId,
       errorCode: "upstream_failed", mode: "checkpoint", attempt: 1,
+      retryStatus: automaticRetryStatus("scheduled", 1, 10),
     }];
     const full = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
     assert.ok((full?.messages as MessageLike[]).some((row) =>
@@ -6893,7 +6896,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         [UID, sessionId, sourceClientMessageId, status]);
       const snapshot = await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" });
       assert.deepEqual(snapshot?.automaticRecoveries,
-        ["leased", "sent", "forwarded"].includes(status) ? expected : [], status);
+        ["leased", "sent", "forwarded"].includes(status)
+          ? expected.map((entry) => ({ ...entry, retryStatus: automaticRetryStatus(status === "forwarded" ? "running" : "scheduled", 1, 10) }))
+          : [], status);
       assert.ok((snapshot?.messages as MessageLike[]).some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
         "the source terminal stays immutable while the recovery job changes");
     }
@@ -6943,8 +6948,8 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       createdAt: 1_783_950_150_000,
       usage: { inputTokens: 6, outputTokens: 872 },
     }));
-    const jobs = await pool.query<{ recovery_mode: string; semantic_recovery_attempt: number }>(
-      `SELECT recovery_mode,semantic_recovery_attempt
+    const jobs = await pool.query<{ recovery_mode: string; semantic_recovery_attempt: number; request_json: Record<string, unknown> }>(
+      `SELECT recovery_mode,semantic_recovery_attempt,request_json
          FROM turn_recovery_jobs
         WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
       [UID, sessionId, sourceClientMessageId],
@@ -6952,6 +6957,14 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(jobs.rowCount, 1);
     assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
     assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
+    assert.ok(Value.Check(InboundMessage, jobs.rows[0]!.request_json),
+      "presentation metadata must not invalidate the strict recovery admission envelope");
+    const recovery = (jobs.rows[0]!.request_json.content as { recovery: Record<string, unknown> }).recovery;
+    assert.equal(recovery.max, 10);
+    assert.equal(recovery.retryLimit, undefined);
+    const snapshot = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    assert.deepEqual(snapshot?.automaticRecoveries?.[0]?.retryStatus, automaticRetryStatus("scheduled", 1, 3),
+      "actual settled-tools retry budget is 3 while legacy max remains 10");
   });
 
   // OCV5-321 (#611729fb): same settled Box tape, but the live stream for the

@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
@@ -1379,7 +1380,7 @@ export class Gateway {
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(body))
+    res.end(JSON.stringify(withUserError(body, code)))
   }
   private sendSessionReadFailure(
     res: ServerResponse,

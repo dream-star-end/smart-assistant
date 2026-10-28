@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * 通用 HTTP helpers — 无框架依赖,只用 node:http 原生类型。
  */
@@ -335,7 +336,7 @@ export function sendJson(
       res.setHeader(k, String(v));
     }
   }
-  res.end(JSON.stringify(body));
+  res.end(JSON.stringify(withUserError(body, status)));
 }
 
 /**

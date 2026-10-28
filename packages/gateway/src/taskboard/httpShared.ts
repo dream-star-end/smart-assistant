@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * Taskboard HTTP shared helpers: request context type, JSON/error responses, body field coercion, unique-constraint detection, project resolution.
  *
@@ -49,7 +50,7 @@ export interface TaskboardHttpContext {
 
 export function sendJson(res: ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
+  res.end(JSON.stringify(withUserError(body, code)))
 }
 
 export function sendError(

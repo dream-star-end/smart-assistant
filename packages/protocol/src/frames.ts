@@ -5,6 +5,7 @@ import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
 import { SysMediaJob } from './mediaGeneration.js'
 import { ContextPressure, ContextCompaction } from './contextPressure.js'
+import { UserErrorSchema } from './userErrorSchema.js'
 import { AUTOMATIC_TURN_RETRY_MAX } from './turnErrorTaxonomy.js'
 
 // ───────────────────────────────────────────────
@@ -1049,6 +1050,8 @@ export type OutboundActiveTurnReplayStart = Static<typeof OutboundActiveTurnRepl
 // ───────────────────────────────────────────────
 export const OutboundError = Type.Object({
   type: Type.Literal('outbound.error'),
+  /** Additive display metadata; legacy fields keep their original meaning. */
+  userError: Type.Optional(UserErrorSchema),
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
@@ -1370,6 +1373,9 @@ export type OutboundCallUsage = Static<typeof OutboundCallUsage>
 // ───────────────────────────────────────────────
 export const SysContextRebuilt = Type.Object({
   type: Type.Literal('sys.context_rebuilt'),
+  clientMessageId: Type.Optional(ClientMessageId),
+  noticeId: Type.Optional(Type.String()),
+  reason: Type.Optional(Type.Union([Type.Literal('engine-switch'), Type.Literal('native-resume-loss')])),
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
@@ -1497,7 +1503,25 @@ export type ControlFrame = Static<typeof ControlFrame>
 // ───────────────────────────────────────────────
 // Top-level frame
 // ───────────────────────────────────────────────
+export const SysRecoveryStatus = Type.Object({
+  type: Type.Literal('sys.recovery_status'),
+  peer: Peer,
+  sourceClientMessageId: ClientMessageId,
+  rootClientMessageId: ClientMessageId,
+  clientMessageId: ClientMessageId,
+  retryStatus: Type.Object({
+    state: Type.Literal('running'),
+    attempt: Type.Integer({ minimum: 1 }),
+    maxAttempts: Type.Optional(Type.Integer({ minimum: 1 })),
+    message: Type.String(),
+    actions: Type.Array(Type.String()),
+  }),
+  ts: Type.Number(),
+})
+export type SysRecoveryStatus = Static<typeof SysRecoveryStatus>
+
 export const AnyFrame = Type.Union([
+  SysRecoveryStatus,
   InboundMessage,
   InboundPermissionResponse,
   PromptQueueMutationFrame,

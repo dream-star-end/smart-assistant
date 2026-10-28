@@ -487,9 +487,13 @@ export function _buildContextRebuiltFrame(
   out: OutboundMessage & { _userId?: string },
   agentId: string,
   messageCount: number,
+  reason?: 'engine-switch' | 'native-resume-loss',
+  clientMessageId?: string,
 ): SysContextRebuilt & { _userId?: string } {
   return {
     type: 'sys.context_rebuilt',
+    ...(reason ? { reason } : {}),
+    ...(clientMessageId ? { clientMessageId, noticeId: `${clientMessageId}:${agentId}` } : {}),
     ..._inheritOutboundRouting(out),
     agentId,
     messageCount,

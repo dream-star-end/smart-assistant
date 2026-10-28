@@ -277,6 +277,8 @@ export interface AgentSession {
    * set this for an engine switch or a lost native id so the fallback replay
    * can announce a rebuild. Do not set it on a successful native resume. */
   _contextRebuildNotice?: 'engine-switch' | 'native-resume-loss'
+  /** One notice per continuous fallback episode; a usable native resume resets it. */
+  _contextRebuildNoticeSent?: boolean
   /** A same-engine resume-map entry existed, but the newly selected transport
    * cannot consume it (for example Cursor Sand CCB -> official CC). Preheat may
    * mint a fresh native id before the first real turn; that empty id must not
