@@ -25,6 +25,7 @@ import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
+import { recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 import { rootLogger } from "../../logging/logger.js";
 
 const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
@@ -571,7 +572,12 @@ export class BoxToolFetch {
             } catch (error) {
               // OCV5-304: no claim was made and nothing launched; a recovered
               // dispatch continues the exchange as a fresh Box invocation.
-              if (!(await this.releaseOrphanedExchange(args, error))) throw error;
+              if (!(await this.releaseOrphanedExchange(args, error))) {
+                if (error instanceof BoxDurableJournalError || error instanceof BoxContinuationDecisionError) {
+                  recordBoxContinuationRejection("claim", error.code);
+                }
+                throw error;
+              }
               resumeToolResults = true;
             }
           }

@@ -420,6 +420,17 @@ export const anthropicProxyReject = new Counter({
   labelNames: ["reason"],
 });
 
+export const boxContinuationCompatibility = new Counter({
+  name: "box_continuation_shape_compatible_total",
+  help: "Unknown Box CLI result shapes accepted after semantic comparison",
+  labelNames: ["stage", "reason"],
+});
+export const boxContinuationRejections = new Counter({
+  name: "box_continuation_rejected_total",
+  help: "Box continuation validation rejections by stage and reason",
+  labelNames: ["stage", "reason"],
+});
+
 export const wsBridgeBufferedBytes = new Histogram(
   {
     name: "ws_bridge_buffered_bytes",
@@ -760,6 +771,8 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   anthropicProxyStreamDuration.render(out);
   anthropicProxySettle.render(out);
   anthropicProxyReject.render(out);
+  boxContinuationCompatibility.render(out);
+  boxContinuationRejections.render(out);
   wsBridgeBufferedBytes.render(out);
   wsBridgeSessionDuration.render(out);
   containerEnsureDuration.render(out);
@@ -790,6 +803,8 @@ export function resetMetricsForTest(): void {
   anthropicProxyStreamDuration.reset();
   anthropicProxySettle.reset();
   anthropicProxyReject.reset();
+  boxContinuationCompatibility.reset();
+  boxContinuationRejections.reset();
   wsBridgeBufferedBytes.reset();
   wsBridgeSessionDuration.reset();
   containerEnsureDuration.reset();

@@ -11,7 +11,8 @@ export type DurableHistogramMetric =
   | "anthropic_proxy_ttft_seconds"
   | "anthropic_proxy_stream_duration_seconds"
   | "container_ensure_duration_seconds"
-  | "ws_bridge_ttft_seconds";
+  | "ws_bridge_ttft_seconds"
+  | "box_continuation_decisions";
 
 type MetricSpec = {
   labelName: "family" | "kind";
@@ -24,11 +25,34 @@ const MODEL_FAMILIES = new Set([
 ]);
 const COLD_WARM = new Set(["cold", "warm"]);
 
+/** Bounded validation labels, shared by logging and durable observations. */
+export const BOX_CONTINUATION_REJECTION_REASONS: ReadonlySet<string> = new Set([
+  "BOX_TOOL_ECHO_INVALID", "BOX_TOOL_ECHO_CONTENT_INVALID", "BOX_TOOL_ECHO_ID_INVALID",
+  "BOX_TOOL_ECHO_EXPECTED_INVALID", "BOX_TOOL_ECHO_CONTENT_MISMATCH",
+  "BOX_TOOL_ECHO_CLI_BACKGROUNDED", "BOX_TOOL_ECHO_UNVERIFIED", "BOX_TOOL_ECHO_INCOMPLETE",
+  "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION", "BOX_PREPARED_CATALOG_MISSING",
+  "BOX_PREPARED_REJECT", "BOX_PREPARED_STALE", "BOX_AUTHORITY_MALFORMED", "BOX_CACHE_ANNOTATION_INVALID",
+  "BOX_TOOL_RESUME_IDENTITY_INVALID", "BOX_CALL_AMBIGUOUS", "BOX_RESUME_IN_PROGRESS",
+  "BOX_TOOL_OWNER_UNKNOWN", "BOX_TOOL_OWNER_INVALID", "BOX_TOOL_ROUND_LIMIT",
+  "BOX_TOOL_CATALOG_CHANGED", "BOX_TOOL_CONTEXT_CHANGED", "BOX_TOOL_RESULT_MISMATCH",
+  "BOX_TOOL_ASSISTANT_CHANGED", "BOX_TOOL_SPOOL_CAPACITY_EXCEEDED",
+  "BOX_TOOL_RESUME_JOURNAL_INVALID", "BOX_TOOL_RESUME_REQUEST_INVALID",
+  "BOX_TOOL_RESUME_BINDING_INVALID", "BOX_TOOL_RESUME_DECISION_UNBOUND",
+]);
+const BOX_CONTINUATION_KINDS = new Set([
+  "other",
+  ...["admission", "claim", "echo"].flatMap((stage) => [
+    ...["envelope", "opaque_content"].map((reason) => `${stage}:compatible:${reason}`),
+    ...[...BOX_CONTINUATION_REJECTION_REASONS, "other"].map((reason) => `${stage}:rejected:${reason}`),
+  ]),
+]);
+
 const SPECS: Record<DurableHistogramMetric, MetricSpec> = {
   anthropic_proxy_ttft_seconds: { labelName: "family", allowedValues: MODEL_FAMILIES },
   anthropic_proxy_stream_duration_seconds: { labelName: "family", allowedValues: MODEL_FAMILIES },
   container_ensure_duration_seconds: { labelName: "kind", allowedValues: COLD_WARM },
   ws_bridge_ttft_seconds: { labelName: "kind", allowedValues: COLD_WARM },
+  box_continuation_decisions: { labelName: "kind", allowedValues: BOX_CONTINUATION_KINDS },
 };
 
 type RollupEntry = {
@@ -86,7 +110,7 @@ function normalizeLabel(metric: DurableHistogramMetric, raw: string): Record<str
   return {
     [spec.labelName]: spec.allowedValues.has(candidate)
       ? candidate
-      : spec.labelName === "family" ? "other" : "warm",
+      : spec.allowedValues.has("warm") ? "warm" : "other",
   };
 }
 

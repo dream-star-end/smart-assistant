@@ -1,20 +1,19 @@
-/** Strictly bind Claude CLI's user/tool_result echo to the tool results that
+/** Semantically bind Claude CLI's user/tool_result echo to the tool results that
  * OpenClaude already published. Echoes are observations, never instructions
  * to execute a tool again or bill another round. */
 import { createHash } from "node:crypto";
 import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
+import { compareBoxResult, projectBoxResult } from "./boxResultSemantics.js";
+import { recordBoxContinuationCompatibility, recordBoxContinuationRejection } from "./boxContinuationMetrics.js";
 
 type ExpectedEcho = Pick<BoxMatchedToolResult,
   "modelToolUseId" | "contentHash" | "isError">
   & { readonly content?: BoxMatchedToolResult["content"] };
 type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
-/** OCV5-302: Claude Code rewrites some MCP tool results before the model sees
- * them, so its echo can differ from what OpenClaude published. A mismatching
- * echo is accepted only as a byte-exact rebuild of the CLI's rewrite of the
- * published content, which must be in hand (live continuation, or recovery
- * after the hash-verified published file was read); hash-only evidence stays
- * strictly byte-bound:
+/** OCV5-302 / OCV5-653: compare representation changes through the semantic
+ * projection. Known lossy rewrites still need the published content and the
+ * proofs below; hash-only recovery stays strictly byte-bound:
  *  - empty result -> `(<tool> completed with no output)`;
  *  - text over the MCP 50k-char limit -> the CLI's own `<persisted-output>`
  *    message (buildLargeToolResultMessage/generatePreview), rebuilt here.
@@ -118,7 +117,10 @@ function cliTransformed(echoed: EchoBlock[], expected: ExpectedEcho): boolean {
 }
 
 export class BoxToolResultEchoError extends Error {
-  constructor(readonly code: string) { super(code); this.name = "BoxToolResultEchoError"; }
+  constructor(readonly code: string) {
+    super(code); this.name = "BoxToolResultEchoError";
+    recordBoxContinuationRejection("echo", code);
+  }
 }
 function obj(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -126,42 +128,12 @@ function obj(value: unknown): Record<string, unknown> {
   }
   return value as Record<string, unknown>;
 }
-function content(value: unknown): Array<Record<string, unknown>> {
-  const blocks = typeof value === "string" ? [{ type: "text", text: value }] : value;
-  if (!Array.isArray(blocks) || blocks.length > 64) {
-    throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_INVALID");
-  }
-  return blocks.map((raw) => {
-    const block = obj(raw);
-    if (block.type === "text" && typeof block.text === "string"
-      && Object.keys(block).length === 2 && Object.hasOwn(block, "text")) {
-      return { type: "text", text: block.text };
-    }
-    if (block.type === "image") {
-      const source = obj(block.source);
-      if (Object.keys(block).length !== 2 || !Object.hasOwn(block, "source")
-        || Object.keys(source).length !== 3
-        || !Object.hasOwn(source, "type") || !Object.hasOwn(source, "media_type")
-        || !Object.hasOwn(source, "data")
-        || source.type !== "base64" || typeof source.data !== "string"
-        || typeof source.media_type !== "string"
-        || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(source.media_type)) {
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_INVALID");
-      }
-      const decoded = Buffer.from(source.data, "base64");
-      if (decoded.toString("base64") !== source.data) {
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_INVALID");
-      }
-      return { type: "image", data: source.data, mimeType: source.media_type };
-    }
-    throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_INVALID");
-  });
-}
 
 export class BoxToolResultEcho {
   private readonly expected = new Map<string, ExpectedEcho>();
   private readonly seen = new Set<string>();
-  private deferred: Array<{ echoed: EchoBlock[]; expected: ExpectedEcho }> = [];
+  private deferred: Array<{ echoed: EchoBlock[]; expected: ExpectedEcho;
+    warning?: "envelope" | "opaque_content" }> = [];
   constructor(results: readonly ExpectedEcho[]) {
     if (!Array.isArray(results) || results.length < 1 || results.length > 32) {
       throw new BoxToolResultEchoError("BOX_TOOL_ECHO_EXPECTED_INVALID");
@@ -188,27 +160,41 @@ export class BoxToolResultEcho {
       const id = block.tool_use_id;
       if (block.type !== "tool_result" || typeof id !== "string"
         || !this.expected.has(id) || this.seen.has(id)
-        || Object.keys(block).some((key) => key !== "type" && key !== "tool_use_id"
-          && key !== "content" && key !== "is_error")
         || (block.is_error !== undefined && typeof block.is_error !== "boolean")) {
         throw new BoxToolResultEchoError("BOX_TOOL_ECHO_ID_INVALID");
       }
-      const normalized = content(block.content);
+      let projection: ReturnType<typeof projectBoxResult>;
+      try { projection = projectBoxResult(block.content); }
+      catch { throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_INVALID"); }
+      const normalized = projection.atoms;
+      const envelopeChanged = Object.keys(block).some((key) =>
+        !["type", "tool_use_id", "content", "is_error"].includes(key));
       const isError = block.is_error === true;
       const hash = createHash("sha256").update(JSON.stringify({
         content: normalized, isError })).digest("hex");
       const expected = this.expected.get(id)!;
-      if (isError !== expected.isError || (hash !== expected.contentHash && (!expected.content
-        || !possibleCliRewrite(normalized as EchoBlock[], expected.content as EchoBlock[])))) {
-        const first = normalized[0] as EchoBlock | undefined;
+      if (isError !== expected.isError) {
+        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+      }
+      const compared = expected.content
+        ? compareBoxResult(projection, expected.content) : "incompatible";
+      const warning = projection.unknownShape || envelopeChanged
+        ? (projection.opaque ? "opaque_content" : "envelope") : undefined;
+      if (warning && !expected.content) {
+        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+      }
+      if (hash !== expected.contentHash && compared === "incompatible") {
+        const first = normalized[0];
         if (first?.type === "text" && CLI_BACKGROUNDED.test(first.text)) {
           throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CLI_BACKGROUNDED");
         }
-        throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
-      }
-      // OCV5-302: a possible CLI rewrite of known published content is
-      // verified asynchronously (pixels) before the echo may complete.
-      if (hash !== expected.contentHash) this.deferred.push({ echoed: normalized as EchoBlock[], expected });
+        if (!expected.content || !possibleCliRewrite(normalized, expected.content as EchoBlock[])) {
+          throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+        }
+        // Known lossy representations (empty markers / persisted previews /
+        // source notes) still require their complete existing proof.
+        this.deferred.push({ echoed: normalized, expected, warning });
+      } else if (warning) recordBoxContinuationCompatibility("echo", warning);
       this.seen.add(id);
     }
   }
@@ -220,6 +206,7 @@ export class BoxToolResultEcho {
       if (!cliTransformed(item.echoed, item.expected)) {
         throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
       }
+      if (item.warning) recordBoxContinuationCompatibility("echo", item.warning);
     }
   }
 
