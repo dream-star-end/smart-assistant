@@ -8399,6 +8399,26 @@
       ]
     },
     {
+      "id": "INC-20261028-SERVICE-RESTART-REFUND-COPY",
+      "occurredAt": "2026-10-27",
+      "severity": "P1",
+      "symptom": "t1133（个人版）：会话 webmvqm6jl6964ekm（k3.1-pro，uid3）dispatch d70edbec 以 SERVICE_RESTART 收口，状态卡写「本轮未计费，如已扣除，积分已原路退回」；只读核账：该轮主 dispatch 9 笔 committed 共 74 积分 + 3 个 explorer 子会话 1285 积分，turn_waivers / 正向 ledger 均为 0，没有任何退款。根因：render.ts errorPresentation 对 service_restart 写死 waived:true 与退款句，TurnStatusCard 强制 waiverApplied=true；退款只走 turn_waivers←tape waiveReason，TurnWaiveReason 不含 service_restart，网关合成 crashed tape 也不带 waiveReason。修：service_restart 文案随真实 waiver 标记（usage.waived）——无 waiver 时说明中断前已完成部分按实际用量计费、不称未计费/已退回；有 waiver 才说已免单退回；状态卡不再对 SERVICE_RESTART 强制免单、非免单不出 ShieldCheck。不改账本与 waiver 路径；历史扣费按 t1133 结论不退结案。",
+      "rootFixCommit": "c8e4fb8a",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "t1133 SERVICE_RESTART 无 turn waiver → 不称未计费/已退回，按实际用量计费"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "t1133 SERVICE_RESTART 状态卡无 turn waiver → 不称未计费/已退回"
+        }
+      ]
+    },
+    {
       "id": "INC-20261028-BOX-CAPACITY-HELD-GHOST",
       "occurredAt": "2026-10-28",
       "severity": "P1",
