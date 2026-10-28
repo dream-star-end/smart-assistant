@@ -37,13 +37,14 @@ class FakeWS {
   }
 }
 
-function makeSocket(): ChatSocket {
+function makeSocket(overrides: Partial<ChatSocketDeps> = {}): ChatSocket {
   const deps: ChatSocketDeps = {
     getToken: () => "tok",
     getAuthEpoch: () => 0,
     silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
     onAuthExpired: () => {},
     defaultAgentId: "main",
+    ...overrides,
   };
   return new ChatSocket(deps);
 }
@@ -99,7 +100,7 @@ function boot(id: string): { sock: ChatSocket; ws: FakeWS; session: ChatSession 
       },
       turnStatus: null, reconcile: null, pendingPermissions: { items: [], completeness: "complete" },
       usage: null, credits: null, frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 1,
-    }),
+    }) as never,
   });
   sock.setGateReady(true);
   const ws = FakeWS.instances.at(-1)!;

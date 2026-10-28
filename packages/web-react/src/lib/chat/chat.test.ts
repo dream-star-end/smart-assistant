@@ -7562,8 +7562,8 @@ describe("ChatSocket problem card reporting", () => {
     const sock = makeSocket({
       syncSession: async () => {},
       reportProblemCard: (p) => { reports.push({ ...p }); },
-      readSessionSnapshot: opts.snapshot ?? recoveryChildRunning(sessId),
-    } as never);
+      readSessionSnapshot: (opts.snapshot ?? recoveryChildRunning(sessId)) as never,
+    });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
