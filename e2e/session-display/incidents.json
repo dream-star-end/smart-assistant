@@ -9009,6 +9009,11 @@
       "rootFixCommit": "9cb4f3aa",
       "regressions": [
         {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/sealed-partial-answer.node-test.mjs",
+          "assertion": "INC-20261028-BOX-SEALED-PARTIAL-ANSWER: sealed crash keeps Markdown and the hard failure card"
+        },
+        {
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/render.test.ts",
           "assertion": "sealed crash preserves Markdown before a directly appended API error"
