@@ -6,6 +6,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const scratch = mkdtempSync(join(tmpdir(), 'oc-v5-system-executor-proof-'))
+// Complete cold/load-bound runs have taken >100s; retain a finite budget without retrying or omitting tests.
+const timeoutMs = 180_000
+const startedAt = performance.now()
 const proof = spawnSync(process.execPath, ['--import', 'tsx', '--test',
   'packages/storage/src/systemActions.test.ts',
   'packages/storage/src/__tests__/controlRecoveryRecord.test.ts',
@@ -38,9 +41,12 @@ const proof = spawnSync(process.execPath, ['--import', 'tsx', '--test',
   'packages/gateway/src/__tests__/systemHelpCli.test.ts',
   'packages/gateway/src/__tests__/systemHelpTurnLifecycle.test.ts',
 ], { cwd: root, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: scratch, TMPDIR: scratch },
-  stdio: 'inherit', timeout: 120_000 })
+  stdio: 'inherit', timeout: timeoutMs })
 if (proof.error || proof.signal || proof.status !== 0) {
-  console.error('[system-executor-proofs] FAIL')
+  console.error('[system-executor-proofs] FAIL', JSON.stringify({
+    error: proof.error?.message ?? null, code: (proof.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+    signal: proof.signal, status: proof.status, timeoutMs, elapsedMs: Math.round(performance.now() - startedAt),
+  }))
   process.exit(1)
 }
 console.log('[system-executor-proofs] PASS independent browser approval, original request replay and frozen executors')
