@@ -95,6 +95,9 @@ DO NOT MERGE — 待真 Grok OD / 管家
   the default disabled path performs no lookup. Artifacts are bounded (128 KiB ZIP / 32 KiB JSON).
 - Local focused run: 46 tests passed, 0 failed/skipped (receipt, parity, TMPDIR/cache, source-pin).
   Scoped strict TypeScript, changed-file Biome, shell syntax and unchanged 18-gate parity passed.
-  No existing assertion was changed or removed; full application suites remain CI-owned.
+  Full application suites remain CI-owned. Code review R1 identified the existing summary test's
+  old call-shape scanner as obsolete after d024e44e0: it counted 7 local forms against 15 marks.
+  The scanner now also recognizes the exact receipt-guard + local-command form; its original
+  gate-count/phase-count equality assertion is preserved (15/15), not relaxed.
 - Live GitHub signature acceptance and an actual merge-group drill remain activation prerequisites;
   local mocks prove rejection/fallback and command policy, not cryptographic signing by GitHub.
