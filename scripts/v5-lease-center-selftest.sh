@@ -40,6 +40,9 @@ export OC_V5_LEASE_TRAIN_PLANNED_STALE_SECONDS=1
 export OC_V5_LEASE_CUTOVER_GRACE_FILE="$T/run/cutover-grace-until"
 export OC_USER_ID=3
 unset OC_SESSION_KEY OC_V5_LEASE_CALLBACK_URL
+# A CI runner may itself be a systemd service. This fixture uses setsid and must
+# never inherit the runner's service identity or create a real transient unit.
+unset INVOCATION_ID
 
 # 假仓库:origin(bare)+ 工作树,3 个 commit:c0(已上线) c1 c2
 git init -q --bare "$T/origin.git"

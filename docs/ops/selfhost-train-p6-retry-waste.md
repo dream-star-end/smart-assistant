@@ -31,3 +31,5 @@ DO NOT MERGE — 待真 Grok OD / 管家。
 ## 用例卫生
 
 原 source-pin/idle 测试因 `cmd_deploy` 新增前置 idle 与 reuse 分支，需同步 stub 和截取边界；原断言不放宽。outer-policy fixture 同步加载 `cmd_cutover` 新增的真实 E3 helper 依赖。host gate 函数移到共享 helper 后，原测试从两份文件拼接提取。worker 测试增加私有 host load/proc/lock fixture，使真实宿主繁忙不能改变用例结果。新增测试通过 selfhost gates CI 执行；全量 commercial/gateway/web-react 留给 CI。
+
+首次 CI 的 lease fixture 继承了 runner 的 `INVOCATION_ID`，误走真实 systemd 发车分支，fake deploy 启动数为零。用拒绝所有 systemd 命令的私有桩重现 T1 的 5 项失败后，fixture 清除该外部 service 标识；CI 显式注入同类标识来覆盖隔离行为。原有 64 项断言不变。
