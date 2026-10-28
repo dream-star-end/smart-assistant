@@ -101,3 +101,50 @@ DO NOT MERGE — 待真 Grok OD / 管家
   gate-count/phase-count equality assertion is preserved (15/15), not relaxed.
 - Live GitHub signature acceptance and an actual merge-group drill remain activation prerequisites;
   local mocks prove rejection/fallback and command policy, not cryptographic signing by GitHub.
+
+
+## P8 deepen — 2026-10-28, implementation baseline 02907d209
+
+DO NOT MERGE. The prior code audit is APPROVED and its head has 22 successful checks
+(2 merge-group-only jobs skipped on PR). This follow-up strengthens the same draft;
+no activation, queue registration, merge, deployment, dependencies or runtime changes.
+
+Planned changes, to be reviewed before implementation:
+
+1. Require `gh attestation verify --format json` and inspect only its verified certificate
+   extensions. In addition to all existing verifier flags, require the certificate's
+   `runInvocationURI` to equal the authenticated run/attempt URL and `buildTrigger` to be
+   `merge_group`. Do not treat the payload or user-controlled provenance predicate as
+   run identity. Empty, malformed, missing or mismatched verified output is a miss.
+2. Check artifact `workflow_run` id/head SHA/head branch against the selected run before
+   download. Check repository numeric identity if supplied by the corresponding API run
+   (with explicit schema validation); prefer requiring the documented run/artifact IDs
+   rather than accepting incomplete metadata. Preserve latest-only selection and final
+   run/attempt recheck, bounded calls and scratch cleanup.
+3. Tighten input syntax to reject repository dot segments and invalid/empty queue refs.
+   ZIP parsing must accept one ordinary receipt entry only, rejecting duplicate entries,
+   symlink/device entries, encrypted/invalid archives and oversized decompressed data.
+4. Add focused behavioral regressions for verified certificate run/attempt/event mismatches,
+   malformed API/artifact/ZIP outputs, cleanup on every failure, exact independent verifier
+   argument expectations, CLI issuance event/checkout/outcome failures, and shell prepare
+   hit-to-miss/reset/failure propagation. Use isolated temp fixtures and fake gh executables;
+   no network credentials, shared DB, gate workloads or live deployment from these tests.
+   Retain every existing assertion and gate command; update mocks for stricter metadata.
+
+Scope: receipt TS library/CLI only if needed, receipt test files, receipt CI test/typecheck
+wiring only if a new test file needs inclusion, this plan. Keep authoritative manifest,
+subset policy, parity checker, existing gate commands and train integration unchanged.
+Validation: regression red/green on the receipt suite, targeted parity/source-pin/TMPDIR/
+summary tests, scoped strict tsc and Biome, shell syntax, fix-trailers. Full application
+suites remain CI-owned. Before any shared test lock, run H/wait-for-trains.sh --self train-p8;
+BUSY means wait. No new worktree or node_modules. Commit+push, H/codex-review.sh using only
+gpt-6-astra/xhigh, update PR evidence and CONTINUE, then stop with the requested DONE line.
+
+Possible regression: an older gh or incomplete certificate/API response causes extra local
+execution. This is intentional fail-closed behavior, remains default OFF, and must never
+permit a failed local gate. Real GitHub cryptographic acceptance and actual merge_group drill
+remain separate activation prerequisites, not claimed by mock tests.
+
+Contract references: [gh verified JSON](https://cli.github.com/manual/gh_attestation_verify),
+[Fulcio certificate extensions](https://github.com/sigstore/sigstore-go/blob/main/pkg/fulcio/certificate/extensions.go),
+[Actions artifact API](https://docs.github.com/en/rest/actions/artifacts#list-workflow-run-artifacts).
