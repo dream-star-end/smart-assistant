@@ -8,12 +8,12 @@ import type { EngineContentEvent } from '../engine/engineEvents.js'
 import { renderHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
 import { classifyRunError } from '../errorClassify.js'
 
-const serialize = (input: string) => JSON.stringify({ event: 'user', message: { content: input } }) + '\n'
+const serialize = (input: string) => `${JSON.stringify({ event: 'user', message: { content: input } })}\n`
 
 test('50 MiB history is fitted using encoded bytes and preserves the exact current request', async () => {
   const events: EngineContentEvent[] = []
   const input = renderHistoricalContextJsonPrompt(
-    Array.from({ length: 200 }, (_, i) => ({ role: 'User', text: `${i}:` + 'x'.repeat(256 * 1024) })),
+    Array.from({ length: 200 }, (_, i) => ({ role: 'User', text: `${i}:${'x'.repeat(256 * 1024)}` })),
     '继续处理 "最后一个任务" 😀',
   )
   const result = await prepareBoundedPrompt({ input, serialize, maxBytes: 600 * 1024, cwd: '/unused', engine: 'antigravity', onEvent: (e) => events.push(e) })

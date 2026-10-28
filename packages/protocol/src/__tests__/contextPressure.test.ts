@@ -11,7 +11,7 @@ test('pressure and completed transformations are additive frames with distinct m
   const frame = { ...routing, ...pressure, type: 'session.context_pressure' }
   assert.ok(Value.Check(SessionContextPressure, frame))
   assert.ok(Value.Check(AnyFrame, frame))
-  for (const usedRatio of [-1, NaN, Infinity]) assert.equal(Value.Check(SessionContextPressure, { ...frame, usedRatio }), false)
+  for (const usedRatio of [-1, Number.NaN, Number.POSITIVE_INFINITY]) assert.equal(Value.Check(SessionContextPressure, { ...frame, usedRatio }), false)
   assert.equal(Value.Check(SessionContextPressure, { ...frame, scope: 'unlimited' }), false)
   const done = { ...routing, type: 'sys.context_compacted', engine: 'antigravity', scope: 'launch_prompt', strategy: 'file_reference', beforeBytes: 999999, afterBytes: 800, droppedEntries: 0 }
   assert.ok(Value.Check(SysContextCompacted, done))
