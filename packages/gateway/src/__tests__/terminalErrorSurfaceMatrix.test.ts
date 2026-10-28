@@ -149,6 +149,13 @@ const SCENARIOS: readonly Scenario[] = [
     attempts: 1,
     why: 'OCV5-556 — 平台写给 Antigravity CLI 的凭证本地判过期,同一启动重放只会再失败(三次恢复各白烧 25-31 万上游输入);下一条消息会拿到新凭证',
   },
+  {
+    code: 'box_capacity_held',
+    sample:
+      'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"},"request_id":"065f563d454c692b1f828fd3d36d49c3"}',
+    attempts: 1,
+    why: 'OCV5-649 — Box 准入在任何模型调用前拒绝,会话槽仍被上一轮占着;同轮重试只会再等同一个 hold(商业 uid4 10-28 连续三次)',
+  },
 ]
 
 /**
