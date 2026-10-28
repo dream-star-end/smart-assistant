@@ -61,3 +61,19 @@ test('an oversized platform envelope still fails honestly and removes only its u
     assert.deepEqual(await readdir(cwd), [])
   } finally { await rm(cwd, { recursive: true, force: true }) }
 })
+
+
+test('content-addressed references publish atomically and reuse files across callers', async () => {
+  const { writeContextReference } = await import('../engine/contextReference.js')
+  const cwd = await mkdtemp(join(tmpdir(), 'oc-context-ref-'))
+  try {
+    const content = Buffer.alloc(256 * 1024, 9)
+    const key = 'a'.repeat(64)
+    const refs = await Promise.all(Array.from({ length: 4 }, () => writeContextReference(cwd, content, 'image.png', key)))
+    assert.equal(new Set(refs.map(r => r.file)).size, 1)
+    assert.deepEqual(await readFile(refs[0]!.file), content)
+    assert.equal((await readdir(cwd)).length, 1)
+    assert.equal((await writeContextReference(cwd, content, 'image.png', key)).file, refs[0]!.file)
+    await assert.rejects(writeContextReference(cwd, 'changed', 'image.png', key), /does not match/)
+  } finally { await rm(cwd, { recursive: true, force: true }) }
+})
