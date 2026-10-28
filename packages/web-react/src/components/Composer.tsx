@@ -494,7 +494,8 @@ export function Composer({
   latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
     (previousSubmit.value!==value||previousSubmit.attachments!==attachments||previousSubmit.draftKey!==draftKey||previousSubmit.replyTo!==replyTo?1:0)};
   // Keep the draft until asynchronous fee confirmation has accepted this send.
-  const submit = (sendPrediction = false) => {
+  // onAccepted runs only once onSend accepted it (a declined confirm returns false).
+  const submit = (sendPrediction = false, onAccepted?: () => void) => {
     if (disabled || !canSend || submittingRef.current) return;
     const typed = value.trim().length > 0 || doneMedia.length > 0;
     if (!typed && !sendPrediction) return;
@@ -504,6 +505,7 @@ export function Composer({
     const finish=(sent:unknown)=>{
       submittingRef.current=false;
       if(sent===false)return;
+      onAccepted?.();
       if(latestSubmitRef.current.draftKey!==snapshot.draftKey){
         // A successful first send may promote the empty composer to its new
         // session. Clear only the submitted owner's unchanged stored draft.
@@ -1001,10 +1003,7 @@ export function Composer({
                   aria-label="排队发送"
                   title="本轮结束后自动发送"
                   className="text-accent"
-                  onClick={() => {
-                    submit();
-                    toast("已加入队列，本轮结束后发送", "info");
-                  }}
+                  onClick={() => submit(false, () => toast("已加入队列，本轮结束后发送", "info"))}
                 >
                   <ListPlus size={19} />
                 </IconButton>

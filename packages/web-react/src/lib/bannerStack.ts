@@ -10,12 +10,14 @@
  * 优先级表就是产品约定,改它要改这里并改测试,不要在渲染处临时调换顺序。
  */
 
-export type BannerKind = 'error' | 'connection' | 'dormant' | 'update' | 'cost'
+export type BannerKind = 'error' | 'connection' | 'turn' | 'dormant' | 'update' | 'cost'
 
-/** 从高到低。error(上一条发送失败,带重试)必须恒在最上;connection 是断线真相,其次。 */
+/** 从高到低。error(上一条发送失败,带重试)必须恒在最上;connection 是断线真相,其次。
+ *  turn = 本轮仍在运行、现在发送会排队另计费(B4);只在已连接时出现,与 connection 不同屏。 */
 export const BANNER_PRIORITY: readonly BannerKind[] = [
   'error',
   'connection',
+  'turn',
   'dormant',
   'update',
   'cost',

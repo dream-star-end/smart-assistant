@@ -41,10 +41,17 @@ describe('resolveBanners(全局横幅栈裁决,S-06)', () => {
   })
 
   test('展开后全部露出、顺序不变,并给出「收起」入口', () => {
-    const r = resolveBanners(['cost', 'update', 'dormant', 'connection', 'error'], true)
+    // B4 新增 turn 后输入改成「全部种类倒序」,断言意图不变:展开即按优先级全露。
+    const r = resolveBanners([...BANNER_PRIORITY].reverse(), true)
     expect(r.visible).toEqual([...BANNER_PRIORITY])
     expect(r.hidden).toEqual([])
     expect(r.canCollapse).toBe(true)
+  })
+
+  test('本轮运行条(turn)排在连接条之后、休眠/新版本/成本提醒之前', () => {
+    expect(resolveBanners(['cost', 'update', 'turn', 'dormant']).visible).toEqual(['turn', 'dormant'])
+    expect(resolveBanners(['turn', 'error']).visible).toEqual(['error', 'turn'])
+    expect(BANNER_PRIORITY.indexOf('turn')).toBe(BANNER_PRIORITY.indexOf('connection') + 1)
   })
 
   test('条数本就不超上限时,expanded 不产生「收起」入口', () => {
