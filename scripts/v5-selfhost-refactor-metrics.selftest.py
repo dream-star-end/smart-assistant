@@ -136,7 +136,7 @@ class DrainTest(unittest.TestCase):
                 "\n".join([
                     '2026-10-20T00:00:00Z {"ts":"2026-10-20T00:00:00Z","msg":"user-chat-bridge: inbound turn start","uid":"3","traceId":"tr1","connId":"c1"}',
                     '2026-10-20T00:00:10Z {"ts":"2026-10-20T00:00:10Z","msg":"user-chat-bridge: closed","uid":"3","connId":"c1","durationMs":10000,"cause":"client_close"}',
-                    '2026-10-20T00:02:00Z {"ts":"2026-10-20T00:02:00Z","msg":"dispatch transition by reconciler","uid":"3","action":"fence_hard_cap"}',
+                    '2026-10-20T00:02:00Z {"ts":"2026-10-20T00:02:00Z","msg":"dispatch transition by reconciler","userId":"3","action":"fence_hard_cap"}',
                     '2026-10-20T00:03:00Z {"ts":"2026-10-20T00:03:00Z","msg":"user-chat-bridge: closed","uid":"9","connId":"other","durationMs":1000,"cause":"client_close"}',
                 ]) + "\n",
                 encoding="utf-8",
@@ -156,7 +156,7 @@ class DrainTest(unittest.TestCase):
                     '{"service":"openclaude-v3","writeCalls":1}',
                     '{"ts":"2026-10-20T00:00:00.000Z","msg":"user-chat-bridge: inbound turn start","uid":"3","traceId":"tr1","connId":"c1"}',
                     '{"ts":"2026-10-20T00:00:10.000Z","msg":"user-chat-bridge: closed","uid":"3","connId":"c1","durationMs":10000,"cause":"client_close"}',
-                    '{"ts":"2026-10-20T00:05:00.000Z","msg":"dispatch transition by reconciler","uid":"3","action":"fence_hard_cap"}',
+                    '{"ts":"2026-10-20T00:05:00.000Z","msg":"dispatch transition by reconciler","userId":"3","action":"fence_hard_cap"}',
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -175,6 +175,71 @@ class DrainTest(unittest.TestCase):
             self.assertEqual(stats["fence_hard_cap_lines_in_scope"], 1)
             self.assertEqual(stats["log_files"], 2)
 
+
+
+    def test_enter_drain_is_the_browser_disconnect(self):
+        """Review r1 P1 at the closed-log read.
+
+        Enter drain at second 10, closed recorded at second 70, turn ends at
+        second 100, no other connection. The browser was already gone at enter
+        drain, so the uncovered gap is 90s and the turn exceeds drain. Treating
+        the bridge closed timestamp as the disconnect counts only 30s and
+        reports 0.
+        """
+        start = "2026-10-20T00:00:00Z"
+        drain_at = "2026-10-20T00:00:10Z"
+        closed_at = "2026-10-20T00:01:10Z"
+        ended = "2026-10-20T00:01:40Z"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "openclaude-v5-selfhost.log"
+            log.write_text(
+                "\n".join([
+                    '{"ts":"%s","msg":"user-chat-bridge: inbound turn start","uid":"3","traceId":"tr1","connId":"c1"}' % start,
+                    '{"ts":"%s","msg":"user-chat-bridge: enter drain","uid":"3","connId":"c1","inflightCount":1,"admittedCount":1,"preparationCount":0}' % drain_at,
+                    '{"ts":"%s","msg":"user-chat-bridge: closed","uid":"3","connId":"c1","durationMs":70000,"cause":"client_close"}' % closed_at,
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            turns = [{
+                "u": 3,
+                "t": "tr1",
+                "tt": [],
+                "a": m._parse_epoch(start),
+                "e": m._parse_epoch(ended),
+            }]
+            stats = m.scan_master_logs([log], turns)
+            self.assertEqual(stats["h_turns_in_log_window"], 1)
+            self.assertEqual(stats["drain_exceeded_turns"], 1)
+
+    def test_fence_hard_cap_uses_user_id_and_query_window(self):
+        """Review r1 P1: production fence lines carry userId, not uid.
+
+        Query is 2026-10-20 for uid 3. The log contains a 2026-10-01
+        userId=765 fence_hard_cap and a 2026-10-20 userId=9 fence_hard_cap.
+        In-range count is 0. Reading uid treats both missing-uid lines as
+        in scope and ignores since/until, so the count is 2.
+
+        The same window also has an out-of-range userId=3 line and an in-range
+        line with no user id. Neither is in scope. The in-range userId=9 line
+        is another uid, not dropped as unparsable.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "openclaude-v5-selfhost.log"
+            log.write_text(
+                "\n".join([
+                    '{"ts":"2026-10-01T00:00:00Z","msg":"dispatch transition by reconciler","userId":"765","action":"fence_hard_cap"}',
+                    '{"ts":"2026-10-01T08:00:00Z","msg":"dispatch transition by reconciler","userId":"3","action":"fence_hard_cap"}',
+                    '{"ts":"2026-10-20T04:00:00Z","msg":"dispatch transition by reconciler","userId":"9","action":"fence_hard_cap"}',
+                    '{"ts":"2026-10-20T05:00:00Z","msg":"dispatch transition by reconciler","action":"fence_hard_cap"}',
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            since = m._parse_epoch("2026-10-20T00:00:00+08:00")
+            until = m._parse_epoch("2026-10-21T00:00:00+08:00")
+            turns = [{"u": 3, "t": "tr-none", "tt": [], "a": since, "e": since + 60}]
+            stats = m.scan_master_logs([log], turns, since=since, until=until, cohort_uids={3})
+            self.assertEqual(stats["fence_hard_cap_lines_in_scope"], 0)
+            self.assertEqual(stats["fence_hard_cap_lines_other_uid"], 1)
 
 class QueryAndReportTest(unittest.TestCase):
     def test_sql_is_scoped_and_read_only_body(self):
@@ -272,6 +337,26 @@ class QueryAndReportTest(unittest.TestCase):
         failed_text = m.render_markdown(failed)
         self.assertIn("查询失败", failed_text)
         self.assertNotIn("17.5%", failed_text)
+
+
+    def test_zero_recoveries_are_zero_percent(self):
+        """Review r1 P1: SQL GROUP BY omits a zero class, so S_recover is absent.
+
+        Ten human turns and zero recovery turns must render 0.0% (0/10).
+        classes.get("S_recover") is None and the report says 无样本.
+        """
+        report = m.assemble(
+            {"since": "2026-10-20T00:00:00+08:00", "until": "2026-10-21T00:00:00+08:00"},
+            [3],
+            {"cohort": {"classes": {"H_human": 10}, "h_users": 4}},
+            None,
+        )
+        self.assertEqual(report["w3"]["h_human"], 10)
+        self.assertEqual(report["w3"]["s_recover"], 0)
+        self.assertEqual(report["w3"]["recovery_ratio"], 0.0)
+        self.assertEqual(report["w3"]["recovery_display"], "0.0% (0/10)")
+        text = m.render_markdown(report)
+        self.assertIn("自动恢复回合 S_recover=0，比例 0.0% (0/10)", text)
 
     def test_redact(self):
         self.assertIn("<redacted>", m.redact("fail postgres://user:secret@localhost/db tail"))

@@ -17,8 +17,9 @@ W1
   切后台首绘：product_friction_events.code='FIRST_TEXT_PAINT_AFTER_BACKGROUND' 的
   latency_ms，用 percentile_cont（p50 / p95）。没有 latency 的事件计入 n，但不进分位。
   空白视口：code LIKE 'TIMELINE_BLANK%' 的事件次数（web）。
-  断线超过 drain：master 日志里，人发回合的发起连接在终态前关闭，且从该关闭到终态之间
-  没有任何同 uid 连接覆盖的时长 > 60s。日志不含 session_id，同 uid 的其它标签页会算作「有连接」。
+  断线超过 drain：master 日志里，人发回合的发起连接在终态前断开，且从断开到终态之间
+  没有任何同 uid 连接覆盖的时长 > 60s。浏览器在 `user-chat-bridge: enter drain` 时已经断开；
+  没有这条日志时，断开时间才用 `user-chat-bridge: closed`。日志不含 session_id，同 uid 的其它标签页会算作「有连接」。
   个人帧缺口：只算 gateway 的 dispatch 流（stream_key 不以 legacy: 开头）。
   缺口 A = max(frame_seq) - count > 200；缺口 B = (max-min+1) - count > 200。
   pruneProjectedLiveFrames 会删掉已投影到 tape 的帧，于是 count=0 且 max 为空。
@@ -30,7 +31,9 @@ W1
   （只在没有 tape、走了 projectFallback 时写）。
   另外单列：producer_fenced_at 非空、outcome=interrupted、终态时刻减去
   accepted/admitted ≥ 6 小时。这是代理，不是动作名本身。
-  日志里 fence_hard_cap 的行数只覆盖日志保留期。
+  日志里 fence_hard_cap 的行数只覆盖日志保留期与查询窗口的交集。
+  生产日志的用户字段是 userId（bridge 连接日志才是 uid）。缺 userId 的行不计入。
+  只统计 ts 落在 [since, until) 且 userId 属于本次查询人群的行；默认人群排除 765。
   container_link_active：information_schema 里有这个列或 container_links 表才计数，
   否则输出「未上线」。
 
@@ -139,6 +142,7 @@ _URL_RE = re.compile(r"(postgres(ql)?://)[^ \s\"]+")
 
 CLOSED_MSG = "user-chat-bridge: closed"
 INBOUND_MSG = "user-chat-bridge: inbound turn start"
+ENTER_DRAIN_MSG = "user-chat-bridge: enter drain"
 
 
 def redact(text: str) -> str:
@@ -442,10 +446,44 @@ def _line_stamp(line: str) -> float | None:
     return None
 
 
-def scan_master_logs(paths: list[Path], turns: list[dict]) -> dict:
-    uids = {int(turn["u"]) for turn in turns if turn.get("u") is not None}
+def _digit_id(raw) -> int | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    text = str(raw)
+    if not text.isdigit():
+        return None
+    return int(text)
+
+
+def _stamp_in_window(stamp: float | None, since: float | None, until: float | None) -> bool:
+    if stamp is None:
+        return False
+    if since is not None and stamp < since:
+        return False
+    if until is not None and stamp >= until:
+        return False
+    return True
+
+
+def scan_master_logs(
+    paths: list[Path],
+    turns: list[dict],
+    since: float | None = None,
+    until: float | None = None,
+    cohort_uids: list[int] | set[int] | None = None,
+) -> dict:
+    """Scan master logs for browser disconnects and in-window fence_hard_cap lines.
+
+    Bridge lines identify the user with uid. fence_hard_cap lines identify the
+    user with userId. A fence line with no userId is not in scope. since/until
+    are epoch seconds; None means that side of the window is open. cohort_uids
+    None means every user except the acceptance account.
+    """
+    turn_uids = {int(turn["u"]) for turn in turns if turn.get("u") is not None}
+    fence_cohort = None if cohort_uids is None else {int(uid) for uid in cohort_uids}
     closes = []
     inbounds = []
+    drain_at: dict[tuple[int, str], float] = {}
     first = None
     last = None
     fence_in_scope = 0
@@ -461,27 +499,43 @@ def scan_master_logs(paths: list[Path], turns: list[dict]) -> dict:
                 obj = parse_log_json(line)
                 if obj is None:
                     continue
-                uid_raw = obj.get("uid")
-                try:
-                    uid = int(uid_raw) if uid_raw is not None and str(uid_raw).isdigit() else None
-                except (TypeError, ValueError):
-                    uid = None
                 if "fence_hard_cap" in line:
-                    if uid is None or uid in uids:
-                        fence_in_scope += 1
-                    else:
-                        fence_other += 1
-                if uid is None or uid not in uids:
+                    fence_uid = _digit_id(obj.get("userId"))
+                    fence_stamp = _parse_epoch(str(obj.get("ts") or ""))
+                    if fence_uid is not None and _stamp_in_window(fence_stamp, since, until):
+                        in_cohort = (
+                            fence_uid != ACCEPTANCE_UID
+                            if fence_cohort is None
+                            else fence_uid in fence_cohort
+                        )
+                        if in_cohort:
+                            fence_in_scope += 1
+                        else:
+                            fence_other += 1
+                uid = _digit_id(obj.get("uid"))
+                if uid is None or uid not in turn_uids:
                     continue
                 msg = obj.get("msg")
                 stamp = _parse_epoch(str(obj.get("ts") or ""))
                 if stamp is None:
                     continue
-                if msg == CLOSED_MSG and isinstance(obj.get("durationMs"), (int, float)) and obj.get("connId"):
-                    closes.append((uid, str(obj["connId"]), stamp - float(obj["durationMs"]) / 1000.0, stamp))
-                elif msg == INBOUND_MSG and obj.get("traceId") and obj.get("connId"):
-                    inbounds.append((uid, str(obj["traceId"]), stamp, str(obj["connId"])))
-    stats = drain_stats(turns, closes, inbounds, first, last)
+                conn_id = obj.get("connId")
+                if msg == ENTER_DRAIN_MSG and conn_id:
+                    key = (uid, str(conn_id))
+                    prev = drain_at.get(key)
+                    if prev is None or stamp < prev:
+                        drain_at[key] = stamp
+                elif msg == CLOSED_MSG and isinstance(obj.get("durationMs"), (int, float)) and conn_id:
+                    closes.append((uid, str(conn_id), stamp - float(obj["durationMs"]) / 1000.0, stamp))
+                elif msg == INBOUND_MSG and obj.get("traceId") and conn_id:
+                    inbounds.append((uid, str(obj["traceId"]), stamp, str(conn_id)))
+    adjusted = []
+    for uid, conn_id, start, end in closes:
+        disconnected = drain_at.get((uid, conn_id))
+        if disconnected is not None and start <= disconnected < end:
+            end = disconnected
+        adjusted.append((uid, conn_id, start, end))
+    stats = drain_stats(turns, adjusted, inbounds, first, last)
     stats["fence_hard_cap_lines_in_scope"] = fence_in_scope
     stats["fence_hard_cap_lines_other_uid"] = fence_other
     stats["log_files"] = len(paths)
@@ -821,9 +875,16 @@ def _classes(cohort) -> dict:
 
 
 def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats: dict | None) -> dict:
-    classes = _classes(sql_results.get("cohort"))
-    h_turns = classes.get("H_human")
-    recover = classes.get("S_recover")
+    cohort_row = sql_results.get("cohort")
+    classes = _classes(cohort_row)
+    # GROUP BY omits a class whose count is zero. A successful cohort with no
+    # S_recover key is 0 recoveries, not a missing sample.
+    if isinstance(cohort_row, dict) and not _failed(cohort_row):
+        h_turns = classes.get("H_human", 0)
+        recover = classes.get("S_recover", 0)
+    else:
+        h_turns = None
+        recover = None
     stop = sql_results.get("stop")
     if _failed(stop) or not isinstance(stop, dict):
         stop_section = stop if _failed(stop) else {"error": "missing"}
@@ -853,6 +914,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
                 "fence_hard_cap 不写 turn_dispatches.failure_code。"
                 "friction 的 reason=fence_hard_cap 只在无 tape 的 projectFallback 路径写入。"
                 "fenced_interrupted_ge_6h 是 producer_fenced 且时长≥6 小时的代理，动作名无法从终态列回放。"
+                "日志行读 userId，缺该字段的不计入，并且只保留 ts 落在查询窗口内的行。"
             ),
         }
         if log_stats and "fence_hard_cap_lines_in_scope" in log_stats:
@@ -917,6 +979,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
                 "origin_closed_before_terminal": log_stats.get("origin_closed_before_terminal"),
                 "note": (
                     "分母是 admitted 落在日志时间范围内的人发回合。"
+                    "浏览器在 enter drain 时断开；没有 enter drain 的连接用 closed 时间。"
                     "关闭记录没有 session_id，同一 uid 的其它连接会算作覆盖。"
                     "找不到发起连接的回合记入 no_origin_conn，不算断线超过 drain。"
                 ),
@@ -1322,7 +1385,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_logs and not _failed(sql_results.get("drain_turns")):
         turns = sql_results.get("drain_turns") or []
         try:
-            log_stats = scan_master_logs(log_paths(Path(args.log_dir)), turns)
+            log_stats = scan_master_logs(
+                log_paths(Path(args.log_dir)),
+                turns,
+                since=since_epoch,
+                until=until_epoch,
+                cohort_uids=None if uids is None else uids,
+            )
         except OSError as exc:
             log_stats = {"error": redact(str(exc))[:300]}
             failures.append("logs")
