@@ -702,13 +702,15 @@ function sanitizeErrorDetail(detail: string | undefined): string | undefined {
 }
 
 /**
- * 从正文尾部切出 tape 兼容终止器([turn failed: …] / [error] …)。tape 把它作为兼容 final
- * 追加到最后一个 assistant segment 的 text 尾,合法部分回答与终止器常同串:
+ * 从正文尾部切出 tape 兼容终止器([turn failed: …] / [error] … / API Error 信封)。
+ * tape 把它作为兼容 final 追加到最后一个 assistant segment 的 text 尾,合法部分回答与
+ * 终止器常同串,API Error 甚至可能直接跟在 closing code fence 后而没有换行:
  *   "…正常部分回答…\n\n[turn failed: …]\n"
+ *   "…```API Error: 409 {\"error\":…}"
  * 返回 { body: 终止器前的正文(trim), terminator: 终止器串(trim) };无终止器 → body=原串、terminator=""。
  */
 function splitTrailingTerminator(text: string): { body: string; terminator: string } {
-  const m = /\n*[ \t]*(\[(?:turn failed|error)\b[^\n]*)\s*$/i.exec(text);
+  const m = /\n*[ \t]*((?:\[(?:turn failed|error)\b|API Error: \d{3}\s+\{\s*"error"\s*:)[^\n]*)\s*$/i.exec(text);
   if (!m) return { body: text, terminator: "" };
   return { body: text.slice(0, m.index).trim(), terminator: m[1].trim() };
 }
@@ -904,7 +906,12 @@ export function errorPresentation(
   // engine_error 且**正文本身**是 JSON/堆栈内部串 → 收敛为友好内部错误文案(把内部转储当"答复"
   // 甩给用户是最刺眼的一类)。**只看 text**(不再因 detail 内部就命中):若 text 是合法部分回答、
   // 仅 detail 是内部串,应落到下方 R6 分支保住部分回答(detail 交由 sanitizeErrorDetail 脱敏)。
-  if (normalized === "engine_error" && looksLikeInternalError(text)) {
+  const { body: beforeTrailingTerminator } = splitTrailingTerminator(text?.trim() ?? "");
+  if (
+    normalized === "engine_error" &&
+    looksLikeInternalError(text) &&
+    (!beforeTrailingTerminator || looksLikeInternalError(beforeTrailingTerminator))
+  ) {
     return {
       title: ERROR_LABELS.engine_error,
       message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
