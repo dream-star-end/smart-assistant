@@ -772,7 +772,7 @@ write_master_version_json() { # <staging> <short-sha>
 #   packages/protocol 整棵 tree(@openclaude/protocol 依赖)
 #   packages/mcp-memory/src(web-react 唯一越包相对 import:mcp-memory/src/toolNames)
 #   根 package-lock.json / package.json(依赖版本)
-#   本文件自身(构建步骤一变就作废所有旧 key)
+#   本文件与 selfhost prewarm 库(任一构建步骤改变即作废旧 key)
 #   node --version
 #   构建进程环境里会进产物的变量:VITE_*(Vite 编译期内联)、NODE_ENV、BROWSERSLIST*
 # donor 必须是完整封存的 release:.complete 结构合法、根 0:0 且不可组/他写、release_artifact_digest
@@ -787,6 +787,7 @@ WEB_DIST_KEY_PATHS=(
   package-lock.json
   package.json
   scripts/v5-selfhost-master-release-lib.sh
+  scripts/lib/v5-selfhost-prewarm.sh
 )
 
 master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 → rc=1(调用方照常构建)
@@ -829,6 +830,7 @@ web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改�
 
 find_web_dist_donor() { # <key>
   local key="$1" cand rec rkey rdigest got live=""
+  if declare -F prewarm_web_donor >/dev/null && prewarm_web_donor "$key"; then return 0; fi
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
   if [[ -L "$MASTER_LIVE_LINK" ]]; then
     live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -1170,6 +1172,8 @@ build_master_release() {
       cleanup_master_staging
       die "复用 web dist 失败(donor=$web_donor)"
     fi
+    [[ "$(web_dist_digest "$staging/packages/web-react/dist")" == "$(jq -er .distDigest "$web_donor/$WEB_DIST_REUSE_RECORD")" ]] \
+      || { cleanup_master_staging; die "复制后的 web dist 摘要不符"; }
     MASTER_FRONTEND_MODE="reused"
   else
     [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"

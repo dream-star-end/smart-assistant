@@ -88,6 +88,12 @@ jobs:
       - name: Gate script tests
         run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts scripts/__tests__/archMeasure.node-test.mjs scripts/__tests__/kernelReleaseClosure.test.ts scripts/__tests__/protocolBrowserEntry.test.ts scripts/__tests__/ocTrace.test.ts scripts/__tests__/ocTraceChain.test.ts
 
+      - name: Selfhost tip prewarm and artifact reuse regressions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sqlite3 jq rsync
+          sudo node --test scripts/__tests__/v5SelfhostPrewarm.node-test.mjs scripts/__tests__/v5SelfhostDeploySpeed.node-test.mjs scripts/__tests__/selfhostSourcePin.node-test.mjs
+
       # OCV5-548:kernel(脱敏/日志/trace 唯一实现)的单测;selfhost CI 不跑逐包 test:*,这里单独跑。
       - name: Kernel unit tests
         run: npm run test:kernel

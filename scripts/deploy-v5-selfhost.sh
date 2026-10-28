@@ -185,6 +185,8 @@ die() {
 # shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
 # shellcheck source=lib/v5-selfhost-rollback.sh
@@ -226,6 +228,10 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  if [[ "${MODE:-}" == prewarm-artifacts ]]; then
+    prewarm_cleanup_invocation
+    return "$exit_rc"
+  fi
   tsum_finish "$exit_rc" 2>/dev/null || :
   # Owner loss forbids successor state/holder writes from this invocation.
   [[ "$exit_rc" == 86 ]] && return 86
@@ -496,6 +502,7 @@ maybe_acquire_selfhost_deploy_lock() {
     deploy|bootstrap|build-master-only|cutover|rollback)
       [[ "$DRY" == 1 ]] && return 0
       acquire_selfhost_deploy_lock
+      prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "预热未停净,拒绝发布"
       ;;
   esac
 }
@@ -510,6 +517,7 @@ usage() {
   --preflight           只读硬门(残留/端口/密钥/个人版)。任何一条不满足即非 0 退出
   --bootstrap           仅首次安装。本机已有 live symlink / env 时请改用 --deploy
   --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
+  --prewarm-artifacts   idle worker 专用:锁外预热 tip 制品,不建列车/不切 live
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
   --rollback            退回 .prev-release 及它当时的运行四元组(一次一步;不跑迁移、不回滚 schema;
@@ -570,7 +578,7 @@ for arg in "$@"; do
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--prewarm-artifacts|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -601,8 +609,8 @@ fi
   && die "--release= 只能与 --cutover 同用"
 [[ -n "$LEASE_TRAIN_ID" && "$MODE" != "deploy" ]] \
   && die "--lease-train= 只能与 --deploy 同用"
-[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "p0-web" ]] \
-  && die "--target-sha= 只能与 --deploy 或 --p0-web 同用"
+[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "p0-web" && "$MODE" != "prewarm-artifacts" ]] \
+  && die "--target-sha= 只能与 --deploy/--p0-web/--prewarm-artifacts 同用"
 [[ "$DRY" == 1 && "$MODE" == p0-web* ]] && die "--p0-web* 没有 dry-run(构建在锁外、切换可秒级回退)"
 [[ -n "$LEASE_TRAIN_ID" && -z "$LEASE_TARGET_SHA" ]] && die "--lease-train= 必须同时给 --target-sha="
 [[ -z "$LEASE_TARGET_SHA" || "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--target-sha= 必须是 40 位 sha"
@@ -1434,12 +1442,6 @@ SQL
   fi
   LEASE_TRAIN_ACTIVE=1
 }
-runtime_caps_from_metadata() {
-  local sha="$1"
-  git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
-    | jq -er '.runtimeCapabilities | join(" ")'
-}
-
 build_platform_bundle() {
   local sha="$1" nonce staging rev src
   log "── build platform bundle ──"
@@ -1488,40 +1490,6 @@ build_platform_bundle() {
   log "  ✓ platform bundle rev=$BUILT_BUNDLE_REV"
 }
 
-build_runtime_release() {
-  local sha="$1" caps nonce raw staging prev image_id
-  log "── build runtime release(git archive + prune + finalize) ──"
-  caps="$(runtime_caps_from_metadata "$sha")" \
-    || die "读 release-metadata.json runtimeCapabilities 失败"
-  image_id="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE")" \
-    || die "inspect runtime 镜像失败"
-  RUNTIME_IMAGE_ID="$image_id"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] git archive $sha → prune --exclude-from=$EXCLUDES → oc_hotcfg_finalize_release"
-    BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-dryrunrelease"
-    return 0
-  fi
-  prev="$(oc_hotcfg_env_get "$V5_ENV" OC_RUNTIME_RELEASE || true)"
-  nonce="$(openssl rand -hex 8)"
-  raw="$OC_HOTCFG_RELEASES_ROOT/.raw-$nonce"
-  staging="$OC_HOTCFG_RELEASES_ROOT/.staging-$nonce"
-  mkdir -p "$OC_HOTCFG_RELEASES_ROOT"
-  rm -rf "$raw" "$staging"
-  mkdir -p "$raw" "$staging"
-  git -C "$REPO_ROOT" archive --format=tar "$sha" | tar -x -C "$raw" \
-    || { rm -rf "$raw" "$staging"; die "git archive 失败"; }
-  rsync -a --exclude-from="$EXCLUDES" "$raw/" "$staging/" \
-    || { rm -rf "$raw" "$staging"; die "rsync prune 失败"; }
-  rm -rf "$raw"
-  write_flavor_manifest "$staging" selfhost "$sha" \
-    || { rm -rf "$staging"; die "写 runtime flavor.manifest.json 失败"; }
-  BUILT_RUNTIME_RELEASE="$(oc_hotcfg_finalize_release "$staging" "$image_id" "$sha" "${prev:-}" "$caps")" \
-    || { rm -rf "$staging"; die "release finalize 失败(npm ci / ccb bun build / MANIFEST)"; }
-  BUILT_RUNTIME_RELEASE="$(printf '%s' "$BUILT_RUNTIME_RELEASE" | tr -d '[:space:]')"
-  [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* ]] \
-    || die "release 目录非法: $BUILT_RUNTIME_RELEASE"
-  log "  ✓ runtime release=$BUILT_RUNTIME_RELEASE"
-}
 
 # ── runtime release 与 master release 并行构建(2026-10-08 devflow-opt)──
 # 两者都只读 pinned SHA 的 git archive,写各自独立的 staging(runtime: $OC_HOTCFG_RELEASES_ROOT,
@@ -3083,6 +3051,7 @@ cmd_cutover() {
 }
 
 case "$MODE" in
+  prewarm-artifacts) cmd_prewarm_artifacts ;;
   preflight) cmd_preflight ;;
   bootstrap) cmd_bootstrap ;;
   deploy) cmd_deploy ;;
