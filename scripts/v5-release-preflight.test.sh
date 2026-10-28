@@ -153,6 +153,24 @@ rpf_add fail c z; rpf_report >/dev/null && bad "report rc 0 despite a failure" |
 # ── selfhost wiring ───────────────────────────────────────────────────
 body="$(sed -n '/^cmd_deploy() {/,/^}/p' "$DEPLOY")"
 line_of() { grep -n -- "$1" <<<"$body" | head -1 | cut -d: -f1; }
+# P4 moves split-lane L0 into prepare, after the train is claimed and before its
+# build. Check both lanes independently instead of mixing their first call sites.
+begin="$(line_of '^    lease_train_begin "\$sha"')"
+prepare="$(line_of 'selfhost_prepare_candidate "\$sha"')"
+if [[ -n "$begin" && -n "$prepare" ]] && (( begin < prepare )); then
+  ok "split deploy claims its train before prepare (L0 refusal is deploy-reported)"
+else
+  bad "split claim/prepare order begin=$begin prepare=$prepare"
+fi
+deploy_body="$body"
+body="$(sed -n '/^selfhost_prepare_candidate() {/,/^}/p' "$ROOT/scripts/lib/v5-selfhost-prepare.sh")"
+pf="$(line_of 'selfhost_release_preflight "\$sha" prepared')"; build="$(line_of 'build_master_release "\$sha"')"
+if [[ -n "$pf" && -n "$build" ]] && (( pf < build )); then
+  ok "prepare runs L0 on its pinned SHA before building"
+else
+  bad "prepare L0/build order pf=$pf build=$build"
+fi
+body="$(sed -n '/^  if \[\[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 \]\]; then/,$p' <<<"$deploy_body")"
 pf="$(line_of 'selfhost_release_preflight')"; begin="$(line_of '^    lease_train_begin "\$sha"')"
 trailer="$(line_of 'assert_fix_trailers "\$sha"')"; build="$(line_of 'build_master_release "\$sha"')"
 # 2026-10-22 18:4x: L0 ran before lease_train_begin, so its refusal was not a deploy-reported train

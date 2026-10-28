@@ -298,6 +298,11 @@ cmd_prewarm_artifacts() {
     exec 8>&-; prewarm_skip lease-or-policy; return 0
   fi
   exec 8>&-
+  # P4 preparation adopts these caches without deploy.lock. Share its artifact
+  # mutex before any cache write; fd9 remains the speculative worker guard.
+  selfhost_lock_py prepare "$SELFHOST_PREPARE_LOCK" "$SELFHOST_DEPLOY_LOCK_DIR"
+  exec 10<>"$SELFHOST_PREPARE_LOCK"
+  flock -n 10 || { prewarm_skip artifact-lock; return 0; }
   busy="$(master_gate_busy_reason)" || { prewarm_skip host-probe-failed; return 0; }
   [[ -z "$busy" ]] || { prewarm_skip host-busy; return 0; }
   cache="$(prewarm_cache_root)"

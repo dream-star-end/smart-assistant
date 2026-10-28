@@ -50,6 +50,7 @@ function run(f, body, extra = "") {
     OC_HOTCFG_RELEASES_ROOT="$T/official"; OC_BUN_BIN="$T/bun"; V5_ENV="$T/env"
     MASTER_RELEASES_ROOT="$T/master"; MASTER_LIVE_LINK="$T/live"
     SELFHOST_DEPLOY_LOCK_DIR="$T/run"; SELFHOST_DEPLOY_LOCK="$T/run/deploy.lock"
+    SELFHOST_PREPARE_LOCK="$T/run/prepare.lock"
     EXCLUDES="$REPO_ROOT/packages/commercial/agent-sandbox/runtime-src-excludes.txt"
     IMAGE=sha256:${"a".repeat(64)}; RUNTIME_IMAGE=fixture
     mkdir -p "$T/cache" "$T/run"; chmod 700 "$T/cache" "$T/run"; touch "$V5_ENV"
@@ -121,6 +122,57 @@ test("real warm entry refuses active train and held deploy lock before invoking 
   `));
 });
 
+test("speculation refuses a P4 artifact owner before changing cache state", (t) => {
+  const f = fixture(t);
+  ok(run(f, `${db}${mode}
+    echo retained >"$T/cache/sentinel"
+    build_runtime_release() { echo BAD >"$T/build"; }
+    exec 7<>"$SELFHOST_PREPARE_LOCK"; flock -n 7
+    cmd_prewarm_artifacts
+    test ! -e "$T/build"; test ! -e "$T/cache/attempt.json"
+    test "$(cat "$T/cache/sentinel")" = retained
+    flock -n "$SELFHOST_DEPLOY_LOCK" true
+  `));
+});
+
+test("prewarm artifact protection survives in a child until its bounded work exits", (t) => {
+  const f = fixture(t);
+  ok(run(f, `${db}${mode}
+    prewarm_budget_ok() { return 1; }
+    cmd_prewarm_artifacts
+    (
+      touch "$T/child-ready"
+      for ((i=0; i<300; i++)); do
+        [[ ! -e "$T/child-release" ]] || exit 0
+        sleep .01
+      done
+      exit 1
+    ) & child=$!
+    for ((i=0; i<300; i++)); do [[ ! -e "$T/child-ready" ]] || break; sleep .01; done
+    test -e "$T/child-ready"
+    exec 10>&-
+    if flock -n "$SELFHOST_PREPARE_LOCK" true; then exit 1; fi
+    touch "$T/child-release"; wait "$child"
+    flock -n "$SELFHOST_PREPARE_LOCK" true
+  `));
+});
+
+test("runtime builder uses the pinned exclusion file after its extraction into a library", (t) => {
+  const f = fixture(t);
+  f.put("packages/commercial/agent-sandbox/runtime-src-excludes.txt", "packages/protocol/\n");
+  ok(run(f, `
+    DRY=0
+    docker() { echo "$IMAGE"; }
+    write_flavor_manifest() { :; }
+    oc_hotcfg_finalize_release() {
+      test "$(cat "$1/packages/protocol/src/marker")" = protocol || return 1
+      echo "$OC_HOTCFG_RELEASES_ROOT/rel-0123456789ab"
+    }
+    build_runtime_release "$SHA"
+    test "$BUILT_RUNTIME_RELEASE" = "$T/official/rel-0123456789ab"
+  `));
+});
+
 test("runtime cache adopts only exact keys and full verified bytes; existing targets are reverified", (t) => {
   const f = fixture(t);
   ok(run(f, `${runtimeFixture}
@@ -160,6 +212,7 @@ test("actual warm entry builds archived web A outside deploy lock, defers Docker
     find_master_release_donor() { return 1; }
     npm() {
       ( exec 7<>"$SELFHOST_DEPLOY_LOCK"; flock -n 7 ) || return 1
+      if flock -n "$SELFHOST_PREPARE_LOCK" true; then return 1; fi
       if [[ "$1" == ci ]]; then mkdir node_modules; return 0; fi
       [[ "$*" == 'run build --workspace packages/web-react' && "$NODE_OPTIONS" == --max-old-space-size=4096 ]] || return 1
       mkdir -p packages/web-react/dist

@@ -372,6 +372,7 @@ SQL
   # 直接 setsid 的子进程仍在同一 cgroup,tick 结束即被收割(2026-09-05 实测:首三班 30s 内全死)。
   # 所以在 systemd 下用 systemd-run 起独立 transient unit;不在 systemd 下(selftest)退回 setsid。
   # 锁:transient unit 无法继承 fd 8 → 这里先释放,让执行器自己走脚本原生 flock 路径;
+  # P4: 两条 spawn 路径都不继承锁;prepare 在锁外,执行器仅在 flip 前加锁。
   # 双发防线仍是 train 唯一开放索引 + 本 tick 已确认锁空。
   local pid
   local deploy_args=(--deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head)
@@ -398,11 +399,12 @@ SQL
     done
     [[ -n "$pid" && "$pid" != 0 ]] || { wlog "拿不到 $unit MainPID(可能已秒退),交给对账"; pid=0; }
   else
-    OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
+    exec 8>&-  # P4: planning is over; executor prepares before acquiring its own flip lock
+    OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
       setsid nohup "$DEPLOY_BIN" "${deploy_args[@]}" \
-        >"$logf" 2>&1 </dev/null 8>&8 211>&- 212>&- &
+        >"$logf" 2>&1 </dev/null 8>&- 211>&- 212>&- &
     pid=$!
-    exec 8>&-   # worker 放手;锁随执行器进程生命周期
+    exec 8>&-   # executor owns its later flip lock
   fi
   lease_tx <<SQL || wlog "写 executor_pid 失败(对账将按 planned 超时处理)"
 BEGIN IMMEDIATE;
