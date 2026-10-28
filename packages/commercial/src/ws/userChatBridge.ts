@@ -2445,6 +2445,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   // shutdown 之后不再起 headless:正在 drain 的桥已 unregister,shutdown 踢不到它,
   // drain 到期若再转 headless 就会在进程关停后继续占着容器 WS。
   let headlessShutdown = false;
+  // 正在 drain 的桥的完成判定;shutdown 后 open 流不再续 drain,逐个重判一次(与改动前同:
+  // receipt 已放下 admitted 记录的 drain 立即收尾)。
+  const drainingChecks = new Set<() => void>();
   const headlessKey = (uidKey: bigint, cid: number): string => `${uidKey.toString()}:${cid}`;
   const noteLiveStreamCovered = (uidKey: bigint, cid: number, streamKey: string): void => {
     const consumers = headlessConsumers.get(headlessKey(uidKey, cid));
@@ -3939,7 +3942,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let headlessCheckTimer: ReturnType<typeof setInterval> | null = null;
     const dispatchStreamKey = (sessionId: string, clientMessageId: string): string =>
       `${sessionId}\u0000${clientMessageId}`;
-    const hasOpenDispatchStreams = (): boolean => openDispatchStreams.size > 0;
+    const hasOpenDispatchStreams = (): boolean => !headlessShutdown && openDispatchStreams.size > 0;
     const closeDispatchStream = (key: string): void => {
       closedDispatchStreams.add(key);
       if (openDispatchStreams.delete(key)) checkDrainComplete();
@@ -9839,6 +9842,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // 进 drain 路径(只有 user 主动 close + 有 codex inflight 才会)
       drainCause = triggerCause;
+      drainingChecks.add(checkDrainComplete);
       detachUserSide(triggerCause);
       bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
@@ -10535,6 +10539,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function finalCleanup(finalCause: BridgeCloseCause): void {
       if (cleaned) return;
       cleaned = true;
+      drainingChecks.delete(checkDrainComplete);
       cause = finalCause;
       if (drainTimer !== null) {
         clearTimeout(drainTimer);
@@ -10706,6 +10711,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     headlessShutdown = true;
+    for (const check of [...drainingChecks]) check();
     registry.closeAll(reason);
     // headless 桥已 unregister,registry 踢不到它们。
     for (const set of [...headlessConsumers.values()]) {
