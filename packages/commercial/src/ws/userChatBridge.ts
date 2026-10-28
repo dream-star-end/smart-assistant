@@ -1490,6 +1490,35 @@ function readDispatchDrainMs(): number {
 }
 
 /**
+ * UXE-A1 — headless consumer。drain 到期时本连接若仍看得到 open dispatch 的容器流
+ * (admitted/accepted,未见 isFinal、PG 未终态),不关容器 WS,转 headless:继续消费帧 →
+ * 照常落 client_session_live_frames(落帧即续 lease)、续 admitted 心跳、走终态/计费路径;
+ * 同 uid+容器的在线桥落了同一条流的帧即接管(本桥退出)。
+ *
+ * 资源边界(drain 120s 上限的原意):只有 open dispatch 才 headless;寿命上限默认 90min
+ * (= reconciler accepted stuck floor,到点交给 reconciler);进程内并发上限默认 256,
+ * 超了降级为现状(drain 到期即关)。env 非法 → 缺省;LIMIT=0 关闭 headless。
+ */
+const DEFAULT_DISPATCH_HEADLESS_MAX_MS = 90 * 60_000;
+const DEFAULT_DISPATCH_HEADLESS_LIMIT = 256;
+const DEFAULT_DISPATCH_HEADLESS_CHECK_MS = 30_000;
+function readPositiveEnvMs(key: string, fallback: number, min: number): number {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= min ? Math.trunc(n) : fallback;
+}
+function readDispatchHeadlessMaxMs(): number {
+  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_MAX_MS", DEFAULT_DISPATCH_HEADLESS_MAX_MS, 50);
+}
+function readDispatchHeadlessCheckMs(): number {
+  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_CHECK_MS", DEFAULT_DISPATCH_HEADLESS_CHECK_MS, 50);
+}
+function readDispatchHeadlessLimit(): number {
+  return readPositiveEnvMs("OC_DISPATCH_HEADLESS_LIMIT", DEFAULT_DISPATCH_HEADLESS_LIMIT, 0);
+}
+
+/**
  * PR2 v1.0.66 — 32-hex per-turn 标识,master 生成且**强制覆写** client 提供的值。
  *
  * 设计契约:client (浏览器) 不应也无法预测此 id;若 client 把别的 turn 的
@@ -2404,6 +2433,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return open;
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
+  // UXE-A1:浏览器已走、仍替 open dispatch 消费容器流的桥。key = `${uid}:${containerId}`。
+  // 在线桥落了同一条流的帧 → release 该流;headless 桥流清空即收尾(关它的容器 WS)。
+  interface HeadlessConsumer {
+    streams: ReadonlySet<string>;
+    release(streamKey: string): void;
+    end(cause: BridgeCloseCause): void;
+  }
+  const headlessConsumers = new Map<string, Set<HeadlessConsumer>>();
+  let headlessActive = 0;
+  const headlessKey = (uidKey: bigint, cid: number): string => `${uidKey.toString()}:${cid}`;
+  const noteLiveStreamCovered = (uidKey: bigint, cid: number, streamKey: string): void => {
+    const consumers = headlessConsumers.get(headlessKey(uidKey, cid));
+    if (!consumers) return;
+    for (const consumer of [...consumers]) consumer.release(streamKey);
+  };
   const uidToRecoveryExecutors = new Map<
     string,
     Set<(job: ClaimedRecoveryJob) => void>
@@ -3879,6 +3923,39 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       preparationInFlight > 0 || admittedDispatches.size > 0 || enrichmentDispatches.size > 0;
     const hasPreTransferDispatchWork = (): boolean =>
       preparationInFlight > 0 || enrichmentDispatches.size > 0;
+
+    // UXE-A1:本连接容器流里还在跑的 dispatch(sessionId + clientMessageId)。receipt 之后
+    // admittedDispatches 就放下了记录,但回合仍在出帧 —— drain/headless 靠这张表决定要不要留着
+    // 容器 WS。只在能 headless 时记(有 pgPool 做终态权威 + 有 containerId 做接管键)。
+    //   openDispatchStreams:见过帧、未见 isFinal、PG 未判终态。
+    //   closedDispatchStreams:已 isFinal / PG 终态 / 被在线桥接管 → 迟到帧不再重开。
+    const headlessCapable = deps.pgPool !== undefined && containerId !== undefined;
+    const openDispatchStreams = new Map<string, { sessionId: string; clientMessageId: string }>();
+    const closedDispatchStreams = new Set<string>();
+    let headless: HeadlessConsumer | null = null;
+    let headlessCheckTimer: ReturnType<typeof setInterval> | null = null;
+    const dispatchStreamKey = (sessionId: string, clientMessageId: string): string =>
+      `${sessionId}\u0000${clientMessageId}`;
+    const hasOpenDispatchStreams = (): boolean => openDispatchStreams.size > 0;
+    const closeDispatchStream = (key: string): void => {
+      closedDispatchStreams.add(key);
+      if (openDispatchStreams.delete(key)) checkDrainComplete();
+    };
+    const noteDispatchStreamFrame = (
+      sessionId: string,
+      clientMessageId: string,
+      isFinal: boolean,
+    ): void => {
+      if (!headlessCapable) return;
+      const key = dispatchStreamKey(sessionId, clientMessageId);
+      if (isFinal) {
+        closeDispatchStream(key);
+        return;
+      }
+      // headless 期不再认领新流:那是别的回合,归在线桥。
+      if (headless !== null || closedDispatchStreams.has(key)) return;
+      openDispatchStreams.set(key, { sessionId, clientMessageId });
+    };
 
     /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
     const dropAdmittedDispatch = (clientMessageId: string): void => {
@@ -8427,6 +8504,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
               if (!acceptEnrichmentReceipt(rec)) return;
+              // 容器已接手执行,admitted 记录随即放下;回合流仍归本连接消费(UXE-A1)。
+              noteDispatchStreamFrame(rec.sessionId, rec.clientMessageId, false);
               if (pool) {
                 if (rec.recoveryJob) {
                   void markRecoveryContainerReceipt(pool, {
@@ -9201,6 +9280,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         sessionKey: string;
         frameSeq: number;
         payload: string;
+        /** outbound.message isFinal=true = 回合终止器(protocol frames.ts)。 */
+        isFinal: boolean;
       } | null = null;
       if (containerId !== undefined && !isBinary) {
         let frameStr: string | null = null;
@@ -9213,6 +9294,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           try { parsedOut = JSON.parse(frameStr); } catch { /* non-JSON: skip */ }
           if (parsedOut !== null && typeof parsedOut === "object") {
             const wire = parsedOut as {
+              type?: unknown;
+              isFinal?: unknown;
               sessionKey?: unknown;
               frameSeq?: unknown;
               clientMessageId?: unknown;
@@ -9237,6 +9320,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sessionKey: wire.sessionKey,
                 frameSeq: wire.frameSeq,
                 payload: frameStr,
+                isFinal: wire.type === "outbound.message" && wire.isFinal === true,
               };
             }
           }
@@ -9433,6 +9517,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameSeq: stamped.frameSeq,
               payload: stamped.payload,
             });
+            if (stamped.clientMessageId !== null) {
+              noteDispatchStreamFrame(durableSessionId, stamped.clientMessageId, stamped.isFinal);
+              // 在线桥已把这条流落库 → 同容器的 headless 桥放手(UXE-A1 接管)。
+              if (!userDetached) {
+                noteLiveStreamCovered(
+                  uid,
+                  containerId!,
+                  dispatchStreamKey(durableSessionId, stamped.clientMessageId),
+                );
+              }
+            }
             forwardCommittedFrame();
           },
           (error) => {
@@ -9651,7 +9746,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
       // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
       // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
-      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
+      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams()) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -9732,7 +9827,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (triggerCause === "client_close" ||
           triggerCause === "backpressure" ||
           triggerCause === "internal_error") &&
-        (inflightCodexTurns.size > 0 || hasPendingDispatchWork());
+        (inflightCodexTurns.size > 0 || hasPendingDispatchWork() || hasOpenDispatchStreams());
 
       if (!shouldDrain) {
         finalCleanup(triggerCause);
@@ -9752,7 +9847,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // RFC §2.2 B1:有在飞 admitted dispatch → 取 max(billing, dispatch drain,默认 60s / 上限 120s);
       // 无 dispatch(纯 codex billing drain)→ 沿用 5s billing 窗口。
-      const drainMs = hasPendingDispatchWork()
+      const drainMs = hasPendingDispatchWork() || hasOpenDispatchStreams()
         ? Math.max(
             readDrainBillingMs(),
             readDispatchDrainMs(),
@@ -9760,18 +9855,96 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           )
         : readDrainBillingMs();
       drainTimer = setTimeout(() => {
-        bridgeLog?.warn("user-chat-bridge: drain timeout", {
-          leftover: inflightCodexTurns.size,
-          admittedLeftover: admittedDispatches.size,
-          preparationLeftover: preparationInFlight,
-        });
-        for (const [requestId, snap] of inflightCodexTurns) {
-          recordBillingRecovery(requestId, "failed", snap);
-        }
-        terminalizeAllEnriching();
-        finalCleanup(drainCause ?? "client_close");
+        if (enterHeadless()) return;
+        expireDrain("user-chat-bridge: drain timeout");
       }, drainMs);
       drainTimer.unref?.();
+    }
+
+    function expireDrain(message: string): void {
+      bridgeLog?.warn(message, {
+        leftover: inflightCodexTurns.size,
+        admittedLeftover: admittedDispatches.size,
+        preparationLeftover: preparationInFlight,
+        openStreamLeftover: openDispatchStreams.size,
+      });
+      for (const [requestId, snap] of inflightCodexTurns) {
+        recordBillingRecovery(requestId, "failed", snap);
+      }
+      terminalizeAllEnriching();
+      finalCleanup(drainCause ?? "client_close");
+    }
+
+    /**
+     * UXE-A1:drain 到期仍有 open dispatch 流 → 留着容器 WS 当 headless consumer。
+     * drainTimer 换成寿命上限 timer,所以 cleanup() 的 drain 抢占语义(container_close/
+     * error/shutdown/force 立即 final)原样适用;流清空走 checkDrainComplete 收尾。
+     */
+    function enterHeadless(): boolean {
+      if (
+        !headlessCapable ||
+        !hasOpenDispatchStreams() ||
+        containerWs.readyState !== WebSocket.OPEN
+      ) return false;
+      const limit = readDispatchHeadlessLimit();
+      if (headlessActive >= limit) {
+        bridgeLog?.warn("user-chat-bridge: headless limit reached, closing at drain timeout", {
+          limit,
+          ux_headless_active: headlessActive,
+          openStreams: openDispatchStreams.size,
+        });
+        return false;
+      }
+      const key = headlessKey(uid, containerId!);
+      const consumer: HeadlessConsumer = {
+        streams: new Set(openDispatchStreams.keys()),
+        release: (streamKey) => closeDispatchStream(streamKey),
+        end: (endCause) => cleanup(endCause, true),
+      };
+      // 同容器更早的 headless 桥若只盯着本桥也在盯的流,它已多余(容器对两条 WS 同发)。
+      const peers = headlessConsumers.get(key);
+      for (const older of peers ? [...peers] : []) {
+        if ([...older.streams].every((s) => openDispatchStreams.has(s))) older.end("client_close");
+      }
+      let set = headlessConsumers.get(key);
+      if (!set) { set = new Set(); headlessConsumers.set(key, set); }
+      set.add(consumer);
+      headless = consumer;
+      headlessActive += 1;
+      const maxMs = readDispatchHeadlessMaxMs();
+      drainTimer = setTimeout(() => expireDrain("user-chat-bridge: headless max lifetime"), maxMs);
+      drainTimer.unref?.();
+      headlessCheckTimer = setInterval(() => { void checkHeadlessStreams(); }, readDispatchHeadlessCheckMs());
+      headlessCheckTimer.unref?.();
+      bridgeLog?.info("user-chat-bridge: enter headless", {
+        openStreams: openDispatchStreams.size,
+        admittedCount: admittedDispatches.size,
+        inflightCount: inflightCodexTurns.size,
+        maxMs,
+        ux_headless_active: headlessActive,
+      });
+      void checkHeadlessStreams();
+      return true;
+    }
+
+    /** PG 是终态权威:流对应的 dispatch 已终态 / 转人工 / 不存在 → 放下(帧没等到 isFinal 也收尾)。 */
+    async function checkHeadlessStreams(): Promise<void> {
+      const pool = deps.pgPool;
+      if (!pool || headless === null) return;
+      for (const [key, stream] of [...openDispatchStreams]) {
+        try {
+          const row = await getDispatchByLogicalKey(pool, {
+            userId: uid,
+            sessionId: stream.sessionId,
+            clientMessageId: stream.clientMessageId,
+          });
+          if (row === null || row.status === "terminal" || row.status === "manual_reconcile") {
+            closeDispatchStream(key);
+          }
+        } catch (err) {
+          bridgeLog?.warn("user-chat-bridge: headless dispatch check failed", { err });
+        }
+      }
     }
 
     /**
@@ -9779,7 +9952,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 双 map 均空才提前结束 drain。不在 drain 期 / 任一 map 非空时 no-op。
      */
     function checkDrainComplete(): void {
-      if (drainTimer !== null && inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
+      if (
+        drainTimer !== null &&
+        inflightCodexTurns.size === 0 &&
+        !hasPendingDispatchWork() &&
+        !hasOpenDispatchStreams()
+      ) {
         clearTimeout(drainTimer);
         drainTimer = null;
         finalCleanup(drainCause ?? "client_close");
@@ -10365,6 +10543,25 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         clearInterval(dispatchHeartbeatTimer);
         dispatchHeartbeatTimer = null;
       }
+      if (headlessCheckTimer !== null) {
+        clearInterval(headlessCheckTimer);
+        headlessCheckTimer = null;
+      }
+      if (headless !== null) {
+        const key = headlessKey(uid, containerId!);
+        const set = headlessConsumers.get(key);
+        if (set?.delete(headless)) {
+          headlessActive -= 1;
+          if (set.size === 0) headlessConsumers.delete(key);
+        }
+        bridgeLog?.info("user-chat-bridge: exit headless", {
+          finalCause,
+          openStreams: openDispatchStreams.size,
+          ux_headless_active: headlessActive,
+        });
+        headless = null;
+      }
+      openDispatchStreams.clear();
 
       // keyring 普查:连接终结 = 这个容器的这条连接不再在册。留着不摘 = 轮换步骤② 的
       // 覆盖率会被已经断开的连接稀释(永远收敛不到 100%,或反过来把已下线的旧 env
@@ -10505,6 +10702,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);
+    // headless 桥已 unregister,registry 踢不到它们。
+    for (const set of [...headlessConsumers.values()]) {
+      for (const consumer of [...set]) consumer.end("shutdown");
+    }
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }

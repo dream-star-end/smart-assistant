@@ -4499,3 +4499,158 @@ describe("P2b entry freeze: user-chat-bridge Origin", () => {
     }
   });
 });
+
+// UXE-A1(t1198u):浏览器断开超过 drain 后,open dispatch 的容器流不再随 drain 关掉 ——
+// bridge 转 headless 继续落帧(落帧即续 lease),直到 isFinal / PG 终态 / 在线桥接管。
+describe("UXE-A1 headless consumer for open dispatch streams", () => {
+  const ENV_KEYS = [
+    "DRAIN_BILLING_MS",
+    "OC_DISPATCH_DRAIN_MS",
+    "OC_DISPATCH_HEADLESS_CHECK_MS",
+    "OC_DISPATCH_HEADLESS_LIMIT",
+  ] as const;
+  const saved = new Map<string, string | undefined>();
+  before(() => {
+    for (const key of ENV_KEYS) saved.set(key, process.env[key]);
+    process.env.DRAIN_BILLING_MS = "50";
+    process.env.OC_DISPATCH_DRAIN_MS = "100";
+    process.env.OC_DISPATCH_HEADLESS_CHECK_MS = "50";
+  });
+  after(() => {
+    for (const key of ENV_KEYS) {
+      const prev = saved.get(key);
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  });
+
+  const SESSION = "sess-a1";
+  const CMID = "cm-a1-headless";
+  const frame = (frameSeq: number, isFinal = false): string => JSON.stringify({
+    type: "outbound.message",
+    sessionKey: `agent:main:webchat:dm:${SESSION}`,
+    frameSeq,
+    peer: { id: SESSION, kind: "dm" },
+    clientMessageId: CMID,
+    isFinal,
+    blocks: [{ kind: "text", text: `t${frameSeq}` }],
+  });
+
+  async function headlessRig(row: Record<string, unknown>) {
+    const persisted: number[] = [];
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
+      persistOutboundFrame: async (input) => { persisted.push(input.frameSeq); },
+      ...helloTerminalBillingTrio({ row }),
+    });
+    portRef.value = rig.containerPort;
+    return { rig, persisted };
+  }
+
+  async function connect(rig: TestRig, uid: string): Promise<{ ws: WebSocket; container: WebSocket }> {
+    const containerOpen = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt(uid));
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+    return { ws, container: await containerOpen };
+  }
+
+  const acceptedRow = (uid: string) => rawDispatchRow({
+    userId: uid, sessionId: SESSION, clientMessageId: CMID, status: "accepted", outcome: null,
+  });
+
+  test("drain 到期仍在跑 → 容器 WS 不关、断线期帧继续落库;isFinal 后收尾", async () => {
+    const { rig, persisted } = await headlessRig(acceptedRow("1201"));
+    try {
+      const { ws, container } = await connect(rig, "1201");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      let containerClosed = false;
+      container.once("close", () => { containerClosed = true; });
+      ws.close();
+      await waitClose(ws);
+      await new Promise<void>((resolve) => setTimeout(resolve, 400)); // > drain 100ms
+      assert.equal(containerClosed, false, "open dispatch 的容器流不得随 drain 关闭");
+      container.send(frame(2));
+      await waitFor(() => persisted.includes(2));
+      container.send(frame(3, true));
+      await waitFor(() => containerClosed, 3000);
+      assert.deepEqual(persisted, [1, 2, 3]);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("没等到 isFinal,PG 判终态 → headless 收尾", async () => {
+    const row = acceptedRow("1202");
+    const { rig, persisted } = await headlessRig(row);
+    try {
+      const { ws, container } = await connect(rig, "1202");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      let containerClosed = false;
+      container.once("close", () => { containerClosed = true; });
+      ws.close();
+      await new Promise<void>((resolve) => setTimeout(resolve, 400));
+      assert.equal(containerClosed, false);
+      row.status = "terminal";
+      row.outcome = "completed";
+      await waitFor(() => containerClosed, 3000);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("重连的在线桥落了同一条流 → headless 桥放手,新桥继续", async () => {
+    const { rig, persisted } = await headlessRig(acceptedRow("1203"));
+    try {
+      const first = await connect(rig, "1203");
+      first.container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      let firstClosed = false;
+      first.container.once("close", () => { firstClosed = true; });
+      first.ws.close();
+      await new Promise<void>((resolve) => setTimeout(resolve, 400));
+      assert.equal(firstClosed, false);
+
+      const second = await connect(rig, "1203");
+      second.container.send(frame(2));
+      await waitFor(() => firstClosed, 3000);
+      assert.ok(persisted.includes(2));
+      assert.equal(second.container.readyState, WebSocket.OPEN, "接管方的容器 WS 保持");
+      second.ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("没有 open dispatch 流 → user close 立即关容器 WS(行为不变)", async () => {
+    const { rig } = await headlessRig(acceptedRow("1204"));
+    try {
+      const { ws, container } = await connect(rig, "1204");
+      const closed = new Promise<void>((resolve) => container.once("close", () => resolve()));
+      ws.close();
+      await closed;
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("OC_DISPATCH_HEADLESS_LIMIT=0 → drain 到期照旧关闭", async () => {
+    process.env.OC_DISPATCH_HEADLESS_LIMIT = "0";
+    const { rig, persisted } = await headlessRig(acceptedRow("1205"));
+    try {
+      const { ws, container } = await connect(rig, "1205");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      const closedAt = new Promise<number>((resolve) => container.once("close", () => resolve(Date.now())));
+      const t0 = Date.now();
+      ws.close();
+      const elapsed = (await closedAt) - t0;
+      assert.ok(elapsed >= 80, `应等满 drain 窗口,实测 ${elapsed}ms`);
+    } finally {
+      delete process.env.OC_DISPATCH_HEADLESS_LIMIT;
+      await stopRig(rig);
+    }
+  });
+});
