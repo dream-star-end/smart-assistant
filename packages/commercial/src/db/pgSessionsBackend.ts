@@ -1,4 +1,5 @@
 import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
+import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
 import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
@@ -12124,7 +12125,7 @@ export function createPgSessionsBackend(
       userId: string,
       afterRecordId = 0,
       limit = 200,
-      options?: { seekTail?: boolean },
+      options?: { seekTail?: boolean } & SessionSnapshotOptions,
     ) {
       return readDurableClientSessionLiveFrames(
         pool,
@@ -12132,7 +12133,10 @@ export function createPgSessionsBackend(
         userId,
         afterRecordId,
         limit,
-        options,
+        { ...options, readSnapshot: (client) => {
+          const uid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1];
+          return uid ? buildSessionSnapshot(client, uid, sessionId, { ...options, limit }) : Promise.resolve(null);
+        } },
       );
     },
 

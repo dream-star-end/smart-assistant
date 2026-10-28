@@ -244,6 +244,7 @@ async function nextBusinessFrame(fc: { next: () => Promise<string> }): Promise<R
     try {
       const parsed = JSON.parse(s) as Record<string, unknown>;
       if (typeof parsed?.type === "string" && (parsed.type as string).startsWith("sys.")) continue;
+      if (parsed.type === "outbound.session_snapshot") continue; // Covered by sessionSnapshot.test.ts.
       return parsed;
     } catch {
       /* 非 JSON(binary 透传等)不属于业务 JSON 断言目标,跳过 */
@@ -2852,6 +2853,7 @@ function helloTerminalBillingTrio(opts: {
   const lookups = opts.lookups ?? [];
   return {
     pgPool: {
+      async connect() { return { query: this.query, release() {} }; },
       query: async (sql: unknown, params?: unknown[]) => {
         const text = typeof sql === "string"
           ? sql
@@ -2863,6 +2865,9 @@ function helloTerminalBillingTrio(opts: {
         if (/SELECT status FROM users WHERE id/.test(text)) {
           return { rows: [{ status: "active" }], rowCount: 1 };
         }
+        if (/session-snapshot-owner/.test(text)) {
+          return { rows: [{ as_of: String(Date.now()) }], rowCount: 1 };
+        }
         if (/open-dispatch-engine-ready/.test(text)) {
           opts.readyScans?.push(params ?? []);
           const rows = opts.readyScanRows ?? [];
@@ -2871,8 +2876,10 @@ function helloTerminalBillingTrio(opts: {
         if (/FROM turn_dispatches/.test(text) && /client_message_id/.test(text)) {
           if (opts.beforeTurnDispatchLookup) await opts.beforeTurnDispatchLookup();
           lookups.push(params ?? []);
-          return opts.row
-            ? { rows: [opts.row], rowCount: 1 }
+          const row = opts.row && (params?.[2] === opts.row.client_message_id ||
+            ["admitted", "accepted", "rejecting"].includes(String(opts.row.status))) ? opts.row : null;
+          return row
+            ? { rows: [row], rowCount: 1 }
             : { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 0 };
@@ -3173,7 +3180,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     assert.equal(frame.status, null);
   });
 
-  test("hello 没有 inFlightClientMessageId → 不查 PG、不发帧", async () => {
+  test("hello 没有 inFlightClientMessageId → 查询当前回合，不伪造旧终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "805";
     const { rig, ws } = await openHelloRig({
@@ -3202,7 +3209,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `无 inFlight 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "无 inFlightClientMessageId 不得查 turn_dispatches");
+      assert.equal(lookups.length, lookupsBefore + 1, "新设备必须查询当前 open dispatch");
     } finally {
       ws.close();
       await waitClose(ws);

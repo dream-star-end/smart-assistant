@@ -1,77 +1,68 @@
-/**
- * INC-20261028-STALE-ENGINE-STARTING — hello snapshot for an open
- * (admitted/accepted) dispatch.
- *
- * Once the last browser detaches, the bridge closes the container WS after the
- * drain window; frames emitted after that are neither persisted nor
- * replayable, so a reconnecting tab may still hold engine_starting from before
- * the disconnect. On hello the bridge sends that tab an authoritative phase
- * from persisted evidence only: status:null when the stream head proves the
- * engine got past startup, else engine_starting. meta.detached tells the
- * client the process between disconnect and now may be missing; meta.since is
- * the dispatch's admitted_at. Sent only to the hello's own userWs (other tabs
- * of the same uid may not be on this turn).
- */
-import { WebSocket } from "ws";
-import { readOpenDispatchEngineReady } from "../db/liveTurnFrames.js";
-import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
+import { isClientMessageId, type SessionSnapshot } from '@openclaude/protocol'
+import type { Pool } from 'pg'
+import { WebSocket } from 'ws'
+import { readSessionSnapshot, SESSION_SNAPSHOT_MAX_BYTES } from '../db/sessionSnapshot.js'
+import { openDispatchTurnStatusSnapshotFrame } from '../db/sessionSnapshotStatus.js'
+export { openDispatchTurnStatusSnapshotFrame } from '../db/sessionSnapshotStatus.js'
 
-type SnapshotRow = Pick<TurnDispatchRow, "status" | "dispatchId" | "attemptNo" | "agentId" | "admittedAt">;
-type SnapshotLog = { info(msg: string, meta: Record<string, unknown>): void } | null | undefined;
-type Queryable = Parameters<typeof readOpenDispatchEngineReady>[0];
+type SnapshotLog = { info(msg: string, meta: Record<string, unknown>): void } | null | undefined
+type SnapshotSocket = Pick<WebSocket, 'readyState' | 'send' | 'bufferedAmount'>
 
-export function openDispatchTurnStatusSnapshotFrame(input: {
-  peerId: string;
-  agentId: string;
-  clientMessageId: string;
-  engineReady: boolean;
-  admittedAt: Date;
-  now?: number;
-}): Record<string, unknown> {
-  const safeId = input.peerId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  return {
-    type: "outbound.turn_status",
-    sessionKey: `agent:${input.agentId || "main"}:webchat:dm:${safeId}`,
-    channel: "webchat",
-    peer: { id: input.peerId, kind: "dm" },
-    clientMessageId: input.clientMessageId,
-    status: input.engineReady ? null : "engine_starting",
-    meta: { detached: true, since: input.admittedAt.getTime() },
-    ts: input.now ?? Date.now(),
-  };
+/** Rolling-client projection of #1198. Credits are the very same object as
+ * the canonical snapshot; this compatibility frame never advances frameSeq. */
+export function sendHelloOpenDispatchSnapshot(
+  userWs: SnapshotSocket, snapshot: SessionSnapshot,
+): void {
+  const row = snapshot.dispatch
+  if (!row || (row.status !== 'admitted' && row.status !== 'accepted')) return
+  userWs.send(JSON.stringify(openDispatchTurnStatusSnapshotFrame({
+    peerId: snapshot.sessionId, agentId: row.agentId, clientMessageId: row.clientMessageId,
+    engineReady: snapshot.engineReady === true, admittedAt: new Date(row.since),
+    credits: snapshot.credits, now: snapshot.asOf,
+  })))
 }
 
-/**
- * Returns true when `row` is an open dispatch (the hello terminal fallback
- * must skip it), whether or not the snapshot could be sent.
- */
-export async function sendHelloOpenDispatchSnapshot(
-  q: Queryable,
-  userWs: Pick<WebSocket, "readyState" | "send">,
-  row: SnapshotRow,
-  ids: { uid: string; peerId: string; clientMessageId: string },
-  log: SnapshotLog,
-): Promise<boolean> {
-  if (row.status !== "admitted" && row.status !== "accepted") return false;
-  const engineReady = await readOpenDispatchEngineReady(q, {
-    dispatchId: row.dispatchId,
-    attemptNo: row.attemptNo,
-  });
-  if (userWs.readyState !== WebSocket.OPEN) return true;
-  try {
-    userWs.send(JSON.stringify(openDispatchTurnStatusSnapshotFrame({
-      peerId: ids.peerId,
-      agentId: row.agentId,
-      clientMessageId: ids.clientMessageId,
-      engineReady,
-      admittedAt: row.admittedAt,
-    })));
-    log?.info("user-chat-bridge: hello open dispatch status snapshot sent", {
-      uid: ids.uid,
-      sessionId: ids.peerId,
-      clientMessageId: ids.clientMessageId,
-      engineReady,
-    });
-  } catch { /* 发不出就静默降级 */ }
-  return true;
+/** Started after forwarding hello. Only PG participates; no ContainerLink or
+ * browser-owned cache is a source of snapshot facts. */
+export async function sendHelloSessionSnapshots(
+  pool: Pool, userWs: SnapshotSocket, uid: string, peers: unknown[], log: SnapshotLog,
+): Promise<void> {
+  await Promise.resolve()
+  const seen = new Set<string>()
+  // Preserve the old eight-session budget and prioritize in-flight sessions.
+  const candidates = peers.filter((p): p is Record<string, unknown> => !!p && typeof p === 'object')
+    .sort((a, b) => Number(b.inFlight === true) - Number(a.inFlight === true))
+  for (const peer of candidates) {
+    if (userWs.readyState !== WebSocket.OPEN || userWs.bufferedAmount > 4 * SESSION_SNAPSHOT_MAX_BYTES) break
+    if (typeof peer.peerId !== 'string' || seen.has(peer.peerId)) continue
+    if (seen.size >= 8) break
+    seen.add(peer.peerId)
+    const cmid = peer.inFlightClientMessageId
+    if (cmid !== undefined && (typeof cmid !== 'string' || cmid.length > 200 || !isClientMessageId(cmid))) continue
+    const clientMessageId = peer.inFlight === true && typeof cmid === 'string' && cmid.length <= 200 && isClientMessageId(cmid)
+      ? cmid : undefined
+    try {
+      const snapshot = await readSessionSnapshot(pool, uid, peer.peerId, {
+        clientMessageId,
+        afterSeq: typeof peer.lastFrameSeq === 'number' ? peer.lastFrameSeq : 0,
+        streamKey: typeof peer.lastStreamKey === 'string' ? peer.lastStreamKey : undefined,
+      })
+      if (!snapshot || userWs.readyState !== WebSocket.OPEN) continue
+      sendHelloOpenDispatchSnapshot(userWs, snapshot)
+      if (clientMessageId === snapshot.dispatch?.clientMessageId && snapshot.reconcile) {
+        userWs.send(JSON.stringify({
+          type: 'outbound.message', channel: 'webchat', peer: { id: peer.peerId, kind: 'dm' },
+          clientMessageId, blocks: [], isFinal: true,
+          meta: { reconcile: snapshot.reconcile, clientMessageId }, ts: snapshot.asOf,
+        }))
+      }
+      userWs.send(JSON.stringify({
+        type: 'outbound.session_snapshot', channel: 'webchat',
+        peer: { id: peer.peerId, kind: 'dm' }, snapshot,
+      }))
+      log?.info('user-chat-bridge: hello session snapshot sent', { uid, sessionId: peer.peerId })
+    } catch {
+      // A failing session must not block hello forwarding or other sessions.
+    }
+  }
 }

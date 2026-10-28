@@ -2,7 +2,7 @@ import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.
 import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
-import { sendHelloOpenDispatchSnapshot } from "./helloOpenDispatchSnapshot.js";
+import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
 import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapshot } from "./containerLink.js";
 import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
@@ -361,10 +361,6 @@ export const CLOSE_BRIDGE = {
  * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
 export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
-/** 单条 hello 最多查这么多在飞候选。peers 数组来自客户端,无此上限可把 PG 打满。 */
-const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
-/** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
-const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
 /** 单条 hello 最多从 PG 补齐这么多会话的在飞 live frames。 */
 const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
 /** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
@@ -5405,8 +5401,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const uidStr = uid.toString();
             // 前端只在发送态未清且 id 合法时携带 inFlightClientMessageId。
             // 这里只收集候选,查询必须等 hello 转发之后再跑。
-            const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
-            const terminalNotifySeen = new Set<string>();
             const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
             const liveCatchupSeen = new Set<string>();
             // INC-20260907-PERMISSION-ROOTFIX: permission hello scan is independent
@@ -5435,29 +5429,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     ? Math.max(0, peer.lastFrameSeq)
                     : 0;
                 liveCatchupSessions.push({ sessionId: peer.peerId, afterFrameSeq });
-              }
-              const inFlightId = peer.inFlightClientMessageId;
-              // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
-              // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
-              // 重复项放大成并行 PG 查询。
-              if (
-                peer.inFlight === true &&
-                typeof inFlightId === "string" &&
-                inFlightId !== "" &&
-                inFlightId.length <= HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN &&
-                isClientMessageId(inFlightId)
-              ) {
-                const dedupeKey = `${peer.peerId}\0${inFlightId}`;
-                if (
-                  !terminalNotifySeen.has(dedupeKey) &&
-                  terminalNotifyCandidates.length < HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES
-                ) {
-                  terminalNotifySeen.add(dedupeKey);
-                  terminalNotifyCandidates.push({
-                    peerId: peer.peerId,
-                    clientMessageId: inFlightId,
-                  });
-                }
               }
               const aid =
                 typeof peer.agentId === "string" && peer.agentId !== ""
@@ -5524,59 +5495,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 绝不能挡在 hello 转发前面:容器靠这条 hello 把 containerWs 登记进
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
-            if (terminalNotifyCandidates.length > 0 && deps.pgPool) {
-              const pgPool = deps.pgPool;
-              void (async () => {
-                try {
-                  await Promise.resolve();
-                  for (const { peerId, clientMessageId } of terminalNotifyCandidates) {
-                    // 查询前也要看连接:断开后结果没人收,继续查只会空烧 PG。
-                    if (userWs.readyState !== WebSocket.OPEN) break;
-                    const row = await getDispatchByLogicalKey(pgPool, {
-                      userId: uid,
-                      sessionId: peerId,
-                      clientMessageId,
-                    });
-                    if (row === null) continue;
-                    if (await sendHelloOpenDispatchSnapshot(pgPool, userWs, row, { uid: uidStr, peerId, clientMessageId }, bridgeLog)) continue;
-                    if (row.status !== "terminal") continue;
-                    let reconcile: "turn_completed" | "interrupted" | null = null;
-                    if (row.outcome === "completed") {
-                      reconcile = "turn_completed";
-                    } else if (row.outcome === "interrupted" || row.outcome === "crashed") {
-                      // 前端 reducer 只认这两个字面量。不要模仿容器的 turn_interrupted,
-                      // 也不要带 interrupted:'service_restart'(会触发自动恢复)。
-                      reconcile = "interrupted";
-                    }
-                    // not_accepted / executed_error / 其它 / null → 什么都不发:
-                    // 失败态交给现有 fail-visible 通道,避免和失败卡打架。
-                    if (reconcile === null) continue;
-                    // 只打本条 hello 所在的 userWs,不用 broadcastToUser —
-                    // 同 uid 其它标签页未必卡在这一轮,广播会误清它们的发送态。
-                    if (userWs.readyState !== WebSocket.OPEN) continue;
-                    try {
-                      userWs.send(JSON.stringify({
-                        type: "outbound.message",
-                        channel: "webchat",
-                        peer: { id: peerId, kind: "dm" },
-                        clientMessageId,
-                        blocks: [],
-                        isFinal: true,
-                        meta: { reconcile, clientMessageId },
-                        ts: Date.now(),
-                      }));
-                      bridgeLog?.info("user-chat-bridge: hello terminal dispatch fallback sent", {
-                        uid: uidStr,
-                        sessionId: peerId,
-                        clientMessageId,
-                        reconcile,
-                      });
-                    } catch { /* 发不出就静默降级 */ }
-                  }
-                } catch {
-                  // 任何失败都只能静默:hello 处理绝不能因回落抛错。
-                }
-              })().catch(() => {});
+            if (deps.pgPool) {
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
