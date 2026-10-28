@@ -728,6 +728,11 @@ export async function _runOneTurn(
         )
         return
       }
+      if (e.kind === 'context_pressure') {
+        eventBus.emit('session.context_pressure', createEvent('session.context_pressure', session.agentId, {
+          sessionKey: session.sessionKey, ...e.pressure,
+        }))
+      }
       if (e.kind === 'call_usage') {
         const call: CallTokenUsageSnapshot = {
           ...structuredClone(e.call),

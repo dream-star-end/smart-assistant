@@ -615,8 +615,11 @@ describe('AntigravityAdapter', () => {
       const input = renderHistoricalContextJsonPrompt(transcript, 'latest question')
       assert.ok(Buffer.byteLength(input, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
       assert.ok(Buffer.byteLength(JSON.stringify(input), 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES)
-      const { summary } = await runTurn(h, 'tool-success.ndjson', { input })
+      const { summary, events } = await runTurn(h, 'tool-success.ndjson', { input })
       assert.equal(summary?.isError, false, summary?.errorDetail)
+      const compacted = events.find((e) => e.kind === 'context_compacted')
+      assert.ok(compacted?.kind === 'context_compacted' && compacted.compaction.strategy === 'history_suffix')
+      assert.ok(compacted?.kind === 'context_compacted' && compacted.compaction.droppedEntries > 0)
       const cap = JSON.parse(await readFile(h.capture, 'utf8'))
       assert.ok(Buffer.byteLength(cap.stdin, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
       const prompt = JSON.parse(cap.stdin.trim()).message.content as string
@@ -628,31 +631,53 @@ describe('AntigravityAdapter', () => {
     }
   })
 
-  test('refuses a current message that alone exceeds the stdin limit, classified as context too long', async () => {
+  test('spools an oversized current input without losing its history or native continuation', async () => {
     const h = await harness()
     try {
       h.adapter.setAntigravityRoute(ROUTE)
-      const input = renderHistoricalContextJsonPrompt([{ role: 'User', text: 'hi' }], 'x'.repeat(ANTIGRAVITY_MAX_PROMPT_BYTES))
-      const { summary } = await runTurn(h, 'tool-success.ndjson', { input })
-      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_PROMPT_TOO_LARGE/)
-      assert.equal(classifyRunError(summary?.errorDetail).code, 'context_too_long')
-      assert.equal(existsSync(h.capture), false)
+      const current = '最新任务\n"quoted" 😀'.repeat(100_000)
+      const input = renderHistoricalContextJsonPrompt([{ role: 'User', text: 'previous decision' }], current)
+      const { summary, events } = await runTurn(h, 'tool-success.ndjson', { input })
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      const cap = JSON.parse(await readFile(h.capture, 'utf8'))
+      assert.ok(Buffer.byteLength(cap.stdin, 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES)
+      const prompt = JSON.parse(cap.stdin.trim()).message.content as string
+      const fileLine = prompt.split('\n').find((line) => line.startsWith('Input file: '))!
+      const file = JSON.parse(fileLine.slice('Input file: '.length)) as string
+      assert.ok(file.startsWith(h.dir + path.sep))
+      assert.equal(await readFile(file, 'utf8'), input)
+      const observations = events.filter((e) => e.kind === 'context_pressure' || e.kind === 'context_compacted')
+      assert.equal(observations[0]?.kind, 'context_pressure')
+      assert.equal(observations[1]?.kind, 'context_compacted')
+      assert.ok(observations[0]?.kind === 'context_pressure' && observations[0].pressure.usedRatio > 1)
+      assert.ok(observations[1]?.kind === 'context_compacted' && observations[1].compaction.strategy === 'file_reference')
+      assert.ok(observations[1]?.kind === 'context_compacted' && observations[1].compaction.droppedEntries === 0)
+      // A later turn retains the same native conversation and sends only its
+      // new input. The original file remains readable from native history.
+      const resumed = await runTurn(h, 'tool-success.ndjson', { input: 'continue' })
+      assert.equal(resumed.summary?.isError, false)
+      const next = JSON.parse(await readFile(h.capture, 'utf8'))
+      assert.ok(next.argv.includes('--conversation'))
+      assert.doesNotMatch(next.stdin, /Input file:/)
+      assert.equal(await readFile(file, 'utf8'), input)
     } finally {
       await h.restore()
     }
   })
 
-  test('refuses prompts above the verified stdin size before spawning', async () => {
+  test('ordinary prompts do not create context artifacts or compaction observations', async () => {
     const h = await harness()
     try {
       h.adapter.setAntigravityRoute(ROUTE)
-      const { summary } = await runTurn(h, 'tool-success.ndjson', { input: 'x'.repeat(ANTIGRAVITY_MAX_PROMPT_BYTES) })
-      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_PROMPT_TOO_LARGE/)
-      assert.equal(existsSync(h.capture), false)
+      const { summary, events } = await runTurn(h, 'tool-success.ndjson', { input: 'hello' })
+      assert.equal(summary?.isError, false)
+      assert.equal(events.some((e) => e.kind === 'context_compacted' || e.kind === 'context_pressure'), false)
+      assert.equal((await readdir(h.dir)).some((name) => name.startsWith('.openclaude-context-')), false)
     } finally {
       await h.restore()
     }
   })
+
 })
 
 describe('antigravity tool normalization', () => {

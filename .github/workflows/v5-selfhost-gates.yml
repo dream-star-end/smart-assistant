@@ -111,6 +111,10 @@ jobs:
           npx tsx --test packages/gateway/src/__tests__/delegateContext.test.ts packages/gateway/src/__tests__/delegateTrace.test.ts packages/gateway/src/__tests__/delegateTraceDurable.test.ts packages/gateway/src/__tests__/delegateAsyncJobs.test.ts packages/gateway/src/__tests__/ccbTraceHeader.test.ts
           npx tsx --test packages/commercial/src/__tests__/internalDelegateTrace.test.ts packages/commercial/src/__tests__/turnDispatchStore.test.ts packages/commercial/src/__tests__/turnDispatchReconciler.test.ts packages/commercial/src/__tests__/containerLogArchive.test.ts scripts/__tests__/containerArchiveDrill.test.ts
 
+      - name: Context launch budgets (offline)
+        run: |
+          npx tsx --test --test-concurrency=1 packages/protocol/src/__tests__/contextPressure.test.ts packages/gateway/src/__tests__/boundedPrompt.test.ts packages/gateway/src/__tests__/contextObservationFrames.test.ts packages/gateway/src/__tests__/antigravityAdapter.test.ts
+
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
 

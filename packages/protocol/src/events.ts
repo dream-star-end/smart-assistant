@@ -18,6 +18,7 @@
  *   - verification.* Plan/output verification results
  */
 import { type Static, Type } from '@sinclair/typebox'
+import { ContextPressure } from './contextPressure.js'
 import type { ToolTerminationReason } from './toolFailureAudit.js'
 
 // ── Schema version ──────────────────────────────
@@ -299,6 +300,13 @@ export const ApprovalEvent = Type.Intersect([
 ])
 export type ApprovalEvent = Static<typeof ApprovalEvent>
 
+export const SessionContextPressureEvent = Type.Intersect([
+  EventBase,
+  ContextPressure,
+  Type.Object({ type: Type.Literal('session.context_pressure'), sessionKey: Type.String() }),
+])
+export type SessionContextPressureEvent = Static<typeof SessionContextPressureEvent>
+
 // ── Union of all events ─────────────────────────
 export const GatewayEvent = Type.Union([
   CronFiredEvent,
@@ -308,6 +316,7 @@ export const GatewayEvent = Type.Union([
   AgentDelegatedEvent,
   AgentCompletedEvent,
   SessionCrashedEvent,
+  SessionContextPressureEvent,
   TurnCompletedEvent,
   ToolCalledEvent,
   MemoryHitEvent,
@@ -330,6 +339,7 @@ export const GATEWAY_EVENT_TYPES = [
   'agent.delegated',
   'agent.completed',
   'session.crashed',
+  'session.context_pressure',
   'turn.completed',
   'tool.called',
   'memory.hit',

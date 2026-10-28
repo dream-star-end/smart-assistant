@@ -19,6 +19,7 @@ import type {
   AgentDelegatedEvent,
   AgentCompletedEvent,
   SessionCrashedEvent,
+  SessionContextPressureEvent,
   TurnCompletedEvent,
   ToolCalledEvent,
   MemoryHitEvent,
@@ -36,6 +37,7 @@ type EventPayloadMap = {
   'agent.delegated': AgentDelegatedEvent
   'agent.completed': AgentCompletedEvent
   'session.crashed': SessionCrashedEvent
+  'session.context_pressure': SessionContextPressureEvent
   'turn.completed': TurnCompletedEvent
   'tool.called': ToolCalledEvent
   'memory.hit': MemoryHitEvent
