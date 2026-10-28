@@ -8901,6 +8901,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
           "assertion": "OCV5-649 the liveness look passes the real transport argument check"
