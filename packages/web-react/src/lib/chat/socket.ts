@@ -1419,7 +1419,13 @@ export class ChatSocket {
     const sync = this.deps.syncSession;
     if (!sync) return;
     const lifecycle = this.lifecycleEpoch;
-    void Promise.resolve().then(() => sync(sessId, context)).then((ok) => ok !== false, () => false).then((ok) => {
+    let read: ReturnType<typeof sync>;
+    try {
+      read = sync(sessId, context);
+    } catch {
+      read = false;
+    }
+    void Promise.resolve(read).then((ok) => ok !== false, () => false).then((ok) => {
       if (ok || !retry || lifecycle !== this.lifecycleEpoch) return;
       setTimeout(() => {
         if (lifecycle === this.lifecycleEpoch) this.syncHistory(sessId, context, false);

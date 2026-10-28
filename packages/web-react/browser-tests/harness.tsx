@@ -64,7 +64,7 @@ import {
   resetShadowStatsForTests,
 } from "../src/lib/timeline/shadowLifecycle";
 import { createMemoryAuthSession } from "../src/lib/authSession";
-import { ChatSocket, exactUserReplayPayload } from "../src/lib/chat/socket";
+import { ChatSocket, exactUserReplayPayload, type ChatSocketDeps } from "../src/lib/chat/socket";
 import { manualTaskContinuationSource, taskContinuationPrompt } from "../src/lib/chat/manualTaskContinuation";
 import { useSessionList } from "../src/hooks/useSessionList";
 import { useUnreadSessions } from "../src/hooks/useUnreadSessions";
@@ -234,7 +234,7 @@ declare global {
         cursor: number;
         requests: string[];
       }>;
-      /** Reload mid-turn: the tape-commit completion lands inside the replay backlog (INC-20261015-RESUME-REPLAY-LAG). */
+      /** Reload mid-turn: the tape-commit completion lands while the snapshot catch-up is still paging (INC-20261015-RESUME-REPLAY-LAG). */
       runResumeReplayCompletion: () => Promise<{
         settledMs: number | null;
         syncCalls: number;
@@ -1852,6 +1852,8 @@ class HarnessWebSocket {
 
 let replayReportedErrors = 0;
 let replaySyncCalls = 0;
+/** HTTP face of the session snapshot for the replay socket (snapshot paging). */
+let replaySnapshotRead: () => Promise<unknown> = async () => null;
 const replaySocket = new ChatSocket({
   getToken: () => "harness-replay-token",
   getAuthEpoch: () => 0,
@@ -1860,6 +1862,7 @@ const replaySocket = new ChatSocket({
   defaultAgentId: REPLAY_AGENT_ID,
   reportClientError: () => { replayReportedErrors += 1; },
   syncSession: () => { replaySyncCalls += 1; },
+  readSessionSnapshot: () => replaySnapshotRead() as ReturnType<NonNullable<ChatSocketDeps["readSessionSnapshot"]>>,
 });
 replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "replay 会话");
 
@@ -2292,9 +2295,27 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         isFinal: false,
         ts: seq,
       });
-      // Reload shape: the gateway re-reads the running turn from its start.
-      ws.deliver({ type: "outbound.active_turn_replay_start", sessionKey, channel: "webchat", peer, clientMessageId: cmid });
-      for (let seq = 1; seq <= cut; seq++) ws.deliver(delta(seq));
+      // Reload shape: the hello snapshot re-reads the running turn's stream from its start
+      // (cursor_reset); the tail is still paging over HTTP.
+      const dispatchId = "99999999-9999-4999-8999-999999999999";
+      const streamKey = `dispatch:${dispatchId}:1`;
+      const final = { ...delta(total + 1), blocks: [], isFinal: true };
+      const page = (from: number, to: number, more: boolean) => ({
+        v: 1, sessionId: REPLAY_SESSION_ID,
+        dispatch: {
+          id: dispatchId, clientMessageId: cmid, agentId: REPLAY_AGENT_ID, status: "accepted",
+          outcome: null, attempt: 1, since: 1, acceptedAt: 1, terminalAt: null,
+        },
+        streamKey, lastFrameSeq: total + 1, lastFrameAt: total + 1, engineReady: true, turnStatus: null,
+        reconcile: null, pendingPermissions: { items: [], completeness: "complete" }, usage: null, credits: null,
+        frames: Array.from({ length: to - from + 1 }, (_, i) => from + i)
+          .map((seq) => ({ recordId: String(seq), frameSeq: seq, payload: seq > total ? final : delta(seq) })),
+        nextAfterSeq: to, hasMore: more, gap: more ? { reason: "cursor_reset" } : null, asOf: total + 2,
+      });
+      let releaseTail: () => void = () => {};
+      replaySnapshotRead = () => new Promise((resolve) => { releaseTail = () => resolve(page(cut + 1, total + 1, false)); });
+      ws.deliver({ type: "outbound.session_snapshot", channel: "webchat", peer, snapshot: page(1, cut, true) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const syncBefore = replaySyncCalls;
       const t0 = performance.now();
       // The tape commit already happened; its completion overtakes the rest of the backlog.
@@ -2310,6 +2331,7 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         // Committed after the whole answer was generated: newer than every backlog frame.
         ts: total + 1,
       });
+      releaseTail();
       let settledMs: number | null = null;
       for (let i = 0; i < 200; i++) {
         if (!replaySocket.sessions.get(REPLAY_SESSION_ID)?._sendingInFlight) {
@@ -2319,9 +2341,10 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       const syncCalls = replaySyncCalls - syncBefore;
-      // The rest of the backlog is older than the settled completion: REST history, not the
-      // backlog, completes the row, so these frames must neither grow nor double it.
+      // The catch-up already merged the whole stream: the same frames arriving live again
+      // must neither grow nor double the row.
       for (let seq = cut + 1; seq <= total; seq++) ws.deliver(delta(seq));
+      replaySnapshotRead = async () => null;
       const root = document.querySelector("#timeline-replay-root");
       await new Promise((resolve) => setTimeout(resolve, 300));
       const text = replaySocket.sessions.get(REPLAY_SESSION_ID)?.messages.find((m) => m.id === rowId)?.text ?? "";
@@ -2330,7 +2353,7 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         settledMs,
         syncCalls,
         textLength: text.length,
-        expectedLength: start.length + (cut - 1),
+        expectedLength: start.length + (total - 2) + end.length,
         domStartCount: dom.split("BROWSER_RESUME_START").length - 1,
         domEndCount: dom.split("BROWSER_RESUME_END").length - 1,
       };

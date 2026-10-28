@@ -100,6 +100,10 @@ const snapshotDispatch = (clientMessageId: string) => ({
   outcome: null, attempt: 1, since: 5, acceptedAt: 6, terminalAt: null,
 });
 const snapshotFlush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+/** Recovery grace verification reads this: the recovery child is open on the server. */
+const recoveryChildRunning = (sessId: string) => async () => JSON.parse(sessionSnapshotFrame(sessId, {
+  dispatch: snapshotDispatch("m-recover-child"),
+})).snapshot;
 
 function msgFrame(over: AnyFrame): OutboundMessageWire {
   return {
@@ -7161,10 +7165,16 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
   });
 
   /** 起一条 master 拥有自动恢复、已 admitted 的在飞 turn,再喂一条可自动恢复的 outbound.error。 */
-  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean; earlyDecision?: boolean } = {}) {
+  function deferredErrorFixture(
+    sessId: string,
+    opts: { masterOwns?: boolean; earlyDecision?: boolean; snapshot?: () => Promise<unknown> } = {},
+  ) {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket({ syncSession: async () => {} });
+    const sock = makeSocket({
+      syncSession: async () => {},
+      readSessionSnapshot: (opts.snapshot ?? recoveryChildRunning(sessId)) as never,
+    });
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
@@ -7429,6 +7439,19 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
+  test("OD1: grace timeout with no recovery running on the server paints the card once and ends 重试中", async () => {
+    const { sock, session } = deferredErrorFixture("s-defer-timeout-none", {
+      snapshot: async () => JSON.parse(sessionSnapshotFrame("s-defer-timeout-none", {})).snapshot,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await snapshotFlush();
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(errorCards(session)).toHaveLength(1);
+    sock.stop();
+  });
+
   test("recoverySkipped ack for the deferred lineage lands the red card before the skip notice", () => {
     const { sock, ws, session, user } = deferredErrorFixture("s-defer-skip");
     ws.onmessage?.({ data: JSON.stringify({
@@ -7529,14 +7552,18 @@ describe("ChatSocket problem card reporting", () => {
     traceId?: string;
   };
 
-  function problemCardFixture(sessId: string, opts: { masterOwns?: boolean; code?: string } = {}) {
+  function problemCardFixture(
+    sessId: string,
+    opts: { masterOwns?: boolean; code?: string; snapshot?: () => Promise<unknown> } = {},
+  ) {
     const reports: ProblemCardCall[] = [];
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({
       syncSession: async () => {},
       reportProblemCard: (p) => { reports.push({ ...p }); },
-    });
+      readSessionSnapshot: opts.snapshot ?? recoveryChildRunning(sessId),
+    } as never);
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
@@ -7654,6 +7681,17 @@ describe("ChatSocket problem card reporting", () => {
     vi.advanceTimersByTime(60_000);
     expect(reports.filter((r) => r.outcome === "failed")).toHaveLength(0);
     expect(reports.filter((r) => r.path === "decision_timeout")).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("OD1: grace timeout with no recovery on the server reports failed/decision_timeout once", async () => {
+    const { sock, reports } = problemCardFixture("s-pc-dtimeout-none", {
+      snapshot: async () => JSON.parse(sessionSnapshotFrame("s-pc-dtimeout-none", {})).snapshot,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await snapshotFlush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(reports.filter((r) => r.outcome === "failed").map((r) => r.path)).toEqual(["decision_timeout"]);
     sock.stop();
   });
 
