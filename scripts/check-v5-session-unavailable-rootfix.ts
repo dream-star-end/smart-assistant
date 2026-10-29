@@ -1165,3 +1165,16 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[container-request-body-errors] PASS — aborted reads never become size errors or forward partial bytes; 512KiB cap remains enforced')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/commercial/src/__tests__/antigravityRelay.test.ts'],
+  expected: [
+    'OCV5-659 relay stream failures do not become size errors or reserve credits',
+    'OCV5-659 relay metadata and generate byte caps still reject before billing',
+  ],
+  namePattern: 'OCV5-659',
+  label: 'relay-request-body-errors',
+  timeoutMs: 120_000,
+})
+console.log('[relay-request-body-errors] PASS — relay read errors never reserve credits or become 413; metadata and generate byte caps remain enforced')
