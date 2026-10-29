@@ -2,7 +2,7 @@ import { AlertTriangle, RotateCcw, Sparkles, Wallet } from "lucide-react";
 import type { ReactNode } from "react";
 import type { AgentGatePhase } from "../hooks/useAgentGate";
 import { groupDigits } from "../lib/utils";
-import { ErrorTechDetails } from "./ErrorTechDetails";
+import { ErrorTechDetails } from "./chat/lazyTurnErrorNotice";
 import { Button, Spinner } from "./ui";
 
 /**

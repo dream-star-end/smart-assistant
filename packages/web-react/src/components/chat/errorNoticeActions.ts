@@ -25,7 +25,7 @@ export function noticeActions(list: readonly ErrorNoticeAction[]): readonly [Not
  *  - 免单卡只留重发和反馈(本轮已退款,不引导换模型或开新会话);
  *  - 「联系管理员」走反馈入口,带上这条消息的追踪信息。
  */
-export function errorNoticeActions(input: {
+export type ErrorNoticeActionsInput = {
   msg: ChatMessage;
   cb: CardCallbacks;
   userError: UserError;
@@ -38,7 +38,9 @@ export function errorNoticeActions(input: {
   continueInterrupted?: () => void;
   topUp?: ErrorNoticeAction;
   contactAdmin?: () => void;
-}): ErrorNoticeAction[] {
+};
+
+export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeAction[] {
   const { cb, isLastTurn, waived } = input;
   const h: ErrorActionHandlers = {};
   if (isLastTurn) {

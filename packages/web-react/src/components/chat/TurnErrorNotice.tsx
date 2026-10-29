@@ -11,7 +11,9 @@ import type { ErrorNoticeAction, UserError } from "../../lib/chat/userErrorView"
 import type { NoticeTone } from "../../lib/ui/statusTone";
 import { ErrorTechDetails } from "../ErrorTechDetails";
 import { Notice } from "../ui/Notice";
-import { noticeActions } from "./errorNoticeActions";
+import { errorNoticeActions, type ErrorNoticeActionsInput, noticeActions } from "./errorNoticeActions";
+
+export { ErrorTechDetails };
 
 export type TurnErrorNoticeProps = {
   role: "alert" | "status";
@@ -25,8 +27,8 @@ export type TurnErrorNoticeProps = {
   fixedBody?: string;
   /** 正文下的补充说明。 */
   note?: ReactNode;
-  /** 目录建议 → 可执行的按钮(最多两个,门控在调用方)。 */
-  actions: (userError: UserError) => readonly ErrorNoticeAction[];
+  /** 目录建议 → 可执行的按钮(最多两个)。终态卡传门控输入,由本块按目录排出按钮(errorNoticeActions)。 */
+  actions: ((userError: UserError) => readonly ErrorNoticeAction[]) | Omit<ErrorNoticeActionsInput, "userError">;
   /** 技术详情(码、请求 ID、消息 ID),默认收起。 */
   details?: string;
 };
@@ -39,7 +41,7 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
       tone={p.tone}
       className={p.className}
       title={p.title}
-      actions={noticeActions(p.actions(userError))}
+      actions={noticeActions(typeof p.actions === "function" ? p.actions(userError) : errorNoticeActions({ ...p.actions, userError }))}
       details={p.details ? <ErrorTechDetails text={p.details} /> : undefined}
     >
       {p.fixedBody ?? userError.message}

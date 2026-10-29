@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
-import { claimProblemCardReport, problemCardReportKey } from "../lib/chat/problemCardReportGuard";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
 import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
@@ -403,9 +402,11 @@ export function useChatSocket(opts: {
         }, authRef.current?.snapshot().token);
       },
       reportProblemCard: (p) => {
-        // 刷新 / 重连 / 多标签页不重复报同一张卡(W3)。
-        if (!claimProblemCardReport(problemCardReportKey(p))) return;
-        reportClientFriction({
+        // 刷新 / 重连 / 多标签页不重复报同一张卡(W3)。去重表按需加载(首屏预算);块取不到时照常上报。
+        void import("../lib/chat/problemCardReportGuard").then(
+          (guard) => guard.claimProblemCardReport(guard.problemCardReportKey(p)),
+          () => true,
+        ).then((claimed) => claimed && reportClientFriction({
           surface: "chat",
           stage: "problem_card",
           code: p.code,
@@ -417,7 +418,7 @@ export function useChatSocket(opts: {
           attempts: p.attempts,
           traceId: p.traceId,
           sessionId: p.sessionId,
-        }, authRef.current?.snapshot().token);
+        }, authRef.current?.snapshot().token));
       },
       // resume_failed / 重连 reconcile：有游标走 REST 增量、无游标才全量；两者都以 server
       // 为最终权威源并走 applyServerMessages 收口（含 client-owned 行保留与团队卡归一化）。

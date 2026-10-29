@@ -52,7 +52,6 @@ import {
   errorTechnicalDetails,
   readUserError,
   standaloneErrorTitle,
-  type UserError,
 } from "../../lib/chat/userErrorView";
 // 从 lib 取(不是 settings/SubscriptionDialog):红卡在首屏同步渲染,静态引订阅弹窗会把弹窗 +
 // 支付入口一并钉进入口闭包(2026-09-17 first-screen-budget 超限修复)。
@@ -80,9 +79,8 @@ import {
 } from "../ui";
 import { formatDate } from "../ui/TimeAgo";
 import { Notice } from "../ui/Notice";
-import { ErrorTechDetails } from "../ErrorTechDetails";
-import { errorNoticeActions, noticeActions } from "./errorNoticeActions";
-import { ErrorNotice } from "./lazyTurnErrorNotice";
+import type { ErrorNoticeActionsInput } from "./errorNoticeActions";
+import { ErrorNotice, ErrorTechDetails } from "./lazyTurnErrorNotice";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
@@ -1062,11 +1060,9 @@ export function AssistantCard({
       cb.getToken?.(),
     );
   }, [isInsufficient, msg.id, cb]);
-  const buildErrorActions = (userError: UserError) =>
-    errorNoticeActions({
+  const errorActions: Omit<ErrorNoticeActionsInput, "userError"> = {
       msg,
       cb,
-      userError,
       isLastTurn,
       waived: presentedError?.waived === true,
       preciseRetryTarget: retryEligible && !isInsufficient ? sourceUser : undefined,
@@ -1086,7 +1082,7 @@ export function AssistantCard({
           }
         : undefined,
       contactAdmin: cb.onFeedback ? () => cb.onFeedback?.(buildFeedbackCtx(msg)) : undefined,
-    });
+    };
   // 错误码、请求 ID、消息 ID 只进「技术详情」,默认收起。
   const technicalDetails = presentedError || standaloneError
     ? errorTechnicalDetails({
@@ -1266,20 +1262,19 @@ export function AssistantCard({
                 {msg._recoverySkippedNotice}
               </p>
             ) : undefined}
-            actions={buildErrorActions}
+            actions={errorActions}
             details={technicalDetails}
           />
         ) : standaloneError && !live ? (
-          <Notice
+          <ErrorNotice
             role="alert"
             tone="attention"
             className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
             title={standaloneErrorTitle(standaloneError)}
-            actions={noticeActions(buildErrorActions(standaloneError))}
-            details={technicalDetails ? <ErrorTechDetails text={technicalDetails} /> : undefined}
-          >
-            {standaloneError.message}
-          </Notice>
+            userError={standaloneError}
+            actions={errorActions}
+            details={technicalDetails}
+          />
         ) : null}
 
         {showUnpublishedProcessPending && (
