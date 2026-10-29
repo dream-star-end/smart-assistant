@@ -254,6 +254,11 @@ export const containerLinkRebuilt = new Counter({ name: "container_link_rebuilt_
 export const containerLinkReconnect = new Counter({ name: "container_link_reconnect_total", help: "Bounded container link recovery outcomes", labelNames: ["outcome"] });
 export const containerLinkGap = new Counter({ name: "container_link_gap_total", help: "Durable container ring replay gaps", labelNames: [] });
 export const containerLinkControlDelivered = new Counter({ name: "container_link_control_delivered_total", help: "Successful durable control transport sends, including retries", labelNames: ["via"] });
+export const containerLinkOriginInjected = new Counter({
+  name: "container_link_origin_injected_total",
+  help: "Origin turns first claimed by a container link",
+  labelNames: ["kind"], // cron | dlgcb | lsc
+});
 
 export const gatewayRequests = new Counter({
   name: "gateway_http_requests_total",
@@ -766,6 +771,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   containerLinkReconnect.render(out);
   containerLinkGap.render(out);
   containerLinkControlDelivered.render(out);
+  containerLinkOriginInjected.render(out);
   gatewayRequests.render(out);
   billingDebits.render(out);
   claudeApiRequests.render(out);
@@ -802,6 +808,7 @@ export function resetMetricsForTest(): void {
   containerLinkReconnect.reset();
   containerLinkGap.reset();
   containerLinkControlDelivered.reset();
+  containerLinkOriginInjected.reset();
   gatewayRequests.reset();
   billingDebits.reset();
   claudeApiRequests.reset();

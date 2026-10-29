@@ -5863,6 +5863,13 @@ export async function registerCommercial(
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     containerLinkEnabled: containerLinkOn,
     resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
+    readContainerLinkBundleRev: async (uid, cid) => {
+      const status = v3Deps ? await getV3ContainerStatus(v3Deps, Number(uid)) : null;
+      if (!status || status.containerId !== cid || status.state !== "running") {
+        throw new Error("container link execution carrier unavailable");
+      }
+      return status.labels?.["com.openclaude.runtime.bundle_rev"] || undefined;
+    },
     containerLinkRecovery: { channel: runtimeChannel },
     modelSwitchCost,
     jwtSecret,

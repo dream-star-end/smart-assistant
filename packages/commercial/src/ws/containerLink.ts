@@ -45,6 +45,19 @@ export class ContainerLinkHandle extends EventEmitter {
   detached = false;
   recoveryOnly = false;
   keepAlive = false;
+  background = false;
+  private retainers = 0;
+  get retained(): boolean { return this.retainers > 0; }
+  retain(): () => void {
+    this.retainers++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.retainers--;
+      this.onStreamsChanged();
+    };
+  }
   active = false;
   opened = false;
   disposed = false;
@@ -424,6 +437,12 @@ export class ContainerLinkRegistry {
   readonly dialTimeoutMs: number;
   readonly heartbeatMs: number;
   readonly maxBufferedBytes: number;
+  /** Execution contexts may join an already woken carrier, never dial a fallback. */
+  attachExisting(uid: bigint, cid: number): WebSocket | null {
+    const link = this.links.get(`${uid}:${cid}`);
+    if (this.stopping || !link || link.stopping || link.ws?.readyState !== WebSocket.OPEN) return null;
+    return link.attach().socket;
+  }
   constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number }) {
     this.dialTimeoutMs = opts?.dialTimeoutMs ?? 5000;
     this.heartbeatMs = opts?.heartbeatMs ?? 30_000;

@@ -13,6 +13,7 @@
 import assert from 'node:assert/strict'
 import { beforeEach, describe, test } from 'node:test'
 import {
+  containerLinkOriginInjected,
   incrAnthropicProxyReject,
   incrAnthropicProxySettle,
   // 顺带验证老 helper 仍可用
@@ -238,9 +239,26 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
     })
   })
 
+  test('origin injection counter renders bounded kinds and resets with other series', async () => {
+    containerLinkOriginInjected.inc({ kind: 'cron' })
+    containerLinkOriginInjected.inc({ kind: 'dlgcb' })
+    containerLinkOriginInjected.inc({ kind: 'lsc' })
+    containerLinkOriginInjected.inc({ kind: 'lsc' })
+    let text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
+    assert.ok(text.includes('container_link_origin_injected_total{kind="cron"} 1'))
+    assert.ok(text.includes('container_link_origin_injected_total{kind="dlgcb"} 1'))
+    assert.ok(text.includes('container_link_origin_injected_total{kind="lsc"} 2'))
+    resetMetricsForTest()
+    text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
+    assert.ok(text.includes('# HELP container_link_origin_injected_total'))
+    assert.ok(!text.includes('container_link_origin_injected_total{'))
+  })
+
   describe('renderPrometheus 全局结构', () => {
     test('v1 + v3 系列都出现一次,以 newline 结尾', async () => {
       const text = await renderPrometheus({ override: { agentContainersRunning: 0 } })
+      assert.ok(text.includes('# HELP container_link_origin_injected_total'))
+      assert.ok(text.includes('# TYPE container_link_origin_injected_total counter'))
       // v1 counter(5)
       assert.ok(text.includes('# HELP gateway_http_requests_total'))
       assert.ok(text.includes('# HELP billing_debit_total'))
@@ -269,12 +287,12 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
       assert.ok(text.includes('# HELP account_pool_health'))
       assert.ok(text.includes('# HELP agent_containers_running'))
       assert.ok(text.endsWith('\n'))
-      // 控制投递新增一个 counter；所有 HELP 仍各出现一次
+      // 控制投递与原点注入各新增一个 counter；所有 HELP 仍各出现一次
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        25,
-        `HELP 行总数 = 25 (原21系列 + 4 ContainerLink counter), got ${helpCount}`,
+        26,
+        `HELP 行总数 = 26 (原21系列 + 3 ContainerLink recovery counter + control delivery + origin injection), got ${helpCount}`,
       )
     })
   })

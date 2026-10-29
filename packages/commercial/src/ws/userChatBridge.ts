@@ -1,4 +1,10 @@
 import { ContainerLinkControls } from "./containerLinkControls.js";
+import { ContainerLinkWake } from "./containerLinkWake.js";
+import { injectOriginTurn, type CronOriginExecutor, type CronOriginExecutorClaimResult,
+  type CronOriginInjectInput, type CronOriginInjectResult } from "./originTurnInjection.js";
+export { executeCronOriginInject, lookupCronOriginSessionModel, resolveCronOriginAdmitModel } from "./originTurnInjection.js";
+export type { CronOriginExecutor, CronOriginExecutorClaimResult, CronOriginInjectInput, CronOriginInjectResult } from "./originTurnInjection.js";
+import { loadBridgeModelChecker, loadBridgeAgentResolver } from "./bridgeExecutionContext.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
@@ -13,7 +19,7 @@ import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapsh
 import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
-import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
+import {type ModelSwitchCostService} from '../billing/modelSwitchCost.js';
 import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
@@ -235,7 +241,6 @@ import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
 } from "../db/pgSessionsBackend.js";
-import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
@@ -851,6 +856,7 @@ export interface UserChatBridgeDeps {
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
   resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
+  readContainerLinkBundleRev?: (uid: bigint, containerId: number) => Promise<string | undefined>;
   containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
   modelSwitchCost?: ModelSwitchCostService;
   jwtSecret: string | Uint8Array;
@@ -1460,12 +1466,6 @@ export function codexAbandonFailureCode(reason: string): JournalFailureCode {
   return "INTERNAL_ERROR";
 }
 
-export type CronOriginExecutorClaimResult =
-  | { kind: "claimed" }
-  | { kind: "not_claimed" }
-  | { kind: "rejected" }
-  | { kind: "delivery_unknown" }
-
 export function classifyTurnDispatchReceipt(
   receipt: {
     dispatchId?: unknown;
@@ -1511,23 +1511,6 @@ export function classifyTurnDispatchReceipt(
   return "invalid";
 }
 
-export type CronOriginExecutor = (payload: {
-  encoded: Buffer
-  admitted: {
-    clientMessageId: string
-    sessionId: string
-    agentId: string
-    dispatchId: string
-    billingRequestId: string
-    attemptNo: number
-    leaseEpoch: number
-    /** Exact DB lease owner; cron-origin is not the bridge connId. */
-    leaseOwnerId: string
-    anchorSeq: bigint | null
-    requestHash: string
-  }
-}) => CronOriginExecutorClaimResult | Promise<CronOriginExecutorClaimResult>
-
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
@@ -1571,226 +1554,6 @@ export interface UserChatBridgeHandler {
   ): void;
   /** @internal test seam: inspect the real executor registered by attestation. */
   _testGetCronOriginExecutor(uid: string): CronOriginExecutor | null;
-}
-
-export type CronOriginInjectInput = {
-  uid: bigint
-  sessionId: string
-  text: string
-  clientMessageId: string
-  agentId: string
-}
-
-export type CronOriginInjectResult =
-  | { kind: "injected" }
-  | { kind: "gone" }
-  | { kind: "in_flight" }
-  | { kind: "no_transport" }
-  | { kind: "failed"; reason: string }
-
-/** Origin-session cron must reuse the conversation's current model, not the
- *  process default (glm). An empty/missing model keeps the historical
- *  `admitUserTurn({ model: null })` path. */
-export function resolveCronOriginAdmitModel(
-  sessionModelId: string | null | undefined,
-): string | null {
-  if (typeof sessionModelId !== "string") return null;
-  const trimmed = sessionModelId.trim();
-  if (!trimmed) return null;
-  if (!/^[A-Za-z0-9._-]{1,64}$/.test(trimmed)) return null;
-  return trimmed;
-}
-
-/**
- * Cron-origin inject only needs the origin session's `model_id`. Do NOT go
- * through `getClientSession` here: that hydrates every turn tape of the
- * session (hundreds of MB for long-lived parents), routinely trips the 30s
- * `statement_timeout`, and keeps the container's 15s POST waiting past its
- * deadline — the container then retries the same id every minute and the
- * repeated hydrations saturate the master. One indexed row read is enough.
- */
-export async function lookupCronOriginSessionModel(
-  pool: Pick<Pool, "query">,
-  sessionId: string,
-  sessionUserId: string,
-): Promise<string | null> {
-  return readClientSessionModelId(pool, sessionId, sessionUserId);
-}
-
-/** Shared origin-session inject path used by the bridge and unit tests. */
-export async function executeCronOriginInject(opts: {
-  input: CronOriginInjectInput
-  pgPool?: UserChatBridgeDeps["pgPool"]
-  modelSwitchCost?: ModelSwitchCostService;
-  lookupSessionModel?: (
-    sessionId: string,
-    sessionUserId: string,
-  ) => Promise<string | null | undefined>
-  admitUserTurn: NonNullable<UserChatBridgeDeps["admitUserTurn"]>
-  /** Resolve transport candidates only after durable admission. A bridge that
-   * disappeared during the admission await must never be called as a stale
-   * closure. `executor` remains as a focused-test convenience. */
-  getExecutors?: () => Iterable<CronOriginExecutor>
-  executor?: CronOriginExecutor
-  log?: Logger
-}): Promise<CronOriginInjectResult> {
-  const { input, pgPool, lookupSessionModel, admitUserTurn, getExecutors, executor, log, modelSwitchCost } = opts;
-  if (!isClientMessageId(input.clientMessageId) || input.sessionId.trim() === "" || input.text.trim() === "") {
-    return { kind: "failed", reason: "invalid_payload" };
-  }
-  const content = { text: input.text };
-  const requestHash = computeDispatchRequestHash(content);
-  const sessionUserId = "c:" + input.uid.toString();
-  let originModel: string | null = null;
-  try {
-    let raw: string | null | undefined;
-    if (lookupSessionModel) {
-      raw = await lookupSessionModel(input.sessionId, sessionUserId);
-    } else if (pgPool) {
-      // Single-row model read; never the tape-hydrating getClientSession.
-      raw = await lookupCronOriginSessionModel(pgPool, input.sessionId, sessionUserId);
-    }
-    originModel = resolveCronOriginAdmitModel(raw);
-  } catch (err) {
-    log?.warn("user-chat-bridge: cron origin session model lookup failed", {
-      uid: input.uid.toString(),
-      sessionId: input.sessionId,
-      err,
-    });
-  }
-  if(modelSwitchCost && originModel){
-    try {await modelSwitchCost.assertAuthorized(input.uid.toString(),{sessionId:input.sessionId,requestId:input.clientMessageId,
-      targetModel:originModel,agentId:input.agentId||'main',text:input.text});}
-    catch(error){return {kind:'failed',reason:error instanceof ModelSwitchCostError?error.code:'MODEL_SWITCH_UNAVAILABLE'};}
-  }
-  const message = {
-    id: input.clientMessageId,
-    role: "user" as const,
-    text: input.text,
-    ts: Date.now(),
-    _routing: {
-      teamMode: false,
-      effortLevel: null as string | null,
-      ...(originModel ? { model: originModel } : {}),
-    },
-  };
-  let admit;
-  try {
-    admit = await admitUserTurn({
-      uid: input.uid,
-      sessionUserId,
-      sessionId: input.sessionId,
-      clientMessageId: input.clientMessageId,
-      agentId: input.agentId || "main",
-      model: originModel,
-      requestHash,
-      billingRequestId: ensureRequestIdServerSide(),
-      dispatchId: randomUUID(),
-      ownerId: `cron-origin:${input.clientMessageId}`,
-      exclusiveSession: true,
-      message,
-    });
-  } catch (err) {
-    log?.warn("user-chat-bridge: cron origin admit threw", {
-      uid: input.uid.toString(),
-      sessionId: input.sessionId,
-      err,
-    });
-    return { kind: "failed", reason: "admit_threw" };
-  }
-  if (admit.kind === "session_not_found" || admit.kind === "session_deleted") {
-    return { kind: "gone" };
-  }
-  if (admit.kind === "session_busy") return { kind: "in_flight" };
-  if (
-    admit.kind === "append_error" ||
-    admit.kind === "recovery_conflict" ||
-    admit.kind === "previously_failed" ||
-    admit.kind === "manual_hold" ||
-    admit.kind === "immutable_conflict"
-  ) {
-    return { kind: "failed", reason: admit.kind };
-  }
-  if (admit.kind === "deduplicated") return { kind: "injected" };
-  if (admit.kind === "already_owned") return { kind: "in_flight" };
-  if (admit.kind === "in_flight") {
-    // accepted is the durable container receipt. rejecting is not success and
-    // must stay retryable; never ACK from the Master admission lease alone.
-    return admit.dispatch.status === "accepted"
-      ? { kind: "injected" }
-      : { kind: "in_flight" };
-  }
-  const d = admit.dispatch;
-  if (typeof d.ownerId !== "string" || d.ownerId.length === 0) {
-    log?.error("user-chat-bridge: cron origin admitted row missing lease owner", {
-      dispatchId: d.dispatchId,
-    });
-    if (pgPool) {
-      await casToTerminal(pgPool, {
-        dispatchId: d.dispatchId,
-        outcome: "executed_error",
-        failureCode: "dispatch_lease_owner_missing",
-        clientNotified: false,
-        fromStatuses: ["admitted"],
-        expectedEpoch: d.leaseEpoch,
-      });
-    }
-    return { kind: "failed", reason: "dispatch_lease_owner_missing" };
-  }
-  const frame = {
-    type: "inbound.message",
-    channel: "webchat",
-    peer: { kind: "dm", id: input.sessionId },
-    agentId: input.agentId || "main",
-    clientMessageId: input.clientMessageId,
-    idempotencyKey: `cron-origin:${input.clientMessageId}`,
-    content,
-    ts: message.ts,
-    ...(originModel ? { model: originModel } : {}),
-  };
-  const payload = {
-    encoded: Buffer.from(JSON.stringify(frame), "utf8"),
-    admitted: {
-      clientMessageId: d.clientMessageId,
-      sessionId: d.sessionId,
-      agentId: d.agentId,
-      dispatchId: d.dispatchId,
-      billingRequestId: d.billingRequestId,
-      attemptNo: d.attemptNo,
-      leaseEpoch: d.leaseEpoch,
-      leaseOwnerId: d.ownerId,
-      anchorSeq: d.anchorSeq,
-      requestHash: d.requestHash,
-    },
-  };
-  const candidates = getExecutors
-    ? [...getExecutors()]
-    : executor
-      ? [executor]
-      : [];
-  if (candidates.length === 0) return { kind: "no_transport" };
-  for (const candidate of candidates) {
-    let claim: CronOriginExecutorClaimResult;
-    try {
-      claim = await candidate(payload);
-    } catch (err) {
-      log?.warn("user-chat-bridge: cron executor delivery became unknown", {
-        dispatchId: d.dispatchId,
-        err,
-      });
-      return { kind: "failed", reason: "delivery_unknown" };
-    }
-    if (claim.kind === "claimed") return { kind: "injected" };
-    if (claim.kind === "rejected") {
-      return { kind: "failed", reason: "dispatch_rejected" };
-    }
-    if (claim.kind === "delivery_unknown") {
-      return { kind: "failed", reason: "delivery_unknown" };
-    }
-    // Only a synchronous, explicit not_claimed result may select another
-    // bridge. claimed/delivery_unknown can already have bytes in flight.
-  }
-  return { kind: "no_transport" };
 }
 
 // ---------- 内部工具 --------------------------------------------------------
@@ -2293,6 +2056,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Set<(job: ClaimedRecoveryJob) => void>
   >();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
+  const wake = links && recovery ? new ContainerLinkWake({ links, deps, isInMaintenance, wake: carrier => recovery.wake(carrier),
+    start: (user, uid, endpoint, socket, abort, connId, context) => startBridge(user, uid, endpoint, [], endpoint.containerId,
+      socket, abort, context.checker, context.agents, connId, context.role),
+  }) : null;
+
   const recoveryDrainRunning = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
   const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
@@ -2478,80 +2246,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         //     refresh 失败保留上次 checker(**放宽面**的可用性取舍)。
         //   - **epoch 联动(0144 / 代码审 R1 BLOCKER-1)**:周期刷新 + keep-LKG 对
         //     「撤权」是不够的 —— 见 ModelCheckerHandle 头注。
-        let modelCheckerHandle: ModelCheckerHandle | null = null;
-        if (deps.loadAllowedModelChecker) {
-          const loader = deps.loadAllowedModelChecker;
-
-          // grants 快照的 epoch 戳 = **读 grants 之前**观察到的 DB epoch 的保守下界。
-          //   · catalog 快照 epoch ≤ DB epoch(单调、只会落后)→ 用它盖戳只会盖低,不会盖高;
-          //   · 盖低 = 多做一次重载(安全方向);盖高 = 撤权被永久漏掉(BLOCKER-1 的形态)。
-          // 所以取戳**必须发生在 loader() 之前**,绝不能读完 grants 再补一个"当前 epoch"。
-          const observeEpoch = (): bigint =>
-            deps.modelAuthority?.catalog.peek()?.securityEpoch ?? 0n;
-
-          let inner: (modelId: string) => boolean = () => false; // 载入成功前一律不放行
-          let checkerEpoch = 0n;
-          const applyLoad = (stamp: bigint, next: (modelId: string) => boolean): void => {
-            // 迟到的旧班车(stamp 更小)不得把新快照换回旧的。
-            if (stamp < checkerEpoch) return;
-            inner = next;
-            checkerEpoch = stamp;
-          };
-          let loadInflight: { minEpoch: bigint; p: Promise<void> } | null = null;
-          const startLoad = (minEpoch: bigint): Promise<void> => {
-            const entry: { minEpoch: bigint; p: Promise<void> } = { minEpoch, p: Promise.resolve() };
-            entry.p = (async () => {
-              const next = await loader(uid, minEpoch === 0n ? undefined : minEpoch);
-              applyLoad(minEpoch, next);
-            })().finally(() => {
-              if (loadInflight === entry) loadInflight = null;
-            });
-            loadInflight = entry;
-            return entry.p;
-          };
-
-          try {
-            await startLoad(observeEpoch());
-          } catch (err) {
-            log?.error("user-chat-bridge: loadAllowedModelChecker threw", {
-              uid: uid.toString(),
-              err,
-            });
-            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
-            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
-            return;
-          }
-
-          modelCheckerHandle = {
-            isAllowed: (modelId) => inner(modelId),
-            epoch: () => checkerEpoch,
-            refresh: async () => {
-              try {
-                await startLoad(observeEpoch());
-              } catch (err) {
-                // 不切 inner —— 保留上次成功 checker。详见 GRANTS_REFRESH_INTERVAL_MS 注释。
-                // (这是**放宽面**的兜底:新授权晚 30s 生效可以忍;**收窄面**由
-                //  reloadAtLeast 的 fail-closed 路径接管,不共用这条 keep-LKG。)
-                log?.warn("user-chat-bridge: modelChecker refresh failed (keep last good)", {
-                  uid: uid.toString(),
-                  err,
-                });
-              }
-            },
-            reloadAtLeast: async (want) => {
-              if (checkerEpoch >= want) return;
-              // 只搭「启动时刻已观察到 epoch ≥ want」的车 —— 更早启动的那班可能读的是
-              // 撤权之前的 grants,搭上去等于把撤权漏掉。否则自己开一班(grants 是一条
-              // 轻 SELECT,多几班的代价远低于把安全结论押在别人的时序上)。
-              const cur = loadInflight;
-              await (cur !== null && cur.minEpoch >= want ? cur.p : startLoad(want));
-              if (checkerEpoch < want) {
-                throw new Error(
-                  `grants snapshot did not reach epoch ${want} (at ${checkerEpoch})`,
-                );
-              }
-            },
-          };
+        let modelCheckerHandle: ModelCheckerHandle | null;
+        try { modelCheckerHandle = await loadBridgeModelChecker(deps, uid); }
+        catch (err) {
+          log?.error("user-chat-bridge: loadAllowedModelChecker threw", { uid: String(uid), err });
+          sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
+          ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable");
+          return;
         }
 
         // 1.5) V3 Phase 4H+ maintenance 闸门:非 admin 在维护模式下不得建立新 chat 会话。
@@ -2612,74 +2313,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         //
         //   **refresh 复用同一 endpoint.bundleRev**:容器在本连接存续期内不会换 rev
         //   (被 recycle → 桥断)。新容器 = 新连接 = 重新取 label,不存在"连接中途换 rev"。
-        const connectionBundleRev = endpoint.bundleRev;
-        let agentModelResolverHandle:
-          | {
-              resolve: (agentId: string) => string | null;
-              isRuntimeDenied: (agentId: string) => boolean;
-              isIdentityRegistered: (agentId: string) => boolean;
-              authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
-              refresh: () => Promise<void>;
-            }
-          | null = null;
-        if (deps.loadAgentModelResolver) {
-          const loadResolver = deps.loadAgentModelResolver;
-          const resolverOpts: { bundleRev?: string } = connectionBundleRev !== undefined
-            ? { bundleRev: connectionBundleRev }
-            : {};
-          let innerResolve: AgentModelResolver;
-          try {
-            innerResolve = await loadResolver(uid, resolverOpts);
-          } catch (err) {
-            // 含阶段 B 的 SeedDeclarationError(rev 缺失 / bundle 被篡改 / schema 不认):
-            // fail-closed 拒连接,不放行到容器(放行 = 按未知声明计费)。
-            log?.error("user-chat-bridge: loadAgentModelResolver threw", {
-              uid: uid.toString(),
-              bundleRev: connectionBundleRev ?? null,
-              err,
-            });
-            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
-            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
-            return;
-          }
-          // refresh 去重:miss 补触发 + 周期 timer 可能并发,同一时刻只放一个在飞
-          // (DB 查询很轻,但没必要放大;后到的直接搭前一班车)。
-          // 注意:此处刻意不写 `finally { }` 块 —— userChatBridge.test.ts 的
-          // tryAutoRebindFlush 源码 tripwire 以「文件内第一个 `finally {`」定位
-          // 目标块,在它之前新增 finally 块会让 tripwire 锚错。.finally() 等价。
-          let refreshInflight: Promise<void> | null = null;
-          agentModelResolverHandle = {
-            resolve: (agentId) => innerResolve(agentId),
-            isRuntimeDenied: (agentId) => innerResolve.isRuntimeDenied?.(agentId) === true,
-            isIdentityRegistered: (agentId) => innerResolve.isIdentityRegistered?.(agentId) ?? false,
-            authorizeExecution: async (agentId) => {
-              // Capture the resolver for this frame: periodic refresh must not
-              // replace a successful execution snapshot after its await.
-              const current = innerResolve;
-              return current.authorizeExecution
-                ? current.authorizeExecution(agentId)
-                : { identity: { requestedId: agentId, executionAgentId: agentId, status: "no-registration" as const }, model: current(agentId) };
-            },
-            refresh: async () => {
-              if (refreshInflight !== null) return refreshInflight;
-              refreshInflight = (async () => {
-                try {
-                  // 同一 bundleRev:连接存续期内容器不变 ⇒ seed 声明不变(LRU 命中,零 IO)。
-                  const next = await loadResolver(uid, resolverOpts);
-                  innerResolve = next;
-                } catch (err) {
-                  // 保留上次成功快照(与 modelChecker.refresh 同语义)。
-                  log?.warn("user-chat-bridge: agentModelResolver refresh failed (keep last good)", {
-                    uid: uid.toString(),
-                    err,
-                  });
-                }
-              })().finally(() => {
-                refreshInflight = null;
-              });
-              return refreshInflight;
-            },
-          };
+        let agentModelResolverHandle: Awaited<ReturnType<typeof loadBridgeAgentResolver>>;
+        try { agentModelResolverHandle = await loadBridgeAgentResolver(deps, uid, endpoint.bundleRev); }
+        catch (err) {
+          log?.error("user-chat-bridge: loadAgentModelResolver threw", { uid: String(uid), err });
+          sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
+          ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable");
+          return;
         }
 
         // 3) 构造容器 WS — direct(sync)或 tunnel(async pre-dial mTLS+pin)。
@@ -2955,14 +2595,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
         cronOriginExecutor = async (payload) => {
-          const registered = cronOriginExecutor;
-          if (
-            cleaned ||
-            userDetached ||
-            registered === null
-          ) {
-            return { kind: "not_claimed" };
-          }
           const existing = admittedDispatches.get(payload.admitted.clientMessageId);
           if (existing !== undefined) {
             // Re-entering the same in-memory claim must wait for its first
@@ -3644,7 +3276,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     const linkHandle = getContainerLinkHandle(containerWs);
     if (linkHandle) linkHandle.onStreamsChanged = () => checkDrainComplete();
-    const hasOpenDispatchStreams = (): boolean => linkHandle?.hasOpenDispatches ?? false;
+    const hasOpenDispatchStreams = (): boolean => !!(linkHandle?.hasOpenDispatches || linkHandle?.retained);
     const noteDispatchStreamFrame = (sessionId: string, clientMessageId: string, isFinal: boolean): void => {
       linkHandle?.noteStream(sessionId, clientMessageId, isFinal);
     };
@@ -3956,7 +3588,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       },
     };
-    const { unregister, evicted } = linkHandle?.recoveryOnly ? { unregister: () => {}, evicted: [] } : registry.register(conn);
+    const { unregister, evicted } = (linkHandle?.recoveryOnly || linkHandle?.background) ? { unregister: () => {}, evicted: [] } : registry.register(conn);
     // 踢人必须留痕:互踢循环/超限排查的第一手证据(close code 4505 服务端此前无日志)。
     for (const victim of evicted) {
       bridgeLog?.warn("user-chat-bridge: kicked oldest connection (per-user limit)", {
@@ -10040,10 +9672,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
-      unregisterExecutors?.();
-      unregisterExecutors = null;
-      recoveryExecutor = null;
-      cronOriginExecutor = null;
+      if (!linkHandle) {
+        unregisterExecutors?.(); unregisterExecutors = null;
+        recoveryExecutor = null; cronOriginExecutor = null;
+      }
     }
 
     /**
@@ -10057,6 +9689,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function finalCleanup(finalCause: BridgeCloseCause): void {
       if (cleaned) return;
       cleaned = true;
+      unregisterExecutors?.(); unregisterExecutors = null;
+      recoveryExecutor = null; cronOriginExecutor = null;
       drainingChecks.delete(checkDrainComplete);
       cause = finalCause;
       if (drainTimer !== null) {
@@ -10211,12 +9845,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(recoveryDrainTimer);
     shuttingDown = true;
     recovery?.stop();
+    wake?.stop();
     if (links) links.stopping = true;
     registry.closeAll(reason);
     for (const check of [...drainingChecks]) check();
     await links?.shutdown();
     await recovery?.drain();
     await controlsStopped;
+    await wake?.drain();
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
@@ -10358,17 +9994,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }
 
   async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
-    const executors = availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()));
-    if (executors.length === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
-    return executeCronOriginInject({
-      modelSwitchCost:deps.modelSwitchCost,
-      input,
-      pgPool: deps.pgPool,
-      admitUserTurn: deps.admitUserTurn,
-      // Resolve after admission so a bridge removed while PG was awaited is
-      // never retained as a stale executor closure.
+    return injectOriginTurn({ deps, input, linksEnabled: links !== null,
       getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString())),
-      log,
+      acquire: wake ? carrier => wake.acquire(carrier) : undefined,
     });
   }
 
