@@ -1,6 +1,6 @@
 // v5 设置/计费中心的展示文案映射（唯一权威源，杜绝各组件硬编码散落）。
 
-import type { UsageReportWindow } from "../../lib/types";
+import type { UsageLedgerRow, UsageReportWindow } from "../../lib/types";
 
 /**
  * credit_ledger.reason → 中文标签。后端 reason 是开放枚举（admin/ledger.ts），
@@ -17,7 +17,8 @@ export const LEDGER_REASON_LABEL: Record<string, string> = {
   refund: "退费",
   adjustment: "人工调整",
   monthly_grant: "月度额度",
-  subscription: "订阅扣费",
+  subscription: "订阅额度到账",
+  subscription_expire: "周期额度结清",
   agent_open: "开通智能体",
   muse_media: "Muse 图片/视频",
 };
@@ -38,6 +39,24 @@ export function ledgerReasonView(
   if (workload === "auto_dream") return { label: "记忆整理", raw: null };
   const known = LEDGER_REASON_LABEL[reason];
   return known ? { label: known, raw: null } : { label: "其他", raw: reason };
+}
+
+/** Subscription replacement and expiry share a ledger reason; the order reference distinguishes them. */
+export function ledgerRowView(
+  row: Pick<UsageLedgerRow, "reason" | "workload" | "ref_type" | "ref_id" | "memo">,
+): { label: string; raw: string | null; memo: string | null } {
+  const reason = ledgerReasonView(row.reason, row.workload);
+  if (row.reason !== "subscription_expire" || row.workload === "auto_dream") {
+    return { ...reason, memo: row.memo };
+  }
+  const ordered = row.ref_type === "subscription" && !!row.ref_id;
+  // Translate the exact historical writer format, without rewriting append-only ledger rows.
+  const legacy = /^expire (\d+) on [a-z0-9-]+ renew\/rollover$/.exec(row.memo ?? "");
+  return {
+    label: ordered ? "订单生效，旧额度结清" : reason.label,
+    raw: reason.raw,
+    memo: legacy ? `旧周期剩余 ${legacy[1]} 积分结清，新周期额度另行到账` : row.memo,
+  };
 }
 
 /**

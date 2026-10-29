@@ -18,7 +18,7 @@ import { rememberSubscriptionPaid, requestSubscribeIntent } from "./Subscription
 import {
   formatReportBucket,
   ledgerReasonLabel,
-  ledgerReasonView,
+  ledgerRowView,
   REPORT_WINDOW_NOUN,
   shortTime,
 } from "./labels";
@@ -528,7 +528,7 @@ export function AccountTab({
             <ul className="flex flex-col gap-0.5">
               {rows.map((r) => {
                 const neg = r.delta.trim().startsWith("-");
-                const reason = ledgerReasonView(r.reason, r.workload);
+                const reason = ledgerRowView(r);
                 return (
                   <li
                     key={r.id}
@@ -541,7 +541,7 @@ export function AccountTab({
                         title={reason.raw ?? undefined}
                       >
                         {reason.label}
-                        {r.memo ? <span className="text-faint"> · {r.memo}</span> : null}
+                        {reason.memo ? <span className="text-faint"> · {reason.memo}</span> : null}
                       </span>
                       <span className="block truncate text-caption text-faint">
                         {shortTime(r.created_at)} · 余额 {formatCredits(r.balance_after)} 积分
