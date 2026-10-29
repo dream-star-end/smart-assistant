@@ -1112,6 +1112,12 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
           if (e.kind === 'error') errors.push(String(e.error))
         }).finally(() => { settled = true })
         const timer = await waitForLivenessTimer(timers, fileP)
+        // The watchdog arms before async turn reservation installs persistence.
+        // Wait for that real boundary before advancing the injected clock.
+        for (let i = 0; i < 80 && typeof session._persistActiveTurn !== 'function'; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        assert.equal(typeof session._persistActiveTurn, 'function', 'file work starts only after turn persistence is ready')
         now += 2 * IDLE_TIMEOUT_TOOL_MS
         session.runner.lastActivityAt = now
         timer.fn()
