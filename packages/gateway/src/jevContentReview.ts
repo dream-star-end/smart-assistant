@@ -1,6 +1,8 @@
 /**
  * Pre-dispatch content record. Never blocks the current user message.
  * A session stops only after an admin bans it.
+ * An optional prefilter may record a hard violation before JEV. A miss,
+ * a missing key, or a prefilter error still falls through to JEV.
  */
 import { createHash } from 'node:crypto'
 
@@ -66,6 +68,8 @@ let inflight = 0
 let cachedAgent: object | null = null
 let testDeps: ContentReviewDeps | null = null
 let alerter: ((event: ContentReviewAlert) => void | Promise<void>) | null = null
+/** True means a hard violation was already confirmed. False or a throw falls through to JEV. */
+let prefilter: ((text: string) => Promise<boolean>) | null = null
 const pending = new Set<Promise<void>>()
 
 export function contentReviewEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -104,6 +108,10 @@ export function setContentReviewAlerter(
   alerter = fn
 }
 
+export function setContentReviewPrefilter(fn: ((text: string) => Promise<boolean>) | null): void {
+  prefilter = fn
+}
+
 export function setContentReviewDepsForTests(deps: ContentReviewDeps | null): void {
   testDeps = deps
   cachedAgent = null
@@ -114,6 +122,7 @@ export function resetContentReviewForTests(): void {
   cachedAgent = null
   testDeps = null
   alerter = null
+  prefilter = null
 }
 
 export function flushContentReviewForTests(): Promise<void> {
@@ -148,6 +157,21 @@ export async function runUserContentReview(input: {
   inflight += 1
   const signal = AbortSignal.timeout(testDeps?.timeoutMs ?? 1500)
   try {
+    if (prefilter) {
+      let hit = false
+      try {
+        hit = await prefilter(text)
+      } catch {
+        hit = false
+      }
+      if (hit) {
+        return await persistReview(input, text, {
+          choice: 'policy_violation',
+          confidence: 1,
+          thresholdMet: true,
+        }, '前置免费审核判定为硬违规。')
+      }
+    }
     const body = JSON.stringify({
       model: 'typesafe-ai/jev',
       state: text.slice(0, 12_000),
@@ -156,42 +180,53 @@ export async function runUserContentReview(input: {
     const res = await reviewFetch(key, body, signal)
     if (res.status !== 200) return null
     const parsed = parseRisk(await res.json())
-    const record = getContentReviewStore().insert({
-      userId: input.userId.slice(0, 80),
-      sessionKey: input.sessionKey,
-      textHash: createHash('sha256').update(text).digest('hex'),
-      excerpt: text.slice(0, 180),
-      choice: parsed.choice ?? 'none',
-      confidence: parsed.confidence,
-      thresholdMet: parsed.thresholdMet,
-    })
-    if (parsed.thresholdMet && parsed.choice === 'policy_violation' && alerter) {
-      const event: ContentReviewAlert = {
-        reviewId: record.id,
-        sessionKey: record.sessionKey,
-        userId: record.userId,
-        confidence: parsed.confidence ?? 0,
-        excerpt: record.excerpt,
-        body: [
-          `会话 ${record.sessionKey || '(未知)'}`,
-          `用户 ${record.userId}`,
-          `置信度 ${parsed.confidence}`,
-          '',
-          record.excerpt,
-          '',
-          '未拦截本条消息。确认后可发送站内信并记一次违规。累计 3 次封禁账号。',
-        ].join('\n'),
-      }
-      await alerter(event)
-      getContentReviewStore().markAlerted(record.id)
-    }
-    return record
+    return await persistReview(input, text, parsed)
   } catch (error) {
     log.info('content review failed', { errorName: error instanceof Error ? error.name : 'Error' })
     return null
   } finally {
     inflight -= 1
   }
+}
+
+
+async function persistReview(
+  input: { text: string; userId: string; sessionKey: string },
+  text: string,
+  parsed: { choice: string | null; confidence: number | null; thresholdMet: boolean },
+  note?: string,
+): Promise<ContentReviewRecord | null> {
+  const record = getContentReviewStore().insert({
+    userId: input.userId.slice(0, 80),
+    sessionKey: input.sessionKey,
+    textHash: createHash('sha256').update(text).digest('hex'),
+    excerpt: text.slice(0, 180),
+    choice: parsed.choice ?? 'none',
+    confidence: parsed.confidence,
+    thresholdMet: parsed.thresholdMet,
+  })
+  if (parsed.thresholdMet && parsed.choice === 'policy_violation' && alerter) {
+    const event: ContentReviewAlert = {
+      reviewId: record.id,
+      sessionKey: record.sessionKey,
+      userId: record.userId,
+      confidence: parsed.confidence ?? 0,
+      excerpt: record.excerpt,
+      body: [
+        `会话 ${record.sessionKey || '(未知)'}`,
+        `用户 ${record.userId}`,
+        `置信度 ${parsed.confidence}`,
+        '',
+        record.excerpt,
+        '',
+        note,
+        '未拦截本条消息。确认后可发送站内信并记一次违规。累计 3 次封禁账号。',
+      ].filter((line): line is string => typeof line === 'string').join('\n'),
+    }
+    await alerter(event)
+    getContentReviewStore().markAlerted(record.id)
+  }
+  return record
 }
 
 async function reviewFetch(key: string, body: string, signal: AbortSignal): Promise<ReviewResponse> {
