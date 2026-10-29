@@ -24,7 +24,7 @@ import {
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
-import { AuthGate, type AuthMode } from "./components/AuthGate";
+import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
@@ -225,6 +225,7 @@ import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } fr
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
+import { useStopShortcut } from "./hooks/useStopShortcut";
 import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
 import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
@@ -239,6 +240,7 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
@@ -1483,6 +1485,7 @@ export function App() {
     onRespondPermission,
     signMedia,
     stopTurn,
+    stopTurnIfCurrent,
     toolActions,
   } = useChatCardActions({
     activeId,
@@ -1680,9 +1683,18 @@ export function App() {
     setArchiveLoading,
     settleArchiveAnchor,
     sockRef,
-    stopTurn,
     streamText,
     wsSending,
+  });
+
+  const stopShortcutDialog = useStopShortcut({
+    enabled: inWorkspace && sending,
+    turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
+    getStopAction: () => {
+      if (demo) return stopTurn;
+      const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
+      return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
+    },
   });
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
@@ -1895,7 +1907,8 @@ export function App() {
       // 首页(Landing)固定深色,登录页跟随系统主题:系统浅色时直切会闪白。
       // 外层容器挂 animate-in(styles.css 的 fade-up 0.32s)把硬切柔化成整页淡入。
       <div className="h-full animate-in">
-        <AuthGate
+        <LazyBoundary fallback={<SplashFallback />}>
+          <AuthGate
           onLogin={login}
           onRegister={register}
           onVerifyEmail={verifyEmail}
@@ -1923,7 +1936,8 @@ export function App() {
           requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
           initialMode={authMode}
           resetToken={resetToken}
-        />
+          />
+        </LazyBoundary>
       </div>
     );
   }
@@ -2947,6 +2961,7 @@ export function App() {
         </LazyBoundary>
       )}
       {confirmDialogEl}
+      {stopShortcutDialog}
       {promptTextEl}
       {/* 圈选编辑器是懒块:有 source 才挂载(编辑器自身在 !open 时即重置全部状态、无退场动画,
           条件挂载与原先常驻+open 显隐等价);关闭即卸载,下次打开走已缓存的模块。 */}

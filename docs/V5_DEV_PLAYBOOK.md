@@ -316,7 +316,8 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
    的 `arrivedAt/completedAt/durationMs`，再对 relay `fetch_started/first_byte/stream_complete`
    与 `antigravity_relay_usage`。实测一次 463 秒上游生成（首字节约 10 秒，27,290 思考 token）
    之后 `write_file` 只执行 1.548 秒，整轮正常完成。CLI 不透出思考正文/写入内容；步骤总耗时
-   包含此前生成等待，不能据此给写文件加短截止。商业版过程行的执行/等待分开显示随 #1242 另发（2026-10-30 同步时未带，首屏预算）。
+   包含此前生成等待，不能据此给写文件加短截止。过程行将有实证的执行耗时与此前等待分开显示，
+   无可见输出时只说「等待模型响应」，不伪称工具仍在跑或已确认模型正在思考。
    Antigravity 进程 keepalive 仅证明进程存活，会刷新 idle；它不是上游进展证明。relay 的
    `undici.request` 经默认 Agent（7.25.0）有 300 秒 headers/body inactivity 超时（非总调用时限）；
    `sessionSubmit` 另有不依赖 activity 的 12 小时逻辑 turn 硬上限。诊断时分别核对网络、进程与工具，

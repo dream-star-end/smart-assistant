@@ -119,7 +119,7 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
         receipt[`history${width}`] = rows.map((r) => [r.kind, r.duration]);
         for (const r of rows) assert.ok(!/token/i.test(r.text), `step row has no token text: ${r.text}`);
         // 首步从用户发出算起;并行的第二条命令与第一条重叠的部分不重复计;长命令含模型写它的时间。
-        assert.deepEqual(rows.map((r) => r.duration), ["9.0 秒", "<0.1 秒", "1.3 秒", "21 秒", "3 分 08 秒"]);
+        assert.deepEqual(rows.map((r) => r.duration), ["9.0 秒", "<0.1 秒", "1.3 秒", "执行 0.9 秒等待 20 秒", "执行 2 分 05 秒等待 1 分 03 秒"]);
         const shared = rows.find((r) => r.text.includes("pwd"));
         assert.match(shared.title, /本步耗时 1\.3 秒.*所在模型调用共 205,000 token/);
         // 折叠的步骤组摘要给出这一组合计用时。
@@ -156,6 +156,29 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
       assert.deepEqual(errors, []);
     } finally { await context.close(); }
   });
+  for (const width of [1280, 390]) {
+    await t.test(`#1234 generation wait and actual file execution @${width}px`, async () => {
+      const context = await browser.newContext({ viewport: { width, height: 900 } });
+      const page = await context.newPage();
+      try {
+        await page.goto(url);
+        await page.getByTestId("step-harness").waitFor();
+        await page.evaluate(() => window.__stepPage.setScene("model-wait"));
+        await page.getByTestId("process-live-tail").waitFor();
+        assert.match(await page.getByTestId("process-live-tail").innerText(), /等待模型响应[\s\S]*7 分 4[3-9] 秒/);
+        assert.equal(await page.getByTestId("process-group-summary").getAttribute("data-live-working"), "false");
+        await shot(page, `model-wait-${width}`);
+        await page.evaluate(() => window.__stepPage.setScene("file-done"));
+        await expandAll(page);
+        assert.equal(await page.getByTestId("process-live-tail").count(), 0);
+        const file = page.locator('[data-testid="tool-step"]').last();
+        assert.match(await file.getByTestId("step-duration").innerText(), /执行 1\.5 秒[\s\S]*等待 7 分 43 秒/);
+        const bounds = await file.getByTestId("step-duration").boundingBox();
+        assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "both durations stay readable on mobile");
+        await shot(page, `file-done-${width}`);
+      } finally { await context.close(); }
+    });
+  }
   console.log("STEP_DURATION_RECEIPT", JSON.stringify(receipt));
   assert.ok(existsSync(assetDir));
 });

@@ -7,7 +7,7 @@ import { TooltipProvider } from "../src/components/ui";
 // OCV5-367: one agent turn shaped like the operator's screenshot (several tool
 // steps sharing one model call's 「共Xk token」), as a finished history turn and
 // as a live turn with a step still running.
-type Scene = "history" | "live";
+type Scene = "history" | "live" | "model-wait" | "file-done";
 
 function row(id: string, role: ChatMessage["role"], text: string, ts: number, extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id, role, text, ts, ...extra } as ChatMessage;
@@ -63,11 +63,26 @@ function liveMessages(now: number): ChatMessage[] {
   ];
 }
 
+function slowGenerationMessages(now: number, finished: boolean): ChatMessage[] {
+  const owner = { _clientMessageId: "u3" };
+  return [
+    row("u3", "user", "生成财务模型文件", now - 600_000, { status: finished ? "replied" : "sent" }),
+    row("previous", "tool", "终端", now - 465_266, {
+      ...owner, toolName: "Bash", inputJson: { command: "tool --help" }, _completed: true,
+      completedAt: now - 463_029, durationMs: 2237, output: "ok",
+    }),
+    ...(finished ? [row("write", "tool", "写入文件", now, {
+      ...owner, toolName: "write_file", inputJson: { Path: "/work/report.py" }, _completed: true,
+      completedAt: now + 1548, durationMs: 1548, output: "",
+    }), row("answer-3", "assistant", "文件已写入。", now + 2000, owner)] : []),
+  ];
+}
+
 function Harness() {
   const [scene, setScene] = useState<Scene>("history");
   const [now] = useState(() => Date.now());
   (window as unknown as { __stepPage: { setScene: (s: Scene) => void } }).__stepPage = { setScene };
-  const messages = scene === "history" ? historyMessages() : liveMessages(now);
+  const messages = scene === "history" ? historyMessages() : scene === "live" ? liveMessages(now) : slowGenerationMessages(now, scene === "file-done");
   return (
     <TooltipProvider>
       <div data-testid="step-harness" data-scene={scene} style={{ maxWidth: 760, padding: 16 }}>
@@ -75,7 +90,8 @@ function Harness() {
           key={scene}
           processDisclosure
           messages={messages}
-          sending={scene === "live"}
+          sending={scene === "live" || scene === "model-wait"}
+          turnActivity={scene === "model-wait" ? { startedAt: now - 600_000, lastFrameAt: now, agentName: "助手" } : undefined}
           sessionId={`step-${scene}`}
           cb={{}}
         />

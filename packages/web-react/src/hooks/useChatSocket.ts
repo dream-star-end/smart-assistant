@@ -103,7 +103,7 @@ export type UseChatSocket = {
     contextTier?: InboundMessage["contextTier"];
     serviceTier?: InboundMessage["serviceTier"];
   }) => void;
-  stop: (sessId: string) => void;
+  stop: (sessId: string, expectedClientMessageId?: string) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   retryMessage: (p: {
     sessId: string;
@@ -790,7 +790,7 @@ export function useChatSocket(opts: {
   );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
-  const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
+  const stop = useCallback<UseChatSocket["stop"]>((sessId, expectedClientMessageId) => socket.stopTurn(sessId, expectedClientMessageId), [socket]);
   const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
   const continueInterruptedTurn = useCallback<UseChatSocket["continueInterruptedTurn"]>(
     (p) => socket.continueInterruptedTurn(p),

@@ -28,10 +28,10 @@ describe('OCV5-367 步骤耗时', () => {
     })
     expect(timings.get('think')).toEqual({ ms: 82_153 - 60_000 })
     expect(timings.get('say')).toEqual({ ms: 86_186 - 82_153 })
-    expect(timings.get('t1')).toEqual({ ms: 88_391 - 86_186 })
-    expect(timings.get('t2')).toEqual({ ms: 88_552 - 88_391 })
+    expect(timings.get('t1')).toEqual({ ms: 88_391 - 86_186, executionMs: 2_205 })
+    expect(timings.get('t2')).toEqual({ ms: 88_552 - 88_391, executionMs: 100 })
     // 模型写这条命令的 30 秒算在这一步里,不算到上一条工具头上。
-    expect(timings.get('t3')).toEqual({ ms: 130_806 - 88_552 })
+    expect(timings.get('t3')).toEqual({ ms: 130_806 - 88_552, executionMs: 11_741 })
     const sum = [...timings.values()].reduce((acc, t) => acc + (t.ms ?? 0), 0)
     expect(sum).toBe(130_806 - 60_000)
   })
@@ -52,10 +52,10 @@ describe('OCV5-367 步骤耗时', () => {
       row('prev', 'tool', 500, { _completed: true, completedAt: 1_000 }),
       row('write', 'tool', 2_000, { _completed: true, durationMs: 1_000, completedAt: 63_000 }),
     ]
-    expect(computeStepTimings(rows, { active: false }).get('write')).toEqual({ ms: 62_000 })
+    expect(computeStepTimings(rows, { active: false }).get('write')).toEqual({ ms: 62_000, executionMs: 1_000 })
     // 旧 tape 没有 completedAt:只剩下界 ts+durationMs,长参数的时间落到下一步。
     const legacy = [rows[0]!, row('write', 'tool', 2_000, { _completed: true, durationMs: 1_000 })]
-    expect(computeStepTimings(legacy, { active: false }).get('write')).toEqual({ ms: 2_000 })
+    expect(computeStepTimings(legacy, { active: false }).get('write')).toEqual({ ms: 2_000, executionMs: 1_000 })
   })
 
   test('并行工具:被上一步完全覆盖的一步显示自身时长,不出现 0 或负数', () => {
@@ -78,7 +78,7 @@ describe('OCV5-367 步骤耗时', () => {
     ]
     const timings = computeStepTimings(rows, { active: false })
     expect(timings.has('unit')).toBe(false)
-    expect(timings.get('t1')).toEqual({ ms: 500 })
+    expect(timings.get('t1')).toEqual({ ms: 500, executionMs: 500 })
     expect(timings.has('dangling')).toBe(false)
     expect(computeStepTimings([row('x', 'tool', 0)], { active: true }).size).toBe(0)
   })
@@ -86,11 +86,11 @@ describe('OCV5-367 步骤耗时', () => {
   test('轮起点晚于首步或相隔超过一天(不同时钟)时不用,改从首步开始算', () => {
     const rows = [row('t1', 'tool', 10_000, { _completed: true, durationMs: 1_000 })]
     expect(computeStepTimings(rows, { turnStartedAt: 20_000, active: false }).get('t1')).toEqual({
-      ms: 1_000,
+      ms: 1_000, executionMs: 1_000,
     })
     expect(
       computeStepTimings(rows, { turnStartedAt: 10_000 - 25 * 3600_000, active: false }).get('t1'),
-    ).toEqual({ ms: 1_000 })
+    ).toEqual({ ms: 1_000, executionMs: 1_000 })
   })
 
   test('合并的思考组:各段相加;末段进行中则整体从累计值往上跳', () => {
@@ -102,6 +102,20 @@ describe('OCV5-367 步骤耗时', () => {
     expect(combineStepTimings(timings, ['a', 'b'])).toEqual({ runningSince: 8_000 })
     expect(combineStepTimings(timings, ['a', 'missing'])).toBeUndefined()
     expect(combineStepTimings(null, ['a'])).toBeUndefined()
+  })
+
+  test('#1234: 7m43s generation wait is separate from the 1.548s file execution', () => {
+    const rows = [
+      row('prev', 'tool', 1_000, { _completed: true, completedAt: 3_237 }),
+      row('write', 'tool', 466_266, { _completed: true, completedAt: 467_814, durationMs: 1_548 }),
+    ]
+    const timings = computeStepTimings(rows, { active: false })
+    expect(timings.get('write')).toEqual({ ms: 464_577, executionMs: 1_548 })
+    expect(combineStepTimings(timings, ['write'])).toEqual({ ms: 464_577, executionMs: 1_548 })
+    for (const durationMs of [-1, Number.NaN, Number.POSITIVE_INFINITY, 999_999, undefined]) {
+      expect(computeStepTimings([{ ...rows[1]!, durationMs }], { active: false }).get('write')).toEqual({ ms: 1_548 })
+    }
+    expect(computeStepTimings([{ ...rows[1]!, durationMs: 0 }], { active: false }).get('write')).toEqual({ ms: 1_548, executionMs: 0 })
   })
 
   test.each([
