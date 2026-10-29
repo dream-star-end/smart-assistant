@@ -221,6 +221,91 @@ describe("hello = 订阅；快照对齐状态", () => {
     sock.stop();
   });
 
+  test.each([
+    { hasUser: false, historyOk: false },
+    { hasUser: false, historyOk: true },
+    { hasUser: true, historyOk: false },
+    { hasUser: true, historyOk: true },
+  ])("authoritative terminal survives a delayed open/reset (user=$hasUser, history=$historyOk)", async ({ hasUser, historyOk }) => {
+    const syncSession = vi.fn(async () => historyOk);
+    const readSessionSnapshot = vi.fn(async () => null);
+    const { sock, ws, s } = boot({ syncSession, readSessionSnapshot });
+    if (hasUser) s.messages.push({ id: CMID, role: "user", text: "q", ts: 1, status: "sent" } as ChatMessage);
+    s.messages.push({
+      id: "existing-process", role: "thinking", text: "visible process", ts: 2,
+      _clientMessageId: CMID, _turnOwnerId: CMID,
+    } as ChatMessage);
+    pushSnapshot(ws, openSnapshot({ asOf: 1_000 }));
+    await flush();
+    ws.push({ ...detachedStatus(), frameSeq: 2 });
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(2);
+
+    pushSnapshot(ws, openSnapshot({
+      dispatch: dispatchRow({ status: "terminal", outcome: "executed_error", terminalAt: 2_000 }),
+      asOf: 2_000, turnStatus: null,
+    }));
+    await flush();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(s._activeClientMessageId).toBeUndefined();
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe(hasUser ? "sent" : undefined);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+
+    pushSnapshot(ws, openSnapshot({
+      asOf: 1_000, gap: { reason: "cursor_reset" }, hasMore: true,
+      frames: [{ recordId: "1", frameSeq: 1, payload: {
+        ...textFrame(1, ""), ts: Date.now() + 1,
+        blocks: [{ kind: "thinking", text: "stale replay", messageId: "old-thinking" }],
+      } }],
+      pendingPermissions: {
+        items: [{
+          type: "outbound.permission_request", sessionKey: SK, channel: "webchat", peer,
+          requestId: "perm-after-terminal", toolName: "Bash", inputPreview: "{}", ts: 2_000,
+        }],
+        completeness: "truncated",
+      },
+    }));
+    await flush();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(s._activeClientMessageId).toBeUndefined();
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(2);
+    expect(s._snapshotStream?.streamKey).toBe(STREAM);
+    expect(s.messages.some((m) => m.id === "existing-process" && m.text === "visible process")).toBe(true);
+    expect(s.messages.some((m) => m.text === "stale replay")).toBe(false);
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe(hasUser ? "sent" : undefined);
+    expect(s.messages.some((m) => m.role === "permission" && m.requestId === "perm-after-terminal")).toBe(true);
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    expect(readSessionSnapshot).not.toHaveBeenCalled();
+
+    const next = dispatchRow({ id: "22222222-2222-2222-2222-222222222222", clientMessageId: "m-next-dispatch" });
+    const nextStream = `dispatch:${next.id}:1`;
+    pushSnapshot(ws, openSnapshot({
+      dispatch: next, streamKey: nextStream, asOf: 3_000,
+      turnStatus: { ...detachedStatus(), clientMessageId: next.clientMessageId },
+    }));
+    await flush();
+    expect(s._activeClientMessageId).toBe(next.clientMessageId);
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    pushSnapshot(ws, openSnapshot({
+      dispatch: { ...next, status: "terminal", outcome: "executed_error", terminalAt: 4_000 },
+      streamKey: nextStream, asOf: 4_000, turnStatus: null,
+    }));
+    await flush();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+
+    pushSnapshot(ws, openSnapshot({
+      dispatch: dispatchRow({ attempt: 2 }), streamKey: `dispatch:${dispatchRow().id}:2`, asOf: 5_000,
+      lastFrameSeq: 1, nextAfterSeq: 1, gap: { reason: "cursor_reset" },
+      frames: [{ recordId: "next-attempt", frameSeq: 1, payload: {
+        ...textFrame(1, "next attempt started"), ts: Date.now() + 1,
+      } }],
+    }));
+    await flush();
+    expect(s._activeClientMessageId).toBe(CMID);
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(assistantText(s.messages)).toBe("next attempt started");
+    sock.stop();
+  });
+
   test("a final replayed from a snapshot retries a failed history read", async () => {
     const syncSession = vi.fn(async () => false);
     const { sock, ws, s } = boot({ syncSession });

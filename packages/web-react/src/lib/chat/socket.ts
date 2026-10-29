@@ -69,7 +69,9 @@ import {
   isOpenSnapshotDispatch,
   isSessionSnapshot,
   isSnapshotFenced,
+  isTerminalSnapshotDispatch,
   mayClaimSnapshotDispatch,
+  rememberTerminalSnapshotDispatch,
   SNAPSHOT_ACK_TIMEOUT_MS,
   SNAPSHOT_MAX_PAGES,
   SNAPSHOT_PAGE_LIMIT,
@@ -3146,6 +3148,11 @@ export class ChatSocket {
       if (!current()) return;
       confirmSnapshotDelivery(sess, snap.dispatch);
       const d = snap.dispatch;
+      if (isOpenSnapshotDispatch(d) && isTerminalSnapshotDispatch(sess, d)) {
+        this.applySnapshotHead(sess, snap, false);
+        this.scheduleNotify();
+        return;
+      }
       const rebuild = snap.gap?.reason === "cursor_reset";
       if (fresh && isOpenSnapshotDispatch(d) && mayClaimSnapshotDispatch(sess, d) && (rebuild || !snapshotIsStale(sess, snap))) {
         if (!this.confirmDispatchAdmission(sessId, d.clientMessageId, d.acceptedAt != null)) {
@@ -3229,6 +3236,7 @@ export class ChatSocket {
       }
       // not_accepted / executed_error: the failure is shown from history (fail-visible).
       // The snapshot already proves it stopped; a failed or not-yet-projected history cannot hold the next send.
+      rememberTerminalSnapshotDispatch(sess, d);
       this.finishDispatch(sess.id, d.clientMessageId);
       this.clearSendingState(sess);
       needsHistory = true;

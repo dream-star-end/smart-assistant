@@ -3,7 +3,7 @@
  *
  * WS hello 收到的 `outbound.session_snapshot` 和 HTTP `GET /api/sessions/:id/live-frames`
  * 返回的 `snapshot` 是服务端同一个 `buildSessionSnapshot` 的输出（契约见 #1200）。这里放
- * 两条传输共用的纯判定：快照形状、请求游标、合并规则（B3-SPEC §4 R1–R5）、B3 兜底目标。
+ * 两条传输共用的判定：快照形状、请求游标、合并规则（B3-SPEC §4 R1–R5）、B3 兜底目标。
  * 应用本身在 ChatSocket.applySessionSnapshot，两条传输只有这一个入口。
  */
 import { isClientMessageId, type SessionSnapshot } from "@openclaude/protocol/browser";
@@ -28,6 +28,22 @@ export type SnapshotQuery = {
 };
 
 export type SnapshotDispatch = NonNullable<SessionSnapshot["dispatch"]>;
+
+/** Exact server terminal proof lives with the session, independently of delayed history projection. */
+const terminalSnapshotDispatches = new WeakMap<ChatSession, Set<string>>();
+
+export function rememberTerminalSnapshotDispatch(sess: ChatSession, d: SnapshotDispatch): void {
+  let identities = terminalSnapshotDispatches.get(sess);
+  if (!identities) {
+    identities = new Set();
+    terminalSnapshotDispatches.set(sess, identities);
+  }
+  identities.add(`${d.id}:${d.attempt}`);
+}
+
+export function isTerminalSnapshotDispatch(sess: ChatSession, d: SnapshotDispatch): boolean {
+  return terminalSnapshotDispatches.get(sess)?.has(`${d.id}:${d.attempt}`) === true;
+}
 
 export function isSessionSnapshot(raw: unknown): raw is SessionSnapshot {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
