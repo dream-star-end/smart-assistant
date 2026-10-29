@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { confirmSnapshotDelivery } from "./deliveryConfirm";
+import { mergeFullServerWins, applyServerIncremental } from "../persist";
 import { createSession } from "./model";
 import { messageSignature, agentTerminalStatus } from "./render";
 import { ChatSocket } from "./socket";
@@ -81,6 +82,14 @@ describe("container-confirmed delivery", () => {
     frame({ type: "outbound.session_snapshot", snapshot: { dispatch: { clientMessageId: user.id, acceptedAt: 100 } } });
     expect(user._deliveryState).toBe("accepted");
     expect(sess._turnCostCredits).toBe("71");
+  });
+
+  test.each([false, true])("late history preserves confirmed delivery (timeline=%s)", (timeline) => {
+    const { user, frame } = setup();
+    frame({ type: "outbound.ack", accepted: true });
+    const older = { ...user, _deliveryState: undefined, _timelineRecord: timeline };
+    expect(mergeFullServerWins([older], [user])[0]._deliveryState).toBe("accepted");
+    expect(applyServerIncremental([user], [older])[0]._deliveryState).toBe("accepted");
   });
 
   test("cancelled delegate terminal status is neutral", () => {
