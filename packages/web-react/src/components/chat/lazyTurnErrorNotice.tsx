@@ -48,6 +48,7 @@ function fromModule<P>(pick: (module: NoticeModule) => ComponentType<P>) {
 
 const LazyTurnErrorNotice = fromModule((module) => module.TurnErrorNotice);
 const LazyErrorTechDetails = fromModule((module) => module.ErrorTechDetails);
+const LazyTurnStatusCard = fromModule((module) => module.TurnStatusCard);
 
 function prefetchWhenIdle(): void {
   preloadTurnErrorNotice().catch(() => {});
@@ -72,6 +73,15 @@ export function ErrorTechDetails(props: ComponentProps<typeof ErrorTechDetailsIm
   return (
     <Suspense fallback={null}>
       <LazyErrorTechDetails {...props} />
+    </Suspense>
+  );
+}
+
+/** Durable dispatch failure: all error-only presentation stays in the notice chunk. */
+export function TurnStatusCard(props: ComponentProps<NoticeModule["TurnStatusCard"]>) {
+  return (
+    <Suspense fallback={null}>
+      <LazyTurnStatusCard {...props} />
     </Suspense>
   );
 }

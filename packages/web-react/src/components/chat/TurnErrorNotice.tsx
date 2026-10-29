@@ -6,9 +6,12 @@
  * 冻结的旧快照正文)由调用方作为 fixedBody 传入。动作按目录建议,执行入口由调用方给。
  */
 import type { ReactNode } from "react";
+import type { ChatMessage } from "../../lib/chat/model";
+import { errorPresentation } from "../../lib/chat/render";
+import { readUserError, type ErrorNoticeAction, type UserError } from "../../lib/chat/userErrorView";
+import type { CardCallbacks } from "./cards";
 import { errorTechnicalDetails, standaloneErrorTitle } from "../../lib/chat/userErrorNotice";
 import { resolveUserError } from "../../lib/chat/userErrorLookup";
-import type { ErrorNoticeAction, UserError } from "../../lib/chat/userErrorView";
 import type { NoticeTone } from "../../lib/ui/statusTone";
 import { ErrorTechDetails } from "../ErrorTechDetails";
 import { Notice } from "../ui/Notice";
@@ -49,5 +52,43 @@ export function TurnErrorNotice(p: TurnErrorNoticeProps) {
       {p.fixedBody ?? userError.message}
       {p.note}
     </Notice>
+  );
+}
+
+/** Durable dispatch failure rendered as status, never as Agent-authored text. */
+export function TurnStatusCard({
+  msg,
+  cb,
+  currentTurn,
+}: {
+  msg: ChatMessage;
+  cb: CardCallbacks;
+  currentTurn: boolean;
+}) {
+  const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
+  const retryTarget = msg._clientMessageId
+    ? cb.resolveRetryTarget?.(msg._clientMessageId)
+    : undefined;
+  const retry = retryTarget && cb.onRetrySend
+    ? { label: "重试", onClick: () => cb.onRetrySend?.(retryTarget) }
+    : cb.onRegenerate ? { label: "重新尝试", onClick: cb.onRegenerate } : undefined;
+  const details = {
+    code: msg._errorCode,
+    requestId: msg.usage?.traceId,
+    clientMessageId: msg._clientMessageId,
+    detail: presented.detail,
+  };
+  return (
+    <TurnErrorNotice
+      role="status"
+      tone="attention"
+      className="animate-in"
+      title={presented.title}
+      userError={readUserError(msg._userError)}
+      code={presented.code}
+      fixedBody={presented.fixedMessage ? presented.message : undefined}
+      actions={() => (currentTurn && retry ? [retry] : [])}
+      details={details}
+    />
   );
 }

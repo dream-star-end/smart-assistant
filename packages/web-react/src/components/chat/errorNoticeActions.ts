@@ -2,10 +2,10 @@ import { pickErrorActions } from "../../lib/chat/userErrorNotice";
 import { requestSubscribeIntent, type SubscribeIntent } from "../../lib/subscribeIntent";
 import { reportClientFriction } from "../../lib/clientFriction";
 import type { ChatMessage } from "../../lib/chat/model";
-import {
-  type ErrorActionHandlers,
-  type ErrorNoticeAction,
-  type UserError,
+import type {
+  ErrorActionHandlers,
+  ErrorNoticeAction,
+  UserError,
 } from "../../lib/chat/userErrorView";
 import type { NoticeAction } from "../ui/Notice";
 import type { CardCallbacks } from "./cards";
