@@ -1488,6 +1488,7 @@ export function App() {
     onRespondPermission,
     signMedia,
     stopTurn,
+    stopTurnIfCurrent,
     toolActions,
   } = useChatCardActions({
     identity: resolvedIdentity,
@@ -1675,7 +1676,11 @@ export function App() {
   const stopShortcutDialog = useStopShortcut({
     enabled: inWorkspace && sending,
     turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
-    onStop: stopTurn,
+    getStopAction: () => {
+      if (demo) return stopTurn;
+      const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
+      return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
+    },
   });
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──

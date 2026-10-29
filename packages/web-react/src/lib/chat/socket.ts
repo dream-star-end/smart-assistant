@@ -6412,9 +6412,12 @@ export class ChatSocket {
     this.kickDispatchPump();
   }
 
-  stopTurn(sessId: string): void {
+  stopTurn(sessId: string, expectedClientMessageId?: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    // Confirmed Stop is compare-and-act on live state. No await occurs before
+    // enqueueControl freezes this identity into the durable stop payload.
+    if (expectedClientMessageId !== undefined && sess._activeClientMessageId !== expectedClientMessageId) return;
     const pending = this.offlineQueue.filter((item) => item.sessId === sessId);
     if (!sess._sendingInFlight && pending.length === 0) return;
     // 「正在重试中」软状态下按停止:源轮在服务端已是终态,没有可停的在飞 turn。落下用户停止

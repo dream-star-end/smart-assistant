@@ -22,7 +22,7 @@ test("#1233: trusted Escape confirms, cancels safely, and never stops a replacem
         const needle = '      event.preventDefault();';
         assert.equal(source.split(needle).length, 2);
         replacements += 1;
-        return { contents: source.replace(needle, `${needle}\n      current.current.onStop();\n      return;`), loader: "ts" };
+        return { contents: source.replace(needle, `${needle}\n      current.current.getStopAction()?.();\n      return;`), loader: "ts" };
       });
     } }] : [], logLevel: "silent",
   });
@@ -54,6 +54,13 @@ test("#1233: trusted Escape confirms, cancels safely, and never stops a replacem
   await dialog.waitFor();
   await page.evaluate(() => window.nextTurn());
   await page.getByTestId("turn").filter({ hasText: "2" }).waitFor();
+  await page.getByRole("button", { name: "停止任务" }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.equal(await page.getByTestId("stops").textContent(), "0");
+  await input.click();
+  await page.keyboard.press("Escape");
+  await dialog.waitFor();
+  await page.evaluate(() => window.replaceWithoutRender());
   await page.getByRole("button", { name: "停止任务" }).click();
   await dialog.waitFor({ state: "hidden" });
   assert.equal(await page.getByTestId("stops").textContent(), "0");
