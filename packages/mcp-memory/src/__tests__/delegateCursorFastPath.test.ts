@@ -8,12 +8,16 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
 import {
+  DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS,
+  delegateLeaderResultBudget,
   formatDelegateFanoutRunning,
+  formatDelegateHttpResult,
   formatDelegateSuccess,
   interpretDelegateStartBody,
   interpretDelegateWaitBody,
   resolveCursorFastWaitMs,
   runCursorDelegateFastPath,
+  truncateDelegateLeaderResult,
 } from '../delegateCursorFastPath.js'
 
 describe('resolveCursorFastWaitMs', () => {
@@ -35,7 +39,11 @@ describe('runCursorDelegateFastPath', () => {
       transport: {
         start: async () => ({
           statusCode: 200,
-          body: JSON.stringify({ status: 'running', jobId: 'dlgjob-1', agentId: 'coding-assistant' }),
+          body: JSON.stringify({
+            status: 'running',
+            jobId: 'dlgjob-1',
+            agentId: 'coding-assistant',
+          }),
         }),
         wait: async () => ({
           statusCode: 200,
@@ -63,7 +71,11 @@ describe('runCursorDelegateFastPath', () => {
       transport: {
         start: async () => ({
           statusCode: 200,
-          body: JSON.stringify({ status: 'running', jobId: 'dlgjob-slow', agentId: 'coding-assistant' }),
+          body: JSON.stringify({
+            status: 'running',
+            jobId: 'dlgjob-slow',
+            agentId: 'coding-assistant',
+          }),
         }),
         wait: async () => ({
           statusCode: 200,
@@ -171,10 +183,7 @@ describe('interpret helpers', () => {
       { kind: 'running', jobId: 'j1' },
     )
     assert.equal(
-      interpretDelegateWaitBody(
-        429,
-        JSON.stringify({ status: 'running', jobId: 'j1' }),
-      ).kind,
+      interpretDelegateWaitBody(429, JSON.stringify({ status: 'running', jobId: 'j1' })).kind,
       'running',
     )
     const done = interpretDelegateWaitBody(
@@ -278,7 +287,12 @@ describe('runCursorDelegateFastPath — wait transport blip → running handle (
       const r = await runCursorDelegateFastPath({
         fastWaitMs: 40,
         label: 'x',
-        transport: { start: started, wait: async () => { throw mk() } },
+        transport: {
+          start: started,
+          wait: async () => {
+            throw mk()
+          },
+        },
       })
       assert.equal(r.kind, 'running')
     }
@@ -289,7 +303,12 @@ describe('runCursorDelegateFastPath — wait transport blip → running handle (
       runCursorDelegateFastPath({
         fastWaitMs: 40,
         label: 'x',
-        transport: { start: started, wait: async () => { throw new TypeError('bad json path') } },
+        transport: {
+          start: started,
+          wait: async () => {
+            throw new TypeError('bad json path')
+          },
+        },
       }),
       /bad json path/,
     )
@@ -301,11 +320,134 @@ describe('runCursorDelegateFastPath — wait transport blip → running handle (
         fastWaitMs: 40,
         label: 'x',
         transport: {
-          start: async () => { throw Object.assign(new Error('delegate client timeout after 15s'), { code: 'ETIMEDOUT' }) },
+          start: async () => {
+            throw Object.assign(new Error('delegate client timeout after 15s'), {
+              code: 'ETIMEDOUT',
+            })
+          },
           wait: async () => ({ statusCode: 200, body: '{}' }),
         },
       }),
       /timeout/,
     )
+  })
+})
+
+describe('truncateDelegateLeaderResult', () => {
+  it('leaves short text, including the exact 6000-char boundary, unchanged', () => {
+    assert.equal(truncateDelegateLeaderResult('修复完成'), '修复完成')
+    assert.equal(truncateDelegateLeaderResult(''), '')
+    const exact = 'x'.repeat(DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS)
+    assert.equal(truncateDelegateLeaderResult(exact), exact)
+  })
+
+  it('keeps the head and the tail and states how many characters were omitted', () => {
+    const text = `${'A'.repeat(3000)}MIDDLE${'B'.repeat(3000)}`
+    const out = truncateDelegateLeaderResult(text)
+    assert.equal(text.length, 6006)
+    assert.ok(out.startsWith('A'.repeat(3000)))
+    assert.ok(out.endsWith('B'.repeat(3000)))
+    assert.equal(out.includes('MIDDLE'), false)
+    assert.match(out, /中间省略 6 字/)
+    assert.match(out, /完整结果仍在该成员会话与产物文件,未删除/)
+  })
+
+  it('lists an artifact path that sits only in the omitted middle', () => {
+    const path = '/home/agent/.openclaude/generated/trip-plan.md'
+    const text = `${'A'.repeat(3000)}见 ${path} 全文${'B'.repeat(3000)}`
+    const out = truncateDelegateLeaderResult(text)
+    assert.equal(out.includes('见 '), false)
+    assert.match(out, /产物路径\(完整文件仍在,请用 Read 打开\)/)
+    assert.match(out, new RegExp(`- ${path.replace(/[.]/g, '\\.')}`))
+  })
+
+  it('does not split a surrogate pair at the cut', () => {
+    const text = `A\uD83D\uDE00${'C'.repeat(20)}`
+    const out = truncateDelegateLeaderResult(text, 3)
+    for (let i = 0; i < out.length; i++) {
+      const cu = out.charCodeAt(i)
+      if (cu >= 0xd800 && cu <= 0xdbff) {
+        const next = out.charCodeAt(i + 1)
+        assert.ok(next >= 0xdc00 && next <= 0xdfff)
+        i++
+      } else {
+        assert.ok(cu < 0xdc00 || cu > 0xdfff)
+      }
+    }
+    assert.match(out, /中间省略/)
+  })
+
+  it('shares the review budget: 1..4 items stay at 6000, more items split 24000', () => {
+    assert.equal(delegateLeaderResultBudget(1), 6000)
+    assert.equal(delegateLeaderResultBudget(3), 6000)
+    assert.equal(delegateLeaderResultBudget(4), 6000)
+    assert.equal(delegateLeaderResultBudget(5), 4800)
+    assert.equal(delegateLeaderResultBudget(8), 3000)
+    assert.equal(delegateLeaderResultBudget(100), 800)
+    assert.equal(delegateLeaderResultBudget(0), 6000)
+  })
+})
+
+describe('formatDelegateSuccess leader cap', () => {
+  it('short success text and sessionKey stay byte-for-byte', () => {
+    assert.equal(
+      formatDelegateSuccess('coding-assistant', 'ok', 'sk'),
+      '✅ 委派完成 (agent: coding-assistant)\n\nok\n\nsessionKey=sk\n下次同一成员续跑请传 resumeSessionKey。',
+    )
+    assert.equal(formatDelegateSuccess('a', ''), '✅ 委派完成 (agent: a)\n\n(无输出)')
+  })
+
+  it('long member output is capped before the sessionKey footer', () => {
+    const text = `${'A'.repeat(3000)}MIDDLE${'B'.repeat(3000)}`
+    const out = formatDelegateSuccess('coding-assistant', text, 'agent:coding:delegate:1')
+    assert.match(out, /^✅ 委派完成 \(agent: coding-assistant\)/)
+    assert.equal(out.includes('MIDDLE'), false)
+    assert.match(out, /中间省略 6 字/)
+    assert.match(out, /sessionKey=agent:coding:delegate:1/)
+    assert.match(out, /resumeSessionKey/)
+    assert.ok(out.trimEnd().endsWith('下次同一成员续跑请传 resumeSessionKey。'))
+  })
+
+  it('fast path finished inside the wait window returns the capped text', async () => {
+    const output = `${'H'.repeat(4000)}SECRET_MIDDLE${'T'.repeat(4000)}`
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 40,
+      label: 'research-assistant',
+      transport: {
+        start: async () => ({
+          statusCode: 200,
+          body: JSON.stringify({ status: 'running', jobId: 'dlgjob-long', sessionKey: 'sk-long' }),
+        }),
+        wait: async () => ({
+          statusCode: 200,
+          body: JSON.stringify({
+            status: 'done',
+            jobId: 'dlgjob-long',
+            httpStatus: 200,
+            ok: true,
+            output,
+            sessionKey: 'sk-long',
+          }),
+        }),
+      },
+    })
+    assert.equal(r.kind, 'ok')
+    if (r.kind !== 'ok') return
+    assert.equal(r.text.includes('SECRET_MIDDLE'), false)
+    assert.match(r.text, /中间省略/)
+    assert.match(r.text, /sessionKey=sk-long/)
+    assert.equal(r.text, formatDelegateSuccess('research-assistant', output, 'sk-long'))
+  })
+
+  it('a long member error is capped, a short gateway error is not', () => {
+    const short = formatDelegateHttpResult(500, { error: 'boom' }, 'main')
+    assert.deepEqual(short, { kind: 'error', text: '委派失败: boom' })
+    const huge = `API Error: 500 ${'E'.repeat(7000)}`
+    const failed = formatDelegateHttpResult(200, { ok: true, output: huge }, 'main')
+    assert.equal(failed.kind, 'error')
+    if (failed.kind !== 'error') return
+    assert.match(failed.text, /^子 agent 执行出错: /)
+    assert.match(failed.text, /中间省略/)
+    assert.equal(failed.text.includes('E'.repeat(7000)), false)
   })
 })

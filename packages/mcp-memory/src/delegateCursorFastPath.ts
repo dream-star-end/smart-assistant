@@ -51,8 +51,98 @@ export function resolveCursorFastWaitMs(env: NodeJS.ProcessEnv = process.env): n
   )
 }
 
-export function formatDelegateSuccess(label: string, output: string, sessionKey?: string): string {
-  const body = `✅ 委派完成 (agent: ${label})\n\n${output || '(无输出)'}`
+/**
+ * 成员回传进队长工具结果的上限。数字与 gateway `teamMode.ts` 的审查证据对齐
+ * (`REVIEW_EVIDENCE_ITEM_MAX_CHARS` / `REVIEW_EVIDENCE_TOTAL_MAX_CHARS`):
+ * 单条正文最多 6000 字,多条按条数分摊后合计不超过 24000。
+ * fan-out 最多 4 条,因此每条预算仍是 6000,四条正文合计正好顶到 24000。
+ * 超出只截队长看到的工具文本(留开头和结尾,标出省略字数);
+ * 成员会话、作业结果和产物文件里的原文不改、不删。
+ */
+export const DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS = 6000
+export const DELEGATE_LEADER_RESULT_TOTAL_MAX_CHARS = 24000
+const DELEGATE_LEADER_RESULT_MIN_CHARS = 800
+
+/** 与 teamMode 的产物路径同一形态,避免截掉中间后队长失去 Read 目标。 */
+const GENERATED_ARTIFACT_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/[^\s`'")\]]+/g
+
+export function delegateLeaderResultBudget(itemCount: number): number {
+  const n = Number.isFinite(itemCount) && itemCount >= 1 ? Math.floor(itemCount) : 1
+  return Math.max(
+    DELEGATE_LEADER_RESULT_MIN_CHARS,
+    Math.min(
+      DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS,
+      Math.floor(DELEGATE_LEADER_RESULT_TOTAL_MAX_CHARS / n),
+    ),
+  )
+}
+
+function extractGeneratedArtifactPaths(text: string): string[] {
+  if (!text) return []
+  const set = new Set<string>()
+  for (const m of text.matchAll(GENERATED_ARTIFACT_PATH_RE)) set.add(m[0])
+  return [...set]
+}
+
+function resolveLeaderResultMax(maxChars?: number): number {
+  if (typeof maxChars !== 'number' || !Number.isFinite(maxChars) || maxChars < 2) {
+    return DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS
+  }
+  return Math.floor(maxChars)
+}
+
+function clipHead(text: string, len: number): string {
+  let end = Math.min(Math.max(len, 0), text.length)
+  if (end > 0 && end < text.length) {
+    const cu = text.charCodeAt(end - 1)
+    if (cu >= 0xd800 && cu <= 0xdbff) end -= 1
+  }
+  return text.slice(0, end)
+}
+
+function clipTail(text: string, len: number): string {
+  let start = Math.max(0, text.length - Math.max(len, 0))
+  if (start > 0 && start < text.length) {
+    const cu = text.charCodeAt(start)
+    if (cu >= 0xdc00 && cu <= 0xdfff) start += 1
+  }
+  return text.slice(start)
+}
+
+/**
+ * 队长上下文里的成员正文。不超过 max 字的原文对半留开头和结尾,中间写明省略字数。
+ * 落在省略段里的产物路径仍逐条列出。短文本原样返回。
+ */
+export function truncateDelegateLeaderResult(
+  text: string,
+  maxChars: number = DELEGATE_LEADER_RESULT_ITEM_MAX_CHARS,
+): string {
+  const max = resolveLeaderResultMax(maxChars)
+  if (text.length <= max) return text
+  const paths = extractGeneratedArtifactPaths(text)
+  const headLen = Math.ceil(max / 2)
+  const tailLen = max - headLen
+  const head = clipHead(text, headLen)
+  const tail = clipTail(text, tailLen)
+  const omitted = text.length - head.length - tail.length
+  const pathBlock =
+    paths.length > 0
+      ? `\n产物路径(完整文件仍在,请用 Read 打开):\n${paths.map((p) => `- ${p}`).join('\n')}`
+      : ''
+  const note = `\n…(中间省略 ${omitted} 字;完整结果仍在该成员会话与产物文件,未删除)${pathBlock}\n`
+  return `${head}${note}${tail}`
+}
+
+export function formatDelegateSuccess(
+  label: string,
+  output: string,
+  sessionKey?: string,
+  maxChars?: number,
+): string {
+  const shown = output
+    ? truncateDelegateLeaderResult(output, resolveLeaderResultMax(maxChars))
+    : '(无输出)'
+  const body = `✅ 委派完成 (agent: ${label})\n\n${shown}`
   if (!sessionKey) return body
   return `${body}\n\nsessionKey=${sessionKey}\n下次同一成员续跑请传 resumeSessionKey。`
 }
@@ -233,25 +323,29 @@ export function formatDelegateHttpResult(
   httpStatus: number,
   data: Record<string, unknown>,
   label: string,
+  maxChars?: number,
 ): FormattedDelegateResult {
+  const max = resolveLeaderResultMax(maxChars)
   if (httpStatus < 200 || httpStatus >= 300) {
-    const err =
-      typeof data.error === 'string' ? data.error : JSON.stringify(data)
-    return { kind: 'error', text: `委派失败: ${err}` }
+    const err = typeof data.error === 'string' ? data.error : JSON.stringify(data)
+    return { kind: 'error', text: `委派失败: ${truncateDelegateLeaderResult(err, max)}` }
   }
   if (data.error || data.ok === false) {
     const err = String(data.error || data.output || 'unknown error')
-    return { kind: 'error', text: `子 agent 执行出错: ${err}` }
+    return { kind: 'error', text: `子 agent 执行出错: ${truncateDelegateLeaderResult(err, max)}` }
   }
   const output = typeof data.output === 'string' ? data.output : ''
   if (looksLikeDelegateApiError(output)) {
-    return { kind: 'error', text: `子 agent 执行出错: ${output}` }
+    return {
+      kind: 'error',
+      text: `子 agent 执行出错: ${truncateDelegateLeaderResult(output, max)}`,
+    }
   }
   const sessionKey =
     typeof data.sessionKey === 'string' && data.sessionKey.trim()
       ? data.sessionKey.trim()
       : undefined
-  return { kind: 'ok', text: formatDelegateSuccess(label, output, sessionKey) }
+  return { kind: 'ok', text: formatDelegateSuccess(label, output, sessionKey, max) }
 }
 
 export type CursorDelegateTransport = {
