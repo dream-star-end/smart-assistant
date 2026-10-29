@@ -11,6 +11,8 @@ import { createUserChatBridge, type UserChatBridgeDeps } from "../ws/userChatBri
 import { resolveContainerLinkEndpoint } from "../ws/containerLinkEndpoint.js";
 import { recordContainerLinkGap, scanContainerLinkCarriers } from "../ws/containerLinkRecoveryStore.js";
 import { createLogger } from "../logging/logger.js";
+import { resetDesktopTunnelRegistryForTest } from "../ws/desktopTunnelRegistry.js";
+import type { DesktopMuxSession } from "../ws/desktopMux.js";
 
 const restoredDispatch = "22222222-2222-4222-8222-222222222222";
 const restoredKey = `dispatch:${restoredDispatch}:1`;
@@ -84,7 +86,7 @@ async function recoveryRig(client: Client, receive: (ws: WebSocket, frame: Recor
     },
     ...extra,
   });
-  return { bridge, sockets, persisted, events, activity: () => activity,
+  return { bridge, sockets, persisted, events, url: `ws://127.0.0.1:${(server.address() as { port: number }).port}/ws`, activity: () => activity,
     stop: async () => { await bridge.shutdown(); for (const socket of sockets) socket.terminate(); await new Promise<void>(resolve => server.close(() => resolve())); } };
 }
 
@@ -185,6 +187,85 @@ test("startup ring miss persists a scoped gap with no fabricated frames or curso
     assert.deepEqual(rig.persisted, []);
     assert.equal((await readContainerLinkReplay(client, 42n, 7, "restored", restoredSessionKey)).afterSeq, 0);
   } finally { await rig.stop(); await client.end(); }
+});
+
+test("desktop cold-start and tunnel re-registration wait without spending the five reconnect attempts", async () => {
+  const client = await recoveryFixture();
+  const registry = resetDesktopTunnelRegistryForTest();
+  let lookups = 0;
+  let provisioned = 0;
+  const hellos: number[] = [];
+  const rig = await recoveryRig(client, (socket, frame) => {
+    if (frame.type !== "inbound.hello") return;
+    hellos.push(frame.peers[0].lastFrameSeq);
+    socket.send(JSON.stringify(replayFrame(frame.peers[0].lastFrameSeq + 1)));
+  }, {
+    containerLinkRecovery: { spacingMs: 1, retryMs: 1, maxAttempts: 5 },
+    resolveContainerEndpoint: async () => { provisioned++; throw new Error("must not provision"); },
+    resolveContainerLinkEndpoint: async (uid, cid) => { lookups++; return resolveContainerLinkEndpoint(client, "v5", uid, cid); },
+  });
+  const outcomes = () => rig.events.map(line => JSON.parse(line)).filter(event => event.msg === "container-link: reconnect");
+  const registerTunnel = () => registry.attach(7, { mux: {
+    openWs: (path: string) => { assert.equal(path, "/ws"); return new WebSocket(rig.url); },
+    close: () => { for (const socket of rig.sockets) socket.terminate(); },
+  } as unknown as DesktopMuxSession }, { deviceId: "delayed-desktop", uid: 42, expiresAt: new Date(Date.now() + 60_000) });
+  try {
+    await client.query("UPDATE agent_containers SET runtime_kind='desktop',bound_ip=NULL,port=NULL");
+    await rig.bridge.rebuildContainerLinks!();
+    await eventually(() => lookups >= 8);
+    assert.equal(rig.sockets.length, 0);
+    assert.deepEqual(outcomes(), []);
+    await registerTunnel();
+    await eventually(() => rig.persisted.length === 1);
+    assert.equal(outcomes().filter(event => event.outcome === "attempt").length, 1);
+    assert.equal(rig.bridge.containerLinkSnapshots!()[0]!.subscribers, 0);
+    assert.equal(rig.activity(), 0);
+
+    const beforeDrop = lookups;
+    registry.drop(7, "test reconnect");
+    await eventually(() => lookups >= beforeDrop + 8);
+    assert.equal(outcomes().filter(event => event.outcome === "attempt").length, 1);
+    await registerTunnel();
+    await eventually(() => rig.persisted.length === 2);
+    assert.deepEqual(hellos, [0, 1]);
+    for (let expected = 3; expected <= 5; expected++) {
+      rig.sockets.at(-1)!.terminate();
+      await eventually(() => rig.persisted.length === expected);
+    }
+    rig.sockets.at(-1)!.terminate();
+    await eventually(() => outcomes().some(event => event.outcome === "exhausted"));
+    assert.deepEqual(hellos, [0, 1, 2, 3, 4]);
+    assert.deepEqual(rig.persisted, [1, 2, 3, 4, 5]);
+    assert.equal((await client.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n, 5);
+    assert.equal(rig.sockets.length, 5);
+    assert.equal(outcomes().filter(event => event.outcome === "attempt").length, 5);
+    assert.equal(outcomes().filter(event => event.outcome === "vanished").length, 0);
+    assert.equal(provisioned, 0);
+  } finally { await rig.stop(); registry.dropAll(); await client.end(); }
+});
+
+test("desktop waiting for a tunnel stops when the exact PG carrier is no longer active", async () => {
+  const client = await recoveryFixture();
+  const registry = resetDesktopTunnelRegistryForTest();
+  let lookups = 0;
+  const rig = await recoveryRig(client, () => {}, {
+    resolveContainerLinkEndpoint: async (uid, cid) => { lookups++; return resolveContainerLinkEndpoint(client, "v5", uid, cid); },
+  });
+  try {
+    await client.query("UPDATE agent_containers SET runtime_kind='desktop'");
+    assert.equal(await resolveContainerLinkEndpoint(client, "v5", 43n, 7), null);
+    assert.equal(await resolveContainerLinkEndpoint(client, "v3", 42n, 7), null);
+    assert.equal(await resolveContainerLinkEndpoint(client, "v5", 42n, 8), null);
+    await rig.bridge.rebuildContainerLinks!();
+    await eventually(() => lookups >= 8);
+    await client.query("UPDATE agent_containers SET state='vanished'");
+    await eventually(() => rig.events.some(line => JSON.parse(line).outcome === "vanished"));
+    const stoppedAt = lookups;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(lookups, stoppedAt);
+    assert.equal(rig.sockets.length, 0);
+    assert.equal(await resolveContainerLinkEndpoint(client, "v5", 42n, 7), null);
+  } finally { await rig.stop(); registry.dropAll(); await client.end(); }
 });
 
 test("vanished container is neither provisioned nor retried and restored admitted lease still expires", async () => {

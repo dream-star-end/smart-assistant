@@ -7,7 +7,7 @@ type Entry = { attempts: number; queued: boolean; again: boolean; exhausted: boo
 export interface ContainerLinkRecoveryOptions {
   pool: Queryable
   channel: string
-  attach(carrier: LinkCarrier, rows: LinkDispatch[], signal: AbortSignal): Promise<'rebuilt' | 'attached' | 'vanished'>
+  attach(carrier: LinkCarrier, rows: LinkDispatch[], signal: AbortSignal): Promise<'rebuilt' | 'attached' | 'vanished' | 'pending'>
   drain(): Promise<void>
   log?: { info?(message: string, fields?: Record<string, unknown>): void; warn?(message: string, fields?: Record<string, unknown>): void } | null
   retryMs?: number
@@ -61,22 +61,29 @@ export class ContainerLinkRecovery {
     }
     entry.queued = true
     const current = entry
+    let counted = false
+    const countAttempt = () => {
+      if (retry && !counted) { counted = true; current.attempts++; this.report('attempt', carrier, current.attempts) }
+    }
     const work = this.tail.then(async () => {
       if (this.abort.signal.aborted) return
-      if (retry) { current.attempts++; this.report('attempt', carrier, current.attempts) }
-      await delay(retry ? (this.options.retryMs ?? 1000) * 2 ** (current.attempts - 1) : (this.options.spacingMs ?? 100), undefined, { signal: this.abort.signal })
+      await delay(retry ? (this.options.retryMs ?? 1000) * 2 ** current.attempts : (this.options.spacingMs ?? 100), undefined, { signal: this.abort.signal })
       await this.options.drain()
       if (this.abort.signal.aborted) return
       const rows = await readContainerLinkDispatches(this.options.pool, carrier)
       if (this.abort.signal.aborted || rows.length === 0) return
       const result = await this.options.attach(carrier, rows, this.abort.signal)
       if (this.abort.signal.aborted) return
+      // A live desktop may register its tunnel after startup. Keep its dial budget.
+      if (result === 'pending') { current.again = true; return }
       if (result === 'vanished') { current.again = false; this.report('vanished', carrier, current.attempts); return }
+      countAttempt()
       if (result === 'rebuilt') containerLinkRebuilt.inc({})
       if (retry) this.report('success', carrier, current.attempts)
       this.options.log?.info?.('container-link: rebuilt', { ...carrier, result, container_link_rebuilt_total: result === 'rebuilt' ? 1 : 0 })
     }).catch(error => {
       if (this.abort.signal.aborted) return
+      countAttempt()
       current.again = true
       this.report('error', carrier, current.attempts)
       this.options.log?.warn?.('container-link: recovery failed', { ...carrier, error })

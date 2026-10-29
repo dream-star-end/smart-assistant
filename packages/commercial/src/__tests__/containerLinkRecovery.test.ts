@@ -74,3 +74,70 @@ test('recovery failures retry serially and stop cancels the pending backoff', as
   recovery.stop(); await recovery.drain()
   assert.equal(attempts, 1)
 })
+
+test('desktop pending checks preserve the full lifetime reconnect budget', async () => {
+  resetMetricsForTest()
+  let ready = false
+  let checks = 0
+  let dials = 0
+  const outcomes: string[] = []
+  const recovery = new ContainerLinkRecovery({ ...options(async () => {
+    checks++
+    if (!ready) return 'pending'
+    dials++
+    recovery.lost(42n, 7)
+    return 'rebuilt'
+  }), maxAttempts: 5, log: { info: (_message, fields) => {
+    if (typeof fields?.outcome === 'string') outcomes.push(fields.outcome)
+  } } })
+  try {
+    await recovery.start()
+    await until(() => checks >= 8)
+    assert.equal(dials, 0)
+    assert.deepEqual(outcomes, [])
+    const lines: string[] = []; containerLinkReconnect.render(lines)
+    assert.equal(lines.some(line => line.startsWith('container_link_reconnect_total{')), false)
+    ready = true
+    await until(() => outcomes.includes('exhausted'))
+    assert.equal(dials, 5)
+    assert.equal(outcomes.filter(outcome => outcome === 'attempt').length, 5)
+    assert.equal(outcomes.filter(outcome => outcome === 'success').length, 5)
+    assert.equal(outcomes.filter(outcome => outcome === 'exhausted').length, 1)
+  } finally { recovery.stop(); await recovery.drain() }
+})
+
+test('pending desktop leaves the startup queue available and shutdown cancels polling', async () => {
+  let checks = 0
+  let restoredOther = false
+  const recovery = new ContainerLinkRecovery({ ...options(async got => {
+    if (got.containerId === 7) { checks++; return 'pending' }
+    restoredOther = true
+    return 'rebuilt'
+  }), pool: { query: async (sql: string) => ({ rows: sql.includes('SELECT DISTINCT')
+    ? [{ user_id: '42', container_id: 7 }, { user_id: '43', container_id: 8 }] : [row] }) } as unknown as Queryable })
+  try {
+    await recovery.start()
+    assert.equal(restoredOther, true)
+    await until(() => checks >= 8)
+    recovery.stop(); await recovery.drain()
+    const stoppedAt = checks
+    recovery.lost(42n, 7)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    assert.equal(checks, stoppedAt)
+  } finally { recovery.stop(); await recovery.drain() }
+})
+
+test('dispatch lookup errors still exhaust the reconnect budget', async () => {
+  let queries = 0
+  const outcomes: string[] = []
+  const recovery = new ContainerLinkRecovery({ ...options(async () => { throw new Error('must not dial') }),
+    pool: { query: async () => { queries++; throw new Error('database unavailable') } } as unknown as Queryable,
+    log: { info: (_message, fields) => { if (typeof fields?.outcome === 'string') outcomes.push(fields.outcome) } },
+  })
+  try {
+    recovery.lost(42n, 7)
+    await until(() => outcomes.includes('exhausted'))
+    assert.equal(queries, 3)
+    assert.equal(outcomes.filter(outcome => outcome === 'attempt').length, 3)
+  } finally { recovery.stop(); await recovery.drain() }
+})

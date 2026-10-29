@@ -851,7 +851,7 @@ export interface UserChatBridgeDeps {
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
-  resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | null>;
+  resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
   containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
   modelSwitchCost?: ModelSwitchCostService;
   jwtSecret: string | Uint8Array;

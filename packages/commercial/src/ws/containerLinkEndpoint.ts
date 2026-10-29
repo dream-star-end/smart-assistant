@@ -5,7 +5,7 @@ import type { ResolveContainerEndpoint } from './userChatBridge.js'
 import { getDesktopTunnelRegistry } from './desktopTunnelRegistry.js'
 
 /** Exact existing carrier only. Recovery must never provision or recycle. */
-export async function resolveContainerLinkEndpoint(pool: Queryable, channel: string, uid: bigint, containerId: number): Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | null> {
+export async function resolveContainerLinkEndpoint(pool: Queryable, channel: string, uid: bigint, containerId: number): Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | 'pending' | null> {
   const result = await pool.query<{
     bound_ip: string | null; port: number | null; runtime_kind: string
     host_uuid: string | null; host_name: string | null; container_internal_id: string | null
@@ -18,7 +18,7 @@ export async function resolveContainerLinkEndpoint(pool: Queryable, channel: str
   const row = result.rows[0]
   if (!row) return null
   if (row.runtime_kind === 'desktop') {
-    return getDesktopTunnelRegistry().get(containerId) ? { host: 'desktop-reverse', port: 0, containerId, desktop: { containerId } } : null
+    return getDesktopTunnelRegistry().get(containerId) ? { host: 'desktop-reverse', port: 0, containerId, desktop: { containerId } } : 'pending'
   }
   if (!row.bound_ip || row.port === null) return null
   if (row.host_uuid && row.host_name !== 'self') {

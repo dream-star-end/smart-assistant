@@ -21,11 +21,12 @@ export type StartRecoveryBridge = (user: WebSocket, uid: bigint, endpoint: Endpo
 export async function rebuildContainerLink(input: {
   carrier: LinkCarrier; rows: LinkDispatch[]; signal: AbortSignal
   links: ContainerLinkRegistry; deps: UserChatBridgeDeps; maxFrameBytes: number; start: StartRecoveryBridge
-}): Promise<'rebuilt' | 'attached' | 'vanished'> {
+}): Promise<'rebuilt' | 'attached' | 'vanished' | 'pending'> {
   const { carrier, signal, links, deps } = input
   const uid = BigInt(carrier.uid)
   const endpoint = await deps.resolveContainerLinkEndpoint!(uid, carrier.containerId)
   if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
+  if (endpoint === 'pending') return 'pending'
   if (!endpoint || endpoint.containerId !== carrier.containerId) return 'vanished'
   const existed = links.snapshots().some(link => link.uid === carrier.uid && link.containerId === carrier.containerId)
   const connId = randomUUID()
