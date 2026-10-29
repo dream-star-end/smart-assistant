@@ -12,9 +12,13 @@ const FALLBACK_STARTERS = [
 /** 起步卡的装饰图标:按位置轮换,纯视觉(starters 是自由文本,不做语义归类)。 */
 const STARTER_ICONS = [Sparkles, PenLine, Lightbulb, ListChecks];
 
-/** 按本地时间问候;凌晨单独一档,不在 3 点说「早上好」。 */
+/**
+ * 按北京时间问候;凌晨单独一档,不在 3 点说「早上好」。
+ * 不读浏览器时区(体验官 10-28 / 10-29:北京 16:25 的下午,美西时区的浏览器问候「夜深了」)。与账单时间(#1237)
+ * 同一口径固定 Asia/Shanghai;中国不实行夏令时,UTC+8 直接算,不必为一个小时数拉 Intl 时区数据。
+ */
 export function greetingFor(date: Date): string {
-  const h = date.getHours();
+  const h = (date.getUTCHours() + 8) % 24;
   if (h >= 5 && h < 11) return "上午好";
   if (h >= 11 && h < 13) return "中午好";
   if (h >= 13 && h < 18) return "下午好";
