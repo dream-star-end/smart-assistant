@@ -10,6 +10,42 @@ import { computeGoalTokensUsed, materializeLosslessTurn, parseLosslessTurnPayloa
 const TURN_KEY = "a".repeat(64);
 
 describe("materializeLosslessTurn", () => {
+  test("refresh-stable truncated reason preserves pauses and maps legacy booleans to max_tokens", () => {
+    const base = {
+      sessionId: "web-lossless-paused",
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: TURN_KEY,
+      text: "partial answer",
+      createdAt: 1_783_944_000_000,
+    };
+    for (const fields of [
+      { truncated: true },
+      { truncatedReason: "max_tokens" },
+      { truncatedReason: "pause_turn" },
+    ]) {
+      const expected = "truncatedReason" in fields ? fields.truncatedReason : "max_tokens";
+      const single = materializeLosslessTurn({ ...base, ...fields });
+      assert.equal(single.records.find((r) => r.payload.role === "assistant")?.payload._truncated, expected);
+      const segmented = materializeLosslessTurn({
+        ...base,
+        ...fields,
+        assistantSegments: [
+          { index: 0, text: "partial ", ts: base.createdAt },
+          { index: 1, text: "answer", ts: base.createdAt + 1 },
+        ],
+      }).records.filter((r) => r.payload.role === "assistant");
+      assert.equal(segmented[0]!.payload._truncated, undefined);
+      assert.equal(segmented[1]!.payload._truncated, expected);
+    }
+    assert.throws(() => parseLosslessTurnPayload({ ...base, truncatedReason: "error" }), /truncatedReason is invalid/);
+    assert.throws(() => parseLosslessTurnPayload({
+      ...base, text: "", continuationOfTurnKey: "b".repeat(64), truncatedReason: "pause_turn",
+      runtimeEvents: [{ ordinal: 1, observedAt: base.createdAt, source: "gateway", payload: { type: "system" } }],
+    }), /continuation must contain only completed runtimeEvents/);
+  });
+
   test("stamps exact client turn attribution into every immutable record and hash", () => {
     const turn = materializeLosslessTurn({
       sessionId: "web-lossless-123",

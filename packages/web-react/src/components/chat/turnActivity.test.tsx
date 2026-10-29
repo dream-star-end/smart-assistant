@@ -124,14 +124,14 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();
   });
 
-  test("OCV5-523: retrying → one model-busy retry hint, no counter or warning colour", () => {
+  test("TRUTH-08: 容器回合内重试写明第 n 次，保持中性活动行", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("模型繁忙，正在重试…");
+    expect(t).toContain("正在自动重试（第 2 次）");
     expect(t).not.toMatch(/\d+\/10|后重试/);
     expect(node.className).toContain("text-muted");
     expect(node.className).not.toContain("text-warning");
@@ -142,7 +142,7 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
       dispatch: { phase: "sending", queued: 1, serviceStarting: false },
       turnStatus: { kind: "retrying", attempt: 1, max: 10, retryAt: Date.now() },
     });
-    expect(screen.getByLabelText("生成中").textContent).toContain("模型繁忙，正在重试…");
+    expect(screen.getByLabelText("生成中").textContent).toContain("正在自动重试（第 1 次）");
     expect(screen.queryByText("正在发送…")).not.toBeInTheDocument();
   });
 

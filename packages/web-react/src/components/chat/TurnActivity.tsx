@@ -139,7 +139,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   } else if (retry) {
     // OCV5-523: all automatic recovery shares this activity row. Only a
     // confirmed terminal failure becomes an error card.
-    text = "模型繁忙，正在重试…";
+    text = retry.attempt >= 1 ? `正在自动重试（第 ${retry.attempt} 次）` : "正在自动重试…";
     cls = "retrying";
   } else if (info.dispatch) {
     ({ text, cls } = dispatchActivityLabel(info.dispatch));

@@ -4,7 +4,9 @@ import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
 import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
 import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
-import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
+import { recoveryJobStatus } from './recoveryPresentation.js';
+import { handleTurnDispatchReceipt } from './turnDispatchReceipt.js';
+export { classifyTurnDispatchReceipt } from './turnDispatchReceipt.js';
 import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
@@ -194,10 +196,8 @@ import {
 import { systemHelpDispatchFields } from "../system-assistant/helpBridge.js";
 import {
   backfillDispatchTraceId,
-  casAdmittedToAccepted,
   casToManualReconcile,
   casToTerminal,
-  getDispatchByLogicalKey,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
@@ -224,7 +224,6 @@ import {
 import {
   claimDueRecoveryJobs,
   forwardRecoveryUnderRootFence,
-  markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
   pauseRecoveryPreReceipt,
@@ -1466,50 +1465,6 @@ export type CronOriginExecutorClaimResult =
   | { kind: "rejected" }
   | { kind: "delivery_unknown" }
 
-export function classifyTurnDispatchReceipt(
-  receipt: {
-    dispatchId?: unknown;
-    attemptNo?: unknown;
-    sessionId?: unknown;
-    clientMessageId?: unknown;
-    state?: unknown;
-    outcome?: unknown;
-  },
-  expected: {
-    dispatchId: string;
-    attemptNo: number;
-    sessionId: string;
-    clientMessageId: string;
-  },
-): "accepted" | "rejected" | "invalid" {
-  if (
-    receipt.dispatchId !== expected.dispatchId ||
-    receipt.attemptNo !== expected.attemptNo ||
-    receipt.sessionId !== expected.sessionId ||
-    receipt.clientMessageId !== expected.clientMessageId
-  ) return "invalid";
-  if (receipt.state === "rejected") {
-    return receipt.outcome === "not_accepted" || receipt.outcome === null
-      ? "rejected"
-      : "invalid";
-  }
-  if (receipt.state === "terminal") {
-    return receipt.outcome === "completed" ||
-        receipt.outcome === "interrupted" ||
-        receipt.outcome === "crashed"
-      ? "accepted"
-      : "invalid";
-  }
-  if (
-    receipt.outcome === null &&
-    (receipt.state === "queued" ||
-      receipt.state === "running" ||
-      receipt.state === "recovery_pending" ||
-      receipt.state === "sink_staged" ||
-      receipt.state === "sink_stage_failed")
-  ) return "accepted";
-  return "invalid";
-}
 
 export type CronOriginExecutor = (payload: {
   encoded: Buffer
@@ -5370,7 +5325,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
             if (deps.pgPool) {
-              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog);
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog, connId);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
@@ -8027,150 +7982,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        // ── turn_dispatch_receipt(RFC §3.b)── 容器已持有该逻辑键的 inbox 行(重复
-        // 到达/接管重发)。内部控制帧,绝不透传浏览器。消费 = dispatch CAS accepted +
-        // 本连接放下转发所有权(容器已拥有执行,lease 心跳不再由本桥续)。
-        if (attestPeek !== null && attestPeek.includes('"outbound.control.turn_dispatch_receipt"')) {
-          let parsedReceipt: unknown = null;
-          try { parsedReceipt = JSON.parse(attestPeek); } catch { /* 非 JSON → 落回常规路径 */ }
-          if (
-            parsedReceipt !== null && typeof parsedReceipt === "object" &&
-            (parsedReceipt as { type?: unknown }).type === "outbound.control.turn_dispatch_receipt"
-          ) {
-            const receipt = parsedReceipt as {
-              clientMessageId?: unknown;
-              dispatchId?: unknown;
-              attemptNo?: unknown;
-              sessionId?: unknown;
-              state?: unknown;
-              outcome?: unknown;
-            };
-            const cmid = isClientMessageId(receipt.clientMessageId) ? receipt.clientMessageId : null;
-            const rec = cmid !== null ? admittedDispatches.get(cmid) : undefined;
-            if (rec !== undefined) {
-              const disposition = classifyTurnDispatchReceipt(receipt, rec);
-              if (disposition === "invalid") {
-                bridgeLog?.warn("user-chat-bridge: invalid dispatch receipt ignored", {
-                  dispatchId: receipt.dispatchId,
-                  clientMessageId: receipt.clientMessageId,
-                  attemptNo: receipt.attemptNo,
-                  state: receipt.state,
-                });
-                return;
-              }
-              const pool = deps.pgPool;
-              if (disposition === "rejected") {
-                const rejectedEnrichment = enrichmentDispatches.get(rec.clientMessageId);
-                if (
-                  rejectedEnrichment?.record === rec &&
-                  !claimEnrichmentTerminalization(rejectedEnrichment)
-                ) return;
-                if (!pool) {
-                  settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
-                  if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
-                    enrichmentDispatches.delete(rec.clientMessageId);
-                  }
-                  dropAdmittedDispatch(rec.clientMessageId);
-                  return;
-                }
-                void (async () => {
-                  let persisted = false;
-                  try {
-                    if (rec.recoveryJob) {
-                      persisted = await releaseRecoveryPreReceipt(pool, {
-                        job: rec.recoveryJob,
-                        dispatchId: rec.dispatchId,
-                        dispatchOwner: rec.leaseOwnerId,
-                        dispatchLeaseEpoch: rec.leaseEpoch,
-                      });
-                    } else {
-                      persisted = await casToTerminal(pool, {
-                        dispatchId: rec.dispatchId,
-                        outcome: "not_accepted",
-                        failureCode: "DISPATCH_NOT_ACCEPTED",
-                        clientNotified: false,
-                        fromStatuses: ["admitted"],
-                        expectedEpoch: rec.leaseEpoch,
-                      }) !== null;
-                    }
-                  } catch (err) {
-                    bridgeLog?.warn("user-chat-bridge: rejected receipt convergence failed", {
-                      dispatchId: rec.dispatchId,
-                      err,
-                    });
-                  } finally {
-                    settleCronOriginClaim(
-                      rec.dispatchId,
-                      { kind: persisted ? "rejected" : "delivery_unknown" },
-                    );
-                    if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
-                      enrichmentDispatches.delete(rec.clientMessageId);
-                    }
-                    dropAdmittedDispatch(rec.clientMessageId);
-                  }
-                })();
-                return;
-              }
-              if (!acceptEnrichmentReceipt(rec)) return;
-              // 容器已接手执行,admitted 记录随即放下;回合流仍归原链路消费者处理。
-              noteDispatchStreamFrame(rec.sessionId, rec.clientMessageId, false);
-              if (pool) {
-                if (rec.recoveryJob) {
-                  void markRecoveryContainerReceipt(pool, {
-                    dispatchId: rec.dispatchId,
-                    dispatchAttemptNo: rec.attemptNo,
-                    expectedDispatchLeaseEpoch: rec.leaseEpoch,
-                  }).then((accepted) => {
-                    if (accepted) broadcastToUser(uid, recoveryRunningFrame(rec.recoveryJob!));
-                  }).catch(() => {});
-                  dropAdmittedDispatch(rec.clientMessageId);
-                } else {
-                  // Cron injection success is the durable accepted CAS, not
-                  // ws.send and not an in-memory lease. Resolve its HTTP call
-                  // only after that proof is committed; a lost response can
-                  // safely retry and observe this accepted row.
-                  void (async () => {
-                    let claimed = false;
-                    const mustConfirmCronClaim = cronOriginClaimWaiters.has(rec.dispatchId);
-                    try {
-                      const accepted = await casAdmittedToAccepted(pool, {
-                        dispatchId: rec.dispatchId,
-                        expectedEpoch: rec.leaseEpoch,
-                      });
-                      if (accepted !== null) {
-                        claimed = true;
-                      } else if (mustConfirmCronClaim) {
-                        const durable = await getDispatchByLogicalKey(pool, {
-                          userId: uid,
-                          sessionId: rec.sessionId,
-                          clientMessageId: rec.clientMessageId,
-                        });
-                        claimed = durable?.dispatchId === rec.dispatchId &&
-                          durable.attemptNo === rec.attemptNo &&
-                          durable.status === "accepted";
-                      }
-                    } catch (err) {
-                      bridgeLog?.warn("user-chat-bridge: dispatch receipt CAS failed", {
-                        dispatchId: rec.dispatchId,
-                        err,
-                      });
-                    } finally {
-                      settleCronOriginClaim(
-                        rec.dispatchId,
-                        { kind: claimed ? "claimed" : "delivery_unknown" },
-                      );
-                      dropAdmittedDispatch(rec.clientMessageId);
-                    }
-                  })();
-                }
-              } else {
-                settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
-                dropAdmittedDispatch(rec.clientMessageId);
-              }
-            }
-            return;
-          }
-        }
+        if (handleTurnDispatchReceipt(attestPeek, {
+          pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
+          claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,
+          settleCronOriginClaim, noteDispatchStreamFrame,
+          hasCronOriginClaim: (dispatchId) => cronOriginClaimWaiters.has(dispatchId),
+          broadcast: (frame) => { broadcastToUser(uid, frame); },
+          warn: (message, meta) => bridgeLog?.warn(message, meta),
+        })) return;
         // Durable Stop/permission runtime receipt. Commit the lifecycle edge
         // before notifying tabs; if PG is unavailable the lease expires and
         // the identical control is retried instead of being guessed applied.

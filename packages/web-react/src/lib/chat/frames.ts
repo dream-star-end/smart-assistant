@@ -30,6 +30,7 @@ import type {
   MediaRef,
   OutboundActiveTurnReplayStart,
   OutboundCallUsage,
+  OutboundSessionSnapshot,
   OutboundContentBlock,
   OutboundError,
   OutboundMessage,
@@ -272,6 +273,7 @@ export type RecoveryDecisionWire = {
 export type AckWire = {
   type: "outbound.ack";
   admitted?: boolean;
+  accepted?: boolean;
   deduplicated?: boolean;
   /** Master atomically rejected a stale/unsafe recovery child. The browser
    * removes only that deterministic optimistic row and keeps the old tape. */
@@ -335,6 +337,7 @@ export type OutboundWire =
   | OutboundResumeFailedWire
   | OutboundActiveTurnReplayStartWire
   | OutboundTurnStatusWire
+  | OutboundSessionSnapshot
   | OutboundTurnUsageWire
   | OutboundCallUsageWire
   | OutboundControlReceiptWire

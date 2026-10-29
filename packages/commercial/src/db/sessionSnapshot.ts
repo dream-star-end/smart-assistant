@@ -1,4 +1,4 @@
-import type { SessionSnapshot, TurnTokenUsageSnapshot } from '@openclaude/protocol'
+import { automaticRetryStatus, type SessionSnapshot, type TurnTokenUsageSnapshot } from '@openclaude/protocol'
 import type { Pool, PoolClient } from 'pg'
 import { readDispatchSettledCredits } from '../billing/dispatchSettledCredits.js'
 import { pendingPermissionPromptToFrame, readPendingPermissionPrompts } from '../dispatch/turnControlStore.js'
@@ -46,9 +46,39 @@ export async function buildSessionSnapshot(
   )).rows[0]
   const snapshot: SessionSnapshot = {
     v: 1, sessionId, dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
-    engineReady: null, turnStatus: null, reconcile: null,
+    engineReady: null, turnStatus: null, reconcile: null, recovery: null,
     pendingPermissions: { items: [], completeness: 'complete' }, usage: null, credits: null,
     frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf,
+  }
+  // Optional during rolling upgrades; a missing recovery table must not poison
+  // the transaction used by the remaining authoritative snapshot queries.
+  await q.query('SAVEPOINT session_snapshot_recovery')
+  try {
+    const recovery = (await q.query<{
+      status: NonNullable<SessionSnapshot['recovery']>['status']
+      semantic_recovery_attempt: number; retry_limit: number | null
+    }>(
+      `/* session-snapshot-recovery */
+       SELECT status,semantic_recovery_attempt,
+              request_json->'_automaticRecoveryRetryLimit' AS retry_limit
+         FROM turn_recovery_jobs
+        WHERE user_id=$1::bigint AND session_id=$2
+          AND status IN ('queued','leased','sent','forwarded')
+        ORDER BY created_at DESC,job_id DESC LIMIT 1`,
+      [uid, sessionId],
+    )).rows[0]
+    if (recovery) snapshot.recovery = {
+      status: recovery.status, attempt: recovery.semantic_recovery_attempt, maxAttempts: recovery.retry_limit,
+      retryStatus: automaticRetryStatus(recovery.status === 'forwarded' ? 'running' : 'scheduled',
+        recovery.semantic_recovery_attempt, recovery.retry_limit ?? undefined),
+    }
+  } catch (error) {
+    await q.query('ROLLBACK TO SAVEPOINT session_snapshot_recovery')
+    // Only a not-yet-migrated rolling peer means this optional fact is absent.
+    // A timeout/read failure cannot prove that automatic recovery stopped.
+    if ((error as { code?: unknown } | null)?.code !== '42P01') throw error
+  } finally {
+    await q.query('RELEASE SAVEPOINT session_snapshot_recovery')
   }
   const agentId = row?.agent_id || 'main'
   const sessionKey = `agent:${agentId}:webchat:dm:${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -81,7 +111,7 @@ export async function buildSessionSnapshot(
     await q.query('ROLLBACK TO SAVEPOINT session_snapshot_credits')
   }
   await q.query('RELEASE SAVEPOINT session_snapshot_credits')
-  if (row.status === 'terminal') snapshot.reconcile = terminalDispatchReconcile(row.outcome)
+  if (row.status === 'terminal' && !snapshot.recovery) snapshot.reconcile = terminalDispatchReconcile(row.outcome)
   const stream = (await q.query<{
     projection_source: string; provenance: { containerLinkGap?: SessionSnapshot['gap'] }; frame_seq: string | null; created_at: Date | null
   }>(
