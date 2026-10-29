@@ -100,6 +100,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/http/proxy/boxInteractivePrintParity.test.ts',
     cases: ['an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p'],
   },
+  {
+    incident: 'INC-20261029-SESSION-WS-BOUNDARY', slug: 'inc-20261029-session-ws-boundary', db: false,
+    file: 'packages/gateway/src/__tests__/promptToolRecovery.test.ts',
+    cases: ['keeps file search/deletion inside the current conversation unless the user names another one'],
+  },
 ]
 
 function fail(message: string): never {
