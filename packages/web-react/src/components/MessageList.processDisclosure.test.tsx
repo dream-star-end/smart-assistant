@@ -2736,3 +2736,46 @@ test("过程条写人话摘要而不是步数，右栏本轮步数口径不变",
   expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/步/);
   expect(screen.queryByTestId("process-tally")).not.toBeInTheDocument();
 });
+
+// P3（体验官 10-29 pm）：没发附件却写「读取 1 个文件」。读技能说明是准备工作；`cat > f <<EOF` 是写；
+// 只有读 uploads 目录才叫附件；等子任务不是又一条命令。
+test("P3 读取归类：技能说明、heredoc 写文件、附件、等待委派各归其位", () => {
+  const bash = (id: string, command: string) => row(id, "tool", "终端", { toolName: "Bash", inputJson: { command } });
+  expect(workSummary([bash("s", "cat /home/agent/.openclaude/skills/docx/SKILL.md")])).toBe("");
+  expect(workSummary([bash("w", "cat > /home/agent/.openclaude/generated/纪要.md <<'EOF'\n# 纪要\nEOF")])).toBe("写了 1 个文件");
+  expect(workSummary([bash("r", "cat /tmp/a.txt 2>/dev/null")])).toBe("读了 1 个文件");
+  expect(workSummary([bash("u", "cat /home/agent/.openclaude/uploads/周会.txt")])).toBe("读了 1 个附件");
+  expect(workSummary([row("ur", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/home/agent/.openclaude/uploads/周会.txt" } })])).toBe("读了 1 个附件");
+  expect(workSummary([bash("dw", "oc-memory delegate-wait dlgjob-mvon5yk2-7398486c106a")])).toBe("");
+});
+
+// P3：团队模式下看不出发生了委派。过程里的委派步骤写「委派给 谁：做什么」+ 进行中 / 完成。
+test("P3 委派步骤写出谁接了、做什么、进行中 / 完成", () => {
+  const owner = { _clientMessageId: "u1" };
+  const view = renderList([
+    row("u1", "user", "审一下报告", { status: "replied" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+    row("ag", "agent-group", "检查报告格式", { ...owner, _delegate: true, _delegateAgentId: "researcher", _delegateGoal: "检查报告格式", _completed: true }),
+    row("a1", "assistant", "审完了。", { ...owner }),
+  ]);
+  expect(screen.getByTestId("process-title")).toHaveTextContent("派出 1 个子任务");
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  const step = screen.getAllByTestId("process-step-row").find((node) => (node.textContent ?? "").includes("委派给"))!;
+  expect(step).toHaveTextContent("委派给 researcher：检查报告格式");
+  expect(within(step).getByTestId("process-delegate-state")).toHaveTextContent("完成");
+  // 原委派卡(子代理的过程)在技术详情里,标题也写出接手的子代理。
+  fireEvent.click(within(step).getAllByRole("button")[0]!);
+  expect(within(step).getByTestId("agent-group-assignee")).toHaveTextContent("委派给 researcher");
+  view.unmount();
+
+  renderList([
+    row("u1", "user", "审一下报告", { status: "sent" }),
+    row("ag", "agent-group", "检查报告格式", { ...owner, _delegate: true, _delegateAgentId: "researcher", _delegateGoal: "检查报告格式" }),
+  ], { sending: true, turnActivity: { startedAt: Date.now() - 5_000, agentName: "主助手" } });
+  expect(screen.getByTestId("process-step-live")).toHaveTextContent("委派给 researcher：检查报告格式");
+  for (const toggle of screen.queryAllByTestId("process-detail-toggle")) {
+    if (toggle.getAttribute("aria-expanded") !== "true") fireEvent.click(toggle);
+  }
+  expect(screen.getByTestId("process-delegate-state")).toHaveTextContent("进行中");
+});

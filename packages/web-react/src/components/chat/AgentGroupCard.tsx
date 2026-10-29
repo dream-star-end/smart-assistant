@@ -17,6 +17,7 @@ import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
 import { DelegateProcessList } from "./delegateProcessList";
 import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
+import { agentDisplayName } from "./agentNames";
 
 /** 终态图标(与 agentTerminalStatus tone 对齐):完成→Users、失败→X、超时→Clock。 */
 export function TerminalIcon({ tone, size }: { tone: "success" | "danger" | "warning"; size: number }) {
@@ -218,6 +219,10 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
           {running ? <Spinner size={13} /> : <TerminalIcon tone={status.tone} size={13} />}
         </span>
+        {/* 团队模式:谁接了这件事先写出来(体验官 P3「看不出委派」)。 */}
+        {msg._delegateAgentId ? (
+          <span data-testid="agent-group-assignee" className="shrink-0 text-body text-muted">{`委派给 ${agentDisplayName(msg._delegateAgentId)}`}</span>
+        ) : null}
         <span className="min-w-0 truncate text-body font-medium text-fg">{msg.text || "子任务"}</span>
         <span className="ml-auto flex max-w-[55%] flex-wrap items-center justify-end gap-x-2 gap-y-1">
           {running ? (

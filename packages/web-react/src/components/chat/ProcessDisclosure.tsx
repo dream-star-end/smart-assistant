@@ -19,7 +19,9 @@ import {
   Wrench,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
+import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../../lib/chat/model";
+import { agentTerminalStatus } from "../../lib/chat/render";
+import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
 import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
 import { type CardCallbacks, ProgressiveMarkdown, RecoveredStepContext } from "./cards";
@@ -105,6 +107,8 @@ function commandText(message: ChatMessage): string {
 }
 
 const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd"]);
+/** `cat > f <<'EOF'`、`cat a >> b`:首词是 cat,其实是写文件(`2>`、`>&2` 不算)。 */
+const CAT_WRITE_RE = /(?:^|[^0-9&<>])>>?\s*[^\s&|>]/;
 
 const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 const GENERATED_PREFIX = "/home/agent/.openclaude/generated/";
@@ -545,6 +549,7 @@ function countLabel(message: ChatMessage): string {
     const tool = (message.toolName ?? "").toLowerCase();
     const head = commandHead(message).toLowerCase();
     const verb = SHELL_TOOLS.has(tool) ? head : tool || head;
+    if (verb === "cat" && CAT_WRITE_RE.test(commandText(message))) return "编辑";
     if (verb === "read" || verb === "view" || verb === "cat") return "读取";
     if (verb === "edit" || verb === "write" || verb === "patch" || verb === "multiedit") return "编辑";
     if (verb === "grep" || verb === "rg" || verb === "glob" || verb === "find" || verb === "search") return "搜索";
@@ -594,16 +599,19 @@ function workKind(message: ChatMessage): string {
     const display = normalizeToolForDisplay(message);
     const label = resolveToolMeta(display.name, display.input).label;
     const head = reliableHeadCall(stripShellWrapperForDisplay(commandOf(display.input)));
-    const path = String(display.input?.file_path ?? "");
-    if (PREP_LABELS.has(label) || head?.bin === "oc-system" || /^(?:-h|--help|help)$/.test(head?.op ?? "") || /\/skills\/.*SKILL\.md$/i.test(path)) {
+    // 读工具给 file_path,shell 的 `cat …` 只有命令文本:两处都看。
+    const target = String(display.input?.file_path ?? "") || commandOf(display.input);
+    if (PREP_LABELS.has(label) || head?.bin === "oc-system" || /^(?:-h|--help|help)$/.test(head?.op ?? "") || /\/skills\/[^\s'"]*SKILL\.md\b/i.test(target)) {
       return "prep";
     }
+    // 等子任务是委派的一部分,不是又一条命令;不进摘要。
+    if (label === "等待委派") return "wait";
     if (/^(?:委[派托]|并行委派|子任务$)/.test(label)) return "call";
     if (label === "写入文件") return "write";
+    // 其余按工具名或命令首词归类(cat 是读、cat > f 是写、rg 是搜),不扫参数。
+    const kind = COUNT_KIND[countLabel(message)] ?? "";
     // 用户上传的附件单独说:没发附件时,「读了 1 个文件」不能被读成读了附件。
-    if (path.includes("/.openclaude/uploads/")) return "attach";
-    // 其余按工具名或命令首词归类(cat 是读、rg 是搜),不扫参数。
-    return COUNT_KIND[countLabel(message)] ?? "";
+    return kind === "read" && target.includes("/.openclaude/uploads/") ? "attach" : kind;
   } catch {
     return "other";
   }
@@ -837,6 +845,7 @@ function runningToolPhrase(message: ChatMessage): string {
   if (SHELL_TOOLS.has(token) || token === "bash" || token === "sh") {
     const bin = (head?.bin ?? "").toLowerCase();
     if (bin === "rg" || bin === "grep" || bin === "find") return "正在搜索资料";
+    if (bin === "cat" && CAT_WRITE_RE.test(command)) return "正在写入文件";
     if (bin === "cat" || bin === "view") return "正在读取文件";
   }
   return actionPhrase(message);
@@ -880,6 +889,25 @@ function rawAuditCommand(message: ChatMessage): string {
 /** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
  * A later completed sibling must not hide a tool that is still running.
  * `pending` is only the still-running status phrase. Finished and failed lines stay still. */
+function isDelegateRow(message: ChatMessage): boolean {
+  return message.role === "agent-group" || message.role === "delegate-progress";
+}
+
+/** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理。 */
+function delegateTitle(rows: readonly ChatMessage[]): string {
+  const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];
+  if (rows.length > 1) return `委派给 ${names.join("、")}`;
+  const goal = (rows[0]?._delegateGoal || rows[0]?.text || "").replace(/\s+/g, " ").trim();
+  return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
+}
+
+/** 委派步骤右侧的状态:有一个还在跑就是「进行中」,否则取最差的终态(超时 / 失败 / 完成)。 */
+function delegateState(rows: readonly ChatMessage[]): { label: string; running: boolean } {
+  if (rows.some((message) => !message._completed && !isServerAuthoredRow(message))) return { label: "进行中", running: true };
+  const states = rows.map((message) => agentTerminalStatus(message));
+  return { label: (states.find((state) => state.tone === "danger") ?? states.find((state) => state.tone === "warning") ?? states[0])?.label ?? "完成", running: false };
+}
+
 function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
   const work = messages.filter((message) => message.role !== "assistant" && message.role !== "user");
   const runningTool = [...work].reverse().find(toolStillRunning);
@@ -890,7 +918,7 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
     return { text: (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48), pending: false };
   }
   if (latest.role === "agent-group" || latest.role === "delegate-progress") {
-    return { text: (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48), pending: true };
+    return { text: delegateTitle([latest]).slice(0, 48), pending: true };
   }
   if (latest.role === "tool") {
     if (latest.error || latest._isError || latest._errorCode) {
@@ -1343,7 +1371,10 @@ export function ProcessDisclosure<T>({
       </>
     );
     const head = rows[0];
-    let title = "思考";
+    // 委派:谁接了、做什么、进行中 / 完成一眼可见;原委派卡(子代理的过程)在技术详情里。
+    const delegated = !deferred && rows.length > 0 && rows.every(isDelegateRow);
+    const delegation = delegated ? delegateState(rows) : null;
+    let title = delegated ? delegateTitle(rows) : "思考";
     let reason = "";
     if (inline && head?.role === "tool") {
       try {
@@ -1356,7 +1387,7 @@ export function ProcessDisclosure<T>({
     }
     return (
       <RailRow key={key} testId="process-step" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={active && key === lastItemKey}>
-        {inline && head ? (
+        {(inline || delegated) && head ? (
           // UI-3:人话标题(「读取 周会记录.txt」「运行命令」「思考」);命令、技能 / 任务 ID、英文思考小标题
           // 和输出都在点开后的「技术详情」(原卡,原样)里。
           <Fold
@@ -1366,7 +1397,11 @@ export function ProcessDisclosure<T>({
                 <span className={`min-w-0 truncate text-body ${node.tone === "live" ? "text-muted" : "text-faint"}`}>
                   {node.tone === "live" && head.role === "thinking" ? "正在思考" : title}
                 </span>
-                {hasErrorMark(head) ? <span className="shrink-0 text-meta text-faint">未成功</span> : null}
+                {delegation ? (
+                  <span data-testid="process-delegate-state" className={`shrink-0 text-meta ${delegation.running ? "text-muted" : "text-faint"}`}>
+                    {delegation.label}
+                  </span>
+                ) : hasErrorMark(head) ? <span className="shrink-0 text-meta text-faint">未成功</span> : null}
               </>
             }
             meta={<StepMetaBadge ids={rows.map((message) => message.id)} tokenUsage={tokenUsageOf?.(item)} />}
