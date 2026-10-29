@@ -983,7 +983,8 @@ function rotateReason(line: string): string | null {
     Array.isArray(top.message.content)
   ) {
     for (const block of top.message.content as Array<{ text?: unknown }>) {
-      if (typeof block?.text === 'string' && /^Not logged in\b/.test(block.text)) return 'login'
+      if (typeof block?.text === 'string' && /^(?:Not logged in|Login expired|OAuth token revoked)\b/.test(block.text))
+        return 'login'
       if (typeof block?.text === 'string' && /hit your .*limit|usage limit/i.test(block.text))
         return 'quota'
     }

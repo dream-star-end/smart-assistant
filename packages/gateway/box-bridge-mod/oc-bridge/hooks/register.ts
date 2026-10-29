@@ -254,7 +254,7 @@ export const register: Register = (on) => {
       return next({ ...e, message: { ...m, content: [] } } as any)
     }
     const stored = await next(e)
-    const row = { door: e.door, uuid: e.uuid, agentId: e.agentId, message: stored?.message ?? e.message } as any
+    const row = { door: e.door, uuid: e.uuid, agentId: e.agentId, origin: e.origin, message: stored?.message ?? e.message } as any
     if (print && printing && !printing.stopped && !e.agentId) {
       if (e.door === 'response' && row.message?.type === 'assistant') send(sj.printRow(row))
       else held.push(...sj.row(row))
