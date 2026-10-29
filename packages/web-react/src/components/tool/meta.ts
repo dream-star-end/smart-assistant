@@ -703,13 +703,13 @@ export function humanStepTitle(name: string, input: Record<string, unknown> | nu
   const label = resolveToolMeta(name, input).label;
   if (label === "终端") return "运行命令";
   if (label === "等待委派") return "等待子任务完成";
-  if (!/[^\x00-\x7F]/.test(label)) return "调用工具";
+  if (!/[\u0080-\uffff]/.test(label)) return "调用工具";
   let object = NO_OBJECT_LABELS.has(label) ? "" : toolSummary(name, input).trim();
   const verb = FILE_STEP_VERB[label];
   if (verb) return object ? `${verb} ${object.replace(/^.*\//, "")}` : label;
   if (/^https?:\/\//.test(object)) object = displayDomain(object);
   // 纯 ASCII、无空格、也不像文件名或域名的(技能 ID、任务 ID、蛇形操作名、`--help`)不是人话。
-  if (!/[^\x00-\x7F]|\s|\.[a-z]{2,5}$/i.test(object)) object = "";
+  if (!/[\u0080-\uffff]|\s|\.[a-z]{2,5}$/i.test(object)) object = "";
   return object ? `${label} ${object}` : label;
 }
 

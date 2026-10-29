@@ -12,7 +12,7 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
-import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -23,9 +23,9 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  type ChatMessage,
-  type LiveTurnTokenUsageSnapshot,
+import type {
+  ChatMessage,
+  LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -76,8 +76,7 @@ import {
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
-import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
-import { TeamPanel } from "./chat/TeamPanel";
+import { GeneratingPlaceholderCard, TeamPanel } from "./chat/lazyTimelineCards";
 import {
   PermissionCard,
   PermissionPromptHost,

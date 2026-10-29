@@ -142,6 +142,8 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "level 2 is narrative and counts only");
       await desktop.page.getByTestId("process-detail-toggle").click();
+      assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "level 3 shows human step titles before tech details");
+      await desktop.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().click();
       await desktop.page.getByText("summarize-stock.mjs").waitFor();
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-manus-desktop-expanded.png") });
 
@@ -182,6 +184,8 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       });
       console.log("MOBILE_GROUP_STABLE", JSON.stringify(stableGeometry));
       await stableGroup.tap();
+      assert.equal(await mobile.page.getByText("summarize-stock.mjs").count(), 0);
+      await mobile.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().tap();
       await mobile.page.getByText("summarize-stock.mjs").waitFor();
       const userAfter = await mobile.page.getByText("做一版库存看板").boundingBox();
       assert.ok(userBefore && userAfter && Math.abs(userBefore.y - userAfter.y) < 80, "mobile expand stays on this turn");
@@ -508,8 +512,8 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
           assert.equal(await process.count(), 1);
           const toggle = process.getByTestId("process-toggle");
           assert.equal(await toggle.getAttribute("aria-expanded"), "false");
-          assert.match(await toggle.innerText(), /目标 1 项/);
-          assert.doesNotMatch(await toggle.innerText(), /目标 [234]/);
+          assert.match(await toggle.innerText(), /完成 · 运行了 1 条命令/);
+          assert.doesNotMatch(await toggle.innerText(), /目标/);
           assert.equal(await page.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 0);
           assert.equal(await page.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
           report.checkpoints.push("collapsed");
@@ -544,7 +548,8 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
           assert.equal(await page.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
           assert.equal(await page.getByText("LATEST_CLEARED_NO_FALLBACK", { exact: true }).count(), 0);
           assert.equal(await historical.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 1);
-          assert.match(await toggle.innerText(), /目标 1 项/);
+          assert.match(await toggle.innerText(), /完成 · 运行了 1 条命令/);
+          assert.doesNotMatch(await toggle.innerText(), /目标/);
           assert.equal(await page.getByText("目标更新不是普通回答。", { exact: true }).count(), 1);
           report.checkpoints.push("clear");
           assert.equal(errors.length, 0, errors.join("\n"));

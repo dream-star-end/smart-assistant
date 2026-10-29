@@ -423,9 +423,22 @@ async function ensureConsultProcessOpen(page) {
 }
 
 async function expandConsultCard(page) {
-  await ensureConsultProcessOpen(page);
-  const expand = page.getByRole("button", { name: /咨询顾问/, expanded: false });
-  if (await expand.count()) await expand.first().click();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await ensureConsultProcessOpen(page);
+    const collapsed = page.getByRole("button", { name: /咨询顾问/, expanded: false });
+    if ((await collapsed.count()) === 0) {
+      if ((await page.getByRole("button", { name: /咨询顾问/, expanded: true }).count()) >= 2) return;
+    } else {
+      try {
+        await collapsed.first().click({ timeout: 1_500 });
+        continue;
+      } catch {
+        // Live turn completion auto-collapses process-toggle (`explicit === undefined`); reopen on next pass.
+      }
+    }
+    await page.waitForTimeout(100);
+  }
 }
 
 async function waitForConsultAdvice(page, inbounds) {

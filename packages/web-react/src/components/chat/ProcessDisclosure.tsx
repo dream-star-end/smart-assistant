@@ -617,12 +617,26 @@ function workKind(message: ChatMessage): string {
   }
 }
 
+function delegateCallCount(message: ChatMessage): number {
+  try {
+    const tasks = normalizeToolForDisplay(message).input?.tasks;
+    if (Array.isArray(tasks) && tasks.length > 0) return tasks.length;
+  } catch {
+    // malformed inputJson falls back to output header or 1
+  }
+  const hit = /并行委派\s*(\d+)\s*个子任务/.exec(String(message.output ?? ""));
+  const parsed = hit ? Number(hit[1]) : 0;
+  return parsed > 0 ? parsed : 1;
+}
+
 /** 「读了 6 个文件、派出 1 个子任务、写了 1 个文件」。没有可说的事返回空串。 */
 export function workSummary(messages: readonly ChatMessage[]): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
     const kind = workKind(message);
-    if (kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    if (!kind) continue;
+    const step = kind === "call" ? delegateCallCount(message) : 1;
+    counts.set(kind, (counts.get(kind) ?? 0) + step);
   }
   // 委派调用和子任务卡常是同一件事:取两者较大的那个,不重复数。
   const calls = counts.get("call") ?? 0;
@@ -893,10 +907,10 @@ function isDelegateRow(message: ChatMessage): boolean {
   return message.role === "agent-group" || message.role === "delegate-progress";
 }
 
-/** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理。 */
+/** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理与子任务数。 */
 function delegateTitle(rows: readonly ChatMessage[]): string {
   const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];
-  if (rows.length > 1) return `委派给 ${names.join("、")}`;
+  if (rows.length > 1) return `委派给 ${names.join("、")}（${rows.length} 个子任务）`;
   const goal = (rows[0]?._delegateGoal || rows[0]?.text || "").replace(/\s+/g, " ").trim();
   return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
 }
@@ -1077,23 +1091,7 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
-/** 只在本轮进行中、且有可信起点(本轮活动的 startedAt)时计时;没有就不显示,绝不编。 */
-function useElapsed(startedAt: number | null | undefined, active: boolean): string {
-  const valid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!valid) return;
-    setNow(Date.now());
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [valid]);
-  if (!valid) return "";
-  const ms = now - (startedAt as number);
-  if (ms < 0 || ms > 24 * 3600_000) return "";
-  return formatElapsed(ms);
-}
-
-/** 1s 一跳的「现在」。只在有可信时间源时开表,结束即停。 */
+/** 1s 一跳的「现在」(统一驱动外壳已耗时与静默/运行计时)。只在有可信时间源时开表,结束即停。 */
 function useNowTicker(enabled: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -1295,14 +1293,16 @@ export function ProcessDisclosure<T>({
   const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
   const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
   const hasToolRows = processRows.some((message) => message.role === "tool");
-  const elapsed = useElapsed(startedAt, active);
+  const elapsedValid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
   // 用户只能看到一段静止的文字(外壳标题的计时在长过程里早已滚出视口)。
   const currentSection = currentIndex >= 0 ? sections[currentIndex] : undefined;
   const completedSince = currentSection && !currentSection.narrative ? completedToolsSince(currentSection.messages) : null;
   const liveClock = active && typeof lastFrameAt === "number" && Number.isFinite(lastFrameAt) && lastFrameAt > 0;
-  const now = useNowTicker(liveClock || (active && completedSince !== null));
+  const now = useNowTicker(elapsedValid || liveClock || (active && completedSince !== null));
+  const elapsedMs = elapsedValid ? now - (startedAt as number) : -1;
+  const elapsed = elapsedMs >= 0 && elapsedMs <= 24 * 3600_000 ? formatElapsed(elapsedMs) : "";
   const quietMs = liveClock ? Math.max(0, now - (lastFrameAt as number)) : 0;
   const narrativeSettled = liveClock && !!currentSection?.narrative && quietMs >= QUIET_TAIL_MS;
   const toolWaitMs = completedSince === null ? 0 : now - completedSince;
