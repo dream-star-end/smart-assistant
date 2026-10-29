@@ -142,7 +142,7 @@ export async function executeCronOriginInject(opts: {
   }
   const content = { text: input.text };
   const requestHash = computeDispatchRequestHash(content);
-  const sessionUserId = "c:" + input.uid.toString();
+  const sessionUserId = `c:${input.uid.toString()}`;
   let originModel: string | null = null;
   try {
     let raw: string | null | undefined;
@@ -176,7 +176,7 @@ export async function executeCronOriginInject(opts: {
       ...(originModel ? { model: originModel } : {}),
     },
   };
-  let admit;
+  let admit: Awaited<ReturnType<typeof admitUserTurn>>;
   try {
     admit = await admitUserTurn({
       uid: input.uid,
