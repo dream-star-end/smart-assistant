@@ -27,7 +27,9 @@ const here = dirname(fileURLToPath(import.meta.url))
 const HONEST =
   /思考中|正在思考|处理过程|工具中|执行操作|处理时间较长|后台运行中|深度思考中|正在生成内容/
 const STALE_ENGINE = /正在启动引擎/
-const CLOCK_ORIGIN = new Date('2026-10-29T00:00:00Z')
+// The mock gateway stamps admission with host time. Share its epoch so that
+// replayed thinking cannot sort before the user after a fixed calendar date.
+const CLOCK_ORIGIN = new Date()
 
 const results = []
 
