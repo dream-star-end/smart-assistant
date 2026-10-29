@@ -1,4 +1,7 @@
 import test from "node:test";
+import { normalizeBoxDefaultTemperature, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { prepareBoxContinuation, preparedMatchesBody } from "./boxPreparedContinuation.js";
 import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import assert from "node:assert/strict";
 import { validateBoxTextRequest, validateBoxRequest,
@@ -195,4 +198,32 @@ test("every listed Box model passes the gate; a model without effort takes none"
   // A model outside the table gets no keep-all exception.
   assert.equal(validateBoxTextRequest({ ...base, model: "box-api-claude-sonnet-5",
     context_management: keepAll } as ProxyBody), "BOX_PARAMETER_UNMAPPED");
+});
+
+
+test("Box default temperature is absent from text and tool compilation without weakening gates", () => {
+  const tools = [{ name: "local_echo", description: "synthetic local tool", input_schema: { type: "object", properties: {} } }];
+  for (const body of [base, { ...base, tools, tool_choice: { type: "auto" } } as ProxyBody]) {
+    const supplied = { ...body, temperature: 1 } as ProxyBody;
+    assert.equal(validateBoxRequest(supplied, true), null);
+    const normalized = normalizeBoxDefaultTemperature(supplied);
+    assert.equal(Object.hasOwn(normalized, "temperature"), false);
+    assert.equal(supplied.temperature, 1, "normalization must not mutate the raw request");
+    assert.equal(Object.hasOwn(normalizeBoxSemanticBody(supplied), "temperature"), false);
+    assert.equal(deriveBoxContextHash(supplied), deriveBoxContextHash(body),
+      "the API default cannot fork replay or continuation identity");
+    const prepared = prepareBoxContinuation({ uid: 247n, canonicalModel: supplied.model,
+      rawBody: supplied, authorityKind: "local_catalog", authorityTurnId: null });
+    assert.equal(preparedMatchesBody(prepared, normalized), true);
+    assert.equal(validateBoxRequest(supplied, true, prepared), null);
+    for (const temperature of [0.2, 0, 2, null, "1"]) {
+      assert.equal(validateBoxRequest({ ...body, temperature } as ProxyBody, true),
+        "BOX_PARAMETER_UNMAPPED", String(temperature));
+    }
+    for (const parameter of [{ top_p: 1 }, { top_k: 1 }, { stop_sequences: [] },
+      { service_tier: "auto" }, { context_management: {} }]) {
+      assert.equal(validateBoxRequest({ ...supplied, ...parameter } as ProxyBody, true),
+        "BOX_PARAMETER_UNMAPPED");
+    }
+  }
 });
