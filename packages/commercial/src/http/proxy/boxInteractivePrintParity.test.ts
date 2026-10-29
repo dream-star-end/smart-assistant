@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
+import { readBoxProfileSignals } from "./boxProfileSignals.js";
 
 const FRAMES = pathToFileURL(resolve(dirname(fileURLToPath(import.meta.url)),
   "../../../../gateway/box-bridge-mod/oc-bridge/hooks/frames.ts")).href;
@@ -172,4 +173,53 @@ test("usage at stop: the forwarded SSE bills the real usage; a zero start withou
   });
   const p = createBoxCliSseDecoder(MODEL);
   assert.throws(() => { for (const line of strict) p.push(`${line}\n`); }, /BOX_CLI_USAGE_MISMATCH/);
+});
+
+// ---- an API error stand-in (2026-10-29: the Box default login's refresh failed) ----
+
+/** As the interactive runner ran it on the Box (CLI 2.1.312, a login whose refresh failed): the
+ * engine's stand-in row comes in with origin model `<synthetic>` and the step ends without a stop. */
+async function apiErrorTurn(tools: string[], servers: { name: string; status: string }[],
+  origin: { kind: string; model?: string }): Promise<string[]> {
+  const sj = await session();
+  sj.turnStart();
+  return [sj.printInit(tools, servers),
+    ...sj.printStep({ turnId: "e8f0f6f2-3c4f-4f0e-9a51-0c6c4f6b2d10", index: 0, model: MODEL, chunks: [],
+      rows: [{ door: "response", uuid: "c7c846e6-1787-4b04-a29f-d800698c1e4a", origin,
+        message: { type: "assistant", content: [{ type: "text", text: "Login expired · Please run /login" }] } }] },
+    { stopReason: null, usage: null }),
+    sj.result({ reason: "error", answer: "", durationMs: 150 }, null)];
+}
+
+test("an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p", async () => {
+  const lines = await apiErrorTurn([], [], { kind: "model", model: "<synthetic>" });
+  const record = lines.map((line) => JSON.parse(line)).find((item) => item.type === "assistant");
+  assert.equal(record.message.model, "<synthetic>");
+  assert.equal(record.is_api_error_message, true);
+  const sse = createBoxCliSseDecoder(MODEL);
+  assert.throws(() => { for (const line of lines) sse.push(`${line}\n`); }, /BOX_CLI_UPSTREAM_REFUSED/);
+  assert.deepEqual(readBoxProfileSignals(`${lines.join("\n")}\n`), [{ kind: "login_required" }]);
+  const catalog = compileBoxToolCatalog([{ name: "Bash", description: "Synthetic local tool",
+    input_schema: { type: "object", properties: { value: { type: "string" } } } }]);
+  const tool = await apiErrorTurn([catalog.boxNameByClientName.get("Bash")!],
+    [{ name: "ocbridge", status: "connected" }], { kind: "model", model: "<synthetic>" });
+  const decoder = new BoxCliToolHandoffDecoder(MODEL, catalog);
+  assert.throws(() => { for (const line of tool) decoder.push(`${line}\n`); }, /BOX_CLI_UPSTREAM_REFUSED/);
+});
+
+test("the model's own answer stays an answer even when it reads like a login notice", async () => {
+  const sj = await session();
+  sj.turnStart();
+  const text = "Login expired · Please run /login";
+  const usage = { input_tokens: 2, output_tokens: 9, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const lines = [sj.printInit([], []),
+    ...sj.printStep({ turnId: "0d7f6f8e-8a43-4c55-9d3e-6d7b2f1e4a21", index: 0, model: MODEL,
+      chunks: [{ kind: "text", index: 0, text }],
+      rows: [{ ...row("a1", [{ type: "text", text }]), origin: { kind: "model", model: MODEL } }] },
+    { stopReason: "end_turn", usage }),
+    sj.result({ reason: "answer", answer: text, durationMs: 900, usage }, "end_turn")];
+  const decoder = createBoxCliSseDecoder(MODEL);
+  for (const line of lines) decoder.push(`${line}\n`);
+  assert.equal(decoder.finish().outputTokens, 9);
+  assert.deepEqual(readBoxProfileSignals(`${lines.join("\n")}\n`), []);
 });
