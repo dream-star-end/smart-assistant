@@ -223,6 +223,7 @@ import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } fr
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
+import { useStopShortcut } from "./hooks/useStopShortcut";
 import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
 import { useSystemActionCardActions } from "./hooks/useSystemActionCardActions";
 import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
@@ -1667,9 +1668,14 @@ export function App() {
     setArchiveLoading,
     settleArchiveAnchor,
     sockRef,
-    stopTurn,
     streamText,
     wsSending,
+  });
+
+  const stopShortcutDialog = useStopShortcut({
+    enabled: inWorkspace && sending,
+    turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
+    onStop: stopTurn,
   });
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
@@ -2902,6 +2908,7 @@ export function App() {
         </LazyBoundary>
       )}
       {confirmDialogEl}
+      {stopShortcutDialog}
       {promptTextEl}
       {/* 圈选编辑器是懒块:有 source 才挂载(编辑器自身在 !open 时即重置全部状态、无退场动画,
           条件挂载与原先常驻+open 显隐等价);关闭即卸载,下次打开走已缓存的模块。 */}

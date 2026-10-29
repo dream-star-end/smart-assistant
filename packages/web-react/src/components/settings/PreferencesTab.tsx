@@ -413,7 +413,7 @@ export function BuiltinHotkeysTable() {
   const rows: Array<{ keys: string; action: string }> = [
     { keys: `${mod}+K`, action: '搜索与跳转（项目、会话、文件）' },
     { keys: `${mod}+Shift+O`, action: '新建会话' },
-    { keys: 'Esc', action: '停止生成（生成中）' },
+    { keys: 'Esc', action: '确认停止（生成中）' },
     { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
     { keys: `${mod}+V`, action: '粘贴图片为附件' },
     { keys: `${mod}+F`, action: '会话内查找' },

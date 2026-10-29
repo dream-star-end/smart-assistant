@@ -46,6 +46,7 @@ describe("状态语义表(UI-SPEC §4.3)", () => {
     expect(SIDEBAR_DOT_STATUS).toEqual({
       running: "running",
       unread: "unread",
+      stopped: "stopped",
       error: "failed",
       service_restart: "service_restart",
     });
