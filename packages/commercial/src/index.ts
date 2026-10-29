@@ -5972,7 +5972,6 @@ export async function registerCommercial(
   const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     containerLinkEnabled: containerLinkOn,
-    modelSwitchCost,
     jwtSecret,
     promptQueueEnabled: isPromptQueueV1Enabled(),
     // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).
