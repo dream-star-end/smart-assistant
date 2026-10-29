@@ -227,8 +227,8 @@ describe("useUnreadSessions", () => {
     }
     vi.stubGlobal("Notification", FakeNotification);
     localStorage.setItem(unreadNotifyStorageKey("u1"), "1");
-    const { rerender } = hook({ sessions: [{ id: "s1", runState: "running" }], activeId: "other", userId: "u1" });
-    rerender({ sessions: [{ id: "s1", runState: "idle", lastOutcome: "interrupted", lastErrorCode: "USER_CANCELLED" }], activeId: "other", userId: "u1" });
+    const { rerender } = hook({ sessions: [{ id: "s1", title: "停止通知", runState: "running" }], activeId: "other", userId: "u1" });
+    rerender({ sessions: [{ id: "s1", title: "停止通知", runState: "idle", lastOutcome: "interrupted", lastErrorCode: "USER_CANCELLED" }], activeId: "other", userId: "u1" });
     expect(bodies).toEqual(["已停止"]);
   });
 
