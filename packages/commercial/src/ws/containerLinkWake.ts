@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
+import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import { getContainerLinkHandle, type ContainerLinkHandle, type ContainerLinkRegistry } from "./containerLink.js";
 import { attachContainerTransport } from "./containerLinkTransport.js";
 import { loadBridgeAgentResolver, loadBridgeModelChecker } from "./bridgeExecutionContext.js";
@@ -86,13 +87,15 @@ export class ContainerLinkWake {
         check();
         endpoint = { ...endpoint, bundleRev };
       }
+      const user = execution ? (await deps.pgPool!.query<{ role: string; status: string }>("SELECT role,status FROM users WHERE id=$1", [carrier.uid])).rows[0] : { role: "user", status: "active" };
+      check();
+      if (!user || user.status !== "active") throw new Error("container link user unavailable");
+      if (execution && user.role !== "admin" && await isInMaintenance()) throw new Error("container link under maintenance");
+      check();
       const checker = execution ? await loadBridgeModelChecker(deps, uid) : null;
       check();
       const agents = execution ? await loadBridgeAgentResolver(deps, uid, endpoint.bundleRev) : null;
       check();
-      const user = execution ? (await deps.pgPool!.query<{ role: string }>("SELECT role FROM users WHERE id=$1", [carrier.uid])).rows[0] : { role: "user" };
-      check();
-      if (!user) throw new Error("container link user unavailable");
       const connId = randomUUID();
       socket = await attachContainerTransport({ uid, endpoint, links, deps,
         signal: abort.signal, connId, maxFrameBytes: this.options.maxFrameBytes });

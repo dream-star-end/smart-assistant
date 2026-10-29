@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
+import type { Pool } from "pg";
+import { resetPool, setPoolOverride } from "../db/index.js";
+import { _clearMaintenanceCache } from "../middleware/maintenanceMode.js";
 import { WebSocket, WebSocketServer } from "ws";
 import { ContainerLinkRegistry, getContainerLinkHandle } from "../ws/containerLink.js";
 import { availableExecutors, registerBridgeExecutors, type RecoveryExecutor } from "../ws/bridgeExecutorRegistration.js";
@@ -9,6 +12,17 @@ import { hasBrowserActivity } from "../ws/containerLinkPolicy.js";
 import type { CronOriginExecutor } from "../ws/originTurnInjection.js";
 import type { ResolveContainerEndpoint, UserChatBridgeDeps } from "../ws/userChatBridge.js";
 import type { Queryable } from "../dispatch/turnDispatchStore.js";
+
+// Maintenance deliberately preserves its existing DB-error fail-open contract;
+// unit tests never initialize an external PG connection for that global read.
+beforeEach(() => {
+  _clearMaintenanceCache();
+  setPoolOverride({
+    query: async () => { throw new Error("global settings DB unavailable in unit test"); },
+    end: async () => {},
+  } as unknown as Pool);
+});
+afterEach(async () => { await resetPool(); _clearMaintenanceCache(); });
 
 type WakeOptions = ConstructorParameters<typeof ContainerLinkWake>[0];
 type Endpoint = Awaited<ReturnType<ResolveContainerEndpoint>>;
@@ -35,7 +49,7 @@ async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true)
   await new Promise<void>((resolve) => server.once("listening", resolve));
   let physicalConnections = 0;
   server.on("connection", () => { physicalConnections++; });
-  const pool = { query: async () => ({ rows: [{ role: "user" }], rowCount: 1 }) } as unknown as Queryable;
+  const pool = { query: async () => ({ rows: [{ role: "user", status: "active" }], rowCount: 1 }) } as unknown as Queryable;
   const links = new ContainerLinkRegistry(pool, undefined, { heartbeatMs: 10_000 });
   const endpoint: Endpoint = { host: "127.0.0.1", port: (server.address() as { port: number }).port,
     containerId: carrier.containerId, bundleRev: "endpoint-stale-rev" };
@@ -75,7 +89,6 @@ async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true)
       handle.onStreamsChanged = cleanup;
       user.on("close", () => { handle.detach(); cleanup(); });
       if (register) install(socket);
-      handle.activate();
     },
   });
   return {
@@ -236,5 +249,53 @@ test("origin registration wait fails on deadline or physical shutdown", { timeou
     await rig.links.shutdown();
     await waiting;
     lease.release();
+  } finally { await rig.stop(); }
+});
+
+
+test("disabled users cannot acquire an execution context", { timeout: 5000 }, async () => {
+  let roleReads = 0;
+  const disabledPool = { query: async () => {
+    roleReads++;
+    return { rows: [{ role: "user", status: "disabled" }], rowCount: 1 };
+  } } as unknown as UserChatBridgeDeps["pgPool"];
+  const rig = await fixture({ pgPool: disabledPool });
+  try {
+    assert.equal(await rig.wake.acquire(carrier, { execution: true }), null);
+    assert.equal(roleReads, 1);
+    assert.equal(rig.dials(), 0);
+    assert.equal(rig.starts(), 0);
+    assert.equal(rig.maps.origin.size, 0);
+    assert.deepEqual(rig.links.snapshots(), []);
+  } finally { await rig.stop(); }
+});
+
+test("the same disabled user may acquire a control-only link without execution grants", { timeout: 5000 }, async () => {
+  let roleReads = 0;
+  let grantLoads = 0;
+  const disabledPool = { query: async () => {
+    roleReads++;
+    return { rows: [{ role: "user", status: "disabled" }], rowCount: 1 };
+  } } as unknown as UserChatBridgeDeps["pgPool"];
+  const rig = await fixture({
+    pgPool: disabledPool,
+    loadAllowedModelChecker: async () => { grantLoads++; return () => true; },
+    loadAgentModelResolver: async () => { grantLoads++; return () => "model"; },
+    readContainerLinkBundleRev: async () => { throw new Error("control must not need bundle execution authority"); },
+  });
+  try {
+    const lease = await rig.wake.acquire(carrier, { execution: false });
+    assert.ok(lease);
+    assert.equal(rig.dials(), 1);
+    assert.equal(rig.starts(), 1);
+    assert.equal(roleReads, 0, "control delivery does not reauthorize a new user execution");
+    assert.equal(grantLoads, 0);
+    assert.equal(rig.contexts[0]!.checker, null);
+    assert.equal(rig.contexts[0]!.agents, null);
+    assert.equal(getContainerLinkHandle(lease.socket)!.recoveryOnly, true);
+    assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
+    assert.equal(rig.activity(), 0);
+    lease.release();
+    assert.deepEqual(rig.links.snapshots(), []);
   } finally { await rig.stop(); }
 });

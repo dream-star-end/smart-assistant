@@ -738,6 +738,21 @@ test("headless origin injection loads the actual bundle authorization context an
   }
 });
 
+test("a disabled user's offline origin callback is refused before admission or physical delivery", async () => {
+  const rig = await originLinkRig();
+  try {
+    await rig.session("origin-disabled-user");
+    await rig.pool.query("UPDATE users SET status='disabled' WHERE id=42");
+    const result = await rig.bridge.injectCronOriginTurn(rig.input("origin-disabled-user", "dlgcb-disabled-user-1"));
+    assert.notEqual(result.kind, "injected");
+    assert.equal(rig.messages.length, 0);
+    assert.equal(rig.sockets.length, 0, "a disabled user must not open a new execution transport");
+    assert.equal((await rig.pool.query("SELECT count(*)::int AS n FROM turn_dispatches")).rows[0].n, 0);
+    assert.equal((await rig.pool.query("SELECT messages FROM client_sessions WHERE id='origin-disabled-user'")).rows[0].messages, "[]");
+    assert.deepEqual(rig.errors, []);
+  } finally { await rig.stop(); }
+});
+
 test("a real restarted scheduler injects its due cron offline and consumes the same occurrence once", async () => {
   const rig = await originLinkRig();
   const home = await mkdtemp(join(tmpdir(), "origin-link-cron-"));

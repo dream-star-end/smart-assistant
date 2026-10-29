@@ -29,6 +29,7 @@ import { persistGatewayLiveFrame } from "../../db/liveTurnFrames.js";
 import { createPgSessionsBackend } from "../../db/pgSessionsBackend.js";
 import { buildSessionSnapshot } from "../../db/sessionSnapshot.js";
 import { createLogger } from "../../logging/logger.js";
+import { _clearMaintenanceCache } from "../../middleware/maintenanceMode.js";
 import { AuthoritySigner } from "../../ws/authoritySigner.js";
 import { resolveContainerLinkEndpoint } from "../../ws/containerLinkEndpoint.js";
 import { BRIDGE_WS_PATH, createUserChatBridge, type CronOriginInjectInput, type UserChatBridgeDeps } from "../../ws/userChatBridge.js";
@@ -69,8 +70,10 @@ function catalog(): ModelCatalogCache {
 // Private schema, actual admission/receipt/frame SQL, and separate transaction
 // connections. A shared Client would hide the concurrent admission row lock.
 const SCHEMA_SQL = `
-  CREATE TABLE users(id bigint PRIMARY KEY,role text,credits bigint);
-  INSERT INTO users VALUES(42,'user',1000000);
+  CREATE TABLE users(id bigint PRIMARY KEY,role text,credits bigint,status text NOT NULL DEFAULT 'active');
+  INSERT INTO users(id,role,credits) VALUES(42,'user',1000000);
+  CREATE TABLE system_settings(key text PRIMARY KEY,value jsonb NOT NULL,description text,
+    updated_at timestamptz DEFAULT now(),updated_by bigint);
   CREATE TABLE user_subscriptions(user_id bigint,status text,period_end timestamptz,period_credits bigint);
   CREATE TABLE org_memberships(user_id bigint,org_id bigint,status text,billing_enabled boolean);
   CREATE TABLE orgs(id bigint,credits bigint,status text);
@@ -139,6 +142,7 @@ export async function originLinkRig() {
   await pool.query(SCHEMA_SQL);
   await pool.query(`INSERT INTO agent_containers VALUES(7,42,'active','v5','docker','127.0.0.1',$1,NULL,'origin-fixture',$2)`, [port, ORIGIN_BUNDLE_REV]);
   setPoolOverride(pool);
+  _clearMaintenanceCache();
 
   container.on("connection", socket => {
     sockets.push(socket);
@@ -273,6 +277,7 @@ export async function originLinkRig() {
       await new Promise<void>(resolve => gateway.close(() => resolve()));
       await new Promise<void>(resolve => container.close(() => resolve()));
       resetLiveUnitCheckpointScheduler();
+      _clearMaintenanceCache();
       await resetPool();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();
