@@ -1081,15 +1081,67 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       return Object.assign(id, { unref() {} }) as unknown as NodeJS.Timeout
     }) as typeof setInterval
     globalThis.clearInterval = ((handle: NodeJS.Timeout) => {
-      const idx = timers.findIndex((t) => t.id === (handle as unknown as number))
+      const idx = timers.findIndex((t) => t.id === Number(handle))
       if (idx >= 0) timers.splice(idx, 1)
     }) as typeof clearInterval
 
+    let fileP: Promise<unknown> | undefined
+    let fileRunner: HangRunner | undefined
     let idleP: Promise<unknown> | undefined
     let waitP: Promise<unknown> | undefined
     let idleRunner: HangRunner | undefined
     let waitRunner: HangRunner | undefined
     try {
+      // INC-20261029-GEMINI-FILE-TIMEOUT: exercise the same live submit watchdog
+      // without changing this gate's pinned set of behavioral test leaves.
+      fileRunner = new HangRunner()
+      {
+        const sm = new SessionManager({
+          version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+          auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' },
+        } as any)
+        ;(sm as unknown as { _saveResumeMap: () => void })._saveResumeMap = () => {}
+        const session = makeCcbSession(fileRunner, 'agent:main:cron:dm:file-timeout:test')
+        let fileStartedAt: number | undefined
+        Object.defineProperty(session.runner, 'idleWatchdogActivityAt', {
+          get: () => fileStartedAt ?? session.runner.lastActivityAt,
+        })
+        const errors: string[] = []
+        let settled = false
+        fileP = sm.submit(session, 'file work', (e: any) => {
+          if (e.kind === 'error') errors.push(String(e.error))
+        }).finally(() => { settled = true })
+        const timer = await waitForLivenessTimer(timers, fileP)
+        now += 2 * IDLE_TIMEOUT_TOOL_MS
+        session.runner.lastActivityAt = now
+        timer.fn()
+        await new Promise((resolve) => setImmediate(resolve))
+        assert.equal(settled, false, 'model waiting before ACTIVE retains the existing policy')
+        fileStartedAt = now
+        now += 1_548
+        fileStartedAt = undefined
+        session.runner.lastActivityAt = now
+        timer.fn()
+        assert.equal(settled, false, 'a completed 1548ms file must not leave a deadline')
+
+        const persistedCodes: string[] = []
+        const persist = session._persistActiveTurn
+        assert.equal(typeof persist, 'function')
+        session._persistActiveTurn = (...args: [string, string, string, string?]) => {
+          persistedCodes.push(args[2])
+          return persist(...args)
+        }
+        fileStartedAt = now
+        now += IDLE_TIMEOUT_TOOL_MS + 1
+        session.runner.lastActivityAt = now
+        timer.fn()
+        await fileP
+        assert.deepEqual(persistedCodes, ['LIVENESS_TIMEOUT'], 'use the existing durable system-timeout path exactly once')
+        assert.ok(errors.some((message) => message.includes('无输出') || message.includes('免单')))
+        assert.equal(timers.some((entry) => entry.ms === 15_000), false, 'terminal clears the watchdog')
+        reportContract('C-sm-bounded-file-heartbeat', { code: 'LIVENESS_TIMEOUT', count: 1 }, { code: persistedCodes[0], count: persistedCodes.length })
+      }
+      timers.length = 0
       const idleEvents: string[] = []
       const smIdle = new SessionManager({
         version: 1,
@@ -1173,6 +1225,11 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       assert.equal(actual.waitingSettledAfter2h, expected.waitingSettledAfter2h)
     } finally {
       try {
+        fileRunner?.interrupt()
+      } catch {
+        // drain
+      }
+      try {
         idleRunner?.interrupt()
       } catch {
         // drain
@@ -1183,7 +1240,7 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
         // drain
       }
       await awaitBounded(
-        Promise.all([idleP ?? Promise.resolve(), waitP ?? Promise.resolve()]),
+        Promise.all([fileP ?? Promise.resolve(), idleP ?? Promise.resolve(), waitP ?? Promise.resolve()]),
       )
       Date.now = origNow
       globalThis.setInterval = origSetInterval
