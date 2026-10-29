@@ -1167,6 +1167,30 @@ same_supervised_process() { # <pid> <starttime>; stopped supervisors are not hea
   [[ "$start" == "$2" ]]
 }
 
+mutation_process_live() { # <role> <live|supervised> <pid> <starttime> [anchor-release-file]
+  local role="$1" mode="$2" pid="$3" expected="$4" state="" start="" reason=""
+  # Capture the SAME read which makes the fencing decision, before any cleanup
+  # can kill a different supervisor and make it appear to be the original loss.
+  if ! read -r state start < <(process_state_start "$pid"); then
+    reason=proc-read-failed
+  elif [[ "$start" != "$expected" ]]; then
+    reason=start-mismatch
+  else
+    case "$state" in
+      Z|X|x) reason=dead ;;
+      T|t) [[ "$mode" == supervised ]] && reason=stopped ;;
+    esac
+  fi
+  [[ -n "$reason" ]] || return 0
+  # Preserve sentinel-first / release-file-second ordering at normal handoff.
+  [[ "$role" == anchor && -n "${5:-}" && -e "$5" ]] && return 0
+  # Only bounded, controlled identifiers; never argv, environment or credentials.
+  printf 'MUTATION_PROCESS_LOST time=%s observer=%s role=%s mode=%s pid=%s expected_start=%s state=%s actual_start=%s reason=%s\n' \
+    "$EPOCHREALTIME" "$BASHPID" "$role" "$mode" "$pid" "$expected" \
+    "${state:-missing}" "${start:-missing}" "$reason" >&2
+  return 1
+}
+
 terminate_exact_process() { # <pid> <starttime>; never signal a reused pid
   local pid="$1" start="$2" i
   [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && -n "$start" ]] || return 0
@@ -1818,8 +1842,8 @@ mutation_lease_live() {
   [[ "$MUTATION_LEASE_ACTIVE" == 1 ]] || return 1
   [[ -n "$MUTATION_LEASE_PID" && -n "$MUTATION_LEASE_START" \
     && -n "$MUTATION_LEASE_TTL_PID" && -n "$MUTATION_LEASE_TTL_START" ]] || return 1
-  same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
-    && same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
+  mutation_process_live lease-ssh live "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+    && mutation_process_live lease-ttl live "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START"
 }
 
 # 翻转/激活类关键点前活体断言:后台 ssh 死 → 远端 flock 已随通道关闭释放,自愈 host-action
@@ -11483,11 +11507,10 @@ run_mutation_lane_supervised() { # <function> [args...]
     set +m
     close_mutation_lane_inherited_locks
     : >"$ready"
-    while same_supervised_process "$outer_pid" "$outer_start" \
-        && same_supervised_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
-        && same_supervised_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
-        && { same_supervised_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
-          || [[ -e "$anchor_release" ]]; }; do
+    while mutation_process_live outer supervised "$outer_pid" "$outer_start" \
+        && mutation_process_live lease-ssh supervised "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
+        && mutation_process_live lease-ttl supervised "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
+        && mutation_process_live anchor supervised "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" "$anchor_release"; do
       # Sentinel first, release file second. The sentinel exits only after the
       # leader has written the release file, so a sentinel seen gone here with
       # the file present is the controlled end. The other order could read "no

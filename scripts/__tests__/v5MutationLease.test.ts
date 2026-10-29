@@ -354,6 +354,7 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
       120_000,
     )
     assert.match(out.stdout, /LANES=40 BAD=0/, `${out.stdout}\n${out.stderr}`)
+    assert.doesNotMatch(out.stderr, /MUTATION_PROCESS_LOST/, 'normal sentinel release is not a loss')
   })
 
   test('in-flight arm durability failure rejects the payload before any mutation starts', async () => {
@@ -522,6 +523,72 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
       await killRecordedProcesses(commandPids, leasePidFile)
     }
   })
+
+  test('a failed process read is recorded once and remains fail-closed', async () => {
+    const fx = await fixture(30)
+    const calls = path.join(fx.dir, 'read-calls')
+    const out = orchestrate([
+      `process_state_start() { echo read >>"${calls}"; return 42; }`,
+      'mutation_process_live lease-ssh supervised 424242 123; echo CHECK_RC=$?',
+    ].join('\n'), fx.env)
+    assert.match(out.stdout, /CHECK_RC=1/)
+    assert.equal(await readFile(calls, 'utf8'), 'read\n', 'failed reads must not be retried into success')
+    assert.match(out.stderr, /role=lease-ssh .*pid=424242 expected_start=123 state=missing actual_start=missing reason=proc-read-failed/)
+  })
+
+  for (const [role, signal] of [
+    ['outer', 'SIGSTOP'], ['lease-ssh', 'SIGSTOP'], ['lease-ttl', 'SIGSTOP'],
+    ['anchor', 'SIGSTOP'], ['lease-ssh', 'SIGKILL'], ['lease-ttl', 'SIGKILL'],
+  ] as const) {
+    test(`first ${role} ${signal} evidence precedes cleanup and preserves crash-stop`, async () => {
+      const fx = await fixture(30)
+      const started = path.join(fx.dir, 'started')
+      const evidence = path.join(fx.dir, 'evidence')
+      const ids = path.join(fx.dir, 'ids')
+      const commandPids = path.join(fx.dir, 'payload-pids')
+      const leasePids = path.join(fx.dir, 'lease-pids')
+      const heartbeat = path.join(fx.dir, 'heartbeat')
+      const child = spawnOrchestrated([
+        `exec 2>"${evidence}"`,
+        'heartbeat_lane() {',
+        `  printf '%s\\n' "$BASHPID" >"${commandPids}"`,
+        '  read -r anchor_pid anchor_start <"$anchor_ready"',
+        `  printf '%s %s %s %s\\n' "$outer_pid" "$MUTATION_LEASE_PID" "$MUTATION_LEASE_TTL_PID" "$anchor_pid" >"${ids}"`,
+        `  : >"${started}"`,
+        `  while :; do printf '%s\\n' "$RANDOM" >"${heartbeat}"; sleep 0.05; done`,
+        '}',
+        'acquire_production_mutation_lease 5 >/dev/null',
+        `printf '%s %s\\n' "$MUTATION_LEASE_PID" "$MUTATION_LEASE_TTL_PID" >"${leasePids}"`,
+        'run_mutation_lane_supervised heartbeat_lane',
+        'rc=$?', 'release_production_mutation_lease', 'exit "$rc"',
+      ].join('\n'), fx.env)
+      let target: number | undefined
+      try {
+        assert.equal(await waitUntil(() => readFile(started).then(() => true).catch(() => false), 5_000), true)
+        const pids = (await readFile(ids, 'utf8')).trim().split(/\s+/).map(Number)
+        target = pids[['outer', 'lease-ssh', 'lease-ttl', 'anchor'].indexOf(role)]
+        assert.ok(target && Number.isSafeInteger(target) && target > 1)
+        process.kill(target!, signal)
+        assert.equal(await waitUntil(() => recordedProcessesExited(commandPids), 3_000), true, 'lane must stop immediately, not at TTL')
+        const frozen = await readFile(heartbeat, 'utf8')
+        await new Promise(resolve => setTimeout(resolve, 250))
+        assert.equal(await readFile(heartbeat, 'utf8'), frozen, 'no payload mutations after fencing')
+        assert.equal(await waitUntil(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000), true)
+        if (role === 'outer') process.kill(target!, 'SIGCONT')
+        assert.equal(await waitForExit(child, 8_000), true)
+        assert.equal(child.exitCode, 86)
+        assert.equal(await readFile(fx.laneMarker).then(() => true).catch(() => false), true)
+        const first = (await readFile(evidence, 'utf8')).split('\n').find(line => line.startsWith('MUTATION_PROCESS_LOST '))
+        assert.ok(first, 'first-loss evidence must survive runtime directory removal')
+        assert.match(first, new RegExp(`role=${role} .*pid=${target} `))
+        if (signal === 'SIGSTOP') assert.match(first, /state=T .*reason=stopped/)
+      } finally {
+        if (target && signal === 'SIGSTOP') { try { process.kill(target, 'SIGCONT') } catch { /* gone */ } }
+        child.kill('SIGKILL')
+        await killRecordedProcesses(commandPids, leasePids)
+      }
+    })
+  }
 
   test('lane leader death after payload completion cannot wedge authorization or clear evidence', async () => {
     const fx = await fixture(30)
