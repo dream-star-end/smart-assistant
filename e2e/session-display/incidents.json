@@ -8766,6 +8766,43 @@
         "reason": "修复是所有引擎共用 TOOLS 段里的行为守则：确定性部分（守则进入每个引擎的提示词）由 unit 覆盖；模型是否遵守是非确定的，个人版 canary 无法稳定复现「搜索兄弟会话目录并提议删除」，没有可接进 runner 的 browser/live proof。上线后用真实会话发「delete test」人工核对一次。",
         "since": "2026-10-29"
       }
+    },
+    {
+      "id": "INC-20261029-RENAME-LIST-RACE",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "个人版/商业版 #1240：体验官重命名会话第一次没生效。侧栏列表每 60 秒轮询、窗口每次获得焦点都会重拉并以服务端为准合并；改名前已发出的列表请求在乐观改名之后返回旧标题，把新标题盖回去。改为 PATCH 未落地前钉住本地标题，落地后按服务端 updatedAt 记为已确认，更早的列表快照不再覆盖。",
+      "rootFixCommit": "5ee2cad6",
+      "coverageCommits": [
+        "4f0de813"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ui-lag.node-test.mjs",
+          "assertion": "#1240 rename while a session-list refresh is in flight: the first rename sticks"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useSessionList.test.tsx",
+          "assertion": "PATCH 未落地时在飞的旧列表回来，不把乐观标题盖回去"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261029-HIDDEN-DRAWER-CLICK",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "个人版/商业版 #1240：体验官在手机宽度与桌面宽度之间切换时，输入框第一次点击没有反应。窄屏打开的会话抽屉是 Radix 模态 Sheet，靠 md:hidden 隐藏；窗口拉宽后抽屉看不见但模态仍开着，下一次点击只关掉了这个隐形抽屉。改为视口到 md 即关闭抽屉，md 以上不以打开态渲染。",
+      "rootFixCommit": "4f0de813",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ui-lag.node-test.mjs",
+          "assertion": "#1240 drawer left open below md, window widened: the first click on the composer focuses it"
+        }
+      ]
     }
   ]
 }

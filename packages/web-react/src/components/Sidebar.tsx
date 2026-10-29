@@ -429,17 +429,23 @@ export function Sidebar({
     return list.length ? ([["", list]] as [string, Session[]][]) : [];
   }, [filtered, pinnedIds, searching, runningIds, knownProjectIds]);
 
+  // onSearchMessages 每次 App 重渲都是新函数(流式回合里每帧一次):不进依赖,否则每帧都重跑本 effect——
+  // 清空命中触发整栏二次重渲,且防抖计时被反复重置,回合进行中消息搜索迟迟不出(#1240)。
+  const searchMessagesRef = useRef(onSearchMessages);
+  searchMessagesRef.current = onSearchMessages;
+  const canSearchMessages = Boolean(onSearchMessages);
   useEffect(() => {
     const needle = q.trim();
-    if (!needle || !onSearchMessages) {
-      setSearchHits([]);
+    const search = searchMessagesRef.current;
+    if (!needle || !canSearchMessages || !search) {
+      setSearchHits((cur) => (cur.length === 0 ? cur : []));
       setSearchRemote("idle");
       return;
     }
     setSearchRemote("loading");
     const ac = new AbortController();
     const timer = window.setTimeout(() => {
-      void onSearchMessages(needle, ac.signal, activeSearchProjectId, archivedExpanded)
+      void search(needle, ac.signal, activeSearchProjectId, archivedExpanded)
         .then((hits) => {
           if (ac.signal.aborted) return;
           setSearchHits(hits);
@@ -456,7 +462,7 @@ export function Sidebar({
       window.clearTimeout(timer);
       ac.abort();
     };
-  }, [q, onSearchMessages, activeSearchProjectId, archivedExpanded]);
+  }, [q, canSearchMessages, activeSearchProjectId, archivedExpanded]);
 
   const displayProjects = useMemo(
     () =>
@@ -552,20 +558,45 @@ export function Sidebar({
     emitReorder(next);
   };
 
-  const onToggleSelected = (id: string) => {
-    setSelectedIds((cur) => {
-      const next = new Set(cur);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-    setMultiSelect(true);
-  };
-
   const clearMulti = () => {
     setSelectedIds(new Set());
     setMultiSelect(false);
   };
+
+  // 会话行(memo)拿到的回调必须是稳定引用:App 每帧都给新函数，直接透传会让每一行跟着每帧重渲(#1240)。
+  // 经 ref 调到最新的回调;有无某个回调(决定菜单项显隐)仍由调用处按原 prop 判断。
+  const rowCallbacksRef = useRef({
+    onSelect, onRename, onDelete, onTogglePin, onMoveToProject, onCreateProjectFromSession, onArchive, onMarkRead,
+  });
+  rowCallbacksRef.current = {
+    onSelect, onRename, onDelete, onTogglePin, onMoveToProject, onCreateProjectFromSession, onArchive, onMarkRead,
+  };
+  const rowActions = useMemo(() => {
+    const cb = () => rowCallbacksRef.current;
+    return {
+      select: (id: string) => cb().onSelect(id),
+      rename: (s: Session) => cb().onRename(s),
+      remove: (s: Session) => cb().onDelete(s),
+      togglePin: (s: Session) => cb().onTogglePin?.(s),
+      moveToProject: (s: Session, projectId: string | null) => cb().onMoveToProject?.(s, projectId),
+      createProjectFromSession: (s: Session) => cb().onCreateProjectFromSession?.(s),
+      archive: (s: Session) => cb().onArchive?.(s),
+      markRead: (id: string) => cb().onMarkRead?.(id),
+      toggleSelected: (id: string) => {
+        setSelectedIds((cur) => {
+          const next = new Set(cur);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+        setMultiSelect(true);
+      },
+      enterMultiSelect: (id: string) => {
+        setMultiSelect(true);
+        setSelectedIds((cur) => new Set(cur).add(id));
+      },
+    };
+  }, []);
 
   const hasAccountMenu = Boolean(
     onOpenManage ||
@@ -757,31 +788,33 @@ export function Sidebar({
     }
     if (item.kind === "session") {
       const s = item.session;
+      const live = liveTerminal?.(s.id);
+      const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
       return (
         <SessionRow
           session={s}
           active={s.id === activeId}
           projects={orderedProjects}
           indent={item.indent}
-          isSending={isSending}
-          liveTerminal={liveTerminal}
-          now={now}
-          onSelect={onSelect}
-          onRename={onRename}
-          onDelete={onDelete}
-          onTogglePin={onTogglePin}
-          onMoveToProject={onMoveToProject}
-          onCreateProjectFromSession={onCreateProjectFromSession}
-          onArchive={onArchive}
-          onMarkRead={onMarkRead}
+          running={running}
+          lastOutcome={live?.lastOutcome ?? s.lastOutcome}
+          lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+          now={running ? now : 0}
+          onSelect={rowActions.select}
+          onRename={rowActions.rename}
+          onDelete={rowActions.remove}
+          onTogglePin={onTogglePin ? rowActions.togglePin : undefined}
+          onMoveToProject={onMoveToProject ? rowActions.moveToProject : undefined}
+          onCreateProjectFromSession={
+            onCreateProjectFromSession ? rowActions.createProjectFromSession : undefined
+          }
+          onArchive={onArchive ? rowActions.archive : undefined}
+          onMarkRead={onMarkRead ? rowActions.markRead : undefined}
           unread={unreadIds?.has(s.id)}
           multiSelect={multiSelect}
           selected={selectedIds.has(s.id)}
-          onToggleSelected={onToggleSelected}
-          onEnterMultiSelect={(id) => {
-            setMultiSelect(true);
-            setSelectedIds((cur) => new Set(cur).add(id));
-          }}
+          onToggleSelected={rowActions.toggleSelected}
+          onEnterMultiSelect={rowActions.enterMultiSelect}
           allowDrag={!coarse}
           highlightQuery={searching ? q : undefined}
           projectHint={

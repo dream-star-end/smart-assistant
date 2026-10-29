@@ -403,6 +403,11 @@ export function App() {
   // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
   const isMdViewport = useMdViewport();
   const isWideViewport = useWideViewport();
+  // 侧栏抽屉只属于窄屏:拉宽到 md 时 CSS(md:hidden)藏起了它，但 Radix 模态仍开着，
+  // 下一次点输入框只会关掉这个看不见的抽屉(#1240「首次点击无响应」)。跨过 md 即关。
+  useEffect(() => {
+    if (isMdViewport) setMobileNavOpen(false);
+  }, [isMdViewport]);
   const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
   const [paneSheetOpen, setPaneSheetOpen] = useState(false);
   const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
@@ -2104,7 +2109,7 @@ export function App() {
 
       {/* 移动：侧栏抽屉。Sheet 原语提供遮罩/Escape/焦点陷阱。 */}
       <Sheet
-        open={mobileNavOpen}
+        open={mobileNavOpen && !isMdViewport}
         onOpenChange={setMobileNavOpen}
         side="left"
         srTitle="会话导航"
