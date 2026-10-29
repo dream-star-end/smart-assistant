@@ -8813,6 +8813,51 @@
       ]
     },
     {
+      "id": "INC-20261029-DELEGATE-PREFLIGHT-QUOTA",
+      "occurredAt": "2026-10-29",
+      "severity": "P1",
+      "symptom": "本地模型/目录预检未起runner且未计费的拒绝仍消耗每turn委派额度，阻断后续合法委派。",
+      "rootFixCommit": "b88a1a6f",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/memberDelegateLimit.test.ts",
+          "assertion": "preflight quota preserves hidden and member limits"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "leaves all member attempts available"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "[delegate-preflight-quota] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261029-BOX-AGENT-TEMPERATURE",
+      "occurredAt": "2026-10-29",
+      "severity": "P1",
+      "symptom": "Box Agent关闭thinking时发送默认temperature=1，被门禁在预扣前误拒绝为BOX_PARAMETER_UNMAPPED。",
+      "rootFixCommit": "3cb52acf",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRequestGate.test.ts",
+          "assertion": "Box default temperature is absent from text and tool compilation without weakening gates"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "[box-agent-default-temperature] PASS"
+        }
+      ]
+    },
+    {
       "id": "INC-20261030-TAPE-JOB-RETRY",
       "occurredAt": "2026-10-30",
       "severity": "P1",

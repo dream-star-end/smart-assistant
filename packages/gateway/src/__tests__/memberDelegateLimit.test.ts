@@ -282,3 +282,46 @@ describe('委派回传 output 无损', () => {
     assert.equal(result.output.length, 6000, 'review 输出必须全量保留')
   })
 })
+
+
+describe('preflight quota preserves hidden and member limits', () => {
+  for (const target of ['coding-assistant', 'hidden-reviewer']) {
+    it(`missing ${target} preflight does not consume quota`, async () => {
+      process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN = '1'
+      process.env.OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN = '1'
+      const gw = makeGateway()
+      const getConfig = gw._getAgentsConfig
+      gw._getAgentsConfig = async () => {
+        const cfg = await getConfig()
+        return { ...cfg, agents: cfg.agents.filter((a: { id: string }) => a.id !== target) }
+      }
+      for (let i = 0; i < 4; i++) {
+        assert.equal((await delegate(gw, target, memberBody())).status, 404)
+      }
+      gw._getAgentsConfig = getConfig
+      assert.equal((await delegate(gw, target, memberBody())).status, 200)
+      assert.equal((await delegate(gw, target, memberBody())).status, 429)
+    })
+  }
+
+  it('spawned submit failure still consumes member quota', async () => {
+    process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN = '1'
+    const gw = makeGateway()
+    let submitted = 0
+    gw.sessions.submit = async () => { submitted++; throw new Error('started runner failed') }
+    await delegate(gw, 'coding-assistant', memberBody())
+    assert.equal(submitted, 1)
+    assert.equal((await delegate(gw, 'coding-assistant', memberBody())).status, 429)
+    assert.equal(submitted, 1)
+  })
+
+  it('concurrent valid members share one synchronous quota acquisition', async () => {
+    process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN = '1'
+    const gw = makeGateway()
+    const results = await Promise.all([
+      delegate(gw, 'coding-assistant', memberBody()),
+      delegate(gw, 'coding-assistant', memberBody()),
+    ])
+    assert.deepEqual(results.map(r => r.status).sort(), [200, 429])
+  })
+})
