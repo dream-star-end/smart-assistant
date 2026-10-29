@@ -128,7 +128,8 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
                 }
                 if (reload) await page.reload(); else await page.goto(preview.url);
                 if (shape === "legacy-frozen") await page.getByText(partial, { exact: true }).waitFor();
-                else await page.getByText("资料暂未处理完成", { exact: true }).waitFor();
+                // W3:错误卡是懒加载块(错误目录不进首屏),可能比正文晚一帧出现;等卡出来再数。
+                await page.getByText("资料暂未处理完成", { exact: true }).waitFor();
                 const body = await page.locator("body").innerText();
                 assert.equal(await page.getByText("资料暂未处理完成", { exact: true }).count(), 1);
                 // W3:卡片正文用错误目录的人话(request_too_large → size)。
