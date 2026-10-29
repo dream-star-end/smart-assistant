@@ -43,6 +43,7 @@ import {
   parseUsageBoardProjectQuery,
   pgUsageBoardProjectSql,
 } from "../billing/boardProjectAttribution.js";
+import { loadLedgerRowContext } from "../billing/ledgerRowContext.js";
 import {
   verifyCommercialJwtSync,
   verifyCommercialJwtSyncDetailed,
@@ -2092,6 +2093,8 @@ export async function handleGetMyUsage(
     limit: ledgerLimit,
     before: ledgerBeforeRaw && ledgerBeforeRaw !== "" ? ledgerBeforeRaw : undefined,
   });
+  // #1237:对话扣费行补模型展示名 + 会话标题,前端不再展示内部 memo(cost=<n>)。
+  const ledgerContext = await loadLedgerRowContext(query, uid, ledgerResult.rows);
   const ledger = {
     rows: ledgerResult.rows.map((r) => ({
       id: r.id,
@@ -2102,6 +2105,8 @@ export async function handleGetMyUsage(
       ref_type: r.ref_type,
       ref_id: r.ref_id,
       memo: r.memo,
+      model_name: ledgerContext.get(r.id)?.model_name ?? null,
+      session_title: ledgerContext.get(r.id)?.session_title ?? null,
       created_at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
     })),
     next_before: ledgerResult.next_before,

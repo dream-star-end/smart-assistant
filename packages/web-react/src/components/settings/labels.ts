@@ -11,6 +11,14 @@ export const LEDGER_REASON_LABEL: Record<string, string> = {
   promotion: "活动赠送",
   topup: "充值到账",
   topup_test: "测试充值",
+  // 写侧真实 reason(credit_ledger CHECK)。chat 是对话扣费的唯一写法(proxyBilling spendTwoBucket)。
+  chat: "对话扣费",
+  agent_chat: "智能体对话扣费",
+  agent_subscription: "智能体订阅",
+  admin_adjust: "人工调整",
+  minimax_media: "媒体生成",
+  image_generation: "图片生成",
+  pack: "加量包到账",
   charge: "对话扣费",
   usage: "对话扣费",
   usage_charge: "对话扣费",
@@ -22,6 +30,21 @@ export const LEDGER_REASON_LABEL: Record<string, string> = {
   agent_open: "开通智能体",
   muse_media: "Muse 图片/视频",
 };
+
+/** 退费 memo `waive:<code>;turn:<hash>` 的 code → 用户说明(#1237)。 */
+const WAIVE_MEMO_LABEL: Record<string, string> = {
+  idle_timeout: "对话超时未完成，已退回",
+  no_response: "模型未返回内容，已退回",
+};
+
+/** 对话扣费行的次级文案:模型 · 会话;写侧内部 memo(cost=<n>)不给用户看。 */
+function usageRowMemo(
+  row: Pick<UsageLedgerRow, "memo" | "model_name" | "session_title">,
+): string | null {
+  const parts = [row.model_name, row.session_title].filter((s): s is string => !!s?.trim());
+  if (parts.length > 0) return parts.join(" · ");
+  return row.memo && /^cost=\d+$/.test(row.memo) ? null : row.memo;
+}
 
 export function ledgerReasonLabel(reason: string): string {
   return LEDGER_REASON_LABEL[reason] || reason;
@@ -43,9 +66,15 @@ export function ledgerReasonView(
 
 /** Subscription replacement and expiry share a ledger reason; the order reference distinguishes them. */
 export function ledgerRowView(
-  row: Pick<UsageLedgerRow, "reason" | "workload" | "ref_type" | "ref_id" | "memo">,
+  row: Pick<UsageLedgerRow, "reason" | "workload" | "ref_type" | "ref_id" | "memo"> &
+    Partial<Pick<UsageLedgerRow, "model_name" | "session_title">>,
 ): { label: string; raw: string | null; memo: string | null } {
   const reason = ledgerReasonView(row.reason, row.workload);
+  const waive = row.reason === "refund" ? /^waive:([a-z_]+)(;|$)/.exec(row.memo ?? "") : null;
+  if (waive) return { ...reason, memo: WAIVE_MEMO_LABEL[waive[1]] ?? "未完成的对话，已退回" };
+  if (row.ref_type === "usage_record" && row.reason !== "refund") {
+    return { ...reason, memo: usageRowMemo(row) };
+  }
   if (row.reason !== "subscription_expire" || row.workload === "auto_dream") {
     return { ...reason, memo: row.memo };
   }
@@ -137,11 +166,25 @@ export function formatReportBucket(bucket: string, window: UsageReportWindow): s
   return m ? m[1] : bucket;
 }
 
-/** ISO 时间 → 简洁本地展示（M月D日 HH:mm）。非法时间返回空串。 */
+const SHORT_TIME_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Shanghai",
+  month: "numeric",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+/**
+ * ISO 时间 → 北京时间简洁展示（M月D日 HH:mm）。非法时间返回空串。
+ * 固定 Asia/Shanghai(#1237):与收支报表的日桶(usageReport.ts)同一时区，
+ * 不随浏览器时区漂移——美西时区浏览器曾把当天 11:12 的扣费显示成前一天 20:12。
+ */
 export function shortTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  return `${d.getMonth() + 1}月${d.getDate()}日 ${String(d.getHours()).padStart(2, "0")}:${String(
-    d.getMinutes(),
-  ).padStart(2, "0")}`;
+  const p: Record<string, string> = {};
+  for (const x of SHORT_TIME_FMT.formatToParts(d)) p[x.type] = x.value;
+  const pad = (v: string | undefined) => (v ?? "").padStart(2, "0");
+  return `${p.month}月${p.day}日 ${pad(p.hour)}:${pad(p.minute)}`;
 }
