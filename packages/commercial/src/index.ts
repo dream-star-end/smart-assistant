@@ -1,3 +1,4 @@
+import { resolveContainerLinkEndpoint } from "./ws/containerLinkEndpoint.js";
 import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContainer.js";
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
 import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
@@ -5861,6 +5862,8 @@ export async function registerCommercial(
   const containerLinkOn = containerLinkEnabled(flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined);
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     containerLinkEnabled: containerLinkOn,
+    resolveContainerLinkEndpoint: (uid, cid) => resolveContainerLinkEndpoint(getPool(), runtimeChannel, uid, cid),
+    containerLinkRecovery: { channel: runtimeChannel },
     modelSwitchCost,
     jwtSecret,
     issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
@@ -7110,6 +7113,7 @@ export async function registerCommercial(
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
 
+  void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);
   return {
     handle: async (req, res) => {

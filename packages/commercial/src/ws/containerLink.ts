@@ -1,3 +1,5 @@
+import { recordContainerLinkGap, type LinkDispatch } from "./containerLinkRecoveryStore.js";
+import { containerLinkGap } from "../admin/metrics.js";
 import { ContainerLinkHello } from "./containerLinkHello.js";
 /**
  * Master owns one physical WS per (uid, containerId). Bridge handles retain
@@ -41,6 +43,7 @@ export class ContainerLinkHandle extends EventEmitter {
   readonly streams = new Map<string, Stream>();
   readonly closedStreams = new Set<string>();
   detached = false;
+  recoveryOnly = false;
   active = false;
   opened = false;
   disposed = false;
@@ -82,6 +85,11 @@ export class ContainerLinkHandle extends EventEmitter {
       this.streams.set(key, this.streams.get(key) ?? { sessionId, clientMessageId });
       this.link.claimStream(key, this);
     }
+  }
+  restoreDispatch(record: LinkDispatch): void {
+    const key = streamKey(record.sessionId, record.clientMessageId);
+    if (!this.link.restoreDispatch(key, record, this)) return;
+    this.streams.set(key, record);
   }
   bindDispatch(record: Stream & { dispatchId: string; attemptNo: number; leaseEpoch: number }): void {
     const key = streamKey(record.sessionId, record.clientMessageId);
@@ -146,7 +154,7 @@ class ContainerLink {
     create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>,
   ) {
     this.hello = new ContainerLinkHello(registry.pool, uid, containerId);
-    this.ready = Promise.resolve().then(() => create(this.abort.signal)).then((ws) => {
+    const dialWork = Promise.resolve().then(() => create(this.abort.signal)).then((ws) => {
       this.ws = ws;
       // Also cover an async tunnel factory resolving after shutdown.
       if (this.stopping) { ws.on("error", () => {}); ws.terminate(); return; }
@@ -159,12 +167,16 @@ class ContainerLink {
       ws.on("message", (data, binary) => this.receive(data, binary));
       ws.on("error", (err) => {
         this.registry.log?.warn?.("container-link: transport error", { uid: String(uid), containerId, err });
-        this.stop(err);
+        this.transportFailed(err);
       });
-      ws.on("close", () => this.stop());
+      ws.on("close", () => this.registry.onTransportLost ? this.transportFailed(new Error("container link transport closed")) : this.stop());
       this.timer = setInterval(() => { void this.tick(); }, registry.heartbeatMs);
       this.timer.unref();
     });
+    let timeout: ReturnType<typeof setTimeout>;
+    this.ready = Promise.race([dialWork, new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("container link dial timeout")), registry.dialTimeoutMs);
+    })]).finally(() => clearTimeout(timeout));
   }
   attach(): ContainerLinkHandle {
     if (this.stopping) throw new Error("container link stopped");
@@ -189,6 +201,16 @@ class ContainerLink {
   bindDispatch(key: string, record: Stream, owner: ContainerLinkHandle): void {
     this.routes.set(`stream:${key}`, owner);
     this.routes.set(`dispatch:${record.dispatchId}:${record.attemptNo}`, owner);
+  }
+  restoreDispatch(key: string, record: Stream, owner: ContainerLinkHandle): boolean {
+    if (this.routes.has(`stream:${key}`)) return false;
+    this.bindDispatch(key, record, owner);
+    return true;
+  }
+  private transportFailed(error: Error): void {
+    if (this.stopping) return;
+    this.stop(error);
+    this.registry.onTransportLost?.(this.uid, this.containerId);
   }
   send(handle: ContainerLinkHandle, data: RawData, opts?: { binary?: boolean }, cb?: (err?: Error) => void): void {
     const frame = parse(data, opts?.binary === true);
@@ -222,6 +244,7 @@ class ContainerLink {
     this.sendingBytes += bytes;
     const work = (this.sending ?? Promise.resolve()).then(async () => {
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
+      if (helloPeers !== null) await this.registry.beforeReplay?.();
       const prepared = helloPeers === null ? null : await this.hello.prepare(helloPeers);
       if (prepared) data = Buffer.from(JSON.stringify(prepared));
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
@@ -230,13 +253,35 @@ class ContainerLink {
       });
       if (prepared) this.hello.committed(prepared);
       cb?.();
-    }).catch((error: Error) => { cb?.(error); this.stop(error); }).finally(() => {
+    }).catch((error: Error) => { cb?.(error); this.transportFailed(error); }).finally(() => {
       this.sendingBytes -= bytes;
       if (this.sending === work) this.sending = null;
     });
     this.sending = work;
   }
+  private receiving: Promise<void> | null = null;
+  private receivingBytes = 0;
   private receive(data: RawData, binary: boolean): void {
+    if (this.stopping) return;
+    const frame = parse(data, binary);
+    if (frame?.type !== "outbound.resume_failed" && this.receiving === null) { this.deliver(data, binary); return; }
+    const bytes = Buffer.byteLength(Buffer.isBuffer(data) ? data : String(data));
+    this.receivingBytes += bytes;
+    if (this.receivingBytes > this.registry.maxBufferedBytes) { this.transportFailed(new Error("container link receive backpressure")); return; }
+    const work = (this.receiving ?? Promise.resolve()).then(async () => {
+      if (this.stopping) return;
+      if (frame?.type === "outbound.resume_failed") {
+        const count = await recordContainerLinkGap(this.registry.pool, this.uid, this.containerId, frame);
+        if (count > 0) { containerLinkGap.inc({}, count); this.registry.report("gap", this); }
+      }
+      this.deliver(data, binary);
+    }).catch((error: Error) => this.transportFailed(error)).finally(() => {
+      this.receivingBytes -= bytes;
+      if (this.receiving === work) this.receiving = null;
+    });
+    this.receiving = work;
+  }
+  private deliver(data: RawData, binary: boolean): void {
     if (this.stopping) return;
     this.transportAliveAt = Date.now();
     const frame = parse(data, binary);
@@ -290,7 +335,7 @@ class ContainerLink {
     if (this.tickWork) return this.tickWork;
     if (this.stopping || this.ws?.readyState !== WebSocket.OPEN) return Promise.resolve();
     if (Date.now() - this.transportAliveAt > this.registry.heartbeatMs * 3) {
-      this.stop();
+      this.transportFailed(new Error("container link heartbeat timeout"));
       return Promise.resolve();
     }
     this.ws.ping();
@@ -313,6 +358,7 @@ class ContainerLink {
           stream.dispatchId = row.dispatchId;
           stream.attemptNo = row.attemptNo;
           stream.leaseEpoch = row.leaseEpoch;
+          if (handle.recoveryOnly && row.status === "admitted") continue;
           await renewContainerLinkLease(this.registry.pool, this.uid, this.containerId, row);
         } catch (err) {
           this.registry.log?.warn?.("container-link: heartbeat failed", { uid: String(this.uid), containerId: this.containerId, err });
@@ -354,7 +400,7 @@ class ContainerLink {
     this.queued = [];
     this.queuedBytes = 0;
   }
-  async drain(): Promise<void> { await Promise.allSettled([this.ready, this.tickWork, this.sending]); }
+  async drain(): Promise<void> { await Promise.allSettled([this.ready, this.tickWork, this.sending, this.receiving]); }
   snapshot(): ContainerLinkSnapshot {
     return { uid: String(this.uid), containerId: this.containerId,
       subscribers: [...this.consumers].filter((h) => !h.detached).length,
@@ -370,9 +416,13 @@ export class ContainerLinkRegistry {
   stopping = false;
   takeovers = 0;
   detachedFrames = 0;
+  onTransportLost?: (uid: bigint, containerId: number) => void;
+  beforeReplay?: () => Promise<void>;
+  readonly dialTimeoutMs: number;
   readonly heartbeatMs: number;
   readonly maxBufferedBytes: number;
-  constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number }) {
+  constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number }) {
+    this.dialTimeoutMs = opts?.dialTimeoutMs ?? 5000;
     this.heartbeatMs = opts?.heartbeatMs ?? 30_000;
     this.maxBufferedBytes = opts?.maxBufferedBytes ?? 4 * 1024 * 1024;
   }
@@ -391,7 +441,12 @@ export class ContainerLinkRegistry {
       await link.ready;
       if (this.stopping) throw new Error("container link registry shutting down");
       return link.attach().socket;
-    } catch (error) { link.stop(); throw error; }
+    } catch (error) {
+      const failed = !link.stopping;
+      link.stop();
+      if (failed && !this.stopping) this.onTransportLost?.(uid, cid);
+      throw error;
+    }
   }
   remove(link: ContainerLink): void {
     const key = `${link.uid}:${link.containerId}`;
@@ -408,6 +463,7 @@ export class ContainerLinkRegistry {
     });
   }
   snapshots(): ContainerLinkSnapshot[] { return [...this.links.values()].map((link) => link.snapshot()); }
+  async drain(): Promise<void> { await Promise.allSettled([...this.draining].map((link) => link.drain())); }
   async shutdown(): Promise<void> {
     this.stopping = true;
     for (const link of [...this.links.values()]) {
