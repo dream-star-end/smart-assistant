@@ -155,7 +155,7 @@ describe("0096 双钱包 + 订阅计费 (integ)", () => {
     assert.equal(sub!.periodEnd.getTime() - sub!.periodStart.getTime(), 30 * 86400_000);
     assert.equal((await getBalanceBreakdown(uid)).wallet, 500n);
     const readLedger = () => query<{ delta: string; reason: string; ref_id: string | null }>(
-      `SELECT delta::text,reason,ref_id FROM credit_ledger WHERE user_id=$1 ORDER BY id`, [uid]);
+      "SELECT delta::text,reason,ref_id FROM credit_ledger WHERE user_id=$1 ORDER BY id", [uid]);
     const ledger = (await readLedger()).rows;
     assert.deepEqual(ledger, [
       { delta: "300", reason: "subscription", ref_id: null },
