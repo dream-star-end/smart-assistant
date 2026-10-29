@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DEFAULT_PROJECT_ID } from "../components/sidebar/constants";
 import { useToast } from "../components/ui";
 import { api, apiErrorMessage } from "../lib/api";
 import {
@@ -9,8 +10,12 @@ import {
 } from "../lib/projectLifecycle";
 import type { AuthSession, ChatProject, DeletedChatProject } from "../lib/types";
 
+/**
+ * 存的是「与默认折叠态相反」的分组 id：真实项目默认收起，在集合里 = 用户展开过；未分类默认展开，
+ * 在集合里 = 收起（UI-1）。换了键名：旧键存的是「收起过的」，语义相反，不沿用。
+ */
 export function projectCollapsedStorageKey(userId: string): string {
-  return `oc_v5_sidebar_project_collapsed:${userId}`;
+  return `oc_v5_sidebar_project_toggled:${userId}`;
 }
 
 export function archivedExpandedStorageKey(userId: string): string {
@@ -107,16 +112,21 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   const [projects, setProjects] = useState<ChatProject[]>([]);
   const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
   const [projectsLoaded, setProjectsLoaded] = useState(demo);
-  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() =>
+  const [toggledIds, setToggledIds] = useState<Set<string>>(() =>
     userId ? readCollapsed(userId) : new Set(),
   );
+  const collapsedIds = useMemo(() => {
+    const out = new Set(projects.filter((p) => !toggledIds.has(p.id)).map((p) => p.id));
+    if (toggledIds.has(DEFAULT_PROJECT_ID)) out.add(DEFAULT_PROJECT_ID);
+    return out;
+  }, [projects, toggledIds]);
   // 列表请求代数：登出 / 换号 / 卸载后迟到的响应不再写入。
   const listGenRef = useRef(0);
   const listInflightRef = useRef(false);
   const listFailedRef = useRef(false);
 
   useEffect(() => {
-    setCollapsedIds(userId ? readCollapsed(userId) : new Set());
+    setToggledIds(userId ? readCollapsed(userId) : new Set());
   }, [userId]);
 
   const canList = !demo && Boolean(auth) && Boolean(userId);
@@ -190,7 +200,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
 
   const toggleCollapsed = useCallback(
     (projectId: string) => {
-      setCollapsedIds((cur) => {
+      setToggledIds((cur) => {
         const next = new Set(cur);
         if (next.has(projectId)) next.delete(projectId);
         else next.add(projectId);
