@@ -2842,7 +2842,7 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
-await check("T29 自动恢复显示第2次重试；重试成功保持实时可见", async () => {
+await check("T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
