@@ -9481,7 +9481,7 @@
       "occurredAt": "2026-10-29",
       "severity": "P1",
       "symptom": "商业队长prompt宣称可委派的Codex/Antigravity/Cursor/ZCode型号与billed_delegate执行边界不一致，导致未起进程即409且无扣费。",
-      "rootFixCommit": "b7cb6bfd5",
+      "rootFixCommit": "b7cb6bfd",
       "coverageCommits": [],
       "regressions": [
         {
