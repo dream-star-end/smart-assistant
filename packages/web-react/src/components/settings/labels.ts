@@ -117,17 +117,7 @@ export function apiRequestStatusLabel(status: string | null | undefined): string
   return API_REQUEST_STATUS_LABEL[status] || status;
 }
 
-/** 思考深度档位（preferences.default_effort 枚举；具体模型支持集由 API 决定）。 */
-export const EFFORT_OPTIONS: {
-  value: "low" | "medium" | "high" | "xhigh" | "max";
-  label: string;
-}[] = [
-  { value: "low", label: "低" },
-  { value: "medium", label: "中" },
-  { value: "high", label: "高" },
-  { value: "xhigh", label: "很高" },
-  { value: "max", label: "最高" },
-];
+export { EFFORT_OPTIONS } from "./effortOptions";
 
 /** 订单状态 → 中文（虎皮椒：pending|paid|expired|canceled）。 */
 export function orderStatusLabel(status: string): string {

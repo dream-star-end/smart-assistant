@@ -46,7 +46,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from './LongContextCostWarning'
-import { EFFORT_OPTIONS } from './settings/labels'
+import { EFFORT_OPTIONS } from './settings/effortOptions'
 import {
   Badge,
   DropdownMenu,
