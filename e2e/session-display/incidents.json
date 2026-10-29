@@ -8618,6 +8618,31 @@
       "coverageCommits": [
         "994bc473"
       ]
+    },
+    {
+      "id": "INC-20261029-GEMINI-TOOL-WAIT",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "#1234 个人版 Gemini 4 Argon 高思考的写文件步骤显示约7m44s且一直提示正在思考下一步。只读取证确认整轮completed；上游首字节9.65s、流持续462.94s，思考27290 token，随后write_file仅执行1548ms。此前生成等待被步骤总墙钟并入写文件耗时，完成工具的摘要仍有运行流光。保留总墙钟与既有超时，只把有实证的执行/等待分开显示，并在完成工具后显示等待模型响应及经过时间。",
+      "rootFixCommit": "42720a71",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/stepTiming.test.ts",
+          "assertion": "#1234: 7m43s generation wait is separate from the 1.548s file execution"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "工具完成后等待模型响应从结果计时，心跳不重置；新工具和终态清除等待"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/step-duration.node-test.mjs",
+          "assertion": "#1234 generation wait and actual file execution @${width}px"
+        }
+      ]
     }
   ]
 }
