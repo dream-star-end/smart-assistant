@@ -94,7 +94,7 @@ test('desktop pending checks preserve the full lifetime reconnect budget', async
     await recovery.start()
     await until(() => checks >= 8)
     assert.equal(dials, 0)
-    assert.deepEqual(outcomes, [])
+    assert.equal(outcomes.length, 0)
     const lines: string[] = []; containerLinkReconnect.render(lines)
     assert.equal(lines.some(line => line.startsWith('container_link_reconnect_total{')), false)
     ready = true
