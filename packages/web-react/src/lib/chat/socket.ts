@@ -15,6 +15,8 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
+import { contextRebuiltRow } from "./contextRebuilt";
+import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -90,7 +92,6 @@ import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
   AUTOMATIC_RECOVERY_REPLAY_DISPLAY,
-  contextRebuiltNotice,
   INTERRUPTED_CONTINUE_DISPLAY,
   INTERRUPTED_CONTINUE_PROMPT,
   backoffDelay,
@@ -149,6 +150,7 @@ import type {
   OutboundWire,
   GoalSnapshotWire,
   RecoveryDecisionWire,
+  RecoveryStatusWire,
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
@@ -1447,22 +1449,10 @@ export class ChatSocket {
    * 后 loadStored 复原该行也能命中去重)。
    */
   private applyContextRebuilt(sess: ChatSession, frame: ContextRebuiltWire): void {
-    const count =
-      typeof frame.messageCount === "number" && Number.isFinite(frame.messageCount) && frame.messageCount > 0
-        ? Math.floor(frame.messageCount)
-        : sess.messages.length;
-    // 确定性去重 id:优先 frameSeq(per-sessionKey 单调),回退 server ts,再回退时钟(极端缺省)。
-    const identity =
-      typeof frame.frameSeq === "number" && Number.isFinite(frame.frameSeq)
-        ? `f${frame.frameSeq}`
-        : typeof frame.ts === "number" && Number.isFinite(frame.ts)
-          ? `t${frame.ts}`
-          : `x${Date.now()}`;
-    const dedupId = `sys-ctxrebuild-${sess.id}-${identity}`;
-    if (sess.messages.some((m) => m.id === dedupId)) return; // 幂等:同帧只插一条
-    const text = contextRebuiltNotice(count);
-    addMessage(sess, "system", text, { id: dedupId, _source: "local" });
-    this.setTransientNotice(sess.id, text); // 仅 turn 进行中显示的 live flash
+    const row = contextRebuiltRow(sess, frame); // 按 noticeId 去重(旧帧退回 frameSeq/ts)
+    if (!row) return;
+    addMessage(sess, "system", row.text, { id: row.id, _source: "local" });
+    this.setTransientNotice(sess.id, row.text); // 仅 turn 进行中显示的 live flash
     this.deps.persistSession?.(sess.id); // durable:落 IndexedDB
     this.scheduleNotify();
   }
@@ -2694,6 +2684,12 @@ export class ChatSocket {
         this.applyRecoveryDecision(f as RecoveryDecisionWire);
         return;
       }
+      case "sys.recovery_status": {
+        const frame = f as RecoveryStatusWire;
+        const sess = this.sessions.get(frame.peer?.id);
+        if (sess && applyRecoveryStatusFrame(sess, frame)) this.scheduleNotify();
+        return;
+      }
       case "sys.context_rebuilt": {
         // 引擎无法原生续接、走兜底注入历史(provider 切换 / 非原生 resume)时容器 emit。
         // 插入一条 client-owned 的 system 提示行 + 会话内 transient 软提示(boss 硬指标 3)。
@@ -2729,6 +2725,8 @@ export class ChatSocket {
         if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
           if (frame.recovery?.automatic === true) {
             this.adoptMasterAutomaticRecovery(frame.peer.id, frame.clientMessageId, frame.recovery);
+            const sess = this.sessions.get(frame.peer.id);
+            if (sess) rememberRetryStatus(sess, { ...frame.recovery, clientMessageId: frame.clientMessageId }, frame.retryStatus);
           }
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
         }
@@ -3112,6 +3110,7 @@ export class ChatSocket {
     if (!sessId) return;
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    rememberRetryStatus(sess, frame, frame.retryStatus, frame.ts);
     const pending = this.pendingRecoveryErrors.get(sessId);
     const matchesPending = !!pending &&
       (!pending.clientMessageId || pending.clientMessageId === frame.sourceClientMessageId);
