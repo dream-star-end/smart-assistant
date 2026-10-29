@@ -4,13 +4,12 @@
  * - 默认收起。这一轮有产出时顶栏出「产出 N」(手机进「⋯」),点开才展开;用户手动开 / 关记在本机,
  *   打开过的保持打开(宽屏 ≥1100px 内联第三列)。更窄的视口用贴底 Sheet,不硬挤三列。
  * - 「N」与产出页同源:最新一轮的 collectTurnOutputs → outputCount(文件 + 图片媒体 + 本机预览)。
- * - 面板本体(InspectorPanel)懒加载,不进首屏(first-screen-budget);这里只留开合状态和小常量。
+ * - 面板本体(InspectorPanel)和产出提取(workbench)都懒加载,不进首屏(first-screen-budget);
+ *   这里只留开合状态和小常量。
  * 面板里看哪一步是纯 UI 态,不进 ChatSocket。
  */
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DeferredPayloadLoader, PaneRequest, PaneTab } from "../components/InspectorPanel";
-import { collectTurnOutputs, outputCount } from "../components/chat/workbench";
-import { collectWorkTurns } from "../components/chat/workTurns";
 import type { ToolLike } from "../components/tool/format";
 import { Sheet } from "../components/ui";
 import type { ChatMessage } from "../lib/chat/model";
@@ -53,12 +52,6 @@ function writeOpen(open: boolean): void {
 /** 只把属于当前会话的请求交给面板:请求在切会话前发出、面板在切会话后挂载时,旧请求作废。 */
 export function paneRequestForSession(request: PaneRequest | null, sessionId: string | null | undefined): PaneRequest | null {
   return request && (request.sessionId ?? null) === (sessionId ?? null) ? request : null;
-}
-
-/** 最新一轮的产出数(与产出页同一套提取)。 */
-export function latestTurnOutputCount(messages: readonly ChatMessage[]): number {
-  const turn = collectWorkTurns(messages).at(-1);
-  return turn ? outputCount(collectTurnOutputs(turn)) : 0;
 }
 
 export function useDetailPane({
@@ -111,8 +104,22 @@ export function useDetailPane({
   const available = inChat && (demo ? !!request?.message : !!activeId && messages.length > 0);
   const inline = available && isWide && open;
   const shown = inline || (available && !isWide && sheetOpen);
+  const [outputs, setOutputs] = useState(0);
+  // 产出提取在 workbench(与产出页共用的懒块)里,按需加载后再数;模块缓存后每次只是一个微任务。
   // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
-  const outputs = useMemo(() => (available ? latestTurnOutputCount(messages) : 0), [available, messages, version]);
+  useEffect(() => {
+    if (!available) {
+      setOutputs(0);
+      return;
+    }
+    let live = true;
+    void import("../components/chat/workbench").then((m) => {
+      if (live) setOutputs(m.latestTurnOutputCount(messages));
+    });
+    return () => {
+      live = false;
+    };
+  }, [available, messages, version]);
   const toggle = (tab?: PaneTab) => {
     if (!shown) return openPane(tab);
     if (isWide) setOpen(false);

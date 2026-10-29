@@ -42,11 +42,12 @@ function renderPicker(
 }
 
 describe("AgentPicker 团队模式开关文案（知情同意）", () => {
+  // UI-2a 改写成人话(「由 … 带队」「分出去的部分按各自的模型计费」),知情要素不变:引擎、计费更高、分工按各自模型计费。
   it("描述明确告知：队长切换 GPT-6-Astra 引擎、计费高于默认模型、委派按对应模型计费", async () => {
     renderPicker();
-    const desc = await screen.findByText(/开启后队长引擎将切换为 GPT-6-Astra/);
+    const desc = await screen.findByText(/由 GPT-6-Astra 带队/);
     expect(desc.textContent).toContain("计费高于默认模型");
-    expect(desc.textContent).toContain("每次委派按对应智能体的模型计费");
+    expect(desc.textContent).toContain("分出去的部分按各自的模型计费");
   });
 
   it("开关翻转经 onToggleTeamMode 上抛（App 的全局 flag 是唯一权威）", async () => {
@@ -124,7 +125,11 @@ describe("AgentPicker 三态协作", () => {
       advisorModels: [],
       advisorUnavailableReason: "顾问引擎尚未证明无工具隔离",
     });
-    expect((await screen.findAllByText(/尚未证明无工具隔离/)).length).toBeGreaterThan(0);
+    // UI-2a:服务端原因是工程口径,卡片写人话,原句只留在悬停提示里。
+    const shown = await screen.findAllByText(/暂时没有可用的顾问型号/);
+    expect(shown.length).toBeGreaterThan(0);
+    expect(screen.queryByText(/尚未证明无工具隔离/)).toBeNull();
+    expect(shown.some((el) => el.getAttribute("title") === "顾问引擎尚未证明无工具隔离")).toBe(true);
     expect(screen.queryByLabelText("选择顾问型号")).toBeNull();
   });
 
