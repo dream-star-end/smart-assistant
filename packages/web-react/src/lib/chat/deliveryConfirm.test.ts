@@ -56,7 +56,7 @@ describe("container-confirmed delivery", () => {
     { type: "outbound.turn_status", status: "working" },
     { type: "outbound.message", blocks: [], isFinal: false },
     { type: "outbound.turn_usage", usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
-    { type: "outbound.call_usage", usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } },
+    { type: "outbound.call_usage", call: { callId: "call-1", targetIds: ["tool-1"], usage: { totalTokens: 1 } } },
   ])("$type confirms only the correlated user row", (data) => {
     const { user, frame } = setup();
     frame({ type: "outbound.ack", admitted: true });
