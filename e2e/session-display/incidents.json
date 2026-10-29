@@ -9501,7 +9501,7 @@
       "occurredAt": "2026-10-29",
       "severity": "P1",
       "symptom": "本地模型/目录预检未起runner且未计费的拒绝仍消耗每turn委派额度，阻断后续合法委派。",
-      "rootFixCommit": "b88a1a6f3",
+      "rootFixCommit": "b88a1a6f",
       "coverageCommits": [],
       "regressions": [
         {
@@ -9526,7 +9526,7 @@
       "occurredAt": "2026-10-29",
       "severity": "P1",
       "symptom": "Box Agent关闭thinking时发送默认temperature=1，被门禁在预扣前误拒绝为BOX_PARAMETER_UNMAPPED。",
-      "rootFixCommit": "3cb52acf6",
+      "rootFixCommit": "3cb52acf",
       "coverageCommits": [],
       "regressions": [
         {
