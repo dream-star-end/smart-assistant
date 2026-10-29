@@ -1251,9 +1251,8 @@ export async function submit(
     // handleStdout:505) — this includes CCB's _oc_telemetry side-channel
     // events (tool.preUse fires just before each tool.call, turn.apiResponse
     // after each stream, etc.), so a live subprocess keeps refreshing even
-    // during long tools that produce no content blocks. An engine may expose
-    // idleWatchdogActivityAt for already-started bounded work that process
-    // heartbeats must not keep alive (Antigravity native file operations).
+    // during long tools that produce no content blocks. idleWatchdogActivityAt
+    // excludes synthetic liveness for already-started bounded file operations.
     // 阈值策略集中在文件顶部的 `pickIdleTimeoutMs` 里(见对应注释),这里
     // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
     // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。

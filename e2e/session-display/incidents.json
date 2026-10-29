@@ -9331,7 +9331,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
-          "assertion": "INC-20261029-GEMINI-FILE-TIMEOUT bounded file activity expires through submit despite fresh process heartbeats"
+          "assertion": "C-sm-bounded-file-heartbeat"
         }
       ]
     }
