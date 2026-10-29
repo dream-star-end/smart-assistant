@@ -95,6 +95,11 @@ export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
     file: 'packages/commercial/src/__tests__/studioComposeFlow.integ.test.ts',
     cases: ['after a failed compose the user can ask the director to compose again, free (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY)'],
   },
+  {
+    incident: 'INC-20261029-BOX-LOGIN-EXPIRED-STOP-REASON', slug: 'inc-20261029-box-login-expired-stop-reason', db: false,
+    file: 'packages/commercial/src/http/proxy/boxInteractivePrintParity.test.ts',
+    cases: ['an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p'],
+  },
 ]
 
 function fail(message: string): never {

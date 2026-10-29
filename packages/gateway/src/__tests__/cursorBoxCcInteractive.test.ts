@@ -97,6 +97,8 @@ test('signal tap: plan-window and notice lines per turn, rotation on a rejected 
   const notLoggedIn = JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: 'Not logged in · Please run /login' }] } })
   assert.deepEqual(tap.push(`${notLoggedIn}\n${result}\n`), [{ rotate: 'login' }])
   assert.deepEqual(tap.push(`${result}\n`), [{ rotate: null }], 'a reason belongs to its own turn')
+  const loginExpired = JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: 'Login expired · Please run /login' }] }, is_api_error_message: true })
+  assert.deepEqual(tap.push(`${loginExpired}\n${result}\n`), [{ rotate: 'login' }], 'a login whose refresh failed (CLI 2.1.312)')
   tap.take()
   // Near the window: a hint to move before a refusal; a refusal in the same turn outranks it.
   assert.deepEqual(tap.push(`${rate('allowed', 0.985)}\n${result}\n`), [{ rotate: 'near_limit' }])
@@ -306,6 +308,13 @@ test('frames: chunk mapping, abort result and user text', () => {
   sj.noteAgentCall('toolu_agent')
   const row = JSON.parse(sj.row({ door: 'response', uuid: 'u', agentId: 'a1', message: { type: 'assistant', role: 'assistant', content: [] } })[0]!)
   assert.equal(row.parent_tool_use_id, 'toolu_agent')
+  assert.equal(row.message.model, 'm')
+  assert.equal(row.is_api_error_message, undefined)
+  // The engine's stand-in for a failed request (origin model `<synthetic>`) is printed as -p prints it.
+  const standIn = JSON.parse(sj.row({ door: 'response', uuid: 'e', origin: { kind: 'model', model: '<synthetic>' },
+    message: { type: 'assistant', content: [{ type: 'text', text: 'Login expired · Please run /login' }] } })[0]!)
+  assert.equal(standIn.message.model, '<synthetic>')
+  assert.equal(standIn.is_api_error_message, true)
   // No turn usage from the engine (abort, API error): the steps' sum stands,
   // never zeros, so a paid step is not settled as free.
   const aborted = JSON.parse(sj.result({ reason: 'aborted', answer: '', durationMs: 5 }, 'tool_use'))
