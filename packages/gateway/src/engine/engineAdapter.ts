@@ -292,6 +292,10 @@ export interface EngineAdapter extends EventEmitter {
   readonly isRunning: boolean
   /** 底座最近输出活动时间戳(liveness watchdog 读;submit 开始时会重置写入)。 */
   lastActivityAt: number
+  /** Optional engine-owned idle clock for bounded work already in progress.
+   * Synthetic process heartbeats must not extend that work's deadline.
+   * Absent means the existing lastActivityAt policy remains authoritative. */
+  readonly idleWatchdogActivityAt?: number
   /** Phase 5:当前活跃进程 spawn 时绑定的 ready repo snapshot(recycle 决策用)。 */
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null
   /**

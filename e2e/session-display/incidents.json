@@ -8645,6 +8645,73 @@
       ]
     },
     {
+      "id": "INC-20261029-GEMINI-FILE-TIMEOUT",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "#1234 超时补强：本次 write_file 1548ms 并未挂死，但只读审计发现 Antigravity 30s 合成心跳会持续刷新15min/30min静默门，真实原生文件工具ACTIVE后不结束只剩12h兜底。限定当前turn已开始的5种原生文件读写/编辑工具，用首次ACTIVE复用既有15min阈值与15s巡检；重复ACTIVE、无关输出与合成心跳不续期，完成清理，跨turn隔离。模型生成期和既有计费策略不变；用户主动取消与系统超时原因分离。未扩展全SSE语义进展判定。",
+      "rootFixCommit": "124a55d7",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "first ACTIVE bounds file work despite heartbeat, duplicate ACTIVE and unrelated output; DONE/ERROR release it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "a prior turn result and late close cannot retain or clear the new file deadline"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "the first user or system interrupt keeps its cause through later interrupts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
+          "assertion": "C-sm-bounded-file-heartbeat"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-cron-submit-boundary.ts",
+          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261029-ESC-STOP-STATUS",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "个人版 #1233：GPT-6.1-Sol 运行时按 Esc 立即终止，且主动停止的 USER_CANCELLED 被会话终态推导缺省映为 executed_error，侧栏和系统通知误报出错。Esc 改为同一回合身份校验的确认框，用户停止归 interrupted 并显示中性已停止。只读核对 usage/journal/ledger：该轮有实际输出，按冻结费率结算9积分且仅扣一次；此改动不更改计费或余额。",
+      "rootFixCommit": "5ad56ab1",
+      "coverageCommits": [
+        "3b5c96d3"
+      ],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/esc-stop.node-test.mjs",
+          "assertion": "#1233: trusted Escape confirms, cancels safely, and never stops a replacement turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useStopShortcut.test.tsx",
+          "assertion": "Esc requests confirmation; cancel keeps running and explicit confirm stops once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/sessionStatus.test.ts",
+          "assertion": "%s 不把主动停止误判成执行失败"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/thinkingSafety.test.ts",
+          "assertion": "confirmed stop rejects a replaced live identity and freezes its payload before async persistence"
+        }
+      ]
+    },
+    {
       "id": "INC-20261029-LEDGER-TZ-LABEL",
       "occurredAt": "2026-10-29",
       "severity": "P2",

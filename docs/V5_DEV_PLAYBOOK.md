@@ -322,6 +322,12 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
    `undici.request` 经默认 Agent（7.25.0）有 300 秒 headers/body inactivity 超时（非总调用时限）；
    `sessionSubmit` 另有不依赖 activity 的 12 小时逻辑 turn 硬上限。诊断时分别核对网络、进程与工具，
    不把有持续流的合法高思考按短总墙钟误杀。
+   已确认当前 turn 首次 `ACTIVE` 的 `view_file/write_to_file/replace_file_content/`
+   `multi_replace_file_content/sed_file`，通过 `idleWatchdogActivityAt` 复用既有 15 分钟阈值和
+   15 秒巡检；重复 ACTIVE、无关输出与合成心跳均不续期，DONE/ERROR 只清理对应工具。
+   超时走既有 `LIVENESS_TIMEOUT` 强制收尾，不能标为用户主动取消；计费策略不变。
+   这条工具边界不覆盖模型的心跳流或其他长工具：上游仅发送心跳字节仍会续网络 idle，
+   未新增全 SSE 语义进展截止，仍受原有 12 小时会话兜底。
 
 ### 3.3 会话历史/持久化问题(高频类)
 心智模型:**用户行走 POST /user-message；模型生成内容由 v2 lossless turn tape 在 PG 中完整保存，`client_sessions.messages` 只留常量大小 anchor，读取时水合为 assistant/thinking/tool/agent-group/plan/goal**。合并语义在 `lib/persist.ts`:
