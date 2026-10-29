@@ -1,9 +1,10 @@
 import { cleanup, renderHook } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
+import { createMemoryAuthSession } from '../lib/authSession'
 import { useChatCardActions, type ChatCardActionsInput } from './useChatCardActions'
 function setup() {
   const input = {
-    authRef: { current: { token: 'fixture' } },
+    authRef: { current: createMemoryAuthSession(() => {}, 'fixture') },
     demo: false, communityBlogEnabled: true, chat: {}, agent: { id: 'fixture' },
     openManage: vi.fn(), openBlog: vi.fn(), openPane: vi.fn(), openSettings: vi.fn(),
     setCollapsed: vi.fn(), setBoardOpen: vi.fn(),
