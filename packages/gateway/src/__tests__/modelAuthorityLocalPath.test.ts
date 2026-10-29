@@ -580,6 +580,49 @@ describe('④⑤ codex delegate / provider pin 的本地 turn → DELEGATE_CODEX
     assert.equal(d.canonicalModel, 'gpt-5.6-sol')
   })
 
+  for (const code of ['DELEGATE_CODEX_UNSUPPORTED', 'DELEGATE_MODEL_UNKNOWN',
+    'MODEL_NOT_AVAILABLE', 'MODEL_CATALOG_UNAVAILABLE']) {
+    test(`preflight quota: ${code} leaves all member attempts available`, async () => {
+      const prev = process.env.OC_MODEL_AUTHORITY
+      const prevExempt = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+      process.env.OC_MODEL_AUTHORITY = '1'
+      Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+      try {
+        if (code === 'MODEL_NOT_AVAILABLE') {
+          _setModelCatalogClientForTests({ getRoutingView: async () => view([]) } as any)
+        } else installCatalog({ fail: code === 'MODEL_CATALOG_UNAVAILABLE' })
+        const gw = makeDelegateGateway()
+        const parentSessionKey = 'agent:main:webchat:dm:preflight-quota'
+        const model = code === 'DELEGATE_CODEX_UNSUPPORTED' ? 'gpt-5.6-sol'
+          : code === 'DELEGATE_MODEL_UNKNOWN' ? 'missing-model' : undefined
+        for (let i = 0; i < 9; i++) {
+          const rejected = await runDelegate(gw, 'coding-assistant', {
+            goal: 'preflight reject', sourceAgent: 'main', parentSessionKey, model,
+          })
+          assert.equal(rejected.body.code, code, JSON.stringify(rejected))
+          assert.notEqual(rejected.status, 429)
+        }
+        assert.equal(gw.sessions.getOrCreateCalls, 0)
+        installCatalog()
+        for (let i = 0; i < 8; i++) {
+          const accepted = await runDelegate(gw, 'coding-assistant', {
+            goal: 'valid member', sourceAgent: 'main', parentSessionKey, model: 'glm-5.2',
+          })
+          assert.equal(accepted.status, 200, JSON.stringify(accepted))
+        }
+        assert.equal(gw.sessions.getOrCreateCalls, 8)
+        const blocked = await runDelegate(gw, 'coding-assistant', {
+          goal: 'ninth real attempt', sourceAgent: 'main', parentSessionKey, model: 'glm-5.2',
+        })
+        assert.equal(blocked.status, 429)
+      } finally {
+        restoreFlag(prev)
+        if (prevExempt === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+        else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = prevExempt
+      }
+    })
+  }
+
   test('HTTP delegate 端点:codex 目标 → 409 + code,且 getOrCreate **从未被调用**(未 spawn)', async () => {
     installCatalog()
     const prev = process.env.OC_MODEL_AUTHORITY
