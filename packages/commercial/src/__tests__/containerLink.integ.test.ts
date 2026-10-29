@@ -647,8 +647,8 @@ for (const [kind, clientMessageId] of [
       await rig.session(sessionId);
       const input = rig.input(sessionId, clientMessageId);
       const results = await Promise.all(Array.from({ length: 4 }, () => rig.bridge.injectCronOriginTurn(input)));
-      assert.ok(results.some(result => result.kind === "injected"), JSON.stringify(results));
-      assert.ok(results.every(result => result.kind === "injected" || result.kind === "in_flight"), JSON.stringify(results));
+      assert.ok(results.some(result => result.kind === "injected"), `${JSON.stringify(results)}\n${rig.events.join("\n")}`);
+      assert.ok(results.every(result => result.kind === "injected" || result.kind === "in_flight"), `${JSON.stringify(results)}\n${rig.events.join("\n")}`);
       const expectedFrames = kind === "dlgcb" ? 2 : 1;
       await originEventually(async () => (await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n === expectedFrames, () => rig.events.join("\n"));
       assert.deepEqual(rig.errors, []);
@@ -704,7 +704,7 @@ test("origin wake and concurrent browser hellos share one physical link; detach 
     const [injected, first, second] = await Promise.all([
       rig.bridge.injectCronOriginTurn(input), rig.openBrowser("origin-hello"), rig.openBrowser("origin-hello"),
     ]);
-    assert.equal(injected.kind, "injected");
+    assert.equal(injected.kind, "injected", rig.events.join("\n"));
     await originEventually(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2, () => rig.events.join("\n"));
     assert.equal(rig.sockets.length, 1, "all concurrent wakes and hellos must use the registry's single physical transport");
     assert.equal(rig.messages.length, 1);
@@ -724,13 +724,23 @@ test("headless origin injection loads the actual bundle authorization context an
   for (const refusal of ["model", "identity", "epoch"] as const) {
     const rig = await originLinkRig();
     try {
+      await rig.session(`origin-authorized-${refusal}`);
+      const authorized = await rig.bridge.injectCronOriginTurn(rig.input(`origin-authorized-${refusal}`, `cron-origin-authorized-${refusal}`));
+      assert.equal(authorized.kind, "injected", rig.events.join("\n"));
+      assert.equal(rig.messages.length, 1, "the same real transport must execute successfully before revocation");
       await rig.session(`origin-denied-${refusal}`);
       if (refusal === "model") rig.authorization.allowed = false;
       if (refusal === "identity") rig.authorization.ready = false;
       if (refusal === "epoch") rig.authorization.epoch = 13n;
       const result = await rig.bridge.injectCronOriginTurn(rig.input(`origin-denied-${refusal}`, `cron-origin-denied-${refusal}`));
-      assert.notEqual(result.kind, "injected", `${refusal} authority refusal must never acknowledge execution`);
-      assert.equal(rig.messages.length, 0, `${refusal} authority refusal must happen before physical delivery`);
+      assert.equal(result.kind, "failed", `${refusal}: ${JSON.stringify(result)}\n${rig.events.join("\n")}`);
+      assert.equal(rig.messages.length, 1, `${refusal} authority refusal must happen before another physical delivery`);
+      const expectedLog = {
+        model: "user-chat-bridge: model not authorized",
+        identity: "user-chat-bridge: fresh identity authority rejected execution",
+        epoch: "user-chat-bridge: security epoch changed before signing — refusing turn",
+      }[refusal];
+      assert.ok(rig.events.some(line => JSON.parse(line).msg === expectedLog), `${refusal}: ${JSON.stringify(result)}\n${rig.events.join("\n")}`);
       assert.ok(rig.checkerLoads.some(load => load.uid === ORIGIN_UID && load.epoch === 12n));
       assert.ok(rig.resolverLoads.some(load => load.uid === ORIGIN_UID && load.bundleRev === ORIGIN_BUNDLE_REV));
       assert.deepEqual(rig.errors, []);
@@ -773,7 +783,7 @@ test("a real restarted scheduler injects its due cron offline and consumes the s
     assert.equal(second.length, 1);
     assert.equal(second[0].deliveryId, first[0].deliveryId);
     assert.equal(second[0].clientMessageId, first[0].clientMessageId);
-    await originEventually(async () => (await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n === 1);
+    await originEventually(async () => (await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n === 1, () => rig.events.join("\n"));
     assert.equal(rig.messages.length, 1);
     assert.equal(rig.bridge.containerLinkSnapshots!()[0]!.subscribers, 0);
     assert.equal((await rig.pool.query("SELECT count(*)::int AS n FROM turn_dispatches")).rows[0].n, 1);

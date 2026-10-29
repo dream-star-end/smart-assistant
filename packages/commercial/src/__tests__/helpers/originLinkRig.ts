@@ -19,6 +19,7 @@ import {
   ModelAuthorityConsumer,
   buildContainerAttestFrame,
 } from "@openclaude/gateway";
+import { DispatchAuthorityConsumer, durableTurnDispatchCapabilities } from "../../../../gateway/src/turnDispatchInbox.js";
 import { signAccess } from "../../auth/jwt.js";
 import { ModelCatalogSnapshot, type ModelCatalogCache, type ModelCatalogEntry, type ModelCatalogPricing } from "../../billing/modelCatalog.js";
 import { InMemoryPreCheckRedis } from "../../billing/preCheck.js";
@@ -160,8 +161,13 @@ export async function originLinkRig() {
   container.on("connection", socket => {
     sockets.push(socket);
     const consumer = new ModelAuthorityConsumer({ keyring: signer.publicKeyring(), containerId: ORIGIN_CARRIER, uid: Number(ORIGIN_UID), required: true });
+    const dispatchConsumer = new DispatchAuthorityConsumer({ keyring: signer.publicKeyring(),
+      containerId: String(ORIGIN_CARRIER), uid: String(ORIGIN_UID) });
     const connection = consumer.newConnection();
-    socket.send(JSON.stringify(buildContainerAttestFrame(consumer, connection, ORIGIN_CARRIER)));
+    const attest = buildContainerAttestFrame(consumer, connection, ORIGIN_CARRIER);
+    // Match wsConnection's combined model/durable-dispatch readiness broadcast.
+    attest.capabilities.push(...durableTurnDispatchCapabilities(dispatchConsumer.enabled, true));
+    socket.send(JSON.stringify(attest));
     socket.on("message", data => {
       try {
         const frame = JSON.parse(String(data)) as Frame;
@@ -184,6 +190,8 @@ export async function originLinkRig() {
         const authority = verifyAuthority(frame[MODEL_AUTHORITY_FIELD].authority, signer.publicKeyring(), Date.now());
         assert.equal(authority.canonicalModel, "glm-5.2");
         assert.equal(authority.connectionChallenge, connection.challenge);
+        dispatchConsumer.consume(frame, connection.challenge, frame.content,
+          { modelAuthorityBillingRequestId: authority.billingRequestId });
         messages.push(frame);
         socket.send(JSON.stringify({ type: "outbound.control.turn_dispatch_receipt", ...{
           dispatchId: dispatch.dispatchId, attemptNo: dispatch.attemptNo, sessionId: dispatch.sessionId,
