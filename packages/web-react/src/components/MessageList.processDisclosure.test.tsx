@@ -1433,7 +1433,7 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[4]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待模型响应");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     // OCV5-312: 展开时流光在「正在干活」的摘要行上,外壳标题不扫。
     expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
@@ -1451,7 +1451,7 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待模型响应");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("VERSION");
     expect(screen.queryByText("READ_SECRET")).not.toBeInTheDocument();
 
@@ -1879,7 +1879,7 @@ describe("MessageList Manus 过程披露", () => {
       ts: T0 - 50_000,
     });
 
-    test("叙述段写完后静默超过 3 秒，时间轴末尾挂一行活的「正在思考下一步」，新步骤一来就消失", () => {
+    test("叙述段写完后静默超过 3 秒，时间轴末尾挂一行活的「等待模型响应」，新步骤一来就消失", () => {
       const mid = row("m", "assistant", "临时目录占了 1G，接下来清缓存。", { _clientMessageId: "u", ts: T0 - 1_000 });
       const activity = { startedAt: T0 - 60_000, lastFrameAt: T0 - 1_000, agentName: "助手" };
       const view = renderList([user, done, mid], { sending: true, turnActivity: activity });
@@ -1892,9 +1892,9 @@ describe("MessageList Manus 过程披露", () => {
         vi.advanceTimersByTime(3_000);
       });
       const tail = screen.getByTestId("process-live-tail");
-      expect(tail).toHaveTextContent("正在思考下一步");
+      expect(tail).toHaveTextContent("等待模型响应");
       expect(tail).toHaveTextContent("4 秒");
-      expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+      expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待模型响应");
       // 一轮仍只有一处在扫:展开时是尾行。
       expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
       expect(tail.querySelector(".oc-live-status-shine")).not.toBeNull();
@@ -1927,6 +1927,26 @@ describe("MessageList Manus 过程披露", () => {
       expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
     });
 
+    test("工具完成后等待模型响应从结果计时，心跳不重置；新工具和终态清除等待", () => {
+      const tool = { ...done, completedAt: T0 - 463_029, ts: T0 - 465_266 };
+      const activity = { startedAt: T0 - 600_000, lastFrameAt: T0, agentName: "助手" };
+      const view = renderList([user, tool], { sending: true, turnActivity: activity });
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("等待模型响应7 分 43 秒");
+      expect(screen.getByTestId("process-group-summary")).toHaveAttribute("data-live-working", "false");
+      expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
+      act(() => vi.advanceTimersByTime(2_000));
+      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}}
+        turnActivity={{ ...activity, lastFrameAt: Date.now() }} />);
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("7 分 45 秒");
+      const next = row("write", "tool", "写入文件", { _clientMessageId: "u", toolName: "write_file",
+        inputJson: { Path: "/work/report.py" }, _completed: false, ts: Date.now() });
+      view.rerender(<MessageList processDisclosure messages={[user, tool, next]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} turnActivity={activity} />);
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("等待模型响应");
+      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} turnActivity={activity} />);
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+    });
+
     test("命令连续运行超过 5 秒，在干活的摘要行旁显示每秒在走的「已运行 N 秒」", () => {
       const running = row("c2", "tool", "终端", {
         _clientMessageId: "u",
@@ -1952,7 +1972,7 @@ describe("MessageList Manus 过程披露", () => {
       expect(screen.getByTestId("process-step-running-for")).toHaveTextContent("已运行 1 分 15 秒");
       // 只挂在正在干活的那一段;已完成的段没有。
       expect(screen.getAllByTestId("process-step-running-for")).toHaveLength(1);
-      // 静默时长不影响命令段(不是叙述段),不会冒出「正在思考下一步」尾行。
+      // 静默时长不影响命令段(不是叙述段),不会冒出「等待模型响应」尾行。
       expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
     });
 
@@ -2192,7 +2212,7 @@ describe("MessageList Manus 过程披露", () => {
       inputJson: { file_path: "/tmp/VERSION" },
       _completed: true,
       output: "ok",
-    }, "正在思考下一步", /VERSION|\/tmp|Read/);
+    }, "等待模型响应", /VERSION|\/tmp|Read/);
 
     cleanup();
     renderList([
@@ -2231,7 +2251,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByTestId("process-group-missed")).not.toBeInTheDocument();
     expect(screen.queryByText(/步未成功/)).not.toBeInTheDocument();
     expect(document.querySelector("[data-testid=process-disclosure] .text-danger")).toBeNull();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待模型响应");
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
     // 点开摘要后,这一步如实标「未成功」,但与其他过程文字同为安静灰字,整块不出现危险色。

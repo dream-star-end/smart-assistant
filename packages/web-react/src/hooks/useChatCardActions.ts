@@ -121,7 +121,12 @@ export function useChatCardActions({
 }: ChatCardActionsInput) {
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sendImplicitRatingRef, setBusy, setChatError, setStreamText, stopRef, stoppedTurnRef are App useState setter/useRef passed in, stable
-  const stopTurn = useCallback(() => {
+  const stopTurnTarget = useCallback((expectedClientMessageId?: string) => {
+    // A confirmation may outlive the rendered turn. Check the mutable socket
+    // before feedback/local teardown, then carry the same identity to Stop.
+    if (!demo && expectedClientMessageId !== undefined &&
+      (!activeId || !chat.isSending(activeId) ||
+        chat.getSession(activeId)?._activeClientMessageId !== expectedClientMessageId)) return;
     if (demo) {
       stopRef.current = true;
       setBusy(false);
@@ -133,10 +138,13 @@ export function useChatCardActions({
       if (stopTarget) sendImplicitRatingRef.current?.(stopTarget, { reason: "中途打断" });
       // 本轮由用户主动打断 → 不做完成脉冲高亮（nudge effect 消费该标记后清）。
       stoppedTurnRef.current = true;
-      chat.stop(activeId);
+      chat.stop(activeId, expectedClientMessageId);
     }
     setChatError(null);
   }, [demo, activeId, chat]);
+  // Keep event-facing callbacks argument-free (React may supply a click event).
+  const stopTurn = useCallback(() => stopTurnTarget(), [stopTurnTarget]);
+  const stopTurnIfCurrent = useCallback((clientMessageId: string) => stopTurnTarget(clientMessageId), [stopTurnTarget]);
 
   // ── P5 渲染层接线 ──────────────────────────────────────────────────────
   // 媒体签名单一权威：把 api.mediaSign 注入渲染树（demo 无网络 → null）。容器内路径
@@ -487,6 +495,7 @@ export function useChatCardActions({
     onRespondPermission,
     signMedia,
     stopTurn,
+    stopTurnIfCurrent,
     toolActions,
   };
 }

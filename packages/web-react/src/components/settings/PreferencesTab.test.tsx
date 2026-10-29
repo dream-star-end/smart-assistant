@@ -153,7 +153,7 @@ describe('BuiltinHotkeysTable · 快捷键只读表', () => {
     render(<BuiltinHotkeysTable />)
     expect(screen.getByText('搜索与跳转（项目、会话、文件）')).toBeInTheDocument()
     expect(screen.getByText('新建会话')).toBeInTheDocument()
-    expect(screen.getByText('停止生成（生成中）')).toBeInTheDocument()
+    expect(screen.getByText('确认停止（生成中）')).toBeInTheDocument()
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
     expect(screen.queryByPlaceholderText('动作名')).not.toBeInTheDocument()
     expect(models).not.toHaveBeenCalled()
