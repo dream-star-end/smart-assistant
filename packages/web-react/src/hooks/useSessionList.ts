@@ -225,6 +225,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   // 回调/句柄经 ref 镜像：App 每渲染可能传新闭包，这里始终读最新版本而不进 useCallback
   // 依赖（保持 selectSession/newSession 依赖面与拆分前一致；useChatSocket persistRef 同款）。
   const confirmedMetadata = useRef(new Map<string, SessionMetadataSnapshot>());
+  /** 重命名 PATCH 未落地期间的本地标题：此前已发出的列表请求带回旧标题，不能盖掉它(#1240)。 */
+  const pendingTitles = useRef(new Map<string, string>());
   const cbRef = useRef(opts);
   cbRef.current = opts;
   const toast = useToast();
@@ -538,6 +540,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         const confirmed = confirmedMetadata.current.get(m.id);
         if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, ...confirmed };
         else confirmedMetadata.current.set(m.id, { id: m.id, title: m.title, pinned: m.pinned === true, updatedAt: m.updatedAt });
+        const pendingTitle = pendingTitles.current.get(m.id);
+        if (pendingTitle !== undefined) m = { ...m, title: pendingTitle };
         const s = metaToSession(m, user.id);
         if (s.modelId !== undefined && !modelPayloadFresh(m.id, payloadUpdatedAt)) {
           const { modelId: _stale, ...rest } = s;
@@ -650,9 +654,19 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
     if (!demo) {
       cbRef.current.sockRef.current?.renameSession(s.id, t);
+      // 60s 轮询 / 窗口 focus 重拉随时可能在飞：PATCH 落地前带回的旧标题曾把乐观标题盖回去，
+      // 用户看到「第一次重命名没生效」(#1240)。落地前钉住本地标题，落地后按服务端 updatedAt 记为已确认，
+      // 更早的列表快照(updatedAt 更小)由 mapListMetas 的 confirmed 分支挡住。
+      pendingTitles.current.set(s.id, t);
       try {
-        await api.patchSessionTitle(cbRef.current.authSession, s.id, t);
+        const res = await api.patchSessionTitle(cbRef.current.authSession, s.id, t);
+        const prev = confirmedMetadata.current.get(s.id);
+        if (typeof res?.updatedAt === "number" && (!prev || prev.updatedAt <= res.updatedAt)) {
+          confirmedMetadata.current.set(s.id, { id: s.id, title: t, pinned: s.pinned === true, updatedAt: res.updatedAt });
+        }
+        if (pendingTitles.current.get(s.id) === t) pendingTitles.current.delete(s.id);
       } catch (e) {
+        if (pendingTitles.current.get(s.id) === t) pendingTitles.current.delete(s.id);
         // 服务端失败：此前静默吞掉，60s 轮询 server-wins 后标题「自己变回去」（USL-01）。
         // 现在立刻回滚三个持有方并告知，用户可重试。
         setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: s.title } : x)));
@@ -937,6 +951,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     listRefreshInflightRef.current = null;
     loadMoreInflightRef.current = false;
     confirmedMetadata.current.clear();
+    pendingTitles.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
