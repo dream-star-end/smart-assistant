@@ -8,7 +8,10 @@
  *   {"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text",
  *     "text":"You've hit your session limit · resets 11:20pm (Asia/Taipei)"}]}}
  *   {"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text",
- *     "text":"Not logged in · Please run /login"}]}} */
+ *     "text":"Not logged in · Please run /login"}]}}
+ * A login whose refresh failed (2.1.312, 2026-10-29): the interactive runner says "Login expired ·
+ * Please run /login"; `-p` tags the record `"error":"authentication_failed"` and words it "Failed to
+ * authenticate: OAuth session expired and could not be refreshed". */
 
 export type BoxProfileSignal =
   | { kind: "rate_limit"; status: "allowed" | "allowed_warning" | "rejected" | "other";
@@ -23,6 +26,9 @@ export type BoxProfileSignal =
 export interface BoxQuotaWindow { utilization: number; resetsAtMs: number | null }
 export interface BoxQuotaWindows { fiveHour?: BoxQuotaWindow; sevenDay?: BoxQuotaWindow }
 
+/** A login the CLI can no longer use: no credentials, a refresh that failed, a revoked token. */
+const LOGIN_LOST = /^(?:Not logged in|Login expired|OAuth token revoked)\b/;
+
 function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -35,7 +41,7 @@ function parseLine(line: string): BoxProfileSignal | null {
   let record: unknown;
   try { record = JSON.parse(line); } catch { return null; }
   if (!record || typeof record !== "object") return null;
-  const top = record as { type?: unknown; rate_limit_info?: unknown; message?: unknown };
+  const top = record as { type?: unknown; rate_limit_info?: unknown; message?: unknown; error?: unknown };
   if (top.type === "rate_limit_event") {
     const info = top.rate_limit_info;
     if (!info || typeof info !== "object") return null;
@@ -70,9 +76,10 @@ function parseLine(line: string): BoxProfileSignal | null {
   if (top.type === "assistant" && top.message && typeof top.message === "object") {
     const message = top.message as { model?: unknown; content?: unknown };
     if (message.model !== "<synthetic>" || !Array.isArray(message.content)) return null;
+    if (top.error === "authentication_failed") return { kind: "login_required" };
     for (const block of message.content) {
       const text = block && typeof block === "object" ? (block as { text?: unknown }).text : null;
-      if (typeof text === "string" && /^Not logged in\b/.test(text)) return { kind: "login_required" };
+      if (typeof text === "string" && LOGIN_LOST.test(text)) return { kind: "login_required" };
     }
   }
   return null;

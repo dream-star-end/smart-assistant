@@ -301,6 +301,17 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
    与容器网段错配(已收口 containerNet 单一权威,再现=有人复制了私有副本);③对照 turn_dispatches
    行的 admitted→terminal 间隔,秒级即死大概率是①。
 
+7. **Box 模型(box-api-claude-* / box-claude-*)全部秒失败**:先在 Box 上看登录,再看解码器。
+   `env -u CLAUDE_CONFIG_DIR claude auth status`(default 登录 = `/home/box/.claude`)是
+   `loggedIn:false` 就是登录丢了,不是额度也不是调度(2026-10-29:Box 08:12 恢复后,恢复回来的
+   cc1 令牌在 09:41 首次刷新失败被 CLI 清空,商业 15 次 Box 请求全挂)。CLI 对这类失败不发请求,
+   直接写一条替身消息(interactive "Login expired · Please run /login";`-p` 记 `error:"authentication_failed"`),
+   `/tmp/ocv5-289-run-*/stdout.jsonl` 里 `duration_api_ms:0`、`errors:["turn ended on an API error"]`。
+   oc-bridge 以前把它印成真模型名、无 stop_reason,路由报 `BOX_TOOL_STOP_REASON_INVALID`→`BOX_REPLAY_REJECTED`;
+   现在按 `-p` 印成 `<synthetic>`+`is_api_error_message`,报 `BOX_CLI_UPSTREAM_REFUSED` 并把该登录 bench 成
+   `login_required`。恢复只能由账号持有人重新 OAuth(box 用户、不设 CLAUDE_CONFIG_DIR 跑
+   `claude auth login`);不要把别的配置目录的 `.credentials.json` 拷过来——同一 refresh token 两处轮换会互相踢掉。
+
 ### 3.3 会话历史/持久化问题(高频类)
 心智模型:**用户行走 POST /user-message；模型生成内容由 v2 lossless turn tape 在 PG 中完整保存，`client_sessions.messages` 只留常量大小 anchor，读取时水合为 assistant/thinking/tool/agent-group/plan/goal**。合并语义在 `lib/persist.ts`:
 - full 合并 `mergeFullServerWins`:server 权威在前,保留尾部乐观段 + 中段 local-only user 行 + 中段 local-only 团队卡;
