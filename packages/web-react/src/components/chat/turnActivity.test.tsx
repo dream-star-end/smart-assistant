@@ -124,7 +124,7 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();
   });
 
-  test("TRUTH-08: 容器回合内重试写明第 n 次，保持中性活动行", () => {
+  test("OCV5-523: retrying → one model-busy retry hint, no counter or warning colour", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
