@@ -3,6 +3,7 @@
   "_doc": "OCV5-582: every gate the selfhost release train runs, and the PR workflow that runs the same script/command. scripts/check-release-gate-parity.ts keeps this list, build_master_release() and .github/workflows/v5-selfhost-*.yml equal in both directions. A gate CI cannot run needs a written ciExempt reason instead of ci.",
   "gates": [
     { "id": "prompt-privacy-lifecycle", "script": "scripts/check-v5-prompt-privacy-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "session-workspace-boundary", "script": "scripts/check-v5-session-workspace-boundary.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-success-recovery", "script": "scripts/check-v5-box-success-recovery.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-continuation", "script": "scripts/check-v5-box-continuation.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-incident-proofs", "script": "scripts/check-v5-box-incident-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },

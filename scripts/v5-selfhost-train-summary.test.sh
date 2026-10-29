@@ -176,11 +176,11 @@ for mode in deploy prewarm-artifacts; do
   done
 done
 check "cmd_deploy starts the recorder" bash -c "sed -n '/^cmd_deploy() {/,/^}/p' '$DEPLOY' | grep -qE '^  tsum_init '"
-# P3: eleven C jobs + D share one wall-clock phase; four isolated C gates retain marks.
+# P3: twelve C jobs + D share one wall-clock phase; four isolated C gates retain marks.
 # Exact execution/parent-only per-job receipts are covered by v5SelfhostParallelGates.node-test.mjs.
 body="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB")"
 queued="$(printf '%s\n' "$body" | grep -cE '^    C\.[a-z-]+:master_job_')"
-check "all eleven deterministic C jobs are queued" test "$queued" = 11
+check "all twelve deterministic C jobs are queued" test "$queued" = 12
 cmarks="$(printf '%s\n' "$body" | sed -n 's/^  tsum_mark \(C\.[a-z-]*\) .*/\1/p')"
 check "one C.parallel mark plus all four isolated C marks" test "$cmarks" = $'C.parallel\nC.box-success-recovery\nC.box-continuation\nC.box-incident-proofs\nC.ccb-mcp'
 check "D is queued and its measured duration returns to the parent" \
