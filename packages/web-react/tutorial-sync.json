@@ -41,14 +41,14 @@
       "sourceHash": "28929dea79b975ded0f755c79f179c1c89e05acbbce7d1130a384e64a47e9159"
     },
     "chat-basics": {
-      "contentHash": "a56f353f7a551df181c4c41080bc12e9d7bb9879a076b67644fca792aa37e0c4",
-      "contentVersion": 10,
+      "contentHash": "000024acac21be57521f9d2d19d4b0c64cdc43ccb07e081006db72075174fbb3",
+      "contentVersion": 11,
       "entryIdentityHash": "4194fd045aa4495dbf08feb24034668f3d9bc26dd16f21d653357acafbfc8661",
       "mediaHash": "c499b1db8bcebaffaec1ad215c73f62adfc4326ac5c135c6a49c657fcdfb059a",
       "mediaKey": "chat-basics",
       "mediaVersion": 5,
       "registryHash": "343b05739f30ffb4df16583570adcf768ad03a8f0df19d80097465aec77dc35f",
-      "sourceHash": "871150229697c4a02d3939045e728ebc984129d3f706e536281b425f7faeb204"
+      "sourceHash": "eda9a047da7310cc83678b269bac1035f1c822570a5a5e6ebf0ff1e7f9b92ce1"
     },
     "connectors": {
       "contentHash": "60d53be82da147122f4fef4ea5028d7e02e59148ab15b9454ee7aa933f45a874",
