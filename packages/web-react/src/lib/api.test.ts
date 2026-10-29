@@ -1383,3 +1383,74 @@ test('confirmDesktopEnroll posts enrollment_id and drops code from the caller re
   expect(result.deepLink?.startsWith('openclaude://enroll/callback?')).toBe(true)
   expect(result).not.toHaveProperty('code')
 })
+
+function jwtWithExp(expSec: number): string {
+  return `${base64urlUtf8(JSON.stringify({ alg: 'none', typ: 'JWT' }))}.${base64urlUtf8(JSON.stringify({ exp: expSec }))}.sig`
+}
+
+test('a near-expiry access JWT refreshes before the request and the request sees only the new token', async () => {
+  const exp = Math.floor(Date.now() / 1000) - 5
+  const old = jwtWithExp(exp)
+  const seen: string[] = []
+  let refreshCalls = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url).includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        return ok({ access_token: 'tok-fresh', access_exp: 999, remember: true })
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch,
+  )
+  const { session, token } = makeSession(old)
+  const res = await callWithRefresh(session, async (used) => {
+    seen.push(used)
+    return ok({ ok: true }) as unknown as Response
+  })
+  expect(res.status).toBe(200)
+  expect(seen).toEqual(['tok-fresh'])
+  expect(refreshCalls).toBe(1)
+  expect(token()).toBe('tok-fresh')
+})
+
+test('an access JWT with more than 90s left does not pre-refresh', async () => {
+  const exp = Math.floor(Date.now() / 1000) + 10 * 60
+  const old = jwtWithExp(exp)
+  const seen: string[] = []
+  const fetchMock = vi.fn(async () => {
+    throw new Error('fetch should not run')
+  })
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession(old)
+  const res = await callWithRefresh(session, async (used) => {
+    seen.push(used)
+    return ok({ ok: true }) as unknown as Response
+  })
+  expect(res.status).toBe(200)
+  expect(seen).toEqual([old])
+  expect(fetchMock).not.toHaveBeenCalled()
+})
+
+test('a non-JWT token still waits for 401 before refreshing', async () => {
+  const seen: string[] = []
+  let refreshCalls = 0
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string) => {
+      if (String(url).includes('/api/auth/refresh')) {
+        refreshCalls += 1
+        return ok({ access_token: 'tok-after-401', access_exp: 999, remember: true })
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch,
+  )
+  const { session } = makeSession('account-a')
+  const res = await callWithRefresh(session, async (used) => {
+    seen.push(used)
+    return (used === 'account-a' ? unauthorized() : ok({ ok: true })) as unknown as Response
+  })
+  expect(res.status).toBe(200)
+  expect(seen).toEqual(['account-a', 'tok-after-401'])
+  expect(refreshCalls).toBe(1)
+})

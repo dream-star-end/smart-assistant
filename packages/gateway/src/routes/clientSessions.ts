@@ -939,6 +939,13 @@ export function handleClientSessionsHttp(
           }
           putModelId = m
         }
+        // 建行探针打到已存在的活跃行：200 空操作，不写库、不 409。
+        // 缺行 / 已删除仍走下面的 upsert（deleted 不是 active）。
+        // 带消息或非 0 _baseSyncedAt 的真 stale 写保持 409。
+        if (isSessionEnsureProbe(data) && (await clientSessionIsActive(sessId, userId))) {
+          io.sendJson(res, 200, { ok: true, applied: false, existed: true })
+          return
+        }
         const updatedAt = Date.now()
         const result = await upsertClientSession(
           {
@@ -1070,6 +1077,20 @@ export function handleClientSessionsHttp(
     }
   }
   return false
+}
+
+/**
+ * ensureServerSession 的建行探针：messages 空（或缺席）且 _baseSyncedAt 缺席或 0。
+ * 行已存在时这是 no-op，不应走 upsert 的 rejected_stale 409。
+ * 带消息或非 0 水位的写入仍走原乐观并发。
+ */
+export function isSessionEnsureProbe(data: {
+  messages?: unknown
+  _baseSyncedAt?: unknown
+}): boolean {
+  if (data._baseSyncedAt !== undefined && data._baseSyncedAt !== 0) return false
+  if (data.messages === undefined) return true
+  return Array.isArray(data.messages) && data.messages.length === 0
 }
 
 /**

@@ -372,6 +372,8 @@ export function App() {
   // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在登录页加载，已登录与首页深链时另取一次。
   const [signedInCommunityBlog, setSignedInCommunityBlog] = useState<boolean | null>(null);
   const [blogRequest, setBlogRequest] = useState<BlogViewRequest | null>(null);
+  // null = 还不知道。只有明确 true 才探测 inflight-delegates；失败 / 缺字段保持 null，不发请求。
+  const [delegateInflightSurface, setDelegateInflightSurface] = useState<boolean | null>(null);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
@@ -1107,18 +1109,24 @@ export function App() {
   // 已登录（侧栏入口）或教程中心已打开（含匿名访客的 tab=blog 深链）时取一次；登录页与 demo 不多发请求。
   const needCommunityBlogFlag = !demo && (authed || tutorialOpen);
   useEffect(() => {
-    if (!needCommunityBlogFlag || signedInCommunityBlog !== null) return;
+    if (
+      !needCommunityBlogFlag ||
+      (signedInCommunityBlog !== null && delegateInflightSurface !== null)
+    )
+      return;
     let cancelled = false;
     api
       .getPublicConfig()
       .then((cfg) => {
-        if (!cancelled) setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+        if (cancelled) return;
+        setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+        setDelegateInflightSurface(cfg.featureDelegateInflight === true);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [needCommunityBlogFlag, signedInCommunityBlog]);
+  }, [needCommunityBlogFlag, signedInCommunityBlog, delegateInflightSurface]);
   const communityBlogEnabled =
     !demo && (signedInCommunityBlog ?? publicCfg?.featureCommunityBlog === true);
 
@@ -1263,7 +1271,11 @@ export function App() {
   const inflightDelegates = useInflightDelegates({
     sessionId: !demo && activeId ? activeId : null,
     messages: wsMessages,
-    enabled: !demo && gate.access && !!activeId,
+    enabled:
+      !demo &&
+      gate.access &&
+      !!activeId &&
+      (delegateInflightSurface ?? publicCfg?.featureDelegateInflight) === true,
     auth,
   });
 

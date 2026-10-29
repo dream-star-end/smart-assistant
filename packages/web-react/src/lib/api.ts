@@ -1182,6 +1182,7 @@ export const api = {
       allow_registration: boolean;
       feature_community_blog?: boolean;
       feature_community_blog_ai_review?: boolean;
+      feature_delegate_inflight?: boolean;
     }>(fetch("/api/public/config", { headers: { Accept: "application/json" } })).then((b) => ({
       turnstileSiteKey: b.turnstile_site_key,
       turnstileBypass: b.turnstile_bypass,
@@ -1190,6 +1191,7 @@ export const api = {
       featureImage2: b.feature_image2,
       featureCommunityBlog: b.feature_community_blog === true,
       featureCommunityBlogAiReview: b.feature_community_blog_ai_review === true,
+      featureDelegateInflight: b.feature_delegate_inflight === true,
       allowRegistration: b.allow_registration,
     })),
 
