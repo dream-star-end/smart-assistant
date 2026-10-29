@@ -953,7 +953,7 @@ function useNowTicker(enabled: boolean): number {
   return now;
 }
 
-/** 叙述段写完、下一步还没冒出来时,静默多久才在时间轴末尾挂「正在思考下一步」(避免步骤间闪一下)。 */
+/** 可见进展结束后,静默多久才显示等待模型响应(避免步骤间闪一下)。 */
 const QUIET_TAIL_MS = 3_000;
 /** 当前步骤里的工具连续跑多久才在摘要行旁显示「已运行 N 秒」。 */
 const RUNNING_META_MS = 5_000;
@@ -969,6 +969,23 @@ function earliestRunningSince(messages: readonly ChatMessage[], turnStartedAt: n
     if (since === null || ts < since) since = ts;
   }
   return since;
+}
+
+/** A completed tool's result is the wait boundary, not a later heartbeat.
+ * Do not infer a wait while another tool/thinking/delegate row is active. */
+function completedToolsSince(messages: readonly ChatMessage[]): number | null {
+  if (messages.at(-1)?.role !== "tool" || messages.some((message) =>
+    (message.role !== "tool" && message.role !== "thinking") || toolStillRunning(message))) return null;
+  let latest: number | null = null;
+  for (const message of messages) {
+    if (message.role !== "tool") continue;
+    if (message._liveUnit || !Number.isFinite(message.ts) || message.ts <= 0) return null;
+    const end = message.completedAt ?? (typeof message.durationMs === "number" && Number.isFinite(message.durationMs) && message.durationMs >= 0
+      ? message.ts + message.durationMs : undefined);
+    if (typeof end !== "number" || !Number.isFinite(end) || end < message.ts) return null;
+    latest = Math.max(latest ?? end, end);
+  }
+  return latest;
 }
 
 // 与右栏「N 步」同口径(OCV5-640):只数工具调用。以前思考、计划、子任务也各算一步,同一轮聊天写
@@ -996,7 +1013,7 @@ function kindTally<T>(sections: readonly ProcessSection<T>[], messagesOf: (item:
   return [...counts].sort((a, b) => b[1] - a[1]);
 }
 
-/** 外壳标题上的实时动作:当前那一段的最新动作;一步刚跑完、下一步还没来时是「正在思考下一步」。 */
+/** Only a thinking row proves thinking; silence is waiting for a model response. */
 function shellLivePhrase<T>(
   sections: readonly ProcessSection<T>[],
   currentIndex: number,
@@ -1004,12 +1021,11 @@ function shellLivePhrase<T>(
 ): { text: string; pending: boolean } {
   const current = sections[currentIndex];
   if (!current) return { text: "正在处理", pending: true };
-  // 叙述段已经写完一阵、下一步还没来:模型在想下一步,不是还在写这段话。
-  if (current.narrative) return { text: narrativeSettled ? "正在思考下一步" : "正在组织回复", pending: true };
+  if (current.narrative) return { text: narrativeSettled ? "等待模型响应" : "正在组织回复", pending: true };
   const status = stepLiveStatus(current.messages);
   if (!status.text) return { text: "正在处理", pending: true };
   if (status.pending) return status;
-  return { text: "正在思考下一步", pending: true };
+  return { text: "等待模型响应", pending: true };
 }
 
 const KIND_PHRASE: Record<string, (n: number) => string> = {
@@ -1144,7 +1160,7 @@ export function ProcessDisclosure<T>({
   startedAt?: number | null;
   /**
    * 本会话最近一帧到达浏览器的时刻(会话级 _lastFrameAt)。只用于进行中的「静默多久」判断:
-   * 叙述段写完后迟迟没有下一步时,在时间轴末尾挂一行「正在思考下一步」;工具长时间运行时在
+   * 叙述段写完后迟迟没有下一步时,在时间轴末尾挂一行「等待模型响应」;工具长时间运行时在
    * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
    */
   lastFrameAt?: number | null;
@@ -1183,11 +1199,16 @@ export function ProcessDisclosure<T>({
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
   // 用户只能看到一段静止的文字(外壳标题的计时在长过程里早已滚出视口)。
-  const liveClock = active && typeof lastFrameAt === "number" && Number.isFinite(lastFrameAt) && lastFrameAt > 0;
-  const now = useNowTicker(liveClock);
   const currentSection = currentIndex >= 0 ? sections[currentIndex] : undefined;
+  const completedSince = currentSection && !currentSection.narrative ? completedToolsSince(currentSection.messages) : null;
+  const liveClock = active && typeof lastFrameAt === "number" && Number.isFinite(lastFrameAt) && lastFrameAt > 0;
+  const now = useNowTicker(liveClock || (active && completedSince !== null));
   const quietMs = liveClock ? Math.max(0, now - (lastFrameAt as number)) : 0;
   const narrativeSettled = liveClock && !!currentSection?.narrative && quietMs >= QUIET_TAIL_MS;
+  const toolWaitMs = completedSince === null ? 0 : now - completedSince;
+  const toolsSettled = active && completedSince !== null && toolWaitMs >= QUIET_TAIL_MS && toolWaitMs <= 24 * 3600_000;
+  const waiting = narrativeSettled || toolsSettled;
+  const waitingMs = toolsSettled ? toolWaitMs : quietMs;
   const runningSince =
     liveClock && currentSection && !currentSection.narrative ? earliestRunningSince(currentSection.messages, startedAt) : null;
   const runningMs = runningSince === null ? 0 : now - runningSince;
@@ -1391,7 +1412,7 @@ export function ProcessDisclosure<T>({
               // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
-              const working = active && index === currentIndex;
+              const working = active && index === currentIndex && !toolsSettled;
               const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
@@ -1448,14 +1469,14 @@ export function ProcessDisclosure<T>({
                 </div>
               );
             }) : null}
-            {open && narrativeSettled ? (
-              // 叙述段写完、下一步还没到:在最新进展处挂一行活的「正在思考下一步」+ 静默时长。
+            {open && waiting ? (
+              // 在最新进展处显示等待时长,不把已经完成的工具标为仍在执行。
               // 下一步一冒出来(新帧到达、当前段换成步骤组)这行就消失,流光随之落到那一段的摘要行上。
               <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
                 <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
-                  <span className="oc-live-status-shine min-w-0 truncate text-body text-muted">正在思考下一步</span>
+                  <span className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
                   <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
-                    {formatElapsed(quietMs)}
+                    {formatElapsed(waitingMs)}
                   </span>
                 </div>
               </RailRow>
