@@ -104,6 +104,9 @@ const WHITELIST = new Set<string>([
   // It does not write the six tables. Routing through sessions backend would
   // open a second transaction and lose the settle-time bind snapshot.
   "packages/commercial/src/billing/boardProjectAttribution.ts",
+  // #1237: /api/me/usage ledger rows read the owner's session title through one
+  // SELECT-only LEFT JOIN of client_sessions, bounded to the caller's uid and ledger ids.
+  "packages/commercial/src/billing/ledgerRowContext.ts",
   // Orphan dispatch finalize owns one atomic PG transaction: lock dispatch + lock the
   // tenant session row + append a visible tapeless fallback + close the dispatch.
   // Splitting the session projection through a backend call would lose that fence.

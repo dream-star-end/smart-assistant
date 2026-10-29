@@ -706,6 +706,10 @@ export type UsageLedgerRow = {
   ref_type: string | null;
   ref_id: string | null;
   memo: string | null;
+  /** 对话扣费行:模型展示名(#1237)。非 usage_record 行或旧后端为空。 */
+  model_name?: string | null;
+  /** 对话扣费行:所属会话标题(本人且未删除)。 */
+  session_title?: string | null;
   created_at: string;
 };
 

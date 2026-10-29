@@ -256,6 +256,36 @@ describe("AccountTab 账单流水文案", () => {
     expect(label).toHaveAttribute("title", "mystery_backend_reason");
     expect(screen.queryByText("mystery_backend_reason")).not.toBeInTheDocument();
   });
+
+  test("#1237 对话扣费行：显示模型与会话、北京时间，不显示 cost=<n>", async () => {
+    mockedGetSub.mockResolvedValue(makeSub("4000", "3000"));
+    const usage = makeUsage();
+    usage.ledger = {
+      rows: [
+        {
+          id: "26673",
+          delta: "-53",
+          balance_after: "198338",
+          reason: "chat",
+          ref_type: "usage_record",
+          ref_id: "28950",
+          memo: "cost=53",
+          model_name: "Gemini 4 Argon (Antigravity)",
+          session_title: "体验-金融",
+          created_at: "2026-10-29T03:12:24.566Z",
+        },
+      ],
+      next_before: null,
+    };
+    mockedGetUsage.mockResolvedValue(usage);
+    renderTab();
+    const memo = await screen.findByText(/Gemini 4 Argon \(Antigravity\) · 体验-金融/);
+    const row = memo.closest("li") as HTMLElement;
+    expect(within(row).getByText("对话扣费")).toBeInTheDocument();
+    expect(within(row).getByText(/10月29日 11:12/)).toBeInTheDocument();
+    expect(within(row).queryByText(/cost=/)).not.toBeInTheDocument();
+    expect(screen.getByText("对话结束后结算入账，时间为北京时间")).toBeInTheDocument();
+  });
 });
 
 describe("AccountTab 积分收支卡", () => {
