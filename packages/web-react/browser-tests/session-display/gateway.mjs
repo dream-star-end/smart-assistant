@@ -1,9 +1,11 @@
 /**
  * Session-display mock gateway.
  *
- * Speaks the hello path that is on feat/v5-selfhost today
- * (helloOpenDispatchSnapshot + outbound ring catch-up). It does not invent
- * the unmerged codex-rf-snapshot fields. engine_starting is stored with a
+ * Speaks the hello path that is on feat/v5-selfhost today: the #1198
+ * compatibility turn_status, outbound ring catch-up, and the #1200
+ * `outbound.session_snapshot` (commercial/src/ws/helloOpenDispatchSnapshot.ts);
+ * HTTP live-frames carries the same snapshot (commercial/src/db/sessionSnapshot.ts,
+ * one dispatch stream, no pages/byte limits). engine_starting is stored with a
  * frameSeq so a later hello does not replay it after the detached snapshot
  * and paint 「正在启动引擎」 again. Content frames stay replayable.
  */
@@ -74,6 +76,8 @@ function finalText(clientMessageId, frameSeq, text) {
     meta: { turn: 1, stopReason: 'end_turn' },
   }
 }
+
+const STREAM_KEY = 'dispatch:dsp-sd-1:1'
 
 function isReplayable(frame) {
   if (typeof frame.frameSeq !== 'number' || frame.frameSeq <= 0) return false
@@ -187,6 +191,41 @@ export class MockGateway {
       meta: { detached: true, since: this.admittedAt },
       ts: Date.now(),
     }
+  }
+
+  /** buildSessionSnapshot for this one-dispatch session (#1200 contract). */
+  sessionSnapshot({ afterSeq, streamKey } = {}) {
+    const snapshot = {
+      v: 1, sessionId: SESSION_ID, dispatch: null, streamKey: null, lastFrameSeq: null,
+      lastFrameAt: null, engineReady: null, turnStatus: null, reconcile: null,
+      pendingPermissions: { items: [], completeness: 'complete' }, usage: null, credits: null,
+      frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: Date.now(),
+    }
+    if (!this.clientMessageId) return snapshot
+    const open = this.status === 'open'
+    snapshot.dispatch = {
+      id: 'dsp-sd-1', clientMessageId: this.clientMessageId, agentId: AGENT_ID,
+      status: open ? 'accepted' : 'terminal', outcome: open ? null : 'completed', attempt: 1,
+      since: this.admittedAt, acceptedAt: this.admittedAt, terminalAt: open ? null : this.updatedAt,
+    }
+    snapshot.streamKey = STREAM_KEY
+    const lastFrameSeq = this.frames.reduce((max, frame) => Math.max(max, frame.frameSeq || 0), 0)
+    snapshot.lastFrameSeq = lastFrameSeq || null
+    snapshot.lastFrameAt = lastFrameSeq ? Date.now() : null
+    if (open) {
+      snapshot.engineReady = this.engineReady
+      snapshot.turnStatus = this.snapshotFrame()
+    } else snapshot.reconcile = 'turn_completed'
+    const asked = Number(afterSeq) > 0 ? Number(afterSeq) : 0
+    const reset = asked > 0 && (streamKey !== STREAM_KEY || asked > lastFrameSeq)
+    snapshot.nextAfterSeq = reset ? 0 : asked
+    for (const payload of this.frames) {
+      if (!(payload.frameSeq > snapshot.nextAfterSeq)) continue
+      snapshot.frames.push({ recordId: `rec-${payload.frameSeq}`, frameSeq: payload.frameSeq, payload })
+      snapshot.nextAfterSeq = payload.frameSeq
+    }
+    if (reset) snapshot.gap = { reason: 'cursor_reset' }
+    return snapshot
   }
 
   userMessage() {
@@ -340,6 +379,12 @@ export class MockGateway {
       if (this.status === 'open' && this.clientMessageId) {
         this.send(ws, this.snapshotFrame())
       }
+      if (match?.peerId === SESSION_ID) {
+        this.send(ws, {
+          type: 'outbound.session_snapshot', channel: 'webchat', peer: peer(),
+          snapshot: this.sessionSnapshot({ afterSeq: match.lastFrameSeq, streamKey: match.lastStreamKey }),
+        })
+      }
       for (const item of this.frames) {
         if (!isReplayable(item)) continue
         if ((item.frameSeq || 0) <= last) continue
@@ -404,7 +449,13 @@ export async function startSessionDisplayGateway(assetDir) {
           req.method === 'GET' &&
           (path === `${sessionPath}/live-frames` || path.startsWith(`${sessionPath}/live-frames/`))
         ) {
-          const body = JSON.stringify(gateway.liveFramesPage())
+          const body = JSON.stringify({
+            ...gateway.liveFramesPage(),
+            snapshot: gateway.sessionSnapshot({
+              afterSeq: url.searchParams.get('afterSeq'),
+              streamKey: url.searchParams.get('streamKey') ?? undefined,
+            }),
+          })
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
           res.end(body)
           return

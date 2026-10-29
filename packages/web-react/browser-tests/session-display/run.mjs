@@ -315,6 +315,9 @@ async function runR2(browser, gateway) {
     const label = await waitHonest(page, gateway, 5_000)
     await assertContent(page, gateway, text)
     assertHonest(label)
+    // B3: back in the foreground with no snapshot or sequenced frame for 8s, the browser reads the
+    // same session snapshot over HTTP; the parked frame arrives through it.
+    await page.clock.fastForward(8_000)
     await expectProcessText(page, gateway, thinking)
     return '通过'
   } finally {
