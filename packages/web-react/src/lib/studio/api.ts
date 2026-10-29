@@ -101,7 +101,9 @@ export const studioApi = {
     call<StudioProjectView>(auth, `/projects/${encodeURIComponent(id)}/start`, { method: 'POST' }),
   /** Confirm a waiting plan / raised budget (awaiting_user + approve_plan|budget). */
   approve: (auth: AuthSession, id: string) =>
-    call<StudioProjectView>(auth, `/projects/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
+    call<StudioProjectView>(auth, `/projects/${encodeURIComponent(id)}/approve`, {
+      method: 'POST',
+    }),
   /** Upload (images by default, or audio for a clone sample; ≤ 25 MB); the server checks the bytes. */
   uploadAsset: async (
     auth: AuthSession,
@@ -216,6 +218,14 @@ export const studioApi = {
     call<{ ok: true }>(auth, `/annotations/${encodeURIComponent(id)}/${action}`, {
       method: 'POST',
     }),
+  /**
+   * Adopt one finished take (POST /takes/:id/select). A video is kept and the shot is ready; a frame
+   * sends the shot back to generating a new video from it. A project waiting on the user resumes.
+   */
+  selectTake: (auth: AuthSession, takeId: string) =>
+    call<{ projectId: string }>(auth, `/takes/${encodeURIComponent(takeId)}/select`, {
+      method: 'POST',
+    }),
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -264,6 +274,8 @@ export function studioErrorText(err: unknown): string {
         return '目标时长太长了，请先调短'
       case 'STUDIO_VOICE_CUSTOM_OFF':
         return '自定义音色即将开放，现在可以用系统音色'
+      case 'STUDIO_TAKE_NOT_READY':
+        return '这个版本还没生成完，不能采用'
       case 'ANNOTATION_BUSY':
         return '这条批注正在执行或已经处理过了'
       case 'ANNOTATION_LIMIT':
