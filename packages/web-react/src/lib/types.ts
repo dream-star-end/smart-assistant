@@ -324,6 +324,8 @@ export type PublicConfig = {
   featureCommunityBlog?: boolean;
   /** 经验分享投稿是否先走 AI 自动审核（OC_TUTORIAL_AI_MODERATION=on）。 */
   featureCommunityBlogAiReview?: boolean;
+  /** 会话级 inflight 委派条。缺省或 false = 不探测（商业 flag 关时不打 404）。 */
+  featureDelegateInflight?: boolean;
 };
 
 /**
