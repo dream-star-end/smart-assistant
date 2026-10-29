@@ -9995,7 +9995,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
     return injectOriginTurn({ deps, input, linksEnabled: links !== null,
-      getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(String(input.uid))),
+      getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString())),
       acquire: wake ? carrier => wake.acquire(carrier) : undefined,
     });
   }

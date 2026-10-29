@@ -9,7 +9,11 @@ import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
 import { createProofTsxCache } from './lib/proofTsxCache.js'
 
 const root = process.cwd()
-const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
+// Origin admission was extracted from the bridge; preserve every invariant
+// across the same execution source set, as for the gateway split below.
+const bridge = ['userChatBridge.ts', 'originTurnInjection.ts']
+  .map((file) => readFileSync(join(root, 'packages/commercial/src/ws', file), 'utf8'))
+  .join('\n')
 const reconciler = readFileSync(
   join(root, 'packages/commercial/src/dispatch/turnDispatchReconciler.ts'),
   'utf8',
