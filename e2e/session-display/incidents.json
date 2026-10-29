@@ -9247,6 +9247,31 @@
           "assertion": "an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
         }
       ]
+    },
+    {
+      "id": "INC-20261029-ESC-STOP-STATUS",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "个人版 #1233：GPT-6.1-Sol 运行时按 Esc 立即终止，且主动停止的 USER_CANCELLED 被会话终态推导缺省映为 executed_error，侧栏和系统通知误报出错。Esc 改为同一回合身份校验的确认框，用户停止归 interrupted 并显示中性已停止。只读核对 usage/journal/ledger：该轮有实际输出，按冻结费率结算9积分且仅扣一次；此改动不更改计费或余额。",
+      "rootFixCommit": "5ad56ab1",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/esc-stop.node-test.mjs",
+          "assertion": "#1233: trusted Escape confirms, cancels safely, and never stops a replacement turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useStopShortcut.test.tsx",
+          "assertion": "Esc requests confirmation; cancel keeps running and explicit confirm stops once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/sessionStatus.test.ts",
+          "assertion": "%s 不把主动停止误判成执行失败"
+        }
+      ]
     }
   ]
 }
