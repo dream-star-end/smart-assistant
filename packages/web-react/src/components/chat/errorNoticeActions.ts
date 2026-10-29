@@ -1,8 +1,10 @@
+import { pickErrorActions } from "../../lib/chat/userErrorNotice";
+import { requestSubscribeIntent, type SubscribeIntent } from "../../lib/subscribeIntent";
+import { reportClientFriction } from "../../lib/clientFriction";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   type ErrorActionHandlers,
   type ErrorNoticeAction,
-  pickErrorActions,
   type UserError,
 } from "../../lib/chat/userErrorView";
 import type { NoticeAction } from "../ui/Notice";
@@ -36,7 +38,7 @@ export type ErrorNoticeActionsInput = {
   /** 原 user 行(修改消息用),不要求可重试。 */
   editTarget?: ChatMessage;
   continueInterrupted?: () => void;
-  topUp?: ErrorNoticeAction;
+  topUp?: { label: string; intent: SubscribeIntent };
   contactAdmin?: () => void;
 };
 
@@ -59,7 +61,17 @@ export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeA
     }
   }
   if (!waived && cb.onStartNewSession) h.new_session = { label: "新建会话继续", onClick: cb.onStartNewSession };
-  if (input.topUp) h.topup = input.topUp;
+  if (input.topUp && cb.onTopUp) {
+    const { label, intent } = input.topUp;
+    h.topup = { label, onClick: () => {
+      requestSubscribeIntent(intent);
+      reportClientFriction(
+        { surface: "chat", stage: "exhausted_cta", code: "EXHAUSTED_CTA", outcome: "succeeded" },
+        cb.getToken?.(),
+      );
+      cb.onTopUp?.();
+    } };
+  }
   if (input.contactAdmin) h.contact_admin = { label: "联系管理员", onClick: input.contactAdmin };
   // 断点续接是这张卡最有用的出口,目录没把「重试」排第一时也放在最前面。
   const order = input.continueInterrupted && isLastTurn

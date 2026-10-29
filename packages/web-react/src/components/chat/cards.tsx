@@ -49,15 +49,13 @@ import {
   stripMarkdown,
 } from "../../lib/chat/render";
 import {
-  errorTechnicalDetails,
   readUserError,
-  standaloneErrorTitle,
 } from "../../lib/chat/userErrorView";
 // 从 lib 取(不是 settings/SubscriptionDialog):红卡在首屏同步渲染,静态引订阅弹窗会把弹窗 +
 // 支付入口一并钉进入口闭包(2026-09-17 first-screen-budget 超限修复)。
-import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../../lib/subscribeIntent";
+import { lastKnownSubscriptionPaid } from "../../lib/subscribeIntent";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
-import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
+import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { useUiPlainText } from "../iui/plainText";
 import { Markdown } from "../Markdown";
@@ -78,9 +76,8 @@ import {
   useToast,
 } from "../ui";
 import { formatDate } from "../ui/TimeAgo";
-import { Notice } from "../ui/Notice";
 import type { ErrorNoticeActionsInput } from "./errorNoticeActions";
-import { ErrorNotice, ErrorTechDetails } from "./lazyTurnErrorNotice";
+import { ErrorNotice } from "./lazyTurnErrorNotice";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
@@ -829,12 +826,12 @@ export function TurnStatusCard({
   const retry = retryTarget && cb.onRetrySend
     ? { label: "重试", onClick: () => cb.onRetrySend?.(retryTarget) }
     : cb.onRegenerate ? { label: "重新尝试", onClick: cb.onRegenerate } : undefined;
-  const details = errorTechnicalDetails({
+  const details = {
     code: msg._errorCode,
     requestId: msg.usage?.traceId,
     clientMessageId: msg._clientMessageId,
     detail: presented.detail,
-  });
+  };
   return (
     <ErrorNotice
       role="status"
@@ -1069,28 +1066,18 @@ export function AssistantCard({
       editTarget: sourceUser,
       continueInterrupted: showInterruptedContinuation ? () => cb.onContinueInterrupted?.(msg) : undefined,
       topUp: isInsufficient && cb.onTopUp
-        ? {
-            label: creditsCopy.cta,
-            onClick: () => {
-              requestSubscribeIntent(creditsCopy.intent);
-              reportClientFriction(
-                { surface: "chat", stage: "exhausted_cta", code: "EXHAUSTED_CTA", outcome: "succeeded" },
-                cb.getToken?.(),
-              );
-              cb.onTopUp?.();
-            },
-          }
+        ? { label: creditsCopy.cta, intent: creditsCopy.intent }
         : undefined,
       contactAdmin: cb.onFeedback ? () => cb.onFeedback?.(buildFeedbackCtx(msg)) : undefined,
     };
   // 错误码、请求 ID、消息 ID 只进「技术详情」,默认收起。
   const technicalDetails = presentedError || standaloneError
-    ? errorTechnicalDetails({
+    ? {
         code: standaloneError?.code ?? msg._errorCode,
         requestId: msg.usage?.traceId,
         clientMessageId: msg._clientMessageId,
         detail: shownDetail,
-      })
+      }
     : undefined;
   // Finalized immutable tapes may contain a deferred runtime batch after the
   // canonical assistant row. That transport row must still mount and decode,
@@ -1237,16 +1224,15 @@ export function AssistantCard({
             )}
           </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
-          <Notice
+          <ErrorNotice
             role="alert"
             tone="attention"
             className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
             title="这句没有发出去"
-            actions={isLastTurn && cb.onRegenerate ? [{ label: "重试", onClick: cb.onRegenerate }] : undefined}
-            details={technicalDetails ? <ErrorTechDetails text={technicalDetails} /> : undefined}
-          >
-            {msg._recoverySkippedNotice}
-          </Notice>
+            actions={() => isLastTurn && cb.onRegenerate ? [{ label: "重试", onClick: cb.onRegenerate }] : []}
+            details={technicalDetails}
+            fixedBody={msg._recoverySkippedNotice}
+          />
         ) : !suppressErrorAlert && presentedError ? (
           // 终态错误卡(W3):一句标题 + 人话正文 + 最多两个建议动作 + 收起的技术详情。
           <ErrorNotice
@@ -1270,7 +1256,6 @@ export function AssistantCard({
             role="alert"
             tone="attention"
             className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
-            title={standaloneErrorTitle(standaloneError)}
             userError={standaloneError}
             actions={errorActions}
             details={technicalDetails}

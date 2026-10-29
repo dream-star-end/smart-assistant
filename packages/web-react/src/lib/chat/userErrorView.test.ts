@@ -1,12 +1,10 @@
 import { USER_ERROR_CATALOG } from "@openclaude/protocol/browser";
 import { describe, expect, test, vi } from "vitest";
 import { resolveUserError } from "./userErrorLookup";
+import { errorTechnicalDetails, pickErrorActions, standaloneErrorTitle } from "./userErrorNotice";
 import {
-  errorTechnicalDetails,
   knownUserError,
-  pickErrorActions,
   readUserError,
-  standaloneErrorTitle,
 } from "./userErrorView";
 
 const wire = {

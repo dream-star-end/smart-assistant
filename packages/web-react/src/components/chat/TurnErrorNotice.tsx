@@ -6,6 +6,7 @@
  * 冻结的旧快照正文)由调用方作为 fixedBody 传入。动作按目录建议,执行入口由调用方给。
  */
 import type { ReactNode } from "react";
+import { errorTechnicalDetails, standaloneErrorTitle } from "../../lib/chat/userErrorNotice";
 import { resolveUserError } from "../../lib/chat/userErrorLookup";
 import type { ErrorNoticeAction, UserError } from "../../lib/chat/userErrorView";
 import type { NoticeTone } from "../../lib/ui/statusTone";
@@ -18,7 +19,7 @@ export { ErrorTechDetails };
 export type TurnErrorNoticeProps = {
   role: "alert" | "status";
   tone: NoticeTone;
-  title: ReactNode;
+  title?: ReactNode;
   className?: string;
   /** 服务端给的人话错误(错误帧 / 提交时的快照);没有就按 code 查目录。 */
   userError?: UserError;
@@ -30,19 +31,20 @@ export type TurnErrorNoticeProps = {
   /** 目录建议 → 可执行的按钮(最多两个)。终态卡传门控输入,由本块按目录排出按钮(errorNoticeActions)。 */
   actions: ((userError: UserError) => readonly ErrorNoticeAction[]) | Omit<ErrorNoticeActionsInput, "userError">;
   /** 技术详情(码、请求 ID、消息 ID),默认收起。 */
-  details?: string;
+  details?: string | Parameters<typeof errorTechnicalDetails>[0];
 };
 
 export function TurnErrorNotice(p: TurnErrorNoticeProps) {
   const userError = resolveUserError(p.userError, p.code);
+  const details = typeof p.details === "string" ? p.details : p.details ? errorTechnicalDetails(p.details) : undefined;
   return (
     <Notice
       role={p.role}
       tone={p.tone}
       className={p.className}
-      title={p.title}
+      title={p.title ?? standaloneErrorTitle(userError)}
       actions={noticeActions(typeof p.actions === "function" ? p.actions(userError) : errorNoticeActions({ ...p.actions, userError }))}
-      details={p.details ? <ErrorTechDetails text={p.details} /> : undefined}
+      details={details ? <ErrorTechDetails text={details} /> : undefined}
     >
       {p.fixedBody ?? userError.message}
       {p.note}
