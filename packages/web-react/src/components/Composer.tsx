@@ -33,7 +33,7 @@ import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
-import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
+import { clearDraft, draftExceedsStorage, readDraft } from "../lib/composerDraft";
 import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";

@@ -325,6 +325,9 @@ const DRIFT_BASELINE: Record<DriftMetric, Record<string, number>> = {
     "components/org": 1,
     "components/project": 4,
     "components/settings": 1,
+    // Commercial Studio is absent from selfhost. Freeze its unchanged
+    // 15ff7638b inventory when importing this new ratchet; only decreases follow.
+    "components/studio": 147,
     "components/ui": 4,
     "hooks": 2,
     "lib": 17,
