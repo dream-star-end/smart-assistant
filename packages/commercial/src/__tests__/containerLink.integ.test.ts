@@ -575,3 +575,58 @@ test("exact terminal Stop persists and replays the truthful ended reason without
     } finally { await rig.stop(); }
   } finally { await client.end(); }
 });
+
+test("control routing selects the exact user/session/turn carrier and leaves ambiguous or unauthorized controls unclaimed", async () => {
+  const client = await recoveryFixture();
+  const pool = fixturePools.get(client)!;
+  await client.query(`INSERT INTO client_sessions VALUES
+      ('ambiguous','c:42',NULL),('wrong-channel','c:42',NULL),
+      ('deleted-control','c:42',NOW()),('foreign-control','c:43',NULL),('other-session','c:42',NULL);
+    INSERT INTO agent_containers(id,user_id,state,runtime_channel,runtime_kind)
+      VALUES (8,42,'active','v5','desktop'),(9,42,'active','v3','docker');
+    INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,attempt_no,status,agent_container_id,admitted_at)
+      VALUES ('a1111111-1111-4111-8111-111111111111',42,'restored','newer-other-turn','main',1,'terminal',8,NOW()+interval '1 minute'),
+             ('a2222222-2222-4222-8222-222222222222',43,'restored','turn','main',1,'terminal',8,NOW()+interval '2 minutes'),
+             ('a3333333-3333-4333-8333-333333333333',42,'other-session','turn','main',1,'terminal',8,NOW()+interval '3 minutes'),
+             ('a4444444-4444-4444-8444-444444444444',42,'wrong-channel','turn','main',1,'accepted',9,NOW()),
+             ('a5555555-5555-4555-8555-555555555555',42,'deleted-control','turn','main',1,'accepted',7,NOW()),
+             ('a6666666-6666-4666-8666-666666666666',42,'foreign-control','turn','main',1,'accepted',7,NOW())`);
+  await admitDurableControl(pool, controlInput("routing-exact"));
+  for (const [id, sessionId] of [
+    ["routing-ambiguous", "ambiguous"], ["routing-channel", "wrong-channel"],
+    ["routing-deleted", "deleted-control"], ["routing-foreign", "foreign-control"],
+  ] as const) {
+    const input = controlInput(id);
+    input.sessionId = sessionId;
+    input.payload.peer = { id: sessionId, kind: "dm" };
+    await admitDurableControl(pool, input);
+  }
+  const received: string[] = [];
+  const lookups: number[] = [];
+  const rig = await recoveryRig(client, receiveControls(received), {
+    resolveContainerLinkEndpoint: async (uid, cid) => {
+      lookups.push(cid);
+      return resolveContainerLinkEndpoint(client, "v5", uid, cid);
+    },
+  });
+  try {
+    // Let only the durable-control timer discover work. An ambiguous prompt
+    // has no dispatch and must never guess between the docker and desktop.
+    await eventually(async () => (await client.query("SELECT status FROM turn_control_requests WHERE control_id='routing-exact'")).rows[0].status === "terminal");
+    await new Promise(resolve => setTimeout(resolve, 2100));
+    assert.deepEqual(received, ["routing-exact"]);
+    assert.deepEqual(lookups, [7], rig.events.join("\n"));
+    assert.equal(rig.sockets.length, 1);
+    assert.deepEqual(rig.bridge.containerLinkSnapshots!().map(link => ({ uid: link.uid, containerId: link.containerId, subscribers: link.subscribers })),
+      [{ uid: "42", containerId: 7, subscribers: 0 }]);
+    assert.deepEqual((await client.query(`SELECT control_id,status,delivery_attempt FROM turn_control_requests
+      WHERE control_id<>'routing-exact' ORDER BY control_id`)).rows, [
+      { control_id: "routing-ambiguous", status: "pending", delivery_attempt: 0 },
+      { control_id: "routing-channel", status: "pending", delivery_attempt: 0 },
+      { control_id: "routing-deleted", status: "pending", delivery_attempt: 0 },
+      { control_id: "routing-foreign", status: "pending", delivery_attempt: 0 },
+    ]);
+    assert.equal(rig.bridge.registry.total(), 0);
+    assert.equal(rig.activity(), 0);
+  } finally { await rig.stop(); await client.end(); }
+});
