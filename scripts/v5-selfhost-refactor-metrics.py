@@ -51,10 +51,15 @@ W3
 
 W5
   Box：人发回合里 model 以 box- 开头。非 completed 率 = outcome 不是 completed 的回合 / 回合数。
-  not_accepted 是其中 outcome='not_accepted' 的次数。
+  NULL outcome 也计入非 completed；completed 和 non_terminal 另列。
+  not_accepted 是其中 outcome='not_accepted' 的次数。失败桶保留模型、status/outcome/failure_code；
+  model_family 只按模型前缀分类，不代表实际 transport。stage 按 outcome/status 派生，不是日志阶段。
   续接拒绝：journal.error_msg / failure_code 命中 BOX_TOOL_OWNER_UNKNOWN、BOX_REPLAY_REJECTED、
   BOX_REPLAY_PENDING、ECHO_MISMATCH、echo mismatch、snapshot mismatch。按码分，web 与
-  自动化、连不上会话的行分开，头条只加 web。
+  自动化、连不上会话的行分开，头条只加 web；这份旧来源不覆盖准入前拒绝。
+  box_continuation_decisions：全个人实例校验事件，按五分钟相交桶、kind/component/release/commit
+  汇总 sample_count；没有 uid/model 标签，不能套用 H/uid 过滤，也不与旧 journal 次数相加。
+  边缘桶可能包含窗口外事件；没有持久化样本不等于拒绝为零。
 
 日志
   /var/log/openclaude-v5-selfhost.log* 只保留约 15 天。断线和日志侧 orphan 计数
@@ -66,7 +71,7 @@ W5
 安全
   只读。每段 SQL 由本脚本包进 BEGIN READ ONLY … ROLLBACK，statement_timeout=20s。
   库名写死为 openclaude_v5_selfhost（个人版）。不接收数据库 URL。
-  查询带时间范围；分组查询带 LIMIT。
+  查询带时间范围；W5 聚合保留全部分桶，其余分组查询带 LIMIT。
 """
 
 from __future__ import annotations
@@ -101,6 +106,17 @@ COHORT_NOTE = (
     "默认排除 uid 765 验收号。自动化会话（session_id 不以 web 开头）不进入比率。"
     "H 是 web 会话里 cmid 以 m- 开头且不是 m-recover- 的人发回合。"
     "S_recover 是 m-recover-。dlgcb- 与 lsc- 单独计数。"
+)
+BOX_FAILURE_BUCKETS_NOTE = (
+    "model_family 只按模型前缀分类（api_claude / claude / other_box），不代表实际 transport。"
+    "stage 是派生分类：outcome=not_accepted → admission；其余非 terminal → in_flight；"
+    "其余 terminal → execution，不是日志记录的真实失败阶段。NULL outcome 计入非 completed。"
+)
+BOX_CONTINUATION_DECISIONS_NOTE = (
+    "全个人实例的持久化校验事件，不是人发回合数；没有 uid/model 标签，不能按本报告 H/uid 过滤。"
+    "按与查询窗口相交的五分钟桶汇总 sample_count，边缘桶可能含窗口外事件。"
+    "这些是当前持久化快照，不与旧 journal 次数相加；刷盘延迟、丢样本需结合运行日志判断。"
+    "无持久化样本不证明拒绝为零。"
 )
 
 # 顺序有意义：先匹配更具体的请求体积，再匹配 prompt，再匹配上下文。
@@ -324,7 +340,9 @@ def box_summary(rows: list[dict]) -> list[dict]:
         out.append({
             "model": model,
             "turns": turns,
+            "completed": row.get("completed"),
             "non_completed": non_completed,
+            "non_terminal": row.get("non_terminal"),
             "not_accepted": not_accepted,
             "non_completed_rate": ratio(non_completed, turns),
         })
@@ -805,18 +823,56 @@ FROM (
 """,
         "box": f"""
 SELECT coalesce(json_agg(json_build_object(
-  'model', model, 'turns', turns, 'non_completed', non_completed, 'not_accepted', not_accepted
+  'model', model, 'turns', turns, 'completed', completed, 'non_completed', non_completed,
+  'non_terminal', non_terminal, 'not_accepted', not_accepted
 ) ORDER BY turns DESC), '[]'::json)
 FROM (
   SELECT model,
          count(*) AS turns,
+         count(*) FILTER (WHERE outcome = 'completed') AS completed,
          count(*) FILTER (WHERE outcome IS DISTINCT FROM 'completed') AS non_completed,
+         count(*) FILTER (WHERE status IS DISTINCT FROM 'terminal') AS non_terminal,
          count(*) FILTER (WHERE outcome = 'not_accepted') AS not_accepted
   FROM turn_dispatches
   WHERE {window} AND {user} AND {_h_sql()} AND model ~ '^box-'
   GROUP BY model
   ORDER BY turns DESC
-  LIMIT 40
+) t;
+""",
+        "box_failure_buckets": f"""
+SELECT coalesce(json_agg(t ORDER BY n DESC, model, stage, status, outcome, failure_code), '[]'::json)
+FROM (
+  SELECT model,
+         CASE WHEN model LIKE 'box-api-claude-%' THEN 'api_claude'
+              WHEN model LIKE 'box-claude-%' THEN 'claude'
+              ELSE 'other_box' END AS model_family,
+         CASE WHEN outcome = 'not_accepted' THEN 'admission'
+              WHEN status IS DISTINCT FROM 'terminal' THEN 'in_flight'
+              ELSE 'execution' END AS stage,
+         status, coalesce(outcome, '(none)') AS outcome,
+         coalesce(failure_code, '(none)') AS failure_code, count(*) AS n
+  FROM turn_dispatches
+  WHERE {window} AND {user} AND {_h_sql()} AND model ~ '^box-'
+    AND outcome IS DISTINCT FROM 'completed'
+  GROUP BY 1, 2, 3, 4, 5, 6
+) t;
+""",
+        "box_continuation_decisions": f"""
+SELECT coalesce(json_agg(json_build_object(
+  'bucket_start', bucket_start, 'kind', kind,
+  'stage', split_part(kind, ':', 1), 'decision', split_part(kind, ':', 2),
+  'reason', split_part(kind, ':', 3), 'component', component,
+  'control_plane_release', control_plane_release, 'control_plane_commit', control_plane_commit,
+  'n', n
+) ORDER BY bucket_start, kind, component, control_plane_release, control_plane_commit), '[]'::json)
+FROM (
+  SELECT bucket_start, labels->>'kind' AS kind, component,
+         control_plane_release, control_plane_commit, sum(sample_count) AS n
+  FROM telemetry_metric_rollups
+  WHERE metric = 'box_continuation_decisions'
+    AND bucket_start < {until_sql}::timestamptz
+    AND bucket_start + interval '5 minutes' > {since_sql}::timestamptz
+  GROUP BY bucket_start, labels->>'kind', component, control_plane_release, control_plane_commit
 ) t;
 """,
         "continuation": f"""
@@ -943,7 +999,7 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
                     "exists": True,
                 })
     box_rows = sql_results.get("box")
-    box = box_rows if _failed(box_rows) else box_summary(box_rows or [])
+    box = box_rows if box_rows is None or _failed(box_rows) else box_summary(box_rows)
     journal = sql_results.get("oversize_journal")
     messages = sql_results.get("oversize_messages")
     dispatch_over = sql_results.get("oversize_dispatch")
@@ -1014,8 +1070,15 @@ def assemble(window: dict, uids: list[int] | None, sql_results: dict, log_stats:
         },
         "w5": {
             "box_models": box,
+            "box_failure_buckets": sql_results.get("box_failure_buckets"),
+            "box_failure_buckets_note": BOX_FAILURE_BUCKETS_NOTE,
+            "box_continuation_decisions": sql_results.get("box_continuation_decisions"),
+            "box_continuation_decisions_note": BOX_CONTINUATION_DECISIONS_NOTE,
             "continuation_rejects": continuation,
-            "note": "非 completed 率的分母是该模型的人发回合。续接拒绝头条只计 scope=web 的 journal 行。",
+            "note": (
+                "非 completed 率的分母是该模型的人发回合。non_terminal 单列尚非 terminal 的回合。"
+                "续接拒绝旧来源只计 scope=web 的 journal 行，不覆盖准入前拒绝。"
+            ),
         },
     }
 
@@ -1247,14 +1310,58 @@ def render_markdown(report: dict) -> str:
     elif _failed(box):
         lines.append("查询失败：" + str(box.get("error")))
     elif not box:
-        lines.append("Box 人发回合：0")
+        lines.append("Box 人发回合：0（无样本，不能据此判断非 completed 率达标）")
     else:
-        lines.append("| 模型 | 回合 | 非 completed | 非 completed 率 | not_accepted |")
-        lines.append("|---|---:|---:|---:|---:|")
+        lines.append("| 模型 | 回合 | completed | 非 completed | 非 completed 率 | non_terminal | not_accepted |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
         for row in box:
+            completed = row.get("completed")
+            non_terminal = row.get("non_terminal")
             lines.append(
-                f"| {row.get('model')} | {row.get('turns')} | {row.get('non_completed')} | "
-                f"{fmt_ratio(row.get('non_completed'), row.get('turns'))} | {row.get('not_accepted')} |"
+                f"| {row.get('model')} | {row.get('turns')} | {completed if completed is not None else '未采集'} | "
+                f"{row.get('non_completed')} | {fmt_ratio(row.get('non_completed'), row.get('turns'))} | "
+                f"{non_terminal if non_terminal is not None else '未采集'} | {row.get('not_accepted')} |"
+            )
+    lines.append("")
+    lines.append("非 completed 回合分桶：")
+    lines.append("")
+    lines.append(w5.get("box_failure_buckets_note") or "")
+    lines.append("")
+    buckets = w5.get("box_failure_buckets")
+    if buckets is None:
+        lines.append("未跑")
+    elif _failed(buckets):
+        lines.append("查询失败：" + str(buckets.get("error")))
+    elif not buckets:
+        lines.append("无非 completed 回合分桶（需结合上方回合样本数判断）")
+    else:
+        lines.append("| 模型 | model_family | 派生 stage | status | outcome | failure_code | 回合 |")
+        lines.append("|---|---|---|---|---|---|---:|")
+        for row in buckets:
+            lines.append(
+                f"| {row.get('model')} | {row.get('model_family')} | {row.get('stage')} | {row.get('status')} | "
+                f"{row.get('outcome')} | {row.get('failure_code')} | {row.get('n')} |"
+            )
+    lines.append("")
+    lines.append("续接校验事件（durable rollup）：")
+    lines.append("")
+    lines.append(w5.get("box_continuation_decisions_note") or "")
+    lines.append("")
+    decisions = w5.get("box_continuation_decisions")
+    if decisions is None:
+        lines.append("未跑")
+    elif _failed(decisions):
+        lines.append("查询失败：" + str(decisions.get("error")))
+    elif not decisions:
+        lines.append("未采集／窗口无持久化样本，不能判定拒绝为零")
+    else:
+        lines.append("| 五分钟桶起点 | component | release | commit | stage | decision | reason | 事件 |")
+        lines.append("|---|---|---|---|---|---|---|---:|")
+        for row in decisions:
+            lines.append(
+                f"| {row.get('bucket_start')} | {row.get('component')} | {row.get('control_plane_release')} | "
+                f"{row.get('control_plane_commit')} | {row.get('stage')} | {row.get('decision')} | "
+                f"{row.get('reason')} | {row.get('n')} |"
             )
     lines.append("")
     lines.append("续接拒绝（journal）：")

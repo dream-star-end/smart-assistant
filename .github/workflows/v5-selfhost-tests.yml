@@ -152,6 +152,9 @@ jobs:
           printf '%s\n' "${timeout_version%%$'\n'*}"
           [[ "$timeout_version" == *"GNU coreutils"* ]]
 
+      - name: Check personal refactor metric definitions
+        run: python3 scripts/v5-selfhost-refactor-metrics.selftest.py
+
       - name: Run v5-ops
         # baseline hardening must prove production root:root ownership.
         run: |

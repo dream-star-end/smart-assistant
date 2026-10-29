@@ -97,6 +97,18 @@ class StatTest(unittest.TestCase):
         self.assertEqual([row["model"] for row in rows], ["box-api-claude-opus", "box-claude-haiku"])
         self.assertAlmostEqual(rows[1]["non_completed_rate"], 5 / 16)
 
+    def test_box_summary_keeps_completed_and_non_terminal_separate(self):
+        # One completed turn, one interrupted turn, and one still running with
+        # NULL outcome: both latter turns count as non_completed, only one is open.
+        row = m.box_summary([
+            {"model": "box-claude-haiku", "turns": 3, "completed": 1,
+             "non_completed": 2, "non_terminal": 1, "not_accepted": 0},
+        ])[0]
+        self.assertEqual(row["completed"], 1)
+        self.assertEqual(row["non_completed"], 2)
+        self.assertEqual(row["non_terminal"], 1)
+        self.assertAlmostEqual(row["non_completed_rate"], 2 / 3)
+
     def test_new_metric_absent_is_not_online(self):
         self.assertEqual(m.new_metric_status(False, None), "未上线")
         self.assertEqual(m.new_metric_status(True, 4), 4)
@@ -246,11 +258,17 @@ class QueryAndReportTest(unittest.TestCase):
         queries = m.build_queries("2026-10-01T00:00:00+08:00", "2026-10-15T00:00:00+08:00", None)
         joined = "\n".join(queries.values()).lower()
         self.assertNotIn("begin", joined)
-        self.assertNotIn("commit", joined)
+        # control_plane_commit is a read-only release column, not COMMIT SQL.
+        self.assertNotRegex(joined, r"\bcommit\b")
         self.assertNotIn("insert ", joined)
         self.assertNotIn("update ", joined)
         self.assertNotIn("delete ", joined)
-        for body in queries.values():
+        for name, body in queries.items():
+            if name == "box_continuation_decisions":
+                # Rollups have no uid label and cannot inherit the H population.
+                self.assertNotIn("user_id", body)
+                self.assertIn("FROM telemetry_metric_rollups", body)
+                continue
             if body.strip().startswith("SELECT coalesce") and "container_link" in body:
                 continue
             self.assertIn("765", body if "information_schema" not in body else "765")
@@ -265,6 +283,127 @@ class QueryAndReportTest(unittest.TestCase):
         explicit = m.build_queries("2026-10-01T00:00:00+08:00", "2026-10-15T00:00:00+08:00", [3])
         self.assertIn("user_id IN (3)", explicit["cohort"])
         self.assertNotIn("<> 765", explicit["cohort"])
+
+    def test_w5_queries_keep_all_buckets_and_use_existing_dimensions(self):
+        queries = m.build_queries("2026-10-01T00:02:00+08:00", "2026-10-01T00:07:00+08:00", [3])
+        box = queries["box"]
+        self.assertIn("count(*) FILTER (WHERE outcome = 'completed') AS completed", box)
+        self.assertIn("outcome IS DISTINCT FROM 'completed'", box)
+        self.assertIn("status IS DISTINCT FROM 'terminal'", box)
+        buckets = queries["box_failure_buckets"]
+        for body in (box, buckets):
+            self.assertIn("user_id IN (3)", body)
+            self.assertIn("session_id ~ '^web'", body)
+            self.assertIn("client_message_id !~ '^m-recover-'", body)
+            self.assertIn("admitted_at >= '2026-10-01T00:02:00+08:00'", body)
+            self.assertIn("admitted_at < '2026-10-01T00:07:00+08:00'", body)
+            self.assertNotIn("LIMIT", body)
+        self.assertIn("'api_claude'", buckets)
+        self.assertIn("'claude'", buckets)
+        self.assertIn("'other_box'", buckets)
+        self.assertIn("outcome = 'not_accepted' THEN 'admission'", buckets)
+        self.assertIn("status IS DISTINCT FROM 'terminal' THEN 'in_flight'", buckets)
+        self.assertIn("ELSE 'execution'", buckets)
+        self.assertIn("coalesce(outcome, '(none)')", buckets)
+        self.assertIn("coalesce(failure_code, '(none)')", buckets)
+        self.assertIn("GROUP BY 1, 2, 3, 4, 5, 6", buckets)
+        self.assertNotIn("JOIN", buckets)
+        rollup = queries["box_continuation_decisions"]
+        self.assertIn("metric = 'box_continuation_decisions'", rollup)
+        self.assertIn("sum(sample_count) AS n", rollup)
+        self.assertNotIn("counter_value", rollup)
+        self.assertIn("labels->>'kind'", rollup)
+        self.assertIn("component", rollup)
+        self.assertIn("control_plane_release", rollup)
+        self.assertIn("control_plane_commit", rollup)
+        self.assertNotIn("LIMIT", rollup)
+        self.assertNotIn("user_id", rollup)
+        # A 00:04 event lives in the 00:00 bucket; the intersecting lower
+        # boundary must retain it, while the note discloses outside-window data.
+        self.assertIn("bucket_start < '2026-10-01T00:07:00+08:00'::timestamptz", rollup)
+        self.assertIn("bucket_start + interval '5 minutes' > '2026-10-01T00:02:00+08:00'::timestamptz", rollup)
+        default_rollup = m.build_queries("2026-10-01T00:02:00+08:00", "2026-10-01T00:07:00+08:00", None)
+        self.assertEqual(rollup, default_rollup["box_continuation_decisions"])
+
+    def test_w5_rollup_only_rejections_and_compatibility_are_visible(self):
+        buckets = [
+            {"model": "box-api-claude-opus", "model_family": "api_claude", "stage": "admission",
+             "status": "terminal", "outcome": "not_accepted", "failure_code": "DISPATCH_NOT_ACCEPTED", "n": 1},
+            {"model": "box-claude-haiku", "model_family": "claude", "stage": "execution",
+             "status": "terminal", "outcome": "crashed", "failure_code": "ENGINE_ERROR", "n": 1},
+            {"model": "box-claude-haiku", "model_family": "claude", "stage": "in_flight",
+             "status": "accepted", "outcome": "(none)", "failure_code": "(none)", "n": 1},
+        ]
+        # Each row is a grouped persisted sample_count snapshot, not a process
+        # counter or a dispatch; compatible and rejected must stay separate.
+        decisions = [
+            {"bucket_start": "2026-10-01T00:00:00+08:00", "kind": "admission:rejected:BOX_PREPARED_REJECT",
+             "stage": "admission", "decision": "rejected", "reason": "BOX_PREPARED_REJECT", "n": 3,
+             "component": "egress", "control_plane_release": "rel-a", "control_plane_commit": "abc123"},
+            {"bucket_start": "2026-10-01T00:05:00+08:00", "kind": "echo:compatible:envelope",
+             "stage": "echo", "decision": "compatible", "reason": "envelope", "n": 2,
+             "component": "master", "control_plane_release": "rel-b", "control_plane_commit": "def456"},
+        ]
+        report = m.assemble(
+            {"since": "2026-10-01T00:02:00+08:00", "until": "2026-10-01T00:07:00+08:00"},
+            [3],
+            {"box": [{"model": "box-claude-haiku", "turns": 3, "completed": 1,
+                      "non_completed": 2, "non_terminal": 1, "not_accepted": 0}],
+             "box_failure_buckets": buckets, "box_continuation_decisions": decisions, "continuation": []},
+            None,
+        )
+        self.assertEqual(report["w5"]["box_failure_buckets"], buckets)
+        self.assertEqual(report["w5"]["box_continuation_decisions"], decisions)
+        text = m.render_markdown(report)
+        self.assertIn("BOX_PREPARED_REJECT | 3", text)
+        self.assertIn("compatible | envelope | 2", text)
+        self.assertIn("api_claude | admission", text)
+        self.assertIn("claude | in_flight | accepted | (none) | (none) | 1", text)
+        self.assertIn("rel-a | abc123", text)
+        self.assertIn("rel-b | def456", text)
+        self.assertIn("全个人实例", text)
+        self.assertIn("不能按本报告 H/uid 过滤", text)
+        self.assertIn("边缘桶可能含窗口外事件", text)
+        self.assertIn("不与旧 journal 次数相加", text)
+        self.assertIn("不代表实际 transport", text)
+        self.assertIn("不是日志记录的真实失败阶段", text)
+
+    def test_w5_missing_results_are_not_zero_samples(self):
+        report = m.assemble(
+            {"since": "2026-10-01T00:00:00+08:00", "until": "2026-10-02T00:00:00+08:00"},
+            [3], {}, None,
+        )
+        self.assertIsNone(report["w5"]["box_models"])
+        self.assertIsNone(report["w5"]["box_failure_buckets"])
+        self.assertIsNone(report["w5"]["box_continuation_decisions"])
+        text = m.render_markdown(report).split("## W5 Box", 1)[1]
+        self.assertEqual(text.count("未跑"), 4)
+        self.assertNotIn("Box 人发回合：0", text)
+
+    def test_w5_empty_samples_do_not_prove_success_or_zero_rejections(self):
+        report = m.assemble(
+            {"since": "2026-10-01T00:00:00+08:00", "until": "2026-10-02T00:00:00+08:00"},
+            [3], {"box": [], "box_failure_buckets": [], "box_continuation_decisions": [], "continuation": []}, None,
+        )
+        self.assertEqual(report["w5"]["box_models"], [])
+        self.assertEqual(report["w5"]["box_continuation_decisions"], [])
+        text = m.render_markdown(report).split("## W5 Box", 1)[1]
+        self.assertIn("Box 人发回合：0（无样本", text)
+        self.assertIn("未采集／窗口无持久化样本，不能判定拒绝为零", text)
+        self.assertNotIn("0.0%", text)
+
+    def test_w5_query_errors_are_preserved(self):
+        failed = {"error": "statement timeout"}
+        report = m.assemble(
+            {"since": "2026-10-01T00:00:00+08:00", "until": "2026-10-02T00:00:00+08:00"},
+            [3], {"box": failed, "box_failure_buckets": failed, "box_continuation_decisions": failed}, None,
+        )
+        for name in ("box_models", "box_failure_buckets", "box_continuation_decisions"):
+            self.assertEqual(report["w5"][name], failed)
+        text = m.render_markdown(report).split("## W5 Box", 1)[1]
+        self.assertEqual(text.count("查询失败：statement timeout"), 3)
+        self.assertNotIn("Box 人发回合：0", text)
+        self.assertNotIn("未采集／窗口无持久化样本", text)
 
     def test_report_renders_baseline_phrases(self):
         report = m.assemble(
