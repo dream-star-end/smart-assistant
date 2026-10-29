@@ -29,6 +29,10 @@ export type OutputFile = {
   kind: OutputKind;
   /** 本轮对它的改动;只在回答里被提到(脚本生成的文件等)时为 undefined。 */
   change?: FileChange;
+  /** 这是本轮把其它交付文件打成的 zip:打进去的文件数(列表里作「全部下载」)。 */
+  bundle?: number;
+  /** 回答只报了 zip,这个文件是从打包记录里还原出来的单个交付文件。 */
+  packed?: true;
 };
 
 export type OutputMedia = { src: string; kind: "image" | "video" | "audio"; name: string };
@@ -135,6 +139,31 @@ function toolOutputText(m: ChatMessage): string {
   return typeof tail === "string" ? tail : "";
 }
 
+/**
+ * `oc-artifact-qa pack --out x.zip -- a.docx b.pptx` 通过时打印的报告(JSON 后跟一行 PASS):zip 路径 → 打进去的
+ * 文件(绝对路径)。交付技能让模型 ≥2 个文件时只报 zip 路径,单个文件就只能从这里还原。
+ */
+function packReports(m: ChatMessage): { zip: string; members: string[] }[] {
+  const text = toolOutputText(m);
+  if (!text.includes("oc-artifact-qa")) return [];
+  const out: { zip: string; members: string[] }[] = [];
+  for (const chunk of text.split(/^(?:PASS|FAIL)\s*$/m)) {
+    const start = chunk.indexOf("{");
+    const end = chunk.lastIndexOf("}");
+    if (start < 0 || end <= start) continue;
+    try {
+      const report = JSON.parse(chunk.slice(start, end + 1)) as { tool?: unknown; passed?: unknown; input?: Record<string, unknown> };
+      const input = report.input;
+      if (report.tool !== "oc-artifact-qa" || report.passed !== true || input?.kind !== "zip" || typeof input.path !== "string") continue;
+      const members = asArr(input.paths).filter((p): p is string => typeof p === "string" && p.startsWith("/"));
+      if (members.length) out.push({ zip: input.path, members });
+    } catch {
+      // 不是这份报告(或被截断):不还原,照旧只有 zip。
+    }
+  }
+  return out;
+}
+
 function failed(m: ChatMessage): boolean {
   const kind = resolveToolStatus(normalizeToolForDisplay(m)).kind;
   return kind === "error" || kind === "blocked";
@@ -161,10 +190,13 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
     sources.push({ url, title: title || domainOf(url), domain: domainOf(url) });
   };
 
+  const packs = new Map<string, string[]>();
+
   for (const m of turn.rows) {
     if (m.role === "tool") {
       const { name, input } = normalizeToolForDisplay(m);
       if (failed(m)) continue;
+      for (const pack of packReports(m)) packs.set(pack.zip, pack.members);
       // 浏览器截图存进交付目录 = 给用户的图(OCV5-374):这一步折在处理过程里,图在这里露出来。
       const browser = browserStepOf(m);
       if (browser) {
@@ -208,6 +240,16 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
         }
       }
     }
+  }
+  // 回答只报了 zip:打进去的每个文件单独列出(可预览、单独下载),zip 排在它们后面作「全部下载」。
+  for (let i = 0; i < files.length; i++) {
+    const members = packs.get(files[i]!.path);
+    if (!members) continue;
+    const fresh = members.filter((p) => !seenFiles.has(p));
+    for (const p of fresh) seenFiles.add(p);
+    files[i] = { ...files[i]!, bundle: members.length };
+    files.splice(i, 0, ...fresh.map((p): OutputFile => ({ path: p, name: baseName(p), kind: outputKindOf(p), packed: true })));
+    i += fresh.length;
   }
   // 图片文件直接进图片区,不在文件区重复出现。
   const imageFiles = files.filter((f) => f.kind === "image");
