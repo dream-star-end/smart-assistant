@@ -77,7 +77,7 @@ async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true)
     ...extra,
   };
   const wake = new ContainerLinkWake({
-    links, deps, maxFrameBytes: 1024 * 1024,
+    links, deps, maxFrameBytes: 1024 * 1024, isInMaintenance: async () => false,
     start(user, _uid, _endpoint, socket, _abort, _connId, context) {
       starts++; contexts.push(context); subscribers.push(user);
       const handle = getContainerLinkHandle(socket)!;
