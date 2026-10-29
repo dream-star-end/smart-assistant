@@ -9475,6 +9475,26 @@
           "assertion": "#1240 drawer left open below md, window widened: the first click on the composer focuses it"
         }
       ]
+    },
+    {
+      "id": "INC-20261029-DELEGATE-CATALOG-ROUTE",
+      "occurredAt": "2026-10-29",
+      "severity": "P1",
+      "symptom": "商业队长prompt宣称可委派的Codex/Antigravity/Cursor/ZCode型号与billed_delegate执行边界不一致，导致未起进程即409且无扣费。",
+      "rootFixCommit": "b7cb6bfd",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/delegateModelCatalogPrompt.test.ts",
+          "assertion": "every advertised commercial slug passes billed_delegate local preflight"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-delegate-billing-requestid.ts",
+          "assertion": "[delegate-catalog-route] PASS — commercial slugs execute under billed_delegate and selfhost retains every engine"
+        }
+      ]
     }
   ]
 }

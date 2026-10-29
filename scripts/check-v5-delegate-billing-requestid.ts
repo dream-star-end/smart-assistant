@@ -482,6 +482,34 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Pro
   }
 }
 
+// INC-20261029-DELEGATE-CATALOG-ROUTE: execute the actual prompt and billing truth table.
+{
+  const { renderDelegateModelSection } = await import("../packages/gateway/src/delegateModelCatalogPrompt.js");
+  const { decideLocalExecution } = await import("../packages/gateway/src/localExecution.js");
+  const { parseCatalogResponse } = await import("../packages/gateway/src/modelCatalogClient.js");
+  const models = [
+    ["deepseek-v4-flash", "ccb"], ["grok-build", "grok"], ["gpt-6-astra", "codex"],
+    ["cursor-grok-4.6-high", "cursor"], ["zcode-glm-5.3", "zcode"],
+    ["antigravity-gemini-4-argon", "antigravity"],
+  ] as const;
+  const view = parseCatalogResponse({ projection_revision: "proof", security_epoch: "1",
+    models: models.map(([model_id, engine]) => ({ model_id, engine, display_name: model_id,
+      provider_id: engine, context_window: 200_000, supported_efforts: [],
+      supports_vision: false, capability_zero: false, supports_thinking: false })) });
+  const input = { models: view.models, projectionRevision: "proof", verifiedAt: 1 };
+  const text = renderDelegateModelSection(input, {});
+  const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
+    .flatMap(line => [...line[1]!.matchAll(/`([^`]+)`/g)].map(match => match[1]!));
+  assert.deepEqual(advertised, ["deepseek-v4-flash", "grok-build"]);
+  for (const model of advertised) {
+    assert.doesNotThrow(() => decideLocalExecution({ view, agent: { id: "member" },
+      model, kind: "billed_delegate", env: {} }));
+  }
+  const personal = renderDelegateModelSection(input, { OC_SELFHOST_ENGINE_LOCAL_TURNS: "1" });
+  for (const [model] of models) assert.ok(personal.includes(model), model);
+  console.log("[delegate-catalog-route] PASS — commercial slugs execute under billed_delegate and selfhost retains every engine");
+}
+
 await runWaitCloseProof(root);
 rmSync(testHome, { recursive: true, force: true });
 console.log(
