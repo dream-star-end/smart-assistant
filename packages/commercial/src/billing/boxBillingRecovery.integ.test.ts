@@ -6,13 +6,98 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Pool } from "pg";
 import { recoverBoxBillingRequest,
-  settleBoxReplayBeforeDelivery } from "./boxBillingRecovery.js";
+  reconcileBoxBillingBatch, settleBoxReplayBeforeDelivery } from "./boxBillingRecovery.js";
+import { InMemoryPreCheckRedis } from "./preCheck.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
 import { shouldRetainBoxPrecheck } from "./proxyBilling.js";
 
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
   ?? process.env.TEST_DATABASE_URL;
+
+test("late proven Box stops release retained credit reservations without charging",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(readFileSync(new URL("./boxBillingRecoveryTempSchema.sql", import.meta.url), "utf8"));
+    const pinned = { connect: async () => ({ query: client.query.bind(client), release() {} }),
+      query: client.query.bind(client) } as unknown as Pool;
+    const redis = new InMemoryPreCheckRedis();
+    const uid = 900_000_001n;
+    const nonce = "b".repeat(24);
+    const epoch = "c".repeat(32);
+    const base = { model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+      boxInvocationMode: "detached_tool", boxLaunchPermit: true,
+      boxState: "unknown", boxRunNonce: nonce, boxLeaseEpoch: epoch,
+      boxStopOutcome: "failed", boxTerminalProof: { runNonce: nonce, leaseEpoch: epoch,
+        keeperPid: 101, cliPid: 102, reason: "worker_failed", revision: 2, workerExitCode: 143 } };
+    const amounts = [300, 940, 941, 942, 936, 937, 939, 940, 941, 878, 942];
+    for (const [i, amount] of amounts.entries()) {
+      const id = `t1257u-stopped-${i}`;
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,precheck_credits) VALUES ($1,$2,'inflight',$3,$4)`,
+      [id, String(uid), JSON.stringify(base), amount]);
+      await redis.atomicReserve({ userId: uid, requestId: id, balance: 10000n,
+        maxCost: BigInt(amount), ttlSeconds: 14700 });
+      assert.equal(await shouldRetainBoxPrecheck(pinned, id, uid), true);
+    }
+    assert.equal(redis.totalLocked(uid), 9636n);
+    assert.equal((await redis.atomicReserve({ userId: uid, requestId: "next-opus",
+      balance: 10000n, maxCost: 939n, ttlSeconds: 14700 })).ok, false);
+    await reconcileBoxBillingBatch(pinned, 100, redis);
+    assert.equal(redis.totalLocked(uid), 9636n, "unknown calls retain their full protection");
+
+    // The original HTTP finalizer has already returned. A later stop has
+    // proven worker exit; nobody will call that finalizer a second time.
+    await client.query(`UPDATE request_finalize_journal SET state='aborted',final_credits=0,
+      failure_code='STREAM_FAILED',ctx=jsonb_set(ctx,'{boxState}','"failed_stopped"')`);
+    const before = await client.query("SELECT request_id,updated_at FROM request_finalize_journal ORDER BY request_id");
+    let failRelease = true;
+    const flaky = { atomicReserve: redis.atomicReserve.bind(redis),
+      releaseReservation: async (input: Parameters<typeof redis.releaseReservation>[0]) => {
+        if (failRelease) throw new Error("synthetic Redis failure");
+        return redis.releaseReservation(input);
+      } };
+    await reconcileBoxBillingBatch(pinned, 100, flaky);
+    assert.equal(redis.totalLocked(uid), 9636n, "failed Redis release must remain retryable");
+    failRelease = false;
+    for (let i = 0; i < 4; i++) await reconcileBoxBillingBatch(pinned, 3, flaky);
+    assert.equal(redis.totalLocked(uid), 0n, "bounded batches must advance beyond processed rows");
+    assert.equal((await redis.atomicReserve({ userId: uid, requestId: "next-opus",
+      balance: 10000n, maxCost: 939n, ttlSeconds: 14700 })).ok, true);
+    await reconcileBoxBillingBatch(pinned, 100, redis);
+    assert.equal(redis.totalLocked(uid), 939n, "idempotent cleanup cannot release a new request");
+    assert.deepEqual((await client.query("SELECT request_id,updated_at FROM request_finalize_journal ORDER BY request_id")).rows,
+      before.rows, "reservation bookkeeping must not reset business timestamps");
+    assert.equal((await client.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n, 0);
+    assert.equal((await client.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n, 0);
+
+    const protectedContexts = [
+      { ...base, boxState: "unknown" },
+      { ...base, boxState: "failed_stopped", boxTerminalProof: { ...base.boxTerminalProof, leaseEpoch: "d".repeat(32) } },
+      { ...base, boxState: "failed_stopped", boxTerminalProof: null },
+      { ...base, boxState: "failed_stopped", boxToolHandoff: {} },
+      { ...base, boxState: "failed_stopped", boxUsage: {} },
+      { ...base, boxState: "failed_stopped", boxOwnerRequestId: "owner" },
+      { ...base, boxState: "failed_stopped", boxResumeRequestId: "resume" },
+      { ...base, boxState: "failed_stopped", boxTerminalProof: {
+        runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 } },
+    ];
+    for (const [i, ctx] of protectedContexts.entries()) {
+      const id = `t1257u-protected-${i}`;
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,precheck_credits,final_credits) VALUES ($1,$2,'aborted',$3,1,0)`,
+      [id, String(uid + 1n), JSON.stringify(ctx)]);
+      await redis.atomicReserve({ userId: uid + 1n, requestId: id, balance: 100n,
+        maxCost: 1n, ttlSeconds: 14700 });
+    }
+    await reconcileBoxBillingBatch(pinned, 100, redis);
+    assert.equal(redis.totalLocked(uid + 1n), BigInt(protectedContexts.length),
+      "uncertain proofs and potentially billable chains must stay reserved");
+  } finally { client.release(); await pool.end(); }
+});
+
 test("terminal Box evidence settles once, with durable usage and turn locator",
   { skip: !testDatabaseUrl }, async () => {
   const pool = new Pool({ connectionString: testDatabaseUrl,

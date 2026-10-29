@@ -16,6 +16,11 @@ type Proof = { incident: string; slug: string; file: string; db: boolean; cases:
 
 export const MASTER_INCIDENT_PROOFS: readonly Proof[] = [
   {
+    incident: 'INC-20261029-BOX-STOPPED-CREDIT-HOLD', slug: 'inc-20261029-box-stopped-credit-hold', db: true,
+    file: 'packages/commercial/src/billing/boxBillingRecovery.integ.test.ts',
+    cases: ['late proven Box stops release retained credit reservations without charging'],
+  },
+  {
     incident: 'INC-20261009-ALERT-INBOX-FALLBACK', slug: 'inc-20261009-alert-inbox-fallback', db: true,
     file: 'packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts',
     cases: [
