@@ -47,8 +47,3 @@ export function useStopShortcut({ enabled, turnKey, getStopAction }: {
   }, [enabled, turnKey, confirm]);
   return dialog;
 }
-
-/** Load the shortcut with the workspace; the explicit Stop control is independent. */
-export function StopShortcut(props: Parameters<typeof useStopShortcut>[0]) {
-  return useStopShortcut(props);
-}
