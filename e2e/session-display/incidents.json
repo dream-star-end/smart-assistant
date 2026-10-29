@@ -8552,7 +8552,7 @@
       "occurredAt": "2026-10-29",
       "severity": "P1",
       "symptom": "商业 Box 模型(box-api-claude-opus-5-5 等)自 2026-10-29 09:41 CST 起全部失败:Box 08:12 恢复后,恢复回来的 cc1 默认登录(/home/box/.claude)首次刷新令牌失败被 CLI 2.1.312 清空,此后每个 Box 回合 CLI 不发请求、只写替身消息「Login expired · Please run /login」。oc-bridge 把这条替身印成真模型名且无 stop_reason,路由报 BOX_TOOL_STOP_REASON_INVALID→BOX_REPLAY_REJECTED(15/15,含 uid2046 的 11 次),登录也从未被 bench。修复让 bridge 按 -p 印成 <synthetic>+is_api_error_message(→BOX_CLI_UPSTREAM_REFUSED,不投递不计费),并把 Login expired/OAuth token revoked/authentication_failed 认成 login_required。恢复服务另需账号持有人重新 OAuth。",
-      "rootFixCommit": "9056645e",
+      "rootFixCommit": "5d1a3366",
       "coverageCommits": [],
       "regressions": [
         {
