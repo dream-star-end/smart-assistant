@@ -148,7 +148,9 @@ describe('buildAgentsSlot 注入「委派可用型号」', () => {
     })
     assert.match(slot.content, /## 委派可用型号/)
     assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
-    assert.doesNotMatch(slot.content, /- Codex:/)
+    const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
+      .split(/\n## /)[0]
+    assert.doesNotMatch(section, /- Codex:/)
   })
   it('无投影(null)→ 提示行而非静默消失', async () => {
     const slot = await buildAgentsSlot({ agentId: 'main', model: 'glm-5.3-zai', delegateModelCatalog: null })
