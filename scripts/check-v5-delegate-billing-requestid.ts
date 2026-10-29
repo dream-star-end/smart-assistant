@@ -495,7 +495,7 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Pro
   const view = parseCatalogResponse({ projection_revision: "proof", security_epoch: "1",
     models: models.map(([model_id, engine]) => ({ model_id, engine, display_name: model_id,
       provider_id: engine, context_window: 200_000, supported_efforts: [],
-      supports_vision: false, supports_thinking: false })) });
+      supports_vision: false, capability_zero: false, supports_thinking: false })) });
   const input = { models: view.models, projectionRevision: "proof", verifiedAt: 1 };
   const text = renderDelegateModelSection(input, {});
   const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]

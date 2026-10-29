@@ -198,7 +198,7 @@ describe('commercial delegation catalog matches billed execution', () => {
     const catalog = parseCatalogResponse({ projection_revision: 'contract', security_epoch: '1',
       models: models.map(m => ({ model_id: m.modelId, display_name: m.modelId,
         engine: m.engine, provider_id: m.engine, context_window: 200000,
-        supported_efforts: [], supports_vision: false, supports_thinking: false })) })
+        supported_efforts: [], supports_vision: false, capability_zero: false, supports_thinking: false })) })
     const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
       .flatMap(line => [...line[1].matchAll(/`([^`]+)`/g)].map(match => match[1]))
     assert.deepEqual(advertised, ['deepseek-v4-flash', 'grok-build'])
