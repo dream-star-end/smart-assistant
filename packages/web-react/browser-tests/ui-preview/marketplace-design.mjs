@@ -97,6 +97,11 @@ else {
     assert.equal(overflow,false,`overflow: ${width}/${theme}`);checks++
     assert.equal(await page.locator('.marketplace-card').count()>0,true);checks++
     await page.screenshot({path:join(out,`market-${width}-${theme}.png`)})
+    if (width<640) {
+      // UI-5: the first card must be on the first phone screen (the old hero filled it, UI-SPEC M2).
+      const firstCard=await page.locator('.marketplace-card').first().boundingBox()
+      assert(firstCard && firstCard.y+48<844,`first card below the fold: ${width}/${theme}`);checks++
+    }
     await page.getByRole('button',{name:'办公文档',exact:true}).click()
     assert.equal(await page.locator('.marketplace-card:not([data-category="office-docs"])').count(),0);checks++
     await page.getByRole('button',{name:'返回全部',exact:true}).click()
@@ -142,6 +147,15 @@ else {
   assert(box.y>=80 && box.y+box.height<=500,'visualViewport containment');checks++
   await mobile.getByRole('searchbox').fill('PPT')
   assert.equal(await mobile.locator('.marketplace-hero').count(),0);checks++
+  // UI-5: search stays pinned while the phone list scrolls.
+  await mobile.goto(url)
+  await mobile.getByRole('heading',{name:'平台精选',exact:true}).waitFor()
+  const barBefore=await mobile.locator('.marketplace-toolbar').boundingBox()
+  const scrolled=await mobile.locator('.marketplace-content').evaluate(e=>{e.scrollTop=600;return e.scrollTop})
+  await mobile.waitForTimeout(150)
+  const barAfter=await mobile.locator('.marketplace-toolbar').boundingBox()
+  assert(scrolled>100 && Math.abs(barAfter.y-barBefore.y)<=1,'sticky search on mobile');checks++
+  await mobile.screenshot({path:join(out,'market-mobile-scrolled.png')})
   await page.goto(`${url}?scene=market-detail`)
   await page.getByRole('button',{name:'安装',exact:true}).waitFor()
   await page.evaluate(()=>{window.__ocApiMocks.installMarketplace=async()=>{throw new Error('offline')}})

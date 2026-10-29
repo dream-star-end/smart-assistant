@@ -1,6 +1,6 @@
 import * as Dialog from '@radix-ui/react-dialog'
-import { ArrowUpRight, CheckCircle2, Compass, LogIn, TriangleAlert, X } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { CheckCircle2, LogIn, TriangleAlert, X } from 'lucide-react'
+import { type CSSProperties, useCallback, useEffect, useState } from 'react'
 import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import { marketplaceArtifactKind } from '../lib/marketplace'
 import type { AuthSession, MarketplaceMyPublish } from '../lib/types'
@@ -38,6 +38,10 @@ const TAB_ID_BASE = 'marketplace'
  *    「标题+副标题+Tabs+pill+搜索+chips」六层横向控件,滚动时 kind 上下文也不会丢。
  * 2. 发布结果通知移出滚动区:它是「刚发生的事」,滚一下就找不回来是反的。
  * 3. 未登录态从一行灰字换成带出口的 EmptyState。
+ *
+ * ── 2026-10-29 UI-5「素净工作台」 ─────────────────────────────────────────
+ * 头部只剩一行:标题 · 分区 · 关闭(手机上分区换到第二行)。青柠色标、英文字标和标语都去掉了 ——
+ * 市场和主应用用同一套 token,不再像另一个产品(UI-SPEC §1.3 M1–M3)。
  */
 export function MarketplaceCenter({
   open,
@@ -143,37 +147,33 @@ export function MarketplaceCenter({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
+          // 高度上限覆盖 oc-center-dialog 的默认 85dvh:市场是浏览型大弹层,要更高。该变量在未分层的
+          // .oc-center-dialog 规则里有默认值,工具类盖不过,只能走内联样式(取小的兜底仍由该规则负责)。
+          style={{ '--oc-center-max-h': 'calc(var(--oc-visual-height, 100dvh) - 24px)' } as CSSProperties}
+          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex h-[calc(100dvh-24px)] w-[calc(100vw-16px)] max-w-[1120px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-border bg-surface text-fg shadow-float focus:outline-none data-[state=open]:animate-in sm:h-[min(91dvh,940px)] sm:w-[calc(100vw-32px)] lg:w-[calc(100vw-64px)]"
         >
-          <div className="marketplace-masthead">
-            <div className="marketplace-brand">
-              <span className="marketplace-brand-mark" aria-hidden="true"><Compass size={22} strokeWidth={1.6} /></span>
-              <div className="min-w-0">
-                <Dialog.Title className="marketplace-brand-title">AI 市场</Dialog.Title>
-                <span className="marketplace-wordmark" aria-hidden="true">CLARVY / COLLECTIONS</span>
-              </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-4 py-3 sm:flex-nowrap sm:px-6">
+            <div className="min-w-0">
+              <Dialog.Title className="truncate text-title font-semibold text-fg">AI 市场</Dialog.Title>
             </div>
-            <span className="marketplace-masthead-note">让好想法，有好工具。<ArrowUpRight size={14} aria-hidden="true" /></span>
-            <Dialog.Close asChild>
-              <IconButton aria-label="关闭" size="sm">
-                <X size={16} />
-              </IconButton>
-            </Dialog.Close>
-          </div>
-
-          <div className="marketplace-navigation">
             <Tabs
               aria-label="市场分区"
               idBase={TAB_ID_BASE}
               value={safeTab}
               onValueChange={(v) => onTabChange(v as MarketplaceTab)}
               items={tabs.map((t) => ({ value: t.value, label: t.label, featureId: t.featureId }))}
+              className="order-last max-sm:w-full max-sm:[&>[role=tab]]:flex-1 sm:order-none"
             />
+            <Dialog.Close asChild>
+              <IconButton aria-label="关闭" size="sm" className="ml-auto">
+                <X size={16} />
+              </IconButton>
+            </Dialog.Close>
           </div>
 
           {/* 发布结果通知:留在滚动区外,滚动时不丢;多条时给出剩余计数,不再"看起来只有一条"。 */}
           {auth && publishNotice && (
-            <div className="border-b border-border px-4 py-2.5">
+            <div className="border-b border-border px-4 py-2.5 sm:px-6">
               <Alert
                 density="compact"
                 tone={noticeApproved ? 'success' : 'warning'}
@@ -220,7 +220,7 @@ export function MarketplaceCenter({
             role="tabpanel"
             id={`${TAB_ID_BASE}-panel-${safeTab}`}
             aria-labelledby={`${TAB_ID_BASE}-tab-${safeTab}`}
-            className="marketplace-content min-h-0 flex-1 overflow-y-auto"
+            className="marketplace-content min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-pt-28 [scrollbar-gutter:stable]"
           >
             {!auth ? (
               <EmptyState
