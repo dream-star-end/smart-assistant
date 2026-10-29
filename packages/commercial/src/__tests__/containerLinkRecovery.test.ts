@@ -141,3 +141,34 @@ test('dispatch lookup errors still exhaust the reconnect budget', async () => {
     assert.equal(outcomes.filter(outcome => outcome === 'attempt').length, 3)
   } finally { recovery.stop(); await recovery.drain() }
 })
+
+test('durable wake coalesces with recovery and permits zero dispatches', async () => {
+  let attachCount = 0
+  const recovery = new ContainerLinkRecovery({ ...options(async (got, rows, _signal, keepAlive) => {
+    assert.deepEqual(got, carrier)
+    assert.equal(rows.length, 0)
+    assert.equal(keepAlive, true)
+    attachCount++
+    return 'rebuilt'
+  }), pool: { query: async () => ({ rows: [] }) } as unknown as Queryable })
+  try {
+    await Promise.all([recovery.wake(carrier), recovery.wake(carrier)])
+    assert.equal(attachCount, 1)
+  } finally { recovery.stop(); await recovery.drain() }
+})
+
+test('control-only wake retains lifetime retry cap across repeated poll requests', async () => {
+  resetMetricsForTest()
+  let calls = 0
+  const recovery = new ContainerLinkRecovery({ ...options(async () => {
+    calls++
+    throw new Error('offline')
+  }), pool: { query: async () => ({ rows: [] }) } as unknown as Queryable })
+  try {
+    await recovery.wake(carrier)
+    await until(() => calls === 4)
+    await recovery.drain()
+    await Promise.all([recovery.wake(carrier), recovery.wake(carrier)])
+    assert.equal(calls, 4) // initial wake plus the existing three retries
+  } finally { recovery.stop(); await recovery.drain() }
+})
