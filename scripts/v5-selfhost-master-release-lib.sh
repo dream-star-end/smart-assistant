@@ -1063,6 +1063,13 @@ build_master_release() {
       return 1
     fi
   }
+  master_job_session_boundary() {
+    mlog "  session workspace boundary in every engine prompt @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-workspace-boundary.ts ); then
+      mlog "pinned session workspace boundary proof 失败"
+      return 1
+    fi
+  }
   master_job_system_approval() {
     mlog "  durable system approval fencing proof @ pinned staging"
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-system-approval-proofs.ts ); then
@@ -1179,6 +1186,7 @@ build_master_release() {
     C.callback-ws:master_job_callback_ws:callback-payload-hash \
     C.cron-submit:master_job_cron_submit:cron-submit-boundary \
     C.prompt-privacy:master_job_prompt_privacy:prompt-privacy-lifecycle \
+    C.session-boundary:master_job_session_boundary \
     C.system-approval:master_job_system_approval:system-approval-fencing \
     C.system-executor:master_job_system_executor:system-executor-fencing \
     C.host-log-policy:master_job_host_log_policy \

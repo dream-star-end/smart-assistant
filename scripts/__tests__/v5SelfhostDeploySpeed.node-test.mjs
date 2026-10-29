@@ -208,7 +208,7 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
  // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
  assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
  const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
- assert.equal(queued.length,11);assert.equal(new Set(queued).size,11);
+ assert.equal(queued.length,12);assert.equal(new Set(queued).size,12);
  assert.ok(at('  if ! master_build_jobs_wait;')<wait,'C/D drained before runtime/Box barrier');
  for(const g of after)assert.ok(marks.some(([n])=>n===g),g);
  // the first Box gate's mark opens its phase, then the await (OCV5-557 wait is counted inside that phase)

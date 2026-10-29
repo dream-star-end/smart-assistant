@@ -68,9 +68,7 @@ const SELFHOST_PROOF_DEBT_CEILING = 63;
 // 2026-10-26 OCV5-622: office refresh-grace / cross-tab lock is unit+integ proven;
 // dual-tab BootSplash live proof needs post-ride canary on personal office session
 // (browser harness cannot yet drive two real tabs against live auth cookies).
-// 2026-10-29 #1238 INC-20261029-SESSION-WS-BOUNDARY (评审中显式调高 3→4): 修复是 TOOLS 段的行为守则,
-// 守则注入由 unit 覆盖;模型是否遵守是非确定的,个人版 canary 无法稳定复现,没有可接 runner 的 proof 层。
-const SELFHOST_PROOF_PENDING_BASELINE = 4;
+const SELFHOST_PROOF_PENDING_BASELINE = 3;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {

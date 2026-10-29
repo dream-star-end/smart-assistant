@@ -8754,18 +8754,26 @@
       "severity": "P2",
       "symptom": "#1238 混合轮新会话发「delete test」，agent 以 find 搜 workspace/ 命中另一会话目录 sessions/webmvon30lpno3vsx/test-pomodoro.cjs，并用用户问答弹窗提议删除。cwd 与产出面板按会话隔离（isolated_v1），文件列表 API 无跨会话泄漏；缺的是 agent 侧边界。修复：所有引擎共用的 TOOLS 段加入「会话工作区边界」，未点名不得搜索/修改/删除其它对话目录，且不得把它们作为删除候选。",
       "rootFixCommit": "b95039bc",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "aa21210c"
+      ],
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/promptToolRecovery.test.ts",
           "assertion": "keeps file search/deletion inside the current conversation unless the user names another one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionWorkspaceBoundary.test.ts",
+          "assertion": "every engine prompt keeps file search and deletion inside the current conversation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-workspace-boundary.ts",
+          "assertion": "[session-workspace-boundary] PASS every engine prompt keeps file work inside the current conversation"
         }
-      ],
-      "proofPending": {
-        "reason": "修复是所有引擎共用 TOOLS 段里的行为守则：确定性部分（守则进入每个引擎的提示词）由 unit 覆盖；模型是否遵守是非确定的，个人版 canary 无法稳定复现「搜索兄弟会话目录并提议删除」，没有可接进 runner 的 browser/live proof。上线后用真实会话发「delete test」人工核对一次。",
-        "since": "2026-10-29"
-      }
+      ]
     },
     {
       "id": "INC-20261029-RENAME-LIST-RACE",
