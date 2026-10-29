@@ -1073,6 +1073,78 @@ async function waitForLivenessTimer(
 }
 
 describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)', () => {
+  it('INC-20261029-GEMINI-FILE-TIMEOUT bounded file activity expires through submit despite fresh process heartbeats', { timeout: 15_000 }, async () => {
+    const origNow = Date.now
+    const origSetInterval = globalThis.setInterval
+    const origClearInterval = globalThis.clearInterval
+    let now = 8_000_000
+    const timers: Array<{ id: number; fn: () => void; ms: number }> = []
+    let nextId = 1
+    Date.now = () => now
+    globalThis.setInterval = ((fn: () => void, ms?: number) => {
+      const id = nextId++
+      timers.push({ id, fn, ms: Number(ms) || 0 })
+      return Object.assign(id, { unref() {} }) as unknown as NodeJS.Timeout
+    }) as typeof setInterval
+    globalThis.clearInterval = ((handle: NodeJS.Timeout) => {
+      const idx = timers.findIndex((t) => t.id === (handle as unknown as number))
+      if (idx >= 0) timers.splice(idx, 1)
+    }) as typeof clearInterval
+    const runner = new HangRunner()
+    let pending: Promise<unknown> | undefined
+    try {
+      const sm = new SessionManager({
+        version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+        auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' },
+      } as any)
+      ;(sm as unknown as { _saveResumeMap: () => void })._saveResumeMap = () => {}
+      const session = makeCcbSession(runner, 'agent:main:cron:dm:file-timeout:test')
+      let fileStartedAt: number | undefined
+      Object.defineProperty(session.runner, 'idleWatchdogActivityAt', {
+        get: () => fileStartedAt ?? session.runner.lastActivityAt,
+      })
+      const errors: string[] = []
+      let settled = false
+      pending = sm.submit(session, 'file work', (e: any) => {
+        if (e.kind === 'error') errors.push(String(e.error))
+      }).finally(() => { settled = true })
+      const timer = await waitForLivenessTimer(timers, pending)
+      now += 2 * IDLE_TIMEOUT_TOOL_MS
+      session.runner.lastActivityAt = now
+      timer.fn()
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(settled, false, 'model waiting before ACTIVE retains the existing policy')
+      fileStartedAt = now
+      now += 1_548
+      fileStartedAt = undefined
+      session.runner.lastActivityAt = now
+      timer.fn()
+      assert.equal(settled, false, 'a completed 1548ms file must not leave a deadline')
+
+      const persistedCodes: string[] = []
+      const persist = session._persistActiveTurn
+      assert.equal(typeof persist, 'function')
+      session._persistActiveTurn = (...args: [string, string, string, string?]) => {
+        persistedCodes.push(args[2])
+        return persist(...args)
+      }
+      fileStartedAt = now
+      now += IDLE_TIMEOUT_TOOL_MS + 1
+      session.runner.lastActivityAt = now
+      timer.fn()
+      await pending
+      assert.deepEqual(persistedCodes, ['LIVENESS_TIMEOUT'], 'use the existing durable system-timeout path exactly once')
+      assert.ok(errors.some((message) => message.includes('无输出') || message.includes('免单')))
+      assert.equal(timers.some((entry) => entry.ms === 15_000), false, 'terminal clears the watchdog')
+    } finally {
+      runner.interrupt()
+      await awaitBounded(pending)
+      Date.now = origNow
+      globalThis.setInterval = origSetInterval
+      globalThis.clearInterval = origClearInterval
+    }
+  })
+
   it('non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires', { timeout: 15_000 }, async () => {
     const origNow = Date.now
     const origSetInterval = globalThis.setInterval

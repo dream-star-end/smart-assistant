@@ -1275,7 +1275,9 @@ export async function submit(
     // handleStdout:505) — this includes CCB's _oc_telemetry side-channel
     // events (tool.preUse fires just before each tool.call, turn.apiResponse
     // after each stream, etc.), so a live subprocess keeps refreshing even
-    // during long tools that produce no content blocks.
+    // during long tools that produce no content blocks. An engine may expose
+    // idleWatchdogActivityAt for already-started bounded work that process
+    // heartbeats must not keep alive (Antigravity native file operations).
     // 阈值策略集中在文件顶部的 `pickIdleTimeoutMs` 里(见对应注释),这里
     // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
     // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
@@ -1295,7 +1297,9 @@ export async function submit(
         // A blocking Codex requestUserInput is an explicit human wait, not
         // engine silence. Keep checking the immutable 12h hard limit above,
         // but never turn a pending question into LIVENESS_TIMEOUT/waiver.
-        const idleMs = Date.now() - session.runner.lastActivityAt
+        const idleMs = Date.now() - (
+          session.runner.idleWatchdogActivityAt ?? session.runner.lastActivityAt
+        )
         // pendingToolCalls 经 adapter 读当前活跃 turn 的 parser(turn 间为 0),
         // 语义与旧 session._currentParser?.pendingToolCalls 一致。
         const threshold = pickIdleTimeoutMs(

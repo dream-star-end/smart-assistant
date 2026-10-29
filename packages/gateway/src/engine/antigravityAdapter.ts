@@ -72,6 +72,12 @@ export const ANTIGRAVITY_MAX_PROMPT_BYTES = 300 * 1024
 const SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const KEEPALIVE_INTERVAL_MS = 30_000
+/** Native file operations have no model-generation phase after ACTIVE.
+ * Reuse the gateway's existing idle budget from that observed start; do not
+ * apply it to commands, MCP, subagents, or the preceding high-effort thought. */
+const BOUNDED_FILE_TOOLS = new Set([
+  'view_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file',
+])
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
@@ -151,6 +157,7 @@ interface TurnContext {
   lastWasText: boolean
   tools: Map<string, TurnToolEntry>
   toolStartedAt: Map<string, number>
+  boundedFileToolStartedAt: Map<string, number>
   pendingToolIds: Set<string>
   usage: StepUsage
   stderr: string
@@ -166,6 +173,7 @@ interface TurnContext {
   procClosed: boolean
   abandoned: boolean
   interrupted: boolean
+  interruptReason: 'user' | 'system' | null
   errorDetail: string | null
   /** step_index of this launch's own user_input; earlier indices are history. */
   firstOwnStepIndex: number | null
@@ -333,6 +341,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       lastWasText: false,
       tools: new Map(),
       toolStartedAt: new Map(),
+      boundedFileToolStartedAt: new Map(),
       pendingToolIds: new Set(),
       usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, thinkingTokens: 0 },
       stderr: '',
@@ -347,6 +356,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       procClosed: false,
       abandoned: false,
       interrupted: false,
+      interruptReason: null,
       errorDetail: null,
       firstOwnStepIndex: null,
       preludeErrorDetail: null,
@@ -764,6 +774,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
     const parameters = info.parameters ?? {}
+    // Only this launch's first ACTIVE proves that local work started. Replayed
+    // history, duplicate ACTIVE, unrelated stdout and keepalive cannot renew it.
+    if (
+      state === 'ACTIVE' && BOUNDED_FILE_TOOLS.has(nativeName) &&
+      ctx.firstOwnStepIndex !== null && typeof step.step_index === 'number' &&
+      Number.isSafeInteger(step.step_index) && step.step_index >= ctx.firstOwnStepIndex &&
+      !ctx.tools.get(id)?.completed && !ctx.boundedFileToolStartedAt.has(id)
+    ) {
+      ctx.boundedFileToolStartedAt.set(id, Date.now())
+    }
     if (!ctx.tools.has(id)) {
       const toolName = antigravityProductToolName(nativeName, parameters)
       const inputJson = antigravityProductToolInput(nativeName, parameters)
@@ -818,6 +838,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     tool.durationMs = Date.now() - (ctx.toolStartedAt.get(id) ?? Date.now())
     tool.ts = Date.now()
     ctx.pendingToolIds.delete(id)
+    ctx.boundedFileToolStartedAt.delete(id)
     ctx.params.onEvent({
       kind: 'block',
       block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output, preview: output.slice(0, 500) },
@@ -945,7 +966,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     if (ctx.terminal) return
     ctx.terminal = true
-    if (ctx.interrupted && ctx.errorDetail === null) ctx.errorDetail = 'Antigravity turn cancelled'
+    if (ctx.interrupted && ctx.errorDetail === null) {
+      ctx.errorDetail = ctx.interruptReason === 'user'
+        ? 'Antigravity turn cancelled' : 'Antigravity turn interrupted by system'
+    }
     if (ctx.errorDetail !== null) ctx.errorDetail = normalizeAntigravityErrorDetail(ctx.errorDetail)
     const isError = ctx.errorDetail !== null
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
@@ -990,7 +1014,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const status: EngineExternalBillingEvent['status'] = budgetStop || !isError ? 'success'
       : cls ? 'unavailable' : 'error'
     const terminalCode: EngineExternalBillingEvent['terminalCode'] = budgetStop || !isError ? undefined
-      : ctx.interrupted ? 'USER_CANCELLED'
+      : ctx.interruptReason === 'user' ? 'USER_CANCELLED'
       : cls === 'auth' ? 'AUTH_UNAVAILABLE'
       : cls === 'quota' ? 'QUOTA_UNAVAILABLE'
       : 'ENGINE_ERROR'
@@ -1049,9 +1073,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx.keepalive = null
   }
 
-  interrupt(): boolean {
+  interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const ctx = this.active
-    if (!ctx?.proc || ctx.proc.killed || ctx.terminal) return false
+    if (!ctx?.proc || ctx.proc.killed || ctx.terminal || ctx.sawResult) return false
+    ctx.interruptReason ??= reason
     ctx.interrupted = true
     killProcessGroup(ctx.proc, 'SIGINT')
     return true
@@ -1134,6 +1159,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   sendPermissionResponse(_requestId: string, _response: unknown): boolean { return false }
   getPartialSnapshot(): PartialSnapshot { return snapshotOf(this.active) }
   get pendingToolCalls(): number { return this.active?.pendingToolIds.size ?? 0 }
+  get idleWatchdogActivityAt(): number {
+    const ctx = this.active
+    let at = this.lastActivityAt
+    if (ctx && !ctx.terminal && !ctx.abandoned && !ctx.sawResult) {
+      for (const startedAt of ctx.boundedFileToolStartedAt.values()) at = Math.min(at, startedAt)
+    }
+    return at
+  }
   get isRunning(): boolean { return !!this.active?.proc && !this.active.proc.killed && !this.active.terminal }
   getBoundRepoBinding(): { selectionVersion: number; workspaceDir: string } | null { return null }
 }

@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -77,6 +77,15 @@ function replay() {
   }))
   if (process.env.FAKE_AGY_STDERR) process.stderr.write(fs.readFileSync(process.env.FAKE_AGY_STDERR, 'utf8'))
   if (process.env.FAKE_AGY_HANG === '1') { setInterval(() => {}, 1000); return }
+  if (process.env.FAKE_AGY_STREAM_FILE) {
+    let offset = 0
+    setInterval(() => {
+      const text = fs.readFileSync(process.env.FAKE_AGY_STREAM_FILE, 'utf8')
+      if (text.length > offset) process.stdout.write(text.slice(offset))
+      offset = text.length
+    }, 10)
+    return
+  }
   for (const line of fs.readFileSync(process.env.FAKE_AGY_FIXTURE, 'utf8').split('\\n')) {
     if (line.trim()) process.stdout.write(line + '\\n')
   }
@@ -126,6 +135,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
   set('FAKE_AGY_HANG', undefined)
   set('FAKE_AGY_EXIT_DELAY_MS', undefined)
   set('FAKE_AGY_EXIT_CODE', undefined)
+  set('FAKE_AGY_STREAM_FILE', undefined)
   const adapter = new AntigravityAdapter({
     sessionKey: 'agent:main:webchat:dm:agy-test',
     agentId: 'main',
@@ -181,6 +191,160 @@ async function runTurn(
   h.adapter.off('session_id', onSession)
   return { summary, events, sessionIds }
 }
+
+/** A real child process, with its clock controlled by the parent test. */
+async function controlledTurn(h: Harness, name: string) {
+  const file = path.join(h.dir, `${name}.ndjson`)
+  await writeFile(file, '')
+  process.env.FAKE_AGY_STREAM_FILE = file
+  const events: EngineEvent[] = []
+  const run = h.adapter.submitTurn({
+    input: 'file operation', requestId: 'c'.repeat(32),
+    onEvent: (event) => events.push(event),
+    sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+  })
+  await run.submitted
+  let sequence = 0
+  const push = async (...lines: object[]) => {
+    const marker = `observed-${name}-${++sequence}`
+    await appendFile(file, [...lines, {
+      event: 'step_update',
+      step_update: { step_type: 'agent_response', text_delta: marker },
+    }].map((line) => JSON.stringify(line)).join('\n') + '\n')
+    for (let i = 0; i < 300; i++) {
+      if (events.some((e) => e.kind === 'block' && e.block.kind === 'text' && e.block.text === marker)) return
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.fail(`fake CLI did not deliver ${marker}`)
+  }
+  await push({ event: 'step_update', step_update: { step_type: 'user_input', state: 'DONE', step_index: 10 } })
+  return { run, push, file }
+}
+
+function fileStep(index: number, state: string, toolName = 'write_to_file') {
+  return { event: 'step_update', step_update: {
+    step_type: 'tool', step_index: index, state,
+    tool_info: { name: toolName, parameters: { TargetFile: '/tmp/generated.txt' } },
+  } }
+}
+
+describe('INC-20261029-GEMINI-FILE-TIMEOUT native file watchdog', () => {
+  test('first ACTIVE bounds file work despite heartbeat, duplicate ACTIVE and unrelated output; DONE/ERROR release it', async () => {
+    const realNow = Date.now
+    let now = 1_000_000
+    Date.now = () => now
+    _internals.setTimingTestHooks({ keepaliveMs: 20 })
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const live = await controlledTurn(h, 'clock')
+      now += 30 * 60_000
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now, 'long high thinking still uses process liveness')
+      now += 463_029
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now, 'pre-tool high thinking has no file deadline')
+      await live.push(fileStep(1, 'ACTIVE'), fileStep(11, 'DONE'), fileStep(12, 'ACTIVE', 'run_command'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now, 'replayed history, DONE-only and non-file work do not arm the clock')
+      await live.push(fileStep(13, 'ACTIVE'))
+      now += 1_548
+      await live.push(fileStep(13, 'DONE'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now, 'the incident file finishes in 1548ms')
+      await live.push(fileStep(13, 'ACTIVE'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now, 'a late duplicate cannot revive a completed tool')
+
+      const older = now
+      await live.push(fileStep(14, 'ACTIVE', 'view_file'))
+      now += 100
+      const younger = now
+      await live.push(fileStep(15, 'ACTIVE', 'replace_file_content'))
+      now += 15 * 60_000
+      await live.push(fileStep(14, 'ACTIVE', 'view_file'))
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      assert.equal(h.adapter.lastActivityAt, now, 'the process heartbeat remains alive')
+      assert.equal(h.adapter.idleWatchdogActivityAt, older, 'heartbeats and repeated ACTIVE cannot renew started work')
+      assert.ok(now - h.adapter.idleWatchdogActivityAt > 15 * 60_000)
+      await live.push(fileStep(14, 'DONE', 'view_file'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, younger, 'one completion cannot clear another file deadline')
+      await live.push(fileStep(15, 'ERROR', 'replace_file_content'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now)
+      for (const [index, toolName] of ['multi_replace_file_content', 'sed_file'].entries()) {
+        await live.push(fileStep(20 + index, 'ACTIVE', toolName))
+        const started = now
+        now += 100
+        await live.push(fileStep(20 + index, 'ACTIVE', toolName))
+        assert.equal(h.adapter.idleWatchdogActivityAt, started)
+        await live.push(fileStep(20 + index, 'DONE', toolName))
+        assert.equal(h.adapter.idleWatchdogActivityAt, now)
+      }
+      await h.adapter.shutdown()
+      await live.run.summary
+    } finally {
+      await h.adapter.shutdown()
+      await h.restore()
+      _internals.setTimingTestHooks(null)
+      Date.now = realNow
+    }
+  })
+
+  test('a prior turn result and late close cannot retain or clear the new file deadline', async () => {
+    const realNow = Date.now
+    let now = 2_000_000
+    Date.now = () => now
+    _internals.setTimingTestHooks({ keepaliveMs: 20, resultSettleMs: 20 })
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '250'
+      const previous = await controlledTurn(h, 'old')
+      await previous.push(fileStep(11, 'ACTIVE'))
+      await appendFile(previous.file, JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'finished old turn' } }) + '\n')
+      await previous.run.summary
+      now += 1_000
+      Reflect.deleteProperty(process.env, 'FAKE_AGY_EXIT_DELAY_MS')
+      const current = await controlledTurn(h, 'new')
+      await current.push(fileStep(11, 'ACTIVE'))
+      const started = now
+      now += 16 * 60_000
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      assert.equal(h.adapter.lastActivityAt, now)
+      assert.equal(h.adapter.idleWatchdogActivityAt, started)
+      await current.push(fileStep(11, 'DONE'))
+      assert.equal(h.adapter.idleWatchdogActivityAt, now)
+      await h.adapter.shutdown()
+      await current.run.summary
+    } finally {
+      await h.adapter.shutdown()
+      await h.restore()
+      _internals.setTimingTestHooks(null)
+      Date.now = realNow
+    }
+  })
+
+  test('the first user or system interrupt keeps its cause through later interrupts', async () => {
+    for (const first of ['user', 'system'] as const) {
+      const h = await harness()
+      try {
+        h.adapter.setAntigravityRoute(ROUTE)
+        const seen: Record<string, unknown>[] = []
+        h.adapter.on('external_billing', (event) => seen.push(event))
+        const live = await controlledTurn(h, first)
+        await live.push(fileStep(11, 'ACTIVE'))
+        assert.equal(h.adapter.interrupt(first), true)
+        h.adapter.interrupt(first === 'user' ? 'system' : 'user')
+        const summary = await live.run.summary
+        await h.adapter.waitForOutputDrain()
+        assert.equal(summary?.stopReason, 'interrupted')
+        assert.equal(seen.length, 1)
+        assert.equal(seen[0]?.status, 'error', 'existing settlement status is unchanged')
+        assert.equal(seen[0]?.terminalCode, first === 'user' ? 'USER_CANCELLED' : 'ENGINE_ERROR')
+      } finally {
+        await h.adapter.shutdown()
+        await h.restore()
+      }
+    }
+  })
+})
 
 describe('validateAntigravityRoute', () => {
   test('accepts only the token-bound loopback relay prefix', () => {
