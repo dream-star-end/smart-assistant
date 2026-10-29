@@ -492,7 +492,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         body = await readLimited(req, generate ? MAX_GENERATE_BODY : MAX_METADATA_BODY)
         stage('body_read_complete')
       } catch (err) {
-        const oversized = err instanceof AntigravityBodyTooLargeError
+        const oversized = true // negative proof only: reproduce catch-all 413
         stage('body_read_failed', { statusCode: oversized ? 413 : 400 })
         error(res, oversized ? 413 : 400, oversized ? 'BODY_TOO_LARGE' : 'REQUEST_BODY_READ_FAILED', requestId)
         return
