@@ -8643,6 +8643,36 @@
           "assertion": "#1234 generation wait and actual file execution @${width}px"
         }
       ]
+    },
+    {
+      "id": "INC-20261029-GEMINI-FILE-TIMEOUT",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "#1234 超时补强：本次 write_file 1548ms 并未挂死，但只读审计发现 Antigravity 30s 合成心跳会持续刷新15min/30min静默门，真实原生文件工具ACTIVE后不结束只剩12h兜底。限定当前turn已开始的5种原生文件读写/编辑工具，用首次ACTIVE复用既有15min阈值与15s巡检；重复ACTIVE、无关输出与合成心跳不续期，完成清理，跨turn隔离。模型生成期和既有计费策略不变；用户主动取消与系统超时原因分离。未扩展全SSE语义进展判定。",
+      "rootFixCommit": "124a55d77",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "first ACTIVE bounds file work despite heartbeat, duplicate ACTIVE and unrelated output; DONE/ERROR release it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "a prior turn result and late close cannot retain or clear the new file deadline"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "the first user or system interrupt keeps its cause through later interrupts"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
+          "assertion": "INC-20261029-GEMINI-FILE-TIMEOUT bounded file activity expires through submit despite fresh process heartbeats"
+        }
+      ]
     }
   ]
 }
