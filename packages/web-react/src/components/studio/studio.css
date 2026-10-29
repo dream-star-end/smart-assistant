@@ -318,6 +318,27 @@
   background: var(--accent);
   color: #fff;
 }
+/* the director's step: done steps get a tick colour, the working one a live ring */
+.st-steps a[data-step="done"] .n {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.st-steps a[data-step="now"] {
+  color: var(--fg);
+}
+.st-steps a[data-step="now"] .n {
+  box-shadow: 0 0 0 2px var(--st-agent, var(--accent));
+}
+.st-steps-mobile button[data-step="now"]::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  vertical-align: middle;
+  background: var(--st-agent, var(--accent));
+}
 .st-credit {
   display: flex;
   align-items: center;

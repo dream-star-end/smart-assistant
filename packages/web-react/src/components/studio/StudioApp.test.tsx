@@ -215,6 +215,47 @@ describe('StudioApp (OCV5-593)', () => {
     )
   })
 
+  test('the step bar follows the director: from the brief to 设定 once the plan is through', async () => {
+    let started = false
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    const body = () => ({
+      project: project({ status: started ? 'running' : 'draft' }),
+      shots: started
+        ? [{ id: 's0', ordinal: 0, spec: { title: '晨雾' }, status: 'planned', activeTakeId: null }]
+        : [],
+      lines: [],
+      assets: started
+        ? [
+            {
+              id: 'a0',
+              kind: 'character',
+              name: '红狐',
+              locked: false,
+              descriptor: null,
+              blobSha: null,
+              voiceId: null,
+              meta: {},
+              createdAt: '',
+            },
+          ]
+        : [],
+      takes: [],
+      events: [],
+    })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: body() })
+    routes[`POST /api/studio/projects/${ID}/start`] = () => {
+      started = true
+      return { status: 200, body: body() }
+    }
+    mount(`/studio/p/${ID}/brief`)
+    const brief = await screen.findByRole('link', { name: /需求/ })
+    expect(brief).toHaveAttribute('data-step', 'now')
+    fireEvent.click(await screen.findByRole('button', { name: /全自动开始/ }))
+    await waitFor(() => expect(location.pathname).toBe(`/studio/p/${ID}/image`))
+    expect(screen.getByRole('link', { name: /设定/ })).toHaveAttribute('data-step', 'now')
+    expect(screen.getByRole('link', { name: /需求/ })).toHaveAttribute('data-step', 'done')
+  })
+
   test('brief page: the storyboard estimate is shown while running and when asking to approve', async () => {
     let view: Partial<StudioProject> = {
       status: 'running',
