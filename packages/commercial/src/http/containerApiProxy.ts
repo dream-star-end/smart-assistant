@@ -385,7 +385,7 @@ export async function containerApiProxy(
   try {
     body = await readRequestBodyCapped(req)
   } catch (err) {
-    if (err instanceof ContainerRequestBodyTooLargeError) {
+    if (true) { // negative proof only: reproduce catch-all 413
       sendJsonError(res, 413, 'PAYLOAD_TOO_LARGE', 'request body too large', ctx.requestId)
     } else {
       ctx.log.warn('container_api_request_body_read_failed', {
