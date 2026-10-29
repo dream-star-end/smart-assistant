@@ -312,6 +312,17 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
    `login_required`。恢复只能由账号持有人重新 OAuth(box 用户、不设 CLAUDE_CONFIG_DIR 跑
    `claude auth login`);不要把别的配置目录的 `.credentials.json` 拷过来——同一 refresh token 两处轮换会互相踢掉。
 
+8. **Gemini / Antigravity「写文件卡数分钟」先分清模型生成和工具执行**（#1234）：先查 tape
+   的 `arrivedAt/completedAt/durationMs`，再对 relay `fetch_started/first_byte/stream_complete`
+   与 `antigravity_relay_usage`。实测一次 463 秒上游生成（首字节约 10 秒，27,290 思考 token）
+   之后 `write_file` 只执行 1.548 秒，整轮正常完成。CLI 不透出思考正文/写入内容；步骤总耗时
+   包含此前生成等待，不能据此给写文件加短截止。过程行将有实证的执行耗时与此前等待分开显示，
+   无可见输出时只说「等待模型响应」，不伪称工具仍在跑或已确认模型正在思考。
+   Antigravity 进程 keepalive 仅证明进程存活，会刷新 idle；它不是上游进展证明。relay 的
+   `undici.request` 经默认 Agent（7.25.0）有 300 秒 headers/body inactivity 超时（非总调用时限）；
+   `sessionSubmit` 另有不依赖 activity 的 12 小时逻辑 turn 硬上限。诊断时分别核对网络、进程与工具，
+   不把有持续流的合法高思考按短总墙钟误杀。
+
 ### 3.3 会话历史/持久化问题(高频类)
 心智模型:**用户行走 POST /user-message；模型生成内容由 v2 lossless turn tape 在 PG 中完整保存，`client_sessions.messages` 只留常量大小 anchor，读取时水合为 assistant/thinking/tool/agent-group/plan/goal**。合并语义在 `lib/persist.ts`:
 - full 合并 `mergeFullServerWins`:server 权威在前,保留尾部乐观段 + 中段 local-only user 行 + 中段 local-only 团队卡;

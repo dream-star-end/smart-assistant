@@ -15,7 +15,7 @@ import type { ChatMessage } from './model'
  * — a row without a trustworthy time gets no entry and the UI shows nothing.
  */
 export type StepTiming =
-  | { ms: number; runningSince?: undefined }
+  | { ms: number; runningSince?: undefined; executionMs?: number }
   | { ms?: undefined; runningSince: number }
 
 /** Clocks further apart than this are not the same turn (or not the same clock). */
@@ -84,7 +84,16 @@ export function computeStepTimings(
       continue
     }
     const ms = end > boundary ? end - boundary : Math.max(0, end - start)
-    if (ms <= MAX_TURN_SPAN_MS) out.set(message.id, { ms })
+    if (ms <= MAX_TURN_SPAN_MS) {
+      // Keep the aggregate wall clock, but do not present model generation
+      // before a tool as time spent executing it (#1234). Only the engine's
+      // recorded duration proves execution; ts/completedAt may include input streaming.
+      const executionMs = message.role === 'tool' && !toolRunning(message) &&
+        typeof message.durationMs === 'number' && Number.isFinite(message.durationMs) &&
+        message.durationMs >= 0 && message.durationMs <= ms
+        ? message.durationMs : undefined
+      out.set(message.id, { ms, ...(executionMs !== undefined ? { executionMs } : {}) })
+    }
     boundary = Math.max(boundary, end)
   }
   return out
@@ -96,6 +105,7 @@ export function combineStepTimings(
   ids: readonly string[],
 ): StepTiming | undefined {
   if (!timings || ids.length === 0) return undefined
+  if (ids.length === 1) return timings.get(ids[0]!)
   let total = 0
   for (const id of ids) {
     const timing = timings.get(id)
@@ -108,7 +118,7 @@ export function combineStepTimings(
 
 export function stepTimingsSignature(timings: ReadonlyMap<string, StepTiming>): string {
   let sig = ''
-  for (const [id, timing] of timings) sig += `${id}:${timing.ms ?? `r${timing.runningSince}`}|`
+  for (const [id, timing] of timings) sig += `${id}:${timing.ms ?? `r${timing.runningSince}`}:${timing.ms !== undefined ? timing.executionMs ?? '' : ''}|`
   return sig
 }
 
