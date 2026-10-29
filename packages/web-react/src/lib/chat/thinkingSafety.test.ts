@@ -175,6 +175,40 @@ describe("transient 软提示：不落 IndexedDB / 清除时机", () => {
     sock.stop();
   });
 
+  test("confirmed stop rejects a replaced live identity and freezes its payload before async persistence", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    let release!: () => void;
+    const persisted = new Promise<void>((resolve) => { release = resolve; });
+    const persistPendingControl = vi.fn(() => persisted);
+    const sock = makeSocket({ persistPendingControl });
+    try {
+      sock.setGateReady(true);
+      const ws = FakeWS.instances.at(-1)!;
+      ws.open();
+      sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+      admitLatest(sock, ws);
+      const session = sock.sessions.get("s1")!;
+      const original = session._activeClientMessageId!;
+      session._activeClientMessageId = "replacement";
+      sock.stopTurn("s1", original);
+      expect(persistPendingControl).not.toHaveBeenCalled();
+      expect(session._stopSettlement).toBeUndefined();
+      sock.stopTurn("s1", "replacement");
+      expect(persistPendingControl).toHaveBeenCalledTimes(1);
+      expect(ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.control.stop")).toHaveLength(0);
+      session._activeClientMessageId = "third-turn";
+      release();
+      await persisted;
+      await Promise.resolve();
+      const frames = ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.control.stop");
+      expect(frames).toHaveLength(1);
+      expect(frames[0].clientMessageId).toBe("replacement");
+    } finally {
+      sock.stop();
+    }
+  });
+
   test("用户手动停止 → 清除 transient 软提示", () => {
     vi.useFakeTimers();
     FakeWS.autoPong = true;

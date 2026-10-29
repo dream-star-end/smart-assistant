@@ -4,7 +4,9 @@ import { afterEach, expect, test, vi } from "vitest";
 import { useStopShortcut } from "./useStopShortcut";
 
 afterEach(cleanup);
-function Harness(props: Parameters<typeof useStopShortcut>[0]) { return useStopShortcut(props); }
+function Harness(props: { enabled: boolean; turnKey: string; onStop: () => void }) {
+  return useStopShortcut({ ...props, getStopAction: () => props.onStop });
+}
 
 test("Esc requests confirmation; cancel keeps running and explicit confirm stops once", async () => {
   const onStop = vi.fn();

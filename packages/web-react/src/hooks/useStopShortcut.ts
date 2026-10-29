@@ -3,15 +3,16 @@ import { useConfirm } from "../components/ui/ConfirmDialog";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "../lib/hotkeys";
 
 /** Esc only requests Stop. Confirmation belongs to the exact turn that opened it. */
-export function useStopShortcut({ enabled, turnKey, onStop }: {
+export function useStopShortcut({ enabled, turnKey, getStopAction }: {
   enabled: boolean;
   turnKey: string;
-  onStop: () => void;
+  /** Capture an action bound to the live socket identity, not a render snapshot. */
+  getStopAction: () => (() => void) | null;
 }) {
   const [confirm, dialog] = useConfirm();
   const pending = useRef(false);
-  const current = useRef({ enabled, turnKey, onStop });
-  current.current = { enabled, turnKey, onStop };
+  const current = useRef({ enabled, turnKey, getStopAction });
+  current.current = { enabled, turnKey, getStopAction };
 
   useEffect(() => {
     let valid = true;
@@ -20,6 +21,8 @@ export function useStopShortcut({ enabled, turnKey, onStop }: {
         sending: enabled, dialogOpen: isDialogLayerOpen(),
       }) !== "stop") return;
       event.preventDefault();
+      const stop = current.current.getStopAction();
+      if (!stop) return;
       pending.current = true;
       try {
         const choice = await confirm({
@@ -30,7 +33,7 @@ export function useStopShortcut({ enabled, turnKey, onStop }: {
           danger: true,
         });
         if (choice === true && valid && current.current.enabled && current.current.turnKey === turnKey) {
-          current.current.onStop();
+          stop();
         }
       } finally {
         pending.current = false;

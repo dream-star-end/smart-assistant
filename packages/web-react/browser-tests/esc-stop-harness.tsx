@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { SessionStatusDot } from "../src/components/SessionStatusDot";
@@ -10,8 +10,13 @@ function Harness() {
   const [turn, setTurn] = useState(1);
   const [stops, setStops] = useState(0);
   const stop = () => { setStops((n) => n + 1); setRunning(false); };
-  const dialog = useStopShortcut({ enabled: running, turnKey: `session:${turn}`, onStop: stop });
-  (window as unknown as { nextTurn: () => void }).nextTurn = () => { setTurn((n) => n + 1); setRunning(true); };
+  const liveTurn = useRef(turn);
+  const dialog = useStopShortcut({ enabled: running, turnKey: `session:${turn}`, getStopAction: () => {
+    const expected = liveTurn.current;
+    return () => { if (liveTurn.current === expected) stop(); };
+  } });
+  (window as unknown as { nextTurn: () => void }).nextTurn = () => { liveTurn.current += 1; setTurn(liveTurn.current); setRunning(true); };
+  (window as unknown as { replaceWithoutRender: () => void }).replaceWithoutRender = () => { liveTurn.current += 1; };
   const terminal = deriveLiveTerminalFromMessages([{ _errorCode: "USER_CANCELLED" }]);
   return <>
     <output data-testid="stops">{stops}</output>
