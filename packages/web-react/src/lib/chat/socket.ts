@@ -1571,6 +1571,9 @@ export class ChatSocket {
     // authority. A late admission ACK must not revive sending or remove the
     // local teardown fence during that settlement window.
     if (sess._stopSettlement?.clientMessageId === clientMessageId) return true;
+    // The turn already ended with a deferred terminal error (its slot was released on the
+    // error frame); a trailing frame of it must not take the slot back from its recovery.
+    if (sess._deferredTerminalErrorClientMessageId === clientMessageId) return true;
     // OCV5-427: every live frame of the turn re-confirms admission. Only a
     // confirmation that moved something opens a render window; replayed
     // frames of an already admitted turn stay quiet.

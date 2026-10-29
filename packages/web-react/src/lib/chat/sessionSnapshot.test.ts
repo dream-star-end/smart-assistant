@@ -502,6 +502,31 @@ describe("恢复宽限到点按快照收口（OD1）", () => {
     sock.stop();
   });
 
+  test("the [error] text final that trails a deferred error does not take the dispatch slot back", async () => {
+    // Legacy gateways (no master-v1) recover in the browser: the recovery child queues behind
+    // this slot, so a trailing frame of the failed turn re-claiming it stalls the recovery.
+    const { sock, ws, s } = boot({ syncSession: () => new Promise<boolean>(() => {}) });
+    ws.push({ type: "sys.relay_ready" });
+    void sock.sendMessage({ sessId: "s1", agentId: "main", text: "long task" });
+    await flush();
+    const user = s.messages.find((m) => m.role === "user")!;
+    const slots = (sock as unknown as { dispatchSlots: Map<string, string> }).dispatchSlots;
+    ws.push({ type: "outbound.ack", admitted: true, peer, clientMessageId: user.id });
+    expect(slots.get("s1")).toBe(user.id);
+    ws.push({
+      type: "outbound.error", peer, sessionKey: SK, clientMessageId: user.id, code: "engine_error",
+      message: "temporary model error", frameSeq: 1, ts: Date.now(),
+    });
+    expect(s._deferredTerminalErrorClientMessageId).toBe(user.id);
+    expect(slots.get("s1")).toBeUndefined();
+    ws.push({
+      type: "outbound.message", peer, sessionKey: SK, channel: "webchat", clientMessageId: user.id,
+      blocks: [{ kind: "text", text: "[error] temporary model error" }], isFinal: true, frameSeq: 2, ts: Date.now(),
+    });
+    expect(slots.get("s1")).toBeUndefined();
+    sock.stop();
+  });
+
   test("snapshot unreadable (offline) → waits another grace instead of guessing", async () => {
     const readSessionSnapshot = vi.fn(async () => { throw new Error("offline"); });
     const { sock, s } = deferred({ readSessionSnapshot });

@@ -2731,6 +2731,13 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
       m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid &&
       (m._source === "server" || !!m._turnTapeId));
     if (adopted) return false;
+    // The decision is final: release every card of this turn freezeErrorCardSnapshots held for it
+    // (the verified status record too), or a status record that supersedes the red card hides both.
+    for (const m of sess.messages) {
+      if (m._clientMessageId !== cmid || m._errorHeldForRecovery !== true || m.role === "assistant") continue;
+      m._errorHeldForRecovery = undefined;
+      commitErrorCardSnapshot(m);
+    }
     const existing = sess.messages.find((m) =>
       m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode);
     if (existing?._errorCardSnapshot?.disposition === "card") return false;
