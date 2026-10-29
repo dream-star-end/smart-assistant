@@ -101,13 +101,15 @@ export function AgentPicker({
   )
   const [loading, setLoading] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
-  const [reload, setReload] = useState(0)
   const advisorSelectId = useId()
 
   useEffect(() => {
-    if (!open || !auth) return
+    if (open && auth) setLoading(true)
+  }, [open, auth])
+
+  useEffect(() => {
+    if (!open || !auth || !loading) return
     let alive = true
-    setLoading(true)
     setLoadFailed(false)
     api
       .listMyAgents(auth)
@@ -121,7 +123,7 @@ export function AgentPicker({
     return () => {
       alive = false
     }
-  }, [open, auth, reload])
+  }, [open, auth, loading])
 
   const defaultAgent = agents.find((a) => a.isDefault) ?? MAIN_AGENT
   const others = agents.filter((a) => !a.isDefault)
@@ -337,7 +339,7 @@ export function AgentPicker({
       {loadFailed && (
         <p role="alert" className="mb-2 text-caption text-warning">
           智能体加载失败。
-          <button type="button" className="ml-2 underline" onClick={() => setReload((n) => n + 1)}>重试</button>
+          <button type="button" className="ml-2 underline" onClick={() => setLoading(true)}>重试</button>
         </p>
       )}
 

@@ -67,10 +67,13 @@ export async function buildSessionSnapshot(
         ORDER BY created_at DESC,job_id DESC LIMIT 1`,
       [uid, sessionId],
     )).rows[0]
-    if (recovery) snapshot.recovery = {
-      status: recovery.status, attempt: recovery.semantic_recovery_attempt, maxAttempts: recovery.retry_limit,
-      retryStatus: automaticRetryStatus(recovery.status === 'forwarded' ? 'running' : 'scheduled',
-        recovery.semantic_recovery_attempt, recovery.retry_limit ?? undefined),
+    if (recovery) {
+      const retryStatus = automaticRetryStatus(recovery.status === 'forwarded' ? 'running' : 'scheduled',
+        recovery.semantic_recovery_attempt, recovery.retry_limit ?? undefined)
+      snapshot.recovery = {
+        status: recovery.status, attempt: recovery.semantic_recovery_attempt, maxAttempts: recovery.retry_limit,
+        retryStatus: { ...retryStatus, actions: [...retryStatus.actions] },
+      }
     }
   } catch (error) {
     await q.query('ROLLBACK TO SAVEPOINT session_snapshot_recovery')

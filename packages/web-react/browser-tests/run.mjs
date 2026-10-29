@@ -2842,20 +2842,20 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
-await check("T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见", async () => {
+await check("T29 自动恢复显示第2次重试；重试成功保持实时可见", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
   await page.evaluate(() => window.__replayDrive.pushRetryStatus());
-  await replayRoot.getByText("模型繁忙，正在重试…", { exact: true }).waitFor({
+  await replayRoot.getByText("正在自动重试（第 2 次）", { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
-  // OCV5-523: one shared retry activity, no attempt counter or error card.
+  // D1: one shared retry activity includes the confirmed attempt, without a second error card.
   if (await replayRoot.getByText(/\d+\/10/).count()) {
-    throw new Error("自动重试期间不应显示重试计数");
+    throw new Error("自动重试期间不应显示过时固定上限");
   }
   if (await replayRoot.getByText(replayMarkers.retryControl, { exact: true }).count()) {
     throw new Error("自动恢复控制 user 行重新显示为聊天气泡");

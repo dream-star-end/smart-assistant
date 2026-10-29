@@ -128,10 +128,13 @@ test('an enrichment fence that already terminalized wins before any database awa
 test('automatic recovery retains its atomic receipt and running-status path', async () => {
   const queries: unknown[] = []
   const h = harness(async (sql, values) => { queries.push({ sql, values }); return { rows: [], rowCount: 1 } })
-  const recoveryJob = {
+  const recoveryJob: ClaimedRecoveryJob = {
+    jobId: 'receipt-recovery-job', userId: 3n, sourceTurnKey: 'a'.repeat(64),
+    errorCode: 'UPSTREAM_UNAVAILABLE', recoveryMode: 'checkpoint', transportWaitAttempt: 0,
+    leaseOwner: record.leaseOwnerId, leaseEpoch: record.leaseEpoch,
     sessionId: record.sessionId, sourceClientMessageId: 'cm-source', rootClientMessageId: 'cm-root',
     semanticRecoveryAttempt: 2, request: { clientMessageId: record.clientMessageId, _automaticRecoveryRetryLimit: 3 },
-  } as ClaimedRecoveryJob
+  }
   h.context.admittedDispatches.set(record.clientMessageId, { ...record, ...{ recoveryJob } })
   assert.equal(handleTurnDispatchReceipt(receipt(), h.context), true)
   await setImmediate()
