@@ -662,7 +662,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         const res = await api.patchSessionTitle(cbRef.current.authSession, s.id, t);
         const prev = confirmedMetadata.current.get(s.id);
         if (typeof res?.updatedAt === "number" && (!prev || prev.updatedAt <= res.updatedAt)) {
-          confirmedMetadata.current.set(s.id, { id: s.id, title: t, pinned: s.pinned === true, updatedAt: res.updatedAt });
+          // 标题 PATCH 只为标题背书：置顶沿用最近一次已确认的值，没有才用本地值。
+          confirmedMetadata.current.set(s.id, { id: s.id, title: t, pinned: prev ? prev.pinned : s.pinned === true, updatedAt: res.updatedAt });
         }
         if (pendingTitles.current.get(s.id) === t) pendingTitles.current.delete(s.id);
       } catch (e) {

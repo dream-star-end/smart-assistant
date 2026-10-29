@@ -1070,4 +1070,22 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
       expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.title).toBe("别处又改了"),
     );
   });
+
+  test("改名只为标题背书：此前已确认的置顶不被改名框打开时的旧值盖掉", async () => {
+    const { result, harness } = await renderSessionList({ confirmResult: true, promptResult: "office-1029pm" });
+    const target = result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    expect(target.pinned).not.toBe(true);
+    act(() => result.current.applySessionMetadata({ id: "webkeepme001", title: "保留的会话", pinned: true, updatedAt: 2_500 }));
+    const stale = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+    vi.mocked(api.listSessions).mockImplementationOnce(() => stale.promise);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(2));
+    harness.patchSessionTitle.mockResolvedValue({ ok: true, updatedAt: 3_000 });
+    await act(async () => {
+      await result.current.renameSessionPrompt(target);
+    });
+    await act(async () => stale.resolve([meta("webkeepme001", "保留的会话")] as never));
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
+  });
 });
