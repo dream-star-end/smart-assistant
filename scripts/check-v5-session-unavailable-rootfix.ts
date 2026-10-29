@@ -1151,3 +1151,30 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/commercial/src/__tests__/containerApiProxy.test.ts'],
+  expected: [
+    'OCV5-659 body read failures are connection errors and never forwarded',
+    'OCV5-659 complete request at the byte cap still reaches container lookup',
+    'rejects oversized request bodies before dispatch',
+  ],
+  namePattern: 'OCV5-659|rejects oversized request bodies before dispatch',
+  label: 'container-request-body-errors',
+  timeoutMs: 120_000,
+})
+console.log('[container-request-body-errors] PASS — aborted reads never become size errors or forward partial bytes; 512KiB cap remains enforced')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/commercial/src/__tests__/antigravityRelay.test.ts'],
+  expected: [
+    'OCV5-659 relay stream failures do not become size errors or reserve credits',
+    'OCV5-659 relay metadata and generate byte caps still reject before billing',
+  ],
+  namePattern: 'OCV5-659',
+  label: 'relay-request-body-errors',
+  timeoutMs: 120_000,
+})
+console.log('[relay-request-body-errors] PASS — relay read errors never reserve credits or become 413; metadata and generate byte caps remain enforced')
