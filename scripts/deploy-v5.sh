@@ -173,6 +173,7 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 source "$RUNTIME_LIB"
 source "$SCRIPT_DIR/lib/v5-commercial-release-policy.sh"
 source "$SCRIPT_DIR/lib/v5-host-admission.sh"
+source "$SCRIPT_DIR/lib/v5-commercial-cutover-idle.sh"
 FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
 if [[ -f "$FLAVOR_LIB" ]]; then
   # shellcheck source=scripts/lib/assert-flavor.sh
@@ -8367,6 +8368,7 @@ deploy() {
     if [[ "$hc_release" == 1 ]]; then build_runtime_release || { echo "✗ runtime release 构建失败(live 未改)" >&2; exit 1; }; fi
     sync_assets_to_pool "$BUILT_RELEASE" || { echo "✗ assets 预同步失败(live 未改)" >&2; exit 1; }
   fi
+  commercial_wait_for_cutover_idle "$kp_previous_release" || { local idle_rc=$?; echo "✗ 未证明商业空窗,live 未切换" >&2; exit "$idle_rc"; }
   begin_planned_maintenance deploy "$RESTART_EGRESS"
   # RFC §1.2:进入不可逆翻转段(KP 门关闭 / release 激活 / egress)前活体断言远端 lease 仍持有。
   # 此刻 live master 仍未改,失活即 end maintenance 后干净退出(无 KP 门需回滚)。
