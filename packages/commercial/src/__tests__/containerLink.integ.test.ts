@@ -78,11 +78,11 @@ async function recoveryRig(client: Client, receive: (ws: WebSocket, frame: Recor
     pricing: {} as UserChatBridgeDeps["pricing"],
     markContainerActivity: () => { activity++; }, activityKeepaliveIntervalMs: 5,
     persistOutboundFrame: async input => {
-      persisted.push(input.frameSeq);
       await client.query(`INSERT INTO client_session_live_streams(stream_key,user_id,session_id,agent_container_id,source)
         VALUES ($1,'c:42','restored',7,'gateway') ON CONFLICT DO NOTHING`, [restoredKey]);
       await client.query(`INSERT INTO client_session_live_frames VALUES ($1,'gateway',7,$2,$3,$4) ON CONFLICT DO NOTHING`,
         [restoredKey, input.sessionKey, input.frameSeq, Buffer.from(JSON.stringify(input.payload))]);
+      persisted.push(input.frameSeq);
     },
     ...extra,
   });
