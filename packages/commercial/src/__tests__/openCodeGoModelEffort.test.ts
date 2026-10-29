@@ -75,6 +75,21 @@ describe('OpenCode Go vision ceiling', () => {
     assert.equal(providerCapabilityCeiling(route()).supportsVision, false)
   })
 
+  test('Flash canonical and legacy alias require the real Go upstream for native vision', () => {
+    for (const modelId of ['deepseek-v4-flash', 'deepseek-v4-flash-opencode-go']) {
+      const entry = { modelId, engine: 'ccb', state: 'active', providerId: 'opencodego',
+        upstreamModelId: 'deepseek-v4.1-flash',
+        capabilityProfile: { supportsVision: true, reasoning: { supported: [] } } };
+      assert.deepEqual(checkSnapshotCapabilities({ entries: [entry] }), []);
+      for (const route of [
+        { providerId: 'opencodego', upstreamModelId: 'deepseek-v4-flash' },
+        { providerId: 'deepseek', upstreamModelId: 'deepseek-flash' },
+      ]) {
+        assert.equal(checkSnapshotCapabilities({ entries: [{ ...entry, ...route }] }).length, 1);
+      }
+    }
+  });
+
   test('snapshot check accepts vision only on allowlisted Go upstream ids', () => {
     const entry = (modelId: string, upstreamModelId: string, supportsVision: boolean) => ({
       modelId,

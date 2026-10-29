@@ -88,6 +88,7 @@ describe("0096 双钱包 + 订阅计费 (integ)", () => {
     let sub = await getUserSubscription(uid);
     assert.equal(sub?.planCode, "free");
     assert.equal(sub?.periodCredits.toString(), "300");
+    assert.equal(sub!.periodEnd.getTime() - sub!.periodStart.getTime(), 30 * 86400_000);
     // 幂等：再次 ensure 不重复发放
     await ensureFreeSubscription(uid);
     sub = await getUserSubscription(uid);
@@ -135,6 +136,34 @@ describe("0096 双钱包 + 订阅计费 (integ)", () => {
     assert.equal(sub?.periodCredits.toString(), "10000"); // 重置(旧 300 清零，发 10000)
     assert.ok(sub!.periodEnd.getTime() > Date.now() + 25 * 86400_000); // ~30 天
     assert.equal((await getBalanceBreakdown(uid)).wallet.toString(), "500"); // 钱包不动
+  });
+
+  test("free quota replaced by Lite after five minutes is an order settlement, not a short TTL", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const uid = await mkUser(500n);
+    await ensureFreeSubscription(uid);
+    await query(`UPDATE user_subscriptions SET period_start=NOW()-INTERVAL '5 minutes',
+      period_end=NOW()+INTERVAL '30 days'-INTERVAL '5 minutes' WHERE user_id=$1`, [uid]);
+    const before = await getUserSubscription(uid);
+    assert.ok(before!.periodEnd.getTime() > Date.now() + 29 * 86400_000);
+    const order = await createSubscriptionOrder({
+      userId: uid, kind: "subscription", planCode: "lite", amountCents: 3800n, credits: 4000n,
+    });
+    await markOrderPaid({ orderNo: order.order_no, callbackPayload: {} });
+    const sub = await getUserSubscription(uid);
+    assert.equal(sub?.periodCredits, 4000n);
+    assert.equal(sub!.periodEnd.getTime() - sub!.periodStart.getTime(), 30 * 86400_000);
+    assert.equal((await getBalanceBreakdown(uid)).wallet, 500n);
+    const readLedger = () => query<{ delta: string; reason: string; ref_id: string | null }>(
+      `SELECT delta::text,reason,ref_id FROM credit_ledger WHERE user_id=$1 ORDER BY id`, [uid]);
+    const ledger = (await readLedger()).rows;
+    assert.deepEqual(ledger, [
+      { delta: "300", reason: "subscription", ref_id: null },
+      { delta: "-300", reason: "subscription_expire", ref_id: order.order_no },
+      { delta: "4000", reason: "subscription", ref_id: order.order_no },
+    ]);
+    await markOrderPaid({ orderNo: order.order_no, callbackPayload: {} });
+    assert.deepEqual((await readLedger()).rows, ledger, "payment replay must not grant twice");
   });
 
   test("upgrade：期内桶补到新档额度 + 周期不变", async (t) => {
