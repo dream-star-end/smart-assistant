@@ -416,8 +416,10 @@ function assertWaitCloseTap(tap: string): void {
   assert.deepEqual(leaves, [...WAIT_CLOSE_CASES], "all nine lifecycle cases must succeed exactly once");
 }
 
-async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Promise<void> {
-  const testFile = join(candidateRoot, "packages/gateway/src/__tests__/waitClose.test.ts");
+async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
+  regression?: { file: string; titles: readonly string[]; label: string }): Promise<void> {
+  const testFile = join(candidateRoot,
+    regression?.file ?? "packages/gateway/src/__tests__/waitClose.test.ts");
   // Resolve from the candidate (never npx download / a global package fallback).
   const tsx = createRequire(join(candidateRoot, "package.json")).resolve("tsx");
   readFileSync(testFile); // missing fixture must fail before spawning
@@ -473,9 +475,20 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Pro
         resolveProof(stdout);
       });
     });
-    assertWaitCloseTap(tap);
     console.log(tap.trimEnd());
-    console.log("[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters");
+    if (regression) {
+      assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!|^\s*ok\b[^\r\n]*#\s*(?:SKIP|TODO)\b/gmi);
+      const tests = [...tap.matchAll(/^# tests (\d+)\r?$/gm)].map(m => Number(m[1]));
+      assert.equal(tests.length, 1, "complete TAP test summary required");
+      assert.ok(tests[0]! >= regression.titles.length && tests[0]! > 0);
+      assert.match(tap, new RegExp(`^# pass ${tests[0]}\\r?$`, "m"));
+      for (const key of ["fail", "cancelled", "skipped", "todo"]) {
+        assert.match(tap, new RegExp(`^# ${key} 0\\r?$`, "m"));
+      }
+      for (const title of regression.titles) assert.ok(tap.includes(`- ${title}\n`), title);
+    } else assertWaitCloseTap(tap);
+    if (regression) console.log(`[${regression.label}] PASS`);
+    else console.log("[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters");
   } finally {
     // close has been observed before removal, including timeout/group kill.
     rmSync(home, { recursive: true, force: true });
@@ -511,6 +524,26 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000): Pro
 }
 
 await runWaitCloseProof(root);
+// [delegate-preflight-quota] PASS
+await runWaitCloseProof(root, 60_000, {
+  file: "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+  titles: ["DELEGATE_CODEX_UNSUPPORTED", "DELEGATE_MODEL_UNKNOWN", "MODEL_NOT_AVAILABLE",
+    "MODEL_CATALOG_UNAVAILABLE"].map(code => `preflight quota: ${code} leaves all member attempts available`),
+  label: "delegate-preflight-quota",
+});
+await runWaitCloseProof(root, 60_000, {
+  file: "packages/gateway/src/__tests__/memberDelegateLimit.test.ts",
+  titles: ["missing hidden-reviewer preflight does not consume quota",
+    "spawned submit failure still consumes member quota",
+    "concurrent valid members share one synchronous quota acquisition"],
+  label: "delegate-preflight-limits",
+});
+// [box-agent-default-temperature] PASS
+await runWaitCloseProof(root, 60_000, {
+  file: "packages/commercial/src/http/proxy/boxRequestGate.test.ts",
+  titles: ["Box default temperature is absent from text and tool compilation without weakening gates"],
+  label: "box-agent-default-temperature",
+});
 rmSync(testHome, { recursive: true, force: true });
 console.log(
   "[delegate-billing-requestid] PASS — codex/grok delegate admits a 32-hex requestId that reaches sessions.submit, codex_billing is live-settled once with delegate attribution, glm skips, failures abandon, failed settles are queued and retried once",
