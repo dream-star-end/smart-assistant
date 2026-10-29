@@ -369,7 +369,11 @@ function OtherOutputs({
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-body text-fg">{f.name}</span>
                       <span className="block truncate text-caption text-faint">
-                        {f.change ? `${KIND_LABEL[f.kind]} · ${f.change.entries.length} 次改动` : `${KIND_LABEL[f.kind]} · 回答里提到`}
+                        {f.change
+                          ? `${KIND_LABEL[f.kind]} · ${f.change.entries.length} 次改动`
+                          : f.bundle
+                            ? `压缩包 · 全部下载(${f.bundle} 个文件)`
+                            : `${KIND_LABEL[f.kind]} · ${f.packed ? "本轮产出" : "回答里提到"}`}
                       </span>
                     </span>
                     <span className="flex shrink-0 items-center gap-2 text-meta">

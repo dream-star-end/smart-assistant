@@ -71,6 +71,31 @@ describe("collectTurnOutputs", () => {
     ]);
   });
 
+  test("P3 回答只报了 zip:打包记录里的每个文件单独列出,zip 排在后面作全部下载;没通过的打包不还原", () => {
+    const gen = "/home/agent/.openclaude/generated";
+    const report = (passed: boolean, zip: string, paths: string[]) =>
+      `${JSON.stringify({ schemaVersion: 1, tool: "oc-artifact-qa", passed, verdict: passed ? "PASS" : "FAIL", input: { paths, kind: "zip", path: zip } }, null, 2)}\n${passed ? "PASS" : "FAIL"}\n`;
+    const [turn] = collectWorkTurns([
+      user("u1", "做纪要和汇报"),
+      tool("p0", "Bash", { command: `oc-artifact-qa pack --out ${gen}/old.zip -- ${gen}/x.docx` }, { output: report(false, `${gen}/old.zip`, [`${gen}/x.docx`]) }),
+      tool("p1", "Bash", { command: `oc-artifact-qa pack --out ${gen}/周报.zip -- ${gen}/纪要.docx ${gen}/汇报.pptx ${gen}/封面.png` }, {
+        output: `${report(true, `${gen}/周报.zip`, [`${gen}/纪要.docx`, `${gen}/汇报.pptx`, `${gen}/封面.png`])}`,
+      }),
+      assistant("a1", `已打包：\`${gen}/周报.zip\`，另见 \`${gen}/old.zip\``),
+    ]);
+    const o = collectTurnOutputs(turn);
+    expect(o.files.map((f) => [f.name, f.bundle ?? 0, f.packed ?? false])).toEqual([
+      ["纪要.docx", 0, true],
+      ["汇报.pptx", 0, true],
+      ["周报.zip", 3, false],
+      ["old.zip", 0, false],
+    ]);
+    expect(o.media.map((m) => m.name)).toEqual(["封面.png"]);
+    // 主产物按原规则从单个文件 / 图片里选,不再落到 zip 上。
+    expect(pickHero(o)).toEqual({ type: "media", src: `${gen}/封面.png` });
+    expect(pickHero({ ...o, media: [] })).toEqual({ type: "file", path: `${gen}/纪要.docx` });
+  });
+
   test("写出的图片文件进图片区,不在文件区重复", () => {
     const [turn] = collectWorkTurns([user("u1", "画图"), tool("w1", "Write", { file_path: "/w/logo.svg", content: "<svg/>" })]);
     const o = collectTurnOutputs(turn);
