@@ -35,6 +35,8 @@ import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import type { Pool, PoolClient } from 'pg'
 
+import { removePreviews } from './preview.js'
+
 export const STUDIO_USER_LIMIT_BYTES = 5n * 1024n ** 3n
 export const STUDIO_SITE_LIMIT_BYTES = 15n * 1024n ** 3n
 export const STUDIO_DISK_FLOOR_BYTES = 2n * 1024n ** 3n
@@ -144,6 +146,11 @@ export class StudioBlobStore {
         const st = await statfs(root)
         return BigInt(st.bavail) * BigInt(st.bsize)
       })
+  }
+
+  /** The store's directory (previews are kept under it, beside the blobs). */
+  get root(): string {
+    return this.opts.root
   }
 
   blobPath(sha: string): string {
@@ -538,6 +545,7 @@ export class StudioBlobStore {
         // Unlinked while the sha lock is held: a concurrent put of the same content waits for it
         // and then finds the file missing, so it renames its own copy into place.
         await rm(this.blobPath(sha), { force: true })
+        await removePreviews(this.opts.root, sha).catch(() => {})
         return true
       })
       if (gone) removed++

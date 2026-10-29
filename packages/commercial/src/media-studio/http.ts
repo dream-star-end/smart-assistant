@@ -18,6 +18,7 @@
  *   POST   /api/studio/annotations/:id/send|apply|reject
  *   POST   /api/studio/blobs/:sha/ticket             → {url, expiresInSeconds}
  *   GET    /api/studio/blobs/:sha?ticket=            Range-capable
+ *   GET    /api/studio/blobs/:sha/preview?w=&ticket= a WebP of an image blob, w ∈ 320|640|1280
  *
  * Everything is 404 unless OC_STUDIO_ENABLED=1 and the user is an admin or allow-listed (D13):
  * the surface does not reveal itself to anyone else.
@@ -38,6 +39,7 @@ import { type StudioBlobStore, StudioBlobTooLargeError, StudioQuotaError } from 
 import { audioDurationMs } from './music/audioLength.js'
 import type { ComposeRunnerLike } from './orchestrator/compose.js'
 import type { OrchestratorApi } from './orchestrator/service.js'
+import { canPreview, previewBytes, previewWidth, sendPreview } from './preview.js'
 import type { ProviderRegistry } from './providers/registry.js'
 import { MEDIA_KINDS, type MusicQuery } from './providers/types.js'
 import type { StudioStore } from './store.js'
@@ -77,6 +79,7 @@ const PROJECT_RE = new RegExp(
 const TAKE_SELECT_RE = new RegExp(`^/takes/(${UUID})/select$`)
 const VOICE_NARRATION_RE = new RegExp(`^/assets/(${UUID})/narration$`)
 const BLOB_RE = /^\/blobs\/([0-9a-f]{64})(\/ticket)?$/
+const PREVIEW_RE = /^\/blobs\/([0-9a-f]{64})\/preview$/
 const PROJECT_MUSIC_RE = new RegExp(`^/projects/(${UUID})/music(/edit)?$`)
 const ANNOTATION_RE = new RegExp(`^/annotations/(${UUID})(?:/(send|apply|reject))?$`)
 const MUSIC_AUDIO_TYPES = new Set(['audio/mpeg', 'audio/wav'])
@@ -186,6 +189,24 @@ export async function dispatchStudioRoute(
       (await studio.blobs.openCatalog(blob[1]!))
     if (!file) throw notFound()
     await sendBlobFile(req, res, file)
+    return
+  }
+  // The same ticket (bound to the sha) reads a downscaled preview; a non-image gets its original.
+  const preview = PREVIEW_RE.exec(path)
+  if (preview && method === 'GET') {
+    const ticket = url.searchParams.get('ticket')
+    if (!ticket) throw new HttpError(401, 'UNAUTHORIZED', 'blob ticket required')
+    const userId = verifyBlobTicket(deps.jwtSecret, ticket, preview[1]!)
+    const file =
+      (await studio.blobs.open(BigInt(userId), preview[1]!)) ??
+      (await studio.blobs.openCatalog(preview[1]!))
+    if (!file) throw notFound()
+    if (!canPreview(file.mime)) {
+      await sendBlobFile(req, res, file)
+      return
+    }
+    const w = previewWidth(url.searchParams.get('w'))
+    sendPreview(req, res, file.sha, w, await previewBytes(studio.blobs.root, file, w))
     return
   }
 

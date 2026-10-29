@@ -537,6 +537,13 @@ describe('dispatchStudioRoute', () => {
     const bad = await fetch(`${origin}${url}`, { headers: { range: 'bytes=20-' } })
     assert.equal(bad.status, 416)
     assert.equal((await fetch(`${base}/blobs/${SHA}`)).status, 401)
+    // Q2: the same ticket reads /preview; a video has no preview and gets its original bytes.
+    const preview = await fetch(
+      `${origin}${url.replace(`/blobs/${SHA}?`, `/blobs/${SHA}/preview?w=320&`)}`,
+    )
+    assert.equal(preview.status, 200)
+    assert.equal(await preview.text(), '0123456789')
+    assert.equal((await fetch(`${base}/blobs/${SHA}/preview`)).status, 401)
   })
 
   it('accepts only uploads whose bytes match their declared image/audio type', async () => {

@@ -18,7 +18,7 @@ import {
 } from 'lucide-react'
 import { type PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { useBlobUrl } from '../../../hooks/useBlobUrl'
+import { previewUrl, useBlobUrl } from '../../../hooks/useBlobUrl'
 import { useVideoFrames } from '../../../hooks/useVideoFrames'
 import {
   ANNOTATION_TEXT_MAX,
@@ -36,7 +36,7 @@ import {
 } from '../../../lib/studio/annotations'
 import { StudioApiError, studioApi, studioErrorText } from '../../../lib/studio/api'
 import { formatCredits, formatTimecode } from '../../../lib/studio/format'
-import { qaScoreOf, shotCard, takesOf } from '../../../lib/studio/model'
+import { posterOf, qaScoreOf, shotCard, takesOf } from '../../../lib/studio/model'
 import { MODERATION_TEXT, qaView, recommendedTakes } from '../../../lib/studio/qa'
 import type { StudioProjectView, StudioTake } from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
@@ -218,6 +218,8 @@ function ShotReview(props: {
   // media + playback
   const url = useBlobUrl(auth, take?.blobSha)
   const video = isVideoTake(take)
+  // The clip loads on demand (Q2): its first frame shows meanwhile, from the preview.
+  const posterUrl = useBlobUrl(auth, video && take ? posterOf(view, take) : null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [time, setTime] = useState(0)
   const [playing, setPlaying] = useState(false)
@@ -424,7 +426,8 @@ function ShotReview(props: {
                   className="st-media-fill"
                   src={url}
                   playsInline
-                  preload="auto"
+                  preload="metadata"
+                  {...(posterUrl ? { poster: previewUrl(posterUrl, 1280) } : {})}
                   onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
                   // A remounted video (after compare, or another version) starts at 0: put it back at
                   // the time the UI shows, so new annotations land on the frame that is on screen
@@ -444,7 +447,8 @@ function ShotReview(props: {
               ) : url ? (
                 <img
                   className="st-media-fill"
-                  src={url}
+                  src={previewUrl(url, 1280)}
+                  decoding="async"
                   draggable={false}
                   alt={`镜头 #${shot.ordinal + 1} v${take?.version ?? ''}`}
                 />

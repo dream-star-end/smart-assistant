@@ -33,6 +33,15 @@ export function blobTicketUrl(auth: AuthSession, sha: string, now = Date.now()):
   return pending
 }
 
+/**
+ * The downscaled WebP of an image blob at a ticket URL (GET /blobs/:sha/preview, Q2): same ticket,
+ * width rounded up server-side to 320 / 640 / 1280. A URL of another shape is returned unchanged.
+ */
+export function previewUrl(url: string, width: number): string {
+  const m = /^(.*\/blobs\/[0-9a-f]{64})\?(.*)$/.exec(url)
+  return m ? `${m[1]}/preview?w=${width}&${m[2]}` : url
+}
+
 /** Test seam. */
 export function __resetBlobTickets(): void {
   tickets.clear()

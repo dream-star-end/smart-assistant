@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { eventText, rulerTicks, shotCard, timeline } from './model'
+import { eventText, posterOf, rulerTicks, shotCard, timeline } from './model'
 import type { StudioProjectView, StudioShot, StudioTake } from './types'
 
 const shot = (i: number, over: Partial<StudioShot> = {}): StudioShot => ({
@@ -208,5 +208,39 @@ describe('eventText', () => {
       '项目已创建',
     )
     expect(eventText({ id: '1', ts: '', type: 'x.y', payload: null })).toBe('x.y')
+  })
+})
+
+describe('posterOf (Q2)', () => {
+  test('a shot video stands for the frame made before it; other takes have no poster', () => {
+    const f1 = take({
+      id: 'f1',
+      ownerKind: 'shot_frame',
+      version: 1,
+      blobSha: '1'.repeat(64),
+      createdAt: '2026-10-29T01:00:00Z',
+    })
+    const f2 = take({
+      id: 'f2',
+      ownerKind: 'shot_frame',
+      version: 2,
+      blobSha: '2'.repeat(64),
+      createdAt: '2026-10-29T03:00:00Z',
+    })
+    const failed = take({
+      id: 'f3',
+      ownerKind: 'shot_frame',
+      version: 3,
+      status: 'failed',
+      blobSha: null,
+      createdAt: '2026-10-29T04:00:00Z',
+    })
+    const v1 = take({ id: 'v1', createdAt: '2026-10-29T02:00:00Z' })
+    const v2 = take({ id: 'v2', version: 2, createdAt: '2026-10-29T05:00:00Z' })
+    const v = view({ shots: [shot(0)], takes: [f1, f2, failed, v1, v2] })
+    expect(posterOf(v, v1)).toBe('1'.repeat(64))
+    expect(posterOf(v, v2)).toBe('2'.repeat(64))
+    expect(posterOf(v, f2)).toBeNull()
+    expect(posterOf(view({ takes: [v1] }), v1)).toBeNull()
   })
 })

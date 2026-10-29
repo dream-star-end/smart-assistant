@@ -47,6 +47,20 @@ export function takesOf(
     .sort((a, b) => b.version - a.version)
 }
 
+/**
+ * The still that stands for a shot video in lists: the newest finished first frame of the shot
+ * made before the video (the frame it was generated from), else its newest frame. Lists show this
+ * image instead of loading the video itself (Q2).
+ */
+export function posterOf(view: StudioProjectView, take: StudioTake): string | null {
+  if (take.ownerKind !== 'shot_video') return null
+  const frames = takesOf(view, take.ownerId, ['shot_frame']).filter(
+    (t) => t.status === 'succeeded' && t.blobSha,
+  )
+  const before = frames.find((t) => t.createdAt <= take.createdAt)
+  return (before ?? frames[0])?.blobSha ?? null
+}
+
 export interface ShotCardModel {
   shot: StudioShot
   spec: ShotSpec

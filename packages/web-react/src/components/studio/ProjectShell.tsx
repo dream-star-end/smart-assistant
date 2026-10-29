@@ -1,12 +1,15 @@
 // OCV5-593 project frame: breadcrumb, step tabs (需求 / 设定 / 镜头 / 配音 / 音乐 / 成片), credit pill.
 
 import { ChevronRight, Clapperboard, Coins } from 'lucide-react'
+import { useMemo } from 'react'
 
 import { useStudioProject } from '../../hooks/useStudioProject'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
+import { posterOf } from '../../lib/studio/model'
 import type { StudioPage, StudioRoute } from '../../lib/studio/path'
 import type { ProvidersView } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
+import { PosterContext } from './MediaThumb'
 import { StateView } from './StateViews'
 import { BoardPage } from './pages/Board'
 import { BriefPage } from './pages/Brief'
@@ -45,6 +48,11 @@ export function ProjectShell(props: {
 }) {
   const { auth, projectId, page, navigate } = props
   const { state, reload, refresh, applyProject } = useStudioProject(auth, projectId)
+  const view = state.state === 'ready' ? state.view : null
+  const posterFor = useMemo(
+    () => (view ? (t: Parameters<typeof posterOf>[1]) => posterOf(view, t) : null),
+    [view],
+  )
 
   if (state.state === 'loading') return <StateView kind="loading" />
   if (state.state === 'missing') {
@@ -73,7 +81,7 @@ export function ProjectShell(props: {
     navigate({ kind: 'project', id: projectId, page: 'review', shot })
 
   return (
-    <>
+    <PosterContext.Provider value={posterFor}>
       <header className="st-topbar">
         <div className="st-crumb">
           <a
@@ -184,6 +192,6 @@ export function ProjectShell(props: {
           onReload={refresh}
         />
       )}
-    </>
+    </PosterContext.Provider>
   )
 }
