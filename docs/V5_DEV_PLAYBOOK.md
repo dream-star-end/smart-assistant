@@ -312,6 +312,13 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 ### 3.4 计费问题
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
 
+Box 报 `INSUFFICIENT_CREDITS` 但订阅余额充足时，同时查 Redis `precheck:u:{uid}:locks/amounts`。
+HTTP 先失败、keeper 后证明停止的请求可能已是 journal `aborted/failed_stopped`，却仍占用预留
+（t1257u，uid2046 的 11 条零扣费失败请求累计占用 9636）。现有 Box billing reconciler 会按精确
+uid/requestId 释放有匹配 nonce/epoch 终止证明、无 usage/handoff/链引用且 final_credits=0 的失败首轮；
+Redis 成功后记 `ctx.boxPrecheckReleased`，失败可重试。禁止整桶删 Redis、改余额或清未证明终止的
+unknown/live 请求。预留释放只能消除 402，原模型失败仍须独立验证和修复。
+
 个人版 `delegate_grok/delegate_codex` 的无 dispatch durable journal：父 turn 终态不代表后台子任务已结束，禁止仅挂父 dispatch 绕过 cutover idle。已确认终止且无 usage 的 `abandon` 与失败 `settle` 共用容器 `_platform/delegate-engine-billing.json` 持久重试队列（OCV5-652）；检查 `pendingAbandons` 是否等待 master ACK。迟到 usage 优先于 abandon，非永久 abort 仍可重开结算。未证明终止、或 gateway 在落盘意图前消失的 journal 继续保留 24h 恢复保护，不能据父终态或租约过期手动清掉。
 
 月赠发放后几分钟出现 `subscription_expire`，先按同一订单核对旧桶结清与新桶到账，
