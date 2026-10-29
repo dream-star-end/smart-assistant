@@ -3460,7 +3460,14 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
     },
     cache: { hit_rate: null },
     sessions: { rows: [], limit: 20, offset: 0, has_more: false },
-    ledger: { rows: [], next_before: null },
+    ledger: { rows: [
+      { id: "3", delta: "4000", balance_after: "4000", reason: "subscription",
+        ref_type: "subscription", ref_id: "order-lite", memo: "grant lite 4000", created_at: "2026-10-29T01:41:49Z" },
+      { id: "2", delta: "-300", balance_after: "0", reason: "subscription_expire",
+        ref_type: "subscription", ref_id: "order-lite", memo: "expire 300 on lite renew/rollover", created_at: "2026-10-29T01:41:49Z" },
+      { id: "1", delta: "300", balance_after: "300", reason: "subscription",
+        ref_type: "subscription", ref_id: null, memo: "free subscription bootstrap", created_at: "2026-10-29T01:36:44Z" },
+    ], next_before: null },
     cutoff_started_at: null,
   };
   const emptyReport = {
@@ -3609,6 +3616,13 @@ await check("T42 设置壳 390 单列可切五分区、1440 竖导航 168px、�
       throw new Error(`390 切到「${name}」后未选中`);
     }
     await dialog.getByText(marker, { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    if (name === "账户") {
+      await dialog.getByText("订单生效，旧额度结清", { exact: false }).waitFor({ state: "visible" });
+      const ledger = await dialog.getByRole("list").filter({ hasText: "旧额度结清" }).innerText();
+      if (!ledger.includes("订阅额度到账") || !ledger.includes("新周期额度另行到账") || /订阅扣费|expire 300/.test(ledger)) {
+        throw new Error(`订单替换免费额度仍误报到期/扣费: ${ledger}`);
+      }
+    }
     await assertNoOverflow(dialog, `390 分区 ${name}`);
   }
   await assertTheme("dark", "390");

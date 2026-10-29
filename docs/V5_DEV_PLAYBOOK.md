@@ -314,6 +314,10 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 
 个人版 `delegate_grok/delegate_codex` 的无 dispatch durable journal：父 turn 终态不代表后台子任务已结束，禁止仅挂父 dispatch 绕过 cutover idle。已确认终止且无 usage 的 `abandon` 与失败 `settle` 共用容器 `_platform/delegate-engine-billing.json` 持久重试队列（OCV5-652）；检查 `pendingAbandons` 是否等待 master ACK。迟到 usage 优先于 abandon，非永久 abort 仍可重开结算。未证明终止、或 gateway 在落盘意图前消失的 journal 继续保留 24h 恢复保护，不能据父终态或租约过期手动清掉。
 
+月赠发放后几分钟出现 `subscription_expire`，先按同一订单核对旧桶结清与新桶到账，
+不能只凭 reason 推断 TTL；Flash 识图也须先比对 active catalog 的 provider/upstream/vision，
+源码白名单已修不代表生产目录已切。实证与空窗步骤见 [t1254u](T1254U_FLASH_QUOTA_REPAIR.md)。
+
 ### 3.5 市场/技能问题
 市场权威=master PG;容器侧靠 `syncMarketplaceHub`(已内建单飞+5s TTL+限频 warn 日志,"装了不显示"先看容器日志里的 sync warn)。管理面读技能在**容器内 gateway** 执行(生效面=runtime source release 轴,§2 矩阵)。用户向 skill API 必须 `includePlatform:false`(防平台技能泄露)。
 
