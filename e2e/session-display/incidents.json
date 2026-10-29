@@ -8710,6 +8710,62 @@
           "assertion": "confirmed stop rejects a replaced live identity and freezes its payload before async persistence"
         }
       ]
+    },
+    {
+      "id": "INC-20261029-LEDGER-TZ-LABEL",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "#1237 体验官称账单流水无当天扣费、最新一条为 10/28 20:12「其他 · cost=53」。只读核对：流水完整，该行实为 10/29 11:12 CST（浏览器按美西时区显示），下午金融轮 16:56 尚未结算（17:07 入账 -71）。chat 理由未映射成「其他」，memo 为写侧内部 cost=<n>。修复：时间固定北京时间并加入账说明；补全 credit_ledger 全部理由标签；对话扣费行显示模型展示名与会话标题，免单退费转白话。",
+      "rootFixCommit": "ae2372b2",
+      "coverageCommits": [
+        "adfce445"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/labels.test.ts",
+          "assertion": "UTC 03:12 → 北京时间同日 11:12"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/labels.test.ts",
+          "assertion": "旧后端无上下文 → 不显示 cost=<n>"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/AccountTab.test.tsx",
+          "assertion": "#1237 对话扣费行：显示模型与会话、北京时间，不显示 cost=<n>"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/billing/ledgerRowContext.test.ts",
+          "assertion": "只查本人 usage_record 引用;按 ledger id 回填,可多条 ledger 指向同一 usage"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ledger-timezone.node-test.mjs",
+          "assertion": "today's 11:12 CST chat debit shows as Beijing time with model · session, never cost=<n>"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261029-SESSION-WS-BOUNDARY",
+      "occurredAt": "2026-10-29",
+      "severity": "P2",
+      "symptom": "#1238 混合轮新会话发「delete test」，agent 以 find 搜 workspace/ 命中另一会话目录 sessions/webmvon30lpno3vsx/test-pomodoro.cjs，并用用户问答弹窗提议删除。cwd 与产出面板按会话隔离（isolated_v1），文件列表 API 无跨会话泄漏；缺的是 agent 侧边界。修复：所有引擎共用的 TOOLS 段加入「会话工作区边界」，未点名不得搜索/修改/删除其它对话目录，且不得把它们作为删除候选。",
+      "rootFixCommit": "b95039bc",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/promptToolRecovery.test.ts",
+          "assertion": "keeps file search/deletion inside the current conversation unless the user names another one"
+        }
+      ],
+      "proofPending": {
+        "reason": "修复是所有引擎共用 TOOLS 段里的行为守则：确定性部分（守则进入每个引擎的提示词）由 unit 覆盖；模型是否遵守是非确定的，个人版 canary 无法稳定复现「搜索兄弟会话目录并提议删除」，没有可接进 runner 的 browser/live proof。上线后用真实会话发「delete test」人工核对一次。",
+        "since": "2026-10-29"
+      }
     }
   ]
 }

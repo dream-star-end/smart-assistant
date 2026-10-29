@@ -501,6 +501,7 @@ export function AccountTab({
         <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           账单流水
         </div>
+        <p className="-mt-1 pb-2 text-caption text-faint">对话结束后结算入账，时间为北京时间</p>
         {err && (
           <div className="mb-2">
             <Alert tone="danger" className="text-meta">
