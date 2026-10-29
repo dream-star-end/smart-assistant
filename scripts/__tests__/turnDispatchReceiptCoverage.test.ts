@@ -26,7 +26,7 @@ describe('extracted turn dispatch receipt source guard', () => {
   it('ignores whitespace and comment/string decoys', () => {
     assert.doesNotThrow(() => assertTurnDispatchReceiptCoverage(
       bridge.replace('handleTurnDispatchReceipt(attestPeek,', 'handleTurnDispatchReceipt( attestPeek ,'),
-      receipt + '\n// classifyTurnDispatchReceipt(receipt, rec)\nconst decoy = "if (disposition === rejected)";\n',
+      `${receipt}\n// classifyTurnDispatchReceipt(receipt, rec)\nconst decoy = "if (disposition === rejected)";\n`,
     ))
   })
   it('rejects an import of a different module', () => {
@@ -37,7 +37,7 @@ describe('extracted turn dispatch receipt source guard', () => {
   })
   it('rejects a disconnected handler even if its old invocation is left in a comment', () => {
     const changed = mutate(bridge, 'if (handleTurnDispatchReceipt(attestPeek, {', 'if (unrelatedReceipt(attestPeek, {')
-    assert.throws(() => assertTurnDispatchReceiptCoverage(changed + '\n// handleTurnDispatchReceipt(attestPeek, {})\n', receipt), pattern)
+    assert.throws(() => assertTurnDispatchReceiptCoverage(`${changed}\n// handleTurnDispatchReceipt(attestPeek, {})\n`, receipt), pattern)
   })
   it('rejects a disconnected admitted-record lookup context', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(
@@ -53,7 +53,7 @@ describe('extracted turn dispatch receipt source guard', () => {
   it('rejects classifier markers hidden in comments or strings', () => {
     const changed = mutate(receipt, 'const disposition = classifyTurnDispatchReceipt(receipt, rec)', 'const disposition = unrelatedClassifier(receipt, rec)')
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
-      changed + '\n// classifyTurnDispatchReceipt(receipt, rec)\nconst decoy = "classifyTurnDispatchReceipt(receipt, rec)";\n'), pattern)
+      `${changed}\n// classifyTurnDispatchReceipt(receipt, rec)\nconst decoy = "classifyTurnDispatchReceipt(receipt, rec)";\n`), pattern)
   })
   it('rejects a lost rejected-receipt branch', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
@@ -68,6 +68,6 @@ describe('extracted turn dispatch receipt source guard', () => {
       mutate(receipt, 'if (!context.acceptEnrichmentReceipt(rec)) return true', 'context.acceptEnrichmentReceipt(rec)')), pattern)
   })
   it('rejects malformed source instead of accepting a partial parse', () => {
-    assert.throws(() => assertTurnDispatchReceiptCoverage(bridge, receipt + '\nconst broken = ('), pattern)
+    assert.throws(() => assertTurnDispatchReceiptCoverage(bridge, `${receipt}\nconst broken = (`), pattern)
   })
 })
