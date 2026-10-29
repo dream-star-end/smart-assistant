@@ -475,6 +475,7 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
         resolveProof(stdout);
       });
     });
+    console.log(tap.trimEnd());
     if (regression) {
       assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!|#\s*(?:SKIP|TODO)\b/gmi);
       const tests = [...tap.matchAll(/^# tests (\d+)\r?$/gm)].map(m => Number(m[1]));
@@ -486,7 +487,6 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
       }
       for (const title of regression.titles) assert.ok(tap.includes(`- ${title}\n`), title);
     } else assertWaitCloseTap(tap);
-    console.log(tap.trimEnd());
     if (regression) console.log(`[${regression.label}] PASS`);
     else console.log("[delegate-wait-close] PASS — nine durable lifecycle cases completed without skipped tests or orphan waiters");
   } finally {
