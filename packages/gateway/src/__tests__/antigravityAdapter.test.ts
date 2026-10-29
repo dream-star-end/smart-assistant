@@ -206,10 +206,10 @@ async function controlledTurn(h: Harness, name: string) {
   let sequence = 0
   const push = async (...lines: object[]) => {
     const marker = `observed-${name}-${++sequence}`
-    await appendFile(file, [...lines, {
+    await appendFile(file, `${[...lines, {
       event: 'step_update',
       step_update: { step_type: 'agent_response', text_delta: marker },
-    }].map((line) => JSON.stringify(line)).join('\n') + '\n')
+    }].map((line) => JSON.stringify(line)).join('\n')}\n`)
     for (let i = 0; i < 300; i++) {
       if (events.some((e) => e.kind === 'block' && e.block.kind === 'text' && e.block.text === marker)) return
       await new Promise((resolve) => setTimeout(resolve, 10))
@@ -297,7 +297,7 @@ describe('INC-20261029-GEMINI-FILE-TIMEOUT native file watchdog', () => {
       process.env.FAKE_AGY_EXIT_DELAY_MS = '250'
       const previous = await controlledTurn(h, 'old')
       await previous.push(fileStep(11, 'ACTIVE'))
-      await appendFile(previous.file, JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'finished old turn' } }) + '\n')
+      await appendFile(previous.file, `${JSON.stringify({ event: 'result', result: { status: 'ERROR', error: 'finished old turn' } })}\n`)
       await previous.run.summary
       now += 1_000
       Reflect.deleteProperty(process.env, 'FAKE_AGY_EXIT_DELAY_MS')
