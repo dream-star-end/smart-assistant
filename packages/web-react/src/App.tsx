@@ -1253,7 +1253,7 @@ export function App() {
 
   const sendingIdsRef = useRef(new Set<string>());
   const liveTerminalsRef = useRef(
-    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null }>(),
+    new Map<string, { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt: number }>(),
   );
   const liveTerminals = useMemo(() => {
     void chat.version;
@@ -1263,7 +1263,7 @@ export function App() {
     for (const id of sendingIdsRef.current) {
       if (!now.has(id)) {
         const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, t);
+        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: Date.now() });
       }
     }
     sendingIdsRef.current = now;

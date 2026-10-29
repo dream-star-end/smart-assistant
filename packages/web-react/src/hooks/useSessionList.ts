@@ -196,7 +196,7 @@ export type UseSessionList = {
   applySessionMetadata: (metadata: SessionMetadataSnapshot) => void;
   applySessionTerminal: (
     sessId: string,
-    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+    terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
   ) => void;
   /** 登出/登录时的整体重置：清列表与选中、清已拉历史标记、允许重新自动选中最近会话。 */
   reset: () => void;
@@ -915,22 +915,27 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const applySessionTerminal = useCallback(
     (
       sessId: string,
-      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null,
+      terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
     ) => {
       setSessions((c) =>
         c.map((x) => {
           if (x.id !== sessId) return x;
           const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
           const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
+          // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 还是回合开始前那次轮询的值，
+          // 行从「运行中算到现在」跌回旧值，要等下一轮列表刷新（≤60s）才对上。用本 tab 看到的结束时刻补上。
+          const ended =
+            terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0) ? { lastAt: terminal.endedAt } : null;
           if (
             x.runState === "idle" &&
             x.lastOutcome === nextOutcome &&
             x.lastErrorCode === nextCode
           ) {
-            return x;
+            return ended ? { ...x, ...ended } : x;
           }
           return {
             ...x,
+            ...ended,
             runState: "idle" as const,
             ...(terminal
               ? {

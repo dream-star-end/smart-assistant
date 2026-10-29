@@ -740,6 +740,23 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.sessions[0].lastAt).toBe(3_000);
   });
 
+  // 侧栏用时 = createdAt → lastAt：本 tab 刚跑完的回合，列表 lastAt 还停在回合开始前（下一轮刷新 ≤60s 才更新），
+  // 行会从「运行中算到现在」跌回旧值。终态带上本 tab 看到的结束时刻；只前进不后退，也不重复标未读。
+  test("applySessionTerminal 用本 tab 的结束时刻补齐 lastAt，不倒退、不重复标未读", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const row = () => result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    expect(row().lastAt).toBe(2_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 9_000 }));
+    expect(row()).toMatchObject({ lastAt: 9_000, runState: "idle", lastOutcome: "completed", unread: true });
+    // 用户点开读过（未读由 useUnreadSessions 清，这里直接改列表模拟）。
+    act(() => result.current.setSessions((c) => c.map((x) => (x.id === "webkeepme001" ? { ...x, unread: false } : x))));
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 5_000 }));
+    expect(row().lastAt).toBe(9_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 12_000 }));
+    expect(row()).toMatchObject({ lastAt: 12_000, unread: false });
+    expect(result.current.sessions.find((s) => s.id === "webdropme001")!.lastAt).toBe(2_000);
+  });
+
   test("toggleArchiveSession 乐观更新并 PATCH archived；失败回滚", async () => {
     vi.spyOn(api, "listSessions").mockResolvedValue([
       { id: "webkeepme001", title: "保留的会话", agentId: "main", archived: false, updatedAt: 2_000, lastAt: 2_000, messageCount: 1 },
