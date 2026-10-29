@@ -15,6 +15,10 @@ import { resetDesktopTunnelRegistryForTest } from "../ws/desktopTunnelRegistry.j
 import type { DesktopMuxSession } from "../ws/desktopMux.js";
 import { admitDurableControl, releaseTurnControlForRetry, type DurableControlInput } from "../dispatch/turnControlStore.js";
 import { forwardRecoveryUnderRootFence, type ClaimedRecoveryJob } from "../dispatch/turnRecoveryStore.js";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ORIGIN_BUNDLE_REV, ORIGIN_UID, originEventually, originLinkRig, runOriginCronProcess, seedOriginCron } from "./helpers/originLinkRig.js";
 
 const restoredDispatch = "22222222-2222-4222-8222-222222222222";
 const restoredKey = `dispatch:${restoredDispatch}:1`;
@@ -629,4 +633,138 @@ test("control routing selects the exact user/session/turn carrier and leaves amb
     assert.equal(rig.bridge.registry.total(), 0);
     assert.equal(rig.activity(), 0);
   } finally { await rig.stop(); await client.end(); }
+});
+
+for (const [kind, clientMessageId] of [
+  ["cron", "cron-origin-offline"],
+  ["dlgcb", "dlgcb-offline-job-1"],
+  ["lsc", "lsc-offline-receipt"],
+] as const) {
+  test(`offline ${kind} injects once through the real link; concurrent retry, reconnect and restart reuse its durable receipt`, async () => {
+    const rig = await originLinkRig();
+    const sessionId = `origin-${kind}`;
+    try {
+      await rig.session(sessionId);
+      const input = rig.input(sessionId, clientMessageId);
+      const results = await Promise.all(Array.from({ length: 4 }, () => rig.bridge.injectCronOriginTurn(input)));
+      assert.ok(results.some(result => result.kind === "injected"), JSON.stringify(results));
+      assert.ok(results.every(result => result.kind === "injected" || result.kind === "in_flight"), JSON.stringify(results));
+      const expectedFrames = kind === "dlgcb" ? 2 : 1;
+      await originEventually(async () => (await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n === expectedFrames, () => rig.events.join("\n"));
+      assert.deepEqual(rig.errors, []);
+      assert.equal(rig.messages.length, 1);
+      assert.equal(rig.provisioning(), 0, "offline injection must resolve an existing carrier without browser provisioning");
+      assert.equal(rig.activity(), 0, "background work must not refresh browser activity");
+      assert.equal(rig.bridge.containerLinkSnapshots!()[0]!.subscribers, 0);
+      const before = (await rig.pool.query("SELECT dispatch_id,billing_request_id,attempt_no,lease_epoch,status,agent_container_id,runtime_kind FROM turn_dispatches")).rows[0];
+      assert.equal(before.status, "accepted");
+      assert.equal(String(before.agent_container_id), "7", "startup recovery must retain the precise origin carrier");
+      assert.equal(before.runtime_kind, "docker");
+      assert.equal((await rig.pool.query("SELECT count(*)::int AS n FROM turn_dispatches")).rows[0].n, 1);
+      const history = JSON.parse((await rig.pool.query("SELECT messages FROM client_sessions WHERE id=$1", [sessionId])).rows[0].messages);
+      assert.equal(history.filter((message: { id: string }) => message.id === clientMessageId).length, 1);
+      assert.equal((await rig.bridge.injectCronOriginTurn(input)).kind, "injected");
+      assert.equal(rig.messages.length, 1);
+
+      const beforeReconnect = rig.sockets.length;
+      rig.sockets.find(socket => socket.readyState === WebSocket.OPEN)!.terminate();
+      await originEventually(() => rig.sockets.length > beforeReconnect && rig.hellos.length > 0, () => rig.events.join("\n"));
+      assert.equal((await rig.bridge.injectCronOriginTurn(input)).kind, "injected");
+      assert.equal(rig.messages.length, 1);
+      assert.equal(rig.sockets.filter(socket => socket.readyState === WebSocket.OPEN).length, 1);
+
+      await rig.restart();
+      await rig.bridge.rebuildContainerLinks!();
+      await originEventually(() => rig.bridge.containerLinkSnapshots!().length === 1, () => rig.events.join("\n"));
+      assert.equal((await rig.bridge.injectCronOriginTurn(input)).kind, "injected");
+      assert.equal(rig.messages.length, 1, "a new bridge process must ACK the accepted PG receipt without sending again");
+      assert.deepEqual((await rig.pool.query("SELECT dispatch_id,billing_request_id,attempt_no,lease_epoch,status,agent_container_id,runtime_kind FROM turn_dispatches")).rows[0], before);
+      assert.equal((await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n, expectedFrames);
+
+      const snapshot = await rig.snapshot(sessionId, clientMessageId);
+      assert.equal(snapshot?.dispatch?.clientMessageId, clientMessageId);
+      assert.equal(snapshot?.streamKey, `dispatch:${before.dispatch_id}:1`);
+      assert.equal(snapshot?.frames.length, expectedFrames);
+      if (kind === "dlgcb") {
+        assert.deepEqual(snapshot!.frames.map(frame => (frame.payload as { blocks: unknown[] }).blocks), [
+          [{ kind: "delegate_progress", runId: "delegate-run", agentId: "researcher", jobId: "dlgjob-offline", goal: "offline callback evidence", phase: "start" }],
+          [{ kind: "delegate_progress", runId: "delegate-run", agentId: "researcher", jobId: "dlgjob-offline", goal: "offline callback evidence", phase: "done", text: "delegate completed" }],
+        ], "offline delegate frames must remain exact in buildSessionSnapshot");
+      }
+      assert.deepEqual(rig.errors, []);
+    } finally { await rig.stop(); }
+  });
+}
+
+test("origin wake and concurrent browser hellos share one physical link; detach preserves the origin executor", async () => {
+  const rig = await originLinkRig();
+  try {
+    await rig.session("origin-hello");
+    const input = rig.input("origin-hello", "cron-origin-hello");
+    const [injected, first, second] = await Promise.all([
+      rig.bridge.injectCronOriginTurn(input), rig.openBrowser("origin-hello"), rig.openBrowser("origin-hello"),
+    ]);
+    assert.equal(injected.kind, "injected");
+    await originEventually(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2, () => rig.events.join("\n"));
+    assert.equal(rig.sockets.length, 1, "all concurrent wakes and hellos must use the registry's single physical transport");
+    assert.equal(rig.messages.length, 1);
+    first.browser.close();
+    second.browser.close();
+    await originEventually(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 0);
+    await rig.session("origin-after-detach");
+    const detached = await rig.bridge.injectCronOriginTurn(rig.input("origin-after-detach", "lsc-after-detach"));
+    assert.equal(detached.kind, "injected");
+    assert.equal(rig.messages.length, 2);
+    assert.equal(rig.sockets.length, 1, "detach must keep the live origin executor registered");
+    assert.deepEqual(rig.errors, []);
+  } finally { await rig.stop(); }
+});
+
+test("headless origin injection loads the actual bundle authorization context and refuses revoked model/identity/epoch", async () => {
+  for (const refusal of ["model", "identity", "epoch"] as const) {
+    const rig = await originLinkRig();
+    try {
+      await rig.session(`origin-denied-${refusal}`);
+      if (refusal === "model") rig.authorization.allowed = false;
+      if (refusal === "identity") rig.authorization.ready = false;
+      if (refusal === "epoch") rig.authorization.epoch = 13n;
+      const result = await rig.bridge.injectCronOriginTurn(rig.input(`origin-denied-${refusal}`, `cron-origin-denied-${refusal}`));
+      assert.notEqual(result.kind, "injected", `${refusal} authority refusal must never acknowledge execution`);
+      assert.equal(rig.messages.length, 0, `${refusal} authority refusal must happen before physical delivery`);
+      assert.ok(rig.checkerLoads.some(load => load.uid === ORIGIN_UID && load.epoch === 12n));
+      assert.ok(rig.resolverLoads.some(load => load.uid === ORIGIN_UID && load.bundleRev === ORIGIN_BUNDLE_REV));
+      assert.deepEqual(rig.errors, []);
+    } finally { await rig.stop(); }
+  }
+});
+
+test("a real restarted scheduler injects its due cron offline and consumes the same occurrence once", async () => {
+  const rig = await originLinkRig();
+  const home = await mkdtemp(join(tmpdir(), "origin-link-cron-"));
+  const callback = (output: string) => output.split("\n").filter(line => line.startsWith("ORIGIN_CALLBACK ")).map(line => JSON.parse(line.slice("ORIGIN_CALLBACK ".length)));
+  try {
+    await rig.session("cron-restart");
+    await seedOriginCron(home);
+    const first = callback(await runOriginCronProcess(home, rig.cronInjectUrl, "retry"));
+    assert.equal(first.length, 1, "the first scheduler must leave an owned retryable due occurrence");
+    assert.equal(rig.messages.length, 0);
+    const retryPath = join(home, "cron", "retry-state.json");
+    const retries = JSON.parse(await readFile(retryPath, "utf8"));
+    assert.equal(retries["origin-restart"].deliveryId, first[0].deliveryId);
+    retries["origin-restart"].nextAttemptAt = 0;
+    await writeFile(retryPath, JSON.stringify(retries));
+    await rig.restart();
+    const second = callback(await runOriginCronProcess(home, rig.cronInjectUrl, "inject"));
+    assert.equal(second.length, 1);
+    assert.equal(second[0].deliveryId, first[0].deliveryId);
+    assert.equal(second[0].clientMessageId, first[0].clientMessageId);
+    await originEventually(async () => (await rig.pool.query("SELECT count(*)::int AS n FROM client_session_live_frames")).rows[0].n === 1);
+    assert.equal(rig.messages.length, 1);
+    assert.equal(rig.bridge.containerLinkSnapshots!()[0]!.subscribers, 0);
+    assert.equal((await rig.pool.query("SELECT count(*)::int AS n FROM turn_dispatches")).rows[0].n, 1);
+    const third = callback(await runOriginCronProcess(home, rig.cronInjectUrl, "inject"));
+    assert.deepEqual(third, [], "a further scheduler process must observe the consumed occurrence");
+    assert.equal(rig.messages.length, 1);
+    assert.deepEqual(rig.errors, []);
+  } finally { await rig.stop(); await rm(home, { recursive: true, force: true }); }
 });

@@ -45,6 +45,19 @@ export class ContainerLinkHandle extends EventEmitter {
   detached = false;
   recoveryOnly = false;
   keepAlive = false;
+  background = false;
+  private retainers = 0;
+  get retained(): boolean { return this.retainers > 0; }
+  retain(): () => void {
+    this.retainers++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.retainers--;
+      this.onStreamsChanged();
+    };
+  }
   active = false;
   opened = false;
   disposed = false;

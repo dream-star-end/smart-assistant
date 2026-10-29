@@ -16,23 +16,27 @@ export function availableExecutors<T extends Executor>(values: Iterable<T> | und
 export class ContainerLinkExecutors {
   private readonly candidates = new Map<ContainerLinkHandle, BridgeExecutors>();
   private unmount: (() => void) | null = null;
-  private current(): BridgeExecutors | undefined {
-    for (const [handle, value] of this.candidates) {
-      if (handle.active && !handle.detached && !handle.disposed) return value;
+  private current(kind: keyof BridgeExecutors): BridgeExecutors | undefined {
+    const candidates = [...this.candidates].sort(([a], [b]) =>
+      Number(b.background && b.retained) - Number(a.background && a.retained));
+    for (const [handle, value] of candidates) {
+      if (handle.active && !handle.disposed && handle.readyState === 1 &&
+          (kind === "origin" ? !handle.recoveryOnly : !handle.detached) && value[kind]) return value;
     }
     return undefined;
   }
+  get canInject(): boolean { return this.current("origin")?.origin != null; }
   readonly recovery: RecoveryExecutor = (job) => {
-    const executor = this.current()?.recovery;
+    const executor = this.current("recovery")?.recovery;
     if (!executor) throw new Error("container link has no execution context");
     executor(job);
   };
   readonly origin: CronOriginExecutor = (payload) => {
-    return this.current()?.origin?.(payload) ?? { kind: "not_claimed" };
+    return this.current("origin")?.origin?.(payload) ?? { kind: "not_claimed" };
   };
   constructor() {
-    availability.set(this.recovery, () => this.current()?.recovery != null);
-    availability.set(this.origin, () => this.current()?.origin != null);
+    availability.set(this.recovery, () => this.current("recovery")?.recovery != null);
+    availability.set(this.origin, () => this.canInject);
   }
   register(handle: ContainerLinkHandle, callbacks: BridgeExecutors, mount: (value: BridgeExecutors) => () => void): () => void {
     this.candidates.set(handle, callbacks);

@@ -183,8 +183,10 @@ test("RF-step3: one stable executor and control transport across tabs, detach an
     for (const socket of transports.get("1")!) socket.send(wire({type: "inbound.goal_sync", goal: {}}));
     assert.equal(physical.sent.length, 1, "one goal/control send per physical transport");
     getContainerLinkHandle(b)!.detach();
-    assert.equal(availableExecutors(maps.recovery.get("1")).length, 0, "step4 wakeup is not implemented");
+    assert.equal(availableExecutors(maps.recovery.get("1")).length, 0, "recovery ownership stays browser-bound until PR-B");
+    assert.equal(availableExecutors(maps.origin.get("1")).length, 1, "origin remains owned by the live link after detach");
     assert.deepEqual(await executor({} as Parameters<CronOriginExecutor>[0]), {kind: "not_claimed"});
+    assert.deepEqual(calls, ["origin-0", "origin-1", "origin-1"]);
     await registry.shutdown();
     assert.equal(maps.origin.size, 0);
     assert.equal(maps.recovery.size, 0);
