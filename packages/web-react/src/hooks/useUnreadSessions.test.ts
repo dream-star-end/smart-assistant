@@ -219,6 +219,19 @@ describe("useUnreadSessions", () => {
     expect(localStorage.getItem(unreadNotifyStorageKey("u1"))).toBe("0");
   });
 
+  test("主动停止通知显示已停止，不显示出错", () => {
+    const bodies: Array<string | undefined> = [];
+    class FakeNotification {
+      static permission: NotificationPermission = "granted";
+      constructor(_title: string, options?: NotificationOptions) { bodies.push(options?.body); }
+    }
+    vi.stubGlobal("Notification", FakeNotification);
+    localStorage.setItem(unreadNotifyStorageKey("u1"), "1");
+    const { rerender } = hook({ sessions: [{ id: "s1", runState: "running" }], activeId: "other", userId: "u1" });
+    rerender({ sessions: [{ id: "s1", runState: "idle", lastOutcome: "interrupted", lastErrorCode: "USER_CANCELLED" }], activeId: "other", userId: "u1" });
+    expect(bodies).toEqual(["已停止"]);
+  });
+
   // UUS-01：系统通知 onclick 此前只 close()，点了没有落点。
   test("点击系统通知：聚焦窗口并把会话 id 交给 onNotificationOpen", () => {
     const created: Array<{ title: string; options?: NotificationOptions; onclick: (() => void) | null; close: () => void }> = [];

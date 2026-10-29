@@ -25,9 +25,15 @@ describe("resolveGlobalHotkey", () => {
     expect(resolveGlobalHotkey(key({ key: "O", ctrlKey: true, shiftKey: true }))).toBe("new");
   });
 
-  test("Esc 仅在生成中停止", () => {
+  test("Esc 仅在生成中请求停止确认", () => {
     expect(resolveGlobalHotkey(key({ key: "Escape" }))).toBeNull();
     expect(resolveGlobalHotkey(key({ key: "Escape" }), { sending: true })).toBe("stop");
+  });
+
+  test("Esc 不接管输入法、长按或已被组件处理的按键", () => {
+    for (const over of [{ isComposing: true }, { keyCode: 229 }, { repeat: true }, { defaultPrevented: true }]) {
+      expect(resolveGlobalHotkey({ ...key({ key: "Escape" }), ...over }, { sending: true })).toBeNull();
+    }
   });
 
   test("Esc 归弹层:生成中但有对话框/菜单打开时不停止(S-02)", () => {
