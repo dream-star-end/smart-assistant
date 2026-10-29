@@ -35,12 +35,14 @@ import type { ProviderRegistry } from '../media-studio/providers/registry.js'
 import type { MediaKind, MediaOp, MediaProvider } from '../media-studio/providers/types.js'
 import { claimStudioTasks } from '../media-studio/queue.js'
 import { StudioStore } from '../media-studio/store.js'
+import { prepareAuthRowResetForTest } from './helpers/authRows.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
 const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
 let pgAvailable = false
+let resetRows: (() => Promise<void>) | undefined
 
 async function probe(): Promise<boolean> {
   const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
@@ -68,6 +70,22 @@ before(async () => {
   setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 8 }))
   await resetTestSchemaForTest()
   await runMigrations()
+  // Keep the original FK-closure isolation without rewriting every users child
+  // table before every case. Business calls still use real, separate transactions.
+  resetRows = await prepareAuthRowResetForTest(async (client) => {
+    await client.query('DELETE FROM studio_projects')
+    await client.query('DELETE FROM studio_blob_refs')
+    await client.query('DELETE FROM studio_blobs')
+    await client.query('DELETE FROM studio_quota')
+    await client.query('DELETE FROM studio_quota_holds')
+    await client.query('DELETE FROM studio_step_results')
+    // Also check the two roots outside the shared reset's users FK closure.
+    const extra = await client.query<{ blobs: number; quota: number }>(
+      `SELECT (SELECT count(*) FROM studio_blobs)::int AS blobs,
+              (SELECT count(*) FROM studio_quota)::int AS quota`,
+    )
+    assert.deepEqual(extra.rows, [{ blobs: 0, quota: 0 }])
+  })
 })
 
 after(async () => {
@@ -83,9 +101,8 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return
-  await query(
-    'TRUNCATE TABLE studio_projects, studio_blob_refs, studio_blobs, studio_quota, studio_quota_holds, studio_step_results, users RESTART IDENTITY CASCADE',
-  )
+  assert.ok(resetRows)
+  await resetRows()
 })
 
 const skip = (t: { skip: (m: string) => void }) => {
