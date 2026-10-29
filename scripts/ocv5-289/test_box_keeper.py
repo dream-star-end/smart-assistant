@@ -17,7 +17,7 @@ import time
 import unittest
 
 HERE = Path(__file__).parent
-KEEPER = HERE / "box_keeper.py"
+KEEPER = Path(os.environ.get("OCV5_KEEPER_UNDER_TEST", str(HERE / "box_keeper.py")))
 SUPERVISOR = HERE / "box_supervisor.py"
 
 
@@ -135,8 +135,14 @@ class KeeperTest(unittest.TestCase):
                          (proof.name[-24:], epoch, 'worker_failed', 2, 7))
         self.assertEqual(marker['keeperPid'], proc.pid)
 
-    def test_escaped_descendant_blocks_terminal_proof(self) -> None:
-        options, proof, _ = self.proof_args()
+    def test_owned_escaped_descendant_is_fenced_and_reaped_before_proof(self) -> None:
+        # Once the kernel proves direct-child ownership, leaving this live
+        # descendant behind must not destroy the only terminal publisher.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        options, proof, epoch = self.proof_args()
         escaped_file = self.tmp / 'escaped'
         code = ('import os,subprocess;'
                 'p=subprocess.Popen(["/usr/bin/sleep","30"],start_new_session=True,'
@@ -150,12 +156,33 @@ class KeeperTest(unittest.TestCase):
         try:
             self.await_file(escaped_file)
             proc.communicate(timeout=12)
-            self.assertEqual(proc.returncode, 125)
-            self.assertFalse((proof / 'terminal.json').exists())
+            self.assertEqual(proc.returncode, 0)
+            marker = json.loads((proof / 'terminal.json').read_text())
+            self.assertEqual((marker['runNonce'], marker['leaseEpoch'], marker['reason']),
+                             (proof.name[-24:], epoch, 'worker_complete'))
+            self.assertFalse(Path(f'/proc/{int(escaped_file.read_text())}').exists())
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(-1, os.WNOHANG)
         finally:
-            if escaped_file.exists():
-                try: os.kill(int(escaped_file.read_text()), signal.SIGKILL)
-                except ProcessLookupError: pass
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                if escaped_file.exists():
+                    fd = None
+                    try:
+                        pid = int(escaped_file.read_text())
+                        fd = os.pidfd_open(pid, 0)
+                        os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+                        os.waitpid(pid, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+            finally:
+                libc.prctl(36, previous.value, 0, 0, 0)
 
     def test_worker_sigkill_adopts_and_stops_cli_without_recycled_pgid(self) -> None:
         libc = ctypes.CDLL(None, use_errno=True)

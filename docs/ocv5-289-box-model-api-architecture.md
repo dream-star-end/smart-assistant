@@ -307,6 +307,19 @@ disappeared HTTP handle, timeout or
 that escaped the original process group, it must **not** publish a safe-stop
 marker; reconciliation remains unknown/manual rather than assuming death.
 
+After W is actually waited and the original CLI group's last signal is over,
+the single-threaded keeper may enumerate its own kernel direct-child list as
+candidates. It binds every candidate with a pidfd and verifies the same fd is
+still its waitable child via `waitid(P_PIDFD, WEXITED|WNOHANG|WNOWAIT)` before
+any per-process `pidfd_send_signal(flags=0)`. No numeric PID/PGID fallback is
+permitted. Newly adopted grandchildren share the existing one-second cleanup
+budget; a missing or empty list is never proof. Only actual `ECHILD` after
+reaping allows terminal publication. Inaccessible ownership, missing pidfd
+capability, resource bounds or deadline expiry remain unknown with no marker.
+The real W exit status and existing late-Stop completion priority remain intact.
+Real private-PID1 probes must record live/zombie state before fixture cleanup;
+namespace teardown cannot count as a keeper fence.
+
 The master reads the marker only via the pinned eligible account and egress,
 checks file owner/mode/no symlink, exact run nonce/epoch and expected state,
 and cross-checks durable per-round billing evidence. A marker proves at most
