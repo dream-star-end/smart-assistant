@@ -29,6 +29,8 @@ export type RowLike = {
   door: string
   uuid: string
   agentId?: string
+  /** session.append's `origin`: who caused the row (`{ kind: 'model', model }` on a response row). */
+  origin?: { kind: string; model?: string }
   message: {
     type: 'user' | 'assistant' | 'attachment' | 'system'
     name?: string
@@ -64,6 +66,15 @@ export type PrintStep = {
 }
 
 const ZERO: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+
+/** The CLI's stand-in for a response no request produced (an API error: a lost login, a usage limit, a
+ * 4xx/5xx) comes in as a response row whose origin is model `<synthetic>` (CLI 2.1.312, 2026-10-29).
+ * `-p` prints that record as model `<synthetic>` with `is_api_error_message`, and the hosts key on exactly
+ * that (the Box model route's refusal and login health, Route B's login rotation). Printed under the
+ * step's model it read as an answer without a stop reason. */
+function isApiErrorRow(r: RowLike): boolean {
+  return r.door === 'response' && r.origin?.kind === 'model' && r.origin.model === '<synthetic>'
+}
 
 function usageOf(u: Usage | null | undefined): Usage {
   if (!u) return { ...ZERO }
@@ -389,11 +400,13 @@ export class StreamJson {
   }
 
   private assistantLine(r: RowLike, msgId: string, model: string): string {
+    const apiError = isApiErrorRow(r)
     return this.line({
       type: 'assistant',
-      message: { id: msgId, type: 'message', role: 'assistant', model,
+      message: { id: msgId, type: 'message', role: 'assistant', model: apiError ? '<synthetic>' : model,
         content: r.message.content, stop_reason: null, stop_sequence: null, usage: { ...ZERO } },
       parent_tool_use_id: null, session_id: this.sessionId, uuid: r.uuid,
+      ...(apiError ? { is_api_error_message: true } : {}),
     })
   }
 
@@ -412,16 +425,18 @@ export class StreamJson {
     const m = r.message
     if (m.type === 'assistant' && r.door === 'response') {
       const step = this.steps.get(r.agentId ?? '')
+      const apiError = isApiErrorRow(r)
       return [this.line({
         type: 'assistant',
         message: {
           id: step?.msgId ?? `msg_ocb_row_${r.uuid}`,
-          type: 'message', role: 'assistant', model: step?.model ?? this.model,
+          type: 'message', role: 'assistant', model: apiError ? '<synthetic>' : step?.model ?? this.model,
           content: m.content, stop_reason: null, stop_sequence: null, usage: { ...ZERO },
         },
         parent_tool_use_id: parent,
         session_id: this.sessionId,
         uuid: r.uuid,
+        ...(apiError ? { is_api_error_message: true } : {}),
       })]
     }
     if (m.type === 'user' && (r.door === 'tool-result' || r.door === 'tool-message')) {

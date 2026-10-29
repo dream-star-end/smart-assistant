@@ -53,6 +53,7 @@ const BEHAVIOR = [
   "[go-websearch-server-tool] PASS — official WebSearch side requests on Go chat/responses bridges are answered from platform search with zero usage and no upstream call; mixed requests keep only function tools",
   "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery",
   "[box-stopped-precheck] PASS — late proven Box stops release retained credit reservations without charging",
+  "[box-login-expired-stop-reason] PASS — an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -897,6 +898,22 @@ async function runWorker(argv: string[]): Promise<void> {
   assert.doesNotMatch(stopped.stdout, /^\s*not ok \d+|^\s*(?:not )?ok \d+ .*#\s*(?:SKIP|TODO)\b/m,
     "BOX_STOPPED_PRECHECK_PROOF_NOT_GREEN");
   emit(BEHAVIOR[8]!);
+  // INC-20261029-BOX-LOGIN-EXPIRED-STOP-REASON: both decoders must reject
+  // CLI API-error stand-ins while preserving real answers that mention login.
+  const login = spawnSync(process.execPath, ["--import", "tsx", "--test",
+    "--test-reporter=tap", "--test-concurrency=1",
+    "packages/commercial/src/http/proxy/boxInteractivePrintParity.test.ts"], {
+    cwd: ROOT, env: process.env, encoding: "utf8", timeout: 45_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  emit(login.stdout ?? "");
+  if (login.stderr) emitErr(login.stderr);
+  assert.equal(login.status, 0, "BOX_LOGIN_STANDIN_TEST_FAILED");
+  assert.equal((login.stdout.match(/^ok \d+ - an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p$/gm) ?? []).length,
+    1, "BOX_LOGIN_STANDIN_PROOF_MISSING");
+  assert.doesNotMatch(login.stdout, /^\s*not ok \d+|^\s*(?:not )?ok \d+ .*#\s*(?:SKIP|TODO)\b/m,
+    "BOX_LOGIN_STANDIN_PROOF_NOT_GREEN");
+  emit(BEHAVIOR[9]!);
 }
 
 function parseFormal(argv: string[]): string {
