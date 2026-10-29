@@ -9,6 +9,7 @@ import type { SessionLastOutcome } from "./types";
 export type SessionStatusKind =
   | "running"
   | "completed"
+  | "stopped"
   | "interrupted"
   | "error"
   | "service_restart"
@@ -33,16 +34,18 @@ export const SESSION_STATUS_LABELS: Record<Exclude<SessionStatusKind, "none">, s
   running: "运行中",
   completed: "已完成",
   interrupted: "已中断",
+  stopped: "已停止",
   error: "出错",
   service_restart: "服务重启中断，可继续",
 };
 
 /** 侧栏行首唯一状态点。completed/interrupted 只在未读时出绿点；error / service_restart 不因已读消失。 */
-export type SidebarDotKind = "running" | "unread" | "error" | "service_restart" | "none";
+export type SidebarDotKind = "running" | "unread" | "stopped" | "error" | "service_restart" | "none";
 
 export const SIDEBAR_DOT_LABELS: Record<Exclude<SidebarDotKind, "none">, string> = {
   running: "运行中",
   unread: "未读",
+  stopped: "已停止",
   error: "出错",
   service_restart: "服务重启中断，可继续",
 };
@@ -65,6 +68,7 @@ export function resolveSidebarDot(input: SessionStatusInput, unread?: boolean): 
   if (kind === "running") return "running";
   if (kind === "error") return "error";
   if (kind === "service_restart") return "service_restart";
+  if (kind === "stopped") return "stopped";
   if (unread) return "unread";
   return "none";
 }
@@ -73,6 +77,7 @@ export function resolveSessionStatus(input: SessionStatusInput): SessionStatusKi
   if (input.running) return "running";
   const code = normalizeTurnErrorCode(input.lastErrorCode);
   if (code === "service_restart") return "service_restart";
+  if (code === "stopped" || code === "user_cancelled") return "stopped";
   switch ((input.lastOutcome ?? "").trim().toLowerCase()) {
     case "completed":
       return "completed";
@@ -108,7 +113,11 @@ export function deriveLiveTerminalFromMessages(
     if (m._turnStatusRecord) continue;
     const code = typeof m._errorCode === "string" && m._errorCode ? m._errorCode : null;
     const outcome = asLastOutcome(m._dispatchOutcome ?? "");
-    if (normalizeTurnErrorCode(code) === "service_restart") {
+    const normalized = normalizeTurnErrorCode(code);
+    if (normalized === "stopped" || normalized === "user_cancelled") {
+      return { lastOutcome: "interrupted", lastErrorCode: code };
+    }
+    if (normalized === "service_restart") {
       return { lastOutcome: outcome ?? "crashed", lastErrorCode: code };
     }
     if (outcome) return { lastOutcome: outcome, lastErrorCode: code };

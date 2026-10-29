@@ -95,6 +95,7 @@ export function failedLabel(reason?: string): string {
 export const SIDEBAR_DOT_STATUS: Record<Exclude<SidebarDotKind, "none">, StatusKind> = {
   running: "running",
   unread: "unread",
+  stopped: "stopped",
   error: "failed",
   service_restart: "service_restart",
 };

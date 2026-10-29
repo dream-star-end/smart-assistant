@@ -18,17 +18,20 @@ export function isDialogLayerOpen(
 
 /**
  * 全局快捷键分派：⌘K 快速跳转(输入框内也生效)、⌘⇧O 新建、⌘\ 开合详情面板(输入框内也生效)、
- * Esc(生成中)停止。
+ * Esc(生成中)请求停止确认。
  *
  * Esc 有两个持有方:Radix 弹层的「关闭」与这里的「停止生成」。弹层打开时 Esc 只该关弹层 ——
  * 否则用户在生成中打开任意对话框再按 Esc 关掉,会连带掐掉正在生成的这一轮。
  * `dialogOpen` 由调用方在事件发生时刻算出(见 isDialogLayerOpen),这里只做纯判断。
  */
 export function resolveGlobalHotkey(
-  e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { code?: string },
+  e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { code?: string; defaultPrevented?: boolean; isComposing?: boolean; repeat?: boolean; keyCode?: number },
   opts: { sending?: boolean; dialogOpen?: boolean } = {},
 ): GlobalHotkeyAction {
-  if (e.key === "Escape") return opts.sending && !opts.dialogOpen ? "stop" : null;
+  if (e.key === "Escape") {
+    if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return null;
+    return opts.sending && !opts.dialogOpen ? "stop" : null;
+  }
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return null;
   // ⌘K opens the palette from anywhere, the composer included (focus usually sits there).
