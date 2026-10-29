@@ -760,6 +760,31 @@
   flex-direction: column;
   gap: 8px;
 }
+.st-plan-steps {
+  margin: 4px 0 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--st-stage-faint);
+}
+.st-plan-steps .done {
+  color: var(--st-stage-muted);
+}
+.st-plan-steps .on {
+  color: var(--st-stage-fg);
+  font-weight: 600;
+}
+.st-plan-stop {
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  color: var(--st-stage-fg);
+  background: rgba(255, 170, 60, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 170, 60, 0.4);
+}
 .st-shot-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
