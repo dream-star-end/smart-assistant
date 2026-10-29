@@ -9253,9 +9253,9 @@
       "occurredAt": "2026-10-29",
       "severity": "P2",
       "symptom": "个人版 #1233：GPT-6.1-Sol 运行时按 Esc 立即终止，且主动停止的 USER_CANCELLED 被会话终态推导缺省映为 executed_error，侧栏和系统通知误报出错。Esc 改为同一回合身份校验的确认框，用户停止归 interrupted 并显示中性已停止。只读核对 usage/journal/ledger：该轮有实际输出，按冻结费率结算9积分且仅扣一次；此改动不更改计费或余额。",
-      "rootFixCommit": "5ad56ab1",
+      "rootFixCommit": "26aa6bb3",
       "coverageCommits": [
-        "3b5c96d3"
+        "d1752e0d"
       ],
       "regressions": [
         {
