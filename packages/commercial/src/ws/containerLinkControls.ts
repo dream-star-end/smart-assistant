@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Pool } from 'pg'
+import type { Pool, QueryResult } from 'pg'
 import { WebSocket } from 'ws'
 import { containerLinkControlDelivered } from '../admin/metrics.js'
 import { claimDueTurnControls, releaseTurnControlForRetry } from '../dispatch/turnControlStore.js'
@@ -44,7 +44,7 @@ export class ContainerLinkControls {
     }
     let after: string | null = null
     while (!this.stopped) {
-      const page = await this.options.pool.query<{ user_id: string }>(
+      const page: QueryResult<{ user_id: string }> = await this.options.pool.query<{ user_id: string }>(
         `SELECT DISTINCT user_id FROM turn_control_requests
           WHERE status IN ('pending','leased') AND next_attempt_at<=NOW()
             AND (status='pending' OR lease_until<NOW())
@@ -104,7 +104,7 @@ export class ContainerLinkControls {
   private async deliver(uid: bigint): Promise<void> {
     let after: string | null = null
     do {
-      const targets = this.options.links ? await this.targets(uid, after) : []
+      const targets: Target[] = this.options.links ? await this.targets(uid, after) : []
       if (this.stopped) return
       const carriers = new Map(targets.map(target => [target.control_id, target.container_id]))
       const ready = targets.filter(target => this.options.links!.controlTransport(uid, target.container_id))
