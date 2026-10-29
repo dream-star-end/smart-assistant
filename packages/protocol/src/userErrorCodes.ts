@@ -57,7 +57,7 @@ export const HTTP_ERROR_GROUPS = {
     "github_upstream", "github_upstream_invalid", "grok_relay_failed", "grok_upstream_error",
     "grok_upstream_timeout", "ilink_upstream", "marketplace_relay_failed", "minimax_upstream_error",
     "minimax_upstream_timeout", "network", "network_transient", "no_transport", "probe_transport_failed",
-    "provision_timeout", "proxy_unavailable", "qq_transport_failed", "request_timeout", "timeout",
+    "provision_timeout", "proxy_unavailable", "qq_transport_failed", "request_body_read_failed", "request_timeout", "timeout",
     "upstream", "upstream_auth_refresh_failed", "upstream_error", "upstream_failed", "upstream_no_body",
     "upstream_preparation_failed", "upstream_rejected", "upstream_timeout", "voice_no_audio_timeout",
     "voice_start_timeout", "voice_upstream_closed", "voice_upstream_error", "voice_upstream_timeout",
