@@ -8526,6 +8526,35 @@
         "142aad7e",
         "c83f12f2"
       ]
+    },
+    {
+      "id": "INC-20261029-CONTAINER-BODY-READ",
+      "occurredAt": "2026-10-25",
+      "severity": "P1",
+      "symptom": "t1298u 7-day audit found 17 internal container API GET requests logged as HTTP413, with no public-edge413. Historical logs lack the read exception so their exact causes remain unproven. A deterministic handler defect maps any interrupted body read to PAYLOAD_TOO_LARGE, including zero-byte GET and partial PUT. Explicit byte-cap errors now remain413; stream failures return400 REQUEST_BODY_READ_FAILED, stay unforwarded, and emit bounded uid/route/reason diagnostics. Model conversation oversize failures are separate existing fixes.",
+      "rootFixCommit": "eae7a211",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/containerApiProxy.test.ts",
+          "assertion": "OCV5-659 body read failures are connection errors and never forwarded"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/containerApiProxy.test.ts",
+          "assertion": "OCV5-659 complete request at the byte cap still reaches container lookup"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/containerApiProxy.test.ts",
+          "assertion": "rejects oversized request bodies before dispatch"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[container-request-body-errors] PASS — aborted reads never become size errors or forward partial bytes; 512KiB cap remains enforced"
+        }
+      ]
     }
   ]
 }
