@@ -1404,15 +1404,19 @@ describe("OCV5-613 canonical identity follows the admitted dispatch", () => {
       for (const container of rig.containerWss.clients) container.close(1011, "613 isolated close");
       await waitFor(() => client!.readyState === WebSocket.CLOSED);
       releaseAdmit();
-      await waitFor(() => queries.some((q) => q.params[2] === "bridge_closed_during_admission"));
+      await waitFor(() => queries.some((q) => q.params[1] === "bridge-admission-handoff"));
       assert.equal(admissions.length, 1);
       const admission = admissions[0]!;
       assert.equal(admission.agentId, "main");
-      const terminal = queries.filter((q) => /status = 'terminal'/.test(q.sql));
-      assert.equal(terminal.length, 1);
-      assert.equal(terminal[0]!.params[0], admission.dispatchId);
-      assert.equal(terminal[0]!.params[1], "executed_error");
-      assert.equal(terminal[0]!.params[2], "bridge_closed_during_admission");
+      // Commercial e37d6ce8 keeps a closed admission rejecting until exact
+      // inbox proof resolves ownership; a late close must not invent a terminal.
+      const rejecting = queries.filter((q) => /status = 'rejecting'/.test(q.sql));
+      assert.equal(rejecting.length, 1);
+      assert.equal(rejecting[0]!.params[0], admission.dispatchId);
+      assert.equal(rejecting[0]!.params[1], "bridge-admission-handoff");
+      assert.equal(rejecting[0]!.params[3], "1", "handoff remains fenced by the admitted epoch");
+      assert.match(rejecting[0]!.sql, /status = 'admitted' AND lease_epoch = \$4/);
+      assert.equal(queries.filter((q) => /status = 'terminal'/.test(q.sql)).length, 0);
       const insert = queries.find((q) => /INSERT INTO turn_traces/.test(q.sql));
       assert.ok(insert);
       const links = queries.filter((q) => /SET dispatch_id = COALESCE/.test(q.sql));
