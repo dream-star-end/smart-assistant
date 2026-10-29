@@ -134,3 +134,16 @@ describe("deriveLiveTerminalFromMessages", () => {
     });
   });
 });
+
+// #1233: USER_CANCELLED is a terminal event, not a product failure.
+describe("主动停止的实时与持久状态", () => {
+  it.each(["USER_CANCELLED", "user_cancelled", "STOPPED", "stopped"])("%s 不把主动停止误判成执行失败", (code) => {
+    const live = deriveLiveTerminalFromMessages([{ _errorCode: code }]);
+    expect(live).toEqual({ lastOutcome: "interrupted", lastErrorCode: code });
+    expect(resolveSessionStatus(live!)).toBe("stopped");
+    for (const lastOutcome of ["interrupted", "executed_error", undefined]) {
+      expect(resolveSidebarDot({ lastOutcome, lastErrorCode: code }, false)).toBe("stopped");
+    }
+    expect(resolveSessionStatus({ ...live!, running: true })).toBe("running");
+  });
+});
