@@ -15,3 +15,15 @@ describe('TOOLS slot failure recovery guidance', () => {
     assert.match(content, /不要为每个任务预检环境、自动安装依赖或修改网关\/沙箱配置/)
   })
 })
+
+describe('TOOLS slot session workspace boundary (#1238)', () => {
+  test('keeps file search/deletion inside the current conversation unless the user names another one', () => {
+    const content = buildToolsSlot().content
+    assert.match(content, /## 会话工作区边界/)
+    assert.match(content, /不属于当前对话的 `workspace\/sessions\/\*` 目录都是用户的\*\*其它对话\*\*/)
+    assert.match(content, /只查当前工作目录、`generated\/` 和 `uploads\/`,并排除其它对话的/)
+    assert.match(content, /搜索根不要用 `workspace\/sessions\/`/)
+    assert.match(content, /\*\*不要\*\*把其它对话的文件当作删除\/修改候选/)
+    assert.match(content, /先说明它来自另一个对话/)
+  })
+})
