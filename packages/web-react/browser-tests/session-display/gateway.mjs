@@ -104,6 +104,8 @@ export class MockGateway {
     this.dropBudget = 0
     this.finishAfterDrops = false
     this.suppressHelloBody = false
+    this.credits = null
+    this.snapshotReads = []
     this.terminalText = ''
     this.inboundMessages = []
     this.hellos = 0
@@ -128,6 +130,7 @@ export class MockGateway {
       hellos: this.hellos,
       closes: this.closes,
       connections: this.connections,
+      snapshotReads: this.snapshotReads,
       inbound: this.inboundMessages,
       frames: this.frames.map(
         (frame) =>
@@ -215,6 +218,7 @@ export class MockGateway {
     if (open) {
       snapshot.engineReady = this.engineReady
       snapshot.turnStatus = this.snapshotFrame()
+      if (this.credits) snapshot.credits = { ...this.credits, asOf: Date.now() }
     } else snapshot.reconcile = 'turn_completed'
     const asked = Number(afterSeq) > 0 ? Number(afterSeq) : 0
     const reset = asked > 0 && (streamKey !== STREAM_KEY || asked > lastFrameSeq)
@@ -449,12 +453,16 @@ export async function startSessionDisplayGateway(assetDir) {
           req.method === 'GET' &&
           (path === `${sessionPath}/live-frames` || path.startsWith(`${sessionPath}/live-frames/`))
         ) {
+          const query = {
+            afterSeq: url.searchParams.get('afterSeq'),
+            streamKey: url.searchParams.get('streamKey') ?? undefined,
+            dispatch: url.searchParams.get('dispatch') ?? undefined,
+          }
+          gateway.snapshotReads.push(query)
+          gateway.note(`HTTP snapshot afterSeq=${query.afterSeq} stream=${query.streamKey ?? '-'} dispatch=${query.dispatch ?? '-'}`)
           const body = JSON.stringify({
             ...gateway.liveFramesPage(),
-            snapshot: gateway.sessionSnapshot({
-              afterSeq: url.searchParams.get('afterSeq'),
-              streamKey: url.searchParams.get('streamKey') ?? undefined,
-            }),
+            snapshot: gateway.sessionSnapshot(query),
           })
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
           res.end(body)

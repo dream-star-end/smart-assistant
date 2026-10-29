@@ -76,6 +76,7 @@ import {
   snapshotFrameRecords,
   snapshotIsStale,
   snapshotLeadAgent,
+  snapshotNeedsRebuild,
   snapshotQuery,
   snapshotWatchTargets,
   type SessionSnapshot,
@@ -1805,6 +1806,7 @@ export class ChatSocket {
       } catch {
         /* ignore */
       }
+      this.armSnapshotWatchdog();
       this.flushAbandonedModelSwitches()
 
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
@@ -3158,7 +3160,7 @@ export class ChatSocket {
       if (!current()) return;
       const running = sess._sendingInFlight ? sess._activeClientMessageId : undefined;
       if (pages.records.length > 0) {
-        this.applyDurableLiveFrames(sessId, pages.records, rebuild && d ? [d.clientMessageId] : []);
+        this.applyDurableLiveFrames(sessId, pages.records, snapshotNeedsRebuild(sess, snap) && d ? [d.clientMessageId] : []);
       }
       // A final among the frames settles the turn like a live final: one history read for its tape.
       const settled = running && !(sess._sendingInFlight && sess._activeClientMessageId === running) ? running : undefined;
@@ -3168,7 +3170,7 @@ export class ChatSocket {
       }
       if (pages.degraded) sess._liveJournalDegraded = true;
       if (!this.applySnapshotHead(sess, last, fresh, true, ctx.asked) && settled) {
-        void this.deps.syncSession?.(sessId, { clientMessageId: settled });
+        this.syncHistory(sessId, { clientMessageId: settled });
       }
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();
@@ -3226,10 +3228,13 @@ export class ChatSocket {
         return true;
       }
       // not_accepted / executed_error: the failure is shown from history (fail-visible).
+      // The snapshot already proves it stopped; a failed or not-yet-projected history cannot hold the next send.
+      this.finishDispatch(sess.id, d.clientMessageId);
+      this.clearSendingState(sess);
       needsHistory = true;
     }
     if (!needsHistory || !readHistory) return false;
-    void this.deps.syncSession?.(sess.id, historyCmid ? { clientMessageId: historyCmid } : undefined);
+    this.syncHistory(sess.id, historyCmid ? { clientMessageId: historyCmid } : undefined);
     return true;
   }
 

@@ -71,6 +71,13 @@ function createSocket(): ChatSocket {
     silentRefresh: async (epoch) => ({ kind: 'transient', epoch, retryAfterMs: 3_600_000 }),
     onAuthExpired: () => {},
     defaultAgentId: AGENT,
+    readSessionSnapshot: async (sessId, query) => {
+      const params = new URLSearchParams()
+      for (const [key, value] of Object.entries(query)) params.set(key, String(value))
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessId)}/live-frames?${params}`)
+      if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`)
+      return (await res.json()).snapshot
+    },
     syncSession: async (sessId) => {
       const current = box.socket
       if (!current) return false
@@ -136,6 +143,7 @@ function SessionDisplay() {
         socket.ensureSession(SESSION_ID, AGENT, '边界剧本')
       }
       if (cancelled) return
+      socket.setActiveSession(SESSION_ID)
       socket.start()
       socket.setGateReady(true)
     }

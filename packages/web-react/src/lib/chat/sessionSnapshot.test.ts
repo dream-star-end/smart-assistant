@@ -195,6 +195,50 @@ describe("hello = 订阅；快照对齐状态", () => {
     sock.stop();
   });
 
+  test.each([
+    { status: "terminal", outcome: "not_accepted", historyOk: false },
+    { status: "terminal", outcome: "executed_error", historyOk: true },
+    { status: "manual_reconcile", outcome: null, historyOk: false },
+  ] as const)("$status/$outcome releases the turn even when history has no terminal row", async ({ status, outcome, historyOk }) => {
+    const syncSession = vi.fn(async () => historyOk);
+    const { sock, ws, s } = boot({ syncSession });
+    pushSnapshot(ws, openSnapshot());
+    await flush();
+    pushSnapshot(ws, openSnapshot({ dispatch: dispatchRow({ status, outcome }), turnStatus: null }));
+    await flush();
+    expect(s._sendingInFlight).toBe(false);
+    expect(s._activeClientMessageId).toBeUndefined();
+    expect(sock.isSessionBusy("s1")).toBe(false);
+    expect(s.messages.some((m) => m.text?.includes("已取消"))).toBe(false);
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: CMID });
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
+    expect(syncSession).toHaveBeenCalledTimes(historyOk ? 1 : 2);
+    ws.sent.length = 0;
+    await sock.sendMessage({ sessId: "s1", agentId: "main", text: "next turn" });
+    await flush();
+    expect(ws.sent.map((raw) => JSON.parse(raw)).some((f) => f.type === "inbound.message" && f.content?.text === "next turn")).toBe(true);
+    sock.stop();
+  });
+
+  test("a final replayed from a snapshot retries a failed history read", async () => {
+    const syncSession = vi.fn(async () => false);
+    const { sock, ws, s } = boot({ syncSession });
+    pushSnapshot(ws, openSnapshot());
+    await flush();
+    pushSnapshot(ws, openSnapshot({ frames: [{
+      recordId: "2", frameSeq: 2,
+      payload: { ...textFrame(2, "done"), isFinal: true, meta: { stopReason: "end_turn" } },
+    }] }));
+    await flush();
+    expect(s._sendingInFlight).toBe(false);
+    expect(syncSession).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS);
+    await flush();
+    expect(syncSession).toHaveBeenCalledTimes(2);
+    sock.stop();
+  });
+
   test("a late open snapshot never resurrects a turn this tab already finished", async () => {
     const { sock, ws, s } = boot();
     s.messages.push({ id: CMID, role: "user", text: "q", ts: 1, status: "replied" } as ChatMessage);
@@ -249,7 +293,7 @@ describe("afterSeq 续页与缺口", () => {
     sock.stop();
   });
 
-  test("cursor_reset rebuilds the turn from the stream instead of trusting a stale cursor", async () => {
+  test.each([undefined, `${STREAM}-old`])("cursor_reset rebuilds a new stream instead of trusting stale cursor 50 (%s)", async (previousStream) => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -260,6 +304,7 @@ describe("afterSeq 续页与缺口", () => {
         { id: "m-local", role: "assistant", text: "stale partial", ts: 2, _clientMessageId: CMID } as ChatMessage,
       ],
       _lastFrameSeqByKey: { [SK]: 50 },
+      _snapshotStream: previousStream ? { streamKey: previousStream, agentId: "main" } : undefined,
       _sendingInFlight: true,
       _activeClientMessageId: CMID,
     });
@@ -271,6 +316,21 @@ describe("afterSeq 续页与缺口", () => {
     const s = sock.sessions.get("s1")!;
     expect(assistantText(s.messages)).toBe("fresh");
     expect(s._lastFrameSeqByKey?.[SK]).toBe(1);
+    sock.stop();
+  });
+
+  test("a delayed cursor_reset on the same stream preserves newer live thinking and the cursor", async () => {
+    const { sock, ws, s } = boot();
+    const frames = [record(1, "hello"), record(2, " world")];
+    pushSnapshot(ws, openSnapshot({ frames, lastFrameSeq: 2, nextAfterSeq: 2 }));
+    await flush();
+    ws.push({ ...textFrame(3, ""), blocks: [{ kind: "thinking", text: "newer live thinking", messageId: "thinking-3" }] });
+    expect(s.messages.some((m) => m.role === "thinking" && m.text === "newer live thinking")).toBe(true);
+    pushSnapshot(ws, openSnapshot({ frames, lastFrameSeq: 2, nextAfterSeq: 2, gap: { reason: "cursor_reset" } }));
+    await flush();
+    expect(s.messages.some((m) => m.role === "thinking" && m.text === "newer live thinking")).toBe(true);
+    expect(assistantText(s.messages)).toBe("hello world");
+    expect(s._lastFrameSeqByKey?.[SK]).toBe(3);
     sock.stop();
   });
 
@@ -287,6 +347,31 @@ describe("afterSeq 续页与缺口", () => {
 });
 
 describe("B3：hello 没完成时 8s 内走 HTTP 快照", () => {
+  test("a foreground reconnect arms HTTP fallback for an unselected in-flight session", async () => {
+    const readSessionSnapshot = vi.fn(async (sessionId: string) => snapshot({ sessionId }));
+    const { sock, ws } = boot({ readSessionSnapshot });
+    const other = sock.ensureSession("s2", "main");
+    other._sendingInFlight = true;
+    other._activeClientMessageId = "m-run-2";
+    ws.close(1006, "");
+    await vi.advanceTimersByTimeAsync(3_000);
+    await flush();
+    readSessionSnapshot.mockClear();
+    const reconnect = FakeWS.instances.at(-1)!;
+    expect(reconnect).not.toBe(ws);
+    reconnect.open();
+    pushSnapshot(reconnect, snapshot());
+    await flush();
+    await vi.advanceTimersByTimeAsync(SNAPSHOT_ACK_TIMEOUT_MS - 1);
+    expect(readSessionSnapshot).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(readSessionSnapshot).toHaveBeenCalledTimes(1);
+    expect(readSessionSnapshot).toHaveBeenCalledWith("s2", { afterSeq: 0, dispatch: "m-run-2" });
+    expect(other._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
   test("WS stuck connecting: visible → 8s → HTTP snapshot for the selected and every in-flight session", async () => {
     let resolve!: (snap: SessionSnapshot) => void;
     const readSessionSnapshot = vi.fn((sessId: string) => sessId === "s1"
@@ -647,6 +732,32 @@ describe("snapshot recovery preserves container delivery truth", () => {
 });
 
 describe("没有本地猜测：在飞回合只由快照裁定", () => {
+  test("a cancelled unsent turn manually retried with the same cmid accepts the authoritative snapshot", async () => {
+    const { sock, ws, s } = boot({}, false);
+    await sock.sendMessage({ sessId: "s1", agentId: "main", text: "retry after cancellation" });
+    await flush();
+    const user = s.messages.find((m) => m.role === "user")!;
+    sock.stopTurn("s1");
+    expect(user.status).toBe("error");
+    expect(s._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    const cmid = user.id;
+    await sock.retryMessage({ sessId: "s1", msgId: cmid, agentId: "main" });
+    ws.open();
+    await flush();
+    expect(user.id).toBe(cmid);
+    pushSnapshot(ws, openSnapshot({
+      dispatch: dispatchRow({ clientMessageId: cmid }),
+      frames: [{ recordId: "1", frameSeq: 1, payload: { ...textFrame(1, "server accepted retry", cmid), ts: Date.now() + 1 } }],
+      turnStatus: { ...detachedStatus("compacting"), clientMessageId: cmid },
+    }));
+    await flush();
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe(cmid);
+    expect(s._turnStatus).toBe("compacting");
+    expect(assistantText(s.messages, cmid)).toBe("server accepted retry");
+    sock.stop();
+  });
+
   test("an IndexedDB-restored in-flight turn is decided by HTTP when no hello snapshot arrives in 8s", async () => {
     vi.useFakeTimers();
     const readSessionSnapshot = vi.fn(async () => openSnapshot({

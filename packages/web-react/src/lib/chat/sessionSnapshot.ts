@@ -91,13 +91,21 @@ export function snapshotIsStale(
   return getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key) > snap.lastFrameSeq;
 }
 
-/** 用户已按停止的回合：停止边界之后的帧和 open 状态都不再应用，只等终态。 */
+/** A reset may replace an old stream cursor, but cannot erase newer live evidence on the same stream. */
+export function snapshotNeedsRebuild(
+  sess: Pick<ChatSession, "id" | "_snapshotStream" | "_lastFrameSeqByKey" | "_lastFrameSeq">,
+  snap: SessionSnapshot,
+): boolean {
+  return snap.gap?.reason === "cursor_reset" &&
+    (sess._snapshotStream?.streamKey !== snap.streamKey || !snapshotIsStale(sess, snap));
+}
+
+/** An outstanding Stop holds live content until settlement; a past local cancellation cannot overrule a server snapshot. */
 export function isSnapshotFenced(
-  sess: Pick<ChatSession, "_cancelledAutomaticRecoveryIds" | "_stopSettlement">,
+  sess: Pick<ChatSession, "_stopSettlement">,
   d: SessionSnapshot["dispatch"],
 ): boolean {
-  return !!d && (sess._stopSettlement?.clientMessageId === d.clientMessageId ||
-    sess._cancelledAutomaticRecoveryIds?.[d.clientMessageId] === true);
+  return !!d && sess._stopSettlement?.clientMessageId === d.clientMessageId;
 }
 
 /** R1/R4：本地已经收尾或用户停过的回合，晚到的 open 快照不能把它复活。 */
