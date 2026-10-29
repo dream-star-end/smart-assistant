@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { readFileInRange } from '../../utils/readFileInRange.ts'
 import { CCB_REQUEST_BYTE_LIMITS, createCcbBudgetFetch, prepareCcbRequestBody, RequestBodyBudgetError } from './requestBodyBudget.ts'
-import { PROXY_BYTE_BUDGET_LEGACY } from '../../../../packages/commercial/src/http/proxy/shared.ts'
+import { enforceFieldByteBudgets, PROXY_BYTE_BUDGET_LEGACY } from '../../../../packages/commercial/src/http/proxy/shared.ts'
 import { BOX_API_MODEL_IDS } from '../../../../packages/protocol/src/boxApiModels.ts'
 
 const BOX_MODELS = BOX_API_MODEL_IDS
@@ -44,6 +44,70 @@ async function harness(t) {
 
 test('budget matches the ordinary proxy authority without changing any gate', () => {
   assert.deepEqual(CCB_REQUEST_BYTE_LIMITS, { body: PROXY_BYTE_BUDGET_LEGACY.totalBody, messages: PROXY_BYTE_BUDGET_LEGACY.messages, system: PROXY_BYTE_BUDGET_LEGACY.system, tools: PROXY_BYTE_BUDGET_LEGACY.tools })
+})
+
+test('t1282u Kimi image tool history crosses 8MiB and resumes twice without losing tool pairs', async t => {
+  const h = await harness(t)
+  // Synthetic content only. The first messages byte count matches the incident;
+  // small individual images exercise aggregate growth, not one oversized file.
+  const originals = Array.from({ length: 52 }, (_, i) => Buffer.alloc(132_000, i))
+  const history = [user('Review the document.')]
+  for (let i = 0; i < originals.length; i++) {
+    history.push(
+      assistant([{ type: 'tool_use', id: `read-${i}`, name: 'Read', input: { file_path: `${i}.jpg` } }]),
+      user([{ type: 'tool_result', tool_use_id: `read-${i}`, is_error: false, content: [media(originals[i], 'image/jpeg')] }]),
+    )
+  }
+  const padding = 9_326_964 - Buffer.byteLength(JSON.stringify(history))
+  assert.ok(padding > 0 && padding < 256 * 1024)
+  history[0].content += 'x'.repeat(padding)
+  assert.equal(Buffer.byteLength(JSON.stringify(history)), 9_326_964)
+  const sent = []
+  const proxy = async (_url, init) => {
+    const body = JSON.parse(init.body)
+    sent.push(body)
+    try {
+      enforceFieldByteBudgets(body)
+      return new Response('accepted', { status: 200 })
+    } catch (error) {
+      assert.equal(error.code, 'BODY_FIELD_TOO_LARGE')
+      return new Response(error.code, { status: 413 })
+    }
+  }
+  const wrap = enabled => createCcbBudgetFetch(proxy, {
+    enabled: () => enabled, remoteOwnsHistory: model => BOX_MODELS.includes(model),
+    cwd: () => h.cwd, sessionId: () => 'kimi-native-resume', onEvent: e => h.events.push(e),
+  })
+  let firstReferences
+  for (let turn = 0; turn < 3; turn++) {
+    if (turn > 0) history.push(assistant('Previous attempt ended.'), user('请继续'))
+    const nativeSnapshot = JSON.stringify(history)
+    const raw = JSON.stringify({ ...payload(history), model: 'k3.1-pro' })
+    const beforeCalls = sent.length
+    // Current live has no budget wrapper: continuation alone repeats the 413.
+    assert.equal((await wrap(false)('https://offline.invalid/v1/messages?beta=true', { method: 'POST', body: raw })).status, 413)
+    assert.equal((await wrap(true)('https://offline.invalid/v1/messages?beta=true', { method: 'POST', body: raw })).status, 200)
+    assert.equal(sent.length, beforeCalls + 2, 'each attempt makes exactly one proxy call')
+    const wire = assertFits(JSON.stringify(sent.at(-1)))
+    assert.equal(wire.messages.length, history.length)
+    assert.equal(JSON.stringify(history), nativeSnapshot, 'native resume history is immutable')
+    assert.deepEqual(wire.messages[0], history[0])
+    if (turn > 0) assert.deepEqual(wire.messages.at(-1), history.at(-1))
+    for (let i = 0; i < originals.length; i++) {
+      assert.deepEqual(wire.messages[1 + i * 2], history[1 + i * 2])
+      const result = wire.messages[2 + i * 2].content[0]
+      assert.equal(result.tool_use_id, `read-${i}`)
+      assert.equal(result.is_error, false)
+      const files = paths([wire.messages[2 + i * 2]])
+      const recovered = files.length ? await readFile(files[0]) : Buffer.from(result.content[0].source.data, 'base64')
+      assert.deepEqual(recovered, originals[i], 'every image remains recoverable byte for byte')
+    }
+    const references = paths(wire.messages)
+    assert.ok(references.length > 0 && references.length < originals.length)
+    if (firstReferences) assert.deepEqual(references, firstReferences)
+    else firstReferences = references
+  }
+  assert.equal(h.events.filter(e => e.kind === 'context_compacted').length, 3)
 })
 
 test('>20MB history with multiple images/PDFs keeps exact attachments and continues in one native session', async t => {
