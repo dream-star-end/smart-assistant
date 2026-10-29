@@ -1935,15 +1935,15 @@ describe("MessageList Manus 过程披露", () => {
       expect(screen.getByTestId("process-group-summary")).toHaveAttribute("data-live-working", "false");
       expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
       act(() => vi.advanceTimersByTime(2_000));
-      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending sessionId="session-a" cb={{}}
+      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}}
         turnActivity={{ ...activity, lastFrameAt: Date.now() }} />);
       expect(screen.getByTestId("process-live-tail")).toHaveTextContent("7 分 45 秒");
       const next = row("write", "tool", "写入文件", { _clientMessageId: "u", toolName: "write_file",
         inputJson: { Path: "/work/report.py" }, _completed: false, ts: Date.now() });
-      view.rerender(<MessageList processDisclosure messages={[user, tool, next]} sending sessionId="session-a" cb={{}} turnActivity={activity} />);
+      view.rerender(<MessageList processDisclosure messages={[user, tool, next]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} turnActivity={activity} />);
       expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
       expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("等待模型响应");
-      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending={false} sessionId="session-a" cb={{}} turnActivity={activity} />);
+      view.rerender(<MessageList processDisclosure messages={[user, tool]} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} turnActivity={activity} />);
       expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
     });
 
