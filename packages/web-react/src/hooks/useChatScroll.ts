@@ -8,7 +8,6 @@ import { useRef, useMemo, useCallback, useEffect, useLayoutEffect } from "react"
 import { createStickToBottomController } from "../components/chat/stickToBottom";
 import { attachWheelFence } from "../components/chat/wheelFence";
 import { captureVisibleVirtualRowAnchor, restoreVisibleVirtualRowAnchor } from "../components/chat/archivePaging";
-import { resolveGlobalHotkey, isDialogLayerOpen } from "../lib/hotkeys";
 import type { VisibleVirtualRowAnchor } from "../components/chat/archivePaging";
 import type { UseChatSocket } from "./useChatSocket";
 import type { Message } from "../lib/types";
@@ -29,7 +28,6 @@ export type ChatScrollInput = {
   setArchiveLoading: React.Dispatch<React.SetStateAction<boolean>>;
   settleArchiveAnchor: (token?: number | undefined) => void;
   sockRef: React.RefObject<UseChatSocket | null>;
-  stopTurn: () => void;
   streamText: string;
   wsSending: boolean;
 };
@@ -50,7 +48,6 @@ export function useChatScroll({
   setArchiveLoading,
   settleArchiveAnchor,
   sockRef,
-  stopTurn,
   streamText,
   wsSending,
 }: ChatScrollInput) {
@@ -308,20 +305,6 @@ export function useChatScroll({
       document.documentElement.style.removeProperty("--oc-visual-offset-top");
     };
   }, [inWorkspace, scrollToChatBottom]);
-
-  useEffect(() => {
-    if (!inWorkspace) return;
-    const onKey = (e: KeyboardEvent) => {
-      // Esc 的第一持有方是打开着的弹层(Radix Dialog / AlertDialog / DropdownMenu):生成中在对话框里
-      // 按 Esc 只该关对话框,不该连带掐掉这一轮(shell 审计 S-02)。按事件时刻的 DOM 判断,不逐个面板维护布尔量。
-      if (resolveGlobalHotkey(e, { sending, dialogOpen: isDialogLayerOpen() }) === "stop") {
-        e.preventDefault();
-        stopTurn();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, sending, stopTurn]);
 
   return {
     beginDirectUserChatScroll,

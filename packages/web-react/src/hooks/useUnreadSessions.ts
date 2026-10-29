@@ -102,6 +102,7 @@ function notifyBody(session: UnreadSessionInput): string {
     lastOutcome: session.lastOutcome,
     lastErrorCode: session.lastErrorCode,
   });
+  if (kind === "stopped") return "已停止";
   if (kind === "error" || kind === "interrupted" || kind === "service_restart") return "出错";
   if (session.lastErrorCode) return "出错";
   return "已完成";
