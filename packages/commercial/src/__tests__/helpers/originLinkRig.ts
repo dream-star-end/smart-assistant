@@ -111,8 +111,21 @@ const SCHEMA_SQL = `
   CREATE TABLE turn_tape_cost_components(session_id text,user_id text,tape_id text,request_id text,cost_credits numeric);
   CREATE TABLE pending_usage_patches(user_id text,turn_key text,parent_turn_key text,request_id text,cost_credits text);
   CREATE TABLE turn_permission_requests(user_id bigint,session_id text,request_id text,client_message_id text,
-    tool_use_id text,tool_name text,input_json jsonb,expires_at timestamptz,status text,created_at timestamptz DEFAULT now());
-  CREATE TABLE turn_control_requests(user_id bigint,session_id text,kind text,status text,root_client_message_id text,created_at timestamptz);
+    tool_use_id text,tool_name text,input_sha256 text,input_json jsonb,ask_payload_json jsonb,expires_at timestamptz,
+    status text DEFAULT 'pending',response_control_id text,response_json jsonb,
+    created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),PRIMARY KEY(user_id,request_id));
+  CREATE TABLE turn_control_requests(control_id text PRIMARY KEY,user_id bigint,session_id text,
+    root_client_message_id text,kind text,request_id text,payload_json jsonb,status text DEFAULT 'pending',
+    lease_owner text,lease_epoch bigint DEFAULT 0,lease_until timestamptz,delivery_attempt int DEFAULT 0,
+    next_attempt_at timestamptz DEFAULT now(),error_code text,created_at timestamptz DEFAULT now(),
+    updated_at timestamptz DEFAULT now(),applied_at timestamptz,terminal_at timestamptz);
+  CREATE TABLE turn_recovery_jobs(job_id uuid PRIMARY KEY,user_id bigint,session_id text,
+    root_client_message_id text,source_client_message_id text,source_turn_key text,error_code text,
+    recovery_mode text,semantic_recovery_attempt int,transport_wait_attempt int DEFAULT 0,request_json jsonb,
+    tape_sha256 text,status text DEFAULT 'queued',lease_owner text,lease_epoch bigint DEFAULT 0,
+    lease_until timestamptz,next_attempt_at timestamptz DEFAULT now(),pause_reason text,dispatch_id uuid,
+    dispatch_attempt_no int,terminal_outcome text,container_receipt_at timestamptz,
+    created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now());
 `;
 
 type Frame = Record<string, any>;

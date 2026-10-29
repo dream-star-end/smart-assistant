@@ -1,28 +1,18 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { afterEach, beforeEach, test } from "node:test";
-import type { Pool } from "pg";
-import { resetPool, setPoolOverride } from "../db/index.js";
-import { _clearMaintenanceCache } from "../middleware/maintenanceMode.js";
+import { test } from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import { ContainerLinkRegistry, getContainerLinkHandle } from "../ws/containerLink.js";
 import { availableExecutors, registerBridgeExecutors, type RecoveryExecutor } from "../ws/bridgeExecutorRegistration.js";
 import { ContainerLinkWake, waitForOriginExecutor } from "../ws/containerLinkWake.js";
 import { hasBrowserActivity } from "../ws/containerLinkPolicy.js";
+import { ContainerLinkRecovery } from "../ws/containerLinkRecovery.js";
+import { rebuildContainerLink } from "../ws/containerLinkRebuild.js";
+import { registerBridgeTransport } from "../ws/containerLinkTransport.js";
+import type { LinkCarrier } from "../ws/containerLinkRecoveryStore.js";
 import type { CronOriginExecutor } from "../ws/originTurnInjection.js";
 import type { ResolveContainerEndpoint, UserChatBridgeDeps } from "../ws/userChatBridge.js";
 import type { Queryable } from "../dispatch/turnDispatchStore.js";
-
-// Maintenance deliberately preserves its existing DB-error fail-open contract;
-// unit tests never initialize an external PG connection for that global read.
-beforeEach(() => {
-  _clearMaintenanceCache();
-  setPoolOverride({
-    query: async () => { throw new Error("global settings DB unavailable in unit test"); },
-    end: async () => {},
-  } as unknown as Pool);
-});
-afterEach(async () => { await resetPool(); _clearMaintenanceCache(); });
 
 type WakeOptions = ConstructorParameters<typeof ContainerLinkWake>[0];
 type Endpoint = Awaited<ReturnType<ResolveContainerEndpoint>>;
@@ -43,18 +33,29 @@ class ConnectingTransport extends EventEmitter {
   }
 }
 
-/** Exercise wake and real link ownership; fake only the large bridge execution closure. */
-async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true) {
+/** Real shared recovery, rebuild and physical WS; fake only the bridge closures. */
+async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true,
+  options: { wake?: (carrier: LinkCarrier) => Promise<void> } = {}) {
   const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
   await new Promise<void>((resolve) => server.once("listening", resolve));
   let physicalConnections = 0;
   server.on("connection", () => { physicalConnections++; });
-  const pool = { query: async () => ({ rows: [{ role: "user", status: "active" }], rowCount: 1 }) } as unknown as Queryable;
+  const pool = { query: async (sql: string, params?: unknown[]) => {
+    if (sql.includes("FROM users")) {
+      assert.deepEqual(params, [carrier.uid]);
+      return { rows: [{ role: "user", status: "active" }], rowCount: 1 };
+    }
+    assert.deepEqual(params, [carrier.uid, carrier.containerId], "shared recovery reads only the exact carrier's dispatches");
+    return { rows: [], rowCount: 0 };
+  } } as unknown as Queryable;
   const links = new ContainerLinkRegistry(pool, undefined, { heartbeatMs: 10_000 });
   const endpoint: Endpoint = { host: "127.0.0.1", port: (server.address() as { port: number }).port,
     containerId: carrier.containerId, bundleRev: "endpoint-stale-rev" };
   const maps = { recovery: new Map<string, Set<RecoveryExecutor>>(), origin: new Map<string, Set<CronOriginExecutor>>() };
+  const transports = new Map<string, Set<WebSocket>>();
   const contexts: Array<Parameters<WakeOptions["start"]>[6]> = [];
+  const serviceSockets: WebSocket[] = [];
+  const sharedWakeCarriers: LinkCarrier[] = [];
   let dials = 0;
   let activity = 0;
   let starts = 0;
@@ -64,27 +65,57 @@ async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true)
     recovery: () => {},
     origin: () => { originCalls++; return { kind: "claimed" }; },
   }, maps);
+  const resolveEndpoint = extra.resolveContainerLinkEndpoint ?? (async () => endpoint);
   const deps: UserChatBridgeDeps = {
     jwtSecret: "container-link-wake-test",
     resolveContainerEndpoint: async () => { throw new Error("wake must not provision"); },
-    resolveContainerLinkEndpoint: async (uid, cid) => {
-      assert.equal(uid, 42n); assert.equal(cid, 7); return endpoint;
-    },
     pgPool: pool as UserChatBridgeDeps["pgPool"],
     markContainerActivity: () => { activity++; },
     containerConnectTimeoutMs: 1500,
     createContainerSocket: (host, port) => { dials++; return new WebSocket(`ws://${host}:${port}/ws`); },
     ...extra,
+    resolveContainerLinkEndpoint: (uid, cid) => {
+      assert.equal(uid, 42n); assert.equal(cid, 7);
+      return resolveEndpoint(uid, cid);
+    },
   };
+  const recovery = new ContainerLinkRecovery({
+    pool, channel: "v5", spacingMs: 1, retryMs: 1000, maxAttempts: 1,
+    drain: () => links.drain(),
+    attach: (got, rows, signal, keepAlive) => {
+      assert.deepEqual(got, carrier);
+      assert.deepEqual(rows, [], "wake must work before any dispatch exists");
+      assert.equal(keepAlive, true);
+      return rebuildContainerLink({ carrier: got, rows, signal, keepAlive, links, deps, maxFrameBytes: 1024 * 1024,
+        start(user, uid, serviceEndpoint, socket) {
+          assert.equal(uid, 42n); assert.equal(serviceEndpoint.containerId, 7);
+          const handle = getContainerLinkHandle(socket)!;
+          assert.equal(handle.recoveryOnly, true);
+          assert.equal(handle.keepAlive, true);
+          serviceSockets.push(socket);
+          registerBridgeTransport(uid, socket, transports);
+          // Registration may precede execution, but recoveryOnly remains ineligible.
+          if (register) install(socket);
+          user.on("close", () => handle.detach());
+        },
+      });
+    },
+  });
   const wake = new ContainerLinkWake({
-    links, deps, maxFrameBytes: 1024 * 1024, isInMaintenance: async () => false,
-    start(user, _uid, _endpoint, socket, _abort, _connId, context) {
+    links, deps, isInMaintenance: async () => false,
+    wake: async (got) => {
+      assert.deepEqual(got, carrier);
+      sharedWakeCarriers.push({ ...got });
+      await (options.wake?.(got) ?? recovery.wake(got));
+    },
+    start(user, uid, executionEndpoint, socket, _abort, _connId, context) {
+      assert.equal(uid, 42n); assert.equal(executionEndpoint.containerId, 7);
       starts++; contexts.push(context); subscribers.push(user);
       const handle = getContainerLinkHandle(socket)!;
       assert.equal(handle.background, true);
       assert.equal(handle.retained, true, "pin precedes start even with no open streams");
       assert.equal(handle.hasOpenDispatches, false);
-      // Simulate bridge teardown while retaining the production handle and link.
+      // Simulate execution teardown over the production service and handle.
       const cleanup = () => { if (handle.detached && !handle.retained && !handle.hasOpenDispatches) socket.terminate(); };
       handle.onStreamsChanged = cleanup;
       user.on("close", () => { handle.detach(); cleanup(); });
@@ -92,11 +123,11 @@ async function fixture(extra: Partial<UserChatBridgeDeps> = {}, register = true)
     },
   });
   return {
-    wake, links, endpoint, maps, contexts, subscribers, install,
+    wake, recovery, links, endpoint, maps, contexts, subscribers, serviceSockets, sharedWakeCarriers, install,
     dials: () => dials, starts: () => starts, activity: () => activity,
     physicalConnections: () => physicalConnections, originCalls: () => originCalls,
     stop: async () => {
-      wake.stop(); await wake.drain(); await links.shutdown();
+      wake.stop(); recovery.stop(); await wake.drain(); await recovery.drain(); await links.shutdown();
       for (const socket of server.clients) socket.terminate();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
@@ -125,6 +156,8 @@ test("concurrent headless acquire pins one context and one physical connection w
     assert.equal(rig.dials(), 1);
     assert.equal(rig.physicalConnections(), 1);
     assert.equal(rig.starts(), 1);
+    assert.deepEqual(rig.sharedWakeCarriers, [carrier]);
+    assert.equal(rig.serviceSockets.length, 1);
     assert.deepEqual(loadedRevisions, [actualRevision]);
     assert.equal(rig.contexts[0]!.role, "user");
     assert.equal(rig.contexts[0]!.checker!.isAllowed("running-model"), true);
@@ -137,7 +170,13 @@ test("concurrent headless acquire pins one context and one physical connection w
     assert.equal(getContainerLinkHandle(first.socket)!.retained, true, "one caller cannot unpin the other callers");
     for (const lease of leases.slice(1)) lease!.release();
     assert.equal(getContainerLinkHandle(first.socket)!.disposed, true);
-    assert.deepEqual(rig.links.snapshots(), []);
+    const service = getContainerLinkHandle(rig.serviceSockets[0]!)!;
+    assert.equal(service.disposed, false, "execution release preserves the shared read-only service");
+    assert.equal(service.recoveryOnly, true);
+    assert.equal(service.keepAlive, true);
+    assert.equal(service.readyState, WebSocket.OPEN);
+    assert.equal(rig.links.snapshots().length, 1);
+    assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
   } finally { endpointRead.resolve(rig.endpoint); await rig.stop(); }
 });
 
@@ -157,8 +196,9 @@ test("detached execution keeps origin available but excludes recovery and recove
     assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
     assert.deepEqual(await origin({} as Parameters<CronOriginExecutor>[0]), { kind: "not_claimed" });
     lease.release();
-    assert.equal(rig.maps.origin.size, 0);
-    assert.equal(rig.maps.recovery.size, 0);
+    assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
+    assert.equal(availableExecutors(rig.maps.recovery.get("42")).length, 0);
+    assert.equal(getContainerLinkHandle(rig.serviceSockets[0]!)!.disposed, false);
   } finally { await rig.stop(); }
 });
 
@@ -194,12 +234,16 @@ for (const mode of ["timeout", "shutdown"] as const) {
   });
 }
 
-test("a socket that never opens times out and releases its retained context", { timeout: 5000 }, async () => {
+test("a shared service socket that never opens times out without starting an execution context", { timeout: 5000 }, async () => {
   const physical = new ConnectingTransport();
   const rig = await fixture({ containerConnectTimeoutMs: 30,
     createContainerSocket: () => physical as unknown as WebSocket });
   try {
     assert.equal(await rig.wake.acquire(carrier), null);
+    // The shared recovery owns its independent dial timeout, even if this
+    // caller's shorter wait has already ended.
+    await rig.recovery.drain();
+    assert.equal(rig.starts(), 0);
     assert.equal(physical.readyState, WebSocket.CLOSED);
     assert.deepEqual(rig.links.snapshots(), []);
     assert.equal(rig.maps.origin.size, 0);
@@ -296,6 +340,45 @@ test("the same disabled user may acquire a control-only link without execution g
     assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
     assert.equal(rig.activity(), 0);
     lease.release();
+    assert.equal(rig.links.snapshots().length, 1);
+    assert.equal(getContainerLinkHandle(rig.serviceSockets[0]!)!.recoveryOnly, true);
+  } finally { await rig.stop(); }
+});
+
+
+test("shared wake without an exact open service never falls back to a second dial path", { timeout: 5000 }, async () => {
+  const rig = await fixture({}, true, { wake: async () => {} });
+  try {
+    assert.equal(await rig.wake.acquire(carrier), null);
+    assert.deepEqual(rig.sharedWakeCarriers, [carrier]);
+    assert.equal(rig.dials(), 0, "execution context must only attachExisting after shared wake");
+    assert.equal(rig.starts(), 0);
     assert.deepEqual(rig.links.snapshots(), []);
+  } finally { await rig.stop(); }
+});
+
+test("execution re-acquire joins the same exact uid/container service after releasing its first context", { timeout: 5000 }, async () => {
+  const rig = await fixture();
+  try {
+    const first = await rig.wake.acquire(carrier);
+    assert.ok(first);
+    const service = getContainerLinkHandle(rig.serviceSockets[0]!)!;
+    const physical = service.link.ws;
+    assert.equal(rig.links.attachExisting(43n, carrier.containerId), null);
+    assert.equal(rig.links.attachExisting(42n, carrier.containerId + 1), null);
+    first.release();
+    assert.equal(getContainerLinkHandle(first.socket)!.disposed, true);
+    assert.equal(service.disposed, false);
+    const second = await rig.wake.acquire(carrier);
+    assert.ok(second);
+    assert.notEqual(second.socket, first.socket, "released execution state is rebuilt separately");
+    assert.equal(getContainerLinkHandle(second.socket)!.link.ws, physical);
+    assert.equal(rig.serviceSockets.length, 1);
+    assert.equal(rig.dials(), 1);
+    assert.equal(rig.physicalConnections(), 1);
+    assert.deepEqual(rig.sharedWakeCarriers, [carrier, carrier]);
+    second.release();
+    assert.equal(service.disposed, false);
+    assert.equal(availableExecutors(rig.maps.origin.get("42")).length, 0);
   } finally { await rig.stop(); }
 });

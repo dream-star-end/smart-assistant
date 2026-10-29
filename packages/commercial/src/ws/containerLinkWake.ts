@@ -2,7 +2,6 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { getContainerLinkHandle, type ContainerLinkHandle, type ContainerLinkRegistry } from "./containerLink.js";
-import { attachContainerTransport } from "./containerLinkTransport.js";
 import { loadBridgeAgentResolver, loadBridgeModelChecker } from "./bridgeExecutionContext.js";
 import type { LinkCarrier } from "./containerLinkRecoveryStore.js";
 import type { ResolveContainerEndpoint, UserChatBridgeDeps } from "./userChatBridge.js";
@@ -25,12 +24,13 @@ class BackgroundSubscriber extends EventEmitter {
   terminate(): void { this.close(); }
 }
 
-/** Shared control/origin wake entry. No provisioning, browser quota or activity. */
+/** Execution context over the shared recovery wake entry. Never dials a transport. */
 export class ContainerLinkWake {
   private readonly entries = new Map<string, Entry>();
   private readonly abort = new AbortController();
   constructor(private readonly options: {
-    links: ContainerLinkRegistry; deps: UserChatBridgeDeps; maxFrameBytes: number;
+    links: ContainerLinkRegistry; deps: UserChatBridgeDeps;
+    wake(carrier: LinkCarrier): Promise<void>;
     isInMaintenance(): Promise<boolean>;
     start(user: WebSocket, uid: bigint, endpoint: Endpoint, socket: WebSocket,
       abort: AbortController, connId: string, context: Context): void;
@@ -97,9 +97,10 @@ export class ContainerLinkWake {
       const agents = execution ? await loadBridgeAgentResolver(deps, uid, endpoint.bundleRev) : null;
       check();
       const connId = randomUUID();
-      socket = await attachContainerTransport({ uid, endpoint, links, deps,
-        signal: abort.signal, connId, maxFrameBytes: this.options.maxFrameBytes });
+      await this.options.wake(carrier);
       check();
+      socket = links.attachExisting(uid, carrier.containerId) ?? undefined;
+      if (!socket) return null;
       const handle = getContainerLinkHandle(socket)!;
       handle.background = true;
       handle.recoveryOnly = !execution;

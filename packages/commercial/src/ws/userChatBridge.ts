@@ -2056,7 +2056,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Set<(job: ClaimedRecoveryJob) => void>
   >();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
-  const wake = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkWake({ links, deps, maxFrameBytes, isInMaintenance,
+  const wake = links && recovery ? new ContainerLinkWake({ links, deps, isInMaintenance, wake: carrier => recovery.wake(carrier),
     start: (user, uid, endpoint, socket, abort, connId, context) => startBridge(user, uid, endpoint, [], endpoint.containerId,
       socket, abort, context.checker, context.agents, connId, context.role),
   }) : null;
