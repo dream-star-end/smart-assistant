@@ -1,3 +1,4 @@
+import { ContainerLinkControls } from "./containerLinkControls.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
@@ -210,13 +211,11 @@ import {
 } from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
-  claimDueTurnControls,
   HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   markTurnControlReceipt,
   pendingPermissionPromptToFrame,
   persistPermissionAuthority,
   readPendingPermissionPromptsForSessions,
-  releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
   selectHelloPermissionSessions,
   settlePermissionPromptFromRuntime,
@@ -2282,7 +2281,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
     ...deps.containerLinkRecovery,
     drain: async () => { await links.drain(); await outboundPersistQueues.drain(); },
-    attach: (carrier, rows, signal) => rebuildContainerLink({ carrier, rows, signal, links, deps, maxFrameBytes,
+    attach: (carrier, rows, signal, keepAlive) => rebuildContainerLink({ carrier, rows, signal, keepAlive, links, deps, maxFrameBytes,
       start: (user, uid, endpoint, socket, abort, connId) => startBridge(user, uid, endpoint, [], endpoint.containerId, socket, abort, null, null, connId),
     }),
   }) : null;
@@ -2294,59 +2293,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Set<(job: ClaimedRecoveryJob) => void>
   >();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
-  const controlDrainRunning = new Set<string>();
   const recoveryDrainRunning = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
-  const controlLeaseOwner = `master:${randomUUID()}`;
   const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
-  const controlLeaseMs = 15_000;
   const recoveryLeaseMs = 120_000;
 
-  /** Master-owned control outbox drainer. The physical bridge is only a
-   * transport candidate: PostgreSQL claim/lease is the delivery authority,
-   * so browser disconnects and Master restarts cannot erase Stop/permission. */
-  const drainDurableControlsForUser = async (uid: bigint): Promise<void> => {
-    if (!deps.pgPool) return;
-    const key = uid.toString();
-    if (controlDrainRunning.has(key)) return;
-    const sockets = uidToContainerWs.get(key);
-    const socket = sockets && [...sockets].find((candidate) => candidate.readyState === WebSocket.OPEN);
-    if (!socket) return;
-    controlDrainRunning.add(key);
-    try {
-      const controls = await claimDueTurnControls(deps.pgPool, {
-        userId: uid,
-        ownerId: controlLeaseOwner,
-        leaseMs: controlLeaseMs,
-      });
-      for (const control of controls) {
-        const live = [...(uidToContainerWs.get(key) ?? [])]
-          .find((candidate) => candidate.readyState === WebSocket.OPEN);
-        if (!live) {
-          await releaseTurnControlForRetry(deps.pgPool, control);
-          continue;
-        }
-        const encoded = JSON.stringify({ ...control.payload, controlId: control.controlId });
-        try {
-          live.send(encoded, { binary: false }, (error) => {
-            if (!error) return;
-            void releaseTurnControlForRetry(deps.pgPool!, control).catch(() => {});
-          });
-        } catch {
-          await releaseTurnControlForRetry(deps.pgPool, control);
-        }
-      }
-    } catch (error) {
-      log?.warn("user-chat-bridge: durable control drain failed", { uid: key, error });
-    }
-    controlDrainRunning.delete(key);
-  };
-  const controlDrainTimer = setInterval(() => {
-    for (const uid of uidToContainerWs.keys()) {
-      void drainDurableControlsForUser(BigInt(uid));
-    }
-  }, 1_000);
-  controlDrainTimer.unref?.();
+  const controls = deps.pgPool ? new ContainerLinkControls({
+    pool: deps.pgPool, channel: deps.containerLinkRecovery?.channel ?? "v5", links,
+    legacy: uidToContainerWs, wake: carrier => recovery?.wake(carrier) ?? Promise.resolve(), log,
+  }) : null;
+  const drainDurableControlsForUser = (uid: bigint): Promise<void> => controls?.drain(uid) ?? Promise.resolve();
 
   /** Master-owned semantic recovery scheduler. Executors are registered only
    * by attested durable-dispatch bridges; every claimed request then enters
@@ -5163,6 +5119,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     controlId,
                     controlKind: kind,
                     status: admission.status === "terminal" ? "terminal" : "persisted",
+                    ...(admission.errorCode ? { errorCode: admission.errorCode } : {}),
                     peer,
                     ...(rootClientMessageId ? { clientMessageId: rootClientMessageId } : {}),
                     ...(requestId ? { requestId } : {}),
@@ -9384,7 +9341,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
       // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
       // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
-      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams()) {
+      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams() && !linkHandle?.keepAlive) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -9425,7 +9382,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // checkDrainComplete:billing settle 把 inflightCodexTurns.size→0 时调,提前 final
     function cleanup(triggerCause: BridgeCloseCause, force = false): void {
       if (cleaned) return;
-      if (!force && !shuttingDown && hasOpenDispatchStreams() &&
+      if (!force && !shuttingDown && (hasOpenDispatchStreams() || linkHandle?.keepAlive) &&
           (triggerCause === "client_close" || triggerCause === "backpressure" || triggerCause === "internal_error")) {
         drainCause = triggerCause;
         if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
@@ -9538,7 +9495,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (drainTimer !== null || (userDetached && linkHandle !== undefined)) &&
         inflightCodexTurns.size === 0 &&
         !hasPendingDispatchWork() &&
-        !hasOpenDispatchStreams()
+        !hasOpenDispatchStreams() && !linkHandle?.keepAlive
       ) {
         if (drainTimer !== null) clearTimeout(drainTimer);
         drainTimer = null;
@@ -10250,7 +10207,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
     if (frontendBuildTimer) clearInterval(frontendBuildTimer);
-    clearInterval(controlDrainTimer);
+    const controlsStopped = controls?.stop();
     clearInterval(recoveryDrainTimer);
     shuttingDown = true;
     recovery?.stop();
@@ -10259,6 +10216,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     for (const check of [...drainingChecks]) check();
     await links?.shutdown();
     await recovery?.drain();
+    await controlsStopped;
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
@@ -10433,7 +10391,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     shutdown,
     registry,
     containerLinkSnapshots: () => links?.snapshots() ?? [],
-    rebuildContainerLinks: () => recovery?.start() ?? Promise.resolve(),
+    rebuildContainerLinks: async () => { await Promise.all([recovery?.start(), controls?.scan()]); },
     broadcastToUser,
     syncGoalToContainers,
     broadcastAll,
