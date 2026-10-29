@@ -291,6 +291,8 @@ function listBody(store) {
       sessionListRow(BOARD_SESSION, "库存看板", store.clocks[BOARD_SESSION], store.board.length + store.older.length),
       sessionListRow(WAIT_SESSION, "待你确认", store.clocks[WAIT_SESSION], store.wait.length),
       sessionListRow(OLD_SESSION, "旧日期对照", store.clocks[OLD_SESSION], store.old.length),
+      // Perf scripts (ui-lag/run-lag.mjs) fill a realistic sidebar.
+      ...(store.extraSessions ?? []),
     ],
   };
 }

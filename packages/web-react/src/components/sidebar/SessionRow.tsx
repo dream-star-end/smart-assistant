@@ -7,8 +7,7 @@ import {
   SquareCheck,
   Trash2,
 } from "lucide-react";
-import { type PointerEvent as ReactPointerEvent, useRef, useState } from "react";
-import { isSidebarSessionRunning } from "../../lib/sessionStatus";
+import { type PointerEvent as ReactPointerEvent, memo, useRef, useState } from "react";
 import type { ChatProject, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
@@ -33,13 +32,18 @@ const LONG_PRESS_MS = 450;
 /** 长按期间手指位移超过此值视为滚动，取消长按。 */
 const LONG_PRESS_SLOP_PX = 8;
 
-export function SessionRow({
+/**
+ * 侧栏会话行。memo:流式回合里 App/Sidebar 每帧重渲,行只在自己的数据变了才重渲(#1240)——
+ * 所以运行态/终态由 Sidebar 算好以原始值传入，回调须是稳定引用(Sidebar 用 latest-ref 包装)。
+ */
+export const SessionRow = memo(function SessionRow({
   session: s,
   active,
   projects,
   indent,
-  isSending,
-  liveTerminal,
+  running,
+  lastOutcome,
+  lastErrorCode,
   now,
   onSelect,
   onRename,
@@ -62,10 +66,12 @@ export function SessionRow({
   active: boolean;
   projects: ChatProject[];
   indent?: boolean;
-  isSending?: (id: string) => boolean;
-  liveTerminal?: (
-    id: string,
-  ) => { lastOutcome?: string | null; lastErrorCode?: string | null } | undefined;
+  /** 本 tab 发送中或服务端 runState=running(isSidebarSessionRunning)。 */
+  running: boolean;
+  /** 本 tab 终态优先，否则列表元数据。 */
+  lastOutcome?: string | null;
+  lastErrorCode?: string | null;
+  /** 只有运行中的行用到(用时算到现在);其余行由 Sidebar 传 0,30s 时钟不打穿它们的 memo。 */
   now: number;
   onSelect: (id: string) => void;
   onRename: (s: Session) => void;
@@ -86,8 +92,6 @@ export function SessionRow({
   /** 搜索结果里显示会话所在项目(平时由分组表达,搜索结果是平铺的)。 */
   projectHint?: string;
 }) {
-  const live = liveTerminal?.(s.id);
-  const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
   const title = s.title || "新对话";
   // 「更多」菜单关闭后的焦点归还：鼠标关闭不把焦点拉回 hover 才可见的触发钮（原行为），
   // 键盘关闭则保留 Radix 默认把焦点还给触发钮，Tab 序列不再从 body 重头开始（SR-02）。
@@ -192,8 +196,8 @@ export function SessionRow({
         >
           <SessionStatusDot
             running={running}
-            lastOutcome={live?.lastOutcome ?? s.lastOutcome}
-            lastErrorCode={live?.lastErrorCode ?? s.lastErrorCode}
+            lastOutcome={lastOutcome}
+            lastErrorCode={lastErrorCode}
             unread={unread}
           />
         </span>
@@ -355,4 +359,4 @@ export function SessionRow({
       </div>
     </div>
   );
-}
+});
