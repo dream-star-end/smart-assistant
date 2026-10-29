@@ -183,6 +183,58 @@ afterEach(() => {
 })
 
 describe('Antigravity relay handler', () => {
+  async function refuseBody(source: Readable, generate: boolean) {
+    const token = await mintRoute()
+    const req = Object.assign(source, {
+      method: 'POST',
+      url: `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:${generate ? 'streamGenerateContent?alt=sse' : 'loadCodeAssist'}`,
+      headers: { authorization: `Bearer ${CONTAINER_TOKEN}` },
+    })
+    const res = {
+      statusCode: 200, text: '',
+      setHeader() {},
+      end(text: string) { this.text = text },
+    }
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(), clientSecret: 'test-client-secret',
+      freshToken: async () => { assert.fail('body rejection must not fetch account credentials') },
+      meteredCost: async () => { assert.fail('body rejection must precede billing admission') },
+      recordUsage: async () => { assert.fail('body rejection must not charge') },
+      reportOutcome: async () => { assert.fail('body rejection is not an upstream outcome') },
+      requestFn: (async () => { assert.fail('body rejection must not forward') }) as never,
+    })
+    await handler(req as any, res as any, CTX)
+    assert.equal(_antigravityInflightForTests().has(token), false)
+    return res
+  }
+
+  test('OCV5-659 relay stream failures do not become size errors or reserve credits', async () => {
+    for (const generate of [false, true]) {
+      const req = Readable.from((async function* () {
+        yield Buffer.from('{"partial":')
+        throw Object.assign(new Error('private payload must not escape'), { code: 'ECONNRESET', status: 413 })
+      })())
+      const res = await refuseBody(req, generate)
+      assert.equal(res.statusCode, 400)
+      assert.equal(JSON.parse(res.text).error.code, 'REQUEST_BODY_READ_FAILED')
+      assert.doesNotMatch(res.text, /BODY_TOO_LARGE|private payload/)
+    }
+  })
+
+  test('OCV5-659 relay metadata and generate byte caps still reject before billing', async () => {
+    for (const generate of [false, true]) {
+      const chunk = Buffer.alloc(64 * 1024)
+      const chunks = (generate ? 32 : 1) * 16
+      const req = Readable.from((function* () {
+        for (let i = 0; i < chunks; i++) yield chunk
+        yield Buffer.from('x')
+      })())
+      const res = await refuseBody(req, generate)
+      assert.equal(res.statusCode, 413)
+      assert.equal(JSON.parse(res.text).error.code, 'BODY_TOO_LARGE')
+    }
+  })
+
   test('generate call: injects the account token, streams, and meters usageMetadata', async () => {
     const token = await mintRoute()
     const { status, text, captured } = await relay(
