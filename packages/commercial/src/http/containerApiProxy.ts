@@ -38,6 +38,8 @@ const MAX_REQUEST_BODY_BYTES = 512 * 1024
 const MAX_RESPONSE_BODY_BYTES = 2 * 1024 * 1024
 const MAX_HEADER_BYTES = 64 * 1024
 
+class ContainerRequestBodyTooLargeError extends Error {}
+
 const FORWARD_REQUEST_HEADERS = new Set(['accept', 'content-type', 'user-agent', 'x-request-id'])
 
 const RESPONSE_HEADER_ALLOWLIST = new Set(['content-type', 'etag', 'last-modified'])
@@ -79,10 +81,7 @@ async function readRequestBodyCapped(req: IncomingMessage): Promise<Buffer> {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     total += buf.length
     if (total > MAX_REQUEST_BODY_BYTES) {
-      const err = new Error(`request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`)
-      ;(err as Error & { code?: string; status?: number }).code = 'PAYLOAD_TOO_LARGE'
-      ;(err as Error & { code?: string; status?: number }).status = 413
-      throw err
+      throw new ContainerRequestBodyTooLargeError(`request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`)
     }
     chunks.push(buf)
   }
@@ -386,8 +385,15 @@ export async function containerApiProxy(
   try {
     body = await readRequestBodyCapped(req)
   } catch (err) {
-    const status = (err as Error & { status?: number }).status ?? 413
-    sendJsonError(res, status, 'PAYLOAD_TOO_LARGE', 'request body too large', ctx.requestId)
+    if (err instanceof ContainerRequestBodyTooLargeError) {
+      sendJsonError(res, 413, 'PAYLOAD_TOO_LARGE', 'request body too large', ctx.requestId)
+    } else {
+      ctx.log.warn('container_api_request_body_read_failed', {
+        uid: String(uid), method, route: rule.label,
+        reason: req.aborted ? 'aborted' : 'read_failed',
+      })
+      sendJsonError(res, 400, 'REQUEST_BODY_READ_FAILED', 'request body could not be read', ctx.requestId)
+    }
     return
   }
 

@@ -160,6 +160,8 @@ function error(res: ServerResponse, status: number, code: string, requestId: str
   res.end(JSON.stringify({ error: { code, message: `antigravity relay: ${code}` }, requestId }))
 }
 
+class AntigravityBodyTooLargeError extends Error {}
+
 function readLimited(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -168,7 +170,7 @@ function readLimited(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
       total += chunk.length
       if (total > maxBytes) {
         req.destroy()
-        reject(new Error('body too large'))
+        reject(new AntigravityBodyTooLargeError('body too large'))
         return
       }
       chunks.push(chunk)
@@ -489,8 +491,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         stage('body_read_started')
         body = await readLimited(req, generate ? MAX_GENERATE_BODY : MAX_METADATA_BODY)
         stage('body_read_complete')
-      } catch {
-        error(res, 413, 'BODY_TOO_LARGE', requestId)
+      } catch (err) {
+        const oversized = err instanceof AntigravityBodyTooLargeError
+        stage('body_read_failed', { statusCode: oversized ? 413 : 400 })
+        error(res, oversized ? 413 : 400, oversized ? 'BODY_TOO_LARGE' : 'REQUEST_BODY_READ_FAILED', requestId)
         return
       }
     }
