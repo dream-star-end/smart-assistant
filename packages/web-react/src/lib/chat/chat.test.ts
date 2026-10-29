@@ -8908,7 +8908,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     sock.stop();
   });
 
-  test("a user Stop fence does not block a different open dispatch from the snapshot", async () => {
+  test("a historical Stop fence follows server settlement before a different open dispatch", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
     sock.ensureSession("s1", "main");
@@ -8918,14 +8918,30 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const active = sock.sessions.get("s1")!;
     active._cancelledAutomaticRecoveryIds = { "m-user-stopped": true };
 
+    // START #1216 decision ④: a historical local cancellation cannot overrule
+    // a server snapshot that still says accepted. An outstanding Stop has its
+    // own _stopSettlement fence, covered by the preceding test.
     ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: snapshotDispatch("m-user-stopped") }) });
     await snapshotFlush();
+    expect(active._activeClientMessageId).toBe("m-user-stopped");
+    expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(active._stopSettlement).toBeUndefined();
+    expect(active._cancelledAutomaticRecoveryIds?.["m-user-stopped"]).toBe(true);
+
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: {
+      ...snapshotDispatch("m-user-stopped"), status: "terminal", outcome: "executed_error", terminalAt: 7,
+    } }) });
+    await snapshotFlush();
+    expect(active._activeClientMessageId).toBeUndefined();
     expect(sock.isSessionBusy("s1")).toBe(false);
 
-    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: snapshotDispatch("m-user-new") }) });
+    ws.onmessage?.({ data: sessionSnapshotFrame("s1", { dispatch: {
+      ...snapshotDispatch("m-user-new"), id: "88888888-8888-4888-8888-888888888888",
+    } }) });
     await snapshotFlush();
     expect(active._activeClientMessageId).toBe("m-user-new");
     expect(sock.isSessionBusy("s1")).toBe(true);
+    expect(active._cancelledAutomaticRecoveryIds?.["m-user-stopped"]).toBe(true);
     sock.stop();
   });
 
