@@ -739,8 +739,22 @@ describe('ModelSelector 最近使用', () => {
     localStorage.clear()
   })
 
-  // C-27:切过同家族不同档位后,「最近」会出现与当前选中同一家族的行且带 ✓,与主列表重复。
-  it('与当前选中同一 Cursor 家族的最近记录不进「最近」分组;其它家族照常', async () => {
+  /** 「最近」分组 = 标签之后、分隔线之前的兄弟节点。 */
+  function recentGroupIds(): string[] {
+    const ids: string[] = []
+    const label = document.querySelector('[data-recent-group="true"]')
+    for (let el = label?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
+      const id = el.getAttribute('data-model-id')
+      if (id) ids.push(id)
+    }
+    return ids
+  }
+  const allRowIds = () =>
+    [...document.querySelectorAll('[role="menuitem"][data-model-id]')].map((el) => el.getAttribute('data-model-id'))
+
+  // C-27 / 体验官 10-29「GPT-6.1-Sol 出现两次」:「最近」里有的不再在下面的全部列表里重复;
+  // 同家族的不同档位并成一行(当前选中的家族也留在「最近」,带 ✓),不再出现两行同名。
+  it('「最近」与全部列表不重复:选中家族并成一行留在「最近」,下面不再列', async () => {
     const GROK_MODELS: PublicModel[] = [
       { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
       { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
@@ -751,17 +765,39 @@ describe('ModelSelector 最近使用', () => {
     render(<ModelSelector models={GROK_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
-    const recentLabel = document.querySelector('[data-recent-group="true"]')
-    expect(recentLabel).toBeTruthy()
-    // 「最近」分组 = 标签之后、分隔线之前的兄弟节点。
-    const recentIds: string[] = []
-    for (let el = recentLabel?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
-      const id = el.getAttribute('data-model-id')
-      if (id) recentIds.push(id)
-    }
-    // 同家族(grok)不出现在最近;glm-5.2 出现。
-    expect(recentIds).toEqual(['glm-5.2'])
     expect(document.querySelectorAll('[data-recent-group="true"]')).toHaveLength(1)
+    const recent = recentGroupIds()
+    expect(recent).toHaveLength(2)
+    expect(recent[1]).toBe('glm-5.2')
+    const all = allRowIds()
+    expect(new Set(all).size).toBe(all.length)
+    expect(all).toContain('deepseek-v4')
+    expect(document.querySelectorAll('[role="menuitem"][data-cursor-family]')).toHaveLength(1)
+  })
+
+  // 体验官 10-29「最近」顺序跳:按目录顺序排,不按使用先后;选来选去顺序不变。
+  it('「最近」按目录顺序排,来回切换不换位', async () => {
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['gpt-6-astra', 'glm-5.2', 'deepseek-v4']))
+    const { unmount } = render(<ModelSelector models={MODELS} selectedId="deepseek-v4" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(recentGroupIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra'])
+    unmount()
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['deepseek-v4', 'gpt-6-astra', 'glm-5.2']))
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(recentGroupIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra'])
+    expect(allRowIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra', 'gpt-5.6-sol'])
+  })
+
+  it('全部模型都在「最近」时不分组,列表照常', async () => {
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['glm-5.2', 'deepseek-v4']))
+    render(<ModelSelector models={MODELS.slice(0, 2)} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-recent-group="true"]')).toBeNull()
+    expect(allRowIds()).toEqual(['glm-5.2', 'deepseek-v4'])
   })
 
   it('选过的模型出现在「最近」分组', async () => {

@@ -352,11 +352,25 @@ export function ModelSelector({
   })()
   const disabled = Boolean(loading || teamEngineActive || (models.length === 0 && lockedModels.length === 0))
   const rows = modelPickerRows(models, lockedModels)
+  // 「最近」(OCV5-150):最近选过的 3 个模型。按目录顺序排,当前选中的也留在里面,并从下面的全部列表里拿掉:
+  // 同一个模型不再出现两次(体验官 10-29「GPT-6.1-Sol 出现两次」;C-27 同家族档位重复),选来选去「最近」也
+  // 不按使用先后来回换位(「顺序跳」)。家族行有任一成员选过就算;锁定行不进。全部模型都在「最近」时不分组。
+  const recentIds = readRecentModels()
+  const recentPicked = rows.filter((row) =>
+    row.kind === 'plain'
+      ? recentIds.includes(row.model.id)
+      : (row.kind === 'cursor-family' || row.kind === 'context-family' || row.kind === 'grok-build-family') &&
+        row.row.members.some((m) => recentIds.includes(m.id)),
+  )
+  const recentRows = recentPicked.length < rows.length ? recentPicked : []
   const {
     visible: visibleRows,
     collapsed: collapsedRows,
     selectedInCollapsed,
-  } = partitionCollapsedRows(rows, selectedId)
+  } = partitionCollapsedRows(
+    rows.filter((row) => !recentRows.includes(row)),
+    selectedId,
+  )
   // 折叠组默认收起;当前选中项落在组内时自动展开,保证选中项永远可见。
   const [collapsedOpen, setCollapsedOpen] = useState(selectedInCollapsed)
   useEffect(() => {
@@ -378,44 +392,6 @@ export function ModelSelector({
   }, [teamEngineActive])
   const showCollapsedGroup = collapsedRows.length > 0
   const [, setRecentTick] = useState(0)
-  const recentRows = (() => {
-    const seen = new Set<string>()
-    const out: typeof rows = []
-    for (const id of readRecentModels()) {
-      if (id === selectedId) continue
-      if (!models.some((m) => m.id === id)) continue
-      if (lockedModels.some((m) => m.id === id)) continue
-      const row = rows.find((item) => {
-        if (item.kind === 'plain') return item.model.id === id
-        if (
-          item.kind === 'cursor-family' ||
-          item.kind === 'context-family' ||
-          item.kind === 'grok-build-family'
-        ) {
-          return item.row.members.some((m) => m.id === id)
-        }
-        return false
-      })
-      if (!row) continue
-      // 与当前选中同一家族的行不进「最近」(C-27):切过同家族不同档位后,主列表里那一行已带 ✓,
-      // 「最近」再出现一次同名同 ✓ 的行只会让人以为是两个模型。
-      if (row.kind === 'cursor-family' && selectedCursor && row.row.family === selectedCursor.family) continue
-      if (row.kind === 'context-family' && selectedContext && row.row.family === selectedContext.family) continue
-      if (row.kind === 'grok-build-family' && isGrokBuildCatalogId(selectedId)) continue
-      const ident =
-        row.kind === 'plain'
-          ? `plain:${row.model.id}`
-          : row.kind === 'cursor-family' ||
-              row.kind === 'context-family' ||
-              row.kind === 'grok-build-family'
-            ? `${row.kind}:${row.row.family}`
-            : `other:${id}`
-      if (seen.has(ident)) continue
-      seen.add(ident)
-      out.push(row)
-    }
-    return out
-  })()
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
