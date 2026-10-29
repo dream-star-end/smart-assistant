@@ -1051,7 +1051,7 @@ describe("Sidebar 归档与批量", () => {
     expect(onLoadArchived).toHaveBeenCalled();
   });
 
-  it("会话更多菜单可归档，也可进入多选并批量操作", () => {
+  it("会话更多菜单可归档，也可进入多选并批量操作", async () => {
     const onArchive = vi.fn();
     const onBatch = vi.fn();
     renderSidebar({
@@ -1066,12 +1066,12 @@ describe("Sidebar 归档与批量", () => {
 
     openSessionMenu("Beta 上线检查");
     fireEvent.click(screen.getByRole("menuitem", { name: "多选" }));
-    expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
+    expect(await screen.findByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
     fireEvent.click(screen.getByRole("button", { name: "归档" }));
     expect(onBatch).toHaveBeenCalledWith(["s-beta"], "archive", undefined);
   });
 
-  it("搜索行常驻「多选」，不依赖行 hover，移动端也能进多选", () => {
+  it("搜索行常驻「多选」，不依赖行 hover，移动端也能进多选", async () => {
     const onBatch = vi.fn();
     renderSidebar({ sessions: listSessions, onBatch });
     const chrome = document.querySelector("[data-product-entry-scope='sidebar-primary']");
@@ -1084,7 +1084,7 @@ describe("Sidebar 归档与批量", () => {
     expect(chrome!.contains(entry)).toBe(true);
     expect(chrome!.contains(screen.getByPlaceholderText("搜索标题或消息"))).toBe(true);
     fireEvent.click(entry);
-    expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 0 条");
+    expect(await screen.findByTestId("sidebar-batch-bar")).toHaveTextContent("已选 0 条");
     expect(screen.getByLabelText("选择 季度复盘 Alpha")).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("选择 Beta 上线检查"));
     expect(screen.getByTestId("sidebar-batch-bar")).toHaveTextContent("已选 1 条");
@@ -1771,7 +1771,7 @@ describe("Sidebar S-08 加载更早会话失败可重试", () => {
 });
 
 describe("Sidebar BB 批量条", () => {
-  it("选中含已归档会话时出现「取消归档」；删除按钮为 danger 语义", () => {
+  it("选中含已归档会话时出现「取消归档」；删除按钮为 danger 语义", async () => {
     localStorage.setItem("oc_v5_sidebar_archived_expanded:u1", "1");
     const onBatch = vi.fn();
     renderSidebar({
@@ -1782,6 +1782,7 @@ describe("Sidebar BB 批量条", () => {
       onBatch,
     });
     fireEvent.click(screen.getByRole("button", { name: "多选" }));
+    await screen.findByTestId("sidebar-batch-bar");
     expect(screen.queryByRole("button", { name: "取消归档" })).toBeNull();
     fireEvent.click(screen.getByLabelText("选择 已收进箱底"));
     fireEvent.click(screen.getByRole("button", { name: "取消归档" }));
@@ -1809,10 +1810,10 @@ describe("Sidebar BB 批量条", () => {
     expect(onSearchMessages.mock.calls[0]![3]).toBe(true);
   });
 
-  it("批量条固定两行：第一行计数 + 取消，第二行操作按钮全部带可访问名称", () => {
+  it("批量条固定两行：第一行计数 + 取消，第二行操作按钮全部带可访问名称", async () => {
     renderSidebar({ sessions: listSessions, onBatch: () => {} });
     fireEvent.click(screen.getByRole("button", { name: "多选" }));
-    const bar = screen.getByTestId("sidebar-batch-bar");
+    const bar = await screen.findByTestId("sidebar-batch-bar");
     expect(bar).toHaveAttribute("role", "toolbar");
     expect(bar.children).toHaveLength(2);
     expect(bar.children[0]).toHaveTextContent("已选 0 条");
@@ -1951,12 +1952,12 @@ describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
     }
   });
 
-  it("多选入口收进搜索行尾部的图标钮，可访问名仍是「多选」", () => {
+  it("多选入口收进搜索行尾部的图标钮，可访问名仍是「多选」", async () => {
     renderSidebar({ sessions: rows, onBatch: () => {} });
     const entry = screen.getByRole("button", { name: "多选" });
     expect(entry.closest("label")?.querySelector("[data-sidebar-search]")).not.toBeNull();
     fireEvent.click(entry);
-    expect(screen.getByTestId("sidebar-batch-bar")).toBeInTheDocument();
+    expect(await screen.findByTestId("sidebar-batch-bar")).toBeInTheDocument();
   });
 
   it("项目内会话带层级引导线；置顶 / 未分组顶层会话不带", () => {

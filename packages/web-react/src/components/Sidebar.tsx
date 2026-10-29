@@ -26,6 +26,8 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  Suspense,
+  lazy,
   useEffect,
   useMemo,
   useRef,
@@ -49,7 +51,6 @@ import type {
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
 import { BrandMark } from "./BrandMark";
 import { ThemeToggle } from "./ThemeToggle";
-import { BatchBar } from "./sidebar/BatchBar";
 import { ProjectRow } from "./sidebar/ProjectRow";
 import { SessionRow } from "./sidebar/SessionRow";
 import { VirtualList } from "./sidebar/VirtualList";
@@ -80,6 +81,9 @@ import {
   IconButton,
   StatusPill,
 } from "./ui";
+
+/** 多选批量条只在进入多选后出现，懒加载，不进首屏（UI-1 用它抵掉本片首屏增量）。 */
+const BatchBar = lazy(() => import("./sidebar/BatchBar").then((m) => ({ default: m.BatchBar })));
 
 /** 空态提示行叠加「新建会话」CTA 后的行高(文字 + gap + 按钮 + 原 py-6 呼吸位)。 */
 const EMPTY_HINT_CTA_HEIGHT = 108;
@@ -1143,6 +1147,7 @@ export function Sidebar({
       </div>
 
       {multiSelect && onBatch && (
+        <Suspense fallback={null}>
         <BatchBar
           count={selectedIds.size}
           projects={orderedProjects}
@@ -1154,6 +1159,7 @@ export function Sidebar({
           }}
           onCancel={clearMulti}
         />
+        </Suspense>
       )}
 
       {/* 会话列表导航语义:读屏用户按 landmark/region 快速跳到会话区(探针:工作区 nav=0)。 */}
