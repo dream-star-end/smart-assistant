@@ -2115,8 +2115,9 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     { ...source.deps, writeMessage: store.write }))).kind !== "final") fail("IDLE_SOURCE_TURN");
   // the proxy's billing finalizer commits a settled row
   await db.query("UPDATE request_finalize_journal SET state='committed' WHERE request_id='box-idle-src'");
-  // the compact fallback request is refused before admission, so egress never has a row for the idle turn
-  if (api.gate({ model: MODEL, stream: true, max_tokens: 64, temperature: 1,
+  // OCV5-660 accepts the historical API default 1; use a nondefault sampler
+  // to keep proving refusal before admission and recovery with no egress row.
+  if (api.gate({ model: MODEL, stream: true, max_tokens: 64, temperature: 0.2,
     messages: [{ role: "user", content: "summarize the conversation" }] }, true) !== "BOX_PARAMETER_UNMAPPED") {
     fail("IDLE_COMPACT_FALLBACK_ADMITTED");
   }
