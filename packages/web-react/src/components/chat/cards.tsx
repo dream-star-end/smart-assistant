@@ -43,6 +43,7 @@ import {
   speechLangFor,
 } from "../../lib/chat/pure";
 import { BRAND } from "../../lib/brand";
+import { STATUS } from "../../lib/ui/statusTone";
 import {
   CONTINUE_PROMPT,
   defaultCollapsed,
@@ -76,6 +77,7 @@ import {
   TooltipProvider,
   useToast,
 } from "../ui";
+import { Notice } from "../ui/Notice";
 import { formatDate } from "../ui/TimeAgo";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
@@ -1187,12 +1189,9 @@ export function AssistantCard({
 
         {/* 终态错误卡：自动免单用温和提示，不把平台 JSON/英文堆栈甩给用户。 */}
         {errorCardHeld ? null : isUserCancelled ? (
-          <output
-            className="mt-2.5 flex items-center gap-2 py-1 text-body text-muted"
-            aria-label="已停止生成"
-          >
-            <Square size={14} className="shrink-0" />
-            <span>已停止生成</span>
+          // UI-3:已停止是本轮末尾的一条时间线提示(实心停止块,不再是像未勾复选框的空心框)。
+          <output className="mt-2.5 block" aria-label="已停止生成">
+            <Notice tone="stopped" title={STATUS.stopped.label} />
           </output>
         ) : recoveredStep && sem.automaticRecovery === true ? (
           // OCV5-390: an error the platform retries by itself and that the turn got past is not the

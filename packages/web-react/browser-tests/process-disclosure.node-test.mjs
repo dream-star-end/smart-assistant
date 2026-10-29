@@ -356,15 +356,19 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(await attentionProcess.getByText(/步未成功/).count(), 0);
       assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
       await attentionGroup.click();
-      const failed = attentionProcess.getByTestId("tool-step").filter({ hasText: "未成功" });
+      // UI-3:步骤行是人话标题 + 安静的「未成功」;命令和输出在点开后的「技术详情」(原工具卡)里。
+      const failed = attentionProcess.getByTestId("process-step-row").filter({ hasText: "未成功" });
       assert.equal(await failed.count(), 1);
       const quiet = failed.getByText("未成功", { exact: true });
       await quiet.waitFor();
       assert.equal(await quiet.evaluate((node) => node.classList.contains("text-faint")), true);
       assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
-      const failedToggle = failed.getByRole("button").first();
+      const stepToggle = failed.getByRole("button").first();
+      if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.click();
+      const failedToggle = failed.getByTestId("tool-step").getByRole("button").first();
       if (await failedToggle.getAttribute("aria-expanded") !== "true") await failedToggle.click();
-      const failedOutput = failed.locator("pre");
+      assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
+      const failedOutput = failed.getByTestId("tool-step").locator("pre");
       assert.equal(await failedOutput.count(), 1);
       await failedOutput.waitFor({ state: "visible" });
       assert.ok((await failedOutput.textContent()).split("\n").includes("probe-error-detail"));
@@ -662,7 +666,7 @@ test("live status is single and readable in both themes and accessibility media"
           assert.equal(await group.count(), 1);
           if (await group.getAttribute("aria-expanded") !== "true") await group.tap();
           assert.equal(await shell.getByTestId("process-details").locator(".oc-live-status-shine").count(), 0, "tool/internal rows never duplicate shimmer");
-          const tool = shell.getByTestId("tool-step").filter({ hasText: "STILL_RUNNING_FILE" });
+          const tool = shell.getByTestId("process-step-row").filter({ hasText: "STILL_RUNNING_FILE" });
           assert.equal(await tool.count(), 1);
           const header = tool.getByRole("button");
           assert.equal(await header.count(), 1);

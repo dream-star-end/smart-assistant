@@ -58,14 +58,13 @@ async function bundle(assetDir) {
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, readdirSync(cssDir).find((n) => n.endsWith(".css")))));
 }
 
-/** Label + right-hand meta of every visible step row, in order. */
+/** Title + right-hand meta of every visible step row, in order (UI-3: the row's 技术详情 is open, so text has the command). */
 function steps(page) {
-  return page.locator("[data-testid='tool-step'], [data-testid='thinking-step']").evaluateAll((rows) => rows.map((row) => {
-    const header = row.querySelector("button, div");
+  return page.locator("[data-testid='process-step-row']").evaluateAll((rows) => rows.map((row) => {
     const duration = row.querySelector("[data-testid='step-duration']");
     return {
-      kind: row.getAttribute("data-testid"),
-      text: (header?.textContent ?? "").replace(/\s+/g, " ").trim(),
+      kind: row.querySelector("[data-testid='thinking-step']") ? "thinking-step" : "tool-step",
+      text: (row.textContent ?? "").replace(/\s+/g, " ").trim(),
       duration: duration?.textContent ?? null,
       running: duration?.getAttribute("data-step-running") ?? null,
       title: duration?.getAttribute("title") ?? null,
@@ -79,7 +78,11 @@ async function expandAll(page) {
   for (const toggle of await page.getByTestId("process-detail-toggle").all()) {
     if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
   }
-  await page.locator("[data-testid='tool-step']").first().waitFor();
+  await page.locator("[data-testid='process-step-row']").first().waitFor();
+  for (const row of await page.getByTestId("process-step-row").all()) {
+    const toggle = row.getByRole("button").first();
+    if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+  }
 }
 
 test("OCV5-367: process steps show elapsed time instead of token totals", { timeout: 180000 }, async (t) => {

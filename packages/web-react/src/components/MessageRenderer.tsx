@@ -11,7 +11,7 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections, promptShadowedToolIds } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -24,7 +24,6 @@ import {
   useState,
 } from "react";
 import {
-  isRetryingTurnStatus,
   type ChatMessage,
   type LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
@@ -1040,7 +1039,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
 function processTimeBounds(
   items: readonly RenderItem[],
   process: RenderItem,
-): { startedAt: number | null; endedAt: number | null } {
+): { startedAt: number | null; endedAt: number | null; next?: ChatMessage } {
   const index = items.indexOf(process);
   const time = (value: unknown) =>
     typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
@@ -1049,6 +1048,7 @@ function processTimeBounds(
   return {
     startedAt: before && !before._liveUnit ? time(before.completedAt) ?? time(before.ts) : null,
     endedAt: after && after.role !== "user" && !after._liveUnit ? time(after.ts) : null,
+    next: after,
   };
 }
 
@@ -1517,18 +1517,6 @@ function turnHasVisibleWork(
     if (message && isPlatedAssistantMessage(message)) return true;
   }
   return false;
-}
-
-/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
-function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
-  if (!info) return false;
-  if (info.recoveryStatus?.kind === "stopping") return true;
-  if (isRetryingTurnStatus(info.turnStatus)) return true;
-  const status = info.turnStatus;
-  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
-    return true;
-  }
-  return !!info.leaderStep;
 }
 
 export function MessageList({
@@ -2725,6 +2713,7 @@ export function MessageList({
             needle,
             bounds.startedAt ?? "",
             bounds.endedAt ?? "",
+            turnOutcome(bounds.next),
             ...sections.map((section) => disclosureValues[`detail:${section.key}`] === true ? 1 : 0),
             ...it.items.map(leafMemoKey),
           ].join("\u0001")}
@@ -2746,10 +2735,9 @@ export function MessageList({
           keyOf={renderItemKey}
           messagesOf={itemMessages}
           olderSteps={olderSteps}
-          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
-          lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
-          turnStartedAt={it.active ? turnActivity?.startedAt ?? bounds.startedAt : bounds.startedAt}
-          turnEndedAt={bounds.endedAt}
+          activity={it.active ? turnActivity : null}
+          bounds={bounds}
+          tokenUsageOf={(item) => ("tokenUsage" in item ? item.tokenUsage : undefined)}
         />
         </ProcessGroupMemo>
       );

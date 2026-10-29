@@ -689,15 +689,19 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(await attentionProcess.getByText(/步未成功/).count(), 0);
       assert.equal(await desktop.page.getByText("node scripts/check-available.mjs").count(), 0);
       await attentionGroup.click();
-      const failed = attentionProcess.getByTestId("tool-step").filter({ hasText: "未成功" });
+      // UI-3:步骤行是人话标题 + 安静的「未成功」;命令和输出在点开后的「技术详情」(原工具卡)里。
+      const failed = attentionProcess.getByTestId("process-step-row").filter({ hasText: "未成功" });
       assert.equal(await failed.count(), 1);
       const quiet = failed.getByText("未成功", { exact: true });
       await quiet.waitFor();
       assert.equal(await quiet.evaluate((node) => node.classList.contains("text-faint")), true);
       assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
-      const failedToggle = failed.getByRole("button").first();
+      const stepToggle = failed.getByRole("button").first();
+      if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.click();
+      const failedToggle = failed.getByTestId("tool-step").getByRole("button").first();
       if (await failedToggle.getAttribute("aria-expanded") !== "true") await failedToggle.click();
-      const failedOutput = failed.locator("pre");
+      assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
+      const failedOutput = failed.getByTestId("tool-step").locator("pre");
       assert.equal(await failedOutput.count(), 1);
       await failedOutput.waitFor({ state: "visible" });
       assert.ok((await failedOutput.textContent()).split("\n").includes("南仓对账没有通过，看板先不发布。"));

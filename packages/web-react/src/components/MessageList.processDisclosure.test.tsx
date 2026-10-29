@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
-import { operationSummary } from "./chat/ProcessDisclosure";
+import { workSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
@@ -47,6 +47,9 @@ function renderList(
 function expandAllProcess() {
   fireEvent.click(screen.getByTestId("process-toggle"));
   for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  // UI-3:「准备工作 N 步」和每一步的「技术详情」也点开,原卡(命令、输出入口)才渲染。
+  for (const prep of screen.queryAllByTestId("process-prep")) fireEvent.click(within(prep).getAllByRole("button")[0]!);
+  for (const step of screen.queryAllByTestId("process-step-row")) fireEvent.click(within(step).getAllByRole("button")[0]!);
 }
 
 function settledTurn(): ChatMessage[] {
@@ -1804,8 +1807,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(summaries[0]!.className).toContain("text-faint");
     expect(summaries[1]!.getAttribute("data-live-working")).toBe("true");
     expect(summaries[1]!.className).toContain("oc-live-status-shine");
-    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
-    expect(screen.getByTestId("process-step-live").className).toContain("text-faint");
+    // UI-3:展开时唯一的运行状态行就是在干活的那一段;外壳只留「处理中」和计时。
+    expect(summaries[1]).toContainElement(screen.getByTestId("process-step-live"));
+    expect(screen.getByTestId("process-title")).toHaveTextContent("处理中");
     expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
 
     fireEvent.click(screen.getByTestId("process-toggle"));
@@ -2274,6 +2278,10 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    // UI-3:步骤行是人话标题,原始命令收在点开后的「技术详情」里。
+    expect(screen.getByTestId("process-step-row")).toHaveTextContent("等待子任务完成");
+    expect(screen.queryByTestId("process-raw-command")).not.toBeInTheDocument();
+    fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
     expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/dlgjob/);
 
@@ -2291,26 +2299,46 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("等待子任务完成");
     expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/\/bin\/bash|dlgjob/);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    fireEvent.click(within(screen.getByTestId("process-step-row")).getAllByRole("button")[0]!);
     expect(screen.getByTestId("process-raw-command").textContent ?? "").toBe(wrapped);
   });
 
-  test("命令计数看工具名或命令首词，不扫参数里的子串", () => {
-    expect(operationSummary([
+  test("UI-3 人话摘要：按工具类别或命令首词归类，不扫参数；思考、准备工作、目标不算；最多三类", () => {
+    expect(workSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo complicated-catalog" } }),
-    ])).toBe("命令 1 项");
-    expect(operationSummary([
+    ])).toBe("运行了 1 条命令");
+    expect(workSummary([
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "cat /tmp/a" } }),
-    ])).toBe("读取 1 项");
-    expect(operationSummary([
+    ])).toBe("读了 1 个文件");
+    expect(workSummary([
       row("t", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/tmp/a" } }),
-    ])).toBe("读取 1 项");
-    expect(operationSummary([
+    ])).toBe("读了 1 个文件");
+    expect(workSummary([
       row("g", "goal", "库存目标", { cleared: true, goalStatus: "cleared" }),
       row("t", "tool", "终端", { toolName: "Bash", inputJson: { command: "echo keep" } }),
-    ])).toBe("命令 1 项");
-    expect(operationSummary([
-      row("g", "goal", "做完的目标", { goalStatus: "completed" }),
-    ])).toBe("目标 1 项");
+    ])).toBe("运行了 1 条命令");
+    expect(workSummary([row("g", "goal", "做完的目标", { goalStatus: "completed" })])).toBe("");
+    // 查技能、平台自检、--help 是准备工作,思考也不进摘要。
+    expect(workSummary([
+      row("s", "tool", "查看技能", { toolName: "mcp__openclaude-memory__skill_view", inputJson: { name: "coding-suite" } }),
+      row("p", "tool", "终端", { toolName: "Bash", inputJson: { command: "/run/oc/platform/current/bin/oc-system status" } }),
+      row("h", "tool", "终端", { toolName: "Bash", inputJson: { command: "oc-browser --help" } }),
+      row("th", "thinking", "Planning the timer controls"),
+      row("w", "tool", "写入", { toolName: "Write", inputJson: { file_path: "/w/纪要.docx", content: "x" } }),
+    ])).toBe("写了 1 个文件");
+    // 委派命令和它的子任务卡是同一件事,不重复数。
+    expect(workSummary([
+      row("d", "tool", "终端", { toolName: "Bash", inputJson: { command: "oc-memory delegate --goal 写计时器" } }),
+      row("ag", "agent-group", "写计时器", { _delegate: true }),
+    ])).toBe("派出 1 个子任务");
+    // 最多三类,次数多的在前。
+    expect(workSummary([
+      row("r1", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/a" } }),
+      row("c1", "tool", "终端", { toolName: "Bash", inputJson: { command: "ls" } }),
+      row("r2", "tool", "读取", { toolName: "Read", inputJson: { file_path: "/b" } }),
+      row("e1", "tool", "编辑", { toolName: "Edit", inputJson: { file_path: "/a" } }),
+      row("g1", "tool", "搜索", { toolName: "WebSearch", inputJson: { query: "q" } }),
+    ])).toBe("读了 2 个文件、运行了 1 条命令、写了 1 个文件");
   });
 
   test("已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在", () => {
@@ -2608,8 +2636,72 @@ test("OCV5-525: hidden next tail leaves the task summary visible outside the ste
   expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
 });
 
-// OCV5-640：同一轮聊天写「已执行 28 个步骤」、右栏写「17 步」。两处都只数工具调用；思考 / 子任务只进分类小计。
-test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只数工具调用", () => {
+// UI-3（体验官 C1/C2/C4）：过程默认是一行人话；展开后每步是「动词 + 对象」，命令、技能 ID、任务 ID、
+// 英文思考小标题只在点开那一步的「技术详情」里；查技能 / 平台自检 / --help 归成「准备工作 N 步」。
+test("UI-3 步骤行说人话，技术信息收进技术详情，底层步骤并成准备工作", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "做一个番茄钟", { status: "replied", ts: 1_700_000_000_000 }),
+    row("sk", "tool", "查看技能", { ...owner, toolName: "mcp__openclaude-memory__skill_view", inputJson: { name: "coding-suite" }, _completed: true, output: "x" }),
+    row("sys", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "/run/oc/platform/current/bin/oc-system status" }, _completed: true, output: "ok" }),
+    row("th", "thinking", "**Planning the timer controls**\n\n先想按钮。", { ...owner }),
+    row("py", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "python - <<'PY'\nprint(1)\nPY" }, _completed: true, output: "1" }),
+    row("rd", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "/home/agent/.openclaude/uploads/周会记录.txt" }, _completed: true, output: "notes" }),
+    row("bad", "tool", "读取", { ...owner, toolName: "Read", inputJson: { file_path: "/w/missing.txt" }, _completed: true, error: true, output: "File does not exist." }),
+    row("a1", "assistant", "做好了。", { ...owner, ts: 1_700_000_402_000 }),
+  ]);
+  // 历史轮外壳:结局 + 人话摘要 + 用时;附件和文件分开说;准备工作、思考不进摘要。
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令、读了 1 个附件、读了 1 个文件");
+  expect(screen.getByTestId("process-meta")).toHaveTextContent("6 分 42 秒");
+  expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+  const titles = screen.getAllByTestId("process-step-row").map((node) => node.querySelector("button span")?.textContent);
+  expect(titles).toEqual(["思考", "运行命令", "读取 周会记录.txt", "读取 missing.txt"]);
+  expect(screen.getByTestId("process-prep")).toHaveTextContent("准备工作 2 步");
+  // 默认视图里没有命令、技能 ID、英文思考标题;失败的那一步写原因。
+  const rail = screen.getByTestId("process-stages");
+  expect(rail.textContent ?? "").not.toMatch(/<<'PY'|oc-system|coding-suite|Planning the timer/);
+  expect(screen.getByTestId("process-step-reason")).toHaveTextContent("File does not exist.");
+  // 点开一步才出现技术详情(原卡,命令原样);耗时不在技术详情里重复。
+  fireEvent.click(within(screen.getAllByTestId("process-step-row")[1]!).getAllByRole("button")[0]!);
+  const tech = screen.getByTestId("process-step-tech");
+  expect(tech).toHaveTextContent("技术详情");
+  expect(tech.textContent ?? "").toContain("python - <<'PY'");
+  expect(within(tech).queryByTestId("step-duration")).toBeNull();
+  fireEvent.click(within(screen.getByTestId("process-prep")).getAllByRole("button")[0]!);
+  expect(within(screen.getByTestId("process-prep")).getAllByTestId("process-step-row")).toHaveLength(2);
+});
+
+test("UI-3 停止的一轮外壳不写「完成」", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "跑一下", { status: "replied" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+    row("a1", "assistant", "", { ...owner, error: true, _errorCode: "stopped" }),
+  ]);
+  expect(screen.getByTestId("process-title")).toHaveTextContent("已停止 · 运行了 1 条命令");
+  expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/完成/);
+  expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "stopped");
+  expect(screen.getAllByRole("status", { name: "已停止生成" })).toHaveLength(1);
+});
+
+test("UI-3 重试等阶段由 TurnActivity 一行说，过程外壳不再挂第二行「正在…」", () => {
+  const owner = { _clientMessageId: "u1" };
+  renderList([
+    row("u1", "user", "跑一下", { status: "sent" }),
+    row("c1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "ls" }, _completed: true, output: "a" }),
+  ], {
+    sending: true,
+    turnActivity: { startedAt: Date.now() - 5_000, agentName: "主助手", turnStatus: { kind: "retrying", attempt: 1, max: 3, retryAt: Date.now() + 1_000 } },
+  });
+  expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+  expect(screen.getByTestId("turn-activity-footer")).toHaveTextContent(/重试/);
+});
+
+// OCV5-640：同一轮聊天写「已执行 28 个步骤」、右栏写「17 步」。UI-3 起过程条不再写步数(TurnSummary 是人话摘要 + 用时),
+// 两处不会再对不上;右栏的步数口径不变。
+test("过程条写人话摘要而不是步数，右栏本轮步数口径不变", () => {
   const messages = [
     row("u1", "user", "核对库存", { status: "replied" }),
     row("think-1", "thinking", "先看目录", { _clientMessageId: "u1" }),
@@ -2640,9 +2732,7 @@ test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只�
   renderList(messages);
   const panelSteps = collectPaneSteps(messages).turns[0]?.steps.length;
   expect(panelSteps).toBe(2);
-  expect(screen.getByTestId("process-title")).toHaveTextContent(`已执行 ${panelSteps} 个步骤`);
-  // 思考和子任务没有消失，仍在分类小计里。
-  const tally = screen.getByTestId("process-tally");
-  expect(within(tally).getByTitle("思考 3")).toBeInTheDocument();
-  expect(within(tally).getByTitle("子任务 1")).toBeInTheDocument();
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令、派出 1 个子任务、读了 1 个文件");
+  expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/步/);
+  expect(screen.queryByTestId("process-tally")).not.toBeInTheDocument();
 });

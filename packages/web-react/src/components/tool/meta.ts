@@ -691,6 +691,28 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
   return mcpSummary(mcp.server, mcp.op, input).slice(0, 80);
 }
 
+const FILE_STEP_VERB: Record<string, string> = { 读取文件: "读取", 写入文件: "写入", 编辑文件: "修改", 笔记本: "编辑" };
+/** 摘要是正则、命令或代码的标签:标题只留动词。 */
+const NO_OBJECT_LABELS = new Set(["搜索内容", "搜索文件", "执行命令", "执行脚本", "执行代码", "等待输出"]);
+
+/**
+ * UI-3 过程时间轴里一步的人话标题「动词 + 对象」。命令、目录、技能 / 任务 ID、内部操作名都不进标题,
+ * 只在这一步的「技术详情」(原工具卡)里。对象不是人话就只留动词,绝不回落到原始命令。
+ */
+export function humanStepTitle(name: string, input: Record<string, unknown> | null): string {
+  const label = resolveToolMeta(name, input).label;
+  if (label === "终端") return "运行命令";
+  if (label === "等待委派") return "等待子任务完成";
+  if (!/[^\x00-\x7F]/.test(label)) return "调用工具";
+  let object = NO_OBJECT_LABELS.has(label) ? "" : toolSummary(name, input).trim();
+  const verb = FILE_STEP_VERB[label];
+  if (verb) return object ? `${verb} ${object.replace(/^.*\//, "")}` : label;
+  if (/^https?:\/\//.test(object)) object = displayDomain(object);
+  // 纯 ASCII、无空格、也不像文件名或域名的(技能 ID、任务 ID、蛇形操作名、`--help`)不是人话。
+  if (!/[^\x00-\x7F]|\s|\.[a-z]{2,5}$/i.test(object)) object = "";
+  return object ? `${label} ${object}` : label;
+}
+
 /** MCP per-server 摘要（端口自 `_mcpSummary`，去 codex）。 */
 function mcpSummary(server: string, op: string, input: Record<string, unknown>): string {
   if (!input) return "";

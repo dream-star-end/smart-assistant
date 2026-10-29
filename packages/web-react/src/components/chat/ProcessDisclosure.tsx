@@ -2,7 +2,6 @@ import {
   Bot,
   ChevronRight,
   Brain,
-  Check,
   ChevronDown,
   Circle,
   FileText,
@@ -20,19 +19,22 @@ import {
   Wrench,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import type { ChatMessage } from "../../lib/chat/model";
+import { type ChatMessage, isRetryingTurnStatus } from "../../lib/chat/model";
+import { STATUS } from "../../lib/ui/statusTone";
 import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
 import { type CardCallbacks, ProgressiveMarkdown, RecoveredStepContext } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
-import { detectOcCli, resolveToolMeta } from "../tool/meta";
+import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { ProcessStepContext } from "./processStep";
-import { StepTimingContext } from "./stepDuration";
+import { StepMetaBadge, StepTimingContext } from "./stepDuration";
+import type { DisplayTokenUsage } from "./tokenUsage";
+import type { TurnActivityInfo } from "./TurnActivity";
 import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn } from "../../lib/utils";
-import { isPaneStep, toolChangedFileCount } from "./workPane";
+import { toolChangedFileCount } from "./workPane";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -563,16 +565,98 @@ function countLabel(message: ChatMessage): string {
   return "";
 }
 
-export function operationSummary(messages: readonly ChatMessage[]): string {
+// ── UI-3 人话摘要 ────────────────────────────────────────────────────────────
+// 摘要只说用户关心的几类事(读 / 写 / 命令 / 搜索 / 子任务 / 附件),按次数取前三类;思考、问答和
+// 「准备工作」(查技能、查工具、记忆、任务列表、平台自检、--help、读技能说明)不进摘要。
+
+const PREP_LABELS = new Set([
+  "查看技能", "技能列表", "技能检索", "启用技能", "查找工具", "任务列表", "记忆", "核心记忆", "记忆检索", "记忆更新",
+  "历史检索", "归档检索", "MCP 资源列表", "MCP 资源模板",
+]);
+
+const COUNT_KIND: Record<string, string> = { 读取: "read", 编辑: "write", 搜索: "search", 命令: "cmd", 工具: "other" };
+
+const KIND_PHRASE: Record<string, (n: number) => string> = {
+  read: (n) => `读了 ${n} 个文件`,
+  attach: (n) => `读了 ${n} 个附件`,
+  write: (n) => `写了 ${n} 个文件`,
+  cmd: (n) => `运行了 ${n} 条命令`,
+  search: (n) => `搜索了 ${n} 次`,
+  sub: (n) => `派出 ${n} 个子任务`,
+  other: (n) => `调用了 ${n} 次工具`,
+};
+
+function workKind(message: ChatMessage): string {
+  if (message.role === "agent-group" || message.role === "delegate-progress") return "sub";
+  if (message.role === "thinking") return "think";
+  if (message.role !== "tool" || PROMPT_CARD_TOOLS.has(message.toolName ?? "")) return "";
+  try {
+    const display = normalizeToolForDisplay(message);
+    const label = resolveToolMeta(display.name, display.input).label;
+    const head = reliableHeadCall(stripShellWrapperForDisplay(commandOf(display.input)));
+    const path = String(display.input?.file_path ?? "");
+    if (PREP_LABELS.has(label) || head?.bin === "oc-system" || /^(?:-h|--help|help)$/.test(head?.op ?? "") || /\/skills\/.*SKILL\.md$/i.test(path)) {
+      return "prep";
+    }
+    if (/^(?:委[派托]|并行委派|子任务$)/.test(label)) return "call";
+    if (label === "写入文件") return "write";
+    // 用户上传的附件单独说:没发附件时,「读了 1 个文件」不能被读成读了附件。
+    if (path.includes("/.openclaude/uploads/")) return "attach";
+    // 其余按工具名或命令首词归类(cat 是读、rg 是搜),不扫参数。
+    return COUNT_KIND[countLabel(message)] ?? "";
+  } catch {
+    return "other";
+  }
+}
+
+/** 「读了 6 个文件、派出 1 个子任务、写了 1 个文件」。没有可说的事返回空串。 */
+export function workSummary(messages: readonly ChatMessage[]): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
-    if (isClearedGoalRecord(message)) continue;
-    const label = countLabel(message);
-    if (!label) continue;
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+    const kind = workKind(message);
+    if (kind) counts.set(kind, (counts.get(kind) ?? 0) + 1);
   }
-  if (counts.size === 0) return "执行记录";
-  return [...counts].map(([label, count]) => `${label} ${count} 项`).join(" · ");
+  // 委派调用和子任务卡常是同一件事:取两者较大的那个,不重复数。
+  const calls = counts.get("call") ?? 0;
+  if (calls > (counts.get("sub") ?? 0)) counts.set("sub", calls);
+  return [...counts]
+    .filter(([kind]) => KIND_PHRASE[kind])
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([kind, n]) => KIND_PHRASE[kind]!(n))
+    .join("、");
+}
+
+/** 一段步骤的摘要行:有事说事;只有思考 / 准备工作时直说。 */
+function groupSummary(messages: readonly ChatMessage[]): string {
+  const said = workSummary(messages);
+  if (said) return said;
+  const thoughts = messages.filter((message) => message.role === "thinking").length;
+  if (thoughts) return thoughts > 1 ? `思考 ${thoughts} 次` : "思考";
+  const prep = messages.filter((message) => workKind(message) === "prep").length;
+  return prep ? `准备工作 ${prep} 步` : "执行记录";
+}
+
+/**
+ * 重试、停止、引擎启动、压缩、等你确认、队长步骤:这些阶段由 TurnActivity 说(B4-SPEC §3.4 唯一的
+ * 阶段来源),时间线底部单独一行。那时过程外壳不再挂自己的「正在…」,同一时刻只有一行运行状态。
+ */
+export function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
+  if (!info) return false;
+  if (info.recoveryStatus?.kind === "stopping") return true;
+  if (isRetryingTurnStatus(info.turnStatus)) return true;
+  const status = info.turnStatus;
+  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
+    return true;
+  }
+  return !!info.leaderStep;
+}
+
+/** 本轮怎么收的尾:过程之后的那一行是停止 / 错误时,外壳不能写「完成」(与下面的提示自相矛盾)。 */
+export function turnOutcome(next: ChatMessage | undefined): "done" | "stopped" | "failed" {
+  if (next?.role !== "assistant" || !hasErrorMark(next)) return "done";
+  const code = String(next._errorCode ?? "").toLowerCase();
+  return code === "stopped" || code === "user_cancelled" ? "stopped" : "failed";
 }
 
 export type ProcessSection<T> = {
@@ -826,7 +910,7 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
 // 点开才看输出。「正在做什么」由外壳标题(动作 + 计时)和当前段节点的运行光晕表达。
 // 状态色只给运行中 / 未成功 / 受阻。
 
-type NodeTone = "live" | "error" | "warning" | "idle";
+type NodeTone = "live" | "warning" | "idle";
 
 const KIND_ICON: Record<string, LucideIcon> = {
   命令: Terminal,
@@ -879,7 +963,6 @@ function stepNode(messages: readonly ChatMessage[], live: boolean): { Icon: Luci
 
 const NODE_TONE: Record<NodeTone, string> = {
   live: "oc-step-node-live text-accent ring-accent/45",
-  error: "text-danger ring-danger/35 bg-[color-mix(in_srgb,var(--danger)_9%,var(--bg))]",
   warning: "text-warning ring-warning/40 bg-[color-mix(in_srgb,var(--warning)_10%,var(--bg))]",
   idle: "text-faint ring-border",
 };
@@ -897,8 +980,8 @@ function StepNode({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
   );
 }
 
-/** 运行中的外壳标志:一圈慢转的弧光 + 呼吸的中心点;结束后换成安静的对勾。 */
-function ShellGlyph({ active }: { active: boolean }) {
+/** 运行中的外壳标志:一圈慢转的弧光 + 呼吸的中心点;结束后是状态表里这一结局的安静图标(勾 / 停止块 / 叹号)。 */
+function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "stopped" | "failed" }) {
   if (active) {
     return (
       <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-6 shrink-0 items-center justify-center">
@@ -906,14 +989,55 @@ function ShellGlyph({ active }: { active: boolean }) {
       </span>
     );
   }
+  const { icon: Icon, filled } = STATUS[outcome];
   return (
     <span
       aria-hidden
       data-testid="process-glyph-done"
+      data-outcome={outcome}
       className="flex size-6 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
     >
-      <Check size={13} strokeWidth={2.25} />
+      {Icon ? <Icon size={13} strokeWidth={2.25} fill={filled ? "currentColor" : "none"} /> : null}
     </span>
+  );
+}
+
+/** 技术详情里的原卡不再挂耗时(标题行已经挂了一份)。 */
+const NO_TIMINGS = new Map<string, never>();
+
+/**
+ * UI-3 点开才看的一行:时间轴里的一步(人话标题 + 未成功 + 耗时,点开是「技术详情」)和「准备工作 N 步」。
+ * below 不论开合都挂在标题下面(未成功的原因)。
+ */
+function Fold({ testId, head, meta, below, children }: {
+  testId: string;
+  head: ReactNode;
+  meta?: ReactNode;
+  below?: ReactNode;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div data-testid={testId} className="min-w-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className="group/step -mx-2 flex min-h-9 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+      >
+        {head}
+        <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+          {meta}
+          <ChevronRight
+            size={14}
+            aria-hidden
+            className={`text-faint transition-transform duration-200 ${open ? "rotate-90" : "opacity-0 group-hover/step:opacity-100 group-focus-visible/step:opacity-100 [@media(hover:none)]:opacity-100"}`}
+          />
+        </span>
+      </button>
+      {below}
+      {open ? children : null}
+    </div>
   );
 }
 
@@ -988,31 +1112,6 @@ function completedToolsSince(messages: readonly ChatMessage[]): number | null {
   return latest;
 }
 
-// 与右栏「N 步」同口径(OCV5-640):只数工具调用。以前思考、计划、子任务也各算一步,同一轮聊天写
-// 「已执行 28 个步骤」、面板写「17 步」;那些种类仍在分类小计里露出。
-function stepItemCount<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): number {
-  let count = 0;
-  for (const section of sections) {
-    if (section.narrative) continue;
-    for (const item of section.items) count += messagesOf(item).filter(isPaneStep).length;
-  }
-  return count;
-}
-
-function kindTally<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): [string, number][] {
-  const counts = new Map<string, number>();
-  for (const section of sections) {
-    if (section.narrative) continue;
-    for (const item of section.items) {
-      const head = firstCounted(messagesOf(item));
-      if (!head) continue;
-      const label = countLabel(head);
-      counts.set(label, (counts.get(label) ?? 0) + 1);
-    }
-  }
-  return [...counts].sort((a, b) => b[1] - a[1]);
-}
-
 /** Only a thinking row proves thinking; silence is waiting for a model response. */
 function shellLivePhrase<T>(
   sections: readonly ProcessSection<T>[],
@@ -1026,34 +1125,6 @@ function shellLivePhrase<T>(
   if (!status.text) return { text: "正在处理", pending: true };
   if (status.pending) return status;
   return { text: "等待模型响应", pending: true };
-}
-
-const KIND_PHRASE: Record<string, (n: number) => string> = {
-  命令: (n) => `运行 ${n} 条命令`,
-  读取: (n) => `读取 ${n} 个文件`,
-  编辑: (n) => `编辑 ${n} 处`,
-  搜索: (n) => `搜索 ${n} 次`,
-  工具: (n) => `调用 ${n} 次工具`,
-  思考: (n) => (n > 1 ? `思考 ${n} 次` : "思考"),
-  计划: (n) => (n > 1 ? `更新 ${n} 次计划` : "更新计划"),
-  目标: (n) => `${n} 条目标记录`,
-  子任务: (n) => `${n} 个子任务`,
-  问答: (n) => `${n} 次问答`,
-  授权: (n) => `${n} 次授权`,
-  计划确认: (n) => `${n} 次计划确认`,
-};
-
-/** 一段步骤的人话摘要:「运行 7 条命令，读取 1 个文件」。按出现先后排,同类合并。 */
-export function naturalSummary(items: readonly (readonly ChatMessage[])[]): string {
-  const counts = new Map<string, number>();
-  for (const rows of items) {
-    const head = firstCounted(rows);
-    if (!head) continue;
-    const label = countLabel(head);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
-  }
-  if (counts.size === 0) return "执行记录";
-  return [...counts].map(([label, n]) => (KIND_PHRASE[label] ?? ((k: number) => `${label} ${k} 项`))(n)).join("，");
 }
 
 /** 一段的节点:段里有在跑的就是运行态;图标取段内最多的那类。未成功在摘要行右侧单独标出,不把整段染红。 */
@@ -1139,10 +1210,9 @@ export function ProcessDisclosure<T>({
   keyOf,
   messagesOf,
   olderSteps,
-  startedAt,
-  lastFrameAt,
-  turnStartedAt,
-  turnEndedAt,
+  activity,
+  bounds,
+  tokenUsageOf,
 }: {
   sections: ProcessSection<T>[];
   onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
@@ -1156,19 +1226,24 @@ export function ProcessDisclosure<T>({
   messagesOf: (item: T) => ChatMessage[];
   /** Unloaded earlier steps of this same turn. Stays inside the shell. */
   olderSteps?: ReactNode;
-  /** 本轮活动起点(TurnActivity.startedAt)。只用于进行中的计时,缺省则不显示时长。 */
-  startedAt?: number | null;
   /**
-   * 本会话最近一帧到达浏览器的时刻(会话级 _lastFrameAt)。只用于进行中的「静默多久」判断:
-   * 叙述段写完后迟迟没有下一步时,在时间轴末尾挂一行「等待模型响应」;工具长时间运行时在
-   * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
+   * 进行中这一轮的活动快照(只在 active 时给)。startedAt 用于计时;lastFrameAt(最近一帧到达浏览器)
+   * 只用于「静默多久」:叙述段写完后迟迟没有下一步时挂「等待模型响应」,工具长时间运行时在摘要行旁
+   * 显示已运行时长。缺省(历史轮、单测)则都不出现。
    */
-  lastFrameAt?: number | null;
-  /** OCV5-367: 本轮起点(进行中 = 本轮活动起点;历史 = 本轮用户消息时刻),首步耗时从这里算。 */
-  turnStartedAt?: number | null;
-  /** OCV5-367: 过程之后第一行(本轮回答)的到达时刻,末步没有自身终点时以它收尾。 */
-  turnEndedAt?: number | null;
+  activity?: TurnActivityInfo | null;
+  /**
+   * OCV5-367 本轮的时间边界:startedAt = 本轮用户消息时刻(首步耗时从这里算),endedAt = 过程之后第一行
+   * (本轮回答)的到达时刻(末步没有自身终点时以它收尾);next = 那一行本身,用来判断本轮怎么收的尾。
+   */
+  bounds?: { startedAt: number | null; endedAt: number | null; next?: ChatMessage };
+  /** 一步所在模型调用的 token 用量,只进耗时的悬停说明。 */
+  tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
 }) {
+  const startedAt = activity?.startedAt ?? null;
+  const lastFrameAt = activity?.lastFrameAt ?? null;
+  const turnStartedAt = startedAt ?? bounds?.startedAt ?? null;
+  const turnEndedAt = bounds?.endedAt ?? null;
   const messages = sections.flatMap((section) => section.messages);
   // OCV5-367: 每一步的耗时(自上一步结束到本步结束)。按值签名缓存,数值不变时 Map 引用不变,
   // 步骤行(在 memo 边界之下读 context)不会被每一帧无谓重渲。
@@ -1177,7 +1252,6 @@ export function ProcessDisclosure<T>({
   const timingsRef = useRef<{ sig: string; map: typeof computedTimings } | null>(null);
   if (timingsRef.current?.sig !== timingsSig) timingsRef.current = { sig: timingsSig, map: computedTimings };
   const stepTimings = timingsRef.current.map;
-  const summary = operationSummary(messages);
   // Cleared/completed goals are diagnostics, not a new step. They must not
   // take the current-stage identity from the work still in progress.
   let currentIndex = -1;
@@ -1187,8 +1261,6 @@ export function ProcessDisclosure<T>({
       break;
     }
   }
-  const steps = stepItemCount(sections, messagesOf);
-  const tally = kindTally(sections, messagesOf);
   // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
   // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
   const openPane = useArtifactInspect().openPane;
@@ -1213,8 +1285,15 @@ export function ProcessDisclosure<T>({
     liveClock && currentSection && !currentSection.narrative ? earliestRunningSince(currentSection.messages, startedAt) : null;
   const runningMs = runningSince === null ? 0 : now - runningSince;
   const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
-  const live = active ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  // 同一时刻只有一行运行状态:阶段归 TurnActivity 时外壳不说「正在…」;展开时那一行落在时间轴里
+  // 在干活的段(或「等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
+  const live = active && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
+  const outcome = turnOutcome(bounds?.next);
+  const tookMs = turnEndedAt !== null && turnStartedAt !== null ? turnEndedAt - turnStartedAt : -1;
+  const meta = active ? elapsed : tookMs > 0 && tookMs <= 24 * 3600_000 ? formatElapsed(tookMs) : "";
+  const said = active ? "" : workSummary(messages);
   // 历史轮挂载时不播入场动画,只有进行中新冒出来的步骤才轻轻浮入。
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
@@ -1243,13 +1322,11 @@ export function ProcessDisclosure<T>({
     const key = keyOf(item);
     const deferred = rows.some((message) => message._payloadDeferred);
     const node = stepNode(rows, active && isLastOfProcess);
-    // 只有工具 / 思考行换成时间轴行样式;子任务、计划等仍用原卡(它们自带结构)。
+    // 只有工具 / 思考行换成人话步骤行(原卡进「技术详情」);子任务、计划等仍用原卡(它们自带结构)。
     const inline = !deferred && rows.length > 0 && rows.every((message) => message.role === "tool" || message.role === "thinking");
-    return (
-      <RailRow key={key} testId="process-step" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={active && key === lastItemKey}>
-        <div className={inline ? "" : "py-1"}>
-          <ProcessStepContext.Provider value={inline}>{renderItem(item)}</ProcessStepContext.Provider>
-        </div>
+    const body = (
+      <>
+        <ProcessStepContext.Provider value={inline}>{renderItem(item)}</ProcessStepContext.Provider>
         {rows.map((message) => {
           const raw = rawAuditCommand(message);
           if (!raw) return null;
@@ -1263,7 +1340,74 @@ export function ProcessDisclosure<T>({
             </pre>
           );
         })}
+      </>
+    );
+    const head = rows[0];
+    let title = "思考";
+    let reason = "";
+    if (inline && head?.role === "tool") {
+      try {
+        const display = normalizeToolForDisplay(head);
+        title = humanStepTitle(display.name, display.input);
+        reason = resolveToolStatus(display).errorFirstLine;
+      } catch {
+        title = "调用工具";
+      }
+    }
+    return (
+      <RailRow key={key} testId="process-step" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={active && key === lastItemKey}>
+        {inline && head ? (
+          // UI-3:人话标题(「读取 周会记录.txt」「运行命令」「思考」);命令、技能 / 任务 ID、英文思考小标题
+          // 和输出都在点开后的「技术详情」(原卡,原样)里。
+          <Fold
+            testId="process-step-row"
+            head={
+              <>
+                <span className={`min-w-0 truncate text-body ${node.tone === "live" ? "text-muted" : "text-faint"}`}>
+                  {node.tone === "live" && head.role === "thinking" ? "正在思考" : title}
+                </span>
+                {hasErrorMark(head) ? <span className="shrink-0 text-meta text-faint">未成功</span> : null}
+              </>
+            }
+            meta={<StepMetaBadge ids={rows.map((message) => message.id)} tokenUsage={tokenUsageOf?.(item)} />}
+            below={reason ? (
+              // 未成功写原因(错误输出首行),安静灰字;整轮失败另有顶层提示。
+              <div data-testid="process-step-reason" className="-mt-0.5 truncate pb-1 text-meta text-faint" title={reason}>
+                {reason}
+              </div>
+            ) : null}
+          >
+            <div data-testid="process-step-tech" className="oc-reveal mb-1.5 mt-0.5 border-l-2 border-border pl-3">
+              <p className="pt-0.5 text-caption text-faint">技术详情</p>
+              <StepTimingContext.Provider value={NO_TIMINGS}>{body}</StepTimingContext.Provider>
+            </div>
+          </Fold>
+        ) : (
+          <div className="py-1">{body}</div>
+        )}
       </RailRow>
+    );
+  };
+
+  /** 一段的展开明细:人话步骤在前,底层步骤收成一行「准备工作 N 步」挂在后面。 */
+  const stepRows = (items: readonly T[], isLastSection: boolean) => {
+    const prep = items.filter((item) => {
+      const rows = messagesOf(item);
+      return rows.length > 0 && rows.every((message) => workKind(message) === "prep");
+    });
+    const last = items.at(-1);
+    const row = (item: T) => stepRow(item, isLastSection && item === last);
+    return (
+      <>
+        {items.filter((item) => !prep.includes(item)).map(row)}
+        {prep.length ? (
+          <RailRow node={<StepNode Icon={Wrench} tone="idle" />} enter={false}>
+            <Fold testId="process-prep" head={<span className="min-w-0 truncate text-body text-faint">{`准备工作 ${prep.length} 步`}</span>}>
+              {prep.map(row)}
+            </Fold>
+          </RailRow>
+        ) : null}
+      </>
     );
   };
 
@@ -1282,9 +1426,10 @@ export function ProcessDisclosure<T>({
         data-testid="process-toggle"
         onClick={() => setOpen(!open)}
       >
-        <ShellGlyph active={active} />
+        <ShellGlyph active={active} outcome={outcome} />
         <span className="flex min-w-0 flex-1 items-baseline gap-2">
-          {live ? (
+          <span className="sr-only">{title}</span>
+          {live && !liveInRail ? (
             <span
               key={live.text}
               data-testid="process-step-live"
@@ -1294,30 +1439,14 @@ export function ProcessDisclosure<T>({
               {live.text}
             </span>
           ) : (
-            <span className="shrink-0 text-body font-medium text-faint" data-testid="process-title">
-              {steps > 0 ? `已执行 ${steps} 个步骤` : title}
+            // UI-3 TurnSummary:「完成 · 读了 6 个文件、派出 1 个子任务、写了 1 个文件」+ 用时;进行中只写「处理中」。
+            <span className="min-w-0 truncate text-body font-medium text-faint" data-testid="process-title">
+              {active ? "处理中" : said ? `${STATUS[outcome].label} · ${said}` : STATUS[outcome].label}
             </span>
           )}
-          <span className="sr-only">{`${title} · ${summary}`}</span>
-          {active ? (
+          {meta ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
-              {[elapsed, steps > 0 ? `${steps} 步` : ""].filter(Boolean).join(" · ")}
-            </span>
-          ) : tally.length > 0 ? (
-            <span aria-hidden className="flex min-w-0 items-center gap-2.5 overflow-hidden text-meta tabular-nums text-muted" data-testid="process-tally">
-              {tally.slice(0, 5).map(([label, count], index) => {
-                const Icon = KIND_ICON[label] ?? Wrench;
-                return (
-                  <span
-                    key={label}
-                    className={index >= 3 ? "hidden shrink-0 items-center gap-1 sm:inline-flex" : "inline-flex shrink-0 items-center gap-1"}
-                    title={`${label} ${count}`}
-                  >
-                    <Icon size={12} strokeWidth={2} className="text-faint" />
-                    {count}
-                  </span>
-                );
-              })}
+              {meta}
             </span>
           ) : null}
         </span>
@@ -1412,7 +1541,9 @@ export function ProcessDisclosure<T>({
               // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
-              const working = active && index === currentIndex && !toolsSettled;
+              // UI-3:在干活的段,摘要行就是这一轮唯一的运行状态行(写「正在…」),跑完才换成这一段的人话摘要;
+              // 工具都已返回、在等模型时(#1234)那一行落到下面的「等待模型响应」尾行,不把已完成的工具标为仍在执行。
+              const working = !!live && index === currentIndex && !toolsSettled;
               const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
@@ -1429,7 +1560,13 @@ export function ProcessDisclosure<T>({
                         data-live-working={working ? "true" : "false"}
                         className={`min-w-0 truncate text-body ${working ? "oc-live-status-shine text-muted" : "text-faint"}`}
                       >
-                        {naturalSummary(section.items.map(messagesOf))}
+                        {working && live ? (
+                          <span key={live.text} data-testid="process-step-live" data-live-pending={live.pending ? "true" : "false"} className="oc-swap-in">
+                            {live.text}
+                          </span>
+                        ) : (
+                          groupSummary(section.messages)
+                        )}
                       </span>
                       {working && runningFor ? (
                         // 长命令 / 长工具:流光之外再给一个每秒在走的数字,一眼看出「还在跑、跑了多久」。
@@ -1451,7 +1588,6 @@ export function ProcessDisclosure<T>({
                           {formatStepDuration(groupTiming.ms)}
                         </span>
                       ) : null}
-                      <span className="sr-only">{operationSummary(section.messages)}</span>
                       {/* OCV5-313: 不在摘要行单独点出「N 步未成功」——中途个别步骤没成功是正常流程,
                           事实留在展开后的步骤行里(安静的灰字),整轮失败另有顶层错误卡。 */}
                       <ChevronRight
@@ -1463,18 +1599,18 @@ export function ProcessDisclosure<T>({
                   </RailRow>
                   {details ? (
                     <div className="space-y-0.5" data-testid="process-details">
-                      {section.items.map((item, i) => stepRow(item, isLastSection && i === section.items.length - 1))}
+                      {stepRows(section.items, isLastSection)}
                     </div>
                   ) : null}
                 </div>
               );
             }) : null}
-            {open && waiting ? (
-              // 在最新进展处显示等待时长,不把已经完成的工具标为仍在执行。
-              // 下一步一冒出来(新帧到达、当前段换成步骤组)这行就消失,流光随之落到那一段的摘要行上。
+            {open && waiting && live ? (
+              // 可见进展之后在等模型(叙述写完或工具都已返回):在最新进展处挂一行活的「等待模型响应」+ 等待时长,
+              // 不把已经完成的工具标为仍在执行。下一步一冒出来这行就消失,流光随之落到那一段的摘要行上。
               <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
                 <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
-                  <span className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
+                  <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
                   <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
                     {formatElapsed(waitingMs)}
                   </span>

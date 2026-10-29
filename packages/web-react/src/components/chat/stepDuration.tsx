@@ -9,6 +9,9 @@ import { type DisplayTokenUsage, TokenUsageBadge, tokenUsageSnapshot } from './t
  */
 export const StepTimingContext = createContext<ReadonlyMap<string, StepTiming> | null>(null)
 
+/** Steps shorter than this keep their duration out of sight until hovered (UI-SPEC §5 UI-3). */
+const QUIET_STEP_MS = 10_000
+
 function useTicker(enabled: boolean): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -24,6 +27,8 @@ function useTicker(enabled: boolean): number {
  * Right-hand meta of a step row. Inside the process timeline it shows how
  * long the step took (live steps count up); the model call's token total
  * moves to the tooltip. A step without a recorded time shows nothing.
+ * UI-3: under 10 s the number only appears while the row is hovered or focused
+ * (it stays in the tooltip and for screen readers); a row of 0.1 s badges is noise.
  * Outside the timeline it is the plain token badge.
  */
 export function StepMetaBadge({
@@ -59,7 +64,7 @@ export function StepMetaBadge({
     <span
       data-testid="step-duration"
       data-step-running={running ? 'true' : 'false'}
-      className="inline-flex shrink-0 flex-col items-end whitespace-nowrap text-caption font-medium tabular-nums text-faint"
+      className={`inline-flex shrink-0 flex-col items-end whitespace-nowrap text-caption font-medium tabular-nums text-faint ${ms < QUIET_STEP_MS ? 'opacity-0 transition-opacity group-hover/step:opacity-100 group-focus-visible/step:opacity-100' : ''}`}
       title={title}
       aria-label={title}
     >
