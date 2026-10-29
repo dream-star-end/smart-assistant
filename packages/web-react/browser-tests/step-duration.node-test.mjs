@@ -174,7 +174,8 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
         await page.evaluate(() => window.__stepPage.setScene("file-done"));
         await expandAll(page);
         assert.equal(await page.getByTestId("process-live-tail").count(), 0);
-        const file = page.locator('[data-testid="tool-step"]').last();
+        // UI-3: the duration sits on the step's human title row; the original tool card is its 技术详情.
+        const file = page.getByTestId("process-step-row").last();
         assert.match(await file.getByTestId("step-duration").innerText(), /执行 1\.5 秒[\s\S]*等待 7 分 43 秒/);
         const bounds = await file.getByTestId("step-duration").boundingBox();
         assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "both durations stay readable on mobile");
