@@ -478,7 +478,7 @@ test('production wiring: all 15 C gates + D run pinned; C/D overlap; Box waits f
   const starts = lines.filter((l) => l.startsWith('start '));
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
-    'cron-submit', 'prompt-privacy', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
+    'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
     'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const firstEnd = lines.findIndex((l) => l.startsWith('end '));
@@ -535,9 +535,9 @@ for (const receipt of ['hit', 'wrong-sha']) {
       // Worker-local notes would be lost; final summary proves parent ownership.
       assert.equal(notes(f)[`gateEvidence.${gate}`], receipt === 'hit' ? 'merge-queue-receipt' : 'local');
     }
-    const local = ['D', 'C.cursor-sand', 'C.host-log-policy', 'C.architecture'];
+    const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 8 : 16);
+    assert.equal(ids.length, receipt === 'hit' ? 9 : 17);
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
     for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.ccb-mcp']) {
