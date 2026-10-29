@@ -10,7 +10,7 @@ export function confirmDispatchDelivery(sess: ChatSession, clientMessageId: stri
   const state = accepted ? "accepted" : user._deliveryState ?? "admitted";
   const changed = user._deliveryState !== state;
   user._deliveryState = state;
-  if (first) {
+  if (first && !accepted) {
     sess._turnStartedAt = Date.now();
     sess._turnCostCredits = "0";
     sess._turnCostSeenRequestIds = new Set();

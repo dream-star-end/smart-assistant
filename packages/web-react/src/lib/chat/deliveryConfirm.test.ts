@@ -52,6 +52,22 @@ describe("container-confirmed delivery", () => {
     expect(sess._turnCredits?.settled).toBe("23");
   });
 
+  test("accepted after a lost admission ACK preserves already confirmed charges", () => {
+    const { sess, user, frame } = setup();
+    sess._turnCostCredits = "35";
+    sess._turnCostSeenRequestIds = new Set(["charge-before-receipt"]);
+    sess._turnCredits = { settled: "35", requests: 1, asOf: 100 };
+    sess._turnStartedAt = 42;
+    frame({ type: "outbound.ack", accepted: true });
+    expect(user._deliveryState).toBe("accepted");
+    expect(sess._turnCostCredits).toBe("35");
+    expect(sess._turnCostSeenRequestIds).toEqual(new Set(["charge-before-receipt"]));
+    expect(sess._turnCredits?.settled).toBe("35");
+    expect(sess._turnStartedAt).toBe(42);
+    frame({ type: "outbound.ack", admitted: true });
+    expect(sess._turnCostCredits).toBe("35");
+  });
+
   test.each([
     { type: "outbound.turn_status", status: "working" },
     { type: "outbound.message", blocks: [], isFinal: false },
