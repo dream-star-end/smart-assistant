@@ -181,6 +181,49 @@ export async function settleBoxReplayBeforeDelivery(pool: Pool, input: {
   return expected >= 0n && debited >= expected;
 }
 
+/** HTTP finalization can precede the keeper's proof of a failed stop. Revisit
+ * those unbilled first rounds after the stop commits, without releasing any
+ * live/unknown invocation or a tool chain that still has billable usage. */
+async function releaseStoppedPrechecks(pool: Pool, redis: PreCheckRedis, limit: number): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const rows = await client.query<JournalRow>(
+      `SELECT rfj.request_id,rfj.user_id::text,rfj.ctx FROM request_finalize_journal rfj
+        WHERE rfj.state='aborted' AND rfj.final_credits=0
+          AND rfj.usage_id IS NULL AND rfj.ledger_id IS NULL
+          AND rfj.ctx->>'boxInvocationRecovery'='v1'
+          AND rfj.ctx->>'boxState'='failed_stopped'
+          AND rfj.ctx->>'boxStopOutcome'='failed'
+          AND rfj.ctx->>'boxPrecheckReleased' IS DISTINCT FROM 'true'
+          AND NOT (rfj.ctx ?| ARRAY['boxToolHandoff','boxUsage','boxOwnerRequestId','boxResumeRequestId'])
+          AND NOT EXISTS (SELECT 1 FROM usage_records ur
+            WHERE ur.request_id=rfj.request_id AND ur.user_id=rfj.user_id)
+        ORDER BY rfj.updated_at,rfj.request_id LIMIT $1 FOR UPDATE OF rfj SKIP LOCKED`,
+      [limit]);
+    for (const row of rows.rows) {
+      const ctx = row.ctx;
+      if (typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+        || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) continue;
+      try {
+        const proof = parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`,
+          { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
+        if (proof.reason === "worker_complete") continue;
+      } catch { continue; }
+      await releasePreCheck(redis, { userId: row.user_id, requestId: row.request_id });
+      // Missing Redis keys are also success (expiry or a prior release followed
+      // by a lost COMMIT). Preserve the journal's business timestamp.
+      await client.query(`UPDATE request_finalize_journal
+        SET ctx=jsonb_set(ctx,'{boxPrecheckReleased}','true') WHERE request_id=$1 AND user_id=$2`,
+      [row.request_id, row.user_id]);
+    }
+    await client.query("COMMIT");
+  } catch {
+    await client.query("ROLLBACK").catch(() => {});
+    // No marker commits on a Redis/DB failure; the existing scheduler retries.
+  } finally { client.release(); }
+}
+
 /** Bounded operator/scheduler entry. Unknown outcomes are never promoted. */
 export async function reconcileBoxBillingBatch(pool: Pool, limit = 20,
   preCheckRedis?: PreCheckRedis): Promise<{
@@ -207,5 +250,7 @@ export async function reconcileBoxBillingBatch(pool: Pool, limit = 20,
       else counts[result]++;
     } catch { counts.pending++; } // Leave journal/evidence for the next pass.
   }
+  if (preCheckRedis) await releaseStoppedPrechecks(pool, preCheckRedis,
+    Math.max(1, Math.min(limit, 100)));
   return counts;
 }

@@ -9197,6 +9197,26 @@
         }
       ],
       "coverageCommits": []
+    },
+    {
+      "id": "INC-20261029-BOX-STOPPED-CREDIT-HOLD",
+      "occurredAt": "2026-10-29",
+      "severity": "P1",
+      "symptom": "商业 uid2046 已付费 Pro 且余额10000、Opus目录公开启用，但11条 Box首轮失败请求在HTTP finalizer保留预留后，迟到的匹配终止证明只将journal转为aborted/failed_stopped，未释放Redis预留9636，后续请求误报INSUFFICIENT_CREDITS。既有Box billing reconciler补齐已证明终止、零扣费、无usage/handoff/链引用的精确预留释放；原始BOX_TOOL_STOP_REASON_INVALID仍需另行定位，不将预留修复当成模型恢复证明。",
+      "rootFixCommit": "1daa6834",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxBillingRecovery.integ.test.ts",
+          "assertion": "late proven Box stops release retained credit reservations without charging"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "late proven Box stops release retained credit reservations without charging"
+        }
+      ]
     }
   ]
 }
