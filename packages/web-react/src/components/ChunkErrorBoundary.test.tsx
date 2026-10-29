@@ -13,15 +13,18 @@ function Boom({ message }: { message: string }): never {
 }
 
 describe('ChunkErrorBoundary(懒块失效兜底屏,shell 审计 S-09 / S-18)', () => {
-  it('stale chunk → 「已发布新版本」alertdialog,唯一出口是走 Button 原语的「刷新」并自动聚焦', () => {
+  // OCV5-634(X-P1-2):行为有意改变 —— 动态 import 失败也可能是断网/弱网,不再断言「已发布新版本」。
+  it('stale chunk → 「页面需要刷新」alertdialog(不断言发版),唯一出口是走 Button 原语的「刷新」并自动聚焦', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     render(
       <ChunkErrorBoundary>
         <Boom message="Failed to fetch dynamically imported module: /assets/ManageCenter-8f21c0.js" />
       </ChunkErrorBoundary>,
     )
-    const dialog = screen.getByRole('alertdialog', { name: '已发布新版本' })
+    const dialog = screen.getByRole('alertdialog', { name: '页面需要刷新' })
     expect(dialog).toBeInTheDocument()
+    expect(dialog).toHaveTextContent('可能刚发布了新版本，或网络波动导致部分页面没有加载下来')
+    expect(dialog).not.toHaveTextContent('已发布新版本')
     const refresh = screen.getByRole('button', { name: '刷新' })
     // 原语的触控靶兜底与焦点环都在类名里
     expect(refresh.className).toContain('[@media(hover:none)]:min-h-11')

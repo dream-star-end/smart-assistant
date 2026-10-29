@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * v3 container API proxy — safely expose selected personal-version APIs to
  * commercial users by forwarding them to the caller's own isolated container.
@@ -173,7 +174,7 @@ function sendJsonError(
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
   })
-  res.end(JSON.stringify({ error: { code, message, request_id: requestId } }))
+  res.end(JSON.stringify(withUserError({ error: { code, message, request_id: requestId } }, status)))
 }
 
 async function readTunnelBody(

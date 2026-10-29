@@ -3,8 +3,11 @@
  * path, counts identity+text diffs, and never changes the returned messages.
  *
  * Flag: OC_TIMELINE_LIFECYCLE_V1 / window.__OC_TIMELINE_LIFECYCLE_V1 /
- * VITE_OC_TIMELINE_LIFECYCLE_V1. Default off.
+ * VITE_OC_TIMELINE_LIFECYCLE_V1 (explicit local override), else the server
+ * switch `timelineShadow` (OCV5-630). Default off. Only server-driven shadow
+ * sends content-free mismatch summaries to /api/client-errors.
  */
+import { type ClientFrictionSignal, reportClientFriction } from "../clientFriction";
 import type { ChatMessage } from "../chat/model";
 import { identityOf, lifecycleOf, projectTimeline } from "./projectLifecycle";
 
@@ -62,7 +65,8 @@ declare global {
   }
 }
 
-function readRawMode(): string {
+/** Explicit local override (window / process.env / VITE); undefined when none is set. */
+function readExplicitMode(): string | undefined {
   if (typeof globalThis !== "undefined") {
     const g = globalThis as typeof globalThis & {
       __OC_TIMELINE_LIFECYCLE_V1?: string;
@@ -80,13 +84,33 @@ function readRawMode(): string {
   } catch {
     /* import.meta may be unavailable in some test shims */
   }
-  return "off";
+  return undefined;
+}
+
+/**
+ * OCV5-630 server switch (GET /api/features `timelineShadow` ← OC_TIMELINE_LIFECYCLE_SHADOW).
+ * Only turns on shadow, never read; an explicit local override above still wins (including "off").
+ */
+let serverShadow = false;
+
+export function setTimelineLifecycleServerShadow(on: boolean): void {
+  serverShadow = on === true;
+}
+
+function normalizeMode(raw: string): TimelineLifecycleMode {
+  const mode = raw.trim().toLowerCase();
+  return mode === "shadow" || mode === "read" ? mode : "off";
 }
 
 export function timelineLifecycleMode(): TimelineLifecycleMode {
-  const raw = readRawMode().trim().toLowerCase();
-  if (raw === "shadow" || raw === "read") return raw;
-  return "off";
+  const explicit = readExplicitMode();
+  if (explicit !== undefined) return normalizeMode(explicit);
+  return serverShadow ? "shadow" : "off";
+}
+
+/** Shadow came from the server switch, not a local override: the only case that reports. */
+function serverDrivenShadow(): boolean {
+  return readExplicitMode() === undefined && serverShadow;
 }
 
 function forceSample(): boolean {
@@ -209,11 +233,76 @@ export function lastShadowFor(entry: ShadowEntry): ShadowObservation | undefined
   return lastByEntry.get(entry);
 }
 
+// ── OCV5-630 content-free report (only when the server switch turned shadow on) ──
+// One bounded product-friction event per sampled observation. client-errors is
+// rate limited per IP (30 req/min) and shared with real error reports, so this
+// stays far below it whatever the session count: at most one report every
+// 30 s per page (≤2/min), at most one per session × entry × outcome per
+// 5 minutes, and at most 40 per page. Never identities or text: only the
+// entry, the mismatch shape counts and the total time.
+const REPORT_WINDOW_MS = 5 * 60_000;
+const MIN_REPORT_GAP_MS = 30_000;
+const PAGE_REPORT_CAP = 40;
+const COUNT_CAP = 9_999;
+const lastReportAt = new Map<string, number>();
+let lastAnyReportAt: number | undefined;
+let pageReports = 0;
+let reporter: (signal: ClientFrictionSignal) => void = (signal) => {
+  reportClientFriction(signal);
+};
+
+export function shadowReportSignal(observation: ShadowObservation): ClientFrictionSignal {
+  const mismatch = observation.mismatchCount > 0;
+  const cap = (n: number) => Math.min(COUNT_CAP, n);
+  const oldOnly = cap(observation.mismatches.filter((row) => row.oldKeep && !row.newKeep).length);
+  const newOnly = cap(observation.mismatches.filter((row) => row.newKeep && !row.oldKeep).length);
+  const changed = cap(observation.mismatches.filter((row) => row.oldKeep && row.newKeep).length);
+  return {
+    surface: "chat",
+    stage: "timeline_shadow",
+    code: mismatch ? "TIMELINE_SHADOW_MISMATCH" : "TIMELINE_SHADOW_MATCH",
+    outcome: mismatch ? "failed" : "succeeded",
+    latencyMs: Math.max(0, Math.round(observation.totalMs)),
+    path: observation.entry.replace(/-/g, "_"),
+    reason: mismatch ? `old${oldOnly}_new${newOnly}_diff${changed}` : "none",
+    ...(observation.sessionId ? { sessionId: observation.sessionId } : {}),
+  };
+}
+
+function maybeReport(observation: ShadowObservation): void {
+  if (!observation.sampled || !serverDrivenShadow()) return;
+  const key = `${observation.sessionId ?? "-"}|${observation.entry}|${observation.mismatchCount > 0 ? "m" : "ok"}`;
+  const now = Date.now();
+  const last = lastReportAt.get(key);
+  if (last !== undefined && now - last < REPORT_WINDOW_MS) return;
+  if (lastAnyReportAt !== undefined && now - lastAnyReportAt < MIN_REPORT_GAP_MS) return;
+  if (pageReports >= PAGE_REPORT_CAP) return;
+  lastReportAt.set(key, now);
+  lastAnyReportAt = now;
+  pageReports += 1;
+  try {
+    reporter(shadowReportSignal(observation));
+  } catch {
+    /* telemetry never affects the timeline */
+  }
+}
+
+export function setShadowReporterForTests(fn: ((signal: ClientFrictionSignal) => void) | null): void {
+  reporter = fn ?? ((signal) => {
+    reportClientFriction(signal);
+  });
+}
+
 export function resetShadowStatsForTests(): void {
   timings.length = 0;
   mismatchedSessions.clear();
   lastObservation = undefined;
   lastByEntry.clear();
+  lastReportAt.clear();
+  lastAnyReportAt = undefined;
+  pageReports = 0;
+  serverShadow = false;
+  setShadowReporterForTests(null);
 }
 
 export function observeTimelineShadow(opts: {
@@ -257,6 +346,7 @@ export function observeTimelineShadow(opts: {
   if (timings.length > MAX_SAMPLES) timings.shift();
   if (observation.mismatchCount > 0 && opts.sessionId) mismatchedSessions.add(opts.sessionId);
   publishStats(observation);
+  maybeReport(observation);
   return observation;
 }
 

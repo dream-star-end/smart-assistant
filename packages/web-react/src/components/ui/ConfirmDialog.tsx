@@ -4,13 +4,17 @@
  *
  * 用法(hook 返回 [fn, element],element 挂在组件树任意处):
  *   const [confirm, confirmEl] = useConfirm();
- *   ... await confirm({ title: "删除该会话?", danger: true }) → boolean
- *   ... await confirm({ title: "切换模型?", altText: "直接切换" }) → true | false | "alt"
+ *   ... await confirm({ title: "删除该会话？", danger: true }) → boolean
+ *   ... await confirm({ title: "切换模型？", altText: "直接切换" }) → true | false | "alt"
  *
  *   const [promptText, promptEl] = usePrompt();
  *   ... await promptText({ title: "重命名会话", initial: s.title }) → string | null
  *
  * 基于 Modal(Radix Dialog):焦点陷阱/Escape/aria 免费获得。Escape/遮罩关闭=取消。
+ *
+ * 初始焦点自己定(UI-SPEC §6 #29):Radix 默认聚焦第一个可聚焦元素 —— 标题行的 ×,
+ * 重命名时焦点落在 ×、Ctrl+A 选中整页。确认框:危险操作聚焦「取消」(回车不误删),
+ * 其余聚焦主按钮;输入框:聚焦并全选。
  */
 import { type ReactNode, useCallback, useRef, useState } from "react";
 import { Button } from "./Button";
@@ -18,6 +22,19 @@ import { Input } from "./Input";
 import { Modal } from "./Modal";
 
 export type ConfirmChoice = boolean | "alt";
+
+const ZH_PUNCT: Record<string, string> = { ",": "，", "?": "？", "!": "！", ":": "：", ";": "；" };
+/** 紧跟在汉字或中文右括号/引号后面的半角标点。数字、英文后的不动(12:30、a,b.txt)。 */
+const HALF_PUNCT_AFTER_CJK = /([\u3400-\u9fff\uf900-\ufaff」』）》】])([,?!:;])/g;
+
+/**
+ * 对话框文案统一用中文标点(UI-SPEC §6 #22:「删除,不可恢复」中英标点混用)。
+ * 调用方散在几十处,收在原语里一处做,只改字符串文案;ReactNode 正文原样渲染。
+ */
+export function zhPunct<T>(text: T): T {
+  if (typeof text !== "string") return text;
+  return text.replace(HALF_PUNCT_AFTER_CJK, (_, c: string, p: string) => c + ZH_PUNCT[p]) as T;
+}
 
 export type ConfirmOpts = {
   title: string;
@@ -33,6 +50,8 @@ export type ConfirmOpts = {
 export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, ReactNode] {
   const [opts, setOpts] = useState<ConfirmOpts | null>(null);
   const resolverRef = useRef<((v: ConfirmChoice) => void) | null>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
 
   const confirm = useCallback((o: ConfirmOpts) => {
     return new Promise<ConfirmChoice>((resolve) => {
@@ -55,24 +74,33 @@ export function useConfirm(): [(opts: ConfirmOpts) => Promise<ConfirmChoice>, Re
       onOpenChange={(open) => {
         if (!open) settle(false);
       }}
-      title={opts?.title}
+      onOpenAutoFocus={(e) => {
+        e.preventDefault();
+        const target = opts?.danger ? cancelRef : confirmRef;
+        target.current?.focus();
+      }}
+      title={zhPunct(opts?.title)}
       footer={
         <>
-          <Button variant="ghost" onClick={() => settle(false)}>
-            {opts?.cancelText ?? "取消"}
+          <Button ref={cancelRef} variant="ghost" onClick={() => settle(false)}>
+            {zhPunct(opts?.cancelText) ?? "取消"}
           </Button>
           {opts?.altText ? (
             <Button variant="secondary" onClick={() => settle("alt")}>
-              {opts.altText}
+              {zhPunct(opts.altText)}
             </Button>
           ) : null}
-          <Button variant={opts?.danger ? "danger" : "primary"} onClick={() => settle(true)}>
-            {opts?.confirmText ?? "确定"}
+          <Button
+            ref={confirmRef}
+            variant={opts?.danger ? "danger" : "primary"}
+            onClick={() => settle(true)}
+          >
+            {zhPunct(opts?.confirmText) ?? "确定"}
           </Button>
         </>
       }
     >
-      {opts?.body ?? null}
+      {zhPunct(opts?.body) ?? null}
     </Modal>
   );
 
@@ -92,6 +120,7 @@ export function usePrompt(): [(opts: PromptOpts) => Promise<string | null>, Reac
   const [opts, setOpts] = useState<PromptOpts | null>(null);
   const [value, setValue] = useState("");
   const resolverRef = useRef<((v: string | null) => void) | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const promptText = useCallback((o: PromptOpts) => {
     return new Promise<string | null>((resolve) => {
@@ -119,7 +148,12 @@ export function usePrompt(): [(opts: PromptOpts) => Promise<string | null>, Reac
       onOpenChange={(open) => {
         if (!open) settle(null);
       }}
-      title={opts?.title}
+      onOpenAutoFocus={(e) => {
+        e.preventDefault();
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }}
+      title={zhPunct(opts?.title)}
       footer={
         <>
           <Button variant="ghost" onClick={() => settle(null)}>
@@ -131,8 +165,9 @@ export function usePrompt(): [(opts: PromptOpts) => Promise<string | null>, Reac
         </>
       }
     >
-      {opts?.body}
+      {zhPunct(opts?.body)}
       <Input
+        ref={inputRef}
         value={value}
         maxLength={opts?.maxLength ?? 120}
         placeholder={opts?.placeholder}
@@ -143,8 +178,6 @@ export function usePrompt(): [(opts: PromptOpts) => Promise<string | null>, Reac
             submit();
           }
         }}
-        // biome-ignore lint/a11y/noAutofocus: 输入对话框打开即聚焦是预期交互
-        autoFocus
       />
     </Modal>
   );

@@ -1,3 +1,5 @@
+import { automaticRetryStatus, InboundMessage } from '@openclaude/protocol';
+import { Value } from '@sinclair/typebox/value';
 // pgSessionsBackend 集成 + 并发契约测试(RFC-v5-sessions-pg §9)。
 //
 // 需 PG fixture(openclaude_test，与其它 integ 同库)。为不污染共享 public schema，本套件在
@@ -35,6 +37,8 @@ import {
   _setAfterLosslessStageBatch,
   _setPhaseASqlObserver,
   _resetAutomaticRecoveryReconcileSkipsForTest,
+  _prepareLosslessTurnTapeOutsideLocks,
+  _stagePreparedLosslessTurnRecords,
   LOSSLESS_TURN_RECORD_STAGE_BATCH_SIZE,
   type PgSessionsBackend,
 } from "../db/pgSessionsBackend.js";
@@ -6880,6 +6884,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       sourceClientMessageId, rootClientMessageId: sourceClientMessageId,
       clientMessageId: jobs.rows[0]!.request_json.clientMessageId,
       errorCode: "upstream_failed", mode: "checkpoint", attempt: 1,
+      retryStatus: automaticRetryStatus("scheduled", 1, 10),
     }];
     const full = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
     assert.ok((full?.messages as MessageLike[]).some((row) =>
@@ -6897,7 +6902,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         [UID, sessionId, sourceClientMessageId, status]);
       const snapshot = await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" });
       assert.deepEqual(snapshot?.automaticRecoveries,
-        ["leased", "sent", "forwarded"].includes(status) ? expected : [], status);
+        ["leased", "sent", "forwarded"].includes(status)
+          ? expected.map((entry) => ({ ...entry, retryStatus: automaticRetryStatus(status === "forwarded" ? "running" : "scheduled", 1, 10) }))
+          : [], status);
       assert.ok((snapshot?.messages as MessageLike[]).some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
         "the source terminal stays immutable while the recovery job changes");
     }
@@ -6947,8 +6954,8 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       createdAt: 1_783_950_150_000,
       usage: { inputTokens: 6, outputTokens: 872 },
     }));
-    const jobs = await pool.query<{ recovery_mode: string; semantic_recovery_attempt: number }>(
-      `SELECT recovery_mode,semantic_recovery_attempt
+    const jobs = await pool.query<{ recovery_mode: string; semantic_recovery_attempt: number; request_json: Record<string, unknown> }>(
+      `SELECT recovery_mode,semantic_recovery_attempt,request_json
          FROM turn_recovery_jobs
         WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
       [UID, sessionId, sourceClientMessageId],
@@ -6956,6 +6963,14 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(jobs.rowCount, 1);
     assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
     assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
+    assert.ok(Value.Check(InboundMessage, jobs.rows[0]!.request_json),
+      "presentation metadata must not invalidate the strict recovery admission envelope");
+    const recovery = (jobs.rows[0]!.request_json.content as { recovery: Record<string, unknown> }).recovery;
+    assert.equal(recovery.max, 10);
+    assert.equal(recovery.retryLimit, undefined);
+    const snapshot = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    assert.deepEqual(snapshot?.automaticRecoveries?.[0]?.retryStatus, automaticRetryStatus("scheduled", 1, 3),
+      "actual settled-tools retry budget is 3 while legacy max remains 10");
   });
 
   // OCV5-321 (#611729fb): same settled Box tape, but the live stream for the
@@ -7954,6 +7969,157 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(row!.status, "terminal");
     assert.equal(row!.outcome, "crashed");
     assert.equal(row!.failureCode, "SERVICE_RESTART");
+  });
+
+  // OCV5-646 (t1134u): the turn streamed an answer and tool steps, then a
+  // gateway restart staged the inbox-only SERVICE_RESTART tape (text ''). The
+  // records must carry what was streamed, and survive the frame prune.
+  maybe("OCV5-646 boot-recovery SERVICE_RESTART tape keeps the streamed answer after prune", async () => {
+    const restartTape = (sessionId: string, clientMessageId: string, dispatchId: string, turnKey: string) =>
+      buildTape({
+        agentId: "main",
+        sessionId,
+        turnIndex: 1,
+        clientMessageId,
+        status: "crashed",
+        turnKey,
+        createdAt: 1_783_950_170_000,
+        text: "",
+        errorCode: "SERVICE_RESTART",
+        errorDetail: "任务因服务重启中断，此前已生成的过程已完整保留",
+        dispatchId,
+        attemptNo: 1,
+      });
+    const finalizeRestart = async (sessionId: string, clientMessageId: string, turnKey: string,
+      frames: Array<Record<string, unknown>>) => {
+      await backend.upsertClientSession(mkSession({ id: sessionId, userId: CUSER }));
+      const admit = await backend.admitUserTurn(admitInput({ sessionId, clientMessageId }));
+      assert.equal(admit.kind, "admitted");
+      const dispatchId = (admit as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+      const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+      for (const [index, frame] of frames.entries()) {
+        const frameSeq = index + 1;
+        await persistGatewayLiveFrame(pool, {
+          uid: UID,
+          sessionId,
+          clientMessageId,
+          agentContainerId: 1,
+          sessionKey,
+          frameSeq,
+          payload: JSON.stringify({ sessionKey, frameSeq, clientMessageId, peer: { id: sessionId, kind: "dm" }, ...frame }),
+        });
+      }
+      const tape = restartTape(sessionId, clientMessageId, dispatchId, turnKey);
+      for (const part of tape.parts) {
+        await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, { dispatchId, attemptNo: 1 });
+      }
+      assert.equal((await backend.finalizeLosslessTurnTape(CUSER, tape.finalize)).applied, "finalized");
+      const records = await pool.query<{ role: string; payload: Buffer }>(
+        `SELECT role,payload FROM client_session_turn_tape_records
+          WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 ORDER BY ordinal`,
+        [sessionId, CUSER, tape.finalize.tapeId],
+      );
+      return records.rows.map((row) => ({
+        role: row.role,
+        payload: JSON.parse(Buffer.from(row.payload).toString("utf8")) as Record<string, unknown>,
+      }));
+    };
+    const message = (blocks: Array<Record<string, unknown>>) => ({ type: "outbound.message", blocks });
+
+    const sessionId = "s-ocv5-646-fold";
+    const records = await finalizeRestart(sessionId, "cm-ocv5-646-fold", "d".repeat(64), [
+      message([{ kind: "thinking", text: "先核对故障", messageId: "m1" }]),
+      message([{ kind: "text", text: "要根治，", messageId: "m1" }]),
+      message([{ kind: "text", text: "不能只加一次重试。", messageId: "m1" }]),
+      message([{ kind: "tool_use", blockId: "tu-1", toolName: "Bash", inputJson: { command: "ls" }, inputPreview: "ls" }]),
+      { type: "outbound.permission_request", requestId: "perm-1", toolName: "Bash" },
+      message([{ kind: "tool_result", toolUseBlockId: "tu-1", toolName: "Bash", output: "a.ts" }]),
+      message([{ kind: "tool_use", blockId: "tu-2", toolName: "Read", inputPreview: "b.ts" }]),
+    ]);
+    assert.deepEqual(records.map((row) => row.role), ["thinking", "tool", "tool", "assistant"]);
+    const answer = records.at(-1)!.payload;
+    assert.equal(answer.text, "要根治，不能只加一次重试。");
+    assert.equal(answer._errorCode, "SERVICE_RESTART");
+    assert.equal(records[1]!.payload.output, "a.ts");
+    assert.equal(records[2]!.payload.partial, true);
+
+    await pruneProjectedLiveFrames(pool, { batchSize: 100 });
+    const left = await pool.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.session_id=$1`,
+      [sessionId],
+    );
+    assert.equal(left.rows[0]!.n, "0");
+    const timeline = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    const shown = (timeline!.messages as MessageLike[]).find((m) => m.role === "assistant" && m._errorCode === "SERVICE_RESTART");
+    assert.equal(shown?.text, "要根治，不能只加一次重试。");
+
+    // No frames: the synthetic row is materialized exactly as before.
+    const bare = await finalizeRestart("s-ocv5-646-bare", "cm-ocv5-646-bare", "e".repeat(64), []);
+    assert.deepEqual(bare.map((row) => row.role), ["assistant"]);
+    assert.equal(bare[0]!.payload.text, "任务因服务重启中断，此前已生成的过程已完整保留");
+    assert.equal(bare[0]!.payload._isError, true);
+
+    // Codex r1/r2: a straggler frame between two prepare attempts must not
+    // change the record set (immutable record identity on retry). Frames that
+    // reach the dispatch row lock after Phase A are dropped.
+    const lateSession = "s-ocv5-646-late";
+    const lateCmid = "cm-ocv5-646-late";
+    await backend.upsertClientSession(mkSession({ id: lateSession, userId: CUSER }));
+    const lateAdmit = await backend.admitUserTurn(admitInput({ sessionId: lateSession, clientMessageId: lateCmid }));
+    assert.equal(lateAdmit.kind, "admitted");
+    const lateDispatch = (lateAdmit as { dispatch: { dispatchId: string } }).dispatch.dispatchId;
+    const lateKey = `agent:main:webchat:dm:${lateSession}`;
+    const lateFrame = (frameSeq: number, blocks: Array<Record<string, unknown>>) =>
+      persistGatewayLiveFrame(pool, {
+        uid: UID, sessionId: lateSession, clientMessageId: lateCmid, agentContainerId: 1, sessionKey: lateKey,
+        frameSeq,
+        payload: JSON.stringify({ type: "outbound.message", sessionKey: lateKey, frameSeq, clientMessageId: lateCmid,
+          peer: { id: lateSession, kind: "dm" }, blocks }),
+      });
+    await lateFrame(1, [{ kind: "tool_use", blockId: "tu-a", toolName: "Bash", inputPreview: "ls" }]);
+    await lateFrame(2, [{ kind: "text", text: "先看目录。", messageId: "m1" }]);
+    const lateTape = restartTape(lateSession, lateCmid, lateDispatch, "f".repeat(64));
+    for (const part of lateTape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, { dispatchId: lateDispatch, attemptNo: 1 });
+    }
+    // as gateway buildLosslessTurnTapeRequests sends the boot-recovery tape
+    const lateFinalize = {
+      ...lateTape.finalize,
+      settlement: {
+        billingAnchorId: `srv-${lateSession}-main-t1`,
+        engineBillings: [],
+        text: "",
+        ts: 1_783_950_170_000,
+        errorCode: "SERVICE_RESTART",
+      },
+    };
+    await backend.finalizeLosslessTurnTape(CUSER, lateFinalize, { materialize: false });
+    const format = (await pool.query<{ f: number }>(
+      `SELECT record_storage_format AS f FROM client_session_turn_tapes
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [lateSession, CUSER, lateTape.finalize.tapeId],
+    )).rows[0]!.f as 2 | 3;
+    const first = await _prepareLosslessTurnTapeOutsideLocks(pool, CUSER, lateFinalize, format);
+    assert.ok(first);
+    await _stagePreparedLosslessTurnRecords(pool, CUSER, lateFinalize, first);
+    await lateFrame(3, [{ kind: "tool_use", blockId: "tu-b", toolName: "Read", inputPreview: "late" }]);
+    const lateCount = await pool.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM client_session_live_frames f
+         JOIN client_session_live_streams s ON s.stream_key=f.stream_key
+        WHERE s.dispatch_id=$1::uuid`,
+      [lateDispatch],
+    );
+    assert.equal(lateCount.rows[0]!.n, "2");
+    assert.equal((await backend.finalizeLosslessTurnTape(CUSER, lateFinalize)).applied, "finalized");
+    const lateRecords = await pool.query<{ msg_id: string; role: string }>(
+      `SELECT msg_id,role FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 ORDER BY ordinal`,
+      [lateSession, CUSER, lateTape.finalize.tapeId],
+    );
+    assert.deepEqual(lateRecords.rows.map((row) => row.msg_id), first.turn.records.map((record) => record.id));
+    assert.deepEqual(lateRecords.rows.map((row) => row.role), ["tool", "assistant"]);
   });
 
   maybe("SERVICE_RESTART sentinel + late completed 清 failure_code; late crash 写真实码", async () => {

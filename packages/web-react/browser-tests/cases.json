@@ -293,6 +293,10 @@
     {
       "id": "T73",
       "proves": "冷启动(传输已开、relay 未就绪→4503 starting→重连 relay_ready)期间排队消息的活动行依次显示「正在连接服务… · 1 条待发送」「服务启动中，就绪后自动发送 · 1 条待发送」「正在发送…」，服务器确认收到(admission ACK)前绝不显示「思考中」(INC-20261015-COLDSTART-QUEUED-THINKING，OCV5-428)"
+    },
+    {
+      "id": "T74",
+      "proves": "回合在途切回会话时：启动态已超过 30 秒无新数据，经真实 ChatSocket→reducer→MessageList 的活动行不再显示「正在启动引擎」而是诚实文案；收到 hello 的 meta.detached 快照显示「后台运行中」；下一条真实帧到达即切回实时阶段，终态不粘(INC-20261028-STALE-ENGINE-STARTING)"
     }
   ]
 }

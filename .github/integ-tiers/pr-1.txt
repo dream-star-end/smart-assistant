@@ -19,3 +19,5 @@ packages/commercial/src/__tests__/permissionPromptSnapshotExplain.integ.test.ts
 packages/commercial/src/__tests__/permissionTimelineGet.integ.test.ts
 # OCV5-377: a refused recovery dispatch never leaves its job "retrying" forever
 packages/commercial/src/__tests__/turnRecoveryRefusedDispatch.integ.test.ts
+# RF-link: detached dispatch leases cannot revive another attempt or terminal turn
+packages/commercial/src/__tests__/containerLink.integ.test.ts

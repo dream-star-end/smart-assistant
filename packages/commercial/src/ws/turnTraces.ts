@@ -97,30 +97,44 @@ export function recordTurnTrace(
   });
 }
 
+/** Identity projection of a newly admitted webchat turn; never a frame default. */
+export function admittedTraceIdentity(dispatch: { agentId: string; sessionId: string }) {
+  return {
+    agentId: dispatch.agentId,
+    sessionKey: `agent:${dispatch.agentId}:webchat:dm:${dispatch.sessionId.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+  };
+}
+
 /**
- * MIN1:trace 登记发生在**分类阶段**(同步,dispatch 尚未受理),此时 dispatch_id/request_id
- * 还没铸;受理成功后本函数 **fire-and-forget** 补填这两个纯展示列(RFC §2 I3)。绝不动受理主链,
- * 失败只 warn(观测挂了不能拖垮对话)。COALESCE 兜底:trace 行若尚未落(极端时序),UPDATE
- * 命中 0 行无害,下次进会话仍可靠 dispatch/usage 表定位。
- *
- * OCV5-57 audit r1 B2 / r3: bounded retry (3 attempts, backoff) on both
- * empty rowCount and thrown PG errors. Still non-blocking; timers are unref'd.
+ * Enrich only this turn's trace after admission, without blocking its main path.
+ * The optional identity comes from the persisted dispatch and replaces an early
+ * frame-derived projection. Existing display links remain COALESCE; retries on
+ * PG failures/empty rows stay bounded and warn-only. No historical scan or fill.
  */
 export function updateTurnTraceDispatch(
   pool: Pool | undefined,
   warn: ((msg: string, fields?: Record<string, unknown>) => void) | undefined,
-  input: { traceId: string; dispatchId: string; requestId: string },
+  input: {
+    traceId: string;
+    dispatchId: string;
+    requestId: string;
+    identity?: ReturnType<typeof admittedTraceIdentity>;
+  },
 ): void {
   if (!pool) return;
+  const identity = input.identity;
+  const identityColumns = identity ? ", agent_id = $4, session_key = $5" : "";
+  const params = [input.traceId, input.dispatchId, input.requestId];
+  if (identity) params.push(identity.agentId, identity.sessionKey);
   retryPoolWrite({
     delays: TURN_TRACE_DISPATCH_BACKFILL_DELAYS_MS,
     retryOnEmpty: true,
     run: () => pool.query(
       `UPDATE turn_traces
           SET dispatch_id = COALESCE(dispatch_id, $2),
-              request_id  = COALESCE(request_id, $3)
+              request_id  = COALESCE(request_id, $3)${identityColumns}
         WHERE trace_id = $1`,
-      [input.traceId, input.dispatchId, input.requestId],
+      params,
     ),
     onDone: (ok, err, attempts) => {
       if (ok) return;

@@ -111,6 +111,9 @@ describe("thinking-safety liveness 分流（S3）", () => {
 
     const notice = sock.getTransientNotice("s1");
     expect(notice?.text).toContain("较长时间未收到新内容");
+    // B4:不再引导「停止后重新发送」——那会打断已付费的回合再付一轮。
+    expect(notice?.text).toContain("本轮可能仍在运行，可以继续等待");
+    expect(notice?.text).not.toMatch(/停止后重新发送|重新发送|重发/);
     expect(s._sendingInFlight).toBe(true); // in-flight 未被清（turn 生死交给 server）
     expect(s.messages.length).toBe(msgCountBefore); // 没有插入任何消息
     expect(s.messages.some((m) => m._emptyTurn)).toBe(false);

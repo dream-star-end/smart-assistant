@@ -25,10 +25,19 @@
  *     新标签页见同一目标直接横幅,省掉那 MAX 次无用刷新(多 tab/重开的观感风暴收敛)。
  *     storage 没了 → 退回纯谱系封顶(每条谱系仍 ≤ MAX 次)。
  * ── 安全点(与存储无关)────────────────────────────────────────────────────
+ *  S0 页面隐藏(OCV5-635):可见页一律不自动刷 —— 阅读、滚轮滚动都不产生输入事件,只靠
+ *     「30s 无输入」挡不住读到一半被整页刷掉。可见时只亮顶栏 pill,也不按 5min 升级横幅;
+ *     切到后台后由下面的 5s 重估在后台完成软刷,用户回来已是新版本。
  *  S1 无在飞 turn(_sendingInFlight 探针)+ 无草稿附件 + 距用户输入 ≥30s;不安全每 5s
- *     重估,挂起 >5min 出横幅;探针抛错按 busy(保守)。
+ *     重估,隐藏且挂起 >5min 出横幅;探针抛错按 busy(保守)。
  *  S2 形态校验:双端 id 均 8-32 hex 且不等才动作;dev 无 meta → 恒 inert。
  *  全程只用本地 now(),不掺服务器时间戳(跨时钟域红线)。
+ *
+ * ── 顶栏 pill(OCV5-626,不打扰的手动出口)────────────────────────────────────
+ *  形态校验通过且版本不一致的那一刻就亮,不等安全点也不等 5min:用户忙着时静默软刷
+ *  一直推迟,原先只能等横幅,期间撞上旧 chunk 才知道发了版。pill 只是给一个随手可点的
+ *  reloadNow() 入口,不改上面任何自动刷新规则;横幅出现时让位,「稍后」收起横幅后回到 pill,
+ *  版本一致或已开始刷新时熄灭。
  *
  * 刻意不做 reload 冷却:谱系硬顶已限总次数(≤MAX),再加"两次刷之间等 10min"只会
  * 拖延真正需要的第二次刷新(快速修复版发布后用户被迫干等),弊大于利。
@@ -55,6 +64,8 @@ export type AppUpdateDeps = {
   /** 写 reload 谱系计数,返回是否**写入并读回成功**(生产=history.replaceState + 读回)。
    *  返回 false = 无法持久化谱系 → 一次都不自动刷(fail-safe)。 */
   writeLineage: (n: number) => boolean;
+  /** 页面是否隐藏(生产=document.visibilityState === "hidden")。S0:只在隐藏时自动软刷。 */
+  isHidden: () => boolean;
 };
 
 export class AppUpdateGovernor {
@@ -66,6 +77,9 @@ export class AppUpdateGovernor {
   private lastActivityAt: number;
   private bannerVisible = false;
   private bannerDismissedFor: string | null = null;
+  /** 最近一帧确认的不一致目标(形态合法);版本一致即清空。pill 的唯一依据。 */
+  private mismatchTarget: string | null = null;
+  private pillVisible = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private reloaded = false;
   /** 本页所处 reload 谱系的已刷次数(构造时从 URL 读一次,之后只增不减)。 */
@@ -95,10 +109,16 @@ export class AppUpdateGovernor {
 
   /** 服务端握手帧入口。非法/缺失一律 no-op(S2)。 */
   onServerBuild(raw: unknown): void {
+    this.handleServerBuild(raw);
+    this.syncPill();
+  }
+
+  private handleServerBuild(raw: unknown): void {
     const server = typeof raw === "string" && BUILD_ID_RE.test(raw) ? raw : null;
     if (!server || this.reloaded) return;
     const client = this.deps.getClientBuild();
     if (!client || !BUILD_ID_RE.test(client)) return; // dev / meta 缺失 → inert
+    this.mismatchTarget = server === client ? null : server;
     if (server === client) {
       // 已是最新(典型:成功软刷后的下一帧)。清空 pending + 清 URL 谱系标记(谱系完成,
       // 地址栏归位;此后自发 reload 从 0 重新计,因为已经是对的版本了)。
@@ -132,6 +152,7 @@ export class AppUpdateGovernor {
     if (this.reloaded) return;
     this.reloaded = true;
     this.stopTimer();
+    this.syncPill();
     this.deps.reload();
   }
 
@@ -146,6 +167,7 @@ export class AppUpdateGovernor {
     return () => this.listeners.delete(fn);
   };
   getBannerVisible = (): boolean => this.bannerVisible;
+  getPillVisible = (): boolean => this.pillVisible;
 
   // ── 内部 ──
 
@@ -167,6 +189,14 @@ export class AppUpdateGovernor {
       return;
     }
 
+    // S0 页面可见 → 不自动刷,只靠 pill;隐藏后由本重估接手。挂起计时从「隐藏且被挡」才开始算,
+    // 免得前台读了很久、一切到后台就立刻出横幅。
+    if (!this.deps.isHidden()) {
+      this.pendingSince = now;
+      this.timer = setTimeout(this.check, RECHECK_MS);
+      return;
+    }
+
     // S1 安全点
     const busy = [...this.busyProbes].some((p) => {
       try { return p(); } catch { return true; } // 探针抛错按 busy(保守)
@@ -183,6 +213,7 @@ export class AppUpdateGovernor {
       return;
     }
     this.reloaded = true;
+    this.syncPill();
     this.deps.reload();
   };
 
@@ -200,6 +231,23 @@ export class AppUpdateGovernor {
   private setBanner(visible: boolean): void {
     if (this.bannerVisible === visible) return;
     this.bannerVisible = visible;
+    this.pillVisible = this.derivePill();
+    this.emit();
+  }
+
+  /** 只在 pill 可见性真的变了时通知(横幅变化已由 setBanner 一并通知)。 */
+  private syncPill(): void {
+    const next = this.derivePill();
+    if (next === this.pillVisible) return;
+    this.pillVisible = next;
+    this.emit();
+  }
+
+  private derivePill(): boolean {
+    return this.mismatchTarget !== null && !this.bannerVisible && !this.reloaded;
+  }
+
+  private emit(): void {
     for (const fn of this.listeners) fn();
   }
 
@@ -322,6 +370,7 @@ export const appUpdate = new AppUpdateGovernor({
   storage: typeof window === "undefined" ? null : probeLocalStorage(),
   readLineage: () => (typeof window === "undefined" ? 0 : readLineageFromUrl(window.location.hash)),
   writeLineage: writeLineageToUrl,
+  isHidden: () => typeof document !== "undefined" && document.visibilityState === "hidden",
 });
 
 if (typeof window !== "undefined") {

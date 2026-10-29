@@ -259,7 +259,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
   });
 
   test("user：气泡 + 状态角标", () => {
-    renderMsg(mk("user", { text: "提问", status: "sent" }));
+    renderMsg(mk("user", { text: "提问", status: "sent" }), { sending: true });
     expect(screen.getByText("提问")).toBeInTheDocument();
     expect(screen.getByText("已送达")).toBeInTheDocument();
   });
@@ -1044,6 +1044,37 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(retries).toHaveLength(1);
     fireEvent.click(retries[0]);
     expect(onRetrySend).toHaveBeenCalledWith(recoveryChild);
+  });
+
+  test("OCV5-645 自动恢复子行在、源行无快照但已有正文:正文照常显示,只藏错误卡", () => {
+    render(
+      <MessageList
+        messages={[
+          { ...failedUser, status: "sent" },
+          mk("assistant", {
+            id: "a-held-source-with-answer",
+            _clientMessageId: failedUser.id,
+            _errorCode: "engine_error",
+            _errorHeldForRecovery: true,
+            text: "HELD_SOURCE_PARTIAL_ANSWER\n\n[turn failed: BOX_REPLAY_PENDING]",
+          }),
+          mk("user", {
+            id: "u-held-recovery-child",
+            text: "↻ 自动从断点继续",
+            _isAutoRetry: true,
+            _automaticRecovery: true,
+            _recoveryOfClientMessageId: failedUser.id,
+          }),
+        ]}
+        sending={false}
+        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn() }}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("HELD_SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
+    expect(screen.queryByText("↻ 自动从断点继续")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
   });
 
   test("手动恢复子行不渲染，只靠血缘字段也能隐藏", () => {
@@ -3739,6 +3770,60 @@ describe("MessageList 会话内查找", () => {
     opener.remove();
     scroller.remove();
   });
+
+  test("OCV5-628:还没输入时不报「无匹配」，输入后才出计数", () => {
+    render(
+      <MessageList
+        messages={[mk("user", { id: "f628-u1", text: "苹果派", status: "sent" })]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        find={{ onClose: vi.fn() }}
+      />,
+    );
+    expect(screen.queryByTestId("find-count")).toBeNull();
+    expect(screen.queryByText("无匹配")).toBeNull();
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), { target: { value: "香蕉" } });
+    expect(screen.getByTestId("find-count")).toHaveTextContent("无匹配");
+    fireEvent.change(screen.getByRole("textbox", { name: "在会话中查找" }), { target: { value: "  " } });
+    expect(screen.queryByTestId("find-count")).toBeNull();
+  });
+
+  test("OCV5-628:云端还有更早记录时如实说明查找范围，「搜更早」走显式归档分页，输入本身不发请求", async () => {
+    const onLoadOlder = vi.fn(async () => {});
+    const props = {
+      messages: [mk("user", { id: "f628-u2", text: "苹果派", status: "sent" as const })],
+      sending: false,
+      cb: {},
+      onRespondPermission: () => {},
+      find: { onClose: vi.fn() },
+    };
+    const { rerender } = render(
+      <MessageList {...props} archive={{ hasMore: true, loading: false, error: false, onLoadOlder }} />,
+    );
+    const box = screen.getByRole("textbox", { name: "在会话中查找" });
+    expect(screen.queryByTestId("find-scope-hint")).toBeNull();
+
+    fireEvent.change(box, { target: { value: "香蕉" } });
+    const hint = screen.getByTestId("find-scope-hint");
+    expect(hint).toHaveTextContent("已加载部分无匹配");
+    expect(hint).toHaveTextContent("更早的记录还没加载，不在查找范围内");
+    expect(onLoadOlder).not.toHaveBeenCalled();
+    fireEvent.click(within(hint).getByRole("button", { name: "搜更早" }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+
+    // 有命中时仍说明范围，但不再说「无匹配」。
+    fireEvent.change(box, { target: { value: "苹果" } });
+    expect(screen.getByTestId("find-count")).toHaveTextContent("1/1");
+    expect(screen.getByTestId("find-scope-hint")).not.toHaveTextContent("无匹配");
+
+    // 加载中按钮原位禁用；已到最早记录后提示消失。
+    rerender(<MessageList {...props} archive={{ hasMore: true, loading: true, error: false, onLoadOlder }} />);
+    expect(within(screen.getByTestId("find-scope-hint")).getByRole("button", { name: /加载中/ })).toBeDisabled();
+    rerender(<MessageList {...props} archive={{ hasMore: false, loading: false, error: false, onLoadOlder }} />);
+    expect(screen.queryByTestId("find-scope-hint")).toBeNull();
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
 });
 
 
@@ -4226,5 +4311,36 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
     expect(screen.queryAllByRole("button", { name: "更多操作" })
       .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
+  });
+});
+// 「已送达」= 服务端已受理、回复还没开始。sent 同时也是停止 / 服务重启中断 / 重复受理 / 自动恢复源轮的
+// 落定态,REST 对账、自动重试软状态、停止收尾都会把一条早已出过回复的用户行写回 sent;标签若只看
+// status,就会在已回复或已结束的消息下反复冒出来又消失。
+describe("「已送达」只属于在飞且还没有回复的那一轮", () => {
+  const list = (messages: ChatMessage[], sending: boolean) => (
+    <MessageList messages={messages} sending={sending} cb={{}} onRespondPermission={() => {}} />
+  );
+
+  test("回复开始后用户行被写回 sent(自动重试软状态 / 停止收尾):不再冒出「已送达」", () => {
+    const user = mk("user", { id: "u1", text: "长任务", status: "sent" });
+    const view = render(list([user], true));
+    expect(screen.getByText("已送达")).toBeInTheDocument();
+    const reply = mk("assistant", { id: "a1", text: "开始处理", _clientMessageId: "u1" });
+    view.rerender(list([{ ...user, status: "read" }, reply], true));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+    view.rerender(list([{ ...user, status: "sent" }, reply], true));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+    view.rerender(list([{ ...user, status: "sent" }, reply], false));
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
+  });
+
+  test("已结束的轮落定为 sent(服务重启中断 / 回复前就停止):历史消息下不显示「已送达」", () => {
+    render(list([
+      mk("user", { id: "u1", text: "第一问", status: "sent" }),
+      mk("assistant", { id: "a1", text: "部分回答", _clientMessageId: "u1" }),
+      mk("user", { id: "u2", text: "第二问", status: "sent" }),
+    ], false));
+    expect(screen.getByText("第二问")).toBeInTheDocument();
+    expect(screen.queryByText("已送达")).not.toBeInTheDocument();
   });
 });

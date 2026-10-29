@@ -465,6 +465,9 @@ class BoxSession {
   private sawExit = false
   private stopRequested = false
   private failedWriteCleanup: Promise<void> | undefined
+  private writeFailed = false
+  private closing = false
+  private writing: Promise<void> = Promise.resolve()
   private readonly signals = new BoxLoginSignalTap()
   private readonly abort = new AbortController()
   /** Set once the session gave up before READY: later lines go back to the bridge. */
@@ -530,7 +533,12 @@ class BoxSession {
     throw last instanceof Error ? last : new Error('BOX_CC_WRITE_FAILED')
   }
 
-  private async writeLine(line: string): Promise<void> {
+  private writeLine(line: string): Promise<void> {
+    this.writing = this.sendLine(line)
+    return this.writing
+  }
+
+  private async sendLine(line: string): Promise<void> {
     try {
       const isGptWeb = isBoxGptWebModelArgv(this.o.args)
       const stampedLine =
@@ -546,7 +554,8 @@ class BoxSession {
         this.activeGptWebUserLine = stampedLine
       }
     } catch (err) {
-      if (this.abort.signal.aborted) return
+      if (this.writeFailed) return
+      this.writeFailed = true
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
       this.o.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
       // The interactive host would otherwise keep its tmux session until this
@@ -607,6 +616,10 @@ class BoxSession {
       this.o.late(line)
       return
     }
+    if (this.closing) {
+      this.o.late(line)
+      return
+    }
     if (this.abort.signal.aborted) return
     if (this.held) {
       this.held.push(line)
@@ -626,7 +639,7 @@ class BoxSession {
     return (async () => {
       try {
         for (const line of lines) {
-          if (this.abort.signal.aborted) break
+          if (this.closing || this.abort.signal.aborted) break
           await this.writeLine(line)
         }
       } finally {
@@ -694,6 +707,16 @@ class BoxSession {
     return { kind: 'not_ready', ...o, held }
   }
 
+  /** Close admission before joining writes; the reader must not choose a successful
+   * outcome while an already-started write or its stop response is still pending. */
+  private async finishWrites(): Promise<void> {
+    this.closing = true
+    await this.gate
+    await this.writing
+    this.abort.abort()
+    if (this.failedWriteCleanup) await this.failedWriteCleanup
+  }
+
   async run(): Promise<SessionOutcome> {
     let launch: BoxCcExecRequest
     try {
@@ -756,6 +779,8 @@ class BoxSession {
       this.hostStreamEnded = true
     } catch (error) {
       this.hostStreamEnded = true
+      await this.finishWrites()
+      if (this.writeFailed) throw error
       if (!this.stopRequested && !this.o.abort.signal.aborted) {
         if (isBoxGptWebModelArgv(this.o.args) && this.activeGptWebUserLine !== null) {
           this.o.out.discardIncompleteLine()
@@ -778,9 +803,9 @@ class BoxSession {
         return this.giveUp({ why, unsafe: false, retryable: true })
       }
     } finally {
-      this.abort.abort()
-      if (this.failedWriteCleanup) await this.failedWriteCleanup
+      await this.finishWrites()
     }
+    if (this.writeFailed) return { kind: 'ended', code: 1 }
     if (!this.readySeen && !this.sawStdout && !this.stopRequested && !this.o.abort.signal.aborted) {
       // The host never got a line, so nothing ran.
       const unsafe = /BOX_INTERACTIVE_NOT_READY profile_unsafe/.test(this.hostErr)

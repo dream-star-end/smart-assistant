@@ -142,6 +142,27 @@ describe("AssistantCard 预期错误视觉语义", () => {
   });
 });
 
+describe("OCV5-645 等自动恢复时只藏错误卡", () => {
+  test("挂起且无冻结快照:已有部分回答照常渲染,不出错误卡与重发按钮", () => {
+    renderErr(errMsg({
+      _errorCode: "engine_error",
+      _clientMessageId: "u1",
+      _errorHeldForRecovery: true,
+      text: '长任务已完成，返回示例：\n```json\n{ "status": "ok" }\n```\n\n[turn failed: BOX_REPLAY_PENDING]',
+    }), { onRegenerate: vi.fn() });
+    expect(screen.getByText("长任务已完成，返回示例：")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("结果正在收尾")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
+  });
+
+  test("挂起且没有部分回答:整行不渲染(回归)", () => {
+    renderErr(errMsg({ _errorCode: "engine_error", _errorHeldForRecovery: true,
+      text: "[turn failed: BOX_REPLAY_PENDING]" }), {});
+    expect(screen.queryByTestId("assistant-row")).toBeNull();
+  });
+});
+
 describe("消息引用动作与已发送引用块", () => {
   test("助手消息提供 44px 触控引用动作并回传原消息", () => {
     const onQuote = vi.fn();
@@ -408,8 +429,11 @@ describe("UserCard 状态标签(M-09)", () => {
     expect(screen.queryByText("已回复")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "read" })} cb={{}} />);
     expect(screen.queryByText("已读")).toBeNull();
-    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
+    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} awaitingReply />);
     expect(screen.getByText("已送达")).toBeInTheDocument();
+    // sent 也是停止 / 中断 / 恢复源轮的落定态:不在等回复时不标「已送达」。
+    rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
+    expect(screen.queryByText("已送达")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "sending" })} cb={{}} />);
     expect(screen.getByText("发送中")).toBeInTheDocument();
     rerender(<UserCard msg={userMsg({ status: "queued", text: "等一下再发" })} cb={{}} />);
@@ -927,6 +951,21 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+  });
+
+  test("OCV5-646 重启中断轮换端打开:折回的部分回答照常显示，仍不出错误卡", () => {
+    renderErr(errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _errorDetail: "任务因服务重启中断，此前已生成的过程已完整保留",
+      text: "要根治，不能只加一次重试。",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+    }), {
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.getByText("要根治，不能只加一次重试。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {

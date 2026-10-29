@@ -21,18 +21,29 @@ test('readServerFeatures maps each env flag', () => {
     chips: false,
     recipeSchedule: false,
     unfiledSuggest: false,
+    timelineShadow: false,
   })
   assert.deepEqual(
-    readServerFeatures({ OC_P5_CHIPS: 'yes', OC_P5_RECIPE_SCHEDULE: '0', OC_P5_UNFILED_SUGGEST: 'on' }),
-    { chips: true, recipeSchedule: false, unfiledSuggest: true },
+    readServerFeatures({
+      OC_P5_CHIPS: 'yes',
+      OC_P5_RECIPE_SCHEDULE: '0',
+      OC_P5_UNFILED_SUGGEST: 'on',
+      OC_TIMELINE_LIFECYCLE_SHADOW: '1',
+    }),
+    { chips: true, recipeSchedule: false, unfiledSuggest: true, timelineShadow: true },
   )
 })
 
 test('serverFeatureContainerEnv forwards only flags that are on, normalised to =1', () => {
   assert.deepEqual(serverFeatureContainerEnv({}), [])
   assert.deepEqual(
-    serverFeatureContainerEnv({ OC_P5_CHIPS: 'true', OC_P5_RECIPE_SCHEDULE: 'nope', OC_P5_UNFILED_SUGGEST: '1' }),
-    ['OC_P5_CHIPS=1', 'OC_P5_UNFILED_SUGGEST=1'],
+    serverFeatureContainerEnv({
+      OC_P5_CHIPS: 'true',
+      OC_P5_RECIPE_SCHEDULE: 'nope',
+      OC_P5_UNFILED_SUGGEST: '1',
+      OC_TIMELINE_LIFECYCLE_SHADOW: 'on',
+    }),
+    ['OC_P5_CHIPS=1', 'OC_P5_UNFILED_SUGGEST=1', 'OC_TIMELINE_LIFECYCLE_SHADOW=1'],
   )
 })
 
@@ -42,8 +53,10 @@ test('parseServerFeatures fails closed', () => {
   assert.deepEqual(parseServerFeatures({}), SERVER_FEATURES_OFF)
   assert.deepEqual(parseServerFeatures({ features: 'on' }), SERVER_FEATURES_OFF)
   assert.deepEqual(
-    parseServerFeatures({ features: { chips: true, recipeSchedule: 'true', unfiledSuggest: 1, other: true } }),
-    { chips: true, recipeSchedule: false, unfiledSuggest: false },
+    parseServerFeatures({
+      features: { chips: true, recipeSchedule: 'true', unfiledSuggest: 1, timelineShadow: 'on', other: true },
+    }),
+    { chips: true, recipeSchedule: false, unfiledSuggest: false, timelineShadow: false },
   )
   assert.ok(Object.isFrozen(SERVER_FEATURES_OFF))
 })

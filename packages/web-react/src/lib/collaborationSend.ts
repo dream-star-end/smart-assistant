@@ -1,4 +1,4 @@
-import { api } from './api'
+import { api, ApiError } from './api'
 import {
   type CollabUiState,
   collaborationPutBody,
@@ -64,7 +64,12 @@ export async function prepareAdvisorSend(input: {
   return { state, recoveredAdvisor }
 }
 
-/** Keep the original identity fence across session creation and config persistence. */
+/**
+ * Materialize the first-send collaboration override for a new session.
+ * Align with persistCollab: one CAS 409 → GET fresh rev → PUT retry so a
+ * stale expectedRev (new-chat race / concurrent leave-team write) does not
+ * surface as「协作配置保存失败」and leave the header stuck on default team.
+ */
 export async function saveInitialCollaboration(
   auth: Auth,
   sessionId: string,
@@ -72,22 +77,31 @@ export async function saveInitialCollaboration(
   asDefault: boolean,
   identityEpoch: number,
 ) {
+  const bodyFor = (rev: number) =>
+    collaborationPutBody({
+      sessionId,
+      mode: state.mode,
+      advisorModel:
+        state.mode === 'advisor' ? (state.advisorModel ?? recommendedAdvisorModel(state)) : null,
+      expectedRev: rev,
+      asDefault,
+    })
+  const stillCurrent = () => auth.snapshot().epoch === identityEpoch
   try {
-    const doc = await api.putCollaborationConfig(
-      auth,
-      collaborationPutBody({
-        sessionId,
-        mode: state.mode,
-        advisorModel:
-          state.mode === 'advisor' ? (state.advisorModel ?? recommendedAdvisorModel(state)) : null,
-        expectedRev: state.rev,
-        asDefault,
-      }),
-    )
-    return auth.snapshot().epoch === identityEpoch ? doc : null
+    const doc = await api.putCollaborationConfig(auth, bodyFor(state.rev))
+    return stillCurrent() ? doc : null
   } catch (error) {
-    if (auth.snapshot().epoch !== identityEpoch) return null
-    throw error
+    if (!stillCurrent()) return null
+    if (!(error instanceof ApiError) || error.status !== 409) throw error
+    try {
+      const fresh = await api.getCollaborationConfig(auth, sessionId)
+      if (!stillCurrent()) return null
+      const saved = await api.putCollaborationConfig(auth, bodyFor(fresh.rev))
+      return stillCurrent() ? saved : null
+    } catch (retryErr) {
+      if (!stillCurrent()) return null
+      throw retryErr
+    }
   }
 }
 

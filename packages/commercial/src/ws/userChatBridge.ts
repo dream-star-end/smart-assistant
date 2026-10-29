@@ -1,4 +1,13 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { containerLinkSnapshotSession } from "./containerLinkHello.js";
+import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
+import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
+import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
+import { sendErrorFrame } from './userErrorFrames.js';
+import { withUserError } from '@openclaude/protocol';
+import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
+import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapshot } from "./containerLink.js";
+import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -50,7 +59,7 @@ import { isBoxGptWebAllowedUser, isCursorCredentialMember } from "../cursor/acce
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
-import { recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
+import { admittedTraceIdentity, recordTurnTrace, updateTurnTraceDispatch } from "./turnTraces.js";
 import {
   extractFirstVisibleAttribution,
   FirstVisiblePersistGate,
@@ -351,10 +360,6 @@ export const CLOSE_BRIDGE = {
  * 导出供 index.ts 装配 createTunnelContainerSocket 时复用,避免两处 magic number 漂移。 */
 export const DEFAULT_MAX_FRAME_BYTES = 448 * 1024 * 1024;
 
-/** 单条 hello 最多查这么多在飞候选。peers 数组来自客户端,无此上限可把 PG 打满。 */
-const HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES = 8;
-/** clientMessageId 长度硬顶。先挡住无界字符串(单帧上限 448 MiB),再跑格式校验。 */
-const HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN = 200;
 /** 单条 hello 最多从 PG 补齐这么多会话的在飞 live frames。 */
 const HELLO_LIVE_CATCHUP_MAX_SESSIONS = 8;
 /** 单会话 hello 补齐帧数封顶,与 GET live-frames 页大小对齐。 */
@@ -722,129 +727,21 @@ export class ContainerUnreadyError extends Error {
   }
 }
 
-/** 测试 / 2I-2 metrics 回调:单事件钩子。 */
-export interface BridgeMetricSink {
-  /** 一条用户帧已转发到容器(bytes 是 raw 字节数,含 binary)。 */
-  onUserFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
-  /** 一条容器帧已转发到用户。 */
-  onContainerFrame?(uid: bigint, bytes: number, isBinary: boolean): void;
-  /**
-   * Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧 的间隔。
-   * 每个 bridge session 至多触发一次(若用户从未发帧,则不触发)。
-   * kind 透 endpoint.coldStart(undefined → "warm",见 ResolveContainerEndpoint 漏标说明)。
-   */
-  onTtft?(uid: bigint, kind: "cold" | "warm", seconds: number): void;
-  /** 当前任意一侧 buffered bytes 取最大值上报(用于 prometheus gauge)。 */
-  onBufferedBytes?(uid: bigint, side: "user_to_container" | "container_to_user", bytes: number): void;
-  /** 桥关闭时单次,拿到本次会话总字节数 / 时长 / closeCode。 */
-  onClose?(stats: {
-    uid: bigint;
-    connId: string;
-    durationMs: number;
-    closeCode: number;
-    closeReason: string;
-    bytesUserToContainer: number;
-    bytesContainerToUser: number;
-    cause: BridgeCloseCause;
-  }): void;
-}
+import {
+  CONTAINER_ATTEST_FRAME_TYPE,
+  type BridgeMetricSink,
+  type BridgeCloseCause,
+  type BridgeModelAuthorityDeps,
+  type ModelCheckerHandle,
+} from "./userChatBridgeTypes.js";
+export type {
+  BridgeMetricSink,
+  BridgeCloseCause,
+  BridgeModelAuthorityDeps,
+  ModelCheckerHandle,
+} from "./userChatBridgeTypes.js";
+export { CONTAINER_ATTEST_FRAME_TYPE } from "./userChatBridgeTypes.js";
 
-/** 桥关闭的根因分类(供 metrics / 日志诊断)。 */
-export type BridgeCloseCause =
-  | "client_close"           // 用户主动 close
-  | "container_close"        // 容器主动 close
-  | "container_error"        // 容器 socket 错(ECONNREFUSED 等)
-  | "container_unready"      // ensureRunning throw ContainerUnreadyError
-  | "auth_failed"            // JWT 验证失败
-  | "frame_too_big"          // 单帧超过 maxFrameBytes
-  | "binary_unsupported"     // (保留,默认放行 binary)
-  | "backpressure"           // buffer 超 maxBufferedBytes
-  | "internal_error"         // 兜底
-  | "shutdown";              // server.shutdown()
-
-// ---------- 模型执行权威(方案 §2 / §7 步 4)---------------------------------
-
-/**
- * bridge 侧的模型权威签发装配(docs/V5_MODEL_AUTHORITY_PLAN.md)。
- *
- * **注入即开启**(index.ts 只在 flag `OC_MODEL_AUTHORITY=1` 时构造并注入):
- *   - 未注入 → bridge 完全走旧路径(不签发、不注入、不做 attestation 门),零行为变化;
- *   - 注入   → ①每条连接要求容器 attest `model_authority_v1`(未 attest 前缓冲用户帧,
- *              有界 + 超时;超时/不支持 → 拒连接 + 触发 stale recycle);
- *              ②每条 forward 的 inbound.message 先 strip 客户端同名字段,再注入
- *              master 签名的 `__oc_model_authority`;
- *              ③codex 计费链的 isCodex 判定改用 **descriptor.engine**(与签发同源,
- *              不再是 baked 的 gpt-* 前缀集合)。
- *
- * fail-closed 边界:catalog 快照 unknown / epoch fence 失败 / 模型不可路由 → **拒帧**,
- * 绝不「降级为不带 envelope 转发」—— 那会让容器回落 baked 判定,而 master 这边可能已按
- * 另一套语义预扣,正是本批次要消灭的计费/执行分裂。
- */
-export interface BridgeModelAuthorityDeps {
-  /** master 独占私钥的签发器(公钥 keyring 由 supervisor 注入容器 env)。 */
-  signer: AuthoritySigner;
-  /** ModelExecutionCatalog 快照缓存(epoch fence 的执行体)。 */
-  catalog: ModelCatalogCache;
-  /**
-   * 容器不支持 attestation(旧 release / 旧 env)→ 触发 stale recycle,让用户下次连接
-   * 拿到带 keyring 的新容器。未注入 → 只拒连接不 recycle(测试/降级)。
-   */
-  recycleContainer?: (containerId: number, reason: string) => void;
-  /** 等待容器 attestation 的上限(默认 10s)。 */
-  attestTimeoutMs?: number;
-  /**
-   * **签发边界的 epoch 直读**(代码审 R1 MAJOR-2)。默认 = billing/modelCatalog
-   * `readSecurityEpoch()`(单行 SELECT,无时间缓存,与 fence 同一权威源)。
-   *
-   * 为什么签发边界要**再读一次**:`resolveTurnExecution` 的 fence 发生在 turn 起手,
-   * 但从那里走到"签票"之间还隔着 route / acquire / preCheck / journal / 历史消息装配
-   * 好几个 await —— 安全写(disable 模型 / 撤销授权 / 改价 / bump epoch)完全可能落在
-   * 这中间。只在早期 fence 一次,等于用一个**已经过时的快照**签出一张长命票据
-   * (lease TTL = 50min),把"安全变更立刻生效"的承诺打穿。
-   *
-   * 测试注入用。
-   */
-  readSecurityEpoch?: () => Promise<bigint>;
-  /**
-   * keyring 覆盖普查(R3-M7 轮换步骤② 的 gate)。缺省 = 进程级单例
-   * `ws/authorityKeyCensus.authorityKeyCensus`。测试注入以隔离。
-   */
-  census?: AuthorityKeyCensus;
-}
-
-/**
- * 0049 grants checker 的连接级 handle(**epoch 联动版**,代码审 R1 BLOCKER-1)。
- *
- * 旧形态的洞:checker 每 GRANTS_REFRESH_INTERVAL_MS(30s)刷一次,**刷新失败永久保留旧
- * checker**。撤销授权后:
- *   - CCB 有 egress 的每请求授权兜底(proxy 里重查 role+grants);
- *   - **codex 根本不经 /v1/messages egress** → 唯一的授权闸就是本 checker。
- * 于是「撤权 → 30s 窗口(或 DB 抖动时的**无限**窗口)内旧连接照签票、照执行」。
- *
- * 修法(与 catalog 同一条 fence 语义):
- *   - grants 快照带 **epoch 戳**(= 读 grants 之前观察到的 DB security epoch 的下界);
- *   - 0144 起任何 grant 写(含 DELETE)都 bump epoch;
- *   - 每个 turn 在 catalog epoch fence **之后**比对:checker.epoch < 权威 epoch → 说明
- *     期间发生过安全写(可能就是撤权)→ `reloadAtLeast(权威 epoch)` 同步重载并**重新判定**;
- *   - 重载失败 / 达不到目标 epoch → **拒帧**(禁止 keep-LKG 放行)。
- *
- * 「放宽」与「收窄」两条路分开:周期 refresh 失败仍 keep-LKG(新授权晚点生效可以忍),
- * 收窄面(reloadAtLeast)一律 fail-closed。
- */
-export interface ModelCheckerHandle {
-  /** 已绑定本连接 uid+DB role+grants+fenced visibility 的 sync 判定闭包。 */
-  isAllowed: (modelId: string) => boolean;
-  /** 当前 grants 快照的 epoch 下界(0 = 尚未观察到任何 epoch,视作最陈旧)。 */
-  epoch: () => bigint;
-  /** 周期刷新(放宽面):失败保留上次成功快照,不抛。 */
-  refresh: () => Promise<void>;
-  /** 严格重载到 ≥ want(收窄面):失败或达不到 → 抛,调用方**必须拒帧**。 */
-  reloadAtLeast: (want: bigint) => Promise<void>;
-}
-
-/** 容器 attestation 帧 type —— 与 gateway `modelAuthority.CONTAINER_ATTEST_FRAME_TYPE` 同值
- *  (两包不互相 import,parity 由 modelAuthorityBridge.test.ts 锁定)。 */
-export const CONTAINER_ATTEST_FRAME_TYPE = "outbound.control.container_attest";
 
 /** 等待容器 attestation 的默认上限。容器 open 后立刻发 attest,10s 已是极宽松的上限。 */
 const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
@@ -975,6 +872,9 @@ async function resolveTurnExecution(
 // ---------- Deps + Handler --------------------------------------------------
 
 export interface UserChatBridgeDeps {
+  /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
+  containerLinkEnabled?: boolean;
+  containerLinkHeartbeatMs?: number;
   jwtSecret: string | Uint8Array;
   /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
   promptQueueEnabled?: boolean;
@@ -1511,13 +1411,6 @@ function readDispatchDrainMs(): number {
   return Math.min(n, MAX_DISPATCH_DRAIN_MS);
 }
 
-/**
- * PR2 v1.0.66 — 32-hex per-turn 标识,master 生成且**强制覆写** client 提供的值。
- *
- * 设计契约:client (浏览器) 不应也无法预测此 id;若 client 把别的 turn 的
- * requestId 塞进 inbound.message 试图错关 inflight 行 → master 直接覆写,
- * 防伪造。容器侧只在 inbound→outbound.codex_billing 透传,不验证。
- */
 function ensureRequestIdServerSide(): string {
   return randomBytes(16).toString("hex");
 }
@@ -1643,6 +1536,7 @@ export type CronOriginExecutor = (payload: {
   admitted: {
     clientMessageId: string
     sessionId: string
+    agentId: string
     dispatchId: string
     billingRequestId: string
     attemptNo: number
@@ -1661,6 +1555,7 @@ export interface UserChatBridgeHandler {
   shutdown(reason?: string): Promise<void>;
   /** 测试 / metrics:获取 ConnectionRegistry。 */
   registry: ConnectionRegistry;
+  containerLinkSnapshots?(): ContainerLinkSnapshot[];
   /**
    * 给指定 uid 的所有活跃 user WS 广播一个 JSON 帧(旁路透传管道,非容器来源)。
    *
@@ -1871,6 +1766,7 @@ export async function executeCronOriginInject(opts: {
     admitted: {
       clientMessageId: d.clientMessageId,
       sessionId: d.sessionId,
+      agentId: d.agentId,
       dispatchId: d.dispatchId,
       billingRequestId: d.billingRequestId,
       attemptNo: d.attemptNo,
@@ -1992,31 +1888,6 @@ function inboundTurnIdentityFromParsed(parsed: unknown): InboundTurnIdentity {
 const SESSION_DELETED_WIRE_MESSAGE =
   "This conversation was deleted. Start a new one; retrying here will not bring it back.";
 
-function sendErrorFrame(
-  ws: WebSocket,
-  code: string,
-  message: string,
-  turn?: {
-    peerId?: string | null;
-    clientMessageId?: string | null;
-    retryable?: boolean;
-    action?: string;
-  },
-): void {
-  if (ws.readyState !== WebSocket.OPEN) return;
-  try {
-    ws.send(JSON.stringify({
-      type: "error",
-      code,
-      message,
-      ...(turn?.peerId ? { peer: { id: turn.peerId, kind: "dm" } } : {}),
-      ...(turn?.clientMessageId ? { clientMessageId: turn.clientMessageId } : {}),
-      ...(turn?.retryable === false || turn?.retryable === true ? { retryable: turn.retryable } : {}),
-      ...(turn?.action ? { action: turn.action } : {}),
-    }));
-  }
-  catch { /* client gone */ }
-}
 
 function sendSessionDeletedFrame(
   ws: WebSocket,
@@ -2255,9 +2126,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       : DISPATCH_LEASE_HEARTBEAT_MS;
   const log = deps.logger;
   const metrics = deps.metrics ?? {};
-  const createContainerSocket = deps.createContainerSocket
-    ?? ((host, port, _signal) =>
-        new WebSocket(`ws://${host}:${port}/ws`, { perMessageDeflate: false, maxPayload: maxFrameBytes }));
 
   const registry = new ConnectionRegistry({ maxPerUser });
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxFrameBytes });
@@ -2418,6 +2286,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     return open;
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
+  const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
+    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes })
+    : null;
+  const drainingChecks = new Set<() => void>();
+  let shuttingDown = false;
   const uidToRecoveryExecutors = new Map<
     string,
     Set<(job: ClaimedRecoveryJob) => void>
@@ -2485,7 +2358,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     const key = uid.toString();
     if (recoveryDrainRunning.has(key)) return;
     const executors = uidToRecoveryExecutors.get(key);
-    const executor = executors && [...executors][0];
+    const executor = availableExecutors(executors)[0];
     if (!executor) return;
     recoveryDrainRunning.add(key);
     try {
@@ -2500,7 +2373,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         leaseMs: recoveryLeaseMs,
       });
       for (const job of jobs) {
-        const liveExecutor = [...(uidToRecoveryExecutors.get(key) ?? [])][0];
+        const liveExecutor = availableExecutors(uidToRecoveryExecutors.get(key))[0];
         if (!liveExecutor) {
           await releaseRecoveryForTransportWait(deps.pgPool, job);
           continue;
@@ -2861,31 +2734,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const connectAbort = new AbortController();
         let containerWs: WebSocket;
         try {
-          if (endpoint.desktop) {
-            const { getDesktopTunnelRegistry } = await import("./desktopTunnelRegistry.js");
-            containerWs = getDesktopTunnelRegistry().openWs(endpoint.desktop.containerId, "/ws") as unknown as WebSocket;
-          } else if (endpoint.tunnel) {
-            if (!deps.createTunnelContainerSocket) {
-              // 部署级配置漏注 — 给 4503 让前端别死循环重连(会上报 alert 由 ensureRunning 路径)
-              log?.error("user-chat-bridge: tunnel endpoint but factory not injected", {
-                uid: uid.toString(),
-                hostId: endpoint.tunnel.hostId,
-                containerInternalId: endpoint.tunnel.containerInternalId,
-              });
-              sendErrorFrame(ws, "ERR_INTERNAL", "tunnel not configured");
-              try { ws.close(CLOSE_BRIDGE.INTERNAL, "tunnel not configured"); } catch { /* */ }
-              return;
-            }
-            containerWs = await deps.createTunnelContainerSocket(
-              endpoint.tunnel,
-              endpoint.port,
-              connectAbort.signal,
-              // S12e CG4:connection-level trace 透传,headers 写 X-Connection-Trace-Id
-              connId,
-            );
-          } else {
-            containerWs = createContainerSocket(endpoint.host, endpoint.port, connectAbort.signal);
-          }
+          containerWs = await attachContainerTransport({
+            uid, endpoint, links, deps, maxFrameBytes, signal: connectAbort.signal, connId,
+          });
         } catch (err) {
           log?.error("user-chat-bridge: container socket factory failed", {
             uid: uid.toString(),
@@ -2947,6 +2798,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           connId,
           claims.role === "admin" ? "admin" : "user",
         );
+        getContainerLinkHandle(containerWs)?.activate();
       })().catch((err: unknown) => {
         log?.error("user-chat-bridge: upgrade pipeline threw", { err });
         try { ws.close(CLOSE_BRIDGE.INTERNAL, "internal error"); } catch { /* */ }
@@ -3106,6 +2958,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let containerHasDurableDispatch = false;
     let recoveryExecutor: ((job: ClaimedRecoveryJob) => void) | null = null;
     let cronOriginExecutor: CronOriginExecutor | null = null;
+    let unregisterExecutors: (() => void) | null = null;
     let attestTimer: ReturnType<typeof setTimeout> | null = null;
     const attestQueue: Array<{
       data: RawData;
@@ -3191,24 +3044,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
           executeAdmittedTurn(encoded, false, "recovery", undefined, job);
         };
-        const key = uid.toString();
-        let executors = uidToRecoveryExecutors.get(key);
-        if (!executors) {
-          executors = new Set();
-          uidToRecoveryExecutors.set(key, executors);
-        }
-        executors.add(recoveryExecutor);
-        void drainDurableRecoveryForUser(uid);
       }
       if (containerHasDurableDispatch && deps.admitUserTurn && cronOriginExecutor === null) {
         cronOriginExecutor = async (payload) => {
           const registered = cronOriginExecutor;
-          const candidates = uidToCronOriginExecutors.get(uid.toString());
           if (
             cleaned ||
             userDetached ||
-            registered === null ||
-            !candidates?.has(registered)
+            registered === null
           ) {
             return { kind: "not_claimed" };
           }
@@ -3245,13 +3088,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           );
           return receipt;
         };
-        const key = uid.toString();
-        let executors = uidToCronOriginExecutors.get(key);
-        if (!executors) {
-          executors = new Set();
-          uidToCronOriginExecutors.set(key, executors);
-        }
-        executors.add(cronOriginExecutor);
+      }
+      if (unregisterExecutors === null && (recoveryExecutor || cronOriginExecutor)) {
+        unregisterExecutors = registerBridgeExecutors(uid, containerWs,
+          { recovery: recoveryExecutor, origin: cronOriginExecutor },
+          { recovery: uidToRecoveryExecutors, origin: uidToCronOriginExecutors });
+        void drainDurableRecoveryForUser(uid);
       }
       if (attestTimer !== null) {
         clearTimeout(attestTimer);
@@ -3824,6 +3666,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     interface AdmittedDispatch {
       clientMessageId: string;
       sessionId: string;
+      agentId: string;
       dispatchId: string;
       billingRequestId: string;
       attemptNo: number;
@@ -3890,6 +3733,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       preparationInFlight > 0 || admittedDispatches.size > 0 || enrichmentDispatches.size > 0;
     const hasPreTransferDispatchWork = (): boolean =>
       preparationInFlight > 0 || enrichmentDispatches.size > 0;
+
+    const linkHandle = getContainerLinkHandle(containerWs);
+    if (linkHandle) linkHandle.onStreamsChanged = () => checkDrainComplete();
+    const hasOpenDispatchStreams = (): boolean => linkHandle?.hasOpenDispatches ?? false;
+    const noteDispatchStreamFrame = (sessionId: string, clientMessageId: string, isFinal: boolean): void => {
+      linkHandle?.noteStream(sessionId, clientMessageId, isFinal);
+    };
 
     /** 删记录并在 drain 期推进完成判定(map 空 + inflight 空才收尾)。 */
     const dropAdmittedDispatch = (clientMessageId: string): void => {
@@ -4450,14 +4300,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ensureDispatchHeartbeat();
         }
       }
-      // OCV5-403: cron-origin and prompt-queue dispatches are admitted before
-      // this frame's trace row is written, and the admission block below is
-      // skipped for them (persistUserRow=false), so the "admitted" backfill never
-      // runs. Link the trace here (display-only columns, COALESCE, fire-and-forget,
-      // warn only). Browser frames keep their post-admission backfill: a record
-      // found only by clientMessageId may belong to another session.
+      // Cron's pretracked record was projected at canonical registration, before preflight.
       if (
-        !persistUserRow &&
+        !persistUserRow && pretrackedEnrichment === undefined &&
         admittedThisFrame !== null &&
         traceId !== null &&
         admittedThisFrame.record.sessionId === peerId
@@ -4466,6 +4311,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           traceId,
           dispatchId: admittedThisFrame.record.dispatchId,
           requestId: admittedThisFrame.record.billingRequestId,
+          identity: admittedTraceIdentity(admittedThisFrame.record),
         });
         // Plan §7.4: these lanes admit without a trace, so link turn_dispatches.trace_id too.
         if (deps.pgPool) {
@@ -4717,6 +4563,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               const admittedRecord: AdmittedDispatch = {
                 clientMessageId,
                 sessionId: peerId,
+                agentId: d.agentId,
                 dispatchId: d.dispatchId,
                 billingRequestId: d.billingRequestId,
                 attemptNo: d.attemptNo,
@@ -4731,6 +4578,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // committed after finalCleanup, tracking synchronously claims the
               // row for strict admitted-only terminalization.
               admittedThisFrame = trackEnrichmentDispatch(admittedRecord);
+              // MIN1:受理成功后回填 turn_traces 的纯展示列(fire-and-forget,不动主链)。
+              if (traceId !== null) {
+                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
+                  traceId,
+                  dispatchId: d.dispatchId,
+                  requestId: d.billingRequestId,
+                  identity: admittedTraceIdentity(d),
+                });
+              }
               if (!isEnriching(admittedThisFrame)) {
                 admittedThisFrame = null;
                 return null;
@@ -4755,6 +4611,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   broadcastToUser(uid, {
                     type: "outbound.ack",
                     admitted: true,
+                    retryStatus: recoveryJobStatus(recoveryJob, "scheduled"),
                     ...(idempotencyKey ? { idempotencyKey } : {}),
                     peer: { id: peerId, kind: "dm" },
                     clientMessageId,
@@ -4775,14 +4632,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // R5 note:heartbeat 只在确认连接存活后才起 —— finalCleanup 已跑过的话,此刻新建的
               // interval 无人清理,会把整个 bridge 闭包钉在内存里。顺序=登记→cleaned→heartbeat。
               ensureDispatchHeartbeat();
-              // MIN1:受理成功后回填 turn_traces 的纯展示列(fire-and-forget,不动主链)。
-              if (traceId !== null) {
-                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
-                  traceId,
-                  dispatchId: d.dispatchId,
-                  requestId: d.billingRequestId,
-                });
-              }
               break; // 继续 enrichment / forward
             }
             case "deduplicated": {
@@ -5488,21 +5337,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
           }
 
-          // Phase 0.4 — inbound.hello → bridge ring replay.
-          //
-          // Each peer in the hello carries `lastFrameSeq` (last outbound seq
-          // the tab successfully processed). We peekReplay against the
-          // bridge-layer ring; if it satisfies, push the missed frames over
-          // userWs. If it can't, emit `outbound.resume_failed` so the client
-          // escalates to REST sync (matches personal-master server.ts
-          // autoResumeFromHello envelope verbatim — same shape as what the
-          // container would have emitted).
-          //
-          // We do NOT return here: hello must still reach the container so
-          // its embedded gateway registers `bridge.containerWs` into
-          // `clientsByPeer` for live delivery. Container's own peekReplay
-          // may also fire — duplicate frames are deduped client-side via
-          // the frameSeq cursor in websocket.js handleOutbound.
+          // Browser hello registers master subscribers and serves durable catchup.
+          // ContainerLink replaces its replay hints with the shared PG cursor;
+          // flag-off retains the legacy container hello contract.
           if (
             parsed !== null &&
             typeof parsed === "object" &&
@@ -5533,8 +5370,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const uidStr = uid.toString();
             // 前端只在发送态未清且 id 合法时携带 inFlightClientMessageId。
             // 这里只收集候选,查询必须等 hello 转发之后再跑。
-            const terminalNotifyCandidates: Array<{ peerId: string; clientMessageId: string }> = [];
-            const terminalNotifySeen = new Set<string>();
             const liveCatchupSessions: Array<{ sessionId: string; afterFrameSeq: number }> = [];
             const liveCatchupSeen = new Set<string>();
             // INC-20260907-PERMISSION-ROOTFIX: permission hello scan is independent
@@ -5563,29 +5398,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     ? Math.max(0, peer.lastFrameSeq)
                     : 0;
                 liveCatchupSessions.push({ sessionId: peer.peerId, afterFrameSeq });
-              }
-              const inFlightId = peer.inFlightClientMessageId;
-              // peers 来自客户端。协议规定 inFlightClientMessageId 仅在
-              // inFlight===true 时携带,且为短 uuid;不校验就会被无界字符串/
-              // 重复项放大成并行 PG 查询。
-              if (
-                peer.inFlight === true &&
-                typeof inFlightId === "string" &&
-                inFlightId !== "" &&
-                inFlightId.length <= HELLO_TERMINAL_NOTIFY_MAX_CLIENT_MESSAGE_ID_LEN &&
-                isClientMessageId(inFlightId)
-              ) {
-                const dedupeKey = `${peer.peerId}\0${inFlightId}`;
-                if (
-                  !terminalNotifySeen.has(dedupeKey) &&
-                  terminalNotifyCandidates.length < HELLO_TERMINAL_NOTIFY_MAX_CANDIDATES
-                ) {
-                  terminalNotifySeen.add(dedupeKey);
-                  terminalNotifyCandidates.push({
-                    peerId: peer.peerId,
-                    clientMessageId: inFlightId,
-                  });
-                }
               }
               const aid =
                 typeof peer.agentId === "string" && peer.agentId !== ""
@@ -5652,57 +5464,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // 绝不能挡在 hello 转发前面:容器靠这条 hello 把 containerWs 登记进
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
-            if (terminalNotifyCandidates.length > 0 && deps.pgPool) {
-              const pgPool = deps.pgPool;
-              void (async () => {
-                try {
-                  await Promise.resolve();
-                  for (const { peerId, clientMessageId } of terminalNotifyCandidates) {
-                    // 查询前也要看连接:断开后结果没人收,继续查只会空烧 PG。
-                    if (userWs.readyState !== WebSocket.OPEN) break;
-                    const row = await getDispatchByLogicalKey(pgPool, {
-                      userId: uid,
-                      sessionId: peerId,
-                      clientMessageId,
-                    });
-                    if (row === null || row.status !== "terminal") continue;
-                    let reconcile: "turn_completed" | "interrupted" | null = null;
-                    if (row.outcome === "completed") {
-                      reconcile = "turn_completed";
-                    } else if (row.outcome === "interrupted" || row.outcome === "crashed") {
-                      // 前端 reducer 只认这两个字面量。不要模仿容器的 turn_interrupted,
-                      // 也不要带 interrupted:'service_restart'(会触发自动恢复)。
-                      reconcile = "interrupted";
-                    }
-                    // not_accepted / executed_error / 其它 / null → 什么都不发:
-                    // 失败态交给现有 fail-visible 通道,避免和失败卡打架。
-                    if (reconcile === null) continue;
-                    // 只打本条 hello 所在的 userWs,不用 broadcastToUser —
-                    // 同 uid 其它标签页未必卡在这一轮,广播会误清它们的发送态。
-                    if (userWs.readyState !== WebSocket.OPEN) continue;
-                    try {
-                      userWs.send(JSON.stringify({
-                        type: "outbound.message",
-                        channel: "webchat",
-                        peer: { id: peerId, kind: "dm" },
-                        clientMessageId,
-                        blocks: [],
-                        isFinal: true,
-                        meta: { reconcile, clientMessageId },
-                        ts: Date.now(),
-                      }));
-                      bridgeLog?.info("user-chat-bridge: hello terminal dispatch fallback sent", {
-                        uid: uidStr,
-                        sessionId: peerId,
-                        clientMessageId,
-                        reconcile,
-                      });
-                    } catch { /* 发不出就静默降级 */ }
-                  }
-                } catch {
-                  // 任何失败都只能静默:hello 处理绝不能因回落抛错。
-                }
-              })().catch(() => {});
+            if (deps.pgPool) {
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
@@ -6167,11 +5930,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 typeof peerIdRaw === "string" && peerIdRaw !== ""
                   ? `agent:${effectiveFrameAgentId}:webchat:dm:${peerIdRaw.replace(/[^a-zA-Z0-9_-]/g, "_")}`
                   : "(unknown-peer)";
-              // TODO(durable-dispatch): turn_traces.dispatch_id/request_id 是纯展示列
-              // (RFC §2 I3),但本 trace 登记是**同步**发生于分类阶段,而 dispatch 受理与
-              // server requestId 铸造都在下游 async IIFE(attach 之后)。此处两者均未就绪 →
-              // 保持 null(recordTurnTrace 默认 null,schema 兼容)。要填充需把 trace insert
-              // 移到受理后逐 IIFE 重复登记,与"不 restructure id-minting"约束冲突,故不做。
+              // Keep an early trace even if admission fails. Once admitted, only this
+              // trace is enriched with the returned dispatch's identity and display links.
               recordTurnTrace(
                 deps.pgPool,
                 (msg, fields) => turnLogForFrame?.warn(msg, fields),
@@ -6185,6 +5945,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   clientBuild: clientBuildForConnection,
                 },
               );
+              // Cron is already admitted; project even if preflight later rejects or closes.
+              const cronTraceDispatch = isCronOriginDispatch ? pretrackedEnrichment?.record : undefined;
+              if (cronTraceDispatch !== undefined && cronTraceDispatch.sessionId === peerIdRaw &&
+                cronTraceDispatch.clientMessageId === (parsed as { clientMessageId?: unknown }).clientMessageId) {
+                updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLogForFrame?.warn(msg, fields), {
+                  traceId: turnTraceIdForFrame, dispatchId: cronTraceDispatch.dispatchId,
+                  requestId: cronTraceDispatch.billingRequestId, identity: admittedTraceIdentity(cronTraceDispatch),
+                });
+                if (deps.pgPool) {
+                  const dispatchId = cronTraceDispatch.dispatchId;
+                  void backfillDispatchTraceId(deps.pgPool, { dispatchId, traceId: turnTraceIdForFrame }).catch((err) => {
+                    turnLogForFrame?.warn("user-chat-bridge: dispatch trace backfill failed", { dispatchId, err });
+                  });
+                }
+              }
               if (typeof peerIdRaw === "string" && peerIdRaw !== "") {
                 responseMilestoneTracker.begin({
                   traceId: turnTraceIdForFrame,
@@ -8003,7 +7778,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         failDispatchPreForward(dispatchRecord, "bridge_cleaned_before_physical_forward");
         return false;
       }
-      if (markActivity && containerId !== undefined) {
+      if (markActivity && containerId !== undefined && hasBrowserActivity(userDetached, userWs.readyState)) {
         const now = Date.now();
         if (now - lastActivityRefreshAt >= ACTIVITY_REFRESH_INTERVAL_MS) {
           lastActivityRefreshAt = now;
@@ -8033,6 +7808,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       const transfer = beginEnrichmentTransfer(dispatchRecord);
       if (dispatchRecord !== undefined && transfer === null) return false;
+      if (dispatchRecord) linkHandle?.bindDispatch(dispatchRecord);
       return sendToContainer(data, isBinary, len, transfer);
     }
 
@@ -8427,12 +8203,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 return;
               }
               if (!acceptEnrichmentReceipt(rec)) return;
+              // 容器已接手执行,admitted 记录随即放下;回合流仍归原链路消费者处理。
+              noteDispatchStreamFrame(rec.sessionId, rec.clientMessageId, false);
               if (pool) {
                 if (rec.recoveryJob) {
                   void markRecoveryContainerReceipt(pool, {
                     dispatchId: rec.dispatchId,
                     dispatchAttemptNo: rec.attemptNo,
                     expectedDispatchLeaseEpoch: rec.leaseEpoch,
+                  }).then((accepted) => {
+                    if (accepted) broadcastToUser(uid, recoveryRunningFrame(rec.recoveryJob!));
                   }).catch(() => {});
                   dropAdmittedDispatch(rec.clientMessageId);
                 } else {
@@ -8650,7 +8430,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           : null;
       if (
         masterOnlyFrameType === "sys.incident" || masterOnlyFrameType === "sys.goal_snapshot" ||
-        masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
+        masterOnlyFrameType === "sys.recovery_status" || masterOnlyFrameType === "sys.media_job" || masterOnlyFrameType === "sys.recovery_decision" ||
         // OCV5-591 A2-1c-2: studio activity is master-authored only.
         masterOnlyFrameType === "sys.studio_event"
       ) {
@@ -9202,6 +8982,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         sessionKey: string;
         frameSeq: number;
         payload: string;
+        /** outbound.message isFinal=true = 回合终止器(protocol frames.ts)。 */
+        isFinal: boolean;
       } | null = null;
       if (containerId !== undefined && !isBinary) {
         let frameStr: string | null = null;
@@ -9214,6 +8996,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           try { parsedOut = JSON.parse(frameStr); } catch { /* non-JSON: skip */ }
           if (parsedOut !== null && typeof parsedOut === "object") {
             const wire = parsedOut as {
+              type?: unknown;
+              isFinal?: unknown;
               sessionKey?: unknown;
               frameSeq?: unknown;
               clientMessageId?: unknown;
@@ -9238,6 +9022,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sessionKey: wire.sessionKey,
                 frameSeq: wire.frameSeq,
                 payload: frameStr,
+                isFinal: wire.type === "outbound.message" && wire.isFinal === true,
               };
             }
           }
@@ -9361,7 +9146,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             durableStampedFrame.payload,
           );
         }
-        const sessionId = durableStampedFrame?.sessionId ?? null;
+        const sessionId = durableStampedFrame?.sessionId ?? (linkHandle ? containerLinkSnapshotSession(data, isBinary) : null);
         const recipients: WebSocket[] = [];
         const seenRecipients = new Set<WebSocket>();
         const addRecipient = (ws: WebSocket): void => {
@@ -9434,6 +9219,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               frameSeq: stamped.frameSeq,
               payload: stamped.payload,
             });
+            linkHandle?.persisted(durableSessionId, stamped.clientMessageId, stamped.isFinal);
             forwardCommittedFrame();
           },
           (error) => {
@@ -9476,12 +9262,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     containerWs.on("open", () => {
       clearTimeout(connectTimer);
-      {
-        const key = uid.toString();
-        let set = uidToContainerWs.get(key);
-        if (!set) { set = new Set(); uidToContainerWs.set(key, set); }
-        set.add(containerWs);
-      }
+      registerBridgeTransport(uid, containerWs, uidToContainerWs);
       bridgeLog?.debug("user-chat-bridge: container connected", {
         host: endpoint.host, port: endpoint.port,
       });
@@ -9552,6 +9333,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     });
 
     containerWs.on("message", onContainerMessage);
+    containerWs.on("linkShutdown", () => cleanup("shutdown", true));
 
     containerWs.on("error", (err: Error) => {
       bridgeLog?.warn("user-chat-bridge: container ws error", { err });
@@ -9630,8 +9412,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 只刷存活,不刷下行帧。与 60s 帧 debounce 共用 lastActivityRefreshAt。
     if (markActivity && containerId !== undefined && activityKeepaliveIntervalMs > 0) {
       activityKeepaliveTimer = setInterval(() => {
-        if (cleaned || userDetached) return;
-        if (userWs.readyState !== WebSocket.OPEN) return;
+        if (cleaned || !hasBrowserActivity(userDetached, userWs.readyState)) return;
         const now = Date.now();
         if (now - lastActivityRefreshAt < ACTIVITY_REFRESH_INTERVAL_MS) return;
         lastActivityRefreshAt = now;
@@ -9652,7 +9433,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
       // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
       // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
-      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
+      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams()) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -9693,6 +9474,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // checkDrainComplete:billing settle 把 inflightCodexTurns.size→0 时调,提前 final
     function cleanup(triggerCause: BridgeCloseCause, force = false): void {
       if (cleaned) return;
+      if (!force && !shuttingDown && hasOpenDispatchStreams() &&
+          (triggerCause === "client_close" || triggerCause === "backpressure" || triggerCause === "internal_error")) {
+        drainCause = triggerCause;
+        if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
+        drainingChecks.add(checkDrainComplete);
+        detachUserSide(triggerCause);
+        return;
+      }
 
       // 已在 drain 中
       if (drainTimer !== null) {
@@ -9733,7 +9522,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (triggerCause === "client_close" ||
           triggerCause === "backpressure" ||
           triggerCause === "internal_error") &&
-        (inflightCodexTurns.size > 0 || hasPendingDispatchWork());
+        (inflightCodexTurns.size > 0 || hasPendingDispatchWork() || hasOpenDispatchStreams());
 
       if (!shouldDrain) {
         finalCleanup(triggerCause);
@@ -9742,6 +9531,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
       // 进 drain 路径(只有 user 主动 close + 有 codex inflight 才会)
       drainCause = triggerCause;
+      drainingChecks.add(checkDrainComplete);
       detachUserSide(triggerCause);
       bridgeLog?.info("user-chat-bridge: enter drain", {
         inflightCount: inflightCodexTurns.size,
@@ -9753,7 +9543,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
       // RFC §2.2 B1:有在飞 admitted dispatch → 取 max(billing, dispatch drain,默认 60s / 上限 120s);
       // 无 dispatch(纯 codex billing drain)→ 沿用 5s billing 窗口。
-      const drainMs = hasPendingDispatchWork()
+      const drainMs = hasPendingDispatchWork() || hasOpenDispatchStreams()
         ? Math.max(
             readDrainBillingMs(),
             readDispatchDrainMs(),
@@ -9761,18 +9551,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           )
         : readDrainBillingMs();
       drainTimer = setTimeout(() => {
-        bridgeLog?.warn("user-chat-bridge: drain timeout", {
-          leftover: inflightCodexTurns.size,
-          admittedLeftover: admittedDispatches.size,
-          preparationLeftover: preparationInFlight,
-        });
-        for (const [requestId, snap] of inflightCodexTurns) {
-          recordBillingRecovery(requestId, "failed", snap);
+        if (!shuttingDown && hasOpenDispatchStreams()) {
+          clearTimeout(drainTimer!); drainTimer = null;
+          return;
         }
-        terminalizeAllEnriching();
-        finalCleanup(drainCause ?? "client_close");
+        expireDrain("user-chat-bridge: drain timeout");
       }, drainMs);
       drainTimer.unref?.();
+    }
+
+    function expireDrain(message: string): void {
+      bridgeLog?.warn(message, {
+        leftover: inflightCodexTurns.size,
+        admittedLeftover: admittedDispatches.size,
+        preparationLeftover: preparationInFlight,
+        openStreamLeftover: linkHandle?.streams.size ?? 0,
+      });
+      for (const [requestId, snap] of inflightCodexTurns) {
+        recordBillingRecovery(requestId, "failed", snap);
+      }
+      terminalizeAllEnriching();
+      finalCleanup(drainCause ?? "client_close");
     }
 
     /**
@@ -9780,8 +9579,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      * 双 map 均空才提前结束 drain。不在 drain 期 / 任一 map 非空时 no-op。
      */
     function checkDrainComplete(): void {
-      if (drainTimer !== null && inflightCodexTurns.size === 0 && !hasPendingDispatchWork()) {
-        clearTimeout(drainTimer);
+      if (userDetached && linkHandle && !hasOpenDispatchStreams() && drainTimer === null &&
+          !cleaned && (inflightCodexTurns.size > 0 || hasPendingDispatchWork())) {
+        cleanup(drainCause ?? "client_close");
+      }
+      if (
+        (drainTimer !== null || (userDetached && linkHandle !== undefined)) &&
+        inflightCodexTurns.size === 0 &&
+        !hasPendingDispatchWork() &&
+        !hasOpenDispatchStreams()
+      ) {
+        if (drainTimer !== null) clearTimeout(drainTimer);
         drainTimer = null;
         finalCleanup(drainCause ?? "client_close");
       }
@@ -10272,6 +10080,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function detachUserSide(triggerCause: BridgeCloseCause): void {
       if (userDetached) return;
       userDetached = true;
+      linkHandle?.detach();
       for (const key of retainedOutboundPersistQueueKeys) {
         outboundPersistQueues.release(key);
       }
@@ -10323,24 +10132,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (set.size === 0) uidToContainerWs.delete(key);
         }
       }
-      if (recoveryExecutor !== null) {
-        const key = uid.toString();
-        const executors = uidToRecoveryExecutors.get(key);
-        if (executors) {
-          executors.delete(recoveryExecutor);
-          if (executors.size === 0) uidToRecoveryExecutors.delete(key);
-        }
-        recoveryExecutor = null;
-      }
-      if (cronOriginExecutor !== null) {
-        const key = uid.toString();
-        const executors = uidToCronOriginExecutors.get(key);
-        if (executors) {
-          executors.delete(cronOriginExecutor);
-          if (executors.size === 0) uidToCronOriginExecutors.delete(key);
-        }
-        cronOriginExecutor = null;
-      }
+      unregisterExecutors?.();
+      unregisterExecutors = null;
+      recoveryExecutor = null;
+      cronOriginExecutor = null;
     }
 
     /**
@@ -10354,6 +10149,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     function finalCleanup(finalCause: BridgeCloseCause): void {
       if (cleaned) return;
       cleaned = true;
+      drainingChecks.delete(checkDrainComplete);
       cause = finalCause;
       if (drainTimer !== null) {
         clearTimeout(drainTimer);
@@ -10505,7 +10301,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     if (frontendBuildTimer) clearInterval(frontendBuildTimer);
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
+    shuttingDown = true;
+    if (links) links.stopping = true;
     registry.closeAll(reason);
+    for (const check of [...drainingChecks]) check();
+    await links?.shutdown();
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
@@ -10537,7 +10337,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     }
     if (!set || set.size === 0) return 0;
     let text: string;
-    try { text = JSON.stringify(payload); }
+    try { text = JSON.stringify(withUserError(payload)); }
     catch (err) {
       log?.warn("user-chat-bridge: broadcastToUser stringify failed", {
         uid: uid.toString(), err,
@@ -10647,15 +10447,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   }
 
   async function injectCronOriginTurn(input: CronOriginInjectInput): Promise<CronOriginInjectResult> {
-    const executors = uidToCronOriginExecutors.get(input.uid.toString());
-    if (!executors || executors.size === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
+    const executors = availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()));
+    if (executors.length === 0 || !deps.admitUserTurn) return { kind: "no_transport" };
     return executeCronOriginInject({
       input,
       pgPool: deps.pgPool,
       admitUserTurn: deps.admitUserTurn,
       // Resolve after admission so a bridge removed while PG was awaited is
       // never retained as a stale executor closure.
-      getExecutors: () => uidToCronOriginExecutors.get(input.uid.toString()) ?? [],
+      getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString())),
       log,
     });
   }
@@ -10678,6 +10478,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     handleUpgrade,
     shutdown,
     registry,
+    containerLinkSnapshots: () => links?.snapshots() ?? [],
     broadcastToUser,
     syncGoalToContainers,
     broadcastAll,

@@ -35,6 +35,7 @@ import { proveEmptyRecoveryCliResult, proveReadPdfDocument } from "./lib/boxRead
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { proveGptWebCitationMarkers } from "./lib/boxGptWebCitationProof.js"; // OCV5-584 (file-size ratchet): [ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
+import { boxBridgeFailed, boxBridgeOutcome } from "./lib/boxBridgeFailureProof.js";
 import { scaledMs } from "./lib/gateLoadScale.js";
 
 const LIMIT_MS = 120_000;
@@ -2686,10 +2687,9 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
   failing.refuse.writes = true;
   const refused = boxCliBridge(api, failing, "ocv5-317-refused");
   refused.stdin.write(line("never delivered"));
-  const outcome = await Promise.race([refused.bridge.then((exit) => `exit-${exit}`, () => "failed"),
-    tick(30_000).then(() => "still-waiting")]);
-  if (outcome !== "failed" || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
-    fail(`LARGE_LINE_WRITE_FAILURE_${outcome} ${refused.err().trim().split("\n").slice(-4).join(" | ").slice(-500)}`);
+  const outcome = await boxBridgeOutcome(refused.bridge, tick(30_000));
+  if (!boxBridgeFailed(outcome) || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
+    fail(`LARGE_LINE_WRITE_FAILURE_${JSON.stringify(outcome)} ${refused.err().trim().split("\n").slice(-4).join(" | ").slice(-500)}`);
   }
   refused.stdin.end();
   if (!await gone(failing.readers)) fail("LARGE_LINE_REFUSED_HOST_LEFT_RUNNING");
@@ -3710,7 +3710,7 @@ async function main(): Promise<void> {
     await proveMixedCallTurnCut(api), await (await import("./lib/boxCapacityHeldProof.js")).proveCapacityHeldReleased(CANDIDATE), // OCV5-649 (file-size ratchet): [ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
-    await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
+    await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api), await (await import("./lib/boxRunCleanupProof.js")).proveRunCleanupToolResults(CANDIDATE), // OCV5-645 (file-size ratchet): [ocv5-645-run-cleanup-tool-results] PASS — a recovered run whose CLI wrote a session tool-results tree finishes its privacy cleanup instead of retrying it forever, and any other folder there stays refused
     ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
@@ -3721,7 +3721,7 @@ async function main(): Promise<void> {
       await proveOutputLimitResume(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
-    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
+    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database), await (await import("./lib/serviceRestartFoldProof.js")).proveRestartTapeFold(CANDIDATE, api.tape, (run) => withSessionsBackend(api, database, run))]; // OCV5-646 (file-size ratchet): [ocv5-646-restart-tape-fold] PASS — a boot-recovery SERVICE_RESTART tape keeps the answer and tool steps the dispatch streamed, after its live frames are pruned
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);

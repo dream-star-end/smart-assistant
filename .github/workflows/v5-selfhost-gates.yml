@@ -86,11 +86,16 @@ jobs:
         run: npx tsx scripts/check-incident-ledger-superset.ts
 
       - name: Gate script tests
-        run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts scripts/__tests__/archMeasure.node-test.mjs scripts/__tests__/kernelReleaseClosure.test.ts scripts/__tests__/protocolBrowserEntry.test.ts scripts/__tests__/ocTrace.test.ts
+        run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts scripts/__tests__/archMeasure.node-test.mjs scripts/__tests__/kernelReleaseClosure.test.ts scripts/__tests__/protocolBrowserEntry.test.ts scripts/__tests__/ocTrace.test.ts scripts/__tests__/ocTraceChain.test.ts
 
       # OCV5-548:kernel(脱敏/日志/trace 唯一实现)的单测;selfhost CI 不跑逐包 test:*,这里单独跑。
       - name: Kernel unit tests
         run: npm run test:kernel
+
+      - name: Context launch budgets (offline)
+        run: |
+          npx tsx --test --test-concurrency=1 packages/protocol/src/__tests__/contextPressure.test.ts packages/gateway/src/__tests__/boundedPrompt.test.ts packages/gateway/src/__tests__/contextObservationFrames.test.ts packages/gateway/src/__tests__/antigravityAdapter.test.ts packages/gateway/src/__tests__/ccbContextObservation.test.ts
+          npx tsx --test claude-code-best/src/services/api/requestBodyBudget.node-test.mjs scripts/__tests__/ccbSharedInputs.node-test.mjs
 
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite

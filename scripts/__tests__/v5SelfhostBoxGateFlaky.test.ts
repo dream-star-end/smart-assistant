@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { boxBridgeFailed, boxBridgeOutcome } from "../lib/boxBridgeFailureProof.js";
 import { gateLoadScale, scaledMs } from "../lib/gateLoadScale.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -307,4 +308,23 @@ describe("one throwaway test database per train (OCV5-557 item 1)", () => {
       assert.match(swept.stderr, new RegExp(`dropped leftover ${leftover}`));
       assert.equal(existsSync(path.join(env.OC_V5_GATE_DB_REGISTRY, `${leftover}.json`)), false);
     });
+});
+
+// OCV5-609: keep the write-refusal proof fail-closed for the bridge's two failure forms.
+test("Box refusal proof rejects successful, invalid, and timed-out bridge outcomes", () => {
+  assert.equal(boxBridgeFailed({ kind: "rejected" }), true);
+  for (const code of [1, 143, 255]) assert.equal(boxBridgeFailed({ kind: "resolved", code }), true);
+  for (const code of [0, -0, -1, 256, 512, 2 ** 32, 2 ** 53, undefined, null, "1", Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+    assert.equal(boxBridgeFailed({ kind: "resolved", code }), false, String(code));
+  }
+  assert.equal(boxBridgeFailed({ kind: "timeout" }), false);
+});
+
+test("Box refusal proof distinguishes actual bridge settlement from its timeout", async () => {
+  const pending = new Promise<never>(() => {});
+  for (const [bridge, failed] of [[Promise.resolve(0), false], [Promise.resolve(1), true],
+    [Promise.reject(new Error("refused write")), true]] as const) {
+    assert.equal(boxBridgeFailed(await boxBridgeOutcome(bridge, pending)), failed);
+  }
+  assert.equal(boxBridgeFailed(await boxBridgeOutcome(pending, Promise.resolve())), false);
 });

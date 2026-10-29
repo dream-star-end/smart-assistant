@@ -65,6 +65,12 @@ const WHITELIST = new Set<string>([
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
+  // #1200: PG sessions backend 的快照拆分模块；在调用方同一 REPEATABLE READ
+  // READ ONLY 事务内读取 session 归属、dispatch 与帧，不能另开 backend 事务。
+  "packages/commercial/src/db/sessionSnapshot.ts",
+  // #1200: 快照积分只读投影在同一事务内合并已落 tape 与 pending 的实际扣费，
+  // 按 request_id 去重；不写六表，另开事务会让两种归属之间的迁移被漏计/重计。
+  "packages/commercial/src/billing/dispatchSettledCredits.ts",
   // OCV5-607: PG sessions backend 拆分；在同一只读事务内验证归属与完整原生存档，
   // 仍由 pgSessionsBackend 委托并注入原 batch validators，不新增业务 SQL 入口。
   "packages/commercial/src/db/pgCcbTranscriptRestore.ts",

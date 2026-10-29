@@ -66,6 +66,8 @@ import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
 import { TurnCostReminder } from "./components/chat/TurnCostReminder";
+import { BackgroundTurnBanner } from "./components/chat/BackgroundTurnBanner";
+import { useBackgroundTurn } from "./hooks/useBackgroundTurn";
 import {
   captureVisibleVirtualRowAnchor,
   restoreVisibleVirtualRowAnchor,
@@ -151,7 +153,7 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaJobWire } from "./lib/chat/frames";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
-import type { ChatMessage } from "./lib/chat/model";
+import { type ChatMessage, isTurnDetached } from "./lib/chat/model";
 import {
   exactUserReplayPayload,
   interruptedContinuationTarget,
@@ -201,6 +203,7 @@ import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage, ApiError } from "./lib/api";
 import { uploadFilesToProject } from "./lib/projectFileUpload";
 import { reportClientFriction } from "./lib/clientFriction";
+import { setTimelineLifecycleServerShadow } from "./lib/timeline/shadowLifecycle";
 import {
   effectiveEffortModelId,
   effortForModel,
@@ -395,6 +398,8 @@ export function App() {
   const [bannersExpanded, setBannersExpanded] = useState(false);
   // UpdateBanner 自己订阅 governor,这里再订一份只为把它算进横幅栈的条数。
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
+  // 版本不一致即亮的顶栏 pill(OCV5-626);横幅出现时 governor 自己把它熄掉。
+  const updatePillVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getPillVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
   // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
@@ -815,6 +820,10 @@ export function App() {
 
   // 服务端功能开关（GET /api/features；读不到 = 全关，demo 不读）。
   const serverFeatures = useServerFeatures(demo ? null : auth, demo);
+  // OCV5-630:服务端开关 → 时间线投影器 shadow 观测与上报(本地显式覆盖仍优先);登出/换号读回 off。
+  useEffect(() => {
+    setTimelineLifecycleServerShadow(serverFeatures.timelineShadow);
+  }, [serverFeatures.timelineShadow]);
   const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
   useEffect(() => {
     setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
@@ -1397,6 +1406,8 @@ export function App() {
       dispatch,
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
+      transport: chat.status.cls,
+      detached: isTurnDetached(activeSess),
       progressHint: activeSess._turnProgressHint,
       hasPlated: wsMessages.some((m) =>
         isPlatedAssistantMessage(m) &&
@@ -1418,7 +1429,7 @@ export function App() {
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
     };
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
-  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus]);
+  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus, chat.status.cls]);
 
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
@@ -1553,6 +1564,9 @@ export function App() {
   const queuedOutgoing = wsMessages.filter(
     (message) => message.role === "user" && message.status === "queued",
   );
+  // B4a: honest "this turn is still running" banner + soft confirm before a 继续-style send.
+  const backgroundTurn = useBackgroundTurn({ chat, sess: activeSess, enabled: !demo && !gated,
+    queuedCount: queuedOutgoing.length, compact: !isMdViewport, confirm: confirmDialog });
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -1925,7 +1939,8 @@ export function App() {
   if (!gated && connBanner && isMdViewport) activeBannerKinds.push("connection");
   if (!demo && gate.phase.kind === "dormant") activeBannerKinds.push("dormant");
   if (!demo && updateBannerVisible) activeBannerKinds.push("update");
-  if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
+  if (backgroundTurn.notice && isMdViewport) activeBannerKinds.push("turn");
+  if (!demo && !gated && activeSess?._turnCostReminderCredits && !backgroundTurn.notice) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
 
@@ -2314,6 +2329,8 @@ export function App() {
           paneOpen={paneShown}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
+          updateAvailable={!demo && updatePillVisible}
+          onReloadForUpdate={demo ? undefined : () => appUpdate.reloadNow()}
         />
         {!demo && auth && authRecoveryAvailable && <LazyBoundary fallback={null}>
           <IdentityRecoveryNotice onRetry={retryBoot} />
@@ -2506,8 +2523,8 @@ export function App() {
               className="mx-auto mb-2 max-w-3xl px-4 empty:mb-0 empty:hidden"
             />
           )}
-          {/* 以下五条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
-              发送失败 > 连接状态 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
+          {/* 以下六条横幅的显隐由 bannerStack(resolveBanners)统一裁决,渲染顺序即优先级:
+              发送失败 > 连接状态 > 本轮运行 > 容器休眠 > 新版本 > 成本提醒;超出 2 条的折叠成一行。 */}
           {showBanner("error") && chatError && (
             <ErrorBanner
               error={chatError}
@@ -2543,6 +2560,7 @@ export function App() {
               </Alert>
             </div>
           )}
+          {showBanner("turn") && backgroundTurn.notice && <BackgroundTurnBanner notice={backgroundTurn.notice} />}
           {showBanner("dormant") && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
@@ -2590,7 +2608,7 @@ export function App() {
           )}
           <Composer
             onSend={(text, media, replyTo) =>
-              send(text, media, undefined, undefined, replyTo)
+              backgroundTurn.guardSend(text, media, () => send(text, media, undefined, undefined, replyTo))
             }
             busy={sending}
             stopping={activeSess?._recoveryStatus?.kind === "stopping"}
@@ -2617,6 +2635,8 @@ export function App() {
                     {connBanner.text}
                   </Alert>
                 </div>
+              ) : backgroundTurn.notice && !isMdViewport ? (
+                <BackgroundTurnBanner notice={backgroundTurn.notice} />
               ) : undefined
             }
             placeholder={`和「${agent.name}」对话…`}

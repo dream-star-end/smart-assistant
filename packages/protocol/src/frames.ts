@@ -4,6 +4,8 @@ import { SERVICE_TIERS } from './serviceTiers.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
 import { SysMediaJob } from './mediaGeneration.js'
+import { ContextPressure, ContextCompaction } from './contextPressure.js'
+import { UserErrorSchema } from './userErrorSchema.js'
 import { AUTOMATIC_TURN_RETRY_MAX } from './turnErrorTaxonomy.js'
 
 // ───────────────────────────────────────────────
@@ -1045,6 +1047,8 @@ export type OutboundActiveTurnReplayStart = Static<typeof OutboundActiveTurnRepl
 // ───────────────────────────────────────────────
 export const OutboundError = Type.Object({
   type: Type.Literal('outbound.error'),
+  /** Additive display metadata; legacy fields keep their original meaning. */
+  userError: Type.Optional(UserErrorSchema),
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
@@ -1249,6 +1253,13 @@ export type OutboundExternalEngineBilling = Static<typeof OutboundExternalEngine
 // 来源:CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
 // (cli/print.ts:2214 + services/compact/compact.ts:414,763,819,1106)
 // ───────────────────────────────────────────────
+export const DispatchCredits = Type.Object({
+  settled: Type.String({ pattern: '^[0-9]+$', maxLength: 40 }),
+  requests: Type.Integer({ minimum: 0 }),
+  asOf: Type.Integer({ minimum: 0 }),
+})
+export type DispatchCredits = Static<typeof DispatchCredits>
+
 const _turnStatusCommon = {
   type: Type.Literal('outbound.turn_status'),
   sessionKey: Type.String(),
@@ -1257,6 +1268,16 @@ const _turnStatusCommon = {
   // V3 S12e — 与 outbound.message / outbound.codex_billing 同 trace 语义,
   // 标记触发本帧的 turn。dispatchInbound stamp,仅观察用。
   traceId: Type.Optional(TraceIdString),
+  // INC-20261028-STALE-ENGINE-STARTING — only on the bridge's hello snapshot for
+  // an open dispatch: frames may have been missed while no browser was attached.
+  // since = dispatch admitted_at (epoch ms).
+  meta: Type.Optional(
+    Type.Object({
+      detached: Type.Literal(true),
+      since: Type.Optional(Type.Integer({ minimum: 0 })),
+      credits: Type.Optional(DispatchCredits),
+    }),
+  ),
 } as const
 /** 当前 turn 的非流式阶段。null = 回到普通流式 / 空闲态。
  *  受控判别联合(turn-retry 批):retry 元数据只在 status='retrying' 分支
@@ -1319,6 +1340,58 @@ export const OutboundTurnUsage = Type.Object({
 })
 export type OutboundTurnUsage = Static<typeof OutboundTurnUsage>
 
+/** Transport-independent PG snapshot. afterSeq belongs to streamKey, never to
+ * the legacy HTTP record-id cursor. Missing data is explicit; null dispatch
+ * alone is not evidence that a client's in-flight turn completed. */
+export const SessionSnapshot = Type.Object({
+  v: Type.Literal(1),
+  sessionId: Type.String(),
+  dispatch: Type.Union([Type.Null(), Type.Object({
+    id: Type.String(),
+    clientMessageId: Type.String(),
+    agentId: Type.String(),
+    status: Type.Union(['admitted', 'accepted', 'rejecting', 'terminal', 'manual_reconcile'].map(s => Type.Literal(s))),
+    outcome: Type.Union([Type.String(), Type.Null()]),
+    attempt: Type.Integer({ minimum: 1 }),
+    since: Type.Integer(),
+    acceptedAt: Type.Union([Type.Integer(), Type.Null()]),
+    terminalAt: Type.Union([Type.Integer(), Type.Null()]),
+  })]),
+  streamKey: Type.Union([Type.String(), Type.Null()]),
+  lastFrameSeq: Type.Union([Type.Integer(), Type.Null()]),
+  lastFrameAt: Type.Union([Type.Integer(), Type.Null()]),
+  engineReady: Type.Union([Type.Boolean(), Type.Null()]),
+  turnStatus: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
+  reconcile: Type.Union([Type.Literal('turn_completed'), Type.Literal('interrupted'), Type.Null()]),
+  pendingPermissions: Type.Object({
+    items: Type.Array(Type.Record(Type.String(), Type.Unknown())),
+    completeness: Type.Union([Type.Literal('complete'), Type.Literal('truncated'), Type.Literal('unavailable')]),
+  }),
+  usage: Type.Union([Type.Null(), Type.Object({ frameSeq: Type.Integer(), usage: TurnTokenUsageSnapshot })]),
+  credits: Type.Union([DispatchCredits, Type.Null()]),
+  frames: Type.Array(Type.Object({
+    recordId: Type.String(), frameSeq: Type.Integer(), payload: Type.Unknown(),
+  })),
+  nextAfterSeq: Type.Integer({ minimum: 0 }),
+  hasMore: Type.Boolean(),
+  gap: Type.Union([Type.Null(), Type.Object({
+    reason: Type.Union(['page_limit', 'byte_limit', 'cursor_reset', 'sequence_gap', 'tape'].map(s => Type.Literal(s))),
+    afterSeq: Type.Optional(Type.Integer()),
+    beforeSeq: Type.Optional(Type.Integer()),
+    recordId: Type.Optional(Type.String()),
+    sha256: Type.Optional(Type.String()),
+    frameSeq: Type.Optional(Type.Integer()),
+  })]),
+  asOf: Type.Integer({ minimum: 0 }),
+})
+export type SessionSnapshot = Static<typeof SessionSnapshot>
+
+export const OutboundSessionSnapshot = Type.Object({
+  type: Type.Literal('outbound.session_snapshot'),
+  channel: Type.String(), peer: Peer, snapshot: SessionSnapshot,
+})
+export type OutboundSessionSnapshot = Static<typeof OutboundSessionSnapshot>
+
 // Exact per-model-call usage for the cards named by targetIds. This is a
 // progress sideband; the same snapshot is embedded into the immutable turn
 // tape for refresh/re-login recovery.
@@ -1357,6 +1430,9 @@ export type OutboundCallUsage = Static<typeof OutboundCallUsage>
 // ───────────────────────────────────────────────
 export const SysContextRebuilt = Type.Object({
   type: Type.Literal('sys.context_rebuilt'),
+  clientMessageId: Type.Optional(ClientMessageId),
+  noticeId: Type.Optional(Type.String()),
+  reason: Type.Optional(Type.Union([Type.Literal('engine-switch'), Type.Literal('native-resume-loss')])),
   sessionKey: Type.String(),
   channel: Type.String(),
   peer: Peer,
@@ -1370,6 +1446,28 @@ export const SysContextRebuilt = Type.Object({
   traceId: Type.Optional(TraceIdString),
 })
 export type SysContextRebuilt = Static<typeof SysContextRebuilt>
+
+// Gateway observations: additive WS/ring frames, never billing or content blocks.
+const ContextObservationRouting = Type.Object({
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  agentId: Type.String(),
+  ts: Type.Optional(Type.Number()),
+  traceId: Type.Optional(TraceIdString),
+})
+export const SessionContextPressure = Type.Intersect([
+  ContextObservationRouting,
+  ContextPressure,
+  Type.Object({ type: Type.Literal('session.context_pressure') }),
+])
+export type SessionContextPressure = Static<typeof SessionContextPressure>
+export const SysContextCompacted = Type.Intersect([
+  ContextObservationRouting,
+  ContextCompaction,
+  Type.Object({ type: Type.Literal('sys.context_compacted') }),
+])
+export type SysContextCompacted = Static<typeof SysContextCompacted>
 
 // ───────────────────────────────────────────────
 // V5 自愈体系(RFC-v5-selfheal-ops §5)— 运维事故用户推送
@@ -1477,7 +1575,25 @@ export type ControlFrame = Static<typeof ControlFrame>
 // ───────────────────────────────────────────────
 // Top-level frame
 // ───────────────────────────────────────────────
+export const SysRecoveryStatus = Type.Object({
+  type: Type.Literal('sys.recovery_status'),
+  peer: Peer,
+  sourceClientMessageId: ClientMessageId,
+  rootClientMessageId: ClientMessageId,
+  clientMessageId: ClientMessageId,
+  retryStatus: Type.Object({
+    state: Type.Literal('running'),
+    attempt: Type.Integer({ minimum: 1 }),
+    maxAttempts: Type.Optional(Type.Integer({ minimum: 1 })),
+    message: Type.String(),
+    actions: Type.Array(Type.String()),
+  }),
+  ts: Type.Number(),
+})
+export type SysRecoveryStatus = Static<typeof SysRecoveryStatus>
+
 export const AnyFrame = Type.Union([
+  SysRecoveryStatus,
   InboundMessage,
   InboundPermissionResponse,
   PromptQueueMutationFrame,
@@ -1493,9 +1609,12 @@ export const AnyFrame = Type.Union([
   OutboundExternalEngineBilling,
   OutboundTurnStatus,
   OutboundTurnUsage,
+  OutboundSessionSnapshot,
   OutboundCallUsage,
   PromptQueueSnapshot,
   SysContextRebuilt,
+  SessionContextPressure,
+  SysContextCompacted,
   SysIncident,
   SysGoalSnapshot,
   SysStudioEvent,

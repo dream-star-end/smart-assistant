@@ -34,6 +34,8 @@ import {
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
   collectTurnStatusRecordTurnIds,
+  isErrorCardHeld,
+  isErrorCardHeldWithAnswer,
   isErrorCardSupersededByTurnStatus,
   messageKind,
   safeMessageSignature,
@@ -227,6 +229,7 @@ export const MessageRenderer = memo(
             cb={cb}
             failurePresentedBelow={failurePresentedBelow}
             readOnly={readOnly}
+            awaitingReply={sending && isLast}
           />
         );
       case "assistant":
@@ -2189,9 +2192,11 @@ export function MessageList({
         // 已经提交的卡不许因自动恢复子轮再被藏掉；没提交的中间态仍隐藏。
         // 用户手动「从断点继续」后，这张卡已被处理，随之收起（OCV5-307）。
         (m._errorCardSnapshot?.disposition !== "card" ||
-          manuallyContinuedSourceIds.has(m._clientMessageId))
+          manuallyContinuedSourceIds.has(m._clientMessageId)) &&
+        // OCV5-645: a held row keeps its partial answer on screen; AssistantCard hides only the card.
+        !isErrorCardHeldWithAnswer(m)
       ) &&
-      !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
+      !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
@@ -2231,7 +2236,7 @@ export function MessageList({
           typeof message._clientMessageId === "string" &&
           message._clientMessageId.length > 0 &&
           (message._turnStatusRecord === true ||
-            (message.role === "assistant" && !!message._errorCode)),
+            (message.role === "assistant" && !!message._errorCode && !isErrorCardHeld(message))),
       )
       .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
   );
@@ -2476,6 +2481,8 @@ export function MessageList({
   visibleKeysRef.current = visibleItems.map(itemKey);
   if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
     const eager = new Set(visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey));
+    // 过程里的定位桩只在该过程(或阶段详情)展开、行真正挂上时才用到这张表;收起态不挂行,
+    // 也就不取(OCV5-627)。
     for (const item of visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS)) {
       if (item.kind !== "process") continue;
       for (const message of item.members) {
@@ -2654,8 +2661,6 @@ export function MessageList({
           (message.role === "assistant" || message.role === "user") &&
           (message.text ?? "").toLowerCase().includes(needle)
         );
-      const eager = eagerPayloadKeysRef.current?.has(it.key) === true
-        || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
       const explicit = disclosureValues[it.key];
       // Absent means the default: open while this turn is still running,
       // closed once it has finished. A click stores true or false and is not
@@ -2678,7 +2683,6 @@ export function MessageList({
           renderItem={renderItem}
           keyOf={renderItemKey}
           messagesOf={itemMessages}
-          eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
           lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
@@ -2947,7 +2951,7 @@ export function MessageList({
     ) : null}
     {find ? (
       <div
-        className="sticky top-0 z-10 mx-auto flex max-w-3xl items-center gap-1.5 bg-bg/95 px-5 py-2"
+        className="sticky top-0 z-10 mx-auto flex max-w-3xl flex-wrap items-center gap-1.5 bg-bg/95 px-5 py-2"
         onKeyDown={stopFindKeys}
         onPointerDown={stopFindKeys}
         onTouchStart={stopFindKeys}
@@ -2972,9 +2976,12 @@ export function MessageList({
           }}
           className="min-w-0 flex-1"
         />
-        <span className="shrink-0 text-caption tabular-nums text-muted">
-          {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
-        </span>
+        {/* OCV5-628:还没输入时不报「无匹配」。 */}
+        {findQuery.trim() ? (
+          <span className="shrink-0 text-caption tabular-nums text-muted" data-testid="find-count">
+            {findMatchesList.length === 0 ? "无匹配" : `${findCurrent + 1}/${findMatchesList.length}`}
+          </span>
+        ) : null}
         <IconButton
           shape="square"
           size="sm"
@@ -3018,6 +3025,33 @@ export function MessageList({
         >
           <X size={16} />
         </IconButton>
+        {/* OCV5-628:查找只覆盖已加载的消息。云端还有更早的页时如实说明范围,并给一个显式的
+            「搜更早」(与历史顶部的「查看更早历史记录」同一条 requestOlderArchive,不因滚动或输入
+            自动发请求);加载完 messages 变化,命中自动重算。单独一行,窄屏不挤输入框。 */}
+        {findQuery.trim() && hasOlderHistory ? (
+          <div
+            className="flex basis-full items-center justify-between gap-2 text-caption text-muted"
+            data-testid="find-scope-hint"
+          >
+            <span className="min-w-0">
+              {findMatchesList.length === 0 ? "已加载部分无匹配，" : ""}更早的记录还没加载，不在查找范围内
+            </span>
+            <button
+              type="button"
+              onKeyDown={stopFindKeys}
+              onClick={requestOlderArchive}
+              disabled={Boolean(archive?.loading) || archiveQueued}
+              aria-busy={Boolean(archive?.loading) || archiveQueued}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11"
+            >
+              {archive?.loading || archiveQueued
+                ? <><Spinner size={12} /> 加载中…</>
+                : archive?.error
+                  ? <span className="text-danger">加载失败，点击重试</span>
+                  : "搜更早"}
+            </button>
+          </div>
+        ) : null}
       </div>
     ) : null}
     <div

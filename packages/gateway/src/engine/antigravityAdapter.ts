@@ -50,7 +50,7 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
-import { fitHistoricalContextJsonPrompt } from '../historicalContextPrompt.js'
+import { prepareBoundedPrompt } from './boundedPrompt.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import {
   ANTIGRAVITY_PREAMBLE,
@@ -440,22 +440,21 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const stdinLine = (input: string): string =>
       `${JSON.stringify({ event: 'user', message: { content: assemblePrompt(platformContent, input, this.platformGoal) } })}\n`
     const input = promptText(ctx.params.input)
-    // Injected history is sized without this envelope; drop its oldest
-    // entries here rather than refuse a turn that can still run.
-    const fitted = fitHistoricalContextJsonPrompt(
+    const line = await prepareBoundedPrompt({
       input,
-      (candidate) => Buffer.byteLength(stdinLine(candidate), 'utf8') <= ANTIGRAVITY_MAX_PROMPT_BYTES,
-    )
-    if (fitted && fitted.dropped > 0) {
-      log.warn('antigravity injected history trimmed to the stdin limit', {
-        sessionKey: this.opts.sessionKey,
-        traceId: ctx.params.traceId,
-        droppedEntries: fitted.dropped,
-      })
-    }
-    const line = stdinLine(fitted?.prompt ?? input)
-    if (Buffer.byteLength(line, 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES) {
-      throw new Error(`ANTIGRAVITY_PROMPT_TOO_LARGE: ${Buffer.byteLength(line, 'utf8')} bytes > ${ANTIGRAVITY_MAX_PROMPT_BYTES}`)
+      serialize: stdinLine,
+      maxBytes: ANTIGRAVITY_MAX_PROMPT_BYTES,
+      cwd: cwdDecision.cwd,
+      engine: this.engineId,
+      onEvent: (event) => { if (!ctx.terminal) ctx.params.onEvent(event) },
+    })
+    // Context-file IO can outlive the logical turn. Never launch a paid CLI
+    // after end()/shutdown has already retired this turn during preparation.
+    if (ctx.terminal || ctx.abandoned) {
+      this.cleanupLaunch(ctx)
+      ctx.resolveDrain?.()
+      ctx.resolveDrain = null
+      return
     }
 
     const isolatedEnv = buildCodexEnv()

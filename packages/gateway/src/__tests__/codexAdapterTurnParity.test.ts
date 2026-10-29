@@ -1745,3 +1745,72 @@ test('draft isolated workspace preheat survives authoritative first-send creatio
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('native context observations cross the Codex adapter only during their live turn', async () => {
+  const h = makeHarness();
+  const turn = beginTurn(h);
+  await waitForRequest(h, 'turn/start');
+  const tokenUsage = { modelContextWindow: 1000, last: { totalTokens: 850, inputTokens: 800, outputTokens: 50 }, total: { totalTokens: 50000, inputTokens: 49000, outputTokens: 1000 } };
+  h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage });
+  const item = { id: 'native-compact', type: 'contextCompaction' };
+  h.proc().notify('item/started', { threadId: 'thr-new-1', turnId: 'internal-1', item });
+  h.proc().notify('item/completed', { threadId: 'thr-new-1', turnId: 'internal-1', item });
+  assert.deepEqual(h.events.filter((e) => e.kind === 'context_pressure' || e.kind === 'context_compacted'), [
+    { kind: 'context_pressure', pressure: { engine: 'codex', scope: 'native_context', dimension: 'tokens', level: 'warning', usedRatio: 0.85 } },
+    { kind: 'context_compacted', compaction: { engine: 'codex', scope: 'native_context', strategy: 'native_summary', beforeTokens: 850 } },
+  ]);
+  h.proc().notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'turn-1', status: 'completed' } });
+  await turn.summary;
+  const before = h.events.length;
+  h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage });
+  assert.equal(h.events.length, before);
+});
+
+for (const outcome of ['overflow', 'stop', 'shutdown']) {
+  test(`native compact shutdown preserves the first terminal classification and late usage (${outcome})`, { timeout: 10000 }, async () => {
+    const cancelled = outcome === 'stop';
+    const h = makeHarness();
+    const first = beginTurn(h, { requestId: 'native-first' });
+    await waitForRequest(h, 'turn/start');
+    const tokens = (n: number) => ({ totalTokens: n, inputTokens: n, outputTokens: 0 });
+    h.proc().notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'turn-1', tokenUsage: {
+      modelContextWindow: 1000, last: tokens(900), total: tokens(1000),
+    } });
+    h.proc().notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'turn-1', status: 'completed' } });
+    await first.submitted;
+    await first.summary;
+    h.events.length = 0;
+    h.billing.length = 0;
+    const p = h.proc() as FakeCodexProc & { exitCode: number | null; signalCode: string | null };
+    p.exitCode = null;
+    p.signalCode = null;
+    p.kill = () => {
+      p.killed = true;
+      setImmediate(() => {
+        p.notify('thread/tokenUsage/updated', { threadId: 'thr-new-1', turnId: 'native-fail', tokenUsage: {
+          modelContextWindow: 1000, last: tokens(100), total: tokens(1100),
+        } });
+        p.emit('close', 0, 'SIGTERM');
+      });
+    };
+    p.onRequest = (req) => {
+      if (req.method !== 'thread/compact/start') return;
+      p.respondTo(req.id, {});
+      p.notify('turn/started', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'inProgress' } });
+      if (cancelled) setImmediate(() => h.adapter.interrupt());
+      else if (outcome === 'shutdown') setImmediate(() => { void h.adapter.shutdown(); });
+      else p.notify('turn/completed', { threadId: 'thr-new-1', turn: { id: 'native-fail', status: 'failed', error: { message: 'context window exceeded' } } });
+    };
+    const next = beginTurn(h, { requestId: 'native-next', input: 'must not be submitted' });
+    await next.submitted;
+    assert.equal(h.billing.length, 1, JSON.stringify(h.events));
+    assert.equal(next.finalized, true, JSON.stringify(h.events));
+    const result = await next.summary;
+    assert.equal(result?.usage.inputTokens, 100);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0]?.terminalCode, cancelled ? 'USER_CANCELLED' : 'CODEX_ERROR');
+    if (outcome === 'overflow') assert.equal(result?.errorClass, 'context_too_long');
+    assert.equal(p.written.filter((r) => r.method === 'turn/start').length, 1);
+    assert.equal(h.events.filter((e) => e.kind === 'context_compacted').length, 0);
+  });
+}

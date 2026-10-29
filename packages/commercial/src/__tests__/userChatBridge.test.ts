@@ -77,6 +77,8 @@ interface TestRig {
 
 async function startRig(opts: {
   resolve?: ResolveContainerEndpoint;
+  containerLinkEnabled?: boolean;
+  containerLinkHeartbeatMs?: number;
   maxPerUser?: number;
   maxFrameBytes?: number;
   maxBufferedBytes?: number;
@@ -122,6 +124,8 @@ async function startRig(opts: {
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
     resolveContainerEndpoint: (uid) => rig.resolveImpl!(uid),
+    containerLinkEnabled: opts.containerLinkEnabled,
+    containerLinkHeartbeatMs: opts.containerLinkHeartbeatMs,
     maxPerUser: opts.maxPerUser,
     maxFrameBytes: opts.maxFrameBytes,
     maxBufferedBytes: opts.maxBufferedBytes,
@@ -240,6 +244,7 @@ async function nextBusinessFrame(fc: { next: () => Promise<string> }): Promise<R
     try {
       const parsed = JSON.parse(s) as Record<string, unknown>;
       if (typeof parsed?.type === "string" && (parsed.type as string).startsWith("sys.")) continue;
+      if (parsed.type === "outbound.session_snapshot") continue; // Covered by sessionSnapshot.test.ts.
       return parsed;
     } catch {
       /* 非 JSON(binary 透传等)不属于业务 JSON 断言目标,跳过 */
@@ -2866,23 +2871,44 @@ function rawDispatchRow(input: {
 function helloTerminalBillingTrio(opts: {
   row?: Record<string, unknown> | null;
   lookups?: unknown[][];
+  linkRenewals?: unknown[][];
+  /** Rows for readOpenDispatchEngineReady (persisted head of the open stream). */
+  readyScanRows?: Array<{ payload: Buffer | null }>;
+  readyScans?: unknown[][];
   beforeTurnDispatchLookup?: () => Promise<void>;
+  beforeSnapshotRead?: () => Promise<void>;
 }): Pick<UserChatBridgeDeps, "pgPool" | "preCheckRedis" | "pricing"> {
   const lookups = opts.lookups ?? [];
   return {
     pgPool: {
+      async connect() { return { query: this.query, release() {} }; },
       query: async (sql: unknown, params?: unknown[]) => {
         const text = typeof sql === "string"
           ? sql
           : String((sql as { text?: unknown })?.text ?? "");
+        if (/container_link_heartbeat/.test(text)) {
+          opts.linkRenewals?.push(params ?? []);
+          return { rows: [], rowCount: 1 };
+        }
         if (/SELECT status FROM users WHERE id/.test(text)) {
           return { rows: [{ status: "active" }], rowCount: 1 };
+        }
+        if (/session-snapshot-owner/.test(text)) {
+          await opts.beforeSnapshotRead?.();
+          return { rows: [{ as_of: String(Date.now()) }], rowCount: 1 };
+        }
+        if (/open-dispatch-engine-ready/.test(text)) {
+          opts.readyScans?.push(params ?? []);
+          const rows = opts.readyScanRows ?? [];
+          return { rows, rowCount: rows.length };
         }
         if (/FROM turn_dispatches/.test(text) && /client_message_id/.test(text)) {
           if (opts.beforeTurnDispatchLookup) await opts.beforeTurnDispatchLookup();
           lookups.push(params ?? []);
-          return opts.row
-            ? { rows: [opts.row], rowCount: 1 }
+          const row = opts.row && (params?.[2] === opts.row.client_message_id ||
+            ["admitted", "accepted", "rejecting"].includes(String(opts.row.status))) ? opts.row : null;
+          return row
+            ? { rows: [row], rowCount: 1 }
             : { rows: [], rowCount: 0 };
         }
         return { rows: [], rowCount: 0 };
@@ -2928,6 +2954,8 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     containerId: number;
     row?: Record<string, unknown> | null;
     lookups?: unknown[][];
+    readyScanRows?: Array<{ payload: Buffer | null }>;
+    readyScans?: unknown[][];
     beforeTurnDispatchLookup?: () => Promise<void>;
   }): Promise<{
     rig: TestRig;
@@ -2939,6 +2967,8 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
       row: opts.row,
       lookups,
       beforeTurnDispatchLookup: opts.beforeTurnDispatchLookup,
+      readyScanRows: opts.readyScanRows,
+      readyScans: opts.readyScans,
     });
     const portRef = { p: 0 };
     const rig = await startRig({
@@ -3082,20 +3112,29 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
-  test("hello + inFlight + 非 terminal(accepted) → 不发补帧", async () => {
-    const uid = "804";
-    const peerId = "peerAccepted";
-    const clientMessageId = "cm-accepted";
+  // INC-20261028-STALE-ENGINE-STARTING:断线超过 drain 后容器帧不落库,标签页停在
+  // engine_starting。hello 对 open dispatch 按已落库证据下发权威阶段快照,只打本条 userWs。
+  async function helloOpenDispatchSnapshot(opts: {
+    uid: string;
+    status: "accepted" | "admitted";
+    readyScanRows: Array<{ payload: Buffer | null }>;
+  }): Promise<{ frame: Record<string, unknown>; readyScans: unknown[][]; admittedAt: Date }> {
+    const peerId = `peerOpen${opts.uid}`;
+    const clientMessageId = `cm-open-${opts.uid}`;
+    const row = rawDispatchRow({
+      userId: opts.uid,
+      sessionId: peerId,
+      clientMessageId,
+      status: opts.status,
+      outcome: null,
+    });
+    const readyScans: unknown[][] = [];
     const { rig, ws } = await openHelloRig({
-      uid,
-      containerId: 804,
-      row: rawDispatchRow({
-        userId: uid,
-        sessionId: peerId,
-        clientMessageId,
-        status: "accepted",
-        outcome: null,
-      }),
+      uid: opts.uid,
+      containerId: Number(opts.uid),
+      row,
+      readyScanRows: opts.readyScanRows,
+      readyScans,
     });
     try {
       const fc = frameCollector(ws);
@@ -3104,26 +3143,73 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         peers: [{
           peerId,
           agentId: "main",
-          lastFrameSeq: 0,
+          lastFrameSeq: 3,
           inFlight: true,
           inFlightClientMessageId: clientMessageId,
         }],
       });
       ws.send(helloFrame);
       await waitHelloForwarded(rig, helloFrame);
+      // 有界等待:快照缺失时必须红,不能把测试挂死。
       const got = await Promise.race([
         nextBusinessFrame(fc),
-        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+        new Promise<null>((r) => setTimeout(() => r(null), 2000)),
       ]);
-      assert.equal(got, null, `非 terminal 不得发补帧(收到 ${JSON.stringify(got)})`);
+      assert.ok(got, "open dispatch 的 hello 必须收到权威 turn_status 快照");
+      const frame = got;
+      assert.equal(frame.peer && (frame.peer as { id?: unknown }).id, peerId);
+      assert.equal(frame.clientMessageId, clientMessageId);
+      assert.equal(frame.sessionKey, `agent:main:webchat:dm:${peerId}`);
+      return { frame, readyScans, admittedAt: row.admitted_at as Date };
     } finally {
       ws.close();
       await waitClose(ws);
       await stopRig(rig);
     }
+  }
+
+  const startupFrame = (status: string) =>
+    ({ payload: Buffer.from(JSON.stringify({ type: "outbound.turn_status", status })) });
+
+  test("hello + inFlight + accepted + 已落库就绪证据(thinking) → turn_status null + detached", async () => {
+    const { frame, readyScans, admittedAt } = await helloOpenDispatchSnapshot({
+      uid: "806",
+      status: "accepted",
+      readyScanRows: [
+        { payload: Buffer.from(JSON.stringify({ type: "sys.context_rebuilt" })) },
+        startupFrame("engine_starting"),
+        { payload: Buffer.from(JSON.stringify({ type: "outbound.message", blocks: [{ kind: "thinking", text: "I" }] })) },
+      ],
+    });
+    assert.equal(frame.type, "outbound.turn_status");
+    assert.equal(frame.status, null);
+    assert.notEqual(frame.isFinal, true, "open dispatch 不得补 isFinal");
+    assert.deepEqual(frame.meta, { detached: true, since: admittedAt.getTime() });
+    assert.equal(readyScans.length, 1);
+    assert.equal(readyScans[0]![0], "dispatch:d-hello-terminal:1");
   });
 
-  test("hello 没有 inFlightClientMessageId → 不查 PG、不发帧", async () => {
+  test("hello + inFlight + accepted + 只有启动帧 → engine_starting + since + detached", async () => {
+    const { frame, admittedAt } = await helloOpenDispatchSnapshot({
+      uid: "807",
+      status: "accepted",
+      readyScanRows: [startupFrame("engine_starting"), startupFrame("engine_starting")],
+    });
+    assert.equal(frame.type, "outbound.turn_status");
+    assert.equal(frame.status, "engine_starting");
+    assert.deepEqual(frame.meta, { detached: true, since: admittedAt.getTime() });
+  });
+
+  test("hello + inFlight + admitted + 超大帧(内容) → 视为已就绪", async () => {
+    const { frame } = await helloOpenDispatchSnapshot({
+      uid: "808",
+      status: "admitted",
+      readyScanRows: [startupFrame("engine_starting"), { payload: null }],
+    });
+    assert.equal(frame.status, null);
+  });
+
+  test("hello 没有 inFlightClientMessageId → 查询当前回合，不伪造旧终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "805";
     const { rig, ws } = await openHelloRig({
@@ -3152,7 +3238,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `无 inFlight 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "无 inFlightClientMessageId 不得查 turn_dispatches");
+      assert.equal(lookups.length, lookupsBefore + 1, "新设备必须查询当前 open dispatch");
     } finally {
       ws.close();
       await waitClose(ws);
@@ -3289,7 +3375,7 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
     }
   });
 
-  test("hello + 超长 clientMessageId(>200) → 不查 PG、不发帧", async () => {
+  test("hello + 超长 clientMessageId(>200) → 当作缺省：不拿它查库、不伪造终态补帧", async () => {
     const lookups: unknown[][] = [];
     const uid = "809";
     const peerId = "peerLongId";
@@ -3326,7 +3412,10 @@ describe("userChatBridge — hello terminal dispatch fallback", () => {
         new Promise<null>((r) => setTimeout(() => r(null), 250)),
       ]);
       assert.equal(got, null, `超长 id 不得发补帧(收到 ${JSON.stringify(got)})`);
-      assert.equal(lookups.length, lookupsBefore, "超长 clientMessageId 不得查 turn_dispatches");
+      assert.ok(
+        lookups.slice(lookupsBefore).every((args) => !JSON.stringify(args).includes(clientMessageId)),
+        "超长 clientMessageId 不得进入任何查询参数",
+      );
     } finally {
       ws.close();
       await waitClose(ws);
@@ -4376,6 +4465,253 @@ describe("userChatBridge — first_visible persist is not permanently suppressed
       ws.close();
       await waitClose(ws);
     } finally {
+      await stopRig(rig);
+    }
+  });
+});
+// RF-link replaces A1: one container transport persists across browser detach/attach.
+describe("RF-link singleton transport for open dispatch streams", () => {
+  const ENV_KEYS = [
+    "DRAIN_BILLING_MS",
+    "OC_DISPATCH_DRAIN_MS",
+    "OC_CONTAINER_LINK",
+  ] as const;
+  const saved = new Map<string, string | undefined>();
+  before(() => {
+    for (const key of ENV_KEYS) saved.set(key, process.env[key]);
+    process.env.DRAIN_BILLING_MS = "50";
+    process.env.OC_DISPATCH_DRAIN_MS = "100";
+    process.env.OC_CONTAINER_LINK = "1";
+  });
+  after(() => {
+    for (const key of ENV_KEYS) {
+      const prev = saved.get(key);
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  });
+
+  const SESSION = "sess-a1";
+  const CMID = "cm-a1-headless";
+  const frame = (frameSeq: number, isFinal = false): string => JSON.stringify({
+    type: "outbound.message",
+    sessionKey: `agent:main:webchat:dm:${SESSION}`,
+    frameSeq,
+    peer: { id: SESSION, kind: "dm" },
+    clientMessageId: CMID,
+    isFinal,
+    blocks: [{ kind: "text", text: `t${frameSeq}` }],
+  });
+
+  async function linkRig(row: Record<string, unknown>, beforeSnapshotRead?: () => Promise<void>) {
+    const persisted: number[] = [];
+    const renewals: unknown[][] = [];
+    row.agent_container_id = "77";
+    const portRef = { value: 0 };
+    const rig = await startRig({
+      resolve: async () => ({ host: "127.0.0.1", port: portRef.value, containerId: 77 }),
+      persistOutboundFrame: async (input) => { persisted.push(input.frameSeq); },
+      containerLinkHeartbeatMs: 50,
+      ...helloTerminalBillingTrio({ row, linkRenewals: renewals, beforeSnapshotRead }),
+    });
+    portRef.value = rig.containerPort;
+    return { rig, persisted, renewals };
+  }
+
+  async function connect(rig: TestRig, uid: string): Promise<{ ws: WebSocket; container: WebSocket }> {
+    const containerOpen = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt(uid));
+    await new Promise<void>((resolve) => ws.once("open", resolve));
+    return { ws, container: await containerOpen };
+  }
+
+  const acceptedRow = (uid: string) => rawDispatchRow({
+    userId: uid, sessionId: SESSION, clientMessageId: CMID, status: "accepted", outcome: null,
+  });
+
+  test("两个在线标签共享 WS、各收到会话帧和快照,同一帧仅落库一次", async () => {
+    const { rig, persisted } = await linkRig(acceptedRow("1207"));
+    try {
+      const first = await connect(rig, "1207");
+      const second = openClient(rig.gatewayPort, await makeJwt("1207"));
+      const received: Record<string, unknown>[][] = [[], []];
+      for (const [index, socket] of [first.ws, second].entries()) {
+        socket.on("message", (data) => received[index]!.push(JSON.parse(String(data))));
+      }
+      await new Promise<void>((resolve) => second.once("open", resolve));
+      await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 2);
+      const hello = JSON.stringify({ type: "inbound.hello", peers: [{ peerId: SESSION, agentId: "main", lastFrameSeq: 999 }] });
+      first.ws.send(hello);
+      second.send(hello);
+      await waitFor(() => rig.containerSeen.filter((entry) => JSON.parse(String(entry.data)).type === "inbound.hello").length === 2);
+      first.container.send(frame(1));
+      first.container.send(JSON.stringify({ type: "outbound.turn_status", peer: { id: SESSION, kind: "dm" }, status: null, marker: "shared-status" }));
+      first.container.send(JSON.stringify({ type: "outbound.prompt_queue.snapshot", owner: { clientSessionId: SESSION }, items: [], marker: "shared-queue" }));
+      await waitFor(() => persisted.length === 1 && received.every((frames) =>
+        frames.some((value) => value.frameSeq === 1) &&
+        frames.some((value) => value.marker === "shared-status") &&
+        frames.some((value) => value.marker === "shared-queue")));
+      assert.equal(rig.containerSockets.length, 1);
+      assert.deepEqual(persisted, [1]);
+      for (const frames of received) {
+        assert.equal(frames.filter((value) => value.frameSeq === 1).length, 1);
+        assert.equal(frames.filter((value) => value.marker === "shared-status").length, 1);
+        assert.equal(frames.filter((value) => value.marker === "shared-queue").length, 1);
+      }
+      first.ws.close();
+      second.close();
+    } finally { await stopRig(rig); }
+  });
+
+  test("drain 到期仍在跑 → 容器 WS 不关、断线期帧继续落库;isFinal 后收尾", async () => {
+    const { rig, persisted, renewals } = await linkRig(acceptedRow("1201"));
+    try {
+      const { ws, container } = await connect(rig, "1201");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      let containerClosed = false;
+      container.once("close", () => { containerClosed = true; });
+      ws.close();
+      await waitClose(ws);
+      await new Promise<void>((resolve) => setTimeout(resolve, 400)); // > drain 100ms
+      assert.equal(containerClosed, false, "open dispatch 的容器流不得随 drain 关闭");
+      assert.ok(renewals.length >= 2, "no output for 400ms still renews accepted lease");
+      assert.equal(rig.bridge.containerLinkSnapshots!()[0]?.subscribers, 0);
+      container.send(frame(2));
+      await waitFor(() => persisted.includes(2));
+      container.send(frame(3, true));
+      await waitFor(() => containerClosed, 3000);
+      assert.deepEqual(persisted, [1, 2, 3]);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("没等到 isFinal,PG 判终态 → 链路收尾", async () => {
+    const row = acceptedRow("1202");
+    const { rig, persisted } = await linkRig(row);
+    try {
+      const { ws, container } = await connect(rig, "1202");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      let containerClosed = false;
+      container.once("close", () => { containerClosed = true; });
+      ws.close();
+      await new Promise<void>((resolve) => setTimeout(resolve, 400));
+      assert.equal(containerClosed, false);
+      row.status = "terminal";
+      row.outcome = "completed";
+      await waitFor(() => containerClosed, 3000);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("重连 attach 原链路：慢 PG 快照不阻塞 hello、续租与单次落帧", async () => {
+    let releaseSnapshot!: () => void;
+    const snapshotGate = new Promise<void>((resolve) => { releaseSnapshot = resolve; });
+    let snapshotReading = false;
+    const { rig, persisted, renewals } = await linkRig(acceptedRow("1203"), async () => {
+      snapshotReading = true;
+      await snapshotGate;
+    });
+    try {
+      const first = await connect(rig, "1203");
+      first.container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      first.ws.close();
+      await waitClose(first.ws);
+      const second = openClient(rig.gatewayPort, await makeJwt("1203"));
+      const frames = frameCollector(second);
+      const snapshots: Array<{ sessionId: string; dispatch: { clientMessageId: string; status: string } }> = [];
+      second.on("message", (data) => {
+        const wire = JSON.parse(String(data));
+        if (wire.type === "outbound.session_snapshot") snapshots.push(wire.snapshot);
+      });
+      await new Promise<void>((r) => second.once("open", r));
+      await waitFor(() => rig.bridge.containerLinkSnapshots!()[0]?.subscribers === 1);
+      const hello = JSON.stringify({type: "inbound.hello", peers: [{peerId: SESSION, agentId: "main", lastFrameSeq: 1}]});
+      second.send(hello);
+      await waitFor(() => rig.containerSeen.some((entry) => {
+        const wire = JSON.parse(String(entry.data));
+        return wire.type === "inbound.hello" && wire.peers?.[0]?.peerId === SESSION;
+      }));
+      await waitFor(() => snapshotReading);
+      assert.equal(snapshots.length, 0, "hello 已转发，PG 尚未放行时不发快照");
+      const renewalsBefore = renewals.length;
+      await waitFor(() => renewals.length > renewalsBefore);
+      first.container.send(frame(2));
+      await waitFor(() => persisted.includes(2));
+      let received: { frameSeq?: number };
+      do { received = JSON.parse(await frames.next()); } while (received.frameSeq !== 2);
+      assert.equal(rig.containerSockets.length, 1);
+      assert.deepEqual(persisted, [1, 2]);
+      assert.equal(first.container.readyState, WebSocket.OPEN);
+      assert.equal(snapshots.length, 0, "快照仍挂起时 live 帧照常送达");
+      releaseSnapshot();
+      await waitFor(() => snapshots.length === 1);
+      assert.equal(snapshots[0]!.sessionId, SESSION);
+      assert.equal(snapshots[0]!.dispatch.clientMessageId, CMID);
+      assert.equal(snapshots[0]!.dispatch.status, "accepted");
+      first.container.send(frame(3, true));
+      await waitFor(() => persisted.includes(3));
+      second.close();
+    } finally { releaseSnapshot(); await stopRig(rig); }
+  });
+
+  test("没有 open dispatch 流 → user close 立即关容器 WS(行为不变)", async () => {
+    const { rig } = await linkRig(acceptedRow("1204"));
+    try {
+      const { ws, container } = await connect(rig, "1204");
+      const closed = new Promise<void>((resolve) => container.once("close", () => resolve()));
+      ws.close();
+      await closed;
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("接管后 shutdown → 所有链路与心跳有序关闭", async () => {
+    const { rig, persisted } = await linkRig(acceptedRow("1206"));
+    let stopped = false;
+    try {
+      const { ws, container } = await connect(rig, "1206");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      const closed = new Promise<void>((resolve) => container.once("close", () => resolve()));
+      ws.close();
+      await waitClose(ws);
+      await rig.bridge.shutdown(); // 桥仍在 drain(100ms),已 unregister
+      stopped = true;
+      await Promise.race([
+        closed,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("container WS left open after shutdown")), 3000)),
+      ]);
+    } finally {
+      if (stopped) {
+        await new Promise<void>((r) => rig.containerWss.close(() => r()));
+        await new Promise<void>((r) => rig.gateway.close(() => r()));
+      } else {
+        await stopRig(rig);
+      }
+    }
+  });
+
+  test("OC_CONTAINER_LINK=0 → 恢复旧 bridge 关闭行为", async () => {
+    process.env.OC_CONTAINER_LINK = "0";
+    const { rig, persisted } = await linkRig(acceptedRow("1205"));
+    try {
+      const { ws, container } = await connect(rig, "1205");
+      container.send(frame(1));
+      await waitFor(() => persisted.includes(1));
+      const closedAt = new Promise<number>((resolve) => container.once("close", () => resolve(Date.now())));
+      const t0 = Date.now();
+      ws.close();
+      const elapsed = (await closedAt) - t0;
+      assert.ok(elapsed < 1000, `accepted stream no longer retains a transport: ${elapsed}ms`);
+      assert.deepEqual(rig.bridge.containerLinkSnapshots!(), []);
+    } finally {
+      process.env.OC_CONTAINER_LINK = "1";
       await stopRig(rig);
     }
   });

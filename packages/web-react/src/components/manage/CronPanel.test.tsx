@@ -106,7 +106,10 @@ describe("CronPanel 写路径:乐观更新 + 局部替换 + Toast(不再整表�
 
     fireEvent.click(await screen.findByRole("switch", { name: "启用「每日早报」" }));
 
-    expect(await screen.findByText("操作失败（追踪号 req-x）")).toBeInTheDocument();
+    // 追踪号不进正文,收进「复制追踪号」按钮(UI-0 Toast,UI-SPEC §1.1 C6)。
+    const alert = (await screen.findByText("操作失败")).closest("[role=alert]") as HTMLElement;
+    expect(alert).not.toHaveTextContent("req-x");
+    expect(within(alert).getByRole("button", { name: "复制追踪号" })).toHaveAttribute("title", "追踪号 req-x");
     expect(screen.queryByText(/boom/)).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("启用中")).toBeInTheDocument());
   });
@@ -470,14 +473,15 @@ describe("CronPanel 行(OCV5-360:整行一个点按目标,开关是唯一行内�
     mountPanel();
     const status = await screen.findByText("启用中");
     expect(status).toHaveAttribute("data-cron-status");
-    expect(status.querySelector(".bg-success")).not.toBeNull();
+    // 圆点颜色走状态别名(UI-0 StatusPill):启用中 = done 色调。
+    expect(status.querySelector(".bg-status-done")).not.toBeNull();
     const desc = screen.getByText("汇总昨天进展");
     expect(desc).toHaveClass("line-clamp-2");
     expect(desc).not.toHaveClass("block");
     const overdue = document.querySelector("[data-cron-overdue]") as HTMLElement;
     expect(overdue).toHaveTextContent(/已过点 · 原定/);
     expect(overdue).not.toHaveClass("text-warning");
-    expect(overdue.querySelector(".bg-warning")).not.toBeNull();
+    expect(overdue.querySelector(".bg-status-attention")).not.toBeNull();
   });
 
   test("编辑表单底部可删除;新建表单没有删除入口", async () => {

@@ -2145,9 +2145,10 @@ export async function _runDelegateTaskCore(
         }
       } else if (submitSettled) {
         // Engine reached a terminal state with no usage: close the journal.
-        // Timeout/unsettled must NOT abandon — aborted journals are not
-        // reopened by the durable reconciler, and a late codex_billing
-        // frame would leak. Leave inflight for tape settle / 24h waiver.
+        // The billing client durably retries this terminal decision if the
+        // master is unavailable. Non-permanent aborts can reopen for late usage.
+        // Timeout/unsettled must NOT abandon: the child may still be running,
+        // so keep its journal inflight for tape settle / 24h waiver.
         await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
       } else {
         this.log.warn('delegate_engine_billing_kept_inflight', {

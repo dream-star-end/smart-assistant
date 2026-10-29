@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   type LiveFrameInput,
+  type SessionSnapshot,
   type LiveUnitState,
   type LiveUnitsPage,
   type ReduceLiveFramesOptions,
@@ -149,6 +150,7 @@ export interface ClientSessionLiveFrame {
 }
 
 export interface ClientSessionLiveFramePage {
+  snapshot?: SessionSnapshot | null;
   frames: ClientSessionLiveFrame[];
   nextCursor: string | null;
   hasMore: boolean;
@@ -163,6 +165,7 @@ export interface ClientSessionLiveFramePage {
 export type ReadClientSessionLiveFramesOptions = {
   /** Opt-in last-page read. after=0 still pages forward unless this is set. */
   seekTail?: boolean;
+  readSnapshot?: (client: PoolClient) => Promise<SessionSnapshot | null>;
 };
 
 /** Hot GET live-frames only reads live streams of in-flight dispatches. */
@@ -294,6 +297,22 @@ export async function persistGatewayLiveFrame(
           )
         ).rows[0] ?? null
       : null;
+    // OCV5-646: the master folds this stream into a boot-recovery
+    // SERVICE_RESTART tape at prepare. Phase A of that tape commits under this
+    // same dispatch row lock, so a frame that reaches here after it would make
+    // two prepare attempts fold different frames (immutable record identity
+    // conflict on retry). The turn is already terminal; drop it.
+    if (dispatch && finalizedTape === null) {
+      const restartCut = await client.query(
+        `SELECT 1 FROM client_session_turn_tapes
+          WHERE dispatch_id=$1::uuid AND attempt_no=$2 AND finalized_at IS NULL
+            AND visible_at IS NOT NULL AND status='crashed'
+            AND visible_head->>'errorCode'='SERVICE_RESTART'
+          LIMIT 1`,
+        [dispatch.dispatch_id, dispatch.attempt_no],
+      );
+      if ((restartCut.rowCount ?? 0) > 0) return { streamKey, live: false };
+    }
 
     const stream = await client.query(
       `INSERT INTO client_session_live_streams
@@ -460,6 +479,48 @@ export function liveCatchupSendDecision(
     : HELLO_LIVE_CATCHUP_MAX_BYTES;
   if (buffered + payload > budget) return "backpressure";
   return "send";
+}
+
+/** Head frames scanned for engine-ready evidence; startup emits only a few. */
+const OPEN_DISPATCH_READY_SCAN_FRAMES = 16;
+/** Startup frames are tiny; anything larger is content and counts as evidence. */
+const OPEN_DISPATCH_READY_SCAN_MAX_FRAME_BYTES = 4096;
+
+function isStartupOnlyLiveFrame(payload: Buffer): boolean {
+  try {
+    const frame = JSON.parse(payload.toString("utf8")) as { type?: unknown; status?: unknown };
+    if (frame.type === "sys.context_rebuilt") return true;
+    return frame.type === "outbound.turn_status" &&
+      (frame.status === "engine_starting" || frame.status === "engine_resuming");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * INC-20261028-STALE-ENGINE-STARTING — does the persisted head of one open
+ * dispatch's live stream prove the engine got past startup? Any frame other
+ * than context_rebuilt / engine_starting / engine_resuming is evidence. The
+ * caller scopes the dispatch to uid+session (getDispatchByLogicalKey).
+ */
+export async function readOpenDispatchEngineReady(
+  q: Pick<Pool, "query">,
+  input: { dispatchId: string; attemptNo: number },
+): Promise<boolean> {
+  const res = await q.query<{ payload: Buffer | null }>(
+    `/* open-dispatch-engine-ready */
+     SELECT CASE WHEN octet_length(f.payload) <= $2 THEN f.payload END AS payload
+       FROM client_session_live_frames f
+      WHERE f.stream_key = $1
+      ORDER BY f.frame_seq ASC
+      LIMIT $3`,
+    [
+      `dispatch:${input.dispatchId}:${input.attemptNo}`,
+      OPEN_DISPATCH_READY_SCAN_MAX_FRAME_BYTES,
+      OPEN_DISPATCH_READY_SCAN_FRAMES,
+    ],
+  );
+  return res.rows.some((row) => row.payload == null || !isStartupOnlyLiveFrame(row.payload));
 }
 
 /**
@@ -739,6 +800,7 @@ export async function readClientSessionLiveFrames(
       // 客户端据此识别"两次水合之间发生的 live→tape 切换"(含断连期间完成的
       // turn),一次性布尔标记对那种场景是盲的(codex 审计 blocker)。
       tapeProjectionVersion,
+      ...(options?.readSnapshot ? { snapshot: await options.readSnapshot(client) } : {}),
     };
   }, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
 }

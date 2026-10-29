@@ -1,3 +1,5 @@
+import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
+import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
 import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
 // pgSessionsBackend — master 会话权威六表的 **PostgreSQL 实现**(RFC-v5-sessions-pg,P2)。
@@ -268,6 +270,7 @@ import {
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
 import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
+import { foldSyntheticServiceRestartTape } from "./serviceRestartLiveFold.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
   readClientSessionLiveUnits as readDurableClientSessionLiveUnits,
@@ -1474,7 +1477,7 @@ const PROBE_EXPECTED_COLUMNS: ReadonlyArray<[string, string, string]> = [
  * waits for its drain/claim/admit cycle — or paint the red card right away
  * when the master has decided no automatic recovery will follow.
  */
-export type AutomaticRecoveryDecision =
+export type AutomaticRecoveryDecision = { retryStatus?: AutomaticRetryStatus } & (
   | {
       scheduled: true;
       sourceClientMessageId: string;
@@ -1502,7 +1505,7 @@ export type AutomaticRecoveryDecision =
         | "retry_exhausted"
         | "media_not_durable"
         | "enqueue_rejected";
-    };
+    });
 
 export interface PgSessionsBackendOptions {
   /** 启动时快照的权威 generation(RFC D5:probe 复核 marker 未漂移)。 */
@@ -2187,6 +2190,8 @@ export async function appendRecoveryGiveUpTerminalCard(
     id: `m-recovery-giveup-${input.rootClientMessageId}`,
     role: "assistant",
     text,
+    _userError: getUserError(input.reason === "retry_exhausted" ? "automatic_retry_exhausted"
+      : input.reason === "recovery_refused" ? "automatic_retry_refused" : "automatic_retry_paused"),
     ts: Date.now(),
     // status:"completed" 是前端把用户角标从「已发送」翻成「已回复」的唯一谓词
     // (web/modules/messages.js _deriveUserMsgStatus);缺了它这张卡等于没发。
@@ -2271,8 +2276,10 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   const declined = (
     reason: Extract<AutomaticRecoveryDecision, { scheduled: false }>["reason"],
     errorCode: string,
+    retryStatus = automaticRetryStatus("declined"),
   ): AutomaticRecoveryDecision => ({
     scheduled: false,
+    retryStatus,
     sourceClientMessageId: clientMessageId,
     errorCode,
     reason,
@@ -2415,7 +2422,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "silent_no_progress",
     });
-    return done(declined("silent_no_progress", errorCode), paused);
+    return done(declined("silent_no_progress", errorCode, automaticRetryStatus("paused", currentAttempt)), paused);
   }
   // OCV5-317: a checkpoint admitted only because every tool had settled keeps
   // a short automatic budget (tools ran, so the old no-progress rule never
@@ -2438,7 +2445,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
       rootClientMessageId,
       reason: "retry_exhausted",
     });
-    return done(declined("retry_exhausted", errorCode));
+    return done(declined("retry_exhausted", errorCode, automaticRetryStatus("exhausted", currentAttempt, retryLimit)));
   }
   const semanticRecoveryAttempt = currentAttempt + 1;
   const identity = turnRecoveryAttemptIdentity(
@@ -2487,6 +2494,8 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   };
   const request: Record<string, unknown> = {
     type: "inbound.message",
+    // Presentation metadata stays outside the strict recovery admission envelope.
+    _automaticRecoveryRetryLimit: retryLimit,
     idempotencyKey: identity.idempotencyKey,
     channel: "webchat",
     peer: { id: input.sessionId, kind: "dm" },
@@ -2520,6 +2529,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   if (!enqueued) return done(declined("enqueue_rejected", errorCode));
   return done({
     scheduled: true,
+    retryStatus: automaticRetryStatus("scheduled", semanticRecoveryAttempt, retryLimit),
     sourceClientMessageId: clientMessageId,
     rootClientMessageId,
     errorCode,
@@ -4086,6 +4096,13 @@ export async function _prepareLosslessTurnTapeOutsideLocks(
   } catch (err) {
     throw new Error(`lossless turn tape canonical JSON invalid: ${(err as Error).message}`);
   }
+  // OCV5-646: a boot-recovery SERVICE_RESTART tape carries no process; fold
+  // what this dispatch already streamed before finalize retires its frames.
+  rawPayload = await foldSyntheticServiceRestartTape(pool, {
+    sessionId: request.sessionId,
+    userId,
+    tapeId: request.tapeId,
+  }, rawPayload);
   const turn = materializeLosslessTurn(rawPayload, {
     runtimeBatching: recordStorageFormat === 3,
   });
@@ -8870,10 +8887,13 @@ async function readAutomaticRecoveriesForSession(
     error_code: string;
     recovery_mode: 'replay' | 'checkpoint';
     semantic_recovery_attempt: number;
+    status: string;
+    retry_limit: number | null;
   }>(
     `SELECT source_client_message_id,root_client_message_id,
             request_json->>'clientMessageId' AS client_message_id,
-            error_code,recovery_mode,semantic_recovery_attempt
+            error_code,recovery_mode,semantic_recovery_attempt,status,
+            request_json->'_automaticRecoveryRetryLimit' AS retry_limit
        FROM turn_recovery_jobs
       WHERE user_id=$1::bigint AND session_id=$2
         AND status IN ('queued','leased','sent','forwarded')
@@ -8887,6 +8907,8 @@ async function readAutomaticRecoveriesForSession(
     errorCode: row.error_code,
     mode: row.recovery_mode,
     attempt: row.semantic_recovery_attempt,
+    retryStatus: automaticRetryStatus(row.status === "forwarded" ? "running" : "scheduled",
+      row.semantic_recovery_attempt, row.retry_limit ?? undefined),
   })) };
 }
 
@@ -12183,7 +12205,7 @@ export function createPgSessionsBackend(
       userId: string,
       afterRecordId = 0,
       limit = 200,
-      options?: { seekTail?: boolean },
+      options?: { seekTail?: boolean } & SessionSnapshotOptions,
     ) {
       return readDurableClientSessionLiveFrames(
         pool,
@@ -12191,7 +12213,10 @@ export function createPgSessionsBackend(
         userId,
         afterRecordId,
         limit,
-        options,
+        { ...options, readSnapshot: (client) => {
+          const uid = /^c:([1-9][0-9]*)$/.exec(userId)?.[1];
+          return uid ? buildSessionSnapshot(client, uid, sessionId, { ...options, limit }) : Promise.resolve(null);
+        } },
       );
     },
 

@@ -2692,7 +2692,7 @@ await check("T33 当前微博账号重新扫码登录不会先解绑旧连接", 
   }
   await connectors.getByRole("button", { name: "账号「我的微博」的更多操作" }).click();
   await page.getByRole("menu").getByRole("menuitem", { name: "重新扫码登录" }).click();
-  const confirmation = page.getByRole("dialog").filter({ hasText: "重新登录「微博」?" });
+  const confirmation = page.getByRole("dialog").filter({ hasText: "重新登录「微博」？" });
   await confirmation.getByText(/新扫码成功前会保留当前登录状态/).waitFor({ state: "visible" });
   await confirmation.getByText(/写入能力和免逐次确认/).waitFor({ state: "visible" });
   await confirmation.getByRole("button", { name: "重新扫码登录" }).click();
@@ -2913,6 +2913,38 @@ await check("T48 引擎冷启动阶段显示启动/恢复文案，首内容清�
   await waitForReplay((state) => !state.sending, "引擎启动证明轮没有被 final 正常收尾");
   if (await replayRoot.getByText(/正在启动引擎|正在恢复会话/).count()) {
     throw new Error("终态后引擎启动文案仍粘在时间线上");
+  }
+});
+
+await check("T74 stale engine starting after resume shows an honest label; detached snapshot then live frame", async () => {
+  // INC-20261028-STALE-ENGINE-STARTING:商业 uid 4 手机切后台 19 分钟,切回时活动行仍是「正在启动引擎 (1184s)」。
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`切回证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+  const activity = replayRoot.getByLabel("生成中");
+  await activity.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
+  await page.evaluate(() => window.__replayDrive.ageTurnClock(1_163_000));
+  await activity.getByText(/无新数据|连接已断开/).waitFor({ state: "visible", timeout: 3000 });
+  if (await activity.getByText(/启动引擎/).count()) {
+    throw new Error("切回时启动态已过期,活动行仍显示「正在启动引擎」");
+  }
+  await page.evaluate(() => window.__replayDrive.pushDetachedSnapshot(null));
+  await activity.getByText(/后台运行中/).waitFor({ state: "visible", timeout: 3000 });
+  if (await activity.getByText(/启动引擎/).count()) {
+    throw new Error("hello detached 快照后仍显示「正在启动引擎」");
+  }
+  await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
+  await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
+  if (await activity.getByText(/后台运行中|启动引擎/).count()) {
+    throw new Error("新帧到达后 detached / 启动文案仍粘着");
+  }
+  await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "切回证明轮没有被 final 正常收尾");
+  if (await replayRoot.getByText(/正在启动引擎|后台运行中|深度思考中/).count()) {
+    throw new Error("终态后启动/后台/思考文案仍粘在时间线上");
   }
 });
 

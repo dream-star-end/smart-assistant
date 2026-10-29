@@ -91,6 +91,7 @@ import {
   _isBlockingUserInputTool,
   _permissionRequestExpiresAt,
 } from './pendingPermissionSnapshot.js'
+import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
@@ -2048,6 +2049,8 @@ export async function dispatchInbound(
           })
         } else if (e.kind === 'task_notification_delivered') {
           this.handleCcbLocalAgentDelivered(session.sessionKey, e.taskId)
+        } else if (e.kind === 'context_pressure' || e.kind === 'context_compacted') {
+          this.deliver(buildContextObservationFrame(out, session.agentId, e), adapter)
         } else if (e.kind === 'turn_status') {
           // Plan 2 (compact-progress-frame) — CCB setSDKStatus 侧信道。CcbMessageParser
           // 把 stdout `{type:'system', subtype:'status', status:'compacting'|null}` 转成
@@ -2316,8 +2319,8 @@ export async function dispatchInbound(
         // turn 传本回调(delegate/cron/train submit 不传 → 无用户可见提示,正确:那些
         // 内部子 turn 没有前台用户看)。gateway-authored 决策直接 deliver(),不绕 engine
         // event 流(那是底座上报通道)。frame 路由继承主 out(_inheritOutboundRouting)。
-        emitContextRebuilt: (info: { messageCount: number }) => {
-          this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount), adapter)
+        emitContextRebuilt: (info: { messageCount: number; reason?: 'engine-switch' | 'native-resume-loss' }) => {
+          this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount, info.reason, safeClientMessageId), adapter)
         },
         ...(safeClientMessageId
           ? {

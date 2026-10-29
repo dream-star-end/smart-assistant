@@ -454,7 +454,9 @@ export function buildHistoricalContextPrompt(
   currentUserText: string,
   maxHistoryChars?: number,
   maxPromptBytes?: number,
+  includeCurrentUserText = true,
 ): string | null {
+  const promptUserText = includeCurrentUserText ? currentUserText : ''
   const currentNorm = normForCompare(currentUserText)
   const rows: Array<{ role: ModelHistorySemanticRole; text: string; status?: unknown }> = []
   for (const raw of messages) {
@@ -487,7 +489,7 @@ export function buildHistoricalContextPrompt(
         role: modelHistoryRoleLabel(message.role),
         text: message.text,
       })),
-      currentUserText,
+      promptUserText,
     )
   if (
     typeof maxPromptBytes === 'number' &&
@@ -528,7 +530,7 @@ export function buildHistoricalContextPrompt(
     '</openclaude_previous_context>',
     '',
     '<current_user_message>',
-    currentUserText,
+    promptUserText,
     '</current_user_message>',
   ].join('\n')
 }
@@ -583,7 +585,7 @@ export function shouldAttemptHistoricalContextInjection(opts: {
   hasProviderResumeId?: boolean
 }): boolean {
   if (opts.channel !== 'webchat') return false
-  if (typeof opts.userTextOrBlocks !== 'string') return false
+  if (typeof opts.userTextOrBlocks !== 'string' && !Array.isArray(opts.userTextOrBlocks)) return false
   if (opts.injectionKey) return opts.lastInjectedKey !== opts.injectionKey
   return !opts.alreadyInjected && !opts.hasProviderResumeId
 }
@@ -591,7 +593,9 @@ export function shouldAttemptHistoricalContextInjection(opts: {
 export function shouldEmitContextRebuilt(opts: {
   historyMode: 'native-resume' | 'stateless-replay'
   reason?: AgentSession['_contextRebuildNotice']
+  alreadyNotified?: boolean
 }): boolean {
+  if (opts.alreadyNotified) return false
   return opts.historyMode === 'native-resume' || opts.reason !== undefined
 }
 
@@ -767,11 +771,12 @@ export function scheduleSessionOutputAssetCollection(opts: {
   traceId?: string
   chatProjectId?: string | null
 }): void {
-  if (!opts.userId || !opts.assistantText) return
+  // OCV5-625: still scan workspace/sessions/<id> when the turn text has no generated/ paths.
+  if (!opts.userId) return
   void collectSessionOutputAssets({
     userId: opts.userId,
     sessionId: opts.sessionId,
-    assistantText: opts.assistantText,
+    assistantText: opts.assistantText || '',
     ...(opts.chatProjectId !== undefined ? { chatProjectId: opts.chatProjectId } : {}),
   }).catch((err) => {
     log.warn(
@@ -2111,7 +2116,7 @@ export class SessionManager {
        *  (server.ts)发 sys.context_rebuilt 提示帧(boss 硬指标 3:引擎无法原生续接、
        *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
        *  submit 不传 → 无用户可见提示。gateway-authored 决策,不进 engine event 流。 */
-      emitContextRebuilt?: (info: { messageCount: number }) => void
+      emitContextRebuilt?: (info: { messageCount: number; reason?: 'engine-switch' | 'native-resume-loss' }) => void
       /** Active-turn reconnect lifecycle for one validated webchat user row.
        * Hooks are isolated from turn correctness: SessionManager logs and
        * ignores hook failures and always releases session.lock. */

@@ -445,6 +445,22 @@ export function _buildTurnStatusFrame(
  * retrying 形态展平为 `status:'retrying'` + 平级 `retry`;compacting/null 为
  * `status` 本身。给「拼装未类型化 wire 对象」的路径用(autoResume 的 JSON.stringify)。
  */
+/**
+ * Phase to re-send on a reconnect hello, or undefined when nothing should be
+ * sent (runner idle: the ring / synthetic isFinal own the terminal state).
+ * A running turn always gets its authoritative phase, including null: the
+ * startup phase's clear frame may have been emitted while no browser was
+ * attached, and without this the tab keeps showing 「正在启动引擎」 until the
+ * next content frame (INC-20261028-STALE-ENGINE-STARTING).
+ */
+export function _helloTurnStatusResendPhase(
+  runnerIsRunning: boolean,
+  currentTurnStatus: GatewayTurnPhase | undefined,
+): GatewayTurnPhase | undefined {
+  if (!runnerIsRunning) return undefined
+  return currentTurnStatus ?? null
+}
+
 export function _turnStatusWireFields(
   phase: GatewayTurnPhase,
 ):
@@ -471,9 +487,13 @@ export function _buildContextRebuiltFrame(
   out: OutboundMessage & { _userId?: string },
   agentId: string,
   messageCount: number,
+  reason?: 'engine-switch' | 'native-resume-loss',
+  clientMessageId?: string,
 ): SysContextRebuilt & { _userId?: string } {
   return {
     type: 'sys.context_rebuilt',
+    ...(reason ? { reason } : {}),
+    ...(clientMessageId ? { clientMessageId, noticeId: `${clientMessageId}:${agentId}` } : {}),
     ..._inheritOutboundRouting(out),
     agentId,
     messageCount,

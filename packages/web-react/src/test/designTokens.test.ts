@@ -12,8 +12,8 @@
  *     因为 `bg-*-soft text-*` 是仓内徽章的标准组合;
  *   - 非文字类(焦点环 / 控件边界)≥ 3:1(AA 非文本对比)。
  */
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -35,7 +35,8 @@ function locateStylesheet(): string {
   throw new Error(`找不到 styles.css(cwd=${process.cwd()})`);
 }
 
-const CSS = readFileSync(locateStylesheet(), "utf8");
+const STYLESHEET = locateStylesheet();
+const CSS = readFileSync(STYLESHEET, "utf8");
 
 /**
  * 取某个主题块({ ... })内的 token 表。light = `:root`,dark = `.dark`,landing = `.congjian-landing`。
@@ -192,5 +193,218 @@ describe("排版 scale 契约", () => {
     expect(CSS).not.toMatch(/--text-sm:/);
     expect(CSS).not.toMatch(/--text-xs:/);
     expect(CSS).not.toMatch(/--text-lg:/);
+  });
+});
+
+describe("状态语义别名(UI-SPEC §4.3,lib/ui/statusTone.ts)", () => {
+  const ALIASES = {
+    "status-running": "accent",
+    "status-attention": "warning",
+    "status-done": "success",
+    "status-failed": "danger",
+    "status-idle": "faint",
+  } as const;
+
+  it.each(THEMES)("$name 的 --status-* 指向本主题自己的语义色", ({ selector }) => {
+    const t = tokensOf(selector);
+    for (const [alias, base] of Object.entries(ALIASES)) {
+      expect(t[alias], `--${alias}`).toBeDefined();
+      expect(t[alias], `--${alias}`).toBe(t[base]);
+    }
+  });
+
+  it("工具类经 @theme inline 引用别名(在使用处求值,局部换肤容器取自己的值)", () => {
+    const inline = /@theme inline \{([^}]*)\}/.exec(CSS)?.[1] ?? "";
+    for (const alias of Object.keys(ALIASES)) {
+      expect(inline).toMatch(new RegExp(`--color-${alias}:\\s*var\\(--${alias}\\);`));
+    }
+  });
+});
+
+describe("中文字体栈(UI-SPEC §4.1)", () => {
+  it("覆盖鸿蒙 / 小米 / 安卓 / Linux 的系统黑体,Inter 仍排第一;苹果、Windows 先命中原有字体", () => {
+    const stack = /--font-sans:([^;]+);/.exec(CSS)?.[1].trim() ?? "";
+    expect(stack.startsWith('"Inter Variable"')).toBe(true);
+    const order = [
+      "PingFang SC",
+      "Microsoft YaHei",
+      "HarmonyOS Sans SC",
+      "MiSans",
+      "Noto Sans SC",
+      "Source Han Sans SC",
+    ].map((f) => stack.indexOf(`"${f}"`));
+    expect(order.every((i) => i > 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+});
+
+/**
+ * 防回潮计数门(UI-SPEC §4.1 / §4.4):按目录数「绕过 token 的写法」,**只准降不准升**。
+ *
+ * 为什么是计数而不是禁止:存量还有几百处,一次清不完;但新代码不能再往上加。每片 UI 改造合入后
+ * 把下面的基线改成新的(更小的)数字。新目录没有基线 = 0。
+ *
+ * 数的是去掉注释后的 src 下 .ts/.tsx/.css(不含测试、styles.css 这个 token 权威源):
+ *   - pxText        `text-[13px]` 任意字号(用 text-title/section/body/meta/caption)
+ *   - rawColor      `#hex`、`rgb()/rgba()` 硬编码颜色(用语义 token)
+ *   - paletteColor  `bg-gray-500` 这类 Tailwind 原色(用语义 token)
+ *   - radius        `rounded-[10px]` 任意圆角(用 rounded-sm/md/lg/xl/full)
+ *   - adhocDot      手写状态点:同一串类名里有 rounded-full + 小尺寸 + 状态底色(用 ui/StatusPill)
+ *   - adhocError    私有错误样式:`bg-danger-soft` / `border-danger` 自己拼错误框(用 Alert / ui/Notice)
+ * 豁免:落地页、教程、admin(UI-SPEC §4.1)。
+ */
+const DRIFT_EXEMPT = [
+  /^admin\//,
+  /^components\/tutorials\//,
+  /^components\/landing\//,
+  /^components\/Landing\.tsx$/,
+  /^test\//,
+  /\.test\.tsx?$/,
+  /^styles\.css$/,
+];
+const PALETTE =
+  "slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose";
+const count = (code: string, re: RegExp) => code.match(re)?.length ?? 0;
+
+const DRIFT_METRICS = {
+  pxText: (code: string) => count(code, /\btext-\[\d+(?:\.\d+)?px\]/g),
+  rawColor: (code: string) =>
+    count(code, /(?<![\w&#])#(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3,4})(?![\w-])/g) +
+    count(code, /\brgba?\(/g),
+  paletteColor: (code: string) =>
+    count(
+      code,
+      new RegExp(
+        `\\b(?:bg|text|border|ring|from|via|to|fill|stroke|outline|divide|decoration|shadow|caret|placeholder)-(?:${PALETTE})-\\d{2,3}\\b`,
+        "g",
+      ),
+    ),
+  radius: (code: string) =>
+    count(code, /\brounded(?:-(?:t|r|b|l|s|e|tl|tr|br|bl|ss|se|es|ee))?-\[[^\]\s]+\]/g),
+  adhocDot: (code: string, file: string) => {
+    if (file === "components/ui/StatusPill.tsx") return 0;
+    const statusBg = new RegExp(
+      `(?:^|\\s)bg-(?:accent|success|warning|danger|info|faint|muted|status-[a-z]+|(?:${PALETTE})-\\d{2,3})(?=[\\s/]|$)`,
+    );
+    let n = 0;
+    for (const m of code.matchAll(/(["'`])((?:(?!\1)[^\\\n]|\\.)*)\1/g)) {
+      const s = m[2];
+      if (
+        /\brounded-full\b/.test(s) &&
+        /(?:^|\s)(?:size|h|w)-(?:1|1\.5|2|2\.5|\[\d+(?:\.\d+)?px\])(?=\s|$)/.test(s) &&
+        statusBg.test(s)
+      )
+        n += 1;
+    }
+    return n;
+  },
+  adhocError: (code: string) =>
+    count(code, /(?:^|[\s"'`])(?:bg-danger-soft|bg-danger\/\d+|border-danger(?:\/\d+)?)(?=[\s"'`]|$)/gm),
+} satisfies Record<string, (code: string, file: string) => number>;
+
+type DriftMetric = keyof typeof DRIFT_METRICS;
+
+/** 基线(2026-10-29 UI-0,base 29d7af504)。数字只能改小;新目录不写 = 0。 */
+const DRIFT_BASELINE: Record<DriftMetric, Record<string, number>> = {
+  pxText: {
+    "components/*": 110,
+    "components/chat": 29,
+    "components/manage": 14,
+    "components/org": 8,
+    "components/payment": 1,
+    "components/project": 2,
+    "components/settings": 14,
+    "components/tool": 36,
+    "components/ui": 4,
+  },
+  rawColor: {
+    "components/*": 31,
+    "components/chat": 2,
+    "components/iui": 3,
+    "components/marketplace": 56,
+    "components/org": 1,
+    "components/project": 4,
+    "components/settings": 1,
+    // Commercial Studio is absent from selfhost. Freeze its unchanged
+    // 15ff7638b inventory when importing this new ratchet; only decreases follow.
+    "components/studio": 147,
+    "components/ui": 4,
+    "hooks": 2,
+    "lib": 17,
+  },
+  paletteColor: { "components/*": 31, "lib": 22 },
+  radius: {
+    "components/*": 25,
+    "components/chat": 4,
+    "components/manage": 2,
+    "components/project": 1,
+    "components/ui": 1,
+  },
+  adhocDot: {
+    "components/*": 6,
+    "components/chat": 1,
+    "components/manage": 3,
+    "components/marketplace": 1,
+    "components/taskboard": 2,
+  },
+  adhocError: {
+    "components/*": 15,
+    "components/chat": 8,
+    "components/github": 2,
+    "components/manage": 1,
+    "components/marketplace": 2,
+    "components/settings": 3,
+    "components/taskboard": 6,
+    "components/tool": 10,
+    "components/ui": 6,
+  },
+};
+
+function stripComments(code: string): string {
+  return code.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:\\"'`])\/\/.*$/gm, "$1");
+}
+
+/** 目录粒度:components 下按子目录,components 根下的文件归「components/*」,其余按顶层目录。 */
+function bucketOf(rel: string): string {
+  const parts = rel.split("/");
+  if (parts[0] === "components") return parts.length >= 3 ? `components/${parts[1]}` : "components/*";
+  return parts.length >= 2 ? parts[0] : "(root)";
+}
+
+function walk(dir: string, out: string[] = []): string[] {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) walk(p, out);
+    else if (/\.(tsx?|css)$/.test(e.name)) out.push(p);
+  }
+  return out;
+}
+
+function countDrift(): Record<DriftMetric, Record<string, number>> {
+  const src = dirname(STYLESHEET);
+  const metrics = Object.keys(DRIFT_METRICS) as DriftMetric[];
+  const out = Object.fromEntries(metrics.map((k) => [k, {}])) as Record<DriftMetric, Record<string, number>>;
+  for (const abs of walk(src)) {
+    const rel = relative(src, abs).split(sep).join("/");
+    if (DRIFT_EXEMPT.some((re) => re.test(rel))) continue;
+    const code = stripComments(readFileSync(abs, "utf8"));
+    const bucket = bucketOf(rel);
+    for (const k of metrics) {
+      const n = DRIFT_METRICS[k](code, rel);
+      if (n) out[k][bucket] = (out[k][bucket] ?? 0) + n;
+    }
+  }
+  return out;
+}
+
+describe("防回潮计数门(只准降不准升)", () => {
+  const now = countDrift();
+  it.each(Object.keys(DRIFT_METRICS) as DriftMetric[])("%s:各目录不超过基线", (metric) => {
+    const over = Object.entries(now[metric])
+      .filter(([bucket, n]) => n > (DRIFT_BASELINE[metric][bucket] ?? 0))
+      .map(([bucket, n]) => `${bucket}: ${n} > 基线 ${DRIFT_BASELINE[metric][bucket] ?? 0}`);
+    // 超了 = 新代码又绕过了 token / 原语:改用语义 token、StatusPill、Notice,不要调高基线。
+    // 现值整表打在失败信息里,清掉一批之后照它把基线改小。
+    expect(over, `现值 ${metric} = ${JSON.stringify(now[metric])}`).toEqual([]);
   });
 });

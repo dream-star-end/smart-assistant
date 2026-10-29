@@ -18,6 +18,12 @@ export const SERVER_FEATURE_ENV = {
   recipeSchedule: 'OC_P5_RECIPE_SCHEDULE',
   /** P5: suggest a project for unfiled chats (used by a later change). */
   unfiledSuggest: 'OC_P5_UNFILED_SUGGEST',
+  /**
+   * OCV5-630: run the timeline lifecycle projector in shadow next to the old
+   * merge path and report content-free mismatch summaries (web-react
+   * lib/timeline/shadowLifecycle). An explicit browser override still wins.
+   */
+  timelineShadow: 'OC_TIMELINE_LIFECYCLE_SHADOW',
 } as const
 
 export type ServerFeatureKey = keyof typeof SERVER_FEATURE_ENV

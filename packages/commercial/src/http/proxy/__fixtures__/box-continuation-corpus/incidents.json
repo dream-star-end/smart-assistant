@@ -1,0 +1,1819 @@
+[
+  {
+    "incident": "INC-20261001-BOX-TOOL-NAME-CONTINUE",
+    "rootFixCommit": "257ab6da",
+    "stage": "mapper",
+    "shape": "client tool name must be mapped to current CLI alias",
+    "messages": [
+      {
+        "role": "user",
+        "content": "task"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "toolu_old",
+            "name": "Bash",
+            "input": {
+              "value": "x"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_old",
+            "content": "done"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "contains": "mcp__ocbridge__Bash"
+  },
+  {
+    "incident": "INC-20261001-BOX-CLI-REJECTED-CALL-TURN-FAIL",
+    "rootFixCommit": "fc0276aa",
+    "stage": "decoder",
+    "shape": "CLI self-rejection followed by a new model message",
+    "records": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "tools": [
+          "mcp__ocbridge__Bash"
+        ],
+        "mcp_servers": [
+          {}
+        ]
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_a",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_bad",
+            "name": "Bash",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"x\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_a",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_bad",
+              "name": "Bash",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      },
+      {
+        "type": "user",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_bad",
+              "content": "<tool_use_error>Error: No such tool available: Bash</tool_use_error>",
+              "is_error": true
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_b",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_good",
+            "name": "mcp__ocbridge__Bash",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"x\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_b",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_good",
+              "name": "mcp__ocbridge__Bash",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "ids": [
+      "toolu_good"
+    ]
+  },
+  {
+    "incident": "INC-20261001-BOX-CLI-RESULT-REWRITE-ECHO",
+    "rootFixCommit": "f1d63636",
+    "stage": "echo",
+    "shape": "empty MCP result rewritten to completed marker (same incident also contains image resizing and persisted output)",
+    "published": [],
+    "observed": "(mcp__ocbridge__Bash completed with no output)"
+  },
+  {
+    "incident": "INC-20261001-BOX-CCB-IMAGE-META-CONTINUATION",
+    "rootFixCommit": "465b844d",
+    "stage": "admission",
+    "shape": "image result plus generated coordinate text",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_img",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": "[Image: original 2x2, displayed at 1x1. Multiply coordinates by 2.00 to map to original image.]"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "continuation_candidate"
+  },
+  {
+    "incident": "INC-20261001-BOX-SKILL-CONTINUATION",
+    "rootFixCommit": "8fd82f68",
+    "stage": "admission",
+    "shape": "Skill launch followed by body",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_s",
+              "name": "Skill",
+              "input": {
+                "skill": "demo"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_s",
+              "content": "Launching skill: demo"
+            },
+            {
+              "type": "text",
+              "text": "Base directory for this skill: /home/agent/.claude/skills/demo\n\n# Skill\nSteps."
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "continuation_candidate"
+  },
+  {
+    "incident": "INC-20261003-BOX-PARALLEL-SKILL-BODIES",
+    "rootFixCommit": "8057d0eb",
+    "stage": "admission",
+    "shape": "parallel Skill bodies after both results",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_a",
+              "name": "Skill",
+              "input": {
+                "skill": "a"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_b",
+              "name": "Skill",
+              "input": {
+                "skill": "b"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_a",
+              "content": "Launching skill: a"
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_b",
+              "content": "Launching skill: b"
+            },
+            {
+              "type": "text",
+              "text": "Base directory for this skill: /home/agent/.claude/skills/b\n\n# Skill\nSteps."
+            },
+            {
+              "type": "text",
+              "text": "Base directory for this skill: /home/agent/.claude/skills/a\n\n# Skill\nSteps."
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "continuation_candidate"
+  },
+  {
+    "incident": "INC-20261003-BOX-SKILL-BUDGET-TAIL",
+    "rootFixCommit": "15a6d2a5",
+    "stage": "admission",
+    "shape": "Skill body then system token budget",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_s",
+              "name": "Skill",
+              "input": {
+                "skill": "demo"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_s",
+              "content": "Launching skill: demo"
+            },
+            {
+              "type": "text",
+              "text": "Base directory for this skill: /home/agent/.claude/skills/demo\n\n# Skill\nSteps."
+            }
+          ]
+        },
+        {
+          "role": "system",
+          "content": [
+            {
+              "type": "text",
+              "text": "<total_tokens>1234 tokens left</total_tokens>",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "continuation_candidate"
+  },
+  {
+    "incident": "INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT",
+    "rootFixCommit": "cafdfc81",
+    "stage": "admission",
+    "shape": "answered exchange merged with recovery prompt",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_a",
+              "name": "Bash",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_a",
+              "content": "done"
+            },
+            {
+              "type": "text",
+              "text": "continue"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "fresh"
+  },
+  {
+    "incident": "INC-20261006-BOX-MIXED-CALL-TURN-CUT",
+    "rootFixCommit": "cdcd1cfb",
+    "stage": "decoder",
+    "shape": "exposed and unexposed tool calls in one message",
+    "records": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "tools": [
+          "mcp__ocbridge__Bash"
+        ],
+        "mcp_servers": [
+          {}
+        ]
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_mix",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_good",
+            "name": "mcp__ocbridge__Bash",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"x\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_mix",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_good",
+              "name": "mcp__ocbridge__Bash",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 1,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_hidden",
+            "name": "mcp__openclaude-memory__delegate_task",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 1,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"x\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_mix",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_hidden",
+              "name": "mcp__openclaude-memory__delegate_task",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 1
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "ids": [
+      "toolu_good"
+    ]
+  },
+  {
+    "incident": "INC-20261006-BOX-BIGCTX-QUOTA",
+    "rootFixCommit": "3d0e67f5",
+    "stage": "decoder",
+    "shape": "synthetic usage limit is a real refusal, not a result rewrite",
+    "records": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "tools": [
+          "mcp__ocbridge__Bash"
+        ],
+        "mcp_servers": [
+          {}
+        ]
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1791300000,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1.04,
+              "resetsAt": 1791300000
+            },
+            "seven_day": {
+              "utilization": 0.4,
+              "resetsAt": 1791316800
+            }
+          }
+        },
+        "uuid": "5ca628f8-054b-42f0-a5dd-d35290955504",
+        "session_id": "d75631ba-6ecf-4aae-9e39-a5f6d484c1e2"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "afce91d0-054c-4d71-86a1-297a23c3fe5c",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null,
+            "fallback_credit": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 11:20pm (Asia/Taipei)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "d75631ba-6ecf-4aae-9e39-a5f6d484c1e2",
+        "uuid": "e1c919ce-a57a-47e6-bde3-4bcd990e3809",
+        "timestamp": "2026-10-06T10:51:59.762Z",
+        "error": "rate_limit",
+        "request_id": "req_011CfkreN254w5dVB4yRqKkV",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "d75631ba-6ecf-4aae-9e39-a5f6d484c1e2",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard",
+          "fallback_credit": null
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 11:20pm (Asia/Taipei)",
+        "type": "result",
+        "duration_ms": 460,
+        "uuid": "68062830-0b5d-43ea-84a2-fa174a731c8c",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "error": "BOX_CLI_UPSTREAM_RATE_LIMITED"
+  },
+  {
+    "incident": "INC-20261008-BOX-PARALLEL-IMAGE-CAPTION",
+    "rootFixCommit": "f295fb3f",
+    "stage": "admission",
+    "shape": "five parallel images with one ambiguous trailing caption",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_img0",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img1",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img2",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img3",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img4",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img0",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img1",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img2",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img3",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img4",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": "[Image: original 2x2, displayed at 1x1. Multiply coordinates by 2.00 to map to original image.]"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "fresh"
+  },
+  {
+    "incident": "INC-20261008-BOX-FOREIGN-TOOL-HISTORY",
+    "rootFixCommit": "3d3a652b",
+    "stage": "mapper",
+    "shape": "foreign provider historical IDs are retained as history",
+    "messages": [
+      {
+        "role": "user",
+        "content": "task"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "tool_foreign",
+            "name": "Bash",
+            "input": {
+              "value": "x"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "tool_foreign",
+            "content": "done"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "contains": "next"
+  },
+  {
+    "incident": "INC-20261010-BOX-OUTPUT-LIMIT-RESUME",
+    "rootFixCommit": "01831646",
+    "stage": "decoder",
+    "shape": "synthetic continuation after max_tokens",
+    "records": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "tools": [
+          "mcp__ocbridge__Bash"
+        ],
+        "mcp_servers": [
+          {}
+        ]
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_cut",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "text",
+            "text": ""
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "text_delta",
+            "text": "partial"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_cut",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "partial"
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "max_tokens"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      },
+      {
+        "type": "user",
+        "isSynthetic": true,
+        "parent_tool_use_id": null,
+        "session_id": "12345678-1234-4123-8123-123456789abc",
+        "message": {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Output token limit hit. Resume directly."
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_after",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_good",
+            "name": "mcp__ocbridge__Bash",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"x\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_after",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_good",
+              "name": "mcp__ocbridge__Bash",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "ids": [
+      "toolu_good"
+    ]
+  },
+  {
+    "incident": "INC-20261011-BOX-TOOL-409-STUCK-RECOVERY",
+    "rootFixCommit": "3198303a",
+    "stage": "admission",
+    "shape": "five results with an unknown CLI text tail",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_img0",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img1",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img2",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img3",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            },
+            {
+              "type": "tool_use",
+              "id": "toolu_img4",
+              "name": "Read",
+              "input": {
+                "value": "x"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img0",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img1",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img2",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img3",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_img4",
+              "content": [
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                  }
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": "[Image: future coordinate presentation]"
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "fresh"
+  },
+  {
+    "incident": "INC-20261012-BOX-MCP-AUTO-BACKGROUND",
+    "rootFixCommit": "66a71da6",
+    "stage": "echo",
+    "shape": "tool still running is not its completed result",
+    "published": [
+      {
+        "type": "text",
+        "text": "done"
+      }
+    ],
+    "observed": "MCP tool \"ocbridge/Bash\" is still running after 120s. It was moved to the background as task abc and keeps running.",
+    "error": "BOX_TOOL_ECHO_CLI_BACKGROUNDED"
+  },
+  {
+    "incident": "INC-20261012-BOX-CC2-IMAGE-SOURCE-NOTE",
+    "rootFixCommit": "bac88458",
+    "stage": "echo",
+    "shape": "image source note under selected login config directory",
+    "published": [
+      {
+        "type": "image",
+        "mimeType": "image/png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      }
+    ],
+    "observed": [
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        }
+      },
+      {
+        "type": "text",
+        "text": "[Image: source: /home/box/.claude-account2/projects/project/session/tool-results/a.png]"
+      }
+    ]
+  },
+  {
+    "incident": "INC-20261018-BOX-DELEGATE-EMPTY-CURRENT",
+    "rootFixCommit": "42cc42f4",
+    "stage": "mapper",
+    "shape": "deferred tool announcement follows delegated goal",
+    "messages": [
+      {
+        "role": "user",
+        "content": "delegated-goal"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "<system-reminder>\n<available-deferred-tools>SearchExtraTools</available-deferred-tools>\n</system-reminder>"
+          }
+        ]
+      }
+    ],
+    "contains": "delegated-goal"
+  },
+  {
+    "incident": "INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT",
+    "rootFixCommit": "f83fbaf6",
+    "stage": "decoder",
+    "shape": "CLI decodes a top-level JSON boolean string",
+    "records": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "tools": [
+          "mcp__ocbridge__Bash"
+        ],
+        "mcp_servers": [
+          {}
+        ]
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_start",
+          "message": {
+            "id": "msg_repair",
+            "model": "claude-opus-5-5",
+            "role": "assistant",
+            "content": [],
+            "usage": {
+              "input_tokens": 10,
+              "output_tokens": 0
+            }
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_start",
+          "index": 0,
+          "content_block": {
+            "type": "tool_use",
+            "id": "toolu_good",
+            "name": "mcp__ocbridge__Bash",
+            "input": {}
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": {
+            "type": "input_json_delta",
+            "partial_json": "{\"value\": \"true\"}"
+          }
+        }
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "id": "msg_repair",
+          "model": "claude-opus-5-5",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_good",
+              "name": "mcp__ocbridge__Bash",
+              "input": {
+                "value": true
+              }
+            }
+          ]
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "content_block_stop",
+          "index": 0
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_delta",
+          "delta": {
+            "stop_reason": "tool_use"
+          },
+          "usage": {
+            "input_tokens": 10,
+            "output_tokens": 7
+          }
+        }
+      },
+      {
+        "type": "stream_event",
+        "event": {
+          "type": "message_stop"
+        }
+      }
+    ],
+    "ids": [
+      "toolu_good"
+    ]
+  },
+  {
+    "incident": "INC-20261022-BOX-READ-PDF-DOCUMENT",
+    "rootFixCommit": "71b0514d",
+    "stage": "admission",
+    "shape": "Read result followed by cached PDF document",
+    "body": {
+      "model": "box-api-claude-opus-5-5",
+      "max_tokens": 128,
+      "stream": true,
+      "tools": [
+        {
+          "name": "Bash",
+          "description": "Bash",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Read",
+          "description": "Read",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        {
+          "name": "Skill",
+          "description": "Skill",
+          "input_schema": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      ],
+      "metadata": {
+        "user_id": "{\"session_id\": \"corpus\", \"oc_turn_key\": \"abababababababababababababababababababababababababababababababab\"}"
+      },
+      "messages": [
+        {
+          "role": "user",
+          "content": "task"
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "toolu_pdf",
+              "name": "Read",
+              "input": {
+                "file_path": "/u/a.pdf"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "toolu_pdf",
+              "content": "PDF file read: /u/a.pdf (1KB)"
+            },
+            {
+              "type": "document",
+              "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQKJSVFT0YK"
+              },
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "expected": "fresh"
+  }
+]

@@ -25,7 +25,7 @@ import { checkToken, verifyJwt } from './auth.js'
 import { httpRequestsTotal, httpRequestDuration } from './metrics.js'
 import { isFileAllowed, isFileBlocked } from './gatewayFilePolicy.js'
 import { CLAUDE_OAUTH_USER_AGENT, JWT_TTL_SECONDS } from './server.js'
-import { shouldLogHttpAccess, mimeFor, staticCacheControl } from './httpUploadStatic.js'
+import { shouldLogHttpAccess, mimeFor, staticCacheControl, staticFileCandidates } from './httpUploadStatic.js'
 import type { Gateway } from './server.js'
 
 export interface GatewayHttpHost {
@@ -332,34 +332,56 @@ export function _handleHttpAfterCommercial(
   }
 
   // 静态 web UI (with in-memory cache)
-  if (this.deps.webRoot) {
-    // /admin → /admin.html:React 管理后台是 web-react 的第二 Vite 入口,产物是 dist 里
-    // 真实存在的 /admin.html。提供一个无扩展名的 /admin 便捷入口,302 到真实文件后由下方
-    // 通用静态服务命中(no-cache,同 index.html);否则 /admin 会落到 SPA fallback 拿到用户端
-    // index.html。仅 spa(v5 Aurora)模式:vanilla(v3/personal)产物不含 admin.html。
-    if (this.deps.staticMode === 'spa' && url.pathname === '/admin') {
-      res.writeHead(302, { Location: '/admin.html' })
-      res.end()
-      return
-    }
-    const safePath = url.pathname === '/' ? '/index.html' : url.pathname
-    // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
-    // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
-    const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
-    const filePath = resolve(this.deps.webRoot, `.${safePath}`)
-    if (filePath.startsWith(resolve(this.deps.webRoot))) {
-      if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return
-    }
-    // SPA fallback — only for navigation requests (no file extension)
-    // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
-    const hasExtension = /\.\w+$/.test(url.pathname)
-    if (!hasExtension) {
-      const indexPath = resolve(this.deps.webRoot, 'index.html')
-      if (this._serveStaticCached(indexPath, 'no-cache', req, res, 'text/html')) return
-    }
-  }
+  if (serveWebStatic.call(this, url, req, res)) return
   res.writeHead(404)
   res.end('not found')
+}
+
+/**
+ * 静态 web UI(含 /admin 302 与 SPA 回退)。true = 已响应;false = 交给调用方 404。
+ * 自 _handleHttpAfterCommercial 原样抽出以便单测(OCV5-632);在原逻辑上只多两件事,
+ * 规则都在 staticFileCandidates:spa 下 /assets/* 在 webRoot 未命中时回落资产池(按真实路径
+ * 判包含),spa 下 .map 一律 404(路径归一后判)。未配置资产池时除 .map 外与抽出前逐字一致。
+ */
+export function serveWebStatic(
+  this: Pick<GatewayHttpHost, 'deps' | '_serveStaticCached'>,
+  url: URL,
+  req: IncomingMessage,
+  res: ServerResponse,
+): boolean {
+  const webRoot = this.deps.webRoot
+  if (!webRoot) return false
+  // /admin → /admin.html:React 管理后台是 web-react 的第二 Vite 入口,产物是 dist 里
+  // 真实存在的 /admin.html。提供一个无扩展名的 /admin 便捷入口,302 到真实文件后由下方
+  // 通用静态服务命中(no-cache,同 index.html);否则 /admin 会落到 SPA fallback 拿到用户端
+  // index.html。仅 spa(v5 Aurora)模式:vanilla(v3/personal)产物不含 admin.html。
+  if (this.deps.staticMode === 'spa' && url.pathname === '/admin') {
+    res.writeHead(302, { Location: '/admin.html' })
+    res.end()
+    return true
+  }
+  const safePath = url.pathname === '/' ? '/index.html' : url.pathname
+  // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
+  // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
+  // 资产池命中同样落在 /assets/ 下,沿用 immutable(内容哈希文件名)。
+  const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
+  const candidates = staticFileCandidates(safePath, {
+    webRoot,
+    staticMode: this.deps.staticMode,
+    assetsPool: this.deps.webAssetsPool,
+  })
+  if (candidates === null) return false
+  for (const filePath of candidates) {
+    if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return true
+  }
+  // SPA fallback — only for navigation requests (no file extension)
+  // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
+  const hasExtension = /\.\w+$/.test(url.pathname)
+  if (!hasExtension) {
+    const indexPath = resolve(webRoot, 'index.html')
+    if (this._serveStaticCached(indexPath, 'no-cache', req, res, 'text/html')) return true
+  }
+  return false
 }
 
 /**

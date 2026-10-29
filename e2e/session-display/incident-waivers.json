@@ -367,6 +367,12 @@
       "reason": "OCV5-619: remove GPT Image 2 hard daily >=10 enforce in reserveImageUsage; credits + in-flight lock remain. Studio already dual gpt-image/muse-image; label-only clarify. Not an incident fix. image2Run integ admits 11th; ImageStudio unit. Raising proofPending baseline forbidden.",
       "approvedBy": "user/steward t990u-t991u 2026-10-25 no GPT image daily limit + Muse/GPT optional; butler executor fixing missing Incident trailer on draft PR #1110 (no merge/ship)",
       "expiresAt": "2026-11-25"
+    },
+    {
+      "commit": "122f0f0297e33eeb6c438fd0cc566b8216da5085",
+      "reason": "OCV5-652: durable retry for a confirmed terminal delegate's failed no-usage abandon POST. Latent recovery gap, reproduced by unit tests; the OCV5-651 live example completed naturally. No parent-dispatch bypass, waiver-age change, or live-state cleanup. Unproven child death remains protected and tracked; draft pending real Grok OD and steward.",
+      "approvedBy": "user t1154u/t1155u, 2026-10-28 START OCV5-652: authorize smallest correct selfhost repair with regression tests and draft PR only; no reproduced live incident; DO NOT MERGE — 待真 Grok OD / 管家",
+      "expiresAt": "2026-11-27"
     }
   ]
 }

@@ -1,3 +1,4 @@
+import { CodexNativeContext } from './codexNativeContext.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
 // Test-only override of the spawn used to launch `codex app-server`. See
@@ -397,6 +398,7 @@ export function assertPromptQueueRunnerAdmission(
 }
 
 export class CodexAppServerRunner extends EventEmitter {
+  private nativeContext = new CodexNativeContext((event) => this.emit('context_observation', event), (status) => this.emitTurnStatus(status))
   private threadId: string | null
   private proc: ChildProcessWithoutNullStreams | null = null
   private nextRequestId = 0
@@ -658,6 +660,7 @@ export class CodexAppServerRunner extends EventEmitter {
     return this.opts.model
   }
   setModel(model: string | undefined): void {
+    if (this.opts.model !== model) this.nativeContext.reset()
     this.opts.model = model
   }
 
@@ -961,6 +964,11 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   interrupt(): boolean {
+    if (this.nativeContext.running) {
+      this.pendingStartInterrupt = true
+      this.nativeContext.abort(new Error('Native context compaction interrupted'))
+      return true
+    }
     // 审计 R8:退避窗口内 activeTurnId 为 null 但有重试待发 —— 中断退避,runTurn 的
     // backoff sleep 立即以「已中断」返回,走 USER_CANCELLED 终态并清 retrying 状态帧。
     // **必须先于 proc 存活守卫**:proc 已死但退避 sleep 仍在跑时(如 crash 与 close
@@ -1206,7 +1214,9 @@ export class CodexAppServerRunner extends EventEmitter {
     // Same transient-shutdown semantics as CodexRunner: kill the current
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
+    const preserveNativeUsage = this.nativeContext.running
     this.shuttingDown = true
+    this.nativeContext.abort(new Error('Native context compaction interrupted'))
     this._preheatGeneration++
     this._preheatPromise = null
     this._preheatedSignature = null
@@ -1320,10 +1330,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // every prior turn's tokens. Resetting our baseline would over-bill the
     // first turn after a respawn by the entire thread total.
     //
-    // The proc close handler emits a usage-bearing forced result before it
-    // rejects the completer, so killed-turn tokens are billed to this turn.
-    this.activeTurnTotal = null
-    this.currentTurnUsage = null
+    // Native preflight has no user turn completer: after stdout drains its
+    // caller emits the original failure/Stop with this still-unconsumed usage.
+    if (!preserveNativeUsage) {
+      this.activeTurnTotal = null
+      this.currentTurnUsage = null
+    }
     this.resetCallUsageAttribution()
     // Tear down the per-spawn launch overrides so the next post-shutdown
     // submit() rebuilds against a fresh sessionDir. Re-using a stale
@@ -1776,6 +1788,7 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private failAllPending(reason: string): void {
+    this.nativeContext.abort(new Error(reason))
     for (const [, p] of this.pending) {
       p.reject(new Error(reason))
     }
@@ -2562,6 +2575,7 @@ export class CodexAppServerRunner extends EventEmitter {
         stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
+      this.nativeContext.beginTurn()
       // ── attempt 循环 ──────────────────────────────────────────────────
       // 仅「turn/start 请求本身被拒」的窄路径可循环重试(shouldRetryTurnStart 门)。
       // 一旦 turn/start 成功返回 turn.id,turn 进入执行,后续任何失败(status=
@@ -2570,6 +2584,18 @@ export class CodexAppServerRunner extends EventEmitter {
       for (;;) {
         // 每个 attempt 起点集中复位 per-attempt 态(见 resetAttemptState)。
         this.resetAttemptState()
+        if (!this.pendingStartInterrupt) {
+          await this.nativeContext.compactIfNeeded({
+            threadId: this.threadId,
+            timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
+            send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
+            drainFailure: async () => {
+              const drained = this.outputDrainPromise
+              if (!this.shuttingDown) await this.recycleProcKeepQueue('native-context-compaction-failed')
+              await drained
+            },
+          })
+        }
 
         // Set up the completion box BEFORE turn/start so a fast turn/completed
         // notification (rare but possible) doesn't slip past us.

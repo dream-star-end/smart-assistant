@@ -53,6 +53,9 @@ function make(over?: Partial<AppUpdateDeps> & { storage?: Storage | null; lineag
     now: () => Date.now(),
     storage,
     ...urlLineage(box),
+    // OCV5-635 起自动软刷只发生在页面隐藏时;下面的安全点/谱系用例都是在测这种情况。
+    // 可见页的行为单列在「前台可见页」一组。
+    isHidden: () => true,
     ...over,
   });
   return { gov, reload, storage, box };
@@ -317,6 +320,155 @@ describe("横幅动作", () => {
     passIdle();
     gov.onServerBuild(SERVER);
     expect(seen).toEqual([true]);
+  });
+});
+
+describe("顶栏 pill(OCV5-626:版本不一致即亮,不等安全点)", () => {
+  it("用户忙 + 刚有输入:不一致帧一到 pill 立即可见,横幅不出、也不刷", () => {
+    const { gov, reload } = make();
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    expect(gov.getPillVisible()).toBe(true);
+    expect(gov.getBannerVisible()).toBe(false);
+    vi.advanceTimersByTime(60_000);
+    expect(reload).not.toHaveBeenCalled();
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("版本一致 / id 形态非法 / dev 无 meta → pill 不亮", () => {
+    const same = make();
+    same.gov.onServerBuild(CLIENT);
+    expect(same.gov.getPillVisible()).toBe(false);
+
+    const bad = make();
+    bad.gov.onServerBuild("NOT HEX");
+    bad.gov.onServerBuild(undefined);
+    expect(bad.gov.getPillVisible()).toBe(false);
+
+    const dev = make({ getClientBuild: () => null });
+    dev.gov.onServerBuild(SERVER);
+    expect(dev.gov.getPillVisible()).toBe(false);
+  });
+
+  it("之后来了一致帧(另一处已拿到新前端 / 回滚)→ pill 熄灭", () => {
+    const { gov } = make();
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    expect(gov.getPillVisible()).toBe(true);
+    gov.onServerBuild(CLIENT);
+    expect(gov.getPillVisible()).toBe(false);
+  });
+
+  it("挂起 5min 出横幅时 pill 让位;「稍后」收起横幅后 pill 回来", () => {
+    const { gov } = make();
+    gov.registerBusyProbe(() => true);
+    passIdle();
+    gov.onServerBuild(SERVER);
+    expect(gov.getPillVisible()).toBe(true);
+    vi.advanceTimersByTime(5 * 60_000 + 10_000);
+    expect(gov.getBannerVisible()).toBe(true);
+    expect(gov.getPillVisible()).toBe(false);
+    gov.dismissBanner();
+    expect(gov.getBannerVisible()).toBe(false);
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("谱系到顶(D1 记账/直接横幅)时同样只出横幅,不并列 pill", () => {
+    const { gov } = make({ lineage: { n: 2 } });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    expect(gov.getBannerVisible()).toBe(true);
+    expect(gov.getPillVisible()).toBe(false);
+  });
+
+  it("点 pill 走 reloadNow:立刻刷、不动谱系计数,pill 随之熄灭", () => {
+    const box = { n: 0 };
+    const { gov, reload } = make({ lineage: box });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    gov.reloadNow();
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(box.n).toBe(0);
+    expect(gov.getPillVisible()).toBe(false);
+  });
+
+  it("安全点自动软刷时 pill 也熄灭(页面正在离开,不留可重复点的入口)", () => {
+    const { gov, reload } = make();
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(6_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(gov.getPillVisible()).toBe(false);
+  });
+
+  it("subscribe:pill 亮灭通知订阅者,重复的同目标帧不重复通知", () => {
+    const { gov } = make();
+    gov.registerBusyProbe(() => true);
+    const seen: boolean[] = [];
+    gov.subscribe(() => seen.push(gov.getPillVisible()));
+    gov.onServerBuild(SERVER);
+    gov.onServerBuild(SERVER);
+    gov.onServerBuild(CLIENT);
+    expect(seen).toEqual([true, false]);
+  });
+});
+
+describe("前台可见页(OCV5-635:不静默整页刷新,只亮 pill)", () => {
+  it("可见、空闲、不忙:再久也不自动刷、不出横幅,pill 一直亮", () => {
+    const { gov, reload, box } = make({ isHidden: () => false });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(reload).not.toHaveBeenCalled();
+    expect(box.n).toBe(0);
+    expect(gov.getBannerVisible()).toBe(false);
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("切到后台后由 5s 重估接手:空闲且不忙即软刷一次,谱系 +1", () => {
+    let hidden = false;
+    const { gov, reload, box } = make({ isHidden: () => hidden });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(reload).not.toHaveBeenCalled();
+    hidden = true;
+    vi.advanceTimersByTime(6_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(box.n).toBe(1);
+  });
+
+  it("前台读了很久再切后台但正忙:挂起计时从隐藏起算,隐藏满 5min 才出横幅", () => {
+    let hidden = false;
+    const { gov, reload } = make({ isHidden: () => hidden });
+    gov.registerBusyProbe(() => true);
+    passIdle();
+    gov.onServerBuild(SERVER);
+    vi.advanceTimersByTime(30 * 60_000);
+    hidden = true;
+    vi.advanceTimersByTime(60_000);
+    expect(gov.getBannerVisible()).toBe(false);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(gov.getBannerVisible()).toBe(true);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("可见时点 pill(reloadNow)照常立即刷新", () => {
+    const { gov, reload } = make({ isHidden: () => false });
+    gov.onServerBuild(SERVER);
+    gov.reloadNow();
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("谱系到顶 / 不可写这类必须人工处理的情况,可见页照样出横幅", () => {
+    const maxed = make({ isHidden: () => false, lineage: { n: 2 } });
+    passIdle();
+    maxed.gov.onServerBuild(SERVER);
+    expect(maxed.gov.getBannerVisible()).toBe(true);
+    const unwritable = make({ isHidden: () => false, writeLineage: () => false });
+    passIdle();
+    unwritable.gov.onServerBuild(SERVER);
+    expect(unwritable.gov.getBannerVisible()).toBe(true);
   });
 });
 

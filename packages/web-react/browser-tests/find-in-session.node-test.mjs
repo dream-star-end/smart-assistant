@@ -165,12 +165,6 @@ async function holdFence(page) {
   await page.waitForFunction(() => window.__findPage.wheelFence === true, null, { timeout: 2000 });
 }
 
-async function waitPin(page, key) {
-  await page.waitForFunction((k) =>
-    document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === k,
-  key, { timeout: 4000 });
-}
-
 /** Capture pending pin atomically (pin set, target not yet visible) and re-hold the fence. */
 async function waitPending(page, key, timeout = 4000) {
   const handle = await page.waitForFunction((k) => {
@@ -1037,13 +1031,22 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         await typeNeedle(page, "FIND_NEEDLE_MID");
         events.keys += 15;
         await waitFindReady(page, "1/1");
-        await holdFence(page);
-        await page.getByRole("button", { name: "下一处" }).click();
+        const next = page.getByRole("button", { name: "下一处" });
+        // Arm at the trusted click, after Playwright's focus/scroll preparation.
+        // An earlier scrollend can release a fence held across protocol calls.
+        await next.evaluate((button) => button.addEventListener("click", () => {
+          window.__findPage.holdFence();
+        }, { capture: true, once: true }));
+        // Observe the real pending state before the click; waitPending captures
+        // it atomically, without a second round trip racing the 1200 ms pin budget.
+        const [pending] = await Promise.all([
+          waitPending(page, "m250"),
+          next.click(),
+        ]);
         events.clicks += 1;
-        await waitPin(page, "m250");
-        const pending = await snapshot(page);
         assert.equal(pending.findPin, "m250");
         assert.equal(pending.visible, false);
+        assert.equal(pending.wheelFence, true);
         return pending;
       }
 

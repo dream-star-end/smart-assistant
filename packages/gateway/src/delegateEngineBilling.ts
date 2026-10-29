@@ -133,6 +133,8 @@ interface BillingSettledReceipt {
 interface BillingQueue {
   schemaVersion: 1
   pending: DurableCodexBilling[]
+  /** Proven terminal, no-usage requests whose abandon has not been ACKed. */
+  pendingAbandons?: string[]
   settledReceipts?: BillingSettledReceipt[]
 }
 
@@ -159,9 +161,16 @@ async function readBillingQueue(queuePath: string): Promise<BillingQueue> {
     if (raw?.schemaVersion !== 1 || !Array.isArray(raw.pending)) {
       throw new Error('DELEGATE_ENGINE_BILLING_QUEUE_INVALID')
     }
+    if (raw.pendingAbandons !== undefined && (
+      !Array.isArray(raw.pendingAbandons) ||
+      raw.pendingAbandons.some((id) => typeof id !== 'string' || !REQUEST_ID_RE.test(id))
+    )) {
+      throw new Error('DELEGATE_ENGINE_BILLING_QUEUE_INVALID')
+    }
     return {
       schemaVersion: 1,
       pending: raw.pending,
+      pendingAbandons: raw.pendingAbandons ?? [],
       settledReceipts: Array.isArray(raw.settledReceipts) ? raw.settledReceipts : [],
     }
   } catch (err) {
@@ -265,6 +274,8 @@ export function createDelegateEngineBillingClient(args?: {
       const index = queue.pending.findIndex((row) => row.requestId === billing.requestId)
       if (index >= 0) queue.pending[index] = billing
       else queue.pending.push(billing)
+      // Exact usage evidence takes precedence over an earlier no-usage intent.
+      queue.pendingAbandons = (queue.pendingAbandons ?? []).filter((id) => id !== billing.requestId)
       await writeDurableJson(queuePath, queue)
     })
 
@@ -272,6 +283,7 @@ export function createDelegateEngineBillingClient(args?: {
     withQueueLock(async () => {
       const queue = await readBillingQueue(queuePath)
       const next = queue.pending.filter((row) => row.requestId !== billing.requestId)
+      const abandons = (queue.pendingAbandons ?? []).filter((id) => id !== billing.requestId)
       const receipts = [...(queue.settledReceipts ?? [])]
       const needsConsultProjection = billing.delegateAgentId === 'advisor'
       if (
@@ -280,10 +292,12 @@ export function createDelegateEngineBillingClient(args?: {
       ) {
         receipts.push({ requestId: billing.requestId, at: Date.now() })
       }
-      if (next.length !== queue.pending.length || receipts.length !== (queue.settledReceipts?.length ?? 0)) {
+      if (next.length !== queue.pending.length || receipts.length !== (queue.settledReceipts?.length ?? 0) ||
+          abandons.length !== (queue.pendingAbandons?.length ?? 0)) {
         await writeDurableJson(queuePath, {
-          schemaVersion: 1,
+          ...queue,
           pending: next,
+          pendingAbandons: abandons,
           settledReceipts: receipts,
         })
       }
@@ -352,12 +366,33 @@ export function createDelegateEngineBillingClient(args?: {
       if (!REQUEST_ID_RE.test(requestId)) {
         throw new Error('DELEGATE_ENGINE_BILLING_INVALID_REQUEST_ID')
       }
-      await post(ABANDON_PATH, { requestId })
+      const queued = await withQueueLock(async () => {
+        const queue = await readBillingQueue(queuePath)
+        if (queue.pending.some((row) => row.requestId === requestId)) return false
+        queue.pendingAbandons = [...new Set([...(queue.pendingAbandons ?? []), requestId])]
+        // Persist before HTTP: a gateway exit or unavailable master must not
+        // strand this already-terminal delegate behind the 24h waiver.
+        await writeDurableJson(queuePath, queue)
+        return true
+      })
+      if (!queued) return
+      try {
+        await post(ABANDON_PATH, { requestId })
+        await withQueueLock(async () => {
+          const queue = await readBillingQueue(queuePath)
+          queue.pendingAbandons = (queue.pendingAbandons ?? []).filter((id) => id !== requestId)
+          await writeDurableJson(queuePath, queue)
+        })
+      } catch (err) {
+        scheduleRetry()
+        throw err
+      }
     },
     async retryPending() {
       return withQueueLock(async () => {
         const queue = await readBillingQueue(queuePath)
         const remaining: DurableCodexBilling[] = []
+        const remainingAbandons: string[] = []
         const receipts = [...(queue.settledReceipts ?? [])]
         for (const billing of queue.pending) {
           try {
@@ -382,12 +417,22 @@ export function createDelegateEngineBillingClient(args?: {
           const outcome = AdvisorConsultStore.projectSettledReceipt(rec.requestId)
           if (outcome === 'pending' || outcome === 'store-closed') kept.push(rec)
         }
+        const usageIds = new Set(queue.pending.map((billing) => billing.requestId))
+        for (const requestId of queue.pendingAbandons ?? []) {
+          if (usageIds.has(requestId)) continue
+          try {
+            await post(ABANDON_PATH, { requestId })
+          } catch {
+            remainingAbandons.push(requestId)
+          }
+        }
         await writeDurableJson(queuePath, {
-          schemaVersion: 1,
+          ...queue,
           pending: remaining,
+          pendingAbandons: remainingAbandons,
           settledReceipts: kept,
         })
-        if (remaining.length > 0) {
+        if (remaining.length > 0 || remainingAbandons.length > 0) {
           scheduleRetry()
           throw new Error('DELEGATE_ENGINE_BILLING_RECOVERY_PENDING')
         }
@@ -408,8 +453,7 @@ export function createDelegateEngineBillingClient(args?: {
         }
         if (kept.length !== (queue.settledReceipts?.length ?? 0)) {
           await writeDurableJson(queuePath, {
-            schemaVersion: 1,
-            pending: queue.pending,
+            ...queue,
             settledReceipts: kept,
           })
         }

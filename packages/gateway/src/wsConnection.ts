@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 /**
  * Gateway WebSocket connection: connection lifecycle, hello auto-resume, stop, delivery and stamped/status frames
  *
@@ -19,6 +20,8 @@ import {
   type OutboundTurnStatus,
   type OutboundTurnUsage,
   type SysContextRebuilt,
+  type SessionContextPressure,
+  type SysContextCompacted,
   isClientMessageId,
   type PromptQueueMutationFrame,
 } from '@openclaude/protocol'
@@ -58,7 +61,7 @@ import {
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
-import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
 
 const MODEL_SWITCH_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/
@@ -225,7 +228,7 @@ export function handleWsConnection(
       try {
         frame = JSON.parse(raw.toString()) as InboundFrame
       } catch {
-        ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
+        ws.send(JSON.stringify(withUserError({ type: 'error', error: 'invalid json' })))
         return
       }
       // Client-side application-level ping. Echo a pong (preserving the
@@ -733,7 +736,7 @@ export function handleWsConnection(
         if (!sessionKey) return
         const session = this.sessions.getByKey(sessionKey)
         if (!session) {
-          ws.send(JSON.stringify({ type: 'error', error: 'session not found' }))
+          ws.send(JSON.stringify(withUserError({ type: 'error', error: 'session not found' })))
           return
         }
         this.log.info('compact session', { sessionKey })
@@ -774,14 +777,14 @@ export function handleWsConnection(
         } catch (err: any) {
           // E5 — 原文进日志,ws 控制面错误帧只发受控文案。
           this.log.error('compact session failed', { sessionKey }, err)
-          ws.send(JSON.stringify({ type: 'error', error: '上下文压缩失败，请稍后重试' }))
+          ws.send(JSON.stringify(withUserError({ type: 'error', error: '上下文压缩失败，请稍后重试' })))
         }
       }
     } catch (err: any) {
       this.log.error('ws-message unhandled error', undefined, err)
       try {
         // E5 — 同上:err.message 可能含内部路径/栈,只回受控文案。
-        ws.send(JSON.stringify({ type: 'error', error: '服务内部错误，请稍后重试' }))
+        ws.send(JSON.stringify(withUserError({ type: 'error', error: '服务内部错误，请稍后重试' })))
       } catch {
         /* ws may already be closed */
       }
@@ -1022,12 +1025,17 @@ export async function autoResumeFromHello(
     //   - 长 compact + 长断网 + ring 满:replay 拿不回 compact_start,这里兜底
     //   - runner 已停:不发(turn 已结束,前端会收到 ring 里的 isFinal 或者
     //     紧跟着的 turn-interrupted isFinal,自行清空 UI 状态)
+    //   - runner 在跑且 phase 为 null 也发(status:null):启动态的清态帧可能
+    //     发生在无浏览器连接期间,不补发前端会一直停在「正在启动引擎」
+    //     (INC-20261028-STALE-ENGINE-STARTING)
     // 单 ws send(只给本次 hello 的 client 看,不是所有 peerKey),与下方
     // synthetic isFinal 同模式 —— 不走 deliver(),避免把同一帧再 ring + 广播。
-    // biome-ignore lint/complexity/useOptionalChain: moved verbatim from server.ts (OCV5-483); pre-existing there
-    if (session && session.runner.isRunning && session.currentTurnStatus != null) {
+    const resendPhase = session
+      ? _helloTurnStatusResendPhase(session.runner.isRunning, session.currentTurnStatus)
+      : undefined
+    if (resendPhase !== undefined) {
       try {
-        const phase = session.currentTurnStatus
+        const phase = resendPhase
         // retrying 补发展平为 status:'retrying' + 平级 retry(前端按 retry.retryAt
         // 重算剩余倒计时,不从完整 delayMs 重头显示);compacting/null 照旧。
         const turnStatusFrame = JSON.stringify({
@@ -1041,7 +1049,7 @@ export async function autoResumeFromHello(
         ws.send(turnStatusFrame)
         this.log.info('auto-resume rebroadcast turn_status', {
           sessionKey,
-          status: typeof phase === 'object' ? phase.status : phase,
+          status: phase && typeof phase === 'object' ? phase.status : phase,
         })
       } catch {}
     }
@@ -1407,6 +1415,8 @@ export type DeliverOut = | OutboundMessage
     | OutboundTurnUsage
     | OutboundCallUsage
     | SysContextRebuilt
+    | SessionContextPressure
+    | SysContextCompacted
 
 /**
  * Outbound frame egress — WS broadcast + outboundRing + optional adapter fan-out.
@@ -1435,7 +1445,8 @@ export function deliver(
   // (rather than only `_userId`)means CG7 doesn't have to revisit this
   // strip site every time it adds a new private field. Keeping stripped
   // values locally lets WS branch still route per-user.
-  const { wire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+  const { wire: strippedWire, userId: stampedUserId } = _stripPrivateRoutingFields(out)
+  const wire = withUserError(strippedWire)
   if (wire.type === 'outbound.message' || wire.type === 'outbound.error') {
     const sessionKey =
       typeof (wire as { sessionKey?: unknown }).sessionKey === 'string'
@@ -1476,7 +1487,9 @@ export function deliver(
     wire.type === 'outbound.turn_status' ||
     wire.type === 'outbound.turn_usage' ||
     wire.type === 'outbound.call_usage' ||
-    wire.type === 'sys.context_rebuilt'
+    wire.type === 'sys.context_rebuilt' ||
+    wire.type === 'session.context_pressure' ||
+    wire.type === 'sys.context_compacted'
   if (adapter && !isSideband) {
     adapter
       .send(wire as OutboundMessage)
@@ -1517,6 +1530,7 @@ export function deliver(
     // review/嵌套委派以 >15 帧/s 刷进度帧,不分级时 2 分钟就冲穿整个 ring。
     const blocks = (wire as { blocks?: Array<{ kind?: string }> }).blocks
     const isProgressFrame =
+      wire.type === 'session.context_pressure' ||
       wire.type === 'outbound.turn_status' ||
       wire.type === 'outbound.turn_usage' ||
       wire.type === 'outbound.call_usage' ||

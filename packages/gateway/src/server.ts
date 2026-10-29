@@ -1,3 +1,4 @@
+import { withUserError } from '@openclaude/protocol'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -217,7 +218,7 @@ import type { UploadFsOps } from './gatewayFilePolicy.js'
 export { decideLocalExecution, resolveLocalExecutionIfEnforced, localExecutionOverride, resolveExecutionModel, EXECUTION_MODEL_FALLBACK_ROUTE, resolveSyntheticTurnModel, downgradeSyntheticCodex, readLiveRunnerModel, peekLiveRunnerModel, liveSessionModelUnusableReason, liveSessionReuseSkipReason, EXECUTION_MODEL_FALLBACK, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT, TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, TICKETLESS_LIVE_SESSION_REPLACING_REASON } from './localExecution.js'
 export type { LocalExecutionDecision, LocalTurnKind, SyntheticTurnModel } from './localExecution.js'
 // Moved to ./turnFrames.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
-export { _shouldPushTurnInterruptedFinal, _buildTurnTraceContext, _buildEngineErrorFrame, _earlyRejectErrorFrames, _inheritOutboundRouting, preparedModelSwitchCatchupFrame, _stripPrivateRoutingFields, _buildTurnStatusFrame, _turnStatusWireFields, _buildContextRebuiltFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldInterruptUnknownInFlight, GATEWAY_TERMINAL_CODE_MESSAGES, _safeErrorFrameDetail, _parseConnectionTraceIdFromUpgrade, ACTIVE_TURN_REPLAY_CANDIDATE_MAX } from './turnFrames.js'
+export { _shouldPushTurnInterruptedFinal, _buildTurnTraceContext, _buildEngineErrorFrame, _earlyRejectErrorFrames, _inheritOutboundRouting, preparedModelSwitchCatchupFrame, _stripPrivateRoutingFields, _buildTurnStatusFrame, _turnStatusWireFields, _helloTurnStatusResendPhase, _buildContextRebuiltFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldInterruptUnknownInFlight, GATEWAY_TERMINAL_CODE_MESSAGES, _safeErrorFrameDetail, _parseConnectionTraceIdFromUpgrade, ACTIVE_TURN_REPLAY_CANDIDATE_MAX } from './turnFrames.js'
 export type { PrivateRoutingFields } from './turnFrames.js'
 import { _stripPrivateRoutingFields } from './turnFrames.js'
 // Moved to ./gatewayTypes.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
@@ -344,6 +345,12 @@ export interface GatewayDeps {
    * 仅影响 Cache-Control 头的计算;ETag/304、路径白名单、SPA 回退逻辑两模式共用。
    */
   staticMode?: 'vanilla' | 'spa'
+  /**
+   * 资产池根(OCV5-632,X-P1-1 PR-a):`<pool>/assets/` 存放历次发版的内容哈希资产。仅 'spa' 生效:
+   * `/assets/*` 在 webRoot 未命中时回落到这里,旧标签页懒加载上一版 chunk 不再 404。
+   * 未设 = 与之前完全一致。由 cli launcher 从 OC_V5_WEB_ASSETS_POOL 注入(仅 v5 通道)。
+   */
+  webAssetsPool?: string
   channelFactories?: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter>
   /** V3 2H: 商业化模块挂载点(undefined = 未启用)。由 cli launcher 在 COMMERCIAL_ENABLED=1 时注入。 */
   commercial?: CommercialHook
@@ -1364,7 +1371,7 @@ export class Gateway {
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(body))
+    res.end(JSON.stringify(withUserError(body, code)))
   }
   private sendSessionReadFailure(
     res: ServerResponse,

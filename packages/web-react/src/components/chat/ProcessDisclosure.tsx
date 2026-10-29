@@ -53,7 +53,7 @@ const WORK_ROLES = new Set<ChatMessage["role"]>([
 ]);
 
 const INTERACTIVE_TOOL_RE =
-  /^(?:AskUserQuestion|ExitPlanMode)$|ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode/i;
+  /ask_user|request_user_input|present_options|present_task_approval|exit_plan_mode|exitplanmode/i;
 
 export function isFoldableWorkRole(message: ChatMessage): boolean {
   return WORK_ROLES.has(message.role);
@@ -380,12 +380,21 @@ export function toolShowsUniqueArtifact(
   return keys.some((key) => !owned.has(key));
 }
 
-function interactiveTool(message: ChatMessage): boolean {
-  return INTERACTIVE_TOOL_RE.test(message.toolName ?? "");
-}
-
 /** CCB tools whose prompt card (role=permission) fully replaces the tool row. */
 const PROMPT_CARD_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+/**
+ * A tool row the user acts on. AskUserQuestion / ExitPlanMode rows never are:
+ * the question / plan is answered on the prompt card, the row only carries the
+ * engine echo. That card is local to this browser — another device, a refresh,
+ * a durable-replay owner reset (drops answered cards) or a Cursor detached card
+ * (no toolUseId) leaves the row unpaired, and it used to stay outside 处理过程.
+ * Whether a question still needs the user is the card's call (isAnsweredPrompt).
+ */
+function interactiveTool(message: ChatMessage): boolean {
+  const name = message.toolName ?? "";
+  return !PROMPT_CARD_TOOLS.has(name) && INTERACTIVE_TOOL_RE.test(name);
+}
 
 /**
  * A CCB question or plan review lands twice: the prompt card (用户问答 /
@@ -394,12 +403,11 @@ const PROMPT_CARD_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
  * "User has answered your questions: …", "User has approved your plan…",
  * "User rejected the plan"). The card already shows the question / plan and
  * the outcome, and owns the pending / answered state, so the tool row is a
- * duplicate. Left in place it is caught by `interactiveTool` and sits outside
- * 处理过程 under the answered card.
+ * duplicate.
  *
  * Returns the ids of tool rows to drop. Only an exact pairing counts — same
  * tool name and same tool_use id; a tool row whose card is missing (paged out,
- * lost history) stays.
+ * lost history) stays, as one step inside 处理过程.
  */
 export function promptShadowedToolIds(messages: readonly ChatMessage[]): Set<string> {
   const promptKeys = new Set<string>();
@@ -540,6 +548,8 @@ function countLabel(message: ChatMessage): string {
     if (verb === "grep" || verb === "rg" || verb === "glob" || verb === "find" || verb === "search") return "搜索";
     if (SEARCH_TOOL_TOKENS.has(toolToken(message.toolName ?? ""))) return "搜索";
     if (SHELL_TOOLS.has(tool) || verb === "bash" || verb === "sh" || verb === "exec") return "命令";
+    if (tool === "askuserquestion") return "问答";
+    if (tool === "exitplanmode") return "计划确认";
     return "工具";
   }
   if (message.role === "thinking") return "思考";
@@ -706,6 +716,9 @@ const SEARCH_TOOL_TOKENS = new Set([
  */
 function runningToolPhrase(message: ChatMessage): string {
   const name = message.toolName ?? "";
+  // A question / plan review still open is waiting on the user, not running a tool.
+  if (name === "AskUserQuestion") return "等待你回答";
+  if (name === "ExitPlanMode") return "等待你确认计划";
   const command = stripShellWrapperForDisplay(commandText(message));
   const head = reliableHeadCall(command);
   if (head?.bin === "oc-memory") {
@@ -1109,7 +1122,6 @@ export function ProcessDisclosure<T>({
   renderItem,
   keyOf,
   messagesOf,
-  eagerDeferred,
   olderSteps,
   startedAt,
   lastFrameAt,
@@ -1126,8 +1138,6 @@ export function ProcessDisclosure<T>({
   renderItem: (item: T) => ReactNode;
   keyOf: (item: T) => string;
   messagesOf: (item: T) => ChatMessage[];
-  /** Tail locators keep hydrating while the disclosure stays collapsed. */
-  eagerDeferred: boolean;
   /** Unloaded earlier steps of this same turn. Stays inside the shell. */
   olderSteps?: ReactNode;
   /** 本轮活动起点(TurnActivity.startedAt)。只用于进行中的计时,缺省则不显示时长。 */
@@ -1188,13 +1198,6 @@ export function ProcessDisclosure<T>({
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
   const lastItemKey = lastItem === undefined ? "" : keyOf(lastItem);
-
-  const clippedDeferred = (item: T) =>
-    eagerDeferred && messagesOf(item).some((message) => message._payloadDeferred) ? (
-      <div key={`deferred:${keyOf(item)}`} className="h-px overflow-hidden" data-testid="process-deferred-hydrate" aria-hidden>
-        {renderItem(item)}
-      </div>
-    ) : null;
 
   const narrativeBody = (section: ProcessSection<T>, isLive: boolean) => (
     <div className="space-y-1">
@@ -1329,9 +1332,9 @@ export function ProcessDisclosure<T>({
         </button>
       ) : null}
       </div>
-      {!open
-        ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
-        : null}
+      {/* 收起时不挂任何隐藏水合节点:>1 MiB 定位桩的正文只在展开(本层或阶段详情)后按原规则
+          取——尾部直接取,其余进视口 600px 再取。此前收起态也会把首屏尾部的定位桩塞进 1px
+          隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}
       {(olderSteps || open) ? (
           <div
             className={`oc-rail relative mt-1 space-y-0.5 pb-1 ${open ? "oc-reveal" : ""}`}
@@ -1441,9 +1444,7 @@ export function ProcessDisclosure<T>({
                     <div className="space-y-0.5" data-testid="process-details">
                       {section.items.map((item, i) => stepRow(item, isLastSection && i === section.items.length - 1))}
                     </div>
-                  ) : (
-                    section.items.map((item) => clippedDeferred(item))
-                  )}
+                  ) : null}
                 </div>
               );
             }) : null}

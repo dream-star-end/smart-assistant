@@ -1,3 +1,4 @@
+import type { ContextObservation } from '../../../packages/protocol/src/contextPressure.js'
 import type { UUID } from 'crypto'
 import { randomUUID } from 'crypto'
 import { getIsNonInteractiveSession, getSessionId } from '../bootstrap/state.js'
@@ -94,6 +95,7 @@ type BashOutputTailEvent = {
 }
 
 export type SdkEvent =
+  | { type: 'system'; subtype: 'context_observation'; observation: ContextObservation }
   | TaskStartedEvent
   | TaskProgressEvent
   | TaskNotificationSdkEvent

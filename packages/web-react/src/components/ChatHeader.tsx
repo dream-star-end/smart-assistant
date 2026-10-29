@@ -9,13 +9,14 @@ import {
   PanelRight,
   PanelRightClose,
   PenSquare,
+  RefreshCw,
   Search,
   Share2,
   ShieldCheck,
   Users,
   Wallet,
 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Agent } from "../lib/agents";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
@@ -33,6 +34,7 @@ import {
   Popover,
   PopoverContent,
   PopoverTrigger,
+  useToastAnchor,
 } from "./ui";
 
 /** 快捷键修饰键按平台显示:Mac 系 ⌘,其余 Ctrl(C-24:Windows/Linux 用户此前看到的是 Mac 符号)。 */
@@ -82,6 +84,8 @@ export function ChatHeader({
   projectBreadcrumb,
   projectSuggestion,
   onOpenProjectScope,
+  updateAvailable = false,
+  onReloadForUpdate,
 }: {
   agent: Agent;
   onAgentClick: () => void;
@@ -147,15 +151,23 @@ export function ChatHeader({
   /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
   projectSuggestion?: { name: string; onAccept: () => void; onDismiss: () => void } | null;
   onOpenProjectScope?: () => void;
+  /** 服务端已是新前端(appUpdate.getPillVisible)。true 且给了 onReloadForUpdate 时模型行右端出「新版本」pill。 */
+  updateAvailable?: boolean;
+  onReloadForUpdate?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
+  const showUpdatePill = updateAvailable && !!onReloadForUpdate;
   // 团队模式说明弹层的受控开关：点「关闭团队模式」需要主动收起弹层（chip 随
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
   const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
   const engineLabel = teamEngineLabel(models ?? []);
+  // toast 落在顶栏实测下沿之下(手机顶栏两行时也不压住模型行)。
+  const headerRef = useRef<HTMLElement>(null);
+  useToastAnchor(headerRef);
   return (
     <header
+      ref={headerRef}
       className="flex min-h-14 shrink-0 flex-wrap items-center gap-1 px-2 pb-2 header-safe-t sm:flex-nowrap sm:px-3 sm:pb-2.5"
       data-product-entry-scope="chat-header"
     >
@@ -265,7 +277,7 @@ export function ChatHeader({
           </button>
         </span>
       ) : null}
-      {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
+      {(teamModeActive || advisorModeActive || (models && onSelectModel) || showUpdatePill) && (
         <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
           {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
           {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
@@ -373,6 +385,25 @@ export function ChatHeader({
               onOpenChange={onModelPickerOpenChange}
               onCancelSwitch={onCancelModelSwitch}
             />
+          )}
+          {/* OCV5-626:版本不一致即亮,不等安全点 / 5 分钟横幅。放模型行右端:窄屏这一行整宽且右侧
+              本就空着,不挤顶栏图标;桌面紧跟模型选择器。点一下走 governor.reloadNow()。 */}
+          {showUpdatePill && (
+            <button
+              type="button"
+              data-product-control
+              data-testid="update-pill"
+              aria-label="有新版本，点击刷新页面"
+              title="有新版本，点击刷新页面"
+              onClick={onReloadForUpdate}
+              className="group ml-auto flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98] sm:ml-1"
+            >
+              <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                <RefreshCw size={11} className="shrink-0" />
+                <span className="sm:hidden">新版本</span>
+                <span className="hidden sm:inline">有新版本 · 刷新</span>
+              </span>
+            </button>
           )}
         </div>
       )}
