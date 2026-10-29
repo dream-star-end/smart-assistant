@@ -1,6 +1,7 @@
 /**
- * 语音输入（STT）—— v3 parity：浏览器 MediaRecorder → WS /ws/voice-transcribe
- * → Deepgram Nova-3 转写 → DeepSeek 上下文润色。Deepgram key 不出服务端。
+ * 语音输入（STT）—— 浏览器 MediaRecorder → WS /ws/voice-transcribe。
+ * 服务端有可用 OpenAI key 时整段走 gpt-transcribe，否则 Deepgram Nova-3。
+ * 之后都是 DeepSeek 上下文润色。Key 不出服务端，协议不变。
  *
  * 简化 UX（相对现网 speech.js 的按住-说话手势）：点击麦克风开始录音，再次点击停止
  * → 转写 → 把润色后的文本通过 onText 回填输入框。不支持/未配置时 supported=false。
