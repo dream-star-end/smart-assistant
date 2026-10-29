@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { ACTIVE_BOX_STATES, IDLE_COUNTS_SQL, IDLE_JOURNAL_SQL, readIdleSnapshot, waitForIdle } from '../lib/commercialCutoverIdle.js';
+import { ACTIVE_BOX_STATES, IDLE_COUNTS_SQL, IDLE_JOURNAL_SQL, readIdleSnapshot, waitForIdle, verifyListeners } from '../lib/commercialCutoverIdle.js';
 
 const zero = { dispatches: 0, muse: 0, media: 0, studio: 0 };
 const row = { request_id: 'stopped', user_id: '4', container_id: '1', state: 'inflight',
@@ -81,4 +81,25 @@ test('official ordinary deploy checks after all builds and before live activatio
   assert.match(wrapper, /assert_mutation_lease_alive 'commercial-idle-before'/);
   assert.match(wrapper, /assert_mutation_lease_alive 'commercial-idle-after'/);
   assert.doesNotMatch(wrapper, /allow-inflight|systemctl|kill /);
+});
+
+test('legacy npx egress accepts only its actual listening descendant and exact source', () => {
+  const tree = new Map([[12, { parent: 1, cwd: '/release' }], [13, { parent: 12, cwd: '/release' }],
+    [20, { parent: 1, cwd: '/release' }], [21, { parent: 12, cwd: '/other' }]]);
+  const info = (pid: number) => { const p = tree.get(pid); assert.ok(p); return p; };
+  assert.equal(verifyListeners('users:(("node",pid=13,fd=4))', 12, '/release', info), '13');
+  assert.equal(verifyListeners('users:(("node",pid=12,fd=4))', 12, '/release', info), '12');
+  for (const text of ['', 'no owner', 'pid=20,', 'pid=21,']) {
+    assert.throws(() => verifyListeners(text, 12, '/release', info));
+  }
+});
+
+test('ordinary direct activation rechecks idle after its own asset synchronization', () => {
+  const source = readFileSync(new URL('../deploy-v5.sh', import.meta.url), 'utf8');
+  const activate = source.match(/^activate_release\(\) \{[\s\S]*?^\}/m)![0];
+  const guard = activate.indexOf('commercial_wait_for_cutover_idle "$prev"');
+  assert.ok(guard > activate.indexOf('sync_assets_to_pool "$reldir"'));
+  assert.ok(guard < activate.indexOf('prepare_direct_turn_timeline_activation'));
+  assert.ok(guard < activate.indexOf('systemctl restart'));
+  assert.match(source, /if ! activate_release "\$BUILT_RELEASE" --wait-user-idle; then/);
 });

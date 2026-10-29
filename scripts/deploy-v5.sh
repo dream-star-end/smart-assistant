@@ -5941,6 +5941,10 @@ activate_release() {
   [[ "$ACTIVE_SLOT" == A ]] && old_prev_file="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
   # 前端资产先于任何 live 翻转就位；失败仅留下加法式孤儿资产，无运行态变化。
   sync_assets_to_pool "$reldir" || return 1
+  # Ordinary deploy's direct path synchronizes assets here; recheck after that work.
+  if [[ "${2:-}" == --wait-user-idle ]]; then
+    commercial_wait_for_cutover_idle "$prev" || return $?
+  fi
   prepare_direct_turn_timeline_activation "$reldir" "$prev" || return 1
   tmplink="$ACTIVE_SRC.newlink.$$"
   # A slot:同时写 .prev-release 文件(传统 lane 兼容兜底);B slot:rollback 权威在 deploy_state.previous_active_release,不写文件(不污染 A 的兜底)。
@@ -8480,7 +8484,7 @@ deploy() {
       exit 1
     fi
   else
-    if ! activate_release "$BUILT_RELEASE"; then
+    if ! activate_release "$BUILT_RELEASE" --wait-user-idle; then
       require_mutation_lease_for_compensation "release-activation-gate-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readlinkSync } from 'node:fs';
+import { readFileSync, readlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { BoxDurableJournal } from '../../packages/commercial/src/http/proxy/boxDurableJournal.js';
@@ -74,6 +74,30 @@ export async function waitForIdle(read: () => Promise<{ free: boolean }>,
   throw new Error('commercial cutover idle timeout; live activation refused');
 }
 
+// Legacy units may have an npx MainPID. The listener must be that process or its
+// verified descendant, and must itself execute from the expected immutable release.
+export function verifyListeners(listeners: string, mainPid: number, expectedCwd: string,
+  processInfo: (pid: number) => { parent: number; cwd: string }) {
+  assert.ok(listeners.trim(), 'missing egress listener');
+  const pids = new Set<number>();
+  for (const line of listeners.trim().split('\n')) {
+    const matches = [...line.matchAll(/pid=([0-9]+),/g)];
+    assert.ok(matches.length > 0, 'listener owner missing');
+    for (const match of matches) {
+      const listenerPid = Number(match[1]);
+      assert.equal(processInfo(listenerPid).cwd, expectedCwd);
+      let pid = listenerPid;
+      const seen = new Set<number>();
+      while (pid !== mainPid) {
+        assert.ok(pid > 1 && !seen.has(pid), 'listener outside serving unit');
+        seen.add(pid); pid = processInfo(pid).parent;
+      }
+      pids.add(listenerPid);
+    }
+  }
+  return [...pids].sort((a, b) => a - b).join(',');
+}
+
 async function main() {
   const [expectedMaster, expectedEgress] = process.argv.slice(2);
   const release = /^\/opt\/openclaude\/openclaude-v5-releases\/rel-[a-f0-9]+-[0-9]{8}-[0-9]{6}$/;
@@ -108,8 +132,12 @@ async function main() {
     assert.equal(active.length, 1);
     const egress = running(active[0]!, expectedEgress!);
     const listeners = execFileSync('ss', ['-Hltnp', 'sport = :18892'], { encoding: 'utf8', timeout: 5000 }).trim();
-    assert.ok(listeners && listeners.split('\n').every(line => line.includes(`"node",pid=${egress},`)));
-    return `${master}:${egress}:${s.active_slot}`;
+    const listenerPids = verifyListeners(listeners, egress, expectedEgress!, pid => {
+      const parent = readFileSync(`/proc/${pid}/status`, 'utf8').match(/^PPid:\s+([0-9]+)$/m);
+      assert.ok(parent, 'missing process parent');
+      return { parent: Number(parent[1]), cwd: readlinkSync(`/proc/${pid}/cwd`) };
+    });
+    return `${master}:${egress}:${listenerPids}:${s.active_slot}`;
   };
   try {
     assert.equal((await pool.query('SHOW default_transaction_read_only')).rows[0].default_transaction_read_only, 'on');
