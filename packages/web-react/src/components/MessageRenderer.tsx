@@ -780,6 +780,21 @@ function itemMessages(item: LeafRenderItem): ChatMessage[] {
 }
 
 /**
+ * 「工作过程」组的 memo 边界(#1240)。MessageList 随每个流式帧重渲，组本身没有 sig 比较，已结束轮的
+ * 外壳 + 时间轴每帧都重渲一遍(长回合里占整页渲染量的近一半)。已结束的组以 sig(组内各叶子行自己的
+ * memo 键 + 展开态)比较，deps 对齐叶子行 memo 比较器里的列表级引用;进行中的组(live)照常每帧渲染。
+ * 始终包这一层，进行中→已结束时元素类型不变，不会重挂外壳。
+ */
+const ProcessGroupMemo = memo(
+  function ProcessGroupMemo({ children }: { live: boolean; sig: string; deps: readonly unknown[]; children: ReactNode }) {
+    return <>{children}</>;
+  },
+  (a, b) =>
+    !a.live && !b.live && a.sig === b.sig &&
+    a.deps.length === b.deps.length && a.deps.every((value, index) => Object.is(value, b.deps[index])),
+);
+
+/**
  * Visible answer ids for disclosure. While a turn is still sending, no
  * assistant is promoted to the final answer — a later tool must not split the
  * one process shell, and the live body stays inside that shell as Markdown.
@@ -2657,6 +2672,34 @@ export function MessageList({
     </div>
   ) : null;
 
+  const genPlaceholderSig = (m: ChatMessage): string => {
+    const gp = m._genPlaceholder;
+    return `genph|${m.id}|${gp?.status}|${gp?.startedAt}|${gp?.aspect}`;
+  };
+  const singleRowSig = (it: Extract<LeafRenderItem, { kind: "single" }>): string => {
+    const turnFinalAssistant = actionRowFinal[it.idx] ?? false;
+    const failurePresentedBelow = it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
+    return `${safeMessageSignature(it.m, {
+      isLast: it.isLast,
+      sending,
+      turnFinalAssistant,
+    })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+  };
+  /** 叶子行重渲的全部依据(与 MessageRenderer / ThinkingCard / TeamPanel 各自的 memo 比较同口径)。 */
+  const leafMemoKey = (it: LeafRenderItem): string => {
+    if (it.kind === "team") return `team|${it.sig}|${JSON.stringify(it.delegateCosts ?? null)}`;
+    if (it.kind === "thinking") return `thinking|${it.sig}|${it.tokenUsage?.totalTokens ?? ""}`;
+    if (it.m._genPlaceholder) return genPlaceholderSig(it.m);
+    const rowId = it.m._timelineUnitKey ?? it.m.id;
+    let rowSig: string;
+    try {
+      rowSig = singleRowSig(it);
+    } catch {
+      rowSig = `corrupt-row|${rowId}`;
+    }
+    return `${rowSig}|ia:${it.idx >= turnStart ? 1 : 0}|dc:${it.delegateCost ?? ""}|ep:${eagerPayloadKeysRef.current?.has(rowId) === true ? 1 : 0}`;
+  };
+
   const renderItem = (it: RenderItem): ReactNode => {
     if (it.kind === "process") {
       const sections = processSections(it.items, itemMessages, renderItemKey);
@@ -2672,7 +2715,21 @@ export function MessageList({
       // reset when tokens arrive or the turn completes.
       const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
       const bounds = processTimeBounds(renderItems, it);
+      const olderSteps = olderLiveStepsKey === it.key ? olderLiveStepsControl : null;
+      const live = it.active || olderSteps !== null;
       return (
+        <ProcessGroupMemo
+          live={live}
+          sig={live ? "" : [
+            open ? 1 : 0,
+            needle,
+            bounds.startedAt ?? "",
+            bounds.endedAt ?? "",
+            ...sections.map((section) => disclosureValues[`detail:${section.key}`] === true ? 1 : 0),
+            ...it.items.map(leafMemoKey),
+          ].join("\u0001")}
+          deps={[sessionId, sending, historyGeneration, processPaging, readOnly, cb, onRespondPermission]}
+        >
         <ProcessDisclosure
           sections={sections}
           onFirstTextPaint={cb.onFirstTextPaint}
@@ -2688,17 +2745,18 @@ export function MessageList({
           renderItem={renderItem}
           keyOf={renderItemKey}
           messagesOf={itemMessages}
-          olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          olderSteps={olderSteps}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
           lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
           turnStartedAt={it.active ? turnActivity?.startedAt ?? bounds.startedAt : bounds.startedAt}
           turnEndedAt={bounds.endedAt}
         />
+        </ProcessGroupMemo>
       );
     }
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
-      const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
+      const placeholderSig = genPlaceholderSig(it.m);
       return (
         <MessageBoundary messageId={it.m.id} sig={placeholderSig}>
           <GeneratingPlaceholderCard
@@ -2737,11 +2795,7 @@ export function MessageList({
     const rowId = it.m._timelineUnitKey ?? it.m.id;
     let rowSig: string;
     try {
-      rowSig = `${safeMessageSignature(it.m, {
-        isLast: it.isLast,
-        sending,
-        turnFinalAssistant,
-      })}|tu:${tokenUsageSignature(it.tokenUsage)}|du:${tokenUsageSignature(delegateTokenUsage(it.m))}|pe:${failurePresentedBelow ? 1 : 0}`;
+      rowSig = singleRowSig(it);
     } catch {
       return (
         <MessageBoundary messageId={rowId} sig={`corrupt-row|${rowId}`}>
