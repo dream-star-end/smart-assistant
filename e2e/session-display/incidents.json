@@ -8572,8 +8572,8 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/check-v5-master-incident-proofs.ts",
-          "assertion": "an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[box-login-expired-stop-reason] PASS — an API error stand-in is the named upstream refusal on both decoders and a login signal, as on -p"
         }
       ]
     }
