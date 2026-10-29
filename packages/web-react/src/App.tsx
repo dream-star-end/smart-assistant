@@ -225,7 +225,6 @@ import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } fr
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 import { useChatScroll } from "./hooks/useChatScroll";
-import { useStopShortcut } from "./hooks/useStopShortcut";
 import { type BlogOpenTarget, useChatCardActions } from "./hooks/useChatCardActions";
 import type { BlogViewRequest } from "./components/tutorials/blog/CommunityBlog";
 import { useAppDeepLinks } from "./hooks/useAppDeepLinks";
@@ -240,6 +239,7 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const StopShortcut = lazy(() => import("./hooks/useStopShortcut").then((m) => ({ default: m.StopShortcut })));
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
@@ -1681,15 +1681,7 @@ export function App() {
     wsSending,
   });
 
-  const stopShortcutDialog = useStopShortcut({
-    enabled: inWorkspace && sending,
-    turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
-    getStopAction: () => {
-      if (demo) return stopTurn;
-      const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
-      return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
-    },
-  });
+
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
   // 面板深链单选优先级见 activePanelOf（同一时刻仅镜像一个顶层中心）。
@@ -2953,7 +2945,19 @@ export function App() {
         </LazyBoundary>
       )}
       {confirmDialogEl}
-      {stopShortcutDialog}
+      {inWorkspace && (
+        <LazyBoundary fallback={null}>
+          <StopShortcut
+            enabled={sending}
+            turnKey={`${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`}
+            getStopAction={() => {
+              if (demo) return stopTurn;
+              const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
+              return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
+            }}
+          />
+        </LazyBoundary>
+      )}
       {promptTextEl}
       {/* 圈选编辑器是懒块:有 source 才挂载(编辑器自身在 !open 时即重置全部状态、无退场动画,
           条件挂载与原先常驻+open 显隐等价);关闭即卸载,下次打开走已缓存的模块。 */}
