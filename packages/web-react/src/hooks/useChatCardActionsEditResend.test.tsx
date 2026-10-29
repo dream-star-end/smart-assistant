@@ -1,4 +1,4 @@
-import { cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { ChatMessage } from "../lib/chat/model";
@@ -33,8 +33,8 @@ function setup(load: ChatCardActionsInput["loadExactUserMessage"]) {
     openManage: vi.fn(), openBlog: vi.fn(), openPane: vi.fn(), openSettings: vi.fn(),
     setCollapsed: vi.fn(), setBoardOpen: vi.fn(),
   } as unknown as ChatCardActionsInput;
-  const { result } = renderHook(() => useChatCardActions(input));
-  return { input, edit: (msg: ChatMessage) => result.current.cardCallbacks.onEditResend!(msg) };
+  const { result, rerender } = renderHook((props) => useChatCardActions(props), { initialProps: input });
+  return { input, switchSession: (activeId: string | undefined) => rerender({ ...input, activeId }), edit: (msg: ChatMessage) => result.current.cardCallbacks.onEditResend!(msg) };
 }
 
 afterEach(cleanup);
@@ -64,4 +64,19 @@ it("普通消息照旧直接填入原文", async () => {
   const { input, edit } = setup(async (m) => m);
   await edit({ id: "u1", role: "user", text: "短消息", ts: 1 } as ChatMessage);
   expect(input.setComposerPrefill).toHaveBeenCalledWith(expect.objectContaining({ text: "短消息" }));
+});
+
+// Codex 审查 #1214 r2 P1:会话 A 的异步原文不得回填到会话 B 的共用 composer。
+it.each(["s2", undefined])("加载原文时切到 %s:丢弃迟到回填,保留当前草稿", async (nextSession) => {
+  let resolve!: (message: ChatMessage) => void;
+  const loaded = new Promise<ChatMessage>((done) => { resolve = done; });
+  const { input, edit, switchSession } = setup(() => loaded);
+  const pending = edit(placeholder);
+  expect(input.loadExactUserMessage).toHaveBeenCalledWith(placeholder);
+  switchSession(nextSession);
+  await act(async () => {
+    resolve({ ...placeholder, text: "会话 A 的完整原文", _userPayloadDeferred: undefined });
+    await pending;
+  });
+  expect(input.setComposerPrefill).not.toHaveBeenCalled();
 });

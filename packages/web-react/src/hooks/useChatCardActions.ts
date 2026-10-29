@@ -6,7 +6,7 @@ import { assertResolvedIdentity, identityIsCurrent, type ResolvedIdentity } from
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
@@ -123,6 +123,8 @@ export function useChatCardActions({
   stoppedTurnRef,
   toast,
 }: ChatCardActionsInput) {
+  const activeSessionRef = useRef(activeId);
+  activeSessionRef.current = activeId;
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sendImplicitRatingRef, setBusy, setChatError, setStreamText, stopRef, stoppedTurnRef are App useState setter/useRef passed in, stable
   const stopTurnTarget = useCallback((expectedClientMessageId?: string) => {
@@ -298,9 +300,9 @@ export function useChatCardActions({
   const editResend = useCallback(
     async (msg: ChatMessage) => {
       const exact = await loadExactOrToast(msg);
-      if (exact) setComposerPrefill({ text: exact.text || "", nonce: Date.now() });
+      if (exact && activeId === activeSessionRef.current) setComposerPrefill({ text: exact.text || "", nonce: Date.now() });
     },
-    [loadExactOrToast, setComposerPrefill],
+    [activeId, loadExactOrToast, setComposerPrefill],
   );
 
   // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
