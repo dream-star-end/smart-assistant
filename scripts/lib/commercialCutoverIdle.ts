@@ -83,8 +83,12 @@ export function verifyListeners(listeners: string, mainPid: number, expectedCwd:
   for (const line of listeners.trim().split('\n')) {
     const matches = [...line.matchAll(/pid=([0-9]+),/g)];
     assert.ok(matches.length > 0, 'listener owner missing');
+    let serving = 0;
     for (const match of matches) {
       const listenerPid = Number(match[1]);
+      // Socket activation retains a copy in PID1. It is not the serving worker;
+      // every socket must still have a verified worker from this exact unit.
+      if (listenerPid === 1 && line.includes('"systemd",pid=1,')) continue;
       assert.equal(processInfo(listenerPid).cwd, expectedCwd);
       let pid = listenerPid;
       const seen = new Set<number>();
@@ -92,8 +96,9 @@ export function verifyListeners(listeners: string, mainPid: number, expectedCwd:
         assert.ok(pid > 1 && !seen.has(pid), 'listener outside serving unit');
         seen.add(pid); pid = processInfo(pid).parent;
       }
-      pids.add(listenerPid);
+      pids.add(listenerPid); serving++;
     }
+    assert.ok(serving > 0, 'socket has no serving worker');
   }
   return [...pids].sort((a, b) => a - b).join(',');
 }

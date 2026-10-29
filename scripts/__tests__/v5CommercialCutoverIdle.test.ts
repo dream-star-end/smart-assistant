@@ -89,7 +89,8 @@ test('legacy npx egress accepts only its actual listening descendant and exact s
   const info = (pid: number) => { const p = tree.get(pid); assert.ok(p); return p; };
   assert.equal(verifyListeners('users:(("node",pid=13,fd=4))', 12, '/release', info), '13');
   assert.equal(verifyListeners('users:(("node",pid=12,fd=4))', 12, '/release', info), '12');
-  for (const text of ['', 'no owner', 'pid=20,', 'pid=21,']) {
+  assert.equal(verifyListeners('users:(("node",pid=13,fd=3),("systemd",pid=1,fd=90))', 12, '/release', info), '13');
+  for (const text of ['', 'no owner', 'pid=20,', 'pid=21,', 'users:(("systemd",pid=1,fd=90))']) {
     assert.throws(() => verifyListeners(text, 12, '/release', info));
   }
 });
