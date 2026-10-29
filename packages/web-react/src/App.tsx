@@ -25,7 +25,6 @@ import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
-import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
@@ -91,14 +90,12 @@ import { isBrowserStepMessage } from "./components/tool/browserDetect";
 import {
   DETAIL_PANE_WIDTH,
   type DeferredPayloadLoader,
-  InspectorPanel,
-  InspectorPanelContent,
   type PaneRequest,
   type PaneTab,
   paneRequestForSession,
   readDetailPaneOpen,
   writeDetailPaneOpen,
-} from "./components/InspectorPanel";
+} from "./components/chat/inspectorState";
 import type { ToolLike } from "./components/tool/format";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
@@ -245,6 +242,9 @@ type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
+const DesktopEnrollPage = lazy(() =>
+  import("./components/DesktopEnrollPage").then((m) => ({ default: m.DesktopEnrollPage })),
+);
 const TutorialCenter = lazy(() =>
   import("./components/TutorialCenter").then((m) => ({ default: m.TutorialCenter })),
 );
@@ -260,6 +260,13 @@ const TaskboardView = lazy(() =>
 // 覆盖层,此前静态 import 把它们(连同 ImageViewer 三模式、ProjectAssetsPanel 等)钉在入口静态
 // 闭包里。改 React.lazy 后由渲染点的挂载闸(useMountedOnce / 条件挂载)控制首次下载;打开过
 // 一次即常驻,状态保留与关闭语义与原先「始终挂载、按 open 显隐」一致。
+// 详情面板沿用 paneInline / paneSheetOpen 的打开条件，首次打开时才下载。
+const InspectorPanel = lazy(() =>
+  import("./components/InspectorPanel").then((m) => ({ default: m.InspectorPanel })),
+);
+const InspectorPanelContent = lazy(() =>
+  import("./components/InspectorPanel").then((m) => ({ default: m.InspectorPanelContent })),
+);
 const ImageAnnotationEditor = lazy(() =>
   import("./components/ImageAnnotationEditor").then((m) => ({ default: m.ImageAnnotationEditor })),
 );
@@ -1917,7 +1924,11 @@ export function App() {
   }
 
   if (desktopEnroll && auth) {
-    return <DesktopEnrollPage auth={auth} />;
+    return (
+      <LazyBoundary fallback={<SplashFallback />}>
+        <DesktopEnrollPage auth={auth} />
+      </LazyBoundary>
+    );
   }
 
   if (studio && auth) {
@@ -2677,23 +2688,33 @@ export function App() {
       {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
           更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
       {paneInline && (
-        <InspectorPanel
+        <LazyBoundary
           key={activeId ?? "demo"}
-          messages={wsMessages}
-          version={chat.version}
-          running={wsSending}
-          request={paneRequestHere}
-          deferredLoader={paneDeferredLoader}
-          focusNonce={paneRequestHere?.nonce}
-          onClose={() => setPaneOpen(false)}
-          onActiveChange={setPaneActive}
-          width={paneWidth.width}
-          resizing={paneWidth.resizing}
-          widthMin={DETAIL_PANE_WIDTH.min}
-          widthMax={DETAIL_PANE_WIDTH.max}
-          onResizeStart={paneWidth.onResizeStart}
-          onResizeKeyDown={paneWidth.onResizeKeyDown}
-        />
+          fallback={
+            <aside className="flex shrink-0 flex-col items-center gap-3 border-l border-border p-4" style={{ width: paneWidth.width }}>
+              <span role="status" className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</span>
+              <Button variant="ghost" onClick={() => setPaneOpen(false)}>关闭详情面板</Button>
+            </aside>
+          }
+        >
+          <InspectorPanel
+            key={activeId ?? "demo"}
+            messages={wsMessages}
+            version={chat.version}
+            running={wsSending}
+            request={paneRequestHere}
+            deferredLoader={paneDeferredLoader}
+            focusNonce={paneRequestHere?.nonce}
+            onClose={() => setPaneOpen(false)}
+            onActiveChange={setPaneActive}
+            width={paneWidth.width}
+            resizing={paneWidth.resizing}
+            widthMin={DETAIL_PANE_WIDTH.min}
+            widthMax={DETAIL_PANE_WIDTH.max}
+            onResizeStart={paneWidth.onResizeStart}
+            onResizeKeyDown={paneWidth.onResizeKeyDown}
+          />
+        </LazyBoundary>
       )}
       <Sheet
         open={paneAvailable && paneSheetOpen && !isWideViewport}
@@ -2705,16 +2726,26 @@ export function App() {
       >
         {paneSheetOpen && (
           <div className="flex h-[80dvh] min-h-0 flex-col">
-            <InspectorPanelContent
+            <LazyBoundary
               key={activeId ?? "demo"}
-              messages={wsMessages}
-              version={chat.version}
-              running={wsSending}
-              request={paneRequestHere}
-              deferredLoader={paneDeferredLoader}
-              onClose={() => setPaneSheetOpen(false)}
-              onActiveChange={setPaneActive}
-            />
+              fallback={
+                <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-4">
+                  <span role="status" className="flex items-center gap-2 text-muted"><Spinner />正在加载详情面板…</span>
+                  <Button variant="ghost" onClick={() => setPaneSheetOpen(false)}>关闭详情面板</Button>
+                </div>
+              }
+            >
+              <InspectorPanelContent
+                key={activeId ?? "demo"}
+                messages={wsMessages}
+                version={chat.version}
+                running={wsSending}
+                request={paneRequestHere}
+                deferredLoader={paneDeferredLoader}
+                onClose={() => setPaneSheetOpen(false)}
+                onActiveChange={setPaneActive}
+              />
+            </LazyBoundary>
           </div>
         )}
       </Sheet>
