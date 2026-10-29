@@ -3,12 +3,12 @@ import { after, describe, test } from 'node:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { EventEmitter } from 'node:events'
 import { SessionManager, type AgentSession } from '../sessionManager.js'
 import { CcbAdapter } from '../engine/ccbAdapter.js'
 import { registerEngine, type EngineAuthorityOverride, type EngineCreateOpts } from '../engine/registry.js'
 import type { SubprocessRunner } from '../subprocessRunner.js'
 import type { AgentDef, OpenClaudeConfig } from '@openclaude/storage'
-import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import type { HistoricalTurnInput } from '../historicalContextPayload.js'
 
 const engines = ['ccb', 'codex', 'grok', 'cursor', 'zcode', 'antigravity'] as const
@@ -16,14 +16,14 @@ const workspace = mkdtempSync(join(tmpdir(), 'rf-errors-matrix-'))
 after(() => rmSync(workspace, { recursive: true, force: true }))
 
 /** Only runner construction and submission are replaced. Real manager switch/history gates execute. */
-class MatrixRunner extends MinimalPrivacyRunner {
+class MatrixRunner extends EventEmitter {
   sessionId: string | null = null
   isRunning = false
   lastActivityAt = Date.now()
   shutdowns = 0
   model: string | undefined
   constructor(opts: EngineCreateOpts) { super(); this.model = opts.model }
-  async start() { this.recordBuiltPromptPrivacy(); this.isRunning = true }
+  async start() { this.isRunning = true }
   async shutdown() { this.shutdowns++; this.isRunning = false }
   clearSessionId() { this.sessionId = null }
   setModel(model: string | undefined) { this.model = model }

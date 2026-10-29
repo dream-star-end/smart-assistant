@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { CodexNativeContext } from '../engine/codexNativeContext.js'
-import { codexRelayTrace } from '../relayTrace.js'
 import { CodexAppServerRunner } from '../engine/codexAppServerRunner.js'
 import type { ContextObservation } from '@openclaude/protocol'
 
@@ -165,10 +164,9 @@ for (const completedBeforeAck of [false, true]) {
     const context = new CodexNativeContext((e) => observations.push(e))
     context.observeUsage('thread-1', { threadId: 'thread-1', tokenUsage: usage(900) })
     let drains = 0
-    const running = context.compactIfNeeded({ threadId: 'thread-1', traceId: 'trace123456789012', timeoutMs: 1000,
+    const running = context.compactIfNeeded({ threadId: 'thread-1', timeoutMs: 1000,
       send: () => new Promise(() => {}), drainFailure: async () => { drains++ },
     })
-    assert.equal(codexRelayTrace(JSON.stringify({ thread_id: 'thread-1' })), 'trace123456789012')
     if (completedBeforeAck) {
       context.notification('turn/started', { threadId: 'thread-1', turn: { id: 'c1' } })
       const item = { id: 'compact', type: 'contextCompaction' }
@@ -182,7 +180,6 @@ for (const completedBeforeAck of [false, true]) {
     assert.equal(drains, 1)
     assert.equal(context.running, false)
     assert.equal(observations.filter((e) => e.kind === 'context_compacted').length, 0)
-    assert.equal(codexRelayTrace(JSON.stringify({ thread_id: 'thread-1' })), undefined)
   })
 }
 

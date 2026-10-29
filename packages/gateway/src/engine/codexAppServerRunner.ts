@@ -2586,7 +2586,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.resetAttemptState()
         if (!this.pendingStartInterrupt) {
           await this.nativeContext.compactIfNeeded({
-            threadId: this.threadId, traceId: turnTraceId,
+            threadId: this.threadId,
             timeoutMs: NATIVE_COMPACTION_TIMEOUT_MS,
             send: () => this.sendRequest('thread/compact/start', { threadId: this.threadId }),
             drainFailure: async () => {

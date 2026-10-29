@@ -5531,7 +5531,7 @@
       "rootFixCommit": "f1d63636",
       "coverageCommits": [
         "81b959db",
-        "2cea9e69"
+        "b6be1f6e"
       ],
       "regressions": [
         {
@@ -6271,7 +6271,7 @@
         "92acb899",
         "dc1ea28c",
         "43b509a0",
-        "571fa589"
+        "03d8e914"
       ],
       "regressions": [
         {
@@ -9028,10 +9028,8 @@
       "occurredAt": "2026-10-23",
       "severity": "P2",
       "symptom": "缺省agent的派发已按main受理，但canonical trace仍为NULL及agent:null会话键；接管返回旧agent时也不能从本次帧推断。仅修观测投影，不改变执行、计费或租约身份。",
-      "rootFixCommit": "1bb8a534",
-      "coverageCommits": [
-        "892f3ed6"
-      ],
+      "rootFixCommit": "6821243e",
+      "coverageCommits": [],
       "regressions": [
         {
           "layer": "unit",
@@ -9055,11 +9053,8 @@
       "occurredAt": "2026-10-27",
       "severity": "P1",
       "symptom": "报障 #a9f49bcf：Box Claude 长任务（~74 分钟）HTTP 200 后 BOX_EXEC_REMOTE_EXIT → BOX_TOOL_TERMINAL_UNPROVEN，回合以 ENGINE_ERROR / BOX_REPLAY_PENDING 收尾，扣费齐但已流出的助手正文不展示，只剩「结果正在收尾」。该 trace 不在个人版数据里（btd-01），按代码静态还原同类回合（CONTINUE-20261027-box-terminal-display §3/§4）。本条只修三处：F1 失败轮部分回答按全文子串判内部串，带 JSON/栈帧引用/以 [ 开头的正常答复整段被丢（改为整体结构判断，detail 守卫不变）；F2 有自动恢复子行时源错误行连正文整行被藏（改为只藏错误卡）；G3 恢复成功的 run 无 native pointer、keep=0 隐私清理不认 <session>/tool-results/，126 后无限重试（按 boxNativeGcFile 规则放行）。请求内 20 秒证明窗口（G1）与恢复正文回写（G2）不在本条。",
-      "rootFixCommit": "48022f40",
-      "coverageCommits": [
-        "5f0be34a",
-        "ab2658d1"
-      ],
+      "rootFixCommit": "46b36dc8",
+      "coverageCommits": [],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -9093,12 +9088,8 @@
       "occurredAt": "2026-10-27",
       "severity": "P1",
       "symptom": "t1134u：发「怎么根治」后浏览器里看到了流式正文和工具过程，换终端/浏览器再打开这一轮为空。会话 webmvqm6jl6964ekm（k3.1-pro，非 Box），dispatch d70edbec 在 403 后挂起，13:52Z 发版重启时 gateway boot recovery 只用 inbox 字段合成 SERVICE_RESTART crashed tape（text 空），master finalize 把流翻成 tape、读路径不再读帧，每小时的 pruneProjectedLiveFrames 随后删帧，新端 hydrate 只剩合成错误行。修：master 物化这种合成 tape 前用该 dispatch 自己的 live 帧折回正文/思考/工具；前端 SERVICE_RESTART 行把折回的正文作部分回答显示。挂起不结算（G-C）与已删帧会话的补救不在本条（CONTINUE-20261028-box-terminal-verify §4–§6）。",
-      "rootFixCommit": "e36fa3b9",
-      "coverageCommits": [
-        "3d3f39f1",
-        "5cf81015",
-        "9599479a"
-      ],
+      "rootFixCommit": "0a6de973",
+      "coverageCommits": [],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -9132,7 +9123,7 @@
       "occurredAt": "2026-10-28",
       "severity": "P2",
       "symptom": "商业（2026-10-28）：uid 4 会话 webmvrwwrwvsh1rvi 用 k3.1-pro 发「请再核实一下」后手机 10 秒即断线切后台，引擎 19 秒已就绪、回合在后台持续跑（>30 分钟联网核查），切回时活动行仍显示「全能助手 正在启动引擎 (1184s)…」，用户以为启动卡死。根因：①bridge 在最后一个浏览器断开 60s drain 后关容器 WS，断线期间帧不落库也无法回放，startup 清态帧丢失；②computeTypingLabel 的 engine_* 分支在任何静默判断之前返回；③hello 不给 open dispatch 下发权威阶段，容器 hello 补发也跳过 null。",
-      "rootFixCommit": "6edf026e",
+      "rootFixCommit": "23de284c",
       "coverageCommits": [],
       "regressions": [
         {
@@ -9177,7 +9168,7 @@
       "occurredAt": "2026-10-28",
       "severity": "P1",
       "symptom": "W3 用户反馈 t1048u/t1049u 与体验官 X-P2-6/X-P2-2：错误原码/内部 ID 外露，自动恢复实际短预算 3 却只有旧 max=10 元数据；无 prepared handoff 的带附件跨引擎首轮因只接受 string 而跳过历史，native resume 丢失期间历史键每轮变化导致重建灰条重复。服务端新增安全展示目录和实际重试状态，并补齐 multimodal 历史与 episode 提示去重。UI 接入另由 FE-errors 完成。",
-      "rootFixCommit": "aa88f75b",
+      "rootFixCommit": "b78f6782",
       "regressions": [
         {
           "layer": "unit",
@@ -9205,10 +9196,7 @@
           "assertion": "[multimodal-history-envelope] PASS — actual Antigravity fake-CLI stdin fits after multimodal history trimming"
         }
       ],
-      "coverageCommits": [
-        "142aad7e",
-        "c83f12f2"
-      ]
+      "coverageCommits": []
     }
   ]
 }

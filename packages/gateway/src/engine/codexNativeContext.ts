@@ -1,5 +1,4 @@
 import type { ContextObservation } from '@openclaude/protocol'
-import { adoptCodexTurnTrace, bindCodexThreadTrace } from '../relayTrace.js'
 
 type Measurement = { threadId: string; tokens: number; window: number }
 type Pending = {
@@ -96,7 +95,6 @@ export class CodexNativeContext {
     if (!pending || params.threadId !== pending.threadId) return undefined
     if (method === 'turn/started' && typeof turnId === 'string') {
       pending.turnId = turnId
-      adoptCodexTurnTrace(pending.threadId, turnId)
       return 'handled'
     }
     const item = record(params.item)
@@ -104,7 +102,6 @@ export class CodexNativeContext {
       if (pending.turnId && pending.turnId !== turnId) return 'handled'
       pending.turnId = turnId
       pending.itemId = typeof item?.id === 'string' ? item.id : undefined
-      adoptCodexTurnTrace(pending.threadId, turnId)
     }
     if (!pending.turnId || turnId !== pending.turnId) return 'handled'
     if (method === 'thread/tokenUsage/updated') return 'usage'
@@ -120,7 +117,6 @@ export class CodexNativeContext {
 
   async compactIfNeeded(opts: {
     threadId: string | null
-    traceId: string | undefined
     timeoutMs: number
     send: () => Promise<unknown>
     drainFailure: () => Promise<void>
@@ -128,7 +124,6 @@ export class CodexNativeContext {
     const measured = this.measured
     if (!measured || measured.threadId !== opts.threadId || measured.tokens / measured.window < 0.8) return
     this.pressure(measured)
-    const releaseTrace = bindCodexThreadTrace(measured.threadId, opts.traceId)
     let rejectWait!: (error: Error) => void
     const cancelled = new Promise<never>((_, reject) => { rejectWait = reject })
     const completed = new Promise<void>((resolve) => {
@@ -150,7 +145,6 @@ export class CodexNativeContext {
       clearTimeout(timer)
       this.retired = this.pending ? { threadId: this.pending.threadId, turnId: this.pending.turnId } : undefined
       this.pending = undefined
-      releaseTrace()
       this.status?.(null)
     }
   }

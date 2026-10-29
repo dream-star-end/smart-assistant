@@ -48,6 +48,7 @@ const TURN_COPY: Record<TurnErrorCode, readonly [UserErrorCategory, string]> = {
   session_deleted: ['not_found', '这个会话已被删除，请从回收站恢复，或新建会话继续。'],
   project_context_unavailable: ['storage', '会话所属项目的指令和文件暂时没有加载出来，请稍后重试。'],
   durable_dispatch_unavailable: ['execution', '本条消息暂时未能接入执行通道，请稍后重试。'],
+  admission_restart_unexecuted: ['execution', '服务重启时任务尚未开始执行，请重新尝试。'],
   stopped: ['cancelled', '本轮生成已停止。'],
   user_cancelled: ['cancelled', '本轮已取消。'],
   runner_crashed: ['execution', '执行环境意外中断，请重新尝试。'],
