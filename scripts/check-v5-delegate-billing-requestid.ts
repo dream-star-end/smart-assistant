@@ -477,7 +477,7 @@ async function runWaitCloseProof(candidateRoot: string, timeoutMs = 60_000,
     });
     console.log(tap.trimEnd());
     if (regression) {
-      assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!|#\s*(?:SKIP|TODO)\b/gmi);
+      assert.doesNotMatch(tap, /^\s*not ok\b|^\s*Bail out!|^\s*ok\b[^\r\n]*#\s*(?:SKIP|TODO)\b/gmi);
       const tests = [...tap.matchAll(/^# tests (\d+)\r?$/gm)].map(m => Number(m[1]));
       assert.equal(tests.length, 1, "complete TAP test summary required");
       assert.ok(tests[0]! >= regression.titles.length && tests[0]! > 0);
