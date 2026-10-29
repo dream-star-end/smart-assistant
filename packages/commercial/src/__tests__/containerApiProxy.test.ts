@@ -224,12 +224,59 @@ describe('containerApiProxy', () => {
     assert.equal(got.body.toString(), '{"text":"hello"}')
   })
 
+  it('OCV5-659 body read failures are connection errors and never forwarded', async () => {
+    for (const partial of [false, true]) {
+      const failure = Object.assign(new Error('private body detail must not be logged'), { code: 'ECONNRESET', status: 413 })
+      const req = Object.assign(Readable.from((async function* () {
+        if (partial) yield Buffer.from('{"incomplete":')
+        throw failure
+      })()), {
+        method: partial ? 'PUT' : 'GET',
+        url: partial ? '/api/agents/main/memory/user' : '/api/features',
+        headers: { host: 'claudeai.chat' },
+        aborted: !partial,
+      })
+      const res = makeRes()
+      const logs: unknown[][] = []
+      const ctx = makeCtx()
+      ctx.log.warn = (...args: unknown[]) => { logs.push(args) }
+      await containerApiProxy(req as any, res as any, ctx as any, {
+        v3: {} as any, bridgeSecret: 'bridge-secret',
+        getStatus: async () => { assert.fail('incomplete body must not reach container lookup') },
+      }, 7n)
+      assert.equal(res.statusCode, 400)
+      const body = JSON.parse(res.body.toString())
+      assert.equal(body.error.code, 'REQUEST_BODY_READ_FAILED')
+      assert.equal(body.userError.category, 'connection')
+      assert.doesNotMatch(res.body.toString(), /PAYLOAD_TOO_LARGE|private body detail/)
+      assert.equal(logs.length, 1)
+      assert.deepEqual(logs[0], ['container_api_request_body_read_failed', {
+        uid: '7', method: req.method,
+        route: partial ? '/api/agents/:id/memory/:target' : '/api/features',
+        reason: partial ? 'read_failed' : 'aborted',
+      }])
+    }
+  })
+
+  it('OCV5-659 complete request at the byte cap still reaches container lookup', async () => {
+    const req = makeReq({ method: 'PUT', url: '/api/agents/main/memory/user', body: Buffer.alloc(512 * 1024) })
+    const res = makeRes()
+    let lookups = 0
+    await containerApiProxy(req as any, res as any, makeCtx() as any, {
+      v3: {} as any, bridgeSecret: 'bridge-secret',
+      getStatus: async () => { lookups++; return null },
+    }, 7n)
+    assert.equal(lookups, 1)
+    assert.equal(res.statusCode, 503)
+    assert.match(res.body.toString(), /CONTAINER_NOT_RUNNING/)
+  })
+
   it('rejects oversized request bodies before dispatch', async () => {
     let dispatched = false
     const req = makeReq({
       method: 'PUT',
       url: '/api/agents/main/memory/user',
-      body: Buffer.alloc(513 * 1024),
+      body: Buffer.alloc(512 * 1024 + 1),
     })
     const res = makeRes()
     await containerApiProxy(
