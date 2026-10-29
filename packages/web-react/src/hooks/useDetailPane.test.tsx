@@ -3,10 +3,11 @@
  * 顶栏开关从收起态打开的是产出页、面板本体懒加载后照常挂上。
  */
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, renderHook, screen } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
-import { DetailPane, PANE_OPEN_STORAGE_KEY, latestTurnOutputCount, useDetailPane } from "./useDetailPane";
+import { latestTurnOutputCount } from "../components/chat/workbench";
+import { DetailPane, PANE_OPEN_STORAGE_KEY, useDetailPane } from "./useDetailPane";
 
 const TS = 1_700_000_000_000;
 const W = "/home/agent/.openclaude/workspace/s1";
@@ -61,11 +62,11 @@ describe("latestTurnOutputCount", () => {
 describe("useDetailPane", () => {
   const base = { activeId: "s1", inChat: true, demo: false, version: 1 };
 
-  test("默认收起;这一轮有产出时给出 N,顶栏开关打开的是产出页并记住「手动打开过」", () => {
+  test("默认收起;这一轮有产出时给出 N,顶栏开关打开的是产出页并记住「手动打开过」", async () => {
     viewport(true);
     const { result } = renderHook(() => useDetailPane({ ...base, messages: withOutputs() }));
     expect(result.current.shown).toBe(false);
-    expect(result.current.outputs).toBe(2);
+    await waitFor(() => expect(result.current.outputs).toBe(2));
     act(() => result.current.toggle?.());
     expect(result.current.shown).toBe(true);
     expect(result.current.host.request?.tab).toBe("outputs");
