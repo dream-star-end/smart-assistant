@@ -38,8 +38,9 @@ test("#1240 long run: sidebar rows and settled process shells do not re-render p
   assert.equal(m.composerValue, "继续追问一下细节", "typing during the run reaches the composer");
   assert.ok(m.frames > 80, `run streamed ${m.frames} frames`);
   const rows = m.by.SessionRow ?? 0;
-  assert.ok(rows <= SESSION_ROW_BUDGET, `SessionRow rendered ${rows} times during the run (budget ${SESSION_ROW_BUDGET})`);
   const settled = Object.entries(m.pd).filter(([key]) => key.startsWith("active=false"));
+  console.log(`[ui-lag] frames=${m.frames} rendersPerFrame=${m.rendersPerFrame} SessionRow=${rows} settledShells=${JSON.stringify(settled.map(([, n]) => n))}`);
+  assert.ok(rows <= SESSION_ROW_BUDGET, `SessionRow rendered ${rows} times during the run (budget ${SESSION_ROW_BUDGET})`);
   assert.ok(settled.length > 0, "settled turns are on screen");
   for (const [key, n] of settled) {
     assert.ok(n <= SETTLED_SHELL_BUDGET, `settled process shell ${key} rendered ${n} times (budget ${SETTLED_SHELL_BUDGET})`);
