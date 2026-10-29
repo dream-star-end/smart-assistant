@@ -64,7 +64,10 @@ async function bundleHarness() {
 }
 
 describe("#1237 ledger row in a US-Pacific Chromium (real AccountTab)", { timeout: 90_000 }, () => {
-  let browser, server, origin, bundled;
+  let browser;
+  let server;
+  let origin;
+  let bundled;
   before(async () => {
     bundled = await bundleHarness();
     server = createServer((req, res) => {
@@ -76,7 +79,7 @@ describe("#1237 ledger row in a US-Pacific Chromium (real AccountTab)", { timeou
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
     });
-    origin = "http://127.0.0.1:" + server.address().port;
+    origin = `http://127.0.0.1:${server.address().port}`;
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
   });
   after(async () => {
