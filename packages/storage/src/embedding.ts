@@ -13,7 +13,14 @@
  *   EMBEDDING_BASE_URL   — API base URL (default: "https://api.openai.com/v1")
  *   EMBEDDING_BATCH_SIZE — texts per request (default: 100; DashScope compatible-mode caps at 10)
  *   EMBEDDING_TIMEOUT_MS — per-request timeout (default: 30000)
+ *
+ * text-embedding-3-large at 1024 dimensions is opt-in. Callers switch to it
+ * only when an OpenAI key is configured; these defaults stay on 3-small.
  */
+
+export const OPENAI_EMBEDDING_BASE_URL = 'https://api.openai.com/v1'
+export const OPENAI_LARGE_EMBEDDING_MODEL = 'text-embedding-3-large'
+export const OPENAI_LARGE_EMBEDDING_DIMENSIONS = 1024
 
 // ── Interface ────────────────────────────────────
 
