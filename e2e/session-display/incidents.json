@@ -9252,7 +9252,7 @@
       "id": "INC-20261029-CONTAINER-BODY-READ",
       "occurredAt": "2026-10-25",
       "severity": "P1",
-      "symptom": "t1298u 7-day audit found 17 internal container API GET requests logged as HTTP413, with no public-edge413. Historical logs lack the read exception so their exact causes remain unproven. A deterministic handler defect maps any interrupted body read to PAYLOAD_TOO_LARGE, including zero-byte GET and partial PUT. Explicit byte-cap errors now remain413; stream failures return400 REQUEST_BODY_READ_FAILED, stay unforwarded, and emit bounded uid/route/reason diagnostics. Model conversation oversize failures are separate existing fixes.",
+      "symptom": "t1298u 7-day audit found 17 internal container API GET requests logged as HTTP413, with no public-edge413. Historical logs lack the read exception so their exact causes remain unproven. A deterministic handler defect maps any interrupted body read to PAYLOAD_TOO_LARGE, including zero-byte GET and partial PUT. Explicit byte-cap errors now remain413; stream failures return400 REQUEST_BODY_READ_FAILED, stay unforwarded, and emit bounded uid/route/reason diagnostics. Model conversation oversize failures are separate existing fixes. The same unconditional413 catch in the Antigravity relay is also corrected; no historical relay-body-limit incident is claimed. Its existing1MiB metadata/32MiB generate limits stay enforced before billing.",
       "rootFixCommit": "eae7a211",
       "regressions": [
         {
@@ -9274,7 +9274,20 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "[container-request-body-errors] PASS — aborted reads never become size errors or forward partial bytes; 512KiB cap remains enforced"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityRelay.test.ts",
+          "assertion": "OCV5-659 relay stream failures do not become size errors or reserve credits"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[relay-request-body-errors] PASS — relay read errors never reserve credits or become 413; metadata and generate byte caps remain enforced"
         }
+      ],
+      "coverageCommits": [
+        "994bc473"
       ]
     }
   ]
