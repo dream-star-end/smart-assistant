@@ -1,8 +1,13 @@
 /**
  * User-facing text for a failed Codex imageGeneration item.
  * Codex 0.163 often sets status=failed with failure=null and puts the HTTP
- * body only on stderr. Keep the upstream code, drop bytes, tokens, and raw JSON.
+ * body only on stderr. The user sees a whitelist Chinese sentence. Internal
+ * codes and upstream text stay in the log, with secrets stripped.
  */
+
+import { createLogger } from '../logger.js'
+
+const log = createLogger({ module: 'imageGenerationFailure' })
 
 const CONTINUE = '点「继续」，助手会改用其他方式做完。'
 
@@ -15,29 +20,67 @@ const CODE_GLOSS: Record<string, string> = {
   IMAGE_BILLING_INSUFFICIENT: '积分不够',
 }
 
+const GENERIC = `图片生成没有完成。${CONTINUE}`
+
+const CODE_RE = /^[A-Z][A-Z0-9_]{0,48}$/
+
+/** Strip token, key, secret, bearer, and cookie values before any log line. */
+export function redactImageUpstream(raw: string): string {
+  const assignment =
+    /\b(?:access_token|refresh_token|id_token|api[_-]?key|client_secret|secret|password|bearer|cookie|authorization|token)\s*[=:]\s*(?:"[^"]*"|'[^']*'|\S+)/gi
+  return raw
+    .replace(assignment, (match) => {
+      const sep = match.search(/[=:]/)
+      return `${match.slice(0, sep + 1)}[redacted]`
+    })
+    .replace(/\bbearer\s+\S+/gi, 'bearer [redacted]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, 'sk-[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+    .replace(/[A-Za-z0-9+/]{40,}={0,2}/g, '[redacted]')
+}
+
+/**
+ * User copy is a known reason-code gloss, or one generic sentence.
+ * Free text, HTTP status, and unknown codes are never interpolated.
+ */
 export function formatImageGenerationFailure(input: {
   code?: string
   httpStatus?: string
   detail?: string
 }): string {
-  const code = input.code
-  if (code && /^[A-Z][A-Z0-9_]{0,48}$/.test(code)) {
-    const gloss = CODE_GLOSS[code]
-    const reason = gloss ? `${code}（${gloss}）` : code
-    return `图片生成没有完成：${reason}。${CONTINUE}`
+  const code = input.code && CODE_RE.test(input.code) ? input.code : undefined
+  if (code || input.httpStatus || input.detail) {
+    log.warn('image generation failure', {
+      ...(code ? { code } : {}),
+      ...(input.httpStatus && /^\d{3}$/.test(input.httpStatus)
+        ? { httpStatus: input.httpStatus }
+        : {}),
+      ...(input.detail ? { upstream: redactImageUpstream(input.detail) } : {}),
+    })
   }
-  if (input.detail) return `图片生成没有完成：${input.detail}。${CONTINUE}`
-  if (input.httpStatus && /^\d{3}$/.test(input.httpStatus)) {
-    return `图片生成失败（HTTP ${input.httpStatus}）。${CONTINUE}`
-  }
-  return `图片生成没有完成。${CONTINUE}`
+  const gloss = code ? CODE_GLOSS[code] : undefined
+  if (gloss) return `图片生成没有完成：${gloss}。${CONTINUE}`
+  return GENERIC
 }
 
-/** Pull a short, non-secret reason off the completed item. */
+function messageOf(value: unknown): string | undefined {
+  if (typeof value === 'string') return value
+  if (!value || typeof value !== 'object') return undefined
+  const message = (value as { message?: unknown }).message
+  return typeof message === 'string' ? message : undefined
+}
+
+/** Pull a short, non-secret reason off the completed item. Secrets stay in the log. */
 export function imageFailureDetail(item: Record<string, unknown>): string | undefined {
   for (const candidate of [item.error, item.failure]) {
-    const text = detailText(candidate)
-    if (text) return text
+    const raw = messageOf(candidate)
+    if (raw === undefined) continue
+    const text = raw.replace(/\s+/g, ' ').trim()
+    if (text.length < 1 || text.length > 120) continue
+    const redacted = redactImageUpstream(text)
+    log.warn('image generation upstream detail', { upstream: redacted })
+    if (redacted !== text) continue
+    return text
   }
   return undefined
 }
@@ -69,21 +112,4 @@ export function noteFromImageGenerationStderr(line: string): string | null {
     httpStatus: http?.[1],
     code: code?.[1],
   })
-}
-
-function detailText(value: unknown): string | undefined {
-  if (typeof value === 'string') return safeDetail(value)
-  if (value && typeof value === 'object') {
-    const message = (value as { message?: unknown }).message
-    if (typeof message === 'string') return safeDetail(message)
-  }
-  return undefined
-}
-
-function safeDetail(raw: string): string | undefined {
-  const text = raw.replace(/\s+/g, ' ').trim()
-  if (text.length < 1 || text.length > 120) return undefined
-  if (/bearer\s+|sk-[a-z0-9]|api[_-]?key|eyJ[a-z0-9]/i.test(text)) return undefined
-  if (/[A-Za-z0-9+/]{40,}={0,2}/.test(text)) return undefined
-  return text
 }

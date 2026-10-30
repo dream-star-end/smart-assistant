@@ -141,7 +141,7 @@ import {
   _consumeRateLimitsForEmit as _consumeRateLimitsForEmitImpl,
   emitResult as emitResultImpl,
 } from './codexAppServerNotifications.js'
-import { rememberImageStderr } from './imageGenerationFailure.js'
+import { rememberImageStderr, redactImageUpstream } from './imageGenerationFailure.js'
 export {
   isMissingRolloutError,
   isGoalAlreadyClearedError,
@@ -2220,7 +2220,7 @@ export class CodexAppServerRunner extends EventEmitter {
     for (const line of result.completeLines) {
       rememberImageStderr(this, line); log.warn('codex app-server stderr', {
         sessionKey: this.opts.sessionKey,
-        line: line.slice(0, 1024),
+        line: redactImageUpstream(line).slice(0, 1024),
       })
     }
     if (result.deniedLines > 0) {

@@ -166,22 +166,10 @@ function continueAskUserQuestion(
   requestId: string,
   onRespond: PermissionRespond,
 ): void {
-  const answers: Record<string, string> = {};
-  for (const q of questions) {
-    const opt = (q.options ?? []).find(
-      (o) => o && typeof o.label === "string" && o.label !== OTHER && o.label.length > 0,
-    );
-    if (!opt) {
-      onRespond({ requestId, behavior: "deny", message: "User continued" });
-      return;
-    }
-    answers[q.question] = opt.label;
-  }
-  onRespond({
-    requestId,
-    behavior: "allow",
-    updatedInput: { ...(input ?? {}), answers },
-  });
+  // 继续只放开这一轮，不替用户选题。钱和权限必须本人点。
+  void questions;
+  void input;
+  onRespond({ requestId, behavior: "deny", message: "User continued" });
 }
 
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
