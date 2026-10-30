@@ -27,7 +27,7 @@ function fixture(t){
  const commit=(path,content)=>{writeFileSync(join(repo,path),content);git('commit','-qam','c '+path);return git('rev-parse','HEAD');};
  return{dir,repo,env,git,commit,base:git('rev-parse','HEAD')};
 }
-function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'SCRIPT_DIR='+q(join(root,'scripts')),'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
+function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),`SCRIPT_DIR=${q(join(root,'scripts'))}`,'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
 function ok(o){assert.equal(o.status,0,o.stdout+'\n'+o.stderr);return o.stdout.trim();}
 const key=(f,sha)=>ok(bash(f,webLib,'master_web_dist_key '+q(sha)));
 
