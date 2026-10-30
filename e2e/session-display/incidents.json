@@ -9058,12 +9058,17 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/advisorNoWriteTurn.test.ts",
-          "assertion": "queued"
+          "assertion": "a queued normal submit cannot clear the active restricted turn"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/advisorReadOnlyCcb.test.ts",
           "assertion": "CCB warm transitions rebuild the tool surface and drop external MCP before user input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyBox.test.ts",
+          "assertion": "preserves no-write tools and closes remote MCP discovery"
         },
         {
           "layer": "unit",
@@ -9080,6 +9085,9 @@
           "path": "scripts/check-v5-ccb-mcp-availability.ts",
           "assertion": "proveAdvisorNoWrite(root);"
         }
+      ],
+      "coverageCommits": [
+        "c65f8b61"
       ]
     }
   ]
