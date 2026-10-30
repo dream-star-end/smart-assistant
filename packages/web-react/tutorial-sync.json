@@ -211,14 +211,14 @@
       "sourceHash": "70f631c3eb4827261b9aac7e148cd44ec6495caf17f89c69fee29a9f4911f85a"
     },
     "skills-training": {
-      "contentHash": "2c404a20521857115b0a241219e1b22b8db65a4fa83a7f1425295591089f8976",
-      "contentVersion": 6,
+      "contentHash": "0a3c422f73fc86e03da17112b4bad3ef10d3686408cd74b439533e749a6c7079",
+      "contentVersion": 7,
       "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "c71747f458c6e4284c6a154a5865f4db74e1da3ce71f5d313cc63b8a9862a27e",
       "mediaKey": "skills-training",
       "mediaVersion": 3,
       "registryHash": "8a53ced07b08480a052d6a3cd4e63e74341c8944a071aa1a47f49c8e2aa75772",
-      "sourceHash": "07424e60db49c83e20bbf8260482fdfc716a0298940643ebe8e46abe03c8f28c"
+      "sourceHash": "334c1a992c86306746e02d15b137b5c3bca02026fb9e66b3e0db365b5b9cfebb"
     },
     "taskboard": {
       "contentHash": "759fdef5188979b87ee3a35fb169a266f763c63a9d40e10eca03e0485db8c0c6",
