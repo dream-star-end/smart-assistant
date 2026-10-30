@@ -1265,20 +1265,16 @@ export function App() {
   );
   const liveTerminals = useMemo(() => {
     void chat.version;
-    if (demo) return liveTerminalsRef.current;
+    const prev = liveTerminalsRef.current;
+    if (demo) return prev;
     const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
-    for (const id of now) liveTerminalsRef.current.delete(id);
-    for (const id of sendingIdsRef.current) {
-      if (!now.has(id) && !chat.isSending(id)) {
-        const messages = chat.getSession(id)?.messages;
-        liveTerminalsRef.current.set(id, {
-          ...resolveLiveTurnEndTerminal(messages),
-          endedAt: deriveLiveTerminalEndedAt(messages),
-        });
-      }
-    }
+    let next: typeof prev | undefined;
+    for (const id of now) if (prev.has(id)) (next ??= new Map(prev)).delete(id);
+    for (const id of sendingIdsRef.current)
+      if (!now.has(id) && !chat.isSending(id))
+        (next ??= new Map(prev)).set(id, { ...resolveLiveTurnEndTerminal(chat.getSession(id)?.messages), endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
     sendingIdsRef.current = now;
-    return new Map(liveTerminalsRef.current);
+    return (liveTerminalsRef.current = next ?? prev);
   }, [demo, chat, sessions]);
   useEffect(() => {
     for (const [id, t] of liveTerminals) applySessionTerminal(id, t);
