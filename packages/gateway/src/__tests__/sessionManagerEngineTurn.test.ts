@@ -1,4 +1,4 @@
-import { encodeUpstreamRetryHint } from '@openclaude/protocol';
+import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH } from '@openclaude/protocol';
 import { waitForRetryDelay, _runOneTurn as runOneTurnAttempt, type TurnRunnerHost } from '../sessionTurnRunner.js';
 import { createServer } from 'node:http';
 /**
@@ -15,7 +15,7 @@ import { createServer } from 'node:http';
  * Run: npx tsx --test packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts
  */
 
-import { describe, test } from "node:test";
+import { describe, test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
@@ -79,6 +79,8 @@ class FakeCcbRunner extends EventEmitter {
   startCalls = 0;
   startDelayMs = 0;
   readonly submittedInputs: unknown[] = [];
+  traceId: string | undefined;
+  setTraceId(traceId: string | undefined): void { this.traceId = traceId; }
   consultTurnBinding:
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined;
@@ -208,6 +210,81 @@ function makeSession(
   } as unknown as AgentSession;
 }
 
+// A phase barrier must never hide an earlier submit failure (or leave a server
+// alive after the test runner has already marked an unhandled rejection).
+async function waitForTurnTestStage(
+  stage: Promise<void>, completion: Promise<unknown>, t: TestContext, label: string,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: () => void = () => {};
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 5_000);
+    onAbort = () => reject(t.signal.reason ?? new Error(`test aborted while waiting for ${label}`));
+    if (t.signal.aborted) onAbort();
+    else t.signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    await Promise.race([stage, completion.then(() => {
+      throw new Error(`turn completed before ${label}`);
+    }), deadline]);
+  } finally {
+    clearTimeout(timer);
+    t.signal.removeEventListener('abort', onAbort);
+  }
+}
+
+async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
+  const keys = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN', 'OC_USER_ID'] as const;
+  const previous = keys.map((key) => process.env[key]);
+  let identityReads = 0;
+  let renewalRequests = 0;
+  let protocolError: unknown;
+  const server = createServer(async (req, res) => {
+    try {
+      assert.equal(req.headers.authorization, 'Bearer test-token');
+      if (req.url === '/internal/v3/marketplace/sync') {
+        assert.equal(req.method, 'GET');
+        identityReads++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '1', profiles: [] } }));
+        return;
+      }
+      assert.equal(req.url, TURN_LEASE_RENEW_PATH);
+      assert.equal(req.method, 'POST');
+      for await (const _chunk of req) { /* drain */ }
+      renewalRequests++;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'TURN_LEASE_REVOKED', message: 'private authority detail' } }));
+    } catch (error) {
+      protocolError = error;
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'FIXTURE_PROTOCOL_ERROR' } }));
+    }
+  });
+  let closing: Promise<void> | undefined;
+  const close = () => closing ??= (async () => {
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+  })();
+  t.after(close);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+  process.env.OC_USER_ID = '1';
+  return { close, assertCalls: () => {
+    assert.equal(protocolError, undefined);
+    assert.equal(identityReads, 1, 'submit must cross the normal authenticated identity gate');
+    assert.equal(renewalRequests, 1, 'retry must reach the distinct lease endpoint exactly once');
+  } };
+}
+
 describe('long-task authority interruption keeps paid progress', () => {
   for (const kind of ['text', 'thinking', 'tool', 'empty'] as const) {
     test(`authority expiry after ${kind} preserves progress and only empty proposes waiver`, async () => {
@@ -281,9 +358,9 @@ describe('long-task authority interruption keeps paid progress', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
-  for (const status of [403, 409]) {
+  for (const status of [403, 409] as const) {
     for (const hasProgress of [true, false]) {
-      test(`submit archives ${hasProgress ? 'prior paid progress' : 'zero output'} after retry renewal ${status} and waits for terminal ACK`, { timeout: 10_000 }, async () => {
+      test(`submit archives ${hasProgress ? 'prior paid progress' : 'zero output'} after retry renewal ${status} and waits for terminal ACK`, { timeout: 10_000 }, async (t) => {
         const captured = makeCapturingSink();
         let entered!: () => void;
         const sinkEntered = new Promise<void>((resolve) => { entered = resolve; });
@@ -296,20 +373,30 @@ describe('long-task authority interruption keeps paid progress', () => {
           return { ok: true };
         };
         setV3MasterSinkSingleton(captured.sink);
-        const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
-        const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
-        const server = createServer(async (req, res) => {
-          for await (const _chunk of req) { /* drain */ }
-          res.writeHead(status, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: { code: 'TURN_LEASE_REVOKED', message: 'private authority detail' } }));
-        });
-        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-        process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-        process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+        t.after(() => { setV3MasterSinkSingleton(null); });
+        const master = await makeLeaseMasterFixture(t, status);
+        let submission: Promise<void> | undefined;
+        let session: AgentSession | undefined;
+        let runner: FakeCcbRunner | undefined;
+        const sm = new SessionManager(makeConfigStub());
+        let cleaning: Promise<void> | undefined;
+        const cleanup = () => cleaning ??= (async () => {
+          acknowledge();
+          session?._externalTurnAbort?.abort(new Error('test cleanup'));
+          runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+          try {
+            await session?.runner.shutdown();
+            await submission?.catch(() => {}); // the phase/terminal awaits retain the actual failure
+            await sm.awaitPendingPersistence();
+          } finally {
+            setV3MasterSinkSingleton(null);
+            await master.close();
+          }
+        })();
+        t.after(cleanup);
         try {
-          const sm = new SessionManager(makeConfigStub());
           (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
-          const runner = new FakeCcbRunner((r) => setImmediate(() => {
+          runner = new FakeCcbRunner((r) => setImmediate(() => {
             if (hasProgress) {
               r.text('已完成前半部分');
               r.thinking('此前分析');
@@ -323,21 +410,23 @@ describe('long-task authority interruption keeps paid progress', () => {
               errorClass: 'model_capacity',
             });
           }));
-          const session = makeSession(runner, { channel: 'webchat', userId: 'user-1' });
+          session = makeSession(runner, { channel: 'webchat', userId: '1' });
           const events: SessionStreamEvent[] = [];
           const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
           let finished = false;
-          const submission = sm.submit(session, '完成任务', (event) => events.push(event),
+          submission = sm.submit(session, '完成任务', (event) => events.push(event),
             undefined, undefined, 'req-renewal-revoked', 'trace-renewal-revoked', undefined,
             { modelAuthority: authority }).then(() => { finished = true; });
-          await sinkEntered;
+          await waitForTurnTestStage(sinkEntered, submission, t, 'terminal persistence ACK barrier');
           assert.equal(finished, false, 'submit remains pending until master ACK');
           assert.equal(events.some((event) => event.kind === 'error'), false, 'terminal error waits for master ACK');
           assert.equal(runner.submittedInputs.length, 1, 'revoked retry never resubmits the engine');
+          assert.equal(runner.traceId, 'trace-renewal-revoked');
           acknowledge();
           await submission;
           await sm.awaitPendingPersistence();
           assert.equal(finished, true);
+          master.assertCalls();
           assert.equal(captured.payloads.length, 1, 'all attempts share one terminal tape');
           const payload = captured.payloads[0]!;
           assert.ok(payload.turnIndex > 0);
@@ -357,14 +446,7 @@ describe('long-task authority interruption keeps paid progress', () => {
           assert.equal(events.filter((event) => event.kind === 'error').length, 1);
           assert.doesNotMatch(JSON.stringify(payload), /private authority detail|old-lease|TypeError/);
         } finally {
-          acknowledge();
-          setV3MasterSinkSingleton(null);
-          if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
-          else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-          if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
-          else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
-          server.closeAllConnections();
-          await new Promise<void>((resolve) => server.close(() => resolve()));
+          await cleanup();
         }
       });
     }
@@ -399,7 +481,7 @@ describe('long-task authority interruption keeps paid progress', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
-  test('Stop during retry refresh retains USER_CANCELLED and does not propose waiver', async () => {
+  test('Stop during retry refresh retains USER_CANCELLED and does not propose waiver', { timeout: 10_000 }, async (t) => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
@@ -410,19 +492,40 @@ describe('long-task authority interruption keeps paid progress', () => {
       for await (const _chunk of req) { /* drain */ }
       arrived(); // response intentionally waits for Stop to abort the refresh
     });
+    const controller = new AbortController();
+    let run: Promise<void> | undefined;
+    let runner: FakeCcbRunner | undefined;
+    let session: AgentSession | undefined;
+    let cleaning: Promise<void> | undefined;
+    const cleanup = () => cleaning ??= (async () => {
+      controller.abort(new Error('test cleanup'));
+      runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+      server.closeAllConnections();
+      try {
+        await session?.runner.shutdown();
+        await run?.catch(() => {});
+      } finally {
+        setV3MasterSinkSingleton(null);
+        if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+        else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
+        if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+        else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+        if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    })();
+    t.after(cleanup);
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
     process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
     try {
-      const runner = new FakeCcbRunner(() => { throw new Error('stopped retry must not submit'); });
-      const controller = new AbortController();
-      const session = makeSession(runner, { channel: 'webchat', userId: 'user-1', _externalTurnAbort: controller });
+      runner = new FakeCcbRunner(() => { throw new Error('stopped retry must not submit'); });
+      session = makeSession(runner, { channel: 'webchat', userId: 'user-1', _externalTurnAbort: controller });
       const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
-      const run = runOneTurnAttempt.call(new SessionManager(makeConfigStub()) as unknown as TurnRunnerHost,
+      run = runOneTurnAttempt.call(new SessionManager(makeConfigStub()) as unknown as TurnRunnerHost,
         session, 'continue', () => {}, 'req-refresh-stop', undefined, undefined,
         undefined, undefined, undefined, 'b'.repeat(64), 'u1', authority,
         [], [{ index: 0, text: '已保存回答', ts: Date.now() }], [], [], [], false, true, true, false, 1);
-      await requestArrived;
+      await waitForTurnTestStage(requestArrived, run, t, 'retry refresh request');
       const persisted = session._persistActiveTurn?.('interrupted', '用户已停止', 'USER_CANCELLED');
       controller.abort(new Error('user stopped'));
       await persisted;
@@ -432,13 +535,7 @@ describe('long-task authority interruption keeps paid progress', () => {
       assert.equal(captured.payloads[0]?.waiveReason, undefined);
       assert.equal(captured.payloads[0]?.text, '已保存回答');
     } finally {
-      setV3MasterSinkSingleton(null);
-      if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
-      else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-      if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
-      else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await cleanup();
     }
   });
 });
@@ -1722,7 +1819,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("browser Stop during retry backoff prevents the next continue attempt", async () => {
+  test("browser Stop during retry backoff prevents the next continue attempt", { timeout: 10_000 }, async (t) => {
     const sm = new SessionManager(makeConfigStub());
     (sm as unknown as { _transientRetryDelayMs: () => number })
       ._transientRetryDelayMs = () => 60_000;
@@ -1744,38 +1841,54 @@ describe("crash/interrupt partial persistence", () => {
       session,
     );
     const clientMessageId = "msg-stop-retry";
-    const completion = sm.submit(
-      session,
-      "finish the task",
-      (event) => {
-        if (
-          event.kind === "turn_status" && typeof event.status === "object" &&
-          event.status?.status === "retrying"
-        ) {
-          retryNotice();
-        }
-      },
-      undefined,
-      undefined,
-      "2".repeat(32),
-      undefined,
-      undefined,
-      {
-        replayLifecycle: {
-          clientMessageId,
-          onStart: () => {},
-          onBeforeRelease: () => {},
-          onEnd: () => {},
+    let completion: Promise<void> | undefined;
+    let cleaning: Promise<void> | undefined;
+    const cleanup = () => cleaning ??= (async () => {
+      sm.interruptClientTurn(session.sessionKey, clientMessageId);
+      session._externalTurnAbort?.abort(new Error('test cleanup'));
+      runner.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+      await session.runner.shutdown();
+      await completion?.catch(() => {});
+      await sm.awaitPendingPersistence();
+      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.delete(session.sessionKey);
+    })();
+    t.after(cleanup);
+    try {
+      completion = sm.submit(
+        session,
+        "finish the task",
+        (event) => {
+          if (
+            event.kind === "turn_status" && typeof event.status === "object" &&
+            event.status?.status === "retrying"
+          ) {
+            retryNotice();
+          }
         },
-      },
-    );
+        undefined,
+        undefined,
+        "2".repeat(32),
+        undefined,
+        undefined,
+        {
+          replayLifecycle: {
+            clientMessageId,
+            onStart: () => {},
+            onBeforeRelease: () => {},
+            onEnd: () => {},
+          },
+        },
+      );
 
-    await retrying;
-    assert.equal(sm.interruptClientTurn(session.sessionKey, clientMessageId), true);
-    await assert.rejects(completion, /abort/i);
-    assert.equal(submits, 1);
-    assert.deepEqual(runner.submittedInputs, ["finish the task"]);
-    assert.equal(session._externalTurnAbort, undefined);
+      await waitForTurnTestStage(retrying, completion, t, 'retrying status');
+      assert.equal(sm.interruptClientTurn(session.sessionKey, clientMessageId), true);
+      await assert.rejects(completion, /abort/i);
+      assert.equal(submits, 1);
+      assert.deepEqual(runner.submittedInputs, ["finish the task"]);
+      assert.equal(session._externalTurnAbort, undefined);
+    } finally {
+      await cleanup();
+    }
   });
 
   test("non-retryable engine failures remain one attempt", async () => {
