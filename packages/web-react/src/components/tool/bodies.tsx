@@ -161,8 +161,6 @@ const KV_KEY_LABELS: Record<string, string> = {
   input_tokens: "输入 token",
   output_tokens: "输出 token",
   total_tokens: "总 token",
-  "tokens before": "压缩前 token",
-  "tokens after": "压缩后 token",
 };
 
 function kvKeyLabel(key: string): string {
@@ -1014,20 +1012,6 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
           />
         )}
         <OutputBlock output={output} />
-      </>
-    );
-  }
-  if (type === "contextCompaction") {
-    return (
-      <>
-        <KvList
-          obj={{
-            "tokens before": input?.tokensBefore ?? input?.beforeTokens,
-            "tokens after": input?.tokensAfter ?? input?.afterTokens,
-            note: input?.note || input?.summary,
-          }}
-        />
-        <OutputBlock output={tool.output} />
       </>
     );
   }

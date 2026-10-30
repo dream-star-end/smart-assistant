@@ -32,8 +32,10 @@ import {
   useArtifactInspect,
   useArtifactInspectActive,
 } from "./tool/context";
+import { QuietContextNote } from "./chat/QuietContextNote";
 import {
   type ToolLike,
+  isContextCompactionMessage,
   normalizeToolForDisplay,
 } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
@@ -44,6 +46,17 @@ import { Badge, IconButton, Spinner } from "./ui";
 export type { ToolLike } from "./tool/format";
 
 export function ToolCard({
+  message,
+  tokenUsage,
+}: {
+  message: ToolLike;
+  tokenUsage?: DisplayTokenUsage;
+}) {
+  if (isContextCompactionMessage(message)) return <QuietContextNote message={message} />;
+  return <StandardToolCard message={message} tokenUsage={tokenUsage} />;
+}
+
+function StandardToolCard({
   message,
   tokenUsage,
 }: {

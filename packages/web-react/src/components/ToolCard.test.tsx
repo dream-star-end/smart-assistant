@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test } from "vitest";
 import { MediaSignProvider } from "./chat/media";
 import { ToolCard } from "./ToolCard";
+import { TooltipProvider } from "./ui/Tooltip";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
@@ -864,32 +865,57 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(text).not.toContain("ig_error");
   });
 
-  test("Codex contextCompaction 合并 completed-only 字段", () => {
+  test("Codex contextCompaction 渲染为淡灰单行，悬停说明带中文 token 数", async () => {
     render(
-      <ToolCard
-        message={{
-          toolName: "codex:contextCompaction",
-          inputJson: { type: "contextCompaction", id: "ctx1" },
-          output: JSON.stringify({
-            type: "contextCompaction",
-            id: "ctx1",
-            tokensBefore: 12000,
-            tokensAfter: 7000,
-            note: "已压缩",
-          }),
-          _completed: true,
-        }}
-      />,
+      <TooltipProvider>
+        <ToolCard
+          message={{
+            toolName: "codex:contextCompaction",
+            inputJson: { type: "contextCompaction", id: "ctx1" },
+            output: JSON.stringify({
+              type: "contextCompaction",
+              id: "ctx1",
+              tokensBefore: 12000,
+              tokensAfter: 7000,
+              note: "已压缩",
+            }),
+            _completed: true,
+          }}
+        />
+      </TooltipProvider>,
     );
-    expect(screen.getByText("压缩上下文")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button"));
-    // 键中文化 + 数字千分位(T-27)
-    expect(screen.getByText("压缩前 token")).toBeInTheDocument();
-    expect(screen.getByText("12,000")).toBeInTheDocument();
-    expect(screen.getByText("压缩后 token")).toBeInTheDocument();
-    expect(screen.getByText("7,000")).toBeInTheDocument();
-    expect(screen.getByText("已压缩")).toBeInTheDocument();
+    const note = screen.getByTestId("quiet-context-note");
+    expect(note).toHaveTextContent("已在后台整理较早的对话");
+    expect(screen.queryByText("压缩上下文")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "压缩上下文" })).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("tokens before");
+    expect(document.body.textContent).not.toContain("tokens after");
+    expect(document.body.textContent).not.toContain("已压缩");
+    fireEvent.focus(note);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent(
+      "对话较长，系统已自动整理较早内容，原始记录仍完整保存，不影响继续聊天。",
+    );
+    expect(tip).toHaveTextContent("整理前约 12,000 / 整理后约 7,000");
+  });
+
+  test("Codex contextCompaction 没有前后 token 时悬停只留说明", async () => {
+    render(
+      <TooltipProvider>
+        <ToolCard
+          message={{
+            toolName: "codex:contextCompaction",
+            inputJson: { type: "contextCompaction", id: "ctx2" },
+            _completed: true,
+          }}
+        />
+      </TooltipProvider>,
+    );
+    fireEvent.focus(screen.getByTestId("quiet-context-note"));
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("原始记录仍完整保存，不影响继续聊天。");
+    expect(tip.textContent ?? "").not.toContain("整理前");
+    expect(tip.textContent ?? "").not.toContain("整理后");
   });
 
   test("Codex dynamicToolCall builtin 复用原生 Bash body", () => {
