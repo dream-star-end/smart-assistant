@@ -41,8 +41,10 @@ import type {
   Peer,
   PromptQueueMutationFrame,
   PromptQueueSnapshot,
+  SysRecoveryStatus,
   TurnTokenUsageSnapshot,
 } from "@openclaude/protocol/frames";
+import type { AutomaticRetryStatus, UserError } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 
@@ -145,6 +147,8 @@ export type LegacyBridgeErrorWire = {
   code?: string;
   message?: string;
   traceId?: string;
+  /** 人话错误(#1206);旧服务没有,按 code 查目录。 */
+  userError?: UserError;
 } & WireRuntimeFields;
 
 /** 商业版扣费广播（master→user）。**不进 frameSeq 去重**（§3）。*/
@@ -207,6 +211,10 @@ export type ContextRebuiltWire = {
   peer?: Peer;
   agentId?: string;
   messageCount?: number;
+  clientMessageId?: string;
+  /** 同一段重建只提示一次的去重键(#1206);旧服务没有,退回 frameSeq/ts。 */
+  noticeId?: string;
+  reason?: "engine-switch" | "native-resume-loss";
 } & WireRuntimeFields;
 
 export type GoalSnapshotWire = {
@@ -259,6 +267,9 @@ export type RecoveryDecisionWire = {
   sourceClientMessageId: string;
   errorCode: string;
   ts?: number;
+  /** #1206 起带:人话错误与重试进度(实际 N)。 */
+  userError?: UserError;
+  retryStatus?: AutomaticRetryStatus;
 } & (
   | {
       scheduled: true;
@@ -289,6 +300,8 @@ export type AckWire = {
   idempotencyKey?: string;
   peer?: Peer;
   clientMessageId?: string;
+  /** 自动恢复子轮被受理时的进度(scheduled,实际 N);`recovery.max` 是兼容常量。 */
+  retryStatus?: AutomaticRetryStatus;
   /** Master-scheduled automatic recovery lineage (broadcast to every tab of
    * the uid). The browser does not own `m-recover-*` cmids, so without this it
    * would keep the source terminal card while the retry silently runs. */
@@ -304,6 +317,9 @@ export type AckWire = {
     displayText?: string;
   };
 };
+
+/** master 把恢复子轮交给容器后广播「正在重试」(#1206)。按 rootClientMessageId 归并。 */
+export type RecoveryStatusWire = SysRecoveryStatus;
 
 /** keepalive pong（按 id 匹配，先于一切 session handler 处理）。*/
 export type PongWire = { type: "pong"; id?: number };
@@ -360,6 +376,7 @@ export type OutboundWire =
   | MediaJobWire
   | StudioEventWire
   | RecoveryDecisionWire
+  | RecoveryStatusWire
   | AckWire
   | PongWire
   | RepoStatusWire
