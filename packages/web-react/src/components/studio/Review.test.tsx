@@ -298,6 +298,7 @@ describe('ReviewPage hand over to the agent (OCV5-593 FE-7b)', () => {
     expect(note).toHaveTextContent('agent 理解为：重画首帧，尾巴改白')
     fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
     await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'apply'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '不采用' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: '不采用' }))
     await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'reject'))
   })
