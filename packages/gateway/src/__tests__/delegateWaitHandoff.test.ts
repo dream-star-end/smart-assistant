@@ -19,9 +19,9 @@ import { _armNotifyRetryScheduler } from '../gatewayLifecycle.js'
 
 const PARENT = 'agent:main:webchat:dm:handoff-test'
 
-function fixture() {
+function fixture(sm = false) {
   const calls: Array<Record<string, unknown>> = []
-  const store = new DelegateJobStore({ ttlMs: 60_000, sleep: async () => {} })
+  const store = new DelegateJobStore({ ttlMs: 60_000, sleep: async () => {}, sm })
   const notifier = new DefaultEngineNotifier({
     resumeInject: { inject: async (event) => { calls.push({ event }); return { ok: true } } },
   })
@@ -130,7 +130,7 @@ describe('MCP deadline handoff', () => {
     for (const failed of [false, true]) {
       it(`returns ${failed ? 'failure' : 'success'} on stdout after refusing a deadline handoff with SM ${sm ? 'on' : 'off'}`, async () => {
         process.env.OC_DELEGATE_SM = sm ? '1' : '0'
-        const f = fixture()
+        const f = fixture(sm)
         const id = f.create()
         assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), false)
         f.complete(id, failed)
