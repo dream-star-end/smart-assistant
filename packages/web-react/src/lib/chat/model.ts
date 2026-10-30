@@ -291,6 +291,8 @@ export type ChatMessage = {
   _continuationOfTurnKey?: string;
   // ── user ──
   status?: UserMsgStatus;
+  /** Admission is master queueing; accepted is confirmed container delivery. */
+  _deliveryState?: "admitted" | "accepted";
   /** 用户自己点停止取消的待发消息(OCV5-421):仍可重发,但显示中性「发送已取消」而不是红色「发送失败」。 */
   _sendCancelled?: boolean;
   _media?: MediaRef[];
@@ -799,8 +801,13 @@ export type ChatSession = {
   _lastFinaledAt?: number;
   /** Browser-only actual debit accumulated during the active root turn. */
   _turnCostCredits?: string;
+  _admittedClientMessageId?: string;
   /** Stable request ids already folded into `_turnCostCredits`. */
   _turnCostSeenRequestIds?: Set<string>;
+  /** Session-wide replay fence for cost badges, retained across turn boundaries. */
+  _costChargedSeenRequestIds?: Set<string>;
+  /** Same actual-debit projection as SessionSnapshot.credits. */
+  _turnCredits?: { settled: string; requests: number; asOf: number };
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
