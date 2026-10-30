@@ -510,6 +510,83 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
     assert.deepEqual(s2.rows[0], { status: 'ready', active: video.rows[0]!.id })
   })
 
+  for (const paused of [false, true]) {
+    test(`a frame picked during ${paused ? 'paused composition' : 'composition'} dispatches a new video`, async (t) => {
+      if (skip(t)) return
+      const img = new FakeProvider('img', 'image')
+      const vid = new FakeProvider('vid', 'video')
+      const d = await deps(img, vid)
+      const p = await runningProject(1)
+      const shotId = await shotWithFrame(d, p)
+      await runOne(d) // the original video finishes; its shot is ready
+      const frame = (
+        await query<{ id: string; blob_sha: string }>(
+          `SELECT id::text AS id, blob_sha FROM studio_takes
+            WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND status = 'succeeded'`,
+          [shotId],
+        )
+      ).rows[0]!
+      const imageCalls = img.calls
+      const videoCalls = vid.calls
+      await query(`UPDATE studio_projects SET status = 'composing' WHERE id = $1`, [p.id])
+      const store = new StudioStore(getPool())
+      if (paused) await store.transition(p.userId, p.id, 'pause')
+      const api = makeOrchestratorApi(getPool(), () => {}, d)
+      await api.selectTake(p.userId, frame.id)
+
+      const selected = (
+        await query<{ status: string; resume: string | null }>(
+          `SELECT status, settings->>'resumeTo' AS resume FROM studio_projects WHERE id = $1`,
+          [p.id],
+        )
+      ).rows[0]!
+      assert.deepEqual(selected, {
+        status: paused ? 'paused' : 'running',
+        resume: paused ? 'running' : null,
+      })
+      if (paused) {
+        await advanceProject(d, p.id)
+        const held = await query(
+          `SELECT 1 FROM studio_takes WHERE owner_kind = 'shot_video' AND owner_id = $1 AND status = 'queued'`,
+          [shotId],
+        )
+        assert.equal(held.rowCount, 0, 'the user remains paused until they resume')
+        assert.equal((await store.transition(p.userId, p.id, 'resume')).status, 'running')
+      }
+
+      await advanceProject(d, p.id)
+      await advanceProject(d, p.id)
+      const videos = await query<{ id: string; version: number; status: string }>(
+        `SELECT id::text AS id, version, status FROM studio_takes
+          WHERE owner_kind = 'shot_video' AND owner_id = $1 ORDER BY version`,
+        [shotId],
+      )
+      assert.deepEqual(
+        videos.rows.map(({ version, status }) => ({ version, status })),
+        [{ version: 1, status: 'succeeded' }, { version: 2, status: 'queued' }],
+        'two advances dispatch exactly one new video',
+      )
+      const request = (
+        await query<{ request: MediaRequest }>(
+          `SELECT payload->'request' AS request FROM studio_tasks WHERE payload->>'takeId' = $1`,
+          [videos.rows[1]!.id],
+        )
+      ).rows[0]!.request
+      assert.equal(request.op, 'video.from_image')
+      assert.deepEqual(request.inputs, [{ role: 'first_frame', blobSha: frame.blob_sha }])
+      await runOne(d)
+      const shot = (
+        await query<{ status: string; active: string | null }>(
+          `SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1`,
+          [shotId],
+        )
+      ).rows[0]!
+      assert.deepEqual(shot, { status: 'ready', active: videos.rows[1]!.id })
+      assert.equal(vid.calls, videoCalls + 1)
+      assert.equal(img.calls, imageCalls, 'the selected first frame is reused')
+    })
+  }
+
   test("after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)", async (t) => {
     if (skip(t)) return
     // prod 2026-10-27 c6f0a9f2: Muse (the only video provider) failed one video of a shot; the user
