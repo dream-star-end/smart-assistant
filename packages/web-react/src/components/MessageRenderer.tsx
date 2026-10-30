@@ -876,7 +876,9 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
       for (const id of pending) ids.add(id);
       pending = [];
     }
-    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+    // A retired notice must not take its saved answer into a collapsed process
+    // when the continuation replies. Only the notice was consumed by Continue.
+    if (isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && message.id) pending.push(message.id);
   }
   return ids;
 }
@@ -2187,11 +2189,22 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
+  // A manual continuation retires the notice, never the work stored on its row.
+  // Project a held card for display only: a frozen/raw snapshot remains intact,
+  // and the existing errorPresentation rules still decide whether text is an
+  // answer or a diagnostic. Keeping the row also preserves its exact usage.
+  const continuationViewMessages = safeMessages.map((message): ChatMessage =>
+    message.role === "assistant" && !!message._errorCode &&
+    typeof message._clientMessageId === "string" &&
+    manuallyContinuedSourceIds.has(message._clientMessageId)
+      ? { ...message, _errorHeldForRecovery: true, _errorCardSnapshot: { disposition: "silent" } }
+      : message,
+  );
   // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
   // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
   // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
   const turnLineageParents = turnRecoveryParents(safeMessages);
-  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
+  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(continuationViewMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&

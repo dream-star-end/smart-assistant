@@ -185,7 +185,7 @@ async function longTaskWaiveRequest(userId: bigint, body: Record<string, unknown
   const req = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage
   req.method = 'POST'; req.headers = { authorization: `Bearer oc-v3.7.${secret}` }
   let payload = ''
-  const res = { statusCode: 200, headersSent: false, setHeader() {},
+  const res = { statusCode: 200, headersSent: false, setHeader() { /* This response probe captures only status and JSON. */ },
     end(value: string) { payload += value } } as unknown as ServerResponse
   await handler(req, res, { hostUuid: 'test-host', boundIp: '172.30.0.5' })
   return { status: res.statusCode, body: JSON.parse(payload), broadcasts }
