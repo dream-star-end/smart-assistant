@@ -109,6 +109,7 @@ async function moderateBrief(
   deps: ExecuteDeps,
   task: StudioTask,
   p: NonNullable<Awaited<ReturnType<typeof projectOf>>>,
+  signal: AbortSignal,
 ): Promise<boolean> {
   const requestId = `${task.execRequestId}:mod`
   const stored = await deps.pool.query<{ output: { text?: string } }>(
@@ -126,6 +127,7 @@ async function moderateBrief(
           attempt: Math.max(0, task.attempts - 1),
           prompt: buildModerationPrompt(p.brief),
           billTo: 'platform',
+          signal,
           onResult: async (r) => {
             await deps.pool.query(
               `INSERT INTO studio_step_results(request_id, user_id, task_id, output)
@@ -139,6 +141,7 @@ async function moderateBrief(
       text = null // unavailable: decided below like an unsure verdict
     }
   }
+  signal.throwIfAborted()
   const m = text === null ? { verdict: 'unavailable' as const, reason: '' } : parseModeration(text)
   const outcome = moderationOutcome(m.verdict, deps.qa?.enabled === true)
   if (outcome === 'plan') {
@@ -167,7 +170,8 @@ async function moderateBrief(
   return false
 }
 
-async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
+async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
   const p = await projectOf(deps.pool, task.projectId)
   if (!p) {
     await finishStudioTask(deps.pool, task, { status: 'canceled', error: 'project gone' })
@@ -197,7 +201,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
   }
 
   // A2-1b-1: the brief is moderated before anything is planned or generated (D7).
-  if (!(await moderateBrief(deps, task, p))) return
+  if (!(await moderateBrief(deps, task, p, signal))) return
 
   // A stored answer (an earlier attempt got it, then lost its lease) is reused, never re-asked.
   const stored = await deps.pool.query<{ output: { text?: string } }>(
@@ -208,6 +212,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError('PLANNER_UNAVAILABLE', false, 'planner is not configured')
+    let seq = 0
     const res = await deps.grok({
       userId: BigInt(p.user_id),
       containerId: null,
@@ -215,7 +220,23 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
       attempt: Math.max(0, task.attempts - 1),
       prompt: buildPlanPrompt(input),
       billTo: 'platform',
+      signal,
+      onDelta: async (delta) => {
+        signal.throwIfAborted()
+        await withLease(deps.pool, task, async (c) => {
+          const status = await c.query<{ status: string }>(
+            'SELECT status FROM studio_projects WHERE id = $1 FOR UPDATE', [task.projectId],
+          )
+          signal.throwIfAborted()
+          if (status.rows[0]?.status !== 'planning') throw new LeaseLostError()
+          await appendStudioEvent(c, task.projectId, 'plan.delta', {
+            taskId: task.id, requestId: task.execRequestId, attempt: task.attempts,
+            leaseEpoch: task.epoch, seq: ++seq, delta,
+          })
+        })
+      },
       onResult: async (r) => {
+        signal.throwIfAborted()
         await deps.pool.query(
           `INSERT INTO studio_step_results(request_id, user_id, task_id, output)
            VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (request_id) DO NOTHING`,
@@ -261,6 +282,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask): Promise<void> {
 
   const estimate = estimatePlan(plan, deps.providers, user, p.aspect)
   await withLease(deps.pool, task, async (c) => {
+    signal.throwIfAborted()
     const status = await c.query<{ status: string }>(
       'SELECT status FROM studio_projects WHERE id = $1 FOR UPDATE',
       [task.projectId],
@@ -794,7 +816,7 @@ export async function executeTask(
       throw new MediaProviderError('TOO_MANY_ATTEMPTS', false, `claimed ${task.attempts} times`)
     }
     if (!(await gate(deps, task))) return
-    if (task.kind === 'plan') return await runPlan(deps, task)
+    if (task.kind === 'plan') return await runPlan(deps, task, signal)
     if (task.kind === 'gen') return await runGen(deps, task, signal)
     if (task.kind === 'compose') return await runCompose(deps, task)
     if (task.kind === 'qa') return await runQa(deps, task)

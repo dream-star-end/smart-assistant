@@ -61,6 +61,7 @@ import {
   setSecurityHeaders,
 } from "../http/util.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { readResponses, ResponsesDeltaError, ResponsesStreamError, type ResponsesSource } from "./responsesStream.js";
 
 export { GROK_VISION_PATH };
 export const GROK_VISION_UPSTREAM = "https://cli-chat-proxy.grok.com/v1/responses";
@@ -101,9 +102,8 @@ const VisionRequestSchema = z
 
 type HandlerCtx = { hostUuid: string; boundIp: string };
 
-type UpstreamResponse = {
+type UpstreamResponse = ResponsesSource & {
   statusCode: number;
-  body: { text: () => Promise<string> };
 };
 
 export interface GrokVisionCatalog {
@@ -130,6 +130,7 @@ export interface GrokVisionHandlerDeps {
       dispatcher?: Dispatcher;
       headersTimeout: number;
       bodyTimeout: number;
+      signal?: AbortSignal;
     },
   ) => Promise<UpstreamResponse>;
   recordStatus?: (accountId: bigint, statusCode: number) => Promise<void>;
@@ -356,6 +357,9 @@ export interface GrokRunInput {
    * code — the HTTP route always uses "user".
    */
   billTo?: "user" | "platform";
+  /** Text-only callers may persist incremental previews; callbacks are awaited in stream order. */
+  onDelta?: (delta: string) => Promise<void>;
+  signal?: AbortSignal;
   /** Called after a successful upstream answer and before settlement (studio persists it first). */
   onResult?: (result: { text: string; usage: GrokVisionUsage; model: string; requestId: string }) => Promise<void>;
   /** Rate-limit key; defaults to the container id, or `studio:<userId>` without a container. */
@@ -410,6 +414,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
   const baseLog = (deps.logger ?? rootLogger).child({ subsys: "grokVisionProxy" });
 
   return async function run(input: GrokRunInput): Promise<GrokRunResult> {
+    input.signal?.throwIfAborted();
     const reqLog = input.logger ?? baseLog;
     const { userId, containerId } = input;
     const billTo = input.billTo ?? "user";
@@ -540,28 +545,27 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         throw new GrokRunError(503, "GROK_VISION_NOT_CONFIGURED", "no active grok account");
       }
       accessToken = await freshToken(accountId);
+      input.signal?.throwIfAborted();
+      const streaming = !input.image && !!input.onDelta;
       const upstream = await requestFn(GROK_VISION_UPSTREAM, {
         method: "POST",
         dispatcher: directEgressDispatcher(),
         headersTimeout: UPSTREAM_TIMEOUT_MS,
         bodyTimeout: UPSTREAM_TIMEOUT_MS,
-        headers: grokVisionHeaders(accessToken, canonical),
+        signal: input.signal,
+        headers: { ...grokVisionHeaders(accessToken, canonical), ...(streaming ? { accept: "text/event-stream" } : {}) },
         body: input.image
           ? grokVisionBody({ upstreamModel, mediaType: input.image.mediaType, data: input.image.data, prompt: input.prompt })
-          : grokTextBody({ upstreamModel, prompt: input.prompt }),
+          : grokTextBody({ upstreamModel, prompt: input.prompt, stream: streaming }),
       });
-      const text = await upstream.body.text();
       void recordStatus(accountId, upstream.statusCode).catch(() => {});
       if (upstream.statusCode >= 400) {
+        await upstream.body.text();
         reqLog.warn("grok_vision_upstream_status", { status: upstream.statusCode });
         throw new GrokRunError(502, "GROK_UPSTREAM_ERROR", "grok vision upstream rejected the request");
       }
-      let json: unknown;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned invalid JSON");
-      }
+      const json = await readResponses(upstream, streaming ? input.onDelta : undefined, input.signal);
+      input.signal?.throwIfAborted();
       answer = textFromGrokVisionResponse(json);
       if (!answer) throw new GrokRunError(502, "GROK_BAD_RESPONSE", "grok vision returned no text");
       const metered = usageFromGrokVisionResponse(json);
@@ -569,6 +573,11 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       usage = metered;
     } catch (err) {
       await abandon("grok_vision_upstream_failed");
+      if (err instanceof ResponsesDeltaError) throw err.original;
+      if (input.signal?.aborted) throw err;
+      if (err instanceof ResponsesStreamError) {
+        throw new GrokRunError(502, "GROK_BAD_RESPONSE", err.message);
+      }
       if (err instanceof GrokRunError) {
         reqLog.warn("grok_vision_failed", { code: err.code, status: err.status });
         throw err;
@@ -655,13 +664,14 @@ export async function resettleGrokRun(
 }
 
 /** Text-only Responses body (studio planning / prompt / interpret steps). */
-export function grokTextBody(input: { upstreamModel: string; prompt: string }): string {
+export function grokTextBody(input: { upstreamModel: string; prompt: string; stream?: boolean }): string {
   return JSON.stringify({
     model: input.upstreamModel,
     input: [{ role: "user", content: [{ type: "input_text", text: input.prompt }] }],
     reasoning: { effort: "low" },
     max_output_tokens: MAX_OUTPUT_TOKENS,
     store: false,
+    ...(input.stream ? { stream: true } : {}),
   });
 }
 
