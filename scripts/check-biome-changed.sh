@@ -94,6 +94,9 @@ while IFS=$'\t' read -r n f; do
   fi
   if (( n > b )); then
     echo "✗ $f: $n biome errors (was $b at the merge-base)" >&2
+    # Preserve the strict count gate, and expose the exact rule/location so CI
+    # failures can be fixed without rerunning a whole suite just for diagnostics.
+    "$BIOME" lint --max-diagnostics=20 --files-max-size=8388608 "$f" >&2 || true
     bad=1
   elif (( n > 0 )); then
     echo "  $f: $n pre-existing errors (was $b), none added"

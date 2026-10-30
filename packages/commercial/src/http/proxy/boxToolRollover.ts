@@ -166,7 +166,9 @@ export async function finishToolRollover(pool: Db, input: { uid: bigint; request
   } finally { if (!done) await client.query("ROLLBACK").catch(() => {}); client.release(); }
 }
 
-/** Only server-installed, proof-backed retirement receipts leave the current idle set. */
+/** Only server-installed, proof-backed retirement receipts leave the current idle set.
+ * The receipt fixes the successor; a later proven-stopped orphan recovery may
+ * legitimately replace boxRecoveredBy without undoing physical retirement. */
 export function retiredToolRolloverSql(alias: string): string {
   const c = `${alias}.ctx`;
   return `COALESCE((${c}->>'boxState'='failed_stopped' AND jsonb_typeof(${c}->'boxRolloverRetired')='object'
@@ -175,7 +177,7 @@ export function retiredToolRolloverSql(alias: string): string {
     AND ${c}#>>'{boxRolloverRetired,leaseEpoch}'=${c}->>'boxLeaseEpoch'
     AND ${c}#>>'{boxRolloverRetired,accountId}'=${c}->>'boxAccountId'
     AND EXISTS (SELECT 1 FROM request_finalize_journal retired_leaf
-      JOIN request_finalize_journal successor ON successor.request_id=retired_leaf.ctx->>'boxRecoveredBy'
+      JOIN request_finalize_journal successor ON successor.request_id=retired_leaf.ctx#>>'{boxRolloverTo,requestId}'
         AND successor.user_id=retired_leaf.user_id
       WHERE retired_leaf.user_id=${alias}.user_id
         AND retired_leaf.request_id=${c}#>>'{boxRolloverRetired,ownerRequestId}'

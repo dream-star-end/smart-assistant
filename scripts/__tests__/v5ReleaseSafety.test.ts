@@ -1245,15 +1245,15 @@ function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): P
   })
 }
 
-type ManualPgTransportOptions = { pgTransport: 'os-supervision'; deployDelaySeconds?: 2 }
+type ManualPgTransportOptions = { pgTransport: 'os-supervision'; holdDeploy?: boolean }
 type ManualPgTransportEvent = {
   seq: number; kind: 'entered' | 'completed' | 'rejected'; role: string;
   pid: number; start: string; monotonicNs: number; args: string[]; reason?: string;
 }
 
-// This transport is ONLY for the shortest OS-supervision TTL leaf. It is not
-// evidence of a real PG admission/lock, which has its own unchanged integration gate.
-async function manualOsPgTransport(dir: string, bin: string, deployDelaySeconds = 0) {
+// These OS-supervision leaves cover short-TTL commands and stalled acquisition.
+// They are not real PG admission/lock evidence; that integration gate is unchanged.
+async function manualOsPgTransport(dir: string, bin: string, holdDeploy = false) {
   const identitySql = "SELECT json_build_object('clusterId', system_identifier::text, 'database', current_database(), 'databaseOid', (SELECT oid::text FROM pg_database WHERE datname=current_database()), 'serverAddress', inet_server_addr()::text, 'serverPort', inet_server_port(), 'postmasterEpoch', extract(epoch FROM pg_postmaster_start_time())::text, 'inRecovery', pg_is_in_recovery())::text FROM pg_control_system()"
   const deploySql = `BEGIN; ${identitySql}; SELECT pg_advisory_xact_lock(hashtextextended('openclaude:v5:production-mutation-admission:v1',0)); COMMIT;`
   const dsns = {
@@ -1264,7 +1264,7 @@ async function manualOsPgTransport(dir: string, bin: string, deployDelaySeconds 
   const receipt = path.join(dir, 'os-pg-transport.json')
   const transport = path.join(bin, 'psql')
   const config = path.join(dir, 'os-pg-transport-config.json')
-  await writeFile(config, JSON.stringify({ dsns, identitySql, deploySql, receipt, deployDelaySeconds }), { mode: 0o600 })
+  await writeFile(config, JSON.stringify({ dsns, identitySql, deploySql, receipt, holdDeploy }), { mode: 0o600 })
   await writeFile(receipt, JSON.stringify({ events: [] }), { mode: 0o600 })
   await writeFile(transport, '#!/usr/bin/python3\n' + String.raw`
 import fcntl, json, os, sys, time
@@ -1303,8 +1303,12 @@ def enter(state):
 if not transact(enter):
     print('OS-only PG transport rejected unexpected protocol', file=sys.stderr)
     sys.exit(79)
-if role == 'deploy' and cfg['deployDelaySeconds']:
-    time.sleep(cfg['deployDelaySeconds'])
+if role == 'deploy' and cfg['holdDeploy']:
+    # Never return a successful response on a timer. Only the original lease
+    # deadline/OS supervisor can end this real, PID/start-bound transport.
+    import signal
+    while True:
+        signal.pause()
 identity = dict(clusterId='123456789', database='openclaude_test', databaseOid='16384',
                 serverAddress='127.0.0.1', serverPort=55432, postmasterEpoch='1700000000', inRecovery=False)
 def complete(state):
@@ -1387,7 +1391,7 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
   assert.equal(source.split(lockNeedle).length - 1, 1, 'manual wrapper lock path replacement drifted')
   const envFile = path.join(dir, 'v5.env')
   const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
-  const pgTransport = options ? await manualOsPgTransport(dir, bin, options.deployDelaySeconds) : undefined
+  const pgTransport = options ? await manualOsPgTransport(dir, bin, options.holdDeploy) : undefined
   await writeFile(envFile, [
     `DATABASE_URL=${JSON.stringify(pgTransport?.dsns.gateway ?? fixtureUrl)}`,
     `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.deploy ?? fixtureUrl)}`,
@@ -1409,10 +1413,12 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
     .replace(envNeedle, `V5_ENV="${envFile}"`)
   await writeFile(wrapper, fixtureSource)
   await chmod(wrapper, 0o755)
+  const remoteStderr = path.join(dir, 'remote-stderr.log')
   await writeFile(
     path.join(bin, 'ssh'),
     [
       '#!/bin/bash',
+      'if [[ -n "${FAKE_REMOTE_STDERR:-}" ]]; then exec 2>>"$FAKE_REMOTE_STDERR"; fi',
       'printf "%s\\n" "$$" >>"$FAKE_SSH_PIDS"',
       'while [[ "${1:-}" == "-o" ]]; do',
       '  [[ $# -ge 2 ]] || exit 2',
@@ -1459,6 +1465,7 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
     sshPids,
     remotePids,
     commandPids,
+    remoteStderr,
     pgTransport,
     wrapper,
     command,
@@ -1468,6 +1475,7 @@ async function manualLeaseFixture(options?: ManualPgTransportOptions) {
       KL_HOST: 'fake-manual-lease',
       FAKE_SSH_PIDS: sshPids,
       FAKE_REMOTE_PIDS: remotePids,
+      FAKE_REMOTE_STDERR: remoteStderr,
       COMMAND_PIDS: commandPids,
       COMMAND_STARTED: commandStarted,
       COMMAND_RELEASE: commandRelease,
@@ -3526,32 +3534,62 @@ describe('v5 release safety lanes', () => {
     dirs.push(dir)
     const release = path.join(dir, 'release')
     await mkdir(release)
-    const large = path.join(release, 'a-large.bin')
+    const target = path.join(release, 'a-regular.bin')
     const added = path.join(release, 'z-added-after-snapshot')
-    const truncate = spawnSync('truncate', ['-s', '64M', large], { encoding: 'utf8' })
-    assert.equal(truncate.status, 0, truncate.stderr)
-    const harness = [
+    const receipt = path.join(dir, 'digest-injection.json')
+    const shim = path.join(dir, 'digest-open-shim.py')
+    await writeFile(target, 'stable regular file\n')
+    // Run the actual Python received from release_artifact_digest. Its real
+    // file open is after the first snapshot/root check and before the final
+    // snapshot, so injection needs neither a /proc race nor a large file.
+    await writeFile(shim, String.raw`
+import json, os, sys
+from pathlib import Path
+source = sys.stdin.read()
+sys.argv = sys.argv[1:]
+real_open = os.open
+target = os.fsencode(${JSON.stringify(target)})
+added = Path(${JSON.stringify(added)})
+receipt = Path(${JSON.stringify(receipt)})
+def inject_on_open(filename, *args, **kwargs):
+    fd = real_open(filename, *args, **kwargs)
+    if os.fsencode(filename) == target:
+        if receipt.exists():
+            raise RuntimeError("fixture injected twice")
+        added.write_text("injected-after-initial-snapshot\n")
+        receipt.write_text(json.dumps(dict(opened=os.fsdecode(filename), added=str(added), count=1)))
+    return fd
+os.open = inject_on_open
+exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__="__main__"))
+`)
+    const prefix = [
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
-      'python3() {',
-      '  command /usr/bin/python3 "$@" <&0 & local child=$!',
-      '  (',
-      '    while kill -0 "$child" 2>/dev/null; do',
-      `      for fd in /proc/$child/fd/*; do [[ "$(readlink -f "$fd" 2>/dev/null || true)" == '${large}' ]] && { printf x > '${added}'; exit 0; }; done`,
-      '    done',
-      '  ) & local mutator=$!',
-      '  local rc=0; wait "$child" || rc=$?; wait "$mutator" || true; return "$rc"',
-      '}',
+    ]
+    const invoke = (inject: boolean) => spawnSync('bash', ['-c', [
+      ...prefix,
+      ...(inject ? [`python3() { command /usr/bin/python3 '${shim}' "$@"; }`] : []),
       `release_artifact_digest '${release}'`,
-    ].join('\n')
-    const result = spawnSync('bash', ['-c', harness], {
+    ].join('\n')], {
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,
       env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
     })
-    assert.notEqual(result.status, 0)
+    const stable = invoke(false)
+    assert.equal(stable.status, 0, stable.stderr)
+    assert.match(stable.stdout.trim(), /^[a-f0-9]{64}$/)
+    assert.equal(existsSync(receipt), false)
+    assert.equal(existsSync(added), false)
+    const result = invoke(true)
+    const injection = await readFile(receipt, 'utf8').catch(() => '')
+    assert.ok(injection, `injection missing; status=${result.status}; signal=${result.signal}; stderr=${result.stderr}`)
+    assert.deepEqual(JSON.parse(injection), { opened: target, added, count: 1 })
+    assert.equal(await readFile(added, 'utf8'), 'injected-after-initial-snapshot\n')
+    assert.equal(result.error, undefined, result.stderr)
+    assert.equal(result.signal, null, result.stderr)
+    assert.notEqual(result.status, 0, result.stderr)
     assert.match(result.stderr, /release tree changed during digest/)
   })
 
@@ -8268,32 +8306,73 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     }
   })
 
-  test('OS-only PG transport rejects invalid protocol and slow admission expires before command start', async () => {
-    const slowFx = await manualLeaseFixture({ pgTransport: 'os-supervision', deployDelaySeconds: 2 })
+  test('OS-only PG stalled admission expires under its original TTL before command start', async () => {
+    const slowFx = await manualLeaseFixture({ pgTransport: 'os-supervision', holdDeploy: true })
+    // This independent slow-acquisition fixture needs enough initial time to
+    // enter a real transport under CI load. The separate 2s OS command boundary
+    // is unchanged. Never restart or extend either clock after entered.
+    const ttlSeconds = 12
+    const startedAt = Date.now()
     const slowChild = spawn('bash', [slowFx.wrapper, slowFx.command], {
-      env: { ...slowFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
-      stdio: 'ignore',
+      env: { ...slowFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: String(ttlSeconds) },
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
+    let stdout = ''
+    let stderr = ''
+    let spawnError = ''
+    slowChild.stdout?.on('data', (chunk) => { stdout = (stdout + String(chunk)).slice(-32_768) })
+    slowChild.stderr?.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-32_768) })
+    slowChild.on('error', (error) => { spawnError = error.message })
+    const diagnostic = async (reason: string) => `${reason}; ${JSON.stringify({
+      ttlSeconds, elapsedMs: Date.now() - startedAt, exitCode: slowChild.exitCode,
+      signal: slowChild.signalCode, spawnError, stdout, stderr,
+      remoteStderr: (await readFile(slowFx.remoteStderr, 'utf8').catch(() => '')).slice(-32_768),
+      transportEvents: await manualPgTransportEvents(slowFx),
+    })}`
     let owned: ManualProcessIdentity[] = []
     try {
       assert.equal(await waitUntilManualLease(async () =>
-        (await manualPgTransportEvents(slowFx)).some((e) => e.role === 'deploy' && e.kind === 'entered'), 5_000), true,
-      'slow case never reached the actual transport')
+        (await manualPgTransportEvents(slowFx)).some((e) => e.role === 'deploy' && e.kind === 'entered'), 10_000), true,
+        await diagnostic('slow case never reached the actual transport'))
       const entry = (await manualPgTransportEvents(slowFx)).find((e) => e.role === 'deploy' && e.kind === 'entered')!
-      assert.equal((await manualProcessIdentity(entry.pid))?.start, entry.start, 'slow transport is not a live PID/start-bound process')
+      assert.equal((await manualProcessIdentity(entry.pid))?.start, entry.start,
+        await diagnostic('slow transport is not a live PID/start-bound process'))
       owned = await manualOwnedProcessSnapshot(slowFx, slowChild.pid!)
-      assert.equal(owned.some((p) => p.pid === entry.pid && p.start === entry.start), true, 'transport missing from owned subtree')
-      assert.equal(owned.some((p) => p.pid === slowChild.pid), true, 'wrapper missing from owned subtree')
-      assert.equal(await waitForChildExit(slowChild, 8_000), true, 'slow acquisition did not terminate under original hard TTL')
-      assert.equal(slowChild.exitCode, 86, `slow acquisition must fail closed; signal=${slowChild.signalCode}`)
-      assert.equal(existsSync(slowFx.commandStarted), false, 'expired acquisition started a command')
-      assert.deepEqual((await manualPgTransportEvents(slowFx)).map((e) => [e.role, e.kind]), [['deploy', 'entered']], 'slow deploy must not flush an accepted response or admit reads')
+      assert.equal(owned.some((p) => p.pid === entry.pid && p.start === entry.start), true,
+        await diagnostic('transport missing from owned subtree'))
+      assert.equal(owned.some((p) => p.pid === slowChild.pid), true,
+        await diagnostic('wrapper missing from owned subtree'))
+      const transportStat = await readFile(`/proc/${entry.pid}/stat`, 'utf8')
+      const transportFields = transportStat.slice(transportStat.lastIndexOf(') ') + 2).trim().split(/\s+/)
+      const transportPgid = Number(transportFields[2])
+      assert.equal(transportFields[19], entry.start, await diagnostic('transport identity changed while reading PGID'))
+      assert.equal(Number.isSafeInteger(transportPgid) && transportPgid > 1
+        && owned.some((p) => p.pid === transportPgid), true,
+        await diagnostic('transport PGID is not bound to the owned subtree'))
+      assert.equal(await waitForChildExit(slowChild, 12_000), true,
+        await diagnostic('slow acquisition did not terminate under original hard TTL'))
+      assert.equal(slowChild.exitCode, 86, await diagnostic('slow acquisition must fail closed'))
+      assert.equal(slowChild.signalCode, null, await diagnostic('wrapper was killed instead of exiting on its original TTL'))
+      assert.match(stderr, /production-mutation lease 本地安全 TTL 在取锁期间已到/,
+        await diagnostic('missing original acquisition-TTL refusal reason'))
+      assert.equal(existsSync(slowFx.commandStarted), false,
+        await diagnostic('expired acquisition started a command'))
+      assert.deepEqual((await manualPgTransportEvents(slowFx)).map((e) => [e.role, e.kind]), [['deploy', 'entered']],
+        await diagnostic('stalled deploy flushed an accepted response or admitted reads'))
       assert.equal(await waitUntilManualLease(async () => {
         for (const process of owned) if ((await manualProcessIdentity(process.pid))?.start === process.start) return false
         return true
-      }, 6_000), true, 'expired acquisition left PID/start-bound transport descendants alive')
+      }, 6_000), true, await diagnostic('expired acquisition left PID/start-bound transport descendants alive'))
+      assert.equal(await waitUntilManualLease(() => {
+        try {
+          process.kill(-transportPgid, 0)
+          return false
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code === 'ESRCH'
+        }
+      }, 6_000), true, await diagnostic('expired acquisition left the owned transport PGID alive'))
       assert.equal(await waitUntilManualLease(() => spawnSync('flock', ['-n', slowFx.lock, 'true']).status === 0, 6_000), true,
-      'expired acquisition left remote flock held')
+        await diagnostic('expired acquisition left remote flock held'))
     } finally {
       slowChild.kill('SIGKILL')
       for (const process of owned) {
@@ -8303,7 +8382,9 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       }
       await killManualLeaseFixtureProcesses(slowFx.sshPids, slowFx.remotePids)
     }
+  })
 
+  test('OS-only PG transport rejects invalid protocol', async () => {
     for (const invalid of ['unknown-sql', 'wrong-role-sql', 'duplicate-role', 'early-read', 'unknown-dsn', 'invalid-argv'] as const) {
       const fx = await manualLeaseFixture({ pgTransport: 'os-supervision' })
       const pg = fx.pgTransport!

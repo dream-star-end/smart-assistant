@@ -367,5 +367,35 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
     assert.deepEqual(totals.rows[0],{ usage: 260,ledger: 260,journal: 260 });
     const idle = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
     assert.equal(idle.status,"terminal",JSON.stringify(idle));
+    // A later recovery may replace a stopped holder. Its mutable alias must
+    // not revoke the immutable receipt of an already retired physical run.
+    const oldLeafId = "roll-request-127";
+    const successorId = "roll-request-128";
+    const oldLeaf = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.ctx;
+    const successor = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[successorId])).rows[0]!.ctx;
+    const recoveredLeaf = { ...oldLeaf,boxRecoveredBy: "roll-later-recovery" };
+    await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[oldLeafId,JSON.stringify(recoveredLeaf)]);
+    assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"terminal",
+      "a mutable recovery alias cannot reintroduce 128 retired paid rows into idle");
+    assert.deepEqual((await query("SELECT ctx->'boxRolloverRetired' receipt FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.receipt,
+      oldLeaf.boxRolloverRetired,"the completed retirement receipt is never rewritten");
+    const invalidProofs = [
+      { id: successorId,ctx: { ...successor,boxRolloverFrom: undefined } },
+      { id: successorId,ctx: { ...successor,boxRolloverReady: "00000000-0000-4000-8000-000000000000" } },
+      { id: oldLeafId,ctx: { ...recoveredLeaf,boxTerminalProof: undefined } },
+      { id: oldLeafId,ctx: { ...recoveredLeaf,boxTerminalProof: { ...oldLeaf.boxTerminalProof,reason: "worker_complete" } } },
+    ];
+    for (const invalid of invalidProofs) {
+      await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[invalid.id,JSON.stringify(invalid.ctx)]);
+      assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending",
+        "the fixed successor still requires the original From, ready revision and physical stop proof");
+      await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",
+        [invalid.id,JSON.stringify(invalid.id === oldLeafId ? recoveredLeaf : successor)]);
+    }
+    const unchangedTotals = await query(`SELECT (SELECT sum(credits)::int FROM usage_records) usage,
+      (SELECT -sum(delta)::int FROM credit_ledger) ledger,
+      (SELECT sum(final_credits)::int FROM request_finalize_journal) journal`);
+    assert.deepEqual(unchangedTotals.rows[0],totals.rows[0],"recovery aliases do not change any settled amount");
+    assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"terminal");
   } finally { client.release(); await pool.end(); }
 });
