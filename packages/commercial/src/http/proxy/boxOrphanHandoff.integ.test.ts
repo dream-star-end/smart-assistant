@@ -2,10 +2,155 @@
 // dispatch's tool results were meant for.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal } from "./boxDurableJournal.js";
 
 const url = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL ?? process.env.TEST_DATABASE_URL;
+
+async function stoppedRecoveryFixture() {
+  const schema = `box_stale_recovery_${randomBytes(8).toString("hex")}`;
+  const admin = new Pool({ connectionString: url, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ connectionString: url, max: 4,
+    options: `-c search_path=${schema}` });
+  const q = (sql: string, params: unknown[] = []) => pool.query(sql, params);
+  await q(`CREATE TABLE request_finalize_journal (request_id text PRIMARY KEY,
+    user_id bigint NOT NULL, state text NOT NULL, ctx jsonb NOT NULL,
+    updated_at timestamptz DEFAULT now())`);
+  await q(`CREATE TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
+    user_id bigint NOT NULL, status text NOT NULL)`);
+  const dispatchId = "11111111-1111-4111-8111-111111111111";
+  await q(`INSERT INTO turn_dispatches VALUES ($1,3,'terminal')`, [dispatchId]);
+  const parent = { model: "box-api-claude-opus-5-5", boxSessionId: "sess-stale",
+    boxTurnKey: "aa".repeat(32), boxState: "failed_stopped", boxAccountId: "20",
+    boxRunNonce: "a".repeat(24), boxLeaseEpoch: "b".repeat(32), boxRecoveredBy: "box-holder",
+    boxNativeSessionId: "97e7cf80-82f8-42f5-8024-8ce817427990",
+    boxBillingContext: { v: 1, sessionId: "web", mode: "chat", parentSessionId: null,
+      delegateAgentId: null, turnKey: "aa".repeat(32), parentTurnKey: null, authority: null,
+      dispatchId, attemptNo: 1, verificationSponsorship: null, apiKeyId: null },
+    boxToolHandoff: { version: 1, roundNo: 1, messageId: "msg_1", catalogHash: "c".repeat(64),
+      detachedRunnerHash: "d".repeat(64), spoolOffset: 10, assistantContentHash: "1".repeat(64),
+      assistantEchoHash: "2".repeat(64), assistantNoCallerHash: "3".repeat(64),
+      verifiedPendingToolUseIds: ["toolu_S"],
+      usage: { inputTokens: 2, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      toolUses: [{ id: "toolu_S", boxName: "mcp__ocbridge__Skill", clientName: "Skill",
+        inputHash: "e".repeat(64) }] } };
+  const holder = { model: parent.model, boxSessionId: parent.boxSessionId,
+    boxTurnKey: "bb".repeat(32), boxState: "failed_stopped", boxStopOutcome: "failed",
+    boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool", boxAccountId: "20",
+    boxRunNonce: "c".repeat(24), boxLeaseEpoch: "d".repeat(32),
+    boxNativeSessionId: "1c920e55-5463-4b73-adf8-302f64e7a925",
+    boxCancelIntent: { v: 1, reason: "user_cancel", requestId: "box-holder", atMs: 1 },
+    boxBillingContext: { ...parent.boxBillingContext, turnKey: "bb".repeat(32) },
+    boxTerminalProof: { runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+      keeperPid: 100, cliPid: 101, reason: "worker_failed", revision: 2, workerExitCode: 143 } };
+  await q(`INSERT INTO request_finalize_journal VALUES
+    ('box-parent',3,'committed',$1),('box-holder',3,'aborted',$2)`,
+    [JSON.stringify(parent), JSON.stringify(holder)]);
+  const journal = new BoxDurableJournal(pool);
+  const find = () => journal.findOrphanToolHandoff({ uid: 3n, sessionId: "sess-stale",
+    turnKey: "ff".repeat(32), toolIds: ["toolu_S"] });
+  return { pool, q, journal, find, parent, holder, dispatchId,
+    close: async () => { await pool.end();
+      try { await admin.query(`DROP SCHEMA ${schema} CASCADE`); } finally { await admin.end(); } } };
+}
+
+test("stopped admitted recovery holder is reclaimable after terminal failure",
+  { skip: !url }, async () => {
+  const f = await stoppedRecoveryFixture();
+  try {
+    const found = await f.find();
+    assert.equal(found.kind === "orphan" && found.staleClaim, "box-holder");
+    assert.equal(await f.journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n,
+      by: "box-next", replacing: "box-holder" }), true);
+    assert.equal(await f.journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n,
+      by: "box-other", replacing: "box-holder" }), false);
+    const row = await f.q(`SELECT ctx->>'boxRecoveredBy' AS holder
+      FROM request_finalize_journal WHERE request_id='box-parent'`);
+    assert.equal(row.rows[0].holder, "box-next");
+    // A second recovery can itself fail before any delivered handoff; the
+    // original exchange must remain recoverable through another replacement.
+    await f.q(`INSERT INTO request_finalize_journal VALUES ('box-next',3,'aborted',$1)`,
+      [JSON.stringify({ ...f.holder, boxRunNonce: "e".repeat(24), boxLeaseEpoch: "f".repeat(32),
+        boxTerminalProof: { runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32),
+          keeperPid: 200, cliPid: 201, reason: "keeper_stopped", revision: 1 } })]);
+    const next = await f.find();
+    assert.equal(next.kind === "orphan" && next.staleClaim, "box-next");
+    assert.equal(await f.journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n,
+      by: "box-third", replacing: "box-next" }), true);
+  } finally { await f.close(); }
+});
+
+test("admitted recovery holders require bound failure proof and no successor",
+  { skip: !url }, async () => {
+  const f = await stoppedRecoveryFixture();
+  try {
+    const invalid = [
+      { state: "inflight" }, { state: "finalizing" }, { state: "committed" },
+      { boxState: "unknown" }, { boxState: "handoff" }, { boxStopOutcome: "rejected_stream" },
+      { boxInvocationRecovery: "v0" }, { boxInvocationMode: "text" },
+      { model: "box-api-claude-sonnet-5-5" }, { boxSessionId: "other" },
+      { boxTerminalProof: null }, { boxTerminalProof: { ...f.holder.boxTerminalProof, revision: 1 } },
+      { boxTerminalProof: { ...f.holder.boxTerminalProof, runNonce: "f".repeat(24) } },
+      { boxTerminalProof: { ...f.holder.boxTerminalProof, leaseEpoch: "f".repeat(32) } },
+      { boxTerminalProof: { runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+        keeperPid: 100, cliPid: 101, reason: "worker_complete", revision: 1 } },
+      { boxToolHandoff: {} }, { boxReplayMessage: {} }, { boxOwnerRequestId: "other" },
+      { boxResumeRequestId: "other" }, { boxRecoveredBy: "other" }, { boxBillingContext: {} },
+    ];
+    for (const change of invalid) {
+      const { state = "aborted", ...ctx } = change as Record<string, unknown>;
+      await f.q(`UPDATE request_finalize_journal SET state=$1,ctx=$2 WHERE request_id='box-holder'`,
+        [state, JSON.stringify({ ...f.holder, ...ctx })]);
+      assert.equal((await f.find()).kind, "claimed", JSON.stringify(change));
+    }
+    await f.q(`UPDATE request_finalize_journal SET state='aborted',ctx=$1 WHERE request_id='box-holder'`,
+      [JSON.stringify(f.holder)]);
+    await f.q(`UPDATE turn_dispatches SET status='running'`);
+    assert.equal((await f.find()).kind, "claimed", "holder dispatch is live");
+    await f.q(`DELETE FROM turn_dispatches`);
+    assert.equal((await f.find()).kind, "claimed", "missing dispatch is unknown");
+  } finally { await f.close(); }
+});
+
+test("stale recovery replacement rechecks the holder after lookup",
+  { skip: !url }, async () => {
+  const f = await stoppedRecoveryFixture();
+  try {
+    for (const change of [{ state: "committed" }, { boxToolHandoff: {} }, { boxResumeRequestId: "next" }]) {
+      await f.q(`UPDATE request_finalize_journal SET state='aborted',ctx=$1 WHERE request_id='box-holder'`,
+        [JSON.stringify(f.holder)]);
+      assert.equal((await f.find()).kind, "orphan");
+      const { state = "aborted", ...ctx } = change as Record<string, unknown>;
+      await f.q(`UPDATE request_finalize_journal SET state=$1,ctx=$2 WHERE request_id='box-holder'`,
+        [state, JSON.stringify({ ...f.holder, ...ctx })]);
+      assert.equal(await f.journal.claimOrphanRecovery({ requestId: "box-parent", uid: 3n,
+        by: "box-next", replacing: "box-holder" }), false, JSON.stringify(change));
+    }
+  } finally { await f.close(); }
+});
+
+test("two recoveries replace a stopped holder with one PostgreSQL CAS winner",
+  { skip: !url }, async () => {
+  const f = await stoppedRecoveryFixture();
+  const clients = await Promise.all([f.pool.connect(), f.pool.connect()]);
+  try {
+    const pids = await Promise.all(clients.map((client) => client.query(`SELECT pg_backend_pid() AS pid`)));
+    assert.notEqual(pids[0].rows[0].pid, pids[1].rows[0].pid, "independent PostgreSQL sessions");
+    const journals = clients.map((client) => {
+      const query = client.query.bind(client);
+      return new BoxDurableJournal({ query, connect: async () => ({ query, release: () => {} }) } as never);
+    });
+    const claims = await Promise.all(journals.map((journal, i) => journal.claimOrphanRecovery({
+      requestId: "box-parent", uid: 3n, by: `box-contender-${i}`, replacing: "box-holder" })));
+    assert.equal(claims.filter(Boolean).length, 1);
+    const row = await f.q(`SELECT ctx->>'boxRecoveredBy' AS holder
+      FROM request_finalize_journal WHERE request_id='box-parent'`);
+    assert.equal(row.rows[0].holder, `box-contender-${claims.indexOf(true)}`);
+  } finally { clients.forEach((client) => client.release()); await f.close(); }
+});
+
 test("orphan handoff lookup requires same tool ids, another turn and a terminal dispatch",
   { skip: !url }, async () => {
   const pool = new Pool({ connectionString: url, max: 1 });
