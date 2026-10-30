@@ -3351,32 +3351,62 @@ describe('v5 release safety lanes', () => {
     dirs.push(dir)
     const release = path.join(dir, 'release')
     await mkdir(release)
-    const large = path.join(release, 'a-large.bin')
+    const target = path.join(release, 'a-regular.bin')
     const added = path.join(release, 'z-added-after-snapshot')
-    const truncate = spawnSync('truncate', ['-s', '64M', large], { encoding: 'utf8' })
-    assert.equal(truncate.status, 0, truncate.stderr)
-    const harness = [
+    const receipt = path.join(dir, 'digest-injection.json')
+    const shim = path.join(dir, 'digest-open-shim.py')
+    await writeFile(target, 'stable regular file\n')
+    // Run the actual Python received from release_artifact_digest. Its real
+    // file open is after the first snapshot/root check and before the final
+    // snapshot, so injection needs neither a /proc race nor a large file.
+    await writeFile(shim, String.raw`
+import json, os, sys
+from pathlib import Path
+source = sys.stdin.read()
+sys.argv = sys.argv[1:]
+real_open = os.open
+target = os.fsencode(${JSON.stringify(target)})
+added = Path(${JSON.stringify(added)})
+receipt = Path(${JSON.stringify(receipt)})
+def inject_on_open(filename, *args, **kwargs):
+    fd = real_open(filename, *args, **kwargs)
+    if os.fsencode(filename) == target:
+        if receipt.exists():
+            raise RuntimeError("fixture injected twice")
+        added.write_text("injected-after-initial-snapshot\n")
+        receipt.write_text(json.dumps(dict(opened=os.fsdecode(filename), added=str(added), count=1)))
+    return fd
+os.open = inject_on_open
+exec(compile(source, "<actual-release-artifact-digest>", "exec"), dict(__name__="__main__"))
+`)
+    const prefix = [
       'set -euo pipefail',
       'export V5_DEPLOY_SOURCE_ONLY=1',
       `source '${deploy}'`,
-      'python3() {',
-      '  command /usr/bin/python3 "$@" <&0 & local child=$!',
-      '  (',
-      '    while kill -0 "$child" 2>/dev/null; do',
-      `      for fd in /proc/$child/fd/*; do [[ "$(readlink -f "$fd" 2>/dev/null || true)" == '${large}' ]] && { printf x > '${added}'; exit 0; }; done`,
-      '    done',
-      '  ) & local mutator=$!',
-      '  local rc=0; wait "$child" || rc=$?; wait "$mutator" || true; return "$rc"',
-      '}',
+    ]
+    const invoke = (inject: boolean) => spawnSync('bash', ['-c', [
+      ...prefix,
+      ...(inject ? [`python3() { command /usr/bin/python3 '${shim}' "$@"; }`] : []),
       `release_artifact_digest '${release}'`,
-    ].join('\n')
-    const result = spawnSync('bash', ['-c', harness], {
+    ].join('\n')], {
       cwd: root,
       encoding: 'utf8',
       timeout: 30_000,
       env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
     })
-    assert.notEqual(result.status, 0)
+    const stable = invoke(false)
+    assert.equal(stable.status, 0, stable.stderr)
+    assert.match(stable.stdout.trim(), /^[a-f0-9]{64}$/)
+    assert.equal(existsSync(receipt), false)
+    assert.equal(existsSync(added), false)
+    const result = invoke(true)
+    const injection = await readFile(receipt, 'utf8').catch(() => '')
+    assert.ok(injection, `injection missing; status=${result.status}; signal=${result.signal}; stderr=${result.stderr}`)
+    assert.deepEqual(JSON.parse(injection), { opened: target, added, count: 1 })
+    assert.equal(await readFile(added, 'utf8'), 'injected-after-initial-snapshot\n')
+    assert.equal(result.error, undefined, result.stderr)
+    assert.equal(result.signal, null, result.stderr)
+    assert.notEqual(result.status, 0, result.stderr)
     assert.match(result.stderr, /release tree changed during digest/)
   })
 

@@ -140,7 +140,7 @@ async function longTaskTape(userId: bigint, key: string, options: {
       const result = await backend.finalizeLosslessTurnTape(userKey, finalize)
       if (options.engineBilling) {
         const stored = (await query<{ engine_billings: unknown }>(
-          `SELECT engine_billings FROM client_session_turn_tapes WHERE session_id=$1 AND tape_id=$2`,
+          'SELECT engine_billings FROM client_session_turn_tapes WHERE session_id=$1 AND tape_id=$2',
           [sessionId, digest])).rows[0]!
         assert.deepEqual(stored.engine_billings, [{ ...options.engineBilling, turnKey: key }])
       }

@@ -326,6 +326,44 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             probeArm = true;
           }
           await launch(requestId);
+          if (index === 128) {
+            // PR1274 may replace a proven-stopped recovery holder. Exercise its
+            // real lookup/CAS after the rollover successor's first round fails.
+            const originalChild = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
+            const oldLeafId = claim.ownerRequestId;
+            const originalLeaf = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.ctx;
+            const settled = await query("SELECT sum(final_credits)::text credits FROM request_finalize_journal");
+            await journal.markFirstRoundStoppedFailure({ requestId,uid: 3n,leaseEpoch: epoch,
+              proof: { runNonce: nonce,leaseEpoch: epoch,keeperPid: 101,cliPid: 102,
+                reason: "worker_failed",revision: 2,workerExitCode: 143 } });
+            await query("UPDATE turn_dispatches SET status='terminal' WHERE dispatch_id=$1",[dispatchId]);
+            const failedChild = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
+            const find = () => journal.findOrphanToolHandoff({ uid: 3n,sessionId: session,
+              turnKey: "b".repeat(64),toolIds: ["toolu_roll_127"] });
+            await query("UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxState}','\"unknown\"'::jsonb) WHERE request_id=$1",[requestId]);
+            assert.equal((await find()).kind,"claimed","an unknown successor never permits another paid invocation");
+            assert.equal(await journal.claimOrphanRecovery({ requestId: oldLeafId,uid: 3n,
+              by: "roll-stale-recovered",replacing: requestId }),false);
+            await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[requestId,JSON.stringify(failedChild)]);
+            const found = await find();
+            assert.equal(found.kind === "orphan" && found.staleClaim,requestId);
+            assert.equal(await journal.claimOrphanRecovery({ requestId: oldLeafId,uid: 3n,
+              by: "roll-stale-recovered",replacing: requestId }),true);
+            assert.equal(await journal.claimOrphanRecovery({ requestId: oldLeafId,uid: 3n,
+              by: "roll-stale-duplicate",replacing: requestId }),false);
+            const closed = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
+            assert.equal(closed.status,"failed","replacing the holder must not resurrect the retired 128-row generation");
+            if (closed.status === "failed") assert.deepEqual(closed.requestIds,[requestId]);
+            const recoveredLeaf = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.ctx;
+            assert.deepEqual(recoveredLeaf,{ ...originalLeaf,boxRecoveredBy: "roll-stale-recovered" });
+            assert.deepEqual((await query("SELECT sum(final_credits)::text credits FROM request_finalize_journal")).rows,settled.rows);
+            await admitNextUserAfterStop("roll-stale-recovered");
+            // Restore this synthetic failure branch so the original 260-call
+            // scenario can still prove all three successful generations.
+            await resetGap(requestId,originalChild);
+            await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[oldLeafId,JSON.stringify(originalLeaf)]);
+            await query("UPDATE turn_dispatches SET status='accepted' WHERE dispatch_id=$1",[dispatchId]);
+          }
         } else {
           assert.equal(decision.kind,"new_claim");
           if (decision.kind !== "new_claim") throw new Error("missing resume claim");
@@ -367,5 +405,35 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
     assert.deepEqual(totals.rows[0],{ usage: 260,ledger: 260,journal: 260 });
     const idle = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
     assert.equal(idle.status,"terminal",JSON.stringify(idle));
+    // A later recovery may replace a stopped holder. Its mutable alias must
+    // not revoke the immutable receipt of an already retired physical run.
+    const oldLeafId = "roll-request-127";
+    const successorId = "roll-request-128";
+    const oldLeaf = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.ctx;
+    const successor = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[successorId])).rows[0]!.ctx;
+    const recoveredLeaf = { ...oldLeaf,boxRecoveredBy: "roll-later-recovery" };
+    await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[oldLeafId,JSON.stringify(recoveredLeaf)]);
+    assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"terminal",
+      "a mutable recovery alias cannot reintroduce 128 retired paid rows into idle");
+    assert.deepEqual((await query("SELECT ctx->'boxRolloverRetired' receipt FROM request_finalize_journal WHERE request_id=$1",[oldLeafId])).rows[0]!.receipt,
+      oldLeaf.boxRolloverRetired,"the completed retirement receipt is never rewritten");
+    const invalidProofs = [
+      { id: successorId,ctx: { ...successor,boxRolloverFrom: undefined } },
+      { id: successorId,ctx: { ...successor,boxRolloverReady: "00000000-0000-4000-8000-000000000000" } },
+      { id: oldLeafId,ctx: { ...recoveredLeaf,boxTerminalProof: undefined } },
+      { id: oldLeafId,ctx: { ...recoveredLeaf,boxTerminalProof: { ...oldLeaf.boxTerminalProof,reason: "worker_complete" } } },
+    ];
+    for (const invalid of invalidProofs) {
+      await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[invalid.id,JSON.stringify(invalid.ctx)]);
+      assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending",
+        "the fixed successor still requires the original From, ready revision and physical stop proof");
+      await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",
+        [invalid.id,JSON.stringify(invalid.id === oldLeafId ? recoveredLeaf : successor)]);
+    }
+    const unchangedTotals = await query(`SELECT (SELECT sum(credits)::int FROM usage_records) usage,
+      (SELECT -sum(delta)::int FROM credit_ledger) ledger,
+      (SELECT sum(final_credits)::int FROM request_finalize_journal) journal`);
+    assert.deepEqual(unchangedTotals.rows[0],totals.rows[0],"recovery aliases do not change any settled amount");
+    assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"terminal");
   } finally { client.release(); await pool.end(); }
 });
