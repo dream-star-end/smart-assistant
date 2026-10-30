@@ -58,6 +58,12 @@ import {
   stripShellWrapper,
 } from './codexAppServerProtocol.js'
 import { log } from './codexAppServerRunner.js'
+import {
+  formatImageGenerationFailure,
+  imageFailureDetail,
+  rememberImageStderr,
+  takeImageFailureNote,
+} from './imageGenerationFailure.js'
 import type { CodexAppServerRunner } from './codexAppServerRunner.js'
 
 export interface CodexNotificationHost {
@@ -1016,11 +1022,19 @@ export async function handleItemCompleted(
   if (itemType === 'imageGeneration') {
     const outcome = codexToolOutcome(item)
     if (outcome.isError) {
-      this.emitToolResult(itemId, 'imageGeneration failed', true, undefined, {
-        terminationReason: outcome.terminationReason ?? 'tool_error',
-      })
+      const stderrNote = takeImageFailureNote(this)
+      this.emitToolResult(
+        itemId,
+        stderrNote ?? formatImageGenerationFailure({ detail: imageFailureDetail(item) }),
+        true,
+        undefined,
+        { terminationReason: outcome.terminationReason ?? 'tool_error' },
+      )
       return
     }
+    // A stderr note belongs to the failed item that just consumed it. Drop any
+    // leftover before a later item in this attempt can reuse it.
+    rememberImageStderr(this, null)
     // codex's image_gen tool emits two notification shapes depending on the
     // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
     // 0.125.0):
@@ -1123,7 +1137,9 @@ export async function handleItemCompleted(
     this.emitToolResult(
       itemId,
       isError
-        ? `imageGeneration failed: ${failedNames.join(', ') || 'tool reported an error'}`
+        ? formatImageGenerationFailure({
+            detail: failedNames.length > 0 ? `没有写入 ${failedNames.join(', ')}` : undefined,
+          })
         : `imageGeneration → ${summary}`,
       isError,
       undefined,

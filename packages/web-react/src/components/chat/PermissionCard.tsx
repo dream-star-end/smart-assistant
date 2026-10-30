@@ -160,6 +160,18 @@ export function isAwaitingPermissionPrompt(msg: ChatMessage, now = Date.now()): 
   return !permissionHasExpired(msg, now);
 }
 
+function continueAskUserQuestion(
+  questions: AqQuestion[],
+  input: Record<string, unknown> | null,
+  requestId: string,
+  onRespond: PermissionRespond,
+): void {
+  // 继续只放开这一轮，不替用户选题。钱和权限必须本人点。
+  void questions;
+  void input;
+  onRespond({ requestId, behavior: "deny", message: "User continued" });
+}
+
 function asAskUserQuestion(msg: ChatMessage): AqQuestion[] | null {
   if (msg.toolName !== "AskUserQuestion") return null;
   const input = msg.inputJson as AqInput | null | undefined;
@@ -498,9 +510,19 @@ export function PermissionCard({
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
       {canAnswer && (
         <div className="flex items-center gap-2 border-t border-border/70 px-3 py-2">
+          {questions && msg.requestId && (
+            <Button
+              size="sm"
+              variant="accent"
+              shape="pill"
+              onClick={() => continueAskUserQuestion(questions, input, msg.requestId!, onRespond)}
+            >
+              继续
+            </Button>
+          )}
           <Button
             size="sm"
-            variant="accent"
+            variant={questions ? "secondary" : "accent"}
             shape="pill"
             onClick={() => {
               if (msg.requestId) reopenPermissionUi(msg.requestId);
