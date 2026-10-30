@@ -577,7 +577,7 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       await runOne(d)
       const shot = (
         await query<{ status: string; active: string | null }>(
-          `SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1`,
+          'SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1',
           [shotId],
         )
       ).rows[0]!
