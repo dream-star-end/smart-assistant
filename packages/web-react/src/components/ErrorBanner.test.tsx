@@ -17,7 +17,11 @@ test("聊天错误条在窄屏把操作区换到下一行，且重试/关闭仍�
   );
 
   expect(screen.getByRole("alert")).toHaveClass("flex-wrap", "sm:flex-nowrap");
-  expect(screen.getByText("追踪号 req-mobile")).toBeInTheDocument();
+  // W3:追踪号收在「技术详情」里,默认不显示,展开后可复制。
+  const trace = screen.getByText("追踪号：req-mobile");
+  expect(trace).not.toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: /技术详情/ }));
+  expect(trace).toBeVisible();
   const retry = screen.getByRole("button", { name: "继续" });
   expect(retry.parentElement).toHaveClass("w-full", "sm:w-auto");
   expect(retry).toHaveClass("[@media(hover:none)]:h-11");

@@ -321,7 +321,7 @@ const DRIFT_BASELINE: Record<DriftMetric, Record<string, number>> = {
     "components/*": 31,
     "components/chat": 2,
     "components/iui": 3,
-    "components/marketplace": 56,
+    "components/marketplace": 0,
     "components/org": 1,
     "components/project": 4,
     "components/settings": 1,

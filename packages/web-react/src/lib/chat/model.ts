@@ -9,7 +9,13 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { CursorContextTier, MessageReplyQuote, ServiceTier, UserError } from "@openclaude/protocol/browser";
+import type {
+  AutomaticRetryStatus,
+  CursorContextTier,
+  MessageReplyQuote,
+  ServiceTier,
+  UserError,
+} from "@openclaude/protocol/browser";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,
@@ -36,7 +42,17 @@ export type TurnStatusState =
   // 进程 spawn 中 / 带历史恢复中。首个内容块或后继阶段态到达即被清除。
   | "engine_starting"
   | "engine_resuming"
-  | { kind: "retrying"; attempt: number; max: number; retryAt: number };
+  | RetryingTurnStatus;
+
+/** `max` 是兼容常量,不是这一轮的实际上限,不拿来显示。`retryStatus` 是服务端给的真实进度,
+ *  只在渲染时由 retryStatus.activeTurnStatus 附上。 */
+export type RetryingTurnStatus = {
+  kind: "retrying";
+  attempt: number;
+  max: number;
+  retryAt: number;
+  retryStatus?: AutomaticRetryStatus;
+};
 
 /** 判别 `_turnStatus` 是否处于「引擎冷启动」阶段(内容帧兜底消解 + 渲染层消费)。 */
 export function isEngineStartupTurnStatus(
@@ -48,7 +64,7 @@ export function isEngineStartupTurnStatus(
 /** 判别 `_turnStatus` 是否处于「自动重试中」态（供 reducer 内容帧自动消解 + 渲染层消费）。 */
 export function isRetryingTurnStatus(
   s: TurnStatusState | null | undefined,
-): s is { kind: "retrying"; attempt: number; max: number; retryAt: number } {
+): s is RetryingTurnStatus {
   return typeof s === "object" && s !== null && s.kind === "retrying";
 }
 
@@ -274,6 +290,8 @@ export type ChatMessage = {
   _continuationOfTurnKey?: string;
   // ── user ──
   status?: UserMsgStatus;
+  /** Admission is master queueing; accepted is confirmed container delivery. */
+  _deliveryState?: "admitted" | "accepted";
   /** 用户自己点停止取消的待发消息(OCV5-421):仍可重发,但显示中性「发送已取消」而不是红色「发送失败」。 */
   _sendCancelled?: boolean;
   _media?: MediaRef[];
@@ -331,6 +349,10 @@ export type ChatMessage = {
         title: string;
         message: string;
         detail?: string;
+        /** W3:提交时错误帧带的 userError;卡片正文用它。旧快照没有。 */
+        userError?: UserError;
+        /** W3:没有 userError 时冻结的目录码,卡片按它查错误目录(之后错误码变了也不重算)。 */
+        catalogCode?: string;
       };
   /** 恢复裁决还没到。历史里的源错误行先不展示，避免抢先画卡。 */
   _errorHeldForRecovery?: true;
@@ -747,6 +769,14 @@ export type ChatSession = {
   _reconciling?: boolean;
   /** Single low-cognition user-visible recovery/control state. */
   _recoveryStatus?: RecoveryStatusState;
+  /** master 自动重试的真实进度,按根消息归并(lib/chat/retryStatus.ts)。只用于展示。 */
+  _automaticRetryStatus?: {
+    rootClientMessageId: string;
+    sourceClientMessageId?: string;
+    clientMessageId?: string;
+    status: AutomaticRetryStatus;
+    ts: number;
+  };
   /** Background live-journal hydrate hit a page/time cap or request timeout.
    * Not persisted; UI offers an explicit retry. */
   _liveJournalDegraded?: boolean;
@@ -770,8 +800,13 @@ export type ChatSession = {
   _lastFinaledAt?: number;
   /** Browser-only actual debit accumulated during the active root turn. */
   _turnCostCredits?: string;
+  _admittedClientMessageId?: string;
   /** Stable request ids already folded into `_turnCostCredits`. */
   _turnCostSeenRequestIds?: Set<string>;
+  /** Session-wide replay fence for cost badges, retained across turn boundaries. */
+  _costChargedSeenRequestIds?: Set<string>;
+  /** Same actual-debit projection as SessionSnapshot.credits. */
+  _turnCredits?: { settled: string; requests: number; asOf: number };
   /** Set once the advisory 500-credit line is reached; UI keeps it live until turn cleanup. */
   _turnCostReminderCredits?: string;
   _tokenUsage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };

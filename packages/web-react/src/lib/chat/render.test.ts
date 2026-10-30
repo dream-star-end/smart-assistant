@@ -330,6 +330,8 @@ describe("errorLabel / stripMarkdown", () => {
     const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
     const presented = errorPresentation("ENGINE_ERROR", raw, raw);
     expect(presented).toEqual({
+      code: "model_authority_expired",
+      fixedMessage: true,
       title: "任务暂时中断",
       message: "已有进度已保留。可以从断点继续；已完成的调用按实际用量计费。",
       detail: "请求 ID：9cad8ad4bf74b7050694873e6ab16b01",

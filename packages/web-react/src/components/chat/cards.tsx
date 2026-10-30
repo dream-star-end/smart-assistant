@@ -5,7 +5,6 @@
  */
 import {
   AlertTriangle,
-  ArrowLeftRight,
   BookmarkPlus,
   Brain,
   ChevronRight,
@@ -15,8 +14,6 @@ import {
   Info,
   ListTodo,
   RotateCcw,
-  RotateCw,
-  ShieldCheck,
   Sparkles,
   MessageSquare,
   MoreHorizontal,
@@ -53,11 +50,14 @@ import {
   isStaleSoftBoxReplaySnapshot,
   stripMarkdown,
 } from "../../lib/chat/render";
+import {
+  readUserError,
+} from "../../lib/chat/userErrorView";
 // 从 lib 取(不是 settings/SubscriptionDialog):红卡在首屏同步渲染,静态引订阅弹窗会把弹窗 +
 // 支付入口一并钉进入口闭包(2026-09-17 first-screen-budget 超限修复)。
-import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../../lib/subscribeIntent";
+import { lastKnownSubscriptionPaid } from "../../lib/subscribeIntent";
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
-import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
+import { reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
 import { useUiPlainText } from "../iui/plainText";
 import { Markdown } from "../Markdown";
@@ -78,6 +78,8 @@ import {
   useToast,
 } from "../ui";
 import { formatDate } from "../ui/TimeAgo";
+import type { ErrorNoticeActionsInput } from "./errorNoticeActions";
+import { ErrorNotice } from "./lazyTurnErrorNotice";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
@@ -651,13 +653,13 @@ function MessageActions({
 
 // ═══════════════ user ═══════════════
 // 只标注**过渡态**与失败:「已回复」是每条历史用户消息的终态,助手回复本身就是证据,再标一遍
-// 只剩噪音;「已读」同理。「已送达」保留 —— 它只在当前在飞轮出现,告诉用户服务端已受理。
+// 只剩噪音;「已读」同理。只有容器接单确认后才显示「已送达」。
 // status=sent 不足以说明这一点:停止、服务重启中断、重复受理、自动恢复源轮都把行落定成 sent,
 // 回复开始后的软重试 / 停止收尾也会把 read 写回 sent。所以「已送达」另由调用方给 awaitingReply。
 const USER_STATUS_LABEL: Record<string, string> = {
   sending: "发送中",
   queued: "还在等上一项",
-  sent: "已送达",
+  sent: "已受理",
   error: "发送失败",
 };
 
@@ -708,7 +710,9 @@ export function UserCard({
   const cancelledByUser = status === "error" && msg._sendCancelled === true;
   const statusLabel = cancelledByUser
     ? (msg._errorDetail || "发送已取消")
-    : status && (status !== "sent" || awaitingReply) ? USER_STATUS_LABEL[status] : undefined;
+    : status && (status !== "sent" || awaitingReply)
+      ? status === "sent" && msg._deliveryState === "accepted" ? "已送达" : USER_STATUS_LABEL[status]
+      : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
   const canContinue = status === "error" && !failurePresentedBelow && Boolean(cb?.onContinueInterrupted) &&
     (!cb?.resolveInterruptedContinuation || !!cb.resolveInterruptedContinuation(msg));
@@ -810,35 +814,7 @@ export function UserCard({
   );
 }
 
-/** Durable dispatch failure rendered as status, never as Agent-authored text. */
-export function TurnStatusCard({
-  msg,
-  cb,
-  currentTurn,
-}: {
-  msg: ChatMessage;
-  cb: CardCallbacks;
-  currentTurn: boolean;
-}) {
-  const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
-  const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
-  return (
-    <div className="rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3 animate-in" role="status">
-      <div className="flex items-start gap-2.5">
-        <ShieldCheck size={16} className="mt-0.5 shrink-0 text-warning" />
-        <div className="min-w-0 flex-1">
-          <div className="text-body font-medium text-fg">{presented.title}</div>
-          <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted">{presented.message}</div>
-        </div>
-        {source && cb.onContinueInterrupted && (
-          <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
-            <RotateCcw size={12} /> 继续
-          </Button>
-        )}
-      </div>
-    </div>
-  );
-}
+export { TurnStatusCard } from "./lazyTurnErrorNotice";
 
 const LONG_MARKDOWN_STEP = 128 * 1024;
 const LIVE_MARKDOWN_TAIL = 64 * 1024;
@@ -965,6 +941,8 @@ export function AssistantCard({
       })
     : null;
   if (errorCardHeld && !presentedError?.bodyText) return null;
+  // 没有错误码、只带 userError 的终态行(服务端「自动重试已停止」卡):正文换成同样的人话提示。
+  const standaloneError = hasError ? undefined : readUserError(msg._userError);
   const isSyntheticEmptyNotice =
     !hasError && (msg.text ?? "").trim() === "本轮未能产出可见回复，已结束，可重试或继续";
 
@@ -974,7 +952,6 @@ export function AssistantCard({
   const isEmptyNoReply =
     normalizedCode === "no_response" || normalizedCode === "phantom_turn";
   const sem = turnErrorSemantics(normalizedCode);
-  const expectedError = sem.expected === true;
   // Same narrow exception as legacy size: a sealed failure must not keep
   // a frozen「结果正在收尾」title. Every other snapshot stays monotone.
   const ignoreStaleSoftSnapshot =
@@ -1003,23 +980,29 @@ export function AssistantCard({
   const shownTitle = isEmptyNoReply
     ? "这轮没有回复"
     : (frozenCard?.title ?? presentedError?.title);
-  const shownMessage = isEmptyNoReply
-    ? "模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。"
-    : (frozenCard?.message ?? presentedError?.message);
-  const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
   const creditsCopy = insufficientCreditsCopy(
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
-  // Only the latest unfinished task may continue; historical errors never
-  // replay a later request. A trailing runtime batch does not own this action.
+  const shownMessage = isEmptyNoReply
+    ? "模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。"
+    : (frozenCard?.message ?? presentedError?.message);
+  // Preserve the committed catalog snapshot and each turn's billing-specific copy.
+  const cardUserError = frozenCard ? frozenCard.userError : readUserError(msg._userError);
+  const cardCode = frozenCard ? frozenCard.catalogCode : presentedError?.code;
+  const cardFixedBody = frozenCard
+    ? (frozenCard.userError || frozenCard.catalogCode ? undefined : frozenCard.message)
+    : msg._recoverySkippedNotice ?? (isInsufficient
+      ? creditsCopy.message
+      : isEmptyNoReply || presentedError?.fixedMessage ? shownMessage : undefined);
+  const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
+  const sourceUser = msg._clientMessageId ? cb.resolveRetryTarget?.(msg._clientMessageId) : undefined;
+  // The exact source resolver also owns standalone give-up cards and recovery
+  // ancestry. Historical errors and trailing runtime rows cannot replay a task.
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const source = isLastTurn && !ctx.sending
     ? cb.resolveInterruptedContinuation?.(msg)
     : undefined;
   const showInterruptedContinuation = !!source && !!cb.onContinueInterrupted;
-  const showTopUp = isInsufficient && !!cb.onTopUp;
-  const showSwitchModelHint =
-    !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch" && !!cb.onOpenModelPicker;
   useEffect(() => {
     if (!isInsufficient) return;
     reportClientFrictionOnce(
@@ -1033,17 +1016,27 @@ export function AssistantCard({
       cb.getToken?.(),
     );
   }, [isInsufficient, msg.id, cb]);
-  // OCV5-421: 需要用户动手的卡必须给动作,不能只写「请在上方切换模型 / 请刷新页面」。
-  const showSwitchModel =
-    !!presentedError && !presentedError.waived && isLastTurn && sem.cta === "switch_model" && !!cb.onOpenModelPicker;
-  const showReload =
-    !!presentedError && !presentedError.waived && isLastTurn && (sem.cta === "refresh" || sem.cta === "relogin");
-  const showActionRow =
-    showTopUp ||
-    showSwitchModel ||
-    showReload ||
-    showInterruptedContinuation ||
-    (isLastTurn && showSwitchModelHint);
+  const errorActions: Omit<ErrorNoticeActionsInput, "userError"> = {
+    msg,
+    cb,
+    isLastTurn,
+    waived: presentedError?.waived === true,
+    editTarget: sourceUser,
+    continueInterrupted: showInterruptedContinuation ? () => cb.onContinueInterrupted?.(msg) : undefined,
+    topUp: isInsufficient && cb.onTopUp
+      ? { label: creditsCopy.cta, intent: creditsCopy.intent }
+      : undefined,
+    contactAdmin: cb.onFeedback ? () => cb.onFeedback?.(buildFeedbackCtx(msg)) : undefined,
+  };
+  // 错误码、请求 ID、消息 ID 只进「技术详情」,默认收起。
+  const technicalDetails = presentedError || standaloneError
+    ? {
+        code: standaloneError?.code ?? msg._errorCode,
+        requestId: msg.usage?.traceId,
+        clientMessageId: msg._clientMessageId,
+        detail: shownDetail,
+      }
+    : undefined;
   // Finalized immutable tapes may contain a deferred runtime batch after the
   // canonical assistant row. That transport row must still mount and decode,
   // but it must not take the current turn's regenerate action away from the
@@ -1084,7 +1077,7 @@ export function AssistantCard({
             - 用户主动停止同样走 bodyText：已经产生的部分回答必须可见，不能因为
               stopped/user_cancelled 就整段藏掉（费用和过程都是真实发生过的）。
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
-        {msg.text && !hasError && !isSyntheticEmptyNotice ? (
+        {msg.text && !hasError && !isSyntheticEmptyNotice && !standaloneError ? (
           <OptionsGroupProvider live={live}>
             {/* 流式光标由 Markdown(caret)内联注入到最后一个文本块末尾,不再落在正文下一行。 */}
             <ProgressiveMarkdown text={msg.text} live={live} caret={live} />
@@ -1194,104 +1187,43 @@ export function AssistantCard({
             )}
           </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
-          <Alert
-            tone="warning"
-            density="compact"
-            className="mt-2.5 max-w-full overflow-hidden"
-            icon={<AlertTriangle size={17} />}
+          <ErrorNotice
+            role="alert"
+            tone="attention"
+            className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
             title="这句没有发出去"
-          >
-            <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
+            actions={() => showInterruptedContinuation ? [{ label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }] : []}
+            details={technicalDetails}
+            fixedBody={msg._recoverySkippedNotice}
+          />
+        ) : !suppressErrorAlert && presentedError ? (
+          // 终态错误卡(W3):一句标题 + 人话正文 + 最多两个建议动作 + 收起的技术详情。
+          <ErrorNotice
+            role="alert"
+            tone={errorTone === "danger" ? "failed" : "attention"}
+            className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
+            title={isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
+            userError={cardUserError}
+            code={cardCode ?? presentedError.code}
+            fixedBody={cardFixedBody}
+            note={frozenCard && msg._recoverySkippedNotice && msg._recoverySkippedNotice !== shownMessage ? (
+              <p data-testid="recovery-skipped-notice" className="mt-1.5">
                 {msg._recoverySkippedNotice}
               </p>
-              {showInterruptedContinuation && (
-                <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
-                    <RotateCcw size={14} /> 继续
-                  </Button>
-                </div>
-              )}
-            </div>
-          </Alert>
-        ) : !suppressErrorAlert && presentedError && (
-          <Alert
-            tone={errorTone}
-            density={isEmptyNoReply || (expectedError && !presentedError.waived && !frozenCard) ? "compact" : "comfortable"}
-            className="mt-2.5 max-w-full overflow-hidden"
-            icon={isEmptyNoReply || !(presentedError.waived && !frozenCard) ? <AlertTriangle size={17} /> : <ShieldCheck size={17} />}
-            title={isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
-          >
-            <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {frozenCard
-                  ? frozenCard.message
-                  : (msg._recoverySkippedNotice ??
-                    (isInsufficient ? creditsCopy.message : shownMessage))}
-              </p>
-              {frozenCard && msg._recoverySkippedNotice && msg._recoverySkippedNotice !== shownMessage && (
-                <p data-testid="recovery-skipped-notice" className="mt-1.5 text-[13px] leading-5 text-muted [overflow-wrap:anywhere]">
-                  {msg._recoverySkippedNotice}
-                </p>
-              )}
-              {shownDetail && (
-                <details className="mt-1.5 max-w-full">
-                  <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">
-                    查看请求信息
-                  </summary>
-                  <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
-                    {shownDetail}
-                  </pre>
-                </details>
-              )}
-              {showActionRow && (
-                <div className="mt-2.5 flex flex-wrap items-center gap-2">
-                  {showInterruptedContinuation && (
-                    <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
-                      <RotateCcw size={14} /> 继续
-                    </Button>
-                  )}
-                  {showTopUp ? (
-                    // insufficient_credits CTA = 导航非重发,不受末轮门控。
-                    <Button
-                      size="sm"
-                      variant="accent"
-                      shape="pill"
-                      onClick={() => {
-                        requestSubscribeIntent(creditsCopy.intent);
-                        reportClientFriction(
-                          {
-                            surface: "chat",
-                            stage: "exhausted_cta",
-                            code: "EXHAUSTED_CTA",
-                            outcome: "succeeded",
-                          },
-                          cb.getToken?.(),
-                        );
-                        cb.onTopUp?.();
-                      }}
-                    >
-                      <Wallet size={14} /> {creditsCopy.cta}
-                    </Button>
-                  ) : showSwitchModel ? (
-                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onOpenModelPicker}>
-                      <ArrowLeftRight size={14} /> 切换模型
-                    </Button>
-                  ) : showReload ? (
-                    <Button size="sm" variant="secondary" shape="pill" onClick={() => window.location.reload()}>
-                      <RotateCw size={14} /> 刷新页面
-                    </Button>
-                  ) : null}
-                  {isLastTurn && showSwitchModelHint && (
-                    <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
-                      切换模型
-                    </Button>
-                  )}
-                </div>
-              )}
-            </div>
-          </Alert>
-        )}
+            ) : undefined}
+            actions={errorActions}
+            details={technicalDetails}
+          />
+        ) : standaloneError && !live ? (
+          <ErrorNotice
+            role="alert"
+            tone="attention"
+            className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
+            userError={standaloneError}
+            actions={errorActions}
+            details={technicalDetails}
+          />
+        ) : null}
 
         {showUnpublishedProcessPending && (
           <output
@@ -1308,7 +1240,7 @@ export function AssistantCard({
         {(() => {
           // OCV5-390: copy / more sit with the rating — once per turn, on its final answer. Text the
           // model wrote before a tool, or before the error the turn ended on, carries no action row.
-          const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice &&
+          const showActions = !live && !hasError && !standaloneError && !!msg.text && !isSyntheticEmptyNotice &&
             (ctx.turnFinalAssistant ?? ctx.isLast ?? true);
           // OCV5-459: a user-stop row whose text went into the steps keeps copy / more like any
           // finished message; copy takes the turn's last text (_stopCopyText, view-only).
@@ -1322,7 +1254,7 @@ export function AssistantCard({
           // 中间文本回复不各自带评价(boss 07-11)。流式中 / 团队编排未终态时不出;历史各轮末条各自可评。
           // 未登录/demo 由卡内 Context 兜底隐藏。
           const showRating =
-            !live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply &&
+            !live && !hasError && !standaloneError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply &&
             !!ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn);
           // P5b：完成态（非流式、本轮已收笔）、非只读、所在轮末条回答，且 App 给了入口才进菜单。
           const showProjectSave =
@@ -1629,7 +1561,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         <span className="ml-auto flex items-center gap-2">
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {done ? (
-            <Badge tone={msg._isError ? "danger" : "success"}>{msg._isError ? "失败" : "完成"}</Badge>
+            <Badge tone={msg.cancelled ? "neutral" : msg._isError ? "danger" : "success"}>{msg.cancelled ? "已取消" : msg._isError ? "失败" : "完成"}</Badge>
           ) : (
             <Badge tone="accent">进行中</Badge>
           )}
@@ -1674,7 +1606,9 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           (失败 → 红 X,不再对着「失败」徽记画绿勾)。 */}
       {collapsed && done && msg.summary && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
-          {msg._isError ? (
+          {msg.cancelled ? (
+            <X size={13} className="mt-0.5 shrink-0 text-muted" data-testid="delegate-summary-icon" />
+          ) : msg._isError ? (
             <X size={13} className="mt-0.5 shrink-0 text-danger" data-testid="delegate-summary-icon" />
           ) : (
             <Check size={13} className="mt-0.5 shrink-0 text-success" data-testid="delegate-summary-icon" />

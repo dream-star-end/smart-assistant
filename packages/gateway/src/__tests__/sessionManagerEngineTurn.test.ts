@@ -35,6 +35,7 @@ import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEv
 import type { EngineCreateOpts } from "../engine/registry.js";
 import type { SubprocessRunner, TurnModelAuthority } from "../subprocessRunner.js";
 import {
+  buildLosslessTurnTapeRequests,
   setV3MasterSinkSingleton,
   type V3MasterSink,
   type V3MasterSinkPayload,
@@ -916,6 +917,33 @@ function makeDelayingSink(delayMs: number): CapturedSink {
 }
 
 describe("crash/interrupt partial persistence", () => {
+  for (const reason of ["max_tokens", "pause_turn"] as const) {
+    test(`refresh-stable truncated reason: ${reason} reaches the canonical tape`, async () => {
+      const captured = makeCapturingSink();
+      setV3MasterSinkSingleton(captured.sink);
+      try {
+        const sm = new SessionManager(makeConfigStub());
+        const events: SessionStreamEvent[] = [];
+        const runner = new FakeCcbRunner((r) => {
+          setImmediate(() => {
+            r.text("partial answer");
+            r.result({ stop_reason: reason, usage: { input_tokens: 10, output_tokens: 4 } });
+          });
+        });
+        const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+        await sm.submit(session, "continue later", (event) => events.push(event));
+        assert.equal(captured.payloads.length, 1);
+        const payload = captured.payloads[0]!;
+        assert.equal(payload.truncatedReason, reason);
+        assert.equal(payload.truncated, reason === "max_tokens" ? true : undefined);
+        const tape = buildLosslessTurnTapeRequests(payload);
+        assert.equal(JSON.parse(tape.canonical.toString("utf8")).truncatedReason, reason);
+      } finally {
+        setV3MasterSinkSingleton(null);
+      }
+    });
+  }
+
   test("co-locates the exact engine billing frame with the immutable paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

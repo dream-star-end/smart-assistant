@@ -1,8 +1,13 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { ContainerLinkControls } from "./containerLinkControls.js";
+import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
+import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
 import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
 import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
-import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
+import { recoveryJobStatus } from './recoveryPresentation.js';
+import { handleTurnDispatchReceipt } from './turnDispatchReceipt.js';
+export { classifyTurnDispatchReceipt } from './turnDispatchReceipt.js';
 import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
@@ -186,11 +191,9 @@ import {
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
   backfillDispatchTraceId,
-  casAdmittedToAccepted,
   casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
-  getDispatchByLogicalKey,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
@@ -204,13 +207,11 @@ import {
 } from "../db/liveTurnFrames.js";
 import {
   admitDurableControl,
-  claimDueTurnControls,
   HELLO_PENDING_PERMISSION_MAX_SESSIONS,
   markTurnControlReceipt,
   pendingPermissionPromptToFrame,
   persistPermissionAuthority,
   readPendingPermissionPromptsForSessions,
-  releaseTurnControlForRetry,
   resolvePermissionExpiresAt,
   selectHelloPermissionSessions,
   settlePermissionPromptFromRuntime,
@@ -219,7 +220,6 @@ import {
 import {
   claimDueRecoveryJobs,
   forwardRecoveryUnderRootFence,
-  markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
   pauseRecoveryPreReceipt,
@@ -875,6 +875,8 @@ export interface UserChatBridgeDeps {
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
+  resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
+  containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
   jwtSecret: string | Uint8Array;
   /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
   promptQueueEnabled?: boolean;
@@ -1486,50 +1488,6 @@ export type CronOriginExecutorClaimResult =
   | { kind: "rejected" }
   | { kind: "delivery_unknown" }
 
-export function classifyTurnDispatchReceipt(
-  receipt: {
-    dispatchId?: unknown;
-    attemptNo?: unknown;
-    sessionId?: unknown;
-    clientMessageId?: unknown;
-    state?: unknown;
-    outcome?: unknown;
-  },
-  expected: {
-    dispatchId: string;
-    attemptNo: number;
-    sessionId: string;
-    clientMessageId: string;
-  },
-): "accepted" | "rejected" | "invalid" {
-  if (
-    receipt.dispatchId !== expected.dispatchId ||
-    receipt.attemptNo !== expected.attemptNo ||
-    receipt.sessionId !== expected.sessionId ||
-    receipt.clientMessageId !== expected.clientMessageId
-  ) return "invalid";
-  if (receipt.state === "rejected") {
-    return receipt.outcome === "not_accepted" || receipt.outcome === null
-      ? "rejected"
-      : "invalid";
-  }
-  if (receipt.state === "terminal") {
-    return receipt.outcome === "completed" ||
-        receipt.outcome === "interrupted" ||
-        receipt.outcome === "crashed"
-      ? "accepted"
-      : "invalid";
-  }
-  if (
-    receipt.outcome === null &&
-    (receipt.state === "queued" ||
-      receipt.state === "running" ||
-      receipt.state === "recovery_pending" ||
-      receipt.state === "sink_staged" ||
-      receipt.state === "sink_stage_failed")
-  ) return "accepted";
-  return "invalid";
-}
 
 export type CronOriginExecutor = (payload: {
   encoded: Buffer
@@ -1556,6 +1514,7 @@ export interface UserChatBridgeHandler {
   /** 测试 / metrics:获取 ConnectionRegistry。 */
   registry: ConnectionRegistry;
   containerLinkSnapshots?(): ContainerLinkSnapshot[];
+  rebuildContainerLinks?(): Promise<void>;
   /**
    * 给指定 uid 的所有活跃 user WS 广播一个 JSON 帧(旁路透传管道,非容器来源)。
    *
@@ -2287,8 +2246,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
-    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes })
+    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes, dialTimeoutMs: connectTimeoutMs })
     : null;
+  if (links) links.beforeReplay = () => outboundPersistQueues.drain();
+  const recovery = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkRecovery({
+    pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
+    ...deps.containerLinkRecovery,
+    drain: async () => { await links.drain(); await outboundPersistQueues.drain(); },
+    attach: (carrier, rows, signal, keepAlive) => rebuildContainerLink({ carrier, rows, signal, keepAlive, links, deps, maxFrameBytes,
+      start: (user, uid, endpoint, socket, abort, connId) => startBridge(user, uid, endpoint, [], endpoint.containerId, socket, abort, null, null, connId),
+    }),
+  }) : null;
+  if (links && recovery) links.onTransportLost = (uid, cid) => recovery.lost(uid, cid);
   const drainingChecks = new Set<() => void>();
   let shuttingDown = false;
   const uidToRecoveryExecutors = new Map<
@@ -2296,59 +2265,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     Set<(job: ClaimedRecoveryJob) => void>
   >();
   const uidToCronOriginExecutors = new Map<string, Set<CronOriginExecutor>>();
-  const controlDrainRunning = new Set<string>();
   const recoveryDrainRunning = new Set<string>();
   const recoveryLastScanAt = new Map<string, number>();
-  const controlLeaseOwner = `master:${randomUUID()}`;
   const recoveryLeaseOwner = `master-recovery:${randomUUID()}`;
-  const controlLeaseMs = 15_000;
   const recoveryLeaseMs = 120_000;
 
-  /** Master-owned control outbox drainer. The physical bridge is only a
-   * transport candidate: PostgreSQL claim/lease is the delivery authority,
-   * so browser disconnects and Master restarts cannot erase Stop/permission. */
-  const drainDurableControlsForUser = async (uid: bigint): Promise<void> => {
-    if (!deps.pgPool) return;
-    const key = uid.toString();
-    if (controlDrainRunning.has(key)) return;
-    const sockets = uidToContainerWs.get(key);
-    const socket = sockets && [...sockets].find((candidate) => candidate.readyState === WebSocket.OPEN);
-    if (!socket) return;
-    controlDrainRunning.add(key);
-    try {
-      const controls = await claimDueTurnControls(deps.pgPool, {
-        userId: uid,
-        ownerId: controlLeaseOwner,
-        leaseMs: controlLeaseMs,
-      });
-      for (const control of controls) {
-        const live = [...(uidToContainerWs.get(key) ?? [])]
-          .find((candidate) => candidate.readyState === WebSocket.OPEN);
-        if (!live) {
-          await releaseTurnControlForRetry(deps.pgPool, control);
-          continue;
-        }
-        const encoded = JSON.stringify({ ...control.payload, controlId: control.controlId });
-        try {
-          live.send(encoded, { binary: false }, (error) => {
-            if (!error) return;
-            void releaseTurnControlForRetry(deps.pgPool!, control).catch(() => {});
-          });
-        } catch {
-          await releaseTurnControlForRetry(deps.pgPool, control);
-        }
-      }
-    } catch (error) {
-      log?.warn("user-chat-bridge: durable control drain failed", { uid: key, error });
-    }
-    controlDrainRunning.delete(key);
-  };
-  const controlDrainTimer = setInterval(() => {
-    for (const uid of uidToContainerWs.keys()) {
-      void drainDurableControlsForUser(BigInt(uid));
-    }
-  }, 1_000);
-  controlDrainTimer.unref?.();
+  const controls = deps.pgPool ? new ContainerLinkControls({
+    pool: deps.pgPool, channel: deps.containerLinkRecovery?.channel ?? "v5", links,
+    legacy: uidToContainerWs, wake: carrier => recovery?.wake(carrier) ?? Promise.resolve(), log,
+  }) : null;
+  const drainDurableControlsForUser = (uid: bigint): Promise<void> => controls?.drain(uid) ?? Promise.resolve();
 
   /** Master-owned semantic recovery scheduler. Executors are registered only
    * by attested durable-dispatch bridges; every claimed request then enters
@@ -2812,66 +2738,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     uid: bigint,
     endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string; desktop?: { containerId: number } },
     earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
-    /**
-     * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
-     * 路径填,test mock 路径可不填。无值或 deps.markContainerActivity 未注入
-     * → 不刷活动(等价于回到本 PR 之前的行为,只在 ensureRunning 刷一次)。
-     */
     containerId: number | undefined,
-    /**
-     * 已构造好的容器侧 WS(direct 或 tunnel)。caller 在 handleUpgrade 内
-     * 完成构造,把成功品交给本函数;失败品 caller 自己 close,不进 bridge。
-     */
     containerWs: WebSocket,
-    /**
-     * caller 持有的 abort controller(同 createXxxContainerSocket 收到的 signal)。
-     * cleanup 时调 abort() — 让 tunnel WS 在握手阶段 abort 也能被打断。
-     */
     connectAbort: AbortController,
-    /**
-     * 0049 模型授权 handle —— null 表示本连接不做模型校验(deps 未注入,或
-     * caller 显式不要鉴权)。语义见 `ModelCheckerHandle`(含 R1 BLOCKER-1 的 epoch 联动)。
-     *
-     * onUserMessage 每条 inbound.message 帧 sync 调一次 isAllowed,且追踪
-     * lastSeenModelId 让没带 model 字段的后续帧也参与校验(plan v3 review v1
-     * follow-up:防"已用 gpt-5.5 跑起来的桥被撤销后无 model 字段帧透传");
-     * 权威开启时,每 turn 还会在 catalog epoch fence 之后跑一次 grants epoch fence
-     * (resolveAuthorityExecOrReject 尾部)。
-     */
     modelCheckerHandle: ModelCheckerHandle | null,
-    /**
-     * P0 计费旁路封堵 —— master 侧 agent→model 权威快照 handle(bridge 可信模型
-     * 推导;null = deps 未注入,桥不做推导,行为与字段加入前一致)。
-     *   - `resolve(agentId)`:已绑定本连接 uid 的 sync 快照 closure;null = 权威
-     *     推导不出(未知 agentId)
-     *   - `isRuntimeDenied(agentId)`:已安装/预设但能力未就绪的显式拒绝集；即使
-     *     浏览器带了 model 也不得绕过
-     *   - `refresh()`:重拉快照(周期 timer 与推导 miss 时补触发,幂等去重)
-     * onUserMessage 的 inbound.message 分类用它推导「帧无 model 时该 agent 的
-     * 有效模型」,与容器 gateway resolveEngine 的判定保持同构。
-     */
-    agentModelResolverHandle:
-      | {
-          resolve: (agentId: string) => string | null;
-          isRuntimeDenied: (agentId: string) => boolean;
-          isIdentityRegistered: (agentId: string) => boolean;
-          authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
-          refresh: () => Promise<void>;
-        }
-      | null,
-    /**
-     * S12e CG4:caller(handleUpgrade)早期生成的 connection-scoped trace。
-     * 移到 caller 的原因:tunnel factory 在 startBridge 之前调,需要同一个值
-     * 写 outgoing `X-Connection-Trace-Id` 头与 bridge log connection 字段共享。
-     * 36 char UUID(`randomUUID()`),过 TRACE_ID_REGEX。
-     */
+    agentModelResolverHandle: {
+      resolve: (agentId: string) => string | null;
+      isRuntimeDenied: (agentId: string) => boolean;
+      isIdentityRegistered: (agentId: string) => boolean;
+      authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
+      refresh: () => Promise<void>;
+    } | null,
     connId: string,
-    /**
-     * 连接用户的角色(来自 handleUpgrade 的 JWT claims.role,缺省 'user')。
-     * 当前唯一消费点 = executionDescriptor 的角色分档窗口投影(modelRolePolicy,
-     * 如 kimi-k3:admin 1M / 其他 500k)。语义与 claims.role 的其它读取点一致:
-     * 非破坏性产品分档,token 生命周期内的角色漂移可容忍(收窄方向保守)。
-     */
     userRole: "user" | "admin" = "user",
   ): void {
     // CG2b/CG4 — connection-scoped logger:把 uid + connection-level trace 钉进 bindings,
@@ -4081,7 +3959,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       },
     };
-    const { unregister, evicted } = registry.register(conn);
+    const { unregister, evicted } = linkHandle?.recoveryOnly ? { unregister: () => {}, evicted: [] } : registry.register(conn);
     // 踢人必须留痕:互踢循环/超限排查的第一手证据(close code 4505 服务端此前无日志)。
     for (const victim of evicted) {
       bridgeLog?.warn("user-chat-bridge: kicked oldest connection (per-user limit)", {
@@ -4959,6 +4837,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const encoded = Buffer.from(JSON.stringify(result), "utf8");
         forwardInboundFrame(encoded, false, encoded.length);
       };
+      if (linkHandle?.recoveryOnly) { rejectPromptQueueDispatch("NO_BRIDGE"); return; }
       const forwardPreparedFrame = (
         frameData: RawData,
         frameIsBinary: boolean,
@@ -5215,6 +5094,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                     controlId,
                     controlKind: kind,
                     status: admission.status === "terminal" ? "terminal" : "persisted",
+                    ...(admission.errorCode ? { errorCode: admission.errorCode } : {}),
                     peer,
                     ...(rootClientMessageId ? { clientMessageId: rootClientMessageId } : {}),
                     ...(requestId ? { requestId } : {}),
@@ -5465,7 +5345,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
             if (deps.pgPool) {
-              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog);
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog, connId);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;
@@ -8124,144 +8004,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
-        // ── turn_dispatch_receipt(RFC §3.b)── 容器已持有该逻辑键的 inbox 行(重复
-        // 到达/接管重发)。内部控制帧,绝不透传浏览器。消费 = dispatch CAS accepted +
-        // 本连接放下转发所有权(容器已拥有执行,lease 心跳不再由本桥续)。
-        if (attestPeek !== null && attestPeek.includes('"outbound.control.turn_dispatch_receipt"')) {
-          let parsedReceipt: unknown = null;
-          try { parsedReceipt = JSON.parse(attestPeek); } catch { /* 非 JSON → 落回常规路径 */ }
-          if (
-            parsedReceipt !== null && typeof parsedReceipt === "object" &&
-            (parsedReceipt as { type?: unknown }).type === "outbound.control.turn_dispatch_receipt"
-          ) {
-            const receipt = parsedReceipt as {
-              clientMessageId?: unknown;
-              dispatchId?: unknown;
-              attemptNo?: unknown;
-              sessionId?: unknown;
-              state?: unknown;
-              outcome?: unknown;
-            };
-            const cmid = isClientMessageId(receipt.clientMessageId) ? receipt.clientMessageId : null;
-            const rec = cmid !== null ? admittedDispatches.get(cmid) : undefined;
-            if (rec !== undefined) {
-              const disposition = classifyTurnDispatchReceipt(receipt, rec);
-              if (disposition === "invalid") {
-                bridgeLog?.warn("user-chat-bridge: invalid dispatch receipt ignored", {
-                  dispatchId: receipt.dispatchId,
-                  clientMessageId: receipt.clientMessageId,
-                  attemptNo: receipt.attemptNo,
-                  state: receipt.state,
-                });
-                return;
-              }
-              const pool = deps.pgPool;
-              if (disposition === "rejected") {
-                const rejectedEnrichment = enrichmentDispatches.get(rec.clientMessageId);
-                if (
-                  rejectedEnrichment?.record === rec &&
-                  !claimEnrichmentTerminalization(rejectedEnrichment)
-                ) return;
-                if (!pool) {
-                  settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
-                  if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
-                    enrichmentDispatches.delete(rec.clientMessageId);
-                  }
-                  dropAdmittedDispatch(rec.clientMessageId);
-                  return;
-                }
-                void (async () => {
-                  let persisted = false;
-                  try {
-                    // A rejected tombstone permanently fences this delivery;
-                    // retrying it as a transport wait can never execute. The
-                    // recovery scheduler atomically hands off to a new cmid.
-                    persisted = await casToTerminal(pool, {
-                      dispatchId: rec.dispatchId,
-                      outcome: "not_accepted",
-                      failureCode: "DISPATCH_NOT_ACCEPTED",
-                      clientNotified: false,
-                      fromStatuses: ["admitted"],
-                      expectedEpoch: rec.leaseEpoch,
-                    }) !== null;
-                  } catch (err) {
-                    bridgeLog?.warn("user-chat-bridge: rejected receipt convergence failed", {
-                      dispatchId: rec.dispatchId,
-                      err,
-                    });
-                  } finally {
-                    settleCronOriginClaim(
-                      rec.dispatchId,
-                      { kind: persisted ? "rejected" : "delivery_unknown" },
-                    );
-                    if (enrichmentDispatches.get(rec.clientMessageId) === rejectedEnrichment) {
-                      enrichmentDispatches.delete(rec.clientMessageId);
-                    }
-                    dropAdmittedDispatch(rec.clientMessageId);
-                  }
-                })();
-                return;
-              }
-              if (!acceptEnrichmentReceipt(rec)) return;
-              // 容器已接手执行,admitted 记录随即放下;回合流仍归原链路消费者处理。
-              noteDispatchStreamFrame(rec.sessionId, rec.clientMessageId, false);
-              if (pool) {
-                if (rec.recoveryJob) {
-                  void markRecoveryContainerReceipt(pool, {
-                    dispatchId: rec.dispatchId,
-                    dispatchAttemptNo: rec.attemptNo,
-                    expectedDispatchLeaseEpoch: rec.leaseEpoch,
-                  }).then((accepted) => {
-                    if (accepted) broadcastToUser(uid, recoveryRunningFrame(rec.recoveryJob!));
-                  }).catch(() => {});
-                  dropAdmittedDispatch(rec.clientMessageId);
-                } else {
-                  // Cron injection success is the durable accepted CAS, not
-                  // ws.send and not an in-memory lease. Resolve its HTTP call
-                  // only after that proof is committed; a lost response can
-                  // safely retry and observe this accepted row.
-                  void (async () => {
-                    let claimed = false;
-                    const mustConfirmCronClaim = cronOriginClaimWaiters.has(rec.dispatchId);
-                    try {
-                      const accepted = await casAdmittedToAccepted(pool, {
-                        dispatchId: rec.dispatchId,
-                        expectedEpoch: rec.leaseEpoch,
-                      });
-                      if (accepted !== null) {
-                        claimed = true;
-                      } else if (mustConfirmCronClaim) {
-                        const durable = await getDispatchByLogicalKey(pool, {
-                          userId: uid,
-                          sessionId: rec.sessionId,
-                          clientMessageId: rec.clientMessageId,
-                        });
-                        claimed = durable?.dispatchId === rec.dispatchId &&
-                          durable.attemptNo === rec.attemptNo &&
-                          durable.status === "accepted";
-                      }
-                    } catch (err) {
-                      bridgeLog?.warn("user-chat-bridge: dispatch receipt CAS failed", {
-                        dispatchId: rec.dispatchId,
-                        err,
-                      });
-                    } finally {
-                      settleCronOriginClaim(
-                        rec.dispatchId,
-                        { kind: claimed ? "claimed" : "delivery_unknown" },
-                      );
-                      dropAdmittedDispatch(rec.clientMessageId);
-                    }
-                  })();
-                }
-              } else {
-                settleCronOriginClaim(rec.dispatchId, { kind: "delivery_unknown" });
-                dropAdmittedDispatch(rec.clientMessageId);
-              }
-            }
-            return;
-          }
-        }
+        if (handleTurnDispatchReceipt(attestPeek, {
+          pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
+          claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,
+          settleCronOriginClaim, noteDispatchStreamFrame,
+          hasCronOriginClaim: (dispatchId) => cronOriginClaimWaiters.has(dispatchId),
+          broadcast: (frame) => { broadcastToUser(uid, frame); },
+          warn: (message, meta) => bridgeLog?.warn(message, meta),
+        })) return;
         // Durable Stop/permission runtime receipt. Commit the lifecycle edge
         // before notifying tabs; if PG is unavailable the lease expires and
         // the identical control is retried instead of being guessed applied.
@@ -9433,7 +9183,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // 仅在没有 codex inflight 且无在飞 durable dispatch 时才透传 close 给容器
       // (走 force final 路径);有其一时进 drain,container 留着让 turn 跑完 + 收 billing /
       // 保 lease,drain 收尾时由 finalCleanup 统一 terminate。
-      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams()) {
+      if (inflightCodexTurns.size === 0 && !hasPendingDispatchWork() && !hasOpenDispatchStreams() && !linkHandle?.keepAlive) {
         try {
           if (containerWs.readyState === WebSocket.OPEN
             || containerWs.readyState === WebSocket.CONNECTING) {
@@ -9474,7 +9224,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // checkDrainComplete:billing settle 把 inflightCodexTurns.size→0 时调,提前 final
     function cleanup(triggerCause: BridgeCloseCause, force = false): void {
       if (cleaned) return;
-      if (!force && !shuttingDown && hasOpenDispatchStreams() &&
+      if (!force && !shuttingDown && (hasOpenDispatchStreams() || linkHandle?.keepAlive) &&
           (triggerCause === "client_close" || triggerCause === "backpressure" || triggerCause === "internal_error")) {
         drainCause = triggerCause;
         if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
@@ -9587,7 +9337,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         (drainTimer !== null || (userDetached && linkHandle !== undefined)) &&
         inflightCodexTurns.size === 0 &&
         !hasPendingDispatchWork() &&
-        !hasOpenDispatchStreams()
+        !hasOpenDispatchStreams() && !linkHandle?.keepAlive
       ) {
         if (drainTimer !== null) clearTimeout(drainTimer);
         drainTimer = null;
@@ -10299,13 +10049,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
     if (frontendBuildTimer) clearInterval(frontendBuildTimer);
-    clearInterval(controlDrainTimer);
+    const controlsStopped = controls?.stop();
     clearInterval(recoveryDrainTimer);
     shuttingDown = true;
+    recovery?.stop();
     if (links) links.stopping = true;
     registry.closeAll(reason);
     for (const check of [...drainingChecks]) check();
     await links?.shutdown();
+    await recovery?.drain();
+    await controlsStopped;
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
@@ -10479,6 +10232,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     shutdown,
     registry,
     containerLinkSnapshots: () => links?.snapshots() ?? [],
+    rebuildContainerLinks: async () => { await Promise.all([recovery?.start(), controls?.scan()]); },
     broadcastToUser,
     syncGoalToContainers,
     broadcastAll,

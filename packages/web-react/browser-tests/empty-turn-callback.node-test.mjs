@@ -101,7 +101,9 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
         assert.equal(leaf.clientMessageId,cmid,"actual sink and actual wire share owner");
         if(mode==="empty") {
           const title=page.getByText(/^(模型服务暂时中断|这轮没有回复)$/);
-          await page.getByText("模型繁忙，正在重试…",{exact:true}).waitFor();
+          const retry=page.getByTestId("automatic-retry-status");
+          await retry.getByText("正在自动重试…",{exact:true}).waitFor();
+          assert.equal(await retry.getAttribute("data-notice-tone"),"progress","soft recovery stays a progress notice without invented n/N");
           assert.equal(await title.count(),0,"recoverable NO_RESPONSE must not paint before the authoritative decision");
           assert.equal(await page.getByRole("button",{name:"停止",exact:true}).count(),1);
           terminalMessages=snap.terminalMessages;

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
+import { assertTurnDispatchReceiptCoverage } from './lib/turnDispatchReceiptCoverage.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -74,10 +75,9 @@ if (bridge.includes('terminalizeAllEnriching("client_disconnected_before_enrichm
   throw new Error('[session-unavailable-rootfix] browser detach still terminalizes enrichment')
 }
 assertPreparationLaneCoverage(bridge)
+assertTurnDispatchReceiptCoverage(bridge,
+  readFileSync(join(root, 'packages/commercial/src/ws/turnDispatchReceipt.ts'), 'utf8'))
 for (const marker of [
-  'classifyTurnDispatchReceipt(receipt, rec)',
-  'if (disposition === "rejected")',
-  'if (!acceptEnrichmentReceipt(rec)) return;',
   'getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()))',
   'if (admit.kind === "already_owned") return { kind: "in_flight" };',
   'forwardInboundFrame(frameData, frameIsBinary, frameLength, dispatchRecord)',
@@ -820,6 +820,29 @@ await runTapProof({
   timeoutMs: 120_000,
 })
 console.log('[preparation-lane-coverage] PASS — all seven lanes and 27 exact positive/negative cases, zero skip/cancel')
+
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['scripts/__tests__/turnDispatchReceiptCoverage.test.ts'],
+  expected: [
+    'accepts the production bridge connection and extracted receipt handler',
+    'ignores whitespace and comment/string decoys',
+    'rejects an import of a different module',
+    'rejects a disconnected handler even if its old invocation is left in a comment',
+    'rejects a disconnected admitted-record lookup context',
+    'rejects a handler result that no longer consumes internal receipts',
+    'rejects classifier markers hidden in comments or strings',
+    'rejects a lost rejected-receipt branch',
+    'rejects a lost durable rejection convergence',
+    'rejects a definitive container rejection being released to the same recovery identity',
+    'rejects weakening a terminal rejection into a different recovery outcome',
+    'rejects an enrichment fence that no longer stops a terminalized turn',
+    'rejects malformed source instead of accepting a partial parse',
+  ],
+  label: 'turn-dispatch-receipt-coverage',
+  timeoutMs: 120_000,
+})
+console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 13 exact cases')
 
 await runTapProof({
   fromRoot: candidateRoot,

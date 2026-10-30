@@ -196,9 +196,9 @@ export async function claimDueMaterializationJobs(
     `WITH due AS (
        SELECT job_id
          FROM turn_tape_materialization_jobs
-        WHERE status IN ('queued','leased','failed')
+        WHERE status IN ('queued','leased')
           AND next_attempt_at<=NOW()
-          AND (status IN ('queued','failed') OR lease_until<NOW())
+          AND (status='queued' OR lease_until<NOW())
         ORDER BY created_at
         FOR UPDATE SKIP LOCKED
         LIMIT $3
@@ -249,9 +249,9 @@ export async function claimDueSettlementJobs(
          FROM turn_tape_settlement_jobs j
          JOIN client_session_turn_tapes t
            ON t.session_id=j.session_id AND t.user_id=j.user_id AND t.tape_id=j.tape_id
-        WHERE j.status IN ('queued','leased','failed')
+        WHERE j.status IN ('queued','leased')
           AND j.next_attempt_at<=NOW()
-          AND (j.status IN ('queued','failed') OR j.lease_until<NOW())
+          AND (j.status='queued' OR j.lease_until<NOW())
           AND (t.settlement_verified_at IS NOT NULL
                OR t.materialization_status='complete'
                OR t.finalized_at IS NOT NULL)
@@ -323,10 +323,9 @@ export async function failOrRequeueMaterializationJob(
     const result = await q.query(
       `UPDATE turn_tape_materialization_jobs
           SET status='failed', last_error=$4,
-              next_attempt_at=NOW()+($5::bigint * INTERVAL '1 millisecond'),
-              updated_at=NOW()
+              lease_owner=NULL, lease_until=NULL, updated_at=NOW()
         WHERE job_id=$1 AND lease_owner=$2 AND lease_epoch=$3 AND status='leased'`,
-      [job.jobId, job.leaseOwner, job.leaseEpoch, error.slice(0, 2000), SETTLEMENT_COLD_BACKOFF_MS],
+      [job.jobId, job.leaseOwner, job.leaseEpoch, error.slice(0, 2000)],
     );
     if ((result.rowCount ?? 0) !== 1) return "lost";
     await q.query(
@@ -369,19 +368,46 @@ export async function failOrRequeueSettlementJob(
   error: string,
   maxAttempts = SETTLEMENT_HOT_MAX_ATTEMPTS,
 ): Promise<"failed" | "requeued" | "lost"> {
-  const cold = job.attempt >= maxAttempts;
-  const backoff = cold ? SETTLEMENT_COLD_BACKOFF_MS : jobBackoffMs(job.attempt);
+  const failed = job.attempt >= maxAttempts;
   const result = await q.query(
     `UPDATE turn_tape_settlement_jobs
-        SET status='queued', last_error=$4,
-            next_attempt_at=NOW()+($5::bigint * INTERVAL '1 millisecond'),
-            cold_attempts=cold_attempts + CASE WHEN $6 THEN 1 ELSE 0 END,
+        SET status=CASE WHEN $6 THEN 'failed' ELSE 'queued' END, last_error=$4,
+            next_attempt_at=CASE WHEN $6 THEN next_attempt_at
+              ELSE NOW()+($5::bigint * INTERVAL '1 millisecond') END,
             lease_owner=NULL, lease_until=NULL, updated_at=NOW()
       WHERE job_id=$1 AND lease_owner=$2 AND lease_epoch=$3 AND status='leased'`,
-    [job.jobId, job.leaseOwner, job.leaseEpoch, error.slice(0, 2000), backoff, cold],
+    [job.jobId, job.leaseOwner, job.leaseEpoch, error.slice(0, 2000), jobBackoffMs(job.attempt), failed],
   );
   if ((result.rowCount ?? 0) !== 1) return "lost";
-  return cold ? "failed" : "requeued";
+  return failed ? "failed" : "requeued";
+}
+
+export interface TapeJobAlertCandidate {
+  job_id: string;
+  session_id: string;
+  tape_id: string;
+  attempt: number;
+  error_class: "materialization_failed" | "settlement_failed" | "awaiting_materialization" | "late_tape_after_fence";
+}
+
+/** Read-only: never release held jobs or expose their payload/raw error. */
+export async function listTapeJobAlertCandidates(q: Queryable): Promise<TapeJobAlertCandidate[]> {
+  const result = await q.query<TapeJobAlertCandidate>(
+    `SELECT job_id, session_id, tape_id, attempt, 'materialization_failed'::text AS error_class
+       FROM turn_tape_materialization_jobs WHERE status='failed'
+     UNION ALL
+     SELECT job_id, session_id, tape_id, attempt,
+            CASE WHEN status='failed' THEN 'settlement_failed' ELSE last_error END AS error_class
+       FROM turn_tape_settlement_jobs
+      WHERE status='failed'
+         OR (status='held' AND (
+              (last_error='awaiting_materialization' AND created_at<NOW()-INTERVAL '1 hour')
+           OR (last_error='late_tape_after_fence' AND created_at<NOW()-INTERVAL '24 hours')
+         ))`,
+  );
+  // No LIMIT: already-alerted old jobs must not starve later candidates.
+  // created_at is stable across idempotent enqueue, unlike updated_at.
+  return result.rows;
 }
 
 export async function settlementHandoffPresent(

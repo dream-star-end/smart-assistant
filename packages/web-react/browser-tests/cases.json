@@ -116,7 +116,7 @@
     },
     {
       "id": "T29",
-      "proves": "真 Chromium 中 retrying wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后只显示一行模型繁忙正在重试软提示；同一在途 turn 随后收到实时正文与 final 时成功内容可见、发送态结束且没有中间 API Error 红卡"
+      "proves": "真 Chromium 中 retrying wire 帧经 HarnessWebSocket→ChatSocket→reducer→真实 MessageList 后只显示一行「正在自动重试…」软提示；同一在途 turn 随后收到实时正文与 final 时成功内容可见、发送态结束且没有中间 API Error 红卡"
     },
     {
       "id": "T30",

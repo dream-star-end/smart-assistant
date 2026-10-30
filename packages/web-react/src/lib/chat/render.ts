@@ -20,6 +20,7 @@ import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/proto
 import { isServerAuthoredRow } from "./model";
 import type { BashTail, ChatMessage, ChildBlock } from "./model";
 import { friendlyBridgeErrorMessage, insufficientCreditsCopy, isSilentTurnErrorCode, problemCardPresentation } from "./pure";
+import { readUserError } from "./userErrorView";
 
 /**
  * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
@@ -387,6 +388,7 @@ export function messageSignature(
         head,
         textSig(m.text),
         m.status ?? "",
+        m._deliveryState ?? "",
         (m._media?.length ?? 0),
         m._replyTo
           ? `${m._replyTo.messageId}:${m._replyTo.role}:${textSig(m._replyTo.text)}`
@@ -463,6 +465,7 @@ export function messageSignature(
         m._teamFallback ? 1 : 0,
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
+        m.cancelled ? 1 : 0,
         // 终态三态(server 行区分超时):变则徽记要重渲。
         m._delegateStatus ?? "",
         // 审查裁决(仅审查员行携带):与执行态正交,可能在委派完成后才到达,
@@ -479,6 +482,7 @@ export function messageSignature(
         textSig(m.text),
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
+        m.cancelled ? 1 : 0,
         m.summary ? m.summary.length : 0,
         (m.entries ?? []).length,
         m.entries?.length ? m.entries[m.entries.length - 1].phase : "",
@@ -512,8 +516,9 @@ export function safeMessageSignature(
  * 两态。仅在非运行态(已完成 / server 骨架)使用——运行态由调用方单独渲染"运行中"。
  */
 export function agentTerminalStatus(
-  m: Pick<ChatMessage, "_isError" | "_delegateStatus">,
-): { label: string; tone: "success" | "danger" | "warning" } {
+  m: Pick<ChatMessage, "_isError" | "_delegateStatus" | "cancelled">,
+): { label: string; tone: "success" | "danger" | "warning" | "neutral" } {
+  if (m.cancelled) return { label: "已取消", tone: "neutral" };
   if (m._delegateStatus === "timeout") return { label: "超时", tone: "warning" };
   if (m._isError || m._delegateStatus === "failed") return { label: "失败", tone: "danger" };
   return { label: "完成", tone: "success" };
@@ -650,6 +655,12 @@ export function errorLabel(code: string | undefined): string {
   return ERROR_LABELS[normalizeTurnErrorCode(code)] ?? "出错了";
 }
 
+/**
+ * 卡片正文写着这一轮计费事实的码(W3):错误目录的人话说不出来,沿用按码文案。
+ * model_config_changed_retry_turn 2026-10-06 一轮 22 次调用后被拒,卡片曾误写「不计费」。
+ */
+const BILLING_FACT_CODES = new Set(["model_config_changed_retry_turn", "project_context_unavailable"]);
+
 /** 免单类错误码集合:**从 protocol 单一权威派生**(TURN_ERROR_TAXONOMY 中 waivable===true)。 */
 const WAIVED_ERROR_CODES = WAIVED_TURN_ERROR_CODES;
 
@@ -776,8 +787,15 @@ function splitTrailingTerminator(text: string): { body: string; terminator: stri
 }
 
 export type ErrorPresentation = {
+  /** 展示用的归一化错误码(含 MODEL_AUTHORITY / ANTIGRAVITY 超限这类按正文改判后的码),查错误目录用。 */
+  code: string;
   title: string;
   message: string;
+  /**
+   * message 带着错误码说不出的这一轮的事实(免单 / 未计费 / 结果收尾 / 服务端白名单原因 / 开通引导),
+   * 卡片正文用它;否则正文用错误目录的人话(userError.message)。
+   */
+  fixedMessage?: boolean;
   /**
    * 失败轮里模型已产出的**合法部分回答**正文(Codex 审计 R6)。tape 水合把 _errorCode 挂在最后一个
    * assistant segment,其 text 可能同时携带正常部分回答;此字段承载那段正文,由 AssistantCard 用
@@ -880,6 +898,8 @@ export function errorPresentation(
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
   if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
     return {
+      code: normalized,
+      fixedMessage: true,
       title: "消息未开始处理",
       message: "消息未能开始处理，已确认未计费，请重试。",
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
@@ -895,6 +915,8 @@ export function errorPresentation(
       ? ""
       : partialAnswerBody(body);
     return {
+      code: normalized,
+      fixedMessage: true,
       title: "任务已中断",
       message: "此前已生成的过程已完整保留。你可以从现有进度继续；本轮未计费，如已扣除，积分已原路退回。",
       ...(partialAnswer ? { bodyText: partialAnswer } : {}),
@@ -914,6 +936,8 @@ export function errorPresentation(
           ? "任务未能产生有效回复。本轮未扣费，并已发送站内信说明。"
           : "长任务的执行凭证未能继续。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。你可以继续。";
     return {
+      code: normalized,
+      fixedMessage: true,
       title: "本轮已自动免单",
       message,
       ...(partialAnswer && partialAnswer !== code && partialAnswer !== detail ? { bodyText: partialAnswer } : {}),
@@ -927,6 +951,8 @@ export function errorPresentation(
       ? ""
       : partialAnswerBody(body);
     return {
+      code: normalized,
+      fixedMessage: true,
       title: "任务暂时中断",
       message: "已有进度已保留。可以从断点继续；已完成的调用按实际用量计费。",
       ...(partialAnswer ? { bodyText: partialAnswer } : {}),
@@ -943,6 +969,7 @@ export function errorPresentation(
           ? "任务未能产生有效回复。你可以继续。"
           : "长任务的执行凭证未能继续。你的消息已保留，可以继续。";
     return {
+      code: normalized,
       title: "任务未正常完成",
       message,
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
@@ -951,6 +978,7 @@ export function errorPresentation(
   }
   if (normalized === "auth_error") {
     return {
+      code: normalized,
       title: ERROR_LABELS.auth_error,
       message: "认证状态异常，本轮未正常完成。可以继续。",
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
@@ -972,6 +1000,8 @@ export function errorPresentation(
   ) {
     const partialAnswer = partialAnswerBody(text);
     return {
+      code: normalized,
+      fixedMessage: true,
       title: BOX_REPLAY_PENDING_SOFT_TITLE,
       message:
         "远端结果仍在确认中。已生成的内容已保留；稍后刷新即可看到完整结果，不会重复扣费。",
@@ -991,6 +1021,7 @@ export function errorPresentation(
   // OCV5-645:text 里切得出部分回答(partialAnswerBody)时也落到 R6,不因答复里带 JSON/栈帧就整段丢。
   if (normalized === "engine_error" && looksLikeInternalError(text) && !partialAnswerBody(text)) {
     return {
+      code: normalized,
       title: ERROR_LABELS.engine_error,
       message: "任务执行时遇到内部错误。你的消息已保留，可以直接重试。",
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
@@ -1023,6 +1054,9 @@ export function errorPresentation(
   const keepText = !isRaw && (t === byCode || serverMsgOk);
   if (keepText) {
     return {
+      code: normalized,
+      // 服务端白名单原因(容器更新指路、图片审核说明)、积分开通引导、计费事实是这一轮特有的说法。
+      fixedMessage: t !== byCode || normalized === "insufficient_credits" || BILLING_FACT_CODES.has(normalized),
       title: errorLabel(normalized),
       message: t,
       ...(safeDetail ? { detail: safeDetail } : {}),
@@ -1036,6 +1070,8 @@ export function errorPresentation(
   const detailOut = normalized === "request_too_large"
     ? safeDetail : safeDetail ?? sanitizeErrorDetail(terminator);
   return {
+    code: normalized,
+    fixedMessage: normalized === "insufficient_credits" || BILLING_FACT_CODES.has(normalized),
     title: errorLabel(normalized),
     message: byCode,
     ...(partialAnswer ? { bodyText: partialAnswer } : {}),
@@ -1076,15 +1112,21 @@ export function commitErrorCardSnapshot(
     presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
       ? "yellow"
       : "red";
-  const body = typeof messageOverride === "string" && messageOverride.length > 0
-    ? messageOverride
-    : presented.message;
+  const override = typeof messageOverride === "string" && messageOverride.length > 0;
+  const body = override ? messageOverride : presented.message;
+  // W3:卡片正文用错误目录的人话 —— 帧带的 userError 原样冻结;没有就冻结查目录用的码,由懒加载的
+  // 错误卡去查(目录不进首屏)。这一轮特有的事实(覆盖文案、计费 / 白名单说法)仍用 message。
+  const userError = override || presented.fixedMessage ? undefined : readUserError(message._userError);
+  const catalog = override || presented.fixedMessage
+    ? {}
+    : userError ? { userError } : { catalogCode: presented.code };
   message._errorCardSnapshot = {
     disposition: "card",
     tone,
     title: presented.title,
     message: body,
     ...(presented.detail ? { detail: presented.detail } : {}),
+    ...catalog,
   };
   return "card";
 }

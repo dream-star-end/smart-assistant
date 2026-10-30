@@ -1919,6 +1919,11 @@ function mergeLocalClientFields(
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
   serverMsg = carryRecoverySkippedNotice(serverMsg, localMsg);
+  // Delivery is a confirmed transport fact; a history response started before
+  // acceptance must not roll its badge back, including exact timeline user rows.
+  if (serverMsg.role === "user" && localMsg.role === "user" && localMsg._deliveryState && serverMsg._deliveryState !== "accepted") {
+    serverMsg = { ...serverMsg, _deliveryState: localMsg._deliveryState };
+  }
   // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
   if (
     localMsg._errorCardSnapshot &&

@@ -2,6 +2,8 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
+import { USER_ERROR_CATALOG } from "@openclaude/protocol/browser";
+import { manualTaskContinuationSource } from "../../lib/chat/manualTaskContinuation";
 import { ChatInteractionContext } from "../tool/context";
 import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
 import { BRAND } from "../../lib/brand";
@@ -126,7 +128,8 @@ describe("UserCard 复制", () => {
 });
 
 describe("AssistantCard 预期错误视觉语义", () => {
-  test("route unavailable 使用紧凑 warning 卡且无 trace 时不渲染详情", () => {
+  // W3:错误卡统一用 Notice(attention 语气);正文是错误目录的人话,原始码只在收起的技术详情里。
+  test("route unavailable 使用 attention 提示,无 trace 时技术详情只有码和消息 ID", () => {
     renderErr(errMsg({
       _errorCode: "codex_route_unavailable",
       _clientMessageId: "u1",
@@ -134,11 +137,13 @@ describe("AssistantCard 预期错误视觉语义", () => {
     }), {});
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveClass("border-warning/30", "px-3", "py-2");
-    expect(alert).not.toHaveClass("border-danger/30");
-    expect(alert).toHaveTextContent("模型服务暂时不可用");
+    expect(alert).toHaveAttribute("data-notice-tone", "attention");
+    expect(alert).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
     expect(alert).not.toHaveTextContent("GPT");
-    expect(screen.queryByText("查看请求信息")).toBeNull();
+    const details = screen.getByTestId("error-tech-details");
+    expect(details).not.toBeVisible();
+    expect(details).toHaveTextContent("错误码：codex_route_unavailable");
+    expect(details).not.toHaveTextContent("请求 ID");
   });
 });
 
@@ -430,6 +435,9 @@ describe("UserCard 状态标签(M-09)", () => {
     rerender(<UserCard msg={userMsg({ status: "read" })} cb={{}} />);
     expect(screen.queryByText("已读")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} awaitingReply />);
+    expect(screen.getByText("已受理")).toBeInTheDocument();
+    expect(screen.queryByText("已送达")).toBeNull();
+    rerender(<UserCard msg={userMsg({ status: "sent", _deliveryState: "accepted" })} cb={{}} awaitingReply />);
     expect(screen.getByText("已送达")).toBeInTheDocument();
     // sent 也是停止 / 中断 / 恢复源轮的落定态:不在等回复时不标「已送达」。
     rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
@@ -755,7 +763,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(onRegenerate).not.toHaveBeenCalled();
   });
 
-  test("找不到原 user 行(resolveRetryTarget→undefined)→ 不显精确「重试」,落回「重新尝试」", () => {
+  test("找不到可继续的原任务时不回退重放最后一条消息", () => {
     const onRegenerate = vi.fn();
     renderErr(errMsg({ _clientMessageId: "u1" }), {
       onRetrySend: vi.fn(),
@@ -767,7 +775,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(onRegenerate).not.toHaveBeenCalled();
   });
 
-  test("无 _clientMessageId → 即便 resolver 有值也不走精确路径(落回「重新尝试」)", () => {
+  test("仅有精确重发 resolver 不授予继续或原任务重放", () => {
     renderErr(errMsg({}), {
       onRetrySend: vi.fn(),
       onRegenerate: vi.fn(),
@@ -777,7 +785,8 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 
-  test("cta=retry_or_switch(model_capacity)→ 精确「重试」+「切换模型」引导文案", () => {
+  // W3:按错误目录给动作;没有入口的建议不再写成引导文案(以前是「或在上方切换模型后重试」)。
+  test("cta=retry_or_switch(model_capacity)→ 同任务「继续」+「切换模型」", () => {
     renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
       onRetrySend: vi.fn(),
       onOpenModelPicker: vi.fn(),
@@ -900,8 +909,8 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
   });
 
-  test("免单码(no_response)非可重试红卡 → 不显精确「重试」(保留 onRegenerate 兜底)", () => {
-    // waived=true 分支:presentedError.waived 为真 → retryEligible false。
+  test("免单码(no_response)仍按原任务继续，不重放请求", () => {
+    // 免单事实保留，继续动作仍由当前原任务来源授权。
     renderErr(errMsg({ _errorCode: "no_response", _clientMessageId: "u1", usage: { waived: true } }), {
       onRegenerate: vi.fn(),
       onContinueInterrupted: vi.fn(),
@@ -909,7 +918,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       resolveRetryTarget: () => retryableUser,
     });
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    // 末轮 + 兜底可用 → 「重新尝试」保留。
+    // 当前来源可用时显示继续。
     expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 
@@ -918,7 +927,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("末轮 idle timeout 且有 durable 断点 → 优先显示「从断点继续」", () => {
+  test("末轮 idle timeout 且有 durable 断点 → 优先显示「继续」", () => {
     const onContinueInterrupted = vi.fn();
     const error = errMsg({
       _errorCode: "LIVENESS_TIMEOUT",
@@ -979,19 +988,24 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  test("early terminal 后还有同轮过程（非页面尾行）→ marker 不取得续跑 CTA", () => {
+  test("早期错误之后已有同轮有效回答 → 来源门不授予继续 CTA", () => {
+    const error = errMsg({ _errorCode: "idle_timeout", _clientMessageId: "u1" });
+    const messages = [retryableUser, error, {
+      id: "a-completed", role: "assistant", text: "本轮后来已完成", ts: 2, _clientMessageId: "u1",
+    } as ChatMessage];
+    const onContinueInterrupted = vi.fn();
+    const onRegenerate = vi.fn();
     render(
       <AssistantCard
-        msg={errMsg({ _errorCode: "idle_timeout", _clientMessageId: "u1" })}
+        msg={error}
         ctx={{ isLast: false, sending: false, inActiveTurn: true }}
-        cb={{
-          onRegenerate: vi.fn(),
-          onContinueInterrupted: vi.fn(),
-          resolveInterruptedContinuation: () => retryableUser,
-        }}
+        cb={{ onRegenerate, onContinueInterrupted,
+          resolveInterruptedContinuation: (row) => manualTaskContinuationSource(messages, row) }}
       />,
     );
-    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^(继续|重试|重新尝试)$/ })).toBeNull();
+    expect(onContinueInterrupted).not.toHaveBeenCalled();
+    expect(onRegenerate).not.toHaveBeenCalled();
   });
 });
 
@@ -1494,7 +1508,7 @@ describe("sealed crashed tape does not keep 结果正在收尾", () => {
       _errorCardSnapshot: soft,
     }), {});
     expect(screen.getByRole("alert")).toHaveTextContent("任务执行失败");
-    expect(screen.getByRole("alert")).toHaveTextContent("任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。");
+    expect(screen.getByRole("alert")).toHaveTextContent(USER_ERROR_CATALOG.engine_error!.message);
     expect(screen.getByText("博客大纲已写完，正在排版。")).toBeInTheDocument();
     expect(screen.queryByText("结果正在收尾")).toBeNull();
     expect(screen.queryByText(/仍在确认|稍后刷新|不会重复扣费/)).toBeNull();
