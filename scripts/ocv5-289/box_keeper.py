@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Ancestor subreaper for the Box Claude supervisor (offline prototype).
+"""Ancestor subreaper and terminal proof publisher for the Box supervisor.
 
 P=keeper is the initial Exec process, W=stdout supervisor worker, C=Claude CLI.
 If W disappears, P adopts C before it is reaped and may safely signal C's
-numeric process group. No terminal proof is published by this prototype.
+numeric process group. Escaped descendants require their own kernel child fence;
+only actual ECHILD permits terminal publication.
 """
 import ctypes
 import errno
@@ -24,6 +25,8 @@ PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_PATH = re.compile(r"^/tmp/ocv5-289-(?:v2-)?supervisor-([a-f0-9]{16})\.py$")
 PROOF_DIR = re.compile(r"^/tmp/ocv5-289-proof-([a-f0-9]{24})$")
 EPOCH = re.compile(r"^[a-f0-9]{32}$")
+MAX_ADOPTED_CHILDREN = 256
+MAX_CHILDREN_BYTES = 4096
 
 
 def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | None]:
@@ -189,8 +192,65 @@ def stop_adopted_group(pid: int) -> bool:
     return False
 
 
+def owned_children() -> list[int]:
+    """Candidates only: proc may omit a child, so this is never an idle proof."""
+    fd = os.open(f"/proc/self/task/{os.getpid()}/children",
+                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        raw = os.read(fd, MAX_CHILDREN_BYTES + 1)
+    finally:
+        os.close(fd)
+    tokens = raw.split()
+    if (len(raw) > MAX_CHILDREN_BYTES or len(tokens) > MAX_ADOPTED_CHILDREN
+            or any(not token.isdigit() or len(token) > 10
+                   or not 0 < int(token) <= 2147483647 for token in tokens)):
+        raise ValueError("OWNED_CHILDREN_INVALID")
+    return list(dict.fromkeys(int(token) for token in tokens))
+
+
+def stop_owned_children(deadline: float) -> None:
+    """Signal only pidfds still proved to be this single reaper's children.
+
+    W has already been waited, the original leader's last group signal is over,
+    SIGCHLD is waitable, and no handler/thread reaps between validation and signal.
+    Bind the entire batch before signalling; never fall back to a numeric PID.
+    """
+    if (not hasattr(os, "pidfd_open") or not hasattr(os, "P_PIDFD")
+            or not hasattr(signal, "pidfd_send_signal")):
+        raise OSError(errno.ENOSYS, "CHILD_PIDFD_UNAVAILABLE")
+    handles = []
+
+    def running(pid: int, fd: int) -> bool:
+        status = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if status is not None and status.si_pid != pid:
+            raise ValueError("CHILD_PIDFD_IDENTITY_INVALID")
+        return status is None
+
+    try:
+        for pid in owned_children():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("CHILD_CLEANUP_DEADLINE")
+            fd = os.pidfd_open(pid, 0)
+            handles.append((pid, fd))
+            running(pid, fd)  # ECHILD rejects a foreign or recycled candidate.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid, fd in handles:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("CHILD_CLEANUP_DEADLINE")
+                if running(pid, fd):
+                    try:
+                        signal.pidfd_send_signal(fd, sig, None, 0)
+                    except ProcessLookupError:
+                        pass  # Reap and ECHILD, not this signal, decide completion.
+            if sig == signal.SIGTERM and handles:
+                time.sleep(min(.1, max(0, deadline - time.monotonic())))
+    finally:
+        for _, fd in handles:
+            os.close(fd)
+
+
 def reap_adopted_after_last_signal() -> bool:
-    """Bounded cleanup only *after* the CLI leader can no longer be signalled."""
+    """One shared budget for all batches; only real ECHILD proves all reaped."""
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
         try:
@@ -198,7 +258,11 @@ def reap_adopted_after_last_signal() -> bool:
         except ChildProcessError:
             return True
         if child_pid == 0:
-            time.sleep(.02)
+            try:
+                stop_owned_children(deadline)
+            except (OSError, ValueError):
+                return False
+            time.sleep(min(.02, max(0, deadline - time.monotonic())))
     return False
 
 

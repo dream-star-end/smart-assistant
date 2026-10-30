@@ -63,6 +63,7 @@ import {
   parseOcMemoryCommand,
 } from "./ocMemoryCli";
 import { errorLabel } from "./render";
+import { readUserError, type UserError } from "./userErrorView";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   supportsAutomaticTurnRecovery,
@@ -2422,7 +2423,17 @@ export function applyOutboundMessage(
     // max_tokens / pause_turn 截断标记。
     const stopReason = frame.meta?.stopReason;
     const truncatedReason = stopReason === "max_tokens" || stopReason === "pause_turn" ? stopReason : null;
-    if (truncatedReason && sess._streamingAssistant?.text) sess._streamingAssistant._truncated = truncatedReason;
+    if (truncatedReason) {
+      for (let i = sess.messages.length - 1; i >= 0; i--) {
+        const m = sess.messages[i];
+        if (m.role === "user") break;
+        if (m.role === "assistant" && m.text?.trim()) {
+          m._truncated = truncatedReason;
+          break;
+        }
+      }
+    }
+    const interrupted = frame.meta?.interrupted || suppressLegacyErrorText || stopReason === "error";
     // finalize plan / tool 卡。
     for (const m of sess.messages) {
       if (isImmutableTapeViewportRow(m)) continue;
@@ -2433,7 +2444,7 @@ export function applyOutboundMessage(
       if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error && !m._background) {
         m._completed = true;
         // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
-        if ((frame.meta?.interrupted || suppressLegacyErrorText) && !m.output && !m.bashTail) m.cancelled = true;
+        if (interrupted && !m.output && !m.bashTail) m.cancelled = true;
       }
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
@@ -2441,6 +2452,7 @@ export function applyOutboundMessage(
       // delegate_progress phase=done|error。
       if ((m.role === "agent-group" || m.role === "delegate-progress") && !m._completed && !m._background) {
         m._completed = true;
+        if (interrupted) m.cancelled = true;
         if (m.completedAt == null) m.completedAt = Date.now();
       }
     }
@@ -2544,6 +2556,7 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       sess._turnStartedAt = frame.meta.since;
     }
   }
+  if (frame.meta?.credits) sess._turnCredits = { ...frame.meta.credits };
 }
 
 // ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════
@@ -2627,6 +2640,8 @@ export type DeferredTerminalErrorPaint = {
   displayMessage?: string;
   clientMessageId?: string;
   traceId?: string;
+  /** 错误帧带的人话错误;旧服务没有,渲染时按错误码查目录。 */
+  userError?: UserError;
 };
 
 /**
@@ -2634,17 +2649,23 @@ export type DeferredTerminalErrorPaint = {
  * 只有下一轮 final 才会顺手扫掉),于是红卡下面一直转圈。按本轮归属把它们标成已取消。
  * 后台委派(_background)照旧等子任务自己的终态。
  */
-function settleOrphanTools(sess: ChatSession, ownerId: string | undefined): void {
+function settleOrphanProcesses(sess: ChatSession, ownerId: string | undefined): void {
   for (const m of sess.messages) {
-    if (m.role !== "tool" || m._completed !== false || m.error || m._background) continue;
-    if (isImmutableTapeViewportRow(m)) continue;
+    if (m._completed || m._background || isImmutableTapeViewportRow(m)) continue;
     if (ownerId && m._turnOwnerId && m._turnOwnerId !== ownerId) continue;
-    m._completed = true;
-    if (!m.output && !m.bashTail) m.cancelled = true;
+    if (m.role === "tool" && m._completed === false && !m.error) {
+      m._completed = true;
+      if (!m.output && !m.bashTail) m.cancelled = true;
+    } else if (m.role === "agent-group" || m.role === "delegate-progress") {
+      m._completed = true;
+      m.cancelled = true;
+      m.completedAt ??= Date.now();
+    }
   }
 }
 
-function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
+/** 返回这次是否新画了一张错误卡(已提交过的卡不重画,也就不该再上报一次)。 */
+function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): boolean {
   const silent = isSilentTurnErrorCode(paint.normalized);
   const keepQuietStopLine = paint.normalized === "stopped" || paint.normalized === "user_cancelled";
   const alreadyCommitted = paint.clientMessageId
@@ -2654,10 +2675,12 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
       m._errorCardSnapshot?.disposition === "card")
     : false;
   // 已经提交过的卡不再画第二张，也不改第一张。静默终态（重启/容器回收）不落错误行。
-  if (!alreadyCommitted && (!silent || keepQuietStopLine)) {
+  const painted = !alreadyCommitted && (!silent || keepQuietStopLine);
+  if (painted) {
     const msg = addMessage(sess, "assistant", paint.displayMessage ?? paint.text, {
       _errorCode: paint.normalized,
       _errorDetail: paint.detail,
+      ...(paint.userError ? { _userError: paint.userError } : {}),
       ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
       ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
     });
@@ -2670,7 +2693,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     ? sess._activeClientMessageId === paint.clientMessageId
     : true; // rolling compatibility for old gateways
   if (ownsActiveTurn) {
-    settleOrphanTools(sess, paint.clientMessageId ?? sess._activeClientMessageId);
+    settleOrphanProcesses(sess, paint.clientMessageId ?? sess._activeClientMessageId);
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
@@ -2699,6 +2722,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
       }
     }
   }
+  return painted;
 }
 
 /**
@@ -2718,6 +2742,7 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
     if (existing?._errorCardSnapshot?.disposition === "card") return false;
     if (existing) {
       existing._errorHeldForRecovery = undefined;
+      if (paint.userError && !existing._userError) existing._userError = paint.userError;
       if (paint.displayMessage) existing.text = paint.displayMessage;
       const disposition = commitErrorCardSnapshot(existing, paint.displayMessage);
       paintTerminalError(sess, paint, false);
@@ -2825,12 +2850,14 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     ? "user_cancelled"
     : normalizeBridgeErrorCode(frame.code);
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
+  const userError = readUserError(frame.userError);
   const paint: DeferredTerminalErrorPaint = {
     normalized,
     text: friendlyBridgeErrorMessage(normalized, frame.message || "出错了"),
     detail: safeBridgeErrorDetail(normalized, frame.traceId),
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+    ...(userError ? { userError } : {}),
   };
   const terminalDecision = frame.recoveryDisposition === "terminal";
   if (terminalDecision || isSilentTurnErrorCode(normalized)) {
@@ -2876,9 +2903,10 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     return;
   }
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
-  paintTerminalError(sess, paint, userCancelled);
+  const painted = paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
+  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
+  if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,
@@ -2913,12 +2941,14 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
+  const userError = readUserError(frame.userError);
   const paint: DeferredTerminalErrorPaint = {
     normalized,
     text: friendlyBridgeErrorMessage(frame.code, frame.message),
     detail: safeBridgeErrorDetail(frame.code, frame.traceId),
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+    ...(userError ? { userError } : {}),
   };
   if (isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
@@ -2955,9 +2985,10 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     return;
   }
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
-  paintTerminalError(sess, paint, userCancelled);
+  const painted = paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
+  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
+  if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,
@@ -2993,20 +3024,10 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
  * a multi-request root turn is still active. */
 export const TURN_COST_REMINDER_CREDITS = 500n;
 
-function applyTurnCostReminder(sess: ChatSession, frame: CostChargedWire): void {
-  if (!sess._sendingInFlight) return;
-  const requestId = typeof frame.requestId === "string" ? frame.requestId.trim() : "";
-  if (!requestId) return;
+function applyTurnCostReminder(sess: ChatSession, requestId: string | undefined, actualDebit: bigint | null): void {
+  if (!sess._sendingInFlight || !requestId || actualDebit === null || actualDebit <= 0n) return;
   const seen = sess._turnCostSeenRequestIds ?? new Set<string>();
   if (seen.has(requestId)) return;
-
-  let actualDebit: bigint;
-  try {
-    actualDebit = BigInt(frame.debitedCredits ?? frame.costCredits ?? "");
-  } catch {
-    return;
-  }
-  if (actualDebit <= 0n) return;
 
   seen.add(requestId);
   sess._turnCostSeenRequestIds = seen;
@@ -3023,7 +3044,7 @@ function applyTurnCostReminder(sess: ChatSession, frame: CostChargedWire): void 
   }
 }
 
-// ═══════════════ cost_charged（商业版，响应徽章不去重；提醒按 requestId 精确去重）═══════════════
+// ═══════════════ cost_charged（实扣展示按会话 requestId 去重）═══════════════
 export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWire, effects: FrameEffects = {}): void {
   const refresh = () => {
     if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) effects.refreshBalance?.();
@@ -3032,7 +3053,26 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     refresh();
     return;
   }
-  applyTurnCostReminder(sess, frame);
+  let add: bigint | null = null;
+  try {
+    const parsed = BigInt((frame.debitedCredits ?? frame.costCredits) as string);
+    add = parsed < 0n ? null : parsed;
+  } catch { /* malformed display amount */ }
+  const requestId = frame.requestId?.trim();
+  if (requestId && add !== null) {
+    const seen = sess._costChargedSeenRequestIds ??= new Set<string>();
+    if (seen.has(requestId)) { refresh(); return; }
+    seen.add(requestId);
+    if (seen.size > 512) seen.delete(seen.values().next().value!);
+  }
+  applyTurnCostReminder(sess, requestId, add);
+  if (sess._sendingInFlight && add !== null) {
+    let settled = add;
+    try { settled += BigInt(sess._turnCredits?.settled ?? "0"); } catch { /* old local state */ }
+    sess._turnCredits = {
+      settled: settled.toString(), requests: (sess._turnCredits?.requests ?? 0) + 1, asOf: Date.now(),
+    };
+  }
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。
   //
   // Fix B — 委派成本精确归属:frame.parentSessionId 存在 = 这是委派子智能体的成本,它属于
@@ -3052,14 +3092,6 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     Date.now() - sess._lastFinaledAt < COST_CHARGED_LAST_FINAL_TTL_MS
   ) {
     target = sess.messages.find((m) => m.id === sess._lastFinaledAssistantId) || null;
-  }
-  // 解析 costCredits → BigInt（负数/非法 → null，丢弃累加但仍刷余额）。
-  let add: bigint | null = null;
-  try {
-    const parsed = BigInt(frame.costCredits as string);
-    add = parsed < 0n ? null : parsed;
-  } catch {
-    add = null;
   }
   // (a) 无 target：
   //   - **turn 进行中（_sendingInFlight）→ 入队 _pendingCostCredits**，收尾时 drain 到本轮响应。

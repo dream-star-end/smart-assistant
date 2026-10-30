@@ -22,13 +22,15 @@ const orphan = { requestId: "box-orphan", uid: 3n, accountId: 20n, runNonce: "a"
 
 function service(opts: { orphan: unknown; stop?: string; error?: Error; claim?: boolean }) {
   const calls: string[] = [];
+  const claims: { requestId: string; by: string; replacing?: string }[] = [];
   let firstInput: { resumeToolResults?: boolean } | null = null;
   const journal = { claimRemoteCleanup: async () => true, remoteCleanupStatus: async () => "pending",
     remoteCleanupDoneByRunIdentity: async () => false, prelaunchCleanupDoneByRunIdentity: async () => false,
     markRemoteCleaned: async () => {}, listRemoteCleanupCandidates: async () => [],
     findOrphanToolHandoff: async (input: { toolIds: readonly string[]; turnKey: string }) => {
       calls.push(`find:${input.toolIds.join(",")}`); return opts.orphan; },
-    claimOrphanRecovery: async (input: { requestId: string; by: string }) => {
+    claimOrphanRecovery: async (input: { requestId: string; by: string; replacing?: string }) => {
+      claims.push(input);
       calls.push(`claim-orphan:${input.requestId}:${input.by}`); return opts.claim ?? true; },
     releaseOrphanRecovery: async (input: { requestId: string }) => { calls.push(`release:${input.requestId}`); } };
   const svc = new BoxToolFetch({ supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
@@ -47,7 +49,7 @@ function service(opts: { orphan: unknown; stop?: string; error?: Error; claim?: 
           keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 } };
     }) as never,
   });
-  return { svc, calls, firstInput: () => firstInput };
+  return { svc, calls, claims, firstInput: () => firstInput };
 }
 
 test("OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation", async () => {
@@ -62,6 +64,18 @@ test("OCV5-304 a recovered dispatch stops the orphan and continues as a fresh in
   const stopped = service({ orphan: { kind: "orphan", stopped: true, identity: orphan } });
   assert.equal((await stopped.svc.fetch(call)).status, 200);
   assert.deepEqual(stopped.calls, ["claim", "find:toolu_S", "claim-orphan:box-orphan:box-recover", "first"]);
+});
+
+test("stale stopped recovery forwards the old holder and reloads history once", async () => {
+  const s = service({ orphan: { kind: "orphan", stopped: true,
+    staleClaim: "box-stopped-holder", identity: orphan } });
+  const response = await s.svc.fetch(call);
+  assert.match(await response.text(), /message_stop/);
+  assert.deepEqual(s.claims, [{ requestId: "box-orphan", uid: 3n,
+    by: "box-recover", replacing: "box-stopped-holder" }]);
+  assert.equal(s.firstInput()?.resumeToolResults, true);
+  assert.equal(s.calls.filter((call) => call === "first").length, 1);
+  assert.equal(s.calls.some((call) => call.startsWith("stop:")), false);
 });
 
 test("concurrent recoveries continue the exchange only once", async () => {

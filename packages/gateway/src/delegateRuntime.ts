@@ -1123,50 +1123,6 @@ export async function _runDelegateTaskCore(
     return { kind: 'rejected', httpStatus: 400, message: 'delegation depth limit exceeded (max 3)' }
   }
 
-  // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
-  //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
-  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
-  // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
-  // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
-  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。失败/超时的委派同样占额度:每次
-  // 尝试都是全额计费的 delegate session。本闸先于资源闸排队:per-turn 额度等不出来 fail
-  // fast、不占等待名额(保守偏置)。
-  const delegateGuardKey =
-    typeof parentSessionKey === 'string' && parentSessionKey
-      ? parentSessionKey
-      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
-  if (isTeamReviewExecution(targetAgentId)) {
-    const hiddenLimit = resolveHiddenDelegationsPerTurn()
-    if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
-      this.log.warn('delegate_hidden_limit', {
-        targetAgentId,
-        guardKey: delegateGuardKey,
-        limit: hiddenLimit,
-      })
-      return {
-        kind: 'rejected',
-        httpStatus: 429,
-        message: `审查委派已达本轮上限(${hiddenLimit}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
-      }
-    }
-  } else if (!isReview) {
-    // 普通成员委派(队长直接派给已安装成员)。isReview 豁免(那是内部硬编排,走 hidden 分支)。
-    const memberLimit = resolveMemberDelegationsPerTurn()
-    const memberGuard = (this._memberDelegateGuard ??= new PerTurnDelegationGuard(memberLimit))
-    if (!memberGuard.tryAcquire(delegateGuardKey)) {
-      this.log.warn('delegate_member_limit', {
-        targetAgentId,
-        guardKey: delegateGuardKey,
-        limit: memberLimit,
-      })
-      return {
-        kind: 'rejected',
-        httpStatus: 429,
-        message: `本轮委派已达上限(${memberLimit} 次/turn)。请先整合已经收到的成员结果,基于现有产出继续推进;若确实还需要更多子任务,合并为更少的委派或分两轮进行,不要在同一轮内持续拆分委派。`,
-      }
-    }
-  }
-
   // Find target agent
   const cfg = await this._getAgentsConfig()
   const identityProjection = await fetchIdentityCompatProjection()
@@ -1253,6 +1209,50 @@ export async function _runDelegateTaskCore(
       httpStatus: mapped.httpStatus,
       message: mapped.message,
       code: mapped.code,
+    }
+  }
+
+  // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
+  //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限(env OPENCLAUDE_HIDDEN_DELEGATIONS_PER_TURN,默认 3);
+  //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
+  // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
+  // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
+  // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。本地预检拒绝不占额度;预检通过后
+  // 已启动的失败/超时仍占额度。本闸先于资源闸排队:per-turn 额度等不出来 fail
+  // fast、不占等待名额(保守偏置)。
+  const delegateGuardKey =
+    typeof parentSessionKey === 'string' && parentSessionKey
+      ? parentSessionKey
+      : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
+  if (isTeamReviewExecution(targetAgentId)) {
+    const hiddenLimit = resolveHiddenDelegationsPerTurn()
+    if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey, Date.now(), hiddenLimit)) {
+      this.log.warn('delegate_hidden_limit', {
+        targetAgentId,
+        guardKey: delegateGuardKey,
+        limit: hiddenLimit,
+      })
+      return {
+        kind: 'rejected',
+        httpStatus: 429,
+        message: `审查委派已达本轮上限(${hiddenLimit}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+      }
+    }
+  } else if (!isReview) {
+    // 普通成员委派(队长直接派给已安装成员)。isReview 豁免(那是内部硬编排,走 hidden 分支)。
+    const memberLimit = resolveMemberDelegationsPerTurn()
+    const memberGuard = (this._memberDelegateGuard ??= new PerTurnDelegationGuard(memberLimit))
+    if (!memberGuard.tryAcquire(delegateGuardKey)) {
+      this.log.warn('delegate_member_limit', {
+        targetAgentId,
+        guardKey: delegateGuardKey,
+        limit: memberLimit,
+      })
+      return {
+        kind: 'rejected',
+        httpStatus: 429,
+        message: `本轮委派已达上限(${memberLimit} 次/turn)。请先整合已经收到的成员结果,基于现有产出继续推进;若确实还需要更多子任务,合并为更少的委派或分两轮进行,不要在同一轮内持续拆分委派。`,
+      }
     }
   }
 

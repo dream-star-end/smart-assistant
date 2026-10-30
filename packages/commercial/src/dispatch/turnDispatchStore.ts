@@ -772,3 +772,69 @@ export async function clearDispatchShutdownEvidence(
   )
   return res.rowCount ?? 0
 }
+
+/** Link recovery reads dispatch ownership and the session tombstone in one PG snapshot.
+ * Keep these queries with the dispatch authority instead of in transport code. */
+export type LinkCarrier = { uid: string; containerId: number }
+export type LinkDispatch = {
+  sessionId: string; clientMessageId: string; agentId: string
+  dispatchId: string; attemptNo: number; leaseEpoch: number
+}
+
+export async function scanContainerLinkCarriers(pool: Queryable, channel: string, after: LinkCarrier | null): Promise<LinkCarrier[]> {
+  const result = await pool.query<{ user_id: string; container_id: number }>(
+    `SELECT DISTINCT d.user_id, d.agent_container_id::int AS container_id
+       FROM turn_dispatches d JOIN agent_containers ac ON ac.id=d.agent_container_id AND ac.user_id=d.user_id
+       JOIN client_sessions s ON s.id=d.session_id AND s.user_id='c:' || d.user_id::text
+      WHERE d.status IN ('admitted','accepted') AND d.terminal_at IS NULL AND s.deleted_at IS NULL
+        AND ac.state='active' AND ac.runtime_channel=$1 AND ac.runtime_kind IN ('docker','desktop')
+        AND ($2::bigint IS NULL OR (d.user_id,d.agent_container_id)>($2::bigint,$3::bigint))
+      ORDER BY d.user_id, d.agent_container_id::int LIMIT 100`,
+    [channel, after?.uid ?? null, after?.containerId ?? null],
+  )
+  return result.rows.map(row => ({ uid: row.user_id, containerId: row.container_id }))
+}
+
+export async function readContainerLinkDispatches(pool: Queryable, carrier: LinkCarrier): Promise<LinkDispatch[]> {
+  const result = await pool.query<{
+    session_id: string; client_message_id: string; agent_id: string
+    dispatch_id: string; attempt_no: number; lease_epoch: string
+  }>(
+    `SELECT d.session_id,d.client_message_id,d.agent_id,d.dispatch_id,d.attempt_no,d.lease_epoch
+       FROM turn_dispatches d JOIN client_sessions s ON s.id=d.session_id AND s.user_id='c:' || d.user_id::text
+      WHERE d.user_id=$1 AND d.agent_container_id=$2 AND d.status IN ('admitted','accepted')
+        AND d.terminal_at IS NULL AND s.deleted_at IS NULL ORDER BY d.admitted_at`,
+    [carrier.uid, carrier.containerId],
+  )
+  return result.rows.map(row => ({ sessionId: row.session_id, clientMessageId: row.client_message_id,
+    agentId: row.agent_id, dispatchId: row.dispatch_id, attemptNo: row.attempt_no, leaseEpoch: Number(row.lease_epoch) }))
+}
+
+export type ContainerLinkControlTarget = { control_id: string; container_id: number }
+
+/** Select a durable control's carrier under the same session ownership/tombstone fence. */
+export async function readContainerLinkControlTargets(
+  pool: Queryable, uid: bigint, channel: string, after: string | null,
+): Promise<ContainerLinkControlTarget[]> {
+  const result = await pool.query<ContainerLinkControlTarget>(
+    `SELECT c.control_id,ac.id::int AS container_id
+       FROM turn_control_requests c
+       JOIN client_sessions s ON s.id=c.session_id AND s.user_id='c:' || c.user_id::text AND s.deleted_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT d.agent_container_id FROM turn_dispatches d
+          WHERE d.user_id=c.user_id AND d.session_id=c.session_id
+          ORDER BY (d.client_message_id=COALESCE(c.payload_json->>'clientMessageId',c.root_client_message_id)) DESC NULLS LAST,
+                   d.admitted_at DESC,d.dispatch_id DESC LIMIT 1
+       ) d ON true
+       JOIN agent_containers ac ON ac.user_id=c.user_id AND ac.state='active' AND ac.runtime_channel=$2
+        AND ac.runtime_kind IN ('docker','desktop')
+        AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
+          SELECT 1 FROM agent_containers other WHERE other.user_id=c.user_id AND other.state='active'
+            AND other.runtime_channel=$2 AND other.runtime_kind IN ('docker','desktop') AND other.id<>ac.id)))
+      WHERE c.user_id=$1 AND c.status IN ('pending','leased') AND c.next_attempt_at<=NOW()
+        AND (c.status='pending' OR c.lease_until<NOW())
+        AND ($3::text IS NULL OR c.control_id>$3)
+      ORDER BY c.control_id LIMIT 100`, [String(uid), channel, after],
+  )
+  return result.rows
+}

@@ -589,7 +589,8 @@ export function ConnectorsTab({
     return (
       <PluginRow
         key={key}
-        row={row}
+        // 本机插件没有卡片(不需要账号),按已连接处理。
+        row={{ ...row, connected: card ? card.connected : true }}
         busy={!preferencesKnown || toggling === key}
         onOpen={() => setSelected(key)}
         onConnect={canConnect ? () => {
@@ -793,7 +794,7 @@ export function ConnectorsTab({
           「添加」portal 进上下文行右侧；它是本分区唯一的头部动作。 */}
       <PanelHeader
         title="插件"
-        hint="打开开关就能在对话里用；点插件进入设置（账号、权限、各项开关）。"
+        hint="连上账号、打开开关就能在对话里用；点插件进入设置（账号、权限、各项开关）。"
         action={
           onOpenMarketplace && (
             <Button size="sm" variant="ghost" onClick={onOpenMarketplace} aria-label="添加插件">
@@ -848,7 +849,7 @@ export function ConnectorsTab({
           <>
             {/* 每个插件是一段「标题 + 说明 + 元信息 + 它的账号列表」，段与段之间一条发丝线；
                 不再是「每个插件一张卡、卡里再套账号卡」。两组都非空时才出组标题。 */}
-            {/* OCV5-383：一级列表每个插件一行「图标 + 名称 + 状态 + 启用开关」，点行进入详情。
+            {/* OCV5-383：一级列表每个插件一行「图标 + 名称 + 状态 + 连接或启用开关」，点行进入详情。
                 已连接与本机插件（不用账号）在前，未连接在后；两组都非空时才出组标题。 */}
             {connectedCards.length + localPlugins.length > 0 && (
               <ConnectorGroup label={grouped ? '已连接' : undefined} count={connectedCards.length + localPlugins.length}>

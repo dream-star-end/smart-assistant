@@ -274,13 +274,65 @@ export function refreshAuth(
   return flight;
 }
 
+/** 距 access JWT exp 不足这么久就先续期，避免轮询先打出一条 401。 */
+export const ACCESS_REFRESH_LEAD_MS = 90_000;
+
+/**
+ * 浏览器侧读 JWT exp（atob，不打日志）。空串 / 非 JWT / exp 非数字 → false，
+ * 调用方保持原请求。已过期同样为 true。
+ */
+export function accessTokenNeedsRefresh(
+  token: string,
+  nowMs: number = Date.now(),
+  leadMs: number = ACCESS_REFRESH_LEAD_MS,
+): boolean {
+  const expMs = jwtExpMs(token);
+  if (expMs === null) return false;
+  return expMs - nowMs <= leadMs;
+}
+
+function jwtExpMs(token: string): number | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const body = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = body + "=".repeat((4 - (body.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded)) as { exp?: unknown };
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function expiredAccessResponse(): Response {
+  return new Response(
+    JSON.stringify({ error: { code: "UNAUTHORIZED", message: "invalid or expired token" } }),
+    { status: 401, headers: { "content-type": "application/json" } },
+  );
+}
+
 // export：admin 数据层（src/admin/lib/adminApi.ts）复用同一套透明刷新重放，
 // 不新建第二套鉴权/刷新机制。仅加导出，实现不动。
 export async function callWithRefresh(
   a: AuthSession,
   make: (token: string) => Promise<Response>,
 ): Promise<Response> {
-  const used = a.snapshot();
+  let used = a.snapshot();
+  // access 15 分钟到期。铃铛等轮询若等 401 再刷新，控制台会先记一条 401。
+  // 距 exp 不足 90s（或已过期）先静默续期再发请求。非 JWT 不预刷新。只尝试一次，
+  // 新 token 仍临近过期也不再预刷新，避免和下面的 401 重放叠成循环。
+  if (accessTokenNeedsRefresh(used.token)) {
+    const pre = await refreshAuth(a, used.epoch);
+    const after = a.snapshot();
+    if (after.epoch !== used.epoch || pre.kind === "stale") throw new AuthEpochStaleError();
+    if (pre.kind === "invalid") {
+      a.expire(used.epoch);
+      return fenceAuthResponse(expiredAccessResponse(), a, used.epoch);
+    }
+    if (pre.kind === "success" && after.token === pre.result.accessToken) {
+      used = after;
+    }
+  }
   const res = await make(used.token);
   // 普通 2xx/4xx 也可能在换号后才返回；旧身份响应不得交给调用方解析、写入当前 UI。
   if (a.snapshot().epoch !== used.epoch) throw new AuthEpochStaleError();
