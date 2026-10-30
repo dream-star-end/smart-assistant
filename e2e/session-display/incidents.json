@@ -9047,6 +9047,30 @@
           "assertion": "proveKeeperOwnedChildren(CANDIDATE)"
         }
       ]
+    },
+    {
+      "id": "INC-20261030-BOX-AGENT-SESSION-409",
+      "occurredAt": "2026-10-30",
+      "severity": "P0",
+      "symptom": "Box第五回合父请求停在工具handoff时，内建Agent两次返回409。调用链确认子Agent沿用全局CLI API session，journal在数值cap前拒同session；历史未记录原始子UUID，故不把源码推断当作已落日志。修复为真实Agent稳定独立API UUID、每次invocation原authority快照与服务端generation墓碑；Stop先持久fence，再由原nonce/epoch keeper物理证明和结算收口，后台不借下一回合authority。不改容量、原proof预算、132/14历史扣费。",
+      "rootFixCommit": "1283304b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/boxAgentScope.test.ts",
+          "assertion": "real subagents get stable independent API UUIDs; root/teammate/other models retain the root"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxAgentScopes.integ.test.ts",
+          "assertion": "committed cancel-before-admit fences a late HTTP request even after a positive no-run receipt"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-664-box-agent-session] PASS"
+        }
+      ]
     }
   ]
 }
