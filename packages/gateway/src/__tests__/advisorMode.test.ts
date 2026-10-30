@@ -34,15 +34,58 @@ describe('advisor no-write intent', () => {
       '顾问只给建议，不要改文件。用三条短句说，刚才那份提纲还缺什么。',
       '不要修改任何文件', '别动代码', '禁止写入工作区', '请勿删除文件',
       '不用改文件', '本轮不修改代码', '不要对文件做任何修改', '文件先不要改',
-      '不要改 README.md', '只给修改建议', '仅做分析', '只回复三句话', '只读检查',
+      '只给修改建议', '仅做分析', '只回复三句话', '只读检查',
       'Do not modify any files.', "Don't edit files.", 'Don’t touch the code.',
       'Do not make any changes to files.', 'Do not create or delete files.',
-      "Don't touch README.md", 'No file changes.', 'Review without modifying files.',
+      'No file changes.', 'Review without modifying files.',
       'Keep the workspace unchanged.', 'Read-only review.', 'readonly analysis',
       'Advice only.', 'Only give me suggestions.', 'Just provide recommendations.', 'Only reply in chat.',
     ]) {
       assert.equal(detectAdvisorNoWrite(request), true, request)
     }
+  })
+
+  it('does not turn a target-specific prohibition into a whole-turn write ban', () => {
+    for (const request of [
+      '请修改 app.ts，不要改 README.md。',
+      '不要改 README.md',
+      '请修改 app.ts，不要改 README.md 文件。',
+      '请修改 app.ts，不要修改 docs/ 下的文件。',
+      '请修改 app.ts，README.md 只读。',
+      '请修改 app.ts，不要改任何其他文件。',
+      '请修改 app.ts，除 app.ts 外不要修改任何文件。',
+      'Update app.ts, do not modify README.md.',
+      "Don't touch README.md",
+      'Do not edit the README.md file; update app.ts.',
+      'Update app.ts; do not edit files in docs/.',
+      'Keep README.md unchanged and edit app.ts.',
+      'Edit app.ts, keep README.md read-only.',
+      'Update app.ts, do not modify any other files.',
+      'Update app.ts; do not modify any files except app.ts.',
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), false, request)
+      const snapshot = buildAdvisorSnapshot({
+        question: 'Check the request.', concern: '', advisorModel: 'gpt-6-astra',
+        source: { userTask: request },
+      })
+      assert.equal(snapshot.constraints.includes(ADVISOR_NO_WRITE_CONSTRAINT), false, request)
+    }
+  })
+
+  it('keeps whole-turn restrictions when the request also names specific files', () => {
+    for (const request of [
+      '不要修改任何文件，包括 app.ts 和 README.md。',
+      '不要修改任何一个文件',
+      '不要修改文件的内容',
+      '请看 app.ts 和 README.md，不要改文件。',
+      '只读检查 app.ts 和 README.md。',
+      '只给 README.md 的建议，不要改任何文件。',
+      'Do not modify any files, including app.ts and README.md.',
+      'Do not modify any of the files',
+      'Read app.ts and README.md. Do not edit any files.',
+      'Read-only review of README.md and app.ts.',
+      'Only give advice about app.ts; do not write files.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
   })
 
   it('does not restrict ordinary implementation or unrelated requests not to stop or ask', () => {

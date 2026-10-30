@@ -84,19 +84,39 @@ export function uniquePendingConsultInvocationId(
 export const ADVISOR_NO_WRITE_CONSTRAINT =
   '【本轮禁止写文件】用户要求本轮只读、只给建议或仅回复。主模型只能用只读工具验证，交付只写回复；不得写入、修改、新建或删除文件，不得通过命令、MCP 或委派绕过。顾问不要建议主模型改文件、执行写命令或把建议落实到文件。'
 
-/** Evaluate the original user turn only; never infer permissions from injected prompts or history. */
+const ZH_WRITE_BAN = String.raw`(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)`
+const ZH_WRITE_VERB = String.raw`(?:改(?:动|写)?|更改|修改|编辑|写入?|创建|新建|删除|保存|更新|覆盖|触碰|动)`
+const ZH_ALL_FILES = String.raw`(?:(?:任何|所有|任意|全部)(?:一个|一份)?(?:的)?\s*)?(?:文件|代码|文档|仓库|工作区|源码|磁盘)(?:的内容)?`
+// A named file, subset, or file property is a local constraint. Only a generic
+// object (optionally followed by a purpose/example) disables all turn writes.
+const ZH_GLOBAL_END = String.raw`(?=$|\s*(?:来|以|去|作为|用于|包括|包含|例如|比如|[（(]))`
+const EN_WRITE_BAN = String.raw`\b(?:do\s+not|don't|never|must\s+not|cannot|can't|no)\s+(?:(?:actually|directly|ever)\s+)*`
+const EN_WRITE_VERB = String.raw`(?:modify|edit|change|write|create|delete|remove|save|update|overwrite|touch|patch)`
+const EN_ALL_FILES = String.raw`(?:(?:any|all)(?:\s+of)?\s+)?(?:(?:the|this|current|entire|whole)\s+)?(?:files?|code|documents?|repo(?:sitory)?|workspace|disk|anything)\b`
+const EN_GLOBAL_END = String.raw`(?!\s+(?:in|under|inside|within|named|called|matching|from|[\w/-]+\.[a-z]{1,8})\b)`
+const ADVISOR_WHOLE_TURN_REPLY_ONLY = [
+  /^\s*(?:(?:请|帮我|本轮|这轮|这一轮|全程|主模型|以)\s*)*(?:禁写|只读|(?:只|仅)(?:允许|需要|需|用|做)?\s*(?:查看|检查|分析|审查|给(?:出)?(?:意见|(?:修改)?建议|方案)|提供(?:意见|建议|方案)|提建议|回复|回答|输出建议|告诉我|说))/,
+  /^\s*(?:please\s+)?(?:read[\s-]?only|(?:advice|suggestions?|response|reply)\s+only|(?:only|just)\s+(?:(?:give|provide)\s+(?:me\s+)?(?:advice|suggestions?|recommendations?)|advise|answer|respond|reply|explain|review|analy[sz]e))\b/i,
+]
+const ADVISOR_WHOLE_TURN_NO_WRITE = [
+  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:(?:再|去|实际|直接|自动|擅自|执行|进行)\s*)*${ZH_WRITE_VERB}\s*${ZH_ALL_FILES}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:对)?${ZH_ALL_FILES}\s*(?:做|进行|作)?\s*(?:任何)?${ZH_WRITE_VERB}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`^\s*${ZH_ALL_FILES}\s*(?:都|也|先|暂时)?\s*${ZH_WRITE_BAN}\s*${ZH_WRITE_VERB}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`${EN_WRITE_BAN}(?:${EN_WRITE_VERB}(?:\s+(?:or|and)\s+${EN_WRITE_VERB})*|(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?|patches?))\s+(?:(?:to|on|into)\s+)?${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
+  new RegExp(String.raw`\bwithout\s+(?:modifying|editing|changing|writing|creating|deleting|saving|updating|touching)\s+${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
+  /\bno\s+(?:file|code|document|workspace)\s+(?:writes?|changes?|edits?|modifications?)\b(?!\s+(?:to|in|under|inside|within|for|from)\b)/i,
+  new RegExp(String.raw`\b(?:keep|leave)\s+${EN_ALL_FILES}\s+(?:unchanged|untouched|unmodified)\b`, 'i'),
+]
+
+/** Only whole-turn intent disables all writes; target-specific restrictions remain in the task. */
 export function detectAdvisorNoWrite(userText: string): boolean {
   const text = userText.normalize('NFKC').replace(/[’‘]/g, "'")
-  return [
-    /(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)\s*(?:(?:再|去|实际|直接|自动|擅自|执行|进行)\s*)*(?:改(?:动|写)?|更改|修改|编辑|写入?|创建|新建|删除|保存|更新|覆盖|触碰|动)[^。！？!?\n，,；;]{0,20}(?:文件|代码|文档|仓库|工作区|源码|磁盘|[\w/-]+\.[a-zA-Z]{1,8}\b)/,
-    /(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)\s*(?:对)?[^。！？!?\n，,；;]{0,12}(?:文件|代码|文档|仓库|工作区|源码|磁盘)\s*(?:做|进行|作)?\s*(?:任何)?\s*(?:改动|更改|修改|编辑|写入|删除|更新|覆盖)/,
-    /(?:文件|代码|文档|仓库|工作区|源码|磁盘)\s*(?:都|也|先|暂时)?\s*(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|不)\s*(?:改|修改|编辑|写|创建|删除|更新|覆盖|动)/,
-    /(?:禁写|只读|(?:只|仅)(?:允许|需要|需|用|做)?\s*(?:查看|检查|分析|审查|给(?:出)?(?:意见|(?:修改)?建议|方案)|提供(?:意见|建议|方案)|提建议|回复|回答|输出建议|告诉我|说))/,
-    /\b(?:do\s+not|don't|never|must\s+not|cannot|can't|no)\s+(?:(?:actually|directly|ever)\s+)*(?:modify|edit|change|write|create|delete|remove|save|update|overwrite|touch|patch|(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?|patches?))\b[^.!?\n,;]{0,40}\b(?:files?|code|documents?|repo(?:sitory)?|workspace|disk|anything|[\w/-]+\.[a-z]{1,8})\b/i,
-    /\bwithout\s+(?:modifying|editing|changing|writing|creating|deleting|saving|updating|touching)\b[^.!?\n,;]{0,40}\b(?:files?|code|documents?|repo(?:sitory)?|workspace|disk)\b/i,
-    /\b(?:no\s+(?:file|code|document|workspace)\s+(?:writes?|changes?|edits?|modifications?)|read[\s-]?only|(?:advice|suggestions?|response|reply)\s+only|(?:only|just)\s+(?:(?:give|provide)\s+(?:me\s+)?(?:advice|suggestions?|recommendations?)|advise|answer|respond|reply|explain|review|analy[sz]e))\b/i,
-    /\b(?:keep|leave)\b[^.!?\n,;]{0,24}\b(?:files?|code|documents?|repo(?:sitory)?|workspace)\b[^.!?\n,;]{0,16}\b(?:unchanged|untouched|unmodified)\b/i,
-  ].some((pattern) => pattern.test(text))
+  return text.split(/[。！？!?\n，,；;]+|\.(?=\s|$)/).some(
+    clause => ADVISOR_WHOLE_TURN_REPLY_ONLY.some(pattern => pattern.test(clause)) || (
+      !/(?:除[^。！？!?\n，,；;]{1,120}(?:外|以外)|\b(?:except|excluding|apart from|other than)\b)/i.test(clause) &&
+      ADVISOR_WHOLE_TURN_NO_WRITE.some(pattern => pattern.test(clause))
+    ),
+  )
 }
 
 export const ADVISOR_PREAMBLE = [
