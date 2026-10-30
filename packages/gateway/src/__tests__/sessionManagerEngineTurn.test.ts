@@ -233,6 +233,17 @@ async function waitForTurnTestStage(
   }
 }
 
+async function drainTurnTestCleanup(drain: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([drain, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('turn fixture cleanup drain exceeded 5 seconds')), 5_000);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   const keys = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN', 'OC_USER_ID'] as const;
   const previous = keys.map((key) => process.env[key]);
@@ -381,13 +392,15 @@ describe('long-task authority interruption keeps paid progress', () => {
         const sm = new SessionManager(makeConfigStub());
         let cleaning: Promise<void> | undefined;
         const cleanup = () => cleaning ??= (async () => {
-          acknowledge();
-          session?._externalTurnAbort?.abort(new Error('test cleanup'));
-          runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
           try {
-            await session?.runner.shutdown();
-            await submission?.catch(() => {}); // the phase/terminal awaits retain the actual failure
-            await sm.awaitPendingPersistence();
+            await drainTurnTestCleanup((async () => {
+              acknowledge();
+              session?._externalTurnAbort?.abort(new Error('test cleanup'));
+              runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+              await session?.runner.shutdown();
+              await submission?.catch(() => {}); // the phase/terminal awaits retain the actual failure
+              await sm.awaitPendingPersistence();
+            })());
           } finally {
             setV3MasterSinkSingleton(null);
             await master.close();
@@ -498,18 +511,20 @@ describe('long-task authority interruption keeps paid progress', () => {
     let session: AgentSession | undefined;
     let cleaning: Promise<void> | undefined;
     const cleanup = () => cleaning ??= (async () => {
-      controller.abort(new Error('test cleanup'));
-      runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
-      server.closeAllConnections();
       try {
-        await session?.runner.shutdown();
-        await run?.catch(() => {});
+        await drainTurnTestCleanup((async () => {
+          controller.abort(new Error('test cleanup'));
+          runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+          await session?.runner.shutdown();
+          await run?.catch(() => {});
+        })());
       } finally {
         setV3MasterSinkSingleton(null);
         if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
         else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
         if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
         else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+        server.closeAllConnections();
         if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     })();
@@ -1844,13 +1859,18 @@ describe("crash/interrupt partial persistence", () => {
     let completion: Promise<void> | undefined;
     let cleaning: Promise<void> | undefined;
     const cleanup = () => cleaning ??= (async () => {
-      sm.interruptClientTurn(session.sessionKey, clientMessageId);
-      session._externalTurnAbort?.abort(new Error('test cleanup'));
-      runner.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
-      await session.runner.shutdown();
-      await completion?.catch(() => {});
-      await sm.awaitPendingPersistence();
-      (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.delete(session.sessionKey);
+      try {
+        await drainTurnTestCleanup((async () => {
+          sm.interruptClientTurn(session.sessionKey, clientMessageId);
+          session._externalTurnAbort?.abort(new Error('test cleanup'));
+          runner.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+          await session.runner.shutdown();
+          await completion?.catch(() => {});
+          await sm.awaitPendingPersistence();
+        })());
+      } finally {
+        (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.delete(session.sessionKey);
+      }
     })();
     t.after(cleanup);
     try {
