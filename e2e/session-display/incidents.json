@@ -8986,6 +8986,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
           "assertion": "a manually continued diagnostic-only error does not become a saved answer"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts",
+          "assertion": "a mutable recovery alias cannot reintroduce 128 retired paid rows into idle"
         }
       ],
       "rootFixCommit": "34388f31",
@@ -8995,7 +9000,8 @@
         "f3431226",
         "061ca420",
         "aebfb4cb",
-        "c0688f55"
+        "c0688f55",
+        "031472d3"
       ]
     },
     {
