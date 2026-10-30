@@ -28,7 +28,7 @@ test('persistent vectors stay inside one embedding model across a switch and a s
   const originalFetch = globalThis.fetch
   const calls: Array<{ model: string; texts: string[] }> = []
   let failOpenAi = false
-  let storage: typeof import('../index.ts') | null = null
+  let storage: typeof import('../index.js') | null = null
 
   function apply(entries: string[]): void {
     for (const key of ENV_KEYS) {
@@ -51,13 +51,24 @@ test('persistent vectors stay inside one embedding model across a switch and a s
     ]
   }
 
+
+  // Same pins buildCoreMemoryEmbeddingContainerEnv emits for a usable OpenAI key.
+  // That builder lives in commercial; this storage test must not import it.
+  function openAiLargeEnv(): string[] {
+    return [
+      'EMBEDDING_PROVIDER=openai',
+      'EMBEDDING_MODEL=text-embedding-3-large',
+      'EMBEDDING_DIMENSIONS=1024',
+      'EMBEDDING_BASE_URL=https://api.openai.com/v1',
+      'EMBEDDING_API_KEY=sk-fake-openai-key',
+      'EMBEDDING_BATCH_SIZE=100',
+      'OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC=1',
+    ]
+  }
+
   try {
     process.env.OPENCLAUDE_HOME = home
-    storage = await import('../index.ts')
-    const { buildCoreMemoryEmbeddingContainerEnv } = await import(
-      '../../../commercial/src/agent-sandbox/coreMemoryEmbeddingEnv.ts'
-    )
-
+    storage = await import('../index.js')
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input))
       const body = JSON.parse(String(init?.body)) as { model: string; input: string[]; dimensions: number }
@@ -135,7 +146,7 @@ test('persistent vectors stay inside one embedding model across a switch and a s
 
     failOpenAi = true
     storage.resetEmbeddingProvider()
-    apply(buildCoreMemoryEmbeddingContainerEnv({}, { openAiApiKey: 'sk-fake-openai-key' }))
+    apply(openAiLargeEnv())
     const blocked = storage.getEmbeddingProvider()
     assert.equal(blocked.modelId, 'text-embedding-3-large')
     const refused = await storage.hybridArchivalSearch('acceptance-agent', 'paraphrase', blocked, 2)
@@ -153,7 +164,7 @@ test('persistent vectors stay inside one embedding model across a switch and a s
     await storage.closeSessionsDb()
     storage.resetVectorStore()
     storage.resetEmbeddingProvider()
-    apply(buildCoreMemoryEmbeddingContainerEnv({}, { openAiApiKey: 'sk-fake-openai-key' }))
+    apply(openAiLargeEnv())
     const switched = storage.getEmbeddingProvider()
     await storage.initVectorStore(switched.dimensions)
     const switchedHits = await storage.hybridArchivalSearch('acceptance-agent', 'paraphrase', switched, 2)

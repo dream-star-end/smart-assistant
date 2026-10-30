@@ -66,8 +66,7 @@ describe('openai api key pool', () => {
     } finally {
       resetOpenAiPlatformKeyCacheForTests()
       resetApiKeyPoolSnapshotForTests()
-      if (prev === undefined) delete process.env.OPENAI_API_KEY
-      else process.env.OPENAI_API_KEY = prev
+      process.env.OPENAI_API_KEY = prev ?? ''
     }
   })
 })
