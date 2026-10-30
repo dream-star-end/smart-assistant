@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,7 +19,6 @@ for (const key of ['OC_RUNTIME_CHANNEL', 'OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENC
 const { closeSessionsDb, paths } = await import('@openclaude/storage')
 const { SessionManager } = await import('../sessionManager.js')
 const { Gateway, PerTurnDelegationGuard } = await import('../server.js')
-const { MinimalPrivacyRunner } = await import('./fixtures/minimalPrivacyRunner.js')
 const { detectAdvisorNoWrite } = await import('../advisorMode.js')
 
 after(async () => {
@@ -33,7 +33,7 @@ const EMPTY: PartialSnapshot = {
 }
 
 /** The actual SessionManager and turn runner run through this neutral engine boundary. */
-class RecordingEngine extends MinimalPrivacyRunner {
+class RecordingEngine extends EventEmitter {
   readonly calls: Array<{ readOnly: boolean; input: TurnParams['input']; turnKey?: string }> = []
   readonly capabilities: EngineCapabilities
   readonly nativeSessionId = null
@@ -72,7 +72,6 @@ class RecordingEngine extends MinimalPrivacyRunner {
   getPartialSnapshot(): PartialSnapshot { return structuredClone(EMPTY) }
 
   submitTurn(params: TurnParams): EngineTurnRun {
-    this.recordBuiltPromptPrivacy()
     this.isRunning = true
     this.calls.push({ readOnly: params.readOnly === true, input: params.input, turnKey: params.turnKey })
     const fail = this.failNext
