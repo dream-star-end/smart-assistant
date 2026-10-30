@@ -31,7 +31,7 @@ import {
   MODEL_CATALOG_PATH as GW_CATALOG_PATH,
   TURN_LEASE_HEADER as GW_TURN_LEASE_HEADER,
 } from "@openclaude/gateway";
-import { AUTHORITY_TTL_MS } from "@openclaude/protocol";
+import { AUTHORITY_TTL_MS, TURN_LEASE_TTL_MS } from "@openclaude/protocol";
 
 import {
   ModelCatalogSnapshot,
@@ -472,6 +472,23 @@ describe("modelAuthorityGate — bridge 签名凭据", () => {
       }),
       "MODEL_AUTHORITY_INVALID",
     );
+  });
+
+  test("expired long lease is rejected by egress with or without the expired startup authority", async () => {
+    const s = snap();
+    const issuedAt = 1_800_000_000_000;
+    const { minted, keyring } = signerFor(s, {}, { now: issuedAt });
+    for (const withAuthority of [false, true]) {
+      await expectReject(enforceModelAuthority({
+        catalog: source(s), keyring,
+        headers: headers({
+          [TURN_LEASE_HEADER]: minted.bundle.lease,
+          ...(withAuthority ? { [AUTHORITY_HEADER]: minted.bundle.authority } : {}),
+        }),
+        uid: UID, containerId: CONTAINER_ID, model: "glm-5.2",
+        now: issuedAt + TURN_LEASE_TTL_MS + 1,
+      }), "MODEL_AUTHORITY_INVALID");
+    }
   });
 
   test("lease 与 authority 属于不同 turn → LeaseMismatch 拒(跨 turn 降级攻击面)", async () => {

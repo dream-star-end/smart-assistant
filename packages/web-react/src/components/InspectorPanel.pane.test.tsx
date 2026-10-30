@@ -310,7 +310,7 @@ describe("Codex r1 回归", () => {
         onClose={() => {}}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: "重试" }));
+    fireEvent.click(await screen.findByRole("button", { name: "继续" }));
     expect(await screen.findByText(/HUGE-BODY-LOADED/)).toBeInTheDocument();
     await waitFor(() => expect(failing).toHaveBeenCalledTimes(2));
   });

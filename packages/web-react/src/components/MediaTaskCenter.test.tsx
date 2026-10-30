@@ -12,6 +12,7 @@ vi.mock('../lib/api', () => ({
 }))
 
 import { MediaTaskCenter, failureSummary, phaseLabel } from './MediaTaskCenter'
+import { mediaTaskContinuationDraft } from './AppDialogs'
 
 /** 危险操作先弹确认层(M-06):在指定标题的对话框里点某个按钮。 */
 async function confirmIn(dialogName: string, action: string | RegExp) {
@@ -287,7 +288,7 @@ describe('MediaTaskCenter', () => {
     expect(screen.getByTitle('第 2 版')).toHaveTextContent('1/1 个分镜')
   })
 
-  test('failed job offers 重新发起 when the host wires onReusePrompt (M-17 / X-M4), copy fallback disappears', async () => {
+  test('failed job Continue retains its original session identity and requires explicit send', async () => {
     const failed = job('f', {
       status: 'failed',
       phase: 'upload',
@@ -295,6 +296,7 @@ describe('MediaTaskCenter', () => {
       errorCode: 'H3_OOM',
       errorMessage: 'CUDA out of memory',
       prompt: '一只在雪地里奔跑的柴犬',
+      sessionId: 'original-session',
     })
     vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -315,9 +317,15 @@ describe('MediaTaskCenter', () => {
     )
     await screen.findByText('一只在雪地里奔跑的柴犬')
     expect(screen.queryByRole('button', { name: /复制提示词/ })).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '重新发起' }))
+    fireEvent.click(screen.getByRole('button', { name: '继续' }))
     expect(onReusePrompt).toHaveBeenCalledTimes(1)
-    expect(onReusePrompt).toHaveBeenCalledWith('一只在雪地里奔跑的柴犬')
+    expect(onReusePrompt).toHaveBeenCalledWith(failed)
+    const draft = mediaTaskContinuationDraft(failed, [{ id: 'another-session' }, { id: 'original-session' }])
+    expect(draft?.sessionId).toBe('original-session')
+    expect(draft?.text).toContain('一只在雪地里奔跑的柴犬')
+    expect(draft?.text).toContain('不要重新开始或重复已完成的操作')
+    expect(mediaTaskContinuationDraft(failed, [{ id: 'another-session' }])).toBeNull()
+    expect(mediaTaskContinuationDraft({ ...failed, sessionId: null }, [{ id: 'another-session' }])).toBeNull()
   })
 
   test('the standalone heading is hidden when only projects exist', async () => {

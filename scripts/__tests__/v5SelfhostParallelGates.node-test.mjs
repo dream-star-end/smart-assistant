@@ -25,7 +25,8 @@ function fixture(t, load = '0.00') {
   }
   writeFileSync(join(dir, 'load'), `${load} 0 0 1/1 1\n`);
   for (const name of ['check-architecture.ts', 'v5-selfhost-watch-gate.sh', 'lib/gateTestDb.mjs',
-    'check-v5-box-success-recovery.ts', 'check-v5-box-continuation.ts', 'check-v5-box-incident-proofs.ts']) {
+    'check-v5-box-success-recovery.ts', 'check-v5-box-continuation.ts', 'check-v5-box-incident-proofs.ts',
+    'check-v5-box-longtask.ts']) {
     writeFileSync(join(dir, 'staging/scripts', name), 'fixture\n');
   }
   return { dir, env: { PATH: `${join(dir, 'bin')}:${process.env.PATH}`, HOME: dir,
@@ -419,6 +420,7 @@ case "$*" in
   *check-v5-box-success-recovery.ts*) id=C.box-success-recovery ;;
   *check-v5-box-continuation.ts*) id=C.box-continuation ;;
   *check-v5-box-incident-proofs.ts*) id=C.box-incident-proofs ;;
+  *check-v5-box-longtask.ts*) id=C.box-longtask ;;
   *check-v5-ccb-mcp-availability.ts*) id=C.ccb-mcp ;;
 esac
 printf 'start %s %s %s\\n' "$id" "$PWD" "$TMPDIR" >>"$EVENTS"
@@ -470,7 +472,7 @@ run_gates
 `;
 }
 
-test('production wiring: all 15 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
+test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
   const f = fixture(t);
   const r = run(f, wireFixture(f));
   assert.equal(r.status, 0, r.stderr);
@@ -479,7 +481,7 @@ test('production wiring: all 15 C gates + D run pinned; C/D overlap; Box waits f
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
     'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
-    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'ccb-mcp'].map((id) => `C.${id}`);
+    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const firstEnd = lines.findIndex((l) => l.startsWith('end '));
   assert.equal(lines.slice(0, firstEnd).filter((l) => l.startsWith('start ')).length, 3);
@@ -502,6 +504,7 @@ test('production wiring: all 15 C gates + D run pinned; C/D overlap; Box waits f
     if (line.startsWith('end ')) active--;
   }
   assert.equal(active, 0);
+  assert.ok(lines.indexOf('end C.box-longtask') < lines.indexOf('db-drop'));
   assert.ok(lines.indexOf('db-drop') < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
   assert.equal(lines.at(-1), 'seal built');
   for (const id of ids.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')) {
@@ -537,10 +540,11 @@ for (const receipt of ['hit', 'wrong-sha']) {
     }
     const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 9 : 17);
+    assert.equal(ids.length, receipt === 'hit' ? 10 : 18);
+    assert.equal(notes(f)['gateEvidence.box-longtask'], 'local');
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
-    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.ccb-mcp']) {
+    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.box-longtask', 'C.ccb-mcp']) {
       assert.ok(lines.findIndex((l) => l.startsWith(`start ${phase} `)) > awaited, phase);
     }
     assert.equal(lines.at(-1), 'seal built');

@@ -68,6 +68,18 @@ afterEach(() => {
 });
 
 describe("OutputViewer", () => {
+  it("预览失败以继续为首操作，仍只重新读取同一个文件", async () => {
+    fetchMock.mockRejectedValue(new Error("offline"));
+    renderViewer(out({ id: "read-again", name: "notes.txt" }));
+    const dialog = await screen.findByRole("dialog");
+    const fallback = await within(dialog).findByTestId("output-preview-fallback");
+    expect(within(fallback).getAllByRole("button")[0]).toHaveTextContent("继续");
+    fetchMock.mockResolvedValue(new Response("restored file"));
+    fireEvent.click(within(fallback).getByRole("button", { name: "继续" }));
+    expect(await within(dialog).findByTestId("output-preview-text")).toHaveTextContent("restored file");
+    expect(String(fetchMock.mock.calls.at(-1)![0])).toContain("/api/media-signed?t=");
+  });
+
   it("纯文本按文字显示，内容里的 HTML 不会变成元素；可复制", async () => {
     const body = '<img src=x onerror="alert(1)"><b>粗体?</b>\n第二行';
     fetchMock.mockResolvedValue(new Response(body));

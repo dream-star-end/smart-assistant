@@ -99,6 +99,18 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
       const recovery = frame.content?.recovery;
       const id = frame.clientMessageId;
       const peer = { id: BOARD_SESSION, kind: "dm" };
+      if ((frame.content?.displayText === "继续" && recovery?.automatic !== true) || recovery?.automatic === false) {
+        scenario.manual.push(frame);
+        send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
+        preview.store.board.push({ id, role: "user", text: "继续", _modelText: frame.content.text,
+          status: "replied", ts: Date.now(), _source: "server" },
+          { id: `manual-answer-${id}`, role: "assistant", text: "RECOVERY_MANUALLY_CONTINUED_ONCE",
+            ts: Date.now() + 1, _source: "server", _clientMessageId: id });
+        preview.store.revision += 1;
+        return send({ type: "outbound.message", peer, sessionKey: `agent:main:webchat:dm:${BOARD_SESSION}`,
+          clientMessageId: id, frameSeq: ++scenario.seq,
+          blocks: [{ kind: "text", text: "RECOVERY_MANUALLY_CONTINUED_ONCE" }], isFinal: true });
+      }
       if (recovery) {
         assert.equal(recovery.sourceClientMessageId, scenario.source);
         assert.equal(recovery.automatic, true);
@@ -132,7 +144,7 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
     for (const [width, reject] of [[1280,true],[390,true],[1280,false]]) await t.test(`${width} ${reject ? "rejected across REST and reload" : "recoverable control"}`, async () => {
-      scenario = { source: null, original: null, inbound: [], children: [], skipped: 0, hello: 0, seq: 0, reject };
+      scenario = { source: null, original: null, inbound: [], manual: [], children: [], skipped: 0, hello: 0, seq: 0, reject };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width===390, hasTouch: width===390 });
       const page = await context.newPage(); const errors = [];
@@ -228,6 +240,24 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         assert.equal(outputLines.filter((line) => line === "$ echo RECOVERY_SAVED_TOOL").length, 1);
         assert.equal(outputLines.filter((line) => line === "RECOVERY_TOOL_RESULT").length, 1);
         assert.equal(await page.getByTestId("user-row").count(), 1);
+        // A durable automatic refusal must stop replay forever, while a later
+        // human Continue is a new normal admission with the saved context.
+        const go = page.getByRole("button", { name: "继续", exact: true });
+        assert.equal(await go.count(), 1);
+        await go.click();
+        await page.getByText("RECOVERY_MANUALLY_CONTINUED_ONCE", { exact: true }).first().waitFor();
+        assert.equal(scenario.manual.length, 1);
+        const manual = scenario.manual[0];
+        assert.equal(manual.peer.id, BOARD_SESSION);
+        assert.notEqual(manual.clientMessageId, scenario.source);
+        assert.equal(manual.content.recovery, undefined, "explicit continuation after refusal uses normal admission");
+        assert.notEqual(manual.content.text, "RECOVERY_ORIGINAL_REQUEST");
+        assert.match(manual.content.text, /RECOVERY_ORIGINAL_REQUEST/);
+        assert.match(manual.content.text, /不要重新执行已经完成的步骤/);
+        assert.equal(scenario.children.length, 1, "human Continue does not reopen the rejected automatic lineage");
+        assert.equal(scenario.skipped, 1);
+        assert.equal(scenario.inbound.length, 3, "one source, one denied automatic child, one human follow-up");
+        assert.deepEqual(preview.store.board.slice(0, scenario.original.length), scenario.original, "source tools/results are retained, not executed twice");
         assert.deepEqual(errors, []);
         console.log("RECOVERY_RECEIPT", JSON.stringify({ width, reject, originals: 1, children: scenario.children.length, skipped: scenario.skipped, detailResponses, reload: true, sourceHash, sourceDigest, transformCount }));
       } catch (error) { console.error("RECOVERY_DIAGNOSTIC", JSON.stringify({ scenario, stored: await stored(page), detailResponses, body: (await page.locator("body").innerText()).slice(-4000), errors })); throw error; } finally { await context.close(); }

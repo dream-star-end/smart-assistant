@@ -1073,7 +1073,7 @@ async function waitForLivenessTimer(
 }
 
 describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner (not model E2E)', () => {
-  it('non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires', { timeout: 15_000 }, async () => {
+  it('silence trips idle while waiting and active turns continue beyond 12h/24h', { timeout: 15_000 }, async () => {
     const origNow = Date.now
     const origSetInterval = globalThis.setInterval
     const origClearInterval = globalThis.clearInterval
@@ -1189,8 +1189,9 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       waitRunner = new HangRunner()
       waitRunner.lastActivityAt = now
       const waitSession = makeCcbSession(waitRunner, 'agent:main:cron:dm:wait-wd:test')
+      let waitingForUserInput = true
       Object.defineProperty(waitSession.runner, 'waitingForUserInput', {
-        get: () => true,
+        get: () => waitingForUserInput,
         configurable: true,
       })
       let waitSettled = false
@@ -1209,18 +1210,23 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       const waitingSettledAfter2h = waitSettled
       assert.equal(waitSettled, false, 'waiting turn must not idle-timeout at 2h')
       assert.equal(waitEvents.length, 0)
-      now = started + AUTHORITY_TURN_MAX_LIFETIME_MS
+      for (const elapsed of [AUTHORITY_TURN_MAX_LIFETIME_MS, 2 * AUTHORITY_TURN_MAX_LIFETIME_MS]) {
+        now = started + elapsed
+        waitTimer.fn()
+        await new Promise((r) => setImmediate(r))
+        assert.equal(waitSettled, false, 'waiting has no total wall-clock deadline')
+      }
+      waitingForUserInput = false
+      waitRunner.lastActivityAt = now
       waitTimer.fn()
-      await waitP
-      assert.ok(
-        waitEvents.some((msg) => msg.includes('12 小时') || msg.includes('上限')),
-        `12h hard limit must still fire while waiting, got ${JSON.stringify(waitEvents)}`,
-      )
+      await new Promise((r) => setImmediate(r))
+      assert.equal(waitSettled, false, 'a live turn also continues beyond 24h')
+      assert.equal(waitEvents.length, 0)
       const expected = {
         layer: 'session-manager-submit',
         idleTripped: true,
         waitingSkips2h: true,
-        hardLimitAt12h: true,
+        hardLimitAt12h: false,
         waitingSettledAfter2h: false,
       }
       const actual = {
@@ -1235,6 +1241,11 @@ describe('OCV5-188 Layer 2 — real SessionManager.submit + synthetic HangRunner
       assert.equal(actual.waitingSkips2h, expected.waitingSkips2h)
       assert.equal(actual.hardLimitAt12h, expected.hardLimitAt12h)
       assert.equal(actual.waitingSettledAfter2h, expected.waitingSettledAfter2h)
+      waitRunner.emit('message', {
+        type: 'result', total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 },
+        is_error: false, stop_reason: 'end_turn',
+      })
+      await waitP
     } finally {
       try {
         fileRunner?.interrupt()

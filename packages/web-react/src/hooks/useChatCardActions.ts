@@ -16,7 +16,8 @@ import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
-import { preciseRetryEligible, interruptedContinuationTarget } from "../lib/chat/socket";
+import { preciseRetryEligible } from "../lib/chat/socket";
+import { manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
 import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
@@ -305,13 +306,8 @@ export function useChatCardActions({
     [activeId, loadExactOrToast, setComposerPrefill],
   );
 
-  // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
-  // _clientMessageId 在当前会话里定位可**原样重发**的 user 行。现场取 messages(稳定句柄 sockRef,
-  // 不捕获每帧刷新的 wsMessages),与 retrySend 同 deps(仅随会话切换变)。资格三条:
-  //   (a) 该 user 行存在且 status='error'(有完整 payload、确实失败);
-  //   (b)(c) 自带 _routing 快照 + 附件重发证据仍在 —— 见 preciseRetryEligible(与 retryMessage
-  //   实际读取的字段严格对齐,防止借用别轮 _lastRouting / 静默丢附件)。任一不满足 → 返回
-  //   undefined,红卡落回 onRegenerate 兜底(见 AssistantCard 的 R5 末轮门控)。
+  // Editing resolves the exact failed user row. Error-card execution uses
+  // Continue below and never falls back to replaying the latest request.
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
   const resolveRetryTarget = useCallback(
     (clientMessageId: string): ChatMessage | undefined => {
@@ -330,22 +326,29 @@ export function useChatCardActions({
     (error: ChatMessage): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return interruptedContinuationTarget(msgs, error, activeId)?.user;
+      return manualTaskContinuationSource(msgs, error);
     },
     [demo, activeId],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
+  const pendingContinuations = useRef(new Set<string>());
   const continueInterrupted = useCallback(
-    (error: ChatMessage) => {
-      if (demo || !activeId) return;
-      sockRef.current?.continueInterruptedTurn({
-        sessId: activeId,
-        errorMessageId: error.id,
-        agentId: agent.id,
-      });
+    async (error: ChatMessage) => {
+      if (demo || !activeId || activeSessionRef.current !== activeId) return;
+      if (!identity || !identityIsCurrent(identity, authRef.current)) return;
+      let action: typeof import("./manualTaskContinuationAction");
+      try {
+        action = await import("./manualTaskContinuationAction");
+      } catch {
+        if (activeSessionRef.current === activeId && identityIsCurrent(identity, authRef.current)) {
+          toast("继续功能加载失败，请稍后再试", "error");
+        }
+        return;
+      }
+      await action.continueManualTask({ activeId, demo, identity, authRef, sockRef, send, error,
+        agentId: agent.id, activeSessionRef, pendingContinuations, loadExactOrToast });
     },
-    [demo, activeId, agent.id],
+    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef, toast],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

@@ -7,6 +7,7 @@
     { "id": "box-success-recovery", "script": "scripts/check-v5-box-success-recovery.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-continuation", "script": "scripts/check-v5-box-continuation.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "box-incident-proofs", "script": "scripts/check-v5-box-incident-proofs.ts", "ci": "v5-selfhost-release-gates.yml" },
+    { "id": "box-longtask", "script": "scripts/check-v5-box-longtask.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "cursor-sand-inference", "script": "scripts/check-v5-cursor-sand-inference.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "ccb-mcp-availability", "script": "scripts/check-v5-ccb-mcp-availability.ts", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "delegate-billing-requestid", "script": "scripts/check-v5-delegate-billing-requestid.ts", "ci": "v5-selfhost-release-gates.yml" },

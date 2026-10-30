@@ -2,7 +2,8 @@
  * before its sidecar file is published; failure after publication is unknown
  * and cannot be safely replayed. Keep this in sync with the Python runner and
  * supervisor bounds, then verify the actual Box echo format before enabling. */
-export const BOX_TOOL_MAX_ROUNDS = 128;
+import { BOX_TOOL_MAX_ROUNDS } from "../../billing/boxToolLimits.js";
+export { BOX_TOOL_MAX_ROUNDS };
 export const BOX_TOOL_MAX_WALL_MS = 4 * 60 * 60 * 1000;
 export const BOX_TOOL_SPOOL_MAX_BYTES = 256 * 1024 * 1024;
 export const BOX_TOOL_MAX_LINE_BYTES = 16 * 1024 * 1024;

@@ -64,7 +64,8 @@ import {
   resetShadowStatsForTests,
 } from "../src/lib/timeline/shadowLifecycle";
 import { createMemoryAuthSession } from "../src/lib/authSession";
-import { ChatSocket } from "../src/lib/chat/socket";
+import { ChatSocket, exactUserReplayPayload } from "../src/lib/chat/socket";
+import { manualTaskContinuationSource, taskContinuationPrompt } from "../src/lib/chat/manualTaskContinuation";
 import { useSessionList } from "../src/hooks/useSessionList";
 import { useUnreadSessions } from "../src/hooks/useUnreadSessions";
 import { TUTORIAL_CASE_BY_ID } from "../src/lib/tutorialCaseCatalog";
@@ -91,11 +92,12 @@ declare global {
     __lazyTimeline: {
       userFetches: number;
       tapeFetches: number;
-      userRetry: null | {
+      userContinuation: null | {
         id: string;
         text: string;
         modelText?: string;
         retryFilename?: string;
+        continuationText: string;
       };
       tapeFetch: null | { tapeId: string; ordinal: number; recordId: string; role: string };
     };
@@ -184,7 +186,7 @@ declare global {
         replyTo?: { messageId: string; role: "user" | "assistant"; text: string };
       }>;
     };
-    __errorUxRetries: number;
+    __errorUxContinuations: Array<{ sourceId: string; text: string; displayText: string }>;
     __mountAskQuestion: () => void;
     __completeTimelineThinking: () => void;
     /** fixture 的精确文本标记与期望顺序,供 run.mjs 读取 —— 断言常量不在两处各写一份。 */
@@ -384,7 +386,7 @@ window.__sends = [];
 window.__uploads = [];
 window.__composerStops = 0;
 window.__setComposerState = () => {};
-window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userRetry: null, tapeFetch: null };
+window.__lazyTimeline = { userFetches: 0, tapeFetches: 0, userContinuation: null, tapeFetch: null };
 window.__scrollTimeline = {
   calls: [],
   mergedPages: 0,
@@ -451,7 +453,7 @@ window.__estimateAnchor = {
 };
 window.__askQuestion = { responses: [] };
 window.__messageQuote = { sends: [] };
-window.__errorUxRetries = 0;
+window.__errorUxContinuations = [];
 window.__mountAskQuestion = () => {};
 window.__completeTimelineThinking = () => {};
 window.__replayFixture = {
@@ -763,8 +765,13 @@ createRoot(document.getElementById("error-ux-root")!).render(
       messages={[errorUxUser, errorUxAssistant]}
       sending={false}
       cb={{
-        onRetrySend: () => { window.__errorUxRetries += 1; },
-        resolveRetryTarget: (id) => id === errorUxUser.id ? errorUxUser : undefined,
+        resolveInterruptedContinuation: (error) => manualTaskContinuationSource([errorUxUser, errorUxAssistant], error),
+        onContinueInterrupted: (error) => {
+          const source = manualTaskContinuationSource([errorUxUser, errorUxAssistant], error);
+          if (!source) throw new Error("missing original task context");
+          window.__errorUxContinuations.push({ sourceId: source.id,
+            text: taskContinuationPrompt(exactUserReplayPayload(source).text), displayText: "继续" });
+        },
       }}
       onRespondPermission={() => {}}
     />
@@ -913,12 +920,14 @@ createRoot(document.getElementById("timeline-user-root")!).render(
           window.__lazyTimeline.userFetches += 1;
           return [exactUser];
         },
-        onRetrySend: (message) => {
-          window.__lazyTimeline.userRetry = {
+        onContinueInterrupted: (message) => {
+          const payload = exactUserReplayPayload(message);
+          window.__lazyTimeline.userContinuation = {
             id: message.id,
             text: message.text,
             modelText: message._modelText,
             retryFilename: message._retryMedia?.[0]?.filename,
+            continuationText: taskContinuationPrompt(payload.text),
           };
         },
       }}

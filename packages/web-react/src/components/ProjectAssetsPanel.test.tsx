@@ -113,7 +113,7 @@ describe("ProjectAssetsPanel", () => {
       </ToastProvider>,
     );
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
     await waitFor(() => expect(screen.getByText("还没有文件")).toBeTruthy());
     expect(list).toHaveBeenCalledTimes(2);
   });

@@ -71,7 +71,7 @@ export function RepoStatusBanner({
         </div>
         {status === "failed" && onRetry && (
           <Button type="button" size="sm" variant="secondary" onClick={onRetry}>
-            重试
+            继续
           </Button>
         )}
         {(status === "failed" || status === "ready") && (

@@ -456,8 +456,8 @@ export function shouldRecycleForVisionCapability(
 export interface TurnModelAuthority {
   /** 完整签名 authority envelope(base64url；仅作已消费的入站启动凭据保留)。 */
   readonly authorityEnvelope: string
-  /** turn lease envelope(base64url;TTL = 最大 turn 窗口 + grace)。 */
-  readonly leaseEnvelope: string
+  /** Latest rolling lease; the logical turn shares this owner across retries. */
+  leaseEnvelope: string
   /** 已验签的 CCB 执行语义；与两张 envelope 同一份 descriptor。 */
   readonly executionDescriptor: CcbExecutionDescriptor
 }

@@ -260,7 +260,7 @@ export function ImageCommentMode({
               }}
               className="min-h-10 rounded-full bg-white/10 px-4 text-sm text-white hover:bg-white/20"
             >
-              重试
+              继续
             </button>
           </div>
         ) : (

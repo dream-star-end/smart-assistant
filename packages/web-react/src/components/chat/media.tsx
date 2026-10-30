@@ -354,7 +354,7 @@ export function ZoomableImage({
           // 就绪/加载态点击开查看器。
           aria-label={
             status === "error"
-              ? `重试加载${alt ? ` ${alt}` : "图片"}`
+              ? `继续加载${alt ? ` ${alt}` : "图片"}`
               : `放大查看${alt ? ` ${alt}` : "图片"}`
           }
           onClick={() => (status === "error" ? reload() : openViewer())}
@@ -373,7 +373,7 @@ export function ZoomableImage({
             />
           )}
           {/* 加载中/未就绪:深色 shimmer 骨架 + 居中百分比(禁纯白;reduced-motion 由 CSS 处理)。
-              失败:同骨架底 +「加载失败 · 点击重试」文案。加载完由 <img> 接管尺寸。 */}
+              失败:同骨架底 +「加载失败 · 点击继续」文案。加载完由 <img> 接管尺寸。 */}
           {status !== "loaded" && (
             <span
               className="oc-img-skeleton flex h-40 w-64 max-w-full items-center justify-center rounded-lg"
@@ -382,7 +382,7 @@ export function ZoomableImage({
               <span className="flex items-center gap-1 text-center text-xs font-medium tabular-nums text-white/85 drop-shadow">
                 {status === "error" ? (
                   <>
-                    <RotateCcw size={12} /> 加载失败 · 点击重试
+                    <RotateCcw size={12} /> 加载失败 · 点击继续
                   </>
                 ) : percent != null ? (
                   `${percent}%`
@@ -719,7 +719,7 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
             onClick={() => void start()}
             className="flex h-6 items-center gap-1 font-medium text-accent hover:underline"
           >
-            <RotateCcw size={12} /> 重试
+            <RotateCcw size={12} /> 继续
           </button>
           <a
             href="#"
