@@ -109,7 +109,7 @@ test("admitted recovery holders require bound failure proof and no successor",
       [JSON.stringify(f.holder)]);
     await f.q(`UPDATE turn_dispatches SET status='running'`);
     assert.equal((await f.find()).kind, "claimed", "holder dispatch is live");
-    await f.q(`DELETE FROM turn_dispatches`);
+    await f.q("DELETE FROM turn_dispatches");
     assert.equal((await f.find()).kind, "claimed", "missing dispatch is unknown");
   } finally { await f.close(); }
 });
@@ -136,7 +136,7 @@ test("two recoveries replace a stopped holder with one PostgreSQL CAS winner",
   const f = await stoppedRecoveryFixture();
   const clients = await Promise.all([f.pool.connect(), f.pool.connect()]);
   try {
-    const pids = await Promise.all(clients.map((client) => client.query(`SELECT pg_backend_pid() AS pid`)));
+    const pids = await Promise.all(clients.map((client) => client.query("SELECT pg_backend_pid() AS pid")));
     assert.notEqual(pids[0].rows[0].pid, pids[1].rows[0].pid, "independent PostgreSQL sessions");
     const journals = clients.map((client) => {
       const query = client.query.bind(client);
