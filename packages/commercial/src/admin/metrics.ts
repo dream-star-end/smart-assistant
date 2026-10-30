@@ -250,6 +250,11 @@ function renderLabels(v: LabelValues): string {
 
 // ─── registry ─────────────────────────────────────────────────────────
 
+export const containerLinkRebuilt = new Counter({ name: "container_link_rebuilt_total", help: "Container links rebuilt from open dispatches", labelNames: [] });
+export const containerLinkReconnect = new Counter({ name: "container_link_reconnect_total", help: "Bounded container link recovery outcomes", labelNames: ["outcome"] });
+export const containerLinkGap = new Counter({ name: "container_link_gap_total", help: "Durable container ring replay gaps", labelNames: [] });
+export const containerLinkControlDelivered = new Counter({ name: "container_link_control_delivered_total", help: "Successful durable control transport sends, including retries", labelNames: ["via"] });
+
 export const gatewayRequests = new Counter({
   name: "gateway_http_requests_total",
   help: "Total HTTP requests handled by the commercial gateway",
@@ -759,6 +764,10 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   agentRunning.set({}, agentContainersRunning);
 
   const out: string[] = [];
+  containerLinkRebuilt.render(out);
+  containerLinkReconnect.render(out);
+  containerLinkGap.render(out);
+  containerLinkControlDelivered.render(out);
   gatewayRequests.render(out);
   billingDebits.render(out);
   claudeApiRequests.render(out);
@@ -791,6 +800,10 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
 // ─── test helper(不出 index.ts)─────────────────────────────────────
 
 export function resetMetricsForTest(): void {
+  containerLinkRebuilt.reset();
+  containerLinkReconnect.reset();
+  containerLinkGap.reset();
+  containerLinkControlDelivered.reset();
   gatewayRequests.reset();
   billingDebits.reset();
   claudeApiRequests.reset();

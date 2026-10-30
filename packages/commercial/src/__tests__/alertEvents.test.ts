@@ -119,6 +119,12 @@ describe("alertEvents — EVENT_META", () => {
     }
   });
 
+  test("tape job stuck alerts are registered with operational severity", () => {
+    assert.equal(eventMetaFor(EVENTS.OPS_TAPE_JOB_STUCK)?.severity, "warning");
+    assert.equal(eventMetaFor(EVENTS.OPS_TAPE_JOB_STUCK)?.group, "ops");
+    assert.equal(eventMetaFor(EVENTS.OPS_TAPE_JOB_STUCK)?.trigger, "both");
+  });
+
   test("ops.* 运维事件已登记(shell 监控统一送达)", () => {
     // 系统 A(v5-monitor.sh / v5-daily-check.sh)psql 直插 outbox 的 4 个事件
     // 必须在目录里,否则 admin「事件目录/覆盖率」看不到、通道无法订阅它们。

@@ -122,7 +122,7 @@ export async function persistPermissionAuthority(
 export async function admitDurableControl(
   pool: Pool,
   input: DurableControlInput,
-): Promise<{ inserted: boolean; status: TurnControlStatus }> {
+): Promise<{ inserted: boolean; status: TurnControlStatus; errorCode?: string }> {
   return inTransaction(pool, async (client) => {
     let effectiveRootClientMessageId = input.rootClientMessageId ?? null
     if (input.kind === 'stop') {
@@ -150,16 +150,39 @@ export async function admitDurableControl(
         [input.userId.toString(), input.sessionId, effectiveRootClientMessageId],
       )
     }
-    const inserted = await client.query<{ status: TurnControlStatus }>(
+    // Classify the original exact target before this Stop cancels recovery
+    // dispatches. Runtime TURN_NOT_ACTIVE also covers pre-admission races and
+    // cannot establish this fact. A terminal parent never hides live children.
+    const inserted = await client.query<{ status: TurnControlStatus; error_code?: string | null }>(
       `INSERT INTO turn_control_requests (
-         control_id,user_id,session_id,root_client_message_id,kind,request_id,payload_json
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+         control_id,user_id,session_id,root_client_message_id,kind,request_id,payload_json,
+         status,error_code,terminal_at
+       ) SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,
+                CASE WHEN target.ended THEN 'terminal' ELSE 'pending' END,
+                CASE WHEN target.ended THEN 'TURN_ALREADY_ENDED' ELSE NULL END,
+                CASE WHEN target.ended THEN NOW() ELSE NULL END
+           FROM (
+             SELECT $5::text='stop' AND $8::text IS NOT NULL AND EXISTS (
+               SELECT 1 FROM turn_dispatches d
+                WHERE d.user_id=$2 AND d.session_id=$3
+                  AND d.client_message_id=$8 AND d.status='terminal'
+             ) AND NOT EXISTS (
+               SELECT 1 FROM turn_recovery_jobs j
+               LEFT JOIN turn_dispatches child
+                 ON child.user_id=j.user_id AND child.session_id=j.session_id
+                AND ((child.dispatch_id=j.dispatch_id AND child.attempt_no=j.dispatch_attempt_no)
+                     OR child.client_message_id=j.request_json->>'clientMessageId')
+                WHERE j.user_id=$2 AND j.session_id=$3 AND j.root_client_message_id=$4
+                  AND (j.status IN ('sent','forwarded')
+                       OR child.status IN ('admitted','accepted','rejecting'))
+             ) AS ended
+           ) target WHERE TRUE
        ON CONFLICT (control_id) DO NOTHING
-       RETURNING status`,
+       RETURNING status,error_code`,
       [
         input.controlId, input.userId.toString(), input.sessionId,
         effectiveRootClientMessageId, input.kind, input.requestId ?? null,
-        JSON.stringify(input.payload),
+        JSON.stringify(input.payload), input.rootClientMessageId ?? null,
       ],
     )
     if (inserted.rowCount === 0) {
@@ -171,8 +194,9 @@ export async function admitDurableControl(
         request_id: string | null
         payload_json: Record<string, unknown>
         status: TurnControlStatus
+        error_code: string | null
       }>(
-        `SELECT user_id::text,session_id,root_client_message_id,kind,request_id,payload_json,status
+        `SELECT user_id::text,session_id,root_client_message_id,kind,request_id,payload_json,status,error_code
            FROM turn_control_requests WHERE control_id=$1 FOR UPDATE`,
         [input.controlId],
       )
@@ -185,7 +209,7 @@ export async function admitDurableControl(
       ) {
         throw new TurnControlConflictError('CONTROL_ID_CONFLICT')
       }
-      return { inserted: false, status: row.status }
+      return { inserted: false, status: row.status, ...(row.error_code ? { errorCode: row.error_code } : {}) }
     }
 
     if (input.kind === 'stop') {
@@ -261,7 +285,8 @@ export async function admitDurableControl(
         ],
       )
     }
-    return { inserted: true, status: 'pending' }
+    const admitted = inserted.rows[0]!
+    return { inserted: true, status: admitted.status, ...(admitted.error_code ? { errorCode: admitted.error_code } : {}) }
   })
 }
 
@@ -405,7 +430,7 @@ export async function settlePermissionPromptFromRuntime(
  * and another process resumes delivery; there is no browser-memory authority. */
 export async function claimDueTurnControls(
   pool: Pool,
-  input: { userId: bigint; ownerId: string; leaseMs: number; limit?: number },
+  input: { userId: bigint; ownerId: string; leaseMs: number; limit?: number; controlIds?: string[] },
 ): Promise<ClaimedTurnControl[]> {
   const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)))
   const result = await pool.query<{
@@ -426,6 +451,7 @@ export async function claimDueTurnControls(
           AND status IN ('pending','leased')
           AND next_attempt_at<=NOW()
           AND (status='pending' OR lease_until<NOW())
+          AND ($5::text[] IS NULL OR control_id=ANY($5::text[]))
         ORDER BY created_at
         FOR UPDATE SKIP LOCKED
         LIMIT $4
@@ -438,7 +464,7 @@ export async function claimDueTurnControls(
       WHERE c.control_id=due.control_id
       RETURNING c.control_id,c.user_id::text,c.session_id,c.root_client_message_id,
                 c.kind,c.request_id,c.payload_json,c.lease_epoch::text,c.delivery_attempt`,
-    [input.userId.toString(), input.ownerId, Math.max(1000, Math.trunc(input.leaseMs)), limit],
+    [input.userId.toString(), input.ownerId, Math.max(1000, Math.trunc(input.leaseMs)), limit, input.controlIds ?? null],
   )
   return result.rows.map((row) => ({
     controlId: row.control_id,

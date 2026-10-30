@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
+import { CHAT_CREATE_TEMPLATES } from "../../lib/chatCreateTemplates";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { SkillsPanel } from "./SkillsPanel";
 
@@ -32,7 +33,9 @@ function evalsFor(name: string): Awaited<ReturnType<typeof api.getSkillEvals>> {
 }
 
 /** 装配 SkillsPanel + 全部依赖桩;返回 getSkillEvals spy 供断言探测行为。 */
-function mountPanel(opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => void } = {}) {
+function mountPanel(
+  opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => void; onAskInChat?: (text: string) => void } = {},
+) {
   vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
   vi.spyOn(api, "listSkills").mockResolvedValue(opts.skills ?? SKILLS);
   vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
@@ -49,7 +52,7 @@ function mountPanel(opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => v
       }) as SkillDetail,
   );
   const evals = vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));
-  render(<SkillsPanel auth={auth} onOpenMarketplace={opts.onOpenMarketplace} />);
+  render(<SkillsPanel auth={auth} onOpenMarketplace={opts.onOpenMarketplace} onAskInChat={opts.onAskInChat} />);
   return { evals };
 }
 
@@ -77,6 +80,16 @@ describe("SkillsPanel 加载 / 空态 / 出口", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "去市场安装技能" }));
     expect(onOpenMarketplace).toHaveBeenCalledTimes(1);
+  });
+
+  test("空态讲清技能怎么来，并能直接在对话里引导着做一个(UI-5)", async () => {
+    const onAskInChat = vi.fn();
+    mountPanel({ skills: [], onOpenMarketplace: vi.fn(), onAskInChat });
+
+    expect(await screen.findByText(/把这个流程存成技能/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "在对话中创建技能" }));
+    expect(onAskInChat).toHaveBeenCalledWith(CHAT_CREATE_TEMPLATES.skill);
+    expect(screen.getByRole("button", { name: "去市场安装技能" })).toBeInTheDocument();
   });
 
   test("搜索无结果:走空态并给「清除筛选」出口", async () => {

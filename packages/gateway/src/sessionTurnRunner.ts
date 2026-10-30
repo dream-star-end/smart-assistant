@@ -1879,6 +1879,9 @@ export async function _runOneTurn(
               ...(traceId ? { traceId } : {}),
             },
             ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
+            ...(result.stopReason === 'max_tokens' || result.stopReason === 'pause_turn'
+              ? { truncatedReason: result.stopReason }
+              : {}),
             ...(completedHasError
               ? {
                   errorCode:

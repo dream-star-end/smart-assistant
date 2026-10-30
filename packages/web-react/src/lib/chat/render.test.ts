@@ -330,6 +330,8 @@ describe("errorLabel / stripMarkdown", () => {
     const raw = '{"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"},"request_id":"9cad8ad4bf74b7050694873e6ab16b01"}';
     const presented = errorPresentation("ENGINE_ERROR", raw, raw);
     expect(presented).toEqual({
+      // W3:展示用的归一化码(查错误目录用,不进正文)。
+      code: "model_authority_expired",
       title: "任务未正常完成",
       message: "长任务的执行凭证未能继续。你的消息已保留，可以重新尝试。",
       detail: "请求 ID：9cad8ad4bf74b7050694873e6ab16b01",
