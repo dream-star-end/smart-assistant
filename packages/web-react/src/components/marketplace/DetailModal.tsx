@@ -1,7 +1,6 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol/browser'
 import {
   Activity,
-  Sparkles,
   ArrowUpCircle,
   Download,
   FileQuestion,
@@ -23,6 +22,7 @@ import {
   connectorActionLabel,
   connectorAuthModeLabel,
   formatInstallCount,
+  marketplaceArtifactKind,
   marketTrySkillPrefill,
 } from '../../lib/marketplace'
 import type {
@@ -36,7 +36,10 @@ import type {
 import { cn } from '../../lib/utils'
 import { AgentScopePicker, agentScopeLabels, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
-import { Alert, Badge, Button, EmptyState, Modal, Skeleton, Tooltip, cardVariants } from '../ui'
+import { Alert, Badge, Button, EmptyState, Modal, Skeleton, StatusPill, Tooltip, cardVariants } from '../ui'
+import { CardMark } from './CardMark'
+
+const ARTIFACT_LABEL = { skill: '技能', agent: '智能体', plugin: '插件' } as const
 
 /**
  * 「详细介绍」里 Markdown 的字号收口(K-15)。styles.css 的 `.prose` 规则是**未分层**的
@@ -641,12 +644,15 @@ export function DetailModal({
     if (done)
       return (
         <>
-          <Badge
-            tone={isAgent && installNeedsAuthorization ? 'warning' : 'success'}
+          <StatusPill
+            variant="pill"
+            size="md"
+            {...(isAgent && installNeedsAuthorization
+              ? { tone: 'attention' as const }
+              : { status: 'done' as const })}
+            label={successBadgeLabel}
             className="self-center max-sm:justify-center"
-          >
-            <ShieldCheck size={13} /> {successBadgeLabel}
-          </Badge>
+          />
           {nextStep && (
             <Button variant="primary" onClick={nextStep.onClick}>
               {nextStep.label}
@@ -690,9 +696,7 @@ export function DetailModal({
       )
     if (installed)
       return (
-        <Badge tone="success" className="self-center max-sm:justify-center">
-          <ShieldCheck size={13} /> 已安装
-        </Badge>
+        <StatusPill variant="pill" size="md" status="done" label="已安装" className="self-center max-sm:justify-center" />
       )
     return (
       <Button variant="primary" loading={installing} onClick={install}>
@@ -710,8 +714,18 @@ export function DetailModal({
       // 与同为「浏览并选择」的 AgentPicker 对齐到 lg(max-w-2xl)。
       size="lg"
       className="marketplace-detail"
-      title={<span className="marketplace-detail-title"><span aria-hidden="true"><Sparkles size={24} strokeWidth={1.5} /></span>{detail?.name ?? '市场详情'}</span>}
-      description={detail ? `${detail.slug} · v${detail.version}` : undefined}
+      // 头部与卡片同一枚首字方块(UI-5,不再是青柠底星芒);副标题说种类和版本,slug 这类内部标识不上头部。
+      title={
+        detail ? (
+          <span className="flex min-w-0 items-center gap-3">
+            <CardMark name={detail.name} category={detail.category} size="lg" />
+            <span className="min-w-0 break-words">{detail.name}</span>
+          </span>
+        ) : (
+          '市场详情'
+        )
+      }
+      description={detail ? `${ARTIFACT_LABEL[marketplaceArtifactKind(detail)]} · v${detail.version}` : undefined}
       footer={
         // 单个 flex item 拿满宽后可在内部分两行:第一行是就近的失败提示,第二行才是动作组。
         <div className="flex w-full flex-col gap-2">
@@ -865,7 +879,7 @@ export function DetailModal({
 
           {/* ① 身份与信任 + 真实使用信号:驱动「装不装」的东西必须紧贴标题,不能压在长介绍之后。
               色彩预算按语义分配:身份/信任 success、分类 info、标签与统计一律 neutral。 */}
-          <div className="marketplace-detail-facts flex flex-col gap-1.5">
+          <div className="flex flex-col gap-1.5 rounded-md border border-border p-3">
             <div className="flex flex-wrap items-center gap-1.5">
               {isPreset && (
                 <Badge tone="success">

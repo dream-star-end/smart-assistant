@@ -754,8 +754,11 @@ export function PublishPanel({
   }, [refill]);
 
   return (
-    <div className="marketplace-publish marketplace-workbench flex flex-col gap-4 px-4 py-4">
-      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">MADE TO SHARE</span><h2>把你的得心应手，分享出去。</h2><p>将经验变成技能，让更多人从你的创造中受益。</p></header>
+    <div className="marketplace-publish mx-auto flex w-full min-w-0 max-w-[860px] flex-col gap-4 px-4 py-4 sm:px-6">
+      <header className="pt-1">
+        <h2 className="text-title font-semibold text-fg">发布到市场</h2>
+        <p className="mt-1 text-meta text-muted">把你做好的技能、智能体或插件分享给其他人。</p>
+      </header>
       {confirmEl}
       <div ref={publishesRef}>
         <MyPublishes

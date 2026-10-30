@@ -1,28 +1,5 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol/browser";
-import {
-  ArrowUpCircle,
-  ArrowUpRight,
-  BarChart3,
-  Bot,
-  Boxes,
-  Code2,
-  FileText,
-  GraduationCap,
-  Layers,
-  type LucideIcon,
-  PackageSearch,
-  Palette,
-  Plug,
-  RefreshCw,
-  Search,
-  ShieldCheck,
-  Sparkles,
-  Star,
-  ThumbsUp,
-  TrendingUp,
-  Users,
-  Wrench,
-} from "lucide-react";
+import { Check, PackageSearch, RefreshCw, Search, Sparkles, ThumbsUp, Users } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -36,6 +13,7 @@ import { api, apiErrorMessage } from "../../lib/api";
 import { reportClientFrictionBatch } from "../../lib/clientFriction";
 import {
   benchmarkBadgeLabel,
+  cardBlurb,
   formatInstallCount,
   groupCardsByCategory,
   marketAskAiPrefill,
@@ -45,20 +23,22 @@ import {
 import type { PluginEntry } from "../../lib/pluginDirectory";
 import { pluginMatchesQuery } from "../../lib/pluginDirectory";
 import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
+import type { SemanticTone } from "../../lib/ui/statusTone";
 import { usePluginDirectory } from "../../lib/usePluginDirectory";
 import { cn } from "../../lib/utils";
 import {
   Alert,
-  Badge,
   Button,
   EmptyState,
   IconButton,
   Input,
   ListSkeleton,
+  StatusPill,
   type TabItem,
   Tabs,
   useToast,
 } from "../ui";
+import { BUILTIN_PLUGIN_CATEGORY, CardMark } from "./CardMark";
 import { DetailModal } from "./DetailModal";
 
 /** 「未分类」兜底分区/筛选片的合成 id（不与任何 taxonomy id 冲突）。 */
@@ -87,6 +67,8 @@ function useNarrowViewport(): boolean {
   return useSyncExternalStore(subscribeNarrow, getNarrowSnapshot, () => false);
 }
 
+type BrowseKind = "skill" | "agent" | "connector";
+
 /** 类目切换(与顶层 Tabs 同一套原语,不再是本页第三种横向控件)。value=存储层 kind。 */
 const KIND_TABS: TabItem[] = [
   { value: "skill", label: "技能" },
@@ -95,40 +77,17 @@ const KIND_TABS: TabItem[] = [
 ];
 
 /**
- * 分类 → 图标。改造前每张卡都是同一个紫色 Sparkles,一屏 12 张卡就是 12 个一模一样的
- * 小方块,图标彻底失去扫读价值。按 taxonomy 分化后,用户能靠形状快速定位「这是做文档的
- * 还是写代码的」。未知分类回落 Sparkles(与旧行为一致)。
+ * 「试试」并进搜索框占位词(UI-5):改造前它是搜索框下面单独一行芯片,和分类筛选叠成两行
+ * 筛选(UI-SPEC §1.3 M6)。
  */
-const CATEGORY_ICON: Record<string, LucideIcon> = {
-  "office-docs": FileText,
-  "data-analysis": BarChart3,
-  "coding-dev": Code2,
-  "research-academic": GraduationCap,
-  "design-creative": Palette,
-  "finance-business": TrendingUp,
-  "daily-tools": Wrench,
-  "skill-pack": Boxes,
+const SEARCH_EXAMPLES: Record<BrowseKind, string> = {
+  skill: "「翻译」「论文」",
+  agent: "「写作」「编程」",
+  connector: "「文档」「代码」",
 };
 
-/** 卡片左上角图标:智能体/插件按形态区分,技能按分类区分。 */
-function cardIcon(card: MarketplaceCard): LucideIcon {
-  const artifact = marketplaceArtifactKind(card);
-  if (artifact === "agent") return Bot;
-  if (artifact === "plugin") return Plug;
-  return (card.category ? CATEGORY_ICON[card.category] : undefined) ?? Sparkles;
-}
-
-/**
- * 平台预装的内置插件(飞书 / GitHub / Notion / WebDAV / 邮箱)不是市场条目:市场目录有意不列它们
- * (listMarketBrowseCatalog 过滤默认连接器),v1 的 WebDAV / 邮箱更没有 listing。插件类目把它们
- * 合成卡片并进来,用户在「插件」里看到的才是完整的插件列表(OCV5-379)。点击直接去管理中心绑定账号。
- */
-const BUILTIN_PLUGIN_CATEGORY: Record<string, string> = {
-  github: "coding-dev",
-  notion: "office-docs",
-  feishu: "office-docs",
-  webdav: "office-docs",
-};
+/** 卡片网格:手机单列,平板两列,桌面三列。分区视图与平铺视图共用。 */
+const GRID = "marketplace-grid grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3";
 
 function builtinPluginCard(entry: PluginEntry): MarketplaceCard {
   return {
@@ -144,39 +103,54 @@ function builtinPluginCard(entry: PluginEntry): MarketplaceCard {
   };
 }
 
-/** 分区图标:每个区头都有,不再只有「平台精选」一个有图标、其余光秃。 */
-function sectionIcon(categoryId: string): LucideIcon {
-  return CATEGORY_ICON[categoryId] ?? Layers;
-}
+/** 插件目录的色调 → 状态语义色调(lib/ui/statusTone):已连接 = 完成色,需重新授权 = 失败色。 */
+const PLUGIN_TONE: Record<PluginEntry["tone"], SemanticTone> = {
+  success: "done",
+  warning: "attention",
+  danger: "failed",
+  neutral: "idle",
+};
+
+/** 卡片主按钮:没连上的插件「连接」、有新版本「更新」、没装的「安装」,其余「已安装」。 */
+type CardAction = "connect" | "update" | "install" | "installed";
+const ACTION_LABEL: Record<CardAction, string> = {
+  connect: "连接",
+  update: "更新",
+  install: "安装",
+  installed: "已安装",
+};
+/** 主按钮的外观。卡片里的那枚是整卡按钮的一部分(点它和点卡片是同一件事),只画样子不另设焦点。 */
+const ACTION_CLASS =
+  "inline-flex h-8 shrink-0 items-center rounded-md border border-border bg-surface px-3 text-body font-medium text-fg transition-colors group-hover:border-border-strong";
 
 /**
- * 单张目录卡片(分区视图与平铺视图共用,保证两处样式一致)。
- *
- * 固定三段式,保证同排卡片等高、信息位置恒定:
- *   ① 身份:图标 + 名称 + 安装态图标 + 两行描述;
- *   ② 标签:身份徽章(互斥取一)+ 分类 + 最多 2 个 tag,超出折成 +N;
- *   ③ 卡底信号行:评分 / 在用数 / 发布者自报评测,永远贴卡底(mt-auto)。
- * 改造前这里最多能同时出现 9 个徽章 + 一行评测徽记,评分位还用 ml-auto 在换行后到处漂。
+ * 单张目录卡片(分区视图与平铺视图共用)。UI-5 之后只留四样东西:
+ *   ① 识别标:按分类着色的首字方块(不再是一屏同款插头 / 星芒图标);
+ *   ② 名字 + 一句人话描述(插件的凭据说明留给详情页,见 lib/marketplace cardBlurb);
+ *   ③ 一行安静的元信息:插件连接状态(StatusPill)、评分、在用人数、发布者自报评测;
+ *   ④ 主按钮:连接 / 更新 / 安装 / 已安装。
+ * 分类、标签徽章不再上卡:分区标题和首字方块的颜色已经说明分类。
  */
 function CardTile({
   card,
   installed,
   plugins,
   onOpen,
-  featured = false,
+  onConnect,
 }: {
-  featured?: boolean;
   card: MarketplaceCard;
   installed: Map<string, MarketplaceInstalled>;
   /** 插件目录(slug → 状态);只在「插件」类目传入。 */
   plugins?: Map<string, PluginEntry>;
   onOpen: (slug: string) => void;
+  /** 市场插件装了还没连账号时,主按钮直接去管理中心连接(不经过详情页)。 */
+  onConnect?: (slug: string) => void;
 }) {
   const inst = card.preset ? undefined : installed.get(card.slug);
   const canUpdate = inst ? updateAvailable(inst) : false;
   const bench = benchmarkBadgeLabel(card.benchmark);
-  // 使用信号(真实使用 > 安装):近30天有去重使用人数则以「30天 N 人在用」替代原
-  // 安装数徽章位;否则如实展示「N 次安装」，不把安装量冒充活跃人数。缺字段(旧后端)两者皆无 → 不占位。
+  // 使用信号(真实使用 > 安装):近30天有去重使用人数则以「30天 N 人在用」替代安装数;
+  // 否则如实展示「N 次安装」，不把安装量冒充活跃人数。缺字段(旧后端)两者皆无 → 不占位。
   const users30d = card.users30d ?? 0;
   const inUseLabel =
     users30d > 0
@@ -187,12 +161,10 @@ function CardTile({
   // 评分:服务端已保证样本≥5 才非 null(前端不做二次阈值判断)。中性信号,诚实文案。
   const rating = card.rating ?? null;
   const ratingTotal = rating ? rating.up + rating.down : 0;
-  // 卡片只在「已知分类」时渲染分类徽章 —— 未分类不占位不噪音(分区视图里区头已足够)。
   const catLabel = isMarketplaceCategoryId(card.category)
     ? marketplaceCategoryLabel(card.category)
     : null;
-  // 身份徽章互斥取一:预设 > 官方已预装 > 官方 > 可更新。多个身份同时挂满整行是改造前
-  // 卡高参差的主要来源,而它们表达的是同一件事「这条目由谁背书」。
+  // 身份互斥取一:预设 > 官方已预装 > 官方 > 可更新。只进读屏名,卡面只留一个「官方 / 预设」小字。
   const identity = card.preset
     ? "预设 · 开箱即用"
     : card.preinstalled
@@ -202,164 +174,160 @@ function CardTile({
         : canUpdate
           ? "可更新"
           : null;
-  const trusted = Boolean(card.preset || card.preinstalled || card.official);
-  const Icon = cardIcon(card);
-  const tags = card.tags.slice(0, 2);
-  const restTags = card.tags.length - tags.length;
+  const trustMark = card.preset ? "预设" : card.preinstalled || card.official ? "官方" : null;
   // 插件卡:状态以插件目录为准(已连接 / 未连接 / 需重新授权),与管理中心同一判据;
   // 有新版本仍优先提示更新。目录读不到时退回原来的「已安装」。
   const plugin = plugins?.get(card.slug);
   const pluginState = plugin && !canUpdate ? plugin : null;
   const stateLabel = canUpdate ? "有新版本" : pluginState ? pluginState.stateLabel : inst ? "已安装" : null;
+  const action: CardAction =
+    pluginState?.state === "needs-connect"
+      ? "connect"
+      : canUpdate
+        ? "update"
+        : inst || card.preset || card.preinstalled || pluginState
+          ? "installed"
+          : "install";
+  // 预装插件点整卡就去管理中心,不需要第二个按钮;市场插件点整卡开详情,「连接」得是单独的按钮。
+  const connectHere = action === "connect" && onConnect && !card.preinstalled ? onConnect : null;
+  const isPlugin = marketplaceArtifactKind(card) === "plugin";
   // 整卡是一个 button:不给显式名的话,读屏会把描述+全部徽章+评分连读成几十字的按钮名。
   // 描述走 aria-describedby(而不是 aria-hidden):名字短、描述仍可听 —— 它是装不装的主要依据。
   const ariaLabel = [card.name, catLabel, identity, stateLabel].filter(Boolean).join("，");
   const descId = useId();
-  const hasSignals = Boolean(rating || inUseLabel || bench);
+  const showState = Boolean(pluginState || canUpdate);
+  const hasMeta = Boolean(showState || rating || inUseLabel || bench);
 
   return (
-    <li>
+    <li className="relative min-w-0">
       <button
         type="button"
         onClick={() => onOpen(card.slug)}
         aria-label={ariaLabel}
         aria-describedby={descId}
         data-category={card.category ?? "general"}
-        data-featured={featured || undefined}
-        className="marketplace-card"
+        className="marketplace-card group flex h-full w-full items-center gap-3 rounded-md border border-border bg-surface p-4 text-left outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <span className="marketplace-card-top">
-          <span className="marketplace-card-icon"><Icon size={24} strokeWidth={1.6} aria-hidden="true" /></span>
-          <span className="marketplace-card-state">
-            {canUpdate ? <><ArrowUpCircle size={13} aria-hidden="true" /> 可更新</>
-              : pluginState ? (
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1",
-                    pluginState.tone === "success" && "text-success",
-                    pluginState.tone === "warning" && "text-warning",
-                    pluginState.tone === "danger" && "text-danger",
-                  )}
-                  data-testid="plugin-state"
-                >
-                  {pluginState.state === "connected" ? <ShieldCheck size={13} aria-hidden="true" /> : <Plug size={13} aria-hidden="true" />}
-                  {pluginState.stateLabel}
-                </span>
-              )
-              : inst ? <><ShieldCheck size={13} aria-hidden="true" /> 已安装</>
-                : <ArrowUpRight size={18} className="marketplace-card-arrow" aria-hidden="true" />}
+        <CardMark name={card.name} category={card.category} />
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="flex min-w-0 items-baseline gap-1.5">
+            <span className="marketplace-card-name truncate text-body font-semibold text-fg">{card.name}</span>
+            {trustMark && <span className="shrink-0 text-caption text-faint">{trustMark}</span>}
           </span>
+          <span id={descId} className="marketplace-card-description line-clamp-2 text-meta text-muted">
+            {cardBlurb(card.description, isPlugin)}
+          </span>
+          {hasMeta && (
+            <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
+              {showState && (
+                <StatusPill
+                  variant="pill"
+                  tone={canUpdate || !pluginState ? "idle" : PLUGIN_TONE[pluginState.tone]}
+                  label={stateLabel ?? undefined}
+                  data-testid={pluginState ? "plugin-state" : undefined}
+                  className="text-caption"
+                />
+              )}
+              {rating && (
+                // role=img + aria-label:样本量说明从桌面端才触发的原生 title 挪进无障碍名,
+                // 触屏用户不再完全够不到它。
+                <span
+                  role="img"
+                  aria-label={`好评 ${rating.up}/${ratingTotal}，来自 ${ratingTotal} 次真实使用的反馈`}
+                  className="inline-flex items-center gap-1"
+                >
+                  <ThumbsUp size={11} aria-hidden="true" />
+                  {rating.up}/{ratingTotal}
+                </span>
+              )}
+              {inUseLabel && (
+                <span className="inline-flex items-center gap-1">
+                  <Users size={11} aria-hidden="true" />
+                  {inUseLabel}
+                </span>
+              )}
+              {/* 评测徽记:免责不能只靠 hover —— 「· 自报」直接进可见文案,完整口径进无障碍名。 */}
+              {bench && (
+                <span
+                  role="img"
+                  aria-label={`${bench.label}（${bench.title}）`}
+                  className="inline-flex min-w-0 items-center gap-1 truncate"
+                >
+                  {bench.label} · 自报
+                </span>
+              )}
+            </span>
+          )}
         </span>
-        <span className="marketplace-card-name">{card.name}</span>
-        <span id={descId} className="marketplace-card-description line-clamp-2">{card.description}</span>
-        {(identity || catLabel || card.tags.length > 0) && (
-          <div className="marketplace-card-tags flex flex-wrap items-center gap-1" aria-hidden="true">
-            {identity && (
-              <Badge tone={trusted ? "success" : "accent"} size="sm">
-                {identity}
-              </Badge>
-            )}
-            {catLabel && (
-              <Badge tone="info" size="sm">
-                <Layers size={10} /> {catLabel}
-              </Badge>
-            )}
-            {tags.map((t) => (
-              <Badge key={t} tone="neutral" size="sm">
-                {t}
-              </Badge>
-            ))}
-            {restTags > 0 && (
-              <Badge tone="neutral" size="sm">
-                +{restTags}
-              </Badge>
-            )}
-          </div>
-        )}
-
-        {hasSignals && (
-          <div className="marketplace-card-signals">
-            {rating && (
-              // role=img + aria-label:样本量说明从桌面端才触发的原生 title 挪进无障碍名,
-              // 触屏用户不再完全够不到它。
-              <span
-                role="img"
-                aria-label={`好评 ${rating.up}/${ratingTotal}，来自 ${ratingTotal} 次真实使用的反馈`}
-                className="inline-flex items-center gap-1"
-              >
-                <ThumbsUp size={11} aria-hidden="true" />
-                {rating.up}/{ratingTotal}
-              </span>
-            )}
-            {inUseLabel && (
-              <span className="inline-flex items-center gap-1">
-                <Users size={11} aria-hidden="true" />
-                {inUseLabel}
-              </span>
-            )}
-            {/* 评测徽记:免责不能只靠 hover —— 「· 自报」直接进可见文案,完整口径进无障碍名。 */}
-            {bench && (
-              <span
-                role="img"
-                aria-label={`${bench.label}（${bench.title}）`}
-                className="inline-flex min-w-0 items-center gap-1 truncate"
-              >
-                {bench.label} · 自报
-              </span>
-            )}
-          </div>
+        {action === "installed" ? (
+          <span aria-hidden="true" className="inline-flex shrink-0 items-center gap-1 text-meta text-faint">
+            <Check size={13} strokeWidth={1.75} />
+            {ACTION_LABEL.installed}
+          </span>
+        ) : (
+          // 有单独「连接」按钮时这里只占位,保证文字列宽度不变。
+          <span aria-hidden="true" className={cn(ACTION_CLASS, connectHere && "invisible")}>
+            {ACTION_LABEL[action]}
+          </span>
         )}
       </button>
+      {connectHere && (
+        <Button
+          size="sm"
+          variant="secondary"
+          aria-label={`连接「${card.name}」`}
+          onClick={() => connectHere(card.slug)}
+          className="absolute right-4 top-1/2 -translate-y-1/2"
+        >
+          {ACTION_LABEL.connect}
+        </Button>
+      )}
     </li>
   );
 }
 
-/** 区头:overline 级结构标签 + 计数 + 分隔线,与卡片标题拉开两档,分区不再塌平。 */
+/** 区头:标题 + 计数 + 一句说明(桌面),标题和卡片名拉开一档,不再挂图标和徽章。 */
 function Section({
   title,
   blurb,
   count,
   truncated,
-  icon: Icon,
-  iconClassName,
   cards,
   installed,
   plugins,
   onOpen,
+  onConnect,
 }: {
   title: string;
   blurb?: string;
   count: number;
   /** 目录只拉了一页:分区计数只是"已加载"的成员数,不能当"共有"说(K-03)。 */
   truncated?: boolean;
-  icon: LucideIcon;
-  iconClassName?: string;
   cards: MarketplaceCard[];
   installed: Map<string, MarketplaceInstalled>;
   plugins?: Map<string, PluginEntry>;
   onOpen: (slug: string) => void;
+  onConnect?: (slug: string) => void;
 }) {
   return (
-    <section className="marketplace-section" data-featured={title === "平台精选" || undefined}>
-      <div className="marketplace-section-heading">
-        <div className="flex flex-wrap items-center gap-2">
-          <Icon size={13} className={cn("shrink-0 text-faint", iconClassName)} aria-hidden="true" />
-          <h3 className="marketplace-section-title">
-            {title}
-          </h3>
-          <Badge tone="neutral" size="sm">
-            {truncated ? `已加载 ${count}` : count}
-          </Badge>
-          {truncated && <span className="text-caption text-faint">还有更多未加载</span>}
-        </div>
-        {/* 分区说明在窄屏隐藏:每个分区多一行就多吃 16px,而 390px 屏上光是必需控件
-            (Tabs/类目/搜索/分类片)已经占掉近一半高度。 */}
-        {blurb && <p className="mt-1 hidden line-clamp-1 text-caption text-faint sm:block">{blurb}</p>}
-
+    <section className="marketplace-section flex flex-col gap-3">
+      <div className="flex min-w-0 items-baseline gap-2">
+        <h3 className="shrink-0 text-section font-semibold text-fg">{title}</h3>
+        <span className="shrink-0 text-meta tabular-nums text-faint">{truncated ? `已加载 ${count}` : count}</span>
+        {truncated && <span className="shrink-0 text-caption text-faint">还有更多未加载</span>}
+        {/* 分区说明在窄屏隐藏:每个分区多一行就多吃 16px。 */}
+        {blurb && <p className="hidden min-w-0 truncate text-caption text-faint sm:block">{blurb}</p>}
       </div>
-      <ul className="marketplace-grid">
+      <ul className={GRID}>
         {cards.map((c) => (
-          <CardTile key={c.slug} card={c} installed={installed} plugins={plugins} onOpen={onOpen} featured={title === "平台精选"} />
+          <CardTile
+            key={c.slug}
+            card={c}
+            installed={installed}
+            plugins={plugins}
+            onOpen={onOpen}
+            onConnect={onConnect}
+          />
         ))}
       </ul>
     </section>
@@ -368,7 +336,7 @@ function Section({
 
 /**
  * 发现：kind 切换 + 搜索 + 目录卡片。
- * - 有查询词 → 平铺相关度列表（服务端排序权威，卡片加分类徽章）。
+ * - 有查询词 → 平铺相关度列表（服务端排序权威）。
  * - 空查询 → 分区视图（平台精选 → 按 taxonomy 顺序的分类分区 → 未分类兜底），
  *   顶部一行可横向滚动的分类筛选片；选中某类后平铺该类。**信任服务端顺序**，
  *   前端只做纯分组，不再自行按热度重排。
@@ -380,6 +348,11 @@ function Section({
  * · 精选卡在下方分类区去重(同一张卡在一屏里出现两次是改造前最真实的困惑源);
  * · 静默校准失败不再弹红条,只在头带留一个可点的重试;
  * · AI 导购入口常驻,并进两个空态。
+ *
+ * ── 2026-10-29 UI-5「素净工作台」 ──────────────────────────────────────────
+ * · 删掉 hero、英文小字和自带的纸色调色板(marketplace.css),全部改用主 token;
+ * · 「试试」芯片并进搜索框占位词,分类筛选只剩一行;
+ * · 卡片换成首字方块 + 一句人话 + 状态 + 主按钮(见 CardTile)。
  */
 export function BrowsePanel({
   auth,
@@ -395,9 +368,9 @@ export function BrowsePanel({
 }: {
   auth: AuthSession;
   /** 仅展示该类目（存储层 kind；connector 在产品层显示为「插件」）。 */
-  kind?: "skill" | "agent" | "connector";
+  kind?: BrowseKind;
   /** 类目切换回调。缺省则不渲染类目 Tabs(状态权威在壳层 MarketplaceCenter)。 */
-  onKindChange?: (kind: "skill" | "agent" | "connector") => void;
+  onKindChange?: (kind: BrowseKind) => void;
   /** 审核状态转为终态时递增；即使查询词/kind 未变也重新拉市场目录。 */
   revision?: number;
   /** 审核通过通知的 CTA：切到对应分类并直接打开新条目详情。 */
@@ -655,30 +628,16 @@ export function BrowsePanel({
 
   return (
     <div className="marketplace-browse flex flex-col">
-      {!q && selectedCat === null && (
-        <section className="marketplace-hero" aria-label="探索市场">
-          <div className="marketplace-hero-copy">
-            <span className="marketplace-eyebrow"><span /> 为你的灵感，扩展可能</span>
-            <h2>好工具，<br />让想法<span className="marketplace-hero-emphasis">更进一步。</span></h2>
-            <p>{kind === "agent" ? "找到与你默契配合的智能体，把专业的事交给专业的伙伴。" : kind === "connector" ? "连接你熟悉的应用，让对话与工作自然衔接。" : "发现实用技能，把重复的事交给 AI，把时间留给创造。"}</p>
-          </div>
-          <div className="marketplace-hero-art" aria-hidden="true">
-            <span className="marketplace-art-caption">YOUR NEXT CAPABILITY</span>
-            <div className="marketplace-art-stack"><span><Code2 size={28} /></span><span><Bot size={32} strokeWidth={1.5} /></span><span><Sparkles size={42} strokeWidth={1.3} /></span></div>
-            <span className="marketplace-art-foot">灵感 × 能力 <ArrowUpRight size={16} /></span>
-          </div>
-        </section>
-      )}
-      {/* 一条 sticky 头带承载「看哪一类 + 搜什么 + 让 AI 帮挑」:改造前 kind pill 在
-          sticky 搜索框上方且不吸顶,一滚动就只剩一个孤零零的搜索框。 */}
-      <div className="marketplace-toolbar">
+      {/* 一条吸顶栏承载「看哪一类 + 搜什么 + 让 AI 帮挑」(UI-5:去掉 hero 和英文小字之后,打开市场
+          第一眼就是它和卡片)。手机上两行:类目一行,搜索一行,整条吸顶。 */}
+      <div className="marketplace-toolbar sticky top-0 z-10 flex flex-col gap-2 border-b border-border bg-surface px-4 py-3 sm:flex-row sm:items-center sm:gap-3 sm:px-6">
         {onKindChange && (
           <Tabs
             aria-label="市场类型"
             value={kind}
-            onValueChange={(v) => onKindChange(v as "skill" | "agent" | "connector")}
+            onValueChange={(v) => onKindChange(v as BrowseKind)}
             items={KIND_TABS}
-            className="marketplace-kind-tabs shrink-0 self-start sm:self-auto"
+            className="shrink-0 max-sm:w-full max-sm:[&>[role=tab]]:flex-1"
           />
         )}
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
@@ -695,7 +654,7 @@ export function BrowsePanel({
               aria-label={`搜索${noun}`}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder={`搜索${noun}`}
+              placeholder={`搜索${noun}，试试${SEARCH_EXAMPLES[kind]}`}
               className="marketplace-search pl-9"
             />
           </div>
@@ -711,32 +670,14 @@ export function BrowsePanel({
           )}
           {onAskAiInChat && (
             <Button size="sm" variant="ghost" className="shrink-0" onClick={askAi}>
-              <Sparkles size={14} className="text-accent" aria-hidden="true" /> AI 帮我挑
+              <Sparkles size={14} aria-hidden="true" /> AI 帮我挑
             </Button>
           )}
         </div>
       </div>
-      {!q && (
-        // 提示词做成可点的芯片:改造前是一行纯文字,三个带引号的词看着像能点,点了没反应(K-06)。
-        <div className="marketplace-suggestions flex flex-wrap items-center gap-1.5 text-caption text-faint">
-          <span>试试</span>
-          {(kind === "agent"
-            ? ["写作", "编程", "研究"]
-            : kind === "connector"
-              ? ["文档", "代码", "沟通"]
-              : ["翻译", "论文", "写作"]
-          ).map((word) => (
-            <Chip key={word} active={false} onClick={() => setQ(word)}>
-              {word}
-            </Chip>
-          ))}
-        </div>
-      )}
 
-      {/* 分类筛选片:仅浏览态且有分区时渲染。移动端一行横向滚动(不换行),右缘渐隐替代
-          改造前那行「左右滑动查看更多分类」的常驻小字 —— 可滚动这件事应该由视觉暗示,而不是
-          占一行去讲。桌面端(sm 起)有宽度就直接换行:此前桌面也横滚、还隐藏了滚动条又没有
-          箭头,鼠标用户根本到不了被右缘截掉的最后一片(K-12)。 */}
+      {/* 分类筛选只留这一行(UI-5)。移动端一行横向滚动,右缘渐隐暗示还有;桌面端(sm 起)有宽度就
+          直接换行:此前桌面也横滚、还隐藏了滚动条又没有箭头,鼠标用户到不了被截掉的最后一片(K-12)。 */}
       {grouped && (grouped.categories.length > 0 || grouped.uncategorized.length > 0) && (
         <div className="relative">
           <section
@@ -744,7 +685,7 @@ export function BrowsePanel({
             // 只在窄屏(真的横滚时)可聚焦;桌面换行不滚,不留无意义的 Tab 停靠点(QA t-1028 §6 #1)。
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
             tabIndex={narrow ? 0 : undefined}
-            className="marketplace-categories flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
+            className="marketplace-categories flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-1 pt-3 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible sm:px-6"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
               全部
@@ -762,13 +703,13 @@ export function BrowsePanel({
           </section>
           <div
             aria-hidden="true"
-            className="marketplace-category-fade pointer-events-none absolute inset-y-0 right-0 w-8 sm:hidden"
+            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-linear-to-l from-surface to-transparent sm:hidden"
           />
         </div>
       )}
 
       {err && (
-        <div className="px-4 pb-2">
+        <div className="px-4 pt-3 sm:px-6">
           <Alert
             tone="danger"
             density="compact"
@@ -784,7 +725,7 @@ export function BrowsePanel({
       )}
 
       {firstLoad ? (
-        <ListSkeleton variant="card" rows={4} className="px-4 pb-5" />
+        <ListSkeleton variant="card" rows={4} className="px-4 py-4 sm:px-6" />
       ) : empty && !err ? (
         debouncedQ ? (
           <EmptyState
@@ -794,7 +735,7 @@ export function BrowsePanel({
             action={
               <div className="flex flex-wrap items-center justify-center gap-2">
                 {onAskAiInChat && (
-                  <Button size="sm" variant="accent" onClick={askAi}>
+                  <Button size="sm" variant="primary" onClick={askAi}>
                     <Sparkles size={14} aria-hidden="true" /> 让 AI 帮我找
                   </Button>
                 )}
@@ -812,7 +753,7 @@ export function BrowsePanel({
             action={
               <div className="flex flex-wrap items-center justify-center gap-2">
                 {onCreateInChat && (
-                  <Button size="sm" variant="accent" onClick={onCreateInChat}>
+                  <Button size="sm" variant="primary" onClick={onCreateInChat}>
                     <Sparkles size={14} aria-hidden="true" /> 让 AI 帮我做一个
                   </Button>
                 )}
@@ -829,24 +770,20 @@ export function BrowsePanel({
         // 刷新/翻页时保留旧列表(只压暗),不再整片闪成骨架把滚动位置打乱。
         <div
           aria-busy={loading || undefined}
-          className={cn("flex flex-col", loading && "opacity-60 transition-opacity")}
+          className={cn("flex flex-col pt-3", loading && "opacity-60 transition-opacity")}
         >
           {/* 结果条:平铺态给「在看哪一类/搜了什么 + 命中数 + 返回全部」,分区态给总数。
-              窄屏在不必要时(分区态且没有更多可加载)让出这 21px —— 分区计数已在各区头。 */}
+              窄屏在不必要时让出这一行 —— 分区计数已在各区头。 */}
           <div
             className={cn(
-              "marketplace-results flex items-center gap-2",
+              "marketplace-results flex min-h-8 items-center gap-2 px-4 pb-2 sm:px-6",
               !flatMode && !truncated && "hidden sm:flex",
             )}
           >
             {flatMode ? (
               <>
-                <h3 className="min-w-0 truncate text-caption font-semibold uppercase tracking-[0.06em] text-muted">
-                  {flatTitle}
-                </h3>
-                <Badge tone="neutral" size="sm">
-                  {flatCards.length}
-                </Badge>
+                <h3 className="min-w-0 truncate text-section font-semibold text-fg">{flatTitle}</h3>
+                <span className="shrink-0 text-meta tabular-nums text-faint">{flatCards.length}</span>
               </>
             ) : (
               // 只拉了一页时说「已加载」而不是「共」:分区计数与这里都不能把一页当全量(K-03)。
@@ -874,19 +811,18 @@ export function BrowsePanel({
 
           {sections && selectedCat === null ? (
             // 分区视图:平台精选 → 各分类分区 → 未分类兜底
-            <div className="marketplace-sections">
+            <div className="marketplace-sections flex flex-col gap-7 px-4 pb-8 pt-1 sm:px-6">
               {sections.featured.length > 0 && (
                 <Section
                   title="平台精选"
                   blurb={`平台为你挑选的优质${noun}`}
                   count={sections.featured.length}
                   truncated={truncated}
-                  icon={Star}
-                  iconClassName="text-accent"
                   cards={sections.featured}
                   installed={installed}
                   plugins={pluginBySlug}
                   onOpen={openCard}
+                  onConnect={onOpenConnectors}
                 />
               )}
               {sections.categories.map((c) => (
@@ -896,11 +832,11 @@ export function BrowsePanel({
                   blurb={c.blurb}
                   count={c.cards.length}
                   truncated={truncated}
-                  icon={sectionIcon(c.id)}
                   cards={c.cards}
                   installed={installed}
                   plugins={pluginBySlug}
                   onOpen={openCard}
+                  onConnect={onOpenConnectors}
                 />
               ))}
               {sections.uncategorized.length > 0 && (
@@ -909,26 +845,33 @@ export function BrowsePanel({
                   blurb="暂未归类的条目"
                   count={sections.uncategorized.length}
                   truncated={truncated}
-                  icon={Layers}
                   cards={sections.uncategorized}
                   installed={installed}
                   plugins={pluginBySlug}
                   onOpen={openCard}
+                  onConnect={onOpenConnectors}
                 />
               )}
             </div>
           ) : (
             // 平铺视图:搜索相关度列表,或选中某个分类筛选片
-            <ul className="marketplace-grid marketplace-flat-grid">
+            <ul className={cn(GRID, "marketplace-flat-grid px-4 pb-8 sm:px-6")}>
               {flatCards.map((c) => (
-                <CardTile key={c.slug} card={c} installed={installed} plugins={pluginBySlug} onOpen={openCard} />
+                <CardTile
+                  key={c.slug}
+                  card={c}
+                  installed={installed}
+                  plugins={pluginBySlug}
+                  onOpen={openCard}
+                  onConnect={onOpenConnectors}
+                />
               ))}
             </ul>
           )}
 
           {/* 目录不再硬截断:装满一页就给出口,否则第 51 个商品对用户等于不存在。 */}
           {truncated && (
-            <div className="px-4 pb-5">
+            <div className="px-4 pb-5 sm:px-6">
               <Button variant="secondary" size="sm" className="w-full" loading={loading} onClick={loadMore}>
                 加载更多
               </Button>
