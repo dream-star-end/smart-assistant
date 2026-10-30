@@ -1,4 +1,4 @@
-import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH } from '@openclaude/protocol';
+import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH, PLATFORM_PROMPT_SLOTS_PATH } from '@openclaude/protocol';
 import { waitForRetryDelay, _runOneTurn as runOneTurnAttempt, type TurnRunnerHost } from '../sessionTurnRunner.js';
 import { createServer } from 'node:http';
 /**
@@ -248,6 +248,7 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   const keys = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN', 'OC_USER_ID'] as const;
   const previous = keys.map((key) => process.env[key]);
   let identityReads = 0;
+  let privacyReads = 0;
   let renewalRequests = 0;
   let protocolError: unknown;
   const server = createServer(async (req, res) => {
@@ -258,6 +259,15 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
         identityReads++;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '1', profiles: [] } }));
+        return;
+      }
+      const url = new URL(req.url ?? '', 'http://fixture');
+      if (url.pathname === PLATFORM_PROMPT_SLOTS_PATH) {
+        assert.equal(req.method, 'GET');
+        assert.deepEqual([...url.searchParams], []);
+        privacyReads++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }));
         return;
       }
       assert.equal(req.url, TURN_LEASE_RENEW_PATH);
@@ -292,6 +302,7 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   return { close, assertCalls: () => {
     assert.equal(protocolError, undefined);
     assert.equal(identityReads, 1, 'submit must cross the normal authenticated identity gate');
+    assert.equal(privacyReads, 0, 'this edition has no prompt-privacy admission fetch');
     assert.equal(renewalRequests, 1, 'retry must reach the distinct lease endpoint exactly once');
   } };
 }
