@@ -674,6 +674,7 @@ export function registerAgentForeground({
 }): {
   taskId: string;
   backgroundSignal: Promise<void>;
+  abortController: AbortController;
   cancelAutoBackground?: () => void;
 } {
   void initTaskOutputAsSymlink(agentId, getAgentTranscriptPath(asAgentId(agentId)));
@@ -744,7 +745,7 @@ export function registerAgentForeground({
     cancelAutoBackground = () => clearTimeout(timer);
   }
 
-  return { taskId: agentId, backgroundSignal, cancelAutoBackground };
+  return { taskId: agentId, backgroundSignal, abortController, cancelAutoBackground };
 }
 
 /**

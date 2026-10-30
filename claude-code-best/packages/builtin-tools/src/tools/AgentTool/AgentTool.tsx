@@ -936,7 +936,6 @@ export const AgentTool = buildTool({
       // and optionally in a worktree cwd override for filesystem isolation
       return runWithAgentContext(syncAgentContext, () =>
         wrapWithCwd(async () => {
-          linkBoxAgentAbort(syncAgentContext.boxInvocation, toolUseContext.abortController.signal);
           const agentMessages: MessageType[] = [];
           const agentStartTime = Date.now();
           const syncTracker = createProgressTracker();
@@ -969,6 +968,8 @@ export const AgentTool = buildTool({
           // promise, accumulating callbacks for the lifetime of the agent.
           let backgroundPromise: Promise<{ type: 'background' }> | undefined;
           let cancelAutoBackground: (() => void) | undefined;
+          let foregroundAbortController = toolUseContext.abortController;
+          let unlinkForegroundAbort: (() => void) | undefined;
           if (!isBackgroundTasksDisabled) {
             const registration = registerAgentForeground({
               agentId: syncAgentId,
@@ -980,6 +981,15 @@ export const AgentTool = buildTool({
               autoBackgroundMs: getAutoBackgroundMs() || undefined,
             });
             foregroundTaskId = registration.taskId;
+            foregroundAbortController = registration.abortController;
+            // The SDK/UI task Stop must abort the actual foreground HTTP.
+            // Keep the root link removable: a durably detached background
+            // task retains its independent controller and survives root ESC.
+            const parentSignal = toolUseContext.abortController.signal;
+            const abortForeground = () => registration.abortController.abort(parentSignal.reason);
+            if (parentSignal.aborted) abortForeground();
+            else parentSignal.addEventListener('abort', abortForeground, { once: true });
+            unlinkForegroundAbort = () => parentSignal.removeEventListener('abort', abortForeground);
             backgroundPromise = registration.backgroundSignal.then(() => ({
               type: 'background' as const,
             }));
@@ -995,6 +1005,7 @@ export const AgentTool = buildTool({
           let stopForegroundSummarization: (() => void) | undefined;
           // const capture for sound type narrowing inside the callback below
           const summaryTaskId = foregroundTaskId;
+          linkBoxAgentAbort(syncAgentContext.boxInvocation, foregroundAbortController.signal);
 
           // Get async iterator for the agent
           const agentIterator = runAgent({
@@ -1002,6 +1013,7 @@ export const AgentTool = buildTool({
             override: {
               ...runAgentParams.override,
               agentId: syncAgentId,
+              abortController: foregroundAbortController,
             },
             onCacheSafeParams:
               summaryTaskId && getSdkAgentProgressSummariesEnabled()
@@ -1067,6 +1079,8 @@ export const AgentTool = buildTool({
                   // Capture the taskId for use in the async callback
                   const backgroundedTaskId = foregroundTaskId;
                   await detachBoxAgentInvocation(syncAgentContext.boxInvocation);
+                  unlinkForegroundAbort?.();
+                  unlinkForegroundAbort = undefined;
                   wasBackgrounded = true;
                   // Stop foreground summarization; the backgrounded closure
                   // below owns its own independent stop function.
@@ -1347,6 +1361,7 @@ export const AgentTool = buildTool({
             // Store the error to handle after cleanup
             syncAgentError = toError(error);
           } finally {
+            unlinkForegroundAbort?.();
             if (!wasBackgrounded) await finishBoxAgentInvocation(syncAgentContext.boxInvocation).catch(() => {});
             // Clear the background hint UI
             if (toolUseContext.setToolJSX) {

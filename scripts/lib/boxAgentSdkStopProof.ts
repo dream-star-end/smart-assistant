@@ -25,10 +25,12 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
   // The first wait is installed before the CLI can generate an error.
   void failed.catch(()=>{})
   const fail=(error:unknown)=>{if(cleaning)return;failure ??=error instanceof Error?error:new Error(String(error));rejectFailure(failure)}
-  const within=async<T>(stage:Promise<T>):Promise<T>=>{
+  const observed:string[]=[]
+  const within=async<T>(label:string,stage:Promise<T>):Promise<T>=>{
     let timer:ReturnType<typeof setTimeout>|undefined
     try {return await Promise.race([stage,failed,new Promise<never>((_resolve,reject)=>{
-      timer=setTimeout(()=>reject(new Error('BOX_AGENT_SDK_STOP_CONTROL_DEADLINE')),15_000)
+      timer=setTimeout(()=>reject(new Error(`BOX_AGENT_SDK_STOP_CONTROL_DEADLINE_${label} ${JSON.stringify({
+        rootCalls,modelReady,agentId,started:[...started],barrierObserved,stopObserved,abortObserved,observed})}`)),15_000)
     })])} finally {if(timer) clearTimeout(timer)}
   }
   let rootSession:string|undefined
@@ -133,6 +135,8 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
         if(!line.trim())continue
         try {
           const frame=JSON.parse(line)
+          observed.push(`${frame.type}:${frame.subtype ?? frame.request?.subtype ?? frame.response?.subtype ?? ''}`)
+          if(observed.length>20) observed.shift()
           if(frame.type==='system' && frame.subtype==='task_started' && frame.task_type==='local_agent') {
             started.add(frame.task_id);maybeReady()
           } else if(frame.type==='control_request' && frame.request?.subtype==='box_agent_scope') {
@@ -168,18 +172,18 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
       }
     })
     write({type:'user',message:{role:'user',content:'Use Agent once; the host will stop its running task.'}})
-    await within(taskReady)
+    await within('task-ready',taskReady)
     write({type:'control_request',request_id:failedStopId,request:{subtype:'stop_task',task_id:agentId}})
-    await within(failedStop)
+    await within('failed-stop-response',failedStop)
     assert.equal(abortObserved,false)
     write({type:'control_request',request_id:stopId,request:{subtype:'stop_task',task_id:agentId}})
-    await within(cancelled)
+    await within('durable-stop-control',cancelled)
     assert.equal(stopObserved,false)
     write({type:'control_request',request_id:barrierId,request:{subtype:'mcp_status'}})
-    await within(barrier)
+    await within('reader-barrier',barrier)
     assert.ok(heldAck);heldAck()
-    await within(stopped)
-    await within(abortedModel)
+    await within('confirmed-stop-response',stopped)
+    await within('actual-model-http-abort',abortedModel)
     await controls
     if(failure)throw failure
   } finally {await clean()}
