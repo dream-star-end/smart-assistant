@@ -18,13 +18,13 @@ priority: 8
 
 ```bash
 # CSV → 规范 xlsx
-oc-xlsx from-csv data.csv -o /home/agent/.openclaude/结果.xlsx
+oc-xlsx from-csv data.csv -o /home/agent/.openclaude/generated/结果.xlsx
 
 # JSON 对象数组 → xlsx(列取并集,缺失留空)
-oc-xlsx from-json records.json -o out.xlsx
+oc-xlsx from-json records.json -o /home/agent/.openclaude/generated/out.xlsx
 
 # markdown 表格 → xlsx(文中多张表 → 多个 sheet,sheet 名取表格前最近的标题)
-oc-xlsx from-md report.md -o tables.xlsx
+oc-xlsx from-md report.md -o /home/agent/.openclaude/generated/tables.xlsx
 ```
 
 先把要落表的数据写成 CSV/JSON/markdown 表,再一条命令成表,省 token 又稳定。
@@ -47,7 +47,7 @@ chart = BarChart(); chart.title = "月度利润"
 chart.add_data(Reference(ws, min_col=4, min_row=1, max_row=4), titles_from_data=True)
 chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=4))
 ws.add_chart(chart, "F2")
-wb.save("/home/agent/.openclaude/财务.xlsx")
+wb.save("/home/agent/.openclaude/generated/财务.xlsx")
 ```
 
 数据透视用 `pandas.pivot_table` 算好后写入一个 sheet,或用 openpyxl 的公式;大表统计用 `duckdb` 写 SQL(比手搓 DataFrame 更省 token、更快):
@@ -58,7 +58,7 @@ df = duckdb.sql("""
   SELECT 部门, ROUND(SUM(金额),2) AS 合计, COUNT(*) AS 笔数
   FROM read_csv_auto('明细.csv') GROUP BY 部门 ORDER BY 合计 DESC
 """).df()
-df.to_excel("/home/agent/.openclaude/汇总.xlsx", index=False)   # pandas 走 openpyxl 引擎
+df.to_excel("/home/agent/.openclaude/generated/汇总.xlsx", index=False)   # pandas 走 openpyxl 引擎
 ```
 
 ## 3. 读取用户上传的表格
@@ -90,7 +90,7 @@ oc-artifact-qa inspect --input out.xlsx --out-dir out.xlsx.qa --expect qa-expect
 contact sheet,确认列宽、换行、数字格式和图表可读;复杂表还要确认重算后没有 `#REF!`、
 `#DIV/0!` 等错误。失败就修工作簿并重新 QA,不能只用 `unzip -t` 或最终回复自述代替。
 
-最终回复给**绝对路径**(如 `/home/agent/.openclaude/结果.xlsx`)并说明 sheet、公式和 QA 结果。
+交付文件必须写入 `/home/agent/.openclaude/generated/<文件名>`；最终回复逐个列出各主要文件的完整**绝对路径**(如 `/home/agent/.openclaude/generated/结果.xlsx`)并说明 sheet、公式和 QA 结果。
 
 ## 工具调用纪律(重要)
 
