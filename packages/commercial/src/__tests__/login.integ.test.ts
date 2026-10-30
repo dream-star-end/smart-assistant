@@ -856,7 +856,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
   });
 
   // OCV5-622:默认 grace=45 后，rotate 后 11s / 40s 同 fingerprint 复用仍走 race
-  // （覆盖办公号实测 ~11.6s 误判 theft）。超 grace 且后继已被使用才 theft；后继未使用见下方补发用例。
+  // （覆盖办公号实测 ~11.6s 误判 theft）；超 grace 仍 theft。
   test("reuse rotated refresh at 11s / 40s (default grace=45) → REFRESH_RACE", async (t) => {
     if (skipIfNoPg(t)) return;
     const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
@@ -907,6 +907,67 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     }
   });
 
+  test("reuse rotated refresh at 50s (default grace=45) → still theft", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
+    process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+    try {
+      await setupUser("paula-overgrace@example.com", "paula overgrace password");
+      const lr = await login(
+        {
+          email: "paula-overgrace@example.com",
+          password: "paula overgrace password",
+          turnstile_token: "tok",
+        },
+        {
+          jwtSecret: JWT_SECRET,
+          turnstileBypass: true,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        },
+      );
+      const oldRaw = lr.refresh_token;
+      const r1 = await refresh(oldRaw, {
+        jwtSecret: JWT_SECRET,
+        remoteIp: "10.1.2.3",
+        userAgent: "race-test-ua",
+      });
+      await query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '50 seconds' WHERE token_hash = $1",
+        [refreshTokenHash(oldRaw)],
+      );
+      let theftFired = false;
+      await assert.rejects(
+        refresh(oldRaw, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+          onTheftDetected: () => {
+            theftFired = true;
+          },
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+      assert.equal(theftFired, true, "age=50s must still theft under default grace=45");
+      await assert.rejects(
+        refresh(r1.refresh_token, {
+          jwtSecret: JWT_SECRET,
+          remoteIp: "10.1.2.3",
+          userAgent: "race-test-ua",
+        }),
+        (err: unknown) =>
+          err instanceof RefreshError && err.code === "INVALID_REFRESH",
+      );
+    } finally {
+      if (prev === undefined) process.env.REFRESH_ROTATION_GRACE_SECONDS = "";
+      else process.env.REFRESH_ROTATION_GRACE_SECONDS = prev;
+    }
+  });
+
+  // INC-20261030-REFRESH-UNDELIVERED-SETCOOKIE: the anchored case above records no real
+  // client IP, so it stays theft. Reissue needs UA, bound IP and the stored client_ip
+  // (CF-Connecting-IP in production) to all match, and the successor to be unused.
   test("lost Set-Cookie: reuse at 50s and at 6h, same fingerprint, unused successor → reissue, no theft", async (t) => {
     if (skipIfNoPg(t)) return;
     const prev = process.env.REFRESH_ROTATION_GRACE_SECONDS;
@@ -920,12 +981,13 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         await setupUser(email, "paula overgrace password");
         const lr = await login(
           { email, password: "paula overgrace password", turnstile_token: "tok" },
-          { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
+          { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
         );
         const oldRaw = lr.refresh_token;
         const delivered = await refresh(oldRaw, {
           jwtSecret: JWT_SECRET,
           remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
           userAgent: "race-test-ua",
         });
         await query(
@@ -936,6 +998,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         const again = await refresh(oldRaw, {
           jwtSecret: JWT_SECRET,
           remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
           userAgent: "race-test-ua",
           onTheftDetected: () => { theftFired = true; },
         });
@@ -953,6 +1016,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         const kept = await refresh(again.refresh_token, {
           jwtSecret: JWT_SECRET,
           remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
           userAgent: "race-test-ua",
         });
         assert.ok(kept.access_token.length > 0);
@@ -971,17 +1035,19 @@ describe("auth.refresh rotation (integ, LOW)", () => {
       await setupUser("paula-consumed@example.com", "paula overgrace password");
       const lr = await login(
         { email: "paula-consumed@example.com", password: "paula overgrace password", turnstile_token: "tok" },
-        { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
+        { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
       );
       const oldest = lr.refresh_token;
       const mid = await refresh(oldest, {
         jwtSecret: JWT_SECRET,
         remoteIp: "10.1.2.3",
+        clientIp: "203.0.113.10",
         userAgent: "race-test-ua",
       });
       const tip = await refresh(mid.refresh_token, {
         jwtSecret: JWT_SECRET,
         remoteIp: "10.1.2.3",
+        clientIp: "203.0.113.10",
         userAgent: "race-test-ua",
       });
       await query(
@@ -993,6 +1059,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         refresh(oldest, {
           jwtSecret: JWT_SECRET,
           remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
           userAgent: "race-test-ua",
           onTheftDetected: () => { theftFired = true; },
         }),
@@ -1003,6 +1070,7 @@ describe("auth.refresh rotation (integ, LOW)", () => {
         refresh(tip.refresh_token, {
           jwtSecret: JWT_SECRET,
           remoteIp: "10.1.2.3",
+          clientIp: "203.0.113.10",
           userAgent: "race-test-ua",
         }),
         (err: unknown) => err instanceof RefreshError && err.code === "INVALID_REFRESH",
@@ -1013,17 +1081,18 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     }
   });
 
-  test("reuse outside grace with unused successor but different IP → still theft", async (t) => {
+  test("reuse outside grace with unused successor but different client IP → still theft", async (t) => {
     if (skipIfNoPg(t)) return;
     await setupUser("paula-otherip@example.com", "paula overgrace password");
     const lr = await login(
       { email: "paula-otherip@example.com", password: "paula overgrace password", turnstile_token: "tok" },
-      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", userAgent: "race-test-ua" },
+      { jwtSecret: JWT_SECRET, turnstileBypass: true, remoteIp: "10.1.2.3", clientIp: "203.0.113.10", userAgent: "race-test-ua" },
     );
     const oldRaw = lr.refresh_token;
     const live = await refresh(oldRaw, {
       jwtSecret: JWT_SECRET,
       remoteIp: "10.1.2.3",
+      clientIp: "203.0.113.10",
       userAgent: "race-test-ua",
     });
     await query(
@@ -1034,7 +1103,8 @@ describe("auth.refresh rotation (integ, LOW)", () => {
     await assert.rejects(
       refresh(oldRaw, {
         jwtSecret: JWT_SECRET,
-        remoteIp: "10.9.9.9",
+        remoteIp: "10.1.2.3",
+        clientIp: "198.51.100.66",
         userAgent: "race-test-ua",
         onTheftDetected: () => { theftFired = true; },
       }),

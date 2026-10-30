@@ -19,9 +19,11 @@ import { prepareAuthRowResetForTest } from "./helpers/authRows.js";
  *         a reissued successor cannot be alternated, two tabs do not revoke the new
  *         ticket, and a reissue is stored as revoked_reason 'reissued'.
  *
- * All credentials are fake fixtures. remoteIp "127.0.0.1" is what handleRefresh passes
- * for every proxied client (ctx.authBoundIp = req.socket.remoteAddress, router.ts:2260,
- * handlers.ts:967); the selfhost master binds 127.0.0.1 behind cloudflared.
+ * All credentials and addresses are fake fixtures. remoteIp "127.0.0.1" is what
+ * handleRefresh passes for every proxied client (ctx.authBoundIp =
+ * req.socket.remoteAddress); the selfhost master binds 127.0.0.1 behind cloudflared.
+ * clientIp is what handleRefresh derives from CF-Connecting-IP on that loopback socket
+ * (refreshClientIpFromRequest), so `fp` models one real browser behind the tunnel.
  */
 
 const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://test:test@127.0.0.1:55432/openclaude_test";
@@ -30,7 +32,8 @@ const JWT_SECRET = "z".repeat(64);
 const PASSWORD = "sec review fake password";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/141.0 Safari/537.36";
 const PROXY_IP = "127.0.0.1";
-const fp = { jwtSecret: JWT_SECRET, remoteIp: PROXY_IP, userAgent: UA };
+const CLIENT_IP = "203.0.113.10";
+const fp = { jwtSecret: JWT_SECRET, remoteIp: PROXY_IP, clientIp: CLIENT_IP, userAgent: UA };
 
 let pgAvailable = false;
 let resetAuthRows: (() => Promise<void>) | undefined;
@@ -77,7 +80,7 @@ function skip(t: { skip: (r: string) => void }): boolean {
 const isInvalid = (e: unknown) => e instanceof RefreshError && e.code === "INVALID_REFRESH";
 
 /** Login → one rotation. Returns X (rotated, aged past grace) and Y (its live, unused successor). */
-async function staleChain(label: string, opts: { remember?: boolean; clientIp?: string } = {}) {
+async function staleChain(label: string, opts: { remember?: boolean; clientIp?: string | null } = {}) {
   const email = `sec-${label}@example.com`;
   const bound = opts.clientIp === undefined ? fp : { ...fp, clientIp: opts.clientIp };
   await register({ email, password: PASSWORD, turnstile_token: "tok" }, { mailer: new NullMailer(), turnstileBypass: true });
@@ -124,6 +127,8 @@ describe("sec-authrefresh R: regression invariants (must pass)", () => {
     ["IP mismatch", { remoteIp: "10.9.9.9" }],
     ["empty UA", { userAgent: "" }],
     ["missing IP", { remoteIp: undefined }],
+    ["client IP mismatch behind loopback", { clientIp: "198.51.100.66" }],
+    ["missing client IP", { clientIp: null }],
   ] as const) {
     test(`R-02 ${name} with unused successor → theft, family revoked`, async (t) => {
       if (skip(t)) return;
@@ -135,6 +140,16 @@ describe("sec-authrefresh R: regression invariants (must pass)", () => {
       await assert.rejects(refresh(y.refresh_token, fp), isInvalid);
     });
   }
+
+  test("R-02 family issued without a client IP → theft even when the request has one", async (t) => {
+    if (skip(t)) return;
+    const { x, y } = await staleChain("r02-no-stored-client-ip", { clientIp: null });
+    let fired = 0;
+    await assert.rejects(refresh(x, { ...fp, onTheftDetected: () => { fired++; } }), isInvalid);
+    assert.equal(fired, 1);
+    assert.equal((await family(x)).live, 0);
+    await assert.rejects(refresh(y.refresh_token, fp), isInvalid);
+  });
 
   test("R-03 within grace (<45s) a stale presentation is still REFRESH_RACE, no issuance", async (t) => {
     if (skip(t)) return;

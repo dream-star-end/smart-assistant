@@ -224,7 +224,6 @@ export function clientIpOf(req: IncomingMessage): string {
   return socketIp;
 }
 
-// 导出给测试用,不是 public API
 /**
  * Real client IP for refresh_tokens.client_ip and the lost-cookie reissue check.
  *
@@ -257,6 +256,7 @@ export function refreshClientIpFromRequest(
   return cleaned ? normalizeClientIp(cleaned) : null;
 }
 
+// 导出给测试用,不是 public API
 export const __internal_clientIp = { ipv4ToInt, ipv6ToBigInt, ipInCidrV4, ipInCidrV6, isCloudflareIp, normalizeClientIp };
 
 export function userAgentOf(req: IncomingMessage): string | null {
