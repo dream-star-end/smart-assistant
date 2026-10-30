@@ -183,6 +183,11 @@ sweep_stale_master_gate_tmpdirs() {
 # 门的断言、计数都不在这里;倍数只放大门里的等待预算,上限 3 倍。
 MASTER_BOX_GATE_LOAD_MAX=8          # 16 核的一半(用户 2026-10-21 定),不读环境变量
 MASTER_GATE_LOAD_SCALE_MAX=3        # 同上
+# 命令行命中 npm test/check:v5 仅作候选(rf-heavy 排队等列车时 argv 也带测试命令,但整棵进程树处于 sleep/flock 阻塞)。
+# 采样窗 200ms(Linux USER_HZ=100 下约 20 个时钟 tick):足以覆盖活跃测试在异步 IO 间隙的 CPU 推进,且远小于 15s 轮询周期;
+# 阈值 1 tick(200ms 内进程树累计 >=10ms CPU,约单核 5%),或树内任一线程处于 R/D 状态即认定真在跑测试。
+MASTER_GATE_PROC_SAMPLE_SEC=0.20
+MASTER_GATE_PROC_CPU_MIN_TICKS=1
 MASTER_GATE_IDLE_TIMEOUT_S="${MASTER_GATE_IDLE_TIMEOUT_S:-900}"
 MASTER_GATE_IDLE_POLL_S="${MASTER_GATE_IDLE_POLL_S:-15}"
 MASTER_GATE_LOADAVG="${MASTER_GATE_LOADAVG:-/proc/loadavg}"
@@ -228,10 +233,11 @@ master_gate_load_scale() {
     'BEGIN { s = l / d; if (s < 1) s = 1; if (s > m) s = m; printf "%.2f", s }'
 }
 
-# 主机不空闲的原因(空闲时什么都不打印):负载、被持有的 test-mutex 锁、npm test 类进程。
-# 锁只用 flock -n 试探后立即放开,不新建锁文件;进程只读 /proc/<pid>/cmdline,不 pgrep/pkill。
+# 主机不空闲的原因(空闲时什么都不打印):负载、被持有的 test-mutex 锁、真在跑的 npm test 类进程。
+# 锁只用 flock -n 试探后立即放开,不新建锁文件;进程先按 /proc/<pid>/cmdline 筛候选(只排除 $$ / BASHPID,不 pgrep/pkill),
+# 再核候选及其子进程树在采样窗内是否有 R/D 线程或 CPU tick 增长,排除 wait-for-trains.sh/flock/sleep 排队等待者。
 master_gate_busy_reason() {
-  local l f name rc pid cmd reasons=() args=()
+  local l f name rc pid cmd idx active_out="" reasons=() args=() cand_pids=() cand_labels=()
   l="$(master_gate_load1)"
   if [[ -z "$l" ]]; then
     reasons+=("load1=unreadable")
@@ -249,15 +255,171 @@ master_gate_busy_reason() {
   for f in "$MASTER_GATE_PROC_ROOT"/[0-9]*/cmdline; do
     pid="${f%/cmdline}"
     pid="${pid##*/}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
     [[ "$pid" != "$$" && "$pid" != "${BASHPID:-}" ]] || continue
     args=()
-    mapfile -d '' -t args <"$f" 2>/dev/null || continue
+    mapfile -d '' -t args 2>/dev/null <"$f" || continue
     (( ${#args[@]} > 0 )) || continue
     cmd=" ${args[*]} "
     if [[ "$cmd" =~ [[:space:]/]npm(-cli\.js)?[[:space:]]+(test|run[[:space:]]+(test|check:v5)[^[:space:]]*)[[:space:]] ]]; then
-      reasons+=("pid$pid:${BASH_REMATCH[0]//[[:space:]]/ }")
+      cand_pids+=("$pid")
+      cand_labels+=("pid$pid:${BASH_REMATCH[0]//[[:space:]]/ }")
     fi
   done
+  if (( ${#cand_pids[@]} > 0 )); then
+    active_out="$(python3 - "$MASTER_GATE_PROC_ROOT" "$MASTER_GATE_PROC_SAMPLE_SEC" "$MASTER_GATE_PROC_CPU_MIN_TICKS" "$$" "${BASHPID:-}" "${cand_pids[@]}" <<'PY'
+import os
+import sys
+import time
+
+proc_root = sys.argv[1]
+sample_sec = float(sys.argv[2])
+min_ticks = int(sys.argv[3])
+excluded = {os.getpid()}
+for raw_self in (sys.argv[4], sys.argv[5]):
+    if raw_self.isdigit():
+        excluded.add(int(raw_self))
+cands = [int(x) for x in sys.argv[6:]]
+
+
+def parse_stat(raw):
+    rparen = raw.rfind(b") ")
+    if rparen < 0:
+        return None
+    fields = raw[rparen + 2:].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return (
+            fields[0],
+            int(fields[1]),
+            int(fields[11]) + int(fields[12]),
+            int(fields[13]) + int(fields[14]),
+            int(fields[17]),
+            int(fields[19]),
+        )
+    except ValueError:
+        return None
+
+
+def snapshot():
+    procs = {}
+    children = {}
+    try:
+        it = os.scandir(proc_root)
+    except OSError:
+        return procs, children
+    with it:
+        for entry in it:
+            name = entry.name
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid in excluded:
+                continue
+            try:
+                with open(os.path.join(proc_root, name, "stat"), "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            info = parse_stat(raw)
+            if info is None:
+                continue
+            procs[pid] = info
+            children.setdefault(info[1], []).append(pid)
+    return procs, children
+
+
+def subtree(root_pid, procs, children):
+    if root_pid not in procs:
+        return []
+    out = []
+    seen = {root_pid}
+    queue = [root_pid]
+    while queue:
+        cur = queue.pop(0)
+        out.append(cur)
+        for ch in children.get(cur, ()):
+            if ch not in seen and ch in procs:
+                seen.add(ch)
+                queue.append(ch)
+    return out
+
+
+def node_running(pid, info):
+    if info[0] in (b"R", b"D"):
+        return True
+    if info[4] <= 1:
+        return False
+    task_dir = os.path.join(proc_root, str(pid), "task")
+    try:
+        it = os.scandir(task_dir)
+    except OSError:
+        return False
+    with it:
+        for entry in it:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(os.path.join(task_dir, entry.name, "stat"), "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            rparen = raw.rfind(b") ")
+            if rparen >= 0:
+                tf = raw[rparen + 2:].split(None, 1)
+                if tf and tf[0] in (b"R", b"D"):
+                    return True
+    return False
+
+
+procs0, children0 = snapshot()
+active = set()
+pending = []
+for idx, cpid in enumerate(cands):
+    if cpid not in procs0:
+        continue
+    nodes0 = subtree(cpid, procs0, children0)
+    if any(node_running(q, procs0[q]) for q in nodes0):
+        active.add(idx)
+    else:
+        pending.append((idx, cpid, procs0[cpid][5], nodes0))
+
+if pending:
+    time.sleep(sample_sec)
+    procs1, children1 = snapshot()
+    for idx, cpid, start0, nodes0 in pending:
+        info_c1 = procs1.get(cpid)
+        if info_c1 is None or info_c1[5] != start0:
+            continue
+        nodes1 = subtree(cpid, procs1, children1)
+        if any(node_running(q, procs1[q]) for q in nodes1):
+            active.add(idx)
+            continue
+        own_delta = 0
+        for q in nodes1:
+            info1 = procs1[q]
+            info0 = procs0.get(q)
+            if info0 is not None and info0[5] == info1[5]:
+                if info1[2] > info0[2]:
+                    own_delta += info1[2] - info0[2]
+            else:
+                own_delta += info1[2]
+        sum0 = sum(procs0[q][2] + procs0[q][3] for q in nodes0)
+        sum1 = sum(procs1[q][2] + procs1[q][3] for q in nodes1)
+        if own_delta >= min_ticks or (sum1 - sum0) >= min_ticks:
+            active.add(idx)
+
+for idx in sorted(active):
+    print(idx)
+PY
+)"
+    if [[ -n "$active_out" ]]; then
+      while IFS= read -r idx; do
+        [[ "$idx" =~ ^[0-9]+$ ]] && reasons+=("${cand_labels[idx]}") || :
+      done <<<"$active_out"
+    fi
+  fi
   (( ${#reasons[@]} == 0 )) || printf '%s' "${reasons[*]:0:6}"
   return 0
 }
