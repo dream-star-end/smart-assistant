@@ -6,7 +6,33 @@ import { BOX_NATIVE_CONTEXT_MODELS } from './boxNativeRemoteContext.js'
 const START_BYTES = 16 * 1024 * 1024
 const CHUNK_BYTES = 4 * 1024 * 1024
 const MAX_CACHE = 16
-const digest = (s: string) => createHash('sha256').update(s).digest('hex')
+
+/** Derive sizes and prefix hashes from this call's actual array JSON. Parsing
+ * first preserves array nulls and toJSON(key), unlike stringifying each original
+ * element independently. The wire still carries the original message objects. */
+function messageSnapshot(json: string, count: number) {
+  const messages: unknown = JSON.parse(json)
+  if (!Array.isArray(messages) || messages.length !== count) {
+    throw new Error('完整资料传输校验未通过，文件和对话已保留。')
+  }
+  const hash = createHash('sha256').update('[')
+  const prefixDigests = [hash.copy().update(']').digest('hex')]
+  const messageBytes: number[] = []
+  for (const [index, message] of messages.entries()) {
+    const encoded = JSON.stringify(message)
+    if (encoded === undefined) throw new Error('完整资料传输校验未通过，文件和对话已保留。')
+    messageBytes.push(Buffer.byteLength(encoded, 'utf8'))
+    if (index) hash.update(',')
+    hash.update(encoded)
+    prefixDigests.push(hash.copy().update(']').digest('hex'))
+  }
+  const suffixBytes = new Array<number>(count + 1)
+  suffixBytes[count] = 2
+  for (let index = count - 1; index >= 0; index--) {
+    suffixBytes[index] = suffixBytes[index + 1]! + messageBytes[index]! + (index < count - 1 ? 1 : 0)
+  }
+  return { messageBytes, suffixBytes, prefixDigests }
+}
 
 type Params = {
   model: string
@@ -95,6 +121,9 @@ export async function sendWithBoxContextTransport<T extends Params, R>(
   if (Buffer.byteLength(fullMessages, 'utf8') <= START_BYTES || params.messages.length < 2) {
     return await send(params, options.timeoutMs)
   }
+  // Rebuilt on every call: in-place edits to old objects must invalidate refs.
+  // An explicit reference repair can reuse this same invocation's snapshot.
+  const snapshot = messageSnapshot(fullMessages, params.messages.length)
   const key = JSON.stringify([client.baseURL, params.model, params.metadata ?? null])
   for (let repair = 0; ; repair++) {
     try {
@@ -102,12 +131,12 @@ export async function sendWithBoxContextTransport<T extends Params, R>(
       const prefixEnd = params.messages.length - 1
       if (ref && (ref.expires_at <= Date.now()
         || ref.message_count > prefixEnd
-        || digest(JSON.stringify(params.messages.slice(0, ref.message_count))) !== ref.messages_sha256)) {
+        || snapshot.prefixDigests[ref.message_count] !== ref.messages_sha256)) {
         refs.delete(key)
         ref = undefined
       }
       let offset = ref?.message_count ?? 0
-      const remainingBytes = Buffer.byteLength(JSON.stringify(params.messages.slice(offset)), 'utf8')
+      const remainingBytes = snapshot.suffixBytes[offset]!
       // Reuse a previously complete prefix until the delta grows. Exact prefix
       // hashes deliberately miss if a caller changed any original byte.
       if (!ref || remainingBytes > CHUNK_BYTES) {
@@ -116,12 +145,12 @@ export async function sendWithBoxContextTransport<T extends Params, R>(
           let end = offset
           let bytes = 2
           while (end < prefixEnd) {
-            const next = Buffer.byteLength(JSON.stringify(params.messages[end]), 'utf8') + 1
+            const next = snapshot.messageBytes[end]! + 1
             if (end > offset && bytes + next > CHUNK_BYTES) break
             bytes += next
             end++
           }
-          const expected = digest(JSON.stringify(params.messages.slice(0, end)))
+          const expected = snapshot.prefixDigests[end]!
           const reply = await client.post<Ref>('/v1/messages/context', {
             body: stageBody(params, params.messages.slice(offset, end), ref?.reference),
             signal,
@@ -160,4 +189,3 @@ export async function sendWithBoxContextTransport<T extends Params, R>(
     }
   }
 }
-
