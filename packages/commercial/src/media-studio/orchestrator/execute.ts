@@ -27,6 +27,7 @@ import {
 import { type StudioQaDeps, qaGates } from './qa.js'
 import { failInterpret, runInterpret } from './runInterpret.js'
 import { failQa, runQa } from './runQa.js'
+import { pausesProvider, providerPauseMessage, waitsForProvider } from './providerFailure.js'
 
 export { LeaseLostError }
 
@@ -521,6 +522,14 @@ async function runGen(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal):
       err instanceof MediaProviderError
         ? err
         : new MediaProviderError('PROVIDER_ERROR', false, (err as Error).message ?? 'error')
+    if (waitsForProvider(e.code)) {
+      await waitForOriginal(deps, task)
+      return
+    }
+    if (pausesProvider(e.code)) {
+      await failGen(deps, task, g, e, userId, provider)
+      return
+    }
     if (e.retryable && task.attempts < MAX_PROVIDER_ATTEMPTS) {
       await withLease(deps.pool, task, async (c) => {
         await retryStudioTask(c, task, {
@@ -640,7 +649,7 @@ async function failGen(
       ownerId: g.ownerId,
       takeId: g.takeId,
       code: e.code,
-      message: isMuseSourceFailure(g.providerId, g.request.op, e.code)
+      message: pausesProvider(e.code) ? providerPauseMessage(e.code) : isMuseSourceFailure(g.providerId, g.request.op, e.code)
         ? `${MUSE_SOURCE_FAILED_TEXT}（${e.code}），会自动换下一个可用的服务。`
         : `${g.providerId} 失败（${e.code}），会自动换下一个可用的服务。`,
     })
@@ -650,8 +659,8 @@ async function failGen(
 
 /** Paused projects keep their queued work for later; canceled / deleted ones drop it. */
 async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
-  const r = await deps.pool.query<{ status: string; deleted: boolean }>(
-    'SELECT status, deleted_at IS NOT NULL AS deleted FROM studio_projects WHERE id = $1',
+  const r = await deps.pool.query<{ status: string; deleted: boolean; reason: string | null }>(
+    "SELECT status, deleted_at IS NOT NULL AS deleted, settings->>'awaitingReason' AS reason FROM studio_projects WHERE id = $1",
     [task.projectId],
   )
   const p = r.rows[0]
@@ -706,7 +715,7 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
     })
     return false
   }
-  if (p.status === 'paused') {
+  if (p.status === 'paused' || (p.status === 'awaiting_user' && p.reason === 'provider_failure' && task.kind !== 'interpret')) {
     // Waiting out a pause is not an attempt: give the claim back so MAX_TASK_CLAIMS counts runs only.
     await withLease(deps.pool, task, async (c) => {
       await retryStudioTask(c, task, { delaySeconds: 60, error: 'project paused' })
@@ -719,6 +728,14 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
   return true
 }
 
+/** The provider has already accepted this execution; poll its idempotent result without a new take. */
+async function waitForOriginal(deps: ExecuteDeps, task: StudioTask): Promise<void> {
+  await withLease(deps.pool, task, async (c) => {
+    await retryStudioTask(c, task, { delaySeconds: 30, error: 'IMAGE_REQUEST_IN_PROGRESS' })
+    await c.query('UPDATE studio_tasks SET attempts = GREATEST(0, attempts - 1) WHERE id = $1', [task.id])
+  })
+}
+
 /**
  * An executor error that is not a lost lease: retry with backoff a bounded number of times, then
  * close the task — a generation books what was charged and releases its reservation, a plan hands
@@ -729,7 +746,11 @@ async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promi
     err instanceof MediaProviderError
       ? err
       : new MediaProviderError('EXECUTOR_ERROR', true, (err as Error)?.message ?? 'error')
-  if (e.retryable && task.attempts < MAX_PROVIDER_ATTEMPTS) {
+  if (task.kind === 'gen' && waitsForProvider(e.code)) {
+    await waitForOriginal(deps, task)
+    return
+  }
+  if (!pausesProvider(e.code) && e.retryable && task.attempts < MAX_PROVIDER_ATTEMPTS) {
     await withLease(deps.pool, task, (c) =>
       retryStudioTask(c, task, {
         delaySeconds: 30 * 2 ** (task.attempts - 1),
