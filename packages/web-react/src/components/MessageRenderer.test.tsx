@@ -21,12 +21,14 @@ import {
 } from "./tool/__fixtures__/sessionToolTexts";
 import { ChatInteractionContext, ToolCardActionsContext } from "./tool/context";
 import { preloadTimelineCards } from "./chat/lazyTimelineCards";
+import { preloadProcessStages } from "./chat/lazyProcessStages";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
 // 渲染工具卡展开体与低频时间线卡片的断言先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(preloadToolBody);
 loadBeforeAll(preloadTimelineCards);
+loadBeforeAll(preloadProcessStages);
 
 afterEach(() => {
   cleanup();

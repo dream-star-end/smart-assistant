@@ -9,6 +9,7 @@ import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
 import { preloadTimelineCards } from "./chat/lazyTimelineCards";
+import { preloadProcessStages } from "./chat/lazyProcessStages";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 import { prefetchMarkdownImpl } from "./Markdown";
@@ -19,6 +20,7 @@ loadBeforeAll(prefetchMarkdownImpl);
 // These tests assert expanded tool bodies and TeamPanel synchronously, so lazy chunks must be loaded first.
 loadBeforeAll(preloadToolBody);
 loadBeforeAll(preloadTimelineCards);
+loadBeforeAll(preloadProcessStages);
 
 afterEach(() => {
   cleanup();
