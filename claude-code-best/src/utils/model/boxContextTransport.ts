@@ -7,20 +7,41 @@ const START_BYTES = 16 * 1024 * 1024
 const CHUNK_BYTES = 4 * 1024 * 1024
 const MAX_CACHE = 16
 
-/** Derive sizes and prefix hashes from this call's actual array JSON. Parsing
- * first preserves array nulls and toJSON(key), unlike stringifying each original
- * element independently. The wire still carries the original message objects. */
+/** Input is this call's native JSON.stringify(messages), not arbitrary JSON.
+ * Slice its exact canonical spans without decoding/re-encoding a large history;
+ * array nulls and toJSON(key) are already reflected in these bytes. The wire
+ * still carries the original message objects. */
 export function boxContextMessageSnapshot(json: string, count: number) {
-  const messages: unknown = JSON.parse(json)
-  if (!Array.isArray(messages) || messages.length !== count) {
+  const invalid = () => { throw new Error('完整资料传输校验未通过，文件和对话已保留。') }
+  if (json[0] !== '[' || json[json.length - 1] !== ']') invalid()
+  const ends: number[] = []
+  const tokens = /["\\[\]{},]/g
+  let depth = 0
+  let inString = false
+  for (let token = tokens.exec(json); token; token = tokens.exec(json)) {
+    const char = token[0]
+    if (inString) {
+      if (char === '\\') tokens.lastIndex = token.index + 2
+      else if (char === '"') inString = false
+    } else if (char === '"') inString = true
+    else if (char === '[' || char === '{') depth++
+    else if (char === ']' || char === '}') {
+      if (--depth < 0 || (depth === 0 && token.index !== json.length - 1)) invalid()
+    } else if (char === ',' && depth === 1) ends.push(token.index)
+  }
+  if (inString || depth !== 0) invalid()
+  if (json.length > 2) ends.push(json.length - 1)
+  if (ends.length !== count) {
     throw new Error('完整资料传输校验未通过，文件和对话已保留。')
   }
   const hash = createHash('sha256').update('[')
   const prefixDigests = [hash.copy().update(']').digest('hex')]
   const messageBytes: number[] = []
-  for (const [index, message] of messages.entries()) {
-    const encoded = JSON.stringify(message)
-    if (encoded === undefined) throw new Error('完整资料传输校验未通过，文件和对话已保留。')
+  let start = 1
+  for (const [index, end] of ends.entries()) {
+    if (end <= start) invalid()
+    const encoded = json.slice(start, end)
+    start = end + 1
     messageBytes.push(Buffer.byteLength(encoded, 'utf8'))
     if (index) hash.update(',')
     hash.update(encoded)

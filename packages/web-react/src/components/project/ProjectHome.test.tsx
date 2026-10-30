@@ -1,12 +1,12 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectTab } from "../../hooks/useAppRoute";
 import { api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { ChatProject, ProjectAsset, Session } from "../../lib/types";
-import { ToastProvider, TooltipProvider } from "../ui";
+import { Modal, ToastProvider, TooltipProvider } from "../ui";
 import { ProjectHome, type ProjectHomeProps } from "./ProjectHome";
 import {
   PROJECT_RECIPES,
@@ -24,9 +24,29 @@ loadBeforeAll(() => import("../ImageViewer"));
 // 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(prefetchMarkdownImpl);
 
-afterEach(() => {
+async function finishProjectHomeCleanup(): Promise<void> {
   cleanup();
+  // Radix unmount autofocus runs on a real timer; finish it before jsdom restores constructors.
+  await act(async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+afterEach(async () => {
+  await finishProjectHomeCleanup();
   vi.restoreAllMocks();
+});
+
+it("finishes the real Modal close autofocus before cleanup returns", async () => {
+  const onCloseAutoFocus = vi.fn();
+  render(
+    <Modal open onOpenChange={() => {}} srTitle="cleanup contract" onCloseAutoFocus={onCloseAutoFocus}>
+      <button type="button">focus target</button>
+    </Modal>,
+  );
+  expect(screen.getByRole("dialog", { name: "cleanup contract" })).toBeInTheDocument();
+  await finishProjectHomeCleanup();
+  expect(onCloseAutoFocus).toHaveBeenCalledTimes(1);
 });
 
 const project: ChatProject = {

@@ -100,7 +100,7 @@ function singleImageData(message: unknown): string | undefined {
 export async function transcriptNeedsRecovery(file: SessionReadHandle): Promise<boolean> {
   const { size } = await file.stat()
   let position = 0
-  let carry = Buffer.alloc(0)
+  let fragments: Buffer[] = []
   let bad = false
   const nodes = new Map<string, { parent: unknown; sidechain: boolean; boundary: boolean }>()
   let liveSegment: Obj | undefined
@@ -134,13 +134,23 @@ export async function transcriptNeedsRecovery(file: SessionReadHandle): Promise<
     const { bytesRead } = await file.read(chunk, 0, chunk.length, position)
     check(bytesRead > 0, 'CCB_TRANSCRIPT_SHORT_READ')
     position += bytesRead
-    const bytes = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead)
+    // Scan each new chunk once; join a long row only at its actual LF.
+    const bytes = chunk.subarray(0, bytesRead)
     let start = 0
     let at = bytes.indexOf(10)
-    while (at >= 0) { line(bytes.subarray(start, at)); start = at + 1; at = bytes.indexOf(10, start) }
-    carry = bytes.subarray(start)
+    while (at >= 0) {
+      const tail = bytes.subarray(start, at)
+      if (fragments.length) {
+        fragments.push(tail)
+        line(Buffer.concat(fragments))
+        fragments = []
+      } else line(tail)
+      start = at + 1
+      at = bytes.indexOf(10, start)
+    }
+    if (start < bytes.length) fragments.push(bytes.subarray(start))
   }
-  if (carry.length) line(carry)
+  if (fragments.length) line(fragments.length === 1 ? fragments[0]! : Buffer.concat(fragments))
   let preservedHead: string | undefined
   if (liveSegment && typeof liveSegment.headUuid === 'string' && typeof liveSegment.tailUuid === 'string'
     && typeof liveSegment.anchorUuid === 'string' && nodes.has(liveSegment.anchorUuid) && nodes.has(liveSegment.headUuid)) {

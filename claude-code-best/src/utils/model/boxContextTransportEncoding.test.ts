@@ -10,10 +10,14 @@ test('canonical layout matches independent whole-array prefix hashes and exact U
   sparse[2] = null
   const keyed = { toJSON(key: string) { return { role: 'user', content: [key, undefined, null, sparse] } } }
   const messages: unknown[] = [
-    { role: 'user', content: '\u03a9\u2028\ud800\\\"' },
+    { role: 'user', content: '\u03a9\u2028\ud800\\\"[,]{}' },
     undefined,
     { z: 'last inserted', a: { '10': 'ten', '2': 'two', b: -0, a: 1e-7 } },
     keyed,
+    [true, false, 1e21, null, ['nested', '\\\"', '\\\\', '"[,]{}\\']],
+    'top level string with \\"[,]{}',
+    42,
+    null,
     { role: 'assistant', content: 'tail' },
   ]
   const full = JSON.stringify(messages)
@@ -31,6 +35,17 @@ test('canonical layout matches independent whole-array prefix hashes and exact U
   expect((canonical[3] as { content: unknown[] }).content[0]).toBe('3')
   expect(JSON.stringify(messages)).toBe(full)
   expect(typeof keyed.toJSON).toBe('function')
+  for (const tiny of [[], [null], ['\\"[,]{}'], [[1, { nested: [true] }]]]) {
+    const actual = boxContextMessageSnapshot(JSON.stringify(tiny), tiny.length)
+    for (let end = 0; end <= tiny.length; end++) {
+      expect(actual.prefixDigests[end]).toBe(digest(tiny.slice(0, end)))
+      expect(actual.suffixBytes[end]).toBe(Buffer.byteLength(JSON.stringify(tiny.slice(end)), 'utf8'))
+    }
+  }
+  expect(() => boxContextMessageSnapshot(JSON.stringify(messages), messages.length - 1)).toThrow()
+  for (const invalid of ['{}', '[', '[,]', '[[]', '[]]', '[][1]']) {
+    expect(() => boxContextMessageSnapshot(invalid, messages.length)).toThrow()
+  }
 })
 
 test('a fresh snapshot rechecks in-place old bytes on the same message objects', () => {
