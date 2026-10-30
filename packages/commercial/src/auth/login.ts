@@ -33,6 +33,7 @@ import { getBalanceBreakdown } from "../billing/spend.js";
 import { ensureFreeSubscription } from "../billing/subscription.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
+import { validClientIp } from "./clientIp.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import {
   lockRefreshFamily,
@@ -127,6 +128,23 @@ function rotationGraceSeconds(): number {
   return n;
 }
 
+/** 后继刚被标成 reissued、仍在宽限内，且 authBoundIp 指纹齐全。
+ *  age 是两边事务的 NOW()（事务起点）之差。输家若更早 BEGIN，会看到很小的负数，
+ *  那仍是同一次补发。负得超过宽限才不当 race。
+ */
+function lostReissueIsRace(
+  row: { expired: boolean; revoked_reason: string | null; revoked_age_sec: string | null } | undefined,
+  grace: number,
+  sameUa: boolean,
+  sameIp: boolean,
+  fingerprintPresent: boolean,
+): boolean {
+  if (!row || row.expired || row.revoked_reason !== "reissued" || grace <= 0) return false;
+  if (!sameUa || !sameIp || !fingerprintPresent) return false;
+  const age = Number(row.revoked_age_sec);
+  return Number.isFinite(age) && age >= -grace && age < grace;
+}
+
 export interface LoginUser {
   id: string;
   email: string;
@@ -183,6 +201,13 @@ export interface LoginDeps {
    * race grace `sameIp` 比对恒真。
    */
   bindIp?: string;
+  /**
+   * 真实客户端 IP，写入 refresh_tokens.client_ip，只给「Set-Cookie 没送达」的补发比对。
+   * 显式传入（含 null）不再回落到 remoteIp：null / 空 / 非法表示指纹不全，拒绝补发。
+   * 省略时才回落 remoteIp，让仍用 remoteIp 模拟客户端的旧测试保持原语义。
+   * 生产 handler 必须显式传入。不要传 authBoundIp：个人版它恒为 127.0.0.1。
+   */
+  clientIp?: string | null;
   userAgent?: string;
   /** 测试可注入 now(秒) */
   now?: () => number;
@@ -215,6 +240,17 @@ async function getDummyHash(): Promise<string> {
 
 function nowSec(deps?: { now?: () => number }): number {
   return deps?.now ? deps.now() : Math.floor(Date.now() / 1000);
+}
+
+/**
+ * client_ip to store and to compare on reissue.
+ * An explicit clientIp (including null) is authoritative and does not fall
+ * back to the loopback socket. Omitting it falls back to remoteIp so older
+ * tests that model the client as remoteIp keep working.
+ */
+function resolvedClientIp(deps: { clientIp?: string | null; remoteIp?: string | null }): string | null {
+  if (deps.clientIp !== undefined) return validClientIp(deps.clientIp);
+  return validClientIp(deps.remoteIp);
 }
 
 export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult> {
@@ -359,13 +395,14 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
       }
     }
     await client.query(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7)`,
       [
         current.id,
         refresh.hash,
         deps.userAgent ?? null,
         bindIp,
+        resolvedClientIp(deps),
         refresh.expires_at,
         rememberMe,
       ],
@@ -433,8 +470,14 @@ export interface RefreshResult {
 }
 
 export interface RefreshExtraDeps {
-  /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。 */
+  /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。race grace 的 sameIp 也用它。 */
   remoteIp?: string;
+  /**
+   * 本次请求的真实客户端 IP。补发必须与行上的 client_ip 一致且都非空。
+   * 省略时回落 remoteIp（旧测试）；显式 null 不回落。
+   * 45s race 宽限仍只看 remoteIp（authBoundIp），不看这个字段。
+   */
+  clientIp?: string | null;
   userAgent?: string;
   /** 测试可注入新 refresh TTL。 */
   refreshTtlSeconds?: number;
@@ -449,6 +492,10 @@ export interface RefreshExtraDeps {
     remoteIp?: string;
     userAgent?: string;
   }) => void;
+  /**
+   * 补发成功时的审计钩子。不要做重 I/O，也不要记录 token / UA / IP。
+   */
+  onReissued?: (ev: { user_id: string; family_id: string }) => void;
 }
 
 /**
@@ -489,6 +536,7 @@ export async function refresh(
   const ts = nowSec(deps);
   const nowIso = new Date(ts * 1000).toISOString();
   const refreshTtl = deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS;
+  const reqClientIp = resolvedClientIp(deps);
 
   // 全流程在 tx 中:lock family → revalidate/lock 旧 row → INSERT 新 → UPDATE 旧
   const result = await tx(async (client) => {
@@ -517,6 +565,8 @@ export async function refresh(
       // 客户端 replay 即使在 grace 内也会被 fingerprint 拒掉,继续走 theft。
       bound_user_agent: string | null;
       bound_ip: string | null;
+      /** 两侧都是合法 client_ip 且相等。空指纹不是匹配。 */
+      same_client_ip: boolean;
       /** 0031 新增;老行默认 TRUE(迁移时 DEFAULT)。 */
       remember_me: boolean;
     }>(
@@ -532,13 +582,16 @@ export async function refresh(
               END AS revoked_age_sec,
               rt.user_agent AS bound_user_agent,
               host(rt.ip) AS bound_ip,
+              (rt.client_ip IS NOT NULL
+               AND $4::inet IS NOT NULL
+               AND rt.client_ip = $4::inet) AS same_client_ip,
               rt.remember_me AS remember_me
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
           AND rt.family_id = $3::uuid
         FOR UPDATE OF rt`,
-      [tokenHash, nowIso, lockTarget.familyId],
+      [tokenHash, nowIso, lockTarget.familyId, reqClientIp],
     );
 
     if (lookupRes.rows.length === 0) {
@@ -560,11 +613,14 @@ export async function refresh(
     //      Date.now() — 避免 app/DB 时钟漂移把 race 误判成 theft 或反之
     //   2) 加 UA + IP fingerprint:必须和原 row 写入时的 UA/IP 一致才算 race。
     //      不同 UA/IP 的 grace 内 replay 仍走 theft 路径(攻击者从异地复用)
-    //   3) ageSec < 0(理论不可能,DB 时钟不会倒流)走保守的 theft 而非 race
+    //   3) age 比宽限还负(NOW() 是事务起点,输家更早 BEGIN 会看到小负数)才当 theft
+    // 'reissued' 与 'rotated' 一样是「这张票已经被换过」的信号。宽限内同
+    // authBoundIp 指纹仍是 REFRESH_RACE；宽限外整族 theft。logout / admin /
+    // password_reset 不进这条链。
     if (
       row.revoked_at !== null &&
       !row.expired &&
-      row.revoked_reason === "rotated"
+      (row.revoked_reason === "rotated" || row.revoked_reason === "reissued")
     ) {
       const ageSecRaw = row.revoked_age_sec !== null ? Number(row.revoked_age_sec) : Number.POSITIVE_INFINITY;
       const ageSec = Number.isFinite(ageSecRaw) ? ageSecRaw : Number.POSITIVE_INFINITY;
@@ -583,25 +639,37 @@ export async function refresh(
         (deps.remoteIp ?? "").length > 0 &&
         (row.bound_user_agent ?? "").length > 0 &&
         (deps.userAgent ?? "").length > 0;
-      if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp && fingerprintPresent) {
+      const uaPresent =
+        (row.bound_user_agent ?? "").length > 0 &&
+        (deps.userAgent ?? "").length > 0;
+      // NOW() 是事务起点。输家可能更早 BEGIN，age 会是很小的负数，仍在宽限内。
+      if (grace > 0 && ageSec >= -grace && ageSec < grace && sameUa && sameIp && fingerprintPresent) {
         // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
         return { kind: "race" as const };
       }
-      // 直接后继还没被用过、且 UA/IP 与签发时一致：上一张 Set-Cookie 没送达
-      // （关页、发版掐断连接、晚到响应盖住新 cookie）。补发一张新票，不把
-      // 仍在有效期内、从未被出示过的后继判成盗用。后继已经再轮换过，或指纹
-      // 对不上，仍走下面的整族吊销。不延长 refresh TTL。
-      if (sameUa && sameIp && fingerprintPresent) {
+      // 补发不看 authBoundIp。个人版 socket 恒为 127.0.0.1，同 IP 恒真，
+      // 只剩 UA。要比存下来的真实客户端 IP（client_ip），两侧都非空才算。
+      // 后继未用过才补发，并把它标成 'reissued' 而不是 'rotated'。
+      // 第二个 tab 若看到后继刚被标 reissued 且仍在 45s 内、authBoundIp 指纹
+      // 一致，返回 REFRESH_RACE，不要把第一张新票整族吊销。不延长 refresh TTL。
+      // 'reissued' 的票本身不能再被补发：宽限判断在上面，这里直接落到 theft。
+      if (row.revoked_reason === "rotated" && sameUa && row.same_client_ip && uaPresent) {
         const succ = await client.query<{
           id: string;
           live: boolean;
           expired: boolean;
           remember_me: boolean;
+          revoked_reason: string | null;
+          revoked_age_sec: string | null;
         }>(
           `SELECT child.id::text AS id,
                   (child.revoked_at IS NULL) AS live,
                   (child.expires_at <= $2::timestamptz) AS expired,
-                  child.remember_me AS remember_me
+                  child.remember_me AS remember_me,
+                  child.revoked_reason,
+                  CASE WHEN child.revoked_at IS NULL THEN NULL
+                       ELSE EXTRACT(EPOCH FROM (NOW() - child.revoked_at))::text
+                  END AS revoked_age_sec
              FROM refresh_tokens parent
              JOIN refresh_tokens child
                ON child.id = parent.rotated_to_id
@@ -614,40 +682,67 @@ export async function refresh(
         if (child?.live && !child.expired) {
           const redelivered = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
           const reIns = await client.query<{ id: string }>(
-            `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
+            `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at,
                                         family_id, revoked_at, revoked_reason, remember_me)
-             VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL, $7)
+             VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7::uuid, NULL, NULL, $8)
              RETURNING id::text AS id`,
             [
               row.user_id,
               redelivered.hash,
               deps.userAgent ?? null,
               deps.remoteIp ?? null,
+              reqClientIp,
               redelivered.expires_at,
               row.family_id,
               child.remember_me,
             ],
           );
-          const reId = reIns.rows[0].id;
+          const reId = reIns.rows[0]?.id;
+          if (!reId) {
+            throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+          }
           const marked = await client.query(
             `UPDATE refresh_tokens
                 SET revoked_at = NOW(),
-                    revoked_reason = 'rotated',
+                    revoked_reason = 'reissued',
                     rotated_to_id = $1::bigint
               WHERE id = $2::bigint
                 AND revoked_at IS NULL`,
             [reId, child.id],
           );
           if ((marked.rowCount ?? 0) !== 1) {
-            throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+            // 另一个事务已经把后继标走。抛错回滚本事务里的 INSERT，避免第二张活票。
+            // 标成 reissued 且仍在宽限内：REFRESH_RACE。否则落到下面的 theft。
+            const lost = await client.query<{
+              expired: boolean;
+              revoked_reason: string | null;
+              revoked_age_sec: string | null;
+            }>(
+              `SELECT (expires_at <= $2::timestamptz) AS expired,
+                      revoked_reason,
+                      CASE WHEN revoked_at IS NULL THEN NULL
+                           ELSE EXTRACT(EPOCH FROM (NOW() - revoked_at))::text
+                      END AS revoked_age_sec
+                 FROM refresh_tokens
+                WHERE id = $1::bigint`,
+              [child.id, nowIso],
+            );
+            if (lostReissueIsRace(lost.rows[0], grace, sameUa, sameIp, fingerprintPresent)) {
+              throw new RefreshError("REFRESH_RACE", "refresh token rotation race");
+            }
+          } else {
+            return {
+              kind: "reissued" as const,
+              user_id: row.user_id,
+              role: row.role,
+              family_id: row.family_id,
+              newRefresh: redelivered,
+              remember: child.remember_me,
+            };
           }
-          return {
-            kind: "rotated" as const,
-            user_id: row.user_id,
-            role: row.role,
-            newRefresh: redelivered,
-            remember: child.remember_me,
-          };
+        }
+        if (child && !child.live && lostReissueIsRace(child, grace, sameUa, sameIp, fingerprintPresent)) {
+          return { kind: "race" as const };
         }
       }
       const massRevoke = await client.query<{ id: string }>(
@@ -683,15 +778,16 @@ export async function refresh(
     // unchecked 形同虚设)。
     const newRefresh = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
     const ins = await client.query<{ id: string }>(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at,
                                   family_id, revoked_at, revoked_reason, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL, $7)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7::uuid, NULL, NULL, $8)
        RETURNING id::text AS id`,
       [
         row.user_id,
         newRefresh.hash,
         deps.userAgent ?? null,
         deps.remoteIp ?? null,
+        reqClientIp,
         newRefresh.expires_at,
         row.family_id,
         row.remember_me,
@@ -744,6 +840,14 @@ export async function refresh(
     deps.jwtSecret,
     { now: ts, ttlSeconds: deps.accessTtlSeconds },
   );
+
+  if (result.kind === "reissued") {
+    try {
+      deps.onReissued?.({ user_id: result.user_id, family_id: result.family_id });
+    } catch {
+      // 回调失败不影响响应语义
+    }
+  }
 
   return {
     user_id: result.user_id,
