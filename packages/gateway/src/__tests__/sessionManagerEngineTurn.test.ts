@@ -240,7 +240,7 @@ describe('long-task authority interruption keeps paid progress', () => {
       } finally { setV3MasterSinkSingleton(null); }
     });
   }
-  test('retry refresh rejection preserves prior progress and never submits the old ticket', async () => {
+  test('retry refresh rejection preserves prior progress and never submits the old ticket', { timeout: 10_000 }, async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
@@ -267,6 +267,10 @@ describe('long-task authority interruption keeps paid progress', () => {
         [{ index: 0, text: '此前的分析', ts: Date.now() }], [], [], false, true, true, false, 1);
       assert.equal(received, 1);
       assert.equal(runner.submittedInputs.length, 0);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]?.turnIndex, 1);
+      assert.equal(captured.payloads[0]?.usage?.turn, 1);
+      assert.equal(session.turns, 1, 'unsubmitted terminal attempt still consumes the reserved logical turn');
       assert.equal(captured.payloads[0]?.text, '此前的真实回答');
       assert.equal(captured.payloads[0]?.thinkingText, '此前的分析');
       assert.equal(captured.payloads[0]?.errorCode, 'MODEL_AUTHORITY_EXPIRED');
@@ -282,6 +286,94 @@ describe('long-task authority interruption keeps paid progress', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+  for (const status of [403, 409]) {
+    for (const hasProgress of [true, false]) {
+      test(`submit archives ${hasProgress ? 'prior paid progress' : 'zero output'} after retry renewal ${status} and waits for terminal ACK`, { timeout: 10_000 }, async () => {
+        const captured = makeCapturingSink();
+        let entered!: () => void;
+        const sinkEntered = new Promise<void>((resolve) => { entered = resolve; });
+        let acknowledge!: () => void;
+        const ack = new Promise<void>((resolve) => { acknowledge = resolve; });
+        captured.sink.persistOrQueue = async (payload) => {
+          captured.payloads.push(payload);
+          entered();
+          await ack;
+          return { ok: true };
+        };
+        setV3MasterSinkSingleton(captured.sink);
+        const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+        const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+        const server = createServer(async (req, res) => {
+          for await (const _chunk of req) { /* drain */ }
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'TURN_LEASE_REVOKED', message: 'private authority detail' } }));
+        });
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+        process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+        try {
+          const sm = new SessionManager(makeConfigStub());
+          (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+          const runner = new FakeCcbRunner((r) => setImmediate(() => {
+            if (hasProgress) {
+              r.text('已完成前半部分');
+              r.thinking('此前分析');
+              r.toolPair('retained-step', 'Read', '已读取内容');
+              r.plan({ blockId: 'retained-plan', text: '继续后半部分', partial: false });
+            }
+            r.result({
+              is_error: true,
+              subtype: 'error_during_execution',
+              result: 'Selected model is at capacity. Please try a different model.',
+              errorClass: 'model_capacity',
+            });
+          }));
+          const session = makeSession(runner, { channel: 'webchat', userId: 'user-1' });
+          const events: SessionStreamEvent[] = [];
+          const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
+          let finished = false;
+          const submission = sm.submit(session, '完成任务', (event) => events.push(event),
+            undefined, undefined, 'req-renewal-revoked', 'trace-renewal-revoked', undefined,
+            { modelAuthority: authority }).then(() => { finished = true; });
+          await sinkEntered;
+          assert.equal(finished, false, 'submit remains pending until master ACK');
+          assert.equal(events.some((event) => event.kind === 'error'), false, 'terminal error waits for master ACK');
+          assert.equal(runner.submittedInputs.length, 1, 'revoked retry never resubmits the engine');
+          acknowledge();
+          await submission;
+          await sm.awaitPendingPersistence();
+          assert.equal(finished, true);
+          assert.equal(captured.payloads.length, 1, 'all attempts share one terminal tape');
+          const payload = captured.payloads[0]!;
+          assert.ok(payload.turnIndex > 0);
+          assert.equal(payload.turnIndex, session.turns);
+          assert.equal(payload.usage?.turn, payload.turnIndex);
+          assert.equal(payload.status, 'crashed');
+          assert.equal(payload.errorCode, 'MODEL_AUTHORITY_EXPIRED');
+          assert.equal(payload.waiveReason, hasProgress ? undefined : 'platform_authority_expired');
+          assert.equal(payload.text, hasProgress ? '已完成前半部分' : '');
+          if (hasProgress) {
+            assert.equal(payload.thinkingText, '此前分析');
+            assert.equal(payload.tools?.[0]?.blockId, 'retained-step');
+            assert.equal(payload.structuredBlocks?.[0]?.blockId, 'retained-plan');
+          }
+          assert.ok(payload.runtimeEvents?.some((event) =>
+            (event.payload as { type?: string }).type === 'terminal_error'));
+          assert.equal(events.filter((event) => event.kind === 'error').length, 1);
+          assert.doesNotMatch(JSON.stringify(payload), /private authority detail|old-lease|TypeError/);
+        } finally {
+          acknowledge();
+          setV3MasterSinkSingleton(null);
+          if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+          else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
+          if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+          else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+      });
+    }
+  }
   test('successful retry refresh followed by synchronous submit failure rejects without hanging', { timeout: 10_000 }, async () => {
     const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
     const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;

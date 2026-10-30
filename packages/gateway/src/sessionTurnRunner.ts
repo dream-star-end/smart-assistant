@@ -1166,8 +1166,23 @@ export async function _runOneTurn(
     // summary resolve → microtask 执行本函数,期间不会有新的 stdout 宏任务插入,
     // 后处理相对底座输出流的顺序与旧同步实现一致(含 crash 路径下
     // _pendingStaleResumeClear 先于 getOrCreate 'exit' handler 可见)。
-    const finalizeTurn = async (result: TurnSummary | null): Promise<void> => {
+    const finalizeTurn = async (
+      result: TurnSummary | null,
+      rejectedBeforeSubmit = false,
+    ): Promise<void> => {
       if (terminalPersistenceClaim === 'partial') return
+      // A retry whose lease was revoked has no EngineTurnRun: submitting the
+      // stale ticket is forbidden. It still owns the reserved logical turn
+      // and must archive earlier attempts through the same terminal/ACK path.
+      // Other missing handles remain an orchestration error.
+      if (!turn && (!rejectedBeforeSubmit || result?.errorKind !== 'model_authority')) {
+        throw new Error('terminal finalization requires an engine turn')
+      }
+      if (rejectedBeforeSubmit) {
+        if (turn) throw new Error('rejected retry already submitted an engine turn')
+        // The parser normally advances this counter when it receives a result.
+        session.turns = Math.max(session.turns, prevTurns + 1)
+      }
       detach()
       if (result?.nativeCompactionSummary) {
         session._lastNativeCompactionSummary = result.nativeCompactionSummary
@@ -1502,7 +1517,7 @@ export async function _runOneTurn(
       // phantom 信号经 turn 句柄读(异常终态 result=null 时仍可读 —— 旧实现
       // 在 onFinish(null) 里同样消费 telemetry signals;正常终态与
       // result.phantomSignals 同源同值)。
-      const signals = turn!.getPhantomSignals()
+      const signals = turn ? turn.getPhantomSignals() : result!.phantomSignals
       let isPhantomTurn = false
       switch (signals.apiState) {
         case 'skipped':
@@ -2254,7 +2269,7 @@ export async function _runOneTurn(
             tools: [], runtimeEvents: [], stopReason: null, numTurns: null, isError: true,
             errorKind: 'model_authority', errorDetail: 'MODEL_AUTHORITY_EXPIRED', staleResumeId: false,
             phantomSignals: { apiState: 'unknown', skipReason: null },
-          }).catch((err) => {
+          }, true).catch((err) => {
             onEvent({ kind: 'error', error: String(err) })
             settle(() => resolve())
           })

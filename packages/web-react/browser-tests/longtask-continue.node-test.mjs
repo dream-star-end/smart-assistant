@@ -55,7 +55,7 @@ test('t1360u real App: paid and zero-output tasks continue in the original conve
       builder.onLoad({ filter: /\/src\/lib\/chat\/render\.ts$/ }, () => {
         const baseline = process.env.OC_LONGTASK_RENDER_BASELINE ?? resolve(here, '../../../../fixtures/render-before.ts');
         transforms += 1;
-        return { contents: readFileSync(baseline, 'utf8'), loader: 'ts' };
+        return { contents: readFileSync(baseline, 'utf8'), loader: 'ts', resolveDir: resolve(here, '../src/lib/chat') };
       });
     } }] : [], logLevel: 'warning',
   });
