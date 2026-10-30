@@ -83,10 +83,10 @@ export async function buildSessionSnapshot(
   await q.query('RELEASE SAVEPOINT session_snapshot_credits')
   if (row.status === 'terminal') snapshot.reconcile = terminalDispatchReconcile(row.outcome)
   const stream = (await q.query<{
-    projection_source: string; frame_seq: string | null; created_at: Date | null
+    projection_source: string; provenance: { containerLinkGap?: SessionSnapshot['gap'] }; frame_seq: string | null; created_at: Date | null
   }>(
     `/* session-snapshot-watermark */
-     SELECT s.projection_source, f.frame_seq, f.created_at
+     SELECT s.projection_source, s.provenance, f.frame_seq, f.created_at
        FROM client_session_live_streams s
        LEFT JOIN LATERAL (
          SELECT frame_seq,created_at FROM client_session_live_frames
@@ -95,6 +95,7 @@ export async function buildSessionSnapshot(
       WHERE s.stream_key=$1 AND s.user_id=$2 AND s.session_id=$3`,
     [streamKey, `c:${uid}`, sessionId],
   )).rows[0]
+  snapshot.gap = stream?.provenance?.containerLinkGap ?? null
   snapshot.lastFrameSeq = stream?.frame_seq == null ? null : Number(stream.frame_seq)
   snapshot.lastFrameAt = stream?.created_at?.getTime() ?? null
 

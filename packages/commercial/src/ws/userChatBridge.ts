@@ -1,4 +1,6 @@
 import { grokExecutionUpstream } from '@openclaude/protocol'
+import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
+import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
 import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
 import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
@@ -875,6 +877,8 @@ export interface UserChatBridgeDeps {
   /** Composition supplies the verified selfhost default; explicit env 0 rolls back. */
   containerLinkEnabled?: boolean;
   containerLinkHeartbeatMs?: number;
+  resolveContainerLinkEndpoint?: (uid: bigint, containerId: number) => Promise<Awaited<ReturnType<ResolveContainerEndpoint>> | "pending" | null>;
+  containerLinkRecovery?: { channel?: string; retryMs?: number; spacingMs?: number; maxAttempts?: number };
   jwtSecret: string | Uint8Array;
   /** Prompt queue is dark unless the process-level rollout flag is exactly on. */
   promptQueueEnabled?: boolean;
@@ -1556,6 +1560,7 @@ export interface UserChatBridgeHandler {
   /** 测试 / metrics:获取 ConnectionRegistry。 */
   registry: ConnectionRegistry;
   containerLinkSnapshots?(): ContainerLinkSnapshot[];
+  rebuildContainerLinks?(): Promise<void>;
   /**
    * 给指定 uid 的所有活跃 user WS 广播一个 JSON 帧(旁路透传管道,非容器来源)。
    *
@@ -2287,8 +2292,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   };
   const uidToContainerWs = new Map<string, Set<WebSocket>>();
   const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
-    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes })
+    ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes, dialTimeoutMs: connectTimeoutMs })
     : null;
+  if (links) links.beforeReplay = () => outboundPersistQueues.drain();
+  const recovery = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkRecovery({
+    pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
+    ...deps.containerLinkRecovery,
+    drain: async () => { await links.drain(); await outboundPersistQueues.drain(); },
+    attach: (carrier, rows, signal) => rebuildContainerLink({ carrier, rows, signal, links, deps, maxFrameBytes,
+      start: (user, uid, endpoint, socket, abort, connId) => startBridge(user, uid, endpoint, [], endpoint.containerId, socket, abort, null, null, connId),
+    }),
+  }) : null;
+  if (links && recovery) links.onTransportLost = (uid, cid) => recovery.lost(uid, cid);
   const drainingChecks = new Set<() => void>();
   let shuttingDown = false;
   const uidToRecoveryExecutors = new Map<
@@ -2812,66 +2827,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     uid: bigint,
     endpoint: { host: string; port: number; coldStart?: boolean; bundleRev?: string; desktop?: { containerId: number } },
     earlyMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }>,
-    /**
-     * 可选 agent_containers.id。来自 ResolveContainerEndpoint;v3 supervisor
-     * 路径填,test mock 路径可不填。无值或 deps.markContainerActivity 未注入
-     * → 不刷活动(等价于回到本 PR 之前的行为,只在 ensureRunning 刷一次)。
-     */
     containerId: number | undefined,
-    /**
-     * 已构造好的容器侧 WS(direct 或 tunnel)。caller 在 handleUpgrade 内
-     * 完成构造,把成功品交给本函数;失败品 caller 自己 close,不进 bridge。
-     */
     containerWs: WebSocket,
-    /**
-     * caller 持有的 abort controller(同 createXxxContainerSocket 收到的 signal)。
-     * cleanup 时调 abort() — 让 tunnel WS 在握手阶段 abort 也能被打断。
-     */
     connectAbort: AbortController,
-    /**
-     * 0049 模型授权 handle —— null 表示本连接不做模型校验(deps 未注入,或
-     * caller 显式不要鉴权)。语义见 `ModelCheckerHandle`(含 R1 BLOCKER-1 的 epoch 联动)。
-     *
-     * onUserMessage 每条 inbound.message 帧 sync 调一次 isAllowed,且追踪
-     * lastSeenModelId 让没带 model 字段的后续帧也参与校验(plan v3 review v1
-     * follow-up:防"已用 gpt-5.5 跑起来的桥被撤销后无 model 字段帧透传");
-     * 权威开启时,每 turn 还会在 catalog epoch fence 之后跑一次 grants epoch fence
-     * (resolveAuthorityExecOrReject 尾部)。
-     */
     modelCheckerHandle: ModelCheckerHandle | null,
-    /**
-     * P0 计费旁路封堵 —— master 侧 agent→model 权威快照 handle(bridge 可信模型
-     * 推导;null = deps 未注入,桥不做推导,行为与字段加入前一致)。
-     *   - `resolve(agentId)`:已绑定本连接 uid 的 sync 快照 closure;null = 权威
-     *     推导不出(未知 agentId)
-     *   - `isRuntimeDenied(agentId)`:已安装/预设但能力未就绪的显式拒绝集；即使
-     *     浏览器带了 model 也不得绕过
-     *   - `refresh()`:重拉快照(周期 timer 与推导 miss 时补触发,幂等去重)
-     * onUserMessage 的 inbound.message 分类用它推导「帧无 model 时该 agent 的
-     * 有效模型」,与容器 gateway resolveEngine 的判定保持同构。
-     */
-    agentModelResolverHandle:
-      | {
-          resolve: (agentId: string) => string | null;
-          isRuntimeDenied: (agentId: string) => boolean;
-          isIdentityRegistered: (agentId: string) => boolean;
-          authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
-          refresh: () => Promise<void>;
-        }
-      | null,
-    /**
-     * S12e CG4:caller(handleUpgrade)早期生成的 connection-scoped trace。
-     * 移到 caller 的原因:tunnel factory 在 startBridge 之前调,需要同一个值
-     * 写 outgoing `X-Connection-Trace-Id` 头与 bridge log connection 字段共享。
-     * 36 char UUID(`randomUUID()`),过 TRACE_ID_REGEX。
-     */
+    agentModelResolverHandle: {
+      resolve: (agentId: string) => string | null;
+      isRuntimeDenied: (agentId: string) => boolean;
+      isIdentityRegistered: (agentId: string) => boolean;
+      authorizeExecution: NonNullable<AgentModelResolver["authorizeExecution"]>;
+      refresh: () => Promise<void>;
+    } | null,
     connId: string,
-    /**
-     * 连接用户的角色(来自 handleUpgrade 的 JWT claims.role,缺省 'user')。
-     * 当前唯一消费点 = executionDescriptor 的角色分档窗口投影(modelRolePolicy,
-     * 如 kimi-k3:admin 1M / 其他 500k)。语义与 claims.role 的其它读取点一致:
-     * 非破坏性产品分档,token 生命周期内的角色漂移可容忍(收窄方向保守)。
-     */
     userRole: "user" | "admin" = "user",
   ): void {
     // CG2b/CG4 — connection-scoped logger:把 uid + connection-level trace 钉进 bindings,
@@ -4081,7 +4048,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       },
     };
-    const { unregister, evicted } = registry.register(conn);
+    const { unregister, evicted } = linkHandle?.recoveryOnly ? { unregister: () => {}, evicted: [] } : registry.register(conn);
     // 踢人必须留痕:互踢循环/超限排查的第一手证据(close code 4505 服务端此前无日志)。
     for (const victim of evicted) {
       bridgeLog?.warn("user-chat-bridge: kicked oldest connection (per-user limit)", {
@@ -4959,6 +4926,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         const encoded = Buffer.from(JSON.stringify(result), "utf8");
         forwardInboundFrame(encoded, false, encoded.length);
       };
+      if (linkHandle?.recoveryOnly) { rejectPromptQueueDispatch("NO_BRIDGE"); return; }
       const forwardPreparedFrame = (
         frameData: RawData,
         frameIsBinary: boolean,
@@ -10302,10 +10270,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     shuttingDown = true;
+    recovery?.stop();
     if (links) links.stopping = true;
     registry.closeAll(reason);
     for (const check of [...drainingChecks]) check();
     await links?.shutdown();
+    await recovery?.drain();
     await outboundPersistQueues.drain();
     await new Promise<void>((resolve) => {
       try { wss.close(() => resolve()); } catch { resolve(); }
@@ -10479,6 +10449,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     shutdown,
     registry,
     containerLinkSnapshots: () => links?.snapshots() ?? [],
+    rebuildContainerLinks: () => recovery?.start() ?? Promise.resolve(),
     broadcastToUser,
     syncGoalToContainers,
     broadcastAll,
