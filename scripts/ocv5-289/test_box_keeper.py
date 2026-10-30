@@ -1,4 +1,6 @@
 """Offline keeper/worker/CLI lifecycle tests; only kill own test processes."""
+import array
+import fcntl
 import hashlib
 import ctypes
 import json
@@ -13,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 
@@ -248,7 +251,20 @@ class KeeperTest(unittest.TestCase):
 
     def test_output_backpressure_cancel_is_prompt(self) -> None:
         proc = self.start('import os;os.write(1,b"x"*200000)')
-        time.sleep(.5)  # leave parent stdout PIPE unread so W blocks in writer
+        # Wait for actual CLI output and a full unread pipe, rather than
+        # assuming a loaded host finishes the report/ACK startup in .5s.
+        fd = proc.stdout.fileno()
+        capacity = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+        self.assertLess(capacity, 200000, "fixture must exceed stdout capacity")
+        pending = array.array('i', [0])
+        until = time.monotonic() + 4
+        while time.monotonic() < until:
+            self.assertIsNone(proc.poll(), "keeper exited before backpressure")
+            fcntl.ioctl(fd, termios.FIONREAD, pending, True)
+            if pending[0] == capacity:
+                break
+            time.sleep(.01)
+        self.assertEqual(pending[0], capacity, "stdout never became backpressured")
         began = time.monotonic()
         proc.terminate()
         proc.wait(timeout=3)
