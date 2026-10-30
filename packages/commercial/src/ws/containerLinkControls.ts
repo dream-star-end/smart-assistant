@@ -4,9 +4,8 @@ import { WebSocket } from 'ws'
 import { containerLinkControlDelivered } from '../admin/metrics.js'
 import { claimDueTurnControls, releaseTurnControlForRetry } from '../dispatch/turnControlStore.js'
 import type { ContainerLinkRegistry } from './containerLink.js'
-import type { LinkCarrier } from './containerLinkRecoveryStore.js'
+import { readContainerLinkControlTargets, type LinkCarrier, type ContainerLinkControlTarget as Target } from '../dispatch/turnDispatchStore.js'
 
-type Target = { control_id: string; container_id: number }
 interface Options {
   pool: Pool
   channel: string
@@ -75,27 +74,7 @@ export class ContainerLinkControls {
   /** Prefer the exact turn's carrier. A prompt without a dispatch can use
    * the sole active carrier, but never guess between desktop and docker. */
   private async targets(uid: bigint, after: string | null): Promise<Target[]> {
-    const result = await this.options.pool.query<Target>(
-      `SELECT c.control_id,ac.id::int AS container_id
-         FROM turn_control_requests c
-         JOIN client_sessions s ON s.id=c.session_id AND s.user_id='c:' || c.user_id::text AND s.deleted_at IS NULL
-         LEFT JOIN LATERAL (
-           SELECT d.agent_container_id FROM turn_dispatches d
-            WHERE d.user_id=c.user_id AND d.session_id=c.session_id
-            ORDER BY (d.client_message_id=COALESCE(c.payload_json->>'clientMessageId',c.root_client_message_id)) DESC NULLS LAST,
-                     d.admitted_at DESC,d.dispatch_id DESC LIMIT 1
-         ) d ON true
-         JOIN agent_containers ac ON ac.user_id=c.user_id AND ac.state='active' AND ac.runtime_channel=$2
-          AND ac.runtime_kind IN ('docker','desktop')
-          AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
-            SELECT 1 FROM agent_containers other WHERE other.user_id=c.user_id AND other.state='active'
-              AND other.runtime_channel=$2 AND other.runtime_kind IN ('docker','desktop') AND other.id<>ac.id)))
-        WHERE c.user_id=$1 AND c.status IN ('pending','leased') AND c.next_attempt_at<=NOW()
-          AND (c.status='pending' OR c.lease_until<NOW())
-          AND ($3::text IS NULL OR c.control_id>$3)
-        ORDER BY c.control_id LIMIT 100`, [String(uid), this.options.channel, after],
-    )
-    return result.rows
+    return readContainerLinkControlTargets(this.options.pool, uid, this.options.channel, after)
   }
 
   private legacyTransport(uid: bigint): WebSocket | null {
