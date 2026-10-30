@@ -82,6 +82,50 @@ function open(props: Partial<Parameters<typeof ShareDialog>[0]> = {}) {
 }
 
 describe("ShareDialog", () => {
+  it.each(["关闭", "卸载"])("%s时取消正在读取的预览图片", async (action) => {
+    const read = vi.spyOn(FileReader.prototype, "readAsDataURL").mockImplementation(function (this: FileReader) {
+      Object.defineProperty(this, "readyState", { value: FileReader.LOADING, configurable: true });
+    });
+    const abort = vi.spyOn(FileReader.prototype, "abort").mockImplementation(function (this: FileReader) {
+      Object.defineProperty(this, "readyState", { value: FileReader.DONE, configurable: true });
+      this.dispatchEvent(new ProgressEvent("abort"));
+    });
+    renderShareCard.mockResolvedValue({ blob: new Blob(["png"], { type: "image/png" }), layout: {} });
+    try {
+      const view = open();
+      await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        if (action === "卸载") view.unmount();
+        else view.rerender(
+          <ToastProvider>
+            <ShareDialog open={false} onOpenChange={() => {}} messages={MESSAGES} sending={false} title="客户名单" agentName="全能助手" />
+          </ToastProvider>,
+        );
+      });
+      expect(abort).toHaveBeenCalledTimes(1);
+    } finally {
+      read.mockRestore();
+      abort.mockRestore();
+    }
+  });
+
+  it("关闭后绘图才完成时不会再启动图片读取", async () => {
+    let finishRender!: (value: { blob: Blob; layout: object }) => void;
+    renderShareCard.mockReturnValue(new Promise((resolve) => { finishRender = resolve; }));
+    const read = vi.spyOn(FileReader.prototype, "readAsDataURL").mockImplementation(() => {});
+    try {
+      const view = open();
+      await waitFor(() => expect(renderShareCard).toHaveBeenCalledTimes(1));
+      view.unmount();
+      await act(async () => {
+        finishRender({ blob: new Blob(["png"], { type: "image/png" }), layout: {} });
+      });
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it("生成长图后显示预览;保存图片用会话标题命名", async () => {
     const blob = new Blob(["png"], { type: "image/png" });
     renderShareCard.mockResolvedValue({ blob, layout: {} });
