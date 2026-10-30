@@ -152,3 +152,86 @@ test('entering team still asks model-switch consent (OCV5-623)', async () => {
   expect(put).not.toHaveBeenCalled()
   expect(f.result.current.collabMode).toBe('solo')
 })
+
+test('new session (activeId=undefined) defaults to the last actually used session model (U3)', async () => {
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  const setModelId = vi.fn()
+  const models = [
+    { id: 'deepseek-v4-flash', display_name: 'DeepSeek V4 Flash' },
+    { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
+    { id: 'MiniMax-M3', display_name: 'MiniMax M3' },
+  ]
+  const sessions = [
+    { id: 's-used', title: 'Used', ownerUserId: 'u', updatedAt: '2026-10-30T01:00:00Z', lastAt: 2_000, messageCount: 3, modelId: 'gpt-5.6-sol' },
+    { id: 's-old', title: 'Old', ownerUserId: 'u', updatedAt: '2026-10-29T01:00:00Z', lastAt: 1_000, messageCount: 2, modelId: 'deepseek-v4-flash' },
+  ]
+  const f = setup()
+  f.rerender({
+    ...f.input,
+    activeId: 's-used',
+    models,
+    sessions,
+    setModelId,
+  } as SessionModelAndCollabInput)
+  expect(setModelId).toHaveBeenLastCalledWith('gpt-5.6-sol')
+
+  setModelId.mockClear()
+  f.rerender({
+    ...f.input,
+    activeId: undefined,
+    models,
+    sessions,
+    setModelId,
+  } as SessionModelAndCollabInput)
+  expect(setModelId).toHaveBeenLastCalledWith('gpt-5.6-sol')
+})
+
+test('explicit draft model pick is preserved across late session list refreshes until new draft or explicit default_model change (U3)', async () => {
+  vi.spyOn(api, 'getCollaborationConfig').mockResolvedValue(doc('solo', 1))
+  const setModelId = vi.fn()
+  const models = [
+    { id: 'deepseek-v4-flash', display_name: 'DeepSeek V4 Flash' },
+    { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
+    { id: 'MiniMax-M3', display_name: 'MiniMax M3' },
+  ]
+  const f = setup()
+  f.rerender({
+    ...f.input,
+    activeId: undefined,
+    models,
+    sessions: [],
+    setModelId,
+  } as SessionModelAndCollabInput)
+  expect(setModelId).toHaveBeenLastCalledWith('deepseek-v4-flash')
+
+  await act(() => f.result.current.selectModel('MiniMax-M3'))
+  expect(setModelId).toHaveBeenLastCalledWith('MiniMax-M3')
+
+  setModelId.mockClear()
+  // 迟到的 listSessions 带回上次会话模型时,不覆盖用户在当前空白草稿的显式选择
+  f.rerender({
+    ...f.input,
+    activeId: undefined,
+    models,
+    modelId: 'MiniMax-M3',
+    sessions: [
+      { id: 's-used', title: 'Used', ownerUserId: 'u', updatedAt: '2026-10-30T01:00:00Z', lastAt: 2_000, messageCount: 2, modelId: 'gpt-5.6-sol' },
+    ],
+    setModelId,
+  } as SessionModelAndCollabInput)
+  expect(setModelId).not.toHaveBeenCalled()
+
+  // 用户在设置里显式修改默认模型(带 default_model_updated_at)则更新当前草稿
+  f.rerender({
+    ...f.input,
+    activeId: undefined,
+    models,
+    modelId: 'MiniMax-M3',
+    modelPrefs: { default_model: 'deepseek-v4-flash', default_model_updated_at: 5_000 },
+    sessions: [
+      { id: 's-used', title: 'Used', ownerUserId: 'u', updatedAt: '2026-10-30T01:00:00Z', lastAt: 2_000, messageCount: 2, modelId: 'gpt-5.6-sol' },
+    ],
+    setModelId,
+  } as SessionModelAndCollabInput)
+  expect(setModelId).toHaveBeenLastCalledWith('deepseek-v4-flash')
+})
