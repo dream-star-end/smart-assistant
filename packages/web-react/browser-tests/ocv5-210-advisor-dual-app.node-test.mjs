@@ -578,7 +578,8 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.match(String(retried.collabConfigVersion || ""), /v1:advisor:gpt-6-astra/);
     await a.page.getByText("ADVISOR_TASK_CONTINUED", { exact: true }).waitFor();
     await expandConsultCard(a.page);
-    assert.equal(await consultCardToggle(a.page).count(), 1, "completed advisor tool remains once across Continue");
+    // UI-3:同一条顾问工具展开后是人话步骤行,技术详情里还有原卡。两枚按钮是这一条,不是续跑复制的第二条。
+    assert.equal(await consultCardToggle(a.page).count(), 2, "completed advisor tool remains once across Continue");
     await a.page.getByText(ADVICE, { exact: true }).waitFor();
 
     await a.page.close();
