@@ -428,9 +428,22 @@ async function ensureConsultProcessOpen(page) {
 }
 
 async function expandConsultCard(page) {
-  await ensureConsultProcessOpen(page);
-  const expand = page.getByRole("button", { name: /咨询顾问/, expanded: false });
-  if (await expand.count()) await expand.first().click();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await ensureConsultProcessOpen(page);
+    const collapsed = page.getByRole("button", { name: /咨询顾问/, expanded: false });
+    if ((await collapsed.count()) === 0) {
+      if ((await page.getByRole("button", { name: /咨询顾问/, expanded: true }).count()) >= 2) return;
+    } else {
+      try {
+        await collapsed.first().click({ timeout: 1_500 });
+        continue;
+      } catch {
+        // Live turn completion auto-collapses process-toggle (`explicit === undefined`); reopen on next pass.
+      }
+    }
+    await page.waitForTimeout(100);
+  }
 }
 
 async function waitForConsultAdvice(page, inbounds) {
@@ -565,7 +578,8 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.match(String(retried.collabConfigVersion || ""), /v1:advisor:gpt-6-astra/);
     await a.page.getByText("ADVISOR_TASK_CONTINUED", { exact: true }).waitFor();
     await expandConsultCard(a.page);
-    assert.equal(await consultCardToggle(a.page).count(), 1, "completed advisor tool remains once across Continue");
+    // UI-3:同一条顾问工具展开后是人话步骤行,技术详情里还有原卡。两枚按钮是这一条,不是续跑复制的第二条。
+    assert.equal(await consultCardToggle(a.page).count(), 2, "completed advisor tool remains once across Continue");
     await a.page.getByText(ADVICE, { exact: true }).waitFor();
 
     await a.page.close();

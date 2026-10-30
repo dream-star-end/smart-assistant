@@ -11,8 +11,8 @@ import { ReadOnlySystemActionsBoundary } from "./iui/ReadOnlySystemActionsBounda
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections, promptShadowedToolIds } from "./chat/ProcessDisclosure";
-import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, keepDistinctActivity, processSections, promptShadowedToolIds, turnOutcome } from "./chat/ProcessDisclosure";
+import { ChevronDown, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -23,10 +23,9 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  isRetryingTurnStatus,
-  type ChatMessage,
-  type LiveTurnTokenUsageSnapshot,
+import type {
+  ChatMessage,
+  LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -78,8 +77,7 @@ import {
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TimelineEagerMediaContext } from "./chat/timelineEager";
-import { GeneratingPlaceholderCard } from "./chat/GeneratingPlaceholderCard";
-import { TeamPanel } from "./chat/TeamPanel";
+import { GeneratingPlaceholderCard, TeamPanel } from "./chat/lazyTimelineCards";
 import {
   PermissionCard,
   PermissionPromptHost,
@@ -1038,20 +1036,38 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
  * before the shell (the user's message, or a mid-turn reply) ends where the
  * first step's clock starts; the row just after it (the answer) starts where a
  * last step with no recorded end stops. A following user row is a new turn and
- * never closes this one.
+ * never closes this one. `following` is that same turn after the shell, up to
+ * the next user row, so the outcome can see a terminal error past the answer.
+ * Timing still ends on the immediate next row.
  */
 function processTimeBounds(
   items: readonly RenderItem[],
   process: RenderItem,
-): { startedAt: number | null; endedAt: number | null } {
+): { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following: ChatMessage[] } {
   const index = items.indexOf(process);
   const time = (value: unknown) =>
     typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
   const before = index > 0 ? itemRows(items[index - 1]!).at(-1) : undefined;
   const after = index >= 0 && index + 1 < items.length ? itemRows(items[index + 1]!)[0] : undefined;
+  const following: ChatMessage[] = [];
+  if (index >= 0) {
+    for (let cursor = index + 1; cursor < items.length; cursor += 1) {
+      let reachedUser = false;
+      for (const message of itemRows(items[cursor]!)) {
+        if (message.role === "user") {
+          reachedUser = true;
+          break;
+        }
+        following.push(message);
+      }
+      if (reachedUser) break;
+    }
+  }
   return {
     startedAt: before && !before._liveUnit ? time(before.completedAt) ?? time(before.ts) : null,
     endedAt: after && after.role !== "user" && !after._liveUnit ? time(after.ts) : null,
+    next: after,
+    following,
   };
 }
 
@@ -1520,18 +1536,6 @@ function turnHasVisibleWork(
     if (message && isPlatedAssistantMessage(message)) return true;
   }
   return false;
-}
-
-/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
-function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
-  if (!info) return false;
-  if (info.recoveryStatus?.kind === "stopping") return true;
-  if (isRetryingTurnStatus(info.turnStatus)) return true;
-  const status = info.turnStatus;
-  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
-    return true;
-  }
-  return !!info.leaderStep;
 }
 
 export function MessageList({
@@ -2744,6 +2748,7 @@ export function MessageList({
             needle,
             bounds.startedAt ?? "",
             bounds.endedAt ?? "",
+            turnOutcome(bounds.following),
             ...sections.map((section) => disclosureValues[`detail:${section.key}`] === true ? 1 : 0),
             ...it.items.map(leafMemoKey),
           ].join("\u0001")}
@@ -2765,10 +2770,9 @@ export function MessageList({
           keyOf={renderItemKey}
           messagesOf={itemMessages}
           olderSteps={olderSteps}
-          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
-          lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
-          turnStartedAt={it.active ? turnActivity?.startedAt ?? bounds.startedAt : bounds.startedAt}
-          turnEndedAt={bounds.endedAt}
+          activity={it.active ? turnActivity : null}
+          bounds={bounds}
+          tokenUsageOf={(item) => ("tokenUsage" in item ? item.tokenUsage : undefined)}
         />
         </ProcessGroupMemo>
       );
