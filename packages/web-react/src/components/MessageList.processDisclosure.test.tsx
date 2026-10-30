@@ -2587,6 +2587,50 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
   });
+
+  // 验收 r1 P1:bounds.next 停在普通回答上,总览写成「完成」,下面却是终态错误。
+  // 结局跟同轮终态走(到下一条用户消息为止);下一轮自己的完成不受影响。位置断言仍在上面的用例里。
+  test("同轮普通回答之后的终态错误让过程总览写没完成，下一轮仍写完成", () => {
+    renderList([
+      row("u", "user", "同步两边分支", { status: "replied" }),
+      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("err", "assistant", "合并中断", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+      row("u2", "user", "下一轮", { status: "replied" }),
+      row("t2", "tool", "终端", { _clientMessageId: "u2", toolName: "Bash", inputJson: { command: "git status" }, _completed: true, output: "ok" }),
+      row("a2", "assistant", "下一轮已经对齐", { _clientMessageId: "u2" }),
+    ]);
+    const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(2);
+    expect(within(shells[0]!).getByTestId("process-title")).toHaveTextContent(/^没完成 · 运行了 2 条命令$/);
+    expect(within(shells[0]!).getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "failed");
+    expect(within(shells[1]!).getByTestId("process-title")).toHaveTextContent(/^完成 · 运行了 1 条命令$/);
+    expect(within(shells[1]!).getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
+    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    const error = screen.getByText("模型暂不可用");
+    if (!answer) throw new Error("missing answer row");
+    expect(shells[0]!.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 越过的中途错误不把过程总览写成没完成", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("err-mid", "assistant", "通用代码已生成商业版候选并推送", {
+        _clientMessageId: "u",
+        _errorCode: "model_not_available",
+        _errorDetail: '{"subtype":"error_during_execution","result":"Selected model is at capacity."}',
+        usage: { traceId: "trace-mid-err" },
+      }),
+      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByTestId("process-title")).toHaveTextContent(/^完成 · 运行了 2 条命令$/);
+    expect(screen.getByTestId("process-glyph-done")).toHaveAttribute("data-outcome", "done");
+  });
 });
 
 describe("OCV5-370 过程摘要上的详情面板入口", () => {

@@ -674,10 +674,18 @@ export function keepDistinctActivity(info: TurnActivityInfo | null | undefined):
   return !!info.leaderStep;
 }
 
-/** 本轮怎么收的尾:过程之后的那一行是停止 / 错误时,外壳不能写「完成」(与下面的提示自相矛盾)。 */
-export function turnOutcome(next: ChatMessage | undefined): "done" | "stopped" | "failed" {
-  if (next?.role !== "assistant" || !hasErrorMark(next)) return "done";
-  const code = String(next._errorCode ?? "").toLowerCase();
+/**
+ * 本轮怎么收的尾。过程外壳之后、下一条用户消息之前,以最后一条助手消息为终态行:
+ * 它是停止 / 错误时外壳不能写「完成」。只看外壳正后方第一行会让普通回答盖住同轮稍后的终态错误。
+ */
+export function turnOutcome(following: readonly ChatMessage[] | undefined): "done" | "stopped" | "failed" {
+  let terminal: ChatMessage | undefined;
+  for (const message of following ?? []) {
+    if (message.role === "user") break;
+    if (message.role === "assistant") terminal = message;
+  }
+  if (!terminal || !hasErrorMark(terminal)) return "done";
+  const code = String(terminal._errorCode ?? "").toLowerCase();
   return code === "stopped" || code === "user_cancelled" ? "stopped" : "failed";
 }
 
@@ -1260,9 +1268,10 @@ export function ProcessDisclosure<T>({
   activity?: TurnActivityInfo | null;
   /**
    * OCV5-367 本轮的时间边界:startedAt = 本轮用户消息时刻(首步耗时从这里算),endedAt = 过程之后第一行
-   * (本轮回答)的到达时刻(末步没有自身终点时以它收尾);next = 那一行本身,用来判断本轮怎么收的尾。
+   * (本轮回答)的到达时刻(末步没有自身终点时以它收尾);next = 那一行本身。
+   * following = 过程之后、下一条用户消息之前的行。结局看其中的终态行,不看 next 单独一行。
    */
-  bounds?: { startedAt: number | null; endedAt: number | null; next?: ChatMessage };
+  bounds?: { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following?: readonly ChatMessage[] };
   /** 一步所在模型调用的 token 用量,只进耗时的悬停说明。 */
   tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
 }) {
@@ -1318,7 +1327,7 @@ export function ProcessDisclosure<T>({
   const live = active && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
   const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
-  const outcome = turnOutcome(bounds?.next);
+  const outcome = turnOutcome(bounds?.following);
   const tookMs = turnEndedAt !== null && turnStartedAt !== null ? turnEndedAt - turnStartedAt : -1;
   const meta = active ? elapsed : tookMs > 0 && tookMs <= 24 * 3600_000 ? formatElapsed(tookMs) : "";
   const said = active ? "" : workSummary(messages);
