@@ -11,44 +11,20 @@ import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS, BOX_TOOL_SPOOL_MAX_BYTES,
   BOX_TOOL_MESSAGE_STREAM_MAX_BYTES, BOX_TOOL_POST_ECHO_RESERVE_BYTES,
   reserveBoxToolEcho } from "./boxToolCapacity.js";
 
+import { parseToolRollover, unadmittedToolRollover, unadmittedToolRolloverFieldsSql,
+  type BoxToolRolloverReceipt, type BoxToolRolloverClaim } from "../../billing/boxToolRolloverIdentity.js";
+export { parseToolRollover, unadmittedToolRollover,
+  type BoxToolRolloverReceipt, type BoxToolRolloverClaim } from "../../billing/boxToolRolloverIdentity.js";
+const UNADMITTED_SQL = unadmittedToolRolloverFieldsSql();
 type Db = Pick<Pool,"connect"|"query">;
 type Hash = { modelToolUseId: string; contentHash: string; isError: boolean };
-export interface BoxToolRolloverReceipt {
-  v: 1; requestId: string; ownerRequestId: string; accountId: string; runNonce: string;
-  leaseEpoch: string; durableRevision: string; reason: "rounds"|"wall"|"spool";
-  sessionId: string; turnKey: string; model: string; nextContextHash: string;
-  resultHashes: readonly Hash[]; roundNo: number; catalogHash: string; detachedRunnerHash: string;
-}
-export interface BoxToolRolloverClaim extends Omit<BoxToolRolloverReceipt,"accountId"> { accountId: bigint }
 export class BoxToolRolloverRequired extends Error {
   readonly code = "BOX_TOOL_ROLLOVER_REQUIRED";
   constructor(readonly claim: BoxToolRolloverClaim) { super("BOX_TOOL_ROLLOVER_REQUIRED"); }
 }
-const ID = /^[A-Za-z0-9_-]{1,64}$/, HEX64 = /^[a-f0-9]{64}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 function fail(): never { throw new BoxDurableJournalError("BOX_TOOL_ROLLOVER_FENCE_LOST"); }
 function receiptOf(claim: BoxToolRolloverClaim): BoxToolRolloverReceipt {
   return { ...claim, accountId: claim.accountId.toString() };
-}
-export function parseToolRollover(raw: unknown): BoxToolRolloverReceipt | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const r = raw as BoxToolRolloverReceipt;
-  if (Object.keys(r).sort().join(",") !== "accountId,catalogHash,detachedRunnerHash,durableRevision,leaseEpoch,model,nextContextHash,ownerRequestId,reason,requestId,resultHashes,roundNo,runNonce,sessionId,turnKey,v"
-    || r.v !== 1 || !ID.test(r.requestId) || !ID.test(r.ownerRequestId)
-    || !/^[1-9][0-9]{0,19}$/.test(r.accountId) || !/^[a-f0-9]{24}$/.test(r.runNonce)
-    || !/^[a-f0-9]{32}$/.test(r.leaseEpoch) || !UUID.test(r.durableRevision)
-    || !["rounds","wall","spool"].includes(r.reason)
-    || !/^[A-Za-z0-9._:-]{1,256}$/.test(r.sessionId) || !HEX64.test(r.turnKey)
-    || typeof r.model !== "string" || !HEX64.test(r.nextContextHash)
-    || !HEX64.test(r.catalogHash) || !HEX64.test(r.detachedRunnerHash)
-    || !Number.isSafeInteger(r.roundNo) || r.roundNo < 1 || r.roundNo > BOX_TOOL_MAX_ROUNDS
-    || !Array.isArray(r.resultHashes) || r.resultHashes.length < 1 || r.resultHashes.length > 32
-    || Array.from({ length: r.resultHashes.length },(_,i) => i).some((i) => !Object.hasOwn(r.resultHashes,i))
-    || r.resultHashes.some((h) => !h || Object.keys(h).sort().join(",") !== "contentHash,isError,modelToolUseId"
-      || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(h.modelToolUseId) || !HEX64.test(h.contentHash)
-      || typeof h.isError !== "boolean")
-    || new Set(r.resultHashes.map((h) => h.modelToolUseId)).size !== r.resultHashes.length) return null;
-  return r;
 }
 async function activeDispatch(client: PoolClient, uid: bigint, ctx: Record<string,unknown>): Promise<void> {
   const billing = parseBoxBillingContext(ctx.boxBillingContext);
@@ -241,21 +217,32 @@ export async function cancelToolRollovers(pool: Db, input: { uid: bigint; contai
     // remote stage/paid launch. Close it through the existing prestart state,
     // without inventing a keeper proof or rewriting prior settled generations.
     // Admitted/unknown successors retain their physical stop-proof path.
-    const cancelled = await client.query(`UPDATE request_finalize_journal
+    const cancelled = await client.query<{ request_id: string; state: string; ctx: Record<string,unknown> }>(
+      `UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxRolloverCancelled":true}'::jsonb ||
-        CASE WHEN NOT (ctx ? 'boxState') AND NOT (ctx ? 'boxRunNonce')
-          AND NOT (ctx ? 'boxLeaseEpoch') AND NOT (ctx ? 'boxAccountId')
-          AND NOT (ctx ? 'boxLaunchPermit') AND NOT (ctx ? 'boxPrelaunchControl')
-          AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxOwnerRequestId')
-          AND NOT (ctx ? 'boxResumeRequestId')
+        CASE WHEN NOT (ctx ? 'boxState') AND ${UNADMITTED_SQL}
         THEN '{"boxState":"prestart_stopped"}'::jsonb ELSE '{}'::jsonb END,updated_at=NOW()
       WHERE user_id=$1 AND container_id=$2 AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-        AND state='inflight' AND jsonb_typeof(ctx->'boxRolloverFrom')='object'
+        AND (state='inflight' OR (state='aborted' AND final_credits=0 AND ${UNADMITTED_SQL}
+          AND (NOT (ctx ? 'boxState') OR (ctx->>'boxState'='prestart_stopped'
+            AND ctx->>'boxRolloverCancelled'='true'))))
+        AND jsonb_typeof(ctx->'boxRolloverFrom')='object'
         AND ctx#>>'{boxRolloverFrom,requestId}'=request_id
         AND ctx#>>'{boxRolloverFrom,v}'='1'
         AND ctx#>>'{boxRolloverFrom,sessionId}'=$3 AND ctx#>>'{boxRolloverFrom,turnKey}'=$4
-        AND ctx#>>'{boxRolloverFrom,model}'=ctx->>'model'`,
+        AND ctx#>>'{boxRolloverFrom,model}'=ctx->>'model'
+      RETURNING request_id,state,ctx`,
       [input.uid.toString(),input.containerId.toString(),input.sessionId,input.turnKey]);
+    // Validate before COMMIT: the SQL has locked each returned row, and an
+    // HTTP abort racing this transaction preserves ctx and zeroes this request
+    // only. finalizing/committed financial ownership is never closed here.
+    for (const row of cancelled.rows) {
+      const receipt = parseToolRollover(row.ctx.boxRolloverFrom);
+      if (!receipt || receipt.requestId !== row.request_id || receipt.model !== row.ctx.model
+        || row.ctx.boxInvocationRecovery !== "v1"
+        || receipt.sessionId !== input.sessionId || receipt.turnKey !== input.turnKey
+        || (row.state === "aborted" && !unadmittedToolRollover(row.ctx,row.request_id))) fail();
+    }
     await client.query("COMMIT"); done = true; return (cancelled.rowCount ?? 0) > 0;
   } finally { if (!done) await client.query("ROLLBACK").catch(() => {}); client.release(); }
 }

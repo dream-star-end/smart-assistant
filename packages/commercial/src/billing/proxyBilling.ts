@@ -34,6 +34,7 @@
 
 import { readPoolOutcome, type PoolOutcome } from "../account-pool/policy/outcome.js";
 import { isBoxApiModel } from "@openclaude/protocol";
+import { unadmittedToolRolloverSql } from "./boxToolRolloverIdentity.js";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
@@ -380,7 +381,12 @@ export async function abortInflightJournal(
             error_msg=$2,
             failure_code=$3,
             final_credits=0,
-            ctx=ctx - 'settlementClaimId',
+            ctx=(ctx - 'settlementClaimId') || CASE
+              -- This same abort CAS proves admission can never occur. Persist
+              -- closure before a disconnect/process exit can lose any Stop RPC.
+              WHEN state='inflight' AND ${unadmittedToolRolloverSql()}
+              THEN '{"boxState":"prestart_stopped","boxRolloverCancelled":true}'::jsonb
+              ELSE '{}'::jsonb END,
             updated_at=NOW()
       WHERE request_id=$1
         AND (COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'

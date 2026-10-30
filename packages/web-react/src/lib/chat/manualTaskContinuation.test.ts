@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
+import { getUserError } from "@openclaude/protocol/browser";
+import { splitStoppedNarration } from "../../components/chat/turnSegment";
 import type { ChatMessage } from "./model";
-import { manualTaskContinuationSource, taskContinuationPrompt } from "./manualTaskContinuation";
+import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "./manualTaskContinuation";
 
 describe("t1360u every interrupted task continues in its original conversation", () => {
   test("zero output and partial work resolve the exact same latest source", () => {
@@ -42,10 +44,79 @@ describe("t1360u every interrupted task continues in its original conversation",
     expect(manualTaskContinuationSource([user, first, last, transport], last)).toBe(user);
     expect(manualTaskContinuationSource([user, first, { ...last, _errorCode: undefined, text: "已经完成" }], first)).toBeUndefined();
   });
+  test("a transport-only end status is not another interrupted task", () => {
+    const user = { id: "u", role: "user", text: "原目标", ts: 1 } as ChatMessage;
+    const error = { id: "e", role: "assistant", text: "已做完一半", ts: 2, _errorCode: "engine_error" } as ChatMessage;
+    const status = { id: "status", role: "assistant", text: "本轮结束", ts: 3, _turnStatusRecord: true } as ChatMessage;
+    expect(manualTaskContinuationSource([user, error, status], error)).toBe(user);
+    expect(manualTaskContinuationSource([user, error, status], status)).toBeUndefined();
+  });
   test("ordinary manual continuation includes the goal as context and forbids repeating completed work", () => {
     const prompt = taskContinuationPrompt("部署并验证版本A");
     expect(prompt).toContain("不要重新执行已经完成的步骤");
     expect(prompt).toContain("部署并验证版本A");
     expect(prompt).not.toBe("部署并验证版本A");
+  });
+});
+
+
+describe("canonical continuation source integrity", () => {
+  const stopped = () => {
+    const user = { id: "human", role: "user", text: "原始部署目标", ts: 1 } as ChatMessage;
+    const raw = { id: "narration", role: "assistant", text: "已经完成分析", ts: 2,
+      _errorCode: "USER_CANCELLED", _clientMessageId: user.id } as ChatMessage;
+    const tool = { id: "tool", role: "tool", text: "", ts: 3, _completed: true, _clientMessageId: user.id } as ChatMessage;
+    const rows = [user, raw, tool];
+    const view = splitStoppedNarration(rows).at(-1)!;
+    return { user, raw, tool, rows, view };
+  };
+  test("only the real render projection maps to its raw stopped record and human goal", () => {
+    const { user, raw, rows, view } = stopped();
+    expect(view.id).toBe("narration:stopped");
+    expect(view._continuationSourceId).toBe(raw.id);
+    expect(canonicalTaskContinuationError(rows, view)).toBe(raw);
+    expect(manualTaskContinuationSource(rows, view)).toBe(user);
+    expect(raw._continuationSourceId).toBeUndefined();
+    expect(Object.keys(view)).not.toContain("_continuationSourceId");
+    expect(JSON.stringify(view)).not.toContain("_continuationSourceId");
+    const serialized = JSON.parse(JSON.stringify(view)) as ChatMessage;
+    expect(canonicalTaskContinuationError(rows, serialized)).toBeUndefined();
+    const forged = { ...view, _continuationSourceId: raw.id };
+    expect(canonicalTaskContinuationError(rows, forged)).toBeUndefined();
+    expect(manualTaskContinuationSource([...rows, forged], forged)).toBeUndefined();
+  });
+  test("a missing, foreign-owned or superseded stop source never continues", () => {
+    const { user, raw, tool, rows, view } = stopped();
+    expect(manualTaskContinuationSource([user, tool], view)).toBeUndefined();
+    const replacement = { ...raw };
+    expect(canonicalTaskContinuationError([user, replacement, tool], view)).toBe(replacement);
+    expect(manualTaskContinuationSource([user, replacement, tool], view)).toBe(user);
+    expect(manualTaskContinuationSource([user, { ...raw, _clientMessageId: "foreign" }, tool], view)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, { ...raw, _errorCode: "engine_error" }, tool], view)).toBeUndefined();
+    expect(manualTaskContinuationSource([...rows, { ...user, id: "new-human" }], view)).toBeUndefined();
+    expect(manualTaskContinuationSource([...rows, { ...raw, id: "later-terminal" }], view)).toBeUndefined();
+    view._clientMessageId = "foreign";
+    expect(manualTaskContinuationSource(rows, view)).toBeUndefined();
+  });
+  test("the Master's root-owned give-up card survives hidden parallel recovery attempts", () => {
+    const user = { id: "root", role: "user", text: "保留这个原目标", ts: 1 } as ChatMessage;
+    const first = { ...user, id: "attempt-1", text: "CONTROL_1", _recoveryOfClientMessageId: user.id };
+    const last = { ...user, id: "attempt-2", text: "CONTROL_2", _recoveryOfClientMessageId: user.id };
+    const childError = { id: "child-error", role: "assistant", text: "", ts: 3,
+      _errorCode: "engine_error", _clientMessageId: last.id } as ChatMessage;
+    const giveup = { id: "giveup", role: "assistant", text: "自动恢复已停止", ts: 4,
+      _userError: getUserError("automatic_retry_exhausted"), _clientMessageId: user.id } as ChatMessage;
+    const rows = [user, first, last, childError, giveup];
+    expect(manualTaskContinuationSource(rows, giveup)).toBe(user);
+    expect(manualTaskContinuationSource(rows, childError)).toBeUndefined();
+    expect(manualTaskContinuationSource([first, last, childError, giveup], giveup)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, { ...user, id: "unrelated" }, first, last, childError, giveup], giveup)).toBeUndefined();
+    const foreign = { ...giveup, _clientMessageId: "unrelated" };
+    expect(manualTaskContinuationSource([...rows.slice(0, -1), foreign], foreign)).toBeUndefined();
+    const sibling = { ...giveup, _clientMessageId: first.id };
+    expect(manualTaskContinuationSource([...rows.slice(0, -1), sibling], sibling)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, { ...last, _recoveryOfClientMessageId: last.id }, giveup], giveup)).toBeUndefined();
+    expect(manualTaskContinuationSource([...rows, { ...user, id: "new-human" }], giveup)).toBeUndefined();
+    expect(manualTaskContinuationSource([...rows, { ...childError, id: "later-terminal" }], giveup)).toBeUndefined();
   });
 });

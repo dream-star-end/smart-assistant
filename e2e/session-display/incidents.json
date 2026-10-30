@@ -9623,7 +9623,7 @@
           "assertion": "t1360u real App: paid and zero-output tasks continue in the original conversation"
         }
       ],
-      "rootFixCommit": "010fbb0d05f834ef1b59f84b842fce541e590141"
+      "rootFixCommit": "010fbb0d"
     }
   ]
 }

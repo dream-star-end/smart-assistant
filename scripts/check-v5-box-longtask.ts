@@ -80,7 +80,8 @@ async function main(): Promise<void> {
   // In particular no NODE_OPTIONS/NODE_PATH, production PG/Redis/Box credentials,
   // OCV5_289_JOURNAL_TEST_DATABASE_URL or OC_V5_PROOF_TEST_DATABASE_URL survive.
   const files = TESTS.map(candidateFile);
-  const hashes = [...TESTS,...PRODUCT,"scripts/check-v5-box-longtask.ts",
+  const hashes = [...TESTS,...PRODUCT,"packages/commercial/src/billing/proxyBilling.ts",
+    "packages/commercial/src/billing/boxToolRolloverIdentity.ts","packages/commercial/src/billing/boxToolLimits.ts","scripts/check-v5-box-longtask.ts",
     "scripts/check-v5-box-success-recovery.ts","scripts/lib/gateLoadScale.ts",
     "scripts/lib/test-blocking-stdio.mjs"]
     .map((path) => ({ path,sha256: sha256(candidateFile(path)) }));

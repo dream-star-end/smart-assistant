@@ -456,7 +456,7 @@ export async function _runOneTurn(
     // A turn is only killed if the agent produces no output for this long, so long
     // active tasks keep running while genuinely stuck turns still get interrupted.
     // Waiting for the user is not silence: re-arm instead of IDLE_TIMEOUT/waiver.
-    // The 12h logical-turn hard limit in submit() is unchanged.
+    // Active logical turns have no total lifetime cap; physical Box runs stay bounded.
     const IDLE_TIMEOUT_MS = pickTurnSilentBackstopMs(session.providerTag, session.model)
     const timer = setTimeout(() => {
       const fire = applyTurnIdleTimeoutTick({
