@@ -9631,13 +9631,24 @@
           "layer": "unit",
           "path": "packages/web-react/src/hooks/manualTaskContinuationChunkFailure.test.tsx",
           "assertion": "a failed Continue chunk reports once and never falls back to task replay or send"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "manual checkpoint preserves the paid partial answer through completion and reload"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "a manually continued diagnostic-only error does not become a saved answer"
         }
       ],
       "rootFixCommit": "010fbb0d",
       "coverageCommits": [
         "4ec36bd4",
         "b88d52f2",
-        "b6d8511d"
+        "b6d8511d",
+        "6677f862"
       ]
     }
   ]
