@@ -164,6 +164,11 @@ interface EmbeddingIndexIdentity {
   dimensions: number
 }
 
+interface StoredEmbeddingIndex extends EmbeddingIndexIdentity {
+  /** Bumps on every rebuild and on every vector write. A stale snapshot must not commit. */
+  generation: number
+}
+
 const VEC_TABLES = ['archival_vec', 'sessions_vec'] as const
 const IDENTITY_ID_CHUNK = 500
 
@@ -194,26 +199,39 @@ function ensureIdentityTable(db: Database.Database): void {
       dimensions INTEGER NOT NULL
     );
   `)
+  const cols = db.prepare('PRAGMA table_info(embedding_index_identity)').all() as Array<{ name: string }>
+  if (!cols.some((col) => col.name === 'generation')) {
+    db.exec('ALTER TABLE embedding_index_identity ADD COLUMN generation INTEGER NOT NULL DEFAULT 0')
+  }
 }
 
-function readIdentity(db: Database.Database): EmbeddingIndexIdentity | null {
+function readIdentity(db: Database.Database): StoredEmbeddingIndex | null {
   ensureIdentityTable(db)
   const row = db.prepare(
-    'SELECT backend, model, dimensions FROM embedding_index_identity WHERE id = 1',
-  ).get() as EmbeddingIndexIdentity | undefined
+    'SELECT backend, model, dimensions, generation FROM embedding_index_identity WHERE id = 1',
+  ).get() as StoredEmbeddingIndex | undefined
   return row ?? null
 }
 
 function writeIdentity(db: Database.Database, identity: EmbeddingIndexIdentity): void {
   ensureIdentityTable(db)
   db.prepare(`
-    INSERT INTO embedding_index_identity (id, backend, model, dimensions)
-    VALUES (1, ?, ?, ?)
+    INSERT INTO embedding_index_identity (id, backend, model, dimensions, generation)
+    VALUES (1, ?, ?, ?, 1)
     ON CONFLICT(id) DO UPDATE SET
       backend = excluded.backend,
       model = excluded.model,
-      dimensions = excluded.dimensions
+      dimensions = excluded.dimensions,
+      generation = embedding_index_identity.generation + 1
   `).run(identity.backend, identity.model, identity.dimensions)
+}
+
+/** Invalidate in-flight rebuild snapshots. Call in the same transaction as the vector write. */
+export function notePersistentVectorMutation(db: Database.Database): void {
+  ensureIdentityTable(db)
+  db.prepare(
+    'UPDATE embedding_index_identity SET generation = generation + 1 WHERE id = 1',
+  ).run()
 }
 
 function listVecIds(db: Database.Database, table: 'archival_vec' | 'sessions_vec'): string[] | null {
@@ -338,7 +356,14 @@ function replaceVecRows(
  * Make the on-disk index match `provider` before any KNN.
  * Returns false when a rebuild was required and embedding failed. Callers must
  * then skip vector search so an old model's vectors are never scored.
+ *
+ * Embedding runs outside the write lock. The commit takes BEGIN IMMEDIATE and
+ * re-reads identity plus generation. A peer that already aligned this model
+ * wins: the late snapshot is discarded. A peer write that only bumped the
+ * generation makes this snapshot stale, so the rebuild loads source text again.
  */
+const MAX_REBUILD_ATTEMPTS = 8
+
 function alignEmbeddingIndex(db: Database.Database, provider: EmbeddingProvider): Promise<boolean> {
   const run = alignChain.then(
     () => alignEmbeddingIndexUnlocked(db, provider),
@@ -348,51 +373,107 @@ function alignEmbeddingIndex(db: Database.Database, provider: EmbeddingProvider)
   return run
 }
 
+type RebuildCommit = 'applied' | 'aligned' | 'stale'
+
+function commitRebuiltIndex(
+  db: Database.Database,
+  current: EmbeddingIndexIdentity,
+  snapshotGeneration: number,
+  archivalDocs: SourceDoc[],
+  archivalVecs: Float32Array[],
+  sessionDocs: SourceDoc[],
+  sessionVecs: Float32Array[],
+): RebuildCommit {
+  const apply = db.transaction((): RebuildCommit => {
+    const now = readIdentity(db)
+    if (now && sameIdentity(now, current) && vecTablesMatchDimensions(db, current.dimensions)) {
+      return 'aligned'
+    }
+    if ((now?.generation ?? -1) !== snapshotGeneration) return 'stale'
+    recreateVecTables(db, current.dimensions)
+    replaceVecRows(db, 'archival_vec', archivalDocs, archivalVecs)
+    replaceVecRows(db, 'sessions_vec', sessionDocs, sessionVecs)
+    writeIdentity(db, current)
+    return 'applied'
+  })
+  return apply.immediate()
+}
+
+function stampEmptyIdentity(db: Database.Database, current: EmbeddingIndexIdentity): 'done' | 'retry' {
+  const apply = db.transaction((): 'done' | 'retry' => {
+    const now = readIdentity(db)
+    const dimsOk = vecTablesMatchDimensions(db, current.dimensions)
+    if (now && sameIdentity(now, current) && dimsOk) return 'done'
+    const archivalIds = listVecIds(db, 'archival_vec')
+    const sessionIds = listVecIds(db, 'sessions_vec')
+    const unknown = archivalIds === null || sessionIds === null
+    const hasVectors = unknown || archivalIds.length + sessionIds.length > 0
+    if (now || hasVectors || !dimsOk) return 'retry'
+    writeIdentity(db, current)
+    return 'done'
+  })
+  return apply.immediate()
+}
+
 async function alignEmbeddingIndexUnlocked(
   db: Database.Database,
   provider: EmbeddingProvider,
 ): Promise<boolean> {
   const current = providerIdentity(provider)
-  const stored = readIdentity(db)
-  const dimsOk = vecTablesMatchDimensions(db, current.dimensions)
-  if (stored && sameIdentity(stored, current) && dimsOk) return true
+  for (let attempt = 0; attempt < MAX_REBUILD_ATTEMPTS; attempt++) {
+    const stored = readIdentity(db)
+    const dimsOk = vecTablesMatchDimensions(db, current.dimensions)
+    if (stored && sameIdentity(stored, current) && dimsOk) return true
 
-  const archivalIds = listVecIds(db, 'archival_vec')
-  const sessionIds = listVecIds(db, 'sessions_vec')
-  const unknown = archivalIds === null || sessionIds === null
-  const hasVectors = unknown || archivalIds.length + sessionIds.length > 0
-  if (!stored && !hasVectors && dimsOk) {
-    writeIdentity(db, current)
-    return true
-  }
+    const archivalIds = listVecIds(db, 'archival_vec')
+    const sessionIds = listVecIds(db, 'sessions_vec')
+    const unknown = archivalIds === null || sessionIds === null
+    const hasVectors = unknown || archivalIds.length + sessionIds.length > 0
+    if (!stored && !hasVectors && dimsOk) {
+      if (stampEmptyIdentity(db, current) === 'done') return true
+      continue
+    }
 
-  let archivalDocs: SourceDoc[]
-  let sessionDocs: SourceDoc[]
-  try {
-    archivalDocs = loadArchivalDocs(db, archivalIds)
-    sessionDocs = loadSessionDocs(db, sessionIds)
-    const archivalVecs = await embedDocs(provider, archivalDocs)
-    const sessionVecs = await embedDocs(provider, sessionDocs)
-    const apply = db.transaction(() => {
-      recreateVecTables(db, current.dimensions)
-      replaceVecRows(db, 'archival_vec', archivalDocs, archivalVecs)
-      replaceVecRows(db, 'sessions_vec', sessionDocs, sessionVecs)
-      writeIdentity(db, current)
-    })
-    apply()
-    _vecDimensions = current.dimensions
-    const from = stored ? `${stored.backend}/${stored.model}` : 'untagged'
-    process.stderr.write(
-      `[oc-memory] rebuilt persistent vectors ${from} -> ${current.backend}/${current.model} (${current.dimensions}d, ${archivalDocs.length} archival, ${sessionDocs.length} sessions)\n`,
-    )
-    return true
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    process.stderr.write(
-      `[oc-memory] persistent vector rebuild failed; refusing cross-model search: ${msg.slice(0, 200)}\n`,
-    )
-    return false
+    const snapshotGeneration = stored?.generation ?? -1
+    try {
+      const archivalDocs = loadArchivalDocs(db, archivalIds)
+      const sessionDocs = loadSessionDocs(db, sessionIds)
+      const archivalVecs = await embedDocs(provider, archivalDocs)
+      const sessionVecs = await embedDocs(provider, sessionDocs)
+      const outcome = commitRebuiltIndex(
+        db,
+        current,
+        snapshotGeneration,
+        archivalDocs,
+        archivalVecs,
+        sessionDocs,
+        sessionVecs,
+      )
+      if (outcome === 'stale') continue
+      _vecDimensions = current.dimensions
+      if (outcome === 'aligned') {
+        process.stderr.write(
+          `[oc-memory] kept persistent vectors ${current.backend}/${current.model} (${current.dimensions}d); a concurrent migration already finished\n`,
+        )
+        return true
+      }
+      const from = stored ? `${stored.backend}/${stored.model}` : 'untagged'
+      process.stderr.write(
+        `[oc-memory] rebuilt persistent vectors ${from} -> ${current.backend}/${current.model} (${current.dimensions}d, ${archivalDocs.length} archival, ${sessionDocs.length} sessions)\n`,
+      )
+      return true
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(
+        `[oc-memory] persistent vector rebuild failed; refusing cross-model search: ${msg.slice(0, 200)}\n`,
+      )
+      return false
+    }
   }
+  process.stderr.write(
+    '[oc-memory] persistent vector rebuild failed; refusing cross-model search: snapshot stayed stale\n',
+  )
+  return false
 }
 
 // ── Session vector ID encoding ───────────────────
@@ -430,6 +511,7 @@ export async function upsertArchivalVector(
   db.transaction(() => {
     db.prepare('DELETE FROM archival_vec WHERE id = ?').run(id)
     db.prepare('INSERT INTO archival_vec (id, embedding) VALUES (?, ?)').run(id, embedding)
+    notePersistentVectorMutation(db)
   })()
 }
 
@@ -438,7 +520,10 @@ export async function upsertArchivalVector(
  */
 export async function deleteArchivalVector(id: string): Promise<void> {
   const db = await getVecDb()
-  db.prepare('DELETE FROM archival_vec WHERE id = ?').run(id)
+  db.transaction(() => {
+    db.prepare('DELETE FROM archival_vec WHERE id = ?').run(id)
+    notePersistentVectorMutation(db)
+  })()
 }
 
 /**
@@ -479,6 +564,7 @@ export async function upsertSessionVector(
   db.transaction(() => {
     db.prepare('DELETE FROM sessions_vec WHERE id = ?').run(id)
     db.prepare('INSERT INTO sessions_vec (id, embedding) VALUES (?, ?)').run(id, embedding)
+    notePersistentVectorMutation(db)
   })()
 }
 

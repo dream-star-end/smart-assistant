@@ -24,6 +24,7 @@ import {
   deleteArchivalVector,
   upsertSessionVector,
   encodeSessionVecId,
+  notePersistentVectorMutation,
 } from './vectorStore.js'
 
 // ── Constants ───────────────────────────────────
@@ -308,7 +309,10 @@ function runChunkedSql(
 
 async function deleteSessionVector(id: string): Promise<void> {
   const db = await getSessionsDb()
-  db.prepare('DELETE FROM sessions_vec WHERE id = ?').run(id)
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions_vec WHERE id = ?').run(id)
+    notePersistentVectorMutation(db)
+  })()
 }
 
 // ── Pipeline processing ─────────────────────────
@@ -642,6 +646,7 @@ export async function deduplicateArchival(agentId: string): Promise<string[]> {
       deleteVecStmt?.run(row.id)
       ids.push(row.id)
     }
+    if (deleteVecStmt && ids.length > 0) notePersistentVectorMutation(db)
 
     return ids
   }).immediate()
