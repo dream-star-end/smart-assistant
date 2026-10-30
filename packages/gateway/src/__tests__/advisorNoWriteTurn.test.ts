@@ -19,7 +19,8 @@ const { closeSessionsDb, paths } = await import('@openclaude/storage')
 const { SessionManager } = await import('../sessionManager.js')
 const { Gateway, PerTurnDelegationGuard } = await import('../server.js')
 const { MinimalPrivacyRunner } = await import('./fixtures/minimalPrivacyRunner.js')
-const { detectAdvisorNoWrite } = await import('../advisorMode.js')
+const { buildAdvisorSnapshot, ADVISOR_NO_WRITE_CONSTRAINT } = await import('../advisorMode.js')
+const { normalizeMessageReplyQuote } = await import('@openclaude/protocol')
 
 after(async () => {
   await closeSessionsDb()
@@ -188,9 +189,9 @@ function gatewayFixture() {
     sessions: f.manager, deliver() {},
   })
   f.manager.getOrCreate = async () => f.session
-  const inbound = (text: string, mode: 'solo' | 'advisor' = 'advisor', media: unknown[] = []) =>
+  const inbound = (text: string, mode: 'solo' | 'advisor' = 'advisor', media: unknown[] = [], replyTo?: unknown) =>
     gw.dispatchInbound({ type: 'inbound.message', channel: 'webchat', peer: { id: f.peerId, kind: 'dm' },
-      collabMode: mode, advisorModel: 'gpt-6-astra', content: { text, media }, _userId: '1' })
+      collabMode: mode, advisorModel: 'gpt-6-astra', content: { text, media, replyTo }, _userId: '1' })
   return { ...f, inbound }
 }
 
@@ -201,7 +202,7 @@ test('actual inbound uses raw user no-write intent and only restricts advisor mo
   await f.inbound('不要改文件，只给建议。', 'solo')
   assert.deepEqual(f.runner.calls.map(call => call.readOnly), [true, false, false])
   const normalAdvisorPayload = String(f.runner.calls[1]?.input)
-  assert.equal(detectAdvisorNoWrite(normalAdvisorPayload), true, 'the mode preamble itself mentions no-write constraints')
+  assert.match(normalAdvisorPayload, /用户禁止改文件或要求只读/, 'the mode preamble still carries its conditional no-write instruction')
   assert.equal(f.runner.calls[1]?.readOnly, false, 'the preamble must not turn an ordinary editing request read-only')
   await f.manager.awaitPendingPersistence()
 })
@@ -215,5 +216,38 @@ test('no-write text inside an injected attachment does not restrict an ordinary 
   assert.equal(f.runner.calls.length, 1)
   assert.match(String(f.runner.calls[0]?.input), /This is quoted attachment content/)
   assert.equal(f.runner.calls[0]?.readOnly, false)
+  await f.manager.awaitPendingPersistence()
+})
+
+test('a local file prohibition preserves authorized edits in the same advisor turn', { timeout: 15_000 }, async () => {
+  const f = gatewayFixture()
+  await f.inbound('请修改 app.ts，不要改 README.md。')
+  assert.equal(f.runner.calls.length, 1)
+  assert.equal(f.runner.calls[0]?.readOnly, false)
+  assert.match(String(f.runner.calls[0]?.input), /不要改 README.md/)
+  await f.manager.awaitPendingPersistence()
+})
+
+test('reply history cannot change current no-write intent or the advisor user-task snapshot', { timeout: 15_000 }, async () => {
+  const f = gatewayFixture()
+  for (const [currentText, quotedText, expectedReadOnly] of [
+    ['请修改 app.ts 并保存。', '顾问只给建议，不要改文件。', false],
+    ['不要改文件，只给建议。', '请修改 app.ts 并保存。', true],
+  ] as const) {
+    const replyTo = normalizeMessageReplyQuote({ messageId: 'old-user-message', role: 'user', text: quotedText })
+    assert.ok(replyTo)
+    await f.inbound(currentText, 'advisor', [], replyTo)
+    const call = f.runner.calls.at(-1)!
+    assert.equal(call.readOnly, expectedReadOnly)
+    assert.match(String(call.input), /\[被引用的历史消息/)
+    assert.ok(String(call.input).includes(quotedText))
+    assert.equal(f.session._currentTurnUserText, currentText)
+    const snapshot = buildAdvisorSnapshot({
+      question: 'Review the current request.', concern: '', advisorModel: 'gpt-6-astra',
+      source: { userTask: f.session._currentTurnUserText ?? '', injectedConstraints: f.session._injectedTurnConstraints },
+    })
+    assert.equal(snapshot.constraints.includes(ADVISOR_NO_WRITE_CONSTRAINT), expectedReadOnly)
+    assert.equal(snapshot.userTask, currentText)
+  }
   await f.manager.awaitPendingPersistence()
 })
