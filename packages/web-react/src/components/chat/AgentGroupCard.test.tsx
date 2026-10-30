@@ -30,6 +30,16 @@ function agentRow(over: Partial<ChatMessage> = {}): ChatMessage {
 
 // M-07:折叠态结果摘要恒用绿色 ✓,即便徽记是「失败 / 超时」,终态语义自相矛盾。
 describe("AgentGroupCard 折叠摘要图标跟终态 tone(M-07)", () => {
+  test("TRUTH-10: 被中断的组卡显示已取消，无完成绿勾", () => {
+    render(<AgentGroupCard msg={agentRow({ cancelled: true })} />);
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(screen.queryByText("完成")).not.toBeInTheDocument();
+    const icon = screen.getByTestId("agent-summary-icon");
+    expect(icon).toHaveAttribute("data-tone", "neutral");
+    expect(icon).toHaveClass("text-muted");
+    expect(icon).not.toHaveClass("text-success");
+  });
+
   test("失败 → 红 X;超时 → warning 时钟;完成 → 绿勾", () => {
     const { rerender } = render(<AgentGroupCard msg={agentRow({ _isError: true })} />);
     expect(screen.getByText("失败")).toBeInTheDocument();

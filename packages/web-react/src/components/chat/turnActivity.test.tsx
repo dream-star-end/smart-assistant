@@ -124,17 +124,28 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();
   });
 
+  // W3:仍是唯一一处自动重试提示、不用警示色;没有服务端进度时不写次数,兼容常量 max 不当作 N 显示。
   test("OCV5-523: retrying → one model-busy retry hint, no counter or warning colour", () => {
     renderTA({
       startedAt: Date.now(),
-      turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
+      turnStatus: { kind: "retrying", attempt: 2, max: 10, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("模型繁忙，正在重试…");
-    expect(t).not.toMatch(/\d+\/10|后重试/);
-    expect(node.className).toContain("text-muted");
-    expect(node.className).not.toContain("text-warning");
+    expect(t).toContain("正在自动重试…");
+    expect(t).not.toMatch(/\d|后重试/);
+    expect(screen.getByTestId("automatic-retry-status")).toHaveAttribute("data-notice-tone", "progress");
+  });
+
+  test("W3: 服务端给了实际上限 → 「正在自动重试（n/N）」", () => {
+    renderTA({
+      startedAt: Date.now(),
+      turnStatus: {
+        kind: "retrying", attempt: 2, max: 10, retryAt: Date.now(),
+        retryStatus: { state: "running", attempt: 2, maxAttempts: 3, message: "正在自动重试（2/3）。", actions: [] },
+      },
+    });
+    expect(screen.getByTestId("automatic-retry-status")).toHaveTextContent("正在自动重试（2/3）。");
   });
 
   test("OCV5-523: a queued recovery keeps the shared retry hint during admission", () => {
@@ -142,7 +153,7 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
       dispatch: { phase: "sending", queued: 1, serviceStarting: false },
       turnStatus: { kind: "retrying", attempt: 1, max: 10, retryAt: Date.now() },
     });
-    expect(screen.getByLabelText("生成中").textContent).toContain("模型繁忙，正在重试…");
+    expect(screen.getByLabelText("生成中").textContent).toContain("正在自动重试…");
     expect(screen.queryByText("正在发送…")).not.toBeInTheDocument();
   });
 

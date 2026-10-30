@@ -4,6 +4,7 @@ import { detectServerTerminalTurns } from "../persist";
 import { isServerAuthoredRow, type ChatMessage, type ChatSession } from "./model";
 import { enterDeferredRecoverySoftState, type DeferredTerminalErrorPaint } from "./reducer";
 import { friendlyBridgeErrorMessage, safeBridgeErrorDetail } from "./pure";
+import { rememberRetryStatus } from "./retryStatus";
 
   /** Jobs and finalized source rows share one PG read snapshot. */
 export function applyAutomaticRecoverySnapshot(
@@ -55,6 +56,8 @@ export function applyAutomaticRecoverySnapshot(
       sess._deferredTerminalErrorClientMessageId = cmid;
       enterDeferredRecoverySoftState(sess, cmid);
       sess._turnStatus = { kind: "retrying", attempt: job?.attempt ?? 1, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
+      // 重连/刷新后靠快照恢复「正在自动重试（n/N）」的真实进度。
+      if (job) rememberRetryStatus(sess, job, job.retryStatus);
     }
   }
 

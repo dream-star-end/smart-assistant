@@ -787,7 +787,7 @@ export const TUTORIAL_TOPICS = {
   },
   "skills-training": {
     featureId: "skills-training",
-    contentVersion: 6,
+    contentVersion: 7,
     intro:
       "技能是一套在特定场景自动启用的可复用工作流程，包含说明、参考资料、脚本和评测用例。管理中心可查看市场安装和个人自建的技能，编辑自己的技能，运行评测，并让训练流程基于失败案例提出改进草稿。",
     outcome: "把一次成功做法固化成稳定流程，并用评测防止后续修改退化。",
@@ -803,7 +803,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "创建技能与评测",
-        body: "在对话中引导创建，或在管理中心编辑正文、文件和 evals 用例。",
+        body: "还没有技能时，在管理中心点击“在对话中创建技能”，会打开新会话并预填创建提示；确认或修改后再发送，不会自动发送。已有技能可在管理中心编辑正文、文件和 evals 用例。",
       },
       {
         title: "运行评测",

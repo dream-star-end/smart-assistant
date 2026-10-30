@@ -1,17 +1,9 @@
-import {
-  AlertTriangle,
-  ArrowUpCircle,
-  Bot,
-  type LucideIcon,
-  PackageOpen,
-  Plug,
-  Settings2,
-  Trash2,
-  Wrench,
-} from 'lucide-react'
+import { AlertTriangle, ArrowUpCircle, PackageOpen, Settings2, Trash2 } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
 import { updateAvailable } from '../../lib/marketplace'
+import type { PluginEntry } from '../../lib/pluginDirectory'
+import type { SemanticTone } from '../../lib/ui/statusTone'
 import { usePluginDirectory } from '../../lib/usePluginDirectory'
 import type {
   AuthSession,
@@ -19,7 +11,6 @@ import type {
   MarketplaceInstalled,
   MarketplaceMyAgent,
 } from '../../lib/types'
-import { cn } from '../../lib/utils'
 import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from '../AgentScopePicker'
 import {
   Alert,
@@ -33,10 +24,12 @@ import {
   Modal,
   PanelHeader,
   Select,
+  StatusPill,
   TimeAgo,
   Tooltip,
   useToast,
 } from '../ui'
+import { BUILTIN_PLUGIN_CATEGORY, CardMark } from './CardMark'
 
 type UninstallReason =
   | 'not_needed'
@@ -55,27 +48,26 @@ const UNINSTALL_REASON_OPTIONS: Array<{ value: UninstallReason; label: string }>
   { value: 'other', label: '其他' },
 ]
 
-/** 种类 → 图标芯片配色。改造前 skill 与 agent 共用同一枚绿色 ShieldCheck,列表里分不出种类。 */
-const KIND_CHIP: Record<string, { icon: LucideIcon; className: string }> = {
-  agent: { icon: Bot, className: 'bg-accent-soft text-accent' },
-  skill: { icon: Wrench, className: 'bg-info-soft text-info' },
-  connector: { icon: Plug, className: 'bg-hover text-muted' },
+/**
+ * 行首识别标:与市场卡片同一枚首字方块(UI-5),按条目区分而不是按种类 —— 行已经按种类分组。
+ * 已安装记录不带分类,插件按预装分类表着色,其余中性。被下架的换成警示图标。
+ */
+function RowMark({ name, slug, revoked }: { name: string; slug: string; revoked?: boolean }) {
+  if (revoked)
+    return (
+      <span aria-hidden="true" className="flex size-10 shrink-0 items-center justify-center rounded-md bg-warning-soft text-warning">
+        <AlertTriangle size={16} />
+      </span>
+    )
+  return <CardMark name={name} category={BUILTIN_PLUGIN_CATEGORY[slug]} />
 }
 
-function KindChip({ kind, revoked }: { kind: string; revoked?: boolean }) {
-  const chip = KIND_CHIP[kind] ?? KIND_CHIP.skill
-  const Icon = revoked ? AlertTriangle : chip.icon
-  return (
-    <span
-      aria-hidden="true"
-      className={cn(
-        'flex size-8 shrink-0 items-center justify-center rounded-lg',
-        revoked ? 'bg-warning-soft text-warning' : chip.className,
-      )}
-    >
-      <Icon size={15} />
-    </span>
-  )
+/** 插件目录的色调 → 状态语义色调(与市场卡片同一映射)。 */
+const PLUGIN_TONE: Record<PluginEntry['tone'], SemanticTone> = {
+  success: 'done',
+  warning: 'attention',
+  danger: 'failed',
+  neutral: 'idle',
 }
 
 /**
@@ -324,8 +316,7 @@ export function InstalledPanel({
     return (
       <li key={r.slug}>
         <CardRow
-          className="marketplace-installed-row"
-          icon={<KindChip kind={r.kind} revoked={revoked} />}
+          icon={<RowMark name={r.name} slug={r.slug} revoked={revoked} />}
           title={r.name}
           meta={
             <>
@@ -406,8 +397,11 @@ export function InstalledPanel({
   }
 
   return (
-    <div className="marketplace-library flex flex-col">
-      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">YOUR COLLECTION</span><h2>我的能力库</h2><p>管理已安装的工具，让每一项能力各就其位。</p></header>
+    <div className="flex flex-col pb-5">
+      <header className="px-4 pb-2 pt-5">
+        <h2 className="text-title font-semibold text-fg">我的能力库</h2>
+        <p className="mt-1 text-meta text-muted">已安装的智能体、技能和插件都在这里。</p>
+      </header>
       <Modal
         open={pendingUninstall !== null}
         onOpenChange={(open) => {
@@ -562,17 +556,19 @@ export function InstalledPanel({
                 return (
                 <li key={r.slug}>
                   <CardRow
-          className="marketplace-installed-row"
-                    icon={<KindChip kind="connector" revoked={r.listingState === 'revoked'} />}
+                    icon={<RowMark name={r.name} slug={r.slug} revoked={r.listingState === 'revoked'} />}
                     title={r.name}
                     meta={
                       <>
                         <Badge tone="neutral">v{r.version}</Badge>
                         {r.listingState === 'revoked' && <Badge tone="warning">已被下架</Badge>}
                         {state && (
-                          <Badge tone={state.tone} data-testid="plugin-state">
-                            {state.stateLabel}
-                          </Badge>
+                          <StatusPill
+                            variant="pill"
+                            tone={PLUGIN_TONE[state.tone]}
+                            label={state.stateLabel}
+                            data-testid="plugin-state"
+                          />
                         )}
                         <span className="text-meta text-faint">
                           安装于 <TimeAgo value={r.installedAt} />

@@ -1340,6 +1340,28 @@ export const OutboundTurnUsage = Type.Object({
 })
 export type OutboundTurnUsage = Static<typeof OutboundTurnUsage>
 
+/** Shared scheduler retry truth, also carried by reconnect snapshots. */
+export const RetryStatus = Type.Object({
+  state: Type.Union(['scheduled', 'running', 'paused', 'exhausted', 'declined'].map(s => Type.Literal(s))),
+  attempt: Type.Optional(Type.Integer({ minimum: 0 })),
+  maxAttempts: Type.Optional(Type.Integer({ minimum: 1 })),
+  message: Type.String(),
+  actions: Type.Array(Type.String()),
+})
+export type RetryStatus = Static<typeof RetryStatus>
+
+/** Master admission and container acceptance are separate confirmations. */
+export const OutboundAck = Type.Object({
+  type: Type.Literal('outbound.ack'),
+  peer: Type.Optional(Peer),
+  clientMessageId: Type.Optional(ClientMessageId),
+  admitted: Type.Optional(Type.Boolean()),
+  accepted: Type.Optional(Type.Boolean()),
+  deduplicated: Type.Optional(Type.Boolean()),
+  idempotencyKey: Type.Optional(Type.String()),
+})
+export type OutboundAck = Static<typeof OutboundAck>
+
 /** Transport-independent PG snapshot. afterSeq belongs to streamKey, never to
  * the legacy HTTP record-id cursor. Missing data is explicit; null dispatch
  * alone is not evidence that a client's in-flight turn completed. */
@@ -1363,6 +1385,12 @@ export const SessionSnapshot = Type.Object({
   engineReady: Type.Union([Type.Boolean(), Type.Null()]),
   turnStatus: Type.Union([Type.Record(Type.String(), Type.Unknown()), Type.Null()]),
   reconcile: Type.Union([Type.Literal('turn_completed'), Type.Literal('interrupted'), Type.Null()]),
+  recovery: Type.Optional(Type.Union([Type.Null(), Type.Object({
+    status: Type.Union(['queued', 'leased', 'sent', 'forwarded'].map(s => Type.Literal(s))),
+    attempt: Type.Integer({ minimum: 1 }),
+    maxAttempts: Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]),
+    retryStatus: RetryStatus,
+  })])),
   pendingPermissions: Type.Object({
     items: Type.Array(Type.Record(Type.String(), Type.Unknown())),
     completeness: Type.Union([Type.Literal('complete'), Type.Literal('truncated'), Type.Literal('unavailable')]),
@@ -1582,11 +1610,9 @@ export const SysRecoveryStatus = Type.Object({
   rootClientMessageId: ClientMessageId,
   clientMessageId: ClientMessageId,
   retryStatus: Type.Object({
+    ...RetryStatus.properties,
     state: Type.Literal('running'),
     attempt: Type.Integer({ minimum: 1 }),
-    maxAttempts: Type.Optional(Type.Integer({ minimum: 1 })),
-    message: Type.String(),
-    actions: Type.Array(Type.String()),
   }),
   ts: Type.Number(),
 })
@@ -1594,6 +1620,7 @@ export type SysRecoveryStatus = Static<typeof SysRecoveryStatus>
 
 export const AnyFrame = Type.Union([
   SysRecoveryStatus,
+  OutboundAck,
   InboundMessage,
   InboundPermissionResponse,
   PromptQueueMutationFrame,

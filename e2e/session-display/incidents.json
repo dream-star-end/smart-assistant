@@ -9426,7 +9426,8 @@
       "symptom": "#1238 混合轮新会话发「delete test」，agent 以 find 搜 workspace/ 命中另一会话目录 sessions/webmvon30lpno3vsx/test-pomodoro.cjs，并用用户问答弹窗提议删除。cwd 与产出面板按会话隔离（isolated_v1），文件列表 API 无跨会话泄漏；缺的是 agent 侧边界。修复：所有引擎共用的 TOOLS 段加入「会话工作区边界」，未点名不得搜索/修改/删除其它对话目录，且不得把它们作为删除候选。商业版（2026-10-30 同步）：发布门 check-v5-master-incident-proofs.ts 在 pinned 树上跑该 TOOLS 段用例，守则缺失即发布失败；不占 PROOF_PENDING_BASELINE。模型是否遵守仍需真实会话人工核对。",
       "rootFixCommit": "220fa3e8",
       "coverageCommits": [
-        "e82ad871"
+        "e82ad871",
+        "2fbe4f86"
       ],
       "regressions": [
         {
@@ -9438,6 +9439,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "keeps file search/deletion inside the current conversation unless the user names another one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionWorkspaceBoundary.test.ts",
+          "assertion": "every engine prompt keeps file search and deletion inside the current conversation"
         }
       ]
     },
@@ -9582,6 +9588,35 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[box-stopped-recovery-claim] PASS"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261030-TAPE-JOB-RETRY",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "turn_tape 物化超过8次进入failed后仍按小时重领，attempt达到1355/1310；结算第30次失败仍写queued冷重试，failed及超时held均无作业告警。修复：两类failed终态停止自动认领，结算30次封顶；按job+UTC日去重通知failed、awaiting_materialization超过1h和late_tape_after_fence超过24h。保留held栅栏、计费字节与账目，不自动补物化。",
+      "rootFixCommit": "917f5e53",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts",
+          "assertion": "materialization stops at eight attempts and old failed jobs are never reclaimed"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts",
+          "assertion": "settlement stops at thirty attempts while preserving verification and lease fencing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/tapeJobScheduler.test.ts",
+          "assertion": "daily keys survive scans, reason changes and restart, and roll at UTC midnight"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key"
         }
       ]
     }
