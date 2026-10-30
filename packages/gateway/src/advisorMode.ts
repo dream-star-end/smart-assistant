@@ -128,7 +128,26 @@ function advisorNamedTargets(text: string): string[] {
 
 function advisorHasTargetException(clause: string): boolean {
   const exception = clause.match(/(?:除(?!非)了?|\b(?:except(?:\s+for)?|excluding|apart from|other than)\b)\s*(\S+)/i)
-  return !!exception && advisorNamedTargets(exception[1]!).length > 0
+  if (!exception) return false
+  const operand = exception[1]!
+  // An exception for reading a file does not authorize writing it.
+  if (/^(?:读取?|阅读|查看|检查|分析|审查|讨论|咨询|建议|解释|说明)(?!\.)/.test(operand)) return false
+  return advisorNamedTargetOperand(operand)
+}
+
+function advisorNamedTargetOperand(text: string): boolean {
+  return /^(?:[\p{L}\p{N}_@+~./\\-]+\.[a-zA-Z0-9]{1,16}|(?:[\p{L}\p{N}_@+~.-]+[\\/])+)(?=\s|$|以外|之外|外)/u.test(text)
+}
+
+function advisorHasExplicitWrite(clause: string): boolean {
+  return ADVISOR_EXPLICIT_WRITE.some(pattern => {
+    const match = pattern.exec(clause)
+    if (!match) return false
+    const object = clause.slice(match[0].length).trimStart()
+    // "修改建议" / "change suggestions" are nouns, not editing permission.
+    // A literal filename such as 建议.md remains an editable target.
+    return !/^(?:建议|意见|方案|计划|说明|方法|步骤|策略|advice\b|suggestions?\b|recommendations?\b|proposals?\b|plans?\b)/i.test(object) || advisorNamedTargetOperand(object)
+  })
 }
 
 /** Only whole-turn intent disables all writes; target-specific restrictions remain in the task. */
@@ -152,7 +171,7 @@ export function detectAdvisorNoWrite(userText: string): boolean {
       !advisorHasTargetException(clause) &&
       ADVISOR_WHOLE_TURN_NO_WRITE.some(pattern => pattern.test(clause))
   ))) return true
-  const edits = clauses.filter(clause => ADVISOR_EXPLICIT_WRITE.some(pattern => pattern.test(clause)))
+  const edits = clauses.filter(advisorHasExplicitWrite)
   return clauses.some(clause => {
     if (!ADVISOR_WHOLE_TURN_REPLY_ONLY.some(pattern => pattern.test(clause))) return false
     const targets = advisorNamedTargets(clause)

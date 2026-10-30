@@ -110,6 +110,8 @@ describe('advisor no-write intent', () => {
       'Update app.ts; read-only review of docs/.',
       'Update app.ts; do not modify files outside src/.',
       'Update app.ts; do not modify any files outside src/.',
+      '请修改 建议.md，只读检查 README.md。',
+      'Update suggestions.md; read-only review of README.md.',
     ]) assert.equal(detectAdvisorNoWrite(request), false, request)
     for (const request of [
       '只读检查 README.md。', '只给 README.md 的建议。',
@@ -142,6 +144,13 @@ describe('advisor no-write intent', () => {
       '顾问只给建议，不要改文件，除了提供建议不要做其他事。',
       'Do not modify any files, except give advice.',
       '不要改文件，除非我授权修改app.ts。',
+      '只读检查 README.md，修改建议请直接列出。',
+      '只读检查 README.md，修改建议针对 app.ts 直接列出。',
+      'Read-only review of README.md, change suggestions should be listed.',
+      '不要改任何文件，除了读取README.md不要做其他事。',
+      '不要改任何文件，除了读取README.md。',
+      '不要改任何文件，除了读取 README.md。',
+      'Do not modify any files, except read README.md.',
     ]) assert.equal(detectAdvisorNoWrite(request), true, request)
   })
 
