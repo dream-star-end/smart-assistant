@@ -10,7 +10,7 @@ const MAX_CACHE = 16
 /** Derive sizes and prefix hashes from this call's actual array JSON. Parsing
  * first preserves array nulls and toJSON(key), unlike stringifying each original
  * element independently. The wire still carries the original message objects. */
-function messageSnapshot(json: string, count: number) {
+export function boxContextMessageSnapshot(json: string, count: number) {
   const messages: unknown = JSON.parse(json)
   if (!Array.isArray(messages) || messages.length !== count) {
     throw new Error('完整资料传输校验未通过，文件和对话已保留。')
@@ -123,7 +123,7 @@ export async function sendWithBoxContextTransport<T extends Params, R>(
   }
   // Rebuilt on every call: in-place edits to old objects must invalidate refs.
   // An explicit reference repair can reuse this same invocation's snapshot.
-  const snapshot = messageSnapshot(fullMessages, params.messages.length)
+  const snapshot = boxContextMessageSnapshot(fullMessages, params.messages.length)
   const key = JSON.stringify([client.baseURL, params.model, params.metadata ?? null])
   for (let repair = 0; ; repair++) {
     try {
