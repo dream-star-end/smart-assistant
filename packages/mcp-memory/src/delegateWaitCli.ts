@@ -5,6 +5,7 @@
  * a bounded segment returns the same pending jobIds for the next call.
  */
 import {
+  delegateLeaderResultBudget,
   formatDelegateHttpResult,
   interpretDelegateWaitBody,
   isTransientDelegateWaitError,
@@ -128,7 +129,15 @@ export async function runDelegateWaitLoop(opts: {
         results.set(jobId, { kind: 'error', text: view.error })
         continue
       }
-      results.set(jobId, formatDelegateHttpResult(view.httpStatus, view.body, jobId))
+      results.set(
+        jobId,
+        formatDelegateHttpResult(
+          view.httpStatus,
+          view.body,
+          jobId,
+          delegateLeaderResultBudget(unique.length),
+        ),
+      )
     }
     if (pending.size === 0) break
     if (

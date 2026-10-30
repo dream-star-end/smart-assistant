@@ -13,11 +13,11 @@ import {
   cleanSkillQuery,
   cosineSim,
   getSkillEmbeddingProvider,
-  isSkillEmbeddingAvailable,
   skillEmbedText,
   skillEmbeddingBackendId,
-  skillEmbeddingConfigFromEnv,
 } from '@openclaude/storage'
+
+import { resolvePlatformSkillEmbeddingConfig } from '../openai/platformSkillEmbedding.js'
 
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { isDefaultConnectorArtifact } from '../connectors/defaults/index.js'
@@ -148,17 +148,18 @@ export async function handleMarketplaceSearch(
       .map((c) => toCard(c))
   }
 
-  if (!isSkillEmbeddingAvailable()) {
+  const embedCfg = await resolvePlatformSkillEmbeddingConfig()
+  if (!(embedCfg.apiKey ?? '').trim()) {
     sendJson(res, 200, { results: keyword(), method: 'keyword' })
     return
   }
 
   try {
     const provider = getSkillEmbeddingProvider({
-      ...skillEmbeddingConfigFromEnv(),
+      ...embedCfg,
       dispatcher: directEgressDispatcher(),
     })
-    const backendId = `${skillEmbeddingBackendId()}/${provider.modelId}`
+    const backendId = `${skillEmbeddingBackendId(embedCfg.baseUrl)}/${provider.modelId}`
     const dim = provider.dimensions
 
     const [qv] = await provider.embed([cleanSkillQuery(q)], 'query')
