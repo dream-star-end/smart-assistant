@@ -9,7 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { CursorContextTier, MessageReplyQuote, ServiceTier } from "@openclaude/protocol/browser";
+import type { CursorContextTier, MessageReplyQuote, ServiceTier, UserError } from "@openclaude/protocol/browser";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,
@@ -317,6 +317,8 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /** 服务端给的人话错误(错误帧 / 终态卡上的 userError)。正文只用它,错误码只进技术详情。 */
+  _userError?: UserError;
   /**
    * 错误卡第一次提交时写死的展示。之后错误码、免单、历史同步都不得改颜色、标题或正文。
    * `silent` = 这一轮不出现错误卡（点停 / 计划内重启 / 容器回收）。

@@ -1579,3 +1579,19 @@ describe("t1360u current interruption keeps a single Continue", () => {
     });
   }
 });
+
+
+test("UserCard retires a rejected old source while retaining a genuinely current failed send", () => {
+  const msg = userMsg({ status: "error" });
+  const go = vi.fn();
+  const resolve = vi.fn((): ChatMessage | undefined => undefined);
+  const cb = { onContinueInterrupted: go, resolveInterruptedContinuation: resolve };
+  const view = render(<UserCard msg={msg} cb={cb} />);
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(go).not.toHaveBeenCalled();
+  resolve.mockReturnValue(msg);
+  view.rerender(<UserCard msg={msg} cb={cb} />);
+  fireEvent.click(screen.getByRole("button", { name: "继续" }));
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(msg);
+});

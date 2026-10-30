@@ -25,7 +25,7 @@ describe("t1360u commercial error-card Continue inventory", () => {
         ctx={{ isLast: true, sending: false, inActiveTurn: true }}
         cb={{ onContinueInterrupted: go, resolveInterruptedContinuation: () => ({ id: "u", role: "user", text: "原任务", ts: 0 }),
           onRegenerate: regenerate, onRetrySend: retry, onTopUp: vi.fn() }} />);
-      const action = screen.getByRole("button", { name: "继续", exact: true });
+      const action = screen.getByRole("button", { name: "继续" });
       expect(screen.queryByRole("button", { name: /^(重试|重新尝试|重新发送)$/ })).toBeNull();
       fireEvent.click(action);
       expect(go).toHaveBeenCalledTimes(1);

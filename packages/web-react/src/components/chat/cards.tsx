@@ -704,12 +704,14 @@ export function UserCard({
 }) {
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
-  // 用户自己停止的待发消息:中性说明 + 「重新发送」,不是红色失败。
+  // 用户自己停止的待发消息保留中性说明，通过当前来源门继续。
   const cancelledByUser = status === "error" && msg._sendCancelled === true;
   const statusLabel = cancelledByUser
     ? (msg._errorDetail || "发送已取消")
     : status && (status !== "sent" || awaitingReply) ? USER_STATUS_LABEL[status] : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
+  const canContinue = status === "error" && !failurePresentedBelow && Boolean(cb?.onContinueInterrupted) &&
+    (!cb?.resolveInterruptedContinuation || !!cb.resolveInterruptedContinuation(msg));
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
   return (
@@ -790,10 +792,10 @@ export function UserCard({
             </button>
           )}
           {/* A failed send keeps its original task context through Continue. */}
-          {status === "error" && cb?.onContinueInterrupted && (
+          {status === "error" && canContinue && (
             <button
               type="button"
-              onClick={() => cb.onContinueInterrupted?.(msg)}
+              onClick={() => cb?.onContinueInterrupted?.(msg)}
               className={cn(
                 "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11",
                 cancelledByUser ? "bg-card text-fg" : "bg-danger-soft text-danger",

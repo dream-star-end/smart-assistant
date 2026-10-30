@@ -57,15 +57,27 @@ async function revealPaidCredits(page, screenshot) {
   await row.waitFor();
   const more = row.getByRole('button', { name: '更多操作', exact: true });
   if (await more.count() > 0) {
+    // Modal menus hide the background from role queries. Capture the actual
+    // trigger before opening it, then read its DOM attributes directly.
+    const trigger = await more.elementHandle();
+    assert.ok(trigger, 'the real billing action trigger is mounted');
     await more.click();
-    const menu = page.getByRole('menu', { name: '消息操作', exact: true });
+    // Radix names the menu through its trigger's aria-labelledby. Its literal
+    // aria-label is not the accessible name; bind to this trigger's real popup.
+    await until('billing trigger owns an open menu', async () =>
+      await trigger.getAttribute('aria-expanded') === 'true' && !!await trigger.getAttribute('aria-controls'));
+    const menuId = await trigger.getAttribute('aria-controls');
+    assert.ok(menuId, 'the real More trigger identifies its own billing menu');
+    const menu = page.locator(`[id=${JSON.stringify(menuId)}]`);
     await menu.waitFor();
-    const credits = menu.getByLabel('消耗 71 积分', { exact: true });
+    assert.equal(await menu.getAttribute('role'), 'menu');
+    const credits = menu.getByTestId('assistant-meta-menu').getByLabel('消耗 71 积分', { exact: true });
     await credits.waitFor();
     assert.equal((await credits.innerText()).trim(), '71 积分');
     await screenshot();
     await page.keyboard.press('Escape');
     await menu.waitFor({ state: 'hidden' });
+    assert.equal(await trigger.getAttribute('aria-expanded'), 'false', 'billing menu closes before Continue');
     return;
   }
   // A bodyless pre-fix error has no action row; its standalone metadata is
