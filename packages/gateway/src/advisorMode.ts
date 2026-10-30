@@ -86,37 +86,82 @@ export const ADVISOR_NO_WRITE_CONSTRAINT =
 
 const ZH_WRITE_BAN = String.raw`(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)`
 const ZH_WRITE_VERB = String.raw`(?:改(?:动|写)?|更改|修改|编辑|写入?|创建|新建|删除|保存|更新|覆盖|触碰|动)`
+const ZH_WRITE_VERBS = String.raw`${ZH_WRITE_VERB}(?:\s*(?:或者|或|和|与|及|以及|并且|并|、)\s*${ZH_WRITE_VERB})*`
 const ZH_ALL_FILES = String.raw`(?:(?:任何|所有|任意|全部)(?:一个|一份)?(?:的)?\s*)?(?:文件|代码|文档|仓库|工作区|源码|磁盘)(?:的内容)?`
-// A named file, subset, or file property is a local constraint. Only a generic
-// object (optionally followed by a purpose/example) disables all turn writes.
-const ZH_GLOBAL_END = String.raw`(?=$|\s*(?:来|以|去|作为|用于|包括|包含|例如|比如|[（(]))`
+// Reject explicit target/subdirectory qualifiers, rather than requiring a
+// particular ending: coordination, purposes and polite particles remain global.
+const ZH_GLOBAL_END = String.raw`(?!\s*(?:里|中|内|下|外|名为|叫作|路径为|(?:的)?(?:名(?:称)?|编码|权限|属性|格式|大小|类型|后缀|扩展名|元数据|路径|目录|子目录)|(?:in|under|inside|within|outside|from|named|matching)\b|[\w./-]+\.[a-zA-Z0-9]{1,16}\b))`
 const EN_WRITE_BAN = String.raw`\b(?:do\s+not|don't|never|must\s+not|cannot|can't|no)\s+(?:(?:actually|directly|ever)\s+)*`
 const EN_WRITE_VERB = String.raw`(?:modify|edit|change|write|create|delete|remove|save|update|overwrite|touch|patch)`
 const EN_ALL_FILES = String.raw`(?:(?:any|all)(?:\s+of)?\s+)?(?:(?:the|this|current|entire|whole)\s+)?(?:files?|code|documents?|repo(?:sitory)?|workspace|disk|anything)\b`
-const EN_GLOBAL_END = String.raw`(?!\s+(?:in|under|inside|within|named|called|matching|from|[\w/-]+\.[a-z]{1,8})\b)`
+const EN_GLOBAL_END = String.raw`(?!\s+(?:in|under|inside|within|outside|named|called|matching|from|[\w/-]+\.[a-z]{1,16})\b)`
 const ADVISOR_WHOLE_TURN_REPLY_ONLY = [
   /^\s*(?:(?:请|帮我|本轮|这轮|这一轮|全程|主模型|以)\s*)*(?:禁写|只读|(?:只|仅)(?:允许|需要|需|用|做)?\s*(?:查看|检查|分析|审查|给(?:出)?(?:意见|(?:修改)?建议|方案)|提供(?:意见|建议|方案)|提建议|回复|回答|输出建议|告诉我|说))/,
+  /^\s*(?:(?:请|帮我|本轮|这轮|这一轮|主模型)\s*)*(?:只|仅)(?:需要|需|允许)?\s*(?:给出?|提供)[^。！？!?\n，,；;]{0,120}(?:建议|意见|方案)/,
   /^\s*(?:please\s+)?(?:read[\s-]?only|(?:advice|suggestions?|response|reply)\s+only|(?:only|just)\s+(?:(?:give|provide)\s+(?:me\s+)?(?:advice|suggestions?|recommendations?)|advise|answer|respond|reply|explain|review|analy[sz]e))\b/i,
 ]
 const ADVISOR_WHOLE_TURN_NO_WRITE = [
-  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:(?:再|去|实际|直接|自动|擅自|执行|进行)\s*)*${ZH_WRITE_VERB}\s*${ZH_ALL_FILES}${ZH_GLOBAL_END}`),
-  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:对)?${ZH_ALL_FILES}\s*(?:做|进行|作)?\s*(?:任何)?${ZH_WRITE_VERB}${ZH_GLOBAL_END}`),
-  new RegExp(String.raw`^\s*${ZH_ALL_FILES}\s*(?:都|也|先|暂时)?\s*${ZH_WRITE_BAN}\s*${ZH_WRITE_VERB}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:(?:再|去|实际|直接|自动|擅自|执行|进行)\s*)*${ZH_WRITE_VERBS}\s*${ZH_ALL_FILES}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`${ZH_WRITE_BAN}\s*(?:对)?${ZH_ALL_FILES}\s*(?:做|进行|作)?\s*(?:任何)?${ZH_WRITE_VERBS}${ZH_GLOBAL_END}`),
+  new RegExp(String.raw`^\s*${ZH_ALL_FILES}\s*(?:都|也|先|暂时)?\s*${ZH_WRITE_BAN}\s*${ZH_WRITE_VERBS}${ZH_GLOBAL_END}`),
   new RegExp(String.raw`${EN_WRITE_BAN}(?:${EN_WRITE_VERB}(?:\s+(?:or|and)\s+${EN_WRITE_VERB})*|(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?|patches?))\s+(?:(?:to|on|into)\s+)?${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
   new RegExp(String.raw`\bwithout\s+(?:modifying|editing|changing|writing|creating|deleting|saving|updating|touching)\s+${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
-  /\bno\s+(?:file|code|document|workspace)\s+(?:writes?|changes?|edits?|modifications?)\b(?!\s+(?:to|in|under|inside|within|for|from)\b)/i,
+  new RegExp(String.raw`\bwithout\s+(?:making|applying)\s+(?:any\s+)?(?:changes?|edits?|modifications?)\s+(?:to|in|on)\s+${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
+  new RegExp(String.raw`\bno\s+(?:changes?|edits?|modifications?|writes?)\s+(?:to|of|in)\s+${EN_ALL_FILES}${EN_GLOBAL_END}`, 'i'),
+  /\bno\s+(?:file|code|document|workspace)\s+(?:writes?|changes?|edits?|modifications?)\b(?!\s+(?:to|in|under|inside|within|outside|for|from)\b)/i,
   new RegExp(String.raw`\b(?:keep|leave)\s+${EN_ALL_FILES}\s+(?:unchanged|untouched|unmodified)\b`, 'i'),
 ]
+const ADVISOR_EXPLICIT_WRITE = [
+  new RegExp(String.raw`^(?:(?:请|现在|本轮|这轮|直接|先|帮我|务必|允许|可以)\s*)*${ZH_WRITE_VERB}`),
+  new RegExp(String.raw`^(?:(?:please|now|then|you may|you can|go ahead and)\s+)*${EN_WRITE_VERB}\b`, 'i'),
+]
+
+function advisorNamedTargets(text: string): string[] {
+  // Chinese operation words can touch a filename without a separating space.
+  const targetText = text.replace(ADVISOR_EXPLICIT_WRITE[0]!, '').replace(
+    /^(?:(?:请|帮我|本轮|这轮|这一轮|全程|主模型|以)\s*)*(?:(?:禁写|只读)\s*(?:查看|检查|分析|审查|阅读|看)?|(?:只|仅)(?:允许|需要|需|用|做)?\s*(?:查看|检查|分析|审查|给出?|提供))\s*/,
+    '',
+  )
+  const names = targetText.match(/[\p{L}\p{N}_@+~./\\-]+\.[a-zA-Z0-9]{1,16}\b|(?:[\p{L}\p{N}_@+~.-]+[\\/])+/gu) ?? []
+  return names.map(name => name.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, ''))
+}
+
+function advisorHasTargetException(clause: string): boolean {
+  const exception = clause.match(/(?:除(?!非)了?|\b(?:except(?:\s+for)?|excluding|apart from|other than)\b)\s*(\S+)/i)
+  return !!exception && advisorNamedTargets(exception[1]!).length > 0
+}
 
 /** Only whole-turn intent disables all writes; target-specific restrictions remain in the task. */
 export function detectAdvisorNoWrite(userText: string): boolean {
-  const text = userText.normalize('NFKC').replace(/[’‘]/g, "'")
-  return text.split(/[。！？!?\n，,；;]+|\.(?=\s|$)/).some(
-    clause => ADVISOR_WHOLE_TURN_REPLY_ONLY.some(pattern => pattern.test(clause)) || (
-      !/(?:除[^。！？!?\n，,；;]{1,120}(?:外|以外)|\b(?:except|excluding|apart from|other than)\b)/i.test(clause) &&
+  const text = userText.normalize('NFKC').replace(/[’‘]/g, "'").replace(/[`“”「」『』"]/g, ' ')
+  const clauses = text.split(/[。！？!?\n；;]+|\.(?=\s|$)/).flatMap(sentence => {
+    const parts = sentence.split(/[，,]+/).map(clause => clause.trim()).filter(Boolean)
+    const result: string[] = []
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index]!
+      // Keep comma-separated exceptions attached to the restriction they scope.
+      if (/^(?:除了?|except\b|excluding\b|apart from\b|other than\b)/i.test(part)) {
+        if (result.length) result[result.length - 1] += ` ${part}`
+        else result.push(`${part} ${parts[++index] ?? ''}`.trim())
+      } else result.push(part)
+    }
+    return result
+  })
+  // A generic file ban is authoritative even beside an otherwise authorized edit.
+  if (clauses.some(clause => (
+      !advisorHasTargetException(clause) &&
       ADVISOR_WHOLE_TURN_NO_WRITE.some(pattern => pattern.test(clause))
-    ),
-  )
+  ))) return true
+  const edits = clauses.filter(clause => ADVISOR_EXPLICIT_WRITE.some(pattern => pattern.test(clause)))
+  return clauses.some(clause => {
+    if (!ADVISOR_WHOLE_TURN_REPLY_ONLY.some(pattern => pattern.test(clause))) return false
+    const targets = advisorNamedTargets(clause)
+    // A standalone read-only request still protects the turn. Beside an explicit
+    // edit of another target, the named read-only/advice clause is only local.
+    return targets.length === 0 || !edits.some(edit => edit !== clause && (
+      advisorNamedTargets(edit).length === 0 || advisorNamedTargets(edit).some(target => !targets.includes(target))
+    ))
+  })
 }
 
 export const ADVISOR_PREAMBLE = [

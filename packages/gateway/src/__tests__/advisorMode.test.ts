@@ -62,6 +62,14 @@ describe('advisor no-write intent', () => {
       'Edit app.ts, keep README.md read-only.',
       'Update app.ts, do not modify any other files.',
       'Update app.ts; do not modify any files except app.ts.',
+      'Update app.ts; do not modify any files, except app.ts.',
+      'Except app.ts, do not modify any files.',
+      '请修改 app.ts，不要改任何文件，除了 app.ts。',
+      '除 app.ts 外，不要修改任何文件。',
+      '请修改 app.ts，不要改文件名。',
+      '不要修改文件编码',
+      '请修改 app.ts，不要改文件的格式。',
+      '请修改 app.ts，不要改文件权限或属性。',
     ]) {
       assert.equal(detectAdvisorNoWrite(request), false, request)
       const snapshot = buildAdvisorSnapshot({
@@ -85,6 +93,55 @@ describe('advisor no-write intent', () => {
       'Read app.ts and README.md. Do not edit any files.',
       'Read-only review of README.md and app.ts.',
       'Only give advice about app.ts; do not write files.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
+  })
+
+  it('keeps named read-only and advice scopes local when another target is explicitly editable', () => {
+    for (const request of [
+      '请修改 app.ts，只读检查 README.md。',
+      '请修改app.ts，只读检查README.md。',
+      '只读检查 README.md，请修改 app.ts。',
+      '请修改 app.ts，只给 README.md 的建议。',
+      '请修改 app.ts，只读检查 docs/。',
+      'Update app.ts; read-only review of README.md.',
+      'UPDATE app.ts; READ-ONLY review of README.md.',
+      'Read-only review of README.md; update app.ts.',
+      'Update app.ts; only give advice about README.md.',
+      'Update app.ts; read-only review of docs/.',
+      'Update app.ts; do not modify files outside src/.',
+      'Update app.ts; do not modify any files outside src/.',
+    ]) assert.equal(detectAdvisorNoWrite(request), false, request)
+    for (const request of [
+      '只读检查 README.md。', '只给 README.md 的建议。',
+      '请修改app.ts，只读检查app.ts。',
+      'UPDATE app.ts; READ-ONLY review of ./app.ts.',
+      'Read-only review of README.md.', 'Only give advice about README.md.',
+      '请修改 app.ts，只读检查 README.md，不要改任何文件。',
+      'Update app.ts; read-only review of README.md; do not modify any files.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
+  })
+
+  it('recognizes generic global bans with coordinated actions, objects and natural endings', () => {
+    for (const request of [
+      '请分析问题，不要改文件或执行命令。',
+      '不要写入或修改任何文件',
+      '不要写入或者修改任何文件',
+      '不要修改文件和代码',
+      '不要改文件 ', '不要改文件\t',
+      '不要改文件或者运行命令',
+      '别改文件了，先提建议。',
+      '这轮不要改文件，谢谢。',
+      '不要改任何文件的内容，也不要运行命令。',
+      'No changes to any files.',
+      'Review without making any changes to files.',
+      'Do not write or modify any files.',
+      'Do not modify files or execute commands.',
+      'Do not modify files and code.',
+      'Do not modify files ',
+      'Update app.ts; do not modify any files or execute commands.',
+      '顾问只给建议，不要改文件，除了提供建议不要做其他事。',
+      'Do not modify any files, except give advice.',
+      '不要改文件，除非我授权修改app.ts。',
     ]) assert.equal(detectAdvisorNoWrite(request), true, request)
   })
 
