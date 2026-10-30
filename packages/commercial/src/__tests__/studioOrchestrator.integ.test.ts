@@ -338,6 +338,10 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
                 const rows = await query<{ payload: { seq: number; delta: string } }>("SELECT payload FROM studio_events WHERE project_id=$1 AND type='plan.delta' ORDER BY id", [project.id])
                 assert.deepEqual(rows.rows.map((r) => [r.payload.seq, r.payload.delta]), deltaTexts.slice(0, i + 1).map((s, n) => [n + 1, s]))
                 assert.equal((await query('SELECT 1 FROM studio_shots WHERE project_id=$1', [project.id])).rowCount, 0)
+                const view = await new StudioStore(getPool()).projectView(userId, project.id)
+                const activity = view!.events as Array<{ type: string }>
+                assert.ok(activity.some((e) => e.type === 'project.created'))
+                assert.equal(activity.some((e) => e.type === 'plan.delta'), false, 'previews do not flood ordinary activity')
               }
               yield event({ type: 'response.completed', response: json })
             },

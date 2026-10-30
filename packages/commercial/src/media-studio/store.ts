@@ -289,7 +289,7 @@ export class StudioStore {
       ),
       this.pool.query(
         `SELECT id::text AS id, ts, type, payload FROM studio_events
-         WHERE project_id=$1 ORDER BY id DESC LIMIT 50`,
+         WHERE project_id=$1 AND type <> 'plan.delta' ORDER BY id DESC LIMIT 50`,
         [id],
       ),
       // OCV5-591 A2-1b-2: what the agent understood and how running it went (no model internals).
