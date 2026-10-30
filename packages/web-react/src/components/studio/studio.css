@@ -782,8 +782,8 @@
   border-radius: 12px;
   font-size: 13px;
   color: var(--st-stage-fg);
-  background: rgba(255, 170, 60, 0.14);
-  box-shadow: inset 0 0 0 1px rgba(255, 170, 60, 0.4);
+  background: color-mix(in srgb, var(--st-amber) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--st-amber) 40%, transparent);
 }
 .st-shot-grid {
   display: grid;
