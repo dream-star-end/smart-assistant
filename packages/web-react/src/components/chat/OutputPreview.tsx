@@ -75,7 +75,7 @@ function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
           className="inline-flex items-center gap-1 rounded-full px-3 py-1 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
         >
           <RotateCw size={12} aria-hidden />
-          重试
+          继续
         </button>
       )}
     </div>

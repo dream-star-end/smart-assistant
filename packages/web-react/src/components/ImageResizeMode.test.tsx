@@ -136,7 +136,7 @@ describe('ImageResizeMode', () => {
       const resolveSrc = vi.fn(async () => 'https://signed.test/y.png')
       render(<ImageResizeMode {...baseProps} resolveSrc={resolveSrc} canSubmit onSubmit={vi.fn()} />)
       fireEvent.error(screen.getByAltText('风景'))
-      fireEvent.click(screen.getByRole('button', { name: '重试' }))
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
       const img = await waitFor(() => {
         const el = screen.getByAltText('风景')
         expect(el).toHaveAttribute('src', 'https://signed.test/y.png')
@@ -152,7 +152,7 @@ describe('ImageResizeMode', () => {
     render(<ImageResizeMode {...baseProps} canSubmit onSubmit={vi.fn()} />)
     fireEvent.error(screen.getByAltText('风景'))
     expect(screen.getByText('图片加载失败')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '继续' })).toBeInTheDocument()
   })
 
   test('解析失败:取图字节失败 → 错误提示', async () => {

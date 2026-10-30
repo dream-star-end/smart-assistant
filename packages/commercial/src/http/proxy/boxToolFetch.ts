@@ -1,3 +1,4 @@
+import { BoxToolRolloverRequired } from "./boxToolRollover.js";
 /** Internal Box tool transport on the existing OpenClaude Messages route.
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
@@ -572,7 +573,19 @@ export class BoxToolFetch {
             } catch (error) {
               // OCV5-304: no claim was made and nothing launched; a recovered
               // dispatch continues the exchange as a fresh Box invocation.
-              if (!(await this.releaseOrphanedExchange(args, error))) {
+              if (error instanceof BoxToolRolloverRequired) {
+                // The journal has already matched the entire exchange, attribution and successor.
+                // No sidecar was written. An uncertain stop never authorizes a fresh invocation.
+                if (abort.signal.aborted || !this.deps.stopOrphanRun) throw error;
+                const claim = error.claim;
+                const outcome = await this.deps.stopOrphanRun({ requestId: claim.ownerRequestId,
+                  uid: args.uid,accountId: claim.accountId,runNonce: claim.runNonce,leaseEpoch: claim.leaseEpoch });
+                if (outcome !== "stopped_proven" || abort.signal.aborted) {
+                  throw new BoxContinuationDecisionError("in_progress_or_unknown","BOX_TOOL_ROLLOVER_PENDING");
+                }
+                await this.deps.journal.finishToolRollover({ requestId: args.requestId,uid: args.uid,claim });
+                if (abort.signal.aborted) throw new BoxContinuationDecisionError("reject","BOX_TOOL_ROLLOVER_CANCELLED");
+              } else if (!(await this.releaseOrphanedExchange(args, error))) {
                 if (error instanceof BoxDurableJournalError || error instanceof BoxContinuationDecisionError) {
                   recordBoxContinuationRejection("claim", error.code);
                 }

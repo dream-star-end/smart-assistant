@@ -73,34 +73,40 @@ function openMoreMenu(): HTMLElement {
   return screen.getByRole("menu");
 }
 
-describe("F3 UserCard 发送失败重试命中区", () => {
-  test("仅有 transport error 时保留发送失败与 44px 重试出口", () => {
+describe("F3 UserCard 发送失败继续命中区", () => {
+  test("仅有 transport error 时保留发送失败与 44px 继续出口，不重放原请求", () => {
+    const onContinueInterrupted = vi.fn();
     const onRetrySend = vi.fn();
-    render(<UserCard msg={userMsg({ status: "error" })} cb={{ onRetrySend }} />);
+    const message = userMsg({ status: "error" });
+    render(<UserCard msg={message} cb={{ onContinueInterrupted, onRetrySend }} />);
     expect(screen.getByText("发送失败")).toBeInTheDocument();
-    const btn = screen.getByRole("button", { name: /重试/ });
+    const btn = screen.getByRole("button", { name: "继续" });
     // 对齐同批其它命中区写法（MessageRenderer 续轮按钮）：粗指针下 ≥44px。
     expect(btn).toHaveClass("[@media(hover:none)]:min-h-11");
     fireEvent.click(btn);
-    expect(onRetrySend).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(message);
+    expect(onRetrySend).not.toHaveBeenCalled();
   });
 
-  test("同一轮已有可见错误卡时隐藏重复的发送失败与重试", () => {
+  test("同一轮已有可见错误卡时隐藏重复的发送失败与继续", () => {
     render(
       <UserCard
         msg={userMsg({ status: "error" })}
-        cb={{ onRetrySend: vi.fn() }}
+        cb={{ onRetrySend: vi.fn(), onContinueInterrupted: vi.fn() }}
         failurePresentedBelow
       />,
     );
     expect(screen.getByTestId("message-text")).toHaveTextContent("你好");
     expect(screen.queryByText("发送失败")).toBeNull();
     expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 
-  test("非 error 态不渲染重试按钮", () => {
-    render(<UserCard msg={userMsg({ status: "sent" })} cb={{ onRetrySend: () => {} }} />);
+  test("非 error 态不渲染失败继续按钮", () => {
+    render(<UserCard msg={userMsg({ status: "sent" })} cb={{ onContinueInterrupted: vi.fn() }} />);
     expect(screen.queryByRole("button", { name: /重试/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 });
 
@@ -742,22 +748,26 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     },
   );
 
-  test("可重试码 + _clientMessageId 命中原 user 行 → 显示精确「重试」(不显「重新尝试」)", () => {
+  test("已有来源的错误优先继续，不重放原始请求", () => {
     const onRetrySend = vi.fn();
     const onRegenerate = vi.fn();
+    const onContinueInterrupted = vi.fn();
     renderErr(errMsg({ _clientMessageId: "u1" }), {
       onRetrySend,
       onRegenerate,
+      onContinueInterrupted,
+      resolveInterruptedContinuation: () => retryableUser,
       resolveRetryTarget: () => retryableUser,
     });
-    const btn = screen.getByRole("button", { name: "重试" });
+    const btn = screen.getByRole("button", { name: "继续" });
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
     fireEvent.click(btn);
-    expect(onRetrySend).toHaveBeenCalledWith(retryableUser);
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onRetrySend).not.toHaveBeenCalled();
     expect(onRegenerate).not.toHaveBeenCalled();
   });
 
-  test("找不到原 user 行(resolveRetryTarget→undefined)→ 不显精确「重试」,落回「重新尝试」", () => {
+  test("找不到原 user 行时不提供继续，也不退回重新生成", () => {
     const onRegenerate = vi.fn();
     renderErr(errMsg({ _clientMessageId: "u1" }), {
       onRetrySend: vi.fn(),
@@ -765,29 +775,30 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       resolveRetryTarget: () => undefined,
     });
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    const regen = screen.getByRole("button", { name: "重新尝试" });
-    fireEvent.click(regen);
-    expect(onRegenerate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+    expect(onRegenerate).not.toHaveBeenCalled();
   });
 
-  test("无 _clientMessageId → 即便 resolver 有值也不走精确路径(落回「重新尝试」)", () => {
+  test("无来源身份时不把旧重发 resolver 当作继续依据", () => {
     renderErr(errMsg({}), {
       onRetrySend: vi.fn(),
       onRegenerate: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 
   // W3:按错误目录给动作;没有入口的建议不再写成引导文案(以前是「或在上方切换模型后重试」)。
-  test("cta=retry_or_switch(model_capacity)→ 精确「重试」+「切换模型」", () => {
+  test("cta=retry_or_switch(model_capacity)→「继续」+「切换模型」", () => {
     renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
       onRetrySend: vi.fn(),
       onOpenModelPicker: vi.fn(),
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
       resolveRetryTarget: () => retryableUser,
     });
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "切换模型" })).toBeInTheDocument();
   });
 
@@ -866,7 +877,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     );
   });
 
-  test("cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试", () => {
+  test("a deleted session never defaults to creating another conversation or replaying", () => {
     const onStartNewSession = vi.fn();
     renderErr(errMsg({ _errorCode: "session_deleted", _clientMessageId: "u1" }), {
       onStartNewSession,
@@ -874,8 +885,8 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       onRegenerate: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
-    fireEvent.click(screen.getByRole("button", { name: "新建会话继续" }));
-    expect(onStartNewSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
+    expect(onStartNewSession).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
@@ -906,15 +917,17 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
   });
 
-  test("免单码(no_response)非可重试红卡 → 不显精确「重试」(保留 onRegenerate 兜底)", () => {
-    // waived=true 分支:presentedError.waived 为真 → retryEligible false。
+  test("免单码(no_response)有来源时仍显示继续，不借重新生成重放任务", () => {
+    // 已免单与否不改变显式继续；来源与上下文必须保留。
     renderErr(errMsg({ _errorCode: "no_response", _clientMessageId: "u1", usage: { waived: true } }), {
       onRegenerate: vi.fn(),
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
       resolveRetryTarget: () => retryableUser,
     });
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    // 末轮 + 兜底可用 → 「重新尝试」保留。
-    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+    // 错误卡不能借 onRegenerate 重放最新任务。
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 
   test("cta=none 的非重试错误找不到精确目标时也不显示「重新尝试」", () => {
@@ -922,7 +935,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("末轮 idle timeout 且有 durable 断点 → 优先显示「从断点继续」", () => {
+  test("末轮 idle timeout 且有 durable 断点 → 显示「继续」", () => {
     const onContinueInterrupted = vi.fn();
     const error = errMsg({
       _errorCode: "LIVENESS_TIMEOUT",
@@ -934,7 +947,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       onContinueInterrupted,
       resolveInterruptedContinuation: () => retryableUser,
     });
-    fireEvent.click(screen.getByRole("button", { name: "从断点继续" }));
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
     expect(onContinueInterrupted).toHaveBeenCalledWith(error);
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
@@ -964,7 +977,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.getByRole("alert")).toBeInTheDocument();
     expect(screen.getByText("这句没有发出去")).toBeInTheDocument();
     expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
@@ -999,45 +1012,51 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
   });
 });
 
-describe("AssistantCard 重发按钮末轮门控(Codex 审计 R5)", () => {
+describe("AssistantCard 继续按钮末轮门控(Codex 审计 R5)", () => {
   // 历史中间错误卡:inActiveTurn=false(不在最后一条 user 之后)。
   const HIST_CTX: RenderCtx = { isLast: false, sending: false, inActiveTurn: false };
 
-  test("历史中间错误卡(非末轮)→ 精确「重试」也不显(避免乱序重发历史消息)", () => {
+  test("历史中间错误卡即便有来源与回调，也不提供继续或旧重发", () => {
     render(
       <AssistantCard
         msg={errMsg({ _clientMessageId: "u1" })}
         ctx={HIST_CTX}
-        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => retryableUser }}
+        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => retryableUser,
+          onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => retryableUser }}
       />,
     );
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 
-  test("历史中间错误卡(非末轮)→ 「重新尝试」兜底也不显(onRegenerate 会重发最新一轮,无关内容)", () => {
+  test("历史中间错误卡没有旧重发目标时，也不借重新生成处理最新任务", () => {
     render(
       <AssistantCard
         msg={errMsg({ _clientMessageId: "u1" })}
         ctx={HIST_CTX}
-        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => undefined }}
+        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => undefined,
+          onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => retryableUser }}
       />,
     );
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
     // 标题/正文照旧:红卡仍在(标题可见),仅无重发按钮。
     expect(screen.getByText("模型服务暂时中断")).toBeInTheDocument();
   });
 
-  test("历史中间错误卡的 model_capacity → 不显「切换模型」引导(引导只在末轮伴随重试按钮出现)", () => {
+  test("历史中间错误卡的 model_capacity 不提供切换模型或继续动作", () => {
     render(
       <AssistantCard
         msg={errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" })}
         ctx={HIST_CTX}
-        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => retryableUser }}
+        cb={{ onRetrySend: vi.fn(), onRegenerate: vi.fn(), resolveRetryTarget: () => retryableUser,
+          onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => retryableUser }}
       />,
     );
     expect(screen.queryByText(/切换模型/)).toBeNull();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
   });
 
   test("历史 insufficient_credits 错误卡 → 「开通 Lite」仍显(导航非重发,不受门控)", () => {
@@ -1086,14 +1105,15 @@ describe("AssistantCard 失败轮部分正文(Codex 审计 R6)", () => {
           usage: { waived: true },
         } as Partial<ChatMessage>)}
         ctx={ERR_CTX}
-        cb={{ onRegenerate: vi.fn() }}
+        cb={{ onRegenerate: vi.fn(), onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => retryableUser }}
       />,
     );
     expect(screen.getByText("这轮没有回复")).toBeInTheDocument();
-    expect(screen.getByText("模型没有生成内容，本轮未扣费。点重试再发一次。")).toBeInTheDocument();
-    // 免单卡不走精确「重试」(那会按原 payload 重发)。末轮给「重新尝试」。
+    expect(screen.getByText("模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。")).toBeInTheDocument();
+    // 免单与零产出也只提供同会话继续，不能默认重放整个任务。
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
-    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 });
 
@@ -1460,18 +1480,59 @@ describe("AssistantCard 需用户处理的错误卡给动作(OCV5-421)", () => {
 });
 
 describe("UserCard 用户自己停止的待发消息(OCV5-421)", () => {
-  test("显示中性「发送已取消」与「重新发送」,不是红色「发送失败」", () => {
+  test("显示中性「发送已取消」与「继续」，保留原消息且不重发", () => {
     const onRetrySend = vi.fn();
+    const onContinueInterrupted = vi.fn();
+    const message = userMsg({ status: "error", _sendCancelled: true, _errorDetail: "发送已取消" });
+    const original = structuredClone(message);
     render(
       <UserCard
-        msg={userMsg({ status: "error", _sendCancelled: true, _errorDetail: "发送已取消" })}
-        cb={{ onRetrySend }}
+        msg={message}
+        cb={{ onRetrySend, onContinueInterrupted }}
       />,
     );
     expect(screen.queryByText("发送失败")).toBeNull();
     const label = screen.getByText("发送已取消");
     expect(label.parentElement!.className).toContain("text-faint");
-    fireEvent.click(screen.getByRole("button", { name: /重新发送/ }));
-    expect(onRetrySend).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onContinueInterrupted).toHaveBeenCalledWith(message);
+    expect(onRetrySend).not.toHaveBeenCalled();
+    expect(message).toEqual(original);
   });
+});
+
+
+describe("t1360u current interruption keeps a single Continue", () => {
+  for (const code of ["model_authority_expired", "engine_error", "user_cancelled"]) {
+    test(`${code} remains actionable before a trailing runtime batch`, async () => {
+      const msg = errMsg({ _errorCode: code, text: "已完成写入A", usage: { costCredits: "12" } });
+      const onContinueInterrupted = vi.fn();
+      const onRegenerate = vi.fn();
+      render(<AssistantCard msg={msg} ctx={{ isLast: false, sending: false, inActiveTurn: true, turnFinalAssistant: false }}
+        cb={{ resolveInterruptedContinuation: () => userMsg({}), onContinueInterrupted, onRegenerate }} />);
+      const action = await screen.findByRole("button", { name: "继续" });
+      fireEvent.click(action);
+      expect(onContinueInterrupted).toHaveBeenCalledWith(msg);
+      expect(onRegenerate).not.toHaveBeenCalled();
+      expect(screen.getByText("已完成写入A")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
+    });
+  }
+});
+
+
+test("UserCard retires a rejected old source while retaining a genuinely current failed send", () => {
+  const msg = userMsg({ status: "error" });
+  const go = vi.fn();
+  const resolve = vi.fn((): ChatMessage | undefined => undefined);
+  const cb = { onContinueInterrupted: go, resolveInterruptedContinuation: resolve };
+  const view = render(<UserCard msg={msg} cb={cb} />);
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(go).not.toHaveBeenCalled();
+  resolve.mockReturnValue(msg);
+  view.rerender(<UserCard msg={msg} cb={cb} />);
+  fireEvent.click(screen.getByRole("button", { name: "继续" }));
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(msg);
 });

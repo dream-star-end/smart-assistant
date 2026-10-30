@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
@@ -311,16 +312,16 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留重试出口", () => {
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留继续出口", () => {
     renderList(
       [
         row("u", "user", "继续合并", { status: "replied" }),
         row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
         midTurnError("engine_error"),
       ],
-      { cb: { onRegenerate: () => {} } },
+      { cb: { onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => row("u", "user", "继续合并") } },
     );
-    const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    const retry = screen.getByRole("button", { name: "继续" });
     // 以错误收尾 = 本轮结局:仍是完整错误卡,不是「已继续」说明。
     expect(screen.queryByTestId("recovered-error-note")).toBeNull();
     expect(screen.getByRole("alert")).toBeInTheDocument();
@@ -345,7 +346,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
     expect(within(card).queryByRole("alert")).toBeNull();
-    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
+    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/, /^继续$/]) {
       expect(within(card).queryByRole("button", { name })).toBeNull();
     }
   });
@@ -2645,4 +2646,251 @@ test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只�
   const tally = screen.getByTestId("process-tally");
   expect(within(tally).getByTitle("思考 3")).toBeInTheDocument();
   expect(within(tally).getByTitle("子任务 1")).toBeInTheDocument();
+});
+
+
+test("the real stopped narration projection has one Continue bound to its canonical raw message", () => {
+  const user = { id: "stopped-human", role: "user", text: "原始目标", ts: 1, status: "error" } as ChatMessage;
+  const stopped = { id: "stopped-narration", role: "assistant", text: "已经完成第一步", ts: 2,
+    _errorCode: "USER_CANCELLED", _clientMessageId: user.id } as ChatMessage;
+  const tool = { id: "stopped-tool", role: "tool", text: "", ts: 3, toolName: "Read", output: "saved",
+    _completed: true, _clientMessageId: user.id } as ChatMessage;
+  const messages = [user, stopped, tool];
+  const go = vi.fn();
+  render(<MessageList messages={messages} sending={false}
+    cb={{ resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view),
+      onContinueInterrupted: (view) => {
+        const canonical = canonicalTaskContinuationError(messages, view);
+        if (canonical && manualTaskContinuationSource(messages, view)) go(canonical.id);
+      } }} onRespondPermission={() => {}} />);
+  const buttons = screen.getAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(stopped.id);
+  expect(messages).toEqual([user, stopped, tool]);
+  expect(stopped._continuationSourceId).toBeUndefined();
+});
+
+
+test("real dispatch status keeps one Continue before its hidden duplicate engine error", async () => {
+  const user = row("double-failure-human", "user", "原始部署目标", { status: "error", _source: "server" });
+  const status = row("turn-status:double-failure-human", "system", "", {
+    _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+    _errorCode: "dispatch_lost", _clientMessageId: user.id });
+  const duplicate = row("double-failure-error", "assistant", "", {
+    _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: user.id });
+  const messages = [user, status, duplicate];
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(status);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("eleven real failed attempts render one final status and Continue while all 33 raw rows survive", async () => {
+  const messages: ChatMessage[] = [];
+  for (let attempt = 0; attempt <= 10; attempt++) {
+    const id = `dispatch-attempt-${attempt}`;
+    messages.push(row(id, "user", attempt ? "RECOVERY_CONTROL" : "原始目标", {
+      status: "error", _source: "server", ts: 1_700_000_000_000 + attempt * 3,
+      ...(attempt ? { _recoveryOfClientMessageId: `dispatch-attempt-${attempt - 1}`, _recoveryMode: "replay" as const,
+        _automaticRecovery: true, _automaticRecoveryRootClientMessageId: "dispatch-attempt-0",
+        _automaticRecoveryAttempt: attempt, _automaticRecoveryMax: 10 } : {}) }),
+    row(`turn-status:${id}`, "system", "", { _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+      _errorCode: "dispatch_lost", _clientMessageId: id, ts: 1_700_000_000_001 + attempt * 3 }),
+    row(`duplicate:${id}`, "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR",
+      _clientMessageId: id, ts: 1_700_000_000_002 + attempt * 3 }));
+  }
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  expect(screen.queryByText("RECOVERY_CONTROL")).toBeNull();
+  expect(manualTaskContinuationSource(messages, messages[31])).toBe(messages[0]);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(messages[31]);
+  expect(messages).toHaveLength(33);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+
+test("an admitted manual checkpoint retires the old failed UserCard through running and success", async () => {
+  const source = row("retired-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const saved = row("retired-saved-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo saved" },
+    output: "saved", _completed: true, _source: "server", _clientMessageId: source.id });
+  const error = row("retired-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  const original = [source, saved, error];
+  const before = JSON.stringify(original);
+  let messages = original;
+  let sending = false;
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+    sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  expect(await screen.findAllByRole("button", { name: "继续" })).toHaveLength(1);
+  const child = row("retired-manual-child", "user", "CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const active = row("retired-running-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo resumed" },
+    _completed: false, _source: "server", _clientMessageId: child.id });
+  messages = [...original, child, active];
+  sending = true;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(screen.queryByText("CHECKPOINT_CONTROL")).toBeNull();
+  messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+    row("retired-success", "assistant", "继续后完成", { _source: "server", _clientMessageId: child.id })];
+  sending = false;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+  // A later failed human send is independent and must retain its own recovery action.
+  const newest = row("new-independent-failure", "user", "新的失败目标", { status: "error" });
+  messages = [...messages, newest];
+  view.rerender(screenState());
+  const action = await screen.findByRole("button", { name: "继续" });
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
+  fireEvent.click(action);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(newest);
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+});
+
+test("a refused checkpoint returns the original source; a real failed child owns one new Continue", async () => {
+  const source = row("refused-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const error = row("refused-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _recoverySkippedNotice: "未从断点继续，原任务仍已保留。",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  let messages = [source, error];
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList messages={messages} sending={false} sessionId="session-a"
+    cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+  expect(go).toHaveBeenLastCalledWith(error);
+  go.mockClear();
+  const child = row("new-failed-child", "user", "CHECKPOINT_CONTROL", { status: "error", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const terminal = row("new-child-error", "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: child.id });
+  messages = [source, error, child, terminal];
+  view.rerender(screenState());
+  const actions = await screen.findAllByRole("button", { name: "继续" });
+  expect(actions).toHaveLength(1);
+  expect(screen.queryByText("发送失败")).toBeNull();
+  fireEvent.click(actions[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(terminal);
+});
+
+test.each(["committed", "uncommitted", "held"] as const)(
+  "manual checkpoint preserves the paid partial answer through completion and reload (%s)",
+  async (snapshot) => {
+    const source = row("paid-source", "user", "完成报告，保留已执行步骤", { status: "error", _source: "server" });
+    const saved = row("paid-saved-tool", "tool", "", { toolName: "Read", inputJson: { file_path: "saved-report.md" },
+      output: "SAVED_REPORT_RESULT", _completed: true, _source: "server", _clientMessageId: source.id });
+    const diagnostic = 'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}';
+    const error = row("paid-partial-error", "assistant", `SAVED_PAID_FIRST_PARAGRAPH\n\nSAVED_PAID_SECOND_PARAGRAPH\n\n${diagnostic}`, {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _turnTapeId: "paid-tape", _turnTapeComplete: true, _dispatchOutcome: "crashed",
+      usage: { costCredits: "71", waived: false, inputTokens: 50, outputTokens: 100 },
+      _errorHeldForRecovery: snapshot === "held" ? true : undefined,
+      _errorCardSnapshot: snapshot === "committed"
+        ? { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" }
+        : undefined,
+    });
+    const original = [source, saved, error];
+    const before = JSON.stringify(original);
+    let messages = original;
+    let sending = false;
+    const cb = { onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+    const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+      sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+    const view = render(screenState());
+    expect(await screen.findByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+
+    const assertSavedBody = () => {
+      expect(screen.getByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+      expect(screen.getByText("SAVED_PAID_SECOND_PARAGRAPH")).toBeVisible();
+      expect(screen.queryByText(/PRIVATE_DIAGNOSTIC/)).toBeNull();
+      expect(screen.queryByText("原中断提示")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+      expect(screen.queryByText("MANUAL_CHECKPOINT_CONTROL")).toBeNull();
+      expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+    };
+    const assertSavedUsage = () => {
+      const answer = screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").closest("[data-testid=assistant-row]");
+      if (!answer) throw new Error("missing saved partial answer row");
+      expect(within(answer as HTMLElement).getByLabelText("消耗 71 积分")).toHaveTextContent("71 积分");
+      expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+    };
+    const child = row("paid-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+      _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+    const active = row("paid-continuing-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo continue" },
+      _source: "server", _clientMessageId: child.id, _completed: false });
+    messages = [...original, child, active];
+    sending = true;
+    view.rerender(screenState());
+    assertSavedBody();
+
+    messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+      row("paid-finished", "assistant", "CONTINUED_PAID_ANSWER", { _source: "server", _clientMessageId: child.id })];
+    sending = false;
+    view.rerender(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+
+    // A fresh component receives only the persisted rows, without a local held-card repair.
+    view.unmount();
+    messages = JSON.parse(JSON.stringify(messages)) as ChatMessage[];
+    render(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+  },
+);
+
+test("a manually continued diagnostic-only error does not become a saved answer", async () => {
+  const source = row("diagnostic-source", "user", "继续原任务", { status: "error", _source: "server" });
+  const error = row("diagnostic-only-error", "assistant",
+    'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}', {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _errorCardSnapshot: { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" },
+    });
+  const child = row("diagnostic-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "replied", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const messages = [source, error, child,
+    row("diagnostic-finished", "assistant", "CONTINUED_WITHOUT_DIAGNOSTIC", { _source: "server", _clientMessageId: child.id })];
+  const before = JSON.stringify(messages);
+  renderList(messages);
+  expect(await screen.findByText("CONTINUED_WITHOUT_DIAGNOSTIC")).toBeVisible();
+  expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+  expect(screen.queryByText(/PRIVATE_DIAGNOSTIC|MODEL_AUTHORITY_INVALID/)).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(JSON.stringify(messages)).toBe(before);
 });

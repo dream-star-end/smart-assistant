@@ -1,3 +1,4 @@
+import { BoxToolRolloverRequired } from "./boxToolRollover.js";
 /** Publish OpenClaude-executed tool results into one already-running Box CLI.
  * The journal CAS precedes every remote result write. A write is attempted
  * once; uncertain publication is never retried or counted as a new model call. */
@@ -112,6 +113,7 @@ export async function publishBoxToolResume(input: {
     const decision = deps.journal.decideToolResume
       ? await race(deps.journal.decideToolResume(claimInput))
       : { kind: "new_claim" as const, claim: await race(deps.journal.claimToolResume(claimInput)) };
+    if (decision.kind === "rollover_claim") throw new BoxToolRolloverRequired(decision.claim);
     if (!resumeMayPublish(decision)) {
       throw new BoxContinuationDecisionError(
         decision.kind === "reject" ? "reject" : "in_progress_or_unknown",

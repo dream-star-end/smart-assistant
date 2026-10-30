@@ -295,9 +295,9 @@ try {
     writeFileSync(probePath, `${probeToken}\n`);
     await chooser.setFiles(probePath);
     // 必须等到 chip done 终态再放行;上传飞行中没有「重试」按钮,瞬时断言会漏掉失败。
-    // done: 发送键因 doneMedia 变为可用; error: 「重试上传」出现则立刻 fail。
+    // done: 发送键因 doneMedia 变为可用; error: 「继续上传」出现则立刻 fail。
     await page.getByRole("button", { name: `移除 ${probeName}` }).waitFor({ state: "visible", timeout: STEP_TIMEOUT });
-    const retry = page.getByRole("button", { name: `重试上传 ${probeName}` });
+    const retry = page.getByRole("button", { name: `继续上传 ${probeName}` });
     const send = page.getByRole("button", { name: "发送" });
     // 必须覆盖前端 uploadFile 的最坏重试预算(5 次 × Retry-After clamp 上限 10s,
     // 外加每次请求自身的 ensure 等待),否则真上传还在合法退避就被本门判死。

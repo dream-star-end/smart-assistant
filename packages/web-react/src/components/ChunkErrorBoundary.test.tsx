@@ -25,7 +25,7 @@ describe('ChunkErrorBoundary(懒块失效兜底屏,shell 审计 S-09 / S-18)', (
     expect(dialog).toBeInTheDocument()
     expect(dialog).toHaveTextContent('可能刚发布了新版本，或网络波动导致部分页面没有加载下来')
     expect(dialog).not.toHaveTextContent('已发布新版本')
-    const refresh = screen.getByRole('button', { name: '刷新' })
+    const refresh = screen.getByRole('button', { name: '继续' })
     // 原语的触控靶兜底与焦点环都在类名里
     expect(refresh.className).toContain('[@media(hover:none)]:min-h-11')
     expect(refresh.className).toContain('focus-visible:ring-2')
@@ -49,7 +49,7 @@ describe('ChunkErrorBoundary(懒块失效兜底屏,shell 审计 S-09 / S-18)', (
         </ChunkErrorBoundary>,
       )
       expect(screen.getByRole('alertdialog', { name: '此页面加载出错' })).toBeInTheDocument()
-      fireEvent.click(screen.getByRole('button', { name: '刷新' }))
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
       expect(reload).toHaveBeenCalledTimes(1)
     } finally {
       Object.defineProperty(window, 'location', { configurable: true, value: original })

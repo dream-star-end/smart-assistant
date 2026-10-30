@@ -6548,12 +6548,17 @@ export async function registerCommercial(
             const reason = (job.payload as { reason?: string; turnKey?: string }).reason;
             const turnKey = (job.payload as { turnKey?: string }).turnKey;
             if (!reason || !turnKey) throw new Error("waiver job payload missing reason/turnKey");
-            await applyTurnWaiver(getPool(), {
+            const waiver = await applyTurnWaiver(getPool(), {
               userId: uid,
               turnKey,
               reason: reason as "idle_timeout",
               logger: rootLogger.child({ subsys: "tapeWaiver" }),
             });
+            if (waiver.disposition === 'deferred') {
+              throw new Error(`turn waiver proof pending: ${waiver.reason}`);
+            }
+            // Denied is a completed proposal, with no fence/refund/receipt.
+            // Billing jobs and later settlements retain their actual charges.
           },
         }));
         // Coalesce: a burst of finalizes runs at most one extra tick at a time;

@@ -477,8 +477,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       WHERE request_id=$1`, [toolCall.requestId, 256 * 1024 * 1024 - 1_000_000]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
-    (error: unknown) => error instanceof BoxDurableJournalError
-      && error.code === "BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
+    (error: unknown) => error instanceof Error
+      && (error as Error & { code: string }).code === "BOX_TOOL_ROLLOVER_REQUIRED");
+    // Capacity now rolls a fully validated exchange into a bounded new invocation.
+    // Restore this synthetic claim so the remaining mismatch/normal-resume matrix keeps its original scope.
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxRecoveredBy'-'boxRolloverTo'
+      WHERE request_id=$1`,[toolCall.requestId]);
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxRolloverFrom'-'boxSessionId'-'boxTurnKey'
+      WHERE request_id=$1`,[`box-d-${suffix}`]);
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb(1234::bigint))
       WHERE request_id=$1`, [toolCall.requestId]);

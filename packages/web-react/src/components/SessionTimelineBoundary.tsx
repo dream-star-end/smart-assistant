@@ -67,7 +67,7 @@ export class SessionTimelineBoundary extends Component<Props, State> {
                 this.props.onRetry?.();
               }}
             >
-              重试
+              继续
             </button>
           )}
         </div>
