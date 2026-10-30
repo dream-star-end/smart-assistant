@@ -9584,6 +9584,38 @@
           "assertion": "[box-stopped-recovery-claim] PASS"
         }
       ]
+    },
+    {
+      "id": "INC-20261030-TAPE-JOB-RETRY",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "turn_tape 物化超过8次进入failed后仍按小时重领，attempt达到1355/1310；结算第30次失败仍写queued冷重试，failed及超时held均无作业告警。修复：两类failed终态停止自动认领，结算30次封顶；按job+UTC日去重通知failed、awaiting_materialization超过1h和late_tape_after_fence超过24h。保留held栅栏、计费字节与账目，不自动补物化。",
+      "rootFixCommit": "345633d7b22fd36e0c0b4bfa2cb4db6e5e649591",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts",
+          "assertion": "materialization stops at eight attempts and old failed jobs are never reclaimed"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnTapeJobs.integ.test.ts",
+          "assertion": "settlement stops at thirty attempts while preserving verification and lease fencing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/tapeJobScheduler.test.ts",
+          "assertion": "daily keys survive scans, reason changes and restart, and roll at UTC midnight"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key"
+        }
+      ],
+      "coverageCommits": [
+        "f978157d"
+      ]
     }
   ]
 }
