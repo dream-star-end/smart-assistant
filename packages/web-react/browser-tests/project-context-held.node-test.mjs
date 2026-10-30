@@ -15,7 +15,7 @@ import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.m
 // not read the session's project from the master, so it held the turn before
 // dispatch (outbound.error project_context_unavailable + [error] final, exactly
 // the frames server.ts sends). The page must say why, say nothing ran or was
-// billed, and offer one retry that resends the same message, which then runs.
+// billed, and offer one Continue that preserves the goal and context without replaying it.
 // OC_PROJECT_HELD_RED=1 removes the code's copy from pure.ts/render.ts, i.e. a
 // client that does not know the hold, and must fail.
 const require = createRequire(import.meta.url);
@@ -27,7 +27,7 @@ const renderPath = resolve(here, "../src/lib/chat/render.ts");
 const red = process.env.OC_PROJECT_HELD_RED === "1";
 let transformCount = 0;
 
-test("INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it", { timeout: 180000 }, async (t) => {
+test("INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one same-session Continue runs it", { timeout: 180000 }, async (t) => {
   const assetDir = mkdtempSync(join(tmpdir(), "oc-project-held-browser-"));
   await build({
     entryPoints: [join(here, "process-disclosure-app-harness.tsx")], bundle: true,
@@ -64,20 +64,28 @@ test("INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and 
       const id = frame.clientMessageId;
       const peer = { id: BOARD_SESSION, kind: "dm" };
       const sessionKey = `agent:main:webchat:dm:${BOARD_SESSION}`;
-      scenario.sent.push({ id, text: frame.content.text });
+      scenario.sent.push(frame);
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
       const ts = Date.now();
       if (scenario.sent.length === 1) {
         // First attempt: master unreachable, turn held before dispatch.
-        send({ type: "outbound.error", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, code: "project_context_unavailable", message: "项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。", isFinal: false, ts });
+        preview.store.board = [
+          { id, role: "user", text: frame.content.text, status: "error", ts, _source: "server",
+            _routing: { model: "glm-5.2", teamMode: false, effortLevel: "high" } },
+          { id: `held-${id}`, role: "assistant", text: "", ts: ts + 1, _source: "server",
+            _errorCode: "project_context_unavailable", _clientMessageId: id },
+        ];
+        scenario.original = structuredClone(preview.store.board);
+        preview.store.revision += 1;
+        send({ type: "outbound.error", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, code: "project_context_unavailable", message: "项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后在当前会话继续。", isFinal: false, ts });
         send({ type: "outbound.message", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, blocks: [{ kind: "text", text: "[error] PROJECT_CONTEXT_UNAVAILABLE" }], isFinal: true, ts: ts + 1 });
         return;
       }
-      // Retry: master is back, the turn runs normally.
-      preview.store.board = structuredClone([
-        { id, role: "user", text: frame.content.text, status: "completed", ts, _source: "server" },
+      // The user's follow-up goes through normal admission in the same session.
+      preview.store.board.push(
+        { id, role: "user", text: frame.content.displayText, _modelText: frame.content.text, status: "completed", ts, _source: "server" },
         { id: `reply-${id}`, role: "assistant", text: "PROJECT_TURN_RAN", status: "completed", ts: ts + 1, _source: "server", _clientMessageId: id },
-      ]);
+      );
       preview.store.revision += 1;
       send({ type: "outbound.message", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, blocks: [{ kind: "text", text: "PROJECT_TURN_RAN" }], isFinal: true, ts: ts + 1 });
     });
@@ -85,7 +93,7 @@ test("INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and 
   let browser;
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
-    for (const width of [1280, 390]) await t.test(`${width} held turn card, then one retry runs`, async () => {
+    for (const width of [1280, 390]) await t.test(`${width} held turn card, then one Continue runs`, async () => {
       scenario = { sent: [], seq: 0 };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
@@ -100,12 +108,20 @@ test("INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and 
         assert.equal(await page.getByText("项目信息暂未加载", { exact: true }).count(), 1, "one held-turn card");
         assert.match(body, /还没有开始，也不会计费/, "the card says nothing ran and nothing was billed");
         assert.doesNotMatch(body, /「重试」|「重新尝试」/, "the card does not name a button that may not be the one shown");
-        const retry = page.getByRole("button", { name: /重试|重新尝试/ });
-        assert.equal(await retry.count(), 1, "exactly one retry button");
+        const retry = page.getByRole("button", { name: "继续", exact: true });
+        assert.equal(await retry.count(), 1, "exactly one Continue button");
         await retry.click();
         await page.getByText("PROJECT_TURN_RAN").first().waitFor({ timeout: 15000 });
-        assert.equal(scenario.sent.length, 2, "the retry resent once");
-        assert.equal(scenario.sent[1].text, "PROJECT_HELD_REQUEST", "the retry resent the same message");
+        assert.equal(scenario.sent.length, 2, "one source plus one human follow-up");
+        const follow = scenario.sent[1];
+        assert.equal(follow.peer.id, BOARD_SESSION);
+        assert.notEqual(follow.clientMessageId, scenario.sent[0].clientMessageId);
+        assert.equal(follow.content.displayText, "继续");
+        assert.equal(follow.content.recovery, undefined, "manual Continue uses normal admission");
+        assert.notEqual(follow.content.text, "PROJECT_HELD_REQUEST");
+        assert.match(follow.content.text, /PROJECT_HELD_REQUEST/);
+        assert.match(follow.content.text, /不要重新执行已经完成的步骤/);
+        assert.deepEqual(preview.store.board.slice(0, scenario.original.length), scenario.original);
         assert.deepEqual(errors, []);
         console.log("PROJECT_HELD_RECEIPT", JSON.stringify({ width, cards: 1, retries: 1, red, transformCount }));
       } catch (error) {

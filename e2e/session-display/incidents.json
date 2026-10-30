@@ -1338,7 +1338,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
-          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
+          "assertion": "historical pending waiver refunds only the exact 259-credit turn to original personal buckets and sends once"
         },
         {
           "layer": "integration",
@@ -3642,7 +3642,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/cards.test.tsx",
-          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+          "assertion": "a deleted session never defaults to creating another conversation or replaying"
         },
         {
           "layer": "deploy-gate",
@@ -4085,7 +4085,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         },
         {
           "layer": "deploy-gate",
@@ -6423,7 +6423,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
-          "assertion": "exactly one retry button"
+          "assertion": "exactly one Continue button"
         },
         {
           "layer": "unit",
@@ -6899,7 +6899,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
-          "assertion": "the card does not name a button that is not there"
+          "assertion": "one Continue instead of replaying completed work"
         },
         {
           "layer": "unit",
@@ -7020,7 +7020,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
-          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it"
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one same-session Continue runs it"
         }
       ]
     },
@@ -9336,7 +9336,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         }
       ]
     },
@@ -9545,6 +9545,122 @@
           "path": "scripts/check-v5-delegate-billing-requestid.ts",
           "assertion": "[box-agent-default-temperature] PASS"
         }
+      ]
+    },
+    {
+      "id": "INC-20261030-LONGTASK-CONTINUE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "商业回合 #21fdeea1 已有128条成功请求、273352输出tokens，物理Box进程第128轮之后被BOX_TOOL_ROUND_LIMIT截断；续签后的lease未进入gateway自动重试，重试带初始旧lease而报MODEL_AUTHORITY_EXPIRED，最终把已产出的128条请求整轮退款5543积分。修复保持每个物理进程128轮/4h/256MiB边界，在完整exchange/authority/计费身份校验后durably认领继承者，原keeper真实停止证明落库后，从现有历史和已完成工具结果开启新代；保留Stop优先、容量、未知不重发及跨代idle证明。历史已退款不回收。续签共享authority保存最新短票、活跃dispatch严格续期；未来整轮免单只认完整的零产出和结算证据。所有当前错误/中断执行入口统一在原会话继续，零产出同样适用，保留原目标、已完成步骤、路由和费用。 商业保留现有Alert卡与Grok/规范化行为，正式v5-ops CI及冻结candidate门实跑。",
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts",
+          "assertion": "260 paid-result boundaries span three bounded generations and finish idle"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.test.ts",
+          "assertion": "resource boundaries apply to one generation and reserve a complete next message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.test.ts",
+          "assertion": "only a durable stopped generation reaches fresh launch; unknown and cancellation keep the claim"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxUserStopHandler.test.ts",
+          "assertion": "an authenticated Stop durably cancels the rollover gap before looking for another run"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/boxLongtaskGate.test.ts",
+          "assertion": "long-task release proof rejects silent skip, missing behavior, truncation and false exit-zero TAP"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-longtask.ts",
+          "assertion": "[biz-longtask-box-generations] PASS — 260 requests span 128/128/4 physical generations; proven stops preserve prior usage, gap cancellation and capacity fences hold, and final idle converges"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalTurnLeaseRenew.test.ts",
+          "assertion": "active exact dispatch recovers expired lease after 24h with strict legacy wire"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/masterTurnLease.test.ts",
+          "assertion": "retry refresh saves the latest lease before any subprocess hot-update"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbAdapterTurnParity.test.ts",
+          "assertion": "authority synthetic diagnostic preserves earlier answer in the same segment"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/turnWaiverPolicy.test.ts",
+          "assertion": "pending canonical engine usage denies before billing job execution (r1 regression)"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "r1: positive canonical engine usage denies before and after its billing job"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
+          "assertion": "historical applied authority waiver keeps its receipt and is never recaptured"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/useChatCardActionsContinuation.test.tsx",
+          "assertion": "double clicks hydrate and submit only once; late hydration cannot cross sessions"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/manualTaskContinuation.test.ts",
+          "assertion": "a failed user row continues its own first or second goal"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/longtask-continue.node-test.mjs",
+          "assertion": "t1360u real App: paid and zero-output tasks continue in the original conversation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "an admitted manual checkpoint retires the old failed UserCard through running and success"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/manualTaskContinuationChunkFailure.test.tsx",
+          "assertion": "a failed Continue chunk reports once and never falls back to task replay or send"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "manual checkpoint preserves the paid partial answer through completion and reload"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "a manually continued diagnostic-only error does not become a saved answer"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxToolRollover.integ.test.ts",
+          "assertion": "a mutable recovery alias cannot reintroduce 128 retired paid rows into idle"
+        }
+      ],
+      "rootFixCommit": "010fbb0d",
+      "coverageCommits": [
+        "4ec36bd4",
+        "b88d52f2",
+        "b6d8511d",
+        "6677f862",
+        "c9d3443e"
       ]
     },
     {

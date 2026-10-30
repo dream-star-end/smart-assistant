@@ -98,7 +98,7 @@
       "mediaKey": "github-repository",
       "mediaVersion": 2,
       "registryHash": "d2a4d08cdbe9fe8f304ce573f8c818d55007b22f60680c6f5225b59cfc4b6d40",
-      "sourceHash": "a0c22540edeba6a551077ada754075407af494ff5e9abe84903c444a4fe74656"
+      "sourceHash": "04b6ea9dabe641d429a76addd037b5e0b7499c05fc3fdde2dbe5634e9529641f"
     },
     "image-create-edit": {
       "contentHash": "c540c520a658661ef339bdcdea74c6c8d6b7681ae4786a8c109fc9c54b0a6026",
@@ -118,7 +118,7 @@
       "mediaKey": "inbox",
       "mediaVersion": 2,
       "registryHash": "a8a5a10f6db81c8adae5e129d9df1b6d8165d09edcbab9c7ac845ae833303d15",
-      "sourceHash": "8687c33af096bff05e3f114ecbe43ca9b3c4f843037fff1ecca6ec3232137b18"
+      "sourceHash": "196b0a015e658e4b7569972325c1ef340d6f8899198a2cf36c597af117b5764d"
     },
     "marketplace-discovery": {
       "contentHash": "77a9027ba94ce27285b8d2f7c14c6a572b62582f5d986c89a2605ee9567cd4e4",

@@ -22,7 +22,7 @@ describe("RepoStatusBanner", () => {
     render(
       <RepoStatusBanner selection={failed} progressPct={0} onDismiss={() => {}} onRetry={onRetry} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 

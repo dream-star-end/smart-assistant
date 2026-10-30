@@ -1512,7 +1512,7 @@ function PreviewError({
         {retryable && (
           <button type="button" onClick={onRetry} className="preview-primary-button mx-auto mt-3.5">
             <RefreshCw size={16} />
-            重新连接
+            继续
           </button>
         )}
         <details className="preview-error-details group">

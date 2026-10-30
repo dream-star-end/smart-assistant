@@ -42,6 +42,7 @@ import {
 } from "../lib/chat/render";
 import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
+import { collectRecoveredTurnStatusRecordIds } from "../lib/chat/manualTaskContinuation";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
@@ -707,7 +708,7 @@ function DeferredTapeRecordCard({
           }}
           className="text-muted underline-offset-2 hover:text-fg hover:underline"
         >
-          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
+          {isUserPayload ? "完整用户消息加载失败，点击继续" : "真实记录加载失败，点击继续"}
         </button>
       ) : (
         <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
@@ -875,7 +876,9 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
       for (const id of pending) ids.add(id);
       pending = [];
     }
-    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+    // A retired notice must not take its saved answer into a collapsed process
+    // when the continuation replies. Only the notice was consumed by Continue.
+    if (isErroredAssistant(message) && !isErrorCardHeldWithAnswer(message) && message.id) pending.push(message.id);
   }
   return ids;
 }
@@ -1484,7 +1487,7 @@ export type MessageListArchive = {
   archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
-  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
+  /** 上次云端加载失败(按钮转「加载失败，点击继续」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
@@ -2153,6 +2156,7 @@ export function MessageList({
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
+  const recoveredStatusRecordIds = collectRecoveredTurnStatusRecordIds(safeMessages);
   // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. Automatic
   // and manual children are both hidden. While a child exists, its source
@@ -2185,11 +2189,22 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
+  // A manual continuation retires the notice, never the work stored on its row.
+  // Project a held card for display only: a frozen/raw snapshot remains intact,
+  // and the existing errorPresentation rules still decide whether text is an
+  // answer or a diagnostic. Keeping the row also preserves its exact usage.
+  const continuationViewMessages = safeMessages.map((message): ChatMessage =>
+    message.role === "assistant" && !!message._errorCode &&
+    typeof message._clientMessageId === "string" &&
+    manuallyContinuedSourceIds.has(message._clientMessageId)
+      ? { ...message, _errorHeldForRecovery: true, _errorCardSnapshot: { disposition: "silent" } }
+      : message,
+  );
   // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
   // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
   // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
   const turnLineageParents = turnRecoveryParents(safeMessages);
-  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
+  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(continuationViewMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -2213,6 +2228,7 @@ export function MessageList({
       ) &&
       !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
       !isRedundantRuntimeEnvelope(m) &&
+      !recoveredStatusRecordIds.has(m.id) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
   ))), turnLineageParents);
@@ -2255,6 +2271,9 @@ export function MessageList({
       )
       .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
   );
+  // A manual child has taken over this failure even when its retired assistant
+  // card is no longer visible. Do not resurrect the old user's failed-send CTA.
+  for (const sourceId of manuallyContinuedSourceIds) presentedErrorTurnIds.add(visibleErrorTurnId(sourceId));
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,
@@ -2661,7 +2680,7 @@ export function MessageList({
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
           : liveAttention === "error"
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : "加载更早的处理步骤"}
       </button>
     </div>
@@ -2846,7 +2865,7 @@ export function MessageList({
           : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
           : windowStart === 0 && archive?.error
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : windowStart > 0
               ? `查看更早历史记录（还有 ${windowStart} 条）`
               : legacyArchivedRemaining > 0
@@ -3101,7 +3120,7 @@ export function MessageList({
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
                 : archive?.error
-                  ? <span className="text-danger">加载失败，点击重试</span>
+                  ? <span className="text-danger">加载失败，点击继续</span>
                   : "搜更早"}
             </button>
           </div>

@@ -253,7 +253,7 @@ describe("InboxDialog", () => {
     render(<InboxDialog open auth={auth} onClose={() => {}} onUnreadChange={() => {}} />);
     expect(await screen.findByText("加载站内信失败")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
     expect(await screen.findByText("标题1")).toBeInTheDocument();
   });
 });

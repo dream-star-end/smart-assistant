@@ -7,6 +7,7 @@
 import type { BlogDraft } from "../components/tutorials/blog/blogLib";
 import { tutorialHref } from "./useAppRoute";
 import { useCallback, useMemo, useRef } from "react";
+import { identityIsCurrent, type ResolvedIdentity } from "../lib/resolvedIdentity";
 import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
@@ -16,7 +17,8 @@ import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
-import { preciseRetryEligible, interruptedContinuationTarget } from "../lib/chat/socket";
+import { preciseRetryEligible } from "../lib/chat/socket";
+import { manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
 import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
@@ -49,6 +51,7 @@ export type ChatCardActionsInput = {
   activeId: string | undefined;
   agent: Agent;
   authRef: React.RefObject<AuthSession>;
+  identity: ResolvedIdentity | null;
   chat: UseChatSocket;
   chipsBoardProjectId: string | null;
   chipsProjectName: string;
@@ -87,6 +90,7 @@ export function useChatCardActions({
   activeId,
   agent,
   authRef,
+  identity,
   chat,
   chipsBoardProjectId,
   chipsProjectName,
@@ -338,22 +342,29 @@ export function useChatCardActions({
     (error: ChatMessage): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return interruptedContinuationTarget(msgs, error, activeId)?.user;
+      return manualTaskContinuationSource(msgs, error);
     },
     [demo, activeId],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
+  const pendingContinuations = useRef(new Set<string>());
   const continueInterrupted = useCallback(
-    (error: ChatMessage) => {
-      if (demo || !activeId) return;
-      sockRef.current?.continueInterruptedTurn({
-        sessId: activeId,
-        errorMessageId: error.id,
-        agentId: agent.id,
-      });
+    async (error: ChatMessage) => {
+      if (demo || !activeId || activeSessionRef.current !== activeId) return;
+      if (!identity || !identityIsCurrent(identity, authRef.current)) return;
+      let action: typeof import("./manualTaskContinuationAction");
+      try {
+        action = await import("./manualTaskContinuationAction");
+      } catch {
+        if (activeSessionRef.current === activeId && identityIsCurrent(identity, authRef.current)) {
+          toast("继续功能加载失败，请稍后再试", "error");
+        }
+        return;
+      }
+      await action.continueManualTask({ activeId, demo, identity, authRef, sockRef, send, error,
+        agentId: agent.id, activeSessionRef, pendingContinuations, loadExactOrToast });
     },
-    [demo, activeId, agent.id],
+    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef, toast],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

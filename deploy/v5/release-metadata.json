@@ -194,7 +194,8 @@
     "0326_community_blog",
     "0327_community_tutorial_moderation",
     "0328_community_tutorial_revisions",
-    "0329_media_studio_music"
+    "0329_media_studio_music",
+    "0330_turn_lease_binding"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

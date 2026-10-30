@@ -437,6 +437,9 @@ export type ChatMessage = {
   /** OCV5-459: view-only, set by splitStoppedNarration on a user-stop row: the text the copy button
    * copies (the turn's last text before the Stop). Never persisted. */
   _stopCopyText?: string;
+  /** View-only, non-enumerable ID minted by splitStoppedNarration. The ID alone
+   * grants no continuation: its in-memory canonical-source proof must match. */
+  _continuationSourceId?: string;
   /** Exact logical order inside one immutable physical tape record. */
   _timelineLogicalOrdinal?: number;
   /** Server-authored lifecycle stamp (OCV5-21). Absent on legacy rows. */

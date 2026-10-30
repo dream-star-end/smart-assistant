@@ -11,7 +11,7 @@ import { sign as cryptoSign, generateKeyPairSync } from 'node:crypto'
 import { describe, it } from 'node:test'
 
 import {
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
+  TURN_LEASE_TTL_MS,
   AUTHORITY_TTL_MS,
   type JsonValue,
   MODEL_AUTHORITY_FIELD,
@@ -457,12 +457,12 @@ describe('verifyTurnLease + assertLeaseMatchesAuthority', () => {
     assert.ok(verifyTurnLease(signLeaseEnvelope(l), keyring, t))
   })
 
-  it('滚动续签保持 originalIssuedAt，可用到 12h 绝对上限前', () => {
+  it('滚动续签跨过 24h，单张 lease 仍只具有短窗口', () => {
     const originalIssuedAt = NOW
     const renewed = makeLease({
       originalIssuedAt,
-      issuedAt: NOW + 11 * 60 * 60_000,
-      expiresAt: originalIssuedAt + AUTHORITY_TURN_MAX_LIFETIME_MS,
+      issuedAt: NOW + 24 * 60 * 60_000,
+      expiresAt: NOW + 24 * 60 * 60_000 + TURN_LEASE_TTL_MS,
     })
     const verified = verifyTurnLease(
       signLeaseEnvelope(renewed),
@@ -480,19 +480,37 @@ describe('verifyTurnLease + assertLeaseMatchesAuthority', () => {
     assert.equal(turnLeaseOriginalIssuedAt(verified), legacy.issuedAt)
   })
 
-  it('拒绝倒置时间窗口和越过 12h 绝对上限的签名 lease', () => {
+  it('拒绝倒置时间窗口和单张超过 50min 的签名 lease', () => {
     const cases: TurnLease[] = [
       makeLease({ originalIssuedAt: NOW + 1, issuedAt: NOW }),
       makeLease({ originalIssuedAt: NOW, issuedAt: NOW + 10, expiresAt: NOW + 10 }),
       makeLease({
         originalIssuedAt: NOW,
         issuedAt: NOW + 60_000,
-        expiresAt: NOW + AUTHORITY_TURN_MAX_LIFETIME_MS + 1,
+        expiresAt: NOW + 60_000 + TURN_LEASE_TTL_MS + 1,
       }),
     ]
     for (const lease of cases) {
       expectCode(() => verifyTurnLease(signLeaseEnvelope(lease), keyring, NOW), 'BadShape')
     }
+  })
+
+  it('只有显式 renewal 验签允许过期，签名和窗口校验仍不可绕过', () => {
+    const lease = makeLease()
+    const expiredAt = lease.expiresAt + 1
+    const envelope = signLeaseEnvelope(lease)
+    expectCode(() => verifyTurnLease(envelope, keyring, expiredAt), 'Expired')
+    assert.deepEqual(verifyTurnLease(envelope, keyring, expiredAt, { allowExpired: true }), lease)
+    const tampered = JSON.parse(Buffer.from(envelope, 'base64url').toString('utf8'))
+    tampered.payload.uid += 1
+    expectCode(
+      () => verifyTurnLease(Buffer.from(JSON.stringify(tampered)).toString('base64url'), keyring, expiredAt, { allowExpired: true }),
+      'VerifyFail',
+    )
+    expectCode(
+      () => verifyTurnLease(signLeaseEnvelope(makeLease({ expiresAt: NOW + TURN_LEASE_TTL_MS + 1 })), keyring, expiredAt, { allowExpired: true }),
+      'BadShape',
+    )
   })
 
   it('绑定字段任一不一致 → LeaseMismatch', () => {

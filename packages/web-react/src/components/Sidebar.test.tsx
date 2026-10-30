@@ -1786,7 +1786,7 @@ describe("Sidebar S-08 加载更早会话失败可重试", () => {
   it("loadMoreError 时显示重试按钮，点击调用 onLoadMore", () => {
     const onLoadMore = vi.fn();
     renderSidebar({ sessions: listSessions, hasMore: true, loadMoreError: true, onLoadMore });
-    const retry = screen.getByRole("button", { name: /加载更早会话失败，点击重试/ });
+    const retry = screen.getByRole("button", { name: /加载更早会话失败，点击继续/ });
     fireEvent.click(retry);
     expect(onLoadMore).toHaveBeenCalledTimes(1);
   });
@@ -1794,7 +1794,7 @@ describe("Sidebar S-08 加载更早会话失败可重试", () => {
   it("加载中优先显示「加载更多…」，无错误时不出现重试", () => {
     renderSidebar({ sessions: listSessions, hasMore: true, loadingMore: true, loadMoreError: true });
     expect(screen.getByText("加载更多…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /点击重试/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /点击继续/ })).toBeNull();
   });
 });
 

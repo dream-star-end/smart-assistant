@@ -345,7 +345,7 @@ describe("AttachChip 触控尺寸、失败原因与文件名截断", () => {
   test("移除 / 重试在触屏下 44px;失败原因就地可见;文件名中段截断保留扩展名", () => {
     render(<AttachChip a={errored} onRemove={() => {}} onRetry={() => {}} />);
     expect(screen.getByRole("button", { name: `移除 ${errored.name}` })).toHaveClass("[@media(hover:none)]:size-11");
-    expect(screen.getByLabelText(`重试上传 ${errored.name}`)).toHaveClass("[@media(hover:none)]:min-h-11");
+    expect(screen.getByLabelText(`继续上传 ${errored.name}`)).toHaveClass("[@media(hover:none)]:min-h-11");
     expect(screen.getByRole("status")).toHaveTextContent("文件超过 20 MB");
     const shown = screen.getByText(/…/).textContent ?? "";
     expect(shown.endsWith(".sketch")).toBe(true);
@@ -390,7 +390,7 @@ describe("发送键禁用原因可见(C-10)", () => {
     const file = new File(["x"], "fail.txt", { type: "text/plain" });
     Object.defineProperty(input, "files", { value: [file], configurable: true });
     fireEvent.change(input);
-    await waitFor(() => expect(screen.getByLabelText("重试上传 fail.txt")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("继续上传 fail.txt")).toBeInTheDocument());
     expect(screen.getByTestId("composer-send-blocked-reason")).toHaveTextContent("有附件上传失败");
     fireEvent.click(screen.getByRole("button", { name: "移除 fail.txt" }));
     expect(screen.queryByTestId("composer-send-blocked-reason")).toBeNull();
@@ -415,7 +415,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRetry={onRetry}
       />,
     );
-    const btn = screen.getByLabelText("重试上传 report.pdf");
+    const btn = screen.getByLabelText("继续上传 report.pdf");
     fireEvent.click(btn);
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
@@ -427,7 +427,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 a.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 a.txt")).toBeNull();
   });
 
   test("done 态不显示「重试」", () => {
@@ -437,7 +437,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 b.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 b.txt")).toBeNull();
   });
 
   test("error 态但未传 onRetry（如无持有 File）→ 不渲染重试按钮", () => {
@@ -447,7 +447,7 @@ describe("AttachChip（附件 chip 上传失败重试）", () => {
         onRemove={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("重试上传 c.txt")).toBeNull();
+    expect(screen.queryByLabelText("继续上传 c.txt")).toBeNull();
   });
 });
 
@@ -526,13 +526,13 @@ describe("附件 error 态不得静默发送", () => {
     });
     fireEvent(screen.getByPlaceholderText("给从简发消息…"), event);
 
-    await waitFor(() => expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("继续上传 fail-probe.png")).toBeInTheDocument());
     fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "带附件发送" } });
     const send = screen.getByRole("button", { name: "发送" });
     expect(send).toBeDisabled();
     expect(send).toHaveAttribute("title", "有附件上传失败，请重试或移除后再发送");
     fireEvent.click(send);
     expect(onSend).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("重试上传 fail-probe.png")).toBeInTheDocument();
+    expect(screen.getByLabelText("继续上传 fail-probe.png")).toBeInTheDocument();
   });
 });

@@ -574,7 +574,7 @@ function AssetsError({ error, onReload }: { error: string; onReload: () => void 
       tone="danger"
       action={
         <Button size="sm" variant="secondary" onClick={onReload}>
-          重试
+          继续
         </Button>
       }
     >

@@ -174,7 +174,9 @@ before(async () => {
   await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT,
+    request_id TEXT,
     turn_key TEXT,
+    parent_turn_key TEXT,
     status TEXT,
     output_tokens BIGINT NOT NULL DEFAULT 0,
     cache_read_tokens BIGINT NOT NULL DEFAULT 0

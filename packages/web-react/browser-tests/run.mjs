@@ -12,7 +12,7 @@
 //   T3 选文件后 chip 出现且非 error 态(onUpload stub → done);
 //   T4 file input 结构红线:type=file / 无 accept / 计算样式非 display:none / tabindex=-1
 //      (国产内核约束 61de46e2/de16e2be 的真浏览器断言);
-//   T5 惰性 user sidecar 在真 viewport 水合为原文，重试收到同一份精确 payload;
+//   T5 惰性 user sidecar 在真 viewport 水合为原文，继续保留精确目标与附件、不重放原请求;
 //   T6 惰性 Agent tape record 水合为真实 ToolCard，不显示 locator 替身;
 //   T7 点「+」→「设定目标」→ 目标对话框弹出(同菜单的第二入口回归对照)。
 //   T8 统一时间线上滑零请求，显式点击只取一页，虚拟 remount 不重取;
@@ -669,7 +669,7 @@ await check("T2 「+」菜单不再含「添加附件」且不常驻挡住输入
 
 await check("T3 选文件后 chip 出现且非 error 态(stub 上传 → done)", async () => {
   await page.getByRole("button", { name: "移除 attach-probe.txt" }).waitFor({ state: "visible", timeout: 3000 });
-  const retry = await page.getByRole("button", { name: "重试上传 attach-probe.txt" }).count();
+  const retry = await page.getByRole("button", { name: "继续上传 attach-probe.txt" }).count();
   if (retry !== 0) throw new Error("chip 进入了 error 态(出现重试按钮),stub 上传本应 done");
   const uploads = await page.evaluate(() => window.__uploads);
   if (!uploads.includes("attach-probe.txt")) throw new Error(`onUpload 未收到文件: ${JSON.stringify(uploads)}`);
@@ -727,7 +727,7 @@ await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
     throw new Error(`图片 paste 未阻止默认行为:${JSON.stringify(pasteResult)}`);
   }
   await page.getByRole("button", { name: "移除 paste-probe.png" }).waitFor({ state: "visible", timeout: 3000 });
-  const retry = await page.getByRole("button", { name: "重试上传 paste-probe.png" }).count();
+  const retry = await page.getByRole("button", { name: "继续上传 paste-probe.png" }).count();
   if (retry !== 0) throw new Error("粘贴图片 chip 进入了 error 态");
   const state = await page.evaluate(() => ({
     value: document.querySelector("textarea")?.value,
@@ -739,20 +739,26 @@ await check("T27 输入框粘贴 PNG 直接上传为图片附件", async () => {
   }
 });
 
-await check("T5 惰性 user sidecar 水合为原文且重试收到精确 payload", async () => {
+await check("T5 惰性 user sidecar 水合后继续保留精确目标与附件", async () => {
   const root = page.locator("#timeline-user-root");
   await root.getByText("EXACT_DEFERRED_USER_MARKER").waitFor({ state: "visible", timeout: 3000 });
-  await root.getByRole("button", { name: "重试" }).click();
+  await root.getByRole("button", { name: "继续", exact: true }).click();
   const state = await page.evaluate(() => window.__lazyTimeline);
   if (state.userFetches !== 1) throw new Error(`user payload fetch 次数=${state.userFetches},应为 1`);
+  const { continuationText, ...original } = state.userContinuation ?? {};
   const expected = JSON.stringify({
     id: "deferred-user-probe",
     text: "EXACT_DEFERRED_USER_MARKER",
     modelText: "EXACT_MODEL_VISIBLE_PROMPT",
     retryFilename: "exact-retry.txt",
   });
-  if (JSON.stringify(state.userRetry) !== expected) {
-    throw new Error(`重试未收到精确 user payload:${JSON.stringify(state.userRetry)}`);
+  if (JSON.stringify(original) !== expected) {
+    throw new Error(`继续未保留精确 user payload:${JSON.stringify(state.userContinuation)}`);
+  }
+  if (continuationText === "EXACT_MODEL_VISIBLE_PROMPT" ||
+      !continuationText?.includes("EXACT_MODEL_VISIBLE_PROMPT") ||
+      !continuationText?.includes("不要重新执行已经完成的步骤")) {
+    throw new Error(`继续误重放原请求或丢失精确目标:${JSON.stringify(state.userContinuation)}`);
   }
 });
 
@@ -3287,15 +3293,18 @@ await check("T38 社区教程真浏览器：公开阅读只读，用户投稿进
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
 });
 
-await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async () => {
+await check("T40 390px 失败轮只有一个保留原任务上下文的继续出口", async () => {
   await page.setViewportSize({ width: 390, height: 844 });
   const root = page.locator("#error-ux-root");
   await root.getByText("你是什么模型", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   const text = await root.textContent() ?? "";
   if (text.includes("发送失败")) throw new Error("用户行仍重复展示发送失败");
   if (text.includes("GPT")) throw new Error("供应商路由名仍暴露给用户");
-  if (await root.getByRole("button", { name: "重试", exact: true }).count() !== 1) {
-    throw new Error("失败轮没有收敛为唯一重试入口");
+  if (await root.getByRole("button", { name: "继续", exact: true }).count() !== 1) {
+    throw new Error("失败轮没有收敛为唯一继续入口");
+  }
+  if (await root.getByRole("button", { name: /^(重试|重新尝试|重新发送)$/ }).count() !== 0) {
+    throw new Error("失败轮仍提供原任务重发入口");
   }
   // W3:原始错误码只在收起的「技术详情」里,默认视图不出现码和请求 ID。
   const alert = root.getByRole("alert");
@@ -3311,9 +3320,13 @@ await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async 
   const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
   if (overflows) throw new Error("错误轮在 390px 视口发生横向溢出");
 
-  await root.getByRole("button", { name: "重试", exact: true }).click();
-  if (await page.evaluate(() => window.__errorUxRetries) !== 1) {
-    throw new Error("唯一重试入口没有精确触发一次重发");
+  await root.getByRole("button", { name: "继续", exact: true }).click();
+  const continuations = await page.evaluate(() => window.__errorUxContinuations);
+  if (continuations.length !== 1 || continuations[0].sourceId !== "browser-error-ux-user" ||
+      continuations[0].displayText !== "继续" || continuations[0].text === "你是什么模型" ||
+      !continuations[0].text.includes("你是什么模型") ||
+      !continuations[0].text.includes("不要重新执行已经完成的步骤")) {
+    throw new Error(`继续没有精确保留原任务上下文:${JSON.stringify(continuations)}`);
   }
   if (DEFAULT_VIEWPORT) await page.setViewportSize(DEFAULT_VIEWPORT);
 });
