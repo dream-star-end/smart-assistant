@@ -628,14 +628,14 @@ export class BoxDurableJournal implements BoxJournalPort {
       await lock(client, [`box:session:${input.uid}:${sessionId}`]);
       if (input.replacing !== undefined) {
         const parent = await client.query<{ ctx: Record<string, unknown> }>(
-          `SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          "SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE",
           [input.requestId, input.uid.toString()]);
         const ctx = parent.rows[0]?.ctx;
         if (!ctx || ctx.boxRecoveredBy !== input.replacing) {
           await client.query("ROLLBACK"); committed = true; return false;
         }
         const holder = await client.query<{ state: string; ctx: Record<string, unknown> }>(
-          `SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE",
           [input.replacing, input.uid.toString()]);
         if (!(await orphanRecoveryHolderIsStale(client.query.bind(client), input.uid, ctx, holder.rows[0]))) {
           await client.query("ROLLBACK"); committed = true; return false;

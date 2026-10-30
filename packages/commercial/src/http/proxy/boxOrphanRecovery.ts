@@ -28,14 +28,14 @@ export async function orphanRecoveryHolderIsStale(query: Query, uid: bigint,
     || ["boxToolHandoff", "boxReplayMessage", "boxOwnerRequestId", "boxResumeRequestId",
       "boxRecoveredBy"].some((key) => ctx[key] !== undefined)) return false;
   try {
-    const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n", {
+    const proof = parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`, {
       runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
     if (proof.reason !== "keeper_stopped" && proof.reason !== "worker_failed") return false;
   } catch { return false; }
   const billing = parseBoxBillingContext(ctx.boxBillingContext);
   if (!billing?.dispatchId) return false;
   const dispatch = await query(
-    `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
+    "SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2",
     [uid.toString(), billing.dispatchId]);
   return dispatch.rows[0]?.status === "terminal";
 }

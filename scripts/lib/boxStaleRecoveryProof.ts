@@ -25,7 +25,9 @@ export async function proveStoppedRecoveryClaim(kit: ReadPdfKit): Promise<string
     const parked = kit.boxTurn(api, db, journal, who, name, "a".repeat(64), undefined,
       { dispatchId: ended, nextSpool: kit.spoolOf([kit.cliInit, ...kit.FINAL_ANSWER]) });
     await parked.first();
-    const parent = `${name}-1`, holder = `${name}-2`, next = `${name}-3`;
+    const parent = `${name}-1`;
+    const holder = `${name}-2`;
+    const next = `${name}-3`;
     const stopped = await api.stopCoordinator(journal, parked.host.target).requestStop({
       requestId: parent, uid, accountId: who.containerId,
       runNonce: parked.host.runNonce, leaseEpoch: parked.host.leaseEpoch });
@@ -34,7 +36,8 @@ export async function proveStoppedRecoveryClaim(kit: ReadPdfKit): Promise<string
     if (!await journal.claimOrphanRecovery({ requestId: parent, uid, by: holder })) {
       fail(`STALE_RECOVERY_SETUP_CLAIM_${scenario}`);
     }
-    const nonce = String(index + 1).repeat(24), epoch = String(index + 4).repeat(32);
+    const nonce = String(index + 1).repeat(24);
+    const epoch = String(index + 4).repeat(32);
     const proof = scenario === "complete"
       ? { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }
       : { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
@@ -61,7 +64,8 @@ export async function proveStoppedRecoveryClaim(kit: ReadPdfKit): Promise<string
     if (!answer.includes("done") || parked.host.count.launch !== 2 || parked.host.count.stop !== 1) {
       fail("STALE_RECOVERY_NO_FRESH_ANSWER");
     }
-    const original = await kit.journalRow(db, parent), fresh = await kit.journalRow(db, next);
+    const original = await kit.journalRow(db, parent);
+    const fresh = await kit.journalRow(db, next);
     if (original?.ctx.boxRecoveredBy !== next || fresh?.ctx.boxState !== "terminal") {
       fail("STALE_RECOVERY_CLAIM_NOT_REPLACED");
     }
