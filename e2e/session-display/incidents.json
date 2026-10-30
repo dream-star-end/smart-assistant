@@ -9427,7 +9427,7 @@
       "rootFixCommit": "220fa3e8",
       "coverageCommits": [
         "e82ad871",
-        "2fbe4f86d7f067e3fc9e2980784fb82db8b73496"
+        "2fbe4f86"
       ],
       "regressions": [
         {
@@ -9596,7 +9596,7 @@
       "occurredAt": "2026-10-30",
       "severity": "P1",
       "symptom": "turn_tape 物化超过8次进入failed后仍按小时重领，attempt达到1355/1310；结算第30次失败仍写queued冷重试，failed及超时held均无作业告警。修复：两类failed终态停止自动认领，结算30次封顶；按job+UTC日去重通知failed、awaiting_materialization超过1h和late_tape_after_fence超过24h。保留held栅栏、计费字节与账目，不自动补物化。",
-      "rootFixCommit": "917f5e5318b88b0302e9a1aa8515abe88a88e906",
+      "rootFixCommit": "917f5e53",
       "regressions": [
         {
           "layer": "integration",

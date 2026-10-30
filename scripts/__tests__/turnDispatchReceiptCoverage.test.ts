@@ -63,6 +63,16 @@ describe('extracted turn dispatch receipt source guard', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
       mutate(receipt, 'await casToTerminal(pool, {', 'await unrelatedTerminal(pool, {')), pattern)
   })
+  it('rejects a definitive container rejection being released to the same recovery identity', () => {
+    assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
+      mutate(receipt, 'persisted = await casToTerminal(pool, {',
+        'await releaseRecoveryPreReceipt(pool, {}); persisted = await casToTerminal(pool, {')), pattern)
+  })
+  it('rejects weakening a terminal rejection into a different recovery outcome', () => {
+    assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
+      mutate(receipt, "outcome: 'not_accepted', failureCode: 'DISPATCH_NOT_ACCEPTED'",
+        "outcome: 'not_accepted', failureCode: 'OTHER_REJECTION'")), pattern)
+  })
   it('rejects an enrichment fence that no longer stops a terminalized turn', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
       mutate(receipt, 'if (!context.acceptEnrichmentReceipt(rec)) return true', 'context.acceptEnrichmentReceipt(rec)')), pattern)

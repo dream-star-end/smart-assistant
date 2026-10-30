@@ -78,8 +78,18 @@ export function assertTurnDispatchReceiptCoverage(bridgeSource: string, receiptS
     text(statement.expression.left) === 'disposition' && ts.isStringLiteral(statement.expression.right) &&
     statement.expression.right.text === 'rejected')
   if (!rejected || !ts.isIfStatement(rejected) || !returns(rejected.thenStatement, 'true') ||
-    calls(rejected.thenStatement, 'releaseRecoveryPreReceipt').length !== 1 ||
+    calls(rejected.thenStatement, 'releaseRecoveryPreReceipt').length !== 0 ||
     calls(rejected.thenStatement, 'casToTerminal').length !== 1) fail('rejected receipts must keep durable convergence and be consumed')
+  const terminal = calls(rejected.thenStatement, 'casToTerminal')[0]!
+  const options = terminal.arguments[1]
+  if (text(terminal.arguments[0]!) !== 'pool' || !options || !ts.isObjectLiteralExpression(options)) {
+    fail('rejected receipts must terminalize through the bridge pool')
+  }
+  const fields = new Map(options.properties.filter(ts.isPropertyAssignment).map(property => [text(property.name), text(property.initializer)]))
+  for (const [name, value] of [['dispatchId', 'rec.dispatchId'], ['outcome', "'not_accepted'"],
+    ['failureCode', "'DISPATCH_NOT_ACCEPTED'"], ['fromStatuses', "['admitted']"], ['expectedEpoch', 'rec.leaseEpoch']]) {
+    if (fields.get(name) !== value) fail(`rejected receipts must retain terminal ${name}`)
+  }
   const fence = handler.body.statements.find(statement => ts.isIfStatement(statement) &&
     ts.isPrefixUnaryExpression(statement.expression) && statement.expression.operator === ts.SyntaxKind.ExclamationToken &&
     ts.isCallExpression(statement.expression.operand) && text(statement.expression.operand.expression) === 'context.acceptEnrichmentReceipt' &&
