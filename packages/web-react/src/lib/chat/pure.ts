@@ -796,52 +796,52 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   upstream_timeout: "模型响应超时，你的消息已保留，请重试。",
   network_error: "网络波动导致本轮中断，请重试。",
   context_too_long:
-    "本会话内容已超过模型的上下文上限。可以精简这条消息后重发、点击下方按钮在新会话中继续，或在上方切换支持更长上下文的模型。",
+    "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。",
   request_too_large: "本轮资料未能完整处理，文件和对话均已保留。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──
-  engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",
-  internal_error: "服务遇到内部错误，你的消息已保留，请重试。",
-  auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
+  engine_error: "任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。",
+  internal_error: "服务遇到内部错误，你的消息已保留，可以在当前会话继续。",
+  auth_error: "认证状态异常，本轮未正常完成，可以继续。",
   box_capacity_held: "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。",
   platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
-  service_restart: "服务正在更新，本轮已中断，请重试。",
+  service_restart: "服务正在更新，本轮已中断，可以继续。",
   admission_restart_unexecuted: "本轮尚未开始，消息已保留。自动恢复未完成时，可以重新尝试。",
-  session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
-  session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",
-  durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",
+  session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。可以在当前会话继续。",
+  session_deleted: "这个会话已被删除。请先从回收站恢复，再在原会话继续。",
+  durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击继续。",
   // 精确「重试」与兜底「重新尝试」都可能出现(看原消息是否带 _routing),文案不点名按钮。
-  project_context_unavailable: "这个会话所在项目的指令和文件暂时没有加载出来，本轮还没有开始，也不会计费。请稍后用下方按钮重新发送。",
+  project_context_unavailable: "这个会话所在项目的指令和文件暂时没有加载出来，本轮还没有开始，也不会计费。请稍后在原会话继续。",
   stopped: "本轮生成已停止。",
   user_cancelled: "本轮已取消。",
-  runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
+  runner_crashed: "执行环境意外中断，你的消息已保留，可以在当前会话继续。",
   // ── 免单类(waivable;errorPresentation 走 waiver 分支,此处仅供契约完备 + 兜底展示)──
-  model_authority_expired: "长任务的执行凭证未能继续，本轮不收费，你可以重新尝试。",
+  model_authority_expired: "任务暂时中断，已有进度已保留，可以从断点继续。",
   liveness_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   idle_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   no_response: "任务未能产生有效回复，本轮未扣费。",
   phantom_turn: "任务未能产生有效回复，本轮未扣费。",
-  turn_limit: "任务达到运行上限，系统已中断，本轮不收费。",
+  turn_limit: "任务暂时中断，已有进度已保留，可以从断点继续。",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   // 拒帧可能发生在回合中途(egress 每请求 fence):停止前已完成的调用已经照常计费,只有被拒的
   // 这一次不计费 —— 文案不能说整轮不计费(2026-10-06 一轮 22 次调用 275 积分后被拒,卡片却写
   // 「不计费」)。该码 retryable:false,卡片只会落到「重新尝试」兜底按钮,不会出精确「重试」,
   // 所以按钮名也按实际写。
   model_config_changed_retry_turn:
-    "平台的模型配置刚刚更新，本轮在这里停止。停止前已完成的调用照常计费，被拒的这一次不计费。你的消息没有丢：点「重新尝试」即可原样重发。",
+    "平台的模型配置刚刚更新，本轮在这里停止。停止前已完成的调用照常计费，被拒的这一次不计费。你的消息和已有进度已保留，可以在当前会话继续。",
   // 同一码覆盖：上游满载且明说换模型、grok 路由过期、provider 未配置、catalog 下架（errorClassify OCV5-252）。
   // 文案不能只说「已下架/未开通」——满载是最常见来源，那样写会误导用户以为模型被撤了。
   model_not_available: "这个模型暂时接不了这条请求（可能是上游满载，也可能已下架或未对你的账号开通），请在上方切换一个模型后重发。",
   unresolved_agent_model: "没能确定本轮要用的模型，请在上方选择模型后重发。",
-  model_authority_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
-  model_catalog_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
+  model_authority_unavailable: "模型配置正在同步，请稍后在当前会话继续。",
+  model_catalog_unavailable: "模型配置正在同步，请稍后在当前会话继续。",
   unauthorized_model: "当前账号尚未开通这个模型，请切换模型或联系管理员。",
   // ── 连接/环境 ──
   unauthorized: "登录状态已失效，请重新登录后继续。",
   maintenance: "服务正在维护中，请稍后再试。",
   conn_kicked: "连接曾短暂中断，系统会自动重连并续传，已生成的内容不受影响。",
   // 运行环境已重建:必须**刷新页面**,重试无效(allowPublicServerMessage:服务端 message 指路)。
-  container_outdated: "运行环境已更新，请刷新页面后重新发送（直接重试不会生效）。",
+  container_outdated: "运行环境已更新，请刷新页面后在当前会话继续。",
   err_container: "运行环境出现异常，你的消息已保留，请重试。",
   err_container_timeout: "运行环境响应超时，请重试。",
   err_internal: "服务遇到内部错误，请重试。",

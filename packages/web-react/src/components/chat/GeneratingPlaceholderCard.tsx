@@ -218,7 +218,7 @@ export function GeneratingPlaceholderCard({
                   onClick={onRetry}
                   className="mt-1 inline-flex items-center gap-1 rounded-full bg-hover px-2.5 py-1 text-caption text-fg hover:opacity-90"
                 >
-                  <RotateCcw size={12} /> 重试
+                  <RotateCcw size={12} /> 继续
                 </button>
               )}
             </div>

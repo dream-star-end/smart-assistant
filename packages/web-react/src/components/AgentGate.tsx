@@ -121,7 +121,7 @@ export function AgentGate({
           desc="系统的智能体运行时正在准备中，请稍后再试。"
         >
           <Button variant="secondary" size="md" shape="pill" onClick={onRetry}>
-            <RotateCcw size={15} /> 重试
+            <RotateCcw size={15} /> 继续
           </Button>
         </Panel>
       );
@@ -143,7 +143,7 @@ export function AgentGate({
           }
         >
           <Button variant="secondary" size="md" shape="pill" onClick={onRetry}>
-            <RotateCcw size={15} /> 重试
+            <RotateCcw size={15} /> 继续
           </Button>
         </Panel>
       );

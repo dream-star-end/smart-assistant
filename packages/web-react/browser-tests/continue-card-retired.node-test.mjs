@@ -13,7 +13,7 @@ import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.m
 
 // INC-20261002-CONTINUE-CARD-LINGERS in the real App: a turn fails after a
 // Bash step whose effect is not proven read-only, so recovery is manual. The
-// user clicks 从断点继续 on the committed card; the continuation runs and the
+// user clicks Continue on the committed card; the continuation runs and the
 // card must leave the timeline. OC_CONTINUE_CARD_RED=1 removes only the
 // manual-continuation clause from MessageList and reproduces the incident.
 const require = createRequire(import.meta.url);
@@ -30,7 +30,7 @@ async function until(label, fn, timeout = 15000) {
   throw new Error(`${label}: timed out`);
 }
 
-test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 retires the committed card", { timeout: 180000 }, async (t) => {
+test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on Continue retires the committed card", { timeout: 180000 }, async (t) => {
   const assetDir = mkdtempSync(join(tmpdir(), "oc-continue-card-browser-"));
   await build({
     entryPoints: [join(here, "process-disclosure-app-harness.tsx")], bundle: true,
@@ -69,6 +69,17 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
       const id = frame.clientMessageId;
       const peer = { id: BOARD_SESSION, kind: "dm" };
       const sessionKey = `agent:main:webchat:dm:${BOARD_SESSION}`;
+      if (frame.content?.displayText === "继续" && !recovery) {
+        scenario.normal.push(frame);
+        send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
+        preview.store.board.push({ id, role: "user", text: "继续", _modelText: frame.content.text,
+          status: "replied", ts: Date.now(), _source: "server" },
+          { id: `normal-${id}`, role: "assistant", text: "CONTINUE_NORMAL_AFTER_REFUSAL",
+            ts: Date.now() + 1, _source: "server", _clientMessageId: id });
+        preview.store.revision += 1;
+        return send({ type: "outbound.message", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq,
+          blocks: [{ kind: "text", text: "CONTINUE_NORMAL_AFTER_REFUSAL" }], isFinal: true });
+      }
       if (recovery) {
         scenario.children.push({ id, automatic: recovery.automatic, mode: recovery.mode, source: recovery.sourceClientMessageId });
         if (scenario.decline) {
@@ -107,7 +118,7 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
     for (const [width, decline] of [[1280, false], [390, false], [1280, true]]) await t.test(`${width} ${decline ? "declined continuation brings the card back" : "running continuation retires the card"}`, async () => {
-      scenario = { source: null, children: [], seq: 0, decline, finish: null, running: false };
+      scenario = { source: null, children: [], normal: [], seq: 0, decline, finish: null, running: false };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
       const page = await context.newPage(); const errors = [];
@@ -118,7 +129,7 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         await page.getByRole("button", { name: "发送", exact: true }).click();
         const card = page.getByRole("alert");
         await card.waitFor();
-        const resume = page.getByRole("button", { name: "从断点继续" });
+        const resume = page.getByRole("button", { name: "继续", exact: true });
         await resume.waitFor();
         assert.equal(await card.count(), 1, "one committed failure card");
         assert.equal(scenario.children.length, 0, "an unproven Bash effect is never continued automatically");
@@ -128,7 +139,21 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         if (decline) {
           await until("the declined card is back with its notice", async () =>
             (await card.count()) === 1 && (await card.innerText()).includes("未从断点继续"));
-          assert.equal(await page.getByRole("button", { name: "从断点继续" }).count(), 0, "a declined continuation is not offered again");
+          const normalGo = page.getByRole("button", { name: "继续", exact: true });
+          assert.equal(await normalGo.count(), 1, "a refused checkpoint still allows an explicit human follow-up");
+          const sourceRows = structuredClone(preview.store.board);
+          await normalGo.click();
+          await page.getByText("CONTINUE_NORMAL_AFTER_REFUSAL", { exact: true }).waitFor();
+          assert.equal(scenario.children.length, 1, "the refused checkpoint is never replayed");
+          assert.equal(scenario.normal.length, 1);
+          const follow = scenario.normal[0];
+          assert.equal(follow.peer.id, BOARD_SESSION);
+          assert.notEqual(follow.clientMessageId, scenario.source);
+          assert.equal(follow.content.recovery, undefined);
+          assert.notEqual(follow.content.text, "CONTINUE_ORIGINAL_REQUEST");
+          assert.match(follow.content.text, /CONTINUE_ORIGINAL_REQUEST/);
+          assert.match(follow.content.text, /不要重新执行已经完成的步骤/);
+          assert.deepEqual(preview.store.board.slice(0, sourceRows.length), sourceRows);
           assert.deepEqual(errors, []);
           console.log("CONTINUE_CARD_RECEIPT", JSON.stringify({ width, decline, children: 1, cardBack: true, red, transformCount }));
           return;
@@ -141,12 +166,12 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
         assert.equal(scenario.running, true);
         // While the continuation runs the source card is resolved, not a live failure.
         assert.equal(await card.count(), 0, "running continuation: the committed failure card is retired");
-        assert.equal(await page.getByRole("button", { name: /重新尝试|从断点继续/ }).count(), 0, "running continuation: no retry or resume button remains");
+        assert.equal(await page.getByRole("button", { name: /^(继续|重新尝试|从断点继续)$/ }).count(), 0, "running continuation: no retry or resume button remains");
         scenario.finish();
         await page.getByText("CONTINUE_RESUMED_ANSWER", { exact: true }).waitFor();
         await running.waitFor({ state: "detached" });
         assert.equal(await card.count(), 0, "finished continuation: the card stays retired");
-        assert.equal(await page.getByRole("button", { name: /重新尝试|从断点继续/ }).count(), 0, "finished continuation: no retry or resume button");
+        assert.equal(await page.getByRole("button", { name: /^(继续|重新尝试|从断点继续)$/ }).count(), 0, "finished continuation: no retry or resume button");
         assert.deepEqual(errors, []);
         console.log("CONTINUE_CARD_RECEIPT", JSON.stringify({ width, decline, children: 1, retired: true, red, transformCount }));
       } catch (error) {

@@ -1381,6 +1381,7 @@ export class SubprocessRunner extends EventEmitter {
         // loopback Cursor relay does not consume this header, so there is no
         // subprocess write in this narrowly-scoped lane.
         void leaseEnvelope
+        this.refreshRollingDelegateContext()
         return
       }
       if (this.opts.authorityEngine === 'cursor') {
@@ -1390,6 +1391,7 @@ export class SubprocessRunner extends EventEmitter {
         // The box CLI never sees these headers. Marking the process stale here
         // would only make the next turn kill a healthy box process.
         void leaseEnvelope
+        this.refreshRollingDelegateContext()
         return
       }
       // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the renewed
@@ -1403,6 +1405,7 @@ export class SubprocessRunner extends EventEmitter {
         ...headerEnv,
       }
       this.spawnedOfficialHeaderFingerprint = undefined
+      this.refreshRollingDelegateContext()
       return
     }
     const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
@@ -1412,6 +1415,7 @@ export class SubprocessRunner extends EventEmitter {
     )
     if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
     await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+    this.refreshRollingDelegateContext()
   }
 
   /** The turn trace for CCB's egress requests (OCV5-570), or undefined when CCB's upstream is not egress. */
@@ -1980,6 +1984,14 @@ export class SubprocessRunner extends EventEmitter {
     if (binding && prev && prev !== binding.turnKey && this.proc) {
       this.pendingConsultRespawn = true
     }
+  }
+
+  private refreshRollingDelegateContext(): void {
+    // Advisor invocations persist the exact v2 token hash as their receipt.
+    // Reminting that token would break replay/result retrieval. Its separate
+    // renewal protocol must preserve those receipts; ordinary v1 delegates
+    // can safely roll their same-turn caller identity now.
+    if (!this.consultTurnBinding) this.refreshDelegateContext()
   }
 
   /** Refresh caller binding at the actual turn boundary, not process spawn. */

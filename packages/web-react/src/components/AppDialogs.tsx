@@ -12,6 +12,7 @@ import { TASKBOARD_ENABLED } from "../lib/taskboardFeature";
 import { uploadFilesToProject } from "../lib/projectFileUpload";
 import { normalizeManageTab } from "../lib/manageTabs";
 import { CHAT_CREATE_TEMPLATES } from "../lib/chatCreateTemplates";
+import { taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { DEFAULT_AGENT } from "../lib/agents";
 import { lazy } from "react";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
@@ -69,6 +70,16 @@ const InboxDialog = lazy(() => import("./InboxDialog").then((m) => ({ default: m
 const MediaTaskCenter = lazy(() =>
   import("./MediaTaskCenter").then((m) => ({ default: m.MediaTaskCenter })),
 );
+
+/** No active-session fallback: an old media job belongs only to its original session. */
+export function mediaTaskContinuationDraft(
+  job: { prompt?: string; sessionId?: string | null },
+  sessions: readonly Pick<Session, "id">[],
+): { sessionId: string; text: string } | null {
+  const sessionId = job.sessionId;
+  if (!sessionId || !job.prompt?.trim() || !sessions.some((session) => session.id === sessionId)) return null;
+  return { sessionId, text: taskContinuationPrompt(job.prompt) };
+}
 
 const ShareDialog = lazy(() => import("./ShareDialog").then((m) => ({ default: m.ShareDialog })));
 
@@ -340,6 +351,7 @@ export function AppDialogs({
   user,
   wsMessages,
 }: AppDialogsProps) {
+  const mediaAuthEpoch = auth?.snapshot().epoch;
   return (
     <>
       <AgentPicker
@@ -621,11 +633,23 @@ export function AppDialogs({
             auth={auth}
             liveJob={liveMediaJob}
             onOpenChange={setMediaTasksOpen}
-            onReusePrompt={(prompt) => {
-              // media M-17 / X-M4:失败任务「重新发起」→ 关任务中心,提示词写进 Composer 草稿
-              //(与教程 starterPrompt / 编辑重发同一条 prefill 路),用户改一改就能再发。
+            onReusePrompt={async (job) => {
+              if (!authed || !auth || authRef.current !== auth || auth.snapshot().epoch !== mediaAuthEpoch) return;
+              const draft = mediaTaskContinuationDraft(job, sessions);
+              if (!draft) {
+                try {
+                  await navigator.clipboard.writeText(job.prompt ?? "");
+                  if (authRef.current === auth && auth.snapshot().epoch === mediaAuthEpoch)
+                    toast("原会话暂不可用，已复制提示词；没有发送新任务。", "info");
+                } catch {
+                  if (authRef.current === auth && auth.snapshot().epoch === mediaAuthEpoch)
+                    toast("原会话暂不可用，请手动复制提示词。", "info");
+                }
+                return;
+              }
+              selectSession(draft.sessionId);
               setMediaTasksOpen(false);
-              setComposerPrefill({ text: prompt, nonce: Date.now() });
+              setComposerPrefill({ text: draft.text, nonce: Date.now() });
             }}
           />
         </LazyBoundary>

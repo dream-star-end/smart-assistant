@@ -118,7 +118,7 @@ export function JournalHydrationRetry({ onRetry }: { onRetry: () => void }) {
         className="shrink-0 text-xs font-medium text-fg underline underline-offset-2 hover:text-accent [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2"
         onClick={onRetry}
       >
-        重新加载
+        继续
       </button>
     </output>
   );

@@ -3966,6 +3966,14 @@ read -r uid gid mode < <(stat -Lc '%u %g %a' -- "$marker")
 REMOTE
 }
 
+# Preserve failure ordering; the caller still explicitly returns 1.
+build_release_failure_cleanup() { # <staging> <message> [local candidate]
+  local staging="$1" failure_message="$2" box_cand="${3:-}"
+  echo "$failure_message" >&2
+  if [[ -n "$box_cand" ]]; then rm -rf "$box_cand"; fi
+  ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+}
+
 build_release() {
   BUILT_RELEASE=""; BUILT_RELEASE_SOURCE_COMMIT=""; DIST_BUILD_ID=""
   local full_sha short_sha ts staging reldir cur
@@ -4003,19 +4011,15 @@ build_release() {
   # 远端建到 staging;任一步失败 → 清 staging + return 1(半成品不落 rel-*)
   ssh "$KL_HOST" "mkdir -p '$staging'" || { echo "✗ mkdir staging 失败" >&2; return 1; }
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | ssh "$KL_HOST" "tar -x -C '$staging'"; then
-    echo "✗ git archive/解包失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+    build_release_failure_cleanup "$staging" "✗ git archive/解包失败"; return 1; fi
   flavor_tmpd="$(mktemp -d)"
   if ! write_flavor_manifest "$flavor_tmpd" commercial "$full_sha"; then
     rm -rf "$flavor_tmpd"
-    echo "✗ write commercial flavor.manifest.json failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ write commercial flavor.manifest.json failed"; return 1
   fi
   if ! scp -q "$flavor_tmpd/flavor.manifest.json" "$KL_HOST:$staging/flavor.manifest.json"; then
     rm -rf "$flavor_tmpd"
-    echo "✗ scp flavor.manifest.json failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ scp flavor.manifest.json failed"; return 1
   fi
   rm -rf "$flavor_tmpd"
   # node_modules:lock 未变且当前有 → 硬链复用;否则空目录 npm ci(不碰旧 release 硬链)
@@ -4024,7 +4028,7 @@ build_release() {
         cp -al '$cur/node_modules' '$staging/node_modules'; echo '  lock 未变 → 硬链复用 node_modules' >&2
       else
         echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
-      fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+      fi"; then build_release_failure_cleanup "$staging" "✗ node_modules 准备失败"; return 1; fi
   # OCV5-121: real isolated PG/SQLite/HTTP journeys on this exact pinned source.
   # The proof needs the hermetic test PostgreSQL fixture (127.0.0.1:55432, octest) which
   # only exists on the deploy host — production has no test PG, so on 2026-09-07 the first
@@ -4033,67 +4037,45 @@ build_release() {
   # not the pinned sha (assert_clean_source_tree already proved the tree equals HEAD).
   # The runner owns its hard deadline and cleanup; failure cannot publish a candidate.
   if [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != "$full_sha" ]]; then
-    echo "✗ pinned queued-consumer proof: REPO_ROOT HEAD != pinned $full_sha" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned queued-consumer proof: REPO_ROOT HEAD != pinned $full_sha"; return 1
   fi
   if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
         npx --no-install tsx scripts/check-v5-queued-consumer.ts); then
-    echo "✗ pinned queued-consumer hermetic proof failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned queued-consumer hermetic proof failed"; return 1
   fi
   # OCV5-380: master-side incidents that came with the selfhost merge (alert inbox fallback, inbox
   # delivery key, project output assets, PROJECT.md seed). Each named regression case must pass on
   # this pinned tree; the alert cases run on the same hermetic test PostgreSQL.
   if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
         npx --no-install tsx scripts/check-v5-master-incident-proofs.ts); then
-    echo "✗ pinned master incident proofs failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned master incident proofs failed"; return 1
   fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-lossless-anchor-contract.ts"; then
-    echo "✗ pinned lossless anchor contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned lossless anchor contract gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-visible-orphan-liveness.ts"; then
-    echo "✗ pinned visible-orphan liveness gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned visible-orphan liveness gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts"; then
-    echo "✗ pinned Cursor Sand InferenceService contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned Cursor Sand InferenceService contract gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts"; then
-    echo "✗ pinned CCB MCP availability contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned CCB MCP availability contract gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts"; then
-    echo "✗ pinned delegate engine billing requestId contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned delegate engine billing requestId contract gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && node scripts/check-v5-callback-payload-hash.mjs"; then
-    echo "✗ pinned callback payload hash WS proof failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned callback payload hash WS proof failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts"; then
-    echo "✗ pinned cron submit durability boundary gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned cron submit durability boundary gate failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts"; then
-    echo "✗ pinned session-unavailable rootfix contract gate failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned session-unavailable rootfix contract gate failed"; return 1
   fi
   # KL has no 127.0.0.1:55432. Do not ssh this probe and do not read
   # DATABASE_URL. Commercial does not assume the controller fixture.
@@ -4101,74 +4083,52 @@ build_release() {
   # Do not write flavor.manifest.json and do not borrow checkout/donor deps.
   box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
   if [[ -z "$box_dsn" ]]; then
-    echo "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture"; return 1
   fi
   box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
-    echo "✗ box success recovery: git archive $full_sha failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ box success recovery: git archive $full_sha failed" "$box_cand"; return 1
   fi
   if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
-    echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" "$box_cand"; return 1
   fi
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
       TEST_DATABASE_URL="$box_dsn" \
       npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
-    echo "✗ pinned box success recovery behavioral gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned box success recovery behavioral gate failed" "$box_cand"; return 1
   fi
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
       npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha"); then
-    echo "✗ pinned box multitool continuation gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned box multitool continuation gate failed" "$box_cand"; return 1
   fi
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
       TEST_DATABASE_URL="$box_dsn" \
       npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha"); then
-    echo "✗ pinned box incident proofs gate failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned box incident proofs gate failed" "$box_cand"; return 1
   fi
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
       npx --no-install tsx scripts/check-v5-box-terminal-unproven-probe.ts); then
-    echo "✗ pinned box terminal-unproven liveness probe failed" >&2
-    rm -rf "$box_cand"; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1
+    build_release_failure_cleanup "$staging" "✗ pinned box terminal-unproven liveness probe failed" "$box_cand"; return 1
   fi
   if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
       -u OC_V5_PROOF_TEST_DATABASE_URL \
       npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
-    echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
-    rm -rf "$box_cand"
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" "$box_cand"; return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha"); then
+    build_release_failure_cleanup "$staging" "✗ pinned box long-task generations gate failed" "$box_cand"; return 1
   fi
   rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
-    echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-codex-chatgpt-ws.ts"; then
-    echo "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned Codex ChatGPT websocket hang gate (INC-20260915-CODEX-CHATGPT-WS) failed"; return 1
   fi
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-advisor-1m-dup-picker.ts"; then
-    echo "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ pinned advisor 1M twin picker gate (INC-20260915-ADVISOR-1M-DUP-PICKER) failed"; return 1
   fi
   # dist:--with-dist 时**在 staging(archive pinned 源)上跑官方 workspace build**
   # (`tsc -b && vite build`;R2#2:不从共用工作树构建,
@@ -4180,15 +4140,15 @@ build_release() {
     if try_reuse_web_dist "$staging" "$cur" "$full_sha"; then
       echo "  ✓ with-dist 复用旧 dist(证据:git diff-tree 无差异 + .complete + dist 存在;来自 $DIST_REUSE_FROM)" >&2
     elif ! ssh "$KL_HOST" "set -e; cd '$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages/web-react >/dev/null 2>&1"; then
-      echo "✗ staging web official build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+      build_release_failure_cleanup "$staging" "✗ staging web official build 失败"; return 1; fi
   else
     if ! ssh "$KL_HOST" "set -e
         [ -n '$cur' ] && [ -d '$cur/packages/web-react/dist' ] || { echo '✗ 当前 release 无 dist 可继承' >&2; exit 1; }
         mkdir -p '$staging/packages/web-react'; rm -rf '$staging/packages/web-react/dist'; cp -al '$cur/packages/web-react/dist' '$staging/packages/web-react/dist'"; then
-      echo "✗ dist 继承失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+      build_release_failure_cleanup "$staging" "✗ dist 继承失败"; return 1; fi
   fi
   DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$staging/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
-  [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ staging dist 缺 oc-build meta" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
+  [[ -n "$DIST_BUILD_ID" ]] || { build_release_failure_cleanup "$staging" "✗ staging dist 缺 oc-build meta"; return 1; }
   # Core semantic recall runs in the master host process, not in a user
   # container. Materialize the pinned q8 assets inside this master staging tree,
   # verify every SHA, disable remote model access, then execute real inference
@@ -4208,29 +4168,23 @@ node scripts/materialize-core-memory-model.mjs "${args[@]}"
 npx --no-install tsx scripts/core-memory-local-ranker-smoke.ts --model-dir "$target"
 REMOTE
   then
-    echo "✗ staging Core memory q8 模型物化/离线真实推理失败" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ staging Core memory q8 模型物化/离线真实推理失败"; return 1
   fi
   # VERSION(钉死 short_sha)；所有 npm/vite/dist 步骤完成后才收紧 baseline，随后用
   # 当前 checkout 的可信 guard 做最终只读复验。guard 失败时 staging 必须清掉，绝不能
   # 写 .complete 或进入 rel-* 命名空间。
   if ! write_version "$staging" "$short_sha" >&2; then ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
   if ! harden_release_baseline "$staging"; then
-    echo "✗ staging CCB baseline hardening/validation 失败" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ staging CCB baseline hardening/validation 失败"; return 1
   fi
   # Bake the checkout's expectedSkills into the immutable release before the
   # tree digest. .complete.baselineManifestSha256 is filled by the marker writer.
   if ! write_release_baseline_manifest "$staging" "$full_sha"; then
-    echo "✗ staging .baseline-manifest.json 写入失败" >&2
-    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
-    return 1
+    build_release_failure_cleanup "$staging" "✗ staging .baseline-manifest.json 写入失败"; return 1
   fi
   # 完整性校验 + strong .complete(full source/metadata/tree digests) + 原子改名。
   if ! publish_strong_release "$staging" "$reldir" "$full_sha" "$short_sha" "$ts"; then
-    echo "✗ 完整性校验/原子改名失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+    build_release_failure_cleanup "$staging" "✗ 完整性校验/原子改名失败"; return 1; fi
   if [[ -n "$DIST_REUSE_FROM" ]]; then
     record_dist_reuse_in_complete "$reldir" || {
       echo "✗ dist 复用 provenance 写入 .complete 失败" >&2

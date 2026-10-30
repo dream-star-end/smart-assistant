@@ -19,7 +19,6 @@ import {
   ShieldCheck,
   Sparkles,
   MessageSquare,
-  MessageSquarePlus,
   MoreHorizontal,
   Pencil,
   Quote,
@@ -183,9 +182,8 @@ export type CardCallbacks = {
     messageId: string,
     expected: { recordId: string; role: string; contentSha256?: string },
   ) => ChatMessage[] | null;
-  /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
-   *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
-   *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
+  /** Locate the exact failed source for editing. Error execution uses the
+   * continuation resolver and never falls back to replaying another task. */
   resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
   /** P5b:把一条已完成的回答存到所在项目（「记住这条」= 项目记忆，「存为项目技能」）。
    *  App 只在 OC_P5_CHIPS 打开、会话属于有看板的项目、非 demo 时提供；缺省不出这两个入口。 */
@@ -791,17 +789,17 @@ export function UserCard({
               立即发送
             </button>
           )}
-          {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
-          {status === "error" && cb?.onRetrySend && (
+          {/* A failed send keeps its original task context through Continue. */}
+          {status === "error" && cb?.onContinueInterrupted && (
             <button
               type="button"
-              onClick={() => cb.onRetrySend?.(msg)}
+              onClick={() => cb.onContinueInterrupted?.(msg)}
               className={cn(
                 "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11",
                 cancelledByUser ? "bg-card text-fg" : "bg-danger-soft text-danger",
               )}
             >
-              <RotateCcw size={11} /> {cancelledByUser ? "重新发送" : "重试"}
+              <RotateCcw size={11} /> 继续
             </button>
           )}
         </div>
@@ -821,9 +819,7 @@ export function TurnStatusCard({
   currentTurn: boolean;
 }) {
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
-  const retryTarget = msg._clientMessageId
-    ? cb.resolveRetryTarget?.(msg._clientMessageId)
-    : undefined;
+  const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
   return (
     <div className="rounded-lg border border-warning/30 bg-warning/5 px-3.5 py-3 animate-in" role="status">
       <div className="flex items-start gap-2.5">
@@ -832,14 +828,9 @@ export function TurnStatusCard({
           <div className="text-body font-medium text-fg">{presented.title}</div>
           <div className="mt-0.5 text-[12.5px] leading-relaxed text-muted">{presented.message}</div>
         </div>
-        {currentTurn && retryTarget && cb.onRetrySend && (
-          <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onRetrySend?.(retryTarget)}>
-            <RotateCcw size={12} /> 重试
-          </Button>
-        )}
-        {currentTurn && !retryTarget && cb.onRegenerate && (
-          <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-            <RotateCcw size={12} /> 重新尝试
+        {source && cb.onContinueInterrupted && (
+          <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+            <RotateCcw size={12} /> 继续
           </Button>
         )}
       </div>
@@ -1011,54 +1002,22 @@ export function AssistantCard({
     ? "这轮没有回复"
     : (frozenCard?.title ?? presentedError?.title);
   const shownMessage = isEmptyNoReply
-    ? "模型没有生成内容，本轮未扣费。点重试再发一次。"
+    ? "模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。"
     : (frozenCard?.message ?? presentedError?.message);
   const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
   const creditsCopy = insufficientCreditsCopy(
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
-  // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
-  // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 不显示精确「重试」,
-  // 落回原有 onRegenerate「重新尝试」兜底(现状语义)。
-  const retryEligible =
-    !!presentedError &&
-    !presentedError.waived &&
-    sem.retryable &&
-    (sem.cta === "retry" || sem.cta === "retry_or_switch");
-  const retryTarget =
-    retryEligible && msg._clientMessageId
-      ? cb.resolveRetryTarget?.(msg._clientMessageId)
-      : undefined;
-  // cta==='retry_or_switch'(容量类:同模型稍后可用,换模型立即可用)→ 按钮旁附「切换模型」。
-  // 有 onOpenModelPicker 时渲染可点按钮打开顶栏受控模型菜单，否则保留引导文案。
-  const showSwitchModelHint =
-    !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch";
-  // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
-  // onRegenerate 兜底 = 重发**最后一条** user 消息;历史中间错误卡若显示任何重发按钮,一点就把
-  // 无关的最新一轮内容重发出去(精确重发亦会把历史消息插到当前会话尾,乱序)。故裁定:错误卡上的
-  // 一切重发按钮(精确「重试」+ 兜底「重新尝试」+「切换模型」引导)只在**该错误卡属于最后一轮**时
-  // 显示。末轮判据复用 turnSegment 单一权威 inActiveTurn(= 该行位于最后一条 user 之后 = 当前轮
-  // 尾部;错误卡恒追加在其归属 user 轮之后,故与"_clientMessageId 命中最后一条 user"等价),不另
-  // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
-  // 耗尽 CTA 是导航非重发,不受此门控。
+  // Only the latest unfinished task may continue; historical errors never
+  // replay a later request. A trailing runtime batch does not own this action.
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
-  const interruptedContinuationTarget =
-    isLastTurn && ctx.isLast
-      ? cb.resolveInterruptedContinuation?.(msg)
-      : undefined;
-  const showInterruptedContinuation =
-    !msg._recoverySkippedNotice &&
-    !!interruptedContinuationTarget &&
-    !!cb.onContinueInterrupted;
-  const showPreciseRetry = !isInsufficient && isLastTurn && !!retryTarget;
-  const showRegenFallback =
-    !isInsufficient &&
-    isLastTurn &&
-    !showInterruptedContinuation &&
-    !retryTarget &&
-    (sem.cta === "retry" || sem.cta === "retry_or_switch") &&
-    !!cb.onRegenerate;
+  const source = isLastTurn && !ctx.sending
+    ? cb.resolveInterruptedContinuation?.(msg)
+    : undefined;
+  const showInterruptedContinuation = !!source && !!cb.onContinueInterrupted;
   const showTopUp = isInsufficient && !!cb.onTopUp;
+  const showSwitchModelHint =
+    !!presentedError && !presentedError.waived && sem.cta === "retry_or_switch" && !!cb.onOpenModelPicker;
   useEffect(() => {
     if (!isInsufficient) return;
     reportClientFrictionOnce(
@@ -1072,9 +1031,6 @@ export function AssistantCard({
       cb.getToken?.(),
     );
   }, [isInsufficient, msg.id, cb]);
-  // cta==='new_session'(上下文超限类):导航非重发,同耗尽 CTA 不受末轮门控。
-  const showNewSession =
-    !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
   // OCV5-421: 需要用户动手的卡必须给动作,不能只写「请在上方切换模型 / 请刷新页面」。
   const showSwitchModel =
     !!presentedError && !presentedError.waived && isLastTurn && sem.cta === "switch_model" && !!cb.onOpenModelPicker;
@@ -1082,12 +1038,9 @@ export function AssistantCard({
     !!presentedError && !presentedError.waived && isLastTurn && (sem.cta === "refresh" || sem.cta === "relogin");
   const showActionRow =
     showTopUp ||
-    showNewSession ||
     showSwitchModel ||
     showReload ||
     showInterruptedContinuation ||
-    showPreciseRetry ||
-    showRegenFallback ||
     (isLastTurn && showSwitchModelHint);
   // Finalized immutable tapes may contain a deferred runtime batch after the
   // canonical assistant row. That transport row must still mount and decode,
@@ -1153,11 +1106,11 @@ export function AssistantCard({
             title="这轮没有回复"
           >
             <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以重试。</p>
-              {isLastTurn && cb.onRegenerate && (
+              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以在当前会话继续。</p>
+              {showInterruptedContinuation && (
                 <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重试
+                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                    <RotateCcw size={14} /> 继续
                   </Button>
                 </div>
               )}
@@ -1174,7 +1127,7 @@ export function AssistantCard({
                   ? "模型暂停了本轮（通常因长任务超时），可让它继续。"
                   : "回复达到长度上限被截断，可让模型继续写。"}
               </span>
-              {cb.onContinue && (
+              {isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast) && cb.onContinue && (
                 <Button size="sm" variant="secondary" shape="pill" onClick={cb.onContinue}>
                   继续
                 </Button>
@@ -1202,6 +1155,11 @@ export function AssistantCard({
           >
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
+            {showInterruptedContinuation && (
+              <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                继续
+              </Button>
+            )}
           </output>
         ) : recoveredStep && sem.automaticRecovery === true ? (
           // OCV5-390: an error the platform retries by itself and that the turn got past is not the
@@ -1245,10 +1203,10 @@ export function AssistantCard({
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
                 {msg._recoverySkippedNotice}
               </p>
-              {isLastTurn && cb.onRegenerate && (
+              {showInterruptedContinuation && (
                 <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重试
+                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                    <RotateCcw size={14} /> 继续
                   </Button>
                 </div>
               )}
@@ -1286,6 +1244,11 @@ export function AssistantCard({
               )}
               {showActionRow && (
                 <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                  {showInterruptedContinuation && (
+                    <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                      <RotateCcw size={14} /> 继续
+                    </Button>
+                  )}
                   {showTopUp ? (
                     // insufficient_credits CTA = 导航非重发,不受末轮门控。
                     <Button
@@ -1308,15 +1271,6 @@ export function AssistantCard({
                     >
                       <Wallet size={14} /> {creditsCopy.cta}
                     </Button>
-                  ) : showNewSession ? (
-                    <Button
-                      size="sm"
-                      variant="accent"
-                      shape="pill"
-                      onClick={cb.onStartNewSession}
-                    >
-                      <MessageSquarePlus size={14} /> 新建会话继续
-                    </Button>
                   ) : showSwitchModel ? (
                     <Button size="sm" variant="accent" shape="pill" onClick={cb.onOpenModelPicker}>
                       <ArrowLeftRight size={14} /> 切换模型
@@ -1325,39 +1279,11 @@ export function AssistantCard({
                     <Button size="sm" variant="secondary" shape="pill" onClick={() => window.location.reload()}>
                       <RotateCw size={14} /> 刷新页面
                     </Button>
-                  ) : showInterruptedContinuation ? (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      shape="pill"
-                      onClick={() => cb.onContinueInterrupted?.(msg)}
-                    >
-                      <RotateCcw size={14} /> 从断点继续
-                    </Button>
-                  ) : showPreciseRetry ? (
-                    // 末轮 + 精确路径可用:优先精确重发原轮(复用原 payload 含附件),不走 onRegenerate。
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      shape="pill"
-                      onClick={() => cb.onRetrySend?.(retryTarget!)}
-                    >
-                      <RotateCcw size={14} /> 重试
-                    </Button>
-                  ) : showRegenFallback ? (
-                    // 末轮 + 精确路径不可用(找不到原 user 行 / 不可重试码)→ onRegenerate 兜底。
-                    <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                      <RotateCcw size={14} /> 重新尝试
-                    </Button>
                   ) : null}
                   {isLastTurn && showSwitchModelHint && (
-                    cb.onOpenModelPicker ? (
-                      <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
-                        切换模型
-                      </Button>
-                    ) : (
-                      <span className="text-xs text-muted">或在上方切换模型后重试</span>
-                    )
+                    <Button size="sm" variant="ghost" shape="pill" onClick={cb.onOpenModelPicker}>
+                      切换模型
+                    </Button>
                   )}
                 </div>
               )}

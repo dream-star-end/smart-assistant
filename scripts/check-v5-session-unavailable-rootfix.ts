@@ -230,20 +230,22 @@ const preparedPublish = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolResumePublish.ts'), 'utf8')
 const preparedJournal = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const preparedClaim = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolResumeClaim.ts'), 'utf8')
 if (!preparedGate.includes('classifyBoxContinuation')
   || !preparedFetch.includes('continuation_candidate')
   || !preparedEgress.includes('continuation_candidate')
   || !preparedPublish.includes('resumeMayPublish(')
-  || !preparedJournal.includes('matchPreparedToolResults(')
-  || !preparedJournal.includes('consumePrepared(')
+  || !preparedJournal.includes('return claimBoundBoxToolResume(')
+  || !preparedClaim.includes('matchPreparedToolResults(')
+  || !preparedClaim.includes('consumePrepared(')
   || !preparedSrc.includes('fingerprintOfPrepared')) {
   throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
 const editEcho = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
-const editJournal = readFileSync(join(root,
-  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const editJournal = preparedJournal + '\n' + preparedClaim
 const editFinger = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxCallFingerprint.ts'), 'utf8')
 if (!editEcho.includes('export function editReplaceAllFalseDefault(')

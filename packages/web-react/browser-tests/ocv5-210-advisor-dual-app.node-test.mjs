@@ -311,6 +311,13 @@ function startFixture() {
           });
           return;
         }
+        if (f.content?.displayText === "继续" && !f.content?.recovery) {
+          const finalSeq = ++seq;
+          assert.equal(pendingFinals.has(clientMessageId), false, "each continuation owns one final release");
+          pendingFinals.set(clientMessageId, () => send({ ...base, frameSeq: finalSeq,
+            blocks: [{ kind: "text", text: "ADVISOR_TASK_CONTINUED" }], isFinal: true }));
+          return;
+        }
         seq += 1;
         send({
           ...base,
@@ -488,7 +495,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await a.page.getByPlaceholder(/和「全能助手」对话/).fill(RETRY_TEXT);
     await a.page.getByRole("button", { name: "发送" }).click();
     try {
-      await a.page.getByRole("button", { name: "重试" }).waitFor({ timeout: 15_000 });
+      await a.page.getByRole("button", { name: "继续" }).waitFor({ timeout: 15_000 });
     } catch (err) {
       throw new Error(`${err.message}\n${await dumpPage(a.page, inbounds, "wait-retry")}`);
     }
@@ -523,18 +530,29 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     assert.match(afterTeamSwitch, /顾问 gpt-6-astra/);
 
     const beforeRetry = inbounds.length;
-    await a.page.getByRole("button", { name: "重试" }).first().click();
+    await a.page.getByRole("button", { name: "继续" }).first().click();
     for (let i = 0; i < 25 && inbounds.length === beforeRetry; i += 1) {
       await new Promise((done) => setTimeout(done, 200));
     }
     const retried = inbounds.at(-1);
-    assert.ok(retried && inbounds.length > beforeRetry, "retry must dispatch inbound.message");
-    assert.equal(retried.content?.text, RETRY_TEXT);
-    assert.equal(retried.collabMode, "advisor", "retry must keep original advisor snapshot, not later team pref");
+    assert.ok(retried && inbounds.length > beforeRetry, "Continue must dispatch one newly admitted inbound.message");
+    assert.equal(inbounds.length, beforeRetry + 1, "one Continue admits one follow-up");
+    assert.notEqual(retried.content?.text, RETRY_TEXT, "Continue does not replay the original task");
+    assert.ok(retried.content?.text.includes(RETRY_TEXT), "Continue retains the original goal as context");
+    assert.match(retried.content.text, /不要重新执行已经完成的步骤/);
+    assert.equal(retried.content.displayText, "继续");
+    assert.equal(retried.content.recovery, undefined, "manual continuation uses normal admission");
+    assert.equal(retried.peer.id, failedInbound.peer.id);
+    assert.notEqual(retried.clientMessageId, failedInbound.clientMessageId);
+    assert.equal(retried.collabMode, "advisor", "Continue must keep original advisor snapshot, not later team pref");
     assert.equal(retried.advisorModel, "gpt-6-astra");
     assert.match(String(retried.collabConfigVersion || ""), /v1:advisor:gpt-6-astra/);
-
     releaseFinal(retried.clientMessageId);
+    await a.page.getByText("ADVISOR_TASK_CONTINUED", { exact: true }).waitFor();
+    await expandConsultCard(a.page);
+    assert.equal(await consultCardToggle(a.page).count(), 1, "completed advisor tool remains once across Continue");
+    await a.page.getByText(ADVICE, { exact: true }).waitFor();
+
     await a.page.close();
     const a2 = await bootPage(ctxA, origin, js);
     const reopened = a2.page.getByRole("button", { name: new RegExp(USER_TEXT) });

@@ -45,6 +45,7 @@ import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import { taskContinuationPrompt } from "./lib/chat/manualTaskContinuation";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
@@ -1503,6 +1504,7 @@ export function App() {
     activeId,
     agent,
     authRef,
+    identity: resolvedIdentity,
     chat,
     chipsBoardProjectId,
     chipsProjectName,
@@ -2438,7 +2440,7 @@ export function App() {
                       className="rounded-full bg-hover px-3 py-1.5 text-xs text-fg"
                       onClick={() => retryHistory(activeId)}
                     >
-                      重试
+                      继续
                     </button>
                   ) : undefined
                 }
@@ -2571,9 +2573,10 @@ export function App() {
             <ErrorBanner
               error={chatError}
               onRetry={() => {
+                if (!activeId) return;
                 const t = chatError.retryText;
                 setChatError(null);
-                send(t);
+                send(taskContinuationPrompt(t), undefined, undefined, "继续", undefined, { sessionId: activeId });
               }}
               onDismiss={() => setChatError(null)}
               onSwitchModel={demo ? undefined : () => setModelPickerOpen(true)}

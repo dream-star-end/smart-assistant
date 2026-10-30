@@ -29,6 +29,7 @@ import {
   resolveCcbHarness,
   type PermissionResponse,
   type SdkMessage,
+  type TurnModelAuthority,
 } from '../subprocessRunner.js'
 import { TelemetryChannel, type OcTelemetryEvent } from '../telemetryChannel.js'
 import type {
@@ -49,7 +50,7 @@ import type {
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { notifyClaimFenceOf } from '../engineNotifier.js'
 import { createLogger } from '../logger.js'
-import { renewTurnLease } from '../masterTurnLease.js'
+import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from '../masterTurnLease.js'
 import { notifyBoxUserStop } from './boxUserStopClient.js'
 
 const log = createLogger({ module: 'ccbAdapter' })
@@ -310,9 +311,9 @@ function buildTurnSummary(
       cacheCreationTokens: result.cacheCreationTokens,
       totalTokens: result.totalTokens,
     },
-    assistantText: errorKind === 'model_authority' ? '' : result.assistantText,
+    assistantText: result.assistantText,
     thinkingText: result.thinkingText,
-    assistantSegments: errorKind === 'model_authority' ? [] : result.assistantSegments,
+    assistantSegments: result.assistantSegments,
     thinkingSegments: result.thinkingSegments,
     tools: result.tools,
     runtimeEvents: errorKind === 'model_authority'
@@ -491,7 +492,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       onEvent: (e: SessionStreamEvent) => {
         // A platform lease rejection is not a provider-login failure and its
         // raw internal response must not become a red user-facing card. The
-        // terminal result below emits one normalized, waived outcome.
+        // terminal result below emits one normalized, recoverable outcome.
         if (e.kind === 'error' && containsModelAuthorityInvalid(e.error)) return
         // P1-6:登记未决 permission_request(waitingForUserInput 数据源)。
         if (e.kind === 'permission_request' && e.request.requestId) {
@@ -619,13 +620,14 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       .submit(params.input, params.requestId, params.modelAuthority, params.turnKey)
       .then(() => {
         if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
+          if (this._activeTurn !== ctx) this._activeTurn?.stopLeaseRenewal?.()
           this._activeTurn = ctx
         }
         if (params.modelAuthority && params.turnKey && this._activeTurn === ctx) {
           ctx.stopLeaseRenewal = this._startLeaseRenewal(
             ctx,
             params.turnKey,
-            params.modelAuthority.leaseEnvelope,
+            params.modelAuthority,
           )
         }
       })
@@ -652,12 +654,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   private _startLeaseRenewal(
     ctx: CcbTurnContext,
     turnKey: string,
-    initialLease: string,
+    authority: TurnModelAuthority,
+    refresh = refreshTurnModelAuthorityLease,
   ): () => void {
     let stopped = false
     let timer: NodeJS.Timeout | null = null
-    let currentLease = initialLease
-    let failures = 0
+    const controller = new AbortController()
     const schedule = (delayMs: number): void => {
       if (stopped) return
       timer = setTimeout(() => void run(), delayMs)
@@ -666,30 +668,36 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     const run = async (): Promise<void> => {
       if (stopped || this._activeTurn !== ctx) return
       try {
-        const renewed = await renewTurnLease(turnKey, currentLease)
+        const renewed = await refresh(turnKey, authority, {
+          signal: controller.signal,
+          onRetry: (err, failures) => {
+            if (failures === 1 || failures % 10 === 0) {
+              log.warn('rolling turn lease renewal failed; retrying', {
+                turnKey, failures, error: (err as Error).message,
+              })
+            }
+          },
+        })
         if (stopped || this._activeTurn !== ctx) return
         await this.runner.updateTurnLease(renewed.lease)
-        currentLease = renewed.lease
-        failures = 0
         log.info('rolling turn lease renewed', { turnKey, expiresAt: renewed.expiresAt })
         schedule(TURN_LEASE_RENEW_AFTER_MS)
       } catch (err) {
-        failures++
-        if (failures === 1 || failures % 10 === 0) {
-          log.warn('rolling turn lease renewal failed; retrying', {
-            turnKey,
-            failures,
-            error: (err as Error).message,
-          })
-        }
-        // Initial renewal starts with 20 minutes of lease headroom. A one-minute
-        // retry cadence tolerates control-plane deploys without request floods.
+        if (stopped || this._activeTurn !== ctx) return
+        log.warn('rolling turn lease could not update live runner', {
+          turnKey, error: (err as Error).message,
+        })
+        // Revoked/finalized identities are never renewed again. A fallible
+        // subprocess update may retry; the shared owner already has its new
+        // lease, so a process restart cannot resurrect the initial ticket.
+        if (err instanceof RenewTurnLeaseError && !err.retryable) return
         schedule(60_000)
       }
     }
     schedule(TURN_LEASE_RENEW_AFTER_MS)
     return () => {
       stopped = true
+      controller.abort(new Error('turn lease renewal stopped'))
       if (timer) clearTimeout(timer)
       timer = null
     }
@@ -809,6 +817,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const active = this._activeTurn
+    active?.stopLeaseRenewal?.()
     if (reason === 'user' && active) this._notifyBoxStop(active, 'user')
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
@@ -816,6 +825,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   async shutdown(): Promise<void> {
+    this._activeTurn?.stopLeaseRenewal?.()
+    this._routeTurn?.stopLeaseRenewal?.()
     if (this._boxStopPending) {
       let timer: ReturnType<typeof setTimeout> | undefined
       try {

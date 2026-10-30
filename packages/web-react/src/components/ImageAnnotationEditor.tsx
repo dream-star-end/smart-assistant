@@ -892,7 +892,7 @@ export function ImageAnnotationEditor({
                   }}
                   className="flex min-h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-white transition-colors hover:bg-white/20"
                 >
-                  <RotateCcw size={16} /> 重试
+                  <RotateCcw size={16} /> 继续
                 </button>
               </div>
             )}
