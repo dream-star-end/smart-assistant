@@ -6899,7 +6899,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
-          "assertion": "exactly one Continue button"
+          "assertion": "one Continue instead of replaying completed work"
         },
         {
           "layer": "unit",
@@ -7020,7 +7020,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
-          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and continues in the same conversation"
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one same-session Continue runs it"
         }
       ]
     },
