@@ -9656,6 +9656,21 @@
         "6677f862",
         "c9d3443e"
       ]
+    },
+    {
+      "id": "INC-20261029-BOX-TERMINAL-UNPROVEN",
+      "occurredAt": "2026-10-29",
+      "severity": "P0",
+      "symptom": "Box成功stdout后缺少terminal proof，503且最终aborted/expired_unproven/0。历史keeper实际退出cause无诊断；独立可复现缺陷为收养逃逸后代1s后仍活时keeper永久退出。修复仅对内核pidfd/P_PIDFD可证明的本keeper子进程有界回收，真实ECHILD才准终态；不将历史假设当已证实事故根因，不改变Stop/容量/计费。",
+      "rootFixCommit": "946a6e63",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "proveKeeperOwnedChildren(CANDIDATE)"
+        }
+      ]
     }
   ]
 }
