@@ -78,6 +78,18 @@ describe('buildCoreMemoryEmbeddingContainerEnv', () => {
     assert.equal(out.filter((v) => v.includes(key)).length, 1)
   })
 
+  test('explicit null from the pool does not revive OPENAI_API_KEY', () => {
+    const out = buildCoreMemoryEmbeddingContainerEnv(
+      { OPENAI_API_KEY: 'sk-env-valid-1234', DASHSCOPE_API_KEY: 'dash-key' },
+      { openAiApiKey: null },
+    )
+    assert.equal(out.some((value) => value.startsWith('EMBEDDING_API_KEY=sk-')), false)
+    assert.equal(out.includes('EMBEDDING_PROVIDER=openai'), false)
+    assert.equal(out.includes('EMBEDDING_MODEL=text-embedding-3-large'), false)
+    assert.ok(out.includes('EMBEDDING_BATCH_SIZE=10'))
+    assert.ok(out.includes('OPENCLAUDE_CORE_MEMORY_LOCAL_SEMANTIC=1'))
+  })
+
   test('blank openai key keeps the historical pin', () => {
     const out = buildCoreMemoryEmbeddingContainerEnv(
       { EMBEDDING_MODEL: 'text-embedding-v4' },

@@ -34,6 +34,11 @@ export interface EmbeddingProvider {
   readonly modelId: string
   /** Embedding vector dimensions */
   readonly dimensions: number
+  /**
+   * Stable backend identity (URL host). Persistent indexes must not mix
+   * vectors from two hosts, even when the model name and dimensions match.
+   */
+  readonly backendId?: string
 
   /**
    * Generate embeddings for one or more texts.
@@ -98,6 +103,17 @@ export function defaultEmbeddingBatchSize(baseUrl: string | undefined): number {
   return 100
 }
 
+/** Host of an embedding base URL. Used to keep persistent indexes model-specific. */
+export function embeddingBackendId(baseUrl: string | undefined): string {
+  const url = (baseUrl ?? '').trim()
+  if (!url) return 'unknown'
+  try {
+    return new URL(url).host || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
 // ── OpenAI Provider ──────────────────────────────
 
 interface OpenAIEmbeddingResponse {
@@ -109,6 +125,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly providerId = 'openai'
   readonly modelId: string
   readonly dimensions: number
+  readonly backendId: string
 
   private readonly apiKey: string
   private readonly baseUrl: string
@@ -121,6 +138,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.dimensions = config.dimensions ?? 1536
     this.apiKey = config.apiKey ?? ''
     this.baseUrl = (config.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
+    this.backendId = embeddingBackendId(this.baseUrl)
     this.batchSize = config.batchSize ?? defaultEmbeddingBatchSize(this.baseUrl)
     this.timeoutMs = config.timeoutMs ?? 30_000
     this.dispatcher = config.dispatcher
@@ -297,4 +315,13 @@ export function isEmbeddingAvailable(): boolean {
 /** Reset the singleton (for testing). */
 export function resetEmbeddingProvider(): void {
   _provider = null
+}
+
+/**
+ * The process singleton, if one has already been created.
+ * Does not read env or construct a provider, so a vector-store init cannot
+ * accidentally open a paid client from leftover environment variables.
+ */
+export function currentEmbeddingProvider(): EmbeddingProvider | null {
+  return _provider
 }

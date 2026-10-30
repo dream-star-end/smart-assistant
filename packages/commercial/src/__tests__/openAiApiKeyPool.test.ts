@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { API_KEY_SERVICE_RE, apiKeyHint, apiKeyPoolShouldQuery } from '../account-pool/apiKeyPool.js'
+import { skillEmbeddingConfigFromEnv } from '@openclaude/storage'
+import { API_KEY_SERVICE_RE, apiKeyHint, apiKeyPoolShouldQuery, installApiKeyPoolSnapshotForTests, resetApiKeyPoolSnapshotForTests } from '../account-pool/apiKeyPool.js'
+import { buildCoreMemoryEmbeddingContainerEnv } from '../agent-sandbox/coreMemoryEmbeddingEnv.js'
 import { resetOpenAiPlatformKeyCacheForTests, selectOpenAiPlatformKey } from '../openai/openAiPlatformKey.js'
 import { apiKeyServices } from '../http/admin/pools.js'
 
@@ -31,5 +33,41 @@ describe('openai api key pool', () => {
     assert.equal(key, null)
     assert.ok(Date.now() - started < 1000)
     process.env.OPENAI_API_KEY = prev ?? ''
+  })
+
+  test('disabled and cooling pool members do not fall back to OPENAI_API_KEY', async () => {
+    const prev = process.env.OPENAI_API_KEY
+    process.env.OPENAI_API_KEY = 'sk-env-valid-1234'
+    const explicitEnv = {
+      OPENAI_API_KEY: 'sk-env-valid-1234',
+      DASHSCOPE_API_KEY: 'dash-key',
+    }
+    resetOpenAiPlatformKeyCacheForTests()
+    installApiKeyPoolSnapshotForTests([
+      { id: 'openai-disabled', service: 'openai', status: 'disabled' },
+      {
+        id: 'openai-cooling',
+        service: 'openai',
+        status: 'active',
+        cooldownUntil: new Date(Date.now() + 60 * 60 * 1000),
+      },
+      { id: 'openai-cooldown-status', service: 'openai', status: 'cooldown' },
+    ])
+    try {
+      const key = await selectOpenAiPlatformKey('embedding-pool-disabled')
+      assert.equal(key, null)
+      const skill = skillEmbeddingConfigFromEnv(explicitEnv, { openAiApiKey: key })
+      assert.equal(skill.model, 'text-embedding-v4')
+      assert.equal(skill.apiKey, 'dash-key')
+      const container = buildCoreMemoryEmbeddingContainerEnv(explicitEnv, { openAiApiKey: key })
+      assert.equal(container.some((value) => value.startsWith('EMBEDDING_API_KEY=sk-')), false)
+      assert.equal(container.includes('EMBEDDING_MODEL=text-embedding-3-large'), false)
+      assert.ok(container.includes('EMBEDDING_BATCH_SIZE=10'))
+    } finally {
+      resetOpenAiPlatformKeyCacheForTests()
+      resetApiKeyPoolSnapshotForTests()
+      if (prev === undefined) delete process.env.OPENAI_API_KEY
+      else process.env.OPENAI_API_KEY = prev
+    }
   })
 })

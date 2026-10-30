@@ -160,6 +160,53 @@ export function apiKeyPoolShouldQuery(service: string): boolean {
   return snapshot.rows.some((r) => r.service === service)
 }
 
+export interface ApiKeyPoolSnapshotMember {
+  id: string
+  service: string
+  status: 'active' | 'cooldown' | 'disabled'
+  /** When set on an active row, the member stays unusable until this time. */
+  cooldownUntil?: Date | null
+}
+
+/**
+ * Install a pool snapshot without reading the database. Tests use this to
+ * prove a disabled or cooling pool stays authoritative. Never call it from
+ * production paths.
+ */
+export function installApiKeyPoolSnapshotForTests(members: ApiKeyPoolSnapshotMember[]): void {
+  snapshot = {
+    at: Date.now(),
+    rows: members.map((member) => ({
+      id: member.id,
+      service: member.service,
+      label: 'test',
+      fingerprint: '0000000000000000',
+      key_hint: '…test',
+      source: 'admin' as const,
+      tier: API_KEY_DEFAULT_TIER,
+      weight: 1,
+      status: member.status === 'cooldown' ? 'cooldown' : member.status,
+      disabled_by: member.status === 'disabled' ? 'admin' : null,
+      health_score: 100,
+      cooldown_until: member.cooldownUntil ?? null,
+      cooldown_reason: member.status === 'active' && member.cooldownUntil == null ? null : 'rate_limited',
+      backoff_level: 0,
+      next_probe_at: null,
+      last_error: null,
+      last_used_at: null,
+      key_enc: Buffer.alloc(0),
+      key_nonce: Buffer.alloc(0),
+    })),
+  }
+  loading = null
+}
+
+/** Drop the in-process pool snapshot. Tests only. */
+export function resetApiKeyPoolSnapshotForTests(): void {
+  snapshot = null
+  loading = null
+}
+
 /** Load the snapshot now (boot); throws if the DB is unreachable. */
 export async function primeApiKeyPool(): Promise<void> {
   await loadSnapshot()

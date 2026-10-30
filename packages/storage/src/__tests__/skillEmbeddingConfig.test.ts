@@ -103,6 +103,19 @@ describe('skillEmbeddingConfigFromEnv', () => {
     assert.equal(cfg.batchSize, 10)
   })
 
+  it('does not revive OPENAI_API_KEY when the pool selector passes null', () => {
+    const cfg = skillEmbeddingConfigFromEnv(
+      { OPENAI_API_KEY: 'sk-env-valid-1234', DASHSCOPE_API_KEY: 'dash-key' },
+      { openAiApiKey: null },
+    )
+    assert.equal(cfg.model, 'text-embedding-v4')
+    assert.equal(cfg.dimensions, 1024)
+    assert.equal(cfg.apiKey, 'dash-key')
+    assert.equal(cfg.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+    assert.equal(cfg.batchSize, 10)
+    assert.equal(String(cfg.apiKey).includes('sk-env'), false)
+  })
+
   it('rebuilds the provider when the model changes and reuses it for the same config', () => {
     resetSkillEmbeddingProvider()
     const dash = getSkillEmbeddingProvider(

@@ -68,14 +68,19 @@ function cleanOpenAiKey(value: string | null | undefined): string {
  * DashScope compatible-mode stays at 10, anything else uses the OpenAI default
  * (100) instead of a hardcoded DashScope cap.
  *
- * An OpenAI key (pool key passed in, or OPENAI_API_KEY) switches the unpinned
- * config to text-embedding-3-large at 1024 dimensions on api.openai.com.
+ * An OpenAI key switches the unpinned config to text-embedding-3-large at
+ * 1024 dimensions on api.openai.com. When `opts` includes `openAiApiKey`,
+ * that value is the only authority: explicit null or blank (the pool has
+ * members but none are usable) does not fall back to OPENAI_API_KEY. The env
+ * key is read only when the override is omitted.
  */
 export function skillEmbeddingConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   opts: { openAiApiKey?: string | null } = {},
 ): EmbeddingProviderConfig {
-  const openAiKey = cleanOpenAiKey(opts.openAiApiKey) || cleanOpenAiKey(env.OPENAI_API_KEY)
+  const openAiKey = Object.prototype.hasOwnProperty.call(opts, 'openAiApiKey')
+    ? cleanOpenAiKey(opts.openAiApiKey)
+    : cleanOpenAiKey(env.OPENAI_API_KEY)
   const pinned = env.SKILL_EMBEDDING_MODEL !== undefined || env.SKILL_EMBEDDING_BASE_URL !== undefined
   if (openAiKey && !pinned) {
     return {

@@ -14,7 +14,7 @@
 
 import type Database from 'better-sqlite3'
 import * as sqliteVec from 'sqlite-vec'
-import type { EmbeddingProvider } from './embedding.js'
+import { currentEmbeddingProvider, type EmbeddingProvider } from './embedding.js'
 import { literalFtsQuery } from './ftsQuery.js'
 import { getSessionsDb } from './sessionsDb.js'
 
@@ -28,22 +28,48 @@ let _vecDimensions = 0
  * Must be called before any vector operations.
  * Idempotent — safe to call multiple times with the same dimensions.
  * Re-initializes if the underlying DB handle has changed (e.g. after closeSessionsDb).
+ *
+ * When `provider` is omitted, an already-constructed process provider with the
+ * same dimensions is used. Pass null to skip model alignment. A provider whose
+ * backend, model, or dimensions differ from the stored index rebuilds archival
+ * and session vectors from source text before any later query can compare them.
  */
-export async function initVectorStore(dimensions: number): Promise<Database.Database> {
+export async function initVectorStore(
+  dimensions: number,
+  provider?: EmbeddingProvider | null,
+): Promise<Database.Database> {
   if (!Number.isFinite(dimensions) || dimensions <= 0 || !Number.isInteger(dimensions)) {
     throw new Error(`initVectorStore: dimensions must be a positive integer, got ${dimensions}`)
   }
 
   const db = await getSessionsDb()
-
-  // Re-initialize if DB handle changed (e.g. after closeSessionsDb + reopen)
-  if (_vecDb && _vecDb === db && _vecDimensions > 0) {
-    if (dimensions !== _vecDimensions) {
+  const requested = provider === undefined ? currentEmbeddingProvider() : provider
+  if (requested && requested.dimensions !== dimensions) {
+    if (provider !== undefined) {
       throw new Error(
-        `initVectorStore: already initialized with dimensions=${_vecDimensions}, cannot change to ${dimensions}`,
+        `initVectorStore: provider dimensions ${requested.dimensions} do not match requested ${dimensions}`,
       )
     }
+  }
+  const alignedProvider = requested && requested.dimensions === dimensions ? requested : null
+
+  // Same live handle: still align the model. A container can keep the DB open
+  // across a config reload, and dimensions alone do not identify the model.
+  if (_vecDb && _vecDb === db && _vecDimensions === dimensions) {
+    if (alignedProvider) {
+      const ok = await alignEmbeddingIndex(db, alignedProvider)
+      if (!ok) {
+        throw new Error(
+          'initVectorStore: persistent vectors belong to a different embedding model and could not be rebuilt',
+        )
+      }
+    }
     return db
+  }
+  if (_vecDb && _vecDb === db && _vecDimensions > 0 && !alignedProvider) {
+    throw new Error(
+      `initVectorStore: already initialized with dimensions=${_vecDimensions}, cannot change to ${dimensions}`,
+    )
   }
 
   sqliteVec.load(db)
@@ -64,19 +90,34 @@ export async function initVectorStore(dimensions: number): Promise<Database.Data
   `)
 
   // Verify existing tables have compatible dimensions by probing both tables.
-  // If dimensions mismatch, vec0 will error on query with the wrong-sized vector.
+  // A mismatch is fatal only when we have no provider to rebuild from source text.
   const probe = new Float32Array(dimensions)
+  let dimensionsMismatch = false
   for (const table of ['archival_vec', 'sessions_vec']) {
     try {
       db.prepare(`SELECT id FROM ${table} WHERE embedding MATCH ? AND k = 1`).all(probe)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.includes('dimensions') || msg.includes('vector')) {
-        throw new Error(
-          `initVectorStore: ${table} has incompatible dimensions (requested ${dimensions}): ${msg}`,
-        )
+        dimensionsMismatch = true
+        if (!alignedProvider) {
+          throw new Error(
+            `initVectorStore: ${table} has incompatible dimensions (requested ${dimensions}): ${msg}`,
+          )
+        }
       }
       // Empty table is fine — probe returns 0 rows
+    }
+  }
+
+  if (alignedProvider) {
+    const ok = await alignEmbeddingIndex(db, alignedProvider)
+    if (!ok) {
+      throw new Error(
+        dimensionsMismatch
+          ? `initVectorStore: vector tables have incompatible dimensions (requested ${dimensions}) and could not be rebuilt`
+          : 'initVectorStore: persistent vectors belong to a different embedding model and could not be rebuilt',
+      )
     }
   }
 
@@ -109,6 +150,249 @@ function isVecReady(): boolean {
 export function resetVectorStore(): void {
   _vecDb = null
   _vecDimensions = 0
+}
+
+// ── Embedding index identity ─────────────────────
+// vec0 rows are only an id and a vector. Archival and session search must not
+// compare a query from one backend/model with vectors from another, even when
+// the dimensions match. The identity row is the authority; a change rebuilds
+// both tables from source text before KNN.
+
+interface EmbeddingIndexIdentity {
+  backend: string
+  model: string
+  dimensions: number
+}
+
+const VEC_TABLES = ['archival_vec', 'sessions_vec'] as const
+const IDENTITY_ID_CHUNK = 500
+
+let alignChain: Promise<unknown> = Promise.resolve()
+
+function providerIdentity(provider: EmbeddingProvider): EmbeddingIndexIdentity {
+  return {
+    backend: provider.backendId || provider.providerId,
+    model: provider.modelId,
+    dimensions: provider.dimensions,
+  }
+}
+
+function sameIdentity(a: EmbeddingIndexIdentity, b: EmbeddingIndexIdentity): boolean {
+  return a.backend === b.backend && a.model === b.model && a.dimensions === b.dimensions
+}
+
+function tableExists(db: Database.Database, name: string): boolean {
+  return db.prepare('SELECT 1 FROM sqlite_master WHERE name = ?').get(name) !== undefined
+}
+
+function ensureIdentityTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_index_identity (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      backend TEXT NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL
+    );
+  `)
+}
+
+function readIdentity(db: Database.Database): EmbeddingIndexIdentity | null {
+  ensureIdentityTable(db)
+  const row = db.prepare(
+    'SELECT backend, model, dimensions FROM embedding_index_identity WHERE id = 1',
+  ).get() as EmbeddingIndexIdentity | undefined
+  return row ?? null
+}
+
+function writeIdentity(db: Database.Database, identity: EmbeddingIndexIdentity): void {
+  ensureIdentityTable(db)
+  db.prepare(`
+    INSERT INTO embedding_index_identity (id, backend, model, dimensions)
+    VALUES (1, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      backend = excluded.backend,
+      model = excluded.model,
+      dimensions = excluded.dimensions
+  `).run(identity.backend, identity.model, identity.dimensions)
+}
+
+function listVecIds(db: Database.Database, table: 'archival_vec' | 'sessions_vec'): string[] | null {
+  if (!tableExists(db, table)) return []
+  try {
+    const rows = db.prepare(`SELECT id FROM ${table}`).all() as Array<{ id: string }>
+    return rows.map((row) => row.id)
+  } catch {
+    return null
+  }
+}
+
+function vecTablesMatchDimensions(db: Database.Database, dimensions: number): boolean {
+  const probe = new Float32Array(dimensions)
+  for (const table of VEC_TABLES) {
+    if (!tableExists(db, table)) return false
+    try {
+      db.prepare(`SELECT id FROM ${table} WHERE embedding MATCH ? AND k = 1`).all(probe)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('dimensions') || msg.includes('vector')) return false
+    }
+  }
+  return true
+}
+
+function recreateVecTables(db: Database.Database, dimensions: number): void {
+  db.exec(`
+    DROP TABLE IF EXISTS archival_vec;
+    DROP TABLE IF EXISTS sessions_vec;
+    CREATE VIRTUAL TABLE archival_vec USING vec0(
+      id TEXT PRIMARY KEY,
+      embedding FLOAT[${dimensions}]
+    );
+    CREATE VIRTUAL TABLE sessions_vec USING vec0(
+      id TEXT PRIMARY KEY,
+      embedding FLOAT[${dimensions}]
+    );
+  `)
+}
+
+interface SourceDoc {
+  id: string
+  content: string
+}
+
+function rowsByIds<T extends { id: string }>(
+  db: Database.Database,
+  sqlPrefix: string,
+  ids: string[],
+): T[] {
+  const out: T[] = []
+  for (let i = 0; i < ids.length; i += IDENTITY_ID_CHUNK) {
+    const chunk = ids.slice(i, i + IDENTITY_ID_CHUNK)
+    const placeholders = chunk.map(() => '?').join(',')
+    const rows = db.prepare(`${sqlPrefix} (${placeholders})`).all(...chunk) as T[]
+    out.push(...rows)
+  }
+  return out
+}
+
+function loadArchivalDocs(db: Database.Database, ids: string[] | null): SourceDoc[] {
+  if (!tableExists(db, 'archival')) return []
+  if (ids === null) {
+    return db.prepare('SELECT id, content FROM archival ORDER BY id').all() as SourceDoc[]
+  }
+  if (ids.length === 0) return []
+  return rowsByIds<SourceDoc>(db, 'SELECT id, content FROM archival WHERE id IN', ids)
+}
+
+function loadSessionDocs(db: Database.Database, ids: string[] | null): SourceDoc[] {
+  if (!tableExists(db, 'sessions_fts')) return []
+  const stmt = db.prepare(
+    'SELECT content FROM sessions_fts WHERE session_id = ? AND turn_idx = ? AND role = ? LIMIT 1',
+  )
+  const picked = new Map<string, string>()
+  const consider = (id: string): void => {
+    if (picked.has(id)) return
+    const decoded = decodeSessionVecId(id)
+    if (!decoded.sessionId || !Number.isFinite(decoded.turnIdx) || !decoded.role) return
+    const row = stmt.get(decoded.sessionId, decoded.turnIdx, decoded.role) as { content: string } | undefined
+    if (row) picked.set(id, row.content)
+  }
+  if (ids === null) {
+    const rows = db.prepare(
+      'SELECT session_id, turn_idx, role FROM sessions_fts',
+    ).all() as Array<{ session_id: string; turn_idx: number; role: string }>
+    for (const row of rows) consider(encodeSessionVecId(row.session_id, row.turn_idx, row.role))
+  } else {
+    for (const id of ids) consider(id)
+  }
+  return [...picked.entries()].map(([id, content]) => ({ id, content }))
+}
+
+async function embedDocs(provider: EmbeddingProvider, docs: SourceDoc[]): Promise<Float32Array[]> {
+  if (docs.length === 0) return []
+  const vectors = await provider.embed(docs.map((doc) => doc.content), 'document')
+  if (vectors.length !== docs.length) {
+    throw new Error(`embedding rebuild count mismatch: expected ${docs.length}, got ${vectors.length}`)
+  }
+  for (const vector of vectors) {
+    if (vector.length !== provider.dimensions) {
+      throw new Error(
+        `embedding rebuild dimension mismatch: expected ${provider.dimensions}, got ${vector.length}`,
+      )
+    }
+  }
+  return vectors
+}
+
+function replaceVecRows(
+  db: Database.Database,
+  table: 'archival_vec' | 'sessions_vec',
+  docs: SourceDoc[],
+  vectors: Float32Array[],
+): void {
+  const insert = db.prepare(`INSERT INTO ${table} (id, embedding) VALUES (?, ?)`)
+  for (let i = 0; i < docs.length; i++) insert.run(docs[i].id, vectors[i])
+}
+
+/**
+ * Make the on-disk index match `provider` before any KNN.
+ * Returns false when a rebuild was required and embedding failed. Callers must
+ * then skip vector search so an old model's vectors are never scored.
+ */
+function alignEmbeddingIndex(db: Database.Database, provider: EmbeddingProvider): Promise<boolean> {
+  const run = alignChain.then(
+    () => alignEmbeddingIndexUnlocked(db, provider),
+    () => alignEmbeddingIndexUnlocked(db, provider),
+  )
+  alignChain = run.then(() => undefined, () => undefined)
+  return run
+}
+
+async function alignEmbeddingIndexUnlocked(
+  db: Database.Database,
+  provider: EmbeddingProvider,
+): Promise<boolean> {
+  const current = providerIdentity(provider)
+  const stored = readIdentity(db)
+  const dimsOk = vecTablesMatchDimensions(db, current.dimensions)
+  if (stored && sameIdentity(stored, current) && dimsOk) return true
+
+  const archivalIds = listVecIds(db, 'archival_vec')
+  const sessionIds = listVecIds(db, 'sessions_vec')
+  const unknown = archivalIds === null || sessionIds === null
+  const hasVectors = unknown || archivalIds.length + sessionIds.length > 0
+  if (!stored && !hasVectors && dimsOk) {
+    writeIdentity(db, current)
+    return true
+  }
+
+  let archivalDocs: SourceDoc[]
+  let sessionDocs: SourceDoc[]
+  try {
+    archivalDocs = loadArchivalDocs(db, archivalIds)
+    sessionDocs = loadSessionDocs(db, sessionIds)
+    const archivalVecs = await embedDocs(provider, archivalDocs)
+    const sessionVecs = await embedDocs(provider, sessionDocs)
+    const apply = db.transaction(() => {
+      recreateVecTables(db, current.dimensions)
+      replaceVecRows(db, 'archival_vec', archivalDocs, archivalVecs)
+      replaceVecRows(db, 'sessions_vec', sessionDocs, sessionVecs)
+      writeIdentity(db, current)
+    })
+    apply()
+    _vecDimensions = current.dimensions
+    const from = stored ? `${stored.backend}/${stored.model}` : 'untagged'
+    process.stderr.write(
+      `[oc-memory] rebuilt persistent vectors ${from} -> ${current.backend}/${current.model} (${current.dimensions}d, ${archivalDocs.length} archival, ${sessionDocs.length} sessions)\n`,
+    )
+    return true
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(
+      `[oc-memory] persistent vector rebuild failed; refusing cross-model search: ${msg.slice(0, 200)}\n`,
+    )
+    return false
+  }
 }
 
 // ── Session vector ID encoding ───────────────────
@@ -355,14 +639,18 @@ export async function hybridArchivalSearch(
       }>)
     : []
 
-  // 2. Vector search (if provider available and vec store initialized)
+  // 2. Vector search (if provider available and vec store initialized).
+  // Skip KNN when the stored index belongs to another model and could not be rebuilt.
   let vecResults: Array<{ id: string; distance: number }> = []
   if (provider && isVecReady()) {
-    try {
-      const [queryVec] = await provider.embed([query], 'query')
-      vecResults = await searchArchivalByVector(queryVec, agentId, fetchLimit)
-    } catch {
-      // Fall back to BM25-only on embedding/vector failure
+    const aligned = await alignEmbeddingIndex(db, provider)
+    if (aligned) {
+      try {
+        const [queryVec] = await provider.embed([query], 'query')
+        vecResults = await searchArchivalByVector(queryVec, agentId, fetchLimit)
+      } catch {
+        // Fall back to BM25-only on embedding/vector failure
+      }
     }
   }
 
@@ -470,14 +758,17 @@ export async function hybridSessionSearch(
     bm25Deduped.push(r)
   }
 
-  // 2. Vector search
+  // 2. Vector search. Skip KNN when the stored index belongs to another model.
   let vecResults: Array<{ id: string; distance: number }> = []
   if (provider && isVecReady() && query.trim()) {
-    try {
-      const [queryVec] = await provider.embed([query], 'query')
-      vecResults = await searchSessionsByVector(queryVec, agentId, fetchLimit)
-    } catch {
-      // Fall back to BM25-only
+    const aligned = await alignEmbeddingIndex(db, provider)
+    if (aligned) {
+      try {
+        const [queryVec] = await provider.embed([query], 'query')
+        vecResults = await searchSessionsByVector(queryVec, agentId, fetchLimit)
+      } catch {
+        // Fall back to BM25-only
+      }
     }
   }
 

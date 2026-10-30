@@ -6,6 +6,13 @@
  * (EMBEDDING_BATCH_SIZE=10). When an OpenAI key is configured, embeddings
  * switch to text-embedding-3-large at 1024 dimensions and the batch size
  * follows the OpenAI default instead of the DashScope cap.
+ *
+ * When `opts` includes `openAiApiKey`, that value is the only authority.
+ * Explicit null or blank means the service pool has no usable key and must
+ * not be revived from OPENAI_API_KEY. The env key is read only when the
+ * override is omitted. Persistent archival/session vectors are rebuilt on
+ * model change inside the vector store; this env still names the model the
+ * new process will embed with.
  */
 
 import {
@@ -33,7 +40,9 @@ export function buildCoreMemoryEmbeddingContainerEnv(
   sourceEnv: NodeJS.ProcessEnv = process.env,
   opts: { openAiApiKey?: string | null } = {},
 ): string[] {
-  const openAiKey = cleanOpenAiKey(opts.openAiApiKey) || cleanOpenAiKey(sourceEnv.OPENAI_API_KEY);
+  const openAiKey = Object.prototype.hasOwnProperty.call(opts, "openAiApiKey")
+    ? cleanOpenAiKey(opts.openAiApiKey)
+    : cleanOpenAiKey(sourceEnv.OPENAI_API_KEY);
   if (openAiKey) {
     const explicitBatch = sourceEnv.EMBEDDING_BATCH_SIZE?.trim();
     const batch =

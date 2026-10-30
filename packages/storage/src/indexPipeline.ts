@@ -334,7 +334,7 @@ export async function processIndexQueue(
   batchSize = 50,
 ): Promise<PipelineStats> {
   await ensureIndexMetaSchema()
-  await initVectorStore(provider.dimensions)
+  await initVectorStore(provider.dimensions, provider)
   const { entries: batch, claimToken } = await claimBatch(batchSize)
 
   const stats: PipelineStats = { processed: 0, embedded: 0, deleted: 0, errors: 0 }
