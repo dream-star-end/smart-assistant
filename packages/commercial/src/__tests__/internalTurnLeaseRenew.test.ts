@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { test } from 'node:test'
+import { inspect } from 'node:util'
 import { TURN_LEASE_TTL_MS, verifyTurnLease } from '@openclaude/protocol'
 import type { Pool, PoolClient } from 'pg'
 import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
@@ -167,8 +168,8 @@ test('terminal/waived/policy/container/model/attempt/fenced states cannot renew'
     [{ dispatchAttemptNo: 2 }, 'TURN_NOT_ACTIVE'], [{ fenced: true }, 'TURN_NOT_ACTIVE'],
   ] as const) {
     const { res, sql } = await run(signer, initial.bundle.lease, ORIGINAL + 24 * 60 * 60_000, opts)
-    assert.equal(res.statusCode, 409, JSON.stringify(opts))
-    assert.equal(res.json().error.code, code, JSON.stringify(opts))
+    assert.equal(res.statusCode, 409, inspect(opts))
+    assert.equal(res.json().error.code, code, inspect(opts))
     assert.ok(sql.some((q) => q.text === 'ROLLBACK'))
   }
 })

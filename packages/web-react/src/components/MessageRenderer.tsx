@@ -2263,6 +2263,9 @@ export function MessageList({
       )
       .map((message) => visibleErrorTurnId(message._clientMessageId as string)),
   );
+  // A manual child has taken over this failure even when its retired assistant
+  // card is no longer visible. Do not resurrect the old user's failed-send CTA.
+  for (const sourceId of manuallyContinuedSourceIds) presentedErrorTurnIds.add(visibleErrorTurnId(sourceId));
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,

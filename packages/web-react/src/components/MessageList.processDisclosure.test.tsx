@@ -2727,3 +2727,80 @@ test("eleven real failed attempts render one final status and Continue while all
   expect(messages).toHaveLength(33);
   expect(JSON.stringify(messages)).toBe(before);
 });
+
+
+test("an admitted manual checkpoint retires the old failed UserCard through running and success", async () => {
+  const source = row("retired-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const saved = row("retired-saved-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo saved" },
+    output: "saved", _completed: true, _source: "server", _clientMessageId: source.id });
+  const error = row("retired-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  const original = [source, saved, error];
+  const before = JSON.stringify(original);
+  let messages = original;
+  let sending = false;
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+    sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  expect(await screen.findAllByRole("button", { name: "继续" })).toHaveLength(1);
+  const child = row("retired-manual-child", "user", "CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const active = row("retired-running-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo resumed" },
+    _completed: false, _source: "server", _clientMessageId: child.id });
+  messages = [...original, child, active];
+  sending = true;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(screen.queryByText("CHECKPOINT_CONTROL")).toBeNull();
+  messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+    row("retired-success", "assistant", "继续后完成", { _source: "server", _clientMessageId: child.id })];
+  sending = false;
+  view.rerender(screenState());
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("发送失败")).toBeNull();
+  expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+  // A later failed human send is independent and must retain its own recovery action.
+  const newest = row("new-independent-failure", "user", "新的失败目标", { status: "error" });
+  messages = [...messages, newest];
+  view.rerender(screenState());
+  const action = await screen.findByRole("button", { name: "继续" });
+  expect(screen.getAllByRole("button", { name: "继续" })).toHaveLength(1);
+  fireEvent.click(action);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(newest);
+  expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+});
+
+test("a refused checkpoint returns the original source; a real failed child owns one new Continue", async () => {
+  const source = row("refused-user-source", "user", "原始目标", { status: "error", _source: "server" });
+  const error = row("refused-source-error", "assistant", "", { _errorCode: "ENGINE_ERROR", _source: "server",
+    _clientMessageId: source.id, _recoverySkippedNotice: "未从断点继续，原任务仍已保留。",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "原失败", message: "原任务未完成" } });
+  let messages = [source, error];
+  const go = vi.fn();
+  const cb = { onContinueInterrupted: go,
+    resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+  const screenState = () => <MessageList messages={messages} sending={false} sessionId="session-a"
+    cb={cb} onRespondPermission={() => {}} />;
+  const view = render(screenState());
+  fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+  expect(go).toHaveBeenLastCalledWith(error);
+  go.mockClear();
+  const child = row("new-failed-child", "user", "CHECKPOINT_CONTROL", { status: "error", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const terminal = row("new-child-error", "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: child.id });
+  messages = [source, error, child, terminal];
+  view.rerender(screenState());
+  const actions = await screen.findAllByRole("button", { name: "继续" });
+  expect(actions).toHaveLength(1);
+  expect(screen.queryByText("发送失败")).toBeNull();
+  fireEvent.click(actions[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(terminal);
+});

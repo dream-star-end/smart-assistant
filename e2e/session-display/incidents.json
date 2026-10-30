@@ -1310,7 +1310,7 @@
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/turnWaiver.integ.test.ts",
-          "assertion": "refunds only the exact 259-credit turn to original personal buckets and sends once"
+          "assertion": "historical pending waiver refunds only the exact 259-credit turn to original personal buckets and sends once"
         },
         {
           "layer": "integration",
@@ -3584,7 +3584,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/cards.test.tsx",
-          "assertion": "cta=new_session(session_deleted)→「新建会话继续」，禁止同会话重试"
+          "assertion": "a deleted session never defaults to creating another conversation or replaying"
         },
         {
           "layer": "deploy-gate",
@@ -4025,7 +4025,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cronExecutionHeartbeat.test.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         },
         {
           "layer": "deploy-gate",
@@ -6000,7 +6000,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
-          "assertion": "exactly one retry button"
+          "assertion": "exactly one Continue button"
         },
         {
           "layer": "unit",
@@ -6074,7 +6074,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
-          "assertion": "the card does not name a button that is not there"
+          "assertion": "exactly one Continue button"
         },
         {
           "layer": "unit",
@@ -6344,7 +6344,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
-          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it"
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and continues in the same conversation"
         }
       ]
     },
@@ -8675,7 +8675,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-cron-submit-boundary.ts",
-          "assertion": "non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires"
+          "assertion": "silence trips idle while waiting and active turns continue beyond 12h/24h"
         }
       ]
     },

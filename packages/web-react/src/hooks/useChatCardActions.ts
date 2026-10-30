@@ -16,11 +16,11 @@ import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
-import { preciseRetryEligible, interruptedContinuationTarget, exactUserReplayPayload } from "../lib/chat/socket";
-import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
+import { preciseRetryEligible } from "../lib/chat/socket";
+import { manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
-import { normalizeMessageReplyQuote, parsePlatformReasoningEffort } from "@openclaude/protocol/browser";
+import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
 import type { Agent } from "../lib/agents";
 import type { AuthSession } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
@@ -336,44 +336,19 @@ export function useChatCardActions({
     async (error: ChatMessage) => {
       if (demo || !activeId || activeSessionRef.current !== activeId) return;
       if (!identity || !identityIsCurrent(identity, authRef.current)) return;
-      const sock = sockRef.current;
-      const rows = sock?.getMessages(activeId) ?? [];
-      const canonical = canonicalTaskContinuationError(rows, error);
-      const source = canonical && manualTaskContinuationSource(rows, error);
-      if (!sock || !source || !canonical) return;
-      const key = `${activeId}\0${source.id}`;
-      if (pendingContinuations.current.has(key)) return;
-      pendingContinuations.current.add(key);
+      let action: typeof import("./manualTaskContinuationAction");
       try {
-        if (interruptedContinuationTarget(rows, canonical, activeId)) {
-          sock.continueInterruptedTurn({ sessId: activeId, errorMessageId: canonical.id, agentId: agent.id });
-          return;
+        action = await import("./manualTaskContinuationAction");
+      } catch {
+        if (activeSessionRef.current === activeId && identityIsCurrent(identity, authRef.current)) {
+          toast("继续功能加载失败，请稍后再试", "error");
         }
-        const exact = await loadExactOrToast(source);
-        if (!exact || !identityIsCurrent(identity, authRef.current) || activeSessionRef.current !== activeId || sockRef.current !== sock ||
-          manualTaskContinuationSource(sock.getMessages(activeId), error)?.id !== source.id) return;
-        const replay = exactUserReplayPayload(exact);
-        // Explicit human follow-up uses the normal admission/credit/auth gates.
-        // It neither deletes old content nor resends an executed task.
-        const text = taskContinuationPrompt(replay.text);
-        const routing = exact._routing;
-        if (routing) {
-          await sock.send({
-            sessId: activeId, agentId: agent.id, text, media: replay.media, displayText: "继续",
-            model: routing.model, teamMode: routing.teamMode,
-            effortLevel: routing.effortLevel === null ? null : parsePlatformReasoningEffort(routing.effortLevel),
-            collabMode: routing.collabMode, advisorModel: routing.advisorModel,
-            collabConfigVersion: routing.collabConfigVersion,
-            contextTier: routing.contextTier, serviceTier: routing.serviceTier,
-          });
-        } else {
-          await send(text, replay.media, undefined, "继续", undefined, { sessionId: activeId });
-        }
-      } finally {
-        pendingContinuations.current.delete(key);
+        return;
       }
+      await action.continueManualTask({ activeId, demo, identity, authRef, sockRef, send, error,
+        agentId: agent.id, activeSessionRef, pendingContinuations, loadExactOrToast });
     },
-    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef],
+    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef, toast],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

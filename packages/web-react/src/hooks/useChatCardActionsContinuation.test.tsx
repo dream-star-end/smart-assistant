@@ -1,4 +1,4 @@
-import { cleanup, renderHook } from "@testing-library/react";
+import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { ChatMessage } from "../lib/chat/model";
@@ -42,7 +42,7 @@ test("double clicks hydrate and submit only once; late hydration cannot cross se
   const old = result.current.cardCallbacks.onContinueInterrupted!;
   const first = old(error);
   const second = old(error);
-  expect(input.loadExactUserMessage).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(input.loadExactUserMessage).toHaveBeenCalledTimes(1));
   rerender({ value: { ...input, activeId: "s2" } });
   finish(user);
   await Promise.all([first, second]);
@@ -59,6 +59,7 @@ test("identity changes and a newer user revoke a pending Continue", async () => 
     vi.mocked(input.loadExactUserMessage).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
     const { result, unmount } = renderHook(() => useChatCardActions(input));
     const pending = result.current.cardCallbacks.onContinueInterrupted!(error);
+    await waitFor(() => expect(input.loadExactUserMessage).toHaveBeenCalledTimes(1));
     if (change === "identity") auth.commitToken(auth.beginIdentity(), "bob");
     else rows.push({ ...user, id: "u2", text: "新任务" });
     finish(user);

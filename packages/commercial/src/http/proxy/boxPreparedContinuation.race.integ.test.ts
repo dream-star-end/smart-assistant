@@ -55,7 +55,8 @@ test("two concurrent journal claims publish one local file and add no usage row"
     await client.query(`CREATE SCHEMA ${schema}`);
     await client.query(`CREATE TABLE ${schema}.request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query(`CREATE TABLE ${schema}.usage_records (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, cost_credits bigint)`);
@@ -258,7 +259,8 @@ test("native and billing session namespaces bind independently before publicatio
       assert.equal(Number(where.rows[0]?.port), 55432);
       await client.query(`CREATE TEMP TABLE request_finalize_journal (
         request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-        state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+        state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
         error_msg text, failure_code text, final_credits bigint)`);
       await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
       const located = await client.query(`SELECT c.relname, n.nspname FROM pg_class c

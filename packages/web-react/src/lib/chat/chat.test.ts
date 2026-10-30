@@ -388,7 +388,7 @@ describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN �
     );
     const msg = friendlyBridgeErrorMessage("DURABLE_DISPATCH_UNAVAILABLE");
     expect(msg).toMatch(/执行通道/);
-    expect(msg).toMatch(/重试/);
+    expect(msg).toMatch(/继续/);
     expect(msg).not.toMatch(/系统暂时不可用/);
   });
 
