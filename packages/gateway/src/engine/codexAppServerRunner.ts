@@ -29,9 +29,6 @@ import {
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
-  CODEX_EXPLICIT_STANDARD_MODELS,
-  CODEX_STANDARD_SERVICE_TIER,
-  codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -50,13 +47,15 @@ import {
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
-  normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { writeCodexDelegateContext } from './codexDelegateContext.js'
-import { advisorReadOnlyThreadConfig, assertAdvisorReadOnlyRuntime, buildAdvisorReadOnlyArgs } from './codexAdvisorReadOnly.js'
+import {
+  buildAdvisorReadOnlyArgs, buildCodexThreadPolicyParams,
+  buildCodexTurnPolicyParams, readAdvisorReadOnlyConfig,
+} from './codexAdvisorReadOnly.js'
 import {
   buildHermeticDenial,
   isHermeticExecutionMethod,
@@ -183,14 +182,6 @@ const NATIVE_COMPACTION_TIMEOUT_MS = 15 * 60_000
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
 
-const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
-  'You are in implementation mode, not plan-only mode.',
-  'Decide autonomously whether the user request benefits from a visible plan/task list before or during execution.',
-  'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan; keep exactly one active step when work is underway.',
-  'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
-  'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
-  'When creating or editing files, prefer native fileChange/apply_patch edits so the UI can render Write/Edit cards; avoid Bash heredocs solely for file writes unless the shell command also needs real shell-side effects such as batch scaffolding.',
-].join(' ')
 
 // ───────────────────────────────────────────────
 // CodexAppServerRunner
@@ -1758,12 +1749,9 @@ export class CodexAppServerRunner extends EventEmitter {
     const initializeStartedAt = performance.now()
     try {
       const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
-      if (this.advisorReadOnly) {
-        assertAdvisorReadOnlyRuntime(initialized)
-        this.advisorReadOnlyConfig = advisorReadOnlyThreadConfig(await this.sendRequest('config/read', {
-          cwd: effectiveCwd, includeLayers: false,
-        }), this.cachedOverrides?.tokenFile != null)
-      } else this.advisorReadOnlyConfig = undefined
+      this.advisorReadOnlyConfig = await readAdvisorReadOnlyConfig(this.advisorReadOnly, initialized,
+        () => this.sendRequest('config/read', { cwd: effectiveCwd, includeLayers: false }),
+        this.cachedOverrides?.tokenFile != null)
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
         stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
     } catch (err) {
@@ -2066,46 +2054,11 @@ export class CodexAppServerRunner extends EventEmitter {
     emitGoalBlockImpl.call(this as unknown as CodexNotificationHost, goal)
   }
 
-  private codexReasoningEffort(): string | undefined {
-    return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
-  }
-
-  private codexTransportModel(): string | undefined {
-    return codexTransportModelId(this.opts.model)
-  }
-
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
-    const mode = this.conversationMode
-    const reasoningEffort = this.codexReasoningEffort()
-    const params: Record<string, unknown> = {
-      threadId: this.threadId,
-      input: [{ type: 'text', text: prompt }],
-      collaborationMode: {
-        mode,
-        settings: {
-          model: this.codexTransportModel() ?? '',
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-          developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
-        },
-      },
-      sandboxPolicy: this.opts.hermeticNoTools
-        ? { type: 'readOnly', networkAccess: false }
-        : this.advisorReadOnly
-          ? { type: 'readOnly', networkAccess: false }
-        : mode === 'plan'
-          ? { type: 'readOnly', networkAccess: true }
-          : { type: 'dangerFullAccess' },
-    }
-    if (this.codexTransportModel()) params.model = this.codexTransportModel()
-    if (this.advisorReadOnly) params.environments = []
-    if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
-    // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
-    // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
-    // a catalog Fast default (GPT-6 Luna) never applies.
-    if (CODEX_EXPLICIT_STANDARD_MODELS.has(this.opts.model ?? '')) {
-      params.serviceTierForTurn = CODEX_STANDARD_SERVICE_TIER
-    }
-    return params
+    return buildCodexTurnPolicyParams(prompt, this.threadId, {
+      ...this.opts, effortLevel: this.effortLevel,
+      mode: this.conversationMode, readOnly: this.advisorReadOnly,
+    })
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -2158,11 +2111,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
-      approvalPolicy: 'never',
-      sandbox: this.opts.hermeticNoTools || this.advisorReadOnly ? 'read-only' : 'danger-full-access',
-      ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
-      cwd: effectiveCwd,
-      ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+      ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+        this.advisorReadOnly, this.advisorReadOnlyConfig, this.opts.hermeticNoTools),
     })) as { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
     if (typeof tid !== 'string' || !tid) {
@@ -2493,11 +2443,8 @@ export class CodexAppServerRunner extends EventEmitter {
             await this.sendRequest('thread/resume', {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
               threadId: this.threadId,
-              approvalPolicy: 'never',
-              sandbox: this.advisorReadOnly ? 'read-only' : 'danger-full-access',
-              ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
-              cwd: effectiveCwd,
-              ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+              ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                this.advisorReadOnly, this.advisorReadOnlyConfig),
             })
           } catch (err) {
             // Self-heal "no rollout found for thread id" (-32600). Caused by
@@ -2540,11 +2487,8 @@ export class CodexAppServerRunner extends EventEmitter {
                 await this.sendRequest('thread/resume', {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                   threadId: fallback,
-                  approvalPolicy: 'never',
-                  sandbox: this.advisorReadOnly ? 'read-only' : 'danger-full-access',
-                  ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
-                  cwd: effectiveCwd,
-                  ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+                  ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                    this.advisorReadOnly, this.advisorReadOnlyConfig),
                 })
                 this.emit('session_id', fallback)
                 this.attached = true
