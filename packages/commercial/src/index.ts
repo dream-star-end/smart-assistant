@@ -729,7 +729,6 @@ import {
   createVoiceTranscribeHandler,
   type VoiceTranscribeHandler,
 } from "./ws/voiceTranscribe.js";
-import { selectOpenAiPlatformKey } from "./openai/openAiPlatformKey.js";
 import {
   composeMultiplier,
   getAgentCostMultiplier,
