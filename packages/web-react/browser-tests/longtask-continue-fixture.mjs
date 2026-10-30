@@ -4,6 +4,7 @@ import { BOARD_SESSION } from './process-disclosure-story.mjs';
 export const LONGTASK_CONTEXT = 'LONGTASK_CONTEXT_ALREADY_SAVED';
 export const LONGTASK_PARTIAL = 'LONGTASK_PARTIAL_ANSWER_ALREADY_SAVED';
 export const LONGTASK_TOOL_FILE = 'longtask-ledger.md';
+export const LONGTASK_TOOL_RESULT = 'LONGTASK_TOOL_RESULT_ALREADY_SAVED';
 export const LONGTASK_FINISHED = 'LONGTASK_CONTINUED_IN_SAME_SESSION';
 
 export function createLongtaskScenario(kind) {
@@ -18,7 +19,7 @@ export function createLongtaskScenario(kind) {
     ...(kind === 'paid' ? [
       { id: 'longtask-completed-read', role: 'tool', text: '', toolName: 'Read',
         blockId: 'longtask-read', inputJson: { file_path: LONGTASK_TOOL_FILE },
-        output: 'LONGTASK_TOOL_RESULT_ALREADY_SAVED', _completed: true,
+        output: LONGTASK_TOOL_RESULT, _completed: true,
         _clientMessageId: source, _turnTapeId: 'tape-longtask-paid',
         _toolEffect: { authority: 'gateway-v1', safety: 'read_only', outcome: 'completed',
           registryEntrySha256: 'a'.repeat(64) } },

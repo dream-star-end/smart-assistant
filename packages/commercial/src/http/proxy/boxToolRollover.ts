@@ -94,12 +94,12 @@ export async function claimToolRollover(client: PoolClient, input: { uid: bigint
 
 async function lockedChild(client: PoolClient, uid: bigint, requestId: string): Promise<Record<string,unknown>> {
   const peek = await client.query<{ ctx: Record<string,unknown> }>(
-    `SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2`,[uid.toString(),requestId]);
+    "SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2",[uid.toString(),requestId]);
   const receipt = parseToolRollover(peek.rows[0]?.ctx.boxRolloverFrom);
   if (!receipt) fail();
   await lock(client,[`box:session:${uid}:${receipt.sessionId}`]);
   const row = await client.query<{ ctx: Record<string,unknown>; state: string }>(
-    `SELECT ctx,state FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2 FOR UPDATE`,
+    "SELECT ctx,state FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2 FOR UPDATE",
     [uid.toString(),requestId]);
   if (row.rowCount !== 1 || row.rows[0]!.state !== "inflight") fail();
   return row.rows[0]!.ctx;
@@ -127,10 +127,11 @@ export async function finishToolRollover(pool: Db, input: { uid: bigint; request
     const leaf = byId.get(receipt.ownerRequestId);
     if (!leaf || leaf.ctx.boxRecoveredBy !== input.requestId
       || !isDeepStrictEqual(leaf.ctx.boxRolloverTo,receipt)) fail();
-    const proof = parseBoxTerminalProof(JSON.stringify(leaf.ctx.boxTerminalProof)+"\n",
+    const proof = parseBoxTerminalProof(`${JSON.stringify(leaf.ctx.boxTerminalProof)}\n`,
       { runNonce: receipt.runNonce,leaseEpoch: receipt.leaseEpoch });
     if (proof.reason === "worker_complete") fail();
-    let cursor: string | undefined = receipt.ownerRequestId, expected = receipt.roundNo;
+    let cursor: string | undefined = receipt.ownerRequestId;
+    let expected = receipt.roundNo;
     const seen = new Set<string>();
     while (cursor) {
       const row = byId.get(cursor);
@@ -251,7 +252,7 @@ export async function cancelToolRollovers(pool: Db, input: { uid: bigint; contai
 export async function withToolRolloverLaunchFence(pool: Db, uid: bigint, requestId: string,
   run: (query: PoolClient["query"]) => Promise<void>): Promise<void> {
   const peek = await pool.query<{ ctx: Record<string,unknown> }>(
-    `SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2`,[uid.toString(),requestId]);
+    "SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2",[uid.toString(),requestId]);
   if (peek.rows[0]?.ctx.boxRolloverFrom === undefined) { await run(pool.query.bind(pool)); return; }
   const client = await pool.connect(); let done = false;
   try {

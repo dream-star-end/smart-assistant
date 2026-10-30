@@ -9,7 +9,8 @@ export interface BoxToolRolloverReceipt {
   resultHashes: readonly Hash[]; roundNo: number; catalogHash: string; detachedRunnerHash: string;
 }
 export interface BoxToolRolloverClaim extends Omit<BoxToolRolloverReceipt,"accountId"> { accountId: bigint }
-const ID = /^[A-Za-z0-9_-]{1,64}$/, HEX64 = /^[a-f0-9]{64}$/;
+const ID = /^[A-Za-z0-9_-]{1,64}$/;
+const HEX64 = /^[a-f0-9]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RECEIPT_KEYS = ["accountId","catalogHash","detachedRunnerHash","durableRevision","leaseEpoch",
   "model","nextContextHash","ownerRequestId","reason","requestId","resultHashes","roundNo",
@@ -56,7 +57,8 @@ export function unadmittedToolRolloverFieldsSql(ctx = "ctx"): string {
 /** Same complete receipt/never-admit shape as the JS validator. CASE bounds
  * array work and rejects malformed JSON without throwing from an abort CAS. */
 export function unadmittedToolRolloverSql(ctx = "ctx", requestId = "request_id"): string {
-  const r = `(${ctx}->'boxRolloverFrom')`, hashes = `(${r}->'resultHashes')`;
+  const r = `(${ctx}->'boxRolloverFrom')`;
+  const hashes = `(${r}->'resultHashes')`;
   const keys = RECEIPT_KEYS.map((key) => `'${key}'`).join(",");
   const strings = STRING_KEYS.map((key) => `jsonb_typeof(${r}->'${key}')='string'`).join(" AND ");
   const models = BOX_API_MODELS.map((model) => `'${model.id}'`).join(",");
@@ -72,7 +74,8 @@ export function unadmittedToolRolloverSql(ctx = "ctx", requestId = "request_id")
       AND ${r}->>'runNonce' ~ '^[a-f0-9]{24}$' AND ${r}->>'leaseEpoch' ~ '^[a-f0-9]{32}$'
       AND ${r}->>'durableRevision' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
       AND ${r}->>'reason' IN ('rounds','wall','spool')
-      AND ${r}->>'sessionId' ~ '^[A-Za-z0-9._:-]{1,256}$'
+      AND ${r}->>'sessionId' ~ '^[A-Za-z0-9._:-]+$'
+      AND char_length(${r}->>'sessionId') BETWEEN 1 AND 256
       AND ${["turnKey","nextContextHash","catalogHash","detachedRunnerHash"].map((key) => `${r}->>'${key}' ~ '^[a-f0-9]{64}$'`).join(" AND ")}
       AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(${hashes}) entry(value)
         WHERE NOT (CASE WHEN jsonb_typeof(entry.value)='object' THEN COALESCE((

@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import { getUserError } from "@openclaude/protocol/browser";
 import { splitStoppedNarration } from "../../components/chat/turnSegment";
 import type { ChatMessage } from "./model";
-import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "./manualTaskContinuation";
+import { canonicalTaskContinuationError, collectRecoveredTurnStatusRecordIds, manualTaskContinuationSource, taskContinuationPrompt } from "./manualTaskContinuation";
 
 describe("t1360u every interrupted task continues in its original conversation", () => {
   test("zero output and partial work resolve the exact same latest source", () => {
@@ -118,5 +118,90 @@ describe("canonical continuation source integrity", () => {
     expect(manualTaskContinuationSource([user, { ...last, _recoveryOfClientMessageId: last.id }, giveup], giveup)).toBeUndefined();
     expect(manualTaskContinuationSource([...rows, { ...user, id: "new-human" }], giveup)).toBeUndefined();
     expect(manualTaskContinuationSource([...rows, { ...childError, id: "later-terminal" }], giveup)).toBeUndefined();
+  });
+});
+
+
+describe("dispatch status owns its hidden duplicate error", () => {
+  const user = { id: "dispatch-human", role: "user", text: "原始目标", ts: 1 } as ChatMessage;
+  const status = { id: "turn-status:dispatch-human", role: "system", text: "", ts: 2, _source: "server",
+    _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: user.id } as ChatMessage;
+  const duplicate = { id: "duplicate-error", role: "assistant", text: "", ts: 3,
+    _errorCode: "ENGINE_ERROR", _clientMessageId: user.id } as ChatMessage;
+
+  test("the visible canonical status can continue before its renderer-suppressed empty error", () => {
+    expect(manualTaskContinuationSource([user, status, duplicate], status)).toBe(user);
+    expect(manualTaskContinuationSource([user, status, { ...duplicate, text: "  " }], status)).toBe(user);
+    expect(canonicalTaskContinuationError([user, status, duplicate], status)).toBe(status);
+  });
+  test("new tasks, other owners, real answers and newer statuses still revoke the old status", () => {
+    const blockers: ChatMessage[] = [
+      { ...user, id: "new-human" },
+      { ...duplicate, _clientMessageId: "foreign-owner" },
+      { ...duplicate, _clientMessageId: undefined },
+      { ...duplicate, text: "真实部分回答" },
+      { ...duplicate, _errorCode: undefined, _userError: getUserError("engine_error") },
+      { ...status, id: "later-status", ts: 4 },
+    ];
+    for (const blocker of blockers) {
+      expect(manualTaskContinuationSource([user, status, blocker], status)).toBeUndefined();
+    }
+    for (const invalid of [{ ...status, _source: undefined }, { ...status, _dispatchTerminal: false },
+      { ...status, _errorCode: undefined }, { ...status, role: "assistant" as const }]) {
+      expect(manualTaskContinuationSource([user, invalid, duplicate], invalid)).toBeUndefined();
+    }
+  });
+  test("a status suppressed by actual server output cannot claim the later empty error", () => {
+    const answer = { id: "actual-answer", role: "assistant", text: "实际回答", ts: 2,
+      _clientMessageId: user.id, _source: "server" } as ChatMessage;
+    expect(manualTaskContinuationSource([user, status, answer, duplicate], status)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, status, answer, duplicate], duplicate)).toBe(user);
+  });
+});
+
+describe("recovery dispatch statuses remain raw while their intermediate view collapses", () => {
+  test.each(["previous", "root"] as const)("%s recovery lineage keeps only the last empty status, without rewriting 33 rows", (parent) => {
+    const rows: ChatMessage[] = [];
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      const id = `failed-${attempt}`;
+      rows.push({ id, role: "user", text: attempt ? "RECOVERY_CONTROL" : "原始目标", ts: attempt * 3,
+        ...(attempt ? { _recoveryOfClientMessageId: parent === "root" ? "failed-0" : `failed-${attempt - 1}`, _recoveryMode: "replay" as const,
+          _automaticRecovery: true, _automaticRecoveryRootClientMessageId: "failed-0",
+          _automaticRecoveryAttempt: attempt, _automaticRecoveryMax: 10 } : {}) },
+      { id: `turn-status:${id}`, role: "system", text: "", ts: attempt * 3 + 1, _source: "server",
+        _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: id },
+      { id: `error-${id}`, role: "assistant", text: "", ts: attempt * 3 + 2,
+        _errorCode: "ENGINE_ERROR", _clientMessageId: id });
+    }
+    const before = JSON.stringify(rows);
+    expect([...collectRecoveredTurnStatusRecordIds(rows)]).toEqual(
+      Array.from({ length: 10 }, (_, attempt) => `turn-status:failed-${attempt}`));
+    expect(manualTaskContinuationSource(rows, rows[31])).toBe(rows[0]);
+    expect(JSON.stringify(rows)).toBe(before);
+    expect(rows).toHaveLength(33);
+  });
+  test("independent tasks, missing/cyclic or interrupted ancestry, unknown owners and real work stay visible", () => {
+    const root = { id: "root-status-task", role: "user", text: "原目标", ts: 1 } as ChatMessage;
+    const status = { id: "root-status", role: "system", text: "", ts: 2, _source: "server",
+      _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: root.id } as ChatMessage;
+    const child = { ...root, id: "recovery-child", text: "CONTROL", _recoveryOfClientMessageId: root.id };
+    expect(collectRecoveredTurnStatusRecordIds([root, status, child])).toEqual(new Set([status.id]));
+    for (const rows of [
+      [root, status, { ...root, id: "independent" }],
+      [status, child],
+      [root, status, { ...child, _recoveryOfClientMessageId: child.id }],
+      [root, status, { ...root, id: "independent" }, child],
+      [root, { ...status, _clientMessageId: "unknown" }, child],
+      [root, { ...status, text: "真实状态内容" }, child],
+      [root, { ...status, _source: undefined }, child],
+      [root, { ...status, _dispatchTerminal: false }, child],
+    ]) expect(collectRecoveredTurnStatusRecordIds(rows)).toEqual(new Set());
+    for (const work of [
+      { id: "paid-answer", role: "assistant", text: "保留部分回答", _errorCode: "ENGINE_ERROR", ts: 3 },
+      { id: "paid-thinking", role: "thinking", text: "已完成分析", ts: 3 },
+      { id: "paid-tool", role: "tool", text: "", _completed: true, ts: 3 },
+    ] as ChatMessage[]) {
+      expect(collectRecoveredTurnStatusRecordIds([root, status, { ...work, _clientMessageId: root.id }, child])).toEqual(new Set());
+    }
   });
 });

@@ -23,7 +23,7 @@ import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
   deriveBoxFallbackAlias } from "./boxCallFingerprint.js";
-import { type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
+import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";

@@ -42,6 +42,7 @@ import {
 } from "../lib/chat/render";
 import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
+import { collectRecoveredTurnStatusRecordIds } from "../lib/chat/manualTaskContinuation";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
   EAGER_PAYLOAD_TAIL_ITEMS,
@@ -2153,6 +2154,7 @@ export function MessageList({
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
+  const recoveredStatusRecordIds = collectRecoveredTurnStatusRecordIds(safeMessages);
   // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. Automatic
   // and manual children are both hidden. While a child exists, its source
@@ -2213,6 +2215,7 @@ export function MessageList({
       ) &&
       !(isErrorCardHeld(m) && !isErrorCardHeldWithAnswer(m)) &&
       !isRedundantRuntimeEnvelope(m) &&
+      !recoveredStatusRecordIds.has(m.id) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
   ))), turnLineageParents);

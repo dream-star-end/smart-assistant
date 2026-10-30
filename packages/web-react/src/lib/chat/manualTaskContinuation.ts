@@ -1,7 +1,8 @@
 import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import { stoppedNarrationContinuationSource } from "./stoppedNarrationSource";
-import type { ChatMessage } from "./model";
-import { INTERRUPTED_CONTINUE_PROMPT } from "./pure";
+import { isServerAuthoredRow, type ChatMessage } from "./model";
+import { INTERRUPTED_CONTINUE_PROMPT, isRecoveryControlUserTurn } from "./pure";
+import { collectResolvedDispatchTurnIds, collectTurnStatusRecordTurnIds, isErrorCardSupersededByTurnStatus } from "./render";
 
 /** Map a genuine render-only stop back to its exact raw source. A field,
  * suffix or serialized view cannot authorize a task. Current raw ownership is rechecked. */
@@ -29,6 +30,39 @@ export function canonicalTaskContinuationError(
   return messages.find((row) => row.id === error.id);
 }
 
+/** Render-only collapse of empty dispatch failures already followed by a
+ * proven recovery child. Independent tasks and broken lineage stay visible. */
+export function collectRecoveredTurnStatusRecordIds(messages: readonly ChatMessage[]): Set<string> {
+  const recoveredOwners = new Set<string>();
+  let related = new Set<string>();
+  let previous: string | undefined;
+  const produced = new Set<string>();
+  for (const row of messages) {
+    if (row.role === "user") {
+      if (!isRecoveryControlUserTurn(row)) {
+        related = new Set([row.id]);
+        previous = row.id;
+      } else if (previous && row._recoveryOfClientMessageId &&
+          related.has(row._recoveryOfClientMessageId) && !related.has(row.id)) {
+        recoveredOwners.add(previous);
+        related.add(row.id);
+        previous = row.id;
+      } else {
+        related = new Set();
+        previous = undefined;
+      }
+    } else if (row._clientMessageId && !row._turnStatusRecord &&
+        (((row.role === "assistant" || row.role === "thinking") && !!row.text?.trim()) ||
+          (row.role === "tool" && (row._completed === true || !!row.output || !!row.bashTail)))) {
+      produced.add(row._clientMessageId);
+    }
+  }
+  return new Set(messages.filter((row) => row.role === "system" && row._turnStatusRecord === true &&
+    row._dispatchTerminal === true && !!row._errorCode && !row.text?.trim() &&
+    isServerAuthoredRow(row) && !!row._clientMessageId &&
+    recoveredOwners.has(row._clientMessageId) && !produced.has(row._clientMessageId)).map((row) => row.id));
+}
+
 /** An explicit Continue belongs to the latest source, including a turn that
  * never produced output. This grants no automatic-recovery or replay rights. */
 export function manualTaskContinuationSource(
@@ -39,11 +73,18 @@ export function manualTaskContinuationSource(
   if (!canonical) return undefined;
   if (canonical._turnStatusRecord === true && !canonical._errorCode && !canonical._userError && canonical._dispatchTerminal !== true) return undefined;
   const end = messages.indexOf(canonical);
+  // Match the actual renderer: an authoritative visible dispatch status owns
+  // the empty assistant error it suppresses, even when that transport row came later.
+  const statusOwners = canonical.role === "system" && canonical._turnStatusRecord === true && canonical._dispatchTerminal === true &&
+    !!canonical._errorCode && isServerAuthoredRow(canonical)
+    ? collectTurnStatusRecordTurnIds([canonical], collectResolvedDispatchTurnIds(messages))
+    : new Set<string>();
   if (end < 0 || messages.slice(end + 1).some((row) =>
-    row.role === "user" ||
-    (row.role === "assistant" && (!!row._errorCode ||
-      (!row._turnStatusRecord && !row._payloadDeferred && !row._turnTapeProcess && (!!row._userError || !!row.text?.trim())))) ||
-    (row._turnStatusRecord === true && !!row._errorCode))) return undefined;
+    !isErrorCardSupersededByTurnStatus(row, statusOwners) && (
+      row.role === "user" ||
+      (row.role === "assistant" && (!!row._errorCode ||
+        (!row._turnStatusRecord && !row._payloadDeferred && !row._turnTapeProcess && (!!row._userError || !!row.text?.trim())))) ||
+      (row._turnStatusRecord === true && !!row._errorCode)))) return undefined;
   let sourceIndex = canonical.role === "user" ? end : end - 1;
   while (sourceIndex >= 0 && messages[sourceIndex].role !== "user") sourceIndex--;
   const nearestUserIndex = sourceIndex;

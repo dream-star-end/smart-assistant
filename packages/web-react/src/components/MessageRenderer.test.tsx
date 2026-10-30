@@ -4359,7 +4359,7 @@ test("real MessageList keeps one Continue on a terminal error before trailing tr
   render(<MessageList messages={messages} sending={false}
     cb={{ onContinueInterrupted, onRegenerate, resolveInterruptedContinuation: (error) => manualTaskContinuationSource(messages, error) }}
     onRespondPermission={() => {}} />);
-  const buttons = screen.getAllByRole("button", { name: "继续", exact: true });
+  const buttons = screen.getAllByRole("button", { name: "继续" });
   expect(buttons).toHaveLength(1);
   fireEvent.click(buttons[0]);
   expect(onContinueInterrupted).toHaveBeenCalledWith(terminal);

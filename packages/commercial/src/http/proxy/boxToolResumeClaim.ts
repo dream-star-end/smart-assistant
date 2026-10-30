@@ -92,7 +92,8 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
         if (consumed.rowCount) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       }
-      const owner = owners.rows[0]!, ctx = owner.ctx;
+      const owner = owners.rows[0]!;
+      const ctx = owner.ctx;
       const nativeSessionId = ctx.boxNativeSessionId;
       const nativeCliCwd = ctx.boxNativeCliCwd;
       const nativeCliVersion = typeof ctx.boxNativeCliVersion === "string"

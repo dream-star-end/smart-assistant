@@ -1494,7 +1494,7 @@ describe("sealed crashed tape does not keep 结果正在收尾", () => {
       _errorCardSnapshot: soft,
     }), {});
     expect(screen.getByRole("alert")).toHaveTextContent("任务执行失败");
-    expect(screen.getByRole("alert")).toHaveTextContent("任务执行时遇到内部错误，你的消息已保留，可以直接重试。");
+    expect(screen.getByRole("alert")).toHaveTextContent("任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。");
     expect(screen.getByText("博客大纲已写完，正在排版。")).toBeInTheDocument();
     expect(screen.queryByText("结果正在收尾")).toBeNull();
     expect(screen.queryByText(/仍在确认|稍后刷新|不会重复扣费/)).toBeNull();
@@ -1570,7 +1570,7 @@ describe("t1360u current interruption keeps a single Continue", () => {
       const onRegenerate = vi.fn();
       render(<AssistantCard msg={msg} ctx={{ isLast: false, sending: false, inActiveTurn: true, turnFinalAssistant: false }}
         cb={{ resolveInterruptedContinuation: () => userMsg({}), onContinueInterrupted, onRegenerate }} />);
-      const action = await screen.findByRole("button", { name: "继续", exact: true });
+      const action = await screen.findByRole("button", { name: "继续" });
       fireEvent.click(action);
       expect(onContinueInterrupted).toHaveBeenCalledWith(msg);
       expect(onRegenerate).not.toHaveBeenCalled();
