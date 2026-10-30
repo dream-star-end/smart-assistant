@@ -65,7 +65,7 @@ const DELEGATE_LEADER_RESULT_MIN_CHARS = 800
 
 /**
  * 成员回传里的产物路径。成对引号、反引号、尖括号和书名号里的内容一直取到配对结束符,
- * 空格、中文和多个点都算文件名。裸路径在空白、行尾和句末标点处停下,不按点号后的字符类别截断。
+ * 空格、中文和多个点都算文件名。裸路径在空白、行尾和句末标点处停下。点号后面是扩展名,或后面还有扩展名(report.最终版.md),点号留在文件名里。句末 ASCII 点不并进 Read 目标。
  */
 const ARTIFACT_PREFIX = '/home/agent/.openclaude/generated/'
 
@@ -80,7 +80,7 @@ const ARTIFACT_QUOTE_CLOSER: Readonly<Record<string, string>> = {
   '『': '』',
 }
 
-/** 裸路径在这些字符处结束。点号不是句末标点,后面的中文仍属于文件名。 */
+/** 裸路径在这些字符处结束。ASCII 点另判:后面是扩展名,或后面还有扩展名,才继续。 */
 const BARE_PATH_STOP = /[\s`"'\]>,;:!?，。、；：！？…]/u
 
 export function delegateLeaderResultBudget(itemCount: number): number {
@@ -117,6 +117,29 @@ function quotedArtifactSpan(
   return { path, next: end + close.length }
 }
 
+function laterFileExtension(text: string, from: number): boolean {
+  let i = from
+  let depth = 0
+  while (i < text.length) {
+    const ch = text[i] ?? ''
+    if (ch === '(' || ch === '（') {
+      depth += 1
+      i += 1
+      continue
+    }
+    if (ch === ')' || ch === '）') {
+      if (depth === 0) return false
+      depth -= 1
+      i += 1
+      continue
+    }
+    if (depth === 0 && BARE_PATH_STOP.test(ch)) return false
+    if (depth === 0 && (ch === '.' || ch === '．') && /[A-Za-z0-9]/.test(text[i + 1] ?? '')) return true
+    i += 1
+  }
+  return false
+}
+
 function bareArtifactSpan(text: string, prefixAt: number): { path: string; next: number } {
   let i = prefixAt + ARTIFACT_PREFIX.length
   let depth = 0
@@ -136,12 +159,22 @@ function bareArtifactSpan(text: string, prefixAt: number): { path: string; next:
       i += 1
       continue
     }
+    if (ch === '.' || ch === '．') {
+      const next = text[i + 1] ?? ''
+      if (/[A-Za-z0-9]/.test(next) || laterFileExtension(text, i + 1)) {
+        i += 1
+        continue
+      }
+      break
+    }
     if (BARE_PATH_STOP.test(ch)) break
     i += 1
   }
   // 左括号没配上时,括号后面的句子不属于文件名。
   if (depth > 0 && rewindTo >= 0) i = rewindTo
-  const path = text.slice(prefixAt, i)
+  let end = i
+  while (end > prefixAt && /[.．…,;:!?，。、；：！？]/u.test(text[end - 1] ?? '')) end -= 1
+  const path = text.slice(prefixAt, end)
   return { path, next: Math.max(i, prefixAt + ARTIFACT_PREFIX.length) }
 }
 

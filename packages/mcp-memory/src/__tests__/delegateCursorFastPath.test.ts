@@ -407,12 +407,13 @@ describe('truncateDelegateLeaderResult', () => {
     const bare = '/home/agent/.openclaude/generated/trip-plan.md'
     const gz = '/home/agent/.openclaude/generated/archive.tar.gz'
     const csv = '/home/agent/.openclaude/generated/sales.csv'
+    const report = '/home/agent/.openclaude/generated/report.md'
     const text = [
       'H'.repeat(3500),
-      `见 ${bare}。以及 ${gz}。下一句 "${csv}",结束`,
+      `见 ${bare}。以及 ${gz}.下一句 ${report}. "${csv}",结束`,
       'T'.repeat(3500),
     ].join('')
-    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [bare, gz, csv])
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [bare, gz, report, csv])
   })
 
   it('keeps a parenthesized filename and still stops at a markdown link closer', () => {
