@@ -447,7 +447,14 @@ export function shouldAutoContinueEmptyTurn(p: {
  * 上下文重建 system 提示行文案(引擎无法原生续接、走兜底注入历史时)。`n` = 注入的对话条数。
  * 文案严格取自设计合同 §5,四个 agent 共用同一源,勿各写各的。
  */
-export function contextRebuiltNotice(n: number): string {
+export function contextRebuiltNotice(n: number, reason?: "engine-switch" | "native-resume-loss"): string {
+  // W3:新服务说明原因(换了引擎 / 原会话没能续上);旧服务不带 reason,沿用原文案。
+  if (reason === "engine-switch") {
+    return `换了模型引擎，已用最近 ${n} 条对话重建上下文。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。`;
+  }
+  if (reason === "native-resume-loss") {
+    return `原会话没能直接续上，已用最近 ${n} 条对话重建上下文。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。`;
+  }
   return `已重新加载会话上下文(最近 ${n} 条对话摘要)。更早的细节助手可能记不全,如需引用旧内容可直接粘贴。`;
 }
 

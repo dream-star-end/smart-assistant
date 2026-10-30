@@ -3,6 +3,7 @@ import {
   benchmarkBadgeLabel,
   benchmarkSuspect,
   bundleHasEvals,
+  cardBlurb,
   connectorActionEffectLabel,
   connectorActionLabel,
   connectorAuthModeLabel,
@@ -214,6 +215,29 @@ describe('marketAskAiPrefill / marketTrySkillPrefill (AI 导购预填文案)', (
     expect(out).toContain('「学术翻译」')
     expect(out).toContain('slug: academic-translate')
     expect(out).toContain('上手示例')
+  })
+})
+
+describe('cardBlurb (市场卡片的一句人话)', () => {
+  it('技能 / 智能体只取第一句，不改字', () => {
+    expect(cardBlurb('把大纲变成 10 页 PPT。支持自定义模板。', false)).toBe('把大纲变成 10 页 PPT')
+    expect(cardBlurb('学术翻译：中英互译，保留术语', false)).toBe('学术翻译：中英互译，保留术语')
+    expect(cardBlurb('  ', false)).toBe('')
+  })
+
+  it('平台内置插件的技术说明去掉品类名、括注和凭据分句', () => {
+    expect(cardBlurb('飞书自建应用:用 app_id/app_secret 换取租户凭据,读取机器人信息与会话。', true)).toBe(
+      '读取机器人信息与会话',
+    )
+    expect(cardBlurb('GitHub 集成:用个人访问令牌(PAT)读取账号信息与仓库(只读)。', true)).toBe('读取账号信息与仓库')
+    expect(cardBlurb('Notion 集成:检索/查询页面与数据库(需在 Notion 侧创建集成并授权页面)。', true)).toBe(
+      '检索/查询页面与数据库',
+    )
+    expect(cardBlurb('坚果云 / Nextcloud / 通用 WebDAV:浏览目录、读写文件。', true)).toBe('浏览目录、读写文件')
+  })
+
+  it('插件说明全是凭据字眼时退回第一句原文，不出空卡', () => {
+    expect(cardBlurb('用 API Key 登录。', true)).toBe('用 API Key 登录')
   })
 })
 

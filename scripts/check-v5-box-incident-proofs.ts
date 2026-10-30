@@ -3714,7 +3714,7 @@ async function main(): Promise<void> {
     ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db), await (await import("./lib/boxStaleRecoveryProof.js")).proveStoppedRecoveryClaim({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), // [box-stopped-recovery-claim] PASS
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
-      await proveIdleNoSummary(api, db),
+      await proveIdleNoSummary(api, db), await (await import("./lib/tapeJobTerminalProof.js")).proveTapeJobTerminals(CANDIDATE, db), // [ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key
       await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),

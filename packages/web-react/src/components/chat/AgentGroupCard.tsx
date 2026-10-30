@@ -19,9 +19,9 @@ import { DelegateProcessList } from "./delegateProcessList";
 import { delegateTokenUsage, TokenUsageBadge } from "./tokenUsage";
 
 /** 终态图标(与 agentTerminalStatus tone 对齐):完成→Users、失败→X、超时→Clock。 */
-export function TerminalIcon({ tone, size }: { tone: "success" | "danger" | "warning"; size: number }) {
+export function TerminalIcon({ tone, size }: { tone: "success" | "danger" | "warning" | "neutral"; size: number }) {
   if (tone === "warning") return <Clock size={size} />;
-  if (tone === "danger") return <X size={size} />;
+  if (tone === "danger" || tone === "neutral") return <X size={size} />;
   return <Users size={size} />;
 }
 
@@ -271,7 +271,7 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
           <span
             className={cn(
               "mt-0.5 shrink-0",
-              status.tone === "danger" ? "text-danger" : status.tone === "warning" ? "text-warning" : "text-success",
+              status.tone === "danger" ? "text-danger" : status.tone === "warning" ? "text-warning" : status.tone === "neutral" ? "text-muted" : "text-success",
             )}
             data-testid="agent-summary-icon"
             data-tone={status.tone}

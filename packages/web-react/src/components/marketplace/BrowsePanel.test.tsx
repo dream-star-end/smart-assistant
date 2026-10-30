@@ -66,10 +66,12 @@ test("空查询渲染分区视图:平台精选 + 分类分区 + 未分类兜底"
 
   render(<BrowsePanel auth={auth} />);
 
-  expect(await screen.findByPlaceholderText("搜索技能")).toBeInTheDocument();
-  // 提示词是可点的芯片(K-06),不再是一行带引号的纯文字。
-  expect(screen.getByRole("button", { name: "翻译" })).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "论文" })).toBeInTheDocument();
+  // UI-5:「试试」并进搜索框占位词,不再单独占一行芯片(和分类筛选叠成两行筛选,UI-SPEC M6)。
+  expect(await screen.findByRole("searchbox", { name: "搜索技能" })).toHaveAttribute(
+    "placeholder",
+    "搜索技能，试试「翻译」「论文」",
+  );
+  expect(screen.queryByRole("button", { name: "翻译" })).not.toBeInTheDocument();
   // 分区区头(heading 角色,不与同名 chip 冲突)
   expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "办公文档" })).toBeInTheDocument();
@@ -379,7 +381,7 @@ test("卡片描述两行截断:line-clamp-2 不与 block 同挂,且对辅助技�
   expect(cardBtn).toHaveAccessibleDescription("d");
 });
 
-test("分类筛选片带 aria-pressed;提示词芯片点一下即搜(K-06 / K-07)", async () => {
+test("分类筛选片带 aria-pressed;搜索框输入经防抖后才发请求(K-07)", async () => {
   searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
   listMarketplaceInstalled.mockResolvedValue([]);
 
@@ -389,9 +391,13 @@ test("分类筛选片带 aria-pressed;提示词芯片点一下即搜(K-06 / K-07
   fireEvent.click(screen.getByRole("button", { name: "办公文档", pressed: false }));
   expect(screen.getByRole("button", { name: "办公文档", pressed: true })).toBeInTheDocument();
 
-  fireEvent.click(screen.getByRole("button", { name: "翻译" }));
-  expect((screen.getByPlaceholderText("搜索技能") as HTMLInputElement).value).toBe("翻译");
+  const calls = searchMarketplace.mock.calls.length;
+  fireEvent.change(screen.getByRole("searchbox", { name: "搜索技能" }), { target: { value: "翻" } });
+  fireEvent.change(screen.getByRole("searchbox", { name: "搜索技能" }), { target: { value: "翻译" } });
+  // 连续两次输入只发一次请求,带的是最后的值。
+  expect(searchMarketplace).toHaveBeenCalledTimes(calls);
   await waitFor(() => expect(searchMarketplace.mock.calls.at(-1)?.[1]).toBe("翻译"));
+  expect(searchMarketplace).toHaveBeenCalledTimes(calls + 1);
 });
 
 test("目录未装满一页 → 不出现「加载更多」", async () => {
@@ -507,16 +513,35 @@ test("首屏失败不会误报成空目录，保留可重试出口", async () =>
   expect(await screen.findByRole("button", { name: /PPT 生成器/ })).toBeInTheDocument();
 });
 
-test("搜索时让出展厅标题空间，清空后恢复发现", async () => {
+test("没有 hero:搜索时分区换成平铺结果,清空后回到分区(UI-5)", async () => {
   searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
   listMarketplaceInstalled.mockResolvedValue([]);
   render(<BrowsePanel auth={auth} />);
-  expect(screen.getByRole("region", { name: "探索市场" })).toBeInTheDocument();
-  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "PPT" } });
+  await screen.findByRole("heading", { name: "平台精选" });
+  // 改造前打开市场先是半屏「好工具，让想法更进一步。」,手机上一张卡都看不到(UI-SPEC M2)。
   expect(screen.queryByRole("region", { name: "探索市场" })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "PPT" } });
   await waitFor(() => expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "PPT", "skill", 50));
+  expect(await screen.findByRole("heading", { name: "“PPT” 的结果" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "平台精选" })).not.toBeInTheDocument();
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "" } });
-  expect(screen.getByRole("region", { name: "探索市场" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "平台精选" })).toBeInTheDocument();
+});
+
+test("卡片主按钮:没装的「安装」、装了的「已安装」,点哪里都是开详情(UI-5)", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([
+    { slug: "word", kind: "skill", name: "Word 排版", version: "1.0.0", versionId: "1", artifactHash: "h", installedAt: "2026-10-01T00:00:00Z", listingState: "active" },
+  ]);
+  render(<BrowsePanel auth={auth} />);
+  const ppt = await screen.findByRole("button", { name: /^PPT 生成器/ });
+  expect(ppt).toHaveTextContent(/安装$/);
+  expect(ppt).not.toHaveTextContent("已安装");
+  await waitFor(() => expect(screen.getByRole("button", { name: /^Word 排版/ })).toHaveTextContent("已安装"));
+  // 卡片里的主按钮只是整卡按钮的一部分,不另占一个 Tab 停靠点。
+  expect(screen.queryByRole("button", { name: "安装" })).not.toBeInTheDocument();
+  fireEvent.click(ppt);
+  expect(screen.getByTestId("detail-slug")).toHaveTextContent("ppt");
 });
 
 // ── 插件类目:市场搜索结果 ∪ 内置插件 + 状态徽标(OCV5-379) ─────────────────────
@@ -624,6 +649,46 @@ test("插件类目:内置插件并入目录并带状态,点内置卡直接去管
     (signals as { entitySlug: string }[]).map((x) => x.entitySlug),
   );
   expect(exposed).toEqual(["weibo"]);
+});
+
+test("插件类目:装了没连账号的市场插件,主按钮「连接」直接去管理中心;卡片本身仍开详情(UI-5)", async () => {
+  searchMarketplace.mockResolvedValue({ results: [WEIBO_CARD], method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  mockPluginDirectory();
+  getPluginManagement.mockResolvedValue({
+    catalog: [
+      {
+        versionId: "v2",
+        slug: "weibo",
+        pluginType: "managed-browser",
+        label: "微博",
+        description: "",
+        accountMode: "required",
+        actions: [],
+        installed: true,
+        installedVersion: "1.0.0",
+        latestVersionId: "v2",
+        latestVersion: "1.0.0",
+        installedCurrent: true,
+        updateAvailable: false,
+        available: true,
+      },
+    ],
+    accounts: [],
+  });
+  const onOpenConnectors = vi.fn();
+
+  render(<BrowsePanel auth={auth} kind="connector" onOpenConnectors={onOpenConnectors} />);
+  const connect = await screen.findByRole("button", { name: "连接「微博」" });
+  expect(within(screen.getByRole("button", { name: /^微博/ })).getByTestId("plugin-state")).toHaveTextContent("待授权");
+  fireEvent.click(connect);
+  expect(onOpenConnectors).toHaveBeenCalledWith("weibo");
+  expect(screen.queryByTestId("detail-slug")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: /^微博/ }));
+  expect(screen.getByTestId("detail-slug")).toHaveTextContent("weibo");
+  // 预装插件点整卡就去管理中心,不再多一枚「连接」按钮。
+  expect(screen.queryByRole("button", { name: "连接「GitHub」" })).not.toBeInTheDocument();
 });
 
 test("插件类目搜索态:只并入命中关键词的内置插件", async () => {
