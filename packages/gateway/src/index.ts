@@ -130,6 +130,7 @@ export {
   isContentReviewSessionBanned,
   observeUserContentReview,
   setContentReviewAlerter,
+  setContentReviewPrefilter,
 } from './jevContentReview.js'
 export { getContentReviewStore } from './contentReviewStore.js'
 export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'

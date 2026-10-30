@@ -7,6 +7,7 @@ import {
   type TextVerdict,
   decideModeration,
   detectPromptInjection,
+  prefilterTutorialWithOmni,
   evaluateTutorialText,
   parseTextVerdict,
   parseVisionVerdict,
@@ -386,5 +387,41 @@ describe('tutorialModeration · 正文判定', () => {
       ),
       /text status 503/,
     )
+  })
+})
+
+describe('tutorialModeration · omni 前置', () => {
+  test('硬违规用模板驳回，无 key 不调用审核接口', async () => {
+    let calls = 0
+    const hit = await prefilterTutorialWithOmni({
+      title: '标题',
+      summary: '摘要',
+      bodyMarkdown: '正文',
+      images: [],
+      apiKey: 'sk-test-not-a-real-key-9876',
+      fetchImpl: async () => {
+        calls += 1
+        return new Response(JSON.stringify({
+          results: [{ flagged: true, categories: { 'sexual/minors': true } }],
+        }), { status: 200 })
+      },
+    })
+    assert.equal(hit?.verdict, 'reject')
+    assert.match(hit?.reason ?? '', /违规/)
+    assert.equal((hit?.reason ?? '').includes('sexual'), false)
+    assert.match(hit?.adminNote ?? '', /未成年色情/)
+    assert.equal(calls, 1)
+
+    const miss = await prefilterTutorialWithOmni({
+      title: '标题',
+      summary: '摘要',
+      bodyMarkdown: '正文',
+      images: [],
+      apiKey: null,
+      fetchImpl: async () => {
+        throw new Error('should not call')
+      },
+    })
+    assert.equal(miss, null)
   })
 })

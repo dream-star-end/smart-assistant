@@ -16,7 +16,9 @@ import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.j
 import { isInMaintenance } from './middleware/maintenanceMode.js';
 import { HttpError, sendJson } from './http/util.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
-import { setContentReviewAlerter } from '@openclaude/gateway'
+import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway'
+import { omniHardHit } from './openai/omniModeration.js'
+import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
@@ -6092,12 +6094,14 @@ export async function registerCommercial(
     broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
   };
 
-  // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
-  // then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
+  // Browser voice input. A usable OpenAI key buffers the clip and posts it to
+  // gpt-transcribe. Otherwise MediaRecorder streams to Deepgram Nova-3.
+  // Then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
   // Master-only commercial path: no runtime image rebuild required.
   const voiceTranscribeHandler: VoiceTranscribeHandler = createVoiceTranscribeHandler({
     jwtSecret,
     deepgramApiKey: cfg.DEEPGRAM_API_KEY,
+    resolveOpenAiApiKey: () => selectOpenAiPlatformKey("voice-transcribe"),
     openCodeGoApiKey: cfg.OPENCODE_GO_API_KEY,
     asrModel: cfg.VOICE_ASR_MODEL,
     asrLanguage: cfg.VOICE_ASR_LANGUAGE,
@@ -7117,6 +7121,15 @@ export async function registerCommercial(
   }
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
+  setContentReviewPrefilter(async (text) => {
+    try {
+      const key = await selectOpenAiPlatformKey('omni-moderate')
+      const result = await omniHardHit({ apiKey: key, text, timeoutMs: 2_000 })
+      return result.hit
+    } catch {
+      return false
+    }
+  })
 
   void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { EventEmitter, once } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createNetServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -8,6 +9,7 @@ import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { after, before, describe, test } from 'node:test'
 
 import { createChatGptProxyServer, type ChatGptProxyServer } from '../server.js'
+import { createLogger } from '../../logging/logger.js'
 
 /**
  * Fake upstream HTTP CONNECT proxy: answers 200 and echoes bytes back upper-cased
@@ -99,6 +101,7 @@ describe('chatgpt proxy server', () => {
   let entitled = true
   const allowlist: number[] = [7]
   const used: number[] = []
+  const tunnelEvents = new EventEmitter()
 
   before(async () => {
     dir = mkdtempSync(join(tmpdir(), 'oc-cgp-'))
@@ -115,6 +118,12 @@ describe('chatgpt proxy server', () => {
         uid === 3 ? 'admin' : uid === 7 || uid === 9 ? 'user' : null,
       getEntitlement: async () => ({ assembled: entitled, allowlist }),
       onTunnelUsed: (uid) => used.push(uid),
+      logger: createLogger({
+        level: 'info',
+        out: (line) => {
+          if (JSON.parse(line).msg === 'chatgpt_proxy.tunnel_closed') tunnelEvents.emit('closed')
+        },
+      }),
       listenHost: '127.0.0.1',
     })
     port = (await proxy.listen()).port
@@ -203,8 +212,11 @@ describe('chatgpt proxy server', () => {
       r.socket.write('hello tunnel')
     })
     assert.equal(echoed, 'HELLO TUNNEL')
+    // Client destruction is asynchronous across the TLS connection. Observe the
+    // server's cleanup completion before checking its exact reservation count.
+    const closed = once(tunnelEvents, 'closed', { signal: AbortSignal.timeout(5_000) })
     r.socket.destroy()
-    await new Promise((res) => setTimeout(res, 50))
+    await closed
     assert.equal(proxy.activeTunnels(), 0)
   })
 

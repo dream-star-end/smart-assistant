@@ -217,6 +217,11 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         if (await toggle.getAttribute("aria-expanded")!=="true") await toggle.click();
         const detailToggle = shell.getByTestId("process-detail-toggle");
         if (await detailToggle.count() && await detailToggle.getAttribute("aria-expanded")!=="true") await detailToggle.click();
+        // UI-3: each step is a human title row; the original thinking/tool card is its 技术详情.
+        for (const row of await shell.getByTestId("process-step-row").all()) {
+          const rowToggle = row.getByRole("button").first();
+          if (await rowToggle.getAttribute("aria-expanded") !== "true") await rowToggle.click();
+        }
         // The step button's name carries its duration since OCV5-367 (「思考 <0.1 秒」).
         const thinkingToggle = shell.getByTestId("thinking-step").getByRole("button", { name: /^思考(\s|$)/ });
         assert.equal(await thinkingToggle.count(), 1, "one source thinking step");

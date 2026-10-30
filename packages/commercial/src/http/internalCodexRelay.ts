@@ -952,6 +952,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         return
       }
       if (!image2Enabled) {
+        userLog.warn('image2_disabled')
         sendJsonError(res, 503, 'IMAGE2_DISABLED', 'Image 2 is temporarily unavailable', requestId)
         return
       }

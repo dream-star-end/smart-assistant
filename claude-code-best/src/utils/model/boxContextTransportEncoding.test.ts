@@ -34,7 +34,7 @@ function params(messages: unknown[]) {
 }
 function padding() {
   return Array.from({ length: 69 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user',
-    content: `${i}:` + 'x'.repeat(256 * 1024) }))
+    content: `${i}:${'x'.repeat(256 * 1024)}` }))
 }
 
 test('canonical prefix digests preserve array nulls, escapes, ordering and original toJSON keys', async () => {
@@ -68,7 +68,7 @@ test('in-place old message edits invalidate a cached reference on the next invoc
   const before = server.stages()
   await sendWithBoxContextTransport(server.client, input, new AbortController().signal, send)
   expect(server.stages()).toBe(before)
-  messages[0]!.content = 'edited in place: ' + messages[0]!.content
+  messages[0]!.content = `edited in place: ${messages[0]!.content}`
   await sendWithBoxContextTransport(server.client, input, new AbortController().signal, send)
   expect(server.stages()).toBeGreaterThan(before)
 })

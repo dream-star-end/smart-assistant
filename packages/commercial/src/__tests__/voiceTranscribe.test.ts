@@ -270,4 +270,271 @@ describe("voiceTranscribe websocket", () => {
     assert.equal(final?.text, "晚上好呀，你在干什么？");
     assert.equal(final?.changed, true);
   });
+
+  test("gpt-transcribe posts the buffered clip and does not open Deepgram", async () => {
+    const seen: string[] = [];
+    let deepgramOpened = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      openAiApiKey: "sk-test-not-a-real-key-9876",
+      logger: {
+        trace() {},
+        debug() {},
+        info(msg, fields) { seen.push(`${msg} ${JSON.stringify(fields ?? {})}`); },
+        warn(msg, fields) { seen.push(`${msg} ${JSON.stringify(fields ?? {})}`); },
+        error(msg, fields) { seen.push(`${msg} ${JSON.stringify(fields ?? {})}`); },
+        child() { return this; },
+      },
+      createDeepgramSocket: () => {
+        deepgramOpened = true;
+        throw new Error("deepgram should not open");
+      },
+      fetchImpl: async (url, init) => {
+        assert.equal(String(url), "https://api.openai.com/v1/audio/transcriptions");
+        assert.doesNotMatch(String(url), /sk-test/);
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer sk-test-not-a-real-key-9876");
+        assert.equal(headers["Content-Type"], undefined);
+        assert.equal((init as { dispatcher?: unknown }).dispatcher == null, false);
+        const form = init?.body;
+        assert.ok(form instanceof FormData);
+        assert.equal(form.get("model"), "gpt-transcribe");
+        assert.equal(form.get("response_format"), "json");
+        assert.equal(form.get("language"), "zh");
+        assert.equal(form.get("prompt"), "OpenClaude");
+        const file = form.get("file");
+        assert.ok(file instanceof Blob);
+        assert.equal((file as File).name, "audio.webm");
+        assert.equal(Buffer.from(await file.arrayBuffer()).toString(), "helloworld");
+        return new Response(JSON.stringify({ text: "你好世界" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({
+      type: "start",
+      mimeType: "audio/webm;codecs=opus",
+      keyterms: ["OpenClaude"],
+    })));
+    const ready = await recvJson(ws);
+    assert.equal(ready.type, "ready");
+    assert.equal(ready.model, "gpt-transcribe");
+    ws.send(Buffer.from("hello"));
+    ws.send(Buffer.from("world"));
+    const framesP = new Promise<Record<string, unknown>[]>((resolve) => {
+      const frames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        frames.push(msg);
+        if (msg.type === "polish" || msg.type === "error") resolve(frames);
+      });
+    });
+    ws.send(JSON.stringify({ type: "stop" }));
+    const frames = await framesP;
+    assert.equal(deepgramOpened, false);
+    assert.equal(frames.some((m) => m.type === "stopping"), true);
+    const transcript = frames.find((m) => m.type === "transcript");
+    assert.equal(transcript?.text, "你好世界");
+    assert.equal(transcript?.isFinal, true);
+    const polish = frames.at(-1);
+    assert.equal(polish?.type, "polish");
+    assert.equal(polish?.text, "你好世界");
+    assert.equal(polish?.skipped, true);
+    assert.equal(seen.join("\n").includes("sk-test-not-a-real-key-9876"), false);
+  });
+
+  test("uses the session resolver and ignores a static key when the pool has no usable key", async () => {
+    let deepgramOpened = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      openAiApiKey: "sk-static-should-not-be-used",
+      resolveOpenAiApiKey: async () => null,
+      createDeepgramSocket: (url, options) => {
+        deepgramOpened = true;
+        assert.equal(options.headers.Authorization, "Token dg_secret");
+        assert.doesNotMatch(url, /sk-static/);
+        const fake = new EventEmitter() as EventEmitter & { readyState: number; close: () => void };
+        fake.readyState = WebSocket.CONNECTING;
+        fake.close = () => { fake.readyState = WebSocket.CLOSED; fake.emit("close"); };
+        setImmediate(() => { fake.readyState = WebSocket.OPEN; fake.emit("open"); });
+        return fake as unknown as WebSocket;
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    assert.equal(deepgramOpened, true);
+    ws.close();
+  });
+
+  test("prefers a resolved OpenAI key over Deepgram", async () => {
+    let deepgramOpened = false;
+    let seenAuth = "";
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      openAiApiKey: "sk-static-should-not-be-used",
+      resolveOpenAiApiKey: async () => "sk-pool-not-a-real-key",
+      createDeepgramSocket: () => {
+        deepgramOpened = true;
+        throw new Error("deepgram should not open");
+      },
+      fetchImpl: async (_url, init) => {
+        seenAuth = ((init?.headers ?? {}) as Record<string, string>).Authorization ?? "";
+        return new Response("nope", { status: 500 });
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    ws.send(Buffer.from("audio"));
+    ws.send(JSON.stringify({ type: "stop" }));
+    const frames: Record<string, unknown>[] = [];
+    const error = await new Promise<Record<string, unknown>>((resolve) => {
+      ws.on("message", (data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        frames.push(msg);
+        if (msg.type === "error" || msg.type === "polish") resolve(msg);
+      });
+    });
+    assert.equal(error.type, "error");
+    assert.equal(error.code, "VOICE_UPSTREAM_ERROR");
+    assert.equal(frames.some((m) => m.type === "polish"), false);
+    assert.equal(deepgramOpened, false);
+    assert.equal(seenAuth, "Bearer sk-pool-not-a-real-key");
+  });
+
+  test("blank or broken OpenAI key keeps VOICE_NOT_CONFIGURED when Deepgram is unset", async () => {
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      openAiApiKey: "sk-test\nsecret",
+      fetchImpl: async () => {
+        throw new Error("paid api should not be called");
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    const msg = await recvJson(ws);
+    assert.equal(msg.type, "error");
+    assert.equal(msg.code, "VOICE_NOT_CONFIGURED");
+  });
+
+  test("lookup failure falls through to Deepgram and does not call OpenAI", async () => {
+    let deepgramOpened = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      resolveOpenAiApiKey: async () => {
+        throw new Error("db down");
+      },
+      createDeepgramSocket: () => {
+        deepgramOpened = true;
+        const fake = new EventEmitter() as EventEmitter & { readyState: number; close: () => void };
+        fake.readyState = WebSocket.CONNECTING;
+        fake.close = () => { fake.readyState = WebSocket.CLOSED; fake.emit("close"); };
+        setImmediate(() => { fake.readyState = WebSocket.OPEN; fake.emit("open"); });
+        return fake as unknown as WebSocket;
+      },
+      fetchImpl: async () => {
+        throw new Error("paid api should not be called");
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    assert.equal(deepgramOpened, true);
+    ws.close();
+  });
+
+  test("openai ready arms the no-audio timeout without calling the paid api", async () => {
+    let called = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      openAiApiKey: "sk-test-not-a-real-key-9876",
+      noAudioTimeoutMs: 5_000,
+      fetchImpl: async () => {
+        called = true;
+        throw new Error("paid api should not be called");
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    const msg = await recvJson(ws);
+    assert.equal(msg.type, "error");
+    assert.equal(msg.code, "VOICE_NO_AUDIO_TIMEOUT");
+    assert.equal(called, false);
+  });
+
+  test("rejects an openai clip that exceeds the buffer cap before any upload", async () => {
+    let called = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      openAiApiKey: "sk-test-not-a-real-key-9876",
+      maxBufferedAudioBytes: 1024,
+      fetchImpl: async () => {
+        called = true;
+        throw new Error("paid api should not be called");
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    ws.send(Buffer.alloc(600));
+    ws.send(Buffer.alloc(600));
+    const msg = await recvJson(ws);
+    assert.equal(msg.type, "error");
+    assert.equal(msg.code, "VOICE_AUDIO_TOO_LARGE");
+    assert.equal(called, false);
+  });
+
+  test("stop with no audio does not call gpt-transcribe", async () => {
+    let called = false;
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      openAiApiKey: "sk-test-not-a-real-key-9876",
+      fetchImpl: async () => {
+        called = true;
+        throw new Error("paid api should not be called");
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    const framesP = new Promise<Record<string, unknown>[]>((resolve) => {
+      const frames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        frames.push(msg);
+        if (msg.type === "polish" || msg.type === "error") resolve(frames);
+      });
+    });
+    ws.send(JSON.stringify({ type: "stop" }));
+    const frames = await framesP;
+    assert.equal(called, false);
+    assert.equal(frames.at(-1)?.type, "polish");
+    assert.equal(frames.at(-1)?.text, "");
+    assert.equal(frames.at(-1)?.skipped, true);
+  });
+});
+
+const indexSource = readFileSync(resolve(import.meta.dirname, "..", "index.ts"), "utf-8");
+
+test("voice handler resolves the openai pool key per session", () => {
+  assert.match(
+    indexSource,
+    /resolveOpenAiApiKey:\s*\(\)\s*=>\s*selectOpenAiPlatformKey\("voice-transcribe"\)/,
+  );
 });

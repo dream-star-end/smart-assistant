@@ -78,6 +78,7 @@ import { getCodexTokenSnapshot } from "../account-pool/store.js";
 import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
 import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
 import { appendCoreMemoryEmbeddingEnv } from "./coreMemoryEmbeddingEnv.js";
+import { selectOpenAiPlatformKey } from "../openai/openAiPlatformKey.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
@@ -2873,9 +2874,11 @@ export async function provisionV3Container(
       }
     }
     appendCodexRelayEnv(env);
-    // Core-memory local semantic recall: forward master embedding knobs
-    // (skip missing keys) and pin the DashScope batch limit + feature gate.
-    appendCoreMemoryEmbeddingEnv(env);
+    // Core-memory local semantic recall. No OpenAI key keeps the DashScope
+    // batch pin. A pool or env key switches the container to
+    // text-embedding-3-large (1024) and the OpenAI batch size.
+    const openAiApiKey = await selectOpenAiPlatformKey("core-memory-embed");
+    appendCoreMemoryEmbeddingEnv(env, { openAiApiKey });
 
     // 工具失败遥测显式开关透传:仅当 master 进程 env 显式设 OC_TOOL_FAILURE_AUDIT=1
     // 才注入容器(容器侧 v3ToolFailureReporter 与 master 侧 internalToolFailureAudit
