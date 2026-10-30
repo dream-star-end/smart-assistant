@@ -546,8 +546,21 @@ export const SDKControlElicitationResponseSchema = lazySchema(() =>
 // Control Request/Response Wrappers
 // ============================================================================
 
+export const SDKControlBoxAgentScopeRequestSchema = lazySchema(() =>
+  z.strictObject({
+    subtype: z.literal('box_agent_scope'), version: z.literal(1),
+    operation: z.enum(['register', 'detach', 'explicit-stop', 'finish']),
+    scopeId: z.string().uuid(), rootSessionId: z.string().uuid(),
+    sessionId: z.string().uuid(), agentId: z.string().min(1).max(256),
+    turnKey: z.string().regex(/^[a-f0-9]{64}$/),
+    parentScopeId: z.string().uuid().nullable(), background: z.boolean(),
+    sequence: z.number().int().positive(),
+  }),
+)
+
 export const SDKControlRequestInnerSchema = lazySchema(() =>
   z.union([
+    SDKControlBoxAgentScopeRequestSchema(),
     SDKControlInterruptRequestSchema(),
     SDKControlPermissionRequestSchema(),
     SDKControlInitializeRequestSchema(),

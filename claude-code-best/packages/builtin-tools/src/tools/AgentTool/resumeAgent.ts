@@ -1,3 +1,4 @@
+import { captureBoxAgentOrigin, createBoxAgentInvocation } from 'src/utils/boxAgentScope.js'
 import { promises as fsp } from 'fs'
 import { getSdkAgentProgressSummariesEnabled } from 'src/bootstrap/state.js'
 import { getSystemPrompt } from 'src/constants/prompts.js'
@@ -53,6 +54,7 @@ export async function resumeAgentBackground({
   canUseTool: CanUseToolFn
   invokingRequestId?: string
 }): Promise<ResumeAgentResult> {
+  const boxOrigin = captureBoxAgentOrigin()
   const startTime = Date.now()
   const appState = toolUseContext.getAppState()
   // In-process teammates get a no-op setAppState; setAppStateForTasks
@@ -216,6 +218,7 @@ export async function resumeAgentBackground({
 
   const asyncAgentContext = {
     agentId,
+    boxInvocation: createBoxAgentInvocation(boxOrigin, agentId, true),
     parentSessionId: getParentSessionId(),
     agentType: 'subagent' as const,
     subagentName: selectedAgent.agentType,

@@ -298,7 +298,7 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   if (path === "claude-code-best/src/utils/model/boxContextTransport.test.ts"
-    || ["messages", "sessionFileIo", "nativeTranscriptRecovery", "sessionTranscriptReader", "sessionTranscriptQueue"].some(name => path === `claude-code-best/src/utils/__tests__/${name}.test.ts`)) {
+    || ["messages", "sessionFileIo", "nativeTranscriptRecovery", "sessionTranscriptReader", "sessionTranscriptQueue", "boxAgentScope"].some(name => path === `claude-code-best/src/utils/__tests__/${name}.test.ts`)) {
     const command = JSON.parse(ROOT_PACKAGE_JSON).scripts?.["test:ccb:box-context"];
     if (typeof command !== "string" || !command.includes(path.replace("claude-code-best/", ""))) {
       fail(`${path} 未列进 test:ccb:box-context 的实际文件清单`);

@@ -1,3 +1,4 @@
+import { stopBoxAgentById } from '../utils/boxAgentScope.js'
 // Shared logic for stopping a running task.
 // Used by TaskStopTool (LLM-invoked) and SDK stop_task control request.
 
@@ -26,6 +27,7 @@ type StopTaskResult = {
   taskId: string
   taskType: string
   command: string | undefined
+  remoteStop?: 'pending' | 'stopped'
 }
 
 /**
@@ -62,6 +64,7 @@ export async function stopTask(
     )
   }
 
+  const remoteStop = task.type === 'local_agent' ? await stopBoxAgentById(taskId) : undefined
   await taskImpl.kill(taskId, setAppState)
 
   // Bash: suppress the "exit code 137" notification (noise). Agent tasks: don't
@@ -96,5 +99,5 @@ export async function stopTask(
 
   const command = isLocalShellTask(task) ? task.command : task.description
 
-  return { taskId, taskType: task.type, command }
+  return { taskId, taskType: task.type, command, ...(remoteStop ? { remoteStop } : {}) }
 }

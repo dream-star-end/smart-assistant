@@ -163,6 +163,30 @@ export function _interruptDelegationsForParent(this: DelegateGuardHost, parentSe
   return interrupted
 }
 
+/** The receipt path must also await each live delegated Box owner's durable
+ * fence. Queued work retains the existing cancellation/wakeup behavior. */
+export async function interruptDelegationsForReceipt(host: DelegateGuardHost,
+  parentSessionKey:string,visited=new Set<string>()):Promise<boolean> {
+  if (visited.has(parentSessionKey)) return false
+  visited.add(parentSessionKey)
+  // Thin legacy test/adapter hosts have no registry; the real Gateway always does.
+  if (!host._activeDelegationsByParent) return host._interruptDelegationsForParent(parentSessionKey)
+  const children=host._activeDelegationsByParent.get(parentSessionKey)
+  if (!children) return false
+  let interrupted=false
+  for (const key of [...children]) {
+    const descendants=await interruptDelegationsForReceipt(host,key,visited)
+    interrupted=cancelDelegateTraceWait(host,key) || descendants || interrupted
+    host._advisorConsultAborts?.get(key)?.abort()
+    const queued=host._delegateQueueWaiters?.get(key)
+    if (queued) {queued();interrupted=true}
+    if (!host.sessions.getByKey(key)) {children.delete(key);continue}
+    interrupted=await (host.sessions.interruptForReceipt?.(key) ?? host.sessions.interrupt(key,'user')) || interrupted
+  }
+  if (!children.size) host._activeDelegationsByParent.delete(parentSessionKey)
+  return interrupted
+}
+
 export function _liveMainSessionForClient(this: DelegateGuardHost, sessionId: string, userId: string): AgentSession | undefined {
   const live = this.sessions.getByKey(`agent:main:webchat:dm:${sessionId}`)
   if (!live || live.agentId !== 'main') return undefined

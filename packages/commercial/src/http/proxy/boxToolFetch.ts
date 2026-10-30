@@ -277,12 +277,20 @@ export class BoxToolFetch {
     const candidates = await this.deps.journal.listPrelaunchRecoveryCandidates(limit);
     let settled = 0;
     await Promise.allSettled(candidates.map(async (candidate) => {
-      if (this.prelaunchInFlight.has(candidate.runNonce)) return;
+      if (await this.recoverPrelaunchCandidate(candidate)) settled++;
+    }));
+    return settled;
+  }
+
+  /** Exact cancelled scopes may clean a proven unarmed private stage immediately. */
+  async recoverPrelaunchCandidate(candidate: BoxPrelaunchRecoveryCandidate,
+    cancelledScopeId?: string): Promise<boolean> {
+      if (this.prelaunchInFlight.has(candidate.runNonce)) return false;
       this.prelaunchInFlight.add(candidate.runNonce);
       let target: BoxResolvedTarget | null = null;
       let targetWasOwned = false;
       try {
-        if (!await this.deps.journal.claimPrelaunchRecovery(candidate)) return;
+        if (!await this.deps.journal.claimPrelaunchRecovery(candidate,cancelledScopeId)) return false;
         target = await this.resolveCleanupTarget(candidate);
         targetWasOwned = this.targets.get(candidate.runNonce)?.has(target) ?? false;
         if (target.accountId !== candidate.accountId) {
@@ -313,13 +321,11 @@ export class BoxToolFetch {
           && owned.leaseEpoch === candidate.leaseEpoch) {
           await this.releaseLocalTargets(candidate.runNonce);
         }
-        settled++;
+        return true;
       } finally {
         if (target && !targetWasOwned) this.closeUnusedTarget(target);
         this.prelaunchInFlight.delete(candidate.runNonce);
       }
-    }));
-    return settled;
   }
 
   private async cleanedElsewhere(candidate: BoxRemoteCleanupCandidate): Promise<boolean> {

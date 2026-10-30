@@ -13,7 +13,8 @@ import type { BoxResolvedTarget } from "./boxTextFetch.js";
 type Identity = Pick<BoxJournalAdmission,
   "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">;
 type Journal = Pick<BoxDurableJournal, "recordUserCancelIntent" | "getCancelLeaf" |
-  "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure">;
+  "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure">
+  & Partial<Pick<BoxDurableJournal,"recordScopeCancelIntent">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 export type BoxUserStopOutcome = "stopped_proven" | "completed_unsettled" | "pending";
@@ -92,11 +93,16 @@ export class BoxUserStopCoordinator {
     } finally { if (timer) clearTimeout(timer); }
   }
 
-  async requestStop(input: Identity): Promise<BoxUserStopOutcome> {
+  async requestStop(input: Identity, scope?: { scopeId: string; reason: "explicit-stop" | "finish" | "owner-lost" }): Promise<BoxUserStopOutcome> {
     // This must commit before the first remote stop Exec. Failure here must
     // propagate to the authenticated caller; do not signal an unjournaled run.
     const journalTimeoutMs = this.deps.journalTimeoutMs ?? 5_000;
-    try { await bounded(this.deps.journal.recordUserCancelIntent(input), journalTimeoutMs); }
+    try {
+      if (scope) {
+        if (!this.deps.journal.recordScopeCancelIntent) return "pending";
+        await bounded(this.deps.journal.recordScopeCancelIntent({ ...input,...scope }),journalTimeoutMs);
+      } else await bounded(this.deps.journal.recordUserCancelIntent(input), journalTimeoutMs);
+    }
     catch (error) {
       if (error instanceof BoxUserStopTimeout) return "pending";
       throw error;

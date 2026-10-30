@@ -1,3 +1,4 @@
+import { captureBoxAgentOrigin, createBoxAgentInvocation, detachBoxAgentInvocation, finishBoxAgentInvocation, linkBoxAgentAbort } from 'src/utils/boxAgentScope.js';
 import { feature } from 'bun:bundle';
 import * as React from 'react';
 import { buildTool, type ToolDef, toolMatchesName } from 'src/Tool.js';
@@ -337,6 +338,7 @@ export const AgentTool = buildTool({
     assistantMessage,
     onProgress?,
   ) {
+    const boxOrigin = captureBoxAgentOrigin();
     const startTime = Date.now();
     const model = isCoordinatorMode() ? undefined : modelParam;
 
@@ -854,6 +856,7 @@ export const AgentTool = buildTool({
       // Wrap async agent execution in agent context for analytics attribution
       const asyncAgentContext: SubagentContext = {
         agentId: asyncAgentId,
+        boxInvocation: createBoxAgentInvocation(boxOrigin, asyncAgentId, true),
         // For subagents from teammates: use team lead's session
         // For subagents from main REPL: undefined (no parent session)
         parentSessionId: getParentSessionId(),
@@ -917,6 +920,7 @@ export const AgentTool = buildTool({
       // Set up agent context for sync execution (for analytics attribution)
       const syncAgentContext: SubagentContext = {
         agentId: syncAgentId,
+        boxInvocation: createBoxAgentInvocation(boxOrigin, syncAgentId, false),
         // For subagents from teammates: use team lead's session
         // For subagents from main REPL: undefined (no parent session)
         parentSessionId: getParentSessionId(),
@@ -932,6 +936,7 @@ export const AgentTool = buildTool({
       // and optionally in a worktree cwd override for filesystem isolation
       return runWithAgentContext(syncAgentContext, () =>
         wrapWithCwd(async () => {
+          linkBoxAgentAbort(syncAgentContext.boxInvocation, toolUseContext.abortController.signal);
           const agentMessages: MessageType[] = [];
           const agentStartTime = Date.now();
           const syncTracker = createProgressTracker();
@@ -1061,6 +1066,7 @@ export const AgentTool = buildTool({
                 if (isLocalAgentTask(task) && task.isBackgrounded) {
                   // Capture the taskId for use in the async callback
                   const backgroundedTaskId = foregroundTaskId;
+                  await detachBoxAgentInvocation(syncAgentContext.boxInvocation);
                   wasBackgrounded = true;
                   // Stop foreground summarization; the backgrounded closure
                   // below owns its own independent stop function.
@@ -1205,6 +1211,7 @@ export const AgentTool = buildTool({
                         ...worktreeResult,
                       });
                     } finally {
+                      await finishBoxAgentInvocation(syncAgentContext.boxInvocation).catch(() => {});
                       stopBackgroundedSummarization?.();
                       clearInvokedSkillsForAgent(syncAgentId);
                       clearDumpState(syncAgentId);
@@ -1340,6 +1347,7 @@ export const AgentTool = buildTool({
             // Store the error to handle after cleanup
             syncAgentError = toError(error);
           } finally {
+            if (!wasBackgrounded) await finishBoxAgentInvocation(syncAgentContext.boxInvocation).catch(() => {});
             // Clear the background hint UI
             if (toolUseContext.setToolJSX) {
               toolUseContext.setToolJSX(null);

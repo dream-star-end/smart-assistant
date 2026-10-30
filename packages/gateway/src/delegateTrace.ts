@@ -66,8 +66,14 @@ export function registerDelegateTraceWait(host: object, sessionKey: string) {
   }
 }
 export function cancelDelegateTraceWait(host: object, sessionKey: string): boolean {
+  return captureDelegateTraceCancel(host,sessionKey)()
+}
+/** An awaited Stop retries this original waiter, never a replacement at its key. */
+export function captureDelegateTraceCancel(host:object,sessionKey:string):()=>boolean {
   const abort = traceWaits.get(host)?.get(sessionKey)
-  if (!abort) return false
-  abort()
-  return true
+  return ()=>{
+    if (!abort) return false
+    abort()
+    return true
+  }
 }

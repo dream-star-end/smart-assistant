@@ -1,3 +1,4 @@
+import { stopBoxAgentById } from '../../utils/boxAgentScope.js';
 import type { BetaUsage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs';
 import { getSdkAgentProgressSummariesEnabled } from '../../bootstrap/state.js';
 import {
@@ -389,6 +390,7 @@ export function killAsyncAgent(taskId: string, setAppState: SetAppState): void {
 export function killAllRunningAgentTasks(tasks: Record<string, TaskState>, setAppState: SetAppState): void {
   for (const [taskId, task] of Object.entries(tasks)) {
     if (task.type === 'local_agent' && task.status === 'running') {
+      void stopBoxAgentById(taskId).catch(() => {});
       killAsyncAgent(taskId, setAppState);
     }
   }

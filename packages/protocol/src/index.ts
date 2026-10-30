@@ -78,3 +78,5 @@ export type { ModelSwitchCostRequest, ModelSwitchCostQuote, ModelSwitchCostRange
 export * from './systemHelp.js'
 
 export * from './automaticRetryStatus.js'
+
+export * from './boxAgentScope.js'

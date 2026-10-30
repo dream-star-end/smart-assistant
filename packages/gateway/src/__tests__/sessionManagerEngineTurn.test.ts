@@ -2629,6 +2629,32 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("OCV5-664: a receipt captured before engine start fences the same turn even when its persist hook appears during prepare", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const cmid = "m-receipt-prestart-0664";
+      const session = makeWebchatSession(sm, runner, cmid);
+      bind(session);
+      session._runningClientMessageId = cmid;
+      assert.equal(session._persistActiveTurn, undefined);
+      const receipt = sm.captureInterruptForReceipt(session.sessionKey, { clientMessageId: cmid });
+      assert.ok(receipt);
+      const completion = runOneTurnFor(sm, session, [], cmid);
+      await receipt.prepare();
+      await receipt.interrupt();
+      await completion;
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 1);
+      assert.equal(captured.payloads[0]?.errorCode, "USER_CANCELLED");
+      assert.equal(captured.payloads[0]?.text ?? "", "", "no model output escapes the captured pre-start Stop");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
   test("browser Stop maps the real CCB Request was aborted result to USER_CANCELLED", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);

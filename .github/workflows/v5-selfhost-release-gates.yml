@@ -151,6 +151,8 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Box success recovery behavioral gate
         run: env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$(git rev-parse HEAD)"
+      - name: Prepare same-candidate production CCB for real Agent proof
+        run: bash scripts/prepare-v5-box-agent-proof.sh "$PWD"
       - name: Box incident proofs gate (OCV5-488)
         run: env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$(git rev-parse HEAD)"
       - name: Box long-task generations gate (#21fdeea1)

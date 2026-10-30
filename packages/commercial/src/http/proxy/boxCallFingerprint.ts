@@ -1,3 +1,4 @@
+import { BOX_AGENT_SCOPE_UUID } from '@openclaude/protocol';
 /** Stable *secondary* Box replay fingerprint for one OpenClaude turn and
  * canonical Messages request. This is NOT a client-supplied logical call ID:
  * identical independent requests in the same turn are intentionally treated
@@ -52,6 +53,7 @@ function updateStableJson(value: unknown, emit: (part: string) => void,
 
 export interface BoxCallFingerprint {
   readonly turnKey: string;
+  readonly agentScopeId?: string;
   readonly sessionId: string;
   readonly requestHash: string;
   /** Secondary replay fence, not a unique logical-call claim. */
@@ -185,6 +187,10 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
   if (typeof turnKey !== "string" || !/^[a-f0-9]{64}$/.test(turnKey)) {
     throw new BoxCallFingerprintError("BOX_CALL_TURN_KEY_MISSING");
   }
+  const agentScopeId = userMeta.oc_box_agent_scope;
+  if (agentScopeId !== undefined && (typeof agentScopeId !== 'string' || !BOX_AGENT_SCOPE_UUID.test(agentScopeId))) {
+    throw new BoxCallFingerprintError('BOX_AGENT_SCOPE_INVALID');
+  }
   const outer = body.metadata.session_id;
   const inner = userMeta.session_id;
   if (outer !== undefined && typeof outer !== "string") {
@@ -215,11 +221,15 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
     hasher.update(part);
   });
   const requestHash = hasher.digest("hex");
-  const replayFingerprint = createHash("sha256")
+  const replayHasher = createHash("sha256")
     .update("ocv5-box-replay-v1\0").update(uid.toString()).update("\0")
     .update(sessionId).update("\0").update(turnKey).update("\0")
-    .update(requestHash).digest("hex");
-  return { turnKey, sessionId, requestHash, replayFingerprint };
+    .update(requestHash);
+  // Legacy keys remain byte-identical. Scoped invocations cannot replay across generations.
+  if (agentScopeId !== undefined) replayHasher.update('\0box-agent-scope-v1\0').update(agentScopeId);
+  const replayFingerprint = replayHasher.digest('hex');
+  return { turnKey, sessionId, requestHash, replayFingerprint,
+    ...(agentScopeId === undefined ? {} : { agentScopeId }) };
 }
 
 /** CCB 2.1.280's non-streaming retry is a read-only alias of the original

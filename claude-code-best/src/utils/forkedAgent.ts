@@ -9,6 +9,7 @@
  */
 
 import type { UUID } from 'crypto'
+import { withBoxAgentAuxiliaryInvocation } from './boxAgentScope.js'
 import { randomUUID } from 'crypto'
 import type { PromptCommand } from '../commands.js'
 import type { QuerySource } from '../constants/querySource.js'
@@ -570,6 +571,8 @@ export async function runForkedAgent({
 
   // Run the query loop with isolated context (cache-safe params preserved)
   try {
+    await withBoxAgentAuxiliaryInvocation(isolatedToolUseContext.agentId,
+      isolatedToolUseContext.abortController.signal, async () => {
     for await (const message of query({
       messages: initialMessages,
       systemPrompt,
@@ -632,6 +635,7 @@ export async function runForkedAgent({
         }
       }
     }
+    })
   } finally {
     // Release cloned file state cache memory (same pattern as runAgent.ts)
     isolatedToolUseContext.readFileState.clear()

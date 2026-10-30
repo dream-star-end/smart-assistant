@@ -1,3 +1,4 @@
+import { assertBoxAgentRequestActive } from "./boxAgentScopeFence.js";
 import { BoxToolRolloverRequired, finishToolRollover, cancelToolRollovers,
   assertToolRolloverLaunch, withToolRolloverLaunchFence, retiredToolRolloverSql,
   type BoxToolRolloverClaim } from "./boxToolRollover.js";
@@ -81,11 +82,11 @@ function matchingReplayPointer(value: unknown, input: { uid: bigint; requestId: 
     && pointer.roundNo === input.roundNo ? pointer : null;
 }
 function validCancelIntent(value: unknown): value is {
-  v: 1; reason: "user_cancel"; requestId: string; atMs: number } {
+  v: 1; reason: "user_cancel" | "scope_finish" | "scope_owner_lost"; requestId: string; atMs: number } {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const intent = value as Record<string, unknown>;
   return Object.keys(intent).sort().join(",") === "atMs,reason,requestId,v"
-    && intent.v === 1 && intent.reason === "user_cancel"
+    && intent.v === 1 && ["user_cancel", "scope_finish", "scope_owner_lost"].includes(String(intent.reason))
     && typeof intent.requestId === "string"
     && /^[A-Za-z0-9_-]{1,64}$/.test(intent.requestId)
     && Number.isSafeInteger(intent.atMs) && Number(intent.atMs) > 0;
@@ -1205,6 +1206,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `box:account:${input.accountId}`, `box:fingerprint:${input.fingerprint.replayFingerprint}`,
         `box:session:${input.uid}:${input.fingerprint.sessionId}`, `box:user:${input.uid}`,
       ]);
+      if (input.fingerprint.agentScopeId !== undefined) await assertBoxAgentRequestActive(client, input.uid, input.requestId, input.fingerprint);
       // Fingerprint and fallback alias are both derived from the uid, so the
       // user filter keeps the check exact and lets it use idx_rfj_user_time.
       // A settled, unbilled stopped attempt without a completed Message is
@@ -1341,6 +1343,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         ...(fallbackAlias ? { boxFallbackAlias: fallbackAlias } : {}),
         boxRequestHash: input.fingerprint.requestHash,
         ...(imageIdentity ? { boxImageIdentity: imageIdentity } : {}),
+        ...(input.fingerprint.agentScopeId ? { boxAgentScopeId: input.fingerprint.agentScopeId } : {}),
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
         ...(input.invocationMode === "detached_tool"
@@ -1385,7 +1388,8 @@ export class BoxDurableJournal implements BoxJournalPort {
   }
 
   async markRunning(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void> {
-    const changed = await this.pool.query(
+    await withToolRolloverLaunchFence(this.pool,input.uid,input.requestId,async (query) => {
+    const changed = await query(
       `UPDATE request_finalize_journal
           SET ctx = jsonb_set(ctx, '{boxState}', '"running"'::jsonb), updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
@@ -1395,6 +1399,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND NOT (ctx ? 'boxPrelaunchControl')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_START_FENCE_LOST");
+    });
   }
 
   /** One durable text launch permit. Once committed, a missing/ambiguous
@@ -1409,7 +1414,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !isBoxApiUpstreamModel(input.upstreamModel)) {
       throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_IDENTITY_INVALID");
     }
-    const changed = await this.pool.query(
+    await withToolRolloverLaunchFence(this.pool,input.uid,input.requestId,async (query) => {
+    const changed = await query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
               updated_at=NOW()
@@ -1427,6 +1433,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (changed.rowCount !== 1) {
       throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_FENCE_LOST");
     }
+    });
   }
 
   /** Only the caller that has not invoked plan.run may use this transition. */
@@ -1575,6 +1582,17 @@ export class BoxDurableJournal implements BoxJournalPort {
    * original keeper must still prove all descendants stopped. */
   async recordUserCancelIntent(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<void> {
+    return this.recordCancelIntent(input,"user_cancel");
+  }
+  async recordScopeCancelIntent(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> & {
+      scopeId: string; reason: "explicit-stop" | "finish" | "owner-lost" }): Promise<void> {
+    return this.recordCancelIntent(input,input.reason === "explicit-stop" ? "user_cancel"
+      : input.reason === "finish" ? "scope_finish" : "scope_owner_lost",input.scopeId);
+  }
+  private async recordCancelIntent(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">,
+    reason: "user_cancel" | "scope_finish" | "scope_owner_lost", scopeId?: string): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
       || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
@@ -1612,6 +1630,15 @@ export class BoxDurableJournal implements BoxJournalPort {
         || typeof ctx.model !== "string") {
         throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
       }
+      if (scopeId !== undefined) {
+        const fenced = await client.query(`SELECT 1 FROM box_agent_api_scopes s
+          JOIN request_finalize_journal r ON r.user_id=s.user_id AND r.container_id=s.container_id
+          WHERE r.user_id=$1 AND r.request_id=$2 AND s.scope_id=$3::uuid
+            AND r.ctx->>'boxAgentScopeId'=$3::text AND s.cancelled_at IS NOT NULL
+            AND s.session_id::text=r.ctx->>'boxSessionId' AND s.turn_key=r.ctx->>'boxTurnKey'`,
+          [input.uid.toString(),input.requestId,scopeId]);
+        if (fenced.rowCount !== 1) throw new BoxDurableJournalError("BOX_AGENT_SCOPE_INACTIVE");
+      }
       const prior = ctx.boxCancelIntent;
       if (prior !== undefined && !validCancelIntent(prior)) {
         throw new BoxDurableJournalError("BOX_CANCEL_CONFLICT");
@@ -1630,7 +1657,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           ORDER BY request_id FOR UPDATE`,
         [input.uid.toString(), input.accountId.toString(), input.runNonce,
           input.leaseEpoch, ACTIVE]);
-      const intent = prior ?? { v: 1, reason: "user_cancel",
+      const intent = prior ?? { v: 1, reason,
         requestId: input.requestId, atMs: Date.now() };
       for (const current of active.rows) {
         const linked = current.ctx;
@@ -1639,6 +1666,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           || linked.boxInvocationMode !== ctx.boxInvocationMode
           || linked.boxSessionId !== sessionId
           || linked.boxTurnKey !== ctx.boxTurnKey
+          || linked.boxAgentScopeId !== ctx.boxAgentScopeId
           || linked.model !== ctx.model
           || !["inflight", "finalizing", "committed"].includes(current.state)
           || linked.boxTerminalProof !== undefined
@@ -3099,8 +3127,17 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   /** Cross-worker backoff/claim. A second worker cannot dispatch cleanup for
    * this run until the retry window expires; retries remain safe/idempotent. */
-  async claimPrelaunchRecovery(input: BoxPrelaunchRecoveryCandidate): Promise<boolean> {
+  async claimPrelaunchRecovery(input: BoxPrelaunchRecoveryCandidate, cancelledScopeId?: string): Promise<boolean> {
     this.validatePrelaunchReceipt(input);
+    if (cancelledScopeId !== undefined && !/^[0-9a-f-]{36}$/.test(cancelledScopeId)) {
+      throw new BoxDurableJournalError("BOX_AGENT_SCOPE_BINDING_INVALID");
+    }
+    const cancelled = cancelledScopeId === undefined ? "" : ` OR
+            ($9::uuid IS NOT NULL AND ctx->>'boxState'='reserved' AND ctx->>'boxAgentScopeId'=$9::text
+             AND EXISTS (SELECT 1 FROM box_agent_api_scopes s WHERE s.user_id=request_finalize_journal.user_id
+               AND s.container_id=request_finalize_journal.container_id AND s.scope_id=$9::uuid
+               AND s.session_id::text=ctx->>'boxSessionId' AND s.turn_key=ctx->>'boxTurnKey'
+               AND s.cancelled_at IS NOT NULL))`;
     const now = Date.now();
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
@@ -3113,7 +3150,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND NOT (ctx ? 'boxLaunchPermit') AND NOT (ctx ? 'boxTerminalProof')
           AND NOT (ctx ? 'boxPrelaunchRecoveryQuarantine')
           AND ((ctx->>'boxState'='unknown') OR
-            (ctx->>'boxState'='reserved' AND updated_at < NOW() - INTERVAL '16 minutes'))
+            (ctx->>'boxState'='reserved' AND updated_at < NOW() - INTERVAL '16 minutes')${cancelled})
           AND (NOT (ctx ? 'boxPrelaunchRetryAfterMs') OR
             (jsonb_typeof(ctx->'boxPrelaunchRetryAfterMs')='number'
              AND (ctx->>'boxPrelaunchRetryAfterMs') ~ '^[0-9]{13}$'
@@ -3121,7 +3158,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), input.accountId.toString(),
         input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt),
         JSON.stringify({ boxState: "unknown", boxPrelaunchLastAttemptMs: now,
-          boxPrelaunchRetryAfterMs: now + 60_000 }), now]);
+          boxPrelaunchRetryAfterMs: now + 60_000 }), now, ...(cancelledScopeId === undefined ? [] : [cancelledScopeId])]);
     return changed.rowCount === 1;
   }
 

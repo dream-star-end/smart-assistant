@@ -1,3 +1,4 @@
+export const BOX_AGENT_SCOPE_PATH = '/internal/box/agent-scope'
 /**
  * 内部(容器/egress/master 之间)`/internal/*` 路由的单一注册表。
  *
@@ -149,6 +150,8 @@ export interface InternalRouteEntry {
 }
 
 export const INTERNAL_ROUTES = [
+  { path: BOX_AGENT_SCOPE_PATH, match: 'exact', plane: 'v5', egressLocalIntercept: true,
+    sources: ['commercial/src/egress/main.ts', 'gateway/src/engine/boxAgentScopeClient.ts'] },
   // ── v5:delegate grok-route(forwarder 唯一放行例外;selfhost 门控挂载)──
   {
     path: DELEGATE_GROK_ROUTE_MINT_PATH,

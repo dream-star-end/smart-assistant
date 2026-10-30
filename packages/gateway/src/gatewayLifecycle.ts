@@ -1,3 +1,4 @@
+import { getBoxAgentScopeRegistry } from './engine/boxAgentScopeRegistry.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
 /**
@@ -150,6 +151,7 @@ const logTimingStops = new WeakMap<object, () => void>()
 
 export async function start(this: GatewayLifecycleHost): Promise<void> {
   const { config } = this.deps
+  if (/^[1-9][0-9]*$/.test(process.env.OC_CONTAINER_ID ?? '')) getBoxAgentScopeRegistry().start()
 
   // Phase 0.2: replay any server-authored messages queued to the outbox
   // while the previous gateway instance was unable to reach SQLite (disk

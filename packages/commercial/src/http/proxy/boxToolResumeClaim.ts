@@ -1,3 +1,4 @@
+import { assertBoxAgentRequestActive, assertSameBoxAgentScope } from "./boxAgentScopeFence.js";
 /** Fully bound journal continuation claim; its transaction precedes every remote write. */
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
@@ -63,6 +64,8 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
       await client.query("BEGIN");
       await lock(client, [`box:fingerprint:${fingerprint.replayFingerprint}`,
         `box:session:${input.uid}:${fingerprint.sessionId}`]);
+      const incomingScope = fingerprint.agentScopeId === undefined ? undefined
+        : await assertBoxAgentRequestActive(client,input.uid,input.requestId,fingerprint);
       const duplicate = await client.query(
         `SELECT 1 FROM request_finalize_journal
           WHERE ctx->>'boxReplayFingerprint'=$1
@@ -162,6 +165,7 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
       if (child.rowCount !== 1 || !childCtx) {
         throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
       }
+      assertSameBoxAgentScope(incomingScope,ctx,childCtx);
       const preparedIdentity = {
         uid: view.prepared.uid, sessionId: fingerprint.sessionId,
         canonicalModel: view.prepared.canonicalModel, turnKey: fingerprint.turnKey,
@@ -240,6 +244,7 @@ export async function claimBoundBoxToolResume(pool: Pick<Pool,"connect"|"query">
             boxPriorMessageIds: [...priorIds, handoff.messageId],
             boxDetachedRunnerHash: handoff.detachedRunnerHash,
             boxCatalogHash: handoff.catalogHash,
+            ...(incomingScope ? { boxAgentScopeId: incomingScope } : {}),
             boxSessionId: fingerprint.sessionId,
              boxReplayFingerprint: fingerprint.replayFingerprint,
              boxFallbackAlias: fallbackAlias,

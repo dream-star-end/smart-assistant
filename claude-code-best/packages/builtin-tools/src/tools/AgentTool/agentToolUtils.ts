@@ -1,3 +1,4 @@
+import { currentBoxAgentInvocation, finishBoxAgentInvocation } from 'src/utils/boxAgentScope.js'
 import { feature } from 'bun:bundle'
 import { z } from 'zod/v4'
 import { clearInvokedSkillsForAgent } from 'src/bootstrap/state.js'
@@ -692,6 +693,7 @@ export async function runAsyncAgentLifecycle({
       ...worktreeResult,
     })
   } finally {
+    await finishBoxAgentInvocation(currentBoxAgentInvocation()).catch(() => {})
     clearInvokedSkillsForAgent(agentIdForCleanup)
     clearDumpState(agentIdForCleanup)
   }

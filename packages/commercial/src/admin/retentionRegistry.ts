@@ -72,6 +72,8 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
  * (来自全表调研;新增此类表须显式补进本清单,反向门才放行。)
  */
 export const DURABLE_TABLES: readonly string[] = [
+  // Generation tombstones fence future requests; time alone never permits reopening.
+  'box_agent_api_scopes',
   // OCV5-610: exact effect/idempotency evidence; lifetime follows user FK cascade, never age-swept.
   "system_action_receipts",
   // OCV5-537(DAT-8):用户对单条响应的 👍/👎(含可选评论),随用户删除级联;是质量反馈信号,

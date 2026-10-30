@@ -1806,6 +1806,7 @@ export function makeAnthropicProxyHandler(
             workload: ccWorkload,
           }), ...(route.kind === "box" ? {
             boxInvocationRecovery: "v1",
+            ...(boxPrepared?.fingerprint?.agentScopeId ? { boxAgentScopeId: boxPrepared.fingerprint.agentScopeId } : {}),
             billingPricing: serializeBillingPricing(pricing),
             boxBillingContext: serializeBoxBillingContext({
               sessionId, mode: attribution.mode,

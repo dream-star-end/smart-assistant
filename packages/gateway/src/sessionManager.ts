@@ -2212,17 +2212,80 @@ export class SessionManager {
     return _runOneTurnImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, assistantMessageId, thinkingMessageId, toolMessageIdFactory, turnKey, clientMessageId, modelAuthority, retryRuntimeEvents, retryAssistantSegments, retryThinkingSegments, retryTools, retryStructuredBlocks, queueTurn, retryAuthErrors, retryPhantomErrors, retryTransientErrors, attemptOrdinal, automaticRetryState, modelSwitchTransition)
   }
 
+  /** Control receipts must await durable Box intent. A rejection deliberately
+   * leaves the master's durable Stop control pending for its existing retry. */
+  async interruptForReceipt(sessionKey: string, exact?: {turnKey?:string;clientMessageId?:string}): Promise<boolean> {
+    const captured=this.captureInterruptForReceipt(sessionKey,exact)
+    if (!captured) return false
+    await captured.prepare()
+    return captured.interrupt()
+  }
+
+  captureInterruptForReceipt(sessionKey:string,exact?:{turnKey?:string;clientMessageId?:string}) {
+    const s=this.sessions.get(sessionKey)
+    if (!s || (exact?.turnKey !== undefined && s._currentTurnKey !== exact.turnKey)
+      || (exact?.clientMessageId !== undefined && s._runningClientMessageId !== exact.clientMessageId)) return undefined
+    const runner=s.runner, turnKey=s._currentTurnKey, external=s._externalTurnAbort
+    const persist=s._persistActiveTurn
+    if (!persist && exact?.clientMessageId !== undefined) this.fencePreStartStop(s.peerId,exact.clientMessageId)
+    const engine=isBoxApiModel(s.model) ? runner.captureInterruptForReceipt?.(turnKey) : undefined
+    return {target:engine?.target,prepare:async()=>{
+      if (engine) await engine.prepare()
+      else if (isBoxApiModel(s.model) && runner.prepareInterrupt) await runner.prepareInterrupt('user',turnKey)
+    },interrupt:async()=>{
+      // Even on retry, prepare only the captured old engine owner. A completed
+      // old turn is an applied target, never permission to abort its successor.
+      if (this.sessions.get(sessionKey) !== s || s.runner !== runner || s._currentTurnKey !== turnKey
+        || s._externalTurnAbort !== external || s._persistActiveTurn !== persist
+        || (exact?.clientMessageId !== undefined && s._runningClientMessageId !== exact.clientMessageId)) return true
+      if (persist) {
+        const pending=persist('interrupted','本轮已由用户停止。','USER_CANCELLED')
+        this._trackPersistence(pending)
+        await pending
+        return true
+      }
+      if (external && !external.signal.aborted) external.abort()
+      const interrupted=engine ? engine.interrupt() : runner.interrupt('user')
+      return !!external || interrupted
+    }}
+  }
+
   interrupt(sessionKey: string, reason: 'user' | 'system' = 'system'): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
     const external = s._externalTurnAbort
-    if (external && !external.signal.aborted) external.abort()
+    const needsBoxBarrier = reason === 'user' && isBoxApiModel(s.model) && s.runner.prepareInterrupt !== undefined
+    if (!needsBoxBarrier && external && !external.signal.aborted) external.abort()
     const persistActiveTurn = s._persistActiveTurn
     if (persistActiveTurn) {
       const persistence = reason === 'user'
         ? persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
         : persistActiveTurn('interrupted', '本轮因系统调度中断。', 'SYSTEM_INTERRUPT')
       this._trackPersistence(persistence)
+      return true
+    }
+    if (needsBoxBarrier) {
+      const runner = s.runner
+      const turnKey = s._currentTurnKey
+      const captured=runner.captureInterruptForReceipt?.(turnKey)
+      const pending = (async () => {
+        for (;;) {
+          try {if(captured) await captured.prepare();else await runner.prepareInterrupt!('user',turnKey);break}
+          catch {
+            log.warn('box_user_stop_control_pending', {sessionKey})
+            // Retain this exact old turn's local intent when a synchronous
+            // internal caller cannot await a receipt. Retry control only;
+            // after persistence the identity guard still protects a new turn.
+            await new Promise<void>(resolve => {setTimeout(resolve,5000).unref?.()})
+          }
+        }
+        if (this.sessions.get(sessionKey) !== s || s.runner !== runner
+          || s._currentTurnKey !== turnKey || s._externalTurnAbort !== external
+          || s._persistActiveTurn !== persistActiveTurn) return
+        if (external && !external.signal.aborted) external.abort()
+        if(captured) captured.interrupt();else runner.interrupt('user')
+      })()
+      this._trackPersistence(pending)
       return true
     }
     const runnerInterrupted = s.runner.interrupt(reason)

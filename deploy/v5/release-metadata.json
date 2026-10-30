@@ -194,7 +194,8 @@
     "0326_community_tutorial_revisions",
     "0327_system_action_receipts",
     "0328_minimax_voices",
-    "0330_turn_lease_binding"
+    "0330_turn_lease_binding",
+    "0331_box_agent_api_scopes"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

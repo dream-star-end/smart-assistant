@@ -1,3 +1,4 @@
+import { boxAgentMetadata, isBoxApiModel } from '../../utils/boxAgentScope.js'
 import type {
   BetaContentBlock,
   BetaContentBlockParam,
@@ -495,10 +496,11 @@ export function configureTaskBudgetParams(
   }
 }
 
-export function getAPIMetadata() {
+export function getAPIMetadata(model?: string, agentId?: string) {
+  const scoped = boxAgentMetadata(model, agentId)
   // https://docs.google.com/document/d/1dURO9ycXXQCBS0V4Vhl4poDBRgkelFc5t2BNPoEgH5Q/edit?tab=t.0#heading=h.5g7nec5b09w5
   let extra: JsonObject = {}
-  const extraStr = process.env.CLAUDE_CODE_EXTRA_METADATA
+  const extraStr = scoped ? scoped.extraMetadata : process.env.CLAUDE_CODE_EXTRA_METADATA
   if (extraStr) {
     const parsed = safeParseJSON(extraStr, false)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -511,15 +513,16 @@ export function getAPIMetadata() {
     }
   }
 
-  return {
-    user_id: jsonStringify({
+  const userId = jsonStringify({
       ...extra,
       device_id: getOrCreateUserID(),
       // Only include OAuth account UUID when actively using OAuth authentication
       account_uuid: getOauthAccountInfo()?.accountUuid ?? '',
-      session_id: getSessionId(),
-    }),
-  }
+      session_id: scoped?.sessionId ?? getSessionId(),
+      ...(scoped?.scopeId ? { oc_box_agent_scope: scoped.scopeId } : {}),
+    })
+  if (isBoxApiModel(model) && Buffer.byteLength(userId,'utf8') > 512) throw new Error('BOX_API_METADATA_TOO_LARGE')
+  return { user_id: userId }
 }
 
 export async function verifyApiKey(
@@ -552,8 +555,9 @@ export async function verifyApiKey(
             messages,
             temperature: 1,
             ...(betas.length > 0 && { betas: betas.filter(Boolean) }),
-            metadata: getAPIMetadata(),
+            metadata: getAPIMetadata(model),
             ...getExtraBodyParams(),
+            ...(isBoxApiModel(model) ? {metadata:getAPIMetadata(model)} : {}),
           })
           return true
         },
@@ -1807,7 +1811,7 @@ async function* queryModel(
       tools: allTools,
       tool_choice: options.toolChoice,
       ...(useBetas && { betas: filteredBetas }),
-      metadata: getAPIMetadata(),
+      metadata: getAPIMetadata(normalizeModelStringForAPI(options.model), options.agentId),
       max_tokens: maxOutputTokens,
       thinking,
       ...(temperature !== undefined && { temperature }),
@@ -1817,6 +1821,9 @@ async function* queryModel(
           context_management: contextManagement,
         }),
       ...extraBodyParams,
+      // Platform Box identity cannot be replaced by arbitrary extra body JSON.
+      ...(isBoxApiModel(normalizeModelStringForAPI(options.model))
+        ? { metadata: getAPIMetadata(normalizeModelStringForAPI(options.model), options.agentId) } : {}),
       ...(Object.keys(outputConfig).length > 0 && {
         output_config: outputConfig,
       }),
@@ -1931,7 +1938,7 @@ async function* queryModel(
           }).withResponse(),
         )
         queryCheckpoint('query_response_headers_received')
-        streamRequestId = result.request_id
+        streamRequestId = result.request_id ?? result.response.headers.get('x-request-id') ?? undefined
         streamResponse = result.response
         return result.data
       },
