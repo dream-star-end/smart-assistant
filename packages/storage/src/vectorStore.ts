@@ -190,6 +190,11 @@ function tableExists(db: Database.Database, name: string): boolean {
   return db.prepare('SELECT 1 FROM sqlite_master WHERE name = ?').get(name) !== undefined
 }
 
+function identityColumnExists(db: Database.Database, name: string): boolean {
+  const cols = db.prepare('PRAGMA table_info(embedding_index_identity)').all() as Array<{ name: string }>
+  return cols.some((col) => col.name === name)
+}
+
 function ensureIdentityTable(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS embedding_index_identity (
@@ -199,9 +204,17 @@ function ensureIdentityTable(db: Database.Database): void {
       dimensions INTEGER NOT NULL
     );
   `)
-  const cols = db.prepare('PRAGMA table_info(embedding_index_identity)').all() as Array<{ name: string }>
-  if (!cols.some((col) => col.name === 'generation')) {
+  if (identityColumnExists(db, 'generation')) return
+  try {
     db.exec('ALTER TABLE embedding_index_identity ADD COLUMN generation INTEGER NOT NULL DEFAULT 0')
+  } catch (err) {
+    // Two processes can both observe the missing column. The later ALTER
+    // raises duplicate column name. Once the winner's column is present,
+    // keep going: throwing here disables embedding for a successful add.
+    const msg = err instanceof Error ? err.message : String(err)
+    if (!msg.includes('duplicate column name: generation') || !identityColumnExists(db, 'generation')) {
+      throw err
+    }
   }
 }
 
