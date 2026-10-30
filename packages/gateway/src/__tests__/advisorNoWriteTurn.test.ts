@@ -278,6 +278,8 @@ test('inbound preserves local read-only targets and enforces coordinated whole-t
     ['顾问只给建议，不要改文件，除了提供建议不要做其他事。', true],
     ['Do not modify any files, except give advice.', true],
     ['不要改文件，除非我授权修改app.ts。', true],
+    ['只读检查 README.md，修改建议请直接列出。', true],
+    ['不要改任何文件，除了读取README.md不要做其他事。', true],
     ['只读检查 README.md。', true],
     ['请修改 app.ts，只读检查 README.md，不要改任何文件。', true],
   ] as const) {
