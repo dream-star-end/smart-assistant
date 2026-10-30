@@ -898,7 +898,7 @@ export function errorPresentation(
         ? "任务长时间没有新输出，系统已中断。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。"
         : normalized === "no_response" || normalized === "phantom_turn"
           ? "任务未能产生有效回复。本轮未扣费，并已发送站内信说明。"
-          : "长任务的执行凭证未能继续。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。你可以重新尝试。";
+          : "长任务的执行凭证未能继续。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。你可以继续。";
     return {
       code: normalized,
       fixedMessage: true,
@@ -926,12 +926,12 @@ export function errorPresentation(
   }
   if (waiverEligible) {
     const message = normalized === "turn_limit"
-      ? "任务达到 12 小时运行上限，系统已中断。你可以重新尝试。"
+      ? "任务达到 12 小时运行上限，系统已中断。你可以继续。"
       : normalized === "liveness_timeout" || normalized === "idle_timeout"
-        ? "任务长时间没有新输出，系统已中断。你可以重新尝试。"
+        ? "任务长时间没有新输出，系统已中断。你可以继续。"
         : normalized === "no_response" || normalized === "phantom_turn"
-          ? "任务未能产生有效回复。你可以重新尝试。"
-          : "长任务的执行凭证未能继续。你的消息已保留，可以重新尝试。";
+          ? "任务未能产生有效回复。你可以继续。"
+          : "长任务的执行凭证未能继续。你的消息已保留，可以继续。";
     return {
       code: normalized,
       title: "任务未正常完成",
@@ -944,7 +944,7 @@ export function errorPresentation(
     return {
       code: normalized,
       title: ERROR_LABELS.auth_error,
-      message: "认证状态异常，本轮未正常完成。请重新尝试。",
+      message: "认证状态异常，本轮未正常完成。可以继续。",
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
       waived: false,
     };

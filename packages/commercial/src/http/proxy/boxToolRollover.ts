@@ -236,11 +236,25 @@ export async function cancelToolRollovers(pool: Db, input: { uid: bigint; contai
   const client = await pool.connect(); let done = false;
   try {
     await client.query("BEGIN"); await lock(client,[`box:session:${input.uid}:${input.sessionId}`]);
+    // admit and armGuardedLaunch use this same session/row fence. With no
+    // admission state or physical identity, this successor never reached any
+    // remote stage/paid launch. Close it through the existing prestart state,
+    // without inventing a keeper proof or rewriting prior settled generations.
+    // Admitted/unknown successors retain their physical stop-proof path.
     const cancelled = await client.query(`UPDATE request_finalize_journal
-      SET ctx=ctx || '{"boxRolloverCancelled":true}'::jsonb,updated_at=NOW()
+      SET ctx=ctx || '{"boxRolloverCancelled":true}'::jsonb ||
+        CASE WHEN NOT (ctx ? 'boxState') AND NOT (ctx ? 'boxRunNonce')
+          AND NOT (ctx ? 'boxLeaseEpoch') AND NOT (ctx ? 'boxAccountId')
+          AND NOT (ctx ? 'boxLaunchPermit') AND NOT (ctx ? 'boxPrelaunchControl')
+          AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxOwnerRequestId')
+          AND NOT (ctx ? 'boxResumeRequestId')
+        THEN '{"boxState":"prestart_stopped"}'::jsonb ELSE '{}'::jsonb END,updated_at=NOW()
       WHERE user_id=$1 AND container_id=$2 AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
         AND state='inflight' AND jsonb_typeof(ctx->'boxRolloverFrom')='object'
-        AND ctx#>>'{boxRolloverFrom,requestId}'=request_id`,
+        AND ctx#>>'{boxRolloverFrom,requestId}'=request_id
+        AND ctx#>>'{boxRolloverFrom,v}'='1'
+        AND ctx#>>'{boxRolloverFrom,sessionId}'=$3 AND ctx#>>'{boxRolloverFrom,turnKey}'=$4
+        AND ctx#>>'{boxRolloverFrom,model}'=ctx->>'model'`,
       [input.uid.toString(),input.containerId.toString(),input.sessionId,input.turnKey]);
     await client.query("COMMIT"); done = true; return (cancelled.rowCount ?? 0) > 0;
   } finally { if (!done) await client.query("ROLLBACK").catch(() => {}); client.release(); }

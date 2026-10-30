@@ -26,6 +26,22 @@ describe("t1360u every interrupted task continues in its original conversation",
     expect(manualTaskContinuationSource([first, second], second)).toBe(second);
     expect(manualTaskContinuationSource([first, second], first)).toBeUndefined();
   });
+  test("an exhausted hidden recovery lineage continues the original human goal", () => {
+    const root = { id: "u1", role: "user", text: "部署原目标", ts: 1 } as ChatMessage;
+    const child = { ...root, id: "recovery", text: "INTERNAL_CONTROL", _recoveryOfClientMessageId: root.id };
+    const error = { id: "e", role: "assistant", text: "", ts: 3, _clientMessageId: child.id } as ChatMessage;
+    expect(manualTaskContinuationSource([root, child, error], error)).toBe(root);
+    expect(manualTaskContinuationSource([child, error], error)).toBeUndefined();
+  });
+  test("only the latest terminal error continues; trailing transport records do not steal it", () => {
+    const user = { id: "u", role: "user", text: "原目标", ts: 1 } as ChatMessage;
+    const first = { id: "e1", role: "assistant", text: "", ts: 2, _errorCode: "engine_error" } as ChatMessage;
+    const last = { ...first, id: "e2", ts: 3 };
+    const transport = { id: "batch", role: "runtime-event", text: "", ts: 4 } as ChatMessage;
+    expect(manualTaskContinuationSource([user, first, last, transport], first)).toBeUndefined();
+    expect(manualTaskContinuationSource([user, first, last, transport], last)).toBe(user);
+    expect(manualTaskContinuationSource([user, first, { ...last, _errorCode: undefined, text: "已经完成" }], first)).toBeUndefined();
+  });
   test("ordinary manual continuation includes the goal as context and forbids repeating completed work", () => {
     const prompt = taskContinuationPrompt("部署并验证版本A");
     expect(prompt).toContain("不要重新执行已经完成的步骤");

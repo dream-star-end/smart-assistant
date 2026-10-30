@@ -311,16 +311,16 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留重试出口", () => {
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留继续出口", () => {
     renderList(
       [
         row("u", "user", "继续合并", { status: "replied" }),
         row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
         midTurnError("engine_error"),
       ],
-      { cb: { onRegenerate: () => {} } },
+      { cb: { onContinueInterrupted: () => {}, resolveInterruptedContinuation: () => row("u", "user", "继续合并") } },
     );
-    const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    const retry = screen.getByRole("button", { name: "继续" });
     // 以错误收尾 = 本轮结局:仍是完整错误卡,不是「已继续」说明。
     expect(screen.queryByTestId("recovered-error-note")).toBeNull();
     expect(screen.getByRole("alert")).toBeInTheDocument();
@@ -345,7 +345,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
     expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
     expect(within(card).queryByRole("alert")).toBeNull();
-    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
+    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/, /^继续$/]) {
       expect(within(card).queryByRole("button", { name })).toBeNull();
     }
   });

@@ -989,7 +989,7 @@ export function AssistantCard({
   const sourceUser = msg._clientMessageId ? cb.resolveRetryTarget?.(msg._clientMessageId) : undefined;
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
-    isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast)
+    isLastTurn && !ctx.sending
       ? cb.resolveInterruptedContinuation?.(msg)
       : undefined;
   const showInterruptedContinuation =

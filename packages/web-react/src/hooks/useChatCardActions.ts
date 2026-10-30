@@ -326,7 +326,7 @@ export function useChatCardActions({
     (error: ChatMessage): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return interruptedContinuationTarget(msgs, error, activeId)?.user ?? manualTaskContinuationSource(msgs, error);
+      return manualTaskContinuationSource(msgs, error);
     },
     [demo, activeId],
   );
