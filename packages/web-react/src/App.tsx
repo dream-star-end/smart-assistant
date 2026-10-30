@@ -146,11 +146,11 @@ import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
 import { imageByteCache } from "./lib/chat/imageBytes";
 import { containerPreviewHrefFromTarget } from "./lib/containerPreview";
-import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
-import type { MediaJobWire } from "./lib/chat/frames";
+import type { MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaGenerationJob } from "@openclaude/protocol/mediaGeneration";
 import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import { type ChatMessage, isTurnDetached } from "./lib/chat/model";
+import { activeTurnStatus } from "./lib/chat/retryStatus";
 import {
   exactUserReplayPayload,
   interruptedContinuationTarget,
@@ -1440,7 +1440,7 @@ export function App() {
         (!activeSess._activeClientMessageId ||
           m._clientMessageId === activeSess._activeClientMessageId),
       ),
-      turnStatus: activeSess._turnStatus ?? null,
+      turnStatus: activeTurnStatus(activeSess),
       recoveryStatus: activeSess._recoveryStatus ?? null,
       hasVisibleProcess: activeSess._liveUnitsPackApplied === true ||
         wsMessages.some((m) =>

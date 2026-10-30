@@ -101,6 +101,7 @@ export const EVENTS = {
   // ── 运维(OCV5-488 Box 占位)──────────────────────────────────
   OPS_BOX_HOLD_STUCK: "ops.box_hold_stuck",
   OPS_BOX_HOLD_RELEASED: "ops.box_hold_released",
+  OPS_TAPE_JOB_STUCK: "ops.tape_job_stuck",
   // ── 运维(v5 自愈体系 codex 修复升级;修复终态失败/超时时 safeEnqueueAlert,需人工介入)──
   OPS_REPAIR_FAILED: "ops.repair_failed",
   OPS_REPAIR_TIMEOUT: "ops.repair_timeout",
@@ -205,6 +206,8 @@ export const EVENT_META: EventMeta[] = [
     description: "Box Claude 运行仍占着会话/账号槽:Box 上已看不到它超过 10 分钟,或超过 4h15m 上限 15 分钟以上(自动收口失灵,60s 轮询)", trigger: "polled" },
   { event_type: EVENTS.OPS_BOX_HOLD_RELEASED, severity: "info", group: "ops",
     description: "清理 worker 发现 Box 上已无该运行的进程,自动释放了它的占位(不改金额)", trigger: "passive" },
+  { event_type: EVENTS.OPS_TAPE_JOB_STUCK, severity: "warning", group: "ops",
+    description: "turn_tape 作业终态失败或 held 超时,每作业每天至多一条告警", trigger: "both" },
   // v5 自愈体系:codex 自动修复升级 —— 修复终态失败或超时,自愈已尽力,需人工介入。
   { event_type: EVENTS.OPS_REPAIR_FAILED, severity: "critical", group: "ops",
     description: "v5 自愈 codex 修复达到失败保险丝阈值(连续失败终态),已停止自动重试,需人工介入", trigger: "passive" },

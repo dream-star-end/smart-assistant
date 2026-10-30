@@ -5,7 +5,10 @@ import { readSessionSnapshot, SESSION_SNAPSHOT_MAX_BYTES } from '../db/sessionSn
 import { openDispatchTurnStatusSnapshotFrame } from '../db/sessionSnapshotStatus.js'
 export { openDispatchTurnStatusSnapshotFrame } from '../db/sessionSnapshotStatus.js'
 
-type SnapshotLog = { info(msg: string, meta: Record<string, unknown>): void } | null | undefined
+type SnapshotLog = {
+  info(msg: string, meta: Record<string, unknown>): void
+  warn(msg: string, meta: Record<string, unknown>): void
+} | null | undefined
 type SnapshotSocket = Pick<WebSocket, 'readyState' | 'send' | 'bufferedAmount'>
 
 /** Rolling-client projection of #1198. Credits are the very same object as
@@ -25,7 +28,7 @@ export function sendHelloOpenDispatchSnapshot(
 /** Started after forwarding hello. Only PG participates; no ContainerLink or
  * browser-owned cache is a source of snapshot facts. */
 export async function sendHelloSessionSnapshots(
-  pool: Pool, userWs: SnapshotSocket, uid: string, peers: unknown[], log: SnapshotLog,
+  pool: Pool, userWs: SnapshotSocket, uid: string, peers: unknown[], log: SnapshotLog, connId?: string,
 ): Promise<void> {
   await Promise.resolve()
   const seen = new Set<string>()
@@ -60,8 +63,15 @@ export async function sendHelloSessionSnapshots(
         peer: { id: peer.peerId, kind: 'dm' }, snapshot,
       }))
       log?.info('user-chat-bridge: hello session snapshot sent', { uid, sessionId: peer.peerId })
-    } catch {
+    } catch (error) {
       // A failing session must not block hello forwarding or other sessions.
+      const code = (error as { code?: unknown } | null)?.code
+      log?.warn('hello_session_snapshot_failed', {
+        uid, sessionId: peer.peerId, connId,
+        errorName: error instanceof Error && /^(?:Error|TypeError|SyntaxError|RangeError|AbortError)$/.test(error.name)
+          ? error.name : 'Error',
+        ...(typeof code === 'string' && /^[A-Z0-9_]{1,40}$/.test(code) ? { errorCode: code } : {}),
+      })
     }
   }
 }
