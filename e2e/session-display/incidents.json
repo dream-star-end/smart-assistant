@@ -9625,7 +9625,7 @@
       "occurredAt": "2026-10-30",
       "severity": "P1",
       "symptom": "uid2058 会话 webmvvde0m9oyavl3 明确要求顾问只给建议、不要改文件，主模型仍以顾问模式验证要求为由成功 Edit 提纲。禁写回合现冻结只读策略，在 CCB/Codex/Grok/Cursor 原生工具和 MCP 调用边界卸掉写入、命令和委派路径，顾问同步收到禁写约束，下一普通回合恢复工具。",
-      "rootFixCommit": "bd2545a8",
+      "rootFixCommit": "45d694b77",
       "regressions": [
         {
           "layer": "unit",
