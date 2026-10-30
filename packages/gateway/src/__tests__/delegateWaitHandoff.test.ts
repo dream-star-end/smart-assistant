@@ -126,18 +126,25 @@ describe('MCP deadline handoff', () => {
     assert.equal(f.calls.length, 0)
   })
 
-  for (const failed of [false, true]) {
-    it(`returns ${failed ? 'failure' : 'success'} on stdout after refusing a deadline handoff`, async () => {
-      const f = fixture()
-      const id = f.create()
-      assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), false)
-      f.complete(id, failed)
-      const response = await waitRoute(f, id)
-      assert.equal(response.body.status, failed ? 'failed' : 'done')
-      assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
-      assert.equal(f.store.snapshotOf(id)?.callbackState, 'skipped_silent')
-      assert.equal(f.calls.length, 0)
-    })
+  for (const sm of [false, true]) {
+    for (const failed of [false, true]) {
+      it(`returns ${failed ? 'failure' : 'success'} on stdout after refusing a deadline handoff with SM ${sm ? 'on' : 'off'}`, async () => {
+        process.env.OC_DELEGATE_SM = sm ? '1' : '0'
+        const f = fixture()
+        const id = f.create()
+        assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), false)
+        f.complete(id, failed)
+        const response = await waitRoute(f, id)
+        // Legacy SM-off uses done for both outcomes; httpStatus/error preserve
+        // the failure. SM-on additionally exposes its failed state on the wire.
+        assert.equal(response.body.status, failed && sm ? 'failed' : 'done')
+        assert.equal(response.body.httpStatus, failed ? 500 : 200)
+        if (failed) assert.equal(response.body.error, 'child failed')
+        assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
+        assert.equal(f.store.snapshotOf(id)?.callbackState, 'skipped_silent')
+        assert.equal(f.calls.length, 0)
+      })
+    }
   }
 
   it('callback completion and terminal catch-up compete for one claim, including intent owner', async () => {
