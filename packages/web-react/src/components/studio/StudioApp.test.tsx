@@ -521,6 +521,18 @@ describe('StudioApp (OCV5-593)', () => {
     ).toBeInTheDocument()
   })
 
+  test('brief page: provider suspension can continue even before a take succeeds', async () => {
+    let waiting = true
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    const view = () => ({ project: project({ status: waiting ? 'awaiting_user' : 'running', settings: waiting ? { awaitingReason: 'provider_failure' } : {} }), shots: [], lines: [], assets: [], takes: [], events: [] })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: view() })
+    routes[`POST /api/studio/projects/${ID}/approve`] = () => { waiting = false; return { status: 200, body: view() } }
+    mount(`/studio/p/${ID}/brief`)
+    fireEvent.click(await screen.findByRole('button', { name: '继续' }))
+    await waitFor(() => expect(calls.some((c) => c.method === 'POST' && c.path.endsWith('/approve'))).toBe(true))
+    await waitFor(() => expect(screen.queryByRole('button', { name: '继续' })).not.toBeInTheDocument())
+  })
+
   test('brief page: empty brief keeps start disabled', async () => {
     routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
     routes[`GET /api/studio/projects/${ID}`] = () => ({
