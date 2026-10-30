@@ -143,7 +143,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           const gap = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
           assert.equal(gap.status,"pending");
           await assert.rejects(() => journal.finishToolRollover({ requestId,uid: 3n,claim }),
-            undefined,"claim and a missing proof never authorize another generation");
+            "claim and a missing proof never authorize another generation");
           const beforeFinishCtx = index === 128
             ? (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx : undefined;
           if (index === 128) {
