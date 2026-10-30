@@ -328,6 +328,15 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
+  it('文献与扫描件提示指向现行 CLI 和技能', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    assert.doesNotMatch(prompt, /scansci-pdf <子命令>|skill_view\("scansci-pdf"\)/)
+    for (const command of ['oc-lit', 'oc-cite', 'oc-ingest', 'oc-ocr']) {
+      assert.ok(prompt.includes(command), command)
+    }
+    assert.ok(prompt.includes('skill_view("oc-lit")'))
+    assert.ok(prompt.includes('skill_view("oc-ingest")'))
+  })
   it('内部效率契约只适用于管理员基线,不注入普通用户或常驻 prompt', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(!prompt.includes('## 效率契约'), '常驻 prompt 与基线重复,主 agent 会读两遍')
