@@ -17,7 +17,7 @@ test('scope Stop needs both a committed future fence and positive original-run p
       fetchImpl:async () => new Response(JSON.stringify({scopeId:identity.scopeId,...receipt}))}),/RECEIPT_INVALID/)
   }
   const answer=await controlBoxAgentScope(identity,'cancel','explicit-stop',{env,fetchImpl:async (url,init) => {
-    assert.equal(String(url),'http://172.31.0.1:18892/internal/box/agent-scope')
+    assert.equal(String(url),'http://172.31.0.1:18892/internal/v5/box/agent-scope')
     assert.deepEqual(JSON.parse(String(init?.body)),{...identity,operation:'cancel',reason:'explicit-stop'})
     return new Response(JSON.stringify({scopeId:identity.scopeId,status:'stopped',fence:'cancelled',proof:'prelaunch_cancelled'}))
   }})

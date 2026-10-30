@@ -1,4 +1,4 @@
-export const BOX_AGENT_SCOPE_PATH = '/internal/box/agent-scope'
+export const BOX_AGENT_SCOPE_PATH = '/internal/v5/box/agent-scope'
 /**
  * 内部(容器/egress/master 之间)`/internal/*` 路由的单一注册表。
  *
