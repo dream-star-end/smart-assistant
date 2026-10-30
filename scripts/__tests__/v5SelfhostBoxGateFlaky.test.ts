@@ -327,6 +327,130 @@ describe("host idle before the Box gates (OCV5-557 item 3)", () => {
     assert.match(activeRes.stdout, new RegExp(`pid${runner.pid}: npm run test:gateway`));
   });
 
+  test("bash -c heredoc that writes web-checks.sh then blocks is idle", async (t) => {
+    const fx = fixture(t);
+    const killGroup = (pid: number | undefined) => {
+      if (!pid) return;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") throw err;
+      }
+    };
+    const readKernelStat = (pid: number): { state: string; ppid: number } | null => {
+      try {
+        const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rparen = raw.lastIndexOf(") ");
+        if (rparen < 0) return null;
+        const fields = raw.slice(rparen + 2).trim().split(/\s+/);
+        return { state: fields[0] ?? "", ppid: Number(fields[1] ?? 0) };
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") return null;
+        throw err;
+      }
+    };
+    const kernelChildrenOf = (ppid: number): number[] => {
+      const out: number[] = [];
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        const pid = Number(name);
+        const st = readKernelStat(pid);
+        if (st && st.ppid === ppid) out.push(pid);
+      }
+      return out;
+    };
+    const unlinkProc = (link: string) => {
+      try {
+        unlinkSync(link);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") throw err;
+      }
+    };
+
+    // Incident shape (tr-20261030T013148Z pid510429): bash -c carries
+    // `cat > web-checks.sh <<'EOF' … npm run test … EOF` and then blocks.
+    // The same argv is a candidate, so a running descendant must still count as busy.
+    const heredocArgv = [
+      "bash", "-c",
+      "cat > web-checks.sh <<'EOF'\n#!/usr/bin/env bash\nnpm run test\nEOF\nflock web-checks.lock sleep 30\n",
+    ];
+    proc(fx, 510429, heredocArgv, { state: "S", utime: 2, stime: 1, comm: "bash" });
+    proc(fx, 510430, ["sleep", "30"], { ppid: 510429, state: "S", utime: 0, stime: 0, comm: "sleep" });
+    const idle = run(fx, "master_gate_busy_reason");
+    assert.equal(idle.status, 0, idle.stderr);
+    assert.equal(idle.stdout, "");
+
+    rmSync(path.join(fx.proc, "510430"), { recursive: true });
+    proc(fx, 510431, ["node", "vitest"], { ppid: 510429, state: "R", utime: 4, stime: 1 });
+    const active = run(fx, "master_gate_busy_reason");
+    assert.equal(active.status, 0, active.stderr);
+    assert.match(active.stdout, /pid510429: npm run test/);
+
+    for (const entry of readdirSync(fx.proc)) rmSync(path.join(fx.proc, entry), { recursive: true, force: true });
+
+    const blockLock = path.join(fx.dir, "heredoc.lock");
+    writeFileSync(blockLock, "");
+    const holder = spawn("flock", [blockLock, "sleep", "40"], { stdio: "ignore", detached: true });
+    t.after(() => killGroup(holder.pid));
+    for (let i = 0; i < 50 && spawnSync("flock", ["-n", blockLock, "true"]).status === 0; i++) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    const ready = path.join(fx.dir, "heredoc.ready");
+    const body = [
+      "cat > web-checks.sh <<'EOF'",
+      "#!/usr/bin/env bash",
+      "npm run test",
+      "EOF",
+      "echo $$ > \"$1\"",
+      "flock \"$2\" sleep 30",
+    ].join("\n");
+    const writer = spawn("bash", ["-c", body, "bash", ready, blockLock], {
+      cwd: fx.dir, stdio: "ignore", detached: true,
+    });
+    t.after(() => killGroup(writer.pid));
+    const linked: string[] = [];
+    t.after(() => {
+      for (const link of linked) unlinkProc(link);
+    });
+    let writerTree: number[] = [];
+    for (let i = 0; i < 100; i++) {
+      if (writer.pid && existsSync(ready)) {
+        const walk = (pid: number): number[] => [pid, ...kernelChildrenOf(pid).flatMap(walk)];
+        const tree = walk(writer.pid);
+        if (tree.length >= 2 && tree.every((pid) => readKernelStat(pid)?.state === "S")) {
+          writerTree = tree;
+          break;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(writer.pid, "heredoc bash did not start");
+    assert.ok(writerTree.length >= 2, `expected blocked flock child in state S, tree=${writerTree.join(",")}`);
+    const cmdline = readFileSync(`/proc/${writer.pid}/cmdline`, "utf8").split("\0").join(" ");
+    assert.match(cmdline, /cat > web-checks\.sh <<'EOF'/);
+    assert.match(cmdline, /npm run test/);
+    assert.match(readFileSync(path.join(fx.dir, "web-checks.sh"), "utf8"), /^npm run test$/m);
+    for (const pid of writerTree) {
+      const link = path.join(fx.proc, String(pid));
+      symlinkSync(`/proc/${pid}`, link);
+      linked.push(link);
+    }
+    const waitingRes = run(fx, "master_gate_busy_reason");
+    for (const link of linked) unlinkProc(link);
+    linked.length = 0;
+    killGroup(writer.pid);
+    killGroup(holder.pid);
+    assert.equal(waitingRes.status, 0, waitingRes.stderr);
+    assert.equal(
+      waitingRes.stdout,
+      "",
+      `blocked heredoc writer was reported busy: [${waitingRes.stdout}]`,
+    );
+  });
+
   test("waits while busy, then goes; gives up after the limit with the reason", (t) => {
     const fx = fixture(t);
     setLoad(fx, "20.00");
