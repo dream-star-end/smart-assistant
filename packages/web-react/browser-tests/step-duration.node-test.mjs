@@ -172,7 +172,7 @@ test("OCV5-367: process steps show elapsed time instead of token totals", { time
         await page.getByTestId("step-harness").waitFor();
         await page.evaluate(() => window.__stepPage.setScene("model-wait"));
         await page.getByTestId("process-live-tail").waitFor();
-        assert.match(await page.getByTestId("process-live-tail").innerText(), /等待模型响应[\s\S]*7 分 4[3-9] 秒/);
+        assert.match(await page.getByTestId("process-live-tail").innerText(), /模型生成中[\s\S]*7 分 4[3-9] 秒/);
         assert.equal(await page.getByTestId("process-group-summary").getAttribute("data-live-working"), "false");
         await shot(page, `model-wait-${width}`);
         await page.evaluate(() => window.__stepPage.setScene("file-done"));
