@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import { symlinkSync } from 'node:fs'
 
 import {
+  ADVISOR_NO_WRITE_CONSTRAINT,
   ADVISOR_PREAMBLE,
   advisorCanonicalModelId,
   assertAdvisorModelAllowed,
@@ -15,6 +16,7 @@ import {
   advisorConsultParentGate,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
+  detectAdvisorNoWrite,
   extractGeneratedPaths,
   formatAdvisorConsultPrompt,
   historyFromSessionMessages,
@@ -26,7 +28,82 @@ import {
   stripAdvisorPreambleFromInjected,
 } from '../advisorMode.js'
 
+describe('advisor no-write intent', () => {
+  it('recognizes explicit file restrictions and advice/reply/read-only turns in Chinese and English', () => {
+    for (const request of [
+      '顾问只给建议，不要改文件。用三条短句说，刚才那份提纲还缺什么。',
+      '不要修改任何文件', '别动代码', '禁止写入工作区', '请勿删除文件',
+      '不用改文件', '本轮不修改代码', '不要对文件做任何修改', '文件先不要改',
+      '不要改 README.md', '只给修改建议', '仅做分析', '只回复三句话', '只读检查',
+      'Do not modify any files.', "Don't edit files.", 'Don’t touch the code.',
+      'Do not make any changes to files.', 'Do not create or delete files.',
+      "Don't touch README.md", 'No file changes.', 'Review without modifying files.',
+      'Keep the workspace unchanged.', 'Read-only review.', 'readonly analysis',
+      'Advice only.', 'Only give me suggestions.', 'Just provide recommendations.', 'Only reply in chat.',
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), true, request)
+    }
+  })
+
+  it('does not restrict ordinary implementation or unrelated requests not to stop or ask', () => {
+    for (const request of [
+      '', '请修改这份提纲并保存文件。', '实现功能，不要停下来问。',
+      '不要停，直接修改文件。', '不要问，修复代码并执行测试。',
+      'Update the file and save the result.', "Don't stop or ask; edit the file.",
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), false, request)
+    }
+  })
+
+  it('keeps the no-write exception visible beside the main-model verification instruction', () => {
+    assert.match(ADVISOR_PREAMBLE, /用户禁止改文件或要求只读、只给建议时/)
+    assert.match(ADVISOR_PREAMBLE, /验证只能用只读工具，交付只写回复/)
+    assert.match(ADVISOR_PREAMBLE, /不得 Write、Edit 或通过命令、MCP、委派改文件/)
+  })
+})
+
 describe('advisorMode snapshot', () => {
+  it('uses the frozen restriction if the raw user task is empty or replaced by a queued turn', () => {
+    for (const userTask of ['', '下一轮请修改文件并保存。']) {
+      const snapshot = buildAdvisorSnapshot({
+        question: 'What is missing?', concern: '', advisorModel: 'gpt-6-astra',
+        source: { userTask, readOnly: true },
+      })
+      assert.equal(snapshot.constraints, ADVISOR_NO_WRITE_CONSTRAINT)
+      assert.equal(snapshot.missing.includes('injected_constraints'), false)
+      assert.match(formatAdvisorConsultPrompt(snapshot), /不要建议主模型改文件/)
+    }
+  })
+
+  it('carries the incident user no-write request into advisor constraints without requiring attachments', () => {
+    const snapshot = buildAdvisorSnapshot({
+      question: '提纲还缺什么？',
+      concern: '',
+      advisorModel: 'gpt-6-astra',
+      source: { userTask: '顾问只给建议，不要改文件。用三条短句说，刚才那份提纲如果拿去给同事看，还缺什么。' },
+    })
+    assert.match(snapshot.constraints, /本轮禁止写文件/)
+    assert.equal(snapshot.constraints, ADVISOR_NO_WRITE_CONSTRAINT)
+    assert.match(snapshot.constraints, /不要建议主模型改文件/)
+    assert.equal(snapshot.missing.includes('injected_constraints'), false)
+    assert.match(formatAdvisorConsultPrompt(snapshot), /【已注入约束】\n【本轮禁止写文件】/)
+  })
+
+  it('keeps the no-write constraint when other injected context exceeds the snapshot cap', () => {
+    const snapshot = buildAdvisorSnapshot({
+      question: 'Review the outline.',
+      concern: '',
+      advisorModel: 'gpt-6-astra',
+      source: {
+        userTask: 'Do not modify any files; only give advice.',
+        injectedConstraints: 'attachment text '.repeat(1000),
+      },
+    })
+    assert.match(snapshot.constraints, /^【本轮禁止写文件】/)
+    assert.match(snapshot.constraints, /不要建议主模型改文件/)
+    assert.equal(snapshot.truncated, true)
+  })
+
   it('marks missing history/tools/artifacts instead of pretending complete', () => {
     const snap = buildAdvisorSnapshot({
       question: 'why red?',

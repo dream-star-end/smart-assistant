@@ -2103,6 +2103,7 @@ export class SessionManager {
       turnChatProjectId?: string | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
+      readOnly?: boolean
       /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
        *  只有 **bridge turn** 有(server.ts dispatchInbound 从验签产物 TurnExecutionDescriptor
        *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner

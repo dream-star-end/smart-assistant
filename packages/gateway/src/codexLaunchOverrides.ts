@@ -45,6 +45,7 @@ import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { buildPromptContext, type IntelligentUiApplied, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
+import { ADVISOR_READ_ONLY_MCP_TOOLS, isAdvisorReadOnlyMcpTool } from '@openclaude/protocol'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -242,6 +243,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
+  readOnly?: boolean
   systemHelpContextFile?: string
   promptPolicy?: PromptPrivacyPolicy
   identityCompat?: IdentityCompatRuntimeContext
@@ -373,7 +375,7 @@ export async function buildCodexLaunchOverrides(
     : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
   const projectSearchOn = isProjectSearchEnabled(process.env)
   const availableMcpTools = mcpLaunch
-    ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => projectSearchOn || name !== 'project_search')
+    ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => (projectSearchOn || name !== 'project_search') && (!ctx.readOnly || isAdvisorReadOnlyMcpTool(name)))
     : []
   const platformResult = await buildPromptContext({
     promptPolicy: ctx.promptPolicy,
@@ -501,6 +503,7 @@ export async function buildCodexLaunchOverrides(
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(ctx.delegationDepth ?? 0),
+      OPENCLAUDE_ADVISOR_READ_ONLY: ctx.readOnly ? '1' : '0',
       ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
         ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
         : {}),
@@ -516,6 +519,10 @@ export async function buildCodexLaunchOverrides(
       `mcp_servers.openclaude_memory.default_tools_approval_mode=${tomlValue('approve')}`,
       '-c',
       `mcp_servers.openclaude_memory.tool_timeout_sec=${codexMcpToolTimeoutSec()}`,
+    )
+    if (ctx.readOnly) argvOverrides.push(
+      '-c',
+      `mcp_servers.openclaude_memory.enabled_tools=${tomlValue([...ADVISOR_READ_ONLY_MCP_TOOLS])}`,
     )
   }
 

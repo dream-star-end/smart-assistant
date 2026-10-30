@@ -56,6 +56,7 @@ import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { writeCodexDelegateContext } from './codexDelegateContext.js'
+import { advisorReadOnlyThreadConfig, assertAdvisorReadOnlyRuntime, buildAdvisorReadOnlyArgs } from './codexAdvisorReadOnly.js'
 import {
   buildHermeticDenial,
   isHermeticExecutionMethod,
@@ -303,6 +304,7 @@ interface QueuedTurn {
   queueTurn?: boolean
   traceId?: string
   automaticRetryState?: AutomaticRetryState
+  readOnly?: boolean
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -342,6 +344,11 @@ export class CodexAppServerRunner extends EventEmitter {
   private shuttingDown = false
   private spawnEmitted = false
   private initialized = false
+  /** Captured from this queue entry; never inferred from a rewritten prompt. */
+  private advisorReadOnly = false
+  /** Tool/MCP schemas are process-scoped, so both policy transitions recycle. */
+  private spawnedAdvisorReadOnly: boolean | null = null
+  private advisorReadOnlyConfig: Record<string, unknown> | undefined
   /**
    * USER_CANCELLED 只发 turn/interrupt、不杀进程。合作式 summary 到达后
    * sessionManager 会跳过 shutdown,下一 turn ensureSpawned 会复用已经
@@ -1051,6 +1058,7 @@ export class CodexAppServerRunner extends EventEmitter {
         runContext: this.opts.runContext,
         frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
+        readOnly: this.advisorReadOnly,
       })
       if (privacyGeneration !== this._preheatGeneration) throw new Error('PROMPT_PRIVACY_SPAWN_STALE')
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
@@ -1154,6 +1162,7 @@ export class CodexAppServerRunner extends EventEmitter {
     queueTurn = false,
     automaticRetryState?: AutomaticRetryState,
     traceId?: string | null,
+    readOnly = false,
   ): Promise<void> {
     const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     this.lastActivityAt = Date.now()
@@ -1173,6 +1182,7 @@ export class CodexAppServerRunner extends EventEmitter {
         queueTurn,
         traceId: turnTraceId,
         automaticRetryState,
+        readOnly,
       })
       void this.drain()
     })
@@ -1333,6 +1343,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.collabAgentPolicy,
         turn.automaticRetryState,
         turn.traceId ?? null,
+        turn.readOnly === true,
       )
       turn.resolve()
     } catch (err) {
@@ -1575,6 +1586,9 @@ export class CodexAppServerRunner extends EventEmitter {
       : []
     const args = [
       'app-server',
+      // Register the platform server. Inherited server tables are explicitly
+      // disabled after initialize because empty TOML maps merge with them.
+      ...(this.advisorReadOnly ? ['-c', 'mcp_servers={}'] : []),
       ...argvOverrides,
       ...providerArgs,
       ...modelCatalogArgs,
@@ -1586,6 +1600,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...applyPatchStreamingArgs,
       ...telemetryArgs,
       ...stageAgentArgs,
+      ...(this.advisorReadOnly ? buildAdvisorReadOnlyArgs() : []),
       '--listen',
       'stdio://',
     ]
@@ -1616,6 +1631,7 @@ export class CodexAppServerRunner extends EventEmitter {
       },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    this.spawnedAdvisorReadOnly = this.advisorReadOnly
     proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
       if (this.proc !== proc) return
       log.warn('codex app-server stdin error', {
@@ -1741,7 +1757,13 @@ export class CodexAppServerRunner extends EventEmitter {
     // won't EPIPE.
     const initializeStartedAt = performance.now()
     try {
-      await this.sendRequest('initialize', this.buildInitializeParams())
+      const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
+      if (this.advisorReadOnly) {
+        assertAdvisorReadOnlyRuntime(initialized)
+        this.advisorReadOnlyConfig = advisorReadOnlyThreadConfig(await this.sendRequest('config/read', {
+          cwd: effectiveCwd, includeLayers: false,
+        }), this.cachedOverrides?.tokenFile != null)
+      } else this.advisorReadOnlyConfig = undefined
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
         stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
     } catch (err) {
@@ -2068,11 +2090,14 @@ export class CodexAppServerRunner extends EventEmitter {
       },
       sandboxPolicy: this.opts.hermeticNoTools
         ? { type: 'readOnly', networkAccess: false }
+        : this.advisorReadOnly
+          ? { type: 'readOnly', networkAccess: false }
         : mode === 'plan'
           ? { type: 'readOnly', networkAccess: true }
           : { type: 'dangerFullAccess' },
     }
     if (this.codexTransportModel()) params.model = this.codexTransportModel()
+    if (this.advisorReadOnly) params.environments = []
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
     // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
     // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
@@ -2134,7 +2159,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
       approvalPolicy: 'never',
-      sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
+      sandbox: this.opts.hermeticNoTools || this.advisorReadOnly ? 'read-only' : 'danger-full-access',
+      ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
       cwd: effectiveCwd,
       ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
     })) as { thread?: { id?: string } } | undefined
@@ -2361,12 +2387,14 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
     traceId?: string | null,
+    readOnly = false,
   ): Promise<void> {
     const turnTraceId = traceId === null ? undefined : traceId ?? this.opts.traceId
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
     // Join speculative preparation; a failed warmup falls back to normal preparation.
     if (this._preheatPromise) await this._preheatPromise.catch(() => {})
+    this.advisorReadOnly = readOnly
     const seenDeltas = new Set<string>()
     const observeFirstDelta = (message: any): void => {
       const delta = message?.event?.delta
@@ -2414,7 +2442,8 @@ export class CodexAppServerRunner extends EventEmitter {
       if (
         this.proc &&
         !this.proc.killed &&
-        ((this.spawnedProviderSignature !== null &&
+        ((this.spawnedAdvisorReadOnly !== null && this.spawnedAdvisorReadOnly !== readOnly) ||
+          (this.spawnedProviderSignature !== null &&
           this.spawnedProviderSignature !== this.codexRouteSignature()) ||
           (this._preheatedSignature !== null &&
             this._preheatedSignature !== this.preheatSignature(repoSnap, effectiveCwd)))
@@ -2465,7 +2494,8 @@ export class CodexAppServerRunner extends EventEmitter {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
               threadId: this.threadId,
               approvalPolicy: 'never',
-              sandbox: 'danger-full-access',
+              sandbox: this.advisorReadOnly ? 'read-only' : 'danger-full-access',
+              ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
               cwd: effectiveCwd,
               ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
             })
@@ -2511,7 +2541,8 @@ export class CodexAppServerRunner extends EventEmitter {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                   threadId: fallback,
                   approvalPolicy: 'never',
-                  sandbox: 'danger-full-access',
+                  sandbox: this.advisorReadOnly ? 'read-only' : 'danger-full-access',
+                  ...(this.advisorReadOnly ? { environments: [], config: this.advisorReadOnlyConfig } : {}),
                   cwd: effectiveCwd,
                   ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
                 })

@@ -1138,6 +1138,7 @@ export function officialCcProxySpawnFingerprint(
  * unit-testable, no side effects, no file I/O.
  */
 export interface CcbCliArgsInput {
+  readOnly?: boolean
   /** e.g. 'bun' or 'node' (maps to `run` vs `--experimental-strip-types`) */
   runtime: string
   /** Entry file path, e.g. src/entrypoints/cli.tsx */
@@ -1222,6 +1223,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     restrictedMemorySources,
     workload,
     hermeticNoTools,
+    readOnly,
     settingsFile,
     structuredOutputSchema,
   } = input
@@ -1254,6 +1256,9 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     args.push('--disallowedTools', ...CCB_PLATFORM_DISALLOWED_TOOLS)
     args.push('--permission-prompt-tool', 'stdio')
   }
+  if (readOnly && !hermeticNoTools) {
+    args.push('--tools', 'Read,Glob,Grep', '--strict-mcp-config')
+  }
   if (hermeticNoTools) {
     args.push('--bare', '--tools', '', '--strict-mcp-config')
   }
@@ -1285,6 +1290,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
 }
 
 export interface OfficialClaudeCliArgsInput {
+  readOnly?: boolean
   model?: string
   permissionMode?: string
   extraPromptFile?: string
@@ -1317,6 +1323,7 @@ export function buildOfficialClaudeCliArgs(input: OfficialClaudeCliArgsInput): s
   }
   args.push('--disallowedTools', ...OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS)
   args.push('--permission-prompt-tool', 'stdio')
+  if (input.readOnly) args.push('--tools', 'Read,Glob,Grep', '--strict-mcp-config')
   if (input.settingsFile) args.push('--settings', input.settingsFile)
   if (input.extraPromptFile) args.push('--append-system-prompt-file', input.extraPromptFile)
   if (input.mcpConfigFile) args.push('--mcp-config', input.mcpConfigFile)
