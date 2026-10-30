@@ -3,11 +3,11 @@ import type { Queryable } from '../dispatch/turnDispatchStore.js'
 import { containerLinkRebuilt, containerLinkReconnect } from '../admin/metrics.js'
 import { readContainerLinkDispatches, scanContainerLinkCarriers, type LinkCarrier, type LinkDispatch } from './containerLinkRecoveryStore.js'
 
-type Entry = { attempts: number; queued: boolean; again: boolean; exhausted: boolean }
+type Entry = { attempts: number; queued: boolean; again: boolean; exhausted: boolean; keepAlive: boolean }
 export interface ContainerLinkRecoveryOptions {
   pool: Queryable
   channel: string
-  attach(carrier: LinkCarrier, rows: LinkDispatch[], signal: AbortSignal): Promise<'rebuilt' | 'attached' | 'vanished' | 'pending'>
+  attach(carrier: LinkCarrier, rows: LinkDispatch[], signal: AbortSignal, keepAlive?: boolean): Promise<'rebuilt' | 'attached' | 'vanished' | 'pending'>
   drain(): Promise<void>
   log?: { info?(message: string, fields?: Record<string, unknown>): void; warn?(message: string, fields?: Record<string, unknown>): void } | null
   retryMs?: number
@@ -44,14 +44,19 @@ export class ContainerLinkRecovery {
   lost(uid: bigint, containerId: number): void {
     void this.enqueue({ uid: String(uid), containerId }, true)
   }
-  private enqueue(carrier: LinkCarrier, retry: boolean): Promise<void> {
+  /** Durable work may need a carrier even when no dispatch is still open. */
+  wake(carrier: LinkCarrier): Promise<void> {
+    return this.enqueue(carrier, false, true)
+  }
+  private enqueue(carrier: LinkCarrier, retry: boolean, keepAlive = false): Promise<void> {
     if (this.abort.signal.aborted) return Promise.resolve()
     const key = `${carrier.uid}:${carrier.containerId}`
     let entry = this.entries.get(key)
     if (!entry) {
-      entry = { attempts: 0, queued: false, again: false, exhausted: false }
+      entry = { attempts: 0, queued: false, again: false, exhausted: false, keepAlive: false }
       this.entries.set(key, entry)
     }
+    entry.keepAlive ||= keepAlive
     if (entry.exhausted) return Promise.resolve()
     if (entry.queued) { entry.again ||= retry; return this.tail }
     if (retry && entry.attempts >= (this.options.maxAttempts ?? 5)) {
@@ -71,8 +76,8 @@ export class ContainerLinkRecovery {
       await this.options.drain()
       if (this.abort.signal.aborted) return
       const rows = await readContainerLinkDispatches(this.options.pool, carrier)
-      if (this.abort.signal.aborted || rows.length === 0) return
-      const result = await this.options.attach(carrier, rows, this.abort.signal)
+      if (this.abort.signal.aborted || (rows.length === 0 && !current.keepAlive)) return
+      const result = await this.options.attach(carrier, rows, this.abort.signal, current.keepAlive)
       if (this.abort.signal.aborted) return
       // A live desktop may register its tunnel after startup. Keep its dial budget.
       if (result === 'pending') { current.again = true; return }

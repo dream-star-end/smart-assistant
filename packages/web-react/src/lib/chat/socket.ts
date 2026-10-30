@@ -12,6 +12,7 @@
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
+import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -388,10 +389,6 @@ type OfflineItem = {
   msgId: string;
   enqueuedAt: number;
   state: "queued" | "persisting" | "awaiting_admission";
-};
-
-type PendingControlItem = Omit<StoredPendingControl, "status"> & {
-  status: "persisting" | "waiting_persist" | "queued" | "awaiting_receipt" | "persisted";
 };
 
 /** Stable key for one logical browser send attempt.  The normal minted
@@ -6222,39 +6219,12 @@ export class ChatSocket {
   }
 
   private applyControlReceipt(frame: OutboundControlReceiptWire): void {
-    const item = this.controlQueue.find((candidate) => candidate.controlId === frame.controlId);
-    if (!item || item.controlKind !== frame.controlKind) return;
-    if (frame.peer?.id && frame.peer.id !== item.sessId) return;
-    if (item.clientMessageId && frame.clientMessageId && frame.clientMessageId !== item.clientMessageId) return;
-    if (item.requestId && frame.requestId && frame.requestId !== item.requestId) return;
-    const sess = this.sessions.get(item.sessId);
-    if (frame.status === "persisted" || (frame.status === "applied" && item.controlKind === "stop")) {
-      item.status = "persisted";
-      if (item.controlKind === "stop" && item.fenceOnly === true) {
-        // 围栏 stop:persisted 即 master 已取消恢复子轮,无 UI 状态需要推进。
-        return;
-      }
-      const stopSettlement = sess?._stopSettlement;
-      if (sess && stopSettlement?.controlId === frame.controlId) {
-        stopSettlement.phase = "persisted";
-        sess._recoveryStatus = {
-          kind: "stopping",
-          masterPersisted: true,
-          attempt: frame.attempt ?? item.attempt,
-          ...(frame.errorCode ? { errorCode: frame.errorCode } : {}),
-        };
-      } else if (sess) {
-        sess._recoveryStatus = {
-          kind: "needs-confirmation",
-          attempt: frame.attempt ?? item.attempt,
-          ...(frame.errorCode ? { errorCode: frame.errorCode } : {}),
-        };
-      }
-      this.deps.persistSession?.(item.sessId);
-      this.scheduleNotify();
-      return;
-    }
-    this.settleControl(frame.controlId, frame.status);
+    applyControlReceipt(frame, {
+      queue: this.controlQueue, sessions: this.sessions,
+      settle: (id, status) => this.settleControl(id, status), persist: this.deps.persistSession,
+      notify: () => this.scheduleNotify(), sync: this.deps.syncSession,
+      notice: (id, text) => { this.transientNotices.set(id, { text, ts: Date.now() }); this.scheduleNotify(); },
+    });
   }
 
   /** Register the exact logical turn synchronously. There is intentionally no

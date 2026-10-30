@@ -20,10 +20,13 @@ export type StartRecoveryBridge = (user: WebSocket, uid: bigint, endpoint: Endpo
 
 export async function rebuildContainerLink(input: {
   carrier: LinkCarrier; rows: LinkDispatch[]; signal: AbortSignal
+  keepAlive?: boolean
   links: ContainerLinkRegistry; deps: UserChatBridgeDeps; maxFrameBytes: number; start: StartRecoveryBridge
 }): Promise<'rebuilt' | 'attached' | 'vanished' | 'pending'> {
   const { carrier, signal, links, deps } = input
   const uid = BigInt(carrier.uid)
+  if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
+  if (input.keepAlive && links.controlTransport(uid, carrier.containerId)) return 'attached'
   const endpoint = await deps.resolveContainerLinkEndpoint!(uid, carrier.containerId)
   if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
   if (endpoint === 'pending') return 'pending'
@@ -39,8 +42,9 @@ export async function rebuildContainerLink(input: {
     if (signal.aborted || links.stopping) throw new Error('container link recovery stopped')
     const handle = getContainerLinkHandle(socket)!
     handle.recoveryOnly = true
+    handle.keepAlive = input.keepAlive === true
     for (const row of input.rows) handle.restoreDispatch(row)
-    if (!handle.hasOpenDispatches) { socket.terminate(); return 'attached' }
+    if (!handle.hasOpenDispatches && !handle.keepAlive) { socket.terminate(); return 'attached' }
     const user = new RecoverySubscriber()
     input.start(user as unknown as WebSocket, uid, endpoint, socket, abort, connId)
     // Existing cleanup detaches timers/executors while retaining open streams.

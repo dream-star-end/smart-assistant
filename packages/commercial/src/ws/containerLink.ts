@@ -44,6 +44,7 @@ export class ContainerLinkHandle extends EventEmitter {
   readonly closedStreams = new Set<string>();
   detached = false;
   recoveryOnly = false;
+  keepAlive = false;
   active = false;
   opened = false;
   disposed = false;
@@ -124,6 +125,7 @@ class ContainerLink {
   private pingSeq = 0;
   private readonly hello: ContainerLinkHello;
   private unmountTransport: (() => void) | null = null;
+  transport: WebSocket | null = null;
   private transportOwner(): ContainerLinkHandle | undefined {
     return [...this.consumers].find((h) => h.active && !h.detached && !h.disposed)
       ?? [...this.consumers].find((h) => h.active && !h.disposed);
@@ -139,6 +141,7 @@ class ContainerLink {
         link.send(owner, data, opts, callback);
       },
     } as WebSocket;
+    this.transport = transport;
     const key = String(this.uid);
     let set = map.get(key);
     if (!set) { set = new Set(); map.set(key, set); }
@@ -463,6 +466,10 @@ export class ContainerLinkRegistry {
     });
   }
   snapshots(): ContainerLinkSnapshot[] { return [...this.links.values()].map((link) => link.snapshot()); }
+  controlTransport(uid: bigint, containerId: number): WebSocket | null {
+    const transport = this.links.get(`${uid}:${containerId}`)?.transport;
+    return transport?.readyState === WebSocket.OPEN ? transport : null;
+  }
   async drain(): Promise<void> { await Promise.allSettled([...this.draining].map((link) => link.drain())); }
   async shutdown(): Promise<void> {
     this.stopping = true;
