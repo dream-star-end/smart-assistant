@@ -88,6 +88,73 @@ describe('Master durable turn controls', () => {
     })
   })
 
+  test('an already-ended exact Stop returns its durable reason while retaining recovery cancellation', async () => {
+    const cancelledRoots: unknown[] = []
+    const { pool, calls } = fakeTransactionalPool((sql, params) => {
+      if (sql.includes('pg_advisory_xact_lock')) return { rowCount: 1 }
+      if (sql.includes('SELECT root_client_message_id FROM turn_recovery_jobs')) {
+        return { rows: [{ root_client_message_id: 'message-root' }] }
+      }
+      if (sql.includes('INSERT INTO turn_control_requests')) {
+        // The classification is part of the insert, before this transaction
+        // can itself turn a pre-send dispatch terminal. Exact target and
+        // cancellation root deliberately differ for a recovery child.
+        assert.equal(params[3], 'message-root')
+        assert.equal(params[7], 'message-child')
+        assert.match(sql, /d\.client_message_id=\$8 AND d\.status='terminal'/)
+        assert.match(sql, /\$5::text='stop' AND \$8::text IS NOT NULL/)
+        assert.match(sql, /j\.root_client_message_id=\$4/)
+        assert.match(sql, /j\.status IN \('sent','forwarded'\)/)
+        assert.match(sql, /child\.status IN \('admitted','accepted','rejecting'\)/)
+        assert.match(sql, /child\.attempt_no=j\.dispatch_attempt_no/)
+        assert.match(sql, /child\.client_message_id=j\.request_json->>'clientMessageId'/)
+        assert.match(sql, /RETURNING status,error_code/)
+        assert.doesNotMatch(sql, /applied_at/)
+        return { rows: [{ status: 'terminal', error_code: 'TURN_ALREADY_ENDED' }] }
+      }
+      if (sql.includes('UPDATE turn_permission_requests p')) return { rowCount: 0 }
+      if (sql.includes('SELECT status,dispatch_id,dispatch_attempt_no')) return { rows: [] }
+      if (sql.includes('UPDATE turn_recovery_jobs')) {
+        cancelledRoots.push(params[2])
+        return { rowCount: 1 }
+      }
+      throw new Error(`unexpected SQL: ${sql}`)
+    })
+    assert.deepEqual(await admitDurableControl(pool, {
+      controlId: 'ctrl-ended', userId: 7n, sessionId: 'session-1',
+      rootClientMessageId: 'message-child', kind: 'stop',
+      payload: { type: 'inbound.control.stop', clientMessageId: 'message-child' },
+    }), { inserted: true, status: 'terminal', errorCode: 'TURN_ALREADY_ENDED' })
+    assert.deepEqual(cancelledRoots, ['message-root'])
+    assert.ok(calls[4]?.startsWith('INSERT INTO turn_control_requests'))
+    assert.ok(calls[7]?.startsWith('UPDATE turn_recovery_jobs'))
+    assert.equal(calls.at(-1), 'COMMIT')
+  })
+
+  test('replayed ended Stop preserves its reason and never repeats cancellation', async () => {
+    const payload = { type: 'inbound.control.stop', clientMessageId: 'message-1' }
+    const { pool, calls } = fakeTransactionalPool((sql) => {
+      if (sql.includes('pg_advisory_xact_lock')) return { rowCount: 1 }
+      if (sql.includes('SELECT root_client_message_id FROM turn_recovery_jobs')) return { rows: [] }
+      if (sql.includes('INSERT INTO turn_control_requests')) return { rowCount: 0 }
+      if (sql.includes('FROM turn_control_requests WHERE control_id=$1 FOR UPDATE')) {
+        assert.match(sql, /status,error_code/)
+        return { rows: [{
+          user_id: '7', session_id: 'session-1', root_client_message_id: 'message-1',
+          kind: 'stop', request_id: null, payload_json: payload,
+          status: 'terminal', error_code: 'TURN_ALREADY_ENDED',
+        }] }
+      }
+      throw new Error(`replay must not repeat side effects: ${sql}`)
+    })
+    assert.deepEqual(await admitDurableControl(pool, {
+      controlId: 'ctrl-ended', userId: 7n, sessionId: 'session-1',
+      rootClientMessageId: 'message-1', kind: 'stop', payload,
+    }), { inserted: false, status: 'terminal', errorCode: 'TURN_ALREADY_ENDED' })
+    assert.equal(calls.at(-1), 'COMMIT')
+    assert.equal(calls.filter(sql => sql.startsWith('UPDATE')).length, 0)
+  })
+
   test('permission response cannot be admitted without a live durable request authority', async () => {
     const { pool, calls } = fakeTransactionalPool((sql) => {
       if (sql.includes('INSERT INTO turn_control_requests')) {
@@ -156,8 +223,9 @@ describe('Master durable turn controls', () => {
   })
 
   test('claim returns fenced delivery attempts and transport backoff never consumes semantic attempts', async () => {
-    const { pool } = fakeTransactionalPool((sql) => {
+    const { pool } = fakeTransactionalPool((sql, params) => {
       if (sql.includes('WITH due AS')) {
+        assert.equal(params[4], null, 'legacy callers retain the whole-user claim')
         return {
           rows: [{
             control_id: 'ctrl-stop-1',
@@ -184,6 +252,22 @@ describe('Master durable turn controls', () => {
     assert.equal(durableRetryDelayMs(1), 2_000)
     assert.equal(durableRetryDelayMs(20), 300_000)
     assert.equal(durableRetryDelayMs(1, 45_000), 45_000)
+  })
+
+  test('carrier-filtered claims pass only selected control identities, including an empty selection', async () => {
+    const selections: unknown[] = []
+    const { pool } = fakeTransactionalPool((sql, params) => {
+      assert.match(sql, /\(\$5::text\[\] IS NULL OR control_id=ANY\(\$5::text\[\]\)\)/)
+      assert.match(sql, /FOR UPDATE SKIP LOCKED/)
+      selections.push(params[4])
+      return { rows: [] }
+    })
+    for (const controlIds of [['ctrl-a', 'ctrl-b'], []]) {
+      assert.deepEqual(await claimDueTurnControls(pool, {
+        userId: 7n, ownerId: 'master-a', leaseMs: 15_000, controlIds,
+      }), [])
+    }
+    assert.deepEqual(selections, [['ctrl-a', 'ctrl-b'], []])
   })
 })
 

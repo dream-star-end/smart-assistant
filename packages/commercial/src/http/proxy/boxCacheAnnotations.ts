@@ -865,14 +865,20 @@ export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
   return kept.length === effective.messages.length ? effective
     : { ...effective, messages: kept } as ProxyBody;
 }
+/** CCB sends the API default when Agent disables thinking; it has no CLI sampling effect. */
+export function normalizeBoxDefaultTemperature(body: ProxyBody): ProxyBody {
+  if (body.temperature !== 1) return body;
+  const { temperature: _defaultTemperature, ...rest } = body;
+  return rest as ProxyBody;
+}
 export function normalizeBoxSemanticBody(body: ProxyBody,
   options: { collapseSingleText?: boolean } = {}): ProxyBody {
   // A validated keep-all hint has no model-visible effect. Drop it from the
   // semantic request hash as well as the CLI plan so a retry with/without the
   // hint cannot evade the same paid-call replay fingerprint.
-  let semanticBody = body;
+  let semanticBody = normalizeBoxDefaultTemperature(body);
   if (isBoxNoopContextManagement(body)) {
-    const { context_management: _hint, ...rest } = body;
+    const { context_management: _hint, ...rest } = semanticBody;
     semanticBody = rest as ProxyBody;
   }
   // OCV5-317 (#b6df9aee): CCB 2.1.280 puts the `<total_tokens>` budget system

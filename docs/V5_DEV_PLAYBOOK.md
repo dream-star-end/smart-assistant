@@ -337,6 +337,8 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 - ~~跨设备/清缓存团队历史必丢~~ **已根治**(P2 批次2):handleDelegateTask 收尾产出 server-authored agent-group 骨架行(runId 去重 local-wins),跨设备可见团队结构+终态+成本;过程 childBlocks 树仍仅本设备 IndexedDB(有意取舍)。
 - **长会话热尾巴+归档**(2026-07-10 根治 4MB 拒写「扣费零送达」事故):client_sessions 行超软阈值 2.5MB → `_spillOverflowCore`(storage 唯一写侧收口)同事务把最老消息搬 `client_session_archive_chunks`,行内只留 ≤2MB 热尾巴(下限 64 条 > 兜底注入窗口 48);`_seq` 冻结不重排。回看走 `GET /api/sessions/:id/archive?before=&limit=`(前端"从云端加载更早的历史")。**full 合并必须带 archivedThroughSeq 水位**:本地 `_seq ≤ 水位`行无条件保留(否则热尾巴响应会误删本地已归档行)。PUT 防复活/append 幂等/cost-patch 短路都查 `client_session_archived_ids`。引擎无法原生续接、走 40 条兜底注入时 gateway 发 `sys.context_rebuilt` → 前端插 system 提示行(client-owned)。存量超限行迁移:`scripts/v5-sessions-spill-archive.ts`(dry-run 先行)。**模型上下文与本机制无关**(同引擎续接=容器卷原生 resume;上下文快满=引擎自动 compact)。
 
+turn_tape 作业重试以 `db/turnTapeJobs.ts` 为权威：物化第 8 次、结算第 30 次失败进入 `failed`，调度器只认领 queued / 租约过期 leased；不通过重领 failed 自愈。`ops.tape_job_stuck` 按 job + UTC 日期去重，覆盖 failed 与创建超过 1h 的 awaiting_materialization、超过 24h 的 late_tape_after_fence。告警不释放 held、不改账；缺 parentTurnKey 的历史 tape 仍需另行批准读兼容，不手工标 complete。
+
 ### 3.4 计费问题
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
 

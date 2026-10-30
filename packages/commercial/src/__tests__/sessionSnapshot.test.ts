@@ -52,6 +52,8 @@ before(async () => {
     CREATE TABLE turn_permission_requests(user_id bigint,session_id text,request_id text,client_message_id text,
       tool_use_id text,tool_name text,input_json jsonb,expires_at timestamptz,status text,created_at timestamptz DEFAULT now());
     CREATE TABLE turn_control_requests(user_id bigint,session_id text,kind text,status text,root_client_message_id text,created_at timestamptz);
+    CREATE TABLE turn_recovery_jobs(job_id bigserial PRIMARY KEY,user_id bigint,session_id text,status text,
+      semantic_recovery_attempt int,request_json jsonb,created_at timestamptz DEFAULT now());
   `)
 })
 after(async () => {
@@ -61,7 +63,7 @@ after(async () => {
 })
 beforeEach(async () => {
   await db.query(`TRUNCATE client_sessions,turn_dispatches,client_session_live_streams,client_session_live_frames,
-    usage_records,client_session_turn_tapes,turn_tape_cost_components,pending_usage_patches,turn_permission_requests,turn_control_requests RESTART IDENTITY`)
+    usage_records,client_session_turn_tapes,turn_tape_cost_components,pending_usage_patches,turn_permission_requests,turn_control_requests,turn_recovery_jobs RESTART IDENTITY`)
   await db.query("INSERT INTO client_sessions VALUES ($1,'c:3',NULL)", [sessionId])
   await db.query(`INSERT INTO turn_dispatches VALUES ($1,3,$2,$3,'main','accepted',NULL,1,now()-interval '1 hour',now(),NULL)`, [id, sessionId, cmid])
   await db.query("INSERT INTO client_session_live_streams(stream_key,session_id,user_id,client_message_id,projection_source) VALUES ($1,$2,'c:3',$3,'live')", [streamKey, sessionId, cmid])
@@ -209,9 +211,84 @@ describe('PG session snapshot transport contract', () => {
       assert.equal(snapshot.turnStatus?.status, 'engine_starting')
     } finally { await db.query('ALTER TABLE usage_records_unavailable RENAME TO usage_records') }
   })
+  for (const status of ['queued', 'leased', 'sent', 'forwarded']) {
+    test(`${status} recovery survives reconnect and suppresses the interrupted parent verdict`, async () => {
+      await db.query("UPDATE turn_dispatches SET status='terminal',outcome='interrupted',terminal_at=now()")
+      await db.query(`INSERT INTO turn_recovery_jobs(user_id,session_id,status,semantic_recovery_attempt,request_json)
+        VALUES(3,$1,$2,2,'{"_automaticRecoveryRetryLimit":3}')`, [sessionId, status])
+      const snapshot = (await readSessionSnapshot(pool, '3', sessionId, { clientMessageId: cmid }))!
+      assert.equal(snapshot.dispatch?.status, 'terminal')
+      assert.equal(snapshot.reconcile, null)
+      assert.deepEqual(snapshot.recovery, {
+        status, attempt: 2, maxAttempts: 3,
+        retryStatus: {
+          state: status === 'forwarded' ? 'running' : 'scheduled', attempt: 2, maxAttempts: 3,
+          message: status === 'forwarded' ? '正在自动重试（2/3）。' : '正在等待自动重试（2/3），请稍候。', actions: [],
+        },
+      })
+      const sent = await hello({ inFlight: true, inFlightClientMessageId: cmid })
+      assert.equal(sent.some(frame => frame.type === 'outbound.message'), false, 'hello must not synthesize an interrupted final')
+      assert.deepEqual(sent.find(frame => frame.type === 'outbound.session_snapshot')!.snapshot, snapshot)
+      assert.equal(Value.Check(OutboundSessionSnapshot, sent.find(frame => frame.type === 'outbound.session_snapshot')), true)
+    })
+  }
+  test('latest active recovery is user/session scoped and a legacy job does not invent a retry limit', async () => {
+    await db.query(`INSERT INTO turn_recovery_jobs(user_id,session_id,status,semantic_recovery_attempt,request_json,created_at) VALUES
+      (3,$1,'queued',1,'{"_automaticRecoveryRetryLimit":3}',now()-interval '1 minute'),
+      (3,$1,'forwarded',2,'{}',now()),(3,$1,'paused',3,'{}',now()+interval '1 minute'),
+      (9,$1,'forwarded',9,'{}',now()+interval '1 minute'),(3,'other-session','forwarded',8,'{}',now()+interval '1 minute')`, [sessionId])
+    const snapshot = (await readSessionSnapshot(pool, '3', sessionId))!
+    assert.equal(snapshot.recovery?.status, 'forwarded')
+    assert.equal(snapshot.recovery?.attempt, 2)
+    assert.equal(snapshot.recovery?.maxAttempts, null)
+    assert.equal(snapshot.recovery?.retryStatus.maxAttempts, undefined)
+    assert.equal(snapshot.recovery?.retryStatus.message, '正在自动重试（第 2 次）。')
+  })
+  test('unavailable optional recovery query rolls back its savepoint without losing dispatch state', async () => {
+    await db.query('ALTER TABLE turn_recovery_jobs RENAME TO turn_recovery_jobs_unavailable')
+    try {
+      const snapshot = (await readSessionSnapshot(pool, '3', sessionId))!
+      assert.equal(snapshot.recovery, null)
+      assert.equal(snapshot.dispatch?.status, 'accepted')
+      assert.equal(snapshot.turnStatus?.status, 'engine_starting')
+    } finally { await db.query('ALTER TABLE turn_recovery_jobs_unavailable RENAME TO turn_recovery_jobs') }
+  })
+  test('a recovery read timeout never becomes an interrupted parent snapshot', async () => {
+    await db.query("UPDATE turn_dispatches SET status='terminal',outcome='interrupted',terminal_at=now()")
+    const queries: string[] = []
+    const timeout = Object.assign(new Error('statement timeout'), { code: '57014' })
+    const unavailable = {
+      async connect() {
+        const client = await pool.connect()
+        return {
+          query(sql: string, values?: unknown[]) {
+            queries.push(sql)
+            if (sql.includes('session-snapshot-recovery')) throw timeout
+            return client.query(sql, values)
+          },
+          release: () => client.release(),
+        }
+      },
+    } as unknown as Pool
+    await assert.rejects(readSessionSnapshot(unavailable, '3', sessionId, { clientMessageId: cmid }), error => error === timeout)
+    assert.deepEqual(queries.slice(-3), [
+      'ROLLBACK TO SAVEPOINT session_snapshot_recovery', 'RELEASE SAVEPOINT session_snapshot_recovery', 'ROLLBACK',
+    ])
+  })
   test('HTTP rejects malformed cursors without a backend query', async () => {
     for (const q of ['?afterSeq=-1', '?afterSeq=1.5', '?dispatch=%20', '?streamKey=garbage', '?limit=501']) {
       assert.equal((await http(q)).code, 400, q)
     }
   })
+})
+
+test('persisted container replay gap remains visible with zero frames in both HTTP and WS snapshots', async () => {
+  const gap = { reason: 'sequence_gap', afterSeq: 0, beforeSeq: 90 }
+  await db.query("UPDATE client_session_live_streams SET provenance=jsonb_build_object('containerLinkGap',$1::jsonb)", [JSON.stringify(gap)])
+  const snapshot = await readSessionSnapshot(pool, '3', sessionId)
+  assert.deepEqual(snapshot?.gap, gap)
+  assert.deepEqual(snapshot?.frames, [])
+  const response = await http()
+  assert.deepEqual(response.body.snapshot.gap, gap)
+  assert.equal(response.body.snapshot.lastFrameSeq, null)
 })

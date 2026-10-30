@@ -93,7 +93,7 @@ test("OCV5-313: actual App refresh preserves owner isolation and quiet failed st
  const tool=failed.getByRole("button").first();if(await tool.getAttribute("aria-expanded")!=="true")await tool.click();
  const pre=failed.locator("pre");await pre.waitFor({state:"visible"});assert.equal((await pre.textContent()).split("\n").filter(line=>line==="OWNER_ORIGINAL_FAILED_OUTPUT").length,1);
  await page.getByText("OWNER_ORIGINAL_FINAL_ERROR",{exact:true}).waitFor();
- const terminal=page.getByText("OWNER_TERMINAL_ERROR",{exact:true});await terminal.waitFor();assert.equal(await terminal.evaluate(n=>n.closest("[data-testid=process-disclosure]")),null);assert.equal(await terminal.evaluate(n=>n.closest("[role=alert]")?.classList.contains("bg-danger-soft")),true);
+ const terminal=page.getByText("OWNER_TERMINAL_ERROR",{exact:true});await terminal.waitFor();assert.equal(await terminal.evaluate(n=>n.closest("[data-testid=process-disclosure]")),null);assert.equal(await terminal.evaluate(n=>n.closest("[role=alert]")?.getAttribute("data-notice-tone")),"failed","terminal failure keeps the failed Notice semantic, distinct from quiet intermediate steps");assert.equal(await terminal.evaluate(n=>!!n.closest("[role=alert]")?.querySelector(".text-status-failed")),true);
  assert.deepEqual(preview.store.board,rows);assert.deepEqual(errors,[]);
  console.log("STRAY_OWNER_RECEIPT",JSON.stringify({width,phase,responses,ownerRows:2,oldResolvedAsk:1,quietFailedStep:1,terminalError:1,transforms}));
  }
