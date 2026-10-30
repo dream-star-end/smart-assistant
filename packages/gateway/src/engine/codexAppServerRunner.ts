@@ -141,6 +141,7 @@ import {
   _consumeRateLimitsForEmit as _consumeRateLimitsForEmitImpl,
   emitResult as emitResultImpl,
 } from './codexAppServerNotifications.js'
+import { noteFromImageGenerationStderr } from './imageGenerationFailure.js'
 export {
   isMissingRolloutError,
   isGoalAlreadyClearedError,
@@ -535,6 +536,8 @@ export class CodexAppServerRunner extends EventEmitter {
 
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
+  /** User-facing note from the latest `image generation failed` stderr line. */
+  public lastImageGenerationFailureNote: string | null = null
   public effortLevel: string | undefined = undefined
   /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 里 INTELLIGENT_UI 段的指纹(没有 = false)。 */
   private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
@@ -2206,6 +2209,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
     this.attemptEmittedTerminal = false
+    this.lastImageGenerationFailureNote = null
   }
 
   /**
@@ -2221,6 +2225,8 @@ export class CodexAppServerRunner extends EventEmitter {
         sessionKey: this.opts.sessionKey,
         line: line.slice(0, 1024),
       })
+      const imageNote = noteFromImageGenerationStderr(line)
+      if (imageNote) this.lastImageGenerationFailureNote = imageNote
     }
     if (result.deniedLines > 0) {
       log.warn('codex relay path denied', {

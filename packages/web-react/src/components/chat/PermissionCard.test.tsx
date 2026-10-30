@@ -1191,3 +1191,22 @@ describe("181 a753 countdown keeps the single expiry authority", () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe("问答卡继续", () => {
+  test("「继续」提交第一项推荐答案，不必先打开问答框", () => {
+    const onRespond = vi.fn();
+    render(
+      <PermissionCard msg={askMsg()} onRespond={onRespond} renderMode="card" livePrompt={false} />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(onRespond).toHaveBeenCalledWith({
+      requestId: "req-1",
+      behavior: "allow",
+      updatedInput: expect.objectContaining({
+        answers: { "多人在线的玩法形态选哪种?": "组队合作割草" },
+      }),
+    });
+  });
+});
+
