@@ -8966,6 +8966,16 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/longtask-continue.node-test.mjs",
           "assertion": "t1360u real App: paid and zero-output tasks continue in the original conversation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "an admitted manual checkpoint retires the old failed UserCard through running and success"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/hooks/manualTaskContinuationChunkFailure.test.tsx",
+          "assertion": "a failed Continue chunk reports once and never falls back to task replay or send"
         }
       ],
       "rootFixCommit": "34388f31",
@@ -8973,7 +8983,8 @@
         "0035dad5",
         "edfb7e87",
         "f3431226",
-        "061ca420"
+        "061ca420",
+        "aebfb4cb"
       ]
     }
   ]
