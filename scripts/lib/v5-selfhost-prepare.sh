@@ -70,8 +70,8 @@ selfhost_prepared_load() { # <sha>; failures must not leave partially assigned a
   master="$(jq -er '.master.path' <<<"$doc")" || return 1
   runtime="$(jq -er '.runtime.path' <<<"$doc")" || return 1
   bundle="$(jq -er '.bundle.path' <<<"$doc")" || return 1
-  oc_hotcfg_verify_manifest_full "$runtime" || return 1
-  oc_hotcfg_verify_manifest_full "$bundle" || return 1
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-digest.py" verify "$runtime" >/dev/null || return 1
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-digest.py" verify "$bundle" >/dev/null || return 1
   BUILT_MASTER_RELEASE="$master"
   BUILT_RUNTIME_RELEASE="$runtime"
   CUTOVER_TUPLE_BUNDLE="$bundle"
@@ -118,7 +118,7 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
 }
 
 selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lock is held
-  local sha="$1"
+  local sha="$1" verify_start verify_rc=0
   tsum_mark A.flip-lock-wait 2>/dev/null || :
   acquire_selfhost_deploy_lock
   prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "prewarm did not stop; flip refused"
@@ -131,7 +131,10 @@ selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lo
   flock -n 9 || die "another prepare owns artifacts; retry flip after it finishes"
   SELFHOST_PREPARE_HELD=1
   selfhost_prepare_identity "$sha"
-  selfhost_prepared_load "$sha" || die "prepared receipt no longer valid at flip"
+  verify_start="$EPOCHREALTIME"
+  selfhost_prepared_load "$sha" || verify_rc=$?
+  tsum_note flip.verifySec "$(awk -v start="$verify_start" -v end="$EPOCHREALTIME" 'BEGIN { printf "%.3f", end-start }')" 2>/dev/null || :
+  [[ "$verify_rc" == 0 ]] || die "prepared receipt no longer valid at flip"
   selfhost_prepare_unlock
   SELFHOST_SPLIT_PREPARED=1
   tsum_mark E0.locked-preflight 2>/dev/null || :

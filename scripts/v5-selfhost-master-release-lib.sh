@@ -902,6 +902,16 @@ write_web_dist_reuse_record() { # <staging> <key-or-empty> <mode> <full-sha> [do
     > "$staging/$WEB_DIST_REUSE_RECORD"
 }
 
+master_seed_frontend_buildinfo() { # <donor-or-empty> <staging>; never share a writable donor inode
+  local donor="$1" staging="$2" src dest
+  src="$donor/packages/web-react/tsconfig.tsbuildinfo"
+  [[ -n "$donor" && -f "$src" ]] || return 0
+  dest="$staging/packages/web-react/tsconfig.tsbuildinfo"
+  cp --remove-destination -- "$src" "$dest" || return 1
+  # Force tsc -b to compare input hashes even when git archive gave changed sources older mtimes.
+  touch -d @0 -- "$dest"
+}
+
 # OCV5-545:把 check-architecture.ts --json 的计数记进列车 summary.json(只记录,读不到就记 unreadable)。
 master_note_architecture() { # <report.json>
   local counts v
@@ -931,6 +941,7 @@ build_master_release() {
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
   MASTER_FRONTEND_ELAPSED_S=""
+  MASTER_FRONTEND_TSC_S=""
   MASTER_FRONTEND_MODE=""
 
   # Explicit invocation pin; build-master-only keeps the no-argument HEAD snapshot.
@@ -1132,7 +1143,9 @@ build_master_release() {
     fi
   }
   master_job_frontend() {
+    local tsc_sec
     t0="$(date +%s)"
+    MASTER_FRONTEND_TSC_S=0
     web_key="$(master_web_dist_key "$full_sha" || true)"
     web_donor=""
     if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
@@ -1144,13 +1157,24 @@ build_master_release() {
         mlog "复用 web dist 失败或复制后的摘要不符(donor=$web_donor)"
         return 1
       fi
+      master_seed_frontend_buildinfo "$web_donor" "$staging" || return 1
       MASTER_FRONTEND_MODE="reused"
     else
       [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
+      master_seed_frontend_buildinfo "${donor:-}" "$staging" || return 1
       mlog "  web-react official build @ staging(不碰工作树 dist)"
-      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
+      if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" \
+          OC_V5_SELFHOST_TSC_TIMER_FILE="$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
+          NODE_OPTIONS="--max-old-space-size=4096 --require=\"$SCRIPT_DIR/lib/v5-selfhost-tsc-timer.cjs\"" \
+          npm run build --workspace packages/web-react ); then
         mlog "staging web-react 构建失败"
         return 1
+      fi
+      MASTER_FRONTEND_TSC_S=unknown
+      if [[ -f "$MASTER_GATE_TMPDIR/frontend-tsc-sec" ]] \
+        && read -r tsc_sec <"$MASTER_GATE_TMPDIR/frontend-tsc-sec" \
+        && [[ "$tsc_sec" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        MASTER_FRONTEND_TSC_S="$tsc_sec"
       fi
       MASTER_FRONTEND_MODE="built"
     fi
@@ -1173,14 +1197,14 @@ build_master_release() {
       return 1
     fi
 
-    printf '%s %s\n' "$MASTER_FRONTEND_MODE" "$MASTER_FRONTEND_ELAPSED_S" >"$MASTER_GATE_TMPDIR/frontend.result"
+    printf '%s %s %s\n' "$MASTER_FRONTEND_MODE" "$MASTER_FRONTEND_ELAPSED_S" "$MASTER_FRONTEND_TSC_S" >"$MASTER_GATE_TMPDIR/frontend.result"
   }
 
   local job job_id job_fn gate_id
   for job in \
+    D:master_job_frontend \
     C.session-rootfix:master_job_session_rootfix:session-unavailable-rootfix \
     C.watch-gate:master_job_watch_gate:watch-gate \
-    D:master_job_frontend \
     C.cursor-sand:master_job_cursor_sand \
     C.delegate-billing:master_job_delegate_billing:delegate-billing-requestid \
     C.callback-ws:master_job_callback_ws:callback-payload-hash \
@@ -1211,12 +1235,14 @@ build_master_release() {
   fi
   # Only the parent writes the summary; never source/eval a worker's result.
   local frontend_extra
-  if ! read -r MASTER_FRONTEND_MODE MASTER_FRONTEND_ELAPSED_S frontend_extra <"$MASTER_GATE_TMPDIR/D/frontend.result" \
+  if ! read -r MASTER_FRONTEND_MODE MASTER_FRONTEND_ELAPSED_S MASTER_FRONTEND_TSC_S frontend_extra <"$MASTER_GATE_TMPDIR/D/frontend.result" \
     || [[ ! "$MASTER_FRONTEND_MODE" =~ ^(built|reused)$ || ! "$MASTER_FRONTEND_ELAPSED_S" =~ ^[0-9]+$ || -n "$frontend_extra" ]]; then
     cleanup_master_staging
     die "frontend 结果缺失/非法"
   fi
+  [[ "$MASTER_FRONTEND_TSC_S" =~ ^[0-9]+([.][0-9]+)?$ ]] || MASTER_FRONTEND_TSC_S=unknown
   tsum_note frontendElapsedSec "$MASTER_FRONTEND_ELAPSED_S" 2>/dev/null || :
+  tsum_note frontendTscSec "$MASTER_FRONTEND_TSC_S" 2>/dev/null || :
   master_note_architecture "$MASTER_GATE_TMPDIR/C.architecture/architecture.json"
   tsum_mark C.box-success-recovery 2>/dev/null || :
   # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。

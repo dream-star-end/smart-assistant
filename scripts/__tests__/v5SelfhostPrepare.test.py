@@ -78,7 +78,7 @@ class Prepared(unittest.TestCase):
             'build_runtime_release() {',
             '  echo runtime >>"$T/gates"; [[ "${FAIL_RUNTIME:-0}" == 0 ]] || die runtime-gate-failed',
             '  BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-0123456789ab"; mkdir -p "$BUILT_RUNTIME_RELEASE"',
-            '  printf \'{"sourceCommit":"%s"}\\n\' "$1" >"$BUILT_RUNTIME_RELEASE/MANIFEST.json"',
+            '  printf \'{"sourceCommit":"%s","digest":"e3b0c44298fc"}\\n\' "$1" >"$BUILT_RUNTIME_RELEASE/MANIFEST.json"',
             '}',
             fn('start_runtime_release_bg'), fn('await_runtime_release_bg'),
             fn('collect_runtime_release_bg'), fn('reap_runtime_release_bg'),
@@ -86,9 +86,9 @@ class Prepared(unittest.TestCase):
             'build_platform_bundle() {',
             '  echo platform >>"$T/gates"; [[ "${FAIL_PLATFORM:-0}" == 0 ]] || die platform-gate-failed',
             '  BUILT_BUNDLE_REV=0123456789ab; mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"',
-            '  echo \'{"sourceCommit":"old-identical-content"}\' >"$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV/MANIFEST.json"',
+            '  echo \'{"sourceCommit":"old-identical-content","digest":"e3b0c44298fc"}\' >"$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV/MANIFEST.json"',
             '}',
-            'oc_hotcfg_verify_manifest_full() { [[ "${FAIL_DIGEST:-0}" == 0 ]]; }',
+            'tsum_note() { printf "%s=%s\\n" "$1" "$2" >>"$T/notes"; }',
         ])
 
     def run_cmd(self, *args):
@@ -662,7 +662,11 @@ selfhost_prepare_unlock
                 self.receipt.write_text(json.dumps(doc))
                 self.bash('selfhost_prepared_enter_flip "$SHA"', ok=False)
         self.receipt.write_text(original)
-        self.bash('FAIL_DIGEST=1; selfhost_prepared_enter_flip "$SHA"', ok=False)
+        tampered = self.t / 'runtime/rel-0123456789ab/tampered'
+        tampered.write_bytes(b'x')
+        self.bash('selfhost_prepared_enter_flip "$SHA"', ok=False)
+        self.assertRegex((self.t / 'notes').read_text(), r'flip.verifySec=\d+\.\d{3}')
+        tampered.unlink()
         (self.t / 'master/rel-test/.complete').write_text('{}')
         self.bash('selfhost_prepared_enter_flip "$SHA"', ok=False)
 

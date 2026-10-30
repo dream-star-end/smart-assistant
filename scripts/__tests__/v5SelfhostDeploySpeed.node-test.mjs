@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {execFileSync,spawnSync} from 'node:child_process';
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync} from 'node:fs';
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,symlinkSync,chmodSync,existsSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -14,7 +14,7 @@ function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(
 const hostPolicy=readFileSync(join(root,'scripts/lib/v5-selfhost-host-log-policy.sh'),'utf8');
 const hostPolicyFiles=['scripts/v5-selfhost-host-log-policy.py','deploy/v5-selfhost/host-log-policy.json','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost','deploy/v5-selfhost/logrotate.d/openclaude-v5-selfhost-egress-watch'];
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'copy_verified_web_dist'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'master_seed_frontend_buildinfo'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(hostPolicy,'host_log_policy_files'),fn(hostPolicy,'host_log_policy_require_bundle'),fn(m,'write_strong_release_marker_local')].join('\n');
 const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
@@ -27,7 +27,7 @@ function fixture(t){
  const commit=(path,content)=>{writeFileSync(join(repo,path),content);git('commit','-qam','c '+path);return git('rev-parse','HEAD');};
  return{dir,repo,env,git,commit,base:git('rev-parse','HEAD')};
 }
-function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
+function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'SCRIPT_DIR='+q(join(root,'scripts')),'TEST_ROOT='+q(f.dir),'log() { echo "$*"; }; mlog() { echo "$*" >&2; }; die() { echo "$*" >&2; exit 73; }','MASTER_RELEASES_ROOT="$TEST_ROOT/releases"; MASTER_LIVE_LINK="$TEST_ROOT/live"',src,body].join('\n')],{env:f.env,cwd:f.dir,encoding:'utf8',timeout:20000});}
 function ok(o){assert.equal(o.status,0,o.stdout+'\n'+o.stderr);return o.stdout.trim();}
 const key=(f,sha)=>ok(bash(f,webLib,'master_web_dist_key '+q(sha)));
 
@@ -55,6 +55,7 @@ test('web dist key changes with every web build input and ignores unrelated back
 function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="0123456789abcdef"></head></html>',seal=true,record=true,poison=false}={}){
  const rel=join(f.dir,'releases',name),dist=join(rel,'packages/web-react/dist');mkdirSync(join(dist,'assets'),{recursive:true});
  writeFileSync(join(dist,'index.html'),html);writeFileSync(join(dist,'assets/main.js'),'console.log(1)\n');
+ writeFileSync(join(rel,'packages/web-react/tsconfig.tsbuildinfo'),'fixture-buildinfo\n');
  mkdirSync(join(rel,'node_modules/tsx'),{recursive:true});mkdirSync(join(rel,'deploy/v5'),{recursive:true});
  writeFileSync(join(rel,'package.json'),'{}');writeFileSync(join(rel,'deploy/v5/release-metadata.json'),'{}');
  writeFileSync(join(rel,'VERSION.json'),JSON.stringify({commit:f.base.slice(0,9)}));
@@ -98,6 +99,10 @@ test('build_master_release reuses a matching dist instead of running the web bui
  assert.match(s,/mode=reused/);assert.doesNotMatch(out.stderr,/NPM_BUILD_RAN/);
  const rec=JSON.parse(s.slice(s.indexOf('{')));assert.equal(rec.key,k);assert.equal(rec.mode,'reused');assert.equal(rec.donor,live);
  assert.equal(readFileSync(join(f.dir,'staging/packages/web-react/dist/assets/main.js'),'utf8'),'console.log(1)\n');
+ const donorInfo=join(live,'packages/web-react/tsconfig.tsbuildinfo'),stagingInfo=join(f.dir,'staging/packages/web-react/tsconfig.tsbuildinfo');
+ assert.equal(readFileSync(stagingInfo,'utf8'),readFileSync(donorInfo,'utf8'));
+ assert.notEqual(statSync(stagingInfo).ino,statSync(donorInfo).ino,'a reused release must carry a private buildinfo for the next train');
+ assert.equal(readFileSync(join(f.dir,'frontend.result'),'utf8').trim().split(' ')[2],'0','reused D has no tsc work');
  // OC_V5_FORCE_WEB_BUILD=1 → the real build path runs (our npm stub fails it → die 73).
  rmSync(join(f.dir,'staging'),{recursive:true,force:true});
  const forced=bash(f,webLib,'OC_V5_FORCE_WEB_BUILD=1\n'+body);assert.equal(forced.status,73,forced.stderr);assert.match(forced.stderr,/NPM_BUILD_RAN/);
