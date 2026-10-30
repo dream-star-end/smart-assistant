@@ -27,13 +27,39 @@ import {
   ControlPrepareModelSwitch,
   OutboundModelSwitchPrepared,
   OutboundTurnStatus,
+  OutboundAck,
+  SessionSnapshot,
   isClientMessageId,
   isControlId,
   isPersistedClientMessageId,
 } from '../frames.js'
+import { automaticRetryStatus } from '../automaticRetryStatus.js'
 
 // 共用 fixture 构造器 —— 一处构造 base frame,后续 spread 覆盖单字段验各种 trace 输入
 const peer = { id: 'p1', kind: 'dm' as const }
+
+describe('additive delivery and recovery contracts', () => {
+  it('accepts legacy ACKs and a separate container acceptance without admission', () => {
+    assert.equal(Value.Check(OutboundAck, { type: 'outbound.ack', peer, clientMessageId: 'cm-1', admitted: true }), true)
+    const accepted = { type: 'outbound.ack', peer, clientMessageId: 'cm-1', accepted: true }
+    assert.equal(Value.Check(OutboundAck, accepted), true)
+    assert.equal('admitted' in accepted, false)
+    assert.equal(Value.Check(OutboundAck, { ...accepted, accepted: 'true' }), false)
+  })
+  it('preserves old snapshots and validates optional in-flight retry truth', () => {
+    const snapshot = {
+      v: 1, sessionId: 'session', dispatch: null, streamKey: null, lastFrameSeq: null, lastFrameAt: null,
+      engineReady: null, turnStatus: null, reconcile: null, pendingPermissions: { items: [], completeness: 'complete' },
+      usage: null, credits: null, frames: [], nextAfterSeq: 0, hasMore: false, gap: null, asOf: 1,
+    }
+    assert.equal(Value.Check(SessionSnapshot, snapshot), true)
+    assert.equal(Value.Check(SessionSnapshot, { ...snapshot, recovery: null }), true)
+    const recovery = { status: 'queued', attempt: 2, maxAttempts: 3, retryStatus: automaticRetryStatus('scheduled', 2, 3) }
+    assert.equal(Value.Check(SessionSnapshot, { ...snapshot, recovery }), true)
+    assert.equal(Value.Check(SessionSnapshot, { ...snapshot, recovery: { ...recovery, status: 'paused' } }), false)
+    assert.equal(Value.Check(SessionSnapshot, { ...snapshot, recovery: { ...recovery, attempt: 0 } }), false)
+  })
+})
 
 function baseInbound(): unknown {
   return {

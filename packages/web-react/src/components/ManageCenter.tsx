@@ -238,6 +238,7 @@ export function ManageCenter({
                           <SkillsPanel
                             auth={auth}
                             onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('skill'))}
+                            onAskInChat={onAskInChat}
                           />
                         </div>
                       )}

@@ -14,7 +14,10 @@ import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
  */
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
+import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
+import { contextRebuiltRow } from "./contextRebuilt";
+import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -90,7 +93,6 @@ import {
   AUTO_CONTINUE_DISPLAY,
   AUTOMATIC_RECOVERY_CHECKPOINT_DISPLAY,
   AUTOMATIC_RECOVERY_REPLAY_DISPLAY,
-  contextRebuiltNotice,
   INTERRUPTED_CONTINUE_DISPLAY,
   INTERRUPTED_CONTINUE_PROMPT,
   backoffDelay,
@@ -149,6 +151,7 @@ import type {
   OutboundWire,
   GoalSnapshotWire,
   RecoveryDecisionWire,
+  RecoveryStatusWire,
   RepoBindErrorWire,
   RepoStatusWire,
   RelayReadyWire,
@@ -1447,22 +1450,10 @@ export class ChatSocket {
    * 后 loadStored 复原该行也能命中去重)。
    */
   private applyContextRebuilt(sess: ChatSession, frame: ContextRebuiltWire): void {
-    const count =
-      typeof frame.messageCount === "number" && Number.isFinite(frame.messageCount) && frame.messageCount > 0
-        ? Math.floor(frame.messageCount)
-        : sess.messages.length;
-    // 确定性去重 id:优先 frameSeq(per-sessionKey 单调),回退 server ts,再回退时钟(极端缺省)。
-    const identity =
-      typeof frame.frameSeq === "number" && Number.isFinite(frame.frameSeq)
-        ? `f${frame.frameSeq}`
-        : typeof frame.ts === "number" && Number.isFinite(frame.ts)
-          ? `t${frame.ts}`
-          : `x${Date.now()}`;
-    const dedupId = `sys-ctxrebuild-${sess.id}-${identity}`;
-    if (sess.messages.some((m) => m.id === dedupId)) return; // 幂等:同帧只插一条
-    const text = contextRebuiltNotice(count);
-    addMessage(sess, "system", text, { id: dedupId, _source: "local" });
-    this.setTransientNotice(sess.id, text); // 仅 turn 进行中显示的 live flash
+    const row = contextRebuiltRow(sess, frame); // 按 noticeId 去重(旧帧退回 frameSeq/ts)
+    if (!row) return;
+    addMessage(sess, "system", row.text, { id: row.id, _source: "local" });
+    this.setTransientNotice(sess.id, row.text); // 仅 turn 进行中显示的 live flash
     this.deps.persistSession?.(sess.id); // durable:落 IndexedDB
     this.scheduleNotify();
   }
@@ -1941,9 +1932,8 @@ export class ChatSocket {
     return true;
   }
 
-  /** Durable admission confirms delivery but does not finish the turn. Keep
-   * the peer slot occupied until final/error/stop so later prompts remain FIFO. */
-  private confirmDispatchAdmission(sessId: string, clientMessageId: string): boolean {
+  /** Admission occupies the FIFO slot; only container evidence confirms delivery. */
+  private confirmDispatchAdmission(sessId: string, clientMessageId: string, accepted = true): boolean {
     const sess = this.sessions.get(sessId);
     if (!sess) return false;
     const pending = this.offlineQueue.find(
@@ -1962,15 +1952,7 @@ export class ChatSocket {
     this.clearPendingDispatch(sessId, clientMessageId);
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
-    // Every live frame carrying this cmid (outbound.message / turn_status /
-    // turn_usage / call_usage) re-confirms admission. Admission only moves the
-    // row forward out of its transport states; once answer blocks have marked
-    // it read/replied, a later status-only or usage frame must not drag it back
-    // to sent — that made「已送达」flicker on and off for the whole turn.
-    if (user && user.status !== "read" && user.status !== "replied" && user.status !== "sent") {
-      user.status = "sent";
-      changed = true;
-    }
+    changed = confirmDispatchDelivery(sess, clientMessageId, accepted) || changed;
     if (
       user?._routing?.modelSwitchId &&
       sess._preparedModelSwitch?.id === user._routing.modelSwitchId
@@ -1999,16 +1981,6 @@ export class ChatSocket {
       this.resetThinkingSafety(sessId);
     }
     this.clearTransientNotice(sess.id);
-    // Authoritative admission always starts a new cost reminder window, even
-    // when submit already set _sendingInFlight for the "replying" affordance.
-    if (
-      sess._turnCostCredits !== "0" ||
-      (sess._turnCostSeenRequestIds?.size ?? 0) > 0 ||
-      sess._turnCostReminderCredits !== undefined
-    ) changed = true;
-    sess._turnCostCredits = "0";
-    sess._turnCostSeenRequestIds = new Set();
-    sess._turnCostReminderCredits = undefined;
     if (changed) this.scheduleNotify();
     return true;
   }
@@ -2492,11 +2464,15 @@ export class ChatSocket {
 
   private dispatch(f: OutboundWire): void {
     switch (f.type) {
+      case "outbound.session_snapshot":
+        confirmSnapshotDelivery(this.sessions.get(f.peer.id), f.snapshot.dispatch);
+        this.scheduleNotify();
+        return;
       case "outbound.message": {
         const frame = f as OutboundMessageWire;
         const sess = this.resolveSession(frame.peer?.id);
         if (!sess) return;
-        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
+        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId, !frame.meta?.reconcile);
         applyOutboundMessage(sess, frame, this.effects());
         return;
       }
@@ -2505,7 +2481,7 @@ export class ChatSocket {
         const sess = this.sessions.get(frame.peer?.id);
         if (sess) {
           const clientMessageId = (frame as OutboundTurnStatusWire & { clientMessageId?: string }).clientMessageId;
-          if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId);
+          if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId, !frame.meta?.detached);
           applyTurnStatus(sess, frame);
         }
         return;
@@ -2694,6 +2670,12 @@ export class ChatSocket {
         this.applyRecoveryDecision(f as RecoveryDecisionWire);
         return;
       }
+      case "sys.recovery_status": {
+        const frame = f as RecoveryStatusWire;
+        const sess = this.sessions.get(frame.peer?.id);
+        if (sess && applyRecoveryStatusFrame(sess, frame)) this.scheduleNotify();
+        return;
+      }
       case "sys.context_rebuilt": {
         // 引擎无法原生续接、走兜底注入历史(provider 切换 / 非原生 resume)时容器 emit。
         // 插入一条 client-owned 的 system 提示行 + 会话内 transient 软提示(boss 硬指标 3)。
@@ -2729,7 +2711,12 @@ export class ChatSocket {
         if (frame.admitted && frame.peer?.id && frame.clientMessageId) {
           if (frame.recovery?.automatic === true) {
             this.adoptMasterAutomaticRecovery(frame.peer.id, frame.clientMessageId, frame.recovery);
+            const sess = this.sessions.get(frame.peer.id);
+            if (sess) rememberRetryStatus(sess, { ...frame.recovery, clientMessageId: frame.clientMessageId }, frame.retryStatus);
           }
+          this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId, frame.accepted === true);
+        }
+        if (frame.accepted && !frame.admitted && frame.peer?.id && frame.clientMessageId) {
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
         }
         if (frame.deduplicated) {
@@ -3112,6 +3099,7 @@ export class ChatSocket {
     if (!sessId) return;
     const sess = this.sessions.get(sessId);
     if (!sess) return;
+    rememberRetryStatus(sess, frame, frame.retryStatus, frame.ts);
     const pending = this.pendingRecoveryErrors.get(sessId);
     const matchesPending = !!pending &&
       (!pending.clientMessageId || pending.clientMessageId === frame.sourceClientMessageId);
@@ -4383,6 +4371,7 @@ export class ChatSocket {
         dispatchId: string;
         clientMessageId: string;
         status: string;
+        acceptedAt?: number | null;
       };
       permissionPrompts?: PermissionPromptSnapshotPayload;
       automaticRecoveries?: AutomaticTurnRecoverySnapshot[];
@@ -4545,6 +4534,7 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
+    confirmSnapshotDelivery(s, openDispatch);
     if (!s._sendingInFlight || settlingActiveTurn) {
       s.messages = repairPostFinalProcessOrder(s.messages);
     }

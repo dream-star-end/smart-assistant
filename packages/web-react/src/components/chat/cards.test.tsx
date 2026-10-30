@@ -126,7 +126,8 @@ describe("UserCard 复制", () => {
 });
 
 describe("AssistantCard 预期错误视觉语义", () => {
-  test("route unavailable 使用紧凑 warning 卡且无 trace 时不渲染详情", () => {
+  // W3:错误卡统一用 Notice(attention 语气);正文是错误目录的人话,原始码只在收起的技术详情里。
+  test("route unavailable 使用 attention 提示,无 trace 时技术详情只有码和消息 ID", () => {
     renderErr(errMsg({
       _errorCode: "codex_route_unavailable",
       _clientMessageId: "u1",
@@ -134,11 +135,13 @@ describe("AssistantCard 预期错误视觉语义", () => {
     }), {});
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveClass("border-warning/30", "px-3", "py-2");
-    expect(alert).not.toHaveClass("border-danger/30");
-    expect(alert).toHaveTextContent("模型服务暂时不可用");
+    expect(alert).toHaveAttribute("data-notice-tone", "attention");
+    expect(alert).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
     expect(alert).not.toHaveTextContent("GPT");
-    expect(screen.queryByText("查看请求信息")).toBeNull();
+    const details = screen.getByTestId("error-tech-details");
+    expect(details).not.toBeVisible();
+    expect(details).toHaveTextContent("错误码：codex_route_unavailable");
+    expect(details).not.toHaveTextContent("请求 ID");
   });
 });
 
@@ -430,6 +433,9 @@ describe("UserCard 状态标签(M-09)", () => {
     rerender(<UserCard msg={userMsg({ status: "read" })} cb={{}} />);
     expect(screen.queryByText("已读")).toBeNull();
     rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} awaitingReply />);
+    expect(screen.getByText("已受理")).toBeInTheDocument();
+    expect(screen.queryByText("已送达")).toBeNull();
+    rerender(<UserCard msg={userMsg({ status: "sent", _deliveryState: "accepted" })} cb={{}} awaitingReply />);
     expect(screen.getByText("已送达")).toBeInTheDocument();
     // sent 也是停止 / 中断 / 恢复源轮的落定态:不在等回复时不标「已送达」。
     rerender(<UserCard msg={userMsg({ status: "sent" })} cb={{}} />);
@@ -774,13 +780,15 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
   });
 
-  test("cta=retry_or_switch(model_capacity)→ 精确「重试」+「切换模型」引导文案", () => {
+  // W3:按错误目录给动作;没有入口的建议不再写成引导文案(以前是「或在上方切换模型后重试」)。
+  test("cta=retry_or_switch(model_capacity)→ 精确「重试」+「切换模型」", () => {
     renderErr(errMsg({ _errorCode: "model_capacity", _clientMessageId: "u1" }), {
       onRetrySend: vi.fn(),
+      onOpenModelPicker: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
-    expect(screen.getByText(/切换模型/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "切换模型" })).toBeInTheDocument();
   });
 
   test("insufficient_credits 免费用户 → 「开通 Lite」无重试/重新尝试", () => {
@@ -872,16 +880,23 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("cta=new_session(context_too_long)→「新建会话继续」导航按钮,无重试类按钮", () => {
-    const onStartNewSession = vi.fn();
+  // W3(#1206 错误目录):上下文超限的建议是精简这条消息或换更长上下文的模型,不再引导新建会话。
+  test("context_too_long →「修改消息」+「切换模型」,无重试类按钮", () => {
+    const onEditResend = vi.fn();
+    const onOpenModelPicker = vi.fn();
     renderErr(errMsg({ _errorCode: "context_too_long", _clientMessageId: "u1" }), {
-      onStartNewSession,
+      onStartNewSession: vi.fn(),
+      onEditResend,
+      onOpenModelPicker,
       onRetrySend: vi.fn(),
       onRegenerate: vi.fn(),
       resolveRetryTarget: () => retryableUser,
     });
-    fireEvent.click(screen.getByRole("button", { name: "新建会话继续" }));
-    expect(onStartNewSession).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "修改消息" }));
+    expect(onEditResend).toHaveBeenCalledWith(retryableUser);
+    fireEvent.click(screen.getByRole("button", { name: "切换模型" }));
+    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "新建会话继续" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });

@@ -1,6 +1,7 @@
-import { ChevronRight, SearchX, Sparkles, Store } from "lucide-react";
+import { ChevronRight, MessageSquarePlus, SearchX, Sparkles, Store } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";
+import { CHAT_CREATE_TEMPLATES } from "../../lib/chatCreateTemplates";
 import type { AuthSession, MarketplaceMyAgent, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { agentScopeLabels } from "../AgentScopePicker";
@@ -43,14 +44,21 @@ import { skillDisplayTitle } from "./skillDisplay";
  * ── OCV5-360 第 4 轮(移动端)─────────────────────────────────────────────
  * 行 = 一个点按目标(打开工作台),不再有行内 编辑 / 删除 按钮簇与手风琴预览;
  * slug 离开行面,删除进工作台底部。页头操作收成一颗「市场」小按钮(窄屏 portal 进上下文行)。
+ *
+ * ── UI-5 空态引导 ──────────────────────────────────────────────────────────
+ * 体验官 10-22 记「技能页空」:新用户看到的是一句说明。现在空态先讲清技能是什么、怎么来,
+ * 再给两条路:在对话里引导着做一个(与市场「在对话中创建」同一份模板),或去市场装现成的。
  */
 export function SkillsPanel({
   auth,
   onOpenMarketplace,
+  onAskInChat,
 }: {
   auth: AuthSession;
   /** 市场入口(外层持有)。缺省时不渲染相关 CTA —— 与 ConnectorsTab 同约定。 */
   onOpenMarketplace?: () => void;
+  /** 关管理中心 → 新会话 → 预填输入框(不自动发送)。缺省时不渲染「在对话中创建」。 */
+  onAskInChat?: (text: string) => void;
 }) {
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
   const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
@@ -202,12 +210,21 @@ export function SkillsPanel({
         <EmptyState
           icon={Sparkles}
           title="还没有技能"
-          hint="在对话里让智能体「把这个流程存成技能」即可自动沉淀，或从市场安装现成的。"
+          hint="技能是智能体可以反复用的做事方法。做完一件事后，对它说「把这个流程存成技能」就会自动存下来；也可以现在就在对话里做一个，或从市场装现成的。"
           action={
-            onOpenMarketplace ? (
-              <Button variant="primary" size="sm" onClick={onOpenMarketplace}>
-                <Store size={14} /> 去市场安装技能
-              </Button>
+            onAskInChat || onOpenMarketplace ? (
+              <div className="flex flex-wrap items-center gap-2">
+                {onAskInChat && (
+                  <Button variant="primary" size="sm" onClick={() => onAskInChat(CHAT_CREATE_TEMPLATES.skill)}>
+                    <MessageSquarePlus size={14} aria-hidden="true" /> 在对话中创建技能
+                  </Button>
+                )}
+                {onOpenMarketplace && (
+                  <Button variant={onAskInChat ? "secondary" : "primary"} size="sm" onClick={onOpenMarketplace}>
+                    <Store size={14} aria-hidden="true" /> 去市场安装技能
+                  </Button>
+                )}
+              </div>
             ) : undefined
           }
         />
