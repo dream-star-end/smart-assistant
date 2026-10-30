@@ -1,3 +1,4 @@
+import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
@@ -1792,6 +1793,7 @@ export class SubprocessRunner extends EventEmitter {
           command: mcpLaunch.command,
           args: mcpLaunch.args,
           env: {
+            ...ccbDelegateMcpBudgetEnvironment(),
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),

@@ -1,3 +1,4 @@
+import { delegateMcpBudgetEnvironment, GROK_MCP_TOOL_TIMEOUT_SEC } from '../delegateMcpBudget.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into official
@@ -139,6 +140,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       })}\n`,
     )
     const env: Record<string, string> = {
+      ...delegateMcpBudgetEnvironment(GROK_MCP_TOOL_TIMEOUT_SEC * 1000),
       OPENCLAUDE_AGENT_ID: input.agentId,
       OC_AGENT_ID: input.agentId,
       ...identityCompatEnvironment(input.identityCompat),
@@ -173,7 +175,7 @@ command = ${tomlString(mcpLaunch.command)}
 args = [${mcpLaunch.args.map(tomlString).join(', ')}]
 enabled = true
 startup_timeout_sec = 30
-tool_timeout_sec = 600
+tool_timeout_sec = ${GROK_MCP_TOOL_TIMEOUT_SEC}
 
 [mcp_servers."openclaude-memory".env]
 ${envLines}

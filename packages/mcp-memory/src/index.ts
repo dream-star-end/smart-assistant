@@ -64,6 +64,7 @@ import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
   resolveCursorFastWaitMs,
+  resolveDelegateMcpBudgetMs,
   runCursorDelegateFastPath,
   type FanoutCursorItem,
   type FormattedDelegateResult,
@@ -253,6 +254,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // ─────────────────────────────────────────────────────────────
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params
+  const delegateDeadlineAtMs = Date.now() + resolveDelegateMcpBudgetMs()
   try {
     // Discovery filtering is not an authorization boundary: an MCP client can
     // still call a hidden tool by name. Reject before any gateway request,
@@ -296,13 +298,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'send_to_agent':
         return await handleSendToAgent(args as any)
       case 'delegate_task':
-        return await handleDelegateTask(args as any)
+        return await handleDelegateTask(args as any, delegateDeadlineAtMs)
       case 'delegate_tasks':
-        return await handleDelegateTasks(args as any)
+        return await handleDelegateTasks(args as any, delegateDeadlineAtMs)
       case 'delegate_wait':
         return await handleDelegateWait(args as any)
       case 'request_review':
-        return await handleRequestReview(args as any)
+        return await handleRequestReview(args as any, delegateDeadlineAtMs)
       case 'consult_advisor':
         return await handleConsultAdvisor(args as any, req)
       case 'task_create':
@@ -782,7 +784,7 @@ async function handleDelegateTask(args: {
   toolsets?: string[]
   resumeSessionKey?: string
   allowSelf?: unknown
-}) {
+}, deadlineAtMs?: number) {
   const goalNorm = normalizeDelegateGoal(args?.goal, args as Record<string, unknown>)
   if (!goalNorm.ok) return toolError(goalNorm.error)
   const agentNorm = normalizeDelegateAgentId(args.agentId)
@@ -792,6 +794,7 @@ async function handleDelegateTask(args: {
   const agentId = agentNorm.agentId || 'main'
   return handleDelegateTaskToAgent(agentId, {
     goal: goalNorm.goal,
+    deadlineAtMs,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
@@ -810,18 +813,18 @@ async function handleDelegateTask(args: {
  * 结果按输入顺序聚合、每项独立标注 ✅/❌。校验/聚合逻辑抽到纯函数 delegateFanout.ts
  * (可单测),本处只负责调用编排。
  */
-async function handleDelegateTasks(args: { tasks?: unknown }) {
+async function handleDelegateTasks(args: { tasks?: unknown }, deadlineAtMs?: number) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
-  return handleAsyncDelegateTasks(normalized.tasks)
+  return handleAsyncDelegateTasks(normalized.tasks, deadlineAtMs)
 }
 
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
  * Delegate tools no longer use one long HTTP request: every engine starts an
- * async job, waits briefly, then returns a resumable job handle before its
- * MCP tools/call deadline. send_to_agent returns that handle immediately and
+ * async job and waits for terminal inside one tools/call, or hands callback
+ * ownership to the gateway before its deadline. send_to_agent returns immediately and
  * lets the gateway inject the origin session when the child finishes.
  */
 
@@ -930,7 +933,7 @@ async function handleRequestReview(args: {
   revisionNote?: string
   resumeSessionKey?: string
   mode?: string
-}) {
+}, deadlineAtMs?: number) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
     return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
@@ -949,19 +952,21 @@ async function handleRequestReview(args: {
         : '对队长准备提交给用户的最终答复草稿做独立质量验收(对照成员证据),给出结构化裁决。',
     context: draft + note,
     label: '质量审查',
+    deadlineAtMs,
     reviewMode,
     resumeSessionKey:
       typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
   })
 }
 
-async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
+async function handleAsyncDelegateTasks(tasks: FanoutTask[], deadlineAtMs?: number) {
   const items = await Promise.all(
     tasks.map(async (t): Promise<FanoutCursorItem> => {
       const label = t.agentId || 'main'
       try {
         const r = await runAsyncDelegateToAgent(label, {
           goal: t.goal,
+          deadlineAtMs,
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
@@ -970,13 +975,14 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
           label,
           allowSelf: t.allowSelf,
         })
-        if (r.kind === 'running') {
+        if (r.kind === 'running' || r.kind === 'deferred') {
           return {
             label,
             goal: t.goal,
             isError: false,
             text: r.text,
             running: true,
+            deferred: r.kind === 'deferred',
             jobId: r.jobId,
           }
         }
@@ -1013,6 +1019,7 @@ async function runAsyncDelegateToAgent(
   targetAgent: string,
   args: {
     goal: string
+    deadlineAtMs?: number
     context?: string
     effort?: string
     toolsets?: string[]
@@ -1054,6 +1061,7 @@ async function runAsyncDelegateToAgent(
   const fastWaitMs = resolveCursorFastWaitMs()
   return runCursorDelegateFastPath({
     fastWaitMs,
+    deadlineAtMs: args.deadlineAtMs,
     label: args.label,
     goal: args.goal,
     transport: {
@@ -1063,11 +1071,11 @@ async function runAsyncDelegateToAgent(
           body,
           timeoutMs: 15_000,
         }),
-      wait: (jobId, waitMs) =>
+      wait: (jobId, waitMs, handoffOnRunning) =>
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
-          body: JSON.stringify({ jobId, waitMs }),
-          timeoutMs: waitMs + 15_000,
+          body: JSON.stringify({ jobId, waitMs, ...(handoffOnRunning ? { handoffOnRunning: true, goal: args.goal } : {}) }),
+          timeoutMs: waitMs + 3_000,
         }),
     },
   })
@@ -1099,6 +1107,7 @@ async function handleDelegateTaskToAgent(
   targetAgent: string,
   args: {
     goal: string
+    deadlineAtMs?: number
     context?: string
     effort?: string
     toolsets?: string[]
