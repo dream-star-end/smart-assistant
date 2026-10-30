@@ -42,7 +42,7 @@ def hash_row(root, item):
             size = str(os.fstat(stream.fileno()).st_size).encode('ascii')
         # GNU sha256sum prefixes escaped filename output, including its hash,
         # with a backslash; the old cut keeps that prefix in the hash field.
-        escaped = b'\\' if b'\\' in path or b'\n' in path else b''
+        escaped = b'\\' if any(char in path for char in (b'\\', b'\n', b'\r')) else b''
         value = escaped + digest.hexdigest().encode('ascii')
         permissions = format(stat.S_IMODE(mode), 'o').encode('ascii')
     return b'\t'.join((path, value, size, permissions)) + b'\n'

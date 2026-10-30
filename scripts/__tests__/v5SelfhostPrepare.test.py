@@ -194,6 +194,7 @@ selfhost_prepared_complete "$SHA" "$BUILT_MASTER_RELEASE"
         (self.t / 'deploy-release').touch()
         self.finish(holder)
         self.assertIn('已取得 selfhost', self.finish(flip))
+        self.assertRegex((self.t / 'notes').read_text(), r'flip.verifySec=\d+\.\d{3}')
 
     def test_reuse_runs_no_build_and_serializes_two_prepares(self):
         first = self.spawn('BUILD_BLOCK="$T/build-continue"; selfhost_prepare_candidate "$SHA"')
