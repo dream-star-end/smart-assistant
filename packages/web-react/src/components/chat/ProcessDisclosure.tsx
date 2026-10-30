@@ -1,40 +1,43 @@
-import {
-  Bot,
-  ChevronRight,
-  Brain,
-  Check,
-  ChevronDown,
-  Circle,
-  FileText,
-  ListChecks,
-  ListTodo,
-  type LucideIcon,
-  MessageCircleQuestion,
-  PanelRight,
-  Pencil,
-  Search,
-  ShieldCheck,
-  Target,
-  Terminal,
-  TriangleAlert,
-  Wrench,
-} from "lucide-react";
+import { ChevronDown, PanelRight, Pencil } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import type { ChatMessage } from "../../lib/chat/model";
-import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
-import { type CardCallbacks, ProgressiveMarkdown, RecoveredStepContext } from "./cards";
+import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../../lib/chat/model";
+import { agentTerminalStatus } from "../../lib/chat/render";
+import { agentDisplayName } from "./agentNames";
+import { STATUS } from "../../lib/ui/statusTone";
+import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
-import { detectOcCli, resolveToolMeta } from "../tool/meta";
+import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
+import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
+import { timelineMessageKey } from "./findInSession";
 import { ProcessStepContext } from "./processStep";
-import { StepTimingContext } from "./stepDuration";
+import { StepMetaBadge, StepTimingContext } from "./stepDuration";
+import type { DisplayTokenUsage } from "./tokenUsage";
+import type { TurnActivityInfo } from "./TurnActivity";
 import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn } from "../../lib/utils";
-import { isPaneStep, toolChangedFileCount } from "./workPane";
-import { timelineMessageKey } from "./findInSession";
+import { toolChangedFileCount } from "./workPane";
+import { ProcessStages } from "./lazyProcessStages";
 
+// 展开时间轴只从外壳拿这些符号。懒块若直接 import cards / meta / status,
+// rolldown 会把它们和 api+protocol 重新并进首屏 styles 块。
+export {
+  FirstTextPaintCommitProbe,
+  ProcessStepContext,
+  ProgressiveMarkdown,
+  RecoveredStepContext,
+  StepMetaBadge,
+  StepTimingContext,
+  combineStepTimings,
+  formatStepDuration,
+  humanStepTitle,
+  normalizeToolForDisplay,
+  resolveToolMeta,
+  resolveToolStatus,
+  timelineMessageKey,
+};
 /**
  * View-only fold for the main chat. Message ids, tape bytes, and scroll
  * ownership stay where they were; this only decides which rows share a
@@ -103,6 +106,8 @@ function commandText(message: ChatMessage): string {
 }
 
 const SHELL_TOOLS = new Set(["bash", "shell", "run_terminal_command", "run_terminal_cmd"]);
+/** `cat > f <<'EOF'`、`cat a >> b`:首词是 cat,其实是写文件(`2>`、`>&2` 不算)。 */
+const CAT_WRITE_RE = /(?:^|[^0-9&<>])>>?\s*[^\s&|>]/;
 
 const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 const GENERATED_PREFIX = "/home/agent/.openclaude/generated/";
@@ -441,7 +446,7 @@ export function isAnsweredPrompt(message: ChatMessage): boolean {
   return message.role === "permission" && message._resolved === true && message._controlPending !== true;
 }
 
-function hasErrorMark(message: ChatMessage): boolean {
+export function hasErrorMark(message: ChatMessage): boolean {
   return Boolean(message.error || message._isError || message._errorCode);
 }
 
@@ -538,11 +543,12 @@ function commandHead(message: ChatMessage): string {
   return base.replace(/^['"]|['"]$/g, "");
 }
 
-function countLabel(message: ChatMessage): string {
+export function countLabel(message: ChatMessage): string {
   if (message.role === "tool") {
     const tool = (message.toolName ?? "").toLowerCase();
     const head = commandHead(message).toLowerCase();
     const verb = SHELL_TOOLS.has(tool) ? head : tool || head;
+    if (verb === "cat" && CAT_WRITE_RE.test(commandText(message))) return "编辑";
     if (verb === "read" || verb === "view" || verb === "cat") return "读取";
     if (verb === "edit" || verb === "write" || verb === "patch" || verb === "multiedit") return "编辑";
     if (verb === "grep" || verb === "rg" || verb === "glob" || verb === "find" || verb === "search") return "搜索";
@@ -563,16 +569,114 @@ function countLabel(message: ChatMessage): string {
   return "";
 }
 
-export function operationSummary(messages: readonly ChatMessage[]): string {
+// ── UI-3 人话摘要 ────────────────────────────────────────────────────────────
+// 摘要只说用户关心的几类事(读 / 写 / 命令 / 搜索 / 子任务 / 附件),按次数取前三类;思考、问答和
+// 「准备工作」(查技能、查工具、记忆、任务列表、平台自检、--help、读技能说明)不进摘要。
+
+const PREP_LABELS = new Set([
+  "查看技能", "技能列表", "技能检索", "启用技能", "查找工具", "任务列表", "记忆", "核心记忆", "记忆检索", "记忆更新",
+  "历史检索", "归档检索", "MCP 资源列表", "MCP 资源模板",
+]);
+
+const COUNT_KIND: Record<string, string> = { 读取: "read", 编辑: "write", 搜索: "search", 命令: "cmd", 工具: "other" };
+
+const KIND_PHRASE: Record<string, (n: number) => string> = {
+  read: (n) => `读了 ${n} 个文件`,
+  attach: (n) => `读了 ${n} 个附件`,
+  write: (n) => `写了 ${n} 个文件`,
+  cmd: (n) => `运行了 ${n} 条命令`,
+  search: (n) => `搜索了 ${n} 次`,
+  sub: (n) => `派出 ${n} 个子任务`,
+  other: (n) => `调用了 ${n} 次工具`,
+};
+
+export function workKind(message: ChatMessage): string {
+  if (message.role === "agent-group" || message.role === "delegate-progress") return "sub";
+  if (message.role === "thinking") return "think";
+  if (message.role !== "tool" || PROMPT_CARD_TOOLS.has(message.toolName ?? "")) return "";
+  try {
+    const display = normalizeToolForDisplay(message);
+    const label = resolveToolMeta(display.name, display.input).label;
+    const head = reliableHeadCall(stripShellWrapperForDisplay(commandOf(display.input)));
+    // 读工具给 file_path,shell 的 `cat …` 只有命令文本:两处都看。
+    const target = String(display.input?.file_path ?? "") || commandOf(display.input);
+    if (PREP_LABELS.has(label) || head?.bin === "oc-system" || /^(?:-h|--help|help)$/.test(head?.op ?? "") || /\/skills\/[^\s'"]*SKILL\.md\b/i.test(target)) {
+      return "prep";
+    }
+    // 等子任务是委派的一部分,不是又一条命令;不进摘要。
+    if (label === "等待委派") return "wait";
+    if (/^(?:委[派托]|并行委派|子任务$)/.test(label)) return "call";
+    if (label === "写入文件") return "write";
+    // 其余按工具名或命令首词归类(cat 是读、cat > f 是写、rg 是搜),不扫参数。
+    const kind = COUNT_KIND[countLabel(message)] ?? "";
+    // 用户上传的附件单独说:没发附件时,「读了 1 个文件」不能被读成读了附件。
+    return kind === "read" && target.includes("/.openclaude/uploads/") ? "attach" : kind;
+  } catch {
+    return "other";
+  }
+}
+
+function delegateCallCount(message: ChatMessage): number {
+  try {
+    const tasks = normalizeToolForDisplay(message).input?.tasks;
+    if (Array.isArray(tasks) && tasks.length > 0) return tasks.length;
+  } catch {
+    // malformed inputJson falls back to output header or 1
+  }
+  const hit = /并行委派\s*(\d+)\s*个子任务/.exec(String(message.output ?? ""));
+  const parsed = hit ? Number(hit[1]) : 0;
+  return parsed > 0 ? parsed : 1;
+}
+
+/** 「读了 6 个文件、派出 1 个子任务、写了 1 个文件」。没有可说的事返回空串。 */
+export function workSummary(messages: readonly ChatMessage[]): string {
   const counts = new Map<string, number>();
   for (const message of messages) {
-    if (isClearedGoalRecord(message)) continue;
-    const label = countLabel(message);
-    if (!label) continue;
-    counts.set(label, (counts.get(label) ?? 0) + 1);
+    const kind = workKind(message);
+    if (!kind) continue;
+    const step = kind === "call" ? delegateCallCount(message) : 1;
+    counts.set(kind, (counts.get(kind) ?? 0) + step);
   }
-  if (counts.size === 0) return "执行记录";
-  return [...counts].map(([label, count]) => `${label} ${count} 项`).join(" · ");
+  // 委派调用和子任务卡常是同一件事:取两者较大的那个,不重复数。
+  const calls = counts.get("call") ?? 0;
+  if (calls > (counts.get("sub") ?? 0)) counts.set("sub", calls);
+  return [...counts]
+    .filter(([kind]) => KIND_PHRASE[kind])
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([kind, n]) => KIND_PHRASE[kind]!(n))
+    .join("、");
+}
+
+
+/**
+ * 重试、停止、引擎启动、压缩、等你确认、队长步骤:这些阶段由 TurnActivity 说(B4-SPEC §3.4 唯一的
+ * 阶段来源),时间线底部单独一行。那时过程外壳不再挂自己的「正在…」,同一时刻只有一行运行状态。
+ */
+export function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
+  if (!info) return false;
+  if (info.recoveryStatus?.kind === "stopping") return true;
+  if (isRetryingTurnStatus(info.turnStatus)) return true;
+  const status = info.turnStatus;
+  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
+    return true;
+  }
+  return !!info.leaderStep;
+}
+
+/**
+ * 本轮怎么收的尾。过程外壳之后、下一条用户消息之前,以最后一条助手消息为终态行:
+ * 它是停止 / 错误时外壳不能写「完成」。只看外壳正后方第一行会让普通回答盖住同轮稍后的终态错误。
+ */
+export function turnOutcome(following: readonly ChatMessage[] | undefined): "done" | "stopped" | "failed" {
+  let terminal: ChatMessage | undefined;
+  for (const message of following ?? []) {
+    if (message.role === "user") break;
+    if (message.role === "assistant") terminal = message;
+  }
+  if (!terminal || !hasErrorMark(terminal)) return "done";
+  const code = String(terminal._errorCode ?? "").toLowerCase();
+  return code === "stopped" || code === "user_cancelled" ? "stopped" : "failed";
 }
 
 export type ProcessSection<T> = {
@@ -607,7 +711,7 @@ export function processSections<T>(
   return sections;
 }
 
-function toolStillRunning(message: ChatMessage): boolean {
+export function toolStillRunning(message: ChatMessage): boolean {
   return message.role === "tool" && !message._completed && !message.error && !message._isError;
 }
 
@@ -753,6 +857,7 @@ function runningToolPhrase(message: ChatMessage): string {
   if (SHELL_TOOLS.has(token) || token === "bash" || token === "sh") {
     const bin = (head?.bin ?? "").toLowerCase();
     if (bin === "rg" || bin === "grep" || bin === "find") return "正在搜索资料";
+    if (bin === "cat" && CAT_WRITE_RE.test(command)) return "正在写入文件";
     if (bin === "cat" || bin === "view") return "正在读取文件";
   }
   return actionPhrase(message);
@@ -782,7 +887,7 @@ function actionPhrase(message: ChatMessage): string {
   }
 }
 
-function rawAuditCommand(message: ChatMessage): string {
+export function rawAuditCommand(message: ChatMessage): string {
   if (message.role !== "tool") return "";
   const original = commandText(message).trim();
   if (!original) return "";
@@ -796,6 +901,25 @@ function rawAuditCommand(message: ChatMessage): string {
 /** Name plus a one-line status. Never the raw tool JSON or the full thinking trace.
  * A later completed sibling must not hide a tool that is still running.
  * `pending` is only the still-running status phrase. Finished and failed lines stay still. */
+export function isDelegateRow(message: ChatMessage): boolean {
+  return message.role === "agent-group" || message.role === "delegate-progress";
+}
+
+/** 「委派给 质量审查员：检查报告格式」;并行委派列出各自接手的子代理与子任务数。 */
+export function delegateTitle(rows: readonly ChatMessage[]): string {
+  const names = [...new Set(rows.map((message) => agentDisplayName(message._delegateAgentId) || "子代理"))];
+  if (rows.length > 1) return `委派给 ${names.join("、")}（${rows.length} 个子任务）`;
+  const goal = (rows[0]?._delegateGoal || rows[0]?.text || "").replace(/\s+/g, " ").trim();
+  return goal ? `委派给 ${names[0]}：${goal}` : `委派给 ${names[0]}`;
+}
+
+/** 委派步骤右侧的状态:有一个还在跑就是「进行中」,否则取最差的终态(超时 / 失败 / 完成)。 */
+export function delegateState(rows: readonly ChatMessage[]): { label: string; running: boolean } {
+  if (rows.some((message) => !message._completed && !isServerAuthoredRow(message))) return { label: "进行中", running: true };
+  const states = rows.map((message) => agentTerminalStatus(message));
+  return { label: (states.find((state) => state.tone === "danger") ?? states.find((state) => state.tone === "warning") ?? states[0])?.label ?? "完成", running: false };
+}
+
 function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pending: boolean } {
   const work = messages.filter((message) => message.role !== "assistant" && message.role !== "user");
   const runningTool = [...work].reverse().find(toolStillRunning);
@@ -806,7 +930,7 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
     return { text: (latest.text || "计划").replace(/\s+/g, " ").trim().slice(0, 48), pending: false };
   }
   if (latest.role === "agent-group" || latest.role === "delegate-progress") {
-    return { text: (latest.text || "子任务").replace(/\s+/g, " ").trim().slice(0, 48), pending: true };
+    return { text: delegateTitle([latest]).slice(0, 48), pending: true };
   }
   if (latest.role === "tool") {
     if (latest.error || latest._isError || latest._errorCode) {
@@ -826,79 +950,8 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
 // 点开才看输出。「正在做什么」由外壳标题(动作 + 计时)和当前段节点的运行光晕表达。
 // 状态色只给运行中 / 未成功 / 受阻。
 
-type NodeTone = "live" | "error" | "warning" | "idle";
-
-const KIND_ICON: Record<string, LucideIcon> = {
-  命令: Terminal,
-  读取: FileText,
-  编辑: Pencil,
-  搜索: Search,
-  工具: Wrench,
-  思考: Brain,
-  计划: ListTodo,
-  目标: Target,
-  子任务: Bot,
-  问答: MessageCircleQuestion,
-  授权: ShieldCheck,
-  计划确认: ListChecks,
-};
-
-function firstCounted(messages: readonly ChatMessage[]): ChatMessage | undefined {
-  return messages.find((message) => !isClearedGoalRecord(message) && countLabel(message));
-}
-
-/** 时间轴节点:图标跟着步骤种类走,颜色只跟状态走(运行中 / 未成功 / 受阻)。 */
-function stepNode(messages: readonly ChatMessage[], live: boolean): { Icon: LucideIcon; tone: NodeTone } {
-  const head = firstCounted(messages) ?? messages[0];
-  if (!head) return { Icon: Circle, tone: "idle" };
-  if (head.role === "tool") {
-    try {
-      const display = normalizeToolForDisplay(head);
-      const meta = resolveToolMeta(display.name, display.input);
-      const status = resolveToolStatus(display);
-      // OCV5-313: 过程里的单步未成功 / 受阻是正常工作流的一部分,节点不染红/黄,与其他步骤同色。
-      const tone: NodeTone = status.isRunning && live ? "live" : "idle";
-      return { Icon: meta.icon, tone };
-    } catch {
-      return { Icon: Wrench, tone: "idle" };
-    }
-  }
-  if (head.role === "permission") {
-    return { Icon: head.toolName === "AskUserQuestion" ? MessageCircleQuestion : ShieldCheck, tone: "idle" };
-  }
-  if (isErroredAssistant(head)) return { Icon: TriangleAlert, tone: "warning" };
-  if (head.role === "agent-group" || head.role === "delegate-progress") {
-    const failed = hasErrorMark(head) || head._delegateStatus === "failed" || head._delegateStatus === "timeout";
-    const done = head._completed === true || head._delegateStatus === "ok";
-    return { Icon: Bot, tone: live && !done && !failed ? "live" : "idle" };
-  }
-  if (head.role === "thinking") return { Icon: Brain, tone: live ? "live" : "idle" };
-  const Icon = KIND_ICON[countLabel(head)] ?? Circle;
-  return { Icon, tone: "idle" };
-}
-
-const NODE_TONE: Record<NodeTone, string> = {
-  live: "oc-step-node-live text-accent ring-accent/45",
-  error: "text-danger ring-danger/35 bg-[color-mix(in_srgb,var(--danger)_9%,var(--bg))]",
-  warning: "text-warning ring-warning/40 bg-[color-mix(in_srgb,var(--warning)_10%,var(--bg))]",
-  idle: "text-faint ring-border",
-};
-
-function StepNode({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
-  return (
-    <span
-      aria-hidden
-      data-testid="process-step-node"
-      data-tone={tone}
-      className={`relative z-[1] mt-1.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-bg ring-1 transition-colors duration-300 [@media(hover:none)]:mt-2.5 ${NODE_TONE[tone]}`}
-    >
-      <Icon size={12.5} strokeWidth={2} />
-    </span>
-  );
-}
-
-/** 运行中的外壳标志:一圈慢转的弧光 + 呼吸的中心点;结束后换成安静的对勾。 */
-function ShellGlyph({ active }: { active: boolean }) {
+/** 运行中的外壳标志:一圈慢转的弧光 + 呼吸的中心点;结束后是状态表里这一结局的安静图标(勾 / 停止块 / 叹号)。 */
+function ShellGlyph({ active, outcome }: { active: boolean; outcome: "done" | "stopped" | "failed" }) {
   if (active) {
     return (
       <span aria-hidden data-testid="process-glyph-live" className="oc-orbit relative flex size-6 shrink-0 items-center justify-center">
@@ -906,18 +959,21 @@ function ShellGlyph({ active }: { active: boolean }) {
       </span>
     );
   }
+  const { icon: Icon, filled } = STATUS[outcome];
   return (
     <span
       aria-hidden
       data-testid="process-glyph-done"
+      data-outcome={outcome}
       className="flex size-6 shrink-0 items-center justify-center rounded-full bg-hover text-muted"
     >
-      <Check size={13} strokeWidth={2.25} />
+      {Icon ? <Icon size={13} strokeWidth={2.25} fill={filled ? "currentColor" : "none"} /> : null}
     </span>
   );
 }
 
-function formatElapsed(ms: number): string {
+
+export function formatElapsed(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
   if (total < 60) return `${total} 秒`;
   const minutes = Math.floor(total / 60);
@@ -925,23 +981,7 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
-/** 只在本轮进行中、且有可信起点(本轮活动的 startedAt)时计时;没有就不显示,绝不编。 */
-function useElapsed(startedAt: number | null | undefined, active: boolean): string {
-  const valid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!valid) return;
-    setNow(Date.now());
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [valid]);
-  if (!valid) return "";
-  const ms = now - (startedAt as number);
-  if (ms < 0 || ms > 24 * 3600_000) return "";
-  return formatElapsed(ms);
-}
-
-/** 1s 一跳的「现在」。只在有可信时间源时开表,结束即停。 */
+/** 1s 一跳的「现在」(统一驱动外壳已耗时与静默/运行计时)。只在有可信时间源时开表,结束即停。 */
 function useNowTicker(enabled: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -988,31 +1028,6 @@ function completedToolsSince(messages: readonly ChatMessage[]): number | null {
   return latest;
 }
 
-// 与右栏「N 步」同口径(OCV5-640):只数工具调用。以前思考、计划、子任务也各算一步,同一轮聊天写
-// 「已执行 28 个步骤」、面板写「17 步」;那些种类仍在分类小计里露出。
-function stepItemCount<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): number {
-  let count = 0;
-  for (const section of sections) {
-    if (section.narrative) continue;
-    for (const item of section.items) count += messagesOf(item).filter(isPaneStep).length;
-  }
-  return count;
-}
-
-function kindTally<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): [string, number][] {
-  const counts = new Map<string, number>();
-  for (const section of sections) {
-    if (section.narrative) continue;
-    for (const item of section.items) {
-      const head = firstCounted(messagesOf(item));
-      if (!head) continue;
-      const label = countLabel(head);
-      counts.set(label, (counts.get(label) ?? 0) + 1);
-    }
-  }
-  return [...counts].sort((a, b) => b[1] - a[1]);
-}
-
 /** Only a thinking row proves thinking; silence is waiting for a model response. */
 function shellLivePhrase<T>(
   sections: readonly ProcessSection<T>[],
@@ -1028,104 +1043,10 @@ function shellLivePhrase<T>(
   return { text: "等待模型响应", pending: true };
 }
 
-const KIND_PHRASE: Record<string, (n: number) => string> = {
-  命令: (n) => `运行 ${n} 条命令`,
-  读取: (n) => `读取 ${n} 个文件`,
-  编辑: (n) => `编辑 ${n} 处`,
-  搜索: (n) => `搜索 ${n} 次`,
-  工具: (n) => `调用 ${n} 次工具`,
-  思考: (n) => (n > 1 ? `思考 ${n} 次` : "思考"),
-  计划: (n) => (n > 1 ? `更新 ${n} 次计划` : "更新计划"),
-  目标: (n) => `${n} 条目标记录`,
-  子任务: (n) => `${n} 个子任务`,
-  问答: (n) => `${n} 次问答`,
-  授权: (n) => `${n} 次授权`,
-  计划确认: (n) => `${n} 次计划确认`,
-};
-
-/** 一段步骤的人话摘要:「运行 7 条命令，读取 1 个文件」。按出现先后排,同类合并。 */
-export function naturalSummary(items: readonly (readonly ChatMessage[])[]): string {
-  const counts = new Map<string, number>();
-  for (const rows of items) {
-    const head = firstCounted(rows);
-    if (!head) continue;
-    const label = countLabel(head);
-    counts.set(label, (counts.get(label) ?? 0) + 1);
-  }
-  if (counts.size === 0) return "执行记录";
-  return [...counts].map(([label, n]) => (KIND_PHRASE[label] ?? ((k: number) => `${label} ${k} 项`))(n)).join("，");
-}
-
-/** 一段的节点:段里有在跑的就是运行态;图标取段内最多的那类。未成功在摘要行右侧单独标出,不把整段染红。 */
-function groupNode(messages: readonly ChatMessage[], current: boolean): { Icon: LucideIcon; tone: NodeTone } {
-  const counts = new Map<string, number>();
-  for (const message of messages) {
-    if (isClearedGoalRecord(message)) continue;
-    const label = countLabel(message);
-    if (label) counts.set(label, (counts.get(label) ?? 0) + 1);
-  }
-  const top = [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
-  const Icon = KIND_ICON[top] ?? Wrench;
-  const last = messages.at(-1);
-  const live = current && (messages.some(toolStillRunning) || last?.role === "thinking");
-  return { Icon, tone: live ? "live" : "idle" };
-}
 
 const shellToggleClass =
   "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
-function StageText({ message, live = false, onFirstTextPaint }: {
-  message: ChatMessage; live?: boolean; onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
-}) {
-  // Same suppression as AssistantCard: an unpublished fallback must not
-  // reappear just because the row was grouped into the process. The body
-  // itself is ProgressiveMarkdown, the final answer's renderer, with no
-  // extra size or color on the wrapper. Only the current live stage keeps
-  // the streaming tail; a finished or reopened stage uses the normal pager.
-  if (message._payloadDeferred || message._hideUnpublishedFallback === true) return null;
-  if (message.error || message._isError || message._errorCode) return null;
-  const text = message.text ?? "";
-  if (!text.trim()) return null;
-  return (
-    <div
-      data-testid="process-stage"
-      data-find-member={timelineMessageKey(message)}
-      className="min-w-0"
-    >
-      <FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />
-      <ProgressiveMarkdown text={text} live={live} />
-    </div>
-  );
-}
-
-/** 时间轴上的一行:左列节点,右列内容。内容列与节点中心对齐到同一条竖线。 */
-function RailRow({
-  node,
-  children,
-  enter,
-  testId,
-}: {
-  node: ReactNode;
-  children: ReactNode;
-  enter: boolean;
-  testId?: string;
-}) {
-  return (
-    <div data-testid={testId} className={enter ? "oc-step-enter relative flex gap-3" : "relative flex gap-3"}>
-      {node}
-      <div className="min-w-0 flex-1">{children}</div>
-    </div>
-  );
-}
-
-/** 叙述段(中途的说明文字)在时间轴上只挂一颗小圆点,正文与步骤标题左缘对齐。 */
-function NarrativeDot() {
-  return (
-    <span aria-hidden className="relative z-[1] flex w-6 shrink-0 justify-center pt-[9px]">
-      <span className="size-1.5 rounded-full bg-border-strong ring-4 ring-bg" />
-    </span>
-  );
-}
 
 export function ProcessDisclosure<T>({
   sections,
@@ -1139,10 +1060,9 @@ export function ProcessDisclosure<T>({
   keyOf,
   messagesOf,
   olderSteps,
-  startedAt,
-  lastFrameAt,
-  turnStartedAt,
-  turnEndedAt,
+  activity,
+  bounds,
+  tokenUsageOf,
 }: {
   sections: ProcessSection<T>[];
   onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
@@ -1156,19 +1076,25 @@ export function ProcessDisclosure<T>({
   messagesOf: (item: T) => ChatMessage[];
   /** Unloaded earlier steps of this same turn. Stays inside the shell. */
   olderSteps?: ReactNode;
-  /** 本轮活动起点(TurnActivity.startedAt)。只用于进行中的计时,缺省则不显示时长。 */
-  startedAt?: number | null;
   /**
-   * 本会话最近一帧到达浏览器的时刻(会话级 _lastFrameAt)。只用于进行中的「静默多久」判断:
-   * 叙述段写完后迟迟没有下一步时,在时间轴末尾挂一行「等待模型响应」;工具长时间运行时在
-   * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
+   * 进行中这一轮的活动快照(只在 active 时给)。startedAt 用于计时;lastFrameAt(最近一帧到达浏览器)
+   * 只用于「静默多久」:叙述段写完后迟迟没有下一步时挂「等待模型响应」,工具长时间运行时在摘要行旁
+   * 显示已运行时长。缺省(历史轮、单测)则都不出现。
    */
-  lastFrameAt?: number | null;
-  /** OCV5-367: 本轮起点(进行中 = 本轮活动起点;历史 = 本轮用户消息时刻),首步耗时从这里算。 */
-  turnStartedAt?: number | null;
-  /** OCV5-367: 过程之后第一行(本轮回答)的到达时刻,末步没有自身终点时以它收尾。 */
-  turnEndedAt?: number | null;
+  activity?: TurnActivityInfo | null;
+  /**
+   * OCV5-367 本轮的时间边界:startedAt = 本轮用户消息时刻(首步耗时从这里算),endedAt = 过程之后第一行
+   * (本轮回答)的到达时刻(末步没有自身终点时以它收尾);next = 那一行本身。
+   * following = 过程之后、下一条用户消息之前的行。结局看其中的终态行,不看 next 单独一行。
+   */
+  bounds?: { startedAt: number | null; endedAt: number | null; next?: ChatMessage; following?: readonly ChatMessage[] };
+  /** 一步所在模型调用的 token 用量,只进耗时的悬停说明。 */
+  tokenUsageOf?: (item: T) => DisplayTokenUsage | undefined;
 }) {
+  const startedAt = activity?.startedAt ?? null;
+  const lastFrameAt = activity?.lastFrameAt ?? null;
+  const turnStartedAt = startedAt ?? bounds?.startedAt ?? null;
+  const turnEndedAt = bounds?.endedAt ?? null;
   const messages = sections.flatMap((section) => section.messages);
   // OCV5-367: 每一步的耗时(自上一步结束到本步结束)。按值签名缓存,数值不变时 Map 引用不变,
   // 步骤行(在 memo 边界之下读 context)不会被每一帧无谓重渲。
@@ -1177,7 +1103,6 @@ export function ProcessDisclosure<T>({
   const timingsRef = useRef<{ sig: string; map: typeof computedTimings } | null>(null);
   if (timingsRef.current?.sig !== timingsSig) timingsRef.current = { sig: timingsSig, map: computedTimings };
   const stepTimings = timingsRef.current.map;
-  const summary = operationSummary(messages);
   // Cleared/completed goals are diagnostics, not a new step. They must not
   // take the current-stage identity from the work still in progress.
   let currentIndex = -1;
@@ -1187,22 +1112,22 @@ export function ProcessDisclosure<T>({
       break;
     }
   }
-  const steps = stepItemCount(sections, messagesOf);
-  const tally = kindTally(sections, messagesOf);
   // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
   // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
   const openPane = useArtifactInspect().openPane;
   const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
   const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
   const hasToolRows = processRows.some((message) => message.role === "tool");
-  const elapsed = useElapsed(startedAt, active);
+  const elapsedValid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
   // 用户只能看到一段静止的文字(外壳标题的计时在长过程里早已滚出视口)。
   const currentSection = currentIndex >= 0 ? sections[currentIndex] : undefined;
   const completedSince = currentSection && !currentSection.narrative ? completedToolsSince(currentSection.messages) : null;
   const liveClock = active && typeof lastFrameAt === "number" && Number.isFinite(lastFrameAt) && lastFrameAt > 0;
-  const now = useNowTicker(liveClock || (active && completedSince !== null));
+  const now = useNowTicker(elapsedValid || liveClock || (active && completedSince !== null));
+  const elapsedMs = elapsedValid ? now - (startedAt as number) : -1;
+  const elapsed = elapsedMs >= 0 && elapsedMs <= 24 * 3600_000 ? formatElapsed(elapsedMs) : "";
   const quietMs = liveClock ? Math.max(0, now - (lastFrameAt as number)) : 0;
   const narrativeSettled = liveClock && !!currentSection?.narrative && quietMs >= QUIET_TAIL_MS;
   const toolWaitMs = completedSince === null ? 0 : now - completedSince;
@@ -1213,59 +1138,20 @@ export function ProcessDisclosure<T>({
     liveClock && currentSection && !currentSection.narrative ? earliestRunningSince(currentSection.messages, startedAt) : null;
   const runningMs = runningSince === null ? 0 : now - runningSince;
   const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
-  const live = active ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  // 同一时刻只有一行运行状态:阶段归 TurnActivity 时外壳不说「正在…」;展开时那一行落在时间轴里
+  // 在干活的段(或「等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
+  const live = active && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
+  const outcome = turnOutcome(bounds?.following);
+  const tookMs = turnEndedAt !== null && turnStartedAt !== null ? turnEndedAt - turnStartedAt : -1;
+  const meta = active ? elapsed : tookMs > 0 && tookMs <= 24 * 3600_000 ? formatElapsed(tookMs) : "";
+  const said = active ? "" : workSummary(messages);
   // 历史轮挂载时不播入场动画,只有进行中新冒出来的步骤才轻轻浮入。
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
   const lastItemKey = lastItem === undefined ? "" : keyOf(lastItem);
 
-  const narrativeBody = (section: ProcessSection<T>, isLive: boolean) => (
-    <div className="space-y-1">
-      {section.items.map((item) => {
-        const rows = messagesOf(item);
-        if (rows.some((message) => message._payloadDeferred)) {
-          return <div key={keyOf(item)}>{renderItem(item)}</div>;
-        }
-        return (
-          <div key={keyOf(item)} className="space-y-1">
-            {rows.map((message) => (
-              <StageText key={message.id} message={message} live={isLive} onFirstTextPaint={onFirstTextPaint} />
-            ))}
-          </div>
-        );
-      })}
-    </div>
-  );
-
-  const stepRow = (item: T, isLastOfProcess: boolean) => {
-    const rows = messagesOf(item);
-    const key = keyOf(item);
-    const deferred = rows.some((message) => message._payloadDeferred);
-    const node = stepNode(rows, active && isLastOfProcess);
-    // 只有工具 / 思考行换成时间轴行样式;子任务、计划等仍用原卡(它们自带结构)。
-    const inline = !deferred && rows.length > 0 && rows.every((message) => message.role === "tool" || message.role === "thinking");
-    return (
-      <RailRow key={key} testId="process-step" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={active && key === lastItemKey}>
-        <div className={inline ? "" : "py-1"}>
-          <ProcessStepContext.Provider value={inline}>{renderItem(item)}</ProcessStepContext.Provider>
-        </div>
-        {rows.map((message) => {
-          const raw = rawAuditCommand(message);
-          if (!raw) return null;
-          return (
-            <pre
-              key={`${message.id}:raw`}
-              data-testid="process-raw-command"
-              className="mb-1 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-hover/60 px-2 py-1 font-mono text-xs text-muted"
-            >
-              {raw}
-            </pre>
-          );
-        })}
-      </RailRow>
-    );
-  };
 
   return (
     <StepTimingContext.Provider value={stepTimings}>
@@ -1282,9 +1168,10 @@ export function ProcessDisclosure<T>({
         data-testid="process-toggle"
         onClick={() => setOpen(!open)}
       >
-        <ShellGlyph active={active} />
+        <ShellGlyph active={active} outcome={outcome} />
         <span className="flex min-w-0 flex-1 items-baseline gap-2">
-          {live ? (
+          <span className="sr-only">{title}</span>
+          {live && !liveInRail ? (
             <span
               key={live.text}
               data-testid="process-step-live"
@@ -1294,30 +1181,14 @@ export function ProcessDisclosure<T>({
               {live.text}
             </span>
           ) : (
-            <span className="shrink-0 text-body font-medium text-faint" data-testid="process-title">
-              {steps > 0 ? `已执行 ${steps} 个步骤` : title}
+            // UI-3 TurnSummary:「完成 · 读了 6 个文件、派出 1 个子任务、写了 1 个文件」+ 用时;进行中只写「处理中」。
+            <span className="min-w-0 truncate text-body font-medium text-faint" data-testid="process-title">
+              {active ? "处理中" : said ? `${STATUS[outcome].label} · ${said}` : STATUS[outcome].label}
             </span>
           )}
-          <span className="sr-only">{`${title} · ${summary}`}</span>
-          {active ? (
+          {meta ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
-              {[elapsed, steps > 0 ? `${steps} 步` : ""].filter(Boolean).join(" · ")}
-            </span>
-          ) : tally.length > 0 ? (
-            <span aria-hidden className="flex min-w-0 items-center gap-2.5 overflow-hidden text-meta tabular-nums text-muted" data-testid="process-tally">
-              {tally.slice(0, 5).map(([label, count], index) => {
-                const Icon = KIND_ICON[label] ?? Wrench;
-                return (
-                  <span
-                    key={label}
-                    className={index >= 3 ? "hidden shrink-0 items-center gap-1 sm:inline-flex" : "inline-flex shrink-0 items-center gap-1"}
-                    title={`${label} ${count}`}
-                  >
-                    <Icon size={12} strokeWidth={2} className="text-faint" />
-                    {count}
-                  </span>
-                );
-              })}
+              {meta}
             </span>
           ) : null}
         </span>
@@ -1362,124 +1233,26 @@ export function ProcessDisclosure<T>({
             data-testid={open ? "process-stages" : "process-older-steps"}
           >
             {olderSteps ? <div className="pl-9">{olderSteps}</div> : null}
-            {open ? sections.map((section, index) => {
-              const isLastSection = index === sections.length - 1;
-              if (section.card) {
-                // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
-                // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。
-                const node = stepNode(section.messages, false);
-                return (
-                  <RailRow key={section.key} testId="process-card" node={<StepNode Icon={node.Icon} tone={node.tone} />} enter={false}>
-                    <div className="min-w-0 space-y-1.5 py-1">
-                      {/* 能进过程的错误卡都已被本轮越过:不再给重试/切换模型/从断点继续(会重复开工)。 */}
-                      <RecoveredStepContext.Provider value>
-                        {section.items.map((item) => (
-                          <div key={keyOf(item)}>{renderItem(item)}</div>
-                        ))}
-                      </RecoveredStepContext.Provider>
-                    </div>
-                  </RailRow>
-                );
-              }
-              if (section.goal) {
-                return (
-                  <RailRow key={section.key} testId="process-goal" node={<StepNode Icon={Target} tone="idle" />} enter={false}>
-                    <div className="py-1">
-                      {section.items.map((item) => (
-                        <div key={keyOf(item)}>{renderItem(item)}</div>
-                      ))}
-                    </div>
-                  </RailRow>
-                );
-              }
-              if (section.narrative) {
-                const current = active && index === currentIndex;
-                // Intermediate replies stay fully readable for the whole turn.
-                // A one-line stage hid text the reader had already seen, then
-                // showed it again only after the turn ended. Tool groups still
-                // collapse. Only the current stage is live.
-                return (
-                  <RailRow key={section.key} node={<NarrativeDot />} enter={false}>
-                    <div className="py-1">{narrativeBody(section, current)}</div>
-                  </RailRow>
-                );
-              }
-              const details = detailOpen(section.key);
-              const current = active && index === currentIndex;
-              const group = groupNode(section.messages, current);
-              // OCV5-312: 流光挂在「正在干活」的这一段摘要行上(当前段、本轮仍在进行),表明 agent 此刻在做什么;
-              // 其余过程文字一律 --faint,让下方 agent 的回复正文更突出。当前在写正文(叙述段)时不挂流光,流式文字本身就是信号。
-              // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
-              // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
-              // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
-              const working = active && index === currentIndex && !toolsSettled;
-              const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
-              return (
-                <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
-                  <RailRow node={<StepNode Icon={group.Icon} tone={group.tone} />} enter={false}>
-                    <button
-                      type="button"
-                      className="group/sum -mx-2 flex min-h-9 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors duration-150 hover:bg-hover/70 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11"
-                      aria-expanded={details}
-                      data-testid="process-detail-toggle"
-                      onClick={() => setDetailOpen(section.key, !details)}
-                    >
-                      <span
-                        data-testid="process-group-summary"
-                        data-live-working={working ? "true" : "false"}
-                        className={`min-w-0 truncate text-body ${working ? "oc-live-status-shine text-muted" : "text-faint"}`}
-                      >
-                        {naturalSummary(section.items.map(messagesOf))}
-                      </span>
-                      {working && runningFor ? (
-                        // 长命令 / 长工具:流光之外再给一个每秒在走的数字,一眼看出「还在跑、跑了多久」。
-                        // 读屏不播报每秒变化的时长。
-                        <span
-                          aria-hidden
-                          data-testid="process-step-running-for"
-                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
-                        >
-                          {`已运行 ${runningFor}`}
-                        </span>
-                      ) : groupTiming?.ms !== undefined ? (
-                        // OCV5-367: 折叠的步骤组给出这一组合计用时(组内每一步都有可信时间才给)。
-                        <span
-                          data-testid="process-group-duration"
-                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
-                          title={`这一组步骤共用时 ${formatStepDuration(groupTiming.ms)}`}
-                        >
-                          {formatStepDuration(groupTiming.ms)}
-                        </span>
-                      ) : null}
-                      <span className="sr-only">{operationSummary(section.messages)}</span>
-                      {/* OCV5-313: 不在摘要行单独点出「N 步未成功」——中途个别步骤没成功是正常流程,
-                          事实留在展开后的步骤行里(安静的灰字),整轮失败另有顶层错误卡。 */}
-                      <ChevronRight
-                        size={14}
-                        aria-hidden
-                        className={`ml-auto shrink-0 text-faint transition-transform duration-200 ease-[var(--ease-spring)] group-hover/sum:text-muted ${details ? "rotate-90" : ""}`}
-                      />
-                    </button>
-                  </RailRow>
-                  {details ? (
-                    <div className="space-y-0.5" data-testid="process-details">
-                      {section.items.map((item, i) => stepRow(item, isLastSection && i === section.items.length - 1))}
-                    </div>
-                  ) : null}
-                </div>
-              );
-            }) : null}
-            {open && waiting ? (
-              // 在最新进展处显示等待时长,不把已经完成的工具标为仍在执行。
-              // 下一步一冒出来(新帧到达、当前段换成步骤组)这行就消失,流光随之落到那一段的摘要行上。
-              <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
-                <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
-                  <span className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
-                  <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
-                    {formatElapsed(waitingMs)}
-                  </span>
-                </div>
-              </RailRow>
+            {open ? (
+              <ProcessStages
+                sections={sections}
+                active={active}
+                currentIndex={currentIndex}
+                live={live}
+                toolsSettled={toolsSettled}
+                runningFor={runningFor}
+                waiting={waiting}
+                waitingMs={waitingMs}
+                stepTimings={stepTimings}
+                lastItemKey={lastItemKey}
+                detailOpen={detailOpen}
+                setDetailOpen={setDetailOpen}
+                renderItem={renderItem}
+                keyOf={keyOf}
+                messagesOf={messagesOf}
+                onFirstTextPaint={onFirstTextPaint}
+                tokenUsageOf={tokenUsageOf}
+              />
             ) : null}
           </div>
         ) : null}

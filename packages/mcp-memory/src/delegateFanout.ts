@@ -103,6 +103,8 @@ export function normalizeFanoutTasks(
 /**
  * 把各子任务结果按输入顺序聚合成一段队长可读文本:顶部一行汇总(成功/失败计数),
  * 每项独立小节标注 ✅/❌ + 目标摘要 + 回传正文。单项失败不影响其余的呈现。
+ * 回传正文在 formatDelegateSuccess 里已按队长上下文上限截断(开头+结尾,标出省略字数);
+ * 这里只按原顺序拼接,不再把成员全文展开进队长上下文。
  */
 export function aggregateDelegateFanoutResults(items: FanoutItemResult[]): string {
   const total = items.length

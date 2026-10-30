@@ -1191,3 +1191,35 @@ describe("181 a753 countdown keeps the single expiry authority", () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe("问答卡继续", () => {
+  test("「继续」不提交任何 allow 答案", () => {
+    const onRespond = vi.fn();
+    render(
+      <PermissionCard
+        msg={askMsg({
+          requestId: "review-payment",
+          inputJson: {
+            questions: [
+              { question: "头像风格？", options: [{ label: "简约" }, { label: "复古" }] },
+              { question: "是否支付积分购买？", options: [{ label: "购买" }, { label: "不购买" }] },
+            ],
+          },
+        })}
+        onRespond={onRespond}
+        renderMode="card"
+        livePrompt={false}
+      />,
+    );
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    const payload = onRespond.mock.calls[0][0];
+    expect(payload.behavior).not.toBe("allow");
+    expect(payload.updatedInput?.answers).toBeUndefined();
+    const encoded = JSON.stringify(payload);
+    expect(encoded).not.toContain("购买");
+    expect(encoded).not.toContain("简约");
+  });
+});
+

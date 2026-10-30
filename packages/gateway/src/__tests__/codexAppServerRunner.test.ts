@@ -1369,7 +1369,81 @@ describe('handleNotification — item/completed', () => {
     assert.equal(tr.message.content[0].termination_reason, 'tool_error')
     assert.equal(tr.message.content[0].content.includes(resultB64), false)
     assert.equal(tr.message.content[0].content.includes(rawMarker), false)
+    assert.match(tr.message.content[0].content, /图片生成没有完成/)
+    assert.equal(tr.message.content[0].content.includes('upstream failed'), false)
+    assert.match(tr.message.content[0].content, /继续/)
     await rm(join(paths.generatedDir, 'codex-thr-img-failed-img-failed.png'), { force: true })
+    await h.cleanup()
+  })
+
+  it('imageGeneration stderr IMAGE2_DISABLED becomes a clear continue note', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-img-disabled'
+    ;(h.runner as any).threadId = 'thr-img-disabled'
+    h.runner.feedStderrForTests(
+      '\u001b[31mERROR\u001b[0m image generation failed: http 503 Service Unavailable: Some("{\\"error\\":{\\"code\\":\\"IMAGE2_DISABLED\\",\\"message\\":\\"Image 2 is temporarily unavailable\\"}}")\n',
+    )
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-img-disabled',
+        turnId: 't-img-disabled',
+        item: {
+          id: 'img-disabled',
+          type: 'imageGeneration',
+          status: 'failed',
+          failure: null,
+          result: '',
+        },
+      },
+    })
+    await waitFor(() =>
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+    )
+    const tr = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(tr)
+    assert.equal(tr.message.content[0].is_error, true)
+    assert.match(tr.message.content[0].content, /Image 2 还没打开/)
+    assert.equal(tr.message.content[0].content.includes('IMAGE2_DISABLED'), false)
+    assert.equal(tr.message.content[0].content.includes('requestId'), false)
+    await h.cleanup()
+  })
+
+  it('imageGeneration short token in the completion frame stays out of tool_result', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-img-token'
+    ;(h.runner as any).threadId = 'thr-img-token'
+    const sentinel = 'demo-secret-123'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-img-token',
+        turnId: 't-img-token',
+        item: {
+          id: 'img-token',
+          type: 'imageGeneration',
+          status: 'failed',
+          failure: null,
+          result: '',
+          error: { message: `access_token=${sentinel}` },
+        },
+      },
+    })
+    await waitFor(() =>
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.type === 'tool_result'),
+    )
+    const tr = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(tr)
+    assert.equal(tr.message.content[0].is_error, true)
+    assert.equal(tr.message.content[0].content.includes(sentinel), false)
+    assert.equal(tr.message.content[0].content.includes('access_token'), false)
+    assert.match(tr.message.content[0].content, /图片生成没有完成/)
     await h.cleanup()
   })
 

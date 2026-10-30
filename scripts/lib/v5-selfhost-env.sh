@@ -173,6 +173,8 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_RUNTIME_RELEASES_ROOT "$OC_HOTCFG_RELEASES_ROOT"
   ensure_env_kv "$V5_ENV" OC_SESSIONS_STORE pg
   ensure_env_kv "$V5_ENV" OC_TOOL_FAILURE_AUDIT 1
+  # Codex imageGeneration. Bound Codex account, not OPENAI_API_KEY. Read at process start.
+  ensure_env_kv "$V5_ENV" OC_IMAGE2_ENABLED true
   ensure_env_kv "$V5_ENV" OC_SKILL_SHADOW_SAMPLE_RATE 0.1
   ensure_env_kv "$V5_ENV" OC_DURABLE_METRIC_ROLLUPS 1
   ensure_env_kv "$V5_ENV" OC_LOCAL_OBSERVABILITY_RETENTION 1
