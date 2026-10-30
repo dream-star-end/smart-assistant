@@ -1903,10 +1903,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
         }}
       />,
     );
-    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击重试" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击继续" })).toBeTruthy());
     expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击重试" }));
+    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击继续" }));
     await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
   });
 
@@ -2349,10 +2349,10 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(button).toHaveAttribute("aria-busy", "true");
   });
 
-  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", async () => {
+  test("云端加载失败 → 按钮显示「加载失败，点击继续」且可点(重试)", async () => {
     const onLoadOlder = vi.fn();
     renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
-    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
+    const btn = screen.getByRole("button", { name: /加载失败，点击继续/ });
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
     await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));

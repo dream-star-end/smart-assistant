@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
+import { createHash } from 'node:crypto'
+import { appendFile } from 'node:fs/promises'
+import { Readable } from 'node:stream'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { settleUsageAndLedger } from '../billing/proxyBilling.js'
 import { applyTurnWaiver, ensurePendingTurnWaiver } from '../billing/refund.js'
@@ -7,7 +11,9 @@ import { lockTurnBillingKeys } from '../billing/turnLock.js'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
-import { resolveLegacyWaiverTurnKey } from '../http/internalTurnWaive.js'
+import { makeTurnWaiveHandler, resolveLegacyWaiverTurnKey } from '../http/internalTurnWaive.js'
+import { createPgSessionsBackend } from '../db/pgSessionsBackend.js'
+import type { TurnWaiveReason } from '@openclaude/protocol'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -101,6 +107,212 @@ async function createTurnSession(
     [sessionId, userKey, turnKey, updatedAt],
   )
 }
+
+/** Use the real multipart/finalizer path, including Phase A before parts. */
+async function longTaskTape(userId: bigint, key: string, options: {
+  reason?: TurnWaiveReason; text?: string; tools?: unknown[]; engineBillings?: unknown[]
+} = {}) {
+  const sessionId = `longtask-${key.slice(0, 12)}`
+  const userKey = `c:${userId}`
+  const createdAt = Date.now()
+  await query(`INSERT INTO client_sessions(id,user_id,created_at,last_at,updated_at)
+    VALUES ($1,$2,$3,$3,$3)`, [sessionId, userKey, createdAt])
+  const canonical = Buffer.from(JSON.stringify({ sessionId, agentId: 'main', turnIndex: 1,
+    status: 'crashed', turnKey: key, text: options.text ?? '', createdAt,
+    waiveReason: options.reason ?? 'platform_authority_expired',
+    errorCode: options.reason === 'turn_limit' ? 'TURN_LIMIT' : 'MODEL_AUTHORITY_EXPIRED',
+    errorDetail: '任务暂时中断', tools: options.tools ?? [], engineBillings: options.engineBillings ?? [],
+  }))
+  const digest = createHash('sha256').update(canonical).digest('hex')
+  const base = { protocolVersion: 2 as const, sessionId, agentId: 'main', turnIndex: 1,
+    status: 'crashed' as const, turnKey: key, tapeId: digest, tapeSha256: digest,
+    totalBytes: canonical.length, partCount: 1, createdAt,
+    waiveReason: options.reason ?? 'platform_authority_expired' }
+  const backend = createPgSessionsBackend(getPool(), { expectedGeneration: 1 })
+  const finalize = { ...base, action: 'finalize' as const }
+  return { sessionId, tapeId: digest, backend, finalize,
+    async headerOnly() { return backend.finalizeLosslessTurnTape(userKey, finalize, { materialize: false }) },
+    async complete() {
+      await backend.stageLosslessTurnTapePart(userKey, { ...base, action: 'part', partIndex: 0,
+        partSha256: digest, data: canonical.toString('base64') }, canonical)
+      return backend.finalizeLosslessTurnTape(userKey, finalize)
+    },
+  }
+}
+
+function longTaskSettle(userId: bigint, turnKey: string, requestId: string, costCredits: bigint, output = 1) {
+  return settleUsageAndLedger(getPool(), { userId, accountId: null, requestId, model: 'test',
+    usage: { input_tokens: 1, output_tokens: output, cache_read_tokens: 0, cache_write_tokens: 0 },
+    snapshotJson: '{}', costCredits, status: 'success', sessionId: 'ccb-longtask', turnKey })
+}
+
+async function longTaskReconciliation(userId: bigint, scenario: string) {
+  const row = (await query<{ credits: string; usage_cost: string; debits: string; refunds: string; waivers: string; receipts: string }>(
+    `SELECT u.credits::text AS credits,
+       (SELECT COALESCE(SUM(cost_credits),0)::text FROM usage_records WHERE user_id=u.id) AS usage_cost,
+       (SELECT COALESCE(-SUM(delta),0)::text FROM credit_ledger WHERE user_id=u.id AND delta<0) AS debits,
+       (SELECT COALESCE(SUM(delta),0)::text FROM credit_ledger WHERE user_id=u.id AND reason='refund') AS refunds,
+       (SELECT COUNT(*)::text FROM turn_waivers WHERE user_id=u.id) AS waivers,
+       (SELECT COUNT(*)::text FROM inbox_messages WHERE user_id=u.id AND source_type='turn_waive') AS receipts
+     FROM users u WHERE u.id=$1`, [userId.toString()])).rows[0]!
+  assert.equal(1000n - BigInt(row.credits), BigInt(row.debits) - BigInt(row.refunds))
+  const proof = { scenario, initialCredits: '1000', ...row }
+  console.log(`LONGTASK_RECONCILIATION ${JSON.stringify(proof)}`)
+  if (process.env.OC_LONGTASK_RECONCILIATION_PATH) {
+    await appendFile(process.env.OC_LONGTASK_RECONCILIATION_PATH, `${JSON.stringify(proof)}\n`)
+  }
+  return row
+}
+
+async function longTaskWaiveRequest(userId: bigint, body: Record<string, unknown>) {
+  const secret = 'a'.repeat(64)
+  const broadcasts: unknown[] = []
+  const handler = makeTurnWaiveHandler({ pgPool: getPool(), identityRepo: {
+    async findActiveByHostAndBoundIp(host, ip) {
+      return { id: 7, user_id: Number(userId), bound_ip: ip, host_uuid: host,
+        secret_hash: createHash('sha256').update(Buffer.from(secret, 'hex')).digest() }
+    },
+  }, broadcastToUser(_uid, payload) { broadcasts.push(payload) } })
+  const req = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage
+  req.method = 'POST'; req.headers = { authorization: `Bearer oc-v3.7.${secret}` }
+  let payload = ''
+  const res = { statusCode: 200, headersSent: false, setHeader() {},
+    end(value: string) { payload += value } } as unknown as ServerResponse
+  await handler(req, res, { hostUuid: 'test-host', boundIp: '172.30.0.5' })
+  return { status: res.statusCode, body: JSON.parse(payload), broadcasts }
+}
+
+describe('long task zero-output proof and accounting (integ)', () => {
+  test('waive endpoint ignores forged output/user flags and defers unknown tenant evidence', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '8a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { text: '已持久化正文' })
+    await tape.complete()
+    const denied = await longTaskWaiveRequest(userId, { turnKey: key,
+      reason: 'platform_authority_expired', hasOutput: false, zeroOutput: true })
+    assert.equal(denied.status, 409)
+    assert.equal(denied.body.error.code, 'TURN_WAIVER_INELIGIBLE')
+    assert.deepEqual(denied.broadcasts, [])
+    const other = (await query<{ id: string }>(`INSERT INTO users(email,password_hash,credits,role)
+      VALUES ('waiver-other@example.com','argon2$stub',1000,'user') RETURNING id::text AS id`)).rows[0]!
+    const unowned = await longTaskWaiveRequest(BigInt(other.id), { turnKey: key,
+      reason: 'platform_authority_expired', userId: userId.toString(), hasOutput: false })
+    assert.equal(unowned.status, 503)
+    assert.deepEqual(unowned.broadcasts, [])
+    const proof = await longTaskReconciliation(userId, 'endpoint-server-proof-tenant-bound')
+    assert.equal(proof.waivers, '0'); assert.equal(proof.receipts, '0')
+  })
+  test('paid retained output denies waiver and later settlement/replay stays paid', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '1a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { text: '已完成的前半部分' })
+    await longTaskSettle(userId, key, 'paid-a', 17n)
+    await longTaskSettle(userId, key, 'paid-b', 23n)
+    assert.equal((await tape.complete()).applied, 'finalized')
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })).disposition, 'denied')
+    await longTaskSettle(userId, key, 'late-paid', 31n)
+    await longTaskSettle(userId, key, 'late-paid', 31n)
+    assert.deepEqual(await longTaskReconciliation(userId, 'paid-retained-and-late-replay'),
+      { credits: '929', usage_cost: '71', debits: '71', refunds: '0', waivers: '0', receipts: '0' })
+  })
+  test('Phase A header cannot fence or zero a late charge; completed tool is output', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '2a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { tools: [{ blockId: 'done', toolName: 'Read',
+      inputJson: {}, output: '', completed: true }] })
+    await tape.headerOnly()
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })).disposition, 'deferred')
+    await longTaskSettle(userId, key, 'header-late', 31n, 0)
+    assert.equal((await tape.complete()).applied, 'finalized')
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })).disposition, 'denied')
+    const proof = await longTaskReconciliation(userId, 'header-deferred-tool-output')
+    assert.equal(proof.credits, '969'); assert.equal(proof.waivers, '0'); assert.equal(proof.refunds, '0')
+    const jobs = await query<{ kind: string; status: string }>(`SELECT kind,status FROM turn_tape_settlement_jobs
+      WHERE user_id=$1 AND tape_id=$2`, [`c:${userId}`, tape.tapeId])
+    assert.ok(jobs.rows.some((job) => job.kind === 'waiver' && job.status === 'queued'))
+  })
+  test('r1: positive canonical engine usage denies before and after its billing job', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    for (const [index, reason] of ['turn_limit', 'platform_authority_expired'].entries()) {
+      for (const before of [false, true]) {
+        const key = `${index + 3}${before ? 'b' : 'a'}`.repeat(32)
+        const requestId = `canonical-positive-${index}-${before}`
+        const tape = await longTaskTape(userId, key, { reason: reason as TurnWaiveReason,
+          engineBillings: [{ requestId, engineSessionId: `oceng-${'c'.repeat(48)}`,
+            status: 'error', durationMs: 10, usage: { input_tokens: 10, output_tokens: 100 } }] })
+        if (before) await longTaskSettle(userId, key, requestId, 59n, 100)
+        assert.equal((await tape.complete()).applied, 'finalized')
+        assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: reason as TurnWaiveReason })).disposition, 'denied')
+        if (!before) await longTaskSettle(userId, key, requestId, 59n, 100)
+      }
+    }
+    const proof = await longTaskReconciliation(userId, 'canonical-positive-order-independent')
+    assert.equal(proof.credits, '764'); assert.equal(proof.usage_cost, '236'); assert.equal(proof.waivers, '0')
+  })
+  test('unknown pending engine usage defers, then actual positive settlement denies', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '5a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { engineBillings: [{ requestId: 'unknown-usage',
+      engineSessionId: `oceng-${'d'.repeat(48)}`, status: 'error', durationMs: 10 }] })
+    await tape.complete()
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })).disposition, 'deferred')
+    await longTaskSettle(userId, key, 'unknown-usage', 13n, 5)
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })).disposition, 'denied')
+    const proof = await longTaskReconciliation(userId, 'unknown-billing-deferred-then-paid')
+    assert.equal(proof.credits, '987'); assert.equal(proof.waivers, '0')
+  })
+  test('billing_failed placeholder cannot prove a pending engine request had zero output', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '9a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { engineBillings: [{ requestId: 'billing-failed-placeholder',
+      engineSessionId: `oceng-${'e'.repeat(48)}`, status: 'error', durationMs: 10 }] })
+    await query(`INSERT INTO usage_records(user_id,mode,model,price_snapshot,cost_credits,request_id,status,turn_key)
+      VALUES ($1,'chat','test','{}'::jsonb,0,'billing-failed-placeholder','billing_failed',$2)`, [userId.toString(), key])
+    await tape.complete()
+    assert.equal((await applyTurnWaiver(getPool(), { userId, turnKey: key,
+      reason: 'platform_authority_expired' })).disposition, 'deferred')
+    const proof = await longTaskReconciliation(userId, 'billing-failed-is-not-final-zero-proof')
+    assert.equal(proof.credits, '1000'); assert.equal(proof.waivers, '0'); assert.equal(proof.receipts, '0')
+  })
+  test('proven zero output fences late settlement and refunds once, including replay', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '6a'.repeat(32)
+    const tape = await longTaskTape(userId, key)
+    await longTaskSettle(userId, key, 'zero-before', 31n, 0)
+    await tape.complete()
+    const first = await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })
+    assert.equal(first.newlyApplied, true)
+    assert.equal(first.refundedCredits, 31n)
+    await longTaskSettle(userId, key, 'zero-late', 19n, 0)
+    const replay = await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })
+    assert.equal(replay.inboxMessageId, first.inboxMessageId)
+    const proof = await longTaskReconciliation(userId, 'zero-output-late-settlement-once')
+    assert.equal(proof.credits, '1000'); assert.equal(proof.refunds, '31'); assert.equal(proof.receipts, '1')
+  })
+  test('historical applied authority waiver keeps its receipt and is never recaptured', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1000n)
+    const key = '7a'.repeat(32)
+    const tape = await longTaskTape(userId, key, { reason: 'idle_timeout', text: '历史已保留内容' })
+    await longTaskSettle(userId, key, 'historic-paid', 41n)
+    await tape.complete()
+    const original = await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'idle_timeout' })
+    // Seed the already-applied historical policy; this is isolated test data.
+    await query(`UPDATE turn_waivers SET reason='platform_authority_expired' WHERE user_id=$1 AND turn_key=$2`, [userId.toString(), key])
+    const replay = await applyTurnWaiver(getPool(), { userId, turnKey: key, reason: 'platform_authority_expired' })
+    assert.equal(replay.waiverId, original.waiverId); assert.equal(replay.inboxMessageId, original.inboxMessageId)
+    assert.equal(replay.refundedCredits, original.refundedCredits); assert.equal(replay.newlyApplied, false)
+    const proof = await longTaskReconciliation(userId, 'historical-waiver-preserved')
+    assert.equal(proof.credits, '1000'); assert.equal(proof.refunds, '41'); assert.equal(proof.receipts, '1')
+  })
+})
 
 describe('exact turn waiver + targeted inbox (integ)', () => {
   test('rolling old report resolves one timeout tape by exact engine session, never a billing window', async (t) => {

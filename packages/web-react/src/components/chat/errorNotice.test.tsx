@@ -85,16 +85,20 @@ describe("终态错误卡说人话", () => {
   test("建议动作:目录给的重试 / 换模型,执行时走原来的入口", () => {
     const onRetrySend = vi.fn();
     const onOpenModelPicker = vi.fn();
+    const onContinueInterrupted = vi.fn();
     const source = { id: "m-client-1", role: "user", text: "原问题", ts: 0, status: "error" } as ChatMessage;
     const card = renderCard(errorRow({ _errorCode: "model_capacity" }), {
       onRetrySend,
       onOpenModelPicker,
+      onContinueInterrupted,
+      resolveInterruptedContinuation: () => source,
       resolveRetryTarget: () => source,
     });
     const buttons = within(card).getAllByRole("button").map((b) => b.textContent);
-    expect(buttons.slice(0, 2)).toEqual(["重试", "切换模型"]);
-    fireEvent.click(within(card).getByRole("button", { name: "重试" }));
-    expect(onRetrySend).toHaveBeenCalledWith(source);
+    expect(buttons.slice(0, 2)).toEqual(["继续", "切换模型"]);
+    fireEvent.click(within(card).getByRole("button", { name: "继续" }));
+    expect(onRetrySend).not.toHaveBeenCalled();
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
     fireEvent.click(within(card).getByRole("button", { name: "切换模型" }));
     expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
   });
@@ -131,12 +135,15 @@ describe("自动重试耗尽 / 暂停的终态卡", () => {
   test.each(["automatic_retry_exhausted", "automatic_retry_paused"] as const)("%s:人话 + 明确的出口动作", (code) => {
     const onOpenModelPicker = vi.fn();
     const onRegenerate = vi.fn();
-    const card = renderCard(giveUp(code), { onOpenModelPicker, onRegenerate, onFeedback: vi.fn() });
+    const onContinueInterrupted = vi.fn();
+    const card = renderCard(giveUp(code), { onOpenModelPicker, onRegenerate, onFeedback: vi.fn(),
+      onContinueInterrupted, resolveInterruptedContinuation: () => ({ id: "root", role: "user", text: "目标", ts: 0 } as ChatMessage) });
     expect(card).toHaveTextContent("自动重试已停止");
     expect(card).toHaveTextContent(USER_ERROR_CATALOG[code]!.message);
-    expect(within(card).getAllByRole("button").slice(0, 2).map((b) => b.textContent)).toEqual(["切换模型", "重新尝试"]);
-    fireEvent.click(within(card).getByRole("button", { name: "重新尝试" }));
-    expect(onRegenerate).toHaveBeenCalledTimes(1);
+    expect(within(card).getAllByRole("button").slice(0, 2).map((b) => b.textContent)).toEqual(["继续", "切换模型"]);
+    fireEvent.click(within(card).getByRole("button", { name: "继续" }));
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    expect(onRegenerate).not.toHaveBeenCalled();
     // 服务端兼容正文不再另画一遍,也不挂复制 / 评价这类回答动作。
     expect(screen.queryByText(/自动恢复已停止：/)).toBeNull();
     expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
@@ -149,13 +156,13 @@ describe("派发失败状态卡", () => {
     render(
       <TurnStatusCard
         msg={{ id: "t1", role: "assistant", text: "", ts: 1, _errorCode: "dispatch_lost", _clientMessageId: "m1", _turnStatusRecord: true } as ChatMessage}
-        cb={{ onRegenerate: vi.fn() }}
+        cb={{ onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => ({ id: "m1", role: "user", text: "目标", ts: 0 } as ChatMessage) }}
         currentTurn
       />,
     );
     const card = screen.getByRole("status");
     expect(card).toHaveTextContent("消息未能开始处理，已确认未计费，请重试。");
-    expect(within(card).getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
+    expect(within(card).getByRole("button", { name: "继续" })).toBeInTheDocument();
     expect(visibleText(card)).not.toContain("dispatch_lost");
   });
 });

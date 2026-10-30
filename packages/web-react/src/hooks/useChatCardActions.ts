@@ -16,7 +16,8 @@ import { isBrowserStepMessage } from "../components/tool/browserDetect";
 import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
-import { preciseRetryEligible, interruptedContinuationTarget } from "../lib/chat/socket";
+import { preciseRetryEligible, interruptedContinuationTarget, exactUserReplayPayload } from "../lib/chat/socket";
+import { manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
 import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
@@ -330,22 +331,52 @@ export function useChatCardActions({
     (error: ChatMessage): ChatMessage | undefined => {
       if (demo || !activeId) return undefined;
       const msgs = sockRef.current?.getMessages(activeId) ?? [];
-      return interruptedContinuationTarget(msgs, error, activeId)?.user;
+      return interruptedContinuationTarget(msgs, error, activeId)?.user ?? manualTaskContinuationSource(msgs, error);
     },
     [demo, activeId],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
+  const pendingContinuations = useRef(new Set<string>());
   const continueInterrupted = useCallback(
-    (error: ChatMessage) => {
-      if (demo || !activeId) return;
-      sockRef.current?.continueInterruptedTurn({
-        sessId: activeId,
-        errorMessageId: error.id,
-        agentId: agent.id,
-      });
+    async (error: ChatMessage) => {
+      if (demo || !activeId || activeSessionRef.current !== activeId) return;
+      if (!identity || !identityIsCurrent(identity, authRef.current)) return;
+      const sock = sockRef.current;
+      const rows = sock?.getMessages(activeId) ?? [];
+      const source = manualTaskContinuationSource(rows, error);
+      if (!sock || !source) return;
+      const key = `${activeId}\0${source.id}`;
+      if (pendingContinuations.current.has(key)) return;
+      pendingContinuations.current.add(key);
+      try {
+        if (interruptedContinuationTarget(rows, error, activeId)) {
+          sock.continueInterruptedTurn({ sessId: activeId, errorMessageId: error.id, agentId: agent.id });
+          return;
+        }
+        const exact = await loadExactOrToast(source);
+        if (!exact || !identityIsCurrent(identity, authRef.current) || activeSessionRef.current !== activeId || sockRef.current !== sock ||
+          manualTaskContinuationSource(sock.getMessages(activeId), error)?.id !== source.id) return;
+        const replay = exactUserReplayPayload(exact);
+        // Explicit human follow-up uses the normal admission/credit/auth gates.
+        // It neither deletes old content nor resends an executed task.
+        const text = taskContinuationPrompt(replay.text);
+        const routing = exact._routing;
+        if (routing) {
+          await sock.send({
+            sessId: activeId, agentId: agent.id, text, media: replay.media, displayText: "继续",
+            model: routing.model, teamMode: routing.teamMode, effortLevel: routing.effortLevel,
+            collabMode: routing.collabMode, advisorModel: routing.advisorModel,
+            collabConfigVersion: routing.collabConfigVersion,
+            contextTier: routing.contextTier, serviceTier: routing.serviceTier,
+          });
+        } else {
+          await send(text, replay.media, undefined, "继续", undefined, { sessionId: activeId });
+        }
+      } finally {
+        pendingContinuations.current.delete(key);
+      }
     },
-    [demo, activeId, agent.id],
+    [demo, activeId, agent.id, identity, loadExactOrToast, send],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

@@ -3,7 +3,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import {
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
   ModelAuthorityError,
   TURN_LEASE_TTL_MS,
   type TurnLease,
@@ -103,7 +102,7 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
     const now = (deps.now ?? Date.now)()
     let lease: TurnLease
     try {
-      lease = verifyTurnLease(raw.lease, signer.reader().keyring(), now)
+      lease = verifyTurnLease(raw.lease, signer.reader().keyring(), now, { allowExpired: true })
     } catch (err) {
       const code = err instanceof ModelAuthorityError ? err.code : 'INVALID'
       log.warn('turn_lease_renew_verify_failed', { requestId, code })
@@ -139,133 +138,127 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         return
       }
 
-      const evidence = await client.query<{
-        request_id: string
-        state: string
-        source: string | null
+      // This immutable mapping follows open-dispatch retention (never GC).
+      // Once turn_key is bound, renewal is a constant-size point lookup and
+      // remains valid across arbitrarily long tools and journal retention.
+      const dispatch = await client.query<{
         turn_key: string | null
-        created_at_ms: string
+        canonical_model: string
+        attempt_no: number
+        dispatch_attempt_no: number
+        status: string
+        terminal_at: Date | null
+        producer_fenced_at: Date | null
+        agent_container_id: string | null
       }>(
-        `SELECT request_id, state, ctx->>'source' AS source,
-                ctx->>'turnKey' AS turn_key,
-                FLOOR(EXTRACT(EPOCH FROM created_at) * 1000)::bigint::text AS created_at_ms
-           FROM request_finalize_journal
-          WHERE user_id=$1 AND container_id=$2
-            AND ctx->>'authorityTurnId'=$3
-            AND created_at >= NOW() - INTERVAL '13 hours'
-          ORDER BY request_id
-          FOR UPDATE`,
-        [identity.userId, identity.containerId, lease.authorityTurnId],
+        `SELECT atd.turn_key, atd.canonical_model, atd.attempt_no,
+                td.attempt_no AS dispatch_attempt_no, td.status, td.terminal_at,
+                td.producer_fenced_at, td.agent_container_id::text
+           FROM authority_turn_dispatches atd
+           JOIN turn_dispatches td ON td.dispatch_id=atd.dispatch_id
+          WHERE atd.authority_turn_id=$1 AND atd.user_id=$2
+          FOR UPDATE OF atd, td`,
+        [lease.authorityTurnId, identity.userId],
       )
-      // Lease-only engines (Cursor Sand) never send main-model traffic through
-      // the egress proxy, so no request_finalize_journal row exists for the
-      // turn. The bridge binds the minted authorityTurnId to the durable
-      // dispatch instead; an open (non-terminal) dispatch binding is therefore
-      // equally valid proof that the turn is still active.
-      let evidenceSource: 'journal' | 'dispatch' = 'journal'
-      let dispatchStartedAt: number | null = null
-      if (!evidence.rowCount) {
-        const dispatchEvidence = await client.query<{ created_at_ms: string }>(
-          `SELECT FLOOR(EXTRACT(EPOCH FROM atd.created_at) * 1000)::bigint::text AS created_at_ms
-             FROM authority_turn_dispatches atd
-             JOIN turn_dispatches td ON td.dispatch_id = atd.dispatch_id
-            WHERE atd.authority_turn_id=$1 AND atd.user_id=$2
-              AND td.status IN ('admitted','accepted')
-              AND td.terminal_at IS NULL
-              AND atd.created_at >= NOW() - INTERVAL '13 hours'
-            FOR UPDATE OF td`,
-          [lease.authorityTurnId, identity.userId],
-        )
-        if (!dispatchEvidence.rowCount) {
-          await client.query('ROLLBACK')
-          sendJson(res, 409, {
-            error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence not found' },
-          })
-          return
-        }
-        evidenceSource = 'dispatch'
-        dispatchStartedAt = Number(dispatchEvidence.rows[0]!.created_at_ms)
+      const active = dispatch.rows[0]
+      if (active && (
+        !['admitted', 'accepted'].includes(active.status) ||
+        active.terminal_at !== null || active.producer_fenced_at !== null ||
+        active.attempt_no !== active.dispatch_attempt_no ||
+        active.canonical_model !== lease.canonicalModel ||
+        active.agent_container_id !== String(identity.containerId)
+      )) {
+        await client.query('ROLLBACK')
+        sendJson(res, 409, { error: { code: 'TURN_NOT_ACTIVE', message: 'active turn identity rejected' } })
+        return
+      }
+      // Expired signatures authenticate identity only. A historical journal
+      // can never reactivate a completed/revoked dispatch.
+      if (!active && lease.expiresAt <= now) {
+        await client.query('ROLLBACK')
+        sendJson(res, 409, { error: { code: 'TURN_NOT_ACTIVE', message: 'active dispatch not found' } })
+        return
+      }
+      if (active?.turn_key !== null && active?.turn_key !== undefined && active.turn_key !== raw.turnKey) {
+        await client.query('ROLLBACK')
+        sendJson(res, 409, { error: { code: 'TURN_KEY_MISMATCH', message: 'turn key does not match active dispatch' } })
+        return
       }
 
-      const evidenceStartedAt =
-        dispatchStartedAt !== null
-          ? dispatchStartedAt
-          : Math.min(...evidence.rows.map((row) => Number(row.created_at_ms)))
-      if (!Number.isSafeInteger(evidenceStartedAt)) {
-        await client.query('ROLLBACK')
-        sendJson(res, 409, {
-          error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence is malformed' },
-        })
-        return
-      }
-      // Keep the signed v1 lease wire shape unchanged for rolling old
-      // gateways/egress readers. The absolute lifetime anchor is durable
-      // server evidence, not a new lease field that old strict parsers reject.
-      // A previously experimental originalIssuedAt is accepted only as a
-      // conservative earlier bound, then stripped from the renewed envelope.
-      const absoluteStartedAt = Math.min(
-        evidenceStartedAt,
-        lease.issuedAt,
-        lease.originalIssuedAt ?? Number.POSITIVE_INFINITY,
-      )
-      const absoluteExpiresAt = absoluteStartedAt + AUTHORITY_TURN_MAX_LIFETIME_MS
-      if (now >= absoluteExpiresAt) {
-        await client.query('ROLLBACK')
-        sendJson(res, 409, {
-          error: { code: 'TURN_LIFETIME_EXCEEDED', message: 'turn lifetime exceeded' },
-        })
-        return
-      }
-      // Proxy journals already carry the gateway's signed-attribution
-      // turnKey. Codex bridge journals are admitted one hop earlier (before
-      // the gateway derives its lossless key), so the first authenticated
-      // renewal binds that one still-inflight row exactly once. Thereafter a
-      // different key is rejected rather than creating a second billing lane.
-      // Dispatch-bound evidence carries no turnKey (the dispatch row is the
-      // billing anchor), so the journal key binding below only applies to
-      // journal evidence.
-      const conflicting =
-        evidenceSource === 'journal'
-        && evidence.rows.some((row) => row.turn_key !== null && row.turn_key !== raw.turnKey)
-      if (conflicting) {
-        await client.query('ROLLBACK')
-        sendJson(res, 409, {
-          error: { code: 'TURN_KEY_MISMATCH', message: 'turn key does not match active evidence' },
-        })
-        return
-      }
-      if (evidenceSource === 'journal' && !evidence.rows.some((row) => row.turn_key === raw.turnKey)) {
-        const bindable = evidence.rows.filter(
-          (row) =>
-            row.turn_key === null && row.state === 'inflight' && row.source === 'codex_bridge',
+      const evidenceSource: 'journal' | 'dispatch' = active ? 'dispatch' : 'journal'
+      if (!active || active.turn_key === null) {
+        // First-bind compatibility only: bounded time window, scalar existence
+        // checks, and at most two Codex candidate ids. Never load the complete
+        // request history or derive a total task deadline from journal age.
+        const evidence = await client.query<{
+          conflicting: boolean
+          matching: boolean
+          bindable: string[]
+        }>(
+          `SELECT
+             EXISTS(SELECT 1 FROM request_finalize_journal
+               WHERE user_id=$1 AND container_id=$2 AND ctx->>'authorityTurnId'=$3
+                 AND created_at >= to_timestamp($5::double precision / 1000)
+                 AND ctx->>'turnKey' IS NOT NULL AND ctx->>'turnKey'<>$4
+               LIMIT 1) AS conflicting,
+             EXISTS(SELECT 1 FROM request_finalize_journal
+               WHERE user_id=$1 AND container_id=$2 AND ctx->>'authorityTurnId'=$3
+                 AND created_at >= to_timestamp($5::double precision / 1000)
+                 AND ctx->>'turnKey'=$4 LIMIT 1) AS matching,
+             ARRAY(SELECT request_id FROM request_finalize_journal
+               WHERE user_id=$1 AND container_id=$2 AND ctx->>'authorityTurnId'=$3
+                 AND created_at >= to_timestamp($5::double precision / 1000)
+                 AND ctx->>'turnKey' IS NULL AND ctx->>'source'='codex_bridge'
+                 AND state='inflight'
+               ORDER BY request_id LIMIT 2 FOR UPDATE) AS bindable`,
+          [identity.userId, identity.containerId, lease.authorityTurnId,
+            raw.turnKey, now - 13 * 60 * 60_000],
         )
-        if (evidence.rows.length !== 1 || bindable.length !== 1) {
+        const proof = evidence.rows[0]
+        if (!proof || proof.conflicting) {
           await client.query('ROLLBACK')
-          sendJson(res, 409, {
-            error: { code: 'TURN_NOT_ACTIVE', message: 'active turn key is not bound' },
-          })
+          sendJson(res, 409, { error: { code: 'TURN_KEY_MISMATCH', message: 'turn key conflicts with active evidence' } })
           return
         }
-        const bound = await client.query(
-          `UPDATE request_finalize_journal
-              SET ctx=jsonb_set(ctx,'{turnKey}',to_jsonb($2::text),true),
-                  updated_at=NOW()
-            WHERE request_id=$1 AND state='inflight'
-              AND ctx->>'source'='codex_bridge'
-              AND ctx->>'turnKey' IS NULL`,
-          [bindable[0]!.request_id, raw.turnKey],
-        )
-        if ((bound.rowCount ?? 0) !== 1) {
-          await client.query('ROLLBACK')
-          sendJson(res, 409, {
-            error: { code: 'TURN_NOT_ACTIVE', message: 'active turn key binding lost' },
-          })
-          return
+        if (!active && !proof.matching) {
+          // Legacy Codex admissions precede gateway turn-key derivation.
+          // Preserve the one-row inflight first binding for unexpired leases.
+          if (proof.bindable.length !== 1) {
+            await client.query('ROLLBACK')
+            sendJson(res, 409, { error: { code: 'TURN_NOT_ACTIVE', message: 'active turn evidence not found' } })
+            return
+          }
+          const bound = await client.query(
+            `UPDATE request_finalize_journal
+                SET ctx=jsonb_set(ctx,'{turnKey}',to_jsonb($2::text),true), updated_at=NOW()
+              WHERE request_id=$1 AND state='inflight'
+                AND ctx->>'source'='codex_bridge' AND ctx->>'turnKey' IS NULL`,
+            [proof.bindable[0], raw.turnKey],
+          )
+          if (bound.rowCount !== 1) {
+            await client.query('ROLLBACK')
+            sendJson(res, 409, { error: { code: 'TURN_NOT_ACTIVE', message: 'active turn key binding lost' } })
+            return
+          }
+        }
+        if (active) {
+          // Lease-only Cursor has no proxy journals. Authenticated exact
+          // dispatch identity permits its first binding, atomically once.
+          const bound = await client.query(
+            `UPDATE authority_turn_dispatches SET turn_key=$3
+              WHERE authority_turn_id=$1 AND user_id=$2 AND turn_key IS NULL`,
+            [lease.authorityTurnId, identity.userId, raw.turnKey],
+          )
+          if (bound.rowCount !== 1) {
+            await client.query('ROLLBACK')
+            sendJson(res, 409, { error: { code: 'TURN_KEY_MISMATCH', message: 'durable turn key binding lost' } })
+            return
+          }
         }
       }
 
       const epoch = await client.query<{ epoch: string }>(
-        'SELECT epoch::text AS epoch FROM model_security_epoch WHERE id',
+        'SELECT epoch::text AS epoch FROM model_security_epoch WHERE id FOR SHARE',
       )
       if (!epoch.rowCount || BigInt(epoch.rows[0]!.epoch) !== BigInt(lease.securityEpoch)) {
         await client.query('ROLLBACK')
@@ -275,7 +268,7 @@ export function makeTurnLeaseRenewHandler(deps: TurnLeaseRenewHandlerDeps): Turn
         return
       }
 
-      const expiresAt = Math.min(now + TURN_LEASE_TTL_MS, absoluteExpiresAt)
+      const expiresAt = now + TURN_LEASE_TTL_MS
       const { originalIssuedAt: _legacyOriginalIssuedAt, ...legacyWireLease } = lease
       const renewed = {
         ...legacyWireLease,

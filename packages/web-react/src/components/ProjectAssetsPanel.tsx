@@ -104,7 +104,7 @@ export function ProjectAssetsPanel(props: {
           density="compact"
           action={
             <Button variant="secondary" size="sm" onClick={reload}>
-              重试
+              继续
             </Button>
           }
         >
@@ -372,7 +372,7 @@ function DownloadControl({
   }
   return (
     <IconButton
-      aria-label={state === "error" ? `重试下载 ${filename}` : `下载 ${filename}`}
+      aria-label={state === "error" ? `继续下载 ${filename}` : `下载 ${filename}`}
       variant="muted"
       size="sm"
       shape="square"

@@ -1,6 +1,7 @@
 import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import { encodeUpstreamRetryHint } from '@openclaude/protocol';
-import { waitForRetryDelay } from '../sessionTurnRunner.js';
+import { waitForRetryDelay, _runOneTurn as runOneTurnAttempt, type TurnRunnerHost } from '../sessionTurnRunner.js';
+import { createServer } from 'node:http';
 /**
  * SessionManager × EngineAdapter turn 编排回归测试(M0)。
  *
@@ -32,7 +33,7 @@ import {
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
-import type { SubprocessRunner } from "../subprocessRunner.js";
+import type { SubprocessRunner, TurnModelAuthority } from "../subprocessRunner.js";
 import {
   setV3MasterSinkSingleton,
   type V3MasterSink,
@@ -69,6 +70,7 @@ function makeConfigStub(): OpenClaudeConfig {
 type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
 
 class FakeCcbRunner extends MinimalPrivacyRunner {
+  pinBoxNativeHarness(): 'ccb' { return 'ccb'; }
   lastActivityAt = Date.now();
   /** Warm process by default so legacy sequence assertions see no synthetic
    * engine_starting frame; cold-start tests flip this to false. */
@@ -210,6 +212,149 @@ function makeSession(
     ...over,
   } as unknown as AgentSession;
 }
+
+describe('long-task authority interruption keeps paid progress', () => {
+  for (const kind of ['text', 'thinking', 'tool', 'empty'] as const) {
+    test(`authority expiry after ${kind} preserves progress and only empty proposes waiver`, async () => {
+      const captured = makeCapturingSink();
+      setV3MasterSinkSingleton(captured.sink);
+      try {
+        const raw = 'API Error: 403 {"error":{"code":"MODEL_AUTHORITY_INVALID","message":"private authority detail"}}';
+        const runner = new FakeCcbRunner((r) => setImmediate(() => {
+          if (kind === 'text') r.text('已完成前半部分');
+          if (kind === 'thinking') r.thinking('已有分析过程');
+          if (kind === 'tool') r.toolPair('paid-step', 'Read', '');
+          r.msg({ type: 'assistant', error: 'auth', message: { content: [{ type: 'text', text: raw }] } });
+          r.result({ is_error: true, subtype: 'error_during_execution', result: raw, errors: [raw] });
+        }));
+        const session = makeSession(runner, { channel: 'webchat', userId: 'user-1' });
+        await runOneTurn(new SessionManager(makeConfigStub()), session, []);
+        assert.equal(captured.payloads.length, 1);
+        const payload = captured.payloads[0]!;
+        assert.equal(payload.errorCode, 'MODEL_AUTHORITY_EXPIRED');
+        assert.equal(payload.waiveReason, kind === 'empty' ? 'platform_authority_expired' : undefined);
+        if (kind === 'text') assert.equal(payload.text, '已完成前半部分');
+        if (kind === 'thinking') assert.equal(payload.thinkingText, '已有分析过程');
+        if (kind === 'tool') assert.equal(payload.tools?.[0]?.blockId, 'paid-step');
+        assert.doesNotMatch(JSON.stringify(payload), /private authority detail|MODEL_AUTHORITY_INVALID/);
+      } finally { setV3MasterSinkSingleton(null); }
+    });
+  }
+  test('retry refresh rejection preserves prior progress and never submits the old ticket', async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+    const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+    let received = 0;
+    const server = createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      received++;
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 'TURN_LEASE_EXPIRED', message: 'private stale ticket' } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+    try {
+      const runner = new FakeCcbRunner(() => { throw new Error('stale ticket must not be submitted'); });
+      const session = makeSession(runner, { channel: 'webchat', userId: 'user-1',
+        _externalTurnAbort: new AbortController() });
+      const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
+      await runOneTurnAttempt.call(new SessionManager(makeConfigStub()) as unknown as TurnRunnerHost,
+        session, 'continue', () => {}, 'req-refresh-denied', 'trace-refresh-denied', undefined,
+        'srv-engine-peer-main-t1', undefined, undefined, 'a'.repeat(64), 'u1', authority,
+        [], [{ index: 0, text: '此前的真实回答', ts: Date.now() }],
+        [{ index: 0, text: '此前的分析', ts: Date.now() }], [], [], false, true, true, false, 1);
+      assert.equal(received, 1);
+      assert.equal(runner.submittedInputs.length, 0);
+      assert.equal(captured.payloads[0]?.text, '此前的真实回答');
+      assert.equal(captured.payloads[0]?.thinkingText, '此前的分析');
+      assert.equal(captured.payloads[0]?.errorCode, 'MODEL_AUTHORITY_EXPIRED');
+      assert.equal(captured.payloads[0]?.waiveReason, undefined);
+      assert.doesNotMatch(JSON.stringify(captured.payloads), /private stale ticket|old-lease/);
+    } finally {
+      setV3MasterSinkSingleton(null);
+      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
+      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+  test('successful retry refresh followed by synchronous submit failure rejects without hanging', { timeout: 10_000 }, async () => {
+    const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+    const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+    const server = createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ lease: 'fresh-lease', expiresAt: Date.now() + 60_000 }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+    try {
+      const runner = new FakeCcbRunner(() => {});
+      const session = makeSession(runner, { _externalTurnAbort: new AbortController() });
+      session.runner.submitTurn = () => { throw new Error('synchronous engine submission failed'); };
+      const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
+      await assert.rejects(runOneTurnAttempt.call(new SessionManager(makeConfigStub()) as unknown as TurnRunnerHost,
+        session, 'continue', () => {}, 'req-submit-throw', undefined, undefined,
+        undefined, undefined, undefined, 'c'.repeat(64), 'u1', authority,
+        [], [], [], [], [], false, true, true, false, 1), /synchronous engine submission failed/);
+      assert.equal(authority.leaseEnvelope, 'fresh-lease');
+    } finally {
+      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
+      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+  test('Stop during retry refresh retains USER_CANCELLED and does not propose waiver', async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+    const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+    let arrived!: () => void;
+    const requestArrived = new Promise<void>((resolve) => { arrived = resolve; });
+    const server = createServer(async (req) => {
+      for await (const _chunk of req) { /* drain */ }
+      arrived(); // response intentionally waits for Stop to abort the refresh
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
+    try {
+      const runner = new FakeCcbRunner(() => { throw new Error('stopped retry must not submit'); });
+      const controller = new AbortController();
+      const session = makeSession(runner, { channel: 'webchat', userId: 'user-1', _externalTurnAbort: controller });
+      const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
+      const run = runOneTurnAttempt.call(new SessionManager(makeConfigStub()) as unknown as TurnRunnerHost,
+        session, 'continue', () => {}, 'req-refresh-stop', undefined, undefined,
+        undefined, undefined, undefined, 'b'.repeat(64), 'u1', authority,
+        [], [{ index: 0, text: '已保存回答', ts: Date.now() }], [], [], [], false, true, true, false, 1);
+      await requestArrived;
+      const persisted = session._persistActiveTurn?.('interrupted', '用户已停止', 'USER_CANCELLED');
+      controller.abort(new Error('user stopped'));
+      await persisted;
+      await run;
+      assert.equal(runner.submittedInputs.length, 0);
+      assert.equal(captured.payloads[0]?.errorCode, 'USER_CANCELLED');
+      assert.equal(captured.payloads[0]?.waiveReason, undefined);
+      assert.equal(captured.payloads[0]?.text, '已保存回答');
+    } finally {
+      setV3MasterSinkSingleton(null);
+      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
+      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
 
 async function runOneTurn(
   sm: SessionManager,

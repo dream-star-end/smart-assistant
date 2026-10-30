@@ -359,7 +359,7 @@ export function InboxDialog({
           >
             <p className="text-body text-danger">{err}</p>
             <Button variant="secondary" size="sm" onClick={retry}>
-              重试
+              继续
             </Button>
           </div>
         ) : messages.length === 0 ? (
@@ -399,7 +399,7 @@ export function InboxDialog({
                   onClick={loadMore}
                   className="text-danger"
                 >
-                  加载失败，点击重试
+                  加载失败，点击继续
                 </Button>
               </div>
             ) : hasMore ? (

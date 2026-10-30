@@ -66,12 +66,10 @@ export function TurnStatusCard({
   currentTurn: boolean;
 }) {
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
-  const retryTarget = msg._clientMessageId
-    ? cb.resolveRetryTarget?.(msg._clientMessageId)
+  const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
+  const retry = source && cb.onContinueInterrupted
+    ? { label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }
     : undefined;
-  const retry = retryTarget && cb.onRetrySend
-    ? { label: "重试", onClick: () => cb.onRetrySend?.(retryTarget) }
-    : cb.onRegenerate ? { label: "重新尝试", onClick: cb.onRegenerate } : undefined;
   const details = {
     code: msg._errorCode,
     requestId: msg.usage?.traceId,

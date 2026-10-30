@@ -1213,11 +1213,11 @@ export function AttachChip({
         <button
           type="button"
           onClick={onRetry}
-          aria-label={`重试上传 ${a.name}`}
+          aria-label={`继续上传 ${a.name}`}
           className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-medium text-danger hover:bg-danger/10 [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-2.5"
         >
           <RotateCcw size={12} />
-          重试
+          继续
         </button>
       )}
       {(onAnnotate || annotateDisabledReason) && (

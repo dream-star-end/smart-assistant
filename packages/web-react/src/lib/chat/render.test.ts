@@ -332,8 +332,9 @@ describe("errorLabel / stripMarkdown", () => {
     expect(presented).toEqual({
       // W3:展示用的归一化码(查错误目录用,不进正文)。
       code: "model_authority_expired",
-      title: "任务未正常完成",
-      message: "长任务的执行凭证未能继续。你的消息已保留，可以重新尝试。",
+      fixedMessage: true,
+      title: "任务暂时中断",
+      message: "已有进度已保留。可以从断点继续；已完成的调用按实际用量计费。",
       detail: "请求 ID：9cad8ad4bf74b7050694873e6ab16b01",
       waived: false,
     });
@@ -346,6 +347,24 @@ describe("errorLabel / stripMarkdown", () => {
     expect(presented.title).toBe("本轮已自动免单");
     expect(presented.message).toContain("已发送站内信说明");
     expect(presented.waived).toBe(true);
+  });
+  test("INC-20261030-LONGTASK-CONTINUE: authority interruption keeps the partial answer and actual-usage copy", () => {
+    const answer = "导出器的测试已经通过，已保存修改。";
+    const raw = 'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"forbidden"}}';
+    for (const code of ["MODEL_AUTHORITY_EXPIRED", "turn_limit"]) {
+      const presented = errorPresentation(code, `${answer}\n\n${raw}`, raw);
+      expect(presented.title).toBe("任务暂时中断");
+      expect(presented.bodyText).toBe(answer);
+      expect(presented.fixedMessage).toBe(true);
+      expect(presented.message).toContain("从断点继续");
+      expect(presented.message).toContain("实际用量计费");
+      expect(presented.waived).toBe(false);
+      expect(JSON.stringify(presented)).not.toMatch(/forbidden|403|不收费|退回|自动免单/);
+    }
+    expect(errorPresentation("MODEL_AUTHORITY_EXPIRED", "MODEL_AUTHORITY_EXPIRED", "MODEL_AUTHORITY_EXPIRED").bodyText).toBeUndefined();
+    const historical = errorPresentation("MODEL_AUTHORITY_EXPIRED", answer, undefined, true);
+    expect(historical.waived).toBe(true);
+    expect(historical.bodyText).toBe(answer);
   });
   test("ENGINE_ERROR 不把 JSON/英文堆栈作为正文或详情展示", () => {
     const raw = '{"error":"API Error","code":"UPSTREAM"}\n at run (/srv/app.js:1:2)';

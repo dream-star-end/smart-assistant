@@ -103,3 +103,15 @@ test("same signed turn coalesces concurrent stop requests without duplicate remo
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("an authenticated Stop durably cancels the rollover gap before looking for another run", async () => {
+  const calls: string[] = [];
+  const result = await invoke({ identity: { resolve: async () => ({ uid: 3n,containerId: 7n }) } as never,
+    journal: { cancelToolRollovers: async (input: { uid: bigint; containerId: bigint }) => {
+      assert.equal(input.uid,3n); assert.equal(input.containerId,7n); calls.push("cancel-gap"); return true;
+    },findCancelableRun: async () => {
+      calls.push("lookup"); throw new BoxDurableJournalError("BOX_CANCEL_RUN_UNKNOWN");
+    } } as never,coordinator: { requestStop: async () => { throw new Error("no live generation"); } } as never });
+  assert.deepEqual(result,{ status: 200,result: { status: "stopped" } });
+  assert.deepEqual(calls,["cancel-gap","lookup"]);
+});

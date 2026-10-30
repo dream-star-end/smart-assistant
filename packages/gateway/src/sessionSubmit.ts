@@ -97,7 +97,6 @@ import { CCB_PROVIDER_TAG, normalizeEngineTag } from './resumeStore.js'
 import { adoptRunContext } from './runContextPersist.js'
 import { deriveLosslessTurnKey, getV3MasterSinkOrNull } from './v3MasterSink.js'
 import {
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
   collectModelHistoryMediaPathHints,
   modelHistorySemanticRole,
   modelHistorySemanticText,
@@ -387,13 +386,6 @@ function persistServerAuthoredTurn(
 
 class TurnIdleTimeoutError extends Error {
   readonly code = 'TURN_IDLE_TIMEOUT'
-}
-
-class TurnHardLimitError extends Error {
-  readonly code = 'TURN_HARD_LIMIT'
-  constructor() {
-    super('turn reached the platform 12 hour execution limit')
-  }
 }
 
 export async function submit(
@@ -1281,21 +1273,13 @@ export async function submit(
     // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
     // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
     const CHECK_INTERVAL = 15_000 // check every 15s
-    const logicalTurnStartedAt = Date.now()
     let livenessTimer: NodeJS.Timeout | null = null
     assertSessionCurrent()
     closeHelpLogical = getSystemHelpRelay(this)?.begin(session, opts?.systemHelpBootstrap)
     const livenessPromise = new Promise<never>((_, reject) => {
       livenessTimer = setInterval(() => {
-        if (Date.now() - logicalTurnStartedAt >= AUTHORITY_TURN_MAX_LIFETIME_MS) {
-          const error = new TurnHardLimitError()
-          logicalTurnAbort.abort(error)
-          reject(error)
-          return
-        }
-        // A blocking Codex requestUserInput is an explicit human wait, not
-        // engine silence. Keep checking the immutable 12h hard limit above,
-        // but never turn a pending question into LIVENESS_TIMEOUT/waiver.
+        // A blocking requestUserInput is an explicit human wait, not silence.
+        // Active logical turns have no total wall-clock deadline.
         const idleMs = Date.now() - (
           session.runner.idleWatchdogActivityAt ?? session.runner.lastActivityAt
         )
@@ -1378,27 +1362,6 @@ export async function submit(
         { sessionKey: session.sessionKey, ...(traceId ? { traceId } : {}) },
         err,
       )
-    } else if (err instanceof TurnHardLimitError || err?.code === 'TURN_HARD_LIMIT') {
-      const persistLimitedTurn = session._persistActiveTurn
-      try {
-        session.runner.interrupt()
-      } catch {}
-      const reason =
-        '任务已达到 12 小时运行上限，系统已中断。本轮已自动免单，积分将原路退回；请重新发起。'
-      if (persistLimitedTurn) {
-        const persistence = persistLimitedTurn('interrupted', reason, 'TURN_LIMIT', 'turn_limit')
-        this._trackPersistence(persistence)
-        await persistence
-      } else {
-        onEvent({ kind: 'error', error: reason })
-      }
-      await logicalTurnRun?.catch((runErr) => {
-        if (runErr !== logicalTurnAbort.signal.reason) throw runErr
-      })
-      log.warn('turn hard limit reached, interrupted', {
-        sessionKey: session.sessionKey,
-        ...(traceId ? { traceId } : {}),
-      })
     } else {
       unhandledTurnError = err
       throw err

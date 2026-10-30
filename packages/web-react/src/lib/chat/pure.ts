@@ -822,12 +822,12 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   user_cancelled: "本轮已取消。",
   runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
   // ── 免单类(waivable;errorPresentation 走 waiver 分支,此处仅供契约完备 + 兜底展示)──
-  model_authority_expired: "长任务的执行凭证未能继续，本轮不收费，你可以重新尝试。",
+  model_authority_expired: "任务暂时中断，已有进度已保留，可以从断点继续。",
   liveness_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   idle_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   no_response: "任务未能产生有效回复，本轮未扣费。",
   phantom_turn: "任务未能产生有效回复，本轮未扣费。",
-  turn_limit: "任务达到运行上限，系统已中断，本轮不收费。",
+  turn_limit: "任务暂时中断，已有进度已保留，可以从断点继续。",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   // 拒帧可能发生在回合中途(egress 每请求 fence):停止前已完成的调用已经照常计费,只有被拒的
   // 这一次不计费 —— 文案不能说整轮不计费(2026-10-06 一轮 22 次调用 275 积分后被拒,卡片却写

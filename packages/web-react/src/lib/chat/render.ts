@@ -605,7 +605,7 @@ const ERROR_LABELS: Record<string, string> = {
   user_cancelled: "已取消本轮",
   runner_crashed: "执行环境异常中断",
   // ── 免单类 ──
-  model_authority_expired: "本轮已自动免单",
+  model_authority_expired: "任务暂时中断",
   liveness_timeout: "本轮已自动免单",
   idle_timeout: "本轮已自动免单",
   no_response: "本轮已自动免单",
@@ -889,6 +889,9 @@ export function errorPresentation(
     };
   }
   if (waiverEligible && waiverApplied) {
+    const partialAnswer = normalized === "model_authority_expired" || normalized === "turn_limit"
+      ? partialAnswerBody(text)
+      : "";
     const message = normalized === "turn_limit"
       ? "任务达到 12 小时运行上限，系统已中断。本轮不收费；如已扣除，积分已原路退回，并已发送站内信说明。"
       : normalized === "liveness_timeout" || normalized === "idle_timeout"
@@ -901,8 +904,24 @@ export function errorPresentation(
       fixedMessage: true,
       title: "本轮已自动免单",
       message,
+      ...(partialAnswer && partialAnswer !== code && partialAnswer !== detail ? { bodyText: partialAnswer } : {}),
       ...(ref ? { detail: `请求 ID：${ref}` } : {}),
       waived: true,
+    };
+  }
+  if (normalized === "model_authority_expired" || normalized === "turn_limit") {
+    const body = text?.trim() ?? "";
+    const partialAnswer = !body || body === code?.trim() || body === detail?.trim()
+      ? ""
+      : partialAnswerBody(body);
+    return {
+      code: normalized,
+      fixedMessage: true,
+      title: "任务暂时中断",
+      message: "已有进度已保留。可以从断点继续；已完成的调用按实际用量计费。",
+      ...(partialAnswer ? { bodyText: partialAnswer } : {}),
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: false,
     };
   }
   if (waiverEligible) {

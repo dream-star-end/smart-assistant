@@ -712,7 +712,7 @@ function DeferredTapeRecordCard({
           }}
           className="text-muted underline-offset-2 hover:text-fg hover:underline"
         >
-          {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
+          {isUserPayload ? "完整用户消息加载失败，点击继续" : "真实记录加载失败，点击继续"}
         </button>
       ) : (
         <span>{isUserPayload ? "正在读取完整用户消息…" : "正在读取真实 Agent 记录…"}</span>
@@ -1489,7 +1489,7 @@ export type MessageListArchive = {
   archivedThroughSeq?: number;
   /** 云端加载进行中(按钮转 loading 态、禁用)。 */
   loading: boolean;
-  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
+  /** 上次云端加载失败(按钮转「加载失败，点击继续」,点击即重试)。 */
   error: boolean;
   /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
   onLoadOlder: () => void | Promise<void>;
@@ -2666,7 +2666,7 @@ export function MessageList({
         {liveUnitsBusy
           ? <><Spinner size={12} /> 加载中…</>
           : liveAttention === "error"
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : "加载更早的处理步骤"}
       </button>
     </div>
@@ -2851,7 +2851,7 @@ export function MessageList({
           : windowStart === 0 && (archive?.loading || archiveQueued)
           ? <><Spinner size={12} /> 加载中…</>
           : windowStart === 0 && archive?.error
-            ? <span className="text-danger">加载失败，点击重试</span>
+            ? <span className="text-danger">加载失败，点击继续</span>
             : windowStart > 0
               ? `查看更早历史记录（还有 ${windowStart} 条）`
               : legacyArchivedRemaining > 0
@@ -3107,7 +3107,7 @@ export function MessageList({
               {archive?.loading || archiveQueued
                 ? <><Spinner size={12} /> 加载中…</>
                 : archive?.error
-                  ? <span className="text-danger">加载失败，点击重试</span>
+                  ? <span className="text-danger">加载失败，点击继续</span>
                   : "搜更早"}
             </button>
           </div>

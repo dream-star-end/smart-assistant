@@ -306,7 +306,7 @@ export function GithubRepoModal({
                   size="sm"
                   onClick={() => void loadLink()}
                 >
-                  重试
+                  继续
                 </Button>
               </div>
             ) : link && !link.linked ? (

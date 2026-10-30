@@ -144,7 +144,7 @@ describe("产出页", () => {
     expect(screen.getByTestId("outputs-hero-origin")).toHaveTextContent("容器里的当前文件");
     // 测试环境没有签名通道 → 读取失败,给重试
     expect(await screen.findByText("没能读取这个文件（可能已被移动或删除）。")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 
   test("读容器文件的回落:文件又被改过(新的一次 Edit 完成)就重读", async () => {

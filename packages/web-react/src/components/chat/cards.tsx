@@ -791,16 +791,16 @@ export function UserCard({
             </button>
           )}
           {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
-          {status === "error" && cb?.onRetrySend && (
+          {status === "error" && cb?.onContinueInterrupted && (
             <button
               type="button"
-              onClick={() => cb.onRetrySend?.(msg)}
+              onClick={() => cb.onContinueInterrupted?.(msg)}
               className={cn(
                 "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11",
                 cancelledByUser ? "bg-card text-fg" : "bg-danger-soft text-danger",
               )}
             >
-              <RotateCcw size={11} /> {cancelledByUser ? "重新发送" : "重试"}
+              <RotateCcw size={11} /> 继续
             </button>
           )}
         </div>
@@ -972,7 +972,7 @@ export function AssistantCard({
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
   const shownMessage = isEmptyNoReply
-    ? "模型没有生成内容，本轮未扣费。点重试再发一次。"
+    ? "模型没有生成新回复。可以在当前会话继续，已完成的调用按实际用量计费。"
     : (frozenCard?.message ?? presentedError?.message);
   // W3:正文用错误目录的人话 —— 帧带的 userError 优先,否则由懒加载的错误卡按码查目录;免单 /
   // 未计费 / 收尾 / 开通引导 / 恢复被跳过这类这一轮特有的说法用 fixedBody。冻结快照按提交时的
@@ -985,9 +985,7 @@ export function AssistantCard({
       ? creditsCopy.message
       : isEmptyNoReply || presentedError?.fixedMessage ? shownMessage : undefined);
   const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
-  // 「精确重试」资格:非免单 + 该码可重试 + cta∈{retry,retry_or_switch} + 会话内能定位到带完整
-  // payload 的原 user 行(_clientMessageId 命中且 status='error')。任一不满足 → 「重新尝试」走
-  // onRegenerate 重发最后一条(现状语义)。
+  // Source lookup is retained for editing; execution always uses Continue.
   const retryEligible =
     !!presentedError &&
     !presentedError.waived &&
@@ -1001,11 +999,10 @@ export function AssistantCard({
   // 充值、新建会话、联系管理员是导航,不受此门控。
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
-    isLastTurn && ctx.isLast
+    isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast)
       ? cb.resolveInterruptedContinuation?.(msg)
       : undefined;
   const showInterruptedContinuation =
-    !msg._recoverySkippedNotice &&
     !!interruptedContinuationTarget &&
     !!cb.onContinueInterrupted;
   useEffect(() => {
@@ -1107,11 +1104,11 @@ export function AssistantCard({
             title="这轮没有回复"
           >
             <div className="min-w-0">
-              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以重试。</p>
-              {isLastTurn && cb.onRegenerate && (
+              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以在当前会话继续。</p>
+              {isLastTurn && showInterruptedContinuation && (
                 <div className="mt-2.5">
-                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
-                    <RotateCcw size={14} /> 重试
+                  <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                    <RotateCcw size={14} /> 继续
                   </Button>
                 </div>
               )}
@@ -1128,7 +1125,7 @@ export function AssistantCard({
                   ? "模型暂停了本轮（通常因长任务超时），可让它继续。"
                   : "回复达到长度上限被截断，可让模型继续写。"}
               </span>
-              {cb.onContinue && (
+              {isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast) && cb.onContinue && (
                 <Button size="sm" variant="secondary" shape="pill" onClick={cb.onContinue}>
                   继续
                 </Button>
@@ -1156,6 +1153,11 @@ export function AssistantCard({
           >
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
+            {showInterruptedContinuation && (
+              <Button size="sm" variant="secondary" shape="pill" onClick={() => cb.onContinueInterrupted?.(msg)}>
+                继续
+              </Button>
+            )}
           </output>
         ) : recoveredStep && sem.automaticRecovery === true ? (
           // OCV5-390: an error the platform retries by itself and that the turn got past is not the
@@ -1193,7 +1195,7 @@ export function AssistantCard({
             tone="attention"
             className="mt-2.5 max-w-full [overflow-wrap:anywhere]"
             title="这句没有发出去"
-            actions={() => isLastTurn && cb.onRegenerate ? [{ label: "重试", onClick: cb.onRegenerate }] : []}
+            actions={() => showInterruptedContinuation ? [{ label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }] : []}
             details={technicalDetails}
             fixedBody={msg._recoverySkippedNotice}
           />

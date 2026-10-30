@@ -69,7 +69,7 @@ describe("OCV5-180 composer owner regressions", () => {
     await act(async () => {
       finish({ kind: "file", url: "/stub/pending-new.txt" });
     });
-    expect(screen.queryByLabelText("重试上传 pending-new.txt")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("继续上传 pending-new.txt")).not.toBeInTheDocument();
     const send = screen.getByRole("button", { name: "发送" });
     expect(send).not.toBeDisabled();
   });

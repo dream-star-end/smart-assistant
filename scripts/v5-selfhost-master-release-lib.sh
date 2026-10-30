@@ -1277,6 +1277,15 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
+  tsum_mark C.box-longtask 2>/dev/null || :
+  tsum_note gateEvidence.box-longtask local 2>/dev/null || :
+  mlog "  Box long-task generations gate @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL -u OCV5_289_JOURNAL_TEST_DATABASE_URL \
+      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-box-longtask.ts --expect-sha "$full_sha" ); then
+    cleanup_master_staging
+    die "pinned Box long-task generations gate 失败"
+  fi
   master_gate_db_drop
   tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"

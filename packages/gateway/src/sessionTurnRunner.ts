@@ -1,4 +1,5 @@
 import { getSystemHelpRelay } from './systemHelpRelay.js'
+import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from './masterTurnLease.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
 import { consumeUnusedPreheat } from './speculativePreheat.js'
 /**
@@ -1395,8 +1396,18 @@ export async function _runOneTurn(
       }
 
       const modelAuthorityFailure = result?.errorKind === 'model_authority'
+      const authorityHasProgress = !!result && (
+        result.assistantText.trim().length > 0 || result.thinkingText.trim().length > 0 ||
+        result.tools.length > 0 || result.usage.outputTokens > 0 ||
+        retryAssistantSegments.some((segment) => segment.text.trim().length > 0) ||
+        retryThinkingSegments.some((segment) => segment.text.trim().length > 0) ||
+        retryTools.length > 0 || retryStructuredBlocks.length > 0 || structuredBlocks.length > 0 ||
+        session._pendingAgentGroups?.some((entry) => entry.ownerTurnKey === undefined || entry.ownerTurnKey === turnKey) === true
+      )
       const modelAuthorityReason = modelAuthorityFailure
-        ? '任务运行时间较长，平台执行凭证未能继续。本轮已自动免单，积分将原路退回；你可以重新尝试。'
+        ? authorityHasProgress
+          ? '任务暂时中断，已生成的内容和步骤已保留。可以从断点继续，已完成的调用按实际用量计费。'
+          : '任务暂时中断。你可以继续。'
         : undefined
       // A generic runner error may be emitted before the remaining stdout
       // drains into a valid terminal result (pipe/error ordering). Preserve
@@ -1458,7 +1469,7 @@ export async function _runOneTurn(
               status: 'crashed' as const,
               reason: modelAuthorityReason!,
               errorCode: 'MODEL_AUTHORITY_EXPIRED',
-              waiveReason: 'platform_authority_expired' as const,
+              ...(authorityHasProgress ? {} : { waiveReason: 'platform_authority_expired' as const }),
             }
           : null)
       if (terminalOverride) {
@@ -2153,69 +2164,109 @@ export async function _runOneTurn(
         session._externalTurnAbort === capturedAbort && capturedAbort !== undefined && !capturedAbort.signal.aborted &&
         !session._plannedTeardown && !session._replacing && !settled && !detached && requestedTerminal === null && turn?.finalized !== true)
     } catch { getSystemHelpRelay(this)?.endAttempt(session) }
-    let submittedTurn: EngineTurnRun
-    try {
-    submittedTurn = runner.submitTurn({
-      input: userTextOrBlocks,
-      ...(queueTurn ? { queueTurn: true } : {}),
-      requestId,
-      ...(turnKey ? { turnKey } : {}),
-      // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
-      // 自取 local_catalog token;codex adapter 不消费本字段)。
-      ...(modelAuthority !== undefined ? { modelAuthority } : {}),
-      traceId,
-      assistantMessageId,
-      thinkingMessageId,
-      toolMessageIdFactory,
-      nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
-      onPostTerminalRuntimeEvent,
-      collabAgentPolicy,
-      ...(session._collabModeTurn === 'advisor' && session._advisorTurn && turnKey
-        ? {
-            consultTurn: {
-              configVersion: session._advisorTurn.configVersion,
-              turnIndex: prevTurns + 1,
-            },
-          }
-        : {}),
-      automaticRetryState,
-      ...(session._usageAttribution ? { usageAttribution: session._usageAttribution } : {}),
-      ...(session._turnCreditBudgetFen !== undefined
-        ? { creditBudgetFen: session._turnCreditBudgetFen }
-        : {}),
-      onEvent: handleEngineEvent,
-      // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /
-      // _lastCcbCumulativeCost(单一权威;回滚由上方 finalizeTurn 就地恢复)。
-      sessionTotals: session,
-      toolUseIdToName: session.toolUseIdToName,
-    })
-    } catch (error) { detach(); throw error }
-    // Capacity is released only after an actual engine submission; cancellation/admission
-    // failures before this point keep the original unused-runner TTL.
-    consumeUnusedPreheat(this, session)
-    turn = submittedTurn
-    // OCV5-435: a Stop that arrived before this run existed ends it now,
-    // through the same user-stop persistence as a Stop on a running turn.
-    if (clientMessageId && this._takePreStartStop(session.peerId, clientMessageId)) {
-      log.info('pre-start stop applied', { sessionKey: session.sessionKey, clientMessageId })
-      this.interrupt(session.sessionKey, 'user')
+    const submitEngineTurn = (): void => {
+      let submittedTurn: EngineTurnRun
+      try {
+      submittedTurn = runner.submitTurn({
+        input: userTextOrBlocks,
+        ...(queueTurn ? { queueTurn: true } : {}),
+        requestId,
+        ...(turnKey ? { turnKey } : {}),
+        // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
+        // 自取 local_catalog token;codex adapter 不消费本字段)。
+        ...(modelAuthority !== undefined ? { modelAuthority } : {}),
+        traceId,
+        assistantMessageId,
+        thinkingMessageId,
+        toolMessageIdFactory,
+        nextDurableEventOrdinal: () => takeDurableEventOrdinal(session),
+        onPostTerminalRuntimeEvent,
+        collabAgentPolicy,
+        ...(session._collabModeTurn === 'advisor' && session._advisorTurn && turnKey
+          ? {
+              consultTurn: {
+                configVersion: session._advisorTurn.configVersion,
+                turnIndex: prevTurns + 1,
+              },
+            }
+          : {}),
+        automaticRetryState,
+        ...(session._usageAttribution ? { usageAttribution: session._usageAttribution } : {}),
+        ...(session._turnCreditBudgetFen !== undefined
+          ? { creditBudgetFen: session._turnCreditBudgetFen }
+          : {}),
+        onEvent: handleEngineEvent,
+        // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /
+        // _lastCcbCumulativeCost(单一权威;回滚由上方 finalizeTurn 就地恢复)。
+        sessionTotals: session,
+        toolUseIdToName: session.toolUseIdToName,
+      })
+      } catch (error) {
+        detach()
+        settle(() => reject(error))
+        return
+      }
+      // Capacity is released only after an actual engine submission; cancellation/admission
+      // failures before this point keep the original unused-runner TTL.
+      consumeUnusedPreheat(this, session)
+      turn = submittedTurn
+      // OCV5-435: a Stop that arrived before this run existed ends it now,
+      // through the same user-stop persistence as a Stop on a running turn.
+      if (clientMessageId && this._takePreStartStop(session.peerId, clientMessageId)) {
+        log.info('pre-start stop applied', { sessionKey: session.sessionKey, clientMessageId })
+        this.interrupt(session.sessionKey, 'user')
+      }
+
+      // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
+      submittedTurn.submitted.catch((err) => {
+        closeHelpAttempt?.()
+        const persistence =
+          requestTerminalPersistence?.('crashed', String(err), 'RUNNER_CRASHED') ?? Promise.resolve()
+        this._trackPersistence(persistence)
+      })
+
+      finalizationDone = submittedTurn.summary.then(finalizeTurn).catch((err) => {
+        // finalizeTurn 自身抛错(编排层内部 bug)时对位旧实现 parser._parseInner
+        // 的 catch → error 事件;并 settle 防 session lock 悬挂(旧实现此路径
+        // 会悬挂,这里顺手加固,正常路径行为不变)。
+        onEvent({ kind: 'error', error: String(err) })
+        settle(() => resolve())
+      })
     }
-
-    // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
-    submittedTurn.submitted.catch((err) => {
-      closeHelpAttempt?.()
-      const persistence =
-        requestTerminalPersistence?.('crashed', String(err), 'RUNNER_CRASHED') ?? Promise.resolve()
-      this._trackPersistence(persistence)
-    })
-
-    finalizationDone = submittedTurn.summary.then(finalizeTurn).catch((err) => {
-      // finalizeTurn 自身抛错(编排层内部 bug)时对位旧实现 parser._parseInner
-      // 的 catch → error 事件;并 settle 防 session lock 悬挂(旧实现此路径
-      // 会悬挂,这里顺手加固,正常路径行为不变)。
-      onEvent({ kind: 'error', error: String(err) })
-      settle(() => resolve())
-    })
+    if (attemptOrdinal > 0 && modelAuthority && turnKey) {
+      const renewalSignal = session._externalTurnAbort?.signal
+      void refreshTurnModelAuthorityLease(turnKey, modelAuthority, { signal: renewalSignal }).then(() => {
+        if (settled || detached || renewalSignal?.aborted) return
+        submitEngineTurn()
+      }).catch(async (error: unknown) => {
+        // Stop/watchdog owns cancellation and its existing terminal code.
+        // An aborted refresh must never repaint USER_CANCELLED as a waiver.
+        if (settled || detached) return
+        if (renewalSignal?.aborted) {
+          detach()
+          settle(() => reject(error))
+          return
+        }
+        if (error instanceof RenewTurnLeaseError && !error.retryable) {
+          finalizationDone = finalizeTurn({
+            usage: { cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, totalTokens: 0 },
+            assistantText: '', thinkingText: '', assistantSegments: [], thinkingSegments: [],
+            tools: [], runtimeEvents: [], stopReason: null, numTurns: null, isError: true,
+            errorKind: 'model_authority', errorDetail: 'MODEL_AUTHORITY_EXPIRED', staleResumeId: false,
+            phantomSignals: { apiState: 'unknown', skipReason: null },
+          }).catch((err) => {
+            onEvent({ kind: 'error', error: String(err) })
+            settle(() => resolve())
+          })
+          await finalizationDone
+          return
+        }
+        detach()
+        settle(() => reject(error))
+      })
+    } else {
+      submitEngineTurn()
+    }
   })
   } finally { closeHelpAttempt?.() }
 }

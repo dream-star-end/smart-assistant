@@ -228,13 +228,27 @@ export function makeTurnWaiveHandler(deps: TurnWaiveHandlerDeps): TurnWaiveHandl
     try {
       // Commit the settlement fence first. `applyTurnWaiver` repeats this
       // idempotently and then atomically performs refund + inbox receipt.
-      await ensurePendingTurnWaiver(deps.pgPool, { userId, turnKey, reason: waiveReason });
+      const fence = await ensurePendingTurnWaiver(deps.pgPool, { userId, turnKey, reason: waiveReason });
+      if ('disposition' in fence) {
+        sendJson(res, fence.disposition === 'denied' ? 409 : 503, {
+          error: { code: fence.disposition === 'denied' ? 'TURN_WAIVER_INELIGIBLE' : 'TURN_WAIVER_PENDING',
+            message: fence.disposition === 'denied' ? 'turn has retained output or unproven effects' : 'authoritative zero-output proof pending' },
+        });
+        return;
+      }
       const result = await applyTurnWaiver(deps.pgPool, {
         userId,
         turnKey,
         reason: waiveReason,
         logger: reqLog,
       });
+      if (result.disposition === 'denied' || result.disposition === 'deferred') {
+        sendJson(res, result.disposition === 'denied' ? 409 : 503, {
+          error: { code: result.disposition === 'denied' ? 'TURN_WAIVER_INELIGIBLE' : 'TURN_WAIVER_PENDING',
+            message: 'authoritative zero-output waiver not approved' },
+        });
+        return;
+      }
       if (result.newlyApplied) {
         try {
           deps.broadcastToUser?.(userId, {
