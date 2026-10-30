@@ -9087,7 +9087,28 @@
         }
       ],
       "coverageCommits": [
-        "c65f8b61"
+        "c65f8b61",
+        "d2db51a3",
+        "0c9ad494"
+      ]
+    },
+    {
+      "id": "INC-20261030-SHARE-PREVIEW-CLEANUP",
+      "occurredAt": "2026-10-30",
+      "severity": "P2",
+      "symptom": "顾问禁写修复的完整前端门暴露既存分享预览清理缺陷：关闭或卸载弹窗后 FileReader 仍读取，延迟绘图也会新启动读取。Vitest 还原 jsdom realm 后遗留读取触发 Expected an Uint8Array 未处理异常，6624 个断言虽通过但命令失败。现清理时取消读取，并阻止失效绘图启动读取；保留正常预览与导出行为。",
+      "rootFixCommit": "9c4f805b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ShareDialog.test.tsx",
+          "assertion": "关闭后绘图才完成时不会再启动图片读取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "share preview cleanup aborts the native FileReader when the dialog closes"
+        }
       ]
     }
   ]
