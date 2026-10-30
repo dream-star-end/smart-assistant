@@ -51,7 +51,7 @@ function ListSection({
   return (
     <section className="flex flex-col gap-2">
       <div className="flex items-center gap-1.5">
-        <h4 className="text-caption font-semibold uppercase tracking-[0.06em] text-muted">
+        <h4 className="text-meta font-semibold text-muted">
           {title}
         </h4>
         <Badge tone="neutral" size="sm">

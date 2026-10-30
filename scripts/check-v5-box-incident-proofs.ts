@@ -2115,8 +2115,8 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     { ...source.deps, writeMessage: store.write }))).kind !== "final") fail("IDLE_SOURCE_TURN");
   // the proxy's billing finalizer commits a settled row
   await db.query("UPDATE request_finalize_journal SET state='committed' WHERE request_id='box-idle-src'");
-  // the compact fallback request is refused before admission, so egress never has a row for the idle turn
-  if (api.gate({ model: MODEL, stream: true, max_tokens: 64, temperature: 1,
+  // OCV5-660: default 1 is accepted; nondefault refusal still proves recovery with no egress row.
+  if (api.gate({ model: MODEL, stream: true, max_tokens: 64, temperature: 0.2,
     messages: [{ role: "user", content: "summarize the conversation" }] }, true) !== "BOX_PARAMETER_UNMAPPED") {
     fail("IDLE_COMPACT_FALLBACK_ADMITTED");
   }
@@ -3646,7 +3646,7 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
-  const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
+  const proofs = [(await import("./lib/boxKeeperOwnedChildrenProof.js")).proveKeeperOwnedChildren(CANDIDATE), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await (await import("./lib/boxGptWebCitationProof.js")).proveGptWebCitationMarkers(CANDIDATE), // OCV5-584 (file-size ratchet): [ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link
     await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api), await (await import("./lib/boxCapacityHeldProof.js")).proveCapacityHeldReleased(CANDIDATE), // OCV5-649 (file-size ratchet): [ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered
@@ -3654,9 +3654,9 @@ async function main(): Promise<void> {
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api), await (await import("./lib/boxRunCleanupProof.js")).proveRunCleanupToolResults(CANDIDATE), // OCV5-645 (file-size ratchet): [ocv5-645-run-cleanup-tool-results] PASS — a recovered run whose CLI wrote a session tool-results tree finishes its privacy cleanup instead of retrying it forever, and any other folder there stays refused
     ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
-      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
+      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db), await (await import("./lib/boxStaleRecoveryProof.js")).proveStoppedRecoveryClaim({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), // [box-stopped-recovery-claim] PASS
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
-      await proveIdleNoSummary(api, db),
+      await proveIdleNoSummary(api, db), await (await import("./lib/tapeJobTerminalProof.js")).proveTapeJobTerminals(CANDIDATE, db), // [ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key
       await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),

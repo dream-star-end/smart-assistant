@@ -6,7 +6,7 @@ import { boxApiModelByEitherId } from "@openclaude/protocol";
 import type { ProxyBody } from "./shared.js";
 import { BoxMessagesShapeError, compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { compileBoxToolCatalog, mapBoxCliEffort } from "./boxToolCatalog.js";
-import { isBoxNoopContextManagement } from "./boxCacheAnnotations.js";
+import { isBoxNoopContextManagement, normalizeBoxDefaultTemperature } from "./boxCacheAnnotations.js";
 import { classifyBoxContinuation, preparedMatchesBody,
   type PreparedContinuation } from "./boxPreparedContinuation.js";
 
@@ -17,6 +17,7 @@ function boxModelWithoutEffort(body: ProxyBody): boolean {
 
 export function validateBoxTextRequest(body: ProxyBody,
   options: { resumeToolResults?: boolean } = {}): string | null {
+  body = normalizeBoxDefaultTemperature(body);
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (body.tools?.length || body.tool_choice !== undefined) return "BOX_TOOLS_REQUIRE_LIVE_BRIDGE";
   if (body.thinking !== undefined || body.output_config !== undefined) {
@@ -51,6 +52,7 @@ export function validateBoxTextRequest(body: ProxyBody,
  * an unsupported Claude Code parameter to make a request appear valid. */
 export function validateBoxToolRequest(body: ProxyBody,
   prepared?: PreparedContinuation): string | null {
+  body = normalizeBoxDefaultTemperature(body);
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (!Array.isArray(body.tools) || body.tools.length < 1) return "BOX_TOOLS_REQUIRED";
   if (body.tool_choice !== undefined && (body.tool_choice === null

@@ -344,6 +344,12 @@ async function startRig(opts: {
           }
           if (/FROM turn_control_requests/.test(sql) && /FOR UPDATE SKIP LOCKED/.test(sql))
             return { rows: [], rowCount: 0 };
+          // This rig has no durable controls. Link delivery now reads the
+          // candidate carrier before claiming, including browser-free users.
+          if (/SELECT c.control_id,ac.id::int AS container_id/.test(sql) && /FROM turn_control_requests c/.test(sql))
+            return { rows: [], rowCount: 0 };
+          if (/SELECT DISTINCT user_id FROM turn_control_requests/.test(sql))
+            return { rows: [], rowCount: 0 };
           if (/FROM turn_recovery_jobs/.test(sql) && /FOR UPDATE SKIP LOCKED/.test(sql))
             return { rows: [], rowCount: 0 };
           const err = new Error(`unexpected durable rig pool query: ${sql}`);

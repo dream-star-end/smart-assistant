@@ -5,6 +5,8 @@
  */
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
+import { EVENTS } from "../admin/alertEvents.js";
+import { enqueueAlert } from "../admin/alertOutbox.js";
 import {
   claimDueMaterializationJobs,
   claimDueSettlementJobs,
@@ -12,6 +14,7 @@ import {
   completeSettlementJob,
   failOrRequeueMaterializationJob,
   failOrRequeueSettlementJob,
+  listTapeJobAlertCandidates,
   renewMaterializationLease,
   type MaterializationJob,
   type SettlementJob,
@@ -19,6 +22,7 @@ import {
 
 export const DEFAULT_INTERVAL_MS = 5_000;
 export const MIN_INTERVAL_MS = 1_000;
+export const ALERT_SCAN_INTERVAL_MS = 60_000;
 
 export interface TapeJobSchedulerDeps {
   pool: Pool;
@@ -29,6 +33,7 @@ export interface TapeJobSchedulerDeps {
   onError?: (err: unknown) => void;
   materializeTape?: (job: MaterializationJob, renew: () => Promise<void>) => Promise<void>;
   settleJob?: (job: SettlementJob) => Promise<void>;
+  _deps?: { enqueueAlert?: typeof enqueueAlert; now?: () => number };
 }
 
 export interface TapeJobSchedulerHandle {
@@ -45,13 +50,49 @@ export function startTapeJobScheduler(deps: TapeJobSchedulerDeps): TapeJobSchedu
   });
   let stopped = false;
   let inFlight: Promise<void> = Promise.resolve();
+  const enqueue = deps._deps?.enqueueAlert ?? enqueueAlert;
+  const now = deps._deps?.now ?? Date.now;
+  let nextAlertScanAt = 0;
 
-  async function runOneTick(): Promise<void> {
+  async function scanAlerts(): Promise<void> {
+    if (now() < nextAlertScanAt) return;
+    try {
+      const candidates = await listTapeJobAlertCandidates(deps.pool);
+      const day = new Date(now()).toISOString().slice(0, 10);
+      for (const job of candidates) {
+        try {
+          await enqueue({
+            event_type: EVENTS.OPS_TAPE_JOB_STUCK,
+            severity: "warning",
+            dedupe_key: `${EVENTS.OPS_TAPE_JOB_STUCK}:${job.job_id}:${day}`,
+            dedupe_all_statuses: true,
+            title: "turn_tape 作业需要检查",
+            body: `session=${job.session_id} tape=${job.tape_id.slice(0, 12)} attempt=${job.attempt} error_class=${job.error_class}`,
+          });
+        } catch (err) {
+          onError(err);
+        }
+      }
+      nextAlertScanAt = now() + ALERT_SCAN_INTERVAL_MS;
+    } catch (err) {
+      onError(err);
+    }
+  }
+
+  async function failMaterialization(job: MaterializationJob, message: string): Promise<void> {
+    if (await failOrRequeueMaterializationJob(deps.pool, job, message) === "failed") nextAlertScanAt = 0;
+  }
+
+  async function failSettlement(job: SettlementJob, message: string): Promise<void> {
+    if (await failOrRequeueSettlementJob(deps.pool, job, message) === "failed") nextAlertScanAt = 0;
+  }
+
+  async function runJobs(): Promise<void> {
     const matJobs = await claimDueMaterializationJobs(deps.pool, { ownerId, limit: 1 });
     for (const job of matJobs) {
       try {
         if (!deps.materializeTape) {
-          await failOrRequeueMaterializationJob(deps.pool, job, "materializeTape hook missing");
+          await failMaterialization(job, "materializeTape hook missing");
           continue;
         }
         await deps.materializeTape(job, async () => {
@@ -62,7 +103,7 @@ export function startTapeJobScheduler(deps: TapeJobSchedulerDeps): TapeJobSchedu
         if (!done) onError(new Error(`materialization complete lost fencing ${job.jobId}`));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await failOrRequeueMaterializationJob(deps.pool, job, message);
+        await failMaterialization(job, message);
         onError(err);
       }
     }
@@ -70,7 +111,7 @@ export function startTapeJobScheduler(deps: TapeJobSchedulerDeps): TapeJobSchedu
     for (const job of settleJobs) {
       try {
         if (!deps.settleJob) {
-          await failOrRequeueSettlementJob(deps.pool, job, "settleJob hook missing");
+          await failSettlement(job, "settleJob hook missing");
           continue;
         }
         await deps.settleJob(job);
@@ -78,9 +119,17 @@ export function startTapeJobScheduler(deps: TapeJobSchedulerDeps): TapeJobSchedu
         if (!done) onError(new Error(`settlement complete lost fencing ${job.jobId}`));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await failOrRequeueSettlementJob(deps.pool, job, message);
+        await failSettlement(job, message);
         onError(err);
       }
+    }
+  }
+
+  async function runOneTick(): Promise<void> {
+    try {
+      await runJobs();
+    } finally {
+      await scanAlerts();
     }
   }
 

@@ -1340,6 +1340,15 @@ export function _resetAllowRegistrationCacheForTests(): void {
   _allowRegCache = null;
 }
 
+/**
+ * 与 gateway isDelegateInflightSurfaceEnabled 同一谓词（1|true|on）。
+ * 复制在这里，不 import gateway（循环依赖）。缺省 / 其它值 = 关。
+ */
+export function delegateInflightSurfaceAdvertised(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = String(env.OC_DELEGATE_INFLIGHT_SURFACE ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "on";
+}
+
 export async function handleGetPublicConfig(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -1369,6 +1378,9 @@ export async function handleGetPublicConfig(
     feature_community_blog: communityBlogEnabled(),
     // 编辑器底部文案：on = 「提交后由 AI 自动审核」；否则「提交后由管理员审核」。
     feature_community_blog_ai_review: tutorialModerationMode() === "on",
+    // 会话级 inflight 委派条。关（商业默认）时前端不发探测，避免控制台 404。
+    // 直接打路由时 flag-off 仍是 404，契约不变。
+    feature_delegate_inflight: delegateInflightSurfaceAdvertised(),
     // system_settings.allow_registration 透传给前端。关停时前端要:
     //   1) 在 register tab 展示 banner + disable 表单 + 不挂 Turnstile
     //   2) 在 login tab 隐藏"立即注册"导航链接(LDC SSO 按钮保留 — 老用户登录用)
