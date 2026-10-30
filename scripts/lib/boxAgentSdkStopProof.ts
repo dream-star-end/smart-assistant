@@ -102,7 +102,7 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
   try {
     await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve))
     const address=server.address();assert.ok(address && typeof address==='object')
-    child=spawn('/usr/bin/node',[join(input.runtime,'cli.js'),'-p','--input-format','stream-json',
+    child=spawn(process.execPath,[join(input.runtime,'cli.js'),'-p','--input-format','stream-json',
       '--output-format','stream-json','--verbose','--model',input.model,'--tools','Agent,Bash',
       '--permission-mode','bypassPermissions','--allow-dangerously-skip-permissions',
       '--dangerously-skip-permissions','--setting-sources','','--strict-mcp-config',

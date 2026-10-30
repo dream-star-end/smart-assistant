@@ -1269,7 +1269,7 @@ build_master_release() {
   fi
   # Actual builtin Agent proof runs this candidate's production CCB, prepared
   # visibly before the unchanged incident gate deadline/load isolation.
-  if ! bash "$staging/scripts/prepare-v5-box-agent-proof.sh" "$staging"; then
+  if ! ( cd "$staging" && bash "$staging/scripts/prepare-v5-box-agent-proof.sh" "$staging" ); then
     cleanup_master_staging
     die "pinned Box Agent proof production CCB preparation failed"
   fi

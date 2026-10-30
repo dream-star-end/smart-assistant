@@ -234,7 +234,7 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
     assert.equal(readFileSync(join(runtime,'cli.js')).equals(readFileSync(entry)),true)
     await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve))
     const address=server.address();assert.ok(address && typeof address === 'object')
-    child=spawn('/usr/bin/node',[join(runtime,'cli.js'),'-p','--input-format','stream-json','--output-format','stream-json',
+    child=spawn(process.execPath,[join(runtime,'cli.js'),'-p','--input-format','stream-json','--output-format','stream-json',
       '--verbose','--model',MODEL,'--tools','Agent,Bash','--permission-mode','bypassPermissions',
       '--allow-dangerously-skip-permissions','--dangerously-skip-permissions','--setting-sources','',
       '--settings',JSON.stringify({hooks:{SubagentStop:[{hooks:[{type:'agent',model:MODEL,
