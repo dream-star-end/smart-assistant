@@ -182,9 +182,8 @@ export type CardCallbacks = {
     messageId: string,
     expected: { recordId: string; role: string; contentSha256?: string },
   ) => ChatMessage[] | null;
-  /** 精确重试目标解析(红卡 CTA 硬门):按 assistant 错误行的 _clientMessageId 定位可原样重发的
-   *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
-   *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
+  /** Locate the exact failed source for editing. Error execution uses the
+   * continuation resolver and never falls back to regenerating another task. */
   resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
   /** P5b:把一条已完成的回答存到所在项目（「记住这条」= 项目记忆，「存为项目技能」）。
    *  App 只在 OC_P5_CHIPS 打开、会话属于有看板的项目、非 demo 时提供；缺省不出这两个入口。 */
@@ -985,18 +984,9 @@ export function AssistantCard({
       ? creditsCopy.message
       : isEmptyNoReply || presentedError?.fixedMessage ? shownMessage : undefined);
   const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
-  // Source lookup is retained for editing; execution always uses Continue.
-  const retryEligible =
-    !!presentedError &&
-    !presentedError.waived &&
-    sem.retryable &&
-    (sem.cta === "retry" || sem.cta === "retry_or_switch");
+  // Editing may reuse the exact failed source. Execution is available only for
+  // the current unfinished turn, never a historical error from another task.
   const sourceUser = msg._clientMessageId ? cb.resolveRetryTarget?.(msg._clientMessageId) : undefined;
-  // ── 重发按钮末轮门控(Codex 审计 R5)────────────────────────────────────────────────
-  // onRegenerate 兜底 = 重发**最后一条** user 消息;历史中间错误卡若显示任何重发按钮,一点就把
-  // 无关的最新一轮内容重发出去(精确重发亦会把历史消息插到当前会话尾,乱序)。故错误卡上的重发类
-  // 按钮只在**该错误卡属于最后一轮**时显示。末轮判据复用 turnSegment 单一权威 inActiveTurn。
-  // 充值、新建会话、联系管理员是导航,不受此门控。
   const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
     isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast)
@@ -1023,7 +1013,6 @@ export function AssistantCard({
       cb,
       isLastTurn,
       waived: presentedError?.waived === true,
-      preciseRetryTarget: retryEligible && !isInsufficient ? sourceUser : undefined,
       editTarget: sourceUser,
       continueInterrupted: showInterruptedContinuation ? () => cb.onContinueInterrupted?.(msg) : undefined,
       topUp: isInsufficient && cb.onTopUp

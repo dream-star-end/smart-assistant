@@ -1,6 +1,6 @@
 import {fixtureSwitchQuote,fixtureExecutionModel} from "./model-switch-cost-fixture.mjs";
 /**
- * Cold-start precise retry of the original failed advisor turn.
+ * Cold-start same-session continuation of the original failed advisor task.
  * Loopback HTTP/WS is not a live model or ledger. Fixture serves the current
  * SessionDetail / payload schema so history load is a real App recovery, not
  * empty `{ok:true}` compatibility.
@@ -439,7 +439,7 @@ function startFixture(opts = {}) {
             appendTape(sessId, {
               id: `err-${clientMessageId}`,
               role: "assistant",
-              text: "本轮派发未能接入执行通道，已中断。请点击重试。",
+              text: "本轮派发未能接入执行通道，已中断。请点击继续。",
               _errorCode: "durable_dispatch_unavailable",
               _clientMessageId: clientMessageId,
               _turnTapeComplete: true,
@@ -571,14 +571,14 @@ async function chooseAdvisor(page) {
   await page.getByRole("dialog").waitFor({ state: "hidden" });
 }
 
-function preciseRetryOnFailedCard(page) {
+function continueOnFailedCard(page) {
   return page
     .locator("div")
     .filter({ hasText: "派发未能接入执行通道" })
-    .getByRole("button", { name: "重试" });
+    .getByRole("button", { name: "继续", exact: true });
 }
 
-test("cold App loads original failed turn and precise retry keeps advisor snapshot", {
+test("cold App loads failed task and Continue keeps its original advisor snapshot", {
   timeout: 180_000,
 }, async () => {
   const js = await bundleApp();
@@ -653,16 +653,16 @@ test("cold App loads original failed turn and precise retry keeps advisor snapsh
     assert.equal(
       inbounds.filter((row) => row.content?.recovery?.automatic === true).length,
       0,
-      "cold boot must not auto-replay the failed turn; user clicks precise retry",
+      "cold boot must not auto-replay the failed turn; user explicitly chooses Continue",
     );
     assert.equal(await a2.page.getByRole("button", { name: "重新尝试" }).count(), 0);
-    const retryCta = preciseRetryOnFailedCard(a2.page);
+    const retryCta = continueOnFailedCard(a2.page);
     try {
       await retryCta.waitFor({ timeout: 10_000 });
     } catch (err) {
       throw new Error(`${err.message}\n${await dumpPage(a2.page, inbounds, httpLog, "cold-precise-retry-cta")}`);
     }
-    assert.equal(await retryCta.count(), 1, "exact busy-card retry CTA, not history banner");
+    assert.equal(await retryCta.count(), 1, "one Continue on the exact failed-task card, not history navigation");
     const payloadGets = httpLog.filter((row) => row.path.includes("/payload")).length;
     const before = inbounds.length;
     await retryCta.click();
@@ -671,7 +671,14 @@ test("cold App loads original failed turn and precise retry keeps advisor snapsh
     }
     const retried = inbounds.at(-1);
     assert.ok(inbounds.length > before, await dumpPage(a2.page, inbounds, httpLog, "cold-retry-inbound"));
-    assert.equal(retried.content?.text, RETRY_TEXT);
+    assert.equal(inbounds.length, before + 1, "one explicit Continue receives one normal admission");
+    assert.notEqual(retried.content?.text, RETRY_TEXT, "Continue must not replay an executed task");
+    assert.ok(retried.content?.text.includes(RETRY_TEXT), "the original goal is preserved as context");
+    assert.match(retried.content.text, /不要重新执行已经完成的步骤/);
+    assert.equal(retried.content.displayText, "继续");
+    assert.equal(retried.content.recovery, undefined, "manual Continue receives normal admission");
+    assert.equal(retried.peer.id, failedInbound.peer.id);
+    assert.notEqual(retried.clientMessageId, failedInbound.clientMessageId);
     assert.equal(retried.model, failedInbound.model);
     assert.equal(retried.collabMode, "advisor");
     assert.equal(retried.advisorModel, "gpt-6-astra");
@@ -689,7 +696,7 @@ test("cold App loads original failed turn and precise retry keeps advisor snapsh
   }
 });
 
-test("cold App refuses precise retry when exact user payload is missing", {
+test("cold App refuses to continue with missing exact user payload", {
   timeout: 120_000,
 }, async () => {
   const js = await bundleApp();
@@ -714,7 +721,7 @@ test("cold App refuses precise retry when exact user payload is missing", {
     {
       id: `err-${corruptId}`,
       role: "assistant",
-      text: "本轮派发未能接入执行通道，已中断。请点击重试。",
+      text: "本轮派发未能接入执行通道，已中断。请点击继续。",
       _errorCode: "durable_dispatch_unavailable",
       _dispatchTerminal: true,
       _clientMessageId: corruptId,
@@ -736,9 +743,11 @@ test("cold App refuses precise retry when exact user payload is missing", {
     await page.page.getByTestId("user-row").filter({ hasText: CORRUPT_TEXT }).waitFor();
     await page.page.getByText("派发未能接入执行通道", { exact: true }).waitFor();
     assert.equal(await page.page.getByTestId("session-history-error-banner").count(), 0);
-    assert.equal(await preciseRetryOnFailedCard(page.page).count(), 0, "deferred user without payload must not expose precise 重试");
-    assert.ok((await page.page.getByRole("button", { name: "重新尝试" }).count()) >= 1);
-    assert.equal(inbounds.length, 0, "negative control never sends; regenerate is not precise retry");
+    assert.equal(await continueOnFailedCard(page.page).count(), 1, "the same Continue action hydrates the exact goal before admission");
+    await continueOnFailedCard(page.page).click();
+    await page.page.getByText(/原始消息加载失败/).waitFor();
+    assert.equal(await page.page.getByRole("button", { name: /^(重试|重新尝试|重新发送)$/ }).count(), 0);
+    assert.equal(inbounds.length, 0, "missing exact goal cannot degrade into a partial/contextless send or original-task replay");
     await ctx.close();
   } finally {
     await browser?.close();
