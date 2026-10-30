@@ -110,6 +110,29 @@ CREATE TABLE IF NOT EXISTS train (
 CREATE UNIQUE INDEX IF NOT EXISTS train_one_open_per_resource
   ON train(resource) WHERE status NOT IN ('committed','failed');
 
+-- Lifetime budget: manual registrations never delete or reset this row.
+CREATE TABLE IF NOT EXISTS train_auto_retry (
+  resource TEXT NOT NULL,
+  target_sha TEXT NOT NULL,
+  source_train_id TEXT NOT NULL,
+  source_sha TEXT NOT NULL,
+  retry_train_id TEXT NOT NULL UNIQUE,
+  reason TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT 'running' CHECK(result IN ('running','committed','failed','recovery_required')),
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  PRIMARY KEY(resource,target_sha)
+);
+CREATE TABLE IF NOT EXISTS train_retry_alert (
+  train_id TEXT PRIMARY KEY,
+  owner_uid TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY,
   transport_id TEXT NOT NULL UNIQUE,

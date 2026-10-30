@@ -177,6 +177,23 @@ id="$selected_id"
   echo "▶ 请立即收口本回合。worker 每 30s 调度:锁空即发一班列车带上所有已登记 sha;结果将按上方实际回调落点送达；面板评论不等于原会话已唤醒。"
 }
 
+# Lifetime selfhost rates; running trains/retries do not enter terminal denominators.
+lease_retry_metrics() {
+  lease_sql "WITH t AS (
+    SELECT count(*) terminal, sum(status='failed') failed FROM train
+      WHERE resource='deploy:selfhost' AND status IN ('committed','failed')
+  ), r AS (
+    SELECT count(*) retries, coalesce(sum(result='committed'),0) succeeded,
+      coalesce(sum(result IN ('failed','recovery_required')),0) failed,
+      coalesce(sum(result='running'),0) pending FROM train_auto_retry
+      WHERE resource='deploy:selfhost'
+  ) SELECT json_object('terminalTrains',t.terminal,'failedTrains',coalesce(t.failed,0),
+    'failureRate',1.0*t.failed/nullif(t.terminal,0),
+    'retries',r.retries,'retrySucceeded',r.succeeded,'retryFailed',r.failed,
+    'retryPending',r.pending,'retrySuccessRate',1.0*r.succeeded/nullif(r.succeeded+r.failed,0))
+    FROM t,r;"
+}
+
 cmd_status() {
   local resource="" id="" json=0
   while [[ $# -gt 0 ]]; do
@@ -197,6 +214,12 @@ cmd_status() {
     lease_sql_json "SELECT id,status,substr(target_sha,1,12) target,owner,executor_pid,rel_path,reason,created_at,finished_at FROM train ORDER BY seq DESC LIMIT 10;" || echo '[]'
     echo ',"outbox_pending":'
     lease_sql_json "SELECT id,kind,target_kind,target,attempts,next_attempt_at,last_error FROM outbox WHERE status='pending' ORDER BY created_at LIMIT 20;" || echo '[]'
+    echo ',"auto_retry_metrics":'
+    lease_retry_metrics
+    echo ',"auto_retries":'
+    lease_sql_json "SELECT target_sha,source_train_id,source_sha,retry_train_id,reason,result,created_at,finished_at FROM train_auto_retry WHERE resource='deploy:selfhost' ORDER BY created_at DESC LIMIT 20;"
+    echo ',"retry_alerts":'
+    lease_sql_json "SELECT train_id,owner_uid,reason,created_at,delivered_at,attempts,last_error FROM train_retry_alert ORDER BY created_at DESC LIMIT 20;"
     echo '}'
     return 0
   fi
@@ -206,6 +229,11 @@ cmd_status() {
   lease_sql -header -column "SELECT id,status,substr(target_sha,1,10) target,owner,executor_pid pid,reason,updated_at FROM train ORDER BY seq DESC LIMIT 5;"
   echo "── outbox pending ──"
   lease_sql -header -column "SELECT id,kind,target_kind,target,attempts,next_attempt_at,last_error FROM outbox WHERE status='pending' ORDER BY created_at LIMIT 10;"
+  echo "── selfhost 自动重试(每 SHA 最多一次；全历史指标，rate 为 0–1) ──"
+  lease_retry_metrics
+  lease_sql -header -column "SELECT substr(target_sha,1,12) target,source_train_id,retry_train_id,reason,result FROM train_auto_retry WHERE resource='deploy:selfhost' ORDER BY created_at DESC LIMIT 10;"
+  echo "── 停车站内告警(未投递持续保留) ──"
+  lease_sql -header -column "SELECT train_id,owner_uid,reason,delivered_at,attempts,last_error FROM train_retry_alert ORDER BY created_at DESC LIMIT 10;"
   echo "── 权威事实 ──"
   echo "  origin tip : $(lease_remote_tip || echo ?)"
   echo "  live       : $(lease_live_rel_path) committed_sha=$(lease_live_committed_sha || echo '(未 committed / 不可结算)')"

@@ -145,7 +145,7 @@ assert_eq "$(q "SELECT COUNT(*) FROM train WHERE status='planned';")" 1 "planned
 "$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 0 "planned 未超时不发第二班"
 sleep 2.2; "$WORKER" >/dev/null 2>&1   # PLANNED_STALE=1s,sqlite 秒级时间戳,留 >1s 余量
 assert_eq "$(q "SELECT status FROM train ORDER BY seq LIMIT 1;")" failed "planned 超时 → failed"
-assert_eq "$(starts)" 1 "对账后同 tick 发出新一班"
+assert_eq "$(starts)" 0 "planned 超时不在白名单,不自动发新一班"
 # b) spawn 后 worker 死:执行器还在跑(hang),再 tick 不重发
 wait_train_done || true; kill_stubs
 reset_db; set_live "$C0" committed; echo hang >"$T/fake-deploy.mode"
@@ -156,7 +156,8 @@ pid="$(q "SELECT executor_pid FROM train WHERE status='building';")"; kill "$pid
 # c) 执行器死、live 未变(未 committed 到 target)→ failed(live committed 但 ≠ target),不 satisfied
 "$WORKER" >/dev/null 2>&1
 assert_eq "$(q "SELECT status FROM train WHERE executor_pid=$pid;")" failed "执行器死且 live≠target → 该班 failed"
-assert_eq "$(q "SELECT COUNT(*) FROM train WHERE status='building';")" 1 "ride 仍 pending → 同 tick 重新发一班(新 train)"
+assert_eq "$(q "SELECT COUNT(*) FROM train WHERE status='building';")" 0 "执行器消失不在重试白名单,不自动重发"
+assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='failed';")" 1 "对账失败同样停车,不得借 worker actor 绕过上限"
 assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='satisfied';")" 0 "未结算"
 kill_stubs
 # d) 同 target 一班已 failed(门禁拒绝)→ 老 ride 转 failed 并回调,不再自动重发;新 ride 才允许再发一班
