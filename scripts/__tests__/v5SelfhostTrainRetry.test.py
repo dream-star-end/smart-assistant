@@ -141,6 +141,21 @@ sys.exit(0)
         status=json.loads(self.bash('bash "$1/oc-lease.sh" status --json').stdout)
         self.assertEqual(status['auto_retry_metrics']['retrySucceeded'],1)
 
+    def test_sql_json_empty_result_and_sql_failure(self):
+        # Ubuntu's older CLI emits no bytes for an empty successful result.
+        bindir = self.case/'bin'
+        bindir.mkdir()
+        sqlite = bindir/'sqlite3'
+        sqlite.write_text('#!/bin/sh\nexit "${FIXTURE_SQL_RC:-0}"\n')
+        sqlite.chmod(0o755)
+        self.env['PATH'] = str(bindir)+os.pathsep+self.env['PATH']
+        result = self.bash('source "$1/v5-lease-lib.sh"; lease_sql_json "SELECT 1 WHERE 0"')
+        self.assertEqual(json.loads(result.stdout), [])
+        self.env['FIXTURE_SQL_RC'] = '17'
+        result = self.bash('source "$1/v5-lease-lib.sh"; lease_sql_json "invalid SQL"', check=False)
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual(result.stdout, '')
+
     def test_manual_registration_does_not_reset_budget(self):
         self.tick(); retry=self.planned(); self.failed(retry)
         self.tick()

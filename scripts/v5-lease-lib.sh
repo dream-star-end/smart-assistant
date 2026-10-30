@@ -51,7 +51,10 @@ lease_sql() { # 只读/单语句;带 busy_timeout
   sqlite3 -cmd '.timeout 5000' -noheader "$LEASE_DB" "$@"
 }
 lease_sql_json() {
-  sqlite3 -cmd '.timeout 5000' -json "$LEASE_DB" "$@"
+  local json
+  json="$(sqlite3 -cmd '.timeout 5000' -json "$LEASE_DB" "$@")" || return $?
+  # Older sqlite3 versions print nothing for an empty result, rather than [].
+  printf '%s\n' "${json:-[]}"
 }
 # 事务脚本从 stdin 读;失败返回非 0 且不做任何授权/发车。
 lease_tx() {
