@@ -832,13 +832,15 @@ await runTapProof({
     'rejects classifier markers hidden in comments or strings',
     'rejects a lost rejected-receipt branch',
     'rejects a lost durable rejection convergence',
+    'rejects a definitive container rejection being released to the same recovery identity',
+    'rejects weakening a terminal rejection into a different recovery outcome',
     'rejects an enrichment fence that no longer stops a terminalized turn',
     'rejects malformed source instead of accepting a partial parse',
   ],
   label: 'turn-dispatch-receipt-coverage',
   timeoutMs: 120_000,
 })
-console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 11 exact cases')
+console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 13 exact cases')
 
 await runTapProof({
   fromRoot: candidateRoot,

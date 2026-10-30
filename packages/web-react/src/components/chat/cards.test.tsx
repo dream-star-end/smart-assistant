@@ -1497,7 +1497,7 @@ describe("sealed crashed tape does not keep 结果正在收尾", () => {
       _errorCardSnapshot: soft,
     }), {});
     expect(screen.getByRole("alert")).toHaveTextContent("任务执行失败");
-    expect(screen.getByRole("alert")).toHaveTextContent("任务执行时遇到内部错误，你的消息已保留，可以直接重试。");
+    expect(screen.getByRole("alert")).toHaveTextContent("本轮执行遇到问题，请重试；如果再次失败，可以换模型或联系管理员。");
     expect(screen.getByText("博客大纲已写完，正在排版。")).toBeInTheDocument();
     expect(screen.queryByText("结果正在收尾")).toBeNull();
     expect(screen.queryByText(/仍在确认|稍后刷新|不会重复扣费/)).toBeNull();
