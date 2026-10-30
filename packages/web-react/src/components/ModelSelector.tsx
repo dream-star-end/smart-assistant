@@ -363,10 +363,12 @@ export function ModelSelector({
     if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
     return row.row.members.some((m) => m.id === id)
   }
-  const pickerRowUsable = (row: (typeof rawRows)[number]): boolean => {
-    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
-    if (row.kind === 'plain') return !isDegraded(row.model)
-    return !row.row.members.every(isDegraded)
+  // 三档可用性优先级：可用(2) > 订阅锁定可解锁(1) > 全部降级禁用(0)。
+  // 当前选中行仅在优先级不低于已留同名行时替换，避免已选降级路线盖掉可点击的解锁入口。
+  const pickerRowRank = (row: (typeof rawRows)[number]): 0 | 1 | 2 => {
+    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return 1
+    const healthy = row.kind === 'plain' ? !isDegraded(row.model) : !row.row.members.every(isDegraded)
+    return healthy ? 2 : 0
   }
   // 「最近」(OCV5-150) + 同展示名去重(U3):
   // 1) 同展示名(如官方 grok-build 与 Cursor cursor-grok-4.7-* 同为「Grok 4.7」,或同名双 id)只保留一行,
@@ -388,7 +390,7 @@ export function ModelSelector({
       rows.push(row)
     } else if (
       pickerRowHasId(row, selectedId) &&
-      (pickerRowUsable(row) || !pickerRowUsable(rows[existingIdx]!))
+      pickerRowRank(row) >= pickerRowRank(rows[existingIdx]!)
     ) {
       rows[existingIdx] = row
     }

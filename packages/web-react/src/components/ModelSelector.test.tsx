@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
+import { resolveSessionModel } from '../lib/modelPreferences'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
 import { EFFORT_OPTIONS } from './settings/labels'
 
@@ -1043,6 +1044,51 @@ describe('ModelSelector 同名模型去重 (U3)', () => {
   afterEach(() => {
     localStorage.clear()
   })
+
+  it('全部已准入模型降级而 resolver 回落官方降级路线时，保留更高优先级的同名锁定路线且可触发解锁 (#1255)', async () => {
+    const models: PublicModel[] = [
+      { id: 'grok-build', display_name: 'Grok 4.7', engine: 'grok', degraded: true },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4', degraded: true },
+    ]
+    const lockedModels: LockedPublicModel[] = [
+      {
+        id: 'cursor-grok-4.7-high',
+        display_name: 'Grok 4.7 High',
+        engine: 'cursor',
+        min_plan_code: 'pro',
+        min_plan_name: 'Pro',
+      },
+    ]
+    const selectedId = resolveSessionModel(models, 'grok-build', {})
+    expect(selectedId).toBe('grok-build')
+    const onSelect = vi.fn()
+    const onLockedSelect = vi.fn()
+    render(
+      <ModelSelector
+        models={models}
+        lockedModels={lockedModels}
+        selectedId={selectedId}
+        onSelect={onSelect}
+        onLockedSelect={onLockedSelect}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const grokItems = items.filter((item) => item.textContent?.includes('Grok 4.7'))
+    expect(grokItems).toHaveLength(1)
+    const grok = grokItems[0]!
+    expect(grok).toHaveAttribute('data-locked', 'true')
+    expect(grok).not.toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(grok)
+    expect(onLockedSelect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: 'cursor-grok-4.7-high',
+        minPlanCode: 'pro',
+      }),
+    )
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
 
   it('官方 grok-build 与 Cursor cursor-grok-4.7 同名「Grok 4.7」时选单只列一次,支持选中态与降级切换', async () => {
     const DUAL_GROK: PublicModel[] = [
