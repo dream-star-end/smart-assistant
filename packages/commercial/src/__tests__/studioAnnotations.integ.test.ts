@@ -385,7 +385,7 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     // first frame was generated and charged (50) before the video.
     const s = await setup()
     const newer = await s.take('shot_frame', s.shot, 2, 'image/png')
-    await query(`UPDATE studio_takes SET inputs = $2::jsonb WHERE id = $1`, [
+    await query('UPDATE studio_takes SET inputs = $2::jsonb WHERE id = $1', [
       s.video.id,
       JSON.stringify({ inputs: [{ role: 'first_frame', blobSha: s.frame.sha }] }),
     ])
