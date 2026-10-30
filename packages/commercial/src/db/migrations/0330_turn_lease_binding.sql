@@ -4,6 +4,7 @@
 -- authenticated renewal endpoint binds the key once under its dispatch lock.
 -- No prompt, credential, financial record or balance is stored or changed.
 
+-- compat: Only a new nullable column is constrained; old rows and old writers remain NULL and all existing encodings/read/write paths are unchanged.
 ALTER TABLE authority_turn_dispatches
   ADD COLUMN turn_key TEXT,
   ADD CONSTRAINT authority_turn_dispatches_turn_key_check

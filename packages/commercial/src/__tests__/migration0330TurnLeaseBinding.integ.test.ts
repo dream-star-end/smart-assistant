@@ -17,6 +17,8 @@ test('0330 keeps old authority bindings valid and persists an exact turn key', a
     assert.equal((await client.query('SELECT turn_key FROM authority_turn_dispatches')).rows[0].turn_key, null)
     // Old writers may continue omitting the additive nullable column.
     await client.query('INSERT INTO authority_turn_dispatches(authority_turn_id) VALUES ($1)', ['b'.repeat(32)])
+    assert.deepEqual((await client.query('SELECT authority_turn_id FROM authority_turn_dispatches ORDER BY authority_turn_id')).rows,
+      [{ authority_turn_id: 'a'.repeat(32) }, { authority_turn_id: 'b'.repeat(32) }], 'old readers still select their existing columns')
     const key = 'c'.repeat(64)
     const bind = await client.query('UPDATE authority_turn_dispatches SET turn_key=$2 WHERE authority_turn_id=$1 AND turn_key IS NULL', ['a'.repeat(32), key])
     assert.equal(bind.rowCount, 1)
