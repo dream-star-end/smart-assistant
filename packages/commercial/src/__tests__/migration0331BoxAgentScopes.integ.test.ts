@@ -32,6 +32,17 @@ test('0331 app role can register/cancel/read exact generations but cannot mutate
     await client.query(`INSERT INTO box_agent_api_scopes(user_id,container_id,scope_id,root_session_id,session_id,agent_id,turn_key)
       VALUES(1,1,$1,$2,$3,'agent',$4)`,[scope,root,session,'a'.repeat(64)])
     assert.equal((await client.query('SELECT session_id::text FROM box_agent_api_scopes')).rows[0].session_id,session)
+    for (const agentId of ['a','A'.repeat(256),'._:-09']) {
+      await client.query(`INSERT INTO box_agent_api_scopes(user_id,container_id,scope_id,root_session_id,session_id,agent_id,turn_key)
+        VALUES(1,1,$1,$2,$3,$4,$5)`,[randomUUID(),root,deriveBoxAgentSession(root,agentId),agentId,'a'.repeat(64)])
+    }
+    for (const agentId of ['','A'.repeat(257),'has space','has/slash','非ASCII']) {
+      await client.query('SAVEPOINT invalid_scope_agent')
+      await assert.rejects(client.query(`INSERT INTO box_agent_api_scopes
+        (user_id,container_id,scope_id,root_session_id,session_id,agent_id,turn_key)
+        VALUES(1,1,$1,$2,$3,$4,$5)`,[randomUUID(),root,randomUUID(),agentId,'a'.repeat(64)]),{code:'23514'})
+      await client.query('ROLLBACK TO SAVEPOINT invalid_scope_agent')
+    }
     await client.query("UPDATE box_agent_api_scopes SET cancelled_at=NOW(),cancel_reason='explicit-stop'")
     for(const sql of ["UPDATE box_agent_api_scopes SET cancelled_at=NULL,cancel_reason=NULL",
       "UPDATE box_agent_api_scopes SET agent_id='changed'",'DELETE FROM box_agent_api_scopes','TRUNCATE box_agent_api_scopes']) {

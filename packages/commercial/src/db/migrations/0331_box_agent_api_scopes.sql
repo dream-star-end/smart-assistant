@@ -8,7 +8,7 @@ CREATE TABLE box_agent_api_scopes (
   scope_id UUID NOT NULL,
   root_session_id UUID NOT NULL,
   session_id UUID NOT NULL,
-  agent_id TEXT NOT NULL CHECK (agent_id ~ '^[A-Za-z0-9._:-]{1,256}$'),
+  agent_id TEXT NOT NULL CHECK (char_length(agent_id) BETWEEN 1 AND 256 AND agent_id ~ '^[A-Za-z0-9._:-]+$'),
   turn_key TEXT NOT NULL CHECK (turn_key ~ '^[a-f0-9]{64}$'),
   cancelled_at TIMESTAMPTZ,
   cancel_reason TEXT CHECK (cancel_reason IN ('explicit-stop','finish','owner-lost')),

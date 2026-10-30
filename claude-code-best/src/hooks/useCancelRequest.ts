@@ -178,8 +178,8 @@ export function CancelRequestHandler(props: CancelRequestHandlerProps): null {
       if (stopped.length > 0) {
         const descriptions = stopped.map(result => `"${result.task.description}"`).join(', ')
         const pending = stopped.filter(result => result.remoteStop === 'pending').length
-        const summary = `${stopped.length} background agent task(s) stopped locally: ${descriptions}.`
-          + (pending ? ` Remote Box stop proof pending for ${pending} task(s).` : '')
+        const remoteStatus = pending ? ` Remote Box stop proof pending for ${pending} task(s).` : ''
+        const summary = `${stopped.length} background agent task(s) stopped locally: ${descriptions}.${remoteStatus}`
         enqueuePendingNotification({ value: summary, mode: 'task-notification' })
         onAgentsKilled()
       }
