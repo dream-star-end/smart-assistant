@@ -265,3 +265,49 @@ test("RF-step3: closing the first tab during cursor lookup does not suppress ano
     assert.equal(physical.sent[0]!.peers[0].lastFrameSeq, 12, "13..20 remain eligible for container replay");
   } finally { await registry.shutdown(); }
 });
+
+test("RF-linkrebuild: receive-only admitted does not renew before exact accepted proof", async () => {
+  let status = "admitted";
+  let renewals = 0;
+  const queryPool = { query: async (sql: string) => {
+    if (sql.includes("container_link_heartbeat")) { renewals++; return { rows: [], rowCount: 1 }; }
+    return { rows: [{ user_id: "42", session_id: "s", client_message_id: "m", dispatch_id: "d",
+      attempt_no: 1, lease_epoch: "2", status, terminal_at: null, anchor_seq: null, agent_container_id: "7" }] };
+  } } as unknown as Queryable;
+  const registry = new ContainerLinkRegistry(queryPool);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    const handle = getContainerLinkHandle(socket)!;
+    handle.recoveryOnly = true;
+    handle.restoreDispatch({ sessionId: "s", clientMessageId: "m", agentId: "main", dispatchId: "d", attemptNo: 1, leaseEpoch: 2 });
+    handle.activate();
+    await handle.link.tick(); await handle.link.tick();
+    assert.equal(renewals, 0);
+    status = "accepted";
+    await handle.link.tick();
+    assert.equal(renewals, 1);
+    status = "terminal";
+    await handle.link.tick();
+    assert.equal(handle.hasOpenDispatches, false);
+  } finally { await registry.shutdown(); }
+});
+
+test("RF-linkrebuild: restore cannot replace an existing browser stream consumer", async () => {
+  const registry = new ContainerLinkRegistry(pool);
+  const physical = new Transport();
+  try {
+    const browser = getContainerLinkHandle(await registry.attach(42n, 7, () => physical as unknown as WebSocket))!;
+    browser.noteStream("s", "m"); browser.activate();
+    const recovery = getContainerLinkHandle(await registry.attach(42n, 7, () => { throw new Error("duplicate dial"); }))!;
+    recovery.recoveryOnly = true;
+    recovery.restoreDispatch({ sessionId: "s", clientMessageId: "m", agentId: "main", dispatchId: "d", attemptNo: 1, leaseEpoch: 2 });
+    assert.equal(recovery.hasOpenDispatches, false);
+    recovery.terminate();
+    let delivered = 0;
+    browser.socket.on("message", () => { delivered++; });
+    physical.push({ type: "outbound.message", peer: { id: "s" }, clientMessageId: "m" });
+    assert.equal(delivered, 1);
+    assert.equal(physical.readyState, WebSocket.OPEN);
+  } finally { await registry.shutdown(); }
+});

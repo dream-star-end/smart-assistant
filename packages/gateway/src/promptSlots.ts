@@ -714,7 +714,7 @@ export async function buildProjectSlot(ctx: PromptSlotContext): Promise<PromptSl
 function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null {
   if (ctx.delegateModelCatalog === false) return null
   if (ctx.delegateModelCatalog === null) return DELEGATE_MODEL_SECTION_UNAVAILABLE
-  if (ctx.delegateModelCatalog) return renderDelegateModelSection(ctx.delegateModelCatalog)
+  if (ctx.delegateModelCatalog) return renderDelegateModelSection(ctx.delegateModelCatalog, process.env)
   try {
     const peek = getModelCatalogClient().peekView()
     if (!peek) return DELEGATE_MODEL_SECTION_UNAVAILABLE
@@ -722,7 +722,7 @@ function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null
       models: peek.view.models,
       projectionRevision: peek.view.projectionRevision,
       verifiedAt: peek.verifiedAt,
-    })
+    }, process.env)
   } catch {
     return DELEGATE_MODEL_SECTION_UNAVAILABLE
   }

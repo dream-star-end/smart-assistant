@@ -225,6 +225,31 @@ export function marketTrySkillPrefill(name: string, slug: string): string {
   return `请帮我安装市场技能「${name}」(slug: ${slug}),装好后告诉我它能帮我做什么、给一个上手示例。`
 }
 
+// ── 市场卡片的一句人话（UI-5） ───────────────────────────────────────────
+
+/** 插件说明里讲凭据的字眼。凭据怎么填是详情页 / 管理中心的事，卡片只说它能做什么。 */
+const CREDENTIAL_TERMS = /app_?id|app_?secret|secret|token|令牌|密钥|凭据|授权码|密码|api[ _-]?key|创建集成/i
+const CREDENTIAL_LEAD = /^(?:用|使用|通过)[^，,]*?(?:令牌|凭据|密钥|授权码|token|secret)\s*/i
+
+/**
+ * 卡片描述只放第一句话。插件再多做三件事：去掉冒号前的品类名（「飞书自建应用」「GitHub 集成」，
+ * 卡片上已有名字）、去掉括注、去掉讲凭据的分句（「用 app_id/app_secret 换取租户凭据」）——
+ * 体验官看到的卡片全是这类技术说明（UI-SPEC §1.3 M5）。完整说明和凭据要求留在详情页。
+ * 全部被去掉时退回第一句原文，不出空卡。
+ */
+export function cardBlurb(description: string, plugin: boolean): string {
+  const first = description.trim().split(/[。！？!?\n]/)[0]?.trim() ?? ''
+  if (!plugin || !first) return first
+  const plain = first.replace(/\s*[（(][^（）()]*[）)]/g, '')
+  const colon = plain.search(/[：:]/)
+  const body = colon >= 0 && plain.slice(colon + 1).trim() ? plain.slice(colon + 1) : plain
+  const kept = body
+    .split(/[，,；;]/)
+    .map((part) => part.trim().replace(CREDENTIAL_LEAD, ''))
+    .filter((part) => part && !CREDENTIAL_TERMS.test(part))
+  return kept.length > 0 ? kept.join('，') : first
+}
+
 // ── API 插件详情的人向文案（K-19） ────────────────────────────────────────
 // 签名契约（connectorContract）里的 authMode 是后端枚举（commercial/connectors/spec/types.ts 的
 // 七种 + marketplaceDb 给受控浏览器 / 无认证插件的 managed_browser / none），动作 id 是发布者起的
