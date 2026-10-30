@@ -42,6 +42,24 @@ export function imageFailureDetail(item: Record<string, unknown>): string | unde
   return undefined
 }
 
+const imageFailureNotes = new WeakMap<object, string>()
+
+/** `line === null` clears the note for this runner. A matching stderr line replaces it. */
+export function rememberImageStderr(host: object, line: string | null): void {
+  if (!line) {
+    imageFailureNotes.delete(host)
+    return
+  }
+  const note = noteFromImageGenerationStderr(line)
+  if (note) imageFailureNotes.set(host, note)
+}
+
+export function takeImageFailureNote(host: object): string | null {
+  const note = imageFailureNotes.get(host) ?? null
+  imageFailureNotes.delete(host)
+  return note
+}
+
 export function noteFromImageGenerationStderr(line: string): string | null {
   const plain = line.split(String.fromCharCode(0x1b)).join('')
   if (!/image generation failed/i.test(plain)) return null

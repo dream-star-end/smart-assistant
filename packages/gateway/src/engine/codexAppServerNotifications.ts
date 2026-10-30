@@ -58,7 +58,12 @@ import {
   stripShellWrapper,
 } from './codexAppServerProtocol.js'
 import { log } from './codexAppServerRunner.js'
-import { formatImageGenerationFailure, imageFailureDetail } from './imageGenerationFailure.js'
+import {
+  formatImageGenerationFailure,
+  imageFailureDetail,
+  rememberImageStderr,
+  takeImageFailureNote,
+} from './imageGenerationFailure.js'
 import type { CodexAppServerRunner } from './codexAppServerRunner.js'
 
 export interface CodexNotificationHost {
@@ -120,7 +125,6 @@ export interface CodexNotificationHost {
   settlePendingUserInputsForTurn: CodexAppServerRunner['settlePendingUserInputsForTurn']
   syncedPlatformGoal: CodexAppServerRunner['syncedPlatformGoal']
   threadId: CodexAppServerRunner['threadId']
-  lastImageGenerationFailureNote: CodexAppServerRunner['lastImageGenerationFailureNote']
   writeRaw: CodexAppServerRunner['writeRaw']
 }
 
@@ -1018,8 +1022,7 @@ export async function handleItemCompleted(
   if (itemType === 'imageGeneration') {
     const outcome = codexToolOutcome(item)
     if (outcome.isError) {
-      const stderrNote = this.lastImageGenerationFailureNote
-      this.lastImageGenerationFailureNote = null
+      const stderrNote = takeImageFailureNote(this)
       this.emitToolResult(
         itemId,
         stderrNote ?? formatImageGenerationFailure({ detail: imageFailureDetail(item) }),
@@ -1031,7 +1034,7 @@ export async function handleItemCompleted(
     }
     // A stderr note belongs to the failed item that just consumed it. Drop any
     // leftover before a later item in this attempt can reuse it.
-    this.lastImageGenerationFailureNote = null
+    rememberImageStderr(this, null)
     // codex's image_gen tool emits two notification shapes depending on the
     // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
     // 0.125.0):
