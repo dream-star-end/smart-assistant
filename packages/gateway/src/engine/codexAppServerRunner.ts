@@ -29,6 +29,7 @@ import {
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
+  codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -868,10 +869,11 @@ export class CodexAppServerRunner extends EventEmitter {
           const cwd = this._applyRepoBindingFromSnapshot(repo)
           await this.ensureSpawned(repo, cwd)
           assertCurrent()
+          const transportModel = codexTransportModelId(this.opts.model)
           await this.sendRequest('thread/resume', {
               ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
             threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
-            ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+            ...(transportModel ? { model: transportModel } : {}),
           })
           assertCurrent()
           this.attached = true
