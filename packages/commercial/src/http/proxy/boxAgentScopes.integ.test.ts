@@ -18,6 +18,11 @@ const address=new URL(url)
 assert.ok(['127.0.0.1','localhost','[::1]'].includes(address.hostname) && /_test$/.test(address.pathname),'test DB must be loopback *_test')
 const schema=`box_scope_${randomBytes(6).toString('hex')}`
 const MODEL='box-api-claude-opus-5-5'
+function requiredUpstreamModel():string {
+  const model=boxApiUpstreamModelFor(MODEL)
+  assert.ok(model,'selected test model must have an upstream')
+  return model
+}
 let pool:Pool
 let serial=0
 test.before(async () => {
@@ -43,7 +48,8 @@ test.after(async () => {
   try {await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)} finally {await admin.end()}
 })
 async function fixture(caps=3) {
-  const uid=BigInt(900664000+ ++serial),containerId=uid
+  const uid=BigInt(900664000+ ++serial)
+  const containerId=uid
   await pool.query('INSERT INTO users VALUES ($1)',[uid.toString()])
   await pool.query('INSERT INTO agent_containers VALUES ($1,$1)',[uid.toString()])
   const rootSessionId=randomUUID()
@@ -65,7 +71,7 @@ async function fixture(caps=3) {
       ...(mode === 'guarded' ? {invocationMode:'detached_tool',contextHash:deriveBoxContextHash(body),
         detachedRunnerHash:'f'.repeat(64),catalogHash:'e'.repeat(64)} : {}),
       ...(mode === 'text' ? {invocationMode:'text',detachedRunnerHash:'f'.repeat(64),
-        upstreamModel:boxApiUpstreamModelFor(MODEL)} : {})}
+        upstreamModel:requiredUpstreamModel()} : {})}
     await pool.query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,state,ctx)
       VALUES($1,$2,$2,'inflight',$3::jsonb)`,[requestId,uid.toString(),JSON.stringify({model:MODEL,
         boxInvocationRecovery:'v1',boxAgentScopeId:identity.scopeId,
@@ -80,7 +86,8 @@ async function fixture(caps=3) {
 }
 
 test('committed cancel-before-admit fences a late HTTP request even after a positive no-run receipt',async () => {
-  const f=await fixture(),identity=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
   assert.equal((await f.scopes.control(f.owner,identity,'register')).status,'active')
   const cancelled=await f.scopes.control(f.owner,identity,'cancel','explicit-stop')
   assert.equal(cancelled.status,'stopped');assert.equal(cancelled.proof,'prelaunch_cancelled')
@@ -93,7 +100,8 @@ test('committed cancel-before-admit fences a late HTTP request even after a posi
 
 test('cancel-after-admit rejects every later launch arm; original prestart CAS closes without changing billing state',async () => {
   for(const mode of ['plain','text','guarded'] as const) {
-    const f=await fixture(),identity=f.scope()
+    const f=await fixture()
+    const identity=f.scope()
     await f.scopes.control(f.owner,identity,'register')
     const call=await f.candidate(identity,mode);await f.journal.admit(call)
     let receipt:BoxPrelaunchReceipt|undefined
@@ -106,7 +114,7 @@ test('cancel-after-admit rejects every later launch arm; original prestart CAS c
     }
     assert.equal((await f.scopes.control(f.owner,identity,'cancel','explicit-stop')).status,'pending')
     if(mode === 'plain') await assert.rejects(() => f.journal.markRunning(call),/BOX_AGENT_SCOPE_INACTIVE/)
-    if(mode === 'text') await assert.rejects(() => f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:boxApiUpstreamModelFor(MODEL)}),/BOX_AGENT_SCOPE_INACTIVE/)
+    if(mode === 'text') await assert.rejects(() => f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:requiredUpstreamModel()}),/BOX_AGENT_SCOPE_INACTIVE/)
     if(mode === 'guarded') await assert.rejects(() => f.journal.armGuardedLaunch({...call,receipt:receipt!}),/BOX_AGENT_SCOPE_INACTIVE/)
     if(receipt) await f.journal.markGuardedPrestartStopped({...call,receipt,cleanedReceipt:`cleaned:${receipt.identityHash}`})
     else await f.journal.markPrestartStopped(call)
@@ -117,10 +125,11 @@ test('cancel-after-admit rejects every later launch arm; original prestart CAS c
 })
 
 test('already armed run stays pending and occupies capacity; expired/missing/wrong-identity proof never retires scope',async () => {
-  const f=await fixture(1),old=f.scope()
+  const f=await fixture(1)
+  const old=f.scope()
   await f.scopes.control(f.owner,old,'register')
   const call=await f.candidate(old,'text');await f.journal.admit(call)
-  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:boxApiUpstreamModelFor(MODEL)})
+  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:requiredUpstreamModel()})
   assert.equal((await f.scopes.control(f.owner,old,'cancel','explicit-stop')).status,'pending')
   const next=f.scope('other');await f.scopes.control(f.owner,next,'register')
   await assert.rejects(() => f.candidate(next).then(input => f.journal.admit(input)),/BOX_CAPACITY_HELD/)
@@ -132,7 +141,9 @@ test('already armed run stays pending and occupies capacity; expired/missing/wro
 })
 
 test('old cancelled generation cannot cancel a same-agent same-turn fresh invocation',async () => {
-  const f=await fixture(),old=f.scope(),next=f.scope()
+  const f=await fixture()
+  const old=f.scope()
+  const next=f.scope()
   assert.equal(old.sessionId,next.sessionId)
   await f.scopes.control(f.owner,old,'register')
   await f.scopes.control(f.owner,old,'cancel','finish')
@@ -145,17 +156,18 @@ test('old cancelled generation cannot cancel a same-agent same-turn fresh invoca
 })
 
 test('only a complete settled physical chain with its exact keeper proof retires a cancelled scope',async () => {
-  const f=await fixture(),identity=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
   await f.scopes.control(f.owner,identity,'register')
   const call=await f.candidate(identity,'text');await f.journal.admit(call)
-  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:boxApiUpstreamModelFor(MODEL)})
+  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:requiredUpstreamModel()})
   const patch={boxState:'failed_stopped',boxTerminalProof:{revision:1,reason:'keeper_stopped',
     runNonce:call.runNonce,leaseEpoch:call.leaseEpoch,keeperPid:11,cliPid:12}}
-  await pool.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,[call.requestId,JSON.stringify(patch)])
+  await pool.query('UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1',[call.requestId,JSON.stringify(patch)])
   assert.equal((await f.scopes.control(f.owner,identity,'cancel','explicit-stop')).status,'pending',
     'keeper proof alone cannot stand in for settlement')
   const before=f.stops()
-  await pool.query(`UPDATE request_finalize_journal SET state='aborted' WHERE request_id=$1`,[call.requestId])
+  await pool.query("UPDATE request_finalize_journal SET state='aborted' WHERE request_id=$1",[call.requestId])
   const stopped=await f.scopes.control(f.owner,identity,'status')
   assert.equal(stopped.status,'stopped');assert.equal(stopped.fence,'cancelled')
   assert.equal(stopped.proof,'all_physical_runs_terminal')
@@ -163,10 +175,11 @@ test('only a complete settled physical chain with its exact keeper proof retires
 })
 
 test('scope cancellation commits the exact generation intent before the original keeper can be selected',async () => {
-  const f=await fixture(),identity=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
   await f.scopes.control(f.owner,identity,'register')
   const call=await f.candidate(identity,'text');await f.journal.admit(call)
-  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:boxApiUpstreamModelFor(MODEL)})
+  await f.journal.armTextLaunch({...call,detachedRunnerHash:'f'.repeat(64),upstreamModel:requiredUpstreamModel()})
   const input={...call,scopeId:identity.scopeId,reason:'explicit-stop' as const}
   await assert.rejects(() => f.journal.recordScopeCancelIntent(input),/BOX_AGENT_SCOPE_INACTIVE/)
   await f.scopes.control(f.owner,identity,'cancel','explicit-stop')
@@ -181,7 +194,9 @@ test('scope cancellation commits the exact generation intent before the original
 })
 
 test('a real tool-resume claim preserves generation and cancellation follows its exact new leaf',async()=>{
-  const f=await fixture(),identity=f.scope(),fresh=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
+  const fresh=f.scope()
   for(const scope of [identity,fresh]) await f.scopes.control(f.owner,scope,'register')
   const call=await f.candidate(identity,'guarded')
   call.canonicalBody.tools=[{name:'Echo',description:'synthetic',input_schema:{type:'object',properties:{}}}]
@@ -225,7 +240,8 @@ test('a real tool-resume claim preserves generation and cancellation follows its
 })
 
 test('cancel and admit racing under the same session lock cannot yield a false no-run receipt plus a launch',async () => {
-  const f=await fixture(),identity=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
   await f.scopes.control(f.owner,identity,'register')
   const call=await f.candidate(identity)
   const [cancelled,admitted]=await Promise.allSettled([
@@ -240,7 +256,8 @@ test('cancel and admit racing under the same session lock cannot yield a false n
 })
 
 test('cancelled generation closes a never-admitted rollover gap and cannot finish or launch its successor',async()=>{
-  const f=await fixture(),identity=f.scope()
+  const f=await fixture()
+  const identity=f.scope()
   await f.scopes.control(f.owner,identity,'register')
   const call=await f.candidate(identity,'guarded')
   // An explicit private fixture of the server's already-journaled rollover
@@ -251,7 +268,7 @@ test('cancelled generation closes a never-admitted rollover gap and cannot finis
     model:MODEL,nextContextHash:call.contextHash!,roundNo:128,catalogHash:call.catalogHash!,
     detachedRunnerHash:call.detachedRunnerHash!,resultHashes:[{modelToolUseId:'toolu_scope_gap',
       contentHash:'1'.repeat(64),isError:false}]}
-  await pool.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,
+  await pool.query('UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1',
     [call.requestId,JSON.stringify({boxSessionId:identity.sessionId,boxTurnKey:identity.turnKey,boxRolloverFrom:receipt})])
   const stopped=await f.scopes.control(f.owner,identity,'cancel','explicit-stop')
   assert.equal(stopped.status,'stopped');assert.equal(stopped.proof,'prelaunch_cancelled')

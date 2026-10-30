@@ -10,7 +10,8 @@ test('0331 app role can register/cancel/read exact generations but cannot mutate
   assert.ok(url,'migration0331 requires an explicit isolated PostgreSQL fixture')
   const address=new URL(url)
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(address.hostname) && /_test$/.test(address.pathname))
-  const pool=new Pool({connectionString:url,max:1}),client=await pool.connect()
+  const pool=new Pool({connectionString:url,max:1})
+  const client=await pool.connect()
   const schema=`scope_migration_${randomBytes(6).toString('hex')}`
   try {
     assert.match((await client.query('SELECT current_database() AS db')).rows[0].db,/_test$/)
@@ -24,7 +25,9 @@ test('0331 app role can register/cancel/read exact generations but cannot mutate
       CREATE TABLE agent_containers(id BIGINT PRIMARY KEY);
       INSERT INTO users VALUES(1);INSERT INTO agent_containers VALUES(1)`)
     await client.query(await readFile(new URL('../db/migrations/0331_box_agent_api_scopes.sql',import.meta.url),'utf8'))
-    const root=randomUUID(),scope=randomUUID(),session=deriveBoxAgentSession(root,'agent')
+    const root=randomUUID()
+    const scope=randomUUID()
+    const session=deriveBoxAgentSession(root,'agent')
     await client.query('SET LOCAL ROLE openclaude_app')
     await client.query(`INSERT INTO box_agent_api_scopes(user_id,container_id,scope_id,root_session_id,session_id,agent_id,turn_key)
       VALUES(1,1,$1,$2,$3,'agent',$4)`,[scope,root,session,'a'.repeat(64)])

@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
-import { type OpenClaudeConfig } from '@openclaude/storage'
+import type { OpenClaudeConfig } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
@@ -379,12 +379,13 @@ export class SubprocessRunner extends EventEmitter {
     // Awaited persistence must never send an old ACK into a replacement CCB.
     if (this.proc !== proc || this.spawnGeneration !== generation || proc.exitCode !== null
       || proc.signalCode !== null || proc.stdin.destroyed || !proc.stdin.writable) return
-    try { proc.stdin.write(JSON.stringify({type:'control_response',response})+'\n') } catch { /* Owner recovery retains intent. */ }
+    try { proc.stdin.write(`${JSON.stringify({type:'control_response',response})}\n`) } catch { /* Owner recovery retains intent. */ }
   }
 
   captureBoxAgentStop(turnKey: string): {target?:{owner:BoxScopeOwner;turnKey:string};prepare:()=>Promise<void>;isCurrent:()=>boolean} {
     const proc = this.proc
-    const generation=this.spawnGeneration,root=this.currentSessionId
+    const generation=this.spawnGeneration
+    const root=this.currentSessionId
     if (!proc || !proc.pid || !root) return {prepare:async()=>{},isCurrent:()=>this.proc===proc}
     const owner = this.boxScopeOwners.get(proc)
       ?? captureBoxScopeOwner(proc.pid,generation,this.boxScopeIncarnation,root)

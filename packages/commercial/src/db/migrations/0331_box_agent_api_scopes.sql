@@ -19,6 +19,7 @@ CREATE TABLE box_agent_api_scopes (
 CREATE INDEX idx_box_agent_api_scopes_session ON box_agent_api_scopes(user_id,session_id);
 COMMENT ON TABLE box_agent_api_scopes IS
   'Non-financial invocation control. Cancellation fences future admission/launch only; never physical-run terminal evidence or capacity release.';
+-- compat: New function is called only by the new table trigger; existing table writes never invoke it.
 CREATE FUNCTION fn_guard_box_agent_api_scope_update() RETURNS TRIGGER LANGUAGE plpgsql AS $scope_guard$
 BEGIN
   IF ROW(NEW.user_id,NEW.container_id,NEW.scope_id,NEW.root_session_id,NEW.session_id,NEW.agent_id,NEW.turn_key)
@@ -30,6 +31,7 @@ BEGIN
   RETURN NEW;
 END
 $scope_guard$;
+-- compat: New-table-only trigger rejects identity changes/cancellation reversal; legacy journal writes stay unchanged.
 CREATE TRIGGER box_agent_api_scope_immutable BEFORE UPDATE ON box_agent_api_scopes
   FOR EACH ROW EXECUTE FUNCTION fn_guard_box_agent_api_scope_update();
 GRANT SELECT, INSERT, UPDATE ON box_agent_api_scopes TO CURRENT_USER;

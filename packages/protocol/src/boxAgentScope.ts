@@ -21,7 +21,7 @@ export interface BoxAgentScopeControlResult {
   sequence: number
   status: 'active' | 'pending' | 'stopped'
 }
-/** RFC 9562 UUIDv5, mirrored with CCB's existing uuid dependency. */
+/** RFC 9562 UUIDv5, mirrored in CCB using the same Node crypto primitive. */
 export function deriveBoxAgentSession(rootSessionId: string, agentId: string): string {
   if (!BOX_AGENT_SCOPE_UUID.test(rootSessionId) || !/^[A-Za-z0-9._:-]{1,256}$/.test(agentId)) {
     throw new Error('BOX_AGENT_SCOPE_IDENTITY_INVALID')

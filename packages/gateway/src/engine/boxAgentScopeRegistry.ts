@@ -92,7 +92,7 @@ export class BoxAgentScopeRegistry {
       let file: Awaited<ReturnType<typeof open>> | undefined
       try {
         file = await open(tmp, 'wx', 0o600)
-        await file.writeFile(JSON.stringify(state) + '\n')
+        await file.writeFile(`${JSON.stringify(state)}\n`)
         await file.sync(); await file.close(); file = undefined
         await rename(tmp, this.deps.file)
         const dir = await open(dirname(this.deps.file), 'r')
@@ -149,7 +149,8 @@ export class BoxAgentScopeRegistry {
           if (ancestor && !ancestor.background) { entry.intent = 'cancel'; entry.reason = 'explicit-stop' }
         }
       } else {
-        const a = parseBoxAgentScopeIdentity(entry.request)!, b = parseBoxAgentScopeIdentity(request)!
+        const a = parseBoxAgentScopeIdentity(entry.request)!
+        const b = parseBoxAgentScopeIdentity(request)!
         if (!sameOwner(entry.owner, owner) || JSON.stringify(a) !== JSON.stringify(b)
           || request.sequence < entry.request.sequence
           || (request.sequence === entry.request.sequence && JSON.stringify(request) !== JSON.stringify(entry.request))) {

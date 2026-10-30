@@ -5,13 +5,16 @@ import { handleStop } from '../wsConnection.js'
 import { registerDelegateTraceWait } from '../delegateTrace.js'
 
 function deferred() {
-  let resolve!:()=>void,reject!:(error:Error)=>void
+  let resolve!:()=>void
+  let reject!:(error:Error)=>void
   const promise=new Promise<void>((yes,no)=>{resolve=yes;reject=no})
   return {promise,resolve,reject}
 }
 function fixture() {
   const key='agent:main:webchat:dm:boxagentreceipt'
-  let barrier=deferred(),interrupts=0,prepares=0
+  let barrier=deferred()
+  let interrupts=0
+  let prepares=0
   const external=new AbortController()
   const session={sessionKey:key,peerId:'boxagentreceipt',model:'box-api-claude-opus-5-5',
     _currentTurnKey:'a'.repeat(64),_runningClientMessageId:'m-boxagentreceipt-0001',
@@ -41,9 +44,14 @@ test('actual browser Stop awaits the Box durable barrier before a receipt and lo
 })
 
 test('same Stop receipt retries frozen child targets after the parent CMID ends, without stopping a replacement',async()=>{
-  const f=fixture(),childKey='agent:worker:delegate:old-child'
-  const oldAbort=new AbortController(),newAbort=new AbortController()
-  let fail=true,oldPrepares=0,oldInterrupts=0,newInterrupts=0
+  const f=fixture()
+  const childKey='agent:worker:delegate:old-child'
+  const oldAbort=new AbortController()
+  const newAbort=new AbortController()
+  let fail=true
+  let oldPrepares=0
+  let oldInterrupts=0
+  let newInterrupts=0
   const oldRunner={prepareInterrupt:async()=>{oldPrepares++;if(fail) throw new Error('child private fsync failed')},
     interrupt:()=>{oldInterrupts++;return true}}
   const child={...f.session,sessionKey:childKey,_runningClientMessageId:'m-child',

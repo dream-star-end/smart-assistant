@@ -825,7 +825,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   captureInterruptForReceipt(turnKey?:string) {
-    const active=this._activeTurn,key=turnKey ?? active?.turnKey
+    const active=this._activeTurn
+    const key=turnKey ?? active?.turnKey
     const captured=key && isBoxApiModel(this.model) ? this.runner.captureBoxAgentStop(key) : undefined
     return {target:captured?.target,prepare:()=>captured?.prepare() ?? Promise.resolve(),interrupt:()=>{
       if (this._activeTurn !== active || (captured && !captured.isCurrent())) return false

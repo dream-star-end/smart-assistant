@@ -7,6 +7,7 @@ import type { TaskStateBase } from '../Task.js'
 import { getTaskByType } from '../tasks.js'
 import { emitTaskTerminatedSdk } from '../utils/sdkEventQueue.js'
 import { isLocalShellTask } from './LocalShellTask/guards.js'
+import type { LocalAgentTaskState } from './LocalAgentTask/LocalAgentTask.js'
 
 export class StopTaskError extends Error {
   constructor(
@@ -64,7 +65,15 @@ export async function stopTask(
     )
   }
 
+  const originalAbort=task.type === 'local_agent' ? (task as LocalAgentTaskState).abortController : undefined
   const remoteStop = task.type === 'local_agent' ? await stopBoxAgentById(taskId) : undefined
+  // A resumed task can reuse the logical agent ID while this exact old
+  // invocation waits for its control ACK. Never kill that replacement.
+  const current=getAppState().tasks?.[taskId]
+  if (!current || current.type !== task.type || current.startTime !== task.startTime
+    || (task.type === 'local_agent' && (current as LocalAgentTaskState).abortController !== originalAbort)) {
+    return {taskId,taskType:task.type,command:task.description,...(remoteStop ? {remoteStop} : {})}
+  }
   await taskImpl.kill(taskId, setAppState)
 
   // Bash: suppress the "exit code 137" notification (noise). Agent tasks: don't

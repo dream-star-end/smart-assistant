@@ -1098,7 +1098,8 @@ export async function _runOneTurn(
           try { await runner.prepareInterrupt!('user',turnKey) }
           catch (error) {
             log.warn('box_user_stop_control_pending', { sessionKey: session.sessionKey })
-            onEvent({kind:'error',error:'停止请求尚待持久确认，请重试停止。',errorCode:'BOX_STOP_CONTROL_PENDING'})
+            // The awaiting WS Stop handler reports the pending control. An
+            // engine error here would falsely close a still-running turn.
             terminalRequestPromise = null
             throw error
           }

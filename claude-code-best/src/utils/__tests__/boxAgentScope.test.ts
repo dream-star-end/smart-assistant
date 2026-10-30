@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { getSessionId } from '../../bootstrap/state.js'
+import { deriveBoxAgentSession as serverDeriveBoxAgentSession } from '../../../../packages/protocol/src/boxAgentScope.js'
 import { runWithAgentContext, type SubagentContext } from '../agentContext.js'
 import { bindBoxAgentControlTransport, boxAgentMetadata, captureBoxAgentOrigin,
   createBoxAgentInvocation, currentBoxAgentInvocation, deriveBoxAgentSession,
   detachBoxAgentInvocation, ensureBoxAgentScope, finishBoxAgentInvocation,
-  isBoxApiModel, linkBoxAgentAbort, renewBoxAgentOrigins, scopedBoxDescriptor, withBoxAgentAuxiliaryInvocation,
+  BOX_AGENT_API_MODELS, isBoxApiModel, linkBoxAgentAbort, renewBoxAgentOrigins, scopedBoxDescriptor, withBoxAgentAuxiliaryInvocation,
   scopedBoxHeaders, stopBoxAgentById, type BoxAgentInvocation } from '../boxAgentScope.js'
 
 const BOX = 'box-api-claude-opus-5-5'
@@ -34,19 +35,27 @@ afterEach(async () => {
 describe('Box Agent invocation boundaries', () => {
   test('real subagents get stable independent API UUIDs; root/teammate/other models retain the root', async () => {
     turn('a')
-    const a = scope('agent-a'), b = scope('agent-b')
+    const a = scope('agent-a')
+    const b = scope('agent-b')
     const root = getSessionId()
     expect(boxAgentMetadata(BOX)).toBeUndefined()
     const first = runWithAgentContext(a,() => boxAgentMetadata(BOX)!)
     expect(first.sessionId).toBe(deriveBoxAgentSession(root,'agent-a'))
+    expect(first.sessionId).toBe(serverDeriveBoxAgentSession(root,'agent-a'))
     expect(first.sessionId).not.toBe(root)
     expect(runWithAgentContext(b,() => boxAgentMetadata(BOX)!.sessionId)).not.toBe(first.sessionId)
     expect(runWithAgentContext(a,() => boxAgentMetadata('deepseek-v4-pro')!.sessionId)).toBe(root)
     expect(runWithAgentContext({agentType:'teammate',agentId:'teammate',agentName:'name',teamName:'team',parentSessionId:root},
       () => boxAgentMetadata(BOX))).toBeUndefined()
     expect(() => runWithAgentContext(a,() => boxAgentMetadata(BOX,'different-agent'))).toThrow('BOX_AGENT_CONTEXT_MISMATCH')
-    expect(isBoxApiModel(BOX+'[1m]')).toBe(true)
-    expect(isBoxApiModel('box-claude-opus-5-5')).toBe(false)
+    expect(isBoxApiModel(`${BOX}[1m]`)).toBe(true)
+    for(const model of BOX_AGENT_API_MODELS) {
+      expect(isBoxApiModel(model)).toBe(true)
+      expect(runWithAgentContext(a,()=>boxAgentMetadata(model)!.sessionId)).toBe(first.sessionId)
+      expect(runWithAgentContext(a,()=>boxAgentMetadata(model)!.scopeId)).toBe(a.boxInvocation!.scopeId)
+    }
+    expect(isBoxApiModel('box-api-claude-unknown')).toBe(false)
+    expect(isBoxApiModel('box-claude-haiku-5-5-unknown')).toBe(false)
     turn('b')
     const resumed = scope('agent-a',true)
     expect(resumed.boxInvocation!.sessionId).toBe(first.sessionId)
@@ -56,7 +65,7 @@ describe('Box Agent invocation boundaries', () => {
 
   test('background A freezes metadata/trace/descriptor; only identical authority may renew its lease', async () => {
     turn('a')
-    delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR
+    Reflect.deleteProperty(process.env,'OC_MODEL_EXECUTION_DESCRIPTOR')
     const a = scope('background-a',true)
     turn('b')
     renewBoxAgentOrigins({ANTHROPIC_CUSTOM_HEADERS:process.env.ANTHROPIC_CUSTOM_HEADERS!})
@@ -82,10 +91,11 @@ describe('Box Agent invocation boundaries', () => {
   test('first paid dispatch waits for registration ACK; missing ACK never permits a request', async () => {
     turn('a')
     const a = scope('ack-agent')
-    let acknowledge!: () => void, dispatched = 0
+    let acknowledge!: () => void
+    let dispatched = 0
     const ack = new Promise<void>(resolve => {acknowledge=resolve})
     bindBoxAgentControlTransport(async request => {await ack;return {scopeId:request.scopeId,sequence:request.sequence,status:'active'}})
-    const request = runWithAgentContext(a,async () => {await ensureBoxAgentScope(BOX+'[2m]');dispatched++})
+    const request = runWithAgentContext(a,async () => {await ensureBoxAgentScope(`${BOX}[2m]`);dispatched++})
     await Promise.resolve()
     expect(dispatched).toBe(0)
     acknowledge();await request

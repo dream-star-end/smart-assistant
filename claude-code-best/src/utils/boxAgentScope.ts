@@ -1,6 +1,5 @@
 /** Invocation-owned Box API identity. Never put this object in telemetry or transcripts. */
-import { randomUUID } from 'node:crypto'
-import { v5 as uuidv5 } from 'uuid'
+import { createHash, randomUUID } from 'node:crypto'
 import { getSessionId } from '../bootstrap/state.js'
 import { getAgentContext, runWithAgentContext } from './agentContext.js'
 
@@ -56,12 +55,29 @@ export function bindBoxAgentControlTransport(
   send: (request: BoxAgentControl) => Promise<BoxAgentControlResult>,
 ): void { transport = send }
 
+/** Exact mirror of protocol BOX_API_MODEL_IDS; CCB is a separate build tree. */
+export const BOX_AGENT_API_MODELS: readonly string[] = [
+  'box-api-claude-opus-5-5',
+  'box-api-claude-sonnet-5-5',
+  'box-api-claude-haiku-4-5',
+  'box-api-claude-haiku-5-5',
+  'box-claude-opus-5-5',
+  'box-claude-sonnet-5',
+  'box-claude-haiku-5-5',
+]
 export function isBoxApiModel(model: string | undefined): boolean {
-  return typeof model === 'string' && /^box-api-claude-[a-z0-9.-]+$/.test(model.replace(/\[(1|2)m\]/gi, '').trim().toLowerCase())
+  return typeof model === 'string' && BOX_AGENT_API_MODELS.includes(model.replace(/\[(1|2)m\]/gi, '').trim().toLowerCase())
 }
 
 export function deriveBoxAgentSession(rootSessionId: string, agentId: string): string {
-  return uuidv5(`openclaude-box-agent-api-v1:${agentId}`, rootSessionId)
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(rootSessionId)
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(agentId)) throw new Error('BOX_AGENT_SCOPE_IDENTITY_INVALID')
+  const bytes=createHash('sha1').update(Buffer.from(rootSessionId.replaceAll('-',''),'hex'))
+    .update(`openclaude-box-agent-api-v1:${agentId}`).digest().subarray(0,16)
+  bytes[6]=(bytes[6]! & 0x0f) | 0x50
+  bytes[8]=(bytes[8]! & 0x3f) | 0x80
+  const hex=bytes.toString('hex')
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
 }
 
 function parseHeaders(raw: string | undefined): Record<string, string> {

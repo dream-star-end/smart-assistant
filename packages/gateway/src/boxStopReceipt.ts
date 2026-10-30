@@ -23,7 +23,9 @@ export async function capturedStopReceipt(host:DelegateGuardHost,identity:{
       && host.sessions.getByKey(s.sessionKey)?._runningClientMessageId===identity.clientMessageId)
     if (!root) return undefined
     if (pending.size>=1024) throw new Error('BOX_STOP_RECEIPT_PENDING_FULL')
-    const targets:Captured[]=[],cancelQueued:Array<()=>void>=[],seen=new Set<string>()
+    const targets:Captured[]=[]
+    const cancelQueued:Array<()=>void>=[]
+    const seen=new Set<string>()
     const capture=(key:string,rootTarget=false)=>{
       if (seen.has(key)) return
       seen.add(key)
@@ -31,7 +33,8 @@ export async function capturedStopReceipt(host:DelegateGuardHost,identity:{
       const target=host.sessions.captureInterruptForReceipt(key,rootTarget
         ? {clientMessageId:identity.clientMessageId} : {turnKey:current?._currentTurnKey})
       if(target) targets.push(target)
-      const queued=host._delegateQueueWaiters?.get(key),advisor=host._advisorConsultAborts?.get(key)
+      const queued=host._delegateQueueWaiters?.get(key)
+      const advisor=host._advisorConsultAborts?.get(key)
       const trace= captureDelegateTraceCancel(host,key)
       cancelQueued.push(()=>{trace();queued?.();advisor?.abort()})
       for(const child of host._activeDelegationsByParent?.get(key) ?? []) capture(child)

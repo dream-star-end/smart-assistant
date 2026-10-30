@@ -13,8 +13,9 @@ import { BoxAgentScopes } from '../../packages/commercial/src/http/proxy/boxAgen
 import { BoxAgentScopeRegistry, captureBoxScopeOwner } from '../../packages/gateway/src/engine/boxAgentScopeRegistry.js'
 import type { BoxAgentScopeIdentity } from '../../packages/protocol/src/boxAgentScope.js'
 import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
+import { proveBoxAgentSdkStop } from './boxAgentSdkStopProof.js'
 
-const MODEL='box-api-claude-opus-5-5'
+const MODEL='box-claude-haiku-5-5'
 const TURN='a'.repeat(64)
 const PRICING={v:1,modelId:MODEL,displayName:'Opus',inputPerMtok:'1',outputPerMtok:'1',
   cacheReadPerMtok:'1',cacheWritePerMtok:'1',multiplier:'1'}
@@ -32,7 +33,7 @@ function answer(res:ServerResponse,id:string,block:{type:'text';text:string}|{ty
   event('message_stop',{type:'message_stop'});res.end()
 }
 function killOwn(child:ChildProcess) {
-  if(!child.pid) return
+  if(!child.pid || child.exitCode!==null || child.signalCode!==null) return
   try {process.kill(-child.pid,'SIGKILL')} catch {try {child.kill('SIGKILL')} catch { /* gone */ }}
 }
 
@@ -47,20 +48,27 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
   const scratch=mkdtempSync('/tmp/ocv5-664-agent-proof-')
   const schema=`agent_proof_${randomBytes(6).toString('hex')}`
   const admin=new Pool({...config,max:1})
-  let pool:Pool|undefined,child:ChildProcess|undefined
+  let pool:Pool|undefined
+  let child:ChildProcess|undefined
   let schemaCreated=false
   const runtime=join(scratch,'runtime')
   let controlChain:Promise<void>=Promise.resolve()
   let cleaning=false
   let failure:Error|undefined
-  let resolveResult!:() => void,rejectResult:((error:Error) => void)|undefined
+  let resolveResult!:() => void
+  let rejectResult:((error:Error) => void)|undefined
   const fail=(error:unknown) => {
     if(cleaning) return
     failure ??=error instanceof Error ? error : new Error(String(error))
     rejectResult?.(failure)
   }
-  let rootSession:string|undefined,childSession:string|undefined,hash:string|undefined
-  let rootCalls=0,childCalls=0,requestNo=0
+  let rootSession:string|undefined
+  let childSession:string|undefined
+  let hash:string|undefined
+  let rootCalls=0
+  let childCalls=0
+  let hookCalls=0
+  let requestNo=0
   const registryFile=join(scratch,'scope-control.json')
   const incarnation=randomUUID()
   let registry:BoxAgentScopeRegistry|undefined
@@ -77,10 +85,10 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
     if(cleaning) throw new Error('BOX_AGENT_PROOF_CLEANING')
     const requestId=`synthetic-environment-${randomUUID()}`
     const applied=new Promise<void>(resolve=>{environmentAcks.set(requestId,resolve)})
-    child!.stdin!.write(JSON.stringify({type:'update_environment_variables',variables})+'\n')
+    child!.stdin!.write(`${JSON.stringify({type:'update_environment_variables',variables})}\n`)
     // The stdin loop processes this read-only control after the update. Its
     // ACK makes global B an observed boundary before the real Bash executes.
-    child!.stdin!.write(JSON.stringify({type:'control_request',request_id:requestId,request:{subtype:'mcp_status'}})+'\n')
+    child!.stdin!.write(`${JSON.stringify({type:'control_request',request_id:requestId,request:{subtype:'mcp_status'}})}\n`)
     await applied
     if(cleaning) throw new Error('BOX_AGENT_PROOF_CLEANING')
   }
@@ -122,10 +130,19 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
           description:'Proof local hash',subagent_type:'general-purpose',
           prompt:'Run the Bash tool to create fresh random bytes in agent-proof.bin and return its SHA256.'}})
       } else if(metadata.oc_box_agent_scope !== undefined) {
-        childCalls++
         const scopeId=String(metadata.oc_box_agent_scope)
         const registered=scopesById.get(scopeId)
         assert.ok(registered,'BOX_AGENT_DURABLE_REGISTER_BEFORE_API')
+        if(registered.agentId.startsWith('hook-agent-')) {
+          assert.equal(++hookCalls,1,'the actual SubagentStop verification hook must run once')
+          assert.notEqual(metadata.session_id,rootSession)
+          assert.notEqual(metadata.session_id,childSession,'hook API identity must be independently bound')
+          const hook=await admission(body);await journal.admit(hook)
+          await journal.markPrestartStopped(hook)
+          answer(res,'msg_agent_hook',{type:'tool_use',id:'toolu_hook_result',name:'StructuredOutput',input:{ok:true}})
+          return
+        }
+        childCalls++
         childSession ??=String(metadata.session_id)
         assert.notEqual(childSession,rootSession,'BOX_AGENT_CHILD_API_ID_ISOLATED')
         assert.equal(metadata.session_id,registered.sessionId)
@@ -220,6 +237,8 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
     child=spawn('/usr/bin/node',[join(runtime,'cli.js'),'-p','--input-format','stream-json','--output-format','stream-json',
       '--verbose','--model',MODEL,'--tools','Agent,Bash','--permission-mode','bypassPermissions',
       '--allow-dangerously-skip-permissions','--dangerously-skip-permissions','--setting-sources','',
+      '--settings',JSON.stringify({hooks:{SubagentStop:[{hooks:[{type:'agent',model:MODEL,
+        prompt:'Verify the synthetic child result and return StructuredOutput with ok true.'}]}]}}),
       '--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--disable-slash-commands','--system-prompt','Synthetic Agent boundary proof.'],{
       cwd:scratch,detached:true,stdio:['pipe','pipe','pipe'],...(dropRoot ? {uid:1000,gid:1000} : {}),
       env:{HOME:scratch,TMPDIR:scratch,XDG_CACHE_HOME:scratch,CLAUDE_CONFIG_DIR:scratch,
@@ -229,7 +248,8 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
         ...environmentA,
         CLAUDE_CODE_EXTRA_BODY:JSON.stringify({metadata:{user_id:JSON.stringify({session_id:'untrusted-extra-body'})}}),
         }})
-    let buffer='',stderr=''
+    let buffer=''
+    let stderr=''
     const result=new Promise<void>((resolve,reject) => {resolveResult=resolve;rejectResult=reject})
     const timer=setTimeout(() => fail(new Error('BOX_AGENT_REAL_CCB_DEADLINE')),60_000)
     child.on('error',fail)
@@ -258,7 +278,7 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
               if(cleaning || child !== capturedChild || capturedChild.exitCode !== null
                 || capturedChild.signalCode !== null || !capturedChild.stdin?.writable
                 || capturedChild.stdin.writableEnded || capturedChild.stdin.destroyed) return
-              capturedChild.stdin.write(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:frame.request_id,response}})+'\n')
+              capturedChild.stdin.write(`${JSON.stringify({type:'control_response',response:{subtype:'success',request_id:frame.request_id,response}})}\n`)
             }).catch(fail)
           } else if(frame.type === 'result') {
             if(frame.is_error) fail(new Error('BOX_AGENT_PARENT_RESULT_ERROR'))
@@ -267,17 +287,18 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
         } catch(error) {fail(error)}
       }
     })
-    child.stdin!.write(JSON.stringify({type:'user',message:{role:'user',content:'Use Agent to obtain a real local Bash hash.'}})+'\n')
+    child.stdin!.write(`${JSON.stringify({type:'user',message:{role:'user',content:'Use Agent to obtain a real local Bash hash.'}})}\n`)
     try {await result} finally {clearTimeout(timer)}
     if(failure) throw failure
     assert.equal(rootCalls,2);assert.equal(childCalls,2)
+    assert.equal(hookCalls,1,'BOX_AGENT_ACTUAL_STOP_HOOK_REQUIRED')
     assert.ok(childSession && rootSession && childSession !== rootSession)
     await controlChain;await registry.pump()
     if(failure) throw failure
     // The exact old serializer identity is a negative control at otherwise
     // sufficient capacity, using the observed real child request body.
     const old=structuredClone(bodies.find(body => meta(body).oc_box_agent_scope !== undefined)!)
-    const oldMeta=meta(old);delete oldMeta.oc_box_agent_scope;oldMeta.session_id=rootSession
+    const oldMeta=meta(old);Reflect.deleteProperty(oldMeta,'oc_box_agent_scope');oldMeta.session_id=rootSession
     old.metadata={user_id:JSON.stringify(oldMeta)}
     await assert.rejects(() => admission(old).then(input => journal.admit(input)),/BOX_CAPACITY_HELD/,
       'BOX_AGENT_LEGACY_SAME_SESSION_MUST_REJECT')
@@ -287,12 +308,17 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
     const defaultJournal=new BoxDurableJournal(pool,() => policy)
     const parent=await admission(first,2n);await defaultJournal.admit(parent)
     const actualChild=structuredClone(bodies.find(body => meta(body).oc_box_agent_scope !== undefined)!)
-    const childMeta=meta(actualChild);delete childMeta.oc_box_agent_scope
+    const childMeta=meta(actualChild);Reflect.deleteProperty(childMeta,'oc_box_agent_scope')
     actualChild.metadata={user_id:JSON.stringify(childMeta)}
     await assert.rejects(() => admission(actualChild,3n,2n).then(input => defaultJournal.admit(input)),/BOX_CAPACITY_HELD/,
       'BOX_AGENT_DEFAULT_ACCOUNT_ONE_CAP_MUST_NOT_EXPAND')
     await assert.rejects(() => admission(actualChild,2n,3n).then(input => defaultJournal.admit(input)),/BOX_CAPACITY_HELD/,
       'BOX_AGENT_DEFAULT_USER_ONE_CAP_MUST_NOT_EXPAND')
+    await proveBoxAgentSdkStop({runtime,model:MODEL,environment:environmentA,registry,answer,registerCleanup,
+      admitSynthetic:async(body)=>{
+        const run=await admission(body);await journal.admit(run)
+        await journal.markPrestartStopped(run)
+      }})
     if(failure) throw failure
     return '[ocv5-664-box-agent-session] PASS — actual production CCB Agent returns a fresh Bash hash with an isolated stable API session; real PG admits parent plus child, rejects legacy/same-child collision, and preserves default capacity'
   } catch(error) {

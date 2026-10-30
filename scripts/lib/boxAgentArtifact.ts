@@ -34,10 +34,11 @@ export function recordBoxAgentArtifact(root:string,bunVersion:string,ccbDistKey:
   if(!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(bunVersion) || !/^[a-f0-9]{12}$/.test(ccbDistKey)) {
     throw new Error('BOX_AGENT_ARTIFACT_BUILD_IDENTITY_INVALID')
   }
-  const source=sourceFiles(root),dist=files(root,join(root,'claude-code-best/dist'),new Set())
+  const source=sourceFiles(root)
+  const dist=files(root,join(root,'claude-code-best/dist'),new Set())
   if(!dist.some(([path]) => path === 'claude-code-best/dist/cli.js')) throw new Error('BOX_AGENT_ARTIFACT_ENTRY_MISSING')
-  writeFileSync(join(root,RECEIPT),JSON.stringify({version:1,bunVersion,ccbDistKey,
-    productionProfile:true,sourceDigest:digest(source),source,distDigest:digest(dist),dist},null,2)+'\n',{mode:0o600})
+  writeFileSync(join(root,RECEIPT),`${JSON.stringify({version:1,bunVersion,ccbDistKey,
+    productionProfile:true,sourceDigest:digest(source),source,distDigest:digest(dist),dist},null,2)}\n`,{mode:0o600})
 }
 export function verifiedBoxAgentEntry(root:string):string {
   const value=JSON.parse(readFileSync(join(root,RECEIPT),'utf8')) as Record<string,unknown>

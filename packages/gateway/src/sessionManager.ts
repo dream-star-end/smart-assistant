@@ -2225,7 +2225,9 @@ export class SessionManager {
     const s=this.sessions.get(sessionKey)
     if (!s || (exact?.turnKey !== undefined && s._currentTurnKey !== exact.turnKey)
       || (exact?.clientMessageId !== undefined && s._runningClientMessageId !== exact.clientMessageId)) return undefined
-    const runner=s.runner, turnKey=s._currentTurnKey, external=s._externalTurnAbort
+    const runner=s.runner
+    const turnKey=s._currentTurnKey
+    const external=s._externalTurnAbort
     const persist=s._persistActiveTurn
     if (!persist && exact?.clientMessageId !== undefined) this.fencePreStartStop(s.peerId,exact.clientMessageId)
     const engine=isBoxApiModel(s.model) ? runner.captureInterruptForReceipt?.(turnKey) : undefined

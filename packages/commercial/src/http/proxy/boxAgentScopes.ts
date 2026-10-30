@@ -44,7 +44,7 @@ function terminalGroup(rows: Row[]): boolean {
   }
   if (rows.some(row => !['committed', 'aborted'].includes(row.state))) return false
   try {
-    parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + '\n',
+    parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`,
       { runNonce: String(ctx.boxRunNonce), leaseEpoch: String(ctx.boxLeaseEpoch) })
   } catch { return false }
   // Validate the complete physical chain; native cache ancestors are different runs.
@@ -52,14 +52,14 @@ function terminalGroup(rows: Row[]): boolean {
   const seen = new Set<string>()
   let cursor: Row | undefined = leaf
   while (cursor) {
-    const item = cursor.ctx
+    const item: Row['ctx'] = cursor.ctx
     if (seen.has(cursor.request_id) || !['terminal', 'failed_stopped'].includes(String(item.boxState))
       || item.boxAccountId !== ctx.boxAccountId || item.boxRunNonce !== ctx.boxRunNonce
       || item.boxLeaseEpoch !== ctx.boxLeaseEpoch || item.boxSessionId !== ctx.boxSessionId
       || item.boxTurnKey !== ctx.boxTurnKey || item.boxAgentScopeId !== ctx.boxAgentScopeId) return false
     seen.add(cursor.request_id)
     if (item.boxOwnerRequestId === undefined) break
-    const parent = typeof item.boxOwnerRequestId === 'string' ? byId.get(item.boxOwnerRequestId) : undefined
+    const parent: Row | undefined = typeof item.boxOwnerRequestId === 'string' ? byId.get(item.boxOwnerRequestId) : undefined
     if (!parent || parent.ctx.boxResumeRequestId !== cursor.request_id) return false
     cursor = parent
   }
@@ -158,7 +158,8 @@ export class BoxAgentScopes {
     await Promise.allSettled(view.groups.filter(rows => !terminalGroup(rows)).map(async rows => {
       const leafs = rows.filter(row => row.ctx.boxResumeRequestId === undefined)
       if (leafs.length !== 1) return
-      const leaf = leafs[0]!, ctx = leaf.ctx
+      const leaf = leafs[0]!
+      const ctx = leaf.ctx
       if (ctx.boxAgentScopeId !== identity.scopeId || ctx.boxSessionId !== identity.sessionId
         || ctx.boxTurnKey !== identity.turnKey || typeof ctx.boxAccountId !== 'string'
         || !/^[1-9][0-9]{0,18}$/.test(ctx.boxAccountId)
@@ -170,7 +171,7 @@ export class BoxAgentScopes {
         const receipt = prelaunchReceipt(ctx)
         if (receipt) await this.deps.recoverPrelaunch({ ...run, receipt }, identity.scopeId)
       } else {
-        try { parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + '\n', run); return }
+        try { parseBoxTerminalProof(`${JSON.stringify(ctx.boxTerminalProof)}\n`, run); return }
         catch { /* Pending physical run: use only its original keeper. */ }
         await this.deps.coordinator.requestStop(run, { scopeId: identity.scopeId, reason: view.reason })
       }

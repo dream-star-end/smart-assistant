@@ -24,7 +24,8 @@ class FakeProc {
   pid=process.pid;exitCode=null;signalCode=null;stdin=new FakeStream()
 }
 function fixture() {
-  const root=randomUUID(),proc=new FakeProc()
+  const root=randomUUID()
+  const proc=new FakeProc()
   const runner=new SubprocessRunner({sessionKey:'agent:main:webchat:dm:scopegen',agentId:'main',
     agentBaseDir:home,config:{} as never,harness:'ccb',resumeSessionId:root} as never)
   const internal=runner as unknown as {proc:FakeProc;spawnGeneration:number;
@@ -38,8 +39,10 @@ function fixture() {
 }
 
 test('a late scope-control ACK never reaches a replacement process generation',async()=>{
-  const f=fixture(),original=registry.handle
-  let entered!:()=>void,release!:()=>void
+  const f=fixture()
+  const original=registry.handle
+  let entered!:()=>void
+  let release!:()=>void
   const started=new Promise<void>(resolve=>{entered=resolve})
   const paused=new Promise<void>(resolve=>{release=resolve})
   registry.handle=async request=>{entered();await paused;return {scopeId:(request as typeof f.request.request).scopeId,sequence:1,status:'active'}}
@@ -54,13 +57,14 @@ test('a late scope-control ACK never reaches a replacement process generation',a
 })
 
 test('dedicated control frames leave the parser and root session untouched and ACK only their current owner',async()=>{
-  const f=fixture(),original=registry.handle
+  const f=fixture()
+  const original=registry.handle
   let resolveHandled!:()=>void
   const handled=new Promise<void>(resolve=>{resolveHandled=resolve})
   registry.handle=async request=>{resolveHandled();return {scopeId:(request as typeof f.request.request).scopeId,sequence:1,status:'active'}}
   const ordinary:unknown[]=[];f.runner.on('message',message=>ordinary.push(message))
   try {
-    f.internal.handleStdout(JSON.stringify(f.request)+'\n',undefined,{proc:f.proc,generation:1})
+    f.internal.handleStdout(`${JSON.stringify(f.request)}\n`,undefined,{proc:f.proc,generation:1})
     await handled;await new Promise<void>(resolve=>setImmediate(resolve))
     assert.equal(ordinary.length,0);assert.equal(f.runner.sessionId,f.root)
     assert.equal(f.proc.stdin.writes.length,1)
@@ -69,7 +73,8 @@ test('dedicated control frames leave the parser and root session untouched and A
 })
 
 test('a captured Stop retry preserves its original owner after process replacement',async()=>{
-  const f=fixture(),original=registry.prepareRootStop
+  const f=fixture()
+  const original=registry.prepareRootStop
   const captured=f.runner.captureBoxAgentStop('a'.repeat(64))
   let observed:unknown
   registry.prepareRootStop=async(owner,turnKey)=>{observed={owner,turnKey}}

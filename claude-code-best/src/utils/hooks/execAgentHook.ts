@@ -34,6 +34,7 @@ import {
   registerStructuredOutputEnforcement,
 } from './hookHelpers.js'
 import { clearSessionHooks } from './sessionHooks.js'
+import { withBoxAgentAuxiliaryInvocation } from '../boxAgentScope.js'
 
 type QueryMessage = Message | StreamEvent | RequestStartEvent
 
@@ -182,11 +183,12 @@ When done, return your result using the ${SYNTHETIC_OUTPUT_TOOL_NAME} tool with:
         hookAgentId,
       )
 
-      let structuredOutputResult: { ok: boolean; reason?: string } | null = null
       let turnCount = 0
       let hitMaxTurns = false
 
       // Use query() for multi-turn execution
+      const structuredOutputResult=await withBoxAgentAuxiliaryInvocation(hookAgentId,combinedSignal,async()=>{
+      let structuredOutputResult: { ok: boolean; reason?: string } | null = null
       for await (const message of query({
         messages: agentMessages,
         systemPrompt,
@@ -245,6 +247,8 @@ When done, return your result using the ${SYNTHETIC_OUTPUT_TOOL_NAME} tool with:
           }
         }
       }
+      return structuredOutputResult
+      })
 
       parentTimeoutSignal.removeEventListener('abort', onParentTimeout)
       cleanupCombinedSignal()

@@ -14,7 +14,9 @@ async function fixture() {
   const root = randomUUID()
   const owner = captureBoxScopeOwner(process.pid,1,randomUUID(),root)
   const server = new Map<string,boolean>()
-  let proof = true, failCancel = false, loseRegisterAck = false
+  let proof = true
+  let failCancel = false
+  let loseRegisterAck = false
   const calls: Array<{scopeId:string;operation:string}> = []
   const remote: typeof controlBoxAgentScope = async (identity,operation) => {
     // ACK must be preceded by the actual durable private control file.
@@ -65,7 +67,8 @@ test('root Stop persists before interrupt, catches late foreground registration,
   const f = await fixture()
   try {
     const registry = f.create()
-    const foreground = f.request('foreground'), background = f.request('background',true)
+    const foreground = f.request('foreground')
+    const background = f.request('background',true)
     const nested = f.request('nested-under-background',false,background.scopeId)
     for (const request of [foreground,background,nested]) await registry.handle(request,f.owner)
     await registry.prepareRootStop(f.owner,foreground.turnKey)
@@ -86,7 +89,8 @@ test('durable detach precedes root Stop and individual Stop leaves peers alive',
   const f = await fixture()
   try {
     const registry = f.create()
-    const a = f.request('detached'), b = f.request('peer',true)
+    const a = f.request('detached')
+    const b = f.request('peer',true)
     await registry.handle(a,f.owner);await registry.handle(b,f.owner)
     await registry.handle({...a,operation:'detach',sequence:2},f.owner)
     await registry.prepareRootStop(f.owner,a.turnKey)
@@ -102,7 +106,9 @@ test('durable detach precedes root Stop and individual Stop leaves peers alive',
 test('captured Stop tree root fences are one durable write before any owner can be interrupted',async()=>{
   const f=await fixture()
   try {
-    const registry=f.create(),a=f.request('owner-a'),b=f.request('owner-b')
+    const registry=f.create()
+    const a=f.request('owner-a')
+    const b=f.request('owner-b')
     const second={...f.owner,generation:2,incarnation:randomUUID()}
     await registry.handle(a,f.owner);await registry.handle(b,second)
     await assert.rejects(()=>registry.prepareRootStops([{owner:f.owner,turnKey:a.turnKey},
