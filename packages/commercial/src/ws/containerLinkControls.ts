@@ -86,9 +86,10 @@ export class ContainerLinkControls {
                      d.admitted_at DESC,d.dispatch_id DESC LIMIT 1
          ) d ON true
          JOIN agent_containers ac ON ac.user_id=c.user_id AND ac.state='active' AND ac.runtime_channel=$2
+          AND ac.runtime_kind IN ('docker','desktop')
           AND (ac.id=d.agent_container_id OR (d.agent_container_id IS NULL AND NOT EXISTS (
             SELECT 1 FROM agent_containers other WHERE other.user_id=c.user_id AND other.state='active'
-              AND other.runtime_channel=$2 AND other.id<>ac.id)))
+              AND other.runtime_channel=$2 AND other.runtime_kind IN ('docker','desktop') AND other.id<>ac.id)))
         WHERE c.user_id=$1 AND c.status IN ('pending','leased') AND c.next_attempt_at<=NOW()
           AND (c.status='pending' OR c.lease_until<NOW())
           AND ($3::text IS NULL OR c.control_id>$3)

@@ -14,7 +14,7 @@ export async function scanContainerLinkCarriers(pool: Queryable, channel: string
        FROM turn_dispatches d JOIN agent_containers ac ON ac.id=d.agent_container_id AND ac.user_id=d.user_id
        JOIN client_sessions s ON s.id=d.session_id AND s.user_id='c:' || d.user_id::text
       WHERE d.status IN ('admitted','accepted') AND d.terminal_at IS NULL AND s.deleted_at IS NULL
-        AND ac.state='active' AND ac.runtime_channel=$1
+        AND ac.state='active' AND ac.runtime_channel=$1 AND ac.runtime_kind IN ('docker','desktop')
         AND ($2::bigint IS NULL OR (d.user_id,d.agent_container_id)>($2::bigint,$3::bigint))
       ORDER BY d.user_id, d.agent_container_id::int LIMIT 100`,
     [channel, after?.uid ?? null, after?.containerId ?? null],

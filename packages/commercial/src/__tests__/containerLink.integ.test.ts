@@ -57,7 +57,7 @@ async function recoveryFixture(): Promise<Client> {
   await client.query(`CREATE TEMP TABLE client_sessions(id text PRIMARY KEY,user_id text,deleted_at timestamptz);
     CREATE TEMP TABLE compute_hosts(id uuid,name text);
     CREATE TEMP TABLE agent_containers(id bigint PRIMARY KEY,user_id bigint,state text,runtime_channel text,
-      runtime_kind text,bound_ip inet,port int,host_uuid uuid,container_internal_id text);
+      runtime_kind text NOT NULL DEFAULT 'docker',bound_ip inet,port int,host_uuid uuid,container_internal_id text);
     CREATE TEMP TABLE turn_dispatches(dispatch_id uuid PRIMARY KEY,user_id bigint,session_id text,client_message_id text,
       agent_id text,model text,request_hash text,billing_request_id text,attempt_no int,status text,outcome text,
       failure_code text,conflict_reason text,resolution text,resolved_at timestamptz,client_notified boolean,
@@ -420,15 +420,19 @@ test("shutdown fences late endpoint lookup during startup and reconnect", async 
   }
 });
 
-test("startup scan keyset pagination is numeric and excludes other runtime channels and deleted sessions", async () => {
+test("startup scan keyset pagination is numeric and excludes other runtime channels, unsupported carriers and deleted sessions", async () => {
   const client = await recoveryFixture();
   try {
-    await client.query(`INSERT INTO client_sessions VALUES ('second','c:100',NULL),('deleted','c:99',NOW());
+    await client.query(`INSERT INTO client_sessions VALUES ('second','c:100',NULL),('deleted','c:99',NOW()),('unsupported','c:101',NULL);
       INSERT INTO agent_containers(id,user_id,state,runtime_channel) VALUES (100,100,'active','v5'),(99,99,'active','v5'),(88,42,'active','v3');
       INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,attempt_no,status,agent_container_id)
       VALUES ('33333333-3333-4333-8333-333333333333',100,'second','m','main',1,'admitted',100),
              ('44444444-4444-4444-8444-444444444444',99,'deleted','m','main',1,'accepted',99),
              ('55555555-5555-4555-8555-555555555555',42,'restored','m','main',1,'accepted',88)`);
+    await client.query(`INSERT INTO agent_containers(id,user_id,state,runtime_channel,runtime_kind)
+      VALUES (101,101,'active','v5','unsupported');
+      INSERT INTO turn_dispatches(dispatch_id,user_id,session_id,client_message_id,agent_id,attempt_no,status,agent_container_id)
+      VALUES ('66666666-6666-4666-8666-666666666666',101,'unsupported','m','main',1,'accepted',101)`);
     assert.deepEqual(await scanContainerLinkCarriers(client, "v5", null), [{ uid: "42", containerId: 7 }, { uid: "100", containerId: 100 }]);
     assert.deepEqual(await scanContainerLinkCarriers(client, "v5", { uid: "42", containerId: 7 }), [{ uid: "100", containerId: 100 }]);
   } finally { await client.end(); }

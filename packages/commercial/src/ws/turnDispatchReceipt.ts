@@ -1,7 +1,7 @@
 import { isClientMessageId, type OutboundAck } from '@openclaude/protocol'
 import type { Pool } from 'pg'
 import { casAdmittedToAccepted, casToTerminal, getDispatchByLogicalKey } from '../dispatch/turnDispatchStore.js'
-import { markRecoveryContainerReceipt, releaseRecoveryPreReceipt, type ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js'
+import { markRecoveryContainerReceipt, type ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js'
 import { recoveryRunningFrame } from './recoveryPresentation.js'
 
 type Receipt = {
@@ -84,15 +84,12 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
     void (async () => {
       let persisted = false
       try {
-        persisted = rec.recoveryJob
-          ? await releaseRecoveryPreReceipt(pool, {
-            job: rec.recoveryJob, dispatchId: rec.dispatchId,
-            dispatchOwner: rec.leaseOwnerId, dispatchLeaseEpoch: rec.leaseEpoch,
-          })
-          : await casToTerminal(pool, {
-            dispatchId: rec.dispatchId, outcome: 'not_accepted', failureCode: 'DISPATCH_NOT_ACCEPTED',
-            clientNotified: false, fromStatuses: ['admitted'], expectedEpoch: rec.leaseEpoch,
-          }) !== null
+        // A rejected inbox identity is an irreversible container tombstone.
+        // Keep the commercial terminal handoff so recovery selects a new cmid.
+        persisted = await casToTerminal(pool, {
+          dispatchId: rec.dispatchId, outcome: 'not_accepted', failureCode: 'DISPATCH_NOT_ACCEPTED',
+          clientNotified: false, fromStatuses: ['admitted'], expectedEpoch: rec.leaseEpoch,
+        }) !== null
       } catch (err) {
         context.warn('user-chat-bridge: rejected receipt convergence failed', { dispatchId: rec.dispatchId, err })
       } finally {
