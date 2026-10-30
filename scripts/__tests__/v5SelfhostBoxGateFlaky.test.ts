@@ -406,6 +406,8 @@ describe("host idle before the Box gates (OCV5-557 item 3)", () => {
       "EOF",
       "echo $$ > \"$1\"",
       "flock \"$2\" sleep 30",
+      // Trailing builtin keeps bash from exec'ing flock, so the heredoc stays in cmdline.
+      ":",
     ].join("\n");
     const writer = spawn("bash", ["-c", body, "bash", ready, blockLock], {
       cwd: fx.dir, stdio: "ignore", detached: true,
@@ -428,8 +430,13 @@ describe("host idle before the Box gates (OCV5-557 item 3)", () => {
       await new Promise((r) => setTimeout(r, 30));
     }
     assert.ok(writer.pid, "heredoc bash did not start");
-    assert.ok(writerTree.length >= 2, `expected blocked flock child in state S, tree=${writerTree.join(",")}`);
-    const cmdline = readFileSync(`/proc/${writer.pid}/cmdline`, "utf8").split("\0").join(" ");
+    const cmdline = existsSync(`/proc/${writer.pid}/cmdline`)
+      ? readFileSync(`/proc/${writer.pid}/cmdline`, "utf8").split("\0").join(" ")
+      : "";
+    assert.ok(
+      writerTree.length >= 2,
+      `expected blocked flock child in state S, tree=${writerTree.join(",")} cmdline=${JSON.stringify(cmdline)}`,
+    );
     assert.match(cmdline, /cat > web-checks\.sh <<'EOF'/);
     assert.match(cmdline, /npm run test/);
     assert.match(readFileSync(path.join(fx.dir, "web-checks.sh"), "utf8"), /^npm run test$/m);
