@@ -9546,7 +9546,7 @@
       "occurredAt": "2026-10-30",
       "severity": "P1",
       "symptom": "商业uid4在cc2上游拒绝后，已启动且有自身停止证明的历史恢复请求仍持有旧boxRecoveredBy；切池前已开始、之后20次恢复在重新选号前返回BOX_RESUME_IN_PROGRESS。允许terminal dispatch下aborted/failed_stopped、无新handoff/replay/后继的失败恢复经session锁及旧holder CAS让出认领，复用完整历史重载；活跃、unknown、完成和证明缺失保持拒绝。",
-      "rootFixCommit": "03d44825",
+      "rootFixCommit": "e2a3f1fc",
       "regressions": [
         {
           "layer": "integration",
@@ -9568,9 +9568,6 @@
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[box-stopped-recovery-claim] PASS"
         }
-      ],
-      "coverageCommits": [
-        "e2a3f1fc"
       ]
     }
   ]
