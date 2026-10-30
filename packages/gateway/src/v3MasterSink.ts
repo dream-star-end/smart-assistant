@@ -209,6 +209,7 @@ export interface V3MasterSinkWirePayload {
    *  diverged from `end_turn`). Renders the red "已截断" pill on the
    *  assistant message after a refresh. */
   truncated?: boolean
+  truncatedReason?: 'max_tokens' | 'pause_turn'
   /** Plan §4.4 改动 7 — short error code for refresh-stable error pill
    *  (e.g. 'overloaded_error'). Joins `errorDetail` for the long form. */
   errorCode?: string
