@@ -1,6 +1,6 @@
 // OCV5-593 project frame: breadcrumb, step tabs (需求 / 设定 / 镜头 / 配音 / 音乐 / 成片), credit pill.
 // The tabs also show the step the director is on (workStage), and the page follows it while the
-// user is still on the step it just finished.
+// user has not edited a form or taken control of navigation.
 
 import { ChevronRight, Clapperboard, Coins } from 'lucide-react'
 import { useEffect, useRef } from 'react'
@@ -51,13 +51,25 @@ export function ProjectShell(props: {
   const { state, reload, refresh, applyProject } = useStudioProject(auth, projectId)
   const stage = state.state === 'ready' ? workStage(state.view) : null
 
-  // Follow the director from one step to the next, but only from the page of the step it left: a
-  // page the user opened themselves (or the review of one shot) is never taken away.
+  // Editing or choosing a page takes control for this project's open shell lifetime.
+  // Progress indicators still advance, while local form drafts stay mounted.
+  const followEnabled = useRef(true)
+  const disableFollow = () => {
+    followEnabled.current = false
+  }
+  useEffect(() => {
+    const onPop = () => {
+      followEnabled.current = false
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
   const followed = useRef<{ id: string; stage: StudioStage } | null>(null)
   useEffect(() => {
     if (!stage) return
     const prev = followed.current?.id === projectId ? followed.current.stage : null
     followed.current = { id: projectId, stage }
+    if (!followEnabled.current) return
     const to = followStage(prev, stage, page)
     if (to) navigate({ kind: 'project', id: projectId, page: to }, true)
   }, [stage, page, projectId, navigate])
@@ -84,7 +96,10 @@ export function ProjectShell(props: {
   }
   const { project } = state.view
   const pct = budgetPercent(project.spentCredits, project.reservedCredits, project.budgetCredits)
-  const go = (p: StudioPage) => navigate({ kind: 'project', id: projectId, page: p })
+  const go = (p: StudioPage) => {
+    disableFollow()
+    navigate({ kind: 'project', id: projectId, page: p })
+  }
   // A finished film has every step done; a failed or canceled project has none under way.
   const stageAt =
     project.status === 'done'
@@ -93,8 +108,10 @@ export function ProjectShell(props: {
         ? STAGE_ORDER.indexOf(stage)
         : -1
   const stepState = (i: number) => (i < stageAt ? 'done' : i === stageAt ? 'now' : undefined)
-  const openShot = (shot: string) =>
+  const openShot = (shot: string) => {
+    disableFollow()
     navigate({ kind: 'project', id: projectId, page: 'review', shot })
+  }
 
   return (
     <>
@@ -169,6 +186,7 @@ export function ProjectShell(props: {
           onProject={applyProject}
           onReload={reload}
           onDeleted={() => navigate({ kind: 'home' }, true)}
+          onEdit={disableFollow}
         />
       ) : page === 'board' ? (
         <BoardPage
@@ -196,6 +214,7 @@ export function ProjectShell(props: {
       ) : page === 'voice' ? (
         <VoicePage
           onReload={reload}
+          onEdit={disableFollow}
           auth={auth}
           view={state.view}
           providers={props.providers}

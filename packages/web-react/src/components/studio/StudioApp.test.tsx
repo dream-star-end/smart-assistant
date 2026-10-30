@@ -12,7 +12,8 @@ vi.mock('../../lib/api', () => ({
 }))
 
 import { __resetStudioProbeCache } from '../../hooks/useStudioProviders'
-import type { ProvidersView, StudioProject } from '../../lib/studio/types'
+import { STUDIO_PUSH_EVENT } from '../../lib/studio/push'
+import type { ProvidersView, StudioProject, StudioProjectView } from '../../lib/studio/types'
 import { StudioApp } from './StudioApp'
 
 const ID = '11111111-2222-4333-8444-555555555555'
@@ -76,6 +77,49 @@ function project(over: Partial<StudioProject> = {}): StudioProject {
     updatedAt: '2026-10-23T00:00:00Z',
     ...over,
   }
+}
+
+function progressingView(stage: 'brief' | 'board' | 'voice' | 'final'): StudioProjectView {
+  return {
+    project: project({
+      status: stage === 'brief' ? 'planning' : stage === 'final' ? 'composing' : 'running',
+    }),
+    shots:
+      stage === 'brief'
+        ? []
+        : [
+            {
+              id: 's0',
+              ordinal: 0,
+              spec: { title: '晨雾', durationSec: 5 },
+              status: stage === 'board' ? 'planned' : 'ready',
+              activeTakeId: null,
+            },
+          ],
+    lines:
+      stage === 'voice' || stage === 'final'
+        ? [
+            {
+              id: 'l0',
+              shotId: 's0',
+              ordinal: 0,
+              speakerAssetId: null,
+              text: '清晨的森林醒来了',
+              emotion: null,
+              speed: null,
+              status: stage === 'voice' ? 'generating' : 'ready',
+              activeTakeId: stage === 'voice' ? null : 't-line',
+            },
+          ]
+        : [],
+    assets: [],
+    takes: [],
+    events: [],
+  }
+}
+
+function pushProject() {
+  fireEvent(window, new CustomEvent(STUDIO_PUSH_EVENT, { detail: { projectId: ID } }))
 }
 
 type Handler = (init?: RequestInit) => { status: number; body: unknown }
@@ -254,6 +298,117 @@ describe('StudioApp (OCV5-593)', () => {
     await waitFor(() => expect(location.pathname).toBe(`/studio/p/${ID}/image`))
     expect(screen.getByRole('link', { name: /设定/ })).toHaveAttribute('data-step', 'now')
     expect(screen.getByRole('link', { name: /需求/ })).toHaveAttribute('data-step', 'done')
+  })
+
+  test('automatic step following retains an unsaved budget when planning finishes', async () => {
+    let view = progressingView('brief')
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: view })
+    mount(`/studio/p/${ID}/brief`)
+    fireEvent.change(await screen.findByLabelText('调整上限'), {
+      target: { value: '4300' },
+    })
+
+    view = progressingView('board')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /镜头/ })).toHaveAttribute('data-step', 'now'),
+    )
+    expect(location.pathname).toBe(`/studio/p/${ID}/brief`)
+    expect(screen.getByLabelText('调整上限')).toHaveValue('4300')
+    expect(calls.every((c) => c.method === 'GET')).toBe(true)
+  })
+
+  test('automatic step following retains a voice design draft when narration finishes', async () => {
+    let view = progressingView('voice')
+    const providers: ProvidersView = {
+      kinds: PROVIDERS.kinds.map((kind) =>
+        kind.kind === 'voice'
+          ? {
+              kind: 'voice',
+              state: 'ready',
+              providers: [
+                {
+                  id: 'minimax-speech',
+                  label: 'MiniMax 语音',
+                  state: 'ready',
+                  models: [
+                    {
+                      id: 'minimax-voice-design',
+                      label: 'MiniMax 音色设计',
+                      ops: ['voice.design', 'voice.clone'],
+                      isDefault: true,
+                    },
+                  ],
+                },
+              ],
+            }
+          : kind,
+      ),
+    }
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: providers })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: view })
+    mount(`/studio/p/${ID}/voice`)
+    fireEvent.click(await screen.findByRole('button', { name: '一句话设计' }))
+    fireEvent.change(screen.getByLabelText('声音描述'), {
+      target: { value: '沉稳温暖的纪录片旁白' },
+    })
+
+    view = progressingView('final')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /成片/ })).toHaveAttribute('data-step', 'now'),
+    )
+    expect(location.pathname).toBe(`/studio/p/${ID}/voice`)
+    expect(screen.getByRole('dialog', { name: '一句话设计音色' })).toBeInTheDocument()
+    expect(screen.getByLabelText('声音描述')).toHaveValue('沉稳温暖的纪录片旁白')
+    expect(calls.every((c) => c.method === 'GET')).toBe(true)
+  })
+
+  test('manual navigation keeps control after progress catches up with the selected page', async () => {
+    let view = progressingView('brief')
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: view })
+    mount(`/studio/p/${ID}/brief`)
+    fireEvent.click(await screen.findByRole('link', { name: /镜头/ }))
+    expect(location.pathname).toBe(`/studio/p/${ID}`)
+
+    view = progressingView('board')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /镜头/ })).toHaveAttribute('data-step', 'now'),
+    )
+    view = progressingView('voice')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /配音/ })).toHaveAttribute('data-step', 'now'),
+    )
+    expect(location.pathname).toBe(`/studio/p/${ID}`)
+    expect(screen.getByRole('heading', { name: '镜头' })).toBeInTheDocument()
+  })
+
+  test('browser history navigation keeps control after progress catches up', async () => {
+    let view = progressingView('brief')
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({ status: 200, body: view })
+    mount(`/studio/p/${ID}/brief`)
+    await screen.findByLabelText('调整上限')
+    history.pushState(null, '', `/studio/p/${ID}`)
+    fireEvent(window, new PopStateEvent('popstate'))
+    expect(screen.getByRole('heading', { name: '镜头' })).toBeInTheDocument()
+
+    view = progressingView('board')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /镜头/ })).toHaveAttribute('data-step', 'now'),
+    )
+    view = progressingView('voice')
+    pushProject()
+    await waitFor(() =>
+      expect(screen.getByRole('link', { name: /配音/ })).toHaveAttribute('data-step', 'now'),
+    )
+    expect(location.pathname).toBe(`/studio/p/${ID}`)
+    expect(screen.getByRole('heading', { name: '镜头' })).toBeInTheDocument()
   })
 
   test('brief page: the storyboard estimate is shown while running and when asking to approve', async () => {

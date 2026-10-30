@@ -90,6 +90,7 @@ export function BriefPage(props: {
   onProject: (p: StudioProject) => void
   onReload: () => Promise<void> | void
   onDeleted: () => void
+  onEdit?: () => void
 }) {
   const { auth, view, providers, onProject } = props
   const { project, shots, assets } = view
@@ -189,7 +190,7 @@ export function BriefPage(props: {
   const budgetValid = /^\d{1,9}$/.test(budget) && budget !== project.budgetCredits
 
   return (
-    <div className="st-brief">
+    <div className="st-brief" onChangeCapture={props.onEdit}>
       {confirmEl}
       <section className="st-brief-main">
         <div className="st-row" style={{ gap: 12, alignItems: 'flex-start' }}>
