@@ -74,9 +74,10 @@ class KeeperTest(unittest.TestCase):
                 "--kill-after", ".1", "--max-output", "262144", "--",
                 sys.executable, "-c", code]
 
-    def start(self, code: str, env: dict | None = None) -> subprocess.Popen:
+    def start(self, code: str, env: dict | None = None, *,
+              pipesize: int = -1) -> subprocess.Popen:
         proc = subprocess.Popen(self.command(code), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env={**os.environ, **(env or {})})
+                                stderr=subprocess.PIPE, env={**os.environ, **(env or {})}, pipesize=pipesize)
         self.processes.append(proc)
         return proc
 
@@ -250,7 +251,7 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 126)
 
     def test_output_backpressure_cancel_is_prompt(self) -> None:
-        proc = self.start('import os;os.write(1,b"x"*200000)')
+        proc = self.start('import os;os.write(1,b"x"*200000)', pipesize=4096)
         # Wait for actual CLI output and a full unread pipe, rather than
         # assuming a loaded host finishes the report/ACK startup in .5s.
         fd = proc.stdout.fileno()
