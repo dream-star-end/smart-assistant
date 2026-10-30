@@ -2149,6 +2149,7 @@ export async function _runOneTurn(
     // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
     const submittedTurn = runner.submitTurn({
       input: userTextOrBlocks,
+      readOnly: session._turnReadOnly === true,
       ...(queueTurn ? { queueTurn: true } : {}),
       requestId,
       ...(turnKey ? { turnKey } : {}),

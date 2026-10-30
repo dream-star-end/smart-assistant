@@ -127,6 +127,8 @@ export interface AgentSession {
    * reaches this budget.
    */
   _turnCreditBudgetFen?: bigint
+  /** Set and cleared only while owning session.lock. */
+  _turnReadOnly?: boolean
   /** Active turn's fail-safe tape finalizer. The outer liveness watchdog uses
    * this instead of emitting an unpersisted error and abandoning the parser. */
   _persistActiveTurn?: (

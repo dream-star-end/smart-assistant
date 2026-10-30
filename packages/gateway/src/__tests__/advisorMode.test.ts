@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 import { symlinkSync } from 'node:fs'
 
 import {
+  ADVISOR_NO_WRITE_CONSTRAINT,
   ADVISOR_PREAMBLE,
   advisorCanonicalModelId,
   assertAdvisorModelAllowed,
@@ -15,6 +16,7 @@ import {
   advisorConsultParentGate,
   buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
+  detectAdvisorNoWrite,
   extractGeneratedPaths,
   formatAdvisorConsultPrompt,
   historyFromSessionMessages,
@@ -26,7 +28,191 @@ import {
   stripAdvisorPreambleFromInjected,
 } from '../advisorMode.js'
 
+describe('advisor no-write intent', () => {
+  it('recognizes explicit file restrictions and advice/reply/read-only turns in Chinese and English', () => {
+    for (const request of [
+      '顾问只给建议，不要改文件。用三条短句说，刚才那份提纲还缺什么。',
+      '不要修改任何文件', '别动代码', '禁止写入工作区', '请勿删除文件',
+      '不用改文件', '本轮不修改代码', '不要对文件做任何修改', '文件先不要改',
+      '只给修改建议', '仅做分析', '只回复三句话', '只读检查',
+      'Do not modify any files.', "Don't edit files.", 'Don’t touch the code.',
+      'Do not make any changes to files.', 'Do not create or delete files.',
+      'No file changes.', 'Review without modifying files.',
+      'Keep the workspace unchanged.', 'Read-only review.', 'readonly analysis',
+      'Advice only.', 'Only give me suggestions.', 'Just provide recommendations.', 'Only reply in chat.',
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), true, request)
+    }
+  })
+
+  it('does not turn a target-specific prohibition into a whole-turn write ban', () => {
+    for (const request of [
+      '请修改 app.ts，不要改 README.md。',
+      '不要改 README.md',
+      '请修改 app.ts，不要改 README.md 文件。',
+      '请修改 app.ts，不要修改 docs/ 下的文件。',
+      '请修改 app.ts，README.md 只读。',
+      '请修改 app.ts，不要改任何其他文件。',
+      '请修改 app.ts，除 app.ts 外不要修改任何文件。',
+      'Update app.ts, do not modify README.md.',
+      "Don't touch README.md",
+      'Do not edit the README.md file; update app.ts.',
+      'Update app.ts; do not edit files in docs/.',
+      'Keep README.md unchanged and edit app.ts.',
+      'Edit app.ts, keep README.md read-only.',
+      'Update app.ts, do not modify any other files.',
+      'Update app.ts; do not modify any files except app.ts.',
+      'Update app.ts; do not modify any files, except app.ts.',
+      'Except app.ts, do not modify any files.',
+      '请修改 app.ts，不要改任何文件，除了 app.ts。',
+      '除 app.ts 外，不要修改任何文件。',
+      '请修改 app.ts，不要改文件名。',
+      '不要修改文件编码',
+      '请修改 app.ts，不要改文件的格式。',
+      '请修改 app.ts，不要改文件权限或属性。',
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), false, request)
+      const snapshot = buildAdvisorSnapshot({
+        question: 'Check the request.', concern: '', advisorModel: 'gpt-6-astra',
+        source: { userTask: request },
+      })
+      assert.equal(snapshot.constraints.includes(ADVISOR_NO_WRITE_CONSTRAINT), false, request)
+    }
+  })
+
+  it('keeps whole-turn restrictions when the request also names specific files', () => {
+    for (const request of [
+      '不要修改任何文件，包括 app.ts 和 README.md。',
+      '不要修改任何一个文件',
+      '不要修改文件的内容',
+      '请看 app.ts 和 README.md，不要改文件。',
+      '只读检查 app.ts 和 README.md。',
+      '只给 README.md 的建议，不要改任何文件。',
+      'Do not modify any files, including app.ts and README.md.',
+      'Do not modify any of the files',
+      'Read app.ts and README.md. Do not edit any files.',
+      'Read-only review of README.md and app.ts.',
+      'Only give advice about app.ts; do not write files.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
+  })
+
+  it('keeps named read-only and advice scopes local when another target is explicitly editable', () => {
+    for (const request of [
+      '请修改 app.ts，只读检查 README.md。',
+      '请修改app.ts，只读检查README.md。',
+      '只读检查 README.md，请修改 app.ts。',
+      '请修改 app.ts，只给 README.md 的建议。',
+      '请修改 app.ts，只读检查 docs/。',
+      'Update app.ts; read-only review of README.md.',
+      'UPDATE app.ts; READ-ONLY review of README.md.',
+      'Read-only review of README.md; update app.ts.',
+      'Update app.ts; only give advice about README.md.',
+      'Update app.ts; read-only review of docs/.',
+      'Update app.ts; do not modify files outside src/.',
+      'Update app.ts; do not modify any files outside src/.',
+      '请修改 建议.md，只读检查 README.md。',
+      'Update suggestions.md; read-only review of README.md.',
+    ]) assert.equal(detectAdvisorNoWrite(request), false, request)
+    for (const request of [
+      '只读检查 README.md。', '只给 README.md 的建议。',
+      '请修改app.ts，只读检查app.ts。',
+      'UPDATE app.ts; READ-ONLY review of ./app.ts.',
+      'Read-only review of README.md.', 'Only give advice about README.md.',
+      '请修改 app.ts，只读检查 README.md，不要改任何文件。',
+      'Update app.ts; read-only review of README.md; do not modify any files.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
+  })
+
+  it('recognizes generic global bans with coordinated actions, objects and natural endings', () => {
+    for (const request of [
+      '请分析问题，不要改文件或执行命令。',
+      '不要写入或修改任何文件',
+      '不要写入或者修改任何文件',
+      '不要修改文件和代码',
+      '不要改文件 ', '不要改文件\t',
+      '不要改文件或者运行命令',
+      '别改文件了，先提建议。',
+      '这轮不要改文件，谢谢。',
+      '不要改任何文件的内容，也不要运行命令。',
+      'No changes to any files.',
+      'Review without making any changes to files.',
+      'Do not write or modify any files.',
+      'Do not modify files or execute commands.',
+      'Do not modify files and code.',
+      'Do not modify files ',
+      'Update app.ts; do not modify any files or execute commands.',
+      '顾问只给建议，不要改文件，除了提供建议不要做其他事。',
+      'Do not modify any files, except give advice.',
+      '不要改文件，除非我授权修改app.ts。',
+      '只读检查 README.md，修改建议请直接列出。',
+      '只读检查 README.md，修改建议针对 app.ts 直接列出。',
+      'Read-only review of README.md, change suggestions should be listed.',
+      '不要改任何文件，除了读取README.md不要做其他事。',
+      '不要改任何文件，除了读取README.md。',
+      '不要改任何文件，除了读取 README.md。',
+      'Do not modify any files, except read README.md.',
+    ]) assert.equal(detectAdvisorNoWrite(request), true, request)
+  })
+
+  it('does not restrict ordinary implementation or unrelated requests not to stop or ask', () => {
+    for (const request of [
+      '', '请修改这份提纲并保存文件。', '实现功能，不要停下来问。',
+      '不要停，直接修改文件。', '不要问，修复代码并执行测试。',
+      'Update the file and save the result.', "Don't stop or ask; edit the file.",
+    ]) {
+      assert.equal(detectAdvisorNoWrite(request), false, request)
+    }
+  })
+
+  it('keeps the no-write exception visible beside the main-model verification instruction', () => {
+    assert.match(ADVISOR_PREAMBLE, /用户禁止改文件或要求只读、只给建议时/)
+    assert.match(ADVISOR_PREAMBLE, /验证只能用只读工具，交付只写回复/)
+    assert.match(ADVISOR_PREAMBLE, /不得 Write、Edit 或通过命令、MCP、委派改文件/)
+  })
+})
+
 describe('advisorMode snapshot', () => {
+  it('uses the frozen restriction if the raw user task is empty or replaced by a queued turn', () => {
+    for (const userTask of ['', '下一轮请修改文件并保存。']) {
+      const snapshot = buildAdvisorSnapshot({
+        question: 'What is missing?', concern: '', advisorModel: 'gpt-6-astra',
+        source: { userTask, readOnly: true },
+      })
+      assert.equal(snapshot.constraints, ADVISOR_NO_WRITE_CONSTRAINT)
+      assert.equal(snapshot.missing.includes('injected_constraints'), false)
+      assert.match(formatAdvisorConsultPrompt(snapshot), /不要建议主模型改文件/)
+    }
+  })
+
+  it('carries the incident user no-write request into advisor constraints without requiring attachments', () => {
+    const snapshot = buildAdvisorSnapshot({
+      question: '提纲还缺什么？',
+      concern: '',
+      advisorModel: 'gpt-6-astra',
+      source: { userTask: '顾问只给建议，不要改文件。用三条短句说，刚才那份提纲如果拿去给同事看，还缺什么。' },
+    })
+    assert.match(snapshot.constraints, /本轮禁止写文件/)
+    assert.equal(snapshot.constraints, ADVISOR_NO_WRITE_CONSTRAINT)
+    assert.match(snapshot.constraints, /不要建议主模型改文件/)
+    assert.equal(snapshot.missing.includes('injected_constraints'), false)
+    assert.match(formatAdvisorConsultPrompt(snapshot), /【已注入约束】\n【本轮禁止写文件】/)
+  })
+
+  it('keeps the no-write constraint when other injected context exceeds the snapshot cap', () => {
+    const snapshot = buildAdvisorSnapshot({
+      question: 'Review the outline.',
+      concern: '',
+      advisorModel: 'gpt-6-astra',
+      source: {
+        userTask: 'Do not modify any files; only give advice.',
+        injectedConstraints: 'attachment text '.repeat(1000),
+      },
+    })
+    assert.match(snapshot.constraints, /^【本轮禁止写文件】/)
+    assert.match(snapshot.constraints, /不要建议主模型改文件/)
+    assert.equal(snapshot.truncated, true)
+  })
+
   it('marks missing history/tools/artifacts instead of pretending complete', () => {
     const snap = buildAdvisorSnapshot({
       question: 'why red?',

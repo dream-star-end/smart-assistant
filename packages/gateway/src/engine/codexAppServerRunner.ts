@@ -29,9 +29,6 @@ import {
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
-  CODEX_EXPLICIT_STANDARD_MODELS,
-  CODEX_STANDARD_SERVICE_TIER,
-  codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -50,12 +47,15 @@ import {
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
-  normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { CodexRelayPathDeniedTracker } from './codexRelayPathGuard.js'
 import { shouldOmitPlatformMcp } from '../codexLaunchOverrides.js'
 import { issueConsultTurnToken, issueDelegateContextToken } from '../delegateContext.js'
+import {
+  buildAdvisorReadOnlyArgs, buildCodexThreadPolicyParams,
+  buildCodexTurnPolicyParams, readAdvisorReadOnlyConfig,
+} from './codexAdvisorReadOnly.js'
 import {
   buildHermeticDenial,
   isHermeticExecutionMethod,
@@ -256,15 +256,6 @@ function killCodexProcessGroup(proc: ChildProcessWithoutNullStreams, signal: Nod
   }
 }
 
-const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
-  'You are in implementation mode, not plan-only mode.',
-  'Decide autonomously whether the user request benefits from a visible plan/task list before or during execution.',
-  'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan; keep exactly one active step when work is underway.',
-  'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
-  'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
-  'When creating or editing files, prefer native fileChange/apply_patch edits so the UI can render Write/Edit cards; avoid Bash heredocs solely for file writes unless the shell command also needs real shell-side effects such as batch scaffolding.',
-].join(' ')
-
 // ───────────────────────────────────────────────
 // CodexAppServerRunner
 //
@@ -375,6 +366,7 @@ interface QueuedTurn {
   collabAgentPolicy?: CollabAgentPolicy
   queueTurn?: boolean
   automaticRetryState?: AutomaticRetryState
+  readOnly?: boolean
 }
 
 export class PromptQueueRunnerInvariantError extends Error {
@@ -414,6 +406,11 @@ export class CodexAppServerRunner extends EventEmitter {
   private shuttingDown = false
   private spawnEmitted = false
   private initialized = false
+  /** Captured from this queue entry; never inferred from a rewritten prompt. */
+  private advisorReadOnly = false
+  /** Tool/MCP schemas are process-scoped, so both policy transitions recycle. */
+  private spawnedAdvisorReadOnly: boolean | null = null
+  private advisorReadOnlyConfig: Record<string, unknown> | undefined
   /**
    * USER_CANCELLED 只发 turn/interrupt、不杀进程。合作式 summary 到达后
    * sessionManager 会跳过 shutdown,下一 turn ensureSpawned 会复用已经
@@ -1077,6 +1074,7 @@ export class CodexAppServerRunner extends EventEmitter {
         runContext: this.opts.runContext,
         frozenProjectContext: this.opts.frozenProjectContext,
         cwd: this.opts.cwd,
+        readOnly: this.advisorReadOnly,
       })
       writeFileSync(overrides.instructionsFile, overrides.instructionsContent, 'utf8')
       this._promptIntelligentUi = overrides.intelligentUiApplied
@@ -1188,6 +1186,9 @@ export class CodexAppServerRunner extends EventEmitter {
     collabAgentPolicy?: CollabAgentPolicy,
     queueTurn = false,
     automaticRetryState?: AutomaticRetryState,
+    /** Reserved for the shared Codex submit signature; business tracing remains session-scoped. */
+    _traceId?: string | null,
+    readOnly = false,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1205,6 +1206,7 @@ export class CodexAppServerRunner extends EventEmitter {
         collabAgentPolicy,
         queueTurn,
         automaticRetryState,
+        readOnly,
       })
       void this.drain()
     })
@@ -1364,6 +1366,7 @@ export class CodexAppServerRunner extends EventEmitter {
         turn.requestId,
         turn.collabAgentPolicy,
         turn.automaticRetryState,
+        turn.readOnly === true,
       )
       turn.resolve()
     } catch (err) {
@@ -1605,6 +1608,9 @@ export class CodexAppServerRunner extends EventEmitter {
       : []
     const args = [
       'app-server',
+      // Register the platform server. Inherited server tables are explicitly
+      // disabled after initialize because empty TOML maps merge with them.
+      ...(this.advisorReadOnly ? ['-c', 'mcp_servers={}'] : []),
       ...argvOverrides,
       ...providerArgs,
       ...modelCatalogArgs,
@@ -1616,6 +1622,7 @@ export class CodexAppServerRunner extends EventEmitter {
       ...applyPatchStreamingArgs,
       ...telemetryArgs,
       ...stageAgentArgs,
+      ...(this.advisorReadOnly ? buildAdvisorReadOnlyArgs() : []),
       '--listen',
       'stdio://',
     ]
@@ -1645,6 +1652,7 @@ export class CodexAppServerRunner extends EventEmitter {
       },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
+    this.spawnedAdvisorReadOnly = this.advisorReadOnly
     proc.stdin.on('error', (err: NodeJS.ErrnoException) => {
       if (this.proc !== proc) return
       log.warn('codex app-server stdin error', {
@@ -1770,7 +1778,10 @@ export class CodexAppServerRunner extends EventEmitter {
     // won't EPIPE.
     const initializeStartedAt = performance.now()
     try {
-      await this.sendRequest('initialize', this.buildInitializeParams())
+      const initialized = await this.sendRequest('initialize', this.buildInitializeParams())
+      this.advisorReadOnlyConfig = await readAdvisorReadOnlyConfig(this.advisorReadOnly, initialized,
+        () => this.sendRequest('config/read', { cwd: effectiveCwd, includeLayers: false }),
+        this.cachedOverrides?.tokenFile != null)
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
         stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
     } catch (err) {
@@ -2073,43 +2084,11 @@ export class CodexAppServerRunner extends EventEmitter {
     emitGoalBlockImpl.call(this as unknown as CodexNotificationHost, goal)
   }
 
-  private codexReasoningEffort(): string | undefined {
-    return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
-  }
-
-  private codexTransportModel(): string | undefined {
-    return codexTransportModelId(this.opts.model)
-  }
-
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
-    const mode = this.conversationMode
-    const reasoningEffort = this.codexReasoningEffort()
-    const params: Record<string, unknown> = {
-      threadId: this.threadId,
-      input: [{ type: 'text', text: prompt }],
-      collaborationMode: {
-        mode,
-        settings: {
-          model: this.codexTransportModel() ?? '',
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-          developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
-        },
-      },
-      sandboxPolicy: this.opts.hermeticNoTools
-        ? { type: 'readOnly', networkAccess: false }
-        : mode === 'plan'
-          ? { type: 'readOnly', networkAccess: true }
-          : { type: 'dangerFullAccess' },
-    }
-    if (this.codexTransportModel()) params.model = this.codexTransportModel()
-    if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
-    // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
-    // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
-    // a catalog Fast default (GPT-6 Luna) never applies.
-    if (CODEX_EXPLICIT_STANDARD_MODELS.has(this.opts.model ?? '')) {
-      params.serviceTierForTurn = CODEX_STANDARD_SERVICE_TIER
-    }
-    return params
+    return buildCodexTurnPolicyParams(prompt, this.threadId, {
+      ...this.opts, effortLevel: this.effortLevel,
+      mode: this.conversationMode, readOnly: this.advisorReadOnly,
+    })
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -2162,10 +2141,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
-      approvalPolicy: 'never',
-      sandbox: this.opts.hermeticNoTools ? 'read-only' : 'danger-full-access',
-      cwd: effectiveCwd,
-      ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+      ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+        this.advisorReadOnly, this.advisorReadOnlyConfig, this.opts.hermeticNoTools),
     })) as { thread?: { id?: string } } | undefined
     const tid = res?.thread?.id
     if (typeof tid !== 'string' || !tid) {
@@ -2389,11 +2366,13 @@ export class CodexAppServerRunner extends EventEmitter {
     requestId?: string,
     collabAgentPolicy?: CollabAgentPolicy,
     automaticRetryState?: AutomaticRetryState,
+    readOnly = false,
   ): Promise<void> {
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
     // Join speculative preparation; a failed warmup falls back to normal preparation.
     if (this._preheatPromise) await this._preheatPromise.catch(() => {})
+    this.advisorReadOnly = readOnly
     const seenDeltas = new Set<string>()
     const observeFirstDelta = (message: any): void => {
       const delta = message?.event?.delta
@@ -2441,7 +2420,8 @@ export class CodexAppServerRunner extends EventEmitter {
       if (
         this.proc &&
         !this.proc.killed &&
-        ((this.spawnedProviderSignature !== null &&
+        ((this.spawnedAdvisorReadOnly !== null && this.spawnedAdvisorReadOnly !== readOnly) ||
+          (this.spawnedProviderSignature !== null &&
           this.spawnedProviderSignature !== this.codexRouteSignature()) ||
           (this._preheatedSignature !== null &&
             this._preheatedSignature !== this.preheatSignature(repoSnap, effectiveCwd)))
@@ -2490,10 +2470,8 @@ export class CodexAppServerRunner extends EventEmitter {
           try {
             await this.sendRequest('thread/resume', {
               threadId: this.threadId,
-              approvalPolicy: 'never',
-              sandbox: 'danger-full-access',
-              cwd: effectiveCwd,
-              ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+              ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                this.advisorReadOnly, this.advisorReadOnlyConfig),
             })
           } catch (err) {
             // Self-heal "no rollout found for thread id" (-32600). Caused by
@@ -2535,10 +2513,8 @@ export class CodexAppServerRunner extends EventEmitter {
               try {
                 await this.sendRequest('thread/resume', {
                   threadId: fallback,
-                  approvalPolicy: 'never',
-                  sandbox: 'danger-full-access',
-                  cwd: effectiveCwd,
-                  ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+                  ...buildCodexThreadPolicyParams(effectiveCwd, this.opts.model,
+                    this.advisorReadOnly, this.advisorReadOnlyConfig),
                 })
                 this.emit('session_id', fallback)
                 this.attached = true

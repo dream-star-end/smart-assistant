@@ -489,6 +489,7 @@ export async function handleConsultAdvisor(
     configVersion: claims.configVersion,
     advisorModel: parent._advisorTurn.advisorModel,
     userTask: parent._currentTurnUserText ?? '',
+    readOnly: parent._turnReadOnly === true,
     constraints: parent._injectedTurnConstraints,
     currentTools,
     peerId: parent.peerId,
@@ -555,6 +556,7 @@ export async function handleConsultAdvisor(
       advisorModel: frozen.advisorModel,
       source: {
         userTask: frozen.userTask,
+        readOnly: frozen.readOnly,
         injectedConstraints: frozen.constraints,
         historyRecords,
         currentTools: frozen.currentTools,

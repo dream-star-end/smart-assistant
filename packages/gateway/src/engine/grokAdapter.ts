@@ -138,6 +138,7 @@ type GrokProcessKeepaliveTestHooks = {
 
 interface GrokLaunchSpec {
   cwd: string
+  readOnlyWorkspaceCwd?: string
   env: NodeJS.ProcessEnv
   bin: string
   promptFile: string
@@ -596,6 +597,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
+      readOnly: ctx.params.readOnly,
       ...(ctx.params.consultTurn && ctx.params.turnKey
         ? {
             consultTurn: {
@@ -653,6 +655,9 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
+      // Native Grok also discovers project/compat MCPs beyond --tools. Keep
+      // discovery away from the user's repo and home for this restricted turn.
+      ...(ctx.params.readOnly ? { HOME: promptDir } : {}),
       GROK_HOME: (() => {
         const runtimeHome = grokRuntimeHome(platform.launchHome, ctx.canonicalModel)
         const stableRoot = ctx.canonicalModel === 'grok-build-fast'
@@ -668,7 +673,11 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
-    ctx.launchSpec = { cwd, env, bin, promptFile }
+    ctx.launchSpec = {
+      cwd: ctx.params.readOnly ? promptDir : cwd,
+      ...(ctx.params.readOnly ? { readOnlyWorkspaceCwd: cwd } : {}),
+      env, bin, promptFile,
+    }
     if (ctx.canonicalModel === 'grok-build-fast' && env.GROK_HOME) {
       seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
       ensureFastCatalog(bin, env, env.GROK_HOME)
@@ -690,6 +699,12 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       '--no-memory',
       '--cwd', spec.cwd,
     ]
+    // --tools is the native model-visible builtin allowlist. In particular,
+    // no shell, image generation, editor, or subagent can bypass the MCP gate.
+    if (ctx.params.readOnly) {
+      args.push('--tools', 'read_file,grep,list_dir')
+      args.push('--rules', `This turn is read-only. The user's workspace is ${JSON.stringify(spec.readOnlyWorkspaceCwd)}. Read and search it using absolute paths. Only the supplied read-only platform MCP tools may be used.`)
+    }
     if (resume && this.nativeId) args.push('--resume', this.nativeId)
     if (this.currentEffort && ['low', 'medium', 'high'].includes(this.currentEffort)) {
       args.push('--reasoning-effort', this.currentEffort)
