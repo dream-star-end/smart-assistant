@@ -16,7 +16,9 @@ import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.j
 import { isInMaintenance } from './middleware/maintenanceMode.js';
 import { HttpError, sendJson } from './http/util.js';
 import { startLogTimingReporter } from './logging/logTimingReporter.js';
-import { setContentReviewAlerter } from '@openclaude/gateway'
+import { setContentReviewAlerter, setContentReviewPrefilter } from '@openclaude/gateway'
+import { omniHardHit } from './openai/omniModeration.js'
+import { selectOpenAiPlatformKey } from './openai/openAiPlatformKey.js'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
@@ -7120,6 +7122,15 @@ export async function registerCommercial(
   }
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
+  setContentReviewPrefilter(async (text) => {
+    try {
+      const key = await selectOpenAiPlatformKey('omni-moderate')
+      const result = await omniHardHit({ apiKey: key, text, timeoutMs: 2_000 })
+      return result.hit
+    } catch {
+      return false
+    }
+  })
 
   void userChatBridge.rebuildContainerLinks?.();
   const stopLogTiming = startLogTimingReporter(rootLogger);
