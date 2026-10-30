@@ -1608,7 +1608,7 @@ describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
         _reviewVerdict: "PASS",
       }),
     );
-    const verdict = screen.getByText("PASS");
+    const verdict = screen.getByText("通过");
     expect(screen.getByText("完成")).toBeInTheDocument();
     expect(verdict.parentElement).toHaveClass("flex-wrap", "max-w-[55%]");
   });
@@ -1644,7 +1644,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
     expect(screen.getByText("7 积分")).toBeInTheDocument();
   });
 
@@ -1691,7 +1691,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
     expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
     expect(screen.getByText("3 积分")).toBeInTheDocument();
     expect(screen.getByText("5 积分")).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
   });
 
   test("典型团队叙事流:并行批次面板 → 队长整合文本 → 审查卡按时序独立在后(债D 成本齐全)", () => {
@@ -1714,7 +1714,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
     ]);
     // 面板只含并行两人;审查卡独立出现,且 DOM 顺序在整合文本之后。
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
-    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("通过")).toBeInTheDocument();
     const html = container.innerHTML;
     expect(html.indexOf("队长整合结论")).toBeGreaterThan(html.indexOf("团队协作"));
     expect(html.indexOf("审查草稿")).toBeGreaterThan(html.indexOf("队长整合结论"));

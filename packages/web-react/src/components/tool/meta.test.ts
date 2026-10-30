@@ -350,6 +350,15 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       "搜索 AI 市场",
     );
     expect(toolSummary("Bash", { command: "oc-market search image" })).toBe("image");
+    // 无位置参数时不把英文子命令(snapshot/screenshot)当用户摘要露出(U7)
+    expect(toolSummary("Bash", { command: "oc-browser snapshot" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-browser screenshot" })).toBe("");
+    expect(toolSummary("mcp__openclaude-memory__memory", { action: "read", section: "用户偏好" })).toBe(
+      "读取 用户偏好",
+    );
+    expect(toolSummary("mcp__openclaude-memory__memory", { action: "replace", target: "项目背景" })).toBe(
+      "更新 项目背景",
+    );
   });
 });
 

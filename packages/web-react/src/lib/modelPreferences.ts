@@ -3,6 +3,18 @@ import type { PublicModel } from "./types";
 
 export type PreferenceEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
+/** 思考深度档位（preferences.default_effort 枚举；具体模型支持集由 API 决定）。 */
+export const EFFORT_OPTIONS: {
+  value: PreferenceEffort;
+  label: string;
+}[] = [
+  { value: "low", label: "低" },
+  { value: "medium", label: "中" },
+  { value: "high", label: "高" },
+  { value: "xhigh", label: "很高" },
+  { value: "max", label: "最高" },
+];
+
 /** preferences 内层快照（后端 strict allowlist；theme enum 用 auto 而非 system）。 */
 export type PrefsView = {
   theme?: "light" | "dark" | "auto";
@@ -130,6 +142,12 @@ export function effortForModel(
 export function effectiveEffortModelId(
   selectedModelId: string | undefined,
   teamLeaderActive: boolean,
+  teamLeaderModelId?: string,
 ): string | undefined {
-  return teamLeaderActive ? DEFAULT_CODEX_ENGINE_MODEL : selectedModelId;
+  if (!teamLeaderActive) return selectedModelId;
+  const serverLeader =
+    typeof teamLeaderModelId === "string" && teamLeaderModelId.trim()
+      ? teamLeaderModelId.trim()
+      : undefined;
+  return serverLeader ?? DEFAULT_CODEX_ENGINE_MODEL;
 }

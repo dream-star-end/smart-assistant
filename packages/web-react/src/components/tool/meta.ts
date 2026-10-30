@@ -469,12 +469,12 @@ function ocCommandSummary(cli: OcCli, command: string): string {
   if (cli === "oc-browser") {
     const args = browserCommandArgs(command, op).filter((token) => token && !token.startsWith("-"));
     if (op === "open" || op === "goto" || op === "tab-new") {
-      return args[0] ? displayDomain(args[0]) : op;
+      return args[0] ? displayDomain(args[0]) : "";
     }
-    if (op === "fill") return humanSummaryToken(args[1] ?? args[0]) || op;
-    if (op === "type" || op === "press" || op === "find") return humanSummaryToken(args[0]) || op;
-    if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : op;
-    return humanSummaryToken(commandFlag(command, "filename")) || op;
+    if (op === "fill") return humanSummaryToken(args[1] ?? args[0]);
+    if (op === "type" || op === "press" || op === "find") return humanSummaryToken(args[0]);
+    if (op === "click" || op === "dblclick") return args[0] ? `元素 ${args[0]}` : "";
+    return humanSummaryToken(commandFlag(command, "filename"));
   }
   if (cli === "oc-web") {
     const url = commandFlag(command, "url") || command.match(/https?:\/\/[^\s'";|]+/)?.[0] || "";
@@ -718,7 +718,22 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     return "";
   }
   if (server === "openclaude-memory") {
-    if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
+    if (op === "memory") {
+      const rawAct = (asStr(input.action) || asStr(input.op) || "read").toLowerCase();
+      const act =
+        rawAct === "write" || rawAct === "set"
+          ? "写入"
+          : rawAct === "append" || rawAct === "add"
+            ? "追加"
+            : rawAct === "replace" || rawAct === "update"
+              ? "更新"
+              : rawAct === "delete" || rawAct === "remove"
+                ? "删除"
+                : rawAct === "list"
+                  ? "查看"
+                  : "读取";
+      return `${act} ${asStr(input.target) || asStr(input.section)}`.trim();
+    }
     if (op === "archival_add" || op === "archival_search" || op === "archival_delete") {
       return asStr(input.query) || asStr(input.id) || asStr(input.text).slice(0, 50);
     }

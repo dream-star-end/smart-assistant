@@ -540,7 +540,7 @@ export function reviewVerdictBadge(
   m: Pick<ChatMessage, "_delegateAgentId" | "_reviewVerdict">,
 ): { label: string; tone: "success" | "warning" } | null {
   if (m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID) return null;
-  if (m._reviewVerdict === REVIEW_VERDICT_PASS) return { label: "PASS", tone: "success" };
+  if (m._reviewVerdict === REVIEW_VERDICT_PASS) return { label: "通过", tone: "success" };
   if (m._reviewVerdict === REVIEW_VERDICT_NEEDS_FIX) return { label: "未通过", tone: "warning" };
   return null;
 }

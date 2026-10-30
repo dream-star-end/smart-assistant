@@ -532,12 +532,9 @@ export function App() {
   // 透传（与 sockRef 同样的 TDZ 规避；handler 本身是 useRepoBinding 的稳定 useCallback）。
   const repoStatusHandlerRef = useRef<(f: RepoStatusWire) => void>(() => {});
   const repoBindErrorHandlerRef = useRef<(f: RepoBindErrorWire) => void>(() => {});
-  // 隐式负反馈上报入口的稳定间接（与 sockRef 同款 TDZ 规避）：send/stopTurn 在
-  // sendImplicitRating 声明之前就要引用它，故经 ref 回填；回调本体在下方 useCallback 定义。
-  // 走 ref 而非直接入 deps → send/stopTurn 引用保持稳定（不被评价态/模型切换牵动重建）。
-  const sendImplicitRatingRef = useRef<
-    ((target: ImplicitTarget, opts: { reason: ImplicitReason }) => void) | null
-  >(null);
+  // 隐式负反馈与发送跳底的稳定间接（TDZ 规避）：回调在下方定义，经 ref 回填以保持 send 引用稳定。
+  const sendImplicitRatingRef = useRef<((target: ImplicitTarget, opts: { reason: ImplicitReason }) => void) | null>(null);
+  const sendScrollRef = useRef<(() => void) | null>(null);
   // 用户主动 Stop 的轮不做完成脉冲高亮：stopTurn 置位，sending 沿的 nudge effect 消费后清。
   const stoppedTurnRef = useRef(false);
 
@@ -1035,6 +1032,7 @@ export function App() {
     publicCfg,
     selectedSessionIdRef,
     sendImplicitRatingRef,
+    sendScrollRef,
     serviceTier,
     sessionEffort,
     sessions,
@@ -1127,10 +1125,7 @@ export function App() {
     view,
   });
 
-  const {
-    inbox,
-    refreshMyAgents,
-  } = useAppDeepLinks({
+  const { inbox, refreshMyAgents, teamLeaderModelId } = useAppDeepLinks({
     auth,
     authRef,
     authed,
@@ -1397,7 +1392,7 @@ export function App() {
   // 的支持集渲染选项;生效档 = 会话显式选择 ?? 全局偏好,不被当前模型支持时如实
   // 显示「跟随」(发送层 effortForModel 同样过滤,所见 = 所发)。
   const effortModel = models.find(
-    (m) => m.id === effectiveEffortModelId(modelId, teamLeaderActive),
+    (m) => m.id === effectiveEffortModelId(modelId, teamLeaderActive, teamLeaderModelId),
   );
   const effortSupported = effortModel?.supported_efforts ?? [];
   const effortCandidate = sessionEffort !== undefined ? sessionEffort : preferenceEffort;
@@ -1664,12 +1659,8 @@ export function App() {
   sendImplicitRatingRef.current = sendImplicitRating;
 
   const {
-    beginDirectUserChatScroll,
-    endDirectUserChatScroll,
-    markUserChatScroll,
-    onChatScroll,
-    onLoadOlderHistory,
-    stickToBottomRef,
+    beginDirectUserChatScroll, endDirectUserChatScroll, markUserChatScroll,
+    onChatScroll, onLoadOlderHistory, scrollToBottomOnSend, stickToBottomRef,
   } = useChatScroll({
     activeId,
     archiveLoading,
@@ -1689,6 +1680,7 @@ export function App() {
     streamText,
     wsSending,
   });
+  sendScrollRef.current = scrollToBottomOnSend;
 
   const stopShortcutDialog = useStopShortcut({
     enabled: inWorkspace && sending,
@@ -2323,9 +2315,9 @@ export function App() {
           onSelectServiceTier={demo ? undefined : setServiceTier}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
-          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
-          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
+          // 团队模式知情指示:与 send 生效条件同构(仅 main 生效),顶栏所见 = 实际所发。
           teamModeActive={!demo && teamMode && agent.id === "main"}
+          teamLeaderModelId={teamLeaderModelId}
           onDisableTeamMode={() => setTeamMode(false)}
           advisorModeActive={!demo && collabMode === "advisor" && agent.id === "main"}
           advisorModelLabel={

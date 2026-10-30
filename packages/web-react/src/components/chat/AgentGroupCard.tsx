@@ -67,6 +67,16 @@ function ProgressiveChildRaw({ text }: { text: string }) {
 
 /** Records that are not a tool-use shell remain first-class process rows.
  * They are never dropped or summarized; large string fields mount in chunks. */
+const RAW_CHILD_FIELD_LABELS: Record<string, string> = {
+  output: "输出",
+  preview: "预览",
+  tail: "尾部输出",
+  error: "错误",
+  text: "正文",
+  explanation: "说明",
+  objective: "目标",
+};
+
 function RawChildEventView({ child }: { child: ChildBlock }) {
   const [open, setOpen] = useState(false);
   const source = child as ChildBlock & Record<string, unknown>;
@@ -115,7 +125,7 @@ function RawChildEventView({ child }: { child: ChildBlock }) {
           {serialized !== "{}" && <ProgressiveChildRaw text={serialized} />}
           {bulk.map((field) => (
             <section key={field.name}>
-              <div className="mb-1 text-caption font-medium text-faint">{field.name}</div>
+              <div className="mb-1 text-caption font-medium text-faint">{RAW_CHILD_FIELD_LABELS[field.name] ?? field.name}</div>
               <ProgressiveChildRaw text={field.text} />
             </section>
           ))}

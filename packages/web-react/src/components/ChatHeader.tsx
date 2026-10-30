@@ -64,6 +64,7 @@ export function ChatHeader({
   modelPickerOpen,
   onModelPickerOpenChange,
   teamModeActive,
+  teamLeaderModelId,
   onDisableTeamMode,
   advisorModeActive,
   advisorModelLabel,
@@ -119,6 +120,8 @@ export function ChatHeader({
    * 队长引擎显示态。条件由 App 的 teamMode 单一状态推导，此处不持第二份状态。
    */
   teamModeActive?: boolean;
+  /** 服务端 /api/public/models 下发的权威队长模型 id；省略时退回协议默认。 */
+  teamLeaderModelId?: string;
   /** 关闭团队模式（直接翻转 App 的全局 flag；省略则 chip 弹层不渲染关闭按钮）。 */
   onDisableTeamMode?: () => void;
   advisorModeActive?: boolean;
@@ -161,7 +164,7 @@ export function ChatHeader({
   // teamModeActive 翻 false 一起卸载,不控 open 会留下无锚点的浮层）。
   const [teamPopoverOpen, setTeamPopoverOpen] = useState(false);
   const [advisorPopoverOpen, setAdvisorPopoverOpen] = useState(false);
-  const engineLabel = teamEngineLabel(models ?? []);
+  const engineLabel = teamEngineLabel(models ?? [], teamLeaderModelId, lockedModels);
   // toast 落在顶栏实测下沿之下(手机顶栏两行时也不压住模型行)。
   const headerRef = useRef<HTMLElement>(null);
   useToastAnchor(headerRef);
@@ -372,6 +375,7 @@ export function ChatHeader({
               onLockedSelect={onLockedSelect}
               loading={modelsLoading}
               teamEngineActive={teamModeActive}
+              teamLeaderModelId={teamLeaderModelId}
               effortSupported={effortSupported}
               effortActive={effortActive}
               onSelectEffort={onSelectEffort}
