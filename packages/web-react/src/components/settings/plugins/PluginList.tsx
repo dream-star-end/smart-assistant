@@ -2,15 +2,17 @@
  * 管理中心 → 插件（OCV5-383）：一级列表只有「名称 + 一行状态 + 启用开关」，其余设置都在点进去的详情页里。
  *
  * - 列表行整行可点（进入详情），开关单独响应、不触发进入；
+ * - 没连上账号的插件行尾给「连接」，连上（或不需要账号）才出启用开关（UI-5，体验官 #36）；
  * - 详情页顶部是返回 + 同一个启用开关；账号、写入、自动回复、更新/卸载等沿用各插件原有的卡片内容；
  * - 本机插件（随平台基线下发、在你的容器里运行，如同花顺行情）的详情由 LocalPluginDetail 渲染：
  *   能做什么、由什么组成、会访问哪些网站、要不要登录、数据声明。
  */
-import { ArrowLeft, ChevronRight, Globe, MessageSquarePlus, Plug, SquareTerminal } from 'lucide-react'
+import { ArrowLeft, ChevronRight, MessageSquarePlus } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { LocalPlugin } from '../../../lib/connectors'
 import type { PluginEntry } from '../../../lib/pluginDirectory'
 import { cn } from '../../../lib/utils'
+import { BUILTIN_PLUGIN_CATEGORY, CardMark } from '../../marketplace/CardMark'
 import { Button, StatusDot, type StatusTone, Switch } from '../../ui'
 
 export type PluginRowModel = {
@@ -22,15 +24,8 @@ export type PluginRowModel = {
   runtime: PluginEntry['runtime']
   enabled: boolean
   enablementKnown?: boolean
-}
-
-function RuntimeIcon({ runtime }: { runtime: PluginEntry['runtime'] }) {
-  const Icon = runtime === 'cli' ? SquareTerminal : runtime === 'browser' ? Globe : Plug
-  return (
-    <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-hover text-muted" aria-hidden>
-      <Icon size={17} strokeWidth={1.75} />
-    </span>
-  )
+  /** 已连上账号，或本来就不需要账号（本机插件）。缺省按已连接处理。 */
+  connected?: boolean
 }
 
 export const RUNTIME_LABEL: Record<PluginEntry['runtime'], string> = {
@@ -39,7 +34,14 @@ export const RUNTIME_LABEL: Record<PluginEntry['runtime'], string> = {
   cli: '本机插件',
 }
 
-/** 一级列表的一行：点行进入详情；右侧开关只管启用。 */
+/**
+ * 一级列表的一行：点行进入详情；右侧开关只管启用。
+ *
+ * 开关的意思是「允许助手用它」，状态的意思是「连没连上」。没连上的插件开关照样亮着、右边写「未连接」，
+ * 读起来像坏了（体验官 #36，截图 r1025am/mix-11）。所以启用中、还没连上的插件只给「连接」，
+ * 连上以后才出开关；已停用的、或启用状态读不到的仍显示开关（前者要能重新打开，后者要禁用着让人看见）。
+ * 详情页顶栏的开关不受影响。
+ */
 export function PluginRow({
   row,
   busy,
@@ -53,6 +55,8 @@ export function PluginRow({
   onConnect?: () => void
   onToggle: (enabled: boolean) => void
 }) {
+  const known = row.enablementKnown !== false
+  const showSwitch = !known || !row.enabled || row.connected !== false
   return (
     <li className="flex items-center gap-2 border-t border-border first:border-t-0" data-plugin-row={row.key}>
       <button
@@ -61,24 +65,26 @@ export function PluginRow({
         aria-label={`${row.label}：${row.status}，打开设置`}
         className="flex min-h-[60px] min-w-0 flex-1 items-center gap-3 rounded-md py-2 pr-1 text-left outline-none hover:bg-hover/60 focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <RuntimeIcon runtime={row.runtime} />
+        <CardMark name={row.label} category={BUILTIN_PLUGIN_CATEGORY[row.key]} />
         <span className="flex min-w-0 flex-1 flex-col">
           <span className="truncate text-body font-medium text-fg">{row.label}</span>
           <span className={cn('flex items-center gap-1.5 text-meta', row.enabled ? 'text-muted' : 'text-faint')}>
             <StatusDot tone={row.enabled ? row.tone : 'neutral'} />
-            <span className="truncate">{row.enablementKnown === false ? '启用状态暂不可用' : row.enabled ? row.status : '已停用'}</span>
+            <span className="truncate">{!known ? '启用状态暂不可用' : row.enabled ? row.status : '已停用'}</span>
           </span>
         </span>
         <ChevronRight size={16} className="shrink-0 text-faint" aria-hidden />
       </button>
-      {onConnect && <Button size="sm" variant="secondary" onClick={onConnect} aria-label={`连接「${row.label}」`}>连接</Button>}
-      <Switch
-        aria-label={`启用「${row.label}」`}
-        checked={row.enablementKnown !== false && row.enabled}
-        disabled={busy}
-        onCheckedChange={onToggle}
-        className="mr-1"
-      />
+      {onConnect && <Button size="sm" variant="secondary" onClick={onConnect} aria-label={`连接「${row.label}」`} className="mr-1">连接</Button>}
+      {showSwitch && (
+        <Switch
+          aria-label={`启用「${row.label}」`}
+          checked={known && row.enabled}
+          disabled={busy}
+          onCheckedChange={onToggle}
+          className="mr-1"
+        />
+      )}
     </li>
   )
 }
@@ -119,7 +125,7 @@ export function DisabledNote({ label }: { label: string }) {
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="border-t border-border py-4 first:border-t-0">
-      <h3 className="mb-2 text-meta font-semibold uppercase tracking-[0.04em] text-faint">{title}</h3>
+      <h3 className="mb-2 text-meta font-semibold text-muted">{title}</h3>
       {children}
     </section>
   )

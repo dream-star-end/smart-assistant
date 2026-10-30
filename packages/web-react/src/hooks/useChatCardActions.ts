@@ -6,7 +6,7 @@ import { assertResolvedIdentity, identityIsCurrent, type ResolvedIdentity } from
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { findStopTarget } from "../lib/implicitFeedback";
 import { api } from "../lib/api";
 import type { FeedbackContext, CardCallbacks } from "../components/chat/cards";
@@ -123,6 +123,8 @@ export function useChatCardActions({
   stoppedTurnRef,
   toast,
 }: ChatCardActionsInput) {
+  const activeSessionRef = useRef(activeId);
+  activeSessionRef.current = activeId;
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sendImplicitRatingRef, setBusy, setChatError, setStreamText, stopRef, stoppedTurnRef are App useState setter/useRef passed in, stable
   const stopTurnTarget = useCallback((expectedClientMessageId?: string) => {
@@ -259,17 +261,25 @@ export function useChatCardActions({
     [openPane],
   );
 
+  // 超长消息在会话里只有占位行(_userPayloadDeferred,text 为空):重试与「编辑 / 修改消息」都先
+  // 取回完整原文;取不到就提示,调用方不再往下做(不发送、不覆盖输入框草稿)。
+  const loadExactOrToast = useCallback(
+    async (msg: ChatMessage) => {
+      const exact = await loadExactUserMessage(msg).catch(() => null);
+      if (!exact) toast("原始消息加载失败，请重试", "error");
+      return exact;
+    },
+    [loadExactUserMessage, toast],
+  );
+
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
   // model/teamMode/effort 由 socket 复用失败首发的 routing 快照,不读取当前偏好。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); sockRef is App useState setter/useRef passed in, stable
   const retrySend = useCallback(
     async (msg: ChatMessage) => {
       if (demo || !activeId) return;
-      const exact = await loadExactUserMessage(msg);
-      if (!exact) {
-        toast("原始消息加载失败，请重试", "error");
-        return;
-      }
+      const exact = await loadExactOrToast(msg);
+      if (!exact) return;
       // A deferred red-card CTA was admitted only when the sidecar recorded
       // complete routing/media evidence. Re-check the decoded row before
       // dispatch so a corrupt/mismatched payload can never degrade to text-only.
@@ -284,7 +294,15 @@ export function useChatCardActions({
         sourceOverride: exact,
       });
     },
-    [demo, activeId, agent.id, loadExactUserMessage, toast],
+    [demo, activeId, agent.id, loadExactOrToast, toast],
+  );
+
+  const editResend = useCallback(
+    async (msg: ChatMessage) => {
+      const exact = await loadExactOrToast(msg);
+      if (exact && activeId === activeSessionRef.current) setComposerPrefill({ text: exact.text || "", nonce: Date.now() });
+    },
+    [activeId, loadExactOrToast, setComposerPrefill],
   );
 
   // 红卡 CTA 硬门(任务④ / Codex 审计 R4)的精确重试目标解析:按 assistant 错误行的
@@ -388,7 +406,7 @@ export function useChatCardActions({
             }
           },
       onRetrySend: demo ? undefined : retrySend,
-      onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onEditResend: editResend,
       onEditQueued: (m) => {
         const text = activeId
           ? (sockRef.current?.editQueuedMessage(activeId, m.id) ?? m.text ?? "")
@@ -467,6 +485,7 @@ export function useChatCardActions({
       newSession,
       onFeedback,
       retrySend,
+      editResend,
       continueInterrupted,
       resolveInterruptedContinuation,
       activeId,

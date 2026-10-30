@@ -81,6 +81,7 @@ import {
   jsonOrThrow,
 } from "./api/http";
 import { projectsApi } from "./api/projectsApi";
+import { knownUserError } from "./chat/userErrorView";
 import { memorySkillsApi } from "./api/memorySkillsApi";
 import { integrationsApi } from "./api/integrationsApi";
 export {
@@ -360,10 +361,12 @@ export function isAuthRecoveryTransient(err: unknown): boolean {
  *   2. ApiError 且命中跨域通用 code（RATE_LIMITED）      → 标准中文（各域同义）。
  *   3. ApiError 且 message 含中文（先剥掉「（追踪号 …）」后缀再判，避免被后缀里的“追踪号”
  *      三字误判）且非通用兜底「请求失败 (NNN)」        → 后端已写好面向用户文案，**直接用**。
- *   4. 其余 ApiError（英文/技术 message，或仅通用兜底） → **不外露**，用调用方中文 fallback；
- *      有 requestId 时尾部补「（追踪号 …）」便于用户反馈、运维排障。
- *   5. 非 ApiError 的其它 Error：message 恰为中文 → 直接用；否则（英文/技术）→ fallback。
- *   6. 其它（字符串 / undefined / 未知）              → fallback。
+ *   4. 回包带 userError（#1206，错误目录的人话，W3）→ 用它。未知码只得到通用文案，
+ *      不如调用方 fallback 贴近操作，落到 5。目录本身不进首屏，这里只读回包。
+ *   5. 其余 ApiError（英文/技术 message，或仅通用兜底） → **不外露**，用调用方中文 fallback；
+ *      有 requestId 时尾部补「（追踪号 …）」（Toast 把它收进「复制追踪号」，正文不显示）。
+ *   6. 非 ApiError 的其它 Error：message 恰为中文 → 直接用；否则（英文/技术）→ fallback。
+ *   7. 其它（字符串 / undefined / 未知）              → fallback。
  *
  * @param fallback 贴合该操作语义的中文（如「加载订阅信息失败」「创建定时任务失败」），
  *                 不要千篇一律「操作失败」。
@@ -383,7 +386,9 @@ export function apiErrorMessage(err: unknown, fallback: string): string {
     }
     const base = err.message.replace(REQ_ID_SUFFIX_RE, "").trim();
     if (base && hasCjk(base) && !GENERIC_HTTP_MESSAGE_RE.test(base)) return base;
-    return err.requestId ? `${fallback}（追踪号 ${err.requestId}）` : fallback;
+    const userError = knownUserError((err.body as { userError?: unknown } | undefined)?.userError);
+    const text = userError?.message ?? fallback;
+    return err.requestId ? `${text}（追踪号 ${err.requestId}）` : text;
   }
 
   if (err instanceof Error && hasCjk(err.message)) return err.message;

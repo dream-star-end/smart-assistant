@@ -10,12 +10,14 @@ import { build as viteBuild } from "vite";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
 import { BOARD_SESSION } from "./process-disclosure-story.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
+
+// W3:统一的自动重试提示;服务端给了进度时写「（n/N）」,否则不写次数。兼容常量 10 不当作 N 显示。
+const RETRY_ACTIVITY = /^正在自动重试(?:…|（(?:第 \d+ 次|\d+\/\d+)）。)$/;
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const red = process.env.OC_RETRY_ERROR_UI_RED ?? "";
-const retryActivity = /^正在自动重试(?:（第 \d+ 次）|…)$/;
 assert.ok(["", "legacy", "history", "phase-a"].includes(red));
 let transforms = 0;
 async function until(label, check, timeout = 15000) {
@@ -141,24 +143,24 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
             await page.getByRole("button", { name: "发送", exact: true }).click();
           }
           await until("pending retry activity or the old red card", async () =>
-            await page.getByText(retryActivity).first().isVisible() ||
+            await page.getByText(RETRY_ACTIVITY).first().isVisible() ||
             await page.getByText("任务执行失败", { exact: true }).first().isVisible());
           await shot("pending");
           assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0, "recoverable errors never paint a red card");
-          assert.equal(await page.getByText(retryActivity).count(), 1, "one shared retry activity");
+          assert.equal(await page.getByText(RETRY_ACTIVITY).count(), 1, "one shared retry activity");
           assert.equal(await page.getByText("发送失败", { exact: true }).count(), 0, "a recovering source is not a failed send");
           scenario.hold = false;
           for (const done of scenario.releaseReads.splice(0)) done();
           if (historyMode(mode)) {
             await page.reload();
-            await page.getByText(retryActivity).waitFor();
+            await page.getByText(RETRY_ACTIVITY).waitFor();
             assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0);
             if (mode === "phase-a") {
               scenario.decisionPending = false;
               preview.store.board = sourceRows(scenario.source);
               preview.store.revision += 1;
               await page.reload();
-              await page.getByText(retryActivity).waitFor();
+              await page.getByText(RETRY_ACTIVITY).waitFor();
               assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0,
                 "phase B job adoption never flashes a terminal card");
             }
@@ -171,12 +173,12 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
             await page.reload();
             await page.getByText("恢复后任务已完成", { exact: true }).waitFor();
             assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0);
-            assert.equal(await page.getByText(retryActivity).count(), 0, "success remains settled after reload");
+            assert.equal(await page.getByText(RETRY_ACTIVITY).count(), 0, "success remains settled after reload");
             assert.equal(await page.getByText("发送失败", { exact: true }).count(), 0, "a recovered source remains delivered after reload");
           } else {
             await page.getByText("任务执行失败", { exact: true }).waitFor();
             assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 1, "a confirmed terminal failure paints exactly one card");
-            assert.equal(await page.getByText(retryActivity).count(), 0);
+            assert.equal(await page.getByText(RETRY_ACTIVITY).count(), 0);
             if (mode === "terminal") assert.equal(scenario.sends, 1, "exhausted budget never dispatches again");
           }
           await shot("final");

@@ -18,8 +18,10 @@ import {
   type TurnStatusState,
 } from "../../lib/chat/model";
 import { type ChatStatusClass, computeTypingLabel, MODEL_THINKING_WORKING_DETAIL } from "../../lib/chat/pure";
+import { retryActivityLabel } from "../../lib/chat/retryStatus";
 import type { DispatchStatus } from "../../lib/chat/socket";
 import { cn } from "../../lib/utils";
+import { Notice } from "../ui/Notice";
 
 /**
  * 喂给 TurnActivity 的会话级快照（由 App 从当前活跃会话 + 当前 agent 派生）。刻意是「值快照」
@@ -42,7 +44,8 @@ export type TurnActivityInfo = {
   /** This turn already has plated assistant text. Footer must not say 「思考中」. */
   hasPlated?: boolean;
   /** turn 非流式阶段态(判别联合,单一权威 model.ts TurnStatusState):
-   *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 统一自动重试文案。 */
+   *  'compacting' → 「正在压缩上下文」;{kind:'retrying'} → 「正在自动重试…」,有服务端进度时
+   *  「正在自动重试（n/N）」(见 retryStatus.activeTurnStatus)。 */
   turnStatus?: TurnStatusState | null;
   /** Browser/service recovery stays in this existing activity row instead of
    * creating a second card or action surface above the composer. */
@@ -131,16 +134,22 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   const retry = isRetryingTurnStatus(info.turnStatus) ? info.turnStatus : null;
   const recoveryKind = info.recoveryStatus?.kind;
 
+  // OCV5-523: all automatic recovery shares this one place, without warning colour. Only a
+  // confirmed terminal failure becomes an error card. W3:说实话 —— 服务端给了进度才写
+  // 「（n/N）」(N 是实际上限),否则不写次数。
+  if (retry && recoveryKind !== "stopping") {
+    return (
+      <div className="retrying py-1" aria-label="生成中" aria-live="polite">
+        <Notice tone="progress" title={retryActivityLabel(retry)} data-testid="automatic-retry-status" />
+      </div>
+    );
+  }
+
   let text: string;
   let cls = "";
   if (recoveryKind === "stopping") {
     text = "正在停止…";
     cls = "stopping";
-  } else if (retry) {
-    // OCV5-523: all automatic recovery shares this activity row. Only a
-    // confirmed terminal failure becomes an error card.
-    text = retry.attempt >= 1 ? `正在自动重试（第 ${retry.attempt} 次）` : "正在自动重试…";
-    cls = "retrying";
   } else if (info.dispatch) {
     ({ text, cls } = dispatchActivityLabel(info.dispatch));
   } else if (

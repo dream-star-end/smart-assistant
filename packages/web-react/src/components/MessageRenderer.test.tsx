@@ -980,7 +980,8 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(screen.queryByText("发送失败")).toBeNull();
     const retries = screen.getAllByRole("button", { name: "重试" });
     expect(retries).toHaveLength(1);
-    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
+    // W3:错误卡正文是错误目录的人话(codex_route_unavailable)。
+    expect(screen.getByRole("alert")).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
     expect(document.body).not.toHaveTextContent("GPT");
     expect(screen.queryByText("查看请求信息")).toBeNull();
 
@@ -1152,7 +1153,8 @@ describe("MessageList 失败轮单一错误出口", () => {
     expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
     expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
     expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("模型服务暂时不可用");
+    // W3:错误卡正文是错误目录的人话(codex_route_unavailable)。
+    expect(screen.getByRole("alert")).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
   });
 });
 
@@ -4190,7 +4192,7 @@ test("frozen error keeps original card and displays recovery rejection once", ()
       _errorCardSnapshot: { disposition: "card", tone: "red", title: "首次错误标题", message: "首次错误正文不可改" } }),
   ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
   expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
-  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
   expect(screen.getAllByText("首次错误正文不可改")).toHaveLength(1);
   expect(screen.getAllByText(notice)).toHaveLength(1);
   expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
@@ -4229,7 +4231,7 @@ test("same-reference recovery feedback updates through memo without rewriting th
   expect(messageSignature(row, context)).not.toBe(absent); view.rerender(<MessageList {...props} />);
   expect(screen.queryByText("反馈乙")).toBeNull(); expect(screen.queryByTestId("recovery-skipped-notice")).toBeNull();
   expect(screen.getAllByText("固定标题")).toHaveLength(1); expect(screen.getAllByText("固定错误正文")).toHaveLength(1);
-  expect(screen.getByText("固定标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getByText("固定标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
   expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
 });
 
@@ -4244,7 +4246,7 @@ test("frozen rejection already in original message appears only once", () => {
   ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
   expect(screen.getAllByText(notice)).toHaveLength(1);
   expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
-  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveAttribute("data-notice-tone", "failed");
   expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
 });
 

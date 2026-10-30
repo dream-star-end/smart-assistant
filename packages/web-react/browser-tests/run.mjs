@@ -2849,13 +2849,14 @@ await check("T29 自动恢复统一显示模型繁忙正在重试；重试成功
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
   await page.evaluate(() => window.__replayDrive.pushRetryStatus());
-  await replayRoot.getByText("正在自动重试（第 2 次）", { exact: true }).waitFor({
+  // W3:统一的重试提示改为「正在自动重试…」;服务端给了实际上限时才写「（n/N）」。
+  await replayRoot.getByText("正在自动重试…", { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
-  // D1: one shared retry activity includes the confirmed attempt, without a second error card.
+  // OCV5-523: one shared retry activity, no attempt counter or error card.
   if (await replayRoot.getByText(/\d+\/10/).count()) {
-    throw new Error("自动重试期间不应显示过时固定上限");
+    throw new Error("自动重试期间不应显示重试计数");
   }
   if (await replayRoot.getByText(replayMarkers.retryControl, { exact: true }).count()) {
     throw new Error("自动恢复控制 user 行重新显示为聊天气泡");
@@ -3290,13 +3291,16 @@ await check("T40 390px 失败轮只显示一个中性紧凑重试出口", async 
   if (await root.getByRole("button", { name: "重试", exact: true }).count() !== 1) {
     throw new Error("失败轮没有收敛为唯一重试入口");
   }
-  if (await root.getByText("查看请求信息", { exact: true }).count() !== 0) {
-    throw new Error("无请求 ID 时仍展示冗余详情入口");
-  }
+  // W3:原始错误码只在收起的「技术详情」里,默认视图不出现码和请求 ID。
   const alert = root.getByRole("alert");
-  const className = await alert.getAttribute("class") ?? "";
-  if (!className.includes("border-warning/30") || !className.includes("px-3") || !className.includes("py-2")) {
-    throw new Error(`预期错误没有使用紧凑 warning 视觉:${className}`);
+  if (await alert.getAttribute("data-notice-tone") !== "attention") {
+    throw new Error(`预期错误没有使用 attention 语气的提示:${await alert.getAttribute("data-notice-tone")}`);
+  }
+  if (await alert.getByTestId("error-tech-details").isVisible()) {
+    throw new Error("技术详情默认应收起");
+  }
+  if (/codex_route_unavailable|请求 ID/.test(await alert.innerText())) {
+    throw new Error("默认视图泄漏错误码或请求 ID");
   }
   const overflows = await root.evaluate((element) => element.scrollWidth > element.clientWidth + 1);
   if (overflows) throw new Error("错误轮在 390px 视口发生横向溢出");

@@ -63,6 +63,7 @@ import {
   parseOcMemoryCommand,
 } from "./ocMemoryCli";
 import { errorLabel } from "./render";
+import { readUserError, type UserError } from "./userErrorView";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   supportsAutomaticTurnRecovery,
@@ -2639,6 +2640,8 @@ export type DeferredTerminalErrorPaint = {
   displayMessage?: string;
   clientMessageId?: string;
   traceId?: string;
+  /** 错误帧带的人话错误;旧服务没有,渲染时按错误码查目录。 */
+  userError?: UserError;
 };
 
 /**
@@ -2661,7 +2664,8 @@ function settleOrphanProcesses(sess: ChatSession, ownerId: string | undefined): 
   }
 }
 
-function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
+/** 返回这次是否新画了一张错误卡(已提交过的卡不重画,也就不该再上报一次)。 */
+function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): boolean {
   const silent = isSilentTurnErrorCode(paint.normalized);
   const keepQuietStopLine = paint.normalized === "stopped" || paint.normalized === "user_cancelled";
   const alreadyCommitted = paint.clientMessageId
@@ -2671,10 +2675,12 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
       m._errorCardSnapshot?.disposition === "card")
     : false;
   // 已经提交过的卡不再画第二张，也不改第一张。静默终态（重启/容器回收）不落错误行。
-  if (!alreadyCommitted && (!silent || keepQuietStopLine)) {
+  const painted = !alreadyCommitted && (!silent || keepQuietStopLine);
+  if (painted) {
     const msg = addMessage(sess, "assistant", paint.displayMessage ?? paint.text, {
       _errorCode: paint.normalized,
       _errorDetail: paint.detail,
+      ...(paint.userError ? { _userError: paint.userError } : {}),
       ...(paint.clientMessageId ? { _clientMessageId: paint.clientMessageId } : {}),
       ...(paint.traceId ? { usage: { traceId: paint.traceId } } : {}),
     });
@@ -2716,6 +2722,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
       }
     }
   }
+  return painted;
 }
 
 /**
@@ -2735,6 +2742,7 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
     if (existing?._errorCardSnapshot?.disposition === "card") return false;
     if (existing) {
       existing._errorHeldForRecovery = undefined;
+      if (paint.userError && !existing._userError) existing._userError = paint.userError;
       if (paint.displayMessage) existing.text = paint.displayMessage;
       const disposition = commitErrorCardSnapshot(existing, paint.displayMessage);
       paintTerminalError(sess, paint, false);
@@ -2842,12 +2850,14 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     ? "user_cancelled"
     : normalizeBridgeErrorCode(frame.code);
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
+  const userError = readUserError(frame.userError);
   const paint: DeferredTerminalErrorPaint = {
     normalized,
     text: friendlyBridgeErrorMessage(normalized, frame.message || "出错了"),
     detail: safeBridgeErrorDetail(normalized, frame.traceId),
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+    ...(userError ? { userError } : {}),
   };
   const terminalDecision = frame.recoveryDisposition === "terminal";
   if (terminalDecision || isSilentTurnErrorCode(normalized)) {
@@ -2893,9 +2903,10 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     return;
   }
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
-  paintTerminalError(sess, paint, userCancelled);
+  const painted = paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
+  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
+  if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,
@@ -2930,12 +2941,14 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
   const userCancelled = normalized === "stopped" || normalized === "user_cancelled";
+  const userError = readUserError(frame.userError);
   const paint: DeferredTerminalErrorPaint = {
     normalized,
     text: friendlyBridgeErrorMessage(frame.code, frame.message),
     detail: safeBridgeErrorDetail(frame.code, frame.traceId),
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
+    ...(userError ? { userError } : {}),
   };
   if (isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
@@ -2972,9 +2985,10 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
     return;
   }
   const immediateRoot = problemCardRootCmid(sess, paint.clientMessageId ?? sess._activeClientMessageId);
-  paintTerminalError(sess, paint, userCancelled);
+  const painted = paintTerminalError(sess, paint, userCancelled);
   effects.persistSession?.(sess.id);
-  if (!isSilentTurnErrorCode(normalized) && immediateRoot) {
+  // 重连重放同一条错误时卡片已经在了:不重画,也不再报一次(管理员数据里同一张卡报过 35 次)。
+  if (painted && !isSilentTurnErrorCode(normalized) && immediateRoot) {
     effects.reportProblemCard?.(sess.id, {
       rootCmid: immediateRoot,
       code: normalized,
