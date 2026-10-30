@@ -3712,9 +3712,9 @@ async function main(): Promise<void> {
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api), await (await import("./lib/boxRunCleanupProof.js")).proveRunCleanupToolResults(CANDIDATE), // OCV5-645 (file-size ratchet): [ocv5-645-run-cleanup-tool-results] PASS — a recovered run whose CLI wrote a session tool-results tree finishes its privacy cleanup instead of retrying it forever, and any other folder there stays refused
     ...await withJournalDatabase(database, async (db) => [await (await import("./lib/boxContextTransportProof.js")).proveContextTransport(CANDIDATE, db), await proveRejectedStreamWedge(api, db), // [ocv5-607-lossless-context-transport] PASS
-      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
+      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db), await (await import("./lib/boxStaleRecoveryProof.js")).proveStoppedRecoveryClaim({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), // [box-stopped-recovery-claim] PASS
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
-      await proveIdleNoSummary(api, db),
+      await proveIdleNoSummary(api, db), await (await import("./lib/tapeJobTerminalProof.js")).proveTapeJobTerminals(CANDIDATE, db), // [ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key
       await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),

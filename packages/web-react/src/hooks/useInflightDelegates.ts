@@ -84,22 +84,24 @@ export function writeDismissedDelegates(
  * Composer-pinned inflight delegate snapshot.
  *
  * Fetch once on session enter/switch. Poll every 15s while any item is
- * non-terminal. Stop on all-terminal, null, or a first 404 for that session
- * (flag-off / missing route — never retry that id in this tab).
+ * non-terminal, backing off to 60s on read failure without discarding the last
+ * confirmed snapshot. A first 404 stops polling (flag-off / missing route).
  */
 export function useInflightDelegates(opts: {
   sessionId: string | null;
   messages: ChatMessage[];
   enabled: boolean;
   auth: AuthSession | null;
-}): { items: InflightDelegateItem[]; dismiss: (jobId: string) => void } {
+}): { items: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
   const { sessionId, messages, enabled, auth } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
+  const [failures, setFailures] = useState(0);
   const [dismissed, setDismissed] = useState<Set<string>>(() => readDismissedDelegates(sessionId));
   const [seenSessionId, setSeenSessionId] = useState(sessionId);
   if (sessionId !== seenSessionId) {
     setSeenSessionId(sessionId);
     setRawItems(null);
+    setFailures(0);
     setDismissed(readDismissedDelegates(sessionId));
   }
   const notFoundRef = useRef(new Set<string>());
@@ -125,10 +127,7 @@ export function useInflightDelegates(opts: {
   const pull = useCallback(async (sid: string, myGen: number) => {
     const a = authRef.current;
     if (!a) return;
-    if (notFoundRef.current.has(sid)) {
-      if (genRef.current === myGen) setRawItems(null);
-      return;
-    }
+    if (notFoundRef.current.has(sid)) return;
     const result = await fetchInflightDelegatesResult(sid, a);
     if (genRef.current !== myGen) return;
     if (result.ok) {
@@ -136,21 +135,24 @@ export function useInflightDelegates(opts: {
         if (!isTerminalDelegateState(item.state)) seenLiveRef.current.add(item.jobId);
       }
       setRawItems(result.items);
+      setFailures(0);
       return;
     }
     if (result.notFound) notFoundRef.current.add(sid);
-    setRawItems(null);
+    setFailures((n) => Math.min(n + 1, 2));
   }, []);
 
   useEffect(() => {
     if (!enabled || !sessionId || !auth) {
       genRef.current += 1;
       setRawItems(null);
+      setFailures(0);
       setDismissed(new Set());
       return;
     }
     const myGen = ++genRef.current;
     setRawItems(null);
+    setFailures(0);
     // 会话内已「知道了」的终态项从 sessionStorage 回灌(H-14),不再随重挂载清零。
     setDismissed(readDismissedDelegates(sessionId));
     seenLiveRef.current = new Set();
@@ -164,8 +166,8 @@ export function useInflightDelegates(opts: {
     !!enabled &&
     !!sessionId &&
     !!auth &&
-    rawItems !== null &&
-    rawItems.some((item) => !isTerminalDelegateState(item.state));
+    !notFoundRef.current.has(sessionId) &&
+    (failures > 0 || rawItems?.some((item) => !isTerminalDelegateState(item.state)));
 
   useEffect(() => {
     if (!shouldPoll || !sessionId) return;
@@ -173,7 +175,7 @@ export function useInflightDelegates(opts: {
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
       void pull(sessionId, myGen);
-    }, POLL_MS);
+    }, POLL_MS * 2 ** failures);
     // 回到前台立刻拉一次(H-15):隐藏期跳过的轮询不必再等下一个 15s。
     const onVisible = () => {
       if (document.visibilityState === "visible") void pull(sessionId, myGen);
@@ -183,7 +185,7 @@ export function useInflightDelegates(opts: {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [shouldPoll, sessionId, pull]);
+  }, [shouldPoll, sessionId, pull, failures]);
 
   const items = useMemo(() => {
     if (!rawItems) return [];
@@ -194,5 +196,5 @@ export function useInflightDelegates(opts: {
     });
   }, [rawItems, messages, dismissed]);
 
-  return { items, dismiss };
+  return { items, degraded: failures > 0, dismiss };
 }

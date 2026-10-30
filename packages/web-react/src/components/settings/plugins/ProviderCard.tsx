@@ -106,7 +106,6 @@ export function ProviderCard({
   const uninstallBlocked = (management?.connectionCount ?? 0) > 0
   return (
     <section data-connector-card={slug} className={CONNECTOR_SECTION}>
-      {onBindToken && <Button variant="ghost" size="sm" onClick={onBindToken}>使用 GitHub 访问令牌</Button>}
       <ConnectorHead
         label={label}
         status={status}
@@ -153,6 +152,17 @@ export function ProviderCard({
           )
         }
       />
+
+      {/* GitHub 的访问令牌是授权的备用路，不是第二个「连接」：放在标题下一句话里，标题行只留一个主动作
+          （插件页 GitHub 双控件，P3）。改造前它是一颗挂在卡片最上方、标题之前的按钮，和「绑定」并排成两个入口。 */}
+      {onBindToken && canBind && !unavailable && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-1 text-meta text-muted">
+          <span>授权页打不开时，可以改用访问令牌：</span>
+          <Button variant="ghost" size="sm" onClick={onBindToken}>
+            使用 GitHub 访问令牌
+          </Button>
+        </div>
+      )}
 
       {unavailable ? (
         <ConnectorNote tone="warning">已下架或暂不可用，仅保留解绑。</ConnectorNote>
