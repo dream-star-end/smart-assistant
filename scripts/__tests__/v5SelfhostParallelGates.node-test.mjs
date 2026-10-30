@@ -119,6 +119,25 @@ if master_build_job_start unreadable task; then exit 99; fi
   assert.match(r.stderr, /unreadable.*未启动/);
 });
 
+test('C/D admission uses own-tree budget while external demand at eight still blocks', (t) => {
+  const f = fixture(t, '12.00');
+  const r = run(f, `
+MASTER_GATE_LOAD_BUDGET_DIR=fixture-owned-state
+master_gate_admission_load1() { [[ "$1" == 12.00 ]]; printf 2.00; }
+task() { event own-budget-admitted; }
+master_build_job_start owned task
+master_build_jobs_wait
+master_gate_admission_load1() { printf 8.00; }
+MASTER_GATE_IDLE_TIMEOUT_S=0
+if master_build_job_start exterior task; then exit 99; fi
+`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(events(f), ['own-budget-admitted']);
+  assert.equal(notes(f)['job.owned.load1'], '2.00');
+  assert.equal(notes(f)['job.exterior.load1'], '8.00');
+  assert.equal(notes(f)['job.exterior.admissionFailure'], 'admission-timeout');
+});
+
 test('failure stops admission; cleanup drains owned workers and grandchildren without touching unrelated work', (t) => {
   const f = fixture(t);
   const r = run(f, `

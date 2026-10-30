@@ -154,6 +154,7 @@ for mode in deploy prewarm-artifacts; do
       release_policy_enabled() { note policy; return 1; }
       release_policy_abort_unexposed() { note abort; }
       reap_runtime_release_bg() { note reap; }
+      master_gate_load_budget_stop() { note load-stop; }
       lease_train_on_exit() { note "lease:$1"; }
       cleanup_master_staging() { note master; }
       cleanup_cutover_unit_snap() { note units; }
@@ -169,7 +170,7 @@ for mode in deploy prewarm-artifacts; do
       if [[ "$code" != 86 ]]; then
         expected+=$'\npolicy'
         [[ "$code" == 0 ]] || expected+=$'\nabort'
-        expected+=$'\nreap\nlease:'"$code"$'\nmaster\nunits\nweb'
+        expected+=$'\nreap\nload-stop\nlease:'"$code"$'\nmaster\nunits\nweb'
       fi
     fi
     check "$mode EXIT cleanup $code has only its ordered effects" test "$(cat "$trace")" = "$expected"
