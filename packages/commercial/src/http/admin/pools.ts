@@ -23,7 +23,7 @@ import { HttpError, readJsonBody, sendJson } from "../util.js";
 
 /** Services that take API keys in pool_api_keys. */
 export function apiKeyServices(): string[] {
-  return ["claude", "gemini", ...Object.keys(STATIC_PROVIDER_META)];
+  return ["claude", "gemini", "openai", ...Object.keys(STATIC_PROVIDER_META)];
 }
 
 /** Display order of the pools on the admin page. */

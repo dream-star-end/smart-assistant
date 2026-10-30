@@ -113,7 +113,7 @@ export async function createMemoryToolsContext(agentId: string): Promise<MemoryT
   if (isEmbeddingAvailable()) {
     try {
       embeddingProvider = getEmbeddingProvider()
-      await initVectorStore(embeddingProvider.dimensions)
+      await initVectorStore(embeddingProvider.dimensions, embeddingProvider)
       process.stderr.write(
         `[oc-memory] embedding enabled: ${embeddingProvider.providerId}/${embeddingProvider.modelId} (${embeddingProvider.dimensions}d)\n`,
       )
