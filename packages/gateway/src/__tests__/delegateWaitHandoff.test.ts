@@ -64,7 +64,9 @@ function fixture(sm = false) {
       failureClass: 'child_error', detail: 'child failed', httpStatus: 500,
       claimToken: owner.claimToken, fencingEpoch: owner.fencingEpoch,
     }), true)
-    else assert.equal(store.complete(jobId, { httpStatus: 200, body: { output: 'final output' } }), true)
+    else assert.equal(store.complete(jobId, { httpStatus: 200, body: { output: 'final output' } }, {
+      claimToken: owner.claimToken!, fencingEpoch: owner.fencingEpoch,
+    }), true)
     const snap = store.snapshotOf(jobId)!
     if (isDelegateNotifierEffective()) void host._ensureDurableSendToAgentCallback(snap, intent(jobId))
     _queueSendToAgentCallback.call(host, { parentSessionKey: PARENT } as any, { jobId, agentId: 'coding-assistant', goal: 'task' })
