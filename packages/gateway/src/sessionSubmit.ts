@@ -431,6 +431,7 @@ export async function submit(
     turnChatProjectId?: string | null
     toolsets?: string[]
     collabAgentPolicy?: CollabAgentPolicy
+    readOnly?: boolean
     /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
      *  只有 **bridge turn** 有(server.ts dispatchInbound 从验签产物 TurnExecutionDescriptor
      *  原样取出);cron/synthetic/delegate/train 等本地路径 submit 不传 —— CCB runner
@@ -629,6 +630,7 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    session._turnReadOnly = opts?.readOnly === true
     log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
@@ -1473,6 +1475,7 @@ export async function submit(
         session._currentTurnIndex = undefined
         session._currentDispatch = undefined
         session._turnCreditBudgetFen = undefined
+        session._turnReadOnly = undefined
         if (queueTurn) {
           this._promptQueueExecutions.delete(session)
           this._promptQueueExecutionKeys.delete(session.sessionKey)

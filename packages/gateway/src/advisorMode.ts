@@ -81,9 +81,28 @@ export function uniquePendingConsultInvocationId(
   return { ok: true, invocationId: id }
 }
 
+export const ADVISOR_NO_WRITE_CONSTRAINT =
+  '【本轮禁止写文件】用户要求本轮只读、只给建议或仅回复。主模型只能用只读工具验证，交付只写回复；不得写入、修改、新建或删除文件，不得通过命令、MCP 或委派绕过。顾问不要建议主模型改文件、执行写命令或把建议落实到文件。'
+
+/** Evaluate the original user turn only; never infer permissions from injected prompts or history. */
+export function detectAdvisorNoWrite(userText: string): boolean {
+  const text = userText.normalize('NFKC').replace(/[’‘]/g, "'")
+  return [
+    /(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)\s*(?:(?:再|去|实际|直接|自动|擅自|执行|进行)\s*)*(?:改(?:动|写)?|更改|修改|编辑|写入?|创建|新建|删除|保存|更新|覆盖|触碰|动)[^。！？!?\n，,；;]{0,20}(?:文件|代码|文档|仓库|工作区|源码|磁盘|[\w/-]+\.[a-zA-Z]{1,8}\b)/,
+    /(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|请勿|不)\s*(?:对)?[^。！？!?\n，,；;]{0,12}(?:文件|代码|文档|仓库|工作区|源码|磁盘)\s*(?:做|进行|作)?\s*(?:任何)?\s*(?:改动|更改|修改|编辑|写入|删除|更新|覆盖)/,
+    /(?:文件|代码|文档|仓库|工作区|源码|磁盘)\s*(?:都|也|先|暂时)?\s*(?:不要|不用|无需|不必|不需要|不许|禁止|不得|不能|别|勿|不)\s*(?:改|修改|编辑|写|创建|删除|更新|覆盖|动)/,
+    /(?:禁写|只读|(?:只|仅)(?:允许|需要|需|用|做)?\s*(?:查看|检查|分析|审查|给(?:出)?(?:意见|(?:修改)?建议|方案)|提供(?:意见|建议|方案)|提建议|回复|回答|输出建议|告诉我|说))/,
+    /\b(?:do\s+not|don't|never|must\s+not|cannot|can't|no)\s+(?:(?:actually|directly|ever)\s+)*(?:modify|edit|change|write|create|delete|remove|save|update|overwrite|touch|patch|(?:make|apply)\s+(?:any\s+)?(?:changes?|edits?|patches?))\b[^.!?\n,;]{0,40}\b(?:files?|code|documents?|repo(?:sitory)?|workspace|disk|anything|[\w/-]+\.[a-z]{1,8})\b/i,
+    /\bwithout\s+(?:modifying|editing|changing|writing|creating|deleting|saving|updating|touching)\b[^.!?\n,;]{0,40}\b(?:files?|code|documents?|repo(?:sitory)?|workspace|disk)\b/i,
+    /\b(?:no\s+(?:file|code|document|workspace)\s+(?:writes?|changes?|edits?|modifications?)|read[\s-]?only|(?:advice|suggestions?|response|reply)\s+only|(?:only|just)\s+(?:(?:give|provide)\s+(?:me\s+)?(?:advice|suggestions?|recommendations?)|advise|answer|respond|reply|explain|review|analy[sz]e))\b/i,
+    /\b(?:keep|leave)\b[^.!?\n,;]{0,24}\b(?:files?|code|documents?|repo(?:sitory)?|workspace)\b[^.!?\n,;]{0,16}\b(?:unchanged|untouched|unmodified)\b/i,
+  ].some((pattern) => pattern.test(text))
+}
+
 export const ADVISOR_PREAMBLE = [
   '【顾问模式已开启】当前主模型不切换。你可以使用 consult_advisor 向无工具顾问提问（question 必填，可选 concern）。',
   '顾问只给建议，没有工具、不能改文件或再委派。你必须用自己的工具验证建议后再交付。',
+  '用户禁止改文件或要求只读、只给建议时，验证只能用只读工具，交付只写回复；不得 Write、Edit 或通过命令、MCP、委派改文件，也不要把顾问的措辞建议落实到文件。',
   '咨询失败时向用户说明并可继续执行，不要把它当成正式审计或审批。',
   '',
 ].join('\n')
@@ -380,6 +399,8 @@ export function stripAdvisorPreambleFromInjected(text: string): string {
 
 export type AdvisorSnapshotInput = {
   userTask: string
+  /** Permission frozen by the active submit, independent of queued-turn prompt fields. */
+  readOnly?: boolean
   injectedConstraints?: string
   historyRecords?: Array<{ role?: string; text?: string; toolName?: string; toolResult?: string }>
   currentTools?: Array<{ name?: string; input?: unknown; result?: string; completed?: boolean }>
@@ -447,9 +468,14 @@ export function buildAdvisorSnapshot(input: {
 }): AdvisorSnapshot {
   const missing: string[] = []
   let truncated = false
-  const constraints = cap(input.source.injectedConstraints ?? '', CONSTRAINT_CAP)
+  const noWrite = input.source.readOnly === true || detectAdvisorNoWrite(input.source.userTask)
+  const injectedConstraints = [
+    ...(noWrite ? [ADVISOR_NO_WRITE_CONSTRAINT] : []),
+    input.source.injectedConstraints ?? '',
+  ].filter(Boolean).join('\n')
+  const constraints = cap(injectedConstraints, CONSTRAINT_CAP)
   truncated = truncated || constraints.truncated
-  if (!input.source.injectedConstraints) missing.push('injected_constraints')
+  if (!injectedConstraints) missing.push('injected_constraints')
   if (!input.source.historyRecords) missing.push('history_tape')
   const tools = (input.source.currentTools ?? []).map((tool) => {
     const result = typeof tool.result === 'string' ? cap(tool.result, TOOL_CAP) : { text: '', truncated: false }
@@ -576,7 +602,7 @@ export function formatAdvisorConsultPrompt(snapshot: AdvisorSnapshot): string {
     `【授权产物】\n${artifacts || '（无）'}`,
     `【咨询问题】\n${snapshot.question}`,
     snapshot.concern ? `【关注点】\n${snapshot.concern}` : '',
-    '请给出可执行建议、风险和需要主模型自行验证的步骤。建议可能有错。',
+    '请给出建议、风险和需要主模型自行验证的步骤。用户禁止改文件时，仅建议只读验证和回复，不要建议主模型改文件。建议可能有错。',
   ]
     .filter(Boolean)
     .join('\n\n')

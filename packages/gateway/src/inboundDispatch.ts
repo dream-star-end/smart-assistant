@@ -60,6 +60,7 @@ import {
   ADVISOR_CONSULT_PARENT_REASON,
   isAdvisorConsultParentEngine,
   stripAdvisorPreambleFromInjected,
+  detectAdvisorNoWrite,
 } from './advisorMode.js'
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
@@ -2238,6 +2239,7 @@ export async function dispatchInbound(
               }
             : undefined
       const leaderSubmitOpts = {
+        readOnly: advisorTurnAllowed && detectAdvisorNoWrite(text ?? ''),
         historicalMessages: masterHistoricalMessages,
         codexRoute: safeCodexRoute,
         grokRoute: safeGrokRoute,

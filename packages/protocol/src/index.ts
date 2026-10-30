@@ -78,3 +78,4 @@ export {
 
 export * from './ccbTranscriptRestore.js'
 export * from './automaticRetryStatus.js'
+export * from './advisorReadOnly.js'

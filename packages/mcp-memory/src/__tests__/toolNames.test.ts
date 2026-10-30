@@ -18,6 +18,13 @@ import { SKILL_PROPOSE_TOOL, TOOLS } from '../toolDefs.js'
 import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES } from '../toolNames.js'
 
 describe('TOOLS ↔ toolNames.ts 锁步', () => {
+  it('consult_advisor verification instruction preserves the user no-write exception', () => {
+    const consult = TOOLS.find((tool) => tool.name === 'consult_advisor')!
+    assert.match(consult.description, /用户禁止改文件或要求只读、只给建议时/)
+    assert.match(consult.description, /验证只能用只读工具，交付只写回复/)
+    assert.match(consult.description, /不得 Write、Edit 或通过命令、MCP、委派改文件/)
+  })
+
   it('TOOLS 的 name 序列逐一等于 MEMORY_MCP_TOOL_NAMES(顺序即声明顺序)', () => {
     assert.deepEqual(
       TOOLS.map((t) => t.name),

@@ -15,6 +15,7 @@ import {
   type GoalStateSnapshot,
   type OutboundContentBlock,
   synthesizeEmptyFailedToolPreview,
+  isAdvisorReadOnlyMcpTool,
 } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -1356,6 +1357,7 @@ function validateCursorFinalPrompt(prompt: string, payloadBytes: number): void {
 }
 
 interface CursorMemoryMcpConfigInput {
+  readOnly?: boolean
   identityCompat?: IdentityCompatRuntimeContext
   launch: McpMemoryLaunch
   tokenFile: string
@@ -1383,6 +1385,7 @@ function buildCursorMemoryMcpConfig(input: CursorMemoryMcpConfigInput): Record<s
     OPENCLAUDE_DELEGATE_CONTEXT_FILE: input.delegateContextFile,
     OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
     OPENCLAUDE_ENGINE: 'cursor',
+    OPENCLAUDE_ADVISOR_READ_ONLY: input.readOnly ? '1' : '0',
     ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
     ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
       ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
@@ -1934,6 +1937,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const payloadBytes = validateCursorTurnPayload(payload)
 
     const contextDir = this.createContextDir(ctx)
+    const discoveryCwd = ctx.params.readOnly ? join(contextDir, 'workspace') : cwd
+    if (ctx.params.readOnly) mkdirSync(discoveryCwd, { mode: 0o700 })
     try {
       const mcpLaunch = resolveMcpMemoryLaunch(this.opts.config.auth.claudeCodePath, {
         fallback: 'node-tsx',
@@ -1946,7 +1951,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         provider: 'cursor',
         model: this.currentModel,
         repoSnapshot: repoSnapshot ?? undefined,
-        availableMcpTools: mcpLaunch ? [...OPENCLAUDE_MEMORY_MCP_TOOLS] : [],
+        availableMcpTools: mcpLaunch
+          ? ctx.params.readOnly
+            ? [...OPENCLAUDE_MEMORY_MCP_TOOLS.filter(isAdvisorReadOnlyMcpTool), 'consult_advisor']
+            : [...OPENCLAUDE_MEMORY_MCP_TOOLS]
+          : [],
         skillEvalExclude: this.opts.skillEvalExclude,
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
@@ -1972,12 +1981,15 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
           .slice(0, 12),
         board_project_id: this.opts.runContext?.boardProjectId ?? this.opts.projectId ?? null,
       })
-      const prompt = renderCursorPrompt(
+      const renderedPrompt = renderCursorPrompt(
         platformResult.content,
         payload,
         getPlatformPrompt('cursor-preamble', CURSOR_PREAMBLE),
         this.platformGoal,
       )
+      const prompt = ctx.params.readOnly
+        ? `This turn is read-only. The user's workspace is ${JSON.stringify(cwd)}. Read and search it using absolute paths.\n\n${renderedPrompt}`
+        : renderedPrompt
       validateCursorFinalPrompt(prompt, payloadBytes)
 
       // Cursor runs in Agent mode with unrestricted tools. Build its ambient
@@ -1985,6 +1997,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       // every present/future credential name. The MCP child receives only its
       // explicit config env below; shell tools get non-secret agent routing.
       const env = buildCursorSpawnEnv(this.opts.agentId, this.opts.sessionKey)
+      env.OPENCLAUDE_ADVISOR_READ_ONLY = ctx.params.readOnly ? '1' : '0'
       Object.assign(env, identityCompatEnvironment(this.opts.identityCompat), { OPENCLAUDE_AGENT_ID: this.opts.agentId })
       if (this.opts.cursorCredentialSelection) {
         env.OPENCLAUDE_CURSOR_SELECTED_KEY = this.opts.cursorCredentialSelection.keyName
@@ -2019,6 +2032,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         )
         chmodSync(contextFile, 0o600)
         const mcpConfig = buildCursorMemoryMcpConfig({
+          readOnly: ctx.params.readOnly,
           identityCompat: this.opts.identityCompat,
           launch: mcpLaunch,
           tokenFile,
@@ -2045,8 +2059,16 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
       this.prepareCursorChatsDir()
       // Wrapper --workspace is `pwd -P` of this spawn cwd. A symlink cwd would
       // hash differently from the CLI store path, so realpath before the check.
-      let workspaceForResume = cwd
-      try { workspaceForResume = realpathSync(cwd) } catch { /* keep cwd */ }
+      let workspaceForResume = discoveryCwd
+      try { workspaceForResume = realpathSync(discoveryCwd) } catch { /* keep cwd */ }
+      if (this.nativeId && !cursorResumeStoreExists(workspaceForResume, this.nativeId)) {
+        relocateCursorResumeStore({
+          resumeId: this.nativeId,
+          currentWorkspacePath: workspaceForResume,
+          previousWorkspacePaths: [cwd],
+          sessionKey: this.opts.sessionKey,
+        })
+      }
       const resumeId = this.nativeId && cursorResumeStoreExists(workspaceForResume, this.nativeId) ? this.nativeId : null
       // A stored id whose local store vanished would silently mint an empty chat.
       if (this.nativeId && resumeId === null) this.nativeId = null
@@ -2065,11 +2087,11 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
 
       const args = [
         ...(selected.upstreamModel === null ? [] : ['--model', selected.upstreamModel]),
-        '--force',
+        ...(ctx.params.readOnly ? ['--mode', 'ask'] : ['--force']),
         '--',
         prompt,
       ]
-      const proc = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env })
+      const proc = spawn(bin, args, { cwd: discoveryCwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env })
       ctx.proc = proc
       if (ctx.abandoned) {
         // shutdown() gave up on this turn while we were still composing the

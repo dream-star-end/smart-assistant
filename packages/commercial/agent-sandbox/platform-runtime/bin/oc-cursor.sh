@@ -1373,6 +1373,11 @@ fi
 [ -z "$model" ] || set -- --model "$model" "$@"
 [ -z "$mode" ] || set -- --mode "$mode" "$@"
 [ "$force" -eq 0 ] || set -- --force "$@"
+if [ "${OPENCLAUDE_ADVISOR_READ_ONLY:-0}" = "1" ]; then
+  # Pinned Cursor 2026.10.16 supports this exact proto-tool allowlist. Ask
+  # mode also stays on, but write/shell/delegate/mode-switch schemas are absent.
+  set -- --allowed-tools "read_tool_call,glob_tool_call,grep_tool_call,ls_tool_call,sem_search_tool_call,read_lints_tool_call,read_todos_tool_call,mcp_tool_call,get_mcp_tools_tool_call,list_mcp_resources_tool_call,read_mcp_resource_tool_call" "$@"
+fi
 
 # setsid gives the CLI and every tool child one process group so Stop cannot
 # leave a shell command running after the wrapper exits. HOME is per-call and
