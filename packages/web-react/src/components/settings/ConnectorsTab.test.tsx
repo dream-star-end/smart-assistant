@@ -485,10 +485,12 @@ describe("ConnectorsTab 目录渲染", () => {
     render(<ConnectorsTab auth={auth} />);
 
     expect(await screen.findByText("WebDAV 网盘")).toBeInTheDocument();
-    // OCV5-383：一级列表每个插件一行「名称 + 状态 + 启用开关」，说明与能力标注在详情页里。
+    // OCV5-383：一级列表每个插件一行，说明与能力标注在详情页里。
+    // UI-5（体验官 #36）：还没连上的插件行尾是「连接」，不出「开着却未连接」的启用开关。
     for (const p of PROVIDERS) {
       expect(screen.getByRole("button", { name: `${p.label}：未连接，打开设置` })).toBeInTheDocument();
-      expect(screen.getByRole("switch", { name: `启用「${p.label}」` })).toBeChecked();
+      expect(screen.getByRole("button", { name: `连接「${p.label}」` })).toBeInTheDocument();
+      expect(screen.queryByRole("switch", { name: `启用「${p.label}」` })).not.toBeInTheDocument();
       expect(screen.queryByText(p.description)).not.toBeInTheDocument();
     }
     for (const p of PROVIDERS) {
@@ -2841,7 +2843,30 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
   });
 
   test("关掉开关 → PATCH 偏好 disabled_plugins，行状态变「已停用」；再打开就恢复", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
+    vi.mocked(api.patchPreferences).mockResolvedValue({ prefs: {} });
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "启用「邮箱」" });
+    fireEvent.click(sw);
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenCalledWith(auth, { disabled_plugins: ["imap"] }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「邮箱」" })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: /^邮箱：/ })).toHaveTextContent("已停用");
+    expect(await screen.findByText(/已停用「邮箱」/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: "启用「邮箱」" }));
+    await waitFor(() => expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, { disabled_plugins: [] }));
+    expect(screen.getByRole("switch", { name: "启用「邮箱」" })).toBeChecked();
+  });
+
+  test("停用的插件即使没连上也留着开关(能重新打开)；启用后没连上就换回「连接」(UI-5)", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.getPreferences).mockResolvedValue({ prefs: { disabled_plugins: ["webdav"] } });
     vi.mocked(api.patchPreferences).mockResolvedValue({ prefs: {} });
     render(
       <ToastProvider>
@@ -2849,21 +2874,17 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
       </ToastProvider>,
     );
     const sw = await screen.findByRole("switch", { name: "启用「WebDAV 网盘」" });
-    fireEvent.click(sw);
-    await waitFor(() =>
-      expect(api.patchPreferences).toHaveBeenCalledWith(auth, { disabled_plugins: ["webdav"] }),
-    );
-    expect(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" })).not.toBeChecked();
-    expect(screen.getByRole("button", { name: /^WebDAV 网盘：/ })).toHaveTextContent("已停用");
-    expect(await screen.findByText(/已停用「WebDAV 网盘」/)).toBeInTheDocument();
+    expect(sw).not.toBeChecked();
+    expect(screen.queryByRole("button", { name: "连接「WebDAV 网盘」" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" }));
+    fireEvent.click(sw);
     await waitFor(() => expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, { disabled_plugins: [] }));
-    expect(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: "启用「WebDAV 网盘」" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "连接「WebDAV 网盘」" })).toBeInTheDocument();
   });
 
   test("保存失败时开关回滚并提示（不乐观谎报）", async () => {
-    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
     vi.mocked(api.patchPreferences).mockRejectedValue(new ApiError({ status: 500, code: "INTERNAL", message: "boom" }));
     render(
       <ToastProvider>
@@ -2906,7 +2927,7 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
   });
 
   test("默认关闭的本机插件（商业版同花顺，OCV5-388）：显示关闭；打开写 enabled_plugins，默认关闭不写进 disabled_plugins", async () => {
-    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
     vi.mocked(api.getLocalPlugins).mockResolvedValue({
       plugins: [{ ...THS_PLUGIN, enabled: false, defaultEnabled: false }],
     });
@@ -3059,6 +3080,28 @@ describe('插件连接简化', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '使用 GitHub 访问令牌' }))
     expect(await screen.findByRole('dialog')).toHaveTextContent('访问令牌')
+  })
+
+  test('GitHub 只有一个连接入口：列表行是「连接」不带开着的开关，详情页标题行只有「绑定」，令牌是标题下的备用路(P3)', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry({ slug: 'github', label: 'GitHub' })] })
+    render(<ConnectorsTab auth={auth} />)
+    // 体验官 10-29：GitHub 行同时有「连接」按钮和已开启的开关，含义不清。
+    expect(await screen.findByRole('button', { name: '连接「GitHub」' })).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: '启用「GitHub」' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '使用 GitHub 访问令牌' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^GitHub：/ }))
+    const card = await waitFor(() => {
+      const el = document.querySelector('[data-connector-card="github"]')
+      expect(el).not.toBeNull()
+      return el as HTMLElement
+    })
+    expect(within(card).getAllByRole('button', { name: '绑定' })).toHaveLength(1)
+    const token = within(card).getByRole('button', { name: '使用 GitHub 访问令牌' })
+    // 令牌按钮不再挂在标题前面：它跟在说明之后，不是和「绑定」并列的第二个入口。
+    const description = card.querySelector('[data-connector-description]') as HTMLElement
+    expect(description.compareDocumentPosition(token) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
   test('v1 failure leaves declarative and local sources accessible with visible degradation', async () => {
