@@ -333,6 +333,18 @@ describe('runCursorDelegateFastPath — wait transport blip → running handle (
   })
 })
 
+function listedArtifactPaths(out: string): string[] {
+  const marker = '产物路径(完整文件仍在,请用 Read 打开):\n'
+  const at = out.indexOf(marker)
+  if (at < 0) return []
+  const paths: string[] = []
+  for (const line of out.slice(at + marker.length).split('\n')) {
+    if (!line.startsWith('- ')) break
+    paths.push(line.slice(2))
+  }
+  return paths
+}
+
 describe('truncateDelegateLeaderResult', () => {
   it('leaves short text, including the exact 6000-char boundary, unchanged', () => {
     assert.equal(truncateDelegateLeaderResult('修复完成'), '修复完成')
@@ -359,6 +371,72 @@ describe('truncateDelegateLeaderResult', () => {
     assert.equal(out.includes('见 '), false)
     assert.match(out, /产物路径\(完整文件仍在,请用 Read 打开\)/)
     assert.match(out, new RegExp(`- ${path.replace(/[.]/g, '\\.')}`))
+  })
+
+  it('lists a backtick-quoted path with a space from the omitted middle', () => {
+    const path = '/home/agent/.openclaude/generated/trip plan.md'
+    const text = `${'H'.repeat(3500)}\n产物：\`${path}\`\n${'T'.repeat(3500)}`
+    const out = truncateDelegateLeaderResult(text)
+    assert.equal(out.includes(path), true)
+    assert.deepEqual(listedArtifactPaths(out), [path])
+  })
+
+  it('lists a backtick-quoted path that contains parentheses', () => {
+    const path = '/home/agent/.openclaude/generated/trip(1).md'
+    const text = `${'H'.repeat(3500)}\n产物：\`${path}\`\n${'T'.repeat(3500)}`
+    const out = truncateDelegateLeaderResult(text)
+    assert.equal(out.includes(path), true)
+    assert.deepEqual(listedArtifactPaths(out), [path])
+  })
+
+  it('keeps a spaced path inside quotes, angle brackets, and corner brackets', () => {
+    const quoted = '/home/agent/.openclaude/generated/trip plan.md'
+    const angled = '/home/agent/.openclaude/generated/图表 (1).png'
+    const cjk = '/home/agent/.openclaude/generated/行程 草案.md'
+    const text = [
+      'H'.repeat(3500),
+      `双引号"${quoted}"`,
+      `链接[下载](<${angled}>)`,
+      `书名号「${cjk}」`,
+      'T'.repeat(3500),
+    ].join('\n')
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [quoted, angled, cjk])
+  })
+
+  it('drops sentence punctuation and a following clause from the Read target', () => {
+    const bare = '/home/agent/.openclaude/generated/trip-plan.md'
+    const gz = '/home/agent/.openclaude/generated/archive.tar.gz'
+    const csv = '/home/agent/.openclaude/generated/sales.csv'
+    const text = [
+      'H'.repeat(3500),
+      `见 ${bare}。以及 ${gz}.下一句 "${csv} 是结果",结束`,
+      'T'.repeat(3500),
+    ].join('')
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [bare, gz, csv])
+  })
+
+  it('keeps a parenthesized filename and still stops at a markdown link closer', () => {
+    const file = '/home/agent/.openclaude/generated/trip(1).md'
+    const link = '/home/agent/.openclaude/generated/sales.csv'
+    const text = `${'H'.repeat(3500)}裸 ${file} 以及[下载](${link})。${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [file, link])
+  })
+
+  it('does not swallow the sentence after an unclosed parenthesis', () => {
+    const head = 'H'.repeat(3500)
+    const tail = 'T'.repeat(3500)
+    const text = `${head}见 /home/agent/.openclaude/generated/trip(draft 还没写完。${tail}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [
+      '/home/agent/.openclaude/generated/trip',
+    ])
+  })
+
+  it('stops after a finished filename when quoted prose follows', () => {
+    const file = '/home/agent/.openclaude/generated/file.name with space.md'
+    const report = '/home/agent/.openclaude/generated/report.md'
+    const notes = '/home/agent/.openclaude/generated/notes.md'
+    const text = `${'H'.repeat(3500)}\`${file}\` 以及 \`${report} 和 ${notes}\`${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [file, report, notes])
   })
 
   it('does not split a surrogate pair at the cut', () => {
@@ -406,6 +484,27 @@ describe('formatDelegateSuccess leader cap', () => {
     assert.match(out, /sessionKey=agent:coding:delegate:1/)
     assert.match(out, /resumeSessionKey/)
     assert.ok(out.trimEnd().endsWith('下次同一成员续跑请传 resumeSessionKey。'))
+  })
+
+  it('preserves quoted artifact paths in the tool result the leader reads', () => {
+    const spaced = '/home/agent/.openclaude/generated/trip plan.md'
+    const paren = '/home/agent/.openclaude/generated/trip(1).md'
+    const spacedOut = formatDelegateSuccess(
+      'member',
+      `${'H'.repeat(3500)}\n产物：\`${spaced}\`\n${'T'.repeat(3500)}`,
+      'child-session',
+    )
+    const parenOut = formatDelegateSuccess(
+      'member',
+      `${'H'.repeat(3500)}\n产物：\`${paren}\`\n${'T'.repeat(3500)}`,
+      'child-session',
+    )
+    assert.equal(spacedOut.includes(spaced), true)
+    assert.equal(parenOut.includes(paren), true)
+    assert.deepEqual(listedArtifactPaths(spacedOut), [spaced])
+    assert.deepEqual(listedArtifactPaths(parenOut), [paren])
+    assert.match(spacedOut, /sessionKey=child-session/)
+    assert.match(parenOut, /resumeSessionKey/)
   })
 
   it('fast path finished inside the wait window returns the capped text', async () => {
