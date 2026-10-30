@@ -388,6 +388,7 @@ export function messageSignature(
         head,
         textSig(m.text),
         m.status ?? "",
+        m._deliveryState ?? "",
         (m._media?.length ?? 0),
         m._replyTo
           ? `${m._replyTo.messageId}:${m._replyTo.role}:${textSig(m._replyTo.text)}`
@@ -464,6 +465,7 @@ export function messageSignature(
         m._teamFallback ? 1 : 0,
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
+        m.cancelled ? 1 : 0,
         // 终态三态(server 行区分超时):变则徽记要重渲。
         m._delegateStatus ?? "",
         // 审查裁决(仅审查员行携带):与执行态正交,可能在委派完成后才到达,
@@ -480,6 +482,7 @@ export function messageSignature(
         textSig(m.text),
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
+        m.cancelled ? 1 : 0,
         m.summary ? m.summary.length : 0,
         (m.entries ?? []).length,
         m.entries?.length ? m.entries[m.entries.length - 1].phase : "",
@@ -513,8 +516,9 @@ export function safeMessageSignature(
  * 两态。仅在非运行态(已完成 / server 骨架)使用——运行态由调用方单独渲染"运行中"。
  */
 export function agentTerminalStatus(
-  m: Pick<ChatMessage, "_isError" | "_delegateStatus">,
-): { label: string; tone: "success" | "danger" | "warning" } {
+  m: Pick<ChatMessage, "_isError" | "_delegateStatus" | "cancelled">,
+): { label: string; tone: "success" | "danger" | "warning" | "neutral" } {
+  if (m.cancelled) return { label: "已取消", tone: "neutral" };
   if (m._delegateStatus === "timeout") return { label: "超时", tone: "warning" };
   if (m._isError || m._delegateStatus === "failed") return { label: "失败", tone: "danger" };
   return { label: "完成", tone: "success" };

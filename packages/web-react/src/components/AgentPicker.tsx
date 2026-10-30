@@ -100,12 +100,17 @@ export function AgentPicker({
     knownAgents?.some((a) => !a.isDefault) ? [...knownAgents] : [MAIN_AGENT],
   )
   const [loading, setLoading] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
   const advisorSelectId = useId()
 
   useEffect(() => {
-    if (!open || !auth) return
+    if (open && auth) setLoading(true)
+  }, [open, auth])
+
+  useEffect(() => {
+    if (!open || !auth || !loading) return
     let alive = true
-    setLoading(true)
+    setLoadFailed(false)
     api
       .listMyAgents(auth)
       .then((rows) => {
@@ -113,12 +118,12 @@ export function AgentPicker({
         const mapped = rows.map(agentFromApiRow)
         setAgents(mapped.length > 0 ? mapped : [MAIN_AGENT])
       })
-      .catch(() => alive && setAgents([MAIN_AGENT]))
+      .catch(() => alive && setLoadFailed(true))
       .finally(() => alive && setLoading(false))
     return () => {
       alive = false
     }
-  }, [open, auth])
+  }, [open, auth, loading])
 
   const defaultAgent = agents.find((a) => a.isDefault) ?? MAIN_AGENT
   const others = agents.filter((a) => !a.isDefault)
@@ -330,6 +335,13 @@ export function AgentPicker({
           </div>
         ) : null}
       </div>
+
+      {loadFailed && (
+        <p role="alert" className="mb-2 text-caption text-warning">
+          智能体加载失败。
+          <button type="button" className="ml-2 underline" onClick={() => setLoading(true)}>重试</button>
+        </p>
+      )}
 
       {/* 其它已安装 agent + 市场入口 —— 2 列均匀网格 */}
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2" aria-busy={loading || undefined}>

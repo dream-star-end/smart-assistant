@@ -12,6 +12,7 @@
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../modelSwitch";
 import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
+import { confirmDispatchDelivery, confirmSnapshotDelivery } from "./deliveryConfirm";
 import { applyControlReceipt, type PendingControlItem } from "./controlReceipts";
 import { contextRebuiltRow } from "./contextRebuilt";
 import { applyRecoveryStatusFrame, rememberRetryStatus } from "./retryStatus";
@@ -1930,9 +1931,8 @@ export class ChatSocket {
     return true;
   }
 
-  /** Durable admission confirms delivery but does not finish the turn. Keep
-   * the peer slot occupied until final/error/stop so later prompts remain FIFO. */
-  private confirmDispatchAdmission(sessId: string, clientMessageId: string): boolean {
+  /** Admission occupies the FIFO slot; only container evidence confirms delivery. */
+  private confirmDispatchAdmission(sessId: string, clientMessageId: string, accepted = true): boolean {
     const sess = this.sessions.get(sessId);
     if (!sess) return false;
     const pending = this.offlineQueue.find(
@@ -1951,15 +1951,7 @@ export class ChatSocket {
     this.clearPendingDispatch(sessId, clientMessageId);
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
-    // Every live frame carrying this cmid (outbound.message / turn_status /
-    // turn_usage / call_usage) re-confirms admission. Admission only moves the
-    // row forward out of its transport states; once answer blocks have marked
-    // it read/replied, a later status-only or usage frame must not drag it back
-    // to sent — that made「已送达」flicker on and off for the whole turn.
-    if (user && user.status !== "read" && user.status !== "replied" && user.status !== "sent") {
-      user.status = "sent";
-      changed = true;
-    }
+    changed = confirmDispatchDelivery(sess, clientMessageId, accepted) || changed;
     if (
       user?._routing?.modelSwitchId &&
       sess._preparedModelSwitch?.id === user._routing.modelSwitchId
@@ -1988,16 +1980,6 @@ export class ChatSocket {
       this.resetThinkingSafety(sessId);
     }
     this.clearTransientNotice(sess.id);
-    // Authoritative admission always starts a new cost reminder window, even
-    // when submit already set _sendingInFlight for the "replying" affordance.
-    if (
-      sess._turnCostCredits !== "0" ||
-      (sess._turnCostSeenRequestIds?.size ?? 0) > 0 ||
-      sess._turnCostReminderCredits !== undefined
-    ) changed = true;
-    sess._turnCostCredits = "0";
-    sess._turnCostSeenRequestIds = new Set();
-    sess._turnCostReminderCredits = undefined;
     if (changed) this.scheduleNotify();
     return true;
   }
@@ -2489,11 +2471,15 @@ export class ChatSocket {
 
   private dispatch(f: OutboundWire): void {
     switch (f.type) {
+      case "outbound.session_snapshot":
+        confirmSnapshotDelivery(this.sessions.get(f.peer.id), f.snapshot.dispatch);
+        this.scheduleNotify();
+        return;
       case "outbound.message": {
         const frame = f as OutboundMessageWire;
         const sess = this.resolveSession(frame.peer?.id);
         if (!sess) return;
-        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId);
+        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId, !frame.meta?.reconcile);
         applyOutboundMessage(sess, frame, this.effects());
         return;
       }
@@ -2502,7 +2488,7 @@ export class ChatSocket {
         const sess = this.sessions.get(frame.peer?.id);
         if (sess) {
           const clientMessageId = (frame as OutboundTurnStatusWire & { clientMessageId?: string }).clientMessageId;
-          if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId);
+          if (clientMessageId) this.confirmDispatchAdmission(sess.id, clientMessageId, !frame.meta?.detached);
           applyTurnStatus(sess, frame);
         }
         return;
@@ -2741,6 +2727,9 @@ export class ChatSocket {
             const sess = this.sessions.get(frame.peer.id);
             if (sess) rememberRetryStatus(sess, { ...frame.recovery, clientMessageId: frame.clientMessageId }, frame.retryStatus);
           }
+          this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId, frame.accepted === true);
+        }
+        if (frame.accepted && !frame.admitted && frame.peer?.id && frame.clientMessageId) {
           this.confirmDispatchAdmission(frame.peer.id, frame.clientMessageId);
         }
         if (frame.deduplicated) {
@@ -4395,6 +4384,7 @@ export class ChatSocket {
         dispatchId: string;
         clientMessageId: string;
         status: string;
+        acceptedAt?: number | null;
       };
       permissionPrompts?: PermissionPromptSnapshotPayload;
       automaticRecoveries?: AutomaticTurnRecoverySnapshot[];
@@ -4557,6 +4547,7 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
+    confirmSnapshotDelivery(s, openDispatch);
     if (!s._sendingInFlight || settlingActiveTurn) {
       s.messages = repairPostFinalProcessOrder(s.messages);
     }

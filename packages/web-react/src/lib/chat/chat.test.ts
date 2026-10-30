@@ -3846,7 +3846,7 @@ describe("applyCostWaived (turn 免单退款)", () => {
   });
 });
 
-describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
+describe("applyCostCharged (§3 requestId 去重、实扣归因)", () => {
   test("active multi-request turn reminder uses actual debit and dedupes requestId", () => {
     const s = sess();
     s._sendingInFlight = true;
@@ -3867,8 +3867,8 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
     }, {});
     expect(s._turnCostCredits).toBe("300");
     expect(s._turnCostReminderCredits).toBeUndefined();
-    // Existing response badge deliberately keeps its no-frameSeq behavior.
-    expect(a.usage?.costCredits).toBe("1200");
+    // The response badge shares the requestId fence and actual-debit basis.
+    expect(a.usage?.costCredits).toBe("300");
 
     applyCostCharged(s, {
       type: "outbound.cost_charged",

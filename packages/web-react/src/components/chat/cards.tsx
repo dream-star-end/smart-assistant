@@ -654,13 +654,13 @@ function MessageActions({
 
 // ═══════════════ user ═══════════════
 // 只标注**过渡态**与失败:「已回复」是每条历史用户消息的终态,助手回复本身就是证据,再标一遍
-// 只剩噪音;「已读」同理。「已送达」保留 —— 它只在当前在飞轮出现,告诉用户服务端已受理。
+// 只剩噪音;「已读」同理。只有容器接单确认后才显示「已送达」。
 // status=sent 不足以说明这一点:停止、服务重启中断、重复受理、自动恢复源轮都把行落定成 sent,
 // 回复开始后的软重试 / 停止收尾也会把 read 写回 sent。所以「已送达」另由调用方给 awaitingReply。
 const USER_STATUS_LABEL: Record<string, string> = {
   sending: "发送中",
   queued: "还在等上一项",
-  sent: "已送达",
+  sent: "已受理",
   error: "发送失败",
 };
 
@@ -711,7 +711,9 @@ export function UserCard({
   const cancelledByUser = status === "error" && msg._sendCancelled === true;
   const statusLabel = cancelledByUser
     ? (msg._errorDetail || "发送已取消")
-    : status && (status !== "sent" || awaitingReply) ? USER_STATUS_LABEL[status] : undefined;
+    : status && (status !== "sent" || awaitingReply)
+      ? status === "sent" && msg._deliveryState === "accepted" ? "已送达" : USER_STATUS_LABEL[status]
+      : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
@@ -1571,7 +1573,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
         <span className="ml-auto flex items-center gap-2">
           <TokenUsageBadge usage={tokenUsage} label="子 Agent 合计" />
           {done ? (
-            <Badge tone={msg._isError ? "danger" : "success"}>{msg._isError ? "失败" : "完成"}</Badge>
+            <Badge tone={msg.cancelled ? "neutral" : msg._isError ? "danger" : "success"}>{msg.cancelled ? "已取消" : msg._isError ? "失败" : "完成"}</Badge>
           ) : (
             <Badge tone="accent">进行中</Badge>
           )}
@@ -1616,7 +1618,9 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           (失败 → 红 X,不再对着「失败」徽记画绿勾)。 */}
       {collapsed && done && msg.summary && (
         <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-meta text-muted">
-          {msg._isError ? (
+          {msg.cancelled ? (
+            <X size={13} className="mt-0.5 shrink-0 text-muted" data-testid="delegate-summary-icon" />
+          ) : msg._isError ? (
             <X size={13} className="mt-0.5 shrink-0 text-danger" data-testid="delegate-summary-icon" />
           ) : (
             <Check size={13} className="mt-0.5 shrink-0 text-success" data-testid="delegate-summary-icon" />

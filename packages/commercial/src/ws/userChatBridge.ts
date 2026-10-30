@@ -5,7 +5,9 @@ import { rebuildContainerLink } from "./containerLinkRebuild.js";
 import { containerLinkSnapshotSession } from "./containerLinkHello.js";
 import { attachContainerTransport, registerBridgeTransport } from "./containerLinkTransport.js";
 import { registerBridgeExecutors, availableExecutors } from "./bridgeExecutorRegistration.js";
-import { recoveryJobStatus, recoveryRunningFrame } from './recoveryPresentation.js';
+import { recoveryJobStatus } from './recoveryPresentation.js';
+import { handleTurnDispatchReceipt } from './turnDispatchReceipt.js';
+export { classifyTurnDispatchReceipt } from './turnDispatchReceipt.js';
 import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
@@ -189,11 +191,9 @@ import {
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
   backfillDispatchTraceId,
-  casAdmittedToAccepted,
   casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
-  getDispatchByLogicalKey,
   heartbeatLease,
   DISPATCH_LEASE_TTL_MS,
   DISPATCH_LEASE_HEARTBEAT_MS,
@@ -220,7 +220,6 @@ import {
 import {
   claimDueRecoveryJobs,
   forwardRecoveryUnderRootFence,
-  markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
   pauseRecoveryPreReceipt,
@@ -1489,50 +1488,6 @@ export type CronOriginExecutorClaimResult =
   | { kind: "rejected" }
   | { kind: "delivery_unknown" }
 
-export function classifyTurnDispatchReceipt(
-  receipt: {
-    dispatchId?: unknown;
-    attemptNo?: unknown;
-    sessionId?: unknown;
-    clientMessageId?: unknown;
-    state?: unknown;
-    outcome?: unknown;
-  },
-  expected: {
-    dispatchId: string;
-    attemptNo: number;
-    sessionId: string;
-    clientMessageId: string;
-  },
-): "accepted" | "rejected" | "invalid" {
-  if (
-    receipt.dispatchId !== expected.dispatchId ||
-    receipt.attemptNo !== expected.attemptNo ||
-    receipt.sessionId !== expected.sessionId ||
-    receipt.clientMessageId !== expected.clientMessageId
-  ) return "invalid";
-  if (receipt.state === "rejected") {
-    return receipt.outcome === "not_accepted" || receipt.outcome === null
-      ? "rejected"
-      : "invalid";
-  }
-  if (receipt.state === "terminal") {
-    return receipt.outcome === "completed" ||
-        receipt.outcome === "interrupted" ||
-        receipt.outcome === "crashed"
-      ? "accepted"
-      : "invalid";
-  }
-  if (
-    receipt.outcome === null &&
-    (receipt.state === "queued" ||
-      receipt.state === "running" ||
-      receipt.state === "recovery_pending" ||
-      receipt.state === "sink_staged" ||
-      receipt.state === "sink_stage_failed")
-  ) return "accepted";
-  return "invalid";
-}
 
 export type CronOriginExecutor = (payload: {
   encoded: Buffer
@@ -5390,7 +5345,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // clientsByPeer,链路一个字节都不能动。所以只 spawn 浮动 promise,
             // 先 await 让出同步栈,等 fall through 到 forwardInboundFrame 之后再查 PG。
             if (deps.pgPool) {
-              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog);
+              void sendHelloSessionSnapshots(deps.pgPool, userWs, uidStr, visiblePeers, bridgeLog, connId);
             }
             if (liveCatchupSessions.length > 0 && deps.pgPool) {
               const pgPool = deps.pgPool;

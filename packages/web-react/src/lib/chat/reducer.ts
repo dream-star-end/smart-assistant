@@ -2423,7 +2423,17 @@ export function applyOutboundMessage(
     // max_tokens / pause_turn 截断标记。
     const stopReason = frame.meta?.stopReason;
     const truncatedReason = stopReason === "max_tokens" || stopReason === "pause_turn" ? stopReason : null;
-    if (truncatedReason && sess._streamingAssistant?.text) sess._streamingAssistant._truncated = truncatedReason;
+    if (truncatedReason) {
+      for (let i = sess.messages.length - 1; i >= 0; i--) {
+        const m = sess.messages[i];
+        if (m.role === "user") break;
+        if (m.role === "assistant" && m.text?.trim()) {
+          m._truncated = truncatedReason;
+          break;
+        }
+      }
+    }
+    const interrupted = frame.meta?.interrupted || suppressLegacyErrorText || stopReason === "error";
     // finalize plan / tool 卡。
     for (const m of sess.messages) {
       if (isImmutableTapeViewportRow(m)) continue;
@@ -2434,7 +2444,7 @@ export function applyOutboundMessage(
       if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error && !m._background) {
         m._completed = true;
         // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
-        if ((frame.meta?.interrupted || suppressLegacyErrorText) && !m.output && !m.bashTail) m.cancelled = true;
+        if (interrupted && !m.output && !m.bashTail) m.cancelled = true;
       }
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
@@ -2442,6 +2452,7 @@ export function applyOutboundMessage(
       // delegate_progress phase=done|error。
       if ((m.role === "agent-group" || m.role === "delegate-progress") && !m._completed && !m._background) {
         m._completed = true;
+        if (interrupted) m.cancelled = true;
         if (m.completedAt == null) m.completedAt = Date.now();
       }
     }
@@ -2545,6 +2556,7 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       sess._turnStartedAt = frame.meta.since;
     }
   }
+  if (frame.meta?.credits) sess._turnCredits = { ...frame.meta.credits };
 }
 
 // ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════
@@ -2637,13 +2649,18 @@ export type DeferredTerminalErrorPaint = {
  * 只有下一轮 final 才会顺手扫掉),于是红卡下面一直转圈。按本轮归属把它们标成已取消。
  * 后台委派(_background)照旧等子任务自己的终态。
  */
-function settleOrphanTools(sess: ChatSession, ownerId: string | undefined): void {
+function settleOrphanProcesses(sess: ChatSession, ownerId: string | undefined): void {
   for (const m of sess.messages) {
-    if (m.role !== "tool" || m._completed !== false || m.error || m._background) continue;
-    if (isImmutableTapeViewportRow(m)) continue;
+    if (m._completed || m._background || isImmutableTapeViewportRow(m)) continue;
     if (ownerId && m._turnOwnerId && m._turnOwnerId !== ownerId) continue;
-    m._completed = true;
-    if (!m.output && !m.bashTail) m.cancelled = true;
+    if (m.role === "tool" && m._completed === false && !m.error) {
+      m._completed = true;
+      if (!m.output && !m.bashTail) m.cancelled = true;
+    } else if (m.role === "agent-group" || m.role === "delegate-progress") {
+      m._completed = true;
+      m.cancelled = true;
+      m.completedAt ??= Date.now();
+    }
   }
 }
 
@@ -2676,7 +2693,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     ? sess._activeClientMessageId === paint.clientMessageId
     : true; // rolling compatibility for old gateways
   if (ownsActiveTurn) {
-    settleOrphanTools(sess, paint.clientMessageId ?? sess._activeClientMessageId);
+    settleOrphanProcesses(sess, paint.clientMessageId ?? sess._activeClientMessageId);
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);
@@ -3007,20 +3024,10 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
  * a multi-request root turn is still active. */
 export const TURN_COST_REMINDER_CREDITS = 500n;
 
-function applyTurnCostReminder(sess: ChatSession, frame: CostChargedWire): void {
-  if (!sess._sendingInFlight) return;
-  const requestId = typeof frame.requestId === "string" ? frame.requestId.trim() : "";
-  if (!requestId) return;
+function applyTurnCostReminder(sess: ChatSession, requestId: string | undefined, actualDebit: bigint | null): void {
+  if (!sess._sendingInFlight || !requestId || actualDebit === null || actualDebit <= 0n) return;
   const seen = sess._turnCostSeenRequestIds ?? new Set<string>();
   if (seen.has(requestId)) return;
-
-  let actualDebit: bigint;
-  try {
-    actualDebit = BigInt(frame.debitedCredits ?? frame.costCredits ?? "");
-  } catch {
-    return;
-  }
-  if (actualDebit <= 0n) return;
 
   seen.add(requestId);
   sess._turnCostSeenRequestIds = seen;
@@ -3037,7 +3044,7 @@ function applyTurnCostReminder(sess: ChatSession, frame: CostChargedWire): void 
   }
 }
 
-// ═══════════════ cost_charged（商业版，响应徽章不去重；提醒按 requestId 精确去重）═══════════════
+// ═══════════════ cost_charged（实扣展示按会话 requestId 去重）═══════════════
 export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWire, effects: FrameEffects = {}): void {
   const refresh = () => {
     if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) effects.refreshBalance?.();
@@ -3046,7 +3053,26 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     refresh();
     return;
   }
-  applyTurnCostReminder(sess, frame);
+  let add: bigint | null = null;
+  try {
+    const parsed = BigInt((frame.debitedCredits ?? frame.costCredits) as string);
+    add = parsed < 0n ? null : parsed;
+  } catch { /* malformed display amount */ }
+  const requestId = frame.requestId?.trim();
+  if (requestId && add !== null) {
+    const seen = sess._costChargedSeenRequestIds ??= new Set<string>();
+    if (seen.has(requestId)) { refresh(); return; }
+    seen.add(requestId);
+    if (seen.size > 512) seen.delete(seen.values().next().value!);
+  }
+  applyTurnCostReminder(sess, requestId, add);
+  if (sess._sendingInFlight && add !== null) {
+    let settled = add;
+    try { settled += BigInt(sess._turnCredits?.settled ?? "0"); } catch { /* old local state */ }
+    sess._turnCredits = {
+      settled: settled.toString(), requests: (sess._turnCredits?.requests ?? 0) + 1, asOf: Date.now(),
+    };
+  }
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。
   //
   // Fix B — 委派成本精确归属:frame.parentSessionId 存在 = 这是委派子智能体的成本,它属于
@@ -3066,14 +3092,6 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     Date.now() - sess._lastFinaledAt < COST_CHARGED_LAST_FINAL_TTL_MS
   ) {
     target = sess.messages.find((m) => m.id === sess._lastFinaledAssistantId) || null;
-  }
-  // 解析 costCredits → BigInt（负数/非法 → null，丢弃累加但仍刷余额）。
-  let add: bigint | null = null;
-  try {
-    const parsed = BigInt(frame.costCredits as string);
-    add = parsed < 0n ? null : parsed;
-  } catch {
-    add = null;
   }
   // (a) 无 target：
   //   - **turn 进行中（_sendingInFlight）→ 入队 _pendingCostCredits**，收尾时 drain 到本轮响应。
