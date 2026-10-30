@@ -103,7 +103,9 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
   it('streams ordered UTF-8 previews before completion, ignores reasoning, and bills the platform', async () => {
     const deltas: string[] = []
     const stream = async function* () {
-      yield* chunks(': heartbeat\r\n\r\n' + event({ type: 'response.reasoning_text.delta', delta: 'private' }))
+      yield* chunks(
+        `: heartbeat\r\n\r\n${event({ type: 'response.reasoning_text.delta', delta: 'private' })}`,
+      )
       yield* chunks(event({ type: 'response.output_text.delta', delta: '红狐' }))
       assert.deepEqual(deltas, ['红狐'], 'callback finishes before reading more upstream')
       yield* chunks(event({ type: 'response.output_text.delta', delta: '起跑' }))

@@ -468,7 +468,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
     );
     let abandon: (reason: string) => Promise<void> = async () => {};
     if (billTo === "user") {
-      let scope;
+      let scope: ReturnType<typeof scopeFromAuthz>;
       try {
         scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
       } catch {
@@ -691,7 +691,7 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
       return;
     }
 
-    let verified;
+    let verified: Awaited<ReturnType<typeof verifyContainerIdentity>>;
     try {
       verified = await verifyContainerIdentity(deps.identityRepo, ctx, req.headers.authorization);
     } catch (err) {
