@@ -250,3 +250,43 @@ test('reply history cannot change current no-write intent or the advisor user-ta
   }
   await f.manager.awaitPendingPersistence()
 })
+
+test('inbound preserves local read-only targets and enforces coordinated whole-turn bans', { timeout: 15_000 }, async () => {
+  const f = gatewayFixture()
+  for (const [text, expectedReadOnly] of [
+    ['请修改 app.ts，只读检查 README.md。', false],
+    ['请修改app.ts，只读检查app.ts。', true],
+    ['请修改app.ts，只读检查README.md。', false],
+    ['请修改 app.ts，不要改文件名。', false],
+    ['不要修改文件编码', false],
+    ['Update app.ts; do not modify any files, except app.ts.', false],
+    ['Except app.ts, do not modify any files.', false],
+    ['请修改 app.ts，不要改任何文件，除了 app.ts。', false],
+    ['Update app.ts; read-only review of README.md.', false],
+    ['Update app.ts; do not modify files outside src/.', false],
+    ['请分析问题，不要改文件或执行命令。', true],
+    ['不要写入或修改任何文件', true],
+    ['不要修改文件和代码', true],
+    ['不要改文件 ', true],
+    ['不要改文件或者运行命令', true],
+    ['别改文件了，先提建议。', true],
+    ['这轮不要改文件，谢谢。', true],
+    ['不要改任何文件的内容，也不要运行命令。', true],
+    ['No changes to any files.', true],
+    ['Review without making any changes to files.', true],
+    ['顾问只给建议，不要改文件，除了提供建议不要做其他事。', true],
+    ['Do not modify any files, except give advice.', true],
+    ['不要改文件，除非我授权修改app.ts。', true],
+    ['只读检查 README.md。', true],
+    ['请修改 app.ts，只读检查 README.md，不要改任何文件。', true],
+  ] as const) {
+    await f.inbound(text)
+    assert.equal(f.runner.calls.at(-1)?.readOnly, expectedReadOnly, text)
+    const snapshot = buildAdvisorSnapshot({
+      question: 'Review the current request.', concern: '', advisorModel: 'gpt-6-astra',
+      source: { userTask: f.session._currentTurnUserText ?? '' },
+    })
+    assert.equal(snapshot.constraints.includes(ADVISOR_NO_WRITE_CONSTRAINT), expectedReadOnly, text)
+  }
+  await f.manager.awaitPendingPersistence()
+})
