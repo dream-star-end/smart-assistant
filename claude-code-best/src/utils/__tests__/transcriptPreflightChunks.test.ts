@@ -41,6 +41,6 @@ test('preflight preserves full-row graph and fatal UTF8 decisions across short-r
 
 test('preflight still rejects a zero-byte short read before the declared EOF', async () => {
   const input = fragmented(Buffer.from('{}\n'), 1, true)
-  await expect(transcriptNeedsRecovery(input.handle)).rejects.toThrow('CCB_TRANSCRIPT_SHORT_READ')
+  await expect(transcriptNeedsRecovery(input.handle)).rejects.toMatchObject({ name: 'SessionFileIntegrityError', code: 'CCB_TRANSCRIPT_SHORT_READ' })
   expect(input.consumed()).toBe(0)
 })
