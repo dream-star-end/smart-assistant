@@ -62,6 +62,22 @@ describe('runDelegateWaitLoop', () => {
     assert.equal(remaining.size, 0)
   })
 
+  it('five long results use the shared 24000 budget, not five full bodies', async () => {
+    const ids = ['j1', 'j2', 'j3', 'j4', 'j5']
+    const sentinel = 'SHOULD_NOT_APPEAR'
+    const output = 'H'.repeat(2500) + sentinel + 'M'.repeat(4000) + 'T'.repeat(2500)
+    const r = await runDelegateWaitLoop({
+      jobIds: ids,
+      pollWaitMs: 20,
+      waitOnce: async (jobId) => ({ statusCode: 200, body: doneBody(jobId, output) }),
+    })
+    assert.equal(r.exitCode, 0, r.stderr)
+    assert.equal(r.stdout.includes(sentinel), false)
+    // floor(24000/5)=4800 kept. Body is 9017 chars (sentinel is 17), so 4217 are omitted.
+    assert.match(r.stdout, /中间省略 4217 字/)
+    assert.match(r.stdout, /委派等待 5 个作业: 5 成功 \/ 0 失败/)
+  })
+
   it('TTL expired → exit 2 with readable error', async () => {
     const r = await runDelegateWaitLoop({
       jobIds: ['dlgjob-gone'],
@@ -100,7 +116,9 @@ describe('runDelegateWaitLoop', () => {
 
   it('one long-poll transport timeout → keep waiting, do not fail the CLI', async () => {
     assert.equal(
-      isTransientDelegateWaitError(Object.assign(new Error('delegate client timeout after 45s'), { code: 'ETIMEDOUT' })),
+      isTransientDelegateWaitError(
+        Object.assign(new Error('delegate client timeout after 45s'), { code: 'ETIMEDOUT' }),
+      ),
       true,
     )
     let n = 0
@@ -178,14 +196,22 @@ describe('runDelegateWaitLoop', () => {
   it('foreground budget env is clamped below Cursor 60-minute handoff', () => {
     assert.equal(resolveDelegateCliForegroundBudgetMs({}), 50 * 60_000)
     assert.equal(
-      resolveDelegateCliForegroundBudgetMs({ OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS: '999999999' }),
+      resolveDelegateCliForegroundBudgetMs({
+        OPENCLAUDE_DELEGATE_CLI_FOREGROUND_BUDGET_MS: '999999999',
+      }),
       55 * 60_000,
     )
   })
 
   it('exit != 0 only when no job is still running', () => {
-    assert.equal(delegateWaitExitCode({ pendingCount: 1, results: [{ kind: 'error', text: 'x' }] }), 0)
-    assert.equal(delegateWaitExitCode({ pendingCount: 0, results: [{ kind: 'error', text: 'x' }] }), 2)
+    assert.equal(
+      delegateWaitExitCode({ pendingCount: 1, results: [{ kind: 'error', text: 'x' }] }),
+      0,
+    )
+    assert.equal(
+      delegateWaitExitCode({ pendingCount: 0, results: [{ kind: 'error', text: 'x' }] }),
+      2,
+    )
     assert.equal(delegateWaitExitCode({ pendingCount: 0, results: [{ kind: 'ok', text: 'x' }] }), 0)
   })
 
@@ -216,7 +242,8 @@ describe('runDelegateWaitLoop', () => {
           status: 'failed',
           jobId,
           httpStatus: 429,
-          error: 'too many concurrent delegations (max 4 non-review; in-use 4/4); 已等待 90s 资源仍紧张,请稍后重试',
+          error:
+            'too many concurrent delegations (max 4 non-review; in-use 4/4); 已等待 90s 资源仍紧张,请稍后重试',
           failure_class: 'capacity_timeout',
         }),
       }),
