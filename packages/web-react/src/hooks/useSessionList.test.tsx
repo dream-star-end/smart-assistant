@@ -1210,3 +1210,104 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
   });
 });
+
+describe("useSessionList 侧栏运行态与快照终态收敛 (U8)", () => {
+  test("canonical getSession 无 openDispatch 时把滞留的 runState=running 收敛为 idle", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 2_200,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+
+    vi.mocked(api.getSession).mockResolvedValueOnce({
+      ...detail("webkeepme001"),
+      updatedAt: 2_500,
+      openDispatch: undefined,
+      messages: [{ id: "a1", role: "agent", content: "done", _dispatchOutcome: "completed" }],
+    } as never);
+
+    await act(async () => {
+      await result.current.loadHistory("webkeepme001", { force: true });
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({
+      runState: "idle",
+      lastOutcome: "completed",
+    });
+  });
+
+  test("回合刚结束时已在飞的旧 listSessions(runState=running) 回来不会复活转圈；之后新回合(updatedAt 更大)照常显示 running", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 2_100,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+
+    const staleInflight = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+    vi.mocked(api.listSessions).mockImplementationOnce(() => staleInflight.promise);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(3));
+
+    act(() => {
+      result.current.applySessionTerminal("webkeepme001", {
+        lastOutcome: "completed",
+        lastErrorCode: null,
+      });
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("idle");
+
+    await act(async () => {
+      staleInflight.resolve([
+        {
+          ...meta("webkeepme001", "保留的会话"),
+          runState: "running",
+          updatedAt: 2_200,
+        },
+        meta("webdropme001", "待删除的会话"),
+      ] as never);
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("idle");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 4_000,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+  });
+});

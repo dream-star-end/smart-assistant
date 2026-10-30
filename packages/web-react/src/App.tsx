@@ -166,7 +166,7 @@ import {
   type ImplicitTarget,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
+import { deriveLiveTerminalEndedAt, resolveLiveTurnEndTerminal } from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
@@ -1269,9 +1269,12 @@ export function App() {
     const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
     for (const id of now) liveTerminalsRef.current.delete(id);
     for (const id of sendingIdsRef.current) {
-      if (!now.has(id)) {
-        const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
+      if (!now.has(id) && !chat.isSending(id)) {
+        const messages = chat.getSession(id)?.messages;
+        liveTerminalsRef.current.set(id, {
+          ...resolveLiveTurnEndTerminal(messages),
+          endedAt: deriveLiveTerminalEndedAt(messages),
+        });
       }
     }
     sendingIdsRef.current = now;

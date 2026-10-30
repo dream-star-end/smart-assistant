@@ -4,6 +4,7 @@ import { useToast } from "../components/ui";
 import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
+import { deriveLiveTerminalFromMessages } from "../lib/sessionStatus";
 import type { StoredSession } from "../lib/persist";
 import type {
   AuthSession,
@@ -220,6 +221,18 @@ export type UseSessionList = {
  * UI（确认/输入对话框）与 chat 展示态（demo messages/chatError）经回调注入，
  * 本 hook 不反向依赖渲染层。
  */
+type TerminalGuard = { floor: number; staleRequest: object | null };
+
+function recordTerminalGuard(
+  guards: Map<string, TerminalGuard>,
+  staleRequest: object | null,
+  id: string,
+  at: number,
+): void {
+  const floor = Math.max(guards.get(id)?.floor ?? 0, at);
+  guards.set(id, { floor, staleRequest });
+}
+
 export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const { demo, auth, user, agentId, holdAutoSelect = false } = opts;
   // 回调/句柄经 ref 镜像：App 每渲染可能传新闭包，这里始终读最新版本而不进 useCallback
@@ -227,6 +240,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const confirmedMetadata = useRef(new Map<string, SessionMetadataSnapshot>());
   /** 重命名 PATCH 未落地期间的本地标题：此前已发出的列表请求带回旧标题，不能盖掉它(#1240)。 */
   const pendingTitles = useRef(new Map<string, string>());
+  const listRefreshInflightRef = useRef<object | null>(null);
+  /**
+   * 终态收敛护栏(U8)：记录本地回合结束或 canonical getSession 确认无 openDispatch 时的服务端水位
+   * 与当时已在途的列表请求引用，防止回合结束前已发出的旧 listSessions 把侧栏重新盖回 running。
+   */
+  const terminalGuardRef = useRef(new Map<string, TerminalGuard>());
   const cbRef = useRef(opts);
   cbRef.current = opts;
   const toast = useToast();
@@ -434,6 +453,41 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             ),
           );
         }
+        // 快照终态收敛(U8)：canonical getSession 已确认无 openDispatch 且本 tab 未在发送时，
+        // 若侧栏仍滞留在 runState="running"（列表轮询与回合结束交错），立即收敛为 idle。
+        if (detail.openDispatch?.clientMessageId) {
+          terminalGuardRef.current.delete(id);
+        } else if (!cbRef.current.sockRef.current?.isSending?.(id)) {
+          const detailAt = typeof detail.updatedAt === "number" ? detail.updatedAt : 0;
+          if (detailAt > 0 || listRefreshInflightRef.current) {
+            recordTerminalGuard(
+              terminalGuardRef.current,
+              listRefreshInflightRef.current,
+              id,
+              detailAt,
+            );
+          }
+          const d = deriveLiveTerminalFromMessages(msgs);
+          setSessions((c) => {
+            let changed = false;
+            const next = c.map((s) => {
+              if (s.id !== id) return s;
+              const out = s.lastOutcome ?? d?.lastOutcome;
+              const code = s.lastOutcome ? s.lastErrorCode : (d?.lastErrorCode ?? s.lastErrorCode);
+              if (s.runState !== "running" && s.lastOutcome === out && s.lastErrorCode === code) {
+                return s;
+              }
+              changed = true;
+              return {
+                ...s,
+                runState: "idle" as const,
+                ...(out !== undefined ? { lastOutcome: out } : {}),
+                ...(code !== undefined ? { lastErrorCode: code } : {}),
+              };
+            });
+            return changed ? next : c;
+          });
+        }
         historyFetchedAtRef.current.set(id, Date.now());
         setHistoryErrorBySession((current) => {
           const existing = current.get(id);
@@ -532,14 +586,31 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
   const archivedFetchedRef = useRef(false);
-  const listRefreshInflightRef = useRef<object | null>(null);
   const listGenerationRef = useRef(0);
 
   const mapListMetas = useCallback(
-    (metas: SessionMeta[]): Session[] => {
+    (metas: SessionMeta[], request?: object | null): Session[] => {
       if (!user) return [];
       return metas.map((m) => {
         const payloadUpdatedAt = m.updatedAt;
+        const guard = terminalGuardRef.current.get(m.id);
+        if (guard) {
+          const staleReq = Boolean(request && guard.staleRequest === request);
+          if (staleReq) guard.staleRequest = null;
+          if (
+            cbRef.current.sockRef.current?.isSending?.(m.id) ||
+            (m.runState !== "running" && !staleReq)
+          ) {
+            terminalGuardRef.current.delete(m.id);
+          } else if (m.runState === "running") {
+            if (staleReq || (guard.floor > 0 && m.updatedAt <= guard.floor)) {
+              if (staleReq && m.updatedAt > guard.floor) guard.floor = m.updatedAt;
+              m = { ...m, runState: "idle" };
+            } else {
+              terminalGuardRef.current.delete(m.id);
+            }
+          }
+        }
         const confirmed = confirmedMetadata.current.get(m.id);
         if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, ...confirmed };
         else confirmedMetadata.current.set(m.id, { id: m.id, title: m.title, pinned: m.pinned === true, updatedAt: m.updatedAt });
@@ -573,7 +644,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             if (fill) fill.serverSettled = true;
           }
         }
-        const server = mapListMetas(metas);
+        const server = mapListMetas(metas, request);
         setSessions((cur) => upsertSessions(cur, server, true));
         if (opts?.initial) {
           nextCursorRef.current = undefined;
@@ -611,19 +682,16 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     const tick = () => {
       if (document.visibilityState === "visible") void refresh();
     };
-    const timer = window.setInterval(tick, LIST_POLL_MS);
-    const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
     const onFocus = () => {
       void refresh();
     };
-    document.addEventListener("visibilitychange", onVis);
+    const timer = window.setInterval(tick, LIST_POLL_MS);
+    document.addEventListener("visibilitychange", tick);
     window.addEventListener("focus", onFocus);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVis);
+      document.removeEventListener("visibilitychange", tick);
       window.removeEventListener("focus", onFocus);
     };
   }, [demo, auth, user, refreshSessionList]);
@@ -687,6 +755,24 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     }
   };
 
+  const forgetSessionLocal = (id: string) => {
+    historyFetchedAtRef.current.delete(id);
+    historyFetchingRef.current.delete(id);
+    setHistoryLoadingTokens((current) => {
+      if (!current.has(id)) return current;
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    modelSyncRef.current.delete(id);
+    terminalGuardRef.current.delete(id);
+    cbRef.current.onDeleteSession?.(id);
+    if (!demo) {
+      cbRef.current.sockRef.current?.removeSession(id);
+      cbRef.current.sockRef.current?.removePersisted(id);
+    }
+  };
+
   const deleteSessionConfirm = async (s: Session) => {
     const title = s.title || "新对话";
     const ok = await cbRef.current.confirmDialog({
@@ -696,24 +782,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       danger: true,
     });
     if (!ok) return;
-    cbRef.current.onDeleteSession?.(s.id);
-    historyFetchedAtRef.current.delete(s.id);
-    historyFetchingRef.current.delete(s.id);
-    setHistoryLoadingTokens((current) => {
-      if (!current.has(s.id)) return current;
-      const next = new Map(current);
-      next.delete(s.id);
-      return next;
-    });
-    modelSyncRef.current.delete(s.id);
+    forgetSessionLocal(s.id);
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
       setActiveId(undefined);
       cbRef.current.onActiveSessionDeleted();
     }
     if (!demo) {
-      cbRef.current.sockRef.current?.removeSession(s.id);
-      cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
       // 服务端删除：失败此前静默（注释自认「reload 后会从 listSessions 复活」，USL-02）。
       // 本地 socket/IndexedDB 副本已清、不做完整回滚；改为告知 + 立刻重拉列表让会话回到侧栏，
       // 用户看到的是「删除失败、会话仍在」而不是刷新后诡异复活；再次选中会重拉服务端历史。
@@ -761,23 +836,6 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     await patchSessionMetaOptimistic(s, { archived }, { ...s, archived });
   };
 
-  const forgetSessionLocal = (id: string) => {
-    historyFetchedAtRef.current.delete(id);
-    historyFetchingRef.current.delete(id);
-    setHistoryLoadingTokens((current) => {
-      if (!current.has(id)) return current;
-      const next = new Map(current);
-      next.delete(id);
-      return next;
-    });
-    modelSyncRef.current.delete(id);
-    cbRef.current.onDeleteSession?.(id);
-    if (!demo) {
-      cbRef.current.sockRef.current?.removeSession(id);
-      cbRef.current.sockRef.current?.removePersisted(id);
-    }
-  };
-
   const batchUpdateSessions = async (
     ids: string[],
     action: SessionBatchAction,
@@ -812,11 +870,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       setActiveId(undefined);
       cbRef.current.onActiveSessionDeleted();
     }
+    const finishBatchDelete = () => {
+      if (action !== "delete") return;
+      for (const id of unique) forgetSessionLocal(id);
+      toast(`已删除 ${unique.length} 条会话`, "success");
+    };
     if (demo) {
-      if (action === "delete") {
-        for (const id of unique) forgetSessionLocal(id);
-        toast(`已删除 ${unique.length} 条会话`, "success");
-      }
+      finishBatchDelete();
       return;
     }
     try {
@@ -825,10 +885,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         action,
         ...(action === "move" ? { projectId: projectId ?? null } : {}),
       });
-      if (action === "delete") {
-        for (const id of unique) forgetSessionLocal(id);
-        toast(`已删除 ${unique.length} 条会话`, "success");
-      }
+      finishBatchDelete();
     } catch (e) {
       setSessions((c) => {
         const map = new Map(c.map((s) => [s.id, s]));
@@ -936,6 +993,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           allowEndedAtFill = !prev.serverSettled;
         }
       }
+      recordTerminalGuard(
+        terminalGuardRef.current,
+        listRefreshInflightRef.current,
+        sessId,
+        confirmedMetadata.current.get(sessId)?.updatedAt ?? 0,
+      );
       setSessions((c) =>
         c.map((x) => {
           if (x.id !== sessId) return x;
@@ -979,6 +1042,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     loadMoreInflightRef.current = false;
     confirmedMetadata.current.clear();
     pendingTitles.current.clear();
+    terminalGuardRef.current.clear();
     historyFetchedAtRef.current.clear();
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
