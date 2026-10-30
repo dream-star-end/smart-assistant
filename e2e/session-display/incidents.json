@@ -9568,6 +9568,9 @@
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[box-stopped-recovery-claim] PASS"
         }
+      ],
+      "coverageCommits": [
+        "e2a3f1fc"
       ]
     }
   ]
