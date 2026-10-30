@@ -9069,7 +9069,15 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[ocv5-664-box-agent-session] PASS"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/boxApiModels.test.ts",
+          "assertion": "keeps the builtin Agent API session matcher exact for every official Box route"
         }
+      ],
+      "coverageCommits": [
+        "21865dc0"
       ]
     }
   ]
