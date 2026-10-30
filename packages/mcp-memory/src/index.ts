@@ -1071,10 +1071,10 @@ async function runAsyncDelegateToAgent(
           body,
           timeoutMs: 15_000,
         }),
-      wait: (jobId, waitMs, handoffOnRunning) =>
+      wait: (jobId, waitMs) =>
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
-          body: JSON.stringify({ jobId, waitMs, ...(handoffOnRunning ? { handoffOnRunning: true, goal: args.goal } : {}) }),
+          body: JSON.stringify({ jobId, waitMs }),
           timeoutMs: waitMs + 3_000,
         }),
     },

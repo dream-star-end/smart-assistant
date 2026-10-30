@@ -115,7 +115,7 @@ describe('runCursorDelegateFastPath', () => {
     assert.ok(completed.every((r) => !/delegate-wait/.test(r.text)))
   })
 
-  it('hands the job to the gateway before the budget, including time spent starting', async () => {
+  it('reads a previously callback-owned job without requesting a new handoff', async () => {
     let now = 0
     const polls: Array<{ ms: number; handoff?: boolean }> = []
     const r = await runCursorDelegateFastPath({
@@ -129,14 +129,14 @@ describe('runCursorDelegateFastPath', () => {
         },
       },
     })
-    assert.deepEqual(polls, [{ ms: 42_000, handoff: true }])
+    assert.deepEqual(polls, [{ ms: 42_000, handoff: undefined }])
     assert.equal(r.kind, 'deferred')
     assert.match(r.text, /自动把结果送回本会话/)
     assert.doesNotMatch(r.text, /delegate-wait|Bash/)
     assert.ok(now < 60_000)
   })
 
-  it('unavailable handoff remains healthy and preserves its stdout wait fallback', async () => {
+  it('deadline exhaustion remains healthy and preserves its stdout wait fallback', async () => {
     let now = 0
     const r = await runCursorDelegateFastPath({
       fastWaitMs: 45_000, deadlineAtMs: 1_000, now: () => now,
@@ -151,7 +151,7 @@ describe('runCursorDelegateFastPath', () => {
     assert.doesNotMatch(r.text, /委派失败|网关已接管/)
   })
 
-  it('still attempts a bounded handoff when job admission used the entire budget', async () => {
+  it('still checks once for a result when job admission used the entire budget', async () => {
     let now = 0
     let waits = 0
     const r = await runCursorDelegateFastPath({
@@ -161,13 +161,15 @@ describe('runCursorDelegateFastPath', () => {
         wait: async (_id, ms, handoff) => {
           waits++
           assert.equal(ms, 250)
-          assert.equal(handoff, true)
-          return response({ status: 'deferred', jobId: 'dlgjob-admitted' })
+          assert.equal(handoff, undefined)
+          now += ms
+          return response({ status: 'running', jobId: 'dlgjob-admitted' })
         },
       },
     })
     assert.equal(waits, 1)
-    assert.equal(r.kind, 'deferred')
+    assert.equal(r.kind, 'running')
+    assert.match(r.text, /oc-memory delegate-wait dlgjob-admitted/)
   })
 
   it('gateway recovery HTTP 503 is retried but a failed job remains terminal', async () => {
@@ -312,6 +314,18 @@ describe('interpret helpers', () => {
 })
 
 describe('formatDelegateFanoutRunning', () => {
+  it('keeps one CLI aggregate for every unfinished member of the same tool call', () => {
+    const text = formatDelegateFanoutRunning([
+      { label: 'done', goal: 'a', isError: false, text: 'already returned' },
+      { label: 'first', goal: 'b', isError: false, text: '', running: true, jobId: 'dlgjob-a' },
+      { label: 'second', goal: 'c', isError: false, text: '', running: true, jobId: 'dlgjob-b' },
+    ])
+    assert.equal(text.match(/oc-memory delegate-wait/g)?.length, 1)
+    assert.match(text, /oc-memory delegate-wait dlgjob-a dlgjob-b/)
+    assert.match(text, /不要结束当前回合/)
+    assert.doesNotMatch(text, /请结束当前回合|网关已接管/)
+  })
+
   it('mixed handoff waits only for jobs whose callback was not confirmed', () => {
     const text = formatDelegateFanoutRunning([
       { label: 'auto', goal: 'a', isError: false, text: '', running: true, deferred: true, jobId: 'dlgjob-auto' },

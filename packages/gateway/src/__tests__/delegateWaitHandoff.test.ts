@@ -2,7 +2,7 @@ import { installDelegateSandbox } from './helpers/delegateSandbox.js'
 const sandbox = installDelegateSandbox()
 
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -50,6 +50,14 @@ function fixture() {
     headers: { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ sessionKey, agentId, depth: 0 }) },
   }) as any
   const intent = (jobId: string) => ({ v: 1 as const, jobId, originSessionKey: PARENT, userId: 'u1', agentId: 'coding-assistant', goal: 'task', createdAt: 1 })
+  // Model an already-persisted handoff from the previous runtime. New wait
+  // requests must never perform this ownership transition themselves.
+  const previouslyHandedOff = async (jobId: string) => {
+    const saved = intent(jobId)
+    await persistSendToAgentIntent(saved)
+    assert.ok(store.handoffStdoutWait(jobId, PARENT, { callbackOriginUserId: 'u1', parentEngine: 'grok' }))
+    host._activeSendToAgentCallbacks.set(jobId, saved)
+  }
   const complete = (jobId: string, failed = false) => {
     const owner = store.snapshotOf(jobId)!
     if (failed) assert.equal(store.fail(jobId, {
@@ -61,7 +69,7 @@ function fixture() {
     if (isDelegateNotifierEffective()) void host._ensureDurableSendToAgentCallback(snap, intent(jobId))
     _queueSendToAgentCallback.call(host, { parentSessionKey: PARENT } as any, { jobId, agentId: 'coding-assistant', goal: 'task' })
   }
-  return { host, store, calls, create, request, complete, intent }
+  return { host, store, calls, create, request, complete, intent, previouslyHandedOff }
 }
 
 async function settled(store: DelegateJobStore, jobId: string) {
@@ -83,11 +91,12 @@ async function waitRoute(f: ReturnType<typeof fixture>, jobId: string, opts: { h
 describe('MCP deadline handoff', () => {
   for (const notifier of [false, true]) {
     for (const failed of [false, true]) {
-      it(`delivers one ${failed ? 'failure' : 'success'} callback with notifier ${notifier ? 'on' : 'off'}`, async () => {
+      it(`drains one existing ${failed ? 'failure' : 'success'} callback with notifier ${notifier ? 'on' : 'off'}`, async () => {
         if (notifier) Object.assign(process.env, { OC_DELEGATE_SM: '1', OC_DELEGATE_DURABLE: '1', OC_DELEGATE_NOTIFIER: '1' })
         const f = fixture()
         const id = f.create()
         const sibling = f.create()
+        await f.previouslyHandedOff(id)
         const response = await waitRoute(f, id, { handoff: true })
         assert.equal(response.body.status, 'deferred')
         assert.equal(f.store.snapshotOf(sibling)?.callback, 'stdout-wait')
@@ -118,16 +127,16 @@ describe('MCP deadline handoff', () => {
   })
 
   for (const failed of [false, true]) {
-    it(`catches ${failed ? 'failure' : 'success'} completed while persisting the handoff`, async () => {
+    it(`returns ${failed ? 'failure' : 'success'} on stdout after refusing a deadline handoff`, async () => {
       const f = fixture()
       const id = f.create()
-      f.host._persistSendToAgentIntent = async (intent: any) => {
-        await persistSendToAgentIntent(intent)
-        f.complete(id, failed)
-      }
-      assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), true)
-      await settled(f.store, id)
-      assert.equal(f.calls.length, 1)
+      assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), false)
+      f.complete(id, failed)
+      const response = await waitRoute(f, id)
+      assert.equal(response.body.status, failed ? 'failed' : 'done')
+      assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
+      assert.equal(f.store.snapshotOf(id)?.callbackState, 'skipped_silent')
+      assert.equal(f.calls.length, 0)
     })
   }
 
@@ -135,6 +144,7 @@ describe('MCP deadline handoff', () => {
     process.env.OC_DELEGATE_CALLBACK_OWNER = 'intent'
     const f = fixture()
     const id = f.create()
+    await f.previouslyHandedOff(id)
     assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), true)
     f.complete(id)
     await Promise.all([
@@ -146,9 +156,10 @@ describe('MCP deadline handoff', () => {
     assert.equal(f.calls[0].clientMessageId, delegateCallbackMessageId(id, 1))
   })
 
-  it('concurrent handoff requests retain the same durable intent and notify epoch', async () => {
+  it('concurrent checks of an existing handoff retain its durable intent and notify epoch', async () => {
     const f = fixture()
     const id = f.create()
+    await f.previouslyHandedOff(id)
     assert.deepEqual(await Promise.all([
       handoffDelegateWait(f.host, f.request(), id, 'task'),
       handoffDelegateWait(f.host, f.request(), id, 'task'),
@@ -160,12 +171,25 @@ describe('MCP deadline handoff', () => {
     assert.equal(f.calls.length, 1)
   })
 
+  it('a disconnected stdout waiter leaves its terminal for the next aggregate reader', async () => {
+    const f = fixture()
+    const id = f.create()
+    f.complete(id)
+    assert.equal(await waitRoute(f, id, { destroyed: true }), undefined)
+    assert.equal(f.store.snapshotOf(id)?.callbackState, 'none')
+    const response = await waitRoute(f, id)
+    assert.equal(response.body.status, 'done')
+    assert.equal(f.store.snapshotOf(id)?.callbackState, 'skipped_silent')
+    assert.equal(f.calls.length, 0)
+  })
+
   it('a disconnected old waiter cannot consume a callback-owned result', async () => {
     const f = fixture()
     const id = f.create()
-    f.store.complete(id, { httpStatus: 200, body: { output: 'done' } })
+    await f.previouslyHandedOff(id)
+    f.complete(id)
     assert.equal(await waitRoute(f, id, { destroyed: true }), undefined)
-    assert.equal(f.store.snapshotOf(id)?.callbackState, 'none')
+    assert.notEqual(f.store.snapshotOf(id)?.callbackState, 'skipped_silent')
     assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), true)
     await settled(f.store, id)
     const late = await waitRoute(f, id)
@@ -188,15 +212,30 @@ describe('MCP deadline handoff', () => {
     assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
   })
 
-  it('persistence failure leaves a live job and returns no fake deferred status', async () => {
+  it('an old client cannot transfer a new stdout job or persist a callback intent', async () => {
     const f = fixture()
     const id = f.create()
-    f.host._persistSendToAgentIntent = async () => { throw new Error('disk unavailable') }
+    let persisted = 0
+    f.host._persistSendToAgentIntent = async () => { persisted++ }
     const response = await waitRoute(f, id, { handoff: true })
     assert.equal(response.body.status, 'running')
+    assert.equal(persisted, 0)
+    assert.deepEqual(await readdir(process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR!), [])
     assert.equal(f.store.snapshotOf(id)?.state, 'running')
     assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
     assert.equal(f.calls.length, 0)
+  })
+
+  it('concurrent old-client requests leave the whole fanout on stdout', async () => {
+    const f = fixture()
+    const ids = [f.create(), f.create()]
+    assert.deepEqual(await Promise.all(ids.map((id) => handoffDelegateWait(f.host, f.request(), id, 'task'))), [false, false])
+    for (const id of ids) {
+      assert.equal(f.store.snapshotOf(id)?.callback, 'stdout-wait')
+      assert.equal(f.store.snapshotOf(id)?.callbackState, 'none')
+    }
+    assert.equal(f.host._activeSendToAgentCallbacks.size, 0)
+    assert.deepEqual(await readdir(process.env.OPENCLAUDE_SEND_TO_AGENT_INTENT_DIR!), [])
   })
 
   for (const failure of ['ORIGIN_SESSION_BUSY', 'NO_TRANSPORT']) {
@@ -211,6 +250,7 @@ describe('MCP deadline handoff', () => {
         delivered++
         return { kind: 'injected' }
       }
+      await f.previouslyHandedOff(id)
       assert.equal(await handoffDelegateWait(f.host, f.request(), id, 'task'), true)
       f.complete(id)
       await delay(10)

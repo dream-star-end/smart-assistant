@@ -1,7 +1,7 @@
 /**
  * Shared delegate fast path (originally introduced for Cursor): start the
  * gateway job asynchronously and keep polling inside the same tools/call.
- * Near the engine deadline the gateway takes callback ownership of this job.
+ * At the engine deadline, retain stdout delivery through one aggregate CLI wait.
  *
  * Pure enough to unit-test with fake HTTP; index.ts only supplies POST/wait.
  * A transport or tool deadline is never the lifetime of a healthy child job.
@@ -71,7 +71,7 @@ export function formatDelegateRunning(
   const keyBit = sessionKey ? ` sessionKey=${sessionKey}` : ''
   return [
     `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}${keyBit}`,
-    '前台工具等待窗口已结束，尚未确认自动回调。子任务会继续运行；请用 Bash 阻塞取回结果，不要重复委派或轮询 MCP:',
+    '前台工具等待窗口已结束。子任务会继续运行；请用 Bash 阻塞取回结果，不要结束当前回合、重复委派或轮询 MCP:',
     `  oc-memory delegate-wait ${jobId}`,
   ].join('\n')
 }
@@ -105,7 +105,9 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
     '### 仍在运行',
     deferred
       ? '网关已接管等待，终态会自动送回本会话。请结束当前回合，不要重新委派或启动等待工具。'
-      : '部分作业尚未确认自动回调。仅用下方 Bash 命令等待这些作业；网关已接管的作业会自动送回，不要重复委派或轮询 MCP。',
+      : stdoutJobIds.length === running.length
+        ? '前台工具等待窗口已结束。请用下方一条 Bash 命令阻塞等待所有未完成作业，不要结束当前回合、重复委派或轮询 MCP。'
+        : '部分作业尚未确认自动回调。仅用下方 Bash 命令等待这些作业；网关已接管的作业会自动送回，不要重复委派或轮询 MCP。',
     ...(!deferred ? [`  oc-memory delegate-wait ${stdoutJobIds.join(' ')}`] : []),
     ...runningLines,
   ].join('\n')
@@ -301,9 +303,10 @@ export async function runCursorDelegateFastPath(
     const roundStarted = now()
     const remaining = deadline - roundStarted
     const waitMs = Math.max(250, Math.min(opts.fastWaitMs, remaining - 3_000))
-    const handoff = remaining <= opts.fastWaitMs + 3_000
     try {
-      const waited = await opts.transport.wait(start.jobId, waitMs, handoff)
+      // Keep the tool/fan-out delivery boundary: per-job callbacks would create
+      // independent paid parent turns. At the deadline use the aggregate CLI.
+      const waited = await opts.transport.wait(start.jobId, waitMs)
       const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
       if (view.kind === 'deferred') {
         return { kind: 'deferred', jobId: view.jobId, text: formatDelegateDeferred(view.jobId, opts.label) }

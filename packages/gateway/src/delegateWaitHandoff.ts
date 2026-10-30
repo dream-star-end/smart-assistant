@@ -1,9 +1,7 @@
-/** Transfer a single MCP wait to the existing durable callback delivery lane. */
+/** Preserve existing callback delivery without creating new billable parent turns. */
 import type { IncomingMessage } from 'node:http'
-import { isDelegateTerminalState } from '@openclaude/protocol'
 import { parseOriginWebchatSessionKey } from './cronOriginSession.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
-import { removeSendToAgentIntent, type SendToAgentIntent } from './sendToAgentIntentStore.js'
 import type { DelegateRuntimeHost } from './delegateRuntime.js'
 import type { DelegateCallbacksHost } from './delegateCallbacks.js'
 import type { DelegateJobStore } from './delegateJobs.js'
@@ -45,7 +43,7 @@ export async function handoffDelegateWait(
   host: DelegateRuntimeHost,
   req: IncomingMessage,
   jobId: string,
-  goal: unknown,
+  _goal: unknown,
 ): Promise<boolean> {
   const raw = req.headers[DELEGATE_CONTEXT_HEADER]
   const token = Array.isArray(raw) ? raw[0] : raw
@@ -55,56 +53,11 @@ export async function handoffDelegateWait(
   const job = store?.snapshotOf(jobId)
   if (!caller || !origin || caller.agentId !== origin.agentId || !store || !host._delegateReconcileReady) return false
   if (!job || job.kind !== 'delegate' || job.parentSessionKey !== caller.sessionKey) return false
-  if (job.callback === 'origin-inject' && job.callbackOriginSessionKey === caller.sessionKey) {
-    return job.callbackState !== 'skipped_silent'
-  }
-  if (job.callback !== 'stdout-wait' || job.callbackState !== 'none') return false
-
-  const intent: SendToAgentIntent = {
-    v: 1,
-    jobId,
-    originSessionKey: caller.sessionKey,
-    userId: host.sessions.getByKey(caller.sessionKey)?.userId,
-    agentId: job.agentId,
-    goal: typeof goal === 'string' ? goal.slice(0, 4_000) : '',
-    createdAt: Date.now(),
-  }
-  try {
-    // The intent is a restart fallback even when the Notifier flag is off.
-    await host._persistSendToAgentIntent(intent)
-  } catch (err) {
-    host.log.warn('delegate wait handoff persistence failed', { jobId }, err as Error)
-    return false
-  }
-  const adopted = store.handoffStdoutWait(jobId, caller.sessionKey, {
-    callbackOriginUserId: intent.userId,
-    parentEngine: host._resolveDelegateParentEngine(caller.sessionKey),
-  })
-  if (!adopted) {
-    // A concurrent handoff may own this same intent now. Only a terminal
-    // stdout consumer makes it safe to remove our unused persistence record.
-    const latest = store.snapshotOf(jobId)
-    if (latest?.callback === 'stdout-wait' && latest.callbackState === 'skipped_silent') {
-      await removeSendToAgentIntent(jobId).catch(() => {})
-    }
-    return false
-  }
-  if (adopted.callbackState === 'delivered' || adopted.callbackState === 'abandoned') {
-    await removeSendToAgentIntent(jobId).catch(() => {})
-    return true
-  }
-  ;(host._activeSendToAgentCallbacks ??= new Map()).set(jobId, {
-    originSessionKey: intent.originSessionKey,
-    userId: intent.userId,
-    agentId: intent.agentId,
-    goal: intent.goal,
-  })
-  // Completion can win while the intent is being persisted. It previously
-  // saw stdout-wait, so dispatch the newly owned terminal explicitly.
-  if (isDelegateTerminalState(adopted.state)) {
-    void host._ensureDurableSendToAgentCallback(adopted, intent).catch((err) => {
-      host.log.warn('delegate wait handoff callback failed', { jobId }, err as Error)
-    })
-  }
-  return true
+  // A job-level callback starts a normal paid parent turn. Independent fan-out
+  // completions cannot preserve the original tool's aggregate delivery boundary,
+  // so new stdout jobs must retain the existing CLI aggregate continuation.
+  // Old clients may still request handoff; only already-owned callbacks qualify.
+  return job.callback === 'origin-inject'
+    && job.callbackOriginSessionKey === caller.sessionKey
+    && job.callbackState !== 'skipped_silent'
 }
