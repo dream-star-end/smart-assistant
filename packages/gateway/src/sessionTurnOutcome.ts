@@ -87,6 +87,7 @@ export function persistServerAuthoredTurnOutcome(args: {
   }
   /** Plan §4.4 改动 7 — refresh-stable status pills. */
   truncated?: boolean
+  truncatedReason?: 'max_tokens' | 'pause_turn'
   errorCode?: string
   errorDetail?: string
   /** Top-level tool calls completed during this turn, captured by
@@ -153,6 +154,7 @@ export function persistServerAuthoredTurnOutcome(args: {
         : {}),
       ...(args.usage !== undefined ? { usage: args.usage } : {}),
       ...(args.truncated ? { truncated: true } : {}),
+      ...(args.truncatedReason ? { truncatedReason: args.truncatedReason } : {}),
       ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
       ...(args.errorDetail !== undefined ? { errorDetail: args.errorDetail } : {}),
       ...(args.tools && args.tools.length > 0 ? { tools: args.tools } : {}),
@@ -278,6 +280,9 @@ export function persistServerAuthoredTurnOutcome(args: {
         text: args.text,
         ts: baseTs,
         status: args.status,
+        ...(args.truncatedReason || args.truncated
+          ? { _truncated: args.truncatedReason ?? 'max_tokens' }
+          : {}),
       })
     }
     // thinking-only legacy turn — already logged inside the try/catch above.

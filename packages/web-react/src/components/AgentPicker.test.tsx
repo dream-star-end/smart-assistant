@@ -250,6 +250,24 @@ describe("AgentPicker capability readiness", () => {
 
 // C-33:首次打开列表未返回前网格是空的,数据到达时卡片突然出现 —— 骨架卡占位避免跳动。
 describe("AgentPicker 加载骨架", () => {
+  it("读取失败保留已确认的目录并明示重试，重试成功后恢复列表", async () => {
+    listMyAgents.mockRejectedValueOnce(new Error("503"));
+    render(
+      <AgentPicker open current={MAIN_AGENT} auth={auth}
+        knownAgents={READINESS_ROWS.map(agentFromApiRow)} onClose={() => {}} onPick={() => {}} />,
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("智能体加载失败");
+    expect(screen.getByRole("button", { name: /科研助手/ })).toBeInTheDocument();
+    listMyAgents.mockResolvedValueOnce([
+      ...READINESS_ROWS,
+      { id: "office-agent", slug: "office-agent", name: "办公助手", description: "", installed: true },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByRole("button", { name: /办公助手/ })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(listMyAgents).toHaveBeenCalledTimes(2);
+  });
+
   it("列表未返回时网格内渲染骨架(role=status 播报加载中),返回后骨架消失", async () => {
     let resolve!: (rows: unknown[]) => void;
     listMyAgents.mockReturnValue(

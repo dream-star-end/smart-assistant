@@ -62,7 +62,7 @@ export function ConnectorHead({
     <div className="flex items-start gap-2">
       <div className="min-w-0 flex-1">
         <div className="flex min-h-7 min-w-0 items-center gap-2">
-          <span className="min-w-0 truncate text-[14px] font-semibold leading-5 text-fg">
+          <span className="min-w-0 truncate text-section font-semibold leading-5 text-fg">
             {label}
           </span>
           {status && (

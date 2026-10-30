@@ -31,6 +31,7 @@ export type LosslessTurnPayload = {
   goalStateRevision?: number;
   usage?: Record<string, unknown>;
   truncated?: boolean;
+  truncatedReason?: "max_tokens" | "pause_turn";
   errorCode?: string;
   errorDetail?: string;
   tools?: Array<Record<string, unknown>>;
@@ -453,6 +454,10 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
   if (truncated !== undefined && typeof truncated !== "boolean") {
     throw new Error("turn tape payload.truncated must be boolean");
   }
+  const truncatedReason = optionalString(raw, "truncatedReason");
+  if (truncatedReason !== undefined && truncatedReason !== "max_tokens" && truncatedReason !== "pause_turn") {
+    throw new Error("turn tape payload.truncatedReason is invalid");
+  }
   const thinkingText = optionalString(raw, "thinkingText");
   const createdAt = optionalPositiveInt(raw, "createdAt");
   if (createdAt === undefined) throw new Error("turn tape payload.createdAt is required");
@@ -547,6 +552,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
       usage !== undefined ||
       thinkingText !== undefined ||
       truncated !== undefined ||
+      truncatedReason !== undefined ||
       errorCode !== undefined ||
       errorDetail !== undefined ||
       tools !== undefined ||
@@ -584,6 +590,7 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
     ...(goalId !== undefined ? { goalId, goalStateRevision: goalStateRevision! } : {}),
     ...(usage !== undefined ? { usage } : {}),
     ...(truncated === true ? { truncated: true } : {}),
+    ...(truncatedReason !== undefined ? { truncatedReason } : {}),
     ...(errorCode !== undefined ? { errorCode } : {}),
     ...(errorDetail !== undefined ? { errorDetail } : {}),
     ...(tools !== undefined ? { tools } : {}),
@@ -813,6 +820,7 @@ export function materializeLosslessTurn(
   options: { runtimeBatching?: boolean } = {},
 ): MaterializedLosslessTurn {
   const body = parseLosslessTurnPayload(raw);
+  const truncatedReason = body.truncatedReason ?? (body.truncated ? "max_tokens" : undefined);
   const baseTs = body.createdAt;
   const tools = body.tools ?? [];
   const idPart = body.agentId === LOSSLESS_TURN_TAPE_LEGACY_AGENT_ID
@@ -1042,7 +1050,7 @@ export function materializeLosslessTurn(
         ...(segment._callUsage ? { _callUsage: segment._callUsage } : {}),
         ...(last ? { _turnKey: body.turnKey } : {}),
         ...(last && body.usage ? { usage: body.usage } : {}),
-        ...(last && body.truncated ? { _truncated: true } : {}),
+        ...(last && truncatedReason ? { _truncated: truncatedReason } : {}),
         ...(last && body.errorCode ? { _errorCode: body.errorCode } : {}),
         ...(last && body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
         ...(last && terminalRetry ? {
@@ -1065,7 +1073,7 @@ export function materializeLosslessTurn(
       _turnKey: body.turnKey,
       ...(body.text.length === 0 ? { _isError: true } : {}),
       ...(body.usage ? { usage: body.usage } : {}),
-      ...(body.truncated ? { _truncated: true } : {}),
+      ...(truncatedReason ? { _truncated: truncatedReason } : {}),
       ...(body.errorCode ? { _errorCode: body.errorCode } : {}),
       ...(body.errorDetail ? { _errorDetail: body.errorDetail } : {}),
       ...(terminalRetry ? {

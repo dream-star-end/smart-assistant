@@ -3846,7 +3846,7 @@ describe("applyCostWaived (turn 免单退款)", () => {
   });
 });
 
-describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
+describe("applyCostCharged (§3 requestId 去重、实扣归因)", () => {
   test("active multi-request turn reminder uses actual debit and dedupes requestId", () => {
     const s = sess();
     s._sendingInFlight = true;
@@ -3867,8 +3867,8 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
     }, {});
     expect(s._turnCostCredits).toBe("300");
     expect(s._turnCostReminderCredits).toBeUndefined();
-    // Existing response badge deliberately keeps its no-frameSeq behavior.
-    expect(a.usage?.costCredits).toBe("1200");
+    // The response badge shares the requestId fence and actual-debit basis.
+    expect(a.usage?.costCredits).toBe("300");
 
     applyCostCharged(s, {
       type: "outbound.cost_charged",
@@ -9830,6 +9830,63 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(session._stopSettlement).toBeUndefined();
     expect(session._recoveryStatus?.kind).toBe("completed");
     expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
+    sock.stop();
+  });
+
+  test.each(["completed", "crashed"])("Master confirmed ended Stop syncs the exact turn and preserves its %s outcome", (outcome) => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const deletePendingControl = vi.fn().mockResolvedValue(undefined);
+    const sock = makeSocket({ syncSession, deletePendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "already finished" });
+    const session = sock.sessions.get("s1")!;
+    const user = session.messages.find((m) => m.role === "user")!;
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", admitted: true, peer: { id: "s1", kind: "dm" }, clientMessageId: user.id }) });
+    sock.stopTurn("s1");
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    const terminal = addMessage(session, outcome === "completed" ? "assistant" : "system", "authoritative evidence", {
+      _clientMessageId: user.id, _dispatchOutcome: outcome,
+      ...(outcome === "crashed" ? { _errorCode: "engine_error" } : {}),
+    });
+    const before = structuredClone(terminal);
+    syncSession.mockClear();
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stop.controlId, controlKind: "stop", status: "terminal",
+      peer: { id: "s1", kind: "dm" }, clientMessageId: user.id, errorCode: "TURN_ALREADY_ENDED",
+    }) });
+    expect(sock.getTransientNotice("s1")?.text).toBe("该回合已结束");
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: user.id });
+    expect(deletePendingControl).toHaveBeenCalledWith("s1", stop.controlId);
+    expect(session._sendingInFlight).toBe(false);
+    expect(terminal).toEqual(before);
+    expect(session.messages.some((message) => message._errorCode === "user_cancelled")).toBe(false);
+    sock.stop();
+  });
+
+  test("runtime Stop miss reconciles the exact turn without claiming it already ended", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const syncSession = vi.fn();
+    const sock = makeSocket({ syncSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "not yet admitted by runtime" });
+    const session = sock.sessions.get("s1")!;
+    const clientMessageId = session.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", admitted: true, peer: { id: "s1", kind: "dm" }, clientMessageId }) });
+    sock.stopTurn("s1");
+    const stop = ws.sent.map((raw) => JSON.parse(raw)).find((frame) => frame.type === "inbound.control.stop");
+    syncSession.mockClear();
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.control.receipt", controlId: stop.controlId, controlKind: "stop", status: "terminal",
+      peer: { id: "s1", kind: "dm" }, clientMessageId, errorCode: "TURN_NOT_ACTIVE",
+    }) });
+    expect(sock.getTransientNotice("s1")).toBeNull();
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId });
+    expect(session._sendingInFlight).toBe(false);
     sock.stop();
   });
 

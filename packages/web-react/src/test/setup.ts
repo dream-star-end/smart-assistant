@@ -1,4 +1,7 @@
 import { configure } from "@testing-library/react";
+import { beforeAll } from "vitest";
+import { preloadTurnErrorNotice } from "../components/chat/lazyTurnErrorNotice";
+import { MODULE_LOAD_TIMEOUT_MS } from "./moduleLoad";
 
 // waitFor/findBy 的失败截止线从 RTL 默认 1s 提到 5s —— 这是**真实时钟**,不是等待时长:
 // 条件满足即刻返回,绿路径零成本;只在断言注定失败时才等满。1s 是按空闲开发机标定的默认值,
@@ -47,3 +50,9 @@ if (typeof window !== "undefined" && typeof window.ResizeObserver !== "function"
 if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
   Element.prototype.scrollIntoView = () => {};
 }
+
+// W3:错误卡(含 protocol 错误目录)在懒加载块里。断言错误卡的用例散在各文件,这里先取好,
+// 渲染时同步出卡(lazyTurnErrorNotice 的同步 thenable)。块很小,不是 OCV5-376 那类重块。
+beforeAll(async () => {
+  await preloadTurnErrorNotice();
+}, MODULE_LOAD_TIMEOUT_MS);

@@ -9,11 +9,16 @@ import {
   renderDelegateModelSection,
   suggestDelegateModels,
 } from '../delegateModelCatalogPrompt.js'
+import { decideLocalExecution } from '../localExecution.js'
+import { parseCatalogResponse } from '../modelCatalogClient.js'
 import { buildAgentsSlot } from '../promptSlots.js'
 import { _internals as _platformPromptInternals } from '../platformPrompts.js'
 
 // 真实投影里 cursor 家族的形状(2026-09 LKG):fable 没有 -fast、gemini 只有 low/medium/high、
 // grok/opus 有全档位 + -fast、sonnet 全档位无 -fast。压缩必须逐个还原,不能拼出不存在的组合。
+const renderAllModels: typeof renderDelegateModelSection = input =>
+  renderDelegateModelSection(input, { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' })
+
 const CURSOR_REAL = [
   'cursor-gemini-3.8-flash-high', 'cursor-gemini-3.8-flash-low', 'cursor-gemini-3.8-flash-medium',
   'cursor-grok-4.6-high', 'cursor-grok-4.6-high-fast', 'cursor-grok-4.6-low', 'cursor-grok-4.6-low-fast',
@@ -82,7 +87,7 @@ describe('renderDelegateModelSection', () => {
     ...mk(CURSOR_REAL, 'cursor'),
   ]
   it('按 engine 分组、只列 available、标注投影与核验状态、声明服务端重校验', () => {
-    const s = renderDelegateModelSection({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
+    const s = renderAllModels({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
     assert.ok(s.startsWith(DELEGATE_MODEL_SECTION_HEADING))
     assert.match(s, /投影 rev-42,已在线核验/)
     assert.match(s, /服务端仍会重新校验/)
@@ -93,15 +98,15 @@ describe('renderDelegateModelSection', () => {
     assert.ok(!/`glm-5\.3`[,\n]/.test(s), '不可用型号不得列出')
   })
   it('verifiedAt=0 → 标注仅本地缓存', () => {
-    const s = renderDelegateModelSection({ models, projectionRevision: 'r', verifiedAt: 0 })
+    const s = renderAllModels({ models, projectionRevision: 'r', verifiedAt: 0 })
     assert.match(s, /仅本地缓存,可能滞后/)
   })
   it('投影为空 → 明确提示不要填 model', () => {
-    const s = renderDelegateModelSection({ models: [], projectionRevision: 'r', verifiedAt: 1 })
+    const s = renderAllModels({ models: [], projectionRevision: 'r', verifiedAt: 1 })
     assert.match(s, /没有可用型号;委派时不要填 `model`/)
   })
   it('整段 token 预算:真实规模投影 < 900 字符', () => {
-    const s = renderDelegateModelSection({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
+    const s = renderAllModels({ models, projectionRevision: 'rev-42', verifiedAt: 1 })
     assert.ok(s.length < 900, `section too long: ${s.length}`)
   })
 })
@@ -136,13 +141,16 @@ describe('buildAgentsSlot 注入「委派可用型号」', () => {
       agentId: 'main',
       model: 'glm-5.3-zai',
       delegateModelCatalog: {
-        models: mk(['gpt-6-astra'], 'codex'),
+        models: [...mk(['deepseek-v4-flash'], 'ccb'), ...mk(['gpt-6-astra'], 'codex')],
         projectionRevision: 'p1',
         verifiedAt: 5,
       },
     })
     assert.match(slot.content, /## 委派可用型号/)
-    assert.match(slot.content, /- Codex: `gpt-6-astra`/)
+    assert.match(slot.content, /- CCB: `deepseek-v4-flash`/)
+    const section = slot.content.slice(slot.content.indexOf(DELEGATE_MODEL_SECTION_HEADING))
+      .split(/\n## /)[0]
+    assert.doesNotMatch(section, /- Codex:/)
   })
   it('无投影(null)→ 提示行而非静默消失', async () => {
     const slot = await buildAgentsSlot({ agentId: 'main', model: 'glm-5.3-zai', delegateModelCatalog: null })
@@ -175,3 +183,36 @@ function assertStaticContract(content: string): void {
   assert.match(content, /`gpt-6` 不是 `gpt-6-astra`/)
   assert.match(content, /delegate_task\(\{ goal: "\.\.\.", agentId: "coding-assistant" \}\)/)
 }
+
+
+describe('commercial delegation catalog matches billed execution', () => {
+  const models = [
+    { modelId: 'deepseek-v4-flash', engine: 'ccb' as const, available: true },
+    { modelId: 'grok-build', engine: 'grok' as const, available: true },
+    { modelId: 'gpt-6-astra', engine: 'codex' as const, available: true },
+    { modelId: 'cursor-grok-4.6-high', engine: 'cursor' as const, available: true },
+    { modelId: 'zcode-glm-5.3', engine: 'zcode' as const, available: true },
+    { modelId: 'antigravity-gemini-4-argon', engine: 'antigravity' as const, available: true },
+  ]
+  const input = { models, projectionRevision: 'contract', verifiedAt: 1 }
+  it('every advertised commercial slug passes billed_delegate local preflight', () => {
+    const text = renderDelegateModelSection(input, {})
+    const catalog = parseCatalogResponse({ projection_revision: 'contract', security_epoch: '1',
+      models: models.map(m => ({ model_id: m.modelId, display_name: m.modelId,
+        engine: m.engine, provider_id: m.engine, context_window: 200000,
+        supported_efforts: [], supports_vision: false, capability_zero: false, supports_thinking: false })) })
+    const advertised = [...text.matchAll(/^- [^:]+: (.+)$/gm)]
+      .flatMap(line => [...line[1].matchAll(/`([^`]+)`/g)].map(match => match[1]))
+    assert.deepEqual(advertised, ['deepseek-v4-flash', 'grok-build'])
+    for (const model of advertised) {
+      assert.doesNotThrow(() => decideLocalExecution({ view: catalog, agent: { id: 'member' },
+        model, kind: 'billed_delegate', env: {} }))
+    }
+    for (const m of models.slice(2)) assert.ok(!text.includes(m.modelId), m.modelId)
+    assert.match(text, /DELEGATE_CODEX_UNSUPPORTED/)
+  })
+  it('selfhost exemption retains every available engine', () => {
+    const text = renderDelegateModelSection(input, { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' })
+    for (const m of models) assert.ok(text.includes(m.modelId), m.modelId)
+  })
+})
