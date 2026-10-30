@@ -526,9 +526,9 @@ describe('long-task authority interruption keeps paid progress', () => {
         })());
       } finally {
         setV3MasterSinkSingleton(null);
-        if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+        if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
         else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-        if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+        if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
         else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
         server.closeAllConnections();
         if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
