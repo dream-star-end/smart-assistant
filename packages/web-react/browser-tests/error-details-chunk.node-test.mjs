@@ -41,6 +41,7 @@ test('error panels retain their actions and technical details when the optional 
     }}], logLevel: 'warning',
   })
   assert.equal(rewrites, red ? 2 : 0)
+  console.log("DETAILS_FIXTURE_REWRITES", rewrites)
   const server = createServer((req, res) => {
     res.setHeader('Content-Type', req.url === '/fixture.js' ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8')
     res.end(req.url === '/fixture.js' ? bundle.outputFiles[0].text : '<!doctype html><meta charset="utf-8"><div id="root"></div><script src="/fixture.js"></script>')
@@ -51,7 +52,7 @@ test('error panels retain their actions and technical details when the optional 
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ['--no-sandbox'] })
     const page = await browser.newPage()
     const errors = []
-    page.on('pageerror', error => errors.push(error.message))
+    page.on('pageerror', error => { errors.push(error.message); console.log('DETAILS_FIXTURE_PAGEERROR', error.message) })
     page.setDefaultTimeout(5000)
     await page.goto(`http://127.0.0.1:${server.address().port}`)
     await page.getByRole('button', { name: '重试发送', exact: true }).click()
