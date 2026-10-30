@@ -86,8 +86,8 @@ test("expired boot refresh on /p/p1 shows 登录已过期 and login returns to t
       assert.equal(new URL(page.url()).pathname, "/p/p1", "the deep link stays in the address bar");
       assert.ok(calls.includes("/api/auth/refresh"));
 
-      await page.getByLabel("邮箱").fill("b@example.com");
-      await page.getByLabel("密码").fill("fixture password");
+      await page.getByLabel("邮箱", { exact: true }).fill("b@example.com");
+      await page.getByLabel("密码", { exact: true }).fill("fixture password");
       await page.getByRole("button", { name: "登录", exact: true }).click();
       await page.getByTestId("project-home").waitFor();
       assert.equal(new URL(page.url()).pathname, "/p/p1", "login returns to the project");
