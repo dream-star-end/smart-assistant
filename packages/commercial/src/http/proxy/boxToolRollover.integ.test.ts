@@ -24,15 +24,16 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
       updated_at timestamptz NOT NULL DEFAULT now(),failure_code text,error_msg text,final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (request_id text PRIMARY KEY,user_id bigint,
       credits bigint,output_tokens bigint)`);
-    await client.query(`CREATE TEMP TABLE credit_ledger (request_id text PRIMARY KEY,delta bigint)`);
+    await client.query("CREATE TEMP TABLE credit_ledger (request_id text PRIMARY KEY,delta bigint)");
     await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,user_id bigint,
       session_id text,attempt_no integer,status text)`);
     const query = client.query.bind(client);
     const journal = new BoxDurableJournal({ query,
       connect: async () => ({ query, release() {} }) } as never);
     const dispatchId = "71111111-1111-4111-8111-111111111111";
-    await query(`INSERT INTO turn_dispatches VALUES ($1,3,'rollover-ui',1,'accepted')`, [dispatchId]);
-    const turn = "a".repeat(64), session = `roll-${randomBytes(5).toString("hex")}`;
+    await query("INSERT INTO turn_dispatches VALUES ($1,3,'rollover-ui',1,'accepted')", [dispatchId]);
+    const turn = "a".repeat(64);
+    const session = `roll-${randomBytes(5).toString("hex")}`;
     // Catalog route only; every model/tool result below is synthetic, with no upstream call.
     const model = "box-api-claude-sonnet-5-5";
     const basis = { model,boxInvocationRecovery: "v1",billingPricing: { v: 1,modelId: model,
@@ -43,9 +44,11 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
     let body = { model,stream: true,max_tokens: 128,messages: [{ role: "user",content: "synthetic" }],
       tools: [{ name: "Echo",description: "synthetic",input_schema: { type: "object",properties: {} } }],
       metadata: { user_id: JSON.stringify({ session_id: session,oc_turn_key: turn }) } } as ProxyBody;
-    const catalogHash = compileBoxToolCatalog(body.tools).bindingSha256, runner = "d".repeat(64);
+    const catalogHash = compileBoxToolCatalog(body.tools).bindingSha256;
+    const runner = "d".repeat(64);
     const stopGap = async (physicalPending = false) => {
-      let status = 0, response = "";
+      let status = 0;
+      let response = "";
       const stop = makeBoxUserStopHandler({ journal,
         identity: { resolve: async () => ({ uid: 3n,containerId: 7n,apiKey: null }) } as never,
         coordinator: { requestStop: async () => {
@@ -69,8 +72,8 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
       await nextJournal.admit({ requestId: nextId,uid: 3n,accountId: 20n,model,canonicalBody: nextBody,
         fingerprint: deriveBoxCallFingerprint(3n,nextBody),runNonce: "7".repeat(24),leaseEpoch: "8".repeat(32),
         invocationMode: "detached_tool",contextHash: deriveBoxContextHash(nextBody),detachedRunnerHash: runner,catalogHash });
-      assert.equal((await query(`SELECT ctx->>'boxState' state FROM request_finalize_journal WHERE request_id=$1`,[nextId])).rows[0]!.state,"reserved");
-      await query(`DELETE FROM request_finalize_journal WHERE request_id=$1`,[nextId]);
+      assert.equal((await query("SELECT ctx->>'boxState' state FROM request_finalize_journal WHERE request_id=$1",[nextId])).rows[0]!.state,"reserved");
+      await query("DELETE FROM request_finalize_journal WHERE request_id=$1",[nextId]);
     };
     const abortRequest = (requestId: string) => abortInflightJournal({ query } as never,
       requestId,"synthetic HTTP disconnect","STREAM_FAILED");
@@ -80,10 +83,10 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
     await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,state,ctx)
       VALUES ('non-box-abort',3,7,'inflight','{"model":"deepseek-v4-flash"}'::jsonb)`);
     assert.equal(await abortRequest("non-box-abort"),true);
-    const nonBox = (await query(`SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id='non-box-abort'`)).rows[0]!;
+    const nonBox = (await query("SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id='non-box-abort'")).rows[0]!;
     assert.deepEqual(nonBox,{ state: "aborted",credits: "0",ctx: { model: "deepseek-v4-flash" } },
       "ordinary non-Box abort retains its original journal result without Box metadata");
-    await query(`DELETE FROM request_finalize_journal WHERE request_id='non-box-abort'`);
+    await query("DELETE FROM request_finalize_journal WHERE request_id='non-box-abort'");
     const exerciseDisconnectedGap = async (requestId: string, ctx: unknown, count: number, tag: string) => {
       await resetGap(requestId,ctx);
       assert.equal(await abortRequest(requestId),true);
@@ -104,7 +107,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
         if (order === "abort-before-stop") assert.equal(await abortRequest(requestId),true);
         await stopGap();
         if (order === "stop-before-abort") assert.equal(await abortRequest(requestId),true);
-        const row = (await query(`SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!;
+        const row = (await query("SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!;
         assert.equal(row.state,"aborted"); assert.equal(row.credits,"0");
         assert.equal(row.ctx.boxState,"prestart_stopped"); assert.equal(row.ctx.boxRolloverCancelled,true);
         for (const key of ["boxTerminalProof","boxRunNonce","boxLeaseEpoch","boxLaunchPermit","boxPrelaunchControl"]) {
@@ -119,8 +122,12 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
       }
       await resetGap(requestId,ctx);
     };
-    let nonce = randomBytes(12).toString("hex"), epoch = randomBytes(16).toString("hex");
-    let localRound = 0, generations = 0, stops = 0, probeArm = false;
+    let nonce = randomBytes(12).toString("hex");
+    let epoch = randomBytes(16).toString("hex");
+    let localRound = 0;
+    let generations = 0;
+    let stops = 0;
+    let probeArm = false;
     const launch = async (requestId: string) => {
       nonce = randomBytes(12).toString("hex"); epoch = randomBytes(16).toString("hex");
       const identity = { requestId,uid: 3n,accountId: 20n,model,canonicalBody: body,
@@ -139,7 +146,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           "a changed admitted context cannot arm the new paid invocation");
         await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxContextHash}',to_jsonb($2::text))
           WHERE request_id=$1`,[requestId,identity.contextHash]);
-        const admitted = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+        const admitted = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
         for (const state of ["reserved","unknown","running"]) {
           for (const journalState of ["inflight","aborted"]) {
             await query(`UPDATE request_finalize_journal SET state=$3,final_credits=CASE WHEN $3='aborted' THEN 0 ELSE NULL END,
@@ -148,7 +155,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
               WHERE request_id=$1`,[requestId,state,journalState]);
             assert.equal(await abortRequest(requestId),false,"HTTP abort cannot close a physical admission");
             assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),journalState === "inflight");
-            const cancelled = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+            const cancelled = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
             assert.equal(cancelled.boxState,state,"even an aborted physical generation still requires cleanup proof");
             assert.equal(cancelled.boxTerminalProof,undefined);
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
@@ -175,15 +182,15 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             canonicalBody: { ...body,system: "changed context" } }),/BOX_TOOL_CONTEXT_CHANGED/);
           await assert.rejects(() => journal.claimToolResume({ requestId,uid: 3n,canonicalModel: model,
             canonicalBody: { ...body,tools: [{ ...body.tools![0]!,description: "changed catalog" }] } }),/BOX_TOOL_CATALOG_CHANGED/);
-          await query(`UPDATE turn_dispatches SET status='terminal' WHERE dispatch_id=$1`,[dispatchId]);
+          await query("UPDATE turn_dispatches SET status='terminal' WHERE dispatch_id=$1",[dispatchId]);
           await assert.rejects(() => journal.claimToolResume({ requestId,uid: 3n,canonicalModel: model,
             canonicalBody: body }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
-          await query(`UPDATE turn_dispatches SET status='accepted' WHERE dispatch_id=$1`,[dispatchId]);
+          await query("UPDATE turn_dispatches SET status='accepted' WHERE dispatch_id=$1",[dispatchId]);
           for (const key of ["billingPricing","boxInvocationRecovery"]) {
-            await query(`UPDATE request_finalize_journal SET ctx=ctx-$2::text WHERE request_id=$1`,[requestId,key]);
+            await query("UPDATE request_finalize_journal SET ctx=ctx-$2::text WHERE request_id=$1",[requestId,key]);
             await assert.rejects(() => journal.claimToolResume({ requestId,uid: 3n,canonicalModel: model,
               canonicalBody: body }),/BOX_TOOL_RESUME_JOURNAL_INVALID/);
-            await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(basis)]);
+            await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[requestId,JSON.stringify(basis)]);
           }
         }
         const decision = await journal.decideToolResume({ requestId,uid: 3n,canonicalModel: model,canonicalBody: body });
@@ -198,7 +205,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           await assert.rejects(() => journal.finishToolRollover({ requestId,uid: 3n,claim }),
             "claim and a missing proof never authorize another generation");
           const beforeFinishCtx = index === 128
-            ? (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx : undefined;
+            ? (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx : undefined;
           if (index === 128) {
             assert.equal(await abortRequest(requestId),true);
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,
@@ -212,13 +219,13 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             const beforeFinishIdle = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
             assert.equal(beforeFinishIdle.status,"failed","128 stopped rows plus one never-launched cancelled successor close before retirement");
             if (beforeFinishIdle.status === "failed") assert.equal(beforeFinishIdle.requestIds.length,129);
-            const closedGap = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
-            const forgedRevision = (claim.durableRevision[0] === "0" ? "1" : "0") + claim.durableRevision.slice(1);
+            const closedGap = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
+            const forgedRevision = `${claim.durableRevision[0] === "0" ? "1" : "0"}${claim.durableRevision.slice(1)}`;
             await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRolloverFrom,durableRevision}',to_jsonb($2::text))
               WHERE request_id=$1`,[requestId,forgedRevision]);
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,
               "pending","an unbound rollover receipt cannot authorize the extra idle component");
-            await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(closedGap)]);
+            await query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",[requestId,JSON.stringify(closedGap)]);
             await assert.rejects(() => journal.finishToolRollover({ requestId,uid: 3n,claim }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
             await admitNextUserAfterStop("roll-gap-before-finish");
             await exerciseDisconnectedGap(requestId,beforeFinishCtx,129,"before-finish");
@@ -234,7 +241,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
               runNonce: "5".repeat(24),leaseEpoch: "6".repeat(32),invocationMode: "detached_tool",
               contextHash: deriveBoxContextHash(otherBody),detachedRunnerHash: runner,catalogHash }),/BOX_CAPACITY_HELD/,
             "the stopped-to-admit gap still reserves one physical account slot");
-            await query(`DELETE FROM request_finalize_journal WHERE request_id='roll-competitor'`);
+            await query("DELETE FROM request_finalize_journal WHERE request_id='roll-competitor'");
             const changedBody = { ...body,system: "different model context" };
             await assert.rejects(() => journal.admit({ requestId,uid: 3n,accountId: 20n,model,
               canonicalBody: changedBody,fingerprint: deriveBoxCallFingerprint(3n,changedBody),
@@ -242,11 +249,23 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
               contextHash: deriveBoxContextHash(changedBody),detachedRunnerHash: runner,catalogHash }),/BOX_TOOL_ROLLOVER_FENCE_LOST/,
             "a receipt is bound to the exact next model context, not just the successor request id");
             assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 8n,sessionId: session,turnKey: turn }),false);
-            const gapBeforeStop = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+            const gapBeforeStop = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
+            // PostgreSQL bounds regex repetition at 255; the session contract allows 256.
+            for (const [length, closes] of [[256,true],[257,false]] as const) {
+              const boundarySession = "s".repeat(length);
+              await resetGap(requestId,{ ...gapBeforeStop,boxSessionId: boundarySession,
+                boxRolloverFrom: { ...gapBeforeStop.boxRolloverFrom,sessionId: boundarySession } });
+              assert.equal(await abortRequest(requestId),true,"session length must not make the abort SQL throw");
+              const boundary = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
+              assert.equal(boundary.boxState,closes ? "prestart_stopped" : undefined,
+                `a ${length}-character session must ${closes ? "close" : "retain the unresolved receipt"}`);
+              assert.equal(boundary.boxRolloverCancelled,closes ? true : undefined);
+            }
+            await resetGap(requestId,gapBeforeStop);
             await stopGap();
             await assert.rejects(() => launch(requestId),/BOX_TOOL_ROLLOVER_FENCE_LOST/,
               "a durable Stop in the generation gap wins over fresh admission");
-            const cancelled = (await query(`SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!;
+            const cancelled = (await query("SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!;
             assert.equal(cancelled.ctx.boxState,"prestart_stopped");
             assert.equal(cancelled.ctx.boxRolloverCancelled,true);
             for (const key of ["boxTerminalProof","boxRunNonce","boxLeaseEpoch","boxLaunchPermit","boxPrelaunchControl"]) {
@@ -260,7 +279,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             await exerciseDisconnectedGap(requestId,gapBeforeStop,1,"after-finish");
             await exerciseAbortStopGap(requestId,gapBeforeStop,1,"after-finish");
             // A row aborted by the previous deployment (without the new atomic marker) also closes on Stop.
-            await query(`UPDATE request_finalize_journal SET state='aborted',final_credits=0 WHERE request_id=$1`,[requestId]);
+            await query("UPDATE request_finalize_journal SET state='aborted',final_credits=0 WHERE request_id=$1",[requestId]);
             await stopGap();
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"failed");
             await resetGap(requestId,gapBeforeStop);
@@ -270,28 +289,28 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
                 WHERE request_id=$1`,[requestId,state]);
               assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false);
               assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
-              assert.equal((await query(`SELECT state FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.state,state);
+              assert.equal((await query("SELECT state FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.state,state);
               await resetGap(requestId,gapBeforeStop);
             }
             for (const marker of [{ boxRunNonce: "9".repeat(24) },{ boxLaunchPermit: true },
               { boxPrelaunchControl: {} },{ settlementClaimId: "11111111-1111-4111-8111-111111111111" }]) {
-              await query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(marker)]);
+              await query("UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1",[requestId,JSON.stringify(marker)]);
               assert.equal(await abortRequest(requestId),true);
-              if ("settlementClaimId" in marker) await query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(marker)]);
+              if ("settlementClaimId" in marker) await query("UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1",[requestId,JSON.stringify(marker)]);
               assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false);
               assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
               await resetGap(requestId,gapBeforeStop);
             }
-            await query(`UPDATE request_finalize_journal SET state='aborted',final_credits=1 WHERE request_id=$1`,[requestId]);
+            await query("UPDATE request_finalize_journal SET state='aborted',final_credits=1 WHERE request_id=$1",[requestId]);
             assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false,
               "a contradictory charged aborted row is never silently closed");
-            assert.equal((await query(`SELECT final_credits::text credits FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.credits,"1");
+            assert.equal((await query("SELECT final_credits::text credits FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.credits,"1");
             await resetGap(requestId,gapBeforeStop);
             for (const malformed of [null,{},"not-an-array"]) {
               await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRolloverFrom,resultHashes}',$2::jsonb)
                 WHERE request_id=$1`,[requestId,JSON.stringify(malformed)]);
               assert.equal(await abortRequest(requestId),true,"malformed receipt data cannot break the ordinary abort CAS");
-              assert.equal((await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx.boxState,undefined);
+              assert.equal((await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx.boxState,undefined);
               assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
               await resetGap(requestId,gapBeforeStop);
             }
@@ -299,7 +318,7 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
               WHERE request_id=$1`,[requestId]);
             assert.equal(await abortRequest(requestId),true);
             await assert.rejects(() => journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
-            const corrupt = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+            const corrupt = (await query("SELECT ctx FROM request_finalize_journal WHERE request_id=$1",[requestId])).rows[0]!.ctx;
             assert.equal(corrupt.boxState,undefined); assert.equal(corrupt.boxRolloverCancelled,undefined);
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
             // Restore only synthetic negative branches; no production Stop/financial record is reversed.
@@ -319,7 +338,8 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           proof: { runNonce: nonce,leaseEpoch: epoch,keeperPid: 101,cliPid: 102,
             reason: "worker_complete",revision: 1 } });
       } else {
-        const id = `toolu_roll_${index}`, input = { step: index };
+        const id = `toolu_roll_${index}`;
+        const input = { step: index };
         const content = [{ type: "tool_use",id,name: "Echo",input }];
         await journal.recordToolHandoff({ requestId,uid: 3n,leaseEpoch: epoch,roundNo: localRound,
           spoolOffset: localRound * 1000,detachedRunnerHash: runner,catalogHash,
@@ -331,9 +351,9 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           { role: "user",content: [{ type: "tool_result",tool_use_id: id,content: `result-${index}` }] }] } as ProxyBody;
       }
       // Synthetic already-settled amounts prove rollover never rewrites prior records.
-      await query(`UPDATE request_finalize_journal SET state='committed',final_credits=1 WHERE request_id=$1`, [requestId]);
-      await query(`INSERT INTO usage_records VALUES ($1,3,1,3)`, [requestId]);
-      await query(`INSERT INTO credit_ledger VALUES ($1,-1)`, [requestId]);
+      await query("UPDATE request_finalize_journal SET state='committed',final_credits=1 WHERE request_id=$1", [requestId]);
+      await query("INSERT INTO usage_records VALUES ($1,3,1,3)", [requestId]);
+      await query("INSERT INTO credit_ledger VALUES ($1,-1)", [requestId]);
     }
     assert.equal(generations,3); assert.equal(stops,2);
     const counts = await query(`SELECT COUNT(*)::int n,MAX(COALESCE((ctx->>'boxRoundNo')::int,1))::int max_round,

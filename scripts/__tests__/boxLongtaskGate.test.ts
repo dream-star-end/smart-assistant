@@ -26,6 +26,6 @@ test("long-task release proof rejects silent skip, missing behavior, truncation 
     complete.replace("ok 5 - authenticated route","ok 5 - authenticated route # SKIP unavailable DB"),
     complete.replace(titles[0]!,"unrelated passing test"),
     complete.replace("# tests 7","# tests 0"),
-    complete + "\n# tests 7",
+    `${complete}\n# tests 7`,
   ]) assert.throws(() => assertLongTaskTap(invalid));
 });

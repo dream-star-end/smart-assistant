@@ -20,7 +20,7 @@ import { preciseRetryEligible, interruptedContinuationTarget, exactUserReplayPay
 import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
-import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
+import { normalizeMessageReplyQuote, parsePlatformReasoningEffort } from "@openclaude/protocol/browser";
 import type { Agent } from "../lib/agents";
 import type { AuthSession } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
@@ -360,7 +360,8 @@ export function useChatCardActions({
         if (routing) {
           await sock.send({
             sessId: activeId, agentId: agent.id, text, media: replay.media, displayText: "继续",
-            model: routing.model, teamMode: routing.teamMode, effortLevel: routing.effortLevel,
+            model: routing.model, teamMode: routing.teamMode,
+            effortLevel: routing.effortLevel === null ? null : parsePlatformReasoningEffort(routing.effortLevel),
             collabMode: routing.collabMode, advisorModel: routing.advisorModel,
             collabConfigVersion: routing.collabConfigVersion,
             contextTier: routing.contextTier, serviceTier: routing.serviceTier,

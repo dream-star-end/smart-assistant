@@ -10,7 +10,7 @@ const user = { id: "u1", role: "user", text: "完成原目标", ts: 1, status: "
 const error = { id: "e1", role: "assistant", text: "", ts: 2, _errorCode: "insufficient_credits", _clientMessageId: "u1" } as ChatMessage;
 function setup(rows = [user, error]) {
   const auth = createMemoryAuthSession(() => {}, "token");
-  const sock = { getMessages: vi.fn(() => rows), continueInterruptedTurn: vi.fn(), send: vi.fn(async () => true) };
+  const sock = { getMessages: vi.fn((sessionId: string) => sessionId === "s1" ? rows : []), continueInterruptedTurn: vi.fn(), send: vi.fn(async () => true) };
   const input = {
     activeId: "s1", agent: { id: "main" }, authRef: { current: auth },
     identity: resolveIdentity(captureIdentityAttempt(auth, "token"), "alice"),

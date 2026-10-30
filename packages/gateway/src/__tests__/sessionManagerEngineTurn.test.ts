@@ -279,9 +279,9 @@ describe('long-task authority interruption keeps paid progress', () => {
       assert.doesNotMatch(JSON.stringify(captured.payloads), /private stale ticket|old-lease/);
     } finally {
       setV3MasterSinkSingleton(null);
-      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
       else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
       else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -365,9 +365,9 @@ describe('long-task authority interruption keeps paid progress', () => {
         } finally {
           acknowledge();
           setV3MasterSinkSingleton(null);
-          if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+          if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
           else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-          if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+          if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
           else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
           server.closeAllConnections();
           await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -397,9 +397,9 @@ describe('long-task authority interruption keeps paid progress', () => {
         [], [], [], [], [], false, true, true, false, 1), /synchronous engine submission failed/);
       assert.equal(authority.leaseEnvelope, 'fresh-lease');
     } finally {
-      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
       else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
       else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -439,9 +439,9 @@ describe('long-task authority interruption keeps paid progress', () => {
       assert.equal(captured.payloads[0]?.text, '已保存回答');
     } finally {
       setV3MasterSinkSingleton(null);
-      if (oldBase === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
+      if (oldBase === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL');
       else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = oldBase;
-      if (oldToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      if (oldToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN');
       else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = oldToken;
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -2663,11 +2663,67 @@ test("the real stopped narration projection has one Continue bound to its canoni
         const canonical = canonicalTaskContinuationError(messages, view);
         if (canonical && manualTaskContinuationSource(messages, view)) go(canonical.id);
       } }} onRespondPermission={() => {}} />);
-  const buttons = screen.getAllByRole("button", { name: "继续", exact: true });
+  const buttons = screen.getAllByRole("button", { name: "继续" });
   expect(buttons).toHaveLength(1);
   fireEvent.click(buttons[0]);
   expect(go).toHaveBeenCalledTimes(1);
   expect(go).toHaveBeenCalledWith(stopped.id);
   expect(messages).toEqual([user, stopped, tool]);
   expect(stopped._continuationSourceId).toBeUndefined();
+});
+
+
+test("real dispatch status keeps one Continue before its hidden duplicate engine error", async () => {
+  const user = row("double-failure-human", "user", "原始部署目标", { status: "error", _source: "server" });
+  const status = row("turn-status:double-failure-human", "system", "", {
+    _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+    _errorCode: "dispatch_lost", _clientMessageId: user.id });
+  const duplicate = row("double-failure-error", "assistant", "", {
+    _source: "server", _errorCode: "ENGINE_ERROR", _clientMessageId: user.id });
+  const messages = [user, status, duplicate];
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(status);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("eleven real failed attempts render one final status and Continue while all 33 raw rows survive", async () => {
+  const messages: ChatMessage[] = [];
+  for (let attempt = 0; attempt <= 10; attempt++) {
+    const id = `dispatch-attempt-${attempt}`;
+    messages.push(row(id, "user", attempt ? "RECOVERY_CONTROL" : "原始目标", {
+      status: "error", _source: "server", ts: 1_700_000_000_000 + attempt * 3,
+      ...(attempt ? { _recoveryOfClientMessageId: `dispatch-attempt-${attempt - 1}`, _recoveryMode: "replay" as const,
+        _automaticRecovery: true, _automaticRecoveryRootClientMessageId: "dispatch-attempt-0",
+        _automaticRecoveryAttempt: attempt, _automaticRecoveryMax: 10 } : {}) }),
+    row(`turn-status:${id}`, "system", "", { _source: "server", _turnStatusRecord: true, _dispatchTerminal: true,
+      _errorCode: "dispatch_lost", _clientMessageId: id, ts: 1_700_000_000_001 + attempt * 3 }),
+    row(`duplicate:${id}`, "assistant", "", { _source: "server", _errorCode: "ENGINE_ERROR",
+      _clientMessageId: id, ts: 1_700_000_000_002 + attempt * 3 }));
+  }
+  const before = JSON.stringify(messages);
+  const go = vi.fn();
+  renderList(messages, { cb: {
+    resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view), onContinueInterrupted: go,
+  } });
+  const buttons = await screen.findAllByRole("button", { name: "继续" });
+  expect(buttons).toHaveLength(1);
+  expect(screen.getAllByText("消息未开始处理")).toHaveLength(1);
+  expect(screen.queryByText("任务执行失败")).toBeNull();
+  expect(screen.queryByText("RECOVERY_CONTROL")).toBeNull();
+  expect(manualTaskContinuationSource(messages, messages[31])).toBe(messages[0]);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(messages[31]);
+  expect(messages).toHaveLength(33);
+  expect(JSON.stringify(messages)).toBe(before);
 });

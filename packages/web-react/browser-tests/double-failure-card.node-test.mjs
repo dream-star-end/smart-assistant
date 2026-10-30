@@ -82,16 +82,29 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
           frameSeq: ++scenario.seq, blocks: [{ kind: "text", text: "DOUBLE_CARD_CONTINUED" }], isFinal: true });
         return;
       }
-      if (frame.content?.recovery?.automatic === true) scenario.attempts.push(frame.content.recovery.attempt);
+      const recovery = frame.content?.recovery;
+      if (recovery?.automatic === true) scenario.attempts.push(recovery.attempt);
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
       const ts = Date.now();
-      // The same failed turn as the server stores it: the verified status record
-      // (dispatch never started, not billed) and the assistant error row.
-      preview.store.board = structuredClone([
-        { id, role: "user", text: frame.content.text, status: "error", ts, _source: "server", _routing: { model: "glm-5.2", effortLevel: "high", teamMode: false } },
+      // Match PG admission: append every user/dispatch-status/error, retaining
+      // the original human goal and the exact recovery metadata from the frame.
+      // The renderer must fold intermediate failures without deleting raw rows.
+      preview.store.board.push(...structuredClone([
+        { id, role: "user", text: frame.content.text, status: "error", ts, _source: "server",
+          _routing: { model: "glm-5.2", effortLevel: "high", teamMode: false },
+          ...(recovery ? {
+            _recoveryOfClientMessageId: recovery.sourceClientMessageId,
+            _recoveryMode: recovery.mode,
+            _automaticRecovery: recovery.automatic,
+            ...(recovery.automatic ? {
+              _automaticRecoveryRootClientMessageId: recovery.rootClientMessageId,
+              _automaticRecoveryAttempt: recovery.attempt,
+              _automaticRecoveryMax: recovery.max,
+            } : {}),
+          } : {}) },
         { id: `turn-status:${id}`, role: "system", text: "", _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: "dispatch_lost", ts: ts + 1, _source: "server", _clientMessageId: id },
         { id: `error-${id}`, role: "assistant", text: "", _errorCode: "ENGINE_ERROR", ts: ts + 2, _source: "server", _clientMessageId: id },
-      ]);
+      ]));
       preview.store.revision += 1;
       send({ type: "outbound.error", peer, sessionKey, clientMessageId: id, frameSeq: ++scenario.seq, code: "ENGINE_ERROR", message: "Context exhausted", isFinal: true, ts: ts + 2 });
     });
@@ -118,6 +131,17 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
         await new Promise((done) => setTimeout(done, 1500));
         assert.deepEqual(scenario.attempts, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "automatic retry lineage climbs 1..10 and stops");
         assert.equal(scenario.sent.length, 11, "the original send plus exactly ten automatic retries");
+        assert.equal(preview.store.board.length, 33, "all eleven raw user/status/error triplets survive server echoes");
+        assert.equal(preview.store.board[0].id, scenario.sent[0], "the original human goal is retained");
+        assert.equal(preview.store.board[0].text, "DOUBLE_CARD_REQUEST");
+        const recoveredUsers = preview.store.board.filter((row) => row.role === "user" && row._automaticRecovery === true);
+        assert.deepEqual(recoveredUsers.map((row) => row._automaticRecoveryAttempt), [1,2,3,4,5,6,7,8,9,10]);
+        for (const row of recoveredUsers) {
+          assert.ok(scenario.sent.includes(row._recoveryOfClientMessageId), "recovery source is a retained admitted user");
+          assert.equal(row._automaticRecoveryRootClientMessageId, scenario.sent[0]);
+          assert.equal(row._automaticRecoveryMax, 10);
+          assert.ok(row._recoveryMode === "replay" || row._recoveryMode === "checkpoint");
+        }
         const body = await page.locator("body").innerText();
         assert.equal(await page.getByText("消息未开始处理", { exact: true }).count(), 1, "the unbilled status card is shown once");
         assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0, "the second red card of the same failure is not shown");

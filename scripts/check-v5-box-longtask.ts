@@ -30,7 +30,8 @@ const PASS = "[biz-longtask-box-generations] PASS — 260 requests span 128/128/
 const MAX_OUTPUT = 8 * 1024 * 1024;
 function fail(reason: string): never { throw new Error(`[box-longtask] ${reason}`); }
 function candidateFile(path: string): string {
-  const file = realpathSync(join(ROOT,path)), rel = relative(ROOT,file);
+  const file = realpathSync(join(ROOT,path));
+  const rel = relative(ROOT,file);
   if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) fail("CANDIDATE_ESCAPE");
   return file;
 }
@@ -50,7 +51,8 @@ function number(tap: string, name: string): number {
 export function assertLongTaskTap(tap: string): { tests: number; pass: number; skipped: number } {
   const plans = [...tap.matchAll(/^1\.\.([0-9]+)$/gm)];
   const points = [...tap.matchAll(/^(ok|not ok) ([0-9]+)(?: - [^\n]*)?$/gm)];
-  const tests = number(tap,"tests"), pass = number(tap,"pass");
+  const tests = number(tap,"tests");
+  const pass = number(tap,"pass");
   if (plans.length !== 1 || Number(plans[0]![1]) !== points.length
     || points.length === 0 || points.some((p,i) => p[1] !== "ok" || Number(p[2]) !== i+1)
     || tests < 7 || pass !== tests) fail("TAP_EXECUTION_INCOMPLETE");
@@ -87,7 +89,10 @@ async function main(): Promise<void> {
     const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((resolve,reject) => {
       const child = spawn(process.execPath,["--import","tsx","--test","--test-concurrency=1","--test-force-exit",...files],
         { cwd: ROOT,env,stdio: ["ignore","pipe","pipe"],detached: true });
-      let stdout = "",stderr = "",bytes = 0,timedOut = false;
+      let stdout = "";
+      let stderr = "";
+      let bytes = 0;
+      let timedOut = false;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const stop = () => {
         if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;

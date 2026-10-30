@@ -2884,7 +2884,7 @@ function hydrateTapeRecord(
   );
 }
 
-export { type HydratedRuntimeBatchDescriptor } from "./runtimeBatch.js";
+export type { HydratedRuntimeBatchDescriptor } from "./runtimeBatch.js";
 
 /** Raw continuity uses the same immutable batch validators as normal tape reads. */
 export function readCcbNativeRestoreArchive(pool: Pool | PoolClient, owner: string,

@@ -1511,7 +1511,7 @@ describe("t1360u current interruption keeps a single Continue", () => {
       const onRegenerate = vi.fn();
       render(<AssistantCard msg={msg} ctx={{ isLast: false, sending: false, inActiveTurn: true, turnFinalAssistant: false }}
         cb={{ resolveInterruptedContinuation: () => userMsg({}), onContinueInterrupted, onRegenerate }} />);
-      const action = await screen.findByRole("button", { name: "继续", exact: true });
+      const action = await screen.findByRole("button", { name: "继续" });
       fireEvent.click(action);
       expect(onContinueInterrupted).toHaveBeenCalledWith(msg);
       expect(onRegenerate).not.toHaveBeenCalled();

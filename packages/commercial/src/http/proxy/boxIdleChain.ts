@@ -333,15 +333,16 @@ function singleRevision(input: { sessionId: string; turnKey: string }, chain: Id
  * physical round. Only its exact 128-row, proof-closed predecessor can
  * authorize this additional idle component before retirement commits. */
 function cancelledRolloverExtra(row: IdleChainRow, byId: Map<string,IdleChainRow>): boolean {
-  const ctx = row.ctx, receipt = unadmittedToolRollover(ctx,row.requestId);
+  const ctx = row.ctx;
+  const receipt = unadmittedToolRollover(ctx,row.requestId);
   if (!receipt || ctx.boxState !== "prestart_stopped" || ctx.boxRolloverCancelled !== true
     || !["inflight","aborted"].includes(row.state)
     || (row.finalCredits != null && row.finalCredits !== "0")) return false;
   const prior = byId.get(receipt.ownerRequestId);
   if (!prior || prior.ctx.boxRecoveredBy !== row.requestId
     || !isDeepStrictEqual(prior.ctx.boxRolloverTo,receipt)) return false;
-  let proof;
-  try { proof = parseBoxTerminalProof(JSON.stringify(prior.ctx.boxTerminalProof)+"\n",
+  let proof: ReturnType<typeof parseBoxTerminalProof>;
+  try { proof = parseBoxTerminalProof(`${JSON.stringify(prior.ctx.boxTerminalProof)}\n`,
     { runNonce: receipt.runNonce,leaseEpoch: receipt.leaseEpoch }); }
   catch { return false; }
   if (proof.reason === "worker_complete") return false;

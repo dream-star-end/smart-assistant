@@ -11,7 +11,7 @@ import { startPreviewServer } from './process-disclosure-app-server.mjs';
 import { BOARD_SESSION } from './process-disclosure-story.mjs';
 import { resolveBrowserExecutable } from '../../../scripts/lib/resolve-browser.mjs';
 import { attachLongtaskWebSocket, createLongtaskScenario, LONGTASK_CONTEXT,
-  LONGTASK_PARTIAL, LONGTASK_TOOL_FILE, LONGTASK_FINISHED } from './longtask-continue-fixture.mjs';
+  LONGTASK_PARTIAL, LONGTASK_TOOL_FILE, LONGTASK_TOOL_RESULT, LONGTASK_FINISHED } from './longtask-continue-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const { build } = require('esbuild');
@@ -29,14 +29,51 @@ async function until(label, predicate, ms = 20_000) {
 }
 
 async function revealCompletedTool(page) {
-  // Settled process rows intentionally unmount while collapsed. Exercise the
-  // real disclosure control before checking the completed tool's filename.
-  if (await page.getByText(LONGTASK_TOOL_FILE, { exact: false }).count() === 0) {
-    for (const toggle of await page.getByTestId('process-toggle').all()) {
-      if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
-    }
+  // Real process UI has two disclosure levels: the turn shell and its tool
+  // group. Both deliberately unmount their children while collapsed.
+  for (const toggle of await page.getByTestId('process-toggle').all()) {
+    if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
   }
-  await page.getByText(LONGTASK_TOOL_FILE, { exact: false }).first().waitFor();
+  await page.getByTestId('process-detail-toggle').first().waitFor();
+  for (const toggle of await page.getByTestId('process-detail-toggle').all()) {
+    if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+  }
+  const step = page.getByTestId('tool-step').filter({ hasText: LONGTASK_TOOL_FILE });
+  await step.waitFor();
+  await step.getByText(LONGTASK_TOOL_FILE, { exact: false }).waitFor();
+  const input = step.getByRole('button', { name: /读取文件/ }).first();
+  if (await input.getAttribute('aria-expanded') === 'false') await input.click();
+  await step.getByText(LONGTASK_TOOL_RESULT, { exact: true }).waitFor();
+  assert.equal(await step.getByText(LONGTASK_TOOL_RESULT, { exact: true }).isVisible(), true,
+    'the completed Read result is readable through the real process controls');
+}
+
+async function revealPaidCredits(page, screenshot) {
+  // With an action row, touch devices show billing only in the real More menu.
+  // Scope by the raw amount but assert the user's visible menu/metadata text.
+  const row = page.getByTestId('assistant-row').filter({
+    has: page.locator('[aria-label="消耗 71 积分"]'),
+  });
+  await row.waitFor();
+  const more = row.getByRole('button', { name: '更多操作', exact: true });
+  if (await more.count() > 0) {
+    await more.click();
+    const menu = page.getByRole('menu', { name: '消息操作', exact: true });
+    await menu.waitFor();
+    const credits = menu.getByLabel('消耗 71 积分', { exact: true });
+    await credits.waitFor();
+    assert.equal((await credits.innerText()).trim(), '71 积分');
+    await screenshot();
+    await page.keyboard.press('Escape');
+    await menu.waitFor({ state: 'hidden' });
+    return;
+  }
+  // A bodyless pre-fix error has no action row; its standalone metadata is
+  // already visible. Keep this path so RED still fails on its body/billing copy.
+  const credits = row.getByLabel('消耗 71 积分', { exact: true });
+  await credits.waitFor();
+  assert.equal((await credits.innerText()).trim(), '71 积分');
+  await screenshot();
 }
 
 async function cachedSessionDiagnostic(page) {
@@ -137,7 +174,7 @@ test('t1360u real App: paid and zero-output tasks continue in the original conve
             stage = 'paid-output-and-billing';
             // These pre-click anchors distinguish the known pre-fix renderer
             // from an unavailable App, missing action, build error or timeout.
-            await page.getByText('71 积分', { exact: true }).first().waitFor();
+            await revealPaidCredits(page, () => screenshot('billing'));
             paidAnchorReady = true;
             assert.equal(await page.getByText(LONGTASK_PARTIAL, { exact: true }).isVisible(), true,
               'LONGTASK_RED_ANCHOR_PARTIAL: LONGTASK_PARTIAL must remain visible before Continue');
@@ -183,6 +220,7 @@ test('t1360u real App: paid and zero-output tasks continue in the original conve
           if (kind === 'paid') {
             await page.getByText(LONGTASK_PARTIAL, { exact: true }).waitFor();
             await revealCompletedTool(page);
+            await revealPaidCredits(page, () => screenshot('billing-reloaded'));
           }
           assert.equal(scenario.frames.length, 1, 'reload never resends the continuation');
           assert.deepEqual(errors, []);

@@ -204,7 +204,7 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
  const drop=at('  master_gate_db_drop\n');
  assert.ok(wait<idle&&idle<db&&db<drop);
  const marks=[...b.matchAll(/^ {2}tsum_mark (C\.[a-z-]+) /gm)].map(x=>[x[1],x.index]);
- const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.ccb-mcp']);
+ const after=new Set(['C.box-success-recovery','C.box-continuation','C.box-incident-proofs','C.box-longtask','C.ccb-mcp']);
  // P3 aggregates overlapping jobs under C.parallel; each still has its own receipt.
  assert.deepEqual(marks.map(x=>x[0]),['C.parallel',...after]);
  const queued=[...b.matchAll(/^ {4}(C\.[a-z-]+):master_job_/gm)].map(x=>x[1]);
@@ -218,7 +218,7 @@ test('P2: bg build starts after admission; non-Box gates overlap it; Box gates a
   else assert.ok(i<boxMark,`${n} overlaps the runtime build`);
  }
  // every Box gate and the ccb-mcp gate command is after the await; every DB gate is between create and drop
- for(const g of['check-v5-box-success-recovery.ts','check-v5-box-continuation.ts','check-v5-box-incident-proofs.ts','check-v5-ccb-mcp-availability.ts'])
+ for(const g of['check-v5-box-success-recovery.ts','check-v5-box-continuation.ts','check-v5-box-incident-proofs.ts','check-v5-box-longtask.ts','check-v5-ccb-mcp-availability.ts'])
   for(const x of b.matchAll(new RegExp(g.replaceAll('.','\\.'),'g')))assert.ok(x.index>idle,g);
  for(const x of b.matchAll(/TEST_DATABASE_URL="\$MASTER_GATE_DB_URL"/g))assert.ok(x.index>db&&x.index<drop);
  assert.ok(at('  tsum_mark C.ccb-mcp ')>drop&&at('  tsum_mark C.ccb-mcp ')<at('\n  cleanup_master_gate_tmpdir\n'));
