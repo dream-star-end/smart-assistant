@@ -351,16 +351,53 @@ export function ModelSelector({
     return parts.length > 0 ? parts.join(' · ') : null
   })()
   const disabled = Boolean(loading || teamEngineActive || (models.length === 0 && lockedModels.length === 0))
-  const rows = modelPickerRows(models, lockedModels)
-  // 「最近」(OCV5-150):最近选过的 3 个模型。按目录顺序排,当前选中的也留在里面,并从下面的全部列表里拿掉:
-  // 同一个模型不再出现两次(体验官 10-29「GPT-6.1-Sol 出现两次」;C-27 同家族档位重复),选来选去「最近」也
-  // 不按使用先后来回换位(「顺序跳」)。家族行有任一成员选过就算;锁定行不进。全部模型都在「最近」时不分组。
+  const rawRows = modelPickerRows(models, lockedModels)
+  const pickerRowLabel = (row: (typeof rawRows)[number]): string => {
+    if (row.kind === 'plain') return modelLabel(row.model)
+    if (row.kind === 'locked-plain') return lockedPlainLabel(row.model)
+    return row.row.label
+  }
+  const pickerRowHasId = (row: (typeof rawRows)[number], id: string | undefined): boolean => {
+    if (!id) return false
+    if (row.kind === 'plain') return row.model.id === id
+    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
+    return row.row.members.some((m) => m.id === id)
+  }
+  const pickerRowUsable = (row: (typeof rawRows)[number]): boolean => {
+    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
+    if (row.kind === 'plain') return !isDegraded(row.model)
+    return !row.row.members.every(isDegraded)
+  }
+  // 「最近」(OCV5-150) + 同展示名去重(U3):
+  // 1) 同展示名(如官方 grok-build 与 Cursor cursor-grok-4.7-* 同为「Grok 4.7」,或同名双 id)只保留一行,
+  //    遵循 rawRows 优先级(可用 → 锁定 → 降级,同级按目录顺序);若后一行命中当前 selectedId 且可用性不低于已留行,
+  //    则改留当前选中行以保持 ✓ 与档位控件一致;任一同名行命中 recentIds 均把该展示名计入「最近」。
+  // 2) 「最近」按目录顺序排,当前选中也留在组内并从下方列表移除;锁定行不进;全部模型都在「最近」时不分组。
   const recentIds = readRecentModels()
-  const recentPicked = rows.filter((row) =>
-    row.kind === 'plain'
-      ? recentIds.includes(row.model.id)
-      : (row.kind === 'cursor-family' || row.kind === 'context-family' || row.kind === 'grok-build-family') &&
-        row.row.members.some((m) => recentIds.includes(m.id)),
+  const rows: typeof rawRows = []
+  const rowIndexByLabel = new Map<string, number>()
+  const recentLabels = new Set<string>()
+  for (const row of rawRows) {
+    const key = pickerRowLabel(row).trim()
+    if (recentIds.some((id) => pickerRowHasId(row, id))) {
+      recentLabels.add(key)
+    }
+    const existingIdx = rowIndexByLabel.get(key)
+    if (existingIdx === undefined) {
+      rowIndexByLabel.set(key, rows.length)
+      rows.push(row)
+    } else if (
+      pickerRowHasId(row, selectedId) &&
+      (pickerRowUsable(row) || !pickerRowUsable(rows[existingIdx]!))
+    ) {
+      rows[existingIdx] = row
+    }
+  }
+  const recentPicked = rows.filter(
+    (row) =>
+      row.kind !== 'locked-plain' &&
+      row.kind !== 'locked-cursor-family' &&
+      recentLabels.has(pickerRowLabel(row).trim()),
   )
   const recentRows = recentPicked.length < rows.length ? recentPicked : []
   const {
@@ -393,7 +430,7 @@ export function ModelSelector({
   const showCollapsedGroup = collapsedRows.length > 0
   const [, setRecentTick] = useState(0)
   const selectedPromo = promoLabelOf(selected)
-  const selectedFamilyRow = rows.find(
+  const selectedFamilyRow = rawRows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
   )
   const cursorMembers =
@@ -411,7 +448,7 @@ export function ModelSelector({
     isGrokBuildCatalogId(selectedId) &&
     models.some((model) => model.id === GROK_BUILD_MODEL_ID) &&
     models.some((model) => model.id === GROK_BUILD_FAST_MODEL_ID)
-  const selectedContextRow = rows.find(
+  const selectedContextRow = rawRows.find(
     (row) => row.kind === 'context-family' && row.row.family === selectedContext?.family,
   )
   const contextMembers =
