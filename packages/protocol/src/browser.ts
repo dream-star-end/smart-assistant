@@ -51,3 +51,4 @@ export { measureLogWrite, takeLogWriteTimingSnapshot } from './logWriteTiming.js
 export * from './upstreamRetryHint.js'
 export * from './ccbTranscriptRestore.js'
 export * from './automaticRetryStatus.js'
+export * from './advisorReadOnly.js'
