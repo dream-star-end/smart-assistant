@@ -93,16 +93,19 @@ export function useSessionModelAndCollab({
   const prevDraftContextRef = useRef({
     activeId,
     auth,
+    defaultModel: modelPrefs.default_model,
     defaultModelUpdatedAt: modelPrefs.default_model_updated_at,
   });
   if (
     prevDraftContextRef.current.activeId !== activeId ||
     prevDraftContextRef.current.auth !== auth ||
+    prevDraftContextRef.current.defaultModel !== modelPrefs.default_model ||
     prevDraftContextRef.current.defaultModelUpdatedAt !== modelPrefs.default_model_updated_at
   ) {
     prevDraftContextRef.current = {
       activeId,
       auth,
+      defaultModel: modelPrefs.default_model,
       defaultModelUpdatedAt: modelPrefs.default_model_updated_at,
     };
     draftExplicitModelRef.current = false;
@@ -126,7 +129,14 @@ export function useSessionModelAndCollab({
     }
     if (draftExplicitModelRef.current) return;
     setModelId(newSessionDefaultModel);
-  }, [demo, models, activeId, newSessionDefaultModel]);
+  }, [
+    demo,
+    models,
+    activeId,
+    newSessionDefaultModel,
+    modelPrefs.default_model,
+    modelPrefs.default_model_updated_at,
+  ]);
 
   // 显式选择模型:活动会话存在则写通三持有方(服务端经 queueModelPatch:选择即挂 pending
   // 意图压制一切在途旧载荷 + 单飞串行合并 PATCH,同时消掉「旧响应迟到盖回」与「连选

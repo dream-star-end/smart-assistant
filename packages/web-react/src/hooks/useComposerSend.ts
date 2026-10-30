@@ -57,6 +57,7 @@ export type ComposerSendInput = {
   projectHome: ProjectRoute | null;
   promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
+  queueModelPatch: (sessId: string, modelId: string) => void;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   serviceTier: "fast" | null;
@@ -103,6 +104,7 @@ export function useComposerSend({
   projectHome,
   promoteDraftCollab,
   publicCfg,
+  queueModelPatch,
   selectedSessionIdRef,
   sendImplicitRatingRef,
   serviceTier,
@@ -287,9 +289,8 @@ export function useComposerSend({
       const existingHasModel = Boolean(sessions.find((session) => session.id === sessionId)?.modelId);
       if ((materializedDraft || (!createdSession && !existingHasModel)) && modelId) {
         sockRef.current?.setSessionModel(sessionId, modelId);
-        void api.patchSessionModel(authRef.current, sessionId, modelId).catch(() => {
-          // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会携带已定格的 socket 模型。
-        });
+        // 与 selectModel 共用 queueModelPatch 同会话单飞队列/水位，避免首发在途 PATCH 后落库覆盖用户随后的显式换模。
+        if (!demo) queueModelPatch(sessionId, modelId);
       }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略(null=显式清除回模型默认),让模型沿用自身默认。
@@ -403,6 +404,7 @@ export function useComposerSend({
       setActiveId,
       applyCollabDoc,
       promoteDraftCollab,
+      queueModelPatch,
       toast,
       setDraftProject,
     ],
