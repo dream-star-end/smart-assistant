@@ -1,8 +1,9 @@
 /**
  * Pre-dispatch content record. Never blocks the current user message.
  * A session stops only after an admin bans it.
- * An optional prefilter may record a hard violation before JEV. A miss,
- * a missing key, or a prefilter error still falls through to JEV.
+ * An optional prefilter may record a hard violation before JEV. The prefilter
+ * keeps its own short timeout. JEV's timeout starts only after that call
+ * settles, so a slow miss, error, or timeout still falls through to JEV.
  */
 import { createHash } from 'node:crypto'
 
@@ -155,7 +156,6 @@ export async function runUserContentReview(input: {
   if (!key) return null
   if (inflight >= MAX_INFLIGHT) return null
   inflight += 1
-  const signal = AbortSignal.timeout(testDeps?.timeoutMs ?? 1500)
   try {
     if (prefilter) {
       let hit = false
@@ -172,6 +172,9 @@ export async function runUserContentReview(input: {
         }, '前置免费审核判定为硬违规。')
       }
     }
+    // The prefilter has its own timeout. Start JEV's budget only after it
+    // settles, so a slow miss, failure, or timeout cannot abort this review.
+    const signal = AbortSignal.timeout(testDeps?.timeoutMs ?? 1500)
     const body = JSON.stringify({
       model: 'typesafe-ai/jev',
       state: text.slice(0, 12_000),

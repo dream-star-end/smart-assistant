@@ -84,6 +84,25 @@ describe("omniHardHit", () => {
     assert.equal(seen.length, 1);
   });
 
+  test("uses its own short timeout and returns a miss when the call aborts", async () => {
+    const started = Date.now();
+    const result = await omniHardHit({
+      apiKey: "sk-test-not-a-real-key-9876",
+      text: "ordinary coding help please",
+      timeoutMs: 40,
+      fetchImpl: (_url, init) => new Promise((_resolve, reject) => {
+        const safety = setTimeout(() => reject(new Error("moderation timeout did not fire")), 2_000);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(safety);
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }, { once: true });
+      }),
+    });
+    assert.equal(result.hit, false);
+    assert.deepEqual(result.categories, []);
+    assert.ok(Date.now() - started < 1_500);
+  });
+
   test("a failed or empty moderation call falls through", async () => {
     const http = await omniHardHit({
       apiKey: "sk-test-not-a-real-key-9876",
