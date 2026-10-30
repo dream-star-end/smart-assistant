@@ -542,8 +542,13 @@ describe("PermissionCard 工具展示(F5/M7)", () => {
     );
     await waitFor(() => expect(screen.getByText("同题？")).toBeInTheDocument());
     fireEvent.click(screen.getByText("左"));
-    reopenPermissionUi("req-same-b");
-    await waitFor(() => expect(screen.getByRole("button", { name: "提交" })).toBeInTheDocument());
+    // 外部协调器通知须等 React 提交；相同题干和按钮不能标识新请求。
+    act(() => reopenPermissionUi("req-same-b"));
+    await waitFor(() => expect(screen.getByTestId("permission-modal-host"))
+      .toHaveAttribute("data-permission-request", "req-same-b"));
+    expect(onRespond).not.toHaveBeenCalled();
+    expect(screen.getByRole("radio", { name: "左" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("radio", { name: "右" })).toHaveAttribute("aria-checked", "false");
     fireEvent.click(screen.getByRole("button", { name: "提交" }));
     expect(onRespond).not.toHaveBeenCalled();
     fireEvent.click(screen.getByText("右"));
