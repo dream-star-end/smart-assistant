@@ -5,6 +5,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { asSessionId } from '../../types/ids.js'
 
 const root = mkdtempSync(join(tmpdir(), 'idle-loader-'))
 process.env.CLAUDE_CONFIG_DIR = join(root, 'config')
@@ -30,7 +31,7 @@ function message(uuid: string, content: string | Array<Record<string, unknown>>,
 }
 
 async function runCase(sessionId: string, messages: ReturnType<typeof message>[], summary: string | undefined) {
-  switchSession(sessionId, join(root, 'config', 'projects', 'p'))
+  switchSession(asSessionId(sessionId), join(root, 'config', 'projects', 'p'))
   const { recordTranscript, resetSessionFilePointer } = await import('../../utils/sessionStorage.js')
   await resetSessionFilePointer()
   await recordTranscript(messages as never)

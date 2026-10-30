@@ -1,5 +1,6 @@
 /** Optional, conservative native idle fit. This never changes the transcript. */
 import type { Message } from '../../types/message.js'
+import type { Attachment } from '../../utils/attachments.js'
 import { normalizeAttachmentForAPI } from '../../utils/messages.js'
 import { getAuthorityModelCapabilities } from '../../utils/model/staticKeyModels.js'
 import { BOX_API_OUTPUT_TOKENS, BOX_NATIVE_CONTEXT_MODELS } from '../../utils/model/boxNativeRemoteContext.js'
@@ -81,16 +82,24 @@ export async function buildIdleNativeFit(
       }
       return true
     }
-    for (const message of messages) {
+    // model-provider keeps attachments open at the internal message boundary.
+    // This is the same producer contract used by the API normalizer; projected
+    // content is still checked below, and malformed input keeps the old path.
+    const estimateRows: Parameters<typeof roughTokenCountEstimationForMessages>[0] = messages.map(message => ({
+      type: message.type, message: message.message,
+      attachment: message.attachment as Attachment | undefined,
+    }))
+    for (const message of estimateRows) {
       if (message.type === 'user' || message.type === 'assistant') {
-        if (!await contentCovered(message.message.content)) return undefined
+        if (!message.message || !await contentCovered(message.message.content)) return undefined
       } else if (message.type === 'attachment') {
+        if (!message.attachment) return undefined
         for (const projected of normalizeAttachmentForAPI(message.attachment)) {
           if (!await contentCovered(projected.message.content)) return undefined
         }
       }
     }
-    const outer = roughTokenCountEstimationForMessages(messages)
+    const outer = roughTokenCountEstimationForMessages(estimateRows)
     const observed = tokenCountWithEstimation(messages)
     if (![outer, observed].every(n => Number.isFinite(n) && n >= 0)) return undefined
     // Full outer content prevents a compacted inner leaf's low usage hiding it.

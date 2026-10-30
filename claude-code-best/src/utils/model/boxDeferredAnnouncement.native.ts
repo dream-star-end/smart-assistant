@@ -70,10 +70,10 @@ async function openSession(sessionId: string) {
   await resetSessionFilePointer()
 }
 
-function stamp(messages: { timestamp?: string }[]) {
+function stamp<T extends object>(messages: T[]) {
   const start = Date.now()
   messages.forEach((message, index) => {
-    message.timestamp = new Date(start + index * 1000).toISOString()
+    Object.assign(message, { timestamp: new Date(start + index * 1000).toISOString() })
   })
   return messages
 }
@@ -146,7 +146,7 @@ async function runQuery(messages: unknown[], model = MODEL) {
     systemPrompt: asSystemPrompt([]),
     userContext: {},
     systemContext: {},
-    canUseTool: async (_tool: unknown, input: unknown) => ({ behavior: 'allow', updatedInput: input }),
+    canUseTool: async (_tool, input) => ({ behavior: 'allow', updatedInput: input }),
     toolUseContext: toolContext as never,
     querySource: 'sdk',
     maxTurns: 1,

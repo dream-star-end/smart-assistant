@@ -194,9 +194,12 @@ export function scopedBoxDescriptor(): { value: string | undefined } | undefined
 }
 
 /** Only an identical authority envelope may refresh its original lease. */
-export function renewBoxAgentOrigins(variables: Record<string, string>): void {
-  if (!Object.hasOwn(variables, 'ANTHROPIC_CUSTOM_HEADERS')) return
-  const next = parseHeaders(variables.ANTHROPIC_CUSTOM_HEADERS)
+export function renewBoxAgentOrigins(variables: unknown): void {
+  if (!variables || typeof variables !== 'object'
+    || !Object.hasOwn(variables, 'ANTHROPIC_CUSTOM_HEADERS')) return
+  const headers = (variables as Record<string, unknown>).ANTHROPIC_CUSTOM_HEADERS
+  if (typeof headers !== 'string') return
+  const next = parseHeaders(headers)
   if (!next['x-oc-model-authority'] || !next['x-oc-turn-lease']) return
   for (const scope of scopes.values()) {
     if (!scope.closed && scope.origin.headers['x-oc-model-authority'] === next['x-oc-model-authority']) {

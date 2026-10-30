@@ -105,7 +105,7 @@ test('three crash cuts keep one summary and the same tail', async () => {
   const stored: Array<Record<string, unknown>> = []
   await applyIdleTranscript({
     sessionId, artifact, messages: artifact.messages as never,
-    record: async (rows) => { stored.push(...rows as never) },
+    record: async (rows) => { stored.push(...rows) },
     flush: async () => {},
     load: async () => ({ messages: stored as never }),
   })

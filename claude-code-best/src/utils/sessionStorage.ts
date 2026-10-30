@@ -1241,7 +1241,7 @@ class Project {
           entrypoint: getEntrypoint(),
           cwd: getCwd(),
           sessionId,
-          timestamp: preserveMessageTimestamp && message.timestamp
+          timestamp: preserveMessageTimestamp && typeof message.timestamp === 'string' && message.timestamp
             ? message.timestamp
             : new Date().toISOString(),
           version: VERSION,

@@ -139,7 +139,7 @@ export class BoxExecTransport {
       let pending = Buffer.alloc(0), stdout = "", stderrBytes = 0;
       let total = 0, exitCode: number | null = null, sawEnd = false;
       for (;;) {
-        let chunk: ReadableStreamReadResult<Uint8Array>;
+        let chunk: { done: false; value: Uint8Array } | { done: true; value?: Uint8Array };
         try { chunk = await raceAbort(reader.read()); }
         catch (error) {
           if (error instanceof BoxExecTransportError) throw error;

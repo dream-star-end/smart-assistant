@@ -45,7 +45,8 @@ describe('Box Agent invocation boundaries', () => {
     expect(first.sessionId).not.toBe(root)
     expect(runWithAgentContext(b,() => boxAgentMetadata(BOX)!.sessionId)).not.toBe(first.sessionId)
     expect(runWithAgentContext(a,() => boxAgentMetadata('deepseek-v4-pro')!.sessionId)).toBe(root)
-    expect(runWithAgentContext({agentType:'teammate',agentId:'teammate',agentName:'name',teamName:'team',parentSessionId:root},
+    expect(runWithAgentContext({agentType:'teammate',agentId:'teammate',agentName:'name',teamName:'team',parentSessionId:root,
+      planModeRequired:false,isTeamLead:false},
       () => boxAgentMetadata(BOX))).toBeUndefined()
     expect(() => runWithAgentContext(a,() => boxAgentMetadata(BOX,'different-agent'))).toThrow('BOX_AGENT_CONTEXT_MISMATCH')
     expect(isBoxApiModel(`${BOX}[1m]`)).toBe(true)
@@ -68,6 +69,10 @@ describe('Box Agent invocation boundaries', () => {
     Reflect.deleteProperty(process.env,'OC_MODEL_EXECUTION_DESCRIPTOR')
     const a = scope('background-a',true)
     turn('b')
+    for (const invalid of [undefined,null,42,'headers',{},
+      {ANTHROPIC_CUSTOM_HEADERS:null},{ANTHROPIC_CUSTOM_HEADERS:{}}]) {
+      expect(() => renewBoxAgentOrigins(invalid)).not.toThrow()
+    }
     renewBoxAgentOrigins({ANTHROPIC_CUSTOM_HEADERS:process.env.ANTHROPIC_CUSTOM_HEADERS!})
     runWithAgentContext(a,() => {
       expect(JSON.parse(boxAgentMetadata(BOX)!.extraMetadata!).oc_turn_key).toBe('a'.repeat(64))

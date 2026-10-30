@@ -1338,7 +1338,7 @@ async function* queryModel(
   // Ordinary platform requests retain media until the final byte fitter can
   // preserve it as files. Other providers and Box retain their existing policy.
   if (!process.env.OPENCLAUDE_SESSION_KEY || getAPIProvider() !== 'firstParty' ||
-    BOX_NATIVE_CONTEXT_MODELS.includes(options.model) || !toolSchemas.some(t => t.name === 'Read')) {
+    BOX_NATIVE_CONTEXT_MODELS.includes(options.model) || !toolSchemas.some(t => 'name' in t && t.name === 'Read')) {
     messagesForAPI = stripExcessMediaItems(messagesForAPI, API_MAX_MEDIA_PER_REQUEST)
   }
 
