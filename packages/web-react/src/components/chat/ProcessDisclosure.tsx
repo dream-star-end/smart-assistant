@@ -4,18 +4,40 @@ import { type ChatMessage, isRetryingTurnStatus, isServerAuthoredRow } from "../
 import { agentTerminalStatus } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
-import type { CardCallbacks } from "./cards";
+import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
-import { detectOcCli, resolveToolMeta } from "../tool/meta";
-import { StepTimingContext } from "./stepDuration";
+import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
+import { resolveToolStatus } from "../tool/status";
+import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
+import { timelineMessageKey } from "./findInSession";
+import { ProcessStepContext } from "./processStep";
+import { StepMetaBadge, StepTimingContext } from "./stepDuration";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import type { TurnActivityInfo } from "./TurnActivity";
-import { computeStepTimings, stepTimingsSignature } from "../../lib/chat/stepTiming";
+import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
+
+// 展开时间轴只从外壳拿这些符号。懒块若直接 import cards / meta / status,
+// rolldown 会把它们和 api+protocol 重新并进首屏 styles 块。
+export {
+  FirstTextPaintCommitProbe,
+  ProcessStepContext,
+  ProgressiveMarkdown,
+  RecoveredStepContext,
+  StepMetaBadge,
+  StepTimingContext,
+  combineStepTimings,
+  formatStepDuration,
+  humanStepTitle,
+  normalizeToolForDisplay,
+  resolveToolMeta,
+  resolveToolStatus,
+  timelineMessageKey,
+};
 /**
  * View-only fold for the main chat. Message ids, tape bytes, and scroll
  * ownership stay where they were; this only decides which rows share a

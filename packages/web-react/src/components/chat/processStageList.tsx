@@ -24,26 +24,31 @@ import {
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { combineStepTimings, formatStepDuration } from "../../lib/chat/stepTiming";
-import { normalizeToolForDisplay } from "../tool/format";
-import { humanStepTitle, resolveToolMeta } from "../tool/meta";
-import { resolveToolStatus } from "../tool/status";
-import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
-import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
-import { timelineMessageKey } from "./findInSession";
-import { ProcessStepContext } from "./processStep";
-import { StepMetaBadge, StepTimingContext } from "./stepDuration";
+import type { CardCallbacks } from "./cards";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import {
+  FirstTextPaintCommitProbe,
+  ProcessStepContext,
+  ProgressiveMarkdown,
+  RecoveredStepContext,
+  StepMetaBadge,
+  StepTimingContext,
+  combineStepTimings,
   countLabel,
   delegateState,
   delegateTitle,
   formatElapsed,
+  formatStepDuration,
   hasErrorMark,
+  humanStepTitle,
   isClearedGoalRecord,
   isDelegateRow,
   isErroredAssistant,
+  normalizeToolForDisplay,
   rawAuditCommand,
+  resolveToolMeta,
+  resolveToolStatus,
+  timelineMessageKey,
   toolStillRunning,
   workKind,
   workSummary,
