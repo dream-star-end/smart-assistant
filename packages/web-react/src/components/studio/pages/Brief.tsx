@@ -529,12 +529,12 @@ export function BriefPage(props: {
               暂停
             </button>
           ) : null}
-          {project.status === 'paused' ? (
+          {project.status === 'paused' || (project.status === 'awaiting_user' && awaitingReason === 'provider_failure') ? (
             <button
               type="button"
               className="st-btn st-btn-sm"
               style={{ flex: 1 }}
-              onClick={() => void transition('resume')}
+              onClick={() => void (awaitingReason === 'provider_failure' && project.status === 'awaiting_user' ? approvePlan() : transition('resume'))}
             >
               <Play />
               继续

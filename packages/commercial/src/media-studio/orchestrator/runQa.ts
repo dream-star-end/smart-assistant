@@ -197,8 +197,9 @@ async function history(
       since = []
       handoffAt = null
     }
-    if (row.qa.skipped === true || row.qa.reason === 'unavailable' || row.qa.error) continue
-    since.push({ id: row.id, score: typeof row.qa.score === 'number' ? row.qa.score : 0 })
+    if (row.qa.skipped === true) continue
+    if (row.qa.reason !== 'unavailable' && !row.qa.error)
+      since.push({ id: row.id, score: typeof row.qa.score === 'number' ? row.qa.score : 0 })
     if (row.qa.next === 'handoff') {
       const at = typeof row.qa.at === 'string' ? Date.parse(row.qa.at) : Number.NaN
       handoffAt = Number.isFinite(at) ? at : row.created_at.getTime()

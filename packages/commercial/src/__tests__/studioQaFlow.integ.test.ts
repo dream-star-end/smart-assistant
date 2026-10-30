@@ -429,6 +429,19 @@ describe('studio visual QA (OCV5-591 A2-1b-1)', () => {
     assert.equal((await takeQa(current.id))?.next, 'redo', 'first real quality failure still gets a redo')
   })
 
+  test('an unavailable QA handoff still resets quality history when the user makes a new candidate', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await s.take('shot_frame', s.shot, { version: 1, qa: { passed: false, score: 0.5, next: 'redo', reason: 'below_threshold' } })
+    await s.take('shot_frame', s.shot, { version: 2, qa: { passed: false, score: 0, next: 'handoff', reason: 'unavailable', error: 'QA_GROK_UPSTREAM_ERROR', at: new Date(Date.now() - 5000).toISOString() } })
+    await query("UPDATE studio_takes SET created_at=NOW() - interval '10 seconds' WHERE project_id=$1", [s.p.id])
+    const current = await s.take('shot_frame', s.shot, { version: 3 })
+    s.grok.answers.push(answer({ character: 0.4 }))
+    await advanceProject(s.advanceDeps, s.p.id)
+    await runOne(s.exec)
+    assert.equal((await takeQa(current.id))?.next, 'redo', 'a user-requested new round is not compared with the old score')
+  })
+
   test('bible candidates: the best passing one is locked once both are judged', async (t) => {
     if (skip(t)) return
     const s = await setup({ candidates: 2 })
