@@ -1133,7 +1133,7 @@ describe("MessageList 失败轮单一错误出口", () => {
           failedUser,
           mk("assistant", {
             id: "a-source-error-after-manual",
-            text: "SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY",
+            text: "SOURCE_PARTIAL_ANSWER_AFTER_MANUAL_RECOVERY",
             _clientMessageId: failedUser.id,
             _errorCode: "model_capacity",
           }),
@@ -1152,7 +1152,7 @@ describe("MessageList 失败轮单一错误出口", () => {
     );
     expect(screen.getByText("你是什么模型")).toBeInTheDocument();
     expect(screen.queryByText("MANUAL_RECOVERY_CONTROL_ROW_SHOULD_HIDE")).toBeNull();
-    expect(screen.queryByText("SOURCE_ERROR_SHOULD_HIDE_AFTER_MANUAL_RECOVERY")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER_AFTER_MANUAL_RECOVERY")).toBeInTheDocument();
     expect(screen.getByText("RECOVERY_ROUND_FINAL_ERROR_SHOULD_SHOW")).toBeInTheDocument();
     // W3:错误卡正文是错误目录的人话(codex_route_unavailable)。
     expect(screen.getByRole("alert")).toHaveTextContent("模型连接暂时不可用，请稍后重试。");
@@ -1162,7 +1162,7 @@ describe("MessageList 失败轮单一错误出口", () => {
 describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
   const failedUser = mk("user", { id: "u-continued-source", text: "部署并验证", status: "sent" });
   const committed = (id: string, text: string) => mk("assistant", {
-    id, text, _clientMessageId: failedUser.id, _errorCode: "engine_error",
+    id, text: "SOURCE_PARTIAL_ANSWER", _clientMessageId: failedUser.id, _errorCode: "engine_error",
     _errorCardSnapshot: { disposition: "card", tone: "red", title: "任务执行失败", message: text },
   });
   const child = (extra: Partial<ChatMessage>) => mk("user", {
@@ -1181,6 +1181,7 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
     renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({}),
       mk("assistant", { id: "a-resumed", text: "RESUMED_PROGRESS", _clientMessageId: "u-continue-child" })]);
     expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.queryByRole("button", { name: /重新尝试|从断点继续/ })).toBeNull();
     expect(screen.getByText("RESUMED_PROGRESS")).toBeInTheDocument();
@@ -1191,6 +1192,7 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
       mk("assistant", { id: "a-child-error", text: "CHILD_REAL_FAILURE", _clientMessageId: "u-continue-child",
         _errorCode: "codex_route_unavailable" })]);
     expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("SOURCE_PARTIAL_ANSWER")).toBeInTheDocument();
     expect(screen.getByText("CHILD_REAL_FAILURE")).toBeInTheDocument();
     expect(screen.getByRole("alert")).toBeInTheDocument();
   });

@@ -2804,3 +2804,93 @@ test("a refused checkpoint returns the original source; a real failed child owns
   expect(go).toHaveBeenCalledTimes(1);
   expect(go).toHaveBeenCalledWith(terminal);
 });
+
+test.each(["committed", "uncommitted", "held"] as const)(
+  "manual checkpoint preserves the paid partial answer through completion and reload (%s)",
+  async (snapshot) => {
+    const source = row("paid-source", "user", "完成报告，保留已执行步骤", { status: "error", _source: "server" });
+    const saved = row("paid-saved-tool", "tool", "", { toolName: "Read", inputJson: { file_path: "saved-report.md" },
+      output: "SAVED_REPORT_RESULT", _completed: true, _source: "server", _clientMessageId: source.id });
+    const diagnostic = 'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}';
+    const error = row("paid-partial-error", "assistant", `SAVED_PAID_FIRST_PARAGRAPH\n\nSAVED_PAID_SECOND_PARAGRAPH\n\n${diagnostic}`, {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _turnTapeId: "paid-tape", _turnTapeComplete: true, _dispatchOutcome: "crashed",
+      usage: { costCredits: "71", waived: false, inputTokens: 50, outputTokens: 100 },
+      _errorHeldForRecovery: snapshot === "held" ? true : undefined,
+      _errorCardSnapshot: snapshot === "committed"
+        ? { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" }
+        : undefined,
+    });
+    const original = [source, saved, error];
+    const before = JSON.stringify(original);
+    let messages = original;
+    let sending = false;
+    const cb = { onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: (view: ChatMessage) => manualTaskContinuationSource(messages, view) };
+    const screenState = () => <MessageList processDisclosure messages={messages} sending={sending}
+      sessionId="session-a" cb={cb} onRespondPermission={() => {}} />;
+    const view = render(screenState());
+    expect(await screen.findByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+
+    const assertSavedBody = () => {
+      expect(screen.getByText("SAVED_PAID_FIRST_PARAGRAPH")).toBeVisible();
+      expect(screen.getByText("SAVED_PAID_SECOND_PARAGRAPH")).toBeVisible();
+      expect(screen.queryByText(/PRIVATE_DIAGNOSTIC/)).toBeNull();
+      expect(screen.queryByText("原中断提示")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByRole("button", { name: "继续" })).toBeNull();
+      expect(screen.queryByText("MANUAL_CHECKPOINT_CONTROL")).toBeNull();
+      expect(JSON.stringify(messages.slice(0, original.length))).toBe(before);
+    };
+    const assertSavedUsage = () => {
+      const answer = screen.getByText("SAVED_PAID_FIRST_PARAGRAPH").closest("[data-testid=assistant-row]");
+      if (!answer) throw new Error("missing saved partial answer row");
+      expect(within(answer as HTMLElement).getByLabelText("消耗 71 积分")).toHaveTextContent("71 积分");
+      expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+    };
+    const child = row("paid-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "sent", _source: "server",
+      _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+    const active = row("paid-continuing-tool", "tool", "", { toolName: "Bash", inputJson: { command: "echo continue" },
+      _source: "server", _clientMessageId: child.id, _completed: false });
+    messages = [...original, child, active];
+    sending = true;
+    view.rerender(screenState());
+    assertSavedBody();
+
+    messages = [...original, { ...child, status: "replied" }, { ...active, _completed: true, output: "done" },
+      row("paid-finished", "assistant", "CONTINUED_PAID_ANSWER", { _source: "server", _clientMessageId: child.id })];
+    sending = false;
+    view.rerender(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+
+    // A fresh component receives only the persisted rows, without a local held-card repair.
+    view.unmount();
+    messages = JSON.parse(JSON.stringify(messages)) as ChatMessage[];
+    render(screenState());
+    expect(await screen.findByText("CONTINUED_PAID_ANSWER")).toBeVisible();
+    assertSavedBody();
+    assertSavedUsage();
+  },
+);
+
+test("a manually continued diagnostic-only error does not become a saved answer", async () => {
+  const source = row("diagnostic-source", "user", "继续原任务", { status: "error", _source: "server" });
+  const error = row("diagnostic-only-error", "assistant",
+    'API Error: {"error":{"code":"MODEL_AUTHORITY_INVALID","status":403,"message":"PRIVATE_DIAGNOSTIC"}}', {
+      _source: "server", _clientMessageId: source.id, _errorCode: "MODEL_AUTHORITY_EXPIRED",
+      _errorCardSnapshot: { disposition: "card", tone: "red", title: "原中断提示", message: "原任务未完成" },
+    });
+  const child = row("diagnostic-manual-child", "user", "MANUAL_CHECKPOINT_CONTROL", { status: "replied", _source: "server",
+    _recoveryOfClientMessageId: source.id, _recoveryMode: "checkpoint", _automaticRecovery: false });
+  const messages = [source, error, child,
+    row("diagnostic-finished", "assistant", "CONTINUED_WITHOUT_DIAGNOSTIC", { _source: "server", _clientMessageId: child.id })];
+  const before = JSON.stringify(messages);
+  renderList(messages);
+  expect(await screen.findByText("CONTINUED_WITHOUT_DIAGNOSTIC")).toBeVisible();
+  expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+  expect(screen.queryByText(/PRIVATE_DIAGNOSTIC|MODEL_AUTHORITY_INVALID/)).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(JSON.stringify(messages)).toBe(before);
+});
