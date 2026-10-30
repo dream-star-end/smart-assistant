@@ -136,7 +136,7 @@ describe('runCursorDelegateFastPath', () => {
     assert.ok(now < 60_000)
   })
 
-  it('unavailable handoff remains healthy and bounded, without a Bash instruction', async () => {
+  it('unavailable handoff remains healthy and preserves its stdout wait fallback', async () => {
     let now = 0
     const r = await runCursorDelegateFastPath({
       fastWaitMs: 45_000, deadlineAtMs: 1_000, now: () => now,
@@ -147,7 +147,8 @@ describe('runCursorDelegateFastPath', () => {
       },
     })
     assert.equal(r.kind, 'running')
-    assert.doesNotMatch(r.text, /delegate-wait|Bash|委派失败/)
+    assert.match(r.text, /oc-memory delegate-wait dlgjob-live/)
+    assert.doesNotMatch(r.text, /委派失败|网关已接管/)
   })
 
   it('still attempts a bounded handoff when job admission used the entire budget', async () => {
@@ -311,6 +312,16 @@ describe('interpret helpers', () => {
 })
 
 describe('formatDelegateFanoutRunning', () => {
+  it('mixed handoff waits only for jobs whose callback was not confirmed', () => {
+    const text = formatDelegateFanoutRunning([
+      { label: 'auto', goal: 'a', isError: false, text: '', running: true, deferred: true, jobId: 'dlgjob-auto' },
+      { label: 'stdout', goal: 'b', isError: false, text: '', running: true, jobId: 'dlgjob-stdout' },
+    ])
+    assert.match(text, /oc-memory delegate-wait dlgjob-stdout/)
+    assert.doesNotMatch(text, /oc-memory delegate-wait dlgjob-auto/)
+    assert.match(text, /网关已接管的作业会自动送回/)
+  })
+
   it('lists handed-off members without asking the model to start a wait tool', () => {
     const text = formatDelegateFanoutRunning([
       {

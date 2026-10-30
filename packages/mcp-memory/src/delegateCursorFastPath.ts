@@ -71,7 +71,8 @@ export function formatDelegateRunning(
   const keyBit = sessionKey ? ` sessionKey=${sessionKey}` : ''
   return [
     `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}${keyBit}`,
-    '前台工具等待窗口已结束，尚未确认自动回调。子任务会继续运行；不要重复委派或启动额外等待工具。',
+    '前台工具等待窗口已结束，尚未确认自动回调。子任务会继续运行；请用 Bash 阻塞取回结果，不要重复委派或轮询 MCP:',
+    `  oc-memory delegate-wait ${jobId}`,
   ].join('\n')
 }
 
@@ -99,11 +100,13 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
     return `- ${it.jobId} (agent: ${it.label}, goal: ${goalPreview})`
   })
   const deferred = running.every((it) => it.deferred)
+  const stdoutJobIds = running.filter((it) => !it.deferred).map((it) => it.jobId)
   const runningSection = [
     '### 仍在运行',
     deferred
       ? '网关已接管等待，终态会自动送回本会话。请结束当前回合，不要重新委派或启动等待工具。'
-      : '前台等待窗口已结束，部分作业尚未确认自动回调。不要重复委派或启动额外等待工具。',
+      : '部分作业尚未确认自动回调。仅用下方 Bash 命令等待这些作业；网关已接管的作业会自动送回，不要重复委派或轮询 MCP。',
+    ...(!deferred ? [`  oc-memory delegate-wait ${stdoutJobIds.join(' ')}`] : []),
     ...runningLines,
   ].join('\n')
   const parts = [header, '']

@@ -51,7 +51,11 @@ function fixture() {
   }) as any
   const intent = (jobId: string) => ({ v: 1 as const, jobId, originSessionKey: PARENT, userId: 'u1', agentId: 'coding-assistant', goal: 'task', createdAt: 1 })
   const complete = (jobId: string, failed = false) => {
-    if (failed) assert.equal(store.fail(jobId, { failureClass: 'child_error', detail: 'child failed', httpStatus: 500 }), true)
+    const owner = store.snapshotOf(jobId)!
+    if (failed) assert.equal(store.fail(jobId, {
+      failureClass: 'child_error', detail: 'child failed', httpStatus: 500,
+      claimToken: owner.claimToken, fencingEpoch: owner.fencingEpoch,
+    }), true)
     else assert.equal(store.complete(jobId, { httpStatus: 200, body: { output: 'final output' } }), true)
     const snap = store.snapshotOf(jobId)!
     if (isDelegateNotifierEffective()) void host._ensureDurableSendToAgentCallback(snap, intent(jobId))
@@ -61,7 +65,7 @@ function fixture() {
 }
 
 async function settled(store: DelegateJobStore, jobId: string) {
-  for (let i = 0; i < 50 && store.snapshotOf(jobId)?.callbackState !== 'delivered'; i++) await delay(2)
+  for (let i = 0; i < 500 && store.snapshotOf(jobId)?.callbackState !== 'delivered'; i++) await delay(10)
   assert.equal(store.snapshotOf(jobId)?.callbackState, 'delivered')
   // Callback cleanup removes a shadow asynchronously after the state CAS.
   await delay(2)
@@ -212,7 +216,6 @@ describe('MCP deadline handoff', () => {
       await delay(10)
       assert.equal(f.store.snapshotOf(id)?.callbackState, 'pending')
       assert.ok(f.host._notifyRetryTimer)
-      await delay(1_150)
       await settled(f.store, id)
       assert.equal(attempts, 2)
       assert.equal(delivered, 1)
