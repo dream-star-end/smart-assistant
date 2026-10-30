@@ -80,7 +80,7 @@ const ARTIFACT_QUOTE_CLOSER: Readonly<Record<string, string>> = {
   '『': '』',
 }
 
-/** 裸路径在这些字符处结束。ASCII 点另判:后面是扩展名,或后面还有扩展名,才继续。 */
+/** 裸路径在这些字符处结束。括号外的 ASCII 点另判:后面是扩展名,或后面还有扩展名,才继续。括号内的点属于文件名。 */
 const BARE_PATH_STOP = /[\s`"'\]>,;:!?，。、；：！？…]/u
 
 export function delegateLeaderResultBudget(itemCount: number): number {
@@ -160,12 +160,14 @@ function bareArtifactSpan(text: string, prefixAt: number): { path: string; next:
       continue
     }
     if (ch === '.' || ch === '．') {
-      const next = text[i + 1] ?? ''
-      if (/[A-Za-z0-9]/.test(next) || laterFileExtension(text, i + 1)) {
-        i += 1
-        continue
+      // 已经进入平衡括号时,点号属于文件名(report(v1.最终版).md)。
+      // 句末点只在括号外判断,避免 depth 回退把整段截成左括号之前。
+      if (depth === 0) {
+        const next = text[i + 1] ?? ''
+        if (!/[A-Za-z0-9]/.test(next) && !laterFileExtension(text, i + 1)) break
       }
-      break
+      i += 1
+      continue
     }
     if (BARE_PATH_STOP.test(ch)) break
     i += 1
