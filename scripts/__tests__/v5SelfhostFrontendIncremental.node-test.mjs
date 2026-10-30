@@ -82,7 +82,9 @@ function donorState(p) {
 }
 
 test('epoch seed catches an older-mtime type error that tsc -b otherwise skips, without modifying the donor', (t) => {
-  const f = fixture(t), donor = project(f, 'donor'), staging = project(f, 'staging');
+  const f = fixture(t);
+  const donor = project(f, 'donor');
+  const staging = project(f, 'staging');
   assertPass(compile(f, donor));
   const before = donorState(donor);
   change(staging, 'export const answer: number = "wrong";\n');
@@ -101,7 +103,9 @@ test('epoch seed catches an older-mtime type error that tsc -b otherwise skips, 
 });
 
 test('epoch seed accepts a valid changed source and detaches an existing donor hard link', (t) => {
-  const f = fixture(t), donor = project(f, 'donor'), staging = project(f, 'staging');
+  const f = fixture(t);
+  const donor = project(f, 'donor');
+  const staging = project(f, 'staging');
   assertPass(compile(f, donor));
   const before = donorState(donor);
   linkSync(donor.info, staging.info);
@@ -116,7 +120,9 @@ test('epoch seed accepts a valid changed source and detaches an existing donor h
 
 for (const kind of ['version mismatch', 'damaged JSON']) {
   test(`tsc itself fully checks a seeded buildinfo with ${kind}`, (t) => {
-    const f = fixture(t), donor = project(f, 'donor'), staging = project(f, 'staging');
+    const f = fixture(t);
+    const donor = project(f, 'donor');
+    const staging = project(f, 'staging');
     assertPass(compile(f, donor));
     const info = readFileSync(donor.info, 'utf8');
     const supplied = kind === 'damaged JSON' ? '{broken buildinfo\n' : JSON.stringify({ ...JSON.parse(info), version: '0.0.fixture' });
@@ -133,7 +139,9 @@ for (const kind of ['version mismatch', 'damaged JSON']) {
 }
 
 test('a source symlink is copied as private buildinfo content, and a missing donor needs no cache', (t) => {
-  const f = fixture(t), donor = project(f, 'donor'), staging = project(f, 'staging');
+  const f = fixture(t);
+  const donor = project(f, 'donor');
+  const staging = project(f, 'staging');
   const cache = join(f.dir, 'cache');
   writeFileSync(cache, 'cache bytes\n');
   const before = statSync(cache).mtimeMs;
@@ -142,7 +150,8 @@ test('a source symlink is copied as private buildinfo content, and a missing don
   assert.equal(readFileSync(staging.info, 'utf8'), 'cache bytes\n');
   assert.notEqual(realpathSync(staging.info), cache);
   assert.equal(statSync(cache).mtimeMs, before);
-  const noCache = project(f, 'no-cache'), emptyStaging = project(f, 'empty-staging');
+  const noCache = project(f, 'no-cache');
+  const emptyStaging = project(f, 'empty-staging');
   seedInto(f, noCache, emptyStaging);
   assert.equal(existsSync(emptyStaging.info), false);
 });
@@ -173,7 +182,9 @@ master_job_frontend
 }
 
 test('the original npm build seeds B donor and records only tsc time with spaces in controller and staging paths', (t) => {
-  const f = fixture(t), donor = project(f, 'donor'), staging = project(f, 'staging');
+  const f = fixture(t);
+  const donor = project(f, 'donor');
+  const staging = project(f, 'staging');
   assertPass(compile(f, donor));
   const before = donorState(donor);
   change(staging, 'export const answer: number = 43;\n');
@@ -201,7 +212,8 @@ fs.writeFileSync('dist/index.html', '<meta name="oc-build" content="0123456789ab
 });
 
 test('the tsc timer records compiler failures and never changes their exit status', (t) => {
-  const f = fixture(t), staging = project(f, 'staging');
+  const f = fixture(t);
+  const staging = project(f, 'staging');
   change(staging, 'export const answer: number = "wrong";\n');
   const uninstrumented = compile(f, staging);
   rmSync(staging.info, { force: true });

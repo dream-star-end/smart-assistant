@@ -99,7 +99,8 @@ test('build_master_release reuses a matching dist instead of running the web bui
  assert.match(s,/mode=reused/);assert.doesNotMatch(out.stderr,/NPM_BUILD_RAN/);
  const rec=JSON.parse(s.slice(s.indexOf('{')));assert.equal(rec.key,k);assert.equal(rec.mode,'reused');assert.equal(rec.donor,live);
  assert.equal(readFileSync(join(f.dir,'staging/packages/web-react/dist/assets/main.js'),'utf8'),'console.log(1)\n');
- const donorInfo=join(live,'packages/web-react/tsconfig.tsbuildinfo'),stagingInfo=join(f.dir,'staging/packages/web-react/tsconfig.tsbuildinfo');
+ const donorInfo=join(live,'packages/web-react/tsconfig.tsbuildinfo');
+ const stagingInfo=join(f.dir,'staging/packages/web-react/tsconfig.tsbuildinfo');
  assert.equal(readFileSync(stagingInfo,'utf8'),readFileSync(donorInfo,'utf8'));
  assert.notEqual(statSync(stagingInfo).ino,statSync(donorInfo).ino,'a reused release must carry a private buildinfo for the next train');
  assert.equal(readFileSync(join(f.dir,'frontend.result'),'utf8').trim().split(' ')[2],'0','reused D has no tsc work');
