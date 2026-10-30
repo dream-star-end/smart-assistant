@@ -606,8 +606,8 @@ export function App() {
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
     onLogout: () => void sockRef.current?.wipePersistence(),
-    // 用着用着被服务端判失效（OCV5-636）：onClearAuth 已收尾并回首页，这里改为直接给登录表单，
-    // useAuth 同时写入「登录状态已失效」提示；地址栏深链保留，重新登录后回到原会话。
+    // 续期明确失效（用着用着，或启动时本浏览器登录过）：直接给登录表单和
+    // 「登录已过期，请重新登录」。地址栏深链（含 /p/<项目>）留在 pending 里，登录后回到原页。
     onSessionExpired: () => {
       setAuthMode("login");
       setView("app");
@@ -1773,7 +1773,8 @@ export function App() {
 
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
   if (!demo && booting) {
-    return <BootSplash />;
+    // 这是在恢复登录，不是页面卡死。慢的时候不要先说「网络较慢」再掉进落地页。
+    return <BootSplash slowHint="正在恢复登录…" />;
   }
   if (!demo && pendingAccount) return <LazyBoundary fallback={<SplashFallback />}>
     <AccountSwitchNotice name={pendingAccount.displayName} ready={accountSwitchReady} onAccept={acceptAccountSwitch} onRetry={retryBoot} />

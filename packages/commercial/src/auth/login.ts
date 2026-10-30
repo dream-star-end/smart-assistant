@@ -107,7 +107,8 @@ export class RefreshError extends Error {
  *   - tab B 同一刻发 refresh(cookie 还是 X),server 见 X 已 rotated
  *   - 在 GRACE 内:返 REFRESH_RACE(401 但**不**清 cookie),tab B 前端
  *     retry 时 cookie 已被 tab A 的响应种成 Y,retry 自动成功
- *   - GRACE 外:等同 theft,整族 mass-revoke
+ *   - GRACE 外且直接后继已被使用、或指纹不符:等同 theft,整族 mass-revoke
+ *   - GRACE 外但直接后继从未被使用且指纹一致:Set-Cookie 未送达,补发新票,不吊销
  *
  * Trade-off: GRACE 内攻击者拿失窃 token 复用不会被检测;但 attacker 没有
  * 新 cookie 可 retry,实际仍然拿不到 access token。这是 OAuth 2.1 实现里
@@ -585,6 +586,69 @@ export async function refresh(
       if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp && fingerprintPresent) {
         // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
         return { kind: "race" as const };
+      }
+      // 直接后继还没被用过、且 UA/IP 与签发时一致：上一张 Set-Cookie 没送达
+      // （关页、发版掐断连接、晚到响应盖住新 cookie）。补发一张新票，不把
+      // 仍在有效期内、从未被出示过的后继判成盗用。后继已经再轮换过，或指纹
+      // 对不上，仍走下面的整族吊销。不延长 refresh TTL。
+      if (sameUa && sameIp && fingerprintPresent) {
+        const succ = await client.query<{
+          id: string;
+          live: boolean;
+          expired: boolean;
+          remember_me: boolean;
+        }>(
+          `SELECT child.id::text AS id,
+                  (child.revoked_at IS NULL) AS live,
+                  (child.expires_at <= $2::timestamptz) AS expired,
+                  child.remember_me AS remember_me
+             FROM refresh_tokens parent
+             JOIN refresh_tokens child
+               ON child.id = parent.rotated_to_id
+              AND child.family_id = parent.family_id
+            WHERE parent.id = $1::bigint
+            FOR UPDATE OF child`,
+          [row.id, nowIso],
+        );
+        const child = succ.rows[0];
+        if (child?.live && !child.expired) {
+          const redelivered = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
+          const reIns = await client.query<{ id: string }>(
+            `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
+                                        family_id, revoked_at, revoked_reason, remember_me)
+             VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL, $7)
+             RETURNING id::text AS id`,
+            [
+              row.user_id,
+              redelivered.hash,
+              deps.userAgent ?? null,
+              deps.remoteIp ?? null,
+              redelivered.expires_at,
+              row.family_id,
+              child.remember_me,
+            ],
+          );
+          const reId = reIns.rows[0].id;
+          const marked = await client.query(
+            `UPDATE refresh_tokens
+                SET revoked_at = NOW(),
+                    revoked_reason = 'rotated',
+                    rotated_to_id = $1::bigint
+              WHERE id = $2::bigint
+                AND revoked_at IS NULL`,
+            [reId, child.id],
+          );
+          if ((marked.rowCount ?? 0) !== 1) {
+            throw new RefreshError("INVALID_REFRESH", "refresh token invalid or expired");
+          }
+          return {
+            kind: "rotated" as const,
+            user_id: row.user_id,
+            role: row.role,
+            newRefresh: redelivered,
+            remember: child.remember_me,
+          };
+        }
       }
       const massRevoke = await client.query<{ id: string }>(
         `UPDATE refresh_tokens
