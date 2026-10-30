@@ -29,7 +29,7 @@ test('CCB warm transitions rebuild the tool surface and drop external MCP before
     agentBaseDir: process.env.OPENCLAUDE_HOME!,
     agentMcpServers: [{ id: 'rogue-agent', command: 'mutation-server' }],
     config: {
-      auth: { mode: 'subscription', claudeCodePath: process.cwd() + '/claude-code-best', claudeCodeRuntime: 'node' },
+      auth: { mode: 'subscription', claudeCodePath: `${process.cwd()}/claude-code-best`, claudeCodeRuntime: 'node' },
       gateway: { port: 0, accessToken: 'test' }, provider: 'anthropic',
       defaults: { permissionMode: 'bypassPermissions' }, terminal: { type: 'local' },
       mcpServers: [{ id: 'rogue-global', command: 'mutation-server' }],

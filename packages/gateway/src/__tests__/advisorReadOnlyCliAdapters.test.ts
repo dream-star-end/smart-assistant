@@ -51,7 +51,7 @@ if (engine === 'grok') {
     process.env[binEnv] = bin
     process.env.OPENCLAUDE_HOME = join(dir, 'home')
     process.env.OPENCLAUDE_ADVISOR_READ_ONLY = '1'
-    delete process.env.OC_MODEL_AUTHORITY
+    Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
     const oldStorageHome = paths.home
     paths.home = join(dir, 'storage-home')
     if (engine === 'cursor') {
