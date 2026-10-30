@@ -16,6 +16,7 @@ import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, validExpiredCh
   type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
+import { orphanRecoveryHolderIsStale } from "./boxOrphanRecovery.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
   deriveBoxFallbackAlias, incomingAssistantAccepted } from "./boxCallFingerprint.js";
@@ -573,9 +574,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length === 0) return { kind: "none" };
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
-    // A claim is stale only when its recovery request ended before it was
-    // ever admitted to a Box run (e.g. it failed while planning); then a later
-    // recovery may take it over. Any admitted claimer keeps it.
+    // A failed recovery gives the exchange back only before admission or
+    // after its admitted invocation is proven stopped without a successor.
     let staleClaim: string | undefined;
     if (ctx.boxRecoveredBy !== undefined) {
       if (typeof ctx.boxRecoveredBy !== "string") return { kind: "claimed" };
@@ -583,7 +583,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `SELECT state, ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2`,
         [ctx.boxRecoveredBy, input.uid.toString()]);
       const holder = claimer.rows[0];
-      if (!holder || holder.state !== "aborted" || holder.ctx.boxState !== undefined) {
+      if (!(await orphanRecoveryHolderIsStale(this.pool.query.bind(this.pool), input.uid, ctx, holder))) {
         return { kind: "claimed" };
       }
       staleClaim = ctx.boxRecoveredBy;
@@ -626,6 +626,21 @@ export class BoxDurableJournal implements BoxJournalPort {
         await client.query("ROLLBACK"); committed = true; return false;
       }
       await lock(client, [`box:session:${input.uid}:${sessionId}`]);
+      if (input.replacing !== undefined) {
+        const parent = await client.query<{ ctx: Record<string, unknown> }>(
+          `SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [input.requestId, input.uid.toString()]);
+        const ctx = parent.rows[0]?.ctx;
+        if (!ctx || ctx.boxRecoveredBy !== input.replacing) {
+          await client.query("ROLLBACK"); committed = true; return false;
+        }
+        const holder = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+          `SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [input.replacing, input.uid.toString()]);
+        if (!(await orphanRecoveryHolderIsStale(client.query.bind(client), input.uid, ctx, holder.rows[0]))) {
+          await client.query("ROLLBACK"); committed = true; return false;
+        }
+      }
       const changed = await client.query(
         `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
             updated_at=NOW()
