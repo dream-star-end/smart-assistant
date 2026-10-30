@@ -1,4 +1,6 @@
 """Offline keeper/worker/CLI lifecycle tests; only kill own test processes."""
+import array
+import fcntl
 import hashlib
 import ctypes
 import json
@@ -13,11 +15,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 
 HERE = Path(__file__).parent
-KEEPER = HERE / "box_keeper.py"
+KEEPER = Path(os.environ.get("OCV5_KEEPER_UNDER_TEST", str(HERE / "box_keeper.py")))
 SUPERVISOR = HERE / "box_supervisor.py"
 
 
@@ -71,9 +74,10 @@ class KeeperTest(unittest.TestCase):
                 "--kill-after", ".1", "--max-output", "262144", "--",
                 sys.executable, "-c", code]
 
-    def start(self, code: str, env: dict | None = None) -> subprocess.Popen:
+    def start(self, code: str, env: dict | None = None, *,
+              pipesize: int = -1) -> subprocess.Popen:
         proc = subprocess.Popen(self.command(code), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env={**os.environ, **(env or {})})
+                                stderr=subprocess.PIPE, env={**os.environ, **(env or {})}, pipesize=pipesize)
         self.processes.append(proc)
         return proc
 
@@ -135,8 +139,14 @@ class KeeperTest(unittest.TestCase):
                          (proof.name[-24:], epoch, 'worker_failed', 2, 7))
         self.assertEqual(marker['keeperPid'], proc.pid)
 
-    def test_escaped_descendant_blocks_terminal_proof(self) -> None:
-        options, proof, _ = self.proof_args()
+    def test_owned_escaped_descendant_is_fenced_and_reaped_before_proof(self) -> None:
+        # Once the kernel proves direct-child ownership, leaving this live
+        # descendant behind must not destroy the only terminal publisher.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        options, proof, epoch = self.proof_args()
         escaped_file = self.tmp / 'escaped'
         code = ('import os,subprocess;'
                 'p=subprocess.Popen(["/usr/bin/sleep","30"],start_new_session=True,'
@@ -150,12 +160,33 @@ class KeeperTest(unittest.TestCase):
         try:
             self.await_file(escaped_file)
             proc.communicate(timeout=12)
-            self.assertEqual(proc.returncode, 125)
-            self.assertFalse((proof / 'terminal.json').exists())
+            self.assertEqual(proc.returncode, 0)
+            marker = json.loads((proof / 'terminal.json').read_text())
+            self.assertEqual((marker['runNonce'], marker['leaseEpoch'], marker['reason']),
+                             (proof.name[-24:], epoch, 'worker_complete'))
+            self.assertFalse(Path(f'/proc/{int(escaped_file.read_text())}').exists())
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(-1, os.WNOHANG)
         finally:
-            if escaped_file.exists():
-                try: os.kill(int(escaped_file.read_text()), signal.SIGKILL)
-                except ProcessLookupError: pass
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                if escaped_file.exists():
+                    fd = None
+                    try:
+                        pid = int(escaped_file.read_text())
+                        fd = os.pidfd_open(pid, 0)
+                        os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+                        os.waitpid(pid, 0)
+                    except (ProcessLookupError, ChildProcessError):
+                        pass
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+            finally:
+                libc.prctl(36, previous.value, 0, 0, 0)
 
     def test_worker_sigkill_adopts_and_stops_cli_without_recycled_pgid(self) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -220,8 +251,21 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 126)
 
     def test_output_backpressure_cancel_is_prompt(self) -> None:
-        proc = self.start('import os;os.write(1,b"x"*200000)')
-        time.sleep(.5)  # leave parent stdout PIPE unread so W blocks in writer
+        proc = self.start('import os;os.write(1,b"x"*200000)', pipesize=4096)
+        # Wait for actual CLI output and a full unread pipe, rather than
+        # assuming a loaded host finishes the report/ACK startup in .5s.
+        fd = proc.stdout.fileno()
+        capacity = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+        self.assertLess(capacity, 200000, "fixture must exceed stdout capacity")
+        pending = array.array('i', [0])
+        until = time.monotonic() + 4
+        while time.monotonic() < until:
+            self.assertIsNone(proc.poll(), "keeper exited before backpressure")
+            fcntl.ioctl(fd, termios.FIONREAD, pending, True)
+            if pending[0] == capacity:
+                break
+            time.sleep(.01)
+        self.assertEqual(pending[0], capacity, "stdout never became backpressured")
         began = time.monotonic()
         proc.terminate()
         proc.wait(timeout=3)
