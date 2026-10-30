@@ -1,5 +1,6 @@
 import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
-import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH } from '@openclaude/protocol';
+import { promptPrivacyFingerprint } from '../promptPrivacyPolicy.js'
+import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH, PLATFORM_PROMPT_SLOTS_PATH } from '@openclaude/protocol';
 import { waitForRetryDelay, _runOneTurn as runOneTurnAttempt, type TurnRunnerHost } from '../sessionTurnRunner.js';
 import { createServer } from 'node:http';
 /**
@@ -254,6 +255,7 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   const keys = ['OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN', 'OC_USER_ID'] as const;
   const previous = keys.map((key) => process.env[key]);
   let identityReads = 0;
+  let privacyReads = 0;
   let renewalRequests = 0;
   let protocolError: unknown;
   const server = createServer(async (req, res) => {
@@ -264,6 +266,15 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
         identityReads++;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ identityCompat: { schema: 1, userId: '1', profiles: [] } }));
+        return;
+      }
+      const url = new URL(req.url ?? '', 'http://fixture');
+      if (url.pathname === PLATFORM_PROMPT_SLOTS_PATH) {
+        assert.equal(req.method, 'GET');
+        assert.deepEqual([...url.searchParams], [['sessionId', 'engine-peer']]);
+        privacyReads++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ slots: [], promptPolicy: { schemaVersion: 1, profile: null } }));
         return;
       }
       assert.equal(req.url, TURN_LEASE_RENEW_PATH);
@@ -298,6 +309,7 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   return { close, assertCalls: () => {
     assert.equal(protocolError, undefined);
     assert.equal(identityReads, 1, 'submit must cross the normal authenticated identity gate');
+    assert.equal(privacyReads, 1, 'submit must fetch the normal session-scoped privacy policy exactly once');
     assert.equal(renewalRequests, 1, 'retry must reach the distinct lease endpoint exactly once');
   } };
 }
@@ -441,6 +453,8 @@ describe('long-task authority interruption keeps paid progress', () => {
           assert.equal(events.some((event) => event.kind === 'error'), false, 'terminal error waits for master ACK');
           assert.equal(runner.submittedInputs.length, 1, 'revoked retry never resubmits the engine');
           assert.equal(runner.traceId, 'trace-renewal-revoked');
+          assert.equal(runner.promptPolicyFingerprint,
+            promptPrivacyFingerprint({ schemaVersion: 1, profile: null }, session.peerId));
           acknowledge();
           await submission;
           await sm.awaitPendingPersistence();
