@@ -727,6 +727,7 @@ import {
   createVoiceTranscribeHandler,
   type VoiceTranscribeHandler,
 } from "./ws/voiceTranscribe.js";
+import { selectOpenAiPlatformKey } from "./openai/openAiPlatformKey.js";
 import {
   composeMultiplier,
   getAgentCostMultiplier,
@@ -6092,12 +6093,14 @@ export async function registerCommercial(
     broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
   };
 
-  // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
-  // then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
+  // Browser voice input. A usable OpenAI key buffers the clip and posts it to
+  // gpt-transcribe. Otherwise MediaRecorder streams to Deepgram Nova-3.
+  // Then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
   // Master-only commercial path: no runtime image rebuild required.
   const voiceTranscribeHandler: VoiceTranscribeHandler = createVoiceTranscribeHandler({
     jwtSecret,
     deepgramApiKey: cfg.DEEPGRAM_API_KEY,
+    resolveOpenAiApiKey: () => selectOpenAiPlatformKey("voice-transcribe"),
     openCodeGoApiKey: cfg.OPENCODE_GO_API_KEY,
     asrModel: cfg.VOICE_ASR_MODEL,
     asrLanguage: cfg.VOICE_ASR_LANGUAGE,

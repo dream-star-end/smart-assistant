@@ -629,8 +629,10 @@ export const commercialConfigSchema = z
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。
      * - 连接 Deepgram 时通过 `Authorization: Token <DEEPGRAM_API_KEY>` header,
      *   绝不放 URL query,避免 access log / browser history 泄漏。
-     * - 未配置时语音 WS 返回 VOICE_NOT_CONFIGURED,前端回退浏览器内置
-     *   SpeechRecognition。
+     * - 未配置 Deepgram、且没有可用 OpenAI key 时，语音 WS 返回
+     *   VOICE_NOT_CONFIGURED，前端回退浏览器内置 SpeechRecognition。
+     * - 服务池 openai 或 OPENAI_API_KEY 有可用 key 时优先 gpt-transcribe，
+     *   不要求本字段。
      */
     DEEPGRAM_API_KEY: z.string().trim().min(1).max(512).optional(),
     VOICE_ASR_MODEL: z.string().trim().min(1).max(64).optional(),
