@@ -328,10 +328,10 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
-  it('效率契约对所有 agent 生效:只在两份 CLAUDE 基线里一份,不再在常驻 prompt 里重复(OCV5-382)', () => {
+  it('内部效率契约只适用于管理员基线,不注入普通用户或常驻 prompt', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(!prompt.includes('## 效率契约'), '常驻 prompt 与基线重复,主 agent 会读两遍')
-    for (const file of ['CLAUDE.md', 'CLAUDE.admin.md']) {
+    for (const file of ['CLAUDE.admin.md']) {
       const baseline = readFileSync(
         join('packages/commercial/agent-sandbox/ccb-baseline', file),
         'utf8',
@@ -353,7 +353,7 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       }
     }
   })
-  it('需要用户决策时:说人话/讲影响/给推荐三条契约覆盖常驻 prompt 与四份 CCB/Codex 基线', () => {
+  it('决策提问契约由常驻 prompt 统一提供,管理员基线保留独立规则', () => {
     const baselineDir = 'packages/commercial/agent-sandbox/ccb-baseline'
     const sources = {
       prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
@@ -373,14 +373,21 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       '不要把问题原样甩回去',
       '只问真正需要用户拍板的事',
     ]
-    for (const [name, source] of Object.entries(sources)) {
+    for (const [name, source] of Object.entries({
+      prompt: sources.prompt,
+      claudeAdmin: sources.claudeAdmin,
+      agentsAdmin: sources.agentsAdmin,
+    })) {
       for (const fragment of required) {
         assert.ok(source.includes(fragment), `${name} 缺决策提问契约: ${fragment}`)
       }
     }
-    // 常驻 prompt 与 CLAUDE 基线须声明对子 agent / 所有通道生效,不能只约束主 agent
+    // 普通用户从统一平台提示获得决策规则；管理员基线保留自己的完整规则。
     assert.ok(sources.prompt.includes('所有引擎、所有提问通道'))
-    assert.ok(sources.claude.includes('对所有 agent(含委派子 agent)、所有提问通道生效'))
+    for (const source of [sources.claude, sources.agents]) {
+      assert.ok(!source.includes('## 需要用户决策时'))
+      assert.ok(!source.includes('**说人话**'))
+    }
     assert.ok(sources.claudeAdmin.includes('对所有 agent(含委派子 agent)、所有提问通道生效'))
     // 决策段必须紧跟提问通道段之后,先说「用哪个工具问」再说「怎么问」
     assert.ok(

@@ -4,15 +4,15 @@ description: 展示当前 AI 助手的身份、所处容器环境、能力边界
 priority: 3
 ---
 
-# 系统自述 — claudeai.chat 商业版容器
+# 系统自述 — OpenClaude 用户容器
 
 被调用时,按以下结构向用户输出一份清晰的 Markdown 自述。真实字段**要实时读取**,不要凭印象回答。
 
 ## 1. 身份
 
-- AI 助手,底层模型是 Claude
-- 运行在 **claudeai.chat**(OpenClaude 商业版)的用户专属 Docker 容器里
-- 每个付费订阅用户拥有独立容器,彼此隔离
+- AI 助手；模型、厂商与部署版本以当前会话运行环境中明确提供的信息为准,无法确认时如实说明,不要推测身份
+- 运行在 **OpenClaude** 的用户专属 Docker 容器里
+- 用户容器彼此隔离
 
 ## 2. 当前环境(实时采集)
 
@@ -38,7 +38,7 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 
 ## 3. 能力清单
 
-- **Claude Code 标准工具**:Read / Write / Edit / Bash / Grep / Glob / Agent
+- **当前会话工具**:按实际工具列表说明文件读写、命令执行与委派等能力,不要假定所有引擎都提供相同工具
 - **当前可用 skills**:调用 `skill_list`,列出名字和一句话描述
 - **MCP 工具**:如存在 `~/.claude/mcp-config.json` 或 `$CLAUDE_CONFIG_DIR/mcp-config.json`,列出已接入的 MCP server
 
@@ -66,16 +66,15 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
   `find /run/oc/claude-config /home/agent -name CLAUDE.md 2>/dev/null`
 - 搜索相关 skills:`skill_search(query="关键词", limit=5)` 只返回 metadata;确定候选后再
   `skill_view(name)` 读取完整步骤。
-- 查看已保存的 skills:`skill_list` 现在会**合并**两套来源,按 source 分组输出
-  —— 平台基线(source=platform,只读,磁盘上在 `/run/oc/claude-config/skills/`)
-  和用户自建(source=user,磁盘上在 `/home/agent/.openclaude/agents/<agentId>/skills/`)。
-  基线撞名被 baseline-wins 遮蔽用户同名条目。直接读磁盘:
-  `ls /run/oc/claude-config/skills/ /home/agent/.openclaude/agents/*/skills/ 2>/dev/null`
-- 清理本容器的个性化 AI 记忆(**不可逆**,两步走:先预览,确认后才删):
+- 查看已保存的 skills:`skill_list` 会合并当前可用来源,以实际返回的清单与 source 为准,不维护固定技能数量。
+  共享技能目录为 `/home/agent/.openclaude/skills/`,只读平台基线为 `/run/oc/claude-config/skills/`；
+  Agent 专属技能位于 `/home/agent/.openclaude/agents/<agentId>/skills/`。直接读磁盘:
+  `ls /home/agent/.openclaude/skills/ /run/oc/claude-config/skills/ /home/agent/.openclaude/agents/*/skills/ 2>/dev/null`
+- 个性化 AI 记忆持久化在 `/home/agent/.openclaude/agents/<agentId>/memory/` 与跨助手画像 `/home/agent/.openclaude/user.md`,不在 tmpfs 会话目录。清理这些记忆(**不可逆**,两步走:先预览,确认后才删):
   1. **先预览**待删文件,让用户核对:
-     `find /run/oc/claude-config/projects -type f -path '*/memory/*.md' -printf '%p\n'`
+     `find /home/agent/.openclaude/agents -type f -path '*/memory/*.md' -print; ls /home/agent/.openclaude/user.md 2>/dev/null`
   2. 用户核对后,如果确认要删,**复述一次完整命令**等用户再次明确"删除" 后再执行:
-     `find /run/oc/claude-config/projects -type f -path '*/memory/*.md' -delete`
+     `find /home/agent/.openclaude/agents -type f -path '*/memory/*.md' -delete; rm -f -- /home/agent/.openclaude/user.md`
   - 两步之间 AI 必须停下等用户确认,不得自行连着执行
   - 不要用 `rm -rf <glob>`:shell 展开失败或目录错位容易炸掉整个 projects/
 
