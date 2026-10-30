@@ -17,7 +17,7 @@ import type { PaneTab } from "../components/InspectorPanel";
 import type { ToolLike } from "../components/tool/format";
 import type { ChatMessage } from "../lib/chat/model";
 import { preciseRetryEligible, interruptedContinuationTarget, exactUserReplayPayload } from "../lib/chat/socket";
-import { manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
+import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
 import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
@@ -338,14 +338,15 @@ export function useChatCardActions({
       if (!identity || !identityIsCurrent(identity, authRef.current)) return;
       const sock = sockRef.current;
       const rows = sock?.getMessages(activeId) ?? [];
-      const source = manualTaskContinuationSource(rows, error);
-      if (!sock || !source) return;
+      const canonical = canonicalTaskContinuationError(rows, error);
+      const source = canonical && manualTaskContinuationSource(rows, error);
+      if (!sock || !source || !canonical) return;
       const key = `${activeId}\0${source.id}`;
       if (pendingContinuations.current.has(key)) return;
       pendingContinuations.current.add(key);
       try {
-        if (interruptedContinuationTarget(rows, error, activeId)) {
-          sock.continueInterruptedTurn({ sessId: activeId, errorMessageId: error.id, agentId: agent.id });
+        if (interruptedContinuationTarget(rows, canonical, activeId)) {
+          sock.continueInterruptedTurn({ sessId: activeId, errorMessageId: canonical.id, agentId: agent.id });
           return;
         }
         const exact = await loadExactOrToast(source);
@@ -371,7 +372,7 @@ export function useChatCardActions({
         pendingContinuations.current.delete(key);
       }
     },
-    [demo, activeId, agent.id, identity, loadExactOrToast, send],
+    [demo, activeId, agent.id, authRef, identity, loadExactOrToast, send, sockRef],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。

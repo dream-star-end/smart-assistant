@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { canonicalTaskContinuationError, manualTaskContinuationSource } from "../lib/chat/manualTaskContinuation";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
@@ -2645,4 +2646,28 @@ test("过程条「已执行 N 个步骤」与右栏本轮步数同口径：只�
   const tally = screen.getByTestId("process-tally");
   expect(within(tally).getByTitle("思考 3")).toBeInTheDocument();
   expect(within(tally).getByTitle("子任务 1")).toBeInTheDocument();
+});
+
+
+test("the real stopped narration projection has one Continue bound to its canonical raw message", () => {
+  const user = { id: "stopped-human", role: "user", text: "原始目标", ts: 1, status: "error" } as ChatMessage;
+  const stopped = { id: "stopped-narration", role: "assistant", text: "已经完成第一步", ts: 2,
+    _errorCode: "USER_CANCELLED", _clientMessageId: user.id } as ChatMessage;
+  const tool = { id: "stopped-tool", role: "tool", text: "", ts: 3, toolName: "Read", output: "saved",
+    _completed: true, _clientMessageId: user.id } as ChatMessage;
+  const messages = [user, stopped, tool];
+  const go = vi.fn();
+  render(<MessageList messages={messages} sending={false}
+    cb={{ resolveInterruptedContinuation: (view) => manualTaskContinuationSource(messages, view),
+      onContinueInterrupted: (view) => {
+        const canonical = canonicalTaskContinuationError(messages, view);
+        if (canonical && manualTaskContinuationSource(messages, view)) go(canonical.id);
+      } }} onRespondPermission={() => {}} />);
+  const buttons = screen.getAllByRole("button", { name: "继续", exact: true });
+  expect(buttons).toHaveLength(1);
+  fireEvent.click(buttons[0]);
+  expect(go).toHaveBeenCalledTimes(1);
+  expect(go).toHaveBeenCalledWith(stopped.id);
+  expect(messages).toEqual([user, stopped, tool]);
+  expect(stopped._continuationSourceId).toBeUndefined();
 });

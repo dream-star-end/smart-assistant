@@ -2,6 +2,7 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { ChatMessage } from "../lib/chat/model";
+import { splitStoppedNarration } from "../components/chat/turnSegment";
 import { captureIdentityAttempt, resolveIdentity } from "../lib/resolvedIdentity";
 import { useChatCardActions, type ChatCardActionsInput } from "./useChatCardActions";
 
@@ -79,4 +80,38 @@ test("zero-output Continue freezes original advisor routing after a later team p
     displayText: "继续", ...routing, text: expect.stringContaining("原任务目标") }));
   expect(input.send).not.toHaveBeenCalled();
   expect(sock.getMessages("s1")).toEqual([original, error]);
+});
+
+
+test("a split stopped view hydrates its canonical human source and retains same-session media/routing", async () => {
+  const original = { ...user, _media: [{ kind: "image", url: "https://example.test/context.png" }],
+    _routing: { model: "glm-5.2", teamMode: false, effortLevel: "high" } } as ChatMessage;
+  const stopped = { ...error, _errorCode: "USER_CANCELLED", text: "已经完成前半段" };
+  const tool = { id: "completed-tool", role: "tool", text: "", ts: 3, _completed: true,
+    _clientMessageId: original.id } as ChatMessage;
+  const rows = [original, stopped, tool];
+  const view = splitStoppedNarration(rows).at(-1)!;
+  const { input, sock } = setup(rows);
+  const { result } = renderHook(() => useChatCardActions(input));
+  expect(result.current.cardCallbacks.resolveInterruptedContinuation!(view)).toBe(original);
+  await result.current.cardCallbacks.onContinueInterrupted!(view);
+  expect(input.loadExactUserMessage).toHaveBeenCalledWith(original);
+  expect(sock.send).toHaveBeenCalledWith(expect.objectContaining({ sessId: "s1", agentId: "main",
+    ...original._routing, displayText: "继续", media: original._media, text: expect.stringContaining(original.text) }));
+  expect(sock.continueInterruptedTurn).not.toHaveBeenCalled();
+  expect(sock.getMessages("s1")).toEqual(rows);
+});
+
+test("checkpoint continuation receives the canonical raw error instead of a presentation clone", async () => {
+  const original = { ...user, _routing: { model: "glm-5.2", teamMode: false, effortLevel: "high" } } as ChatMessage;
+  const tool = { id: "durable-read", role: "tool", text: "", ts: 2, toolName: "Read", output: "saved",
+    _completed: true, _source: "server", _turnTapeId: "tape", _clientMessageId: original.id,
+    _toolEffect: { authority: "gateway-v1", registryEntrySha256: "a".repeat(64), safety: "read_only", outcome: "completed" } } as ChatMessage;
+  const canonical = { ...error, _source: "server", _errorCode: "MODEL_AUTHORITY_EXPIRED", _turnTapeComplete: true } as ChatMessage;
+  const { input, sock } = setup([original, tool, canonical]);
+  const { result } = renderHook(() => useChatCardActions(input));
+  await result.current.cardCallbacks.onContinueInterrupted!({ ...canonical });
+  expect(sock.continueInterruptedTurn).toHaveBeenCalledWith({ sessId: "s1", agentId: "main", errorMessageId: canonical.id });
+  expect(sock.send).not.toHaveBeenCalled();
+  expect(input.send).not.toHaveBeenCalled();
 });

@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import { Pool } from "pg";
 import { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxUserStopHandler } from "./boxUserStopHandler.js";
+import { abortInflightJournal } from "../../billing/proxyBilling.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, hashBoxAssistantContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -58,18 +59,65 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
       await stop(req as never,res as never,{ hostUuid: "synthetic",boundIp: "127.0.0.1" });
       assert.equal(status,200); assert.deepEqual(JSON.parse(response),{ status: physicalPending ? "pending" : "stopped" });
     };
-    const admitNextUserAfterStop = async (nextId: string) => {
+    const admitNextUserAfterStop = async (nextId: string, nextJournal = journal) => {
       const nextTurn = "b".repeat(64);
       const nextBody = { ...body,messages: [...body.messages,{ role: "user",content: "continue from the saved result" }],
         metadata: { user_id: JSON.stringify({ session_id: session,oc_turn_key: nextTurn }) } } as ProxyBody;
       const nextBasis = { ...basis,boxBillingContext: { ...basis.boxBillingContext,turnKey: nextTurn } };
       await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,state,ctx)
         VALUES ($1,3,7,'inflight',$2::jsonb)`,[nextId,JSON.stringify(nextBasis)]);
-      await journal.admit({ requestId: nextId,uid: 3n,accountId: 20n,model,canonicalBody: nextBody,
+      await nextJournal.admit({ requestId: nextId,uid: 3n,accountId: 20n,model,canonicalBody: nextBody,
         fingerprint: deriveBoxCallFingerprint(3n,nextBody),runNonce: "7".repeat(24),leaseEpoch: "8".repeat(32),
         invocationMode: "detached_tool",contextHash: deriveBoxContextHash(nextBody),detachedRunnerHash: runner,catalogHash });
       assert.equal((await query(`SELECT ctx->>'boxState' state FROM request_finalize_journal WHERE request_id=$1`,[nextId])).rows[0]!.state,"reserved");
       await query(`DELETE FROM request_finalize_journal WHERE request_id=$1`,[nextId]);
+    };
+    const abortRequest = (requestId: string) => abortInflightJournal({ query } as never,
+      requestId,"synthetic HTTP disconnect","STREAM_FAILED");
+    const resetGap = (requestId: string, ctx: unknown) => query(`UPDATE request_finalize_journal
+      SET state='inflight',ctx=$2::jsonb,final_credits=NULL,failure_code=NULL,error_msg=NULL WHERE request_id=$1`,
+      [requestId,JSON.stringify(ctx)]);
+    await query(`INSERT INTO request_finalize_journal(request_id,user_id,container_id,state,ctx)
+      VALUES ('non-box-abort',3,7,'inflight','{"model":"deepseek-v4-flash"}'::jsonb)`);
+    assert.equal(await abortRequest("non-box-abort"),true);
+    const nonBox = (await query(`SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id='non-box-abort'`)).rows[0]!;
+    assert.deepEqual(nonBox,{ state: "aborted",credits: "0",ctx: { model: "deepseek-v4-flash" } },
+      "ordinary non-Box abort retains its original journal result without Box metadata");
+    await query(`DELETE FROM request_finalize_journal WHERE request_id='non-box-abort'`);
+    const exerciseDisconnectedGap = async (requestId: string, ctx: unknown, count: number, tag: string) => {
+      await resetGap(requestId,ctx);
+      assert.equal(await abortRequest(requestId),true);
+      // No Stop RPC/catch callback: the original process can disappear here.
+      const restarted = new BoxDurableJournal({ query,
+        connect: async () => ({ query,release() {} }) } as never);
+      for (let read = 0; read < 2; read++) {
+        const idle = await restarted.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
+        assert.equal(idle.status,"failed",`${tag}: durable abort alone survives process loss`);
+        if (idle.status === "failed") assert.equal(idle.requestIds.length,count);
+      }
+      await admitNextUserAfterStop(`${tag}-disconnect`,restarted);
+      await resetGap(requestId,ctx);
+    };
+    const exerciseAbortStopGap = async (requestId: string, ctx: unknown, count: number, tag: string) => {
+      for (const order of ["abort-before-stop","stop-before-abort"]) {
+        await resetGap(requestId,ctx);
+        if (order === "abort-before-stop") assert.equal(await abortRequest(requestId),true);
+        await stopGap();
+        if (order === "stop-before-abort") assert.equal(await abortRequest(requestId),true);
+        const row = (await query(`SELECT state,final_credits::text credits,ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!;
+        assert.equal(row.state,"aborted"); assert.equal(row.credits,"0");
+        assert.equal(row.ctx.boxState,"prestart_stopped"); assert.equal(row.ctx.boxRolloverCancelled,true);
+        for (const key of ["boxTerminalProof","boxRunNonce","boxLeaseEpoch","boxLaunchPermit","boxPrelaunchControl"]) {
+          assert.equal(Object.hasOwn(row.ctx,key),false,"abort/Stop ordering cannot invent physical evidence");
+        }
+        const idle = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
+        assert.equal(idle.status,"failed",`${tag}: ${order} closes idle history`);
+        if (idle.status === "failed") assert.equal(idle.requestIds.length,count);
+        await admitNextUserAfterStop(`${tag}-${order}`);
+        await stopGap(); // Repeated authenticated Stop is idempotent after either ordering.
+        assert.equal(await abortRequest(requestId),false);
+      }
+      await resetGap(requestId,ctx);
     };
     let nonce = randomBytes(12).toString("hex"), epoch = randomBytes(16).toString("hex");
     let localRound = 0, generations = 0, stops = 0, probeArm = false;
@@ -92,16 +140,21 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
         await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxContextHash}',to_jsonb($2::text))
           WHERE request_id=$1`,[requestId,identity.contextHash]);
         const admitted = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
-        for (const state of ["reserved","unknown"]) {
-          await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxState}',to_jsonb($2::text))
-            WHERE request_id=$1`,[requestId,state]);
-          assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),true);
-          const cancelled = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
-          assert.equal(cancelled.boxState,state,"an admitted or unknown generation still requires physical cleanup proof");
-          assert.equal(cancelled.boxTerminalProof,undefined);
-          assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
-          await assert.rejects(() => journal.armGuardedLaunch({ ...identity,receipt }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
-          await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(admitted)]);
+        for (const state of ["reserved","unknown","running"]) {
+          for (const journalState of ["inflight","aborted"]) {
+            await query(`UPDATE request_finalize_journal SET state=$3,final_credits=CASE WHEN $3='aborted' THEN 0 ELSE NULL END,
+              ctx=jsonb_set(ctx,'{boxState}',to_jsonb($2::text))
+                || CASE WHEN $2='running' THEN '{"boxLaunchPermit":true}'::jsonb ELSE '{}'::jsonb END
+              WHERE request_id=$1`,[requestId,state,journalState]);
+            assert.equal(await abortRequest(requestId),false,"HTTP abort cannot close a physical admission");
+            assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),journalState === "inflight");
+            const cancelled = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+            assert.equal(cancelled.boxState,state,"even an aborted physical generation still requires cleanup proof");
+            assert.equal(cancelled.boxTerminalProof,undefined);
+            assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
+            await assert.rejects(() => journal.armGuardedLaunch({ ...identity,receipt }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
+            await resetGap(requestId,admitted);
+          }
         }
         probeArm = false;
       }
@@ -143,11 +196,11 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
           const gap = await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn });
           assert.equal(gap.status,"pending");
           await assert.rejects(() => journal.finishToolRollover({ requestId,uid: 3n,claim }),
-            undefined,"claim and a missing proof never authorize another generation");
+            "claim and a missing proof never authorize another generation");
           const beforeFinishCtx = index === 128
             ? (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx : undefined;
           if (index === 128) {
-            await stopGap(true);
+            assert.equal(await abortRequest(requestId),true);
             assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,
               "pending","a cancelled never-admitted successor cannot stand in for a missing old physical proof");
           }
@@ -168,7 +221,8 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(closedGap)]);
             await assert.rejects(() => journal.finishToolRollover({ requestId,uid: 3n,claim }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
             await admitNextUserAfterStop("roll-gap-before-finish");
-            await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(beforeFinishCtx)]);
+            await exerciseDisconnectedGap(requestId,beforeFinishCtx,129,"before-finish");
+            await exerciseAbortStopGap(requestId,beforeFinishCtx,129,"before-finish");
           }
           await journal.finishToolRollover({ requestId,uid: 3n,claim }); stops++;
           if (index === 128) {
@@ -203,8 +257,53 @@ test("260 paid-result boundaries span three bounded generations and finish idle"
             if (stoppedIdle.status === "failed") assert.deepEqual(stoppedIdle.requestIds,[requestId]);
             // A real next user turn can reserve this same session/account immediately.
             await admitNextUserAfterStop("roll-gap-continue");
-            // Restore only this synthetic negative branch to exercise the successful 260-call path too.
-            await query(`UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(gapBeforeStop)]);
+            await exerciseDisconnectedGap(requestId,gapBeforeStop,1,"after-finish");
+            await exerciseAbortStopGap(requestId,gapBeforeStop,1,"after-finish");
+            // A row aborted by the previous deployment (without the new atomic marker) also closes on Stop.
+            await query(`UPDATE request_finalize_journal SET state='aborted',final_credits=0 WHERE request_id=$1`,[requestId]);
+            await stopGap();
+            assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"failed");
+            await resetGap(requestId,gapBeforeStop);
+            // A finalizing/committed owner and a corrupt aborted receipt stay pending.
+            for (const state of ["finalizing","committed"]) {
+              await query(`UPDATE request_finalize_journal SET state=$2,final_credits=CASE WHEN $2='committed' THEN 1 ELSE NULL END
+                WHERE request_id=$1`,[requestId,state]);
+              assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false);
+              assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
+              assert.equal((await query(`SELECT state FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.state,state);
+              await resetGap(requestId,gapBeforeStop);
+            }
+            for (const marker of [{ boxRunNonce: "9".repeat(24) },{ boxLaunchPermit: true },
+              { boxPrelaunchControl: {} },{ settlementClaimId: "11111111-1111-4111-8111-111111111111" }]) {
+              await query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(marker)]);
+              assert.equal(await abortRequest(requestId),true);
+              if ("settlementClaimId" in marker) await query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb WHERE request_id=$1`,[requestId,JSON.stringify(marker)]);
+              assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false);
+              assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
+              await resetGap(requestId,gapBeforeStop);
+            }
+            await query(`UPDATE request_finalize_journal SET state='aborted',final_credits=1 WHERE request_id=$1`,[requestId]);
+            assert.equal(await journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),false,
+              "a contradictory charged aborted row is never silently closed");
+            assert.equal((await query(`SELECT final_credits::text credits FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.credits,"1");
+            await resetGap(requestId,gapBeforeStop);
+            for (const malformed of [null,{},"not-an-array"]) {
+              await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRolloverFrom,resultHashes}',$2::jsonb)
+                WHERE request_id=$1`,[requestId,JSON.stringify(malformed)]);
+              assert.equal(await abortRequest(requestId),true,"malformed receipt data cannot break the ordinary abort CAS");
+              assert.equal((await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx.boxState,undefined);
+              assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
+              await resetGap(requestId,gapBeforeStop);
+            }
+            await query(`UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRolloverFrom,resultHashes}','[]'::jsonb)
+              WHERE request_id=$1`,[requestId]);
+            assert.equal(await abortRequest(requestId),true);
+            await assert.rejects(() => journal.cancelToolRollovers({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn }),/BOX_TOOL_ROLLOVER_FENCE_LOST/);
+            const corrupt = (await query(`SELECT ctx FROM request_finalize_journal WHERE request_id=$1`,[requestId])).rows[0]!.ctx;
+            assert.equal(corrupt.boxState,undefined); assert.equal(corrupt.boxRolloverCancelled,undefined);
+            assert.equal((await journal.readIdleProof({ uid: 3n,containerId: 7n,sessionId: session,turnKey: turn })).status,"pending");
+            // Restore only synthetic negative branches; no production Stop/financial record is reversed.
+            await resetGap(requestId,gapBeforeStop);
             probeArm = true;
           }
           await launch(requestId);

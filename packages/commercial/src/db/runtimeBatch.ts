@@ -13,9 +13,9 @@ export type HydratedRuntimeBatchDescriptor = {
   manifestSha256: string;
 };
 
-export function expandHydratedRuntimeBatch(
+export function expandHydratedRuntimeBatch<Row extends RuntimeBatchRow>(
   hydrated: MessageLike,
-  row: RuntimeBatchRow,
+  row: Row,
   anchor: MessageLike,
 ): { messages: MessageLike[]; descriptor?: HydratedRuntimeBatchDescriptor } {
   const rawBatch = hydrated._runtimeEventBatch;

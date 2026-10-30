@@ -5,7 +5,7 @@ import { parseBoxReplayMessagePointer, type BoxReplayMessagePointer } from "./bo
 import { BOX_EXPIRED_UNPROVEN_STATE, parseBoxExpiredClose } from "./boxExpiredClose.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { BOX_TOOL_MAX_ROUNDS } from "./boxToolCapacity.js";
-import { parseToolRollover } from "./boxToolRollover.js";
+import { unadmittedToolRollover } from "../../billing/boxToolRolloverIdentity.js";
 import { parseBoxTerminalProof } from "./boxTerminalProof.js";
 
 /** Real autocompact floor for a 200k window minus the stock buffer. Not a test override. */
@@ -333,14 +333,10 @@ function singleRevision(input: { sessionId: string; turnKey: string }, chain: Id
  * physical round. Only its exact 128-row, proof-closed predecessor can
  * authorize this additional idle component before retirement commits. */
 function cancelledRolloverExtra(row: IdleChainRow, byId: Map<string,IdleChainRow>): boolean {
-  const ctx = row.ctx, receipt = parseToolRollover(ctx.boxRolloverFrom);
+  const ctx = row.ctx, receipt = unadmittedToolRollover(ctx,row.requestId);
   if (!receipt || ctx.boxState !== "prestart_stopped" || ctx.boxRolloverCancelled !== true
-    || !["inflight","aborted"].includes(row.state) || receipt.requestId !== row.requestId
-    || (row.finalCredits != null && row.finalCredits !== "0")
-    || receipt.sessionId !== ctx.boxSessionId || receipt.turnKey !== ctx.boxTurnKey || receipt.model !== ctx.model
-    || ["boxRunNonce","boxLeaseEpoch","boxAccountId","boxInvocationMode","boxLaunchPermit",
-      "boxPrelaunchControl","boxTerminalProof","boxOwnerRequestId","boxResumeRequestId",
-      "boxReplayMessage","boxUsage","settlementClaimId"].some((key) => Object.hasOwn(ctx,key))) return false;
+    || !["inflight","aborted"].includes(row.state)
+    || (row.finalCredits != null && row.finalCredits !== "0")) return false;
   const prior = byId.get(receipt.ownerRequestId);
   if (!prior || prior.ctx.boxRecoveredBy !== row.requestId
     || !isDeepStrictEqual(prior.ctx.boxRolloverTo,receipt)) return false;
