@@ -9619,6 +9619,40 @@
           "assertion": "[ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key"
         }
       ]
+    },
+    {
+      "id": "INC-20261030-ADVISOR-NOWRITE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "uid2058 会话 webmvvde0m9oyavl3 明确要求顾问只给建议、不要改文件，主模型仍以顾问模式验证要求为由成功 Edit 提纲。禁写回合现冻结只读策略，在 CCB/Codex/Grok/Cursor 原生工具和 MCP 调用边界卸掉写入、命令和委派路径，顾问同步收到禁写约束，下一普通回合恢复工具。",
+      "rootFixCommit": "bd2545a8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorNoWriteTurn.test.ts",
+          "assertion": "queued"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyCcb.test.ts",
+          "assertion": "CCB warm transitions rebuild the tool surface and drop external MCP before user input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdvisorReadOnly.test.ts",
+          "assertion": "Codex read-only turn replaces a warm process, removes native execution, and restores normal tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/advisorReadOnlyPolicy.test.ts",
+          "assertion": "advisor read-only MCP removes mutators and rejects direct calls before gateway or file writes"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "proveAdvisorNoWrite(root);"
+        }
+      ]
     }
   ]
 }
