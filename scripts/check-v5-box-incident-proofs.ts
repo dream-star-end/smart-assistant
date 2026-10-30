@@ -3704,7 +3704,7 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
-  const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
+  const proofs = [(await import("./lib/boxKeeperOwnedChildrenProof.js")).proveKeeperOwnedChildren(CANDIDATE), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
     proveForeignToolHistory(api), await proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api), await (await import("./lib/boxCapacityHeldProof.js")).proveCapacityHeldReleased(CANDIDATE), // OCV5-649 (file-size ratchet): [ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered
