@@ -7,6 +7,7 @@ export function proveAdvisorNoWrite(root: string): void {
   const tests = [
     'packages/gateway/src/__tests__/advisorNoWriteTurn.test.ts',
     'packages/gateway/src/__tests__/advisorReadOnlyCcb.test.ts',
+    'packages/gateway/src/__tests__/advisorReadOnlyBox.test.ts',
     'packages/gateway/src/__tests__/advisorReadOnlyCliAdapters.test.ts',
     'packages/gateway/src/__tests__/codexAdvisorReadOnly.test.ts',
     'packages/mcp-memory/src/__tests__/advisorReadOnlyPolicy.test.ts',
