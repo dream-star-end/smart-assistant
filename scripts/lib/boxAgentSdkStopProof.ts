@@ -37,6 +37,7 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
   const started=new Set<string>()
   let ready!:()=>void
   let modelClosed!:()=>void
+  let abortObserved=false
   const abortedModel=new Promise<void>(resolve=>{modelClosed=resolve})
   const taskReady=new Promise<void>(resolve=>{ready=resolve})
   const maybeReady=()=>{if(modelReady && agentId && started.has(agentId)) ready()}
@@ -45,7 +46,9 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
   let rootCalls=0
   const server=createServer(async(req,res)=>{
     try {
-      assert.equal(req.url,'/v1/messages')
+      const endpoint=new URL(req.url!,'http://127.0.0.1')
+      assert.equal(endpoint.pathname,'/v1/messages')
+      assert.ok(endpoint.search==='' || endpoint.search==='?beta=true')
       const chunks:Buffer[]=[]
       for await(const chunk of req)chunks.push(Buffer.from(chunk))
       const body=JSON.parse(Buffer.concat(chunks).toString('utf8')) as ProxyBody
@@ -59,7 +62,7 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
         await input.admitSynthetic(body)
         // The synthetic model has not launched a paid process. Keep the real
         // HTTP request open so only the actual TaskStop abort can end it.
-        res.once('close',()=>{if(!cleaning && !res.writableFinished)modelClosed()})
+        res.once('close',()=>{if(!cleaning && !res.writableFinished){abortObserved=true;modelClosed()}})
         modelReady=true;maybeReady()
         return
       }
@@ -79,6 +82,10 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
   let stopArrived!:()=>void
   const stopped=new Promise<void>(resolve=>{stopArrived=resolve})
   const stopId=`stop-${randomUUID()}`
+  const failedStopId=`stop-failed-${randomUUID()}`
+  let rejectFirstStop=true
+  let failedStopArrived!:()=>void
+  const failedStop=new Promise<void>(resolve=>{failedStopArrived=resolve})
   const barrierId=`barrier-${randomUUID()}`
   let barrierObserved=false
   let stopObserved=false
@@ -132,12 +139,22 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
             controls=controls.then(async()=>{
               const request=parseBoxAgentScopeControl(frame.request);assert.ok(request && child?.pid && rootSession)
               identities.set(request.scopeId,{agentId:request.agentId,background:request.background})
+              if(request.operation==='explicit-stop' && rejectFirstStop) {
+                rejectFirstStop=false
+                write({type:'control_response',response:{subtype:'error',request_id:frame.request_id,
+                  error:'synthetic durable Stop persist failed'}})
+                return
+              }
               const owner=captureBoxScopeOwner(child.pid,1,incarnation,rootSession)
               const response=await input.registry.handle(request,owner)
               const ack=()=>write({type:'control_response',response:{subtype:'success',request_id:frame.request_id,response}})
-              if(request.operation==='explicit-stop') {assert.equal(request.agentId,agentId);heldAck=ack;cancelArrived()}
+              if(request.operation==='explicit-stop' && !heldAck) {assert.equal(request.agentId,agentId);heldAck=ack;cancelArrived()}
               else ack()
             }).catch(fail)
+          } else if(frame.type==='control_response' && frame.response?.request_id===failedStopId) {
+            assert.equal(frame.response.subtype,'error','Unpersisted Stop must fail instead of claiming pending')
+            assert.equal(abortObserved,false,'Failed durable Stop must preserve the running local task')
+            failedStopArrived()
           } else if(frame.type==='control_response' && frame.response?.request_id===barrierId) {
             assert.equal(frame.response.subtype,'success');assert.equal(stopObserved,false)
             barrierObserved=true;barrierArrived()
@@ -152,6 +169,9 @@ export async function proveBoxAgentSdkStop(input:{runtime:string;model:string;en
     })
     write({type:'user',message:{role:'user',content:'Use Agent once; the host will stop its running task.'}})
     await within(taskReady)
+    write({type:'control_request',request_id:failedStopId,request:{subtype:'stop_task',task_id:agentId}})
+    await within(failedStop)
+    assert.equal(abortObserved,false)
     write({type:'control_request',request_id:stopId,request:{subtype:'stop_task',task_id:agentId}})
     await within(cancelled)
     assert.equal(stopObserved,false)

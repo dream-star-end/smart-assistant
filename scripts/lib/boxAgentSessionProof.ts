@@ -107,7 +107,9 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
   const meta=(body:ProxyBody) => JSON.parse(String(body.metadata?.user_id)) as Record<string,unknown>
   const server=createServer(async (req,res) => {
     try {
-      assert.equal(req.url,'/v1/messages')
+      const endpoint=new URL(req.url!,'http://127.0.0.1')
+      assert.equal(endpoint.pathname,'/v1/messages')
+      assert.ok(endpoint.search==='' || endpoint.search==='?beta=true')
       const chunks:Buffer[]=[]
       for await(const chunk of req) chunks.push(Buffer.from(chunk))
       const body=JSON.parse(Buffer.concat(chunks).toString('utf8')) as ProxyBody

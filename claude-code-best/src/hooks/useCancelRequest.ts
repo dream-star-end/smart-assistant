@@ -24,7 +24,6 @@ import type { Screen } from '../screens/REPL.js'
 import { exitTeammateView } from '../state/teammateViewHelpers.js'
 import {
   killAllRunningAgentTasks,
-  markAgentsNotified,
 } from '../tasks/LocalAgentTask/LocalAgentTask.js'
 import type { PromptInputMode, VimMode } from '../types/textInputTypes.js'
 import {
@@ -32,7 +31,6 @@ import {
   enqueuePendingNotification,
   hasCommandsInQueue,
 } from '../utils/messageQueueManager.js'
-import { emitTaskTerminatedSdk } from '../utils/sdkEventQueue.js'
 
 /** Time window in ms during which a second press kills all background agents. */
 const KILL_AGENTS_CONFIRM_WINDOW_MS = 3000
@@ -168,31 +166,32 @@ export function CancelRequestHandler(props: CancelRequestHandlerProps): null {
 
   // Shared kill path: stop all agents, suppress per-agent notifications,
   // emit SDK events, enqueue a single aggregate model-facing notification.
-  // Returns true if anything was killed.
+  // Returns true if any Stop was requested. Notifications follow durable ACKs.
   const killAllAgentsAndNotify = useCallback((): boolean => {
     const tasks = store.getState().tasks
     const running = Object.entries(tasks).filter(
       ([, t]) => t.type === 'local_agent' && t.status === 'running',
     )
     if (running.length === 0) return false
-    killAllRunningAgentTasks(tasks, setAppState)
-    const descriptions: string[] = []
-    for (const [taskId, task] of running) {
-      markAgentsNotified(taskId, setAppState)
-      descriptions.push(task.description)
-      emitTaskTerminatedSdk(taskId, 'stopped', {
-        toolUseId: task.toolUseId,
-        summary: task.description,
-      })
-    }
-    const summary =
-      descriptions.length === 1
-        ? `Background agent "${descriptions[0]}" was stopped by the user.`
-        : `${descriptions.length} background agents were stopped by the user: ${descriptions.map(d => `"${d}"`).join(', ')}.`
-    enqueuePendingNotification({ value: summary, mode: 'task-notification' })
-    onAgentsKilled()
+    void killAllRunningAgentTasks(tasks, setAppState).then(outcomes => {
+      const stopped = outcomes.filter(result => result.status === 'stopped')
+      if (stopped.length > 0) {
+        const descriptions = stopped.map(result => `"${result.task.description}"`).join(', ')
+        const pending = stopped.filter(result => result.remoteStop === 'pending').length
+        const summary = `${stopped.length} background agent task(s) stopped locally: ${descriptions}.`
+          + (pending ? ` Remote Box stop proof pending for ${pending} task(s).` : '')
+        enqueuePendingNotification({ value: summary, mode: 'task-notification' })
+        onAgentsKilled()
+      }
+      const unconfirmed = outcomes.length - stopped.length
+      if (unconfirmed > 0) {
+        const summary = `Stop not confirmed for ${unconfirmed} background agent task(s); check their current status and retry.`
+        addNotification({ key: 'kill-agents-unconfirmed', text: summary, priority: 'immediate', timeoutMs: 5000 })
+        enqueuePendingNotification({ value: summary, mode: 'task-notification' })
+      }
+    })
     return true
-  }, [store, setAppState, onAgentsKilled])
+  }, [store, setAppState, onAgentsKilled, addNotification])
 
   // Ctrl+C (app:interrupt). Scoped to teammate-view: killing agents from the
   // main prompt stays a deliberate gesture (chat:killAgents), not a

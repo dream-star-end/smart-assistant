@@ -184,7 +184,7 @@ describe('Box Agent invocation boundaries', () => {
     await runWithAgentContext(parent,()=>ensureBoxAgentScope(BOX))
     const invocation=parent.boxInvocation!
     bindBoxAgentControlTransport(async()=>{throw new Error('lost terminal control')})
-    await expect(stopBoxAgentById(invocation.agentId)).resolves.toBe('pending')
+    await expect(stopBoxAgentById(invocation.agentId)).rejects.toThrow('lost terminal control')
     await expect(finishBoxAgentInvocation(invocation)).rejects.toThrow('lost terminal control')
     expect(invocation.retireRetry).toBeDefined()
     const delivered:string[]=[]
@@ -193,5 +193,18 @@ describe('Box Agent invocation boundaries', () => {
     await finishBoxAgentInvocation(invocation)
     expect(delivered).toEqual(['explicit-stop'])
     expect(invocation.retireRetry).toBeUndefined()
+  })
+
+  test('an active or mismatched Stop ACK never confirms cancellation',async()=>{
+    turn('a')
+    const target=scope('unconfirmed-stop')
+    bindBoxAgentControlTransport(async request=>({scopeId:request.scopeId,sequence:request.sequence,status:'active'}))
+    await runWithAgentContext(target,()=>ensureBoxAgentScope(BOX))
+    await expect(stopBoxAgentById(target.agentId)).rejects.toThrow('BOX_AGENT_STOP_NOT_CONFIRMED')
+    expect(target.boxInvocation!.closed).toBe(true)
+    bindBoxAgentControlTransport(async request=>({scopeId:request.scopeId,sequence:request.sequence+1,status:'pending'}))
+    await expect(stopBoxAgentById(target.agentId)).rejects.toThrow('BOX_AGENT_CONTROL_ACK_MISMATCH')
+    bindBoxAgentControlTransport(async request=>({scopeId:request.scopeId,sequence:request.sequence,status:'pending'}))
+    await expect(stopBoxAgentById(target.agentId)).resolves.toBe('pending')
   })
 })

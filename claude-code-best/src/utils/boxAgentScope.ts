@@ -232,7 +232,8 @@ export async function stopBoxAgentInvocation(scope: BoxAgentInvocation): Promise
   scope.closed = true
   scope.cancelOperation = 'explicit-stop'
   const result = await control(scope, 'explicit-stop')
-  return result.status === 'stopped' ? 'stopped' : 'pending'
+  if (result.status !== 'pending' && result.status !== 'stopped') throw new Error('BOX_AGENT_STOP_NOT_CONFIRMED')
+  return result.status
 }
 
 export async function stopBoxAgentById(agentId: string): Promise<'pending' | 'stopped' | undefined> {
@@ -241,7 +242,7 @@ export async function stopBoxAgentById(agentId: string): Promise<'pending' | 'st
   for (const scope of invocations) scope.closed = true
   const targets = invocations.filter(scope => scope.registered || scope.pending)
   if (!targets.length) return undefined
-  const results = await Promise.all(targets.map(scope => stopBoxAgentInvocation(scope).catch(() => 'pending' as const)))
+  const results = await Promise.all(targets.map(scope => stopBoxAgentInvocation(scope)))
   return results.every(status => status === 'stopped') ? 'stopped' : 'pending'
 }
 
@@ -257,7 +258,8 @@ export async function finishBoxAgentInvocation(scope: BoxAgentInvocation | undef
       // A lost registration ACK may have reached the gateway. Re-register
       // this exact closed generation before retrying its terminal intent.
       if (!scope.registered) {await control(scope,'register');scope.registered=true}
-      await control(scope,scope.cancelOperation)
+      const result=await control(scope,scope.cancelOperation)
+      if (result.status !== 'pending' && result.status !== 'stopped') throw new Error('BOX_AGENT_STOP_NOT_CONFIRMED')
     }
     scopes.delete(scope.scopeId)
   } catch(error) {
