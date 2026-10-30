@@ -165,7 +165,7 @@ import {
   type ImplicitTarget,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
+import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
@@ -1263,7 +1263,7 @@ export function App() {
     for (const id of sendingIdsRef.current) {
       if (!now.has(id)) {
         const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: Date.now() });
+        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
       }
     }
     sendingIdsRef.current = now;

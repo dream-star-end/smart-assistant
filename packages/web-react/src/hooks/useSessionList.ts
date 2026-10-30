@@ -260,6 +260,9 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   //  - pending:最新未落库的显式选择。存续期内一切载荷 modelId 不应用(本地意图优先);
   //    也是"连选合并"的载体 —— 单飞循环每轮取最新 pending,旧值绝不出网,写天然串行无倒序。
   //  - inflight:单飞闸(同会话同时至多一个 PATCH 在途)。
+  const terminalFillRef = useRef<Map<string, { endedAt: number; serverSettled: boolean }>>(
+    new Map(),
+  );
   const modelSyncRef = useRef<Map<string, { floor: number; pending?: string; inflight: boolean }>>(
     new Map(),
   );
@@ -564,6 +567,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       try {
         const metas = await api.listSessions(cbRef.current.authSession);
         if (!isCurrent()) return false;
+        for (const m of metas) {
+          if (m.runState !== "running") {
+            const fill = terminalFillRef.current.get(m.id);
+            if (fill) fill.serverSettled = true;
+          }
+        }
         const server = mapListMetas(metas);
         setSessions((cur) => upsertSessions(cur, server, true));
         if (opts?.initial) {
@@ -917,15 +926,27 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       sessId: string,
       terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
     ) => {
+      let allowEndedAtFill = false;
+      if (terminal?.endedAt != null) {
+        const prev = terminalFillRef.current.get(sessId);
+        if (!prev || terminal.endedAt > prev.endedAt) {
+          terminalFillRef.current.set(sessId, { endedAt: terminal.endedAt, serverSettled: false });
+          allowEndedAtFill = true;
+        } else {
+          allowEndedAtFill = !prev.serverSettled;
+        }
+      }
       setSessions((c) =>
         c.map((x) => {
           if (x.id !== sessId) return x;
           const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
           const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
-          // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 还是回合开始前那次轮询的值，
-          // 行从「运行中算到现在」跌回旧值，要等下一轮列表刷新（≤60s）才对上。用本 tab 看到的结束时刻补上。
+          // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 可能还停在回合开始前，
+          // 临时补齐防回跳；一旦服务端权威 idle 列表到达校正（serverSettled），重放不再覆盖权威 lastAt。
           const ended =
-            terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0) ? { lastAt: terminal.endedAt } : null;
+            allowEndedAtFill && terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0)
+              ? { lastAt: terminal.endedAt }
+              : null;
           if (
             x.runState === "idle" &&
             x.lastOutcome === nextOutcome &&
@@ -962,6 +983,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     historyFetchingRef.current.clear();
     setHistoryLoadingTokens(new Map());
     setHistoryErrorBySession(new Map());
+    terminalFillRef.current.clear();
     modelSyncRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     nextCursorRef.current = undefined;
