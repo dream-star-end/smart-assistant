@@ -64,12 +64,12 @@ export const DELEGATE_LEADER_RESULT_TOTAL_MAX_CHARS = 24000
 const DELEGATE_LEADER_RESULT_MIN_CHARS = 800
 
 /**
- * 成员回传里的产物路径。引号、反引号和尖括号中的文件名保留空格与括号。
- * 裸路径在空白、未闭合的右括号和句读处停下,避免 Read 目标带上正文标点。
+ * 成员回传里的产物路径。成对引号、反引号、尖括号和书名号里的内容一直取到配对结束符,
+ * 空格、中文和多个点都算文件名。裸路径在空白、行尾和句末标点处停下,不按点号后的字符类别截断。
  */
 const ARTIFACT_PREFIX = '/home/agent/.openclaude/generated/'
 
-/** 开引号 → 闭引号。路径本身被包住时,中间的空格和括号都算文件名。 */
+/** 开引号 → 闭引号。路径本身被包住时,中间任何合法文件名字符都保留。 */
 const ARTIFACT_QUOTE_CLOSER: Readonly<Record<string, string>> = {
   '`': '`',
   '"': '"',
@@ -80,11 +80,8 @@ const ARTIFACT_QUOTE_CLOSER: Readonly<Record<string, string>> = {
   '『': '』',
 }
 
-/** 裸路径在这些字符处结束。点号另判:后面还是扩展名才继续。 */
+/** 裸路径在这些字符处结束。点号不是句末标点,后面的中文仍属于文件名。 */
 const BARE_PATH_STOP = /[\s`"'\]>,;:!?，。、；：！？…]/u
-const QUOTED_CUT = /[。，、；：！？,;:!?…]/u
-const CJK_PROSE = /[\u3400-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/u
-const FILE_EXT = /\.[A-Za-z0-9]{1,12}$/
 
 export function delegateLeaderResultBudget(itemCount: number): number {
   const n = Number.isFinite(itemCount) && itemCount >= 1 ? Math.floor(itemCount) : 1
@@ -95,37 +92,6 @@ export function delegateLeaderResultBudget(itemCount: number): number {
       Math.floor(DELEGATE_LEADER_RESULT_TOTAL_MAX_CHARS / n),
     ),
   )
-}
-
-function stripTrailingBodyPunct(path: string): string {
-  return path.replace(/[.．…,;:!?，。、；：！？]+$/u, '')
-}
-
-function pathFromQuotedInterior(raw: string): string | null {
-  const cutAt = raw.search(QUOTED_CUT)
-  const sliced = cutAt < 0 ? raw : raw.slice(0, cutAt)
-  const text = sliced.trimEnd()
-  if (!text.startsWith(ARTIFACT_PREFIX)) return null
-  let i = ARTIFACT_PREFIX.length
-  let best = -1
-  while (i < text.length) {
-    if (text[i] === ' ' || text[i] === '\t') break
-    const tokenStart = i
-    while (i < text.length && text[i] !== ' ' && text[i] !== '\t') i += 1
-    const token = text.slice(tokenStart, i)
-    if (FILE_EXT.test(token)) best = i
-    let j = i
-    while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j += 1
-    if (j >= text.length || j === i) break
-    let k = j
-    while (k < text.length && text[k] !== ' ' && text[k] !== '\t') k += 1
-    const next = text.slice(j, k)
-    // 扩展名后再出现中文,是「路径 + 说明」而不是文件名后半段。
-    if (best >= 0 && (CJK_PROSE.test(next) || next.startsWith('/'))) break
-    i = j
-  }
-  if (best <= ARTIFACT_PREFIX.length) return null
-  return text.slice(0, best)
 }
 
 function quotedArtifactSpan(
@@ -145,9 +111,10 @@ function quotedArtifactSpan(
   if (end < 0) return null
   const newline = text.indexOf('\n', prefixAt)
   if (newline >= 0 && newline < end) return null
-  const path = pathFromQuotedInterior(text.slice(prefixAt, end))
-  if (!path || !text.startsWith(path, prefixAt)) return null
-  return { path, next: prefixAt + path.length }
+  const path = text.slice(prefixAt, end).trim()
+  if (!path.startsWith(ARTIFACT_PREFIX) || path.length <= ARTIFACT_PREFIX.length) return null
+  if (!text.startsWith(path, prefixAt)) return null
+  return { path, next: end + close.length }
 }
 
 function bareArtifactSpan(text: string, prefixAt: number): { path: string; next: number } {
@@ -169,19 +136,12 @@ function bareArtifactSpan(text: string, prefixAt: number): { path: string; next:
       i += 1
       continue
     }
-    if (ch === '.' || ch === '．') {
-      const next = text[i + 1] ?? ''
-      if (!/[A-Za-z0-9]/.test(next)) break
-      i += 1
-      continue
-    }
     if (BARE_PATH_STOP.test(ch)) break
     i += 1
   }
   // 左括号没配上时,括号后面的句子不属于文件名。
   if (depth > 0 && rewindTo >= 0) i = rewindTo
-  const raw = text.slice(prefixAt, i)
-  const path = stripTrailingBodyPunct(raw)
+  const path = text.slice(prefixAt, i)
   return { path, next: Math.max(i, prefixAt + ARTIFACT_PREFIX.length) }
 }
 

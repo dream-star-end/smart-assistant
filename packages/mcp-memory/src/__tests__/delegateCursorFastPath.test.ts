@@ -403,13 +403,13 @@ describe('truncateDelegateLeaderResult', () => {
     assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [quoted, angled, cjk])
   })
 
-  it('drops sentence punctuation and a following clause from the Read target', () => {
+  it('drops sentence punctuation outside a bare or quoted path', () => {
     const bare = '/home/agent/.openclaude/generated/trip-plan.md'
     const gz = '/home/agent/.openclaude/generated/archive.tar.gz'
     const csv = '/home/agent/.openclaude/generated/sales.csv'
     const text = [
       'H'.repeat(3500),
-      `见 ${bare}。以及 ${gz}.下一句 "${csv} 是结果",结束`,
+      `见 ${bare}。以及 ${gz}。下一句 "${csv}",结束`,
       'T'.repeat(3500),
     ].join('')
     assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [bare, gz, csv])
@@ -431,13 +431,38 @@ describe('truncateDelegateLeaderResult', () => {
     ])
   })
 
-  it('stops after a finished filename when quoted prose follows', () => {
+  it('keeps dots and spaces inside one pair of backticks', () => {
     const file = '/home/agent/.openclaude/generated/file.name with space.md'
     const report = '/home/agent/.openclaude/generated/report.md'
     const notes = '/home/agent/.openclaude/generated/notes.md'
-    const text = `${'H'.repeat(3500)}\`${file}\` 以及 \`${report} 和 ${notes}\`${'T'.repeat(3500)}`
+    const text = `${'H'.repeat(3500)}\`${file}\` 以及 \`${report}\` 和 \`${notes}\`${'T'.repeat(3500)}`
     assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [file, report, notes])
   })
+
+  it('keeps a quoted filename with a version and a Chinese suffix', () => {
+    const path = '/home/agent/.openclaude/generated/report.v1 最终版.md'
+    const text = `${'H'.repeat(3500)}\n产物：\`${path}\`\n${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [path])
+  })
+
+  it('keeps an internal dot in a bare Chinese filename', () => {
+    const path = '/home/agent/.openclaude/generated/report.最终版.md'
+    const text = `${'H'.repeat(3500)}\n产物：${path}\n${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [path])
+  })
+
+  it('leaves punctuation outside a corner-bracketed path', () => {
+    const path = '/home/agent/.openclaude/generated/图表 (1).png'
+    const text = `${'H'.repeat(3500)}\n产物：「${path}」。请读取。\n${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [path])
+  })
+
+  it('leaves a Chinese period after a bare path outside the Read target', () => {
+    const path = '/home/agent/.openclaude/generated/report.md'
+    const text = `${'H'.repeat(3500)}\n产物：${path}。请读取。\n${'T'.repeat(3500)}`
+    assert.deepEqual(listedArtifactPaths(truncateDelegateLeaderResult(text)), [path])
+  })
+
 
   it('does not split a surrogate pair at the cut', () => {
     const text = `A\uD83D\uDE00${'C'.repeat(20)}`
