@@ -18,6 +18,7 @@ import { api, apiErrorMessage } from "../lib/api";
 import { INBOX_LEVEL_META, type InboxLevelTone } from "../lib/inboxLevels";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import type { AuthSession, InboxLevel, InboxMessage } from "../lib/types";
+import { formatZoned, zonedDayIndex } from "../lib/displayTime";
 import { cn } from "../lib/utils";
 import { Markdown } from "./Markdown";
 import {
@@ -99,20 +100,16 @@ export function stripMarkdownSummary(md: string, max = 120): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
 /** 绝对时间（title 悬浮用）：YYYY-MM-DD HH:mm。 */
 function fmtAbsTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return formatZoned(d, "datetime");
 }
 
 /**
  * 相对时间：刚刚 / x 分钟前 / 今天 HH:mm / 昨天 HH:mm / 更早 YYYY-MM-DD HH:mm。
- * （仓内 utils.relativeTime 走「x 小时前/x 天前」语义，与本处「今天/昨天 HH:mm」不同，故独立实现。）
+ * 日界按显示时区的公历日，不用浏览器本地午夜。
  */
 function fmtRelativeTime(iso: string): string {
   const d = new Date(iso);
@@ -122,13 +119,11 @@ function fmtRelativeTime(iso: string): string {
   const diffMin = Math.floor((now.getTime() - t) / 60000);
   if (diffMin < 1) return "刚刚";
   if (diffMin < 60) return `${diffMin} 分钟前`;
-  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  const startOfDay = (x: Date) =>
-    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const dayDiff = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+  const hm = formatZoned(d, "time");
+  const dayDiff = zonedDayIndex(now) - zonedDayIndex(d);
   if (dayDiff <= 0) return `今天 ${hm}`;
   if (dayDiff === 1) return `昨天 ${hm}`;
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${hm}`;
+  return `${formatZoned(d, "date")} ${hm}`;
 }
 
 /**

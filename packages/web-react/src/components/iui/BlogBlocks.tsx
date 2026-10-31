@@ -11,6 +11,7 @@ import { ArrowUpRight, Circle, CircleAlert, CircleCheck, CircleX, Link2, LoaderC
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 // 不从 lib/tutorialStudio 取文案：它会把路由模块（连带任务面板）拉进智能 UI 的依赖里。
 import { ApiError, apiErrorMessage } from "../../lib/api";
+import { formatZoned } from "../../lib/displayTime";
 import type { CommunityTutorialMine } from "../../lib/types";
 import { Markdown } from "../Markdown";
 import { type CommunityBlogDraftPayload, chatInteractionUnavailableText, useChatInteraction, useToolCardActions } from "../tool/context";
@@ -460,7 +461,8 @@ const STAGE_CHIP = {
 function clock(iso: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (Number.isNaN(d.getTime())) return "";
+  return formatZoned(d, "time");
 }
 
 function BlogStatusView({ id, nested, readOnly }: { id: string; nested?: boolean; readOnly?: boolean }) {

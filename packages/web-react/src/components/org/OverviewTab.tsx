@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { computeSeatTotal, ratioPct, seatsUsage } from "../../lib/orgBilling";
 import type { AuthSession, OrgStatus, OrgSubscriptionInfo, OrgSummary } from "../../lib/types";
+import { formatDate } from "../ui/TimeAgo";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Badge, Button, Progress, Spinner } from "../ui";
 import { orgRoleLabel, orgErrText } from "./orgShared";
@@ -29,10 +30,7 @@ function statusMeta(status: OrgStatus): {
 
 /** ISO → YYYY-MM-DD(到期日展示)。 */
 function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime())
-    ? "—"
-    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return formatDate(iso, "date");
 }
 
 /**

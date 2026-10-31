@@ -64,6 +64,19 @@ const assistantProfileSchema = z.object({
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
  */
+const ianaTimeZoneSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((tz) => {
+    try {
+      Intl.DateTimeFormat("en-US", { timeZone: tz });
+      return true;
+    } catch {
+      return false;
+    }
+  }, "invalid IANA timezone");
+
 export const PreferencesSchema = z
   .object({
     theme: themeSchema.optional(),
@@ -83,6 +96,7 @@ export const PreferencesSchema = z
     enabled_plugins: disabledPluginsSchema.optional(),
     system_assistant_profile: assistantProfileSchema.optional(),
     system_assistant_recommendations: z.boolean().optional(),
+    timezone: ianaTimeZoneSchema.optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -110,6 +124,7 @@ export const PreferencesPatchSchema = z
     enabled_plugins: disabledPluginsSchema.nullable().optional(),
     system_assistant_profile: assistantProfileSchema.nullable().optional(),
     system_assistant_recommendations: z.boolean().nullable().optional(),
+    timezone: ianaTimeZoneSchema.nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;

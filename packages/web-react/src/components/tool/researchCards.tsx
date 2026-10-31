@@ -7,6 +7,7 @@
  *
  * 扩展:新工具只需在 RESEARCH_CARD_REGISTRY 里加一条 {match, render}。
  */
+import { formatZoned } from "../../lib/displayTime";
 import { ThsToolCard, thsUiBlocks } from "./thsCard";
 import {
   AlertTriangle,
@@ -1537,7 +1538,7 @@ function LiteraturePluginDownloadCard({
   const expired = expiry.kind === "expired";
   const deadline =
     expiry.kind === "until"
-      ? ` · 请在 ${new Date(expiry.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} 前保存`
+      ? ` · 请在 ${formatZoned(new Date(expiry.at), "time")} 前保存`
       : "";
 
   return (

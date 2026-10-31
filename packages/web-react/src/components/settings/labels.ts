@@ -1,5 +1,6 @@
 // v5 设置/计费中心的展示文案映射（唯一权威源，杜绝各组件硬编码散落）。
 
+import { displayTimeZone, formatLedgerShort } from "../../lib/displayTime";
 import type { UsageLedgerRow, UsageReportWindow } from "../../lib/types";
 
 /**
@@ -156,25 +157,29 @@ export function formatReportBucket(bucket: string, window: UsageReportWindow): s
   return m ? m[1] : bucket;
 }
 
-const SHORT_TIME_FMT = new Intl.DateTimeFormat("en-US", {
-  timeZone: "Asia/Shanghai",
-  month: "numeric",
-  day: "numeric",
-  hour: "2-digit",
-  minute: "2-digit",
-  hourCycle: "h23",
-});
-
 /**
- * ISO 时间 → 北京时间简洁展示（M月D日 HH:mm）。非法时间返回空串。
- * 固定 Asia/Shanghai(#1237):与收支报表的日桶(usageReport.ts)同一时区，
- * 不随浏览器时区漂移——美西时区浏览器曾把当天 11:12 的扣费显示成前一天 20:12。
+ * ISO 时间 → 简洁展示（M月D日 HH:mm）。非法时间返回空串。
+ * 缺省北京时间（#1237），与收支报表日桶一致；账户设了时区后跟账户走。
+ * 未设置时不随浏览器漂移——美西时区浏览器曾把当天 11:12 的扣费显示成前一天 20:12。
  */
 export function shortTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
-  const p: Record<string, string> = {};
-  for (const x of SHORT_TIME_FMT.formatToParts(d)) p[x.type] = x.value;
-  const pad = (v: string | undefined) => (v ?? "").padStart(2, "0");
-  return `${p.month}月${p.day}日 ${pad(p.hour)}:${pad(p.minute)}`;
+  return formatLedgerShort(d);
+}
+
+/** 账单说明。没改时区时必须仍是这句，ledger 浏览器测试锁着原文。 */
+export function ledgerTimeCaption(timeZone = displayTimeZone()): string {
+  if (timeZone === "Asia/Shanghai") return "对话结束后结算入账，时间为北京时间";
+  const label =
+    timeZone === "Asia/Taipei"
+      ? "台北时间"
+      : timeZone === "UTC"
+        ? "UTC"
+        : timeZone === "America/New_York"
+          ? "美东时间"
+          : timeZone === "America/Los_Angeles"
+            ? "美西时间"
+            : timeZone;
+  return `对话结束后结算入账，时间为${label}`;
 }

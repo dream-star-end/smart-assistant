@@ -149,3 +149,24 @@ describe('system assistant consent', () => {
     }
   })
 })
+
+describe("timezone", () => {
+  test("接受 IANA 时区", () => {
+    assert.equal(PreferencesSchema.safeParse({ timezone: "Asia/Shanghai" }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ timezone: "Asia/Taipei" }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ timezone: "UTC" }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ timezone: "America/New_York" }).success, true);
+  });
+
+  test("拒绝非法时区", () => {
+    assert.equal(PreferencesSchema.safeParse({ timezone: "Not/AZone" }).success, false);
+    assert.equal(PreferencesSchema.safeParse({ timezone: "" }).success, false);
+    assert.equal(PreferencesSchema.safeParse({ timezone: "x".repeat(65) }).success, false);
+  });
+
+  test("patch null 删除时区", () => {
+    assert.deepEqual(PreferencesPatchSchema.parse({ timezone: null }), { timezone: null });
+    assert.equal(PreferencesPatchSchema.safeParse({ timezone: "Asia/Taipei" }).success, true);
+    assert.equal(PreferencesPatchSchema.safeParse({ timezone: "nope" }).success, false);
+  });
+});

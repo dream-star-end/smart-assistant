@@ -12,6 +12,7 @@ import {
   type ProductFeatureId,
   type SettingsDestinationSection,
 } from "../lib/productCapabilities";
+import { timeZoneFromPrefs } from "../lib/displayTime";
 import { applyIntelligentUiSnapshot } from "../lib/intelligentUi";
 import { type PrefsView, extractPrefs } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
@@ -161,6 +162,7 @@ export function SettingsCenter({
         setPrefs(next);
         setPrefsEpoch(requestEpoch);
         setPrivacySupport(parsePromptPrivacySupport((snap as { features?: { prompt_privacy?: unknown } }).features?.prompt_privacy) ?? { ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
+        timeZoneFromPrefs(snap);
         applyIntelligentUiSnapshot(snap);
         onPreferencesChange?.(next);
       })
@@ -185,6 +187,7 @@ export function SettingsCenter({
       setPrefs(next);
       setPrefsEpoch(requestEpoch);
       setPrivacySupport(parsePromptPrivacySupport((snap as { features?: { prompt_privacy?: unknown } }).features?.prompt_privacy) ?? { ...DEFAULT_PROMPT_PRIVACY_SUPPORT });
+      timeZoneFromPrefs(snap);
       applyIntelligentUiSnapshot(snap);
       onPreferencesChange?.(next, patch);
     },

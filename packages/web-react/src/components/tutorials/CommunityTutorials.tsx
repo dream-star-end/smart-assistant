@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { type FormEvent, useCallback, useEffect, useState } from 'react'
 import type { ChatMessage } from '../../lib/chat/model'
+import { formatZoned } from '../../lib/displayTime'
 import { api, apiErrorMessage } from '../../lib/api'
 import {
   canWithdrawCommunityTutorial,
@@ -49,7 +50,7 @@ const CATEGORY_OPTIONS = [
 function formatSubmittedAt(iso: string): string {
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return iso
-  return date.toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' })
+  return formatZoned(date, 'datetime')
 }
 
 const STATUS_META: Record<
@@ -370,7 +371,7 @@ export function CommunityTutorials({
                       )}
                     </div>
                     <span className="text-caption text-faint">
-                      {new Date(item.publishedAt).toLocaleDateString('zh-CN')}
+                      {formatZoned(new Date(item.publishedAt), 'date')}
                     </span>
                   </div>
                   <h2 className="mt-3 text-title font-semibold leading-6 text-fg group-hover:text-accent">
@@ -425,7 +426,7 @@ function CommunityTutorialDetailView({
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <Badge tone="accent">{communityCategoryLabel(item.category)}</Badge>
         <span className="text-caption text-faint">
-          {item.authorName} · {new Date(item.publishedAt).toLocaleDateString('zh-CN')}
+          {item.authorName} · {formatZoned(new Date(item.publishedAt), 'date')}
         </span>
       </div>
       <h1 className="mt-3 text-heading font-bold leading-tight text-fg">{item.title}</h1>

@@ -12,6 +12,7 @@ import {
   formatRunReferenceCost,
   skipReasonLabel,
 } from '../../lib/taskboard'
+import { formatZoned } from '../../lib/displayTime'
 import {
   TIMELINE_FILTERS,
   type TicketTimelineFilter,
@@ -296,7 +297,7 @@ function SystemRun({
           <p className="text-caption text-muted">
             实时预览
             {run.preview.lastActivityAt
-              ? ` · ${new Date(run.preview.lastActivityAt).toLocaleTimeString()}`
+              ? ` · ${formatZoned(new Date(run.preview.lastActivityAt), 'time')}`
               : ''}
           </p>
           {run.preview.toolNames.length > 0 && (

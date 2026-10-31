@@ -10,6 +10,7 @@ import type {
   UsageReportWindow,
   User,
 } from "../../lib/types";
+import { formatDate } from "../ui/TimeAgo";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { insufficientCreditsCopy } from "../../lib/chat/pure";
@@ -19,6 +20,7 @@ import {
   formatReportBucket,
   ledgerReasonLabel,
   ledgerRowView,
+  ledgerTimeCaption,
   REPORT_WINDOW_NOUN,
   shortTime,
 } from "./labels";
@@ -39,10 +41,7 @@ function bigOr0(s: string): bigint {
 }
 
 function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime())
-    ? "—"
-    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return formatDate(iso, "date");
 }
 
 const LEDGER_PAGE = 20;
@@ -501,7 +500,7 @@ export function AccountTab({
         <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
           账单流水
         </div>
-        <p className="-mt-1 pb-2 text-caption text-faint">对话结束后结算入账，时间为北京时间</p>
+        <p className="-mt-1 pb-2 text-caption text-faint">{ledgerTimeCaption()}</p>
         {err && (
           <div className="mb-2">
             <Alert tone="danger" className="text-meta">

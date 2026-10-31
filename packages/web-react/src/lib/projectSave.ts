@@ -1,4 +1,5 @@
 import { ApiError, AuthEpochStaleError, api } from "./api";
+import { zonedParts } from "./displayTime";
 import { taskboardApi } from "./taskboard";
 import type { AuthSession } from "./types";
 
@@ -40,8 +41,9 @@ export function asciiSlug(text: string, max: number): string {
 }
 
 function ymd(now: Date): string {
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}`;
+  const p = zonedParts(now);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${p.year}${pad(p.month)}${pad(p.day)}`;
 }
 
 /**

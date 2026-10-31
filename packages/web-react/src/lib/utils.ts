@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from "clsx";
+import { zonedDayIndex, zonedParts } from "./displayTime";
 import { extendTailwindMerge } from "tailwind-merge";
 
 /**
@@ -130,14 +131,14 @@ export function relativeTime(iso: string): string {
   if (hr < 24) return `${hr} 小时前`;
   const day = Math.floor(hr / 24);
   if (day < 7) return `${day} 天前`;
-  return new Date(iso).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+  const p = zonedParts(new Date(iso));
+  return `${p.month}月${p.day}日`;
 }
 
 export function groupLabel(iso: string): string {
   const d = new Date(iso);
-  const now = new Date();
-  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const days = Math.round((startOfDay(now) - startOfDay(d)) / 86400000);
+  if (Number.isNaN(d.getTime())) return "";
+  const days = zonedDayIndex(new Date()) - zonedDayIndex(d);
   if (days <= 0) return "今天";
   if (days === 1) return "昨天";
   if (days < 7) return "本周";

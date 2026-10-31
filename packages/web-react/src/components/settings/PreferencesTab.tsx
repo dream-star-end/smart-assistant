@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
+import { browserTimeZone } from '../../lib/displayTime'
 import { setInputPredictionPref, setIntelligentUiPref, useIntelligentUiState } from '../../lib/intelligentUi'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
 import {
@@ -23,6 +24,23 @@ import { Alert, Button, Select, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 import { AssistantPrivacyPreferences } from './AssistantPrivacyPreferences'
+
+const ZONE_CHOICES: { value: string; label: string }[] = [
+  { value: 'Asia/Shanghai', label: '北京时间' },
+  { value: 'Asia/Taipei', label: '台北时间' },
+  { value: 'UTC', label: 'UTC' },
+  { value: 'America/New_York', label: '美东时间' },
+  { value: 'America/Los_Angeles', label: '美西时间' },
+]
+
+function timeZoneOptions(pref: string | undefined): { value: string; label: string }[] {
+  const browser = browserTimeZone()
+  const known = (zone: string) => ZONE_CHOICES.some((o) => o.value === zone)
+  const extra: { value: string; label: string }[] = []
+  if (!known(browser)) extra.push({ value: browser, label: `此浏览器（${browser}）` })
+  if (pref && !known(pref) && pref !== browser) extra.push({ value: pref, label: pref })
+  return [...ZONE_CHOICES, ...extra]
+}
 
 const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
   { value: 'light', label: '浅色', icon: Sun },
@@ -217,6 +235,30 @@ export function PreferencesTab({
             </button>
           ))}
         </div>
+      </div>
+
+      <div className="border-t border-border px-5 py-4">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">时间</div>
+        <div className="flex items-center justify-between gap-3 py-1.5">
+          <span className="text-section text-fg">时区</span>
+          <Select
+            aria-label="时区"
+            inputSize="sm"
+            className="w-auto max-w-[55%]"
+            value={
+              prefs.timezone && timeZoneOptions(prefs.timezone).some((o) => o.value === prefs.timezone)
+                ? prefs.timezone
+                : 'Asia/Shanghai'
+            }
+            onValueChange={(v) => {
+              void onPatch({ timezone: v })
+            }}
+            options={timeZoneOptions(prefs.timezone)}
+          />
+        </div>
+        <p className="text-meta leading-relaxed text-muted">
+          问候、消息时间、分享图和账单都按这里显示。没选过时用北京时间。
+        </p>
       </div>
 
       {/* 默认模型 + 思考深度 */}

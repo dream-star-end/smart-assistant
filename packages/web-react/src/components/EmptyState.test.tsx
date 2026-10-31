@@ -1,10 +1,18 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { type Agent, MAIN_AGENT } from '../lib/agents'
+import { browserTimeZone, setDisplayTimeZonePreference } from '../lib/displayTime'
 import { EmptyState, greetingFor, greetingName } from './EmptyState'
 
-afterEach(cleanup)
+beforeEach(() => {
+  setDisplayTimeZonePreference(browserTimeZone())
+})
+
+afterEach(() => {
+  cleanup()
+  setDisplayTimeZonePreference(undefined)
+})
 
 const AGENT: Agent = {
   id: 'main',
@@ -114,6 +122,18 @@ describe('EmptyState 问候(OCV5-342)', () => {
     expect(at(16)).toBe('下午好')
     expect(at(20)).toBe('晚上好')
     expect(at(23)).toBe('夜深了')
+  })
+
+  it('账户时区决定问候，不跟跑测试的机器时区走', () => {
+    const at = new Date('2026-10-31T03:40:00Z')
+    setDisplayTimeZonePreference('Asia/Taipei')
+    expect(greetingFor(at)).toBe('中午好')
+    setDisplayTimeZonePreference('America/New_York')
+    expect(greetingFor(at)).toBe('夜深了')
+    setDisplayTimeZonePreference('UTC')
+    expect(greetingFor(at)).toBe('夜深了')
+    setDisplayTimeZonePreference('Asia/Shanghai')
+    expect(greetingFor(at)).toBe('中午好')
   })
 
   it('邮箱 / 「用户」兜底名不进问候', () => {

@@ -1,4 +1,5 @@
 import { uiPlainText } from "../../components/iui/plainText";
+import { formatZoned } from "../displayTime";
 import { publicArtifactText } from "./publicArtifactText";
 import { BRAND } from "../brand";
 import { sessionExportFilename } from "./exportFilename";
@@ -525,10 +526,6 @@ export type ShareCardInput = {
 
 export type ShareLayout = { width: number; height: number; ops: DrawOp[]; omitted: number };
 
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
 export function layoutShareCard(input: ShareCardInput, measure: Measure, maxHeight = SHARE_MAX_HEIGHT): ShareLayout {
   const W = SHARE_WIDTH;
   const head: DrawOp[] = [];
@@ -542,9 +539,8 @@ export function layoutShareCard(input: ShareCardInput, measure: Measure, maxHeig
     head.push({ t: "text", x: PAD, y, text: l, font: F.title, color: C.fg });
     y += LH.title;
   }
-  const d = input.now;
   const rounds = input.messages.filter((m) => m.role === "user").length;
-  const meta = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}${rounds ? ` · ${rounds} 轮对话` : ""} · 与「${input.agentName}」`;
+  const meta = `${formatZoned(input.now, "date")}${rounds ? ` · ${rounds} 轮对话` : ""} · 与「${input.agentName}」`;
   head.push({ t: "text", x: PAD, y: y + 2, text: meta, font: F.meta, color: C.muted });
   y += LH.meta + 18;
   const headH = y;

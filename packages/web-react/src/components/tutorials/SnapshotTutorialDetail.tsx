@@ -1,6 +1,7 @@
 import { ArrowLeft, Copy, ExternalLink } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { formatBytes } from "../../lib/chat/download";
+import { formatZoned } from "../../lib/displayTime";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   HTML_EMBED_SANDBOX,
@@ -99,7 +100,7 @@ export function SnapshotTutorialDetail({
         {/* 分类不直出 `coding` 枚举（审计 TU-09）。 */}
         <Badge tone="neutral">{communityCategoryLabel(item.category)}</Badge>
         <span className="text-caption text-faint">
-          {item.authorName} · {new Date(item.publishedAt).toLocaleDateString("zh-CN")}
+          {item.authorName} · {formatZoned(new Date(item.publishedAt), "date")}
         </span>
       </div>
       <h1 className="mt-3 text-heading font-bold leading-tight text-fg">{item.title}</h1>

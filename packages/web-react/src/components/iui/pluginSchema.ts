@@ -10,6 +10,8 @@
  * 修过的记进 notes；修不了才降级。链接只接受 http(s)。
  */
 
+import { formatZoned, zonedParts } from "../../lib/displayTime";
+
 type Ctx = { notes: string[]; partial: boolean };
 type Sub = { subtitle?: string };
 
@@ -327,12 +329,12 @@ function trim1(x: number): string {
   return x.toFixed(1).replace(/\.0$/, "");
 }
 
-/** 日程按本地日期分组（startTime 的本地日期）。 */
+/** 日程按显示时区的公历日分组。 */
 export function groupEventsByDay(items: readonly FeishuEvent[]): { day: string; items: FeishuEvent[] }[] {
   const out: { day: string; items: FeishuEvent[] }[] = [];
   for (const e of items) {
     const d = new Date(e.startTime);
-    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const day = Number.isNaN(d.getTime()) ? "" : formatZoned(d, "date");
     const last = out[out.length - 1];
     if (last && last.day === day) last.items.push(e);
     else out.push({ day, items: [e] });
@@ -342,15 +344,19 @@ export function groupEventsByDay(items: readonly FeishuEvent[]): { day: string; 
 
 export function hm(iso: string): string {
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (Number.isNaN(d.getTime())) return "";
+  return formatZoned(d, "time");
 }
 
 /** 结束时间：与开始在同一天只写时分；跨天写上日期（「10月15日 11:00」），不把多日日程显示成当天。 */
 export function endText(startIso: string, endIso: string): string {
   const s = new Date(startIso);
   const e = new Date(endIso);
-  const sameDay = s.getFullYear() === e.getFullYear() && s.getMonth() === e.getMonth() && s.getDate() === e.getDate();
-  return sameDay ? hm(endIso) : `${e.getMonth() + 1}月${e.getDate()}日 ${hm(endIso)}`;
+  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return hm(endIso);
+  const sp = zonedParts(s);
+  const ep = zonedParts(e);
+  const sameDay = sp.year === ep.year && sp.month === ep.month && sp.day === ep.day;
+  return sameDay ? hm(endIso) : `${ep.month}月${ep.day}日 ${hm(endIso)}`;
 }
 
 export function isCancelled(status: string | undefined): boolean {
