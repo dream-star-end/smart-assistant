@@ -4,7 +4,7 @@
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useEffect, useCallback, useState } from "react";
 import { useInbox } from "./useInbox";
 import { githubErrorText } from "../lib/github";
 import { connectorErrorText } from "../lib/connectors";
@@ -72,6 +72,7 @@ export function useAppDeepLinks({
   user,
   view,
 }: AppDeepLinksInput) {
+  const [teamLeaderModelId, setTeamLeaderModelId] = useState<string | undefined>(undefined);
   // 登录后消费待跑案例：只在 inWorkspace false→true 时读一次；有键先删再预填，禁止自动发送。
   const wasInWorkspaceRef = useRef(inWorkspace);
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setComposerPrefill is App useState setter/useRef passed in, stable
@@ -230,6 +231,7 @@ export function useAppDeepLinks({
         if (cancelled) return;
         setModels(catalog.models);
         setLockedModels(catalog.lockedModels);
+        setTeamLeaderModelId(catalog.teamLeaderModelId);
         // 初始 modelId 不在此直接写:models/modelPrefs 落定会触发 per-session resolver
         // effect,按「活动会话持久化选择 > default_model > 首个健康模型」统一解析。
         setModelPrefs(prefs);
@@ -278,5 +280,6 @@ export function useAppDeepLinks({
   return {
     inbox,
     refreshMyAgents,
+    teamLeaderModelId,
   };
 }

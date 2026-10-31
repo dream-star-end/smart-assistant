@@ -608,6 +608,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     this._interrupting = false
     // InlinePush must not treat a not-yet-ingested parent turn as live.
     // _activeTurn is armed only after submit() confirms the user line landed.
+    this.runner.setReadOnly?.(params.readOnly === true)
     if (params.consultTurn && params.turnKey) {
       this.runner.setConsultTurn({
         turnKey: params.turnKey,

@@ -64,6 +64,7 @@ import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
 import {
   formatDelegateFanoutRunning,
   resolveCursorFastWaitMs,
+  resolveDelegateMcpBudgetMs,
   runCursorDelegateFastPath,
   type FanoutCursorItem,
   type FormattedDelegateResult,
@@ -96,6 +97,7 @@ import {
   isLocalCliToolName,
 } from './localCliTools.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
+import { filterAdvisorReadOnlyMcpTools, isAdvisorReadOnlyMcpTool } from './advisorReadOnlyPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
 // server.connect(见 toolDefs.ts / __tests__/toolNames.test.ts)。
@@ -140,6 +142,7 @@ const DELEGATION_DEPTH = Math.max(
  *  Cursor 已改走正文 ```options 围栏;仅 OC_ASK_USER_MCP=1 时恢复原 MCP 卡。
  *  恢复时仍只挂在 Cursor 主会话上 —— CCB/Codex 各有原生提问工具。 */
 const ENGINE_ID = (process.env.OPENCLAUDE_ENGINE || '').trim().toLowerCase()
+const ADVISOR_READ_ONLY = process.env.OPENCLAUDE_ADVISOR_READ_ONLY === '1'
 const ASK_USER_MCP_ESCAPE = process.env.OC_ASK_USER_MCP === '1'
 const ASK_USER_ENABLED = ENGINE_ID === 'cursor'
 const consumePresentOptionsCall = createPresentOptionsCallBudget(4)
@@ -238,14 +241,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListProjectSearch()) {
     base = base.filter((t) => t.name !== 'project_search')
   }
-  // Antigravity CLI 1.4.0 has no native grep/glob and backgrounds run_command
-  // after 10s. Other engines must not see this MCP shell: it skips native
-  // Bash permission checks and PreToolUse. CallTool repeats the check.
+  // Only Antigravity gets this MCP shell. Restricted advisor parents also
+  // need safe argv-based grep/glob when native execution tools are removed.
+  // CallTool repeats the check; oc_bash never passes the read-only allowlist.
   if (!isLocalCliToolEnabled(ENGINE_ID)) {
-    base = base.filter((t) => !isLocalCliToolName(t.name))
+    base = base.filter((t) => !isLocalCliToolName(t.name) || (ADVISOR_READ_ONLY && isAdvisorReadOnlyMcpTool(t.name)))
   }
-  base = filterListedDelegateTools(base, ENGINE_ID)
-  return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
+  // Cursor's normal consult transport is Bash. Ask mode removes shell tools,
+  // so this turn must retain the same authenticated no-tools consult over MCP.
+  const listed = filterListedDelegateTools(base, ENGINE_ID)
+  if (ADVISOR_READ_ONLY && ENGINE_ID === 'cursor') {
+    const consult = base.find((tool) => tool.name === 'consult_advisor')
+    if (consult) listed.push(consult)
+  }
+  const tools = filterAdvisorReadOnlyMcpTools(filterSkillEvalTools(listed, SKILL_EVAL_MODE), ADVISOR_READ_ONLY)
+  return {
+    tools: ADVISOR_READ_ONLY
+      ? tools.map((tool) => ({
+          ...tool,
+          annotations: {
+            ...(tool as { annotations?: Record<string, unknown> }).annotations,
+            readOnlyHint: true,
+            destructiveHint: false,
+          },
+        }))
+      : tools,
+  }
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -253,20 +274,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // ─────────────────────────────────────────────────────────────
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params
+  const delegateDeadlineAtMs = Date.now() + resolveDelegateMcpBudgetMs()
   try {
+    // Reject unknown names as well as known mutators before handler dispatch,
+    // gateway admission, billing, or local persistence can occur.
+    if (ADVISOR_READ_ONLY && !isAdvisorReadOnlyMcpTool(name)) {
+      return toolError(`advisor_read_only: tool "${name}" is unavailable this turn`)
+    }
     // Discovery filtering is not an authorization boundary: an MCP client can
     // still call a hidden tool by name. Reject before any gateway request,
     // persistent write, or delegation starts.
     if (SKILL_EVAL_MODE && isSkillEvalBlockedTool(name)) {
       return toolError(`tool "${name}" is disabled in eval sessions`)
     }
-    if (isCursorHiddenDelegateTool(name)) {
+    if (isCursorHiddenDelegateTool(name) && !(ADVISOR_READ_ONLY && name === 'consult_advisor')) {
       return toolError(cursorDelegateCliHint(name))
     }
     if (name === 'delegate_wait' && !shouldExposeDelegateWait()) {
       return toolError(delegateWaitDisabledText())
     }
-    if (isLocalCliToolName(name) && !isLocalCliToolEnabled(ENGINE_ID)) {
+    if (isLocalCliToolName(name) && !isLocalCliToolEnabled(ENGINE_ID) && !(ADVISOR_READ_ONLY && isAdvisorReadOnlyMcpTool(name))) {
       return {
         content: [{ type: 'text', text: `${name} 仅在 Antigravity 引擎可用` }],
         isError: true,
@@ -296,13 +323,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case 'send_to_agent':
         return await handleSendToAgent(args as any)
       case 'delegate_task':
-        return await handleDelegateTask(args as any)
+        return await handleDelegateTask(args as any, delegateDeadlineAtMs)
       case 'delegate_tasks':
-        return await handleDelegateTasks(args as any)
+        return await handleDelegateTasks(args as any, delegateDeadlineAtMs)
       case 'delegate_wait':
         return await handleDelegateWait(args as any)
       case 'request_review':
-        return await handleRequestReview(args as any)
+        return await handleRequestReview(args as any, delegateDeadlineAtMs)
       case 'consult_advisor':
         return await handleConsultAdvisor(args as any, req)
       case 'task_create':
@@ -782,7 +809,7 @@ async function handleDelegateTask(args: {
   toolsets?: string[]
   resumeSessionKey?: string
   allowSelf?: unknown
-}) {
+}, deadlineAtMs?: number) {
   const goalNorm = normalizeDelegateGoal(args?.goal, args as Record<string, unknown>)
   if (!goalNorm.ok) return toolError(goalNorm.error)
   const agentNorm = normalizeDelegateAgentId(args.agentId)
@@ -792,6 +819,7 @@ async function handleDelegateTask(args: {
   const agentId = agentNorm.agentId || 'main'
   return handleDelegateTaskToAgent(agentId, {
     goal: goalNorm.goal,
+    deadlineAtMs,
     context: args.context,
     effort: args.effort,
     toolsets: args.toolsets,
@@ -810,18 +838,18 @@ async function handleDelegateTask(args: {
  * 结果按输入顺序聚合、每项独立标注 ✅/❌。校验/聚合逻辑抽到纯函数 delegateFanout.ts
  * (可单测),本处只负责调用编排。
  */
-async function handleDelegateTasks(args: { tasks?: unknown }) {
+async function handleDelegateTasks(args: { tasks?: unknown }, deadlineAtMs?: number) {
   const normalized = normalizeFanoutTasks(args?.tasks)
   if (!normalized.ok) return toolError(normalized.error)
-  return handleAsyncDelegateTasks(normalized.tasks)
+  return handleAsyncDelegateTasks(normalized.tasks, deadlineAtMs)
 }
 
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
  * Delegate tools no longer use one long HTTP request: every engine starts an
- * async job, waits briefly, then returns a resumable job handle before its
- * MCP tools/call deadline. send_to_agent returns that handle immediately and
+ * async job and waits for terminal inside one tools/call, or hands callback
+ * ownership to the gateway before its deadline. send_to_agent returns immediately and
  * lets the gateway inject the origin session when the child finishes.
  */
 
@@ -930,7 +958,7 @@ async function handleRequestReview(args: {
   revisionNote?: string
   resumeSessionKey?: string
   mode?: string
-}) {
+}, deadlineAtMs?: number) {
   const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
   if (!draft) {
     return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
@@ -949,19 +977,21 @@ async function handleRequestReview(args: {
         : '对队长准备提交给用户的最终答复草稿做独立质量验收(对照成员证据),给出结构化裁决。',
     context: draft + note,
     label: '质量审查',
+    deadlineAtMs,
     reviewMode,
     resumeSessionKey:
       typeof args.resumeSessionKey === 'string' ? args.resumeSessionKey : undefined,
   })
 }
 
-async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
+async function handleAsyncDelegateTasks(tasks: FanoutTask[], deadlineAtMs?: number) {
   const items = await Promise.all(
     tasks.map(async (t): Promise<FanoutCursorItem> => {
       const label = t.agentId || 'main'
       try {
         const r = await runAsyncDelegateToAgent(label, {
           goal: t.goal,
+          deadlineAtMs,
           context: t.context,
           effort: t.effort,
           toolsets: t.toolsets,
@@ -970,13 +1000,14 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[]) {
           label,
           allowSelf: t.allowSelf,
         })
-        if (r.kind === 'running') {
+        if (r.kind === 'running' || r.kind === 'deferred') {
           return {
             label,
             goal: t.goal,
             isError: false,
             text: r.text,
             running: true,
+            deferred: r.kind === 'deferred',
             jobId: r.jobId,
           }
         }
@@ -1013,6 +1044,7 @@ async function runAsyncDelegateToAgent(
   targetAgent: string,
   args: {
     goal: string
+    deadlineAtMs?: number
     context?: string
     effort?: string
     toolsets?: string[]
@@ -1054,6 +1086,7 @@ async function runAsyncDelegateToAgent(
   const fastWaitMs = resolveCursorFastWaitMs()
   return runCursorDelegateFastPath({
     fastWaitMs,
+    deadlineAtMs: args.deadlineAtMs,
     label: args.label,
     goal: args.goal,
     transport: {
@@ -1067,7 +1100,7 @@ async function runAsyncDelegateToAgent(
         postJsonToGateway(`${base}/api/delegate/wait`, {
           headers,
           body: JSON.stringify({ jobId, waitMs }),
-          timeoutMs: waitMs + 15_000,
+          timeoutMs: waitMs + 3_000,
         }),
     },
   })
@@ -1099,6 +1132,7 @@ async function handleDelegateTaskToAgent(
   targetAgent: string,
   args: {
     goal: string
+    deadlineAtMs?: number
     context?: string
     effort?: string
     toolsets?: string[]

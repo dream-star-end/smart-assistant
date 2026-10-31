@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  deriveLiveTerminalEndedAt,
   deriveLiveTerminalFromMessages,
   isSidebarSessionRunning,
   resolveSessionStatus,
@@ -145,5 +146,24 @@ describe("主动停止的实时与持久状态", () => {
       expect(resolveSidebarDot({ lastOutcome, lastErrorCode: code }, false)).toBe("stopped");
     }
     expect(resolveSessionStatus({ ...live!, running: true })).toBe("running");
+  });
+});
+
+describe("deriveLiveTerminalEndedAt", () => {
+  it("优先采用终态消息的 completedAt / ts，离线恢复时不把观察时刻当成结束时刻", () => {
+    const end = Date.parse("2026-10-30T10:02:00Z");
+    const observed = Date.parse("2026-10-30T11:00:00Z");
+    expect(
+      deriveLiveTerminalEndedAt(
+        [{ ts: end - 60_000, completedAt: end, _dispatchOutcome: "completed" }],
+        observed,
+      ),
+    ).toBe(end);
+    expect(
+      deriveLiveTerminalEndedAt([{ ts: end, _errorCode: "upstream" }], observed),
+    ).toBe(end);
+    expect(
+      deriveLiveTerminalEndedAt([{ _dispatchOutcome: "completed" }], observed),
+    ).toBe(observed);
   });
 });

@@ -499,7 +499,7 @@ export class DelegateJobStore {
       }
     }
     const draft = this.cloneEntry(job)
-    if (this.sm) {
+    if (this.sm || (job.kind === 'delegate' && job.callback === 'origin-inject')) {
       const next: DelegateJobState = result.httpStatus >= 200 && result.httpStatus < 300 ? 'completed' : 'failed'
       const gate = assertDelegateTransition(draft.state, next)
       if (!gate.ok && draft.state !== next) return false
@@ -579,7 +579,7 @@ export class DelegateJobStore {
     if (isResumeInjectCallback(draft.callback)) {
       draft.callbackState = 'pending'
       draft.callbackEpoch = 1
-    } else {
+    } else if (draft.callback === 'none') {
       draft.callbackState = 'skipped_silent'
     }
     draft.ownerLeaseUntil = null
@@ -1378,6 +1378,33 @@ export class DelegateJobStore {
     draft.notifyRetryAt = null
     draft.lastActivityAt = this.now()
     return this.commit(job, draft, false)
+  }
+
+  /** Transfer only this waiter-owned job; other members may still have live readers. */
+  handoffStdoutWait(
+    jobId: string,
+    parentSessionKey: string,
+    meta: { callbackOriginUserId?: string; parentEngine?: string } = {},
+  ): DelegateJobSnapshot | undefined {
+    const job = this.refreshJob(jobId)
+    if (!job || job.kind !== 'delegate' || job.parentSessionKey !== parentSessionKey) return undefined
+    if (job.callback === 'origin-inject' && job.callbackOriginSessionKey === parentSessionKey) {
+      return job.callbackState === 'skipped_silent' ? undefined : this.snapshot(job)
+    }
+    if (job.callback !== 'stdout-wait' || job.callbackState !== 'none') return undefined
+    const draft = this.cloneEntry(job)
+    draft.callback = 'origin-inject'
+    draft.callbackOriginSessionKey = parentSessionKey
+    if (meta.callbackOriginUserId) draft.callbackOriginUserId = meta.callbackOriginUserId
+    if (meta.parentEngine) draft.parentEngine = meta.parentEngine
+    // SM-off keeps historical stdout rows in state=running even with a result.
+    // Only a dynamically handed-off row needs a terminal state for notify claims.
+    if (job.result && !isDelegateTerminalState(draft.state)) {
+      draft.state = job.result.httpStatus >= 200 && job.result.httpStatus < 300 ? 'completed' : 'failed'
+    }
+    if (job.result || isDelegateTerminalState(job.state)) initTerminalCallback(draft)
+    draft.lastActivityAt = this.now()
+    return this.commit(job, draft, false) ? this.snapshot(job) : undefined
   }
 
   /**

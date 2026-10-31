@@ -58,12 +58,41 @@ export function shareEnv(): { inApp: boolean; touch: boolean } {
 }
 
 /** 预览用 data: URL:内置浏览器长按 blob: 图片常常存不下来,data: 可以。 */
-function blobToDataUrl(blob: Blob): Promise<string> {
+function blobToDataUrl(blob: Blob, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
     const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
+    const abort = () => reader.abort();
+    const cleanup = () => {
+      signal.removeEventListener("abort", abort);
+      reader.onload = null;
+      reader.onerror = null;
+      reader.onabort = null;
+    };
+    reader.onload = () => {
+      const result = String(reader.result);
+      cleanup();
+      resolve(result);
+    };
+    reader.onerror = () => {
+      const error = reader.error;
+      cleanup();
+      reject(error);
+    };
+    reader.onabort = () => {
+      cleanup();
+      reject(signal.reason ?? new DOMException("Preview reading cancelled", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      reader.readAsDataURL(blob);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
   });
 }
 
@@ -116,13 +145,16 @@ export function ShareDialog({
       setCard({ state: "empty" });
       return;
     }
+    const controller = new AbortController();
     setCard({ state: "rendering" });
     void (async () => {
       const prepared = await prepareShareMessages(picked);
+      if (!alive) return;
       const text = shareText(title, agentName, prepared);
       try {
         const { blob } = await renderShareCard({ title, agentName, messages: prepared, now: new Date() });
-        const url = await blobToDataUrl(blob);
+        if (!alive) return;
+        const url = await blobToDataUrl(blob, controller.signal);
         if (!alive) return;
         setCard({ state: "ready", blob, url, text });
       } catch {
@@ -131,6 +163,7 @@ export function ShareDialog({
     })();
     return () => {
       alive = false;
+      controller.abort();
     };
   }, [open, picked, title, agentName]);
 

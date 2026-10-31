@@ -105,6 +105,8 @@ export interface AutomaticRetryState {
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
 export interface TurnParams {
+  /** Frozen user no-write restriction for this advisor turn, including retries. */
+  readOnly?: boolean
   input: string | Array<{ type: string; [k: string]: unknown }>
   /** PG coordinator-originated turn. Adapters may use this to enforce that
    * no hidden runner-local queue forms behind the platform claim. */

@@ -615,6 +615,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         params.queueTurn,
         params.automaticRetryState,
         params.traceId ?? null,
+        params.readOnly === true,
       )
     } catch (err) {
       submitted = Promise.reject(err)

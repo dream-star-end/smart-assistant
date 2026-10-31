@@ -97,16 +97,25 @@ function asLastOutcome(value: string): SessionLastOutcome | null {
   return LAST_OUTCOMES.has(v) ? (v as SessionLastOutcome) : null;
 }
 
-/** 从本 tab 会话消息倒序抽出最近一轮终态（isFinal / outbound.error），供发送结束瞬间落点。 */
-export function deriveLiveTerminalFromMessages(
-  messages:
-    | ReadonlyArray<{
-        _dispatchOutcome?: string;
-        _errorCode?: string;
-        _turnStatusRecord?: boolean;
-      }>
-    | undefined,
-): { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null {
+type TerminalCandidateMessage = {
+  ts?: number;
+  completedAt?: number;
+  _dispatchOutcome?: string;
+  _errorCode?: string;
+  _turnStatusRecord?: boolean;
+};
+
+function finitePositiveMs(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function findLiveTerminalEntry(
+  messages: ReadonlyArray<TerminalCandidateMessage> | undefined,
+): {
+  lastOutcome: SessionLastOutcome;
+  lastErrorCode: string | null;
+  messageTimestamp: number | null;
+} | null {
   if (!messages?.length) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
@@ -114,14 +123,35 @@ export function deriveLiveTerminalFromMessages(
     const code = typeof m._errorCode === "string" && m._errorCode ? m._errorCode : null;
     const outcome = asLastOutcome(m._dispatchOutcome ?? "");
     const normalized = normalizeTurnErrorCode(code);
+    const bestTs = Math.max(finitePositiveMs(m.completedAt) ?? 0, finitePositiveMs(m.ts) ?? 0);
+    const messageTimestamp = bestTs > 0 ? bestTs : null;
     if (normalized === "stopped" || normalized === "user_cancelled") {
-      return { lastOutcome: "interrupted", lastErrorCode: code };
+      return { lastOutcome: "interrupted", lastErrorCode: code, messageTimestamp };
     }
     if (normalized === "service_restart") {
-      return { lastOutcome: outcome ?? "crashed", lastErrorCode: code };
+      return { lastOutcome: outcome ?? "crashed", lastErrorCode: code, messageTimestamp };
     }
-    if (outcome) return { lastOutcome: outcome, lastErrorCode: code };
-    if (code) return { lastOutcome: "executed_error", lastErrorCode: code };
+    if (outcome) return { lastOutcome: outcome, lastErrorCode: code, messageTimestamp };
+    if (code) return { lastOutcome: "executed_error", lastErrorCode: code, messageTimestamp };
   }
   return null;
+}
+
+/** 从本 tab 会话消息倒序抽出最近一轮终态（isFinal / outbound.error），供发送结束瞬间落点。 */
+export function deriveLiveTerminalFromMessages(
+  messages: ReadonlyArray<TerminalCandidateMessage> | undefined,
+): { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } | null {
+  const entry = findLiveTerminalEntry(messages);
+  return entry ? { lastOutcome: entry.lastOutcome, lastErrorCode: entry.lastErrorCode } : null;
+}
+
+/**
+ * 抽取最近终态的实际发生时刻：优先终态消息自带的 completedAt / ts（含离线恢复后 REST 权威历史），
+ * 仅在本地终态消息无有效时间戳时回落观察时刻，避免把恢复观察时间当作会话生命周期终点。
+ */
+export function deriveLiveTerminalEndedAt(
+  messages: ReadonlyArray<TerminalCandidateMessage> | undefined,
+  observedAt = Date.now(),
+): number {
+  return findLiveTerminalEntry(messages)?.messageTimestamp ?? observedAt;
 }

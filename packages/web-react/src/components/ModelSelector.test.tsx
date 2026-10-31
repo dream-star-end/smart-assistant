@@ -31,37 +31,31 @@ describe('ModelSelector 团队模式诚信显示', () => {
     expect(trigger.textContent).not.toContain('团队模式')
   })
 
-  it('团队态：触发器如实显示实际生效的队长引擎，而非用户自选模型', () => {
+  it('团队态：触发器禁用并如实显示服务端队长引擎与倍率，不再展开假选单(U1)', () => {
+    const modelsWithCost: PublicModel[] = [
+      ...MODELS.slice(0, 3),
+      { id: 'gpt-7-leader', display_name: 'GPT-7-Leader', cost_x: 4.5 },
+    ]
+    const onSelect = vi.fn()
     render(
-      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
+      <ModelSelector
+        models={modelsWithCost}
+        selectedId="glm-5.2"
+        onSelect={onSelect}
+        teamEngineActive
+        teamLeaderModelId="gpt-7-leader"
+      />,
     )
     const trigger = screen.getByRole('button', { name: '选择对话模型' })
-    // C-25:顶栏 chip 已写「团队模式」,trigger 改说明实际生效的队长引擎,不再同词两次。
-    expect(trigger.textContent).toContain('队长引擎 · GPT-6-Astra')
+    expect(trigger).toBeDisabled()
+    expect(trigger.textContent).toContain('队长引擎 · GPT-7-Leader')
+    expect(trigger.textContent).toContain('4.5')
     expect(trigger.textContent).not.toContain('团队模式 · ')
     expect(trigger.textContent).not.toContain('GLM-5.2')
-  })
-
-  it('团队态：菜单含不可选说明态（非 menuitem），自选模型保留选中记忆并标注生效时机', async () => {
-    render(
-      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
-    )
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-
-    // 说明态存在且不可选（role=note,不在 menuitem 集合里）
-    const note = await screen.findByRole('note')
-    expect(note.textContent).toContain('团队模式 · 队长引擎 GPT-6-Astra')
-    expect(note.textContent).toContain('团队模式关闭后生效')
-    const items = screen.getAllByRole('menuitem')
-    expect(items.some((i) => i.contains(note))).toBe(false)
-
-    // 用户自选模型仍是列表里的选中项（记忆保留）,并带"关闭后生效"标注
-    const selectedItem = items.find((i) => i.textContent?.includes('GLM-5.2'))
-    expect(selectedItem).toBeTruthy()
-    expect(selectedItem?.textContent).toContain('团队模式关闭后生效')
-    // 未选中项不带该标注
-    const otherItem = items.find((i) => i.textContent?.includes('DeepSeek-V4'))
-    expect(otherItem?.textContent).not.toContain('团队模式关闭后生效')
+    openMenu(trigger)
+    fireEvent.click(trigger)
+    expect(screen.queryByRole('menuitem')).toBeNull()
+    expect(onSelect).not.toHaveBeenCalled()
   })
 
   it('常态：菜单不渲染团队说明态', async () => {
@@ -79,12 +73,39 @@ describe('ModelSelector 团队模式诚信显示', () => {
     expect(document.querySelector('[data-model-id="deepseek-v4"]')).toHaveTextContent('DeepSeek-V4')
   })
 
-  it('团队态：模型仍可选择（onSelect 照常上抛,作为关闭团队模式后的记忆）', async () => {
+  it('团队态切换与退出：开启时自动收起既有菜单并禁用，退出后恢复原自选模型且可正常选模(U1)', async () => {
     const onSelect = vi.fn()
-    render(
-      <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={onSelect} teamEngineActive />,
+    const onOpenChange = vi.fn()
+    const { rerender } = render(
+      <ModelSelector
+        models={MODELS}
+        selectedId="glm-5.2"
+        onSelect={onSelect}
+        open
+        onOpenChange={onOpenChange}
+      />,
     )
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    expect((await screen.findAllByRole('menuitem')).length).toBeGreaterThan(0)
+    rerender(
+      <ModelSelector
+        models={MODELS}
+        selectedId="glm-5.2"
+        onSelect={onSelect}
+        open
+        onOpenChange={onOpenChange}
+        teamEngineActive
+        teamLeaderModelId="gpt-6-astra"
+      />,
+    )
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+    await waitFor(() => expect(screen.queryByRole('menuitem')).toBeNull())
+    expect(screen.getByRole('button', { name: '选择对话模型' })).toBeDisabled()
+
+    rerender(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={onSelect} />)
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).not.toBeDisabled()
+    expect(trigger.textContent).toContain('GLM-5.2')
+    openMenu(trigger)
     const items = await screen.findAllByRole('menuitem')
     const target = items.find((i) => i.textContent?.includes('DeepSeek-V4'))
     expect(target).toBeTruthy()
@@ -92,13 +113,20 @@ describe('ModelSelector 团队模式诚信显示', () => {
     expect(onSelect).toHaveBeenCalledWith('deepseek-v4')
   })
 
-  it('teamEngineLabel：优先取 /api/public/models 里 gpt-6-astra 的 display_name,缺失退回固定标签', () => {
-    expect(teamEngineLabel(MODELS)).toBe('GPT-6-Astra')
+  it('teamEngineLabel：优先以服务端 teamLeaderModelId 为准(含 lockedModels 或未知新 id)，缺省回退协议默认', () => {
+    expect(teamEngineLabel(MODELS, 'gpt-6-astra')).toBe('GPT-6-Astra')
+    expect(
+      teamEngineLabel(
+        [{ id: 'glm-5.2', display_name: 'GLM-5.2' }],
+        'gpt-7-nova',
+        [{ id: 'gpt-7-nova', display_name: 'GPT-7 Nova 旗舰', min_plan_code: 'pro' } as LockedPublicModel],
+      ),
+    ).toBe('GPT-7 Nova 旗舰')
+    expect(teamEngineLabel([{ id: 'glm-5.2' }], 'gpt-8-server-only')).toBe('gpt-8-server-only')
     expect(teamEngineLabel([{ id: 'gpt-6-astra', display_name: 'GPT-6-Astra 旗舰' }])).toBe(
       'GPT-6-Astra 旗舰',
     )
     expect(teamEngineLabel([{ id: 'glm-5.2' }])).toBe('GPT-6-Astra')
-    expect(teamEngineLabel([{ id: 'gpt-5.6-sol', display_name: 'Legacy Sol' }])).toBe('GPT-6-Astra')
     expect(modelLabel({ id: 'x' })).toBe('x')
   })
 })

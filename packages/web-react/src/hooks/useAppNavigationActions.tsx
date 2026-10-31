@@ -244,11 +244,24 @@ export function useAppNavigationActions({
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelPrefs, setPreferenceEffort are App useState setter/useRef passed in, stable
   const applyConversationPreferences = useCallback(
-    (prefs: PrefsView, _patch?: Record<string, unknown>) => {
+    (prefs: PrefsView, patch?: Record<string, unknown>) => {
       setPreferenceEffort(prefs.default_effort);
       // default_model 变更经 modelPrefs → resolver effect 传导:只影响「无自有持久化选择」
       // 的会话与空会话态;已显式选过模型的会话保持自身选择(per-session 隔离语义)。
-      setModelPrefs(prefs);
+      // 仅当设置/系统助手显式修改 default_model 时打本地变更戳,打开设置重读或改 theme 不改此水位。
+      setModelPrefs((prev) => {
+        const modelPatched =
+          (patch !== undefined && "default_model" in patch) ||
+          (prev.default_model !== undefined && prefs.default_model !== prev.default_model);
+        const defaultModelChangedAt = modelPatched
+          ? prefs.default_model
+            ? Date.now()
+            : undefined
+          : prev.default_model_updated_at;
+        return defaultModelChangedAt !== undefined
+          ? { ...prefs, default_model_updated_at: defaultModelChangedAt }
+          : prefs;
+      });
     },
     [],
   );

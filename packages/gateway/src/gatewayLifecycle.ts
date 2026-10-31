@@ -77,8 +77,10 @@ import {
 } from './localExecution.js'
 import { makePeerKey, PENDING_PERMISSION_SWEEP_MS } from './server.js'
 import type { Gateway } from './server.js'
+import { handedOffDelegateRetryDelay, retryHandedOffDelegateNotifies } from './delegateWaitHandoff.js'
 
 export interface GatewayLifecycleHost {
+  _activeSendToAgentCallbacks: Gateway['_activeSendToAgentCallbacks']
   _armNotifyRetryScheduler: Gateway['_armNotifyRetryScheduler']
   _containerPreview: Gateway['_containerPreview']
   _delegateJobs: Gateway['_delegateJobs']
@@ -1373,19 +1375,25 @@ export function _armNotifyRetryScheduler(this: GatewayLifecycleHost): void {
   }
   if (!this._delegateJobs) return
   const notifierOn = isDelegateNotifierEffective()
-  if (!notifierOn && !isDelegateDurableEffective()) return
-  const delay = notifierOn
-    ? delayUntilNextNotifyRetry(this._delegateJobs)
-    : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
+  const handoffDelay = notifierOn ? undefined : handedOffDelegateRetryDelay(this._delegateJobs)
+  const cronDelay = !notifierOn && isDelegateDurableEffective()
+    ? delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
         callbacks: ['cron-origin-inject'],
         skipLegacyCron: true,
       })
+    : undefined
+  const delay = notifierOn
+    ? delayUntilNextNotifyRetry(this._delegateJobs)
+    : [handoffDelay, cronDelay].filter((value): value is number => value !== undefined).sort((a, b) => a - b)[0]
   if (delay == null) return
   this._notifyRetryTimer = setTimeout(() => {
     this._notifyRetryTimer = undefined
     const work = notifierOn
       ? this._retryDelegateNotifies({ dueOnly: true })
-      : this._drainFlagOffCronOriginNotifies({ dueOnly: true })
+      : Promise.all([
+          this._drainFlagOffCronOriginNotifies({ dueOnly: true }),
+          retryHandedOffDelegateNotifies(this),
+        ])
     void work.finally(() => this._armNotifyRetryScheduler())
   }, delay)
   this._notifyRetryTimer.unref()

@@ -36,6 +36,7 @@ import { TaskboardCancelledError, taskboardRunControls, type TaskboardRunControl
 import { readTaskboardDelegateBody, TaskboardBodyTimeoutError } from './taskboard/delegateBody.js'
 import { classifyDelegateOutputError } from './errorClassify.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
+import { handoffDelegateWait } from './delegateWaitHandoff.js'
 import type { AgentSession } from './sessionManager.js'
 import { isHiddenSystemAgentId, isTeamReviewExecution } from './agentVisibility.js'
 import { backfillCronOccurrenceDelegateJobs } from './cron.js'
@@ -150,6 +151,7 @@ export interface DelegateRuntimeHost {
   _dropDelegateInflightSurface: Gateway['_dropDelegateInflightSurface']
   _ensureDelegateInflightSurface: Gateway['_ensureDelegateInflightSurface']
   _ensureDelegateJobStore: Gateway['_ensureDelegateJobStore']
+  _ensureDurableSendToAgentCallback: Gateway['_ensureDurableSendToAgentCallback']
   _forgetDelegateInflight: Gateway['_forgetDelegateInflight']
   _forgetEvictedDelegateResumes: Gateway['_forgetEvictedDelegateResumes']
   _formatDelegateConcurrencyReject: Gateway['_formatDelegateConcurrencyReject']
@@ -1000,10 +1002,23 @@ export async function handleDelegateWait(
   const waitMs = resolveDelegateWaitMs(parsed.waitMs)
   const store = this._ensureDelegateJobStore()
   const view = await store.wait(jobId, waitMs)
+  // A timed-out/reset HTTP reader must not silently consume a later terminal.
+  if (res.destroyed) return
+  if (parsed.handoffOnRunning === true && (view.status === 'running' || view.status === 'queued')) {
+    if (await handoffDelegateWait(this, req, jobId, parsed.goal)) {
+      return this.sendJson(res, 200, { status: 'deferred', jobId })
+    }
+  }
   if (view.status === 'done' || view.status === 'failed') {
     // The parent read this result in-turn; turn-end adoption must not
     // resume-inject it a second time.
     try {
+      const live = store.snapshotOf(jobId)
+      // Once handed off, callback delivery owns the result. A stale waiter
+      // cannot cancel that delivery or return the same terminal in stdout.
+      if (live?.kind === 'delegate' && live.callback === 'origin-inject' && live.callbackOriginSessionKey) {
+        return this.sendJson(res, 200, { status: 'deferred', jobId })
+      }
       store.markResultConsumed(jobId)
     } catch (err) {
       this.log.warn('delegate wait consume mark failed', { jobId }, err as Error)

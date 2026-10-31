@@ -1,6 +1,6 @@
 /**
- * Cursor delegate fast path: 45s-window complete vs timeout→jobId, plus wait
- * interpreting a later final result and TTL expiry. Uses short constants.
+ * Delegate tools retain one invocation across HTTP polls, then use a CLI aggregate
+ * at the engine budget. Virtual clocks cover long jobs without paid models.
  *
  * Run: npx tsx --test packages/mcp-memory/src/__tests__/delegateCursorFastPath.test.ts
  */
@@ -16,11 +16,20 @@ import {
   interpretDelegateStartBody,
   interpretDelegateWaitBody,
   resolveCursorFastWaitMs,
+  resolveDelegateMcpBudgetMs,
   runCursorDelegateFastPath,
   truncateDelegateLeaderResult,
 } from '../delegateCursorFastPath.js'
 
+const response = (body: Record<string, unknown>) => ({ statusCode: 200, body: JSON.stringify(body) })
+
 describe('resolveCursorFastWaitMs', () => {
+  it('uses the gateway-projected tool budget and a conservative legacy default', () => {
+    assert.equal(resolveDelegateMcpBudgetMs({}), 45_000)
+    assert.equal(resolveDelegateMcpBudgetMs({ OPENCLAUDE_DELEGATE_MCP_BUDGET_MS: '585000' }), 585_000)
+    assert.equal(resolveDelegateMcpBudgetMs({ OPENCLAUDE_DELEGATE_MCP_BUDGET_MS: 'invalid' }), 45_000)
+    assert.equal(resolveDelegateMcpBudgetMs({ OPENCLAUDE_DELEGATE_MCP_BUDGET_MS: '1' }), 1)
+  })
   it('defaults to 45s and clamps to 5s..55s', () => {
     assert.equal(resolveCursorFastWaitMs({}), 45_000)
     assert.equal(resolveCursorFastWaitMs({ OPENCLAUDE_DELEGATE_CURSOR_FAST_WAIT_MS: '10' }), 5_000)
@@ -63,33 +72,130 @@ describe('runCursorDelegateFastPath', () => {
     assert.match(r.text, /^✅ 委派完成 \(agent: coding-assistant\)\n\n修复完成$/)
   })
 
-  it('timeout: still running → jobId + oc-memory delegate-wait instruction', async () => {
+  it('crosses 45 seconds and receives terminal inside one tool invocation', async () => {
+    let now = 0
+    let starts = 0
+    const polls: boolean[] = []
     const r = await runCursorDelegateFastPath({
-      fastWaitMs: 40,
+      fastWaitMs: 45_000,
+      deadlineAtMs: 180_000,
+      now: () => now,
       label: 'coding-assistant',
-      goal: '修一个慢 bug',
       transport: {
-        start: async () => ({
-          statusCode: 200,
-          body: JSON.stringify({
-            status: 'running',
-            jobId: 'dlgjob-slow',
-            agentId: 'coding-assistant',
-          }),
-        }),
-        wait: async () => ({
-          statusCode: 200,
-          body: JSON.stringify({ status: 'running', jobId: 'dlgjob-slow' }),
-        }),
+        start: async () => { starts++; return response({ status: 'running', jobId: 'dlgjob-slow' }) },
+        wait: async (_id, ms, handoff) => {
+          polls.push(handoff === true)
+          now += ms
+          return response(polls.length < 3
+            ? { status: 'running', jobId: 'dlgjob-slow' }
+            : { status: 'done', jobId: 'dlgjob-slow', output: '最终结果', ok: true })
+        },
+      },
+    })
+    assert.equal(starts, 1)
+    assert.deepEqual(polls, [false, false, false])
+    assert.equal(now, 135_000)
+    assert.equal(r.kind, 'ok')
+    assert.match(r.text, /最终结果/)
+    assert.doesNotMatch(r.text, /delegate-wait|status=running/)
+  })
+
+  it('shares a deadline across fan-out and waits for each terminal without a Bash round', async () => {
+    const deadlineAtMs = 180_000
+    const completed = await Promise.all([1, 2, 3].map(async (count) => {
+      let now = 0
+      let polls = 0
+      return runCursorDelegateFastPath({
+        fastWaitMs: 45_000, deadlineAtMs, now: () => now, label: `member-${count}`,
+        transport: {
+          start: async () => response({ status: 'queued', jobId: `dlgjob-${count}` }),
+          wait: async (_id, ms) => {
+            now += ms
+            polls++
+            return response(polls < count
+              ? { status: 'queued', jobId: `dlgjob-${count}` }
+              : { status: count === 2 ? 'failed' : 'done', output: `result-${count}`, ...(count === 2 ? { error: 'child failed' } : {}) })
+          },
+        },
+      })
+    }))
+    assert.deepEqual(completed.map((r) => r.kind), ['ok', 'error', 'ok'])
+    assert.ok(completed.every((r) => !/delegate-wait/.test(r.text)))
+  })
+
+  it('reads a previously callback-owned job without requesting a new handoff', async () => {
+    let now = 0
+    const polls: Array<{ ms: number; handoff?: boolean }> = []
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 45_000, deadlineAtMs: 60_000, now: () => now, label: 'main',
+      transport: {
+        start: async () => { now += 15_000; return response({ status: 'running', jobId: 'dlgjob-defer' }) },
+        wait: async (_id, ms, handoff) => {
+          polls.push({ ms, handoff })
+          now += ms
+          return response({ status: 'deferred', jobId: 'dlgjob-defer' })
+        },
+      },
+    })
+    assert.deepEqual(polls, [{ ms: 42_000, handoff: undefined }])
+    assert.equal(r.kind, 'deferred')
+    assert.match(r.text, /自动把结果送回本会话/)
+    assert.doesNotMatch(r.text, /delegate-wait|Bash/)
+    assert.ok(now < 60_000)
+  })
+
+  it('deadline exhaustion remains healthy and preserves its stdout wait fallback', async () => {
+    let now = 0
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 45_000, deadlineAtMs: 1_000, now: () => now,
+      sleep: async (ms) => { now += ms }, label: 'main',
+      transport: {
+        start: async () => response({ status: 'running', jobId: 'dlgjob-live' }),
+        wait: async () => response({ status: 'running', jobId: 'dlgjob-live' }),
       },
     })
     assert.equal(r.kind, 'running')
-    if (r.kind !== 'running') return
-    assert.equal(r.jobId, 'dlgjob-slow')
-    assert.match(r.text, /status=running jobId=dlgjob-slow/)
-    assert.match(r.text, /oc-memory delegate-wait dlgjob-slow/)
-    assert.match(r.text, /不要重复调用 delegate_task/)
-    assert.match(r.text, /不要轮询 MCP/)
+    assert.match(r.text, /oc-memory delegate-wait dlgjob-live/)
+    assert.doesNotMatch(r.text, /委派失败|网关已接管/)
+  })
+
+  it('still checks once for a result when job admission used the entire budget', async () => {
+    let now = 0
+    let waits = 0
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 45_000, deadlineAtMs: 1_000, now: () => now, label: 'main',
+      transport: {
+        start: async () => { now = 1_500; return response({ status: 'running', jobId: 'dlgjob-admitted' }) },
+        wait: async (_id, ms, handoff) => {
+          waits++
+          assert.equal(ms, 250)
+          assert.equal(handoff, undefined)
+          now += ms
+          return response({ status: 'running', jobId: 'dlgjob-admitted' })
+        },
+      },
+    })
+    assert.equal(waits, 1)
+    assert.equal(r.kind, 'running')
+    assert.match(r.text, /oc-memory delegate-wait dlgjob-admitted/)
+  })
+
+  it('gateway recovery HTTP 503 is retried but a failed job remains terminal', async () => {
+    let polls = 0
+    let now = 0
+    const r = await runCursorDelegateFastPath({
+      fastWaitMs: 45_000, deadlineAtMs: 180_000, now: () => now,
+      sleep: async (ms) => { now += ms }, label: 'main',
+      transport: {
+        start: async () => response({ status: 'running', jobId: 'dlgjob-recovery' }),
+        wait: async () => ++polls === 1
+          ? { statusCode: 503, body: JSON.stringify({ error: 'reconciling' }) }
+          : response({ status: 'failed', jobId: 'dlgjob-recovery', error: 'child failed' }),
+      },
+    })
+    assert.equal(polls, 2)
+    assert.equal(r.kind, 'error')
+    assert.match(r.text, /child failed/)
   })
 
   it('wait later returns the final result (CLI/long-poll shape)', async () => {
@@ -213,7 +319,29 @@ describe('interpret helpers', () => {
 })
 
 describe('formatDelegateFanoutRunning', () => {
-  it('lists unfinished jobIds and a single delegate-wait command', () => {
+  it('keeps one CLI aggregate for every unfinished member of the same tool call', () => {
+    const text = formatDelegateFanoutRunning([
+      { label: 'done', goal: 'a', isError: false, text: 'already returned' },
+      { label: 'first', goal: 'b', isError: false, text: '', running: true, jobId: 'dlgjob-a' },
+      { label: 'second', goal: 'c', isError: false, text: '', running: true, jobId: 'dlgjob-b' },
+    ])
+    assert.equal(text.match(/oc-memory delegate-wait/g)?.length, 1)
+    assert.match(text, /oc-memory delegate-wait dlgjob-a dlgjob-b/)
+    assert.match(text, /不要结束当前回合/)
+    assert.doesNotMatch(text, /请结束当前回合|网关已接管/)
+  })
+
+  it('mixed handoff waits only for jobs whose callback was not confirmed', () => {
+    const text = formatDelegateFanoutRunning([
+      { label: 'auto', goal: 'a', isError: false, text: '', running: true, deferred: true, jobId: 'dlgjob-auto' },
+      { label: 'stdout', goal: 'b', isError: false, text: '', running: true, jobId: 'dlgjob-stdout' },
+    ])
+    assert.match(text, /oc-memory delegate-wait dlgjob-stdout/)
+    assert.doesNotMatch(text, /oc-memory delegate-wait dlgjob-auto/)
+    assert.match(text, /网关已接管的作业会自动送回/)
+  })
+
+  it('lists handed-off members without asking the model to start a wait tool', () => {
     const text = formatDelegateFanoutRunning([
       {
         label: 'coder',
@@ -227,6 +355,7 @@ describe('formatDelegateFanoutRunning', () => {
         isError: false,
         text: '',
         running: true,
+        deferred: true,
         jobId: 'dlgjob-a',
       },
       {
@@ -235,68 +364,47 @@ describe('formatDelegateFanoutRunning', () => {
         isError: false,
         text: '',
         running: true,
+        deferred: true,
         jobId: 'dlgjob-b',
       },
     ])
     assert.match(text, /1 已完成 \/ 2 仍在运行/)
-    assert.match(text, /oc-memory delegate-wait dlgjob-a dlgjob-b/)
-    assert.match(text, /不要重复调用 delegate_tasks/)
-    assert.match(text, /不要轮询 MCP/)
+    assert.doesNotMatch(text, /delegate-wait|Bash/)
+    assert.match(text, /网关已接管等待/)
+    assert.match(text, /dlgjob-a/)
+    assert.match(text, /dlgjob-b/)
     assert.match(text, /✅ coder/)
   })
 })
 
-describe('runCursorDelegateFastPath — wait transport blip → running handle (2026-09-06 L2 矩阵)', () => {
-  const started = async () => ({
-    statusCode: 200,
-    body: JSON.stringify({
-      status: 'running',
-      jobId: 'dlgjob-blip',
-      agentId: 'coding-assistant',
-      sessionKey: 'agent:coding-assistant:delegate:main:1:deadbeef',
-    }),
-  })
+describe('runCursorDelegateFastPath — transport blips stay inside the tool call', () => {
+  const started = async () => response({ status: 'running', jobId: 'dlgjob-blip' })
 
-  it('wait ETIMEDOUT(网关长轮询慢于客户端期限)→ 不是失败,返回 jobId + delegate-wait 指令', async () => {
-    const r = await runCursorDelegateFastPath({
-      fastWaitMs: 40,
-      label: 'coding-assistant',
-      goal: 'slow gateway',
-      transport: {
-        start: started,
-        wait: async () => {
-          const err: any = new Error('delegate client timeout after 60s')
-          err.code = 'ETIMEDOUT'
-          throw err
-        },
-      },
-    })
-    assert.equal(r.kind, 'running')
-    if (r.kind !== 'running') return
-    assert.equal(r.jobId, 'dlgjob-blip')
-    assert.match(r.text, /status=running jobId=dlgjob-blip/)
-    assert.match(r.text, /oc-memory delegate-wait dlgjob-blip/)
-    assert.match(r.text, /sessionKey=agent:coding-assistant:delegate:main:1:deadbeef/)
-  })
-
-  it('wait ECONNRESET / socket hang up 同样降级为 running', async () => {
-    for (const mk of [
-      () => Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
-      () => new Error('socket hang up'),
-    ]) {
+  for (const error of [
+    Object.assign(new Error('delegate client timeout after 60s'), { code: 'ETIMEDOUT' }),
+    Object.assign(new Error('reset'), { code: 'ECONNRESET' }),
+    Object.assign(new Error('restarting gateway'), { code: 'ECONNREFUSED' }),
+    new Error('socket hang up'),
+  ]) {
+    it(`retries ${error.message} and returns the final result`, async () => {
+      let polls = 0
+      let now = 0
       const r = await runCursorDelegateFastPath({
-        fastWaitMs: 40,
-        label: 'x',
+        fastWaitMs: 45_000, deadlineAtMs: 180_000, now: () => now,
+        sleep: async (ms) => { now += ms }, label: 'main',
         transport: {
           start: started,
           wait: async () => {
-            throw mk()
+            if (++polls === 1) throw error
+            return response({ status: 'done', jobId: 'dlgjob-blip', output: 'recovered' })
           },
         },
       })
-      assert.equal(r.kind, 'running')
-    }
-  })
+      assert.equal(polls, 2)
+      assert.equal(r.kind, 'ok')
+      assert.match(r.text, /recovered/)
+    })
+  }
 
   it('非传输类错误仍向上抛(不吞真实 bug)', async () => {
     await assert.rejects(

@@ -1,3 +1,4 @@
+import { delegateMcpBudgetEnvironment } from '../delegateMcpBudget.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -97,6 +98,7 @@ export function createZcodePlatformArtifacts(
         })}\n`,
       )
       const env: Record<string, string> = {
+        ...delegateMcpBudgetEnvironment(),
         OPENCLAUDE_AGENT_ID: input.agentId,
         OC_AGENT_ID: input.agentId,
         ...identityCompatEnvironment(input.identityCompat),

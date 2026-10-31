@@ -410,3 +410,29 @@ describe('buildOfficialClaudeCliArgs', () => {
     assert.ok(hasFlagWithValue(args, '--model', 'glm-5.3-zai'))
   })
 })
+
+
+describe('advisor no-write CLI surface', () => {
+  for (const harness of ['ccb', 'official-cc'] as const) {
+    it(`${harness} removes mutation, shell and delegation tools before dispatch`, () => {
+      const args = harness === 'ccb'
+        ? buildCcbCliArgs({ ...BASE, permissionMode: 'bypassPermissions', readOnly: true } as any)
+        : buildOfficialClaudeCliArgs({ permissionMode: 'bypassPermissions', readOnly: true } as any)
+      assert.equal(args.includes('--strict-mcp-config'), true)
+      const tools = args[args.indexOf('--tools') + 1]?.split(',') ?? []
+      assert.ok(tools.includes('Read'))
+      assert.ok(tools.includes('Grep'))
+      for (const attempted of ['Write', 'Edit', 'Bash', 'NotebookEdit', 'Agent', 'Task', 'Skill']) {
+        assert.equal(tools.includes(attempted), false, `${attempted} must be absent before dispatch`)
+      }
+    })
+    it(`${harness} restores normal tools on the next unrestricted turn`, () => {
+      const build = (readOnly: boolean) => harness === 'ccb'
+        ? buildCcbCliArgs({ ...BASE, readOnly } as any)
+        : buildOfficialClaudeCliArgs({ readOnly } as any)
+      build(true)
+      assert.equal(build(false).includes('--tools'), false)
+      assert.equal(build(false).includes('--strict-mcp-config'), false)
+    })
+  }
+})

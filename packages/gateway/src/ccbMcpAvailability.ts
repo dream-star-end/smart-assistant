@@ -12,8 +12,10 @@
  * `../../mcp-memory/src/` specifier would break container precompile.
  */
 import { PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
+import { isAdvisorReadOnlyMcpTool } from '@openclaude/protocol'
 
 export type CcbMcpAvailabilityInput = {
+  readOnly?: boolean
   configuredTools: readonly string[]
   mcpLaunch: unknown | null
   skillEvalMode?: boolean
@@ -68,7 +70,7 @@ export function projectCcbMcpAvailability(input: CcbMcpAvailabilityInput): strin
     }
     if (!input.projectSearchEnabled) platform.delete('project_search')
   }
-  const names = new Set<string>(input.configuredTools)
+  const names = new Set<string>(input.readOnly ? [] : input.configuredTools)
   for (const name of platform) names.add(name)
-  return [...names].sort()
+  return [...names].filter((name) => !input.readOnly || isAdvisorReadOnlyMcpTool(name)).sort()
 }

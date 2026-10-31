@@ -58,6 +58,7 @@ describe('zcode platform artifacts', () => {
       const config = JSON.parse(raw) as any
       const env = config.mcp.servers.openclaude_memory.env as Record<string, string>
       assert.equal(env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE, '/synthetic/system-help-context.json')
+      assert.equal(env.OPENCLAUDE_DELEGATE_MCP_BUDGET_MS, '45000')
       assert.equal(raw.includes('bearer-must-not-enter-config'), false)
       assert.equal(
         readFileSync(env.OPENCLAUDE_GATEWAY_TOKEN_FILE, 'utf8'),

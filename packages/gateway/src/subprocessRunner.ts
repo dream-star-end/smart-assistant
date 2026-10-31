@@ -1,4 +1,5 @@
 import { captureBoxScopeOwner, getBoxAgentScopeRegistry, type BoxScopeOwner } from './engine/boxAgentScopeRegistry.js'
+import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
@@ -741,6 +742,7 @@ export class SubprocessRunner extends EventEmitter {
     }
     let args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
+          readOnly: this.readOnlyTurn,
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
           extraPromptFile: learningContext.extraPromptFile,
@@ -753,6 +755,7 @@ export class SubprocessRunner extends EventEmitter {
       : buildCcbCliArgs({
           runtime: ccbRuntime!,
           entry: ccbEntry!,
+          readOnly: this.readOnlyTurn,
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
           extraPromptFile: learningContext.extraPromptFile,
@@ -859,7 +862,8 @@ export class SubprocessRunner extends EventEmitter {
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
           // OCV5-434: OpenCode Go GPT Fast (see _buildCcbServiceTierEnv).
           ..._buildCcbServiceTierEnv(this._serviceTier),
-          ...(this.opts.hermeticNoTools ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
+          ...(this.opts.hermeticNoTools || this.readOnlyTurn ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
+          ...(this.readOnlyTurn ? { ENABLE_SEARCH_EXTRA_TOOLS: 'false' } : {}),
           // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
           // here to strip run_in_background from Bash/Agent/PowerShell tool
           // schemas (visibility band-aid for Opus 4.7 over-using background
@@ -1686,13 +1690,13 @@ export class SubprocessRunner extends EventEmitter {
       for (const tool of tools ?? []) availableMcpTools.add(tool)
     }
     for (const srv of this.opts.config.mcpServers ?? []) {
-      if (srv.enabled === false) continue
+      if (this.readOnlyTurn || srv.enabled === false) continue
       if (srv.provider && srv.provider !== effectiveProvider) continue
       if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
       addAvailableTools(srv.tools)
     }
     for (const srv of this.opts.agentMcpServers ?? []) {
-      if (srv.enabled === false) continue
+      if (this.readOnlyTurn || srv.enabled === false) continue
       addAvailableTools(srv.tools)
     }
 
@@ -1714,6 +1718,7 @@ export class SubprocessRunner extends EventEmitter {
       )
     }
     const projectedMcpTools = projectCcbMcpAvailability({
+      readOnly: this.readOnlyTurn,
       configuredTools: [...availableMcpTools],
       mcpLaunch,
       skillEvalMode: this.opts.skillEvalMode,
@@ -1848,7 +1853,9 @@ export class SubprocessRunner extends EventEmitter {
           command: mcpLaunch.command,
           args: mcpLaunch.args,
           env: {
+            ...ccbDelegateMcpBudgetEnvironment(),
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
+            OPENCLAUDE_ADVISOR_READ_ONLY: this.readOnlyTurn ? '1' : '0',
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
@@ -1909,7 +1916,7 @@ export class SubprocessRunner extends EventEmitter {
 
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {
-        if (srv.enabled === false) continue
+        if (this.readOnlyTurn || srv.enabled === false) continue
         if (srv.provider && srv.provider !== effectiveProvider) continue
         if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
         mcpServers[srv.id] = {
@@ -1922,7 +1929,7 @@ export class SubprocessRunner extends EventEmitter {
 
       // Layer 3: Agent-specific MCPs (override same id, bypass toolset filter)
       for (const srv of this.opts.agentMcpServers ?? []) {
-        if (srv.enabled === false) continue
+        if (this.readOnlyTurn || srv.enabled === false) continue
         mcpServers[srv.id] = {
           type: 'stdio',
           command: srv.command,
@@ -1940,6 +1947,7 @@ export class SubprocessRunner extends EventEmitter {
         out.mcpConfigFile = mcpPath
       }
     } catch (err) {
+      if (this.readOnlyTurn) throw err
       runnerLog.warn(
         'failed to write mcp config',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
@@ -2064,6 +2072,13 @@ export class SubprocessRunner extends EventEmitter {
     | { turnKey: string; turnIndex: number; configVersion: string }
     | undefined
   private pendingConsultRespawn = false
+  private readOnlyTurn = false
+
+  /** Tool schemas and MCP children are spawn-scoped. Recycle on both edges. */
+  setReadOnly(readOnly: boolean): void {
+    if (readOnly !== this.readOnlyTurn && this.proc) this.pendingConsultRespawn = true
+    this.readOnlyTurn = readOnly
+  }
 
   setConsultTurn(
     binding: { turnKey: string; turnIndex: number; configVersion: string } | undefined,
