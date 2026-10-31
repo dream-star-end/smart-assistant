@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BRAND } from "../lib/brand";
 import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
+import { STOP_ARM_MS } from "./composerSendGuard";
 import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
@@ -226,6 +227,33 @@ describe("Composer Stop ownership", () => {
   test("stopping 态渲染可见「正在停止…」文案", () => {
     render(<Composer busy stopping onSend={() => {}} onStop={() => {}} />);
     expect(screen.getByText("正在停止…")).toBeInTheDocument();
+  });
+
+  // OCV5-695:发送后几秒没反应,用户再点一下正好落在刚出现的「停止」上,把这一轮停掉了。
+  test("pending onSend shows 正在发送 at once and ignores repeat clicks", () => {
+    const onSend = vi.fn(() => new Promise<boolean>(() => {}));
+    render(<Composer onSend={onSend} onStop={() => {}} />);
+    fireEvent.change(screen.getByLabelText("消息输入框"), { target: { value: "做表" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    const pending = screen.getByRole("button", { name: "正在发送" });
+    expect(pending).toBeDisabled();
+    fireEvent.click(pending);
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  test("a click within STOP_ARM_MS of Send turning into Stop is not a Stop", () => {
+    let now = 10_000;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const onStop = vi.fn();
+    const { rerender } = render(<Composer onSend={() => {}} onStop={onStop} />);
+    rerender(<Composer busy onSend={() => {}} onStop={onStop} />);
+    now += STOP_ARM_MS - 1;
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(onStop).not.toHaveBeenCalled();
+    now += 1;
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+    clock.mockRestore();
   });
 });
 

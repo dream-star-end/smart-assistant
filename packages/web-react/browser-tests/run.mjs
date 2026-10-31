@@ -2993,7 +2993,7 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
     throw new Error("活动轮或消费提醒出现了多个 Stop 控件");
   }
   const before = await page.evaluate(() => window.__composerStops);
-  await stop.click();
+  await page.waitForTimeout(1000); await stop.click(); // OCV5-695: a click within 1 s of the Stop flip is not a Stop.
   const after = await page.evaluate(() => window.__composerStops);
   if (after !== before + 1) throw new Error(`Composer Stop 未精确提交一次:${before}→${after}`);
 
