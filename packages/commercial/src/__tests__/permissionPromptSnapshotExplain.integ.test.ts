@@ -133,6 +133,9 @@ describe('OCV5-185 isolated PG EXPLAIN + 200+ scale', () => {
   test('background-only Stop cannot settle or hide the current confirmation on any read surface', async (t) => {
     if (skipIfNeeded(t)) return
     const sessionId = 'sess-background-confirmation'
+    // Shared fixture: later tests count the 320 seeded rows, so remove ours.
+    t.after(() => pool.query(`WITH p AS (DELETE FROM turn_permission_requests WHERE session_id=$1)
+      DELETE FROM turn_control_requests WHERE session_id=$1`, [sessionId]))
     await pool.query(`INSERT INTO turn_permission_requests
       (user_id,request_id,session_id,client_message_id,tool_name,input_sha256,input_json,expires_at,created_at)
       VALUES (3,'req-background-confirmation',$1,'new-parent','Bash',repeat('a',64),

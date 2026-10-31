@@ -1,4 +1,4 @@
-import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
+import { automaticRetryStatus, getUserError, isDelegateBackgroundEnabled, type AutomaticRetryStatus } from '@openclaude/protocol';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
@@ -2929,23 +2929,21 @@ interface DirectTapeSourceRecord {
   visible_content_sha256: string | null;
 }
 
-/** Group records serialize these server-owned fields next to one another.
- * Match the exact run's bytes without decoding untrusted UTF-8 in SQL: one
- * malformed physical record must not fail the entire timeline page. */
+/** Flag off adds no SQL. Flag on: materializeLosslessTurn writes a background
+ * group's server-owned identity as its first bytes, so substring() reads only
+ * the leading TOAST chunks instead of detoasting multi-MB groups. Decode only
+ * bounded ASCII (encode 'escape'): malformed UTF-8 must not fail the page. */
 function backgroundDelegateHeadSql(prefix: "" | "r."): string {
+  if (!isDelegateBackgroundEnabled(process.env)) return "";
   const payload = `COALESCE(${prefix}visible_payload,${prefix}payload)`;
-  const marker = `convert_to('"_delegateRunId":' ||
-    to_json(regexp_replace(${prefix}msg_id,'^.*-agentgroup-',''))::text ||
-    ',"_backgroundDelegate":true','UTF8')`;
-  const offset = `position(${marker} IN ${payload})`;
-  // Decode only a bounded ASCII identity after the exact server-owned marker.
-  // encode(bytea,'escape') tolerates malformed UTF-8 without failing page reads.
-  return `CASE WHEN ${prefix}role='agent-group' THEN ${offset} > 0
-    ELSE FALSE END AS background_delegate,
-    CASE WHEN ${prefix}role='agent-group' AND ${offset} > 0 THEN
-      substring(encode(substring(${payload} from ${offset}+octet_length(${marker}) for 192),'escape')
-        from '^,"_delegateJobId":"(dlgjob-[A-Za-z0-9-]{1,160})"')
-      ELSE NULL END AS background_delegate_job_id`;
+  const head = `convert_to('{"_backgroundDelegate":true,"_delegateRunId":' ||
+    to_json(regexp_replace(${prefix}msg_id,'^.*-agentgroup-',''))::text,'UTF8')`;
+  const matched = `CASE WHEN ${prefix}role='agent-group'
+    THEN substring(${payload} from 1 for octet_length(${head}))=${head} ELSE FALSE END`;
+  // 187 bytes fit the quoted id at its 160-char cap; `+` avoids compiling a {1,160} NFA per backend.
+  return `${matched} AS background_delegate,
+    CASE WHEN ${matched} THEN substring(encode(substring(${payload} from octet_length(${head})+1 for 187),'escape')
+      from '^,"_delegateJobId":"(dlgjob-[A-Za-z0-9-]+)"') END AS background_delegate_job_id,`;
 }
 
 interface DirectTapeVisibleHead {
@@ -4870,8 +4868,7 @@ async function readDirectTapeVisibleHeads(
     await pool.query<DirectTapeVisibleHead>(
       `SELECT r.tape_id, r.msg_id, r.ordinal, r.role, r.ts::text,
               COALESCE(octet_length(r.visible_payload), octet_length(r.payload))::text
-                AS payload_bytes,
-              ${backgroundDelegateHeadSql("r.")},
+                AS payload_bytes,${backgroundDelegateHeadSql("r.")}
               r.visible_content_sha256, t.billing_anchor_id,
               EXISTS (
                 SELECT 1 FROM turn_waivers w
@@ -6670,8 +6667,8 @@ async function readUnifiedTimelineTapeHeads(
        )
        SELECT requested.tape_id,r.msg_id,r.ordinal,r.role,r.ts::text,
               r.content_sha256,
-              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,
-              r.visible_content_sha256, ${backgroundDelegateHeadSql("r.")}
+              COALESCE(octet_length(r.visible_payload),octet_length(r.payload))::text AS payload_bytes,${backgroundDelegateHeadSql("r.")}
+              r.visible_content_sha256
          FROM requested
          JOIN LATERAL (
            SELECT msg_id,ordinal,role,ts,content_sha256,payload,visible_payload,
@@ -7887,8 +7884,7 @@ export async function listTurnTapeRecordsImpl(
     const heads = (
       await pool.query<DirectTapePageHead>(
         `SELECT msg_id, ordinal, role, ts::text, content_sha256,
-                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
-                ${backgroundDelegateHeadSql("")},
+                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,${backgroundDelegateHeadSql("")}
                 visible_content_sha256
            FROM client_session_turn_tape_records
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3
@@ -7944,8 +7940,7 @@ export async function listTurnTapeRecordsImpl(
     const heads = (
       await pool.query<DirectTapePageHead>(
         `SELECT msg_id, ordinal, role, ts::text, content_sha256,
-                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,
-                ${backgroundDelegateHeadSql("")},
+                COALESCE(octet_length(visible_payload), octet_length(payload))::text AS payload_bytes,${backgroundDelegateHeadSql("")}
                 visible_content_sha256
           FROM client_session_turn_tape_records
           WHERE session_id=$1 AND user_id=$2 AND tape_id=$3 AND ordinal >= $4

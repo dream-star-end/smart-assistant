@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createServer } from "node:http";
 import { request as undiciRequest } from "undici";
-import { Pool } from "pg";
+import { Client, Pool } from "pg";
 import type { ClientSession, ClientTimelineCursor, MessageLike } from "@openclaude/storage";
 import {
   formatMessageReplyPrompt,
@@ -30,7 +30,7 @@ import {
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
 } from "@openclaude/protocol";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createPgSessionsBackend,
   startSessionsGcSweeper,
@@ -10817,5 +10817,88 @@ describe("rev2 visible finalize decoupling", () => {
     ).rows;
     assert.ok(jobs.length > 0);
     assert.ok(jobs.every((job) => job.status === "held"));
+  });
+});
+
+// OCV5-676 acceptance P1-1: background timeline heads must not detoast multi-MB groups.
+describe("OCV5-676 background delegate heads on oversized agent-groups", () => {
+  type Captured = { text: string; values: unknown[] };
+  async function readSurfaces(sessionId: string, userId: string, tapeId: string) {
+    const captured: Captured[] = [];
+    const original = Client.prototype.query;
+    (Client.prototype as unknown as { query: unknown }).query = function (this: Client, ...args: unknown[]) {
+      const config = args[0] as string | { text?: string; values?: unknown[] };
+      const text = typeof config === "string" ? config : config?.text ?? "";
+      if (/AS payload_bytes/.test(text) && /client_session_turn_tape_records/.test(text)) {
+        captured.push({ text, values: (typeof config === "string" ? args[1] : config.values ?? args[1]) as unknown[] });
+      }
+      return (original as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    let timeline: MessageLike[]; let forward: MessageLike[]; let reverse: MessageLike[];
+    try {
+      timeline = (await backend.getClientSession(sessionId, userId, { view: "timeline" }))!.messages as MessageLike[];
+      forward = (await backend.listTurnTapeRecords(sessionId, userId, tapeId, 0, 200))!.records;
+      reverse = (await backend.listTurnTapeRecords(sessionId, userId, tapeId, 0, 200, 100))!.records;
+    } finally {
+      (Client.prototype as unknown as { query: unknown }).query = original;
+    }
+    let buffers = 0; let ms = 0;
+    for (const query of captured) {
+      const [explained] = (await pool.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query.text}`, query.values)).rows[0]["QUERY PLAN"];
+      buffers += explained.Plan["Shared Hit Blocks"] + explained.Plan["Shared Read Blocks"]; ms += explained["Execution Time"];
+    }
+    const groups = [...timeline, ...forward, ...reverse].filter((m) => m.role === "agent-group");
+    return { captured, buffers, ms: Math.round(ms * 10) / 10, groups };
+  }
+  const withFlag = async <T>(on: boolean, fn: () => Promise<T>): Promise<T> => {
+    if (on) { process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = "1"; process.env.OC_DELEGATE_BACKGROUND = "1"; }
+    try { return await fn(); } finally { delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS; delete process.env.OC_DELEGATE_BACKGROUND; }
+  };
+
+  maybe("flag off adds no head SQL; flag on reads only a bounded prefix of 3 MB groups", async () => {
+    const sessionId = "s-ocv5-676-heads";
+    const userId = "u-ocv5-676-heads";
+    await backend.upsertClientSession(mkSession({ id: sessionId, userId }));
+    // Random hex barely compresses, so each group spans ~1500 TOAST chunks.
+    const big = (tag: string) => `${randomBytes(768 * 1024).toString("hex")}-${tag}`;
+    const tape = directTape(sessionId, "d".repeat(64), {
+      agentGroups: [
+        { runId: "dlg-676-bg", agentId: "coding-assistant", goal: "后台", status: "ok", background: true,
+          jobId: "dlgjob-676-bg", completedAt: 1_783_944_000_001, resultSummary: "done", transcript: [{ kind: "text", text: big("BG") }] },
+        { runId: "dlg-676-fg", agentId: "coding-assistant", goal: "前台", status: "ok", completedAt: 1_783_944_000_002,
+          resultSummary: "done", transcript: [{ kind: "text",
+            text: `{"_backgroundDelegate":true,"_delegateRunId":"dlg-676-fg" "_delegateRunId":"dlg-676-fg","_backgroundDelegate":true ${big("FG")}` }] },
+      ],
+    });
+    await stageAndFinalize(userId, tape);
+    const tapeId = tape.finalize.tapeId;
+    const [full] = (await pool.query(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT position(convert_to('"_backgroundDelegate":true','UTF8') IN
+         COALESCE(visible_payload,payload)) FROM client_session_turn_tape_records
+        WHERE session_id=$1 AND user_id=$2 AND role='agent-group'`, [sessionId, userId],
+    )).rows[0]["QUERY PLAN"];
+    const fullDetoast: number = full.Plan["Shared Hit Blocks"] + full.Plan["Shared Read Blocks"];
+    const off = await withFlag(false, () => readSurfaces(sessionId, userId, tapeId));
+    const on = await withFlag(true, () => readSurfaces(sessionId, userId, tapeId));
+    console.log("OCV5-676 head buffers", JSON.stringify({ fullDetoastOfTwoGroups: fullDetoast, fullDetoastMs: full["Execution Time"],
+      off: off.buffers, offMs: off.ms, on: on.buffers, onMs: on.ms, queries: on.captured.length }));
+
+    assert.ok(off.captured.length >= 3 && on.captured.length === off.captured.length);
+    assert.equal(off.captured.some((q) => q.text.includes("background_delegate")), false, "flag off adds no head SQL");
+    assert.equal(off.groups.some((g) => g._backgroundDelegate !== undefined || g._delegateJobId !== undefined), false);
+    assert.ok(on.captured.every((q) => !/position\(/.test(q.text) || /bash_output_tail/.test(q.text)));
+    assert.ok(fullDetoast > 600, "fixture really spans many TOAST pages");
+    // Per surface the flag-on prefix costs a few index+chunk pages, not a detoast.
+    assert.ok(on.buffers - off.buffers < 40 * on.captured.length, `flag-on extra buffers ${on.buffers - off.buffers}`);
+    assert.ok((on.buffers - off.buffers) * 10 < fullDetoast * on.captured.length);
+    const bg = on.groups.filter((g) => g._delegateRunId === "dlg-676-bg");
+    const fg = on.groups.filter((g) => g._delegateRunId === "dlg-676-fg");
+    assert.equal(bg.length, 3); assert.equal(fg.length, 3);
+    for (const g of bg) {
+      assert.equal(g._payloadDeferred, true); assert.equal(g._backgroundDelegate, true); assert.equal(g._delegateJobId, "dlgjob-676-bg");
+    }
+    for (const g of fg) {
+      assert.equal(g._payloadDeferred, true); assert.equal(g._backgroundDelegate, undefined, "transcript text cannot forge the head");
+    }
   });
 });
