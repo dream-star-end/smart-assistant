@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { taskboardApi, type Project } from "../lib/taskboard";
+import type { Project } from "../lib/taskboard";
 import {
   parseProjectScopeToken,
   preferredScopeToken,
@@ -103,6 +103,7 @@ export function ProjectScopeProvider({
     }
     setLoading(true);
     try {
+      const { taskboardApi } = await import("../lib/taskboard");
       const rows = await taskboardApi.listProjects(auth);
       if (refreshEpoch.current === request) {
         setWorkProjects(rows);

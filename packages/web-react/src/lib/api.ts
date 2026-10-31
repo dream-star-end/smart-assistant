@@ -82,8 +82,7 @@ import {
 } from "./api/http";
 import { projectsApi } from "./api/projectsApi";
 import { knownUserError } from "./chat/userErrorView";
-import { memorySkillsApi } from "./api/memorySkillsApi";
-import { integrationsApi } from "./api/integrationsApi";
+import { memorySkillsApi, integrationsApi } from "./api/lazyNamespaces";
 export {
   refreshAuth,
   callWithRefresh,

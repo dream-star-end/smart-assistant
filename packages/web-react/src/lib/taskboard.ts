@@ -11,11 +11,11 @@ import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal,
  */
 import { ApiError, apiErrorMessage, bearerHeaders, callWithRefresh, jsonOrThrow } from './api'
 import type { AuthSession } from './types'
+import { TICKET_TYPES, type TicketType } from './ticketTypes'
+
+export { TICKET_TYPES, type TicketType }
 
 // ── 与 domain.ts 锁步的枚举 / 标签 ─────────────────────────────────────────
-
-export const TICKET_TYPES = ['bug', 'feature', 'spike', 'chore'] as const
-export type TicketType = (typeof TICKET_TYPES)[number]
 
 export const TICKET_TYPE_LABEL: Record<TicketType, string> = {
   bug: '问题单',

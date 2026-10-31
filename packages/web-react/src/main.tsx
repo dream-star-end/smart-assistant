@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App, prefetchLazyCentersOnIdle } from './App'
 import { prefetchTapePayloadOnIdle } from './lib/chat/loadTapePayload'
+import { prefetchDeferredApisOnIdle } from './lib/api/lazyNamespaces'
 import { LegalPage } from './components/LegalPage'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { registerServiceWorker } from './registerSW'
@@ -38,5 +39,6 @@ void waitForEntryStyles().then(() => {
   if (!legalKind) {
     prefetchLazyCentersOnIdle()
     prefetchTapePayloadOnIdle()
+    prefetchDeferredApisOnIdle()
   }
 })
