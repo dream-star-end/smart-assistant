@@ -24,7 +24,7 @@ export interface StudioEventFrame {
   projectId: string
   /** The project's status after this event (the web refreshes its view on any frame anyway). */
   status: string
-  event: { id: string; type: string; ts: string; message: string | null }
+  event: { id: string; type: string; ts: string; message: string | null; payload?: Record<string, unknown> }
 }
 
 interface Row {
@@ -35,6 +35,7 @@ interface Row {
   type: string
   ts: Date
   message: string | null
+  payload?: Record<string, unknown>
   live: boolean
 }
 
@@ -43,12 +44,15 @@ export function toFrame(r: Omit<Row, 'live'>): StudioEventFrame {
     type: 'sys.studio_event',
     projectId: r.project_id,
     status: r.status,
-    event: { id: r.id, type: r.type, ts: r.ts.toISOString(), message: r.message },
+    event: {
+      id: r.id, type: r.type, ts: r.ts.toISOString(), message: r.message,
+      ...(r.type === 'plan.delta' ? { payload: r.payload } : {}),
+    },
   }
 }
 
 const SELECT = `SELECT e.id::text AS id, e.project_id::text AS project_id, p.user_id::text AS user_id,
-                       p.status, e.type, e.ts, e.payload->>'message' AS message,
+                       p.status, e.type, e.ts, e.payload->>'message' AS message, e.payload,
                        (p.deleted_at IS NULL) AS live
                   FROM studio_events e JOIN studio_projects p ON p.id = e.project_id`
 

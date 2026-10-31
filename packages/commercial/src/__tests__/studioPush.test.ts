@@ -62,6 +62,11 @@ const until = async (ok: () => boolean) => {
 }
 
 describe('studio push (A2-1c-2)', () => {
+  test('plan.delta retains its stream identity, sequence and text in the socket frame', () => {
+    const payload = { taskId: 'task', requestId: 'req', attempt: 1, leaseEpoch: 2, seq: 3, delta: '红狐' }
+    assert.deepEqual(toFrame(row(12, { type: 'plan.delta', payload })).event.payload, payload)
+    assert.equal(toFrame(row(13, { payload: { internal: true } })).event.payload, undefined)
+  })
   test('toFrame: a sys.studio_event with the project status and the event card', () => {
     assert.deepEqual(
       toFrame(row(12, { status: 'done', type: 'compose.done', message: '成片已生成' })),
