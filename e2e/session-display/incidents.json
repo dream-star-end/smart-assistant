@@ -9189,6 +9189,26 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-BOX-INTERACTIVE-REASON",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "子进程失败时的 BOX_INTERACTIVE 原因行被丢掉，失败记录只剩退出码。现在失败记录保留第一条符合允许名单的原因行；带路径或邮箱的行不进入记录。",
+      "rootFixCommit": "ec9d962a",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-box-interactive-reason] PASS — the failure record keeps the first safe BOX_INTERACTIVE reason and drops paths and emails"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxTerminalProof.test.ts",
+          "assertion": "a failed worker may carry one safe BOX_INTERACTIVE reason"
+        }
+      ]
     }
   ]
 }
