@@ -1,3 +1,4 @@
+import { consumeStateReadbackCompatFinal } from "./stateErrorReadback";
 /**
  * v5 出站帧 → 消息模型**翻译 reducer**。从现网 vanilla handleOutbound + 各独立帧
  * handler 逐条复刻（websocket.js:2559-3540 主线 + 3565-4595 各 handler）。
@@ -1630,6 +1631,11 @@ export function applyOutboundMessage(
   ) {
     suppressLegacyErrorText = true;
     sess._suppressErrorBubbleAtSeq = undefined;
+  }
+  if (suppressLegacyErrorText && consumeStateReadbackCompatFinal(sess, frame)) {
+    markFrameReceived(sess);
+    effects.persistSession?.(sess.id);
+    return;
   }
   // 红卡已被延后(master 拥有自动恢复):这条兼容 [error] final 只是终结符,**不得**清发送态 /
   // retrying 软状态,否则「正在重试中」会在裁决到达前闪成空闲。socket 的 outbound.error 分支已

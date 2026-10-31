@@ -5073,7 +5073,7 @@ export class ChatSocket {
     const epoch = this.lifecycleEpoch;
     return attemptStateErrorReadback(sess, frame, {
       read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess && this.lifecycleEpoch === epoch,
-      replay: () => this.dispatch(frame),
+      replay: (held) => this.dispatch(held),
       changed: () => { this.deps.persistSession?.(sess.id); this.scheduleNotify(); },
     });
   }

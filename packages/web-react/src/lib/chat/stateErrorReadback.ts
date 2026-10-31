@@ -4,7 +4,7 @@ import type { ChatSession } from "./model";
 import type { SessionSnapshot } from "./sessionSnapshot";
 
 type StateErrorFrame = {
-  code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number;
+  code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number; frameSeq?: number; sessionKey?: string;
 };
 const STATE_CODES = new Set(["bad_sequence", "conflict", "turn_changed", "turn_finalized",
   "turn_in_flight", "turn_not_active", "active_turn"]);
@@ -13,6 +13,14 @@ const STORAGE_CODES = new Set(["session_persist_unavailable", "history_enrichmen
   "turn_tape_visible_unavailable", "tape_not_acked", "turn_tape_retryable"]);
 const attempted = new WeakSet<object>();
 const pending = new WeakMap<ChatSession, Set<string>>();
+const compatibilityFinals = new WeakMap<ChatSession, Set<string>>();
+const compatKey = (frame: StateErrorFrame, cmid: string) => `${cmid}:${frame.sessionKey ?? ""}:${frame.frameSeq}`;
+
+/** Called after the reducer accepted frameSeq and identified exact adjacent [error] text. */
+export function consumeStateReadbackCompatFinal(sess: ChatSession, frame: StateErrorFrame): boolean {
+  const cmid = frame.clientMessageId ?? sess._activeClientMessageId;
+  return !!cmid && compatibilityFinals.get(sess)?.delete(compatKey(frame, cmid)) === true;
+}
 
 export function stateErrorWasResolved(code: string, cmid: string, snap: SessionSnapshot): boolean {
   const d = snap.dispatch;
@@ -25,13 +33,13 @@ export function stateErrorWasResolved(code: string, cmid: string, snap: SessionS
 
 /** Only a named peer AND its exact current message can turn an error into a readback.
  * A failed/ambiguous read re-enters the original error handler with the same object. */
-export function attemptStateErrorReadback(
+export function attemptStateErrorReadback<F extends StateErrorFrame>(
   sess: ChatSession,
-  frame: StateErrorFrame,
+  frame: F,
   effects: {
     read: (sessionId: string) => Promise<SessionSnapshot | null | undefined>;
     current: () => boolean;
-    replay: () => void;
+    replay: (frame: F) => void;
     changed: () => void;
   },
 ): boolean {
@@ -46,12 +54,27 @@ export function attemptStateErrorReadback(
   if (inflight.has(key)) return true;
   pending.set(sess, inflight);
   inflight.add(key);
+  // Reuse the reducer's exact adjacent compatibility-final fence while reading authority.
+  if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
+    sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
+    const finals = compatibilityFinals.get(sess) ?? new Set<string>();
+    finals.add(compatKey({ ...frame, frameSeq: frame.frameSeq + 1 }, cmid));
+    compatibilityFinals.set(sess, finals);
+  }
+  const replay = () => {
+    // The adjacent final may already have advanced frameSeq. This is the same
+    // locally held error, not a new incoming frame or a cursor rewind.
+    const held = { ...frame, frameSeq: undefined };
+    attempted.add(held);
+    effects.replay(held);
+    effects.changed();
+  };
   void effects.read(sess.id).then((snap) => {
     if (!effects.current()) return;
-    const latest = [...sess.messages].reverse().find((message) => message.role === "user");
-    if (latest?.id !== cmid) return;
+    if (sess._stopSettlement || (sess._activeClientMessageId && sess._activeClientMessageId !== cmid)) return;
     if (!snap || snap.sessionId !== sess.id || !stateErrorWasResolved(code, cmid, snap)) {
-      effects.replay();
+      const source = sess.messages.find((message) => message.role === "user" && message.id === cmid);
+      if (sess._activeClientMessageId === cmid || source?.status !== "replied") replay();
       return;
     }
     const id = `sys-state-readback-${cmid}-${code}`;
@@ -59,6 +82,6 @@ export function attemptStateErrorReadback(
       id, role: "system", text: "已同步当前任务状态", ts: Date.now(), _source: "local", _errorDetail: code,
     });
     effects.changed();
-  }, () => { if (effects.current()) effects.replay(); }).finally(() => inflight.delete(key));
+  }, () => { if (effects.current()) replay(); }).finally(() => inflight.delete(key));
   return true;
 }

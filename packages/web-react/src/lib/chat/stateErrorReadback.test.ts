@@ -137,3 +137,51 @@ test("same-state duplicate while reading shares one request; a foreign snapshot 
   expect(s.messages.some((row) => row._errorCode === "bad_sequence")).toBe(true);
   sock.stop();
 });
+
+test.each([false, true])("structured error plus adjacent compatibility final retains the held error (read success=%s)", async (success) => {
+  let resolve!: (snap: SessionSnapshot | undefined) => void;
+  const read = vi.fn(() => new Promise<SessionSnapshot | undefined>((r) => { resolve = r; }));
+  const { sock, ws, s } = boot({ readSessionSnapshot: read });
+  const sessionKey = "agent:main:webchat:dm:s1";
+  ws.push(error("session_persist_unavailable", { type: "outbound.error", frameSeq: 1, sessionKey }));
+  ws.push({ type: "outbound.message", peer: { id: "s1", kind: "dm" }, sessionKey,
+    clientMessageId: cmid, frameSeq: 2, blocks: [{ kind: "text", text: "[error] could not persist" }], isFinal: true });
+  await flush();
+  expect(s._sendingInFlight).toBe(true);
+  resolve(success ? snapshot() : undefined); await flush();
+  // accepted alone cannot prove a persist failure was repaired.
+  expect(s.messages.some((row) => row._errorCode === "session_persist_unavailable")).toBe(true);
+  expect(s.messages.some((row) => row.text.includes("[error]"))).toBe(false);
+  expect(s._sendingInFlight).toBe(false);
+  expect(read).toHaveBeenCalledTimes(1);
+  sock.stop();
+});
+
+test("queued user intent does not swallow the current error; asynchronous replay notifies subscribers", async () => {
+  let resolve!: (snap: undefined) => void;
+  const { sock, ws, s } = boot({ readSessionSnapshot: () => new Promise<undefined>((r) => { resolve = r; }) });
+  s.messages.push({ id: "m-queued", role: "user", text: "稍后处理", ts: 2, status: "queued" });
+  const changed = vi.fn(); sock.subscribe(changed);
+  ws.push(error("bad_sequence")); await flush();
+  await vi.advanceTimersByTimeAsync(100);
+  changed.mockClear();
+  resolve(undefined); await flush();
+  await vi.advanceTimersByTimeAsync(100);
+  expect(s.messages.some((row) => row._errorCode === "bad_sequence")).toBe(true);
+  expect(s._sendingInFlight).toBe(false);
+  expect(changed).toHaveBeenCalled();
+  sock.stop();
+});
+
+test("a late adjacent compatibility final cannot end a dispatch the snapshot proved still running", async () => {
+  const { sock, ws, s } = boot({ readSessionSnapshot: async () => snapshot() });
+  const sessionKey = "agent:main:webchat:dm:s1";
+  ws.push(error("bad_sequence", { type: "outbound.error", frameSeq: 1, sessionKey }));
+  await flush();
+  ws.push({ type: "outbound.message", peer: { id: "s1", kind: "dm" }, sessionKey,
+    clientMessageId: cmid, frameSeq: 2, blocks: [{ kind: "text", text: "[error] old sequence" }], isFinal: true });
+  await flush();
+  expect(s._sendingInFlight).toBe(true);
+  expect(s.messages.some((row) => row._errorCode)).toBe(false);
+  sock.stop();
+});
