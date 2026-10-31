@@ -669,31 +669,121 @@ selfhost_prepared_complete "$SHA" "$BUILT_MASTER_RELEASE"
         self.bash('selfhost_prepared_gc touch "$T/gc"')
         self.assertTrue((self.t / 'gc').exists())
 
-    def test_shallow_history_defers_gc_prepare_and_consume_without_deleting_receipts(self):
+    def test_shallow_cutoff_refuses_ancestor_but_reuses_and_consumes_exact_tip(self):
         self.prepare_unique(self.sha)
         self.advance()
         target = self.git('rev-parse', 'HEAD')
         self.prepare_unique(target)
         newer = self.receipt.parent / (target + '.json')
-        expected = {path: path.read_bytes() for path in (self.receipt, newer)}
+        expected = newer.read_bytes()
         shallow = self.repo / '.git/shallow'
         shallow.write_text(target + '\n')
+        shallow_before = shallow.read_bytes()
+        self.assertEqual(self.git('rev-parse', '--is-shallow-repository'), 'true')
         self.assertEqual(self.git('rev-list', target), target)
         self.git('cat-file', '-e', self.sha + '^{commit}')
+        self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertFalse((self.t / 'live-write').exists())
         result = self.bash('selfhost_prepared_gc touch "$T/gc"')
-        self.assertIn('GC deferred: prepared state unreadable', result.stdout)
+        self.assertIn('GC deferred: prepared artifacts await flip', result.stdout)
         self.assertFalse((self.t / 'gc').exists())
-        self.bash(f'selfhost_prepare_candidate {target}', ok=False)
-        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"',
-                  ok=False)
-        for path, data in expected.items():
-            self.assertEqual(path.read_bytes(), data)
-        self.assertEqual(self.build_count(), 2)
-        shallow.unlink()
-        self.bash('selfhost_prepared_enter_flip "$SHA"')
-        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
         self.assertFalse(self.receipt.exists())
+        self.assertEqual(newer.read_bytes(), expected)
+        self.prepare_unique(target)
+        self.assertEqual(newer.read_bytes(), expected)
+        self.assertEqual(self.build_count(), 2)
+        self.bash(f'''selfhost_prepared_enter_flip {target}
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-s3-{target}" ]]
+touch "$T/exact-flip"
+selfhost_prepared_complete {target} "$BUILT_MASTER_RELEASE"
+''')
+        self.assertTrue((self.t / 'exact-flip').exists())
         self.assertFalse(newer.exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+        self.assertEqual(shallow.read_bytes(), shallow_before)
+
+    def test_shallow_boundary_below_candidate_allows_first_build_flip_and_gc(self):
+        boundary = None
+        for source in ('B', 'C', 'D', 'E'):
+            (self.repo / 'source').write_text(source)
+            self.git('commit', '-qam', source)
+            if source == 'B':
+                boundary = self.git('rev-parse', 'HEAD')
+        self.git('push', '-q', 'origin', 'HEAD')
+        target = self.git('rev-parse', 'HEAD')
+        shallow = self.repo / '.git/shallow'
+        shallow.write_text(boundary + '\n')
+        shallow_before = shallow.read_bytes()
+        self.assertEqual(self.git('rev-parse', '--is-shallow-repository'), 'true')
+        history = self.git('rev-list', target).splitlines()
+        self.assertEqual(len(history), 4)
+        self.assertEqual(history[-1], boundary)
+        self.assertNotIn(self.sha, history)
+        self.prepare_unique(target)
+        candidate = self.receipt.parent / (target + '.json')
+        expected = candidate.read_bytes()
+        self.assertEqual(json.loads(expected)['sourceCommit'], target)
+        self.assertEqual((self.t / 'gates').read_text().splitlines(),
+                         ['master', 'runtime', 'platform'])
+        self.prepare_unique(target)
+        self.assertEqual(candidate.read_bytes(), expected)
+        self.assertEqual(self.build_count(), 1)
+        self.bash(f'''selfhost_prepared_enter_flip {target}
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-s3-{target}" ]]
+touch "$T/exact-flip"
+selfhost_prepared_complete {target} "$BUILT_MASTER_RELEASE"
+''')
+        self.assertTrue((self.t / 'exact-flip').exists())
+        self.assertFalse(candidate.exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+        self.assertEqual(shallow.read_bytes(), shallow_before)
+
+    def test_history_query_failure_falls_back_to_exact_tip_receipts(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        old_bytes, new_bytes = self.receipt.read_bytes(), newer.read_bytes()
+        real_git = self.run_cmd('bash', '-c', 'command -v git')
+        wrapper_dir = self.t / 'git-bin'
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / 'git'
+        wrapper.write_text('''#!/bin/bash
+if [[ "$FAIL_PREPARED_HISTORY" == shallow && "$3" == rev-parse && "$4" == --is-shallow-repository ]] \\
+    || [[ "$FAIL_PREPARED_HISTORY" == rev-list && "$3" == rev-list ]]; then
+  printf '%s\\n' "$3" >>"$HISTORY_QUERY_FAILURE_LOG"
+  exit 88
+fi
+''' + f'exec {real_git!r} "$@"\n')
+        wrapper.chmod(0o755)
+        self.env['PATH'] = str(wrapper_dir) + os.pathsep + self.env['PATH']
+        failures = self.t / 'history-query-failures'
+        self.env['HISTORY_QUERY_FAILURE_LOG'] = str(failures)
+        for command in ('shallow', 'rev-list'):
+            with self.subTest(command=command):
+                self.env['FAIL_PREPARED_HISTORY'] = command
+                failures.write_text('')
+                self.receipt.write_bytes(old_bytes)
+                newer.write_bytes(new_bytes)
+                (self.t / 'gc').unlink(missing_ok=True)
+                self.prepare_unique(target)
+                self.assertFalse(self.receipt.exists())
+                self.assertEqual(newer.read_bytes(), new_bytes)
+                self.assertEqual(self.build_count(), 2)
+                self.assertEqual(failures.read_text().splitlines(),
+                                 ['rev-parse' if command == 'shallow' else 'rev-list'])
+                self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+                self.assertFalse((self.t / 'live-write').exists())
+                self.receipt.write_bytes(old_bytes)
+                self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
+                self.assertFalse(newer.exists())
+                self.assertEqual(self.receipt.read_bytes(), old_bytes)
+                self.bash('selfhost_prepared_gc touch "$T/gc"')
+                self.assertFalse(self.receipt.exists())
+                self.assertTrue((self.t / 'gc').exists())
 
     def test_missing_remote_tip_object_is_fetched_without_updating_refs(self):
         self.prepare()

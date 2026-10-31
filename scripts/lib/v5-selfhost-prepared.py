@@ -46,14 +46,18 @@ def artifact(path, root, marker, pattern):
 
 
 def ancestors(repo, sha):
-    # Resolve the complete pinned history once. Git/read failure must not turn
-    # an unknown relationship into permission to delete a prepared receipt.
-    shallow = subprocess.run(['git', '-C', repo, 'rev-parse', '--is-shallow-repository'],
-                             check=True, capture_output=True, text=True)
-    if shallow.stdout.strip() != 'false':
-        raise ValueError('cannot prune receipts with incomplete git history')
-    result = subprocess.run(['git', '-C', repo, 'rev-list', sha], check=True,
-                            capture_output=True, text=True)
+    # Ancestor retention is an optimization. Incomplete/unreadable history
+    # falls back to the original exact-SHA rule without blocking preparation.
+    # Never treat a truncated rev-list as a complete ancestry proof.
+    try:
+        shallow = subprocess.run(['git', '-C', repo, 'rev-parse', '--is-shallow-repository'],
+                                 check=True, capture_output=True, text=True)
+        if shallow.stdout.strip() != 'false':
+            return {sha}
+        result = subprocess.run(['git', '-C', repo, 'rev-list', sha], check=True,
+                                capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return {sha}
     return set(result.stdout.splitlines())
 
 
