@@ -12,6 +12,8 @@ test('ordinary user rules describe the current runtime without repository train 
     /## 效率契约|--with-dist|host cat|\*\*T[012]\*\*|完整列车|底层模型是 Claude|OpenClaude 商业版/,
   )
   assert.match(claude, /当前会话运行环境/)
+  assert.doesNotMatch(claude, /claudeai\.chat/)
+  assert.match(claude, /充值配额 → 平台管理员 \/ 平台官方渠道/)
   for (const file of ['CLAUDE.md', 'AGENTS.md']) {
     assert.doesNotMatch(read(file), /## 需要用户决策时|不看代码、不翻上下文也能拍板/)
   }

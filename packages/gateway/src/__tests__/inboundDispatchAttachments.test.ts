@@ -68,8 +68,9 @@ test('an unparsed legacy Word attachment tells the model to convert it automatic
   const payload = payloads[0]!
   assert.ok(payload.includes(originalPath))
   assert.match(payload, /请总结这份旧版 Word/)
-  assert.match(payload, /libreoffice --headless --convert-to docx "<原文件>" --outdir \/tmp/)
-  assert.match(payload, /再读取转换后的 \.docx/)
-  assert.match(payload, /仅当文件本身损坏导致转换失败/)
+  assert.ok(payload.includes('libreoffice --headless --convert-to docx --outdir "$(dirname "<原文件>")" "<原文件>"'))
+  assert.match(payload, /再用 `oc-web parse <同目录同名\.docx>` 读取/)
+  assert.match(payload, /仅当文件损坏导致转换失败/)
+  assert.doesNotMatch(payload, /--outdir \/tmp/)
   assert.doesNotMatch(payload, /请用户转存|重传/)
 })

@@ -1550,7 +1550,7 @@ export async function dispatchInbound(
               '',
               '可以用 Read 工具读取文档内容(对纯文本、CSV、源码、PDF 等都有效',
               '—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本)。',
-              '若是 .doc 老格式 Word 二进制,先用 Bash 执行 `libreoffice --headless --convert-to docx "<原文件>" --outdir /tmp` 自动转换,再读取转换后的 .docx；仅当文件本身损坏导致转换失败时才向用户说明。',
+              '若是 .doc 老格式 Word 二进制,先用 Bash 执行 `libreoffice --headless --convert-to docx --outdir "$(dirname "<原文件>")" "<原文件>"`,再用 `oc-web parse <同目录同名.docx>` 读取；仅当文件损坏导致转换失败时才向用户说明。',
             )
           }
         }
