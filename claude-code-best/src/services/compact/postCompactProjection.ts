@@ -1,4 +1,4 @@
-import type { UUID } from 'crypto'
+import type { UUID } from 'node:crypto'
 import type { Message, SystemCompactBoundaryMessage } from '../../types/message.js'
 import type { CompactionResult } from './compact.js'
 
