@@ -280,6 +280,9 @@ jobs:
       - name: Train summary recorder
         run: bash scripts/v5-selfhost-train-summary.test.sh
 
+      - name: Bounded train retry and station alerts
+        run: sudo env "PATH=$PATH" python3 scripts/__tests__/v5SelfhostTrainRetry.test.py
+
       - name: Workspace links (OCV5-549)
         run: bash scripts/v5-selfhost-workspace-links.test.sh
 

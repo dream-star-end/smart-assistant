@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/v5-lease-lib.sh
 source "$SCRIPT_DIR/v5-lease-lib.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-train-retry.sh"
 # OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
 # shellcheck source=scripts/v5-selfhost-autorecover.sh
 source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
@@ -303,23 +304,39 @@ dispatch_train() {
   miss="$(lease_sql "SELECT want_sha FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';" \
           | while read -r w; do lease_sha_contained "$w" "$tip" || echo "$w"; done)"
   [[ -z "$miss" ]] || { wlog "tip ${tip:0:12} 不含 pending sha: $miss;不发车"; return 0; }
-  # 同一 target 上一班由执行器自己上报 failed(门禁/构建拒绝 = 确定性失败)→ 不自动重发
-  # (2026-09-05 实测:0274 迁移门拒绝后 worker 每 15min 烧一班)。worker 对账判的 failed(planned 超时、执行器被外力杀)不受此限。
-  # 在那班结束前登记的 ride 置 failed 并回调(design-v2 §2.2:train failed 且无法自动重发 → failed);
-  # 之后新登记的 ride 是人工决定,允许再发一班。
-  local lastf ftid ffin freason flog
-  lastf="$(lease_sql -separator $'\t' "SELECT t.id,t.finished_at,COALESCE(t.reason,''),COALESCE(t.log_path,'') FROM train t
+  # All failure actors share the same lifetime budget. Reconciliation or recovery
+  # must not turn a failed retry into a fresh automatic train on the next tick.
+  local lastf ftid ffin freason flog fsha retry_reason="" retry_sql="" retry_doc='{}'
+  lastf="$(lease_sql -separator '|' "SELECT t.id,t.finished_at,COALESCE(t.reason,''),COALESCE(t.log_path,''),t.target_sha FROM train t
              WHERE t.resource='$RESOURCE' AND t.target_sha='$tip' AND t.status='failed'
-               AND EXISTS (SELECT 1 FROM event e WHERE e.subject_id=t.id AND e.event='train-failed' AND e.actor LIKE 'deploy:%')
-             ORDER BY t.seq DESC LIMIT 1;")"
+             ORDER BY t.seq DESC LIMIT 1;")" || return 0
+  # S3 is separate: never run an old SHA after tip moved. Associate the previous
+  # tip-change failure with the new tip, retaining its cause and source identity.
+  if [[ -z "$lastf" ]]; then
+    local moved moved_id moved_sha
+    moved="$(lease_sql -separator '|' "SELECT id,finished_at,COALESCE(reason,''),COALESCE(log_path,''),target_sha FROM train WHERE resource='$RESOURCE' AND status IN ('failed','committed') ORDER BY seq DESC LIMIT 1;")" || return 0
+    IFS='|' read -r moved_id _ _ _ moved_sha <<<"$moved"
+    if [[ -n "$moved_id" && "$moved_sha" != "$tip" ]] && lease_sha_contained "$moved_sha" "$tip" \
+      && [[ "$(train_retry_classify "$moved_id" 2>/dev/null || true)" == tip_advanced ]]; then
+      lastf="$moved"
+    fi
+  fi
   if [[ -n "$lastf" ]]; then
-    IFS=$'\t' read -r ftid ffin freason flog <<<"$lastf"
+    IFS='|' read -r ftid ffin freason flog fsha <<<"$lastf"
+    local old_pending used
+    old_pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")" || return 0
+    used="$(lease_sql "SELECT COUNT(*) FROM train_auto_retry WHERE resource='$RESOURCE' AND target_sha='$tip';")" || return 0
+    if [[ "$old_pending" -gt 0 && "$used" == 0 ]]; then
+      retry_reason="$(train_retry_classify "$ftid" 2>/dev/null || true)"
+    fi
     local rid
-    while read -r rid; do
-      [[ -n "$rid" ]] || continue
-      transition_with_outbox "$rid" registered failed "train $ftid(target ${tip:0:12})failed,同 target 不自动重发" \
-        "$(lease_body_failed "$rid" "列车 $ftid 失败: $freason" "${flog:-无日志}(target ${tip:0:12} 仍是分支 tip;修复后 push 新 tip 或人工放行后再 register)")"
-    done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")
+    if [[ -z "$retry_reason" ]]; then
+      while read -r rid; do
+        [[ -n "$rid" ]] || continue
+        transition_with_outbox "$rid" registered failed "train $ftid failed; no automatic retry" \
+          "$(lease_body_failed "$rid" "列车 $ftid 失败: $freason" "${flog:-无日志}(自动预算已用或失败不在白名单;修复后 push 新 tip 或明确重新 register)")"
+      done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride' AND created_at <= '$(lease_q "$ffin")';")
+    fi
     pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
     [[ "$pending" -gt 0 ]] || { wlog "tip ${tip:0:12} 上一班 $ftid 已 failed 且无新 ride,不发车"; return 0; }
   fi
@@ -349,6 +366,12 @@ dispatch_train() {
 
   id="$(lease_new_id tr)"; now="$(lease_now)"
   mkdir -p "$WORKER_LOG_DIR"; logf="$WORKER_LOG_DIR/$id.log"
+  if [[ -n "$retry_reason" ]]; then
+    retry_doc="$(jq -cn --arg source "$ftid" --arg sha "$fsha" --arg reason "$retry_reason" '{autoRetry:{attempt:1,sourceTrainId:$source,sourceSha:$sha,reason:$reason}}')" || { exec 8>&-; return 0; }
+    # A unique constraint failure rolls back planned insertion and prevents spawn.
+    retry_sql="INSERT INTO train_auto_retry(resource,target_sha,source_train_id,source_sha,retry_train_id,reason,created_at) VALUES('$RESOURCE','$tip','$ftid','$fsha','$id','$retry_reason','$now');
+$(lease_event_sql "$id" train-auto-retry-planned "$ACTOR" "source=$ftid sourceSha=$fsha reason=$retry_reason target=$tip")"
+  fi
   # 先 insert(planned),再 spawn;唯一部分索引保证同 resource 只有一班 open。
 local lp_views lp_bind
 lp_views="$(lease_policy_views_sql "$RESOURCE")" || { exec 8>&-; return 0; }
@@ -357,14 +380,16 @@ lease_tx <<SQL || { wlog 'insert/bind train 拒绝；不发车'; exec 8>&-; retu
 .bail on
 BEGIN IMMEDIATE;
 $lp_views
-INSERT INTO train(id,resource,target_sha,status,owner,log_path,created_at,updated_at)
-VALUES('$id','$RESOURCE','$tip','planned','$ACTOR','$(lease_q "$logf")','$now','$now');
+INSERT INTO train(id,resource,target_sha,status,owner,log_path,evidence_json,created_at,updated_at)
+VALUES('$id','$RESOURCE','$tip','planned','$ACTOR','$(lease_q "$logf")','$(lease_q "$retry_doc")','$now','$now');
+$retry_sql
 $lp_bind
 $(lease_inflight_bind_sql "$id" "$tip" "$ACTOR")
 $(lease_event_sql "$id" train-planned "$ACTOR" "target=$tip rides=$pending")
 COMMIT;
 SQL
   wlog "train $id planned target=${tip:0:12} rides=$pending → spawn deploy"
+  [[ -z "$retry_reason" ]] || wlog "train $id automatic retry 1/1 reason=$retry_reason source=$ftid sourceSha=$fsha"
   if [[ "$DRY" == 1 ]]; then
     wlog "[dry] 不 spawn"; exec 8>&-; return 0
   fi
@@ -413,6 +438,10 @@ $(lease_event_sql "$id" train-spawned "$ACTOR" "pid=$pid log=$logf")
 COMMIT;
 SQL
   wlog "train $id spawned pid=$pid log=$logf"
+  if [[ -n "$retry_reason" ]]; then
+    printf '\n[lease-worker] automatic retry 1/1 reason=%s source=%s sourceSha=%s target=%s\n' "$retry_reason" "$ftid" "$fsha" "$tip" >>"$logf"
+    [[ -z "$flog" ]] || printf '\n[lease-worker] automatic retry reason=%s nextTrain=%s target=%s\n' "$retry_reason" "$id" "$tip" >>"$flog"
+  fi
 }
 
 # ---------- 6 投递 ----------
@@ -602,10 +631,12 @@ main() {
   reconcile_trains
   # 失败只记日志:自动恢复出错不能挡住结算、发车与投递。
   autorecover_tick || wlog "autorecover tick 异常(下 tick 重试)"
+  train_retry_reconcile || wlog "retry result reconciliation failed; will retry next tick"
   expire_and_alert
   settle_rides
   dispatch_train
   deliver_outbox
+  deliver_train_retry_alerts || wlog "retry stop inbox delivery deferred"
   flush_task_spool
   prewarm_idle_tick || wlog "预热调度失败(不影响列车/投递)"
 }
