@@ -9189,6 +9189,26 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-BOX-ONBOARDING-SCREEN",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "首次启动停在主题页，或停在未登录页时，ready 检查会等到超时才报 BOX_INTERACTIVE_NOT_READY timeout。现在这两种画面立刻失败，分别是 BOX_INTERACTIVE_ONBOARDING 和 BOX_INTERACTIVE_LOGIN_REQUIRED，并且不把画面内容写进错误输出。",
+      "rootFixCommit": "506a9c7e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-box-onboarding-screen] PASS — a theme page and a logged-out page fail immediately with BOX_INTERACTIVE_ONBOARDING or BOX_INTERACTIVE_LOGIN_REQUIRED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxHostBlockingScreen.test.ts",
+          "assertion": "a first-start theme page fails immediately as BOX_INTERACTIVE_ONBOARDING"
+        }
+      ]
     }
   ]
 }
