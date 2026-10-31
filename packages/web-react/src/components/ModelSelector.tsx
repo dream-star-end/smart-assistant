@@ -351,12 +351,65 @@ export function ModelSelector({
     return parts.length > 0 ? parts.join(' · ') : null
   })()
   const disabled = Boolean(loading || teamEngineActive || (models.length === 0 && lockedModels.length === 0))
-  const rows = modelPickerRows(models, lockedModels)
+  const rawRows = modelPickerRows(models, lockedModels)
+  const pickerRowLabel = (row: (typeof rawRows)[number]): string => {
+    if (row.kind === 'plain') return modelLabel(row.model)
+    if (row.kind === 'locked-plain') return lockedPlainLabel(row.model)
+    return row.row.label
+  }
+  const pickerRowHasId = (row: (typeof rawRows)[number], id: string | undefined): boolean => {
+    if (!id) return false
+    if (row.kind === 'plain') return row.model.id === id
+    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return false
+    return row.row.members.some((m) => m.id === id)
+  }
+  // 三档可用性优先级：可用(2) > 订阅锁定可解锁(1) > 全部降级禁用(0)。
+  // 当前选中行仅在优先级不低于已留同名行时替换，避免已选降级路线盖掉可点击的解锁入口。
+  const pickerRowRank = (row: (typeof rawRows)[number]): 0 | 1 | 2 => {
+    if (row.kind === 'locked-plain' || row.kind === 'locked-cursor-family') return 1
+    const healthy = row.kind === 'plain' ? !isDegraded(row.model) : !row.row.members.every(isDegraded)
+    return healthy ? 2 : 0
+  }
+  // 「最近」(OCV5-150) + 同展示名去重(U3):
+  // 1) 同展示名(如官方 grok-build 与 Cursor cursor-grok-4.7-* 同为「Grok 4.7」,或同名双 id)只保留一行,
+  //    遵循 rawRows 优先级(可用 → 锁定 → 降级,同级按目录顺序);若后一行命中当前 selectedId 且可用性不低于已留行,
+  //    则改留当前选中行以保持 ✓ 与档位控件一致;任一同名行命中 recentIds 均把该展示名计入「最近」。
+  // 2) 「最近」按目录顺序排,当前选中也留在组内并从下方列表移除;锁定行不进;全部模型都在「最近」时不分组。
+  const recentIds = readRecentModels()
+  const rows: typeof rawRows = []
+  const rowIndexByLabel = new Map<string, number>()
+  const recentLabels = new Set<string>()
+  for (const row of rawRows) {
+    const key = pickerRowLabel(row).trim()
+    if (recentIds.some((id) => pickerRowHasId(row, id))) {
+      recentLabels.add(key)
+    }
+    const existingIdx = rowIndexByLabel.get(key)
+    if (existingIdx === undefined) {
+      rowIndexByLabel.set(key, rows.length)
+      rows.push(row)
+    } else if (
+      pickerRowHasId(row, selectedId) &&
+      pickerRowRank(row) >= pickerRowRank(rows[existingIdx]!)
+    ) {
+      rows[existingIdx] = row
+    }
+  }
+  const recentPicked = rows.filter(
+    (row) =>
+      row.kind !== 'locked-plain' &&
+      row.kind !== 'locked-cursor-family' &&
+      recentLabels.has(pickerRowLabel(row).trim()),
+  )
+  const recentRows = recentPicked.length < rows.length ? recentPicked : []
   const {
     visible: visibleRows,
     collapsed: collapsedRows,
     selectedInCollapsed,
-  } = partitionCollapsedRows(rows, selectedId)
+  } = partitionCollapsedRows(
+    rows.filter((row) => !recentRows.includes(row)),
+    selectedId,
+  )
   // 折叠组默认收起;当前选中项落在组内时自动展开,保证选中项永远可见。
   const [collapsedOpen, setCollapsedOpen] = useState(selectedInCollapsed)
   useEffect(() => {
@@ -378,46 +431,8 @@ export function ModelSelector({
   }, [teamEngineActive])
   const showCollapsedGroup = collapsedRows.length > 0
   const [, setRecentTick] = useState(0)
-  const recentRows = (() => {
-    const seen = new Set<string>()
-    const out: typeof rows = []
-    for (const id of readRecentModels()) {
-      if (id === selectedId) continue
-      if (!models.some((m) => m.id === id)) continue
-      if (lockedModels.some((m) => m.id === id)) continue
-      const row = rows.find((item) => {
-        if (item.kind === 'plain') return item.model.id === id
-        if (
-          item.kind === 'cursor-family' ||
-          item.kind === 'context-family' ||
-          item.kind === 'grok-build-family'
-        ) {
-          return item.row.members.some((m) => m.id === id)
-        }
-        return false
-      })
-      if (!row) continue
-      // 与当前选中同一家族的行不进「最近」(C-27):切过同家族不同档位后,主列表里那一行已带 ✓,
-      // 「最近」再出现一次同名同 ✓ 的行只会让人以为是两个模型。
-      if (row.kind === 'cursor-family' && selectedCursor && row.row.family === selectedCursor.family) continue
-      if (row.kind === 'context-family' && selectedContext && row.row.family === selectedContext.family) continue
-      if (row.kind === 'grok-build-family' && isGrokBuildCatalogId(selectedId)) continue
-      const ident =
-        row.kind === 'plain'
-          ? `plain:${row.model.id}`
-          : row.kind === 'cursor-family' ||
-              row.kind === 'context-family' ||
-              row.kind === 'grok-build-family'
-            ? `${row.kind}:${row.row.family}`
-            : `other:${id}`
-      if (seen.has(ident)) continue
-      seen.add(ident)
-      out.push(row)
-    }
-    return out
-  })()
   const selectedPromo = promoLabelOf(selected)
-  const selectedFamilyRow = rows.find(
+  const selectedFamilyRow = rawRows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
   )
   const cursorMembers =
@@ -435,7 +450,7 @@ export function ModelSelector({
     isGrokBuildCatalogId(selectedId) &&
     models.some((model) => model.id === GROK_BUILD_MODEL_ID) &&
     models.some((model) => model.id === GROK_BUILD_FAST_MODEL_ID)
-  const selectedContextRow = rows.find(
+  const selectedContextRow = rawRows.find(
     (row) => row.kind === 'context-family' && row.row.family === selectedContext?.family,
   )
   const contextMembers =

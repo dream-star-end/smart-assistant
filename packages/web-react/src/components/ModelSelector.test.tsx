@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom/vitest'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
+import { resolveSessionModel } from '../lib/modelPreferences'
 import { ModelSelector, modelLabel, teamEngineLabel } from './ModelSelector'
 import { EFFORT_OPTIONS } from './settings/labels'
 
@@ -739,8 +740,22 @@ describe('ModelSelector 最近使用', () => {
     localStorage.clear()
   })
 
-  // C-27:切过同家族不同档位后,「最近」会出现与当前选中同一家族的行且带 ✓,与主列表重复。
-  it('与当前选中同一 Cursor 家族的最近记录不进「最近」分组;其它家族照常', async () => {
+  /** 「最近」分组 = 标签之后、分隔线之前的兄弟节点。 */
+  function recentGroupIds(): string[] {
+    const ids: string[] = []
+    const label = document.querySelector('[data-recent-group="true"]')
+    for (let el = label?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
+      const id = el.getAttribute('data-model-id')
+      if (id) ids.push(id)
+    }
+    return ids
+  }
+  const allRowIds = () =>
+    [...document.querySelectorAll('[role="menuitem"][data-model-id]')].map((el) => el.getAttribute('data-model-id'))
+
+  // C-27 / 体验官 10-29「GPT-6.1-Sol 出现两次」:「最近」里有的不再在下面的全部列表里重复;
+  // 同家族的不同档位并成一行(当前选中的家族也留在「最近」,带 ✓),不再出现两行同名。
+  it('「最近」与全部列表不重复:选中家族并成一行留在「最近」,下面不再列', async () => {
     const GROK_MODELS: PublicModel[] = [
       { id: 'cursor-grok-4.6-high-fast', display_name: 'Grok 4.6 High Fast' },
       { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
@@ -751,17 +766,39 @@ describe('ModelSelector 最近使用', () => {
     render(<ModelSelector models={GROK_MODELS} selectedId="cursor-grok-4.6-high-fast" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
-    const recentLabel = document.querySelector('[data-recent-group="true"]')
-    expect(recentLabel).toBeTruthy()
-    // 「最近」分组 = 标签之后、分隔线之前的兄弟节点。
-    const recentIds: string[] = []
-    for (let el = recentLabel?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
-      const id = el.getAttribute('data-model-id')
-      if (id) recentIds.push(id)
-    }
-    // 同家族(grok)不出现在最近;glm-5.2 出现。
-    expect(recentIds).toEqual(['glm-5.2'])
     expect(document.querySelectorAll('[data-recent-group="true"]')).toHaveLength(1)
+    const recent = recentGroupIds()
+    expect(recent).toHaveLength(2)
+    expect(recent[1]).toBe('glm-5.2')
+    const all = allRowIds()
+    expect(new Set(all).size).toBe(all.length)
+    expect(all).toContain('deepseek-v4')
+    expect(document.querySelectorAll('[role="menuitem"][data-cursor-family]')).toHaveLength(1)
+  })
+
+  // 体验官 10-29「最近」顺序跳:按目录顺序排,不按使用先后;选来选去顺序不变。
+  it('「最近」按目录顺序排,来回切换不换位', async () => {
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['gpt-6-astra', 'glm-5.2', 'deepseek-v4']))
+    const { unmount } = render(<ModelSelector models={MODELS} selectedId="deepseek-v4" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(recentGroupIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra'])
+    unmount()
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['deepseek-v4', 'gpt-6-astra', 'glm-5.2']))
+    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(recentGroupIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra'])
+    expect(allRowIds()).toEqual(['glm-5.2', 'deepseek-v4', 'gpt-6-astra', 'gpt-5.6-sol'])
+  })
+
+  it('全部模型都在「最近」时不分组,列表照常', async () => {
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['glm-5.2', 'deepseek-v4']))
+    render(<ModelSelector models={MODELS.slice(0, 2)} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-recent-group="true"]')).toBeNull()
+    expect(allRowIds()).toEqual(['glm-5.2', 'deepseek-v4'])
   })
 
   it('选过的模型出现在「最近」分组', async () => {
@@ -1000,5 +1037,126 @@ describe('OCV5-504 自选档说明保持默认与目录价格权威', () => {
     expect(screen.getByText('较低档偏重响应速度，较高档偏重复杂任务。')).toBeInTheDocument()
     fireEvent.click(document.querySelector('[data-effort="follow"]')!)
     expect(onSelectEffort).toHaveBeenCalledExactlyOnceWith(null)
+  })
+})
+
+describe('ModelSelector 同名模型去重 (U3)', () => {
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('全部已准入模型降级而 resolver 回落官方降级路线时，保留更高优先级的同名锁定路线且可触发解锁 (#1255)', async () => {
+    const models: PublicModel[] = [
+      { id: 'grok-build', display_name: 'Grok 4.7', engine: 'grok', degraded: true },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4', degraded: true },
+    ]
+    const lockedModels: LockedPublicModel[] = [
+      {
+        id: 'cursor-grok-4.7-high',
+        display_name: 'Grok 4.7 High',
+        engine: 'cursor',
+        min_plan_code: 'pro',
+        min_plan_name: 'Pro',
+      },
+    ]
+    const selectedId = resolveSessionModel(models, 'grok-build', {})
+    expect(selectedId).toBe('grok-build')
+    const onSelect = vi.fn()
+    const onLockedSelect = vi.fn()
+    render(
+      <ModelSelector
+        models={models}
+        lockedModels={lockedModels}
+        selectedId={selectedId}
+        onSelect={onSelect}
+        onLockedSelect={onLockedSelect}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const grokItems = items.filter((item) => item.textContent?.includes('Grok 4.7'))
+    expect(grokItems).toHaveLength(1)
+    const grok = grokItems[0]!
+    expect(grok).toHaveAttribute('data-locked', 'true')
+    expect(grok).not.toHaveAttribute('aria-disabled', 'true')
+    fireEvent.click(grok)
+    expect(onLockedSelect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelId: 'cursor-grok-4.7-high',
+        minPlanCode: 'pro',
+      }),
+    )
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+
+  it('官方 grok-build 与 Cursor cursor-grok-4.7 同名「Grok 4.7」时选单只列一次,支持选中态与降级切换', async () => {
+    const DUAL_GROK: PublicModel[] = [
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'grok-build', display_name: 'Grok 4.7', engine: 'grok', cost_x: 3.4 },
+      { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast', engine: 'grok', cost_x: 6.8 },
+      { id: 'cursor-grok-4.7-high', display_name: 'Grok 4.7 High', engine: 'cursor', cost_x: 4.0 },
+      { id: 'cursor-grok-4.7-high-fast', display_name: 'Grok 4.7 High Fast', engine: 'cursor', cost_x: 8.0 },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+    ]
+    localStorage.setItem('oc_v5_recent_models', JSON.stringify(['cursor-grok-4.7-high-fast']))
+    const onSelect = vi.fn()
+    const view = render(<ModelSelector models={DUAL_GROK} selectedId="glm-5.2" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const grokItems = items.filter((item) => item.textContent?.includes('Grok 4.7'))
+    expect(grokItems).toHaveLength(1)
+    expect(grokItems[0]?.getAttribute('data-model-id')).toBe('grok-build')
+    expect(document.querySelector('[data-recent-group="true"]')).not.toBeNull()
+
+    // 已绑定 Cursor Grok 4.7 的既有会话仍保留唯一一行并正常渲染 Cursor 档位控件
+    view.rerender(
+      <ModelSelector models={DUAL_GROK} selectedId="cursor-grok-4.7-high-fast" onSelect={onSelect} />,
+    )
+    const activeGrok = (await screen.findAllByRole('menuitem')).filter((item) =>
+      item.textContent?.includes('Grok 4.7'),
+    )
+    expect(activeGrok).toHaveLength(1)
+    expect(activeGrok[0]?.getAttribute('data-cursor-family')).toBe('grok-4.7')
+    expect(document.querySelector('[data-effort="high"]')).not.toBeNull()
+
+    // 官方 grok-build 全降级时保留健康的 Cursor Grok 4.7 行
+    const degradedOfficial = DUAL_GROK.map((m) =>
+      m.id === 'grok-build' || m.id === 'grok-build-fast' ? { ...m, degraded: true } : m,
+    )
+    view.rerender(<ModelSelector models={degradedOfficial} selectedId="glm-5.2" onSelect={onSelect} />)
+    const fallbackGrok = (await screen.findAllByRole('menuitem')).filter((item) =>
+      item.textContent?.includes('Grok 4.7'),
+    )
+    expect(fallbackGrok).toHaveLength(1)
+    expect(fallbackGrok[0]?.getAttribute('data-cursor-family')).toBe('grok-4.7')
+  })
+
+  it('两个不同普通 model id 同 display_name 时在「最近」与全量中总共只出现一次', async () => {
+    const DUP_PLAIN: PublicModel[] = [
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'grok-4.7-primary', display_name: 'Grok 4.7' },
+      { id: 'grok-4.7-secondary', display_name: 'Grok 4.7' },
+      { id: 'deepseek-v4', display_name: 'DeepSeek-V4' },
+    ]
+    localStorage.setItem(
+      'oc_v5_recent_models',
+      JSON.stringify(['grok-4.7-secondary', 'grok-4.7-primary']),
+    )
+    const view = render(<ModelSelector models={DUP_PLAIN} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    const items = await screen.findAllByRole('menuitem')
+    const grokItems = items.filter((item) => item.textContent?.includes('Grok 4.7'))
+    expect(grokItems).toHaveLength(1)
+    expect(grokItems[0]?.getAttribute('data-model-id')).toBe('grok-4.7-primary')
+
+    view.rerender(
+      <ModelSelector models={DUP_PLAIN} selectedId="grok-4.7-secondary" onSelect={() => {}} />,
+    )
+    const activeItems = (await screen.findAllByRole('menuitem')).filter((item) =>
+      item.textContent?.includes('Grok 4.7'),
+    )
+    expect(activeItems).toHaveLength(1)
+    expect(activeItems[0]?.getAttribute('data-model-id')).toBe('grok-4.7-secondary')
   })
 })

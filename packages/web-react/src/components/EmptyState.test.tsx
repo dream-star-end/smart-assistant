@@ -88,7 +88,7 @@ describe('EmptyState 问候(OCV5-342)', () => {
       <EmptyState
         agent={AGENT}
         userName="Alice"
-        now={new Date(2026, 9, 8, 15, 0)}
+        now={new Date("2026-10-08T15:00:00+08:00")}
         onPrefill={() => {}}
         onChangeAgent={() => {}}
       />,
@@ -106,14 +106,21 @@ describe('EmptyState 问候(OCV5-342)', () => {
     expect(screen.getByText('写邮件、做规划、查资料。')).toBeInTheDocument()
   })
 
-  it('时段划分', () => {
-    const at = (h: number) => greetingFor(new Date(2026, 0, 1, h, 30))
+  it('时段划分(北京时间)', () => {
+    // 北京 h:30 = UTC (h-8):30;Date.UTC 会把负小时折回前一天。
+    const at = (h: number) => greetingFor(new Date(Date.UTC(2026, 0, 1, h - 8, 30)))
     expect(at(3)).toBe('夜深了')
     expect(at(7)).toBe('上午好')
     expect(at(12)).toBe('中午好')
     expect(at(16)).toBe('下午好')
     expect(at(20)).toBe('晚上好')
     expect(at(23)).toBe('夜深了')
+  })
+
+  // 体验官 10-29 16:27:浏览器在美西时区(当地 01:27),旧逻辑读本地小时问候「夜深了」。
+  it('不跟浏览器时区走:北京 16:27 是下午', () => {
+    expect(greetingFor(new Date('2026-10-29T16:27:00+08:00'))).toBe('下午好')
+    expect(greetingFor(new Date('2026-10-29T08:27:00Z'))).toBe('下午好')
   })
 
   it('邮箱 / 「用户」兜底名不进问候', () => {
