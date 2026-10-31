@@ -31,7 +31,7 @@ test("exhaustion gives one-click retry through continuation, never replays the o
   const actions = errorNoticeActions({ msg: { id: "end" } as ChatMessage,
     cb: { onRetrySend: replay }, isLastTurn: true, waived: false,
     continueInterrupted: resume, userError: USER_ERROR_CATALOG.automatic_retry_exhausted! });
-  render(<button onClick={actions[0]!.onClick}>{actions[0]!.label}</button>);
+  render(<button type="button" onClick={actions[0]!.onClick}>{actions[0]!.label}</button>);
   fireEvent.click(screen.getByRole("button", { name: "重试" }));
   expect(resume).toHaveBeenCalledTimes(1);
   expect(replay).not.toHaveBeenCalled();

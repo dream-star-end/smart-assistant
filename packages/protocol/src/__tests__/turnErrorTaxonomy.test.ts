@@ -71,6 +71,14 @@ describe('automatic turn recovery policy', () => {
     }
   })
 
+  it('OCV5-679 held capacity and credential expiry require a checkpoint and keep the shared bound', () => {
+    for (const code of ['box_capacity_held', 'platform_credential_expired']) {
+      assert.equal(supportsAutomaticTurnRecovery(code), true)
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false)
+    }
+    assert.equal(AUTOMATIC_TURN_RETRY_MAX, 10)
+  })
+
   it('normalizes every deployed unexpected runner label to one recovery policy', () => {
     for (const code of [
       'RUNNER_CRASHED',

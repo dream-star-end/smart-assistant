@@ -8425,7 +8425,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered"
+          "assertion": "[ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD stays named on wire and tape with only bounded safe master recovery"
         },
         {
           "layer": "unit",
@@ -8435,12 +8435,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
-          "assertion": "OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and is never auto-recovered"
+          "assertion": "OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and only recovers through master admission"
         },
         {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
-          "assertion": "'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot"
+          "assertion": "OCV5-679 held capacity and credential expiry require a checkpoint and keep the shared bound"
         }
       ]
     },
