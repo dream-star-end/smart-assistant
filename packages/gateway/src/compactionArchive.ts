@@ -141,7 +141,7 @@ export async function readFullCompactionTimeline(
           if (!first && options.allowMissingTimeline) {
             return { timeline: [], timelineGeneration: null, historyRevision: null, snapshotMaxSeq: null }
           }
-          fail('COMPACTION_ARCHIVE_SESSION_NOT_FOUND')
+          return fail('COMPACTION_ARCHIVE_SESSION_NOT_FOUND')
         }
         if (first && (page.timelineGeneration !== first.timelineGeneration ||
             page.historyRevision !== first.historyRevision || page.snapshotMaxSeq !== first.snapshotMaxSeq)) {

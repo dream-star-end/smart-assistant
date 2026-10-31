@@ -44,7 +44,7 @@ async function call(options: {
     setHeader(name: string, value: unknown) { headers[name.toLowerCase()] = value },
     write(value: Buffer) { sent = true; chunks.push(Buffer.from(value)); return true },
     end(value?: string) { sent = true; if (value) chunks.push(Buffer.from(value)) },
-    destroy() { this.destroyed = true },
+    destroy(this: { destroyed: boolean }) { this.destroyed = true },
   } as unknown as ServerResponse
   const handler = makeCompactionTimelineHandler({
     identityRepo,
