@@ -201,6 +201,42 @@ function memberBody(extra: Record<string, unknown> = {}): Record<string, unknown
 }
 
 describe('handleDelegateTask engine-reported billing', () => {
+  it('personal recovery replay without resume key launches and admits the original task only once', async () => {
+    const previous = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+    const billing = makeBillingClient()
+    const gw = makeGateway({ billing })
+    let release!: () => void
+    let observed!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const submitted = new Promise<void>(resolve => { observed = resolve })
+    let launches = 0
+    gw.sessions.submit = async (_session: unknown, _payload: unknown, onEvent: (e: unknown) => void) => {
+      launches++
+      observed()
+      await held
+      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+    }
+    const body = memberBody({ model: 'gpt-5.6-sol', idempotencyKey: 'before-compact-attempt' })
+    const first = delegate(gw, 'auditor', body)
+    try {
+      await Promise.race([submitted, first.then(result => {
+        throw new Error(`delegate ended before model submission: ${JSON.stringify(result)}`)
+      })])
+      // The model has the exact active idempotency key after recovery, while
+      // its old native resume key may have disappeared into a compact summary.
+      const replay = await delegate(gw, 'auditor', body)
+      assert.equal(replay.status, 409)
+      assert.equal(launches, 1)
+      assert.equal(billing.admits.length, 1)
+      assert.equal(gw._delegateResume.dispatchGrants, 1)
+    } finally {
+      release()
+      await first
+      if (previous === undefined) delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = previous
+    }
+  })
   it('(a) codex 委派 submit 收到 32-hex requestId', async () => {
     const billing = makeBillingClient()
     const gw = makeGateway({ billing })

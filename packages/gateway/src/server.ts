@@ -1,4 +1,5 @@
 import { withUserError } from '@openclaude/protocol'
+import { compactionDelegateTasks } from './compactionTasks.js'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
@@ -739,6 +740,10 @@ export class Gateway {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
     installSystemHelpRelay(this.sessions)
+    this.sessions.readCompactionTasks = (key) => [
+      ...compactionDelegateTasks(this._delegateJobs?.listNonTerminal() ?? [], key),
+      ...this.sessions.activeCompactionSubtasks(key),
+    ]
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
     }

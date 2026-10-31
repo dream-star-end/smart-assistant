@@ -65,6 +65,7 @@ import {
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
 import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
+import { personalCompactionEnabled } from './compactionTasks.js'
 import {
   isDelegateCutoverEffective,
   isDelegateDurableEffective,
@@ -689,6 +690,7 @@ export async function handleDelegateTask(
     targetAgentId,
     sourceAgent: sourceAgentId || 'system',
     idempotencyKey,
+    recoverActiveAttempt: personalCompactionEnabled(),
     identityProjection,
   })
   this._forgetEvictedDelegateResumes(resume.evictedKeys)

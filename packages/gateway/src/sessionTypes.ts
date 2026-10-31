@@ -231,6 +231,9 @@ export interface AgentSession {
     at: number
   }
   _lastNativeCompactionSummary?: string
+  /** Original platform input and observations, scoped to this owner/session/trace. */
+  _compactionOriginal?: import('./compactionArchive.js').CompactionArchiveReference
+  _compactionPendingTools?: Map<string, import('./compactionTasks.js').CompactionActiveTask>
   /** Signed context owner for the turn that currently holds session.lock. */
   _boxContextOwner?: string
   /** Set while the lock-held idle path is inside runner.submitTurn. */

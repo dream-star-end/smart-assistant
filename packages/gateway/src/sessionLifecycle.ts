@@ -1,4 +1,6 @@
 import { withFreshPromptPrivacy } from './promptPrivacyRuntime.js'
+import { captureCompactionOriginal } from './compactionArchive.js'
+import { personalCompactionEnabled } from './compactionTasks.js'
 import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
@@ -836,6 +838,13 @@ export async function prepareModelSwitch(
   }
   session._modelSwitchTransition = transition
   try {
+    if (personalCompactionEnabled() && session.channel === 'webchat') {
+      session._compactionOriginal = (await captureCompactionOriginal({
+        ownerUserId: session.userId ?? 'default', sessionId: session.peerId,
+        sessionKey: session.sessionKey, traceId: session._currentTurnTraceId,
+        currentInput: '', allowMissingTimeline: session.turns === 0,
+      })).reference
+    }
     // biome-ignore lint/suspicious/noImplicitAnyLet: moved verbatim from sessionManager.ts (OCV5-480); pre-existing there
     let artifact
     if (session.runner.compactForHandoff) {

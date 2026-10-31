@@ -122,6 +122,8 @@ export class DelegateResumeRegistry {
     sourceAgent: string
     /** Client/request idempotency key. Same key + same resume session never dispatches twice. */
     idempotencyKey?: string
+    /** Personal compaction recovery can lose the resume key, never the exact attempt key. */
+    recoverActiveAttempt?: boolean
     /** Successful authenticated projection; only changes pair semantics, never parent/key ownership. */
     identityProjection?: IdentityCompatProjection
   }): DelegateResumePreflight {
@@ -141,6 +143,19 @@ export class DelegateResumeRegistry {
       }
     }
     this.pruneAttempts()
+    if (!resumeKey && idempotencyKey && input.recoverActiveAttempt) {
+      for (const attempt of this.attempts.values()) {
+        const binding = this.bindings.get(attempt.sessionKey)
+        if (attempt.idempotencyKey !== idempotencyKey || !binding ||
+          !this.reserved.has(attempt.sessionKey) ||
+          binding.parentSessionKey !== parentSessionKey ||
+          binding.targetAgentId !== targetAgentId || binding.sourceAgent !== sourceAgent) continue
+        return {
+          ok: true, sessionKey: attempt.sessionKey, minted: false, evictedKeys,
+          dispatchGranted: false, replay: true, jobId: attempt.jobId,
+        }
+      }
+    }
     if (resumeKey && idempotencyKey) {
       const existing = this.attempts.get(attemptId(resumeKey, idempotencyKey))
       if (existing && this.reserved.has(resumeKey)) {

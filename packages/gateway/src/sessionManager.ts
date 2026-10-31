@@ -191,6 +191,8 @@ import {
   resolveTransientBreakerThreshold,
 } from './transientRetryCircuit.js'
 import { log } from './sessionManagerLog.js'
+import { renderUntrustedCompactionSummary } from './compactionContract.js'
+import { personalCompactionEnabled } from './compactionTasks.js'
 import { type TurnRunnerHost, _runOneTurn as _runOneTurnImpl, runOneTurnWithRetry as runOneTurnWithRetryImpl } from './sessionTurnRunner.js'
 import { type SessionSubmitHost, submit as submitImpl, _getOrCreateExclusive as _getOrCreateExclusiveImpl, getOrCreate as getOrCreateImpl, finishIdleUnderLock as finishIdleUnderLockImpl, recordExternalTurn as recordExternalTurnImpl, beginExternalTurn as beginExternalTurnImpl, _resumeIdFor as _resumeIdForImpl, _resolveDurableResumeId as _resolveDurableResumeIdImpl } from './sessionSubmit.js'
 import { type SessionTailHost, _persistTailBatch as _persistTailBatchImpl, _dispatchPostTerminalRuntimeEvent as _dispatchPostTerminalRuntimeEventImpl, _foldPostTerminalTail as _foldPostTerminalTailImpl, _drainTailFolding as _drainTailFoldingImpl, _drainTailPersistQueue as _drainTailPersistQueueImpl, _buildTailCapMarker as _buildTailCapMarkerImpl, _scheduleTailPersistWorker as _scheduleTailPersistWorkerImpl, _chainTailPersist as _chainTailPersistImpl, _trackPersistence as _trackPersistenceImpl, _warnMissingPostTerminalOwner as _warnMissingPostTerminalOwnerImpl } from './sessionTail.js'
@@ -538,7 +540,7 @@ function buildNativeModelHandoffContext(summaryText: string, mediaPathHints = ''
   const sections = [
     '<openclaude_native_model_handoff>',
     'The previous source model compacted this populated session for the selected target model. Treat the following native handoff as prior conversation context. Do not restate it unless needed.',
-    summaryText,
+    personalCompactionEnabled() ? renderUntrustedCompactionSummary(summaryText) : summaryText,
   ]
   if (mediaPathHints.trim()) {
     sections.push('', mediaPathHints.trimEnd())
@@ -1193,6 +1195,14 @@ export class SessionManager {
   private _lastMissingOwnerWarnAt = 0
   /** @deprecated Use eventBus 'task.created'/'task.deleted' instead. Kept for backward compat. */
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
+  /** Read-only projection of the gateway's existing authoritative delegate jobs. */
+  public readCompactionTasks?: (sessionKey: string) => import('./compactionTasks.js').CompactionActiveTask[]
+  public activeCompactionSubtasks(parentKey: string): import('./compactionTasks.js').CompactionActiveTask[] {
+    return [...this.sessions.values()]
+      .filter(session => session.parentSessionKey === parentKey && (session._activeTurnCount ?? 0) > 0)
+      .map(session => ({ kind: 'subtask', id: session.progressRunId ?? session.sessionKey,
+        state: 'running', sessionKey: session.sessionKey, agentId: session.agentId }))
+  }
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
   public onAuthError?: () => Promise<void>
   /**

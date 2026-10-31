@@ -1,4 +1,5 @@
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
+import { prepareCompactionTurn } from './compactionRecoveryRuntime.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
@@ -101,6 +102,7 @@ import {
   modelHistorySemanticRole,
   modelHistorySemanticText,
   type GoalStateSnapshot,
+  type PromptPrivacyPolicy,
   type ServiceTier,
   type SessionWorkspaceMode,
 } from '@openclaude/protocol'
@@ -179,6 +181,7 @@ export interface SessionSubmitHost {
   onCcbTaskNotification: SessionManager['onCcbTaskNotification']
   onCcbTaskNotificationDelivered: SessionManager['onCcbTaskNotificationDelivered']
   runOneTurnWithRetry: SessionManager['runOneTurnWithRetry']
+  readCompactionTasks: SessionManager['readCompactionTasks']
   scheduleIdleDrain: SessionManager['scheduleIdleDrain']
   sessions: SessionManager['sessions']
 }
@@ -767,7 +770,11 @@ export async function submit(
     const assertSessionCurrent = () => {
       if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_PRIVACY_OPERATION_CANCELLED')
     }
-    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertSessionCurrent })
+    let compactionPromptPolicy: PromptPrivacyPolicy | undefined
+    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, {
+      assertCurrent: assertSessionCurrent,
+      onPrepared: policy => { compactionPromptPolicy = policy },
+    })
     const maybeSetCodexRoute = (session.runner as any).setCodexRoute
     if (typeof maybeSetCodexRoute === 'function') {
       maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
@@ -1004,7 +1011,7 @@ export async function submit(
         if (msg.system === true || !modelHistorySemanticRole(msg)) return total
         return total + modelHistorySemanticText(msg).length
       }, 0) ?? 0
-    const contextOverflowRetryInputs =
+    let contextOverflowRetryInputs =
       effectiveMasterHistoricalMessages &&
       typeof userTextOrBlocks === 'string' &&
       contextOverflowHistoryChars > 0
@@ -1257,6 +1264,20 @@ export async function submit(
         }
       } catch (err) {
         log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
+      }
+    }
+    // Snapshot before a CLI can compact (including Codex's pre-turn 80% path).
+    // Native slash commands stay byte-for-byte commands; ordinary inputs and
+    // overflow attempts all carry the same original-source recovery contract.
+    if (!opts?.modelSwitchInternal) {
+      const recover = await prepareCompactionTurn(
+        session, userTextOrBlocks, compactionPromptPolicy,
+        this.readCompactionTasks?.(session.sessionKey),
+      )
+      assertSessionCurrent()
+      if (recover && !isCcbSlashCommandPrompt(userTextOrBlocks)) {
+        runnerPayload = recover(runnerPayload)
+        contextOverflowRetryInputs = contextOverflowRetryInputs.map(input => recover(input) as string)
       }
     }
     // Auto-name session from first user turn
