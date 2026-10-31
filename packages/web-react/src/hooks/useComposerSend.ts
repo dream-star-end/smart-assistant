@@ -59,6 +59,7 @@ export type ComposerSendInput = {
   publicCfg: PublicConfig | null;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
+  sendScrollRef?: React.RefObject<(() => void) | null>;
   serviceTier: "fast" | null;
   sessionEffort: PreferenceEffort | null | undefined;
   sessions: Session[];
@@ -105,6 +106,7 @@ export function useComposerSend({
   publicCfg,
   selectedSessionIdRef,
   sendImplicitRatingRef,
+  sendScrollRef,
   serviceTier,
   sessionEffort,
   sessions,
@@ -148,6 +150,7 @@ export function useComposerSend({
           createdAt: new Date().toISOString(),
         };
         setMessages((m) => [...m, userMsg]);
+        sendScrollRef?.current?.();
         setBusy(true);
         setStreamText("");
         stopRef.current = false;
@@ -291,6 +294,9 @@ export function useComposerSend({
       // 的支持集过滤(不支持 → null 发送,不硬塞)。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
+      if (!target || target.sessionId === selectedSessionIdRef.current) {
+        sendScrollRef?.current?.();
+      }
       const teamLeaderTurn = sendCollab.teamMode;
       const sent=await sockRef.current?.send({
         ...(authorization?{switchAuthorization:authorization}:{}),

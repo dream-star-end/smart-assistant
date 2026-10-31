@@ -35,7 +35,7 @@ import {
   resolveContextPickerSelection,
   resolveCursorPickerSelection,
 } from '../lib/cursorModelPicker'
-import type { PreferenceEffort } from '../lib/modelPreferences'
+import { EFFORT_OPTIONS, type PreferenceEffort } from '../lib/modelPreferences'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import { readRecentModels, writeRecentModel } from '../lib/recentModels'
 import type { LockedPublicModel, PublicModel } from '../lib/types'
@@ -46,7 +46,6 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from './LongContextCostWarning'
-import { EFFORT_OPTIONS } from './settings/labels'
 import {
   Badge,
   DropdownMenu,
@@ -213,9 +212,35 @@ function lockedPlainLabel(model: LockedPublicModel): string {
  * 见 commercial ws/userChatBridge.ts「teamMode.main」分支）；展示名优先取
  * /api/public/models 里同 id 模型的 display_name，列表未含该模型时退回固定标签。
  */
-export function teamEngineLabel(models: PublicModel[]): string {
-  const m = models.find((x) => x.id === DEFAULT_CODEX_ENGINE_MODEL)
-  return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME
+export function resolveTeamLeaderModel(
+  models: PublicModel[],
+  teamLeaderModelId?: string | null,
+  lockedModels: LockedPublicModel[] = [],
+): PublicModel | LockedPublicModel | undefined {
+  const serverId =
+    typeof teamLeaderModelId === 'string' && teamLeaderModelId.trim()
+      ? teamLeaderModelId.trim()
+      : undefined
+  const targetId = serverId ?? DEFAULT_CODEX_ENGINE_MODEL
+  return models.find((x) => x.id === targetId) ?? lockedModels.find((x) => x.id === targetId)
+}
+
+export function teamEngineLabel(
+  models: PublicModel[],
+  teamLeaderModelId?: string | null,
+  lockedModels: LockedPublicModel[] = [],
+): string {
+  const serverId =
+    typeof teamLeaderModelId === 'string' && teamLeaderModelId.trim()
+      ? teamLeaderModelId.trim()
+      : undefined
+  const targetId = serverId ?? DEFAULT_CODEX_ENGINE_MODEL
+  const usable = models.find((x) => x.id === targetId)
+  if (usable) return modelLabel(usable)
+  const locked = lockedModels.find((x) => x.id === targetId)
+  if (locked) return lockedPlainLabel(locked)
+  if (serverId && serverId !== DEFAULT_CODEX_ENGINE_MODEL) return serverId
+  return DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME
 }
 
 function triggerLabel(
@@ -257,6 +282,7 @@ export function ModelSelector({
   onLockedSelect,
   loading,
   teamEngineActive,
+  teamLeaderModelId,
   effortSupported,
   effortActive,
   onSelectEffort,
@@ -275,6 +301,7 @@ export function ModelSelector({
   onLockedSelect?: (info: LockedSelectInfo) => void
   loading?: boolean
   teamEngineActive?: boolean
+  teamLeaderModelId?: string
   effortSupported?: readonly string[]
   effortActive?: PreferenceEffort | null
   onSelectEffort?: (value: PreferenceEffort | null) => void
@@ -301,7 +328,8 @@ export function ModelSelector({
   const selectedContext = contextFamilyByModelId(selectedId)
   const selectedDegraded = selected ? isDegraded(selected) : false
   const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId)
-  const engineLabel = teamEngineLabel(models)
+  const leaderModel = resolveTeamLeaderModel(models, teamLeaderModelId, lockedModels)
+  const engineLabel = teamEngineLabel(models, teamLeaderModelId, lockedModels)
   const baseLabel = triggerLabel(models, selectedId, loading)
   const label = teamEngineActive ? engineLabel : baseLabel
   // 思考档位是计费相关状态(同家族 medium/high 单价不同),此前只有点开菜单才知道(C-07):
@@ -322,7 +350,7 @@ export function ModelSelector({
     }
     return parts.length > 0 ? parts.join(' · ') : null
   })()
-  const disabled = loading || (models.length === 0 && lockedModels.length === 0)
+  const disabled = Boolean(loading || teamEngineActive || (models.length === 0 && lockedModels.length === 0))
   const rows = modelPickerRows(models, lockedModels)
   const {
     visible: visibleRows,
@@ -336,11 +364,18 @@ export function ModelSelector({
   }, [selectedInCollapsed])
   const narrow = useNarrowViewport()
   const [uncontrolledSheetOpen, setUncontrolledSheetOpen] = useState(false)
-  const sheetOpen = open ?? uncontrolledSheetOpen
+  const sheetOpen = teamEngineActive ? false : (open ?? uncontrolledSheetOpen)
   const setSheetOpen = (next: boolean) => {
+    if (teamEngineActive && next) return
     onOpenChange?.(next)
     if (open === undefined) setUncontrolledSheetOpen(next)
   }
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 进入团队态即收起既有模型弹层,避免悬挂菜单仍可点选。
+  useEffect(() => {
+    if (!teamEngineActive) return
+    onOpenChange?.(false)
+    setUncontrolledSheetOpen(false)
+  }, [teamEngineActive])
   const showCollapsedGroup = collapsedRows.length > 0
   const [, setRecentTick] = useState(0)
   const recentRows = (() => {
@@ -477,14 +512,7 @@ export function ModelSelector({
             <CostMark model={m} />
             <PromoBadge label={promoLabelOf(m)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {active && !degraded && (
-              <>
-                {teamEngineActive && (
-                  <span className="text-caption text-faint">团队模式关闭后生效</span>
-                )}
-                <Check size={14} className="shrink-0 text-accent" />
-              </>
-            )}
+            {active && !degraded && <Check size={14} className="shrink-0 text-accent" />}
           </span>
         </PickerItem>
       )
@@ -517,14 +545,7 @@ export function ModelSelector({
             <CostMark model={representativeModel} />
             <PromoBadge label={promoLabelOf(representativeModel)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {familyActive && !degraded && (
-              <>
-                {teamEngineActive && (
-                  <span className="text-caption text-faint">团队模式关闭后生效</span>
-                )}
-                <Check size={14} className="shrink-0 text-accent" />
-              </>
-            )}
+            {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
           </span>
         </PickerItem>
       )
@@ -591,14 +612,7 @@ export function ModelSelector({
             <CostMark model={representativeModel} />
             <PromoBadge label={promoLabelOf(representativeModel)} />
             {degraded && <Badge tone="danger">暂不可用</Badge>}
-            {familyActive && !degraded && (
-              <>
-                {teamEngineActive && (
-                  <span className="text-caption text-faint">团队模式关闭后生效</span>
-                )}
-                <Check size={14} className="shrink-0 text-accent" />
-              </>
-            )}
+            {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
           </span>
         </PickerItem>
       )
@@ -655,14 +669,7 @@ export function ModelSelector({
           <CostMark model={representativeModel} />
           <PromoBadge label={promoLabelOf(representativeModel)} />
           {degraded && <Badge tone="danger">暂不可用</Badge>}
-          {familyActive && !degraded && (
-            <>
-              {teamEngineActive && (
-                <span className="text-caption text-faint">团队模式关闭后生效</span>
-              )}
-              <Check size={14} className="shrink-0 text-accent" />
-            </>
-          )}
+          {familyActive && !degraded && <Check size={14} className="shrink-0 text-accent" />}
         </span>
       </PickerItem>
     )
@@ -671,19 +678,6 @@ export function ModelSelector({
   const renderPickerBody = (mode: PickerMode) => {
     const notes = (
       <>
-        {teamEngineActive && (
-          <div
-            role="note"
-            className="mx-1 mb-1 shrink-0 rounded-md bg-accent-soft px-2.5 py-2 text-xs leading-relaxed"
-          >
-            <span className="flex items-center gap-1.5 font-medium text-accent">
-              <Users size={12} className="shrink-0" /> 团队模式 · 队长引擎 {engineLabel}
-            </span>
-            <span className="mt-0.5 block text-muted">
-              当前会话按 {engineLabel} 执行与计费；下方自选模型将在团队模式关闭后生效。
-            </span>
-          </div>
-        )}
         {selectedDegraded && !teamEngineActive && (
           <div
             role="note"
@@ -1013,9 +1007,11 @@ export function ModelSelector({
       title={
         loading && selected
           ? '正在切换模型，请稍候'
-          : selectedDegraded && !teamEngineActive
-            ? '当前模型暂不可用，点击更换'
-            : undefined
+          : teamEngineActive
+            ? `团队模式固定由队长模型 ${engineLabel} 执行与计费，关闭团队模式后可切换模型`
+            : selectedDegraded
+              ? '当前模型暂不可用，点击更换'
+              : undefined
       }
       aria-busy={loading || undefined}
       data-degraded={selectedDegraded && !teamEngineActive ? 'true' : undefined}
@@ -1023,7 +1019,7 @@ export function ModelSelector({
         'flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-section font-medium text-muted outline-none transition-colors',
         'hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]',
         'disabled:pointer-events-none disabled:opacity-50',
-        teamEngineActive && 'text-accent hover:text-accent',
+        teamEngineActive && 'text-accent hover:text-accent disabled:opacity-100',
       )}
     >
       {/* 切换中(压缩上下文等)此前只是把 trigger 禁用,用户不知道在等什么(C-28):图标换 spinner + 文案。 */}
@@ -1062,9 +1058,9 @@ export function ModelSelector({
           </span>
         )
       )}
-      {!teamEngineActive && <CostMark model={selected} />}
+      <CostMark model={teamEngineActive ? leaderModel : selected} />
       {!teamEngineActive && <PromoBadge label={selectedPromo} className="hidden sm:inline-flex" />}
-      <ChevronDown size={14} className="shrink-0 text-faint" />
+      {!teamEngineActive && <ChevronDown size={14} className="shrink-0 text-faint" />}
     </button>
   )
 
@@ -1103,7 +1099,7 @@ export function ModelSelector({
           </Sheet>
         </>
       ) : (
-        <DropdownMenu open={open} onOpenChange={onOpenChange}>
+        <DropdownMenu open={sheetOpen} onOpenChange={setSheetOpen}>
           <DropdownMenuTrigger asChild>{triggerButton}</DropdownMenuTrigger>
           <DropdownMenuContent
             align="start"

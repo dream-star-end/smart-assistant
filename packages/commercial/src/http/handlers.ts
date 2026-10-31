@@ -1,7 +1,7 @@
 import type { readSessionMetadata } from '../db/sessionMetadataApproval.js'
 import { projectPublicModels, projectLockedModels } from '../billing/modelPublicProjection.js'
 export type { PublicModelProjection, LockedPublicModelProjection } from '../billing/modelPublicProjection.js'
-import { DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -1461,6 +1461,7 @@ export async function handleListPublicModels(
     sendJson(res, 200, {
       models: projectPublicModels(snapshot, effective, degraded),
       locked_models: projectLockedModels(snapshot, effective),
+      team_leader_model: DEFAULT_CODEX_ENGINE_MODEL,
     });
     return;
   }
@@ -1471,7 +1472,7 @@ export async function handleListPublicModels(
   const models = scope
     ? pricing.listForUser(scope)
     : pricing.listPublic();
-  sendJson(res, 200, { models: annotateDegraded(models, degraded) });
+  sendJson(res, 200, { models: annotateDegraded(models, degraded), team_leader_model: DEFAULT_CODEX_ENGINE_MODEL });
 }
 
 function anonymousModelScope(): UserModelScope {

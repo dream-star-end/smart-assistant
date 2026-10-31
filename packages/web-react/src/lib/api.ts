@@ -1213,18 +1213,25 @@ export const api = {
    */
   async getPublicModels(
     a?: AuthSession,
-  ): Promise<{ models: PublicModel[]; lockedModels: LockedPublicModel[] }> {
+  ): Promise<{ models: PublicModel[]; lockedModels: LockedPublicModel[]; teamLeaderModelId?: string }> {
     const run = (t?: string) =>
       fetch("/api/public/models", {
         headers: t ? bearerHeaders(t) : { Accept: "application/json" },
       });
     const res = a ? await callWithRefresh(a, (t) => run(t)) : await run();
-    const b = await jsonOrThrow<{ models?: PublicModel[]; locked_models?: LockedPublicModel[] }>(
-      res,
-    );
+    const b = await jsonOrThrow<{
+      models?: PublicModel[];
+      locked_models?: LockedPublicModel[];
+      team_leader_model?: unknown;
+    }>(res);
+    const teamLeaderModelId =
+      typeof b.team_leader_model === "string" && b.team_leader_model.trim()
+        ? b.team_leader_model.trim()
+        : undefined;
     return {
       models: Array.isArray(b.models) ? b.models : [],
       lockedModels: Array.isArray(b.locked_models) ? b.locked_models : [],
+      ...(teamLeaderModelId ? { teamLeaderModelId } : {}),
     };
   },
 

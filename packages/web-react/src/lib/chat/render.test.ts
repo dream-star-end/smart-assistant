@@ -192,7 +192,7 @@ describe("reviewVerdictBadge 审查裁决徽记（单一权威纯函数）", () 
   test("审查员行 PASS → success 通过徽记", () => {
     expect(
       reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer", _reviewVerdict: "PASS" }),
-    ).toEqual({ label: "PASS", tone: "success" });
+    ).toEqual({ label: "通过", tone: "success" });
   });
 
   test("审查员行 NEEDS_FIX → warning「未通过」徽记（不用 danger 以免与执行失败混淆）", () => {
