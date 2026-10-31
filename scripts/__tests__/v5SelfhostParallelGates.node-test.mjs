@@ -39,6 +39,7 @@ source ${q(join(root, 'scripts/lib/v5-selfhost-build-jobs.sh'))}
 source ${q(join(root, 'scripts/lib/v5-selfhost-train-summary.sh'))}
 source ${q(join(root, 'scripts/lib/v5-selfhost-gate-receipts.sh'))}
 MASTER_GATE_TMPDIR=${q(join(f.dir, 'tmp'))}
+SCRIPT_DIR=${q(join(root, 'scripts'))}
 MASTER_GATE_LOADAVG=${q(join(f.dir, 'load'))}
 MASTER_GATE_ATTEMPT_DIR=${q(join(f.dir, 'logs'))}
 MASTER_BOX_GATE_LOAD_MAX=8
@@ -46,7 +47,7 @@ MASTER_GATE_IDLE_TIMEOUT_S=20
 OC_V5_TRAIN_SUMMARY_DIR=${q(join(f.dir, 'logs'))}
 LEASE_TRAIN_ID=tr-parallel-test
 mlog() { echo "$*" >&2; }
-${['master_gate_load1', 'master_gate_attempt_log', 'master_gate_first_failure'].map(fn).join('\n')}
+${['master_gate_load1', 'master_gate_attempt_log', 'master_gate_first_failure', 'master_seed_frontend_buildinfo'].map(fn).join('\n')}
 tsum_init
 trap 'rc=$?; reap_master_build_jobs; tsum_finish "$rc"' EXIT
 await_file() {
@@ -412,7 +413,7 @@ const receiptPhases = {
   'C.system-approval': 'system-approval-fencing', 'C.system-executor': 'system-executor-fencing',
 };
 
-function wireFixture(f, failure = '', receipt = 'miss', badDonor = false) {
+function wireFixture(f, failure = '', receipt = 'miss', badDonor = false, tscMetric = '0.125') {
   const runner = `#!/bin/bash
 set -eu
 id="\${TMPDIR##*/}"
@@ -430,7 +431,8 @@ if [[ ${q(receipt)} != hit && ( "$id" == C.session-rootfix || "$id" == C.watch-g
 fi
 if [[ "$id" == ${q(failure || 'never')} ]]; then echo '[gate-failure] fixture failed'; exit 17; fi
 case "$id" in
-  D) mkdir -p packages/web-react/dist; echo '<meta name="oc-build" content="0123456789abcdef">' >packages/web-react/dist/index.html ;;
+  D) mkdir -p packages/web-react/dist; echo '<meta name="oc-build" content="0123456789abcdef">' >packages/web-react/dist/index.html
+     ${tscMetric === 'unknown' ? ':' : `printf '%s\\n' ${q(tscMetric)} >"$OC_V5_SELFHOST_TSC_TIMER_FILE"`} ;;
   C.architecture) echo '{}' >"$TMPDIR/architecture.json" ;;
 esac
 printf 'end %s\\n' "$id" >>"$EVENTS"
@@ -442,6 +444,7 @@ printf 'end %s\\n' "$id" >>"$EVENTS"
   }
   return `
 staging=${q(join(f.dir, 'staging'))}
+donor=''
 full_sha=${q('a'.repeat(40))}
 MASTER_GATE_DB_URL='fixture-private-database'
 MASTER_GATE_LOAD_SCALE=1
@@ -483,6 +486,8 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
     'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
     'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
+  const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
+  assert.deepEqual(queued, ['D', ...expected.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')]);
   const firstEnd = lines.findIndex((l) => l.startsWith('end '));
   assert.equal(lines.slice(0, firstEnd).filter((l) => l.startsWith('start ')).length, 3);
   const awaited = lines.indexOf('runtime-awaited');
@@ -507,10 +512,19 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
   assert.ok(lines.indexOf('end C.box-longtask') < lines.indexOf('db-drop'));
   assert.ok(lines.indexOf('db-drop') < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
   assert.equal(lines.at(-1), 'seal built');
+  assert.equal(notes(f).frontendTscSec, '0.125');
   for (const id of ids.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')) {
     assert.equal(notes(f)[`job.${id}.rc`], '0', id);
     assert.ok(existsSync(notes(f)[`job.${id}.log`]), id);
   }
+});
+
+test('production wiring: unavailable tsc timing records unknown without failing the frontend gate', (t) => {
+  const f = fixture(t);
+  const r = run(f, wireFixture(f, '', 'miss', false, 'unknown'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(notes(f).frontendTscSec, 'unknown');
+  assert.equal(events(f).at(-1), 'seal built');
 });
 
 for (const failure of ['C.session-rootfix', 'D', 'C.architecture']) {
