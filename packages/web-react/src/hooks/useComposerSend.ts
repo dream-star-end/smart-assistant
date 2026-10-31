@@ -57,6 +57,7 @@ export type ComposerSendInput = {
   projectHome: ProjectRoute | null;
   promoteDraftCollab: (sessionId: string, state?: CollabUiState, persist?: boolean) => void;
   publicCfg: PublicConfig | null;
+  queueModelPatch: (sessId: string, modelId: string) => void;
   selectedSessionIdRef: React.RefObject<string | undefined>;
   sendImplicitRatingRef: React.RefObject<((target: ImplicitTarget, opts: { reason: ImplicitReason; }) => void) | null>;
   sendScrollRef?: React.RefObject<(() => void) | null>;
@@ -104,6 +105,7 @@ export function useComposerSend({
   projectHome,
   promoteDraftCollab,
   publicCfg,
+  queueModelPatch,
   selectedSessionIdRef,
   sendImplicitRatingRef,
   sendScrollRef,
@@ -287,6 +289,12 @@ export function useComposerSend({
           // 行尚未建时 PATCH 可 404；随后 send 的幂等 PUT 会使用上面已更新的 socket 标题。
         });
       }
+      const existingHasModel = Boolean(sessions.find((session) => session.id === sessionId)?.modelId);
+      if ((materializedDraft || (!createdSession && !existingHasModel)) && modelId) {
+        sockRef.current?.setSessionModel(sessionId, modelId);
+        // 与 selectModel 共用 queueModelPatch 同会话单飞队列/水位，避免首发在途 PATCH 后落库覆盖用户随后的显式换模。
+        if (!demo) queueModelPatch(sessionId, modelId);
+      }
       // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
       // 当前模型不支持时省略(null=显式清除回模型默认),让模型沿用自身默认。
       // effort 来源:本会话显式选择(sessionEffort,聊天头档位选择器)优先,缺省回落
@@ -337,7 +345,8 @@ export function useComposerSend({
         auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
         ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
       });
-      // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
+      // 侧栏：提到顶 + 更新标题/时间/计数/模型（同步刷新 lastAt 与 modelId，供新建会话取最近使用模型）。
+      const sentAtMs = Date.now();
       setSessions((c) => {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
@@ -347,8 +356,10 @@ export function useComposerSend({
           ...base,
           id: sid,
           title: found?.title && found.messageCount > 0 ? found.title : sessionTitle,
-          updatedAt: new Date().toISOString(),
+          lastAt: sentAtMs,
+          updatedAt: new Date(sentAtMs).toISOString(),
           messageCount: (found?.messageCount ?? 0) + 1,
+          ...(modelId ? { modelId } : {}),
         };
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
@@ -399,6 +410,7 @@ export function useComposerSend({
       setActiveId,
       applyCollabDoc,
       promoteDraftCollab,
+      queueModelPatch,
       toast,
       setDraftProject,
     ],

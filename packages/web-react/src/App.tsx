@@ -1030,7 +1030,7 @@ export function App() {
     newSessionInProject,
     preferenceEffort,
     projectHome,
-    publicCfg,
+    publicCfg, queueModelPatch,
     selectedSessionIdRef,
     sendImplicitRatingRef,
     sendScrollRef,

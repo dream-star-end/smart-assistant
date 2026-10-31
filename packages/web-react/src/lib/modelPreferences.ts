@@ -19,6 +19,8 @@ export const EFFORT_OPTIONS: {
 export type PrefsView = {
   theme?: "light" | "dark" | "auto";
   default_model?: string;
+  /** 本次会话期内用户在设置/系统助手显式修改 default_model 的本地时刻（epoch ms）。 */
+  default_model_updated_at?: number;
   default_effort?: PreferenceEffort;
   notify_email?: boolean;
   notify_telegram?: boolean;
@@ -118,6 +120,60 @@ export function resolveSessionModel(
     ? models.find((m) => m.id === sessionModelId && m.degraded !== true)
     : undefined;
   return own?.id ?? initialModelFromPreferences(models, prefs);
+}
+
+export type SessionModelHistoryEntry = {
+  modelId?: string;
+  messageCount?: number;
+  lastAt?: number;
+  updatedAt?: string;
+};
+
+function sessionActivityAt(entry: SessionModelHistoryEntry): number {
+  if (typeof entry.lastAt === "number" && Number.isFinite(entry.lastAt)) return entry.lastAt;
+  if (typeof entry.updatedAt === "string" && entry.updatedAt.length > 0) {
+    const parsed = Date.parse(entry.updatedAt);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return 0;
+}
+
+/**
+ * 新会话默认模型解析（U3）:
+ * 默认取服务端/持久化会话列表中用户最近一次实际使用（messageCount > 0）的会话模型；
+ * 若用户在本次会话期内显式修改过设置「默认模型」且时刻新于最近使用会话，则采用该显式默认；
+ * 若最近使用模型已下架/不可见/降级或无历史会话，安全回落 initialModelFromPreferences。
+ */
+export function resolveNewSessionModel(
+  models: PublicModel[],
+  prefs: PrefsView,
+  sessions: readonly SessionModelHistoryEntry[] = [],
+): string | undefined {
+  let latestSession: SessionModelHistoryEntry | undefined;
+  let latestAt = -1;
+  for (const session of sessions) {
+    if ((session.messageCount ?? 0) <= 0) continue;
+    const at = sessionActivityAt(session);
+    if (latestSession === undefined || at > latestAt) {
+      latestSession = session;
+      latestAt = at;
+    }
+  }
+  if (
+    prefs.default_model &&
+    typeof prefs.default_model_updated_at === "number" &&
+    Number.isFinite(prefs.default_model_updated_at) &&
+    prefs.default_model_updated_at > latestAt
+  ) {
+    const explicitPreferred = models.find(
+      (m) => m.id === prefs.default_model && m.degraded !== true,
+    );
+    if (explicitPreferred?.id) return explicitPreferred.id;
+  }
+  const latestHealthy = latestSession?.modelId
+    ? models.find((m) => m.id === latestSession.modelId && m.degraded !== true)
+    : undefined;
+  return latestHealthy?.id ?? initialModelFromPreferences(models, prefs);
 }
 
 /**

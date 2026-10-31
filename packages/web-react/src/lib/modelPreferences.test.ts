@@ -6,6 +6,7 @@ import {
   extractAutoDreamFeature,
   extractPrefs,
   initialModelFromPreferences,
+  resolveNewSessionModel,
   resolveSessionModel,
 } from "./modelPreferences";
 
@@ -123,5 +124,73 @@ describe("model preferences", () => {
       }),
     ).toEqual(feature);
     expect(extractAutoDreamFeature({ prefs: {} })).toBeNull();
+  });
+
+  test("新会话默认模型(U3):优先取最近一次实际使用会话的持久化模型", () => {
+    const models: PublicModel[] = [
+      { id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash" },
+      { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
+      { id: "glm-5.2", display_name: "GLM-5.2" },
+    ];
+    const sessions = [
+      // 未发消息的物化草稿(messageCount=0)不算实际使用
+      { modelId: "glm-5.2", messageCount: 0, lastAt: 3_000 },
+      { modelId: "gpt-5.6-sol", messageCount: 2, lastAt: 2_000 },
+      { modelId: "deepseek-v4-flash", messageCount: 5, lastAt: 1_000 },
+    ];
+    expect(resolveNewSessionModel(models, {}, sessions)).toBe("gpt-5.6-sol");
+    // 静态历史 default_model 不压过最近实际使用模型
+    expect(
+      resolveNewSessionModel(models, { default_model: "deepseek-v4-flash" }, sessions),
+    ).toBe("gpt-5.6-sol");
+  });
+
+  test("新会话默认模型(U3):设置中显式新改 default_model 优先,后续新发会话再次按最新实际使用接管", () => {
+    const models: PublicModel[] = [
+      { id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash" },
+      { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
+      { id: "glm-5.2", display_name: "GLM-5.2" },
+    ];
+    const sessions = [{ modelId: "gpt-5.6-sol", messageCount: 1, lastAt: 2_000 }];
+    expect(
+      resolveNewSessionModel(
+        models,
+        { default_model: "glm-5.2", default_model_updated_at: 2_500 },
+        sessions,
+      ),
+    ).toBe("glm-5.2");
+    expect(
+      resolveNewSessionModel(
+        models,
+        { default_model: "glm-5.2", default_model_updated_at: 2_500 },
+        [{ modelId: "gpt-5.6-sol", messageCount: 2, lastAt: 3_000 }],
+      ),
+    ).toBe("gpt-5.6-sol");
+  });
+
+  test("新会话默认模型(U3):最近使用模型已下架或降级时安全回落默认,不翻出更早的旧会话模型", () => {
+    const models: PublicModel[] = [
+      { id: "deepseek-v4-flash", display_name: "DeepSeek V4 Flash" },
+      { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
+      { id: "glm-5.2", display_name: "GLM-5.2", degraded: true },
+    ];
+    expect(
+      resolveNewSessionModel(models, {}, [
+        { modelId: "glm-5.2", messageCount: 1, lastAt: 2_000 },
+        { modelId: "gpt-5.6-sol", messageCount: 4, lastAt: 1_000 },
+      ]),
+    ).toBe("deepseek-v4-flash");
+    expect(
+      resolveNewSessionModel(models, { default_model: "gpt-5.6-sol" }, [
+        { modelId: "retired-opus", messageCount: 1, lastAt: 2_000 },
+      ]),
+    ).toBe("gpt-5.6-sol");
+    // 更近的已使用会话未显式绑定 modelId（即使用默认模型）时，不越过它翻出更早会话的 modelId
+    expect(
+      resolveNewSessionModel(models, { default_model: "deepseek-v4-flash" }, [
+        { messageCount: 1, lastAt: 4_000 },
+        { modelId: "gpt-5.6-sol", messageCount: 2, lastAt: 2_000 },
+      ]),
+    ).toBe("deepseek-v4-flash");
   });
 });

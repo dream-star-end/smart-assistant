@@ -9,7 +9,7 @@ import type {ModelSwitchCostRequest} from '@openclaude/protocol/browser';
  * exact position the statements had, so React hook order and every value are unchanged.
  */
 import { useEffect, useRef, useCallback, useState } from "react";
-import { resolveSessionModel } from "../lib/modelPreferences";
+import { resolveNewSessionModel, resolveSessionModel } from "../lib/modelPreferences";
 import { freshSessionRequiredForSwitch, freshSessionSwitchNotice, modelSwitchCompactionReason } from "../lib/modelSwitch";
 import { MODEL_SWITCH_CANCELLED_MESSAGE } from "../lib/chat/modelSwitchCostDispatch";
 import { type CollabUiState, EMPTY_COLLAB_UI, docToUiState, type CollabMode, advisorParentCapabilityAllowed, ADVISOR_PARENT_BLOCK_REASON, recommendedAdvisorModel, keepCollabChoiceOnSaveFailure, collaborationPutBody } from "../lib/collaborationConfig";
@@ -89,19 +89,54 @@ export function useSessionModelAndCollab({
   // 「新建会话并以目标模型起手」的一次性意图(Opus/Fable 只能新会话使用的弹窗确认后写入):
   // 空态 effect 消费一次即清空,下一次新建仍回默认解析。
   const nextSessionModelRef = useRef<string | undefined>(undefined);
+  const draftExplicitModelRef = useRef(false);
+  const prevDraftContextRef = useRef({
+    activeId,
+    auth,
+    defaultModel: modelPrefs.default_model,
+    defaultModelUpdatedAt: modelPrefs.default_model_updated_at,
+  });
+  if (
+    prevDraftContextRef.current.activeId !== activeId ||
+    prevDraftContextRef.current.auth !== auth ||
+    prevDraftContextRef.current.defaultModel !== modelPrefs.default_model ||
+    prevDraftContextRef.current.defaultModelUpdatedAt !== modelPrefs.default_model_updated_at
+  ) {
+    prevDraftContextRef.current = {
+      activeId,
+      auth,
+      defaultModel: modelPrefs.default_model,
+      defaultModelUpdatedAt: modelPrefs.default_model_updated_at,
+    };
+    draftExplicitModelRef.current = false;
+  }
+  const newSessionDefaultModel = resolveNewSessionModel(
+    models,
+    modelPrefs,
+    demo ? [] : sessions,
+  );
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setModelId is App useState setter/useRef passed in, stable
   useEffect(() => {
-    // 空会话态默认:boot 初值与 default_model 变更传导(= 下一个新会话的初始意图)。
-    // 空态的显式选择(selectModel 只 setModelId)不改本 effect 依赖,不会被覆盖。
+    // 空会话态默认:优先取用户最近一次实际使用会话的模型(服务端/持久化 sessions),回落
+    // default_model 偏好与平台默认;空态已显式选模时锁定意图,不被迟到列表轮询覆盖。
     if (demo || models.length === 0 || activeId !== undefined) return;
     const pinned = nextSessionModelRef.current;
     nextSessionModelRef.current = undefined;
     if (pinned && models.some((m) => m.id === pinned)) {
+      draftExplicitModelRef.current = true;
       setModelId(pinned);
       return;
     }
-    setModelId(resolveSessionModel(models, undefined, modelPrefs));
-  }, [demo, models, activeId, modelPrefs]);
+    if (draftExplicitModelRef.current) return;
+    setModelId(newSessionDefaultModel);
+  }, [
+    demo,
+    models,
+    activeId,
+    newSessionDefaultModel,
+    modelPrefs.default_model,
+    modelPrefs.default_model_updated_at,
+  ]);
 
   // 显式选择模型:活动会话存在则写通三持有方(服务端经 queueModelPatch:选择即挂 pending
   // 意图压制一切在途旧载荷 + 单飞串行合并 PATCH,同时消掉「旧响应迟到盖回」与「连选
@@ -121,6 +156,7 @@ export function useSessionModelAndCollab({
       const selectionEpoch=++modelSelectionEpochRef.current;
       const commit = (modelSwitchId?: string) => {
         if (activeModelSwitchSessionRef.current !== sid||modelSelectionEpochRef.current!==selectionEpoch) return;
+        if (!sid) draftExplicitModelRef.current = true;
         setModelId(id);
         // 成功反馈只挂用户主动切换路径:boot 恢复模型偏好走上方 resolveSessionModel 的
         // setModelId,不经过 commit,不会误报。失败面已有 toast(压缩失败)或 server-wins
