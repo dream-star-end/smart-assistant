@@ -131,9 +131,9 @@ jobs:
             run: npm run test:storage && npm run test:mcp-memory
             timeout: 15
           - name: web-react
-            # 事故/选择器/教程门与 vitest 互不依赖,在同一 job 里并行(原先串行约 15 分钟,是整条 PR CI 的关键路径)。
+            # 事故/选择器/教程门、vitest 与生产构建互不依赖,在同一 job 里并行(原先串行约 15 分钟,是整条 PR CI 的关键路径)。
             # 不拆成两个 job:web-react 是 required check,也是发布 CI 绿门核对的 context,拆出去等于把事故门移出必需门。
-            run: bash .github/scripts/run-parallel.sh 'npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials' 'npm run test:web-react'
+            run: bash .github/scripts/run-parallel.sh 'npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials' 'npm run test:web-react' 'npm run build:web-react'
             timeout: 30
     steps:
       - name: Checkout

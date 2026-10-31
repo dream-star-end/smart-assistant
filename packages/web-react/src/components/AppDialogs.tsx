@@ -4,7 +4,7 @@
  * Moved verbatim out of App() (App.tsx) — FINDINGS §10, OCV5-472. App calls this hook at the
  * exact position the statements had, so React hook order and every value are unchanged.
  */
-import { AgentPicker } from "./AgentPicker";
+import { LazyAgentPicker } from "./LazyAgentPicker";
 import { PendingPaymentRecovery } from "./payment/PendingPaymentRecovery";
 import { LazyBoundary } from "./ChunkErrorBoundary";
 import { DialogFallback } from "./DialogFallback";
@@ -342,7 +342,7 @@ export function AppDialogs({
 }: AppDialogsProps) {
   return (
     <>
-      <AgentPicker
+      <LazyAgentPicker
         open={pickerOpen}
         current={agent}
         auth={demo ? null : auth}
