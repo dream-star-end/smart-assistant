@@ -266,4 +266,20 @@ describe('buildTeamPreamble', () => {
     assert.match(p, /审议策略不可用/)
     assert.match(p, /## 执行类 → 执行策略/)
   })
+
+  it('收紧审议触发:行程、清单等单一交付物请求排除出审议类并划入简单/执行类', () => {
+    for (const cursorEngine of [false, true]) {
+      const p = buildTeamPreamble({ ...base, cursorEngine })
+      const deliberationLine = p.split('\n').find((line) => line.startsWith('- **审议类**:'))
+      const executionLine = p.split('\n').find((line) => line.startsWith('- **执行类**:'))
+      const simpleLine = p.split('\n').find((line) => line.startsWith('- **简单类**:'))
+      assert.ok(deliberationLine, '审议类分类行存在')
+      assert.ok(executionLine, '执行类分类行存在')
+      assert.ok(simpleLine, '简单类分类行存在')
+      assert.match(deliberationLine, /排除.*行程规划、各类清单.*单一交付物请求/)
+      assert.match(deliberationLine, /除非用户明确要求多方案对比或多视角评估,否则一律不走审议/)
+      assert.match(executionLine, /需要联网查证、工具执行或跨领域分工的单一交付物/)
+      assert.match(simpleLine, /无需工具查证或文件产出的常规单一交付物.*两日游行程.*清单.*直接回答交付,不组队、不送审/)
+    }
+  })
 })
