@@ -79,3 +79,20 @@ export * from './systemHelp.js'
 
 export * from './automaticRetryStatus.js'
 export * from './advisorReadOnly.js'
+
+export {
+  G8_BOX_REJECT_CODES,
+  g8CompactSummaryCheckpointInput,
+  g8TurnEndCheckpointInput,
+  judgeG8Replay,
+  resetG8ReplayCheckpointForTest,
+  runG8ReplayCheckpoint,
+  setG8ReplayChecker,
+  setG8ReplayCheckpoint,
+} from './g8ReplayJudge.js'
+export type {
+  G8ReplayObservation,
+  G8ReplayPoint,
+  G8ReplayVerdict,
+  G8ReplayVerdictName,
+} from './g8ReplayJudge.js'
