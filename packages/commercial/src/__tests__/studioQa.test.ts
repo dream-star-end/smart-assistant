@@ -69,6 +69,7 @@ describe('QA answer and verdict (A2-1b-1)', () => {
   })
 
   it('criteria follow the target; a style image is judged on artifacts only', () => {
+    assert.deepEqual(criteriaFor('frame'), ['character', 'scene', 'artifacts'])
     assert.deepEqual(criteriaFor('clip'), ['character', 'scene', 'action', 'artifacts'])
     assert.deepEqual(criteriaFor('bible', 'character'), ['character', 'artifacts'])
     assert.deepEqual(criteriaFor('bible', 'scene'), ['scene', 'artifacts'])
@@ -106,6 +107,21 @@ describe('QA answer and verdict (A2-1b-1)', () => {
       bestScore: 0.6,
     })
     assert.deepEqual([last.next, last.reason], ['handoff', 'retries_exhausted'])
+  })
+
+  it('a still frame is not failed on action; a clip still is', () => {
+    const none = { attempts: 0, bestScore: null }
+    // The prod pattern: character 0.90, action 0.50 on a first frame.
+    const still = verdict({ character: 0.9, scene: 0.84, action: 0.5, artifacts: 0.85 })
+    assert.deepEqual(judgeQa(still, SHOT, none), {
+      passed: true,
+      score: 0.84,
+      next: 'adopt',
+      reason: 'passed',
+    })
+    assert.equal(judgeQa(still, criteriaFor('clip'), none).next, 'redo')
+    // Artifacts still gate a frame.
+    assert.equal(judgeQa(verdict({ action: 0.5, artifacts: 0.7 }), SHOT, none).next, 'redo')
   })
 
   it('a redo that does not beat the best earlier attempt stops early', () => {
@@ -152,6 +168,20 @@ describe('QA prompt and contact sheet (A2-1b-1)', () => {
       '只输出一个 JSON',
     ])
       assert.ok(p.includes(s), s)
+  })
+
+  it('a frame is asked for the pose of the moment, a clip for the action across its frames', () => {
+    const base = {
+      shot: { framing: '中景', action: '狐狸穿过雪地' },
+      bible: [],
+      candidates: ['F1'],
+      references: [],
+    }
+    const frame = buildQaPrompt({ ...base, target: 'frame' })
+    assert.ok(frame.includes('这一瞬间的姿态和构图'))
+    assert.ok(!frame.includes('连起来的动作'))
+    const clip = buildQaPrompt({ ...base, target: 'clip' })
+    assert.ok(clip.includes('这几帧连起来的动作'))
   })
 
   it('a redo prompt keeps its length limit and ends with what to avoid', () => {

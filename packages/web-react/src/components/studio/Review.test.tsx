@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest'
 const createAnnotation = vi.fn(async () => ({ id: 'srv1' }))
 const annotationAction = vi.fn(async () => ({ ok: true }))
 const updateAnnotation = vi.fn(async () => ({ ok: true }))
+const selectTake = vi.fn(async () => ({ projectId: 'p' }))
 vi.mock('../../lib/studio/api', () => ({
   studioApi: {
     blobTicket: vi.fn(async (_a: unknown, sha: string) => ({
@@ -14,6 +15,7 @@ vi.mock('../../lib/studio/api', () => ({
     createAnnotation: (...a: unknown[]) => createAnnotation(...(a as [])),
     annotationAction: (...a: unknown[]) => annotationAction(...(a as [])),
     updateAnnotation: (...a: unknown[]) => updateAnnotation(...(a as [])),
+    selectTake: (...a: unknown[]) => selectTake(...(a as [])),
   },
   studioErrorText: () => '出错了',
   StudioApiError: class StudioApiError extends Error {
@@ -97,6 +99,15 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByText('尾巴颜色和设定不符')).toBeInTheDocument()
   })
 
+  test("a first frame's action score reads as the pose of the moment, not a pass criterion", () => {
+    const v = view()
+    v.takes = [{ ...take(1, 0.84), qa: { score: 0.84, character: 0.9, scene: 0.84, action: 0.5 } }]
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    fireEvent.click(screen.getByRole('tab', { name: 'QA 报告' }))
+    expect(screen.getByText('这一刻的姿态（参考，不计分）')).toBeInTheDocument()
+    expect(screen.queryByText('动作符合分镜')).not.toBeInTheDocument()
+  })
+
   test('a point drops a draft with normalised coordinates; text is kept; it can be handed over', async () => {
     render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: '点' }))
@@ -140,6 +151,69 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByRole('tab', { name: '批注 1' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /^v1/ }))
     expect(screen.getByRole('tab', { name: '批注 0' })).toBeInTheDocument()
+  })
+})
+
+describe('ReviewPage adopts the take on the stage', () => {
+  test('a frame on a needs-you shot re-shoots the video from it; the strip only previews', async () => {
+    selectTake.mockClear()
+    const onReload = vi.fn()
+    render(
+      <ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} onReload={onReload} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /^v1/ }))
+    expect(selectTake).not.toHaveBeenCalled()
+    const adopt = screen.getByTestId('adopt-take')
+    expect(adopt).toHaveTextContent('用 v1 这一帧重拍视频')
+    expect(adopt).toHaveClass('st-btn-primary')
+    expect(screen.getByText('会按这一帧重新生成视频，视频按正常价格扣积分。')).toBeInTheDocument()
+    fireEvent.click(adopt)
+    await waitFor(() => expect(selectTake).toHaveBeenCalledWith(auth, 't1'))
+    await waitFor(() => expect(onReload).toHaveBeenCalled())
+  })
+
+  test('a video is adopted and continues; the adopted one reads 已采用', async () => {
+    selectTake.mockClear()
+    const v = view()
+    const vid = (n: number): StudioTake => ({
+      ...take(n, 0.8),
+      id: `v${n}`,
+      ownerKind: 'shot_video',
+    })
+    v.takes = [vid(1), vid(2)]
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    expect(screen.getByTestId('adopt-take')).toHaveTextContent('采用 v2 并继续')
+    fireEvent.click(screen.getByTestId('adopt-take'))
+    await waitFor(() => expect(selectTake).toHaveBeenCalledWith(auth, 'v2'))
+    cleanup()
+    v.shots[1] = { ...v.shots[1]!, status: 'ready', activeTakeId: 'v2' }
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    expect(screen.getByTestId('adopt-take')).toHaveTextContent('已采用 v2')
+    expect(screen.getByTestId('adopt-take')).toBeDisabled()
+  })
+
+  test('nothing to adopt while the shot is generating or the project is over', () => {
+    const v = view()
+    v.shots[1] = { ...v.shots[1]!, status: 'generating' }
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    expect(screen.getByTestId('adopt-take')).toBeDisabled()
+    expect(screen.getByText('这一镜还在生成，生成完再选版本。')).toBeInTheDocument()
+    cleanup()
+    const done = view()
+    done.project = { ...done.project, status: 'done' }
+    render(<ReviewPage auth={auth} view={done} shotId="s1" onBack={() => {}} />)
+    expect(screen.getByTestId('adopt-take')).toBeDisabled()
+  })
+
+  test('with notes written, 交给 agent is the primary action', async () => {
+    render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: '点' }))
+    fireEvent.pointerDown(box(), { clientX: 250, clientY: 125, pointerId: 1 })
+    fireEvent.change(await screen.findByLabelText('批注说明'), {
+      target: { value: '眼睛别看镜头' },
+    })
+    expect(screen.getByTestId('hand-over')).toHaveClass('st-btn-primary')
+    expect(screen.getByTestId('adopt-take')).not.toHaveClass('st-btn-primary')
   })
 })
 
@@ -233,6 +307,7 @@ describe('ReviewPage hand over to the agent (OCV5-593 FE-7b)', () => {
     expect(note).toHaveTextContent('agent 理解为：重画首帧，尾巴改白')
     fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
     await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'apply'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '不采用' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: '不采用' }))
     await waitFor(() => expect(annotationAction).toHaveBeenCalledWith(auth, 'a1', 'reject'))
   })
