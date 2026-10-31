@@ -15,8 +15,8 @@ describe("t1360u error-card Continue inventory", () => {
         userError, isLastTurn: true, waived, continueInterrupted: go,
         topUp: { label: "购买加量包", intent: "pack" },
       });
-      expect(actions[0]?.label).toBe("继续");
-      expect(actions.map((action) => action.label)).not.toEqual(expect.arrayContaining(["重新尝试", "重试", "重新发送"]));
+      expect(actions[0]?.label).toBe(userError.code.startsWith("automatic_retry_") ? "重试" : "继续");
+      expect(actions.map((action) => action.label)).not.toEqual(expect.arrayContaining(["重新尝试", "重新发送"]));
       actions[0]!.onClick();
       expect(go).toHaveBeenCalledTimes(1);
       expect(regenerate).not.toHaveBeenCalled();

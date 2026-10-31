@@ -157,9 +157,9 @@ jobs:
       - name: Automatic recovery presentation (targeted PG)
         shell: bash
         run: |
-          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 npx --no-install tsx --test --test-name-pattern="finalize schedules completed-error checkpoint|OCV5-317 finalize|OCV5-322 empty|silent liveness recovery" packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts' | tee recovery-presentation.tap
-          # All five selected cases must execute against this job's private service DB.
-          grep -qx '# pass 5' recovery-presentation.tap
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 npx --no-install tsx --test --test-name-pattern="finalize schedules completed-error checkpoint|OCV5-317 finalize|OCV5-322 empty|silent liveness recovery|OCV5-679" packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts' | tee recovery-presentation.tap
+          # All eleven selected cases, including six OCV5-679 regressions, must execute against this job's private service DB.
+          grep -qx '# pass 11' recovery-presentation.tap
           grep -qx '# fail 0' recovery-presentation.tap
 
       - name: Prove committed system action receipts in private PG schema

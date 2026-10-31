@@ -37,11 +37,17 @@ export function errorNoticeActions(input: ErrorNoticeActionsInput): ErrorNoticeA
   const { cb, isLastTurn, waived } = input;
   const h: ErrorActionHandlers = {};
   if (isLastTurn) {
-    if (input.continueInterrupted) h.retry = { label: "继续", onClick: input.continueInterrupted };
+    if (input.continueInterrupted) h.retry = {
+      label: input.userError.code.startsWith("automatic_retry_") ? "重试" : "继续",
+      onClick: input.continueInterrupted,
+    };
     if (!waived) {
       if (cb.onOpenModelPicker) h.switch_model = { label: "切换模型", onClick: cb.onOpenModelPicker };
       const editTarget = input.editTarget;
       if (editTarget && cb.onEditResend) h.edit_message = { label: "修改消息", onClick: () => cb.onEditResend?.(editTarget) };
+      if (editTarget && cb.onEditResend) h.split_upload = {
+        label: "分批上传", onClick: () => cb.onEditResend?.(editTarget),
+      };
       const reload = { label: "刷新页面", onClick: () => window.location.reload() };
       h.refresh = reload;
       h.relogin = reload;

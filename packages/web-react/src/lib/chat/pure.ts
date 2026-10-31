@@ -803,15 +803,15 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   upstream_timeout: "模型响应超时，你的消息已保留，可以在当前会话继续。",
   network_error: "网络波动导致本轮中断，请重试。",
   context_too_long:
-    "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。",
+    "本轮暂时未能完成对话整理，已有内容已保留。",
   request_too_large: "本轮资料未能完整处理，文件和对话均已保留。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──
   engine_error: "任务执行时遇到内部错误，你的消息已保留，可以在当前会话继续。",
   internal_error: "服务遇到内部错误，你的消息已保留，可以在当前会话继续。",
   auth_error: "认证状态异常，本轮未正常完成，可以继续。",
-  box_capacity_held: "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。",
-  platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
+  box_capacity_held: "上一轮任务仍在收尾，本条消息尚未开始处理。",
+  platform_credential_expired: "本轮模型访问凭证已过期，已有进度已保留。",
   service_restart: "服务正在更新，本轮已中断，可以继续。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。可以在当前会话继续。",
   session_deleted: "这个会话已被删除。请先从回收站恢复，再在原会话继续。",

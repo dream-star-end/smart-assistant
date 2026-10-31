@@ -16,7 +16,7 @@ export type { UserError, UserErrorAction };
 
 const ACTIONS: ReadonlySet<string> = new Set<UserErrorAction>([
   "retry", "switch_model", "contact_admin", "edit_message", "relogin",
-  "refresh", "topup", "new_session", "wait", "check_settings",
+  "refresh", "topup", "new_session", "wait", "check_settings", "split_upload",
 ]);
 
 /** 采信回包里的 userError:码、正文、动作齐全才用,否则交给错误码兜底。 */

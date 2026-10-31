@@ -27,8 +27,6 @@ describe('automatic turn recovery policy', () => {
       'codex_turn_busy', // another turn owns the session; FIFO lifecycle owns it
       'codex_billing', // billing admission result is not a model continuation proof
       'project_context_unavailable', // held before dispatch until the master answers; user retries
-      'platform_credential_expired', // OCV5-556: replay reuses the dead launch credential; the next message gets a fresh one
-      'box_capacity_held', // OCV5-649: refused before any model call; recovery only waits on the same held slot
     ])
     const actual = Object.entries(TURN_ERROR_TAXONOMY)
       .filter(([, semantics]) =>
@@ -39,6 +37,8 @@ describe('automatic turn recovery policy', () => {
 
   it('includes transient execution failures but excludes user/action and admission failures', () => {
     for (const code of [
+      'platform_credential_expired',
+      'box_capacity_held',
       'rate_limited',
       'model_capacity',
       'upstream_failed',
@@ -54,8 +54,6 @@ describe('automatic turn recovery policy', () => {
     }
     for (const code of [
       'auth_error',
-      'platform_credential_expired',
-      'box_capacity_held',
       'insufficient_credits',
       'context_too_long',
       'bad_request',
@@ -71,6 +69,14 @@ describe('automatic turn recovery policy', () => {
     ]) {
       assert.equal(supportsAutomaticTurnRecovery(code), false, code)
     }
+  })
+
+  it('OCV5-679 held capacity and credential expiry require a checkpoint and keep the shared bound', () => {
+    for (const code of ['box_capacity_held', 'platform_credential_expired']) {
+      assert.equal(supportsAutomaticTurnRecovery(code), true)
+      assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false)
+    }
+    assert.equal(AUTOMATIC_TURN_RETRY_MAX, 10)
   })
 
   it('normalizes every deployed unexpected runner label to one recovery policy', () => {

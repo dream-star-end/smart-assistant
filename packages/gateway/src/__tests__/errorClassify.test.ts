@@ -15,7 +15,7 @@ import { _tapeErrorCodeForGenericFailure } from '../sessionManager.js'
 import { _buildEngineErrorFrame } from '../turnFrames.js'
 
 describe('classifyRunError', () => {
-  it('OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and is never auto-recovered', () => {
+  it('OCV5-649 Box slot 409 stays box_capacity_held on the wire and tape and only recovers through master admission', () => {
     // The exact production terminal (commercial uid 4, 10-28 trace 5adf074e).
     const raw = JSON.stringify({ subtype: 'success',
       result: 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"},"request_id":"065f563d454c692b1f828fd3d36d49c3"}' })
@@ -24,8 +24,8 @@ describe('classifyRunError', () => {
       peer: { id: 'u4', kind: 'dm' } }, { kind: 'error', error: raw })
     assert.equal(frame.code, 'box_capacity_held')
     assert.equal(_tapeErrorCodeForGenericFailure(raw), 'box_capacity_held')
-    assert.equal(supportsAutomaticTurnRecovery(frame.code), false)
-    assert.equal(supportsAutomaticTurnRecovery(_tapeErrorCodeForGenericFailure(raw)), false)
+    assert.equal(supportsAutomaticTurnRecovery(frame.code), true)
+    assert.equal(supportsAutomaticTurnRecovery(_tapeErrorCodeForGenericFailure(raw)), true)
   })
   it('model_config_changed_retry_turn: production model-authority 409', () => {
     const raw =

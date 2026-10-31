@@ -577,6 +577,7 @@ const C_FULL_LEAVES = [
   'includes transient execution failures but excludes user/action and admission failures',
   'normalizes every deployed unexpected runner label to one recovery policy',
   'requires a checkpoint for ambiguous process-loss errors',
+  'OCV5-679 held capacity and credential expiry require a checkpoint and keep the shared bound',
   'mints one protocol-valid deterministic identity per source turn',
   'derives the monotonic retry counter from raw controls or compacted terminal stamps',
   'resets one first-event silent recovery, then persistently pauses the same no-progress lineage',

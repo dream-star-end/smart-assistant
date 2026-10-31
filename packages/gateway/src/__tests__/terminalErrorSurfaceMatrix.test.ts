@@ -147,7 +147,7 @@ const SCENARIOS: readonly Scenario[] = [
     sample:
       'ANTIGRAVITY_CREDENTIAL_EXPIRED: agent executor error: generating and executing: request failed: Post \"http://127.0.0.1:18789/internal/v5/antigravity-relay/route/<route>/v1internal:streamGenerateContent?alt=sse\": oauth2: token expired and refresh token is not set',
     attempts: 1,
-    why: 'OCV5-556 — 平台写给 Antigravity CLI 的凭证本地判过期,同一启动重放只会再失败(三次恢复各白烧 25-31 万上游输入);下一条消息会拿到新凭证',
+    why: 'OCV5-556 — 平台写给 Antigravity CLI 的凭证本地判过期,同一启动重放只会再失败(三次恢复各白烧 25-31 万上游输入);master持久恢复会经新admission签发凭证，网关仍不原地重试',
   },
   {
     code: 'box_capacity_held',

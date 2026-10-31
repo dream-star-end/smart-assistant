@@ -25,7 +25,7 @@ function frame(value: unknown, flag = 0): Buffer {
  * 4 h 15 min expiry. The liveness look asked for a response cap the transport refuses before sending, so the
  * OCV5-488 absence close never ran; and the 409 became tape ENGINE_ERROR / wire upstream_failed, both
  * auto-recovered, so three recoveries waited on the same hold. Now a gone run is released on its second look
- * and the refusal is box_capacity_held, never automatically recovered. */
+ * and the refusal stays box_capacity_held; W3 recovery now backs off behind the safe checkpoint gate. */
 export async function proveCapacityHeldReleased(candidate: string): Promise<string> {
   const load = (rel: string) => import(pathToFileURL(join(candidate, rel)).href);
   const { BoxRemoteCleanupWorker } = await load("packages/commercial/src/http/proxy/boxRemoteCleanupWorker.ts");
@@ -74,13 +74,14 @@ export async function proveCapacityHeldReleased(candidate: string): Promise<stri
     + '"message":"Box slot busy"},"request_id":"065f563d454c692b1f828fd3d36d49c3"}' });
   const { _buildEngineErrorFrame } = await load("packages/gateway/src/turnFrames.ts");
   const { _tapeErrorCodeForGenericFailure } = await load("packages/gateway/src/sessionManager.ts");
-  const { supportsAutomaticTurnRecovery } = await load("packages/protocol/src/turnErrorTaxonomy.ts");
+  const { supportsAutomaticTurnRecovery, supportsAutomaticRecoveryWithoutCheckpoint, AUTOMATIC_TURN_RETRY_MAX } = await load("packages/protocol/src/turnErrorTaxonomy.ts");
   const wire = _buildEngineErrorFrame({ sessionKey: "sk", channel: "webchat", peer: { id: "u4", kind: "dm" } },
     { kind: "error", error: raw }).code as string;
   const tape = _tapeErrorCodeForGenericFailure(raw) as string;
   if (wire !== "box_capacity_held" || tape !== "box_capacity_held"
-    || supportsAutomaticTurnRecovery(wire) || supportsAutomaticTurnRecovery(tape)) {
-    fail(`CAPACITY_HELD_AUTO_RECOVERED_${wire}_${tape}`);
+    || !supportsAutomaticTurnRecovery(wire) || !supportsAutomaticTurnRecovery(tape)
+    || supportsAutomaticRecoveryWithoutCheckpoint(wire) || AUTOMATIC_TURN_RETRY_MAX !== 10) {
+    fail(`CAPACITY_HELD_RECOVERY_POLICY_${wire}_${tape}`);
   }
-  return "[ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD is box_capacity_held on wire and tape and never automatically recovered";
+  return "[ocv5-649-capacity-held-ghost] PASS — a run gone from the Box is released on its second look through the real exec transport, and its 409 BOX_CAPACITY_HELD stays named on wire and tape with only bounded safe master recovery";
 }

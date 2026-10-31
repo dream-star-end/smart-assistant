@@ -133,7 +133,7 @@ test("OCV5-607 request-size cards keep partial answers and hide the fixed Englis
                 const body = await page.locator("body").innerText();
                 assert.equal(await page.getByText("资料暂未处理完成", { exact: true }).count(), 1);
                 // W3:卡片正文用错误目录的人话(request_too_large → size)。
-                assert.match(body, /请精简消息或分批提交文件/);
+                assert.match(body, /资料超过单次处理上限，文件和对话已保留/);
                 assert.doesNotMatch(body, /Request too large|max 20MB|内部错误/);
                 if (shape !== "legacy") assert.ok(body.includes(partial));
                 if (shape === "legacy-frozen") {
