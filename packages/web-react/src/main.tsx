@@ -1,12 +1,16 @@
-import { StrictMode } from 'react'
+import { lazy, StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App, prefetchLazyCentersOnIdle } from './App'
-import { LegalPage } from './components/LegalPage'
+import { BootSplash } from './components/BootSplash'
+import { LazyBoundary } from './components/ChunkErrorBoundary'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { registerServiceWorker } from './registerSW'
 import { installGlobalClientFrictionHandlers } from './lib/clientFriction'
 import { waitForEntryStyles } from './lib/nonBlockingCss'
 import './styles.css'
+
+// 法务整页按路由加载,避免把协议全文带进聊天首屏。
+const LegalPage = lazy(() => import('./components/LegalPage').then((m) => ({ default: m.LegalPage })))
 
 // 法律文本静态页(/terms /privacy):纯静态、无任何 App 状态,在入口层短路,
 // 不走 App 的路由/鉴权/WS 体系(App 内的 /reset-password 特判需要 AuthGate,故留在 App)。
@@ -23,7 +27,11 @@ void waitForEntryStyles().then(() => {
     <StrictMode>
       <ToastProvider>
         <TooltipProvider>
-          {legalKind ? <LegalPage kind={legalKind} /> : <App />}
+          {legalKind ? (
+            <LazyBoundary fallback={<BootSplash />}>
+              <LegalPage kind={legalKind} />
+            </LazyBoundary>
+          ) : <App />}
         </TooltipProvider>
       </ToastProvider>
     </StrictMode>,
