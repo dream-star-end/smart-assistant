@@ -27,6 +27,7 @@ function harness(
     upstreams?: Array<{ statusCode: number; text: string }>
     admit?: (requestId: string) => boolean
     onAbort?: (requestId: string) => void
+    stream?: AsyncIterable<Uint8Array>
   } = {},
 ) {
   const events: string[] = []
@@ -48,7 +49,14 @@ function harness(
           statusCode: 200,
           text: JSON.stringify(grokVisionUpstreamPayload()),
         }
-      return { statusCode: up.statusCode, body: { text: async () => up.text } }
+      return {
+        statusCode: up.statusCode,
+        ...(opts.stream ? { headers: { 'content-type': 'text/event-stream' } } : {}),
+        body: {
+          text: async () => up.text,
+          ...(opts.stream ? { [Symbol.asyncIterator]: () => opts.stream![Symbol.asyncIterator]() } : {}),
+        },
+      }
     },
     recordStatus: async () => {},
     preCheckWithCostFn: (async (_r: unknown, input: any) => {
@@ -84,6 +92,82 @@ function harness(
 
 describe('makeGrokRunner (OCV5-591 A0)', () => {
   beforeEach(() => __resetGrokVisionRateState())
+
+  const event = (value: unknown) => `data: ${JSON.stringify(value)}\r\n\r\n`
+  const chunks = async function* (text: string) {
+    const bytes = Buffer.from(text)
+    for (let i = 0; i < bytes.length; i += 3) yield bytes.subarray(i, i + 3)
+  }
+  const platform = { userId: 7n, containerId: null, requestId: 'stream', prompt: 'plan', billTo: 'platform' as const }
+
+  it('streams ordered UTF-8 previews before completion, ignores reasoning, and bills the platform', async () => {
+    const deltas: string[] = []
+    const stream = async function* () {
+      yield* chunks(
+        `: heartbeat\r\n\r\n${event({ type: 'response.reasoning_text.delta', delta: 'private' })}`,
+      )
+      yield* chunks(event({ type: 'response.output_text.delta', delta: '红狐' }))
+      assert.deepEqual(deltas, ['红狐'], 'callback finishes before reading more upstream')
+      yield* chunks(event({ type: 'response.output_text.delta', delta: '起跑' }))
+      assert.deepEqual(deltas, ['红狐', '起跑'])
+      yield* chunks(event({ type: 'response.completed', response: grokVisionUpstreamPayload({ text: '红狐起跑' }) }))
+    }
+    const h = harness({ stream: stream() })
+    const out = await h.run({ ...platform, onDelta: async (s) => { deltas.push(s) } })
+    assert.equal(out.text, '红狐起跑')
+    assert.deepEqual(h.events, ['upstream'])
+    assert.equal(JSON.parse(h.bodies[0]!).stream, true)
+    assert.equal(out.usage.reasoning_output_tokens, 52)
+  })
+
+  it('accepts a JSON response to the streaming request without making a second request', async () => {
+    const h = harness()
+    const deltas: string[] = []
+    assert.ok((await h.run({ ...platform, onDelta: async (s) => { deltas.push(s) } })).text)
+    assert.deepEqual(deltas, [])
+    assert.deepEqual(h.events, ['upstream'])
+  })
+
+  it('rejects truncated, failed, incomplete and unmetered streams without persisting a result', async () => {
+    const delta = event({ type: 'response.output_text.delta', delta: 'partial' })
+    for (const ending of [
+      '', 'data: [DONE]\n\n', event({ type: 'response.failed' }),
+      event({ type: 'response.incomplete' }),
+      event({ type: 'response.completed', response: grokVisionUpstreamPayload({ usage: null }) }),
+    ]) {
+      const h = harness({ stream: chunks(delta + ending) })
+      let persisted = false
+      await assert.rejects(h.run({ ...platform, onDelta: async () => {}, onResult: async () => { persisted = true } }), { code: 'GROK_BAD_RESPONSE' })
+      assert.equal(persisted, false)
+      assert.deepEqual(h.events, ['upstream'])
+    }
+  })
+
+  it('propagates delta persistence failure unchanged and stops reading the upstream', async () => {
+    const original = new Error('lease lost')
+    let readAfterDelta = false
+    const stream = async function* () {
+      yield Buffer.from(event({ type: 'response.output_text.delta', delta: 'x' }))
+      readAfterDelta = true
+      yield Buffer.from(event({ type: 'response.completed', response: grokVisionUpstreamPayload() }))
+    }
+    const h = harness({ stream: stream() })
+    await assert.rejects(h.run({ ...platform, onDelta: async () => { throw original } }), (e) => e === original)
+    assert.equal(readAfterDelta, false)
+  })
+
+  it('honours cancellation before admission and during streaming', async () => {
+    const controller = new AbortController()
+    const h = harness()
+    controller.abort()
+    await assert.rejects(h.run({ ...platform, signal: controller.signal }), { name: 'AbortError' })
+    assert.deepEqual(h.events, [])
+    const live = new AbortController()
+    const streaming = harness({ stream: chunks(event({ type: 'response.output_text.delta', delta: 'x' }) + event({ type: 'response.completed', response: grokVisionUpstreamPayload() })) })
+    let persisted = false
+    await assert.rejects(streaming.run({ ...platform, signal: live.signal, onDelta: async () => { live.abort() }, onResult: async () => { persisted = true } }), { name: 'AbortError' })
+    assert.equal(persisted, false)
+  })
 
   it('runs for a user without a container, with a caller-supplied stable request id', async () => {
     const h = harness()

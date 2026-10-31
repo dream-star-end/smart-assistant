@@ -26,6 +26,10 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { InMemoryPreCheckRedis } from '../billing/preCheck.js'
+import { PricingCache } from '../billing/pricing.js'
+import { makeGrokRunner } from '../grok/visionProxy.js'
+import { PUBLIC_VISION_AUTHZ, grokVisionSnapshot, grokVisionUpstreamPayload } from './helpers/grokVisionFixtures.js'
 import { StudioBlobStore } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
 import { advanceProject, dispatchRequest } from '../media-studio/orchestrator/advance.js'
@@ -293,6 +297,68 @@ async function takes(projectId: string) {
 const signal = () => new AbortController().signal
 
 describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
+  test('real planner SSE commits ordered deltas before completion and produces the same final plan as JSON', async (t) => {
+    if (skip(t)) return
+    const plan = {
+      title: '冬日来客',
+      shots: [{ title: '晨雾', framing: '远景', action: '红狐走出晨雾', durationSec: 6 }],
+      bible: [{ kind: 'character', name: '红狐', descriptor: '橙红毛，胸口白色' }],
+      narration: null, music: null,
+    }
+    const text = JSON.stringify(plan)
+    const deltaTexts = [text.slice(0, 50), text.slice(50)]
+    const finalized: unknown[] = []
+    for (const streaming of [true, false]) {
+      const userId = await user()
+      const project = await new StudioStore(getPool()).createProject(userId, { brief: '红狐短片', targetSec: 6, budgetCredits: 2000 })
+      await query("UPDATE studio_projects SET status = 'planning' WHERE id = $1", [project.id])
+      const d = await deps(new FakeProvider('img', 'image'))
+      await advanceProject(d, project.id)
+      const [task] = await claimStudioTasks(getPool(), { owner: 'planner', limit: 1, museOnline: false })
+      assert.ok(task)
+      let calls = 0
+      const billing = async () => { throw new Error('platform planner touched user billing') }
+      d.grok = makeGrokRunner({
+        getPool, preCheckRedis: new InMemoryPreCheckRedis(), pricing: new PricingCache(),
+        catalog: { assertFresh: async () => grokVisionSnapshot() }, loadUserModelAuthz: async () => PUBLIC_VISION_AUTHZ,
+        pickAccountId: async () => 24n, freshToken: async () => Buffer.from('test-token'), recordStatus: async () => {},
+        preCheckWithCostFn: billing, startInflightJournalFn: billing, settleDurableCodexBillingFn: billing,
+        abortInflightJournalFn: billing, releasePreCheckFn: billing,
+        requestFn: async (_url, init) => {
+          calls++
+          const isPlan = JSON.parse(init.body).stream === true
+          const json = grokVisionUpstreamPayload({ text: isPlan ? text : '{"verdict":"pass","reason":""}' })
+          if (!isPlan || !streaming) return { statusCode: 200, body: { text: async () => JSON.stringify(json) } }
+          const event = (v: unknown) => Buffer.from(`data: ${JSON.stringify(v)}\n\n`)
+          const body = {
+            text: async () => { throw new Error('SSE was buffered') },
+            async *[Symbol.asyncIterator]() {
+              for (const [i, delta] of deltaTexts.entries()) {
+                yield event({ type: 'response.output_text.delta', delta })
+                const rows = await query<{ payload: { seq: number; delta: string } }>("SELECT payload FROM studio_events WHERE project_id=$1 AND type='plan.delta' ORDER BY id", [project.id])
+                assert.deepEqual(rows.rows.map((r) => [r.payload.seq, r.payload.delta]), deltaTexts.slice(0, i + 1).map((s, n) => [n + 1, s]))
+                assert.equal((await query('SELECT 1 FROM studio_shots WHERE project_id=$1', [project.id])).rowCount, 0)
+                const view = await new StudioStore(getPool()).projectView(userId, project.id)
+                const activity = view!.events as Array<{ type: string }>
+                assert.ok(activity.some((e) => e.type === 'project.created'))
+                assert.equal(activity.some((e) => e.type === 'plan.delta'), false, 'previews do not flood ordinary activity')
+              }
+              yield event({ type: 'response.completed', response: json })
+            },
+          }
+          return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body }
+        },
+      })
+      await executeTask(d, task, signal())
+      assert.equal(calls, 2, 'one moderation and one planning request, no extra fallback request')
+      const shots = await query('SELECT ordinal, spec FROM studio_shots WHERE project_id=$1 ORDER BY ordinal', [project.id])
+      const assets = await query('SELECT kind, name, descriptor FROM studio_assets WHERE project_id=$1', [project.id])
+      finalized.push({ shots: shots.rows, assets: assets.rows })
+      const events = await query<{ type: string }>("SELECT type FROM studio_events WHERE project_id=$1 AND type LIKE 'plan.%' ORDER BY id", [project.id])
+      assert.deepEqual(events.rows.map((r) => r.type), streaming ? ['plan.delta', 'plan.delta', 'plan.ready'] : ['plan.ready'])
+    }
+    assert.deepEqual(finalized[0], finalized[1])
+  })
   test('concurrent advances dispatch once; concurrent workers split the work; money adds up', async (t) => {
     if (skip(t)) return
     const img = new FakeProvider('img', 'image')
