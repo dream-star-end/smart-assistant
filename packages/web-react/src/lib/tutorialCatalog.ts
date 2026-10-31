@@ -107,7 +107,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 9,
+    contentVersion: 10,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，有时还会出现可点击的选择卡。任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -141,6 +141,7 @@ export const TUTORIAL_TOPICS = {
     tips: [
       "复杂任务写清“完成标准”，比堆很多提示词更有效。",
       "一次会话尽量围绕同一个目标，相关上下文会自然延续。",
+      "输入框为空时若出现浅色预测下一句，按 Tab 或 → 可填入继续编辑，直接点发送即可提交，按 Esc 则收起。",
     ],
     cautions: [
       "涉及转账、发布、删除数据等外部动作，执行前仍应核对确认。",
@@ -195,9 +196,9 @@ export const TUTORIAL_TOPICS = {
   },
   "sessions-history": {
     featureId: "sessions-history",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
-      "每个会话都保留自己的智能体、上下文和任务轨迹。侧栏可搜索、切换、重命名和删除会话；登录同一账号后，服务端保存的消息与团队结果会在其他设备恢复，长会话还可以按需从云端加载更早记录。",
+      "每个会话都保留自己的智能体、上下文和任务轨迹。侧栏可搜索、切换、置顶、归档、移入项目、重命名和删除会话；登录同一账号后，服务端保存的消息与团队结果会在其他设备恢复，长会话还可以按需从云端加载更早记录。",
     outcome: "把不同项目分开管理，并在刷新或换设备后继续原来的工作。",
     scenarios: [
       "按客户或项目建立独立会话",
@@ -224,7 +225,7 @@ export const TUTORIAL_TOPICS = {
     ],
     tips: [
       "一个会话一个主目标，检索和续接都更准确。",
-      "可收藏式保留关键会话：用统一前缀重命名，例如“客户A｜季度复盘”。",
+      "常用会话可直接置顶或移入对应项目；暂时告一段落但仍要保留的会话用归档收起，比手改前缀更省心。",
     ],
     cautions: ["删除不可当作临时归档使用；需要保留的成果请先下载。"],
     media: "sessions-history",
@@ -232,7 +233,7 @@ export const TUTORIAL_TOPICS = {
   },
   "taskboard": {
     featureId: "taskboard",
-    contentVersion: 1,
+    contentVersion: 2,
     intro:
       "侧栏“任务”打开任务面板。工单按阶段推进，每个阶段可以绑定专业 agent（如调研、编码、审查）。它适合需要拆步、等人确认或跨会话跟踪的工作；日常一问一答仍用普通对话即可。",
     outcome: "把一件大事拆成可跟踪的阶段，并让对应专业助手在各自站点推进。",
@@ -252,7 +253,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "让阶段 agent 做事",
-        body: "每个阶段可以指定专业助手。开工后它在该阶段执行；你可在工单评论里补充约束，不必另开互不相干的会话。",
+        body: "每个阶段可以指定专业助手。开工后它在该阶段执行；你可在工单抽屉的时间线里补充约束、查看历次执行结果，或按需停止与重试，不必另开互不相干的会话。",
       },
       {
         title: "把对话和面板一起用",
@@ -274,7 +275,7 @@ export const TUTORIAL_TOPICS = {
   },
   "models-reasoning": {
     featureId: "models-reasoning",
-    contentVersion: 7,
+    contentVersion: 8,
     intro:
       "顶栏模型选择器决定本会话下一条任务由哪个模型执行；设置里的默认模型和思考深度决定新会话的起点。当前可选范围包含 GPT、DeepSeek、GLM、官方 Grok 和 Cursor 家族。不同模型在速度、复杂推理、编程与成本上各有侧重，平台会如实显示当前可用范围和计费。窄屏上选择器从底部弹出，不再带搜索框。",
     outcome: "按任务难度选择合适模型，在响应速度、质量与积分消耗之间取得平衡。",
@@ -290,7 +291,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "按家族和档位选择",
-        body: "先选家族（GPT、DeepSeek、GLM、Grok、Cursor），再选思考档。需要更快时再开速度档（Fast）。窄屏点顶栏模型后，列表从底部弹出。",
+        body: "先选家族（GPT、DeepSeek、GLM、Grok、Cursor），再选思考档。支持速度档的 GPT 型号可在「标准」与「Fast（更快，按 2× 计费）」间切换；切换确认中也可点「取消」。窄屏点顶栏模型后，列表从底部弹出。",
       },
       {
         title: "切换只影响后续消息",
@@ -547,7 +548,7 @@ export const TUTORIAL_TOPICS = {
   },
   "github-repository": {
     featureId: "github-repository",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "把 GitHub 账号授权给平台后，可为当前会话绑定一个仓库和分支。智能体会在绑定的真实代码上下文中查看文件、运行构建和测试，并按你的授权与指令提交或推送改动。仓库绑定是按会话隔离的。",
     outcome: "让编程任务直接落到仓库和分支，而不是只返回一段孤立代码。",
@@ -559,7 +560,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "连接 GitHub",
-        body: "点击输入框下方仓库入口，在仓库对话框中完成 GitHub OAuth 授权及仓库、分支选择；关闭对话框会返回当前会话。",
+        body: "点击输入框下方仓库入口，在仓库对话框中完成 GitHub OAuth 授权及仓库、分支选择；若连接状态加载异常，点「继续」即可重新拉取，关闭对话框会返回当前会话。",
       },
       {
         title: "选仓库与分支",
@@ -588,7 +589,7 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
@@ -625,7 +626,7 @@ export const TUTORIAL_TOPICS = {
   },
   "team-mode": {
     featureId: "team-mode",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "团队模式由队长拆解任务，并按需委派给已安装的专业智能体并行工作。即使未开团队模式，对话里也可以用委派子任务；运行中会出现委派直播卡（delegate-progress），显示子任务正在做什么，而不是一条普通工具结果。界面还会展示成员进度、工具、结果和各自消耗。",
     outcome: "让调研、实现、验证等子任务并行推进，同时看清每一步委派进度。",
@@ -637,7 +638,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "在智能体选择器开启团队模式",
-        body: "在全能助手卡片的「单人 / 顾问 / 团队」里点团队。开启后顶栏会常驻团队标识，并显示真实队长引擎说明。队长引擎与顶栏“当前模型”不是同一件事。顾问模式不会切换队长引擎。",
+        body: "在全能助手卡片的「单人 / 顾问 / 团队」里点团队。开启后顶栏会常驻团队标识（窄屏显示「团队」），点击可查看真实队长引擎计费说明或直接点「关闭团队模式」。队长引擎与顶栏“当前模型”不是同一件事。顾问模式不会切换队长引擎。",
       },
       {
         title: "给出可拆分目标",
@@ -814,7 +815,7 @@ export const TUTORIAL_TOPICS = {
   },
   connectors: {
     featureId: "connectors",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
       "插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装；管理中心只负责账号与授权。除 Notion、飞书、GitHub 和声明式 HTTP 插件外，知识星球支持微信扫码登录及只读内容检索。",
     outcome: "让 AI 在真实业务系统里查数据和执行动作，而不靠手工搬运。",
@@ -859,7 +860,7 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-discovery": {
     featureId: "marketplace-discovery",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "AI 市场汇集三类能力：技能沉淀可复用的方法与流程；智能体组合模型、人设、工具权限和依赖；插件提供可安装、可授权、可审计的外部能力。当前插件分类先支持声明式 HTTP API。",
     outcome: "按任务快速加装专业能力，而不把所有功能塞进一个助手。",
@@ -894,7 +895,7 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-publishing": {
     featureId: "marketplace-publishing",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "你可以把自己的技能、智能体或插件发布到公共市场。发布页支持由 AI 在对话中生成结构化确认单；提交后自动审核，高风险或不确定内容转人工，状态变化会在市场内实时显示。当前插件发布支持声明式 HTTP API。",
     outcome: "把可复用能力版本化、接受审核，并分享给市场用户。",
@@ -929,7 +930,7 @@ export const TUTORIAL_TOPICS = {
   },
   inbox: {
     featureId: "inbox",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "顶栏铃铛汇总服务通知、任务送达、账户提醒和平台公告。未读红点显示需要关注的数量；消息卡可包含格式化正文、图片、图表和链接，并能按全部/未读筛选或一键全部已读。",
     outcome: "在一个位置接收异步任务结果与真正需要处理的服务信息。",
@@ -937,7 +938,7 @@ export const TUTORIAL_TOPICS = {
     steps: [
       {
         title: "关注未读红点",
-        body: "点击顶栏铃铛打开站内信，默认先查看未读消息。",
+        body: "点击顶栏铃铛打开站内信，默认先查看未读消息；若网络波动导致列表或翻页加载失败，点击「继续」即可重新加载并保留已展开上下文。",
       },
       {
         title: "展开消息详情",
@@ -999,9 +1000,9 @@ export const TUTORIAL_TOPICS = {
   },
   "billing-usage": {
     featureId: "billing-usage",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
-      "账户与计费页展示套餐、期内积分、长期钱包、充值、订单和收支；用量页按时间、模型、Token、缓存命中和会话拆解消耗。窄屏可点击顶栏钱包图标打开账户入口。管理员在设置中另有独立的“API 接入”分区，普通账号不会显示该入口。",
+      "账户与计费页展示套餐、期内积分、长期钱包、充值、订单和收支；用量页按时间、模型、Token、缓存命中和会话拆解消耗。点击侧栏左下角账号菜单或顶栏余额胶囊（窄屏为钱包图标）即可打开账户入口。管理员在设置中另有独立的“API 接入”分区，普通账号不会显示该入口。",
     outcome: "知道积分从哪里来、花到哪里，并在预算内选择模型和工作方式。",
     scenarios: ["充值或升级套餐", "分析某段时间用量", "核对模型与缓存消耗"],
     steps: [
