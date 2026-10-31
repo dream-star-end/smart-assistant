@@ -70,11 +70,11 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
   共享技能目录为 `/home/agent/.openclaude/skills/`,只读平台基线为 `/run/oc/claude-config/skills/`；
   Agent 专属技能位于 `/home/agent/.openclaude/agents/<agentId>/skills/`。直接读磁盘:
   `ls /home/agent/.openclaude/skills/ /run/oc/claude-config/skills/ /home/agent/.openclaude/agents/*/skills/ 2>/dev/null`
-- 个性化 AI 记忆持久化在 `/home/agent/.openclaude/agents/<agentId>/memory/` 与跨助手画像 `/home/agent/.openclaude/user.md`,不在 tmpfs 会话目录。清理这些记忆(**不可逆**,两步走:先预览,确认后才删):
+- 个性化 AI 记忆持久化在当前助手的 `/home/agent/.openclaude/agents/<agentId>/memory/`（正文）、`/home/agent/.openclaude/agents/<agentId>/MEMORY.md`（索引）与跨助手画像 `/home/agent/.openclaude/user.md`,不在 tmpfs 会话目录。清理当前助手的持久化记忆与画像(**不可逆**,只清理当前助手自己的记忆目录与 `user.md`,不触碰其他助手或项目文件;两步走:先预览,确认后才删):
   1. **先预览**待删文件,让用户核对:
-     `find /home/agent/.openclaude/agents -type f -path '*/memory/*.md' -print; ls /home/agent/.openclaude/user.md 2>/dev/null`
+     `(aid="${OPENCLAUDE_AGENT_ID:-${OC_AGENT_ID:-main}}"; LC_ALL=C expr "x$aid" : 'x[A-Za-z0-9_-]\{1,64\}$' >/dev/null || { echo "invalid agentId: $aid" >&2; exit 1; }; d="/home/agent/.openclaude/agents/$aid"; if [ -d "$d/memory" ] && [ ! -L "$d/memory" ]; then find "$d/memory" -type f -name '*.md' -print; fi; for f in "$d/MEMORY.md" "/home/agent/.openclaude/user.md"; do if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\n' "$f"; fi; done)`
   2. 用户核对后,如果确认要删,**复述一次完整命令**等用户再次明确"删除" 后再执行:
-     `find /home/agent/.openclaude/agents -type f -path '*/memory/*.md' -delete; rm -f -- /home/agent/.openclaude/user.md`
+     `(aid="${OPENCLAUDE_AGENT_ID:-${OC_AGENT_ID:-main}}"; LC_ALL=C expr "x$aid" : 'x[A-Za-z0-9_-]\{1,64\}$' >/dev/null || { echo "invalid agentId: $aid" >&2; exit 1; }; d="/home/agent/.openclaude/agents/$aid"; if [ -d "$d/memory" ] && [ ! -L "$d/memory" ]; then find "$d/memory" -type f -name '*.md' -delete; fi; rm -f -- "$d/MEMORY.md" "/home/agent/.openclaude/user.md")`
   - 两步之间 AI 必须停下等用户确认,不得自行连着执行
   - 不要用 `rm -rf <glob>`:shell 展开失败或目录错位容易炸掉整个 projects/
 
