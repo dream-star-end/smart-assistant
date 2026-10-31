@@ -6,10 +6,10 @@ import {
   TURN_LABEL_LEDGER_RECONCILE_SQL,
   TURN_LABEL_LEDGER_RECONCILE_USERS_SQL,
   reconcileSqlIsReadOnly,
+  reconcileWindow,
   redactDbUrl,
   turnLabelLedgerGap,
 } from "../billing/turnLabelLedgerReconcile.js";
-import { reconcileWindow } from "../../../../scripts/ops/turn-label-ledger-reconcile.ts";
 
 describe("turnLabelLedgerGap", () => {
   it("alarms when the unattributed vision charges are missing from the label", () => {

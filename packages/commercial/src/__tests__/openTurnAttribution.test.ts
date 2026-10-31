@@ -175,7 +175,7 @@ describe("attributeOpenTurn", () => {
         if (fail) throw new Error("db down");
         return { rows } as never;
       },
-    };
+    } as unknown as Pick<Pool, "query">;
   }
 
   it("logs none and many and does not stamp a failed lookup", async () => {
@@ -228,7 +228,7 @@ describe("rememberOpenTurnKey", () => {
         calls.push(String(sql));
         return { rows: [], rowCount: 1 } as never;
       },
-    };
+    } as unknown as Pick<Pool, "query">;
     await rememberOpenTurnKey(pool, { dispatchId: DISPATCH, userId: 1618n, turnKey: TAPE });
     await rememberOpenTurnKey(pool, { dispatchId: DISPATCH, userId: 1618n, turnKey: "c".repeat(64) });
     await rememberOpenTurnKey(pool, { dispatchId: DISPATCH, userId: 1618n, turnKey: "not-a-key" });

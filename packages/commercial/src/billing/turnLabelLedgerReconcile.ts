@@ -24,6 +24,33 @@ export function redactDbUrl(text: string): string {
   return text.replace(/postgres(?:ql)?:\/\/\S+/gi, "postgres://redacted");
 }
 
+function argFrom(argv: string[], name: string): string | undefined {
+  const idx = argv.indexOf(name);
+  if (idx < 0) return undefined;
+  return argv[idx + 1];
+}
+
+/** Default window is the trailing 24 hours. --since and --until must arrive together. */
+export function reconcileWindow(
+  argv: string[],
+  now: Date,
+): { since: Date; until: Date } | { error: string } {
+  const sinceRaw = argFrom(argv, "--since");
+  const untilRaw = argFrom(argv, "--until");
+  if ((sinceRaw === undefined) !== (untilRaw === undefined)) {
+    return { error: "--since and --until must be passed together" };
+  }
+  if (sinceRaw !== undefined && untilRaw !== undefined) {
+    const since = new Date(sinceRaw);
+    const until = new Date(untilRaw);
+    if (Number.isNaN(since.getTime()) || Number.isNaN(until.getTime()) || since >= until) {
+      return { error: "--since must be earlier than --until" };
+    }
+    return { since, until };
+  }
+  return { since: new Date(now.getTime() - 24 * 60 * 60 * 1000), until: now };
+}
+
 /** One read. Bounds are timestamptz. Labels join through usage_records.created_at
  * because component updated_at is epoch milliseconds. Known skips are journal
  * stamps none|many|unkeyed, and container-less (studio) journals. */
