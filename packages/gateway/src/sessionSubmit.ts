@@ -1,4 +1,5 @@
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
+import { captureAntigravitySwitchHandoff, consumeAntigravitySwitchHandoff } from './engine/antigravityCompaction.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
@@ -1127,13 +1128,10 @@ export async function submit(
     }
     if (providerResumeId) session._contextRebuildNoticeSent = false
     const nativeHandoff =
-      consumingModelSwitch &&
-      transition &&
-      transition.sourceEngine !== session.providerTag &&
-      transition.summaryText &&
-      transition.summaryInjected !== true
-        ? transition
-        : null
+      (consumingModelSwitch && transition && transition.sourceEngine !== session.providerTag &&
+      transition.summaryText && transition.summaryInjected !== true ? transition : null) ??
+      consumeAntigravitySwitchHandoff(session.runner, !consumingModelSwitch && !providerResumeId &&
+        opts?.modelSwitchInternal === undefined && !isCcbSlashCommandPrompt(userTextOrBlocks))
     if (nativeHandoff) {
       let historyForMedia = effectiveMasterHistoricalMessages
       if (!historyForMedia) {
@@ -1154,15 +1152,8 @@ export async function submit(
           historyForMedia = []
         }
       }
-      const mediaPathHints = collectModelHistoryMediaPathHints(
-        historyForMedia,
-        nativeHandoff.summaryText ?? '',
-      )
-      runnerPayload = buildNativeModelHandoffPayload(
-        nativeHandoff.summaryText!,
-        userTextOrBlocks,
-        mediaPathHints,
-      )
+      const mediaPathHints = collectModelHistoryMediaPathHints(historyForMedia, nativeHandoff.summaryText ?? '')
+      runnerPayload = buildNativeModelHandoffPayload(nativeHandoff.summaryText!, userTextOrBlocks, mediaPathHints)
       nativeHandoff.summaryInjected = true
       session._historicalContextInjected = true
       session._historicalContextInjectedKey = `native-switch:${nativeHandoff.id}`
@@ -1845,6 +1836,7 @@ export async function _getOrCreateExclusive(
       advisorExecutionLock: opts.advisorExecutionLock,
       structuredOutputSchema: opts.structuredOutputSchema,
     })
+    captureAntigravitySwitchHandoff({ targetRunner: runner, previousEngine, targetEngine: engineId, hasPreparedTransition: Boolean(existing?._modelSwitchTransition), hermeticNoTools: opts.hermeticNoTools, existingProviderTag: existing?.providerTag, existingNativeSessionId: existing?.runner.nativeSessionId, mappedResumeProviderTag: normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)), mappedResumeId: this._resumeMap.get(opts.sessionKey) })
     const resumeTransportMismatch =
       !opts.hermeticNoTools &&
       hadSameProviderResume &&

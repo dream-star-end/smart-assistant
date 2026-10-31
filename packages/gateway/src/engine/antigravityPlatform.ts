@@ -188,9 +188,9 @@ function projectHostPathDir(launchHome: string, hostBin: string | null | undefin
   return dir
 }
 
+export function resolveAntigravityOpenClaudeHome(): string { return process.env.OPENCLAUDE_HOME?.trim() || paths.home }
 export function antigravityRoot(): string {
-  const openClaudeHome = process.env.OPENCLAUDE_HOME?.trim() || paths.home
-  return privateDir(join(openClaudeHome, 'antigravity-cli'))
+  return privateDir(join(resolveAntigravityOpenClaudeHome(), 'antigravity-cli'))
 }
 
 /** Stable CLI state shared by every launch of this container. */
