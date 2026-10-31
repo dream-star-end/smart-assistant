@@ -111,3 +111,29 @@ test("timeline cursor recovery reads the same snapshot before history and report
   expect(order).toEqual(["snapshot", "history"]);
   sock.stop();
 });
+
+test.each(["session_persist_unavailable", "history_enrichment_unavailable", "turn_tape_state_error",
+  "turn_tape_state_unavailable", "turn_tape_unavailable", "turn_tape_visible_unavailable", "tape_not_acked", "turn_tape_retryable"])(
+  "%s with exact completed durable authority produces only the quiet record", async (code) => {
+    const complete = snapshot();
+    complete.dispatch = { ...complete.dispatch!, status: "terminal", outcome: "completed", terminalAt: 3 };
+    complete.reconcile = "turn_completed";
+    const { sock, ws, s } = boot({ readSessionSnapshot: async () => complete, syncSession: async () => true });
+    ws.push(error(code)); await flush();
+    expect(s.messages.some((row) => row._errorCode === code)).toBe(false);
+    expect(s.messages.filter((row) => row.id.startsWith("sys-state-readback"))).toHaveLength(1);
+    expect(s._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
+test("same-state duplicate while reading shares one request; a foreign snapshot never clears the error", async () => {
+  let resolve!: (snap: SessionSnapshot) => void;
+  const read = vi.fn(() => new Promise<SessionSnapshot>((r) => { resolve = r; }));
+  const { sock, ws, s } = boot({ readSessionSnapshot: read });
+  ws.push(error("bad_sequence")); ws.push(error("bad_sequence")); await flush();
+  expect(read).toHaveBeenCalledTimes(1);
+  resolve(snapshot({ sessionId: "s-foreign" })); await flush();
+  expect(s.messages.some((row) => row.id.startsWith("sys-state-readback"))).toBe(false);
+  expect(s.messages.some((row) => row._errorCode === "bad_sequence")).toBe(true);
+  sock.stop();
+});
