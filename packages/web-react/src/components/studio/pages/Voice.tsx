@@ -121,6 +121,7 @@ export function VoicePage(props: {
   view: StudioProjectView
   providers: ProvidersView
   onOpenShot: (shotId: string) => void
+  onEdit?: () => void
   onReload: () => Promise<void> | void
 }) {
   const { auth, view } = props
@@ -158,7 +159,7 @@ export function VoicePage(props: {
   }
 
   return (
-    <div className="st-board st-board-voice">
+    <div className="st-board st-board-voice" onChangeCapture={props.onEdit}>
       <aside className="st-voice-lib" aria-label="音色">
         <VoiceLibrary
           auth={auth}
