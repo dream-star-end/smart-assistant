@@ -78,6 +78,8 @@ test("#1233: trusted Escape confirms, cancels safely, and never stops a replacem
   assert.match(await status.getAttribute("class"), /bg-status-idle/);
   // The Composer's deliberate Stop button remains a single direct action.
   await page.evaluate(() => window.nextTurn());
+  // OCV5-695: a click within 1 s of Send turning into Stop is the transition click, not a Stop.
+  await page.waitForTimeout(1000);
   await page.getByRole("button", { name: "停止", exact: true }).click();
   assert.equal(await page.getByTestId("stops").textContent(), "2");
 });
