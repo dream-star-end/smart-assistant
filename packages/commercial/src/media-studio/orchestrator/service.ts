@@ -493,11 +493,17 @@ export function makeOrchestratorApi(
         } else {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'this take cannot be chosen yet')
         }
-        // A project waiting on the user picks up again once something was chosen.
+        // A new choice returns composition to the director, which dispatches any replacement
+        // video before composing again. Keep budget/plan approval and user pauses intact.
         await c.query(
           `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason', rev = rev + 1, updated_at = NOW()
-            WHERE id = $1 AND status = 'awaiting_user'
-              AND settings->>'awaitingReason' IN ('needs_user', 'compose_pending')`,
+            WHERE id = $1 AND (status = 'composing' OR (status = 'awaiting_user'
+              AND settings->>'awaitingReason' IN ('needs_user', 'compose_pending')))`,
+          [t.project_id],
+        )
+        await c.query(
+          `UPDATE studio_projects SET settings = settings || '{"resumeTo":"running"}'::jsonb
+            WHERE id = $1 AND status = 'paused' AND settings->>'resumeTo' = 'composing'`,
           [t.project_id],
         )
         await appendStudioEvent(c, t.project_id, 'take.selected', {
