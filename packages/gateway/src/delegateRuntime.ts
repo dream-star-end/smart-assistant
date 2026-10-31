@@ -73,7 +73,7 @@ import {
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
 } from './delegateSmFlag.js'
-import { foldDelegateCompletionSurface } from './delegateCompletionSurface.js'
+import { foldDelegateCompletionSurface, flushBackgroundCompletion } from './delegateCompletionSurface.js'
 import { parseParentEngine } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
@@ -354,6 +354,7 @@ export function _ensureDelegateJobStore(this: DelegateRuntimeHost): DelegateJobS
     ttlMs: resolveDelegateJobTtlMs(),
     sm,
     durable,
+    canCommitTerminal: job => !backgroundDelegates(this).ownsActiveJob(job.id),
     onDrop: (job) => this._forgetDelegateInflight(job.id),
     onTerminal: (job) => {
       if (job.sessionKey) resume.release(job.sessionKey)
@@ -861,6 +862,7 @@ export async function handleDelegateTask(
       })
     }
     const jobId = created.jobId
+    if (backgroundControl) backgroundDelegates(this).beginJob(backgroundControl, jobId)
     runInput.backgroundJobId = jobId
     if (backgroundControl && background) backgroundControl.jobId = jobId
     if (backgroundControl && !sm) {
@@ -892,6 +894,7 @@ export async function handleDelegateTask(
         await this._persistSendToAgentIntent(intent)
       } catch (err) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
+        if (backgroundControl) backgroundDelegates(this).endJob(backgroundControl, jobId)
         store.complete(jobId, {
           httpStatus: 503,
           body: { error: 'background callback persistence unavailable' },
@@ -911,7 +914,7 @@ export async function handleDelegateTask(
     transferredBackground = background
     void this._runDelegateTask(runInput)
       .then((result) => {
-        if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+        if (runInput._leaseTimer && !backgroundControl) clearInterval(runInput._leaseTimer)
         if (backgroundControl?.signal.aborted && result.kind === 'completed') result.cancelled = true
         const mapped = this._delegateResultToHttp(result, targetAgentId)
         if (backgroundControl && result.kind === 'completed' && result.cancelled) mapped.body.cancelled = true
@@ -951,6 +954,7 @@ export async function handleDelegateTask(
           store.complete(jobId, mapped)
           winner = true
         }
+        if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
         if (!winner) return
         flushBackgroundCompletion(runInput)
         const output = result.kind === 'completed' ? result.output : ''
@@ -1134,12 +1138,6 @@ export async function handleDelegateWait(
   })
 }
 
-function flushBackgroundCompletion(input: RunDelegateInput): void {
-  const actions = input.backgroundCompletionActions
-  input.backgroundCompletionActions = undefined
-  for (const publish of actions ?? []) publish()
-}
-
 export async function _runDelegateTask(
   this: DelegateRuntimeHost,
   input: RunDelegateInput,
@@ -1181,7 +1179,8 @@ export async function _runDelegateTask(
     if (err instanceof TaskboardCancelledError) return { kind: 'rejected', httpStatus: 409, message: err.message, failureClass: 'cancelled', cancelled: true }
     throw err
   } finally {
-    if (input._leaseTimer) clearInterval(input._leaseTimer)
+    if (input.backgroundControl) input._backgroundCleanupPending = true
+    if (input._leaseTimer && !input.backgroundControl) clearInterval(input._leaseTimer)
     try {
       this._releasePreadmittedDelegateCapacity(input)
       await input.backgroundControl?.waitForCleanup()
@@ -1194,6 +1193,7 @@ export async function _runDelegateTask(
       }
       detachStop?.()
       leave?.()
+      if (input.backgroundControl && input.backgroundJobId) backgroundDelegates(this).endJob(input.backgroundControl, input.backgroundJobId)
       if (input.backgroundControl && input.backgroundControl.jobId === input.backgroundJobId) {
         backgroundDelegates(this).finish(input.backgroundControl)
       }
@@ -1776,10 +1776,11 @@ export async function _runDelegateTaskCore(
     let beats = 0
     const timer = setInterval(() => {
       beats += 1
-      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
-      const ok = !capHit && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
-      if (!ok) {
-        clearInterval(timer)
+      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS && !input._backgroundCleanupPending && !input.backgroundControl?.signal.aborted
+      const ok = (!capHit || !!input.backgroundControl) && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
+      if (capHit || !ok) {
+        if (capHit && input.backgroundControl) input._backgroundCleanupPending = true
+        if (!input.backgroundControl || !ok) clearInterval(timer)
         // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
         // `input.sessionKey` is optional and must not be passed to interrupt().
         if (!sessionKey) {
@@ -2061,9 +2062,9 @@ export async function _runDelegateTaskCore(
       },
     })
     session = await (input.backgroundControl?.wait(creatingSession,
-      () => this.sessions.destroySession(sessionKey)) ?? creatingSession)
+      () => this.sessions.destroySession(sessionKey, { strictCleanup: true })) ?? creatingSession)
     if (executionControl?.signal.aborted) {
-      await this.sessions.destroySession(sessionKey)
+      await this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined)
       return cancelPreparation(grokRouteLease, engineBillingAdmission)
     }
     hooks?.onSessionSpawned?.()
@@ -2201,7 +2202,7 @@ export async function _runDelegateTaskCore(
   if (executionControl?.signal.aborted) {
     clearTimeoutTimer()
     detachAncestorActivity?.()
-    await this.sessions.destroySession(sessionKey)
+    await this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined)
     return cancelPreparation(grokRouteLease, engineBillingAdmission)
   }
   const submitPromise = this.sessions.submit(
@@ -2331,6 +2332,7 @@ export async function _runDelegateTaskCore(
       ...(verdict ? { verdict } : {}),
     })
   } catch (err: any) {
+    if (input.backgroundControl) input._backgroundCleanupPending = true
     error = error || err?.message || String(err)
     if (err?.name === 'DelegateTimeoutError') {
       timedOut = true
@@ -2430,6 +2432,7 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
+    if (input.backgroundControl) input._backgroundCleanupPending = true
     await executionControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()
@@ -2504,7 +2507,7 @@ export async function _runDelegateTaskCore(
     // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
     // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
     if (!input.resumable) {
-      const destroy = this.sessions.destroySession(sessionKey).catch((err) =>
+      const destroy = this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined).catch((err) =>
         this.log.warn('delegate session destroy failed', { sessionKey, err: String(err) }),
       )
       if (input.taskboardControl || input.backgroundControl) await destroy

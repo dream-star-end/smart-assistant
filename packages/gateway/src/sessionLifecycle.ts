@@ -57,6 +57,45 @@ export interface SessionLifecycleHost {
   submit: SessionManager['submit']
 }
 
+export interface SessionCleanupOptions { strictCleanup?: boolean }
+
+// Failed strict cleanup retains both the session and its proof obligation.
+// Concurrent retire/destroy callers share one attempt; later retries may only
+// delete the captured session after shutdown, stdout-close and mux release ACK.
+const strictSessionCleanups = new WeakMap<AgentSession, { pending?: Promise<void>; acknowledged?: boolean }>()
+
+async function prepareStrictSessionCleanup(host: SessionLifecycleHost, session: AgentSession): Promise<void> {
+  let state = strictSessionCleanups.get(session)
+  if (!state) { state = {}; strictSessionCleanups.set(session, state) }
+  if (state.acknowledged) return
+  if (!state.pending) {
+    const attempt = (async () => {
+      host.markPlannedServiceRestart(session)
+      await session.runner.shutdown()
+      await session.runner.waitForOutputDrain()
+      await host._flushTailFolding(session)
+      if (session.executionTarget.kind === 'remote') {
+        if (!session.userId || !host._remoteTargetController?.releaseMuxConfirmed) {
+          throw new Error('strict remote session cleanup requires an authenticated release ACK controller')
+        }
+        await host._remoteTargetController.releaseMuxConfirmed(session.sessionKey, session.userId, session.executionTarget.hostId)
+      }
+      state!.acknowledged = true
+    })()
+    state.pending = attempt
+    void attempt.finally(() => { if (state!.pending === attempt) state!.pending = undefined }).catch(() => {})
+  }
+  await state.pending
+}
+
+/** Unknown cleanup stays pending; Stop must not turn a failed ACK into success. */
+export async function waitForStrictSessionCleanup(work: () => Promise<void>, onRetry: (error: unknown) => void): Promise<void> {
+  for (;;) {
+    try { await work(); return } catch (error) { onRetry(error) }
+    await new Promise<void>(resolve => setTimeout(resolve, 250))
+  }
+}
+
 /** Background idle drain re-arms while proof stays pending (egress settling). */
 const IDLE_DRAIN_RETRIES = 6
 
@@ -366,6 +405,7 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
         const now = Date.now()
         const toEvict: string[] = []
         for (const [key, s] of this.sessions) {
+          if (strictSessionCleanups.has(s)) continue
           const isTempSession = isTempSessionKey(key)
           const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
           const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
@@ -381,6 +421,7 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
             this.markPlannedServiceRestart(s)
             await s.runner.shutdown()
           } catch {}
+          if (strictSessionCleanups.has(s) || this.sessions.get(key) !== s) continue
           // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态。
           await this._flushTailFolding(s)
           // 释放 remote mux refcount(若为 remote)—— 与 destroySession 语义一致
@@ -389,6 +430,9 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
               ?.releaseMux(key, s.userId, s.executionTarget.hostId)
               .catch((err) => log.warn('evict releaseMux failed', { key, err: String(err) }))
           }
+          // A strict retire may have started while this legacy eviction was
+          // awaiting shutdown/release. Never discard its pending ACK evidence.
+          if (strictSessionCleanups.has(s) || this.sessions.get(key) !== s) continue
           this.sessions.delete(key)
           // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目)。
           this._sessionIdToKey.delete(s.peerId)
@@ -473,23 +517,33 @@ export async function shutdownAll(this: SessionLifecycleHost): Promise<void> {
 export async function destroySession(
   this: SessionLifecycleHost,
   sessionKey: string,
+  options?: SessionCleanupOptions,
 ): Promise<void> {
   const s = this.sessions.get(sessionKey)
   if (s) {
-    // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
-    //  闭包链整体可 GC,无需再显式卸 'message' listener。)
-    this.markPlannedServiceRestart(s)
-    await s.runner.shutdown()
-    // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态(await 持久化链)。
-    await this._flushTailFolding(s)
-    // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
-    // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
-    if (s.executionTarget.kind === 'remote' && s.userId) {
-      await this._remoteTargetController
-        ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
-        .catch((err) =>
-          log.warn('destroySession releaseMux failed', { sessionKey, err: String(err) }),
-        )
+    if (options?.strictCleanup || strictSessionCleanups.has(s)) {
+      await prepareStrictSessionCleanup(this, s)
+      if (this.sessions.get(sessionKey) !== s) return
+    } else {
+      // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
+      //  闭包链整体可 GC,无需再显式卸 'message' listener。)
+      this.markPlannedServiceRestart(s)
+      await s.runner.shutdown()
+      // A1:底座已停产出,flush 折叠 tail 的 pending 并清定时器/状态(await 持久化链)。
+      await this._flushTailFolding(s)
+      // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
+      // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('destroySession releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
+    }
+    if (strictSessionCleanups.has(s)) {
+      await prepareStrictSessionCleanup(this, s)
+      if (this.sessions.get(sessionKey) !== s) return
     }
     this.sessions.delete(sessionKey)
     // Phase 5:同步清 peer→sessionKey 反查索引(避免悬挂条目让后续 recycle 找到死 session)。
@@ -521,26 +575,36 @@ export async function destroySession(
 export async function retireKeepResume(
   this: SessionLifecycleHost,
   sessionKey: string,
+  options?: SessionCleanupOptions,
 ): Promise<void> {
   const s = this.sessions.get(sessionKey)
   if (s) {
-    try {
-      this.markPlannedServiceRestart(s)
-      await s.runner.shutdown()
-    } catch (err) {
-      log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+    if (options?.strictCleanup || strictSessionCleanups.has(s)) {
+      await prepareStrictSessionCleanup(this, s)
+      if (this.sessions.get(sessionKey) !== s) return
+    } else {
+      try {
+        this.markPlannedServiceRestart(s)
+        await s.runner.shutdown()
+      } catch (err) {
+        log.warn('retireKeepResume shutdown failed', { sessionKey }, err)
+      }
+      try {
+        await this._flushTailFolding(s)
+      } catch (err) {
+        log.warn('retireKeepResume flush failed', { sessionKey }, err)
+      }
+      if (s.executionTarget.kind === 'remote' && s.userId) {
+        await this._remoteTargetController
+          ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
+          .catch((err) =>
+            log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
+          )
+      }
     }
-    try {
-      await this._flushTailFolding(s)
-    } catch (err) {
-      log.warn('retireKeepResume flush failed', { sessionKey }, err)
-    }
-    if (s.executionTarget.kind === 'remote' && s.userId) {
-      await this._remoteTargetController
-        ?.releaseMux(sessionKey, s.userId, s.executionTarget.hostId)
-        .catch((err) =>
-          log.warn('retireKeepResume releaseMux failed', { sessionKey, err: String(err) }),
-        )
+    if (strictSessionCleanups.has(s)) {
+      await prepareStrictSessionCleanup(this, s)
+      if (this.sessions.get(sessionKey) !== s) return
     }
     this.sessions.delete(sessionKey)
     this._sessionIdToKey.delete(s.peerId)

@@ -41,7 +41,6 @@ import {
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { QueuedSendList } from "./components/chat/QueuedSendList";
-import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
@@ -241,6 +240,8 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+// Snapshot polling and Stop stay synchronous; the HUD is only needed once jobs exist.
+const PinnedDelegateTracker = lazy(() => import("./components/chat/PinnedDelegateTracker").then((m) => ({ default: m.PinnedDelegateTracker })));
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
@@ -2534,13 +2535,15 @@ export function App() {
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
-          {!demo && !gated && (
-            <PinnedDelegateTracker
-              items={visibleBackgroundDelegateItems(inflightDelegates.items, wsMessages)}
-              onDismiss={inflightDelegates.dismiss}
-              // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
-              onStop={backgroundJobIds.length === 0 && wsSending ? stopTurn : undefined}
-            />
+          {!demo && !gated && inflightDelegates.items.length > 0 && (
+            <LazyBoundary fallback={null}>
+              <PinnedDelegateTracker
+                items={visibleBackgroundDelegateItems(inflightDelegates.items, wsMessages)}
+                onDismiss={inflightDelegates.dismiss}
+                // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
+                onStop={backgroundJobIds.length === 0 && wsSending ? stopTurn : undefined}
+              />
+            </LazyBoundary>
           )}
           {!demo && !gated && (
             <div

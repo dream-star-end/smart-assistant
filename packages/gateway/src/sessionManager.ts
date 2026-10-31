@@ -195,7 +195,7 @@ import { type TurnRunnerHost, _runOneTurn as _runOneTurnImpl, runOneTurnWithRetr
 import { type SessionSubmitHost, submit as submitImpl, _getOrCreateExclusive as _getOrCreateExclusiveImpl, getOrCreate as getOrCreateImpl, finishIdleUnderLock as finishIdleUnderLockImpl, recordExternalTurn as recordExternalTurnImpl, beginExternalTurn as beginExternalTurnImpl, _resumeIdFor as _resumeIdForImpl, _resolveDurableResumeId as _resolveDurableResumeIdImpl } from './sessionSubmit.js'
 import { type SessionTailHost, _persistTailBatch as _persistTailBatchImpl, _dispatchPostTerminalRuntimeEvent as _dispatchPostTerminalRuntimeEventImpl, _foldPostTerminalTail as _foldPostTerminalTailImpl, _drainTailFolding as _drainTailFoldingImpl, _drainTailPersistQueue as _drainTailPersistQueueImpl, _buildTailCapMarker as _buildTailCapMarkerImpl, _scheduleTailPersistWorker as _scheduleTailPersistWorkerImpl, _chainTailPersist as _chainTailPersistImpl, _trackPersistence as _trackPersistenceImpl, _warnMissingPostTerminalOwner as _warnMissingPostTerminalOwnerImpl } from './sessionTail.js'
 import { type SessionAgentGroupsHost, deliverLateDelegateAgentGroup as deliverLateDelegateAgentGroupImpl, bufferPendingAgentGroup as bufferPendingAgentGroupImpl, drainPendingAgentGroups as drainPendingAgentGroupsImpl, _settleDrainedOwnerGroups as _settleDrainedOwnerGroupsImpl, _claimDrainedOwnerGroups as _claimDrainedOwnerGroupsImpl, _sealOwnerTurn as _sealOwnerTurnImpl, _runOnOwnerChain as _runOnOwnerChainImpl, _admitExactOwnerRun as _admitExactOwnerRunImpl, _matchLiveSessionsOwnerRun as _matchLiveSessionsOwnerRunImpl, _matchLiveOwnerRun as _matchLiveOwnerRunImpl, _trimExactOwnerRuns as _trimExactOwnerRunsImpl } from './sessionAgentGroups.js'
-import { type SessionLifecycleHost, preheatRunner as preheatRunnerImpl, recyclePeerForRepoChange as recyclePeerForRepoChangeImpl, recyclePeerForRepoUnbind as recyclePeerForRepoUnbindImpl, startEvictionLoop as startEvictionLoopImpl, shutdownAll as shutdownAllImpl, destroySession as destroySessionImpl, retireKeepResume as retireKeepResumeImpl, scheduleIdleDrain as scheduleIdleDrainImpl, applyIdleResetIfRequested as applyIdleResetIfRequestedImpl, _ccbJsonlExists as _ccbJsonlExistsImpl, _cursorWorkspacePath as _cursorWorkspacePathImpl, setExecutionTarget as setExecutionTargetImpl, prepareModelSwitch as prepareModelSwitchImpl, armRuntimeRecycleDrain as armRuntimeRecycleDrainImpl } from './sessionLifecycle.js'
+import { type SessionLifecycleHost, type SessionCleanupOptions, waitForStrictSessionCleanup, preheatRunner as preheatRunnerImpl, recyclePeerForRepoChange as recyclePeerForRepoChangeImpl, recyclePeerForRepoUnbind as recyclePeerForRepoUnbindImpl, startEvictionLoop as startEvictionLoopImpl, shutdownAll as shutdownAllImpl, destroySession as destroySessionImpl, retireKeepResume as retireKeepResumeImpl, scheduleIdleDrain as scheduleIdleDrainImpl, applyIdleResetIfRequested as applyIdleResetIfRequestedImpl, _ccbJsonlExists as _ccbJsonlExistsImpl, _cursorWorkspacePath as _cursorWorkspacePathImpl, setExecutionTarget as setExecutionTargetImpl, prepareModelSwitch as prepareModelSwitchImpl, armRuntimeRecycleDrain as armRuntimeRecycleDrainImpl } from './sessionLifecycle.js'
 // Moved to ./sessionTypes.js (FINDINGS §7.6, OCV5-480); re-exported for existing importers.
 export type { AgentSession } from './sessionTypes.js'
 import type { AgentSession } from './sessionTypes.js'
@@ -2466,8 +2466,10 @@ export class SessionManager {
 
   /** Destroy a single session: kill subprocess + remove from map + clear resume mapping.
    *  Also clears resume-map even if the session was already evicted from memory. */
-  destroySession(sessionKey: string): Promise<void> {
-    return destroySessionImpl.call(this as unknown as SessionLifecycleHost, sessionKey)
+  destroySession(sessionKey: string, options?: SessionCleanupOptions): Promise<void> {
+    const destroy = () => destroySessionImpl.call(this as unknown as SessionLifecycleHost, sessionKey, options)
+    return options?.strictCleanup ? waitForStrictSessionCleanup(destroy,
+      error => log.warn('strict session destroy pending cleanup ACK', { sessionKey, err: String(error) })) : destroy()
   }
 
   /**
@@ -2475,8 +2477,8 @@ export class SessionManager {
    * later getOrCreate(sessionKey) can native-resume. Awaited by resumable
    * delegate_task; fire-and-forget destroySession remains the one-shot path.
    */
-  retireKeepResume(sessionKey: string): Promise<void> {
-    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey)
+  retireKeepResume(sessionKey: string, options?: SessionCleanupOptions): Promise<void> {
+    return retireKeepResumeImpl.call(this as unknown as SessionLifecycleHost, sessionKey, options)
   }
 
   hasLiveSession(sessionKey: string): boolean {

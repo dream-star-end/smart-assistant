@@ -154,6 +154,8 @@ export interface RunDelegateInput {
   capacitySlotOpts?: { parentBucketKey?: string; isReview?: boolean }
   idempotencyKey?: string
   _leaseTimer?: ReturnType<typeof setInterval>
+  /** Internal: model execution ended; cleanup ACK still owns the live lease. */
+  _backgroundCleanupPending?: boolean
 }
 
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────

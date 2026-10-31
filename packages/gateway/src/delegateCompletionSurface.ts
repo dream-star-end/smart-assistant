@@ -2,6 +2,13 @@ import { isDelegateTerminalState, type DurableAgentGroup } from '@openclaude/pro
 import { DelegateInflightSurfaceStore } from './delegateInflightSurface.js'
 import { isDelegateInflightSurfaceEffective } from './delegateSmFlag.js'
 import type { DelegateSupervisionHost } from './delegateSupervision.js'
+import type { RunDelegateInput } from './delegatePolicy.js'
+
+export function flushBackgroundCompletion(input: RunDelegateInput): void {
+  const actions = input.backgroundCompletionActions
+  input.backgroundCompletionActions = undefined
+  for (const publish of actions ?? []) publish()
+}
 
 /** Legacy completion folds inline; background callers invoke this only after
  * full cleanup and the job's terminal CAS. A completed model is not a retired job. */

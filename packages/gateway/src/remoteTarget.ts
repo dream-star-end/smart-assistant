@@ -55,6 +55,10 @@ export type ExecutionTarget =
 export interface RemoteTargetController {
   acquireMux(sessionId: string, userId: string, hostId: string): Promise<RemoteMuxHandle>
   releaseMux(sessionId: string, userId: string, hostId: string): Promise<void>
+  /** Strict cleanup ACK: reject on unknown/failed release, retaining retry
+   * evidence until this session's reference and any last-holder mux are gone.
+   * A registry entry lost by legacy release is not evidence of remote closure. */
+  releaseMuxConfirmed?(sessionId: string, userId: string, hostId: string): Promise<void>
 }
 
 /** Gateway 层 sentinel:切 remote 但 controller 未注入(commercial 关着 / personal 版) */

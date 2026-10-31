@@ -178,5 +178,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install ripgrep for CLI policy tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Run test:mcp-memory
         run: npm run test:mcp-memory

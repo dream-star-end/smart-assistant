@@ -265,6 +265,8 @@ export type DelegateJobStoreOptions = {
   hydrate?: boolean
   /** Fired after a successful terminal persist so resume occupancy can release. */
   onTerminal?: (job: DelegateJobSnapshot) => void
+  /** Local live owners defer terminal writers and ownership handoff until cleanup ACK. */
+  canCommitTerminal?: (job: DelegateJobSnapshot) => boolean
   /** Fired after a queue-full / unclaimed row is deleted so projections can drop. */
   onDrop?: (job: DelegateJobSnapshot) => void
 }
@@ -352,6 +354,7 @@ export class DelegateJobStore {
   private readonly leaseMs: number
   private readonly durable: DelegateDurableDb | null
   private readonly onTerminal?: (job: DelegateJobSnapshot) => void
+  private readonly canCommitTerminal?: (job: DelegateJobSnapshot) => boolean
   private readonly onDrop?: (job: DelegateJobSnapshot) => void
   /**
    * Phase F: stop new claimQueued/spawn. Queued rows stay queued.
@@ -380,6 +383,7 @@ export class DelegateJobStore {
     this.leaseMs = opts.leaseMs ?? 45_000
     this.durable = opts.durable ?? null
     this.onTerminal = opts.onTerminal
+    this.canCommitTerminal = opts.canCommitTerminal
     this.onDrop = opts.onDrop
     if (this.durable && opts.hydrate !== false) this.hydrateFromDurable()
   }
@@ -756,6 +760,7 @@ export class DelegateJobStore {
   ): DelegateJobSnapshot | undefined {
     const job = this.refreshJob(jobId)
     if (!job) return undefined
+    if (this.canCommitTerminal?.(this.snapshot(job)) === false) return undefined
     if (!['queued', 'running', 'paused_for_cutover'].includes(job.state)) return undefined
     if (job.fencingEpoch !== expectedEpoch) return undefined
     if (nextState === 'queued' && job.state === 'queued') {
@@ -842,6 +847,7 @@ export class DelegateJobStore {
   ): DelegateJobSnapshot | undefined {
     const job = this.refreshJob(jobId)
     if (!job || job.state !== 'running') return undefined
+    if (this.canCommitTerminal?.(this.snapshot(job)) === false) return undefined
     if (job.claimToken !== args.claimToken || job.fencingEpoch !== args.fencingEpoch) return undefined
     const gate = assertDelegateTransition('running', 'paused_for_cutover')
     if (!gate.ok) return undefined
@@ -1842,6 +1848,8 @@ export class DelegateJobStore {
   private commit(live: JobEntry, draft: JobEntry, wake: boolean): boolean {
     const becomingTerminal =
       isDelegateTerminalState(draft.state) && !isDelegateTerminalState(live.state)
+    if ((becomingTerminal || (!live.result && draft.result)) &&
+        this.canCommitTerminal?.(this.snapshot(live)) === false) return false
     if (!this.persistUpdate(live, draft)) {
       this.refreshJob(live.id)
       return false

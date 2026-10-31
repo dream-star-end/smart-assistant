@@ -28,6 +28,7 @@ export function freezeBackgroundDelegateOwner(
 ): BackgroundDelegateOwner | undefined {
   if (!isDelegateBackgroundEffective() || !getV3MasterSinkOrNull() || !claims || !parent ||
       claims.depth !== 0 || parent.channel !== 'webchat' || parent.sessionKey !== claims.sessionKey ||
+      parent.executionTarget?.kind === 'remote' ||
       parent.agentId !== claims.agentId || !claims.traceId || claims.traceId !== parent._currentTurnTraceId ||
       !parent._currentTurnKey || !parent._runningClientMessageId || !parent.userId) return undefined
   return {
@@ -144,6 +145,7 @@ export class BackgroundDelegateScope {
 
 class BackgroundDelegateRegistry {
   readonly scopes = new Set<BackgroundDelegateScope>()
+  private readonly jobCleanups = new Map<string, BackgroundDelegateScope>()
   private readonly retiredSessions = new Map<string, { expires: number; scope: BackgroundDelegateScope }>()
   private readonly stopSnapshots = new Map<string, { expires: number; scopes: Set<BackgroundDelegateScope> }>()
   private readonly closedOwners = new Map<string, number>()
@@ -160,6 +162,11 @@ class BackgroundDelegateRegistry {
     this.scopes.add(scope)
     return scope
   }
+  beginJob(scope: BackgroundDelegateScope, jobId: string): void { this.jobCleanups.set(jobId, scope) }
+  endJob(scope: BackgroundDelegateScope, jobId: string): void {
+    if (this.jobCleanups.get(jobId) === scope) this.jobCleanups.delete(jobId)
+  }
+  ownsActiveJob(jobId: string): boolean { return this.jobCleanups.has(jobId) }
   forSession(key: string): BackgroundDelegateScope | undefined {
     const active = [...this.scopes].find(scope => scope.members.get(key)?.active)
     if (active) return active
@@ -170,6 +177,7 @@ class BackgroundDelegateRegistry {
   }
   finish(scope: BackgroundDelegateScope): void {
     this.scopes.delete(scope)
+    for (const [jobId, owner] of this.jobCleanups) if (owner === scope) this.jobCleanups.delete(jobId)
     for (const [key] of scope.members) {
       this.retiredSessions.set(key, { expires: Date.now() + DELEGATE_CONTEXT_TTL_MS, scope })
     }
