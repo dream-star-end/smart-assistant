@@ -9,7 +9,7 @@
  *  - toolChangedFileCount:一组消息里改到的不同文件数(过程摘要上的「改动 N 个文件」)。
  */
 import type { ChatMessage } from "../../lib/chat/model";
-import { asArr, asStr, detectShellFileWrites, normalizeToolForDisplay, stripShellWrapperForDisplay } from "../tool/format";
+import { asArr, asStr, detectShellFileWrites, isContextCompactionMessage, normalizeToolForDisplay, stripShellWrapperForDisplay } from "../tool/format";
 import { diffLines } from "../tool/lineDiff";
 import { resolveToolStatus } from "../tool/status";
 
@@ -18,9 +18,10 @@ export type PaneStep = { message: ChatMessage; turnIndex: number };
 /**
  * 「一步」的唯一口径:一次顶层工具调用。右栏步骤列表 / 本轮「N 步」与聊天过程条「已执行 N 个步骤」
  * 都按它数(OCV5-640);思考、计划、子任务、问答只进过程条的分类小计,不算步。
+ * 后台整理上下文只留一条淡灰记录,不算步。
  */
 export function isPaneStep(message: ChatMessage): boolean {
-  return message.role === "tool";
+  return message.role === "tool" && !isContextCompactionMessage(message);
 }
 
 export type PaneTurn = {

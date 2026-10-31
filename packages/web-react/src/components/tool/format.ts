@@ -83,6 +83,16 @@ export function parseCodexTypeName(name: string | undefined | null): string | nu
   return null;
 }
 
+/** Codex 自动整理上下文的工具行。过程里它不是一步工具调用。 */
+export function isContextCompactionMessage(message: { toolName?: string | null }): boolean {
+  const name = message.toolName ?? "";
+  return (
+    parseCodexTypeName(name) === "contextCompaction" ||
+    name === "contextCompaction" ||
+    name === "context_compaction"
+  );
+}
+
 function asPlainObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }

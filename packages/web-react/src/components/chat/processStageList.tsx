@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
+import { QuietContextNote } from "./QuietContextNote";
 import type { CardCallbacks } from "./cards";
 import type { DisplayTokenUsage } from "./tokenUsage";
 import {
@@ -42,6 +43,7 @@ import {
   hasErrorMark,
   humanStepTitle,
   isClearedGoalRecord,
+  isContextCompactionMessage,
   isDelegateRow,
   isErroredAssistant,
   normalizeToolForDisplay,
@@ -412,6 +414,15 @@ export function ProcessStageList<T>({
     <>
             {sections.map((section, index) => {
               const isLastSection = index === sections.length - 1;
+              if (section.quiet) {
+                const message = section.messages.find(isContextCompactionMessage);
+                if (!message) return null;
+                return (
+                  <div key={section.key} className="py-0.5 pl-9" data-testid="process-quiet-context">
+                    <QuietContextNote message={message} />
+                  </div>
+                );
+              }
               if (section.card) {
                 // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
                 // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。

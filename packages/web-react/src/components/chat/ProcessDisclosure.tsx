@@ -5,7 +5,7 @@ import { agentTerminalStatus } from "../../lib/chat/render";
 import { agentDisplayName } from "./agentNames";
 import { STATUS } from "../../lib/ui/statusTone";
 import { ProgressiveMarkdown, RecoveredStepContext, type CardCallbacks } from "./cards";
-import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
+import { isContextCompactionMessage, normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, humanStepTitle, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
@@ -18,8 +18,9 @@ import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimings
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
 import { cn } from "../../lib/utils";
-import { toolChangedFileCount } from "./workPane";
+import { isPaneStep, toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
+import { QuietContextNote } from "./lazyQuietContext";
 
 // 展开时间轴只从外壳拿这些符号。懒块若直接 import cards / meta / status,
 // rolldown 会把它们和 api+protocol 重新并进首屏 styles 块。
@@ -33,6 +34,7 @@ export {
   combineStepTimings,
   formatStepDuration,
   humanStepTitle,
+  isContextCompactionMessage,
   normalizeToolForDisplay,
   resolveToolMeta,
   resolveToolStatus,
@@ -544,6 +546,7 @@ function commandHead(message: ChatMessage): string {
 }
 
 export function countLabel(message: ChatMessage): string {
+  if (isContextCompactionMessage(message)) return "";
   if (message.role === "tool") {
     const tool = (message.toolName ?? "").toLowerCase();
     const head = commandHead(message).toLowerCase();
@@ -591,6 +594,7 @@ const KIND_PHRASE: Record<string, (n: number) => string> = {
 };
 
 export function workKind(message: ChatMessage): string {
+  if (isContextCompactionMessage(message)) return "";
   if (message.role === "agent-group" || message.role === "delegate-progress") return "sub";
   if (message.role === "thinking") return "think";
   if (message.role !== "tool" || PROMPT_CARD_TOOLS.has(message.toolName ?? "")) return "";
@@ -685,6 +689,8 @@ export type ProcessSection<T> = {
   goal: boolean;
   /** Full cards on the rail (answered prompts, recovered errors): always visible, never behind a count toggle. */
   card?: boolean;
+  /** 后台整理上下文:一条淡灰记录,不并进工具步骤组,不计步骤。 */
+  quiet?: boolean;
   items: T[];
   messages: ChatMessage[];
 };
@@ -700,12 +706,28 @@ export function processSections<T>(
     const card = messages.length > 0 && messages.every(isProcessCardMessage);
     const narrative = !card && messages.length > 0 && messages.every((message) => message.role === "assistant");
     const goal = !narrative && !card && messages.length > 0 && messages.every((message) => isHistoricalGoalRecord(message));
+    const quiet =
+      !narrative &&
+      !goal &&
+      !card &&
+      messages.length > 0 &&
+      messages.every((message) => isContextCompactionMessage(message));
     const previous = sections.at(-1);
-    if (!narrative && !goal && !card && previous && !previous.narrative && !previous.goal && !previous.card) {
+    if (
+      !narrative &&
+      !goal &&
+      !card &&
+      !quiet &&
+      previous &&
+      !previous.narrative &&
+      !previous.goal &&
+      !previous.card &&
+      !previous.quiet
+    ) {
       previous.items.push(item);
       previous.messages.push(...messages);
     } else {
-      sections.push({ key: keyOf(item), narrative, goal, card, items: [item], messages: [...messages] });
+      sections.push({ key: keyOf(item), narrative, goal, card, quiet, items: [item], messages: [...messages] });
     }
   }
   return sections;
@@ -1107,7 +1129,7 @@ export function ProcessDisclosure<T>({
   // take the current-stage identity from the work still in progress.
   let currentIndex = -1;
   for (let i = sections.length - 1; i >= 0; i -= 1) {
-    if (!sections[i]?.goal && !sections[i]?.card) {
+    if (!sections[i]?.goal && !sections[i]?.card && !sections[i]?.quiet) {
       currentIndex = i;
       break;
     }
@@ -1117,7 +1139,7 @@ export function ProcessDisclosure<T>({
   const openPane = useArtifactInspect().openPane;
   const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
   const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
-  const hasToolRows = processRows.some((message) => message.role === "tool");
+  const hasToolRows = processRows.some((message) => isPaneStep(message));
   const elapsedValid = active && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt > 0;
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
@@ -1224,6 +1246,16 @@ export function ProcessDisclosure<T>({
         </button>
       ) : null}
       </div>
+      {!open && sections.some((section) => section.quiet) ? (
+        <div className="space-y-0.5 pb-0.5 pl-1.5" data-testid="process-quiet-context">
+          {sections.map((section) => {
+            if (!section.quiet) return null;
+            const message = section.messages.find(isContextCompactionMessage);
+            if (!message) return null;
+            return <QuietContextNote key={section.key} message={message} />;
+          })}
+        </div>
+      ) : null}
       {/* 收起时不挂任何隐藏水合节点:>1 MiB 定位桩的正文只在展开(本层或阶段详情)后按原规则
           取——尾部直接取,其余进视口 600px 再取。此前收起态也会把首屏尾部的定位桩塞进 1px
           隐藏容器立即下载并整段渲染,看不见却付全部流量与解析成本。 */}

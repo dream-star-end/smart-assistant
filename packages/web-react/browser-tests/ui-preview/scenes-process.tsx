@@ -138,6 +138,33 @@ function List({ messages, sending }: { messages: ChatMessage[]; sending: boolean
   )
 }
 
+function quietContextTurn(): ChatMessage[] {
+  seq = 0
+  return [
+    msg({ id: 'u-q', role: 'user', text: '继续把这份长文改完。', status: 'replied' }, 180),
+    bash('q-b1', 'wc -l draft.md', '1820 draft.md', {}, 150),
+    msg(
+      {
+        id: 'q-compact',
+        role: 'tool',
+        text: '',
+        toolName: 'codex:contextCompaction',
+        inputJson: { type: 'contextCompaction', id: 'ctx1' },
+        output: JSON.stringify({
+          type: 'contextCompaction',
+          id: 'ctx1',
+          tokensBefore: 182000,
+          tokensAfter: 61000,
+        }),
+        _completed: true,
+      },
+      90,
+    ),
+    bash('q-b2', 'git diff --stat', ' draft.md | 12 +-', {}, 40),
+    msg({ id: 'a-q', role: 'assistant', text: '已改完，开头的背景段收短了。' }, 10),
+  ]
+}
+
 export const processScenes: Scene[] = [
   {
     id: 'process-live',
@@ -166,5 +193,13 @@ export const processScenes: Scene[] = [
         <List messages={doneTurn()} sending={false} />
       </Clicker>
     ),
+  },
+  {
+    id: 'process-quiet-context',
+    label: '处理过程 · 后台整理只留淡灰一行',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: {},
+    render: () => <List messages={quietContextTurn()} sending={false} />,
   },
 ]

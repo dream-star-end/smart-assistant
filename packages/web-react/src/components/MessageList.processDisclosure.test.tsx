@@ -8,9 +8,11 @@ import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkele
 import { workSummary } from "./chat/ProcessDisclosure";
 import { collectPaneSteps } from "./chat/workPane";
 import { MessageList } from "./MessageRenderer";
+import { TooltipProvider } from "./ui/Tooltip";
 import { ArtifactInspectContext } from "./tool/context";
 import { preloadTimelineCards } from "./chat/lazyTimelineCards";
 import { preloadProcessStages } from "./chat/lazyProcessStages";
+import { preloadQuietContext } from "./chat/lazyQuietContext";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 import { prefetchMarkdownImpl } from "./Markdown";
@@ -22,6 +24,7 @@ loadBeforeAll(prefetchMarkdownImpl);
 loadBeforeAll(preloadToolBody);
 loadBeforeAll(preloadTimelineCards);
 loadBeforeAll(preloadProcessStages);
+loadBeforeAll(preloadQuietContext);
 
 afterEach(() => {
   cleanup();
@@ -3133,4 +3136,65 @@ test("a manually continued diagnostic-only error does not become a saved answer"
   expect(screen.queryByText(/PRIVATE_DIAGNOSTIC|MODEL_AUTHORITY_INVALID/)).toBeNull();
   expect(screen.queryByRole("alert")).toBeNull();
   expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("上下文整理是淡灰单行，不计入工具步骤和小计", async () => {
+  const messages = [
+    row("u1", "user", "继续改长文", { status: "replied" }),
+    row("bash-1", "tool", "终端", {
+      _clientMessageId: "u1",
+      toolName: "Bash",
+      inputJson: { command: "wc -l draft.md" },
+      _completed: true,
+      output: "10",
+    }),
+    row("compact-1", "tool", "", {
+      _clientMessageId: "u1",
+      toolName: "codex:contextCompaction",
+      inputJson: { type: "contextCompaction", id: "ctx1" },
+      output: JSON.stringify({
+        type: "contextCompaction",
+        id: "ctx1",
+        tokensBefore: 12000,
+        tokensAfter: 7000,
+        note: "已压缩",
+      }),
+      _completed: true,
+    }),
+    row("answer-1", "assistant", "改完了", { _clientMessageId: "u1" }),
+  ];
+  render(
+    <TooltipProvider>
+      <MessageList
+        processDisclosure
+        messages={messages}
+        sending={false}
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />
+    </TooltipProvider>,
+  );
+  expect(collectPaneSteps(messages).steps).toHaveLength(1);
+  expect(collectPaneSteps(messages).steps[0]?.message.id).toBe("bash-1");
+  expect(workSummary([messages[1]!, messages[2]!])).toBe("运行了 1 条命令");
+  expect(workSummary([messages[2]!])).toBe("");
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令");
+  expect(screen.getByTestId("process-title").textContent ?? "").not.toMatch(/调用了|步/);
+  expect(screen.queryByTestId("process-tally")).not.toBeInTheDocument();
+  const note = screen.getByTestId("quiet-context-note");
+  expect(note).toHaveTextContent("已在后台整理较早的对话");
+  expect(note.closest("[data-testid=process-disclosure]")).not.toBeNull();
+  expect(screen.queryByText("压缩上下文")).not.toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("tokens before");
+  expect(document.body.textContent).not.toContain("tokens after");
+  fireEvent.focus(note);
+  const tip = await screen.findByRole("tooltip");
+  expect(tip).toHaveTextContent("对话较长，系统已自动整理较早内容，原始记录仍完整保存，不影响继续聊天。");
+  expect(tip).toHaveTextContent("整理前约 12,000 / 整理后约 7,000");
+
+  fireEvent.click(screen.getByTestId("process-toggle"));
+  expect(screen.getAllByTestId("quiet-context-note")).toHaveLength(1);
+  expect(screen.queryByText("压缩上下文")).not.toBeInTheDocument();
+  expect(screen.getByTestId("process-title")).toHaveTextContent("完成 · 运行了 1 条命令");
 });
