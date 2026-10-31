@@ -210,14 +210,19 @@ export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delega
   // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列。
   const verdict = reviewVerdictBadge(msg);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
-  const collapsed = userCollapsed ?? (!!msg._completed || isServerRow);
+  const collapsed = userCollapsed ?? (msg._backgroundDelegate === true || !!msg._completed || isServerRow);
   const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : [];
   const tokenUsage = delegateTokenUsage(msg);
   const terminalNoChildren = !running && children.length === 0;
   const bodyId = useId();
 
   return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
+    <div className={cn("rounded-lg border border-border bg-surface", msg._backgroundDelegate !== true && "animate-in")}>
+      {msg._backgroundDelegate === true && (
+        <div className="px-3.5 pt-2 text-caption text-faint" data-testid="background-delegate-record">
+          后台子任务 · {running ? "正在处理" : msg.cancelled ? "已停止" : "结果已返回"}
+        </div>
+      )}
       {/* 折叠开关暴露展开态(aria-expanded/aria-controls,与 DelegateProgressCard 一致)。 */}
       <button
         type="button"

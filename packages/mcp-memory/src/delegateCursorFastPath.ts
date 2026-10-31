@@ -1,12 +1,18 @@
 /**
  * Shared delegate fast path (originally introduced for Cursor): start the
- * gateway job asynchronously and keep polling inside the same tools/call.
- * At the engine deadline, retain stdout delivery through one aggregate CLI wait.
+ * gateway job asynchronously. An explicit background receipt releases the tool;
+ * otherwise keep polling inside the same tools/call and retain one aggregate CLI wait.
  *
  * Pure enough to unit-test with fake HTTP; index.ts only supplies POST/wait.
  * A transport or tool deadline is never the lifetime of a healthy child job.
  */
 import type { FanoutItemResult } from './delegateFanout.js'
+import {
+  formatDelegateBackground,
+  formatDelegateBackgroundFanout,
+  readDelegateBackgroundHandle,
+  type DelegateBackgroundHandle,
+} from './delegateBackground.js'
 
 export const DEFAULT_CURSOR_FAST_WAIT_MS = 45_000
 
@@ -290,9 +296,11 @@ export type FanoutCursorItem = FanoutItemResult & {
   running?: boolean
   deferred?: boolean
   jobId?: string
+  backgroundHandle?: DelegateBackgroundHandle
 }
 
 export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
+  if (items.some((item) => item.backgroundHandle)) return formatDelegateBackgroundFanout(items)
   const running = items.filter((it) => it.running && it.jobId)
   const done = items.filter((it) => !it.running)
   const header = `并行委派 ${items.length} 个子任务: ${done.length} 已完成 / ${running.length} 仍在运行。`
@@ -374,11 +382,11 @@ function startHandleFromBody(data: Record<string, unknown>): {
 export function interpretDelegateStartBody(
   statusCode: number,
   raw: string,
-): { jobId: string; sessionKey?: string; parentSessionKey?: string; parentTurnKey?: string } | { error: string } {
+): { jobId: string; sessionKey?: string; parentSessionKey?: string; parentTurnKey?: string } | DelegateBackgroundHandle | { error: string } {
   const data = parseJsonObject(raw)
   if (data) {
     const handle = startHandleFromBody(data)
-    if (handle) return handle
+    if (handle) return readDelegateBackgroundHandle(statusCode, data) ?? handle
   }
   if (statusCode < 200 || statusCode >= 300) {
     const err =
@@ -450,6 +458,7 @@ export type FormattedDelegateResult =
   | { kind: 'error'; text: string }
   | { kind: 'running'; text: string; jobId: string }
   | { kind: 'deferred'; text: string; jobId: string }
+  | { kind: 'background'; text: string; jobId: string; handle: DelegateBackgroundHandle }
 
 /** Apply the historical sync `/delegate` result mapping (success text / toolError). */
 export function formatDelegateHttpResult(
@@ -507,6 +516,9 @@ export async function runCursorDelegateFastPath(
   const started = await opts.transport.start()
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) return { kind: 'error', text: start.error }
+  if ('resultDelivery' in start && start.resultDelivery === 'background') {
+    return { kind: 'background', jobId: start.jobId, handle: start, text: formatDelegateBackground(start, opts.label) }
+  }
   let polled = false
   while (now() < deadline || !polled) {
     polled = true

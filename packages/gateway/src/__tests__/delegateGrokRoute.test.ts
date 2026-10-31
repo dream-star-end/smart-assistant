@@ -6,6 +6,7 @@
  */
 import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
+import { createServer } from 'node:http'
 import { describe, test } from 'node:test'
 
 import {
@@ -183,6 +184,48 @@ describe('acquireDelegateGrokRoute', () => {
     }
     assert.equal(releaseCalls, 2)
     assert.ok(warnings.some((msg) => msg.includes('delegate_grok_route_release_deferred')))
+  })
+
+  test('waitForAck waits for the real HTTP release response while legacy release still returns immediately', async () => {
+    let ack!: () => void
+    const delayedAck = new Promise<void>(resolve => { ack = resolve })
+    let receivedRelease!: () => void
+    const releaseReached = new Promise<void>(resolve => { receivedRelease = resolve })
+    let releaseCalls = 0
+    const token = 'c'.repeat(64)
+    const server = createServer((req, res) => {
+      req.resume()
+      res.setHeader('content-type', 'application/json')
+      if (req.url?.endsWith('/mint')) {
+        res.end(JSON.stringify({ baseUrl: BASE_URL, routeToken: token }))
+      } else if (req.url?.endsWith('/release')) {
+        releaseCalls++
+        receivedRelease()
+        void delayedAck.then(() => res.end(JSON.stringify({ ok: true })))
+      } else res.end(JSON.stringify({ ok: true }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    assert.ok(address && typeof address !== 'string')
+    try {
+      const acquired = await acquireDelegateGrokRoute({ modelId: 'grok-build', log: LOG,
+        env: { ...ENV, OPENCLAUDE_V3_MASTER_BASE_URL: `http://127.0.0.1:${address.port}` } })
+      assert.ok(acquired.ok)
+      await acquired.lease.release()
+      await releaseReached
+      let released = false
+      const waiting = acquired.lease.release({ waitForAck: true }).then(() => { released = true })
+      await new Promise<void>(resolve => setImmediate(resolve))
+      assert.equal(released, false, 'scheduled retry is not release acknowledgement')
+      assert.equal(releaseCalls, 1, 'both release modes share the same pending request')
+      ack()
+      await waiting
+      assert.equal(released, true)
+    } finally {
+      ack()
+      server.closeAllConnections()
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
   })
 })
 

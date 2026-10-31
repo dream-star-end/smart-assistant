@@ -122,6 +122,13 @@ export interface RunDelegateInput {
   /** Internal root guard owner, distinct from real ancestry and billing. */
   delegationGuardOwnerKey?: string
   taskboardControl?: import('./taskboard/runControl.js').TaskboardRunControl
+  /** Frozen HTTP owner and independent cancellation; never a taskboard billing root. */
+  backgroundControl?: import('./delegateBackground.js').BackgroundDelegateScope
+  backgroundOwner?: import('./delegateBackground.js').BackgroundDelegateOwner
+  backgroundProgress?: import('./delegateProgress.js').DelegateProgressRouting | null
+  backgroundParent?: import('./delegateRuntime.js').ResolveDelegateParentResult
+  /** Model completion is publishable only after cleanup and the job terminal CAS. */
+  backgroundCompletionActions?: Array<() => void>
   /** 2026-09-04 团队模式:审查任务书模板(execution 验收 / deliberation 审议对比)。
    *  仅审查委派读取;非法/缺省 → execution。只影响提示词,不影响闸与计费。 */
   reviewMode?: string
@@ -147,6 +154,8 @@ export interface RunDelegateInput {
   capacitySlotOpts?: { parentBucketKey?: string; isReview?: boolean }
   idempotencyKey?: string
   _leaseTimer?: ReturnType<typeof setInterval>
+  /** Internal: model execution ended; cleanup ACK still owns the live lease. */
+  _backgroundCleanupPending?: boolean
 }
 
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────

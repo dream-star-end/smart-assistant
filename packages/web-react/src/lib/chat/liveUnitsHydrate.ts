@@ -102,6 +102,9 @@ export function liveUnitToMessage(
     ...(unit.runId ? { _delegateRunId: unit.runId, runId: unit.runId } : {}),
     ...(unit.agentId ? { _delegateAgentId: unit.agentId, agentId: unit.agentId } : {}),
     ...(unit.goal ? { goal: unit.goal, _delegate: true, _delegateGoal: unit.goal } : {}),
+    ...(unit.background === true ? { _backgroundDelegate: true, _background: true } : {}),
+    ...(unit.cancelled === true ? { cancelled: true } : {}),
+    ...(unit.jobId ? { _delegateJobId: unit.jobId } : {}),
     ...(unit.kind === "agent_group" ? {
       childBlocks: (unit.children ?? []).map(mapChild),
       _completed: !!unit.completed,

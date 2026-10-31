@@ -41,7 +41,6 @@ import {
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { QueuedSendList } from "./components/chat/QueuedSendList";
-import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState, greetingName } from "./components/EmptyState";
@@ -142,6 +141,7 @@ import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRatings";
 import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
+import { activeBackgroundDelegateJobIds, visibleBackgroundDelegateItems } from "./lib/chat/backgroundDelegates";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -240,6 +240,8 @@ import { AppDialogs } from "./components/AppDialogs";
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+// Snapshot polling and Stop stay synchronous; the HUD is only needed once jobs exist.
+const PinnedDelegateTracker = lazy(() => import("./components/chat/PinnedDelegateTracker").then((m) => ({ default: m.PinnedDelegateTracker })));
 const IdentityRecoveryNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.IdentityRecoveryNotice })));
 const AccountSwitchNotice = lazy(() => import("./components/AccountSwitchNotice").then((m) => ({ default: m.AccountSwitchNotice })));
 const AuthGate = lazy(() => import("./components/AuthGate").then((m) => ({ default: m.AuthGate })));
@@ -1541,6 +1543,14 @@ export function App() {
     stoppedTurnRef,
     toast,
   });
+  const backgroundJobIds = activeBackgroundDelegateJobIds(inflightDelegates.controlItems, wsMessages);
+  const stopConversation = useCallback(() => {
+    if (demo) { stopTurn(); return; }
+    if (!activeId) return;
+    const ids = activeBackgroundDelegateJobIds(inflightDelegates.controlItems, chat.getMessages(activeId));
+    if (chat.isSending(activeId)) stopTurn();
+    if (ids.length > 0) chat.stopBackgroundJobs(activeId, ids);
+  }, [activeId, chat, demo, inflightDelegates.controlItems, stopTurn]);
   // 详情面板里点开大记录(>1 MiB 定位桩)时,与聊天区共用同一套正文取数与页面缓存。
   const paneDeferredLoader = useMemo<DeferredPayloadLoader>(
     () => ({ peek: cardCallbacks.onPeekTapeRecordPayload, fetch: cardCallbacks.onFetchTapeRecordPayload }),
@@ -1684,12 +1694,17 @@ export function App() {
   sendScrollRef.current = scrollToBottomOnSend;
 
   const stopShortcutDialog = useStopShortcut({
-    enabled: inWorkspace && sending,
+    enabled: inWorkspace && (sending || backgroundJobIds.length > 0),
     turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
     getStopAction: () => {
       if (demo) return stopTurn;
       const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
-      return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
+      const sessionId = activeId;
+      const ids = sessionId ? activeBackgroundDelegateJobIds(inflightDelegates.controlItems, chat.getMessages(sessionId)) : [];
+      return clientMessageId || ids.length > 0 ? () => {
+        if (clientMessageId) stopTurnIfCurrent(clientMessageId);
+        if (sessionId && ids.length > 0) chat.stopBackgroundJobs(sessionId, ids);
+      } : null;
     },
   });
 
@@ -2521,13 +2536,15 @@ export function App() {
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
-          {!demo && !gated && (
-            <PinnedDelegateTracker
-              items={inflightDelegates.items}
-              onDismiss={inflightDelegates.dismiss}
-              // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
-              onStop={wsSending ? stopTurn : undefined}
-            />
+          {!demo && !gated && inflightDelegates.items.length > 0 && (
+            <LazyBoundary fallback={null}>
+              <PinnedDelegateTracker
+                items={visibleBackgroundDelegateItems(inflightDelegates.items, wsMessages)}
+                onDismiss={inflightDelegates.dismiss}
+                // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
+                onStop={backgroundJobIds.length === 0 && wsSending ? stopTurn : undefined}
+              />
+            </LazyBoundary>
           )}
           {!demo && !gated && (
             <div
@@ -2625,7 +2642,8 @@ export function App() {
             }
             busy={sending}
             stopping={activeSess?._recoveryStatus?.kind === "stopping"}
-            onStop={stopTurn}
+            onStop={stopConversation}
+            backgroundRunning={backgroundJobIds.length > 0}
             disabled={gated}
             environmentPreparing={!demo && chat.provisioning}
             banner={

@@ -9,6 +9,7 @@ import type { SessionSnapshot } from "./sessionSnapshot";
 import { snapshotQuery, SNAPSHOT_ACK_TIMEOUT_MS } from "./sessionSnapshot";
 import { isTurnDetached, type ChatMessage } from "./model";
 import { ChatSocket, RECOVERY_ADOPTION_GRACE_MS, RECOVERY_DECISION_GRACE_MS, type ChatSocketDeps } from "./socket";
+import { projectBackgroundDelegateRows } from "./backgroundDelegates";
 
 class FakeWS {
   static instances: FakeWS[] = [];
@@ -330,6 +331,48 @@ describe("hello = 订阅；快照对齐状态", () => {
     pushSnapshot(ws, openSnapshot());
     await flush();
     expect(s._sendingInFlight).toBeFalsy();
+    sock.stop();
+  });
+
+  test("a background-only snapshot after final preserves the idle parent and queues its result behind the snapshot prompt", async () => {
+    const syncSession = vi.fn(async () => {
+      sock.applyServerMessages("s1", "main", [
+        { id: CMID, role: "user", text: "q", ts: 1, status: "sent", _source: "server", _seq: 1 },
+        { id: "srv-final-background-parent", role: "assistant", text: "父轮完成", ts: 2, _source: "server", _seq: 2,
+          _clientMessageId: CMID, _turnTapeComplete: true, _dispatchOutcome: "completed" },
+      ], true, 2);
+      return true;
+    });
+    const { sock, ws, s } = boot({ syncSession });
+    s.messages.push({ id: CMID, role: "user", text: "q", ts: 1, status: "sent" });
+    pushSnapshot(ws, openSnapshot());
+    await flush();
+    ws.push({ ...textFrame(1, "父轮完成"), isFinal: true, meta: { stopReason: "end_turn" } });
+    await flush();
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: CMID });
+    expect(s.messages.find((message) => message.id === CMID)?.status).toBe("replied");
+    expect(s._sendingInFlight).toBe(false);
+    const finished = { active: s._activeClientMessageId, started: s._turnStartedAt, status: s._turnStatus };
+
+    pushSnapshot(ws, openSnapshot({
+      lastFrameSeq: 2, nextAfterSeq: 2,
+      frames: [{ recordId: "2", frameSeq: 2, payload: { ...textFrame(2, ""), blocks: [{
+        kind: "delegate_progress", background: true, phase: "done", runId: "dlg-after-final",
+        jobId: "dlgjob-after-final", agentId: "coding-assistant", text: "后台完整结果",
+      }] } }],
+      pendingPermissions: { completeness: "complete", items: [{
+        type: "outbound.permission_request", sessionKey: SK, channel: "webchat", peer,
+        requestId: "ask-user:snapshot", toolName: "AskUserQuestion", inputPreview: "{}", ts: 2_000,
+      }] },
+    }));
+    await flush();
+
+    expect(s._sendingInFlight).toBe(false);
+    expect({ active: s._activeClientMessageId, started: s._turnStartedAt, status: s._turnStatus }).toEqual(finished);
+    const result = s.messages.find((message) => message._delegateRunId === "dlg-after-final");
+    expect(result).toMatchObject({ _backgroundDelegate: true, _completed: true, _turnOwnerId: CMID });
+    expect(s.messages.find((message) => message.requestId === "ask-user:snapshot")).toMatchObject({ _resolved: false });
+    expect(projectBackgroundDelegateRows(s.messages)).not.toContain(result);
     sock.stop();
   });
 

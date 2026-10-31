@@ -1,7 +1,7 @@
 import type { readSessionMetadata } from '../db/sessionMetadataApproval.js'
 import { projectPublicModels, projectLockedModels } from '../billing/modelPublicProjection.js'
 export type { PublicModelProjection, LockedPublicModelProjection } from '../billing/modelPublicProjection.js'
-import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, type PromptPrivacySupport } from '@openclaude/protocol'
+import { DEFAULT_CODEX_ENGINE_MODEL, DEFAULT_PROMPT_PRIVACY_SUPPORT, isDelegateBackgroundEnabled, type PromptPrivacySupport } from '@openclaude/protocol'
 import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
 import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
@@ -1357,7 +1357,7 @@ export function _resetAllowRegistrationCacheForTests(): void {
  */
 export function delegateInflightSurfaceAdvertised(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = String(env.OC_DELEGATE_INFLIGHT_SURFACE ?? "").trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "on";
+  return raw === "1" || raw === "true" || raw === "on" || isDelegateBackgroundEnabled(env);
 }
 
 export async function handleGetPublicConfig(

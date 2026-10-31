@@ -28,4 +28,15 @@ describe('delegateInflightSurfaceAdvertised', () => {
   it('公开配置下发 feature_delegate_inflight', () => {
     assert.ok(handlers.includes('feature_delegate_inflight: delegateInflightSurfaceAdvertised()'))
   })
+
+  it('后台子任务仅在个人版显式开启时启用同一个进度入口', () => {
+    assert.equal(delegateInflightSurfaceAdvertised({ OC_DELEGATE_BACKGROUND: '1' }), false)
+    assert.equal(delegateInflightSurfaceAdvertised({ OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' }), false)
+    assert.equal(delegateInflightSurfaceAdvertised({
+      OC_SELFHOST_ENGINE_LOCAL_TURNS: '1', OC_DELEGATE_BACKGROUND: '0',
+    }), false)
+    assert.equal(delegateInflightSurfaceAdvertised({
+      OC_SELFHOST_ENGINE_LOCAL_TURNS: '1', OC_DELEGATE_BACKGROUND: '1',
+    }), true)
+  })
 })

@@ -139,6 +139,7 @@ import type {
 } from './sessionManager.js'
 
 export interface SessionSubmitHost {
+  interrupt: SessionManager['interrupt']
   _ccbJsonlExists: SessionManager['_ccbJsonlExists']
   _costImpreciseFor: SessionManager['_costImpreciseFor']
   _cursorWorkspacePath: SessionManager['_cursorWorkspacePath']
@@ -399,6 +400,8 @@ export async function submit(
   traceId?: string,
   conversationMode?: 'default' | 'plan',
   opts?: {
+    /** Internal delegate cancellation, including preparation before an engine turn exists. */
+    cancellationSignal?: AbortSignal
     historicalMessages?: unknown[]
     /** v5 codex route 消费链(A1):dispatchInbound 校验后的 per-turn provider
      *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine
@@ -473,6 +476,7 @@ export async function submit(
   },
 ): Promise<void> {
   const submitStartedAt = performance.now()
+  opts?.cancellationSignal?.throwIfAborted()
   // Resolve/rebuild a warm legacy runner under the existing creation gate,
   // before taking the per-turn lock. Never change its durable session key.
   // prepareModelSwitch owns this runner while performing native compaction.
@@ -489,6 +493,7 @@ export async function submit(
       promptQueueExecutionFence: opts?.queueExecutionFence,
     })
   }
+  opts?.cancellationSignal?.throwIfAborted()
   if (this.isRuntimeRecycleDraining()) throw new RuntimeRecycleDrainingError()
   // Commercial PG is the only authoritative history. Never execute a paid
   // turn when the lossless container→master sink failed to initialize: the
@@ -607,6 +612,13 @@ export async function submit(
   let replayLifecycleStarted = false
   let unhandledTurnError: unknown | undefined
   const logicalTurnAbort = new AbortController()
+  const cancelExternal = () => {
+    logicalTurnAbort.abort(opts?.cancellationSignal?.reason)
+    // Never interrupt the predecessor while this submission is waiting for its lock.
+    if (session._externalTurnAbort === logicalTurnAbort) this.interrupt(session.sessionKey, 'user')
+  }
+  opts?.cancellationSignal?.addEventListener('abort', cancelExternal, { once: true })
+  if (opts?.cancellationSignal?.aborted) cancelExternal()
   let closeHelpLogical: (() => void) | undefined
   let logicalTurnRun: Promise<void> | null = null
   if (queueTurn) {
@@ -626,6 +638,7 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    opts?.cancellationSignal?.throwIfAborted()
     session._turnReadOnly = opts?.readOnly === true
     log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
@@ -715,6 +728,7 @@ export async function submit(
     }
     // Browser Stop must own the complete logical turn, including the gap
     // between engine attempts while an automatic retry is backing off.
+    opts?.cancellationSignal?.throwIfAborted()
     session._externalTurnAbort = logicalTurnAbort
     if (opts?.replayLifecycle) {
       replayLifecycleStarted = true
@@ -1308,6 +1322,7 @@ export async function submit(
         }
       }, CHECK_INTERVAL)
     })
+    opts?.cancellationSignal?.throwIfAborted()
     log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
@@ -1369,6 +1384,7 @@ export async function submit(
       throw err
     }
   } finally {
+    opts?.cancellationSignal?.removeEventListener('abort', cancelExternal)
     closeHelpLogical?.()
     clearRunnerPromptPrivacy(session.runner)
     if (

@@ -32,7 +32,7 @@ import { createLogger } from './logger.js'
 
 const log = createLogger({ module: 'delegate-inflight-surface' })
 
-export const SURFACE_SCHEMA_VERSION = 3
+export const SURFACE_SCHEMA_VERSION = 4
 /** 1 = job-store CAS winner projection; 0 = runner fold / live overlay. */
 const AUTHORITY_JOB_STORE = 1
 const AUTHORITY_PROJECTION = 0
@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS inflight_delegate_surface (
   nested INTEGER NOT NULL DEFAULT 0,
   owner_run_id TEXT NOT NULL DEFAULT '',
   tombstoned INTEGER NOT NULL DEFAULT 0,
-  authority INTEGER NOT NULL DEFAULT 0
+  authority INTEGER NOT NULL DEFAULT 0,
+  background INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_inflight_surface_parent
   ON inflight_delegate_surface(parent_session_key);
@@ -147,6 +148,7 @@ export type InflightEnqueueInput = {
   generation?: number
   nested?: boolean
   ownerRunId?: string
+  background?: true
   preserveIdentity?: boolean
   /** Job-store CAS winner projection; allows correcting a previous terminal. */
   authoritative?: boolean
@@ -179,6 +181,7 @@ function cloneSurface(row: SurfaceRow): InflightDelegateSurface {
     parentSessionKey: row.parentSessionKey,
     ...(row.foldedGroup ? { foldedGroup: structuredClone(row.foldedGroup) } : {}),
   }
+  if (row.background) out.background = true
   if (row.truncated) out.truncated = true
   if (row.nested) out.nested = true
   if (row.ownerRunId) out.ownerRunId = row.ownerRunId
@@ -226,6 +229,8 @@ export function boundFoldedGroup(
   const encoded = Buffer.byteLength(JSON.stringify(clone), 'utf8')
   if (encoded <= maxBytes) return { group: clone, truncated: false, bytes: encoded }
   const summary: DurableAgentGroup = {
+    ...(clone.background ? { background: true as const } : {}),
+    ...(clone.cancelled ? { cancelled: true } : {}),
     runId: clone.runId,
     agentId: clone.agentId,
     goal: clampText(clone.goal, INFLIGHT_GOAL_MAX_CHARS),
@@ -248,7 +253,7 @@ export function boundFoldedGroup(
 
 export function summaryGroupFromJob(
   job: DelegateJobSnapshot,
-  existing?: Pick<InflightDelegateSurface, 'runId' | 'goal' | 'agentId'>,
+  existing?: Pick<InflightDelegateSurface, 'runId' | 'goal' | 'agentId' | 'background'>,
 ): DurableAgentGroup {
   const body = job.result?.body ?? {}
   const output = typeof body.output === 'string' ? body.output : ''
@@ -260,11 +265,12 @@ export function summaryGroupFromJob(
         : ''
   const ok = job.state === 'completed'
   return {
+    ...(existing?.background ? { background: true as const, ...(job.state === 'cancelled' ? { cancelled: true } : {}) } : {}),
     runId: existing?.runId || defaultRunId(job.id),
     agentId: existing?.agentId || job.agentId,
     goal: existing?.goal || '',
     status: ok ? 'ok' : 'failed',
-    resultSummary: clampText(ok ? output || error : error || output, INFLIGHT_RESULT_SUMMARY_MAX_CHARS),
+    resultSummary: clampText(existing?.background && job.state === 'cancelled' ? output || '已停止' : ok ? output || error : error || output, INFLIGHT_RESULT_SUMMARY_MAX_CHARS),
     completedAt: job.lastActivityAt ?? job.createdAt ?? Date.now(),
   }
 }
@@ -366,12 +372,12 @@ export class DelegateInflightSurfaceStore {
           job_id, parent_session_key, session_id, user_id, run_id, agent_id, goal, state,
           live_hint, updated_at, fencing_epoch, generation, folded_group_json,
           payload_truncated, payload_bytes, expires_at, nested, owner_run_id,
-          tombstoned, authority
+          tombstoned, authority, background
         ) VALUES (
           @job_id, @parent_session_key, @session_id, @user_id, @run_id, @agent_id, @goal, @state,
           @live_hint, @updated_at, @fencing_epoch, @generation, @folded_group_json,
           @payload_truncated, @payload_bytes, @expires_at, @nested, @owner_run_id,
-          0, @authority
+          0, @authority, @background
         )
         ON CONFLICT(job_id) DO UPDATE SET
           parent_session_key=excluded.parent_session_key,
@@ -394,7 +400,8 @@ export class DelegateInflightSurfaceStore {
           expires_at=excluded.expires_at,
           nested=excluded.nested,
           owner_run_id=excluded.owner_run_id,
-          authority=excluded.authority
+          authority=excluded.authority,
+          background=MAX(inflight_delegate_surface.background,excluded.background)
         WHERE
           inflight_delegate_surface.tombstoned = 0
           AND (
@@ -514,6 +521,12 @@ export class DelegateInflightSurfaceStore {
       }
       if (!existing.has('authority')) {
         db.exec('ALTER TABLE inflight_delegate_surface ADD COLUMN authority INTEGER NOT NULL DEFAULT 0')
+      }
+    }
+    if (current < 4) {
+      const columns = db.prepare('PRAGMA table_info(inflight_delegate_surface)').all() as Array<{ name: string }>
+      if (!columns.some(column => column.name === 'background')) {
+        db.exec('ALTER TABLE inflight_delegate_surface ADD COLUMN background INTEGER NOT NULL DEFAULT 0')
       }
     }
     if (current < SURFACE_SCHEMA_VERSION) {
@@ -653,6 +666,7 @@ export class DelegateInflightSurfaceStore {
         ? (existing?.expiresAt ?? this.now() + this.terminalTtlMs)
         : null,
       nested: input.nested ?? existing?.nested ?? false,
+      background: input.background ?? existing?.background,
       ownerRunId: input.ownerRunId ?? existing?.ownerRunId ?? '',
       truncated: existing?.truncated,
       authority: input.authoritative ? AUTHORITY_JOB_STORE : AUTHORITY_PROJECTION,
@@ -686,6 +700,7 @@ export class DelegateInflightSurfaceStore {
     generation?: number
     nested?: boolean
     ownerRunId?: string
+    background?: true
     preserveIdentity?: boolean
     authoritative?: boolean
   }): InflightDelegateSurface | undefined {
@@ -714,6 +729,7 @@ export class DelegateInflightSurfaceStore {
       }
     }
     if (input.userId) next.userId = input.userId
+    if (input.background) next.background = true
     if (input.nested !== undefined) next.nested = input.nested
     if (input.ownerRunId) next.ownerRunId = input.ownerRunId
     next.state = nextState
@@ -1285,6 +1301,7 @@ export class DelegateInflightSurfaceStore {
         nested: row.nested ? 1 : 0,
         owner_run_id: row.ownerRunId,
         authority: row.authority ?? AUTHORITY_PROJECTION,
+        background: row.background ? 1 : 0,
       })
       if (info.changes === 0) {
         if (this.rowIsTombstoned(row.jobId)) {
@@ -1367,6 +1384,7 @@ function fromRow(row: Record<string, unknown>): SurfaceRow | null {
     payloadBytes,
     expiresAt: row.expires_at == null ? null : Number(row.expires_at),
     nested: Number(row.nested ?? 0) === 1,
+    ...(Number(row.background ?? 0) === 1 ? { background: true as const } : {}),
     ownerRunId: typeof row.owner_run_id === 'string' ? row.owner_run_id : '',
     truncated: truncated || undefined,
     authority: Number(row.authority ?? 0),
@@ -1388,10 +1406,13 @@ function summarizeInflightView(view: InflightDelegateSurface): InflightDelegateS
     parentSessionKey: view.parentSessionKey,
     truncated: true,
   }
+  if (view.background) summary.background = true
   if (view.nested) summary.nested = true
   if (view.ownerRunId) summary.ownerRunId = view.ownerRunId
   if (folded) {
     summary.foldedGroup = {
+      ...(folded.background ? { background: true as const } : {}),
+      ...(folded.cancelled ? { cancelled: true } : {}),
       runId: folded.runId,
       agentId: folded.agentId,
       goal: clampText(folded.goal, 256),

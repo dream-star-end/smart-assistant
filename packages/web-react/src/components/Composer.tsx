@@ -175,6 +175,7 @@ export function Composer({
   onSend,
   busy,
   stopping,
+  backgroundRunning,
   onStop,
   disabled,
   banner,
@@ -204,6 +205,8 @@ export function Composer({
   busy?: boolean;
   /** The same send/stop control is settling an acknowledged Stop. */
   stopping?: boolean;
+  /** Background work never makes the conversation busy; empty input keeps Stop available. */
+  backgroundRunning?: boolean;
   onStop?: () => void;
   disabled?: boolean;
   /** 状态横幅插槽(渲染在输入框上方,Composer 根容器内)。移动端软键盘压缩视口时,
@@ -488,6 +491,7 @@ export function Composer({
     [revoke],
   );
 
+  const showStop = busy || (backgroundRunning === true && !value.trim() && attachments.length === 0);
   const submittingRef=useRef(false);
   const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
   const previousSubmit=latestSubmitRef.current;
@@ -1033,30 +1037,30 @@ export function Composer({
               <button
                 type="button"
                 data-product-control
-                aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
-                aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
+                aria-label={stopping ? "正在停止" : showStop ? "停止" : "发送"}
+                aria-describedby={!showStop && sendablePrediction ? predictionHintId : undefined}
                 title={
                   attachFailed
                     ? "有附件上传失败，请重试或移除后再发送"
                     : uploading
                       ? "附件上传中"
-                      : busy && !stopping
+                      : showStop && !stopping
                         ? "停止生成"
                         : sendablePrediction
                           ? "发送这句预测"
                           : undefined
                 }
                 onClick={() => {
-                  if (busy) {
+                  if (showStop) {
                     if (!stopping) onStop?.();
                     return;
                   }
                   submit(true);
                 }}
-                disabled={stopping || (!canSend && !busy) || disabled}
+                disabled={stopping || (!canSend && !showStop) || disabled}
                 className={cn(
                   "flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
-                  busy
+                  showStop
                     ? "bg-fg text-bg"
                     : canSend
                       ? "bg-primary text-primary-fg hover:opacity-90"
@@ -1065,7 +1069,7 @@ export function Composer({
               >
                 {stopping ? (
                   <Loader2 size={17} className="animate-spin" />
-                ) : busy ? (
+                ) : showStop ? (
                   <Square size={15} className="fill-current" />
                 ) : (
                   <ArrowUp size={19} />

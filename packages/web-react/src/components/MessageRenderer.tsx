@@ -85,6 +85,7 @@ import {
   isAwaitingPermissionPrompt,
 } from "./chat/PermissionCard";
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
+import { projectBackgroundDelegateRows } from "../lib/chat/backgroundDelegates";
 import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
@@ -2162,7 +2163,7 @@ export function MessageList({
   // Drop legacy substitute rows from an old IndexedDB cache and duplicate
   // engine transport envelopes. The latter remain byte-complete in the tape;
   // their canonical immutable Agent blocks are the user-facing timeline.
-  const safeMessages = sanitizeChatMessages(messages, sessionId);
+  const safeMessages = projectBackgroundDelegateRows(sanitizeChatMessages(messages, sessionId));
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
   const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
   const recoveredStatusRecordIds = collectRecoveredTurnStatusRecordIds(safeMessages);

@@ -66,8 +66,9 @@ const SESSION_ID_RE = /^[A-Za-z0-9_:@.-]{1,128}$/
 export interface DelegateGrokRouteLease {
   readonly baseUrl: string
   readonly routeToken: string
-  /** Stops the heartbeat and best-effort expires the master-side lease. */
-  release(): Promise<void>
+  /** Stops the heartbeat. Legacy callers schedule retry and return immediately;
+   * background completion waits for the idempotent master release ACK. */
+  release(opts?: { waitForAck?: boolean }): Promise<void>
 }
 
 export type DelegateGrokRouteAcquire =
@@ -131,8 +132,9 @@ function scheduleReleaseUntilAck(args: {
   routeToken: string
   log: DelegateGrokRouteLog
   retryMs: number
-}): void {
-  if (pendingReleaseTasks.has(args.routeToken)) return
+}): Promise<void> {
+  const pending = pendingReleaseTasks.get(args.routeToken)
+  if (pending) return pending
   const task = (async () => {
     let delayMs = Math.max(1, args.retryMs)
     let warned = false
@@ -166,6 +168,7 @@ function scheduleReleaseUntilAck(args: {
     pendingReleaseTasks.delete(args.routeToken)
   })
   pendingReleaseTasks.set(args.routeToken, task)
+  return task
 }
 
 export async function acquireDelegateGrokRoute(args: {
@@ -256,10 +259,11 @@ export async function acquireDelegateGrokRoute(args: {
         })
     }, heartbeatMs)
     heartbeat.unref?.()
+    let releaseTask: Promise<void> | null = null
     const lease: DelegateGrokRouteLease = {
       baseUrl: parsed.baseUrl,
       routeToken,
-      release: async () => {
+      release: async (opts) => {
         if (heartbeat) {
           clearInterval(heartbeat)
           heartbeat = null
@@ -267,7 +271,7 @@ export async function acquireDelegateGrokRoute(args: {
         // Completion must stay fast for the user. A transient master deploy must
         // also not turn this into a seven-day durable slot leak, so cleanup keeps
         // retrying in the live gateway until the idempotent endpoint acknowledges.
-        scheduleReleaseUntilAck({
+        releaseTask ??= scheduleReleaseUntilAck({
           fetcher,
           baseUrl,
           bearer,
@@ -275,6 +279,7 @@ export async function acquireDelegateGrokRoute(args: {
           log: args.log,
           retryMs: args.releaseRetryMs ?? RELEASE_RETRY_MIN_MS,
         })
+        if (opts?.waitForAck) await releaseTask
       },
     }
     return { ok: true, lease }

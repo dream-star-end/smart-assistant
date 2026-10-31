@@ -337,6 +337,48 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
   const phases: Array<{ phase: string; ms: number }> = []
   const started = performance.now()
   const mark = (phase: string) => phases.push({ phase, ms: Math.round(performance.now() - started) })
+  const nativeFetch = fetch
+  let fetchSequence = 0
+  const fetchImpl = async (url: string, init: RequestInit): Promise<Response> => {
+    let kind = 'unknown'
+    try {
+      if (init.body instanceof Uint8Array) {
+        const body = JSON.parse(Buffer.from(init.body).subarray(5).toString('utf8')) as {
+          command?: unknown
+          args?: unknown
+        }
+        kind = body.command === 'python3'
+          ? 'write'
+          : Array.isArray(body.args) && body.args[1] === BOX_CC_STOP_SCRIPT ? 'stop' : 'launch'
+      }
+    } catch { /* Diagnostics must not change request handling. */ }
+    const label = `fetch-${++fetchSequence}-${kind}`
+    mark(`${label}-start`)
+    const onAbort = () => mark(`${label}-signal-abort`)
+    if (init.signal?.aborted) onAbort()
+    else init.signal?.addEventListener('abort', onAbort, { once: true })
+    let response: Response
+    try {
+      response = await nativeFetch(url, init)
+      mark(`${label}-headers`)
+    } catch (error) {
+      mark(`${label}-reject`)
+      throw error
+    }
+    const arrayBuffer = response.arrayBuffer.bind(response)
+    response.arrayBuffer = async () => {
+      mark(`${label}-arrayBuffer-start`)
+      try {
+        const bytes = await arrayBuffer()
+        mark(`${label}-arrayBuffer-done`)
+        return bytes
+      } catch (error) {
+        mark(`${label}-arrayBuffer-reject`)
+        throw error
+      }
+    }
+    return response
+  }
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     req.on('data', (chunk) => chunks.push(chunk))
@@ -386,6 +428,7 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
       stdin,
       stdout,
       stderr: new PassThrough(),
+      fetchImpl,
     })
     stdin.write('{"type":"user","message":{"role":"user","content":"first"}}\n')
     for (let i = 0; i < 200 && !out.includes('"result"'); i++) {

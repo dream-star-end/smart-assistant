@@ -6,6 +6,7 @@ import {
   type InflightDelegateItem,
 } from "../lib/chat/inflightDelegates";
 import type { ChatMessage } from "../lib/chat/model";
+import { activeBackgroundDelegateJobIds } from "../lib/chat/backgroundDelegates";
 import type { AuthSession } from "../lib/types";
 
 const POLL_MS = 15_000;
@@ -92,7 +93,7 @@ export function useInflightDelegates(opts: {
   messages: ChatMessage[];
   enabled: boolean;
   auth: AuthSession | null;
-}): { items: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
+}): { items: InflightDelegateItem[]; controlItems: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
   const { sessionId, messages, enabled, auth } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
   const [failures, setFailures] = useState(0);
@@ -110,6 +111,7 @@ export function useInflightDelegates(opts: {
   const authRef = useRef(auth);
   authRef.current = auth;
   const genRef = useRef(0);
+  const discoveredBackgroundRef = useRef(new Set<string>());
 
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
@@ -134,7 +136,19 @@ export function useInflightDelegates(opts: {
       for (const item of result.items) {
         if (!isTerminalDelegateState(item.state)) seenLiveRef.current.add(item.jobId);
       }
-      setRawItems(result.items);
+      setRawItems((previous) => {
+        // Terminal job state is irreversible. Preserve only explicit background
+        // terminals when a bounded later snapshot omits them (or an older read
+        // still says running), so their old tool receipts cannot revive Stop.
+        const settled = previous?.filter((item) => item.background === true && isTerminalDelegateState(item.state));
+        if (!settled?.length) return result.items;
+        const latest = new Map(result.items.map((item) => [item.jobId, item]));
+        for (const item of settled) {
+          const fresh = latest.get(item.jobId);
+          if (!fresh || !isTerminalDelegateState(fresh.state)) latest.set(item.jobId, item);
+        }
+        return [...latest.values()];
+      });
       setFailures(0);
       return;
     }
@@ -156,18 +170,35 @@ export function useInflightDelegates(opts: {
     // 会话内已「知道了」的终态项从 sessionStorage 回灌(H-14),不再随重挂载清零。
     setDismissed(readDismissedDelegates(sessionId));
     seenLiveRef.current = new Set();
+    discoveredBackgroundRef.current = new Set();
     void pull(sessionId, myGen);
     return () => {
       genRef.current += 1;
     };
   }, [enabled, sessionId, auth, pull]);
 
+  // A receipt can arrive after the session-entry snapshot was empty, before
+  // any runner/progress exists. Keep reading that exact job until the server
+  // proves its terminal; missing progress is not evidence that it finished.
+  const backgroundKey = activeBackgroundDelegateJobIds(rawItems ?? [], messages).sort().join("\0");
+  const snapshotReady = rawItems !== null;
+  const routeMissing = !!sessionId && notFoundRef.current.has(sessionId);
+  useEffect(() => {
+    if (!enabled || !sessionId || !auth || !backgroundKey || (!snapshotReady && !routeMissing)) return;
+    const fresh = backgroundKey.split("\0").filter((id) => !discoveredBackgroundRef.current.has(id));
+    if (fresh.length === 0) return;
+    for (const id of fresh) discoveredBackgroundRef.current.add(id);
+    // Only explicit new background evidence can retry an earlier missing route.
+    notFoundRef.current.delete(sessionId);
+    void pull(sessionId, genRef.current);
+  }, [backgroundKey, snapshotReady, routeMissing, enabled, sessionId, auth, pull]);
+
   const shouldPoll =
     !!enabled &&
     !!sessionId &&
     !!auth &&
-    !notFoundRef.current.has(sessionId) &&
-    (failures > 0 || rawItems?.some((item) => !isTerminalDelegateState(item.state)));
+    !routeMissing &&
+    (failures > 0 || !!backgroundKey || rawItems?.some((item) => !isTerminalDelegateState(item.state)));
 
   useEffect(() => {
     if (!shouldPoll || !sessionId) return;
@@ -187,14 +218,16 @@ export function useInflightDelegates(opts: {
     };
   }, [shouldPoll, sessionId, pull, failures]);
 
+  // Controls need every authoritative terminal, including rows hidden by HUD
+  // dismissal/recency. Presentation cannot remove evidence that a job finished.
+  const controlItems = useMemo(() => rawItems ?? [], [rawItems]);
   const items = useMemo(() => {
-    if (!rawItems) return [];
-    return filterVisibleInflightItems(mergeInflightWithTimeline(rawItems, messages), {
+    return filterVisibleInflightItems(mergeInflightWithTimeline(controlItems, messages), {
       dismissed,
       seenLive: seenLiveRef.current,
       now: Date.now(),
     });
-  }, [rawItems, messages, dismissed]);
+  }, [controlItems, messages, dismissed]);
 
-  return { items, degraded: failures > 0, dismiss };
+  return { items, controlItems, degraded: failures > 0, dismiss };
 }

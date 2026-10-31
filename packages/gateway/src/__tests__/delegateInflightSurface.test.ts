@@ -299,7 +299,7 @@ describe('R2 gateway wiring (flag-off equivalent + read endpoint)', () => {
     const window = serverSrc.slice(idx, idx + 2200)
     assert.match(window, /_buildTurnStatusFrame/)
     assert.match(window, /status: 'working'/)
-    const liveIdx = window.indexOf('if (liveDetail)')
+    const liveIdx = window.indexOf('if (liveDetail && !input.backgroundControl)')
     const touchIdx = window.indexOf('_touchDelegateInflightSurface')
     assert.ok(liveIdx >= 0 && touchIdx > liveIdx)
     const turnStatusBlock = window.slice(liveIdx, touchIdx)
@@ -318,7 +318,15 @@ describe('R2 gateway wiring (flag-off equivalent + read endpoint)', () => {
     assert.match(serverSrc, /_forgetDelegateInflight|_dropDelegateInflightSurface/)
     assert.match(
       serverSrc,
-      /snap && isDelegateTerminalState\(snap\.state\) \? snap\.state : 'completed'/,
+      /snap && isDelegateTerminalState\(snap\.state\) \? snap\.state/,
+    )
+    assert.match(
+      serverSrc,
+      /args\.background && snap && !isDelegateTerminalState\(snap\.state\)\) return/,
+    )
+    assert.match(
+      serverSrc,
+      /args\.background && args\.cancelled \? 'cancelled' : 'completed'/,
     )
   })
 

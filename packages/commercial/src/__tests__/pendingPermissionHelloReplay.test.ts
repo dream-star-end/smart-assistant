@@ -116,8 +116,9 @@ describe('readPendingPermissionPrompts', () => {
     assert.match(sql, /NOT EXISTS \( SELECT 1 FROM turn_control_requests c/)
     assert.match(sql, /c\.kind='stop' AND c\.status<>'cancelled'/)
     assert.match(sql, /c\.root_client_message_id=p\.client_message_id/)
-    // A peer-wide Stop (null root) issued after the prompt was created also hides it.
-    assert.match(sql, /c\.root_client_message_id IS NULL AND c\.created_at>=p\.created_at/)
+    // A legacy peer-wide Stop (null root) hides it; exact background-job
+    // controls leave foreground permissions open.
+    assert.match(sql, /c\.root_client_message_id IS NULL AND NOT \(c\.payload_json \? 'backgroundJobIds'\) AND c\.created_at>=p\.created_at/)
   })
 
   test('clamps the limit into [1,64]', async () => {

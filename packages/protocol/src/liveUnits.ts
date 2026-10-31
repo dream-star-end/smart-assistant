@@ -80,6 +80,8 @@ export type LiveUnit = {
   agentId?: string
   goal?: string
   jobId?: string
+  background?: boolean
+  cancelled?: boolean
   phase?: string
   completed?: boolean
   children?: LiveChildBlock[]
@@ -243,10 +245,10 @@ function isRunningStatusPayload(raw: unknown): boolean {
         ? parseJsonRecord(raw.trim())
         : null
   if (!obj) return false
-  if (obj.status === 'running') return true
+  if (obj.status === 'running' || (obj.status === 'queued' && obj.resultDelivery === 'background')) return true
   for (const text of mcpWrapperTexts(obj)) {
     const inner = parseJsonRecord(text)
-    if (inner?.status === 'running') return true
+    if (inner?.status === 'running' || (inner?.status === 'queued' && inner.resultDelivery === 'background')) return true
   }
   return false
 }
@@ -264,6 +266,17 @@ function runningToolJobId(block: Record<string, unknown>): string {
     }
   }
   return ''
+}
+
+
+function backgroundToolResult(block: Record<string, unknown>): boolean {
+  for (const raw of [block.outputJson, block.output]) {
+    const obj = asRecord(raw) ?? (typeof raw === 'string' ? parseJsonRecord(raw.trim()) : null)
+    if (!obj) continue
+    if (obj.resultDelivery === 'background') return true
+    if (mcpWrapperTexts(obj).some(text => parseJsonRecord(text)?.resultDelivery === 'background')) return true
+  }
+  return false
 }
 
 function isRunningToolResult(block: Record<string, unknown>): boolean {
@@ -792,6 +805,7 @@ function reduceLiveFramesOnto(
         unit.recordIdLast = frame.recordId
         unit.payloadRef = meta.ref
         if (unit.kind === 'agent_group' && isRunningToolResult(block)) {
+          if (backgroundToolResult(block)) unit.background = true
           unit.open = true
           unit.completed = false
           const jobId = runningToolJobId(block)
@@ -805,6 +819,8 @@ function reduceLiveFramesOnto(
               const standalone = units[standaloneIndex]!
               unit.runId = standalone.runId
               unit.phase = standalone.phase
+              unit.background ||= standalone.background
+              unit.cancelled ||= standalone.cancelled
               unit.children = [...(standalone.children ?? []), ...(unit.children ?? [])]
               if (standalone.seqFirst < unit.seqFirst) {
                 unit.seqFirst = standalone.seqFirst
@@ -870,6 +886,8 @@ function reduceLiveFramesOnto(
         pushStampedUnit(units, unit, processKeys, streamGeneration)
         groups.set(runId, unit)
       }
+      if (block.background === true) unit.background = true
+      if (block.cancelled === true) unit.cancelled = true
       applyDelegatePhase(unit, block, meta.ref)
     }
   }

@@ -949,6 +949,10 @@ export function materializeLosslessTurn(
       ? group._ocEventOrdinal
       : undefined;
     records.push(record({
+      // OCV5-676: a background group's server-owned identity is its first bytes,
+      // so timeline heads read a bounded prefix instead of the whole group.
+      ...(group.background === true ? { _backgroundDelegate: true, _delegateRunId: runId,
+        ...(typeof group.jobId === "string" ? { _delegateJobId: group.jobId } : {}) } : {}),
       ...group,
       id: `${prefix}-agentgroup-${runId}`,
       role: "agent-group",
@@ -957,6 +961,9 @@ export function materializeLosslessTurn(
       status: body.status,
       _delegate: true,
       _delegateRunId: runId,
+      ...(group.background === true ? { _backgroundDelegate: true } : {}),
+      ...(typeof group.jobId === "string" ? { _delegateJobId: group.jobId } : {}),
+      ...(group.cancelled === true ? { cancelled: true } : {}),
       _delegateAgentId: requiredString(group, "agentId"),
       _delegateGoal: goal,
       _delegateStatus: groupStatus,

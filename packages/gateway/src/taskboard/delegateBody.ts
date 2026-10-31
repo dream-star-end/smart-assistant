@@ -9,7 +9,7 @@ export class TaskboardBodyTimeoutError extends Error {
 export function readTaskboardDelegateBody(
   req: IncomingMessage,
   read: (req: IncomingMessage) => Promise<string>,
-  control?: TaskboardRunControl,
+  control?: Pick<TaskboardRunControl, 'signal' | 'assertOpen'>,
   timeoutMs = 30_000,
 ): Promise<string> {
   if (!control) return read(req)

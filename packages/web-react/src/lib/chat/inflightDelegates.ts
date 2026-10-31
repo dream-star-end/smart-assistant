@@ -25,6 +25,7 @@ export type InflightDelegateItem = Pick<
   resultSummary?: string;
   nested?: boolean;
   ownerRunId?: string;
+  background?: boolean;
 };
 
 export type InflightDelegatesFetchResult =
@@ -72,6 +73,7 @@ export function normalizeInflightDelegateItem(raw: unknown): InflightDelegateIte
   };
   if (resultSummary) item.resultSummary = resultSummary;
   if (o.nested === true) item.nested = true;
+  if (o.background === true) item.background = true;
   if (typeof o.ownerRunId === "string" && o.ownerRunId) item.ownerRunId = o.ownerRunId;
   return item;
 }
@@ -79,6 +81,7 @@ export function normalizeInflightDelegateItem(raw: unknown): InflightDelegateIte
 function timelineTerminalState(m: ChatMessage): DelegateJobState | null {
   if (m.role !== "agent-group") return null;
   if (!m._completed) return null;
+  if (m.cancelled === true) return "cancelled";
   if (m._delegateStatus === "failed" || m._delegateStatus === "timeout" || m._isError)
     return "failed";
   return "completed";
@@ -121,7 +124,8 @@ export function mergeInflightWithTimeline(
         : typeof group.ts === "number" && group.ts > 0
           ? group.ts
           : item.updatedAt;
-    const next: InflightDelegateItem = { ...item, state: terminal, updatedAt };
+    const next: InflightDelegateItem = { ...item, state: terminal, updatedAt,
+      ...(group._backgroundDelegate === true ? { background: true } : {}) };
     if (summary) next.resultSummary = summary;
     return next;
   });

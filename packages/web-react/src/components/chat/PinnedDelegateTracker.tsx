@@ -81,8 +81,8 @@ function visibleDelegateItems(items: InflightDelegateItem[]): InflightDelegateIt
  * 状态标(H-07):running 旋转;queued 空心圆(还没开始跑);paused 暂停标(warning);
  * completed ✓;failed / cancelled / killed ×。每个都带 title + aria-label,不再只靠颜色。
  */
-function StatusMark({ state, className }: { state: string; className?: string }) {
-  const label = delegateStateLabel(state);
+function StatusMark({ state, className, background }: { state: string; className?: string; background?: boolean }) {
+  const label = background && state === "cancelled" ? "已停止" : delegateStateLabel(state);
   const common = {
     className: cn("shrink-0", className),
     title: label,
@@ -116,7 +116,7 @@ function DelegateRow({
   return (
     <div className="flex items-start gap-2 text-body">
       <span className="mt-px shrink-0">
-        <StatusMark state={item.state} className="size-3.5" />
+        <StatusMark state={item.state} background={item.background} className="size-3.5" />
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline gap-1.5">
@@ -268,7 +268,7 @@ export function PinnedDelegateTracker({
             {/* 折叠摘要(H-02):状态标 → 名字(窄屏隐藏)→ 目标(唯一可收缩项)→ 计时(在 truncate 之外)。 */}
             {!expanded && summaryItem && (
               <span className="flex min-w-0 flex-1 items-center gap-1.5 text-body text-fg">
-                <StatusMark state={summaryItem.state} className="size-3" />
+                <StatusMark state={summaryItem.state} background={summaryItem.background} className="size-3" />
                 <span className="hidden shrink-0 text-muted sm:inline">{summaryName}</span>
                 <span className="min-w-0 flex-1 truncate" title={summaryItem.goal}>
                   {summaryGoal}

@@ -350,3 +350,18 @@ describe("Composer goalOpenRequest", () => {
     expect(screen.getByText("会话目标")).toBeInTheDocument();
   });
 });
+
+// OCV5-676: one primary action, without making an idle parent busy.
+describe("Composer background tasks", () => {
+  test("empty draft stops background work; typed text is sent immediately", () => {
+    const onStop = vi.fn(); const onSend = vi.fn();
+    render(<Composer backgroundRunning onSend={onSend} onStop={onStop} />);
+    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByRole("textbox", { name: "消息输入框" }), { target: { value: "继续聊新问题" } });
+    expect(screen.queryByRole("button", { name: "排队发送" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    expect(onSend).toHaveBeenCalledWith("继续聊新问题", undefined, undefined);
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+});

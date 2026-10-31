@@ -24,6 +24,7 @@ import { resolveDelegateLedgerRetentionMs } from './delegateDurable.js'
 import { nextDelegateReconcileAt, reconcileDelegateJobsOnBoot } from './delegateReconciler.js'
 import type { Gateway } from './server.js'
 import type { RunDelegateInput } from './delegatePolicy.js'
+import { waitForStrictSessionCleanup } from './sessionLifecycle.js'
 
 export interface DelegateSupervisionHost {
   _armDelegateReconcileFollowup: Gateway['_armDelegateReconcileFollowup']
@@ -92,6 +93,7 @@ export type TouchDelegateInflightSurfaceInput = {
     userId?: string
     nested?: boolean
     ownerRunId?: string
+    background?: true
     preserveIdentity?: boolean
   }
 
@@ -120,6 +122,7 @@ export function _touchDelegateInflightSurface(
       nested: input.nested,
       ownerRunId: input.ownerRunId,
       preserveIdentity: input.preserveIdentity,
+      background: input.background,
       ...fence,
     })
     if (patch) return
@@ -135,6 +138,7 @@ export function _touchDelegateInflightSurface(
       nested: input.nested,
       ownerRunId: input.ownerRunId,
       preserveIdentity: input.preserveIdentity,
+      background: input.background,
       ...fence,
     })
   } catch (err) {
@@ -319,6 +323,15 @@ export async function _completeDelegateResumeClaim(
     return
   }
   reg.markRetiring(input.sessionKey)
+  if (input.backgroundControl) {
+    const sessionKey = input.sessionKey
+    await waitForStrictSessionCleanup(async () => {
+      await this.sessions.retireKeepResume(sessionKey, { strictCleanup: true })
+      if (this.sessions.hasLiveSession(sessionKey)) throw new Error('strict retirement still has a live session')
+    }, error => this.log.warn('background delegate retirement pending cleanup ACK', { sessionKey, err: String(error) }))
+    reg.release(sessionKey)
+    return
+  }
   try {
     await this.sessions.retireKeepResume(input.sessionKey)
   } catch (err) {

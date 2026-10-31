@@ -37,6 +37,7 @@ import { readTaskboardDelegateBody, TaskboardBodyTimeoutError } from './taskboar
 import { classifyDelegateOutputError } from './errorClassify.js'
 import { DELEGATE_CONTEXT_HEADER, verifyDelegateContextToken } from './delegateContext.js'
 import { handoffDelegateWait } from './delegateWaitHandoff.js'
+import { backgroundDelegates, freezeBackgroundDelegateOwner, isDelegateBackgroundEffective } from './delegateBackground.js'
 import type { AgentSession } from './sessionManager.js'
 import { isHiddenSystemAgentId, isTeamReviewExecution } from './agentVisibility.js'
 import { backfillCronOccurrenceDelegateJobs } from './cron.js'
@@ -72,7 +73,7 @@ import {
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
 } from './delegateSmFlag.js'
-import { DelegateInflightSurfaceStore } from './delegateInflightSurface.js'
+import { foldDelegateCompletionSurface, flushBackgroundCompletion } from './delegateCompletionSurface.js'
 import { parseParentEngine } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
@@ -353,6 +354,7 @@ export function _ensureDelegateJobStore(this: DelegateRuntimeHost): DelegateJobS
     ttlMs: resolveDelegateJobTtlMs(),
     sm,
     durable,
+    canCommitTerminal: job => !backgroundDelegates(this).ownsActiveJob(job.id),
     onDrop: (job) => this._forgetDelegateInflight(job.id),
     onTerminal: (job) => {
       if (job.sessionKey) resume.release(job.sessionKey)
@@ -576,11 +578,32 @@ export async function handleDelegateTask(
   const taskboardBinding = entryContext ? taskboardRunControls.lookup(entryContext.sessionKey) : undefined
   if (taskboardBinding?.closed) return this.sendJson(res, 409, { error: 'USER_CANCELLED: task execution has finished', code: 'USER_CANCELLED', failure_class: 'cancelled' })
   const taskboardControl = taskboardBinding?.control ?? undefined
+  const entryLiveParent = entryContext ? this.sessions.getByKey(entryContext.sessionKey) : undefined
+  const inheritedBackground = entryContext ? backgroundDelegates(this).forSession(entryContext.sessionKey) : undefined
+  const entryOwner = !taskboardControl && !isTeamReviewExecution(targetAgentId)
+    ? freezeBackgroundDelegateOwner(entryContext, entryLiveParent)
+    : undefined
+  const entryProgress = entryOwner || inheritedBackground ? this._resolveDelegateProgressTarget({
+    parentSessionKey: entryContext?.sessionKey, sourceAgent: entryContext?.agentId,
+  }) : undefined
+  const entryParent = entryOwner || inheritedBackground ? this._resolveDelegateParent({
+    parentSessionKey: entryContext?.sessionKey, sourceAgent: entryContext?.agentId,
+  }) : undefined
+  if (entryParent?.platformGoal) entryParent.platformGoal = structuredClone(entryParent.platformGoal)
+  let preparingBackground: import('./delegateBackground.js').BackgroundDelegateScope | undefined
+  let transferredBackground = false
   let leavePending: (() => void) | undefined
   try {
-    leavePending = taskboardControl?.enterPending(entryContext!.sessionKey)
+    // Register preparation before body/config I/O. Main Stop can see it before a handle exists.
+    preparingBackground = entryOwner ? backgroundDelegates(this).begin(entryOwner) : undefined
+    const entryControl = taskboardControl ?? inheritedBackground ?? preparingBackground
+    if (inheritedBackground && !inheritedBackground.acceptsCaller(entryContext!.sessionKey, entryContext!.traceId)) {
+      throw new TaskboardCancelledError()
+    }
+    leavePending = taskboardControl?.enterPending(entryContext!.sessionKey) ?? inheritedBackground?.enterPending(entryContext!.sessionKey)
   const parentTraceId = entryContext?.traceId
-  const body = await readTaskboardDelegateBody(req, (request) => this.readBody(request), taskboardControl)
+  const body = await readTaskboardDelegateBody(req, (request) => this.readBody(request), entryControl)
+  entryControl?.assertOpen()
   let parsed: any
   try {
     parsed = JSON.parse(body)
@@ -601,6 +624,23 @@ export async function handleDelegateTask(
       'consult_advisor 只能走 /api/agents/advisor/consult，不能用 delegate',
     )
   }
+  const requestedBackground = parsed.async === true && parsed.resultDelivery === 'background' &&
+    !isTeamReviewExecution(targetAgentId) && !isSendToAgentCallbackComplete(parsed.callbackOnComplete)
+  // A formerly valid root token must never fall back to an unowned foreground
+  // spawn after its Stop beat this HTTP request (including the empty-scope gap).
+  if (requestedBackground && isDelegateBackgroundEffective() && entryContext?.depth === 0 &&
+      entryContext.traceId && entryContext.sessionKey.includes(':webchat:') &&
+      (!entryOwner && (!entryLiveParent?._runningClientMessageId ||
+        entryLiveParent._currentTurnTraceId !== entryContext.traceId))) throw new TaskboardCancelledError()
+  const background = requestedBackground && !!entryOwner && !!entryProgress?.target && !!entryParent
+  if (!background && preparingBackground) {
+    backgroundDelegates(this).finish(preparingBackground)
+    preparingBackground = undefined
+  }
+  const backgroundControl = background ? preparingBackground : inheritedBackground
+  const executionControl = taskboardControl ?? backgroundControl
+  const frozenProgress = backgroundControl ? entryProgress : undefined
+  const frozenParent = backgroundControl ? entryParent : undefined
   const { goal, context, sourceAgent, toolsets } = parsed
   if (!goal) return this.sendError(res, 400, DELEGATE_GOAL_REQUIRED_ERROR)
   const modelNorm = parseDelegateModel(parsed.model)
@@ -663,8 +703,8 @@ export async function handleDelegateTask(
   if (!entryContext && parentSessionKey && taskboardRunControls.lookup(parentSessionKey)) {
     return this.sendError(res, 403, 'taskboard delegation requires signed caller context')
   }
-  const identityProjection = await fetchIdentityCompatProjection()
-  taskboardControl?.assertOpen(parentSessionKey)
+  const identityProjection = await (backgroundControl?.wait(fetchIdentityCompatProjection()) ?? fetchIdentityCompatProjection())
+  executionControl?.assertOpen(parentSessionKey)
   const callerExecutionId =
     identityProjection && sourceAgentId
       ? resolveIdentityCompat(sourceAgentId, identityProjection).executionAgentId
@@ -703,6 +743,7 @@ export async function handleDelegateTask(
         jobId: existing.id,
         agentId: targetAgentId,
         sessionKey: resume.sessionKey,
+        ...(existing.callback === 'none' && background ? { resultDelivery: 'background' } : {}),
       })
     }
     return this.sendError(res, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE)
@@ -715,6 +756,10 @@ export async function handleDelegateTask(
     : undefined
   const runInput: RunDelegateInput = {
     taskboardControl,
+    backgroundControl,
+    backgroundOwner: backgroundControl?.owner,
+    backgroundProgress: frozenProgress,
+    backgroundParent: frozenParent,
     allowSelf: parseDelegateAllowSelf(parsed.allowSelf),
     targetAgentId,
     goal,
@@ -781,7 +826,7 @@ export async function handleDelegateTask(
       parentTraceId,
       queued: sm,
       kind: callbackOnComplete ? 'send_to_agent' : 'delegate',
-      callback: callbackOnComplete ? 'origin-inject' : 'stdout-wait',
+      callback: background ? 'none' : callbackOnComplete ? 'origin-inject' : 'stdout-wait',
       idempotencyKey: sm ? idempotencyKey : undefined,
       parentEngine: isDelegateNotifierEffective()
         ? this._resolveDelegateParentEngine(callbackTarget?.sessionKey ?? parentSessionKey)
@@ -806,24 +851,33 @@ export async function handleDelegateTask(
         agentId: targetAgentId,
         goal,
         state: existing?.state === 'queued' ? 'queued' : 'running',
-        userId: callbackTarget?.userId ?? requestUserId,
+        userId: backgroundControl?.owner.userId ?? callbackTarget?.userId ?? requestUserId,
       })
       return this.sendJson(res, 200, {
         status: existing?.state === 'queued' ? 'queued' : 'running',
         jobId: created.jobId,
         agentId: targetAgentId,
         sessionKey: resume.sessionKey,
+        ...(existing?.callback === 'none' && background ? { resultDelivery: 'background' } : {}),
       })
     }
     const jobId = created.jobId
+    if (backgroundControl) backgroundDelegates(this).beginJob(backgroundControl, jobId)
     runInput.backgroundJobId = jobId
+    if (backgroundControl && background) backgroundControl.jobId = jobId
+    if (backgroundControl && !sm) {
+      const snap = store.snapshotOf(jobId)
+      runInput.claimToken = snap?.claimToken
+      runInput.fencingEpoch = snap?.fencingEpoch
+    }
     this._touchDelegateInflightSurface({
       jobId,
       parentSessionKey,
       agentId: targetAgentId,
       goal,
       state: sm ? 'queued' : 'running',
-      userId: callbackTarget?.userId ?? requestUserId,
+      background: background ? true : undefined,
+      userId: backgroundControl?.owner.userId ?? callbackTarget?.userId ?? requestUserId,
     })
     this._delegateResume.bindJob(resume.sessionKey, idempotencyKey, jobId)
     if (callbackOnComplete && callbackTarget) {
@@ -840,6 +894,7 @@ export async function handleDelegateTask(
         await this._persistSendToAgentIntent(intent)
       } catch (err) {
         this._delegateResume.abort(resume.sessionKey, resume.minted)
+        if (backgroundControl) backgroundDelegates(this).endJob(backgroundControl, jobId)
         store.complete(jobId, {
           httpStatus: 503,
           body: { error: 'background callback persistence unavailable' },
@@ -856,10 +911,13 @@ export async function handleDelegateTask(
         goal,
       })
     }
+    transferredBackground = background
     void this._runDelegateTask(runInput)
       .then((result) => {
-        if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+        if (runInput._leaseTimer && !backgroundControl) clearInterval(runInput._leaseTimer)
+        if (backgroundControl?.signal.aborted && result.kind === 'completed') result.cancelled = true
         const mapped = this._delegateResultToHttp(result, targetAgentId)
+        if (backgroundControl && result.kind === 'completed' && result.cancelled) mapped.body.cancelled = true
         const fence =
           runInput.claimToken && runInput.fencingEpoch !== undefined
             ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
@@ -868,7 +926,7 @@ export async function handleDelegateTask(
           return
         }
         let winner = false
-        if (sm && result.kind === 'rejected' && result.failureClass) {
+        if ((sm || backgroundControl) && result.kind === 'rejected' && result.failureClass) {
           const dropped =
             result.failureClass === 'capacity_queue_full' && store.dropIfUnclaimed(jobId)
           if (dropped) {
@@ -884,13 +942,21 @@ export async function handleDelegateTask(
               nextState: result.failureClass === 'cancelled' ? 'cancelled' : 'failed',
             })
           }
-        } else if (sm) {
-          winner = store.complete(jobId, mapped, fence)
+        } else if (backgroundControl && result.kind === 'completed' && result.cancelled) {
+          winner = store.fail(jobId, {
+            failureClass: 'cancelled', detail: result.error || 'USER_CANCELLED',
+            httpStatus: mapped.httpStatus, body: mapped.body, claimToken: fence?.claimToken,
+            fencingEpoch: fence?.fencingEpoch, nextState: 'cancelled',
+          })
+        } else if (sm || backgroundControl) {
+          winner = store.complete(jobId, mapped, fence, backgroundControl ? { explicitTerminal: true } : undefined)
         } else {
           store.complete(jobId, mapped)
           winner = true
         }
+        if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
         if (!winner) return
+        flushBackgroundCompletion(runInput)
         const output = result.kind === 'completed' ? result.output : ''
         const error =
           result.kind === 'rejected' || result.kind === 'error'
@@ -913,12 +979,14 @@ export async function handleDelegateTask(
           runInput.claimToken && runInput.fencingEpoch !== undefined
             ? { claimToken: runInput.claimToken, fencingEpoch: runInput.fencingEpoch }
             : undefined
-        if (sm) {
-          const winner = store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence)
+        if (sm || backgroundControl) {
+          const winner = store.complete(jobId, { httpStatus: 500, body: { error: message } }, fence,
+            backgroundControl ? { explicitTerminal: true } : undefined)
           if (!winner) return
         } else {
           store.complete(jobId, { httpStatus: 500, body: { error: message } })
         }
+        flushBackgroundCompletion(runInput)
         this._queueSendToAgentCallback(runInput, {
           jobId,
           agentId: targetAgentId,
@@ -931,6 +999,7 @@ export async function handleDelegateTask(
       jobId,
       agentId: targetAgentId,
       sessionKey: resume.sessionKey,
+      ...(background ? { resultDelivery: 'background' } : {}),
     })
   }
   const result = await this._runDelegateTask(runInput)
@@ -942,6 +1011,7 @@ export async function handleDelegateTask(
     throw err
   } finally {
     leavePending?.()
+    if (preparingBackground && !transferredBackground) backgroundDelegates(this).finish(preparingBackground)
   }
 }
 
@@ -1078,12 +1148,14 @@ export async function _runDelegateTask(
   try {
     const binding = input.parentSessionKey ? taskboardRunControls.lookup(input.parentSessionKey) : undefined
     if (binding?.closed) throw new TaskboardCancelledError()
-    const control = input.taskboardControl ?? binding?.control ?? undefined
+    const control = input.taskboardControl ?? binding?.control ?? input.backgroundControl ?? undefined
     if (control) {
-      input.taskboardControl = control
+      if (!input.backgroundControl) input.taskboardControl = control as TaskboardRunControl
       input.sessionKey ??= `agent:${input.targetAgentId}:delegate:${input.sourceAgent || 'system'}:${Date.now()}-${randomBytes(4).toString('hex')}`
       const key = input.sessionKey
-      leave = control.enter(key, key === control.rootSessionKey ? undefined : input.parentSessionKey)
+      leave = control.enter(key, input.backgroundControl
+        ? (input.backgroundControl.members.has(input.parentSessionKey ?? '') ? input.parentSessionKey : undefined)
+        : key === input.taskboardControl?.rootSessionKey ? undefined : input.parentSessionKey)
       const stop = () => {
         cancelDelegateTraceWait(this, key)
         this._delegateQueueWaiters?.get(key)?.()
@@ -1098,8 +1170,8 @@ export async function _runDelegateTask(
     const result = await this._runDelegateTaskCore(input, {
       onSessionSpawned: () => { sessionSpawned = true },
     })
-    if (result.kind === 'completed' && control && input.sessionKey) {
-      control.recordResult({ executionId: result.runId, sessionKey: input.sessionKey, agentId: input.targetAgentId, actualModel: result.actualModel, output: result.output, error: result.error, cancelled: result.cancelled, tokensIn: result.tokensIn, tokensOut: result.tokensOut, costUsd: result.costUsd, costImprecise: result.costImprecise })
+    if (result.kind === 'completed' && input.taskboardControl && input.sessionKey) {
+      input.taskboardControl.recordResult({ executionId: result.runId, sessionKey: input.sessionKey, agentId: input.targetAgentId, actualModel: result.actualModel, output: result.output, error: result.error, cancelled: result.cancelled, tokensIn: result.tokensIn, tokensOut: result.tokensOut, costUsd: result.costUsd, costImprecise: result.costImprecise })
     }
     if (result.kind === 'completed' && input.resumable && input.sessionKey) return { ...result, sessionKey: input.sessionKey }
     return result
@@ -1107,10 +1179,13 @@ export async function _runDelegateTask(
     if (err instanceof TaskboardCancelledError) return { kind: 'rejected', httpStatus: 409, message: err.message, failureClass: 'cancelled', cancelled: true }
     throw err
   } finally {
-    if (input._leaseTimer) clearInterval(input._leaseTimer)
+    if (input.backgroundControl) input._backgroundCleanupPending = true
+    if (input._leaseTimer && !input.backgroundControl) clearInterval(input._leaseTimer)
     try {
       this._releasePreadmittedDelegateCapacity(input)
+      await input.backgroundControl?.waitForCleanup()
       await this._completeDelegateResumeClaim(input, sessionSpawned)
+      if (input.backgroundControl && !input.backgroundJobId) flushBackgroundCompletion(input)
     } finally {
       if (input.delegationGuardOwnerKey) {
         this._hiddenDelegateGuard.resetForParent(input.delegationGuardOwnerKey)
@@ -1118,6 +1193,10 @@ export async function _runDelegateTask(
       }
       detachStop?.()
       leave?.()
+      if (input.backgroundControl && input.backgroundJobId) backgroundDelegates(this).endJob(input.backgroundControl, input.backgroundJobId)
+      if (input.backgroundControl && input.backgroundControl.jobId === input.backgroundJobId) {
+        backgroundDelegates(this).finish(input.backgroundControl)
+      }
     }
   }
 }
@@ -1127,8 +1206,9 @@ export async function _runDelegateTaskCore(
   input: RunDelegateInput,
   hooks?: { onSessionSpawned?: () => void },
 ): Promise<DelegateTaskResult> {
+  const executionControl = input.taskboardControl ?? input.backgroundControl
   const cancelledBeforeSpawn: DelegateTaskResult = { kind: 'rejected', httpStatus: 409, message: 'USER_CANCELLED: stopped before model execution', failureClass: 'cancelled', cancelled: true }
-  input.taskboardControl?.assertOpen()
+  executionControl?.assertOpen()
   const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
   let context = input.context
   let isReview = input.isReview === true
@@ -1208,10 +1288,12 @@ export async function _runDelegateTaskCore(
   }
 
   // Find target agent
-  const cfg = await this._getAgentsConfig()
-  input.taskboardControl?.assertOpen()
-  const identityProjection = await fetchIdentityCompatProjection()
-  input.taskboardControl?.assertOpen()
+  const cfgPromise = this._getAgentsConfig()
+  const cfg = await (input.backgroundControl?.wait(cfgPromise) ?? cfgPromise)
+  executionControl?.assertOpen()
+  const identityPromise = fetchIdentityCompatProjection()
+  const identityProjection = await (input.backgroundControl?.wait(identityPromise) ?? identityPromise)
+  executionControl?.assertOpen()
   const targetIdentity = identityProjection
     ? resolveIdentityCompat(targetAgentId, identityProjection)
     : undefined
@@ -1283,13 +1365,14 @@ export async function _runDelegateTaskCore(
   // 开着时插入(生产没有 grok 本地 turn),catalog 无该行时候选循环自然跳过。
   const preferGrokDefault = !requestedModel && !isReview && isEngineLocalTurnExempt(process.env)
   try {
-    delegateExec = await resolveLocalExecutionIfEnforced({
+    const resolvingExecution = resolveLocalExecutionIfEnforced({
       agent: execAgent,
       kind: 'turn',
       model: requestedModel,
       defaultModel: this.deps.config.defaults.model,
       preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
     })
+    delegateExec = await (input.backgroundControl?.wait(resolvingExecution) ?? resolvingExecution)
   } catch (err) {
     const mapped = this._mapLocalExecutionError(err)
     if (!mapped) throw err
@@ -1345,7 +1428,7 @@ export async function _runDelegateTaskCore(
     }
   }
 
-  input.taskboardControl?.assertOpen()
+  executionControl?.assertOpen()
   const sessionKey =
     input.sessionKey ?? `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
   this.log.info('delegate', {
@@ -1355,7 +1438,7 @@ export async function _runDelegateTaskCore(
     depth,
   })
 
-  const progressRouting = this._resolveDelegateProgressTarget({
+  const progressRouting = input.backgroundProgress ?? this._resolveDelegateProgressTarget({
     parentSessionKey,
     sourceAgent,
   })
@@ -1364,7 +1447,7 @@ export async function _runDelegateTaskCore(
   // 嵌套(二级+):直接父是 delegate 会话 → 进度要挂到用户可见的一级委派卡,而非
   // 另开一张卡或(旧行为)整段丢弃。
   const nestedProgress = progressRouting?.nested === true
-  const delegateParent = this._resolveDelegateParent({
+  const delegateParent = input.backgroundParent ?? this._resolveDelegateParent({
     taskboardControl: input.taskboardControl,
     parentSessionKey,
     sourceAgent,
@@ -1374,7 +1457,7 @@ export async function _runDelegateTaskCore(
   // 随 usageAttribution → runner CLAUDE_CODE_EXTRA_METADATA env → master 计费点
   // 落 usage_records.mode='delegate' / parent_session_id / delegate_agent_id,
   // hidden-reviewer 与嵌套 delegate 同路径打标。
-  const parentClientSessionId = input.taskboardControl?.rootSessionKey ?? resolveDelegateParentClientSessionId({
+  const parentClientSessionId = input.taskboardControl?.rootSessionKey ?? input.backgroundOwner?.locator.parentSessionId ?? resolveDelegateParentClientSessionId({
     progressPeerId: progressTarget?.peerId,
     parentRepoSessionId: delegateParent?.repoSessionId,
     parentSessionKey,
@@ -1386,7 +1469,7 @@ export async function _runDelegateTaskCore(
   // 已不在内存),凭此 locator 走持久晚到 continuation,不再依赖可变会话状态。
   // parentSessionId 用与 owner turn tape 相同的 webchat client session id
   // (= progressTarget.peerId),保证账务 locator 与 tape sessionId 一致。
-  const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = progressTarget
+  const delegateOwnerLocator: DelegateOwnerTurnLocator | undefined = input.backgroundOwner?.locator ?? (progressTarget
     ? (() => {
         const ownerSession = this.sessions.getByKey(progressTarget.sessionKey)
         const ownerTurnKey = ownerSession?._currentTurnKey
@@ -1399,7 +1482,7 @@ export async function _runDelegateTaskCore(
             (Number.isSafeInteger(ownerSession.turns) ? Math.max(1, ownerSession.turns + 1) : 1),
         }
       })()
-    : undefined
+    : undefined)
   if (delegateOwnerLocator) {
     const map = (this._delegateOwnerByRunId ??= new Map())
     map.set(progressRunId, delegateOwnerLocator)
@@ -1433,7 +1516,7 @@ export async function _runDelegateTaskCore(
     : ''
   // Live lookup each emit: a retry may have moved the parent cmid, and a
   // terminated parent must not keep receiving dispatch:<old>:N frames.
-  const emitProgress = (block: DelegateProgressBlock | null) => {
+  const emitProgress = (block: DelegateProgressBlock | null, afterCleanup = false) => {
     if (!progressTarget || !block) return
     // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
     // (done/error 也降为 text,避免嵌套子委派的终态帧提前关掉一级卡)。返回 null → 丢弃。
@@ -1445,10 +1528,21 @@ export async function _runDelegateTaskCore(
         })
       : block
     if (!outBlock) return
+    const backgroundStopped = input.backgroundControl?.signal.aborted === true
+    const terminalProgress = outBlock.phase === 'error' || outBlock.phase === 'done'
+    if (input.backgroundControl && terminalProgress && !afterCleanup) {
+      ;(input.backgroundCompletionActions ??= []).push(() => emitProgress(block, true))
+      return
+    }
+    const deliveredBlock = input.backgroundControl ? {
+      ...outBlock, background: true as const, jobId: input.backgroundControl.jobId,
+      ...(backgroundStopped ? { cancelled: true as const,
+        ...(terminalProgress ? { text: '已停止', block: undefined } : {}) } : {}),
+    } : outBlock
     const parentSession = this.sessions.getByKey(progressTarget.sessionKey)
     const liveCmid =
-      parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId
-    const binding = resolveDelegateProgressBinding({
+      input.backgroundOwner?.clientMessageId ?? parentSession?._runningClientMessageId ?? parentSession?._currentDispatch?.clientMessageId
+    const binding = input.backgroundOwner ? { clientMessageId: input.backgroundOwner.clientMessageId } : resolveDelegateProgressBinding({
       candidate: typeof liveCmid === 'string' ? liveCmid : undefined,
       isFenced: (cmid) =>
         this._outboundRing?.isTurnFenced(progressTarget.sessionKey, cmid) === true,
@@ -1459,7 +1553,7 @@ export async function _runDelegateTaskCore(
       channel: progressTarget.channel,
       peer: { id: progressTarget.peerId, kind: 'dm' as const },
       ...(binding.clientMessageId ? { clientMessageId: binding.clientMessageId } : {}),
-      blocks: [outBlock as any],
+      blocks: [deliveredBlock as any],
       isFinal: false,
       _userId: progressTarget.userId,
     }
@@ -1472,7 +1566,7 @@ export async function _runDelegateTaskCore(
       agentLabel: targetAgent.displayName || targetAgentId,
       parallelCount: this._activeDelegationsByParent.get(progressTarget.sessionKey)?.size,
     })
-    if (liveDetail) {
+    if (liveDetail && !input.backgroundControl) {
       this.deliver(
         _buildTurnStatusFrame(
           {
@@ -1499,6 +1593,7 @@ export async function _runDelegateTaskCore(
       userId: progressTarget.userId,
       preserveIdentity: nestedProgress,
       ownerRunId: emitProgressRunId,
+      background: input.backgroundControl ? true : undefined,
     })
   }
   const streamProgress = progressTarget && input.streamProgress === true
@@ -1522,10 +1617,10 @@ export async function _runDelegateTaskCore(
     delegateParent?.sessionKey,
     sessionKey,
   )
-  if (input.taskboardControl?.signal.aborted) {
+  if (executionControl?.signal.aborted) {
     unregisterDelegation?.()
     this._delegateOwnerByRunId?.delete(progressRunId)
-    await input.taskboardControl.waitForDescendants(sessionKey)
+    await executionControl.waitForDescendants(sessionKey)
     return cancelledBeforeSpawn
   }
   let queuedNoticeSent = false
@@ -1632,9 +1727,9 @@ export async function _runDelegateTaskCore(
     admission?: DelegateEngineBillingAdmission | null,
   ): Promise<DelegateTaskResult> => {
     try {
-      await input.taskboardControl?.waitForDescendants(sessionKey)
+      await executionControl?.waitForDescendants(sessionKey)
       if (admission) await (this._delegateEngineBilling ?? defaultDelegateEngineBilling).abandon(admission.requestId).catch(() => {})
-      if (route) await route.release()
+      if (route) await route.release(input.backgroundControl ? { waitForAck: true } : undefined)
       return cancelledBeforeSpawn
     } finally {
       this._delegateOwnerByRunId?.delete(progressRunId)
@@ -1642,7 +1737,7 @@ export async function _runDelegateTaskCore(
       unregisterDelegation?.()
     }
   }
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  if (executionControl?.signal.aborted) return cancelPreparation()
   if (isDelegateSmEnabled() && input.backgroundJobId) {
     const claimed = this._delegateJobs?.claimQueued(input.backgroundJobId)
     if (!claimed?.ok) {
@@ -1681,10 +1776,11 @@ export async function _runDelegateTaskCore(
     let beats = 0
     const timer = setInterval(() => {
       beats += 1
-      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS
-      const ok = !capHit && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
-      if (!ok) {
-        clearInterval(timer)
+      const capHit = beats > DELEGATE_LEASE_HEARTBEAT_MAX_BEATS && !input._backgroundCleanupPending && !input.backgroundControl?.signal.aborted
+      const ok = (!capHit || !!input.backgroundControl) && this._delegateJobs?.casHeartbeat(jobId, tok, epoch)
+      if (capHit || !ok) {
+        if (capHit && input.backgroundControl) input._backgroundCleanupPending = true
+        if (!input.backgroundControl || !ok) clearInterval(timer)
         // Child key is local `sessionKey` (`input.sessionKey ?? generated`).
         // `input.sessionKey` is optional and must not be passed to interrupt().
         if (!sessionKey) {
@@ -1726,10 +1822,11 @@ export async function _runDelegateTaskCore(
       ? { claimToken: input.claimToken, fencingEpoch: input.fencingEpoch }
       : jobSnapshot?.claimToken ? { claimToken: jobSnapshot.claimToken, fencingEpoch: jobSnapshot.fencingEpoch } : undefined
     try {
-      const trace = await mintDelegateTrace({
+      const mintingTrace = mintDelegateTrace({
         sessionKey, agentId: targetAgentId, delegateRunId: input.backgroundJobId ?? progressRunId,
         parentTraceId: input.parentTraceId, model: delegateExec?.canonicalModel ?? requestedModel,
       })
+      const trace = await (input.backgroundControl?.wait(mintingTrace) ?? mintingTrace)
       if (!traceWait.isAborted() && trace) {
         if (input.backgroundJobId && (!fence || !this._delegateJobs?.bindTrace(input.backgroundJobId, trace, fence))) {
           traceAborted = true
@@ -1744,13 +1841,14 @@ export async function _runDelegateTaskCore(
     const current = input.backgroundJobId ? this._delegateJobs?.snapshotOf(input.backgroundJobId) : undefined
     if (input.backgroundJobId && (!current || current.state !== 'running' || !fence ||
         current.claimToken !== fence.claimToken || current.fencingEpoch !== fence.fencingEpoch)) traceAborted = true
-    if (traceAborted || traceWait.isAborted() || this._shuttingDown || input.taskboardControl?.signal.aborted) {
+    if (traceAborted || traceWait.isAborted() || this._shuttingDown || executionControl?.signal.aborted) {
       if (input._leaseTimer) clearInterval(input._leaseTimer)
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       return { kind: 'rejected', httpStatus: 409, message: 'delegate cancelled before spawn', failureClass: 'cancelled' }
     }
   }
+  input.backgroundControl?.bindTrace(sessionKey, input.traceId)
   if (!input.traceId) this.log.warn('delegate_trace_unbound', {
     parentTraceId: input.parentTraceId, delegateRunId: input.backgroundJobId ?? progressRunId,
     reason: traceMissingReason,
@@ -1770,7 +1868,7 @@ export async function _runDelegateTaskCore(
     requestedModel,
     agentModel: execAgent.model,
   })
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation()
+  if (executionControl?.signal.aborted) return cancelPreparation()
   let grokRoute: { baseUrl: string; routeToken: string } | null = null
   let grokRouteLease: DelegateGrokRouteLease | null = null
   if (grokDelegate) {
@@ -1783,12 +1881,21 @@ export async function _runDelegateTaskCore(
         message: 'Grok 委派暂不可用: missing grok model id',
       }
     }
-    const acquired = await (this._acquireDelegateGrokRoute ?? acquireDelegateGrokRoute)({
+    const acquiringRoute = (this._acquireDelegateGrokRoute ?? acquireDelegateGrokRoute)({
       modelId: grokMintModelId,
       sessionId: sessionKey,
       log: this.log,
     })
-    if (input.taskboardControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
+    let acquired: Awaited<typeof acquiringRoute>
+    try {
+      acquired = await (input.backgroundControl?.wait(acquiringRoute, async result => {
+        if (result.ok) await result.lease.release({ waitForAck: true })
+      }) ?? acquiringRoute)
+    } catch (error) {
+      if (input.backgroundControl?.signal.aborted) return cancelPreparation()
+      throw error
+    }
+    if (executionControl?.signal.aborted) return cancelPreparation(acquired.ok ? acquired.lease : null)
     if (!acquired.ok && !requestedModel) {
       // 默认路径(用户没显式要 grok):mint 失败(订阅并发满 / 容器租约上限 / 无账号 /
       // master 通道缺失)不拒,同一请求内回落到 ccb 的 DELEGATE_GROK_FALLBACK_MODEL,
@@ -1801,13 +1908,15 @@ export async function _runDelegateTaskCore(
         to: DELEGATE_GROK_FALLBACK_MODEL,
       })
       try {
-        delegateExec = await resolveLocalExecutionIfEnforced({
+        const resolvingFallback = resolveLocalExecutionIfEnforced({
           agent: { ...delegatedAgent, model: DELEGATE_GROK_FALLBACK_MODEL },
           kind: 'turn',
           model: DELEGATE_GROK_FALLBACK_MODEL,
           defaultModel: this.deps.config.defaults.model,
         })
+        delegateExec = await (input.backgroundControl?.wait(resolvingFallback) ?? resolvingFallback)
       } catch (err) {
+        if (input.backgroundControl?.signal.aborted) return cancelPreparation()
         const mapped = this._mapLocalExecutionError(err)
         if (!mapped) {
           this._releaseDelegateSlot(slotOpts)
@@ -1847,7 +1956,7 @@ export async function _runDelegateTaskCore(
   // engine-reported (codex/grok) 委派必须先向 master 签 32-hex requestId +
   // inflight journal,否则 adapter 不 emit billing,usage_records.mode=delegate
   // 永远为空。CCB/GLM 走 anthropicProxy,不进这条。失败 fail-closed,禁止白跑。
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease)
+  if (executionControl?.signal.aborted) return cancelPreparation(grokRouteLease)
   const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
   const engineReported = shouldAdmitDelegateEngineBilling({
     delegateEngine: delegateExec?.engine,
@@ -1860,7 +1969,10 @@ export async function _runDelegateTaskCore(
   if (engineReported) {
     const billingModel = delegateExec?.canonicalModel || requestedModel || execAgent.model
     if (!billingModel) {
-      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      if (grokRouteLease) {
+        if (input.backgroundControl) await grokRouteLease.release({ waitForAck: true })
+        else void grokRouteLease.release().catch(() => {})
+      }
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       return {
@@ -1870,7 +1982,7 @@ export async function _runDelegateTaskCore(
       }
     }
     try {
-      engineBillingAdmission = await billingApi.admit({
+      const admittingBilling = billingApi.admit({
         model: billingModel,
         engine: resolveDelegateEngineBillingEngine({
           delegateEngine: delegateExec?.engine,
@@ -1880,12 +1992,18 @@ export async function _runDelegateTaskCore(
         delegateAgentId: targetAgentId,
         sessionKey,
         ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
-        ...(delegateParent?.billingParentTurnKey
-          ? { parentTurnKey: delegateParent.billingParentTurnKey }
+        ...((input.backgroundOwner?.locator.parentTurnKey ?? delegateParent?.billingParentTurnKey)
+          ? { parentTurnKey: input.backgroundOwner?.locator.parentTurnKey ?? delegateParent!.billingParentTurnKey }
           : {}),
       })
+      engineBillingAdmission = await (input.backgroundControl?.wait(admittingBilling,
+        receipt => billingApi.abandon(receipt.requestId).catch(() => {})) ?? admittingBilling)
     } catch (err) {
-      if (grokRouteLease) grokRouteLease.release().catch(() => {})
+      if (input.backgroundControl?.signal.aborted) return cancelPreparation(grokRouteLease)
+      if (grokRouteLease) {
+        if (input.backgroundControl) await grokRouteLease.release({ waitForAck: true })
+        else void grokRouteLease.release().catch(() => {})
+      }
       this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
       const mapped = mapDelegateEngineBillingError(err)
@@ -1901,7 +2019,7 @@ export async function _runDelegateTaskCore(
       }
     }
   }
-  if (input.taskboardControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
+  if (executionControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
   // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
   // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
   const durableTranscript: unknown[] = []
@@ -1916,7 +2034,7 @@ export async function _runDelegateTaskCore(
   let session: AgentSession
   let detachAncestorActivity: (() => void) | undefined
   try {
-    session = await this.sessions.getOrCreate({
+    const creatingSession = this.sessions.getOrCreate({
       sessionKey,
       agent: execAgent,
       // flag 未开 → {}(零变化);flag 开 → catalog 投影的 canonicalModel + engine。
@@ -1938,13 +2056,15 @@ export async function _runDelegateTaskCore(
         mode: 'delegate',
         delegateAgentId: targetAgentId,
         ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
-        ...(delegateParent?.billingParentTurnKey
-          ? { parentTurnKey: delegateParent.billingParentTurnKey }
+        ...((input.backgroundOwner?.locator.parentTurnKey ?? delegateParent?.billingParentTurnKey)
+          ? { parentTurnKey: input.backgroundOwner?.locator.parentTurnKey ?? delegateParent!.billingParentTurnKey }
           : {}),
       },
     })
-    if (input.taskboardControl?.signal.aborted) {
-      await this.sessions.destroySession(sessionKey)
+    session = await (input.backgroundControl?.wait(creatingSession,
+      () => this.sessions.destroySession(sessionKey, { strictCleanup: true })) ?? creatingSession)
+    if (executionControl?.signal.aborted) {
+      await this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined)
       return cancelPreparation(grokRouteLease, engineBillingAdmission)
     }
     hooks?.onSessionSpawned?.()
@@ -1958,7 +2078,7 @@ export async function _runDelegateTaskCore(
       : null
     const handleChildActivity = () => {
       markChildActivity()
-      this._markDelegateAncestorActivity(delegateParent?.sessionKey)
+      if (!input.backgroundControl) this._markDelegateAncestorActivity(delegateParent?.sessionKey)
     }
     session.runner.on?.('activity', handleChildActivity)
     detachAncestorActivity = () => session.runner.off?.('activity', handleChildActivity)
@@ -1975,6 +2095,7 @@ export async function _runDelegateTaskCore(
       userId: progressTarget?.userId,
       nested: nestedProgress,
       ownerRunId: nestedProgress ? emitProgressRunId : undefined,
+      background: input.backgroundControl ? true : undefined,
     })
     if (streamProgress) {
       emitProgress(
@@ -1992,10 +2113,14 @@ export async function _runDelegateTaskCore(
       )
     }
   } catch (err) {
+    if (input.backgroundControl?.signal.aborted) return cancelPreparation(grokRouteLease, engineBillingAdmission)
     if (engineBillingAdmission) {
       await billingApi.abandon(engineBillingAdmission.requestId).catch(() => {})
     }
-    if (grokRouteLease) grokRouteLease.release().catch(() => {})
+    if (grokRouteLease) {
+      if (input.backgroundControl) await grokRouteLease.release({ waitForAck: true })
+      else void grokRouteLease.release().catch(() => {})
+    }
     this._releaseDelegateSlot(slotOpts)
     unregisterDelegation?.()
     // flag 未开时 resolveLocalExecutionIfEnforced 是 no-op,显式未知型号在
@@ -2016,7 +2141,7 @@ export async function _runDelegateTaskCore(
   // P2 债C — 标记"本 turn 队长实际发生过非隐藏委派"(据此在队长 final 放行前触发硬编排
   // 审查)。审查员自身(isReview / hidden)不置位,避免"审查=组队"的自指。progressTarget
   // 是 webchat 父,null 父(cron/嵌套)不置位。
-  if (!isReview && !isHiddenSystemAgentId(targetAgentId) && progressTarget) {
+  if (!input.backgroundControl && !isReview && !isHiddenSystemAgentId(targetAgentId) && progressTarget) {
     ;(this._turnDelegatedNonHiddenByParent ??= new Set()).add(progressTarget.sessionKey)
   }
 
@@ -2074,10 +2199,10 @@ export async function _runDelegateTaskCore(
       reject(err)
     }, timeoutConfig.checkIntervalMs)
   })
-  if (input.taskboardControl?.signal.aborted) {
+  if (executionControl?.signal.aborted) {
     clearTimeoutTimer()
     detachAncestorActivity?.()
-    await this.sessions.destroySession(sessionKey)
+    await this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined)
     return cancelPreparation(grokRouteLease, engineBillingAdmission)
   }
   const submitPromise = this.sessions.submit(
@@ -2165,7 +2290,8 @@ export async function _runDelegateTaskCore(
     engineBillingAdmission?.requestId,
     input.traceId,
     undefined,
-    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
+    { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}),
+      ...(input.backgroundControl ? { cancellationSignal: input.backgroundControl.signal } : {}) },
   )
   try {
     await Promise.race([submitPromise, timeoutPromise])
@@ -2206,6 +2332,7 @@ export async function _runDelegateTaskCore(
       ...(verdict ? { verdict } : {}),
     })
   } catch (err: any) {
+    if (input.backgroundControl) input._backgroundCleanupPending = true
     error = error || err?.message || String(err)
     if (err?.name === 'DelegateTimeoutError') {
       timedOut = true
@@ -2305,7 +2432,8 @@ export async function _runDelegateTaskCore(
     }
     this._runLog.complete(_dlgRun, { status: 'failed', error })
   } finally {
-    await input.taskboardControl?.waitForDescendants(sessionKey)
+    if (input.backgroundControl) input._backgroundCleanupPending = true
+    await executionControl?.waitForDescendants(sessionKey)
     clearTimeoutTimer()
     detachAncestorActivity?.()
     if (engineBillingAdmission) {
@@ -2368,7 +2496,7 @@ export async function _runDelegateTaskCore(
     this._releaseDelegateSlot(slotOpts)
     // grok delegate 的 master 侧账号槽/路由上下文收尾(release 幂等且内部吞错,
     // 不会因清理失败让已完成的委派翻成失败)。
-    if (grokRouteLease) await grokRouteLease.release()
+    if (grokRouteLease) await grokRouteLease.release(input.backgroundControl ? { waitForAck: true } : undefined)
     // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
     // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
     // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey
@@ -2379,13 +2507,14 @@ export async function _runDelegateTaskCore(
     // HTTP/MCP resumable 走外层 _completeDelegateResumeClaim:await retireKeepResume
     // (杀 runner,保留 resume-map),占用栅栏在退休完成前不释放。
     if (!input.resumable) {
-      const destroy = this.sessions.destroySession(sessionKey).catch((err) =>
+      const destroy = this.sessions.destroySession(sessionKey, input.backgroundControl ? { strictCleanup: true } : undefined).catch((err) =>
         this.log.warn('delegate session destroy failed', { sessionKey, err: String(err) }),
       )
-      if (input.taskboardControl) await destroy
+      if (input.taskboardControl || input.backgroundControl) await destroy
     }
   }
 
+  if (input.backgroundControl?.signal.aborted) cancelled = true
   eventBus.emit(
     'agent.completed',
     createEvent('agent.completed', targetAgentId, {
@@ -2404,7 +2533,7 @@ export async function _runDelegateTaskCore(
   // collector is unexpectedly absent, persist a separate top-level card
   // instead of silently losing the nested reply.
   const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
-  const resultSummary = error ? error : output.trim()
+  const resultSummary = input.backgroundControl && cancelled ? output.trim() || '已停止' : error ? error : output.trim()
   const goalUsageRecords = [
     ...(ownGoalUsageRecord ? [ownGoalUsageRecord] : []),
     ...durableGoalUsageRecords,
@@ -2438,6 +2567,7 @@ export async function _runDelegateTaskCore(
     }
   }
   const durableGroup: DurableAgentGroup = {
+    ...(input.backgroundControl ? { background: true as const, ...(input.backgroundJobId === input.backgroundControl.jobId ? { jobId: input.backgroundJobId } : {}), ...(cancelled ? { cancelled: true } : {}) } : {}),
     runId: progressRunId,
     agentId: targetAgentId,
     goal,
@@ -2457,6 +2587,10 @@ export async function _runDelegateTaskCore(
   // 不把 FIFO Map 当归属权威。progressTarget 存在但 launch 未能冻结 owner
   // 时不得 ownerless 写入当前(可能已是 T2) turn。
   const deliverDelegateGroupCard = (): void => {
+    if (input.backgroundControl?.signal.aborted) {
+      durableGroup.cancelled = true
+      durableGroup.resultSummary = output.trim() || '已停止'
+    }
     if (!progressTarget) return
     if (!delegateOwnerLocator) {
       this.log.warn('delegate card dropped: missing frozen owner locator', {
@@ -2479,7 +2613,8 @@ export async function _runDelegateTaskCore(
   }
   this._delegateOwnerByRunId?.delete(progressRunId)
   if (progressTarget && !nestedProgress) {
-    deliverDelegateGroupCard()
+    if (input.backgroundControl) (input.backgroundCompletionActions ??= []).push(deliverDelegateGroupCard)
+    else deliverDelegateGroupCard()
   } else if (nestedProgress && delegateParent) {
     const directParent = this.sessions.getByKey(delegateParent.sessionKey)
     if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
@@ -2520,51 +2655,15 @@ export async function _runDelegateTaskCore(
       deliverDelegateGroupCard()
     }
   }
-  if (isDelegateInflightSurfaceEffective()) {
-    try {
-      const parentKey = progressTarget?.sessionKey ?? parentSessionKey
-      const jobId = DelegateInflightSurfaceStore.resolveJobId(input.backgroundJobId, progressRunId)
-      if (jobId && parentKey) {
-        const surface = this._ensureDelegateInflightSurface()
-        const snap = input.backgroundJobId
-          ? this._delegateJobs?.snapshotOf(String(input.backgroundJobId))
-          : undefined
-        const fence = snap ? { fencingEpoch: snap.fencingEpoch, generation: snap.generation } : {}
-        if (!surface.get(jobId)) {
-          surface.upsertEnqueue({
-            jobId,
-            parentSessionKey: parentKey,
-            agentId: targetAgentId,
-            goal,
-            runId: progressRunId,
-            state: 'running',
-            userId: progressTarget?.userId,
-            nested: nestedProgress,
-            ownerRunId: nestedProgress ? emitProgressRunId : undefined,
-            ...fence,
-          })
-        }
-        surface.foldTerminal({
-          jobId,
-          group: durableGroup,
-          // Job CAS winner is authority: a killed/failed/cancelled job must
-          // not be rewritten as completed by a late runner. Same-terminal
-          // non-authoritative folds are rejected by the surface so a late
-          // runner cannot replace the authoritative failure payload.
-          state: snap && isDelegateTerminalState(snap.state) ? snap.state : 'completed',
-          parentSessionKey: parentKey,
-          userId: progressTarget?.userId,
-          ...fence,
-        })
-      }
-    } catch (err) {
-      this.log.warn(
-        'delegate inflight surface fold failed',
-        { jobId: input.backgroundJobId, progressRunId },
-        err as Error,
-      )
-    }
-  }
+  const foldCompletedSurface = () => foldDelegateCompletionSurface(this, {
+    jobId: input.backgroundJobId, progressRunId,
+    parentSessionKey: progressTarget?.sessionKey ?? parentSessionKey,
+    userId: progressTarget?.userId, agentId: targetAgentId, goal, nested: nestedProgress,
+    ownerRunId: nestedProgress ? emitProgressRunId : undefined,
+    group: durableGroup, background: !!input.backgroundControl, cancelled,
+  })
+  if (input.backgroundControl) (input.backgroundCompletionActions ??= []).push(foldCompletedSurface)
+  else foldCompletedSurface()
 
   const priced = await resolveDelegateCostUsd({
     ...session,
@@ -2858,7 +2957,7 @@ export function _applyDelegateCapacityReject(
 ): DelegateTaskResult {
   const jobId = input.backgroundJobId
   const store = this._delegateJobs
-  if (jobId && store) {
+  if (jobId && store && !input.backgroundControl) {
     if (store.smEnabled) {
       const outcome = store.settleCapacityReject(jobId, {
         failureClass: args.failureClass ?? 'capacity_timeout',

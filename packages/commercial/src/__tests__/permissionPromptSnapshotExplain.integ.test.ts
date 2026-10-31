@@ -13,6 +13,7 @@ import {
   PERMISSION_PROMPT_LOOKUP_SQL,
   PERMISSION_PROMPT_SNAPSHOT_SQL,
   readPendingPermissionPromptsForSessions,
+  readPendingPermissionPrompts,
   readPermissionPromptSnapshot,
   readPermissionPromptsByRequestIds,
 } from '../dispatch/turnControlStore.js'
@@ -71,6 +72,7 @@ before(async () => {
       session_id TEXT NOT NULL,
       root_client_message_id TEXT,
       kind TEXT NOT NULL,
+      payload_json JSONB NOT NULL DEFAULT '{}',
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -128,6 +130,32 @@ function skipIfNeeded(t: { skip: (reason: string) => void }): boolean {
 }
 
 describe('OCV5-185 isolated PG EXPLAIN + 200+ scale', () => {
+  test('background-only Stop cannot settle or hide the current confirmation on any read surface', async (t) => {
+    if (skipIfNeeded(t)) return
+    const sessionId = 'sess-background-confirmation'
+    // Shared fixture: later tests count the 320 seeded rows, so remove ours.
+    t.after(() => pool.query(`WITH p AS (DELETE FROM turn_permission_requests WHERE session_id=$1)
+      DELETE FROM turn_control_requests WHERE session_id=$1`, [sessionId]))
+    await pool.query(`INSERT INTO turn_permission_requests
+      (user_id,request_id,session_id,client_message_id,tool_name,input_sha256,input_json,expires_at,created_at)
+      VALUES (3,'req-background-confirmation',$1,'new-parent','Bash',repeat('a',64),
+        '{"command":"publish"}',NOW()+interval '10 minutes',NOW()-interval '1 minute')`, [sessionId])
+    await pool.query(`INSERT INTO turn_control_requests
+      (control_id,user_id,session_id,root_client_message_id,kind,status,payload_json)
+      VALUES ('ctl-background-only',3,$1,NULL,'stop','applied',
+        '{"type":"inbound.control.stop","backgroundJobIds":["dlgjob-old"]}')`, [sessionId])
+    const pending = await readPendingPermissionPrompts(pool, { userId: 3n, sessionId })
+    assert.deepEqual(pending.map((row) => row.requestId), ['req-background-confirmation'])
+    const hello = await readPendingPermissionPromptsForSessions(pool, { userId: 3n, sessionIds: [sessionId] })
+    assert.deepEqual(hello.bySession.get(sessionId)?.map((row) => row.requestId), ['req-background-confirmation'])
+    const snapshot = await readPermissionPromptSnapshot(pool, { userId: 3n, sessionId })
+    assert.equal(snapshot.items[0]?.status, 'pending')
+    const lookup = await readPermissionPromptsByRequestIds(pool, {
+      userId: 3n, sessionId, requestIds: ['req-background-confirmation'],
+    })
+    assert.equal(lookup[0]?.status, 'pending')
+  })
+
   test('seeded 320 rows (40 sessions × 8)', async (t) => {
     if (skipIfNeeded(t)) return
     const count = await pool.query('SELECT count(*)::int AS n FROM turn_permission_requests')
