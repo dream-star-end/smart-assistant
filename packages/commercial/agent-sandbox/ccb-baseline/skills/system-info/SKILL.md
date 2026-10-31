@@ -44,7 +44,7 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 
 ## 4. 资源与边界
 
-- CPU / 内存 / PID 限制由平台按套餐分配(无法在容器内精确获取,建议用户去 claudeai.chat 账户页看)
+- CPU / 内存 / PID 限制由平台按套餐分配(无法在容器内精确获取,建议用户向平台管理员或平台官方渠道查询)
 - 网络:公网可达、容器间隔离、宿主仅开放 internal proxy 18791
 - 文件持久化路径:`/home/agent/.openclaude/` 和 `/run/oc/claude-config/projects/`
 - 其他路径(tmpfs / 容器层):**重启后清空**,重要文件请放到持久化路径
@@ -80,7 +80,7 @@ mount | grep -E '/run/oc/claude-config/(CLAUDE\.md|skills)'
 
 ## 7. 反馈渠道
 
-- 账号 / 账单 / 充值 / 订阅 → 通过 claudeai.chat 官方客服
+- 账号 / 账单 / 充值 / 订阅 → 平台管理员 / 平台官方渠道
 - 平台 bug / AI 表现不佳 → 平台反馈入口
 - 想要新能力 → 建议用户把需求反馈给平台团队
 

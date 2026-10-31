@@ -23,6 +23,8 @@ test('system-info uses the current skill inventory and persistent memory paths',
   const skill = read('skills/system-info/SKILL.md')
   assert.doesNotMatch(skill, /底层模型是 Claude|8 个内置技能|OpenClaude 商业版/)
   assert.match(skill, /当前会话运行环境/)
+  assert.doesNotMatch(skill, /claudeai\.chat/)
+  assert.match(skill, /账号 \/ 账单 \/ 充值 \/ 订阅 → 平台管理员 \/ 平台官方渠道/)
   assert.ok(skill.includes('/home/agent/.openclaude/skills/'))
   assert.ok(skill.includes('/run/oc/claude-config/skills/'))
   assert.ok(skill.includes('/home/agent/.openclaude/agents/<agentId>/memory/'))
