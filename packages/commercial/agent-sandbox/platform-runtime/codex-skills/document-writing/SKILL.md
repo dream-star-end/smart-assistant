@@ -104,6 +104,8 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 # If L0 FAIL: retry generation once with a new filename; second FAIL → tell the user the failures[].message. Never print that path.
 ```
 
-Print **only** the FINAL absolute path, on its own line. Do not wrap it in a fenced code block. Never invent URLs, ports, tokens, or curl fallbacks. Do not print `.deliver.json` sidecars. Two or more deliverables → `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- file1 file2` and print the zip path only.
+Save every file delivered to the user under `/home/agent/.openclaude/generated/<filename>`. List the full FINAL absolute path of every main deliverable separately, each on its own line; when delivering Word + PDF, list both `.docx` and `.pdf` for independent previews and downloads. Do not wrap paths in a fenced code block. Never invent URLs, ports, tokens, or curl fallbacks. Do not print `.deliver.json` sidecars.
+
+Only for larger batches (for example ≥5 files) or an explicit user request for an archive, use `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- file1 file2 ...` to additionally include a summary `.zip` path. The archive must not replace the individual paths of the main deliverables.
 
 Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-artifact-qa` commands.
