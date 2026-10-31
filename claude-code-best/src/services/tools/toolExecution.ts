@@ -21,6 +21,7 @@ import {
 import {
   addToToolDuration,
   getCodeEditToolDecisionCounter,
+  getSessionId,
   getStatsStore,
 } from '../../bootstrap/state.js'
 import {
@@ -61,6 +62,11 @@ import type {
 import { count } from '../../utils/array.js'
 import { createAttachmentMessage } from '../../utils/attachments.js'
 import { logForDebugging } from '../../utils/debug.js'
+import {
+  applyEditDriftToToolResultBlock,
+  editDriftScopeId,
+  editDriftTurnIdFromMessages,
+} from '../../utils/editDrift.js'
 import { isOpenClaudeAdvisorHermetic } from '../../utils/envUtils.js'
 import {
   AbortError,
@@ -79,6 +85,7 @@ import {
   createUserMessage,
   withMemoryCorrectionHint,
 } from '../../utils/messages.js'
+import { expandPath } from '../../utils/path.js'
 import type {
   PermissionDecisionReason,
   PermissionResult,
@@ -1383,6 +1390,18 @@ async function checkPermissionsAndCallTool(
       result.data,
       toolUseID,
     )
+    // One reminder per file per user turn. Never fail the edit or touch billing.
+    try {
+      applyEditDriftToToolResultBlock(mappedToolResultBlock, {
+        toolName: tool.name,
+        input: processedInput,
+        scopeId: editDriftScopeId(getSessionId(), toolUseContext.agentId),
+        turnId: editDriftTurnIdFromMessages(toolUseContext.messages),
+        normalizePath: expandPath,
+      })
+    } catch (err) {
+      logForDebugging(`edit drift reminder skipped: ${errorMessage(err)}`)
+    }
     const mappedContent = mappedToolResultBlock.content
     const toolResultSizeBytes = !mappedContent
       ? 0
