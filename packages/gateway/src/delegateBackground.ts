@@ -110,7 +110,9 @@ export class BackgroundDelegateScope {
     if (member) member.traceId = traceId
   }
   acceptsCaller(key: string, traceId: string | undefined): boolean {
-    return !!traceId && this.members.get(key)?.traceId === traceId && !this.signal.aborted && !this.finished
+    const member = this.members.get(key)
+    return !!traceId && member?.active === true && !member.sealed &&
+      member.traceId === traceId && !this.signal.aborted && !this.finished
   }
   enterPending(parent: string): () => void {
     return this.enter(`pending-${randomUUID()}`, this.members.has(parent) ? parent : undefined)
@@ -170,6 +172,11 @@ class BackgroundDelegateRegistry {
   forSession(key: string): BackgroundDelegateScope | undefined {
     const active = [...this.scopes].find(scope => scope.members.get(key)?.active)
     if (active) return active
+    // A retired child can still send signed HTTP while its root/siblings live.
+    // Keep its owner so acceptsCaller rejects it instead of falling back to an
+    // unowned legacy spawn. A newer active scope always wins the lookup above.
+    const known = [...this.scopes].find(scope => scope.members.has(key))
+    if (known) return known
     const retired = this.retiredSessions.get(key)
     if (retired && retired.expires > Date.now()) return retired.scope
     this.retiredSessions.delete(key)

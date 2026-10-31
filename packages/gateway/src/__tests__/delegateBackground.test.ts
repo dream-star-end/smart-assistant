@@ -638,6 +638,65 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
     await running
   })
 
+  it('late signed HTTP from a retired child is rejected while its root lives and a new active scope with the same key still works', { timeout: 10_000 }, async t => {
+    const f = fixture(authorityBaseUrl)
+    const registry = backgroundDelegates(f.host)
+    const oldScope = registry.begin(owner)
+    oldScope.jobId = 'dlgjob-old-live-root'
+    const childKey = 'agent:coding-assistant:delegate:main:resumed-child'
+    const oldTrace = 'd'.repeat(32)
+    const newTrace = 'e'.repeat(32)
+    const leaveRoot = oldScope.enter('old-root')
+    const leaveSibling = oldScope.enter('old-sibling', 'old-root')
+    const leaveChild = oldScope.enter(childKey, 'old-root')
+    oldScope.bindTrace(childKey, oldTrace)
+    leaveChild()
+    let calls = 0
+    f.cleanup.resolve()
+    f.host._completeDelegateResumeClaim = (input: any, spawned: boolean) => _completeDelegateResumeClaim.call(f.host, input, spawned)
+    f.host._runDelegateTaskCore = async (input: any) => {
+      calls++
+      f.host.input = input
+      return { kind: 'completed', ok: true, output: 'valid resumed caller' }
+    }
+    const request = (traceId: string): any => Object.assign(new EventEmitter(), { method: 'POST', complete: true,
+      headers: { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({
+        agentId: 'coding-assistant', sessionKey: childKey, depth: 1, traceId,
+      }) } })
+    const rejected: any = {}
+    assert.equal(registry.forSession(childKey), oldScope)
+    assert.equal(oldScope.acceptsCaller(childKey, oldTrace), false)
+    await handleDelegateTask.call(f.host, request(oldTrace), rejected, 'data-analyst')
+    assert.equal(rejected.status, 409)
+    assert.equal(rejected.body.failure_class, 'cancelled')
+    assert.equal(calls, 0)
+    assert.equal(f.store.size(), 0, 'a late child must not create a legacy orphan job')
+    const newScope = registry.begin({ ...owner, clientMessageId: 'cmid-new-root',
+      locator: { ...owner.locator, parentTurnKey: 'c'.repeat(64) } })
+    newScope.jobId = 'dlgjob-new-live-root'
+    const leaveNew = newScope.enter(childKey)
+    newScope.bindTrace(childKey, newTrace)
+    t.after(() => { leaveNew(); leaveSibling(); leaveRoot(); registry.finish(newScope); registry.finish(oldScope) })
+    assert.equal(registry.forSession(childKey), newScope, 'active-first lookup must beat the older inactive member')
+    const stale: any = {}
+    await handleDelegateTask.call(f.host, request(oldTrace), stale, 'data-analyst')
+    assert.equal(stale.status, 409, 'the old signed trace cannot adopt the new active scope')
+    const accepted: any = {}
+    await handleDelegateTask.call(f.host, request(newTrace), accepted, 'data-analyst')
+    assert.equal(accepted.status, 200)
+    await f.terminal.promise
+    assert.equal(calls, 1)
+    assert.equal(f.host.input.backgroundControl, newScope)
+    assert.equal(oldScope.members.get('old-root')?.active, true)
+    assert.equal(oldScope.members.get('old-sibling')?.active, true)
+    await newScope.waitForDescendants(childKey)
+    assert.equal(newScope.acceptsCaller(childKey, newTrace), false, 'an active but sealed caller is already closing')
+    const sealed: any = {}
+    await handleDelegateTask.call(f.host, request(newTrace), sealed, 'data-analyst')
+    assert.equal(sealed.status, 409)
+    assert.equal(calls, 1)
+  })
+
   it('a stopped nested async caller releases its preparing permit when enter rejects after late callback-intent ACK', { timeout: 10_000 }, async t => {
     const f = fixture(authorityBaseUrl)
     const registry = backgroundDelegates(f.host)
