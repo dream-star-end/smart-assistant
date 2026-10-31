@@ -1,7 +1,7 @@
 /** State errors may read authority once; this module never sends a user task. */
 import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import type { ChatSession } from "./model";
-import type { SessionSnapshot } from "./sessionSnapshot";
+import { snapshotIsStale, type SessionSnapshot } from "./sessionSnapshot";
 
 type StateErrorFrame = {
   code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number; frameSeq?: number; sessionKey?: string;
@@ -65,7 +65,8 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     effects.changed();
   };
   void import("./stateErrorReadbackResult").then(({ readStateErrorResult }) =>
-    readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay }),
+    readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay,
+      isStale: (snap) => snapshotIsStale(sess, snap) }),
   ).catch(replay).finally(() => inflight.delete(key));
   return true;
 }

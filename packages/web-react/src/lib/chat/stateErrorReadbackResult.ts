@@ -1,7 +1,7 @@
 /** Snapshot evaluation is loaded only after a state error needs it.
  * Cursor claims and compatibility-final fences stay synchronous in the caller. */
 import type { ChatSession } from "./model";
-import { snapshotIsStale, type SessionSnapshot } from "./sessionSnapshot";
+import type { SessionSnapshot } from "./sessionSnapshot";
 
 function stateErrorWasResolved(requiresCompletion: boolean, cmid: string, snap: SessionSnapshot): boolean {
   const d = snap.dispatch;
@@ -12,20 +12,20 @@ function stateErrorWasResolved(requiresCompletion: boolean, cmid: string, snap: 
 }
 
 /** Load this module before starting HTTP so chunk latency cannot age an already-applied snapshot. */
-export async function readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay }: {
+export async function readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay, isStale }: {
   sess: ChatSession; code: string; cmid: string; requiresCompletion: boolean;
   effects: {
     read: (sessionId: string) => Promise<SessionSnapshot | null | undefined>;
     current: () => boolean; changed: () => void;
   };
-  replay: () => void;
+  replay: () => void; isStale: (snap: SessionSnapshot) => boolean;
 }): Promise<void> {
   const current = () => effects.current() && !sess._stopSettlement &&
     (!sess._activeClientMessageId || sess._activeClientMessageId === cmid);
   if (!current()) return;
   const snap = await effects.read(sess.id);
   if (!current()) return;
-  if (!snap || snap.sessionId !== sess.id || snapshotIsStale(sess, snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
+  if (!snap || snap.sessionId !== sess.id || isStale(snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
     replay();
     return;
   }
