@@ -217,7 +217,7 @@ export async function proveBoxAgentSession(candidate:string,config:PoolConfig,
       CREATE TABLE request_finalize_journal(request_id TEXT PRIMARY KEY,user_id BIGINT NOT NULL,
         container_id BIGINT,state TEXT NOT NULL,ctx JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),error_msg TEXT,failure_code TEXT,final_credits BIGINT)`)
-    await pool.query(readFileSync(join(candidate,'packages/commercial/src/db/migrations/0331_box_agent_api_scopes.sql'),'utf8'))
+    await pool.query(readFileSync(join(candidate,'packages/commercial/src/db/migrations/0332_box_agent_api_scopes.sql'),'utf8'))
     journal=new BoxDurableJournal(pool,() => ({maxRunsPerAccount:3,maxRunsPerUser:3}))
     scopes=new BoxAgentScopes({pool,journal,coordinator:{requestStop:async () => 'pending'},recoverPrelaunch:async () => false})
     registry=new BoxAgentScopeRegistry({file:registryFile,containerId:'1',remote:async (identity,operation,reason) => {

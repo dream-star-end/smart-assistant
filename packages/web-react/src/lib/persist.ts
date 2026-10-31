@@ -210,6 +210,7 @@ export type StoredSession = {
    *  server-wins。与 _lastRouting 语义不同:那是"最近实际发送"供合成续写,这是"用户选择"。 */
   _selectedModelId?: string;
   _preparedModelSwitch?: { id: string; targetModel: string };
+  _snapshotStream?: { streamKey: string; agentId: string };
   _pendingDispatches?: StoredPendingDispatch[];
   /** Hydration-only view of the exact durable control journal. It is stored in
    * the existing v1 dispatch DB, never inline in the best-effort session row. */

@@ -9123,6 +9123,81 @@
       ]
     },
     {
+      "id": "INC-20261030-REFRESH-UNDELIVERED-SETCOOKIE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "个人版 5 个体验账号（1614 体验官、1617 编码、1618 科研、1619 办公、1620 金融）掉登录：一轮多 tab 续期的最后一张 refresh Set-Cookie 没留在浏览器，数小时后浏览器交出已 rotated 的旧 oc_rt，超 45s grace 被判 theft，把从未用过、11 月才到期的活票整族吊销，页面静默落到营销首页且地址栏仍是 /p/<项目>。修复：旧票的直接后继从未被使用，且 UA、authBoundIp、真实客户端 IP（refresh_tokens.client_ip；个人版 loopback socket 上取 CF-Connecting-IP，不取 X-Forwarded-For 首段）都非空且一致时补发同族新票；被替掉的后继记 revoked_reason='reissued'，之后宽限外再出示即 theft（宽限内同指纹 REFRESH_RACE），补发写 refresh_reissued 日志。后继已用、指纹不符、未存 client_ip 仍 theft。前端：曾登录的浏览器启动续期明确失效时提示「登录已过期，请重新登录」并保留深链，登录后回原页。迁移 0331。",
+      "rootFixCommit": "82d4aabc",
+      "coverageCommits": [
+        "7bfe5016",
+        "99628420",
+        "66fb8310",
+        "d0f30989"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "lost Set-Cookie: reuse at 50s and at 6h, same fingerprint, unused successor → reissue, no theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse outside grace after the successor was itself rotated → still theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "reuse outside grace with unused successor but different client IP → still theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/login.integ.test.ts",
+          "assertion": "loopback socket: reissue matches stored client IP; a different one, or an explicit null, is theft"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-01 a different real client IP cannot reissue through the loopback socket"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-02 a reissued successor cannot be alternated with the attacker"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-03 two tabs presenting the same lost cookie: one reissue, one REFRESH_RACE, the new ticket stays live"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts",
+          "assertion": "CE-04 a reissue is stored as reissued, distinct from a normal rotation"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/sec-authrefresh-http.integ.test.ts",
+          "assertion": "H-02 reissue requires the stored CF-Connecting-IP; XFF spoof and a different IP are theft"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/refreshClientIp.test.ts",
+          "assertion": "loopback trusts one CF-Connecting-IP and ignores a spoofed or missing header"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/App.test.tsx",
+          "assertion": "深链 /p/x 启动续期失效：提示登录已过期，登录后回到该项目"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/auth-expired-deeplink.node-test.mjs",
+          "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
+        }
+      ]
+    },
+    {
       "id": "INC-20261030-BOX-AGENT-SESSION-409",
       "occurredAt": "2026-10-30",
       "severity": "P0",

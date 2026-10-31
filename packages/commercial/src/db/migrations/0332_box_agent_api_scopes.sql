@@ -1,4 +1,4 @@
--- 0331: exact invocation generation and irreversible future-launch cancellation.
+-- 0332: exact invocation generation and irreversible future-launch cancellation.
 -- order-dependency: 0330_turn_lease_binding
 -- compat: independent additive control table; legacy requests/journal/billing are unchanged.
 -- Apply 0330_turn_lease_binding first in both release lanes.

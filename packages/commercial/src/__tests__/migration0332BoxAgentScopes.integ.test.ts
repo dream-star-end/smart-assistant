@@ -5,9 +5,9 @@ import { readFile } from 'node:fs/promises'
 import { Pool } from 'pg'
 import { deriveBoxAgentSession } from '@openclaude/protocol'
 
-test('0331 app role can register/cancel/read exact generations but cannot mutate identity or reopen a tombstone',async () => {
+test('0332 app role can register/cancel/read exact generations but cannot mutate identity or reopen a tombstone',async () => {
   const url=process.env.TEST_DATABASE_URL ?? process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
-  assert.ok(url,'migration0331 requires an explicit isolated PostgreSQL fixture')
+  assert.ok(url,'migration0332 requires an explicit isolated PostgreSQL fixture')
   const address=new URL(url)
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(address.hostname) && /_test$/.test(address.pathname))
   const pool=new Pool({connectionString:url,max:1})
@@ -24,7 +24,7 @@ test('0331 app role can register/cancel/read exact generations but cannot mutate
       CREATE TABLE users(id BIGINT PRIMARY KEY);
       CREATE TABLE agent_containers(id BIGINT PRIMARY KEY);
       INSERT INTO users VALUES(1);INSERT INTO agent_containers VALUES(1)`)
-    await client.query(await readFile(new URL('../db/migrations/0331_box_agent_api_scopes.sql',import.meta.url),'utf8'))
+    await client.query(await readFile(new URL('../db/migrations/0332_box_agent_api_scopes.sql',import.meta.url),'utf8'))
     const root=randomUUID()
     const scope=randomUUID()
     const session=deriveBoxAgentSession(root,'agent')
@@ -51,7 +51,7 @@ test('0331 app role can register/cancel/read exact generations but cannot mutate
       await client.query('ROLLBACK TO SAVEPOINT invalid_scope_change')
     }
     const metadata=JSON.parse(await readFile(new URL('../../../../deploy/v5/release-metadata.json',import.meta.url),'utf8'))
-    assert.ok(metadata.requiredMigrations.includes('0331_box_agent_api_scopes'))
+    assert.ok(metadata.requiredMigrations.includes('0332_box_agent_api_scopes'))
   } finally {
     await client.query('RESET ROLE').catch(() => {})
     await client.query('ROLLBACK').catch(() => {})

@@ -8,11 +8,13 @@
  * 合并规则(§3.4):本轮处于什么阶段(「后台运行中」「深度思考中」「启动引擎」「连接已断开」)
  * 只由 TurnActivity 那一行说;提示条不复述阶段,detached 的出现与消失直接跟 isTurnDetached 走,
  * 所以 #1198 的「后台运行中」与本提示条是同一件事的一处说明,不会出现第二条同义提示。
- * 积分(「本轮已扣 N 积分」)由 B4b 从统一快照接入,这一版不带数字。
+ * 积分(「本轮已扣 N 积分」)来自统一快照的实扣结算(B4b),只说已扣,不估算。
  */
 import type { BackgroundSendKind } from "./continuationNudge";
 import type { ChatSession } from "./model";
 import { type ChatStatusClass, STALE_WARN_MS } from "./pure";
+import { TURN_COST_REMINDER_CREDITS } from "./reducer";
+import { formatCredits } from "../utils";
 import type { DispatchStatus } from "./socket";
 
 /** 触发条件全部消失后,提示条再保留这么久,避免帧间隔在 30s 上下时来回闪。 */
@@ -23,7 +25,7 @@ export const BACKGROUND_TURN_TICK_MS = 5_000;
 export const BACKGROUND_TURN_TEXT = "本轮仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。";
 export const BACKGROUND_TURN_TEXT_COMPACT = "本轮仍在运行；新消息会等它结束再发，另行计费。";
 
-export type BackgroundTurnNoticeView = { text: string; compact: boolean };
+export type BackgroundTurnNoticeView = { text: string; compact: boolean; tone?: "info" | "warning" };
 
 /**
  * 本轮已被服务端受理、还没有终态,也不在停止结算中。受理前(dispatch 非 null)活动行
@@ -52,11 +54,36 @@ export type BackgroundTurnFacts = {
   silenceMs: number;
   /** 本会话「待发送」条数。 */
   queuedCount: number;
+  /** 本轮已结算实扣(快照 credits.settled),没有就不参与。 */
+  creditsSettled?: string;
 };
+
+/** (d) 实扣积分到了现有成本提醒的触发线。 */
+export function creditsAtReminderLine(settled: string | undefined): boolean {
+  return !!settled && /^[0-9]+$/.test(settled) && BigInt(settled) >= TURN_COST_REMINDER_CREDITS;
+}
+
+/**
+ * B4-SPEC §3.3:只认当前在飞回合那份快照积分;无请求或为 0 不显示。收到超过 60 秒标出截至时间
+ * (按本地收到时刻算,避开时钟偏差)。
+ */
+export function turnCreditsLine(
+  sess: Pick<ChatSession, "_turnCredits" | "_activeClientMessageId">,
+  now: number,
+  compact: boolean,
+): string | null {
+  const c = sess._turnCredits;
+  if (!c || c.clientMessageId !== sess._activeClientMessageId || c.requests < 1 || !/^[1-9][0-9]*$/.test(c.settled)) {
+    return null;
+  }
+  const minutes = Math.floor((now - c.receivedAt) / 60_000);
+  const asOf = minutes >= 1 ? (compact ? `（${minutes} 分钟前）` : `（截至 ${minutes} 分钟前）`) : "";
+  return `本轮已扣 ${formatCredits(c.settled)} 积分${asOf}`;
+}
 
 /** §3.2 触发 (a) detached、(b) 静默 ≥30s、(c) 已有排队消息。(d) 积分线随 B4b 加入。 */
 export function backgroundTurnTriggered(f: BackgroundTurnFacts): boolean {
-  return f.detached || f.silenceMs >= STALE_WARN_MS || f.queuedCount > 0;
+  return f.detached || f.silenceMs >= STALE_WARN_MS || f.queuedCount > 0 || creditsAtReminderLine(f.creditsSettled);
 }
 
 /**
@@ -72,8 +99,9 @@ export function decideBackgroundTurnNotice(
   return { visible: held, lastTriggerAt: held ? f.lastTriggerAt : null };
 }
 
-export function backgroundTurnNoticeText(compact: boolean): string {
-  return compact ? BACKGROUND_TURN_TEXT_COMPACT : BACKGROUND_TURN_TEXT;
+export function backgroundTurnNoticeText(compact: boolean, creditsLine?: string | null): string {
+  const text = compact ? BACKGROUND_TURN_TEXT_COMPACT : BACKGROUND_TURN_TEXT;
+  return creditsLine ? `${creditsLine}，${text.slice("本轮".length)}` : text;
 }
 
 /** 正在运行的那条用户消息的原文(找不到就不做重复判定)。 */

@@ -33,6 +33,7 @@ import { getBalanceBreakdown } from "../billing/spend.js";
 import { ensureFreeSubscription } from "../billing/subscription.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
+import { validClientIp } from "./clientIp.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import {
   lockRefreshFamily,
@@ -107,7 +108,8 @@ export class RefreshError extends Error {
  *   - tab B 同一刻发 refresh(cookie 还是 X),server 见 X 已 rotated
  *   - 在 GRACE 内:返 REFRESH_RACE(401 但**不**清 cookie),tab B 前端
  *     retry 时 cookie 已被 tab A 的响应种成 Y,retry 自动成功
- *   - GRACE 外:等同 theft,整族 mass-revoke
+ *   - GRACE 外且直接后继已被使用、或指纹不符:等同 theft,整族 mass-revoke
+ *   - GRACE 外但直接后继从未被使用且指纹一致:Set-Cookie 未送达,补发新票,不吊销
  *
  * Trade-off: GRACE 内攻击者拿失窃 token 复用不会被检测;但 attacker 没有
  * 新 cookie 可 retry,实际仍然拿不到 access token。这是 OAuth 2.1 实现里
@@ -182,6 +184,12 @@ export interface LoginDeps {
    * race grace `sameIp` 比对恒真。
    */
   bindIp?: string;
+  /**
+   * 真实客户端 IP，写入 refresh_tokens.client_ip，只给「Set-Cookie 没送达」的补发比对。
+   * 不回落到 remoteIp / bindIp：省略、null、空、非法都存 NULL，这一族以后不能补发。
+   * 生产 handler 传 refreshClientIpFromRequest()。不要传 authBoundIp：个人版它恒为 127.0.0.1。
+   */
+  clientIp?: string | null;
   userAgent?: string;
   /** 测试可注入 now(秒) */
   now?: () => number;
@@ -358,13 +366,14 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
       }
     }
     await client.query(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7)`,
       [
         current.id,
         refresh.hash,
         deps.userAgent ?? null,
         bindIp,
+        validClientIp(deps.clientIp),
         refresh.expires_at,
         rememberMe,
       ],
@@ -432,8 +441,14 @@ export interface RefreshResult {
 }
 
 export interface RefreshExtraDeps {
-  /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。 */
+  /** 写新 row 的 IP / UA(audit 追溯)。可空 — 测试用。race grace 的 sameIp 也用它。 */
   remoteIp?: string;
+  /**
+   * 本次请求的真实客户端 IP，写入新行的 client_ip。补发要求它与旧行的 client_ip
+   * 一致且两侧都非空；省略即 NULL，不回落 remoteIp。
+   * 45s race 宽限仍只看 remoteIp（authBoundIp），不看这个字段。
+   */
+  clientIp?: string | null;
   userAgent?: string;
   /** 测试可注入新 refresh TTL。 */
   refreshTtlSeconds?: number;
@@ -448,6 +463,10 @@ export interface RefreshExtraDeps {
     remoteIp?: string;
     userAgent?: string;
   }) => void;
+  /**
+   * 补发成功时的审计钩子。不要做重 I/O，也不要记录 token / UA / IP。
+   */
+  onReissued?: (ev: { user_id: string; family_id: string }) => void;
 }
 
 /**
@@ -488,6 +507,7 @@ export async function refresh(
   const ts = nowSec(deps);
   const nowIso = new Date(ts * 1000).toISOString();
   const refreshTtl = deps.refreshTtlSeconds ?? REFRESH_TOKEN_TTL_SECONDS;
+  const reqClientIp = validClientIp(deps.clientIp);
 
   // 全流程在 tx 中:lock family → revalidate/lock 旧 row → INSERT 新 → UPDATE 旧
   const result = await tx(async (client) => {
@@ -516,6 +536,8 @@ export async function refresh(
       // 客户端 replay 即使在 grace 内也会被 fingerprint 拒掉,继续走 theft。
       bound_user_agent: string | null;
       bound_ip: string | null;
+      /** 两侧都是合法 client_ip 且相等。空指纹不是匹配。 */
+      same_client_ip: boolean;
       /** 0031 新增;老行默认 TRUE(迁移时 DEFAULT)。 */
       remember_me: boolean;
     }>(
@@ -531,13 +553,16 @@ export async function refresh(
               END AS revoked_age_sec,
               rt.user_agent AS bound_user_agent,
               host(rt.ip) AS bound_ip,
+              (rt.client_ip IS NOT NULL
+               AND $4::inet IS NOT NULL
+               AND rt.client_ip = $4::inet) AS same_client_ip,
               rt.remember_me AS remember_me
          FROM refresh_tokens rt
          JOIN users u ON u.id = rt.user_id
         WHERE rt.token_hash = $1
           AND rt.family_id = $3::uuid
         FOR UPDATE OF rt`,
-      [tokenHash, nowIso, lockTarget.familyId],
+      [tokenHash, nowIso, lockTarget.familyId, reqClientIp],
     );
 
     if (lookupRes.rows.length === 0) {
@@ -560,10 +585,13 @@ export async function refresh(
     //   2) 加 UA + IP fingerprint:必须和原 row 写入时的 UA/IP 一致才算 race。
     //      不同 UA/IP 的 grace 内 replay 仍走 theft 路径(攻击者从异地复用)
     //   3) ageSec < 0(理论不可能,DB 时钟不会倒流)走保守的 theft 而非 race
+    // 'reissued'(被补发替掉的后继)与 'rotated' 同样是「这张票已经被换过」:
+    // 宽限内同指纹仍是 REFRESH_RACE,宽限外整族 theft。logout / admin /
+    // password_reset 不进这条链。
     if (
       row.revoked_at !== null &&
       !row.expired &&
-      row.revoked_reason === "rotated"
+      (row.revoked_reason === "rotated" || row.revoked_reason === "reissued")
     ) {
       const ageSecRaw = row.revoked_age_sec !== null ? Number(row.revoked_age_sec) : Number.POSITIVE_INFINITY;
       const ageSec = Number.isFinite(ageSecRaw) ? ageSecRaw : Number.POSITIVE_INFINITY;
@@ -582,9 +610,93 @@ export async function refresh(
         (deps.remoteIp ?? "").length > 0 &&
         (row.bound_user_agent ?? "").length > 0 &&
         (deps.userAgent ?? "").length > 0;
-      if (grace > 0 && ageSec >= 0 && ageSec < grace && sameUa && sameIp && fingerprintPresent) {
+      const raceFingerprint = grace > 0 && sameUa && sameIp && fingerprintPresent;
+      if (raceFingerprint && ageSec >= 0 && ageSec < grace) {
         // Race grace:返特殊 kind,handler 见后**不**清 cookie + 不报 theft
         return { kind: "race" as const };
+      }
+      // Set-Cookie 没送达:旧票的直接后继从未被用过 → 补发,不吊销。
+      // 除了上面的 UA + authBoundIp 指纹,还要求存下的真实客户端 IP(client_ip)
+      // 两侧都非空且相等:个人版 authBoundIp 恒为 127.0.0.1,只靠它等于只比 UA。
+      // 被替掉的后继标 'reissued'(不是 'rotated'),之后宽限外再出示它即 theft,
+      // 所以正主回来交后继会终结持旧票者的会话,双方不能交替续期。
+      // 只补 'rotated' 的票:'reissued' 的票不再补发,宽限外直接落到 theft。不延长 TTL。
+      if (row.revoked_reason === "rotated" && sameUa && sameIp && fingerprintPresent && row.same_client_ip) {
+        // FOR UPDATE + family 锁:读到的是前一位已提交的状态。
+        // 后继年龄用 clock_timestamp():本事务可能早于前一位 BEGIN,NOW() 会给出负值。
+        const succ = await client.query<{
+          id: string;
+          live: boolean;
+          expired: boolean;
+          remember_me: boolean;
+          revoked_reason: string | null;
+          revoked_age_sec: string | null;
+        }>(
+          `SELECT child.id::text AS id,
+                  (child.revoked_at IS NULL) AS live,
+                  (child.expires_at <= $2::timestamptz) AS expired,
+                  child.remember_me AS remember_me,
+                  child.revoked_reason,
+                  CASE WHEN child.revoked_at IS NULL THEN NULL
+                       ELSE EXTRACT(EPOCH FROM (clock_timestamp() - child.revoked_at))::text
+                  END AS revoked_age_sec
+             FROM refresh_tokens parent
+             JOIN refresh_tokens child
+               ON child.id = parent.rotated_to_id
+              AND child.family_id = parent.family_id
+            WHERE parent.id = $1::bigint
+            FOR UPDATE OF child`,
+          [row.id, nowIso],
+        );
+        const child = succ.rows[0];
+        if (child?.live && !child.expired) {
+          const redelivered = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
+          const reIns = await client.query<{ id: string }>(
+            `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at,
+                                        family_id, revoked_at, revoked_reason, remember_me)
+             VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7::uuid, NULL, NULL, $8)
+             RETURNING id::text AS id`,
+            [
+              row.user_id,
+              redelivered.hash,
+              deps.userAgent ?? null,
+              deps.remoteIp ?? null,
+              reqClientIp,
+              redelivered.expires_at,
+              row.family_id,
+              child.remember_me,
+            ],
+          );
+          await client.query(
+            `UPDATE refresh_tokens
+                SET revoked_at = NOW(),
+                    revoked_reason = 'reissued',
+                    rotated_to_id = $1::bigint
+              WHERE id = $2::bigint`,
+            [reIns.rows[0].id, child.id],
+          );
+          return {
+            kind: "reissued" as const,
+            user_id: row.user_id,
+            role: row.role,
+            family_id: row.family_id,
+            newRefresh: redelivered,
+            remember: child.remember_me,
+          };
+        }
+        // 另一个 tab 刚用同一张丢失的旧票补发过:后继已是 'reissued' 且在宽限内。
+        // 返回 REFRESH_RACE(不清 cookie),前端重试时带上那一 tab 种下的新票;
+        // 不能落到 theft,否则会把刚发出去的新票一起吊销。
+        const childAge = child?.revoked_age_sec != null ? Number(child.revoked_age_sec) : Number.NaN;
+        if (
+          child?.revoked_reason === "reissued" &&
+          !child.expired &&
+          raceFingerprint &&
+          childAge >= 0 &&
+          childAge < grace
+        ) {
+          return { kind: "race" as const };
+        }
       }
       const massRevoke = await client.query<{ id: string }>(
         `UPDATE refresh_tokens
@@ -619,15 +731,16 @@ export async function refresh(
     // unchecked 形同虚设)。
     const newRefresh = issueRefresh({ now: ts, ttlSeconds: refreshTtl });
     const ins = await client.query<{ id: string }>(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at,
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at,
                                   family_id, revoked_at, revoked_reason, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6::uuid, NULL, NULL, $7)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7::uuid, NULL, NULL, $8)
        RETURNING id::text AS id`,
       [
         row.user_id,
         newRefresh.hash,
         deps.userAgent ?? null,
         deps.remoteIp ?? null,
+        reqClientIp,
         newRefresh.expires_at,
         row.family_id,
         row.remember_me,
@@ -680,6 +793,14 @@ export async function refresh(
     deps.jwtSecret,
     { now: ts, ttlSeconds: deps.accessTtlSeconds },
   );
+
+  if (result.kind === "reissued") {
+    try {
+      deps.onReissued?.({ user_id: result.user_id, family_id: result.family_id });
+    } catch {
+      // 回调失败不影响响应语义
+    }
+  }
 
   return {
     user_id: result.user_id,

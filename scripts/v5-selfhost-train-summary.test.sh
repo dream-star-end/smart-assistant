@@ -36,6 +36,8 @@ out="$(run "$d" "
   LEASE_TRAIN_ID=$TID LEASE_TARGET_SHA=0123456789abcdef0123456789abcdef01234567
   MASTER_DEPS_MODE=hardlink MASTER_FRONTEND_MODE=reused
   tsum_init 2>/dev/null || :
+  tsum_note frontendTscSec 1.250 2>/dev/null || :
+  tsum_note flip.verifySec 0.125 2>/dev/null || :
   tsum_mark B 2>/dev/null || :; sleep 0.05
   tsum_mark C.box-success-recovery 2>/dev/null || :; sleep 0.05
   tsum_mark D 2>/dev/null || :
@@ -58,6 +60,8 @@ check "C phase measured (>= 40 ms)" jq -e '.phases[2].durationMs >= 40' "$f"
 check "cache modes and sourceCommit recorded" \
   jq -e '.cache.nodeModules == "hardlink" and .cache.frontend == "reused" and .sourceCommit == "0123456789abcdef0123456789abcdef01234567"' "$f"
 check "load recorded" jq -e '(.load.start | type) == "number" and .load.peakAtMarks >= .load.start and .load.samples == 6' "$f"
+check "only the two S1 measurements are added as notes" \
+  jq -e '.notes == {frontendTscSec:"1.250", "flip.verifySec":"0.125"}' "$f"
 check "no temp file left" bash -c "! ls '$d' | grep -q tmp"
 
 # 2. A failed train: failedPhase is the last non-compensation phase; exit code kept.
@@ -154,6 +158,7 @@ for mode in deploy prewarm-artifacts; do
       release_policy_enabled() { note policy; return 1; }
       release_policy_abort_unexposed() { note abort; }
       reap_runtime_release_bg() { note reap; }
+      master_gate_load_budget_stop() { note load-stop; }
       lease_train_on_exit() { note "lease:$1"; }
       cleanup_master_staging() { note master; }
       cleanup_cutover_unit_snap() { note units; }
@@ -169,7 +174,7 @@ for mode in deploy prewarm-artifacts; do
       if [[ "$code" != 86 ]]; then
         expected+=$'\npolicy'
         [[ "$code" == 0 ]] || expected+=$'\nabort'
-        expected+=$'\nreap\nlease:'"$code"$'\nmaster\nunits\nweb'
+        expected+=$'\nreap\nload-stop\nlease:'"$code"$'\nmaster\nunits\nweb'
       fi
     fi
     check "$mode EXIT cleanup $code has only its ordered effects" test "$(cat "$trace")" = "$expected"
@@ -189,6 +194,7 @@ import sys
 s = open(sys.argv[1]).read()
 assert '    D:master_job_frontend' in s
 assert 'tsum_note frontendElapsedSec "$MASTER_FRONTEND_ELAPSED_S"' in s
+assert 'tsum_note frontendTscSec ' in s
 PY_CHECK
 for p in A B P.mcp-bundle P.seal P.runtime-wait P.platform-bundle E1 E2 E2.apply E3.prep E3.wait-idle E3.units E4 F.prewarm F.C1-C3 F.G1 F.S1 G X.compensate; do
   if [[ "$p" == A ]]; then continue; fi

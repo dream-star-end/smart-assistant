@@ -37,7 +37,7 @@ test.before(async () => {
       CREATE TABLE request_finalize_journal(request_id TEXT PRIMARY KEY,user_id BIGINT NOT NULL,
         container_id BIGINT,state TEXT NOT NULL,ctx JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),error_msg TEXT,failure_code TEXT,final_credits BIGINT)`)
-    await admin.query(await readFile(new URL('../../db/migrations/0331_box_agent_api_scopes.sql',import.meta.url),'utf8'))
+    await admin.query(await readFile(new URL('../../db/migrations/0332_box_agent_api_scopes.sql',import.meta.url),'utf8'))
     pool=new Pool({connectionString:url,max:8,options:`-c search_path=${schema}`})
   } finally {await admin.end()}
 })
