@@ -186,11 +186,10 @@ function fixture(masterBaseUrl: string, storeOptions: DelegateJobStoreOptions = 
   const cleanup = deferred<void>()
   const terminal = deferred<void>()
   let projectTerminal: ((job: any) => void) | undefined
-  let host: any
   const store = new DelegateJobStore({ sm: false, ...storeOptions,
     canCommitTerminal: job => !backgroundDelegates(host).ownsActiveJob(job.id),
     onTerminal: job => { projectTerminal?.(job); terminal.resolve() } })
-  host = sandbox.trackGateway({
+  const host: any = sandbox.trackGateway({
     _delegateJobs: store,
     _delegateReconcileReady: true,
     _admitDelegateCreate: () => 'slot',
