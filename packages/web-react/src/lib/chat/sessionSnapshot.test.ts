@@ -335,12 +335,21 @@ describe("hello = 订阅；快照对齐状态", () => {
   });
 
   test("a background-only snapshot after final preserves the idle parent and queues its result behind the snapshot prompt", async () => {
-    const { sock, ws, s } = boot({ syncSession: vi.fn(async () => true) });
+    const syncSession = vi.fn(async () => {
+      sock.applyServerMessages("s1", "main", [
+        { id: CMID, role: "user", text: "q", ts: 1, status: "sent", _source: "server", _seq: 1 },
+        { id: "srv-final-background-parent", role: "assistant", text: "父轮完成", ts: 2, _source: "server", _seq: 2,
+          _clientMessageId: CMID, _turnTapeComplete: true, _dispatchOutcome: "completed" },
+      ], true, 2);
+      return true;
+    });
+    const { sock, ws, s } = boot({ syncSession });
     s.messages.push({ id: CMID, role: "user", text: "q", ts: 1, status: "sent" });
     pushSnapshot(ws, openSnapshot());
     await flush();
     ws.push({ ...textFrame(1, "父轮完成"), isFinal: true, meta: { stopReason: "end_turn" } });
     await flush();
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: CMID });
     expect(s.messages.find((message) => message.id === CMID)?.status).toBe("replied");
     expect(s._sendingInFlight).toBe(false);
     const finished = { active: s._activeClientMessageId, started: s._turnStartedAt, status: s._turnStatus };
