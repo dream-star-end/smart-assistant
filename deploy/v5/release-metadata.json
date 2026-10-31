@@ -195,7 +195,8 @@
     "0327_system_action_receipts",
     "0328_minimax_voices",
     "0330_turn_lease_binding",
-    "0331_refresh_reissue_client_ip"
+    "0331_refresh_reissue_client_ip",
+    "0332_turn_dispatch_turn_key"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

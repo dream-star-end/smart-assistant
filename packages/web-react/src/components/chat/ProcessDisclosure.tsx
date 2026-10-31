@@ -17,7 +17,7 @@ import type { TurnActivityInfo } from "./TurnActivity";
 import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { useArtifactInspect } from "../tool/context";
-import { cn } from "../../lib/utils";
+import { cn, groupDigits } from "../../lib/utils";
 import { toolChangedFileCount } from "./workPane";
 import { ProcessStages } from "./lazyProcessStages";
 
@@ -1048,6 +1048,40 @@ const shellToggleClass =
   "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
 
+/** Sum of assistant cost labels. Zero and non-digits are skipped. */
+export function sumAssistantCostCredits(messages: readonly ChatMessage[] | undefined): string | null {
+  if (!messages) return null;
+  let sum = 0n;
+  let any = false;
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const credits = message.usage?.costCredits;
+    if (typeof credits !== "string" || !/^\d+$/.test(credits)) continue;
+    const value = BigInt(credits);
+    if (value <= 0n) continue;
+    sum += value;
+    any = true;
+  }
+  return any ? sum.toString() : null;
+}
+
+/** Live header reads the settled total. After refresh, the answer label wins
+ * over a copy sitting inside the section, so the same figure is not added twice. */
+export function processRoundCredits(input: {
+  active: boolean;
+  settledCredits?: string | null;
+  sectionMessages: readonly ChatMessage[];
+  following?: readonly ChatMessage[];
+}): string | null {
+  if (input.active) {
+    return typeof input.settledCredits === "string" && /^[1-9]\d*$/.test(input.settledCredits)
+      ? input.settledCredits
+      : null;
+  }
+  const assistants = input.sectionMessages.filter((message) => message.role === "assistant");
+  return sumAssistantCostCredits(input.following) ?? sumAssistantCostCredits(assistants);
+}
+
 export function ProcessDisclosure<T>({
   sections,
   onFirstTextPaint,
@@ -1147,6 +1181,12 @@ export function ProcessDisclosure<T>({
   const tookMs = turnEndedAt !== null && turnStartedAt !== null ? turnEndedAt - turnStartedAt : -1;
   const meta = active ? elapsed : tookMs > 0 && tookMs <= 24 * 3600_000 ? formatElapsed(tookMs) : "";
   const said = active ? "" : workSummary(messages);
+  const roundCredits = processRoundCredits({
+    active,
+    settledCredits: activity?.settledCredits,
+    sectionMessages: messages,
+    following: bounds?.following,
+  });
   // 历史轮挂载时不播入场动画,只有进行中新冒出来的步骤才轻轻浮入。
   const lastSection = sections.at(-1);
   const lastItem = lastSection?.items.at(-1);
@@ -1189,6 +1229,11 @@ export function ProcessDisclosure<T>({
           {meta ? (
             <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
               {meta}
+            </span>
+          ) : null}
+          {roundCredits ? (
+            <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-round-credits">
+              本轮 {groupDigits(roundCredits)} 积分
             </span>
           ) : null}
         </span>
