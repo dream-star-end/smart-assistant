@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { Client } from "pg";
 import { readContainerLinkReplay } from "../ws/containerLinkHello.js";
 import { renewContainerLinkLease } from "../ws/containerLinkStore.js";
-import type { TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
+import { DISPATCH_NO_RECEIPT_MAX_AGE_MS, heartbeatLease, touchDispatchLeaseOnLiveFrame, type TurnDispatchRow } from "../dispatch/turnDispatchStore.js";
 import { getTestDatabaseUrlForTempTables } from "./helpers/db.js";
 import { WebSocket, WebSocketServer } from "ws";
 import type { Pool } from "pg";
@@ -200,12 +200,16 @@ test("ContainerLink renews admitted/accepted only, fenced by user/carrier/attemp
   const client = new Client({ connectionString: url, connectionTimeoutMillis: 1500 });
   await client.connect();
   try {
-    await client.query(`CREATE TEMP TABLE turn_dispatches (
+    await client.query(`CREATE TEMP TABLE client_sessions (id text PRIMARY KEY, user_id text, deleted_at timestamptz);
+      INSERT INTO client_sessions VALUES ('lease-session', 'c:42', NULL);
+      CREATE TEMP TABLE turn_dispatches (
       dispatch_id uuid PRIMARY KEY, user_id bigint, agent_container_id bigint,
       attempt_no int, lease_epoch bigint, status text, terminal_at timestamptz,
-      lease_until timestamptz, last_attempt_at timestamptz)`);
+      lease_until timestamptz, last_attempt_at timestamptz,
+      session_id text DEFAULT 'lease-session', admitted_at timestamptz DEFAULT NOW())`);
     const dispatchId = "11111111-1111-4111-8111-111111111111";
-    await client.query(`INSERT INTO turn_dispatches VALUES ($1, 42, 7, 2, 3, 'admitted', NULL, NULL, NULL)`, [dispatchId]);
+    await client.query(`INSERT INTO turn_dispatches(dispatch_id,user_id,agent_container_id,attempt_no,lease_epoch,status)
+      VALUES ($1, 42, 7, 2, 3, 'admitted')`, [dispatchId]);
     const row = { dispatchId, attemptNo: 2, leaseEpoch: 3 } as TurnDispatchRow;
     for (const status of ["admitted", "accepted"]) {
       await client.query("UPDATE turn_dispatches SET status=$1, lease_until=NULL", [status]);
@@ -223,6 +227,59 @@ test("ContainerLink renews admitted/accepted only, fenced by user/carrier/attemp
     }
     await client.query("UPDATE turn_dispatches SET status='accepted', terminal_at=NOW()");
     assert.equal(await renewContainerLinkLease(client, 42n, 7, row), false);
+  } finally { await client.end(); }
+});
+
+test("dispatch lease renewal bounds unreceipted attempts and stops for deleted or missing sessions", async () => {
+  const url = getTestDatabaseUrlForTempTables();
+  assert.match(new URL(url).pathname, /_test$/);
+  const client = new Client({ connectionString: url, connectionTimeoutMillis: 1500 });
+  await client.connect();
+  const dispatchId = "11111111-1111-4111-8111-111111111111";
+  try {
+    await client.query(`CREATE TEMP TABLE client_sessions(id text PRIMARY KEY,user_id text,deleted_at timestamptz);
+      INSERT INTO client_sessions VALUES ('lease-session','c:42',NULL);
+      CREATE TEMP TABLE turn_dispatches(dispatch_id uuid PRIMARY KEY,user_id bigint,session_id text,
+        client_message_id text,agent_container_id bigint,attempt_no int,lease_epoch bigint,owner_id text,
+        status text,terminal_at timestamptz,lease_until timestamptz,last_attempt_at timestamptz,admitted_at timestamptz);
+      INSERT INTO turn_dispatches VALUES ('${dispatchId}',42,'lease-session','lease-message',7,2,3,'lease-owner',
+        'admitted',NULL,NULL,NULL,NOW());`);
+    const row = { dispatchId, attemptNo: 2, leaseEpoch: 3 };
+    const renewals = [
+      { name: "bridge", accepts: false, renew: () => heartbeatLease(client, { dispatchId, ownerId: "lease-owner", leaseEpoch: 3 }) },
+      { name: "live frame", accepts: true, renew: () => touchDispatchLeaseOnLiveFrame(client, {
+        userId: 42n, sessionId: "lease-session", clientMessageId: "lease-message",
+      }) },
+      { name: "physical link", accepts: true, renew: () => renewContainerLinkLease(client, 42n, 7, row) },
+    ];
+    for (const renewal of renewals) {
+      await client.query(`UPDATE turn_dispatches SET status='admitted', lease_until=NULL,
+        admitted_at=NOW()-($1::bigint * INTERVAL '1 millisecond')`, [DISPATCH_NO_RECEIPT_MAX_AGE_MS - 10_000]);
+      assert.equal(await renewal.renew(), true, `${renewal.name}: admit remains live within receipt grace`);
+      const capped = await client.query("SELECT EXTRACT(EPOCH FROM lease_until-admitted_at)*1000 AS age FROM turn_dispatches");
+      assert.equal(Number(capped.rows[0].age), DISPATCH_NO_RECEIPT_MAX_AGE_MS, `${renewal.name}: last renewal cannot extend delivery grace`);
+
+      await client.query(`UPDATE turn_dispatches SET lease_until=NULL,
+        admitted_at=NOW()-($1::bigint * INTERVAL '1 millisecond')`, [DISPATCH_NO_RECEIPT_MAX_AGE_MS + 1_000]);
+      assert.equal(await renewal.renew(), false, `${renewal.name}: stale admit cannot renew forever`);
+      assert.equal((await client.query("SELECT lease_until FROM turn_dispatches")).rows[0].lease_until, null);
+
+      await client.query("UPDATE turn_dispatches SET status='accepted', lease_until=NULL");
+      assert.equal(await renewal.renew(), renewal.accepts, `${renewal.name}: accepted turn retains its existing renewal semantics`);
+      if (renewal.accepts) {
+        assert.equal((await client.query("SELECT lease_until>NOW() AS renewed FROM turn_dispatches")).rows[0].renewed, true);
+      }
+      for (const status of ["admitted", "accepted"]) {
+        await client.query("UPDATE turn_dispatches SET status=$1, admitted_at=NOW(), lease_until=NULL", [status]);
+        await client.query("UPDATE client_sessions SET deleted_at=NOW()");
+        assert.equal(await renewal.renew(), false, `${renewal.name}: ${status} deleted session stops renewing`);
+        await client.query("UPDATE client_sessions SET deleted_at=NULL, user_id='c:43'");
+        assert.equal(await renewal.renew(), false, `${renewal.name}: ${status} foreign session cannot renew`);
+        await client.query("DELETE FROM client_sessions");
+        assert.equal(await renewal.renew(), false, `${renewal.name}: ${status} missing session stops renewing`);
+        await client.query("INSERT INTO client_sessions VALUES ('lease-session','c:42',NULL)");
+      }
+    }
   } finally { await client.end(); }
 });
 

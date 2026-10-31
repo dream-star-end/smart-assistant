@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { WebSocket } from "ws";
-import { ContainerLinkRegistry, getContainerLinkHandle } from "../ws/containerLink.js";
+import { ContainerLinkRegistry, getContainerLinkHandle, sendContainerFrame } from "../ws/containerLink.js";
 import { registerBridgeExecutors, availableExecutors, type RecoveryExecutor } from "../ws/bridgeExecutorRegistration.js";
 import { registerBridgeTransport } from "../ws/containerLinkTransport.js";
 import type { CronOriginExecutor } from "../ws/userChatBridge.js";
@@ -237,6 +237,81 @@ test("RF-step3: first link without persisted frames requests the PG open turn, n
   } finally { await registry.shutdown(); }
 });
 
+test("OCV5-682 fresh message bypasses blocked replay and a cancelled message never reaches transport", { timeout: 5000 }, async () => {
+  let release!: () => void;
+  let reading!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const readStarted = new Promise<void>((resolve) => { reading = resolve; });
+  const registry = new ContainerLinkRegistry({ query: async () => {
+    reading();
+    await blocked;
+    return { rows: [{ after_seq: "12", active_message_ids: [] }], rowCount: 1 };
+  } } as unknown as Queryable);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const hello = new Promise<void>((resolve, reject) => socket.send(wire({
+      type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }],
+    }), {}, (error) => error ? reject(error) : resolve()));
+    await readStarted;
+    let callbacks = 0;
+    sendContainerFrame(socket, wire({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "fresh" }), {}, (error) => {
+      assert.equal(error, undefined);
+      callbacks++;
+    }, () => true);
+    const cancelled: Error[] = [];
+    sendContainerFrame(socket, wire({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "expired" }), {}, (error) => {
+      if (error) cancelled.push(error);
+    }, () => false);
+    assert.deepEqual(physical.sent.map((frame) => frame.clientMessageId), ["fresh"], "a waiting cursor cannot age a fresh authority ticket");
+    assert.equal(callbacks, 1);
+    assert.match(cancelled[0]?.message ?? "", /cancelled/);
+    release();
+    await hello;
+    assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.message", "inbound.hello"]);
+  } finally { release(); await registry.shutdown(); }
+});
+
+test("OCV5-682 deferred frame rechecks cancellation at physical write without closing shared transport", { timeout: 5000 }, async () => {
+  let release!: () => void;
+  let reading!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const readStarted = new Promise<void>((resolve) => { reading = resolve; });
+  const registry = new ContainerLinkRegistry({ query: async () => {
+    reading();
+    await blocked;
+    return { rows: [{ after_seq: "12", active_message_ids: [] }], rowCount: 1 };
+  } } as unknown as Queryable);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const hello = new Promise<void>((resolve, reject) => socket.send(wire({
+      type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }],
+    }), {}, (error) => error ? reject(error) : resolve()));
+    await readStarted;
+    let live = true;
+    let callbacks = 0;
+    const cancelled = new Promise<Error | undefined>((resolve) => sendContainerFrame(socket,
+      wire({ type: "inbound.control.session_repo_bind", sessionId: "session" }), {}, (error) => {
+        callbacks++;
+        resolve(error);
+      }, () => live));
+    assert.equal(physical.sent.length, 0, "ordered controls still wait behind hello");
+    live = false;
+    release();
+    await hello;
+    assert.match((await cancelled)?.message ?? "", /cancelled/);
+    assert.equal(callbacks, 1);
+    assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.hello"]);
+    assert.equal(physical.readyState, WebSocket.OPEN, "cancelling a stale frame preserves other consumers");
+    await new Promise<void>((resolve, reject) => socket.send(wire({ type: "ping", id: "still-open" }), {},
+      (error) => error ? reject(error) : resolve()));
+    assert.equal(physical.sent.at(-1)?.type, "ping");
+  } finally { release(); await registry.shutdown(); }
+});
+
 
 test("RF-step3: closing the first tab during cursor lookup does not suppress another tab's missing-frame replay", async () => {
   let release!: () => void;
@@ -310,4 +385,29 @@ test("RF-linkrebuild: restore cannot replace an existing browser stream consumer
     assert.equal(delivered, 1);
     assert.equal(physical.readyState, WebSocket.OPEN);
   } finally { await registry.shutdown(); }
+});
+
+test("OCV5-682 fresh dispatch preserves an earlier queued repository unbind", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const registry = new ContainerLinkRegistry(pool);
+  registry.beforeReplay = () => gate;
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const send = (frame: unknown) => new Promise<void>((resolve, reject) =>
+      socket.send(wire(frame), {}, err => err ? reject(err) : resolve()));
+    const hello = send({ type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    const unbind = send({ type: "inbound.control.session_repo_unbind", sessionId: "session" });
+    const turn = send({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "after-unbind" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(physical.sent.length, 0, "a new turn cannot execute with a repository the user already unbound");
+    release();
+    await Promise.all([hello, unbind, turn]);
+    assert.deepEqual(physical.sent.map(frame => frame.type), [
+      "inbound.hello", "inbound.control.session_repo_unbind", "inbound.message",
+    ]);
+  } finally { release(); await registry.shutdown(); }
 });

@@ -2565,8 +2565,8 @@ export class Gateway {
     return _consumeFrameAuthorityImpl.call(this as unknown as WsConnectionHost, ws, frame, isFromBridge)
   }
 
-  private _rejectAuthority(ws: WebSocket, code: string, detail: string): void {
-    _rejectAuthorityImpl.call(this as unknown as TurnDispatchHost, ws, code, detail)
+  private _rejectAuthority(ws: WebSocket, code: string, detail: string, frame?: Record<string, unknown>): void {
+    _rejectAuthorityImpl.call(this as unknown as TurnDispatchHost, ws, code, detail, frame)
   }
 
   /**

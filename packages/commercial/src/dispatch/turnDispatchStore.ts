@@ -11,6 +11,7 @@
 // takeover ++,消费侧(heartbeat)严格比对 epoch —— 老 owner 的心跳打在旧 epoch 上必 no-op。
 
 import type { Pool, PoolClient } from 'pg'
+import { AUTHORITY_TTL_MS } from '@openclaude/protocol'
 
 /** Pool 或事务内 client 都可作查询面(admit 走 client 与 append 同 tx;reconciler 走 pool)。 */
 export type Queryable = Pick<Pool | PoolClient, 'query'>
@@ -27,6 +28,8 @@ export type DispatchOutcome =
 export const DISPATCH_LEASE_TTL_MS = 90_000
 /** 心跳间隔:约 TTL 的 1/3,连丢两拍才判过期。 */
 export const DISPATCH_LEASE_HEARTBEAT_MS = 30_000
+/** Admission without a container receipt cannot outlive its authority plus delivery grace. */
+export const DISPATCH_NO_RECEIPT_MAX_AGE_MS = AUTHORITY_TTL_MS + 30_000
 /** reconciler 接管 admitted∧租约过期行的最小 age(自 admitted_at):max(120s,5min)=5min。 */
 export const DISPATCH_REJECT_MIN_AGE_MS = 300_000
 /** open 行超龄告警门(RFC §2:open>7d 告警,永不 GC)。 */
@@ -307,16 +310,22 @@ export interface HeartbeatLeaseInput {
 
 /**
  * 续租(bridge attach 长窗口每拍调)。CAS 匹配 dispatch+owner+epoch+status='admitted'。
- * 返回 false = 本 bridge 已非 owner(被接管 / 已离态)→ 调用方停止心跳,勿再当权威。
+ * 返回 false = 已失去 owner / 受理超龄 / 会话已亡 → 调用方停止心跳,勿再当权威。
  */
 export async function heartbeatLease(q: Queryable, input: HeartbeatLeaseInput): Promise<boolean> {
   const now = input.now ?? Date.now()
   const leaseUntil = new Date(now + (input.leaseTtlMs ?? DISPATCH_LEASE_TTL_MS))
   const res = await q.query(
     `UPDATE turn_dispatches
-        SET lease_until = $3, last_attempt_at = $4
-      WHERE dispatch_id = $1 AND owner_id = $2 AND lease_epoch = $5 AND status = 'admitted'`,
-    [input.dispatchId, input.ownerId, leaseUntil, new Date(now), String(input.leaseEpoch)],
+        SET lease_until = LEAST($3, admitted_at + ($6::bigint * INTERVAL '1 millisecond')),
+            last_attempt_at = $4
+      WHERE dispatch_id = $1 AND owner_id = $2 AND lease_epoch = $5 AND status = 'admitted'
+        AND admitted_at + ($6::bigint * INTERVAL '1 millisecond') > $4
+        AND EXISTS (SELECT 1 FROM client_sessions s
+                     WHERE s.id = turn_dispatches.session_id
+                       AND s.user_id = 'c:' || turn_dispatches.user_id::text
+                       AND s.deleted_at IS NULL)`,
+    [input.dispatchId, input.ownerId, leaseUntil, new Date(now), String(input.leaseEpoch), DISPATCH_NO_RECEIPT_MAX_AGE_MS],
   )
   return (res.rowCount ?? 0) === 1
 }
@@ -337,6 +346,8 @@ export interface TouchDispatchLeaseOnLiveFrameInput {
  * Isolation: logical key is user+session+clientMessageId. Rejecting/terminal
  * rows are left alone so takeover/tombstone is not undone. This is liveness
  * evidence from the writer, not a second owner claim — it does not bump epoch.
+ * Admitted rows still need a receipt within the bounded authority window;
+ * accepted execution can keep renewing for as long as its session remains live.
  */
 export async function touchDispatchLeaseOnLiveFrame(
   q: Queryable,
@@ -345,12 +356,47 @@ export async function touchDispatchLeaseOnLiveFrame(
   const ttl = Math.max(1_000, Math.trunc(input.leaseTtlMs ?? DISPATCH_LEASE_TTL_MS))
   const res = await q.query(
     `UPDATE turn_dispatches
-        SET lease_until = NOW() + ($4::bigint * INTERVAL '1 millisecond'),
+        SET lease_until = CASE WHEN status = 'admitted'
+              THEN LEAST(NOW() + ($4::bigint * INTERVAL '1 millisecond'),
+                         admitted_at + ($5::bigint * INTERVAL '1 millisecond'))
+              ELSE NOW() + ($4::bigint * INTERVAL '1 millisecond') END,
             last_attempt_at = NOW()
       WHERE user_id = $1 AND session_id = $2 AND client_message_id = $3
         AND status IN ('admitted', 'accepted')
-        AND terminal_at IS NULL`,
-    [input.userId.toString(), input.sessionId, input.clientMessageId, ttl],
+        AND terminal_at IS NULL
+        AND (status = 'accepted' OR admitted_at + ($5::bigint * INTERVAL '1 millisecond') > NOW())
+        AND EXISTS (SELECT 1 FROM client_sessions s
+                     WHERE s.id = turn_dispatches.session_id
+                       AND s.user_id = 'c:' || turn_dispatches.user_id::text
+                       AND s.deleted_at IS NULL)`,
+    [input.userId.toString(), input.sessionId, input.clientMessageId, ttl, DISPATCH_NO_RECEIPT_MAX_AGE_MS],
+  )
+  return (res.rowCount ?? 0) === 1
+}
+
+/** Physical-link liveness uses the same admission bound and live-session proof as bridge heartbeats. */
+export async function renewContainerDispatchLease(
+  q: Queryable,
+  uid: bigint,
+  containerId: number,
+  row: Pick<TurnDispatchRow, 'dispatchId' | 'attemptNo' | 'leaseEpoch'>,
+): Promise<boolean> {
+  const res = await q.query(
+    `UPDATE turn_dispatches -- container_link_heartbeat
+        SET lease_until = CASE WHEN status = 'admitted'
+              THEN LEAST(NOW() + ($6::bigint * INTERVAL '1 millisecond'),
+                         admitted_at + ($7::bigint * INTERVAL '1 millisecond'))
+              ELSE NOW() + ($6::bigint * INTERVAL '1 millisecond') END,
+            last_attempt_at = NOW()
+      WHERE dispatch_id = $1 AND user_id = $2 AND agent_container_id = $3
+        AND attempt_no = $4 AND lease_epoch = $5
+        AND status IN ('admitted', 'accepted') AND terminal_at IS NULL
+        AND (status = 'accepted' OR admitted_at + ($7::bigint * INTERVAL '1 millisecond') > NOW())
+        AND EXISTS (SELECT 1 FROM client_sessions s
+                     WHERE s.id = turn_dispatches.session_id
+                       AND s.user_id = 'c:' || turn_dispatches.user_id::text
+                       AND s.deleted_at IS NULL)`,
+    [row.dispatchId, uid.toString(), containerId, row.attemptNo, String(row.leaseEpoch), DISPATCH_LEASE_TTL_MS, DISPATCH_NO_RECEIPT_MAX_AGE_MS],
   )
   return (res.rowCount ?? 0) === 1
 }
@@ -363,16 +409,16 @@ export async function touchDispatchLeaseOnLiveFrame(
  */
 export async function casAdmittedToRejecting(
   q: Queryable,
-  input: { dispatchId: string; expectedEpoch: number; ownerId: string; now?: number },
+  input: { dispatchId: string; expectedEpoch: number; ownerId: string; failureCode?: string; now?: number },
 ): Promise<TurnDispatchRow | null> {
   const now = input.now ?? Date.now()
   const res = await q.query<RawDispatchRow>(
     `UPDATE turn_dispatches
         SET status = 'rejecting', owner_id = $2, lease_epoch = lease_epoch + 1,
-            lease_until = NULL, last_attempt_at = $3
+            lease_until = NULL, last_attempt_at = $3, failure_code = COALESCE($5, failure_code)
       WHERE dispatch_id = $1 AND status = 'admitted' AND lease_epoch = $4
       RETURNING ${DISPATCH_COLUMNS}`,
-    [input.dispatchId, input.ownerId, new Date(now), String(input.expectedEpoch)],
+    [input.dispatchId, input.ownerId, new Date(now), String(input.expectedEpoch), input.failureCode ?? null],
   )
   return res.rows.length === 0 ? null : mapRow(res.rows[0]!)
 }

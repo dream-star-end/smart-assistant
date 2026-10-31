@@ -58,6 +58,7 @@ export function collectRecoveredTurnStatusRecordIds(messages: readonly ChatMessa
     }
   }
   return new Set(messages.filter((row) => row.role === "system" && row._turnStatusRecord === true &&
+    !row._dispatchDeliveryRecovery &&
     row._dispatchTerminal === true && !!row._errorCode && !row.text?.trim() &&
     isServerAuthoredRow(row) && !!row._clientMessageId &&
     recoveredOwners.has(row._clientMessageId) && !produced.has(row._clientMessageId)).map((row) => row.id));

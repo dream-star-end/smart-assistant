@@ -96,6 +96,13 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
       if (frame.type === "inbound.hello") { scenario.hello += 1; return send({ type: "sys.relay_ready" }); }
       if (frame.type !== "inbound.message") return;
       scenario.inbound.push(frame);
+      if (scenario.deliveryTest) {
+        scenario.manual.push(frame);
+        const peer = { id: BOARD_SESSION, kind: "dm" };
+        send({ type: "outbound.ack", accepted: true, peer, clientMessageId: frame.clientMessageId });
+        return send({ type: "outbound.message", peer, clientMessageId: frame.clientMessageId,
+          blocks: [{ kind: "text", text: "DELIVERY_RESEND_COMPLETED" }], isFinal: true });
+      }
       const recovery = frame.content?.recovery;
       const id = frame.clientMessageId;
       const peer = { id: BOARD_SESSION, kind: "dm" };
@@ -261,6 +268,52 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         assert.deepEqual(errors, []);
         console.log("RECOVERY_RECEIPT", JSON.stringify({ width, reject, originals: 1, children: scenario.children.length, skipped: scenario.skipped, detailResponses, reload: true, sourceHash, sourceDigest, transformCount }));
       } catch (error) { console.error("RECOVERY_DIAGNOSTIC", JSON.stringify({ scenario, stored: await stored(page), detailResponses, body: (await page.locator("body").innerText()).slice(-4000), errors })); throw error; } finally { await context.close(); }
+    });
+    await t.test("OCV5-682: one gray delivery notice survives reload and final failure resends the exact request", async () => {
+      scenario = { deliveryTest: true, inbound: [], manual: [], hello: 0 };
+      const routing = { model: "glm-5.2", effortLevel: "high", teamMode: false };
+      const root = { id: "cm-delivery-682", role: "user", text: "DELIVERY_ORIGINAL_REQUEST", status: "error",
+        ts: 1, _source: "server", _routing: routing };
+      const child = { ...root, id: "cm-delivery-child-682", text: "↻ 自动重试", _modelText: root.text,
+        _automaticRecovery: true, _automaticRecoveryAttempt: 1, _automaticRecoveryRootClientMessageId: root.id,
+        _recoveryOfClientMessageId: root.id, _recoveryMode: "replay", ts: 3 };
+      const notice = { id: "turn-status:delivery-root", role: "system", text: "", ts: 2, _source: "server",
+        _turnStatusRecord: true, _dispatchTerminal: true, _dispatchLost: true, _errorCode: "DISPATCH_AUTHORITY_EXPIRED",
+        _clientMessageId: root.id, _dispatchDeliveryRecovery: "resent", _dispatchRetryClientMessageId: child.id };
+      const hidden = { ...notice, id: "turn-status:delivery-child", ts: 4, _clientMessageId: child.id,
+        _dispatchDeliveryRecovery: "hidden" };
+      preview.store.board = [root, notice, child, hidden]; preview.store.older = []; preview.store.revision += 1;
+      const context = await browser.newContext({ viewport: { width: 390, height: 950 }, isMobile: true, hasTouch: true });
+      const page = await context.newPage();
+      try {
+        await page.goto(preview.url);
+        const line = page.getByTestId("dispatch-delivery-notice");
+        await line.getByText("这一轮没发出去，已自动重发", { exact: true }).waitFor();
+        assert.equal(await line.count(), 1);
+        assert.match(await line.getAttribute("class"), /text-faint/);
+        assert.equal(await page.getByRole("alert").count(), 0);
+        notice._dispatchDeliveryRecovery = "failed";
+        preview.store.board = [root, notice, child, hidden]; preview.store.revision += 1;
+        for (const ws of preview.wss.clients) ws.send(JSON.stringify({ type: "outbound.resume_failed", peer: { id: BOARD_SESSION, kind: "dm" }, reason: "no_buffer", to: 0 }));
+        await page.getByRole("button", { name: "重新发送", exact: true }).waitFor();
+        assert.equal(await line.count(), 1, "failed child updates the existing delivery line");
+        await page.reload();
+        const resend = page.getByRole("button", { name: "重新发送", exact: true });
+        await resend.waitFor();
+        assert.equal(await line.count(), 1, "history/reload cannot duplicate the notice");
+        assert.equal(await resend.count(), 1);
+        assert.equal(await page.getByText("本轮仍在运行", { exact: true }).count(), 0);
+        await resend.click();
+        await until("one exact user resend", () => scenario.manual.length === 1);
+        assert.equal(scenario.manual[0].content.text, root.text);
+        assert.notEqual(scenario.manual[0].clientMessageId, child.id);
+        assert.equal(scenario.manual[0].content.recovery, undefined);
+        await page.getByText("DELIVERY_RESEND_COMPLETED", { exact: true }).waitFor();
+      } catch (error) {
+        console.error("DELIVERY_RECOVERY_DIAGNOSTIC", JSON.stringify({ scenario, stored: await stored(page),
+          body: (await page.locator("body").innerText()).slice(-5000) }));
+        throw error;
+      } finally { await context.close(); }
     });
   } finally {
     await browser?.close();

@@ -250,6 +250,7 @@ function renderLabels(v: LabelValues): string {
 
 // ─── registry ─────────────────────────────────────────────────────────
 
+export const containerLinkSendChainWait = new Histogram({ name: "container_link_send_chain_wait_ms", help: "Time before a container link frame's physical write", labelNames: [] }, [1, 10, 100, 1000, 5000, 30000, 120000]);
 export const containerLinkRebuilt = new Counter({ name: "container_link_rebuilt_total", help: "Container links rebuilt from open dispatches", labelNames: [] });
 export const containerLinkReconnect = new Counter({ name: "container_link_reconnect_total", help: "Bounded container link recovery outcomes", labelNames: ["outcome"] });
 export const containerLinkGap = new Counter({ name: "container_link_gap_total", help: "Durable container ring replay gaps", labelNames: [] });
@@ -765,6 +766,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   containerLinkRebuilt.render(out);
   containerLinkReconnect.render(out);
   containerLinkGap.render(out);
+  containerLinkSendChainWait.render(out);
   containerLinkControlDelivered.render(out);
   gatewayRequests.render(out);
   billingDebits.render(out);
@@ -801,6 +803,7 @@ export function resetMetricsForTest(): void {
   containerLinkRebuilt.reset();
   containerLinkReconnect.reset();
   containerLinkGap.reset();
+  containerLinkSendChainWait.reset();
   containerLinkControlDelivered.reset();
   gatewayRequests.reset();
   billingDebits.reset();

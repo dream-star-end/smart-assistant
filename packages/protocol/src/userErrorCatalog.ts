@@ -52,6 +52,7 @@ const TURN_COPY: Record<TurnErrorCode, readonly [UserErrorCategory, string]> = {
   user_cancelled: ['cancelled', '本轮已取消。'],
   runner_crashed: ['execution', '执行环境意外中断，请继续。'],
   model_authority_expired: ['auth', '任务暂时中断，已有进度已保留，可以从断点继续。'],
+  dispatch_authority_expired: ['connection', '这一轮没发出去，未计费。'],
   liveness_timeout: ['execution', '任务长时间没有新进展，本轮已停止。请继续或切换模型。'],
   idle_timeout: ['execution', '任务长时间没有新进展，本轮已停止。请继续或切换模型。'],
   no_response: ['model', '模型未能产生有效回复，请继续或切换模型。'],

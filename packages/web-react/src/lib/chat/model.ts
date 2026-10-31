@@ -370,6 +370,8 @@ export type ChatMessage = {
   _dispatchLost?: boolean;
   _dispatchTerminal?: boolean;
   _turnStatusRecord?: boolean;
+  _dispatchDeliveryRecovery?: "resent" | "failed" | "hidden";
+  _dispatchRetryClientMessageId?: string;
 
   // ── lossless turn tape 水合标记（v2 tape;server-authored 行携带，前端只读）──
   /** 该行所属的 lossless turn tape id（tape 是一个原子同步单元）。 */

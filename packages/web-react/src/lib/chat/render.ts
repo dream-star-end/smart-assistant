@@ -359,7 +359,8 @@ export function messageSignature(
   const collapse = m._turnTapeProcess
     ? `|tc:${m._turnTapeProcessExpanded ? 1 : 0}:${m._turnTapeProcessCursor ?? "n"}:${m._turnTapeTotalBytes ?? 0}:${m._dispatchOutcome ?? ""}`
     : "";
-  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}`;
+  const delivery = m._turnStatusRecord ? `|delivery:${m._dispatchDeliveryRecovery ?? ""}:${m._dispatchRetryClientMessageId ?? ""}` : "";
+  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}${delivery}`;
   switch (m.role) {
     case "assistant":
       return [
@@ -610,6 +611,7 @@ const ERROR_LABELS: Record<string, string> = {
   runner_crashed: "执行环境异常中断",
   // ── 免单类 ──
   model_authority_expired: "任务暂时中断",
+  dispatch_authority_expired: "这一轮没发出去",
   liveness_timeout: "本轮已自动免单",
   idle_timeout: "本轮已自动免单",
   no_response: "本轮已自动免单",
@@ -1115,6 +1117,12 @@ export function freezeErrorCardSnapshots(
     }
   }
   for (const message of messages) {
+    // Delivery status has its own single-line presentation throughout the
+    // retry. Hiding an intermediate assistant error must not hide that line.
+    if (message._turnStatusRecord && message._dispatchDeliveryRecovery) {
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
     // The source was delivered; an automatic continuation is not a failed
     // send. Keep its transport label consistent with the held error card.
     if (message.role === "user" && recoveringSources.has(message.id) && message.status === "error") {

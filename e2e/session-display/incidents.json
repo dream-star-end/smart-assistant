@@ -9189,6 +9189,69 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-DISPATCH-LEASE",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "OCV5-682：个人版 uid1614 第二轮 dispatch 在等待全网关保存队列的 hello 重放后排队约 5.5 分钟，送达容器时 120s 模型票据已过期；拒绝缺少回合身份，admitted 无收据租约仍被续租，用户长期看到本轮仍在运行；另一条已删除会话也继续续租。修复限制三处无收据续租至票据 TTL 加 30s，并停止已删除或消失会话续租；新消息绕过 hello 保存等待，重放仅等待本用户容器队列且有界。过期拒绝关联当前 attempt 后先经 durable inbox tombstone 与财务联查，明确未执行未计费才持久化自动重发一次；界面保留一条灰记录，最终失败可重新发送。现网历史行的手工清理不在本修复范围。",
+      "rootFixCommit": "300d301e",
+      "coverageCommits": [
+        "471f5732",
+        "a0038315"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/dispatchDelivery.test.ts",
+          "assertion": "OCV5-682: a fresh dispatch bypasses a held replay drain and keeps its receipt route"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/dispatchDelivery.test.ts",
+          "assertion": "OCV5-682: replay proceeds from PG after its bounded drain wait"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/dispatchDelivery.test.ts",
+          "assertion": "OCV5-682: replay drain excludes another user and container persistence queue"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/dispatchAuthorityRejection.test.ts",
+          "assertion": "OCV5-682: expired authority refusal echoes only exact delivery identities and redacts authority details"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/dispatchAuthorityReconcile.test.ts",
+          "assertion": "OCV5-682: correlated expiry reconciles durable inbox and billing proof before one exact replay"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/containerLink.test.ts",
+          "assertion": "OCV5-682 fresh dispatch preserves an earlier queued repository unbind"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/containerLink.integ.test.ts",
+          "assertion": "dispatch lease renewal bounds unreceipted attempts and stops for deleted or missing sessions"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/dispatchAuthorityRecovery.integ.test.ts",
+          "assertion": "OCV5-682: a proven undelivered turn persists and claims exactly one fresh recovery job in PG"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/dispatchAuthorityRecovery.integ.test.ts",
+          "assertion": "OCV5-682: real PG replay admission waits for the completed no-billing proof"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "OCV5-682: one gray delivery notice survives reload and final failure resends the exact request"
+        }
+      ]
     }
   ]
 }

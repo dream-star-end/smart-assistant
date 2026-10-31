@@ -1,6 +1,7 @@
 import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
+import { undeliveredDispatchStatus } from './undeliveredDispatchStatus.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
 import type { CcbNativeTranscriptArchive, CcbTranscriptRestoreBinding, CcbNativeRestoreTape } from '@openclaude/protocol';
 // pgSessionsBackend — master 会话权威六表的 **PostgreSQL 实现**(RFC-v5-sessions-pg,P2)。
@@ -1892,7 +1893,7 @@ async function mergeVerifiedTurnStatusRows(
   if (rows.length === 0) return messages;
 
   const out = [...messages];
-  for (const row of rows) {
+  for (const row of await undeliveredDispatchStatus(pool, uidMatch[1]!, sessionId, rows)) {
     const anchorSeq = bigIntNum(row.anchor_seq, "turn dispatch anchor_seq");
     if (
       anchorRange &&
@@ -1924,6 +1925,8 @@ async function mergeVerifiedTurnStatusRows(
       _dispatchTerminal: true,
       _dispatchLost: true,
       _errorCode: row.failure_code ?? "DISPATCH_LOST",
+      ...(row.deliveryRecovery ? { _dispatchDeliveryRecovery: row.deliveryRecovery,
+        _dispatchRetryClientMessageId: row.retryClientMessageId } : {}),
       _clientMessageId: row.client_message_id,
     });
   }
@@ -1942,6 +1945,7 @@ const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
 // production may load the protocol package from the previous runtime image
 // while Master has already migrated its recovery rows.
 const PRE_EXECUTION_RECOVERY_CODES = new Set([
+  "dispatch_authority_expired",
   "model_authority_unavailable", "model_catalog_unavailable",
   "codex_pool_busy", "codex_route_unavailable", "codex_container_recycled",
 ]);
@@ -2384,7 +2388,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // overlaps this one).
   // OCV5-322: an empty automatic recovery that failed on the model plane
   // again is deterministic too (#7da201bd: ten 409s in twenty seconds).
-  const retryLimit = (assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
+  const retryLimit = normalizeTurnErrorCode(errorCode) === "dispatch_authority_expired" ? 1 : (assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
       modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])) ||
       emptyRecoveryRepeatsModelPlaneFailure({
         errorCode,
@@ -2394,7 +2398,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     ? SETTLED_TOOLS_CHECKPOINT_RETRY_MAX
     : AUTOMATIC_TURN_RETRY_MAX;
   if (currentAttempt >= retryLimit) {
-    await appendRecoveryGiveUpTerminalCard(client, {
+    if (normalizeTurnErrorCode(errorCode) !== "dispatch_authority_expired") await appendRecoveryGiveUpTerminalCard(client, {
       sessionId: input.sessionId,
       sessionUserId: input.sessionUserId,
       rootClientMessageId,
@@ -2496,6 +2500,37 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     ...(typeof route.model === "string" && route.model.length > 0
       ? { model: route.model }
       : {}),
+  });
+}
+
+/** Called only under the reconciler's terminal dispatch lock, after its
+ * existing same-transaction no-billing proof. The source is a rejected inbox
+ * certificate, not an invented Agent transcript or a fabricated tape. */
+export async function scheduleUndeliveredDispatchRecovery(
+  client: PoolClient,
+  row: Pick<import('../dispatch/turnDispatchStore.js').TurnDispatchRow,
+    'userId' | 'sessionId' | 'clientMessageId' | 'dispatchId' | 'attemptNo' | 'requestHash' | 'agentId' | 'failureCode' | 'outcome'>,
+): Promise<void> {
+  if (row.failureCode !== 'DISPATCH_AUTHORITY_EXPIRED' || row.outcome !== 'not_accepted') return;
+  const sessionUserId = `c:${row.userId}`;
+  const session = (await client.query<{ messages: string; deleted_at: string | null }>(
+    "SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE",
+    [row.sessionId, sessionUserId],
+  )).rows[0];
+  if (!session || session.deleted_at !== null) return;
+  const current: unknown = JSON.parse(session.messages);
+  if (!Array.isArray(current)) return;
+  await scheduleAutomaticRecoveryForFinalizedTurn(client, {
+    uid: row.userId, sessionUserId, sessionId: row.sessionId,
+    clientMessageId: row.clientMessageId, currentMessages: current as MessageLike[],
+    tapeSha256: row.requestHash,
+    turn: {
+      payload: {
+        clientMessageId: row.clientMessageId, status: 'crashed', errorCode: 'dispatch_authority_expired',
+        agentId: row.agentId, turnKey: `dispatch:${row.dispatchId}:${row.attemptNo}`,
+      },
+      records: [],
+    },
   });
 }
 
@@ -7349,7 +7384,7 @@ async function readUnifiedTimelineStatuses(
     )
   ).rows;
   const byAnchor = new Map<number, MessageLike[]>();
-  for (const row of rows) {
+  for (const row of await undeliveredDispatchStatus(client, uidMatch[1]!, sessionId, rows)) {
     const anchorSeq = bigIntNum(row.anchor_seq, "turn dispatch anchor_seq");
     const list = byAnchor.get(anchorSeq) ?? [];
     list.push({
@@ -7363,6 +7398,8 @@ async function readUnifiedTimelineStatuses(
       _dispatchTerminal: true,
       _dispatchLost: true,
       _errorCode: row.failure_code ?? "DISPATCH_LOST",
+      ...(row.deliveryRecovery ? { _dispatchDeliveryRecovery: row.deliveryRecovery,
+        _dispatchRetryClientMessageId: row.retryClientMessageId } : {}),
       _clientMessageId: row.client_message_id,
       _timelineRecord: true,
       _timelineUnitKey: `status:${row.dispatch_id}`,
@@ -8991,15 +9028,22 @@ export function createPgSessionsBackend(
               item._clientMessageId === input.recovery?.sourceClientMessageId &&
               supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
             const dispatchFailure = (
-              await client.query<{ outcome: string; failure_code: string | null }>(
-                `SELECT outcome, failure_code
+              await client.query<{ outcome: string; failure_code: string | null; client_notified: boolean }>(
+                `SELECT outcome, failure_code, client_notified
                    FROM turn_dispatches
                   WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3
                     AND status='terminal'
-                  LIMIT 1`,
+                  LIMIT 1 FOR UPDATE`,
                 [input.uid, input.sessionId, input.recovery.sourceClientMessageId],
               )
             ).rows[0];
+            // The tombstone closes execution first. Only the reconciler's
+            // same-transaction no-billing proof publishes client_notified;
+            // a browser replay must not jump ahead of that financial gate.
+            if (dispatchFailure?.failure_code === 'DISPATCH_AUTHORITY_EXPIRED' &&
+                (dispatchFailure.outcome !== 'not_accepted' || dispatchFailure.client_notified !== true)) {
+              return { kind: 'recovery_conflict', reason: 'source_not_safely_replayable' };
+            }
             const finalized = (
               await client.query<{
                 tape_id: string;
@@ -9022,6 +9066,8 @@ export function createPgSessionsBackend(
               )
             ).rows[0];
             let authoritativeRetryAttempt = automaticSourceAttempt;
+            const authoritativeRetryLimit = dispatchFailure?.failure_code === 'DISPATCH_AUTHORITY_EXPIRED'
+              ? 1 : AUTOMATIC_TURN_RETRY_MAX;
             if (finalized) {
               const recordRows = (
                 await client.query<{ payload: Buffer }>(
@@ -9133,13 +9179,13 @@ export function createPgSessionsBackend(
             if (
               input.recovery.automatic &&
               (
-                authoritativeRetryAttempt >= AUTOMATIC_TURN_RETRY_MAX ||
+                authoritativeRetryAttempt >= authoritativeRetryLimit ||
                 input.recovery.attempt !== authoritativeRetryAttempt + 1
               )
             ) {
               return {
                 kind: "recovery_conflict",
-                reason: authoritativeRetryAttempt >= AUTOMATIC_TURN_RETRY_MAX
+                reason: authoritativeRetryAttempt >= authoritativeRetryLimit
                   ? "automatic_retry_exhausted"
                   : "automatic_attempt_mismatch",
               };

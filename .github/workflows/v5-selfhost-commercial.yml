@@ -162,6 +162,15 @@ jobs:
           grep -qx '# pass 5' recovery-presentation.tap
           grep -qx '# fail 0' recovery-presentation.tap
 
+      - name: Dispatch delivery lease and verified replay (targeted PG)
+        id: dispatch_delivery_pg
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 npx --no-install tsx --test --test-name-pattern="dispatch lease renewal bounds|OCV5-682:" packages/commercial/src/__tests__/containerLink.integ.test.ts packages/commercial/src/__tests__/dispatchAuthorityRecovery.integ.test.ts' | tee dispatch-delivery-pg.tap
+          grep -qx '# pass 3' dispatch-delivery-pg.tap
+          grep -qx '# fail 0' dispatch-delivery-pg.tap
+
       - name: Prove committed system action receipts in private PG schema
         id: system_pg_receipts
         shell: bash
@@ -206,6 +215,15 @@ jobs:
         with:
           name: system-pg-receipts-tap
           path: system-pg-receipts.tap
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload dispatch delivery PG proof
+        if: always() && steps.dispatch_delivery_pg.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-delivery-pg-tap
+          path: dispatch-delivery-pg.tap
           if-no-files-found: error
           retention-days: 14
 

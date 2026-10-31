@@ -1,5 +1,5 @@
 import { recordContainerLinkGap, type LinkDispatch } from "./containerLinkRecoveryStore.js";
-import { containerLinkGap } from "../admin/metrics.js";
+import { containerLinkGap, containerLinkSendChainWait } from "../admin/metrics.js";
 import { ContainerLinkHello } from "./containerLinkHello.js";
 /**
  * Master owns one physical WS per (uid, containerId). Bridge handles retain
@@ -21,6 +21,16 @@ type Stream = { sessionId: string; clientMessageId: string; dispatchId?: string;
 const streamKey = (session: string, message: string): string => JSON.stringify([session, message]);
 const handles = new WeakMap<WebSocket, ContainerLinkHandle>();
 export const getContainerLinkHandle = (ws: WebSocket): ContainerLinkHandle | undefined => handles.get(ws);
+/** The shared link may defer a frame; test the bridge's cancellation fence at the physical write. */
+export function sendContainerFrame(
+  ws: WebSocket, data: RawData, opts: { binary?: boolean }, callback: (err?: Error) => void,
+  canSend?: () => boolean,
+): void {
+  const handle = handles.get(ws);
+  if (handle) handle.sendGuarded(data, opts, callback, canSend);
+  else if (!canSend || canSend()) ws.send(data, opts, callback);
+  else callback(new Error("container frame cancelled"));
+}
 function parse(data: RawData, binary: boolean): Wire | null {
   if (binary) return null;
   try {
@@ -67,8 +77,11 @@ export class ContainerLinkHandle extends EventEmitter {
     this.link.activate(this);
   }
   send(data: RawData, opts?: { binary?: boolean }, callback?: (err?: Error) => void): void {
+    this.sendGuarded(data, opts, callback);
+  }
+  sendGuarded(data: RawData, opts?: { binary?: boolean }, callback?: (err?: Error) => void, canSend?: () => boolean): void {
     if (this.disposed || !this.link.ws) { callback?.(new Error("container link closed")); return; }
-    this.link.send(this, data, opts, callback);
+    this.link.send(this, data, opts, callback, canSend);
   }
   close(): void { this.terminate(); }
   terminate(): void { this.link.release(this); }
@@ -150,6 +163,7 @@ class ContainerLink {
   }
   private sending: Promise<void> | null = null;
   private sendingBytes = 0;
+  private orderedSends = 0;
 
   constructor(
     readonly uid: bigint, readonly containerId: number,
@@ -215,7 +229,8 @@ class ContainerLink {
     this.stop(error);
     this.registry.onTransportLost?.(this.uid, this.containerId);
   }
-  send(handle: ContainerLinkHandle, data: RawData, opts?: { binary?: boolean }, cb?: (err?: Error) => void): void {
+  send(handle: ContainerLinkHandle, data: RawData, opts?: { binary?: boolean }, cb?: (err?: Error) => void, canSend?: () => boolean): void {
+    const queuedAt = Date.now();
     const frame = parse(data, opts?.binary === true);
     if (typeof frame?.requestId === "string") this.routes.set(`request:${frame.requestId}`, handle);
     if (typeof frame?.sessionKey === "string") this.sessions.set(frame.sessionKey, handle);
@@ -238,19 +253,32 @@ class ContainerLink {
       }
     }
     const helloPeers = frame?.type === "inbound.hello" && Array.isArray(frame.peers) ? frame.peers : null;
-    if (helloPeers === null && this.sending === null) { this.ws!.send(data, opts ?? {}, cb); return; }
+    // Message routing was installed synchronously above. A slow replay cursor
+    // must not consume a fresh message's short authority TTL. Other controls
+    // retain hello ordering (notably repo binding).
+    if ((frame?.type === "inbound.message" && this.orderedSends === 0) || (helloPeers === null && this.sending === null)) {
+      if (this.stopping || handle.disposed || (canSend && !canSend())) { cb?.(new Error("container frame cancelled")); return; }
+      containerLinkSendChainWait.observe({}, Date.now() - queuedAt);
+      this.ws!.send(data, opts ?? {}, cb); return;
+    }
     const bytes = Buffer.byteLength(Buffer.isBuffer(data) ? data : String(data));
     if (this.sendingBytes + bytes > this.registry.maxBufferedBytes) {
       const error = new Error("container link send backpressure");
       cb?.(error); this.stop(error); return;
     }
     this.sendingBytes += bytes;
+    // Preserve earlier state-changing controls and messages. Pings and replay
+    // preparation alone do not impose a dependency on a fresh dispatch.
+    const ordered = helloPeers === null && frame?.type !== "ping";
+    if (ordered) this.orderedSends++;
     const work = (this.sending ?? Promise.resolve()).then(async () => {
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
-      if (helloPeers !== null) await this.registry.beforeReplay?.();
+      if (helloPeers !== null) await this.registry.drainBeforeReplay(this.uid, this.containerId);
       const prepared = helloPeers === null ? null : await this.hello.prepare(helloPeers);
       if (prepared) data = Buffer.from(JSON.stringify(prepared));
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
+      if (canSend && !canSend()) { cb?.(new Error("container frame cancelled")); return; }
+      containerLinkSendChainWait.observe({}, Date.now() - queuedAt);
       await new Promise<void>((resolve, reject) => {
         this.ws!.send(data, opts ?? {}, (error) => error ? reject(error) : resolve());
       });
@@ -258,6 +286,7 @@ class ContainerLink {
       cb?.();
     }).catch((error: Error) => { cb?.(error); this.transportFailed(error); }).finally(() => {
       this.sendingBytes -= bytes;
+      if (ordered) this.orderedSends--;
       if (this.sending === work) this.sending = null;
     });
     this.sending = work;
@@ -420,14 +449,25 @@ export class ContainerLinkRegistry {
   takeovers = 0;
   detachedFrames = 0;
   onTransportLost?: (uid: bigint, containerId: number) => void;
-  beforeReplay?: () => Promise<void>;
+  beforeReplay?: (uid: bigint, containerId: number) => Promise<void>;
+  readonly replayDrainTimeoutMs: number;
   readonly dialTimeoutMs: number;
   readonly heartbeatMs: number;
   readonly maxBufferedBytes: number;
-  constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number }) {
+  constructor(readonly pool: Queryable, readonly log?: Log | null, opts?: { heartbeatMs?: number; maxBufferedBytes?: number; dialTimeoutMs?: number; replayDrainTimeoutMs?: number }) {
+    this.replayDrainTimeoutMs = opts?.replayDrainTimeoutMs ?? 5000;
     this.dialTimeoutMs = opts?.dialTimeoutMs ?? 5000;
     this.heartbeatMs = opts?.heartbeatMs ?? 30_000;
     this.maxBufferedBytes = opts?.maxBufferedBytes ?? 4 * 1024 * 1024;
+  }
+  async drainBeforeReplay(uid: bigint, containerId: number): Promise<void> {
+    if (!this.beforeReplay) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.beforeReplay(uid, containerId), new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, this.replayDrainTimeoutMs);
+      })]);
+    } finally { clearTimeout(timer); }
   }
   connect(uid: bigint, cid: number, create: (signal: AbortSignal) => WebSocket | Promise<WebSocket>): Promise<WebSocket> {
     return this.attach(uid, cid, create);
