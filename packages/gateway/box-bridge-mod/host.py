@@ -155,6 +155,19 @@ def only_text(msg):
     return isinstance(content, list) and all(isinstance(b, dict) and b.get('type') == 'text' for b in content)
 
 
+def blocking_screen(pane):
+    """A screen the mod cannot leave. Login is reported before onboarding.
+
+    The result is an operational code. Callers must not attach the pane.
+    """
+    if ("Select login method:" in pane
+            or "Not logged in \u00b7 Run /login" in pane):
+        return "BOX_INTERACTIVE_LOGIN_REQUIRED"
+    if "colorblind-friendly" in pane:
+        return "BOX_INTERACTIVE_ONBOARDING"
+    return None
+
+
 class Host:
     def __init__(self, run_dir, session, claude, args, config_dir=None, extra_env=None, print_mode=False):
         self.run_dir = run_dir
@@ -640,11 +653,17 @@ def run(host, srv, stopping):
         why = 'stopped' if stopping.is_set() else 'timeout' if time.time() > deadline else \
             'exited' if not host.alive() else None
         ticks += 1
+        pane = host.pane()
+        # A theme page or a logged-out page never reaches /ready. Say which
+        # one and stop; do not wait out the ready budget or copy the pane.
+        block = blocking_screen(pane)
+        if block:
+            err(block)
+            return 1
         # A dialog never clears by itself: stop waiting once one is drawn.
-        if not why and ticks % 10 == 0 and any(d in host.pane() for d in DIALOGS):
+        if not why and ticks % 10 == 0 and any(d in pane for d in DIALOGS):
             why = 'dialog'
         if why:
-            pane = host.pane()
             # A dialog drawn before the hooks run cannot be answered by the mod;
             # it must be prevented by configuration (P0), never by keystrokes.
             if 'trust this folder' in pane:
