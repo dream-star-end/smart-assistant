@@ -44,6 +44,7 @@ import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
+import { useSendGuard } from "./composerSendGuard";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -474,6 +475,26 @@ export function Composer({
   const canGoal = !!onSetGoal && !!onGoalAction;
   const hasPlusMenu = canGoal;
   const visibleGoal = visibleGoalOf(goal);
+  // 「+」按钮:有目标菜单时作触发器,否则禁用占位。「+」早已只剩「设定目标」,禁用态文案不再说「附件暂不可用」(C-15)。
+  // 闭合态目标可见性:有活跃目标时右上角显小圆点,近预算转 warning 色(与菜单项内状态点同判定权威 goalNearBudget)。
+  const plusButton = (
+    <IconButton
+      data-product-feature={PRODUCT_CAPABILITIES.files.id}
+      aria-label="更多选项"
+      title={hasPlusMenu ? "更多选项" : "会话目标暂不可用"}
+      disabled={disabled || !hasPlusMenu}
+      className="relative"
+    >
+      <Plus size={20} />
+      {visibleGoal && (
+        <span
+          aria-hidden
+          data-testid="composer-goal-dot"
+          className={cn("absolute right-1 top-1 size-1.5 rounded-full", goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent")}
+        />
+      )}
+    </IconButton>
+  );
 
   const removeAttach = useCallback(
     (id: string) => {
@@ -488,7 +509,7 @@ export function Composer({
     [revoke],
   );
 
-  const submittingRef=useRef(false);
+  const {submittingRef,sending,setSending,stopArmed}=useSendGuard(!!busy);
   const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
   const previousSubmit=latestSubmitRef.current;
   latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
@@ -527,7 +548,7 @@ export function Composer({
     try{
       const sent=onSend(text,doneMedia.length?doneMedia:undefined,replyTo??undefined);
       if(sent&&typeof (sent as Promise<unknown>).then==='function'){
-        void (sent as Promise<unknown>).then(finish,()=>{submittingRef.current=false;});
+        setSending(true);void (sent as Promise<unknown>).then(finish,()=>{submittingRef.current=false;}).finally(()=>setSending(false));
       }else finish(sent);
     }catch{ submittingRef.current=false; }
   };
@@ -883,29 +904,7 @@ export function Composer({
                 无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
             {hasPlusMenu ? (
               <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <IconButton
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    aria-label="更多选项"
-                    title="更多选项"
-                    disabled={disabled}
-                    className="relative"
-                  >
-                    <Plus size={20} />
-                    {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
-                        不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
-                    {visibleGoal && (
-                      <span
-                        aria-hidden
-                        data-testid="composer-goal-dot"
-                        className={cn(
-                          "absolute right-1 top-1 size-1.5 rounded-full",
-                          goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                        )}
-                      />
-                    )}
-                  </IconButton>
-                </DropdownMenuTrigger>
+                <DropdownMenuTrigger asChild>{plusButton}</DropdownMenuTrigger>
                 <DropdownMenuContent align="start" side="top">
                   {canGoal && (
                     <DropdownMenuItem
@@ -928,26 +927,7 @@ export function Composer({
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              <IconButton
-                data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                aria-label="更多选项"
-                // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
-                title="会话目标暂不可用"
-                disabled
-                className="relative"
-              >
-                <Plus size={20} />
-                {visibleGoal && (
-                  <span
-                    aria-hidden
-                    data-testid="composer-goal-dot"
-                    className={cn(
-                      "absolute right-1 top-1 size-1.5 rounded-full",
-                      goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                    )}
-                  />
-                )}
-              </IconButton>
+              plusButton
             )}
             {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
                 390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
@@ -1033,7 +1013,7 @@ export function Composer({
               <button
                 type="button"
                 data-product-control
-                aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+                aria-label={stopping ? "正在停止" : busy ? "停止" : sending ? "正在发送" : "发送"}
                 aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
                 title={
                   attachFailed
@@ -1047,13 +1027,10 @@ export function Composer({
                           : undefined
                 }
                 onClick={() => {
-                  if (busy) {
-                    if (!stopping) onStop?.();
-                    return;
-                  }
-                  submit(true);
+                  if (!busy) submit(true);
+                  else if (!stopping && stopArmed()) onStop?.();
                 }}
-                disabled={stopping || (!canSend && !busy) || disabled}
+                disabled={stopping || (!busy && (sending || !canSend)) || disabled}
                 className={cn(
                   "flex size-9 shrink-0 items-center justify-center rounded-full transition-all [@media(hover:none)]:size-11",
                   busy
@@ -1063,7 +1040,7 @@ export function Composer({
                       : "bg-hover text-faint",
                 )}
               >
-                {stopping ? (
+                {stopping || (sending && !busy) ? (
                   <Loader2 size={17} className="animate-spin" />
                 ) : busy ? (
                   <Square size={15} className="fill-current" />
