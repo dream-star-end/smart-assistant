@@ -172,13 +172,36 @@ describe('StudioApp (OCV5-593)', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  test('home: empty project list, music marked not configured, create goes to the brief page', async () => {
+  test('home: empty project list, music marked not configured, 全自动开拍 creates, starts and lands on planning', async () => {
+    let status: StudioProject['status'] = 'draft'
+    const started = { id: 'e1', ts: new Date().toISOString(), type: 'project.started', payload: {} }
     routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
     routes['GET /api/studio/projects'] = () => ({ status: 200, body: { projects: [], next: null } })
     routes['POST /api/studio/projects'] = () => ({ status: 201, body: { project: project() } })
+    routes[`POST /api/studio/projects/${ID}/start`] = () => {
+      status = 'planning'
+      return {
+        status: 200,
+        body: {
+          project: project({ status }),
+          shots: [],
+          lines: [],
+          assets: [],
+          takes: [],
+          events: [started],
+        },
+      }
+    }
     routes[`GET /api/studio/projects/${ID}`] = () => ({
       status: 200,
-      body: { project: project(), shots: [], lines: [], assets: [], takes: [], events: [] },
+      body: {
+        project: project({ status }),
+        shots: [],
+        lines: [],
+        assets: [],
+        takes: [],
+        events: status === 'planning' ? [started] : [],
+      },
     })
     mount('/studio')
     expect(await screen.findByText('一句话，拍一支片。')).toBeInTheDocument()
@@ -200,7 +223,60 @@ describe('StudioApp (OCV5-593)', () => {
       aspect: '16:9',
       targetSec: 30,
     })
+    // The start went out before the brief page opened (Q3: one click, not two).
+    const posts = calls.filter((c) => c.method === 'POST').map((c) => c.path)
+    expect(posts).toEqual(['/api/studio/projects', `/api/studio/projects/${ID}/start`])
+    expect(await screen.findByTestId('studio-planning')).toHaveTextContent('导演 agent 正在写分镜')
+    expect(screen.getByTestId('studio-planning-elapsed')).toHaveTextContent(/已用 \d+ 秒/)
+    expect(screen.queryByText('分镜还没写')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /全自动开始/ })).not.toBeInTheDocument()
+  })
+
+  test('home: a start that fails still opens the draft, says why, and keeps 全自动开始', async () => {
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes['GET /api/studio/projects'] = () => ({ status: 200, body: { projects: [], next: null } })
+    routes['POST /api/studio/projects'] = () => ({ status: 201, body: { project: project() } })
+    routes[`POST /api/studio/projects/${ID}/start`] = () => ({
+      status: 409,
+      body: { error: { code: 'STUDIO_PROJECT_BUSY', message: 'busy' } },
+    })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: { project: project(), shots: [], lines: [], assets: [], takes: [], events: [] },
+    })
+    mount('/studio')
+    fireEvent.change(await screen.findByLabelText('影片需求'), { target: { value: '红狐' } })
+    fireEvent.click(screen.getByRole('button', { name: /全自动开拍/ }))
+    await waitFor(() => expect(location.pathname).toBe(`/studio/p/${ID}/brief`))
     expect(await screen.findByText('分镜还没写')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /全自动开始/ })).toBeEnabled()
+  })
+
+  test('brief page: a plan that failed says so where the storyboard would be', async () => {
+    routes['GET /api/studio/providers'] = () => ({ status: 200, body: PROVIDERS })
+    routes[`GET /api/studio/projects/${ID}`] = () => ({
+      status: 200,
+      body: {
+        project: project({ settings: { planFailed: true } }),
+        shots: [],
+        lines: [],
+        assets: [],
+        takes: [],
+        events: [
+          { id: 'e1', ts: '2026-10-23T00:00:01Z', type: 'project.started', payload: {} },
+          {
+            id: 'e2',
+            ts: '2026-10-23T00:01:00Z',
+            type: 'plan.failed',
+            payload: { message: '分镜方案没写好，可以改一下需求再开拍。' },
+          },
+        ],
+      },
+    })
+    mount(`/studio/p/${ID}/brief`)
+    expect(await screen.findByTestId('studio-plan-stopped')).toHaveTextContent(
+      '分镜方案没写好，可以改一下需求再开拍。',
+    )
   })
 
   test('brief page: model plan follows /providers and start is enabled for a draft with a brief', async () => {

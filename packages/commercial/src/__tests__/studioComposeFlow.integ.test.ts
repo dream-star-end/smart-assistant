@@ -267,6 +267,24 @@ async function runOne(exec: ExecuteDeps) {
   return task
 }
 
+async function succeededFrame(s: Awaited<ReturnType<typeof setup>>): Promise<string> {
+  const id = randomUUID()
+  const blob = await s.blobs.put({
+    userId: BigInt(s.uid),
+    mime: 'image/png',
+    maxBytes: 64,
+    source: Buffer.from(`frame ${id}`),
+    ref: { kind: 'take', id },
+  })
+  await query(
+    `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op,
+                              status, blob_sha, cost_credits, finished_at)
+     VALUES ($1, $2, 'shot_frame', $3, 1, 'fake', 'm', 'image.generate', 'succeeded', $4, 0, NOW())`,
+    [id, s.p.id, s.shots[0], blob.sha],
+  )
+  return id
+}
+
 describe('studio compose (OCV5-591 A2-1c)', () => {
   test('the director composes the film once everything is ready; free, with QA, credits and the user’s ref', async (t) => {
     if (skip(t)) return
@@ -371,6 +389,52 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
       s.api.requestExport(s.uid, s.p.id, { resolution: '4k', subtitles: 'burn' }),
       { status: 400 },
     )
+  })
+
+  test('a frame picked before queued compose starts returns to video generation without compose_failed', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const frameId = await succeededFrame(s)
+    await advanceProject(s.advanceDeps, s.p.id)
+    assert.equal((await project(s.p.id)).status, 'composing')
+    await s.api.selectTake(s.uid, frameId)
+    const task = await runOne(s.exec)
+    assert.equal(task.kind, 'compose')
+    const ended = await query<{ status: string }>(
+      'SELECT status FROM studio_tasks WHERE id = $1',
+      [task.id],
+    )
+    assert.equal(ended.rows[0]!.status, 'done', 'the old auto compose ends without a missing-input failure')
+    assert.equal((await project(s.p.id)).status, 'running')
+    assert.equal((await finals(s.p.id)).length, 0)
+    assert.equal(s.runner.ran.length, 0, 'no sandbox work starts with the old missing video')
+  })
+
+  test('a frame picked while compose runs discards the old film and returns to video generation', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const frameId = await succeededFrame(s)
+    await advanceProject(s.advanceDeps, s.p.id)
+    s.runner.onCompose = async () => {
+      s.runner.onCompose = null
+      await s.api.selectTake(s.uid, frameId)
+    }
+    await runOne(s.exec)
+    assert.ok(s.runner.ran.some((op) => op.op === 'compose'), 'the old sandbox run really began')
+    assert.equal((await project(s.p.id)).status, 'running')
+    const [stale] = await finals(s.p.id)
+    assert.equal(stale!.status, 'canceled', 'the old film must not be published')
+    const refs = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM studio_blob_refs WHERE ref_kind = 'final' AND ref_id = $1`,
+      [stale!.id],
+    )
+    assert.equal(refs.rows[0]!.n, '0')
+    const compose = await query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM studio_tasks
+        WHERE project_id = $1 AND kind = 'compose' AND status IN ('queued', 'leased')`,
+      [s.p.id],
+    )
+    assert.equal(compose.rows[0]!.n, '0', 'new composition waits for the replacement video')
   })
 
   test('inputs changed while composing are not published; a new compose is queued', async (t) => {

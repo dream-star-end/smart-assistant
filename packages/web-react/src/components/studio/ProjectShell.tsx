@@ -195,6 +195,7 @@ export function ProjectShell(props: {
           providers={props.providers}
           onOpenShot={openShot}
           onOpenBrief={() => go('brief')}
+          onReload={refresh}
         />
       ) : page === 'image' ? (
         <ImageStudioPage

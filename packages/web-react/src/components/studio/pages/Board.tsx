@@ -29,6 +29,7 @@ export function BoardPage(props: {
   providers: ProvidersView
   onOpenShot: (shotId: string) => void
   onOpenBrief: () => void
+  onReload?: () => void
 }) {
   const { auth, view } = props
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
@@ -172,7 +173,13 @@ export function BoardPage(props: {
           onSelect={props.onOpenShot}
         />
       </div>
-      <AgentPanel auth={auth} view={view} cards={cards} onOpenShot={props.onOpenShot} />
+      <AgentPanel
+        auth={auth}
+        view={view}
+        cards={cards}
+        onOpenShot={props.onOpenShot}
+        {...(props.onReload ? { onReload: props.onReload } : {})}
+      />
     </div>
   )
 }
