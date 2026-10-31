@@ -848,7 +848,7 @@ export function InspectorPanelContent({
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
     ...(browserCount > 0 || browserPending ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
-    { value: "steps", label: <span>步骤{count(steps.length)}</span> },
+    { value: "steps", label: <span>步骤{count(workTurns[outputsIndex]?.steps.length ?? 0)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
 

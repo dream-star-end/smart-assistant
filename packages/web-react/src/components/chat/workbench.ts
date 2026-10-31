@@ -11,6 +11,7 @@
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
 import { browserStepOf, isDeliverableShot } from "../tool/browserSteps";
 import type { ChatMessage } from "../../lib/chat/model";
+import { errorPresentation, isDispatchTerminalRow } from "../../lib/chat/render";
 import { asArr, asStr, normalizeToolForDisplay } from "../tool/format";
 import { parseWebSearchSources } from "../tool/webSearchHits";
 import { resolveToolStatus } from "../tool/status";
@@ -350,25 +351,81 @@ export function fileTouchFingerprint(messages: readonly ChatMessage[], path: str
 // ── 摘要 ────────────────────────────────────────────────────────────────
 
 export type TurnSummary = {
-  status: "running" | "error" | "done";
+  status: "running" | "error" | "done" | "not_started" | "interrupted";
   durationMs: number | null;
   steps: number;
   failedSteps: number;
+  /** 与正文错误卡同一标题。非终态为 null。 */
+  statusLabel: string | null;
+  /** 与正文错误卡同一句说明。右栏空态用；非终态为 null。 */
+  statusDetail: string | null;
 };
 
+const NOT_STARTED_CODES = new Set(["dispatch_not_accepted", "dispatch_lost"]);
+
+/** 服务端终态行（快照）压过本地 running。未开始处理的等待时间不是用时。 */
+function serverTerminal(turn: WorkTurn): {
+  kind: "not_started" | "interrupted" | "failed";
+  title: string;
+  detail: string;
+  endedAt: number | null;
+} | null {
+  let row: ChatMessage | undefined;
+  for (let i = turn.rows.length - 1; i >= 0; i--) {
+    const candidate = turn.rows[i];
+    if (candidate && isDispatchTerminalRow(candidate)) {
+      row = candidate;
+      break;
+    }
+  }
+  if (!row) return null;
+  const presented = errorPresentation(row._errorCode, row.text, row._errorDetail, row.usage?.waived === true);
+  const snap = row._errorCardSnapshot?.disposition === "card" ? row._errorCardSnapshot : null;
+  const endedAt = typeof row.ts === "number" && row.ts > 0 ? row.ts : null;
+  const kind = NOT_STARTED_CODES.has(presented.code)
+    ? "not_started"
+    : presented.code === "service_restart"
+      ? "interrupted"
+      : "failed";
+  return {
+    kind,
+    title: snap?.title || presented.title,
+    detail: snap?.message || presented.message,
+    endedAt,
+  };
+}
+
+function durationUntil(turn: WorkTurn, end: number | null): number | null {
+  if (turn.startedAt === undefined || end === null || end < turn.startedAt) return null;
+  return end - turn.startedAt;
+}
+
 export function turnSummary(turn: WorkTurn, running: boolean): TurnSummary {
+  const failedSteps = turn.steps.filter(failed).length;
+  const terminal = serverTerminal(turn);
+  if (terminal) {
+    return {
+      status: terminal.kind === "failed" ? "error" : terminal.kind,
+      durationMs: terminal.kind === "not_started" ? null : durationUntil(turn, terminal.endedAt),
+      steps: turn.steps.length,
+      failedSteps,
+      statusLabel: terminal.title,
+      statusDetail: terminal.detail,
+    };
+  }
   let end = turn.startedAt ?? null;
   for (const r of turn.rows) {
     const t = r.completedAt ?? r.ts;
     if (typeof t === "number" && (end === null || t > end)) end = t;
   }
-  const failedSteps = turn.steps.filter(failed).length;
   const errored = turn.rows.some((r) => r.role === "assistant" && !!r._errorCode);
   return {
     status: running ? "running" : errored ? "error" : "done",
     durationMs: turn.startedAt !== undefined && end !== null && end >= turn.startedAt ? end - turn.startedAt : null,
     steps: turn.steps.length,
     failedSteps,
+    statusLabel: null,
+    statusDetail: null,
   };
 }
 

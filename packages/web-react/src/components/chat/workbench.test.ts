@@ -168,10 +168,70 @@ describe("turnSummary / formatDuration / outputKindOf", () => {
       assistant("a1", "好", TS + 72_000),
     ]);
     const s = turnSummary(turn, false);
-    expect(s).toMatchObject({ status: "done", durationMs: 72_000, steps: 2, failedSteps: 1 });
+    expect(s).toMatchObject({ status: "done", durationMs: 72_000, steps: 2, failedSteps: 1, statusLabel: null });
     expect(turnSummary(turn, true).status).toBe("running");
     expect(formatDuration(s.durationMs ?? 0)).toBe("1 分 12 秒");
     expect(formatDuration(8_400)).toBe("8 秒");
+  });
+
+  test("not_accepted 终态不把等到收尾的时间当成用时，本地 running 也不再盖过服务端快照", () => {
+    const start = TS;
+    // 体验官 /s/webmvvubze351obvb 第 2 轮：admitted 11:41:14 → terminal 14:32:43 = 10289 秒 = 2 小时 51 分。
+    const terminalAt = start + 10_289_000;
+    const [turn] = collectWorkTurns([
+      user("u2", "预算降到 4800", start),
+      {
+        id: "turn-status:c4bc52a0",
+        role: "system",
+        text: "",
+        ts: terminalAt,
+        _dispatchTerminal: true,
+        _errorCode: "DISPATCH_NOT_ACCEPTED",
+        _clientMessageId: "u2",
+      },
+    ]);
+    const summary = turnSummary(turn, true);
+    expect(summary.status).toBe("not_started");
+    expect(summary.durationMs).toBeNull();
+    expect(summary.statusLabel).toBe("消息未开始处理");
+    expect(summary.statusDetail).toContain("已确认未计费");
+    expect(summary.steps).toBe(0);
+    expect(formatDuration(10_289_000)).toBe("2 小时 51 分");
+  });
+
+  test("service_restart 停在服务端终态时刻，并使用与正文相同的标题", () => {
+    const start = TS;
+    const [turn] = collectWorkTurns([
+      user("u", "跑", start),
+      tool("t1", "Bash", { command: "a" }, { ts: start + 1000, completedAt: start + 5_000 }),
+      { id: "err", role: "assistant", text: "", ts: start + 90_000, _errorCode: "service_restart" },
+    ]);
+    const summary = turnSummary(turn, true);
+    expect(summary.status).toBe("interrupted");
+    expect(summary.durationMs).toBe(90_000);
+    expect(summary.statusLabel).toBe("任务已中断");
+    expect(formatDuration(summary.durationMs ?? 0)).toBe("1 分 30 秒");
+  });
+
+  test("executed_error 的右栏标题与正文错误卡相同，用时停在终态行", () => {
+    const start = TS;
+    const [turn] = collectWorkTurns([
+      user("u", "跑", start),
+      tool("t1", "Bash", { command: "a" }, { ts: start + 1000, completedAt: start + 8_000 }),
+      {
+        id: "st",
+        role: "system",
+        text: "",
+        ts: start + 12_000,
+        _dispatchTerminal: true,
+        _errorCode: "ENGINE_ERROR",
+      },
+    ]);
+    const summary = turnSummary(turn, true);
+    expect(summary.status).toBe("error");
+    expect(summary.durationMs).toBe(12_000);
+    expect(summary.statusLabel && summary.statusLabel.length > 0).toBe(true);
+    expect(summary.statusLabel).not.toBe("消息未开始处理");
   });
 
   test("扩展名归类", () => {

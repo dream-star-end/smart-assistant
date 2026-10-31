@@ -190,6 +190,42 @@ describe("产出页", () => {
     expect(screen.getByTestId("outputs-turn")).toHaveTextContent("做一个落地页");
   });
 
+  test("终态未开始处理的一轮与正文同一说法，步骤徽标只反映这一轮", async () => {
+    const t0 = TS;
+    const messages: ChatMessage[] = [
+      user("u1", "第一轮", t0),
+      tool("t1", "Bash", { command: "a" }, { ts: t0 + 1_000 }),
+      tool("t2", "Bash", { command: "b" }, { ts: t0 + 2_000 }),
+      tool("t3", "Bash", { command: "c" }, { ts: t0 + 3_000 }),
+      tool("t4", "Bash", { command: "d" }, { ts: t0 + 4_000 }),
+      assistant("a1", "好了", t0 + 10_000),
+      user("u2", "第二轮", t0 + 20_000),
+      {
+        id: "turn-status:c4bc52a0",
+        role: "system",
+        text: "",
+        ts: t0 + 20_000 + 10_289_000,
+        _dispatchTerminal: true,
+        _errorCode: "DISPATCH_NOT_ACCEPTED",
+        _clientMessageId: "u2",
+      },
+    ];
+    render(<InspectorPanelContent messages={messages} running onClose={() => {}} />);
+    await outputsReady();
+    expect(screen.getByTestId("outputs-turn-counter")).toHaveTextContent("第 2 / 2 轮");
+    expect(screen.getByTestId("outputs-terminal-status")).toHaveTextContent("消息未开始处理");
+    expect(screen.getByTestId("outputs-summary")).not.toHaveTextContent("用时");
+    expect(screen.getByTestId("outputs-turn")).not.toHaveTextContent("进行中");
+    expect(screen.getByTestId("outputs-none")).toHaveTextContent("消息未开始处理");
+    expect(screen.getByTestId("outputs-none")).toHaveTextContent("已确认未计费");
+    expect(screen.queryByRole("tab", { name: /步骤\s*\d/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("上一轮"));
+    expect(screen.getByRole("tab", { name: /步骤\s*4/ })).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-summary")).toHaveTextContent("用时 10 秒");
+    expect(screen.queryByTestId("outputs-terminal-status")).not.toBeInTheDocument();
+  });
+
   test("没有产出的轮给安静的空态,「查看步骤」进步骤页", async () => {
     render(
       <InspectorPanelContent

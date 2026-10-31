@@ -97,8 +97,9 @@ export function TurnBar({
   onOpenSteps: () => void;
 }) {
   const s = turnSummary(turn, running);
+  const live = s.status === "running";
   const parts: ReactNode[] = [];
-  if (s.durationMs !== null && !running) parts.push(`用时 ${formatDuration(s.durationMs)}`);
+  if (s.durationMs !== null && !live) parts.push(`用时 ${formatDuration(s.durationMs)}`);
   if (s.steps > 0) parts.push(`${s.steps} 步${s.failedSteps > 0 ? `（${s.failedSteps} 步失败）` : ""}`);
   if (fileCount > 0) parts.push(`${fileCount} 个文件`);
   return (
@@ -126,13 +127,19 @@ export function TurnBar({
           <ChevronRight size={14} />
         </button>
         <span className="flex-1" />
-        {s.status === "running" ? (
+        {live ? (
           <span className="inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2 py-0.5 text-accent">
             <Spinner size={11} />
             进行中
           </span>
+        ) : s.status === "not_started" || s.status === "interrupted" ? (
+          <span className="rounded-full px-2 py-0.5 text-muted" data-testid="outputs-terminal-status">
+            {s.statusLabel}
+          </span>
         ) : s.status === "error" ? (
-          <span className="rounded-full bg-danger-soft px-2 py-0.5 text-danger">出错</span>
+          <span className="rounded-full bg-danger-soft px-2 py-0.5 text-danger" data-testid="outputs-terminal-status">
+            {s.statusLabel ?? "出错"}
+          </span>
         ) : null}
       </div>
       <h3 className="line-clamp-2 text-section font-semibold leading-snug text-fg" title={turn.title}>
@@ -531,6 +538,12 @@ function TurnOutputsBody({
   const turnEnd = turn.rows.at(-1);
   const empty = outputs.files.length + outputs.media.length + outputs.links.length + outputs.sources.length === 0;
   const fileCount = outputs.files.filter((f) => f.change).length;
+  const summary = turnSummary(turn, running);
+  const live = summary.status === "running";
+  const emptyTitle = summary.statusLabel ?? (live ? "这一轮还在进行" : "这一轮没有产出文件");
+  const emptyDetail = summary.statusDetail ?? (live
+    ? "写出的文件、生成的图片和查过的网页会出现在这里。"
+    : "回答在左侧对话里；想看助手做了什么，可以查看步骤。");
 
   return (
     <>
@@ -554,11 +567,9 @@ function TurnOutputsBody({
         </div>
       ) : empty ? (
         <div className="mx-4 flex flex-col items-center gap-2 rounded-xl border border-dashed border-border px-6 py-10 text-center" data-testid="outputs-none">
-          {running ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
-          <p className="text-body font-medium text-fg">{running ? "这一轮还在进行" : "这一轮没有产出文件"}</p>
-          <p className="text-meta text-muted">
-            {running ? "写出的文件、生成的图片和查过的网页会出现在这里。" : "回答在左侧对话里；想看助手做了什么，可以查看步骤。"}
-          </p>
+          {live ? <Spinner size={18} className="text-accent" /> : <FileText size={20} className="text-faint" aria-hidden />}
+          <p className="text-body font-medium text-fg">{emptyTitle}</p>
+          <p className="text-meta text-muted">{emptyDetail}</p>
         </div>
       ) : null}
       {!empty && <OtherOutputs outputs={outputs} hero={hero} onPick={setPicked} />}

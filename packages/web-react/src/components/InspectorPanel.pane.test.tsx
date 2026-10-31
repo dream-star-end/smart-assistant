@@ -54,7 +54,8 @@ const STEPS = { tab: "steps" as const, nonce: 1 };
 describe("详情面板分区与步骤", () => {
   test("步骤页按轮分组、最近一轮在上并默认展开;点一步进入详情,计数与上一步 / 下一步 / 返回", () => {
     render(<InspectorPanelContent messages={session()} request={STEPS} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /步骤\s*4/ })).toHaveAttribute("aria-selected", "true");
+    // 顶栏徽标只数当前轮（第二轮 3 步）。翻步计数仍走会话里的全部步骤。
+    expect(screen.getByRole("tab", { name: /步骤\s*3/ })).toHaveAttribute("aria-selected", "true");
     const turns = screen.getAllByTestId("pane-turn");
     expect(turns).toHaveLength(2);
     expect(within(turns[0]).getByText("第二轮：写代码并运行")).toBeInTheDocument();
