@@ -5923,7 +5923,17 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     maybe(`OCV5-679 ${errorCode}: checkpoint queues once, backs off and admits the same billing identity`, async () => {
       const sessionId = `s-autoerr-${errorCode}`;
       const sourceClientMessageId = `cm-autoerr-${errorCode}`;
-      await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true });
+      // A real CCB refusal retains its raw result as a runtime checkpoint,
+      // even when the model produced no thinking/text before the proxy's 409.
+      const boxRefusal = { type: 'result', subtype: 'success', is_error: true,
+        result: 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"}}',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        num_turns: 1 };
+      await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true,
+        ...(errorCode === 'box_capacity_held' ? { records: [{ id: 'box-refusal-runtime',
+          role: 'runtime-event', text: JSON.stringify(boxRefusal), ts: 2, status: 'crashed',
+          _runtimeSource: 'ccb', _runtimeEvent: boxRefusal, _ocEventOrdinal: 0,
+          _hiddenRuntimeEvent: true, _clientMessageId: sourceClientMessageId }] } : {}) });
       assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 1);
       const readJobs = () => pool.query("SELECT * FROM turn_recovery_jobs WHERE session_id=$1", [sessionId]);
       const first = (await readJobs()).rows;
