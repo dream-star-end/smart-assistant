@@ -5925,7 +5925,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       const sourceClientMessageId = `cm-autoerr-${errorCode}`;
       await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true });
       assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 1);
-      const readJobs = () => pool.query(`SELECT * FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId]);
+      const readJobs = () => pool.query("SELECT * FROM turn_recovery_jobs WHERE session_id=$1", [sessionId]);
       const first = (await readJobs()).rows;
       assert.equal(first.length, 1);
       assert.equal(first[0].recovery_mode, 'checkpoint');
@@ -5956,7 +5956,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       const sourceClientMessageId = `cm-autoerr-empty-${errorCode}`;
       await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true, records: [] });
       assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
-      assert.equal((await pool.query(`SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId])).rowCount, 0);
+      assert.equal((await pool.query("SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1", [sessionId])).rowCount, 0);
     });
 
     maybe(`OCV5-679 ${errorCode}: tenth attempt exhausts instead of scheduling an eleventh`, async () => {
@@ -5970,9 +5970,9 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
             _automaticRetryAttempt: 10, _automaticRetryMax: 10 }] });
       assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
       const session = await backend.getClientSession(sessionId, CUSER);
-      assert.ok(session?.messages.some((row) =>
+      assert.ok((session?.messages as MessageLike[] | undefined)?.some((row) =>
         (row._userError as { code?: string } | undefined)?.code === 'automatic_retry_exhausted'));
-      assert.equal((await pool.query(`SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId])).rowCount, 0);
+      assert.equal((await pool.query("SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1", [sessionId])).rowCount, 0);
     });
   }
 
