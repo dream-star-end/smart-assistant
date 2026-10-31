@@ -322,7 +322,7 @@ test('control file is private and the bridge copies one stdin line to stdout', a
 // INC-20261005-BOX-CC-FOLLOWUP-TURN: closing stdin used to do nothing. The
 // runner then SIGKILLed the bridge, the next turn was reported as a crash,
 // and the box Claude stayed alive on the session.
-async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
+async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean, ignoreLaunchAbort = false): Promise<{
   code: number | 'pending'
   out: string
   launchFifo: string
@@ -386,6 +386,26 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
       stdin,
       stdout,
       stderr: new PassThrough(),
+      fetchImpl: async (url, init) => {
+        const body = JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString('utf8')) as {
+          command: string
+          args: string[]
+        }
+        const stop = body.args[1] === BOX_CC_STOP_SCRIPT
+        const launch = body.command !== 'python3' && !stop
+        if (launch) init.signal?.addEventListener('abort', () => mark('launch-abort'), { once: true })
+        const response = await fetch(url, ignoreLaunchAbort && launch ? { ...init, signal: undefined } : init)
+        if (stop) {
+          mark('stop-client-headers')
+          const arrayBuffer = response.arrayBuffer.bind(response)
+          response.arrayBuffer = async () => {
+            const data = await arrayBuffer()
+            mark('stop-client-body-eof')
+            return data
+          }
+        }
+        return response
+      },
     })
     stdin.write('{"type":"user","message":{"role":"user","content":"first"}}\n')
     for (let i = 0; i < 200 && !out.includes('"result"'); i++) {
@@ -424,6 +444,13 @@ test('closing stdin ends the box Claude and the bridge exits 0', async (t) => {
 test('closing stdin exits 0 even when the box never reports the exit', async (t) => {
   const run = await bridgeAgainstFakeBox(false)
   t.diagnostic(JSON.stringify({ remoteEndsOnStop: false, phases: run.phases }))
+  assert.equal(run.code, 0)
+  assert.deepEqual(run.stopFifos, [run.launchFifo])
+})
+
+test('closing stdin cancels the launch reader when transport ignores abort', async (t) => {
+  const run = await bridgeAgainstFakeBox(false, true)
+  t.diagnostic(JSON.stringify({ ignoreLaunchAbort: true, phases: run.phases }))
   assert.equal(run.code, 0)
   assert.deepEqual(run.stopFifos, [run.launchFifo])
 })

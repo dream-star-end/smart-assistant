@@ -739,9 +739,19 @@ class BoxSession {
       this.o.stderr.write(`BOX_INTERACTIVE_NOT_READY ${why}\n`)
       return this.giveUp({ why, unsafe: false, retryable: false })
     }
+    let releaseReader: (() => void) | undefined
     try {
       const response = await postExec(this.control, launch, this.o.fetchImpl, this.abort.signal)
       const reader = response.body!.getReader()
+      // Retiring the local bridge must also release its pending read when a
+      // transport does not propagate fetch's AbortSignal to the response body.
+      const cancelReader = (): void => { void reader.cancel().catch(() => undefined) }
+      this.abort.signal.addEventListener('abort', cancelReader, { once: true })
+      releaseReader = () => {
+        this.abort.signal.removeEventListener('abort', cancelReader)
+        reader.releaseLock()
+      }
+      if (this.abort.signal.aborted) cancelReader()
       let pendingBytes = Buffer.alloc(0)
       for (;;) {
         const chunk = await reader.read()
@@ -803,6 +813,7 @@ class BoxSession {
         return this.giveUp({ why, unsafe: false, retryable: true })
       }
     } finally {
+      releaseReader?.()
       await this.finishWrites()
     }
     if (this.writeFailed) return { kind: 'ended', code: 1 }
