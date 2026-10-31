@@ -111,23 +111,40 @@ export function makeCompactionTimelineHandler(deps: Deps) {
         keys.some(key => key !== 'sessionId' && key !== 'cursor') ||
         (rawCursor !== null && !cursor)) return send(400, 'INVALID_TIMELINE_INPUT')
     try {
-      const page = await (deps.readPage ?? readClientTimelinePage)(sessionId, owner, cursor, 200)
-      if (!page) return send(404, 'SESSION_NOT_FOUND')
-      const messages: MessageLike[] = []
-      for (const record of page.messages) messages.push(await hydrateOriginal(record, sessionId, owner, deps))
-      const bytes = Buffer.from(JSON.stringify({ ownerUserId: owner, sessionId, page: { ...page, messages } }))
-      if (bytes.length > (deps.maxResponseBytes ?? COMPACTION_TIMELINE_PAGE_MAX_BYTES)) {
-        return send(413, 'COMPACTION_TIMELINE_PAGE_TOO_LARGE')
+      const maxBytes = deps.maxResponseBytes ?? COMPACTION_TIMELINE_PAGE_MAX_BYTES
+      // Browser pages budget deferred locators, whereas this transport sends
+      // full originals. Re-read a smaller genuine page from the SAME cursor;
+      // only storage may choose its continuation, never a sliced message list.
+      let limit = 200
+      for (;;) {
+        try {
+          const page = await (deps.readPage ?? readClientTimelinePage)(sessionId, owner, cursor, limit)
+          if (!page) return send(404, 'SESSION_NOT_FOUND')
+          const messages: MessageLike[] = []
+          let wireBytes = Buffer.byteLength(JSON.stringify({ ownerUserId: owner, sessionId, page: { ...page, messages: [] } }))
+          for (const record of page.messages) {
+            const original = await hydrateOriginal(record, sessionId, owner, deps)
+            wireBytes += Buffer.byteLength(JSON.stringify(original)) + (messages.length > 0 ? 1 : 0)
+            if (wireBytes > maxBytes) throw new Error('COMPACTION_TIMELINE_PAGE_TOO_LARGE')
+            messages.push(original)
+          }
+          const bytes = Buffer.from(JSON.stringify({ ownerUserId: owner, sessionId, page: { ...page, messages } }))
+          if (bytes.length > maxBytes) throw new Error('COMPACTION_TIMELINE_PAGE_TOO_LARGE')
+          res.statusCode = 200
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.setHeader('Content-Length', bytes.length)
+          res.setHeader('X-OpenClaude-Content-Sha256', digest(bytes))
+          for (let offset = 0; offset < bytes.length; offset += 256 * 1024) {
+            if (res.destroyed) return
+            if (!res.write(bytes.subarray(offset, offset + 256 * 1024))) await drain(res)
+          }
+          res.end()
+          return
+        } catch (error) {
+          if (!(error instanceof Error && error.message === 'COMPACTION_TIMELINE_PAGE_TOO_LARGE') || limit === 1) throw error
+          limit = Math.max(1, Math.floor(limit / 2))
+        }
       }
-      res.statusCode = 200
-      res.setHeader('Content-Type', 'application/json; charset=utf-8')
-      res.setHeader('Content-Length', bytes.length)
-      res.setHeader('X-OpenClaude-Content-Sha256', digest(bytes))
-      for (let offset = 0; offset < bytes.length; offset += 256 * 1024) {
-        if (res.destroyed) return
-        if (!res.write(bytes.subarray(offset, offset + 256 * 1024))) await drain(res)
-      }
-      res.end()
     } catch (error) {
       if (res.headersSent) { res.destroy(); return }
       if (error instanceof Error && error.message === 'COMPACTION_TIMELINE_PAGE_TOO_LARGE') {

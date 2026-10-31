@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import test from 'node:test'
-import { encodeClientTimelineCursor, type ClientTimelinePage } from '@openclaude/storage'
+import { encodeClientTimelineCursor, type ClientTimelineCursor, type ClientTimelinePage, type MessageLike } from '@openclaude/storage'
 import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentity.js'
 import { makeCompactionTimelineHandler, COMPACTION_TIMELINE_PATH } from '../http/internalCompactionTimeline.js'
 
@@ -144,4 +144,64 @@ test('hydration failure or explicit page ceiling never returns a partial success
     messages: [{ id: 'fallback', text: 'visible head projection', _displayDegraded: true }] }) } })
   assert.equal(degraded.status, 503)
   assert.equal(degraded.json.page, undefined)
+})
+
+test('oversized deferred pages shrink through storage cursors and recover every original plus the terminal', async () => {
+  // Scale the review's 33 x 2 MiB / 64 MiB counterexample down by 1024 so
+  // the same page-size defect is quick to reproduce without a large fixture.
+  const maxResponseBytes = 64 * 1024
+  const originals = Array.from({ length: 33 }, (_, index) => ({
+    id: `tool-${index + 1}`, role: 'tool', text: `${index + 1}:` + 'x'.repeat(2 * 1024),
+  }))
+  const payloads = new Map(originals.map(original => [original.id, Buffer.from(JSON.stringify(original))]))
+  const rows: MessageLike[] = originals.map((original, index) => {
+    const payload = payloads.get(original.id)!
+    return { id: original.id, role: 'tool', text: '', _orderSeq: index + 1,
+      _payloadDeferred: true, _payloadBytes: payload.length,
+      _payloadSha256: createHash('sha256').update(payload).digest('hex'),
+      _turnTapeId: 'tape-sized-page', _turnTapeSha256: 'a'.repeat(64), _recordOrdinal: index + 1 }
+  })
+  rows.push({ id: 'terminal-original', role: 'assistant', text: '正常完整终态', _orderSeq: 34 })
+  const calls: Array<{ cursor: ClientTimelineCursor | null; limit: number }> = []
+  const deps: Partial<HandlerDeps> = {
+    maxResponseBytes,
+    readPage: async (_sessionId, owner, cursor = null, limit = 200) => {
+      assert.equal(owner, 'c:765')
+      calls.push({ cursor, limit })
+      const available = rows.filter(row => Number(row._orderSeq) < (cursor?.beforeOrderSeq ?? Infinity))
+      const selected = available.slice(-limit)
+      const hasMore = available.length > selected.length
+      return { ...page, messages: selected, hasMore,
+        nextCursor: hasMore ? { version: 1, timelineGeneration: 3, beforeOrderSeq: Number(selected[0]!._orderSeq) } : null }
+    },
+    readTapePayload: async (_sessionId, owner, tapeId, ordinal, offset = 0, length) => {
+      assert.equal(owner, 'c:765')
+      assert.equal(tapeId, 'tape-sized-page')
+      const payload = payloads.get(`tool-${ordinal}`)!
+      return { payload: payload.subarray(offset, offset + (length ?? payload.length)),
+        totalBytes: payload.length, offset, msgId: `tool-${ordinal}`, role: 'tool',
+        contentSha256: createHash('sha256').update(payload).digest('hex'), tapeSha256: 'a'.repeat(64) }
+    },
+  }
+  const pages: MessageLike[][] = []
+  let cursor: ClientTimelineCursor | null = null
+  for (let pageNo = 0; ; pageNo++) {
+    assert.ok(pageNo < rows.length)
+    const result = await call({ deps, query: 'sessionId=session-raw-1' +
+      (cursor ? `&cursor=${encodeURIComponent(encodeClientTimelineCursor(cursor))}` : '') })
+    assert.equal(result.status, 200)
+    assert.ok(result.bytes.length <= maxResponseBytes)
+    pages.push(result.json.page.messages)
+    if (!result.json.page.hasMore) break
+    assert.ok(result.json.page.nextCursor)
+    cursor = result.json.page.nextCursor
+  }
+  const recovered = pages.reverse().flat()
+  assert.deepEqual(recovered.map(row => row.id), [...originals.map(row => row.id), 'terminal-original'])
+  assert.deepEqual(recovered.slice(0, 33).map(row => row.text), originals.map(row => row.text))
+  assert.equal(recovered.at(-1)?.text, '正常完整终态')
+  assert.ok(calls.some(call => call.limit < 200))
+  const firstCursorRead = calls.findIndex(call => call.cursor !== null)
+  assert.ok(firstCursorRead > 0)
+  assert.ok(calls.slice(0, firstCursorRead).every(call => call.cursor === null))
 })

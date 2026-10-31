@@ -234,6 +234,8 @@ export interface AgentSession {
   /** Original platform input and observations, scoped to this owner/session/trace. */
   _compactionOriginal?: import('./compactionArchive.js').CompactionArchiveReference
   _compactionPendingTools?: Map<string, import('./compactionTasks.js').CompactionActiveTask>
+  /** One logical turn's exact-source wrapper, applied at every retry dispatch. */
+  _compactionRecoverInput?: (input: import('./historicalContextPayload.js').HistoricalTurnInput) => import('./historicalContextPayload.js').HistoricalTurnInput
   /** Signed context owner for the turn that currently holds session.lock. */
   _boxContextOwner?: string
   /** Set while the lock-held idle path is inside runner.submitTurn. */

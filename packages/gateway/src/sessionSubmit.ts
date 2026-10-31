@@ -1011,7 +1011,7 @@ export async function submit(
         if (msg.system === true || !modelHistorySemanticRole(msg)) return total
         return total + modelHistorySemanticText(msg).length
       }, 0) ?? 0
-    let contextOverflowRetryInputs =
+    const contextOverflowRetryInputs =
       effectiveMasterHistoricalMessages &&
       typeof userTextOrBlocks === 'string' &&
       contextOverflowHistoryChars > 0
@@ -1272,12 +1272,11 @@ export async function submit(
     if (!opts?.modelSwitchInternal) {
       const recover = await prepareCompactionTurn(
         session, userTextOrBlocks, compactionPromptPolicy,
-        this.readCompactionTasks?.(session.sessionKey),
+        () => this.readCompactionTasks?.(session.sessionKey) ?? [],
       )
       assertSessionCurrent()
       if (recover && !isCcbSlashCommandPrompt(userTextOrBlocks)) {
-        runnerPayload = recover(runnerPayload)
-        contextOverflowRetryInputs = contextOverflowRetryInputs.map(input => recover(input) as string)
+        session._compactionRecoverInput = recover
       }
     }
     // Auto-name session from first user turn
@@ -1391,6 +1390,7 @@ export async function submit(
     }
   } finally {
     closeHelpLogical?.()
+    session._compactionRecoverInput = undefined
     clearRunnerPromptPrivacy(session.runner)
     if (
       consumingModelSwitch &&

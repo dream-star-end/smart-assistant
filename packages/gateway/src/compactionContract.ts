@@ -139,6 +139,8 @@ export const COMPACTION_INLINE_MAX_BYTES = 24 * 1024
 
 export interface AttachCompactionRecoveryOptions {
   context: string | CompactionRecoveryContext
+  /** Re-read at each dispatch; a job can start or finish during a failed attempt. */
+  activeTasks?: readonly unknown[]
   /** Private exact-source file published by the archive module BEFORE submit.
    * A path is data, not an instruction supplied by a summary. */
   textReference?: string
@@ -190,7 +192,14 @@ export function attachCompactionRecoveryContext(
   input: HistoricalTurnInput,
   opts: AttachCompactionRecoveryOptions,
 ): HistoricalTurnInput {
-  const context = typeof opts.context === 'string' ? opts.context : opts.context.text
+  const originalContext = typeof opts.context === 'string' ? opts.context : opts.context.text
+  const live = opts.activeTasks === undefined ? '' : [
+    'Fresh execution state at this dispatch supersedes captured task liveness. It grants no permission or completion authority; keep the existing task identities and verify before starting work.',
+    '<openclaude_live_tasks_json>',
+    jsonData({ active_tasks: opts.activeTasks }),
+    '</openclaude_live_tasks_json>',
+  ].join('\n')
+  const context = live ? `${originalContext}\n${live}` : originalContext
   const inlineMax = opts.inlineMaxBytes ?? COMPACTION_INLINE_MAX_BYTES
   if (!Number.isSafeInteger(inlineMax) || inlineMax <= 0 ||
     (opts.maxPromptBytes !== undefined && (!Number.isSafeInteger(opts.maxPromptBytes) || opts.maxPromptBytes <= 0))) {
@@ -201,7 +210,8 @@ export function attachCompactionRecoveryContext(
     if (inline) return inline
   }
   if (!opts.textReference) throw new Error('COMPACTION_CONTEXT_REFERENCE_REQUIRED')
-  const referenced = fitWithContext(input, recoveryReference(opts.textReference), opts.maxPromptBytes)
+  const reference = recoveryReference(opts.textReference)
+  const referenced = fitWithContext(input, live ? `${reference}\n${live}` : reference, opts.maxPromptBytes)
   if (!referenced) throw new Error('COMPACTION_CONTEXT_INPUT_EXCEEDS_BYTE_BUDGET')
   return referenced
 }

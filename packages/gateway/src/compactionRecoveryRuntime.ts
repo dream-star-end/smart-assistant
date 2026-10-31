@@ -11,10 +11,11 @@ export async function prepareCompactionTurn(
   session: AgentSession,
   originalInput: HistoricalTurnInput,
   policy: PromptPrivacyPolicy | undefined,
-  tasks: readonly CompactionActiveTask[] = [],
+  tasks: readonly CompactionActiveTask[] | (() => readonly CompactionActiveTask[]) = [],
 ) {
   if (!personalCompactionEnabled() || session.channel !== 'webchat') return null
-  const activeTasks = [...tasks, ...(session._compactionPendingTools?.values() ?? [])]
+  const readTasks = () => [...(typeof tasks === 'function' ? tasks() : tasks), ...(session._compactionPendingTools?.values() ?? [])]
+  const activeTasks = readTasks()
   const agent = session._identityCreationOpts?.agent
   const captured = await captureCompactionOriginal({
     ownerUserId: session.userId ?? 'default', sessionId: session.peerId,
@@ -48,6 +49,7 @@ export async function prepareCompactionTurn(
   return (input: HistoricalTurnInput): HistoricalTurnInput => attachCompactionRecoveryContext(input, {
     context: typeof captured.snapshot.platformContext === 'string' ? captured.snapshot.platformContext : '',
     textReference: captured.reference.textPath,
+    activeTasks: readTasks(),
     // Antigravity budgets its complete JSON stdin envelope and can externalize
     // even the current input. Preserve that existing fallback instead of
     // rejecting here before its adapter can publish the exact file reference.

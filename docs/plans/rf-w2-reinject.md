@@ -18,7 +18,7 @@ CLI 摘要一律标作“来自摘要、未经确认”，只能提供检索线�
 ## 接入时机与引擎适用
 
 `sessionSubmit` 在持有会话锁时调用 `prepareCompactionTurn`，先保存原文，再提交引擎。
-普通下一轮输入及既有上下文溢出重试都携带同一恢复契约；多模态当前输入保留原块。
+每次实际派发（含普通下一轮、上下文溢出与瞬时错误续跑）都携带同一恢复契约，重新读取在途任务身份；多模态当前输入保留原块。
 原生 slash command 保持命令文本，内部模型切换控制流程沿用原路；跨引擎原生摘要交接显式标记未经确认。
 CCB、Codex、Grok 继续由各自 CLI 产生 native compact，平台没有另建摘要生成器。
 Codex 下一轮前的主动 compact 也位于快照之后；CCB/Box/Grok 的底座历史所有权保持原样。
@@ -30,7 +30,7 @@ Cursor、zcode、Antigravity 无原生 compact，恢复契约同样用于平台�
 
 [compactionArchive.ts](../../packages/gateway/src/compactionArchive.ts) 的 `captureCompactionOriginal`
 经 `readCompactionTimelinePage` 完整翻页：有 master 凭据则从其 PG 权威时间线读取并水合大正文，只有独立本地运行才读 SQLite。校验 revision/generation/maxSeq，变化时有界重读。
-内部分页路由 `/internal/v3/compaction-timeline` 仅个人版挂载，沿用 bearer+bound-IP 容器鉴权，owner 仅从身份推导；远端失败不回退本地，分片及整页 SHA 必须完整。
+内部分页按水合后实际字节自动缩页，保留真实游标及全部正文。路由 `/internal/v3/compaction-timeline` 仅个人版挂载，沿用 bearer+bound-IP 容器鉴权，owner 仅从身份推导；远端失败不回退本地，分片及整页 SHA 必须完整。
 不调用带模型窗口裁剪的 `getEngineContextMessages`；首次确认为新会话时才显式允许空时间线。
 source 固定为 `platform-full-timeline`：原始主时间线、exact 当前输入、平台上下文及活动 ID。
 `sessionTurnRunner` 在可见 compact 边界/终态调用 `observeCompactionOriginal`，同步追加当轮

@@ -214,6 +214,36 @@ test('real overflow retry keeps the same original-source prohibition and existin
   assert.equal((await archiveFor(session)).snapshot.currentInput, 'CURRENT_OVERFLOW_REQUEST')
 })
 
+test('native transient continuation reasserts original sources and refreshes newly active task ids', { timeout: 20_000 }, async t => {
+  const { manager, session, fakeModel, jobId } = await managerFixture(t, 'runtime-transient')
+  t.mock.method(manager as unknown as { _transientRetryDelayMs: () => number }, '_transientRetryDelayMs', () => 0)
+  const originalSubmit = fakeModel.submit.bind(fakeModel)
+  fakeModel.submit = async input => {
+    await originalSubmit(input)
+    if (fakeModel.inputs.length === 1) {
+      manager.readCompactionTasks = () => [{ kind: 'delegate', id: 'dlgjob-started-before-429',
+        state: 'running', sessionKey: 'original-child-key', idempotencyKey: 'original-paid-attempt' }]
+      throw new Error('HTTP 429 rate limit exceeded')
+    }
+  }
+  await manager.submit(session, 'CURRENT_TRANSIENT_REQUEST', () => {}, undefined, undefined, undefined, 'runtime-transient-trace')
+  assert.equal(fakeModel.inputs.length, 2)
+  for (const input of fakeModel.inputs) {
+    const data = await submittedSources(input)
+    assert.equal(data.user_instructions[0].text, FORBIDDEN)
+    assert.ok(data.active_tasks.some((task: { id: string }) => task.id === jobId))
+  }
+  const continuation = fakeModel.inputs[1]
+  const text = typeof continuation === 'string' ? continuation : JSON.stringify(continuation)
+  assert.match(text, /上一条消息因上游瞬时错误中断/)
+  const marker = '<openclaude_live_tasks_json>\n'
+  const live = JSON.parse(text.slice(text.indexOf(marker) + marker.length).split('\n')[0]!)
+  assert.equal(live.active_tasks[0].id, 'dlgjob-started-before-429')
+  assert.equal(live.active_tasks[0].idempotencyKey, 'original-paid-attempt')
+  assert.equal(session._compactionRecoverInput, undefined, 'a later control operation must not inherit this turn wrapper')
+  assert.equal((await archiveFor(session)).snapshot.currentInput, 'CURRENT_TRANSIENT_REQUEST')
+})
+
 test('raw native compact commands remain commands through SessionManager.submit and retain pre-command originals', { timeout: 20_000 }, async t => {
   const { manager, session, fakeModel } = await managerFixture(t, 'runtime-native-slash')
   const command = '/compact preserve the original user restrictions'

@@ -2531,7 +2531,7 @@ export async function runOneTurnWithRetry(
     try {
       await this._runOneTurn(
         session,
-        retryInput,
+        session._compactionRecoverInput?.(retryInput) ?? retryInput,
         onEvent,
         requestId,
         traceId,
