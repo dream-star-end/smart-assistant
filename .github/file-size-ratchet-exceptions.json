@@ -5,5 +5,12 @@
     "ticket": "OCV5-491",
     "reason": "verbatim port of the commercial Box incident proofs gate (OCV5-488); both trees keep the file identical for two-tree sync, so it is split in both trees together with the OCV5-491 selfhost Box catch-up; OCV5-488 PR-2 adds the process-absent and idle-stop proofs and PR-3 the container-rebuilt and any-refusal proofs; OCV5-557 (+26) replaces fixed sleeps with bounded waits (stop arrival, process exit, stdin close) and adds the [gate-failure] line the release retry reads; OCV5-583 (+5) pins the idle proof's incarnation start past the grace (CI runner uptime made it red) — split stays with OCV5-491",
     "expires": "2026-11-16"
+  },
+  {
+    "path": "packages/commercial/src/__tests__/userChatBridge.test.ts",
+    "maxLines": 4770,
+    "ticket": "OCV5-673",
+    "reason": "The bridge suite was already over the 3000-line cap. This PR only changes the historical tool-row expectation to the fenced tool output. Splitting the file is outside OCV5-673.",
+    "expires": "2026-11-30"
   }
 ]

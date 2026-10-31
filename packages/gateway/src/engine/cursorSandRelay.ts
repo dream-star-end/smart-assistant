@@ -39,6 +39,7 @@ import {
   isCursorMachineId,
   parseTraceIdCandidate,
   TRACE_ID_HEADER,
+  wrapUntrustedData,
 } from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
 import { AUTHORITY_HEADER, LOCAL_CATALOG_HEADER, TURN_LEASE_HEADER } from '../modelCatalogClient.js'
@@ -523,6 +524,11 @@ function contentText(content: unknown): string {
     .join('\n')
 }
 
+function modelToolResultText(content: unknown): string {
+  const raw = contentText(content)
+  return raw.trim() ? wrapUntrustedData('tool_result', raw) : raw
+}
+
 function contentParts(content: unknown): JsonObject[] {
   if (!Array.isArray(content)) return []
   const parts: JsonObject[] = []
@@ -561,7 +567,7 @@ function contentParts(content: unknown): JsonObject[] {
  * model reported the picture as "(omitted)".
  */
 function toolResultPart(record: JsonObject, toolName: string): JsonObject {
-  const text = contentText(record.content)
+  const text = modelToolResultText(record.content)
   const media = contentParts(record.content).filter((part) => 'image' in part || 'file' in part)
   const part: JsonObject = {
     toolCallId: record.tool_use_id,
@@ -602,7 +608,7 @@ function userHistoryText(content: unknown): string {
     if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
       chunks.push(
         `<tool_result id=${JSON.stringify(block.tool_use_id)} error=${block.is_error === true ? 'true' : 'false'}>`
-        + `${contentText(block.content)}</tool_result>`,
+        + `${modelToolResultText(block.content)}</tool_result>`,
       )
     }
   }

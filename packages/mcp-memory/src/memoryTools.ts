@@ -20,6 +20,7 @@
  * 返回结构刻意沿用旧 MCP handler 的 `{ content:[{type:'text',text}], isError? }`
  * ——CLI 直接取 content[0].text 打印,isError 决定退出码;单一返回形状不分叉。
  */
+import { wrapUntrustedData } from '@openclaude/protocol'
 import {
   type EmbeddingProvider,
   MemoryDir,
@@ -71,13 +72,13 @@ export interface MemoryToolResult {
 }
 
 export function toolOk(msg: string, telemetry?: MemoryToolResult['telemetry']): MemoryToolResult {
-  return { content: [{ type: 'text', text: msg }], ...(telemetry ? { telemetry } : {}) }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', msg) }], ...(telemetry ? { telemetry } : {}) }
 }
 export function toolError(
   msg: string,
   telemetry: MemoryToolResult['telemetry'] = { outcome: 'error' },
 ): MemoryToolResult {
-  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true, telemetry }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', `error: ${msg}`) }], isError: true, telemetry }
 }
 
 /**

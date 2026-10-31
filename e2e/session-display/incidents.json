@@ -9189,6 +9189,33 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-PROMPT-AUTHORITY",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "个人版把工具结果、引用、技能正文和记忆原样送进模型时，正文里的覆盖句可以压过拒绝规则、改写计费，或把尚未确认的状态写成已完成。OCV5-673：代码把平台拒绝规则固定在系统提示最前，后续槽不能替换；送进模型的上述正文包进数据边界，正文原样保留（2026-10-31 人审：正则抹覆盖句会改坏用户的合同、价格表和代码，已去掉）。",
+      "rootFixCommit": "c8e3dd14",
+      "coverageCommits": [
+        "e12dfd61",
+        "1c08dc6a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/instructionAuthority.test.ts",
+          "assertion": "tool result and quote fences keep the body byte-identical behind the boundary note"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/promptSlotsAuthority.test.ts",
+          "assertion": "seals refusal rules ahead of platform capabilities"
+        }
+      ],
+      "proofPending": {
+        "reason": "系统提示拒绝规则和工具结果数据边界没有浏览器界面、live 会话矩阵或发布脚本可挂。证据是协议单测 instructionAuthority 与网关单测 promptSlotsAuthority。不新开发布门，避免牵动 release parity。补上 proof 层后把 SELFHOST_PROOF_PENDING_BASELINE 调回 3。",
+        "since": "2026-10-31"
+      }
     }
   ]
 }

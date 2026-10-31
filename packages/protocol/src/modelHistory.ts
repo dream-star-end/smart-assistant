@@ -5,6 +5,7 @@
  * they are not browser-history limits. The browser timeline remains exact and
  * independently pageable.
  */
+import { wrapUntrustedData } from './instructionAuthority.js'
 import {
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
@@ -358,6 +359,12 @@ function appendSection(parts: string[], label: string, value: unknown): void {
   if (!parts.includes(section)) parts.push(section)
 }
 
+function appendToolData(parts: string[], label: string, value: unknown): void {
+  const body = serialized(value)
+  if (!body.trim()) return
+  appendSection(parts, label, wrapUntrustedData('tool_result', body))
+}
+
 function childBlockSemanticText(value: unknown): string {
   const block = asRecord(value)
   if (!block || typeof block.kind !== 'string' || block.kind === 'thinking') return ''
@@ -371,14 +378,14 @@ function childBlockSemanticText(value: unknown): string {
       appendSection(parts, 'Input', block.inputJson ?? block.inputPreview)
       break
     case 'tool_result':
-      appendSection(
+      appendToolData(
         parts,
         block.isError === true ? 'Tool error' : 'Tool result',
         block.output ?? block.outputJson ?? block.preview,
       )
       break
     case 'tool_output_tail':
-      appendSection(parts, block.truncatedHead === true ? 'Exact tool output tail' : 'Tool output', block.tail)
+      appendToolData(parts, block.truncatedHead === true ? 'Exact tool output tail' : 'Tool output', block.tail)
       break
     case 'plan':
       appendSection(parts, 'Plan', block.text)
@@ -455,9 +462,9 @@ export function modelHistorySemanticText(value: unknown): string {
         // before labelling to avoid doubling giant Bash output in sidecars and
         // in the finite model window.
         if (body !== serialized(output)) appendSection(parts, 'Summary', body)
-        appendSection(parts, 'Output', output)
+        appendToolData(parts, 'Output', output)
       }
-      appendSection(parts, 'Error', message.error)
+      appendToolData(parts, 'Error', message.error)
       break
     case 'plan':
       appendSection(parts, 'Plan', body)

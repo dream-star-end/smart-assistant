@@ -14,6 +14,7 @@ import {
   ZCODE_HOSTED_PERMISSION_MODE,
   zcodeTransportModelId,
   type GoalStateSnapshot,
+  stripUntrustedDataForDisplay,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -962,10 +963,10 @@ export class ZcodeAdapter extends EventEmitter implements EngineAdapter {
     if (!state || state.entry.completed === true) return
     const isError = record.hookEventName === 'PostToolUseFailure'
     const outputJson = isError ? record.error : record.toolResponse
-    const output = isError
+    const output = stripUntrustedDataForDisplay(isError
       ? jsonText(record.error) || 'Tool failed'
-      : jsonText(record.toolResponse)
-    const preview = record.toolResultPreview || output.slice(0, 500)
+      : jsonText(record.toolResponse))
+    const preview = stripUntrustedDataForDisplay(record.toolResultPreview || output.slice(0, 500))
     const now = eventTimestamp(record.timestamp)
     state.entry = {
       ...state.entry,

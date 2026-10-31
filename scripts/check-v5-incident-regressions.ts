@@ -68,7 +68,12 @@ const SELFHOST_PROOF_DEBT_CEILING = 63;
 // 2026-10-26 OCV5-622: office refresh-grace / cross-tab lock is unit+integ proven;
 // dual-tab BootSplash live proof needs post-ride canary on personal office session
 // (browser harness cannot yet drive two real tabs against live auth cookies).
-const SELFHOST_PROOF_PENDING_BASELINE = 3;
+// 2026-10-31 OCV5-673: the refusal seal is a system-prompt and tool-result fence.
+// It has no browser surface, live session-display spec, or release-gate runner.
+// Unit evidence runs in test:gateway (promptSlotsAuthority) and test:protocol
+// (instructionAuthority). Baseline 3 → 4 for this review; lower it when a
+// proof-layer runner exists.
+const SELFHOST_PROOF_PENDING_BASELINE = 4;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {

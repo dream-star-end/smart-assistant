@@ -33,6 +33,7 @@
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
 import './mcpStdioGuard.js'
 import { readFileSync } from 'node:fs'
+import { wrapUntrustedData } from '@openclaude/protocol'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -424,7 +425,7 @@ async function handleSkillList() {
   lines.push(
     'Baseline skills cannot be overwritten via `skill_save` (name is reserved) or deleted via `skill_delete`.',
   )
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', lines.join('\n')) }] }
 }
 
 /**
@@ -496,7 +497,7 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
         lines.push('')
       }
       lines.push('Next: call `skill_view(name)` for the best match before applying it.')
-      return { content: [{ type: 'text', text: lines.join('\n') }] }
+      return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', lines.join('\n')) }] }
     }
   }
 
@@ -527,14 +528,14 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
     lines.push('')
   }
   lines.push('Next: call `skill_view(name)` for the best match before applying it.')
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', lines.join('\n')) }] }
 }
 
 async function handleSkillView(args: { name: string; subfile?: string }) {
   if (SKILL_EVAL_EXCLUDE && args.name === SKILL_EVAL_EXCLUDE) return toolError('skill not found')
   if (SKILL_EVAL_DRAFT_NAME && args.name === SKILL_EVAL_DRAFT_NAME && !args.subfile) {
     const raw = evalDraftRaw()
-    if (raw) return { content: [{ type: 'text', text: `[source: user]\n\n${raw}` }] }
+    if (raw) return { content: [{ type: 'text', text: wrapUntrustedData('skill', `[source: user]\n\n${raw}`) }] }
   }
   const v = await skills.view(args.name, args.subfile)
   if (!v) return toolError('skill not found')
@@ -542,10 +543,10 @@ async function handleSkillView(args: { name: string; subfile?: string }) {
     // Subfile read returns a bare string; we have no source metadata here without
     // a second lookup, but the containing skill_view call can be assumed to land
     // in whichever root actually owned the parent name (baseline-wins).
-    return { content: [{ type: 'text', text: v }] }
+    return { content: [{ type: 'text', text: wrapUntrustedData('skill', v) }] }
   }
   const header = `[source: ${v.source}]`
-  return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
+  return { content: [{ type: 'text', text: wrapUntrustedData('skill', `${header}\n\n${v.rawContent}`) }] }
 }
 
 // Cosine threshold above which a new skill is treated as a near-duplicate of an
@@ -1279,10 +1280,10 @@ async function handleDeleteReminder(args: { id: string }) {
 }
 
 function toolOk(msg: string) {
-  return { content: [{ type: 'text', text: msg }] }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', msg) }] }
 }
 function toolError(msg: string) {
-  return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
+  return { content: [{ type: 'text', text: wrapUntrustedData('tool_result', `error: ${msg}`) }], isError: true }
 }
 
 const transport = new StdioServerTransport()

@@ -7,6 +7,7 @@ export { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
  * in cache-friendly order: static content first (rarely changes), dynamic last.
  *
  * Slot order(实际生效顺序;按 cache-friendly 静态在前、动态在后排):
+ *   0. AUTHORITY         — 平台拒绝规则。代码在拼接末尾固定到最前,后续槽不能替换
  *   1. ENV               — 当轮实测的稳定环境事实(uid/实例/宿主通道/快照),容器生命周期内不变
  *   2. SOUL              — Agent persona (CLAUDE.md / SOUL.md), rarely changes
  *   3. USER              — Explicit per-conversation nickname consent; no automatic user.md read
@@ -58,7 +59,7 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO, DEFAULT_PROMPT_PRIVACY, effectivePromptPrivacy, parsePromptPrivacyPolicy, type PromptPrivacyPolicy } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO, DEFAULT_PROMPT_PRIVACY, effectivePromptPrivacy, parsePromptPrivacyPolicy, sealAuthoritySlots, wrapUntrustedData, type PromptPrivacyPolicy } from '@openclaude/protocol'
 import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
@@ -979,7 +980,7 @@ async function buildMemorySlotParts(
     index = null
   }
   if (!index) return { instructions, index: null }
-  return { instructions, index: `## 当前索引\n\n${index}` }
+  return { instructions, index: `## 当前索引\n\n${wrapUntrustedData('memory', index)}` }
 }
 
 const PROJECT_MEMORY_HEADER = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
@@ -994,7 +995,7 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
     if (ctx.provider === 'cursor') return { name: 'PROJECT_MEMORY', content: header }
     const index = ctx.frozenProjectContext.officialMemoryIndex
     if (!index) return { name: 'PROJECT_MEMORY', content: header }
-    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${index}` }
+    return { name: 'PROJECT_MEMORY', content: `${header}\n\n## 项目索引\n\n${wrapUntrustedData('memory', index)}` }
   }
   const boardId =
     (ctx.projectContext?.bound && ctx.projectContext.boardProjectId) || ctx.projectId || null
@@ -1022,7 +1023,7 @@ export async function buildProjectMemorySlot(ctx: PromptSlotContext): Promise<Pr
   if (!index) return { name: 'PROJECT_MEMORY', content: header }
   return {
     name: 'PROJECT_MEMORY',
-    content: `${header}\n\n## 项目索引\n\n${index}`,
+    content: `${header}\n\n## 项目索引\n\n${wrapUntrustedData('memory', index)}`,
   }
 }
 
@@ -1901,17 +1902,18 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       ? staticFirstSlots(slots, agentsParts, memoryParts)
       : { slots, staticCount: -1 }
   const sanitizeMcpClaims = createMcpClaimSanitizer(ctx.availableMcpTools)
-  const effectiveSlots = ordered.slots.map((slot) => ({
+  const effectiveSlots = sealAuthoritySlots(ordered.slots.map((slot) => ({
     ...slot,
     content: sanitizeMcpClaims(slot.content),
-  }))
+  })))
+  const staticCount = ordered.staticCount < 0 ? -1 : ordered.staticCount + 1
   let content =
-    ordered.staticCount < 0
+    staticCount < 0
       ? effectiveSlots.map((s) => s.content).join(SEPARATOR)
       : [
-          ...effectiveSlots.slice(0, ordered.staticCount).map((s) => s.content),
+          ...effectiveSlots.slice(0, staticCount).map((s) => s.content),
           PROMPT_SESSION_CONTEXT_MARKER,
-          ...effectiveSlots.slice(ordered.staticCount).map((s) => s.content),
+          ...effectiveSlots.slice(staticCount).map((s) => s.content),
         ].join(SEPARATOR)
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
@@ -1932,7 +1934,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   }))
   const contentMetrics = promptContentMetrics.get(content)
   const slotTokensEstimate = Object.fromEntries(
-    ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
+    ['AUTHORITY', 'ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
       'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
       .map(name => [name, effectiveSlots.reduce((sum, slot, index) =>
         sum + (slot.name === name ? metrics[index]!.tokensEstimate : 0), 0)]),

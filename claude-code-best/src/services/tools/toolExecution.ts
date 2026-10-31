@@ -132,6 +132,7 @@ import {
   runPreToolUseHooks,
 } from './toolHooks.js'
 import { isSkillLearningEnabled } from '../skillLearning/featureCheck.js'
+import { sealToolResultContent } from '../../../../packages/protocol/src/instructionAuthority.js'
 
 // Cached import promise for the skill-learning wrapper — paid once, not per call.
 let _skillLearningWrapperCache:
@@ -521,7 +522,7 @@ export async function* runToolUse(
         content: [
           {
             type: 'tool_result',
-            content: `<tool_use_error>${detailedError}</tool_use_error>`,
+            content: sealToolResultContent(`<tool_use_error>${detailedError}</tool_use_error>`),
             is_error: true,
             tool_use_id: toolUse.id,
           },
@@ -1819,7 +1820,8 @@ async function checkPermissionsAndCallTool(
           content: [
             {
               type: 'tool_result',
-              content,
+              // Non-zero Bash exits carry full stdout and MCP isError text here.
+              content: sealToolResultContent(content),
               is_error: true,
               tool_use_id: toolUseID,
             },

@@ -13,6 +13,7 @@ import {
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
   isToolExitCode,
+  stripUntrustedDataForDisplay,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import { _sanitizeThreadId, copyImagePathsToPublicDir } from './codexShared.js'
@@ -1349,7 +1350,7 @@ export function emitToolResult(
         {
           type: 'tool_result',
           tool_use_id: toolUseId,
-          content,
+          content: stripUntrustedDataForDisplay(content),
           is_error: isError,
           ...(engineMeta?.exitCode !== undefined ? { exit_code: engineMeta.exitCode } : {}),
           ...(engineMeta?.terminationReason !== undefined

@@ -8,7 +8,7 @@ import { test } from 'node:test'
 // protobufjs is CommonJS; a namespace import yields `{ default }` under tsx and
 // `loadSync` is undefined (see the same note in engine/cursorSandRelay.ts).
 import protobuf from 'protobufjs'
-import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum } from '@openclaude/protocol'
+import { CURSOR_ENGINE_MODELS, CURSOR_SESSION_CLIENT_VERSION, cursorSessionChecksum, wrapUntrustedData } from '@openclaude/protocol'
 import {
   CURSOR_SAND_DIRECT_CLIENT_SOURCE,
   CURSOR_SAND_DIRECT_CLIENT_VERSION,
@@ -1017,7 +1017,7 @@ test('Fable Sand encodes native tool schemas and structured tool-result history'
   const toolResult = request.messages.find((message: { role?: number }) => message.role === 3)
   assert.equal(toolResult.toolContent.parts[0].toolCallId, 'toolu_1')
   assert.equal(toolResult.toolContent.parts[0].toolName, 'Read')
-  assert.equal(toolResult.toolContent.parts[0].result.stringValue, 'contents')
+  assert.equal(toolResult.toolContent.parts[0].result.stringValue, wrapUntrustedData('tool_result', 'contents'))
 })
 
 test('Sand keeps Read image blocks in tool results and user turns (vision regression)', () => {
@@ -1108,7 +1108,7 @@ test('Grok Sand encodes native tool schemas and structured tool-result history',
   const toolResult = request.messages.find((message: { role?: number }) => message.role === 3)
   assert.equal(toolResult.toolContent.parts[0].toolCallId, 'call_1')
   assert.equal(toolResult.toolContent.parts[0].toolName, 'Bash')
-  assert.equal(toolResult.toolContent.parts[0].result.stringValue, 'ok')
+  assert.equal(toolResult.toolContent.parts[0].result.stringValue, wrapUntrustedData('tool_result', 'ok'))
 })
 
 test('every concrete catalog Cursor model maps to its Sand InferenceService id', () => {

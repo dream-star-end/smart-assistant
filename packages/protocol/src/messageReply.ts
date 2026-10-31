@@ -1,4 +1,5 @@
 import { type Static, Type } from '@sinclair/typebox'
+import { wrapUntrustedData } from './instructionAuthority.js'
 
 export const MESSAGE_REPLY_ID_PATTERN = '^[A-Za-z0-9_.:-]{1,256}$'
 const MESSAGE_REPLY_ID_RE = new RegExp(MESSAGE_REPLY_ID_PATTERN)
@@ -47,7 +48,7 @@ export function formatMessageReplyPrompt(
   const author = replyTo.role === 'user' ? '用户' : '助手'
   return [
     `[被引用的历史消息｜发送者：${author}｜消息ID：${replyTo.messageId}｜原文字符数：${replyTo.text.length}]`,
-    replyTo.text,
+    wrapUntrustedData('quote', replyTo.text),
     '[用户当前消息]',
     currentText,
   ].join('\n')

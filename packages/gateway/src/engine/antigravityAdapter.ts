@@ -37,6 +37,7 @@ import {
   TOOL_FAILED_EMPTY_SENTINEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  stripUntrustedDataForDisplay,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -829,9 +830,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const error = recordOf(info.error)
     const isError = state === 'ERROR' || error !== null
     const raw = antigravityToolOutput(info.output)
-    const output = isError
+    const output = stripUntrustedDataForDisplay(isError
       ? (asText(error?.message) || raw || TOOL_FAILED_EMPTY_SENTINEL)
-      : raw
+      : raw)
     tool.output = output
     tool.completed = true
     tool.isError = isError

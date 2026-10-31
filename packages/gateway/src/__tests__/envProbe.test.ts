@@ -279,10 +279,11 @@ describe('envProbe', () => {
     assert.equal(second.uid, '3')
   })
 
-  it('injects ENV as the first prompt slot from the process cache', async () => {
+  it('injects ENV immediately after the sealed refusal prefix', async () => {
     probeEnvFacts(fakeDeps({ env: selfhostEnv, files: selfhostFiles }))
     const result = await buildPromptContext({ agentId: 'wired-agent' })
-    assert.equal(result.applied[0]?.name, 'ENV')
+    assert.equal(result.applied[0]?.name, 'AUTHORITY')
+    assert.equal(result.applied[1]?.name, 'ENV')
     assert.match(result.content, /uid=3 agent=wired-agent/)
     assert.match(result.content, /inst=新个人版V5自用/)
     // OCV5-166:容器引擎子进程(网页/cron 会话都走这里)拿到用户面时区,而非出口 TZ。
