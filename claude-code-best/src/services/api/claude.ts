@@ -512,6 +512,17 @@ export function boxAgentSessionId(
   return `agent-${digest}`
 }
 
+/** Agent id that may replace the process session on a model request.
+ * toolUseContext.agentId is set for every cache-sharing fork (idle summary,
+ * compact, session memory), not only for a Box subagent. Using it as the
+ * Box session splits the summary from the enclosing turn, so the idle
+ * history commit never matches and the next user stays IDLE_HISTORY_PENDING.
+ * Real subagents opt in by installing AsyncLocalStorage around their query.
+ */
+export function boxModelSessionAgentId(): string | undefined {
+  return getAgentContext()?.agentId
+}
+
 export function getAPIMetadata(agentId?: string) {
   // https://docs.google.com/document/d/1dURO9ycXXQCBS0V4Vhl4poDBRgkelFc5t2BNPoEgH5Q/edit?tab=t.0#heading=h.5g7nec5b09w5
   let extra: JsonObject = {}
@@ -1834,7 +1845,7 @@ async function* queryModel(
       tools: allTools,
       tool_choice: options.toolChoice,
       ...(useBetas && { betas: filteredBetas }),
-      metadata: getAPIMetadata(options.agentId),
+      metadata: getAPIMetadata(boxModelSessionAgentId()),
       max_tokens: maxOutputTokens,
       thinking,
       ...(temperature !== undefined && { temperature }),
