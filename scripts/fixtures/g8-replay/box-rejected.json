@@ -1,0 +1,25 @@
+{
+  "id": "box-rejected",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "box_rejected",
+    "severity": "warning",
+    "askHuman": true,
+    "alert": true,
+    "reason": "box_rejected",
+    "point": "turn_end",
+    "traceId": "11111111111111111111111111111111"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "11111111111111111111111111111111",
+    "boxDecision": "rejected",
+    "failureCode": "BOX_TOOL_RESULT_MISMATCH",
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "not_accepted",
+    "engineReported": "ended",
+    "engineProcessAlive": false,
+    "settledChargeCount": 0
+  }
+}

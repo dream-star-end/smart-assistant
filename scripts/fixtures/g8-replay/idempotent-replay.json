@@ -1,0 +1,24 @@
+{
+  "id": "idempotent-replay",
+  "expect": {
+    "retryable": false,
+    "stopSession": false,
+    "verdict": "ok",
+    "severity": "info",
+    "askHuman": false,
+    "alert": false,
+    "reason": "ok",
+    "point": "turn_end",
+    "traceId": "66666666666666666666666666666666"
+  },
+  "observation": {
+    "point": "turn_end",
+    "traceId": "66666666666666666666666666666666",
+    "settledChargeCount": 2,
+    "idempotentReplay": true,
+    "stackedSettledTurns": 1,
+    "dispatchStatus": "terminal",
+    "dispatchOutcome": "completed",
+    "engineReported": "ended"
+  }
+}

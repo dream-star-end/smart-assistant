@@ -436,6 +436,28 @@ export const boxContinuationRejections = new Counter({
   labelNames: ["stage", "reason"],
 });
 
+const G8_REPLAY_POINTS = new Set(["compact_summary", "turn_end"]);
+const G8_REPLAY_VERDICTS = new Set([
+  "ok",
+  "box_rejected",
+  "engine_state_mismatch",
+  "duplicate_charge",
+  "check_failed",
+]);
+let g8ReplayCheckSeen = false;
+const g8ReplayChecks = new Counter({
+  name: "g8_replay_check_total",
+  help: "G8 replay checkpoint results. Absent until a check runs, so the default-off path adds no series.",
+  labelNames: ["point", "verdict"],
+});
+
+/** Drops unknown labels. A trace id is not a label. */
+export function incG8ReplayCheck(point: string, verdict: string): void {
+  if (!G8_REPLAY_POINTS.has(point) || !G8_REPLAY_VERDICTS.has(verdict)) return;
+  g8ReplayCheckSeen = true;
+  g8ReplayChecks.inc({ point, verdict });
+}
+
 export const wsBridgeBufferedBytes = new Histogram(
   {
     name: "ws_bridge_buffered_bytes",
@@ -780,6 +802,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   anthropicProxyReject.render(out);
   boxContinuationCompatibility.render(out);
   boxContinuationRejections.render(out);
+  if (g8ReplayCheckSeen) g8ReplayChecks.render(out);
   wsBridgeBufferedBytes.render(out);
   wsBridgeSessionDuration.render(out);
   containerEnsureDuration.render(out);
@@ -816,6 +839,8 @@ export function resetMetricsForTest(): void {
   anthropicProxyReject.reset();
   boxContinuationCompatibility.reset();
   boxContinuationRejections.reset();
+  g8ReplayCheckSeen = false;
+  g8ReplayChecks.reset();
   wsBridgeBufferedBytes.reset();
   wsBridgeSessionDuration.reset();
   containerEnsureDuration.reset();
