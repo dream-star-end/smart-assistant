@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { Composer } from "../src/components/Composer";
 import { MessageList } from "../src/components/MessageRenderer";
 import { ToastProvider, TooltipProvider } from "../src/components/ui";
-import { type ChatMessage } from "../src/lib/chat/model";
+import type { ChatMessage } from "../src/lib/chat/model";
 import { applyPermissionSettled } from "../src/lib/chat/reducer";
 import { ChatSocket } from "../src/lib/chat/socket";
 import { backgroundStopControl } from "../src/lib/chat/backgroundDelegates";
@@ -33,13 +33,13 @@ function Harness() {
   const [running, setRunning] = useState(true);
   const update = () => { localStorage.setItem(STORAGE, JSON.stringify(state.session.messages)); redraw((n) => n + 1); };
   return <TooltipProvider><ToastProvider>
-    <button onClick={() => {
+    <button type="button" onClick={() => {
       const group: ChatMessage = { id: "srv-bg-676", role: "agent-group", text: "校验结果", ts: 4, _source: "server", _backgroundDelegate: true,
         _delegateAgentId: "coding-assistant", _delegateRunId: "dlg-676", _completed: true, _resultPreview: "校验结果：三项已通过。" };
       state.socket.applyServerMessages(state.session.id, "main", [...state.session.messages, group], true);
       update();
     }}>后台结果到达</button>
-    <button onClick={() => {
+    <button type="button" onClick={() => {
       applyPermissionSettled(state.session, { type: "outbound.permission_settled", sessionKey: "agent:main:webchat:dm:web-676", channel: "webchat",
         peer: { id: state.session.id, kind: "dm" }, requestId: "ask-user:676", behavior: "allow" }); update();
     }}>服务端确认回执</button>
