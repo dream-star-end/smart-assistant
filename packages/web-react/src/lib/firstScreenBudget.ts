@@ -107,7 +107,7 @@ export function firstScreenBudgetReport(
 export function describeFirstScreenBudget(report: FirstScreenBudgetReport): string {
   const kb = (bytes: number) => `${(bytes / 1024).toFixed(1)}KB`;
   const lines = [
-    `首屏(index.html modulepreload 闭包,${report.closureChunkCount} 个 chunk)gzip ${kb(report.totalGzipBytes)} 超过预算 ${kb(report.budgetBytes)}。`,
+    `首屏(index.html modulepreload 闭包,${report.closureChunkCount} 个 chunk)gzip ${kb(report.totalGzipBytes)} 超过预算 ${kb(report.budgetBytes)}(${report.totalGzipBytes} / ${report.budgetBytes} bytes)。`,
     "把大模块移出入口静态 import(动态 import / 按需加载),或确认体量增长后上调 FIRST_SCREEN_GZIP_BUDGET 并说明理由:",
     ...report.top.map((item) => `  ${item.fileName}  ${kb(item.gzipBytes)}`),
   ];

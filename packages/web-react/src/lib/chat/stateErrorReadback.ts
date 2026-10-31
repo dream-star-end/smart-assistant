@@ -63,8 +63,7 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     effects.changed();
   };
   void import("./stateErrorReadbackResult").then(({ readStateErrorResult }) =>
-    readStateErrorResult({ sess, code, cmid, requiresCompletion: !!policy[1], effects, replay,
-      isStale: snapshotIsStale }),
+    readStateErrorResult(sess, code, cmid, !!policy[1], effects, replay, snapshotIsStale),
   ).catch(replay).finally(() => inflight.delete(key));
   return true;
 }

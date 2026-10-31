@@ -5080,8 +5080,7 @@ export class ChatSocket {
 
   /** Archive cursor conflicts use the same snapshot before reconciling their tape. */
   async syncHistoryNow(sessId: string): Promise<boolean> {
-    const snap = await this.fetchSessionSnapshot(sessId);
-    return !!snap && snap.sessionId === sessId && await this.deps.syncSession?.(sessId) === true;
+    return (await this.fetchSessionSnapshot(sessId))?.sessionId === sessId && await this.deps.syncSession?.(sessId) === true;
   }
 
   /** Archive pagination uses the earliest loaded server order, or its archive watermark. */

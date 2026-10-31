@@ -12,15 +12,19 @@ function stateErrorWasResolved(requiresCompletion: boolean, cmid: string, snap: 
 }
 
 /** Load this module before starting HTTP so chunk latency cannot age an already-applied snapshot. */
-export async function readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay, isStale }: {
-  sess: ChatSession; code: string; cmid: string; requiresCompletion: boolean;
+export async function readStateErrorResult(
+  sess: ChatSession,
+  code: string,
+  cmid: string,
+  requiresCompletion: boolean,
   effects: {
     read: (sessionId: string) => Promise<SessionSnapshot | null | undefined>;
     /** Same lifecycle/session and no Stop or newer active turn. */
     current: () => boolean; changed: () => void;
-  };
-  replay: () => void; isStale: (sess: ChatSession, snap: SessionSnapshot) => boolean;
-}): Promise<void> {
+  },
+  replay: () => void,
+  isStale: (sess: ChatSession, snap: SessionSnapshot) => boolean,
+): Promise<void> {
   if (!effects.current()) return;
   const snap = await effects.read(sess.id);
   if (!effects.current()) return;
