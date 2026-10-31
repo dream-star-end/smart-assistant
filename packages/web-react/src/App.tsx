@@ -23,7 +23,6 @@ import {
 } from "@openclaude/protocol/browser";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
-import { AgentPicker } from "./components/AgentPicker";
 import type { AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
@@ -285,6 +284,7 @@ export function prefetchLazyCentersOnIdle(): void {
   const prefetch = () => {
     // 省流量模式 / 2G 下不在后台下完全部中心(shell 审计 S-16);API 缺席的浏览器照常预取。
     if (!shouldPrefetchCenters(readNetworkInformation())) return;
+    void import("./components/AgentPicker").catch(() => {});
     void import("./components/Landing").catch(() => {});
     void import("./components/SettingsCenter").catch(() => {});
     void import("./components/ManageCenter").catch(() => {});
