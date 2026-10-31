@@ -310,7 +310,8 @@ const args = process.argv.slice(2)
 const output = args[args.indexOf('--output-last-message') + 1]
 const prompt = args[args.length - 1]
 fs.appendFileSync(${JSON.stringify(join(work, 'codex-calls.log'))}, JSON.stringify({ prompt }) + '\\n')
-fs.writeFileSync(output, 'PASS: spec e2e stub')
+const reply = ${JSON.stringify(join(work, 'vision-reply.txt'))}
+fs.writeFileSync(output, fs.existsSync(reply) ? fs.readFileSync(reply, 'utf8') : 'PASS: spec e2e stub')
 `,
     { mode: 0o755 },
   )
@@ -425,6 +426,35 @@ fs.writeFileSync(output, 'PASS: spec e2e stub')
     const report = parseReport(r.stdout)
     assert.equal(report.verdict, 'FAIL')
     assert.ok((report.deterministic as { issues: string[] }).issues.some((m) => m.includes('[spec:spec-parse]')))
+  })
+
+  // OCV5-704: WARN = deterministic checks clean, vision only has suggestions. The skill says
+  // WARN may be delivered; the hint must not tell the agent it failed and must redraw, or a
+  // reviewer that always finds something keeps the agent redrawing the same chart.
+  test('WARN(确定性干净,vision 只有建议):hint 允许交付,不要求重画', async () => {
+    const reply = join(work, 'vision-reply.txt')
+    writeFileSync(reply, '1) 图例与曲线末端轻微重叠(右下)。\n总体:建议把图例移到左上。')
+    try {
+      const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--kind', 'figure'], env)
+      assert.equal(r.code, 0, r.stderr)
+      const report = parseReport(r.stdout)
+      assert.equal((report.deterministic as { issues: unknown[] }).issues.length, 0)
+      assert.equal(report.verdict, 'WARN')
+      const hint = String(report.hint)
+      assert.doesNotMatch(hint, /未通过|重画/)
+      assert.match(hint, /可以交付/)
+    } finally {
+      rmSync(reply, { force: true })
+    }
+  })
+
+  test('FAIL(确定性硬伤):hint 仍要求按 issues 改图重画', async () => {
+    const specFile = join(work, 'broken-for-hint.spec.json')
+    writeFileSync(specFile, '{not json')
+    const r = await runTs('packages/gateway/src/ocFigCheckCli.ts', [image, '--spec', specFile], env)
+    const report = parseReport(r.stdout)
+    assert.equal(report.verdict, 'FAIL')
+    assert.match(String(report.hint), /重画/)
   })
 
   test('--spec 文件不存在:FAIL 而非崩溃', async () => {
