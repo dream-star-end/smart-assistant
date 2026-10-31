@@ -9,6 +9,7 @@ import {
   decideBackgroundTurnNotice,
   isBackgroundTurnOpen,
   runningUserText,
+  turnCreditsLine,
   turnSilenceMs,
 } from "./backgroundTurnNotice";
 import type { ChatMessage } from "./model";
@@ -73,6 +74,11 @@ describe("decideBackgroundTurnNotice(B4-SPEC §3.2)", () => {
 
   test("(c) 已有排队消息 → 显示", () => {
     expect(decide({ queuedCount: 1 }).visible).toBe(true);
+  });
+
+  test("(d) 快照实扣积分到 500 → 显示;未到不单独触发", () => {
+    expect(decide({ creditsSettled: "500" }).visible).toBe(true);
+    expect(decide({ creditsSettled: "499" }).visible).toBe(false);
   });
 
   test("断线 / 连接中 → 立即隐藏并清保持期(断线期间说「仍在运行」会撒谎)", () => {
@@ -168,5 +174,31 @@ describe("backgroundSendConfirm(B4-SPEC §3.5)", () => {
     ]) {
       expect(`${opts.title}${opts.body}`).not.toMatch(/积分|已用|预计|约/);
     }
+  });
+});
+
+describe("积分(B4b:快照实扣,只说已扣)", () => {
+  const credits = (over: Record<string, unknown> = {}) => ({
+    _activeClientMessageId: "m-1",
+    _turnCredits: { clientMessageId: "m-1", settled: "1520", requests: 3, asOf: NOW, receivedAt: NOW, ...over },
+  });
+
+  test("有积分时句首说「本轮已扣 N 积分」,其余与原文案一致", () => {
+    expect(backgroundTurnNoticeText(false, turnCreditsLine(credits(), NOW, false)))
+      .toBe("本轮已扣 1,520 积分，仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。");
+    expect(backgroundTurnNoticeText(true, turnCreditsLine(credits(), NOW, true)))
+      .toBe("本轮已扣 1,520 积分，仍在运行；新消息会等它结束再发，另行计费。");
+  });
+
+  test("收到超过 60 秒标出截至时间", () => {
+    expect(turnCreditsLine(credits({ receivedAt: NOW - 3 * 60_000 }), NOW, false)).toBe("本轮已扣 1,520 积分（截至 3 分钟前）");
+    expect(turnCreditsLine(credits({ receivedAt: NOW - 3 * 60_000 }), NOW, true)).toBe("本轮已扣 1,520 积分（3 分钟前）");
+  });
+
+  test("别的回合 / 无结算 / 0 积分不显示数字", () => {
+    expect(turnCreditsLine(credits({ clientMessageId: "m-0" }), NOW, false)).toBeNull();
+    expect(turnCreditsLine(credits({ requests: 0 }), NOW, false)).toBeNull();
+    expect(turnCreditsLine(credits({ settled: "0" }), NOW, false)).toBeNull();
+    expect(turnCreditsLine({ _activeClientMessageId: "m-1" }, NOW, false)).toBeNull();
   });
 });

@@ -1455,7 +1455,7 @@ export function App() {
     historyError,
   });
 
-  // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
+  // 会话级 transient 软提示（"正在发送…"等）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
   // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
   // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。

@@ -605,8 +605,14 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await a2.page.getByPlaceholder(/和「编程助手」对话|和「全能助手」对话/).fill("非 main 不应继承顾问");
     await a2.page.getByRole("button", { name: "发送" }).click();
     await a2.page.getByTestId("message-text").filter({ hasText: "非 main 不应继承顾问" }).waitFor();
-    const last = inbounds.at(-1);
-    assert.ok(last);
+    // The bubble is local; the WS send follows the dispatch journal write. Wait for this exact
+    // message to reach the gateway instead of reading whatever arrived last.
+    const soloInbound = () => inbounds.findLast((f) => f.content?.text === "非 main 不应继承顾问");
+    for (let i = 0; i < 25 && !soloInbound(); i += 1) {
+      await new Promise((done) => setTimeout(done, 200));
+    }
+    const last = soloInbound();
+    assert.ok(last, "the non-main send must dispatch inbound.message");
     assert.notEqual(last.collabMode, "advisor");
     assert.equal(last.advisorModel, undefined);
     assert.deepEqual(a.errors.filter((e) => !/ResizeObserver/.test(e)), []);

@@ -84,9 +84,9 @@ describe("useBackgroundTurn 提示条显隐(B4-SPEC §3.2)", () => {
     vi.useFakeTimers({ now: T0 });
     const sess = makeSess({ _lastFrameAt: T0 - 1000, _turnDetachedAt: T0 });
     const { result, rerender } = renderTurn({ sess });
-    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT, compact: false });
+    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT, compact: false, tone: "info" });
     rerender({ sess, compact: true });
-    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT_COMPACT, compact: true });
+    expect(result.current.notice).toEqual({ text: BACKGROUND_TURN_TEXT_COMPACT, compact: true, tone: "info" });
   });
 
   test("静默跨过 30s 由自带节拍推进,不依赖 App 重渲", () => {
