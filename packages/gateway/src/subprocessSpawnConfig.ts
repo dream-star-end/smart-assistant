@@ -27,6 +27,7 @@ import {
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { CCB_ADVISOR_PROFILE_VERSION, type AdvisorConsultExecution } from './advisorMode.js'
+import { figcheckTurnIdEnv } from './figcheckRounds.js'
 
 /** The engine=ccb official-cc lane puts per-turn headers in the spawn env and
  * respawns when they change. Cursor Sand and the box-resident CLI never read
@@ -1118,6 +1119,8 @@ export function buildOfficialCcProxySpawnEnv(input: {
   return {
     ..._buildAnthropicCustomHeadersEnv(input.headers),
     ..._buildCcbUsageAttributionEnv(input.usageAttribution, input.turnKey),
+    // OCV5-704: scope the figcheck vision cap to this turn. Empty clears the previous id.
+    ...figcheckTurnIdEnv(input.turnKey),
     [MODEL_EXECUTION_DESCRIPTOR_ENV]: input.executionDescriptorEnv,
     CLAUDE_CODE_MAX_RETRIES: '0',
   }

@@ -2505,6 +2505,8 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
   // 载荷(不进 tape);其余(status:null / compact_end / abort)回到普通流式空态。retry 元数据只在
   // retrying 分支携带,故此处显式 narrow,不接受其它态漂出 retry 字段。
   if (frame.status === "compacting") {
+    // CCB repeats `compacting` while the summary streams; keep the first start.
+    if (sess._turnStatus !== "compacting") sess._turnStatusSince = Date.now();
     sess._turnStatus = "compacting";
   } else if (frame.status === "waiting_for_user") {
     sess._turnStatus = "waiting_for_user";
@@ -2538,6 +2540,7 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     sess._turnStatus = null;
     sess._turnProgressHint = undefined;
   }
+  if (sess._turnStatus !== "compacting") sess._turnStatusSince = undefined;
   // INC-20261028-STALE-ENGINE-STARTING: bridge hello 快照 —— 断线期间可能丢帧,下一条真实帧
   // 到达(_lastFrameAt 越过此刻)即失效。新设备无本地计时时以 dispatch admitted_at 起算。
   if (frame.meta?.detached === true) {

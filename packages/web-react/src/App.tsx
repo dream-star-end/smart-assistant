@@ -1411,6 +1411,7 @@ export function App() {
     return {
       dispatch,
       startedAt: activeSess._turnStartedAt ?? null,
+      statusSince: activeSess._turnStatusSince,
       lastFrameAt: activeSess._lastFrameAt,
       transport: chat.status.cls,
       detached: isTurnDetached(activeSess),

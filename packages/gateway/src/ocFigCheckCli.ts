@@ -7,7 +7,8 @@
  * 一版"(实测有用户为一张 CAD 装置图手动迭代 7 版)。本工具把出图变成**闭环**:
  *
  *   出图 → oc-figcheck → 确定性质量门 + vision 审图 → 拿到 PASS/WARN/FAIL + 问题清单
- *        → agent 据此改代码重画 → 再 figcheck(skill 约定最多 3 轮,超限如实交付)。
+ *        → agent 据此改代码重画 → 再 figcheck(同一回合同一张图最多 3 次视觉复核,
+ *          第 4 次起不再审图,按当前结果交付)。
  *
  * 两层检查:
  *   1) 确定性(不靠模型,Node 读 PNG 字节 + 可选 Pillow 像素统计):分辨率/DPI、
@@ -33,6 +34,14 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { checkSpec, parseFigSpec, specFollowUpQuestions, type FigSpec } from './figSpec.js'
+import {
+  FIGCHECK_VISION_ROUND_MAX,
+  figcheckCapHint,
+  figcheckRoundsDir,
+  peekFigcheckVisionRounds,
+  recordFigcheckVisionRound,
+  resolveFigcheckTurnId,
+} from './figcheckRounds.js'
 import { resolveVisionInput, runVision, visionBackendLabel } from './mcpVisionServer.js'
 import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
@@ -169,6 +178,20 @@ function auditPrompt(kind: FigKind, focus: string | undefined, followUps: string
   return [...common, perKind[kind], ...tail].filter(Boolean).join('\n')
 }
 
+/**
+ * OCV5-704: WARN means the deterministic checks are clean and only the vision reviewer has
+ * comments. The reviewer prompt asks for every nit, so it almost never answers PASS. A WARN
+ * hint that said 未通过 and asked for a redraw kept an agent redrawing one chart for 20 minutes.
+ * The scientific-figures skill already says WARN may be delivered; the hint now says so too.
+ */
+const VERDICT_HINT: Record<'PASS' | 'WARN' | 'FAIL', string> = {
+  PASS: '通过。可作为最终产物。',
+  WARN:
+    '确定性检查已通过,vision.review 只是建议级意见:可以交付当前版本。只修你判断确实影响理解的 1-2 处(修完不必再跑 oc-figcheck),其余建议在回复里列给用户决定;不要为了把 WARN 变成 PASS 反复改图。',
+  FAIL:
+    '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck(最多 3 轮;超限则交付当前版本并如实列出未通过项)。',
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   if (isCliHelpArg(argv[0])) {
@@ -256,39 +279,69 @@ async function main(): Promise<void> {
   }
 
   // ── vision 审图 ───────────────────────────────────────────
+  // OCV5-704: one turn, one image path, at most 3 successful vision reviews.
+  // The next call still runs the deterministic checks, skips vision, and tells
+  // the agent to deliver. A backend failure does not consume a round.
+  // No turn id (a manual shell, or a test that left it unset) stays unlimited.
+  const turnId = resolveFigcheckTurnId(process.env)
+  const roundsDir = figcheckRoundsDir(process.env)
+  const usedBefore = turnId
+    ? peekFigcheckVisionRounds(roundsDir, turnId, resolved.imagePath)
+    : 0
+  const capped = turnId !== null && usedBefore >= FIGCHECK_VISION_ROUND_MAX
+
   let visionText = ''
   let visionOk = true
-  try {
-    visionText = (await runVision(resolved)).trim()
-  } catch (e) {
+  let visionSkipped = false
+  let visionCount = usedBefore
+  if (capped) {
     visionOk = false
-    visionText = `(vision 审图失败:${e instanceof Error ? e.message : String(e)})`
+    visionSkipped = true
+    visionText = '已达上限，未做视觉复核。'
+  } else {
+    try {
+      visionText = (await runVision(resolved)).trim()
+      if (turnId) {
+        const recorded = recordFigcheckVisionRound(roundsDir, turnId, resolved.imagePath)
+        visionCount = recorded > 0 ? recorded : usedBefore + 1
+      }
+    } catch (e) {
+      visionOk = false
+      visionText = `(vision 审图失败:${e instanceof Error ? e.message : String(e)})`
+    }
   }
   const visionPass = visionOk && /^\s*PASS[:：]/i.test(visionText)
 
-  // ── 汇总 verdict ──────────────────────────────────────────
-  // 确定性硬伤(取景空/偏色/裁切/分辨率) → FAIL;vision 未 PASS 但确定性干净 → WARN;
-  // 两者都干净/PASS → PASS。verdict 单独成行,供 agent 程序化判断是否需要重画。
-  const verdict = issues.length > 0 ? 'FAIL' : visionPass ? 'PASS' : visionOk ? 'WARN' : 'WARN'
+  // 确定性硬伤 → FAIL,除非本张图的视觉复核已经到顶(到顶一律 WARN,避免 hint 再要求重画)。
+  // vision 未 PASS 但确定性干净 → WARN。verdict 单独成行。
+  const verdict = capped
+    ? 'WARN'
+    : issues.length > 0
+      ? 'FAIL'
+      : visionPass
+        ? 'PASS'
+        : 'WARN'
+  const hint = capped ? figcheckCapHint(visionCount, issues.length) : VERDICT_HINT[verdict]
+  const vision: Record<string, unknown> = {
+    backend: visionBackendLabel(),
+    pass: visionPass,
+    review: visionText,
+  }
+  if (visionSkipped) vision.skipped = true
+  const report: Record<string, unknown> = {
+    image: resolved.imagePath,
+    kind,
+    ...(specReport ? { spec: specReport } : {}),
+    deterministic: { checks: det, issues },
+    vision,
+    verdict,
+    hint,
+  }
+  if (turnId) {
+    report.rounds = { vision: visionCount, max: FIGCHECK_VISION_ROUND_MAX, capped }
+  }
 
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        image: resolved.imagePath,
-        kind,
-        ...(specReport ? { spec: specReport } : {}),
-        deterministic: { checks: det, issues },
-        vision: { backend: visionBackendLabel(), pass: visionPass, review: visionText },
-        verdict,
-        hint:
-          verdict === 'PASS'
-            ? '通过。可作为最终产物。'
-            : '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck(最多 3 轮;超限则交付当前版本并如实列出未通过项)。',
-      },
-      null,
-      2,
-    )}\n`,
-  )
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
   process.stdout.write(`VERDICT: ${verdict}\n`)
 }
 

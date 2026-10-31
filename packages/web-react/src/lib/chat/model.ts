@@ -705,6 +705,9 @@ export type ChatSession = {
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
   _turnStatus?: TurnStatusState | null;
+  /** OCV5-704: when the current `compacting` phase began (local clock). The
+   * 「正在压缩上下文 (Ns)」 seconds count from here, not from turn start. */
+  _turnStatusSince?: number;
   /** Bridge hello snapshot (meta.detached) arrival time; stale once a newer frame lands. */
   _turnDetachedAt?: number;
   /** Stream of the last applied session snapshot. Hello / HTTP report it with the
@@ -894,6 +897,7 @@ export function clearTurnTiming(sess: ChatSession): void {
   sess._lastFrameAt = undefined;
   sess._isFirstTurnAfterReady = false;
   sess._turnStatus = null;
+  sess._turnStatusSince = undefined;
   sess._turnProgressHint = undefined;
   sess._turnDetachedAt = undefined;
   sess._liveTurnUsage = undefined;

@@ -81,6 +81,7 @@ import {
   appendCrashStderrTail,
   redactCrashStderrTail,
 } from './subprocessSpawnConfig.js'
+import { figcheckTurnIdEnv } from './figcheckRounds.js'
 export {
   _officialCcProxyLane,
   _buildCcbServiceTierEnv,
@@ -1350,6 +1351,8 @@ export class SubprocessRunner extends EventEmitter {
           {
             ..._buildAnthropicCustomHeadersEnv(runtime.headers),
             ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
+            // OCV5-704: bash children inherit this, so oc-figcheck can cap one image per turn.
+            ...figcheckTurnIdEnv(turnKey),
             [MODEL_EXECUTION_DESCRIPTOR_ENV]: this.currentExecutionDescriptorEnv,
             // SessionManager owns the one global 1..10 retry budget. CCB's native
             // withRetry loop is per API call, so leaving it enabled can exceed the

@@ -519,6 +519,26 @@ describe("applyTurnStatus retrying 判别联合", () => {
     expect(s._turnStatus).toBe("compacting");
   });
 
+  // OCV5-704: 「正在压缩上下文 (Ns)」 counted from turn start (1943s at minute 32 of a turn
+  // whose compaction took 56s). The phase keeps its own start.
+  test("compacting 记录阶段起点;重复 compacting 帧不重置;null 清除", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const s = sess();
+      s._turnStartedAt = 1_000;
+      applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
+      expect(s._turnStatusSince).toBe(1_000_000);
+      vi.setSystemTime(1_030_000);
+      applyTurnStatus(s, turnStatusFrame({ status: "compacting" }));
+      expect(s._turnStatusSince).toBe(1_000_000);
+      applyTurnStatus(s, turnStatusFrame({ status: null }));
+      expect(s._turnStatusSince).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("waiting_for_user → 明确的人类等待态", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "waiting_for_user" }));
