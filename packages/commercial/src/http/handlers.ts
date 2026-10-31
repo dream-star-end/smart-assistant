@@ -973,9 +973,9 @@ export async function handleRefresh(
       remoteIp: ctx.authBoundIp,
       clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
-      onReissued: (ev) => {
-        ctx.log.info("refresh_reissued", { family_id: ev.family_id, user_id: ev.user_id });
-      },
+      onReissued: (ev) => ctx.log.info("refresh_reissued", ev),
+      // 不用 ctx.log:它的 child binding 带 clientIp,refresh_theft 不记原始 IP。
+      onTheftDetected: (ev) => rootLogger.warn("refresh_theft", { ...ev, requestId: ctx.requestId }),
     });
     // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导。
     // 2026-04-24 "记住我":继承 refresh_tokens.remember_me(refresh() 返回),
