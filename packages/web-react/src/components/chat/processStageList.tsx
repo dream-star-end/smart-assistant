@@ -461,7 +461,7 @@ export function ProcessStageList<T>({
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
               // UI-3:在干活的段,摘要行就是这一轮唯一的运行状态行(写「正在…」),跑完才换成这一段的人话摘要;
-              // 工具都已返回、在等模型时(#1234)那一行落到下面的「等待模型响应」尾行,不把已完成的工具标为仍在执行。
+              // 工具都已返回、在等模型时(#1234)那一行落到下面的「模型生成中」(等上游时为「等待模型响应」)尾行,不把已完成的工具标为仍在执行。
               const working = !!live && index === currentIndex && !toolsSettled;
               const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
@@ -525,11 +525,11 @@ export function ProcessStageList<T>({
               );
             })}
             {waiting && live ? (
-              // 可见进展之后在等模型(叙述写完或工具都已返回):在最新进展处挂一行活的「等待模型响应」+ 等待时长,
+              // 可见进展之后在等模型(叙述写完或工具都已返回):在最新进展处挂一行活的「模型生成中」(等上游时为「等待模型响应」)+ 等待时长,
               // 不把已经完成的工具标为仍在执行。下一步一冒出来这行就消失,流光随之落到那一段的摘要行上。
               <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
                 <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
-                  <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">等待模型响应</span>
+                  <span data-testid="process-step-live" data-live-pending="true" className="oc-live-status-shine min-w-0 truncate text-body text-muted">{live.text}</span>
                   <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
                     {formatElapsed(waitingMs)}
                   </span>

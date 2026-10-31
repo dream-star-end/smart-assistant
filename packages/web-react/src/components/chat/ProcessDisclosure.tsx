@@ -993,7 +993,7 @@ function useNowTicker(enabled: boolean): number {
   return now;
 }
 
-/** 可见进展结束后,静默多久才显示等待模型响应(避免步骤间闪一下)。 */
+/** 可见进展结束后,静默多久才显示模型生成中/等待模型响应(避免步骤间闪一下)。 */
 const QUIET_TAIL_MS = 3_000;
 /** 当前步骤里的工具连续跑多久才在摘要行旁显示「已运行 N 秒」。 */
 const RUNNING_META_MS = 5_000;
@@ -1028,19 +1028,37 @@ function completedToolsSince(messages: readonly ChatMessage[]): number | null {
   return latest;
 }
 
-/** Only a thinking row proves thinking; silence is waiting for a model response. */
+/** 上游排队 / 自动重试(#1206 retryStatus)/ 引擎冷启动 / 等待服务或用户确认时,保留原「等待模型响应」。 */
+function isWaitingForUpstream(activity: TurnActivityInfo | null | undefined): boolean {
+  if (!activity) return false;
+  if (activity.dispatch) return true;
+  const status = activity.turnStatus;
+  if (
+    isRetryingTurnStatus(status) ||
+    status === "engine_starting" ||
+    status === "engine_resuming" ||
+    status === "waiting_for_user"
+  ) {
+    return true;
+  }
+  const recovery = activity.recoveryStatus?.kind;
+  return recovery === "waiting-service" || recovery === "retrying" || recovery === "needs-confirmation";
+}
+
+/** Only a thinking row proves thinking; once a model request is in flight without deltas, show model generating unless waiting on upstream. */
 function shellLivePhrase<T>(
   sections: readonly ProcessSection<T>[],
   currentIndex: number,
   narrativeSettled = false,
+  idlePhrase = "模型生成中",
 ): { text: string; pending: boolean } {
   const current = sections[currentIndex];
   if (!current) return { text: "正在处理", pending: true };
-  if (current.narrative) return { text: narrativeSettled ? "等待模型响应" : "正在组织回复", pending: true };
+  if (current.narrative) return { text: narrativeSettled ? idlePhrase : "正在组织回复", pending: true };
   const status = stepLiveStatus(current.messages);
   if (!status.text) return { text: "正在处理", pending: true };
   if (status.pending) return status;
-  return { text: "等待模型响应", pending: true };
+  return { text: idlePhrase, pending: true };
 }
 
 
@@ -1078,7 +1096,7 @@ export function ProcessDisclosure<T>({
   olderSteps?: ReactNode;
   /**
    * 进行中这一轮的活动快照(只在 active 时给)。startedAt 用于计时;lastFrameAt(最近一帧到达浏览器)
-   * 只用于「静默多久」:叙述段写完后迟迟没有下一步时挂「等待模型响应」,工具长时间运行时在摘要行旁
+   * 只用于「静默多久」:叙述段写完后迟迟没有下一步时挂「模型生成中」(等上游时为「等待模型响应」),工具长时间运行时在摘要行旁
    * 显示已运行时长。缺省(历史轮、单测)则都不出现。
    */
   activity?: TurnActivityInfo | null;
@@ -1139,8 +1157,18 @@ export function ProcessDisclosure<T>({
   const runningMs = runningSince === null ? 0 : now - runningSince;
   const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
   // 同一时刻只有一行运行状态:阶段归 TurnActivity 时外壳不说「正在…」;展开时那一行落在时间轴里
-  // 在干活的段(或「等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
-  const live = active && !keepDistinctActivity(activity) ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
+  // 在干活的段(或「模型生成中 / 等待模型响应」尾行),外壳只留标题和计时(OCV5-308)。
+  // 真正在等上游时保留「等待模型响应」;模型请求已发出、还没有 delta 时写「模型生成中」。
+  const idlePhrase = isWaitingForUpstream(activity) ? "等待模型响应" : "模型生成中";
+  let live: { text: string; pending: boolean } | null = null;
+  if (active) {
+    if (keepDistinctActivity(activity)) {
+      // 重试、引擎启动等已由 TurnActivity 说。外壳再挂一行会变成第二行状态。
+      live = null;
+    } else {
+      live = shellLivePhrase(sections, currentIndex, narrativeSettled, idlePhrase);
+    }
+  }
   const liveInRail = !!live && open && (waiting || (!!currentSection && !currentSection.narrative));
   const title = active ? "处理过程" : "工作过程";
   const outcome = turnOutcome(bounds?.following);

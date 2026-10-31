@@ -585,10 +585,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.setViewportSize({ width: 1280, height: 1000 });
       await fixtureStep();
 
-      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("等待模型响应"));
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-step-live]")?.textContent?.includes("模型生成中"));
       assert.equal(await desktop.page.getByText("CMD_DONE_SECRET").count(), 0, "finished tool log opened itself");
       assert.equal(await activeShells(), 1);
-      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "等待模型响应" }), "ocv5-265-avatar-polish-tool-done");
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "模型生成中" }), "ocv5-265-avatar-polish-tool-done");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-tool-done.png") });
       await fixtureStep();
 
@@ -602,12 +602,12 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
 
       await desktop.page.waitForFunction(() => {
         const text = document.querySelector("[data-testid=process-step-live]")?.textContent ?? "";
-        return text.includes("等待模型响应") && !text.includes("VERSION");
+        return text.includes("模型生成中") && !text.includes("VERSION");
       });
       assert.equal(await desktop.page.getByText("READ_SECRET").count(), 0, "read log opened itself");
       assert.ok(await desktop.page.locator("[data-testid=process-stage]", { hasText: "STAGE_TWO 继续核对切流窗口" }).count() > 0, "previous stage unmounted after the next tool");
       assert.equal(await activeShells(), 1, "next tool split the turn");
-      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "等待模型响应" }), "ocv5-265-avatar-polish-next-tool");
+      await shotFramed(desktop.page, desktop.page.getByTestId("process-step-live").filter({ hasText: "模型生成中" }), "ocv5-265-avatar-polish-next-tool");
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-live-flow-next-tool.png") });
       await fixtureStep();
 
