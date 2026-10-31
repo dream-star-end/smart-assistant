@@ -17,6 +17,7 @@ import {
   byteCacheKey,
   imageByteCache,
 } from "../../lib/chat/imageBytes";
+import { ArtifactInspectContext } from "../tool/context";
 import { ImageEditActionsContext } from "./imageEditActions";
 import { Media, MediaSignProvider, SignedFileCard, SignedVideo, ZoomableImage } from "./media";
 import { loadBeforeAll } from "../../test/moduleLoad";
@@ -533,5 +534,69 @@ describe("ImageViewer 开启/下载时刷新签名(点击时签名不回归)", (
     expect(hrefs.some((h) => h.startsWith("blob:"))).toBe(true);
     // 气泡缩略 + 查看器原图各一次；下载本身不得再产生第三个网络请求。
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("SignedFileCard 聊天可预览卡片与防重复下载 (OCV5-687)", () => {
+  test("有面板预览上下文时:CSV / Office 卡片点主区域先预览(不触发下载),独立下载按钮连点不重复下载", async () => {
+    const sign = makeSignMock();
+    const fetchMock = vi.fn(async () =>
+      mockResponse(200, { "content-length": "42", "content-type": "text/csv" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    anchorClick.mockClear();
+    const openFile = vi.fn();
+    const csvPath = "/home/agent/.openclaude/generated/季度报表.csv";
+
+    render(
+      <ArtifactInspectContext.Provider value={{ openFile }}>
+        <MediaSignProvider sign={sign}>
+          <SignedFileCard src={csvPath} filename="季度报表.csv" />
+        </MediaSignProvider>
+      </ArtifactInspectContext.Provider>,
+    );
+
+    const previewBtn = await screen.findByTestId("file-card-preview");
+    expect(previewBtn).toHaveTextContent("季度报表.csv");
+    fireEvent.click(previewBtn);
+    expect(openFile).toHaveBeenCalledTimes(1);
+    expect(openFile).toHaveBeenCalledWith(csvPath);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(anchorClick).not.toHaveBeenCalled();
+
+    const dlBtn = screen.getByRole("link", { name: "下载 季度报表.csv" });
+    fireEvent.click(dlBtn, { detail: 1 });
+    fireEvent.click(dlBtn, { detail: 2 });
+    await waitFor(() => expect(anchorClick).toHaveBeenCalledTimes(1));
+    fireEvent.click(dlBtn, { detail: 1 });
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("有面板预览上下文但文件不可预览(.zip):保持整卡点击下载,且连点同样防重下", async () => {
+    const sign = makeSignMock();
+    const fetchMock = vi.fn(async () => mockResponse(200, { "content-length": "128" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    anchorClick.mockClear();
+    const openFile = vi.fn();
+
+    render(
+      <ArtifactInspectContext.Provider value={{ openFile }}>
+        <MediaSignProvider sign={sign}>
+          <SignedFileCard src="/home/agent/.openclaude/generated/archive.zip" filename="archive.zip" />
+        </MediaSignProvider>
+      </ArtifactInspectContext.Provider>,
+    );
+
+    const link = await screen.findByRole("link", { name: /archive\.zip/ });
+    expect(screen.queryByTestId("file-card-preview")).not.toBeInTheDocument();
+    fireEvent.click(link, { detail: 1 });
+    fireEvent.click(link, { detail: 2 });
+    await waitFor(() => expect(anchorClick).toHaveBeenCalledTimes(1));
+    fireEvent.click(link, { detail: 1 });
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect(openFile).not.toHaveBeenCalled();
   });
 });

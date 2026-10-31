@@ -154,6 +154,8 @@ export type ArtifactInspect = {
    * outputs 带上这一轮里的任意一行,面板定位到那一轮的产出。
    */
   openPane?: (tab: "steps" | "outputs", message?: ToolLike | null) => void;
+  /** 从聊天文件卡片点开可预览文件:打开「产出」面板并直接聚焦预览该文件(OCV5-687)。 */
+  openFile?: (path: string) => void;
 };
 
 export const ArtifactInspectContext = createContext<ArtifactInspect>({});

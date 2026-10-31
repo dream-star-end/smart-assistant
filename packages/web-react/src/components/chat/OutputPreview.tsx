@@ -1,13 +1,15 @@
 /**
- * 产出页主卡片的正文(懒加载块,OCV5-372):把一个文件 / 图片按它本来的样子渲染出来。
+ * 产出页主卡片的正文(懒加载块,OCV5-372 / OCV5-687):把一个文件 / 图片按它本来的样子渲染出来。
  *
  *  - 正文来源:优先用会话里回放出的全文(fileSnapshot,零请求、容器回收后也在);回放不出来时
  *    经现有的媒体签名通道读容器里的当前文件(≤1 MB,与项目产出预览同一套上限与重签)。
  *  - HTML:沙盒 iframe(allow-scripts、无 same-origin)+ 与聊天里的 HTML 嵌入同一份 CSP(网络只认固定 CDN、禁表单)。
  *  - Markdown:渲染;代码 / 文本:高亮。都走只读 Markdown,不执行内嵌 HTML、不自动探测语言。
+ *  - CSV / TSV:默认渲染为可横向滚动的结构化表格,支持 >1 MB 首段截断预览与源码切换。
+ *  - Office(docx / xlsx / pptx):二级懒加载块 OfficePreview(fflate + DOMParser 轻量预览)。
  */
 import { AlertCircle, RotateCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { Markdown } from "../Markdown";
 import { wrapWithCspOnly } from "../embedCsp";
 import {
@@ -20,47 +22,67 @@ import {
   fetchSignedCapped,
 } from "../project/outputPreview";
 import { Skeleton } from "../ui";
-import { SignedImg, SignedVideo, SignedAudio, useFreshSignedUrl } from "./media";
+import { CsvTablePreview } from "./DataGridTable";
+import { SignedAudio, SignedImg, SignedVideo, useFreshSignedUrl } from "./media";
 import type { OutputKind } from "./workbench";
+
+const OfficePreview = lazy(() => import("./OfficePreview"));
 
 export type PreviewView = "preview" | "source";
 
 type TextState =
-  | { phase: "ready"; text: string; origin: "session" | "file"; truncated?: boolean }
+  | { phase: "ready"; text: string; origin: "session" | "file"; truncated: boolean }
   | { phase: "loading" }
   | { phase: "too-large" }
   | { phase: "binary" }
   | { phase: "failed"; message: string };
 
-/** 文件正文:会话回放优先,否则读容器里的当前文件。 */
-function useFileText(path: string, replayed: string | null, refreshKey: string): { state: TextState; retry: () => void } {
-  const { get } = useFreshSignedUrl(replayed === null ? path : null);
+/** 文件正文:会话回放优先,否则读容器里的当前文件。CSV 允许截断取首 1 MB 完整行预览。 */
+function useFileText(
+  path: string,
+  replayed: string | null,
+  refreshKey: string,
+  opts: { skip?: boolean; allowTruncate?: boolean } = {},
+): { state: TextState; retry: () => void } {
+  const { skip = false, allowTruncate = false } = opts;
+  const { get } = useFreshSignedUrl(!skip && replayed === null ? path : null);
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<TextState>(() =>
-    replayed !== null ? { phase: "ready", text: replayed, origin: "session" } : { phase: "loading" },
+    replayed !== null ? { phase: "ready", text: replayed, origin: "session", truncated: false } : { phase: "loading" },
   );
   // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是「重试」、refreshKey 是「又有工具动过这个文件」的重读信号
   useEffect(() => {
+    if (skip) return;
     if (replayed !== null) {
-      setState({ phase: "ready", text: replayed, origin: "session" });
+      setState({ phase: "ready", text: replayed, origin: "session", truncated: false });
       return;
     }
     const controller = new AbortController();
     setState({ phase: "loading" });
-    fetchSignedCapped(get, TEXT_PREVIEW_MAX_BYTES, { signal: controller.signal })
+    fetchSignedCapped(get, TEXT_PREVIEW_MAX_BYTES, { signal: controller.signal, truncate: allowTruncate })
       .then((r) => {
         if (controller.signal.aborted) return;
         if (r.kind === "too-large") return setState({ phase: "too-large" });
         const text = decodeText(r.bytes);
-        setState(text === null ? { phase: "binary" } : { phase: "ready", text, origin: "file" });
+        setState(text === null ? { phase: "binary" } : { phase: "ready", text, origin: "file", truncated: r.truncated });
       })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
         setState({ phase: "failed", message: e instanceof Error ? e.message : String(e) });
       });
     return () => controller.abort();
-  }, [replayed, get, attempt, refreshKey]);
+  }, [skip, allowTruncate, replayed, get, attempt, refreshKey]);
   return { state, retry: () => setAttempt((n) => n + 1) };
+}
+
+function PreviewSkeleton() {
+  return (
+    <div className="space-y-2 px-5 py-5" data-testid="output-preview-loading">
+      <Skeleton className="h-3 w-2/3" />
+      <Skeleton className="h-3 w-5/6" />
+      <Skeleton className="h-3 w-1/2" />
+    </div>
+  );
 }
 
 function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
@@ -84,10 +106,25 @@ function Notice({ text, onRetry }: { text: string; onRetry?: () => void }) {
 
 const FRAME_CLASS = "block h-[min(68vh,640px)] w-full border-0 bg-white";
 
-function TextBody({ text, kind, name, view }: { text: string; kind: OutputKind; name: string; view: PreviewView }) {
+function TextBody({
+  text,
+  kind,
+  name,
+  view,
+  truncated = false,
+}: {
+  text: string;
+  kind: OutputKind;
+  name: string;
+  view: PreviewView;
+  truncated?: boolean;
+}) {
   if (view === "preview" && kind === "html") {
     // sandbox 不含 allow-same-origin:取不到父页 cookie / storage;CSP 放在第 0 个字节,模型的代码改不掉。
     return <iframe sandbox="allow-scripts" srcDoc={wrapWithCspOnly(text)} title={`${name} 预览`} className={FRAME_CLASS} data-testid="output-preview-frame" />;
+  }
+  if (view === "preview" && kind === "csv") {
+    return <CsvTablePreview text={text} name={name} byteTruncated={truncated} />;
   }
   if (view === "preview" && kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) {
     return (
@@ -101,7 +138,14 @@ function TextBody({ text, kind, name, view }: { text: string; kind: OutputKind; 
   if (text.length > CODE_HIGHLIGHT_MAX_CHARS) {
     return <pre className="overflow-auto px-4 py-3 font-mono text-xs text-fg">{text}</pre>;
   }
-  const language = kind === "html" ? "html" : kind === "markdown" ? "markdown" : kind === "text" ? "text" : codeLanguageOf(name);
+  const language =
+    kind === "html"
+      ? "html"
+      : kind === "markdown"
+        ? "markdown"
+        : kind === "csv" || kind === "text"
+          ? "text"
+          : codeLanguageOf(name);
   return (
     <div className="px-3 py-1 [&_pre]:my-2" data-testid="output-preview-source">
       <Markdown readOnly autoDetectCode={false}>
@@ -128,20 +172,23 @@ export function FilePreview({
   refreshKey?: string;
   view: PreviewView;
 }) {
-  const { state, retry } = useFileText(path, replayed, refreshKey);
-  if (state.phase === "loading") {
+  const isOffice = kind === "office";
+  const { state, retry } = useFileText(path, replayed, refreshKey, {
+    skip: isOffice,
+    allowTruncate: kind === "csv",
+  });
+  if (isOffice) {
     return (
-      <div className="space-y-2 px-5 py-5" data-testid="output-preview-loading">
-        <Skeleton className="h-3 w-2/3" />
-        <Skeleton className="h-3 w-5/6" />
-        <Skeleton className="h-3 w-1/2" />
-      </div>
+      <Suspense fallback={<PreviewSkeleton />}>
+        <OfficePreview path={path} name={name} refreshKey={refreshKey} />
+      </Suspense>
     );
   }
+  if (state.phase === "loading") return <PreviewSkeleton />;
   if (state.phase === "too-large") return <Notice text="文件超过 1 MB，不在面板里预览；可以下载查看。" />;
   if (state.phase === "binary") return <Notice text="这不是文本文件，不在面板里预览；可以下载查看。" />;
   if (state.phase === "failed") return <Notice text="没能读取这个文件（可能已被移动或删除）。" onRetry={retry} />;
-  return <TextBody text={state.text} kind={kind} name={name} view={view} />;
+  return <TextBody text={state.text} kind={kind} name={name} view={view} truncated={state.truncated} />;
 }
 
 export function MediaPreview({ src, kind, name }: { src: string; kind: "image" | "video" | "audio"; name: string }) {

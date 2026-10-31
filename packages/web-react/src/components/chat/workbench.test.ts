@@ -60,7 +60,8 @@ describe("collectTurnOutputs", () => {
     const o = collectTurnOutputs(turn);
     expect(o.files.map((f) => [f.name, f.kind, !!f.change])).toEqual([
       ["index.html", "html", true],
-      ["report.docx", "file", false],
+      // OCV5-687: .docx 升级为 office 类型以支持面板轻量预览
+      ["report.docx", "office", false],
     ]);
     expect(o.media.map((m) => m.name)).toEqual(["shot.png"]);
     expect(o.links.map((l) => l.url)).toEqual(["http://localhost:5173/"]);
@@ -174,16 +175,53 @@ describe("turnSummary / formatDuration / outputKindOf", () => {
     expect(formatDuration(8_400)).toBe("8 秒");
   });
 
-  test("扩展名归类", () => {
-    expect(["a.html", "b.MD", "c.png", "d.ts", "e.csv", "f.docx", "Dockerfile"].map(outputKindOf)).toEqual([
+  test("扩展名归类(OCV5-687: csv/tsv → csv, docx/xlsx/pptx → office, 旧版二进制 doc/zip 仍为 file)", () => {
+    expect(
+      [
+        "a.html",
+        "b.MD",
+        "b2.qmd",
+        "c.png",
+        "d.ts",
+        "e.csv",
+        "e2.tsv",
+        "f.docx",
+        "g.xlsx",
+        "h.pptx",
+        "old.doc",
+        "pkg.zip",
+        "Dockerfile",
+      ].map(outputKindOf),
+    ).toEqual([
       "html",
+      "markdown",
       "markdown",
       "image",
       "code",
-      "text",
+      "csv",
+      "csv",
+      "office",
+      "office",
+      "office",
+      "file",
       "file",
       "code",
     ]);
+  });
+
+  test("回答中带 URL 编码空格的 Markdown 下载链接([名称](/home/agent/.openclaude/generated/…))同样纳入产出", () => {
+    const [turn] = collectWorkTurns([
+      user("u1", "导出 CSV"),
+      assistant("a1", "已生成 [下载季度报表](/home/agent/.openclaude/generated/%E6%8A%A5%E8%A1%A8%202026.csv)"),
+    ]);
+    const o = collectTurnOutputs(turn);
+    expect(o.files.map((f) => [f.path, f.name, f.kind])).toEqual([
+      ["/home/agent/.openclaude/generated/报表 2026.csv", "报表 2026.csv", "csv"],
+    ]);
+    expect(pickHero(o)).toEqual({
+      type: "file",
+      path: "/home/agent/.openclaude/generated/报表 2026.csv",
+    });
   });
 });
 

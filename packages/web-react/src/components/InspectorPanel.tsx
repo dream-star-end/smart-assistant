@@ -2,36 +2,13 @@
  * InspectorPanel —— 详情面板(右侧第三栏,OCV5-370 改版)。
  *
  * 一个面板三个分区,数据全部来自会话自己的消息(不打后端):
- *   - 步骤:会话里每一次工具调用,按轮分组(最近一轮在上)。点一步进入全文详情
- *     (ToolBodyFullContext=true:diff / 终端输出 / 读文件全文),带「全部步骤」返回、`3 / 9`
- *     计数、上一步 / 下一步(按钮 + 面板内 K/J、←/→)。正在运行的那一轮里停在最新一步时
- *     「跟随中」:新步骤到来自动切过去;翻回旧步骤后给「回到最新」。
- *   - 改动:会话里改过的文件,一个文件一行(改动次数、+/− 行数),点进去按顺序看这份文件的
- *     每一次改动;同会话里对同一文件的再次 Write 按与上次写入的 diff 展示。
+ *   - 产出:会话里全部轮次的产出文件、媒体、预览链接与网页来源(按轮分组,当前轮在上);
+ *   - 步骤:会话里每一次工具调用,按轮分组(最近一轮在上),点一步进入全文详情;
  *   - 计划:会话里最近一份 TodoWrite / plan(只读;没有计划时不出这个分区)。
  *
- * 布局接入(App.tsx):宽屏(≥1100px)是与 Sidebar | main 并列的内联 <aside>,可拖宽、
- * 宽度与开合记住;更窄的视口不挤三列,复用 Sheet 贴底抽屉呈现同一 InspectorPanelContent。
- *
- * 数据:消息对象由 ChatSocket 就地 mutate,App 随 version 重渲时面板自然读到最新流式内容。
- * 状态徽标与卡片共用 {@link resolveToolStatus}(T-05):卡片「受阻/未成功」面板就不会是「完成/已结束」。
+ * 各分区正文(OutputsView / BrowserView / InspectorStepsPlanView)均按需懒加载,移出首屏静态闭包。
  */
-import {
-  ArrowDownToLine,
-  Check,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
-  ChevronUp,
-  Circle,
-  Copy,
-  FileDiff,
-  FilePen,
-  ListChecks,
-  LoaderCircle,
-  Route,
-  X,
-} from "lucide-react";
+import { X } from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -44,84 +21,57 @@ import {
   useState,
 } from "react";
 import type { ChatMessage } from "../lib/chat/model";
-import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
 import { cn } from "../lib/utils";
-import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
-import { CopyIconButton, FullToolBody } from "./chat/paneParts";
+import { extractLatestTodos } from "./chat/PinnedTaskTracker";
+import { collectPaneSteps } from "./chat/workPane";
 import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
 import { isBrowserStepMessage } from "./tool/browserDetect";
-import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
-import {
-  type DisplayTool,
-  type ToolLike,
-  asArr,
-  asStr,
-  normalizeToolForDisplay,
-  stripShellWrapperForDisplay,
-} from "./tool/format";
-import { diffLines } from "./tool/lineDiff";
-import { resolveToolMeta, toolSummary } from "./tool/meta";
-import { parseShellEnvelope } from "./tool/shellEnvelope";
-import { resolveToolStatus } from "./tool/status";
-import { toneTileClass } from "./tool/tone";
-import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
+import type { ToolLike } from "./tool/format";
+import { IconButton, Skeleton, Spinner, Tabs } from "./ui";
 
-// 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
+// 产出 / 浏览器 / 步骤与计划视图均按需懒加载,不进首屏(first-screen-budget)。
 const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
 const BrowserView = lazy(() => import("./chat/BrowserView").then((m) => ({ default: m.BrowserView })));
 
-function codexChangesText(input: Record<string, unknown> | null): string {
-  return asArr(input?.changes)
-    .map((c) => (c && typeof c === "object" ? asStr((c as Record<string, unknown>).diff) : ""))
-    .filter(Boolean)
-    .join("\n");
+type StepsPlanModule = typeof import("./chat/InspectorStepsPlanView");
+let loadedStepsPlan: StepsPlanModule | null = null;
+let pendingStepsPlan: Promise<StepsPlanModule> | null = null;
+
+export function preloadInspectorStepsPlan(): Promise<StepsPlanModule> {
+  pendingStepsPlan ??= import("./chat/InspectorStepsPlanView").then(
+    (module) => {
+      loadedStepsPlan = module;
+      return module;
+    },
+    (error: unknown) => {
+      pendingStepsPlan = null;
+      throw error;
+    },
+  );
+  return pendingStepsPlan;
 }
 
-function formattedInput(input: Record<string, unknown> | null): string {
-  if (!input) return "";
-  try {
-    return JSON.stringify(input, null, 2);
-  } catch {
-    return "";
+const LazyStepsPlanView = lazy(() => {
+  const ready = loadedStepsPlan;
+  if (ready) {
+    const sync = {
+      // biome-ignore lint/suspicious/noThenProperty: 模块已就绪时给 React.lazy 的同步 thenable(同 lazyToolBody),当场解析不挂起。
+      then(resolve: (value: { default: StepsPlanModule["InspectorStepsPlanView"] }) => void) {
+        resolve({ default: ready.InspectorStepsPlanView });
+      },
+    };
+    return sync as unknown as Promise<{ default: StepsPlanModule["InspectorStepsPlanView"] }>;
   }
-}
+  return preloadInspectorStepsPlan().then((module) => ({ default: module.InspectorStepsPlanView }));
+});
 
-/**
- * 「复制全文」按工具类型取**面板里实际展示的正文**(T-04):
- *   - Edit → 行级 diff 文本(与面板 DiffView 同源 diffLines);codex apply_patch 形状取 changes[].diff;
- *   - Write → 文件内容;
- *   - Bash → `$ 命令` + 输出(Cursor 信封先解成 stdout/stderr,不复制 JSON 外壳);
- *   - 其余 → output,没有 output 才回退格式化的 input。
- * 之前一律优先复制 output:Edit/Write 完成后 output 是 "The file has been updated." 这类状态串,
- * 面板展示的是 diff,复制到的却是一句废话。
- */
-export function inspectorCopyText(display: DisplayTool): string {
-  const { name, input, tool } = display;
-  const output = typeof tool.output === "string" ? tool.output : "";
-  switch (name) {
-    case "Edit": {
-      const oldStr = asStr(input?.old_string);
-      const newStr = asStr(input?.new_string);
-      if (oldStr || newStr) {
-        return diffLines(oldStr, newStr)
-          .map((row) => `${row.sign}${row.text}`)
-          .join("\n");
-      }
-      return codexChangesText(input) || output || formattedInput(input);
-    }
-    case "Write":
-      return asStr(input?.content) || codexChangesText(input) || output || formattedInput(input);
-    case "Bash": {
-      const command = stripShellWrapperForDisplay(asStr(input?.command));
-      const env = parseShellEnvelope(output);
-      const streams = env
-        ? [env.stdout, env.stderr].filter(Boolean).join(env.stdout && !env.stdout.endsWith("\n") ? "\n" : "")
-        : output || asStr(tool.bashTail?.tail);
-      return [command ? `$ ${command}` : "", streams].filter(Boolean).join("\n");
-    }
-    default:
-      return output.trim() ? output : formattedInput(input);
-  }
+if (typeof window !== "undefined") {
+  const prefetch = () => {
+    preloadInspectorStepsPlan().catch(() => {});
+  };
+  const idle = (window as Window & { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback;
+  if (idle) idle(prefetch);
+  else window.setTimeout(prefetch, 1500);
 }
 
 function isEditableTarget(node: EventTarget | null): boolean {
@@ -133,14 +83,14 @@ function isEditableTarget(node: EventTarget | null): boolean {
 export type PaneTab = "outputs" | "steps" | "plan" | "browser";
 
 /**
- * 从面板外打开 / 定位面板的请求(工具卡入口、过程摘要上的「改动 N 个文件」、顶栏开关)。
+ * 从面板外打开 / 定位面板的请求(工具卡入口、过程摘要上的「改动 N 个文件」、顶栏开关、文件卡片预览)。
  * nonce 每次请求都换:同一条消息连点两次也会重新定位并把焦点移进面板。
  * tab 缺省 = 只开面板(停在上次的分区)。
  */
 export type PaneRequest = {
   /** "changes" 是 r1 的改动页:改动并进了产出页,旧入口 / 旧记忆按产出处理。 */
   tab?: PaneTab | "changes";
-  /** steps / browser:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
+  /** steps / browser:要打开的那一步;outputs:这一轮里的任意一行或 _output_file 文件定位。 */
   message?: ToolLike | null;
   nonce: number;
   /** 发起请求时的会话;App 只把属于当前会话的请求交给面板(切会话后旧请求作废)。 */
@@ -182,8 +132,6 @@ function sameMessage(a: ToolLike | null | undefined, b: ToolLike | null | undefi
   return ia !== undefined && ia === idOf(b);
 }
 
-type Hydrated = { message: ToolLike; state: "ready" | "loading" | "failed"; retry: () => void };
-
 function pickRecord(records: ChatMessage[] | null, locator: ChatMessage): ChatMessage | null {
   if (!records || records.length === 0) return null;
   return records.find((r) => r.id === locator.id) ?? records.find((r) => r.role === "tool") ?? null;
@@ -205,67 +153,6 @@ function toolLocatorKey(m: ChatMessage): string | null {
   if (m._payloadDeferred !== true || m.role !== "tool" || !m.id) return null;
   if (typeof m._turnTapeId !== "string" || typeof m._recordOrdinal !== "number") return null;
   return `${m._turnTapeId}:${m._recordOrdinal}:${m.id}`;
-}
-
-/** 定位桩 → 完整工具消息(先 peek 页面缓存,没有再取);不是定位桩原样返回。 */
-function useHydratedTool(message: ToolLike, loader?: DeferredPayloadLoader): Hydrated {
-  const m = message as ChatMessage;
-  const deferred = m._payloadDeferred === true;
-  const tapeId = m._turnTapeId;
-  const ordinal = m._recordOrdinal;
-  const expected = deferred && m.id ? expectedOf(m) : null;
-  const canLoad = !!expected && typeof tapeId === "string" && typeof ordinal === "number";
-  const [loaded, setLoaded] = useState<{ key: string; record: ChatMessage | null } | null>(null);
-  const [attempt, setAttempt] = useState(0);
-  const key = canLoad ? `${tapeId}:${ordinal}:${m.id}` : "";
-  const peeked = deferred ? peekRecord(m, loader) : null;
-  const hasPeek = !!peeked;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: key 已覆盖 tapeId / ordinal / id;attempt 是「重试」信号
-  useEffect(() => {
-    if (!canLoad || hasPeek || !loader?.fetch || !expected) return;
-    const controller = new AbortController();
-    loader
-      .fetch(tapeId, ordinal, expected, controller.signal)
-      .then((records) => {
-        if (!controller.signal.aborted) setLoaded({ key, record: pickRecord(records, m) });
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setLoaded({ key, record: null });
-      });
-    return () => controller.abort();
-  }, [key, attempt, hasPeek]);
-  const retry = () => {
-    setLoaded(null);
-    setAttempt((n) => n + 1);
-  };
-  if (!deferred) return { message, state: "ready", retry };
-  const record = peeked ?? (loaded?.key === key ? loaded.record : undefined);
-  if (record) return { message: record, state: "ready", retry };
-  if (!canLoad || !loader?.fetch || record === null) return { message, state: "failed", retry };
-  return { message, state: "loading", retry };
-}
-
-function DeferredNotice({ hydrated }: { hydrated: Hydrated }) {
-  if (hydrated.state === "loading") {
-    return (
-      <div className="flex items-center gap-2 py-2 text-meta text-muted" data-testid="pane-deferred-loading">
-        <Spinner size={13} className="text-accent" />
-        正在加载这一步的完整内容…
-      </div>
-    );
-  }
-  return (
-    <div className="flex items-center gap-2 py-2 text-meta text-muted" data-testid="pane-deferred-failed">
-      这一步的内容较大，没能加载出来。
-      <button
-        type="button"
-        className="rounded text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={hydrated.retry}
-      >
-        继续
-      </button>
-    </div>
-  );
 }
 
 export const PANE_TAB_STORAGE_KEY = "oc_v5_detail_pane_tab";
@@ -320,311 +207,12 @@ function writeStoredTab(tab: PaneTab): void {
   }
 }
 
-const navButtonClass =
-  "inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11";
-
-const rowButtonClass =
-  "flex w-full min-w-0 items-center gap-2.5 px-3 py-1.5 text-left outline-none transition-colors hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11";
-
-function baseName(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
-  return parts.at(-1) ?? path;
-}
-
-function dirName(path: string): string {
-  const norm = path.replace(/\\/g, "/");
-  const i = norm.lastIndexOf("/");
-  return i > 0 ? norm.slice(0, i) : "";
-}
-
-
-/** 一步的头部:类型图标 + 标签 + 状态 + 摘要 + 复制全文。 */
-function StepHeader({ message }: { message: ToolLike }) {
-  const display = normalizeToolForDisplay(message);
-  const meta = resolveToolMeta(display.name, display.input);
-  const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
-  const status = resolveToolStatus(display);
-  return (
-    <div className="flex shrink-0 items-center gap-2.5 border-b border-border px-4 py-3">
-      <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-lg", toneTileClass(meta.tone))}>
-        <Icon size={14} />
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <h3 className="text-body font-semibold text-fg">{meta.label}</h3>
-          {status.isRunning ? (
-            <>
-              <span className="sr-only">{status.label}</span>
-              <Spinner size={13} className="text-accent" />
-            </>
-          ) : (
-            <Badge tone={status.tone}>{status.label}</Badge>
-          )}
-        </div>
-        {summary && (
-          <div className="mt-0.5 truncate font-mono text-xs text-muted" title={summary}>
-            {summary}
-          </div>
-        )}
-      </div>
-      <CopyIconButton getText={() => inspectorCopyText(normalizeToolForDisplay(message))} />
-    </div>
-  );
-}
-
-function StepDetail({
-  message: rawMessage,
-  loader,
-  index,
-  total,
-  following,
-  showLatest,
-  onBack,
-  onPrev,
-  onNext,
-  onLatest,
-}: {
-  message: ToolLike;
-  loader?: DeferredPayloadLoader;
-  index: number;
-  total: number;
-  following: boolean;
-  showLatest: boolean;
-  onBack: () => void;
-  onPrev: () => void;
-  onNext: () => void;
-  onLatest: () => void;
-}) {
-  const inList = index >= 0;
-  const hydrated = useHydratedTool(rawMessage, loader);
-  const message = hydrated.message;
-  return (
-    <>
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1" data-testid="pane-stepper">
-        <button type="button" className={navButtonClass} onClick={onBack}>
-          <ChevronLeft size={14} aria-hidden />
-          全部步骤
-        </button>
-        <span className="flex-1" />
-        {following ? (
-          <span
-            data-testid="pane-following"
-            className="inline-flex items-center gap-1.5 rounded-full bg-accent-soft px-2 py-0.5 text-meta text-accent"
-          >
-            <span aria-hidden className="size-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
-            跟随中
-          </span>
-        ) : showLatest ? (
-          <button type="button" className={navButtonClass} onClick={onLatest} data-testid="pane-latest">
-            <ArrowDownToLine size={13} aria-hidden />
-            回到最新
-          </button>
-        ) : null}
-        {inList && (
-          <>
-            <span className="px-1 text-meta tabular-nums text-muted" data-testid="pane-step-counter">
-              {index + 1} / {total}
-            </span>
-            <IconButton
-              size="sm"
-              shape="square"
-              aria-label="上一步"
-              title="上一步 (K / ←)"
-              disabled={index <= 0}
-              onClick={onPrev}
-            >
-              <ChevronUp size={15} />
-            </IconButton>
-            <IconButton
-              size="sm"
-              shape="square"
-              aria-label="下一步"
-              title="下一步 (J / →)"
-              disabled={index >= total - 1}
-              onClick={onNext}
-            >
-              <ChevronDown size={15} />
-            </IconButton>
-          </>
-        )}
-      </div>
-      <StepHeader message={message} />
-      <div
-        className="min-h-0 flex-1 overflow-y-auto px-4 py-3 [overflow-wrap:anywhere] [&>*:first-child]:mt-0"
-        data-testid="pane-step-body"
-      >
-        {hydrated.state === "ready" ? (
-          <FullToolBody display={normalizeToolForDisplay(message)} />
-        ) : (
-          <DeferredNotice hydrated={hydrated} />
-        )}
-      </div>
-    </>
-  );
-}
-
-function StepRow({
-  message,
-  active,
-  durationMs,
-  onPick,
-}: {
-  message: ToolLike;
-  active: boolean;
-  /** 与过程时间轴同口径(computeStepTimings):从上一步结束到这一步结束,含模型写这一步的时间。 */
-  durationMs?: number;
-  onPick: () => void;
-}) {
-  const display = normalizeToolForDisplay(message);
-  const meta = resolveToolMeta(display.name, display.input);
-  const Icon = meta.icon;
-  const summary = toolSummary(display.name, display.input);
-  const status = resolveToolStatus(display);
-  const duration = durationMs === undefined ? null : formatStepDuration(durationMs);
-  return (
-    <button
-      type="button"
-      data-testid="pane-step"
-      data-tool-status={status.kind}
-      aria-current={active ? "true" : undefined}
-      className={cn(rowButtonClass, active && "bg-accent-soft/60")}
-      onClick={onPick}
-    >
-      <span className={cn("flex size-6 shrink-0 items-center justify-center rounded-md", toneTileClass(meta.tone))}>
-        <Icon size={13} />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-body text-fg">{meta.label}</span>
-        {summary && <span className="block truncate font-mono text-[12px] text-faint">{summary}</span>}
-      </span>
-      <span className="flex shrink-0 items-center text-meta tabular-nums text-faint">
-        {status.isRunning ? (
-          <>
-            <span className="sr-only">{status.label}</span>
-            <Spinner size={13} className="text-accent" />
-          </>
-        ) : status.kind === "done" ? (
-          (duration ?? <span className="sr-only">{status.label}</span>)
-        ) : (
-          <Badge tone={status.tone} size="sm">
-            {status.label}
-          </Badge>
-        )}
-      </span>
-    </button>
-  );
-}
-
-function StepList({
-  turns,
-  total,
-  active,
-  onPick,
-}: {
-  turns: PaneTurn[];
-  total: number;
-  active: ToolLike | null;
-  onPick: (message: ToolLike) => void;
-}) {
-  // 最近一轮默认展开,更早的轮默认收起;用户点过的以用户为准。
-  const [toggled, setToggled] = useState<Record<string, boolean>>({});
-  if (total === 0) {
-    return (
-      <EmptyState
-        icon={Route}
-        title="还没有执行步骤"
-        hint="助手运行命令、读写文件、搜索网页时，每一步都会出现在这里。"
-      />
-    );
-  }
-  const ordered = [...turns].reverse();
-  const newestKey = ordered[0]?.key;
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto py-1" data-testid="pane-step-list">
-      {ordered.map((turn) => {
-        const open = toggled[turn.key] ?? turn.key === newestKey;
-        const timings = open ? computeStepTimings(turn.rows, { turnStartedAt: turn.startedAt, active: false }) : null;
-        return (
-          <section key={turn.key} data-testid="pane-turn" className="pb-1">
-            <button
-              type="button"
-              aria-expanded={open}
-              className={cn(rowButtonClass, "gap-1.5 py-2")}
-              onClick={() => setToggled((t) => ({ ...t, [turn.key]: !open }))}
-            >
-              <ChevronRight
-                size={14}
-                aria-hidden
-                className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
-              />
-              <span className="min-w-0 flex-1 truncate text-body font-medium text-fg" title={turn.title}>
-                {turn.title}
-              </span>
-              <span className="shrink-0 text-meta tabular-nums text-faint">{turn.steps.length} 步</span>
-            </button>
-            {open && (
-              <ol className="pl-3">
-                {turn.steps.map((step) => (
-                  <li key={step.message.id}>
-                    <StepRow
-                      message={step.message}
-                      active={sameMessage(active, step.message)}
-                      durationMs={timings?.get(step.message.id)?.ms}
-                      onPick={() => onPick(step.message)}
-                    />
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
-        );
-      })}
-    </div>
-  );
-}
-
 function OutputsFallback() {
   return (
     <div className="space-y-3 px-4 py-4" data-testid="outputs-loading">
       <Skeleton className="h-3 w-24" />
       <Skeleton className="h-4 w-2/3" />
       <Skeleton className="h-48 w-full rounded-xl" />
-    </div>
-  );
-}
-
-function PlanView({ todos }: { todos: TodoItem[] }) {
-  const done = todos.filter((t) => t.status === "completed").length;
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" data-testid="pane-plan">
-      <p className="mb-2 text-meta text-muted">
-        已完成 {done} / {todos.length}
-      </p>
-      <ol className="space-y-2">
-        {todos.map((t, i) => {
-          const isDone = t.status === "completed";
-          const active = t.status === "in_progress";
-          return (
-            // biome-ignore lint/suspicious/noArrayIndexKey: 计划条目没有稳定 id,同一份列表按位置替换
-            <li key={i} className="flex items-start gap-2 text-body">
-              <span className="mt-0.5 shrink-0">
-                {isDone ? (
-                  <Check className="size-3.5 text-success" />
-                ) : active ? (
-                  <LoaderCircle className="size-3.5 animate-spin text-accent" />
-                ) : (
-                  <Circle className="size-3.5 text-faint" />
-                )}
-              </span>
-              <span className={cn("min-w-0 break-words", isDone ? "text-faint line-through" : active ? "text-fg" : "text-muted")}>
-                {active && t.activeForm ? t.activeForm : t.content}
-                <span className="sr-only">{isDone ? "(已完成)" : active ? "(进行中)" : "(待办)"}</span>
-              </span>
-            </li>
-          );
-        })}
-      </ol>
     </div>
   );
 }
@@ -679,7 +267,7 @@ export function InspectorPanelContent({
   const workTurns = useMemo(() => collectWorkTurns(messages), [messages, version]);
   const todos = extractLatestTodos(messages, 0);
   const lastTurn = workTurns.length - 1;
-  // 产出页看的那一轮:null = 最新一轮(新一轮开始时自动跟过去);翻到旧轮时记它的 key。
+  // 产出页定位的那一轮:null = 最新一轮;从旧轮摘要点进来时记它的 key。
   const turnKeyFor = (message: ToolLike | null | undefined): string | null => {
     const i = turnIndexOf(workTurns, message as { id?: string } | null | undefined);
     return i < 0 || i === lastTurn ? null : (workTurns[i]?.key ?? null);
@@ -690,6 +278,15 @@ export function InspectorPanelContent({
   );
   const keyedTurn = turnKey === null ? -1 : workTurns.findIndex((t) => t.key === turnKey);
   const outputsIndex = keyedTurn >= 0 ? keyedTurn : lastTurn;
+  const extractOutputFile = (m: ToolLike | null | undefined): string | null => {
+    if (!m || m.toolName !== "_output_file" || !m.inputJson || typeof m.inputJson !== "object") return null;
+    const p = (m.inputJson as { file_path?: unknown }).file_path;
+    return typeof p === "string" && p ? p : null;
+  };
+  const [outputFocus, setOutputFocus] = useState<{ path: string; nonce: number } | null>(() => {
+    const p = request ? extractOutputFile(request.message) : null;
+    return p && request ? { path: p, nonce: request.nonce } : null;
+  });
   // 「浏览器」页看的那一步(从浏览器卡点进来时);null = 默认(最新一张截图)。
   const [browserFocus, setBrowserFocus] = useState<string | null>(() =>
     request?.tab === "browser" ? (idOf(request.message) ?? null) : null,
@@ -712,10 +309,6 @@ export function InspectorPanelContent({
   // 大记录定位桩没有命令和输出,认不出是浏览器步:换成请求带来的完整消息,或页面缓存里已取到的正文。
   const clicked = request?.message as ChatMessage | undefined;
   const clickedFull = (m: ChatMessage) => (clicked?._payloadDeferred !== true && sameMessage(clicked, m) ? clicked : null);
-  // OCV5-629:收起的过程不再替面板预取 >1 MiB 定位桩(OCV5-627),带大截图的浏览器步只剩定位桩。面板开着时
-  // 自己补取当前查看轮里缺正文的 tool 定位桩:每条只取一次(失败不自动重试,不循环),走同一 deferredLoader
-  // (生产里按记录身份共享任务与页面缓存),取回的正文留在本面板用于认浏览器步;只在面板卸载时中止。
-  // 「步骤」页正在自取的那一条由 StepDetail 负责,这里不重复发起。
   const loaderRef = useRef(deferredLoader);
   loaderRef.current = deferredLoader;
   const probeRef = useRef<{ controller: AbortController; started: Set<string>; records: Map<string, ChatMessage | null> } | null>(null);
@@ -755,7 +348,6 @@ export function InspectorPanelContent({
         });
     }
   }, [probeKey]);
-  // 卸载时中止并丢弃(StrictMode 的模拟卸载后,重挂会重新补取,不会停在一个已中止的探针上)。
   useEffect(
     () => () => {
       probeRef.current?.controller.abort();
@@ -781,7 +373,6 @@ export function InspectorPanelContent({
     () => (viewedTurn ? viewedTurn.steps.filter((m) => isBrowserStepMessage(m)).length : 0),
     [viewedTurn, version],
   );
-  // 停在「浏览器」页而这一轮的大记录还在补取:先给读取态,不退回产出(取完仍没有浏览器步再退回)。
   const browserPending = tab === "browser" && browserCount === 0 && browserProbing;
 
   const view: PaneTab =
@@ -801,10 +392,13 @@ export function InspectorPanelContent({
     if (!next) return;
     setTabState(next);
     if (next === "outputs" || next === "browser") setTurnKey(turnKeyFor(request.message));
+    if (next === "outputs") {
+      const p = extractOutputFile(request.message);
+      setOutputFocus(p ? { path: p, nonce: request.nonce } : null);
+    }
     if (next === "browser") setBrowserFocus(idOf(request.message) ?? null);
     if (next === "steps") {
       setSelected(request.message ?? null);
-      // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
       setFollow(!!request.message && running && sameMessage(request.message, latest));
     }
   }, [request]);
@@ -853,7 +447,7 @@ export function InspectorPanelContent({
   ];
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 header-safe-t">
         <h2 id={headingId} className="sr-only">
           详情面板
@@ -878,9 +472,10 @@ export function InspectorPanelContent({
         className="flex min-h-0 flex-1 flex-col"
       >
         {view === "steps" ? (
-          shown ? (
-            <StepDetail
-              message={shown}
+          <Suspense fallback={<OutputsFallback />}>
+            <LazyStepsPlanView
+              mode="steps"
+              shown={shown}
               loader={deferredLoader}
               index={index}
               total={steps.length}
@@ -893,10 +488,11 @@ export function InspectorPanelContent({
               onPrev={() => goTo(index - 1)}
               onNext={() => goTo(index + 1)}
               onLatest={() => setFollow(true)}
+              turns={turns}
+              active={selected}
+              onPick={pick}
             />
-          ) : (
-            <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
-          )
+          </Suspense>
         ) : view === "browser" && browserPending ? (
           <div className="flex items-center gap-2 px-4 py-4 text-meta text-muted" data-testid="browser-hydrating">
             <Spinner size={13} className="text-accent" />
@@ -924,25 +520,24 @@ export function InspectorPanelContent({
           </Suspense>
         ) : view === "outputs" ? (
           <Suspense fallback={<OutputsFallback />}>
-          <OutputsView
-            messages={messages}
-            turns={workTurns}
-            index={outputsIndex}
-            running={running && outputsIndex === lastTurn}
-            onSelectTurn={(i) => {
-              const t = workTurns[i];
-              if (t) setTurnKey(i === lastTurn ? null : t.key);
-            }}
-            onOpenSteps={() => {
-              setTab("steps");
-              setSelected(null);
-              setFollow(false);
-            }}
-            onOpenStep={openStep}
-          />
+            <OutputsView
+              messages={messages}
+              turns={workTurns}
+              focusTurnKey={turnKey}
+              focusFile={outputFocus}
+              running={running}
+              onOpenSteps={() => {
+                setTab("steps");
+                setSelected(null);
+                setFollow(false);
+              }}
+              onOpenStep={openStep}
+            />
           </Suspense>
         ) : (
-          <PlanView todos={todos} />
+          <Suspense fallback={<OutputsFallback />}>
+            <LazyStepsPlanView mode="plan" todos={todos} />
+          </Suspense>
         )}
       </div>
     </div>

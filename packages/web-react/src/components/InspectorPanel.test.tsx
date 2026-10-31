@@ -11,7 +11,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { InspectorPanel, InspectorPanelContent } from "./InspectorPanel";
+import { InspectorPanel, InspectorPanelContent, preloadInspectorStepsPlan } from "./InspectorPanel";
 import { ToolCard } from "./ToolCard";
 import {
   ArtifactInspectActiveContext,
@@ -25,6 +25,7 @@ import { loadBeforeAll } from "../test/moduleLoad";
 
 // These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
 loadBeforeAll(preloadToolBody);
+loadBeforeAll(preloadInspectorStepsPlan);
 
 afterEach(cleanup);
 

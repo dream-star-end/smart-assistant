@@ -9,6 +9,7 @@
  *    回放不出来(中间有 shell 改写、Edit 对不上、只有 update diff)→ null,界面改读容器里的当前文件。
  */
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
+import { artifactDownloadPath } from "../../lib/chat/artifactDownloadPath";
 import { browserStepOf, isDeliverableShot } from "../tool/browserSteps";
 import type { ChatMessage } from "../../lib/chat/model";
 import { asArr, asStr, normalizeToolForDisplay } from "../tool/format";
@@ -21,7 +22,7 @@ export { type WorkTurn, collectWorkTurns, turnIndexOf } from "./workTurns";
 
 // ── 产出 ────────────────────────────────────────────────────────────────
 
-export type OutputKind = "html" | "markdown" | "image" | "code" | "text" | "file";
+export type OutputKind = "html" | "markdown" | "csv" | "office" | "image" | "code" | "text" | "file";
 
 export type OutputFile = {
   path: string;
@@ -45,8 +46,10 @@ export type TurnOutputs = {
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
 const VIDEO_EXT = new Set(["mp4", "webm", "mov", "mkv"]);
 const AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a", "flac", "aac"]);
-const MARKDOWN_EXT = new Set(["md", "markdown", "mdx"]);
-const TEXT_EXT = new Set(["txt", "log", "csv", "tsv", "text", "rst", "ini", "conf", "srt", "vtt"]);
+const MARKDOWN_EXT = new Set(["md", "markdown", "mdx", "qmd"]);
+const CSV_EXT = new Set(["csv", "tsv"]);
+const OFFICE_EXT = new Set(["xlsx", "docx", "pptx"]);
+const TEXT_EXT = new Set(["txt", "log", "text", "rst", "ini", "conf", "srt", "vtt"]);
 const CODE_EXT = new Set([
   "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt", "swift", "c", "h", "cc", "cpp", "hpp",
   "cs", "php", "sh", "bash", "zsh", "sql", "json", "yaml", "yml", "toml", "xml", "css", "scss", "less", "vue", "svelte",
@@ -88,6 +91,8 @@ export function outputKindOf(path: string): OutputKind {
   const ext = extOf(path);
   if (ext === "html" || ext === "htm") return "html";
   if (MARKDOWN_EXT.has(ext)) return "markdown";
+  if (CSV_EXT.has(ext)) return "csv";
+  if (OFFICE_EXT.has(ext)) return "office";
   if (IMG_EXT.has(ext)) return "image";
   if (CODE_EXT.has(ext)) return "code";
   if (TEXT_EXT.has(ext)) return "text";
@@ -116,7 +121,12 @@ function answerRefs(text: string): { paths: string[]; urls: string[] } {
     if (/^https?:\/\//i.test(s)) urls.push(s);
     else if (s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/api/") && !/\s/.test(s) && /\.[A-Za-z0-9]{1,10}$/.test(s)) paths.push(s);
   }
-  for (const m of text.matchAll(TEXT_PATH_RE)) paths.push(m[0]);
+  for (const m of text.matchAll(/\[[^\]\n]*\]\(([^)\n]+)\)/g)) {
+    const p = artifactDownloadPath(m[1].trim());
+    if (p && /\.[A-Za-z0-9]{1,10}$/.test(p)) paths.push(p);
+  }
+  const bareText = text.replace(INLINE_CODE_RE, " ").replace(/\[[^\]\n]*\]\([^)\n]+\)/g, " ");
+  for (const m of bareText.matchAll(TEXT_PATH_RE)) paths.push(artifactDownloadPath(m[0]) ?? m[0]);
   for (const m of text.matchAll(URL_RE)) urls.push(m[0].replace(/[.,;:!?]+$/, ""));
   return { paths, urls };
 }
@@ -228,7 +238,16 @@ export function outputCount(o: TurnOutputs): number {
 
 export type HeroRef = { type: "file"; path: string } | { type: "media"; src: string };
 
-const HERO_RANK: Record<OutputKind, number> = { html: 0, markdown: 1, image: 2, code: 3, text: 4, file: 5 };
+const HERO_RANK: Record<OutputKind, number> = {
+  html: 0,
+  markdown: 1,
+  image: 2,
+  csv: 3,
+  office: 4,
+  code: 5,
+  text: 6,
+  file: 7,
+};
 
 /** 默认主产物:网页 > 文档 > 图片 > 改动最多的代码 / 文本 > 其余文件。失败的写入不选。 */
 export function pickHero(o: TurnOutputs): HeroRef | null {

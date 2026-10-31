@@ -27,7 +27,15 @@ import { cn } from "../../lib/utils";
 import { authScopedImageIdentity, pickThumbnailWidth } from "../../lib/chat/imageBytes";
 import { useProgressiveImage } from "../../lib/chat/useProgressiveImage";
 import { LazyBoundary } from "../ChunkErrorBoundary";
+import { useArtifactInspect } from "../tool/context";
 import { useTimelineEagerMedia } from "./timelineEager";
+
+const PREVIEWABLE_FILE_RE =
+  /(?:^|\/)(?:dockerfile|makefile|[^/]+\.(?:html?|md|markdown|mdx|qmd|csv|tsv|xlsx|docx|pptx|txt|log|text|rst|ini|conf|srt|vtt|json|ya?ml|toml|xml|m?[jt]sx?|cjs|py|rb|go|rs|java|kt|swift|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|sql|css|scss|less|vue|svelte|lua|r|dart|scala|exs?|erl|hs|ml|pl|ps1|gradle|proto))$/i;
+
+export function isPreviewableArtifact(pathOrName: string): boolean {
+  return PREVIEWABLE_FILE_RE.test(pathOrName.trim());
+}
 
 // 首屏瘦身(2026-09-17 first-screen-budget 471.4KB > 460KB):全屏查看器及其三模式
 // (ImageAnnotationEditor 圈选编辑 / ImageCommentMode / ImageResizeMode,合计 ≈11.5KB gzip)
@@ -536,91 +544,125 @@ export function useSignedDownload(src: string | null, name: string) {
   const [state, setState] = useState<DownloadState>({ phase: "idle" });
   const abortRef = useRef<AbortController | null>(null);
   const cancelledRef = useRef(false);
+  const busyRef = useRef(false);
+  const recentRef = useRef(false);
+  const recentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearCooldown = useCallback(() => {
+    recentRef.current = false;
+    if (recentTimerRef.current) {
+      clearTimeout(recentTimerRef.current);
+      recentTimerRef.current = null;
+    }
+  }, []);
+  const markCooldown = useCallback(() => {
+    clearCooldown();
+    recentRef.current = true;
+    recentTimerRef.current = setTimeout(() => {
+      recentRef.current = false;
+      recentTimerRef.current = null;
+    }, 1000);
+  }, [clearCooldown]);
   // 卸载即中止在途下载，防 setState-after-unmount。
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(
+    () => () => {
+      abortRef.current?.abort();
+      clearCooldown();
+    },
+    [clearCooldown],
+  );
 
-  const start = useCallback(async () => {
-    if (!src) return;
-    cancelledRef.current = false;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setState({ phase: "downloading", loaded: 0, total: null });
-    const sniff = fileCardSniffEnabled();
-    try {
-      let url = await get();
-      if (!url) throw new Error("sign failed");
-      let res = await fetch(url, { signal: controller.signal });
-      let didResign = false;
-      if (res.status === 410 || res.status === 403) {
-        const resigned = await get({ forceResign: true });
-        if (resigned) {
-          didResign = true;
-          url = resigned;
-          res = await fetch(url, { signal: controller.signal });
-        }
-      }
-      if (sniff && didResign && res.ok) artifactDownloadFriction("RESIGN", "recovered", name);
-      if (!res.ok) {
-        if (sniff && didResign) artifactDownloadFriction("EXPIRED", "failed", name);
-        throw new Error(`HTTP ${res.status}`);
-      }
-      const total = Number(res.headers.get("content-length")) || null;
-      const type = res.headers.get("content-type") || "application/octet-stream";
-      const finishBytes = (bytes: Uint8Array, mime: string) => {
-        if (sniff) {
-          const verdict = sniffOfficeOrPdfMagic(bytes, name);
-          if (!verdict.ok) {
-            artifactDownloadFriction("EMPTY_OR_MAGIC", "failed", name);
-            throw new Error(`magic ${verdict.reason}`);
+  const start = useCallback(
+    async (allowImmediate = false) => {
+      if (!src || busyRef.current || (!allowImmediate && recentRef.current)) return;
+      busyRef.current = true;
+      cancelledRef.current = false;
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setState({ phase: "downloading", loaded: 0, total: null });
+      const sniff = fileCardSniffEnabled();
+      try {
+        let url = await get();
+        if (!url) throw new Error("sign failed");
+        let res = await fetch(url, { signal: controller.signal });
+        let didResign = false;
+        if (res.status === 410 || res.status === 403) {
+          const resigned = await get({ forceResign: true });
+          if (resigned) {
+            didResign = true;
+            url = resigned;
+            res = await fetch(url, { signal: controller.signal });
           }
         }
-        saveBlob(new Blob([bytes as BlobPart], { type: mime }), name);
-        if (sniff) artifactDownloadFriction("SAVE", "succeeded", name);
-        setState({ phase: "idle" });
-      };
-      // sniff 开：小文件读第一次 200 body 直接 saveBlob，禁止 abort 后再 native GET（会漏嗅 410 JSON）。
-      // ≥100MB 仍交原生，避免整包进 JS 内存。flag 关：字节级走现网 abort+nativeDownload。
-      if (pickDownloadStrategy(total) === "native" || !res.body) {
-        if (sniff && (total == null || total < DOWNLOAD_STREAM_MAX_BYTES) && res.arrayBuffer) {
-          const bytes = new Uint8Array(await res.arrayBuffer());
-          finishBytes(bytes, type);
+        if (sniff && didResign && res.ok) artifactDownloadFriction("RESIGN", "recovered", name);
+        if (!res.ok) {
+          if (sniff && didResign) artifactDownloadFriction("EXPIRED", "failed", name);
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const total = Number(res.headers.get("content-length")) || null;
+        const type = res.headers.get("content-type") || "application/octet-stream";
+        const finishBytes = (bytes: Uint8Array, mime: string) => {
+          if (sniff) {
+            const verdict = sniffOfficeOrPdfMagic(bytes, name);
+            if (!verdict.ok) {
+              artifactDownloadFriction("EMPTY_OR_MAGIC", "failed", name);
+              throw new Error(`magic ${verdict.reason}`);
+            }
+          }
+          markCooldown();
+          saveBlob(new Blob([bytes as BlobPart], { type: mime }), name);
+          if (sniff) artifactDownloadFriction("SAVE", "succeeded", name);
+          setState({ phase: "idle" });
+        };
+        // sniff 开：小文件读第一次 200 body 直接 saveBlob，禁止 abort 后再 native GET（会漏嗅 410 JSON）。
+        // ≥100MB 仍交原生，避免整包进 JS 内存。flag 关：字节级走现网 abort+nativeDownload。
+        if (pickDownloadStrategy(total) === "native" || !res.body) {
+          if (sniff && (total == null || total < DOWNLOAD_STREAM_MAX_BYTES) && res.arrayBuffer) {
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            finishBytes(bytes, type);
+            return;
+          }
+          controller.abort(); // 放弃流式：小文件几乎未下正文；超大文件不入 JS 内存
+          markCooldown();
+          setState({ phase: "idle" });
+          nativeDownload(url, name);
           return;
         }
-        controller.abort(); // 放弃流式：小文件几乎未下正文；超大文件不入 JS 内存
-        setState({ phase: "idle" });
-        nativeDownload(url, name);
-        return;
-      }
-      const reader = res.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let loaded = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          chunks.push(value);
-          loaded += value.length;
-          setState({ phase: "downloading", loaded, total });
+        const reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let loaded = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            loaded += value.length;
+            setState({ phase: "downloading", loaded, total });
+          }
         }
+        if (sniff) {
+          finishBytes(concatChunks(chunks, loaded), type);
+          return;
+        }
+        markCooldown();
+        saveBlob(new Blob(chunks as BlobPart[], { type }), name);
+        setState({ phase: "idle" });
+      } catch {
+        clearCooldown();
+        // 用户取消 → 回 idle；真失败(网络/中断/blob 异常)→ error（重试 + 直接下载兜底）。
+        setState(cancelledRef.current ? { phase: "idle" } : { phase: "error" });
+      } finally {
+        abortRef.current = null;
+        busyRef.current = false;
       }
-      if (sniff) {
-        finishBytes(concatChunks(chunks, loaded), type);
-        return;
-      }
-      saveBlob(new Blob(chunks as BlobPart[], { type }), name);
-      setState({ phase: "idle" });
-    } catch {
-      // 用户取消 → 回 idle；真失败(网络/中断/blob 异常)→ error（重试 + 直接下载兜底）。
-      setState(cancelledRef.current ? { phase: "idle" } : { phase: "error" });
-    } finally {
-      abortRef.current = null;
-    }
-  }, [src, get, name]);
+    },
+    [src, get, name, markCooldown, clearCooldown],
+  );
 
   const cancel = useCallback(() => {
     cancelledRef.current = true;
+    clearCooldown();
     abortRef.current?.abort();
-  }, []);
+  }, [clearCooldown]);
 
   /** 「直接下载」逃生门(iOS blob 异常等不可检测场景):同样点击时签名后交原生下载。 */
   const direct = useCallback(async () => {
@@ -644,6 +686,9 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
   const { url: resolved } = useSignedSrc(typeof src === "string" ? src : null);
   const name = (filename || (typeof src === "string" ? src.split("/").pop() : "") || "文件").trim();
   const { state, start, cancel, direct } = useSignedDownload(typeof src === "string" ? src : null, name);
+  const { openFile } = useArtifactInspect();
+  const openPreview =
+    typeof src === "string" && openFile && isPreviewableArtifact(src || name) ? () => openFile(src) : null;
 
   const fileIcon = (
     <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
@@ -742,25 +787,53 @@ export function SignedFileCard({ src, filename, label }: { src?: string; filenam
   }
 
   // idle：href 不暴露挂载态 signed URL（右键/长按另存会拿到 5min 后的 410 JSON）。
-  // 左键/右键/辅助键一律走 start()（点击时重签）。
+  // 可预览文件在有面板上下文时主区点开先预览，右侧保留独立下载锚点；连点不重复触发下载(OCV5-687)。
   const beginDownload = (e: React.MouseEvent) => {
     e.preventDefault();
-    void start();
+    e.stopPropagation();
+    if (e.type === "click" && e.detail > 1) return;
+    void start(e.type === "contextmenu");
   };
   return (
-    <a
-      data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
-      href="#"
-      rel="noreferrer"
-      onClick={beginDownload}
-      onContextMenu={beginDownload}
-      onAuxClick={beginDownload}
-      className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
+    <span
+      className={cn(
+        "my-1.5 inline-flex max-w-full items-stretch overflow-hidden rounded-lg border border-border bg-surface transition-colors hover:border-border-strong",
+        !openPreview && "hover:bg-hover",
+      )}
     >
-      {fileIcon}
-      {nameLabel}
-      <Download size={15} className="shrink-0 text-muted" />
-    </a>
+      {openPreview && (
+        <button
+          type="button"
+          data-testid="file-card-preview"
+          onClick={openPreview}
+          title={`预览 ${name}`}
+          className="flex min-w-0 flex-1 items-center gap-2.5 py-2 pl-3 pr-2.5 text-left transition-colors hover:bg-hover"
+        >
+          {fileIcon}
+          {nameLabel}
+        </button>
+      )}
+      <a
+        data-product-feature={PRODUCT_CAPABILITIES.artifacts.id}
+        href="#"
+        rel="noreferrer"
+        aria-label={openPreview ? `下载 ${name}` : undefined}
+        title={openPreview ? `下载 ${name}` : undefined}
+        onClick={beginDownload}
+        onContextMenu={beginDownload}
+        onAuxClick={beginDownload}
+        className={cn(
+          "inline-flex items-center no-underline transition-colors",
+          openPreview
+            ? "shrink-0 border-l border-border px-2.5 text-muted hover:bg-hover hover:text-fg"
+            : "min-w-0 flex-1 gap-2.5 px-3 py-2",
+        )}
+      >
+        {!openPreview && fileIcon}
+        {!openPreview && nameLabel}
+        <Download size={15} className="shrink-0 text-muted" />
+      </a>
+    </span>
   );
 }
 

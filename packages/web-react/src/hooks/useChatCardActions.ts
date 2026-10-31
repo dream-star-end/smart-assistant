@@ -258,6 +258,8 @@ export function useChatCardActions({
       // 浏览器操作(OCV5-374)进「浏览器」页看截图和整轮操作记录;其余工具进步骤详情。
       open: (t: ArtifactInspectTarget) => openPane(isBrowserStepMessage(t.message) ? "browser" : "steps", t.message),
       openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
+      openFile: (filePath: string) =>
+        openPane("outputs", { toolName: "_output_file", inputJson: { file_path: filePath } }),
     }),
     [openPane],
   );
