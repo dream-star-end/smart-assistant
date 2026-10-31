@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { getSessionId } from 'src/bootstrap/state.js'
 import { runWithAgentContext } from 'src/utils/agentContext.js'
-import { getAPIMetadata } from '../claude.js'
+import { boxModelSessionAgentId, getAPIMetadata } from '../claude.js'
 
 const SUB_RE = /^agent-[a-f0-9]{32}$/
 
@@ -96,5 +96,26 @@ describe('Box subagent session id', () => {
     const id = sessionOf(getAPIMetadata('researcher@my-team'))
     expect(id).toMatch(SUB_RE)
     expect(id).not.toBe(getSessionId())
+  })
+
+  test('a compact fork agent id stays on the process session', () => {
+    const root = getSessionId()
+    expect(boxModelSessionAgentId()).toBeUndefined()
+    expect(sessionOf(getAPIMetadata(boxModelSessionAgentId()))).toBe(root)
+  })
+
+  test('a fork inside a subagent keeps that subagent session', () => {
+    const expected = sessionOf(getAPIMetadata('agent-a'))
+    const seen = runWithAgentContext(
+      {
+        agentId: 'agent-a',
+        agentType: 'subagent',
+        isBuiltIn: true,
+        subagentName: 'general-purpose',
+      },
+      () => sessionOf(getAPIMetadata(boxModelSessionAgentId())),
+    )
+    expect(seen).toBe(expected)
+    expect(seen).not.toBe(getSessionId())
   })
 })
