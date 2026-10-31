@@ -7,11 +7,14 @@ import { createServer } from 'node:http'
 import { backgroundDelegates, BackgroundDelegateScope, isDelegateBackgroundEffective, type BackgroundDelegateOwner } from '../delegateBackground.js'
 import { issueDelegateContextToken, DELEGATE_CONTEXT_HEADER } from '../delegateContext.js'
 import { DelegateJobStore } from '../delegateJobs.js'
-import { handleDelegateTask, _runDelegateTask } from '../delegateRuntime.js'
-import { handleStop } from '../wsConnection.js'
+import { handleDelegateTask, _runDelegateTask, _runDelegateTaskCore } from '../delegateRuntime.js'
+import { deliver, handleStop } from '../wsConnection.js'
 import { setV3MasterSinkSingleton } from '../v3MasterSink.js'
 import { submit } from '../sessionSubmit.js'
 import { acquireDelegateGrokRoute } from '../delegateGrokRoute.js'
+import { OutboundRingBuffer } from '../outboundRing.js'
+import { DelegateInflightSurfaceStore, handleInflightDelegatesRequest } from '../delegateInflightSurface.js'
+import { _completeDelegateResumeClaim } from '../delegateSupervision.js'
 
 const owner: BackgroundDelegateOwner = {
   sessionKey: 'agent:main:webchat:dm:background-session', clientMessageId: 'cmid-background-owner',
@@ -123,6 +126,49 @@ describe('background delegate exact lifetime', { concurrency: 1 }, () => {
     })
     assert.equal(applied, false)
   })
+
+  it('real deliver wire and replay keep an exact background owner after T1 final and T2 admission', () => {
+    enable()
+    const ring = new OutboundRingBuffer()
+    const wire: any[] = []
+    const host: any = { _outboundRing: ring, _recordRingEvictions() {},
+      clientsByPeer: new Map([[`${owner.userId}:webchat:${owner.locator.parentSessionId}`,
+        new Set([{ send: (data: string) => wire.push(JSON.parse(data)) }])]]) }
+    const registry = backgroundDelegates(host)
+    const scope = registry.begin(owner)
+    scope.jobId = 'dlgjob-owner'
+    const leave = scope.enter('child')
+    ring.beginActiveTurn(owner.sessionKey, owner.clientMessageId)
+    const seed = ring.nextSeq(owner.sessionKey)
+    ring.store(owner.sessionKey, seed, Date.now(), '{}')
+    ring.endActiveTurn(owner.sessionKey, owner.clientMessageId)
+    ring.beginActiveTurn(owner.sessionKey, 'cmid-T2')
+    const progress = { kind: 'delegate_progress', phase: 'text', runId: 'run-owner',
+      agentId: 'coding-assistant', jobId: scope.jobId, background: true, text: 'T1 progress' }
+    const send = (blocks: any[], extra: object = {}) => deliver.call(host, {
+      type: 'outbound.message', sessionKey: owner.sessionKey, channel: 'webchat',
+      peer: { id: owner.locator.parentSessionId, kind: 'dm' }, clientMessageId: owner.clientMessageId,
+      blocks, isFinal: false, _userId: owner.userId, ...extra,
+    } as never)
+    send([progress])
+    assert.equal(wire.at(-1).clientMessageId, owner.clientMessageId)
+    const replay = ring.peekReplay(owner.sessionKey, seed)
+    assert.ok(replay.ok)
+    assert.equal(JSON.parse(replay.sent.at(-1)!.data).clientMessageId, owner.clientMessageId)
+    send([progress, { kind: 'text', text: 'mixed frame' }])
+    assert.equal(wire.at(-1).clientMessageId, 'cmid-T2', 'mixed content retains the terminal fence')
+    send([{ ...progress, background: undefined }])
+    assert.equal(wire.at(-1).clientMessageId, 'cmid-T2', 'legacy progress retains the terminal fence')
+    send([{ ...progress, jobId: 'dlgjob-foreign' }])
+    assert.equal(wire.at(-1).clientMessageId, 'cmid-T2', 'unowned lookalikes cannot bypass the fence')
+    send([progress], { isFinal: true })
+    assert.equal(wire.at(-1).clientMessageId, 'cmid-T2', 'a final frame is not a background sideband')
+    leave()
+    registry.finish(scope)
+    send([{ ...progress, phase: 'done' }])
+    assert.equal(wire.at(-1).clientMessageId, owner.clientMessageId, 'post-cleanup publication retains its retired owner')
+    assert.equal(scope.signal.aborted, false, 'normal retirement must not masquerade as user cancellation')
+  })
 })
 
 function fixture() {
@@ -133,7 +179,8 @@ function fixture() {
     turns: 0, workspaceMode: 'legacy' }
   const cleanup = deferred<void>()
   const terminal = deferred<void>()
-  const store = new DelegateJobStore({ sm: false, onTerminal: () => terminal.resolve() })
+  let projectTerminal: ((job: any) => void) | undefined
+  const store = new DelegateJobStore({ sm: false, onTerminal: job => { projectTerminal?.(job); terminal.resolve() } })
   const host: any = sandbox.trackGateway({
     _delegateJobs: store,
     sessions: { getByKey: (key: string) => key === parent.sessionKey ? parent : undefined },
@@ -164,10 +211,98 @@ function fixture() {
   const body = { async: true, resultDelivery: 'background', goal: 'independent delayed work', model: 'glm-5.2' }
   const req: any = Object.assign(new EventEmitter(), { method: 'POST', headers: { [DELEGATE_CONTEXT_HEADER]: token }, complete: true })
   host.readBody = async () => JSON.stringify(body)
-  return { host, store, parent, cleanup, terminal, req, body }
+  return { host, store, parent, cleanup, terminal, req, body,
+    setTerminalProjection: (project: (job: any) => void) => { projectTerminal = project } }
 }
 
 describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
+  for (const stopDuringRetire of [false, true]) {
+    it(`real core keeps GET inflight and Stop live through blocked retire (${stopDuringRetire ? 'cancelled' : 'completed'})`, async () => {
+      const f = fixture()
+      const surface = new DelegateInflightSurfaceStore({ dbPath: null })
+      const retiring = deferred<void>()
+      const releaseRetire = deferred<void>()
+      const children = new Map<string, any>()
+      const groups: any[] = []
+      const progress: any[] = []
+      f.host.deps = { config: { version: 1, defaults: { model: 'glm-5.2' },
+        gateway: { bind: '127.0.0.1', port: 0 }, auth: { mode: 'subscription' } } }
+      f.host._mapLocalExecutionError = () => undefined
+      f.host._getAgentsConfig = async () => ({ agents: [{ id: 'coding-assistant', model: 'glm-5.2', provider: 'anthropic' }] })
+      f.host._memberDelegateGuard = { tryAcquire: () => true, resetForParent() {} }
+      f.host._hiddenDelegateGuard = { resetForParent() {} }
+      f.host._activeDelegationsByParent = new Map()
+      f.host._registerActiveDelegation = () => () => {}
+      f.host._waitForDelegateCapacity = async () => ({ status: 'ok' })
+      f.host._releaseDelegateSlot = () => {}
+      f.host._runLog = { start: () => ({}), complete() {} }
+      f.host._ensureDelegateInflightSurface = () => surface
+      f.host._touchDelegateInflightSurface = (input: any) => surface.upsertEnqueue({ ...input,
+        fencingEpoch: f.store.snapshotOf(input.jobId)?.fencingEpoch ?? 0,
+        generation: f.store.snapshotOf(input.jobId)?.generation ?? 0 })
+      f.host.deliver = (out: any) => progress.push(out)
+      f.host.sessions.getByKey = (key: string) => key === f.parent.sessionKey ? f.parent : children.get(key)
+      f.host.sessions.getOrCreate = async (opts: any) => {
+        const child = { ...opts, agentId: opts.agent.id, model: 'glm-5.2', providerTag: 'ccb', turns: 1,
+          totalCostUSD: 0.1, totalInputTokens: 1, totalOutputTokens: 2,
+          runner: { model: 'glm-5.2', engineId: 'ccb', on() {}, off() {} } }
+        children.set(opts.sessionKey, child)
+        return child
+      }
+      f.host.sessions.submit = async (_session: any, _prompt: string, onEvent: (event: any) => void) => {
+        onEvent({ kind: 'block', block: { kind: 'text', text: 'paid result' } })
+        onEvent({ kind: 'final', meta: { inputTokens: 1, outputTokens: 2 } })
+      }
+      f.host.sessions.flushSessionTailFolding = async () => {}
+      f.host.sessions.bufferPendingAgentGroup = (_key: string, group: any) => { groups.push(group); return true }
+      f.host.sessions.retireKeepResume = async (key: string) => {
+        retiring.resolve()
+        await releaseRetire.promise
+        children.delete(key)
+      }
+      f.host.sessions.hasLiveSession = (key: string) => children.has(key)
+      f.host.sessions.interrupt = () => true
+      f.host._completeDelegateResumeClaim = (input: any, spawned: boolean) => _completeDelegateResumeClaim.call(f.host, input, spawned)
+      f.host._runDelegateTaskCore = (input: any, hooks: any) => {
+        input.traceId = 'f'.repeat(32)
+        return _runDelegateTaskCore.call(f.host, input, hooks)
+      }
+      f.setTerminalProjection(job => surface.projectJob(job))
+      Object.assign(f.body, { streamProgress: true })
+      const read = () => handleInflightDelegatesRequest({ method: 'GET',
+        sessionId: owner.locator.parentSessionId, userId: owner.userId, enabled: true,
+        loadSession: async () => ({}), store: surface, overlayJobs: () => f.store.listNonTerminal(),
+        resolveJob: jobId => f.store.snapshotOf(jobId) })
+      try {
+        const res: any = {}
+        await handleDelegateTask.call(f.host, f.req, res, 'coding-assistant')
+        const jobId = res.body.jobId
+        await retiring.promise
+        const before = await read()
+        assert.equal((before.body.items as any[]).find(item => item.jobId === jobId)?.state, 'running')
+        assert.equal(groups.length, 0, 'a model result card cannot seal the running cleanup job')
+        assert.equal(progress.some(out => out.blocks?.some((block: any) => ['done', 'error'].includes(block.phase))), false)
+        if (stopDuringRetire) {
+          assert.equal(await handleStop.call(f.host, { type: 'inbound.control.stop', channel: 'webchat',
+            peer: { id: f.parent.peerId, kind: 'dm' }, backgroundJobIds: [jobId], _userId: owner.userId }), true)
+          assert.equal(((await read()).body.items as any[]).find(item => item.jobId === jobId)?.state, 'running')
+        }
+        releaseRetire.resolve()
+        await f.terminal.promise
+        const after = await read()
+        const completed = (after.body.items as any[]).find(item => item.jobId === jobId)
+        assert.equal(completed?.state, stopDuringRetire ? 'cancelled' : 'completed')
+        assert.equal(completed?.foldedGroup?.transcript?.some((block: any) => block.text === 'paid result'), true)
+        assert.equal(groups[0]?.jobId, jobId)
+        assert.equal(progress.some(out => out.blocks?.some((block: any) => ['done', 'error'].includes(block.phase))), true)
+      } finally {
+        releaseRetire.resolve()
+        f.cleanup.resolve()
+        surface.close()
+      }
+    })
+  }
+
   it('returns immediately with callback none and only marks cancelled after cleanup', async () => {
     const f = fixture()
     const res: any = {}

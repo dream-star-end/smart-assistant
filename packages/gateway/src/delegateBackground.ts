@@ -50,9 +50,10 @@ export class BackgroundDelegateScope {
   private readonly waiters = new Set<() => void>()
   private readonly pendingCleanup = new Set<Promise<void>>()
   jobId?: string
+  private finished = false
   constructor(readonly owner: BackgroundDelegateOwner) {}
   assertOpen(parent?: string): void {
-    if (this.signal.aborted || (parent && this.members.get(parent)?.sealed)) throw new TaskboardCancelledError()
+    if (this.finished || this.signal.aborted || (parent && this.members.get(parent)?.sealed)) throw new TaskboardCancelledError()
   }
   /** Read-only preparation is interruptible even when its dependency never settles.
    * Resource acquisition callers supply a compensating cleanup for a late receipt. */
@@ -108,13 +109,14 @@ export class BackgroundDelegateScope {
     if (member) member.traceId = traceId
   }
   acceptsCaller(key: string, traceId: string | undefined): boolean {
-    return !!traceId && this.members.get(key)?.traceId === traceId && !this.signal.aborted
+    return !!traceId && this.members.get(key)?.traceId === traceId && !this.signal.aborted && !this.finished
   }
   enterPending(parent: string): () => void {
     return this.enter(`pending-${randomUUID()}`, this.members.has(parent) ? parent : undefined)
   }
+  finish(): void { this.finished = true }
   stop(): boolean {
-    if (this.signal.aborted) return false
+    if (this.finished || this.signal.aborted) return false
     this.controller.abort(new TaskboardCancelledError())
     return true
   }
@@ -172,7 +174,15 @@ class BackgroundDelegateRegistry {
       this.retiredSessions.set(key, { expires: Date.now() + DELEGATE_CONTEXT_TTL_MS, scope })
     }
     // Signed descendant contexts can arrive after the root promise completed.
-    scope.stop()
+    scope.finish()
+  }
+  ownsProgress(input: { sessionKey?: string; clientMessageId?: string; userId?: string; jobIds: string[] }): boolean {
+    return !!input.sessionKey && !!input.clientMessageId && !!input.userId && input.jobIds.length > 0 &&
+      input.jobIds.every(jobId => [...this.scopes,
+        ...[...this.retiredSessions.values()].filter(entry => entry.expires > Date.now()).map(entry => entry.scope),
+      ].some(scope => scope.jobId === jobId &&
+        scope.owner.sessionKey === input.sessionKey && scope.owner.clientMessageId === input.clientMessageId &&
+        scope.owner.userId === input.userId))
   }
   stop(input: { peerId: string; userId?: string; clientMessageId?: string; jobIds?: string[]; captureCurrentTurn?: boolean }): boolean {
     if (!input.userId) return false

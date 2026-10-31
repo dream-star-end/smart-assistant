@@ -73,7 +73,7 @@ import {
   isDelegateNotifierEffective,
   isDelegateSmEnabled,
 } from './delegateSmFlag.js'
-import { DelegateInflightSurfaceStore } from './delegateInflightSurface.js'
+import { foldDelegateCompletionSurface } from './delegateCompletionSurface.js'
 import { parseParentEngine } from './jobTerminal.js'
 import { openDelegateDurableDb } from './delegateDurable.js'
 import {
@@ -912,6 +912,7 @@ export async function handleDelegateTask(
     void this._runDelegateTask(runInput)
       .then((result) => {
         if (runInput._leaseTimer) clearInterval(runInput._leaseTimer)
+        if (backgroundControl?.signal.aborted && result.kind === 'completed') result.cancelled = true
         const mapped = this._delegateResultToHttp(result, targetAgentId)
         if (backgroundControl && result.kind === 'completed' && result.cancelled) mapped.body.cancelled = true
         const fence =
@@ -951,6 +952,7 @@ export async function handleDelegateTask(
           winner = true
         }
         if (!winner) return
+        flushBackgroundCompletion(runInput)
         const output = result.kind === 'completed' ? result.output : ''
         const error =
           result.kind === 'rejected' || result.kind === 'error'
@@ -980,6 +982,7 @@ export async function handleDelegateTask(
         } else {
           store.complete(jobId, { httpStatus: 500, body: { error: message } })
         }
+        flushBackgroundCompletion(runInput)
         this._queueSendToAgentCallback(runInput, {
           jobId,
           agentId: targetAgentId,
@@ -1131,6 +1134,12 @@ export async function handleDelegateWait(
   })
 }
 
+function flushBackgroundCompletion(input: RunDelegateInput): void {
+  const actions = input.backgroundCompletionActions
+  input.backgroundCompletionActions = undefined
+  for (const publish of actions ?? []) publish()
+}
+
 export async function _runDelegateTask(
   this: DelegateRuntimeHost,
   input: RunDelegateInput,
@@ -1177,6 +1186,7 @@ export async function _runDelegateTask(
       this._releasePreadmittedDelegateCapacity(input)
       await input.backgroundControl?.waitForCleanup()
       await this._completeDelegateResumeClaim(input, sessionSpawned)
+      if (input.backgroundControl && !input.backgroundJobId) flushBackgroundCompletion(input)
     } finally {
       if (input.delegationGuardOwnerKey) {
         this._hiddenDelegateGuard.resetForParent(input.delegationGuardOwnerKey)
@@ -1506,7 +1516,7 @@ export async function _runDelegateTaskCore(
     : ''
   // Live lookup each emit: a retry may have moved the parent cmid, and a
   // terminated parent must not keep receiving dispatch:<old>:N frames.
-  const emitProgress = (block: DelegateProgressBlock | null) => {
+  const emitProgress = (block: DelegateProgressBlock | null, afterCleanup = false) => {
     if (!progressTarget || !block) return
     // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
     // (done/error 也降为 text,避免嵌套子委派的终态帧提前关掉一级卡)。返回 null → 丢弃。
@@ -1520,6 +1530,10 @@ export async function _runDelegateTaskCore(
     if (!outBlock) return
     const backgroundStopped = input.backgroundControl?.signal.aborted === true
     const terminalProgress = outBlock.phase === 'error' || outBlock.phase === 'done'
+    if (input.backgroundControl && terminalProgress && !afterCleanup) {
+      ;(input.backgroundCompletionActions ??= []).push(() => emitProgress(block, true))
+      return
+    }
     const deliveredBlock = input.backgroundControl ? {
       ...outBlock, background: true as const, jobId: input.backgroundControl.jobId,
       ...(backgroundStopped ? { cancelled: true as const,
@@ -2570,6 +2584,10 @@ export async function _runDelegateTaskCore(
   // 不把 FIFO Map 当归属权威。progressTarget 存在但 launch 未能冻结 owner
   // 时不得 ownerless 写入当前(可能已是 T2) turn。
   const deliverDelegateGroupCard = (): void => {
+    if (input.backgroundControl?.signal.aborted) {
+      durableGroup.cancelled = true
+      durableGroup.resultSummary = output.trim() || '已停止'
+    }
     if (!progressTarget) return
     if (!delegateOwnerLocator) {
       this.log.warn('delegate card dropped: missing frozen owner locator', {
@@ -2592,7 +2610,8 @@ export async function _runDelegateTaskCore(
   }
   this._delegateOwnerByRunId?.delete(progressRunId)
   if (progressTarget && !nestedProgress) {
-    deliverDelegateGroupCard()
+    if (input.backgroundControl) (input.backgroundCompletionActions ??= []).push(deliverDelegateGroupCard)
+    else deliverDelegateGroupCard()
   } else if (nestedProgress && delegateParent) {
     const directParent = this.sessions.getByKey(delegateParent.sessionKey)
     if (durableGroup.engineBillings && directParent?._durableDelegateEngineBillings) {
@@ -2633,52 +2652,15 @@ export async function _runDelegateTaskCore(
       deliverDelegateGroupCard()
     }
   }
-  if (isDelegateInflightSurfaceEffective()) {
-    try {
-      const parentKey = progressTarget?.sessionKey ?? parentSessionKey
-      const jobId = DelegateInflightSurfaceStore.resolveJobId(input.backgroundJobId, progressRunId)
-      if (jobId && parentKey) {
-        const surface = this._ensureDelegateInflightSurface()
-        const snap = input.backgroundJobId
-          ? this._delegateJobs?.snapshotOf(String(input.backgroundJobId))
-          : undefined
-        const fence = snap ? { fencingEpoch: snap.fencingEpoch, generation: snap.generation } : {}
-        if (!surface.get(jobId)) {
-          surface.upsertEnqueue({
-            jobId,
-            parentSessionKey: parentKey,
-            agentId: targetAgentId,
-            goal,
-            runId: progressRunId,
-            state: 'running',
-            userId: progressTarget?.userId,
-            nested: nestedProgress,
-            ownerRunId: nestedProgress ? emitProgressRunId : undefined,
-            background: input.backgroundControl ? true : undefined,
-            ...fence,
-          })
-        }
-        surface.foldTerminal({
-          jobId,
-          group: durableGroup,
-          // Job CAS winner is authority: a killed/failed/cancelled job must
-          // not be rewritten as completed by a late runner. Same-terminal
-          // non-authoritative folds are rejected by the surface so a late
-          // runner cannot replace the authoritative failure payload.
-          state: snap && isDelegateTerminalState(snap.state) ? snap.state : input.backgroundControl && cancelled ? 'cancelled' : 'completed',
-          parentSessionKey: parentKey,
-          userId: progressTarget?.userId,
-          ...fence,
-        })
-      }
-    } catch (err) {
-      this.log.warn(
-        'delegate inflight surface fold failed',
-        { jobId: input.backgroundJobId, progressRunId },
-        err as Error,
-      )
-    }
-  }
+  const foldCompletedSurface = () => foldDelegateCompletionSurface(this, {
+    jobId: input.backgroundJobId, progressRunId,
+    parentSessionKey: progressTarget?.sessionKey ?? parentSessionKey,
+    userId: progressTarget?.userId, agentId: targetAgentId, goal, nested: nestedProgress,
+    ownerRunId: nestedProgress ? emitProgressRunId : undefined,
+    group: durableGroup, background: !!input.backgroundControl, cancelled,
+  })
+  if (input.backgroundControl) (input.backgroundCompletionActions ??= []).push(foldCompletedSurface)
+  else foldCompletedSurface()
 
   const priced = await resolveDelegateCostUsd({
     ...session,

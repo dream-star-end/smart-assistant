@@ -20,6 +20,7 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'agentHandlers.ts',
   'skillHandlers.ts',
   'delegateRuntime.ts',
+  'delegateCompletionSurface.ts',
   'delegateCallbacks.ts',
   'delegateSupervision.ts',
   'advisorHandlers.ts',

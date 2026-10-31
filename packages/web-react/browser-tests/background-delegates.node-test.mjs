@@ -13,6 +13,8 @@ test("OCV5-676: background results wait for confirmation across reload; the prim
     bundle: true, write: false, format: "iife", jsx: "automatic", loader: { ".css": "empty" },
     alias: { "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)),
       "@openclaude/protocol/browser": fileURLToPath(new URL("../../protocol/src/browser.ts", import.meta.url)),
+      "@openclaude/protocol/teamCards": fileURLToPath(new URL("../../protocol/src/teamCards.ts", import.meta.url)),
+      "@openclaude/protocol/containerPreview": fileURLToPath(new URL("../../protocol/src/containerPreview.ts", import.meta.url)),
       "@openclaude/protocol": fileURLToPath(new URL("../../protocol/src/index.ts", import.meta.url)) },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' } });
   const server = createServer((req, res) => {

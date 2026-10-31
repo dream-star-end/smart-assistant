@@ -1336,8 +1336,9 @@ export async function handleStop(
       if (!live.sessionKey.endsWith(suffix)) continue
       const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
       if (!selfInterrupted) continue
-      if (isDelegateBackgroundEffective() && live.userId === frame._userId && live._currentTurnKey) {
-        backgroundDelegates(this).sealOwner(live.sessionKey, live._currentTurnKey)
+      const stoppedOwner = isDelegateBackgroundEffective() ? this.sessions.getByKey(live.sessionKey) : undefined
+      if (stoppedOwner?.userId === frame._userId && stoppedOwner?._currentTurnKey) {
+        backgroundDelegates(this).sealOwner(live.sessionKey, stoppedOwner._currentTurnKey)
       }
       const backgroundCurrentStopped = isDelegateBackgroundEffective() && backgroundDelegates(this).stop({
         peerId: frame.peer.id, userId: frame._userId, clientMessageId, captureCurrentTurn: true,
@@ -1481,7 +1482,16 @@ export function deliver(
         ? (wire as { sessionKey: string }).sessionKey
         : undefined
     const current = (wire as { clientMessageId?: unknown }).clientMessageId
-    const rebound = rebindOutboundClientMessageId({
+    const blocks = (wire as { blocks?: Array<{ kind?: unknown; background?: unknown; jobId?: unknown }> }).blocks
+    const exactBackgroundSideband = wire.type === 'outbound.message' && wire.channel === 'webchat' &&
+      wire.peer.kind === 'dm' && (wire as { isFinal?: boolean }).isFinal === false && isDelegateBackgroundEffective() &&
+      Array.isArray(blocks) && blocks.length > 0 && blocks.every(block =>
+        block?.kind === 'delegate_progress' && block.background === true &&
+        typeof block.jobId === 'string' && /^dlgjob-[A-Za-z0-9-]{1,160}$/.test(block.jobId)) &&
+      backgroundDelegates(this).ownsProgress({ sessionKey, userId: stampedUserId,
+        clientMessageId: typeof current === 'string' && isClientMessageId(current) ? current : undefined,
+        jobIds: blocks.map(block => block.jobId as string) })
+    const rebound = exactBackgroundSideband ? current as string : rebindOutboundClientMessageId({
       clientMessageId: typeof current === 'string' ? current : undefined,
       sessionKey,
       isFenced: (sk, cmid) => this._outboundRing?.isTurnFenced(sk, cmid) === true,

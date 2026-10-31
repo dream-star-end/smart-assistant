@@ -1,6 +1,8 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createMemoryAuthSession } from "../lib/authSession";
+import { activeBackgroundDelegateJobIds } from "../lib/chat/backgroundDelegates";
+import type { ChatMessage } from "../lib/chat/model";
 import { fetchInflightDelegatesResult, type InflightDelegateItem } from "../lib/chat/inflightDelegates";
 import {
   filterVisibleInflightItems,
@@ -231,4 +233,111 @@ describe("background control authority is independent of HUD presentation", () =
     expect(result.current.items[0]?.state).toBe("completed");
     expect(result.current.controlItems[0]?.state).toBe("running");
   });
+});
+
+describe("new background evidence restarts an idle control snapshot (OCV5-676 R1-3)", () => {
+  const auth = createMemoryAuthSession(() => {}, "tok");
+  const receipt = (): ChatMessage => ({ id: "bg-start-tool", role: "tool", text: "delegate_task", ts: 1, _completed: true,
+    output: JSON.stringify({ status: "running", resultDelivery: "background", jobId: "dlgjob-new" }) });
+  const pending = () => item({ jobId: "dlgjob-new", runId: "dlg-new", background: true, updatedAt: Date.now() });
+
+  test("empty entry → new receipt triggers a read, empty discovery keeps polling, cancelled without progress converges and survives remount", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    let releaseDiscovery!: (value: { ok: true; items: InflightDelegateItem[] }) => void;
+    const discovery = new Promise<{ ok: true; items: InflightDelegateItem[] }>((resolve) => { releaseDiscovery = resolve; });
+    const cancelled = { ...pending(), state: "cancelled" as const };
+    vi.mocked(fetchInflightDelegatesResult)
+      .mockResolvedValueOnce({ ok: true, items: [] })
+      .mockImplementationOnce(() => discovery)
+      .mockResolvedValueOnce({ ok: true, items: [pending()] })
+      .mockResolvedValue({ ok: true, items: [cancelled] });
+    const sessionId = "s-bg-after-empty";
+    const first = renderHook(({ messages }: { messages: ChatMessage[] }) =>
+      useInflightDelegates({ sessionId, messages, enabled: true, auth }), { initialProps: { messages: [] as ChatMessage[] } });
+    await act(async () => {});
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+    const messages = [receipt()];
+    first.rerender({ messages });
+    await act(async () => {});
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+    expect(activeBackgroundDelegateJobIds(first.result.current.controlItems, messages)).toEqual(["dlgjob-new"]);
+    await act(async () => { releaseDiscovery({ ok: true, items: [] }); });
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(first.result.current.controlItems[0]?.state).toBe("running");
+    // Stop cancelled the preparing job. There is intentionally no progress/final row.
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(first.result.current.controlItems).toEqual([cancelled]);
+    expect(activeBackgroundDelegateJobIds(first.result.current.controlItems, messages)).toEqual([]);
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(4);
+    first.unmount();
+    const second = renderHook(() => useInflightDelegates({ sessionId, messages, enabled: true, auth }));
+    await act(async () => {});
+    expect(second.result.current.controlItems).toEqual([cancelled]);
+    expect(activeBackgroundDelegateJobIds(second.result.current.controlItems, messages)).toEqual([]);
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(5);
+  });
+
+  test("a new live background row also triggers discovery after the entry read was empty", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValue({ ok: true, items: [] });
+    const { result, rerender } = renderHook(({ messages }: { messages: ChatMessage[] }) =>
+      useInflightDelegates({ sessionId: "s-bg-live-row", messages, enabled: true, auth }), { initialProps: { messages: [] as ChatMessage[] } });
+    await act(async () => {});
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValue({ ok: true, items: [pending()] });
+    const messages: ChatMessage[] = [{ id: "new-live", role: "agent-group", text: "后台校验", ts: 1,
+      _backgroundDelegate: true, _delegateJobId: "dlgjob-new", _completed: false }];
+    rerender({ messages }); await act(async () => {});
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+    expect(result.current.controlItems[0]?.state).toBe("running");
+    rerender({ messages: [...messages] }); await act(async () => {});
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+  });
+
+  test("known terminal receipts and legacy running tools never start an idle polling loop", async () => {
+    vi.useFakeTimers();
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValue({ ok: true, items: [] });
+    const { rerender } = renderHook(({ messages }: { messages: ChatMessage[] }) =>
+      useInflightDelegates({ sessionId: "s-bg-terminal-history", messages, enabled: true, auth }), { initialProps: { messages: [] as ChatMessage[] } });
+    await act(async () => {});
+    const messages: ChatMessage[] = [receipt(), { id: "durable-done", role: "agent-group", text: "旧结果", ts: 2,
+      _source: "server", _backgroundDelegate: true, _delegateJobId: "dlgjob-new", _completed: true }];
+    rerender({ messages }); await act(async () => {});
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+    rerender({ messages: [{ id: "legacy-tool", role: "tool", text: "delegate_task", ts: 3,
+      output: JSON.stringify({ status: "running", jobId: "legacy" }) }] });
+    await act(async () => {}); await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(1);
+  });
+});
+
+test("a bounded discovery snapshot cannot erase a previously confirmed background terminal or revive its old receipt", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const auth = createMemoryAuthSession(() => {}, "tok");
+  const old = item({ background: true, state: "cancelled", updatedAt: Date.now() });
+  const next = item({ background: true, jobId: "dlgjob-next", runId: "dlg-next", state: "cancelled", updatedAt: Date.now() });
+  const oldReceipt: ChatMessage = { id: "old-receipt", role: "tool", text: "delegate_task", ts: 1,
+    output: JSON.stringify({ status: "running", resultDelivery: "background", jobId: old.jobId }) };
+  const nextReceipt: ChatMessage = { ...oldReceipt, id: "next-receipt",
+    output: JSON.stringify({ status: "running", resultDelivery: "background", jobId: next.jobId }) };
+  vi.mocked(fetchInflightDelegatesResult).mockResolvedValueOnce({ ok: true, items: [old] })
+    .mockResolvedValueOnce({ ok: true, items: [] }).mockResolvedValue({ ok: true, items: [next] });
+  const { result, rerender } = renderHook(({ messages }: { messages: ChatMessage[] }) =>
+    useInflightDelegates({ sessionId: "s-bg-retained-terminal", messages, enabled: true, auth }), { initialProps: { messages: [oldReceipt] } });
+  await act(async () => {});
+  expect(activeBackgroundDelegateJobIds(result.current.controlItems, [oldReceipt])).toEqual([]);
+  rerender({ messages: [oldReceipt, nextReceipt] }); await act(async () => {});
+  expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(2);
+  expect(result.current.controlItems).toContainEqual(old);
+  expect(activeBackgroundDelegateJobIds(result.current.controlItems, [oldReceipt, nextReceipt])).toEqual([next.jobId]);
+  await act(() => vi.advanceTimersByTimeAsync(15_000));
+  expect(activeBackgroundDelegateJobIds(result.current.controlItems, [oldReceipt, nextReceipt])).toEqual([]);
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(fetchInflightDelegatesResult).toHaveBeenCalledTimes(3);
 });

@@ -51,7 +51,7 @@ before(async () => {
     CREATE TABLE pending_usage_patches(user_id text,turn_key text,parent_turn_key text,request_id text,cost_credits text);
     CREATE TABLE turn_permission_requests(user_id bigint,session_id text,request_id text,client_message_id text,
       tool_use_id text,tool_name text,input_json jsonb,expires_at timestamptz,status text,created_at timestamptz DEFAULT now());
-    CREATE TABLE turn_control_requests(user_id bigint,session_id text,kind text,status text,root_client_message_id text,created_at timestamptz);
+    CREATE TABLE turn_control_requests(user_id bigint,session_id text,kind text,status text,root_client_message_id text,created_at timestamptz,payload_json jsonb DEFAULT '{}');
     CREATE TABLE turn_recovery_jobs(job_id bigserial PRIMARY KEY,user_id bigint,session_id text,status text,
       semantic_recovery_attempt int,request_json jsonb,created_at timestamptz DEFAULT now());
   `)
@@ -197,7 +197,7 @@ describe('PG session snapshot transport contract', () => {
     await db.query(`INSERT INTO turn_permission_requests(user_id,session_id,request_id,client_message_id,tool_name,input_json,expires_at,status)
       SELECT 3,$1,request,$2,'tool','{}',now()+duration,'pending' FROM (VALUES
         ('stopped',interval '1 hour'),('ask-user:keep',interval '1 hour'),('expired',interval '-1 hour')) v(request,duration)`, [sessionId, cmid])
-    await db.query("INSERT INTO turn_control_requests VALUES(3,$1,'stop','pending',$2,now())", [sessionId, cmid])
+    await db.query("INSERT INTO turn_control_requests(user_id,session_id,kind,status,root_client_message_id,created_at) VALUES(3,$1,'stop','pending',$2,now())", [sessionId, cmid])
     const snapshot = (await readSessionSnapshot(pool, '3', sessionId))!
     assert.deepEqual(snapshot.pendingPermissions.items.map(p => p.requestId), ['ask-user:keep'])
     assert.equal(snapshot.pendingPermissions.completeness, 'complete')

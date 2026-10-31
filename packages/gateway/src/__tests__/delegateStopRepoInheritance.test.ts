@@ -127,7 +127,7 @@ test('stop interrupts active delegate children for the stopped parent session', 
   )
   assert.match(
     delegateCore,
-    /const\s+delegateParent\s*=\s*this\._resolveDelegateParent/,
+    /const\s+delegateParent\s*=\s*input\.backgroundParent\s*\?\?\s*this\._resolveDelegateParent/,
     'delegate runs must resolve a parent session key and repo binding separately from webchat progress',
   )
   assert.match(
