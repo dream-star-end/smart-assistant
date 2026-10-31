@@ -49,7 +49,7 @@ import {
   SCANSCI_PAPER_HINT_MARKER,
 } from "../ws/paperIntentHint.js";
 import { GoalStateError } from "../goal/goalStateService.js";
-import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, formatMessageReplyPrompt, wrapUntrustedData } from "@openclaude/protocol";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -343,7 +343,7 @@ describe("sanitizeMasterHistoricalMessagesForFrame", () => {
     assert.deepEqual(rows, [
       { id: "u1", role: "user", text: "hello", status: "sent", ts: 1 },
       { id: "a1", role: "assistant", text: "answer" },
-      { id: "t1", role: "tool", text: "Tool: Bash\nInput: {\"command\":\"pwd\"}\nOutput: /srv" },
+      { id: "t1", role: "tool", text: `Tool: Bash\nInput: {"command":"pwd"}\nOutput: ${wrapUntrustedData("tool_result", "/srv")}` },
     ]);
   });
 
