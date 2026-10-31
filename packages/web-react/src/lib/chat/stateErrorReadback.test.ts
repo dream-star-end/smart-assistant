@@ -81,7 +81,7 @@ test("an unreadable snapshot applies the original error once without a read loop
   sock.stop();
 });
 
-test.each(["session_deleted", "session_not_found", "not_found", "forbidden", "unauthorized", "insufficient_credits", "model_switch_stale"])(
+test.each(["session_deleted", "session_not_found", "not_found", "forbidden", "unauthorized", "insufficient_credits", "model_switch_stale", "turn_changed_extra", "turn_tape_retryable_extra"])(
   "%s keeps its existing user/permission/resource path", async (code) => {
     const read = vi.fn(async () => snapshot());
     const { sock, ws } = boot({ readSessionSnapshot: read });

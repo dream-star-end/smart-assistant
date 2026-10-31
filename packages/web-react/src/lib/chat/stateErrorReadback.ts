@@ -6,11 +6,8 @@ import { snapshotIsStale, type SessionSnapshot } from "./sessionSnapshot";
 type StateErrorFrame = {
   code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number; frameSeq?: number; sessionKey?: string;
 };
-const STATE_CODES = new Set(["bad_sequence", "conflict", "turn_changed", "turn_finalized",
-  "turn_in_flight", "turn_not_active", "active_turn"]);
-const STORAGE_CODES = new Set(["session_persist_unavailable", "history_enrichment_unavailable",
-  "turn_tape_state_error", "turn_tape_state_unavailable", "turn_tape_unavailable",
-  "turn_tape_visible_unavailable", "tape_not_acked", "turn_tape_retryable"]);
+const STATE_CODES = /^(?:bad_sequence|conflict|turn_(?:changed|finalized|in_flight|not_active)|active_turn)$/;
+const STORAGE_CODES = /^(?:session_persist_unavailable|history_enrichment_unavailable|turn_tape_(?:state_error|state_unavailable|unavailable|visible_unavailable|retryable)|tape_not_acked)$/;
 const attempted = new WeakSet<object>();
 const pending = new WeakMap<ChatSession, Set<string>>();
 const compatibilityFinals = new WeakMap<ChatSession, Set<string>>();
@@ -22,13 +19,12 @@ export function consumeStateReadbackCompatFinal(sess: ChatSession, frame: StateE
   return !!cmid && compatibilityFinals.get(sess)?.delete(compatKey(frame, cmid)) === true;
 }
 
-export function stateErrorWasResolved(code: string, cmid: string, snap: SessionSnapshot): boolean {
+function stateErrorWasResolved(requiresCompletion: boolean, cmid: string, snap: SessionSnapshot): boolean {
   const d = snap.dispatch;
   if (d?.clientMessageId !== cmid || snap.pendingPermissions.completeness !== "complete" ||
     snap.hasMore || (snap.gap && snap.gap.reason !== "cursor_reset")) return false;
   const completed = d.status === "terminal" && d.outcome === "completed" && snap.reconcile === "turn_completed";
-  if (STORAGE_CODES.has(code)) return completed;
-  return STATE_CODES.has(code) && (completed || (d.status === "accepted" && d.outcome === null));
+  return completed || (!requiresCompletion && d.status === "accepted" && d.outcome === null);
 }
 
 /** Only a named peer AND its exact current message can turn an error into a readback.
@@ -45,10 +41,11 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
   },
 ): boolean {
   const code = normalizeTurnErrorCode(frame.code);
+  const requiresCompletion = STORAGE_CODES.test(code);
   const cmid = frame.clientMessageId;
   if (attempted.has(frame) || frame.peer?.id !== sess.id || !cmid ||
     sess._activeClientMessageId !== cmid || !sess._sendingInFlight || sess._stopSettlement ||
-    (!STATE_CODES.has(code) && !STORAGE_CODES.has(code))) return false;
+    (!STATE_CODES.test(code) && !requiresCompletion)) return false;
   attempted.add(frame);
   if (!effects.accept()) return true;
   const key = `${cmid}:${code}`;
@@ -74,7 +71,7 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
   void effects.read(sess.id).then((snap) => {
     if (!effects.current()) return;
     if (sess._stopSettlement || (sess._activeClientMessageId && sess._activeClientMessageId !== cmid)) return;
-    if (!snap || snap.sessionId !== sess.id || snapshotIsStale(sess, snap) || !stateErrorWasResolved(code, cmid, snap)) {
+    if (!snap || snap.sessionId !== sess.id || snapshotIsStale(sess, snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
       const source = sess.messages.find((message) => message.role === "user" && message.id === cmid);
       if (sess._activeClientMessageId === cmid || source?.status !== "replied") replay();
       return;
