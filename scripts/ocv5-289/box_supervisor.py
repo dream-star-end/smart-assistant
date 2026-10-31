@@ -20,6 +20,9 @@ import subprocess
 import sys
 import time
 
+INTERACTIVE_REASON = re.compile(
+    r"^BOX_INTERACTIVE_[A-Z][A-Z0-9_]{0,40}(?: [a-z0-9_=]{1,32}){0,3}$")
+
 PR_SET_PDEATHSIG = 1
 # Linux uapi/linux/pidfd.h, available for pidfd_send_signal since Linux 6.9.
 # A pinned pidfd prevents sending to a recycled numeric PGID on parent loss.
@@ -335,6 +338,59 @@ def main() -> int:
                 publisher.close()
             return 126
 
+    reason_fd = None
+    raw_reason_fd = os.environ.pop("OCV5_FAILURE_REASON_FD", None)
+    if raw_reason_fd is not None:
+        try:
+            parsed_reason_fd = int(raw_reason_fd)
+        except ValueError:
+            parsed_reason_fd = -1
+        if parsed_reason_fd >= 3:
+            reason_fd = parsed_reason_fd
+    found_reason = None
+    reason_pending = bytearray()
+
+    def note_stderr(chunk: bytes, final: bool = False) -> None:
+        nonlocal found_reason, reason_pending
+        if found_reason is not None:
+            return
+        reason_pending.extend(chunk.replace(b"\r", b""))
+        if final and reason_pending and not reason_pending.endswith(b"\n"):
+            reason_pending.extend(b"\n")
+        while found_reason is None:
+            nl = reason_pending.find(b"\n")
+            if nl < 0:
+                break
+            raw = bytes(reason_pending[:nl])
+            del reason_pending[:nl + 1]
+            if len(raw) > 240:
+                continue
+            try:
+                text = raw.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if INTERACTIVE_REASON.fullmatch(text):
+                found_reason = text
+                reason_pending.clear()
+        if found_reason is None and len(reason_pending) > 240:
+            reason_pending.clear()
+
+    def emit_reason() -> None:
+        nonlocal reason_fd
+        if reason_fd is None:
+            return
+        try:
+            if found_reason is not None:
+                os.write(reason_fd, (found_reason + "\n").encode("ascii"))
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(reason_fd)
+            except OSError:
+                pass
+            reason_fd = None
+
     parent_pid = os.getpid()
     gate_read, gate_write = os.pipe()
     watch_read, watch_write = os.pipe()
@@ -466,6 +522,8 @@ def main() -> int:
             for key, _ in selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
+                    if key.data == "stderr":
+                        note_stderr(b"", final=True)
                     selector.unregister(key.fileobj)
                     continue
                 if key.data == "stdout":
@@ -481,6 +539,7 @@ def main() -> int:
                         reason = 143 if delivery == "cancelled" else 124
                         break
                 else:
+                    note_stderr(chunk)
                     stderr_bytes += len(chunk)
                     if (stderr_bytes > args.stderr_limit if args.stderr_limit
                             else stdout_bytes + stderr_bytes > args.max_output):
@@ -493,6 +552,7 @@ def main() -> int:
     except (OSError, ValueError, json.JSONDecodeError):
         reason = 125
     finally:
+        emit_reason()
         selector.close()
         # Keep the group leader unreaped while signalling. Its PID/PGID cannot
         # be recycled, and descendants that closed stdio are still killed.

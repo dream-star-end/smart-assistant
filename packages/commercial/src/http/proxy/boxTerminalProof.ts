@@ -27,9 +27,10 @@ interface BoxTerminalIdentity {
   keeperPid: number;
   cliPid: number;
 }
+const INTERACTIVE_REASON = /^BOX_INTERACTIVE_[A-Z][A-Z0-9_]{0,40}(?: [a-z0-9_=]{1,32}){0,3}$/;
 export type BoxTerminalProof = BoxTerminalIdentity & (
   { reason: "worker_complete" | "keeper_stopped"; revision: 1 }
-  | { reason: "worker_failed"; revision: 2; workerExitCode: number }
+  | { reason: "worker_failed"; revision: 2; workerExitCode: number; workerReason?: string }
 );
 
 export function makeBoxTerminalRead(proofDir: string): BoxCcExecRequest {
@@ -56,11 +57,15 @@ export function parseBoxTerminalProof(raw: string, expected: {
   const successShape = keys === "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce"
     && (proof.reason === "worker_complete" || proof.reason === "keeper_stopped")
     && proof.revision === 1;
-  const failureShape = keys === "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce,workerExitCode"
+  const failureKeys = "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce,workerExitCode";
+  const reasonOk = !keys.endsWith("workerReason")
+    || (typeof proof.workerReason === "string" && INTERACTIVE_REASON.test(proof.workerReason));
+  const failureShape = (keys === failureKeys || keys === `${failureKeys},workerReason`)
     && proof.reason === "worker_failed" && proof.revision === 2
     && Number.isSafeInteger(proof.workerExitCode)
     && Number(proof.workerExitCode) !== 0
-    && Number(proof.workerExitCode) >= -255 && Number(proof.workerExitCode) <= 255;
+    && Number(proof.workerExitCode) >= -255 && Number(proof.workerExitCode) <= 255
+    && reasonOk;
   if ((!successShape && !failureShape)
     || proof.runNonce !== expected.runNonce || proof.leaseEpoch !== expected.leaseEpoch
     || !Number.isSafeInteger(proof.keeperPid) || (proof.keeperPid as number) < 1

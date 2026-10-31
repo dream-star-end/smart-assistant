@@ -314,5 +314,56 @@ class KeeperTest(unittest.TestCase):
                 self.assertFalse(marker.exists(), "CLI must not run after startup budget")
 
 
+
+    def test_failure_record_keeps_the_first_safe_interactive_reason(self) -> None:
+        options, proof, epoch = self.proof_args()
+        code = (
+            "import sys\n"
+            "sys.stderr.write('noise\\n')\n"
+            "sys.stderr.write('/home/box/.claude/.credentials.json\\n')\n"
+            "sys.stderr.write('user@mail.example.com\\n')\n"
+            "sys.stderr.write('BOX_INTERACTIVE_NOT_READY timeout\\n')\n"
+            "sys.stderr.write('BOX_INTERACTIVE_NOT_READY dialog=trust\\n')\n"
+            "sys.exit(1)\n"
+        )
+        command = self.command(code)
+        command[3:3] = options
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.processes.append(proc)
+        out, err = proc.communicate(timeout=12)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b"")
+        raw = (proof / "terminal.json").read_text()
+        self.assertNotIn("/home", raw)
+        self.assertNotIn("mail.example", raw)
+        self.assertNotIn(".credentials", raw)
+        marker = json.loads(raw)
+        self.assertEqual((marker["reason"], marker["revision"], marker["workerExitCode"],
+                          marker["workerReason"]),
+                         ("worker_failed", 2, 1, "BOX_INTERACTIVE_NOT_READY timeout"))
+        self.assertEqual((marker["runNonce"], marker["leaseEpoch"], marker["keeperPid"]),
+                         (proof.name[-24:], epoch, proc.pid))
+
+    def test_failure_record_omits_an_unsafe_reason_line(self) -> None:
+        options, proof, _epoch = self.proof_args()
+        code = (
+            "import sys\n"
+            "sys.stderr.write('/home/box/.claude/.credentials.json\\n')\n"
+            "sys.stderr.write('user@mail.example.com\\n')\n"
+            "sys.exit(1)\n"
+        )
+        command = self.command(code)
+        command[3:3] = options
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.processes.append(proc)
+        _out, err = proc.communicate(timeout=12)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(err, b"")
+        marker = json.loads((proof / "terminal.json").read_text())
+        self.assertEqual(marker["workerExitCode"], 1)
+        self.assertNotIn("workerReason", marker)
+
+
 if __name__ == "__main__":
     unittest.main()

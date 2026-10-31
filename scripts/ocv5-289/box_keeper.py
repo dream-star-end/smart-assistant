@@ -20,6 +20,9 @@ import subprocess
 import sys
 import time
 
+INTERACTIVE_REASON = re.compile(
+    r"^BOX_INTERACTIVE_[A-Z][A-Z0-9_]{0,40}(?: [a-z0-9_=]{1,32}){0,3}$")
+
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_PATH = re.compile(r"^/tmp/ocv5-289-(?:v2-)?supervisor-([a-f0-9]{16})\.py$")
@@ -62,8 +65,33 @@ def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | No
     return args, proof_dir, epoch
 
 
+def take_worker_reason(fd: int) -> str | None:
+    """One ascii reason line, or nothing. Never a path, an email, or a second line."""
+    try:
+        os.set_blocking(fd, False)
+        try:
+            data = os.read(fd, 256)
+        except BlockingIOError:
+            return None
+        if data.count(b"\n") != 1 or not data.endswith(b"\n"):
+            return None
+        try:
+            line = data[:-1].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        if INTERACTIVE_REASON.fullmatch(line):
+            return line
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str,
-                     worker_exit_code: int | None = None) -> None:
+                     worker_exit_code: int | None = None,
+                     worker_reason: str | None = None) -> None:
     """Publish only after the keeper has reaped every adopted descendant."""
     info = os.lstat(proof_dir)
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
@@ -81,10 +109,16 @@ def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str,
                 raise ValueError("WORKER_EXIT_INVALID")
             record["revision"] = 2
             record["workerExitCode"] = worker_exit_code
+            if isinstance(worker_reason, str) and INTERACTIVE_REASON.fullmatch(worker_reason):
+                record["workerReason"] = worker_reason
         elif reason not in ("worker_complete", "keeper_stopped") or worker_exit_code is not None:
             raise ValueError("TERMINAL_REASON_INVALID")
         content = (json.dumps(record, sort_keys=True,
             separators=(",", ":")) + "\n").encode("ascii")
+        if len(content) > 512 and "workerReason" in record:
+            del record["workerReason"]
+            content = (json.dumps(record, sort_keys=True,
+                separators=(",", ":")) + "\n").encode("ascii")
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600, dir_fd=directory)
         try:
@@ -336,20 +370,24 @@ def main() -> int:
         return 126
     report_read, report_write = os.pipe()
     ack_read, ack_write = os.pipe()
+    reason_read, reason_write = os.pipe()
     keeper_pid = os.getpid()
     env = { **os.environ, "OCV5_KEEPER_REPORT_FD": str(report_write),
-        "OCV5_KEEPER_ACK_FD": str(ack_read) }
+        "OCV5_KEEPER_ACK_FD": str(ack_read),
+        "OCV5_FAILURE_REASON_FD": str(reason_write) }
     try:
         worker = subprocess.Popen([sys.executable, "-I", sys.argv[1], *worker_args],
             env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
-            pass_fds=(report_write, ack_read), close_fds=True,
+            pass_fds=(report_write, ack_read, reason_write), close_fds=True,
             preexec_fn=lambda: worker_setup(keeper_pid))
     except (OSError, subprocess.SubprocessError):
-        for fd in (report_read, report_write, ack_read, ack_write):
+        for fd in (report_read, report_write, ack_read, ack_write, reason_read, reason_write):
             os.close(fd)
         return 126
     os.close(report_write)
     os.close(ack_read)
+    os.close(reason_write)
+    reason_write = -1
     # P must not hold model stdout/stderr open after W exits; reports use pipes.
     for stream_fd in (1, 2):
         try: os.close(stream_fd)
@@ -406,6 +444,11 @@ def main() -> int:
             code = 125
         if cli_pid is None or pidfd is None:
             return 124 if time.monotonic() >= startup_until else 126
+        worker_reason = None
+        if reason_read >= 0:
+            fd = reason_read
+            reason_read = -1
+            worker_reason = take_worker_reason(fd)
         if proof_dir is not None and all_reaped:
             try:
                 if worker.returncode == 0:
@@ -414,7 +457,7 @@ def main() -> int:
                     publish_terminal(proof_dir, epoch, cli_pid, "keeper_stopped")
                 else:
                     publish_terminal(proof_dir, epoch, cli_pid, "worker_failed",
-                        worker_exit_code=worker.returncode)
+                        worker_exit_code=worker.returncode, worker_reason=worker_reason)
             except (OSError, ValueError):
                 # The marker is mandatory once requested: no success without
                 # durable terminal evidence, even though the CLI may be gone.
@@ -424,6 +467,8 @@ def main() -> int:
         os.close(report_read)
         if ack_write >= 0:
             os.close(ack_write)
+        if reason_read >= 0:
+            os.close(reason_read)
         if pidfd is not None:
             os.close(pidfd)
 

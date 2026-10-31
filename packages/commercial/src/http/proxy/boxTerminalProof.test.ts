@@ -58,3 +58,34 @@ test("terminal read script refuses symlink and non-0600 marker", () => {
     assert.notEqual(linked.status, 0);
   } finally { rmSync(random, { recursive: true, force: true }); }
 });
+
+test("a failed worker may carry one safe BOX_INTERACTIVE reason", () => {
+  const failed = { ...record, reason: "worker_failed", revision: 2, workerExitCode: 1,
+    workerReason: "BOX_INTERACTIVE_NOT_READY timeout" };
+  assert.deepEqual(parseBoxTerminalProof(JSON.stringify(failed) + "\n",
+    { runNonce, leaseEpoch }), failed);
+  for (const workerReason of [
+    "BOX_INTERACTIVE_ONBOARDING",
+    "BOX_INTERACTIVE_LOGIN_REQUIRED",
+    "BOX_INTERACTIVE_NOT_READY dialog=trust",
+    "BOX_INTERACTIVE_NO_INPUT",
+    "BOX_INTERACTIVE_READY plugins=oc",
+  ]) {
+    const withReason = { ...failed, workerReason };
+    assert.deepEqual(parseBoxTerminalProof(JSON.stringify(withReason) + "\n",
+      { runNonce, leaseEpoch }), withReason);
+  }
+  for (const workerReason of [
+    "BOX_INTERACTIVE_NOT_READY tmux free text",
+    "/home/box/.claude",
+    "user@mail.example.com",
+    "BOX_INTERACTIVE_not_ready",
+    "not a reason",
+  ]) {
+    assert.throws(() => parseBoxTerminalProof(JSON.stringify({ ...failed, workerReason }) + "\n",
+      { runNonce, leaseEpoch }), /BOX_TERMINAL_PROOF_INVALID/);
+  }
+  const oldShape = { ...record, reason: "worker_failed", revision: 2, workerExitCode: 7 };
+  assert.deepEqual(parseBoxTerminalProof(JSON.stringify(oldShape) + "\n",
+    { runNonce, leaseEpoch }), oldShape);
+});
