@@ -732,6 +732,75 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
     })
   }
 
+  test('a frame picked after a provider pause resumes one new video without buying the frame again', async (t) => {
+    if (skip(t)) return
+    const img = new FakeProvider('img', 'image')
+    const vid = new FakeProvider('vid', 'video')
+    const d = await deps(img, vid)
+    const p = await runningProject(1)
+    const shotId = await shotWithFrame(d, p)
+    vid.fail = new MediaProviderError('MUSE_SOURCE_FETCH_FAILED', true, 'source unavailable')
+    const failed = await runOne(d)
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+    await advanceProject(d, p.id)
+    const paused = await query<{ status: string; reason: string | null }>(
+      "SELECT status, settings->>'awaitingReason' AS reason FROM studio_projects WHERE id = $1",
+      [p.id],
+    )
+    assert.deepEqual(paused.rows[0], { status: 'awaiting_user', reason: 'provider_failure' })
+    const frame = (
+      await query<{ id: string; blob_sha: string }>(
+        `SELECT id::text AS id, blob_sha FROM studio_takes
+          WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND status = 'succeeded'`,
+        [shotId],
+      )
+    ).rows[0]!
+    const api = makeOrchestratorApi(getPool(), () => {}, d)
+    await api.selectTake(p.userId, frame.id)
+    const selected = await query<{ status: string; reason: string | null; budget: string }>(
+      `SELECT status, settings->>'awaitingReason' AS reason, budget_credits::text AS budget
+         FROM studio_projects WHERE id = $1`,
+      [p.id],
+    )
+    assert.deepEqual(selected.rows[0], { status: 'running', reason: null, budget: '2000' })
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+
+    vid.fail = null
+    await advanceProject(d, p.id)
+    await advanceProject(d, p.id)
+    const videos = await query<{ id: string; version: number; status: string; provider: string }>(
+      `SELECT id::text AS id, version, status, provider FROM studio_takes
+        WHERE owner_kind = 'shot_video' AND owner_id = $1 ORDER BY version`,
+      [shotId],
+    )
+    assert.deepEqual(
+      videos.rows.map(({ version, status, provider }) => ({ version, status, provider })),
+      [{ version: 1, status: 'failed', provider: 'vid' }, { version: 2, status: 'queued', provider: 'vid' }],
+      'two advances open exactly one new execution on the same provider',
+    )
+    const request = (
+      await query<{ request: MediaRequest }>(
+        "SELECT payload->'request' AS request FROM studio_tasks WHERE payload->>'takeId' = $1",
+        [videos.rows[1]!.id],
+      )
+    ).rows[0]!.request
+    assert.equal(request.op, 'video.from_image')
+    assert.deepEqual(request.inputs, [{ role: 'first_frame', blobSha: frame.blob_sha }])
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 10n, status: 'running' })
+    const retried = await runOne(d)
+    assert.notEqual(retried.execRequestId, failed.execRequestId)
+    assert.equal(vid.calls, 2, 'one failed request and one confirmed retry')
+    assert.equal(vid.ledger.size, 1, 'only the successful retry charged')
+    assert.equal(img.calls, 1, 'the selected frame is reused without another image call')
+    assert.equal(img.ledger.size, 1)
+    assert.deepEqual(await money(p.id), { spent: 12n, reserved: 0n, status: 'running' })
+    const shot = await query<{ status: string; active: string | null }>(
+      'SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1',
+      [shotId],
+    )
+    assert.deepEqual(shot.rows[0], { status: 'ready', active: videos.rows[1]!.id })
+  })
+
   test("after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)", async (t) => {
     if (skip(t)) return
     // prod 2026-10-27 c6f0a9f2: Muse (the only video provider) failed one video of a shot; the user
