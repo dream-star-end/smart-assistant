@@ -164,6 +164,7 @@ export const TURN_ERROR_TAXONOMY = {
   codex_pool_busy: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
   codex_route_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
   codex_container_recycled: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
+  bridge_closed_during_admission: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
   codex_billing: { retryable: true, cta: 'retry' },
   /** 历史前端码(与 upstream_failed 语义重复,仅存量会话水合可见)。 */
   upstream_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
@@ -545,6 +546,7 @@ const PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES: ReadonlySet<TurnErrorCode> = new S
   'codex_pool_busy',
   'codex_route_unavailable',
   'codex_container_recycled',
+  'bridge_closed_during_admission',
 ])
 
 export function supportsAutomaticRecoveryWithoutCheckpoint(code: string): boolean {

@@ -853,6 +853,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   codex_pool_busy: "账号池繁忙，请稍后重试。",
   codex_route_unavailable: "模型服务暂时不可用，你的消息已保留，请稍后重试。",
   codex_container_recycled: "环境已重建，请刷新页面后重发。",
+  bridge_closed_during_admission: "执行环境刚刚更新，这条消息还没开始处理，未扣费。",
   codex_billing: "计费服务暂时不可用，本轮未开始，请稍后重试。",
   upstream_error: "模型服务暂时不可用，你的消息已保留，可以在当前会话继续。",
 };

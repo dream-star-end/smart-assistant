@@ -645,6 +645,7 @@ const ERROR_LABELS: Record<string, string> = {
   codex_pool_busy: "账号池繁忙",
   codex_route_unavailable: "服务暂时不可用",
   codex_container_recycled: "环境已重建",
+  bridge_closed_during_admission: "这条消息没有开始处理",
   codex_billing: "计费服务暂时不可用",
   upstream_error: "模型服务暂时不可用",
 };
@@ -864,6 +865,16 @@ export function errorPresentation(
   // durable live-frame journal 保留此前所有已展示过程。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
+  if (normalized === "bridge_closed_during_admission") {
+    return {
+      code: normalized,
+      fixedMessage: true,
+      title: "这条消息没有开始处理",
+      message: "执行环境刚刚更新，这条消息还没开始处理，未扣费。",
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: true,
+    };
+  }
   if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
     return {
       code: normalized,

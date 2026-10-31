@@ -66,12 +66,13 @@ export function TurnStatusCard({
   currentTurn: boolean;
 }) {
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
+  const recycleReadmit = presented.code === "bridge_closed_during_admission";
   const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
   const retry = source && cb.onContinueInterrupted
-    ? { label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }
+    ? { label: recycleReadmit ? "重新发送" : "继续", onClick: () => cb.onContinueInterrupted?.(msg) }
     : undefined;
   const details = {
-    code: msg._errorCode,
+    ...(recycleReadmit ? {} : { code: msg._errorCode }),
     requestId: msg.usage?.traceId,
     clientMessageId: msg._clientMessageId,
     detail: presented.detail,

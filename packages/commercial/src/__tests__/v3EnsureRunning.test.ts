@@ -96,6 +96,10 @@ class FakePool {
   }
   /** test 钩子:第 N 次 INSERT 强制 23505 */
   forceUniqConflictOnInserts = new Set<number>();
+  /** OCV5-683: master 上该用户仍有未结束 dispatch。 */
+  openMasterAdmission = false;
+  /** 只让 turn_dispatches 查询失败，其它 SQL 照常。 */
+  throwOnMasterAdmission = false;
   /**
    * V3 Phase 3I per-host cap:模拟 compute_hosts.max_containers。
    * `setHostMax(uuid, null)` 显式模拟 "compute_hosts 行 missing"。
@@ -283,6 +287,12 @@ class FakePool {
         rowCount: 1,
         rows: [{ active: String(active), max_containers: max }],
       };
+    }
+    if (/FROM turn_dispatches/i.test(trimmed) && /terminal_at IS NULL/i.test(trimmed)) {
+      if (this.throwOnMasterAdmission) throw new Error("dispatch query down");
+      return this.openMasterAdmission
+        ? { rowCount: 1, rows: [{ "?column?": 1 }] }
+        : { rowCount: 0, rows: [] };
     }
     throw new Error(`FakePool: unhandled SQL: ${trimmed.slice(0, 200)}`);
   }
@@ -672,6 +682,73 @@ describe("makeV3EnsureRunning", () => {
       assert.equal(ep.coldStart, true, "drain accepted → 回收旧容器并重建");
       assert.ok(captured.stopped >= 1, "旧容器应被 stop");
       assert.ok(captured.containersCreated >= 1, "必须用新镜像重建,不能只停不建");
+  });
+
+  test("v5 stale image + master 有未结束 dispatch → 不询问 drain 直接延期", async () => {
+      const pool = new FakePool();
+      pool.openMasterAdmission = true;
+      pool.preInsertActive(115, "172.31.1.15", "dockerid-pre-115");
+      const { docker, captured } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        runtimeChannelForTest: "v5",
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
+      });
+      const ep = await ensureRunning(115n);
+      assert.equal(ep.coldStart, false);
+      assert.equal(drainCalls, 0);
+      assert.equal(captured.stopped, 0);
+  });
+
+  test("v5 stale image + master admission 查询失败 → 不回收", async () => {
+      const pool = new FakePool();
+      pool.throwOnMasterAdmission = true;
+      pool.preInsertActive(116, "172.31.1.16", "dockerid-pre-116");
+      const { docker, captured } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        runtimeChannelForTest: "v5",
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "accepted"; },
+      });
+      await assert.rejects(ensureRunning(116n), (err: unknown) => {
+        assert.ok(err instanceof ContainerUnreadyError);
+        assert.equal((err as ContainerUnreadyError).reason, "supervisor_error");
+        return true;
+      });
+      assert.equal(drainCalls, 0);
+      assert.equal(captured.stopped, 0);
+  });
+
+  test("v5 force stale recycle 即使 master 有未结束 dispatch 仍回收", async () => {
+      const pool = new FakePool();
+      pool.openMasterAdmission = true;
+      pool.preInsertActive(117, "172.31.1.17", "dockerid-pre-117");
+      const { docker, captured } = makeDocker({
+        inspectState: "running",
+        containerImage: "openclaude/openclaude-runtime:old",
+      });
+      let drainCalls = 0;
+      const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+        probeHealthz: async () => true,
+        probeWsUpgrade: async () => true,
+        runtimeChannelForTest: "v5",
+        forceStaleImageRecycle: true,
+        requestRuntimeRecycleDrain: async () => { drainCalls += 1; return "busy"; },
+      });
+      const ep = await ensureRunning(117n);
+      assert.equal(drainCalls, 0);
+      assert.equal(ep.coldStart, true);
+      assert.ok(captured.stopped >= 1);
   });
 
   test("v5 stale image + 最近有 WS 活动但仍有在途 turn → drain busy 后延期", async () => {

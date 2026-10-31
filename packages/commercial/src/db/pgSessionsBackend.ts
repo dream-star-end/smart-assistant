@@ -1,4 +1,9 @@
 import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
+import {
+  RECYCLE_READMIT_NOTICE_SQL,
+  RECYCLE_READMIT_NOTICE_TEXT,
+  recycleReadmitGreyLineVisible,
+} from '../dispatch/preReceiptRecycleRecovery.js';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
 import { readCcbNativeRestoreArchiveFromDb } from "./pgCcbTranscriptRestore.js";
@@ -1889,7 +1894,7 @@ async function mergeVerifiedTurnStatusRows(
       [uidMatch[1], sessionId],
     )
   ).rows;
-  if (rows.length === 0) return messages;
+  if (rows.length === 0) return appendRecycleReadmitNotices(pool, uidMatch[1]!, sessionId, messages);
 
   const out = [...messages];
   for (const row of rows) {
@@ -1927,6 +1932,50 @@ async function mergeVerifiedTurnStatusRows(
       _clientMessageId: row.client_message_id,
     });
   }
+  return appendRecycleReadmitNotices(pool, uidMatch[1]!, sessionId, out);
+}
+
+async function appendRecycleReadmitNotices(
+  pool: Pool,
+  userId: string,
+  sessionId: string,
+  messages: MessageLike[],
+): Promise<MessageLike[]> {
+  const rows = (
+    await pool.query<{
+      client_message_id: string;
+      accepted_at: Date | null;
+      dispatch_status: string;
+      outcome: string | null;
+      job_status: string;
+      same_dispatch: string | null;
+    }>(RECYCLE_READMIT_NOTICE_SQL, [userId, sessionId])
+  ).rows;
+  if (rows.length === 0) return messages;
+  let out = messages;
+  for (const row of rows) {
+    if (!recycleReadmitGreyLineVisible({
+      sameDispatch: row.same_dispatch === "true",
+      jobStatus: row.job_status,
+      acceptedAt: row.accepted_at,
+      dispatchStatus: row.dispatch_status,
+      outcome: row.outcome,
+    })) continue;
+    const id = `recycle-readmit:${row.client_message_id}`;
+    if (out.some((message) => message.id === id)) continue;
+    if (out === messages) out = [...messages];
+    const notice: MessageLike = {
+      id,
+      role: "system",
+      text: RECYCLE_READMIT_NOTICE_TEXT,
+      ts: row.accepted_at?.getTime() ?? 0,
+      _source: "server",
+      _clientMessageId: row.client_message_id,
+    };
+    const idx = out.findIndex((message) => message.id === row.client_message_id);
+    if (idx >= 0) out.splice(idx + 1, 0, notice);
+    else out.push(notice);
+  }
   return out;
 }
 
@@ -1944,6 +1993,7 @@ const AUTOMATIC_RECOVERY_CONTINUE_PROMPT =
 const PRE_EXECUTION_RECOVERY_CODES = new Set([
   "model_authority_unavailable", "model_catalog_unavailable",
   "codex_pool_busy", "codex_route_unavailable", "codex_container_recycled",
+  "bridge_closed_during_admission",
 ]);
 function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));

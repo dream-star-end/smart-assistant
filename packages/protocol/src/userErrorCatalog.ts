@@ -83,6 +83,7 @@ const TURN_COPY: Record<TurnErrorCode, readonly [UserErrorCategory, string]> = {
   codex_pool_busy: ['capacity', '当前模型服务繁忙，请稍后重试或切换模型。'],
   codex_route_unavailable: ['connection', '模型连接暂时不可用，请稍后重试。'],
   codex_container_recycled: ['execution', '运行环境已重建，请刷新页面后继续。'],
+  bridge_closed_during_admission: ['execution', '执行环境刚刚更新，这条消息还没开始处理，未扣费。'],
   codex_billing: ['billing', '本轮费用校验暂时无法完成，请稍后重试。'],
   upstream_error: ['model', '模型服务暂时不可用，请稍后重试。'],
 }

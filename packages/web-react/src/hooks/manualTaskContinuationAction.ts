@@ -1,4 +1,4 @@
-import { parsePlatformReasoningEffort } from "@openclaude/protocol/browser";
+import { normalizeTurnErrorCode, parsePlatformReasoningEffort } from "@openclaude/protocol/browser";
 import type { RefObject } from "react";
 import type { ChatMessage } from "../lib/chat/model";
 import { canonicalTaskContinuationError, manualTaskContinuationSource, taskContinuationPrompt } from "../lib/chat/manualTaskContinuation";
@@ -38,10 +38,29 @@ export async function continueManualTask({ activeId, demo, identity, authRef, so
     if (!exact || !identityIsCurrent(identity, authRef.current) || activeSessionRef.current !== activeId || sockRef.current !== sock ||
       manualTaskContinuationSource(sock.getMessages(activeId), error)?.id !== source.id) return;
     const replay = exactUserReplayPayload(exact);
+    const routing = exact._routing;
+    // The turn never reached the container, so resend the original message
+    // under a new client id. A continuation prompt would ask the model to
+    // resume work that did not start.
+    if (normalizeTurnErrorCode(canonical._errorCode) === "bridge_closed_during_admission") {
+      const display = replay.displayText ?? replay.text;
+      if (routing) {
+        await sock.send({
+          sessId: activeId, agentId, text: replay.text, media: replay.media, displayText: display,
+          model: routing.model, teamMode: routing.teamMode,
+          effortLevel: routing.effortLevel === null ? null : parsePlatformReasoningEffort(routing.effortLevel),
+          collabMode: routing.collabMode, advisorModel: routing.advisorModel,
+          collabConfigVersion: routing.collabConfigVersion,
+          contextTier: routing.contextTier, serviceTier: routing.serviceTier,
+        });
+      } else {
+        await send(replay.text, replay.media, undefined, display, undefined, { sessionId: activeId });
+      }
+      return;
+    }
     // Explicit human follow-up uses the normal admission/credit/auth gates.
     // It neither deletes old content nor resends an executed task.
     const text = taskContinuationPrompt(replay.text);
-    const routing = exact._routing;
     if (routing) {
       await sock.send({
         sessId: activeId, agentId, text, media: replay.media, displayText: "继续",

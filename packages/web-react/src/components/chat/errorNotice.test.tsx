@@ -165,4 +165,31 @@ describe("派发失败状态卡", () => {
     expect(within(card).getByRole("button", { name: "继续" })).toBeInTheDocument();
     expect(visibleText(card)).not.toContain("dispatch_lost");
   });
+
+  test("执行环境更新且本轮没开始：重新发送，不出现内部码或联系管理员", () => {
+    const onContinueInterrupted = vi.fn();
+    render(
+      <TurnStatusCard
+        msg={{
+          id: "t2", role: "system", text: "", ts: 1,
+          _errorCode: "bridge_closed_during_admission",
+          _clientMessageId: "m2", _turnStatusRecord: true,
+        } as ChatMessage}
+        cb={{
+          onContinueInterrupted,
+          resolveInterruptedContinuation: () => ({ id: "m2", role: "user", text: "原问题", ts: 0 } as ChatMessage),
+        }}
+        currentTurn
+      />,
+    );
+    const card = screen.getByRole("status");
+    expect(card).toHaveTextContent("这条消息没有开始处理");
+    expect(card).toHaveTextContent("执行环境刚刚更新，这条消息还没开始处理，未扣费。");
+    fireEvent.click(within(card).getByRole("button", { name: "重新发送" }));
+    expect(onContinueInterrupted).toHaveBeenCalledTimes(1);
+    const shown = visibleText(card);
+    expect(shown).not.toContain("bridge_closed_during_admission");
+    expect(shown).not.toContain("联系管理员");
+    expect(shown).not.toContain("错误码");
+  });
 });

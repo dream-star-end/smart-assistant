@@ -563,6 +563,23 @@ function bundleRevOfStatus(status: V3ContainerStatus): string | undefined {
  *     等 idleSweep 清,实测会让用户在 docker exit / SIGKILL 等场景下卡几分钟。现在统一
  *     直接清旧 row 重 provision,体感冷启 5-8s,且当前 deps.image 重建保证滚动升级生效。
  */
+async function hasOpenMasterAdmission(
+  pool: { query: (sql: string, params?: unknown[]) => Promise<{ rowCount?: number | null; rows?: unknown[] }> },
+  userId: number,
+  containerId: number,
+): Promise<boolean> {
+  const res = await pool.query(
+    `SELECT 1 FROM turn_dispatches
+      WHERE user_id = $1
+        AND agent_container_id = $2
+        AND status IN ('admitted', 'accepted')
+        AND terminal_at IS NULL
+      LIMIT 1`,
+    [userId, containerId],
+  );
+  return (res.rowCount ?? res.rows?.length ?? 0) > 0;
+}
+
 export function makeV3EnsureRunning(
   deps: V3SupervisorDeps,
   options: EnsureRunningOptions = {},
@@ -690,14 +707,31 @@ export function makeV3EnsureRunning(
           );
         }
       } else if (!force && status) {
-        const drainResult = await drainRuntime(deps, status);
-        if (drainResult !== "accepted") {
+        // Master 已准入但容器 drain 仍可能报 idle（OCV5-683）。未结束的 dispatch
+        // 含已准入未送达，先推迟替换；查询失败则不回收。
+        let masterBusy = false;
+        try {
+          masterBusy = await hasOpenMasterAdmission(deps.pool, uid, status.containerId);
+        } catch {
+          throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
+        }
+        if (masterBusy) {
           recycleStaleImage = false;
           console.warn("[v3ensureRunning] stale-image recycle deferred", {
             uid,
-            reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+            reason: "master_admission",
             staleReasons: runtimeStale.reasons,
           });
+        } else {
+          const drainResult = await drainRuntime(deps, status);
+          if (drainResult !== "accepted") {
+            recycleStaleImage = false;
+            console.warn("[v3ensureRunning] stale-image recycle deferred", {
+              uid,
+              reason: drainResult === "busy" ? "active_turn" : "drain_failed",
+              staleReasons: runtimeStale.reasons,
+            });
+          }
         }
       } else if (force) {
         console.warn("[v3ensureRunning] forced stale-image recycle may terminate active work", {

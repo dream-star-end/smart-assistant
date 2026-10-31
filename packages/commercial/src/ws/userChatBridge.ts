@@ -231,6 +231,17 @@ import {
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
+import {
+  isPreReceiptRecycleReplayCode,
+  markPreReceiptRecycleReplaySent,
+  pausePreReceiptRecycleReplay,
+  recycleReplayDeadlineAt,
+  recycleReplayDecision,
+  recycleReplayDispatchRef,
+  recycleReplayFrame,
+  recycleReplayFrameFromJob,
+  schedulePreReceiptRecycleReplay,
+} from "../dispatch/preReceiptRecycleRecovery.js";
 import type {
   AdmitUserTurnInput,
   AdmitUserTurnResult,
@@ -2770,6 +2781,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     let cause: BridgeCloseCause = "internal_error";
     let requestedCloseCause: BridgeCloseCause | null = null;
     let cleaned = false;
+    let containerDeathForRecycleReplay = false;
     const skippedRecoveryIds = new Set<string>();
     // Bridge TTFT:首个 user→container 帧 ↔ 首个 container→user 帧。
     // - firstUserFrameAtMs 由 onUserMessage / earlyMessages replay 第一次进入时设置
@@ -2867,6 +2879,65 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
+    const replayPreReceiptRecycle = async (job: ClaimedRecoveryJob): Promise<void> => {
+      const pool = deps.pgPool;
+      if (!pool) return;
+      const request = job.request ?? {};
+      const ref = recycleReplayDispatchRef(request);
+      const decision = recycleReplayDecision({
+        nowMs: Date.now(),
+        deadlineAt: recycleReplayDeadlineAt(request),
+        linkOpen: !cleaned && containerWs.readyState === WebSocket.OPEN,
+      });
+      if (decision === "release") {
+        await releaseRecoveryForTransportWait(pool, job);
+        return;
+      }
+      if (decision === "expire") {
+        await pausePreReceiptRecycleReplay(pool, job, "recycle_readmit_expired");
+        if (ref) {
+          await casToTerminal(pool, {
+            dispatchId: ref.dispatchId,
+            outcome: "executed_error",
+            failureCode: "bridge_closed_during_admission",
+            clientNotified: false,
+            fromStatuses: ["admitted"],
+            expectedEpoch: ref.leaseEpoch,
+          });
+        }
+        return;
+      }
+      const marked = await markPreReceiptRecycleReplaySent(pool, job);
+      if (!marked) return;
+      const frame = recycleReplayFrameFromJob(request);
+      if (!frame || !ref) {
+        if (ref) {
+          await casToTerminal(pool, {
+            dispatchId: ref.dispatchId,
+            outcome: "executed_error",
+            failureCode: "bridge_closed_during_admission",
+            clientNotified: false,
+            fromStatuses: ["admitted"],
+            expectedEpoch: ref.leaseEpoch,
+          });
+        }
+        return;
+      }
+      try {
+        executeAdmittedTurn(Buffer.from(JSON.stringify(frame), "utf8"), false, "browser");
+      } catch (error) {
+        await casToTerminal(pool, {
+          dispatchId: ref.dispatchId,
+          outcome: "executed_error",
+          failureCode: "bridge_closed_during_admission",
+          clientNotified: false,
+          fromStatuses: ["admitted"],
+          expectedEpoch: ref.leaseEpoch,
+        });
+        throw error;
+      }
+    };
+
     /** 容器 attest 帧到达(bridge 拦截消费,**绝不**透传给浏览器)。 */
     const onContainerAttest = (frame: Record<string, unknown>): void => {
       if (!authorityOn || attestState !== "pending") return;
@@ -2905,6 +2976,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       attestState = "ok";
       if (containerHasDurableDispatch && deps.pgPool && recoveryExecutor === null) {
         recoveryExecutor = (job) => {
+          if (job.request?._recycleSameDispatch === true) {
+            void replayPreReceiptRecycle(job).catch((error) => {
+              bridgeLog?.warn("user-chat-bridge: recycle readmit replay failed", {
+                jobId: job.jobId,
+                error,
+              });
+            });
+            return;
+          }
           const encoded = Buffer.from(JSON.stringify(job.request), "utf8");
           executeAdmittedTurn(encoded, false, "recovery", undefined, job);
         };
@@ -3541,6 +3621,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       requestHash: string;
       /** Present only for a Master-scheduled automatic recovery. */
       recoveryJob?: ClaimedRecoveryJob;
+      /** Original inbound frame, kept so a pre-receipt recycle can replay this dispatch. */
+      replayFrame?: Record<string, unknown>;
     }
     const admittedDispatches = new Map<string, AdmittedDispatch>();
     type EnrichmentDispatchPhase = "enriching" | "transferring" | "terminalizing" | "transferred";
@@ -3647,6 +3729,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               dispatchOwner: record.leaseOwnerId,
               dispatchLeaseEpoch: record.leaseEpoch,
             });
+          } else if (
+            record.replayFrame
+            && isPreReceiptRecycleReplayCode(failureCode, containerDeathForRecycleReplay)
+          ) {
+            const scheduled = await schedulePreReceiptRecycleReplay(pool, {
+              userId: uid,
+              sessionId: record.sessionId,
+              clientMessageId: record.clientMessageId,
+              dispatchId: record.dispatchId,
+              leaseEpoch: record.leaseEpoch,
+              failureCode,
+              frame: record.replayFrame,
+            });
+            if (scheduled === "scheduled" || scheduled === "pending") {
+              // Same dispatch stays admitted. The next ready container replays it once.
+            } else {
+              await casToTerminal(pool, {
+                dispatchId: record.dispatchId,
+                outcome: "executed_error",
+                failureCode: scheduled === "exhausted"
+                  ? "bridge_closed_during_admission"
+                  : failureCode,
+                clientNotified: false,
+                fromStatuses: ["admitted"],
+                expectedEpoch: record.leaseEpoch,
+              });
+            }
           } else {
             await casToTerminal(pool, {
               dispatchId: record.dispatchId,
@@ -4400,6 +4509,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 }
                 return null;
               }
+              const replayFrame = recoveryJob ? undefined : recycleReplayFrame(frameObj);
               const admittedRecord: AdmittedDispatch = {
                 clientMessageId,
                 sessionId: peerId,
@@ -4412,6 +4522,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 anchorSeq: d.anchorSeq,
                 requestHash,
                 ...(recoveryJob ? { recoveryJob } : {}),
+                ...(replayFrame ? { replayFrame } : {}),
               };
               admittedDispatches.set(clientMessageId, admittedRecord);
               // Own the enrichment phase before observing cleanup. If admission
@@ -9201,6 +9312,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // checkDrainComplete:billing settle 把 inflightCodexTurns.size→0 时调,提前 final
     function cleanup(triggerCause: BridgeCloseCause, force = false): void {
       if (cleaned) return;
+      if (
+        triggerCause === "container_close" ||
+        triggerCause === "container_error" ||
+        triggerCause === "shutdown"
+      ) {
+        containerDeathForRecycleReplay = true;
+      }
       if (!force && !shuttingDown && (hasOpenDispatchStreams() || linkHandle?.keepAlive) &&
           (triggerCause === "client_close" || triggerCause === "backpressure" || triggerCause === "internal_error")) {
         drainCause = triggerCause;

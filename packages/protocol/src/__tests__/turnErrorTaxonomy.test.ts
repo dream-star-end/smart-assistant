@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
+import { USER_ERROR_CATALOG } from '../userErrorCatalog.js'
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   TURN_ERROR_TAXONOMY,
@@ -91,6 +92,7 @@ describe('automatic turn recovery policy', () => {
       'codex_pool_busy',
       'codex_route_unavailable',
       'codex_container_recycled',
+      'bridge_closed_during_admission',
     ]) {
       assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), true, code)
     }
@@ -109,6 +111,20 @@ describe('automatic turn recovery policy', () => {
     ]) {
       assert.equal(supportsAutomaticRecoveryWithoutCheckpoint(code), false, code)
     }
+  })
+
+  it('names a pre-receipt container replacement as one quiet retry', () => {
+    const semantics = TURN_ERROR_TAXONOMY.bridge_closed_during_admission
+    assert.equal(semantics.retryable, true)
+    assert.equal(semantics.automaticRecovery, true)
+    assert.equal(semantics.expected, true)
+    assert.equal(semantics.reportable, false)
+    const entry = USER_ERROR_CATALOG.bridge_closed_during_admission
+    assert.ok(entry)
+    assert.equal(entry.message, '执行环境刚刚更新，这条消息还没开始处理，未扣费。')
+    assert.equal(entry.message.includes('联系管理员'), false)
+    assert.equal(entry.message.includes('bridge_closed'), false)
+    assert.deepEqual([...entry.actions], ['retry'])
   })
 
   it('mints one protocol-valid deterministic identity per source turn', () => {

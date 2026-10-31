@@ -456,6 +456,22 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
     expect(JSON.stringify(p)).not.toMatch(/model_capacity","status|503|"error":\{/);
   });
 
+  test("准入前容器被换：固定一句，不把内部码或联系管理员写进正文", () => {
+    const p = errorPresentation(
+      "bridge_closed_during_admission",
+      "bridge_closed_during_admission 请联系管理员",
+      undefined,
+    );
+    expect(p.title).toBe("这条消息没有开始处理");
+    expect(p.message).toBe("执行环境刚刚更新，这条消息还没开始处理，未扣费。");
+    expect(p.fixedMessage).toBe(true);
+    expect(p.waived).toBe(true);
+    expect(p.message).not.toContain("联系管理员");
+    expect(p.title).not.toContain("联系管理员");
+    expect(p.message).not.toContain("bridge_closed");
+    expect(p.detail ?? "").not.toContain("bridge_closed");
+  });
+
   test("R7:内部 JSON detail 无可提取请求 ID → detail 整个隐去(不外泄)", () => {
     const p = errorPresentation("model_capacity", "", '{"error":"overloaded upstream at run (/srv/x.js:1:2)"}');
     expect(p.detail).toBeUndefined();

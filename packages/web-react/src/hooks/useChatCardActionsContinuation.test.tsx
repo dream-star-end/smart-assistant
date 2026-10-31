@@ -103,6 +103,28 @@ test("a split stopped view hydrates its canonical human source and retains same-
   expect(sock.getMessages("s1")).toEqual(rows);
 });
 
+test("pre-receipt recycle resends the original message instead of a continuation prompt", async () => {
+  const routing = { model: "claude-original", teamMode: false, effortLevel: "high" as const,
+    collabMode: "advisor" as const, advisorModel: "advisor-original", collabConfigVersion: "original-config" };
+  const original = { ...user, text: "原问题原文", _routing: routing };
+  const status = {
+    id: "recycle-status", role: "system", text: "", ts: 2, _source: "server",
+    _turnStatusRecord: true, _dispatchTerminal: true,
+    _errorCode: "bridge_closed_during_admission", _clientMessageId: original.id,
+  } as ChatMessage;
+  const { input, sock } = setup([original, status]);
+  const { result } = renderHook(() => useChatCardActions(input));
+  await result.current.cardCallbacks.onContinueInterrupted!(status);
+  expect(sock.send).toHaveBeenCalledWith(expect.objectContaining({
+    sessId: "s1", agentId: "main", text: "原问题原文", displayText: "原问题原文", ...routing,
+  }));
+  const sent = vi.mocked(sock.send).mock.calls[0]![0] as { text: string; displayText: string };
+  expect(sent.text).not.toContain("原任务目标");
+  expect(sent.displayText).not.toBe("继续");
+  expect(input.send).not.toHaveBeenCalled();
+  expect(sock.continueInterruptedTurn).not.toHaveBeenCalled();
+});
+
 test("checkpoint continuation receives the canonical raw error instead of a presentation clone", async () => {
   const original = { ...user, _routing: { model: "glm-5.2", teamMode: false, effortLevel: "high" } } as ChatMessage;
   const tool = { id: "durable-read", role: "tool", text: "", ts: 2, toolName: "Read", output: "saved",
