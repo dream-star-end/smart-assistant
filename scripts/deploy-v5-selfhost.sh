@@ -248,6 +248,7 @@ cleanup_selfhost_deploy() {
   fi
   # 后台 runtime release 先收尾再释放锁/train;split prepare 子进程继承 artifact fd 9。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
+  master_gate_load_budget_stop
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
   if declare -F lease_train_on_exit >/dev/null 2>&1; then lease_train_on_exit "$exit_rc" || true; fi
   if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then

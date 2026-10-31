@@ -74,7 +74,7 @@ master_build_job_reject() { # <id> <reason>; setup failures also poison future a
 
 master_build_job_start() { # <phase id> <function>, function has explicit failure returns
   local id="$1"; shift
-  local began="$SECONDS" limit load log job_tmp i monitor=0
+  local began="$SECONDS" limit load log job_tmp i monitor=0 MASTER_GATE_ADMISSION_BUDGET=1
   while :; do
     master_build_jobs_poll || return 1
     load="$(master_gate_load1)"

@@ -82,7 +82,7 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     s.stop();
   });
 
-  test("注水任意年龄 exact in-flight：保留身份并进入持续权威对账", () => {
+  test("注水任意年龄 exact in-flight：保留身份，等快照裁定", () => {
     const now = Date.now();
     const s = socket();
     s.loadStored(
@@ -97,8 +97,7 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     const sess = s.sessions.get("s1")!;
     expect(sess._sendingInFlight).toBe(true);
     expect(sess._activeClientMessageId).toBe("u1");
-    expect(sess._reconciling).toBe(true);
-    expect(sess._recoveryStatus?.kind).toBe("waiting-service");
+    expect(sess._recoveryStatus).toBeUndefined();
     expect(sess._turnStartedAt).toBe(now - 20 * 60_000);
     expect(sess._lastFrameAt).toBe(now - 20 * 60_000);
   });
@@ -427,7 +426,6 @@ describe("reducer — resume_failed 落地 dbPut 写点", () => {
     applyResumeFailed(sess, frame, effects);
     // 游标推进到 server currentLast。
     expect(sess._lastFrameSeq).toBe(15);
-    expect(sess._liveStreamBroken).toBe(true);
     // 关键：推进后立即落盘（否则 reload 后 hello 发旧游标 → server 反复 resume 失败）。
     expect(persistSession).toHaveBeenCalledWith("s1");
     expect(forceSync).toHaveBeenCalledWith("s1");

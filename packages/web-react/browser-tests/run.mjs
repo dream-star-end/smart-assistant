@@ -4206,7 +4206,7 @@ await check("T72 INC-20261015-RESUME-REPLAY-LAG: a completion inside the reload 
     result.settledMs === null || result.settledMs > 1000 ||
     result.syncCalls < 1 ||
     result.textLength !== result.expectedLength ||
-    result.domStartCount !== 1 || result.domEndCount !== 0
+    result.domStartCount !== 1 || result.domEndCount !== 1
   ) {
     throw new Error(`重放积压中的完成帧没有立即收口/对账:${JSON.stringify(result)}`);
   }

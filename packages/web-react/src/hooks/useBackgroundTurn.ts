@@ -12,9 +12,11 @@ import {
   type BackgroundTurnNoticeView,
   backgroundSendConfirm,
   backgroundTurnNoticeText,
+  creditsAtReminderLine,
   decideBackgroundTurnNotice,
   isBackgroundTurnOpen,
   runningUserText,
+  turnCreditsLine,
   turnSilenceMs,
 } from "../lib/chat/backgroundTurnNotice";
 import { classifyBackgroundSend } from "../lib/chat/continuationNudge";
@@ -38,6 +40,9 @@ export function useBackgroundTurn({ chat, sess, enabled, queuedCount, compact, c
   const turnOpen = enabled && !!sess && isBackgroundTurnOpen(sess, chat.dispatchStatus(sess.id));
   // 保持期只对同一轮有效:换会话、换轮都从零算。
   const turnKey = turnOpen && sess ? `${sess.id}\u0000${sess._activeClientMessageId ?? ""}` : null;
+  const credits = turnOpen && sess?._turnCredits?.clientMessageId === sess?._activeClientMessageId
+    ? sess?._turnCredits
+    : undefined;
   const holdRef = useRef<{ key: string; at: number } | null>(null);
   const evaluate = (now: number): boolean => {
     if (!sess || turnKey === null) {
@@ -50,6 +55,7 @@ export function useBackgroundTurn({ chat, sess, enabled, queuedCount, compact, c
       detached: isTurnDetached(sess),
       silenceMs: turnSilenceMs(sess, now),
       queuedCount,
+      creditsSettled: credits?.settled,
       lastTriggerAt: holdRef.current?.key === turnKey ? holdRef.current.at : null,
       now,
     });
@@ -72,8 +78,12 @@ export function useBackgroundTurn({ chat, sess, enabled, queuedCount, compact, c
     return () => clearInterval(id);
   }, [turnKey]);
 
-  const notice: BackgroundTurnNoticeView | null = visible
-    ? { text: backgroundTurnNoticeText(compact), compact }
+  const notice: BackgroundTurnNoticeView | null = visible && sess
+    ? {
+        text: backgroundTurnNoticeText(compact, turnCreditsLine(sess, Date.now(), compact)),
+        compact,
+        tone: creditsAtReminderLine(credits?.settled) ? "warning" : "info",
+      }
     : null;
 
   /** 本轮在跑时,「继续」类或重复的消息先软确认;选「先不发」返回 false,Composer 保留草稿。 */

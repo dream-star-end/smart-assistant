@@ -15,7 +15,7 @@ import { useLaneGate } from "./useLaneGate";
 const AUTH_RECOVERY_BACKOFF_MS = [500, 1_000, 2_000, 5_000, 10_000] as const;
 
 /** 已登录的页面被服务端判失效（refresh 明确 invalid，不是主动登出）时给用户的一句话（OCV5-636）。 */
-export const SESSION_EXPIRED_MESSAGE = "登录状态已失效，请重新登录";
+export const SESSION_EXPIRED_MESSAGE = "登录已过期，请重新登录";
 /** 启动续期两轮都撞 REFRESH_RACE（本浏览器的 cookie 已被别处续期替换）时的一句话（OCV5-638）。 */
 export const SESSION_SUPERSEDED_MESSAGE = "登录状态已在其他页面更新，本页没能接上，请重新登录";
 
@@ -59,9 +59,9 @@ export type UseAuthOptions = {
   /** 登出独有的持久层收尾（清本 user 的 IndexedDB 命名空间等；仅非 demo 时调用）。 */
   onLogout?: () => void;
   /**
-   * 本页原本已登录、被服务端判失效（REST/WS 续期明确 invalid）时，在 onClearAuth 之后调用：
-   * App 据此直接给登录表单 + SESSION_EXPIRED_MESSAGE，而不是静默落到营销首页。启动续期失败
-   * （本页从未登录）、主动登出、其它 tab 的登出广播都不触发。
+   * 本页原本已登录，或启动时本浏览器登录过但续期明确 invalid 时，在 onClearAuth 之后调用：
+   * App 据此直接给登录表单 + SESSION_EXPIRED_MESSAGE，而不是静默落到营销首页。
+   * 主动登出、其它 tab 的登出广播、从未登录过的匿名访客不触发。
    */
   onSessionExpired?: () => void;
   /** Hide private UI while retaining valid credentials for an explicit account switch. */
@@ -223,11 +223,15 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // 营销首页、没有任何提示）→ 收尾后补一句失效提示并交给 App 打开登录表单。启动时已经告诉过用户
   // 「本页没能接上」（OCV5-638）、随后重试被服务端判失效，同样提示，不静默落到营销首页。
   const supersededSeenRef = useRef(false);
+  // 启动续期开始时本浏览器已有「登录过」标记。续期明确失效就是用户眼里的登录过期，
+  // 不能因为工作区还没画出来就当成匿名访客，静默丢回营销首页。
+  const bootHadSessionRef = useRef(false);
   expiredUiRef.current = () => {
-    const wasAuthed = authedRef.current || supersededSeenRef.current;
+    const hadSession = authedRef.current || supersededSeenRef.current || bootHadSessionRef.current;
     supersededSeenRef.current = false;
+    bootHadSessionRef.current = false;
     clearAuthState();
-    if (!wasAuthed) return;
+    if (!hadSession) return;
     setAuthError(SESSION_EXPIRED_MESSAGE);
     cbRef.current.onSessionExpired?.();
   };
@@ -307,6 +311,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
   // cleanup 只取消本消费者的 sleep/state commit，不 abort 可能被 REST/WS 共用的 refresh flight。
   useEffect(() => {
     if (!booting) return;
+    bootHadSessionRef.current = hasAuthHint();
     const controller = new AbortController();
     const session = authRef.current;
     const bootEpoch = session.snapshot().epoch;
