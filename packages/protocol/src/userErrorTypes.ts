@@ -6,7 +6,7 @@ export type UserErrorCategory =
 
 export type UserErrorAction =
   | 'retry' | 'switch_model' | 'contact_admin' | 'edit_message' | 'relogin'
-  | 'refresh' | 'topup' | 'new_session' | 'wait' | 'check_settings'
+  | 'refresh' | 'topup' | 'new_session' | 'wait' | 'check_settings' | 'split_upload'
 
 export interface UserError {
   /** Catalog key; machine metadata, never message body. */

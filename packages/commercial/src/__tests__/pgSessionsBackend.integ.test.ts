@@ -5919,6 +5919,63 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     }
   }
 
+  for (const errorCode of ['platform_credential_expired', 'box_capacity_held']) {
+    maybe(`OCV5-679 ${errorCode}: checkpoint queues once, backs off and admits the same billing identity`, async () => {
+      const sessionId = `s-autoerr-${errorCode}`;
+      const sourceClientMessageId = `cm-autoerr-${errorCode}`;
+      await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true });
+      assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 1);
+      const readJobs = () => pool.query(`SELECT * FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId]);
+      const first = (await readJobs()).rows;
+      assert.equal(first.length, 1);
+      assert.equal(first[0].recovery_mode, 'checkpoint');
+      assert.ok(new Date(first[0].next_attempt_at).getTime() - new Date(first[0].created_at).getTime() >= 1900);
+      assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+      assert.deepEqual((await readJobs()).rows, first, 'duplicate scheduling cannot rekey or postpone the job');
+      const identity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 1);
+      const request = first[0].request_json;
+      assert.equal(request.idempotencyKey, identity.idempotencyKey);
+      assert.equal(request.clientMessageId, identity.clientMessageId);
+      assert.equal(request.model, 'gpt-5.6-sol', 'recovery keeps the selected model');
+      assert.equal(request.antigravity, undefined, 'expired credential is not persisted/replayed');
+      const input = admitInput({ sessionId, clientMessageId: identity.clientMessageId,
+        billingRequestId: `brq-${identity.clientMessageId}`,
+        message: { id: identity.clientMessageId, role: 'user', text: request.content.text, ts: 3 },
+        recovery: request.content.recovery });
+      const admitted = await backend.admitUserTurn(input);
+      assert.equal(admitted.kind, 'admitted');
+      const repeated = await backend.admitUserTurn(input);
+      assert.equal(repeated.kind, 'already_owned');
+      const dispatches = await pool.query(`SELECT billing_request_id FROM turn_dispatches
+        WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3`, [UID, sessionId, identity.clientMessageId]);
+      assert.deepEqual(dispatches.rows, [{ billing_request_id: input.billingRequestId }]);
+    });
+
+    maybe(`OCV5-679 ${errorCode}: empty unproven replay remains refused`, async () => {
+      const sessionId = `s-autoerr-empty-${errorCode}`;
+      const sourceClientMessageId = `cm-autoerr-empty-${errorCode}`;
+      await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true, records: [] });
+      assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+      assert.equal((await pool.query(`SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId])).rowCount, 0);
+    });
+
+    maybe(`OCV5-679 ${errorCode}: tenth attempt exhausts instead of scheduling an eleventh`, async () => {
+      const sessionId = `s-autoerr-max-${errorCode}`;
+      const sourceClientMessageId = `cm-autoerr-max-${errorCode}`;
+      await seedRecoverableSource({ sessionId, sourceClientMessageId, errorCode, admitSource: true,
+        records: [{ id: 'checkpoint', role: 'thinking', text: 'saved progress', ts: 2 },
+          { id: 'terminal', role: 'assistant', text: '', ts: 3, _errorCode: errorCode,
+            _clientMessageId: sourceClientMessageId,
+            _automaticRetryRootClientMessageId: sourceClientMessageId,
+            _automaticRetryAttempt: 10, _automaticRetryMax: 10 }] });
+      assert.equal(await backend.reconcileAutomaticRecoveryJobs(UID, 100), 0);
+      const session = await backend.getClientSession(sessionId, CUSER);
+      assert.ok(session?.messages.some((row) =>
+        (row._userError as { code?: string } | undefined)?.code === 'automatic_retry_exhausted'));
+      assert.equal((await pool.query(`SELECT 1 FROM turn_recovery_jobs WHERE session_id=$1`, [sessionId])).rowCount, 0);
+    });
+  }
+
   maybe("lossless anchor recovery trusts interrupted tape waiver without hot error metadata", async () => {
     const sessionId = "s-dd-recovery-lossless-waiver";
     const sourceClientMessageId = "cm-dd-recovery-lossless-waiver";
