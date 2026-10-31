@@ -231,10 +231,11 @@ export interface AgentSession {
     at: number
   }
   _lastNativeCompactionSummary?: string
-  /** Original platform input and observations, scoped to this owner/session/trace. */
-  _compactionOriginal?: import('./compactionArchive.js').CompactionArchiveReference
-  _compactionPendingTools?: Map<string, import('./compactionTasks.js').CompactionActiveTask>
-  /** One logical turn's exact-source wrapper, applied at every retry dispatch. */
+  /** Compaction boundaries observed; recovery is due while above the recovered epoch. */
+  _compactionEpoch?: number
+  _compactionRecoveredEpoch?: number
+  _compactionCapture?: { promise: Promise<import('./compactionRecoveryRuntime.js').CompactionRecoverySources | null>; done: boolean }
+  /** First post-compaction turn's recovery wrapper, applied at every retry dispatch. */
   _compactionRecoverInput?: (input: import('./historicalContextPayload.js').HistoricalTurnInput) => import('./historicalContextPayload.js').HistoricalTurnInput
   /** Signed context owner for the turn that currently holds session.lock. */
   _boxContextOwner?: string

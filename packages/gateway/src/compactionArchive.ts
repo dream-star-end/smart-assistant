@@ -1,7 +1,8 @@
 /** Personal platform originals, never a claim to own an opaque CLI transcript.
- * Snapshots and in-turn fragments are immutable; summaries never enter this store. */
+ * Captured only at compaction boundaries. Timeline records are stored once per
+ * session by content hash; each capture is a small immutable manifest. */
 import { createHash, randomUUID } from 'node:crypto'
-import { constants, closeSync, fsyncSync, openSync, writeFileSync } from 'node:fs'
+import { constants } from 'node:fs'
 import { lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
@@ -27,53 +28,32 @@ export type CompactionArchivePrincipal =
   /** A trusted in-process capability, never a browser-supplied boolean. */
   | { kind: 'ops-trace' }
 
-export interface CompactionArchiveReference {
-  archiveId: string
-  ownerUserId: string
-  sessionId: string
-  traceId?: string
-  source: typeof COMPACTION_ORIGINAL_SOURCE
-  path: string
-  textPath: string
-  contextTextPath: string
-  createdAt: number
-  expiresAt: number
-}
-
-export interface CompactionArchiveSnapshot {
-  schema: 1
+export interface CompactionArchiveManifest {
+  schema: 2
   archiveId: string
   ownerUserId: string
   sessionId: string
   sessionKey: string
   traceId?: string
+  trigger: string
   source: typeof COMPACTION_ORIGINAL_SOURCE
   createdAt: number
   expiresAt: number
   timelineGeneration: number | null
   historyRevision: number | null
   snapshotMaxSeq: number | null
-  timeline: MessageLike[]
-  currentInput: unknown
-  platformContext?: string
-  activeIds?: unknown[]
-}
-
-export interface CompactionTurnOriginal {
-  schema: 1
-  eventId: string
-  archiveId: string
-  sequence: number
-  observedAt: number
-  kind: string
-  payload: unknown
-  pendingTools?: unknown[]
+  /** Content hashes of the exact timeline records, in timeline order. */
+  records: string[]
+  /** Master tape-fallback rows kept with their visible text and reason. */
+  degradedRecords: number
+  currentInput?: unknown
+  /** Platform-visible partial output of the compacting turn, if any. */
+  partial?: unknown
 }
 
 export interface CompactionArchiveRead {
-  snapshot: CompactionArchiveSnapshot
-  reference: CompactionArchiveReference
-  turnOriginals: CompactionTurnOriginal[]
+  manifest: CompactionArchiveManifest
+  timeline: MessageLike[]
 }
 
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex')
@@ -82,14 +62,23 @@ const rootFor = (options: CompactionArchiveOptions): string =>
 const nowFor = (options: CompactionArchiveOptions): number => options.now?.() ?? Date.now()
 const sessionHash = (owner: string, session: string): string => hash(`${owner}\0${session}`)
 const safeId = (id: string): boolean => /^[a-f0-9]{64}$/.test(id)
-const missing = (error: unknown): boolean =>
-  !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
+const errorCode = (error: unknown): unknown => error && typeof error === 'object' && 'code' in error ? error.code : undefined
 const fail = (code: string): never => { throw new Error(code) }
-const activeStages = new Set<string>()
+const sessionDir = (root: string, owner: string, session: string): string => join(root, 'sessions', sessionHash(owner, session))
+
+/** Capture and prune of one session directory never interleave (record GC). */
+const locks = new Map<string, Promise<unknown>>()
+function withLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const next = (locks.get(key) ?? Promise.resolve()).then(run, run)
+  const tail = next.catch(() => {})
+  locks.set(key, tail)
+  void tail.then(() => { if (locks.get(key) === tail) locks.delete(key) })
+  return next
+}
 
 async function privateDirectory(path: string, recursive = false): Promise<void> {
   await mkdir(path, { mode: 0o700, recursive }).catch((error: unknown) => {
-    if (!(error && typeof error === 'object' && 'code' in error && error.code === 'EEXIST')) throw error
+    if (errorCode(error) !== 'EEXIST') throw error
   })
   const stat = await lstat(path)
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o777) !== 0o700 ||
@@ -106,9 +95,17 @@ async function privateRead(path: string): Promise<string> {
   } finally { await file.close() }
 }
 
-async function writeImmutable(path: string, value: string): Promise<void> {
-  const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+/** Exclusive create; an existing record with the same hash is the same bytes. */
+async function writeImmutable(path: string, value: string, existingOk = false): Promise<boolean> {
+  let file
+  try {
+    file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+  } catch (error) {
+    if (existingOk && errorCode(error) === 'EEXIST') return false
+    throw error
+  }
   try { await file.writeFile(value, 'utf8'); await file.sync() } finally { await file.close() }
+  return true
 }
 
 async function syncDirectory(path: string): Promise<void> {
@@ -172,154 +169,88 @@ export async function readFullCompactionTimeline(
   return fail('COMPACTION_ARCHIVE_TIMELINE_CHANGED')
 }
 
-function referenceFor(snapshot: CompactionArchiveSnapshot, root: string): CompactionArchiveReference {
-  const dir = join(root, 'sessions', sessionHash(snapshot.ownerUserId, snapshot.sessionId), snapshot.archiveId)
-  const textPath = join(dir, 'original.txt')
-  return {
-    archiveId: snapshot.archiveId, ownerUserId: snapshot.ownerUserId, sessionId: snapshot.sessionId,
-    ...(snapshot.traceId ? { traceId: snapshot.traceId } : {}), source: snapshot.source,
-    path: join(dir, 'snapshot.json'), textPath, contextTextPath: join(dir, 'recovery-context.txt'),
-    createdAt: snapshot.createdAt, expiresAt: snapshot.expiresAt,
-  }
-}
-
-/** Capture under the caller's session lock, before handing anything to a CLI. */
+/** Best-effort audit copy at a compaction boundary. Callers run it off the
+ * send path and only log failures. */
 export async function captureCompactionOriginal(input: {
   ownerUserId: string
   sessionId: string
   sessionKey: string
   traceId?: string
-  currentInput: unknown
-  platformContext?: string | ((timeline: readonly MessageLike[]) => string | Promise<string>)
-  activeIds?: unknown[]
+  trigger?: string
+  currentInput?: unknown
+  partial?: unknown
   allowMissingTimeline?: boolean
-}, options: CompactionArchiveOptions = {}): Promise<{
-  snapshot: CompactionArchiveSnapshot
-  reference: CompactionArchiveReference
-}> {
+}, options: CompactionArchiveOptions = {}): Promise<{ manifest: CompactionArchiveManifest; timeline: MessageLike[] }> {
   // Freeze caller-owned input before pagination yields to later engine output.
-  const contextBuilder = typeof input.platformContext === 'function'
-    ? input.platformContext as (timeline: readonly MessageLike[]) => string | Promise<string>
-    : undefined
-  const frozen = structuredClone({ ...input, platformContext:
-    typeof input.platformContext === 'string' ? input.platformContext : undefined })
+  const frozen = structuredClone(input)
   if (!frozen.ownerUserId || !frozen.sessionId || !frozen.sessionKey) fail('COMPACTION_ARCHIVE_IDENTITY_REQUIRED')
-  const timeline = await readFullCompactionTimeline(frozen.sessionId, frozen.ownerUserId, {
+  const { timeline, ...versions } = await readFullCompactionTimeline(frozen.sessionId, frozen.ownerUserId, {
     ...options, allowMissingTimeline: frozen.allowMissingTimeline,
   })
-  if (contextBuilder) frozen.platformContext = await contextBuilder(structuredClone(timeline.timeline))
-  const createdAt = nowFor(options)
-  const snapshot: CompactionArchiveSnapshot = {
-    schema: 1, archiveId: hash(randomUUID()), ownerUserId: frozen.ownerUserId,
-    sessionId: frozen.sessionId, sessionKey: frozen.sessionKey,
-    ...(frozen.traceId ? { traceId: frozen.traceId } : {}),
-    source: COMPACTION_ORIGINAL_SOURCE, createdAt,
-    expiresAt: createdAt + COMPACTION_ORIGINAL_RETENTION_MS, ...timeline,
-    currentInput: frozen.currentInput,
-    ...(frozen.platformContext !== undefined ? { platformContext: frozen.platformContext } : {}),
-    ...(frozen.activeIds ? { activeIds: frozen.activeIds } : {}),
-  }
   const root = rootFor(options)
-  await privateDirectory(root, true)
-  await privateDirectory(join(root, 'sessions'))
-  await privateDirectory(join(root, 'traces'))
-  await maybePrune(root, options)
-  const parent = join(root, 'sessions', sessionHash(snapshot.ownerUserId, snapshot.sessionId))
-  await privateDirectory(parent)
-  const stage = join(parent, `.stage-${snapshot.archiveId}`)
-  await privateDirectory(stage)
-  activeStages.add(stage)
-  try {
-    await privateDirectory(join(stage, 'turn-originals'))
-    await writeImmutable(join(stage, 'snapshot.json'), JSON.stringify(snapshot))
-    const platformText = typeof snapshot.platformContext === 'string'
-      ? snapshot.platformContext : JSON.stringify(snapshot.platformContext ?? null, null, 2)
-    // The model reads only the exact recovery sources. The audit/trace copy
-    // retains the entire timeline, which can be far larger than a CLI window.
-    await writeImmutable(join(stage, 'recovery-context.txt'), platformText)
-    await writeImmutable(join(stage, 'original.txt'), [
-      'Source: platform-full-timeline. Native CLI internal transcripts may contain additional material.',
-      '\nAuthoritative platform context:\n', platformText,
-      '\nExact platform timeline:\n', JSON.stringify(snapshot.timeline, null, 2),
-      '\nExact current input:\n', typeof snapshot.currentInput === 'string'
-        ? snapshot.currentInput : JSON.stringify(snapshot.currentInput, null, 2),
-    ].join('\n'))
-    await syncDirectory(stage)
-    const target = join(parent, snapshot.archiveId)
-    await rename(stage, target)
-    await syncDirectory(parent)
-    if (snapshot.traceId) {
-      const traceDir = join(root, 'traces', hash(snapshot.traceId))
+  const dir = sessionDir(root, frozen.ownerUserId, frozen.sessionId)
+  return withLock(dir, async () => {
+    await privateDirectory(root, true)
+    for (const sub of ['sessions', 'traces']) await privateDirectory(join(root, sub))
+    await privateDirectory(dir)
+    await privateDirectory(join(dir, 'records'))
+    await privateDirectory(join(dir, 'captures'))
+    const records: string[] = []
+    let wrote = false
+    for (const record of timeline) {
+      const json = JSON.stringify(record)
+      const id = hash(json)
+      records.push(id)
+      if (await writeImmutable(join(dir, 'records', `${id}.json`), json, true)) wrote = true
+    }
+    if (wrote) await syncDirectory(join(dir, 'records'))
+    const createdAt = nowFor(options)
+    const manifest: CompactionArchiveManifest = {
+      schema: 2, archiveId: hash(randomUUID()), ownerUserId: frozen.ownerUserId,
+      sessionId: frozen.sessionId, sessionKey: frozen.sessionKey,
+      ...(frozen.traceId ? { traceId: frozen.traceId } : {}),
+      trigger: frozen.trigger ?? 'compaction', source: COMPACTION_ORIGINAL_SOURCE,
+      createdAt, expiresAt: createdAt + COMPACTION_ORIGINAL_RETENTION_MS, ...versions, records,
+      degradedRecords: timeline.filter(record => record._displayDegraded === true).length,
+      ...(frozen.currentInput !== undefined ? { currentInput: frozen.currentInput } : {}),
+      ...(frozen.partial !== undefined ? { partial: frozen.partial } : {}),
+    }
+    // Publish the manifest atomically, only after every record it names is durable.
+    const staged = join(dir, 'captures', `.${manifest.archiveId}.tmp`)
+    await writeImmutable(staged, JSON.stringify(manifest))
+    await rename(staged, join(dir, 'captures', `${manifest.archiveId}.json`))
+    await syncDirectory(join(dir, 'captures'))
+    if (manifest.traceId) {
+      const traceDir = join(root, 'traces', hash(manifest.traceId))
       await privateDirectory(traceDir)
-      await writeImmutable(join(traceDir, `${snapshot.archiveId}.json`), JSON.stringify({
-        ownerUserId: snapshot.ownerUserId, sessionId: snapshot.sessionId, archiveId: snapshot.archiveId,
-        traceId: snapshot.traceId, createdAt, expiresAt: snapshot.expiresAt,
+      await writeImmutable(join(traceDir, `${manifest.archiveId}.json`), JSON.stringify({
+        ownerUserId: manifest.ownerUserId, sessionId: manifest.sessionId, archiveId: manifest.archiveId,
+        traceId: manifest.traceId, createdAt, expiresAt: manifest.expiresAt,
       }))
       await syncDirectory(traceDir)
     }
-    return { snapshot, reference: referenceFor(snapshot, root) }
-  } catch (error) {
-    await rm(stage, { recursive: true, force: true }).catch(() => {})
-    throw error
-  } finally {
-    activeStages.delete(stage)
-  }
+    return { manifest, timeline }
+  })
 }
 
-const sequences = new Map<string, number>()
-
-/** Call synchronously when compacting is observed, then catch failures in the
- * engine callback. A fresh immutable fragment preserves every exact snapshot. */
-export function appendCompactionTurnOriginal(reference: CompactionArchiveReference, input: {
-  kind: string
-  payload: unknown
-  pendingTools?: unknown[]
-}, options: CompactionArchiveOptions = {}): { eventId: string; path: string } {
-  const frozen = structuredClone(input)
-  const observedAt = nowFor(options)
-  if (reference.expiresAt <= observedAt) fail('COMPACTION_ARCHIVE_EXPIRED')
-  if (!safeId(reference.archiveId)) fail('COMPACTION_ARCHIVE_INVALID_ID')
-  const root = rootFor(options)
-  const dir = join(root, 'sessions', sessionHash(reference.ownerUserId, reference.sessionId), reference.archiveId, 'turn-originals')
-  const key = `${root}\0${reference.archiveId}`
-  const sequence = (sequences.get(key) ?? 0) + 1
-  sequences.set(key, sequence)
-  const eventId = randomUUID()
-  const event: CompactionTurnOriginal = {
-    schema: 1, eventId, archiveId: reference.archiveId, sequence, observedAt, ...frozen,
-  }
-  const path = join(dir, `${observedAt}-${eventId}.json`)
-  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
-  try { writeFileSync(fd, JSON.stringify(event), 'utf8'); fsyncSync(fd) } finally { closeSync(fd) }
-  const dirFd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW)
-  try { fsyncSync(dirFd) } finally { closeSync(dirFd) }
-  return { eventId, path }
-}
-
-async function loadSnapshot(root: string, owner: string, sessionId: string, archiveId: string, now: number): Promise<CompactionArchiveSnapshot | null> {
+async function loadCapture(root: string, owner: string, sessionId: string, archiveId: string, now: number): Promise<CompactionArchiveRead | null> {
   if (!safeId(archiveId)) return null
+  const dir = sessionDir(root, owner, sessionId)
+  let manifest: CompactionArchiveManifest
   try {
-    const dir = join(root, 'sessions', sessionHash(owner, sessionId), archiveId)
-    const snapshot = JSON.parse(await privateRead(join(dir, 'snapshot.json'))) as CompactionArchiveSnapshot
-    if (snapshot.schema !== 1 || snapshot.source !== COMPACTION_ORIGINAL_SOURCE || snapshot.archiveId !== archiveId ||
-        snapshot.ownerUserId !== owner || snapshot.sessionId !== sessionId || !Array.isArray(snapshot.timeline) ||
-        !Number.isFinite(snapshot.expiresAt) || snapshot.expiresAt <= now) return null
-    return snapshot
-  } catch (error) { if (missing(error)) return null; throw error }
-}
-
-async function readWithFragments(snapshot: CompactionArchiveSnapshot, root: string): Promise<CompactionArchiveRead> {
-  const reference = referenceFor(snapshot, root)
-  const dir = join(root, 'sessions', sessionHash(snapshot.ownerUserId, snapshot.sessionId), snapshot.archiveId, 'turn-originals')
-  const turnOriginals: CompactionTurnOriginal[] = []
-  for (const name of await readdir(dir)) {
-    if (!/^\d+-[a-f0-9-]+\.json$/.test(name)) continue
-    const value = JSON.parse(await privateRead(join(dir, name))) as CompactionTurnOriginal
-    if (value.schema !== 1 || value.archiveId !== snapshot.archiveId) fail('COMPACTION_ARCHIVE_INVALID_FRAGMENT')
-    turnOriginals.push(value)
+    manifest = JSON.parse(await privateRead(join(dir, 'captures', `${archiveId}.json`))) as CompactionArchiveManifest
+  } catch (error) { if (errorCode(error) === 'ENOENT') return null; throw error }
+  if (manifest.schema !== 2 || manifest.source !== COMPACTION_ORIGINAL_SOURCE || manifest.archiveId !== archiveId ||
+      manifest.ownerUserId !== owner || manifest.sessionId !== sessionId || !Array.isArray(manifest.records) ||
+      !Number.isFinite(manifest.expiresAt) || manifest.expiresAt <= now) return null
+  const timeline: MessageLike[] = []
+  for (const id of manifest.records) {
+    if (!safeId(id)) fail('COMPACTION_ARCHIVE_INVALID_MANIFEST')
+    const json = await privateRead(join(dir, 'records', `${id}.json`))
+    if (hash(json) !== id) fail('COMPACTION_ARCHIVE_RECORD_INTEGRITY')
+    timeline.push(JSON.parse(json) as MessageLike)
   }
-  turnOriginals.sort((a, b) => a.observedAt - b.observedAt || a.sequence - b.sequence || a.eventId.localeCompare(b.eventId))
-  return { snapshot, reference, turnOriginals }
+  return { manifest, timeline }
 }
 
 /** Owner reads are exact-session scoped. Ops access is deliberately trace-only. */
@@ -329,9 +260,7 @@ export async function readCompactionOriginal(input: {
   principal: CompactionArchivePrincipal
 }, options: CompactionArchiveOptions = {}): Promise<CompactionArchiveRead | null> {
   if (input.principal.kind !== 'owner') return null
-  const root = rootFor(options)
-  const snapshot = await loadSnapshot(root, input.principal.userId, input.sessionId, input.archiveId, nowFor(options))
-  return snapshot ? readWithFragments(snapshot, root) : null
+  return loadCapture(rootFor(options), input.principal.userId, input.sessionId, input.archiveId, nowFor(options))
 }
 
 export async function readCompactionOriginalByTrace(input: {
@@ -342,89 +271,77 @@ export async function readCompactionOriginalByTrace(input: {
   const root = rootFor(options)
   const dir = join(root, 'traces', hash(input.traceId))
   let names: string[]
-  try { names = await readdir(dir) } catch (error) { if (missing(error)) return null; throw error }
-  const snapshots: CompactionArchiveSnapshot[] = []
+  try { names = await readdir(dir) } catch (error) { if (errorCode(error) === 'ENOENT') return null; throw error }
+  let latest: CompactionArchiveRead | null = null
   for (const name of names) {
     if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
     const index = JSON.parse(await privateRead(join(dir, name))) as {
       ownerUserId: string; sessionId: string; archiveId: string; traceId: string
     }
     if (index.traceId !== input.traceId || (input.principal.kind === 'owner' && index.ownerUserId !== input.principal.userId)) continue
-    const snapshot = await loadSnapshot(root, index.ownerUserId, index.sessionId, index.archiveId, nowFor(options))
-    if (snapshot?.traceId === input.traceId) snapshots.push(snapshot)
+    const read = await loadCapture(root, index.ownerUserId, index.sessionId, index.archiveId, nowFor(options))
+    if (read?.manifest.traceId === input.traceId &&
+        (!latest || read.manifest.createdAt > latest.manifest.createdAt)) latest = read
   }
-  snapshots.sort((a, b) => b.createdAt - a.createdAt || b.archiveId.localeCompare(a.archiveId))
-  return snapshots[0] ? readWithFragments(snapshots[0], root) : null
+  return latest
 }
 
-const lastPrune = new Map<string, number>()
-async function maybePrune(root: string, options: CompactionArchiveOptions): Promise<void> {
-  const now = nowFor(options)
-  const previous = lastPrune.get(root)
-  if (previous !== undefined && now - previous < 60 * 60_000) return
-  await pruneCompactionOriginals(options)
-  lastPrune.set(root, now)
+/** Expired manifests go first; records no live manifest names are then removed. */
+async function pruneSession(root: string, dir: string, now: number): Promise<number> {
+  let removed = 0
+  const live = new Set<string>()
+  let names: string[]
+  try { names = await readdir(join(dir, 'captures')) } catch (error) { if (errorCode(error) === 'ENOENT') names = []; else throw error }
+  for (const name of names) {
+    const path = join(dir, 'captures', name)
+    if (/^\.[a-f0-9]{64}\.tmp$/.test(name)) {
+      // Crash leftover: a manifest that was never published.
+      if ((await lstat(path)).mtimeMs < now - 60 * 60_000) await rm(path, { force: true })
+      continue
+    }
+    if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
+    const manifest = JSON.parse(await privateRead(path)) as CompactionArchiveManifest
+    if (manifest.schema !== 2 || `${manifest.archiveId}.json` !== name || !Array.isArray(manifest.records) ||
+        !Number.isFinite(manifest.expiresAt)) fail('COMPACTION_ARCHIVE_INVALID_MANIFEST')
+    if (manifest.expiresAt > now) { for (const id of manifest.records) live.add(id); continue }
+    await rm(path)
+    if (manifest.traceId) await rm(join(root, 'traces', hash(manifest.traceId), name), { force: true })
+    removed++
+  }
+  let records: string[]
+  try { records = await readdir(join(dir, 'records')) } catch (error) { if (errorCode(error) === 'ENOENT') records = []; else throw error }
+  for (const name of records) {
+    if (/^[a-f0-9]{64}\.json$/.test(name) && !live.has(name.slice(0, 64))) await rm(join(dir, 'records', name))
+  }
+  if (live.size === 0 && !names.some(name => name.endsWith('.tmp'))) await rm(dir, { recursive: true, force: true })
+  return removed
 }
 
 const pruning = new Map<string, Promise<{ removed: number }>>()
 
-/** Timer and foreground capture share one sweep per root. A concurrent capture
- * cannot fail merely because another sweep already removed an expired row. */
+/** Timer sweeps coalesce per root; each session is pruned under its capture lock. */
 export function pruneCompactionOriginals(options: CompactionArchiveOptions = {}): Promise<{ removed: number }> {
   const root = rootFor(options)
   const current = pruning.get(root)
   if (current) return current
-  const pending = pruneCompactionOriginalsImpl(options)
+  const pending = (async () => {
+    const now = nowFor(options)
+    let sessions: string[]
+    try { sessions = await readdir(join(root, 'sessions')) } catch (error) { if (errorCode(error) === 'ENOENT') return { removed: 0 }; throw error }
+    let removed = 0
+    for (const session of sessions) {
+      if (!safeId(session)) continue
+      const dir = join(root, 'sessions', session)
+      const stat = await lstat(dir)
+      if (!stat.isDirectory() || stat.isSymbolicLink()) fail('COMPACTION_ARCHIVE_PRIVATE_DIRECTORY')
+      removed += await withLock(dir, () => pruneSession(root, dir, now))
+    }
+    return { removed }
+  })()
   pruning.set(root, pending)
   const release = () => { if (pruning.get(root) === pending) pruning.delete(root) }
-  // Both branches consume their result, so housekeeping never creates an
-  // unobserved rejecting Promise in addition to the caller's own Promise.
   void pending.then(release, release)
   return pending
-}
-
-/** Fragment files share their snapshot's retention; no orphan fragment store. */
-async function pruneCompactionOriginalsImpl(options: CompactionArchiveOptions): Promise<{ removed: number }> {
-  const root = rootFor(options)
-  const now = nowFor(options)
-  let sessions: string[]
-  try { sessions = await readdir(join(root, 'sessions')) } catch (error) { if (missing(error)) return { removed: 0 }; throw error }
-  let removed = 0
-  for (const session of sessions) {
-    if (!safeId(session)) continue
-    const parent = join(root, 'sessions', session)
-    const parentStat = await lstat(parent)
-    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) fail('COMPACTION_ARCHIVE_PRIVATE_DIRECTORY')
-    for (const id of await readdir(parent)) {
-      if (/^\.stage-[a-f0-9]{64}$/.test(id)) {
-        const stage = join(parent, id)
-        if (activeStages.has(stage)) continue
-        const stageStat = await lstat(stage)
-        if (!stageStat.isDirectory() || stageStat.isSymbolicLink() || stageStat.uid !== process.getuid?.() ||
-            (stageStat.mode & 0o777) !== 0o700) fail('COMPACTION_ARCHIVE_PRIVATE_DIRECTORY')
-        // No manifest is required: a process can crash before snapshot.json
-        // exists. Exact naming, private ownership and the full age window
-        // distinguish abandoned staging from unrelated or active files.
-        if (stageStat.mtimeMs >= now - COMPACTION_ORIGINAL_RETENTION_MS) continue
-        await rm(stage, { recursive: true })
-        removed++
-        continue
-      }
-      if (!safeId(id)) continue
-      const dir = join(parent, id)
-      const snapshot = JSON.parse(await privateRead(join(dir, 'snapshot.json'))) as CompactionArchiveSnapshot
-      if (snapshot.schema !== 1 || snapshot.archiveId !== id ||
-          sessionHash(snapshot.ownerUserId, snapshot.sessionId) !== session || !Number.isFinite(snapshot.expiresAt)) {
-        fail('COMPACTION_ARCHIVE_INVALID_SNAPSHOT')
-      }
-      if (snapshot.expiresAt > now) continue
-      await rm(dir, { recursive: true })
-      sequences.delete(`${root}\0${id}`)
-      if (snapshot.traceId) await rm(join(root, 'traces', hash(snapshot.traceId), `${id}.json`), { force: true })
-      removed++
-    }
-  }
-  return { removed }
 }
 
 /** Enforce retention even if the user never sends another message. Stopping
@@ -434,16 +351,12 @@ export function startCompactionArchiveCleanup(
   onError: (error: unknown) => void | Promise<void> = () => {},
 ): () => void {
   let stopped = false
-  let running = false
   const run = async (): Promise<void> => {
-    if (stopped || running) return
-    running = true
+    if (stopped) return
     try {
       await pruneCompactionOriginals(options)
     } catch (error) {
       try { await onError(error) } catch { /* Logging cannot reject the timer task. */ }
-    } finally {
-      running = false
     }
   }
   void run()

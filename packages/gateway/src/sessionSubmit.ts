@@ -1,5 +1,5 @@
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
-import { prepareCompactionTurn } from './compactionRecoveryRuntime.js'
+import { noteCompactionBoundary, prepareCompactionRecovery } from './compactionRecoveryRuntime.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
@@ -102,7 +102,6 @@ import {
   modelHistorySemanticRole,
   modelHistorySemanticText,
   type GoalStateSnapshot,
-  type PromptPrivacyPolicy,
   type ServiceTier,
   type SessionWorkspaceMode,
 } from '@openclaude/protocol'
@@ -770,11 +769,7 @@ export async function submit(
     const assertSessionCurrent = () => {
       if (session._plannedTeardown || session._replacing || session.runner !== privacyRunner) throw new Error('SESSION_PRIVACY_OPERATION_CANCELLED')
     }
-    let compactionPromptPolicy: PromptPrivacyPolicy | undefined
-    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, {
-      assertCurrent: assertSessionCurrent,
-      onPrepared: policy => { compactionPromptPolicy = policy },
-    })
+    const privacyChanged = await prepareRunnerPromptPrivacy(privacyRunner, session.peerId, { assertCurrent: assertSessionCurrent })
     const maybeSetCodexRoute = (session.runner as any).setCodexRoute
     if (typeof maybeSetCodexRoute === 'function') {
       maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
@@ -1266,18 +1261,11 @@ export async function submit(
         log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
       }
     }
-    // Snapshot before a CLI can compact (including Codex's pre-turn 80% path).
-    // Native slash commands stay byte-for-byte commands; ordinary inputs and
-    // overflow attempts all carry the same original-source recovery contract.
-    if (!opts?.modelSwitchInternal) {
-      const recover = await prepareCompactionTurn(
-        session, userTextOrBlocks, compactionPromptPolicy,
-        () => this.readCompactionTasks?.(session.sessionKey) ?? [],
-      )
+    // Only the first dispatch after an observed compaction carries the
+    // original-source recovery contract; preparing it never fails the turn.
+    if (!opts?.modelSwitchInternal && !isCcbSlashCommandPrompt(userTextOrBlocks)) {
+      session._compactionRecoverInput = await prepareCompactionRecovery(session, () => this.readCompactionTasks?.(session.sessionKey) ?? [])
       assertSessionCurrent()
-      if (recover && !isCcbSlashCommandPrompt(userTextOrBlocks)) {
-        session._compactionRecoverInput = recover
-      }
     }
     // Auto-name session from first user turn
     if (session.turns === 0 && session.currentUserText) {
@@ -2431,6 +2419,7 @@ export async function finishIdleUnderLock(
       }
       session._idleRunning = true
       session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+      noteCompactionBoundary(session, 'box_idle_compact')
       try {
         assertIdleCurrent()
         const settled = await runBoxIdleTurn(privacyRunner, {

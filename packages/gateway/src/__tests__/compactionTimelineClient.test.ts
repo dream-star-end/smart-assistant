@@ -65,11 +65,16 @@ test('remote errors and incomplete credentials never fall back to local stale hi
   assert.equal(localReads, 0)
 })
 
+test('degraded tape-fallback rows are accepted with their reason', async () => {
+  const messages = [{ id: 'fallback', text: 'projection', _displayDegraded: true, _displayDegradeReason: 'records_unpublished' }]
+  const read = await createCompactionTimelineReader({ env, fetcher: fetcher(response(wire({ ...page, messages }))) })('session-raw-1', 'c:765')
+  assert.deepEqual(read?.messages, messages)
+})
+
 test('wrong owner, deferred placeholders, truncated bytes and an explicit ceiling fail closed', async () => {
   for (const result of [
     response(wire(page, 'c:other')),
     response(wire({ ...page, messages: [{ id: 'locator', text: '', _payloadDeferred: true }] })),
-    response(wire({ ...page, messages: [{ id: 'fallback', text: 'projection', _displayDegraded: true }] })),
     response(wire({ ...page, hasMore: true, nextCursor: null })),
     response(wire({ ...page, hasMore: true, nextCursor: { version: 1, timelineGeneration: 2, beforeOrderSeq: -1 } })),
     response(wire(), { sha: '0'.repeat(64) }),

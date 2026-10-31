@@ -140,11 +140,19 @@ test('hydration failure or explicit page ceiling never returns a partial success
   assert.equal(tooLarge.status, 413)
   assert.equal(tooLarge.json.error.code, 'COMPACTION_TIMELINE_PAGE_TOO_LARGE')
   assert.equal(tooLarge.json.page, undefined)
-  const degraded = await call({ deps: { readPage: async () => ({ ...page,
-    messages: [{ id: 'fallback', text: 'visible head projection', _displayDegraded: true }] }) } })
-  assert.equal(degraded.status, 503)
-  assert.equal(degraded.json.page, undefined)
 })
+
+// Acceptance GAP-A0 (#1309): production PG emits tape-fallback rows for these
+// reasons; each one used to turn the whole timeline into a 503.
+for (const reason of ['records_failed', 'records_unpublished', 'tape_hash_mismatch', 'finalized_tape_missing']) {
+  test(`GAP-A0: a ${reason} tape-fallback row is returned with its visible text and reason`, async () => {
+    const fallback = { id: 'a1', role: 'assistant', text: 'visible fallback', _turnTapeId: 't'.repeat(64),
+      _displayDegraded: true, _displayDegradeReason: reason }
+    const result = await call({ deps: { readPage: async () => ({ ...page, messages: [page.messages[0]!, fallback] }) } })
+    assert.equal(result.status, 200)
+    assert.deepEqual(result.json.page.messages, [page.messages[0], fallback])
+  })
+}
 
 test('oversized deferred pages shrink through storage cursors and recover every original plus the terminal', async () => {
   // Scale the review's 33 x 2 MiB / 64 MiB counterexample down by 1024 so

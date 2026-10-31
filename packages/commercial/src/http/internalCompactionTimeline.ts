@@ -25,10 +25,9 @@ type Deps = {
 }
 const digest = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex')
 
+/** Tape-fallback rows (_displayDegraded) are inline visible text that keeps
+ * its degrade reason; one degraded unit never makes the whole timeline fail. */
 async function hydrateOriginal(record: MessageLike, sessionId: string, owner: string, deps: Deps): Promise<MessageLike> {
-  if (record._displayDegraded === true || record._displayDegradeReason !== undefined) {
-    throw new Error('TIMELINE_ORIGINAL_UNAVAILABLE')
-  }
   if (record._payloadDeferred !== true) return record
   if (typeof record.id !== 'string') throw new Error('DEFERRED_RECORD_ID')
   const read = (offset: number, length: number) => record._userPayloadDeferred === true

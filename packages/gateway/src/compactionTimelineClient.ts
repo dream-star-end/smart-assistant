@@ -69,7 +69,7 @@ export function createCompactionTimelineReader(deps: {
     if (result?.ownerUserId !== ownerUserId || result.sessionId !== sessionId ||
         !result.page || !Array.isArray(result.page.messages) ||
         result.page.messages.some(message => !message || typeof message !== 'object' || Array.isArray(message) ||
-          message._payloadDeferred === true || message._displayDegraded === true || message._displayDegradeReason !== undefined) ||
+          message._payloadDeferred === true) ||
         !Number.isSafeInteger(result.page.timelineGeneration) || result.page.timelineGeneration < 1 ||
         !Number.isSafeInteger(result.page.historyRevision) || result.page.historyRevision < 0 ||
         !Number.isSafeInteger(result.page.snapshotMaxSeq) || result.page.snapshotMaxSeq < 0 ||

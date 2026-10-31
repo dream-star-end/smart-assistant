@@ -1,94 +1,121 @@
-import { modelHistorySemanticRole, modelHistorySemanticText, type PromptPrivacyPolicy } from '@openclaude/protocol'
-import { captureCompactionOriginal, appendCompactionTurnOriginal } from './compactionArchive.js'
-import { attachCompactionRecoveryContext, buildCompactionRecoveryContext } from './compactionContract.js'
+import { modelHistorySemanticRole, modelHistorySemanticText } from '@openclaude/protocol'
+import type { MessageLike } from '@openclaude/storage'
+import { captureCompactionOriginal } from './compactionArchive.js'
+import {
+  attachCompactionRecoveryContext,
+  renderCompactionRecoveryContext,
+  type OriginalUserInstruction,
+} from './compactionContract.js'
 import { personalCompactionEnabled, type CompactionActiveTask } from './compactionTasks.js'
 import type { HistoricalTurnInput } from './historicalContextPayload.js'
 import type { AgentSession } from './sessionTypes.js'
 import type { EngineEvent, PartialSnapshot } from './engine/engineEvents.js'
 import { log } from './sessionManagerLog.js'
 
-export async function prepareCompactionTurn(
-  session: AgentSession,
-  originalInput: HistoricalTurnInput,
-  policy: PromptPrivacyPolicy | undefined,
-  tasks: readonly CompactionActiveTask[] | (() => readonly CompactionActiveTask[]) = [],
-) {
-  if (!personalCompactionEnabled() || session.channel !== 'webchat') return null
-  const readTasks = () => [...(typeof tasks === 'function' ? tasks() : tasks), ...(session._compactionPendingTools?.values() ?? [])]
-  const activeTasks = readTasks()
-  const agent = session._identityCreationOpts?.agent
-  const captured = await captureCompactionOriginal({
-    ownerUserId: session.userId ?? 'default', sessionId: session.peerId,
-    sessionKey: session.sessionKey, traceId: session._currentTurnTraceId,
-    currentInput: originalInput, activeIds: activeTasks, allowMissingTimeline: session.turns === 0,
-    platformContext: async timeline => {
-      const userInstructions = timeline.filter(message => modelHistorySemanticRole(message) === 'user')
-        .map((message, index) => ({
-          id: typeof message.id === 'string' ? message.id : `source-${index}`,
-          text: modelHistorySemanticText(message),
-          orderSeq: typeof message._seq === 'number' ? message._seq : undefined,
-        }))
-      const plan = timeline.filter(message => message.role === 'plan').at(-1)
-      return (await buildCompactionRecoveryContext({
-        promptContext: {
-          agentId: session.agentId, sessionKey: session.sessionKey, sessionId: session.peerId,
-          persona: agent?.persona, identityCompat: session._identityCompat?.assets,
-          provider: session.providerTag === 'codex' ? 'codex-native' : session.providerTag,
-          model: session.model, effortLevel: session.runner.effortLevel,
-          promptPolicy: policy,
-          projectId: session.projectId ?? undefined,
-          frozenProjectContext: session.frozenProjectContext,
-          // Recovery reasserts rules; the native spawn owns the actual tool catalog.
-          availableMcpTools: [],
-        },
-        userInstructions,
-        currentUserText: typeof originalInput === 'string' ? originalInput : originalInput
-          .flatMap(block => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n'),
-        plan, goal: session._platformGoal, activeTasks,
-      })).text
-    },
-  })
-  session._compactionOriginal = captured.reference
-  return (input: HistoricalTurnInput): HistoricalTurnInput => attachCompactionRecoveryContext(input, {
-    context: typeof captured.snapshot.platformContext === 'string' ? captured.snapshot.platformContext : '',
-    textReference: captured.reference.contextTextPath,
-    activeTasks: readTasks(),
-    // Antigravity budgets its complete JSON stdin envelope and can externalize
-    // even the current input. Preserve that existing fallback instead of
-    // rejecting here before its adapter can publish the exact file reference.
-    maxPromptBytes: session.providerTag === 'antigravity' ? undefined : session.runner.capabilities.maxPromptBytes,
-  })
+/** Longest the first turn after a compaction waits for a capture still in flight. */
+export const COMPACTION_SOURCE_WAIT_MS = 10_000
+
+export interface CompactionRecoverySources {
+  archiveId: string
+  userInstructions: OriginalUserInstruction[]
+  plan?: unknown
 }
 
-/** Preserve platform-visible original output before any compact boundary.
- * Opaque native CLI internals are deliberately not described as platform text. */
+const enabledFor = (session: AgentSession): boolean =>
+  personalCompactionEnabled() && session.channel === 'webchat'
+
+function sourcesFrom(timeline: readonly MessageLike[], archiveId: string, currentInput?: string): CompactionRecoverySources {
+  const userInstructions = timeline.filter(message => modelHistorySemanticRole(message) === 'user')
+    .map((message, index) => ({
+      id: typeof message.id === 'string' ? message.id : `source-${index}`,
+      text: modelHistorySemanticText(message),
+      ...(typeof message._seq === 'number' ? { orderSeq: message._seq } : {}),
+    }))
+  // The compacting turn's own request may not be persisted yet.
+  if (currentInput && userInstructions.at(-1)?.text !== currentInput) {
+    userInstructions.push({ id: 'compacting-turn-input', text: currentInput })
+  }
+  return { archiveId, userInstructions, plan: timeline.filter(message => message.role === 'plan').at(-1) }
+}
+
+/** Best effort and off the send path: a failure is logged and never reaches the user. */
+function startCapture(session: AgentSession, trigger: string, partial?: PartialSnapshot): void {
+  const currentInput = session.currentUserText
+  const traceId = session._currentTurnTraceId
+  const promise = captureCompactionOriginal({
+    ownerUserId: session.userId ?? 'default', sessionId: session.peerId, sessionKey: session.sessionKey,
+    traceId, trigger, currentInput, partial, allowMissingTimeline: session.turns === 0,
+  }).then(({ manifest, timeline }) => sourcesFrom(timeline, manifest.archiveId, currentInput), (error: unknown) => {
+    log.warn('compaction original capture failed; user turns are unaffected', {
+      sessionKey: session.sessionKey, traceId, trigger,
+      code: error instanceof Error ? error.message : String(error),
+    })
+    return null
+  })
+  const capture = { promise, done: false }
+  session._compactionCapture = capture
+  void promise.then(() => { capture.done = true })
+}
+
+/** A compaction boundary: the next dispatch carries the recovery contract and
+ * the platform originals are retained in the background. Never throws. */
+export function noteCompactionBoundary(session: AgentSession, trigger: string, partial?: PartialSnapshot): void {
+  if (!enabledFor(session)) return
+  session._compactionEpoch = (session._compactionEpoch ?? 0) + 1
+  if (session._compactionCapture && !session._compactionCapture.done) return
+  startCapture(session, trigger, partial)
+}
+
 export function observeCompactionOriginal(
   session: AgentSession, event: EngineEvent, snapshot: () => PartialSnapshot | undefined,
 ): void {
-  if (!session._compactionOriginal) return
-  if (event.kind === 'tool_use_detected') {
-    ;(session._compactionPendingTools ??= new Map()).set(event.tool.id, {
-      kind: 'tool', id: event.tool.id, state: 'running', sessionKey: session.sessionKey,
-    })
-  } else if (event.kind === 'tool_result_detected') {
-    session._compactionPendingTools?.delete(event.result.toolUseId)
-  } else if (event.kind === 'final') {
-    for (const tool of session._compactionPendingTools?.values() ?? []) {
-      tool.state = 'unconfirmed_after_turn'
-    }
+  if (event.kind === 'turn_status' && event.status === 'compacting') {
+    noteCompactionBoundary(session, 'compacting', snapshot())
+  } else if (event.kind === 'context_compacted' && event.compaction.strategy !== 'file_reference') {
+    // file_reference keeps every byte in a file; it drops nothing to recover.
+    noteCompactionBoundary(session, `context_compacted:${event.compaction.strategy}`, snapshot())
   }
-  const boundary = (event.kind === 'turn_status' && event.status === 'compacting') || event.kind === 'context_compacted'
-  if (!boundary && event.kind !== 'final') return
-  try {
-    appendCompactionTurnOriginal(session._compactionOriginal, {
-      kind: boundary ? 'compact_boundary' : event.kind,
-      payload: snapshot() ?? event,
-      pendingTools: [...(session._compactionPendingTools?.values() ?? [])],
-    })
-  } catch (error) {
-    // Never let an observation callback crash the adapter or mutate originals.
-    log.error('compaction original observation could not be retained', {
+}
+
+/** Under the session lock, once per logical turn. Returns a dispatch wrapper
+ * only for the first turn after an observed compaction. Never rejects. */
+export async function prepareCompactionRecovery(
+  session: AgentSession,
+  readTasks: () => readonly CompactionActiveTask[],
+): Promise<((input: HistoricalTurnInput) => HistoricalTurnInput) | undefined> {
+  if (!enabledFor(session)) return undefined
+  const epoch = session._compactionEpoch ?? 0
+  if (epoch <= (session._compactionRecoveredEpoch ?? 0)) return undefined
+  session._compactionRecoveredEpoch = epoch
+  // An in-turn capture can race a mutating timeline; retry once now that the turn is over.
+  if (!session._compactionCapture || (session._compactionCapture.done && !(await session._compactionCapture.promise))) {
+    startCapture(session, 'next_turn')
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const sources = await Promise.race([
+    session._compactionCapture!.promise,
+    new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), COMPACTION_SOURCE_WAIT_MS) }),
+  ])
+  clearTimeout(timer)
+  if (!sources) {
+    log.warn('compaction recovery dispatches without original user turns', {
       sessionKey: session.sessionKey, traceId: session._currentTurnTraceId,
-    }, error)
+    })
+  }
+  // Antigravity budgets its complete stdin envelope and can externalize the
+  // current input itself; other engines fit the recovery into their argv cap.
+  const maxBytes = session.providerTag === 'antigravity' ? undefined : session.runner.capabilities.maxPromptBytes
+  return (input: HistoricalTurnInput): HistoricalTurnInput => {
+    const context = renderCompactionRecoveryContext({
+      userInstructions: sources?.userInstructions ?? null, archiveId: sources?.archiveId,
+      plan: sources?.plan, goal: session._platformGoal, activeTasks: readTasks(),
+    })
+    const attached = attachCompactionRecoveryContext(input, context, maxBytes)
+    if (!attached) {
+      log.warn('compaction recovery does not fit the transport budget; dispatching the original input', {
+        sessionKey: session.sessionKey, traceId: session._currentTurnTraceId,
+      })
+    }
+    return attached ?? input
   }
 }

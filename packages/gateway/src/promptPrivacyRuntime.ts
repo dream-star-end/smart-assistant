@@ -3,9 +3,6 @@ import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { getDesiredPromptPrivacy, promptPrivacyNeedsRestart } from './promptPrivacyDesired.js'
 export interface PromptPrivacyLifecycle {
   assertCurrent(): void
-  /** Reuse this exact admitted policy for same-turn source reinjection. The
-   * callback runs after setPromptPrivacy and never performs a second read. */
-  onPrepared?(policy: PromptPrivacyPolicy): void
   /** Reserve the expected generation change of this operation's own shutdown. */
   beforeOwnedShutdown?(): void
 }
@@ -28,7 +25,6 @@ export async function prepareRunnerPromptPrivacy(runner: PromptPrivacyRunner, se
   lifecycle?.assertCurrent()
   const changed = promptPrivacyNeedsRestart(runner.promptPolicyFingerprint, policy, sessionId)
   runner.setPromptPrivacy(policy)
-  lifecycle?.onPrepared?.(policy)
   return changed
 }
 export async function refreshRunnerPromptPrivacy(runner: PromptPrivacyRunner, sessionId: string | undefined, lifecycle?: PromptPrivacyLifecycle): Promise<void> {

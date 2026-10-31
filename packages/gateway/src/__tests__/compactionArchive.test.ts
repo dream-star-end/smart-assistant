@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import test from 'node:test'
 import type { ClientTimelinePage, MessageLike } from '@openclaude/storage'
 import {
-  appendCompactionTurnOriginal,
   captureCompactionOriginal,
   COMPACTION_ORIGINAL_RETENTION_MS,
   pruneCompactionOriginals,
@@ -26,10 +26,19 @@ const page = (messages: MessageLike[], before: number | null, revision = 1): Cli
 const onePage: NonNullable<CompactionArchiveOptions['readPage']> = async () => page([row(1)], null)
 const input = (ownerUserId = 'owner-a', sessionId = 'session-raw-a') => ({
   ownerUserId, sessionId, sessionKey: `agent:main:webchat:dm:${sessionId}`,
-  traceId: 'a'.repeat(32), currentInput: '当前用户输入\n不许执行 X。',
-  platformContext: 'Authoritative original restriction: 不许执行 X。',
-  activeIds: [{ jobId: 'dlgjob-original', state: 'running' }],
+  traceId: 'a'.repeat(32), trigger: 'compacting', currentInput: '当前用户输入\n不许执行 X。',
 })
+
+async function treeBytes(dir: string): Promise<{ files: number; bytes: number }> {
+  let files = 0
+  let bytes = 0
+  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue
+    files++
+    bytes += (await stat(join(entry.parentPath, entry.name))).size
+  }
+  return { files, bytes }
+}
 
 test('full originals page archived rows and hot rows without a model-window cap', async () => {
   const calls: Array<{ sessionId: string; userId: string; before: number | undefined; limit: number | undefined }> = []
@@ -80,41 +89,31 @@ test('missing timeline is denied unless the authenticated new-session caller exp
   }), { timeline: [], timelineGeneration: null, historyRevision: null, snapshotMaxSeq: null })
 })
 
-test('archive retains exact large platform context and input with immutable private files', async (t) => {
+test('a capture keeps exact private records and reconstructs the timeline in order', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-archive-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   const root = join(temp, 'originals')
-  const options = { root, readPage: onePage, now: () => 1000 }
-  const longContext = '原文禁止 X，摘要的批准未经确认。\n'.repeat(20_000)
-  let contextBuilds = 0
+  const rows = [row(1), { id: 'fallback', role: 'assistant', text: 'visible', _displayDegraded: true, _displayDegradeReason: 'records_failed' }, row(1)]
+  const options = { root, readPage: async () => page(rows, null), now: () => 1000 }
   const original = { ...input(), currentInput: [{ type: 'text', text: '保留\n全文' }] }
-  const saved = await captureCompactionOriginal({ ...original, platformContext: async (timeline) => {
-    contextBuilds++
-    assert.equal(timeline[0]?.id, 'original-1')
-    return longContext
-  } }, options)
+  const saved = await captureCompactionOriginal(original, options)
   original.currentInput[0]!.text = 'later mutation'
-  assert.equal(contextBuilds, 1)
-  assert.equal(saved.snapshot.source, 'platform-full-timeline')
-  assert.equal(saved.snapshot.platformContext, longContext)
-  assert.equal(saved.snapshot.expiresAt - saved.snapshot.createdAt, COMPACTION_ORIGINAL_RETENTION_MS)
-  const text = await readFile(saved.reference.textPath, 'utf8')
-  assert.ok(text.includes(longContext))
-  assert.ok(text.includes('原文 1'))
-  assert.notEqual(saved.reference.contextTextPath, saved.reference.textPath)
-  assert.equal(await readFile(saved.reference.contextTextPath, 'utf8'), longContext,
-    'model recovery references must not force the full assistant audit timeline back into the context window')
+  assert.equal(saved.manifest.source, 'platform-full-timeline')
+  assert.equal(saved.manifest.trigger, 'compacting')
+  assert.equal(saved.manifest.degradedRecords, 1)
+  assert.equal(saved.manifest.expiresAt - saved.manifest.createdAt, COMPACTION_ORIGINAL_RETENTION_MS)
   assert.equal((await stat(root)).mode & 0o777, 0o700)
-  assert.equal((await stat(saved.reference.path)).mode & 0o777, 0o600)
-  assert.equal((await stat(saved.reference.textPath)).mode & 0o777, 0o600)
-  assert.equal((await stat(saved.reference.contextTextPath)).mode & 0o777, 0o600)
+  const sessionDir = join(root, 'sessions', (await readdir(join(root, 'sessions')))[0]!)
+  for (const name of await readdir(join(sessionDir, 'records'))) {
+    assert.equal((await stat(join(sessionDir, 'records', name))).mode & 0o777, 0o600)
+  }
+  assert.equal((await readdir(join(sessionDir, 'records'))).length, 2, 'identical records are stored once')
   const recovered = await readCompactionOriginal({
-    sessionId: original.sessionId, archiveId: saved.reference.archiveId,
+    sessionId: original.sessionId, archiveId: saved.manifest.archiveId,
     principal: { kind: 'owner', userId: original.ownerUserId },
   }, options)
-  assert.deepEqual(recovered?.snapshot.currentInput, [{ type: 'text', text: '保留\n全文' }])
-  assert.equal(recovered?.snapshot.platformContext, longContext)
-  assert.equal(recovered?.reference.contextTextPath, saved.reference.contextTextPath)
+  assert.deepEqual(recovered?.timeline, rows)
+  assert.deepEqual(recovered?.manifest.currentInput, [{ type: 'text', text: '保留\n全文' }])
 })
 
 test('owner and explicit ops-trace reads cannot cross session or owner boundaries', async (t) => {
@@ -125,112 +124,87 @@ test('owner and explicit ops-trace reads cannot cross session or owner boundarie
   const a = await captureCompactionOriginal(input('owner-a'), options)
   now++
   await captureCompactionOriginal(input('owner-b', 'session-raw-b'), options)
-  assert.equal(await readCompactionOriginal({ sessionId: a.reference.sessionId, archiveId: a.reference.archiveId,
+  const id = a.manifest.archiveId
+  assert.equal(await readCompactionOriginal({ sessionId: a.manifest.sessionId, archiveId: id,
     principal: { kind: 'owner', userId: 'owner-b' } }, options), null)
-  assert.equal(await readCompactionOriginal({ sessionId: 'another-session', archiveId: a.reference.archiveId,
+  assert.equal(await readCompactionOriginal({ sessionId: 'another-session', archiveId: id,
     principal: { kind: 'owner', userId: 'owner-a' } }, options), null)
-  assert.equal(await readCompactionOriginal({ sessionId: a.reference.sessionId, archiveId: a.reference.archiveId,
+  assert.equal(await readCompactionOriginal({ sessionId: a.manifest.sessionId, archiveId: id,
     principal: { kind: 'ops-trace' } }, options), null)
   const byOwner = await readCompactionOriginalByTrace({ traceId: 'a'.repeat(32),
     principal: { kind: 'owner', userId: 'owner-a' } }, options)
-  assert.equal(byOwner?.snapshot.ownerUserId, 'owner-a')
+  assert.equal(byOwner?.manifest.ownerUserId, 'owner-a')
   const byOps = await readCompactionOriginalByTrace({ traceId: 'a'.repeat(32),
     principal: { kind: 'ops-trace' } }, options)
-  assert.equal(byOps?.snapshot.ownerUserId, 'owner-b')
+  assert.equal(byOps?.manifest.ownerUserId, 'owner-b')
   assert.equal(await readCompactionOriginalByTrace({ traceId: 'a'.repeat(32),
     principal: { kind: 'owner', userId: 'stranger' } }, options), null)
   assert.equal(await readCompactionOriginalByTrace({ traceId: '../escape', principal: { kind: 'ops-trace' } }, options), null)
 })
 
-test('in-turn original snapshots append synchronously with pending tool IDs, preserving the base', async (t) => {
-  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-turn-'))
+// Acceptance GAP-B (#1309): three turns over a ~1 MB timeline used to write
+// three complete copies twice over (~6 MB). Captures now share records.
+test('GAP-B: repeated captures of a ~1 MB timeline store each record once', async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-dedupe-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
-  const options = { root: join(temp, 'originals'), readPage: onePage, now: () => 1000 }
-  const saved = await captureCompactionOriginal(input(), options)
-  const before = await readFile(saved.reference.path, 'utf8')
-  const payload = { assistantText: '压缩前当轮原文', completedTools: [{ toolUseId: 'tool-exact-7', completed: false }] }
-  const fragment = appendCompactionTurnOriginal(saved.reference, {
-    kind: 'compacting', payload, pendingTools: [{ toolUseId: 'tool-exact-7' }],
-  }, options)
-  payload.assistantText = 'mutated after synchronous append'
-  assert.equal((await stat(fragment.path)).mode & 0o777, 0o600)
-  const recovered = await readCompactionOriginal({ sessionId: saved.reference.sessionId,
-    archiveId: saved.reference.archiveId, principal: { kind: 'owner', userId: 'owner-a' } }, options)
-  assert.equal(recovered?.turnOriginals.length, 1)
-  assert.deepEqual(recovered?.turnOriginals[0]?.payload, {
-    assistantText: '压缩前当轮原文', completedTools: [{ toolUseId: 'tool-exact-7', completed: false }],
-  })
-  assert.deepEqual(recovered?.turnOriginals[0]?.pendingTools, [{ toolUseId: 'tool-exact-7' }])
-  assert.equal(await readFile(saved.reference.path, 'utf8'), before)
+  const rows: MessageLike[] = [{ id: 'u0', role: 'user', text: '禁止执行 X（原文）' },
+    ...Array.from({ length: 50 }, (_, i) => ({ id: `a${i}`, role: 'assistant', text: 'r'.repeat(20_000) }))]
+  const timelineBytes = Buffer.byteLength(JSON.stringify(rows))
+  let current = rows
+  const options = { root: join(temp, 'originals'), readPage: async () => page(current, null), now: () => 1000 }
+  for (let i = 0; i < 3; i++) await captureCompactionOriginal(input(), options)
+  current = [...rows, { id: 'u1', role: 'user', text: '新的一轮' }]
+  await captureCompactionOriginal(input(), options)
+  const { bytes } = await treeBytes(options.root)
+  console.log(`# GAP-B timelineBytes=${timelineBytes} archiveBytes=${bytes} captures=4`)
+  assert.ok(bytes < timelineBytes * 1.1, `archive ${bytes} B must stay near one timeline copy (${timelineBytes} B)`)
 })
 
-test('expiry denies both read seams and cleanup removes the snapshot and all fragments', async (t) => {
+test('expiry denies both read seams and cleanup removes manifests, unshared records and trace indexes', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-retention-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   let now = 1000
-  const options = { root: join(temp, 'originals'), readPage: onePage, now: () => now }
-  const saved = await captureCompactionOriginal(input(), options)
-  const fragment = appendCompactionTurnOriginal(saved.reference, { kind: 'compacting', payload: 'raw exact text' }, options)
-  now += COMPACTION_ORIGINAL_RETENTION_MS
-  assert.equal(await readCompactionOriginal({ sessionId: saved.reference.sessionId,
-    archiveId: saved.reference.archiveId, principal: { kind: 'owner', userId: 'owner-a' } }, options), null)
+  let rows = [row(1), row(2)]
+  const options = { root: join(temp, 'originals'), readPage: async () => page(rows, null), now: () => now }
+  const first = await captureCompactionOriginal(input(), options)
+  now += 60_000
+  rows = [row(2), row(3)]
+  const second = await captureCompactionOriginal({ ...input(), traceId: 'b'.repeat(32) }, options)
+  now = first.manifest.expiresAt
+  assert.equal(await readCompactionOriginal({ sessionId: first.manifest.sessionId,
+    archiveId: first.manifest.archiveId, principal: { kind: 'owner', userId: 'owner-a' } }, options), null)
   assert.equal(await readCompactionOriginalByTrace({ traceId: 'a'.repeat(32), principal: { kind: 'ops-trace' } }, options), null)
-  assert.throws(() => appendCompactionTurnOriginal(saved.reference, { kind: 'late', payload: '' }, options), /EXPIRED/)
   assert.deepEqual(await pruneCompactionOriginals(options), { removed: 1 })
-  await assert.rejects(stat(saved.reference.path), { code: 'ENOENT' })
-  await assert.rejects(stat(fragment.path), { code: 'ENOENT' })
-  assert.equal(await readCompactionOriginalByTrace({ traceId: 'a'.repeat(32), principal: { kind: 'ops-trace' } }, options), null)
+  const kept = await readCompactionOriginal({ sessionId: second.manifest.sessionId,
+    archiveId: second.manifest.archiveId, principal: { kind: 'owner', userId: 'owner-a' } }, options)
+  assert.deepEqual(kept?.timeline, [row(2), row(3)], 'records shared with a live capture survive')
+  const sessionDir = join(options.root, 'sessions', (await readdir(join(options.root, 'sessions')))[0]!)
+  assert.equal((await readdir(join(sessionDir, 'records'))).length, 2, 'the record only the expired capture named is gone')
+  const traceDir = join(options.root, 'traces', createHash('sha256').update('a'.repeat(32)).digest('hex'))
+  assert.deepEqual(await readdir(traceDir), [], 'the expired trace index is removed')
+  now = second.manifest.expiresAt
+  assert.deepEqual(await pruneCompactionOriginals(options), { removed: 1 })
+  await assert.rejects(stat(sessionDir), { code: 'ENOENT' })
 })
 
-test('missing trace IDs mint independent immutable captures and insecure roots fail closed', async (t) => {
+test('unpublished crash manifests are swept and insecure roots fail closed', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-path-'))
-  t.after(() => rm(temp, { recursive: true, force: true }))
-  const options = { root: join(temp, 'originals'), readPage: onePage, now: () => 1000 }
-  const noTrace = { ...input(), traceId: undefined }
-  const a = await captureCompactionOriginal(noTrace, options)
-  const b = await captureCompactionOriginal(noTrace, options)
-  assert.notEqual(a.reference.archiveId, b.reference.archiveId)
-  const path = join(temp, 'root-is-file')
-  await writeFile(path, 'not a directory')
-  await assert.rejects(captureCompactionOriginal(input(), { ...options, root: path }))
-})
-
-test('cleanup removes only old private exact-name crash stages and keeps fresh or unrelated directories', async (t) => {
-  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-stage-retention-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   const now = Date.now()
   const options = { root: join(temp, 'originals'), readPage: onePage, now: () => now }
-  const saved = await captureCompactionOriginal(input(), options)
-  const parent = dirname(dirname(saved.reference.path))
-  const old = join(parent, `.stage-${'1'.repeat(64)}`)
-  const fresh = join(parent, `.stage-${'2'.repeat(64)}`)
-  const unrelated = join(parent, '.stage-unrelated')
-  const oldTime = new Date(now - COMPACTION_ORIGINAL_RETENTION_MS - 1000)
-  for (const dir of [old, fresh, unrelated]) {
-    await mkdir(dir, { mode: 0o700 })
-    await writeFile(join(dir, 'original.txt'), 'crash original', { mode: 0o600 })
-    await utimes(dir, oldTime, oldTime)
-  }
-  await utimes(fresh, new Date(now), new Date(now))
-  assert.deepEqual(await pruneCompactionOriginals(options), { removed: 1 })
-  await assert.rejects(stat(old), { code: 'ENOENT' })
-  assert.equal(await readFile(join(fresh, 'original.txt'), 'utf8'), 'crash original')
-  assert.ok((await stat(unrelated)).isDirectory())
-  assert.ok(await stat(saved.reference.path))
-
-  const outside = join(temp, 'outside')
-  await mkdir(outside, { mode: 0o700 })
-  await writeFile(join(outside, 'keep.txt'), 'outside untouched')
-  const unsafe = join(parent, `.stage-${'3'.repeat(64)}`)
-  await symlink(outside, unsafe)
-  await assert.rejects(pruneCompactionOriginals(options), /PRIVATE_DIRECTORY/)
-  assert.equal(await readFile(join(outside, 'keep.txt'), 'utf8'), 'outside untouched')
-  await rm(unsafe)
-  await mkdir(unsafe, { mode: 0o700 })
-  await chmod(unsafe, 0o755)
-  await utimes(unsafe, oldTime, oldTime)
-  await assert.rejects(pruneCompactionOriginals(options), /PRIVATE_DIRECTORY/)
-  assert.ok((await stat(unsafe)).isDirectory())
+  const saved = await captureCompactionOriginal({ ...input(), traceId: undefined }, options)
+  const captures = join(options.root, 'sessions', (await readdir(join(options.root, 'sessions')))[0]!, 'captures')
+  const crashed = join(captures, `.${'1'.repeat(64)}.tmp`)
+  await writeFile(crashed, '{"partial', { mode: 0o600 })
+  await utimes(crashed, new Date(now - 2 * 60 * 60_000), new Date(now - 2 * 60 * 60_000))
+  assert.deepEqual(await pruneCompactionOriginals(options), { removed: 0 })
+  await assert.rejects(stat(crashed), { code: 'ENOENT' })
+  assert.ok(await stat(join(captures, `${saved.manifest.archiveId}.json`)))
+  const path = join(temp, 'root-is-file')
+  await writeFile(path, 'not a directory')
+  await assert.rejects(captureCompactionOriginal(input(), { ...options, root: path }))
+  await chmod(options.root, 0o755)
+  await assert.rejects(captureCompactionOriginal(input(), options), /PRIVATE_DIRECTORY/)
 })
 
 test('startup and hourly idle cleanup delete expired originals without a new chat, coalesce sweeps and stop', async (t) => {
@@ -243,7 +217,7 @@ test('startup and hourly idle cleanup delete expired originals without a new cha
   const first = await captureCompactionOriginal(input(), options)
   now += hour
   const second = await captureCompactionOriginal(input(), options)
-  now = first.reference.expiresAt + 1
+  now = first.manifest.expiresAt + 1
   clockReads = 0
   t.mock.timers.enable({ apis: ['setInterval'] })
   const errors: unknown[] = []
@@ -255,13 +229,15 @@ test('startup and hourly idle cleanup delete expired originals without a new cha
   const immediate = pruneCompactionOriginals(options)
   assert.equal(immediate, pruneCompactionOriginals(options), 'foreground capture and timer share the root sweep')
   await immediate
-  await assert.rejects(stat(first.reference.path), { code: 'ENOENT' })
-  assert.ok(await stat(second.reference.path))
-  now = second.reference.expiresAt + 1
+  const live = (archive: typeof first) => readCompactionOriginal({ sessionId: archive.manifest.sessionId,
+    archiveId: archive.manifest.archiveId, principal: { kind: 'owner', userId: 'owner-a' } }, { ...options, now: () => 0 })
+  assert.equal(await live(first), null)
+  assert.ok(await live(second))
+  now = second.manifest.expiresAt + 1
   t.mock.timers.tick(hour)
   assert.equal(clockReads, 2, 'the timer starts a new sweep without another capture')
   await pruneCompactionOriginals(options)
-  await assert.rejects(stat(second.reference.path), { code: 'ENOENT' })
+  assert.equal(await live(second), null)
   stop()
   t.mock.timers.tick(hour * 3)
   assert.equal(clockReads, 2, 'stop cancels every future sweep')

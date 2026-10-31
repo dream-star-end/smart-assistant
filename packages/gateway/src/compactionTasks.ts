@@ -5,7 +5,7 @@ import { isEngineLocalTurnExempt } from './modelAuthority.js'
 export const personalCompactionEnabled = isEngineLocalTurnExempt
 
 export interface CompactionActiveTask {
-  kind: 'delegate' | 'tool' | 'subtask'
+  kind: 'delegate' | 'subtask'
   id: string
   state: string
   sessionKey?: string

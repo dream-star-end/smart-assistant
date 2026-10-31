@@ -12,6 +12,8 @@ import { after, afterEach, describe, it } from 'node:test'
 
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import type { DelegateEngineBillingClient } from '../delegateEngineBilling.js'
+import { DELEGATE_CONTEXT_HEADER, issueDelegateContextToken } from '../delegateContext.js'
+import { DELEGATE_TASK_IN_FLIGHT_MESSAGE } from '../delegateResume.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-engine-billing'
 const REQUEST_ID = 'ab'.repeat(16)
@@ -173,8 +175,9 @@ async function delegate(
   gw: any,
   targetAgentId: string,
   body: Record<string, unknown>,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; body: any }> {
-  const req: any = { method: 'POST', headers: {} }
+  const req: any = { method: 'POST', headers }
   gw.readBody = async () => JSON.stringify(body)
   let status = 0
   let raw = ''
@@ -201,42 +204,70 @@ function memberBody(extra: Record<string, unknown> = {}): Record<string, unknown
 }
 
 describe('handleDelegateTask engine-reported billing', () => {
-  it('personal recovery replay without resume key launches and admits the original task only once', async () => {
-    const previous = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
-    process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
-    const billing = makeBillingClient()
-    const gw = makeGateway({ billing })
-    let release!: () => void
-    let observed!: () => void
-    const held = new Promise<void>(resolve => { release = resolve })
-    const submitted = new Promise<void>(resolve => { observed = resolve })
-    let launches = 0
-    gw.sessions.submit = async (_session: unknown, _payload: unknown, onEvent: (e: unknown) => void) => {
-      launches++
-      observed()
-      await held
-      onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
-    }
-    const body = memberBody({ model: 'gpt-5.6-sol', idempotencyKey: 'before-compact-attempt' })
-    const first = delegate(gw, 'auditor', body)
-    try {
-      await Promise.race([submitted, first.then(result => {
-        throw new Error(`delegate ended before model submission: ${JSON.stringify(result)}`)
-      })])
-      // The model has the exact active idempotency key after recovery, while
-      // its old native resume key may have disappeared into a compact summary.
-      const replay = await delegate(gw, 'auditor', body)
-      assert.equal(replay.status, 409)
-      assert.equal(launches, 1)
-      assert.equal(billing.admits.length, 1)
-      assert.equal(gw._delegateResume.dispatchGrants, 1)
-    } finally {
-      release()
-      await first
-      if (previous === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
-      else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = previous
-    }
-  })
+  // Acceptance GAP-D3 (#1309): the real MCP delegate_task / oc-memory CLI
+  // bodies carry no idempotency or resume key. Re-issuing the same task in a
+  // later parent turn (as after a compaction) dispatched and admitted twice.
+  for (const shape of ['sync member body', 'async MCP delegate_task body'] as const) {
+    it(`GAP-D3: a re-issued in-flight task (${shape}) launches and admits billing once`, async () => {
+      const previous = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+      process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = '1'
+      const billing = makeBillingClient()
+      const gw = makeGateway({ billing })
+      let release!: () => void
+      let observed!: () => void
+      const held = new Promise<void>(resolve => { release = resolve })
+      const submitted = new Promise<void>(resolve => { observed = resolve })
+      let launches = 0
+      let finished!: () => void
+      const done = new Promise<void>(resolve => { finished = resolve })
+      gw.sessions.submit = async (_session: unknown, _payload: unknown, onEvent: (e: unknown) => void) => {
+        launches++
+        observed()
+        await held
+        onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
+        finished()
+      }
+      const asyncShape = shape.startsWith('async')
+      // mcp-memory runAsyncDelegateToAgent: no key fields for a fresh delegation.
+      const body = asyncShape
+        ? { goal: '实现子任务', context: '上下文…', model: 'gpt-5.6-sol', sourceAgent: 'main', async: true,
+            streamProgress: true, parentSessionKey: PARENT_KEY }
+        : memberBody({ model: 'gpt-5.6-sol' })
+      const headers = asyncShape
+        ? { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0 }) }
+        : {}
+      const first = delegate(gw, 'auditor', body, headers)
+      try {
+        await submitted
+        gw._hiddenDelegateGuard.resetForParent(PARENT_KEY) // next parent user turn
+        const again = await delegate(gw, 'auditor', body, headers)
+        console.log(`# GAP-D3 ${shape} launches=${launches} admits=${billing.admits.length} replay=${again.status}`)
+        assert.equal(launches, 1)
+        assert.equal(billing.admits.length, 1)
+        assert.equal(gw._delegateResume.dispatchGrants, 1)
+        if (asyncShape) {
+          const started = await first
+          assert.equal(again.status, 200)
+          assert.equal(again.body.jobId, started.body.jobId, 'the model gets the existing job back to wait on')
+        } else {
+          assert.equal(again.status, 409)
+          assert.equal(again.body.error, DELEGATE_TASK_IN_FLIGHT_MESSAGE)
+        }
+        const different = delegate(gw, 'auditor', { ...body, goal: '另一个子任务' }, headers)
+        await new Promise(resolve => setTimeout(resolve, 50))
+        assert.equal(launches, 2, 'a different task still dispatches')
+        release()
+        await different
+      } finally {
+        release()
+        await first
+        await done
+        gw._delegateJobs?.close()
+        if (previous === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
+        else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = previous
+      }
+    })
+  }
   it('(a) codex 委派 submit 收到 32-hex requestId', async () => {
     const billing = makeBillingClient()
     const gw = makeGateway({ billing })
