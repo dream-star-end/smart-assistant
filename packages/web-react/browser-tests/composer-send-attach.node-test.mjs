@@ -70,7 +70,8 @@ test("OCV5-694 real App: the first trusted click on the paperclip opens the file
         page.on("filechooser", (chooser) => choosers.push(chooser));
         await page.goto(preview.url);
         await page.getByRole("textbox", { name: "消息输入框" }).waitFor();
-        // Repro: a new session (sidebar entry on desktop, header button on phones).
+        // Repro: a new session (sidebar on desktop, the drawer behind 打开菜单 on phones).
+        if (width === 390) await page.getByRole("button", { name: /^打开菜单/ }).click();
         await page.getByRole("button", { name: /新建会话/ }).filter({ visible: true }).first().click();
         const clip = page.getByRole("button", { name: "添加附件" });
         await clip.waitFor();
