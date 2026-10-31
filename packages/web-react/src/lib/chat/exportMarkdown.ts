@@ -1,18 +1,15 @@
 import { uiPlainText } from "../../components/iui/plainText";
+import { formatZoned } from "../displayTime";
 import type { ChatMessage } from "./model";
 
 import { selectExportMessages } from "./shareSelection";
 import { publicArtifactText } from "./publicArtifactText";
 
-function pad(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-/** 本地时间 YYYY-MM-DD HH:mm:ss；非法 ts 返回空串。 */
+/** 显示时区的 YYYY-MM-DD HH:mm:ss；非法 ts 返回空串。 */
 export function formatExportTime(ts: number): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return "";
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return formatZoned(d, "full");
 }
 
 function headingFor(role: ChatMessage["role"]): string {

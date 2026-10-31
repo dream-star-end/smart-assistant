@@ -18,6 +18,8 @@ export const EFFORT_OPTIONS: {
 /** preferences 内层快照（后端 strict allowlist；theme enum 用 auto 而非 system）。 */
 export type PrefsView = {
   theme?: "light" | "dark" | "auto";
+  /** IANA 时区。缺省时前端用北京时间，不跟浏览器走。 */
+  timezone?: string;
   default_model?: string;
   /** 本次会话期内用户在设置/系统助手显式修改 default_model 的本地时刻（epoch ms）。 */
   default_model_updated_at?: number;

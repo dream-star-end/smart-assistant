@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { browserTimeZone, setDisplayTimeZonePreference } from "../displayTime";
 import type { ChatMessage } from "./model";
 import {
   layoutShareCard,
@@ -12,6 +13,9 @@ import {
   tableColumnWidths,
   wrapText,
 } from "./shareCard";
+
+beforeEach(() => setDisplayTimeZonePreference(browserTimeZone()));
+afterEach(() => setDisplayTimeZonePreference(undefined));
 
 function msg(partial: Partial<ChatMessage> & Pick<ChatMessage, "id" | "role">): ChatMessage {
   return { text: "", ts: 1, ...partial };

@@ -1,6 +1,7 @@
 import { Bell, CalendarClock, CheckCircle2, Clock, Hash, ListChecks, Settings, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { cronHuman } from "../../lib/cron";
+import { formatZoned } from "../../lib/displayTime";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
 import { asStr } from "./format";
@@ -98,7 +99,7 @@ function fmtDateTime(value?: string): string {
   if (!value) return "";
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
-  return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return formatZoned(d, "short");
 }
 
 function SmallMeta({ icon, children }: { icon?: ReactNode; children: ReactNode }) {

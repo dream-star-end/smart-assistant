@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatZoned } from "../../lib/displayTime";
 import { cn } from "../../lib/utils";
 import { Tooltip } from "./Tooltip";
 
@@ -37,28 +38,9 @@ export function toDate(value: DateInput): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-const pad = (n: number) => String(n).padStart(2, "0");
-
 /** canonical 绝对格式。固定 24h + 补零,不走 locale —— 同一个界面不能有两种日期长相。 */
 function absolute(d: Date, format: DateFormat): string {
-  const Y = d.getFullYear();
-  const M = pad(d.getMonth() + 1);
-  const D = pad(d.getDate());
-  const h = pad(d.getHours());
-  const m = pad(d.getMinutes());
-  const s = pad(d.getSeconds());
-  switch (format) {
-    case "date":
-      return `${Y}-${M}-${D}`;
-    case "time":
-      return `${h}:${m}`;
-    case "short":
-      return `${M}-${D} ${h}:${m}`;
-    case "full":
-      return `${Y}-${M}-${D} ${h}:${m}:${s}`;
-    default:
-      return `${Y}-${M}-${D} ${h}:${m}`;
-  }
+  return formatZoned(d, format === "relative" ? "date" : format);
 }
 
 /** 相对现在。未来时间用「后」缀;跨过 30 天就没有相对意义了,回落 canonical 日期。 */

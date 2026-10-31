@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, act } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { browserTimeZone, setDisplayTimeZonePreference } from "../../lib/displayTime";
 import { cn } from "../../lib/utils";
 import { CopyChip } from "./CopyChip";
 import { DescriptionList, DescriptionRow } from "./DescriptionList";
@@ -9,9 +10,14 @@ import { TimeAgo, formatDate } from "./TimeAgo";
 import { TooltipProvider } from "./Tooltip";
 
 // 本仓 vitest 未开 globals 自动 cleanup,显式隔离每个用例的 DOM。
+// 这些用例用本地日历构造 Date，显示时区钉在本机，断言才不跟缺省北京时间打架。
+beforeEach(() => {
+  setDisplayTimeZonePreference(browserTimeZone());
+});
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  setDisplayTimeZonePreference(undefined);
 });
 
 /** Tooltip 原语要求 Provider 祖先(TimeAgo / CopyChip 都用了)。 */

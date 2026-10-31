@@ -9,6 +9,7 @@ import {
   rememberSubscriptionPaid,
 } from "../../lib/subscribeIntent";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
+import { formatDate } from "../ui/TimeAgo";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { HupijiaoPaymentEntry } from "../payment/HupijiaoPaymentEntry";
 import { Alert, Button, Modal, Spinner, useConfirm } from "../ui";
@@ -43,10 +44,7 @@ const POLL_INTERVAL_MS = 3000;
 
 /** 把套餐周期到期日格式化为 YYYY-MM-DD。 */
 function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime())
-    ? "—"
-    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return formatDate(iso, "date");
 }
 
 /**

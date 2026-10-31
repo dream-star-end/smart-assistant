@@ -10,6 +10,7 @@ import {
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../../lib/api";
 import type { AuthSession, CommunityTutorialMine } from "../../../lib/types";
+import { formatZoned, zonedDayIndex } from "../../../lib/displayTime";
 import { cn } from "../../../lib/utils";
 import { Alert, Button, ListSkeleton, useConfirm, useToast } from "../../ui";
 import { BlogCover, type BlogImageSource } from "./BlogArticle";
@@ -52,9 +53,9 @@ function withdrawConsequence(item: CommunityTutorialMine): string {
 
 function submittedClock(iso: string): string {
   const date = new Date(iso);
-  const today = new Date();
-  if (date.toDateString() === today.toDateString()) {
-    return `提交于 ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (Number.isNaN(date.getTime())) return iso;
+  if (zonedDayIndex(date) === zonedDayIndex(new Date())) {
+    return `提交于 ${formatZoned(date, "time")}`;
   }
   return blogShortDate(iso);
 }

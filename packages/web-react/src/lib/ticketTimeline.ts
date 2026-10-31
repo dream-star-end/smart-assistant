@@ -13,6 +13,7 @@ import {
   type TicketRun,
   type TimelineItem,
 } from './taskboard'
+import { formatZoned, zonedParts } from './displayTime'
 
 export const COMMENT_GROUP_WINDOW_MS = 5 * 60 * 1000
 export const TIMELINE_COMMENT_MAX_LINES = 8
@@ -114,70 +115,30 @@ export function isTimelineCommentLong(body: unknown): boolean {
   return lines > TIMELINE_COMMENT_MAX_LINES
 }
 
-interface ShanghaiParts {
-  year: string
-  month: string
-  day: string
-  hour: string
-  minute: string
-  second: string
-}
-
-let shanghaiPartsFormatter: Intl.DateTimeFormat | undefined
-
-function shanghaiParts(ms: number): ShanghaiParts | null {
-  if (typeof ms !== 'number' || !Number.isFinite(ms)) return null
-  shanghaiPartsFormatter ??= new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-  })
-  const parts = shanghaiPartsFormatter.formatToParts(new Date(ms))
-  const pick = (type: Intl.DateTimeFormatPartTypes) =>
-    parts.find((part) => part.type === type)?.value ?? ''
-  return {
-    year: pick('year'),
-    month: pick('month'),
-    day: pick('day'),
-    hour: pick('hour') === '24' ? '00' : pick('hour'),
-    minute: pick('minute'),
-    second: pick('second'),
-  }
-}
-
-/** 绝对时间固定 Asia/Shanghai，不跟容器本地时区走。悬停 title 用到秒。 */
-export function formatShanghaiAbsolute(ms: number): string {
-  const parts = shanghaiParts(ms)
-  if (!parts) return '—'
-  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
-}
-
 const MINUTE_MS = 60_000
 const HOUR_MS = 60 * MINUTE_MS
 const DAY_MS = 24 * HOUR_MS
 
+/** 绝对时间。缺省北京时间；账户设了时区后跟账户走。悬停 title 用到秒。 */
+export function formatShanghaiAbsolute(ms: number): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
+  return formatZoned(new Date(ms), 'full')
+}
+
 /**
- * 时间线节点上的时间。近 24 小时用相对说法，更早的写出上海时间的月日和时刻，
- * 避免同一天的节点都挤成一个日期。
+ * 时间线节点上的时间。近 24 小时用相对说法，更早的写出月日和时刻，
+ * 避免同一天的节点都挤成一个日期。时区与全站显示时区相同。
  */
 export function formatTimelineTime(ms: number, now: number): string {
-  const when = shanghaiParts(ms)
-  if (!when) return '—'
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
   const safeNow = typeof now === 'number' && Number.isFinite(now) ? now : ms
   const delta = safeNow - ms
   if (delta >= 0 && delta < MINUTE_MS) return '刚刚'
   if (delta >= 0 && delta < HOUR_MS) return `${Math.floor(delta / MINUTE_MS)} 分钟前`
   if (delta >= 0 && delta < DAY_MS) return `${Math.floor(delta / HOUR_MS)} 小时前`
-  const today = shanghaiParts(safeNow)
-  if (today && today.year === when.year) {
-    return `${when.month}-${when.day} ${when.hour}:${when.minute}`
-  }
-  return `${when.year}-${when.month}-${when.day} ${when.hour}:${when.minute}`
+  const when = zonedParts(new Date(ms))
+  const today = zonedParts(new Date(safeNow))
+  return formatZoned(new Date(ms), today.year === when.year ? 'short' : 'datetime')
 }
 
 /** 时间线上的作者名。unidentified 是上游占位，不直接露给界面。 */

@@ -11,6 +11,8 @@
  * 修过的记进 notes；修不了才降级。链接只接受 http(s)，以 // 开头的 B 站封面补成 https。
  */
 
+import { formatZoned } from '../../lib/displayTime'
+
 type Ctx = { notes: string[]; partial: boolean }
 type Sub = { subtitle?: string }
 
@@ -253,8 +255,7 @@ export function when(v: unknown): string | undefined {
     return t
   }
   if (!d || Number.isNaN(d.getTime())) return undefined
-  const p = (x: number) => String(x).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+  return formatZoned(d, 'datetime')
 }
 
 function videoItem(o: Record<string, unknown>): BiliVideoItem | null {

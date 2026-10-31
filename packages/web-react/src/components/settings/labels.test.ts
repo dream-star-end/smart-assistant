@@ -1,5 +1,8 @@
-import { describe, expect, test } from "vitest";
-import { apiRequestStatusLabel, ledgerReasonLabel, ledgerReasonView, ledgerRowView, shortTime } from "./labels";
+import { afterEach, describe, expect, test } from "vitest";
+import { setDisplayTimeZonePreference } from "../../lib/displayTime";
+import { apiRequestStatusLabel, ledgerReasonLabel, ledgerReasonView, ledgerRowView, ledgerTimeCaption, shortTime } from "./labels";
+
+afterEach(() => setDisplayTimeZonePreference(undefined));
 
 describe("ledgerReasonView（审计 SET-16：未知 reason 显示「其他」并保留原值）", () => {
   test("已知 reason → 中文标签，raw 为 null", () => {
@@ -56,6 +59,16 @@ describe("shortTime（#1237：固定北京时间，不随浏览器时区）", ()
     expect(shortTime("2026-10-29T03:12:24.566Z")).toBe("10月29日 11:12");
     expect(shortTime("2026-10-28T16:05:00.000Z")).toBe("10月29日 00:05");
     expect(shortTime("not-a-date")).toBe("");
+  });
+
+  test("账户时区覆盖缺省，说明跟着变", () => {
+    setDisplayTimeZonePreference("America/New_York");
+    expect(shortTime("2026-10-29T03:12:24.566Z")).toBe("10月28日 23:12");
+    expect(ledgerTimeCaption()).toBe("对话结束后结算入账，时间为美东时间");
+  });
+
+  test("缺省说明仍是北京时间", () => {
+    expect(ledgerTimeCaption()).toBe("对话结束后结算入账，时间为北京时间");
   });
 });
 

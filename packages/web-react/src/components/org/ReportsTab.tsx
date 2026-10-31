@@ -8,6 +8,7 @@ import type {
   OrgUsageTrendPoint,
   OrgUsageWindow,
 } from "../../lib/types";
+import { zonedParts } from "../../lib/displayTime";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
 import { StatTile } from "../settings/StatTile";
 import { Alert, Button, Spinner, Tabs } from "../ui";
@@ -81,8 +82,9 @@ export function trendMax(
 function fmtBucket(bucket: string, window: OrgUsageWindow): string {
   const d = new Date(bucket);
   if (Number.isNaN(d.getTime())) return bucket;
-  if (window === "24h") return `${String(d.getHours()).padStart(2, "0")}:00`;
-  return `${d.getMonth() + 1}/${d.getDate()}`;
+  const p = zonedParts(d);
+  if (window === "24h") return `${String(p.hour).padStart(2, "0")}:00`;
+  return `${p.month}/${p.day}`;
 }
 
 const TOKEN_PARTS: { key: keyof OrgUsageTotals; label: string; color: string }[] = [

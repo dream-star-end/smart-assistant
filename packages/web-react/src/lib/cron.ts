@@ -5,6 +5,8 @@
 // 与 packages/gateway/src/cron.ts。因此“几分钟后 / 某时一次”这类绝对时刻必须换算成
 // 上海挂钟分量，绝不能直接用浏览器本地分量，否则跨时区用户会生成错误的小时/日。
 
+import { formatZoned, zonedParts } from "./displayTime";
+
 const DAY_NAMES = ["日", "一", "二", "三", "四", "五", "六"];
 /** 后端 cron 执行时区（容器 TZ）。Asia/Shanghai 固定 UTC+8、无 DST。 */
 export const CRON_TZ = "Asia/Shanghai";
@@ -259,12 +261,8 @@ export type NextRunDescription = {
   title?: string;
 };
 
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
 function absDateTime(d: Date): string {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  return formatZoned(d, "datetime");
 }
 
 /** 启用中任务的下次执行文案：即将执行 / 已过点 / 相对未来 / 未知。 */
@@ -281,9 +279,10 @@ export function describeNextRun(
   const title = absDateTime(d);
   if (t > now) return { kind: "future", label: "下次", title };
   if (now - t < SOON_MS) return { kind: "soon", label: "即将执行", title };
+  const parts = zonedParts(d);
   return {
     kind: "overdue",
-    label: `已过点 · 原定 ${pad2(d.getHours())}:${pad2(d.getMinutes())}`,
+    label: `已过点 · 原定 ${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`,
     title,
   };
 }

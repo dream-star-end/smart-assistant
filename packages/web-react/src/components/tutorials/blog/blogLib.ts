@@ -1,3 +1,4 @@
+import { formatZoned, zonedParts } from "../../../lib/displayTime";
 import type { CommunityTutorialCategory, CommunityTutorialMine } from "../../../lib/types";
 
 // 「经验分享」(OCV5-577) 的纯逻辑:分类配色、日期、头像色、图片压缩、Markdown 工具栏、本地草稿、
@@ -20,22 +21,25 @@ export const BLOG_PLACEHOLDER_GRADIENT: Record<CommunityTutorialCategory, string
   general: "linear-gradient(135deg,#102b29,#2a2f6b)",
 };
 
-/** 「10月21日」;跨年时带年份。 */
+/** 「10月21日」;跨年时带年份。时区与全站显示时区相同。 */
 export function blogShortDate(iso: string, now = new Date()): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
-  const md = `${date.getMonth() + 1}月${date.getDate()}日`;
-  return date.getFullYear() === now.getFullYear() ? md : `${date.getFullYear()}年${md}`;
+  const p = zonedParts(date);
+  const n = zonedParts(now);
+  const md = `${p.month}月${p.day}日`;
+  return p.year === n.year ? md : `${p.year}年${md}`;
 }
 
 export function blogLongDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
-  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+  const p = zonedParts(date);
+  return `${p.year}年${p.month}月${p.day}日`;
 }
 
 export function blogClock(date: Date): string {
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return formatZoned(date, "time");
 }
 
 /** 中文约 400 字/分钟,至少 1 分钟(与后端 tutorialReadMinutes 同一口径)。 */

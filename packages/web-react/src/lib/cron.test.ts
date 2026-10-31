@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSchedule, cronHuman, describeNextRun, scheduleToPreset } from "./cron";
+import { zonedParts } from "./displayTime";
 
 describe("cronHuman", () => {
   it("每天定点", () => expect(cronHuman("0 9 * * *")).toBe("每天 09:00"));
@@ -117,8 +118,9 @@ describe("describeNextRun", () => {
   it("overdue ≥ 5min → 已过点 · 原定 HH:mm", () => {
     const past = new Date(now - 90 * 60_000);
     const d = describeNextRun(past.toISOString(), now);
-    const hh = String(past.getHours()).padStart(2, "0");
-    const mm = String(past.getMinutes()).padStart(2, "0");
+    const parts = zonedParts(past);
+    const hh = String(parts.hour).padStart(2, "0");
+    const mm = String(parts.minute).padStart(2, "0");
     expect(d.kind).toBe("overdue");
     expect(d.label).toBe(`已过点 · 原定 ${hh}:${mm}`);
     expect(d.title).toContain(`${hh}:${mm}`);

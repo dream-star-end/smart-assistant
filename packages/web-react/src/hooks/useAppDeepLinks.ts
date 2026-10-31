@@ -10,6 +10,7 @@ import { githubErrorText } from "../lib/github";
 import { connectorErrorText } from "../lib/connectors";
 import { replaceSearchParams } from "./useAppRoute";
 import { api, apiErrorMessage } from "../lib/api";
+import { setDisplayTimeZonePreference, timeZoneFromPrefs } from "../lib/displayTime";
 import { applyIntelligentUiSnapshot } from "../lib/intelligentUi";
 import { extractPrefs, type PrefsView } from "../lib/modelPreferences";
 import { type Agent, DEFAULT_AGENT, agentFromApiRow } from "../lib/agents";
@@ -213,7 +214,10 @@ export function useAppDeepLinks({
   // 对话前置——选择器降级为「暂无可用模型」，对话仍可在订阅就绪后进行。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); setLockedModels, setModelPrefs, setModels, setModelsLoading, setPreferenceEffort are App useState setter/useRef passed in, stable
   useEffect(() => {
-    if (demo || !auth) return;
+    if (demo || !auth) {
+      setDisplayTimeZonePreference(undefined);
+      return;
+    }
     let cancelled = false;
     setModelsLoading(true);
     Promise.all([
@@ -221,11 +225,15 @@ export function useAppDeepLinks({
       api
         .getPreferences(auth)
         .then((snap) => {
-          // Intelligent UI 开关(OCV5-361)与模型偏好同批水合。
+          // Intelligent UI 开关(OCV5-361)与模型偏好同批水合。时区同一快照。
+          timeZoneFromPrefs(snap);
           applyIntelligentUiSnapshot(snap);
           return extractPrefs(snap);
         })
-        .catch(() => ({} as PrefsView)),
+        .catch(() => {
+          setDisplayTimeZonePreference(undefined);
+          return {} as PrefsView;
+        }),
     ])
       .then(([catalog, prefs]) => {
         if (cancelled) return;

@@ -6,6 +6,7 @@
  * - 手机优先：390px 宽下单列、图片 3 列九宫格、长文默认折叠；外链新窗口打开，不带来源页信息。
  */
 import { type ReactNode, useState } from "react";
+import { zonedDayIndex } from "../../lib/displayTime";
 import { cn } from "../../lib/utils";
 import {
   type FeishuDocSpec,
@@ -286,11 +287,12 @@ const WEEKDAY = ["周日", "周一", "周二", "周三", "周四", "周五", "�
 
 function dayLabel(day: string): string {
   const [y, m, d] = day.split("-").map(Number);
-  const date = new Date(y!, m! - 1, d!);
-  const today = new Date();
-  const diff = Math.round((date.getTime() - new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) / 86_400_000);
+  if (!y || !m || !d) return day;
+  const civil = Math.floor(Date.UTC(y, m - 1, d) / 86_400_000);
+  const diff = civil - zonedDayIndex(new Date());
   const rel = diff === 0 ? "今天" : diff === 1 ? "明天" : diff === -1 ? "昨天" : undefined;
-  return `${m}月${d}日 ${WEEKDAY[date.getDay()]}${rel ? ` · ${rel}` : ""}`;
+  const wd = WEEKDAY[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+  return `${m}月${d}日 ${wd}${rel ? ` · ${rel}` : ""}`;
 }
 
 export function FeishuEventsBlock({ spec, notes, streaming, nested }: BlockProps<FeishuEventsSpec>) {

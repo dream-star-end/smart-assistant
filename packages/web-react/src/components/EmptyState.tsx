@@ -1,5 +1,6 @@
 import { ArrowLeftRight, ArrowUpRight, Lightbulb, ListChecks, PenLine, Sparkles, Target } from "lucide-react";
 import type { Agent } from "../lib/agents";
+import { zonedHour } from "../lib/displayTime";
 import type { User } from "../lib/types";
 import { AgentAvatar } from "./AgentAvatar";
 import { Button } from "./ui";
@@ -12,9 +13,9 @@ const FALLBACK_STARTERS = [
 /** 起步卡的装饰图标:按位置轮换,纯视觉(starters 是自由文本,不做语义归类)。 */
 const STARTER_ICONS = [Sparkles, PenLine, Lightbulb, ListChecks];
 
-/** 按本地时间问候;凌晨单独一档,不在 3 点说「早上好」。 */
+/** 按显示时区问候;凌晨单独一档,不在 3 点说「早上好」。 */
 export function greetingFor(date: Date): string {
-  const h = date.getHours();
+  const h = zonedHour(date);
   if (h >= 5 && h < 11) return "上午好";
   if (h >= 11 && h < 13) return "中午好";
   if (h >= 13 && h < 18) return "下午好";
