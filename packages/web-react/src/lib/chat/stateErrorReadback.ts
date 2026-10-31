@@ -9,14 +9,14 @@ type StateErrorFrame = {
 const STATE_CODES = /^(?:bad_sequence|conflict|turn_(?:changed|finalized|in_flight|not_active)|active_turn)$/;
 const STORAGE_CODES = /^(?:session_persist_unavailable|history_enrichment_unavailable|turn_tape_(?:state_error|state_unavailable|unavailable|visible_unavailable|retryable)|tape_not_acked)$/;
 const attempted = new WeakSet<object>();
-const pending = new WeakMap<ChatSession, Set<string>>();
-const compatibilityFinals = new WeakMap<ChatSession, Set<string>>();
-const compatKey = (frame: StateErrorFrame, cmid: string) => `${cmid}:${frame.sessionKey ?? ""}:${frame.frameSeq}`;
+// Separate key prefixes keep pending reads and adjacent finals disjoint in one session set.
+const readbacks = new WeakMap<ChatSession, Set<string>>();
+const compatKey = (frame: StateErrorFrame, cmid: string) => `f:${cmid}:${frame.sessionKey ?? ""}:${frame.frameSeq}`;
 
 /** Called after the reducer accepted frameSeq and identified exact adjacent [error] text. */
 export function consumeStateReadbackCompatFinal(sess: ChatSession, frame: StateErrorFrame): boolean {
   const cmid = frame.clientMessageId ?? sess._activeClientMessageId;
-  return !!cmid && compatibilityFinals.get(sess)?.delete(compatKey(frame, cmid)) === true;
+  return !!cmid && readbacks.get(sess)?.delete(compatKey(frame, cmid)) === true;
 }
 
 /** Only a named peer AND its exact current message can turn an error into a readback.
@@ -40,17 +40,15 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     (!STATE_CODES.test(code) && !requiresCompletion)) return false;
   attempted.add(frame);
   if (!effects.accept()) return true;
-  const key = `${cmid}:${code}`;
-  const inflight = pending.get(sess) ?? new Set<string>();
+  const key = `r:${cmid}:${code}`;
+  const inflight = readbacks.get(sess) ?? new Set<string>();
+  readbacks.set(sess, inflight);
   // Reuse the reducer's exact adjacent compatibility-final fence while reading authority.
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
-    const finals = compatibilityFinals.get(sess) ?? new Set<string>();
-    finals.add(compatKey({ ...frame, frameSeq: frame.frameSeq + 1 }, cmid));
-    compatibilityFinals.set(sess, finals);
+    inflight.add(compatKey({ ...frame, frameSeq: frame.frameSeq + 1 }, cmid));
   }
   if (inflight.has(key)) return true;
-  pending.set(sess, inflight);
   inflight.add(key);
   const replay = () => {
     if (!effects.current() || sess._stopSettlement ||

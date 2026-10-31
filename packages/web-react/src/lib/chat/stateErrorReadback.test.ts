@@ -133,12 +133,28 @@ test.each(["stop", "lifecycle"])("%s while reading never paints a late success r
   sock.stop();
 });
 
-test("timeline cursor recovery reads the same snapshot before history and reports failure honestly", async () => {
+test("timeline cursor recovery reads the same snapshot before explicit history reconciliation", async () => {
   const order: string[] = [];
-  const { sock } = boot({ readSessionSnapshot: async () => { order.push("snapshot"); return snapshot({ dispatch: null }); },
+  const { sock } = boot({ readSessionSnapshot: async () => { order.push("snapshot"); return snapshot(); },
     syncSession: async () => { order.push("history"); return true; } });
   expect(await sock.syncHistoryNow("s1")).toBe(true);
   expect(order).toEqual(["snapshot", "history"]);
+  sock.stop();
+});
+
+test.each([null, undefined])("timeline snapshot %s remains a visible failure without reading history", async (snap) => {
+  const sync = vi.fn(async () => true);
+  const { sock } = boot({ readSessionSnapshot: async () => snap, syncSession: sync });
+  expect(await sock.syncHistoryNow("s1")).toBe(false);
+  expect(sync).not.toHaveBeenCalled();
+  sock.stop();
+});
+
+test("timeline history synchronization failure is never reported as recovered", async () => {
+  const sync = vi.fn(async () => false);
+  const { sock } = boot({ readSessionSnapshot: async () => snapshot(), syncSession: sync });
+  expect(await sock.syncHistoryNow("s1")).toBe(false);
+  expect(sync).toHaveBeenCalledTimes(1);
   sock.stop();
 });
 
