@@ -32,6 +32,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-build-jobs.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-load-budget.sh"
 
 mlog() { echo "$*" >&2; }
 
@@ -215,13 +216,19 @@ master_gate_base_dsn() {
 master_gate_load1() {
   local a="" rest=""
   read -r a rest <"$MASTER_GATE_LOADAVG" 2>/dev/null || a=""
-  [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$a"
+  if [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    if [[ "${MASTER_GATE_ADMISSION_BUDGET:-0}" == 1 && -n "${MASTER_GATE_LOAD_BUDGET_DIR:-}" ]]; then
+      master_gate_admission_load1 "$a"
+    else
+      printf '%s' "$a"
+    fi
+  fi
   return 0
 }
 
 # 等待倍数 = clamp(load1/8, 1, 3),两位小数;读不到负载按 1。
 master_gate_load_scale() {
-  local l
+  local l MASTER_GATE_ADMISSION_BUDGET=0
   l="$(master_gate_load1)"
   if [[ -z "$l" ]]; then printf '1.00'; return 0; fi
   awk -v l="$l" -v d="$MASTER_BOX_GATE_LOAD_MAX" -v m="$MASTER_GATE_LOAD_SCALE_MAX" \
@@ -263,7 +270,7 @@ master_gate_busy_reason() {
 }
 
 master_gate_wait_host_idle() { # <why> → rc 1 when still busy after MASTER_GATE_IDLE_TIMEOUT_S
-  local why="$1" t0 now reason=""
+  local why="$1" t0 now reason="" MASTER_GATE_ADMISSION_BUDGET=1
   t0="$(date +%s)"
   while :; do
     reason="$(master_gate_busy_reason)"
@@ -959,6 +966,8 @@ build_master_release() {
     return 0
   fi
 
+  # Start own-tree history before runtime/C/D children; all prior host history stays external.
+  master_gate_load_budget_start
   # Shared tsx cache belongs to live services and other work; only private gate dirs are cleaned.
   assert_master_releases_disk
   command -v python3 >/dev/null 2>&1 || die "缺少 python3(算 artifact digest 需要)"

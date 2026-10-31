@@ -40,6 +40,8 @@ jobs:
         run: npx tsx scripts/check-release-gate-parity.ts
       - name: Checker tests
         run: npx tsx --test scripts/__tests__/checkReleaseGateParity.test.ts
+      - name: Own-tree admission load budget tests
+        run: python3 scripts/__tests__/v5SelfhostLoadBudget.test.py
       - name: Build scheduling and sealed cache reuse tests
         # The seal/donor proofs need the same root ownership as the release train.
         run: sudo env "PATH=$PATH" node --test scripts/__tests__/v5SelfhostParallelGates.node-test.mjs scripts/__tests__/v5SelfhostDeploySpeed.node-test.mjs scripts/__tests__/v5SelfhostFrontendIncremental.node-test.mjs scripts/__tests__/v5SelfhostDigest.node-test.mjs
