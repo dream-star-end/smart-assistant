@@ -62,3 +62,29 @@ test('a fresh snapshot rechecks in-place old bytes on the same message objects',
   expect(after.suffixBytes[0]).toBe(Buffer.byteLength(JSON.stringify(messages), 'utf8'))
   expect(after.messageBytes[1]).toBe(before.messageBytes[1])
 })
+
+test('mutating returned derived arrays cannot poison an identical later snapshot', () => {
+  const messages = [{ role: 'user', content: 'isolated snapshot arrays Ω' }, null]
+  const json = JSON.stringify(messages)
+  const exposed = boxContextMessageSnapshot(json, messages.length)
+  exposed.messageBytes[0] = 0
+  exposed.suffixBytes[0] = 0
+  exposed.prefixDigests[1] = '0'.repeat(64)
+  const next = boxContextMessageSnapshot(JSON.stringify(messages), messages.length)
+  expect(next.messageBytes[0]).toBe(Buffer.byteLength(JSON.stringify(messages[0])))
+  expect(next.suffixBytes[0]).toBe(Buffer.byteLength(json))
+  expect(next.prefixDigests[1]).toBe(digest(messages.slice(0, 1)))
+})
+
+test('canonical append preserves independent hashes and UTF8 sizes across escaped nested values', () => {
+  const original: unknown[] = [{ content: 'exact prefix 😀\\\"[,]{}' }, [undefined, { nested: 'Ω' }]]
+  boxContextMessageSnapshot(JSON.stringify(original), original.length)
+  const appended = [...original, { toJSON(key: string) { return { key, content: '\ud800\u2028\\tail' } } }, null]
+  const json = JSON.stringify(appended), canonical = JSON.parse(json) as unknown[]
+  const snapshot = boxContextMessageSnapshot(json, appended.length)
+  for (let end = 0; end <= appended.length; end++) {
+    expect(snapshot.prefixDigests[end]).toBe(digest(canonical.slice(0, end)))
+    expect(snapshot.suffixBytes[end]).toBe(Buffer.byteLength(JSON.stringify(canonical.slice(end))))
+  }
+  expect((canonical[2] as { key: string }).key).toBe('2')
+})

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { clearTimeout as clearMemoTimer, setTimeout as setMemoTimer } from 'node:timers'
 import { APIConnectionTimeoutError } from '@anthropic-ai/sdk'
 import { BOX_NATIVE_CONTEXT_MODELS } from './boxNativeRemoteContext.js'
 
@@ -6,18 +7,45 @@ import { BOX_NATIVE_CONTEXT_MODELS } from './boxNativeRemoteContext.js'
 const START_BYTES = 16 * 1024 * 1024
 const CHUNK_BYTES = 4 * 1024 * 1024
 const MAX_CACHE = 16
+const SNAPSHOT_MAX_UNITS = 20 * 1024 * 1024
+const SNAPSHOT_MAX_MESSAGES = 4096
+const SNAPSHOT_TTL_MS = 30_000
+type MessageSnapshot = { messageBytes: number[]; suffixBytes: number[]; prefixDigests: string[] }
+type SnapshotMemo = MessageSnapshot & {
+  json: string; count: number; hash: ReturnType<typeof createHash>; createdAt: number
+}
+let snapshotMemo: SnapshotMemo | undefined
+let snapshotTimer: ReturnType<typeof setMemoTimer> | undefined
+const copySnapshot = (value: MessageSnapshot): MessageSnapshot => ({
+  messageBytes: value.messageBytes.slice(), suffixBytes: value.suffixBytes.slice(),
+  prefixDigests: value.prefixDigests.slice(),
+})
+function forgetSnapshot() {
+  snapshotMemo = undefined
+  if (snapshotTimer) clearMemoTimer(snapshotTimer)
+  snapshotTimer = undefined
+}
 
 /** Input is this call's native JSON.stringify(messages), not arbitrary JSON.
  * Slice its exact canonical spans without decoding/re-encoding a large history;
  * array nulls and toJSON(key) are already reflected in these bytes. The wire
  * still carries the original message objects. */
-export function boxContextMessageSnapshot(json: string, count: number) {
+export function boxContextMessageSnapshot(json: string, count: number): MessageSnapshot {
   const invalid = () => { throw new Error('完整资料传输校验未通过，文件和对话已保留。') }
+  const now = performance.now()
+  if (snapshotMemo && (now < snapshotMemo.createdAt || now - snapshotMemo.createdAt >= SNAPSHOT_TTL_MS)) forgetSnapshot()
+  // Reuse pure derived bytes only after comparing this call's freshly produced
+  // canonical JSON. Object identity never establishes an unchanged history.
+  if (snapshotMemo && snapshotMemo.count === count && snapshotMemo.json === json) return copySnapshot(snapshotMemo)
+  const prior = snapshotMemo && count > snapshotMemo.count && snapshotMemo.count > 0
+    && json[snapshotMemo.json.length - 1] === ',' && json.startsWith(snapshotMemo.json.slice(0, -1))
+    ? snapshotMemo : undefined
   if (json[0] !== '[' || json[json.length - 1] !== ']') invalid()
   const ends: number[] = []
   const tokens = /["\\[\]{},]/g
-  let depth = 0
+  let depth = prior ? 1 : 0
   let inString = false
+  if (prior) tokens.lastIndex = prior.json.length
   for (let token = tokens.exec(json); token; token = tokens.exec(json)) {
     const char = token[0]
     if (inString) {
@@ -31,20 +59,20 @@ export function boxContextMessageSnapshot(json: string, count: number) {
   }
   if (inString || depth !== 0) invalid()
   if (json.length > 2) ends.push(json.length - 1)
-  if (ends.length !== count) {
+  if (ends.length + (prior?.count ?? 0) !== count) {
     throw new Error('完整资料传输校验未通过，文件和对话已保留。')
   }
-  const hash = createHash('sha256').update('[')
-  const prefixDigests = [hash.copy().update(']').digest('hex')]
-  const messageBytes: number[] = []
-  let start = 1
-  for (const [index, end] of ends.entries()) {
+  const hash = prior ? prior.hash.copy() : createHash('sha256').update('[')
+  const prefixDigests = prior ? prior.prefixDigests.slice() : [hash.copy().update(']').digest('hex')]
+  const messageBytes: number[] = prior ? prior.messageBytes.slice() : []
+  let start = prior ? prior.json.length : 1
+  for (const end of ends) {
     if (end <= start) invalid()
     const encoded = json.slice(start, end)
     start = end + 1
-    messageBytes.push(Buffer.byteLength(encoded, 'utf8'))
-    if (index) hash.update(',')
+    if (messageBytes.length) hash.update(',')
     hash.update(encoded)
+    messageBytes.push(Buffer.byteLength(encoded, 'utf8'))
     prefixDigests.push(hash.copy().update(']').digest('hex'))
   }
   const suffixBytes = new Array<number>(count + 1)
@@ -52,7 +80,19 @@ export function boxContextMessageSnapshot(json: string, count: number) {
   for (let index = count - 1; index >= 0; index--) {
     suffixBytes[index] = suffixBytes[index + 1]! + messageBytes[index]! + (index < count - 1 ? 1 : 0)
   }
-  return { messageBytes, suffixBytes, prefixDigests }
+  const value = { messageBytes, suffixBytes, prefixDigests }
+  forgetSnapshot()
+  // One entry, at most 40 MiB of UTF16 payload plus bounded derived arrays.
+  // The SDK's independent reference cache still retains only small Ref records.
+  if (json.length <= SNAPSHOT_MAX_UNITS && count <= SNAPSHOT_MAX_MESSAGES) {
+    const memo = { ...copySnapshot(value), json, count, hash: hash.copy(), createdAt: now }
+    snapshotMemo = memo
+    snapshotTimer = setMemoTimer(() => {
+      if (snapshotMemo === memo) forgetSnapshot()
+    }, SNAPSHOT_TTL_MS)
+    snapshotTimer.unref()
+  }
+  return value
 }
 
 type Params = {
