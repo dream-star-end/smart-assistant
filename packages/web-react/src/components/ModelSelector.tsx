@@ -376,7 +376,6 @@ export function ModelSelector({
     onOpenChange?.(false)
     setUncontrolledSheetOpen(false)
   }, [teamEngineActive])
-  const showCollapsedGroup = collapsedRows.length > 0
   const [, setRecentTick] = useState(0)
   const recentRows = (() => {
     const seen = new Set<string>()
@@ -416,6 +415,11 @@ export function ModelSelector({
     }
     return out
   })()
+  // 同一行已经出现在「最近」里就不再排进主列表（OCV5-700）。
+  const recentRowSet = new Set(recentRows)
+  const mainRows = visibleRows.filter((row) => !recentRowSet.has(row))
+  const mainCollapsed = collapsedRows.filter((row) => !recentRowSet.has(row))
+  const showMainCollapsed = mainCollapsed.length > 0
   const selectedPromo = promoLabelOf(selected)
   const selectedFamilyRow = rows.find(
     (row) => row.kind === 'cursor-family' && row.row.family === selectedCursor?.family,
@@ -706,8 +710,8 @@ export function ModelSelector({
             <PickerSeparator mode={mode} />
           </>
         )}
-        {visibleRows.map((row) => renderRow(row, '', mode))}
-        {showCollapsedGroup && (
+        {mainRows.map((row) => renderRow(row, '', mode))}
+        {showMainCollapsed && (
           <>
             <PickerSeparator mode={mode} />
             <PickerItem
@@ -728,9 +732,9 @@ export function ModelSelector({
                 )}
                 <span>{COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL}</span>
               </span>
-              <span className="text-caption font-normal text-faint">{collapsedRows.length} 个</span>
+              <span className="text-caption font-normal text-faint">{mainCollapsed.length} 个</span>
             </PickerItem>
-            {collapsedOpen && collapsedRows.map((row) => renderRow(row, '', mode))}
+            {collapsedOpen && mainCollapsed.map((row) => renderRow(row, '', mode))}
           </>
         )}
       </>

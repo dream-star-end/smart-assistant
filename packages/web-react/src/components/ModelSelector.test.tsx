@@ -784,6 +784,36 @@ describe('ModelSelector 最近使用', () => {
     expect(recentItem).toBeTruthy()
     expect(recentItem?.textContent).toContain('DeepSeek-V4')
   })
+
+  it('同一个模型只出现一次，最近用过的排在前面', async () => {
+    const listed: PublicModel[] = [
+      { id: 'glm-5.2', display_name: 'GLM-5.2' },
+      { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
+      { id: 'gpt-6.1-sol-1m', display_name: 'GPT-6.1-Sol 1M' },
+      { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
+      { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna 1M' },
+      { id: 'box-claude-haiku-5-5', display_name: 'Claude Haiku 5.5' },
+    ]
+    localStorage.setItem(
+      'oc_v5_recent_models',
+      JSON.stringify(['gpt-6.1-sol', 'gpt-6-luna', 'box-claude-haiku-5-5']),
+    )
+    render(<ModelSelector models={listed} selectedId="glm-5.2" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const recentLabel = document.querySelector('[data-recent-group="true"]')
+    expect(recentLabel).toBeTruthy()
+    const recentIds: string[] = []
+    for (let el = recentLabel?.nextElementSibling; el && el.getAttribute('role') !== 'separator'; el = el.nextElementSibling) {
+      const id = el.getAttribute('data-model-id')
+      if (id) recentIds.push(id)
+    }
+    expect(recentIds).toEqual(['gpt-6.1-sol', 'gpt-6-luna', 'box-claude-haiku-5-5'])
+    for (const id of recentIds) {
+      expect(document.querySelectorAll(`[data-model-id="${id}"]`)).toHaveLength(1)
+    }
+    expect(document.querySelectorAll('[data-model-id="glm-5.2"]')).toHaveLength(1)
+  })
 })
 
 function stubNarrowViewport(narrow: boolean) {
