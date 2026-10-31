@@ -1,3 +1,4 @@
+import { captureBoxScopeOwner, getBoxAgentScopeRegistry, type BoxScopeOwner } from './engine/boxAgentScopeRegistry.js'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
@@ -9,12 +10,12 @@ import {
   isProjectSearchEnabled,
 } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
-import { type OpenClaudeConfig } from '@openclaude/storage'
+import type { OpenClaudeConfig } from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
@@ -261,6 +262,8 @@ export class SubprocessRunner extends EventEmitter {
   private spawnedUpstreamIsEgress = false
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private spawnGeneration = 0
+  private readonly boxScopeIncarnation = randomUUID()
+  private readonly boxScopeOwners = new WeakMap<ChildProcessWithoutNullStreams,BoxScopeOwner>()
   private processTiming: PassiveStageTiming | undefined
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
@@ -353,6 +356,47 @@ export class SubprocessRunner extends EventEmitter {
 
   get sessionId(): string | null {
     return this.currentSessionId
+  }
+
+  private async handleBoxAgentScope(msg: SdkMessage,
+    source: { proc: ChildProcessWithoutNullStreams; generation: number }): Promise<void> {
+    const { proc,generation } = source
+    const requestId = (msg as {request_id?: unknown}).request_id
+    if (typeof requestId !== 'string' || requestId.length > 256 || this.proc !== proc
+      || this.spawnGeneration !== generation || !proc.pid || !this.currentSessionId) return
+    const root = this.currentSessionId
+    let response: Record<string,unknown>
+    try {
+      if (msg.session_id !== undefined && msg.session_id !== root) throw new Error('BOX_SCOPE_ROOT_CONFLICT')
+      const owner = this.boxScopeOwners.get(proc)
+        ?? captureBoxScopeOwner(proc.pid,generation,this.boxScopeIncarnation,root)
+      if (owner.rootSessionId !== root) throw new Error('BOX_SCOPE_ROOT_CONFLICT')
+      this.boxScopeOwners.set(proc,owner)
+      response = { subtype: 'success', request_id: requestId,
+        response: await getBoxAgentScopeRegistry().handle(msg.request,owner) }
+    } catch {
+      response = { subtype: 'error', request_id: requestId, error: 'BOX_AGENT_SCOPE_CONTROL_PENDING' }
+    }
+    // Awaited persistence must never send an old ACK into a replacement CCB.
+    if (this.proc !== proc || this.spawnGeneration !== generation || proc.exitCode !== null
+      || proc.signalCode !== null || proc.stdin.destroyed || !proc.stdin.writable) return
+    try { proc.stdin.write(`${JSON.stringify({type:'control_response',response})}\n`) } catch { /* Owner recovery retains intent. */ }
+  }
+
+  captureBoxAgentStop(turnKey: string): {target?:{owner:BoxScopeOwner;turnKey:string};prepare:()=>Promise<void>;isCurrent:()=>boolean} {
+    const proc = this.proc
+    const generation=this.spawnGeneration
+    const root=this.currentSessionId
+    if (!proc || !proc.pid || !root) return {prepare:async()=>{},isCurrent:()=>this.proc===proc}
+    const owner = this.boxScopeOwners.get(proc)
+      ?? captureBoxScopeOwner(proc.pid,generation,this.boxScopeIncarnation,root)
+    this.boxScopeOwners.set(proc,owner)
+    return {target:{owner,turnKey},prepare:()=>getBoxAgentScopeRegistry().prepareRootStop(owner,turnKey),
+      isCurrent:()=>this.proc===proc && this.spawnGeneration===generation && this.currentSessionId===root}
+  }
+
+  async prepareBoxAgentStop(turnKey: string): Promise<void> {
+    await this.captureBoxAgentStop(turnKey).prepare()
   }
 
   /** Forget the cached CCB session id. Next start() will NOT pass --resume,
@@ -531,8 +575,9 @@ export class SubprocessRunner extends EventEmitter {
       )
     }
 
+    const generation = ++this.spawnGeneration
     const timing = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
-      sessionKey: this.opts.sessionKey, model: this.opts.model, generation: ++this.spawnGeneration },
+      sessionKey: this.opts.sessionKey, model: this.opts.model, generation },
       (fields) => runnerLog.info('engine_process_timing', { ...fields }))
     timing.once('prepare_started')
     this.starting = true
@@ -989,13 +1034,13 @@ export class SubprocessRunner extends EventEmitter {
       // newly spawned runner state.
       if (this.proc !== proc) return
       if (chunk.length > 0) timing.once('first_stdout')
-      this.handleStdout(chunk, timing)
+      this.handleStdout(chunk, timing, { proc,generation })
     })
     proc.stdout.once('close', () => {
       // A process killed immediately after writing a complete JSON object may
       // omit the conventional trailing newline. Feed one delimiter through
       // the normal parser before declaring the stream drained.
-      if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n', timing)
+      if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n', timing, { proc,generation })
       stdoutClosed = true
       resolveThisDrain()
       if (this.resolveOutputDrain === resolveThisDrain) this.resolveOutputDrain = null
@@ -1023,6 +1068,10 @@ export class SubprocessRunner extends EventEmitter {
 
     const restoreSocket = generationRestoreSocket
     proc.on('exit', (code, signal) => {
+      const scopeOwner = this.boxScopeOwners.get(proc)
+      if (scopeOwner) void getBoxAgentScopeRegistry().ownerExited(scopeOwner).catch(() => {
+        runnerLog.warn('box_agent_owner_exit_cleanup_pending', { generation })
+      })
       if (restoreSocket) { void restoreSocket.close().catch(() => {}); if (this.transcriptRestoreSocket === restoreSocket) this.transcriptRestoreSocket = null }
       // shutdown() may have reached its terminal post-SIGKILL deadline and a
       // later submit may already own a new proc. A delayed exit from the old
@@ -1154,7 +1203,8 @@ export class SubprocessRunner extends EventEmitter {
     })
   }
 
-  private handleStdout(chunk: string, timing = this.processTiming): void {
+  private handleStdout(chunk: string, timing = this.processTiming,
+    source?: { proc: ChildProcessWithoutNullStreams; generation: number }): void {
     this.lastActivityAt = Date.now()
 
     // Scan `chunk` in place rather than first concatenating the entire chunk
@@ -1183,6 +1233,12 @@ export class SubprocessRunner extends EventEmitter {
       if (trimmed) {
         try {
           const msg = JSON.parse(trimmed) as SdkMessage
+          if (msg.type === 'control_request' && (msg.request as {subtype?: unknown} | undefined)?.subtype === 'box_agent_scope') {
+            // Dedicated generation-bound control; never parser/permission/root-session input.
+            if (source) void this.handleBoxAgentScope(msg,source).catch(() => {})
+            offset = nlIdx + 1
+            continue
+          }
           if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'init') {
             timing?.once('sdk_init_received')
           }

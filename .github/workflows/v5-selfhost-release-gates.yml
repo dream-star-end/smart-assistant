@@ -148,6 +148,9 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
+      # Build from the clean candidate before installing test-only CCB dependencies.
+      - name: Prepare same-candidate production CCB for real Agent proof
+        run: bash scripts/prepare-v5-box-agent-proof.sh "$PWD"
       - name: Install CCB from lockfile
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts

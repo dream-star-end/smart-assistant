@@ -1,4 +1,6 @@
 import { withUserError } from '@openclaude/protocol'
+import { interruptDelegationsForReceipt, type DelegateGuardHost } from './delegateGuard.js'
+import { capturedStopReceipt } from './boxStopReceipt.js'
 import { SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { captureSystemHelpFrame } from './systemHelpFrames.js'
 import { getSystemHelpRelay } from './systemHelpRelay.js'
@@ -575,7 +577,15 @@ export function handleWsConnection(
           typeof goalFrame.objective === 'string' ? goalFrame.objective : undefined
         await this.sessions.applyUserGoalAction(goalSessionKey, goalAction, goalObjective)
       } else if (frame.type === 'inbound.control.stop') {
-        const applied = await this.handleStop(frame)
+        let applied:boolean
+        try {applied=await this.handleStop(frame)}
+        catch {
+          // No terminal/applied receipt: master retains and retries its
+          // existing durable Stop control until the gateway confirms it.
+          try {ws.send(JSON.stringify(withUserError({type:'error',error:'停止请求尚待持久确认，请稍后重试停止。',
+            errorCode:'BOX_STOP_CONTROL_PENDING'})))} catch {}
+          return
+        }
         const controlId = (frame as unknown as { controlId?: unknown }).controlId
         if (isControlId(controlId)) {
           try {
@@ -1314,6 +1324,19 @@ export async function handleStop(
   const clientMessageId = isClientMessageId(frame.clientMessageId)
     ? frame.clientMessageId
     : undefined
+  const stopControlId=(frame as {controlId?:unknown}).controlId
+  if (clientMessageId) {
+    const captured=await capturedStopReceipt(this as unknown as DelegateGuardHost,{
+      channel:frame.channel,peerId:frame.peer.id,peerKind:frame.peer.kind,clientMessageId,
+      ...(typeof stopControlId==='string' ? {controlId:stopControlId} : {}),
+    })
+    if (captured !== undefined) {
+      if(captured) for(const live of this.sessions.list()) {
+        if(live.sessionKey.endsWith(suffix)) this._settlePendingPermissionsForStop(live.sessionKey,clientMessageId)
+      }
+      return captured
+    }
+  }
 
   // Exact browser identity is authoritative across assistant switches. Scan
   // the peer's live agent sessions and interrupt only the matching owner,
@@ -1321,9 +1344,10 @@ export async function handleStop(
   if (clientMessageId) {
     for (const live of this.sessions.list()) {
       if (!live.sessionKey.endsWith(suffix)) continue
-      const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
+      const selfInterrupted = await (this.sessions.interruptForReceipt?.(live.sessionKey,{clientMessageId})
+        ?? this.sessions.interruptClientTurn(live.sessionKey, clientMessageId))
       if (!selfInterrupted) continue
-      const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+      const delegateInterrupted = await interruptDelegationsForReceipt(this as unknown as DelegateGuardHost,live.sessionKey)
       const ok = selfInterrupted || delegateInterrupted
       // The turn is gone; any permission it was blocked on must not
       // outlive it as a dead card (browser) / pending row (master).
@@ -1373,8 +1397,8 @@ export async function handleStop(
       let interrupted = false
       for (const live of this.sessions.list()) {
         if (!live.sessionKey.endsWith(suffix)) continue
-        const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
-        const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+        const selfInterrupted = await (this.sessions.interruptForReceipt?.(live.sessionKey) ?? this.sessions.interrupt(live.sessionKey, 'user'))
+        const delegateInterrupted = await interruptDelegationsForReceipt(this as unknown as DelegateGuardHost,live.sessionKey)
         if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
         interrupted = selfInterrupted || delegateInterrupted || interrupted
       }
@@ -1393,8 +1417,8 @@ export async function handleStop(
       sessionKey = routed.sessionKey
     }
   }
-  const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
-  const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+  const selfInterrupted = await (this.sessions.interruptForReceipt?.(sessionKey) ?? this.sessions.interrupt(sessionKey, 'user'))
+  const delegateInterrupted = await interruptDelegationsForReceipt(this as unknown as DelegateGuardHost,sessionKey)
   if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
   let ok = selfInterrupted || delegateInterrupted
   // Compatibility containment for already-open clients: if their selector
@@ -1403,8 +1427,8 @@ export async function handleStop(
   if (!ok && frame.agentId) {
     for (const live of this.sessions.list()) {
       if (!live.sessionKey.endsWith(suffix)) continue
-      const fallbackSelf = this.sessions.interrupt(live.sessionKey, 'user')
-      const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
+      const fallbackSelf = await (this.sessions.interruptForReceipt?.(live.sessionKey) ?? this.sessions.interrupt(live.sessionKey, 'user'))
+      const fallbackDelegates = await interruptDelegationsForReceipt(this as unknown as DelegateGuardHost,live.sessionKey)
       if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
       ok = fallbackSelf || fallbackDelegates || ok
     }

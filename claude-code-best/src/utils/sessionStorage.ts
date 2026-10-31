@@ -1241,7 +1241,7 @@ class Project {
           entrypoint: getEntrypoint(),
           cwd: getCwd(),
           sessionId,
-          timestamp: preserveMessageTimestamp && message.timestamp
+          timestamp: preserveMessageTimestamp && typeof message.timestamp === 'string' && message.timestamp
             ? message.timestamp
             : new Date().toISOString(),
           version: VERSION,
@@ -3772,9 +3772,12 @@ function walkChainBeforeParse(buf: Buffer, prune: boolean): TranscriptWalkResult
     const nl = buf.indexOf(10, start)
     const end = nl < 0 ? buf.length : nl + 1
     const line = buf.subarray(start, end)
-    if (!line.toString('utf8').trim()) { ranges.push({ start, end }); start = end; continue }
     let entry: Entry
-    try { entry = JSON.parse(decoder.decode(line)) as Entry }
+    try {
+      const decoded = decoder.decode(line)
+      if (!decoded.trim()) { ranges.push({ start, end }); start = end; continue }
+      entry = JSON.parse(decoded) as Entry
+    }
     catch {
       if (managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_CORRUPT')
       return { buffer: buf }

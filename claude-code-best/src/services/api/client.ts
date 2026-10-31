@@ -1,3 +1,4 @@
+import { currentBoxAgentInvocation, ensureBoxAgentScope, isBoxApiModel, scopedBoxHeaders } from '../../utils/boxAgentScope.js'
 import { createCcbBudgetFetch } from './requestBodyBudget.js'
 import { BOX_NATIVE_CONTEXT_MODELS } from '../../utils/model/boxNativeRemoteContext.js'
 import { getCwd } from '../../utils/cwd.js'
@@ -101,7 +102,8 @@ export async function getAnthropicClient({
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
-  const customHeaders = getCustomHeaders()
+  await ensureBoxAgentScope(model)
+  const customHeaders = scopedBoxHeaders(getCustomHeaders())
   const defaultHeaders: { [key: string]: string } = {
     'x-app': 'cli',
     'User-Agent': getUserAgent(),
@@ -140,7 +142,7 @@ export async function getAnthropicClient({
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
 
-  const resolvedFetch = buildFetch(fetchOverride, source)
+  const resolvedFetch = buildFetch(fetchOverride, source, model)
 
   const ARGS = {
     defaultHeaders,
@@ -362,7 +364,9 @@ export const CLIENT_REQUEST_ID_HEADER = 'x-client-request-id'
 function buildFetch(
   fetchOverride: ClientOptions['fetch'],
   source: string | undefined,
+  model: string | undefined,
 ): ClientOptions['fetch'] {
+  const invocation = currentBoxAgentInvocation()
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
   const inner = createCcbBudgetFetch(fetchOverride ?? globalThis.fetch, {
     enabled: () => !!process.env.OPENCLAUDE_SESSION_KEY && getAPIProvider() === 'firstParty',
@@ -378,6 +382,16 @@ function buildFetch(
   return (input, init) => {
     // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins
     const headers = new Headers(init?.headers)
+    if (invocation) {
+      // SDK/client retries may reuse defaultHeaders after a rolling renewal.
+      // Refresh only the captured invocation's owned fields at actual fetch.
+      if (isBoxApiModel(model) && (invocation.closed || !invocation.registered)) {
+        throw new Error('BOX_AGENT_SCOPE_CLOSED')
+      }
+      const refreshed = scopedBoxHeaders(Object.fromEntries(headers),invocation)
+      for (const name of [...headers.keys()]) headers.delete(name)
+      for (const [name,value] of Object.entries(refreshed)) headers.set(name,value)
+    }
     // Generate a client-side request ID so timeouts (which return no server
     // request ID) can still be correlated with server logs by the API team.
     // Callers that want to track the ID themselves can pre-set the header.

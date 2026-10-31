@@ -24,6 +24,7 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { GoalStateSnapshot, JobTerminal, OutboundContentBlock } from '@openclaude/protocol'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { TurnModelAuthority, UsageAttributionTag } from '../subprocessRunner.js'
+import type { BoxScopeOwner } from './boxAgentScopeRegistry.js'
 import type {
   EngineEvent,
   DurableRuntimeEvent,
@@ -222,6 +223,11 @@ export interface EngineAdapter extends EventEmitter {
   submitTurn(params: TurnParams): EngineTurnRun
   /** Only the explicit browser Stop may use reason='user'; automatic timeout,
    * quota and recovery interrupts default to system. */
+  prepareInterrupt?(reason: 'user' | 'system', turnKey?: string): Promise<void>
+  captureInterruptForReceipt?(turnKey?: string): {
+    target?:{owner:BoxScopeOwner;turnKey:string}
+    prepare:()=>Promise<void>;interrupt:()=>boolean
+  }
   interrupt(reason?: 'user' | 'system'): boolean
   shutdown(): Promise<void>
   /** Resolves only after the current process generation's stdout has closed.

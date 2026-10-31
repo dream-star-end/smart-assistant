@@ -1,3 +1,4 @@
+import { bindBoxAgentControlTransport } from '../utils/boxAgentScope.js'
 import { flushBeforeSessionChange } from '../utils/sessionTransition.js'
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle'
@@ -609,6 +610,7 @@ export async function runHeadless(
   }
 
   const structuredIO = getStructuredIO(inputPrompt, options)
+  bindBoxAgentControlTransport(request => structuredIO.requestBoxAgentScope(request))
 
   // When emitting NDJSON for SDK clients, any stray write to stdout (debug
   // prints, dependency console.log, library banners) breaks the client's
@@ -4041,15 +4043,14 @@ function runHeadlessStreaming(
           })
         } else if (msg.request.subtype === 'stop_task') {
           const { task_id: taskId } = msg.request
-          try {
-            await stopTask(taskId, {
-              getAppState,
-              setAppState,
-            })
-            sendControlResponseSuccess(msg, {})
-          } catch (error) {
-            sendControlResponseError(msg, errorMessage(error))
-          }
+          // Keep consuming stdin: a Box scope ACK arrives through that same
+          // loop. Respond only after the actual durable Stop result settles.
+          void (async () => {
+            try {
+              const stopped = await stopTask(taskId, { getAppState, setAppState })
+              sendControlResponseSuccess(msg, stopped.remoteStop ? { remote_stop: stopped.remoteStop } : {})
+            } catch (error) { sendControlResponseError(msg, errorMessage(error)) }
+          })()
         } else if (req.subtype === 'generate_session_title') {
           // Fire-and-forget so the Haiku call does not block the stdin loop
           // (which would delay processing of subsequent user messages /

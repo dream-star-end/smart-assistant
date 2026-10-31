@@ -22,6 +22,7 @@ type InputSchema = ReturnType<typeof inputSchema>
 const outputSchema = lazySchema(() =>
   z.object({
     message: z.string().describe('Status message about the operation'),
+    remote_stop: z.enum(['pending', 'stopped']).optional(),
     task_id: z.string().describe('The ID of the task that was stopped'),
     task_type: z.string().describe('The type of the task that was stopped'),
     // Optional: tool outputs are persisted to transcripts and replayed on --resume
@@ -121,7 +122,10 @@ export const TaskStopTool = buildTool({
 
     return {
       data: {
-        message: `Successfully stopped task: ${result.taskId} (${result.command})`,
+        message: result.remoteStop === 'pending'
+          ? `Stop requested for task: ${result.taskId}; remote Box stop proof pending`
+          : `Successfully stopped task: ${result.taskId} (${result.command})`,
+        ...(result.remoteStop ? { remote_stop: result.remoteStop } : {}),
         task_id: result.taskId,
         task_type: result.taskType,
         command: result.command,

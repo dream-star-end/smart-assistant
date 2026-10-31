@@ -4,7 +4,7 @@
 # 的原子生命周期在真 SQL 下成立、每张新表都登记了保留策略(retentionRegistry)
 # —— 即"发版带的 schema 变更不会在生产上炸,也不会留下无人清理的表"。
 #
-# min-tests: 244
+# min-tests: 254
 # max-minutes: 20
 packages/commercial/src/__tests__/migrate.integ.test.ts
 packages/commercial/src/__tests__/migrate_full.integ.test.ts
@@ -35,3 +35,8 @@ packages/commercial/src/__tests__/migration0330TurnLeaseBinding.integ.test.ts
 packages/commercial/src/__tests__/sec-authrefresh.integ.test.ts
 packages/commercial/src/__tests__/sec-authrefresh-http.integ.test.ts
 packages/commercial/src/__tests__/migration0331RefreshReissueClientIp.integ.test.ts
+
+packages/commercial/src/__tests__/migration0332BoxAgentScopes.integ.test.ts
+
+# OCV5-664 schema-owned invocation generation and physical-stop fence, nine real-PG cases.
+packages/commercial/src/http/proxy/boxAgentScopes.integ.test.ts

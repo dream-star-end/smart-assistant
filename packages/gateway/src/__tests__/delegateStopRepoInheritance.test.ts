@@ -147,13 +147,13 @@ test('stop interrupts active delegate children for the stopped parent session', 
   )
   assert.match(
     handleStop,
-    /this\._interruptDelegationsForParent\(\s*live\.sessionKey\s*\)/,
-    'agent-less stop fallback must propagate stop to child delegates',
+    /await interruptDelegationsForReceipt\(this as unknown as DelegateGuardHost,live\.sessionKey\)/,
+    'agent-less stop fallback must await durable child delegate Stop receipts',
   )
   assert.match(
     handleStop,
-    /this\._interruptDelegationsForParent\(\s*sessionKey\s*\)/,
-    'direct stop must propagate stop to child delegates',
+    /await interruptDelegationsForReceipt\(this as unknown as DelegateGuardHost,sessionKey\)/,
+    'direct stop must await durable child delegate Stop receipts',
   )
   assert.match(
     SERVER_TS,
@@ -180,9 +180,12 @@ test('exact browser Stop finds the old assistant turn and cascades through its t
   )
   assert.match(
     handleStop,
-    /if \(clientMessageId\)[\s\S]*_interruptDelegationsForParent\(live\.sessionKey\)/,
-    'an exact leader Stop must cascade to active delegates and hidden reviewer descendants',
+    /if \(clientMessageId\)[\s\S]*await capturedStopReceipt\(/,
+    'an exact leader Stop must use the captured durable Stop tree before returning its receipt',
   )
+  const captured=readFileSync(join(__dirname,'../boxStopReceipt.ts'),'utf8')
+  assert.match(captured,/for\(const child of host\._activeDelegationsByParent\?\.get\(key\) \?\? \[\]\) capture\(child\)/,
+    'captured exact Stop must recurse through every active delegate and hidden reviewer descendant')
 })
 
 test('delegate handler wires the unified additive toolset resolver (no fatal intersection)', () => {

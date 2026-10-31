@@ -1,3 +1,4 @@
+import { assertBoxAgentRequestActive, assertSameBoxAgentScope } from "./boxAgentScopeFence.js";
 /** One bounded physical invocation may retire into another invocation of the same logical turn.
  * Claims contain hashes/identity only. No tool result is published by this module. */
 import { randomUUID } from "node:crypto";
@@ -56,6 +57,7 @@ export async function claimToolRollover(client: PoolClient, input: { uid: bigint
   handoff: BoxStoredToolHandoff; nextContextHash: string; resultHashes: readonly Hash[];
   lastUserMessage: unknown }): Promise<BoxToolRolloverClaim | null> {
   const { ctx,handoff } = input;
+  assertSameBoxAgentScope(typeof input.childCtx.boxAgentScopeId === "string" ? input.childCtx.boxAgentScopeId : undefined, ctx, input.childCtx);
   const roots = await client.query<{ age_ms: string }>(
     `SELECT (EXTRACT(EPOCH FROM (NOW()-created_at))*1000)::bigint::text AS age_ms
       FROM request_finalize_journal WHERE user_id=$1 AND ctx->>'boxRunNonce'=$2
@@ -112,6 +114,7 @@ export async function finishToolRollover(pool: Db, input: { uid: bigint; request
   try {
     await client.query("BEGIN");
     const child = await lockedChild(client,input.uid,input.requestId);
+    await assertBoxAgentRequestActive(client,input.uid,input.requestId);
     const receipt = parseToolRollover(child.boxRolloverFrom);
     if (!receipt || receipt.requestId !== input.requestId || child.boxRolloverCancelled !== undefined
       || child.boxCancelIntent !== undefined || child.boxState !== undefined
@@ -255,11 +258,26 @@ export async function withToolRolloverLaunchFence(pool: Db, uid: bigint, request
   run: (query: PoolClient["query"]) => Promise<void>): Promise<void> {
   const peek = await pool.query<{ ctx: Record<string,unknown> }>(
     "SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2",[uid.toString(),requestId]);
-  if (peek.rows[0]?.ctx.boxRolloverFrom === undefined) { await run(pool.query.bind(pool)); return; }
+  const initial = peek.rows[0]?.ctx;
+  if (initial?.boxRolloverFrom === undefined && initial?.boxAgentScopeId === undefined) {
+    await run(pool.query.bind(pool)); return;
+  }
   const client = await pool.connect(); let done = false;
   try {
     await client.query("BEGIN");
-    const ctx = await lockedChild(client,uid,requestId);
+    let ctx: Record<string,unknown>;
+    if (initial?.boxRolloverFrom !== undefined) ctx = await lockedChild(client,uid,requestId);
+    else {
+      const sessionId = initial?.boxSessionId;
+      if (typeof sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) fail();
+      await lock(client,[`box:session:${uid}:${sessionId}`]);
+      const current = await client.query<{ctx: Record<string,unknown>}>(
+        "SELECT ctx FROM request_finalize_journal WHERE user_id=$1 AND request_id=$2 FOR UPDATE",
+        [uid.toString(),requestId]);
+      if (current.rowCount !== 1 || current.rows[0]!.ctx.boxSessionId !== sessionId) fail();
+      ctx = current.rows[0]!.ctx;
+    }
+    await assertBoxAgentRequestActive(client,uid,requestId);
     await assertToolRolloverLaunch(client,uid,requestId,ctx);
     await run(client.query.bind(client)); await client.query("COMMIT"); done = true;
   } finally { if (!done) await client.query("ROLLBACK").catch(() => {}); client.release(); }

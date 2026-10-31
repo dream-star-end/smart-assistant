@@ -22,6 +22,12 @@ import {
 import { BOX_NATIVE_CONTEXT_MODEL } from '../modelAuthority.js'
 
 describe('boxApiModels', () => {
+  it('keeps the builtin Agent API session matcher exact for every official Box route', () => {
+    const source=readFileSync(new URL('../../../../claude-code-best/src/utils/boxAgentScope.ts',import.meta.url),'utf8')
+    const array=source.match(/export const BOX_AGENT_API_MODELS: readonly string\[\] = \[([\s\S]*?)\n\]/)?.[1]
+    assert.ok(array,'actual CCB Agent model matcher mirror must exist')
+    assert.deepEqual([...array.matchAll(/'([^']+)'/g)].map(match=>match[1]),BOX_API_MODEL_IDS)
+  })
   it('lists opus, sonnet and both haikus with the id the Box CLI reports', () => {
     assert.deepEqual(BOX_API_MODELS.map((m) => [m.id, m.upstreamModel, m.maxOutputTokens, m.supportsEffort, m.runner]), [
       ['box-api-claude-opus-5-5', 'claude-opus-5-5', 128_000, true, 'print'],

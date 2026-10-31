@@ -117,6 +117,13 @@ test('missing malformed wrong-model and user 1m descriptors cannot grant a large
   expect(upperCase?.inputBudget).toBe(822000)
 })
 
+test('missing internal message payloads cannot produce a native fit', async () => {
+  for (const type of ['user', 'assistant', 'attachment']) {
+    expect(await buildIdleNativeFit(asMessages([{ type, uuid: 'missing' }]), MODEL, envFor()))
+      .toBeUndefined()
+  }
+})
+
 test('PDF URL unknown corrupt and oversized media keep the conservative old path', async () => {
   const wide = await sharp({ create: { width: 2001, height: 2, channels: 3,
     background: { r: 0, g: 0, b: 0 } } }).jpeg().toBuffer()

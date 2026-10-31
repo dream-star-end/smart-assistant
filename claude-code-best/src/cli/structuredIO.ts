@@ -1,3 +1,4 @@
+import { renewBoxAgentOrigins, type BoxAgentControl, type BoxAgentControlResult } from '../utils/boxAgentScope.js'
 import { feature } from 'bun:bundle'
 import type {
   ElicitResult,
@@ -365,6 +366,7 @@ export class StructuredIO {
         // (CLAUDE_CODE_SESSION_ACCESS_TOKEN) which must be readable
         // by the REPL process itself, not just child Bash commands.
         const variables = message.variables ?? {}
+        renewBoxAgentOrigins(variables)
         const keys = Object.keys(variables)
         for (const [key, value] of Object.entries(variables)) {
           process.env[key] = value
@@ -487,6 +489,13 @@ export class StructuredIO {
 
   async write(message: StdoutMessage): Promise<void> {
     writeToStdout(ndjsonSafeStringify(message) + '\n')
+  }
+
+  async requestBoxAgentScope(request: BoxAgentControl): Promise<BoxAgentControlResult> {
+    return this.sendRequest<BoxAgentControlResult>(request, z.object({
+      scopeId: z.string().uuid(), sequence: z.number().int().positive(),
+      status: z.enum(['active', 'pending', 'stopped']),
+    }), AbortSignal.timeout(70_000))
   }
 
   private async sendRequest<Response>(

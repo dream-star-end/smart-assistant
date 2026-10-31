@@ -1302,6 +1302,12 @@ build_master_release() {
     cleanup_master_staging
     die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
   fi
+  # Actual builtin Agent proof runs this candidate's production CCB, prepared
+  # visibly before the unchanged incident gate deadline/load isolation.
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash "$staging/scripts/prepare-v5-box-agent-proof.sh" "$staging" ); then
+    cleanup_master_staging
+    die "pinned Box Agent proof production CCB preparation failed"
+  fi
   # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
   master_gate_box_incident_proofs() {
     ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \

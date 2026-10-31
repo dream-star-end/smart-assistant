@@ -1,3 +1,4 @@
+import { stopBoxAgentById } from '../../utils/boxAgentScope.js';
 import type { BetaUsage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs';
 import { getSdkAgentProgressSummariesEnabled } from '../../bootstrap/state.js';
 import {
@@ -358,13 +359,21 @@ export const LocalAgentTask: Task = {
 /**
  * Kill an agent task. No-op if already killed/completed.
  */
-export function killAsyncAgent(taskId: string, setAppState: SetAppState): void {
+export function killAsyncAgent(
+  taskId: string,
+  setAppState: SetAppState,
+  expected?: Pick<LocalAgentTaskState, 'startTime' | 'abortController'>,
+  suppressNotification = false,
+): boolean {
   let killed = false;
+  const stoppedTask: { value?: LocalAgentTaskState } = {};
   updateTaskState<LocalAgentTaskState>(taskId, setAppState, task => {
-    if (task.status !== 'running') {
+    if (task.type !== 'local_agent' || task.status !== 'running'
+      || (expected && (task.startTime !== expected.startTime || task.abortController !== expected.abortController))) {
       return task;
     }
     killed = true;
+    stoppedTask.value = task;
     task.abortController?.abort();
     task.unregisterCleanup?.();
     return {
@@ -375,23 +384,62 @@ export function killAsyncAgent(taskId: string, setAppState: SetAppState): void {
       abortController: undefined,
       unregisterCleanup: undefined,
       selectedAgent: undefined,
+      notified: suppressNotification || task.notified,
     };
   });
   if (killed) {
     void evictTaskOutput(taskId);
-  }
-}
-
-/**
- * Kill all running agent tasks.
- * Used by ESC cancellation in coordinator mode to stop all subagents.
- */
-export function killAllRunningAgentTasks(tasks: Record<string, TaskState>, setAppState: SetAppState): void {
-  for (const [taskId, task] of Object.entries(tasks)) {
-    if (task.type === 'local_agent' && task.status === 'running') {
-      killAsyncAgent(taskId, setAppState);
+    if (suppressNotification && stoppedTask.value) {
+      emitTaskTerminatedSdk(taskId, 'stopped', {
+        toolUseId: stoppedTask.value.toolUseId,
+        summary: stoppedTask.value.description,
+      });
     }
   }
+  return killed;
+}
+
+/** The durable remote intent must precede the local abort, for every Stop entry. */
+export async function stopLocalAgentTask(
+  taskId: string,
+  task: LocalAgentTaskState,
+  setAppState: SetAppState,
+  suppressNotification = false,
+): Promise<{ stopped: boolean; remoteStop?: 'pending' | 'stopped' }> {
+  const remoteStop = await stopBoxAgentById(taskId);
+  const stopped = killAsyncAgent(taskId, setAppState, task, suppressNotification);
+  return { stopped, ...(remoteStop ? { remoteStop } : {}) };
+}
+
+type AgentStopOutcome = {
+  taskId: string;
+  task: LocalAgentTaskState;
+  status: 'stopped' | 'unchanged' | 'failed';
+  remoteStop?: 'pending' | 'stopped';
+};
+
+/**
+ * Explicit bulk Stop; ordinary root ESC does not use this path.
+ * Capture every target before yielding; resumed replacements must survive.
+ */
+export async function killAllRunningAgentTasks(
+  tasks: Record<string, TaskState>,
+  setAppState: SetAppState,
+): Promise<AgentStopOutcome[]> {
+  const pending: Promise<AgentStopOutcome>[] = [];
+  for (const [taskId, task] of Object.entries(tasks)) {
+    if (task.type !== 'local_agent' || task.status !== 'running') continue;
+    pending.push((async (): Promise<AgentStopOutcome> => {
+      try {
+        const result = await stopLocalAgentTask(taskId, task, setAppState, true);
+        return { taskId, task, status: result.stopped ? 'stopped' : 'unchanged',
+          ...(result.remoteStop ? { remoteStop: result.remoteStop } : {}) };
+      } catch {
+        return { taskId, task, status: 'failed' };
+      }
+    })());
+  }
+  return Promise.all(pending);
 }
 
 /**
@@ -626,6 +674,7 @@ export function registerAgentForeground({
 }): {
   taskId: string;
   backgroundSignal: Promise<void>;
+  abortController: AbortController;
   cancelAutoBackground?: () => void;
 } {
   void initTaskOutputAsSymlink(agentId, getAgentTranscriptPath(asAgentId(agentId)));
@@ -696,7 +745,7 @@ export function registerAgentForeground({
     cancelAutoBackground = () => clearTimeout(timer);
   }
 
-  return { taskId: agentId, backgroundSignal, cancelAutoBackground };
+  return { taskId: agentId, backgroundSignal, abortController, cancelAutoBackground };
 }
 
 /**

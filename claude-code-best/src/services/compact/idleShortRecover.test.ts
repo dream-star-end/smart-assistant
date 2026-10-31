@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -14,6 +15,7 @@ import {
   readIdleOp,
   readPendingIdle,
   writeIdleNative,
+  writeIdleCandidate,
 } from '../../../../packages/gateway/src/boxIdleCompact.ts'
 import { SessionManager } from '../../../../packages/gateway/src/sessionManager.ts'
 import { runIdleCompact } from './idleRecover.ts'
@@ -41,7 +43,7 @@ test('a native short that crashes before the gateway write is settled on the nex
         res.setHeader('content-type', 'application/json')
         res.end(JSON.stringify({
           status: 'terminal', sessionId: 'native-session', turnKey: sourceTurn,
-          requestId: 'req', revision: 'rev1', compactRequired: false, capsuleSha256: 'b'.repeat(64),
+          requestId: 'req', revision: 'rev1', compactRequired: true, capsuleSha256: 'b'.repeat(64),
         }))
         return
       }
@@ -63,22 +65,34 @@ test('a native short that crashes before the gateway write is settled on the nex
   process.env.OPENCLAUDE_V3_MASTER_BASE_URL = base
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.test-token'
   after(async () => {
-    process.env.ANTHROPIC_BASE_URL = previous.base
-    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = previous.internal
-    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = previous.token
-    process.env.CLAUDE_CODE_EXTRA_METADATA = previous.meta
-    server.close()
-    await rm(dir, { recursive: true, force: true })
+    for (const [key, value] of [
+      ['ANTHROPIC_BASE_URL', previous.base],
+      ['OPENCLAUDE_V3_MASTER_BASE_URL', previous.internal],
+      ['OPENCLAUDE_V3_CONTAINER_TOKEN', previous.token],
+      ['CLAUDE_CODE_EXTRA_METADATA', previous.meta],
+    ] as const) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    try {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   const source = { sessionId: 'native-session', turnKey: 'a'.repeat(64) }
   let submits = 0
+  let ends = 0
+  let crashedAfterNativeShort = false
   const session = {
     sessionKey: 'short-crash',
     model: BOX_NATIVE_CONTEXT_MODEL,
     _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER,
-    runner: {
+    runner: Object.assign(new EventEmitter(), {
       submitTurn: ({ turnKey }: { turnKey: string }) => ({
+        submitted: Promise.resolve(),
+        end: () => { ends += 1 },
         summary: (async () => {
           submits += 1
           process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({ oc_turn_key: turnKey })
@@ -91,25 +105,39 @@ test('a native short that crashes before the gateway write is settled on the nex
             load: async () => null,
           })
           assert.equal(nativeResult, 'short')
+          crashedAfterNativeShort = true
           throw new Error('crash after native short, before gateway summary')
         })(),
       }),
-    },
+    }),
   }
-  await assert.rejects(finish.call({}, session, source, dir), /crash after native short/)
+  writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: source.sessionId, turnKey: source.turnKey })
+  // The current idle handler retains the failed turn for receipt recovery.
+  await finish.call({}, session, source, dir)
+  assert.equal(crashedAfterNativeShort, true)
   assert.equal(submits, 1)
+  assert.equal(ends, 1)
   assert.equal(readIdleNative(dir, source.sessionId, 'rev1')?.applied, true)
-  assert.equal(readPendingIdle(dir, session.sessionKey)?.disposition, undefined)
+  const pendingAfterCrash = readPendingIdle(dir, session.sessionKey)
+  assert.ok(pendingAfterCrash)
+  assert.equal(pendingAfterCrash.disposition, undefined)
+  assert.equal(nativeShortForOp(readIdleNative(dir, source.sessionId, 'rev1'), {
+    idleTurnKey: pendingAfterCrash.idleTurnKey, revision: 'rev1', sourceSessionId: source.sessionId,
+  }), true)
 
   await finish.call({}, session, source, dir)
   const recovered = readIdleOp(dir, session.sessionKey, 'rev1')
   const pending = readPendingIdle(dir, session.sessionKey)
   const candidate = readIdleCandidate(dir, session.sessionKey)
   assert.equal(submits, 1)
+  assert.equal(ends, 1)
   assert.equal(pending, undefined)
   assert.equal(recovered?.disposition, 'short')
   assert.equal(candidate, undefined)
-  assert.equal(seen.every((turn) => turn === source.turnKey), true)
+  assert.equal(recovered?.idleTurnKey, pendingAfterCrash.idleTurnKey)
+  assert.equal(seen.includes(source.turnKey), true)
+  assert.equal(seen.includes(pendingAfterCrash.idleTurnKey), true)
+  assert.equal(seen.every((turn) => turn === source.turnKey || turn === pendingAfterCrash.idleTurnKey), true)
   assert.equal(idleHistoryStillBlocked({ candidate, pending, recovered }), false)
 
   const foreign = createHash('sha256').update('other-op').digest('hex')

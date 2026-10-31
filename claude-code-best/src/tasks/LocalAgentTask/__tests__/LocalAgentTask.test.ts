@@ -123,11 +123,28 @@ const {
   completeAgentTask,
   failAgentTask,
   killAsyncAgent,
+  killAllRunningAgentTasks,
+  stopLocalAgentTask,
   enqueueAgentNotification,
   registerAsyncAgent,
   updateAgentProgress,
   isLocalAgentTask,
 } = await import('../LocalAgentTask.js')
+const { bindBoxAgentControlTransport, createBoxAgentInvocation, ensureBoxAgentScope,
+  finishBoxAgentInvocation } = await import('../../../utils/boxAgentScope.js')
+const { runWithAgentContext } = await import('../../../utils/agentContext.js')
+const boxScopes: NonNullable<ReturnType<typeof createBoxAgentInvocation>>[] = []
+async function registerBoxTask(taskId: string) {
+  const invocation = createBoxAgentInvocation({
+    rootSessionId: '01234567-89ab-4cde-8fab-0123456789ab',
+    extraMetadata: JSON.stringify({ oc_turn_key: 'a'.repeat(64) }), turnKey: 'a'.repeat(64),
+    headers: { 'x-oc-model-authority': 'synthetic-authority' }, descriptor: undefined,
+  }, taskId, true)!
+  boxScopes.push(invocation)
+  bindBoxAgentControlTransport(async request => ({ scopeId: request.scopeId, sequence: request.sequence, status: 'active' }))
+  await runWithAgentContext({ agentType: 'subagent', agentId: taskId, boxInvocation: invocation },
+    () => ensureBoxAgentScope('box-claude-haiku-5-5'))
+}
 
 // ─── Helpers ───
 
@@ -182,7 +199,9 @@ function makeAssistantMessage(usage: any, content: any[] = []): any {
   }
 }
 
-afterEach(() => {
+afterEach(async () => {
+  bindBoxAgentControlTransport(async request => ({ scopeId: request.scopeId, sequence: request.sequence, status: 'pending' }))
+  await Promise.all(boxScopes.splice(0).map(scope => finishBoxAgentInvocation(scope)))
   enqueuedNotifications.length = 0
   enqueuedCommands.length = 0
   emittedSdkEvents.length = 0
@@ -376,6 +395,100 @@ describe('killAsyncAgent', () => {
 
     const task = getState().tasks['test-agent-001']
     expect(task.status).toBe('completed')
+  })
+})
+
+describe('durable Box task Stop', () => {
+  test('bulk Stop waits for a real ACK before aborting, marking notified, and emitting stopped', async () => {
+    const task = makeRunningTask()
+    const { setAppState, getState } = createSetAppState({ tasks: { [task.id]: task } })
+    await registerBoxTask(task.id)
+    let acknowledge!: () => void
+    const ack = new Promise<void>(resolve => { acknowledge = resolve })
+    bindBoxAgentControlTransport(async request => {
+      await ack
+      return { scopeId: request.scopeId, sequence: request.sequence, status: 'pending' }
+    })
+    const stopping = killAllRunningAgentTasks(getState().tasks, setAppState as any)
+    expect(task.abortController.signal.aborted).toBe(false)
+    expect(getState().tasks[task.id].status).toBe('running')
+    expect(getState().tasks[task.id].notified).toBe(false)
+    expect(emittedSdkEvents).toHaveLength(0)
+    acknowledge()
+    const [result] = await stopping
+    expect(result!.status).toBe('stopped')
+    expect(result!.remoteStop).toBe('pending')
+    expect(task.abortController.signal.aborted).toBe(true)
+    expect(getState().tasks[task.id].notified).toBe(true)
+    expect(emittedSdkEvents.map(event => event.status)).toEqual(['stopped'])
+  })
+
+  test('failed durable control preserves the local task and never emits success', async () => {
+    const task = makeRunningTask()
+    const { setAppState, getState } = createSetAppState({ tasks: { [task.id]: task } })
+    await registerBoxTask(task.id)
+    bindBoxAgentControlTransport(async () => { throw new Error('durable persist failed') })
+    await expect(stopLocalAgentTask(task.id, task, setAppState as any)).rejects.toThrow('durable persist failed')
+    const [result] = await killAllRunningAgentTasks(getState().tasks, setAppState as any)
+    expect(result!.status).toBe('failed')
+    expect(task.abortController.signal.aborted).toBe(false)
+    expect(getState().tasks[task.id].status).toBe('running')
+    expect(getState().tasks[task.id].notified).toBe(false)
+    expect(emittedSdkEvents).toHaveLength(0)
+  })
+
+  test('a resumed generation under the same ID survives the old Stop ACK', async () => {
+    const task = makeRunningTask()
+    const replacement = makeRunningTask({ startTime: task.startTime })
+    const { setAppState, getState } = createSetAppState({ tasks: { [task.id]: task } })
+    await registerBoxTask(task.id)
+    let acknowledge!: () => void
+    const ack = new Promise<void>(resolve => { acknowledge = resolve })
+    bindBoxAgentControlTransport(async request => {
+      await ack
+      return { scopeId: request.scopeId, sequence: request.sequence, status: 'pending' }
+    })
+    const stopping = killAllRunningAgentTasks(getState().tasks, setAppState as any)
+    setAppState(prev => ({ ...prev, tasks: { [task.id]: replacement } }))
+    acknowledge()
+    const [result] = await stopping
+    expect(result!.status).toBe('unchanged')
+    expect(getState().tasks[task.id]).toBe(replacement)
+    expect(replacement.abortController.signal.aborted).toBe(false)
+    expect(replacement.notified).toBe(false)
+    expect(emittedSdkEvents).toHaveLength(0)
+  })
+
+  test('an acknowledged target emits immediately while another target waits, without notifying its replacement', async () => {
+    const first = makeRunningTask({ id: 'first', toolUseId: 'old-first' })
+    const second = makeRunningTask({ id: 'second' })
+    const { setAppState, getState } = createSetAppState({ tasks: { first, second } })
+    await registerBoxTask(first.id)
+    await registerBoxTask(second.id)
+    let releaseSecond!: () => void
+    const secondAck = new Promise<void>(resolve => { releaseSecond = resolve })
+    let firstKilled!: () => void
+    const firstDone = new Promise<void>(resolve => { firstKilled = resolve })
+    bindBoxAgentControlTransport(async request => {
+      if (request.agentId === 'second') await secondAck
+      return { scopeId: request.scopeId, sequence: request.sequence, status: 'pending' }
+    })
+    const trackedSet: typeof setAppState = updater => {
+      setAppState(updater)
+      if (getState().tasks.first.status === 'killed') firstKilled()
+    }
+    const stopping = killAllRunningAgentTasks(getState().tasks, trackedSet as any)
+    await firstDone
+    expect(emittedSdkEvents.map(event => event.taskId)).toEqual(['first'])
+    const replacement = makeRunningTask({ id: 'first', startTime: first.startTime })
+    setAppState(prev => ({ ...prev, tasks: { ...prev.tasks, first: replacement } }))
+    releaseSecond()
+    expect((await stopping).map(result => result.status)).toEqual(['stopped', 'stopped'])
+    expect(replacement.abortController.signal.aborted).toBe(false)
+    expect(replacement.notified).toBe(false)
+    expect(emittedSdkEvents.map(event => [event.taskId, event.opts.toolUseId])).toEqual([
+      ['first', 'old-first'], ['second', undefined],
+    ])
   })
 })
 

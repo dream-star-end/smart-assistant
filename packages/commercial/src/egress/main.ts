@@ -1,3 +1,6 @@
+import { BOX_AGENT_SCOPE_PATH } from '@openclaude/protocol';
+import { BoxAgentScopes } from '../http/proxy/boxAgentScopes.js';
+import { makeBoxAgentScopeHandler } from '../http/proxy/boxAgentScopeHandler.js';
 import { FileBoxContextTransport } from "../http/proxy/boxContextTransport.js";
 import { startLogTimingReporter } from '../logging/logTimingReporter.js';
 /**
@@ -499,6 +502,10 @@ export async function startEgress(): Promise<void> {
   const boxStopHandler = makeBoxUserStopHandler({ identity: identityStrategy,
     journal: boxStopJournal,
     coordinator: boxStopCoordinator });
+  const boxAgentScopeHandler = makeBoxAgentScopeHandler({ identity: identityStrategy,
+    scopes: new BoxAgentScopes({ pool: getPool(), journal: boxStopJournal,
+      coordinator: boxStopCoordinator,
+      recoverPrelaunch: (candidate,scopeId) => boxRecoveryModel.recoverPrelaunchCandidate(candidate,scopeId) }) });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
     journal: boxStopJournal, readCapsule: boxReplayReader,
     stopParked: { journal: new BoxHoldRelease(getPool()), coordinator: boxStopCoordinator } });
@@ -706,6 +713,12 @@ export async function startEgress(): Promise<void> {
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ error: "BOX_LOGIN_STORE_UNAVAILABLE" }));
         } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
+    if (path === BOX_AGENT_SCOPE_PATH) {
+      void boxAgentScopeHandler(req,res,{ hostUuid: selfHostUuid,boundIp: peerIp }).catch(() => {
+        if (!res.headersSent && !res.destroyed) { res.statusCode=503; res.end(JSON.stringify({status:'pending'})); }
       });
       return;
     }

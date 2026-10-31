@@ -200,7 +200,7 @@ async function makeTestQuery() {
       model,
       max_tokens: 1,
       messages,
-      metadata: getAPIMetadata(),
+      metadata: getAPIMetadata(model),
       ...(betas.length > 0 ? { betas } : {}),
     })
     .asResponse()

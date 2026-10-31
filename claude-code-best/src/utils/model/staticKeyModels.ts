@@ -1,3 +1,4 @@
+import { scopedBoxDescriptor } from '../boxAgentScope.js'
 import { isMiniMaxM3Model } from './minimax.js'
 
 const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
@@ -19,9 +20,10 @@ export interface AuthorityModelCapabilities {
  */
 export function getAuthorityModelCapabilities(
   model: string,
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): AuthorityModelCapabilities | undefined {
-  const raw = env[MODEL_EXECUTION_DESCRIPTOR_ENV]
+  const snapshot = env === undefined ? scopedBoxDescriptor() : undefined
+  const raw = snapshot ? snapshot.value : (env ?? process.env)[MODEL_EXECUTION_DESCRIPTOR_ENV]
   if (!raw) return undefined
   let value: unknown
   try {

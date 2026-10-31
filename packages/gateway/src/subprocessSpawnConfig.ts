@@ -942,6 +942,8 @@ export interface SubprocessRunnerOpts {
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
 export interface SdkMessage {
   type: string
+  /** Dedicated controls are parsed separately before ordinary SDK messages. */
+  request?: unknown
   subtype?: string
   session_id?: string
   message?: {

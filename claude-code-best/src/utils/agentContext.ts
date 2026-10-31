@@ -24,12 +24,15 @@
 import { AsyncLocalStorage } from 'async_hooks'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../services/analytics/index.js'
 import { isAgentSwarmsEnabled } from './agentSwarmsEnabled.js'
+import type { BoxAgentInvocation } from './boxAgentScope.js'
 
 /**
  * Context for subagents (Agent tool agents).
  * Subagents run in-process for quick, delegated tasks.
  */
 export type SubagentContext = {
+  /** RAM-only invocation authority; never serialize this context wholesale. */
+  boxInvocation?: BoxAgentInvocation
   /** The subagent's UUID (from createAgentId()) */
   agentId: string
   /** The team lead's session ID (from CLAUDE_CODE_PARENT_SESSION_ID env var), undefined for main REPL subagents */

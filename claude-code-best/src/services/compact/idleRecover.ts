@@ -5,8 +5,9 @@ import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { UUID } from 'crypto'
-import type { Message, UserMessage } from '../../types/message.js'
+import type { Message, UserMessage, SystemCompactBoundaryMessage } from '../../types/message.js'
 import type { CompactionResult } from './compact.js'
+import { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } from './postCompactProjection.js'
 import { groupMessagesByApiRound } from './grouping.js'
 
 export const IDLE_COMPACT_INSTRUCTIONS =
@@ -304,8 +305,8 @@ function resumeLeaf(opId: string): Message {
 }
 
 export function buildIdleCompactionResult(file: IdleNativeFile, _messages: readonly Message[],
-  annotate: (boundary: CompactionResult['boundaryMarker'], anchor: UUID, kept: readonly Message[]) =>
-    CompactionResult['boundaryMarker'] = (boundary) => boundary): {
+  annotate: (boundary: SystemCompactBoundaryMessage, anchor: UUID, kept: readonly Message[]) =>
+    SystemCompactBoundaryMessage = (boundary) => boundary): {
   result: CompactionResult
   artifact: IdleArtifact
 } {
@@ -334,7 +335,7 @@ export function buildIdleCompactionResult(file: IdleNativeFile, _messages: reado
       idleReceiptDigest: artifact.digest,
       idleOpId: file.opId,
     },
-  } as CompactionResult['boundaryMarker'], summaryUuid as UUID, kept)
+  } as SystemCompactBoundaryMessage, summaryUuid as UUID, kept)
   const result: CompactionResult = {
     boundaryMarker: boundary,
     summaryMessages: [summaryMessage],
@@ -371,7 +372,7 @@ export async function applyIdleTranscript(input: {
   })
   const expected = input.messages.map((item) => stable(item as Message))
   const loadedById = new Map(loaded.messages.map((message) => [message.uuid, message]))
-  const ordered = expected.map((item) => loadedById.get(String(item.uuid)))
+  const ordered = input.messages.map((item) => loadedById.get(item.uuid))
   if (ordered.some((item) => !item)) throw new Error('IDLE_ARTIFACT_MISSING')
   const got = ordered.map((item) => stable(item as Message))
   if (JSON.stringify(got) !== JSON.stringify(expected)) throw new Error('IDLE_ARTIFACT_MISSING')
@@ -436,7 +437,7 @@ export async function runIdleCompact(input: {
   record: (
     messages: Message[],
     teamInfo?: { teamName?: string; agentName?: string },
-    startingParentUuid?: string,
+    startingParentUuid?: UUID,
     allMessages?: readonly Message[],
     preserveMessageTimestamp?: boolean,
   ) => Promise<unknown>
@@ -450,7 +451,6 @@ export async function runIdleCompact(input: {
   // idle turn's own committed capsule matches. A later call applies it.
   if (resumed.freshSummary) return 'prepared'
   if (!resumed.file.summaryText) throw new Error('IDLE_HISTORY_PENDING')
-  const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
   const built = buildIdleCompactionResult(resumed.file, input.messages, annotateBoundaryWithPreservedSegment)
   const result: CompactionResult = resumed.file.frozenTail.length === 0
     ? built.result

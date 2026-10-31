@@ -440,6 +440,7 @@ case "$*" in
   *check-v5-box-success-recovery.ts*) id=C.box-success-recovery ;;
   *check-v5-box-continuation.ts*) id=C.box-continuation ;;
   *check-v5-box-incident-proofs.ts*) id=C.box-incident-proofs ;;
+  *prepare-v5-box-agent-proof.sh*) id=C.box-agent-production-prepare ;;
   *check-v5-box-longtask.ts*) id=C.box-longtask ;;
   *check-v5-ccb-mcp-availability.ts*) id=C.ccb-mcp ;;
 esac
@@ -494,7 +495,7 @@ run_gates
 `;
 }
 
-test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
+test('production wiring: all 17 C gates, Agent preparation and D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
   const f = fixture(t);
   const r = run(f, wireFixture(f));
   assert.equal(r.status, 0, r.stderr);
@@ -503,7 +504,7 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
     'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
-    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'ccb-mcp'].map((id) => `C.${id}`);
+    'box-success-recovery', 'box-continuation', 'box-agent-production-prepare', 'box-incident-proofs', 'box-longtask', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
   assert.deepEqual(queued, ['D', ...expected.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')]);
@@ -529,6 +530,7 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
   }
   assert.equal(active, 0);
   assert.ok(lines.indexOf('end C.box-longtask') < lines.indexOf('db-drop'));
+  assert.ok(lines.indexOf('end C.box-agent-production-prepare') < lines.findIndex((l) => l.startsWith('start C.box-incident-proofs ')));
   assert.ok(lines.indexOf('db-drop') < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
   assert.equal(lines.at(-1), 'seal built');
   assert.equal(notes(f).frontendTscSec, '0.125');
@@ -536,6 +538,15 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
     assert.equal(notes(f)[`job.${id}.rc`], '0', id);
     assert.ok(existsSync(notes(f)[`job.${id}.log`]), id);
   }
+});
+
+test('production wiring: failed Agent production preparation blocks incident proof and seal', (t) => {
+  const f=fixture(t);
+  const r=run(f,wireFixture(f,'C.box-agent-production-prepare'));
+  assert.equal(r.status,73,r.stderr);
+  assert.ok(events(f).includes('end C.box-success-recovery'));
+  assert.ok(!events(f).some((line)=>line.startsWith('start C.box-incident-proofs ') || line.startsWith('seal ')));
+  assert.equal(events(f).at(-1),'cleanup');
 });
 
 test('production wiring: unavailable tsc timing records unknown without failing the frontend gate', (t) => {
@@ -573,11 +584,11 @@ for (const receipt of ['hit', 'wrong-sha']) {
     }
     const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 10 : 18);
+    assert.equal(ids.length, receipt === 'hit' ? 11 : 19);
     assert.equal(notes(f)['gateEvidence.box-longtask'], 'local');
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
-    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.box-longtask', 'C.ccb-mcp']) {
+    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-agent-production-prepare', 'C.box-incident-proofs', 'C.box-longtask', 'C.ccb-mcp']) {
       assert.ok(lines.findIndex((l) => l.startsWith(`start ${phase} `)) > awaited, phase);
     }
     assert.equal(lines.at(-1), 'seal built');

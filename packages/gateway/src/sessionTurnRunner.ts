@@ -1,3 +1,4 @@
+import { isBoxApiModel } from '@openclaude/protocol'
 import { getSystemHelpRelay } from './systemHelpRelay.js'
 import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from './masterTurnLease.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
@@ -1082,13 +1083,33 @@ export async function _runOneTurn(
       waiveReason?: TurnWaiveReason,
     ): Promise<void> => {
       closeHelpAttempt?.()
-      // Record the terminal observation immediately, before a cooperative
-      // interrupt can produce more engine events. Its global ordinal thus
-      // reconstructs the exact live ordering after refresh.
-      requestedTerminal ??= { status, reason, errorCode, ...(waiveReason ? { waiveReason } : {}) }
-      retainTerminalError(status, reason, errorCode)
+      const userBoxStop = status === 'interrupted' && errorCode === 'USER_CANCELLED'
+        && isBoxApiModel(session.model) && runner.prepareInterrupt !== undefined
+      const sourceAbort = session._externalTurnAbort
+      const sourceTurnKey = session._currentTurnKey
+      const sourcePersist = session._persistActiveTurn
+      if (!userBoxStop) {
+        requestedTerminal ??= { status, reason, errorCode, ...(waiveReason ? { waiveReason } : {}) }
+        retainTerminalError(status, reason, errorCode)
+      }
       if (terminalRequestPromise) return terminalRequestPromise
       terminalRequestPromise = (async () => {
+        if (userBoxStop) {
+          try { await runner.prepareInterrupt!('user',turnKey) }
+          catch (error) {
+            log.warn('box_user_stop_control_pending', { sessionKey: session.sessionKey })
+            // The awaiting WS Stop handler reports the pending control. An
+            // engine error here would falsely close a still-running turn.
+            terminalRequestPromise = null
+            throw error
+          }
+          if (this.getByKey(session.sessionKey) !== session || session.runner !== runner
+            || session._currentTurnKey !== sourceTurnKey || session._externalTurnAbort !== sourceAbort
+            || session._persistActiveTurn !== sourcePersist) return
+          if (sourceAbort && !sourceAbort.signal.aborted) sourceAbort.abort()
+          requestedTerminal ??= { status,reason,errorCode,...(waiveReason ? {waiveReason} : {}) }
+          retainTerminalError(status,reason,errorCode)
+        }
         const activeTurn = turn
         if (!activeTurn) {
           await Promise.resolve()

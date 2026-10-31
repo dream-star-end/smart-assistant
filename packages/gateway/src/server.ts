@@ -804,7 +804,7 @@ export class Gateway {
           },
           sendDispatch: (context, frame) => this._sendPromptQueueDispatch(context, frame),
           interruptExact: async (context, turnId) =>
-            this.sessions.interruptExact(context.owner.sessionKey, turnId),
+            this.sessions.interruptForReceipt(context.owner.sessionKey, {turnKey:turnId}),
           persistInterrupted: async ({ context, detail, turnId, turnIndex }) => {
             await persistInterruptedPromptQueueTurn({
               sessionKey: context.owner.sessionKey,

@@ -1,3 +1,4 @@
+import { isBoxApiModel } from '../utils/boxAgentScope.js'
 import type { Anthropic } from '@anthropic-ai/sdk'
 import type { BetaMessageParam as MessageParam } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 // @aws-sdk/client-bedrock-runtime is imported dynamically in countTokensWithBedrock()
@@ -325,8 +326,10 @@ export async function countTokensViaHaikuFallback(
     messages: messagesToSend,
     tools: tools.length > 0 ? tools : undefined,
     ...(filteredBetas.length > 0 && { betas: filteredBetas }),
-    metadata: getAPIMetadata(),
+    metadata: getAPIMetadata(normalizeModelStringForAPI(model)),
     ...getExtraBodyParams(),
+    ...(isBoxApiModel(normalizeModelStringForAPI(model))
+      ? {metadata:getAPIMetadata(normalizeModelStringForAPI(model))} : {}),
     // Enable thinking if messages contain thinking blocks
     ...(containsThinking && {
       thinking: {

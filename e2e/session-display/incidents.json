@@ -5852,7 +5852,9 @@
       "severity": "P1",
       "symptom": "商业 rel-97e6472b5（box-claude-haiku-4-5 / sonnet-5 / opus-5-5 于 02:0xZ 激活）：同一会话第一轮正常，第二轮起返回『服务正在更新，本轮已中断，请直接重试本条消息』（service_restart；容器日志 turn terminal error『子进程被信号 SIGKILL 终止』），再下一轮显示的是上一条问题的回答（错位一轮）；用户 2026-10-05 10:26 CST 反馈『续聊有问题』，canary 03:59Z 复现（会话 g48mtmuuq0s79）。根因：Box 常驻官方 CLI 走 official-cc harness 且没有 authorityEngine，runner 把它当成 engine=ccb 代理通道，每轮 lease 不同→spawn env 指纹变化→每个后续 turn 提交前先 shutdown 进程；Box 桥在 stdin 关闭时什么都不做（Box 启动脚本持有 fifo，claude 收不到 EOF），3 秒后被 SIGKILL，该退出落到新一轮头上；Box 里的 claude 从未被通知停止，继续挂在同一会话上并回答下一条输入，进程残留。修复：runner 不再把 Box CLI 归入代理通道（submit 与 lease 续期）；桥在 stdin 关闭时结束自己启动的 claude（读该 fifo 的进程，TERM 后 KILL）并以 0 退出；启动时先结束同一会话遗留的旧 claude。",
       "rootFixCommit": "f6061a3f",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "182af3e5"
+      ],
       "proofPending": {
         "reason": "个人版这里只有 unit 层（真实 runner 对假子进程、真实 Box 脚本对本机 fifo）。deploy-gate 证明和线上多轮对话证据在商业树（611cf330，scripts/check-v5-box-incident-proofs.ts 的 ocv5-315-box-cli-follow-up-turn；个人版没有这份发布门脚本）。个人版发布后的真实多轮 turn 是一次性核对，不是可重复执行的产物。",
         "since": "2026-10-05"
@@ -5872,6 +5874,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
           "assertion": "box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "closing stdin cancels the launch reader when transport ignores abort"
         }
       ]
     },
@@ -9188,6 +9195,46 @@
           "path": "packages/web-react/browser-tests/auth-expired-deeplink.node-test.mjs",
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
+      ]
+    },
+    {
+      "id": "INC-20261030-BOX-AGENT-SESSION-409",
+      "occurredAt": "2026-10-30",
+      "severity": "P0",
+      "symptom": "Box第五回合父请求停在工具handoff时，内建Agent两次返回409。调用链确认子Agent沿用全局CLI API session，journal在数值cap前拒同session；历史未记录原始子UUID，故不把源码推断当作已落日志。修复为真实Agent稳定独立API UUID、每次invocation原authority快照与服务端generation墓碑；Stop先持久fence，再由原nonce/epoch keeper物理证明和结算收口，后台不借下一回合authority。不改容量、原proof预算、132/14历史扣费。",
+      "rootFixCommit": "1283304b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "claude-code-best/src/utils/__tests__/boxAgentScope.test.ts",
+          "assertion": "real subagents get stable independent API UUIDs; root/teammate/other models retain the root"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxAgentScopes.integ.test.ts",
+          "assertion": "committed cancel-before-admit fences a late HTTP request even after a positive no-run receipt"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-664-box-agent-session] PASS"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/boxApiModels.test.ts",
+          "assertion": "keeps the builtin Agent API session matcher exact for every official Box route"
+        }
+      ],
+      "coverageCommits": [
+        "21865dc0",
+        "7c459c4e",
+        "bb555b88",
+        "a1858480",
+        "0e65f329",
+        "36845333",
+        "11cdc966",
+        "f611dbc9",
+        "06642b5d"
       ]
     }
   ]

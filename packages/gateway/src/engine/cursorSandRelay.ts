@@ -2035,7 +2035,7 @@ export class CursorSandRelay {
     try {
       armStall()
       while (true) {
-        let chunk: ReadableStreamReadResult<Uint8Array>
+        let chunk: { done: false; value: Uint8Array } | { done: true; value?: Uint8Array }
         try {
           chunk = await reader.read()
         } catch (error) {

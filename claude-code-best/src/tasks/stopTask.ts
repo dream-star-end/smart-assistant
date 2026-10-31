@@ -6,11 +6,12 @@ import type { TaskStateBase } from '../Task.js'
 import { getTaskByType } from '../tasks.js'
 import { emitTaskTerminatedSdk } from '../utils/sdkEventQueue.js'
 import { isLocalShellTask } from './LocalShellTask/guards.js'
+import { stopLocalAgentTask, type LocalAgentTaskState } from './LocalAgentTask/LocalAgentTask.js'
 
 export class StopTaskError extends Error {
   constructor(
     message: string,
-    public readonly code: 'not_found' | 'not_running' | 'unsupported_type',
+    public readonly code: 'not_found' | 'not_running' | 'unsupported_type' | 'replaced',
   ) {
     super(message)
     this.name = 'StopTaskError'
@@ -26,6 +27,7 @@ type StopTaskResult = {
   taskId: string
   taskType: string
   command: string | undefined
+  remoteStop?: 'pending' | 'stopped'
 }
 
 /**
@@ -62,7 +64,16 @@ export async function stopTask(
     )
   }
 
-  await taskImpl.kill(taskId, setAppState)
+  let remoteStop: 'pending' | 'stopped' | undefined
+  if (task.type === 'local_agent') {
+    const result = await stopLocalAgentTask(taskId, task as LocalAgentTaskState, setAppState)
+    if (!result.stopped) {
+      throw new StopTaskError(`Task ${taskId} completed or was replaced while Stop was pending`, 'replaced')
+    }
+    remoteStop = result.remoteStop
+  } else {
+    await taskImpl.kill(taskId, setAppState)
+  }
 
   // Bash: suppress the "exit code 137" notification (noise). Agent tasks: don't
   // suppress — the AbortError catch sends a notification carrying
@@ -96,5 +107,5 @@ export async function stopTask(
 
   const command = isLocalShellTask(task) ? task.command : task.description
 
-  return { taskId, taskType: task.type, command }
+  return { taskId, taskType: task.type, command, ...(remoteStop ? { remoteStop } : {}) }
 }

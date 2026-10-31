@@ -1511,7 +1511,7 @@ export function getDeferredToolsDeltaAttachment(
   model: string,
   messages: Message[] | undefined,
   scanContext?: DeferredToolsDeltaScanContext,
-): Attachment[] {
+): Extract<Attachment, { type: 'deferred_tools_delta' }>[] {
   if (!isDeferredToolsDeltaEnabled(model)) return []
   // These three checks mirror the sync parts of isSearchExtraToolsEnabled —
   // the attachment text says "available via SearchExtraTools", so SearchExtraTools
