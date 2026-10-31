@@ -5069,12 +5069,12 @@ export class ChatSocket {
   }
 
   private readbackStateError(sess: ChatSession, frame: OutboundErrorWire | LegacyBridgeErrorWire): boolean {
-    const epoch = this.lifecycleEpoch;
+    const epoch = this.lifecycleEpoch, cmid = frame.clientMessageId;
     return attemptStateErrorReadback(sess, frame, {
       accept: () => claimStateErrorFrame(sess, frame),
-      read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess && this.lifecycleEpoch === epoch,
-      replay: (held) => this.dispatch(held),
-      changed: () => { this.deps.persistSession?.(sess.id); this.scheduleNotify(); },
+      read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess && this.lifecycleEpoch === epoch &&
+        !sess._stopSettlement && (!sess._activeClientMessageId || sess._activeClientMessageId === cmid),
+      replay: (held) => this.dispatch(held), changed: () => { this.deps.persistSession?.(sess.id); this.scheduleNotify(); },
     });
   }
 

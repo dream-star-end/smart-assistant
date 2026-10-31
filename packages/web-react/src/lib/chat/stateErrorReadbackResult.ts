@@ -16,16 +16,15 @@ export async function readStateErrorResult({ sess, code, cmid, requiresCompletio
   sess: ChatSession; code: string; cmid: string; requiresCompletion: boolean;
   effects: {
     read: (sessionId: string) => Promise<SessionSnapshot | null | undefined>;
+    /** Same lifecycle/session and no Stop or newer active turn. */
     current: () => boolean; changed: () => void;
   };
-  replay: () => void; isStale: (snap: SessionSnapshot) => boolean;
+  replay: () => void; isStale: (sess: ChatSession, snap: SessionSnapshot) => boolean;
 }): Promise<void> {
-  const current = () => effects.current() && !sess._stopSettlement &&
-    (!sess._activeClientMessageId || sess._activeClientMessageId === cmid);
-  if (!current()) return;
+  if (!effects.current()) return;
   const snap = await effects.read(sess.id);
-  if (!current()) return;
-  if (!snap || snap.sessionId !== sess.id || isStale(snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
+  if (!effects.current()) return;
+  if (!snap || snap.sessionId !== sess.id || isStale(sess, snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
     replay();
     return;
   }
