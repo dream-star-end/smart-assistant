@@ -2,12 +2,15 @@
 // budget, and the instruction box (enabled when the orchestrator ships, A2-1).
 
 import { Check, CircleAlert, Hand, ImageIcon, RefreshCw, Send, Sparkles, Zap } from 'lucide-react'
+import { useState } from 'react'
 
+import { studioApi, studioErrorText } from '../../lib/studio/api'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import { type ShotCardModel, eventText, eventTone } from '../../lib/studio/model'
-import type { StudioProjectView } from '../../lib/studio/types'
+import type { StudioProjectView, StudioTake } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
-import { MediaThumb } from './MediaThumb'
+import { useToast } from '../ui'
+import { MediaThumb, isVideoTake } from './MediaThumb'
 
 const STATUS_LINE: Record<string, string> = {
   draft: '等你开拍',
@@ -33,9 +36,32 @@ export function AgentPanel(props: {
   view: StudioProjectView
   cards: ShotCardModel[]
   onOpenShot: (shotId: string) => void
+  /** Refresh the project after a version was adopted here. */
+  onReload?: () => void
 }) {
   const { project, events, takes } = props.view
   const needs = props.cards.filter((c) => c.tone === 'needs')
+  const toast = useToast()
+  const [adopting, setAdopting] = useState<string | null>(null)
+  const closed =
+    project.status === 'done' || project.status === 'canceled' || project.status === 'failed'
+  // "挑一个版本" means it: a candidate is adopted from here, same call as the review page's 采用.
+  const adopt = async (t: StudioTake) => {
+    if (adopting) return
+    setAdopting(t.id)
+    try {
+      await studioApi.selectTake(props.auth, t.id)
+      toast(
+        isVideoTake(t) ? `已采用 v${t.version}` : `开始用 v${t.version} 这一帧重拍视频`,
+        'success',
+      )
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setAdopting(null)
+      props.onReload?.()
+    }
+  }
   const pct = budgetPercent(project.spentCredits, project.reservedCredits, project.budgetCredits)
   return (
     <aside className="st-panel st-agent-panel" aria-label="导演 agent">
@@ -50,7 +76,8 @@ export function AgentPanel(props: {
               className="st-dot"
               style={{ color: project.status === 'running' ? 'var(--success)' : 'var(--faint)' }}
             />
-            {project.status === 'awaiting_user' && project.settings?.awaitingReason === 'compose_failed'
+            {project.status === 'awaiting_user' &&
+            project.settings?.awaitingReason === 'compose_failed'
               ? '成片没有合成成功，可以在成片页重新合成'
               : (STATUS_LINE[project.status] ?? project.status)}
           </div>
@@ -94,14 +121,32 @@ export function AgentPanel(props: {
               {options.length ? (
                 <div className="st-needs-opts">
                   {options.map((t) => (
-                    <div key={t.id} className="st-needs-opt">
+                    <button
+                      key={t.id}
+                      type="button"
+                      className="st-needs-opt"
+                      disabled={adopting !== null || closed}
+                      title={
+                        isVideoTake(t)
+                          ? '采用这个版本，导演接着做后面的步骤'
+                          : '按这一帧重新生成视频，视频按正常价格扣积分'
+                      }
+                      onClick={() => void adopt(t)}
+                      data-testid="needs-adopt"
+                    >
                       <MediaThumb
                         auth={props.auth}
                         take={t}
                         style={{ aspectRatio: '16 / 9', borderRadius: 0 }}
                       />
-                      <span>v{t.version}</span>
-                    </div>
+                      <span>
+                        {adopting === t.id
+                          ? '正在采用…'
+                          : isVideoTake(t)
+                            ? `采用 v${t.version}`
+                            : `用 v${t.version} 首帧重拍`}
+                      </span>
+                    </button>
                   ))}
                 </div>
               ) : null}
