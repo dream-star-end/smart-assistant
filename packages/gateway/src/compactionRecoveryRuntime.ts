@@ -41,14 +41,17 @@ export async function prepareCompactionTurn(
           // Recovery reasserts rules; the native spawn owns the actual tool catalog.
           availableMcpTools: [],
         },
-        userInstructions, plan, goal: session._platformGoal, activeTasks,
+        userInstructions,
+        currentUserText: typeof originalInput === 'string' ? originalInput : originalInput
+          .flatMap(block => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []).join('\n'),
+        plan, goal: session._platformGoal, activeTasks,
       })).text
     },
   })
   session._compactionOriginal = captured.reference
   return (input: HistoricalTurnInput): HistoricalTurnInput => attachCompactionRecoveryContext(input, {
     context: typeof captured.snapshot.platformContext === 'string' ? captured.snapshot.platformContext : '',
-    textReference: captured.reference.textPath,
+    textReference: captured.reference.contextTextPath,
     activeTasks: readTasks(),
     // Antigravity budgets its complete JSON stdin envelope and can externalize
     // even the current input. Preserve that existing fallback instead of

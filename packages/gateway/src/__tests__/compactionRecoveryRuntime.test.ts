@@ -129,6 +129,9 @@ test('real archived SQLite timeline reaches next runner input with original proh
   assert.equal(saved.snapshot.timeline[0]?.id, 'u-prohibition')
   assert.equal(saved.snapshot.timeline.at(-1)?.id, 'original-plan')
   assert.equal(saved.snapshot.currentInput, current)
+  const modelSources = await readFile(saved.reference.contextTextPath, 'utf8')
+  assert.doesNotMatch(modelSources, /ORIGINAL_ROW_449_/,
+    'recovery reads must not replay the complete assistant audit history')
   const trace = await readCompactionOriginalByTrace({ traceId: session._currentTurnTraceId!, principal: { kind: 'ops-trace' } })
   assert.equal(trace?.reference.archiveId, saved.reference.archiveId)
   assert.equal(await readCompactionOriginal({ sessionId: peerId, archiveId: saved.reference.archiveId,
@@ -207,6 +210,7 @@ test('real overflow retry keeps the same original-source prohibition and existin
   for (const input of fakeModel.inputs) {
     const data = await submittedSources(input)
     assert.equal(data.user_instructions[0].text, FORBIDDEN)
+    assert.equal(data.current_user_text, 'CURRENT_OVERFLOW_REQUEST')
     assert.ok(data.active_tasks.some((task: { id: string }) => task.id === jobId))
     assert.match(typeof input === 'string' ? input : JSON.stringify(input), /CURRENT_OVERFLOW_REQUEST/)
   }
@@ -231,6 +235,7 @@ test('native transient continuation reasserts original sources and refreshes new
   for (const input of fakeModel.inputs) {
     const data = await submittedSources(input)
     assert.equal(data.user_instructions[0].text, FORBIDDEN)
+    assert.equal(data.current_user_text, 'CURRENT_TRANSIENT_REQUEST')
     assert.ok(data.active_tasks.some((task: { id: string }) => task.id === jobId))
   }
   const continuation = fakeModel.inputs[1]

@@ -57,6 +57,8 @@ export interface CompactionRecoveryInput {
    * Always pass the SAME policy frozen by prepareRunnerPromptPrivacy. */
   promptContext?: PromptSlotContext
   userInstructions: readonly OriginalUserInstruction[]
+  /** Exact current user text is also needed by native transient continuations. */
+  currentUserText?: string
   plan?: unknown
   goal?: unknown
   activeTasks?: readonly unknown[]
@@ -95,6 +97,7 @@ export function renderCompactionRecoveryContext(
     sourceMetadataList.push(sourceMetadata('original_user_turn', user.text, user.id))
   }
   for (const [source, value] of [
+    ['original_current_user_text', input.currentUserText],
     ['original_plan', input.plan],
     ['platform_goal', input.goal],
     ['live_execution_records', input.activeTasks],
@@ -112,6 +115,7 @@ export function renderCompactionRecoveryContext(
     // These exact user bytes intentionally bypass platform MCP claim sanitizing
     // and profile projection. They came from this session, never user.md.
     user_instructions: input.userInstructions,
+    current_user_text: input.currentUserText ?? null,
     plan: input.plan ?? null,
     goal: input.goal ?? null,
     active_tasks: input.activeTasks ?? null,

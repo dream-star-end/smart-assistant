@@ -24,7 +24,7 @@ CCB、Codex、Grok 继续由各自 CLI 产生 native compact，平台没有另�
 Codex 下一轮前的主动 compact 也位于快照之后；CCB/Box/Grok 的底座历史所有权保持原样。
 Cursor、zcode、Antigravity 无原生 compact，恢复契约同样用于平台注入历史的字节裁剪与重建。
 传输预算先为恢复契约保留空间，再拟合旧注入历史；不缩短当前输入或原文来源。
-超过内联预算（默认 24 KiB）时引用私有完整文件，要求行动前分块读完；文件内容不裁剪、不改写为摘要。
+超过内联预算（默认 24 KiB）时引用私有完整文件，要求行动前分块读完；文件内容不裁剪、不改写为摘要；模型读取恢复来源文件，完整助手历史保留在 trace 原文中。
 
 ## 原文存储与访问
 
@@ -39,7 +39,7 @@ source 固定为 `platform-full-timeline`：原始主时间线、exact 当前输
 CLI 压缩失败不覆盖或删除上述原文；快照失败发生于提交之前，观察回调失败记录日志，不令 parser 崩溃。
 
 路径为 `$OPENCLAUDE_HOME/compaction-originals/sessions/<owner+session SHA256>/<archiveId>/`，
-包含 `snapshot.json`、完整 `original.txt` 和 `turn-originals/`；trace 索引仅存哈希目录与定位信息。
+包含 `snapshot.json`、完整 `original.txt`、模型恢复专用 `recovery-context.txt` 和 `turn-originals/`；trace 索引仅存哈希目录与定位信息。
 目录 0700、文件 0600，排他写入并同步落盘，基础快照以目录原子发布；不把原文写进日志。
 保留期固定 30 天，读时立即拒绝过期内容；capture 按 root 至多每小时清理一次，
 `pruneCompactionOriginals()` 可供生命周期清理调用，基础快照及所有追加片共同删除。

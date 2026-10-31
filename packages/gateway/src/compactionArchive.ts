@@ -177,7 +177,7 @@ function referenceFor(snapshot: CompactionArchiveSnapshot, root: string): Compac
   return {
     archiveId: snapshot.archiveId, ownerUserId: snapshot.ownerUserId, sessionId: snapshot.sessionId,
     ...(snapshot.traceId ? { traceId: snapshot.traceId } : {}), source: snapshot.source,
-    path: join(dir, 'snapshot.json'), textPath, contextTextPath: textPath,
+    path: join(dir, 'snapshot.json'), textPath, contextTextPath: join(dir, 'recovery-context.txt'),
     createdAt: snapshot.createdAt, expiresAt: snapshot.expiresAt,
   }
 }
@@ -232,6 +232,9 @@ export async function captureCompactionOriginal(input: {
     await writeImmutable(join(stage, 'snapshot.json'), JSON.stringify(snapshot))
     const platformText = typeof snapshot.platformContext === 'string'
       ? snapshot.platformContext : JSON.stringify(snapshot.platformContext ?? null, null, 2)
+    // The model reads only the exact recovery sources. The audit/trace copy
+    // retains the entire timeline, which can be far larger than a CLI window.
+    await writeImmutable(join(stage, 'recovery-context.txt'), platformText)
     await writeImmutable(join(stage, 'original.txt'), [
       'Source: platform-full-timeline. Native CLI internal transcripts may contain additional material.',
       '\nAuthoritative platform context:\n', platformText,

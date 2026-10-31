@@ -100,16 +100,20 @@ test('archive retains exact large platform context and input with immutable priv
   const text = await readFile(saved.reference.textPath, 'utf8')
   assert.ok(text.includes(longContext))
   assert.ok(text.includes('原文 1'))
+  assert.notEqual(saved.reference.contextTextPath, saved.reference.textPath)
+  assert.equal(await readFile(saved.reference.contextTextPath, 'utf8'), longContext,
+    'model recovery references must not force the full assistant audit timeline back into the context window')
   assert.equal((await stat(root)).mode & 0o777, 0o700)
   assert.equal((await stat(saved.reference.path)).mode & 0o777, 0o600)
   assert.equal((await stat(saved.reference.textPath)).mode & 0o777, 0o600)
+  assert.equal((await stat(saved.reference.contextTextPath)).mode & 0o777, 0o600)
   const recovered = await readCompactionOriginal({
     sessionId: original.sessionId, archiveId: saved.reference.archiveId,
     principal: { kind: 'owner', userId: original.ownerUserId },
   }, options)
   assert.deepEqual(recovered?.snapshot.currentInput, [{ type: 'text', text: '保留\n全文' }])
   assert.equal(recovered?.snapshot.platformContext, longContext)
-  assert.equal(recovered?.reference.contextTextPath, saved.reference.textPath)
+  assert.equal(recovered?.reference.contextTextPath, saved.reference.contextTextPath)
 })
 
 test('owner and explicit ops-trace reads cannot cross session or owner boundaries', async (t) => {
