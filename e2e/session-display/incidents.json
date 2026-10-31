@@ -9189,6 +9189,44 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-TURN-LABEL-UNDERCOUNT",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "个人版一轮实扣 132（模型 97 + 四次 figcheck 视觉复核 7+9+8+11），回复标注只显示 97。工具扣费按容器级会话记账，没有回合键。OCV5-704：容器恰好一个已有 turn key 的 open 回合时，把这次工具扣费归到该回合并推进聊天；零个或多个不猜。金额不变、只改归属、不追溯修改历史记录。",
+      "rootFixCommit": "6e85b2fb",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "one open turn labels model 97 plus vision 7+9+8+11"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "zero or several open turns keep the label at 97 while the ledger stays 132"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "does not guess when there is no open turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/openTurnAttribution.test.ts",
+          "assertion": "does not guess when several open turns are visible"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/processRoundCredits.test.tsx",
+          "assertion": "shows 本轮 132 积分 after refresh and while the turn is live"
+        }
+      ],
+      "proofPending": {
+        "reason": "个人版 canary 不能对真实账户扣费来做活体证明。回归是单测回放：一个开着的回合把模型 97 加四次 vision 7+9+8+11 标成 132，零个或多个开着的回合仍标 97、账本仍是 132。不改金额、不回填历史。",
+        "since": "2026-10-31"
+      }
     }
   ]
 }
