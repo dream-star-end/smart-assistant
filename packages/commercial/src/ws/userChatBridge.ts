@@ -1,6 +1,5 @@
 import { handleDispatchAuthorityRejection } from "./dispatchAuthorityRejection.js";
-import { _OutboundPersistQueueCoordinator } from "./outboundPersistQueues.js";
-export { _OutboundPersistQueueCoordinator } from "./outboundPersistQueues.js";
+import { OutboundPersistQueueCoordinator } from "./outboundPersistQueues.js";
 import { ContainerLinkControls } from "./containerLinkControls.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
@@ -1919,6 +1918,19 @@ export async function isCursorContainerOnSelfHost(
     [containerId, uid, trustedHostId],
   );
   return eligible.rowCount === 1;
+}
+
+function isPermanentLiveFrameConflict(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
+  );
+}
+
+/** Keep the locked production negative control at its original entry point. */
+export class _OutboundPersistQueueCoordinator extends OutboundPersistQueueCoordinator {
+  constructor() { super(isPermanentLiveFrameConflict); }
 }
 
 // ---------- 主入口 ----------------------------------------------------------

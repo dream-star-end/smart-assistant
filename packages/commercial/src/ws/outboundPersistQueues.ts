@@ -3,14 +3,6 @@ type OutboundPersistQueueState = {
   failedSeq: number | null;
 };
 
-function isPermanentLiveFrameConflict(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
-  );
-}
-
 /**
  * Serializes durable outbound writes per container/session namespace.
  *
@@ -19,7 +11,8 @@ function isPermanentLiveFrameConflict(error: unknown): boolean {
  * failed state is retired after its current tail drains, so a later reconnect
  * is not permanently poisoned by a failure from an earlier connection.
  */
-export class _OutboundPersistQueueCoordinator {
+export class OutboundPersistQueueCoordinator {
+  constructor(private readonly isPermanentConflict: (error: unknown) => boolean) {}
   private readonly queues = new Map<string, OutboundPersistQueueState>();
   private readonly consumerCounts = new Map<string, number>();
 
@@ -62,7 +55,7 @@ export class _OutboundPersistQueueCoordinator {
         await work();
         if (state!.failedSeq === frameSeq) state!.failedSeq = null;
       } catch (error) {
-        if (isPermanentLiveFrameConflict(error)) {
+        if (this.isPermanentConflict(error)) {
           // An exact retry can turn a prior transient failure into a proven
           // permanent conflict. Retire only that same-sequence barrier; a
           // barrier for any other missing sequence must remain strict.
