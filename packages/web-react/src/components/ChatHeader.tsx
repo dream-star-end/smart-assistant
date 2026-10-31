@@ -257,6 +257,7 @@ export function ChatHeader({
         >
           <button
             type="button"
+            data-product-control
             onClick={projectSuggestion.onAccept}
             aria-label={`移入项目「${projectSuggestion.name}」`}
             title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
@@ -267,6 +268,7 @@ export function ChatHeader({
           </button>
           <button
             type="button"
+            data-product-control
             onClick={projectSuggestion.onDismiss}
             aria-label="不用移入"
             className="inline-flex min-h-11 shrink-0 items-center rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:py-1"
