@@ -1117,6 +1117,12 @@ export function freezeErrorCardSnapshots(
     }
   }
   for (const message of messages) {
+    // Delivery status has its own single-line presentation throughout the
+    // retry. Hiding an intermediate assistant error must not hide that line.
+    if (message._turnStatusRecord && message._dispatchDeliveryRecovery) {
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
     // The source was delivered; an automatic continuation is not a failed
     // send. Keep its transport label consistent with the held error card.
     if (message.role === "user" && recoveringSources.has(message.id) && message.status === "error") {

@@ -265,16 +265,19 @@ describe('V3 2I-2 — anthropicProxy + bridge histograms/counters', () => {
         assert.equal(text.split(`# HELP ${name} `).length - 1, 1)
         assert.ok(text.includes(`# TYPE ${name} counter`))
       }
+      // OCV5-682: physical-write wait is an additive millisecond histogram.
+      assert.equal(text.split('# HELP container_link_send_chain_wait_ms ').length - 1, 1)
+      assert.ok(text.includes('# TYPE container_link_send_chain_wait_ms histogram'))
       // gauges(2)
       assert.ok(text.includes('# HELP account_pool_health'))
       assert.ok(text.includes('# HELP agent_containers_running'))
       assert.ok(text.endsWith('\n'))
-      // 控制投递新增一个 counter；所有 HELP 仍各出现一次
+      // 新增发送等待 histogram；所有 HELP 仍各出现一次。
       const helpCount = (text.match(/^# HELP /gm) ?? []).length
       assert.equal(
         helpCount,
-        25,
-        `HELP 行总数 = 25 (原21系列 + 4 ContainerLink counter), got ${helpCount}`,
+        26,
+        `HELP 行总数 = 26 (原21系列 + 4 ContainerLink counter + 发送等待 histogram), got ${helpCount}`,
       )
     })
   })

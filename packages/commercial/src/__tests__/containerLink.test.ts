@@ -306,7 +306,8 @@ test("OCV5-682 deferred frame rechecks cancellation at physical write without cl
     assert.equal(callbacks, 1);
     assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.hello"]);
     assert.equal(physical.readyState, WebSocket.OPEN, "cancelling a stale frame preserves other consumers");
-    socket.send(wire({ type: "ping", id: "still-open" }));
+    await new Promise<void>((resolve, reject) => socket.send(wire({ type: "ping", id: "still-open" }), {},
+      (error) => error ? reject(error) : resolve()));
     assert.equal(physical.sent.at(-1)?.type, "ping");
   } finally { release(); await registry.shutdown(); }
 });
@@ -402,7 +403,7 @@ test("OCV5-682 fresh dispatch preserves an earlier queued repository unbind", as
     const unbind = send({ type: "inbound.control.session_repo_unbind", sessionId: "session" });
     const turn = send({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "after-unbind" });
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(physical.sent, [], "a new turn cannot execute with a repository the user already unbound");
+    assert.equal(physical.sent.length, 0, "a new turn cannot execute with a repository the user already unbound");
     release();
     await Promise.all([hello, unbind, turn]);
     assert.deepEqual(physical.sent.map(frame => frame.type), [

@@ -309,6 +309,10 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         assert.notEqual(scenario.manual[0].clientMessageId, child.id);
         assert.equal(scenario.manual[0].content.recovery, undefined);
         await page.getByText("DELIVERY_RESEND_COMPLETED", { exact: true }).waitFor();
+      } catch (error) {
+        console.error("DELIVERY_RECOVERY_DIAGNOSTIC", JSON.stringify({ scenario, stored: await stored(page),
+          body: (await page.locator("body").innerText()).slice(-5000) }));
+        throw error;
       } finally { await context.close(); }
     });
   } finally {

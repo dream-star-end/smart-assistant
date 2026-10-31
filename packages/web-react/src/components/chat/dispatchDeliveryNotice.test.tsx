@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 import type { ChatMessage } from '../../lib/chat/model';
 import { collectRecoveredTurnStatusRecordIds } from '../../lib/chat/manualTaskContinuation';
-import { messageSignature } from '../../lib/chat/render';
+import { freezeErrorCardSnapshots, isErrorCardHeld, messageSignature } from '../../lib/chat/render';
 import { TurnStatusCard } from './TurnErrorNotice';
 
 afterEach(cleanup);
@@ -15,6 +15,11 @@ test('OCV5-682: the single gray delivery line keeps its final resend across reco
     _turnStatusRecord: true, _dispatchTerminal: true, _errorCode: 'DISPATCH_AUTHORITY_EXPIRED',
     _clientMessageId: root.id, _dispatchDeliveryRecovery: 'resent', _dispatchRetryClientMessageId: child.id } as ChatMessage;
   expect(collectRecoveredTurnStatusRecordIds([root, notice, child]).has(notice.id)).toBe(false);
+  // REST hydration freezes assistant errors before MessageList filters held
+  // rows. The delivery line stays visible even if an earlier merge held it.
+  notice._errorHeldForRecovery = true;
+  freezeErrorCardSnapshots([root, notice, child]);
+  expect(isErrorCardHeld(notice)).toBe(false);
   const resend = vi.fn();
   const view = render(<TurnStatusCard msg={notice} cb={{ resolveRetryTarget: () => child, onRetrySend: resend }} currentTurn />);
   expect(screen.getAllByRole('status')).toHaveLength(1);
