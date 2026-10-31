@@ -1,3 +1,4 @@
+import { delegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import {
@@ -491,6 +492,7 @@ export async function buildCodexLaunchOverrides(
       depth: ctx.delegationDepth ?? 0,
     })}\n`
     const mcpEnv: Record<string, string> = {
+      ...delegateMcpBudgetEnvironment(codexMcpToolTimeoutSec() * 1000),
       OPENCLAUDE_AGENT_ID: ctx.agentId,
       OC_AGENT_ID: ctx.agentId,
       ...identityCompatEnvironment(ctx.identityCompat),
