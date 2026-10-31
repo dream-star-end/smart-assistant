@@ -1,4 +1,3 @@
-import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
@@ -44,7 +43,6 @@ import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
 import { RepoPill } from "./github/RepoPill";
-import { useSendGuard } from "./composerSendGuard";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -80,6 +78,7 @@ const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 // 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
 const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
 const GoalDialog=lazy(()=>import('./GoalDialog').then(module=>({default:module.GoalDialog})));
+const ComposerImagePreview=lazy(()=>import('./ComposerImagePreview').then(module=>({default:module.ComposerImagePreview})));
 const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 // 已经盖进输入框的预填(按对象认,跨卸载重挂保留;见预填 effect)。
@@ -130,6 +129,8 @@ function clipboardImages(data: DataTransfer): File[] {
 export const ENV_PREP_EXPECTED_MS = 20_000;
 /** 语音错误提示的常驻时长(C-19):3s 来不及读完,改 6s 且下一次点麦克风即清除。 */
 export const VOICE_MSG_TTL_MS = 6_000;
+/** OCV5-695:「发送」刚变成「停止」后这段时间内的点击,是用户对没反应的「发送」点的第二下,不算停止。 */
+export const STOP_ARM_MS = 1000;
 
 function EnvironmentPrepBar() {
   const [pct, setPct] = useState(8);
@@ -509,7 +510,12 @@ export function Composer({
     [revoke],
   );
 
-  const {submittingRef,sending,setSending,stopArmed}=useSendGuard(!!busy);
+  const submittingRef=useRef(false);
+  // OCV5-695:onSend 还在等(计费确认/建会话/网络)时按钮立刻显示「正在发送」并忽略再点;记下不忙→忙的
+  // 那一刻,「停止」出现不满 STOP_ARM_MS 的点击不算停止。挂载时已在生成中则立即可停。
+  const [sending,setSending]=useState(false);
+  const stopFlip=useRef({busy:!!busy,at:-STOP_ARM_MS}).current;
+  if(!!busy!==stopFlip.busy){stopFlip.busy=!!busy;if(busy)stopFlip.at=performance.now();}
   const latestSubmitRef=useRef({value,attachments,draftKey,replyTo,revision:0});
   const previousSubmit=latestSubmitRef.current;
   latestSubmitRef.current={value,attachments,draftKey,replyTo,revision:previousSubmit.revision+
@@ -1028,7 +1034,7 @@ export function Composer({
                 }
                 onClick={() => {
                   if (!busy) submit(true);
-                  else if (!stopping && stopArmed()) onStop?.();
+                  else if (!stopping && performance.now() - stopFlip.at >= STOP_ARM_MS) onStop?.();
                 }}
                 disabled={stopping || (!busy && (sending || !canSend)) || disabled}
                 className={cn(
@@ -1077,34 +1083,12 @@ export function Composer({
         </output>
       )}
 
-      {/* 图片附件灯箱:点击缩略图看全图。 */}
-      <Dialog.Root open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
-          <Dialog.Content
-            aria-describedby={undefined}
-            className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
-          >
-            <Dialog.Title className="sr-only">{preview?.name ?? "图片预览"}</Dialog.Title>
-            {preview && (
-              <img
-                src={preview.url}
-                alt={preview.name}
-                className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-float"
-              />
-            )}
-            <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭预览"
-                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+      {/* 图片附件灯箱:点击缩略图看全图(懒加载,不占首屏块)。 */}
+      {preview && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ComposerImagePreview url={preview.url} name={preview.name} onClose={() => setPreview(null)} />
+        </LazyBoundary>
+      )}
 
       {/* 会话目标对话框:由「+」菜单里的目标项打开(入口自会话头部迁入,功能本身不变)。 */}
       {canGoal && onSetGoal && onGoalAction && goalOpen && (

@@ -2,8 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { BRAND } from "../lib/brand";
-import { Composer, ENV_PREP_EXPECTED_MS } from "./Composer";
-import { STOP_ARM_MS } from "./composerSendGuard";
+import { Composer, ENV_PREP_EXPECTED_MS, STOP_ARM_MS } from "./Composer";
 import { ToastProvider } from "./ui";
 
 afterEach(cleanup);

@@ -536,3 +536,18 @@ describe("附件 error 态不得静默发送", () => {
     expect(screen.getByLabelText("继续上传 fail-probe.png")).toBeInTheDocument();
   });
 });
+
+// 灯箱改为懒加载(不占首屏块,OCV5-695 的字节抵扣):首次点缩略图仍能打开、可关闭。
+describe("图片附件灯箱(懒加载)", () => {
+  test("点缩略图打开全图,点关闭收起", async () => {
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:lightbox-probe") });
+    const file = new File(["png"], "lightbox.png", { type: "image/png" });
+    render(<Composer onSend={() => {}} onUpload={async () => ({ kind: "image", url: "/api/media/l.png" }) as MediaRef} />);
+    fireEvent.change(screen.getByLabelText("选择附件文件"), { target: { files: [file] } });
+    fireEvent.click(await screen.findByRole("button", { name: "预览 lightbox.png" }));
+    const dialog = await screen.findByRole("dialog", { name: "lightbox.png" });
+    expect(dialog.querySelector("img")).toHaveAttribute("src", "blob:lightbox-probe");
+    fireEvent.click(screen.getByRole("button", { name: "关闭预览" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+});
