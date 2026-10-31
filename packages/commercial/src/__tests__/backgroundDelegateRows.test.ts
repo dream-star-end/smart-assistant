@@ -54,7 +54,7 @@ test("forward and reverse record-page SQL read a bounded group prefix only with 
       assert.equal(page?.records[0]?._delegateJobId, "dlgjob-finished");
     }
   } finally {
-    delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS; delete process.env.OC_DELEGATE_BACKGROUND;
+    for (const key of ["OC_SELFHOST_ENGINE_LOCAL_TURNS", "OC_DELEGATE_BACKGROUND"]) Reflect.deleteProperty(process.env, key);
   }
   assert.equal(seen.length, 4);
 });

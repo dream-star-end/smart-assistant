@@ -10852,7 +10852,9 @@ describe("OCV5-676 background delegate heads on oversized agent-groups", () => {
   }
   const withFlag = async <T>(on: boolean, fn: () => Promise<T>): Promise<T> => {
     if (on) { process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = "1"; process.env.OC_DELEGATE_BACKGROUND = "1"; }
-    try { return await fn(); } finally { delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS; delete process.env.OC_DELEGATE_BACKGROUND; }
+    try { return await fn(); } finally {
+      for (const key of ["OC_SELFHOST_ENGINE_LOCAL_TURNS", "OC_DELEGATE_BACKGROUND"]) Reflect.deleteProperty(process.env, key);
+    }
   };
 
   maybe("flag off adds no head SQL; flag on reads only a bounded prefix of 3 MB groups", async () => {
