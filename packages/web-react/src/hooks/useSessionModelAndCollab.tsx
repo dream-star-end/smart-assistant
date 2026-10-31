@@ -216,7 +216,7 @@ export function useSessionModelAndCollab({
       const authorization=authorizeSwitch?await authorizeSwitch({sessionId:activeId,requestId:mintMsgId(),targetModel:id,agentId:agent.id,teamMode:options?.teamMode,
         ...(cursorModelSupportsContextTier(id)&&options?.contextTier?{contextTier:options.contextTier}:{}),
         ...(supportsFastServiceTier(id)&&options?.serviceTier?{serviceTier:options.serviceTier}:{})},
-        {notice,primeNextTurn:true,isCurrent:()=>activeModelSwitchSessionRef.current===sid&&modelSelectionEpochRef.current===selectionEpoch}):undefined;
+        {notice,primeNextTurn:true,listedX:{from:models.find((m)=>m.id===modelId)?.cost_x,to:models.find((m)=>m.id===id)?.cost_x},isCurrent:()=>activeModelSwitchSessionRef.current===sid&&modelSelectionEpochRef.current===selectionEpoch}):undefined;
       const confirmed=authorizeSwitch?authorization?.choice??false:notice?await confirmDialog({...notice,body:<>{SWITCH_COST_WARNING}{notice.body}</>}):true;
       if(confirmed===false||activeModelSwitchSessionRef.current!==sid||modelSelectionEpochRef.current!==selectionEpoch)return;
       if(!reason||!modelId||confirmed==='alt'){commit();return;}
