@@ -4,6 +4,7 @@
 // on every path of the state machine (plan §2).
 
 import type { MediaOp } from '../providers/types.js'
+import { pausesProvider } from './providerFailure.js'
 
 export const MAX_INFLIGHT_PER_PROJECT = 3
 
@@ -26,6 +27,8 @@ export interface DTake {
   provider: string
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled'
   blobSha: string | null
+  errorCode?: string | null
+  providerFailureAcknowledged?: boolean
   /** OCV5-591 A2-1b-1: the take's QA outcome (null: not judged yet). */
   qa?: DQa | null
 }
@@ -104,7 +107,7 @@ export interface Dispatch {
 export type Action =
   | { type: 'enqueue_plan' }
   | { type: 'dispatch'; dispatch: Dispatch }
-  | { type: 'set_status'; status: ProjectStatus; reason?: string }
+  | { type: 'set_status'; status: ProjectStatus; reason?: string; providerCode?: string }
   | { type: 'shot_status'; shotId: string; status: DShot['status'] }
   /** A finished video nobody adopted (the executor declined: the shot had moved on meanwhile). */
   | { type: 'adopt_video'; shotId: string; takeId: string }
@@ -126,7 +129,7 @@ function ownerTakes(s: DState, kind: DTake['ownerKind'], ownerId: string): DTake
 const live = (t: DTake) => t.status === 'queued' || t.status === 'running'
 const ok = (t: DTake) => t.status === 'succeeded' && t.blobSha !== null
 const failedProviders = (ts: DTake[]) => [
-  ...new Set(ts.filter((t) => t.status === 'failed').map((t) => t.provider)),
+  ...new Set(ts.filter((t) => t.status === 'failed' && !pausesProvider(t.errorCode)).map((t) => t.provider)),
 ]
 
 /** A shot is done only when its adopted take is a succeeded video (plan r1 P1-3). */
@@ -167,6 +170,32 @@ export function decide(s: DState): Action[] {
   if (s.status === 'composing')
     return s.canCompose && !s.composeQueued && s.inflight === 0 ? [{ type: 'enqueue_compose' }] : []
   if (s.status !== 'running') return []
+
+  // Preflight every relevant owner before dispatching any new work. Failed services do not
+  // consume a quality regeneration or silently trigger another provider (and another charge).
+  const pendingFailure = (ts: DTake[]) => {
+    if (ts.some(live) || ts.some((t) => accepted(s, t))) return undefined
+    const last = [...ts].sort((a, b) => b.version - a.version)[0]
+    return last?.status === 'failed' && !last.providerFailureAcknowledged && pausesProvider(last.errorCode)
+      ? last : undefined
+  }
+  let failure: DTake | undefined
+  for (const asset of s.assets) {
+    if (BIBLE_KINDS.has(asset.kind) && !(asset.locked && asset.blobSha))
+      failure ??= pendingFailure(ownerTakes(s, 'bible', asset.id))
+  }
+  for (const shot of s.shots) {
+    if (shotDone(s, shot) || shot.status === 'needs_user' || shot.status === 'failed') continue
+    const frames = ownerTakes(s, 'shot_frame', shot.id).filter((t) => t.version >= (shot.redo?.frame ?? 0) || t.id === shot.frameTakeId)
+    const picked = frames.some((t) => t.id === shot.frameTakeId && ok(t))
+    if (!picked) failure ??= pendingFailure(frames)
+    failure ??= pendingFailure(ownerTakes(s, 'shot_video', shot.id).filter((t) => t.version >= (shot.redo?.video ?? 0)))
+  }
+  for (const line of s.lines) {
+    if (line.status !== 'ready' && line.status !== 'needs_user' && line.status !== 'failed')
+      failure ??= pendingFailure(ownerTakes(s, 'line', line.id))
+  }
+  if (failure) return [{ type: 'set_status', status: 'awaiting_user', reason: 'provider_failure', providerCode: failure.errorCode! }]
 
   const actions: Action[] = []
   let budget = Math.max(0, MAX_INFLIGHT_PER_PROJECT - s.inflight)

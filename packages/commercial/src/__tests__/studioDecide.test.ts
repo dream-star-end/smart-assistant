@@ -47,6 +47,29 @@ const dispatches = (s: DState) =>
   )
 
 describe('decide (OCV5-591 A2-1a)', () => {
+  it('pauses provider availability failures before any dispatch, including with alternative providers', () => {
+    for (const errorCode of ['IMAGE_DAILY_LIMIT', 'MUSE_BRIDGE_LOST', 'MUSE_SOURCE_FETCH_FAILED']) {
+      for (const ownerKind of ['bible', 'shot_frame', 'shot_video'] as const) {
+        const failed = take({ id: 'failed', ownerKind, ownerId: ownerKind === 'bible' ? 'a1' : 's0', status: 'failed', blobSha: null, errorCode })
+        const s = state({
+          takes: [failed],
+          assets: ownerKind === 'bible' ? [{ id: 'a1', kind: 'character', locked: false, blobSha: null }] : [],
+        })
+        assert.deepEqual(decide(s), [{ type: 'set_status', status: 'awaiting_user', reason: 'provider_failure', providerCode: errorCode }])
+      }
+    }
+  })
+
+  it('ignores acknowledged, superseded and out-of-window provider failures', () => {
+    const failed = take({ id: 'bad', status: 'failed', blobSha: null, errorCode: 'IMAGE_DAILY_LIMIT' })
+    const acknowledged = decide(state({ takes: [{ ...failed, providerFailureAcknowledged: true }] }))
+    const retry = acknowledged.find((a) => a.type === 'dispatch')
+    assert.ok(retry && retry.type === 'dispatch')
+    assert.deepEqual(retry.dispatch.exclude, [], 'same provider is allowed after acknowledgement')
+    assert.deepEqual(dispatches(state({ takes: [failed, take({ id: 'ok', version: 2 })] })), ['shot_video:s0'])
+    assert.deepEqual(dispatches(state({ takes: [failed], shots: [{ id: 's0', ordinal: 0, status: 'planned', activeTakeId: null, frameTakeId: null, redo: { frame: 2, video: 1 } }] })), ['shot_frame:s0'])
+    assert.deepEqual(dispatches(state({ takes: [{ ...failed, ownerKind: 'bible', ownerId: 'a1' }], assets: [{ id: 'a1', kind: 'character', locked: true, blobSha: 'b'.repeat(64) }] })), ['shot_frame:s0'])
+  })
   it('planning enqueues the plan once; other states do nothing', () => {
     assert.deepEqual(decide(state({ status: 'planning' })), [{ type: 'enqueue_plan' }])
     assert.deepEqual(decide(state({ status: 'planning', hasPlanTask: true })), [])

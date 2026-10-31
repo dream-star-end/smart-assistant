@@ -16,6 +16,7 @@ import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
 import { type BibleEntry, biblePrompt, framePrompt, videoPrompt, withAvoid } from './prompts.js'
 import { type StudioQaDeps, qaGates } from './qa.js'
+import { providerPauseMessage } from './providerFailure.js'
 
 export interface AdvanceDeps {
   pool: Pool
@@ -123,8 +124,10 @@ export async function loadState(
       status: string
       blob_sha: string | null
       qa: unknown
+      error_code: string | null
+      meta: Record<string, unknown>
     }>(
-      `SELECT id::text AS id, owner_kind, owner_id::text AS owner_id, version, provider, status, blob_sha, qa
+      `SELECT id::text AS id, owner_kind, owner_id::text AS owner_id, version, provider, status, blob_sha, qa, error_code, meta
          FROM studio_takes WHERE project_id = $1`,
       [projectId],
     ),
@@ -176,6 +179,8 @@ export async function loadState(
       provider: t.provider,
       status: t.status as DState['takes'][number]['status'],
       blobSha: t.blob_sha,
+      errorCode: t.error_code,
+      providerFailureAcknowledged: t.meta?.providerFailureAcknowledged === true,
       qa: dqa(t.qa),
     })),
     narrationVoiceId: typeof narration?.voiceId === 'string' ? narration.voiceId : null,
@@ -560,8 +565,9 @@ async function apply(
       )
       await appendStudioEvent(client, id, `project.${a.status}`, {
         reason: a.reason ?? null,
+        ...(a.providerCode ? { code: a.providerCode } : {}),
         message:
-          a.status === 'composing'
+          a.providerCode ? providerPauseMessage(a.providerCode) : a.status === 'composing'
             ? '镜头和配音都好了，导演 agent 开始合成成片。'
             : a.reason === 'compose_pending'
               ? '镜头和配音都好了，等待合成（合成沙箱未配置）。'
