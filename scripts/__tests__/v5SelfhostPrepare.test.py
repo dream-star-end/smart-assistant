@@ -1026,6 +1026,39 @@ flock -n "$SELFHOST_DEPLOY_LOCK" true
         (self.t / 'artifact-release').touch()
         self.finish(holder)
 
+    def test_worker_settles_each_tip_only_after_its_own_committed_train(self):
+        # Run the original S3 assertions against this checkout's actual worker.
+        source = (ROOT / 'scripts/v5-lease-center-selftest.sh').read_text()
+        markers = ('echo "═══ T1 ', 'echo "═══ S3 ', 'echo "═══ T2 ',
+                   'echo "PASS=$PASS FAIL=$FAIL"')
+        for marker in markers:
+            self.assertEqual(source.count(marker), 1)
+        first, s3, following, footer = (source.index(marker) for marker in markers)
+        self.assertEqual([first, s3, following, footer], sorted([first, s3, following, footer]))
+        setup, replacements = re.subn(r'^SCRIPT_DIR=.*$',
+                                      f'SCRIPT_DIR={str(ROOT / "scripts")!r}',
+                                      source[:first], flags=re.M)
+        self.assertEqual(replacements, 1)
+        script = self.t / 'lease-s3-focused.sh'
+        script.write_text(setup + source[s3:following] + source[footer:])
+        process = subprocess.Popen(['bash', str(script)], env=self.env, close_fds=True,
+                                   start_new_session=True, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.reap_process, process)
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            process.terminate()  # Let the selftest's EXIT trap clean its private workers.
+            try:
+                stdout, stderr = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=10)
+            self.fail('lease S3 fixture timed out:\n' + stdout + stderr)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertIn('PASS=11 FAIL=0', stdout)
+        print(stdout, end='')
+
 
 if __name__ == '__main__':
     unittest.main()
