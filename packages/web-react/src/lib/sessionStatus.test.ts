@@ -3,6 +3,7 @@ import {
   deriveLiveTerminalEndedAt,
   deriveLiveTerminalFromMessages,
   isSidebarSessionRunning,
+  resolveLiveTurnEndTerminal,
   resolveSessionStatus,
   resolveSidebarDot,
 } from "./sessionStatus";
@@ -165,5 +166,31 @@ describe("deriveLiveTerminalEndedAt", () => {
     expect(
       deriveLiveTerminalEndedAt([{ _dispatchOutcome: "completed" }], observed),
     ).toBe(observed);
+  });
+});
+
+describe("resolveLiveTurnEndTerminal (U8)", () => {
+  it("实时 WS 正常结束消息不含 _dispatchOutcome/_errorCode 时默认收敛为 completed，消除侧栏残留转圈", () => {
+    const terminal = resolveLiveTurnEndTerminal([
+      { _turnStatusRecord: false },
+    ]);
+    expect(terminal).toEqual({ lastOutcome: "completed", lastErrorCode: null });
+    expect(
+      isSidebarSessionRunning(
+        { id: "s1", runState: "running" },
+        { isSending: () => false, liveTerminal: () => terminal },
+      ),
+    ).toBe(false);
+  });
+
+  it("含停止或错误码时保留精确中断/错误终态", () => {
+    expect(resolveLiveTurnEndTerminal([{ _errorCode: "user_cancelled" }])).toEqual({
+      lastOutcome: "interrupted",
+      lastErrorCode: "user_cancelled",
+    });
+    expect(resolveLiveTurnEndTerminal([{ _errorCode: "rate_limited" }])).toEqual({
+      lastOutcome: "executed_error",
+      lastErrorCode: "rate_limited",
+    });
   });
 });

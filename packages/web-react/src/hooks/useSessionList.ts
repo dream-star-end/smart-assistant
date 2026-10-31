@@ -4,6 +4,7 @@ import { useToast } from "../components/ui";
 import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
+import { deriveLiveTerminalFromMessages } from "../lib/sessionStatus";
 import type { StoredSession } from "../lib/persist";
 import type {
   AuthSession,
@@ -26,6 +27,8 @@ export function genWsSessionId(): string {
   return `web${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const isoAt = (t?: number) => new Date(t ?? Date.now()).toISOString();
+
 function makeLocalSession(title: string, ownerUserId: string): Session {
   const now = Date.now();
   return {
@@ -34,7 +37,7 @@ function makeLocalSession(title: string, ownerUserId: string): Session {
     ownerUserId,
     createdAt: now,
     lastAt: now,
-    updatedAt: new Date(now).toISOString(),
+    updatedAt: isoAt(now),
     messageCount: 0,
     pinned: false,
     projectId: null,
@@ -51,7 +54,7 @@ function storedToSession(s: StoredSession, ownerUserId: string): Session {
     ownerUserId,
     createdAt: s.createdAt,
     lastAt: s.lastAt,
-    updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
+    updatedAt: isoAt(s.updatedAt ?? s.lastAt),
     messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
     // modelId 无值时不落键:upsertSessions 的 spread 合并按"键缺席=不表态"保留另一侧的值。
     ...(s._selectedModelId ? { modelId: s._selectedModelId } : {}),
@@ -65,7 +68,7 @@ function metaToSession(m: SessionMeta, ownerUserId: string): Session {
     title: m.title || "新对话",
     ownerUserId,
     createdAt: m.createdAt,
-    updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
+    updatedAt: isoAt(m.updatedAt ?? m.lastAt),
     messageCount: m.messageCount ?? 0,
     pinned: m.pinned === true,
     projectId: m.projectId ?? null,
@@ -90,11 +93,11 @@ export function sessionCursorAt(s: Session): number {
 }
 
 function isAbortError(e: unknown): boolean {
-  return (
-    (e instanceof DOMException && e.name === "AbortError") ||
-    (e instanceof Error && e.name === "AbortError")
-  );
+  return (e instanceof DOMException || e instanceof Error) && e.name === "AbortError";
 }
+
+const byUpdatedDesc = (a: Session, b: Session) =>
+  a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0;
 
 /**
  * 合并侧栏会话：union by id，按 updatedAt 倒序。`incomingWins` 决定重叠项谁覆盖元数据
@@ -107,9 +110,7 @@ function upsertSessions(cur: Session[], incoming: Session[], incomingWins: boole
     const prev = map.get(s.id);
     map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
   }
-  return [...map.values()].sort((a, b) =>
-    a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
-  );
+  return [...map.values()].sort(byUpdatedDesc);
 }
 
 export type UseSessionListOptions = {
@@ -220,6 +221,19 @@ export type UseSessionList = {
  * UI（确认/输入对话框）与 chat 展示态（demo messages/chatError）经回调注入，
  * 本 hook 不反向依赖渲染层。
  */
+type TerminalGuard = { floor: number; staleRequest: object | null };
+
+function recordTerminalGuard(
+  guards: Map<string, TerminalGuard>,
+  staleRequest: object | null,
+  id: string,
+  at: number,
+): void {
+  const floor = Math.max(guards.get(id)?.floor ?? 0, at);
+  guards.set(id, { floor, staleRequest });
+}
+
+
 export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const { demo, auth, user, agentId, holdAutoSelect = false } = opts;
   // 回调/句柄经 ref 镜像：App 每渲染可能传新闭包，这里始终读最新版本而不进 useCallback
@@ -227,11 +241,30 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const confirmedMetadata = useRef(new Map<string, SessionMetadataSnapshot>());
   /** 重命名 PATCH 未落地期间的本地标题：此前已发出的列表请求带回旧标题，不能盖掉它(#1240)。 */
   const pendingTitles = useRef(new Map<string, string>());
+  const listRefreshInflightRef = useRef<object | null>(null);
+  /**
+   * 终态收敛护栏(U8)：记录本地回合结束或 canonical getSession 确认无 openDispatch 时的服务端水位
+   * 与当时已在途的列表请求引用，防止回合结束前已发出的旧 listSessions 把侧栏重新盖回 running。
+   */
+  const terminalGuardRef = useRef(new Map<string, TerminalGuard>());
+  const appliedTerminalsRef = useRef(new WeakSet<object>());
   const cbRef = useRef(opts);
   cbRef.current = opts;
   const toast = useToast();
 
   const [sessions, setSessions] = useState<Session[]>(demo ? DEMO_SESSIONS : []);
+  const patchSession = useCallback((id: string, fn: (s: Session) => Session) => {
+    setSessions((c) => {
+      let changed = false;
+      const next = c.map((s) => {
+        if (s.id !== id) return s;
+        const u = fn(s);
+        if (u !== s) changed = true;
+        return u;
+      });
+      return changed ? next : c;
+    });
+  }, []);
   const [activeId, setActiveId] = useState<string | undefined>(
     demo ? DEMO_SESSIONS[0].id : undefined,
   );
@@ -325,11 +358,27 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     async (id: string, opts?: { force?: boolean }) => {
       const owner = userIdRef.current;
       if (!auth || !owner) return;
-      if (!opts?.force && historyFetchingRef.current.has(id)) return; // 并发中：不重入
-      const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
-      if (!opts?.force && Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
-      if (opts?.force && historyFetchingRef.current.has(id)) return;
+      if (historyFetchingRef.current.has(id)) return; // 并发中：不重入
+      if (!opts?.force && Date.now() - (historyFetchedAtRef.current.get(id) ?? 0) < HISTORY_REFETCH_COOLDOWN_MS)
+        return; // 短时重复：不重拉
       const requestToken = ++historyRequestTokenRef.current;
+      const clearLoading = () =>
+        setHistoryLoadingTokens((current) => {
+          if (current.get(id) !== requestToken) return current;
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
+      const markHistoryFetched = () => {
+        historyFetchedAtRef.current.set(id, Date.now());
+        setHistoryErrorBySession((current) => {
+          const existing = current.get(id);
+          if (!existing || existing.token > requestToken) return current;
+          const next = new Map(current);
+          next.delete(id);
+          return next;
+        });
+      };
       historyFetchingRef.current.set(id, requestToken);
       setHistoryLoadingTokens((current) => {
         const next = new Map(current);
@@ -347,46 +396,43 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
         if (userIdRef.current !== owner || historyFetchingRef.current.get(id) !== requestToken)
           return;
-        const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
         // 会话模型陈旧载荷拦截:pending 意图存续/低于已确认写水位的 detail,其 modelId
         // 不应用(消息合并照常 —— socket 有自己的版本护栏)。
         const freshModelId =
           typeof detail.updatedAt === "number" && modelPayloadFresh(id, detail.updatedAt)
             ? detail.modelId
             : undefined;
-        cbRef.current.sockRef.current?.mergeServerHistory({
+        const toHistoryMerge = (d: typeof detail, modelId: string | undefined) => ({
           sessId: id,
-          agentId: detail.agentId || agentId,
-          messages: msgs,
-          full: !detail.isPartial,
-          maxSeq: detail.maxSeq,
+          agentId: d.agentId || agentId,
+          messages: Array.isArray(d.messages) ? (d.messages as ChatMessage[]) : [],
+          full: !d.isPartial,
+          maxSeq: d.maxSeq,
           // 热尾巴:server 可能只回 `_seq > archivedThroughSeq` 的一截;透传水位/计数,
           // full 合并才不丢本地已归档旧行,并记录归档计数供 UI 展示。
-          archivedThroughSeq: detail.archivedThroughSeq,
-          archivedCount: detail.archivedCount,
-          serverUpdatedAt: detail.updatedAt,
-          modelId: freshModelId,
-          historyRevision: detail.historyRevision,
-          timelineGeneration: detail.timelineGeneration,
-          timelineCursor: detail.timelineCursor,
-          timelineHasMore: detail.timelineHasMore,
-          timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
-          invalidateHistoryCache: detail._historyRevisionUnsupported === true,
+          archivedThroughSeq: d.archivedThroughSeq,
+          archivedCount: d.archivedCount,
+          serverUpdatedAt: d.updatedAt,
+          modelId,
+          historyRevision: d.historyRevision,
+          timelineGeneration: d.timelineGeneration,
+          timelineCursor: d.timelineCursor,
+          timelineHasMore: d.timelineHasMore,
+          timelineSnapshotMaxSeq: d.timelineSnapshotMaxSeq,
+          invalidateHistoryCache: d._historyRevisionUnsupported === true,
+          automaticRecoveries: d.automaticRecoveries,
+          permissionPrompts: d.permissionPrompts,
+        });
+        const merged = toHistoryMerge(detail, freshModelId);
+        const msgs = merged.messages;
+        cbRef.current.sockRef.current?.mergeServerHistory({
+          ...merged,
           openDispatch: detail.openDispatch,
-          automaticRecoveries: detail.automaticRecoveries,
-          permissionPrompts: detail.permissionPrompts,
         });
         // Canonical GET is enough to dismiss the history skeleton. Journal
         // hydrate is a background fill — awaiting it used to pin
         // 「正在加载会话内容…」for as long as live-frames hung.
-        if (historyFetchingRef.current.get(id) === requestToken) {
-          setHistoryLoadingTokens((current) => {
-            if (current.get(id) !== requestToken) return current;
-            const next = new Map(current);
-            next.delete(id);
-            return next;
-          });
-        }
+        if (historyFetchingRef.current.get(id) === requestToken) clearLoading();
         const liveSocket = cbRef.current.sockRef.current;
         if (liveSocket?.hydrateDurableLiveFrameJournal) {
           void liveSocket
@@ -395,27 +441,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
               (after) => api.getSessionLiveFrames(cbRef.current.authSession, id, after, 500),
               async () => {
                 const tapeDetail = await api.getSession(cbRef.current.authSession, id, 0);
-                liveSocket.mergeServerHistory({
-                  sessId: id,
-                  agentId: tapeDetail.agentId || agentId,
-                  messages: Array.isArray(tapeDetail.messages)
-                    ? (tapeDetail.messages as ChatMessage[])
-                    : [],
-                  full: !tapeDetail.isPartial,
-                  maxSeq: tapeDetail.maxSeq,
-                  archivedThroughSeq: tapeDetail.archivedThroughSeq,
-                  archivedCount: tapeDetail.archivedCount,
-                  serverUpdatedAt: tapeDetail.updatedAt,
-                  modelId: tapeDetail.modelId,
-                  historyRevision: tapeDetail.historyRevision,
-                  timelineGeneration: tapeDetail.timelineGeneration,
-                  timelineCursor: tapeDetail.timelineCursor,
-                  timelineHasMore: tapeDetail.timelineHasMore,
-                  timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
-                  invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
-                  automaticRecoveries: tapeDetail.automaticRecoveries,
-                  permissionPrompts: tapeDetail.permissionPrompts,
-                });
+                liveSocket.mergeServerHistory(toHistoryMerge(tapeDetail, tapeDetail.modelId));
               },
               (query) =>
                 api.getSessionLiveUnits(cbRef.current.authSession, id, { n: 20, ...query }),
@@ -428,20 +454,38 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         // 不回填则 App 恢复选择器仍读侧栏旧值。server-wins,detail 无值不清本地
         // (服务端 NULL 只表示"从未显式选择",不存在"清除"流,缺席=不表态)。
         if (freshModelId) {
-          setSessions((c) =>
-            c.map((s) =>
-              s.id === id && s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s,
-            ),
-          );
+          patchSession(id, (s) => (s.modelId !== freshModelId ? { ...s, modelId: freshModelId } : s));
         }
-        historyFetchedAtRef.current.set(id, Date.now());
-        setHistoryErrorBySession((current) => {
-          const existing = current.get(id);
-          if (!existing || existing.token > requestToken) return current;
-          const next = new Map(current);
-          next.delete(id);
-          return next;
-        });
+        // 快照终态收敛(U8)：canonical getSession 已确认无 openDispatch 且本 tab 未在发送时，
+        // 若侧栏仍滞留在 runState="running"（列表轮询与回合结束交错），立即收敛为 idle。
+        if (detail.openDispatch?.clientMessageId) {
+          terminalGuardRef.current.delete(id);
+        } else if (!cbRef.current.sockRef.current?.isSending?.(id)) {
+          const detailAt = typeof detail.updatedAt === "number" ? detail.updatedAt : 0;
+          if (detailAt > 0 || listRefreshInflightRef.current) {
+            recordTerminalGuard(
+              terminalGuardRef.current,
+              listRefreshInflightRef.current,
+              id,
+              detailAt,
+            );
+          }
+          const d = deriveLiveTerminalFromMessages(msgs);
+          patchSession(id, (s) => {
+            const out = s.lastOutcome ?? d?.lastOutcome;
+            const code = s.lastOutcome ? s.lastErrorCode : (d?.lastErrorCode ?? s.lastErrorCode);
+            if (s.runState !== "running" && s.lastOutcome === out && s.lastErrorCode === code) {
+              return s;
+            }
+            return {
+              ...s,
+              runState: "idle",
+              ...(out !== undefined ? { lastOutcome: out } : {}),
+              ...(code !== undefined ? { lastErrorCode: code } : {}),
+            };
+          });
+        }
+        markHistoryFetched();
       } catch (e) {
         // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，
         // 但仍非永久（会话后续被 server 持久化后，冷却过去可正常增量拉到）。其他错误不打戳 →
@@ -451,14 +495,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           e.status === 404 &&
           historyFetchingRef.current.get(id) === requestToken
         ) {
-          historyFetchedAtRef.current.set(id, Date.now());
-          setHistoryErrorBySession((current) => {
-            const existing = current.get(id);
-            if (!existing || existing.token > requestToken) return current;
-            const next = new Map(current);
-            next.delete(id);
-            return next;
-          });
+          markHistoryFetched();
         } else if (historyFetchingRef.current.get(id) === requestToken) {
           // 不外露英文/技术原文(如 "Failed to fetch"),统一走面向用户的中文文案。
           const message = apiErrorMessage(e, "会话加载失败，请重试");
@@ -472,16 +509,11 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         if (historyFetchingRef.current.get(id) === requestToken) {
           historyFetchingRef.current.delete(id);
         }
-        setHistoryLoadingTokens((current) => {
-          if (current.get(id) !== requestToken) return current;
-          const next = new Map(current);
-          next.delete(id);
-          return next;
-        });
+        clearLoading();
       }
     },
     // modelPayloadFresh 为稳定 useCallback([]),入 deps 仅为满足 lint,不改重建时机。
-    [auth, agentId, modelPayloadFresh],
+    [auth, agentId, modelPayloadFresh, patchSession],
   );
 
   const retryHistory = useCallback(
@@ -532,14 +564,31 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const nextCursorRef = useRef<number | undefined>(undefined);
   const loadMoreInflightRef = useRef(false);
   const archivedFetchedRef = useRef(false);
-  const listRefreshInflightRef = useRef<object | null>(null);
   const listGenerationRef = useRef(0);
 
   const mapListMetas = useCallback(
-    (metas: SessionMeta[]): Session[] => {
+    (metas: SessionMeta[], request?: object | null): Session[] => {
       if (!user) return [];
       return metas.map((m) => {
         const payloadUpdatedAt = m.updatedAt;
+        const guard = terminalGuardRef.current.get(m.id);
+        if (guard) {
+          const staleReq = Boolean(request && guard.staleRequest === request);
+          if (staleReq) guard.staleRequest = null;
+          if (
+            cbRef.current.sockRef.current?.isSending?.(m.id) ||
+            (m.runState !== "running" && !staleReq)
+          ) {
+            terminalGuardRef.current.delete(m.id);
+          } else if (m.runState === "running") {
+            if (staleReq || (guard.floor > 0 && m.updatedAt <= guard.floor)) {
+              if (staleReq && m.updatedAt > guard.floor) guard.floor = m.updatedAt;
+              m = { ...m, runState: "idle" };
+            } else {
+              terminalGuardRef.current.delete(m.id);
+            }
+          }
+        }
         const confirmed = confirmedMetadata.current.get(m.id);
         if (confirmed && m.updatedAt < confirmed.updatedAt) m = { ...m, ...confirmed };
         else confirmedMetadata.current.set(m.id, { id: m.id, title: m.title, pinned: m.pinned === true, updatedAt: m.updatedAt });
@@ -573,7 +622,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             if (fill) fill.serverSettled = true;
           }
         }
-        const server = mapListMetas(metas);
+        const server = mapListMetas(metas, request);
         setSessions((cur) => upsertSessions(cur, server, true));
         if (opts?.initial) {
           nextCursorRef.current = undefined;
@@ -591,40 +640,29 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
   // 失败保留本地（IndexedDB 注水）会话，不阻断。
-  useEffect(() => {
-    if (demo || !auth || !user) return;
-    let cancelled = false;
-    refreshSessionList({ initial: true, cancelled: () => cancelled }).then(settled => {
-      if (settled && !cancelled) setServerListSettled(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [demo, auth, user, refreshSessionList]);
-
   // 可见标签 60s 轮询 + 切回前台/窗口 focus 立即重拉。hidden 不打；未登录/demo 不拉。
   // upsertSessions union 保住已 loadMore 的行，不重置分页游标。
   useEffect(() => {
     if (demo || !auth || !user) return;
     let cancelled = false;
-    const refresh = () => refreshSessionList({ cancelled: () => cancelled });
+    const isCancelled = () => cancelled;
+    void refreshSessionList({ initial: true, cancelled: isCancelled }).then((settled) => {
+      if (settled && !cancelled) setServerListSettled(true);
+    });
+    const refresh = () => {
+      void refreshSessionList({ cancelled: isCancelled });
+    };
     const tick = () => {
-      if (document.visibilityState === "visible") void refresh();
+      if (document.visibilityState === "visible") refresh();
     };
     const timer = window.setInterval(tick, LIST_POLL_MS);
-    const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    const onFocus = () => {
-      void refresh();
-    };
-    document.addEventListener("visibilitychange", onVis);
-    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", tick);
+    window.addEventListener("focus", refresh);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onVis);
-      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", tick);
+      window.removeEventListener("focus", refresh);
     };
   }, [demo, auth, user, refreshSessionList]);
 
@@ -650,17 +688,21 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     const previous = confirmedMetadata.current.get(metadata.id);
     if (previous && previous.updatedAt > metadata.updatedAt) return;
     confirmedMetadata.current.set(metadata.id, metadata);
-    setSessions(current => current.map(session => session.id === metadata.id
-      ? { ...session, title: metadata.title, pinned: metadata.pinned, updatedAt: new Date(metadata.updatedAt).toISOString() } : session));
+    patchSession(metadata.id, (session) => ({
+      ...session,
+      title: metadata.title,
+      pinned: metadata.pinned,
+      updatedAt: isoAt(metadata.updatedAt),
+    }));
     cbRef.current.sockRef.current?.renameSession(metadata.id, metadata.title);
-  }, []);
+  }, [patchSession]);
 
   // rename 一次收口三个持有方:App state(侧栏)+ WS service/IndexedDB + 服务端 canonical。
   // 此前只改 App state → listSessions server-wins 下次直接盖回旧标题(纯本地幻觉)。
   const renameSessionPrompt = async (s: Session) => {
     const t = (await cbRef.current.promptText({ title: "重命名会话", initial: s.title }))?.trim();
     if (!t || t === s.title) return;
-    setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
+    patchSession(s.id, (x) => ({ ...x, title: t }));
     if (!demo) {
       cbRef.current.sockRef.current?.renameSession(s.id, t);
       // 60s 轮询 / 窗口 focus 重拉随时可能在飞：PATCH 落地前带回的旧标题曾把乐观标题盖回去，
@@ -679,11 +721,27 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         if (pendingTitles.current.get(s.id) === t) pendingTitles.current.delete(s.id);
         // 服务端失败：此前静默吞掉，60s 轮询 server-wins 后标题「自己变回去」（USL-01）。
         // 现在立刻回滚三个持有方并告知，用户可重试。
-        setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: s.title } : x)));
+        patchSession(s.id, (x) => ({ ...x, title: s.title }));
         cbRef.current.sockRef.current?.renameSession(s.id, s.title);
         console.warn("patchSessionTitle failed", e);
         toast("重命名失败，已恢复原标题", "error");
       }
+    }
+  };
+
+  const forgetSessionLocal = (id: string) => {
+    for (const r of [historyFetchedAtRef, historyFetchingRef, modelSyncRef, terminalGuardRef])
+      r.current.delete(id);
+    setHistoryLoadingTokens((current) => {
+      if (!current.has(id)) return current;
+      const next = new Map(current);
+      next.delete(id);
+      return next;
+    });
+    cbRef.current.onDeleteSession?.(id);
+    if (!demo) {
+      cbRef.current.sockRef.current?.removeSession(id);
+      cbRef.current.sockRef.current?.removePersisted(id);
     }
   };
 
@@ -696,24 +754,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       danger: true,
     });
     if (!ok) return;
-    cbRef.current.onDeleteSession?.(s.id);
-    historyFetchedAtRef.current.delete(s.id);
-    historyFetchingRef.current.delete(s.id);
-    setHistoryLoadingTokens((current) => {
-      if (!current.has(s.id)) return current;
-      const next = new Map(current);
-      next.delete(s.id);
-      return next;
-    });
-    modelSyncRef.current.delete(s.id);
+    forgetSessionLocal(s.id);
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
       setActiveId(undefined);
       cbRef.current.onActiveSessionDeleted();
     }
     if (!demo) {
-      cbRef.current.sockRef.current?.removeSession(s.id);
-      cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
       // 服务端删除：失败此前静默（注释自认「reload 后会从 listSessions 复活」，USL-02）。
       // 本地 socket/IndexedDB 副本已清、不做完整回滚；改为告知 + 立刻重拉列表让会话回到侧栏，
       // 用户看到的是「删除失败、会话仍在」而不是刷新后诡异复活；再次选中会重拉服务端历史。
@@ -735,12 +782,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     patch: { pinned?: boolean; projectId?: string | null; archived?: boolean },
     next: Session,
   ) => {
-    setSessions((c) => c.map((x) => (x.id === s.id ? next : x)));
+    patchSession(s.id, () => next);
     if (demo) return;
     try {
       await api.patchSessionMeta(cbRef.current.authSession, s.id, patch);
     } catch (e) {
-      setSessions((c) => c.map((x) => (x.id === s.id ? s : x)));
+      patchSession(s.id, () => s);
       console.warn("patchSessionMeta failed", e);
       toast("操作失败，已恢复", "error");
     }
@@ -759,23 +806,6 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const toggleArchiveSession = async (s: Session) => {
     const archived = !s.archived;
     await patchSessionMetaOptimistic(s, { archived }, { ...s, archived });
-  };
-
-  const forgetSessionLocal = (id: string) => {
-    historyFetchedAtRef.current.delete(id);
-    historyFetchingRef.current.delete(id);
-    setHistoryLoadingTokens((current) => {
-      if (!current.has(id)) return current;
-      const next = new Map(current);
-      next.delete(id);
-      return next;
-    });
-    modelSyncRef.current.delete(id);
-    cbRef.current.onDeleteSession?.(id);
-    if (!demo) {
-      cbRef.current.sockRef.current?.removeSession(id);
-      cbRef.current.sockRef.current?.removePersisted(id);
-    }
   };
 
   const batchUpdateSessions = async (
@@ -812,11 +842,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       setActiveId(undefined);
       cbRef.current.onActiveSessionDeleted();
     }
+    const finishBatchDelete = () => {
+      if (action !== "delete") return;
+      for (const id of unique) forgetSessionLocal(id);
+      toast(`已删除 ${unique.length} 条会话`, "success");
+    };
     if (demo) {
-      if (action === "delete") {
-        for (const id of unique) forgetSessionLocal(id);
-        toast(`已删除 ${unique.length} 条会话`, "success");
-      }
+      finishBatchDelete();
       return;
     }
     try {
@@ -825,17 +857,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
         action,
         ...(action === "move" ? { projectId: projectId ?? null } : {}),
       });
-      if (action === "delete") {
-        for (const id of unique) forgetSessionLocal(id);
-        toast(`已删除 ${unique.length} 条会话`, "success");
-      }
+      finishBatchDelete();
     } catch (e) {
       setSessions((c) => {
         const map = new Map(c.map((s) => [s.id, s]));
         for (const s of snapshot) map.set(s.id, s);
-        return [...map.values()].sort((a, b) =>
-          a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
-        );
+        return [...map.values()].sort(byUpdatedDesc);
       });
       console.warn("batchSessions failed", e);
       toast("操作失败，已恢复", "error");
@@ -926,6 +953,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       sessId: string,
       terminal: { lastOutcome: SessionLastOutcome; lastErrorCode: string | null; endedAt?: number } | null,
     ) => {
+      if (terminal) {
+        if (appliedTerminalsRef.current.has(terminal)) return;
+        appliedTerminalsRef.current.add(terminal);
+      }
       let allowEndedAtFill = false;
       if (terminal?.endedAt != null) {
         const prev = terminalFillRef.current.get(sessId);
@@ -936,40 +967,43 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           allowEndedAtFill = !prev.serverSettled;
         }
       }
-      setSessions((c) =>
-        c.map((x) => {
-          if (x.id !== sessId) return x;
-          const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
-          const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
-          // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 可能还停在回合开始前，
-          // 临时补齐防回跳；一旦服务端权威 idle 列表到达校正（serverSettled），重放不再覆盖权威 lastAt。
-          const ended =
-            allowEndedAtFill && terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0)
-              ? { lastAt: terminal.endedAt }
-              : null;
-          if (
-            x.runState === "idle" &&
-            x.lastOutcome === nextOutcome &&
-            x.lastErrorCode === nextCode
-          ) {
-            return ended ? { ...x, ...ended } : x;
-          }
-          return {
-            ...x,
-            ...ended,
-            runState: "idle" as const,
-            ...(terminal
-              ? {
-                  lastOutcome: terminal.lastOutcome,
-                  lastErrorCode: terminal.lastErrorCode,
-                  unread: true,
-                }
-              : {}),
-          };
-        }),
+      recordTerminalGuard(
+        terminalGuardRef.current,
+        listRefreshInflightRef.current,
+        sessId,
+        confirmedMetadata.current.get(sessId)?.updatedAt ?? 0,
       );
+      patchSession(sessId, (x) => {
+        const nextOutcome = terminal ? terminal.lastOutcome : x.lastOutcome;
+        const nextCode = terminal ? terminal.lastErrorCode : x.lastErrorCode;
+        // 侧栏用时 = createdAt → lastAt。本 tab 刚跑完的回合，列表里的 lastAt 可能还停在回合开始前，
+        // 临时补齐防回跳；一旦服务端权威 idle 列表到达校正（serverSettled），重放不再覆盖权威 lastAt。
+        const ended =
+          allowEndedAtFill && terminal?.endedAt != null && terminal.endedAt > (x.lastAt ?? 0)
+            ? { lastAt: terminal.endedAt }
+            : null;
+        if (
+          x.runState === "idle" &&
+          x.lastOutcome === nextOutcome &&
+          x.lastErrorCode === nextCode
+        ) {
+          return ended ? { ...x, ...ended } : x;
+        }
+        return {
+          ...x,
+          ...ended,
+          runState: "idle" as const,
+          ...(terminal
+            ? {
+                lastOutcome: terminal.lastOutcome,
+                lastErrorCode: terminal.lastErrorCode,
+                unread: true,
+              }
+            : {}),
+        };
+      });
     },
-    [],
+    [patchSession],
   );
 
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
@@ -977,10 +1011,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     listGenerationRef.current += 1;
     listRefreshInflightRef.current = null;
     loadMoreInflightRef.current = false;
-    confirmedMetadata.current.clear();
-    pendingTitles.current.clear();
-    historyFetchedAtRef.current.clear();
-    historyFetchingRef.current.clear();
+    for (const r of [confirmedMetadata, pendingTitles, terminalGuardRef, historyFetchedAtRef, historyFetchingRef])
+      r.current.clear();
     setHistoryLoadingTokens(new Map());
     setHistoryErrorBySession(new Map());
     terminalFillRef.current.clear();
@@ -1024,15 +1056,12 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     reset,
     serverListSettled,
     historyLoading: activeId !== undefined && historyLoadingTokens.has(activeId),
-    historyError: activeId
-      ? (() => {
-          const row = historyErrorBySession.get(activeId);
-          if (!row) return null;
-          const loadingToken = historyLoadingTokens.get(activeId);
-          if (loadingToken !== undefined && loadingToken > row.token) return null;
-          return { sessionId: activeId, token: row.token, message: row.message };
-        })()
-      : null,
+    historyError: (() => {
+      const row = activeId ? historyErrorBySession.get(activeId) : undefined;
+      return row && (historyLoadingTokens.get(activeId!) ?? 0) <= row.token
+        ? { sessionId: activeId!, token: row.token, message: row.message }
+        : null;
+    })(),
     retryHistory,
     loadHistory,
   };

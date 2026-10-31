@@ -166,7 +166,7 @@ import {
   type ImplicitTarget,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
+import { deriveLiveTerminalEndedAt, resolveLiveTurnEndTerminal } from "./lib/sessionStatus";
 import { deriveConnBanner, isPlatedAssistantMessage, lastRealUserTurn } from "./lib/chat/pure";
 import { useDelayedConnBanner } from "./hooks/useDelayedConnBanner";
 import { incidentStore } from "./lib/incidentStore";
@@ -1265,17 +1265,16 @@ export function App() {
   );
   const liveTerminals = useMemo(() => {
     void chat.version;
-    if (demo) return liveTerminalsRef.current;
+    const prev = liveTerminalsRef.current;
+    if (demo) return prev;
     const now = new Set(sessions.filter((s) => chat.isSending(s.id)).map((s) => s.id));
-    for (const id of now) liveTerminalsRef.current.delete(id);
-    for (const id of sendingIdsRef.current) {
-      if (!now.has(id)) {
-        const t = deriveLiveTerminalFromMessages(chat.getSession(id)?.messages);
-        if (t) liveTerminalsRef.current.set(id, { ...t, endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
-      }
-    }
+    let next: typeof prev | undefined;
+    for (const id of now) if (prev.has(id)) (next ??= new Map(prev)).delete(id);
+    for (const id of sendingIdsRef.current)
+      if (!now.has(id) && !chat.isSending(id))
+        (next ??= new Map(prev)).set(id, { ...resolveLiveTurnEndTerminal(chat.getSession(id)?.messages), endedAt: deriveLiveTerminalEndedAt(chat.getSession(id)?.messages) });
     sendingIdsRef.current = now;
-    return new Map(liveTerminalsRef.current);
+    return (liveTerminalsRef.current = next ?? prev);
   }, [demo, chat, sessions]);
   useEffect(() => {
     for (const [id, t] of liveTerminals) applySessionTerminal(id, t);

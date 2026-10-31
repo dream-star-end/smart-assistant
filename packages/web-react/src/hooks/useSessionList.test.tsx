@@ -1,5 +1,10 @@
-import { act, cleanup, renderHook, screen, waitFor } from "@testing-library/react";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
+import React, { Component, useEffect, useMemo, useRef } from "react";
+import ts from "typescript";
 import { type Mock, afterEach, describe, expect, test, vi } from "vitest";
+import * as sessionStatus from "../lib/sessionStatus";
 import { ToastProvider } from "../components/ui";
 import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
@@ -1208,5 +1213,328 @@ describe("useSessionList 重命名与在飞的列表请求", () => {
     });
     await act(async () => stale.resolve([meta("webkeepme001", "保留的会话")] as never));
     expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({ title: "office-1029pm", pinned: true });
+  });
+});
+
+describe("useSessionList 侧栏运行态与快照终态收敛 (U8)", () => {
+  test("canonical getSession 无 openDispatch 时把滞留的 runState=running 收敛为 idle", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 2_200,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+
+    vi.mocked(api.getSession).mockResolvedValueOnce({
+      ...detail("webkeepme001"),
+      updatedAt: 2_500,
+      openDispatch: undefined,
+      messages: [{ id: "a1", role: "agent", content: "done", _dispatchOutcome: "completed" }],
+    } as never);
+
+    await act(async () => {
+      await result.current.loadHistory("webkeepme001", { force: true });
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")).toMatchObject({
+      runState: "idle",
+      lastOutcome: "completed",
+    });
+  });
+
+  test("回合刚结束时已在飞的旧 listSessions(runState=running) 回来不会复活转圈；之后新回合(updatedAt 更大)照常显示 running", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 2_100,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+
+    const staleInflight = deferred<Awaited<ReturnType<typeof api.listSessions>>>();
+    vi.mocked(api.listSessions).mockImplementationOnce(() => staleInflight.promise);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() => expect(api.listSessions).toHaveBeenCalledTimes(3));
+
+    act(() => {
+      result.current.applySessionTerminal("webkeepme001", {
+        lastOutcome: "completed",
+        lastErrorCode: null,
+      });
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("idle");
+
+    await act(async () => {
+      staleInflight.resolve([
+        {
+          ...meta("webkeepme001", "保留的会话"),
+          runState: "running",
+          updatedAt: 2_200,
+        },
+        meta("webdropme001", "待删除的会话"),
+      ] as never);
+    });
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("idle");
+
+    vi.mocked(api.listSessions).mockResolvedValueOnce([
+      {
+        ...meta("webkeepme001", "保留的会话"),
+        runState: "running",
+        updatedAt: 4_000,
+      },
+      meta("webdropme001", "待删除的会话"),
+    ] as never);
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.runState).toBe("running"),
+    );
+  });
+
+  function extractAppTerminalSlice() {
+    const appPath = ["src/App.tsx", "packages/web-react/src/App.tsx"]
+      .map((rel) => resolve(process.cwd(), rel))
+      .find((candidate) => existsSync(candidate));
+    if (!appPath) throw new Error(`App.tsx not found from cwd=${process.cwd()}`);
+    const source = readFileSync(appPath, "utf8");
+    const parsed = ts.createSourceFile(
+      appPath,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX,
+    );
+    const app = parsed.statements.find(
+      (n) => ts.isFunctionDeclaration(n) && n.name?.text === "App",
+    );
+    if (!app || !ts.isFunctionDeclaration(app) || !app.body) {
+      throw new Error("Exact App declaration not found");
+    }
+    const names = new Set(["sendingIdsRef", "liveTerminalsRef", "liveTerminals"]);
+    const extracted: string[] = [];
+    const found = new Set<string>();
+    let effects = 0;
+    for (const statement of app.body.statements) {
+      if (ts.isVariableStatement(statement)) {
+        const declaration = statement.declarationList.declarations.find(
+          (d) => ts.isIdentifier(d.name) && names.has(d.name.text),
+        );
+        if (declaration && ts.isIdentifier(declaration.name)) {
+          found.add(declaration.name.text);
+          extracted.push(statement.getText(parsed));
+        }
+      } else if (
+        ts.isExpressionStatement(statement) &&
+        ts.isCallExpression(statement.expression) &&
+        statement.expression.expression.getText(parsed) === "useEffect" &&
+        statement
+          .getText(parsed)
+          .includes("for (const [id, t] of liveTerminals) applySessionTerminal(id, t)")
+      ) {
+        effects++;
+        extracted.push(statement.getText(parsed));
+      }
+    }
+    if (found.size !== 3 || effects !== 1) {
+      throw new Error(`Unexpected AST selection: ${[...found]}, effects=${effects}`);
+    }
+    const body = ts.transpileModule(
+      `function useExactAppTerminalSlice(chat, sessions, demo, applySessionTerminal) {\n${extracted.join("\n")}\nreturn liveTerminals;\n}`,
+      { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } },
+    ).outputText;
+    const statusRecord = sessionStatus as Record<string, unknown>;
+    return new Function(
+      "useRef",
+      "useMemo",
+      "useEffect",
+      "deriveLiveTerminalFromMessages",
+      "resolveLiveTurnEndTerminal",
+      "deriveLiveTerminalEndedAt",
+      `${body}\nreturn useExactAppTerminalSlice;`,
+    )(
+      useRef,
+      useMemo,
+      useEffect,
+      sessionStatus.deriveLiveTerminalFromMessages,
+      sessionStatus.resolveLiveTurnEndTerminal,
+      statusRecord.deriveLiveTerminalEndedAt,
+    ) as (
+      chat: unknown,
+      sessions: unknown,
+      demo: boolean,
+      applySessionTerminal: unknown,
+    ) => Map<string, { lastOutcome: string; lastErrorCode: string | null }>;
+  }
+
+  class TerminalRenderBoundary extends Component<
+    { errors: Error[]; children?: React.ReactNode },
+    { failed: boolean }
+  > {
+    state = { failed: false };
+    static getDerivedStateFromError() {
+      return { failed: true };
+    }
+    componentDidCatch(error: Error) {
+      this.props.errors.push(error);
+    }
+    render() {
+      return this.state.failed
+        ? React.createElement("output", { "data-testid": "guard-stopped" }, "guard stopped")
+        : this.props.children;
+    }
+  }
+
+  test("ordinary unannotated success settles without an App/session-list update loop (#1292 repro)", async () => {
+    const sid = "webu8review001";
+    const useExactAppTerminalSlice = extractAppTerminalSlice();
+    const auth = createMemoryAuthSession(() => {}, "synthetic-review-token");
+    const reviewUser: User = { id: "u1", displayName: "Review", roles: ["user"] } as never;
+    const errors: Error[] = [];
+    const logs: unknown[][] = [];
+    vi.spyOn(console, "error").mockImplementation((...args) => {
+      logs.push(args);
+    });
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      {
+        id: sid,
+        title: "ordinary success",
+        agentId: "main",
+        createdAt: 1000,
+        updatedAt: 2000,
+        lastAt: 2000,
+        messageCount: 2,
+        runState: "running",
+      },
+    ] as never);
+    let isSending = true;
+    let renders = 0;
+    let latest: ReturnType<typeof useSessionList> | undefined;
+    const messages = [{ id: "ordinary-final", role: "agent", content: "done", ts: 2100 }];
+    const socket = { isSending: () => isSending };
+    const options = {
+      demo: false,
+      auth,
+      authSession: auth,
+      user: reviewUser,
+      agentId: "main",
+      holdAutoSelect: true,
+      sockRef: { current: socket },
+      confirmDialog: async () => false,
+      promptText: async () => null,
+      clearChatError() {},
+      onNewSessionReset() {},
+      onActiveSessionDeleted() {},
+    };
+    function Harness({ frame }: { frame: number }) {
+      renders++;
+      if (renders > 80) {
+        throw new Error(
+          "REVIEW_RENDER_GUARD: head exceeded 80 renders after ordinary successful turn",
+        );
+      }
+      const list = useSessionList(options as never);
+      latest = list;
+      const chat = useMemo(
+        () => ({ version: frame, isSending: () => isSending, getSession: () => ({ messages }) }),
+        [frame],
+      );
+      useExactAppTerminalSlice(chat, list.sessions, false, list.applySessionTerminal);
+      return React.createElement("output", { "data-testid": "render-count" }, renders);
+    }
+    const element = (frame: number) =>
+      React.createElement(
+        TerminalRenderBoundary,
+        { errors },
+        React.createElement(Harness, { frame }),
+      );
+    const mounted = render(element(0));
+    await waitFor(() => expect(latest?.sessions).toHaveLength(1));
+    expect(renders).toBeLessThan(20);
+    await act(async () => {
+      isSending = false;
+      mounted.rerender(element(1));
+    });
+    expect(
+      errors.map((error) => error.message),
+      `renders=${renders}; consoleErrors=${logs.length}`,
+    ).toEqual([]);
+    expect(logs).toEqual([]);
+    expect(renders).toBeLessThan(30);
+    expect(latest?.sessions[0]).toMatchObject({
+      id: sid,
+      runState: "idle",
+      lastOutcome: "completed",
+      lastErrorCode: null,
+    });
+    const settledRenders = renders;
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(renders).toBe(settledRenders);
+    mounted.unmount();
+  });
+
+  test("applySessionTerminal 在字段未变时返回原 sessions 引用且同一终态对象仅应用一次", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+
+    const terminal = { lastOutcome: "completed" as const, lastErrorCode: null };
+    act(() => {
+      result.current.applySessionTerminal("webkeepme001", terminal);
+    });
+    const afterFirst = result.current.sessions;
+    expect(afterFirst.find((s) => s.id === "webkeepme001")).toMatchObject({
+      runState: "idle",
+      lastOutcome: "completed",
+      lastErrorCode: null,
+      unread: true,
+    });
+
+    // 值完全相同时再次传入新终态对象：保持原数组引用（no-op）
+    act(() => {
+      result.current.applySessionTerminal("webkeepme001", {
+        lastOutcome: "completed",
+        lastErrorCode: null,
+      });
+    });
+    expect(result.current.sessions).toBe(afterFirst);
+
+    // 会话后续已被读或更新后，同一轮终态对象引用再次经 effect 扫过时不再重复应用
+    act(() => {
+      result.current.setSessions((c) =>
+        c.map((s) => (s.id === "webkeepme001" ? { ...s, unread: false } : s)),
+      );
+    });
+    const afterRead = result.current.sessions;
+    act(() => {
+      result.current.applySessionTerminal("webkeepme001", terminal);
+    });
+    expect(result.current.sessions).toBe(afterRead);
+    expect(result.current.sessions.find((s) => s.id === "webkeepme001")?.unread).toBe(false);
   });
 });

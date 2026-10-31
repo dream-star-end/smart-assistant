@@ -155,3 +155,25 @@ export function deriveLiveTerminalEndedAt(
 ): number {
   return findLiveTerminalEntry(messages)?.messageTimestamp ?? observedAt;
 }
+
+/**
+ * 本 tab 发送态刚结束（isSending: true → false）时的兜底终态(U8)：
+ * 实时 WS 正常完成帧的消息不带 `_dispatchOutcome`，此前 deriveLiveTerminalFromMessages 返回 null
+ * 会导致侧栏沿用轮询写下的 `runState="running"` 持续转圈。无错误/中断标记即收敛为 completed。
+ */
+export function resolveLiveTurnEndTerminal(
+  messages:
+    | ReadonlyArray<{
+        _dispatchOutcome?: string;
+        _errorCode?: string;
+        _turnStatusRecord?: boolean;
+      }>
+    | undefined,
+): { lastOutcome: SessionLastOutcome; lastErrorCode: string | null } {
+  return (
+    deriveLiveTerminalFromMessages(messages) ?? {
+      lastOutcome: "completed",
+      lastErrorCode: null,
+    }
+  );
+}
