@@ -1821,7 +1821,7 @@ async function checkPermissionsAndCallTool(
             {
               type: 'tool_result',
               // Non-zero Bash exits carry full stdout and MCP isError text here.
-              content,
+              content: sealToolResultContent(content),
               is_error: true,
               tool_use_id: toolUseID,
             },
