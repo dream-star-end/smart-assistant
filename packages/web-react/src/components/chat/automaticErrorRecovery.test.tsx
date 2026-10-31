@@ -47,3 +47,14 @@ test("oversized attachment opens its original composer for split upload", () => 
   actions[0]!.onClick();
   expect(edit).toHaveBeenCalledWith(source);
 });
+
+test.each([
+  ["context_too_long", "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。"],
+  ["platform_credential_expired", "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。"],
+  ["box_capacity_held", "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。"],
+])("%s legacy platform hint is never shown as an assistant answer", (code, text) => {
+  render(<AssistantCard msg={{ id: "old-error", role: "assistant", text, ts: 1, _errorCode: code } as ChatMessage}
+    ctx={{ isLast: true, sending: false, inActiveTurn: true }} cb={{}} />);
+  expect(screen.queryByText(text)).toBeNull();
+  expect(screen.getByRole("alert")).toHaveTextContent(USER_ERROR_CATALOG[code]!.message);
+});

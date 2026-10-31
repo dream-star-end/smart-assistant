@@ -803,7 +803,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   upstream_timeout: "模型响应超时，你的消息已保留，可以在当前会话继续。",
   network_error: "网络波动导致本轮中断，请重试。",
   context_too_long:
-    "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。",
+    "本轮暂时未能完成对话整理，已有内容已保留。",
   request_too_large: "本轮资料未能完整处理，文件和对话均已保留。",
   bad_request: "这条请求无法被处理，请调整内容后重试。",
   // ── 引擎/平台执行 ──

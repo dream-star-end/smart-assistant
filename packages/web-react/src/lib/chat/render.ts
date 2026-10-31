@@ -999,6 +999,12 @@ export function errorPresentation(
   const t = normalized === "request_too_large"
     ? (text?.trim() ?? "").replace(diagnostic, "").trim()
     : text?.trim() ?? "";
+  // Old platform instructions are diagnostics, never partial model answers.
+  const legacyHint = ({
+    context_too_long: "本会话内容已超过模型的上下文上限。可以精简这条消息，或在上方切换支持更长上下文的模型后继续。",
+    platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
+    box_capacity_held: "上一轮在 Box 上的执行仍在收尾，本条消息未开始处理，不会自动重试。请稍后直接再发一条。",
+  } as Record<string, string>)[normalized] === t;
   const byCode = friendlyBridgeErrorMessage(normalized); // 纯按码正文(不喂 message,避免 server-msg 自反)
   const safeDetail = normalized === "request_too_large"
     ? (ref ? `请求 ID：${ref}` : undefined)
@@ -1010,7 +1016,7 @@ export function errorPresentation(
   const isRaw = !t || echoesDetail || looksLikeInternalError(t) || /^\[(?:turn failed|error)\b/i.test(t);
   const sem = turnErrorSemantics(normalized);
   const serverMsgOk = sem.allowPublicServerMessage === true && isDisplayableServerMessage(t);
-  const keepText = !isRaw && (t === byCode || serverMsgOk);
+  const keepText = !isRaw && !legacyHint && (t === byCode || serverMsgOk);
   if (keepText) {
     return {
       code: normalized,
@@ -1024,7 +1030,7 @@ export function errorPresentation(
   }
   // R6:切出尾部终止器,前半段若是合法部分回答(非空、非内部串) → 作 bodyText 正常渲染,红卡在其下方。
   const { terminator } = splitTrailingTerminator(t);
-  const partialAnswer = echoesDetail ? "" : partialAnswerBody(t);
+  const partialAnswer = echoesDetail || legacyHint ? "" : partialAnswerBody(t);
   // detail 优先级:已脱敏的原 _errorDetail > 终止器排查线索 > 无。真正的 JSON 信封/堆栈已被 R7 隐去。
   const detailOut = normalized === "request_too_large"
     ? safeDetail : safeDetail ?? sanitizeErrorDetail(terminator);
