@@ -1,6 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App, prefetchLazyCentersOnIdle } from './App'
+import { prefetchTapePayloadOnIdle } from './lib/chat/loadTapePayload'
 import { LegalPage } from './components/LegalPage'
 import { ToastProvider, TooltipProvider } from './components/ui'
 import { registerServiceWorker } from './registerSW'
@@ -34,5 +35,8 @@ void waitForEntryStyles().then(() => {
 
   // UX 体验对冲:空闲期预取四大中心懒块(见 App.tsx 注释),首开零延迟。
   // 法务静态页不承载工作区,跳过预取,省流量。
-  if (!legalKind) prefetchLazyCentersOnIdle()
+  if (!legalKind) {
+    prefetchLazyCentersOnIdle()
+    prefetchTapePayloadOnIdle()
+  }
 })

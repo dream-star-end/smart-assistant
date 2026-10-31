@@ -7,7 +7,8 @@ import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
 import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
-import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
+import type { TapePayloadExpectation } from "../lib/chat/tapePayload";
+import { loadTapePayload } from "../lib/chat/loadTapePayload";
 import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import { EMPTY_SESSION_TITLE } from "../lib/sessionTitle";
@@ -1032,7 +1033,7 @@ export function useChatSocket(opts: {
       const cacheKey = tapePayloadCacheKey(userId, sessId, tapeId, recordOrdinal, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getTapeRecordPayload(a, sessId, tapeId, recordOrdinal, queueSignal);
-        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        const records = await (await loadTapePayload()).parseTapeRecordPayload(payload, expected, queueSignal);
         if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
           throw new DOMException("auth identity changed", "AbortError");
         }
@@ -1110,7 +1111,7 @@ export function useChatSocket(opts: {
       const cacheKey = userPayloadCacheKey(userId, sessId, messageId, expected);
       return deferredPayloadQueueRef.current!.request(cacheKey, async (queueSignal) => {
         const payload = await api.getUserMessagePayload(a, sessId, messageId, queueSignal);
-        const records = await parseTapeRecordPayload(payload, expected, queueSignal);
+        const records = await (await loadTapePayload()).parseTapeRecordPayload(payload, expected, queueSignal);
         if (queueSignal.aborted || authRef.current !== a || a.snapshot().epoch !== epoch) {
           throw new DOMException("auth identity changed", "AbortError");
         }
