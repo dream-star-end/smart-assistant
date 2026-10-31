@@ -1,4 +1,4 @@
-import { posix } from 'path'
+import { posix } from 'node:path'
 
 /**
  * How many successful Edit/Write/MultiEdit calls on one file, in one user
@@ -90,13 +90,7 @@ function rawFilePath(input: unknown): string | null {
 }
 
 function formatEditDriftReminder(filePath: string, count: number): string {
-  return (
-    `<system-reminder>你已经第 ${count} 次修改 ${filePath}。` +
-    '停下来对照用户最初的目标：这样改是否仍在朝目标前进？' +
-    '是否在某个细节上原地打转？如果仍在正轨，继续；' +
-    '如果已经偏离或卡住，先交付当前版本，并说明还没解决的问题。' +
-    '</system-reminder>'
-  )
+  return `<system-reminder>你已经第 ${count} 次修改 ${filePath}。停下来对照用户最初的目标：这样改是否仍在朝目标前进？是否在某个细节上原地打转？如果仍在正轨，继续；如果已经偏离或卡住，先交付当前版本，并说明还没解决的问题。</system-reminder>`
 }
 
 function scopeBucket(scopeId: string, turnId: string): ScopeState {
