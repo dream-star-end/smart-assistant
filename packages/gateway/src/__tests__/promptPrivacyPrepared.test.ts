@@ -41,9 +41,9 @@ test('reinjection captures exactly the policy admitted to the runner without a s
     assert.equal(callbacks, 0)
     assert.equal(reads, 1)
   } finally {
-    if (previousUrl === undefined) delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+    if (previousUrl === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
     else process.env.OPENCLAUDE_V3_MASTER_BASE_URL = previousUrl
-    if (previousToken === undefined) delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    if (previousToken === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
     else process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = previousToken
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }

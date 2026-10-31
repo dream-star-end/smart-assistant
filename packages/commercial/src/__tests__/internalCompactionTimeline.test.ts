@@ -151,7 +151,7 @@ test('oversized deferred pages shrink through storage cursors and recover every 
   // the same page-size defect is quick to reproduce without a large fixture.
   const maxResponseBytes = 64 * 1024
   const originals = Array.from({ length: 33 }, (_, index) => ({
-    id: `tool-${index + 1}`, role: 'tool', text: `${index + 1}:` + 'x'.repeat(2 * 1024),
+    id: `tool-${index + 1}`, role: 'tool', text: `${index + 1}:${'x'.repeat(2 * 1024)}`,
   }))
   const payloads = new Map(originals.map(original => [original.id, Buffer.from(JSON.stringify(original))]))
   const rows: MessageLike[] = originals.map((original, index) => {
@@ -168,18 +168,19 @@ test('oversized deferred pages shrink through storage cursors and recover every 
     readPage: async (_sessionId, owner, cursor = null, limit = 200) => {
       assert.equal(owner, 'c:765')
       calls.push({ cursor, limit })
-      const available = rows.filter(row => Number(row._orderSeq) < (cursor?.beforeOrderSeq ?? Infinity))
+      const available = rows.filter(row => Number(row._orderSeq) < (cursor?.beforeOrderSeq ?? Number.POSITIVE_INFINITY))
       const selected = available.slice(-limit)
       const hasMore = available.length > selected.length
       return { ...page, messages: selected, hasMore,
         nextCursor: hasMore ? { version: 1, timelineGeneration: 3, beforeOrderSeq: Number(selected[0]!._orderSeq) } : null }
     },
-    readTapePayload: async (_sessionId, owner, tapeId, ordinal, offset = 0, length) => {
+    readTapePayload: async (_sessionId, owner, tapeId, ordinal, offset, length) => {
       assert.equal(owner, 'c:765')
       assert.equal(tapeId, 'tape-sized-page')
       const payload = payloads.get(`tool-${ordinal}`)!
-      return { payload: payload.subarray(offset, offset + (length ?? payload.length)),
-        totalBytes: payload.length, offset, msgId: `tool-${ordinal}`, role: 'tool',
+      const start = offset ?? 0
+      return { payload: payload.subarray(start, start + (length ?? payload.length)),
+        totalBytes: payload.length, offset: start, msgId: `tool-${ordinal}`, role: 'tool',
         contentSha256: createHash('sha256').update(payload).digest('hex'), tapeSha256: 'a'.repeat(64) }
     },
   }
@@ -187,8 +188,8 @@ test('oversized deferred pages shrink through storage cursors and recover every 
   let cursor: ClientTimelineCursor | null = null
   for (let pageNo = 0; ; pageNo++) {
     assert.ok(pageNo < rows.length)
-    const result = await call({ deps, query: 'sessionId=session-raw-1' +
-      (cursor ? `&cursor=${encodeURIComponent(encodeClientTimelineCursor(cursor))}` : '') })
+    const result = await call({ deps, query: `sessionId=session-raw-1${
+      cursor ? `&cursor=${encodeURIComponent(encodeClientTimelineCursor(cursor))}` : ''}` })
     assert.equal(result.status, 200)
     assert.ok(result.bytes.length <= maxResponseBytes)
     pages.push(result.json.page.messages)

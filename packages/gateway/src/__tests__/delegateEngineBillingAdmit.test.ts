@@ -233,7 +233,7 @@ describe('handleDelegateTask engine-reported billing', () => {
     } finally {
       release()
       await first
-      if (previous === undefined) delete process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS
+      if (previous === undefined) Reflect.deleteProperty(process.env, 'OC_SELFHOST_ENGINE_LOCAL_TURNS')
       else process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS = previous
     }
   })

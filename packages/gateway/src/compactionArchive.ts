@@ -6,7 +6,7 @@ import { lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   paths,
-  readClientTimelinePage,
+  type readClientTimelinePage,
   type ClientTimelineCursor,
   type ClientTimelinePage,
   type MessageLike,
