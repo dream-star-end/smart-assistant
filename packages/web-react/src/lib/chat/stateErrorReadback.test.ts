@@ -39,7 +39,11 @@ function boot(deps: Partial<ChatSocketDeps> = {}) {
   s._activeClientMessageId = cmid; s._sendingInFlight = true;
   return { sock, ws, s };
 }
-async function flush() { for (let i = 0; i < 60; i++) await Promise.resolve(); }
+async function flush() {
+  for (let i = 0; i < 60; i++) await Promise.resolve();
+  await vi.dynamicImportSettled();
+  for (let i = 0; i < 60; i++) await Promise.resolve();
+}
 function error(code: string, over: Record<string, unknown> = {}) {
   return { type: "error", code, peer: { id: "s1", kind: "dm" }, clientMessageId: cmid, ...over };
 }
@@ -100,6 +104,32 @@ test("session switch/new intent while reading does not clear errors or add a suc
   resolve(snapshot()); await flush();
   expect(s._activeClientMessageId).toBe("m-next");
   expect(s.messages.some((row) => row.id.startsWith("sys-state-readback"))).toBe(false);
+  sock.stop();
+});
+
+test.each(["stop", "lifecycle", "new intent"])("%s before the evaluator loads never starts a stale read", async (fence) => {
+  const read = vi.fn(async () => snapshot());
+  const { sock, ws, s } = boot({ readSessionSnapshot: read });
+  ws.push(error("conflict"));
+  if (fence === "stop") s._stopSettlement = { clientMessageId: cmid, phase: "awaiting_receipt" };
+  else if (fence === "lifecycle") sock.stop();
+  else s._activeClientMessageId = "m-next";
+  await flush();
+  expect(read).not.toHaveBeenCalled();
+  expect(s.messages.some((row) => row.id.startsWith("sys-state-readback"))).toBe(false);
+  expect(s.messages.some((row) => row._errorCode === "conflict")).toBe(false);
+  sock.stop();
+});
+
+test.each(["stop", "lifecycle"])("%s while reading never paints a late success record", async (fence) => {
+  let resolve!: (snap: SessionSnapshot) => void;
+  const { sock, ws, s } = boot({ readSessionSnapshot: () => new Promise((r) => { resolve = r; }) });
+  ws.push(error("conflict")); await flush();
+  if (fence === "stop") s._stopSettlement = { clientMessageId: cmid, phase: "awaiting_receipt" };
+  else sock.stop();
+  resolve(snapshot()); await flush();
+  expect(s.messages.some((row) => row.id.startsWith("sys-state-readback"))).toBe(false);
+  expect(s.messages.some((row) => row._errorCode === "conflict")).toBe(false);
   sock.stop();
 });
 

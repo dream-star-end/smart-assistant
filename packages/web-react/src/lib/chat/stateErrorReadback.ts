@@ -1,7 +1,7 @@
 /** State errors may read authority once; this module never sends a user task. */
 import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import type { ChatSession } from "./model";
-import { snapshotIsStale, type SessionSnapshot } from "./sessionSnapshot";
+import type { SessionSnapshot } from "./sessionSnapshot";
 
 type StateErrorFrame = {
   code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number; frameSeq?: number; sessionKey?: string;
@@ -17,14 +17,6 @@ const compatKey = (frame: StateErrorFrame, cmid: string) => `${cmid}:${frame.ses
 export function consumeStateReadbackCompatFinal(sess: ChatSession, frame: StateErrorFrame): boolean {
   const cmid = frame.clientMessageId ?? sess._activeClientMessageId;
   return !!cmid && compatibilityFinals.get(sess)?.delete(compatKey(frame, cmid)) === true;
-}
-
-function stateErrorWasResolved(requiresCompletion: boolean, cmid: string, snap: SessionSnapshot): boolean {
-  const d = snap.dispatch;
-  if (d?.clientMessageId !== cmid || snap.pendingPermissions.completeness !== "complete" ||
-    snap.hasMore || (snap.gap && snap.gap.reason !== "cursor_reset")) return false;
-  const completed = d.status === "terminal" && d.outcome === "completed" && snap.reconcile === "turn_completed";
-  return completed || (!requiresCompletion && d.status === "accepted" && d.outcome === null);
 }
 
 /** Only a named peer AND its exact current message can turn an error into a readback.
@@ -61,6 +53,10 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
   pending.set(sess, inflight);
   inflight.add(key);
   const replay = () => {
+    if (!effects.current() || sess._stopSettlement ||
+      (sess._activeClientMessageId && sess._activeClientMessageId !== cmid)) return;
+    const source = sess.messages.find((message) => message.role === "user" && message.id === cmid);
+    if (sess._activeClientMessageId !== cmid && source?.status === "replied") return;
     // The adjacent final may already have advanced frameSeq. This is the same
     // locally held error, not a new incoming frame or a cursor rewind.
     const held = { ...frame, frameSeq: undefined };
@@ -68,19 +64,8 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     effects.replay(held);
     effects.changed();
   };
-  void effects.read(sess.id).then((snap) => {
-    if (!effects.current()) return;
-    if (sess._stopSettlement || (sess._activeClientMessageId && sess._activeClientMessageId !== cmid)) return;
-    if (!snap || snap.sessionId !== sess.id || snapshotIsStale(sess, snap) || !stateErrorWasResolved(requiresCompletion, cmid, snap)) {
-      const source = sess.messages.find((message) => message.role === "user" && message.id === cmid);
-      if (sess._activeClientMessageId === cmid || source?.status !== "replied") replay();
-      return;
-    }
-    const id = `sys-state-readback-${cmid}-${code}`;
-    if (!sess.messages.some((message) => message.id === id)) sess.messages.push({
-      id, role: "system", text: "已同步当前任务状态", ts: Date.now(), _source: "local", _errorDetail: code,
-    });
-    effects.changed();
-  }, () => { if (effects.current()) replay(); }).finally(() => inflight.delete(key));
+  void import("./stateErrorReadbackResult").then(({ readStateErrorResult }) =>
+    readStateErrorResult({ sess, code, cmid, requiresCompletion, effects, replay }),
+  ).catch(replay).finally(() => inflight.delete(key));
   return true;
 }
