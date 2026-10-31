@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AppUpdateGovernor,
+  ocBuildFromHtml,
   readLineageFromUrl,
   setLineageInHash,
   type AppUpdateDeps,
@@ -511,5 +512,91 @@ describe("WS 重连风暴", () => {
     for (let i = 0; i < 20; i++) gov.onServerBuild(SERVER);
     vi.advanceTimersByTime(60_000);
     expect(reload).toHaveBeenCalledTimes(1);
+  });
+});
+
+async function flushShell(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+describe("壳确认(OCV5-699:刷新不会换壳就不亮胶囊)", () => {
+  it("WS 与 DOM 不同，但刷新会拿到的壳与 DOM 相同 → 不亮 pill、不自动刷", async () => {
+    const fetchServedShell = vi.fn(async () => CLIENT);
+    const { gov, reload } = make({ fetchServedShell, isHidden: () => false });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    expect(gov.getPillVisible()).toBe(false);
+    await flushShell();
+    expect(fetchServedShell).toHaveBeenCalledTimes(1);
+    expect(gov.getPillVisible()).toBe(false);
+    vi.advanceTimersByTime(60_000);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("确认完成前不先亮；壳与 DOM 不同则以壳为准亮 pill", async () => {
+    let resolveShell: (value: string | null) => void = () => {};
+    const fetchServedShell = vi.fn(
+      () =>
+        new Promise<string | null>((resolve) => {
+          resolveShell = resolve;
+        }),
+    );
+    const { gov, reload } = make({ fetchServedShell, isHidden: () => false });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    expect(gov.getPillVisible()).toBe(false);
+    resolveShell(SERVER2);
+    await flushShell();
+    expect(gov.getPillVisible()).toBe(true);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("壳读失败 → 退回连接帧，pill 亮", async () => {
+    const fetchServedShell = vi.fn(async () => null);
+    const { gov } = make({ fetchServedShell, isHidden: () => false });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    await flushShell();
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("壳请求抛错 → 同样退回连接帧", async () => {
+    const fetchServedShell = vi.fn(async () => {
+      throw new Error("shell");
+    });
+    const { gov } = make({ fetchServedShell, isHidden: () => false });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    await flushShell();
+    expect(gov.getPillVisible()).toBe(true);
+  });
+
+  it("更新的匹配帧作废在途确认，不把旧壳结果再亮回来", async () => {
+    let resolveShell: (value: string | null) => void = () => {};
+    const fetchServedShell = vi.fn(
+      () =>
+        new Promise<string | null>((resolve) => {
+          resolveShell = resolve;
+        }),
+    );
+    const { gov } = make({ fetchServedShell, isHidden: () => false });
+    gov.registerBusyProbe(() => true);
+    gov.onServerBuild(SERVER);
+    gov.onServerBuild(CLIENT);
+    expect(gov.getPillVisible()).toBe(false);
+    resolveShell(SERVER2);
+    await flushShell();
+    expect(gov.getPillVisible()).toBe(false);
+  });
+
+  it("ocBuildFromHtml 只认构建注入的 meta", () => {
+    expect(ocBuildFromHtml('<meta name="oc-build" content="abcdef1234567890">')).toBe(
+      "abcdef1234567890",
+    );
+    expect(ocBuildFromHtml('<meta name="oc-build" content="not-hex">')).toBeNull();
+    expect(ocBuildFromHtml("")).toBeNull();
   });
 });

@@ -20,7 +20,7 @@
 // 触发 activate 清理旧 cache(便于强刷)。
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SW_VERSION = 'congjian-sw-v2';
+const SW_VERSION = 'congjian-sw-v3';
 const CACHE = SW_VERSION;
 // 离线导航回落用的 app-shell 键。SPA 下所有导航路由都返回同一份 index，故统一存此键。
 const OFFLINE_SHELL = '/index.html';
@@ -45,16 +45,27 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// 导航：network-first，失败(离线)回落缓存 shell。成功时顺手刷新缓存的 shell。
+// 导航：先向网络要当前壳。fetch(request) 会沿用导航的 cache mode，304 / 重定向可能把旧 index 钉住。
 async function networkFirstNav(request) {
   try {
-    const res = await fetch(request);
-    // 只缓存正常 HTML shell（200）；把它存到统一 shell 键供离线回落。
-    if (res && res.status === 200) {
-      const copy = res.clone();
+    const res = await fetch(request.url, {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      redirect: 'follow',
+    });
+    // 做成非重定向响应再交给页面，也才能放进 Cache。304 不能带 body。
+    const status = res.status;
+    const init = { status, statusText: res.statusText, headers: res.headers };
+    const shell =
+      status === 204 || status === 205 || status === 304
+        ? new Response(null, init)
+        : new Response(await res.arrayBuffer(), init);
+    const type = shell.headers.get('content-type') || '';
+    if (shell.status === 200 && type.includes('text/html')) {
+      const copy = shell.clone();
       caches.open(CACHE).then((c) => c.put(OFFLINE_SHELL, copy)).catch(() => {});
     }
-    return res;
+    return shell;
   } catch {
     const cached = await caches.match(OFFLINE_SHELL);
     if (cached) return cached;

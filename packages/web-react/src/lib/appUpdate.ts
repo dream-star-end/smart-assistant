@@ -33,18 +33,24 @@
  *  S2 形态校验:双端 id 均 8-32 hex 且不等才动作;dev 无 meta → 恒 inert。
  *  全程只用本地 now(),不掺服务器时间戳(跨时钟域红线)。
  *
- * ── 顶栏 pill(OCV5-626,不打扰的手动出口)────────────────────────────────────
- *  形态校验通过且版本不一致的那一刻就亮,不等安全点也不等 5min:用户忙着时静默软刷
- *  一直推迟,原先只能等横幅,期间撞上旧 chunk 才知道发了版。pill 只是给一个随手可点的
- *  reloadNow() 入口,不改上面任何自动刷新规则;横幅出现时让位,「稍后」收起横幅后回到 pill,
- *  版本一致或已开始刷新时熄灭。
+ * ── 顶栏 pill(OCV5-626 / OCV5-699)──────────────────────────────────────────
+ *  两边 id 都合法且不等,并且刷新会拿到的壳也不是眼前这份时才亮(壳读不到则退回只信
+ *  连接帧)。不等安全点。可见页不自动刷;横幅出现时 pill 让位。壳与眼前这份相同、
+ *  版本已经一致、或已经开始刷新时熄灭。
  *
  * 刻意不做 reload 冷却:谱系硬顶已限总次数(≤MAX),再加"两次刷之间等 10min"只会
  * 拖延真正需要的第二次刷新(快速修复版发布后用户被迫干等),弊大于利。
  */
 
 const BUILD_ID_RE = /^[0-9a-f]{8,32}$/;
+const OC_BUILD_META_RE = /<meta\s+name="oc-build"\s+content="([0-9a-f]{8,32})"/;
 const STORAGE_KEY = "oc-build-reload";
+
+/** 从 index.html 抽出构建注入的 oc-build。属性顺序与 vite ocBuildMeta 一致。 */
+export function ocBuildFromHtml(html: string): string | null {
+  const m = OC_BUILD_META_RE.exec(html);
+  return m?.[1] ?? null;
+}
 const MAX_AUTO_RELOADS = 2; // 每条 reload 谱系的硬上限(URL 承载,失忆也生效)
 const INPUT_IDLE_MS = 30_000;
 const RECHECK_MS = 5_000;
@@ -66,6 +72,13 @@ export type AppUpdateDeps = {
   writeLineage: (n: number) => boolean;
   /** 页面是否隐藏(生产=document.visibilityState === "hidden")。S0:只在隐藏时自动软刷。 */
   isHidden: () => boolean;
+  /**
+   * 刷新会拿到的壳的 oc-build。WS 帧与 DOM 不一致时先问它：
+   * 壳与 DOM 相同 → 刷新不会换壳，不是新版本；
+   * 壳与 DOM 不同 → 以壳为准；
+   * 读不到 → 退回只信 WS。
+   */
+  fetchServedShell?: () => Promise<string | null>;
 };
 
 export class AppUpdateGovernor {
@@ -86,6 +99,8 @@ export class AppUpdateGovernor {
   private reloadsSoFar: number;
   /** URL 谱系计数器是否可写(构造时非破坏性探活);false → 永不自动刷。 */
   private lineageWritable: boolean;
+  /** 在途的壳确认。更新的帧到来时作废上一轮。 */
+  private confirmTicket = 0;
 
   constructor(deps: AppUpdateDeps) {
     this.deps = deps;
@@ -118,30 +133,68 @@ export class AppUpdateGovernor {
     if (!server || this.reloaded) return;
     const client = this.deps.getClientBuild();
     if (!client || !BUILD_ID_RE.test(client)) return; // dev / meta 缺失 → inert
-    this.mismatchTarget = server === client ? null : server;
     if (server === client) {
-      // 已是最新(典型:成功软刷后的下一帧)。清空 pending + 清 URL 谱系标记(谱系完成,
-      // 地址栏归位;此后自发 reload 从 0 重新计,因为已经是对的版本了)。
-      this.pendingTarget = null;
-      this.pendingSince = null;
-      this.stopTimer();
-      this.setBanner(false);
-      if (this.reloadsSoFar > 0) {
-        this.deps.writeLineage(0);
-        this.reloadsSoFar = 0;
+      this.confirmTicket += 1;
+      this.adoptMatch();
+      return;
+    }
+    const fetchShell = this.deps.fetchServedShell;
+    if (!fetchShell) {
+      this.adoptMismatch(server);
+      return;
+    }
+    // WS 帧可能和「刷新实际会拿到的 index.html」不是同一枚 id（旧壳被缓存钉住，
+    // 或帧与壳各算各的）。先问 no-store 的壳，再决定亮不亮。
+    const ticket = ++this.confirmTicket;
+    void fetchShell().then(
+      (shell) => {
+        if (ticket !== this.confirmTicket || this.reloaded) return;
+        const current = this.deps.getClientBuild();
+        if (!current || !BUILD_ID_RE.test(current)) return;
+        if (shell && BUILD_ID_RE.test(shell)) {
+          if (shell === current) {
+            this.adoptMatch();
+            return;
+          }
+          this.adoptMismatch(shell);
+          return;
+        }
+        this.adoptMismatch(server);
+      },
+      () => {
+        if (ticket !== this.confirmTicket || this.reloaded) return;
+        this.adoptMismatch(server);
+      },
+    );
+  }
+
+  /** 文档已是刷新会拿到的壳。异步确认回来时也要自己通知 pill。 */
+  private adoptMatch(): void {
+    this.mismatchTarget = null;
+    this.pendingTarget = null;
+    this.pendingSince = null;
+    this.stopTimer();
+    this.setBanner(false);
+    if (this.reloadsSoFar > 0) {
+      this.deps.writeLineage(0);
+      this.reloadsSoFar = 0;
+    }
+    this.syncPill();
+  }
+
+  /** 有一枚用户刷新会换到的构建。异步确认回来时也要自己通知 pill。 */
+  private adoptMismatch(target: string): void {
+    this.mismatchTarget = target;
+    if (this.readPersist().maxedTargets?.includes(target)) {
+      this.showBanner(target);
+    } else {
+      if (this.pendingTarget !== target) {
+        this.pendingTarget = target;
+        this.pendingSince ??= this.deps.now();
       }
-      return;
+      this.check();
     }
-    // D1:本机曾对该目标刷到 MAX 仍没用 → 直接横幅,省无用刷新(best-effort)。
-    if (this.readPersist().maxedTargets?.includes(server)) {
-      this.showBanner(server);
-      return;
-    }
-    if (this.pendingTarget !== server) {
-      this.pendingTarget = server;
-      this.pendingSince ??= this.deps.now();
-    }
-    this.check();
+    this.syncPill();
   }
 
   /** 横幅「立即刷新」:用户主动,绕过安全点,**不动谱系计数**。手动刷是人工限频(点一次
@@ -371,6 +424,11 @@ export const appUpdate = new AppUpdateGovernor({
   readLineage: () => (typeof window === "undefined" ? 0 : readLineageFromUrl(window.location.hash)),
   writeLineage: writeLineageToUrl,
   isHidden: () => typeof document !== "undefined" && document.visibilityState === "hidden",
+  fetchServedShell: () =>
+    fetch("/", { cache: "no-store" })
+      .then((res) => (res.ok ? res.text() : ""))
+      .then((html) => ocBuildFromHtml(html))
+      .catch(() => null),
 });
 
 if (typeof window !== "undefined") {
