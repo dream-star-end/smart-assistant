@@ -34,12 +34,12 @@ export function createCompactionTimelineReader(deps: {
         signal: AbortSignal.timeout(120_000), headersTimeout: 15_000, bodyTimeout: 120_000,
       })
     } catch { throw new Error('COMPACTION_TIMELINE_REMOTE_UNAVAILABLE') }
-    if (response.statusCode === 404) { response.body.destroy(); return null }
-    if (response.statusCode === 409) { response.body.destroy(); throw new ClientTimelineCursorStaleError() }
-    if (response.statusCode !== 200) {
-      response.body.destroy()
-      throw new Error(`COMPACTION_TIMELINE_REMOTE_STATUS_${response.statusCode}`)
-    }
+    // Drain small error bodies: destroying them aborts the request, and undici
+    // then raises an unobserved AbortError after this read has returned.
+    if (response.statusCode !== 200) await response.body.dump().catch(() => {})
+    if (response.statusCode === 404) return null
+    if (response.statusCode === 409) throw new ClientTimelineCursorStaleError()
+    if (response.statusCode !== 200) throw new Error(`COMPACTION_TIMELINE_REMOTE_STATUS_${response.statusCode}`)
     const chunks: Buffer[] = []
     let bytes = 0
     try {

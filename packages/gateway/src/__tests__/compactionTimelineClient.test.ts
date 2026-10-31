@@ -18,7 +18,8 @@ function response(value: unknown, options: { status?: number; sha?: string; raw?
   return {
     statusCode: options.status ?? 200,
     headers: { 'x-openclaude-content-sha256': options.sha ?? createHash('sha256').update(bytes).digest('hex') },
-    body: Readable.from([bytes]),
+    // undici bodies expose dump(); error statuses are drained, never destroyed.
+    body: Object.assign(Readable.from([bytes]), { dump: async () => {} }),
   } as unknown as Awaited<ReturnType<typeof request>>
 }
 const fetcher = (value: Awaited<ReturnType<typeof request>>) =>

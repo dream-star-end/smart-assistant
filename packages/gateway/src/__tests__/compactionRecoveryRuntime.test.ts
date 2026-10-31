@@ -105,8 +105,14 @@ async function managerFixture(t: TestContext, id: string, opts: { overflow?: boo
   t.mock.method(manager as unknown as { _runOneTurn: (...args: unknown[]) => Promise<void> }, '_runOneTurn', async (...args: unknown[]) => {
     await fakeModel.submit(args[1] as HistoricalTurnInput)
   })
+  // Master history lets a context overflow rebuild a shorter exact suffix.
+  const historicalMessages = opts.overflow ? [
+    { id: 'master-old', role: 'assistant', text: FAKE_APPROVAL.repeat(200) },
+    { id: 'master-recent', role: 'user', text: '核对现有委派' },
+  ] : undefined
   const submit = (input: HistoricalTurnInput, trace: string, onEvent: (event: { kind: string }) => void = () => {}) =>
-    manager.submit(session, input, onEvent, undefined, undefined, undefined, trace)
+    manager.submit(session, input, onEvent, undefined, undefined, undefined, trace, undefined,
+      historicalMessages ? { historicalMessages } : undefined)
   const compact = () => runtime.observeCompactionOriginal(session, { kind: 'turn_status', status: 'compacting' }, () => undefined)
   return { manager, session, fakeModel, jobId: created.jobId, submit, compact }
 }
@@ -127,7 +133,9 @@ test('GAP-C2: ordinary turns without a compaction carry no recovery and copy not
   const before = await archiveCount()
   await submit('第一条普通消息', 'runtime-ordinary-1')
   await submit('第二条普通消息', 'runtime-ordinary-2')
-  assert.deepEqual(fakeModel.inputs, ['第一条普通消息', '第二条普通消息'])
+  assert.equal(fakeModel.inputs.length, 2)
+  for (const input of fakeModel.inputs) assert.doesNotMatch(textOf(input), /OpenClaude context recovery contract/)
+  assert.equal(fakeModel.inputs[1], '第二条普通消息')
   assert.equal(await archiveCount(), before)
 })
 
@@ -180,7 +188,10 @@ test('GAP-A1: a master 503 for the compaction timeline resolves to unavailable o
   t.after(() => new Promise<void>(resolve => server.close(() => resolve())))
   process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'synthetic-fixture-only'
-  t.after(() => { delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL; delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN })
+  t.after(() => {
+    Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
+    Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
+  })
   const session = {
     sessionKey: 'agent:main:webchat:dm:degraded-master', peerId: 'degraded-master', agentId: 'main', userId: OWNER,
     channel: 'webchat', providerTag: 'codex', turns: 3, runner: { capabilities: {} },
@@ -200,7 +211,8 @@ test('GAP-A2: an archive directory permission drift never blocks the next messag
   compact()
   await submit('权限漂移后的消息', 'runtime-drift-1')
   assert.equal(fakeModel.inputs.length, 1)
-  assert.match(textOf(fakeModel.inputs[0]!), /权限漂移后的消息$/)
+  assert.equal(sourceJson(fakeModel.inputs[0]!).user_instructions, null)
+  assert.match(textOf(fakeModel.inputs[0]!), /权限漂移后的消息/)
 })
 
 test('an overflow retry of the recovered turn keeps the same original prohibition', { timeout: 20_000 }, async t => {

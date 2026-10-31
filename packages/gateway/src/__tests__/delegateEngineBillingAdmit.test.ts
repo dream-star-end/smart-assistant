@@ -233,7 +233,7 @@ describe('handleDelegateTask engine-reported billing', () => {
         ? { goal: '实现子任务', context: '上下文…', model: 'gpt-5.6-sol', sourceAgent: 'main', async: true,
             streamProgress: true, parentSessionKey: PARENT_KEY }
         : memberBody({ model: 'gpt-5.6-sol' })
-      const headers = asyncShape
+      const headers: Record<string, string> = asyncShape
         ? { [DELEGATE_CONTEXT_HEADER]: issueDelegateContextToken({ agentId: 'main', sessionKey: PARENT_KEY, depth: 0 }) }
         : {}
       const first = delegate(gw, 'auditor', body, headers)

@@ -3,7 +3,7 @@
  * session by content hash; each capture is a small immutable manifest. */
 import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
+import { type FileHandle, lstat, mkdir, open, readdir, rename, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   paths,
@@ -97,7 +97,7 @@ async function privateRead(path: string): Promise<string> {
 
 /** Exclusive create; an existing record with the same hash is the same bytes. */
 async function writeImmutable(path: string, value: string, existingOk = false): Promise<boolean> {
-  let file
+  let file: FileHandle
   try {
     file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
   } catch (error) {
