@@ -243,7 +243,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
     await new Promise<void>((resolve, reject) => authority.close(error => error ? reject(error) : resolve()))
   })
   for (const stopDuringRetire of [false, true]) {
-    it(`real core keeps GET inflight and Stop live through blocked retire (${stopDuringRetire ? 'cancelled' : 'completed'})`, async () => {
+    it(`real core keeps GET inflight and Stop live through blocked retire (${stopDuringRetire ? 'cancelled' : 'completed'})`, { timeout: 15_000 }, async t => {
       const f = fixture(authorityBaseUrl)
       const surface = new DelegateInflightSurfaceStore({ dbPath: null })
       const retiring = deferred<void>()
@@ -299,11 +299,19 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
         sessionId: owner.locator.parentSessionId, userId: owner.userId, enabled: true,
         loadSession: async () => ({}), store: surface, overlayJobs: () => f.store.listNonTerminal(),
         resolveJob: jobId => f.store.snapshotOf(jobId) })
+      let abortWait!: () => void
+      const aborted = new Promise<never>((_, reject) => {
+        abortWait = () => reject(new Error('real core fixture timed out while waiting for admission or cleanup'))
+        t.signal.addEventListener('abort', abortWait, { once: true })
+      })
       try {
         const res: any = {}
-        await handleDelegateTask.call(f.host, f.req, res, 'coding-assistant')
+        await Promise.race([handleDelegateTask.call(f.host, f.req, res, 'coding-assistant'), aborted])
+        assert.equal(res.body.resultDelivery, 'background')
         const jobId = res.body.jobId
-        await retiring.promise
+        await Promise.race([retiring.promise, aborted, f.terminal.promise.then(() => {
+          assert.fail(`delegate reached terminal before retire: ${JSON.stringify(f.store.snapshotOf(jobId))}`)
+        })])
         const before = await read()
         assert.equal((before.body.items as any[]).find(item => item.jobId === jobId)?.state, 'running')
         assert.equal(groups.length, 0, 'a model result card cannot seal the running cleanup job')
@@ -314,7 +322,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
           assert.equal(((await read()).body.items as any[]).find(item => item.jobId === jobId)?.state, 'running')
         }
         releaseRetire.resolve()
-        await f.terminal.promise
+        await Promise.race([f.terminal.promise, aborted])
         const after = await read()
         const completed = (after.body.items as any[]).find(item => item.jobId === jobId)
         assert.equal(completed?.state, stopDuringRetire ? 'cancelled' : 'completed')
@@ -322,6 +330,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
         assert.equal(groups[0]?.jobId, jobId)
         assert.equal(progress.some(out => out.blocks?.some((block: any) => ['done', 'error'].includes(block.phase))), true)
       } finally {
+        t.signal.removeEventListener('abort', abortWait)
         releaseRetire.resolve()
         f.cleanup.resolve()
         surface.close()
