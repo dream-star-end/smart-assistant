@@ -1,10 +1,12 @@
 // OCV5-593 FE-2b 审阅批注 (d05 / m03): one shot's take on the stage with point / box annotations,
 // time ranges dragged on the filmstrip, version strip, QA report and history. Annotations are drafts
 // in this tab until "交给 agent" (FE-7b) sends them; then the server's annotation shows what the
-// agent understood, with 确认执行 / 不采用 / 再发一次.
+// agent understood, with 确认执行 / 不采用 / 再发一次. "采用" adopts the take on the stage as it is
+// (POST /takes/:id/select): a video settles the shot, a frame re-shoots the video from it.
 
 import {
   ArrowLeft,
+  Check,
   Columns2,
   MapPin,
   MousePointer2,
@@ -61,6 +63,8 @@ function num(v: unknown): number | null {
 }
 
 const ASPECT_RATIO: Record<string, string> = { '16:9': '16 / 9', '9:16': '9 / 16', '1:1': '1 / 1' }
+/** Projects the server refuses to change (selectTake answers STUDIO_BAD_TRANSITION). */
+const CLOSED_PROJECT = new Set(['done', 'canceled', 'failed'])
 
 export function ReviewPage(props: {
   auth: AuthSession
@@ -218,6 +222,42 @@ function ShotReview(props: {
   // media + playback
   const url = useBlobUrl(auth, take?.blobSha)
   const video = isVideoTake(take)
+
+  // Adopt the take on the stage. The version strip only previews; this is the one that commits.
+  const adopted = !!take && video && shot.status === 'ready' && shot.activeTakeId === take.id
+  const shotBusy = shot.status === 'generating' || shot.status === 'qa'
+  const closed = CLOSED_PROJECT.has(view.project.status)
+  const canAdopt = !!take && !adopted && !shotBusy && !closed
+  const adoptLabel = !take
+    ? '采用这个版本'
+    : adopted
+      ? `已采用 v${take.version}`
+      : video
+        ? `采用 v${take.version} 并继续`
+        : `用 v${take.version} 这一帧重拍视频`
+  const adoptHint = closed
+    ? '项目已经结束，不能再换版本。'
+    : shotBusy
+      ? '这一镜还在生成，生成完再选版本。'
+      : adopted
+        ? '这一镜用的就是这个版本。'
+        : video
+          ? '采用后这一镜就定了，导演会接着做后面的步骤。'
+          : '会按这一帧重新生成视频，视频按正常价格扣积分。'
+  const adopt = async () => {
+    if (busy || !take || !canAdopt) return
+    setBusy(true)
+    try {
+      await studioApi.selectTake(auth, take.id)
+      toast(video ? `已采用 v${take.version}` : `开始用 v${take.version} 这一帧重拍视频`, 'success')
+    } catch (err) {
+      toast(studioErrorText(err), 'error')
+    } finally {
+      setBusy(false)
+      props.onReload?.()
+    }
+  }
+  const hasNotes = mine.some((d) => d.text.trim())
   const videoRef = useRef<HTMLVideoElement>(null)
   const [time, setTime] = useState(0)
   const [playing, setPlaying] = useState(false)
@@ -838,11 +878,29 @@ function ShotReview(props: {
           )}
         </div>
         <div className="st-review-foot">
+          {take ? (
+            <>
+              <button
+                type="button"
+                className={`st-btn${hasNotes ? '' : ' st-btn-primary'}`}
+                style={{ width: '100%' }}
+                disabled={busy || !canAdopt}
+                onClick={() => void adopt()}
+                data-testid="adopt-take"
+              >
+                <Check />
+                {adoptLabel}
+              </button>
+              <div className="st-cap" style={{ textAlign: 'center', margin: '6px 0 10px' }}>
+                {adoptHint}
+              </div>
+            </>
+          ) : null}
           <button
             type="button"
-            className="st-btn st-btn-primary"
+            className={`st-btn${hasNotes || !take ? ' st-btn-primary' : ''}`}
             style={{ width: '100%' }}
-            disabled={busy || !mine.some((d) => d.text.trim())}
+            disabled={busy || !hasNotes}
             onClick={() => void handOver(mine.map((d) => d.id))}
             data-testid="hand-over"
           >
