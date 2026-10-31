@@ -21,6 +21,7 @@ import {
   readJsonBody,
   sendJson,
   clientIpOf,
+  refreshClientIpFromRequest,
   userAgentOf,
   ensureRequestId,
   setSecurityHeaders,
@@ -751,6 +752,10 @@ async function resolveLaneAndApply(
 
 // ─── POST /api/auth/login ───────────────────────────────────────────
 
+function reissueClientIp(req: IncomingMessage, ctx: RequestContext): string | null {
+  return refreshClientIpFromRequest(ctx.authBoundIp, req.headers["cf-connecting-ip"]);
+}
+
 export async function handleLogin(
   req: IncomingMessage,
   res: ServerResponse,
@@ -784,6 +789,7 @@ export async function handleLogin(
       fetchImpl: deps.fetchImpl,
       remoteIp: ctx.clientIp,
       bindIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
       requireEmailVerified: deps.requireEmailVerified,
       replaceRefreshToken: readRefreshCookie(req),
@@ -965,7 +971,11 @@ export async function handleRefresh(
     const r = await refresh(rawRefresh, {
       jwtSecret: deps.jwtSecret,
       remoteIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
+      onReissued: (ev) => {
+        ctx.log.info("refresh_reissued", { family_id: ev.family_id, user_id: ev.user_id });
+      },
     });
     // cookie Max-Age = 新 token 真实剩余 TTL;到期时间由 server 主导。
     // 2026-04-24 "记住我":继承 refresh_tokens.remember_me(refresh() 返回),
@@ -1085,6 +1095,7 @@ export async function handleVerifyEmail(
     const session = await issueVerifiedUserSession(r.user_id, {
       jwtSecret: deps.jwtSecret,
       bindIp: ctx.authBoundIp,
+      clientIp: reissueClientIp(req, ctx),
       userAgent: ctx.userAgent ?? undefined,
       replaceRefreshToken: readRefreshCookie(req),
     });

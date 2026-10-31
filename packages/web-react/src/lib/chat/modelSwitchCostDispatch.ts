@@ -52,6 +52,8 @@ export async function authorizeQueuedModelSwitch(
     } else {
       if (deps.queue.includes(item) && item.state === 'persisting') {
         item.state = 'queued'
+        const row = deps.sessions.get(item.sessId)?.messages.find((m) => m.id === item.msgId && m.role === 'user')
+        if (row?.status === 'sending') row.status = 'queued'
         if (deps.slots.get(item.sessId) === item.msgId) deps.slots.delete(item.sessId)
         deps.notice(item.sessId, '费用信息暂不可用，消息已保留，恢复连接后重试')
       }

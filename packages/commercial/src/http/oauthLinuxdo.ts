@@ -17,7 +17,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { HttpError } from './util.js'
+import { HttpError, refreshClientIpFromRequest } from './util.js'
 import { readRefreshCookie, setRefreshCookie } from './cookies.js'
 import {
   startLinuxdoOAuth,
@@ -256,6 +256,7 @@ export async function handleLinuxdoCallback(
         jwtSecret: deps.jwtSecret,
         userAgent: ctx.userAgent ?? undefined,
         bindIp: ctx.authBoundIp,
+        clientIp: refreshClientIpFromRequest(ctx.authBoundIp, req.headers['cf-connecting-ip']),
         allowCreate: allowRegSetting.value === true,
         replaceRefreshToken: readRefreshCookie(req),
       },

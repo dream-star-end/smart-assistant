@@ -130,7 +130,7 @@ export type UseChatSocket = {
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
   setGoalState: (sessId: string, goal: ChatSession["goalState"]) => void;
-  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非持久，随 version 快照读回）。*/
+  /** 会话级 transient 软提示（"正在发送…"等，非持久，随 version 快照读回）。*/
   getTransientNotice: (sessId: string | undefined) => { text: string; ts: number } | null;
   respondPermission: (p: {
     sessId: string;
@@ -358,6 +358,16 @@ export function useChatSocket(opts: {
         return api.refresh(session, expectedEpoch, "ws_auth");
       },
       onAuthExpired: (expectedEpoch) => authRef.current?.expire(expectedEpoch),
+      readSessionSnapshot: async (sessId, query) => {
+        const a = authRef.current;
+        if (!a) throw new Error("signed out");
+        const { limit, ...snapshot } = query;
+        return (await api.getSessionLiveFrames(a, sessId, "0", limit ?? 200, { snapshot })).snapshot;
+      },
+      readLiveFramePayload: (sessId, ref) => {
+        const a = authRef.current;
+        return a ? api.getLiveFramePayload(a, sessId, ref) : Promise.reject(new Error("signed out"));
+      },
       lookupPermissionPrompts: (sessId, requestIds) => {
         const now = Date.now();
         const last = permissionLookupAtRef.current.get(sessId) ?? 0;
@@ -520,7 +530,6 @@ export function useChatSocket(opts: {
             (query) => api.getSessionLiveUnits(a, sessId, { n: 20, ...query }),
           );
           if (!isCurrent()) return false;
-          sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
           return true;
         } catch {

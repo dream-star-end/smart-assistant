@@ -173,6 +173,8 @@ test -z "$MASTER_GATE_TMPDIR" && echo cleared`,
         `REPO_ROOT=${JSON.stringify(root)}`,
         `MASTER_RELEASES_ROOT=${JSON.stringify(path.join(dir, "releases"))}`,
         'DRY=0',
+        // Resource sampler lifecycle is covered independently; this harness isolates preflight.
+        'master_gate_load_budget_start() { :; }',
         // Tripwire for the removed legacy call, including accidental reintroduction.
         'prune_shared_tsx_cache() { echo unexpected-shared-prune; exit 91; }',
         diskOk

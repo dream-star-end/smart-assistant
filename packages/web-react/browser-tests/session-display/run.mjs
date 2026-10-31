@@ -6,8 +6,8 @@
  * visibilitychange; airplane mode is context.setOffline. Nothing here dials a
  * live gateway or spends a paid turn.
  *
- * Clauses that need the unmerged snapshot protocol are test.skip, with the
- * slice named in the reason, so this file stays green in CI.
+ * HTTP fallback and settled-credit clauses use the same #1200 snapshot
+ * contract as the product socket.
  */
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -194,22 +194,6 @@ async function assertContent(page, gateway, text) {
   }
 }
 
-test(
-  'R5 hello 未完成时 8 秒内 HTTP 快照对齐',
-  {
-    skip: 'fixme: 依赖 codex-rf-snapshot（B3 并入）。当前协议没有 hello ack，live-frames 也不带 dispatch.turnStatus；8 秒 HTTP 对齐未实现。',
-  },
-  () => {},
-)
-
-test(
-  'R9 上一轮仍在后台运行的横幅与积分确认',
-  {
-    skip: 'fixme: 积分数字「已用 X 积分」依赖 B4b/codex-rf-snapshot。已落地的 B4a 文案不带积分，由 R9 主断言覆盖。',
-  },
-  () => {},
-)
-
 test('session-display scripts R1 R2 R3 R5 R7 R9', { timeout: 300_000 }, async () => {
   const assetDir = mkdtempSync(join(tmpdir(), 'oc-session-display-'))
   let gateway
@@ -272,8 +256,6 @@ test('session-display scripts R1 R2 R3 R5 R7 R9', { timeout: 300_000 }, async ()
   } finally {
     console.log('SESSION_DISPLAY_SUMMARY')
     for (const row of results) console.log(`${row.id} ${row.status}`)
-    console.log('R5 fixme: hello 未完成时 8s HTTP 快照（codex-rf-snapshot）')
-    console.log('R9 fixme: 积分数字（B4b/codex-rf-snapshot）')
     await browser?.close()
     await gateway?.stop?.()
     rmSync(assetDir, { recursive: true, force: true })
@@ -315,7 +297,11 @@ async function runR2(browser, gateway) {
     const label = await waitHonest(page, gateway, 5_000)
     await assertContent(page, gateway, text)
     assertHonest(label)
+    // B3: back in the foreground with no snapshot or sequenced frame for 8s, the browser reads the
+    // same session snapshot over HTTP; the parked frame arrives through it.
+    await page.clock.fastForward(8_000)
     await expectProcessText(page, gateway, thinking)
+    assert.ok(gateway.snapshotReads.length > 0, 'parked thinking must arrive through an HTTP snapshot')
     return '通过'
   } finally {
     await context.close()
@@ -368,6 +354,8 @@ async function runR3(browser, gateway) {
 }
 
 async function runR5(browser, gateway) {
+  await runR5SnapshotFallback(browser, gateway)
+  gateway.reset()
   const text = 'R5_LONG_TASK_WEAKNET'
   const { context, page } = await openHarness(browser, gateway)
   try {
@@ -387,7 +375,30 @@ async function runR5(browser, gateway) {
     await assertContent(page, gateway, text)
     const body = await bodyText(page)
     assert.doesNotMatch(body, STALE_ENGINE)
-    return '通过（反复断线后终态一致、内容不丢）；fixme：hello 未完成时 8s HTTP 快照（codex-rf-snapshot）'
+    return '通过（hello 未完成时 8s HTTP 快照；反复断线后终态一致、内容不丢）'
+  } finally {
+    await context.close()
+  }
+}
+
+async function runR5SnapshotFallback(browser, gateway) {
+  const thinking = 'R5_HTTP_SNAPSHOT_THINKING'
+  gateway.seedCold({
+    userText: 'R5_HELLO_NO_SNAPSHOT', clientMessageId: 'cm-user-r5-http',
+    thinking, admittedAt: CLOCK_ORIGIN.getTime(),
+  })
+  gateway.suppressHelloBody = true
+  const { context, page } = await openHarness(browser, gateway, 'cold')
+  try {
+    const startedAt = Date.now()
+    while (gateway.hellos === 0 && Date.now() - startedAt < 5_000) await sleep(50)
+    assert.ok(gateway.hellos > 0, 'the socket must send hello before its 8s fallback is timed')
+    assert.equal(gateway.snapshotReads.length, 0)
+    await page.clock.fastForward(8_000)
+    await expectProcessText(page, gateway, thinking)
+    assert.ok(gateway.snapshotReads.length > 0, 'hello without a snapshot must fall back to HTTP at 8s')
+    assertHonest(await waitHonest(page, gateway, 5_000))
+    assert.equal(await page.evaluate(() => window.__sd?.sending), true)
   } finally {
     await context.close()
   }
@@ -457,7 +468,17 @@ async function runR9(browser, gateway) {
     } catch (error) {
       throw new Error(await diagnose(page, gateway, `B4a banner missing: ${error}`))
     }
-    return '通过（叠发不丢、原回合仍在、B4a 横幅）；fixme：积分数字（B4b/codex-rf-snapshot）'
+    gateway.credits = { settled: '1520', requests: 3 }
+    gateway.parkThinking('R9_BACKGROUND_THINKING')
+    await setVisibility(page, 'hidden')
+    await page.clock.fastForward(10)
+    await setVisibility(page, 'visible')
+    await page.clock.fastForward(8_000)
+    await banner.getByText('本轮已扣 1,520 积分，仍在运行。现在发送的消息会等本轮结束后再发出，另行计费。')
+      .waitFor({ timeout: 5_000 })
+    assert.ok(gateway.snapshotReads.length > 0, 'credits must come from the authoritative HTTP snapshot')
+    assert.equal(gateway.inboundMessages.length, 1)
+    return '通过（叠发不丢、原回合仍在、后台运行横幅与实扣积分）'
   } finally {
     await context.close()
   }
