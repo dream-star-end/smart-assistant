@@ -13,6 +13,7 @@ import {
   BOX_CC_HOME,
   BOX_CC_REAP_FUNCTION,
   boxOfficialClaudeModel,
+  boxReadOnlyClaudeArgs,
   type BoxCcControl,
   type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
@@ -45,7 +46,7 @@ export function remoteInteractiveClaudeArgs(argv: readonly string[]): string[] {
       out.push('--dangerously-skip-permissions', '--settings', '{"skipDangerousModePermissionPrompt":true}')
     }
   }
-  return out
+  return [...out, ...boxReadOnlyClaudeArgs(argv)]
 }
 
 export interface BoxBridgeMod {

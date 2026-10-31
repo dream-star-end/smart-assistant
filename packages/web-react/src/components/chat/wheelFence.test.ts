@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createStickToBottomController } from "./stickToBottom";
-import { attachWheelFence } from "./wheelFence";
+import { attachWheelFence, isScrollNavigationKey } from "./wheelFence";
 
 function fire(el: HTMLElement, type: string) {
   el.dispatchEvent(new Event(type));
@@ -91,5 +91,41 @@ describe("wheelFence", () => {
     expect(stick.wheelFence.current).toBe(false);
     fire(el, "wheel");
     expect(stick.wheelFence.current).toBe(false);
+  });
+
+  test("键盘边界滚动键无 scroll 事件时仍在 quietMs 后释放 writeSuspended，普通快捷键/按钮交互不误挂篱笆(U4)", () => {
+    const stick = createStickToBottomController();
+    const el = document.createElement("div");
+    const btn = document.createElement("button");
+    el.appendChild(btn);
+    attachWheelFence(el, stick, { quietMs: 200, now: () => Date.now() });
+
+    const copyEvt = new KeyboardEvent("keydown", { key: "c", ctrlKey: true, bubbles: true });
+    el.dispatchEvent(copyEvt);
+    expect(isScrollNavigationKey(copyEvt)).toBe(false);
+    expect(stick.wheelFence.current).toBe(false);
+
+    const btnSpace = new KeyboardEvent("keydown", { key: " ", bubbles: true });
+    btn.dispatchEvent(btnSpace);
+    expect(isScrollNavigationKey(btnSpace)).toBe(false);
+    expect(stick.wheelFence.current).toBe(false);
+
+    // 用户在底部按 End / ArrowDown：若 markUserIntent 先挂起写入但浏览器无 scroll 事件，
+    // wheelFence 必须在 quietMs 后通过 endWheelFence 释放挂起，恢复自动贴底。
+    stick.markUserIntent();
+    const endKey = new KeyboardEvent("keydown", { key: "End", bubbles: true });
+    el.dispatchEvent(endKey);
+    expect(isScrollNavigationKey(endKey)).toBe(true);
+    expect(stick.wheelFence.current).toBe(true);
+
+    const scroller = { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 };
+    scroller.scrollHeight = 1200;
+    stick.scrollToBottom(scroller);
+    expect(scroller.scrollTop).toBe(600);
+
+    vi.advanceTimersByTime(201);
+    expect(stick.wheelFence.current).toBe(false);
+    stick.scrollToBottom(scroller);
+    expect(scroller.scrollTop).toBe(800);
   });
 });

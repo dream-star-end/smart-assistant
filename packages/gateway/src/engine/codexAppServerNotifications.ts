@@ -67,6 +67,7 @@ import {
 import type { CodexAppServerRunner } from './codexAppServerRunner.js'
 
 export interface CodexNotificationHost {
+  advisorReadOnly: CodexAppServerRunner['advisorReadOnly']
   nativeContext: CodexAppServerRunner['nativeContext']
   _handleChatgptAuthTokensRefresh: CodexAppServerRunner['_handleChatgptAuthTokensRefresh']
   activeTurnId: CodexAppServerRunner['activeTurnId']
@@ -329,6 +330,14 @@ export function handleLine(this: CodexNotificationHost, line: string): void {
           sessionKey: this.opts.sessionKey,
           method: msg.method,
         })
+        this.writeRaw(jsonRpcResult(msg.id, denial))
+        return
+      }
+    }
+    if (this.advisorReadOnly && msg.method !== 'item/tool/requestUserInput' && isHermeticExecutionMethod(msg.method)) {
+      const denial = buildHermeticDenial(msg.method)
+      if (denial) {
+        this.attemptHadToolOrPermission = true
         this.writeRaw(jsonRpcResult(msg.id, denial))
         return
       }
@@ -1020,6 +1029,10 @@ export async function handleItemCompleted(
     return
   }
   if (itemType === 'imageGeneration') {
+    if (this.advisorReadOnly) {
+      this.emitToolResult(itemId, 'Image generation is unavailable for this read-only turn', true)
+      return
+    }
     const outcome = codexToolOutcome(item)
     if (outcome.isError) {
       const stderrNote = takeImageFailureNote(this)

@@ -130,6 +130,7 @@ test('the Antigravity MCP shell inherits only the stable help context path and e
     assert.ok(server)
     assert.equal(server.env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE, '/synthetic/system-help-context.json')
     assert.equal(server.env.OPENCLAUDE_GATEWAY_PORT, '18789')
+    assert.equal(server.env.OPENCLAUDE_DELEGATE_MCP_BUDGET_MS, '45000')
     assert.equal(raw.includes('synthetic-gateway-token'), false)
     cleanupAntigravityLaunch(projection)
   })

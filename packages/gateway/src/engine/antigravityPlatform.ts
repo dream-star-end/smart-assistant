@@ -1,3 +1,4 @@
+import { delegateMcpBudgetEnvironment } from '../delegateMcpBudget.js'
 import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into the
@@ -264,6 +265,7 @@ export function projectAntigravityPlatform(
       command: mcpLaunch.command,
       args: [...mcpLaunch.args],
       env: {
+        ...delegateMcpBudgetEnvironment(),
         OPENCLAUDE_AGENT_ID: input.agentId,
         OC_AGENT_ID: input.agentId,
         ...identityCompatEnvironment(input.identityCompat),

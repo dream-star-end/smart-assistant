@@ -36,9 +36,9 @@ export function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
   const g = manifest.gates
   if (!g?.quoteFirst || !g.claimBound || !g.identifier || !g.retraction) return null
   const items: { label: string; passed: boolean }[] = [
-    { label: 'quote 接地', passed: g.quoteFirst.passed },
-    { label: 'claim 绑定', passed: g.claimBound.passed },
-    { label: 'identifier', passed: g.identifier.passed },
+    { label: '引用接地', passed: g.quoteFirst.passed },
+    { label: '论断绑定', passed: g.claimBound.passed },
+    { label: '标识核验', passed: g.identifier.passed },
     { label: '撤稿过滤', passed: g.retraction.passed },
   ]
   if (g.minicheck) items.push({ label: '语义蕴含', passed: g.minicheck.passed })

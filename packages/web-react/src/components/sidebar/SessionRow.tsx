@@ -8,19 +8,23 @@ import {
   Trash2,
 } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, memo, useRef, useState } from "react";
+import { SIDEBAR_DOT_LABELS, resolveSidebarDot } from "../../lib/sessionStatus";
 import type { ChatProject, Session } from "../../lib/types";
+import { SIDEBAR_DOT_STATUS } from "../../lib/ui/statusTone";
 import { cn } from "../../lib/utils";
 import { SessionStatusDot } from "../SessionStatusDot";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
   IconButton,
+  StatusPill,
 } from "../ui";
 import { formatDate } from "../ui/TimeAgo";
 import { formatCompactDuration, sessionDurationWindow } from "./compactDuration";
@@ -127,6 +131,7 @@ export const SessionRow = memo(function SessionRow({
     if (p && Math.hypot(e.clientX - p.x, e.clientY - p.y) > LONG_PRESS_SLOP_PX) cancelPress();
   };
 
+  const dot = resolveSidebarDot({ running, lastOutcome, lastErrorCode }, unread);
   const duration = sessionDurationWindow(s, running, now);
   const durationText = duration ? formatCompactDuration(duration.endAt - duration.startAt) : "";
   const durationTitle = duration
@@ -216,13 +221,8 @@ export const SessionRow = memo(function SessionRow({
           // 命中区铺满整行：点状态点 / 用时区也能切会话（原先只有标题文字可点）。
           className="flex h-full min-w-0 flex-1 items-center rounded-sm text-left outline-none after:absolute after:inset-0 after:rounded-sm after:content-[''] focus-visible:after:ring-2 focus-visible:after:ring-ring"
         >
-          <span
-            className={cn(
-              "truncate",
-              active && "font-medium",
-              unread && !active && "font-semibold text-fg",
-            )}
-          >
+          {/* 未读只用行首的点表示，不加粗（UI-SPEC §4.3）。 */}
+          <span className={cn("truncate", active && "font-medium")}>
             {highlightQuery?.trim() ? (
               <HighlightedText text={title} query={highlightQuery} />
             ) : (
@@ -290,6 +290,19 @@ export const SessionRow = memo(function SessionRow({
                 menuViaKeyboardRef.current = false;
               }}
             >
+              {/* 状态点的说明：桌面悬停有 title，触屏长按呼出的就是这份菜单，第一行写清楚。 */}
+              {dot !== "none" && (
+                <>
+                  <DropdownMenuLabel>
+                    <StatusPill
+                      status={SIDEBAR_DOT_STATUS[dot]}
+                      label={SIDEBAR_DOT_LABELS[dot]}
+                      variant="pill"
+                    />
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               <DropdownMenuItem onSelect={() => onRename(s)}>
                 <Pencil size={14} className="shrink-0 text-muted" />
                 重命名

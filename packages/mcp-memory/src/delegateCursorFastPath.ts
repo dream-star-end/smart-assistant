@@ -1,12 +1,10 @@
 /**
  * Shared delegate fast path (originally introduced for Cursor): start the
- * gateway job asynchronously, wait up to ~45s, and if the child is still
- * running return a jobId plus Bash instructions for
- * `oc-memory delegate-wait`.
+ * gateway job asynchronously and keep polling inside the same tools/call.
+ * At the engine deadline, retain stdout delivery through one aggregate CLI wait.
  *
  * Pure enough to unit-test with fake HTTP; index.ts only supplies POST/wait.
- * Every engine uses this path so Codex/CCB MCP call deadlines are never
- * mistaken for the lifetime of a healthy child job.
+ * A transport or tool deadline is never the lifetime of a healthy child job.
  */
 import type { FanoutItemResult } from './delegateFanout.js'
 
@@ -22,6 +20,7 @@ export function isTransientDelegateWaitError(err: unknown): boolean {
   return (
     code === 'ETIMEDOUT' ||
     code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
     code === 'EPIPE' ||
     /delegate client timeout/i.test(msg) ||
     /socket hang up/i.test(msg)
@@ -49,6 +48,11 @@ export function resolveCursorFastWaitMs(env: NodeJS.ProcessEnv = process.env): n
     MIN_CURSOR_FAST_WAIT_MS,
     MAX_CURSOR_FAST_WAIT_MS,
   )
+}
+
+/** Gateway projects the effective engine deadline, already minus transport margin. */
+export function resolveDelegateMcpBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  return normalizeMs(env.OPENCLAUDE_DELEGATE_MCP_BUDGET_MS, 45_000, 1, 12 * 60 * 60_000)
 }
 
 /**
@@ -273,22 +277,25 @@ export function formatDelegateRunning(
   const keyBit = sessionKey ? ` sessionKey=${sessionKey}` : ''
   return [
     `子任务仍在运行 (agent: ${label}${goalBit})。status=running jobId=${jobId}${keyBit}`,
-    '本次 MCP 调用只负责启动并短等；子任务会继续运行。请立刻用 Bash 阻塞等待结果,不要重复调用 delegate_task,也不要轮询 MCP:',
+    '前台工具等待窗口已结束。子任务会继续运行；请用 Bash 阻塞取回结果，不要结束当前回合、重复委派或轮询 MCP:',
     `  oc-memory delegate-wait ${jobId}`,
-    '该命令会阻塞直到子任务完成、无活动超时或网关重启导致句柄失效,然后把结果打印到 stdout。',
   ].join('\n')
+}
+
+export function formatDelegateDeferred(jobId: string, label: string): string {
+  return `status=deferred jobId=${jobId} (agent: ${label})。网关已接管等待，完成或失败后会自动把结果送回本会话。请结束当前回合，不要重新委派或启动等待工具。`
 }
 
 export type FanoutCursorItem = FanoutItemResult & {
   running?: boolean
+  deferred?: boolean
   jobId?: string
 }
 
 export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
   const running = items.filter((it) => it.running && it.jobId)
   const done = items.filter((it) => !it.running)
-  const jobIds = running.map((it) => it.jobId).filter((id): id is string => Boolean(id))
-  const header = `并行委派 ${items.length} 个子任务: ${done.length} 已完成 / ${running.length} 仍在运行(本次 MCP 调用已返回作业句柄)。`
+  const header = `并行委派 ${items.length} 个子任务: ${done.length} 已完成 / ${running.length} 仍在运行。`
   const doneSections = done.map((it, i) => {
     const mark = it.isError ? '❌' : '✅'
     const goalPreview = it.goal.length > 60 ? `${it.goal.slice(0, 60)}…` : it.goal
@@ -298,11 +305,16 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
     const goalPreview = it.goal.length > 60 ? `${it.goal.slice(0, 60)}…` : it.goal
     return `- ${it.jobId} (agent: ${it.label}, goal: ${goalPreview})`
   })
-  const waitCmd = `  oc-memory delegate-wait ${jobIds.join(' ')}`
+  const deferred = running.every((it) => it.deferred)
+  const stdoutJobIds = running.filter((it) => !it.deferred).map((it) => it.jobId)
   const runningSection = [
     '### 仍在运行',
-    '请立刻用 Bash 一条命令阻塞等待全部未完成子任务,不要重复调用 delegate_tasks,也不要轮询 MCP:',
-    waitCmd,
+    deferred
+      ? '网关已接管等待，终态会自动送回本会话。请结束当前回合，不要重新委派或启动等待工具。'
+      : stdoutJobIds.length === running.length
+        ? '前台工具等待窗口已结束。请用下方一条 Bash 命令阻塞等待所有未完成作业，不要结束当前回合、重复委派或轮询 MCP。'
+        : '部分作业尚未确认自动回调。仅用下方 Bash 命令等待这些作业；网关已接管的作业会自动送回，不要重复委派或轮询 MCP。',
+    ...(!deferred ? [`  oc-memory delegate-wait ${stdoutJobIds.join(' ')}`] : []),
     ...runningLines,
   ].join('\n')
   const parts = [header, '']
@@ -315,6 +327,7 @@ export function formatDelegateFanoutRunning(items: FanoutCursorItem[]): string {
 
 export type DelegateWaitView =
   | { kind: 'running'; jobId: string; sessionKey?: string }
+  | { kind: 'deferred'; jobId: string }
   | { kind: 'expired'; jobId?: string; error: string }
   | { kind: 'result'; httpStatus: number; body: Record<string, unknown> }
   | { kind: 'error'; error: string }
@@ -401,6 +414,9 @@ export function interpretDelegateWaitBody(
     return { kind: 'expired', jobId, error }
   }
   if (!data) return { kind: 'error', error: `等待委派结果失败: 无效 JSON: ${raw.slice(0, 200)}` }
+  if (statusCode >= 200 && statusCode < 300 && data.status === 'deferred' && typeof data.jobId === 'string' && data.jobId.trim()) {
+    return { kind: 'deferred', jobId: data.jobId.trim() }
+  }
   const live = waitRunningView(data)
   if (live) return live
   if (data.status === 'done' || data.status === 'failed') {
@@ -433,6 +449,7 @@ export type FormattedDelegateResult =
   | { kind: 'ok'; text: string }
   | { kind: 'error'; text: string }
   | { kind: 'running'; text: string; jobId: string }
+  | { kind: 'deferred'; text: string; jobId: string }
 
 /** Apply the historical sync `/delegate` result mapping (success text / toolError). */
 export function formatDelegateHttpResult(
@@ -466,55 +483,57 @@ export function formatDelegateHttpResult(
 
 export type CursorDelegateTransport = {
   start: () => Promise<{ statusCode: number; body: string }>
-  wait: (jobId: string, waitMs: number) => Promise<{ statusCode: number; body: string }>
+  wait: (jobId: string, waitMs: number, handoffOnRunning?: boolean) => Promise<{ statusCode: number; body: string }>
 }
 
 /**
- * Start an async delegate job and wait up to `fastWaitMs`. Completes with the
- * same success/error text as today's sync path; otherwise returns a running
- * handle instructing the model to use `oc-memory delegate-wait`.
+ * `fastWaitMs` bounds each HTTP poll, not the tool invocation. Fan-out callers
+ * share deadlineAtMs so starting another member never resets the tools/call budget.
  */
 export async function runCursorDelegateFastPath(
   opts: {
     transport: CursorDelegateTransport
     fastWaitMs: number
+    deadlineAtMs?: number
+    now?: () => number
+    sleep?: (ms: number) => Promise<void>
     label: string
     goal?: string
   },
 ): Promise<FormattedDelegateResult> {
+  const now = opts.now ?? Date.now
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const deadline = opts.deadlineAtMs ?? now() + resolveDelegateMcpBudgetMs()
   const started = await opts.transport.start()
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) return { kind: 'error', text: start.error }
-  let waited: { statusCode: number; body: string }
-  try {
-    waited = await opts.transport.wait(start.jobId, opts.fastWaitMs)
-  } catch (err) {
-    // 2026-09-06 L2 矩阵实测:网关重载时 /api/delegate/wait 长轮询要 52–80s 才返回,
-    // MCP 客户端 (fastWaitMs+15s) 先超时 → 以前整段报「委派失败: delegate client timeout」,
-    // 而子任务其实已经/仍在正常跑(DB 里 completed)。作业句柄已在 start 阶段拿到,传输层
-    // 抖动(ETIMEDOUT/ECONNRESET/socket hang up)只说明"这一轮没等到",不是失败:
-    // 退化为 running 句柄,让父走 `oc-memory delegate-wait <jobId>` 阻塞取回。
-    if (isTransientDelegateWaitError(err)) {
-      return {
-        kind: 'running',
-        jobId: start.jobId,
-        text: formatDelegateRunning(start.jobId, opts.label, opts.goal, start.sessionKey),
+  let polled = false
+  while (now() < deadline || !polled) {
+    polled = true
+    const roundStarted = now()
+    const remaining = deadline - roundStarted
+    const waitMs = Math.max(250, Math.min(opts.fastWaitMs, remaining - 3_000))
+    try {
+      // Keep the tool/fan-out delivery boundary: per-job callbacks would create
+      // independent paid parent turns. At the deadline use the aggregate CLI.
+      const waited = await opts.transport.wait(start.jobId, waitMs)
+      const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
+      if (view.kind === 'deferred') {
+        return { kind: 'deferred', jobId: view.jobId, text: formatDelegateDeferred(view.jobId, opts.label) }
       }
+      if (view.kind === 'expired') return { kind: 'error', text: `委派失败: ${view.error}` }
+      if (view.kind === 'error' && waited.statusCode < 500) return { kind: 'error', text: view.error }
+      if (view.kind === 'result') return formatDelegateHttpResult(view.httpStatus, view.body, opts.label)
+      // A running/queued round is healthy. Keep the model out of the wait loop.
+    } catch (err) {
+      if (!isTransientDelegateWaitError(err)) throw err
     }
-    throw err
+    // Broken transports/mocks can answer immediately. Do not spin a CPU core.
+    if (now() - roundStarted < 200) await sleep(Math.min(1_000, Math.max(0, deadline - now())))
   }
-  const view = interpretDelegateWaitBody(waited.statusCode, waited.body)
-  if (view.kind === 'running') {
-    const sessionKey = start.sessionKey || view.sessionKey
-    return {
-      kind: 'running',
-      jobId: view.jobId,
-      text: formatDelegateRunning(view.jobId, opts.label, opts.goal, sessionKey),
-    }
+  return {
+    kind: 'running',
+    jobId: start.jobId,
+    text: formatDelegateRunning(start.jobId, opts.label, opts.goal, start.sessionKey),
   }
-  if (view.kind === 'expired') {
-    return { kind: 'error', text: `委派失败: ${view.error}` }
-  }
-  if (view.kind === 'error') return { kind: 'error', text: view.error }
-  return formatDelegateHttpResult(view.httpStatus, view.body, opts.label)
 }

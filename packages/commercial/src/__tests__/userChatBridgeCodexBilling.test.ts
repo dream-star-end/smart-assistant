@@ -3104,6 +3104,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         agentId: "main",
         model: "glm-5.2",
         teamMode: true,
+        effortLevel: "xhigh",
         content: "hi",
       }));
 
@@ -3113,6 +3114,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.agentId, "main");
       assert.equal(parsed.teamMode, true);
       assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode main must be forwarded as GPT");
+      assert.equal(parsed.effortLevel, "high", "team leader must override client xhigh effort");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
@@ -3128,7 +3130,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
   test("teamMode 省略 agentId 也按 main GPT 队长处理,避免 master/container 谓词漂移", async () => {
     const variants: Array<{ name: string; extra: Record<string, unknown> }> = [
       { name: "no model", extra: {} },
-      { name: "client glm model", extra: { model: "glm-5.2" } },
+      { name: "client glm model", extra: { model: "glm-5.2", effortLevel: null } },
     ];
     for (const [idx, variant] of variants.entries()) {
       const rig = await startRig({
@@ -3157,6 +3159,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         assert.equal(parsed.agentId, "main", "missing agentId must be normalized to main");
         assert.equal(parsed.teamMode, true);
         assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode main must be forwarded as GPT");
+        assert.equal(parsed.effortLevel, "high", "team leader must set high even for missing/null effort");
         assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
         assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
         const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
@@ -3190,6 +3193,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         agentId: "not-installed-agent",
         model: "glm-5.2",
         teamMode: true,
+        effortLevel: "low",
         content: "hi",
       }));
 
@@ -3199,6 +3203,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.agentId, "main", "unknown teamMode agentId must be normalized to main");
       assert.equal(parsed.teamMode, true);
       assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "unknown teamMode agentId must still force GPT leader");
+      assert.equal(parsed.effortLevel, "high", "demoted team leader must use the same high effort");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
@@ -3236,6 +3241,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main", "teamMode without authority must normalize to main");
       assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, "teamMode without authority must force GPT leader");
+      assert.equal(parsed.effortLevel, "high", "authority-less team leader must use high effort");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
@@ -3245,6 +3251,58 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       ws.close();
     } finally {
       await stopRig(rig);
+    }
+  });
+
+  test("teamMode effort override leaves ordinary and registered non-main frames unchanged", async () => {
+    const variants: Array<{
+      name: string;
+      teamMode: boolean;
+      agentId: string;
+      extra: Record<string, unknown>;
+    }> = [
+      { name: "ordinary xhigh", teamMode: false, agentId: "main", extra: { effortLevel: "xhigh" } },
+      { name: "ordinary missing", teamMode: false, agentId: "main", extra: {} },
+      { name: "ordinary null", teamMode: false, agentId: "main", extra: { effortLevel: null } },
+      { name: "registered non-main", teamMode: true, agentId: "codex", extra: { effortLevel: "xhigh" } },
+    ];
+    for (const [idx, variant] of variants.entries()) {
+      const rig = await startRig({
+        userBalance: 1_000_000n,
+        loadAllowedModelChecker: async () => (modelId: string) => modelId === DEFAULT_CODEX_ENGINE_MODEL,
+        loadAgentModelResolver: async () => (agentId: string) =>
+          agentId === "main" || agentId === "codex" ? DEFAULT_CODEX_ENGINE_MODEL : null,
+      });
+      rig.pricing._setForTests([TEAM_LEADER_PRICING]);
+      try {
+        const containerOpenP = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, await makeJwt(`28${idx}`));
+        await waitOpen(ws);
+        const containerWs = await containerOpenP;
+
+        ws.send(JSON.stringify({
+          type: "inbound.message",
+          agentId: variant.agentId,
+          model: DEFAULT_CODEX_ENGINE_MODEL,
+          teamMode: variant.teamMode,
+          content: variant.name,
+          ...variant.extra,
+        }));
+
+        const frameToContainer = await waitContainerNextFrame(containerWs);
+        const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+        assert.equal(parsed.agentId, variant.agentId, variant.name);
+        assert.equal(parsed.model, DEFAULT_CODEX_ENGINE_MODEL, variant.name);
+        assert.equal(parsed.effortLevel, variant.extra.effortLevel, variant.name);
+        assert.equal(
+          Object.hasOwn(parsed, "effortLevel"),
+          Object.hasOwn(variant.extra, "effortLevel"),
+          `${variant.name}: preserve absent effort as absent`,
+        );
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
     }
   });
 

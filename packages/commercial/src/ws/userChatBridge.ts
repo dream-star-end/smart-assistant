@@ -19,6 +19,7 @@ import {ModelSwitchCostError,type ModelSwitchCostService} from '../billing/model
 import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import type { SystemHelpIdentityScope } from '../system-assistant/helpGrant.js'
 import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
+import { applyTeamLeaderForwarding } from './teamModeForwarding.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -5763,8 +5764,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 sanitizedParsed = withoutWorkspaceMode;
               }
               if (teamModeMain) {
-                sanitizedParsed.agentId = "main";
-                sanitizedParsed.model = DEFAULT_CODEX_ENGINE_MODEL;
+                applyTeamLeaderForwarding(sanitizedParsed);
               }
             }
             // Browser paper hints run before admission freezes the content hash.

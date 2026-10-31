@@ -2187,6 +2187,7 @@ export async function _runOneTurn(
       try {
       submittedTurn = runner.submitTurn({
         input: userTextOrBlocks,
+        readOnly: session._turnReadOnly === true,
         ...(queueTurn ? { queueTurn: true } : {}),
         requestId,
         ...(turnKey ? { turnKey } : {}),

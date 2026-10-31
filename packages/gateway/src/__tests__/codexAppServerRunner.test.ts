@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { paths } from '@openclaude/storage'
+import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import {
   _CODEX_5H_WINDOW_MINS,
   _CODEX_7D_WINDOW_MINS,
@@ -284,6 +285,19 @@ describe('CodexAppServerRunner turn/start params', () => {
     const invalidParams = (h.runner as any).buildTurnStartParams('hi')
     assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
     await h.cleanup()
+  })
+
+  it('passes explicit high for the team leader while retaining its global xhigh default', async () => {
+    const h = await makeHarness({ model: DEFAULT_CODEX_ENGINE_MODEL })
+    try {
+      const defaultParams = (h.runner as any).buildTurnStartParams('hi')
+      assert.equal((defaultParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
+      h.runner.setEffortLevel('high')
+      const teamParams = (h.runner as any).buildTurnStartParams('hi')
+      assert.equal((teamParams.collaborationMode as any).settings.reasoning_effort, 'high')
+    } finally {
+      await h.cleanup()
+    }
   })
 
   it('enforces no-network read-only execution and structured output for hermetic audits', async () => {

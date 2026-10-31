@@ -5,6 +5,10 @@ import { api, ApiError } from "../lib/api";
 import { createMemoryAuthSession } from "../lib/authSession";
 import type { SessionDetail, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
+import { addMessage } from "../lib/chat/model";
+import { ChatSocket } from "../lib/chat/socket";
+import { deriveLiveTerminalEndedAt, deriveLiveTerminalFromMessages } from "../lib/sessionStatus";
+import { formatCompactDuration, sessionDurationWindow } from "../components/sidebar/compactDuration";
 import { useSessionList } from "./useSessionList";
 
 // OCV5-421: 历史读取的瞬时失败会静默重试;本文件用真实重试逻辑、零间隔,免得每条用例等 12 秒。
@@ -738,6 +742,123 @@ describe("useSessionList 置顶 / 项目归属 / 终态字段", () => {
     expect(result.current.sessions[0].lastMessagePreview).toBe("最后一句");
     expect(result.current.sessions[0].createdAt).toBe(1);
     expect(result.current.sessions[0].lastAt).toBe(3_000);
+  });
+
+  // 侧栏用时 = createdAt → lastAt：本 tab 刚跑完的回合，列表 lastAt 还停在回合开始前（下一轮刷新 ≤60s 才更新），
+  // 行会从「运行中算到现在」跌回旧值。终态带上本 tab 看到的结束时刻；只前进不后退，也不重复标未读。
+  test("迟到 REST 终态与本地观察时间补齐：优先采用真实终态时刻，且列表刷新后不被保留的 liveTerminal 覆盖 (#1254)", async () => {
+    const id = "weblatedone01";
+    const start = Date.parse("2026-10-30T10:00:00Z");
+    const end = Date.parse("2026-10-30T10:02:00Z");
+    const observed = Date.parse("2026-10-30T11:00:00Z");
+    const socket = new ChatSocket({
+      getToken: () => "test-token",
+      getAuthEpoch: () => 0,
+      silentRefresh: async (epoch) => ({ kind: "transient", epoch, retryAfterMs: 500 }),
+      onAuthExpired: () => {},
+      defaultAgentId: "main",
+    });
+    try {
+      const session = socket.ensureSession(id, "main", "迟到的终态");
+      const userMessage = addMessage(session, "user", "两分钟任务", { status: "sent" });
+      session.createdAt = start;
+      session.lastAt = start;
+      session._sendingInFlight = true;
+      session._activeClientMessageId = userMessage.id;
+      expect(socket.isSessionBusy(id)).toBe(true);
+
+      vi.spyOn(api, "listSessions").mockResolvedValue([
+        {
+          id,
+          title: "迟到的终态",
+          agentId: "main",
+          createdAt: start,
+          lastAt: end,
+          updatedAt: end,
+          messageCount: 2,
+          runState: "idle",
+          lastOutcome: "completed",
+          lastErrorCode: null,
+        },
+      ] as never);
+      const auth = createMemoryAuthSession(() => {}, "test-token");
+      const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+      const { result } = renderHook(() =>
+        useSessionList({
+          demo: false,
+          auth,
+          authSession: auth,
+          user,
+          agentId: "main",
+          holdAutoSelect: true,
+          sockRef: { current: {} as never },
+          confirmDialog: async () => false,
+          promptText: async () => null,
+          clearChatError: () => {},
+          onNewSessionReset: () => {},
+          onDeleteSession: () => {},
+          onActiveSessionDeleted: () => {},
+        }),
+      );
+      const row = () => result.current.sessions.find((s) => s.id === id)!;
+      await waitFor(() => expect(row()?.lastAt).toBe(end));
+
+      socket.applyServerMessages(
+        id,
+        "main",
+        [
+          {
+            id: "late-final",
+            role: "assistant",
+            text: "完成",
+            ts: end,
+            completedAt: end,
+            _source: "server",
+            _clientMessageId: userMessage.id,
+            _turnTapeComplete: true,
+            _dispatchOutcome: "completed",
+          },
+        ],
+        true,
+        2,
+        { serverUpdatedAt: end },
+      );
+      expect(socket.isSessionBusy(id)).toBe(false);
+      const msgs = socket.sessions.get(id)!.messages;
+      const terminal = deriveLiveTerminalFromMessages(msgs);
+      expect(terminal).toEqual({ lastOutcome: "completed", lastErrorCode: null });
+
+      vi.spyOn(Date, "now").mockReturnValue(observed);
+      expect(deriveLiveTerminalEndedAt(msgs)).toBe(end);
+
+      // 即使调用方传入本地观察时刻作为临时补齐，权威列表刷新后重放保留的 liveTerminal 也必须保持服务端 2 分。
+      const observedTerminal = { ...terminal!, endedAt: Date.now() };
+      act(() => result.current.applySessionTerminal(id, observedTerminal));
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() => expect(row().lastAt).toBe(end));
+      act(() => result.current.applySessionTerminal(id, observedTerminal));
+      const win = sessionDurationWindow(row(), false, observed)!;
+      expect(formatCompactDuration(win.endAt - win.startAt)).toBe("2分");
+    } finally {
+      socket.stop();
+    }
+  });
+
+  test("applySessionTerminal 用本 tab 的结束时刻补齐 lastAt，不倒退、不重复标未读", async () => {
+    const { result } = await renderSessionList({ confirmResult: false, promptResult: null });
+    const row = () => result.current.sessions.find((s) => s.id === "webkeepme001")!;
+    expect(row().lastAt).toBe(2_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 9_000 }));
+    expect(row()).toMatchObject({ lastAt: 9_000, runState: "idle", lastOutcome: "completed", unread: true });
+    // 用户点开读过（未读由 useUnreadSessions 清，这里直接改列表模拟）。
+    act(() => result.current.setSessions((c) => c.map((x) => (x.id === "webkeepme001" ? { ...x, unread: false } : x))));
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 5_000 }));
+    expect(row().lastAt).toBe(9_000);
+    act(() => result.current.applySessionTerminal("webkeepme001", { lastOutcome: "completed", lastErrorCode: null, endedAt: 12_000 }));
+    expect(row()).toMatchObject({ lastAt: 12_000, unread: false });
+    expect(result.current.sessions.find((s) => s.id === "webdropme001")!.lastAt).toBe(2_000);
   });
 
   test("toggleArchiveSession 乐观更新并 PATCH archived；失败回滚", async () => {

@@ -21,6 +21,45 @@ import { WHEEL_FENCE_QUIET_MS, type StickToBottomController } from "./stickToBot
  * Shared by App.tsx and the browser harness so the real-browser gate exercises
  * the production listener ordering, not a copy.
  */
+export interface ScrollKeyEventLike {
+  key: string;
+  defaultPrevented?: boolean;
+  altKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  target?: EventTarget | null;
+}
+
+const NON_SCROLL_KEY_TARGETS =
+  'input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="listbox"], [role="menu"], [role="combobox"]';
+const SPACE_INTERACTIVE_TARGETS =
+  'button, a[href], summary, [role="button"], [role="tab"], [role="menuitem"], [role="option"], [role="switch"], [role="checkbox"], [role="radio"]';
+
+/**
+ * Only keys that can scroll the chat viewport should suspend stick-to-bottom.
+ * Shortcuts (Ctrl/Cmd+C), Escape, Tab, or Enter/Space on inline disclosures and
+ * buttons do not scroll the container and must not freeze auto-follow.
+ */
+export function isScrollNavigationKey(event: ScrollKeyEventLike): boolean {
+  if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return false;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest(NON_SCROLL_KEY_TARGETS)) return false;
+  switch (event.key) {
+    case "ArrowUp":
+    case "ArrowDown":
+    case "PageUp":
+    case "PageDown":
+    case "Home":
+    case "End":
+      return true;
+    case " ":
+    case "Spacebar":
+      return !target?.closest(SPACE_INTERACTIVE_TARGETS);
+    default:
+      return false;
+  }
+}
+
 export function attachWheelFence(
   el: HTMLElement,
   stick: Pick<StickToBottomController, "wheelFence" | "beginWheelFence" | "endWheelFence">,
@@ -81,11 +120,17 @@ export function attachWheelFence(
     scrollEnded = true;
     tryEnd();
   };
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (isScrollNavigationKey(event)) onInput();
+  };
   el.addEventListener("wheel", onInput, { passive: true });
   // Finger lift: direct manipulation ends, the fling (if any) is now the
   // compositor's. Corrections keep deferring until it comes to rest.
   el.addEventListener("touchend", onInput, { passive: true });
   el.addEventListener("touchcancel", onInput, { passive: true });
+  // Boundary scroll keys (e.g. End/ArrowDown while already at bottom) emit no
+  // scroll event; fencing them guarantees endWheelFence releases writeSuspended.
+  el.addEventListener("keydown", onKeyDown);
   el.addEventListener("scroll", onScroll, { passive: true });
   el.addEventListener("scrollend", onScrollEnd);
   return () => {
@@ -93,6 +138,7 @@ export function attachWheelFence(
     el.removeEventListener("wheel", onInput);
     el.removeEventListener("touchend", onInput);
     el.removeEventListener("touchcancel", onInput);
+    el.removeEventListener("keydown", onKeyDown);
     el.removeEventListener("scroll", onScroll);
     el.removeEventListener("scrollend", onScrollEnd);
   };

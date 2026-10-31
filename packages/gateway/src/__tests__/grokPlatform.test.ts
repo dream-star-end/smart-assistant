@@ -46,6 +46,7 @@ describe('grok platform projection', () => {
       assert.equal(lstatSync(tokenFile).mode & 0o777, 0o600)
       assert.match(raw, /OPENCLAUDE_ENGINE = "grok"/)
       assert.match(raw, /tool_timeout_sec = 600/)
+      assert.match(raw, /OPENCLAUDE_DELEGATE_MCP_BUDGET_MS = "585000"/)
       assert.ok(GROK_PREAMBLE.includes('Grok adapter'))
       assert.ok(GROK_PREAMBLE.includes('options'))
       assert.ok(GROK_PREAMBLE.includes('present_task_approval'))
