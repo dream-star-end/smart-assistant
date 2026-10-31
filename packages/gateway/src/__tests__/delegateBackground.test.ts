@@ -1,7 +1,7 @@
 import { installDelegateSandbox } from './helpers/delegateSandbox.js'
 const sandbox = installDelegateSandbox()
 import assert from 'node:assert/strict'
-import { afterEach, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import { EventEmitter } from 'node:events'
 import { createServer } from 'node:http'
 import { backgroundDelegates, BackgroundDelegateScope, isDelegateBackgroundEffective, type BackgroundDelegateOwner } from '../delegateBackground.js'
@@ -18,7 +18,7 @@ import { _completeDelegateResumeClaim } from '../delegateSupervision.js'
 
 const owner: BackgroundDelegateOwner = {
   sessionKey: 'agent:main:webchat:dm:background-session', clientMessageId: 'cmid-background-owner',
-  userId: 'background-user', traceId: 'a'.repeat(32),
+  userId: '765', traceId: 'a'.repeat(32),
   locator: { parentSessionId: 'background-session', parentTurnKey: 'b'.repeat(64), turnIndex: 1 },
 }
 function deferred<T>() {
@@ -26,10 +26,11 @@ function deferred<T>() {
   const promise = new Promise<T>(done => { resolve = done })
   return { promise, resolve }
 }
-function enable() {
+function enable(masterBaseUrl = 'http://master.invalid') {
   Object.assign(process.env, {
     OC_DELEGATE_BACKGROUND: '1', OC_SELFHOST_ENGINE_LOCAL_TURNS: '1', OC_RUNTIME_CHANNEL: 'v5',
-    OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master.invalid', OPENCLAUDE_V3_CONTAINER_TOKEN: 'test-bearer',
+    OPENCLAUDE_V3_MASTER_BASE_URL: masterBaseUrl, OPENCLAUDE_V3_CONTAINER_TOKEN: 'test-bearer',
+    OC_USER_ID: owner.userId,
   })
   setV3MasterSinkSingleton({ persistOrQueue: async () => ({ ok: true }), attemptOnce: async () => {} } as never)
 }
@@ -171,8 +172,8 @@ describe('background delegate exact lifetime', { concurrency: 1 }, () => {
   })
 })
 
-function fixture() {
-  enable()
+function fixture(masterBaseUrl: string) {
+  enable(masterBaseUrl)
   const parent: any = { sessionKey: owner.sessionKey, channel: 'webchat', agentId: 'main', userId: owner.userId,
     peerId: owner.locator.parentSessionId, _currentTurnKey: owner.locator.parentTurnKey,
     _currentTurnTraceId: owner.traceId, _currentTurnIndex: 1, _runningClientMessageId: owner.clientMessageId,
@@ -216,9 +217,34 @@ function fixture() {
 }
 
 describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
+  let authority: ReturnType<typeof createServer>
+  let authorityBaseUrl: string
+  beforeEach(async () => {
+    authority = createServer((req, res) => {
+      req.resume()
+      res.setHeader('content-type', 'application/json')
+      if (req.url !== '/internal/v3/marketplace/sync') {
+        res.writeHead(404).end('{}')
+      } else if (req.headers.authorization !== 'Bearer test-bearer') {
+        res.writeHead(401).end('{}')
+      } else {
+        // Exercise the real authenticated authority fetch and parser, including
+        // the numeric container owner required by identityCompat validation.
+        res.end(JSON.stringify({ identityCompat: { schema: 1, userId: owner.userId, profiles: [] } }))
+      }
+    })
+    await new Promise<void>(resolve => authority.listen(0, '127.0.0.1', resolve))
+    const address = authority.address()
+    assert.ok(address && typeof address !== 'string')
+    authorityBaseUrl = `http://127.0.0.1:${address.port}`
+  })
+  afterEach(async () => {
+    authority.closeAllConnections()
+    await new Promise<void>((resolve, reject) => authority.close(error => error ? reject(error) : resolve()))
+  })
   for (const stopDuringRetire of [false, true]) {
     it(`real core keeps GET inflight and Stop live through blocked retire (${stopDuringRetire ? 'cancelled' : 'completed'})`, async () => {
-      const f = fixture()
+      const f = fixture(authorityBaseUrl)
       const surface = new DelegateInflightSurfaceStore({ dbPath: null })
       const retiring = deferred<void>()
       const releaseRetire = deferred<void>()
@@ -304,7 +330,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
   }
 
   it('returns immediately with callback none and only marks cancelled after cleanup', async () => {
-    const f = fixture()
+    const f = fixture(authorityBaseUrl)
     const res: any = {}
     await handleDelegateTask.call(f.host, f.req, res, 'coding-assistant')
     assert.equal(res.body.resultDelivery, 'background')
@@ -325,7 +351,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
   })
 
   it('a stopped stale signed root caller cannot fall back to foreground model execution', async () => {
-    const f = fixture()
+    const f = fixture(authorityBaseUrl)
     f.parent._runningClientMessageId = undefined
     const res: any = {}
     await handleDelegateTask.call(f.host, f.req, res, 'coding-assistant')
@@ -337,7 +363,7 @@ describe('background HTTP admission and cleanup', { concurrency: 1 }, () => {
   })
 
   it('keeps a stopped background job running until the real master Grok lease release ACK', async () => {
-    const f = fixture()
+    const f = fixture(authorityBaseUrl)
     const releaseAck = deferred<void>()
     const releaseReached = deferred<void>()
     const server = createServer((req, res) => {
