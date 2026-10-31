@@ -61,6 +61,7 @@ import {
   ADVISOR_CONSULT_PARENT_REASON,
   isAdvisorConsultParentEngine,
   stripAdvisorPreambleFromInjected,
+  detectAdvisorNoWrite,
 } from './advisorMode.js'
 import type { GatewayStreamEvent } from './ccbMessageParser.js'
 import { noteForegroundBashToolResult } from './ccbLocalAgentCallback.js'
@@ -871,8 +872,9 @@ export async function dispatchInbound(
     // ── Multimodal handling ──
     // Save all uploaded media to local disk and inject descriptive prompt hints
     // so the agent knows how to access them via MCP tools or Read.
+    const rawUserText = frame.content.text ?? ''
     const text = formatMessageReplyPrompt(
-      frame.content.text ?? '',
+      rawUserText,
       normalizeMessageReplyQuote(frame.content.replyTo),
     )
     const media = frame.content.media ?? []
@@ -1701,7 +1703,7 @@ export async function dispatchInbound(
       session._advisorTurn = advisorTurnAllowed
         ? { advisorModel: frozenAdvisorModel, configVersion: inboundConfigVersion }
         : undefined
-      session._currentTurnUserText = text ?? ''
+      session._currentTurnUserText = rawUserText
       {
         const userText = text ?? ''
         let injected = payload
@@ -2242,6 +2244,7 @@ export async function dispatchInbound(
               }
             : undefined
       const leaderSubmitOpts = {
+        readOnly: advisorTurnAllowed && detectAdvisorNoWrite(rawUserText),
         systemHelpBootstrap: getSystemHelpBootstrap(frame as object),
         historicalMessages: masterHistoricalMessages,
         codexRoute: safeCodexRoute,

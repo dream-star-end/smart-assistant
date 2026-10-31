@@ -8,6 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
+import { isAdvisorReadOnlyMcpTool } from '@openclaude/protocol'
 
 import { paths } from '@openclaude/storage'
 import { issueParentCallerToken } from '../delegateContext.js'
@@ -95,6 +96,7 @@ export interface GrokPlatformInput {
   skillEvalExclude?: string
   skillEvalDraft?: { name: string; dir: string }
   skillTrainRunId?: string
+  readOnly?: boolean
 }
 
 function tomlString(value: string): string {
@@ -151,6 +153,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),
       OPENCLAUDE_ENGINE: 'grok',
+      OPENCLAUDE_ADVISOR_READ_ONLY: input.readOnly ? '1' : '0',
       ...(process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
         ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
         : {}),
@@ -178,7 +181,7 @@ tool_timeout_sec = 600
 [mcp_servers."openclaude-memory".env]
 ${envLines}
 `
-    advertisedMcpTools.push(...GROK_MEMORY_MCP_TOOLS)
+    advertisedMcpTools.push(...GROK_MEMORY_MCP_TOOLS.filter((name) => !input.readOnly || isAdvisorReadOnlyMcpTool(name)))
   }
 
   writePrivate(join(callerDir, 'config.toml'), `${MANAGED_GROK_HEAD}${mcpToml}`)

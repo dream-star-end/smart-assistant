@@ -9047,6 +9047,73 @@
           "assertion": "proveKeeperOwnedChildren(CANDIDATE)"
         }
       ]
+    },
+    {
+      "id": "INC-20261030-ADVISOR-NOWRITE",
+      "occurredAt": "2026-10-30",
+      "severity": "P1",
+      "symptom": "uid2058 会话 webmvvde0m9oyavl3 明确要求顾问只给建议、不要改文件，主模型仍以顾问模式验证要求为由成功 Edit 提纲。禁写回合现冻结只读策略，在 CCB/Codex/Grok/Cursor 原生工具和 MCP 调用边界卸掉写入、命令和委派路径，顾问同步收到禁写约束，下一普通回合恢复工具。",
+      "rootFixCommit": "bd2545a8",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorNoWriteTurn.test.ts",
+          "assertion": "a queued normal submit cannot clear the active restricted turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyCcb.test.ts",
+          "assertion": "CCB warm transitions rebuild the tool surface and drop external MCP before user input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/advisorReadOnlyBox.test.ts",
+          "assertion": "preserves no-write tools and closes remote MCP discovery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdvisorReadOnly.test.ts",
+          "assertion": "Codex read-only turn replaces a warm process, removes native execution, and restores normal tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/mcp-memory/src/__tests__/advisorReadOnlyPolicy.test.ts",
+          "assertion": "advisor read-only MCP removes mutators and rejects direct calls before gateway or file writes"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "proveAdvisorNoWrite(root);"
+        }
+      ],
+      "coverageCommits": [
+        "c65f8b61",
+        "d2db51a3",
+        "0c9ad494",
+        "0d21054b",
+        "3c5cd019",
+        "2e508c2f",
+        "92d8086c"
+      ]
+    },
+    {
+      "id": "INC-20261030-SHARE-PREVIEW-CLEANUP",
+      "occurredAt": "2026-10-30",
+      "severity": "P2",
+      "symptom": "顾问禁写修复的完整前端门暴露既存分享预览清理缺陷：关闭或卸载弹窗后 FileReader 仍读取，延迟绘图也会新启动读取。Vitest 还原 jsdom realm 后遗留读取触发 Expected an Uint8Array 未处理异常，6624 个断言虽通过但命令失败。现清理时取消读取，并阻止失效绘图启动读取；保留正常预览与导出行为。",
+      "rootFixCommit": "9c4f805b",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ShareDialog.test.tsx",
+          "assertion": "关闭后绘图才完成时不会再启动图片读取"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "share preview cleanup aborts the native FileReader when the dialog closes"
+        }
+      ]
     }
   ]
 }
