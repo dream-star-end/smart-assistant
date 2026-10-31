@@ -2445,6 +2445,7 @@ export async function registerCommercial(
         },
         loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
@@ -2664,6 +2665,8 @@ export async function registerCommercial(
           })
         },
         expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+        logger: rootLogger.child({ subsys: "openTurnAttribution" }),
       });
       const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({

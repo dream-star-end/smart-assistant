@@ -1431,6 +1431,11 @@ export function App() {
           m.role === "plan",
         ),
       coldStart: !!activeSess._isFirstTurnAfterReady,
+      settledCredits:
+        activeSess._sendingInFlight &&
+        activeSess._turnCredits?.clientMessageId === activeSess._activeClientMessageId
+          ? activeSess._turnCredits?.settled
+          : undefined,
       agentName: agent.name || "助手",
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
     };

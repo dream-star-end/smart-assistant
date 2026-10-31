@@ -59,6 +59,8 @@ export type TurnActivityInfo = {
   agentName: string;
   /** 团队模式：队长当前正在执行的 plan step 文本（非团队模式恒 null，由 App 门控）。 */
   leaderStep?: string | null;
+  /** 进行中这一轮已结算的实扣合计，字符串积分。缺省或 0 不显示。 */
+  settledCredits?: string;
 };
 
 /**

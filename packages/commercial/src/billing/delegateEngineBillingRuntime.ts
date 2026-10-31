@@ -24,6 +24,11 @@ import {
 } from './codexFinalizer.js'
 import { settleDurableCodexBilling } from './durableCodexBilling.js'
 import {
+  attributeOpenTurn,
+  delegateOpenTurnCtx,
+  openTurnDispatchColumns,
+} from './openTurnAttribution.js'
+import {
   UnknownCapabilitySchemaError,
   type ModelCatalogSnapshot,
 } from './modelCatalog.js'
@@ -81,6 +86,9 @@ export interface DelegateEngineBillingRuntimeDeps {
     requestId: string
   }) => Promise<AdvisorCodexAdmitRoute>
   expireAdvisorCodexRoute?: (token: string) => Promise<void> | void
+  attributeOpenTurnFn?: typeof attributeOpenTurn
+  broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void
+  logger?: { warn(msg: string, fields?: Record<string, unknown>): void }
 }
 
 function requireString(
@@ -256,6 +264,14 @@ export function createDelegateEngineBillingRuntime(
           throw err
         }
         const engineSessionId = deriveEngineSessionId(sessionKey)
+        const openTurn = parentTurnKey
+          ? null
+          : await (deps.attributeOpenTurnFn ?? attributeOpenTurn)(
+              deps.getPool(),
+              { userId, containerId: BigInt(identity.containerId) },
+              deps.logger,
+            )
+        const openTurnColumns = parentTurnKey ? undefined : openTurnDispatchColumns(openTurn)
         const advisorConsult = delegateAgentId === ADVISOR_AGENT_ID && engine === 'codex'
         let advisorRoute: AdvisorCodexAdmitRoute | undefined
         if (advisorConsult) {
@@ -282,11 +298,11 @@ export function createDelegateEngineBillingRuntime(
             containerId: BigInt(identity.containerId),
             model: canonical,
             precheckCredits: precheck.maxCost,
+            ...(openTurnColumns ?? {}),
             ctxJson: {
               agentId,
               delegateAgentId,
-              ...(parentSessionId ? { parentSessionId } : {}),
-              ...(parentTurnKey ? { parentTurnKey } : {}),
+              ...delegateOpenTurnCtx({ parentSessionId, parentTurnKey, stamp: openTurn }),
               source: sourceForEngine(engine),
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
@@ -353,6 +369,7 @@ export function createDelegateEngineBillingRuntime(
             pgPool: deps.getPool(),
             preCheckRedis: deps.preCheckRedis,
             pricing: deps.pricing,
+            broadcastToUser: deps.broadcastToUser,
           },
           userId,
           {

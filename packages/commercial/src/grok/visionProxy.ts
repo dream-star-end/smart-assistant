@@ -38,6 +38,11 @@ import {
 import { scopeFromAuthz, type UserModelAuthzLoader } from "../auth/userModelAuthz.js";
 import { deriveEngineSessionId } from "../billing/codexFinalizer.js";
 import { settleDurableCodexBilling } from "../billing/durableCodexBilling.js";
+import {
+  attributeOpenTurn,
+  openTurnDispatchColumns,
+  visionOpenTurnCtx,
+} from "../billing/openTurnAttribution.js";
 import type { ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import { serializeBillingPricing } from "../billing/persistedBillingPricing.js";
 import type { PricingCache } from "../billing/pricing.js";
@@ -141,6 +146,10 @@ export interface GrokVisionHandlerDeps {
   abortInflightJournalFn?: typeof abortInflightJournal;
   releasePreCheckFn?: typeof releasePreCheck;
   readJournalForTakeoverFn?: typeof readJournalForTakeover;
+  /** Frozen at admit. A failed lookup returns null and must not be stamped. */
+  attributeOpenTurnFn?: typeof attributeOpenTurn;
+  /** Live outbound.cost_charged. Absent on replay so a replay cannot push twice. */
+  broadcastToUser?: (userId: bigint, payload: Record<string, unknown>) => void;
 }
 
 export type GrokVisionHandler = (
@@ -497,6 +506,15 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
         }
         throw err;
       }
+      // One open turn on this container owns the charge. Several, none, or a
+      // missing turn key stay unattributed. Lookup failure is not a skip stamp.
+      const openTurn = containerId === null
+        ? null
+        : await (deps.attributeOpenTurnFn ?? attributeOpenTurn)(
+            deps.getPool(),
+            { userId, containerId },
+            reqLog,
+          );
       let admitted: boolean;
       try {
         admitted = await runStartJournal(deps.getPool(), {
@@ -505,6 +523,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
           containerId,
           model: canonical,
           precheckCredits: precheck.maxCost,
+          ...(openTurnDispatchColumns(openTurn) ?? {}),
           ctxJson: {
             agentId: "vision",
             source: GROK_VISION_JOURNAL_SOURCE,
@@ -517,6 +536,9 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
             },
             upstreamModelId: upstreamModel,
             engineSessionId,
+            // chatSessionId routes the live frame. It is not parentSessionId,
+            // so the charge stays mode=chat and lands on this turn key.
+            ...visionOpenTurnCtx(openTurn),
           },
         });
       } catch (err) {
@@ -633,7 +655,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
 }
 
 async function settleGrokRun(
-  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing">,
+  deps: Pick<GrokVisionHandlerDeps, "getPool" | "preCheckRedis" | "pricing" | "broadcastToUser">,
   runSettle: typeof settleDurableCodexBilling,
   reqLog: Logger,
   userId: bigint,
@@ -641,7 +663,13 @@ async function settleGrokRun(
 ): Promise<void> {
   try {
     const outcome = await runSettle(
-      { pgPool: deps.getPool(), preCheckRedis: deps.preCheckRedis, pricing: deps.pricing, logger: reqLog },
+      {
+        pgPool: deps.getPool(),
+        preCheckRedis: deps.preCheckRedis,
+        pricing: deps.pricing,
+        logger: reqLog,
+        broadcastToUser: deps.broadcastToUser,
+      },
       userId,
       { requestId: frame.requestId, engineSessionId: frame.engineSessionId, status: "success", durationMs: frame.durationMs, usage: frame.usage },
     );

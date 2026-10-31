@@ -50,6 +50,7 @@ import {
   type VerificationSponsorshipSnapshot,
 } from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
+import { rememberOpenTurnKey, TURN_KEY_RE } from "../../billing/openTurnAttribution.js";
 import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit.js";
 import {
   UnroutableProviderError,
@@ -1860,6 +1861,21 @@ export function makeAnthropicProxyHandler(
         });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
         return;
+      }
+
+      if (dispatchIdentity && attribution.turnKey && TURN_KEY_RE.test(attribution.turnKey)) {
+        try {
+          await rememberOpenTurnKey(deps.pgPool, {
+            dispatchId: dispatchIdentity.dispatchId,
+            userId: uid,
+            turnKey: attribution.turnKey,
+          });
+        } catch (err) {
+          userLog.warn("open_turn_key_stamp_failed", {
+            dispatchId: dispatchIdentity.dispatchId,
+            err: errSummary(err),
+          });
+        }
       }
 
       // 9) 装 finalizer(settlement.handOff;从此 release 唯一调用点 = finalize)
