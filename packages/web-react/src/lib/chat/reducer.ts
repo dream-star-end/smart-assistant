@@ -1,3 +1,4 @@
+import { consumeStateReadbackCompatFinal } from "./stateErrorReadback";
 /**
  * v5 出站帧 → 消息模型**翻译 reducer**。从现网 vanilla handleOutbound + 各独立帧
  * handler 逐条复刻（websocket.js:2559-3540 主线 + 3565-4595 各 handler）。
@@ -117,18 +118,13 @@ export type FrameEffects = {
   refreshBalance?: () => void;
   /** 真 turn 失败自动上报（跳过预期业务态）。*/
   reportTurnError?: (p: { code: string; message: string; traceId?: string; sessionId?: string }) => void;
-  /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
+  /** resume_failed / reconcile：游标已推进后，读一次权威历史。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
    * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
    * 等 live 尾巴与真 final 自然收口,期满仍未收口再按 reconcile 收口。缺省/false → 立即收口(旧行为)。
    */
   deferTapeCommitFinal?: (sessId: string, frame: OutboundMessageWire) => boolean;
-  /**
-   * reconcile 'turn_state_unknown'(RFC §4):server 无法判定在飞 turn 终态。**绝不清发送态**,
-   * 由 socket 把该会话 thinking-safety 定时降至 60s(默认 10min),尽快复检服务端权威态。
-   */
-  onTurnStateUnknown?: (sessId: string) => void;
   /**
    * 立即把会话快照落 IndexedDB（断点续传游标 durable）。resume_failed 推进游标后必须
    * 同步落地：否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环。
@@ -1608,9 +1604,8 @@ export function applyOutboundMessage(
   // ── reconcile 'turn_state_unknown'(非 final,RFC §4)──
   // hello 对账时 server 对客户端上报的在飞 turn **无法给出终态**(durable inbox 无行且不是
   // negative proof)。此时**绝不清 _sendingInFlight** —— turn 可能仍在服务端执行,静默清态正是
-  // 本 RFC 要根治的丢 turn 症状。改为:① 立即 REST 全量对账拉回权威态
-  // (含 durable dispatch 状态行);② 请 socket 把 thinking-safety 定时降至 60s(默认
-  // 10min),尽快让用户看到真实终态或经核验的错误状态。
+  // 本 RFC 要根治的丢 turn 症状。改为立即对账拉回权威态(含 durable dispatch 状态行);
+  // 随 hello 下发的会话快照同样给出该回合的权威状态。
   // markFrameReceived 计活(server 确在应答),但不触碰 turn 生命周期。到达此处已过 cross-turn
   // 守卫:frame.clientMessageId 要么命中 active、要么本地无 active/legacy 无 id,均安全放行。
   if (!frame.isFinal && frame.meta?.reconcile === "turn_state_unknown") {
@@ -1618,7 +1613,6 @@ export function applyOutboundMessage(
     const clientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
     if (clientMessageId) effects.forceSync?.(sess.id, { clientMessageId });
     else effects.forceSync?.(sess.id);
-    effects.onTurnStateUnknown?.(sess.id);
     return;
   }
 
@@ -1637,6 +1631,11 @@ export function applyOutboundMessage(
   ) {
     suppressLegacyErrorText = true;
     sess._suppressErrorBubbleAtSeq = undefined;
+  }
+  if (suppressLegacyErrorText && consumeStateReadbackCompatFinal(sess, frame)) {
+    markFrameReceived(sess);
+    effects.persistSession?.(sess.id);
+    return;
   }
   // 红卡已被延后(master 拥有自动恢复):这条兼容 [error] final 只是终结符,**不得**清发送态 /
   // retrying 软状态,否则「正在重试中」会在裁决到达前闪成空闲。socket 的 outbound.error 分支已
@@ -1713,15 +1712,12 @@ export function applyOutboundMessage(
     // live 尾巴之前到达。此处若立即收口,resetReplyTracker 把截止戳定在本帧 server ts,随后到达的
     // 尾巴帧(ts 更早)全被 stale 守卫丢弃 → 本轮显示「已完成」但正文停在半句,约 1s 后 REST 对账才补齐。
     // 本轮仍在流式时交给 socket 宽限等待真 final;hello/reconciler 的 reconcile 不带该来源,行为不变。
-    // OCV5-427:刷新/重连后本轮正经 active_turn_replay_start 重读,尾巴排在成百上千条积压重放帧之后,
-    // 宽限期内等不到 → 不等,立即收口并走下方 onFinal 的精确 REST 对账(tape 已提交,历史即完整)。
     if (
       frame.meta?.reconcile === "turn_completed" &&
       frame.meta?.reconcileSource === "tape_commit" &&
       frameCmid &&
       frameCmid === active &&
       sess._sendingInFlight &&
-      sess._resumeReplayClientMessageId !== frameCmid &&
       effects.deferTapeCommitFinal?.(sess.id, frame) === true
     ) {
       return;
@@ -2556,7 +2552,11 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
       sess._turnStartedAt = frame.meta.since;
     }
   }
-  if (frame.meta?.credits) sess._turnCredits = { ...frame.meta.credits };
+  const clientMessageId = sess._activeClientMessageId;
+  if (frame.meta?.credits && clientMessageId &&
+    (frame.clientMessageId === undefined || frame.clientMessageId === clientMessageId)) {
+    sess._turnCredits = { clientMessageId, ...frame.meta.credits, receivedAt: Date.now() };
+  }
 }
 
 // ═══════════════ outbound.turn_usage（权威实时 token 快照）═══════════════
@@ -2737,6 +2737,13 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
       m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid &&
       (m._source === "server" || !!m._turnTapeId));
     if (adopted) return false;
+    // The decision is final: release every card of this turn freezeErrorCardSnapshots held for it
+    // (the verified status record too), or a status record that supersedes the red card hides both.
+    for (const m of sess.messages) {
+      if (m._clientMessageId !== cmid || m._errorHeldForRecovery !== true || m.role === "assistant") continue;
+      m._errorHeldForRecovery = undefined;
+      commitErrorCardSnapshot(m);
+    }
     const existing = sess.messages.find((m) =>
       m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode);
     if (existing?._errorCardSnapshot?.disposition === "card") return false;
@@ -2835,6 +2842,11 @@ function settleCancelFencedTerminalError(
     : undefined;
   if (exactUser && exactUser.status !== "replied") exactUser.status = "sent";
   effects.persistSession?.(sess.id);
+}
+
+/** State readback claims the same cursor/stale gate before holding a terminal error. */
+export function claimStateErrorFrame(sess: ChatSession, frame: { clientMessageId?: string; frameSeq?: number; sessionKey?: string }): boolean {
+  return !shouldSuppressStaleOutboundError(sess, frame) && acceptFrameSeq(sess, frame);
 }
 
 export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
@@ -3014,7 +3026,6 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
   } else {
     advanceFrameSeqCursorTo(sess, frame, frameTo); // 推游标到 server currentLast（防 reload 死循环，配 dbPut）
   }
-  sess._liveStreamBroken = true;
   effects.persistSession?.(sess.id); // 立即落地仲裁后的游标（dbPut 写点；防 reload 死循环）
   effects.forceSync?.(sess.id);
 }
@@ -3066,11 +3077,15 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     if (seen.size > 512) seen.delete(seen.values().next().value!);
   }
   applyTurnCostReminder(sess, requestId, add);
-  if (sess._sendingInFlight && add !== null) {
+  const activeCmid = sess._activeClientMessageId;
+  if (sess._sendingInFlight && activeCmid && add !== null) {
+    const previous = sess._turnCredits?.clientMessageId === activeCmid ? sess._turnCredits : undefined;
     let settled = add;
-    try { settled += BigInt(sess._turnCredits?.settled ?? "0"); } catch { /* old local state */ }
+    try { settled += BigInt(previous?.settled ?? "0"); } catch { /* old local state */ }
+    const now = Date.now();
     sess._turnCredits = {
-      settled: settled.toString(), requests: (sess._turnCredits?.requests ?? 0) + 1, asOf: Date.now(),
+      clientMessageId: activeCmid, settled: settled.toString(), requests: (previous?.requests ?? 0) + 1,
+      asOf: now, receivedAt: now,
     };
   }
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。

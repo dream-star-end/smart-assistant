@@ -1593,9 +1593,19 @@ export const api = {
     id: string,
     after = "0",
     limit = 200,
-    opts?: { signal?: AbortSignal; timeoutMs?: number },
+    opts?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      /** Session snapshot cursor: afterSeq pairs with streamKey; dispatch is the in-flight cmid. */
+      snapshot?: { afterSeq: number; streamKey?: string; dispatch?: string };
+    },
   ): Promise<DurableLiveFramePage> => {
     const params = new URLSearchParams();
+    if (opts?.snapshot) {
+      params.set("afterSeq", String(opts.snapshot.afterSeq));
+      if (opts.snapshot.streamKey) params.set("streamKey", opts.snapshot.streamKey);
+      if (opts.snapshot.dispatch) params.set("dispatch", opts.snapshot.dispatch);
+    }
     // First shot uses after=0 (LIVE_JOURNAL_OPEN_CURSOR). seek=tail is
     // opt-in only — do not send it as the open-session default.
     if (after === "tail") {
