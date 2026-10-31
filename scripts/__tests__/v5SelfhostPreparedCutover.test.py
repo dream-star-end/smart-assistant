@@ -421,6 +421,22 @@ DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"; DEPLOY_BUILT_SOURCE_COMMIT="$SHA"
         self.assertEqual(history[-1]['masterRelease'], str(self.new))
         self.assertEqual(history[-1]['previousMasterRelease'], str(self.old))
 
+    def test_descendant_tip_still_runs_real_cutover_for_fully_prepared_old_sha(self):
+        self.h.advance()
+        next_sha = self.h.git('rev-parse', 'HEAD')
+        self.cutover(ok=True)
+        self.assert_new_runtime()
+        self.assertEqual(json.loads((self.new / '.complete').read_text())['sourceCommit'], self.h.sha)
+        runtime = Path(self.tuple()['OC_RUNTIME_RELEASE'])
+        self.assertEqual(json.loads((runtime / 'MANIFEST.json').read_text())['sourceCommit'], self.h.sha)
+        self.assertEqual(self.h.git('rev-parse', 'HEAD'), next_sha)
+        self.assertFalse(self.h.receipt.exists())
+        self.assertFalse((self.t / 'prepared' / (next_sha + '.json')).exists())
+        for event in ('E1', 'E2', 'forward-smoke', 'phase:committed', 'durable-disarm'):
+            self.assertIn(event, self.events())
+        self.assertNotIn('build', self.events())
+        self.assertEqual(self.events().count('gc'), 2)
+
     def test_success_cannot_consume_receipt_for_a_different_master(self):
         # Simulates another prepared publication after entering flip. The consume
         # API must bind exact master path, and pending state must defer artifact GC.

@@ -85,6 +85,11 @@ jobs:
           INCIDENT_LEDGER_BASE_REF: ${{ steps.base.outputs.ref }}
         run: npx tsx scripts/check-incident-ledger-superset.ts
 
+      - name: Install isolated release fixture dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sqlite3 jq rsync
+
       - name: Prepare and flip lane isolation (temporary git, locks and artifacts only)
         run: |
           sudo env "PATH=$PATH" python3 scripts/__tests__/v5SelfhostPrepare.test.py
@@ -102,8 +107,6 @@ jobs:
 
       - name: Selfhost tip prewarm and artifact reuse regressions
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends sqlite3 jq rsync
           sudo node --test scripts/__tests__/v5SelfhostPrewarm.node-test.mjs scripts/__tests__/v5SelfhostDeploySpeed.node-test.mjs scripts/__tests__/selfhostSourcePin.node-test.mjs
 
       - name: P2 trace propagation and durable evidence (OCV5-605)
