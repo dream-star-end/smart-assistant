@@ -7916,7 +7916,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-success-recovery.ts",
-          "assertion": "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery"
+          "assertion": "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error recovered only through fresh master admission and a safe checkpoint"
         }
       ]
     },
