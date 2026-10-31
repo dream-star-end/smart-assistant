@@ -4,11 +4,13 @@ import { afterEach, describe, expect, test } from "vitest";
 import { MediaSignProvider } from "./chat/media";
 import { ToolCard } from "./ToolCard";
 import { TooltipProvider } from "./ui/Tooltip";
+import { preloadQuietContext } from "./chat/lazyQuietContext";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
 // These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
 loadBeforeAll(preloadToolBody);
+loadBeforeAll(preloadQuietContext);
 
 afterEach(cleanup);
 

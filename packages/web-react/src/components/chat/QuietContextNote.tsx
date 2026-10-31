@@ -1,5 +1,5 @@
 import { Tooltip } from "../ui/Tooltip";
-import { contextCompactionTokenCounts, type ToolLike } from "../tool/format";
+import { isContextCompactionMessage, normalizeToolForDisplay, type ToolLike } from "../tool/format";
 
 export const QUIET_CONTEXT_LINE = "已在后台整理较早的对话";
 export const QUIET_CONTEXT_EXPLANATION =
@@ -9,8 +9,18 @@ function groupDigits(value: number): string {
   return Math.abs(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
+function roundedCount(value: unknown): number | null {
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) value = Number(value);
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.round(value);
+}
+
+/** 整理前后的 token 数。缺一侧就不凑对，不展示半句。 */
 export function quietContextDetail(message: ToolLike): string {
-  const { before, after } = contextCompactionTokenCounts(message);
+  if (!isContextCompactionMessage(message)) return QUIET_CONTEXT_EXPLANATION;
+  const input = normalizeToolForDisplay(message).input;
+  const before = roundedCount(input?.tokensBefore ?? input?.beforeTokens);
+  const after = roundedCount(input?.tokensAfter ?? input?.afterTokens);
   if (before == null || after == null) return QUIET_CONTEXT_EXPLANATION;
   return `${QUIET_CONTEXT_EXPLANATION} 整理前约 ${groupDigits(before)} / 整理后约 ${groupDigits(after)}`;
 }

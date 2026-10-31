@@ -29,8 +29,8 @@ async function until(label, predicate, ms = 20_000) {
 }
 
 async function revealCompletedTool(page) {
-  // Real process UI has two disclosure levels: the turn shell and its tool
-  // group. Both deliberately unmount their children while collapsed.
+  // Real process UI has three disclosure levels: the turn shell, its tool
+  // group, and the UI-3 step row. Each unmounts its children while collapsed.
   for (const toggle of await page.getByTestId('process-toggle').all()) {
     if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
   }
@@ -38,6 +38,10 @@ async function revealCompletedTool(page) {
   for (const toggle of await page.getByTestId('process-detail-toggle').all()) {
     if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
   }
+  const stepRow = page.getByTestId('process-step-row').filter({ hasText: LONGTASK_TOOL_FILE }).first();
+  await stepRow.waitFor();
+  const stepToggle = stepRow.getByRole('button').first();
+  if (await stepToggle.getAttribute('aria-expanded') === 'false') await stepToggle.click();
   const step = page.getByTestId('tool-step').filter({ hasText: LONGTASK_TOOL_FILE });
   await step.waitFor();
   await step.getByText(LONGTASK_TOOL_FILE, { exact: false }).waitFor();

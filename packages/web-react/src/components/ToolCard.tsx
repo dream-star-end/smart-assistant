@@ -32,7 +32,7 @@ import {
   useArtifactInspect,
   useArtifactInspectActive,
 } from "./tool/context";
-import { QuietContextNote } from "./chat/QuietContextNote";
+import { QuietContextNote } from "./chat/lazyQuietContext";
 import {
   type ToolLike,
   isContextCompactionMessage,

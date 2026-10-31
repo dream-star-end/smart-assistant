@@ -93,23 +93,6 @@ export function isContextCompactionMessage(message: { toolName?: string | null }
   );
 }
 
-function roundedCount(value: unknown): number | null {
-  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) value = Number(value);
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
-  return Math.round(value);
-}
-
-/** 整理前后的 token 数。缺一侧就不凑对，调用方不展示半句。 */
-export function contextCompactionTokenCounts(message: ToolLike): { before: number | null; after: number | null } {
-  if (!isContextCompactionMessage(message)) return { before: null, after: null };
-  const input = normalizeToolForDisplay(message).input;
-  if (!input) return { before: null, after: null };
-  return {
-    before: roundedCount(input.tokensBefore ?? input.beforeTokens),
-    after: roundedCount(input.tokensAfter ?? input.afterTokens),
-  };
-}
-
 function asPlainObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }

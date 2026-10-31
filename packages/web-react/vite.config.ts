@@ -121,12 +121,9 @@ function forbidTaskboardEntryImport(): Plugin {
  * 460.0KB(FIRST_SCREEN_GZIP_BUDGET=471040),来自 #1095 OD 收窄合入后的入口闭包。不改告警
  * (硬拒语义保留、其它门禁不动);按既有公式「实测上取整到 10KB」上调阈值:
  * ceil(460.6/10)*10 = 470.0KB = 481280(~9.4KB 余量)。可逆:改回常量即恢复。
- * 2026-10-30 后台整理只留淡灰一行:过程壳在首屏闭包里,不能再拆出去。个人 tip 实测
- * 481102/481280,余量只剩 178。加上这一行后实测 470.4KB,超过 470.0KB。不按 10KB 进位
- * (那会放出约 10KB);只加 1KB 到 471.0KB = 482304。可逆:改回 481280 即恢复。
  * 纯函数与单测在 src/lib/firstScreenBudget。
  */
-const FIRST_SCREEN_GZIP_BUDGET = 482304;
+const FIRST_SCREEN_GZIP_BUDGET = 481280;
 
 function firstScreenBudget(): Plugin {
   return {

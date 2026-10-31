@@ -22,10 +22,9 @@ import path from "node:path";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import {
   getSkillEmbeddingProvider,
-  isSkillEmbeddingAvailable,
   skillEmbeddingBackendId,
-  skillEmbeddingConfigFromEnv,
 } from "@openclaude/storage";
+import { resolvePlatformSkillEmbeddingConfig } from "../openai/platformSkillEmbedding.js";
 import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import { getLiteratureConfig } from "../admin/literatureConfig.js";
 import {
@@ -742,16 +741,17 @@ async function handleIngest(
  * (hash 的是 skill 规范 JSON)天然不冲突(sha256 不同前像)。研究 ops 不按 token 计费,
  * embedding 走平台 key + 缓存摊薄 → 不增用户成本(铁律②)。
  */
-function buildLitragSemanticDeps(cfg: ResearchConfigPublic): SemanticQueryDeps | undefined {
+async function buildLitragSemanticDeps(cfg: ResearchConfigPublic): Promise<SemanticQueryDeps | undefined> {
   if (cfg.config.litrag.embedBackend !== "http") return undefined;
-  if (!isSkillEmbeddingAvailable()) return undefined;
+  const embedCfg = await resolvePlatformSkillEmbeddingConfig();
+  if (!(embedCfg.apiKey ?? "").trim()) return undefined;
   // 复用共享 singleton provider(与 marketplaceSearch/internalSkillEmbed 同一权威),
   // dispatcher 首次初始化时锁定直连(DashScope 国内端点须绕过全局海外代理)。
   const provider = getSkillEmbeddingProvider({
-    ...skillEmbeddingConfigFromEnv(),
+    ...embedCfg,
     dispatcher: directEgressDispatcher(),
   });
-  const backendId = `${skillEmbeddingBackendId()}/${provider.modelId}`;
+  const backendId = `${skillEmbeddingBackendId(embedCfg.baseUrl)}/${provider.modelId}`;
   const dim = provider.dimensions;
   const cache = makePgSkillEmbedCache();
   return {
@@ -820,7 +820,7 @@ async function handleLitragQuery(
     { topK },
     {
       getDocument: store.getDocument,
-      semantic: buildLitragSemanticDeps(cfg),
+      semantic: await buildLitragSemanticDeps(cfg),
     },
   );
   if (projectId) {

@@ -141,6 +141,7 @@ import {
   _consumeRateLimitsForEmit as _consumeRateLimitsForEmitImpl,
   emitResult as emitResultImpl,
 } from './codexAppServerNotifications.js'
+import { rememberImageStderr, redactImageUpstream } from './imageGenerationFailure.js'
 export {
   isMissingRolloutError,
   isGoalAlreadyClearedError,
@@ -2205,7 +2206,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.resetCallUsageAttribution()
     this.attemptHadObservableOutput = false
     this.attemptHadToolOrPermission = false
-    this.attemptEmittedTerminal = false
+    this.attemptEmittedTerminal = false; rememberImageStderr(this, null)
   }
 
   /**
@@ -2217,9 +2218,9 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!ignoreIdentity && this.proc !== proc) return
     const result = this.relayDeniedTracker.consume(chunk)
     for (const line of result.completeLines) {
-      log.warn('codex app-server stderr', {
+      rememberImageStderr(this, line); log.warn('codex app-server stderr', {
         sessionKey: this.opts.sessionKey,
-        line: line.slice(0, 1024),
+        line: redactImageUpstream(line).slice(0, 1024),
       })
     }
     if (result.deniedLines > 0) {

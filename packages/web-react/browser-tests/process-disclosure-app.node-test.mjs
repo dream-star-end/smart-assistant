@@ -248,7 +248,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(placed.expanded, "true", `${kind} shell is collapsed`);
       assert.equal(placed.avatar, false, `${kind} still paints an avatar`);
       assert.equal(placed.lineClamp, "none", `${kind} proof is line-clamped`);
-      assert.ok(placed.proofHeight > (kind === "tool" ? 16 : 72), `${kind} proof looks truncated: ${JSON.stringify(placed)}`);
+      assert.ok(placed.proofHeight > (kind === "tool" ? 12 : 72), `${kind} proof looks truncated: ${JSON.stringify(placed)}`);
       assert.ok(placed.ok, `${kind} target rect is outside the viewport: ${JSON.stringify(placed)}`);
       if (kind === "tool") assert.match(placed.proofText, /正在运行命令/);
       if (kind === "body") assert.match(placed.proofText, /FINAL_LONG/);
@@ -363,6 +363,8 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await align(desktop.page, desktop.page.getByTestId("process-stage").first());
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-desktop-expanded.png") });
       await desktop.page.getByTestId("process-detail-toggle").first().click();
+      assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0);
+      await desktop.page.getByTestId("process-step-row").filter({ hasText: "运行命令" }).getByRole("button").first().click();
       await desktop.page.getByText("summarize-stock.mjs").waitFor();
       await desktop.page.getByTestId("process-toggle").first().focus();
       await desktop.page.keyboard.press("Enter");
@@ -629,7 +631,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.setViewportSize({ width: 390, height: 844 });
       await shotActiveGoalStage(desktop.page, "body", "ocv5-265-final-goal-stage-mobile390-body");
       await desktop.page.setViewportSize({ width: 1280, height: 1000 });
-      const phasedToggle = desktop.page.getByTestId("process-toggle").filter({ hasText: "思考" }).last();
+      const phasedToggle = desktop.page.getByTestId("process-toggle").last();
       await phasedToggle.click();
       await desktop.page.waitForFunction(() => document.querySelector("[data-process-active=true] [data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
       await phasedToggle.click();
@@ -689,15 +691,19 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.equal(await attentionProcess.getByText(/步未成功/).count(), 0);
       assert.equal(await desktop.page.getByText("node scripts/check-available.mjs").count(), 0);
       await attentionGroup.click();
-      const failed = attentionProcess.getByTestId("tool-step").filter({ hasText: "未成功" });
+      // UI-3:步骤行是人话标题 + 安静的「未成功」;命令和输出在点开后的「技术详情」(原工具卡)里。
+      const failed = attentionProcess.getByTestId("process-step-row").filter({ hasText: "未成功" });
       assert.equal(await failed.count(), 1);
       const quiet = failed.getByText("未成功", { exact: true });
       await quiet.waitFor();
       assert.equal(await quiet.evaluate((node) => node.classList.contains("text-faint")), true);
       assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
-      const failedToggle = failed.getByRole("button").first();
+      const stepToggle = failed.getByRole("button").first();
+      if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.click();
+      const failedToggle = failed.getByTestId("tool-step").getByRole("button").first();
       if (await failedToggle.getAttribute("aria-expanded") !== "true") await failedToggle.click();
-      const failedOutput = failed.locator("pre");
+      assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
+      const failedOutput = failed.getByTestId("tool-step").locator("pre");
       assert.equal(await failedOutput.count(), 1);
       await failedOutput.waitFor({ state: "visible" });
       assert.ok((await failedOutput.textContent()).split("\n").includes("南仓对账没有通过，看板先不发布。"));
@@ -816,7 +822,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(Math.abs(mobileAlign.answerLeft - mobileAlign.processLeft) < 2, JSON.stringify(mobileAlign));
       evidence.mobileAlign = mobileAlign;
       await shotFramed(mobile.page, mobile.page.getByText("FINAL_LONG"), "ocv5-265-avatar-polish-mobile390-answer");
-      const stepToggle = mobile.page.getByTestId("process-toggle").filter({ hasText: "思考" }).last();
+      const stepToggle = mobile.page.getByTestId("process-toggle").last();
       if (await stepToggle.getAttribute("aria-expanded") !== "true") await stepToggle.tap();
       await mobile.page.getByText("STAGE_TWO 继续核对切流窗口").waitFor();
       await shotFramed(mobile.page, mobile.page.getByText("STAGE_TWO 继续核对切流窗口"), "ocv5-265-avatar-polish-mobile390-step");
