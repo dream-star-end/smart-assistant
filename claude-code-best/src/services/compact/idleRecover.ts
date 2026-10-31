@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import type { UUID } from 'crypto'
 import type { Message, UserMessage, SystemCompactBoundaryMessage } from '../../types/message.js'
 import type { CompactionResult } from './compact.js'
+import { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } from './postCompactProjection.js'
 import { groupMessagesByApiRound } from './grouping.js'
 
 export const IDLE_COMPACT_INSTRUCTIONS =
@@ -450,7 +451,6 @@ export async function runIdleCompact(input: {
   // idle turn's own committed capsule matches. A later call applies it.
   if (resumed.freshSummary) return 'prepared'
   if (!resumed.file.summaryText) throw new Error('IDLE_HISTORY_PENDING')
-  const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
   const built = buildIdleCompactionResult(resumed.file, input.messages, annotateBoundaryWithPreservedSegment)
   const result: CompactionResult = resumed.file.frozenTail.length === 0
     ? built.result
