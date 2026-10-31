@@ -823,6 +823,19 @@ RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       rm -rf "$archive" "$smoke_home"; \
     else echo "[runtime] skip Antigravity CLI install (OC_INCLUDE_ANTIGRAVITY=0)"; fi
 
+# 图表中文。fonts-noto-cjk 与 fonts-wqy-zenhei 已在前面的 apt 层，matplotlib
+# 不用 fontconfig，默认 DejaVu/STIX 缺中文字形，标题/坐标/图例会画成方框。
+# 这里只加 site matplotlibrc，并改写会覆盖 rc 的 SciencePlots / seaborn 字体名单。
+# 不新增字体包。本层文件 <10KB，镜像体积增量是一个小层（几十 KB 量级）。
+# 生效要随 runtime 镜像重建。需管家确认镜像发布。现有容器不会自动换上。
+COPY --chown=root:root ./runtime/matplotlibrc /usr/local/share/openclaude/matplotlibrc
+COPY --chown=root:root ./runtime/enable-cjk-matplotlib.py /usr/local/lib/openclaude/enable-cjk-matplotlib.py
+COPY --chown=root:root ./runtime/check-cjk-matplotlib.py /usr/local/lib/openclaude/check-cjk-matplotlib.py
+ENV MATPLOTLIBRC=/usr/local/share/openclaude/matplotlibrc
+RUN python3 /usr/local/lib/openclaude/enable-cjk-matplotlib.py \
+    && MPLCONFIGDIR=/tmp/oc-cjk-mpl-cache python3 /usr/local/lib/openclaude/check-cjk-matplotlib.py --out /tmp/oc-cjk-mpl \
+    && rm -rf /tmp/oc-cjk-mpl /tmp/oc-cjk-mpl-cache
+
 # ------------------------------------------------------------
 # 源码 embed(条件化 OC_EMBED_SOURCE,多阶段选择实现条件 COPY)
 # ------------------------------------------------------------
