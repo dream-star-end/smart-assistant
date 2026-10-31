@@ -5069,7 +5069,8 @@ export class ChatSocket {
   }
 
   private readbackStateError(sess: ChatSession, frame: OutboundErrorWire | LegacyBridgeErrorWire): boolean {
-    const epoch = this.lifecycleEpoch, cmid = frame.clientMessageId;
+    const epoch = this.lifecycleEpoch;
+    const cmid = frame.clientMessageId;
     return attemptStateErrorReadback(sess, frame, {
       accept: () => claimStateErrorFrame(sess, frame),
       read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess && this.lifecycleEpoch === epoch &&
