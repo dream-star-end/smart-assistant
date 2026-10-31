@@ -17,6 +17,7 @@ import {
   type OutboundContentBlock,
   synthesizeEmptyFailedToolPreview,
   isAdvisorReadOnlyMcpTool,
+  stripUntrustedDataForDisplay,
 } from '@openclaude/protocol'
 import { type OpenClaudeConfig, paths } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -2335,7 +2336,8 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.silentToolIds.delete(id)) return
     const tool = ctx.tools.get(id); if (!tool || tool.completed) return
     const { output, outputJson } = toolOutputOf(event); const isError = toolFailed(event)
-    let preview = output.slice(0, 500)
+    const shown = stripUntrustedDataForDisplay(output)
+    let preview = shown.slice(0, 500)
     if (isError && !preview.trim()) {
       preview = synthesizeEmptyFailedToolPreview({
         toolName: tool.toolName,
@@ -2346,9 +2348,9 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     }
     const terminationReason = isError ? 'tool_error' as const : undefined
     const exitCode = cursorToolKindOf(event) === 'shellToolCall' ? shellIoOf(event).exitCode : undefined
-    Object.assign(tool, { output: preview || output, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
+    Object.assign(tool, { output: preview || shown, outputJson: structuredClone(outputJson), completed: true, isError, durationMs: Date.now() - (ctx.startedTools.get(id) ?? Date.now()), ts: Date.now() }); ctx.pending.delete(id)
     if (ctx.pending.size === 0) this.stopPendingKeepalive()
-    ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || output, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
+    ctx.params.onEvent({ kind: 'block', block: { kind: 'tool_result', toolUseBlockId: id, toolName: tool.toolName, isError, output: preview || shown, outputJson: structuredClone(outputJson), preview } }); ctx.params.onEvent({ kind: 'tool_result_detected', result: { toolUseId: id, toolName: tool.toolName, preview, isError, durationMs: tool.durationMs, inputPreview: tool.inputPreview, ...(exitCode !== undefined ? { exitCode } : {}), ...(terminationReason ? { terminationReason } : {}) } })
   }
   private abortTurnForCredits(ctx: TurnCtx): void {
     if (ctx.terminal || ctx.creditExhausted) return

@@ -16,6 +16,7 @@ import {
   type TurnTokenUsageSnapshot,
   isToolExitCode,
   isToolTerminationReason,
+  stripUntrustedDataForDisplay,
 } from '@openclaude/protocol'
 import type {
   DetectedToolResult,
@@ -1439,7 +1440,8 @@ export class CcbMessageParser {
         } else {
           preview = JSON.stringify(previewRaw ?? '')
         }
-        const fullOutput = preview
+        const fullOutput = stripUntrustedDataForDisplay(preview)
+        preview = fullOutput
         if (preview.length > 3000) preview = `${preview.slice(0, 3000)}…`
         const block: Record<string, unknown> = {
           kind: 'tool_result',

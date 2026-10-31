@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
-import type { InboundFrame, OutboundMessage } from '@openclaude/protocol'
+import { formatMessageReplyPrompt, type InboundFrame, type OutboundMessage } from '@openclaude/protocol'
 
 import { Gateway, PerTurnDelegationGuard } from '../server.js'
 
@@ -100,12 +100,13 @@ test('message reply snapshot is derived into the engine prompt without replacing
 
   await gateway.dispatchInbound(frame)
 
-  assert.deepEqual(gateway.submittedPayloads, [[
-    '[被引用的历史消息｜发送者：助手｜消息ID：assistant-42｜原文字符数：6]',
-    '完整历史回答',
-    '[用户当前消息]',
-    '请解释这一段',
-  ].join('\n')])
+  assert.deepEqual(gateway.submittedPayloads, [
+    formatMessageReplyPrompt('请解释这一段', {
+      messageId: 'assistant-42',
+      role: 'assistant',
+      text: '完整历史回答',
+    }),
+  ])
 })
 
 function liveEvents(): any[] {

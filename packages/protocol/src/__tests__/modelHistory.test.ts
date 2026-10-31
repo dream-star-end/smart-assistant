@@ -11,6 +11,7 @@ import {
   resolveModelHistoryContextWindow,
   sanitizePersistedModelHistoryText,
 } from '../modelHistory.js'
+import { wrapUntrustedData } from '../instructionAuthority.js'
 import {
   formatMessageReplyPrompt,
   normalizeMessageReplyQuote,
@@ -31,9 +32,9 @@ test('tool text/output aliases appear once in semantic sidecar and token estimat
     text: marker,
     output: marker,
   })
-  assert.equal(semantic, `Tool: Bash\nOutput: ${marker}`)
+  assert.equal(semantic, `Tool: Bash\nOutput: ${wrapUntrustedData('tool_result', marker)}`)
   assert.equal(semantic.split('REAL-BASH-').length - 1, 1)
-  assert.equal(estimateModelHistoryTokens(semantic), estimateModelHistoryTokens(`Tool: Bash\nOutput: ${marker}`))
+  assert.equal(estimateModelHistoryTokens(semantic), estimateModelHistoryTokens(`Tool: Bash\nOutput: ${wrapUntrustedData('tool_result', marker)}`))
 })
 
 test('a distinct tool summary remains alongside the exact output', () => {
@@ -41,7 +42,7 @@ test('a distinct tool summary remains alongside the exact output', () => {
     modelHistorySemanticText({
       id: 'tool-2', role: 'tool', toolName: 'Fetch', text: 'HTTP 200', output: 'full body',
     }),
-    'Tool: Fetch\nSummary: HTTP 200\nOutput: full body',
+    `Tool: Fetch\nSummary: HTTP 200\nOutput: ${wrapUntrustedData('tool_result', 'full body')}`,
   )
 })
 
@@ -116,7 +117,7 @@ test('reply snapshots normalize through an allow-list and share one deterministi
   })
   const expected = [
     '[被引用的历史消息｜发送者：助手｜消息ID：assistant-42｜原文字符数：6]',
-    '完整历史回答',
+    wrapUntrustedData('quote', '完整历史回答'),
     '[用户当前消息]',
     '请解释这一段',
   ].join('\n')

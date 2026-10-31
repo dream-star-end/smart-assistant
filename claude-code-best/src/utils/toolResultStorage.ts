@@ -23,6 +23,7 @@ import { formatFileSize } from './format.js'
 import { logError } from './log.js'
 import { getProjectDir } from './sessionStorage.js'
 import { jsonStringify } from './slowOperations.js'
+import { sealToolResultContent } from '../../../packages/protocol/src/instructionAuthority.js'
 
 // Subdirectory name for tool results within a session
 export const TOOL_RESULTS_SUBDIR = 'tool-results'
@@ -293,10 +294,10 @@ async function maybePersistLargeToolResult(
     logEvent('tengu_tool_empty_result', {
       toolName: sanitizeToolNameForAnalytics(toolName),
     })
-    return {
+    return presentToolResultToModel({
       ...toolResultBlock,
       content: `(${toolName} completed with no output)`,
-    }
+    })
   }
   // Narrow after the emptiness guard — content is non-nullish past this point.
   if (!content) {
@@ -305,7 +306,7 @@ async function maybePersistLargeToolResult(
 
   // Skip persistence for image content blocks - they need to be sent as-is to Claude
   if (hasImageBlock(content)) {
-    return toolResultBlock
+    return presentToolResultToModel(toolResultBlock)
   }
 
   const size = contentSize(content)
@@ -313,14 +314,14 @@ async function maybePersistLargeToolResult(
   // Use tool-specific threshold if provided, otherwise fall back to global limit
   const threshold = persistenceThreshold ?? MAX_TOOL_RESULT_BYTES
   if (size <= threshold) {
-    return toolResultBlock
+    return presentToolResultToModel(toolResultBlock)
   }
 
   // Persist the entire content as a unit
   const result = await persistToolResult(content, toolResultBlock.tool_use_id)
   if (isPersistError(result)) {
-    // If persistence failed, return the original block unchanged
-    return toolResultBlock
+    // Persistence failed. Still fence the text the model is about to read.
+    return presentToolResultToModel(toolResultBlock)
   }
 
   const message = buildLargeToolResultMessage(result)
@@ -335,7 +336,16 @@ async function maybePersistLargeToolResult(
     thresholdUsed: threshold,
   })
 
-  return { ...toolResultBlock, content: message }
+  return presentToolResultToModel({ ...toolResultBlock, content: message })
+}
+
+function presentToolResultToModel(
+  block: ToolResultBlockParam,
+): ToolResultBlockParam {
+  return {
+    ...block,
+    content: sealToolResultContent(block.content),
+  }
 }
 
 /**

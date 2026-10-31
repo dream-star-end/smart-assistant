@@ -13,7 +13,7 @@ import type { Readable } from 'node:stream'
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
+import { stripUntrustedDataForDisplay, synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type {
@@ -1135,7 +1135,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       }
       return undefined
     })()
-    const output =
+    const output = stripUntrustedDataForDisplay(
       isError && !rawOutput.trim()
         ? synthesizeEmptyFailedToolPreview({
             toolName: tool.toolName,
@@ -1143,7 +1143,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
             taskId,
             status,
           })
-        : rawOutput
+        : rawOutput,
+    )
     tool.output = output
     tool.outputJson = structuredClone(outputJson)
     tool.completed = true
