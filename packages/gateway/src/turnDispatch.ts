@@ -106,7 +106,7 @@ export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: st
         type: 'error',
         code: 'MODEL_AUTHORITY_REJECTED',
         error: 'model authority rejected',
-        ...(correlated ? {
+        ...(correlated && dispatch ? {
           clientMessageId: frame.clientMessageId, peer: { id: peer.id, kind: 'dm' },
           dispatchId: dispatch.dispatchId, attemptNo: dispatch.attemptNo,
           authorityExpired: code === 'expired',

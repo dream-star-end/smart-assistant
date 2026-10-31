@@ -25,7 +25,7 @@ test('OCV5-682: expired refusal requests durable negative proof, stale or accept
   }
   assert.equal(handleDispatchAuthorityRejection(rejection({ attemptNo: 2 }), context), true)
   assert.equal(map.size, 1)
-  assert.deepEqual(queries, [])
+  assert.equal(queries.length, 0)
   assert.equal(handleDispatchAuthorityRejection(rejection(), context), true)
   await setImmediate()
   assert.equal(map.size, 0)

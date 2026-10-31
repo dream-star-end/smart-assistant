@@ -256,7 +256,7 @@ test("dispatch lease renewal bounds unreceipted attempts and stops for deleted o
       await client.query(`UPDATE turn_dispatches SET status='admitted', lease_until=NULL,
         admitted_at=NOW()-($1::bigint * INTERVAL '1 millisecond')`, [DISPATCH_NO_RECEIPT_MAX_AGE_MS - 10_000]);
       assert.equal(await renewal.renew(), true, `${renewal.name}: admit remains live within receipt grace`);
-      const capped = await client.query(`SELECT EXTRACT(EPOCH FROM lease_until-admitted_at)*1000 AS age FROM turn_dispatches`);
+      const capped = await client.query("SELECT EXTRACT(EPOCH FROM lease_until-admitted_at)*1000 AS age FROM turn_dispatches");
       assert.equal(Number(capped.rows[0].age), DISPATCH_NO_RECEIPT_MAX_AGE_MS, `${renewal.name}: last renewal cannot extend delivery grace`);
 
       await client.query(`UPDATE turn_dispatches SET lease_until=NULL,

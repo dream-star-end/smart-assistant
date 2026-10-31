@@ -2514,7 +2514,7 @@ export async function scheduleUndeliveredDispatchRecovery(
   if (row.failureCode !== 'DISPATCH_AUTHORITY_EXPIRED' || row.outcome !== 'not_accepted') return;
   const sessionUserId = `c:${row.userId}`;
   const session = (await client.query<{ messages: string; deleted_at: string | null }>(
-    `SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+    "SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE",
     [row.sessionId, sessionUserId],
   )).rows[0];
   if (!session || session.deleted_at !== null) return;
@@ -9028,15 +9028,22 @@ export function createPgSessionsBackend(
               item._clientMessageId === input.recovery?.sourceClientMessageId &&
               supportsAutomaticTurnRecovery(String(item._errorCode ?? "")));
             const dispatchFailure = (
-              await client.query<{ outcome: string; failure_code: string | null }>(
-                `SELECT outcome, failure_code
+              await client.query<{ outcome: string; failure_code: string | null; client_notified: boolean }>(
+                `SELECT outcome, failure_code, client_notified
                    FROM turn_dispatches
                   WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3
                     AND status='terminal'
-                  LIMIT 1`,
+                  LIMIT 1 FOR UPDATE`,
                 [input.uid, input.sessionId, input.recovery.sourceClientMessageId],
               )
             ).rows[0];
+            // The tombstone closes execution first. Only the reconciler's
+            // same-transaction no-billing proof publishes client_notified;
+            // a browser replay must not jump ahead of that financial gate.
+            if (dispatchFailure?.failure_code === 'DISPATCH_AUTHORITY_EXPIRED' &&
+                (dispatchFailure.outcome !== 'not_accepted' || dispatchFailure.client_notified !== true)) {
+              return { kind: 'recovery_conflict', reason: 'source_not_safely_replayable' };
+            }
             const finalized = (
               await client.query<{
                 tape_id: string;

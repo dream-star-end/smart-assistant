@@ -7,7 +7,7 @@ import { _OutboundPersistQueueCoordinator } from '../ws/userChatBridge.js'
 import type { Queryable } from '../dispatch/turnDispatchStore.js'
 
 class Transport extends EventEmitter {
-  readyState = WebSocket.OPEN
+  readyState: number = WebSocket.OPEN
   sent: Record<string, unknown>[] = []
   send(data: unknown, _opts: unknown, done?: (err?: Error) => void) {
     this.sent.push(JSON.parse(String(data)))

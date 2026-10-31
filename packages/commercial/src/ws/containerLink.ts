@@ -163,6 +163,7 @@ class ContainerLink {
   }
   private sending: Promise<void> | null = null;
   private sendingBytes = 0;
+  private orderedSends = 0;
 
   constructor(
     readonly uid: bigint, readonly containerId: number,
@@ -255,7 +256,7 @@ class ContainerLink {
     // Message routing was installed synchronously above. A slow replay cursor
     // must not consume a fresh message's short authority TTL. Other controls
     // retain hello ordering (notably repo binding).
-    if (frame?.type === "inbound.message" || (helloPeers === null && this.sending === null)) {
+    if ((frame?.type === "inbound.message" && this.orderedSends === 0) || (helloPeers === null && this.sending === null)) {
       if (this.stopping || handle.disposed || (canSend && !canSend())) { cb?.(new Error("container frame cancelled")); return; }
       containerLinkSendChainWait.observe({}, Date.now() - queuedAt);
       this.ws!.send(data, opts ?? {}, cb); return;
@@ -266,6 +267,10 @@ class ContainerLink {
       cb?.(error); this.stop(error); return;
     }
     this.sendingBytes += bytes;
+    // Preserve earlier state-changing controls and messages. Pings and replay
+    // preparation alone do not impose a dependency on a fresh dispatch.
+    const ordered = helloPeers === null && frame?.type !== "ping";
+    if (ordered) this.orderedSends++;
     const work = (this.sending ?? Promise.resolve()).then(async () => {
       if (this.stopping || handle.disposed) { cb?.(new Error("container link closed")); return; }
       if (helloPeers !== null) await this.registry.drainBeforeReplay(this.uid, this.containerId);
@@ -281,6 +286,7 @@ class ContainerLink {
       cb?.();
     }).catch((error: Error) => { cb?.(error); this.transportFailed(error); }).finally(() => {
       this.sendingBytes -= bytes;
+      if (ordered) this.orderedSends--;
       if (this.sending === work) this.sending = null;
     });
     this.sending = work;

@@ -385,3 +385,28 @@ test("RF-linkrebuild: restore cannot replace an existing browser stream consumer
     assert.equal(physical.readyState, WebSocket.OPEN);
   } finally { await registry.shutdown(); }
 });
+
+test("OCV5-682 fresh dispatch preserves an earlier queued repository unbind", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const registry = new ContainerLinkRegistry(pool);
+  registry.beforeReplay = () => gate;
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(1n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const send = (frame: unknown) => new Promise<void>((resolve, reject) =>
+      socket.send(wire(frame), {}, err => err ? reject(err) : resolve()));
+    const hello = send({ type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }] });
+    await new Promise(resolve => setImmediate(resolve));
+    const unbind = send({ type: "inbound.control.session_repo_unbind", sessionId: "session" });
+    const turn = send({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "after-unbind" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(physical.sent, [], "a new turn cannot execute with a repository the user already unbound");
+    release();
+    await Promise.all([hello, unbind, turn]);
+    assert.deepEqual(physical.sent.map(frame => frame.type), [
+      "inbound.hello", "inbound.control.session_repo_unbind", "inbound.message",
+    ]);
+  } finally { release(); await registry.shutdown(); }
+});
