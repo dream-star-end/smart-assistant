@@ -127,6 +127,38 @@ assert_eq "$(comments OCV5-901)$(comments OCV5-902)" "11" "面板各恰 1 条评
 assert_eq "$(q "SELECT COUNT(*) FROM outbox WHERE transport_id NOT GLOB 'lsc-[0-9a-f]*';")" 0 "transport_id 合法字符"
 "$WORKER" >/dev/null 2>&1; assert_eq "$(starts)" 1 "结算后再 tick 不重发"
 
+echo "═══ S3 构建中 tip 前移 → 旧班只结算旧 ride,新 ride 留给下一班 ═══"
+reset_db; set_live "$C0" committed; echo hang >"$T/fake-deploy.mode"
+git -C "$T/wt" reset -q --hard "$C1"
+git -C "$T/wt" push -q --force origin "$C1:refs/heads/feat/test"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C1" --ticket OCV5-912 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1
+s3_old_train="$(q "SELECT id FROM train WHERE status='building';")"
+assert_eq "$(q "SELECT target_sha FROM train WHERE id='$s3_old_train';")" "$C1" "旧班固定 target=C1"
+git -C "$T/wt" push -q origin "$C2:refs/heads/feat/test"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C2" --ticket OCV5-913 --owner s2 >/dev/null
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(starts)" 1 "旧班未 committed 时不发新班"
+assert_eq "$(q "SELECT COUNT(*) FROM lease WHERE status='registered';")" 2 "tip 前移不提前结算任何 ride"
+# Only the old fixture train has committed; the newer source has no live evidence.
+set_live "$C1" committed
+q "UPDATE train SET status='committed', rel_path='$T/releases/rel-$C1', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$s3_old_train';"
+kill_stubs
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(q "SELECT status FROM lease WHERE want_sha='$C1';")" satisfied "旧班 committed 只结算旧 ride"
+assert_eq "$(q "SELECT status FROM lease WHERE want_sha='$C2';")" registered "新 ride 不能借旧班的 committed 结果结算"
+assert_eq "$(starts)" 2 "新 ride 触发下一班"
+s3_next_train="$(q "SELECT id FROM train WHERE status='building';")"
+assert_eq "$(q "SELECT target_sha FROM train WHERE id='$s3_next_train';")" "$C2" "下一班固定新 tip=C2"
+assert_eq "$(q "SELECT target_sha||':'||status FROM train WHERE id='$s3_old_train';")" "$C1:committed" "新班不改旧班 target 或终态"
+set_live "$C2" committed
+q "UPDATE train SET status='committed', rel_path='$T/releases/rel-$C2', finished_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id='$s3_next_train';"
+kill_stubs
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(q "SELECT status FROM lease WHERE want_sha='$C2';")" satisfied "新班自身 committed 后才结算新 ride"
+assert_eq "$(starts)" 2 "两班结算后不再发车"
+assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$C2" "夹具恢复到 C2"
+
 echo "═══ T2 live 已含 SHA → 不发车、register 直接返回;未 push sha → 拒绝 ═══"
 reset_db; set_live "$C2" committed
 out="$("$LEASE" register --resource deploy:selfhost --mode ride --sha "$C1" --owner s1)"; rc=$?

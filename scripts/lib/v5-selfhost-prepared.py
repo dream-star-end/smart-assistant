@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -44,6 +45,14 @@ def artifact(path, root, marker, pattern):
     return {'path': str(path), 'markerSha256': digest(path / marker)}, data
 
 
+def ancestors(repo, sha):
+    # Resolve the complete pinned history once. Git/read failure must not turn
+    # an unknown relationship into permission to delete a prepared receipt.
+    result = subprocess.run(['git', '-C', repo, 'rev-list', sha], check=True,
+                            capture_output=True, text=True)
+    return set(result.stdout.splitlines())
+
+
 def main():
     action, root, sha, *args = sys.argv[1:]
     if not re.fullmatch('[0-9a-f]{40}', sha):
@@ -58,17 +67,28 @@ def main():
     if action == 'init':
         return
     if action == 'prune':
+        history = ancestors(args[0], sha)
         for partial in root.glob('.receipt-*'):
             trusted(partial).unlink()  # exclusive artifact lock proves no active publisher
         for old in root.glob('*.json'):
-            if re.fullmatch('[0-9a-f]{40}\.json', old.name) and old != receipt:
+            if re.fullmatch('[0-9a-f]{40}\.json', old.name):
+                trusted(old)
+                if old.stem in history:
+                    continue  # newer merges do not invalidate fully gated ancestors
                 trusted(old).unlink()
         return
     if action == 'consume':
+        history = ancestors(args[1], sha)
         if receipt.exists():
             doc = json.loads(trusted(receipt).read_text())
-            if doc['master']['path'] == args[0]:
-                receipt.unlink()
+            if doc['master']['path'] != args[0]:
+                return
+            receipt.unlink()
+        # Called only after durable commit. This train covers its strict
+        # ancestors; retain next-train receipts and same-SHA/different-master.
+        for old in root.glob('*.json'):
+            if old.stem != sha and old.stem in history:
+                trusted(old).unlink()
         return
     if action == 'remove':
         if receipt.exists() or receipt.is_symlink():
@@ -125,6 +145,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         print('prepared receipt rejected: ' + str(error), file=sys.stderr)
         sys.exit(2)
