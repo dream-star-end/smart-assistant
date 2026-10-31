@@ -2,9 +2,11 @@
 // budget / format / autonomy, the locked bible, and the per-kind model plan from /providers.
 
 import {
+  CircleAlert,
   Film,
   Image as ImageIcon,
   Link2,
+  Loader2,
   Mic,
   Music,
   Pause,
@@ -28,6 +30,7 @@ import type {
   MediaKind,
   ProvidersView,
   StudioAspect,
+  StudioEvent,
   StudioProject,
   StudioProjectView,
 } from '../../../lib/studio/types'
@@ -46,6 +49,68 @@ const PLAN_ROWS: Array<{ kind: MediaKind; label: string; icon: ReactNode }> = [
 
 function str(v: unknown): string {
   return typeof v === 'string' ? v : ''
+}
+
+/** The newest event of one of these types (events are not guaranteed to arrive sorted). */
+function latestEvent(events: StudioEvent[], types: string[]): StudioEvent | null {
+  let best: StudioEvent | null = null
+  for (const e of events) {
+    if (!types.includes(e.type)) continue
+    if (!best || Date.parse(e.ts) > Date.parse(best.ts)) best = e
+  }
+  return best
+}
+
+function elapsedText(sec: number): string {
+  return sec < 60 ? `${sec} 秒` : `${Math.floor(sec / 60)} 分 ${sec % 60} 秒`
+}
+
+/**
+ * While the director writes the storyboard. The planner answers in one piece (no partial shots
+ * yet), so this says what is under way and for how long instead of an empty "还没写".
+ */
+export function PlanningStage(props: { project: StudioProject; events: StudioEvent[] }) {
+  const started = latestEvent(props.events, ['project.started'])
+  const since = Date.parse(started?.ts ?? props.project.updatedAt)
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [])
+  const sec = Number.isFinite(since) ? Math.max(0, Math.round((now - since) / 1000)) : null
+  const slots = Math.min(8, Math.max(3, Math.round(props.project.targetSec / 5)))
+  return (
+    <div className="st-stage st-brief-empty" data-testid="studio-planning">
+      <div className="st-row" style={{ gap: 8 }}>
+        <Loader2 size={16} className="st-spin" aria-hidden="true" />
+        <div className="st-h3" style={{ color: 'var(--st-stage-fg)' }}>
+          导演 agent 正在写分镜
+        </div>
+        <span style={{ flex: 1 }} />
+        {sec !== null ? (
+          <span className="st-chip st-chip-dark tnum" data-testid="studio-planning-elapsed">
+            已用 {elapsedText(sec)}
+          </span>
+        ) : null}
+      </div>
+      <ol className="st-plan-steps">
+        <li className="done">已开拍</li>
+        <li className="on">审核需求，拆成镜头：景别、动作、台词、时长</li>
+        <li>定好角色和场景的统一设定，算出预估积分</li>
+      </ol>
+      {sec !== null && sec >= 90 ? (
+        <div className="st-cap" style={{ color: 'var(--st-stage-muted)' }}>
+          比平时久一些，导演还在写，不用刷新页面。
+        </div>
+      ) : null}
+      <div className="st-shot-grid" aria-hidden="true" style={{ marginTop: 8 }}>
+        {Array.from({ length: slots }, (_, i) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: fixed placeholders, never reordered
+          <div key={i} className="st-sk" style={{ aspectRatio: '16 / 9', borderRadius: 12 }} />
+        ))}
+      </div>
+    </div>
+  )
 }
 
 export function ModelPlanRow(props: {
@@ -90,6 +155,7 @@ export function BriefPage(props: {
   onProject: (p: StudioProject) => void
   onReload: () => Promise<void> | void
   onDeleted: () => void
+  onEdit?: () => void
 }) {
   const { auth, view, providers, onProject } = props
   const { project, shots, assets } = view
@@ -165,6 +231,17 @@ export function BriefPage(props: {
   const canApprove =
     project.status === 'awaiting_user' &&
     (awaitingReason === 'approve_plan' || awaitingReason === 'budget')
+  // Why a started project is a draft again (plan.failed / brief moderation), shown where the plan
+  // would be rather than only in the activity list. A later start clears it.
+  const lastPlanEvent = latestEvent(view.events, [
+    'project.started',
+    'plan.failed',
+    'brief.moderation',
+  ])
+  const planStop =
+    lastPlanEvent && lastPlanEvent.type !== 'project.started'
+      ? str(lastPlanEvent.payload?.message) || '分镜方案没写好，可以改一下需求再开拍。'
+      : null
 
   const remove = async () => {
     const ok = await confirm({
@@ -189,7 +266,7 @@ export function BriefPage(props: {
   const budgetValid = /^\d{1,9}$/.test(budget) && budget !== project.budgetCredits
 
   return (
-    <div className="st-brief">
+    <div className="st-brief" onChangeCapture={props.onEdit}>
       {confirmEl}
       <section className="st-brief-main">
         <div className="st-row" style={{ gap: 12, alignItems: 'flex-start' }}>
@@ -303,8 +380,16 @@ export function BriefPage(props: {
               </div>
             ))}
           </div>
+        ) : project.status === 'planning' ? (
+          <PlanningStage project={project} events={view.events} />
         ) : (
           <div className="st-stage st-brief-empty">
+            {draft && planStop ? (
+              <div className="st-row st-plan-stop" role="alert" data-testid="studio-plan-stopped">
+                <CircleAlert size={15} />
+                {planStop}
+              </div>
+            ) : null}
             <div className="st-h3" style={{ color: 'var(--st-stage-fg)' }}>
               分镜还没写
             </div>
@@ -529,12 +614,12 @@ export function BriefPage(props: {
               暂停
             </button>
           ) : null}
-          {project.status === 'paused' ? (
+          {project.status === 'paused' || (project.status === 'awaiting_user' && awaitingReason === 'provider_failure') ? (
             <button
               type="button"
               className="st-btn st-btn-sm"
               style={{ flex: 1 }}
-              onClick={() => void transition('resume')}
+              onClick={() => void (awaitingReason === 'provider_failure' && project.status === 'awaiting_user' ? approvePlan() : transition('resume'))}
             >
               <Play />
               继续

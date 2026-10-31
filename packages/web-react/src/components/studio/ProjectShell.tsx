@@ -1,10 +1,14 @@
 // OCV5-593 project frame: breadcrumb, step tabs (需求 / 设定 / 镜头 / 配音 / 音乐 / 成片), credit pill.
+// The tabs also show the step the director is on (workStage), and the page follows it while the
+// user has not edited a form or taken control of navigation.
 
 import { ChevronRight, Clapperboard, Coins } from 'lucide-react'
+import { useEffect, useRef } from 'react'
 
 import { useStudioProject } from '../../hooks/useStudioProject'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import type { StudioPage, StudioRoute } from '../../lib/studio/path'
+import { STAGE_ORDER, type StudioStage, followStage, workStage } from '../../lib/studio/stage'
 import type { ProvidersView } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
 import { StateView } from './StateViews'
@@ -45,6 +49,30 @@ export function ProjectShell(props: {
 }) {
   const { auth, projectId, page, navigate } = props
   const { state, reload, refresh, applyProject } = useStudioProject(auth, projectId)
+  const stage = state.state === 'ready' ? workStage(state.view) : null
+
+  // Editing or choosing a page takes control for this project's open shell lifetime.
+  // Progress indicators still advance, while local form drafts stay mounted.
+  const followEnabled = useRef(true)
+  const disableFollow = () => {
+    followEnabled.current = false
+  }
+  useEffect(() => {
+    const onPop = () => {
+      followEnabled.current = false
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  const followed = useRef<{ id: string; stage: StudioStage } | null>(null)
+  useEffect(() => {
+    if (!stage) return
+    const prev = followed.current?.id === projectId ? followed.current.stage : null
+    followed.current = { id: projectId, stage }
+    if (!followEnabled.current) return
+    const to = followStage(prev, stage, page)
+    if (to) navigate({ kind: 'project', id: projectId, page: to }, true)
+  }, [stage, page, projectId, navigate])
 
   if (state.state === 'loading') return <StateView kind="loading" />
   if (state.state === 'missing') {
@@ -68,9 +96,22 @@ export function ProjectShell(props: {
   }
   const { project } = state.view
   const pct = budgetPercent(project.spentCredits, project.reservedCredits, project.budgetCredits)
-  const go = (p: StudioPage) => navigate({ kind: 'project', id: projectId, page: p })
-  const openShot = (shot: string) =>
+  const go = (p: StudioPage) => {
+    disableFollow()
+    navigate({ kind: 'project', id: projectId, page: p })
+  }
+  // A finished film has every step done; a failed or canceled project has none under way.
+  const stageAt =
+    project.status === 'done'
+      ? STAGE_ORDER.length
+      : stage && project.status !== 'canceled' && project.status !== 'failed'
+        ? STAGE_ORDER.indexOf(stage)
+        : -1
+  const stepState = (i: number) => (i < stageAt ? 'done' : i === stageAt ? 'now' : undefined)
+  const openShot = (shot: string) => {
+    disableFollow()
     navigate({ kind: 'project', id: projectId, page: 'review', shot })
+  }
 
   return (
     <>
@@ -99,6 +140,7 @@ export function ProjectShell(props: {
               key={p}
               href={`/studio/p/${projectId}${p === 'board' ? '' : `/${p}`}`}
               aria-current={page === p || (page === 'review' && p === 'board') ? 'page' : undefined}
+              data-step={stepState(i)}
               onClick={(e) => {
                 e.preventDefault()
                 go(p)
@@ -106,6 +148,7 @@ export function ProjectShell(props: {
             >
               <i className="n">{i + 1}</i>
               {label}
+              {stepState(i) === 'now' ? <span className="sr-only">（进行中）</span> : null}
             </a>
           ))}
         </nav>
@@ -122,9 +165,16 @@ export function ProjectShell(props: {
         </div>
       </header>
       <nav className="st-steps-mobile" aria-label="制作步骤">
-        {STEPS.map(([p, label]) => (
-          <button key={p} type="button" aria-pressed={page === p} onClick={() => go(p)}>
+        {STEPS.map(([p, label], i) => (
+          <button
+            key={p}
+            type="button"
+            aria-pressed={page === p}
+            data-step={stepState(i)}
+            onClick={() => go(p)}
+          >
             {label}
+            {stepState(i) === 'now' ? <span className="sr-only">（进行中）</span> : null}
           </button>
         ))}
       </nav>
@@ -136,6 +186,7 @@ export function ProjectShell(props: {
           onProject={applyProject}
           onReload={reload}
           onDeleted={() => navigate({ kind: 'home' }, true)}
+          onEdit={disableFollow}
         />
       ) : page === 'board' ? (
         <BoardPage
@@ -144,6 +195,7 @@ export function ProjectShell(props: {
           providers={props.providers}
           onOpenShot={openShot}
           onOpenBrief={() => go('brief')}
+          onReload={refresh}
         />
       ) : page === 'image' ? (
         <ImageStudioPage
@@ -163,6 +215,7 @@ export function ProjectShell(props: {
       ) : page === 'voice' ? (
         <VoicePage
           onReload={reload}
+          onEdit={disableFollow}
           auth={auth}
           view={state.view}
           providers={props.providers}

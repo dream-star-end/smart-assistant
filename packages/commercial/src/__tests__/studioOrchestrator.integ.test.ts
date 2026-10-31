@@ -26,6 +26,10 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { InMemoryPreCheckRedis } from '../billing/preCheck.js'
+import { PricingCache } from '../billing/pricing.js'
+import { makeGrokRunner } from '../grok/visionProxy.js'
+import { PUBLIC_VISION_AUTHZ, grokVisionSnapshot, grokVisionUpstreamPayload } from './helpers/grokVisionFixtures.js'
 import { StudioBlobStore } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
 import { advanceProject, dispatchRequest } from '../media-studio/orchestrator/advance.js'
@@ -293,6 +297,147 @@ async function takes(projectId: string) {
 const signal = () => new AbortController().signal
 
 describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
+  test('real planner SSE commits ordered deltas before completion and produces the same final plan as JSON', async (t) => {
+    if (skip(t)) return
+    const plan = {
+      title: '冬日来客',
+      shots: [{ title: '晨雾', framing: '远景', action: '红狐走出晨雾', durationSec: 6 }],
+      bible: [{ kind: 'character', name: '红狐', descriptor: '橙红毛，胸口白色' }],
+      narration: null, music: null,
+    }
+    const text = JSON.stringify(plan)
+    const deltaTexts = [text.slice(0, 50), text.slice(50)]
+    const finalized: unknown[] = []
+    for (const streaming of [true, false]) {
+      const userId = await user()
+      const project = await new StudioStore(getPool()).createProject(userId, { brief: '红狐短片', targetSec: 6, budgetCredits: 2000 })
+      await query("UPDATE studio_projects SET status = 'planning' WHERE id = $1", [project.id])
+      const d = await deps(new FakeProvider('img', 'image'))
+      await advanceProject(d, project.id)
+      const [task] = await claimStudioTasks(getPool(), { owner: 'planner', limit: 1, museOnline: false })
+      assert.ok(task)
+      let calls = 0
+      const billing = async () => { throw new Error('platform planner touched user billing') }
+      d.grok = makeGrokRunner({
+        getPool, preCheckRedis: new InMemoryPreCheckRedis(), pricing: new PricingCache(),
+        catalog: { assertFresh: async () => grokVisionSnapshot() }, loadUserModelAuthz: async () => PUBLIC_VISION_AUTHZ,
+        pickAccountId: async () => 24n, freshToken: async () => Buffer.from('test-token'), recordStatus: async () => {},
+        preCheckWithCostFn: billing, startInflightJournalFn: billing, settleDurableCodexBillingFn: billing,
+        abortInflightJournalFn: billing, releasePreCheckFn: billing,
+        requestFn: async (_url, init) => {
+          calls++
+          const isPlan = JSON.parse(init.body).stream === true
+          const json = grokVisionUpstreamPayload({ text: isPlan ? text : '{"verdict":"pass","reason":""}' })
+          if (!isPlan || !streaming) return { statusCode: 200, body: { text: async () => JSON.stringify(json) } }
+          const event = (v: unknown) => Buffer.from(`data: ${JSON.stringify(v)}\n\n`)
+          const body = {
+            text: async () => { throw new Error('SSE was buffered') },
+            async *[Symbol.asyncIterator]() {
+              for (const [i, delta] of deltaTexts.entries()) {
+                yield event({ type: 'response.output_text.delta', delta })
+                const rows = await query<{ payload: { seq: number; delta: string } }>("SELECT payload FROM studio_events WHERE project_id=$1 AND type='plan.delta' ORDER BY id", [project.id])
+                assert.deepEqual(rows.rows.map((r) => [r.payload.seq, r.payload.delta]), deltaTexts.slice(0, i + 1).map((s, n) => [n + 1, s]))
+                assert.equal((await query('SELECT 1 FROM studio_shots WHERE project_id=$1', [project.id])).rowCount, 0)
+                const view = await new StudioStore(getPool()).projectView(userId, project.id)
+                const activity = view!.events as Array<{ type: string }>
+                assert.ok(activity.some((e) => e.type === 'project.created'))
+                assert.equal(activity.some((e) => e.type === 'plan.delta'), false, 'previews do not flood ordinary activity')
+              }
+              yield event({ type: 'response.completed', response: json })
+            },
+          }
+          return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, body }
+        },
+      })
+      await executeTask(d, task, signal())
+      assert.equal(calls, 2, 'one moderation and one planning request, no extra fallback request')
+      const shots = await query('SELECT ordinal, spec FROM studio_shots WHERE project_id=$1 ORDER BY ordinal', [project.id])
+      const assets = await query('SELECT kind, name, descriptor FROM studio_assets WHERE project_id=$1', [project.id])
+      finalized.push({ shots: shots.rows, assets: assets.rows })
+      const events = await query<{ type: string }>("SELECT type FROM studio_events WHERE project_id=$1 AND type LIKE 'plan.%' ORDER BY id", [project.id])
+      assert.deepEqual(events.rows.map((r) => r.type), streaming ? ['plan.delta', 'plan.delta', 'plan.ready'] : ['plan.ready'])
+    }
+    assert.deepEqual(finalized[0], finalized[1])
+  })
+
+  test('provider pause codes release the failed reservation, stop dispatch, and can be explicitly resumed', async (t) => {
+    if (skip(t)) return
+    for (const code of ['IMAGE_DAILY_LIMIT', 'MUSE_BRIDGE_LOST', 'MUSE_SOURCE_FETCH_FAILED']) {
+      const img = new FakeProvider('img', 'image')
+      const backup = new FakeProvider('backup', 'image')
+      img.fail = new MediaProviderError(code, true, 'provider unavailable')
+      const d = await deps(img, backup)
+      const p = await runningProject(1)
+      await advanceProject(d, p.id)
+      const first = await runOne(d)
+      assert.deepEqual(await money(p.id), { spent: 0n, reserved: 0n, status: 'running' })
+      await advanceProject(d, p.id)
+      assert.deepEqual(await money(p.id), { spent: 0n, reserved: 0n, status: 'awaiting_user' })
+      assert.equal((await takes(p.id)).length, 1)
+      assert.equal(backup.calls, 0)
+      const ev = await query<{ payload: { reason: string; code: string; message: string } }>("SELECT payload FROM studio_events WHERE project_id=$1 AND type='project.awaiting_user'", [p.id])
+      assert.equal(ev.rows[0]!.payload.code, code)
+      assert.equal(ev.rows[0]!.payload.reason, 'provider_failure')
+      assert.match(ev.rows[0]!.payload.message, /暂停/)
+      const api = makeOrchestratorApi(getPool(), () => {})
+      await api.approve(p.userId, p.id)
+      img.fail = null
+      await advanceProject(d, p.id)
+      const second = await runOne(d)
+      assert.notEqual(first.execRequestId, second.execRequestId, 'a confirmed retry is a new execution')
+      assert.equal((await takes(p.id)).length, 2)
+      assert.equal(img.calls, 2)
+      assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+      await query("UPDATE studio_projects SET status='canceled' WHERE id=$1", [p.id])
+    }
+  })
+
+  test('in-progress waits beyond the claim limit on the original task and settles once', async (t) => {
+    if (skip(t)) return
+    const img = new FakeProvider('img', 'image')
+    img.fail = new MediaProviderError('IMAGE_REQUEST_IN_PROGRESS', true, 'still running')
+    const d = await deps(img)
+    const p = await runningProject(1)
+    await advanceProject(d, p.id)
+    let original: string | undefined
+    for (let i = 0; i < 8; i++) {
+      const task = await runOne(d)
+      original ??= task.execRequestId
+      assert.equal(task.execRequestId, original)
+      assert.equal(task.attempts, 1)
+      assert.equal((await takes(p.id)).length, 1)
+      assert.equal((await money(p.id)).reserved, 10n)
+      await query('UPDATE studio_tasks SET run_after=NOW() WHERE id=$1', [task.id])
+      await advanceProject(d, p.id)
+    }
+    img.fail = null
+    assert.equal((await runOne(d)).execRequestId, original)
+    assert.equal(img.ledger.size, 1)
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+  })
+
+  test('provider suspension holds queued work without spending attempts; ordinary timeouts still retry', async (t) => {
+    if (skip(t)) return
+    const img = new FakeProvider('img', 'image')
+    const d = await deps(img)
+    const p = await runningProject(2)
+    await advanceProject(d, p.id)
+    img.fail = new MediaProviderError('IMAGE_DAILY_LIMIT', false, 'daily limit')
+    await runOne(d)
+    await advanceProject(d, p.id)
+    const held = await runOne(d)
+    assert.equal(img.calls, 1, 'queued generation is not sent during provider pause')
+    const row = await query<{ attempts: number }>('SELECT attempts FROM studio_tasks WHERE id=$1', [held.id])
+    assert.equal(row.rows[0]!.attempts, 0)
+    await makeOrchestratorApi(getPool(), () => {}).approve(p.userId, p.id)
+    img.fail = new MediaProviderError('MUSE_TIMEOUT', true, 'timeout')
+    await query('UPDATE studio_tasks SET run_after=NOW() WHERE id=$1', [held.id])
+    const timeout = await runOne(d)
+    assert.equal(timeout.execRequestId, held.execRequestId)
+    const retried = await query<{ status: string; attempts: number }>('SELECT status, attempts FROM studio_tasks WHERE id=$1', [held.id])
+    assert.deepEqual(retried.rows[0], { status: 'queued', attempts: 1 })
+    assert.equal((await money(p.id)).status, 'running')
+  })
   test('concurrent advances dispatch once; concurrent workers split the work; money adds up', async (t) => {
     if (skip(t)) return
     const img = new FakeProvider('img', 'image')
@@ -508,6 +653,152 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       [shotId],
     )
     assert.deepEqual(s2.rows[0], { status: 'ready', active: video.rows[0]!.id })
+  })
+
+  for (const paused of [false, true]) {
+    test(`a frame picked during ${paused ? 'paused composition' : 'composition'} dispatches a new video`, async (t) => {
+      if (skip(t)) return
+      const img = new FakeProvider('img', 'image')
+      const vid = new FakeProvider('vid', 'video')
+      const d = await deps(img, vid)
+      const p = await runningProject(1)
+      const shotId = await shotWithFrame(d, p)
+      await runOne(d) // the original video finishes; its shot is ready
+      const frame = (
+        await query<{ id: string; blob_sha: string }>(
+          `SELECT id::text AS id, blob_sha FROM studio_takes
+            WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND status = 'succeeded'`,
+          [shotId],
+        )
+      ).rows[0]!
+      const imageCalls = img.calls
+      const videoCalls = vid.calls
+      await query(`UPDATE studio_projects SET status = 'composing' WHERE id = $1`, [p.id])
+      const store = new StudioStore(getPool())
+      if (paused) await store.transition(p.userId, p.id, 'pause')
+      const api = makeOrchestratorApi(getPool(), () => {}, d)
+      await api.selectTake(p.userId, frame.id)
+
+      const selected = (
+        await query<{ status: string; resume: string | null }>(
+          `SELECT status, settings->>'resumeTo' AS resume FROM studio_projects WHERE id = $1`,
+          [p.id],
+        )
+      ).rows[0]!
+      assert.deepEqual(selected, {
+        status: paused ? 'paused' : 'running',
+        resume: paused ? 'running' : null,
+      })
+      if (paused) {
+        await advanceProject(d, p.id)
+        const held = await query(
+          `SELECT 1 FROM studio_takes WHERE owner_kind = 'shot_video' AND owner_id = $1 AND status = 'queued'`,
+          [shotId],
+        )
+        assert.equal(held.rowCount, 0, 'the user remains paused until they resume')
+        assert.equal((await store.transition(p.userId, p.id, 'resume')).status, 'running')
+      }
+
+      await advanceProject(d, p.id)
+      await advanceProject(d, p.id)
+      const videos = await query<{ id: string; version: number; status: string }>(
+        `SELECT id::text AS id, version, status FROM studio_takes
+          WHERE owner_kind = 'shot_video' AND owner_id = $1 ORDER BY version`,
+        [shotId],
+      )
+      assert.deepEqual(
+        videos.rows.map(({ version, status }) => ({ version, status })),
+        [{ version: 1, status: 'succeeded' }, { version: 2, status: 'queued' }],
+        'two advances dispatch exactly one new video',
+      )
+      const request = (
+        await query<{ request: MediaRequest }>(
+          `SELECT payload->'request' AS request FROM studio_tasks WHERE payload->>'takeId' = $1`,
+          [videos.rows[1]!.id],
+        )
+      ).rows[0]!.request
+      assert.equal(request.op, 'video.from_image')
+      assert.deepEqual(request.inputs, [{ role: 'first_frame', blobSha: frame.blob_sha }])
+      await runOne(d)
+      const shot = (
+        await query<{ status: string; active: string | null }>(
+          'SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1',
+          [shotId],
+        )
+      ).rows[0]!
+      assert.deepEqual(shot, { status: 'ready', active: videos.rows[1]!.id })
+      assert.equal(vid.calls, videoCalls + 1)
+      assert.equal(img.calls, imageCalls, 'the selected first frame is reused')
+    })
+  }
+
+  test('a frame picked after a provider pause resumes one new video without buying the frame again', async (t) => {
+    if (skip(t)) return
+    const img = new FakeProvider('img', 'image')
+    const vid = new FakeProvider('vid', 'video')
+    const d = await deps(img, vid)
+    const p = await runningProject(1)
+    const shotId = await shotWithFrame(d, p)
+    vid.fail = new MediaProviderError('MUSE_SOURCE_FETCH_FAILED', true, 'source unavailable')
+    const failed = await runOne(d)
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+    await advanceProject(d, p.id)
+    const paused = await query<{ status: string; reason: string | null }>(
+      "SELECT status, settings->>'awaitingReason' AS reason FROM studio_projects WHERE id = $1",
+      [p.id],
+    )
+    assert.deepEqual(paused.rows[0], { status: 'awaiting_user', reason: 'provider_failure' })
+    const frame = (
+      await query<{ id: string; blob_sha: string }>(
+        `SELECT id::text AS id, blob_sha FROM studio_takes
+          WHERE owner_kind = 'shot_frame' AND owner_id = $1 AND status = 'succeeded'`,
+        [shotId],
+      )
+    ).rows[0]!
+    const api = makeOrchestratorApi(getPool(), () => {}, d)
+    await api.selectTake(p.userId, frame.id)
+    const selected = await query<{ status: string; reason: string | null; budget: string }>(
+      `SELECT status, settings->>'awaitingReason' AS reason, budget_credits::text AS budget
+         FROM studio_projects WHERE id = $1`,
+      [p.id],
+    )
+    assert.deepEqual(selected.rows[0], { status: 'running', reason: null, budget: '2000' })
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+
+    vid.fail = null
+    await advanceProject(d, p.id)
+    await advanceProject(d, p.id)
+    const videos = await query<{ id: string; version: number; status: string; provider: string }>(
+      `SELECT id::text AS id, version, status, provider FROM studio_takes
+        WHERE owner_kind = 'shot_video' AND owner_id = $1 ORDER BY version`,
+      [shotId],
+    )
+    assert.deepEqual(
+      videos.rows.map(({ version, status, provider }) => ({ version, status, provider })),
+      [{ version: 1, status: 'failed', provider: 'vid' }, { version: 2, status: 'queued', provider: 'vid' }],
+      'two advances open exactly one new execution on the same provider',
+    )
+    const request = (
+      await query<{ request: MediaRequest }>(
+        "SELECT payload->'request' AS request FROM studio_tasks WHERE payload->>'takeId' = $1",
+        [videos.rows[1]!.id],
+      )
+    ).rows[0]!.request
+    assert.equal(request.op, 'video.from_image')
+    assert.deepEqual(request.inputs, [{ role: 'first_frame', blobSha: frame.blob_sha }])
+    assert.deepEqual(await money(p.id), { spent: 6n, reserved: 10n, status: 'running' })
+    const retried = await runOne(d)
+    assert.notEqual(retried.execRequestId, failed.execRequestId)
+    assert.equal(vid.calls, 2, 'one failed request and one confirmed retry')
+    assert.equal(vid.ledger.size, 1, 'only the successful retry charged')
+    assert.equal(img.calls, 1, 'the selected frame is reused without another image call')
+    assert.equal(img.ledger.size, 1)
+    assert.deepEqual(await money(p.id), { spent: 12n, reserved: 0n, status: 'running' })
+    const shot = await query<{ status: string; active: string | null }>(
+      'SELECT status, active_take_id::text AS active FROM studio_shots WHERE id = $1',
+      [shotId],
+    )
+    assert.deepEqual(shot.rows[0], { status: 'ready', active: videos.rows[1]!.id })
   })
 
   test("after a failed video the user's frame pick retries the same provider (INC-20261027-STUDIO-RETRY-PROVIDER-EXCLUDED)", async (t) => {

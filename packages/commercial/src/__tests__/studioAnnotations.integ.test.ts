@@ -325,6 +325,18 @@ const sure = (op: string, args: unknown, confidence = 0.92) =>
   JSON.stringify({ op, args, confidence, explanation: '按批注重画这个镜头' })
 
 describe('studio annotations (OCV5-591 A2-1b-2)', () => {
+  test('provider suspension still allows an annotation to be interpreted and reopen the project', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ status: 'awaiting_user' })
+    await query(`UPDATE studio_projects SET settings=settings || '{"awaitingReason":"provider_failure"}'::jsonb WHERE id=$1`, [s.p.id])
+    const { id } = await s.api.create(s.uid, s.p.id, { takeId: s.video.id, kind: 'text', text: '尾巴应该是白色的' })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('regenerate_shot', { shotId: s.shot, promptDelta: '尾巴白色' }))
+    const task = await runOne(s.exec)
+    assert.equal(task.kind, 'interpret')
+    assert.equal((await annotation(id)).interpretation?.execution?.state, 'running')
+    assert.equal((await projectRow(s.p.id)).status, 'running')
+  })
   test('a sure instruction on an autonomous finished film runs at once: reopened, the change kept on the shot', async (t) => {
     if (skip(t)) return
     const s = await setup()
@@ -373,7 +385,7 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     // first frame was generated and charged (50) before the video.
     const s = await setup()
     const newer = await s.take('shot_frame', s.shot, 2, 'image/png')
-    await query(`UPDATE studio_takes SET inputs = $2::jsonb WHERE id = $1`, [
+    await query('UPDATE studio_takes SET inputs = $2::jsonb WHERE id = $1', [
       s.video.id,
       JSON.stringify({ inputs: [{ role: 'first_frame', blobSha: s.frame.sha }] }),
     ])

@@ -1,12 +1,17 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
+const selectTake = vi.fn(async () => ({ projectId: 'p' }))
 vi.mock('../../lib/studio/api', () => ({
-  studioApi: { blobTicket: vi.fn(async () => ({ url: '/blob', expiresInSeconds: 900 })) },
+  studioApi: {
+    blobTicket: vi.fn(async () => ({ url: '/blob', expiresInSeconds: 900 })),
+    selectTake: (...a: unknown[]) => selectTake(...(a as [])),
+  },
+  studioErrorText: () => '出错了',
 }))
 
-import type { ProvidersView, StudioProjectView } from '../../lib/studio/types'
+import type { ProvidersView, StudioProjectView, StudioTake } from '../../lib/studio/types'
 import { BoardPage } from './pages/Board'
 
 afterEach(cleanup)
@@ -110,6 +115,44 @@ describe('BoardPage (OCV5-593 FE-2a)', () => {
     )
     // FE-5: with music sources ready, the lane asks for a choice instead of waiting for a generator.
     expect(screen.getByTestId('timeline-music-slot')).toHaveTextContent('还没选配乐')
+  })
+
+  test('a needs-you candidate is adopted from the card itself', async () => {
+    selectTake.mockClear()
+    const onReload = vi.fn()
+    const v = view()
+    const t = (id: string, version: number, ownerKind: StudioTake['ownerKind']): StudioTake => ({
+      id,
+      ownerKind,
+      ownerId: 's1',
+      version,
+      provider: 'muse',
+      model: 'muse-video',
+      op: 'video.from_image',
+      status: 'succeeded',
+      errorCode: null,
+      costCredits: '0',
+      qa: { score: 0.6 },
+      blobSha: 'a'.repeat(64),
+      createdAt: '',
+      finishedAt: null,
+    })
+    v.takes = [t('f1', 1, 'shot_frame'), t('v2', 2, 'shot_video')]
+    render(
+      <BoardPage
+        auth={auth}
+        view={v}
+        providers={providers('unconfigured')}
+        onOpenShot={() => {}}
+        onOpenBrief={() => {}}
+        onReload={onReload}
+      />,
+    )
+    const opts = screen.getAllByTestId('needs-adopt')
+    expect(opts.map((o) => o.textContent)).toEqual(['采用 v2', '用 v1 首帧重拍'])
+    fireEvent.click(opts[0]!)
+    await waitFor(() => expect(selectTake).toHaveBeenCalledWith(auth, 'v2'))
+    await waitFor(() => expect(onReload).toHaveBeenCalled())
   })
 
   test('the instruction box stays disabled until the director agent ships', () => {

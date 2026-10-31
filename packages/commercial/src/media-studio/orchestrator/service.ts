@@ -15,6 +15,7 @@ import { type AdvanceDeps, dispatchRequest } from './advance.js'
 import { type AnnotationApi, makeAnnotationApi } from './annotations.js'
 import { loadComposeInputs } from './compose.js'
 import { parseVariant, variantKey } from './composeJob.js'
+import { PAUSE_PROVIDER_CODES } from './providerFailure.js'
 
 export interface OrchestratorApi {
   start(userId: string, projectId: string): Promise<void>
@@ -140,7 +141,7 @@ export function makeOrchestratorApi(
         // note was written (INC-20261027-STUDIO-COMPOSE-FAILED-NO-RETRY).
         if (
           p.status !== 'awaiting_user' ||
-          (p.reason !== 'approve_plan' && p.reason !== 'budget' && p.reason !== 'compose_failed')
+          (p.reason !== 'approve_plan' && p.reason !== 'budget' && p.reason !== 'compose_failed' && p.reason !== 'provider_failure')
         ) {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'nothing to approve')
         }
@@ -155,6 +156,13 @@ export function makeOrchestratorApi(
             'raise the budget to cover the estimate first',
           )
         }
+        if (p.reason === 'provider_failure') {
+          await c.query(
+            `UPDATE studio_takes SET meta = meta || '{"providerFailureAcknowledged":true}'::jsonb
+              WHERE project_id = $1 AND status = 'failed' AND error_code = ANY($2::text[])`,
+            [projectId, PAUSE_PROVIDER_CODES],
+          )
+        }
         await c.query(
           `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason',
                   rev = rev + 1, updated_at = NOW() WHERE id = $1`,
@@ -162,7 +170,7 @@ export function makeOrchestratorApi(
         )
         await appendStudioEvent(c, projectId, 'project.approved', {
           message:
-            p.reason === 'compose_failed' ? '重新合成成片（不收费）。' : '方案已确认，开始生成。',
+            p.reason === 'provider_failure' ? '继续制作，已保留的结果会复用。' : p.reason === 'compose_failed' ? '重新合成成片（不收费）。' : '方案已确认，开始生成。',
         })
       })
       kick(projectId)
@@ -493,11 +501,17 @@ export function makeOrchestratorApi(
         } else {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'this take cannot be chosen yet')
         }
-        // A project waiting on the user picks up again once something was chosen.
+        // A new choice returns composition to the director, which dispatches any replacement
+        // video before composing again. Keep budget/plan approval and user pauses intact.
         await c.query(
           `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason', rev = rev + 1, updated_at = NOW()
-            WHERE id = $1 AND status = 'awaiting_user'
-              AND settings->>'awaitingReason' IN ('needs_user', 'compose_pending')`,
+            WHERE id = $1 AND (status = 'composing' OR (status = 'awaiting_user'
+              AND settings->>'awaitingReason' IN ('needs_user', 'compose_pending', 'provider_failure')))`,
+          [t.project_id],
+        )
+        await c.query(
+          `UPDATE studio_projects SET settings = settings || '{"resumeTo":"running"}'::jsonb
+            WHERE id = $1 AND status = 'paused' AND settings->>'resumeTo' = 'composing'`,
           [t.project_id],
         )
         await appendStudioEvent(c, t.project_id, 'take.selected', {

@@ -194,6 +194,13 @@ export function StudioHome(props: {
         aspect,
         targetSec: sec,
       })
+      // 全自动开拍 means start: the director begins planning now, not after a second click on the
+      // brief page. A start that fails leaves a draft there, with its own 全自动开始 to retry.
+      try {
+        await studioApi.start(auth, project.id)
+      } catch (err) {
+        toast(`项目已创建，但没能开拍：${studioErrorText(err)}`, 'error')
+      }
       navigate({ kind: 'project', id: project.id, page: 'brief' })
     } catch (err) {
       toast(studioErrorText(err), 'error')
@@ -306,7 +313,7 @@ export function StudioHome(props: {
               >
                 <WandSparkles />
                 {creating ? (
-                  '正在创建…'
+                  '正在开拍…'
                 ) : (
                   <>
                     <span className="st-hide-sm">全自动开拍</span>
