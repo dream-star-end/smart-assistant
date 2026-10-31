@@ -408,6 +408,7 @@ export class Gateway {
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
   private _stopEviction: (() => void) | null = null
+  private _stopCompactionArchiveCleanup: (() => void) | null = null
   /** v3 master sink retry queue stop hook — set when sink is wired in
    *  start(); called in shutdown stage 2 to cancel the periodic drain
    *  timer. null when v3 sink isn't configured (personal version). */

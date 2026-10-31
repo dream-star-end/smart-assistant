@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 import type { ClientTimelinePage, MessageLike } from '@openclaude/storage'
 import {
@@ -12,6 +12,7 @@ import {
   readCompactionOriginal,
   readCompactionOriginalByTrace,
   readFullCompactionTimeline,
+  startCompactionArchiveCleanup,
   type CompactionArchiveOptions,
 } from '../compactionArchive.js'
 
@@ -192,4 +193,100 @@ test('missing trace IDs mint independent immutable captures and insecure roots f
   const path = join(temp, 'root-is-file')
   await writeFile(path, 'not a directory')
   await assert.rejects(captureCompactionOriginal(input(), { ...options, root: path }))
+})
+
+test('cleanup removes only old private exact-name crash stages and keeps fresh or unrelated directories', async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-stage-retention-'))
+  t.after(() => rm(temp, { recursive: true, force: true }))
+  const now = Date.now()
+  const options = { root: join(temp, 'originals'), readPage: onePage, now: () => now }
+  const saved = await captureCompactionOriginal(input(), options)
+  const parent = dirname(dirname(saved.reference.path))
+  const old = join(parent, `.stage-${'1'.repeat(64)}`)
+  const fresh = join(parent, `.stage-${'2'.repeat(64)}`)
+  const unrelated = join(parent, '.stage-unrelated')
+  const oldTime = new Date(now - COMPACTION_ORIGINAL_RETENTION_MS - 1000)
+  for (const dir of [old, fresh, unrelated]) {
+    await mkdir(dir, { mode: 0o700 })
+    await writeFile(join(dir, 'original.txt'), 'crash original', { mode: 0o600 })
+    await utimes(dir, oldTime, oldTime)
+  }
+  await utimes(fresh, new Date(now), new Date(now))
+  assert.deepEqual(await pruneCompactionOriginals(options), { removed: 1 })
+  await assert.rejects(stat(old), { code: 'ENOENT' })
+  assert.equal(await readFile(join(fresh, 'original.txt'), 'utf8'), 'crash original')
+  assert.ok((await stat(unrelated)).isDirectory())
+  assert.ok(await stat(saved.reference.path))
+
+  const outside = join(temp, 'outside')
+  await mkdir(outside, { mode: 0o700 })
+  await writeFile(join(outside, 'keep.txt'), 'outside untouched')
+  const unsafe = join(parent, `.stage-${'3'.repeat(64)}`)
+  await symlink(outside, unsafe)
+  await assert.rejects(pruneCompactionOriginals(options), /PRIVATE_DIRECTORY/)
+  assert.equal(await readFile(join(outside, 'keep.txt'), 'utf8'), 'outside untouched')
+  await rm(unsafe)
+  await mkdir(unsafe, { mode: 0o700 })
+  await chmod(unsafe, 0o755)
+  await utimes(unsafe, oldTime, oldTime)
+  await assert.rejects(pruneCompactionOriginals(options), /PRIVATE_DIRECTORY/)
+  assert.ok((await stat(unsafe)).isDirectory())
+})
+
+test('startup and hourly idle cleanup delete expired originals without a new chat, coalesce sweeps and stop', async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-idle-retention-'))
+  t.after(() => rm(temp, { recursive: true, force: true }))
+  const hour = 60 * 60_000
+  let now = 1000
+  let clockReads = 0
+  const options = { root: join(temp, 'originals'), readPage: onePage, now: () => { clockReads++; return now } }
+  const first = await captureCompactionOriginal(input(), options)
+  now += hour
+  const second = await captureCompactionOriginal(input(), options)
+  now = first.reference.expiresAt + 1
+  clockReads = 0
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  const errors: unknown[] = []
+  const stop = startCompactionArchiveCleanup(options, error => { errors.push(error) })
+  t.after(stop)
+  assert.equal(clockReads, 1, 'startup begins cleanup immediately')
+  t.mock.timers.tick(hour * 3)
+  assert.equal(clockReads, 1, 'a running filesystem sweep is never re-entered')
+  const immediate = pruneCompactionOriginals(options)
+  assert.equal(immediate, pruneCompactionOriginals(options), 'foreground capture and timer share the root sweep')
+  await immediate
+  await assert.rejects(stat(first.reference.path), { code: 'ENOENT' })
+  assert.ok(await stat(second.reference.path))
+  now = second.reference.expiresAt + 1
+  t.mock.timers.tick(hour)
+  assert.equal(clockReads, 2, 'the timer starts a new sweep without another capture')
+  await pruneCompactionOriginals(options)
+  await assert.rejects(stat(second.reference.path), { code: 'ENOENT' })
+  stop()
+  t.mock.timers.tick(hour * 3)
+  assert.equal(clockReads, 2, 'stop cancels every future sweep')
+  assert.deepEqual(errors, [])
+})
+
+test('cleanup reports failures without unhandled rejections even when its error callback rejects', async (t) => {
+  const temp = await mkdtemp(join(tmpdir(), 'oc-compaction-cleanup-errors-'))
+  t.after(() => rm(temp, { recursive: true, force: true }))
+  const root = join(temp, 'root-is-file')
+  await writeFile(root, 'not a directory')
+  let errors = 0
+  let clockReads = 0
+  const options = { root, now: () => { clockReads++; return 1000 } }
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  const stop = startCompactionArchiveCleanup(options, async () => { errors++; throw new Error('logger failed') })
+  t.after(stop)
+  await assert.rejects(pruneCompactionOriginals(options), { code: 'ENOTDIR' })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(errors, 1)
+  t.mock.timers.tick(60 * 60_000)
+  assert.equal(clockReads, 2, 'a logging error cannot strand the running fence')
+  await assert.rejects(pruneCompactionOriginals(options), { code: 'ENOTDIR' })
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.equal(errors, 2)
 })

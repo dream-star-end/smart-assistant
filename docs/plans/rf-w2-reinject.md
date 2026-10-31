@@ -41,8 +41,9 @@ CLI 压缩失败不覆盖或删除上述原文；快照失败发生于提交之�
 路径为 `$OPENCLAUDE_HOME/compaction-originals/sessions/<owner+session SHA256>/<archiveId>/`，
 包含 `snapshot.json`、完整 `original.txt`、模型恢复专用 `recovery-context.txt` 和 `turn-originals/`；trace 索引仅存哈希目录与定位信息。
 目录 0700、文件 0600，排他写入并同步落盘，基础快照以目录原子发布；不把原文写进日志。
-保留期固定 30 天，读时立即拒绝过期内容；capture 按 root 至多每小时清理一次，
-`pruneCompactionOriginals()` 可供生命周期清理调用，基础快照及所有追加片共同删除。
+保留期固定 30 天，读时立即拒绝过期内容；个人版 gateway 启动时和运行期间每小时自动清理，
+无需等待下一次聊天；停机期间的过期内容于下次启动清理。capture 也按 root 至多每小时清理一次。
+`pruneCompactionOriginals()` 将基础快照、所有追加片与过期崩溃暂存目录共同删除；未过期暂存不动。
 `readCompactionOriginal({sessionId,archiveId,principal:{kind:'owner',userId}})` 只读本人会话。
 `readCompactionOriginalByTrace({traceId,principal})` 接受本人或可信进程内 `{kind:'ops-trace'}`；
 ops 只开放 trace 查询 seam，不能借 session reader 扩大权限。本片没有新增公共 HTTP 路由，
@@ -63,4 +64,4 @@ OCV5-675 可调用 owner/ops-trace reader 打开原文及追加片，并自行�
 OCV5-677 可复用 typed 契约和来源标记，本片不改变压缩模型，也不越过 t1387 的既定边界。
 quietctx #1300 继续负责淡灰记录；本片不改 UI，不新增“快满了”提示。
 定向测试已编写：假批准与原文禁止、隐私、字节/多模态、完整分页与一致性、ACL/过期/追加片，
-以及 exact 委派重放不新增派发或 admission；测试、审查与精确 head CI 结果待主控实跑登记。
+以及 exact 委派重放不新增派发或 admission；实际测试、审查与精确 head CI 结果登记在 draft PR 和工单交接中。

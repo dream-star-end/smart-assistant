@@ -85,6 +85,7 @@ const safeId = (id: string): boolean => /^[a-f0-9]{64}$/.test(id)
 const missing = (error: unknown): boolean =>
   !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
 const fail = (code: string): never => { throw new Error(code) }
+const activeStages = new Set<string>()
 
 async function privateDirectory(path: string, recursive = false): Promise<void> {
   await mkdir(path, { mode: 0o700, recursive }).catch((error: unknown) => {
@@ -227,6 +228,7 @@ export async function captureCompactionOriginal(input: {
   await privateDirectory(parent)
   const stage = join(parent, `.stage-${snapshot.archiveId}`)
   await privateDirectory(stage)
+  activeStages.add(stage)
   try {
     await privateDirectory(join(stage, 'turn-originals'))
     await writeImmutable(join(stage, 'snapshot.json'), JSON.stringify(snapshot))
@@ -259,6 +261,8 @@ export async function captureCompactionOriginal(input: {
   } catch (error) {
     await rm(stage, { recursive: true, force: true }).catch(() => {})
     throw error
+  } finally {
+    activeStages.delete(stage)
   }
 }
 
@@ -362,8 +366,25 @@ async function maybePrune(root: string, options: CompactionArchiveOptions): Prom
   lastPrune.set(root, now)
 }
 
+const pruning = new Map<string, Promise<{ removed: number }>>()
+
+/** Timer and foreground capture share one sweep per root. A concurrent capture
+ * cannot fail merely because another sweep already removed an expired row. */
+export function pruneCompactionOriginals(options: CompactionArchiveOptions = {}): Promise<{ removed: number }> {
+  const root = rootFor(options)
+  const current = pruning.get(root)
+  if (current) return current
+  const pending = pruneCompactionOriginalsImpl(options)
+  pruning.set(root, pending)
+  const release = () => { if (pruning.get(root) === pending) pruning.delete(root) }
+  // Both branches consume their result, so housekeeping never creates an
+  // unobserved rejecting Promise in addition to the caller's own Promise.
+  void pending.then(release, release)
+  return pending
+}
+
 /** Fragment files share their snapshot's retention; no orphan fragment store. */
-export async function pruneCompactionOriginals(options: CompactionArchiveOptions = {}): Promise<{ removed: number }> {
+async function pruneCompactionOriginalsImpl(options: CompactionArchiveOptions): Promise<{ removed: number }> {
   const root = rootFor(options)
   const now = nowFor(options)
   let sessions: string[]
@@ -375,6 +396,20 @@ export async function pruneCompactionOriginals(options: CompactionArchiveOptions
     const parentStat = await lstat(parent)
     if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) fail('COMPACTION_ARCHIVE_PRIVATE_DIRECTORY')
     for (const id of await readdir(parent)) {
+      if (/^\.stage-[a-f0-9]{64}$/.test(id)) {
+        const stage = join(parent, id)
+        if (activeStages.has(stage)) continue
+        const stageStat = await lstat(stage)
+        if (!stageStat.isDirectory() || stageStat.isSymbolicLink() || stageStat.uid !== process.getuid?.() ||
+            (stageStat.mode & 0o777) !== 0o700) fail('COMPACTION_ARCHIVE_PRIVATE_DIRECTORY')
+        // No manifest is required: a process can crash before snapshot.json
+        // exists. Exact naming, private ownership and the full age window
+        // distinguish abandoned staging from unrelated or active files.
+        if (stageStat.mtimeMs >= now - COMPACTION_ORIGINAL_RETENTION_MS) continue
+        await rm(stage, { recursive: true })
+        removed++
+        continue
+      }
       if (!safeId(id)) continue
       const dir = join(parent, id)
       const snapshot = JSON.parse(await privateRead(join(dir, 'snapshot.json'))) as CompactionArchiveSnapshot
@@ -390,4 +425,29 @@ export async function pruneCompactionOriginals(options: CompactionArchiveOptions
     }
   }
   return { removed }
+}
+
+/** Enforce retention even if the user never sends another message. Stopping
+ * prevents future sweeps; an already-running sweep is allowed to finish. */
+export function startCompactionArchiveCleanup(
+  options: CompactionArchiveOptions = {},
+  onError: (error: unknown) => void | Promise<void> = () => {},
+): () => void {
+  let stopped = false
+  let running = false
+  const run = async (): Promise<void> => {
+    if (stopped || running) return
+    running = true
+    try {
+      await pruneCompactionOriginals(options)
+    } catch (error) {
+      try { await onError(error) } catch { /* Logging cannot reject the timer task. */ }
+    } finally {
+      running = false
+    }
+  }
+  void run()
+  const timer = setInterval(() => { void run() }, 60 * 60_000)
+  timer.unref?.()
+  return () => { stopped = true; clearInterval(timer) }
 }
