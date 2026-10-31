@@ -107,6 +107,7 @@ export type DelegateCallbackOwner = (typeof DELEGATE_CALLBACK_OWNERS)[number]
  * session surface, decoupled from turn_status working-detail.
  */
 export type InflightDelegateSurface = {
+  background?: true
   jobId: string
   runId: string
   agentId: string

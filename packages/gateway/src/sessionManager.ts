@@ -2078,6 +2078,8 @@ export class SessionManager {
   }
 
   submit(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, effortLevel?: string | null, model?: string, requestId?: string, traceId?: string, conversationMode?: 'default' | 'plan', opts?: {
+      /** Internal delegate cancellation, including preparation before an engine turn exists. */
+      cancellationSignal?: AbortSignal
       historicalMessages?: unknown[]
       /** v5 codex route 消费链(A1):dispatchInbound 校验后的 per-turn provider
        *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine

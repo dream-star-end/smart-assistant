@@ -1,6 +1,6 @@
 /**
  * `oc-memory delegate` / `request-review` — start an async gateway job then
- * use the same bounded foreground wait loop as `delegate-wait`. Identity/depth come from the
+ * accept background delivery or use the bounded foreground `delegate-wait` loop. Identity/depth come from the
  * signed context file (gateway-issued), never from Shell env or CLI flags.
  */
 import { randomBytes } from 'node:crypto'
@@ -14,6 +14,7 @@ import {
   type DelegateWaitLoopResult,
   type DelegateWaitOnce,
 } from './delegateWaitCli.js'
+import { delegateBackgroundCapability, formatDelegateBackground } from './delegateBackground.js'
 
 export const DELEGATE_CONTEXT_HEADER = 'x-openclaude-delegate-context'
 export const DELEGATE_CONTEXT_FILE_ENV = 'OPENCLAUDE_DELEGATE_CONTEXT_FILE'
@@ -73,6 +74,7 @@ export function buildDelegateStartBody(args: DelegateCliArgs): Record<string, un
       : {}),
     ...(args.allowSelf ? { allowSelf: true } : {}),
     ...(args.reviewMode ? { reviewMode: args.reviewMode } : {}),
+    ...delegateBackgroundCapability(args.reviewMode),
     async: true,
     streamProgress: true,
   }
@@ -136,6 +138,9 @@ export async function runDelegateStartAndWait(opts: {
   const start = interpretDelegateStartBody(started.statusCode, started.body)
   if ('error' in start) {
     return { exitCode: 1, stdout: '', stderr: `${start.error}\n` }
+  }
+  if ('resultDelivery' in start && start.resultDelivery === 'background') {
+    return { exitCode: 0, stdout: `${formatDelegateBackground(start, opts.args.agentId)}\n`, stderr: '' }
   }
   return runDelegateWaitLoop({
     jobIds: [start.jobId],

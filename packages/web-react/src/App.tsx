@@ -142,6 +142,7 @@ import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRatings";
 import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
+import { activeBackgroundDelegateJobIds, visibleBackgroundDelegateItems } from "./lib/chat/backgroundDelegates";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
@@ -1541,6 +1542,14 @@ export function App() {
     stoppedTurnRef,
     toast,
   });
+  const backgroundJobIds = activeBackgroundDelegateJobIds(inflightDelegates.controlItems, wsMessages);
+  const stopConversation = useCallback(() => {
+    if (demo) { stopTurn(); return; }
+    if (!activeId) return;
+    const ids = activeBackgroundDelegateJobIds(inflightDelegates.controlItems, chat.getMessages(activeId));
+    if (chat.isSending(activeId)) stopTurn();
+    if (ids.length > 0) chat.stopBackgroundJobs(activeId, ids);
+  }, [activeId, chat, demo, inflightDelegates.controlItems, stopTurn]);
   // 详情面板里点开大记录(>1 MiB 定位桩)时,与聊天区共用同一套正文取数与页面缓存。
   const paneDeferredLoader = useMemo<DeferredPayloadLoader>(
     () => ({ peek: cardCallbacks.onPeekTapeRecordPayload, fetch: cardCallbacks.onFetchTapeRecordPayload }),
@@ -1684,12 +1693,17 @@ export function App() {
   sendScrollRef.current = scrollToBottomOnSend;
 
   const stopShortcutDialog = useStopShortcut({
-    enabled: inWorkspace && sending,
+    enabled: inWorkspace && (sending || backgroundJobIds.length > 0),
     turnKey: `${activeId ?? "demo"}:${activeSess?._activeClientMessageId ?? "demo"}`,
     getStopAction: () => {
       if (demo) return stopTurn;
       const clientMessageId = activeId ? chat.getSession(activeId)?._activeClientMessageId : undefined;
-      return clientMessageId ? () => stopTurnIfCurrent(clientMessageId) : null;
+      const sessionId = activeId;
+      const ids = sessionId ? activeBackgroundDelegateJobIds(inflightDelegates.controlItems, chat.getMessages(sessionId)) : [];
+      return clientMessageId || ids.length > 0 ? () => {
+        if (clientMessageId) stopTurnIfCurrent(clientMessageId);
+        if (sessionId && ids.length > 0) chat.stopBackgroundJobs(sessionId, ids);
+      } : null;
     },
   });
 
@@ -2522,10 +2536,10 @@ export function App() {
           )}
           {!demo && !gated && (
             <PinnedDelegateTracker
-              items={inflightDelegates.items}
+              items={visibleBackgroundDelegateItems(inflightDelegates.items, wsMessages)}
               onDismiss={inflightDelegates.dismiss}
               // 父轮已结束时不再给「停止本轮」(hud H-18 接线):stopTurn 此时无可停之物,按了没反应。
-              onStop={wsSending ? stopTurn : undefined}
+              onStop={backgroundJobIds.length === 0 && wsSending ? stopTurn : undefined}
             />
           )}
           {!demo && !gated && (
@@ -2624,7 +2638,8 @@ export function App() {
             }
             busy={sending}
             stopping={activeSess?._recoveryStatus?.kind === "stopping"}
-            onStop={stopTurn}
+            onStop={stopConversation}
+            backgroundRunning={backgroundJobIds.length > 0}
             disabled={gated}
             environmentPreparing={!demo && chat.provisioning}
             banner={

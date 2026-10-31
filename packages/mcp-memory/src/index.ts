@@ -61,6 +61,7 @@ import {
 import { normalizeSkillSaveArgs } from './skillSaveArgs.js'
 import { buildMcpSkillStore } from './skillStoreContext.js'
 import { delegateResumeIdempotencyKey } from './delegateStartCli.js'
+import { delegateBackgroundCapability } from './delegateBackground.js'
 import {
   formatDelegateFanoutRunning,
   resolveCursorFastWaitMs,
@@ -848,8 +849,8 @@ async function handleDelegateTasks(args: { tasks?: unknown }, deadlineAtMs?: num
 
 /**
  * Delegate tools no longer use one long HTTP request: every engine starts an
- * async job and waits for terminal inside one tools/call, or hands callback
- * ownership to the gateway before its deadline. send_to_agent returns immediately and
+ * async job, accepts explicit background delivery, or retains its existing
+ * foreground wait. send_to_agent returns immediately and
  * lets the gateway inject the origin session when the child finishes.
  */
 
@@ -1000,7 +1001,7 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[], deadlineAtMs?: numb
           label,
           allowSelf: t.allowSelf,
         })
-        if (r.kind === 'running' || r.kind === 'deferred') {
+        if (r.kind === 'running' || r.kind === 'deferred' || r.kind === 'background') {
           return {
             label,
             goal: t.goal,
@@ -1009,6 +1010,7 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[], deadlineAtMs?: numb
             running: true,
             deferred: r.kind === 'deferred',
             jobId: r.jobId,
+            ...(r.kind === 'background' ? { backgroundHandle: r.handle } : {}),
           }
         }
         return {
@@ -1027,7 +1029,11 @@ async function handleAsyncDelegateTasks(tasks: FanoutTask[], deadlineAtMs?: numb
       }
     }),
   )
-  if (items.some((it) => it.running)) return toolOk(formatDelegateFanoutRunning(items))
+  if (items.some((it) => it.running)) {
+    const result = toolOk(formatDelegateFanoutRunning(items))
+    const backgroundJobs = items.flatMap((item) => item.backgroundHandle ? [item.backgroundHandle] : [])
+    return backgroundJobs.length > 0 ? { ...result, structuredContent: { backgroundJobs } } : result
+  }
   return toolOk(
     aggregateDelegateFanoutResults(
       items.map((it) => ({
@@ -1069,6 +1075,7 @@ async function runAsyncDelegateToAgent(
     ...(args.effort ? { effort: args.effort } : {}),
     ...(args.model ? { model: args.model } : {}),
     ...(args.reviewMode ? { reviewMode: args.reviewMode } : {}),
+    ...delegateBackgroundCapability(args.reviewMode),
     sourceAgent,
     toolsets: args.toolsets,
     async: true,
@@ -1147,6 +1154,7 @@ async function handleDelegateTaskToAgent(
     const r = await runAsyncDelegateToAgent(targetAgent, args)
     // 网关的自委派拒绝文案指向 CLI 旗标 --allow-self;MCP 调用方要的是 allowSelf 参数。
     if (r.kind === 'error') return toolError(rewriteSelfDelegateErrorForMcp(r.text))
+    if (r.kind === 'background') return { ...toolOk(r.text), structuredContent: { ...r.handle } }
     return toolOk(r.text)
   } catch (err: any) {
     return toolError(`委派失败: ${describeDelegateTransportError(err)}`)

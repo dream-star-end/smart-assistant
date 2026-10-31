@@ -198,3 +198,37 @@ describe("dismissed 持久化(H-14)", () => {
     expect(back.has("job-0")).toBe(false);
   });
 });
+
+describe("background control authority is independent of HUD presentation", () => {
+  const auth = createMemoryAuthSession(() => {}, "tok");
+  test("dismissed and old terminal jobs remain control evidence after remount", async () => {
+    const sessionId = "s-background-control";
+    writeDismissedDelegates(sessionId, new Set());
+    const fresh = item({ background: true, state: "completed", updatedAt: Date.now() });
+    const old = item({ background: true, jobId: "dlgjob-old", runId: "dlg-old", state: "completed", updatedAt: Date.now() - TERMINAL_RECENCY_MS - 1 });
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValue({ ok: true, items: [fresh, old] });
+    const first = renderHook(() => useInflightDelegates({ sessionId, messages: [], enabled: true, auth }));
+    await act(async () => {});
+    expect(first.result.current.items).toEqual([fresh]);
+    expect(first.result.current.controlItems).toEqual([fresh, old]);
+    act(() => first.result.current.dismiss(fresh.jobId));
+    expect(first.result.current.items).toEqual([]);
+    expect(first.result.current.controlItems).toEqual([fresh, old]);
+    first.unmount();
+    const second = renderHook(() => useInflightDelegates({ sessionId, messages: [], enabled: true, auth }));
+    await act(async () => {});
+    expect(second.result.current.items).toEqual([]);
+    expect(second.result.current.controlItems).toEqual([fresh, old]);
+    writeDismissedDelegates(sessionId, new Set());
+  });
+  test("a finished card can hide HUD progress while the real running job remains stoppable during cleanup", async () => {
+    const running = item({ background: true, updatedAt: Date.now() });
+    vi.mocked(fetchInflightDelegatesResult).mockResolvedValue({ ok: true, items: [running] });
+    const messages = [{ id: "srv-finished", role: "agent-group" as const, text: "校验", ts: Date.now(), _backgroundDelegate: true,
+      _delegateRunId: running.runId, _delegateJobId: running.jobId, _completed: true }];
+    const { result } = renderHook(() => useInflightDelegates({ sessionId: "s-bg-cleanup", messages, enabled: true, auth }));
+    await act(async () => {});
+    expect(result.current.items[0]?.state).toBe("completed");
+    expect(result.current.controlItems[0]?.state).toBe("running");
+  });
+});

@@ -40,6 +40,25 @@ function fakeTransactionalPool(
 }
 
 describe('Master durable turn controls', () => {
+  test('exact background Stop leaves foreground permissions and recovery untouched', async () => {
+    const payload = { type: 'inbound.control.stop', backgroundJobIds: ['dlgjob-1'] }
+    const { pool, calls } = fakeTransactionalPool((sql, params) => {
+      if (sql.includes('pg_advisory_xact_lock')) return { rowCount: 1 }
+      if (sql.includes('INSERT INTO turn_control_requests')) {
+        assert.equal(params[3], null)
+        assert.deepEqual(JSON.parse(String(params[6])), payload)
+        return { rows: [{ status: 'pending' }], rowCount: 1 }
+      }
+      throw new Error(`background Stop must not touch foreground authority: ${sql}`)
+    })
+    assert.deepEqual(await admitDurableControl(pool, {
+      controlId: 'ctrl-background', userId: 7n, sessionId: 'session-1',
+      kind: 'stop', payload,
+    }), { inserted: true, status: 'pending' })
+    assert.equal(calls.at(-1), 'COMMIT')
+    assert.equal(calls.some((sql) => /UPDATE turn_permission_requests|UPDATE turn_recovery_jobs/.test(sql)), false)
+  })
+
   test('Stop commit cancels the exact recovery root in the same transaction', async () => {
     const permissionCancels: unknown[][] = []
     const { pool, calls } = fakeTransactionalPool((sql, params) => {

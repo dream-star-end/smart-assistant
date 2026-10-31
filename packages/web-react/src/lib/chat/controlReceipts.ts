@@ -25,6 +25,14 @@ export function applyControlReceipt(frame: OutboundControlReceiptWire, context: 
   if (item.clientMessageId && frame.clientMessageId && frame.clientMessageId !== item.clientMessageId) return;
   if (item.requestId && frame.requestId && frame.requestId !== item.requestId) return;
   const sess = context.sessions.get(item.sessId);
+  if (item.backgroundOnly === true) {
+    if (frame.status === "persisted") {
+      item.status = "persisted";
+      context.persist?.(item.sessId);
+      context.notify();
+    } else context.settle(frame.controlId, frame.status);
+    return;
+  }
   if (frame.status === "persisted" || (frame.status === "applied" && item.controlKind === "stop")) {
     item.status = "persisted";
     if (item.controlKind === "stop" && item.fenceOnly === true) return;

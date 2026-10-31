@@ -1,3 +1,4 @@
+import { isBackgroundDelegateFrame, stampBackgroundDelegateReceipt } from "./backgroundDelegates";
 /**
  * v5 出站帧 → 消息模型**翻译 reducer**。从现网 vanilla handleOutbound + 各独立帧
  * handler 逐条复刻（websocket.js:2559-3540 主线 + 3565-4595 各 handler）。
@@ -1074,6 +1075,8 @@ export function normalizeGoalCards(sess: ChatSession): void {
 }
 
 type DelegateProgressBlock = {
+  background?: boolean;
+  cancelled?: boolean;
   kind: "delegate_progress";
   runId: string;
   agentId: string;
@@ -1281,6 +1284,8 @@ function applyDelegateUsageSnapshot(msg: ChatMessage, block: DelegateProgressBlo
 /** 把一个 delegate_progress 帧落到已绑定的 agent-group 富卡(done/error → 终态;block → 富子块;
  *  legacy text → 降级子块)。fan-out 物化的组与既有单数委派组共用同一套落地语义。 */
 function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, block: DelegateProgressBlock): void {
+  if (block.background === true) { groupMsg._backgroundDelegate = true; groupMsg._background = true; }
+  if (block.cancelled === true) groupMsg.cancelled = true;
   if (applyDelegateUsageSnapshot(groupMsg, block)) {
     return;
   } else if (block.phase === "done" || block.phase === "error") {
@@ -1392,7 +1397,7 @@ function handleDelegateProgressBlock(
   // tool_use 可 adopt),直接把该 run 物化成 live agent-group —— 同轮 ≥2 个自动聚成 TeamPanel,turn 末
   // server-authored 骨架行按 runId 折叠去重(债A),消除「兜底卡 + 团队面板」三卡并存。单数委派(无 fan-out
   // tool 卡)则保留下方 delegate-progress standalone 兜底,由后到的 delegate_task tool_use adopt(零回归)。
-  if (!legacy && hasActiveFanoutDelegate(sess)) {
+  if (!legacy && (hasActiveFanoutDelegate(sess) || block.background === true)) {
     if (hasFrozenDelegateCard(sess, block.runId)) return;
     const goalRaw = typeof block.goal === "string" ? block.goal : "";
     const groupMsg = addMessage(sess, "agent-group", goalRaw.trim() || "子任务", {
@@ -1431,6 +1436,8 @@ function handleDelegateProgressBlock(
     });
     placeProcessCardAtCallSite(sess, msg);
   }
+  if (block.background === true) { msg._backgroundDelegate = true; msg._background = true; }
+  if (block.cancelled === true) msg.cancelled = true;
   if (block.agentId) msg.agentId = block.agentId;
   if (typeof block.goal === "string" && block.goal && !msg._delegateGoal) {
     msg.goal = block.goal;
@@ -1583,6 +1590,12 @@ export function applyOutboundMessage(
 
   // ── §3 frameSeq dedupe ──
   if (!acceptFrameSeq(sess, frame)) return;
+  // Explicit passive progress may belong to an earlier turn. Update only its
+  // exact child card; parent trackers, admission and confirmation remain untouched.
+  if (isBackgroundDelegateFrame(frame)) {
+    for (const block of frame.blocks ?? []) handleDelegateProgressBlock(sess, block as DelegateProgressBlock, frame.clientMessageId);
+    return;
+  }
 
   // server ts 跟踪(max 单调):供 resetReplyTracker 定格 server 域 stale 截止(§11)。
   trackServerTs(sess, frame.ts);
@@ -2262,14 +2275,16 @@ export function applyOutboundMessage(
         const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
         if (groupMsg) {
           if (frameTurnOwnerId && !groupMsg._turnOwnerId) groupMsg._turnOwnerId = frameTurnOwnerId;
+          const completedBackground = groupMsg._backgroundDelegate === true && groupMsg._completed === true && !!groupMsg._delegateRunId;
           const rawOutput = rb.output ?? rb.preview ?? "";
           const rawPreview = rb.preview ?? rawOutput;
           const preview = friendlyDelegateResultPreview(rawPreview) || (isDelegateResultWrapper(rawPreview) ? "" : rawPreview);
           groupMsg.output = rawOutput;
           if (rb.outputJson !== undefined) groupMsg.outputJson = rb.outputJson;
-          if (isRunningBackgroundToolResult(rawOutput, rb.outputJson)) {
+          stampBackgroundDelegateReceipt(groupMsg);
+          if (isRunningBackgroundToolResult(rawOutput, rb.outputJson) || groupMsg._backgroundDelegate === true) {
             groupMsg._background = true;
-            groupMsg._completed = false;
+            if (!completedBackground) groupMsg._completed = false;
             const jobId = backgroundDelegateJobId(rawOutput, rb.outputJson)
             if (jobId) {
               groupMsg._delegateJobId = jobId
@@ -2298,6 +2313,7 @@ export function applyOutboundMessage(
           existing.completedAt = Date.now();
           existing.output = rb.output ?? rb.preview ?? "";
           if (rb.outputJson !== undefined) existing.outputJson = rb.outputJson;
+          stampBackgroundDelegateReceipt(existing);
           existing.error = !!rb.isError;
           existing._partial = false;
           continue;
@@ -2322,6 +2338,7 @@ export function applyOutboundMessage(
         _partial: false,
         ...(frameTurnOwnerId ? { _turnOwnerId: frameTurnOwnerId } : {}),
       });
+      stampBackgroundDelegateReceipt(m);
       if (rb.blockId) sess._blockIdToMsgId?.set(rb.blockId, m.id);
     } else if (b.kind === "tool_output_tail") {
       // §7 单调守卫：totalBytes 回退丢弃。

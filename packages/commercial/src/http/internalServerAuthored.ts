@@ -224,6 +224,9 @@ const AgentGroupEntrySchema = z
     status: z.enum(["ok", "failed", "timeout"]),
     resultSummary: z.string().max(SCHEMA_AGENT_GROUP_RESULT_MAX_CHARS).optional(),
     completedAt: z.number().int().positive(),
+    background: z.literal(true).optional(),
+    jobId: z.string().regex(/^dlgjob-[A-Za-z0-9-]{1,160}$/).optional(),
+    cancelled: z.literal(true).optional(),
     // P2 债C — 隐藏审查员委派专属结构化裁决(与 @openclaude/protocol
     // teamCards.ts REVIEW_VERDICTS 手抄对齐,同 status 手抄 z.enum 风格)。仅审查员
     // 委派行携带,落库映射为 `_reviewVerdict`;普通成员委派恒 undefined。
@@ -1265,6 +1268,9 @@ export function makeServerAuthoredHandler(
             status: body.status,
             _delegate: true,
             _delegateRunId: ag.runId,
+            ...(ag.background === true ? { _backgroundDelegate: true } : {}),
+            ...(ag.jobId ? { _delegateJobId: ag.jobId } : {}),
+            ...(ag.cancelled === true ? { cancelled: true } : {}),
             _delegateAgentId: ag.agentId,
             _delegateGoal: ag.goal,
             // Tristate (NEW display field) + legacy boolean the current UI reads.

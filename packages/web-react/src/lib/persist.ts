@@ -74,6 +74,8 @@ export type StoredPendingControl = {
    * in-flight / 「正在停止…」,回执也不清当前(可能已是下一轮的)发送态。
    */
   fenceOnly?: true;
+  /** Exact background jobs only: never restores or settles the parent turn. */
+  backgroundOnly?: true;
 };
 
 /**

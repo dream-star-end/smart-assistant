@@ -14,6 +14,8 @@ export type DelegateProgressPhase =
   | 'error'
 
 export type DelegateProgressBlock = {
+  background?: true
+  cancelled?: true
   kind: 'delegate_progress'
   runId: string
   agentId: string

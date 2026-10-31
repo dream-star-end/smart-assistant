@@ -544,6 +544,8 @@ export type ChatMessage = {
   _delegateJobId?: string;
   /** send_to_agent 真后台：父 turn 收尾后组卡仍保持运行中，直到子 agent 终态进度帧。 */
   _background?: boolean;
+  /** Explicit passive delegate result; distinct from legacy tool backgrounding. */
+  _backgroundDelegate?: boolean;
   _agentGroupOrigin?: string;
   _teamFallback?: boolean;
   /** agent-group ↔ delegate-progress run 绑定键（双向 adopt，§7）。*/

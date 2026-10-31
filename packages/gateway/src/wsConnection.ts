@@ -1,3 +1,4 @@
+import { backgroundDelegates, isDelegateBackgroundEffective } from './delegateBackground.js'
 import { withUserError } from '@openclaude/protocol'
 import { SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
 import { captureSystemHelpFrame } from './systemHelpFrames.js'
@@ -575,6 +576,7 @@ export function handleWsConnection(
           typeof goalFrame.objective === 'string' ? goalFrame.objective : undefined
         await this.sessions.applyUserGoalAction(goalSessionKey, goalAction, goalObjective)
       } else if (frame.type === 'inbound.control.stop') {
+        ;(frame as unknown as { _userId?: string })._userId = this.getWsUserId(ws)
         const applied = await this.handleStop(frame)
         const controlId = (frame as unknown as { controlId?: unknown }).controlId
         if (isControlId(controlId)) {
@@ -1297,12 +1299,23 @@ export type HandleStopFrame = {
     agentId?: string
     sessionKey?: string
     clientMessageId?: string
+    backgroundJobIds?: string[]
+    _userId?: string
   }
 
 export async function handleStop(
   this: WsConnectionHost,
   frame: HandleStopFrame,
 ): Promise<boolean> {
+  const hasBackgroundIds = Object.prototype.hasOwnProperty.call(frame, 'backgroundJobIds')
+  const backgroundStopped = frame.channel === 'webchat' && frame.peer.kind === 'dm' &&
+    isDelegateBackgroundEffective() && backgroundDelegates(this).stop({
+    peerId: frame.peer.id, userId: frame._userId, clientMessageId: frame.clientMessageId,
+    jobIds: Array.isArray(frame.backgroundJobIds) ? frame.backgroundJobIds.filter(id => typeof id === 'string') : [],
+  })
+  // An exact background control must never fall through to legacy peer-wide Stop,
+  // even when its IDs are stale, invalid, foreign or already terminal.
+  if (hasBackgroundIds && !frame.clientMessageId) return backgroundStopped
   let sessionKey = frame.sessionKey
   const explicitStopAgentId = sessionKey?.split(':')[1] ?? frame.agentId
   if (explicitStopAgentId && isHiddenSystemAgentId(explicitStopAgentId)) {
@@ -1323,8 +1336,14 @@ export async function handleStop(
       if (!live.sessionKey.endsWith(suffix)) continue
       const selfInterrupted = this.sessions.interruptClientTurn(live.sessionKey, clientMessageId)
       if (!selfInterrupted) continue
+      if (isDelegateBackgroundEffective() && live.userId === frame._userId && live._currentTurnKey) {
+        backgroundDelegates(this).sealOwner(live.sessionKey, live._currentTurnKey)
+      }
+      const backgroundCurrentStopped = isDelegateBackgroundEffective() && backgroundDelegates(this).stop({
+        peerId: frame.peer.id, userId: frame._userId, clientMessageId, captureCurrentTurn: true,
+      })
       const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
-      const ok = selfInterrupted || delegateInterrupted
+      const ok = selfInterrupted || delegateInterrupted || backgroundCurrentStopped || backgroundStopped
       // The turn is gone; any permission it was blocked on must not
       // outlive it as a dead card (browser) / pending row (master).
       this._settlePendingPermissionsForStop(live.sessionKey, clientMessageId)
@@ -1340,6 +1359,9 @@ export async function handleStop(
     // TURN_NOT_ACTIVE and letting it run unseen.
     if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
       this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
+      if (isDelegateBackgroundEffective()) backgroundDelegates(this).stop({
+        peerId: frame.peer.id, userId: frame._userId, clientMessageId, captureCurrentTurn: true,
+      })
       this.log.info('interrupt', {
         sessionKey: `*${suffix}`,
         clientMessageId,
@@ -1364,7 +1386,7 @@ export async function handleStop(
       clientMessageId,
       ok: false,
     })
-    return false
+    return backgroundStopped
   }
   if (!sessionKey) {
     if (frame.agentId) {

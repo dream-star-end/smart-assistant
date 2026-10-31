@@ -124,6 +124,11 @@ export async function admitDurableControl(
   input: DurableControlInput,
 ): Promise<{ inserted: boolean; status: TurnControlStatus; errorCode?: string }> {
   return inTransaction(pool, async (client) => {
+    // Exact background-job controls do not cancel the foreground turn's
+    // permissions or automatic recovery, even though they have no parent cmid.
+    const backgroundOnly = input.kind === 'stop' && input.rootClientMessageId == null &&
+      !isClientMessageId(input.payload.clientMessageId) &&
+      Object.prototype.hasOwnProperty.call(input.payload, 'backgroundJobIds')
     let effectiveRootClientMessageId = input.rootClientMessageId ?? null
     if (input.kind === 'stop') {
       await client.query(
@@ -212,7 +217,7 @@ export async function admitDurableControl(
       return { inserted: false, status: row.status, ...(row.error_code ? { errorCode: row.error_code } : {}) }
     }
 
-    if (input.kind === 'stop') {
+    if (input.kind === 'stop' && !backgroundOnly) {
       // INC-20260903-PENDING-PERMISSION-ZOMBIE — a user Stop makes every
       // still-open prompt of that turn unanswerable (the runtime aborts the
       // tool). Close the durable authority in the same transaction so the
@@ -264,7 +269,7 @@ export async function admitDurableControl(
           [row.dispatch_id, row.dispatch_attempt_no],
         )
       }
-    } else {
+    } else if (input.kind === 'permission') {
       const permission = await client.query<{ status: string }>(
         `SELECT status FROM turn_permission_requests
           WHERE user_id=$1 AND request_id=$2 AND session_id=$3
@@ -710,7 +715,7 @@ export async function readPendingPermissionPrompts(
                AND (
                  c.root_client_message_id=p.client_message_id
                  -- legacy peer-wide Stop: only one admitted after the prompt
-                 OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+                 OR (c.root_client_message_id IS NULL AND NOT (c.payload_json ? 'backgroundJobIds') AND c.created_at>=p.created_at)
                )
           )
         )
@@ -826,7 +831,7 @@ const PENDING_PERMISSION_ZOMBIE_SQL = `
                AND c.status<>'cancelled'
                AND (
                  c.root_client_message_id=p.client_message_id
-                 OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+                 OR (c.root_client_message_id IS NULL AND NOT (c.payload_json ? 'backgroundJobIds') AND c.created_at>=p.created_at)
                )
           )
         )`
@@ -860,7 +865,7 @@ export const PERMISSION_PROMPT_HELLO_PRODUCTION_SQL =
                 AND c.status<>'cancelled'
                 AND (
                   c.root_client_message_id=p.client_message_id
-                  OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+                  OR (c.root_client_message_id IS NULL AND NOT (c.payload_json ? 'backgroundJobIds') AND c.created_at>=p.created_at)
                 )
            )
          )
@@ -1070,7 +1075,7 @@ const STOPPED_PROJECTION_SQL = `(
              AND c.status<>'cancelled'
              AND (
                c.root_client_message_id=p.client_message_id
-               OR (c.root_client_message_id IS NULL AND c.created_at>=p.created_at)
+               OR (c.root_client_message_id IS NULL AND NOT (c.payload_json ? 'backgroundJobIds') AND c.created_at>=p.created_at)
              )
         )
       ) AS stopped`

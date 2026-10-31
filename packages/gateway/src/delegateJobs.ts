@@ -488,18 +488,18 @@ export class DelegateJobStore {
     jobId: string,
     result: DelegateJobHttpResult,
     fence?: { claimToken: string; fencingEpoch: number },
-    opts?: { callbackState?: DelegateCallbackState },
+    opts?: { callbackState?: DelegateCallbackState; explicitTerminal?: boolean },
   ): boolean {
     const job = this.refreshJob(jobId)
     if (!job || job.result) return false
-    if (this.sm && job.claimToken) {
+    if ((this.sm || opts?.explicitTerminal) && job.claimToken) {
       if (!fence || job.claimToken !== fence.claimToken || job.fencingEpoch !== fence.fencingEpoch) {
         if (fence) this.detachRunner(jobId, fence.claimToken, fence.fencingEpoch)
         return false
       }
     }
     const draft = this.cloneEntry(job)
-    if (this.sm || (job.kind === 'delegate' && job.callback === 'origin-inject')) {
+    if (this.sm || opts?.explicitTerminal || (job.kind === 'delegate' && job.callback === 'origin-inject')) {
       const next: DelegateJobState = result.httpStatus >= 200 && result.httpStatus < 300 ? 'completed' : 'failed'
       const gate = assertDelegateTransition(draft.state, next)
       if (!gate.ok && draft.state !== next) return false

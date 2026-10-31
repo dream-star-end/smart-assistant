@@ -92,6 +92,7 @@ export type TouchDelegateInflightSurfaceInput = {
     userId?: string
     nested?: boolean
     ownerRunId?: string
+    background?: true
     preserveIdentity?: boolean
   }
 
@@ -120,6 +121,7 @@ export function _touchDelegateInflightSurface(
       nested: input.nested,
       ownerRunId: input.ownerRunId,
       preserveIdentity: input.preserveIdentity,
+      background: input.background,
       ...fence,
     })
     if (patch) return
@@ -135,6 +137,7 @@ export function _touchDelegateInflightSurface(
       nested: input.nested,
       ownerRunId: input.ownerRunId,
       preserveIdentity: input.preserveIdentity,
+      background: input.background,
       ...fence,
     })
   } catch (err) {

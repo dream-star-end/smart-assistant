@@ -1,3 +1,4 @@
+import { backgroundStopControl, buildStopControl, isBackgroundDelegateFrame, stableControlId } from "./backgroundDelegates";
 import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch,MODEL_SWITCH_CANCELLED_MESSAGE} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
 import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
@@ -408,17 +409,6 @@ export function messageAttemptIdempotencyKey(clientMessageId: string, attempt: n
     hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
   return `webh:${hash.toString(36)}:${safeAttempt}`;
-}
-
-function stableControlId(kind: "stop" | "permission", identity: string): string {
-  const readable = `control:${kind}:${identity}`;
-  if (/^[A-Za-z0-9._:-]{1,128}$/.test(readable)) return readable;
-  let hash = 0xcbf29ce484222325n;
-  for (let i = 0; i < identity.length; i++) {
-    hash ^= BigInt(identity.charCodeAt(i));
-    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-  }
-  return `control:${kind}:h${hash.toString(36)}`;
 }
 
 /** Durable browser identity for exactly one continuation of an interrupted
@@ -2472,7 +2462,7 @@ export class ChatSocket {
         const frame = f as OutboundMessageWire;
         const sess = this.resolveSession(frame.peer?.id);
         if (!sess) return;
-        if (frame.clientMessageId) this.confirmDispatchAdmission(sess.id, frame.clientMessageId, !frame.meta?.reconcile);
+        if (frame.clientMessageId && !isBackgroundDelegateFrame(frame)) this.confirmDispatchAdmission(sess.id, frame.clientMessageId, !frame.meta?.reconcile);
         applyOutboundMessage(sess, frame, this.effects());
         return;
       }
@@ -4251,7 +4241,7 @@ export class ChatSocket {
       : [];
     for (const control of storedControls) {
       const item: PendingControlItem = { ...control, status: "queued" };
-      if (control.controlKind === "stop" && control.fenceOnly === true) {
+      if (control.controlKind === "stop" && (control.fenceOnly === true || control.backgroundOnly === true)) {
         // 围栏 stop 只需重放到 master;不代表在飞 turn,不进入停止态。
       } else if (control.controlKind === "stop") {
         s._sendingInFlight = true;
@@ -4748,7 +4738,7 @@ export class ChatSocket {
                 sessForUnits._liveUnitsPackApplied = true;
                 sessForUnits._liveUnitsHasMoreBefore = raw.hasMoreBefore;
                 sessForUnits._liveUnitsBeforeCursor = raw.beforeCursor;
-                if (sessForUnits._recoveryStatus?.kind !== "stopping") {
+                if (sessForUnits._recoveryStatus?.kind !== "stopping" && raw.units.some((unit) => unit.background !== true)) {
                   sessForUnits._recoveryStatus = { kind: "resumed" };
                 }
               }
@@ -6121,7 +6111,7 @@ export class ChatSocket {
         item.status = "waiting_persist";
         item.attempt += 1;
         const sess = this.sessions.get(item.sessId);
-        if (sess) {
+        if (sess && item.backgroundOnly !== true) {
           sess._recoveryStatus = {
             kind: "waiting-service",
             attempt: item.attempt,
@@ -6192,7 +6182,7 @@ export class ChatSocket {
     if (durableClear) void durableClear.catch(() => {});
     const sess = this.sessions.get(item.sessId);
     if (!sess) return;
-    if (item.controlKind === "stop" && item.fenceOnly === true) {
+    if (item.controlKind === "stop" && (item.fenceOnly === true || item.backgroundOnly === true)) {
       // 围栏 stop 的回执只是 master 已落库取消恢复子轮;红卡早已物化,当前发送态(若有)属于
       // 之后的新轮,不能被这条回执清掉。
       this.scheduleNotify();
@@ -6372,6 +6362,13 @@ export class ChatSocket {
     this.kickDispatchPump();
   }
 
+  stopBackgroundJobs(sessId: string, jobIds: readonly string[]): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const item = backgroundStopControl(sessId, sess.agentId || this.deps.defaultAgentId || "main", jobIds);
+    if (item) this.enqueueControl(item);
+  }
+
   stopTurn(sessId: string, expectedClientMessageId?: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess || (expectedClientMessageId !== undefined && sess._activeClientMessageId !== expectedClientMessageId)) return;
@@ -6403,26 +6400,8 @@ export class ChatSocket {
       if (fenceId) {
         const controlId = stableControlId("stop", `${fenceId}:recovery-fence`);
         if (!this.controlQueue.some((item) => item.controlId === controlId)) {
-          this.enqueueControl({
-            kind: "control",
-            sessId: sess.id,
-            controlId,
-            controlKind: "stop",
-            clientMessageId: fenceId,
-            agentId: stopAgentId,
-            fenceOnly: true,
-            payload: {
-              type: "inbound.control.stop",
-              controlId,
-              channel: "webchat",
-              peer: { id: sess.id, kind: "dm" },
-              agentId: stopAgentId,
-              clientMessageId: fenceId,
-            },
-            enqueuedAt: Date.now(),
-            attempt: 0,
-            status: "queued",
-          });
+          this.enqueueControl(buildStopControl({ sessId: sess.id, agentId: stopAgentId,
+            controlId, clientMessageId: fenceId, fenceOnly: true }));
         }
       }
       this.deps.persistSession?.(sess.id);
@@ -6545,25 +6524,7 @@ export class ChatSocket {
         phase: "persisting",
       };
       sess._recoveryStatus = { kind: "stopping" };
-      this.enqueueControl({
-        kind: "control",
-        sessId: sess.id,
-        controlId,
-        controlKind: "stop",
-        ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}),
-        agentId,
-        payload: {
-          type: "inbound.control.stop",
-          controlId,
-          channel: "webchat",
-          peer: { id: sess.id, kind: "dm" },
-          agentId,
-          ...(activeClientMessageId ? { clientMessageId: activeClientMessageId } : {}),
-        },
-        enqueuedAt: Date.now(),
-        attempt: 0,
-        status: "queued",
-      });
+      this.enqueueControl(buildStopControl({ sessId: sess.id, agentId, controlId, clientMessageId: activeClientMessageId }));
       this.deps.persistSession?.(sess.id);
     } else {
       if (activeClientMessageId) this.finishDispatch(sess.id, activeClientMessageId);

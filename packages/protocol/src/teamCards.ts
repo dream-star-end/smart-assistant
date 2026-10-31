@@ -31,6 +31,9 @@ export const TEAM_CARD_CLIENT_DISPLAY_FIELDS = [
   '_delegateAgentId',
   '_delegateGoal',
   '_delegateRunId',
+  '_delegateJobId',
+  '_backgroundDelegate',
+  'cancelled',
   // 委派终态三态(ok/failed/timeout)。历史上前端只有 `_completed`+`_isError` 两个
   // 布尔,timeout 与 failed 无法区分(都落 _isError=true)。server-authored 化
   // (P2 债A)引入本字段承载完整终态,let 前端可分别渲染"超时/失败";server 行同时
@@ -121,6 +124,11 @@ export interface DurableRuntimeEvent {
 }
 
 export interface DurableAgentGroup {
+  /** Explicit passive background delivery, without a new parent model turn. */
+  background?: true;
+  /** Exact durable job identity, retained after refresh and HUD dismissal. */
+  jobId?: string;
+  cancelled?: true;
   /** 委派 run 关联键(= gateway progressRunId `dlg-…`)。落库映射为行的
    *  `_delegateRunId`,是 server 行 ↔ 本地 `m-*` agent-group 行的去重合并键
    *  (server-wins 禁用,local 富行胜)。 */

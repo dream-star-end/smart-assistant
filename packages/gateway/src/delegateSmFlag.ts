@@ -1,3 +1,4 @@
+import { isDelegateBackgroundEffective } from './delegateBackground.js'
 /**
  * OCV5-22 phase 0 / stage 1 feature flags.
  *
@@ -67,7 +68,7 @@ export function isDelegateInflightSurfaceEnabled(env: NodeJS.ProcessEnv = proces
 }
 
 export function isDelegateInflightSurfaceEffective(env: NodeJS.ProcessEnv = process.env): boolean {
-  return isDelegateInflightSurfaceEnabled(env)
+  return isDelegateInflightSurfaceEnabled(env) || isDelegateBackgroundEffective(env)
 }
 
 function envFlagOn(env: NodeJS.ProcessEnv, key: string): boolean {

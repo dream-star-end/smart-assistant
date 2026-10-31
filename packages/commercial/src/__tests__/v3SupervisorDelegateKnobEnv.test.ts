@@ -26,6 +26,7 @@ const KEYS = [
   'OC_DELEGATE_NOTIFIER',
   'OC_DELEGATE_CUTOVER',
   'OC_DELEGATE_INFLIGHT_SURFACE',
+  'OC_DELEGATE_BACKGROUND',
   'OC_DELEGATE_INLINE_PUSH_CCB',
   'OC_DELEGATE_INLINE_PUSH_CODEX',
   'OC_DELEGATE_CURSOR_MCP_WAIT',
@@ -36,8 +37,8 @@ const KEYS = [
 ] as const
 
 describe('buildDelegateKnobContainerEnv', () => {
-  test('exported key list matches the eighteen knobs and feature flags', () => {
-    assert.equal(KEYS.length, 18)
+  test('exported key list matches the nineteen knobs and feature flags', () => {
+    assert.equal(KEYS.length, 19)
     assert.deepEqual([...DELEGATE_KNOB_CONTAINER_ENV_KEYS], [...KEYS])
   })
 
@@ -113,6 +114,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       OC_DELEGATE_NOTIFIER: '1',
       OC_DELEGATE_CUTOVER: '0',
       OC_DELEGATE_INFLIGHT_SURFACE: '1',
+      OC_DELEGATE_BACKGROUND: '1',
       OC_DELEGATE_INLINE_PUSH_CCB: '1',
       OC_DELEGATE_INLINE_PUSH_CODEX: '0',
       OC_DELEGATE_CURSOR_MCP_WAIT: '1',
@@ -127,6 +129,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       'OC_DELEGATE_NOTIFIER=1',
       'OC_DELEGATE_CUTOVER=0',
       'OC_DELEGATE_INFLIGHT_SURFACE=1',
+      'OC_DELEGATE_BACKGROUND=1',
       'OC_DELEGATE_INLINE_PUSH_CCB=1',
       'OC_DELEGATE_INLINE_PUSH_CODEX=0',
       'OC_DELEGATE_CURSOR_MCP_WAIT=1',

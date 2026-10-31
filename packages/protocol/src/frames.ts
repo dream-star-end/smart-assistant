@@ -320,6 +320,8 @@ export const InboundControlStop = Type.Object({
    * redirecting Stop to the newly selected assistant while the old turn is
    * still running. */
   clientMessageId: Type.Optional(ClientMessageId),
+  /** Exact snapshot; never authorizes a peer-wide Stop. */
+  backgroundJobIds: Type.Optional(Type.Array(Type.String({ pattern: '^dlgjob-[A-Za-z0-9-]{1,160}$' }), { maxItems: 32, uniqueItems: true })),
 })
 export type InboundControlStop = Static<typeof InboundControlStop>
 
@@ -814,6 +816,9 @@ export const OutboundContentBlock = Type.Union([
   // treated as assistant final-answer content.
   Type.Object({
     kind: Type.Literal('delegate_progress'),
+    background: Type.Optional(Type.Literal(true)),
+    cancelled: Type.Optional(Type.Literal(true)),
+    jobId: Type.Optional(Type.String()),
     runId: Type.String(),
     agentId: Type.String(),
     phase: Type.Union([

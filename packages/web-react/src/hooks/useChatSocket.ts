@@ -106,6 +106,7 @@ export type UseChatSocket = {
     serviceTier?: InboundMessage["serviceTier"];
   }) => unknown;
   stop: (sessId: string, expectedClientMessageId?: string) => void;
+  stopBackgroundJobs: (sessId: string, jobIds: readonly string[]) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
   retryMessage: (p: {
     sessId: string;
@@ -801,6 +802,7 @@ export function useChatSocket(opts: {
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback<UseChatSocket["stop"]>((sessId, expectedClientMessageId) => socket.stopTurn(sessId, expectedClientMessageId), [socket]);
+  const stopBackgroundJobs = useCallback<UseChatSocket["stopBackgroundJobs"]>((sessId, jobIds) => socket.stopBackgroundJobs(sessId, jobIds), [socket]);
   const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
   const continueInterruptedTurn = useCallback<UseChatSocket["continueInterruptedTurn"]>(
     (p) => socket.continueInterruptedTurn(p),
@@ -1186,6 +1188,7 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      stopBackgroundJobs,
       retryMessage,
       continueInterruptedTurn,
       editQueuedMessage,
@@ -1230,6 +1233,7 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      stopBackgroundJobs,
       retryMessage,
       continueInterruptedTurn,
       editQueuedMessage,

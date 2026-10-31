@@ -359,7 +359,7 @@ export function messageSignature(
   const collapse = m._turnTapeProcess
     ? `|tc:${m._turnTapeProcessExpanded ? 1 : 0}:${m._turnTapeProcessCursor ?? "n"}:${m._turnTapeTotalBytes ?? 0}:${m._dispatchOutcome ?? ""}`
     : "";
-  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}`;
+  const head = `${m._backgroundDelegate ? "bg|" : ""}${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}${collapse}`;
   switch (m.role) {
     case "assistant":
       return [
@@ -516,9 +516,9 @@ export function safeMessageSignature(
  * 两态。仅在非运行态(已完成 / server 骨架)使用——运行态由调用方单独渲染"运行中"。
  */
 export function agentTerminalStatus(
-  m: Pick<ChatMessage, "_isError" | "_delegateStatus" | "cancelled">,
+  m: Pick<ChatMessage, "_isError" | "_delegateStatus" | "cancelled" | "_backgroundDelegate">,
 ): { label: string; tone: "success" | "danger" | "warning" | "neutral" } {
-  if (m.cancelled) return { label: "已取消", tone: "neutral" };
+  if (m.cancelled) return { label: m._backgroundDelegate === true ? "已停止" : "已取消", tone: "neutral" };
   if (m._delegateStatus === "timeout") return { label: "超时", tone: "warning" };
   if (m._isError || m._delegateStatus === "failed") return { label: "失败", tone: "danger" };
   return { label: "完成", tone: "success" };

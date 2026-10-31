@@ -92,7 +92,7 @@ export function useInflightDelegates(opts: {
   messages: ChatMessage[];
   enabled: boolean;
   auth: AuthSession | null;
-}): { items: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
+}): { items: InflightDelegateItem[]; controlItems: InflightDelegateItem[]; degraded: boolean; dismiss: (jobId: string) => void } {
   const { sessionId, messages, enabled, auth } = opts;
   const [rawItems, setRawItems] = useState<InflightDelegateItem[] | null>(null);
   const [failures, setFailures] = useState(0);
@@ -187,14 +187,16 @@ export function useInflightDelegates(opts: {
     };
   }, [shouldPoll, sessionId, pull, failures]);
 
+  // Controls need every authoritative terminal, including rows hidden by HUD
+  // dismissal/recency. Presentation cannot remove evidence that a job finished.
+  const controlItems = useMemo(() => rawItems ?? [], [rawItems]);
   const items = useMemo(() => {
-    if (!rawItems) return [];
-    return filterVisibleInflightItems(mergeInflightWithTimeline(rawItems, messages), {
+    return filterVisibleInflightItems(mergeInflightWithTimeline(controlItems, messages), {
       dismissed,
       seenLive: seenLiveRef.current,
       now: Date.now(),
     });
-  }, [rawItems, messages, dismissed]);
+  }, [controlItems, messages, dismissed]);
 
-  return { items, degraded: failures > 0, dismiss };
+  return { items, controlItems, degraded: failures > 0, dismiss };
 }

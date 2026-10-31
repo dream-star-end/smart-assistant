@@ -129,6 +129,7 @@ before(async () => {
       session_id TEXT NOT NULL,
       root_client_message_id TEXT,
       kind TEXT NOT NULL,
+      payload_json JSONB NOT NULL DEFAULT '{}',
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
