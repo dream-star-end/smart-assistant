@@ -80,7 +80,8 @@ test('canonical append preserves independent hashes and UTF8 sizes across escape
   const original: unknown[] = [{ content: 'exact prefix 😀\\\"[,]{}' }, [undefined, { nested: 'Ω' }]]
   boxContextMessageSnapshot(JSON.stringify(original), original.length)
   const appended = [...original, { toJSON(key: string) { return { key, content: '\ud800\u2028\\tail' } } }, null]
-  const json = JSON.stringify(appended), canonical = JSON.parse(json) as unknown[]
+  const json = JSON.stringify(appended)
+  const canonical = JSON.parse(json) as unknown[]
   const snapshot = boxContextMessageSnapshot(json, appended.length)
   for (let end = 0; end <= appended.length; end++) {
     expect(snapshot.prefixDigests[end]).toBe(digest(canonical.slice(0, end)))
