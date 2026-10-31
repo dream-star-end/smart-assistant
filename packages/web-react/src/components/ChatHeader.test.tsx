@@ -27,28 +27,41 @@ function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
   );
 }
 
-describe("ChatHeader 团队模式指示 chip", () => {
-  it("teamModeActive=false 时不渲染 chip", () => {
+describe("ChatHeader 协作方式 chip", () => {
+  it("不适用(collabMode 省略,如其它智能体 / demo)时不渲染任何协作 chip", () => {
     renderHeader();
     expect(screen.queryByRole("button", { name: "团队模式已开启" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /协作方式/ })).toBeNull();
   });
 
-  it("teamModeActive=true 时 agent 名旁渲染「团队模式」chip", () => {
-    renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
+  // UI-2a:单人也写出来(体验官:单人模式下看不出走的是什么协作模式);点开去换智能体 / 协作方式。
+  it("单人模式常显「单人」chip,点击打开智能体选择", () => {
+    const onAgentClick = vi.fn();
+    renderHeader({ collabMode: "solo", onAgentClick });
+    const chip = screen.getByRole("button", { name: "协作方式：单人，点击更换" });
+    expect(screen.getByTestId("chat-model-row")).toContainElement(chip);
+    expect(chip.textContent).toBe("单人");
+    expect(screen.queryByRole("button", { name: "团队模式已开启" })).toBeNull();
+    fireEvent.click(chip);
+    expect(onAgentClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("团队模式时 agent 名旁渲染「团队模式」chip", () => {
+    renderHeader({ collabMode: "team", onCollabSolo: () => {} });
     const chip = screen.getByRole("button", { name: "团队模式已开启" });
     expect(chip.textContent).toContain("团队模式");
   });
 
   it("窄屏 chip 另有「团队」文案，桌面全称仍在 DOM", () => {
-    renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
+    renderHeader({ collabMode: "team", onCollabSolo: () => {} });
     const chip = screen.getByRole("button", { name: "团队模式已开启" });
     expect(chip.textContent).toContain("团队");
     expect(chip.textContent).toContain("团队模式");
   });
 
-  it("点击 chip 弹出说明（引擎 + 计费告知）与关闭按钮；点击关闭翻转 flag", async () => {
-    const onDisableTeamMode = vi.fn();
-    renderHeader({ teamModeActive: true, onDisableTeamMode });
+  it("点击 chip 弹出说明（引擎 + 计费告知）与关闭按钮；点击关闭回到单人", async () => {
+    const onCollabSolo = vi.fn();
+    renderHeader({ collabMode: "team", onCollabSolo });
 
     fireEvent.click(screen.getByRole("button", { name: "团队模式已开启" }));
 
@@ -56,20 +69,21 @@ describe("ChatHeader 团队模式指示 chip", () => {
     const note = await screen.findByText(/队长引擎为 GPT-6-Astra/);
     expect(note.textContent).toContain("计费高于默认模型");
 
+    expect(note.textContent).not.toContain("委派");
     fireEvent.click(screen.getByRole("button", { name: "关闭团队模式" }));
-    expect(onDisableTeamMode).toHaveBeenCalledTimes(1);
+    expect(onCollabSolo).toHaveBeenCalledTimes(1);
   });
 
-  it("advisorModeActive=true 时渲染顾问模式 chip", () => {
-    renderHeader({ advisorModeActive: true, onDisableAdvisorMode: () => {} });
+  it("顾问模式时渲染顾问模式 chip", () => {
+    renderHeader({ collabMode: "advisor", onCollabSolo: () => {} });
     expect(screen.getByRole("button", { name: "顾问模式已开启" }).textContent).toContain("顾问模式");
   });
 
   it("顾问 chip 展示冻结型号，不改主模型选择器", () => {
     renderHeader({
-      advisorModeActive: true,
+      collabMode: "advisor",
       advisorModelLabel: "gpt-6-astra",
-      onDisableAdvisorMode: () => {},
+      onCollabSolo: () => {},
     });
     const chip = screen.getByRole("button", { name: "顾问模式已开启" });
     expect(chip.textContent).toContain("gpt-6-astra");
@@ -81,14 +95,31 @@ describe("ChatHeader 团队模式指示 chip", () => {
     expect(trigger.textContent).not.toContain("GPT-6-Astra");
   });
 
-  it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎(chip 表达团队模式,trigger 不再重复该词)", () => {
-    renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
+  it("团队模式时顶栏 ModelSelector 显示实际生效的队长引擎(chip 表达团队模式,trigger 不再重复该词)", () => {
+    renderHeader({ collabMode: "team", onCollabSolo: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
     // C-25:「顶栏所见 = 实际所发」—— 引擎名必须在 trigger 上;「团队模式」一词只由 chip 承担。
     expect(trigger.textContent).toContain("队长引擎 · GPT-6-Astra");
     expect(trigger.textContent).not.toContain("团队模式");
     expect(trigger.textContent).not.toContain("GLM-5.2");
     expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();
+  });
+
+  // #1291:队长以服务端下发的 id 为准;团队态 trigger 锁定(不能自选),说明弹层与 trigger 是同一个队长。
+  it("团队模式按服务端队长 id 锁定模型入口,trigger 与说明弹层显示同一队长和倍率", async () => {
+    renderHeader({
+      models: [...MODELS, { id: "server-leader", display_name: "Server Leader", cost_x: 7.5 }],
+      collabMode: "team",
+      teamLeaderModelId: "server-leader",
+      onCollabSolo: () => {},
+    });
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger).toBeDisabled();
+    expect(trigger.textContent).toContain("Server Leader");
+    expect(trigger.textContent).toContain("7.5×");
+    expect(trigger.textContent).not.toContain("GLM-5.2");
+    fireEvent.click(screen.getByRole("button", { name: "团队模式已开启" }));
+    expect(await screen.findByText(/队长引擎为 Server Leader/)).toBeInTheDocument();
   });
 
   it("常态下 ModelSelector 仍显示用户自选模型", () => {
@@ -292,5 +323,63 @@ describe("ChatHeader 未分类会话的项目建议", () => {
     });
     expect(screen.queryByTestId("chat-project-suggestion")).toBeNull();
     expect(screen.getByTestId("chat-project-breadcrumb")).toHaveTextContent("别的项目");
+  });
+});
+
+describe("ChatHeader 余额单位(UI-2a)", () => {
+  it("余额带「积分」单位;窄屏只留图标,悬停仍能看到带单位的余额", () => {
+    renderHeader({ credits: "998473", onOpenBilling: vi.fn() });
+    const pill = screen.getByRole("button", { name: "账户与计费" });
+    expect(pill.textContent).toBe("998,473 积分");
+    expect(pill).toHaveAttribute("title", "余额 998,473 积分");
+  });
+});
+
+describe("ChatHeader 详情面板入口(UI-2a:默认收起,有产出才出「产出 N」)", () => {
+  it("收起且这一轮没有产出:顶栏不出面板入口", () => {
+    renderHeader({ onTogglePane: vi.fn(), paneOutputs: 0 });
+    expect(screen.queryByTestId("detail-pane-toggle")).toBeNull();
+  });
+
+  it("收起且有产出:桌面出「产出 N」,点了打开面板;手机收进「更多操作」", async () => {
+    const onTogglePane = vi.fn();
+    renderHeader({ onTogglePane, paneOutputs: 2 });
+    const toggle = screen.getByTestId("detail-pane-toggle");
+    expect(toggle.textContent).toBe("产出 2");
+    expect(toggle).toHaveClass("hidden", "sm:flex");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(toggle);
+    expect(onTogglePane).toHaveBeenCalledTimes(1);
+
+    const more = screen.getByRole("button", { name: "更多操作" });
+    expect(more.parentElement).toHaveClass("sm:hidden");
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    fireEvent.click(more);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "产出 2" }));
+    expect(onTogglePane).toHaveBeenCalledTimes(2);
+  });
+
+  it("展开时给收起键(不看产出数),手机菜单里不再出产出项", () => {
+    const onTogglePane = vi.fn();
+    renderHeader({ onTogglePane, paneOpen: true, paneOutputs: 0 });
+    const toggle = screen.getByRole("button", { name: "收起详情面板" });
+    expect(toggle).toHaveAttribute("data-testid", "detail-pane-toggle");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggle);
+    expect(onTogglePane).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "更多操作" })).toBeNull();
+  });
+});
+
+describe("ChatHeader 手机顶栏收拢(UI-2a)", () => {
+  it("所在项目桌面在标题旁,手机收进「更多操作」", async () => {
+    const onOpenProjectScope = vi.fn();
+    renderHeader({ projectBreadcrumb: { chatName: "周报" }, onOpenProjectScope });
+    expect(screen.getByTestId("chat-project-breadcrumb")).toHaveClass("hidden", "sm:inline-flex");
+    const more = screen.getByRole("button", { name: "更多操作" });
+    fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
+    fireEvent.click(more);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "所在项目：周报" }));
+    expect(onOpenProjectScope).toHaveBeenCalledTimes(1);
   });
 });

@@ -97,7 +97,6 @@ export function CreateProjectDialog({
           : "项目里的会话会共用这里的指令和文件。都可以以后再改。"
       }
       size="lg"
-      data-product-feature="create-project"
       onOpenAutoFocus={(e) => {
         e.preventDefault();
         nameRef.current?.focus();

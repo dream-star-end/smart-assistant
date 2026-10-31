@@ -11,7 +11,6 @@ import {
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
   cursorModelById,
-  formatCostX,
   isMorePickerModelId,
 } from '@openclaude/protocol/browser'
 import type { LockedPublicModel, PublicModel } from './types'
@@ -84,9 +83,10 @@ export function cursorPickerDef(
   return cursorModelById(model.id)
 }
 
+/** 费用倍率(相对基准模型的估算,口径见 protocol modelCostIndex),写成「0.5×」而不是「x0.5」(UI-2a)。 */
 export function modelCostLabel(model: { cost_x?: number } | undefined): string | undefined {
   const raw = model?.cost_x
-  return formatCostX(typeof raw === 'number' ? raw : undefined)
+  return typeof raw === 'number' && Number.isFinite(raw) ? `${Number(raw.toFixed(1))}×` : undefined
 }
 
 /**
