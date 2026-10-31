@@ -488,7 +488,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect((refreshCall![1] as RequestInit).keepalive).toBe(true)
   })
 
-  test('用着用着被判失效：直接给登录表单 +「登录状态已失效」，不静默落到营销首页（OCV5-636）', async () => {
+  test('用着用着被判失效：直接给登录表单 +「登录已过期」，不静默落到营销首页（OCV5-636）', async () => {
     let refreshCalls = 0
     fetchMock = vi.fn(async (url: string) => {
       const u = String(url)
@@ -511,11 +511,52 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
 
     setAuthHint()
     render(<App />)
-    expect(await screen.findByText('登录状态已失效，请重新登录')).toBeInTheDocument()
+    expect(await screen.findByText('登录已过期，请重新登录')).toBeInTheDocument()
     expect(screen.getByLabelText('邮箱')).toBeInTheDocument()
     expect(refreshCalls).toBeGreaterThanOrEqual(2)
     expect(screen.queryByRole('button', { name: '免费开始' })).not.toBeInTheDocument()
   })
+
+  test('深链 /p/x 启动续期失效：提示登录已过期，登录后回到该项目', async () => {
+    window.history.replaceState({}, '', '/p/p1')
+    const project = {
+      projects: [{ id: 'p1', name: '论文综述', sortOrder: 0, createdAt: 1, updatedAt: 1, sessionCount: 0 }],
+    }
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) {
+        return errJson(401, { error: { code: 'INVALID_REFRESH', message: 'refresh token invalid or expired' } })
+      }
+      if (u.includes('/api/auth/login')) return LOGIN_B
+      if (u.includes('/api/public/config')) return PUBLIC_CONFIG
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/chat-projects')) return okJson(project)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u2', email: 'b@c.com', role: 'user', display_name: 'Bob', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    setAuthHint()
+    render(<App />)
+    expect(await screen.findByText('登录已过期，请重新登录')).toBeInTheDocument()
+    expect(screen.getByLabelText('邮箱')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '免费开始' })).not.toBeInTheDocument()
+    expect(screen.queryByText('网络较慢，正在加载…')).not.toBeInTheDocument()
+    expect(window.location.pathname).toBe('/p/p1')
+
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'b@c.com' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
+    const submit = screen.getByRole('button', { name: '登录' })
+    await waitFor(() => expect(submit).not.toBeDisabled())
+    await act(async () => {
+      fireEvent.click(submit)
+    })
+    expect(await screen.findByTestId('project-home')).toBeInTheDocument()
+    expect(window.location.pathname).toBe('/p/p1')
+  }, 30000)
 
   test('boot transient refresh failure stays in recovery and does not flash the login page', async () => {
     let refreshCalls = 0

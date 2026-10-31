@@ -35,6 +35,7 @@ import {
 import { SYNTHETIC_EMAIL_DOMAIN } from './socialLogin.js'
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from './turnstile.js'
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from './jwt.js'
+import { validClientIp } from './clientIp.js'
 import type { Mailer } from './mail.js'
 import {
   lockRefreshFamily,
@@ -539,6 +540,8 @@ export async function resendVerification(
 export interface IssueVerifiedSessionDeps {
   jwtSecret: string | Uint8Array
   bindIp?: string | null
+  /** Real client IP for refresh_tokens.client_ip. Null refuses a later reissue. */
+  clientIp?: string | null
   userAgent?: string
   now?: () => number
   accessTtlSeconds?: number
@@ -642,13 +645,14 @@ export async function issueVerifiedUserSession(
       }
     }
     await client.query(
-      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, expires_at, remember_me)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6)`,
+      `INSERT INTO refresh_tokens(user_id, token_hash, user_agent, ip, client_ip, expires_at, remember_me)
+       VALUES ($1, $2, $3, $4, $5::inet, to_timestamp($6), $7)`,
       [
         current.id,
         refresh.hash,
         deps.userAgent ?? null,
         deps.bindIp ?? null,
+        validClientIp(deps.clientIp),
         refresh.expires_at,
         rememberMe,
       ],
