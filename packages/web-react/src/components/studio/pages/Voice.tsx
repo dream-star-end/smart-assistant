@@ -249,7 +249,13 @@ export function VoicePage(props: {
           onSelect={props.onOpenShot}
         />
       </div>
-      <AgentPanel auth={auth} view={view} cards={cards} onOpenShot={props.onOpenShot} />
+      <AgentPanel
+        auth={auth}
+        view={view}
+        cards={cards}
+        onOpenShot={props.onOpenShot}
+        onReload={() => void props.onReload()}
+      />
     </div>
   )
 }

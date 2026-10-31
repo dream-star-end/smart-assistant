@@ -1239,10 +1239,27 @@ fieldset.st-seg {
   margin-top: 10px;
 }
 .st-needs-opt {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 0 0 1px var(--border);
   background: var(--surface);
+}
+.st-needs-opt:hover:not(:disabled),
+.st-needs-opt:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent, var(--border));
+  outline: none;
+}
+.st-needs-opt:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 .st-needs-opt span {
   display: block;
