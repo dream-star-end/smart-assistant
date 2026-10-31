@@ -169,6 +169,20 @@ function auditPrompt(kind: FigKind, focus: string | undefined, followUps: string
   return [...common, perKind[kind], ...tail].filter(Boolean).join('\n')
 }
 
+/**
+ * OCV5-704: WARN means the deterministic checks are clean and only the vision reviewer has
+ * comments. The reviewer prompt asks for every nit, so it almost never answers PASS. A WARN
+ * hint that said 未通过 and asked for a redraw kept an agent redrawing one chart for 20 minutes.
+ * The scientific-figures skill already says WARN may be delivered; the hint now says so too.
+ */
+const VERDICT_HINT: Record<'PASS' | 'WARN' | 'FAIL', string> = {
+  PASS: '通过。可作为最终产物。',
+  WARN:
+    '确定性检查已通过,vision.review 只是建议级意见:可以交付当前版本。只修你判断确实影响理解的 1-2 处(修完不必再跑 oc-figcheck),其余建议在回复里列给用户决定;不要为了把 WARN 变成 PASS 反复改图。',
+  FAIL:
+    '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck(最多 3 轮;超限则交付当前版本并如实列出未通过项)。',
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2)
   if (isCliHelpArg(argv[0])) {
@@ -280,10 +294,7 @@ async function main(): Promise<void> {
         deterministic: { checks: det, issues },
         vision: { backend: visionBackendLabel(), pass: visionPass, review: visionText },
         verdict,
-        hint:
-          verdict === 'PASS'
-            ? '通过。可作为最终产物。'
-            : '未通过:请按 deterministic.issues 与 vision.review 修改绘图代码后重画,再次 oc-figcheck(最多 3 轮;超限则交付当前版本并如实列出未通过项)。',
+        hint: VERDICT_HINT[verdict],
       },
       null,
       2,
