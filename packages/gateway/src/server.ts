@@ -1,4 +1,5 @@
 import { withUserError } from '@openclaude/protocol'
+import { compactionDelegateTasks } from './compactionTasks.js'
 import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
 import { handleSystemHelpLocal } from './systemHelpHttp.js'
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
@@ -407,6 +408,7 @@ export class Gateway {
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
   private _stopEviction: (() => void) | null = null
+  private _stopCompactionArchiveCleanup: (() => void) | null = null
   /** v3 master sink retry queue stop hook — set when sink is wired in
    *  start(); called in shutdown stage 2 to cancel the periodic drain
    *  timer. null when v3 sink isn't configured (personal version). */
@@ -739,6 +741,10 @@ export class Gateway {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
     installSystemHelpRelay(this.sessions)
+    this.sessions.readCompactionTasks = (key) => [
+      ...compactionDelegateTasks(this._delegateJobs?.listNonTerminal() ?? [], key),
+      ...this.sessions.activeCompactionSubtasks(key),
+    ]
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
     }

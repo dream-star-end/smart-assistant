@@ -64,7 +64,8 @@ import {
   resolveDelegateWaitMs,
   type DelegateJobHttpResult,
 } from './delegateJobs.js'
-import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
+import { DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE, DELEGATE_TASK_IN_FLIGHT_MESSAGE, delegateTaskKey } from './delegateResume.js'
+import { personalCompactionEnabled } from './compactionTasks.js'
 import {
   isDelegateCutoverEffective,
   isDelegateDurableEffective,
@@ -689,6 +690,7 @@ export async function handleDelegateTask(
     targetAgentId,
     sourceAgent: sourceAgentId || 'system',
     idempotencyKey,
+    taskKey: personalCompactionEnabled() ? delegateTaskKey({ goal, model: modelNorm.model, reviewMode: parsed.reviewMode }) : undefined,
     identityProjection,
   })
   this._forgetEvictedDelegateResumes(resume.evictedKeys)
@@ -705,7 +707,7 @@ export async function handleDelegateTask(
         sessionKey: resume.sessionKey,
       })
     }
-    return this.sendError(res, 409, DELEGATE_RESUME_OCCUPIED_MESSAGE)
+    return this.sendError(res, 409, parsed.resumeSessionKey ? DELEGATE_RESUME_OCCUPIED_MESSAGE : DELEGATE_TASK_IN_FLIGHT_MESSAGE)
   }
   const callbackOnComplete = isSendToAgentCallbackComplete(parsed.callbackOnComplete)
     ? ('origin-inject' as const)
@@ -749,6 +751,8 @@ export async function handleDelegateTask(
       this._ensureDelegateJobStore()
     }
     if (sm && isDelegateDurableEffective() && !this._delegateReconcileReady) {
+      // Unclaimed: a later identical task must dispatch, not replay this 503.
+      this._delegateResume.abort(resume.sessionKey, resume.minted)
       return this.sendJson(res, 503, {
         error: 'delegate store reconciling',
         failure_class: 'internal',

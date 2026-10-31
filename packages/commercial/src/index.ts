@@ -483,6 +483,7 @@ import {
   type DelegateEngineBillingRuntime,
 } from "./http/internalDelegateEngineBilling.js";
 import { DELEGATE_TRACE_PATH, makeDelegateTraceHandler } from "./http/internalDelegateTrace.js";
+import { COMPACTION_TIMELINE_PATH, makeCompactionTimelineHandler } from "./http/internalCompactionTimeline.js";
 import { makeCommercialRuntimeStatus, type CommercialRuntimeStatus } from "./runtimeStatus.js";
 export type { CommercialRuntimeStatus } from "./runtimeStatus.js";
 import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
@@ -2666,6 +2667,8 @@ export async function registerCommercial(
         expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
       });
       const delegateTraceHandler = makeDelegateTraceHandler({ pool: getPool(), identityRepo });
+      const compactionTimelineHandler = process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === '1'
+        ? makeCompactionTimelineHandler({ identityRepo }) : null;
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
         runtimeRef: delegateEngineBillingRuntimeRef,
@@ -3046,6 +3049,7 @@ export async function registerCommercial(
           return autoDreamOptimizerHandler(req, res, ctx, path);
         }
         if (path === DELEGATE_TRACE_PATH) return delegateTraceHandler(req, res, ctx);
+        if (compactionTimelineHandler && path === COMPACTION_TIMELINE_PATH) return compactionTimelineHandler(req, res, ctx);
         if (isDelegateEngineBillingInternalPath(path)) {
           return delegateEngineBillingHandler(req, res, ctx, path);
         }

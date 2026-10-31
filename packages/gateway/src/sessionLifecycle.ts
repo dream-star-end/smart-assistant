@@ -1,4 +1,5 @@
 import { withFreshPromptPrivacy } from './promptPrivacyRuntime.js'
+import { noteCompactionBoundary } from './compactionRecoveryRuntime.js'
 import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
@@ -836,6 +837,7 @@ export async function prepareModelSwitch(
   }
   session._modelSwitchTransition = transition
   try {
+    noteCompactionBoundary(session, 'model_switch')
     // biome-ignore lint/suspicious/noImplicitAnyLet: moved verbatim from sessionManager.ts (OCV5-480); pre-existing there
     let artifact
     if (session.runner.compactForHandoff) {
