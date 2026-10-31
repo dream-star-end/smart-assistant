@@ -9189,6 +9189,26 @@
           "assertion": "expired boot refresh on /p/p1 shows 登录已过期 and login returns to the project"
         }
       ]
+    },
+    {
+      "id": "INC-20261031-BOX-DEFAULT-LOGIN-GUARD",
+      "occurredAt": "2026-10-31",
+      "severity": "P1",
+      "symptom": "默认登录在交出前没有做在线检查。数据库里过期的 logged_in 会让没有凭证、或引导未完成的默认登录被选中。现在默认登录也要有凭证且 hasCompletedOnboarding 为真，否则不选，并记一条只有账号和 profile 名的告警。",
+      "rootFixCommit": "3642c968",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-box-default-login-guard] PASS — a default login with no credential or unfinished onboarding is refused and a complete one is accepted"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
+          "assertion": "a stale logged-in default login is not selected when the live guard refuses it"
+        }
+      ]
     }
   ]
 }
