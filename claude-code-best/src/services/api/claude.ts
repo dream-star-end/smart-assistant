@@ -19,7 +19,7 @@ import type {
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type { TextBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
 import type { Stream } from '@anthropic-ai/sdk/streaming.mjs'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { existsSync, unlinkSync } from 'node:fs'
 import {
   getAPIProvider,
@@ -495,7 +495,24 @@ export function configureTaskBudgetParams(
   }
 }
 
-export function getAPIMetadata() {
+/** Stable Box session for one subagent. Distinct from the root CLI session,
+ * so a parent handoff does not make the child's admit BOX_CAPACITY_HELD.
+ * Fingerprint-safe and stable across the agent's own turns and resumes. */
+export function boxAgentSessionId(
+  rootSessionId: string,
+  agentId: string,
+): string {
+  const digest = createHash('sha256')
+    .update('ocv5-box-agent-session-v1\0')
+    .update(rootSessionId)
+    .update('\0')
+    .update(agentId)
+    .digest('hex')
+    .slice(0, 32)
+  return `agent-${digest}`
+}
+
+export function getAPIMetadata(agentId?: string) {
   // https://docs.google.com/document/d/1dURO9ycXXQCBS0V4Vhl4poDBRgkelFc5t2BNPoEgH5Q/edit?tab=t.0#heading=h.5g7nec5b09w5
   let extra: JsonObject = {}
   const extraStr = process.env.CLAUDE_CODE_EXTRA_METADATA
@@ -511,13 +528,23 @@ export function getAPIMetadata() {
     }
   }
 
+  const rootSessionId = getSessionId()
+  const scopedAgentId = agentId || getAgentContext()?.agentId
+  // Subagent requests must not reuse the process session. The parent Box
+  // handoff still holds that id, and same-session admission is
+  // BOX_CAPACITY_HELD for the whole 45s wait. Egress fingerprint and slot
+  // occupancy keep using metadata session_id.
+  const sessionId = scopedAgentId
+    ? boxAgentSessionId(rootSessionId, scopedAgentId)
+    : rootSessionId
+
   return {
     user_id: jsonStringify({
       ...extra,
       device_id: getOrCreateUserID(),
       // Only include OAuth account UUID when actively using OAuth authentication
       account_uuid: getOauthAccountInfo()?.accountUuid ?? '',
-      session_id: getSessionId(),
+      session_id: sessionId,
     }),
   }
 }
@@ -1807,7 +1834,7 @@ async function* queryModel(
       tools: allTools,
       tool_choice: options.toolChoice,
       ...(useBetas && { betas: filteredBetas }),
-      metadata: getAPIMetadata(),
+      metadata: getAPIMetadata(options.agentId),
       max_tokens: maxOutputTokens,
       thinking,
       ...(temperature !== undefined && { temperature }),
