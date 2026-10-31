@@ -12,6 +12,8 @@
 
 import type { Pool, PoolClient } from 'pg'
 
+import { g8TurnEndCheckpointInput, runG8ReplayCheckpoint } from '@openclaude/protocol'
+
 /** Pool 或事务内 client 都可作查询面(admit 走 client 与 append 同 tx;reconciler 走 pool)。 */
 export type Queryable = Pick<Pool | PoolClient, 'query'>
 
@@ -458,7 +460,10 @@ export async function casToTerminal(
       RETURNING ${DISPATCH_COLUMNS}`,
     params,
   )
-  return res.rows.length === 0 ? null : mapRow(res.rows[0]!)
+  const row = res.rows.length === 0 ? null : mapRow(res.rows[0]!)
+  // Default-off replay checkpoint. No listener means no log, metric, or alert.
+  if (row) runG8ReplayCheckpoint(g8TurnEndCheckpointInput(row))
+  return row
 }
 
 /**
