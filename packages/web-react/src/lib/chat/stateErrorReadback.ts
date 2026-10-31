@@ -56,7 +56,7 @@ export function attemptStateErrorReadback(
     }
     const id = `sys-state-readback-${cmid}-${code}`;
     if (!sess.messages.some((message) => message.id === id)) sess.messages.push({
-      id, role: "system", text: "已同步当前任务状态", ts: Date.now(), _source: "local",
+      id, role: "system", text: "已同步当前任务状态", ts: Date.now(), _source: "local", _errorDetail: code,
     });
     effects.changed();
   }, () => { if (effects.current()) effects.replay(); }).finally(() => inflight.delete(key));

@@ -1623,7 +1623,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
 export function SystemCard({ msg }: { msg: ChatMessage }) {
   if (!msg.text) return null;
   return (
-    <div className="flex min-w-0 justify-center animate-in">
+    <div className="flex min-w-0 justify-center animate-in" title={msg._errorDetail}>
       <div className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-1.5 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
         {msg.text}
       </div>
