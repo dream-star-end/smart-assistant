@@ -1,3 +1,4 @@
+import { attemptStateErrorReadback } from "./stateErrorReadback";
 import {authorizeQueuedModelSwitch,commitAuthorizedModelSwitchDispatch,MODEL_SWITCH_CANCELLED_MESSAGE} from './modelSwitchCostDispatch';
 import type {AuthorizeSwitch,SwitchAuthorization} from '../../hooks/useModelSwitchCost';
 import {formatMessageReplyPrompt} from '@openclaude/protocol/browser';
@@ -1346,12 +1347,7 @@ export class ChatSocket {
   }
 
   // ═══════════════ 上下文重建提示（context_rebuilt，热尾巴/归档）═══════════════
-  /**
-   * 处理 sys.context_rebuilt 帧:插入一条 client-owned 的 system 提示行(durable,持久化走既有
-   * IndexedDB 通道),并设一条会话级 transient 软提示(live flash)。**幂等**:同一帧(reconnect
-   * replay / 同 turn 重复)只插一条 —— 用 frameSeq/ts 派生确定性 id,已存在即跳过(id 稳定,reload
-   * 后 loadStored 复原该行也能命中去重)。
-   */
+  /** Persist each context-rebuild notice once using its stable notice/frame identity. */
   private applyContextRebuilt(sess: ChatSession, frame: ContextRebuiltWire): void {
     const row = contextRebuiltRow(sess, frame); // 按 noticeId 去重(旧帧退回 frameSeq/ts)
     if (!row) return;
@@ -2086,6 +2082,7 @@ export class ChatSocket {
           const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
+          if (this.readbackStateError(sess, frame)) return;
           applyOutboundError(sess, frame, this.effects());
           // 释放 peer slot(恢复子轮要占同一 slot)。红卡若被延后,由恢复宽限按快照收口。
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
@@ -2108,6 +2105,7 @@ export class ChatSocket {
           const activeClientMessageId = sess._activeClientMessageId;
           const ownsActiveTurn = !frame.clientMessageId ||
             activeClientMessageId === frame.clientMessageId;
+          if (this.readbackStateError(sess, frame)) return;
           applyLegacyBridgeError(sess, frame, this.effects());
           this.finishDispatch(sess.id, frame.clientMessageId ?? (ownsActiveTurn ? activeClientMessageId : undefined));
           // 错误终态也不经 onFinal/clearSendingState → 同样要收口恢复条。
@@ -3318,11 +3316,11 @@ export class ChatSocket {
     const query: SnapshotQuery = opts.verifyOnly ? { afterSeq: 0, limit: 1 } : snapshotQuery(sess, this.deps.defaultAgentId);
     return Promise.resolve()
       .then(() => read(sessId, query))
-      .then((snap) => {
+      .then(async (snap) => {
         this.snapshotHttpInFlight.delete(sessId);
         if (lifecycle !== this.lifecycleEpoch) return undefined;
         if (!isSessionSnapshot(snap)) return null;
-        if (!opts.verifyOnly) void this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt, asked: query.dispatch });
+        if (!opts.verifyOnly) await this.applySessionSnapshot(sessId, snap, { via: "http", requestedAt, asked: query.dispatch });
         return snap;
       }, () => {
         this.snapshotHttpInFlight.delete(sessId);
@@ -5071,20 +5069,21 @@ export class ChatSocket {
     this.scheduleNotify();
   }
 
-  /** Archive-page revision mismatch recovery. Bypass the ordinary debounce:
-   * the page was captured from a different history generation, so a full
-   * history reconciliation is required before retrying pagination. */
-  syncHistoryNow(sessId: string): void {
-    void this.deps.syncSession?.(sessId);
+  private readbackStateError(sess: ChatSession, frame: OutboundErrorWire | LegacyBridgeErrorWire): boolean {
+    return attemptStateErrorReadback(sess, frame, {
+      read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess,
+      replay: () => this.dispatch(frame),
+      changed: () => { this.deps.persistSession?.(sess.id); this.scheduleNotify(); },
+    });
   }
 
-  /**
-   * 下一页归档 getSessionArchive 的 before 游标 = 当前已加载的最老 server `_orderSeq`。
-   * 本地还没拉过归档时,最老 server 行即热尾巴首行(`_orderSeq =
-   * archivedThroughSeq+1`)→ before 落在 archivedThroughSeq+1,取到最新归档页;每前插一页,最老
-   * `_orderSeq` 下降 → 自然上翻。全无顺序轴(纯乐观/未同步)→ 回退水位+1;都缺 → 0
-   * (server 按缺省取最新页)。
-   */
+  /** Archive cursor conflicts use the same snapshot before reconciling their tape. */
+  async syncHistoryNow(sessId: string): Promise<boolean> {
+    const snap = await this.fetchSessionSnapshot(sessId);
+    return !!snap && snap.sessionId === sessId && await this.deps.syncSession?.(sessId) === true;
+  }
+
+  /** Archive pagination uses the earliest loaded server order, or its archive watermark. */
   archiveBeforeSeq(sessId: string): number {
     const s = this.sessions.get(sessId);
     if (!s) return 0;

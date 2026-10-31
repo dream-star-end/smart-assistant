@@ -965,8 +965,10 @@ export function useChatSocket(opts: {
         ).length;
         return { ok: true, loaded: visibleLoaded, hasMore: !!page.hasMore };
       } catch (error) {
-        if (error instanceof ApiError && error.status === 409) socket.syncHistoryNow(sessId);
-        return { ok: false, loaded: 0, hasMore: true, error: true }; // 失败:保留"可重试",hasMore 不封死
+        if (error instanceof ApiError && error.status === 409 && await socket.syncHistoryNow(sessId)) {
+          return { ok: false, loaded: 0, hasMore: true };
+        }
+        return { ok: false, loaded: 0, hasMore: true, error: true };
       } finally {
         olderHistoryFetchingRef.current.delete(sessId);
       }
