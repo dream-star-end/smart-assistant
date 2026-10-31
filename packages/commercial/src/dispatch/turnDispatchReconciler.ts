@@ -25,7 +25,7 @@ import {
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
 import { registerProducerFence } from '../db/liveTurnFrames.js'
-import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
+import { advanceClientTimelineIdentityInTransaction, scheduleUndeliveredDispatchRecovery } from '../db/pgSessionsBackend.js'
 import { closeRefusedRecoveryChains } from '../db/refusedRecoveryCards.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { type ProductFrictionEvent, recordProductFrictionEvent } from '../productFriction/events.js'
@@ -1365,6 +1365,9 @@ async function settleTerminalUnnotified(
     }
     // 未计费 → 直接把 durable dispatch 标记为用户可见。读侧从本行生成 typed
     // status record；不再复制/改写为 assistant message。
+    if (row.outcome === 'not_accepted' && row.failureCode === 'DISPATCH_AUTHORITY_EXPIRED') {
+      await scheduleUndeliveredDispatchRecovery(client, row)
+    }
     const notified = await markClientNotified(client, row.dispatchId)
     if (notified) await advanceVisibleTimelineIdentity(client, row)
     await client.query('COMMIT')
@@ -1473,7 +1476,7 @@ async function resolveRejecting(
     const terminal = await casToTerminal(deps.pool, {
       dispatchId: row.dispatchId,
       outcome: 'not_accepted',
-      failureCode: 'DISPATCH_NOT_ACCEPTED',
+      failureCode: row.failureCode === 'DISPATCH_AUTHORITY_EXPIRED' ? row.failureCode : 'DISPATCH_NOT_ACCEPTED',
       clientNotified: false,
       fromStatuses: ['rejecting'],
       now: nowMs,

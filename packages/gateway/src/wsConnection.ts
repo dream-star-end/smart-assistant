@@ -1677,7 +1677,7 @@ export function _consumeFrameAuthority(
 
   if (!hasEnvelope) {
     if (this._modelAuthority.required) {
-      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority')
+      this._rejectAuthority(ws, 'missing', 'inbound frame carries no model authority', frame)
       return false
     }
     return true
@@ -1695,7 +1695,7 @@ export function _consumeFrameAuthority(
       err instanceof AuthorityRejected
         ? err
         : new AuthorityRejected('bad_shape', (err as Error)?.message ?? String(err))
-    this._rejectAuthority(ws, rejection.code, rejection.message)
+    this._rejectAuthority(ws, rejection.code, rejection.message, frame)
     return false
   }
 }

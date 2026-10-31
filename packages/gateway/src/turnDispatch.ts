@@ -7,7 +7,7 @@
  * touches (typed from the class itself).
  */
 import { randomBytes } from 'node:crypto'
-import { type InboundFrame, isClientMessageId, withUserError } from '@openclaude/protocol'
+import { decodeEnvelope, DISPATCH_AUTHORITY_KIND, type InboundFrame, isClientMessageId, withUserError } from '@openclaude/protocol'
 import type { WebSocket } from 'ws'
 import { removeSendToAgentIntent } from './sendToAgentIntentStore.js'
 import type { DelegateJobSnapshot } from './delegateJobs.js'
@@ -84,16 +84,33 @@ export async function _acquireSyntheticTurnBarrier(this: TurnDispatchHost, sessi
   return { owner, release }
 }
 
-export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: string, detail: string): void {
+export function _rejectAuthority(this: TurnDispatchHost, ws: WebSocket, code: string, detail: string, frame?: Record<string, unknown>): void {
   // 拒帧是安全事件:reason 进日志(运维可见),**不**回给客户端内文
   // (避免把 epoch / challenge / keyId 等内部线索泄漏给容器内的用户 AI)。
   this.log.warn('model_authority.rejected', { code, detail })
+  // Correlation only: unverified envelope fields never authorize execution or
+  // establish absence. Master checks its exact attempt and obtains a durable
+  // reject-if-absent tombstone before replaying anything.
+  const peer = frame?.peer as { id?: unknown; kind?: unknown } | undefined
+  let dispatch: Record<string, unknown> | undefined
+  try {
+    const raw = frame?.[DISPATCH_AUTHORITY_FIELD]
+    if (typeof raw === 'string') dispatch = decodeEnvelope(raw, DISPATCH_AUTHORITY_KIND).payload as Record<string, unknown>
+  } catch { /* malformed authority has no usable dispatch correlation */ }
+  const correlated = frame?.type === 'inbound.message' && isClientMessageId(frame.clientMessageId) &&
+    typeof peer?.id === 'string' && peer.kind === 'dm' && typeof dispatch?.dispatchId === 'string' &&
+    Number.isSafeInteger(dispatch.attemptNo) && (dispatch.attemptNo as number) > 0
   try {
     ws.send(
       JSON.stringify(withUserError({
         type: 'error',
         code: 'MODEL_AUTHORITY_REJECTED',
         error: 'model authority rejected',
+        ...(correlated ? {
+          clientMessageId: frame.clientMessageId, peer: { id: peer.id, kind: 'dm' },
+          dispatchId: dispatch.dispatchId, attemptNo: dispatch.attemptNo,
+          authorityExpired: code === 'expired',
+        } : {}),
       })),
     )
   } catch { /* ws may already be closed */ }

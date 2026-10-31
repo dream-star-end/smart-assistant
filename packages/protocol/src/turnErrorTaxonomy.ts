@@ -123,6 +123,7 @@ export const TURN_ERROR_TAXONOMY = {
 
   // ── 免单类(tape 大写码归一化后落这里;waive 查询仍用大写原值)──
   model_authority_expired: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
+  dispatch_authority_expired: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   liveness_timeout: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
   idle_timeout: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
   no_response: { retryable: false, automaticRecovery: true, cta: 'retry', waivable: true },
@@ -541,6 +542,7 @@ const PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES: ReadonlySet<TurnErrorCode> = new S
   // also occur on a continuation after a tool, so an empty tape alone cannot
   // prove that no external effect happened.
   'model_authority_unavailable',
+  'dispatch_authority_expired',
   'model_catalog_unavailable',
   'codex_pool_busy',
   'codex_route_unavailable',

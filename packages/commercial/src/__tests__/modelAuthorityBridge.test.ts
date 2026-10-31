@@ -270,6 +270,7 @@ async function startRig(opts: {
   promptQueuePreparationTimeoutMs?: number;
   dispatchLeaseHeartbeatMs?: number;
   deferContainerSendCompletionForTest?: (complete: () => void) => void;
+  dispatchTerminalQueries?: Array<{ sql: string; params: unknown[] }>;
   /** B3(R3):注入 mock pgPool 观察受理后 pre-forward 失败出口的 casToTerminal(需三件套齐)。 */
   pgPool?: unknown;
 }): Promise<Rig> {
@@ -316,6 +317,25 @@ async function startRig(opts: {
           if (/(INSERT INTO|UPDATE) turn_traces/.test(sql) || /UPDATE turn_dispatches SET trace_id/.test(sql)) {
             traceWrites.push({ sql, params });
             return { rows: [], rowCount: 1 };
+          }
+          if (opts.dispatchTerminalQueries && /UPDATE turn_dispatches/.test(sql) && /SET status = 'terminal'/.test(sql)) {
+            opts.dispatchTerminalQueries.push({ sql, params });
+            const d = admittedForAuthorityBinding;
+            assert.ok(d, "dispatch terminal CAS must follow admission");
+            assert.equal(params[0], d.dispatchId);
+            assert.deepEqual(params[5], ["admitted"]);
+            assert.equal(params[6], String(d.leaseEpoch));
+            if (d.status !== "admitted") return { rows: [], rowCount: 0 };
+            d.status = "terminal";
+            d.outcome = params[1] as TurnDispatchRow["outcome"];
+            d.failureCode = params[2] as string;
+            d.terminalAt = params[4] as Date;
+            d.leaseUntil = null;
+            const row = Object.fromEntries(Object.entries(d).map(([key, value]) => [
+              key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+              typeof value === "bigint" ? value.toString() : value,
+            ]));
+            return { rows: [row], rowCount: 1 };
           }
           if (/UPDATE turn_dispatches/.test(sql) && /SET status = 'accepted'/.test(sql)) {
             try {
@@ -2527,6 +2547,50 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
+  test("OCV5-682 preparation deadline stays armed until physical send completion without a receipt", async () => {
+    const terminalQueries: Array<{ sql: string; params: unknown[] }> = [];
+    const sendCompletions: Array<() => void> = [];
+    const admittedRows: TurnDispatchRow[] = [];
+    const rig = await startRig({
+      attest: "yes",
+      durableDispatch: true,
+      holdDispatchReceipt: true,
+      promptQueuePreparationTimeoutMs: 150,
+      deferContainerSendCompletionForTest: (complete) => sendCompletions.push(complete),
+      dispatchTerminalQueries: terminalQueries,
+      admitUserTurn: async (input) => {
+        const admitted = fakeAdmittedDispatch(input);
+        if (admitted.kind !== "admitted") throw new Error("unreachable");
+        admittedRows.push(admitted.dispatch);
+        return admitted;
+      },
+    });
+    try {
+      const ws = await openClient(rig.port);
+      ws.send(inboundFrame({
+        clientMessageId: "cm-send-callback-timeout",
+        idempotencyKey: "web:cm-send-callback-timeout:0",
+        peer: { id: "sess-send-callback-timeout", kind: "dm" },
+      }));
+      await waitFor(() => sendCompletions.length === 1);
+      await waitFor(() => terminalQueries.length === 1);
+      const timedOut = terminalQueries[0]!;
+      assert.equal(timedOut.params[1], "executed_error");
+      assert.equal(timedOut.params[2], "dispatch_enrichment_timeout");
+      assert.equal(admittedRows[0]?.status, "terminal");
+      assert.equal(rig.receiptCasCalls.length, 0, "no receipt can excuse an unfinished transfer");
+      for (const complete of sendCompletions.splice(0)) { complete(); complete(); }
+      ws.terminate();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(terminalQueries.length, 1, "late send completion and close cannot terminalize twice");
+      assert.equal(admittedRows[0]?.status, "terminal", "late send callback cannot revive the expired dispatch");
+      assert.equal(rig.receiptCasCalls.length, 0);
+    } finally {
+      for (const complete of sendCompletions.splice(0)) complete();
+      await stopRig(rig);
+    }
+  });
+
   test("R4-B9 accepted receipt synchronously beats close before delayed send callback", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
     const sendCompletions: Array<() => void> = [];
@@ -2583,6 +2647,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       attest: "yes",
       durableDispatch: true,
       pgPool,
+      promptQueuePreparationTimeoutMs: 150,
       deferContainerSendCompletionForTest: (complete) => sendCompletions.push(complete),
       admitUserTurn: async (input) => {
         const admitted = fakeAdmittedDispatch(input);
@@ -2600,7 +2665,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       }));
       await waitFor(() => receiptCasStarted && sendCompletions.length === 1);
       for (const container of rig.containerWss.clients) container.close(1011, "receipt race close");
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 200));
       assert.equal(
         queries.some((q) => /status = 'terminal'/.test(q.sql)),
         false,

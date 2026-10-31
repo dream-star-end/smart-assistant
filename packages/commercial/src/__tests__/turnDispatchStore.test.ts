@@ -8,8 +8,10 @@ import { describe, test } from 'node:test'
 
 import {
   type Queryable,
+  DISPATCH_NO_RECEIPT_MAX_AGE_MS,
   admitDispatch,
   backfillDispatchTraceId,
+  casAdmittedToRejecting,
   casToTerminal,
   heartbeatLease,
   touchDispatchLeaseOnLiveFrame,
@@ -208,6 +210,37 @@ describe('CAS helpers', () => {
     assert.equal(await heartbeatLease(asQ(lost), { dispatchId: 'd', ownerId: 'o', leaseEpoch: 2 }), false)
   })
 
+  test('heartbeatLease caps unreceipted admission and requires a live owned session', async () => {
+    let sql = ''
+    let params: unknown[] = []
+    const now = 1_800_000_000_000
+    await heartbeatLease(asQ({ async query(text: string, values: unknown[]) {
+      sql = text
+      params = values
+      return { rows: [], rowCount: 1 }
+    } }), { dispatchId: 'd', ownerId: 'o', leaseEpoch: 2, now })
+    assert.match(sql, /lease_until = LEAST\(\$3, admitted_at/)
+    assert.match(sql, /admitted_at \+ \(\$6::bigint \* INTERVAL '1 millisecond'\) > \$4/)
+    assert.match(sql, /s\.id = turn_dispatches\.session_id/)
+    assert.match(sql, /s\.user_id = 'c:' \|\| turn_dispatches\.user_id::text/)
+    assert.match(sql, /s\.deleted_at IS NULL/)
+    assert.deepEqual(params.slice(3), [new Date(now), '2', DISPATCH_NO_RECEIPT_MAX_AGE_MS])
+  })
+
+  test('rejecting transition optionally tags authority expiry and otherwise preserves failure code', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = []
+    const q = asQ({ async query(sql: string, params: unknown[]) {
+      calls.push({ sql, params })
+      return { rows: [], rowCount: 0 }
+    } })
+    const input = { dispatchId: 'd', expectedEpoch: 2, ownerId: 'reconciler' }
+    assert.equal(await casAdmittedToRejecting(q, input), null)
+    assert.equal(await casAdmittedToRejecting(q, { ...input, failureCode: 'dispatch_authority_expired' }), null)
+    assert.match(calls[0]!.sql, /failure_code = COALESCE\(\$5, failure_code\)/)
+    assert.equal(calls[0]!.params[4], null)
+    assert.equal(calls[1]!.params[4], 'dispatch_authority_expired')
+  })
+
   test('touchDispatchLeaseOnLiveFrame renews admitted/accepted open rows without owner fence', async () => {
     const captured: string[] = []
     const params: unknown[][] = []
@@ -228,9 +261,12 @@ describe('CAS helpers', () => {
     )
     assert.ok(captured[0]!.includes("status IN ('admitted', 'accepted')"))
     assert.ok(captured[0]!.includes('terminal_at IS NULL'))
+    assert.match(captured[0]!, /status = 'accepted' OR admitted_at/)
+    assert.match(captured[0]!, /s\.deleted_at IS NULL/)
     assert.equal(captured[0]!.includes('owner_id'), false, 'must not require the original WS owner')
     assert.equal(captured[0]!.includes('lease_epoch'), false)
     assert.deepEqual(params[0]!.slice(0, 3), ['3', 'sess-a', 'cm-live'])
+    assert.equal(params[0]![4], DISPATCH_NO_RECEIPT_MAX_AGE_MS)
   })
 
   test('touchDispatchLeaseOnLiveFrame returns false when no open row matches', async () => {

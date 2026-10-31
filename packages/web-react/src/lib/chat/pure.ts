@@ -811,6 +811,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   runner_crashed: "执行环境意外中断，你的消息已保留，可以在当前会话继续。",
   // ── 免单类(waivable;errorPresentation 走 waiver 分支,此处仅供契约完备 + 兜底展示)──
   model_authority_expired: "任务暂时中断，已有进度已保留，可以从断点继续。",
+  dispatch_authority_expired: "这一轮没发出去，未计费。",
   liveness_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   idle_timeout: "任务长时间没有新输出，系统已中断，本轮不收费。",
   no_response: "任务未能产生有效回复，本轮未扣费。",

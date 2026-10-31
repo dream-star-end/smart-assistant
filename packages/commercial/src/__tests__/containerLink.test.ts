@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { WebSocket } from "ws";
-import { ContainerLinkRegistry, getContainerLinkHandle } from "../ws/containerLink.js";
+import { ContainerLinkRegistry, getContainerLinkHandle, sendContainerFrame } from "../ws/containerLink.js";
 import { registerBridgeExecutors, availableExecutors, type RecoveryExecutor } from "../ws/bridgeExecutorRegistration.js";
 import { registerBridgeTransport } from "../ws/containerLinkTransport.js";
 import type { CronOriginExecutor } from "../ws/userChatBridge.js";
@@ -235,6 +235,80 @@ test("RF-step3: first link without persisted frames requests the PG open turn, n
     await new Promise<void>((resolve, reject) => socket.send(wire({type: "inbound.hello", peers: [{peerId: "s", inFlight: true, inFlightClientMessageId: "wrong"}]}), {}, (err) => err ? reject(err) : resolve()));
     assert.deepEqual(physical.sent[0]!.peers, [{peerId: "s", agentId: "main", lastFrameSeq: 0, resumeActiveTurnCandidateMessageIds: ["pg-turn"]}]);
   } finally { await registry.shutdown(); }
+});
+
+test("OCV5-682 fresh message bypasses blocked replay and a cancelled message never reaches transport", { timeout: 5000 }, async () => {
+  let release!: () => void;
+  let reading!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const readStarted = new Promise<void>((resolve) => { reading = resolve; });
+  const registry = new ContainerLinkRegistry({ query: async () => {
+    reading();
+    await blocked;
+    return { rows: [{ after_seq: "12", active_message_ids: [] }], rowCount: 1 };
+  } } as unknown as Queryable);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const hello = new Promise<void>((resolve, reject) => socket.send(wire({
+      type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }],
+    }), {}, (error) => error ? reject(error) : resolve()));
+    await readStarted;
+    let callbacks = 0;
+    sendContainerFrame(socket, wire({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "fresh" }), {}, (error) => {
+      assert.equal(error, undefined);
+      callbacks++;
+    }, () => true);
+    const cancelled: Error[] = [];
+    sendContainerFrame(socket, wire({ type: "inbound.message", peer: { id: "session" }, clientMessageId: "expired" }), {}, (error) => {
+      if (error) cancelled.push(error);
+    }, () => false);
+    assert.deepEqual(physical.sent.map((frame) => frame.clientMessageId), ["fresh"], "a waiting cursor cannot age a fresh authority ticket");
+    assert.equal(callbacks, 1);
+    assert.match(cancelled[0]?.message ?? "", /cancelled/);
+    release();
+    await hello;
+    assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.message", "inbound.hello"]);
+  } finally { release(); await registry.shutdown(); }
+});
+
+test("OCV5-682 deferred frame rechecks cancellation at physical write without closing shared transport", { timeout: 5000 }, async () => {
+  let release!: () => void;
+  let reading!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const readStarted = new Promise<void>((resolve) => { reading = resolve; });
+  const registry = new ContainerLinkRegistry({ query: async () => {
+    reading();
+    await blocked;
+    return { rows: [{ after_seq: "12", active_message_ids: [] }], rowCount: 1 };
+  } } as unknown as Queryable);
+  const physical = new Transport();
+  try {
+    const socket = await registry.attach(42n, 7, () => physical as unknown as WebSocket);
+    getContainerLinkHandle(socket)!.activate();
+    const hello = new Promise<void>((resolve, reject) => socket.send(wire({
+      type: "inbound.hello", peers: [{ peerId: "session", agentId: "main" }],
+    }), {}, (error) => error ? reject(error) : resolve()));
+    await readStarted;
+    let live = true;
+    let callbacks = 0;
+    const cancelled = new Promise<Error | undefined>((resolve) => sendContainerFrame(socket,
+      wire({ type: "inbound.control.session_repo_bind", sessionId: "session" }), {}, (error) => {
+        callbacks++;
+        resolve(error);
+      }, () => live));
+    assert.equal(physical.sent.length, 0, "ordered controls still wait behind hello");
+    live = false;
+    release();
+    await hello;
+    assert.match((await cancelled)?.message ?? "", /cancelled/);
+    assert.equal(callbacks, 1);
+    assert.deepEqual(physical.sent.map((frame) => frame.type), ["inbound.hello"]);
+    assert.equal(physical.readyState, WebSocket.OPEN, "cancelling a stale frame preserves other consumers");
+    socket.send(wire({ type: "ping", id: "still-open" }));
+    assert.equal(physical.sent.at(-1)?.type, "ping");
+  } finally { release(); await registry.shutdown(); }
 });
 
 

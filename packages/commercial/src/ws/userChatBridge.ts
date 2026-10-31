@@ -1,3 +1,6 @@
+import { handleDispatchAuthorityRejection } from "./dispatchAuthorityRejection.js";
+import { _OutboundPersistQueueCoordinator } from "./outboundPersistQueues.js";
+export { _OutboundPersistQueueCoordinator } from "./outboundPersistQueues.js";
 import { ContainerLinkControls } from "./containerLinkControls.js";
 import { ContainerLinkRecovery } from "./containerLinkRecovery.js";
 import { rebuildContainerLink } from "./containerLinkRebuild.js";
@@ -11,7 +14,7 @@ import { sendErrorFrame } from './userErrorFrames.js';
 import { withUserError } from '@openclaude/protocol';
 import {isPlainRecord,hasOnlyKeys} from './bridgeInputGuards.js';
 import { sendHelloSessionSnapshots } from "./helloOpenDispatchSnapshot.js";
-import { ContainerLinkRegistry, getContainerLinkHandle, type ContainerLinkSnapshot } from "./containerLink.js";
+import { ContainerLinkRegistry, getContainerLinkHandle, sendContainerFrame, type ContainerLinkSnapshot } from "./containerLink.js";
 import { containerLinkEnabled, hasBrowserActivity } from "./containerLinkPolicy.js";
 import {checkModelSwitchFrame,promptQueueDispositionForCode,_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
 export {_recoveryRefusalAction,shouldRejectCodexTurnForG7} from './modelSwitchCostGuard.js';
@@ -1918,116 +1921,6 @@ export async function isCursorContainerOnSelfHost(
   return eligible.rowCount === 1;
 }
 
-type OutboundPersistQueueState = {
-  tail: Promise<void>;
-  failedSeq: number | null;
-};
-
-function isPermanentLiveFrameConflict(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { liveFramePermanentConflict?: unknown }).liveFramePermanentConflict === true
-  );
-}
-
-/**
- * Serializes durable outbound writes per container/session namespace.
- *
- * A failure remains a monotonic barrier while at least one browser bridge is
- * attached to that namespace. Once the final browser bridge detaches, the
- * failed state is retired after its current tail drains, so a later reconnect
- * is not permanently poisoned by a failure from an earlier connection.
- */
-export class _OutboundPersistQueueCoordinator {
-  private readonly queues = new Map<string, OutboundPersistQueueState>();
-  private readonly consumerCounts = new Map<string, number>();
-
-  retain(key: string): void {
-    this.consumerCounts.set(key, (this.consumerCounts.get(key) ?? 0) + 1);
-  }
-
-  release(key: string): void {
-    const count = this.consumerCounts.get(key) ?? 0;
-    if (count > 1) {
-      this.consumerCounts.set(key, count - 1);
-      return;
-    }
-    this.consumerCounts.delete(key);
-    const state = this.queues.get(key);
-    if (state !== undefined) this.scheduleCleanup(key, state, state.tail);
-  }
-
-  enqueue(
-    key: string,
-    frameSeq: number,
-    work: () => Promise<void>,
-    onFailure: (error: unknown) => void,
-    onPermanentConflict?: (error: unknown) => void,
-  ): void {
-    let state = this.queues.get(key);
-    if (!state) {
-      state = { tail: Promise.resolve(), failedSeq: null };
-      this.queues.set(key, state);
-    }
-    const task = state.tail.then(async () => {
-      // A reconnect may replay the exact failed sequence from the container's
-      // own ring. That exact retry is allowed to heal the namespace; a later
-      // sequence must never overtake it while a browser generation is alive.
-      if (state!.failedSeq !== null && state!.failedSeq !== frameSeq) {
-        onFailure(new Error(`outbound durability blocked at frame ${state!.failedSeq}`));
-        return;
-      }
-      try {
-        await work();
-        if (state!.failedSeq === frameSeq) state!.failedSeq = null;
-      } catch (error) {
-        if (isPermanentLiveFrameConflict(error)) {
-          // An exact retry can turn a prior transient failure into a proven
-          // permanent conflict. Retire only that same-sequence barrier; a
-          // barrier for any other missing sequence must remain strict.
-          if (state!.failedSeq === frameSeq) state!.failedSeq = null;
-          onPermanentConflict?.(error);
-          return;
-        }
-        state!.failedSeq = frameSeq;
-        onFailure(error);
-      }
-    });
-    state.tail = task;
-    this.scheduleCleanup(key, state, task);
-  }
-
-  async drain(): Promise<void> {
-    await Promise.allSettled([...this.queues.values()].map((state) => state.tail));
-  }
-
-  snapshotForTest(): { queues: number; consumerKeys: number; consumers: number } {
-    return {
-      queues: this.queues.size,
-      consumerKeys: this.consumerCounts.size,
-      consumers: [...this.consumerCounts.values()].reduce((sum, count) => sum + count, 0),
-    };
-  }
-
-  private scheduleCleanup(
-    key: string,
-    state: OutboundPersistQueueState,
-    tail: Promise<void>,
-  ): void {
-    const cleanup = (): void => {
-      if (
-        this.queues.get(key) === state &&
-        state.tail === tail &&
-        (state.failedSeq === null || !this.consumerCounts.has(key))
-      ) {
-        this.queues.delete(key);
-      }
-    };
-    void tail.then(cleanup, cleanup);
-  }
-}
-
 // ---------- 主入口 ----------------------------------------------------------
 
 export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHandler {
@@ -2232,7 +2125,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   const links = deps.pgPool && (deps.containerLinkEnabled ?? containerLinkEnabled())
     ? new ContainerLinkRegistry(deps.pgPool, log, { heartbeatMs: deps.containerLinkHeartbeatMs, maxBufferedBytes, dialTimeoutMs: connectTimeoutMs })
     : null;
-  if (links) links.beforeReplay = () => outboundPersistQueues.drain();
+  if (links) links.beforeReplay = (uid, cid) => outboundPersistQueues.drain(`${uid}:${cid}:`);
   const recovery = links && deps.resolveContainerLinkEndpoint ? new ContainerLinkRecovery({
     pool: deps.pgPool!, channel: deps.containerLinkRecovery?.channel ?? "v5", log,
     ...deps.containerLinkRecovery,
@@ -3689,7 +3582,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       };
       enrichmentDispatches.set(record.clientMessageId, state);
       const expireIfDue = (): boolean => {
-        if (state.phase !== "enriching" || Date.now() < state.deadlineAt) return false;
+        if (!["enriching", "transferring"].includes(state.phase) || Date.now() < state.deadlineAt) return false;
         if (!terminalizeEnrichmentDispatch(state, "dispatch_enrichment_timeout")) return false;
         if (!cleaned && userWs.readyState === WebSocket.OPEN) {
           sendErrorFrame(
@@ -3711,7 +3604,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       const armDeadlineTimer = (): void => {
         state.timer = setTimeout(() => {
           state.timer = null;
-          if (state.phase !== "enriching") return;
+          if (!["enriching", "transferring"].includes(state.phase)) return;
           if (Date.now() < state.deadlineAt) {
             armDeadlineTimer();
             return;
@@ -3736,8 +3629,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       }
     };
 
-    /** Synchronous fence immediately before ws.send. No await is permitted
-     * between this transition and the call into the websocket implementation. */
+    /** Begin hand-off; retain the deadline until a physical write or a validated
+     * receipt wins. The shared link rechecks this fence before writing. */
     const beginEnrichmentTransfer = (
       record: AdmittedDispatch | undefined,
     ): EnrichmentDispatchState | null => {
@@ -3747,11 +3640,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (enrichmentDeadlineChecks.get(state)?.() === true) return null;
       if (state.phase !== "enriching") return null;
       state.phase = "transferring";
-      enrichmentDeadlineChecks.delete(state);
-      if (state.timer !== null) {
-        clearTimeout(state.timer);
-        state.timer = null;
-      }
       return state;
     };
 
@@ -7677,12 +7565,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       transfer: EnrichmentDispatchState | null = null,
     ): boolean => {
       try {
-        containerWs.send(data, { binary: isBinary }, (err) => {
+        sendContainerFrame(containerWs, data, { binary: isBinary }, (err) => {
           const complete = (): void => {
             if (err) {
               bridgeLog?.warn("user-chat-bridge: container send error", { err });
-              if (transfer) {
-                terminalizeEnrichmentDispatch(transfer, "container_forward_rejected");
+              if (transfer && terminalizeEnrichmentDispatch(transfer, "container_forward_rejected")) {
                 cleanup("container_error", true);
               }
             } else {
@@ -7692,7 +7579,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           if (deps.deferContainerSendCompletionForTest) {
             deps.deferContainerSendCompletionForTest(complete);
           } else complete();
-        });
+        }, transfer ? () => {
+          enrichmentDeadlineChecks.get(transfer)?.();
+          return transfer.phase === "transferring";
+        } : undefined);
         bytesUC += len;
         metrics.onUserFrame?.(uid, len, isBinary);
         return true;
@@ -7982,6 +7872,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             return;
           }
         }
+        if (handleDispatchAuthorityRejection(attestPeek, {
+          pool: deps.pgPool, uid, admittedDispatches, acceptEnrichmentReceipt, dropAdmittedDispatch,
+          settleCronOriginClaim, warn: (message, meta) => bridgeLog?.warn(message, meta),
+        })) return;
         if (handleTurnDispatchReceipt(attestPeek, {
           pool: deps.pgPool, uid, admittedDispatches, enrichmentDispatches,
           claimEnrichmentTerminalization, acceptEnrichmentReceipt, dropAdmittedDispatch,

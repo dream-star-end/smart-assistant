@@ -65,6 +65,17 @@ export function TurnStatusCard({
   cb: CardCallbacks;
   currentTurn: boolean;
 }) {
+  if (msg._dispatchDeliveryRecovery === "hidden") return null;
+  if (msg._dispatchDeliveryRecovery) {
+    const target = msg._dispatchRetryClientMessageId ?? msg._clientMessageId;
+    const source = currentTurn && target ? cb.resolveRetryTarget?.(target) : undefined;
+    return <div role="status" data-testid="dispatch-delivery-notice" className="text-faint text-xs py-1"
+      title="消息没有开始执行，已确认未计费。系统最多自动重发一次。">
+      {msg._dispatchDeliveryRecovery === "resent" ? "这一轮没发出去，已自动重发" : "这一轮没发出去"}
+      {msg._dispatchDeliveryRecovery === "failed" && source && cb.onRetrySend ?
+        <button type="button" className="ml-2 underline" onClick={() => cb.onRetrySend?.(source)}>重新发送</button> : null}
+    </div>;
+  }
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
   const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
   const retry = source && cb.onContinueInterrupted

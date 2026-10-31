@@ -32,6 +32,7 @@ export async function closeRefusedRecoveryChains(pool: Pool): Promise<number> {
          JOIN client_sessions s
            ON s.id=j.session_id AND s.user_id='c:'||j.user_id::text AND s.deleted_at IS NULL
         WHERE j.status='paused'
+          AND j.error_code <> 'dispatch_authority_expired'
           AND (j.pause_reason='dispatch_not_accepted' OR j.pause_reason LIKE 'refused:%')
           AND j.updated_at > NOW() - INTERVAL '1 day'
           AND strpos(s.messages, '"m-recovery-giveup-' || j.root_client_message_id || '"') = 0
