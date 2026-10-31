@@ -174,7 +174,7 @@ test("queued user intent does not swallow the current error; asynchronous replay
 });
 
 test("a late adjacent compatibility final cannot end a dispatch the snapshot proved still running", async () => {
-  const { sock, ws, s } = boot({ readSessionSnapshot: async () => snapshot() });
+  const { sock, ws, s } = boot({ readSessionSnapshot: async () => snapshot({ lastFrameSeq: 2 }) });
   const sessionKey = "agent:main:webchat:dm:s1";
   ws.push(error("bad_sequence", { type: "outbound.error", frameSeq: 1, sessionKey }));
   await flush();
@@ -183,5 +183,37 @@ test("a late adjacent compatibility final cannot end a dispatch the snapshot pro
   await flush();
   expect(s._sendingInFlight).toBe(true);
   expect(s.messages.some((row) => row._errorCode)).toBe(false);
+  sock.stop();
+});
+
+test("an old sequenced error never bypasses the original cursor gate through asynchronous replay", async () => {
+  const read = vi.fn(async () => undefined);
+  const { sock, ws, s } = boot({ readSessionSnapshot: read });
+  const sessionKey = "agent:main:webchat:dm:s1";
+  s._lastFrameSeq = 10; s._lastFrameSeqByKey = { [sessionKey]: 10 };
+  ws.push(error("bad_sequence", { type: "outbound.error", frameSeq: 1, sessionKey }));
+  await flush();
+  expect(read).not.toHaveBeenCalled();
+  expect(s._lastFrameSeqByKey[sessionKey]).toBe(10);
+  expect(s._sendingInFlight).toBe(true);
+  expect(s.messages.some((row) => row._errorCode)).toBe(false);
+  sock.stop();
+});
+
+test("two newer errors share the read but each adjacent compatibility final stays fenced", async () => {
+  let resolve!: (snap: SessionSnapshot) => void;
+  const read = vi.fn(() => new Promise<SessionSnapshot>((r) => { resolve = r; }));
+  const { sock, ws, s } = boot({ readSessionSnapshot: read });
+  const sessionKey = "agent:main:webchat:dm:s1";
+  const final = (frameSeq: number) => ({ type: "outbound.message", peer: { id: "s1", kind: "dm" },
+    sessionKey, clientMessageId: cmid, frameSeq, blocks: [{ kind: "text", text: "[error] old sequence" }], isFinal: true });
+  ws.push(error("bad_sequence", { type: "outbound.error", frameSeq: 1, sessionKey })); ws.push(final(2));
+  ws.push(error("bad_sequence", { type: "outbound.error", frameSeq: 3, sessionKey })); ws.push(final(4));
+  await flush();
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(s._sendingInFlight).toBe(true);
+  resolve(snapshot({ lastFrameSeq: 4 })); await flush();
+  expect(s._sendingInFlight).toBe(true);
+  expect(s.messages.some((row) => row._errorCode || row.text.includes("[error]"))).toBe(false);
   sock.stop();
 });

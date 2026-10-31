@@ -24,7 +24,7 @@ import {
   applyCostWaived,
   applyCallUsage,
   applyLegacyBridgeError,
-  applyOutboundError,
+  applyOutboundError, claimStateErrorFrame,
   applyOutboundMessage,
   applyPermissionRequest,
   applyPermissionSettled,
@@ -1357,7 +1357,6 @@ export class ChatSocket {
     this.scheduleNotify();
   }
 
-  // ═══════════════ transient 软提示（会话级、非持久，S3）═══════════════
   private setTransientNotice(sessId: string, text: string): void {
     const s = this.sessions.get(sessId);
     if (
@@ -5072,6 +5071,7 @@ export class ChatSocket {
   private readbackStateError(sess: ChatSession, frame: OutboundErrorWire | LegacyBridgeErrorWire): boolean {
     const epoch = this.lifecycleEpoch;
     return attemptStateErrorReadback(sess, frame, {
+      accept: () => claimStateErrorFrame(sess, frame),
       read: (id) => this.fetchSessionSnapshot(id), current: () => this.sessions.get(sess.id) === sess && this.lifecycleEpoch === epoch,
       replay: (held) => this.dispatch(held),
       changed: () => { this.deps.persistSession?.(sess.id); this.scheduleNotify(); },

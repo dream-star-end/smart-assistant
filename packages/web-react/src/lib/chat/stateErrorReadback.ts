@@ -1,7 +1,7 @@
 /** State errors may read authority once; this module never sends a user task. */
 import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import type { ChatSession } from "./model";
-import type { SessionSnapshot } from "./sessionSnapshot";
+import { snapshotIsStale, type SessionSnapshot } from "./sessionSnapshot";
 
 type StateErrorFrame = {
   code?: string; clientMessageId?: string; peer?: { id: string }; ts?: number; frameSeq?: number; sessionKey?: string;
@@ -37,6 +37,7 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
   sess: ChatSession,
   frame: F,
   effects: {
+    accept: () => boolean;
     read: (sessionId: string) => Promise<SessionSnapshot | null | undefined>;
     current: () => boolean;
     replay: (frame: F) => void;
@@ -49,11 +50,9 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     sess._activeClientMessageId !== cmid || !sess._sendingInFlight || sess._stopSettlement ||
     (!STATE_CODES.has(code) && !STORAGE_CODES.has(code))) return false;
   attempted.add(frame);
+  if (!effects.accept()) return true;
   const key = `${cmid}:${code}`;
   const inflight = pending.get(sess) ?? new Set<string>();
-  if (inflight.has(key)) return true;
-  pending.set(sess, inflight);
-  inflight.add(key);
   // Reuse the reducer's exact adjacent compatibility-final fence while reading authority.
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
@@ -61,6 +60,9 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
     finals.add(compatKey({ ...frame, frameSeq: frame.frameSeq + 1 }, cmid));
     compatibilityFinals.set(sess, finals);
   }
+  if (inflight.has(key)) return true;
+  pending.set(sess, inflight);
+  inflight.add(key);
   const replay = () => {
     // The adjacent final may already have advanced frameSeq. This is the same
     // locally held error, not a new incoming frame or a cursor rewind.
@@ -72,7 +74,7 @@ export function attemptStateErrorReadback<F extends StateErrorFrame>(
   void effects.read(sess.id).then((snap) => {
     if (!effects.current()) return;
     if (sess._stopSettlement || (sess._activeClientMessageId && sess._activeClientMessageId !== cmid)) return;
-    if (!snap || snap.sessionId !== sess.id || !stateErrorWasResolved(code, cmid, snap)) {
+    if (!snap || snap.sessionId !== sess.id || snapshotIsStale(sess, snap) || !stateErrorWasResolved(code, cmid, snap)) {
       const source = sess.messages.find((message) => message.role === "user" && message.id === cmid);
       if (sess._activeClientMessageId === cmid || source?.status !== "replied") replay();
       return;

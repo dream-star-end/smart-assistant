@@ -2844,6 +2844,11 @@ function settleCancelFencedTerminalError(
   effects.persistSession?.(sess.id);
 }
 
+/** State readback claims the same cursor/stale gate before holding a terminal error. */
+export function claimStateErrorFrame(sess: ChatSession, frame: { clientMessageId?: string; frameSeq?: number; sessionKey?: string }): boolean {
+  return !shouldSuppressStaleOutboundError(sess, frame) && acceptFrameSeq(sess, frame);
+}
+
 export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, effects: FrameEffects = {}): void {
   if (shouldSuppressStaleOutboundError(sess, frame)) return;
   if (typeof frame.frameSeq === "number" && frame.frameSeq > 0) {
