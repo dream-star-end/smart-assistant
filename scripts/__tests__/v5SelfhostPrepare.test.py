@@ -669,6 +669,32 @@ selfhost_prepared_complete "$SHA" "$BUILT_MASTER_RELEASE"
         self.bash('selfhost_prepared_gc touch "$T/gc"')
         self.assertTrue((self.t / 'gc').exists())
 
+    def test_shallow_history_defers_gc_prepare_and_consume_without_deleting_receipts(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        expected = {path: path.read_bytes() for path in (self.receipt, newer)}
+        shallow = self.repo / '.git/shallow'
+        shallow.write_text(target + '\n')
+        self.assertEqual(self.git('rev-list', target), target)
+        self.git('cat-file', '-e', self.sha + '^{commit}')
+        result = self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertIn('GC deferred: prepared state unreadable', result.stdout)
+        self.assertFalse((self.t / 'gc').exists())
+        self.bash(f'selfhost_prepare_candidate {target}', ok=False)
+        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"',
+                  ok=False)
+        for path, data in expected.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.assertEqual(self.build_count(), 2)
+        shallow.unlink()
+        self.bash('selfhost_prepared_enter_flip "$SHA"')
+        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
+        self.assertFalse(self.receipt.exists())
+        self.assertFalse(newer.exists())
+
     def test_missing_remote_tip_object_is_fetched_without_updating_refs(self):
         self.prepare()
         target = self.advance_remote_only()
