@@ -100,11 +100,17 @@ export function parseQa(answer: string): QaVerdict {
   return r.data
 }
 
-/** The criteria a target is judged on (a style image has no character or scene to match). */
+/**
+ * The criteria a target is judged on (a style image has no character or scene to match). A first
+ * frame is a still: it cannot show the shot's action, so `action` is scored for the user to read
+ * but does not gate it — gating on it failed 14 of 18 rejected frames at ≈0.50 while character
+ * stayed ≈0.90 (prod 2026-10-25..29). The clip, which can show the action, is still gated on it.
+ */
 export function criteriaFor(
   target: QaTarget,
   assetKind?: 'character' | 'scene' | 'style',
 ): Criterion[] {
+  if (target === 'frame') return ['character', 'scene', 'artifacts']
   if (target !== 'bible') return ['character', 'scene', 'action', 'artifacts']
   if (assetKind === 'character') return ['character', 'artifacts']
   if (assetKind === 'scene') return ['scene', 'artifacts']
@@ -202,6 +208,12 @@ export function buildQaPrompt(input: QaPromptInput): string {
         .filter(Boolean)
         .join('；')
     : ''
+  const action =
+    input.target === 'frame'
+      ? 'action 这一瞬间的姿态和构图是否符合镜头要求（这是静帧，只看这一刻，不要求画出动作过程）'
+      : input.target === 'clip'
+        ? 'action 这几帧连起来的动作是否与镜头要求一致'
+        : 'action 设定图按 1'
   const bible = input.bible
     .map(
       (b) =>
@@ -212,7 +224,7 @@ export function buildQaPrompt(input: QaPromptInput): string {
     `你是影片质检员。图中每格左上角有编号：${what}${refs}。`,
     spec && `镜头要求：${spec}`,
     bible && `设定描述：\n${bible}`,
-    '逐项打分（0–1，1 最好）：character 角色外观与设定是否一致（没有角色时按 1）；scene 场景与设定 / 镜头要求是否一致；action 画面动作与镜头要求是否一致（设定图按 1）；artifacts 有无畸形手脚、错乱文字、闪烁、穿模等瑕疵（1 = 没有）。',
+    `逐项打分（0–1，1 最好）：character 角色外观与设定是否一致（没有角色时按 1）；scene 场景与设定 / 镜头要求是否一致；${action}；artifacts 有无畸形手脚、错乱文字、闪烁、穿模等瑕疵（1 = 没有）。`,
     'moderation 内容审核：pass 合规；review 拿不准，需要人工看；block 明显违规（成人、血腥暴力、仇恨、冒用真人等）。',
     'confidence：你对这次判断有多确定（0–1）。',
     'summary：一句给用户看的中文说明（≤ 100 字）；issues：最多 5 条具体问题 {frame 编号, what 问题}，写成重画时可以避免的描述。',

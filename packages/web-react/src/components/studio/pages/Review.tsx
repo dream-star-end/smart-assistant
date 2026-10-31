@@ -790,12 +790,14 @@ function ShotReview(props: {
                   <div className="st-qa-grid">
                     {QA_ROWS.map(([k, label]) => {
                       const v = num(qa[k])
+                      // A still frame's action is the pose of one moment: shown, not part of the pass.
+                      const soft = k === 'action' && take?.ownerKind === 'shot_frame'
                       return v === null ? null : (
                         <div key={k} className="st-qa-row">
-                          <span>{label}</span>
+                          <span>{soft ? '这一刻的姿态（参考，不计分）' : label}</span>
                           <span className="st-meter">
                             <i
-                              className={v < 0.75 ? 'warn' : ''}
+                              className={v < 0.75 && !soft ? 'warn' : ''}
                               style={{ width: `${Math.round(v * 100)}%` }}
                             />
                           </span>

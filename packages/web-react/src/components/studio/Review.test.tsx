@@ -99,6 +99,15 @@ describe('ReviewPage (OCV5-593 FE-2b)', () => {
     expect(screen.getByText('尾巴颜色和设定不符')).toBeInTheDocument()
   })
 
+  test("a first frame's action score reads as the pose of the moment, not a pass criterion", () => {
+    const v = view()
+    v.takes = [{ ...take(1, 0.84), qa: { score: 0.84, character: 0.9, scene: 0.84, action: 0.5 } }]
+    render(<ReviewPage auth={auth} view={v} shotId="s1" onBack={() => {}} />)
+    fireEvent.click(screen.getByRole('tab', { name: 'QA 报告' }))
+    expect(screen.getByText('这一刻的姿态（参考，不计分）')).toBeInTheDocument()
+    expect(screen.queryByText('动作符合分镜')).not.toBeInTheDocument()
+  })
+
   test('a point drops a draft with normalised coordinates; text is kept; it can be handed over', async () => {
     render(<ReviewPage auth={auth} view={view()} shotId="s1" onBack={() => {}} />)
     fireEvent.click(screen.getByRole('button', { name: '点' }))
