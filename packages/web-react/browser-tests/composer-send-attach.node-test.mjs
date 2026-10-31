@@ -71,7 +71,7 @@ test("OCV5-694 real App: the first trusted click on the paperclip opens the file
         await page.goto(preview.url);
         await page.getByRole("textbox", { name: "消息输入框" }).waitFor();
         // Repro: a new session (sidebar entry on desktop, header button on phones).
-        await page.locator('button:visible', { hasText: /新建会话/ }).or(page.locator('button[aria-label="新建会话"]:visible')).first().click();
+        await page.getByRole("button", { name: /新建会话/ }).filter({ visible: true }).first().click();
         const clip = page.getByRole("button", { name: "添加附件" });
         await clip.waitFor();
         const box = await clip.boundingBox();

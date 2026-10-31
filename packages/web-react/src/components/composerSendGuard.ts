@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 /** OCV5-695: a click landing within this window after the send button turned into Stop is the
  *  user's second click on an unresponsive Send, not a Stop. Measured from the first Stop render. */
@@ -12,12 +12,11 @@ export const STOP_ARM_MS = 1000;
 export function useSendGuard(busy: boolean) {
   const submittingRef = useRef(false);
   const [sending, setSending] = useState(false);
-  const stopShownAt = useRef<number | null>(null);
-  const wasBusy = useRef(busy);
-  useLayoutEffect(() => {
-    if (busy && !wasBusy.current) stopShownAt.current = performance.now();
-    wasBusy.current = busy;
-  }, [busy]);
-  const stopArmed = () => stopShownAt.current === null || performance.now() - stopShownAt.current >= STOP_ARM_MS;
-  return { submittingRef, sending, setSending, stopArmed };
+  // Render-time bookkeeping, idempotent across re-renders: only the busy edge writes.
+  const flip = useRef({ busy, at: -STOP_ARM_MS }).current;
+  if (busy !== flip.busy) {
+    flip.busy = busy;
+    if (busy) flip.at = performance.now();
+  }
+  return { submittingRef, sending, setSending, stopArmed: () => performance.now() - flip.at >= STOP_ARM_MS };
 }

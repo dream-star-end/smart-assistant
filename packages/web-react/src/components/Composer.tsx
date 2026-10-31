@@ -475,6 +475,26 @@ export function Composer({
   const canGoal = !!onSetGoal && !!onGoalAction;
   const hasPlusMenu = canGoal;
   const visibleGoal = visibleGoalOf(goal);
+  // 「+」按钮:有目标菜单时作触发器,否则禁用占位。「+」早已只剩「设定目标」,禁用态文案不再说「附件暂不可用」(C-15)。
+  // 闭合态目标可见性:有活跃目标时右上角显小圆点,近预算转 warning 色(与菜单项内状态点同判定权威 goalNearBudget)。
+  const plusButton = (
+    <IconButton
+      data-product-feature={PRODUCT_CAPABILITIES.files.id}
+      aria-label="更多选项"
+      title={hasPlusMenu ? "更多选项" : "会话目标暂不可用"}
+      disabled={disabled || !hasPlusMenu}
+      className="relative"
+    >
+      <Plus size={20} />
+      {visibleGoal && (
+        <span
+          aria-hidden
+          data-testid="composer-goal-dot"
+          className={cn("absolute right-1 top-1 size-1.5 rounded-full", goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent")}
+        />
+      )}
+    </IconButton>
+  );
 
   const removeAttach = useCallback(
     (id: string) => {
@@ -884,29 +904,7 @@ export function Composer({
                 无目标时(demo)退化为禁用按钮,不弹空菜单。 */}
             {hasPlusMenu ? (
               <DropdownMenu open={plusMenuOpen} onOpenChange={setPlusMenuOpen}>
-                <DropdownMenuTrigger asChild>
-                  <IconButton
-                    data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                    aria-label="更多选项"
-                    title="更多选项"
-                    disabled={disabled}
-                    className="relative"
-                  >
-                    <Plus size={20} />
-                    {/* 闭合态目标可见性:有活跃目标时在触发按钮右上角显小圆点,近预算转 warning 色,
-                        不点开菜单也能感知目标存在/临界(与菜单项内状态点同判定权威 goalNearBudget)。 */}
-                    {visibleGoal && (
-                      <span
-                        aria-hidden
-                        data-testid="composer-goal-dot"
-                        className={cn(
-                          "absolute right-1 top-1 size-1.5 rounded-full",
-                          goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                        )}
-                      />
-                    )}
-                  </IconButton>
-                </DropdownMenuTrigger>
+                <DropdownMenuTrigger asChild>{plusButton}</DropdownMenuTrigger>
                 <DropdownMenuContent align="start" side="top">
                   {canGoal && (
                     <DropdownMenuItem
@@ -929,26 +927,7 @@ export function Composer({
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              <IconButton
-                data-product-feature={PRODUCT_CAPABILITIES.files.id}
-                aria-label="更多选项"
-                // 「+」菜单早已只剩「设定目标」(附件在一级回形针),禁用态文案跟着改,不再说「附件暂不可用」(C-15)。
-                title="会话目标暂不可用"
-                disabled
-                className="relative"
-              >
-                <Plus size={20} />
-                {visibleGoal && (
-                  <span
-                    aria-hidden
-                    data-testid="composer-goal-dot"
-                    className={cn(
-                      "absolute right-1 top-1 size-1.5 rounded-full",
-                      goalNearBudget(visibleGoal) ? "bg-warning" : "bg-accent",
-                    )}
-                  />
-                )}
-              </IconButton>
+              plusButton
             )}
             {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
                 390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
