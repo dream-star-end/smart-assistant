@@ -634,3 +634,18 @@ describe('_buildAnthropicCustomHeadersEnv', () => {
     }
   })
 })
+
+describe('OCV5-704 figcheck turn id', () => {
+  it('64-hex turnKey 写入 OC_FIGCHECK_TURN_ID', async () => {
+    const key = 'ab'.repeat(32)
+    const { runner, writes } = createHarness(undefined, null)
+    await runner.submit('draw', undefined, undefined, key)
+    assert.equal(parseEnvLine(writes[0]!).OC_FIGCHECK_TURN_ID, key)
+  })
+
+  it('非 64-hex turnKey 写空串清位', async () => {
+    const { runner, writes } = createHarness(undefined, null)
+    await runner.submit('draw', undefined, undefined, 'turn-key')
+    assert.equal(parseEnvLine(writes[0]!).OC_FIGCHECK_TURN_ID, '')
+  })
+})
