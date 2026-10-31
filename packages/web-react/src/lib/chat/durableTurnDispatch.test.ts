@@ -191,14 +191,13 @@ describe("hello inFlightClientMessageId (RFC §4)", () => {
 
 // ═══════════════ 2. turn_state_unknown ═══════════════
 describe("reconcile turn_state_unknown (RFC §4)", () => {
-  test("非 final:保发送态 + forceSync(带 clientMessageId)+ onTurnStateUnknown", () => {
+  test("非 final:保发送态 + forceSync(带 clientMessageId)", () => {
     const s = sess();
     const u = addMessage(s, "user", "问题", { status: "sent" });
     s._replyingToMsgId = u.id;
     s._sendingInFlight = true;
     s._activeClientMessageId = u.id;
     const forceSync = vi.fn();
-    const onTurnStateUnknown = vi.fn();
     applyOutboundMessage(
       s,
       msgFrame({
@@ -209,18 +208,16 @@ describe("reconcile turn_state_unknown (RFC §4)", () => {
         clientMessageId: u.id,
         meta: { reconcile: "turn_state_unknown" },
       }),
-      { forceSync, onTurnStateUnknown },
+      { forceSync },
     );
     // **绝不清发送态**(turn 可能仍在执行,静默清态=丢 turn)。
     expect(s._sendingInFlight).toBe(true);
     expect(s._activeClientMessageId).toBe(u.id);
     expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: u.id });
-    expect(onTurnStateUnknown).toHaveBeenCalledWith("s1");
   });
 
-  test("turn_state_unknown 把 thinking-safety 首窗降至 ~60s → 缩短生效(远早于默认 10min)", () => {
+  test("turn_state_unknown 不清发送态、不挂本地软提示,交给权威对账", () => {
     vi.useFakeTimers();
-    FakeWS.autoPong = true; // keepalive 有 pong → 连接确认存活,快进期间走 (b) 软提示分支
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const syncSession = vi.fn();
     const sock = makeSocket({ syncSession });
@@ -242,34 +239,13 @@ describe("reconcile turn_state_unknown (RFC §4)", () => {
         }),
       ),
     });
+    expect(syncSession).toHaveBeenCalledWith("s1", { clientMessageId: userId });
+    vi.advanceTimersByTime(11 * 60_000);
     expect(s._sendingInFlight).toBe(true);
-
-    // ~60s 即触发 thinking-safety(b) → 挂 transient 软提示(缩短窗生效的可观测证据),且仍不清发送态。
-    vi.advanceTimersByTime(61_000);
-    expect(sock.getTransientNotice("s1")?.text).toContain("较长时间未收到新内容");
-    expect(s._sendingInFlight).toBe(true);
-    sock.stop();
-    vi.useRealTimers();
-    FakeWS.instances = [];
-    FakeWS.autoPong = false;
-    vi.unstubAllGlobals();
-  });
-
-  test("对照:无 turn_state_unknown 时 ~62s 内不触发 thinking-safety(默认 10min 窗未到)", () => {
-    vi.useFakeTimers();
-    FakeWS.autoPong = true;
-    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
-    const sock = makeSocket();
-    sock.setGateReady(true);
-    const ws = FakeWS.instances.at(-1)!;
-    ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "长任务" });
-    vi.advanceTimersByTime(62_000);
     expect(sock.getTransientNotice("s1")).toBeNull();
     sock.stop();
     vi.useRealTimers();
     FakeWS.instances = [];
-    FakeWS.autoPong = false;
     vi.unstubAllGlobals();
   });
 });

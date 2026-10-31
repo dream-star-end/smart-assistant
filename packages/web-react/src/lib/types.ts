@@ -10,6 +10,7 @@ import type {
   MarketplaceCapabilityRef,
   MarketplacePluginType,
   MarketplaceReviewSource,
+  SessionSnapshot,
 } from "@openclaude/protocol/browser";
 
 export type {
@@ -572,6 +573,8 @@ export type DurableLiveFramePage = {
   /** 服务端 tape 投影版本水位(tape 投影流计数,单调递增)。旧后端不带该字段
    * (undefined)时,客户端回退到 hasTapeProjection 一次性布尔自愈。 */
   tapeProjectionVersion?: number;
+  /** Same `buildSessionSnapshot` object the WS hello sends (#1200); old backends omit it. */
+  snapshot?: SessionSnapshot | null;
 };
 
 /** GET /api/sessions/:id/timeline — one exact chronological page containing
