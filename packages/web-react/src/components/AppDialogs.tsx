@@ -590,8 +590,9 @@ export function AppDialogs({
               const moving = from?.sessionId ? sessions.find((x) => x.id === from.sessionId) : undefined;
               if (moving) moveSessionToProject(moving, created.id);
               else {
+                // 新建项目后进项目主页（体验官 10-27：以前开一个项目内空白会话，看起来像回到了空首页）。
                 setBoardOpen(false);
-                newSessionInProject(created.id);
+                setProjectHome({ projectId: created.id, tab: "overview" });
               }
               return true;
             }}
