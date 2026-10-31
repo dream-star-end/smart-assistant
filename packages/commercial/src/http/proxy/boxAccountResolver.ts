@@ -69,8 +69,9 @@ export class BoxEgressNotConfiguredError extends BoxAccountResolverError {
   }
 }
 
-/** The Box-side guard refused a non-default login (it logged out, or its projects dir is no longer the
- * shared one). Raised before any lease or admission, so the caller can pick another login. */
+/** The Box-side guard refused this login (logged out, onboarding unfinished, or a named
+ * login whose projects dir is no longer the shared one). Raised before any lease or admission,
+ * so the caller can pick another login. */
 class BoxProfileUnsafeError extends BoxAccountResolverError {
   constructor(readonly key: string) { super("BOX_PROFILE_UNSAFE"); }
 }
@@ -345,23 +346,29 @@ export class BoxAccountResolver {
     return { accountId: pick.candidate.accountId, profile: pick.candidate.profile };
   }
 
-  /** Live check, on the Box and immediately before the target is handed out, that a non-default
-   * login is still logged in and still shares the product's projects directory. A positive result is
-   * reused for 30s; discovery data in the database is never the safety boundary. */
+  /** Live check, on the Box and immediately before the target is handed out, that the chosen
+   * login still matches the Box. A named login must be logged in and share the product's projects
+   * directory. The default login must have a credential and finished onboarding. A positive result
+   * is reused for 30s; discovery data in the database is never the safety boundary. */
   private async guardLogin(transport: Pick<BoxExecTransport, "run">, accountId: bigint,
     profile: string, signal: AbortSignal): Promise<void> {
     const key = boxProfileKey(accountId, profile);
     const at = (this.deps.now ?? Date.now)();
     if ((this.guardOkUntil.get(key) ?? 0) > at) return;
+    const refuse = (): never => {
+      // Status mismatch only: account id and profile name. No credential, path, or email.
+      log.warn("BOX_LOGIN_GUARD_REFUSED", { accountId: accountId.toString(), profile });
+      throw new BoxProfileUnsafeError(key);
+    };
     try {
       const result = await transport.run(makeBoxProfileGuard(profile),
         { timeoutMs: 10_000, maxResponseBytes: 1024, signal });
-      if (result.stdout.trim() !== "ok") throw new BoxProfileUnsafeError(key);
+      if (result.stdout.trim() !== "ok") refuse();
     } catch (error) {
       if (error instanceof BoxProfileUnsafeError) throw error;
       if (error instanceof BoxExecTransportError && error.remoteExitCode === BOX_PROFILE_GUARD_REFUSED) {
         this.guardOkUntil.delete(key);
-        throw new BoxProfileUnsafeError(key);
+        refuse();
       }
       throw error;
     }
@@ -575,7 +582,7 @@ export class BoxAccountResolver {
         { allowWakeIfHibernated: args.allowWakeIfHibernated === true });
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
       const transport = new BoxExecTransport(descriptor, fetchImpl, assertCurrent);
-      if (this.deps.profiles && !inspectOnly && profile !== BOX_DEFAULT_PROFILE) {
+      if (this.deps.profiles && !inspectOnly) {
         await this.guardLogin(transport, accountId, profile, args.signal);
       }
       const scoped = this.deps.profiles

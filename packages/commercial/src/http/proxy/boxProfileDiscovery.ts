@@ -95,21 +95,47 @@ try:
 finally:os.close(hfd)
 print('ready')`;
 
-/** Run right before a launch is handed back for a non-default login: the login must still be
- * logged in and still share the product's projects directory. Exit 7 = refused. */
+/** Run right before a launch is handed back. A named login must still be logged in and
+ * still share the product's projects directory. The default login (`.claude`) must still have
+ * a credential file and a finished onboarding (`hasCompletedOnboarding` is true). The script
+ * stats the credential and never prints it, a path, or anything read from `.claude.json`.
+ * Exit 7 = refused. */
 const GUARD = COMMON + String.raw`
+def small(fd,name,cap):
+ try:f=os.open(name,O|os.O_NONBLOCK,dir_fd=fd)
+ except OSError:return None
+ try:
+  st=os.fstat(f)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=ME or not 1<=st.st_size<=cap:return None
+  return os.read(f,cap)
+ finally:os.close(f)
+def onboarded(hfd):
+ raw=small(hfd,'.claude.json',4*1024*1024)
+ if not raw:return False
+ try:o=json.loads(raw)
+ except Exception:return False
+ return isinstance(o,dict) and o.get('hasCompletedOnboarding') is True
 entry=sys.argv[1] if len(sys.argv)==2 else ''
-if not re.fullmatch(r'\.claude-[a-z0-9][a-z0-9-]{0,31}',entry) or entry=='.claude-default':raise SystemExit(2)
+default=entry=='.claude'
+if not default and (not re.fullmatch(r'\.claude-[a-z0-9][a-z0-9-]{0,31}',entry) or entry=='.claude-default'):raise SystemExit(2)
 hfd=odir(H)
 try:
- try:
-  shared_root(hfd)
-  dfd=odir(entry,hfd)
- except (OSError,SystemExit):raise SystemExit(7)
- try:
-  mine(dfd)
-  if projects_mode(dfd)!='shared' or not credential(dfd):raise SystemExit(7)
- finally:os.close(dfd)
+ if default:
+  try:dfd=odir(entry,hfd)
+  except OSError:raise SystemExit(7)
+  try:
+   mine(dfd)
+   if not credential(dfd) or not onboarded(hfd):raise SystemExit(7)
+  finally:os.close(dfd)
+ else:
+  try:
+   shared_root(hfd)
+   dfd=odir(entry,hfd)
+  except (OSError,SystemExit):raise SystemExit(7)
+  try:
+   mine(dfd)
+   if projects_mode(dfd)!='shared' or not credential(dfd):raise SystemExit(7)
+  finally:os.close(dfd)
 finally:os.close(hfd)
 print('ok')`;
 
@@ -130,10 +156,12 @@ export function makeBoxProfilePrepare(profile: string): BoxCcExecRequest {
 }
 
 export function makeBoxProfileGuard(profile: string): BoxCcExecRequest {
-  if (profile === BOX_DEFAULT_PROFILE || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(profile)) {
+  const named = profile !== BOX_DEFAULT_PROFILE;
+  if (named && !/^[a-z0-9][a-z0-9-]{0,31}$/.test(profile)) {
     throw new BoxProfileDiscoveryError("BOX_PROFILE_GUARD_INVALID");
   }
-  return { command: PYTHON, args: ["-I", "-c", GUARD, `.claude-${profile}`], cwd: "/tmp", environment: ENV };
+  const entry = named ? `.claude-${profile}` : ".claude";
+  return { command: PYTHON, args: ["-I", "-c", GUARD, entry], cwd: "/tmp", environment: ENV };
 }
 /** Exit status of the guard script when it refuses a login. */
 export const BOX_PROFILE_GUARD_REFUSED = 7;

@@ -85,7 +85,42 @@ test("the guard accepts only a logged-in login that still shares the projects di
   assert.equal(onFakeHome((h) => { base(h); rmSync(`${h}/.claude-b`, { recursive: true }); symlinkSync("/tmp", `${h}/.claude-b`); }, run), `exit ${BOX_PROFILE_GUARD_REFUSED}`,
     "profile directory swapped for a symlink");
   assert.equal(onFakeHome((h) => { base(h); rmSync(`${h}/.claude`, { recursive: true }); }, run), `exit ${BOX_PROFILE_GUARD_REFUSED}`, "shared root gone");
-  assert.throws(() => makeBoxProfileGuard("default"), BoxProfileDiscoveryError);
+  assert.throws(() => makeBoxProfileGuard("../x"), BoxProfileDiscoveryError);
+});
+
+test("the guard checks the default login for a credential and finished onboarding", () => {
+  const secret = "SECRET-CREDENTIAL-TOKEN";
+  const mail = "alice.example@mail.example.com";
+  const run = (home: string) => {
+    try { return { code: 0, out: exec(makeBoxProfileGuard("default"), home) }; }
+    catch (e) {
+      const err = e as { status?: number; stdout?: string; stderr?: string };
+      return { code: err.status ?? -1, out: `${err.stdout ?? ""}${err.stderr ?? ""}` };
+    }
+  };
+  const base = (home: string, onboarding: unknown) => {
+    mkdirSync(`${home}/.claude/projects`, { recursive: true });
+    writeFileSync(`${home}/.claude/.credentials.json`, `{"token":"${secret}"}`);
+    writeFileSync(`${home}/.claude.json`, JSON.stringify({ hasCompletedOnboarding: onboarding,
+      oauthAccount: { emailAddress: mail } }));
+  };
+  const ok = onFakeHome((h) => base(h, true), run);
+  assert.equal(ok.code, 0);
+  assert.equal(ok.out.trim(), "ok");
+  assert.equal(ok.out.includes(secret), false);
+  assert.equal(ok.out.includes(mail), false);
+  const loggedOut = onFakeHome((h) => { base(h, true); rmSync(`${h}/.claude/.credentials.json`); }, run);
+  assert.equal(loggedOut.code, BOX_PROFILE_GUARD_REFUSED, "missing credential");
+  assert.equal(loggedOut.out.includes(secret) || loggedOut.out.includes(mail), false);
+  const unfinished = onFakeHome((h) => base(h, false), run);
+  assert.equal(unfinished.code, BOX_PROFILE_GUARD_REFUSED, "onboarding unfinished");
+  const missingFlag = onFakeHome((h) => {
+    base(h, true);
+    writeFileSync(`${h}/.claude.json`, JSON.stringify({ oauthAccount: { emailAddress: mail } }));
+  }, run);
+  assert.equal(missingFlag.code, BOX_PROFILE_GUARD_REFUSED, "onboarding flag absent");
+  const swapped = onFakeHome((h) => { base(h, true); rmSync(`${h}/.claude`, { recursive: true }); symlinkSync("/tmp", `${h}/.claude`); }, run);
+  assert.equal(swapped.code, BOX_PROFILE_GUARD_REFUSED, "default directory swapped for a symlink");
 });
 
 test("prepare never follows a profile directory that is a symlink", () => {

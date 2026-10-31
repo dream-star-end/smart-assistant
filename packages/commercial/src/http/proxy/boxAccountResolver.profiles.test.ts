@@ -65,8 +65,10 @@ function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0,
       if (url.endsWith("/agent.v1.ControlService/Exec")) {
         const text = Buffer.from(init.body as Uint8Array).toString("utf8");
         if (text.includes("SystemExit(7)")) {
-          const name = /\.claude-([a-z0-9-]+)/.exec(text.slice(text.lastIndexOf("-c"), text.length))?.[1] ?? "?";
-          const lastDir = [...text.matchAll(/\.claude-([a-z0-9-]+)(?![a-z0-9-])/g)].map((m) => m[1]!).filter((n) => n !== "default").pop() ?? name;
+          // The profile directory is the guard argv, after the script. `.claude` is the default login.
+          const tail = text.slice(text.lastIndexOf("SystemExit(7)"));
+          const named = /\.claude-([a-z0-9][a-z0-9-]{0,31})(?![a-z0-9-])/.exec(tail);
+          const lastDir = named && named[1] !== "default" ? named[1] : "default";
           guarded.push(lastDir);
           if (guard[lastDir] === "refuse") {
             return new Response(Buffer.concat([frame({ exitEvent: { exitCode: 7 } }), frame({}, 2)]), { status: 200 });
@@ -190,6 +192,33 @@ test("without any saved logins the original weighted random pick is used, exactl
   for (const uid of uids.slice(0, 20)) assert.equal((await f.launch(uid)).accountId, 21n);
   const g = fixture([20n, 21n], [], 0);
   for (const uid of uids.slice(0, 20)) assert.equal((await g.launch(uid)).accountId, 20n);
+});
+
+test("a stale logged-in default login is not selected when the live guard refuses it", async () => {
+  const chunks: string[] = [];
+  const orig = process.stdout.write.bind(process.stderr);
+  process.stdout.write = ((chunk: string | Uint8Array, enc?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean => {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return orig(chunk as never, enc as never, cb as never);
+  }) as typeof process.stdout.write;
+  try {
+    const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+    f.guard.default = "refuse";
+    for (const uid of uids) assert.equal((await f.launch(uid)).profile, "b");
+    assert.ok(f.guarded.includes("default"), "the live guard ran for the default login");
+    assert.equal(f.health.get("20:default")!.lastReason, "profile_unsafe");
+    const only = fixture([20n], [stored(20n, "default")]);
+    only.guard.default = "refuse";
+    await assert.rejects(only.launch(7n), (e: unknown) =>
+      e instanceof BoxAccountResolverError && e.code === "BOX_ACCOUNT_UNAVAILABLE");
+  } finally {
+    process.stdout.write = orig;
+  }
+  const text = chunks.filter((chunk) => chunk.includes("BOX_LOGIN_GUARD_REFUSED")).join("\n");
+  assert.match(text, /BOX_LOGIN_GUARD_REFUSED/);
+  assert.equal(text.includes("@"), false, "the warning has no email");
+  assert.equal(text.includes("/home"), false, "the warning has no path");
+  assert.equal(text.includes("SECRET"), false);
 });
 
 test("a login the Box-side guard refuses is benched before anything is leased and its users move", async () => {
