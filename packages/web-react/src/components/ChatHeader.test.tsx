@@ -105,6 +105,23 @@ describe("ChatHeader 协作方式 chip", () => {
     expect(screen.getByRole("button", { name: "团队模式已开启" })).toBeInTheDocument();
   });
 
+  // #1291:队长以服务端下发的 id 为准;团队态 trigger 锁定(不能自选),说明弹层与 trigger 是同一个队长。
+  it("团队模式按服务端队长 id 锁定模型入口,trigger 与说明弹层显示同一队长和倍率", async () => {
+    renderHeader({
+      models: [...MODELS, { id: "server-leader", display_name: "Server Leader", cost_x: 7.5 }],
+      collabMode: "team",
+      teamLeaderModelId: "server-leader",
+      onCollabSolo: () => {},
+    });
+    const trigger = screen.getByRole("button", { name: "选择对话模型" });
+    expect(trigger).toBeDisabled();
+    expect(trigger.textContent).toContain("Server Leader");
+    expect(trigger.textContent).toContain("7.5×");
+    expect(trigger.textContent).not.toContain("GLM-5.2");
+    fireEvent.click(screen.getByRole("button", { name: "团队模式已开启" }));
+    expect(await screen.findByText(/队长引擎为 Server Leader/)).toBeInTheDocument();
+  });
+
   it("常态下 ModelSelector 仍显示用户自选模型", () => {
     renderHeader();
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
