@@ -9,6 +9,7 @@ import type {
   AgentRemoteRequest,
   AgentRemoteWorker,
 } from '@openclaude/protocol/agentRemote'
+import type { NativeCheckpoint } from '@openclaude/protocol/agentRemoteState'
 
 export interface JournalRecord {
   request: AgentRemoteRequest
@@ -19,11 +20,14 @@ export interface JournalRecord {
   receipt?: AgentRemoteReceipt
   job?: AgentRemoteJobRef
   cursor: { stdout: number; stderr: number }
+  createdAtMs?: number
+  updatedAtMs?: number
 }
 export interface RemoteSession {
   binding: AgentRemoteBinding
   lease?: AgentRemoteLeaseToken & { expiresAtMs: number; active: boolean }
   epochWatermark: number
+  nativeCheckpoint?: NativeCheckpoint
 }
 export interface AgentRemoteState {
   workers: (AgentRemoteWorker & { expiresAtMs: number })[]
@@ -36,12 +40,23 @@ export interface AgentRemoteState {
  * the whole principal aggregate, including binding, lease fence, journal and event.
  * Callbacks are synchronous/pure: no execution/network side effects inside them.
  * A durable implementation must fsync/commit before resolving, preserve watermark
- * and dedup records across restart, and return detached snapshots. No such backend
- * is supplied in P1. Executor-side fencing is also required before real integration.
+ * and dedup records across restart, and return detached snapshots. Journal selections
+ * include ALL unresolved records plus requested historical operations/dependencies; omitted
+ * selection means all history. Metadata/fences still share the same transaction.
+ * Executor-side fencing is also required before real integration.
  */
+export type JournalSelection =
+  | 'all'
+  | 'active'
+  | { operationKey: string; includeOperationKeys?: string[] }
+
 export interface AgentRemoteStore {
   readonly durability: 'volatile' | 'durable'
-  transact<T>(principalId: string, change: (draft: AgentRemoteState) => T): Promise<T>
+  transact<T>(
+    principalId: string,
+    change: (draft: AgentRemoteState) => T,
+    journal?: JournalSelection,
+  ): Promise<T>
 }
 /** Test/reference only: process death loses all authority. Never resume live jobs. */
 export class VolatileAgentRemoteStore implements AgentRemoteStore {

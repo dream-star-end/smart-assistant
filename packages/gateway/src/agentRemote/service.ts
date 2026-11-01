@@ -19,7 +19,19 @@ import {
   validateRemote,
   verifyRemoteRequest,
 } from '@openclaude/protocol/agentRemote'
-import type { AgentRemoteState, AgentRemoteStore, JournalRecord, RemoteSession } from './store.js'
+import {
+  type NativeCheckpoint,
+  type NativeCheckpointIdentity,
+  checkpointMatchesIdentity,
+  verifyNativeCheckpoint,
+} from '@openclaude/protocol/agentRemoteState'
+import type {
+  AgentRemoteState,
+  AgentRemoteStore,
+  JournalRecord,
+  JournalSelection,
+  RemoteSession,
+} from './store.js'
 
 const MAX_ITEMS = 10000
 function time(value: number): number {
@@ -189,9 +201,10 @@ class AgentRemoteService {
   private tx<T>(
     principalId: string,
     change: (state: AgentRemoteState, now: number) => T,
+    journal: JournalSelection = 'active',
   ): Promise<T> {
     requireRemote(/^[A-Za-z0-9_.:-]{1,160}$/.test(principalId), 'bad-principal')
-    return this.store.transact(principalId, (state) => change(state, time(this.clock())))
+    return this.store.transact(principalId, (state) => change(state, time(this.clock())), journal)
   }
   private owner(principalId: string, supplied: string): void {
     requireRemote(principalId === supplied, 'principal-mismatch')
@@ -333,50 +346,62 @@ class AgentRemoteService {
     verifyRemoteRequest(input)
     this.owner(principalId, input.binding.principalId)
     const request = structuredClone(input)
-    return this.tx(principalId, (state, now) => {
-      fence(state, request.binding, request.lease, now)
-      const key = agentRemoteOperationKey(request.binding, request.operationId)
-      const previous = state.journal.find(
-        (item) => agentRemoteOperationKey(item.request.binding, item.request.operationId) === key,
-      )
-      if (previous) {
-        requireRemote(previous.request.payloadHash === request.payloadHash, 'operation-conflict')
-        return previous
-      }
-      requireRemote(request.deadlineAtMs > now, 'deadline-expired')
-      const environment = resources(state, request.binding, now)
-      requireRemote(
-        requiredRemoteCapabilities(request.command).every((capability) =>
-          environment.capabilities.includes(capability),
-        ),
-        'unsupported-capability',
-      )
-      if ('jobId' in request.command) {
-        const command = request.command
-        const source = findRecord(state, request.binding, command.sourceOperationId)
-        requireRemote(
-          source.request.command.kind === 'process.exec' &&
-            source.job &&
-            equal(source.job, {
-              jobId: command.jobId,
-              sourceOperationId: command.sourceOperationId,
-            }),
-          'job-scope-mismatch',
+    return this.tx(
+      principalId,
+      (state, now) => {
+        fence(state, request.binding, request.lease, now)
+        const key = agentRemoteOperationKey(request.binding, request.operationId)
+        const previous = state.journal.find(
+          (item) => agentRemoteOperationKey(item.request.binding, item.request.operationId) === key,
         )
-      }
-      // Memory cannot attest durable execution, even if an environment advertises it.
-      bounded(state.journal)
-      const record: JournalRecord = {
-        request,
-        claim: request.lease,
-        state: 'accepted',
-        cancelRequested: false,
-        events: [],
-        cursor: { stdout: 0, stderr: 0 },
-      }
-      state.journal.push(record)
-      return record
-    })
+        if (previous) {
+          requireRemote(previous.request.payloadHash === request.payloadHash, 'operation-conflict')
+          return previous
+        }
+        requireRemote(request.deadlineAtMs > now, 'deadline-expired')
+        const environment = resources(state, request.binding, now)
+        requireRemote(
+          requiredRemoteCapabilities(request.command).every((capability) =>
+            environment.capabilities.includes(capability),
+          ),
+          'unsupported-capability',
+        )
+        if ('jobId' in request.command) {
+          const command = request.command
+          const source = findRecord(state, request.binding, command.sourceOperationId)
+          requireRemote(
+            source.request.command.kind === 'process.exec' &&
+              source.job &&
+              equal(source.job, {
+                jobId: command.jobId,
+                sourceOperationId: command.sourceOperationId,
+              }),
+            'job-scope-mismatch',
+          )
+        }
+        // Memory cannot attest durable execution, even if an environment advertises it.
+        bounded(state.journal)
+        const record: JournalRecord = {
+          request,
+          claim: request.lease,
+          state: 'accepted',
+          cancelRequested: false,
+          events: [],
+          cursor: { stdout: 0, stderr: 0 },
+          createdAtMs: now,
+          updatedAtMs: now,
+        }
+        state.journal.push(record)
+        return record
+      },
+      {
+        operationKey: agentRemoteOperationKey(request.binding, request.operationId),
+        includeOperationKeys:
+          'jobId' in request.command
+            ? [agentRemoteOperationKey(request.binding, request.command.sourceOperationId)]
+            : [],
+      },
+    )
   }
   /** Atomic start intent, committed BEFORE any execution message is sent.
    * A dispatched intent may already have caused a side effect: never auto-replay.
@@ -391,77 +416,92 @@ class AgentRemoteService {
     this.owner(principalId, binding.principalId)
     binding = structuredClone(binding)
     token = structuredClone(token)
-    return this.tx(principalId, (state, now) => {
-      fence(state, binding, token, now)
-      const record = findRecord(state, binding, operationId)
-      requireRemote(equal(record.claim, token), 'stale-operation-claim')
-      requireRemote(record.state === 'accepted', 'already-dispatched')
-      requireRemote(!record.cancelRequested, 'cancel-pending')
-      requireRemote(record.request.deadlineAtMs > now, 'deadline-expired')
-      record.state = 'dispatched'
-      return record
-    })
+    return this.tx(
+      principalId,
+      (state, now) => {
+        fence(state, binding, token, now)
+        const record = findRecord(state, binding, operationId)
+        requireRemote(equal(record.claim, token), 'stale-operation-claim')
+        requireRemote(record.state === 'accepted', 'already-dispatched')
+        requireRemote(!record.cancelRequested, 'cancel-pending')
+        requireRemote(record.request.deadlineAtMs > now, 'deadline-expired')
+        record.state = 'dispatched'
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(binding, operationId) },
+    )
   }
   async observe(principalId: string, input: AgentRemoteEvent): Promise<JournalRecord> {
     validateRemote<AgentRemoteEvent>(EventSchema, input)
     this.owner(principalId, input.binding.principalId)
     remoteCanonical(input) // Reject lone surrogates/non-JSON before byte accounting.
     const event = structuredClone(input)
-    return this.tx(principalId, (state, now) => {
-      fence(state, event.binding, event.lease, now)
-      const record = findRecord(state, event.binding, event.operationId)
-      requireRemote(
-        event.payloadHash === record.request.payloadHash && equal(event.lease, record.claim),
-        'observation-mismatch',
-      )
-      const previous = record.events[event.sequence - 1]
-      if (previous) {
-        requireRemote(equal(previous, event), 'event-conflict')
-        return record
-      }
-      requireRemote(event.sequence === record.events.length + 1, 'event-gap')
-      requireRemote(!remoteTerminal(record.state) && record.state !== 'unknown', 'operation-closed')
-      if (event.body.type === 'started') {
-        requireRemote(record.state === 'dispatched', 'not-dispatched')
-        record.state = 'started'
-
-        if (record.request.command.kind === 'process.exec') {
-          requireRemote(
-            event.body.job && event.body.job.sourceOperationId === record.request.operationId,
-            'missing-job-reference',
-          )
-          record.job = event.body.job
-        } else requireRemote(!event.body.job, 'unexpected-job-reference')
-      } else {
-        requireRemote(record.state === 'started', 'not-started')
-        if (event.body.type === 'output') {
-          requireRemote(record.request.command.kind === 'process.exec', 'output-not-process')
-          const body = event.body
-          requireRemote(
-            Buffer.byteLength(body.text, 'utf8') <= 262144 &&
-              body.offsetBytes === record.cursor[body.stream],
-            'cursor-mismatch',
-          )
-          record.cursor[body.stream] = time(body.offsetBytes + Buffer.byteLength(body.text, 'utf8'))
-        } else {
-          const receipt = event.body.receipt
-          if (receipt.status === 'cancelled') {
-            requireRemote(record.request.command.kind === 'process.exec', 'stop-not-process')
-            if (receipt.stopScope === 'process-tree')
-              requireRemote(
-                resources(state, event.binding, now).capabilities.includes('process.stop-tree'),
-                'unsupported-stop-evidence',
-              )
-          }
-          if (receipt.status === 'completed') validateResult(record.request, receipt)
-          record.state = receipt.status
-          record.receipt = receipt
+    return this.tx(
+      principalId,
+      (state, now) => {
+        fence(state, event.binding, event.lease, now)
+        const record = findRecord(state, event.binding, event.operationId)
+        requireRemote(
+          event.payloadHash === record.request.payloadHash && equal(event.lease, record.claim),
+          'observation-mismatch',
+        )
+        const previous = record.events[event.sequence - 1]
+        if (previous) {
+          requireRemote(equal(previous, event), 'event-conflict')
+          return record
         }
-      }
-      bounded(record.events)
-      record.events.push(event)
-      return record
-    })
+        requireRemote(event.sequence === record.events.length + 1, 'event-gap')
+        requireRemote(
+          !remoteTerminal(record.state) && record.state !== 'unknown',
+          'operation-closed',
+        )
+        if (event.body.type === 'started') {
+          requireRemote(record.state === 'dispatched', 'not-dispatched')
+          record.state = 'started'
+
+          if (record.request.command.kind === 'process.exec') {
+            requireRemote(
+              event.body.job && event.body.job.sourceOperationId === record.request.operationId,
+              'missing-job-reference',
+            )
+            record.job = event.body.job
+          } else requireRemote(!event.body.job, 'unexpected-job-reference')
+        } else {
+          requireRemote(record.state === 'started', 'not-started')
+          if (event.body.type === 'output') {
+            requireRemote(record.request.command.kind === 'process.exec', 'output-not-process')
+            const body = event.body
+            requireRemote(
+              Buffer.byteLength(body.text, 'utf8') <= 262144 &&
+                body.offsetBytes === record.cursor[body.stream],
+              'cursor-mismatch',
+            )
+            record.cursor[body.stream] = time(
+              body.offsetBytes + Buffer.byteLength(body.text, 'utf8'),
+            )
+          } else {
+            const receipt = event.body.receipt
+            if (receipt.status === 'cancelled') {
+              requireRemote(receipt.stopScope !== 'not-started', 'invalid-stop-evidence')
+              requireRemote(record.request.command.kind === 'process.exec', 'stop-not-process')
+              if (receipt.stopScope === 'process-tree')
+                requireRemote(
+                  resources(state, event.binding, now).capabilities.includes('process.stop-tree'),
+                  'unsupported-stop-evidence',
+                )
+            }
+            if (receipt.status === 'completed') validateResult(record.request, receipt)
+            record.state = receipt.status
+            record.receipt = receipt
+          }
+        }
+        bounded(record.events)
+        record.events.push(event)
+        record.updatedAtMs = now
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(event.binding, event.operationId) },
+    )
   }
   async requestCancel(
     principalId: string,
@@ -472,14 +512,82 @@ class AgentRemoteService {
     this.owner(principalId, binding.principalId)
     binding = structuredClone(binding)
     token = structuredClone(token)
-    return this.tx(principalId, (state, now) => {
-      fence(state, binding, token, now)
-      const record = findRecord(state, binding, operationId)
-      requireRemote(equal(record.claim, token), 'stale-operation-claim')
-      requireRemote(!remoteTerminal(record.state) && record.state !== 'unknown', 'operation-closed')
-      record.cancelRequested = true
-      return record
-    })
+    return this.tx(
+      principalId,
+      (state, now) => {
+        fence(state, binding, token, now)
+        const record = findRecord(state, binding, operationId)
+        requireRemote(equal(record.claim, token), 'stale-operation-claim')
+        requireRemote(
+          !remoteTerminal(record.state) && record.state !== 'unknown',
+          'operation-closed',
+        )
+        record.cancelRequested = true
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(binding, operationId) },
+    )
+  }
+  /** Trusted user/control-plane cancellation; accepted means NO grant exists.
+   * The CAS and receipt commit together, so a late worker cannot dispatch it.
+   */
+  async cancelQueued(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    operationId: string,
+  ): Promise<JournalRecord> {
+    this.owner(principalId, binding.principalId)
+    binding = structuredClone(binding)
+    return this.tx(
+      principalId,
+      (state, now) => {
+        session(state, binding)
+        const record = findRecord(state, binding, operationId)
+        if (
+          record.state === 'cancelled' &&
+          record.receipt?.status === 'cancelled' &&
+          record.receipt.stopScope === 'not-started'
+        )
+          return record
+        requireRemote(record.state === 'accepted', 'not-queued')
+        record.cancelRequested = true
+        record.state = 'cancelled'
+        record.updatedAtMs = now
+        record.receipt = { status: 'cancelled', stopScope: 'not-started' }
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(binding, operationId) },
+    )
+  }
+  async expireQueued(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    operationId: string,
+  ): Promise<JournalRecord> {
+    this.owner(principalId, binding.principalId)
+    binding = structuredClone(binding)
+    return this.tx(
+      principalId,
+      (state, now) => {
+        session(state, binding)
+        const record = findRecord(state, binding, operationId)
+        if (
+          record.state === 'failed' &&
+          record.receipt?.status === 'failed' &&
+          record.receipt.code === 'deadline-before-dispatch'
+        )
+          return record
+        requireRemote(
+          record.state === 'accepted' && record.request.deadlineAtMs <= now,
+          'not-expired-queued',
+        )
+        record.state = 'failed'
+        record.updatedAtMs = now
+        record.receipt = { status: 'failed', code: 'deadline-before-dispatch' }
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(binding, operationId) },
+    )
   }
   async query(
     principalId: string,
@@ -488,7 +596,9 @@ class AgentRemoteService {
   ): Promise<JournalRecord> {
     this.owner(principalId, binding.principalId)
     binding = structuredClone(binding)
-    return this.tx(principalId, (state) => findRecord(state, binding, operationId))
+    return this.tx(principalId, (state) => findRecord(state, binding, operationId), {
+      operationKey: agentRemoteOperationKey(binding, operationId),
+    })
   }
   /** Recovery NEVER runs a command. Only never-started work can receive a new claim.
    * started without a trustworthy receipt becomes unknown and blocks rebinding.
@@ -503,21 +613,76 @@ class AgentRemoteService {
     this.owner(principalId, binding.principalId)
     binding = structuredClone(binding)
     token = structuredClone(token)
+    return this.tx(
+      principalId,
+      (state, now) => {
+        fence(state, binding, token, now)
+        const record = findRecord(state, binding, operationId)
+        if (
+          record.state === 'accepted' ||
+          record.state === 'dispatched' ||
+          record.state === 'started'
+        )
+          requireRemote(token.epoch > record.claim.epoch, 'recovery-requires-new-epoch')
+        if (record.state === 'accepted') {
+          requireRemote(!record.cancelRequested, 'cancel-pending')
+          record.claim = structuredClone(token)
+        } else if (record.state === 'dispatched' || record.state === 'started')
+          record.state = 'unknown'
+        return record
+      },
+      { operationKey: agentRemoteOperationKey(binding, operationId) },
+    )
+  }
+  /** Internal publication only: caller is the quiescent native checkpoint task,
+   * holding the actual session writer lock through file fsync AND this commit.
+   * Not a handler for a caller-supplied claim of quiescence.
+   */
+  async publishNativeCheckpoint(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    token: AgentRemoteLeaseToken,
+    input: NativeCheckpoint,
+  ): Promise<NativeCheckpoint> {
+    this.owner(principalId, binding.principalId)
+    verifyNativeCheckpoint(input)
+    binding = structuredClone(binding)
+    token = structuredClone(token)
+    const checkpoint = structuredClone(input)
     return this.tx(principalId, (state, now) => {
-      fence(state, binding, token, now)
-      const record = findRecord(state, binding, operationId)
-      if (
-        record.state === 'accepted' ||
-        record.state === 'dispatched' ||
-        record.state === 'started'
+      const current = fence(state, binding, token, now)
+      requireRemote(
+        checkpoint.principalId === principalId &&
+          checkpoint.sessionId === binding.sessionId &&
+          checkpoint.environmentId === binding.environmentId &&
+          checkpoint.environmentGeneration === binding.environmentGeneration &&
+          checkpoint.bindingRevision === binding.bindingRevision,
+        'checkpoint-binding',
       )
-        requireRemote(token.epoch > record.claim.epoch, 'recovery-requires-new-epoch')
-      if (record.state === 'accepted') {
-        requireRemote(!record.cancelRequested, 'cancel-pending')
-        record.claim = structuredClone(token)
-      } else if (record.state === 'dispatched' || record.state === 'started')
-        record.state = 'unknown'
-      return record
+      requireRemote(
+        !state.journal.some(
+          (row) => row.request.binding.sessionId === binding.sessionId && unresolved(row),
+        ),
+        'checkpoint-inflight',
+      )
+      current.nativeCheckpoint = checkpoint
+      return checkpoint
+    })
+  }
+  async nativeCheckpoint(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    expected: NativeCheckpointIdentity,
+  ): Promise<NativeCheckpoint | undefined> {
+    this.owner(principalId, binding.principalId)
+    binding = structuredClone(binding)
+    expected = structuredClone(expected)
+    return this.tx(principalId, (state) => {
+      const checkpoint = session(state, binding).nativeCheckpoint
+      if (!checkpoint) return undefined
+      verifyNativeCheckpoint(checkpoint)
+      checkpointMatchesIdentity(checkpoint, expected)
+      return checkpoint
     })
   }
 }
