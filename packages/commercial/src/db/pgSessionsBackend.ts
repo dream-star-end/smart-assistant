@@ -1,3 +1,4 @@
+import { scanUploadReferenceRows, hydrateUploadReferenceMessages, UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_MS, UPLOAD_REFERENCE_MAX_ROWS, type UploadReferenceRow } from '@openclaude/storage';
 import { automaticRetryStatus, getUserError, type AutomaticRetryStatus } from '@openclaude/protocol';
 import { buildSessionSnapshot, type SessionSnapshotOptions } from './sessionSnapshot.js';
 import { patchSessionMetadataInTx } from './sessionMetadataApproval.js'
@@ -5005,6 +5006,7 @@ async function hydrateTurnTapeMessages(
     /** Private runner continuity view: hydrate every user-visible semantic
      * fact, but still skip thinking and opaque audit envelopes. */
     engineContext?: boolean;
+    uploadReferenceMaxBytes?: number;
   } = {},
 ): Promise<MessageLike[]> {
   const refs = messages.filter(
@@ -5079,6 +5081,7 @@ async function hydrateTurnTapeMessages(
     headsByTape.set(head.tape_id, list);
   }
 
+  let uploadReferenceBytes = options.uploadReferenceMaxBytes;
   const hydrated = messages.flatMap((anchor): MessageLike[] => {
     const tapeId = typeof anchor._turnTapeId === "string" ? anchor._turnTapeId : null;
     const tapeSha256 = typeof anchor._turnTapeSha256 === "string" ? anchor._turnTapeSha256 : null;
@@ -5140,7 +5143,12 @@ async function hydrateTurnTapeMessages(
           hydrateTapeRecord(row, anchor, false, anchor._turnTapeComplete === true),
           row,
           anchor,
+          uploadReferenceBytes,
         );
+        if (uploadReferenceBytes !== undefined) {
+          uploadReferenceBytes -= Buffer.byteLength(JSON.stringify(result.messages));
+          if (uploadReferenceBytes <= 0) throw new Error("upload reference expanded tape exceeds budget");
+        }
         expanded.push(...result.messages);
         if (result.descriptor) batchDescriptors.push(result.descriptor);
       }
@@ -8170,7 +8178,7 @@ async function readTapeRecordPayloadChunkImpl(
 }
 
 async function readUserMessagePayloadImpl(
-  pool: Pool,
+  pool: Pool | PoolClient,
   sessionId: string,
   userId: string,
   msgId: string,
@@ -8865,6 +8873,70 @@ export function createPgSessionsBackend(
   const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
   const backend: PgSessionsBackend = {
+    async scanRecentClientSessionMessages(opts, visit) {
+      try {
+        return await withTimelineSnapshot(pool, async client => {
+          let remainingRows = Math.min(opts.maxRows ?? UPLOAD_REFERENCE_MAX_ROWS, UPLOAD_REFERENCE_MAX_ROWS);
+          const deadline = Date.now() + Math.min(opts.maxMs ?? UPLOAD_REFERENCE_MAX_MS, UPLOAD_REFERENCE_MAX_MS);
+          const timeout = async () => {
+            const ms = deadline - Date.now();
+            if (ms <= 0) throw new Error("upload reference scan deadline");
+            await client.query("SELECT set_config('statement_timeout', $1, true)", [`${ms}ms`]);
+          };
+          async function* bodies(): AsyncGenerator<UploadReferenceRow> {
+            await timeout();
+            await client.query(`DECLARE upload_reference_rows NO SCROLL CURSOR FOR
+              SELECT id AS "sessionId", user_id AS "userId",
+                     CASE WHEN octet_length(messages::text) < $3 THEN messages::text ELSE NULL END AS messages
+                FROM client_sessions WHERE last_at >= $1 AND deleted_at IS NULL AND ($2::text IS NULL OR user_id = $2)
+              UNION ALL
+              SELECT s.id AS "sessionId", s.user_id AS "userId",
+                     CASE WHEN octet_length(c.messages::text) < $3 THEN c.messages::text ELSE NULL END AS messages
+                FROM client_session_archive_chunks c JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+               WHERE s.last_at >= $1 AND s.deleted_at IS NULL AND ($2::text IS NULL OR s.user_id = $2)`,
+              [opts.sinceMs, opts.userId, Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES)]);
+            for (;;) {
+              await timeout();
+              const row = (await client.query<UploadReferenceRow>("FETCH FORWARD 1 FROM upload_reference_rows")).rows[0];
+              if (!row) return;
+              if (--remainingRows < 0) throw new Error("upload reference row budget");
+              yield row;
+            }
+          }
+          return scanUploadReferenceRows(bodies(), visit, opts, async (row, messages, bytes) => {
+            await timeout();
+            return hydrateUploadReferenceMessages(messages, bytes, {
+              tapeBytes: async ids => {
+                const rows = (await client.query<{ bytes: string; records: string }>(`
+                  SELECT SUM(octet_length(r.payload))::text AS bytes, COUNT(*)::text AS records
+                    FROM client_session_turn_tapes t JOIN client_session_turn_tape_records r
+                      ON r.session_id=t.session_id AND r.user_id=t.user_id AND r.tape_id=t.tape_id
+                   WHERE t.session_id=$1 AND t.user_id=$2 AND t.tape_id=ANY($3::text[])
+                     AND t.materialization_status='complete' AND t.finalized_at IS NOT NULL
+                     AND t.record_payload_bytes>0 AND t.physical_record_count>0 AND t.logical_record_count>0
+                   GROUP BY t.tape_id,t.record_payload_bytes,t.physical_record_count
+                  HAVING SUM(octet_length(r.payload))=t.record_payload_bytes AND COUNT(*)=t.physical_record_count`,
+                  [row.sessionId, row.userId, ids])).rows;
+                if (rows.length !== ids.length) throw new Error("upload reference tape metadata missing");
+                for (const row of rows) {
+                  const count = Number(row.records);
+                  if (!Number.isSafeInteger(count) || count <= 0 || (remainingRows -= count) < 0) throw new Error("upload reference tape row budget");
+                }
+                return rows.map(r => Number(r.bytes));
+              },
+              tapes: async (raw, budget) => {
+                await timeout();
+                return hydrateTurnTapeMessages(client, row.sessionId, row.userId, raw, { view: "exact", uploadReferenceMaxBytes: budget });
+              },
+              user: async (id, budget) => {
+                await timeout();
+                return readUserMessagePayloadImpl(client, row.sessionId, row.userId, id, 0, budget);
+              },
+            });
+          });
+        });
+      } catch { return false; }
+    },
     async commitVisibleLosslessTurnTape(
       userId: string,
       request: LosslessTurnTapeVisibleRequest,

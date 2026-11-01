@@ -3,7 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { AttachChip, Composer, middleTruncate } from "./Composer";
+import { Composer } from "./Composer";
+import { AttachChip, middleTruncate } from "./ComposerAttachChip";
 import type { MediaRef } from "../lib/chat/frames";
 
 afterEach(cleanup);
@@ -117,7 +118,7 @@ describe("F1b 剪贴板图片直接上传", () => {
 
     expect(event.defaultPrevented).toBe(true);
     await waitFor(() => expect(onUpload).toHaveBeenCalledTimes(1));
-    expect(onUpload).toHaveBeenCalledWith(file);
+    expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function));
     expect(screen.getByRole("button", { name: "移除 paste-probe.png" })).toBeInTheDocument();
   });
 
@@ -136,7 +137,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     });
 
     expect(event.defaultPrevented).toBe(true);
-    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function)));
   });
 
   test("图片与文本/HTML 混合粘贴时只附图，不污染已有正文", async () => {
@@ -160,7 +161,7 @@ describe("F1b 剪贴板图片直接上传", () => {
     });
 
     expect(event.defaultPrevented).toBe(true);
-    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file));
+    await waitFor(() => expect(onUpload).toHaveBeenCalledWith(file, expect.any(Function)));
     expect(textarea).toHaveValue("保留这段正文");
   });
 
@@ -550,11 +551,11 @@ describe("附件合计 2GiB", () => {
     render(<Composer onSend={onSend} onUpload={onUpload} />);
     fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "请看附件" } });
     const shell = screen.getByTestId("composer-shell");
-    const big = 1100 * 1024 * 1024;
+    const mib = 1024 * 1024;
     fireEvent.drop(shell, {
       dataTransfer: {
         types: ["Files"],
-        files: [fileWithSize("a.rar", big), fileWithSize("b.rar", big)],
+        files: [fileWithSize("a.rar", 800 * mib), fileWithSize("b.rar", 800 * mib), fileWithSize("c.rar", 600 * mib)],
         dropEffect: "copy",
         items: [],
       },
@@ -574,20 +575,23 @@ describe("附件合计 2GiB", () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/part" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
     const shell = screen.getByTestId("composer-shell");
-    const part = 1500 * 1024 * 1024;
-    const drop = (name: string) => ({
+    const mib = 1024 * 1024;
+    const drop = (files: File[]) => ({
       dataTransfer: {
         types: ["Files"],
-        files: [fileWithSize(name, part)],
+        files,
         dropEffect: "copy",
         items: [],
       },
     });
     act(() => {
-      fireEvent.drop(shell, drop("first.rar"));
-      fireEvent.drop(shell, drop("second.rar"));
+      fireEvent.drop(shell, drop([fileWithSize("first.rar", 800 * mib)]));
+      fireEvent.drop(shell, drop([fileWithSize("second.rar", 800 * mib), fileWithSize("third.rar", 600 * mib)]));
     });
     expect(onUpload).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId("composer-upload-total-limit")).toHaveTextContent("3000MB");
+    const notice = screen.getByTestId("composer-upload-total-limit");
+    expect(notice).toHaveTextContent("2200MB");
+    expect(notice).toHaveTextContent("2048MB");
+    expect(notice.textContent ?? "").not.toContain("请重试");
   });
 });

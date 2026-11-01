@@ -813,6 +813,7 @@ import {
   deleteFile as nodeAgentDeleteFile,
   getFile as nodeAgentGetFile,
 } from "./compute-pool/nodeAgentClient.js";
+import { createRemoteHostChunkHooks, type RemoteHostChunkHooks } from "./compute-pool/remoteHostChunkHooks.js";
 import { createContainerService } from "./compute-pool/containerService.js";
 import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
 import { initComputePool } from "./compute-pool/poolInit.js";
@@ -892,7 +893,7 @@ function shouldAutoMigrate(
  * 用作"控制面是否静默 / 容器·agent 运行时是否启用 / 灰度归属(channel)"的只读断言面。
  */
 
-export interface RegisterCommercialResult {
+export interface RegisterCommercialResult extends RemoteHostChunkHooks {
   /**
    * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
    * 返回 true 表示已处理完毕,gateway 不再继续路由。
@@ -4299,6 +4300,9 @@ export async function registerCommercial(
     }
   };
 
+
+  const chunkHooks = createRemoteHostChunkHooks();
+
   // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //
   //   dockerEnsureRunning — WeChat / QQ inbound, container-local preview
@@ -7364,6 +7368,7 @@ export async function registerCommercial(
         target.psk?.fill(0);
       }
     },
+    ...chunkHooks,
     // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
     // 任一失败 → healthz body.ok=false(HTTP 仍 200,monitor 消费 ok 字段自动告警),补上
     // "PG/Redis 宕机但 healthz 仍绿零告警"的盲区(2026-07-06 sessions.db 事故的同构面)。

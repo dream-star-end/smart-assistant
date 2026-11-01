@@ -211,6 +211,7 @@ import { type AdvisorHandlersHost, advisorConsultStore as advisorConsultStoreImp
 import { type AskUserPermissionsHost, handlePermissionResponse as handlePermissionResponseImpl, _broadcastPermissionSettled as _broadcastPermissionSettledImpl, handleEngineAskUser as handleEngineAskUserImpl, _finishInWindowAskUserWait as _finishInWindowAskUserWaitImpl, _compensateInWindowAskUserAnswer as _compensateInWindowAskUserAnswerImpl, _persistDetachedAskUserCard as _persistDetachedAskUserCardImpl, _patchDetachedAskUserResolved as _patchDetachedAskUserResolvedImpl, _loadDetachedAskUserCard as _loadDetachedAskUserCardImpl, _hydrateDetachedAskUserPending as _hydrateDetachedAskUserPendingImpl, _submitDetachedAskUserAnswer as _submitDetachedAskUserAnswerImpl, _forceDenyPendingPermission as _forceDenyPendingPermissionImpl, _reapCrashedSessionPendingPermissions as _reapCrashedSessionPendingPermissionsImpl, _settlePendingPermissionsForStop as _settlePendingPermissionsForStopImpl, _autoDenyPendingPermissions as _autoDenyPendingPermissionsImpl, _sweepStalePendingPermissions as _sweepStalePendingPermissionsImpl } from './askUserPermissions.js'
 import { type CronTaskWebhookHost, _drainFlagOffCronOriginNotifies as _drainFlagOffCronOriginNotifiesImpl, _handleWebhook as _handleWebhookImpl, _handleTasksApi as _handleTasksApiImpl, _handleTaskItem as _handleTaskItemImpl, _triggerTask as _triggerTaskImpl, injectCronOriginFromTerminal as injectCronOriginFromTerminalImpl, injectCronOriginSession as injectCronOriginSessionImpl, cronProjectPorts as cronProjectPortsImpl, stampCronProject as stampCronProjectImpl, handleCronChannels as handleCronChannelsImpl, handleCronApi as handleCronApiImpl, handleCronItem as handleCronItemImpl } from './cronTaskWebhook.js'
 import { type HttpMiscHandlersHost, _resolveMediaDirs as _resolveMediaDirsImpl, _sendMediaResolveError as _sendMediaResolveErrorImpl, handleApiFile as handleApiFileImpl, handleMediaGet as handleMediaGetImpl, handleUpload as handleUploadImpl, handleCollaborationConfig as handleCollaborationConfigImpl, handleSearch as handleSearchImpl, handleOAuthStart as handleOAuthStartImpl, handleOAuthCallback as handleOAuthCallbackImpl, refreshClaudeOAuthIfNeeded as refreshClaudeOAuthIfNeededImpl } from './httpMiscHandlers.js'
+import { handleChunkedUpload as handleChunkedUploadImpl } from './httpUploadChunks.js'
 import { type ChannelHandlersHost, _updateWechatIdempotency as _updateWechatIdempotencyImpl, checkInboundBypass as checkInboundBypassImpl, handleTurnCancelIfQueued as handleTurnCancelIfQueuedImpl, handleTurnRejectIfAbsent as handleTurnRejectIfAbsentImpl, handleTurnDispatchState as handleTurnDispatchStateImpl, handleWechatInbound as handleWechatInboundImpl, handleWechatStop as handleWechatStopImpl, handleWechatInboundCompensate as handleWechatInboundCompensateImpl, _handleWechat as _handleWechatImpl, handleEnginePreheat as handleEnginePreheatImpl } from './channelHandlers.js'
 import { type InboundDispatchHost, dispatchInbound as dispatchInboundImpl } from './inboundDispatch.js'
 import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, autoResumeFromHello as autoResumeFromHelloImpl, handleStop as handleStopImpl, deliver as deliverImpl, _sendStatusFrame as _sendStatusFrameImpl, _sendStampedSessionFrame as _sendStampedSessionFrameImpl, _consumeFrameAuthority as _consumeFrameAuthorityImpl } from './wsConnection.js'
@@ -258,7 +259,7 @@ import type { InjectCcbLocalAgentCallbackArgs, InjectSendToAgentCallbackArgs, Se
 import type { AutoResumeFromHelloPeers, DeliverOut, HandleStopFrame } from './wsConnection.js'
 import type { BroadcastPermissionSettledPayload, CompensateInWindowAskUserAnswerPending, FinishInWindowAskUserWaitArgs, HandlePermissionResponseFrame, HydrateDetachedAskUserPendingFrame, PatchDetachedAskUserResolvedPending, PersistDetachedAskUserCardArgs, SubmitDetachedAskUserAnswerPending } from './askUserPermissions.js'
 // Moved to ./httpUploadStatic.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
-export { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, SAFE_UPLOAD_EXTENSION_RE, mimeFor, staticCacheControl, shouldLogHttpAccess } from './httpUploadStatic.js'
+export { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, MAX_UPLOAD_FILE, SAFE_UPLOAD_EXTENSION_RE, mimeFor, staticCacheControl, shouldLogHttpAccess } from './httpUploadStatic.js'
 // Moved to ./autoDreamSchedule.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
 export { AUTO_DREAM_SCHEDULE_KEYS, normalizeAutoDreamSchedule } from './autoDreamSchedule.js'
 // Moved to ./askUserSanitize.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
@@ -1056,6 +1057,7 @@ export class Gateway {
     handleOAuthStart: (...args) => gw.handleOAuthStart(...args),
     handleSearch: (...args) => gw.handleSearch(...args),
     handleUpload: (...args) => gw.handleUpload(...args),
+    handleChunkedUpload: (...args) => gw.handleChunkedUpload(...args),
     readBody: (...args) => gw.readBody(...args),
     sendInternalError: (...args) => gw.sendInternalError(...args),
     sendJson: (...args) => gw.sendJson(...args),
@@ -1500,6 +1502,11 @@ export class Gateway {
    */
   private handleUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return handleUploadImpl.call(this as unknown as HttpMiscHandlersHost, req, res)
+  }
+
+  /** Chunked upload. One HTTP body stays at 100MiB; the assembled file may be 1GiB. */
+  private handleChunkedUpload(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    return handleChunkedUploadImpl.call(this as unknown as HttpMiscHandlersHost, req, res, url)
   }
 
   // GET /api/agents         → { agents, default }

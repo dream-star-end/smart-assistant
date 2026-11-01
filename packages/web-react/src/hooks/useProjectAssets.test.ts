@@ -108,7 +108,7 @@ describe("useProjectAssets", () => {
     await act(async () => {
       await result.current.uploadFiles([file]);
     });
-    expect(api.uploadFile).toHaveBeenCalledWith(auth, file);
+    expect(api.uploadFile).toHaveBeenCalledWith(auth, file, { onProgress: expect.any(Function) });
     expect(api.createProjectAsset).toHaveBeenCalledWith(
       auth,
       expect.objectContaining({
