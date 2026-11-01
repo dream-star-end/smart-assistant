@@ -163,7 +163,13 @@ describe("派发失败状态卡", () => {
     render(
       <TurnStatusCard
         msg={{ id: "t2", role: "assistant", text: "", ts: 1, _errorCode: "ATTACHMENT_TOTAL_EXCEEDED:345649213", _clientMessageId: "m2", _turnStatusRecord: true } as ChatMessage}
-        cb={{ onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => ({ id: "m2", role: "user", text: "目标", ts: 0 } as ChatMessage) }}
+        cb={{
+          onContinueInterrupted: vi.fn(),
+          resolveInterruptedContinuation: () => ({ id: "m2", role: "user", text: "目标", ts: 0 } as ChatMessage),
+          onRetrySend: vi.fn(),
+          resolveRetryTarget: () => ({ id: "m2", role: "user", text: "目标", ts: 0 } as ChatMessage),
+          onRegenerate: vi.fn(),
+        }}
         currentTurn
       />,
     );
