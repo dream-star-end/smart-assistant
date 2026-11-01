@@ -50,6 +50,32 @@ const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
       samples: [...agents.samples, '/api/agents/a/memory/context', '/api/agents/aaa/memory/context'],
     }
   })(),
+  WORKSPACE_API_ROUTES: (() => {
+    const group = LEGACY_HTTP_DISPATCH.WORKSPACE_API_ROUTES
+    const at = group.routes.findIndex((r) => r.id === 'POST /api/uploads')
+    const hex = 'a'.repeat(32)
+    const chunkRoutes = [
+      { id: 'POST /api/uploads/init', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => url.pathname === '/api/uploads/init' && req.method === 'POST' },
+      { id: 'PUT /api/uploads/:id/chunks/:index', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'PUT' && /^\/api\/uploads\/[a-f0-9]{32}\/chunks\/\d+$/.test(url.pathname) },
+      { id: 'GET /api/uploads/:id', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'GET' && /^\/api\/uploads\/[a-f0-9]{32}$/.test(url.pathname) },
+      { id: 'POST /api/uploads/:id/complete', line: 0, calls: ['handleChunkedUpload', 'sendInternalError'],
+        match: (req: { method?: string }, url: URL) => req.method === 'POST' && /^\/api\/uploads\/[a-f0-9]{32}\/complete$/.test(url.pathname) },
+    ]
+    return {
+      ...group,
+      routes: [...group.routes.slice(0, at), ...chunkRoutes, ...group.routes.slice(at)],
+      samples: [
+        '/api/uploads/init',
+        `/api/uploads/${hex}/chunks/0`,
+        `/api/uploads/${'b'.repeat(32)}`,
+        `/api/uploads/${'c'.repeat(32)}/complete`,
+        ...group.samples,
+      ],
+    }
+  })(),
 }
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 

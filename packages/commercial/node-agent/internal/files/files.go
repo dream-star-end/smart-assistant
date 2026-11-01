@@ -295,6 +295,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleGet(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/files/stat":
 		h.handleStat(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/files/assemble":
+		h.handleAssemble(w, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/files/usage":
+		h.handleUsage(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -538,9 +542,19 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// size 上界保护:ReadFile 会把整个文件加载内存,对异常大的文件直接拒
-	if st.Size() > MaxFileSize {
+	if st.Size() > maxReadSize {
 		writeErr(w, http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE",
-			fmt.Sprintf("size %d exceeds %d", st.Size(), MaxFileSize))
+			fmt.Sprintf("size %d exceeds %d", st.Size(), maxReadSize))
+		return
+	}
+
+	if r.URL.Query().Get("hash") == "0" {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(StatResponse{
+			Exists: true,
+			Size:   st.Size(),
+			Mtime:  st.ModTime().UTC().Format(time.RFC3339),
+		})
 		return
 	}
 
@@ -562,7 +576,7 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		hasher := sha256.New()
-		if _, copyErr := io.Copy(hasher, io.LimitReader(f, MaxFileSize+1)); copyErr == nil {
+		if _, copyErr := io.Copy(hasher, io.LimitReader(f, maxReadSize+1)); copyErr == nil {
 			digest = hex.EncodeToString(hasher.Sum(nil))
 		}
 		_ = f.Close()
@@ -586,7 +600,7 @@ func (h *Handler) handleStat(w http.ResponseWriter, r *http.Request) {
 //   - resolveParentNoSymlink: parent 真身仍在白名单(挡 user-data symlink 逃逸)
 //   - O_NOFOLLOW open: 最终项不允许是 symlink
 //   - fd.Stat (而非先 Lstat 再 Open): 关掉 TOCTOU 窗口 + 屏蔽 FIFO/设备/dir
-//   - size 上限 MaxFileSize: 与 master upload limit 对齐
+//   - size 上限 maxReadSize (1GiB assembled file). PUT stays MaxFileSize (200MiB).
 //
 // Content-Length / Content-Type 是协议必要;master 自己再按真实 MIME 设头给
 // HTTP 终端用户,本端给的 octet-stream 只是 RPC 信道默认。
@@ -648,9 +662,9 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("mode=%s not a regular file", st.Mode()))
 		return
 	}
-	if st.Size() > MaxFileSize {
+	if st.Size() > maxReadSize {
 		writeErr(w, http.StatusRequestEntityTooLarge, "FILE_TOO_LARGE",
-			fmt.Sprintf("size %d exceeds %d", st.Size(), MaxFileSize))
+			fmt.Sprintf("size %d exceeds %d", st.Size(), maxReadSize))
 		return
 	}
 
@@ -660,4 +674,361 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	// io.Copy 走 sendfile fast path(Linux);流式不占额外内存。
 	// 即便 client 中途断,err 不致命 — master 那侧会自己处理 truncated body。
 	_, _ = io.Copy(w, f)
+}
+
+// MaxReadSize is the assembled-file cap for GET, STAT, and assemble.
+// PUT stays at MaxFileSize (200MiB). One HTTP body is never 1GiB.
+const MaxReadSize = 1 << 30 // 1 GiB
+
+// maxReadSize is the test seam for GET/STAT/assemble. Production stays at MaxReadSize.
+var maxReadSize int64 = MaxReadSize
+
+var (
+	uploadIDRe  = regexp.MustCompile(`^[a-f0-9]{32}$`)
+	uploadExtRe = regexp.MustCompile(`^[a-z0-9]{1,32}$`)
+	partNameRe  = regexp.MustCompile(`^\.part-[a-f0-9]{32}-\d+$`)
+	asmTmpRe    = regexp.MustCompile(`^\.tmp-asm-[a-f0-9]{32}$`)
+)
+
+func sweepStaleParts(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, ent := range entries {
+		name := ent.Name()
+		// Parts belong to a master-side meta. Deleting one older than 24h
+		// while a later chunk refreshed the meta leaves resume stuck.
+		// The master removes orphans. Only assemble temps are swept here.
+		if !asmTmpRe.MatchString(name) {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+type usageFileJSON struct {
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	MtimeMs int64  `json:"mtimeMs"`
+}
+
+type usageResponse struct {
+	UsedBytes int64           `json:"usedBytes"`
+	Truncated bool            `json:"truncated"`
+	Files     []usageFileJSON `json:"files"`
+}
+
+func (h *Handler) handleUsage(w http.ResponseWriter, r *http.Request) {
+	dirRaw := r.URL.Query().Get("dir")
+	probe, err := validatePath(filepath.Join(dirRaw, ".quota-probe"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+		return
+	}
+	dir := filepath.Dir(probe)
+	sweepStaleParts(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(usageResponse{UsedBytes: 0, Truncated: false, Files: []usageFileJSON{}})
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "LIST_FAIL", err.Error())
+		return
+	}
+	files := make([]usageFileJSON, 0)
+	var used int64
+	truncated := false
+	const capFiles = 10000
+	for _, ent := range entries {
+		name := ent.Name()
+		if asmTmpRe.MatchString(name) {
+			continue
+		}
+		isPart := partNameRe.MatchString(name)
+		if strings.HasPrefix(name, ".") && !isPart {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			// ReadDir follows nothing; Info is Lstat. Skip non-regular.
+			if err == nil && info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if err == nil && !info.Mode().IsRegular() {
+				continue
+			}
+			continue
+		}
+		// Confirm with Lstat so a symlink is never summed.
+		st, err := os.Lstat(filepath.Join(dir, name))
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		used += st.Size()
+		if truncated {
+			continue
+		}
+		if len(files) >= capFiles {
+			truncated = true
+			files = []usageFileJSON{}
+			continue
+		}
+		files = append(files, usageFileJSON{Name: name, Size: st.Size(), MtimeMs: st.ModTime().UnixMilli()})
+	}
+	if truncated {
+		files = []usageFileJSON{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(usageResponse{UsedBytes: used, Truncated: truncated, Files: files})
+}
+
+type assembleResponse struct {
+	Sha256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+}
+
+func (h *Handler) handleAssemble(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	id := q.Get("id")
+	if !uploadIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "BAD_ID", "upload id must be 32 hex chars")
+		return
+	}
+	count, err := strconv.Atoi(q.Get("count"))
+	if err != nil || count < 1 || count > 128 {
+		writeErr(w, http.StatusBadRequest, "BAD_COUNT", "count must be 1..128")
+		return
+	}
+	ext := q.Get("ext")
+	if !uploadExtRe.MatchString(ext) {
+		writeErr(w, http.StatusBadRequest, "BAD_EXT", "bad extension")
+		return
+	}
+	expected, err := strconv.ParseInt(q.Get("expected"), 10, 64)
+	if err != nil || expected < 1 || expected > maxReadSize {
+		writeErr(w, http.StatusBadRequest, "BAD_SIZE", "expected size out of range")
+		return
+	}
+	mode, err := parseMode(q.Get("mode"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_MODE", err.Error())
+		return
+	}
+	ownerUID, ownerGID, hasOwner, err := parseOwner(q.Get("owner_uid"), q.Get("owner_gid"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_OWNER", err.Error())
+		return
+	}
+	probe, err := validatePath(filepath.Join(q.Get("dir"), ".quota-probe"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+		return
+	}
+	dir := filepath.Dir(probe)
+	sweepStaleParts(dir)
+
+	parts := make([]string, count)
+	var total int64
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf(".part-%s-%d", id, i)
+		if !partNameRe.MatchString(name) {
+			writeErr(w, http.StatusBadRequest, "BAD_PART", "part name rejected")
+			return
+		}
+		p, err := validatePath(filepath.Join(dir, name))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+			return
+		}
+		parts[i] = p
+		st, err := os.Lstat(p)
+		if err != nil || !st.Mode().IsRegular() {
+			writeErr(w, http.StatusConflict, "MISSING_PART", fmt.Sprintf("missing part %d", i))
+			return
+		}
+		total += st.Size()
+	}
+	if total != expected {
+		writeErr(w, http.StatusConflict, "SIZE_MISMATCH", fmt.Sprintf("size %d != %d", total, expected))
+		return
+	}
+
+	asmLock := pathLock(filepath.Join(dir, ".assemble-"+id))
+	asmLock.Lock()
+	defer asmLock.Unlock()
+	partLocks := make([]*sync.Mutex, count)
+	for i, p := range parts {
+		partLocks[i] = pathLock(p)
+		partLocks[i].Lock()
+	}
+	defer func() {
+		for i := len(partLocks) - 1; i >= 0; i-- {
+			partLocks[i].Unlock()
+		}
+	}()
+	release := acquire()
+	defer release()
+
+	// Re-stat under the locks. A part may have disappeared.
+	total = 0
+	for i, p := range parts {
+		st, err := os.Lstat(p)
+		if err != nil || !st.Mode().IsRegular() {
+			writeErr(w, http.StatusConflict, "MISSING_PART", fmt.Sprintf("missing part %d", i))
+			return
+		}
+		total += st.Size()
+	}
+	if total != expected {
+		writeErr(w, http.StatusConflict, "SIZE_MISMATCH", fmt.Sprintf("size %d != %d", total, expected))
+		return
+	}
+
+	tmpName := ".tmp-asm-" + id
+	tmpPath, err := validatePath(filepath.Join(dir, tmpName))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+		return
+	}
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "OPEN_FAIL", err.Error())
+		return
+	}
+	ownedTmp := false
+	if err := verifyFdTarget(f.Fd()); err != nil {
+		_ = f.Close()
+		writeErr(w, http.StatusBadRequest, "PATH_DIVERGED", err.Error())
+		return
+	}
+	ownedTmp = true
+	removeTmp := func() {
+		if !ownedTmp {
+			return
+		}
+		_ = os.Remove(tmpPath)
+	}
+	hasher := sha256.New()
+	var written int64
+	for i, p := range parts {
+		in, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			_ = f.Close()
+			removeTmp()
+			writeErr(w, http.StatusConflict, "MISSING_PART", fmt.Sprintf("missing part %d", i))
+			return
+		}
+		if err := verifyFdTarget(in.Fd()); err != nil {
+			_ = in.Close()
+			_ = f.Close()
+			removeTmp()
+			writeErr(w, http.StatusBadRequest, "PATH_DIVERGED", err.Error())
+			return
+		}
+		n, err := io.Copy(io.MultiWriter(f, hasher), in)
+		_ = in.Close()
+		if err != nil {
+			_ = f.Close()
+			removeTmp()
+			writeErr(w, http.StatusInternalServerError, "COPY_FAIL", err.Error())
+			return
+		}
+		written += n
+	}
+	if written != expected {
+		_ = f.Close()
+		removeTmp()
+		writeErr(w, http.StatusConflict, "SIZE_MISMATCH", fmt.Sprintf("wrote %d != %d", written, expected))
+		return
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		removeTmp()
+		writeErr(w, http.StatusInternalServerError, "SYNC_FAIL", err.Error())
+		return
+	}
+	digest := hex.EncodeToString(hasher.Sum(nil))
+	destName := digest + "." + ext
+	destPath, err := validatePath(filepath.Join(dir, destName))
+	if err != nil {
+		_ = f.Close()
+		removeTmp()
+		writeErr(w, http.StatusBadRequest, "BAD_PATH", err.Error())
+		return
+	}
+	if st, err := os.Lstat(destPath); err == nil && st.Mode().IsRegular() {
+		_ = f.Close()
+		removeTmp()
+		existing, hashErr := hashRegularFile(destPath, maxReadSize)
+		if hashErr != nil {
+			writeErr(w, http.StatusInternalServerError, "STAT_FAIL", hashErr.Error())
+			return
+		}
+		if existing != digest {
+			writeErr(w, http.StatusConflict, "DIGEST_MISMATCH", "published file hash differs")
+			return
+		}
+		removeParts(parts)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(assembleResponse{Sha256: digest, Size: st.Size()})
+		return
+	}
+	if hasOwner {
+		if err := chownFile(f, ownerUID, ownerGID); err != nil {
+			_ = f.Close()
+			removeTmp()
+			writeErr(w, http.StatusInternalServerError, "CHOWN_FAIL", err.Error())
+			return
+		}
+	}
+	if err := chmodFile(f, mode); err != nil {
+		_ = f.Close()
+		removeTmp()
+		writeErr(w, http.StatusInternalServerError, "CHMOD_FAIL", err.Error())
+		return
+	}
+	if err := f.Close(); err != nil {
+		removeTmp()
+		writeErr(w, http.StatusInternalServerError, "CLOSE_FAIL", err.Error())
+		return
+	}
+	if err := renameFile(tmpPath, destPath); err != nil {
+		removeTmp()
+		writeErr(w, http.StatusInternalServerError, "RENAME_FAIL", err.Error())
+		return
+	}
+	ownedTmp = false
+	removeParts(parts)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(assembleResponse{Sha256: digest, Size: written})
+}
+
+func removeParts(parts []string) {
+	for _, p := range parts {
+		_ = os.Remove(p)
+	}
+}
+
+func hashRegularFile(path string, limit int64) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := verifyFdTarget(f.Fd()); err != nil {
+		return "", err
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, io.LimitReader(f, limit+1)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

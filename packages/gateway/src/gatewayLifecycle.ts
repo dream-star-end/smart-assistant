@@ -9,6 +9,8 @@ import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
  * touches (typed from the class itself).
  */
 import { mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
+import { startUploadRetention, stopUploadRetention } from './uploadRetention.js'
+import type { LogContext } from './logger.js'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
 import type { ChannelContext } from '@openclaude/plugin-sdk'
@@ -406,7 +408,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       let totalCleaned = 0
       let dirsSwept = 0
       for (const entry of readdirSync(volsRoot)) {
-        if (!/^oc-v3-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
+        if (!/^oc-(v3|v5)-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
         const userUploads = join(volsRoot, entry, '_data', 'uploads')
         const r = sweepTmpInDir(userUploads)
         if (r >= 0) {
@@ -427,6 +429,18 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       // (CI / dev). Log warn but don't fail startup.
       this.log.warn('upload .tmp orphan cleanup (per-user) failed', undefined, err)
     }
+  }
+  try {
+    startUploadRetention({
+      info: (msg, ctx) => {
+        this.log.info(msg, ctx as LogContext | undefined)
+      },
+      warn: (msg, ctx, err) => {
+        this.log.warn(msg, ctx as LogContext | undefined, err)
+      },
+    })
+  } catch (err) {
+    this.log.warn('upload retention arm failed', undefined, err)
   }
 
   this.httpServer = createServer((req, res) => this.handleHttp(req, res))
@@ -985,6 +999,9 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
     clearInterval(this._taskSchedulerTimer)
     this._taskSchedulerTimer = null
   }
+  try {
+    stopUploadRetention()
+  } catch {}
   if (this._taskboardTickTimer !== null) {
     clearInterval(this._taskboardTickTimer)
     this._taskboardTickTimer = null

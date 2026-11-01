@@ -97,7 +97,7 @@ import {
 import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
-import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
+import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_FILE, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
@@ -1055,6 +1055,13 @@ export async function dispatchInbound(
           // /api/media path applies via fstatSync().isFile().
           if (!stat.isFile()) {
             rejectFrame('媒体类型非文件')
+            return
+          }
+          if (stat.size > MAX_UPLOAD_FILE) {
+            rejectFrame(
+              `单个文件超过 ${MAX_UPLOAD_FILE / 1024 / 1024}MB 上限 (${(stat.size / 1024 / 1024).toFixed(1)}MB)`,
+              { byteLen: stat.size },
+            )
             return
           }
           // Aggregate against MAX_UPLOAD_TOTAL — same budget the legacy base64

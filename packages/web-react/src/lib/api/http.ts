@@ -496,8 +496,9 @@ export async function throwApi(res: Response): Promise<never> {
       if (typeof e.code === "string") code = e.code;
       if (Array.isArray(e.issues)) issues = e.issues as ApiIssue[];
     } else if (typeof err === "string") {
-      // gateway：{ error: "<string>" }
+      // gateway：{ error: "<string>", code? }
       message = err;
+      if (typeof b?.code === "string") code = b.code;
     } else if (typeof b?.message === "string") {
       message = b.message as string;
     }

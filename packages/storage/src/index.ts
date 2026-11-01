@@ -53,3 +53,5 @@ export * from './projectFormalLedger.js'
 // OpenViking context façade (P1 B1: gateway-only callers; CLI stays cli_lease_blocked).
 export * from './contextEligibility.js'
 export * from './contextSource.js'
+
+export * from './sessionUploadReferences.js'
