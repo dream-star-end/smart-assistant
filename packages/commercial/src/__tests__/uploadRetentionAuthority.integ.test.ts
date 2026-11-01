@@ -90,11 +90,11 @@ test('upload retention reads authoritative PG hot, archive and exact deferred pa
   try {
     assert.match(String((await client.query('SELECT current_database() AS name')).rows[0]?.name), /^[a-z][a-z0-9_]*_test$/)
     await client.query('SET search_path TO pg_temp, pg_catalog'); await client.query(ddl)
-    process.env.OC_SESSIONS_STORE = 'pg'; delete process.env.OC_CONTAINER_ID
+    process.env.OC_SESSIONS_STORE = 'pg'; Reflect.deleteProperty(process.env, 'OC_CONTAINER_ID')
     const scenario = async (name: string, fn: () => Promise<void>) => t.test(name, async () => {
       await client.query('TRUNCATE pg_temp.client_sessions,pg_temp.client_session_archive_chunks,pg_temp.client_session_turn_tapes,pg_temp.client_session_turn_tape_records,pg_temp.client_session_user_payloads')
       backend.scanRecentClientSessionMessages = scan; queries.length = 0
-      try { await fn() } finally { backend.scanRecentClientSessionMessages = scan; delete process.env.OC_CONTAINER_ID }
+      try { await fn() } finally { backend.scanRecentClientSessionMessages = scan; Reflect.deleteProperty(process.env, 'OC_CONTAINER_ID') }
     })
     await scenario('PG configuration without injected PG backend cannot fall back to stale SQLite', async () => {
       const fixture = await seed(client)
@@ -154,8 +154,8 @@ test('upload retention reads authoritative PG hot, archive and exact deferred pa
       await observeGunzip(async (limits, failures) => { await incomplete(fixture); assert.ok(limits.some(n => n > 0 && n <= 20000)); assert.ok(failures.includes('ERR_BUFFER_TOO_LARGE'), 'gzip must stop at the output limit before post-expansion validation') })
     })
   } finally {
-    if (oldStore === undefined) delete process.env.OC_SESSIONS_STORE; else process.env.OC_SESSIONS_STORE = oldStore
-    if (oldContainer === undefined) delete process.env.OC_CONTAINER_ID; else process.env.OC_CONTAINER_ID = oldContainer
+    if (oldStore === undefined) Reflect.deleteProperty(process.env, 'OC_SESSIONS_STORE'); else process.env.OC_SESSIONS_STORE = oldStore
+    if (oldContainer === undefined) Reflect.deleteProperty(process.env, 'OC_CONTAINER_ID'); else process.env.OC_CONTAINER_ID = oldContainer
     await client.end()
     for (const root of fixtureRoots) rmSync(root, { recursive: true, force: true })
   }
