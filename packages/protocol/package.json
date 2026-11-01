@@ -75,6 +75,11 @@
       "types": "./src/nodeLogTiming.ts",
       "openclaude-precompiled": "./dist/nodeLogTiming.js",
       "default": "./src/nodeLogTiming.ts"
+    },
+    "./agentRemote": {
+      "types": "./src/agentRemote.ts",
+      "openclaude-precompiled": "./dist/agentRemote.js",
+      "default": "./src/agentRemote.ts"
     }
   },
   "dependencies": {
