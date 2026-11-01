@@ -28,6 +28,7 @@ import {
   NativeCheckpointCaptureSchema,
   NativeCheckpointIdentitySchema,
   NativeCheckpointSchema,
+  NativeRecoveryPermitSchema,
   verifyNativeCheckpoint,
 } from '@openclaude/protocol/agentRemoteState'
 import { Type } from '@sinclair/typebox'
@@ -61,6 +62,28 @@ const StateSchema = Type.Object(
           nativeSessionId: Type.Optional(NativeCheckpointIdentitySchema.properties.nativeSessionId),
           nativeDeliveryWatermark: integer,
           nativeCheckpointWatermark: integer,
+          nativeWriterGeneration: integer,
+          nativeSealedWriterGeneration: integer,
+          nativeWriter: Type.Optional(
+            Type.Object(
+              {
+                incarnation: Type.String({
+                  minLength: 1,
+                  maxLength: 160,
+                  pattern: '^[A-Za-z0-9_.:-]+$',
+                }),
+                bindingRevision: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+                ownerInstanceId: Type.String({
+                  minLength: 1,
+                  maxLength: 160,
+                  pattern: '^[A-Za-z0-9_.:-]+$',
+                }),
+              },
+              closed,
+            ),
+          ),
+          nativeRecoveryGeneration: integer,
+          nativeRecovery: Type.Optional(NativeRecoveryPermitSchema),
           nativeCheckpointCapture: Type.Optional(NativeCheckpointCaptureSchema),
           lease: Type.Optional(
             Type.Object(
@@ -107,7 +130,7 @@ const StateSchema = Type.Object(
   closed,
 )
 const APPLICATION_ID = 0x41524d31
-const FORMAT_VERSION = 4
+const FORMAT_VERSION = 5
 // The existing principal metadata shape remains v1; native rows are normalized.
 const METADATA_VERSION = 1
 const MAX_STATE_BYTES = 64 * 1024 * 1024
@@ -127,6 +150,30 @@ function validateState(principalId: string, value: unknown): asserts value is Ag
     'stored-principal-mismatch',
   )
   for (const session of value.sessions) {
+    requireRemote(
+      session.nativeSealedWriterGeneration <= session.nativeWriterGeneration &&
+        (session.nativeWriterGeneration === 0 ? !session.nativeWriter : !!session.nativeWriter),
+      'stored-native-writer-generation',
+    )
+    const recovery = session.nativeRecovery
+    requireRemote(
+      recovery
+        ? recovery.token.generation === session.nativeRecoveryGeneration &&
+            recovery.token.sessionId === session.binding.sessionId &&
+            (recovery.phase === 'completed' ||
+              remoteCanonical(recovery.sourceBinding) === remoteCanonical(session.binding)) &&
+            recovery.identity.nativeSessionId === session.nativeSessionId &&
+            recovery.identity.sessionId === session.binding.sessionId &&
+            recovery.identity.principalId === principalId &&
+            (recovery.phase === 'completed' ||
+              (recovery.identity.environmentId === session.binding.environmentId &&
+                recovery.identity.environmentGeneration === session.binding.environmentGeneration &&
+                recovery.sourceWriterGeneration === session.nativeWriterGeneration)) &&
+            recovery.expiresAtMs > recovery.createdAtMs &&
+            (recovery.phase === 'completed' ? !!recovery.checkpointId : !recovery.checkpointId)
+        : session.nativeRecoveryGeneration === 0,
+      'stored-native-recovery',
+    )
     if (session.nativeCheckpoint) {
       verifyNativeCheckpoint(session.nativeCheckpoint)
       requireRemote(
@@ -140,7 +187,8 @@ function validateState(principalId: string, value: unknown): asserts value is Ag
           session.nativeCheckpointCapture.identity.principalId === principalId &&
           session.nativeCheckpointCapture.identity.sessionId === session.binding.sessionId &&
           session.nativeCheckpointCapture.nativeDeliveryWatermark <=
-            session.nativeDeliveryWatermark,
+            session.nativeDeliveryWatermark &&
+          session.nativeCheckpointCapture.nativeWriterGeneration <= session.nativeWriterGeneration,
         'stored-native-capture',
       )
     requireRemote(
@@ -524,6 +572,79 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
           const before = state.sessions.find(
             (item) => item.binding.sessionId === after.binding.sessionId,
           )
+          if (!before)
+            requireRemote(
+              after.nativeWriterGeneration === 0 &&
+                after.nativeSealedWriterGeneration === 0 &&
+                after.nativeRecoveryGeneration === 0 &&
+                !after.nativeRecovery &&
+                !after.nativeWriter,
+              'stored-native-initial-generation',
+            )
+          if (before) {
+            if (before.nativeRecovery?.phase === 'pending')
+              requireRemote(
+                after.epochWatermark === before.epochWatermark &&
+                  remoteCanonical(after.lease ?? null) === remoteCanonical(before.lease ?? null),
+                'stored-native-recovery-execution-fence',
+              )
+            const generationDelta = after.nativeWriterGeneration - before.nativeWriterGeneration
+            requireRemote(
+              (generationDelta === 0 &&
+                remoteCanonical(after.nativeWriter ?? null) ===
+                  remoteCanonical(before.nativeWriter ?? null)) ||
+                (generationDelta === 1 &&
+                  before.nativeWriterGeneration === before.nativeSealedWriterGeneration &&
+                  !!after.nativeWriter &&
+                  after.nativeWriter.incarnation !== before.nativeWriter?.incarnation &&
+                  after.nativeWriter.bindingRevision === after.binding.bindingRevision &&
+                  after.nativeWriter.ownerInstanceId === after.binding.workerInstanceId &&
+                  before.nativeRecovery?.phase !== 'pending'),
+              'stored-native-writer-transition',
+            )
+            const oldRecovery = before.nativeRecovery
+            const recovery = after.nativeRecovery
+            const recoveryDelta = after.nativeRecoveryGeneration - before.nativeRecoveryGeneration
+            requireRemote(
+              (recoveryDelta === 0 &&
+                (remoteCanonical(recovery ?? null) === remoteCanonical(oldRecovery ?? null) ||
+                  (!!oldRecovery &&
+                    !!recovery &&
+                    oldRecovery.phase === 'pending' &&
+                    recovery.phase === 'completed' &&
+                    remoteCanonical({ ...recovery, phase: 'pending', checkpointId: null }) ===
+                      remoteCanonical({ ...oldRecovery, checkpointId: null }) &&
+                    recovery.checkpointId === after.nativeCheckpoint?.checkpointId &&
+                    after.nativeCheckpointWatermark === after.nativeDeliveryWatermark &&
+                    after.nativeSealedWriterGeneration === after.nativeWriterGeneration &&
+                    !!before.nativeCheckpointCapture &&
+                    'recovery' in before.nativeCheckpointCapture &&
+                    remoteCanonical(before.nativeCheckpointCapture.recovery) ===
+                      remoteCanonical(oldRecovery.token) &&
+                    after.nativeCheckpoint?.checkpointCaptureId ===
+                      before.nativeCheckpointCapture.captureId))) ||
+                (recoveryDelta === 1 &&
+                  recovery?.phase === 'pending' &&
+                  recovery.token.generation === after.nativeRecoveryGeneration &&
+                  after.nativeWriterGeneration === before.nativeWriterGeneration &&
+                  (!before.lease?.active || before.lease.expiresAtMs <= recovery.createdAtMs) &&
+                  (!oldRecovery ||
+                    oldRecovery.phase === 'completed' ||
+                    oldRecovery.expiresAtMs <= recovery.createdAtMs)),
+              'stored-native-recovery-transition',
+            )
+            if (after.nativeSealedWriterGeneration !== before.nativeSealedWriterGeneration)
+              requireRemote(
+                after.nativeSealedWriterGeneration === after.nativeWriterGeneration &&
+                  after.nativeSealedWriterGeneration >= before.nativeSealedWriterGeneration &&
+                  oldRecovery?.phase === 'pending' &&
+                  recovery?.phase === 'completed' &&
+                  recovery.token.generation === oldRecovery.token.generation &&
+                  after.nativeCheckpoint?.checkpointCaptureId ===
+                    before.nativeCheckpointCapture?.captureId,
+                'stored-native-writer-seal',
+              )
+          }
           if (before?.nativeSessionId)
             requireRemote(
               after.nativeSessionId === before.nativeSessionId,
@@ -548,6 +669,8 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
                 after.nativeCheckpoint.checkpointCaptureId === capture.captureId &&
                 after.nativeCheckpoint.nativeDeliveryWatermark ===
                   capture.nativeDeliveryWatermark &&
+                after.nativeCheckpoint.nativeWriterGeneration === capture.nativeWriterGeneration &&
+                after.nativeWriterGeneration === capture.nativeWriterGeneration &&
                 after.nativeDeliveryWatermark === capture.nativeDeliveryWatermark &&
                 remoteCanonical(after.nativeCheckpointCapture) === remoteCanonical(capture),
               'stored-native-checkpoint-capture',

@@ -57,6 +57,123 @@ function find(
   )
   return row
 }
+/** Shared pure mutations for authenticated normal/recovery ingress only. */
+export function applyNativeEvidence(
+  row: NativeJournalRecord,
+  payloadHash: string,
+  trustedLedger: { hostInstanceId: string; ledgerId: string },
+  event: NativeJournalEvent,
+  now: number,
+): NativeJournalRecord {
+  requireRemote(
+    event.sender === 'execution' &&
+      row.dispatch?.hostInstanceId === trustedLedger.hostInstanceId &&
+      row.dispatch.ledgerId === trustedLedger.ledgerId &&
+      event.producerInstanceId === trustedLedger.hostInstanceId &&
+      event.ledgerId === trustedLedger.ledgerId &&
+      event.epoch === row.claim.epoch,
+    'native-evidence-producer',
+  )
+  verifyNativeJson(event.body)
+  verifyNativeBodySemantics(row.request, row.request.operationId, event.sender, event.body)
+  requireRemote(event.sha256 === nativeJournalEventHash(payloadHash, event), 'native-evidence-hash')
+  if (event.sequence <= row.events.length) {
+    requireRemote(equal(row.events[event.sequence - 1], event), 'native-event-conflict')
+    return row
+  }
+  requireRemote(!terminal(row) && event.sequence === row.events.length + 1, 'native-event-sequence')
+  requireRemote(!row.receipt, 'native-execution-already-finished')
+  if (event.body.kind === 'native.receipt') {
+    requireRemote(event.body.payloadHash === payloadHash, 'native-payload-hash')
+    if (event.body.status === 'unknown') row.state = 'unknown'
+    else {
+      const receipt = {
+        body: { ...event.body, status: event.body.status },
+        sha256: nativeReceiptHash(payloadHash, event.body),
+      }
+      requireRemote(!row.receipt || equal(row.receipt, receipt), 'native-receipt-conflict')
+      row.receipt = receipt
+    }
+  }
+  row.events.push(event)
+  row.updatedAtMs = now
+  return row
+}
+
+export function prepareNativeDelivery(
+  row: NativeJournalRecord,
+  payloadHash: string,
+  preparation: import('@openclaude/protocol/agentRemoteNativeDelivery').NativeDeliveryPreparation,
+  now: number,
+): NativeJournalRecord {
+  verifyNativeDeliveryPreparation(preparation, payloadHash)
+  requireRemote(row.receipt?.sha256 === preparation.receiptHash, 'native-delivery-mismatch')
+  verifyNativeDeliveryEvidence(row, preparation)
+  if (row.deliveryPreparation) {
+    requireRemote(equal(row.deliveryPreparation, preparation), 'native-delivery-prepare-conflict')
+    return row
+  }
+  requireRemote(!terminal(row), 'native-delivery-already-finished')
+  row.deliveryPreparation = preparation
+  row.updatedAtMs = now
+  return row
+}
+
+export function commitNativeDelivery(
+  state: AgentRemoteState,
+  row: NativeJournalRecord,
+  payloadHash: string,
+  preparationHash: string,
+  proof: NativeDeliveryWriterProof,
+  now: number,
+): NativeJournalRecord {
+  verifyNativeJson(proof)
+  validateRemote<NativeDeliveryWriterProof>(NativeDeliveryWriterProofSchema, proof)
+  requireRemote(
+    row.deliveryPreparation?.preparationHash === preparationHash && row.receipt,
+    'native-delivery-not-prepared',
+  )
+  // Commit is the durable result of the first proof. Later appends never
+  // replace its original head/hash/ACK on retry.
+  if (row.deliveryCommit) return row
+  const body = {
+    version: 1 as const,
+    preparationHash,
+    receiptHash: row.receipt!.sha256,
+    proof,
+    ack: {
+      kind: 'native.delivery.ack' as const,
+      receiptHash: row.receipt!.sha256,
+      nativeHeadRevision: proof.main.headUuid,
+      nativeHeadHash: proof.main.prefixHash,
+      artifactManifestHash: proof.artifactManifestHash,
+    },
+    committedAtMs: now,
+  }
+  const commit = { ...body, commitHash: nativeDeliveryCommitHash(payloadHash, body) }
+  verifyNativeDeliveryCommit(
+    commit,
+    payloadHash,
+    row.deliveryPreparation!,
+    row.request.nativeSessionId,
+  )
+  const session = state.sessions.find(
+    (item) => item.binding.sessionId === row.request.binding.sessionId,
+  )!
+  requireRemote(
+    Number.isSafeInteger(session.nativeDeliveryWatermark) &&
+      session.nativeDeliveryWatermark >= 0 &&
+      session.nativeDeliveryWatermark < Number.MAX_SAFE_INTEGER,
+    'counter-exhausted',
+  )
+  session.nativeDeliveryWatermark++
+  row.deliveryCommit = commit
+  row.deliveryAck = structuredClone(commit.ack)
+  row.state = row.receipt!.body.status
+  row.updatedAtMs = now
+  return row
+}
+
 export class NativeJournalService {
   constructor(
     private readonly store: AgentRemoteStore,
@@ -74,10 +191,18 @@ export class NativeJournalService {
     principalId: string,
     scope: NativeScope,
     now: number,
+    writerRequired = false,
   ): void {
     validateRemote<NativeScope>(NativeScopeSchema, scope)
     requireRemote(principalId === scope.binding.principalId, 'principal-mismatch')
-    requireAgentRemoteControlFence(state, scope.binding, scope.lease, now)
+    const session = requireAgentRemoteControlFence(state, scope.binding, scope.lease, now)
+    if (writerRequired)
+      requireRemote(
+        session.nativeWriterGeneration > session.nativeSealedWriterGeneration &&
+          session.nativeWriter?.ownerInstanceId === scope.binding.workerInstanceId &&
+          session.nativeWriter.bindingRevision === scope.binding.bindingRevision,
+        'native-writer-not-active',
+      )
     const environment = state.environments.find(
       (row) => row.environmentId === scope.binding.environmentId,
     )
@@ -106,7 +231,7 @@ export class NativeJournalService {
       principalId,
       (state) => {
         const now = this.now()
-        this.fence(state, principalId, expected, now)
+        this.fence(state, principalId, expected, now, true)
         pinAgentRemoteNativeSession(
           state.sessions.find((item) => item.binding.sessionId === expected.binding.sessionId)!,
           expected.nativeSessionId,
@@ -152,7 +277,7 @@ export class NativeJournalService {
       principalId,
       (state) => {
         const now = this.now()
-        this.fence(state, principalId, scope, now)
+        this.fence(state, principalId, scope, now, true)
         const row = find(state, scope, operationId, payloadHash)
         if (row.dispatch) {
           requireRemote(equal(row.dispatch, executor), 'native-grant-conflict')
@@ -215,7 +340,7 @@ export class NativeJournalService {
       principalId,
       (state) => {
         const now = this.now()
-        this.fence(state, principalId, scope, now)
+        this.fence(state, principalId, scope, now, true)
         const row = find(state, scope, operationId, payloadHash)
         requireRemote(
           equal(row.claim, scope.lease) && equal(row.dispatch, executor),
@@ -263,45 +388,7 @@ export class NativeJournalService {
         const now = this.now()
         this.fence(state, principalId, scope, now)
         const row = find(state, scope, operationId, payloadHash)
-        requireRemote(
-          event.sender === 'execution' &&
-            row.dispatch?.hostInstanceId === trustedLedger.hostInstanceId &&
-            row.dispatch.ledgerId === trustedLedger.ledgerId &&
-            event.producerInstanceId === trustedLedger.hostInstanceId &&
-            event.ledgerId === trustedLedger.ledgerId &&
-            event.epoch === row.claim.epoch,
-          'native-evidence-producer',
-        )
-        verifyNativeJson(event.body)
-        verifyNativeBodySemantics(row.request, operationId, event.sender, event.body)
-        requireRemote(
-          event.sha256 === nativeJournalEventHash(payloadHash, event),
-          'native-evidence-hash',
-        )
-        if (event.sequence <= row.events.length) {
-          requireRemote(equal(row.events[event.sequence - 1], event), 'native-event-conflict')
-          return row
-        }
-        requireRemote(
-          !terminal(row) && event.sequence === row.events.length + 1,
-          'native-event-sequence',
-        )
-        requireRemote(!row.receipt, 'native-execution-already-finished')
-        if (event.body.kind === 'native.receipt') {
-          requireRemote(event.body.payloadHash === payloadHash, 'native-payload-hash')
-          if (event.body.status === 'unknown') row.state = 'unknown'
-          else {
-            const receipt = {
-              body: { ...event.body, status: event.body.status },
-              sha256: nativeReceiptHash(payloadHash, event.body),
-            }
-            requireRemote(!row.receipt || equal(row.receipt, receipt), 'native-receipt-conflict')
-            row.receipt = receipt
-          }
-        }
-        row.events.push(event)
-        row.updatedAtMs = now
-        return row
+        return applyNativeEvidence(row, payloadHash, trustedLedger, event, now)
       },
       { operationKey: nativeOperationKey(scope, operationId) },
     )
@@ -324,19 +411,7 @@ export class NativeJournalService {
         const now = this.now()
         this.fence(state, principalId, expected, now)
         const row = find(state, expected, operationId, payloadHash)
-        requireRemote(row.receipt?.sha256 === preparation.receiptHash, 'native-delivery-mismatch')
-        verifyNativeDeliveryEvidence(row, preparation)
-        if (row.deliveryPreparation) {
-          requireRemote(
-            equal(row.deliveryPreparation, preparation),
-            'native-delivery-prepare-conflict',
-          )
-          return row
-        }
-        requireRemote(!terminal(row), 'native-delivery-already-finished')
-        row.deliveryPreparation = preparation
-        row.updatedAtMs = now
-        return row
+        return prepareNativeDelivery(row, payloadHash, preparation, now)
       },
       { operationKey: nativeOperationKey(expected, operationId) },
     )
@@ -362,49 +437,7 @@ export class NativeJournalService {
         const now = this.now()
         this.fence(state, principalId, expected, now)
         const row = find(state, expected, operationId, payloadHash)
-        requireRemote(
-          row.deliveryPreparation?.preparationHash === preparationHash && row.receipt,
-          'native-delivery-not-prepared',
-        )
-        // Commit is the durable result of the first proof. Later appends never
-        // replace its original head/hash/ACK on retry.
-        if (row.deliveryCommit) return row
-        const body = {
-          version: 1 as const,
-          preparationHash,
-          receiptHash: row.receipt!.sha256,
-          proof,
-          ack: {
-            kind: 'native.delivery.ack' as const,
-            receiptHash: row.receipt!.sha256,
-            nativeHeadRevision: proof.main.headUuid,
-            nativeHeadHash: proof.main.prefixHash,
-            artifactManifestHash: proof.artifactManifestHash,
-          },
-          committedAtMs: now,
-        }
-        const commit = { ...body, commitHash: nativeDeliveryCommitHash(payloadHash, body) }
-        verifyNativeDeliveryCommit(
-          commit,
-          payloadHash,
-          row.deliveryPreparation!,
-          row.request.nativeSessionId,
-        )
-        const session = state.sessions.find(
-          (item) => item.binding.sessionId === expected.binding.sessionId,
-        )!
-        requireRemote(
-          Number.isSafeInteger(session.nativeDeliveryWatermark) &&
-            session.nativeDeliveryWatermark >= 0 &&
-            session.nativeDeliveryWatermark < Number.MAX_SAFE_INTEGER,
-          'counter-exhausted',
-        )
-        session.nativeDeliveryWatermark++
-        row.deliveryCommit = commit
-        row.deliveryAck = structuredClone(commit.ack)
-        row.state = row.receipt!.body.status
-        row.updatedAtMs = now
-        return row
+        return commitNativeDelivery(state, row, payloadHash, preparationHash, proof, now)
       },
       { operationKey: nativeOperationKey(expected, operationId) },
     )

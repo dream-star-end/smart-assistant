@@ -1,6 +1,7 @@
 /** P2 native state references. These are not a second dispatch/tape authority. */
 import { type Static, Type } from '@sinclair/typebox'
 import {
+  BindingSchema,
   LeaseSchema,
   agentRemoteContentHash,
   remoteCanonical,
@@ -17,7 +18,7 @@ const nativeId = Type.String({
 })
 export const NativeCheckpointSchema = Type.Object(
   {
-    schemaVersion: Type.Literal(2),
+    schemaVersion: Type.Literal(3),
     checkpointId: digest,
     principalId: id,
     sessionId: id,
@@ -30,6 +31,7 @@ export const NativeCheckpointSchema = Type.Object(
     bindingRevision: positive,
     checkpointCaptureId: id,
     nativeDeliveryWatermark: integer,
+    nativeWriterGeneration: integer,
     // References must be supplied from the existing committed dispatch/tape owner.
     authority: Type.Object(
       { dispatchId: id, turnKey: id, tapeCursor: integer, nativeHeadUuid: id },
@@ -69,21 +71,48 @@ export const NativeCheckpointIdentitySchema = Type.Pick(
 export type NativeCheckpointIdentity = Static<typeof NativeCheckpointIdentitySchema>
 /** Trusted checkpoint orchestrator ticket, captured before copying any bytes.
  * It does not itself prove a flush, process exit or snapshot content. */
-export const NativeCheckpointCaptureSchema = Type.Object(
+export const NativeRecoveryOwnerSchema = Type.Object(
+  { workerInstanceId: id, connectionId: id, challenge: digest },
+  closed,
+)
+export type NativeRecoveryOwner = Static<typeof NativeRecoveryOwnerSchema>
+export const NativeRecoveryTokenSchema = Type.Object(
+  { sessionId: id, permitId: id, generation: positive, owner: NativeRecoveryOwnerSchema },
+  closed,
+)
+export type NativeRecoveryToken = Static<typeof NativeRecoveryTokenSchema>
+export const NativeRecoveryPermitSchema = Type.Object(
   {
-    captureId: id,
+    token: NativeRecoveryTokenSchema,
+    requestId: id,
+    phase: Type.Union([Type.Literal('pending'), Type.Literal('completed')]),
+    sourceBinding: BindingSchema,
     identity: NativeCheckpointIdentitySchema,
-    bindingRevision: positive,
-    lease: LeaseSchema,
-    nativeDeliveryWatermark: integer,
+    environmentIncarnation: id,
+    sourceWriterGeneration: integer,
     createdAtMs: positive,
+    expiresAtMs: positive,
+    checkpointId: Type.Optional(digest),
   },
   closed,
 )
+export type NativeRecoveryPermit = Static<typeof NativeRecoveryPermitSchema>
+const checkpointCaptureFields = {
+  captureId: id,
+  identity: NativeCheckpointIdentitySchema,
+  bindingRevision: positive,
+  nativeDeliveryWatermark: integer,
+  nativeWriterGeneration: integer,
+  createdAtMs: positive,
+}
+export const NativeCheckpointCaptureSchema = Type.Union([
+  Type.Object({ ...checkpointCaptureFields, lease: LeaseSchema }, closed),
+  Type.Object({ ...checkpointCaptureFields, recovery: NativeRecoveryTokenSchema }, closed),
+])
 export type NativeCheckpointCapture = Static<typeof NativeCheckpointCaptureSchema>
 
 export function nativeCheckpointId(value: Omit<NativeCheckpoint, 'checkpointId'>): string {
-  return agentRemoteContentHash(`agent-remote-native-checkpoint-v2\n${remoteCanonical(value)}`)
+  return agentRemoteContentHash(`agent-remote-native-checkpoint-v3\n${remoteCanonical(value)}`)
 }
 /** Native tool producers use only these layouts; transcripts remain Worker-owned.
  * Limits here describe filesystem names, never tool-output byte limits. */

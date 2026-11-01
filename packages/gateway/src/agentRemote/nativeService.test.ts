@@ -89,6 +89,7 @@ async function commitSynthetic(
   )
 }
 async function admitted(f: Fixture) {
+  await f.service.beginNativeWriter('u1', f.binding, f.lease, uuid, 'writer-fixture')
   const s = scope(f)
   const native = new NativeJournalService(f.store, f.now)
   const row = await native.admit('u1', s, request(f, s))

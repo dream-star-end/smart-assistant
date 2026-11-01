@@ -158,6 +158,7 @@ export interface NativeCheckpointRequest {
   bindingRevision: number
   checkpointCaptureId: string
   nativeDeliveryWatermark: number
+  nativeWriterGeneration: number
   authority: NativeCheckpoint['authority']
   transcriptRelativePath: string
   createdAtMs: number
@@ -361,11 +362,12 @@ export class NativeStateRepository {
         request.authority.nativeHeadUuid,
       )
       const semantic: Omit<NativeCheckpoint, 'checkpointId'> = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         ...request.identity,
         bindingRevision: request.bindingRevision,
         checkpointCaptureId: request.checkpointCaptureId,
         nativeDeliveryWatermark: request.nativeDeliveryWatermark,
+        nativeWriterGeneration: request.nativeWriterGeneration,
         authority: request.authority,
         createdAtMs: request.createdAtMs,
         transcriptRelativePath: request.transcriptRelativePath,
@@ -530,6 +532,7 @@ export class NativeStateRepository {
       bindingRevision: manifest.bindingRevision,
       checkpointCaptureId: manifest.checkpointCaptureId,
       nativeDeliveryWatermark: manifest.nativeDeliveryWatermark,
+      nativeWriterGeneration: manifest.nativeWriterGeneration,
       authority: manifest.authority,
       transcriptRelativePath: manifest.transcriptRelativePath,
       createdAtMs: manifest.createdAtMs,

@@ -55,6 +55,7 @@ function files(f: NativeFixture) {
     bindingRevision: f.binding.bindingRevision,
     checkpointCaptureId: 'placeholder',
     nativeDeliveryWatermark: 0,
+    nativeWriterGeneration: 0,
     authority: { dispatchId: 'd1', turnKey: 't1', tapeCursor: 1, nativeHeadUuid: head },
     transcriptRelativePath,
     createdAtMs: 1000,
@@ -334,7 +335,7 @@ test('old v3 WAL format is rejected without changing database or pending WAL byt
   assert.deepEqual(readFileSync(path), databaseBytes)
   assert.deepEqual(readFileSync(`${path}-wal`), walBytes)
 })
-test('format v4 missing version metadata is rejected rather than interpreted as a clean zero boundary', async (t) => {
+test('format v5 missing version metadata is rejected rather than interpreted as a clean zero boundary', async (t) => {
   const f = await fixture(t)
   f.store.close()
   const raw = new Database(f.path)

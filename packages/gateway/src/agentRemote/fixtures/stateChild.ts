@@ -95,6 +95,7 @@ try {
             ...config.request,
             checkpointCaptureId: capture.captureId,
             nativeDeliveryWatermark: capture.nativeDeliveryWatermark,
+            nativeWriterGeneration: capture.nativeWriterGeneration,
             createdAtMs: Math.max(config.request.createdAtMs, capture.createdAtMs),
           }
         }

@@ -53,6 +53,7 @@ function fixture(t: test.TestContext) {
     bindingRevision: 1,
     checkpointCaptureId: 'fixture-capture',
     nativeDeliveryWatermark: 0,
+    nativeWriterGeneration: 0,
     authority: { dispatchId: 'd1', turnKey: 'turn1', tapeCursor: 1, nativeHeadUuid: 'head1' },
     transcriptRelativePath,
     createdAtMs: 1000,

@@ -222,6 +222,9 @@ test('source blob references must match sealed Host envelope declarations rather
           nativeSessionId: row.request.nativeSessionId,
           nativeDeliveryWatermark: 0,
           nativeCheckpointWatermark: 0,
+          nativeWriterGeneration: 0,
+          nativeSealedWriterGeneration: 0,
+          nativeRecoveryGeneration: 0,
           lease: { ...f.lease, expiresAtMs: 2000, active: true },
         },
       ]

@@ -60,9 +60,10 @@ test('native rows survive reopen; receipt alone blocks all four shared mutation 
   )
   const relativePath = `projects/-workspace/${uuid}.jsonl`
   const semantic = {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     checkpointCaptureId: 'fixture-capture',
     nativeDeliveryWatermark: 0,
+    nativeWriterGeneration: 0,
     principalId: 'u1',
     sessionId: 's1',
     nativeSessionId: uuid,
@@ -224,7 +225,7 @@ test('native terminal requires matching receipt and durable writer ACK; owner/ha
   )
   assert.equal((await f.store.transact('u1', (state) => state.nativeJournal)).length, 0)
 })
-test('v1 owned DB rejects before WAL mutation; v4 keeps explicit v1 metadata shape', async (t) => {
+test('v1 owned DB rejects before WAL mutation; v5 keeps explicit v1 metadata shape', async (t) => {
   const f = await fixture(t)
   const legacy = join(f.root, 'legacy.sqlite')
   writeFileSync(legacy, '', { mode: 0o600 })
@@ -238,7 +239,7 @@ test('v1 owned DB rejects before WAL mutation; v4 keeps explicit v1 metadata sha
   })
   const db = new Database(f.path, { readonly: true })
   t.after(() => db.close())
-  assert.equal(db.pragma('user_version', { simple: true }), 4)
+  assert.equal(db.pragma('user_version', { simple: true }), 5)
   const metadata = db
     .prepare('SELECT format_version,payload FROM agent_remote_principals')
     .get() as { format_version: number; payload: string }

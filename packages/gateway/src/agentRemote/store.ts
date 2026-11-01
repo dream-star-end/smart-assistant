@@ -12,6 +12,7 @@ import type {
 import type {
   NativeCheckpoint,
   NativeCheckpointCapture,
+  NativeRecoveryPermit,
 } from '@openclaude/protocol/agentRemoteState'
 import type { NativeJournalRecord } from './nativeJournal.js'
 
@@ -34,6 +35,11 @@ export interface RemoteSession {
   nativeSessionId?: string
   nativeDeliveryWatermark: number
   nativeCheckpointWatermark: number
+  nativeWriterGeneration: number
+  nativeSealedWriterGeneration: number
+  nativeWriter?: { incarnation: string; bindingRevision: number; ownerInstanceId: string }
+  nativeRecoveryGeneration: number
+  nativeRecovery?: NativeRecoveryPermit
   nativeCheckpointCapture?: NativeCheckpointCapture
   nativeCheckpoint?: NativeCheckpoint
 }
