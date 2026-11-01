@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
+import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_UPLOAD_TOTAL_BYTES, attachmentTotalLimitMessage } from "@openclaude/protocol/browser";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
@@ -74,6 +74,10 @@ type Attach = {
 // 附件件数上限:与后端 gateway 帧准入共用 protocol 单一权威常量,消除历史上前端 8 / 后端 5
 // 的漂移(用户挂 6-8 个上传成功却被后端拒)。
 const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
+
+function finiteAttachmentBytes(size: number): number {
+  return Number.isFinite(size) && size > 0 ? size : 0;
+}
 
 // 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。只是提示,加载失败(发版后的
 // 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
@@ -279,6 +283,13 @@ export function Composer({
   // 会用同一个旧值算 room,合计可超 MAX_ATTACH(后端才拒)。每次渲染回写真值,onFiles 内就地累加。
   const attachCountRef = useRef(attachments.length);
   attachCountRef.current = attachments.length;
+  const attachBytesRef = useRef(0);
+  attachBytesRef.current = attachments.reduce((sum, item) => sum + finiteAttachmentBytes(item.size), 0);
+  const [totalLimitNotice, setTotalLimitNotice] = useState<string | null>(null);
+  const selectionOverTotal = attachBytesRef.current > MAX_UPLOAD_TOTAL_BYTES;
+  const totalLimitMessage = selectionOverTotal
+    ? attachmentTotalLimitMessage(attachBytesRef.current)
+    : totalLimitNotice;
   const setAttachments = (next: SetStateAction<OwnedAttach[]>) => {
     setAttach((curr) => {
       const items = typeof next === "function" ? next(curr.items) : next;
@@ -464,7 +475,10 @@ export function Composer({
     .map((a) => a.media as MediaRef);
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
   const canSend =
-    (value.trim().length > 0 || doneMedia.length > 0 || !!sendablePrediction) && !uploading && !attachFailed;
+    (value.trim().length > 0 || doneMedia.length > 0 || !!sendablePrediction) &&
+    !uploading &&
+    !attachFailed &&
+    !selectionOverTotal;
   // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
   const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
@@ -477,6 +491,7 @@ export function Composer({
 
   const removeAttach = useCallback(
     (id: string) => {
+      setTotalLimitNotice(null);
       setAttach((curr) => {
         const hit = curr.items.find((x) => x.id === id);
         if (hit) revoke(hit.previewUrl);
@@ -574,6 +589,14 @@ export function Composer({
       toast("未获取到所选文件,请重试", "info");
       return;
     }
+    const pickedBytes = picked.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
+    if (attachBytesRef.current + pickedBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      const message = attachmentTotalLimitMessage(attachBytesRef.current + pickedBytes);
+      setTotalLimitNotice(message);
+      toast(message, "info");
+      return;
+    }
+    setTotalLimitNotice(null);
     // 上限守卫前置:超出配额的文件**不上传**(此前 chip 有守卫但 onUpload 无条件执行 →
     // 超限文件白白上传后结果被丢弃),且截断有明确提示而非静默。
     const room = Math.max(0, MAX_ATTACH - attachCountRef.current);
@@ -581,6 +604,7 @@ export function Composer({
     const dropped = picked.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     attachCountRef.current += arr.length;
+    attachBytesRef.current += arr.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
     for (const file of arr) {
       const id = `att-${nextAttachId++}`;
       const owner: AttachOwner = { key: draftKey, epoch: attachEpoch };
@@ -674,6 +698,15 @@ export function Composer({
         }}
       >
         {environmentPreparing && <EnvironmentPrepBar />}
+        {totalLimitMessage && (
+          <output
+            data-testid="composer-upload-total-limit"
+            className="mx-3.5 mt-3 block text-caption text-danger"
+            aria-live="polite"
+          >
+            {totalLimitMessage}
+          </output>
+        )}
         {replyTo && (
           <div className="mx-3.5 mt-3 flex items-start gap-2 rounded-xl bg-hover px-3 py-2 text-left">
             <div className="min-w-0 flex-1 border-l-2 border-accent/60 pl-2.5">
@@ -1036,15 +1069,17 @@ export function Composer({
                 aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
                 aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
                 title={
-                  attachFailed
-                    ? "有附件上传失败，请重试或移除后再发送"
-                    : uploading
-                      ? "附件上传中"
-                      : busy && !stopping
-                        ? "停止生成"
-                        : sendablePrediction
-                          ? "发送这句预测"
-                          : undefined
+                  totalLimitMessage
+                    ? totalLimitMessage
+                    : attachFailed
+                      ? "有附件上传失败，请重试或移除后再发送"
+                      : uploading
+                        ? "附件上传中"
+                        : busy && !stopping
+                          ? "停止生成"
+                          : sendablePrediction
+                            ? "发送这句预测"
+                            : undefined
                 }
                 onClick={() => {
                   if (busy) {

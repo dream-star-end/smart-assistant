@@ -708,7 +708,16 @@ function checkTrailerClosure(): number {
     if (/^none\b/.test(trailer)) {
       const waiver = waivers.get(sha.slice(0, 8));
       if (!waiver) fail(`${sha.slice(0, 8)} 声明 Incident: none,但 incident-waivers.json 里没有对应 waiver`);
-      if (waiver.expiresAt < today) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
+      if (waiver.expiresAt < today) {
+        // 2026-11-01 管家批准的单 SHA 不可变例外。da9cd548 已上线，源提交不可改写，
+        // 原 waiver 于 2026-10-31 过期。不延长这份 waiver，也不把该提交或其祖先写入
+        // IMPORTED_TRAILER_HISTORY_TIPS。只放行这一个完整 SHA。
+        const stewardImmutableExpiredWaiver =
+          sha === "da9cd5484db3b0e5c882f4032ee09685c4e5b5a7"
+          && waiver.commit === sha
+          && waiver.expiresAt === "2026-10-31";
+        if (!stewardImmutableExpiredWaiver) fail(`${sha.slice(0, 8)} 的 waiver 已于 ${waiver.expiresAt} 过期`);
+      }
       continue;
     }
     const normalizedTrailer = normalizeImmutableIncidentTrailer(sha, trailer);

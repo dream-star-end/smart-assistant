@@ -30,10 +30,11 @@ export type ContainerInboxState =
 export interface ContainerDispatchStateResponse {
   state: ContainerInboxState
   outcome?: string
+  userFailureCode?: string
 }
 
 export type ContainerCallResult =
-  | { kind: 'ok'; state: ContainerInboxState; outcome?: string }
+  | { kind: 'ok'; state: ContainerInboxState; outcome?: string; userFailureCode?: string }
   /** 容器当前不在跑 / 远端 host 无 tunnel / 网络不可达 —— 保持 rejecting 重试,不推断终态。 */
   | { kind: 'unreachable'; detail: string }
   /** HTTP 通了但状态码非 2xx / body 无法解析 —— 同样不推断,重试。 */
@@ -57,7 +58,7 @@ export interface ContainerDispatchClientDeps {
   timeoutMs?: number
 }
 
-import { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH } from '@openclaude/protocol'
+import { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH, attachmentTotalExceededFailureCode, parseAttachmentTotalExceeded } from '@openclaude/protocol'
 
 export { TURN_CANCEL_IF_QUEUED_PATH, TURN_REJECT_IF_ABSENT_PATH, TURN_DISPATCH_STATE_PATH }
 const DEFAULT_TIMEOUT_MS = 5_000
@@ -96,9 +97,15 @@ function parseStateBody(bodyText: string): ContainerDispatchStateResponse | null
     if (typeof parsed.state !== 'string' || !VALID_STATES.has(parsed.state as ContainerInboxState)) {
       return null
     }
+    const userFailureCode = parseAttachmentTotalExceeded(
+      (parsed as { userFailureCode?: unknown }).userFailureCode,
+    )
     return {
       state: parsed.state as ContainerInboxState,
       ...(typeof parsed.outcome === 'string' ? { outcome: parsed.outcome } : {}),
+      ...(userFailureCode
+        ? { userFailureCode: attachmentTotalExceededFailureCode(userFailureCode.totalBytes) }
+        : {}),
     }
   } catch {
     return null
@@ -196,7 +203,12 @@ export function makeContainerDispatchClient(deps: ContainerDispatchClientDeps): 
     }
     const parsed = parseStateBody(res.bodyText)
     if (parsed === null) return { kind: 'error', detail: `unparseable state body: ${res.bodyText.slice(0, 200)}` }
-    return { kind: 'ok', state: parsed.state, ...(parsed.outcome ? { outcome: parsed.outcome } : {}) }
+    return {
+      kind: 'ok',
+      state: parsed.state,
+      ...(parsed.outcome ? { outcome: parsed.outcome } : {}),
+      ...(parsed.userFailureCode ? { userFailureCode: parsed.userFailureCode } : {}),
+    }
   }
 
   return {

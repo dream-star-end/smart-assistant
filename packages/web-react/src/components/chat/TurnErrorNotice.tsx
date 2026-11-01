@@ -6,6 +6,7 @@
  * 冻结的旧快照正文)由调用方作为 fixedBody 传入。动作按目录建议,执行入口由调用方给。
  */
 import type { ReactNode } from "react";
+import { parseAttachmentTotalExceeded } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../../lib/chat/model";
 import { errorPresentation } from "../../lib/chat/render";
 import { readUserError, type ErrorNoticeAction, type UserError } from "../../lib/chat/userErrorView";
@@ -66,7 +67,9 @@ export function TurnStatusCard({
   currentTurn: boolean;
 }) {
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
-  const source = currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
+  const attachmentTotalBlocked = parseAttachmentTotalExceeded(msg._errorCode) !== null
+    || presented.code === "attachment_total_exceeded";
+  const source = !attachmentTotalBlocked && currentTurn ? cb.resolveInterruptedContinuation?.(msg) : undefined;
   const retry = source && cb.onContinueInterrupted
     ? { label: "继续", onClick: () => cb.onContinueInterrupted?.(msg) }
     : undefined;

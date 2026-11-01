@@ -12,9 +12,11 @@ import { MIME_MAP } from './gatewayFilePolicy.js'
 // 2026-05-18:从 200MB → 100MB。前端 attachments.js 同步;Cloudflare Free/Pro
 // request body cap = 100MB,后端写 200MB 是个永远摸不到的虚上限。前后端对齐到
 // CF 现实让 413 在前端直接拦,而不是被 CF 边缘 HTML 错误页吞掉。
-export const MAX_UPLOAD_SINGLE = 100 * 1024 * 1024
-
-export const MAX_UPLOAD_TOTAL = 300 * 1024 * 1024
+// Numbers live in @openclaude/protocol so the composer and this process share one cap.
+export {
+  MAX_UPLOAD_SINGLE_BYTES as MAX_UPLOAD_SINGLE,
+  MAX_UPLOAD_TOTAL_BYTES as MAX_UPLOAD_TOTAL,
+} from '@openclaude/protocol'
 
 export const SAFE_UPLOAD_EXTENSION_RE = /^[a-z0-9]{1,32}$/
 

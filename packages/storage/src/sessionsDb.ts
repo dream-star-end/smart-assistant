@@ -861,6 +861,14 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_tdi_open ON turn_dispatch_inbox(state)
       WHERE state NOT IN ('terminal','rejected');
   `)
+  // Display-only reason for a queued→rejected attachment-total refusal.
+  // ADD COLUMN NULL is metadata-only. Other transitions leave it NULL.
+  {
+    const inboxCols = db.pragma('table_info(turn_dispatch_inbox)') as Array<{ name: string }>
+    if (!inboxCols.some((column) => column.name === 'user_failure_code')) {
+      db.exec('ALTER TABLE turn_dispatch_inbox ADD COLUMN user_failure_code TEXT')
+    }
+  }
   // 0241: last_at 通常比 inbox.updated_at（终态时刻,epoch ms）早数毫秒,0240 回填后
   // 仍 terminal > last_read_at。一次性抬到 max(inbox.updated_at)。user_version 作门,
   // 禁止每次 open 都重跑（会把真正的新终态未读清掉）。必须在 inbox 建表之后。
@@ -1149,6 +1157,8 @@ export interface TurnDispatchInboxRow {
   createdAt: number
   acceptedAt: number
   updatedAt: number
+  /** Set only when a queued turn is rejected for the attachment total. */
+  userFailureCode?: string
 }
 
 interface TurnDispatchInboxDbRow {
@@ -1167,6 +1177,7 @@ interface TurnDispatchInboxDbRow {
   created_at: number
   accepted_at: number
   updated_at: number
+  user_failure_code?: string | null
 }
 
 function _mapTurnDispatchInboxRow(r: TurnDispatchInboxDbRow): TurnDispatchInboxRow {
@@ -1186,6 +1197,9 @@ function _mapTurnDispatchInboxRow(r: TurnDispatchInboxDbRow): TurnDispatchInboxR
     createdAt: r.created_at,
     acceptedAt: r.accepted_at,
     updatedAt: r.updated_at,
+    ...(typeof r.user_failure_code === 'string' && r.user_failure_code.length > 0
+      ? { userFailureCode: r.user_failure_code }
+      : {}),
   }
 }
 
@@ -1304,17 +1318,21 @@ export async function casTurnDispatchState(input: {
   toState: TurnDispatchInboxState
   outcome?: TurnDispatchInboxOutcome | null
   now?: number
+  /** Written only when the caller supplies one. Other CAS transitions leave the column untouched. */
+  userFailureCode?: string
 }): Promise<TurnDispatchInboxRow | null> {
   const db = await getSessionsDb()
   const now = input.now ?? Date.now()
   const placeholders = input.fromStates.map(() => '?').join(',')
   const setOutcome = input.outcome !== undefined
+  const setCode = input.userFailureCode !== undefined
   const txn = db.transaction((): TurnDispatchInboxRow | null => {
     const res = db
       .prepare(
         `UPDATE turn_dispatch_inbox
             SET state = ?,
                 ${setOutcome ? 'outcome = ?,' : ''}
+                ${setCode ? 'user_failure_code = ?,' : ''}
                 updated_at = ?
           WHERE user_id = ? AND session_id = ? AND client_message_id = ?
             AND state IN (${placeholders})`,
@@ -1322,6 +1340,7 @@ export async function casTurnDispatchState(input: {
       .run(
         input.toState,
         ...(setOutcome ? [input.outcome ?? null] : []),
+        ...(setCode ? [input.userFailureCode ?? null] : []),
         now,
         input.userId,
         input.sessionId,

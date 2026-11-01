@@ -27,6 +27,8 @@ import {
   ModelAuthorityError,
   TURN_DISPATCH_STATE_PATH,
   TURN_TAPE_STATE_PATH,
+  attachmentTotalExceededFailureCode,
+  parseAttachmentTotalExceeded,
   computeDispatchRequestHash,
   parseAuthorityKeyring,
   verifyDispatchAuthority,
@@ -394,13 +396,20 @@ export function inboxSinkStageFailed(
  * INSERT queued 成功后任何 enqueue/beginClientTurn 异常必须走这里(不留给 boot);
  * boot recovery 对残留 queued 也用它收敛。
  */
-export function inboxReject(key: LogicalKey, now?: number): Promise<TurnDispatchInboxRow | null> {
+export function inboxReject(
+  key: LogicalKey,
+  now?: number,
+  userFailureCode?: string,
+): Promise<TurnDispatchInboxRow | null> {
+  const parsed = parseAttachmentTotalExceeded(userFailureCode)
+  const canonical = parsed ? attachmentTotalExceededFailureCode(parsed.totalBytes) : undefined
   return casTurnDispatchState({
     ...key,
     fromStates: ['queued'],
     toState: 'rejected',
     outcome: 'not_accepted',
     ...(now !== undefined ? { now } : {}),
+    ...(canonical ? { userFailureCode: canonical } : {}),
   })
 }
 
@@ -773,6 +782,8 @@ export async function runDurableDispatchAdmission(input: {
   dispatch: () => Promise<void>
   onAdmitError?: (err: unknown) => void
   onOrphanRejectError?: (err: unknown) => void
+  /** Read after dispatch returns. Only an attachment-total code is stored. */
+  userFailureCode?: () => string | undefined
 }): Promise<DurableDispatchAdmissionResult> {
   const { ctx } = input
   markTurnDispatchLive(ctx.dispatchId, ctx.attemptNo)
@@ -798,11 +809,15 @@ export async function runDurableDispatchAdmission(input: {
     await input.dispatch()
   } finally {
     try {
-      await inboxReject({
-        userId: ctx.uid,
-        sessionId: ctx.sessionId,
-        clientMessageId: ctx.clientMessageId,
-      })
+      await inboxReject(
+        {
+          userId: ctx.uid,
+          sessionId: ctx.sessionId,
+          clientMessageId: ctx.clientMessageId,
+        },
+        undefined,
+        input.userFailureCode?.(),
+      )
     } catch (err) {
       input.onOrphanRejectError?.(err)
     } finally {
@@ -994,6 +1009,7 @@ export interface RejectIfAbsentResult {
   inserted: boolean
   state: TurnDispatchInboxState | null
   outcome: TurnDispatchInboxOutcome | null
+  userFailureCode?: string
   /** MINOR ①:逻辑键不存在但 (dispatch_id, attempt_no) 撞了**别的**逻辑键(master 契约破坏)。
    *  为 true 时 inserted=false 且 state/outcome=null —— 调用方据此明确判"未插墓碑因身份冲突",
    *  绝不误当作"已落 negative proof"。 */
@@ -1024,11 +1040,13 @@ export async function rejectTurnDispatchIfAbsent(input: {
     payloadHash: '',
     ...(input.now !== undefined ? { now: input.now } : {}),
   })
+  const parsed = parseAttachmentTotalExceeded(res.row?.userFailureCode)
   return {
     inserted: res.inserted,
     state: res.row?.state ?? null,
     outcome: res.row?.outcome ?? null,
     conflict: res.conflict ?? false,
+    ...(parsed ? { userFailureCode: attachmentTotalExceededFailureCode(parsed.totalBytes) } : {}),
   }
 }
 
@@ -1053,6 +1071,8 @@ export interface TurnDispatchStateResponse {
   outcome: TurnDispatchInboxOutcome | null
   dispatchId: string | null
   attemptNo: number | null
+  /** Present only for an attachment-total rejection. Omitted otherwise so old clients stay compatible. */
+  userFailureCode?: string
 }
 
 /**
@@ -1065,13 +1085,16 @@ export interface TurnDispatchStateResponse {
 export function buildTurnDispatchStateResponse(
   row: TurnDispatchInboxRow | null,
 ): TurnDispatchStateResponse {
-  return {
+  const body: TurnDispatchStateResponse = {
     found: row !== null,
     state: row?.state ?? 'absent',
     outcome: row?.outcome ?? null,
     dispatchId: row?.dispatchId ?? null,
     attemptNo: row?.attemptNo ?? null,
   }
+  const parsed = parseAttachmentTotalExceeded(row?.userFailureCode)
+  if (parsed) body.userFailureCode = attachmentTotalExceededFailureCode(parsed.totalBytes)
+  return body
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1110,7 @@ export interface TurnDispatchReceiptFrame {
   state: TurnDispatchInboxState | null
   outcome: TurnDispatchInboxOutcome | null
   ts: number
+  userFailureCode?: string
 }
 
 /**
@@ -1096,9 +1120,10 @@ export interface TurnDispatchReceiptFrame {
  */
 export function buildTurnDispatchReceiptFrame(
   ctx: Pick<DispatchTurnContext, 'dispatchId' | 'attemptNo' | 'sessionId' | 'clientMessageId'>,
-  row: Pick<TurnDispatchInboxRow, 'state' | 'outcome'> | null | undefined,
+  row: Pick<TurnDispatchInboxRow, 'state' | 'outcome' | 'userFailureCode'> | null | undefined,
   ts: number,
 ): TurnDispatchReceiptFrame {
+  const parsed = parseAttachmentTotalExceeded(row?.userFailureCode)
   return {
     type: 'outbound.control.turn_dispatch_receipt',
     dispatchId: ctx.dispatchId,
@@ -1108,5 +1133,6 @@ export function buildTurnDispatchReceiptFrame(
     state: row?.state ?? null,
     outcome: row?.outcome ?? null,
     ts,
+    ...(parsed ? { userFailureCode: attachmentTotalExceededFailureCode(parsed.totalBytes) } : {}),
   }
 }
