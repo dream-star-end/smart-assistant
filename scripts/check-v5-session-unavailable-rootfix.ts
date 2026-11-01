@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertPreparationLaneCoverage } from './lib/preparationLaneCoverage.js'
-import { assertTurnDispatchReceiptCoverage } from './lib/turnDispatchReceiptCoverage.js'
+import { assertRejectedDispatchFailureHelper, assertTurnDispatchReceiptCoverage } from './lib/turnDispatchReceiptCoverage.js'
 
 const root = process.cwd()
 const bridge = readFileSync(join(root, 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
@@ -77,6 +77,8 @@ if (bridge.includes('terminalizeAllEnriching("client_disconnected_before_enrichm
 assertPreparationLaneCoverage(bridge)
 assertTurnDispatchReceiptCoverage(bridge,
   readFileSync(join(root, 'packages/commercial/src/ws/turnDispatchReceipt.ts'), 'utf8'))
+assertRejectedDispatchFailureHelper(
+  readFileSync(join(root, 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8'))
 for (const marker of [
   'getExecutors: () => availableExecutors(uidToCronOriginExecutors.get(input.uid.toString()))',
   'if (admit.kind === "already_owned") return { kind: "in_flight" };',
@@ -834,13 +836,17 @@ await runTapProof({
     'rejects a lost durable rejection convergence',
     'rejects a definitive container rejection being released to the same recovery identity',
     'rejects weakening a terminal rejection into a different recovery outcome',
+    'still accepts the historical terminal failure code literal',
+    'rejects an attachment helper call that does not forward the receipt code',
+    'accepts the production attachment-total failure helper',
+    'rejects a helper that returns an arbitrary string',
     'rejects an enrichment fence that no longer stops a terminalized turn',
     'rejects malformed source instead of accepting a partial parse',
   ],
   label: 'turn-dispatch-receipt-coverage',
   timeoutMs: 120_000,
 })
-console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 13 exact cases')
+console.log('[turn-dispatch-receipt-coverage] PASS — extracted receipt wiring, rejection convergence and enrichment fence; 17 exact cases')
 
 await runTapProof({
   fromRoot: candidateRoot,
