@@ -167,7 +167,8 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
         'state-format-version',
       )
       requireRemote(
-        initialApplication === 0 || initialApplication === APPLICATION_ID,
+        (initialVersion === 0 && initialApplication === 0) ||
+          (initialVersion === FORMAT_VERSION && initialApplication === APPLICATION_ID),
         'state-application-id',
       )
       if (initialVersion === 0) {
@@ -187,7 +188,8 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
           const applicationId = this.database.pragma('application_id', { simple: true })
           requireRemote(version === 0 || version === FORMAT_VERSION, 'state-format-version')
           requireRemote(
-            applicationId === 0 || applicationId === APPLICATION_ID,
+            (version === 0 && applicationId === 0) ||
+              (version === FORMAT_VERSION && applicationId === APPLICATION_ID),
             'state-application-id',
           )
           if (version === 0) {
