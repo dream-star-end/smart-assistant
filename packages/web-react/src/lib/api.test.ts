@@ -1272,6 +1272,29 @@ function uploadFileBlob(name = 'probe.txt'): File {
   return new File(['probe'], name, { type: 'text/plain' })
 }
 
+test('uploadFile does not upload under another identity while the transport loads', async () => {
+  const fetchMock = vi.fn(async () => ok({ url: '/api/media/probe.txt' }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-loading')
+  const pending = api.uploadFile(session, uploadFileBlob())
+  session.beginIdentity()
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+  expect(fetchMock).not.toHaveBeenCalled()
+})
+
+test('uploadFile does not initialize a chunked upload under another identity while its client loads', async () => {
+  const { uploadFile } = await import('./api/uploadClient')
+  const fetchMock = vi.fn(async () => ok({ uploadId: 'a'.repeat(32) }))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-chunk-loading')
+  const file = uploadFileBlob('large.bin')
+  Object.defineProperty(file, 'size', { value: 200 * 1024 * 1024 })
+  const pending = uploadFile(session, file)
+  session.beginIdentity()
+  await expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+  expect(fetchMock).not.toHaveBeenCalled()
+})
+
 test('uploadFile retries 503 then succeeds', async () => {
   vi.useFakeTimers()
   let calls = 0
@@ -1283,6 +1306,7 @@ test('uploadFile retries 503 then succeeds', async () => {
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
   const { session } = makeSession('tok-upload-503-ok')
   const pending = api.uploadFile(session, uploadFileBlob())
+  await vi.dynamicImportSettled()
   await vi.runAllTimersAsync()
   await expect(pending).resolves.toMatchObject({ url: '/api/media/probe.txt', digest: 'abc' })
   expect(fetchMock).toHaveBeenCalledTimes(4)
@@ -1296,9 +1320,11 @@ test('uploadFile never retries under another identity after a 503 backoff', asyn
   const { session } = makeSession('tok-upload-switch')
   const pending = api.uploadFile(session, uploadFileBlob())
   const expectation = expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+  await vi.dynamicImportSettled()
   await vi.advanceTimersByTimeAsync(0)
   expect(fetchMock).toHaveBeenCalledTimes(1)
   session.beginIdentity() // logout + login as someone else during the backoff
+  await vi.dynamicImportSettled()
   await vi.runAllTimersAsync()
   await expectation
   expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -1314,6 +1340,7 @@ test('uploadFile throws after exhausting 503 retries', async () => {
     status: 503,
     code: 'UNAVAILABLE',
   })
+  await vi.dynamicImportSettled()
   await vi.runAllTimersAsync()
   await expectation
   expect(fetchMock).toHaveBeenCalledTimes(3)
@@ -1344,6 +1371,7 @@ test('uploadFile honors Retry-After seconds and clamps to [1, 10]', async () => 
 
   const fetchMock = await runQueued([uploadUnavailable(7), ok({ url: '/api/media/probe.txt' })])
   const pending = api.uploadFile(makeSession('tok-upload-retry-after').session, uploadFileBlob())
+  await vi.dynamicImportSettled()
   await vi.advanceTimersByTimeAsync(0)
   expect(fetchMock).toHaveBeenCalledTimes(1)
   await vi.advanceTimersByTimeAsync(6999)
@@ -1354,6 +1382,7 @@ test('uploadFile honors Retry-After seconds and clamps to [1, 10]', async () => 
 
   const clampMock = await runQueued([uploadUnavailable(99), ok({ url: '/api/media/clamped.txt' })])
   const pendingClamp = api.uploadFile(makeSession('tok-upload-clamp').session, uploadFileBlob())
+  await vi.dynamicImportSettled()
   await vi.advanceTimersByTimeAsync(0)
   expect(clampMock).toHaveBeenCalledTimes(1)
   await vi.advanceTimersByTimeAsync(9_999)
