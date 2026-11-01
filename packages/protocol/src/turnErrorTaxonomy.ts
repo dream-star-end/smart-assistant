@@ -553,6 +553,125 @@ export function supportsAutomaticRecoveryWithoutCheckpoint(code: string): boolea
     PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES.has(normalized)
 }
 
+/** Model-plane failures that can be an upstream rejection of the first call.
+ * Runner-loss and silent-stall codes stay out: an empty tape after a crash
+ * does not prove that no tool ran. */
+const EMPTY_EXECUTION_REPLAY_CODES: ReadonlySet<string> = new Set([
+  'engine_error',
+  'rate_limited',
+  'upstream_failed',
+  'upstream_error',
+  'upstream_timeout',
+  'network_error',
+  'model_capacity',
+])
+
+/** Box CLI names for "the upstream refused before any model output". The
+ * gateway often rewrites these to engine_error; either form is the same fact. */
+const EMPTY_EXECUTION_RAW_CODES: ReadonlySet<string> = new Set([
+  'BOX_CLI_UPSTREAM_REFUSED',
+  'BOX_CLI_UPSTREAM_RATE_LIMITED',
+  'BOX_UPSTREAM_REFUSED',
+  'BOX_UPSTREAM_RATE_LIMITED',
+])
+
+const TOOL_USE_PAYLOAD = /["']?(?:kind|type)["']?\s*[:=]\s*["']tool_use\b/i
+
+function isSyntheticOrTerminalErrorRow(row: Record<string, unknown>): boolean {
+  if (row._isError === true) return true
+  if (typeof row._errorCode === 'string' || typeof row.errorCode === 'string') return true
+  if (row.is_api_error_message === true) return true
+  if (row.model === '<synthetic>') return true
+  const message = row.message
+  if (message && typeof message === 'object' && !Array.isArray(message)) {
+    const nested = message as Record<string, unknown>
+    if (nested.model === '<synthetic>') return true
+    if (nested.is_api_error_message === true) return true
+  }
+  return isCliApiErrorRow(row)
+}
+
+/** True only when every record is noise from a refusal: no tool, delegate,
+ * permission, real assistant/thinking text, or this-turn token. A string that
+ * merely looks like a tool_use payload fails closed. `modelUsage` is the CLI
+ * session total and is ignored, same as OCV5-571. */
+function provenNoToolNoOutput(records: readonly unknown[]): boolean {
+  let executed = false
+  const seen = new Set<unknown>()
+  const visit = (value: unknown, underRealAssistant: boolean): void => {
+    if (executed) return
+    if (typeof value === 'string') {
+      if (TOOL_USE_PAYLOAD.test(value)) executed = true
+      return
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, underRealAssistant)
+      return
+    }
+    const row = value as Record<string, unknown>
+    const role = typeof row.role === 'string' ? row.role : ''
+    const kind = typeof row.kind === 'string' ? row.kind : ''
+    const type = typeof row.type === 'string' ? row.type : ''
+    if (
+      role === 'tool' || role === 'agent-group' || role === 'delegate-progress' || role === 'permission' ||
+      kind === 'tool_use' || type === 'tool_use' || kind === 'tool_result' || type === 'tool_result' ||
+      kind === 'permission' || type === 'permission'
+    ) {
+      executed = true
+      return
+    }
+    const synthetic = isSyntheticOrTerminalErrorRow(row)
+    const realAssistant = !synthetic && (
+      role === 'assistant' || role === 'thinking' || kind === 'thinking' || type === 'thinking'
+    )
+    if (
+      (underRealAssistant || realAssistant) &&
+      typeof row.text === 'string' && row.text.trim().length > 0
+    ) {
+      executed = true
+      return
+    }
+    const nextReal = underRealAssistant || realAssistant
+    for (const [key, nested] of Object.entries(row)) {
+      if (key === 'modelUsage') continue
+      if (
+        TURN_USAGE_TOKEN_KEY.test(key) &&
+        typeof nested === 'number' && Number.isFinite(nested) && nested > 0
+      ) {
+        executed = true
+        return
+      }
+      visit(nested, nextReal)
+    }
+  }
+  for (const record of records) visit(record, false)
+  return !executed
+}
+
+/**
+ * Resend the user's original text only when this turn provably executed
+ * nothing. Callers that can see `usage_records` must pass
+ * `hasSuccessfulUpstreamUsage` (this function cannot read the database).
+ * A recovery child is not rewritten: its text is already a continuation, and
+ * the parent may have run tools. Runner-loss codes never match.
+ */
+export function shouldReplayOriginalAfterEmptyExecution(input: {
+  errorCode: string
+  records: readonly unknown[]
+  sourceIsAutomaticRecovery?: boolean
+  hasSuccessfulUpstreamUsage?: boolean
+}): boolean {
+  if (input.sourceIsAutomaticRecovery === true) return false
+  if (input.hasSuccessfulUpstreamUsage === true) return false
+  const raw = String(input.errorCode ?? '').trim()
+  const normalized = normalizeTurnErrorCode(raw)
+  const codeMatches = EMPTY_EXECUTION_REPLAY_CODES.has(normalized) || EMPTY_EXECUTION_RAW_CODES.has(raw)
+  if (!codeMatches) return false
+  return provenNoToolNoOutput(input.records)
+}
+
 function stableTurnRecoveryHash(value: string): string {
   let hash = 0xcbf29ce484222325n
   for (let i = 0; i < value.length; i++) {

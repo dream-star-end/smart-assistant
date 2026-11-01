@@ -12,6 +12,7 @@ import {
   shouldResetNativeSessionForRecovery,
   maxAutomaticTurnRetryAttempt,
   supportsAutomaticRecoveryWithoutCheckpoint,
+  shouldReplayOriginalAfterEmptyExecution,
   supportsAutomaticTurnRecovery,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
@@ -380,5 +381,121 @@ describe('automatic turn recovery policy', () => {
       mode: 'checkpoint',
       checkpointSafe: true,
     })
+  })
+})
+
+describe('shouldReplayOriginalAfterEmptyExecution', () => {
+  const synthetic = {
+    role: 'assistant',
+    model: '<synthetic>',
+    is_api_error_message: true,
+    text: "You've hit your weekly limit",
+    usage: { input_tokens: 0, output_tokens: 0 },
+  }
+  const runtime = { role: 'runtime-event', text: 'upstream refused', _completed: true }
+
+  it('resends the original text when an engine_error tape is only a synthetic refusal', () => {
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'ENGINE_ERROR',
+      records: [synthetic, runtime],
+    }), true)
+    assert.equal(assessTurnRecoveryTape([synthetic, runtime]).mode, 'checkpoint')
+  })
+
+  it('accepts the Box refusal code even when the gateway has not normalized it', () => {
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'BOX_CLI_UPSTREAM_REFUSED',
+      records: [{ role: 'assistant', text: 'API Error: 503 upstream refused' }],
+    }), true)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'BOX_CLI_UPSTREAM_RATE_LIMITED',
+      records: [],
+    }), true)
+  })
+
+  it('does not replay when a tool, permission, real answer, or this-turn tokens exist', () => {
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [synthetic, { role: 'tool', toolName: 'Bash', _completed: true }],
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [synthetic, { role: 'permission', _resolved: false }],
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'rate_limited',
+      records: [{ role: 'assistant', text: 'partial answer' }],
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [{ role: 'thinking', text: 'planned the deploy' }],
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [synthetic, { usage: { output_tokens: 12 } }],
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [synthetic, { modelUsage: { output_tokens: 52000 } }],
+    }), true)
+  })
+
+  it('fails closed on a stringified tool_use payload', () => {
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [{ role: 'runtime-event', text: '{"type":"tool_use","name":"Bash"}' }],
+    }), false)
+  })
+
+  it('does not replay runner-loss, a recovery child, or a turn that already billed output', () => {
+    for (const errorCode of ['runner_crashed', 'service_restart', 'no_response', 'phantom_turn', 'idle_timeout', 'liveness_timeout']) {
+      assert.equal(shouldReplayOriginalAfterEmptyExecution({ errorCode, records: [] }), false, errorCode)
+    }
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [],
+      sourceIsAutomaticRecovery: true,
+    }), false)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [],
+      hasSuccessfulUpstreamUsage: true,
+    }), false)
+  })
+
+  it('resends the original text for a CLI session-limit record', () => {
+    const cli = {
+      type: 'assistant',
+      message: {
+        model: '<synthetic>',
+        role: 'assistant',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+        content: [{ type: 'text', text: "You've hit your session limit · resets 11:20pm (Asia/Taipei)" }],
+      },
+      error: 'rate_limit',
+      is_api_error_message: true,
+    }
+    const event = { type: 'rate_limit_event', status: 'rejected' }
+    const result = { type: 'result', subtype: 'error_during_execution', is_error: true }
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'ENGINE_ERROR',
+      records: [event, cli, result],
+    }), true)
+    assert.equal(assessTurnRecoveryTape([event, cli, result]).mode, 'replay')
+    const withRuntime = [cli, { role: 'runtime-event', text: 'upstream refused' }]
+    assert.equal(assessTurnRecoveryTape(withRuntime).mode, 'checkpoint')
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: withRuntime,
+    }), true)
+    assert.equal(shouldReplayOriginalAfterEmptyExecution({
+      errorCode: 'engine_error',
+      records: [{ role: 'assistant', message: { content: [{ type: 'text', text: 'partial answer' }] } }],
+    }), false)
+  })
+
+  it('keeps the pre-execution allowlist unchanged', () => {
+    assert.equal(supportsAutomaticRecoveryWithoutCheckpoint('engine_error'), false)
+    assert.equal(supportsAutomaticRecoveryWithoutCheckpoint('model_authority_unavailable'), true)
   })
 })

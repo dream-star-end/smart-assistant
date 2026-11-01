@@ -41,6 +41,7 @@ import {
   safeMessageSignature,
 } from "../lib/chat/render";
 import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { collectAutomaticRecoveredSourceIds, recoveryFailureIsPresentedBelow } from "../lib/chat/recoveryFailureOutlet";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import { collectRecoveredTurnStatusRecordIds } from "../lib/chat/manualTaskContinuation";
 import {
@@ -2177,6 +2178,7 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
+  const automaticRecoveredSourceIds = collectAutomaticRecoveredSourceIds(safeMessages);
   // OCV5-307: the user acted on a committed card by clicking 从断点继续. While
   // that manual continuation runs (or after it finished) the card is resolved,
   // not a live failure; leaving it up showed 任务执行失败 + 重新尝试 next to
@@ -2283,6 +2285,16 @@ export function MessageList({
   // A manual child has taken over this failure even when its retired assistant
   // card is no longer visible. Do not resurrect the old user's failed-send CTA.
   for (const sourceId of manuallyContinuedSourceIds) presentedErrorTurnIds.add(visibleErrorTurnId(sourceId));
+  const renderableIds = new Set(renderableMessages.map((message) => message.id));
+  const failureIsPresentedBelow = (message: ChatMessage): boolean =>
+    recoveryFailureIsPresentedBelow({
+      message,
+      presentedErrorTurnIds,
+      automaticRecoveredSourceIds,
+      safeMessages,
+      renderableIds,
+      visibleErrorTurnId,
+    });
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,
@@ -2701,7 +2713,7 @@ export function MessageList({
   };
   const singleRowSig = (it: Extract<LeafRenderItem, { kind: "single" }>): string => {
     const turnFinalAssistant = actionRowFinal[it.idx] ?? false;
-    const failurePresentedBelow = it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
+    const failurePresentedBelow = failureIsPresentedBelow(it.m);
     return `${safeMessageSignature(it.m, {
       isLast: it.isLast,
       sending,
@@ -2813,8 +2825,7 @@ export function MessageList({
       );
     }
     const turnFinalAssistant = actionRowFinal[it.idx] ?? false;
-    const failurePresentedBelow =
-      it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
+    const failurePresentedBelow = failureIsPresentedBelow(it.m);
     const rowId = it.m._timelineUnitKey ?? it.m.id;
     let rowSig: string;
     try {

@@ -2424,7 +2424,12 @@ export class ChatSocket {
     const source = sess.messages.find(
       (message) => message.role === "user" && message.id === recovery.sourceClientMessageId,
     );
-    if (source) source._automaticRecoveryAttempted = true;
+    if (source) {
+      source._automaticRecoveryAttempted = true;
+      // The recovery child owns the turn. Leaving status "error" paints 发送失败
+      // on the original bubble once the source error card is hidden.
+      if (source.status === "error") source.status = "sent";
+    }
     const routing: ChatRoutingSnapshot = {
       ...(source?._routing ?? sess._lastRouting ?? {}),
       ...(recovery.model ? { model: recovery.model } : {}),
@@ -2902,6 +2907,27 @@ export class ChatSocket {
     }
   }
 
+  /** Adopt marks a failed source as sent so the bubble does not say 发送失败
+   * while an automatic child is in flight. A skip removes that child; if the
+   * source error is still on the tape, the failure outlet comes back. */
+  private restoreFailedSourceAfterSkippedRecovery(sess: ChatSession, sourceClientMessageId: string | undefined): void {
+    if (!sourceClientMessageId) return;
+    const sourceUser = sess.messages.find((message) =>
+      message.role === "user" && message.id === sourceClientMessageId);
+    if (!sourceUser || sourceUser.status !== "sent" || sourceUser._automaticRecoveryAttempted !== true) return;
+    const childLeft = sess.messages.some((message) =>
+      message.role === "user" &&
+      message._automaticRecovery === true &&
+      (message._recoveryOfClientMessageId === sourceClientMessageId ||
+        message._continuationOfClientMessageId === sourceClientMessageId));
+    if (childLeft) return;
+    const failed = sess.messages.some((message) =>
+      message.role === "assistant" &&
+      message._clientMessageId === sourceClientMessageId &&
+      !!message._errorCode);
+    if (failed) sourceUser.status = "error";
+  }
+
   /** Atomic master lineage rejection: remove only the deterministic recovery
    * child. The original user/process/error tape remains untouched and visible. */
   private reconcileSkippedRecovery(frame: AckWire): boolean {
@@ -2962,6 +2988,7 @@ export class ChatSocket {
     const userIndex = sess.messages.findIndex((message) =>
       message.id === clientMessageId && isRecoveryControlUserTurn(message));
     if (userIndex < 0) {
+      this.restoreFailedSourceAfterSkippedRecovery(sess, sourceClientMessageId);
       this.deps.persistSession?.(sessId);
       this.scheduleNotify();
       return sourceClientMessageId !== undefined;
@@ -2982,6 +3009,7 @@ export class ChatSocket {
         clientMessageId: sourceClientMessageId,
       }, this.effects());
     }
+    this.restoreFailedSourceAfterSkippedRecovery(sess, sourceClientMessageId);
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
     return true;
@@ -4926,7 +4954,13 @@ export class ChatSocket {
         if (kind === "completed") {
           userRow.status = "replied";
         } else if (kind === "error" && userRow.status !== "replied") {
-          userRow.status = "error";
+          const automaticChild = s.messages.some((m) =>
+            m.role === "user" &&
+            m._automaticRecovery === true &&
+            (m._recoveryOfClientMessageId === cmid || m._continuationOfClientMessageId === cmid));
+          // REST reconciliation arrives after adopt and would stamp the source
+          // back to error. An automatic child already took the turn.
+          userRow.status = automaticChild ? "sent" : "error";
         } else if (userRow.status !== "replied") {
           // A service restart happened after durable admission. It belongs on
           // the turn status card, never on the user's transport state.

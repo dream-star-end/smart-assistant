@@ -586,6 +586,13 @@ const C_FULL_LEAVES = [
   'refuses SERVICE_RESTART recovery when the turn already billed successful usage',
   'keeps the ordinary retry budget once model, tool, or token progress exists',
   'derives checkpoint safety from exact process and external-action states',
+  'resends the original text when an engine_error tape is only a synthetic refusal',
+  'accepts the Box refusal code even when the gateway has not normalized it',
+  'does not replay when a tool, permission, real answer, or this-turn tokens exist',
+  'fails closed on a stringified tool_use payload',
+  'does not replay runner-loss, a recovery child, or a turn that already billed output',
+  'resends the original text for a CLI session-limit record',
+  'keeps the pre-execution allowlist unchanged',
 ] as const
 
 const C_SESSION_DELETED_LEAVES = [

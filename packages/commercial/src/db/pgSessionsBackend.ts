@@ -76,6 +76,7 @@ import {
   shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
+  shouldReplayOriginalAfterEmptyExecution,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
@@ -2305,15 +2306,28 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // prompt requires observable-state verification before any repeated write.
   // Exact replay remains fail-closed and is never inferred from a completed
   // tape whose header contradicts its terminal error record.
-  if (status === "completed" && assessment.mode !== "checkpoint") {
-    return done(declined("completed_without_checkpoint", errorCode));
-  }
   const recoveryRecords = input.turn.records.map((record) => record.payload);
   const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
     client,
     input.uid,
     input.turn.payload.turnKey,
   );
+  // A synthetic refusal or a runtime event makes the tape look like a
+  // checkpoint, so the continuation prompt would replace the user's text.
+  // Replay the original only when this turn provably ran nothing. A completed
+  // tape that assesses as replay stays fail-closed below: emptiness after
+  // "completed" is not proof that no write happened. Do not set
+  // resetNativeSession here; that flag is only for silent stalls and would
+  // drop the conversation the user already had.
+  const emptyOriginalReplay = shouldReplayOriginalAfterEmptyExecution({
+    errorCode,
+    records: [...recoveryRecords, ...leftoverRecords],
+    sourceIsAutomaticRecovery: source._automaticRecovery === true,
+    hasSuccessfulUpstreamUsage,
+  });
+  if (status === "completed" && assessment.mode !== "checkpoint") {
+    return done(declined("completed_without_checkpoint", errorCode));
+  }
   if (shouldDeclineLiveServiceRestartRecovery({
     errorCode,
     records: recoveryRecords,
@@ -2322,9 +2336,11 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   })) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
+  const replayOverSyntheticCheckpoint = emptyOriginalReplay && assessment.mode === "checkpoint";
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
+    !replayOverSyntheticCheckpoint &&
     !allowUnsafeAutomaticCheckpoint({
       status,
       errorCode,
@@ -2336,6 +2352,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   }
   if (
     assessment.mode === "replay" &&
+    !emptyOriginalReplay &&
     (
       !assessment.checkpointSafe ||
       !recoveryWithoutCheckpointIsProven(errorCode)
@@ -2343,7 +2360,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   ) {
     return done(declined("replay_not_proven", errorCode));
   }
-  const mode = assessment.mode;
+  const mode = replayOverSyntheticCheckpoint ? "replay" : assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
     ? source._automaticRecoveryRootClientMessageId
     : source._automaticRecovery === true && isClientMessageId(source._recoveryOfClientMessageId)
@@ -9062,13 +9079,30 @@ export function createPgSessionsBackend(
               if (!supportsAutomaticTurnRecovery(finalizedErrorCode)) {
                 return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }
+              const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
+                client,
+                input.uid,
+                typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
+              );
+              // Same proof the scheduler used. A client that asks to replay a
+              // real checkpoint (tools or output) is still rejected. A
+              // completed tape that assesses as replay is never promoted.
+              const emptyOriginalReplay = input.recovery.automatic === true &&
+                input.recovery.mode === "replay" &&
+                shouldReplayOriginalAfterEmptyExecution({
+                  errorCode: finalizedErrorCode,
+                  records: [...records, ...leftoverRecords],
+                  sourceIsAutomaticRecovery: latestUser._automaticRecovery === true,
+                  hasSuccessfulUpstreamUsage,
+                });
+              const replayOverSyntheticCheckpoint = emptyOriginalReplay && assessment.mode === "checkpoint";
               if (
                 finalized.status === "completed" &&
                 assessment.mode !== "checkpoint"
               ) {
                 return { kind: "recovery_conflict", reason: "completed_replay_forbidden" };
               }
-              if (assessment.mode !== input.recovery.mode) {
+              if (assessment.mode !== input.recovery.mode && !replayOverSyntheticCheckpoint) {
                 return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
               }
               if (
@@ -9077,11 +9111,7 @@ export function createPgSessionsBackend(
                   errorCode: finalizedErrorCode,
                   records,
                   leftoverRecords,
-                  hasSuccessfulUpstreamUsage: await sessionTurnHasSuccessfulUsage(
-                    client,
-                    input.uid,
-                    typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
-                  ),
+                  hasSuccessfulUpstreamUsage,
                 })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
@@ -9090,6 +9120,7 @@ export function createPgSessionsBackend(
                 input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
+                !replayOverSyntheticCheckpoint &&
                 !allowUnsafeAutomaticCheckpoint({
                   status: finalized.status,
                   errorCode: finalizedErrorCode,
@@ -9101,6 +9132,7 @@ export function createPgSessionsBackend(
               }
               if (
                 assessment.mode === "replay" &&
+                !emptyOriginalReplay &&
                 (
                   !assessment.checkpointSafe ||
                   !recoveryWithoutCheckpointIsProven(finalizedErrorCode)
