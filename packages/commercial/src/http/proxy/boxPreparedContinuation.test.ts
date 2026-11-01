@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { authoritiesBind, classifyBoxContinuation, consumePrepared, decisionMayPublish,
-  prepareBoxContinuation, preparedMatchesBody, projectAuthority, resumeMayPublish,
-  trustedIdentitiesBind } from "./boxPreparedContinuation.js";
+  prepareBoxContinuation, preparedMatchesBody, projectAuthority, rawBoundarySha256,
+  resumeMayPublish, trustedIdentitiesBind } from "./boxPreparedContinuation.js";
 import { fingerprintOfPrepared } from "./boxCallFingerprint.js";
 import { matchPreparedToolResults } from "./boxToolResultMatcher.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
@@ -139,4 +140,39 @@ test("one prepared view stays stable and is what claim would consume", () => {
   assert.equal(consumed.fingerprint, prepared.fingerprint);
   assert.throws(() => matchPreparedToolResults({ effectiveBody: null }, []),
     /BOX_TOOL_RESULT_CONTEXT_INVALID/);
+});
+
+test("raw boundary bytes match the sorted stable JSON of the pinned body", () => {
+  function legacyStableJson(value: unknown): string {
+    if (value === null || typeof value === "boolean" || typeof value === "string"
+      || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map((item) => legacyStableJson(item)).join(",")}]`;
+    if (!value || typeof value !== "object") return JSON.stringify(null);
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${legacyStableJson(record[key])}`).join(",")}}`;
+  }
+  const payload = `${"A".repeat(1500)}+/=`;
+  const hole: unknown[] = ["a"];
+  hole.length = 3;
+  hole[2] = "c";
+  const pinned = {
+    model: "m",
+    stream: false,
+    max_tokens: 3,
+    messages: [{ role: "user", content: payload }],
+    tools: [{ name: "Z" }, { name: "A" }],
+    tool_choice: { type: "auto", extra: undefined },
+    system: "say \"hi\" \\ slash",
+    thinking: null,
+    output_config: { b: 1, a: "雪", hole, bad: Number.NaN },
+    metadata: { ok: true },
+  };
+  const body = pinned as ProxyBody;
+  const expect = createHash("sha256").update("ocv5-prepared-raw-v1\0")
+    .update(legacyStableJson(pinned)).digest("hex");
+  assert.equal(rawBoundarySha256(body), expect);
+  assert.equal(rawBoundarySha256(body), expect);
+  const changed = { ...pinned, messages: [{ role: "user", content: "B".repeat(1500) }] } as ProxyBody;
+  assert.notEqual(rawBoundarySha256(changed), expect);
 });

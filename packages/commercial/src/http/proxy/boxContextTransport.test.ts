@@ -136,3 +136,38 @@ test("cache entry count is bounded and older references can be re-registered", a
   });
 });
 
+test("an extended prefix stays canonical JSON after edits and key reordering", async () => {
+  await fixture(async (dir) => {
+    const store = new FileBoxContextTransport(dir);
+    const payload = "A".repeat(2048);
+    const prefix = [{ role: "user", content: payload, n: 1 }];
+    const first = await store.put(binding, prefix);
+    assert.equal(first.messages_sha256, sha(JSON.stringify(prefix)));
+    const grown = [...prefix, { role: "user", content: "tail", note: "雪" }];
+    const second = await store.put(binding, grown);
+    assert.equal(second.messages_sha256, sha(JSON.stringify(grown)));
+    const fresh = new FileBoxContextTransport(dir);
+    assert.equal(JSON.stringify(await fresh.get(binding, second.reference)), JSON.stringify(grown));
+    assert.deepEqual(await store.get(binding, second.reference), grown);
+    prefix[0]!.n = 9;
+    const edited = [...prefix, { role: "user", content: "after-edit" }];
+    const third = await store.put(binding, edited);
+    assert.equal(third.messages_sha256, sha(JSON.stringify(edited)));
+    const text = "B".repeat(2048);
+    const ordered = [{ b: 1, a: text }];
+    await store.put(binding, ordered);
+    const reordered = [{ a: text, b: 1 }, { c: true }];
+    const fourth = await store.put(binding, reordered);
+    assert.equal(fourth.messages_sha256, sha(JSON.stringify(reordered)));
+    const live = [{ role: "user", content: "a" }];
+    await store.put(binding, live);
+    live.push({ role: "user", content: "b" });
+    const pushed = await store.put(binding, live);
+    assert.equal(pushed.messages_sha256, sha(JSON.stringify(live)));
+    const body = { model: binding.model, stream: false, max_tokens: 16, messages: grown,
+      metadata: { user_id: "x" } };
+    assert.equal(store.bodyUtf8Bytes(binding, body), Buffer.byteLength(JSON.stringify(body)));
+    const changed = { ...body, messages: edited };
+    assert.equal(store.bodyUtf8Bytes(binding, changed), Buffer.byteLength(JSON.stringify(changed)));
+  });
+});

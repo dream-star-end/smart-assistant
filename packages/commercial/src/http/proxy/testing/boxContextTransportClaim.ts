@@ -8,10 +8,15 @@ import { hashBoxToolInput } from "../boxToolInputHash.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "../boxCallFingerprint.js";
 import type { ProxyBody } from "../shared.js";
+import { memoPureBody } from "../boxPureMemo.js";
 
 type Db = { query: (sql: string, params?: unknown[]) => Promise<any> };
 /** Independent oracle for the candidate body's actual media, not production's digest helper. */
 function expectedImageIdentity(body: ProxyBody) {
+  return memoPureBody(body, "oracle-image", () => expectedImageIdentityUncached(body));
+}
+
+function expectedImageIdentityUncached(body: ProxyBody) {
   const rows: string[] = [];
   let mediaBytes = 0;
   const visit = (value: unknown): void => {

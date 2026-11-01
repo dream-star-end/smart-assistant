@@ -9,6 +9,7 @@ import {
   extractSessionId, enforceTotalBodyBudget, proxyBodySchema,
   type ProxyBody, type ProxyByteBudget, PROXY_BYTE_BUDGET_BOX_NATIVE_V1, MAX_MESSAGES_COUNT,
 } from "./shared.js";
+import { jsonIdentityStamp, proxyBodyUtf8Bytes, stampsEqual, type JsonStamp } from "./boxPureMemo.js";
 
 const MAX_BYTES = PROXY_BYTE_BUDGET_BOX_NATIVE_V1.totalBody;
 const GLOBAL_BYTES = 768 * 1024 * 1024;
@@ -72,8 +73,50 @@ function validHeader(raw: unknown): raw is Header {
 /** The root is a private child of the already configured Box replay directory.
  * A kernel flock serializes quotas across old/new egress processes at cutover.
  * It uses a no-follow parent-opened FD, never a shell-interpolated path. */
+type HotPrefix = {
+  key: string;
+  reference: string;
+  sha256: string;
+  count: number;
+  messages: readonly unknown[];
+  json: string;
+  stamp: JsonStamp | null;
+};
+
+function jsonElement(value: unknown): string {
+  const encoded = JSON.stringify(value);
+  return encoded === undefined ? "null" : encoded;
+}
+
 export class FileBoxContextTransport implements BoxContextTransport {
   constructor(private readonly directory: string, private readonly now = Date.now) {}
+  /** Last successful put in this process. get() still reads and hashes the
+   * file. A matching hash skips JSON.parse. put() rewrites only the new tail
+   * when the stored prefix still has the same JSON identity. */
+  private hot: HotPrefix | null = null;
+
+  private extendedJson(key: string, messages: readonly unknown[]): string {
+    const hot = this.hot;
+    if (!hot || hot.key !== key || !hot.stamp || hot.count > messages.length) {
+      return JSON.stringify(messages);
+    }
+    const stamp = jsonIdentityStamp(messages.slice(0, hot.count));
+    if (!stamp || !stampsEqual(stamp, hot.stamp)) return JSON.stringify(messages);
+    if (hot.count === messages.length) return hot.json;
+    const parts: string[] = [];
+    for (let index = hot.count; index < messages.length; index += 1) {
+      parts.push(jsonElement(messages[index]));
+    }
+    const joiner = hot.count === 0 ? "" : ",";
+    return `${hot.json.slice(0, -1)}${joiner}${parts.join(",")}]`;
+  }
+
+  /** UTF-8 size of JSON.stringify(body), reusing a canonical messages prefix. */
+  bodyUtf8Bytes(binding: BoxContextBinding, body: object): number {
+    const messages = (body as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) return Buffer.byteLength(JSON.stringify(body));
+    return proxyBodyUtf8Bytes(body, this.extendedJson(bindingHash(binding), messages));
+  }
 
   private async directoryHandle() {
     if (!path.isAbsolute(this.directory)) throw new BoxContextTransportError("BOX_CONTEXT_STORE_UNAVAILABLE");
@@ -187,10 +230,12 @@ export class FileBoxContextTransport implements BoxContextTransport {
 
   async put(binding: BoxContextBinding, messages: readonly unknown[]): Promise<BoxContextReference> {
     const key = bindingHash(binding);
-    const data = Buffer.from(JSON.stringify(messages), "utf8");
-    if (messages.length < 1 || messages.length > MAX_MESSAGES_COUNT || data.length > MAX_BYTES) {
+    if (messages.length < 1 || messages.length > MAX_MESSAGES_COUNT) {
       throw new BoxContextTransportError("BOX_CONTEXT_TOO_LARGE");
     }
+    const serialized = this.extendedJson(key, messages);
+    const data = Buffer.from(serialized, "utf8");
+    if (data.length > MAX_BYTES) throw new BoxContextTransportError("BOX_CONTEXT_TOO_LARGE");
     const created = this.now();
     const header: Header = { version: 1, owner: hash(binding.uid), binding: key,
       sha256: hash(data), bytes: data.length, count: messages.length,
@@ -216,6 +261,9 @@ export class FileBoxContextTransport implements BoxContextTransport {
         await unlink(tmp).catch(() => {});
         throw e;
       }
+      const stored = messages.slice();
+      this.hot = { key, reference, sha256: header.sha256, count: stored.length,
+        messages: stored, json: serialized, stamp: jsonIdentityStamp(stored) };
       return { version: 1, reference, message_count: messages.length,
         messages_sha256: header.sha256, expires_at: header.expires };
     });
@@ -238,6 +286,12 @@ export class FileBoxContextTransport implements BoxContextTransport {
           throw new BoxContextTransportError("BOX_CONTEXT_REF_INVALID");
         }
         if (header.expires <= this.now()) throw new BoxContextTransportError("BOX_CONTEXT_REF_EXPIRED");
+        const hot = this.hot;
+        if (hot && hot.key === key && hot.reference === reference
+          && hot.sha256 === header.sha256 && hot.count === header.count
+          && hot.messages.length === header.count) {
+          return hot.messages.slice();
+        }
         const messages: unknown = JSON.parse(data.toString("utf8"));
         if (!Array.isArray(messages) || messages.length !== header.count) {
           throw new BoxContextTransportError("BOX_CONTEXT_REF_INVALID");
@@ -280,7 +334,9 @@ export async function restoreBoxContextRequest(input: {
   });
   if (!parsed.success) throw new BoxContextTransportError("BOX_CONTEXT_REF_INVALID");
   const body = parsed.data;
-  const bytes = Buffer.byteLength(JSON.stringify(body), "utf8");
+  const bytes = input.store instanceof FileBoxContextTransport
+    ? input.store.bodyUtf8Bytes(binding, body)
+    : Buffer.byteLength(JSON.stringify(body));
   enforceTotalBodyBudget(bytes, input.budget);
   return { body, bytes, ...(input.stage ? {
     reference: await input.store.put(binding, body.messages),
