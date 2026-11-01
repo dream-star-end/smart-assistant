@@ -376,6 +376,7 @@ class E2E(unittest.TestCase):
         self.job("s1", prompt="sleep"); time.sleep(3)
         self.proc.send_signal(signal.SIGTERM)
         r = self.res("s1", 20); self.assertEqual(r["error_code"], "MUSE_BRIDGE_LOST")
+        self.assertEqual(r.get("error_message"), "bridge 正在停止"); self.assertTrue(r.get("retryable"))
         self.assertEqual(self.proc.wait(20), 0)
     def test_14_log_hygiene(self):
         log = open(os.path.join(self.home, "bridge.log")).read()
