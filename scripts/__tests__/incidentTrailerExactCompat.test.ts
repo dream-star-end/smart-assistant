@@ -23,7 +23,7 @@ const OLD = "OCV5-171 follow-up";
 const START = "1".repeat(40);
 const TIP = "2".repeat(40);
 type Row = { id: string; rootFixCommit: string; coverageCommits?: string[] };
-type Waiver = { expiresAt: string; emergencyMissingTrailer?: boolean };
+type Waiver = { expiresAt: string; commit?: string; emergencyMissingTrailer?: boolean };
 function execute(options: {
   sha?: string;
   trailer?: string | null;
@@ -134,4 +134,49 @@ test("a future ordinary malformed incident remains rejected", () => {
 test("a commit inside a frozen tip's history is skipped, not judged", () => {
   const r = execute({ trailer: "OCV5-999", frozen: [TIP, TARGET] });
   assert.equal(r.checked, 0);
+});
+
+const SHIPPED_EXPIRED_WAIVER = "da9cd5484db3b0e5c882f4032ee09685c4e5b5a7";
+
+test("steward immutable exception pardons only shipped da9cd548 with its original expiry", () => {
+  const waiver = { commit: SHIPPED_EXPIRED_WAIVER, expiresAt: "2026-10-31" };
+  const result = execute({
+    sha: SHIPPED_EXPIRED_WAIVER,
+    trailer: "none (route lookup key; unit regression, no session display change)",
+    waivers: new Map([[SHIPPED_EXPIRED_WAIVER.slice(0, 8), waiver]]),
+  });
+  assert.equal(result.checked, 1);
+});
+
+test("a different full SHA is not covered by the da9cd548 exception", () => {
+  const sha = `${SHIPPED_EXPIRED_WAIVER.slice(0, 39)}0`;
+  assert.throws(() => execute({
+    sha,
+    trailer: "none (fixture)",
+    waivers: new Map([[sha.slice(0, 8), { commit: sha, expiresAt: "2026-10-31" }]]),
+  }), /已于 2026-10-31 过期/);
+});
+
+test("da9cd548 with any other expiry date stays on the ordinary expired-waiver path", () => {
+  assert.throws(() => execute({
+    sha: SHIPPED_EXPIRED_WAIVER,
+    trailer: "none (fixture)",
+    waivers: new Map([[SHIPPED_EXPIRED_WAIVER.slice(0, 8), { commit: SHIPPED_EXPIRED_WAIVER, expiresAt: "2026-10-30" }]]),
+  }), /已于 2026-10-30 过期/);
+});
+
+test("the da9cd548 exception does not extend the waiver or freeze a history tip", () => {
+  const repo = fileURLToPath(new URL("../..", import.meta.url));
+  const checker = readFileSync(`${repo}/scripts/check-v5-incident-regressions.ts`, "utf8");
+  const shell = readFileSync(`${repo}/scripts/check-v5-fix-trailers.sh`, "utf8");
+  const waivers = JSON.parse(readFileSync(`${repo}/e2e/session-display/incident-waivers.json`, "utf8")) as {
+    waivers: Array<{ commit: string; expiresAt: string }>;
+  };
+  assert.equal(checker.split(SHIPPED_EXPIRED_WAIVER).length - 1, 1);
+  assert.equal(shell.split(SHIPPED_EXPIRED_WAIVER).length - 1, 1);
+  const entry = waivers.waivers.find((waiver) => waiver.commit === SHIPPED_EXPIRED_WAIVER);
+  assert.equal(entry?.expiresAt, "2026-10-31");
+  const tips = /const IMPORTED_TRAILER_HISTORY_TIPS = \[([\s\S]*?)\] as const/.exec(checker)?.[1] ?? "";
+  assert.equal(tips.includes(SHIPPED_EXPIRED_WAIVER), false);
+  assert.equal(tips.includes("197735db77dfbf05280c526963ae04846544cabe"), true);
 });
