@@ -75,7 +75,7 @@ export class BoxInteractiveLogins {
     sticky: { session?: string; prefer?: string } = {}): Promise<BoxInteractiveChoice> {
     if (!(await this.deps.accountActive(accountId))) return { kind: "unknown_account" };
     const own = await this.rows(accountId);
-    const candidates = boxLoginCandidates({ accountId, weight: 1, own, health: this.deps.health });
+    const candidates = boxLoginCandidates({ accountId, weight: 1, own, health: this.deps.health, nowMs: this.now() });
     const load = candidates.reduce((sum, item) => sum + item.loginLoad, 0);
     for (const candidate of candidates) candidate.boxLoad = load;
     const sessionKey = sticky.session ? `${uid}:${accountId}:${sticky.session}` : null;

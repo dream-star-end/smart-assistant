@@ -55,7 +55,6 @@ import {
   LOSSLESS_TURN_TAPE_PART_BYTES,
   LOSSLESS_TURN_TAPE_SHA256_RE,
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
-  assessTurnRecoveryTape,
   modelHistoryReservedTokens,
   estimateModelHistoryTokens,
   estimateModelHistoryUtf8Bytes,
@@ -75,6 +74,7 @@ import {
   shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
+  shouldReplayOriginalAfterEmptyExecution,
   turnRecoveryAttemptIdentity,
   turnRecoveryIdentity,
   parseSessionWorkspaceMode,
@@ -269,7 +269,13 @@ import {
   serializePermissionPromptEntry,
   settleStopControlsForTurn,
 } from "../dispatch/turnControlStore.js";
-import { filterMonotonicLiveFramePayloads } from "../dispatch/leftoverFrameFence.js";
+import {
+  sessionTurnHasSuccessfulUsage,
+  loadLeftoverRecoveryRecords,
+  mergeTapeAndLeftoverRecoveryAssessment,
+  terminalTurnRecordErrorCode,
+} from "./sessionRecoveryEvidence.js";
+export { leftoverFramesToRecoveryRecords } from "./sessionRecoveryEvidence.js";
 import { foldSyntheticServiceRestartTape } from "./serviceRestartLiveFold.js";
 import {
   readClientSessionLiveFrames as readDurableClientSessionLiveFrames,
@@ -1994,141 +2000,6 @@ function recoveryWithoutCheckpointIsProven(code: string): boolean {
   return PRE_EXECUTION_RECOVERY_CODES.has(normalizeTurnErrorCode(code));
 }
 
-/** Leftover live frames are display-isolated after tape projection, but they
- * remain the SERVICE_RESTART checkpoint store. Recovery admission is not the
- * hot hydrate path, so it may read them without putting leftover back into
- * GET /live-frames. */
-/** Callers must pass payloads already through filterMonotonicLiveFramePayloads. */
-async function sessionTurnHasSuccessfulUsage(
-  client: PoolClient,
-  uid: bigint,
-  turnKey: string | undefined,
-): Promise<boolean> {
-  if (typeof turnKey !== "string" || !/^[0-9a-f]{64}$/.test(turnKey)) return false;
-  const row = await client.query(
-    `SELECT 1
-       FROM usage_records
-      WHERE user_id=$1 AND turn_key=$2 AND status='success'
-        AND (output_tokens > 0 OR cache_read_tokens > 0)
-      LIMIT 1`,
-    [uid, turnKey],
-  );
-  return (row.rowCount ?? 0) > 0;
-}
-
-export function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
-  const records: Array<Record<string, unknown>> = [];
-  // OCV5-321 (#611729fb): a live stream carries a tool_use block and later its
-  // tool_result (toolUseBlockId → tool_use.blockId). Unpaired id-less rows made
-  // every Box turn with tools look unsettled, so the OCV5-317 settled-tools
-  // checkpoint was declined as checkpoint_unsafe. Pair by id; blocks without
-  // an id keep the old fail-closed shape.
-  const toolsById = new Map<string, Record<string, unknown>>();
-  for (const payload of payloads) {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
-    const frame = payload as Record<string, unknown>;
-    if (frame.type !== "outbound.message" || !Array.isArray(frame.blocks)) continue;
-    for (const block of frame.blocks) {
-      if (!block || typeof block !== "object" || Array.isArray(block)) continue;
-      const item = block as Record<string, unknown>;
-      const kind = item.kind;
-      if (kind === "thinking") {
-        records.push({
-          role: "thinking",
-          text: typeof item.text === "string" ? item.text : "",
-        });
-        continue;
-      }
-      if (kind === "text") {
-        const text = typeof item.text === "string" ? item.text : "";
-        if (text.trim().length > 0) records.push({ role: "assistant", text });
-        continue;
-      }
-      if (kind === "tool_use" || kind === "tool_result") {
-        const rawId = kind === "tool_use" ? item.blockId : item.toolUseBlockId;
-        const id = typeof rawId === "string" && rawId.length > 0 ? rawId : null;
-        const known = id ? toolsById.get(id) : undefined;
-        if (known) {
-          if (kind === "tool_result") known._completed = true;
-          continue;
-        }
-        const record: Record<string, unknown> = {
-          role: "tool",
-          ...(id ? { toolUseId: id } : {}),
-          _completed: kind === "tool_result",
-        };
-        if (id) toolsById.set(id, record);
-        records.push(record);
-        continue;
-      }
-      if (kind === "delegate_progress") {
-        records.push({
-          role: "delegate-progress",
-          _completed: item._completed === true,
-        });
-      }
-    }
-  }
-  return records;
-}
-
-async function loadLeftoverRecoveryRecords(
-  client: PoolClient,
-  sessionId: string,
-  sessionUserId: string,
-  clientMessageId: string,
-): Promise<unknown[]> {
-  const rows = (
-    await client.query<{ payload: Buffer }>(
-      `SELECT f.payload
-         FROM client_session_live_streams s
-         JOIN client_session_live_frames f ON f.stream_key=s.stream_key
-        WHERE s.session_id=$1 AND s.user_id=$2 AND s.client_message_id=$3
-        ORDER BY f.record_id
-        LIMIT 4000`,
-      [sessionId, sessionUserId, clientMessageId],
-    )
-  ).rows;
-  const payloads: unknown[] = [];
-  for (const row of rows) {
-    try {
-      payloads.push(JSON.parse(Buffer.from(row.payload).toString("utf8")));
-    } catch {
-      // Corrupt leftover frames must not poison tape-backed recovery.
-    }
-  }
-  return leftoverFramesToRecoveryRecords(filterMonotonicLiveFramePayloads(payloads));
-}
-
-function mergeTapeAndLeftoverRecoveryAssessment(
-  tapeRecords: readonly unknown[],
-  leftoverRecords: readonly unknown[],
-): ReturnType<typeof assessTurnRecoveryTape> & { leftoverBacked: boolean } {
-  const tape = assessTurnRecoveryTape(tapeRecords);
-  if (tape.mode === "checkpoint") return { ...tape, leftoverBacked: false };
-  const leftover = assessTurnRecoveryTape(leftoverRecords);
-  if (leftover.mode === "checkpoint") return { ...leftover, leftoverBacked: true };
-  return { ...tape, leftoverBacked: false };
-}
-
-
-
-/** The last assistant record is the semantic terminal surface. An earlier
- * error followed by a later answer is not a failed turn, while trailing tool
- * or runtime audit rows do not erase a terminal assistant error. */
-function terminalTurnRecordErrorCode(records: readonly unknown[]): string {
-  for (let index = records.length - 1; index >= 0; index--) {
-    const record = records[index];
-    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
-    const message = record as MessageLike;
-    if (message.role !== "assistant") continue;
-    return typeof message._errorCode === "string"
-      ? normalizeTurnErrorCode(message._errorCode)
-      : "";
-  }
-  return "";
-}
-
 async function hydrateRecoverySourceUser(
   client: Pool | PoolClient,
   sessionId: string,
@@ -2350,15 +2221,28 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // prompt requires observable-state verification before any repeated write.
   // Exact replay remains fail-closed and is never inferred from a completed
   // tape whose header contradicts its terminal error record.
-  if (status === "completed" && assessment.mode !== "checkpoint") {
-    return done(declined("completed_without_checkpoint", errorCode));
-  }
   const recoveryRecords = input.turn.records.map((record) => record.payload);
   const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
     client,
     input.uid,
     input.turn.payload.turnKey,
   );
+  // A synthetic refusal or a runtime event makes the tape look like a
+  // checkpoint, so the continuation prompt would replace the user's text.
+  // Replay the original only when this turn provably ran nothing. A completed
+  // tape that assesses as replay stays fail-closed below: emptiness after
+  // "completed" is not proof that no write happened. Do not set
+  // resetNativeSession here; that flag is only for silent stalls and would
+  // drop the conversation the user already had.
+  const emptyOriginalReplay = shouldReplayOriginalAfterEmptyExecution({
+    errorCode,
+    records: [...recoveryRecords, ...leftoverRecords],
+    sourceIsAutomaticRecovery: source._automaticRecovery === true,
+    hasSuccessfulUpstreamUsage,
+  });
+  if (status === "completed" && assessment.mode !== "checkpoint") {
+    return done(declined("completed_without_checkpoint", errorCode));
+  }
   if (shouldDeclineLiveServiceRestartRecovery({
     errorCode,
     records: recoveryRecords,
@@ -2367,9 +2251,11 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   })) {
     return done(declined("checkpoint_unsafe", errorCode));
   }
+  const replayOverSyntheticCheckpoint = emptyOriginalReplay && assessment.mode === "checkpoint";
   if (
     assessment.mode === "checkpoint" &&
     !assessment.checkpointSafe &&
+    !replayOverSyntheticCheckpoint &&
     !allowUnsafeAutomaticCheckpoint({
       status,
       errorCode,
@@ -2381,6 +2267,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   }
   if (
     assessment.mode === "replay" &&
+    !emptyOriginalReplay &&
     (
       !assessment.checkpointSafe ||
       !recoveryWithoutCheckpointIsProven(errorCode)
@@ -2388,7 +2275,7 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   ) {
     return done(declined("replay_not_proven", errorCode));
   }
-  const mode = assessment.mode;
+  const mode = replayOverSyntheticCheckpoint ? "replay" : assessment.mode;
   const rootClientMessageId = isClientMessageId(source._automaticRecoveryRootClientMessageId)
     ? source._automaticRecoveryRootClientMessageId
     : source._automaticRecovery === true && isClientMessageId(source._recoveryOfClientMessageId)
@@ -9264,13 +9151,30 @@ export function createPgSessionsBackend(
               if (!supportsAutomaticTurnRecovery(finalizedErrorCode)) {
                 return { kind: "recovery_conflict", reason: "source_not_recoverable" };
               }
+              const hasSuccessfulUpstreamUsage = await sessionTurnHasSuccessfulUsage(
+                client,
+                input.uid,
+                typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
+              );
+              // Same proof the scheduler used. A client that asks to replay a
+              // real checkpoint (tools or output) is still rejected. A
+              // completed tape that assesses as replay is never promoted.
+              const emptyOriginalReplay = input.recovery.automatic === true &&
+                input.recovery.mode === "replay" &&
+                shouldReplayOriginalAfterEmptyExecution({
+                  errorCode: finalizedErrorCode,
+                  records: [...records, ...leftoverRecords],
+                  sourceIsAutomaticRecovery: latestUser._automaticRecovery === true,
+                  hasSuccessfulUpstreamUsage,
+                });
+              const replayOverSyntheticCheckpoint = emptyOriginalReplay && assessment.mode === "checkpoint";
               if (
                 finalized.status === "completed" &&
                 assessment.mode !== "checkpoint"
               ) {
                 return { kind: "recovery_conflict", reason: "completed_replay_forbidden" };
               }
-              if (assessment.mode !== input.recovery.mode) {
+              if (assessment.mode !== input.recovery.mode && !replayOverSyntheticCheckpoint) {
                 return { kind: "recovery_conflict", reason: "recovery_mode_mismatch" };
               }
               if (
@@ -9279,11 +9183,7 @@ export function createPgSessionsBackend(
                   errorCode: finalizedErrorCode,
                   records,
                   leftoverRecords,
-                  hasSuccessfulUpstreamUsage: await sessionTurnHasSuccessfulUsage(
-                    client,
-                    input.uid,
-                    typeof finalized.turn_key === "string" ? finalized.turn_key : undefined,
-                  ),
+                  hasSuccessfulUpstreamUsage,
                 })
               ) {
                 return { kind: "recovery_conflict", reason: "automatic_checkpoint_unsafe" };
@@ -9292,6 +9192,7 @@ export function createPgSessionsBackend(
                 input.recovery.automatic &&
                 assessment.mode === "checkpoint" &&
                 !assessment.checkpointSafe &&
+                !replayOverSyntheticCheckpoint &&
                 !allowUnsafeAutomaticCheckpoint({
                   status: finalized.status,
                   errorCode: finalizedErrorCode,
@@ -9303,6 +9204,7 @@ export function createPgSessionsBackend(
               }
               if (
                 assessment.mode === "replay" &&
+                !emptyOriginalReplay &&
                 (
                   !assessment.checkpointSafe ||
                   !recoveryWithoutCheckpointIsProven(finalizedErrorCode)

@@ -6756,7 +6756,7 @@ describe("ChatSocket interrupted continuation", () => {
     ws.onmessage?.({ data: JSON.stringify(ack) });
 
     expect(session.messages.slice(0, oldRows.length)).toEqual([
-      { ...oldRows[0], _automaticRecoveryAttempted: true },
+      { ...oldRows[0], _automaticRecoveryAttempted: true, status: "sent" },
       ...oldRows.slice(1),
     ]);
     expect(session.messages).toHaveLength(oldRows.length + 1);
