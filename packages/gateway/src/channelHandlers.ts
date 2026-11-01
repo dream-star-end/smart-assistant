@@ -278,6 +278,7 @@ export async function handleTurnRejectIfAbsent(
     inserted: result.inserted,
     state: result.state,
     outcome: result.outcome,
+    ...(result.userFailureCode ? { userFailureCode: result.userFailureCode } : {}),
   })
 }
 

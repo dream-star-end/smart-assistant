@@ -1,4 +1,5 @@
 import { HTTP_ERROR_GROUPS } from './userErrorCodes.js'
+import { parseAttachmentTotalExceeded } from './uploadLimits.js'
 import {
   TURN_ERROR_TAXONOMY, normalizeTurnErrorCode, turnErrorSemantics,
   type TurnErrorCode, type TurnErrorCta,
@@ -127,6 +128,7 @@ export const USER_ERROR_CATALOG: Readonly<Record<string, UserError>> = Object.fr
       : CTA_ACTIONS[semantics.cta].length ? CTA_ACTIONS[semantics.cta] : GROUP_COPY[category][2]
     return [code, entry(code, [category, message, actions], semantics.retryable)]
   })),
+  attachment_total_exceeded: entry('attachment_total_exceeded', ['size', '附件合计超过单条消息上限。请拆成几条再发送。', []]),
   unexpected_error: entry('unexpected_error', GROUP_COPY.unknown),
   automatic_retry_exhausted: entry('automatic_retry_exhausted', ['execution',
     '已达到自动重试上限。你可以换个模型、继续，或联系管理员。', ['switch_model', 'retry', 'contact_admin']]),
@@ -150,6 +152,7 @@ const DISPLAY_ALIASES: Record<string, string> = {
   dispatch_not_accepted: 'durable_dispatch_unavailable', codex_unavailable: 'codex_route_unavailable',
 }
 export function getUserError(rawCode: unknown): UserError {
+  if (parseAttachmentTotalExceeded(rawCode)) return USER_ERROR_CATALOG.attachment_total_exceeded!
   const code = normalizeTurnErrorCode(rawCode)
   const key = DISPLAY_ALIASES[code] ?? code
   return Object.prototype.hasOwnProperty.call(USER_ERROR_CATALOG, key)

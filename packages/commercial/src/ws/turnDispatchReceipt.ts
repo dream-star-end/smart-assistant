@@ -1,4 +1,5 @@
 import { isClientMessageId, type OutboundAck } from '@openclaude/protocol'
+import { rejectedDispatchFailureCode } from '../dispatch/attachmentTotalFailure.js'
 import type { Pool } from 'pg'
 import { casAdmittedToAccepted, casToTerminal, getDispatchByLogicalKey } from '../dispatch/turnDispatchStore.js'
 import { markRecoveryContainerReceipt, releaseRecoveryPreReceipt, type ClaimedRecoveryJob } from '../dispatch/turnRecoveryStore.js'
@@ -7,6 +8,7 @@ import { recoveryRunningFrame } from './recoveryPresentation.js'
 type Receipt = {
   clientMessageId?: unknown; dispatchId?: unknown; attemptNo?: unknown
   sessionId?: unknown; state?: unknown; outcome?: unknown
+  userFailureCode?: unknown
 }
 type ReceiptRecord = {
   clientMessageId: string; sessionId: string; dispatchId: string; attemptNo: number
@@ -90,7 +92,8 @@ export function handleTurnDispatchReceipt<R extends ReceiptRecord, E extends { r
             dispatchOwner: rec.leaseOwnerId, dispatchLeaseEpoch: rec.leaseEpoch,
           })
           : await casToTerminal(pool, {
-            dispatchId: rec.dispatchId, outcome: 'not_accepted', failureCode: 'DISPATCH_NOT_ACCEPTED',
+            dispatchId: rec.dispatchId, outcome: 'not_accepted',
+            failureCode: rejectedDispatchFailureCode({ kind: 'ok', userFailureCode: receipt.userFailureCode }),
             clientNotified: false, fromStatuses: ['admitted'], expectedEpoch: rec.leaseEpoch,
           }) !== null
       } catch (err) {

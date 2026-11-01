@@ -1000,7 +1000,8 @@ export function AssistantCard({
       : undefined;
   const showInterruptedContinuation =
     !!interruptedContinuationTarget &&
-    !!cb.onContinueInterrupted;
+    !!cb.onContinueInterrupted &&
+    presentedError?.code !== "attachment_total_exceeded";
   useEffect(() => {
     if (!isInsufficient) return;
     reportClientFrictionOnce(
