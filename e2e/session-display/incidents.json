@@ -9231,112 +9231,144 @@
         "since": "2026-10-31"
       }
     },
-    {
-      "id": "INC-20261101-RECOVER-UX-EMPTY",
-      "occurredAt": "2026-11-01",
-      "severity": "P1",
-      "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
-      "rootFixCommit": "8c93a18b",
-      "coverageCommits": ["d5f09049"],
-      "regressions": [
-        {
-          "layer": "browser",
-          "path": "packages/web-react/browser-tests/recover-ux-empty.node-test.mjs",
-          "assertion": "a succeeded automatic recovery does not show 发送失败"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
-          "assertion": "resends the original text when an engine_error tape is only a synthetic refusal"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
-          "assertion": "自动恢复已成功时，原消息不再显示发送失败和继续"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxLoginCandidates.test.ts",
-          "assertion": "weekly exhaustion benches a login whose 5-hour reading has aged out"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
-          "assertion": "a weekly-exhausted login is never chosen while another login can run"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
-          "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
-        }
-      ]
-    },
-    {
-      "id": "INC-20261101-UPLOAD-TOTAL-UX",
-      "occurredAt": "2026-11-01",
-      "severity": "P1",
-      "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
-      "rootFixCommit": "64ba5a7f",
-      "coverageCommits": [
-        "b4fbbfc8"
-      ],
-      "regressions": [
-        {
-          "layer": "unit",
-          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-          "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-          "assertion": "300MiB is within the total limit and one extra byte is over"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-          "assertion": "attachment total failure code round-trips and rejects other codes"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-          "assertion": "noteAttachmentTotalRejection stamps 330MB copy and a parseable code"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-          "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
-          "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
-          "assertion": "errorPresentation attachment total says 330MB and does not ask to retry"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
-          "assertion": "附件合计超限状态卡说明 330MB 且没有继续按钮"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/composerAttach.test.tsx",
-          "assertion": "附件合计超过 300MB 时整批不上传并提示分两条发送"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/composerAttach.test.tsx",
-          "assertion": "同一帧内第二批附件超过 300MB 时不再上传"
-        },
-        {
-          "layer": "browser",
-          "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-          "assertion": "附件合计超过 300MB 时不上传并提示分条发送"
-        }
-      ]
-    }
+  {
+    "id": "INC-20261101-UPLOAD-TOTAL-UX",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
+    "rootFixCommit": "64ba5a7f",
+    "coverageCommits": [
+      "b4fbbfc8"
+    ],
+    "regressions": [
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "attachment total failure code round-trips and rejects other codes"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
+        "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+        "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
+        "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
+      },
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+      }
+    ]
+  },
+  {
+    "id": "INC-20261101-RECOVER-UX-EMPTY",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
+    "rootFixCommit": "8c93a18b",
+    "coverageCommits": [
+      "d5f09049"
+    ],
+    "regressions": [
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/recover-ux-empty.node-test.mjs",
+        "assertion": "a succeeded automatic recovery does not show 发送失败"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+        "assertion": "resends the original text when an engine_error tape is only a synthetic refusal"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+        "assertion": "自动恢复已成功时，原消息不再显示发送失败和继续"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/commercial/src/http/proxy/boxLoginCandidates.test.ts",
+        "assertion": "weekly exhaustion benches a login whose 5-hour reading has aged out"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
+        "assertion": "a weekly-exhausted login is never chosen while another login can run"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/commercial/src/http/proxy/boxAccountResolver.profiles.test.ts",
+        "assertion": "a running chat leaves its login once that login's weekly quota is exhausted"
+      }
+    ]
+  },
+  {
+    "id": "INC-20261101-UPLOAD-TOTAL-2G",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
+    "rootFixCommit": "d03b36f0",
+    "regressions": [
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "2GiB is within the total limit and one extra byte is over"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/security.test.ts",
+        "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+      },
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+      }
+    ]
+  }
+
   ]
 }

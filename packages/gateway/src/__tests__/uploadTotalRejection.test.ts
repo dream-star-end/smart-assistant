@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
+import { MAX_UPLOAD_TOTAL } from '../httpUploadStatic.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-gw-upload-total-'))
 process.env.OPENCLAUDE_HOME = testHome
@@ -17,29 +18,35 @@ after(async () => {
 })
 
 
-test('message attachment total includes bytes after the 300MiB cap is crossed', () => {
+test('message attachment total includes bytes after the 2GiB cap is crossed', () => {
   const mib = 1024 * 1024
-  const sizes = Array.from({ length: 8 }, () => 100 * mib)
-  const firstOverPrefix = 4 * 100 * mib
-  assert.equal(3 * 100 * mib > 300 * mib, false)
-  assert.equal(firstOverPrefix > 300 * mib, true)
+  const gib = 1024 * mib
+  const sizes = Array.from({ length: 5 }, () => gib)
+  const firstOverPrefix = 3 * gib
+  assert.equal(2 * gib > MAX_UPLOAD_TOTAL, false)
+  assert.equal(2 * gib + 1 > MAX_UPLOAD_TOTAL, true)
+  assert.equal(firstOverPrefix > 2 * gib, true)
   const total = messageAttachmentTotal(sizes)
-  assert.equal(total, 800 * mib)
+  assert.equal(total, 5 * gib)
   const message = noteAttachmentTotalRejection({}, total)
-  assert.match(message, /800MB/)
+  assert.match(message, /5120MB/)
+  assert.match(message, /2048MB/)
   assert.match(message, /请分3条/)
   assert.equal(message.includes('请重试'), false)
-  assert.equal(noteAttachmentTotalRejection({}, firstOverPrefix).includes('两条'), true)
+  const prefix = noteAttachmentTotalRejection({}, firstOverPrefix)
+  assert.match(prefix, /3072MB/)
+  assert.equal(prefix.includes('两条'), true)
 })
 
-test('noteAttachmentTotalRejection stamps 330MB copy and a parseable code', () => {
+test('noteAttachmentTotalRejection stamps 2200MB copy and a parseable code', () => {
   const frame: { __oc_upload_user_failure_code?: string } = {}
-  const message = noteAttachmentTotalRejection(frame, 345649213)
-  assert.match(message, /330MB/)
-  assert.match(message, /300MB/)
+  const total = 2200 * 1024 * 1024
+  const message = noteAttachmentTotalRejection(frame, total)
+  assert.match(message, /2200MB/)
+  assert.match(message, /2048MB/)
   assert.match(message, /两条/)
   assert.equal(message.includes('请重试'), false)
-  assert.equal(readUploadUserFailureCode(frame), 'ATTACHMENT_TOTAL_EXCEEDED:345649213')
+  assert.equal(readUploadUserFailureCode(frame), 'ATTACHMENT_TOTAL_EXCEEDED:2306867200')
   assert.equal(readUploadUserFailureCode({}), undefined)
   assert.equal(
     readUploadUserFailureCode({ __oc_upload_user_failure_code: 'DISPATCH_NOT_ACCEPTED' } as object),

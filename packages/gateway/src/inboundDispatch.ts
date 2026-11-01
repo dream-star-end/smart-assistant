@@ -97,7 +97,7 @@ import {
 import { buildContextObservationFrame } from './contextObservationFrames.js'
 import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
 import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
-import { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
+import { MAX_INLINE_TEXT_BYTES, MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
@@ -902,17 +902,17 @@ export async function dispatchInbound(
       // 同源),消除历史"前端 8 / 后端 5"漂移导致的"上传成功却被拒"。
       const MAX_FILES_PER_FRAME = MAX_ATTACHMENTS_PER_MESSAGE
       // text-kind attachments 在前端 buildMessageText() 阶段就拼进 content.text,
-      // 绕过了下面基于 m.base64 的 per-file 校验。给 content.text 整体上限兜底,
-      // 防止 (a) 绕前端构造巨 text 帧 (b) 大 text 附件 + 大正文叠加超 300 MB 契约。
+      // 绕过了下面基于 m.base64 的 per-file 校验。内联文本仍按 300MiB 兜底,
+      // 不跟随引用式附件的 2GiB 合计:文本会进帧,附件只带路径。
       const textByteLen = Buffer.byteLength(text, 'utf8')
-      if (textByteLen > MAX_UPLOAD_TOTAL) {
+      if (textByteLen > MAX_INLINE_TEXT_BYTES) {
         if (promptQueueLifecycle) {
           ;(frame as any).__oc_prompt_queue_preflight_rejection = {
             disposition: 'user_action_required',
             reasonCode: 'CONTENT_TOO_LARGE',
           }
         }
-        const errMsg = `消息文本超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
+        const errMsg = `消息文本超过 ${MAX_INLINE_TEXT_BYTES / 1024 / 1024}MB 限制 (${(textByteLen / 1024 / 1024).toFixed(1)}MB)`
         this.log.warn('upload rejected: text too large', {
           reason: errMsg,
           textByteLen,
@@ -962,7 +962,7 @@ export async function dispatchInbound(
       // First pass — validate base64 (legacy) entries the same way as before so
       // old web bundles still get correct 4xx-style WS error frames.
       // The total check happens after every attachment is counted. Rejecting at
-      // the first prefix that crosses 300MiB would name the wrong total.
+      // the first prefix that crosses the cap would name the wrong total.
       for (const m of media) {
         if (!m.base64) continue
         const rawLen = m.base64.length
