@@ -18,14 +18,13 @@ import {
   isStaleUploadPartName,
   parseAttachmentTotalExceeded,
   shouldDeleteAgedUpload,
-  uploadChunkCount,
-  uploadChunkLength,
   uploadFailureCanContinue,
   uploadFileLimitMessage,
   uploadFileTooLarge,
   uploadQuotaExceeded,
   uploadQuotaMessage,
 } from '../uploadLimits.js'
+import { uploadChunkCount, uploadChunkLength } from '../uploadChunkSizing.js'
 
 describe('upload total limit copy', () => {
   test('345649213 bytes formats as 330MB over 300MB in two messages', () => {

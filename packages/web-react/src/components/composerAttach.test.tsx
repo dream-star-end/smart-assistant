@@ -3,7 +3,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
-import { AttachChip, Composer, middleTruncate } from "./Composer";
+import { Composer } from "./Composer";
+import { AttachChip, middleTruncate } from "./ComposerAttachChip";
 import type { MediaRef } from "../lib/chat/frames";
 
 afterEach(cleanup);
