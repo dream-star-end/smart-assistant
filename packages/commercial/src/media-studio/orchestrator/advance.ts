@@ -12,6 +12,7 @@ import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { type ShotRedo, settleAnnotations } from './annotate.js'
 import { reserveBudget } from './budget.js'
+import { directorModelOf } from './directorModel.js'
 import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
 import { type BibleEntry, biblePrompt, framePrompt, videoPrompt, withAvoid } from './prompts.js'
@@ -407,7 +408,13 @@ async function dispatchQa(
   projectId: string,
   takeId: string,
 ): Promise<'queued' | 'budget' | 'exists' | 'unpriced'> {
-  const est = deps.qa?.maxCost ? await deps.qa.maxCost().catch(() => null) : 0n
+  const chosen = await client.query<{ model: string | null }>(
+    `SELECT settings->>'directorModel' AS model FROM studio_projects WHERE id = $1`,
+    [projectId],
+  )
+  const est = deps.qa?.maxCost
+    ? await deps.qa.maxCost(directorModelOf({ directorModel: chosen.rows[0]?.model })).catch(() => null)
+    : 0n
   if (est === null) {
     const noted = await client.query(
       `UPDATE studio_projects SET settings = settings || '{"qaUnpricedNoted":true}'::jsonb

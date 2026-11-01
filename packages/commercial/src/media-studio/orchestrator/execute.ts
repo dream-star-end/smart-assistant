@@ -14,6 +14,7 @@ import { MediaProviderError, type MediaRequest, type MediaResult } from '../prov
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
+import { directorModelOf } from './directorModel.js'
 import { type ComposeRunnerLike, composePayload, failCompose, runCompose } from './compose.js'
 import { LeaseLostError, withLease } from './lease.js'
 import { buildModerationPrompt, moderationOutcome, parseModeration } from './moderation.js'
@@ -64,8 +65,9 @@ async function projectOf(pool: Pool, projectId: string) {
     autonomy: 'max' | 'confirm'
     budget_credits: string
     title: string
+    settings: Record<string, unknown>
   }>(
-    `SELECT user_id::text AS user_id, brief, aspect, target_sec, autonomy, budget_credits::text AS budget_credits, title
+    `SELECT user_id::text AS user_id, brief, aspect, target_sec, autonomy, budget_credits::text AS budget_credits, title, settings
        FROM studio_projects WHERE id = $1`,
     [projectId],
   )
@@ -220,7 +222,9 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
       requestId: task.execRequestId,
       attempt: Math.max(0, task.attempts - 1),
       prompt: buildPlanPrompt(input),
-      billTo: 'platform',
+      model: directorModelOf(p.settings),
+      // The user chose this model: their permission is checked and their ledger pays its price.
+      billTo: 'user',
       signal,
       onDelta: async (delta) => {
         signal.throwIfAborted()

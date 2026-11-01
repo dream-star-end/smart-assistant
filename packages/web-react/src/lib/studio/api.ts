@@ -61,6 +61,8 @@ export interface ProjectDraft {
   targetSec?: number
   budgetCredits?: number
   autonomy?: 'max' | 'confirm'
+  /** Director model for the plan, annotation interpret, and visual QA. Default grok-build. */
+  directorModel?: string | null
 }
 
 export const studioApi = {

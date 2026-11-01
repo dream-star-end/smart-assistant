@@ -13,11 +13,13 @@ import { MediaProviderError } from '../providers/types.js'
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
+import { directorModelOf } from './directorModel.js'
 import type { ExecuteDeps } from './execute.js'
 import { withLease } from './lease.js'
 import type { BibleEntry, ShotSpecForPrompt } from './prompts.js'
 import {
   CLIP_POINTS,
+  MAX_QA_ATTEMPTS,
   QA_REASON_TEXT,
   QA_TARGET,
   type QaHistory,
@@ -26,11 +28,14 @@ import {
   QaParseError,
   type QaReason,
   type QaVerdict,
+  bibleShotConflict,
   buildQaPrompt,
   contactSheet,
   criteriaFor,
   judgeQa,
   parseQa,
+  qaAttemptsFor,
+  qaReasonText,
 } from './qa.js'
 
 interface QaTake {
@@ -44,6 +49,8 @@ interface QaTake {
   duration_ms: number | null
   inputs: { inputs?: Array<{ role?: string; blobSha?: string }> } | null
   user_id: string
+  autonomy: string
+  director_model: string | null
   created_at: Date
 }
 
@@ -64,7 +71,7 @@ async function loadTake(deps: ExecuteDeps, task: StudioTask): Promise<QaTake | n
   const r = await deps.pool.query<QaTake>(
     `SELECT t.id::text AS id, t.owner_kind, t.owner_id::text AS owner_id, t.version, t.status, t.blob_sha,
             t.qa, (t.meta->>'durationMs')::float8 AS duration_ms, t.inputs, p.user_id::text AS user_id,
-            t.created_at
+            p.autonomy, p.settings->>'directorModel' AS director_model, t.created_at
        FROM studio_takes t JOIN studio_projects p ON p.id = t.project_id
       WHERE t.id = $1 AND t.project_id = $2`,
     [takeId, task.projectId],
@@ -345,6 +352,16 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
     return
   }
   const ctx = await loadContext(deps, task.projectId, kind, t.owner_id)
+  // A bible that contradicts the shot can never pass visual QA. Ask the user once,
+  // before another paid redo.
+  if (ctx.shot) {
+    const conflict = bibleShotConflict(ctx.bible, ctx.shot)
+    if (conflict) {
+      const j: QaJudgement = { passed: false, score: 0, next: 'handoff', reason: 'bible_conflict' }
+      await settle(deps, task, t, kind, ctx, { summary: conflict, issues: [], ...j, attempt: 0 }, j, [])
+      return
+    }
+  }
 
   let out = kept
   let attempt = 0
@@ -380,6 +397,7 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
         containerId: null,
         requestId: task.execRequestId,
         attempt,
+        model: directorModelOf({ directorModel: t.director_model }),
         prompt: buildQaPrompt({
           target,
           ...(ctx.assetKind ? { assetKind: ctx.assetKind } : {}),
@@ -433,8 +451,9 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
   }
   const perRound = kind === 'bible' ? (deps.qa?.bibleCandidates ?? 1) : 1
   const { h, scored } = await history(deps, t, perRound)
+  const limit = qaAttemptsFor(t.autonomy)
   const j: QaJudgement = verdict
-    ? judgeQa(verdict, criteriaFor(target, ctx.assetKind), h)
+    ? judgeQa(verdict, criteriaFor(target, ctx.assetKind), h, limit)
     : { passed: false, score: 0, next: 'handoff', reason: 'low_confidence' }
   await settle(
     deps,
@@ -446,6 +465,7 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
       ...(verdict ?? { summary: 'agent 没能给出有效的质检结果。', issues: [] }),
       ...j,
       attempt: h.attempts + 1,
+      maxAttempts: limit,
     },
     j,
     scored,
@@ -514,10 +534,17 @@ async function settle(
     )
     await bookTaskCharge(c, task, charged, { release: true })
     if (wrote.rowCount)
-      await outcome(c, task.projectId, t, kind, ctx, j, qa.summary ?? '', [
-        ...scored,
-        { id: t.id, score: j.score },
-      ])
+      await outcome(
+        c,
+        task.projectId,
+        t,
+        kind,
+        ctx,
+        j,
+        qa.summary ?? '',
+        [...scored, { id: t.id, score: j.score }],
+        typeof qa.maxAttempts === 'number' ? qa.maxAttempts : MAX_QA_ATTEMPTS,
+      )
     if (await overBudget(c, task.projectId)) {
       await c.query(
         `UPDATE studio_projects SET status = 'paused', settings = settings || '{"pausedReason":"budget"}'::jsonb,
@@ -541,8 +568,10 @@ async function outcome(
   j: QaJudgement,
   summary: string,
   scored: Array<{ id: string; score: number }>,
+  maxAttempts: number = MAX_QA_ATTEMPTS,
 ): Promise<void> {
-  const why = (r: QaReason) => `${ctx.label}${QA_REASON_TEXT[r]}${summary ? `：${summary}` : ''}`
+  const why = (r: QaReason) =>
+    `${ctx.label}${qaReasonText(r, maxAttempts)}${summary ? `：${summary}` : ''}`
   if (kind === 'bible') {
     if (j.next === 'adopt') {
       // Lock the best passing candidate once none of this asset's candidates is still pending.
@@ -623,7 +652,10 @@ async function outcome(
       takeId: t.id,
       reason: j.reason,
       takeIds: best2(scored),
-      message: `${why(j.reason)}。最好的版本已留给你挑，也可以写批注。`,
+      message:
+        j.reason === 'bible_conflict'
+          ? `${ctx.label}：${summary || QA_REASON_TEXT.bible_conflict}`
+          : `${why(j.reason)}。最好的版本已留给你挑，也可以写批注。`,
     })
   }
 }

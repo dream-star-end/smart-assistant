@@ -35,6 +35,58 @@ export interface QaConfig {
   bibleCandidates: 1 | 2
 }
 
+/**
+ * Automatic QA attempts for an autonomy level. Both default to MAX_QA_ATTEMPTS (3),
+ * so today's projects redo twice and then stop. OC_STUDIO_QA_ATTEMPTS_MAX and
+ * OC_STUDIO_QA_ATTEMPTS_CONFIRM override one level; OC_STUDIO_QA_ATTEMPTS overrides both
+ * when the level-specific variable is unset. A value outside 1..8 is ignored.
+ */
+export function qaAttemptsFor(
+  autonomy: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const specific = autonomy === 'confirm' ? env.OC_STUDIO_QA_ATTEMPTS_CONFIRM : env.OC_STUDIO_QA_ATTEMPTS_MAX
+  const raw = (specific ?? env.OC_STUDIO_QA_ATTEMPTS ?? '').trim()
+  if (!raw) return MAX_QA_ATTEMPTS
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1 || n > 8) return MAX_QA_ATTEMPTS
+  return n
+}
+
+const DARK_LIGHTING = [/深色/, /暗色/, /黑夜/, /夜景/, /昏暗/, /暗背景/, /黑色背景/, /暗调/]
+const LIGHT_LIGHTING = [/浅灰/, /浅色/, /晨光/, /明亮/, /窗边/, /日光/, /白天/, /白昼/, /高调/, /亮背景/]
+
+function lightingOf(text: string): { dark: boolean; light: boolean } {
+  return {
+    dark: DARK_LIGHTING.some((r) => r.test(text)),
+    light: LIGHT_LIGHTING.some((r) => r.test(text)),
+  }
+}
+
+/**
+ * The style bible and the shot description ask for opposite lighting or backgrounds
+ * (深色背景 vs 浅灰 / 窗边晨光). QA cannot pass that, so the user is asked once
+ * instead of spending the redo budget. A side that mentions both poles is left alone.
+ */
+export function bibleShotConflict(
+  bible: ReadonlyArray<{ descriptor?: string | null }>,
+  shot: { title?: string; framing?: string; action?: string },
+): string | null {
+  const bibleText = bible.map((b) => b.descriptor ?? '').join('\n')
+  const shotText = [shot.title, shot.framing, shot.action].filter(Boolean).join('\n')
+  if (!bibleText.trim() || !shotText.trim()) return null
+  const b = lightingOf(bibleText)
+  const s = lightingOf(shotText)
+  const bibleDark = b.dark && !b.light
+  const bibleLight = b.light && !b.dark
+  const shotDark = s.dark && !s.light
+  const shotLight = s.light && !s.dark
+  if ((bibleDark && shotLight) || (bibleLight && shotDark)) {
+    return '设定集和这个镜头的光线或背景互相矛盾。请改镜头说明，或改设定后再生成。'
+  }
+  return null
+}
+
 export function qaConfigFromEnv(env: NodeJS.ProcessEnv, grok: boolean): QaConfig {
   const off = (env.OC_STUDIO_QA ?? '').trim().toLowerCase() === 'off'
   return {
@@ -45,8 +97,8 @@ export function qaConfigFromEnv(env: NodeJS.ProcessEnv, grok: boolean): QaConfig
 
 /** QA as the worker and the advancer see it. */
 export type StudioQaDeps = QaConfig & {
-  /** Worst-case credits of one QA call (Grok catalog price); null when the catalog is down. */
-  maxCost?: () => Promise<bigint | null>
+  /** Worst-case credits of one QA call at the director model's price; null when the catalog is down. */
+  maxCost?: (model?: string) => Promise<bigint | null>
 }
 
 /** Which owner kinds QA gates: a clip needs the sandbox to take its frames. */
@@ -134,6 +186,7 @@ export type QaReason =
   | 'retries_exhausted'
   | 'no_improvement'
   | 'unavailable'
+  | 'bible_conflict'
 
 export interface QaJudgement {
   passed: boolean
@@ -148,7 +201,12 @@ export interface QaJudgement {
  * moderation flagged it, the judge is unsure, the redos are used up, or a redo did not beat the
  * best earlier attempt. Every path leaves QA: the owner is adopted, redone or handed to the user.
  */
-export function judgeQa(v: QaVerdict, criteria: Criterion[], h: QaHistory): QaJudgement {
+export function judgeQa(
+  v: QaVerdict,
+  criteria: Criterion[],
+  h: QaHistory,
+  maxAttempts: number = MAX_QA_ATTEMPTS,
+): QaJudgement {
   const score = Math.min(...criteria.map((c) => v[c]))
   const meets = criteria.every((c) => v[c] >= QA_THRESHOLDS[c])
   const out = (passed: boolean, next: QaNext, reason: QaReason): QaJudgement => ({
@@ -161,7 +219,7 @@ export function judgeQa(v: QaVerdict, criteria: Criterion[], h: QaHistory): QaJu
   if (v.moderation === 'review') return out(false, 'handoff', 'moderation_review')
   if (v.confidence < QA_MIN_CONFIDENCE) return out(false, 'handoff', 'low_confidence')
   if (meets) return out(true, 'adopt', 'passed')
-  if (h.attempts + 1 >= MAX_QA_ATTEMPTS) return out(false, 'handoff', 'retries_exhausted')
+  if (h.attempts + 1 >= maxAttempts) return out(false, 'handoff', 'retries_exhausted')
   if (h.attempts >= 1 && h.bestScore !== null && score <= h.bestScore)
     return out(false, 'handoff', 'no_improvement')
   return out(false, 'redo', 'below_threshold')
@@ -176,6 +234,14 @@ export const QA_REASON_TEXT: Record<QaReason, string> = {
   retries_exhausted: '自动重做了 2 次仍未通过',
   no_improvement: '重做后没有变好',
   unavailable: '这次没能完成质检',
+  bible_conflict: '设定集和镜头说明冲突，需要你看一下',
+}
+
+/** Same words as QA_REASON_TEXT. A non-default attempt cap says how many redos actually ran. */
+export function qaReasonText(reason: QaReason, maxAttempts: number = MAX_QA_ATTEMPTS): string {
+  if (reason !== 'retries_exhausted') return QA_REASON_TEXT[reason]
+  const redos = Math.max(0, maxAttempts - 1)
+  return redos === 2 ? QA_REASON_TEXT.retries_exhausted : `自动重做了 ${redos} 次仍未通过`
 }
 
 // ── prompt ─────────────────────────────────────────────────────────────────────────────────────

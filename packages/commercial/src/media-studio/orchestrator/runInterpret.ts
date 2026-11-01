@@ -1,5 +1,6 @@
 // OCV5-591 A2-1b-2 — the interpret task (plan §2.2): the annotated frame (the box / point drawn on
-// it) and the project's shots, lines and system voices go to Grok (platform-paid); the answer is
+// it) and the project's shots, lines and system voices go to the director model the user
+// chose (default grok-build). The call is on the user's ledger at that model's price; the answer is
 // stored per request id before use, checked against the whitelist and this project, written onto
 // the annotation, and run straight away only for an autonomous project and a sure instruction.
 
@@ -21,6 +22,7 @@ import {
   buildInterpretPrompt,
   parseInterpretation,
 } from './interpret.js'
+import { directorModelOf } from './directorModel.js'
 import { withLease } from './lease.js'
 
 interface AnnotationRow {
@@ -207,8 +209,8 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     return
   }
   const p = (
-    await deps.pool.query<{ user_id: string; autonomy: 'max' | 'confirm' }>(
-      'SELECT user_id::text AS user_id, autonomy FROM studio_projects WHERE id = $1',
+    await deps.pool.query<{ user_id: string; autonomy: 'max' | 'confirm'; settings: Record<string, unknown> }>(
+      'SELECT user_id::text AS user_id, autonomy, settings FROM studio_projects WHERE id = $1',
       [task.projectId],
     )
   ).rows[0]
@@ -262,11 +264,12 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       requestId: task.execRequestId,
       attempt: Math.max(0, task.attempts - 1),
       prompt: buildInterpretPrompt(ctx, !!marked),
+      model: directorModelOf(p.settings),
       ...(marked
         ? { image: { mediaType: 'image/jpeg' as const, data: marked.toString('base64') } }
         : {}),
-      // Interpret is the platform's (orchestrator plan §4): never on the user's ledger.
-      billTo: 'platform',
+      // The user chose this model: their permission is checked and their ledger pays its price.
+      billTo: 'user',
       rateKey: `studio-interpret:${p.user_id}`,
       onResult: async (r) => {
         await deps.pool.query(
