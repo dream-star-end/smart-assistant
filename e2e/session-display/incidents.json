@@ -9237,6 +9237,9 @@
     "severity": "P1",
     "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
     "rootFixCommit": "64ba5a7f",
+    "coverageCommits": [
+      "b4fbbfc8"
+    ],
     "regressions": [
       {
         "layer": "unit",
