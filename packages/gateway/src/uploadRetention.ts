@@ -26,7 +26,8 @@ import {
   isStaleUploadPartName,
   shouldDeleteAgedUpload,
 } from '@openclaude/protocol'
-import { paths } from '@openclaude/storage'
+import { paths, scanRecentClientSessionMessages } from '@openclaude/storage'
+import { isV3ContainerRuntime } from './hostStaticProviders.js'
 
 const PUBLISHED_NAME = /^[a-f0-9]{64}\.[a-z0-9]{1,32}$/
 const MEDIA_REF = /(?:\/api\/media\/|\/uploads\/)([A-Za-z0-9._-]+)/g
@@ -113,39 +114,6 @@ function publishedAged(dir: string, now: number): AgedFile[] {
   return out
 }
 
-async function readSessionRefs(dbPath: string, userId: string | null, sinceMs: number, into: Set<string>): Promise<boolean> {
-  try {
-    const mod = (await import('better-sqlite3')) as { default: new (path: string, opts: { readonly: boolean; fileMustExist: boolean }) => {
-      prepare: (sql: string) => { all: (...args: unknown[]) => { messages?: string }[] }
-      close: () => void
-    } }
-    const db = new mod.default(dbPath, { readonly: true, fileMustExist: true })
-    try {
-      const hot = db.prepare(
-        `SELECT messages FROM client_sessions
-          WHERE last_at >= ? AND deleted_at IS NULL
-            AND (messages LIKE '%/api/media/%' OR messages LIKE '%/uploads/%')
-            AND (? IS NULL OR user_id = ?)`,
-      ).all(sinceMs, userId, userId)
-      for (const row of hot) collectMediaNames(String(row.messages ?? ''), into)
-      const archived = db.prepare(
-        `SELECT c.messages AS messages
-           FROM client_session_archive_chunks c
-           JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
-          WHERE s.last_at >= ? AND s.deleted_at IS NULL
-            AND (c.messages LIKE '%/api/media/%' OR c.messages LIKE '%/uploads/%')
-            AND (? IS NULL OR s.user_id = ?)`,
-      ).all(sinceMs, userId, userId)
-      for (const row of archived) collectMediaNames(String(row.messages ?? ''), into)
-    } finally {
-      db.close()
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
 export function readReachedSize(size: number, pull: () => number): boolean {
   let off = 0
   while (off < size) {
@@ -230,7 +198,10 @@ export async function scanRefsForUploads(opts: {
   jsonlRoots: string[]
 }): Promise<RefScan> {
   const names = new Set<string>()
-  const dbOk = await readSessionRefs(opts.sessionsDb, opts.userId, opts.sinceMs, names)
+  // A container cannot see the master's authoritative recent sessions.
+  const dbOk = !isV3ContainerRuntime() && await scanRecentClientSessionMessages({
+    sessionsDb: opts.sessionsDb, userId: opts.userId, sinceMs: opts.sinceMs,
+  }, body => collectMediaNames(body, names))
   let jsonlOk = true
   for (const root of opts.jsonlRoots) {
     if (!scanJsonlTree(root, names)) jsonlOk = false

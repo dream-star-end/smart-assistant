@@ -203,12 +203,12 @@ describe('upload reference scan fails closed', () => {
     const viaUploads = `${'cd'.repeat(32)}.bin`
     const viaArchive = `${'ab'.repeat(32)}.txt`
     const insert = db.prepare('INSERT INTO client_sessions (id, user_id, last_at, deleted_at, messages) VALUES (?, ?, ?, NULL, ?)')
-    insert.run('s-default', 'default', now, `{"url":"/uploads/${viaUploads}"}`)
-    insert.run('s-jwt', 'jwt-user', now, 'hello')
+    insert.run('s-default', 'default', now, JSON.stringify([{ url: `/uploads/${viaUploads}` }]).replaceAll('/', '\\/'))
+    insert.run('s-jwt', 'jwt-user', now, '[]')
     db.prepare('INSERT INTO client_session_archive_chunks (session_id, user_id, first_seq, last_seq, message_count, messages, created_at) VALUES (?, ?, 1, 1, 1, ?, ?)').run(
       's-jwt',
       'jwt-user',
-      `{"url":"/api/media/${viaArchive}"}`,
+      `[{"url":"/api/media/${viaArchive}"}]`,
       now,
     )
     db.close()
@@ -222,7 +222,7 @@ describe('upload reference scan fails closed', () => {
     const barePath = join(root, 'bare.db')
     const bare = new Database(barePath)
     bare.exec('CREATE TABLE client_sessions (id TEXT, user_id TEXT, last_at INTEGER, deleted_at INTEGER, messages TEXT)')
-    bare.prepare('INSERT INTO client_sessions (id, user_id, last_at, deleted_at, messages) VALUES (?, ?, ?, NULL, ?)').run('s', 'default', now, `{"url":"/api/media/${viaUploads}"}`)
+    bare.prepare('INSERT INTO client_sessions (id, user_id, last_at, deleted_at, messages) VALUES (?, ?, ?, NULL, ?)').run('s', 'default', now, `[{"url":"/api/media/${viaUploads}"}]`)
     bare.close()
     const incomplete = await scanRefsForUploads({ userId: null, sessionsDb: barePath, sinceMs: now - 1000, jsonlRoots: [] })
     assert.equal(incomplete.complete, false)

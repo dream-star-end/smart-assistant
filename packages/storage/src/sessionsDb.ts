@@ -1,3 +1,4 @@
+import { scanUploadReferenceRows, UPLOAD_REFERENCE_MAX_BYTES, type UploadReferenceOptions, type UploadReferenceRow } from './sessionUploadReferences.js'
 import type { SessionSnapshot } from '@openclaude/protocol';
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
@@ -5929,7 +5930,26 @@ async function _sqlitePatchServerAuthoredMessage(
   return txn()
 }
 
+async function _sqliteScanRecentClientSessionMessages(opts: UploadReferenceOptions, visit: (body: string) => void): Promise<boolean> {
+  const db = new Database(opts.sessionsDb ?? paths.sessionsDb, { readonly: true, fileMustExist: true })
+  try {
+    const rows = db.prepare(`
+      SELECT id AS sessionId, user_id AS userId,
+             CASE WHEN length(CAST(messages AS BLOB)) < ? THEN messages ELSE NULL END AS messages
+        FROM client_sessions WHERE last_at >= ? AND deleted_at IS NULL AND (? IS NULL OR user_id = ?)
+      UNION ALL
+      SELECT s.id AS sessionId, s.user_id AS userId,
+             CASE WHEN length(CAST(c.messages AS BLOB)) < ? THEN c.messages ELSE NULL END AS messages
+        FROM client_session_archive_chunks c JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+       WHERE s.last_at >= ? AND s.deleted_at IS NULL AND (? IS NULL OR s.user_id = ?)
+    `).iterate(Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES), opts.sinceMs, opts.userId, opts.userId,
+      Math.min(opts.maxBytes ?? UPLOAD_REFERENCE_MAX_BYTES, UPLOAD_REFERENCE_MAX_BYTES), opts.sinceMs, opts.userId, opts.userId) as Iterable<UploadReferenceRow>
+    return await scanUploadReferenceRows(rows, visit, opts)
+  } finally { db.close() }
+}
+
 const sqliteBackend = {
+  scanRecentClientSessionMessages: _sqliteScanRecentClientSessionMessages,
   // ── client_sessions 读写 + 归档 + usage 聚合 ──
   probeSessionsDb: _sqliteProbeSessionsDb,
   upsertClientSession: _sqliteUpsertClientSession,
@@ -6029,6 +6049,12 @@ export function setClientSessionsBackend(b: ClientSessionsBackend): void {
  */
 export function getActiveBackend(): ClientSessionsBackend {
   return _activeBackend
+}
+
+export type { UploadReferenceOptions } from './sessionUploadReferences.js'
+export const scanRecentClientSessionMessages: ClientSessionsBackend['scanRecentClientSessionMessages'] = async (...args) => {
+  if (process.env.OC_SESSIONS_STORE?.trim().toLowerCase() === 'pg' && getActiveBackend() === sqliteBackend) return false
+  try { return await getActiveBackend().scanRecentClientSessionMessages(...args) } catch { return false }
 }
 
 // ── 公有 API:薄委托 active backend ──────────────────────────────────────────

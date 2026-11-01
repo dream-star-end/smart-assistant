@@ -17,6 +17,7 @@ export function expandHydratedRuntimeBatch<Row extends RuntimeBatchRow>(
   hydrated: MessageLike,
   row: Row,
   anchor: MessageLike,
+  maxBytes?: number,
 ): { messages: MessageLike[]; descriptor?: HydratedRuntimeBatchDescriptor } {
   const rawBatch = hydrated._runtimeEventBatch;
   if (rawBatch === undefined) return { messages: [hydrated] };
@@ -46,13 +47,17 @@ export function expandHydratedRuntimeBatch<Row extends RuntimeBatchRow>(
   if (sha256Bytes(Buffer.from(JSON.stringify(manifest), "utf8")) !== manifestSha256) {
     throw new Error(`[pgSessions] lossless runtime batch manifest hash mismatch: ${row.tape_id}\0${row.msg_id}`);
   }
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 ||
+    uncompressedBytes > maxBytes || data.length > Math.ceil(maxBytes / 3) * 4 + 4)) {
+    throw new Error("upload reference runtime batch exceeds remaining budget");
+  }
   const compressed = Buffer.from(data, "base64");
   if (compressed.length !== compressedBytes) {
     throw new Error(`[pgSessions] lossless runtime batch compressed length mismatch: ${row.tape_id}\0${row.msg_id}`);
   }
   let raw: Buffer;
   try {
-    raw = gunzipSync(compressed);
+    raw = gunzipSync(compressed, maxBytes === undefined ? undefined : { maxOutputLength: maxBytes });
   } catch (err) {
     throw new Error(
       `[pgSessions] lossless runtime batch gzip invalid: ${row.tape_id}\0${row.msg_id}: ${(err as Error).message}`,
