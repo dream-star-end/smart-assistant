@@ -388,8 +388,8 @@ describe('T03: Upload size limits', () => {
   it('MAX_UPLOAD_SINGLE is 100MB (aligned to Cloudflare Free/Pro body cap)', () => {
     assert.equal(MAX_UPLOAD_SINGLE, 100 * 1024 * 1024)
   })
-  it('MAX_UPLOAD_TOTAL is 300MB', () => {
-    assert.equal(MAX_UPLOAD_TOTAL, 300 * 1024 * 1024)
+  it('MAX_UPLOAD_TOTAL is 2GiB', () => {
+    assert.equal(MAX_UPLOAD_TOTAL, 2 * 1024 * 1024 * 1024)
   })
   it('single limit is less than total limit', () => {
     assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_TOTAL)

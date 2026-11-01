@@ -746,17 +746,17 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(p.message).toContain("未计费");
   });
 
-  test("errorPresentation attachment total says 330MB and does not ask to retry", () => {
-    const p = errorPresentation("ATTACHMENT_TOTAL_EXCEEDED:345649213", "", undefined);
+  test("errorPresentation attachment total says 2200MB and does not ask to retry", () => {
+    const p = errorPresentation("ATTACHMENT_TOTAL_EXCEEDED:2306867200", "", undefined);
     expect(p.code).toBe("attachment_total_exceeded");
     expect(p.fixedMessage).toBe(true);
     expect(p.waived).toBe(true);
     expect(p.title).toBe("附件超过上限");
-    expect(p.message).toContain("330MB");
-    expect(p.message).toContain("300MB");
+    expect(p.message).toContain("2200MB");
+    expect(p.message).toContain("2048MB");
     expect(p.message).toContain("两条");
     expect(p.message).not.toContain("请重试");
-    expect(isDispatchLostCode("ATTACHMENT_TOTAL_EXCEEDED:345649213")).toBe(false);
+    expect(isDispatchLostCode("ATTACHMENT_TOTAL_EXCEEDED:2306867200")).toBe(false);
   });
   test("isDispatchTerminalRow 去枚举化重试判据(M5)", () => {
     // ① server 持久标记 _dispatchTerminal(code-agnostic)。

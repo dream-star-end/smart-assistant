@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 import { getUserError } from '../userErrorCatalog.js'
 import {
+  MAX_INLINE_TEXT_BYTES,
   MAX_UPLOAD_SINGLE_BYTES,
   MAX_UPLOAD_TOTAL_BYTES,
   attachmentSplitCount,
@@ -13,21 +14,26 @@ import {
 
 describe('upload total limit copy', () => {
   test('345649213 bytes formats as 330MB over 300MB in two messages', () => {
-    const message = attachmentTotalLimitMessage(345649213)
+    const limit = 300 * 1024 * 1024
+    const message = attachmentTotalLimitMessage(345649213, limit)
     assert.equal(formatUploadMegabytes(345649213), 330)
     assert.match(message, /330MB/)
     assert.match(message, /300MB/)
     assert.match(message, /两条/)
     assert.equal(message.includes('请重试'), false)
-    assert.equal(attachmentSplitCount(345649213), 2)
+    assert.equal(attachmentSplitCount(345649213, limit), 2)
   })
 
-  test('300MiB is within the total limit and one extra byte is over', () => {
+  test('2GiB is within the total limit and one extra byte is over', () => {
     assert.equal(MAX_UPLOAD_SINGLE_BYTES, 100 * 1024 * 1024)
-    assert.equal(MAX_UPLOAD_TOTAL_BYTES, 300 * 1024 * 1024)
+    assert.equal(MAX_UPLOAD_TOTAL_BYTES, 2 * 1024 * 1024 * 1024)
+    assert.equal(MAX_INLINE_TEXT_BYTES, 300 * 1024 * 1024)
+    assert.equal(attachmentSplitCount(300 * 1024 * 1024), 1)
     assert.equal(attachmentSplitCount(MAX_UPLOAD_TOTAL_BYTES), 1)
     const over = attachmentTotalLimitMessage(MAX_UPLOAD_TOTAL_BYTES + 1)
     assert.match(over, /超过/)
+    assert.match(over, /2048MB/)
+    assert.equal(over.includes('请重试'), false)
     assert.ok(attachmentSplitCount(MAX_UPLOAD_TOTAL_BYTES + 1) >= 2)
   })
 
