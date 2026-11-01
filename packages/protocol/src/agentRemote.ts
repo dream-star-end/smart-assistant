@@ -219,7 +219,10 @@ export const ReceiptSchema = Type.Union([
   ),
   Type.Object({ status: Type.Literal('failed'), code: id }, closed),
   Type.Object(
-    { status: Type.Literal('cancelled'), stopScope: literalUnion(['leader', 'process-tree']) },
+    {
+      status: Type.Literal('cancelled'),
+      stopScope: literalUnion(['not-started', 'leader', 'process-tree']),
+    },
     closed,
   ),
 ])
