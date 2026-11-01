@@ -1,9 +1,11 @@
 // Single source for the per-file and per-message upload caps.
 // The numeric values are a product limit: do not change them here to paper over a UX bug.
-// 100MiB matches the single-request body cap. 300MiB is the per-message total.
+// 100MiB matches the single-request body cap. 2GiB is the referenced attachment total.
+// Inline text stays at 300MiB because those bytes are copied into the frame.
 
 export const MAX_UPLOAD_SINGLE_BYTES = 100 * 1024 * 1024
-export const MAX_UPLOAD_TOTAL_BYTES = 300 * 1024 * 1024
+export const MAX_UPLOAD_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+export const MAX_INLINE_TEXT_BYTES = 300 * 1024 * 1024
 
 const UPLOAD_MIB = 1024 * 1024
 

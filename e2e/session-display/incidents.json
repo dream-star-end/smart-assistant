@@ -9249,17 +9249,12 @@
       {
         "layer": "unit",
         "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
-        "assertion": "300MiB is within the total limit and one extra byte is over"
-      },
-      {
-        "layer": "unit",
-        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
         "assertion": "attachment total failure code round-trips and rejects other codes"
       },
       {
         "layer": "unit",
         "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
-        "assertion": "noteAttachmentTotalRejection stamps 330MB copy and a parseable code"
+        "assertion": "noteAttachmentTotalRejection stamps 2200MB copy and a parseable code"
       },
       {
         "layer": "unit",
@@ -9274,29 +9269,64 @@
       {
         "layer": "unit",
         "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
-        "assertion": "errorPresentation attachment total says 330MB and does not ask to retry"
+        "assertion": "errorPresentation attachment total says 2200MB and does not ask to retry"
       },
       {
         "layer": "unit",
         "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
-        "assertion": "附件合计超限状态卡说明 330MB 且没有继续按钮"
+        "assertion": "附件合计超限状态卡说明 2200MB 且没有继续按钮"
       },
       {
         "layer": "unit",
         "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "附件合计超过 300MB 时整批不上传并提示分两条发送"
+        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
       },
       {
         "layer": "unit",
         "path": "packages/web-react/src/components/composerAttach.test.tsx",
-        "assertion": "同一帧内第二批附件超过 300MB 时不再上传"
+        "assertion": "同一帧内第二批附件超过 2048MB 时不再上传"
       },
       {
         "layer": "browser",
         "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
-        "assertion": "附件合计超过 300MB 时不上传并提示分条发送"
+        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
+      }
+    ]
+  },
+  {
+    "id": "INC-20261101-UPLOAD-TOTAL-2G",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "引用式附件合计仍被 300MiB 卡住。uid4 四个 rar 加一个 docx 共 345649213 字节，单文件都在 100MiB 内，发送被拒。合计上限改为 2GiB，按已落盘文件的字节计。单文件仍是 100MiB。内联文本仍是 300MiB，因为它进帧而不是引用。提示队列的正文预算仍是 300MiB。预检和拒绝文案沿用合计、上限和分条，不计费。",
+    "rootFixCommit": "d03b36f0",
+    "regressions": [
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "2GiB is within the total limit and one extra byte is over"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/security.test.ts",
+        "assertion": "MAX_UPLOAD_TOTAL is 2GiB"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "message attachment total includes bytes after the 2GiB cap is crossed"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "附件合计超过 2048MB 时整批不上传并提示分两条发送"
+      },
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+        "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
       }
     ]
   }
+
   ]
 }

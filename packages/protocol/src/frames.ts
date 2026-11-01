@@ -116,13 +116,12 @@ export type MediaRef = Static<typeof MediaRef>
 // Composer)与后端(gateway dispatchInbound 帧准入)共用本常量**,消除历史上
 // 前端 8 / 后端 5 的漂移(用户挂 6-8 个上传成功却被后端拒"附件数量超过 5 个")。
 // 这是纯粹的"件数"护栏,与字节体积无关:单文件体积由 MAX_UPLOAD_SINGLE(100MB)、
-// 总体积由 MAX_UPLOAD_TOTAL(300MB)独立守护,故 8 件仍在总量预算内、无内存/帧
+// 总体积由 MAX_UPLOAD_TOTAL(2GiB)独立守护,故 8 件仍在总量预算内、无内存/帧
 // 大小硬约束需要压回 5。取 8 保用户体验(boss 铁律:优化不得降低体验)。
 export const MAX_ATTACHMENTS_PER_MESSAGE = 8
 
-/** Prompt queue durable-content budget. Keep this aligned with gateway's
- * existing per-message aggregate upload ceiling; P1 imports this authority
- * instead of inventing a smaller repository-only limit. */
+/** Prompt queue durable JSON and HTTP body budget. Referenced attachment
+ * bytes use MAX_UPLOAD_TOTAL_BYTES and are not copied into this body. */
 export const PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES = 300 * 1024 * 1024
 
 // ───────────────────────────────────────────────

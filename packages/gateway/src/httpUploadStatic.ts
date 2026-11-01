@@ -14,6 +14,7 @@ import { MIME_MAP } from './gatewayFilePolicy.js'
 // CF 现实让 413 在前端直接拦,而不是被 CF 边缘 HTML 错误页吞掉。
 // Numbers live in @openclaude/protocol so the composer and this process share one cap.
 export {
+  MAX_INLINE_TEXT_BYTES,
   MAX_UPLOAD_SINGLE_BYTES as MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL_BYTES as MAX_UPLOAD_TOTAL,
 } from '@openclaude/protocol'
