@@ -537,20 +537,20 @@ describe("附件 error 态不得静默发送", () => {
   });
 });
 
-describe("附件合计 300MB", () => {
+describe("附件合计 2GiB", () => {
   function fileWithSize(name: string, size: number): File {
     const file = new File([new Uint8Array([1])], name, { type: "application/octet-stream" });
     Object.defineProperty(file, "size", { value: size });
     return file;
   }
 
-  test("附件合计超过 300MB 时整批不上传并提示分两条发送", () => {
+  test("附件合计超过 2048MB 时整批不上传并提示分两条发送", () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/big" }) as MediaRef);
     const onSend = vi.fn();
     render(<Composer onSend={onSend} onUpload={onUpload} />);
     fireEvent.change(screen.getByPlaceholderText("给从简发消息…"), { target: { value: "请看附件" } });
     const shell = screen.getByTestId("composer-shell");
-    const big = 160 * 1024 * 1024;
+    const big = 1100 * 1024 * 1024;
     fireEvent.drop(shell, {
       dataTransfer: {
         types: ["Files"],
@@ -561,8 +561,8 @@ describe("附件合计 300MB", () => {
     });
     expect(onUpload).not.toHaveBeenCalled();
     const notice = screen.getByTestId("composer-upload-total-limit");
-    expect(notice).toHaveTextContent("320MB");
-    expect(notice).toHaveTextContent("300MB");
+    expect(notice).toHaveTextContent("2200MB");
+    expect(notice).toHaveTextContent("2048MB");
     expect(notice).toHaveTextContent("两条");
     expect(notice.textContent ?? "").not.toContain("请重试");
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
@@ -570,11 +570,11 @@ describe("附件合计 300MB", () => {
     expect(onSend.mock.calls[0]?.[1] ?? []).toHaveLength(0);
   });
 
-  test("同一帧内第二批附件超过 300MB 时不再上传", () => {
+  test("同一帧内第二批附件超过 2048MB 时不再上传", () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/api/media/part" }) as MediaRef);
     render(<Composer onSend={() => {}} onUpload={onUpload} />);
     const shell = screen.getByTestId("composer-shell");
-    const part = 200 * 1024 * 1024;
+    const part = 1500 * 1024 * 1024;
     const drop = (name: string) => ({
       dataTransfer: {
         types: ["Files"],
@@ -588,6 +588,6 @@ describe("附件合计 300MB", () => {
       fireEvent.drop(shell, drop("second.rar"));
     });
     expect(onUpload).toHaveBeenCalledTimes(1);
-    expect(screen.getByTestId("composer-upload-total-limit")).toHaveTextContent("400MB");
+    expect(screen.getByTestId("composer-upload-total-limit")).toHaveTextContent("3000MB");
   });
 });
