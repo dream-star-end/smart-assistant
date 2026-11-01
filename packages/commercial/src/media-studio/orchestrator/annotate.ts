@@ -19,6 +19,7 @@ import type { PoolClient } from 'pg'
 
 import { appendStudioEvent } from '../store.js'
 import type { Interpretation } from './interpret.js'
+import { PAUSE_PROVIDER_CODES } from './providerFailure.js'
 
 export type Target =
   | { kind: 'shot'; id: string; minVideo: number }
@@ -210,6 +211,17 @@ export async function executeAnnotation(
     }
 
     // A finished film (or one waiting on the user, or being composed) goes back to the director.
+    // Leaving a provider outage is the same continuation as approve(): acknowledge those
+    // failures first, or decide() pauses again on another shot's unacked outage before this
+    // redo is queued.
+    await c.query(
+      `UPDATE studio_takes SET meta = meta || '{"providerFailureAcknowledged":true}'::jsonb
+        WHERE project_id = $1 AND status = 'failed' AND error_code = ANY($2::text[])
+          AND EXISTS (SELECT 1 FROM studio_projects p
+                       WHERE p.id = $1 AND p.status = 'awaiting_user'
+                         AND p.settings->>'awaitingReason' = 'provider_failure')`,
+      [projectId, PAUSE_PROVIDER_CODES],
+    )
     const reopened = await c.query(
       `UPDATE studio_projects SET status = 'running', settings = settings - 'awaitingReason',
               rev = rev + 1, updated_at = NOW()

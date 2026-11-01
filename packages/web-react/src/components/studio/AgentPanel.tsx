@@ -7,10 +7,12 @@ import { useState } from 'react'
 import { studioApi, studioErrorText } from '../../lib/studio/api'
 import { budgetPercent, formatCredits } from '../../lib/studio/format'
 import { type ShotCardModel, eventText, eventTone } from '../../lib/studio/model'
+import { studioPause } from '../../lib/studio/pause'
 import type { StudioProjectView, StudioTake } from '../../lib/studio/types'
 import type { AuthSession } from '../../lib/types'
 import { useToast } from '../ui'
 import { MediaThumb, isVideoTake } from './MediaThumb'
+import { StudioContinue } from './StudioContinue'
 
 const STATUS_LINE: Record<string, string> = {
   draft: '等你开拍',
@@ -40,7 +42,8 @@ export function AgentPanel(props: {
   onReload?: () => void
 }) {
   const { project, events, takes } = props.view
-  const needs = props.cards.filter((c) => c.tone === 'needs')
+  const pause = studioPause(project, events)
+  const needs = props.cards.filter((c) => c.tone === 'needs' && c.chip !== '已暂停，需要你')
   const toast = useToast()
   const [adopting, setAdopting] = useState<string | null>(null)
   const closed =
@@ -76,10 +79,12 @@ export function AgentPanel(props: {
               className="st-dot"
               style={{ color: project.status === 'running' ? 'var(--success)' : 'var(--faint)' }}
             />
-            {project.status === 'awaiting_user' &&
-            project.settings?.awaitingReason === 'compose_failed'
-              ? '成片没有合成成功，可以在成片页重新合成'
-              : (STATUS_LINE[project.status] ?? project.status)}
+            {pause
+              ? pause.reason
+              : project.status === 'awaiting_user' &&
+                  project.settings?.awaitingReason === 'compose_failed'
+                ? '成片没有合成成功，可以在成片页重新合成'
+                : (STATUS_LINE[project.status] ?? project.status)}
           </div>
         </div>
         <span style={{ flex: 1 }} />
@@ -91,6 +96,7 @@ export function AgentPanel(props: {
         ) : null}
       </div>
       <div className="st-agent-body">
+        <StudioContinue auth={props.auth} view={props.view} {...(props.onReload ? { onReload: props.onReload } : {})} />
         {needs.map((c) => {
           const options = takes
             .filter(

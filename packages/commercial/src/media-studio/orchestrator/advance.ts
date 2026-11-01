@@ -140,8 +140,20 @@ export async function loadState(
     ),
   ])
   const user = { id: project.user_id }
-  const can = (k: keyof typeof REPRESENTATIVE_OP) =>
-    deps.providers.candidates(k, REPRESENTATIVE_OP[k], user, { includeOffline: true }).length > 0
+  const providerIds = {
+    image: deps.providers
+      .candidates('image', REPRESENTATIVE_OP.image, user, { includeOffline: true })
+      .map((p) => p.id),
+    video: deps.providers
+      .candidates('video', REPRESENTATIVE_OP.video, user, { includeOffline: true })
+      .map((p) => p.id),
+    voice: deps.providers
+      .candidates('voice', REPRESENTATIVE_OP.voice, user, { includeOffline: true })
+      .map((p) => p.id),
+    music: deps.providers
+      .candidates('music', REPRESENTATIVE_OP.music, user, { includeOffline: true })
+      .map((p) => p.id),
+  }
   // A2-1b-1: QA calls count against the in-flight budget like generations.
   const inflight = tasks.rows
     .filter((t) => t.kind === 'gen' || t.kind === 'qa')
@@ -191,11 +203,12 @@ export async function loadState(
     bibleCandidates: deps.qa?.bibleCandidates ?? 1,
     qaQueued: tasks.rows.flatMap((t) => (t.kind === 'qa' ? (t.qa_takes ?? []) : [])),
     canDispatch: {
-      image: can('image'),
-      video: can('video'),
-      voice: can('voice'),
-      music: can('music'),
+      image: providerIds.image.length > 0,
+      video: providerIds.video.length > 0,
+      voice: providerIds.voice.length > 0,
+      music: providerIds.music.length > 0,
     },
+    providerIds,
   }
   const bible = assets.rows
     .filter((a) => a.kind === 'character' || a.kind === 'scene' || a.kind === 'style')
@@ -530,6 +543,13 @@ async function apply(
         a.status,
         id,
       ])
+      if (a.reason === 'providers_exhausted') {
+        await appendStudioEvent(client, id, 'provider.exhausted', {
+          ownerKind: 'shot',
+          ownerId: a.shotId,
+          message: '可用的服务都试过了，这一步需要你看一下。',
+        })
+      }
     } else if (a.type === 'line_status') {
       await client.query('UPDATE studio_lines SET status = $2 WHERE id = $1 AND project_id = $3', [
         a.lineId,

@@ -452,9 +452,10 @@ export function makeOrchestratorApi(
           status: string
           blob_sha: string | null
           pstatus: string
+          reason: string | null
         }>(
           `SELECT t.project_id::text AS project_id, t.owner_kind, t.owner_id::text AS owner_id, t.status, t.blob_sha,
-                  p.status AS pstatus
+                  p.status AS pstatus, p.settings->>'awaitingReason' AS reason
              FROM studio_takes t JOIN studio_projects p ON p.id = t.project_id
             WHERE t.id = $1 AND p.user_id = $2 AND p.deleted_at IS NULL
             FOR UPDATE OF p`,
@@ -500,6 +501,17 @@ export function makeOrchestratorApi(
           ])
         } else {
           throw new HttpError(409, 'STUDIO_BAD_TRANSITION', 'this take cannot be chosen yet')
+        }
+        // Picking a version while the project is waiting on a provider outage is the same
+        // continuation as approve(): acknowledge those failures first. Otherwise decide()
+        // sees an older shot's unacked MUSE_BRIDGE_LOST and pauses again before the new
+        // video is queued (the pick already opened a fresh window on this shot only).
+        if (t.pstatus === 'awaiting_user' && t.reason === 'provider_failure') {
+          await c.query(
+            `UPDATE studio_takes SET meta = meta || '{"providerFailureAcknowledged":true}'::jsonb
+              WHERE project_id = $1 AND status = 'failed' AND error_code = ANY($2::text[])`,
+            [t.project_id, PAUSE_PROVIDER_CODES],
+          )
         }
         // A new choice returns composition to the director, which dispatches any replacement
         // video before composing again. Keep budget/plan approval and user pauses intact.

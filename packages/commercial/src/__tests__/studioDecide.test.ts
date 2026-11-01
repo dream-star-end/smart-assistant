@@ -266,4 +266,98 @@ describe('decide (OCV5-591 A2-1a)', () => {
     // Nothing composes while a generation is still in flight.
     assert.ok(!decide({ ...ready, inflight: 1 }).some((a) => a.type === 'enqueue_compose'))
   })
+
+  it('a shot whose providers all failed is handed to the user instead of staying generating', () => {
+    const s = state({
+      providerIds: { image: ['gpt-image'], video: ['muse-video'], voice: [], music: [] },
+      shots: [{ id: 's0', ordinal: 0, status: 'generating', activeTakeId: null, frameTakeId: 'f1' }],
+      takes: [
+        take({ id: 'f1' }),
+        take({
+          id: 'v1',
+          ownerKind: 'shot_video',
+          provider: 'muse-video',
+          status: 'failed',
+          blobSha: null,
+          errorCode: 'PROVIDER_OFFLINE',
+        }),
+      ],
+    })
+    assert.deepEqual(decide(s), [
+      { type: 'shot_status', shotId: 's0', status: 'needs_user', reason: 'providers_exhausted' },
+      { type: 'set_status', status: 'awaiting_user', reason: 'needs_user' },
+    ])
+  })
+
+  it('an exhausted shot is still handed over when another shot pauses the project', () => {
+    const s = state({
+      providerIds: { image: ['gpt-image'], video: ['muse-video'], voice: [], music: [] },
+      shots: [
+        { id: 's0', ordinal: 0, status: 'generating', activeTakeId: null, frameTakeId: 'f0' },
+        { id: 's1', ordinal: 1, status: 'generating', activeTakeId: null, frameTakeId: 'f1' },
+      ],
+      takes: [
+        take({ id: 'f0', ownerId: 's0' }),
+        take({
+          id: 'v0',
+          ownerId: 's0',
+          ownerKind: 'shot_video',
+          provider: 'muse-video',
+          status: 'failed',
+          blobSha: null,
+          errorCode: 'MUSE_BRIDGE_LOST',
+        }),
+        take({ id: 'f1', ownerId: 's1' }),
+        take({
+          id: 'v1',
+          ownerId: 's1',
+          ownerKind: 'shot_video',
+          provider: 'muse-video',
+          status: 'failed',
+          blobSha: null,
+          errorCode: 'PROVIDER_OFFLINE',
+        }),
+      ],
+    })
+    assert.deepEqual(decide(s), [
+      { type: 'shot_status', shotId: 's1', status: 'needs_user', reason: 'providers_exhausted' },
+      {
+        type: 'set_status',
+        status: 'awaiting_user',
+        reason: 'provider_failure',
+        providerCode: 'MUSE_BRIDGE_LOST',
+      },
+    ])
+  })
+
+  it('an acknowledged provider failure does not re-pause a shot the user is retrying', () => {
+    const s = state({
+      shots: [
+        {
+          id: 's0',
+          ordinal: 0,
+          status: 'generating',
+          activeTakeId: null,
+          frameTakeId: 'f1',
+          redo: { frame: 0, video: 2 },
+        },
+      ],
+      takes: [
+        take({ id: 'f1' }),
+        take({
+          id: 'v1',
+          ownerKind: 'shot_video',
+          provider: 'muse-video',
+          status: 'failed',
+          blobSha: null,
+          errorCode: 'MUSE_BRIDGE_LOST',
+          providerFailureAcknowledged: true,
+        }),
+      ],
+    })
+    const d = decide(s).find((a) => a.type === 'dispatch')
+    assert.ok(d && d.type === 'dispatch')
+    assert.equal(d.dispatch.ownerKind, 'shot_video')
+    assert.equal(d.dispatch.op, 'video.from_image')
+  })
 })

@@ -90,6 +90,11 @@ export interface DState {
   bibleCandidates?: number
   /** Takes with a queued / leased QA task. */
   qaQueued?: string[]
+  /**
+   * Provider ids that can accept this kind, including ones that are offline.
+   * Absent: callers that predate exhaustion handling; decide does not infer it.
+   */
+  providerIds?: { image: string[]; video: string[]; voice: string[]; music: string[] }
 }
 
 export interface Dispatch {
@@ -108,7 +113,13 @@ export type Action =
   | { type: 'enqueue_plan' }
   | { type: 'dispatch'; dispatch: Dispatch }
   | { type: 'set_status'; status: ProjectStatus; reason?: string; providerCode?: string }
-  | { type: 'shot_status'; shotId: string; status: DShot['status'] }
+  | {
+      type: 'shot_status'
+      shotId: string
+      status: DShot['status']
+      /** Every provider for this step already failed: the shot waits, it does not stay "generating". */
+      reason?: 'providers_exhausted'
+    }
   /** A finished video nobody adopted (the executor declined: the shot had moved on meanwhile). */
   | { type: 'adopt_video'; shotId: string; takeId: string }
   | { type: 'line_status'; lineId: string; status: DLine['status'] }
@@ -131,6 +142,67 @@ const ok = (t: DTake) => t.status === 'succeeded' && t.blobSha !== null
 const failedProviders = (ts: DTake[]) => [
   ...new Set(ts.filter((t) => t.status === 'failed' && !pausesProvider(t.errorCode)).map((t) => t.provider)),
 ]
+
+function windowTakes(s: DState, shot: DShot, kind: 'shot_frame' | 'shot_video'): DTake[] {
+  const floor = kind === 'shot_frame' ? (shot.redo?.frame ?? 0) : (shot.redo?.video ?? 0)
+  return ownerTakes(s, kind, shot.id).filter(
+    (t) => t.version >= floor || (kind === 'shot_frame' && t.id === shot.frameTakeId),
+  )
+}
+
+/** Every provider that could run this step has already failed it. Pause-codes are not "exhausted":
+ *  those wait for the user to continue, and the same provider is tried again after they do. */
+function providersExhausted(s: DState, kind: 'image' | 'video', ts: DTake[]): boolean {
+  const ids = s.providerIds?.[kind]
+  if (!ids) return false
+  const failed = failedProviders(ts)
+  if (failed.length === 0) return false
+  if (ids.length === 0) return true
+  const have = new Set(failed)
+  return ids.every((id) => have.has(id))
+}
+
+/** Shots that can never finish the step they are on: mark them for the user instead of leaving
+ *  them on "generating" while the project pauses for something else. */
+function terminalShots(s: DState): Action[] {
+  const bible = s.assets.filter((a) => BIBLE_KINDS.has(a.kind))
+  const bibleReady = bible.every((a) => a.locked && a.blobSha)
+  const out: Action[] = []
+  for (const shot of s.shots) {
+    if (shotDone(s, shot) || shot.status === 'needs_user' || shot.status === 'failed') continue
+    const frames = windowTakes(s, shot, 'shot_frame')
+    const videos = windowTakes(s, shot, 'shot_video')
+    if (frames.some(live) || videos.some(live)) continue
+    const picked = shot.frameTakeId
+      ? frames.find((t) => t.id === shot.frameTakeId && ok(t))
+      : undefined
+    const frame =
+      picked ?? [...frames].filter((t) => accepted(s, t)).sort((a, b) => b.version - a.version)[0]
+    if (!frame) {
+      if (!bibleReady && frames.length === 0) continue
+      if (providersExhausted(s, 'image', frames)) {
+        out.push({
+          type: 'shot_status',
+          shotId: shot.id,
+          status: 'needs_user',
+          reason: 'providers_exhausted',
+        })
+      }
+      continue
+    }
+    const usable = [...videos].filter((t) => accepted(s, t)).sort((a, b) => b.version - a.version)[0]
+    if (usable && !shot.frameTakeId) continue
+    if (providersExhausted(s, 'video', videos)) {
+      out.push({
+        type: 'shot_status',
+        shotId: shot.id,
+        status: 'needs_user',
+        reason: 'providers_exhausted',
+      })
+    }
+  }
+  return out
+}
 
 /** A shot is done only when its adopted take is a succeeded video (plan r1 P1-3). */
 /** QA gates this owner kind. */
@@ -195,7 +267,18 @@ export function decide(s: DState): Action[] {
     if (line.status !== 'ready' && line.status !== 'needs_user' && line.status !== 'failed')
       failure ??= pendingFailure(ownerTakes(s, 'line', line.id))
   }
-  if (failure) return [{ type: 'set_status', status: 'awaiting_user', reason: 'provider_failure', providerCode: failure.errorCode! }]
+  // Exhausted shots are handed over even when another owner's outage pauses the project.
+  // Otherwise a muse failover on shots 3–4 stays "generating" for as long as shot 5 is paused.
+  const terminal = terminalShots(s)
+  const terminalIds = new Set(
+    terminal.flatMap((a) => (a.type === 'shot_status' ? [a.shotId] : [])),
+  )
+  if (failure) {
+    return [
+      ...terminal,
+      { type: 'set_status', status: 'awaiting_user', reason: 'provider_failure', providerCode: failure.errorCode! },
+    ]
+  }
 
   const actions: Action[] = []
   let budget = Math.max(0, MAX_INFLIGHT_PER_PROJECT - s.inflight)
@@ -271,7 +354,7 @@ export function decide(s: DState): Action[] {
   // 2) shots: first frame (after the bible is locked), then the video from it.
   for (const shot of [...s.shots].sort((a, b) => a.ordinal - b.ordinal)) {
     if (shotDone(s, shot)) continue
-    if (shot.status === 'needs_user' || shot.status === 'failed') {
+    if (shot.status === 'needs_user' || shot.status === 'failed' || terminalIds.has(shot.id)) {
       blocked = true
       continue
     }
@@ -402,5 +485,5 @@ export function decide(s: DState): Action[] {
   } else if (blocked && s.inflight === 0 && !dispatched) {
     actions.push({ type: 'set_status', status: 'awaiting_user', reason: 'needs_user' })
   }
-  return actions
+  return terminal.length ? [...terminal, ...actions] : actions
 }
