@@ -9326,6 +9326,40 @@
         "assertion": "附件合计超过 2048MB 时不上传并提示分条发送"
       }
     ]
+  },
+  {
+    "id": "INC-20261101-UPLOAD-CHUNK-1G",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "单次 HTTP 正文仍是 100MiB，组装后的单个文件可以到 1GiB。文件按 16MiB 分片上传，可以断点续传并看到进度。跨机路径按片推送，由 agent 流式拼接。每人有 10GiB 免费上传空间，满了提示删除旧文件，本次不收费。已发布文件保留 30 天，最近会话仍引用的不删。残留分片会清理。rar 和 zip 不自动解压。不改计费。",
+    "rootFixCommit": "57b6cbd6",
+    "regressions": [
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "10GiB quota tells the user to delete old files and does not charge"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadChunk.test.ts",
+        "assertion": "assembled file cap is 1GiB and one HTTP body stays 100MiB"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/security.test.ts",
+        "assertion": "HTTP body stays 100MiB and the assembled file cap is 1GiB"
+      },
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+        "assertion": "单个文件超过 1024MB 时不上传"
+      }
+    ]
   }
 
   ]
