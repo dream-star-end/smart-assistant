@@ -9375,7 +9375,7 @@
     "severity": "P1",
     "symptom": "单次 HTTP 正文仍是 100MiB，组装后的单个文件可以到 1GiB。文件按 16MiB 分片上传，可以断点续传并看到进度。跨机路径按片推送，由 agent 流式拼接。每人有 10GiB 免费上传空间，满了提示删除旧文件，本次不收费。已发布文件保留 30 天，最近会话仍引用的不删。残留分片会清理。rar 和 zip 不自动解压。不改计费。",
     "rootFixCommit": "57b6cbd6",
-    "coverageCommits": ["b228846d", "9717d18b", "32b9c85f", "49bbf9b3"],
+    "coverageCommits": ["b228846d", "9717d18b", "32b9c85f", "49bbf9b3", "829a9925"],
     "regressions": [
       {
         "layer": "integration",
