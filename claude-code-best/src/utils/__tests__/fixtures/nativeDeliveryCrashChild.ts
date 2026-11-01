@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 const [root, point, mode, control] = process.argv.slice(2)
 if (!root || !point || !mode || !control) throw Error('fixture arguments')
@@ -17,6 +17,7 @@ process.env.TEST_ENABLE_SESSION_PERSISTENCE = '1'
 // Load the real Node control process while CCB imports. It waits on stdin;
 // no commit request exists until the Writer produces its lock-held proof.
 const controlChild = spawn('node', ['--import', 'tsx', control, 'commit', root], {
+  cwd: dirname(control),
   stdio: ['pipe', 'pipe', 'pipe'],
 })
 const controlClosed = once(controlChild, 'close')
