@@ -9,6 +9,7 @@ import { type ShotCardModel, shotCard, timeline } from '../../../lib/studio/mode
 import type { ProvidersView, StudioProjectView, StudioTake } from '../../../lib/studio/types'
 import type { AuthSession } from '../../../lib/types'
 import { AgentPanel } from '../AgentPanel'
+import { StudioContinue } from '../StudioContinue'
 import { MediaThumb } from '../MediaThumb'
 import { ShotCard } from '../ShotCard'
 import { Timeline } from '../Timeline'
@@ -67,6 +68,11 @@ export function BoardPage(props: {
               {formatCredits(view.project.budgetCredits)}
             </span>
           </div>
+          <StudioContinue
+            auth={auth}
+            view={view}
+            {...(props.onReload ? { onReload: props.onReload } : {})}
+          />
           <div className="st-row st-board-head">
             <h2 className="st-title" style={{ fontSize: 18 }}>
               镜头

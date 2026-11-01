@@ -81,11 +81,19 @@ export function shotCard(view: StudioProjectView, shot: StudioShot): ShotCardMod
   const qaScore = qaScoreOf(shown)
   const versions = all.filter((t) => t.ownerKind === 'shot_video').length || all.length
   const costCredits = all.reduce((s, t) => s + (Number(t.costCredits) || 0), 0)
+  const awaiting =
+    typeof view.project?.settings?.awaitingReason === 'string'
+      ? view.project.settings.awaitingReason
+      : null
+  const projectPaused =
+    view.project?.status === 'paused' ||
+    (view.project?.status === 'awaiting_user' && awaiting === 'provider_failure')
+  const activeTask = view.takes.some((t) => t.status === 'queued' || t.status === 'running')
   let tone: ShotCardModel['tone'] = 'planned'
   let chip = '待生成'
   if (shot.status === 'needs_user') {
     tone = 'needs'
-    chip = '需要你'
+    chip = all[0]?.status === 'failed' ? '失败，需要你' : '需要你'
   } else if (shot.status === 'failed') {
     tone = 'bad'
     chip = '失败'
@@ -93,8 +101,14 @@ export function shotCard(view: StudioProjectView, shot: StudioShot): ShotCardMod
     tone = 'ok'
     chip = qaScore !== null ? `通过 ${qaScore.toFixed(2)}` : '通过'
   } else if (shot.status === 'generating' || shot.status === 'qa' || running) {
-    tone = 'gen'
-    chip = shot.status === 'qa' ? '质检中' : versions > 1 ? `重拍 v${versions}` : '生成中'
+    // A paused project with nothing in flight is not still generating.
+    if (projectPaused && !activeTask && !running) {
+      tone = 'needs'
+      chip = '已暂停，需要你'
+    } else {
+      tone = 'gen'
+      chip = shot.status === 'qa' ? '质检中' : versions > 1 ? `重拍 v${versions}` : '生成中'
+    }
   } else if (queued) {
     tone = 'queued'
     chip = '排队'

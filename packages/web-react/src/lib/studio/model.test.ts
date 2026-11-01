@@ -69,6 +69,53 @@ describe('shotCard (OCV5-593)', () => {
     expect(shotCard(v, v.shots[1]!).tone).toBe('queued')
     expect(shotCard(v, v.shots[2]!).tone).toBe('gen')
   })
+
+  test('a paused project with nothing in flight says so instead of 生成中', () => {
+    const project = {
+      id: 'p',
+      title: '',
+      brief: '',
+      status: 'paused' as const,
+      autonomy: 'max' as const,
+      aspect: '16:9' as const,
+      fps: 24,
+      targetSec: 30,
+      budgetCredits: '1',
+      spentCredits: '0',
+      reservedCredits: '0',
+      settings: {},
+      rev: 1,
+      createdAt: '',
+      updatedAt: '',
+    }
+    const held = view({
+      project,
+      shots: [shot(0, { status: 'generating' })],
+      takes: [take({ status: 'failed', blobSha: null, errorCode: 'PROVIDER_OFFLINE' })],
+    })
+    expect(shotCard(held, held.shots[0]!).chip).toBe('已暂停，需要你')
+    expect(shotCard(held, held.shots[0]!).tone).toBe('needs')
+    const busy = view({
+      project,
+      shots: [shot(0, { status: 'generating' })],
+      takes: [take({ status: 'running', blobSha: null })],
+    })
+    expect(shotCard(busy, busy.shots[0]!).chip).toBe('生成中')
+    const outage = view({
+      project: { ...project, status: 'awaiting_user', settings: { awaitingReason: 'provider_failure' } },
+      shots: [shot(0, { status: 'generating' })],
+      takes: [take({ status: 'failed', blobSha: null, errorCode: 'MUSE_BRIDGE_LOST' })],
+    })
+    expect(shotCard(outage, outage.shots[0]!).chip).toBe('已暂停，需要你')
+  })
+
+  test('a needs_user shot whose newest take failed reads as 失败，需要你', () => {
+    const v = view({
+      shots: [shot(0, { status: 'needs_user' })],
+      takes: [take({ status: 'failed', blobSha: null, errorCode: 'PROVIDER_OFFLINE' })],
+    })
+    expect(shotCard(v, v.shots[0]!).chip).toBe('失败，需要你')
+  })
 })
 
 describe('timeline (OCV5-593)', () => {
