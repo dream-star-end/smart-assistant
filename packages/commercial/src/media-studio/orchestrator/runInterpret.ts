@@ -22,6 +22,7 @@ import {
   buildInterpretPrompt,
   parseInterpretation,
 } from './interpret.js'
+import { bookDirectorCharge, resettleStored } from './directorCharge.js'
 import { directorModelOf } from './directorModel.js'
 import { withLease } from './lease.js'
 
@@ -203,9 +204,15 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     )
   ).rows[0]
   if (!a || a.status !== 'sent' || a.interpretation) {
-    await withLease(deps.pool, task, (c) =>
-      finishStudioTask(c, task, { status: 'done', error: 'nothing to interpret' }),
+    const owner = await deps.pool.query<{ user_id: string }>(
+      'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+      [task.projectId],
     )
+    const userId = owner.rows[0] ? BigInt(owner.rows[0].user_id) : null
+    await withLease(deps.pool, task, async (c) => {
+      await bookDirectorCharge(deps.pool, task, c, userId)
+      await finishStudioTask(c, task, { status: 'done', error: 'nothing to interpret' })
+    })
     return
   }
   const p = (
@@ -232,12 +239,17 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     : null
   const ctx = await context(deps, a, take)
 
-  const stored = await deps.pool.query<{ output: { text?: string; frameSha?: string | null } }>(
+  const stored = await deps.pool.query<{
+    output: { text?: string; frameSha?: string | null; usage?: unknown; requestId?: string }
+  }>(
     'SELECT output FROM studio_step_results WHERE request_id = $1',
     [task.execRequestId],
   )
   let answer = typeof stored.rows[0]?.output?.text === 'string' ? stored.rows[0].output.text : null
   let frameSha = stored.rows[0]?.output?.frameSha ?? a.frame_blob_sha
+  if (answer !== null) {
+    await resettleStored(deps, userId, stored.rows[0]?.output, 'INTERPRET_BILLING')
+  }
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError(
@@ -279,7 +291,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
             task.execRequestId,
             p.user_id,
             task.id,
-            JSON.stringify({ text: r.text, model: r.model, frameSha }),
+            JSON.stringify({ text: r.text, model: r.model, frameSha, usage: r.usage, requestId: r.requestId }),
           ],
         )
       },
@@ -323,6 +335,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       })
       if (autoApply(interpretation, p.autonomy)) await executeAnnotation(c, task.projectId, a.id)
     }
+    await bookDirectorCharge(deps.pool, task, c, userId)
     await finishStudioTask(c, task, { status: 'done' })
   })
 }
@@ -359,6 +372,11 @@ export async function failInterpret(
         })
       }
     }
+    const owner = await c.query<{ user_id: string }>(
+      'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+      [task.projectId],
+    )
+    await bookDirectorCharge(deps.pool, task, c, owner.rows[0] ? BigInt(owner.rows[0].user_id) : null)
     await finishStudioTask(c, task, { status: 'failed', error: `${e.code}: ${e.message}` })
   })
 }

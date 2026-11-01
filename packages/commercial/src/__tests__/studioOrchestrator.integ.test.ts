@@ -317,13 +317,25 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       const [task] = await claimStudioTasks(getPool(), { owner: 'planner', limit: 1, museOnline: false })
       assert.ok(task)
       let calls = 0
-      const billing = async () => { throw new Error('platform planner touched user billing') }
+      let settled = 0
       d.grok = makeGrokRunner({
         getPool, preCheckRedis: new InMemoryPreCheckRedis(), pricing: new PricingCache(),
         catalog: { assertFresh: async () => grokVisionSnapshot() }, loadUserModelAuthz: async () => PUBLIC_VISION_AUTHZ,
         pickAccountId: async () => 24n, freshToken: async () => Buffer.from('test-token'), recordStatus: async () => {},
-        preCheckWithCostFn: billing, startInflightJournalFn: billing, settleDurableCodexBillingFn: billing,
-        abortInflightJournalFn: billing, releasePreCheckFn: billing,
+        preCheckWithCostFn: (async (_r: unknown, input: { maxCost: bigint; userId: bigint; requestId: string }) => ({
+          maxCost: input.maxCost,
+          balance: 1000n,
+          capped: false,
+          originalMaxCost: input.maxCost,
+          reservation: { userId: String(input.userId), requestId: input.requestId },
+        })) as never,
+        startInflightJournalFn: (async () => true) as never,
+        settleDurableCodexBillingFn: (async () => {
+          settled += 1
+          return 'committed'
+        }) as never,
+        abortInflightJournalFn: (async () => true) as never,
+        releasePreCheckFn: (async () => {}) as never,
         requestFn: async (_url, init) => {
           calls++
           const isPlan = JSON.parse(init.body).stream === true
@@ -351,6 +363,7 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       })
       await executeTask(d, task, signal())
       assert.equal(calls, 2, 'one moderation and one planning request, no extra fallback request')
+      assert.equal(settled, 1, 'planning is billed to the user once; brief moderation stays platform-paid')
       const shots = await query('SELECT ordinal, spec FROM studio_shots WHERE project_id=$1 ORDER BY ordinal', [project.id])
       const assets = await query('SELECT kind, name, descriptor FROM studio_assets WHERE project_id=$1', [project.id])
       finalized.push({ shots: shots.rows, assets: assets.rows })

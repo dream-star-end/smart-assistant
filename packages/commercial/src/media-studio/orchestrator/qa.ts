@@ -53,8 +53,10 @@ export function qaAttemptsFor(
   return n
 }
 
-const DARK_LIGHTING = [/深色/, /暗色/, /黑夜/, /夜景/, /昏暗/, /暗背景/, /黑色背景/, /暗调/]
-const LIGHT_LIGHTING = [/浅灰/, /浅色/, /晨光/, /明亮/, /窗边/, /日光/, /白天/, /白昼/, /高调/, /亮背景/]
+// Lighting and background only. Bare 深色/浅色 also match clothing (深色西装、浅色衬衫)
+// and would both block a normal shot and hide a real 深色背景 conflict.
+const DARK_LIGHTING = [/深色背景/, /暗色背景/, /黑色背景/, /暗背景/, /暗调/, /黑夜/, /夜景/, /昏暗/]
+const LIGHT_LIGHTING = [/浅灰/, /浅色背景/, /晨光/, /明亮/, /窗边/, /日光/, /白天/, /白昼/, /高调/, /亮背景/]
 
 function lightingOf(text: string): { dark: boolean; light: boolean } {
   return {
@@ -67,12 +69,17 @@ function lightingOf(text: string): { dark: boolean; light: boolean } {
  * The style bible and the shot description ask for opposite lighting or backgrounds
  * (深色背景 vs 浅灰 / 窗边晨光). QA cannot pass that, so the user is asked once
  * instead of spending the redo budget. A side that mentions both poles is left alone.
+ * Character text is not lighting: a dark suit must not fight morning light, and a
+ * light shirt must not cancel a dark-background style.
  */
 export function bibleShotConflict(
-  bible: ReadonlyArray<{ descriptor?: string | null }>,
+  bible: ReadonlyArray<{ kind?: string | null; descriptor?: string | null }>,
   shot: { title?: string; framing?: string; action?: string },
 ): string | null {
-  const bibleText = bible.map((b) => b.descriptor ?? '').join('\n')
+  const bibleText = bible
+    .filter((b) => b.kind !== 'character')
+    .map((b) => b.descriptor ?? '')
+    .join('\n')
   const shotText = [shot.title, shot.framing, shot.action].filter(Boolean).join('\n')
   if (!bibleText.trim() || !shotText.trim()) return null
   const b = lightingOf(bibleText)

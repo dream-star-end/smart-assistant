@@ -208,8 +208,10 @@ export function BriefPage(props: {
   }, [project.brief, editing])
   useEffect(() => {
     let live = true
-    api
-      .getPublicModels(auth)
+    const load = api?.getPublicModels
+    if (typeof load !== 'function') return
+    void load
+      .call(api, auth)
       .then((r) => {
         if (live) setGrokModels(r.models.filter((m) => m.engine === 'grok' && m.degraded !== true))
       })

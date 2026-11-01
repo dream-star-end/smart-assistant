@@ -203,8 +203,9 @@ export class StudioStore {
         throw new HttpError(409, 'STUDIO_PROJECT_LIMIT', 'too many studio projects')
       const id = randomUUID()
       const row = await client.query<ProjectRow>(
-        `INSERT INTO studio_projects(id, user_id, title, brief, aspect, target_sec, budget_credits, autonomy)
-         VALUES ($1, $2, $3, $4, COALESCE($5, '16:9'), COALESCE($6, 30), COALESCE($7, 2000), COALESCE($8, 'max'))
+        `INSERT INTO studio_projects(id, user_id, title, brief, aspect, target_sec, budget_credits, autonomy, settings)
+         VALUES ($1, $2, $3, $4, COALESCE($5, '16:9'), COALESCE($6, 30), COALESCE($7, 2000), COALESCE($8, 'max'),
+                 CASE WHEN $9::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('directorModel', $9::text) END)
          RETURNING ${PROJECT_COLUMNS}`,
         [
           id,
@@ -215,6 +216,7 @@ export class StudioStore {
           patch.targetSec ?? null,
           patch.budgetCredits ?? null,
           patch.autonomy ?? null,
+          patch.directorModel ?? null,
         ],
       )
       await appendStudioEvent(client, id, 'project.created')

@@ -51,7 +51,7 @@ async function reconcileBatch(
               t.exec_request_id AS exec, t.payload->>'providerId' AS provider, t.payload->>'takeId' AS take_id,
               COALESCE(t.payload->>'booked', '0') AS booked, t.kind
          FROM studio_tasks t JOIN studio_projects p ON p.id = t.project_id
-        WHERE t.kind IN ('gen', 'qa') AND t.status IN ('done', 'failed', 'canceled')
+        WHERE t.kind IN ('gen', 'qa', 'plan', 'interpret') AND t.status IN ('done', 'failed', 'canceled')
           AND t.updated_at > NOW() - make_interval(days => $1) AND p.deleted_at IS NULL
           AND t.id > $2::uuid
         ORDER BY t.id
@@ -76,14 +76,14 @@ async function reconcileBatch(
           r.take_id,
           charged.toString(),
         ])
-      } else {
+      } else if (r.kind === 'qa') {
         await client.query(
           `UPDATE studio_takes SET qa = jsonb_set(qa, '{costCredits}', to_jsonb($2::text)) WHERE id = $1 AND qa IS NOT NULL`,
           [r.take_id, charged.toString()],
         )
       }
       await appendStudioEvent(client, r.project_id, 'charge.reconciled', {
-        takeId: r.take_id,
+        ...(r.kind === 'gen' || r.kind === 'qa' ? { takeId: r.take_id } : { taskId: r.id }),
         costCredits: charged.toString(),
         message: '按服务账单更新了一笔费用。',
       })

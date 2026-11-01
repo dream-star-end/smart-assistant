@@ -369,8 +369,21 @@ describe('QA conflicts and autonomy caps', () => {
       bibleShotConflict([{ descriptor: '深色背景' }], { framing: '夜景街道', action: '昏暗' }),
       null,
     )
-    assert.equal(bibleShotConflict([{ descriptor: '深色也有晨光' }], { action: '窗边' }), null)
+    assert.equal(bibleShotConflict([{ descriptor: '深色背景也有晨光' }], { action: '窗边' }), null)
     assert.equal(bibleShotConflict([{ descriptor: '' }], { action: '晨光' }), null)
+    assert.equal(
+      bibleShotConflict([{ kind: 'character', descriptor: '深色西装的男子' }], { action: '窗边晨光' }),
+      null,
+    )
+    const kept = bibleShotConflict(
+      [
+        { kind: 'character', descriptor: '浅色衬衫' },
+        { kind: 'style', descriptor: '深色背景，冷调' },
+      ],
+      { framing: '浅灰墙面', action: '窗边晨光里转身' },
+    )
+    assert.equal(typeof kept, 'string')
+    assert.match(kept!, /矛盾/)
   })
 
   it('attempt caps default to 3 and follow the autonomy env', () => {
