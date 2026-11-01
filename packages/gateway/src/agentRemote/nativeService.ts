@@ -18,6 +18,13 @@ import {
   verifyNativeJson,
 } from '@openclaude/protocol/agentRemoteNative'
 import {
+  type NativeDeliveryWriterProof,
+  NativeDeliveryWriterProofSchema,
+  nativeDeliveryCommitHash,
+  verifyNativeDeliveryCommit,
+  verifyNativeDeliveryPreparation,
+} from '@openclaude/protocol/agentRemoteNativeDelivery'
+import {
   type NativeIntent,
   type NativeJournalEvent,
   NativeJournalEventSchema,
@@ -25,6 +32,7 @@ import {
   nativeJournalEventHash,
   nativeJournalKey,
   nativeReceiptHash,
+  verifyNativeDeliveryEvidence,
 } from './nativeJournal.js'
 import { requireAgentRemoteControlFence } from './service.js'
 import type { AgentRemoteState, AgentRemoteStore } from './store.js'
@@ -294,9 +302,101 @@ export class NativeJournalService {
       { operationKey: nativeOperationKey(scope, operationId) },
     )
   }
-  /** Called only after the actual Writer has installed and fsynced artifacts and
-   * appended its JSONL reference. A model-produced claim is not Writer evidence.
-   */
+  /** Trusted Writer connection only. This metadata pins stable identities and
+   * source references before the actual Writer touches its transcript. */
+  async prepareDelivery(
+    principalId: string,
+    expected: NativeScope,
+    operationId: string,
+    payloadHash: string,
+    input: unknown,
+  ): Promise<NativeJournalRecord> {
+    expected = structuredClone(expected)
+    verifyNativeDeliveryPreparation(input, payloadHash)
+    const preparation = structuredClone(input)
+    return this.store.transact(
+      principalId,
+      (state) => {
+        const now = this.now()
+        this.fence(state, principalId, expected, now)
+        const row = find(state, expected, operationId, payloadHash)
+        requireRemote(row.receipt?.sha256 === preparation.receiptHash, 'native-delivery-mismatch')
+        verifyNativeDeliveryEvidence(row, preparation)
+        if (row.deliveryPreparation) {
+          requireRemote(
+            equal(row.deliveryPreparation, preparation),
+            'native-delivery-prepare-conflict',
+          )
+          return row
+        }
+        requireRemote(!terminal(row), 'native-delivery-already-finished')
+        row.deliveryPreparation = preparation
+        row.updatedAtMs = now
+        return row
+      },
+      { operationKey: nativeOperationKey(expected, operationId) },
+    )
+  }
+  /** Must be called by the authenticated actual Writer after its streaming
+   * lock-held readback. JSON/model-produced claims cannot select this peer role.
+   * Network adapters are deliberately absent from this foundation module. */
+  async commitDelivery(
+    principalId: string,
+    expected: NativeScope,
+    operationId: string,
+    payloadHash: string,
+    preparationHash: string,
+    input: NativeDeliveryWriterProof,
+  ): Promise<NativeJournalRecord> {
+    expected = structuredClone(expected)
+    verifyNativeJson(input)
+    validateRemote<NativeDeliveryWriterProof>(NativeDeliveryWriterProofSchema, input)
+    const proof = structuredClone(input)
+    return this.store.transact(
+      principalId,
+      (state) => {
+        const now = this.now()
+        this.fence(state, principalId, expected, now)
+        const row = find(state, expected, operationId, payloadHash)
+        requireRemote(
+          row.deliveryPreparation?.preparationHash === preparationHash && row.receipt,
+          'native-delivery-not-prepared',
+        )
+        // Commit is the durable result of the first proof. Later appends never
+        // replace its original head/hash/ACK on retry.
+        if (row.deliveryCommit) return row
+        const body = {
+          version: 1 as const,
+          preparationHash,
+          receiptHash: row.receipt!.sha256,
+          proof,
+          ack: {
+            kind: 'native.delivery.ack' as const,
+            receiptHash: row.receipt!.sha256,
+            nativeHeadRevision: proof.main.headUuid,
+            nativeHeadHash: proof.main.prefixHash,
+            artifactManifestHash: proof.artifactManifestHash,
+          },
+          committedAtMs: now,
+        }
+        const commit = { ...body, commitHash: nativeDeliveryCommitHash(payloadHash, body) }
+        verifyNativeDeliveryCommit(
+          commit,
+          payloadHash,
+          row.deliveryPreparation!,
+          row.request.nativeSessionId,
+        )
+        row.deliveryCommit = commit
+        row.deliveryAck = structuredClone(commit.ack)
+        row.state = row.receipt!.body.status
+        row.updatedAtMs = now
+        return row
+      },
+      { operationKey: nativeOperationKey(expected, operationId) },
+    )
+  }
+  /** Validates ACK replay against the already durable delivery commit. This
+   * ingress cannot create a commit or turn an uncommitted operation terminal. */
   async acknowledge(
     principalId: string,
     expected: NativeScope,
@@ -321,13 +421,11 @@ export class NativeJournalService {
             row.receipt.sha256 === ack.receiptHash,
           'native-delivery-mismatch',
         )
-        if (row.deliveryAck) {
-          requireRemote(equal(row.deliveryAck, ack), 'native-delivery-conflict')
-          return row
-        }
-        row.deliveryAck = ack
-        row.state = row.receipt.body.status
-        row.updatedAtMs = now
+        requireRemote(row.deliveryCommit && row.deliveryAck, 'native-delivery-not-committed')
+        requireRemote(
+          equal(row.deliveryAck, ack) && equal(row.deliveryCommit.ack, ack),
+          'native-delivery-conflict',
+        )
         return row
       },
       { operationKey: nativeOperationKey(expected, operationId) },

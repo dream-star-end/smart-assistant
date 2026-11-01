@@ -32,6 +32,10 @@ import {
   verifyNativeFrame,
   verifyNativeJson,
 } from '@openclaude/protocol/agentRemoteNative'
+import {
+  NATIVE_FINAL_EVENT_MAX_BYTES,
+  NATIVE_ORDINARY_EVENT_MAX_BYTES,
+} from '@openclaude/protocol/agentRemoteNativeDelivery'
 import { type Static, Type } from '@sinclair/typebox'
 import Database from 'better-sqlite3'
 import {
@@ -92,6 +96,7 @@ const RecordSchema = Type.Object(
     effectiveInput: Type.Optional(Type.Object({ sha256: digest, policyRevision: integer }, closed)),
     receipt: Type.Optional(Type.Object({ body: NativeReceiptBodySchema, sha256: digest }, closed)),
     eventCount: integer,
+    ordinaryEventBytes: Type.Integer({ minimum: 0, maximum: NATIVE_ORDINARY_EVENT_MAX_BYTES }),
     createdAtMs: integer,
     updatedAtMs: integer,
   },
@@ -220,17 +225,18 @@ export class SqliteNativeHostJournal {
       stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && (stat.mode & 0o077) === 0,
       'host-state-file-private',
     )
-    this.database = new Database(options.filename, { timeout: 5000 })
-    try {
-      const version = this.database.pragma('user_version', { simple: true })
-      const application = this.database.pragma('application_id', { simple: true })
+    // A rejected old-format WAL must remain untouched. A read-write SQLite
+    // connection can checkpoint it on close even before journal_mode is set.
+    const verifyDatabase = (candidate: Database.Database): void => {
+      const version = candidate.pragma('user_version', { simple: true })
+      const application = candidate.pragma('application_id', { simple: true })
       requireRemote(
         (newFile && version === 0 && application === 0) ||
-          (version === 1 && application === APPLICATION_ID),
+          (version === 2 && application === APPLICATION_ID),
         'host-state-format',
       )
       if (!newFile) {
-        const metadata = this.database
+        const metadata = candidate
           .prepare('SELECT payload FROM native_host_identity WHERE singleton=1')
           .get() as { payload: string } | undefined
         requireRemote(
@@ -239,7 +245,7 @@ export class SqliteNativeHostJournal {
         )
       }
       if (!newFile) {
-        const tables = this.database
+        const tables = candidate
           .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
           .all() as { name: string }[]
         const expectedTables = [
@@ -250,9 +256,9 @@ export class SqliteNativeHostJournal {
           'native_host_events',
           'native_host_cancels',
         ].sort()
-        const columns = this.database
-          .prepare('PRAGMA table_info(native_host_operations)')
-          .all() as { name: string }[]
+        const columns = candidate.prepare('PRAGMA table_info(native_host_operations)').all() as {
+          name: string
+        }[]
         requireRemote(
           equal(tables.map((row) => row.name).sort(), expectedTables) &&
             equal(
@@ -262,6 +268,20 @@ export class SqliteNativeHostJournal {
           'host-state-shape',
         )
       }
+    }
+    const probe = new Database(options.filename, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 5000,
+    })
+    try {
+      verifyDatabase(probe)
+    } finally {
+      probe.close()
+    }
+    this.database = new Database(options.filename, { timeout: 5000 })
+    try {
+      verifyDatabase(this.database)
       this.database.pragma('journal_mode = WAL')
       this.database.pragma('synchronous = FULL')
       this.database.pragma('foreign_keys = ON')
@@ -280,7 +300,7 @@ export class SqliteNativeHostJournal {
               .prepare('INSERT INTO native_host_identity VALUES(1,?)')
               .run(remoteCanonical(this.identity))
             this.database.pragma(`application_id = ${APPLICATION_ID}`)
-            this.database.pragma('user_version = 1')
+            this.database.pragma('user_version = 2')
           }
         })
         .immediate()
@@ -594,6 +614,7 @@ export class SqliteNativeHostJournal {
         phase: 'accepted',
         cancelRequested: false,
         eventCount: 0,
+        ordinaryEventBytes: 0,
         createdAtMs: this.now(),
         updatedAtMs: this.now(),
       }
@@ -694,6 +715,16 @@ export class SqliteNativeHostJournal {
     }
     event.sha256 = nativeJournalEventHash(row.request.body.payloadHash, event)
     const payload = remoteCanonical(event)
+    const bytes = Buffer.byteLength(payload, 'utf8')
+    if (body.kind === 'native.receipt' && body.status !== 'unknown')
+      requireRemote(bytes <= NATIVE_FINAL_EVENT_MAX_BYTES, 'host-final-event-capacity')
+    else {
+      requireRemote(
+        row.ordinaryEventBytes + bytes <= NATIVE_ORDINARY_EVENT_MAX_BYTES,
+        'host-ordinary-event-capacity',
+      )
+      row.ordinaryEventBytes += bytes
+    }
     this.database
       .prepare('INSERT INTO native_host_events VALUES(?,?,?,?)')
       .run(

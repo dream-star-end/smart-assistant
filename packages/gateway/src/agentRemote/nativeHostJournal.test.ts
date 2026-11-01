@@ -11,12 +11,17 @@ import {
   nativeManifestHash,
 } from '@openclaude/protocol/agentRemoteNative'
 import Database from 'better-sqlite3'
+import { createInterruptedWal } from './fixtures/interruptedWal.js'
 import {
   type NativeHostIdentity,
   type NativeHostPipelinePermit,
   SqliteNativeHostJournal,
 } from './nativeHostJournal.js'
-import { type NativeJournalRecord, verifyNativeJournalRecord } from './nativeJournal.js'
+import {
+  type NativeJournalRecord,
+  nativeReceiptHash,
+  verifyNativeJournalRecord,
+} from './nativeJournal.js'
 const identity: NativeHostIdentity = {
   ledgerId: 'l1',
   principalId: 'u1',
@@ -733,4 +738,53 @@ test('unknown under the same current lease cannot start a fresh callback or comm
     1,
   )
   assert.equal(f.journal.finish(running.permit, completed(running.request)).phase, 'completed')
+})
+
+test('Host byte budget rejects before sequence allocation and leaves final receipt replayable into control', (t) => {
+  const f = fixture(t)
+  const running = start(f)
+  for (let i = 0; i < 2; i++)
+    f.journal.appendExecutionEvent(running.permit, {
+      kind: 'native.progress',
+      message: { text: 'x'.repeat(6 * 1024 * 1024) },
+    })
+  assert.throws(
+    () =>
+      f.journal.appendExecutionEvent(running.permit, {
+        kind: 'native.progress',
+        message: { text: 'x'.repeat(5 * 1024 * 1024) },
+      }),
+    /host-ordinary-event-capacity/,
+  )
+  assert.equal(
+    f.open().query(f.expected, 'op1', running.request.control.request.body.payloadHash).eventCount,
+    2,
+  )
+  const final = { ...completed(running.request), message: { text: 'y'.repeat(7 * 1024 * 1024) } }
+  const finished = f.journal.finish(running.permit, final)
+  assert.equal(finished.eventCount, 3)
+  const events = f.open().replayEvents(f.expected, 'op1', finished.request.body.payloadHash, 0)
+  assert.deepEqual(
+    events.map((e) => e.sequence),
+    [1, 2, 3],
+  )
+  const row = structuredClone(running.request.control)
+  row.events = events
+  row.receipt = { body: final, sha256: nativeReceiptHash(row.request.body.payloadHash, final) }
+  assert.doesNotThrow(() => verifyNativeJournalRecord(row))
+})
+
+test('old Host format with crash WAL rejects through a read-only probe without checkpoint', (t) => {
+  const f = fixture(t)
+  const filename = join(f.root, 'old-host.sqlite')
+  createInterruptedWal(filename, 0x414e4831, 1)
+  const db = readFileSync(filename)
+  const wal = readFileSync(`${filename}-wal`)
+  assert.ok(wal.length > 0)
+  assert.throws(
+    () => new SqliteNativeHostJournal({ filename, identity, hostInstanceId: 'h1' }),
+    /host-state-format/,
+  )
+  assert.deepEqual(readFileSync(filename), db)
+  assert.deepEqual(readFileSync(`${filename}-wal`), wal)
 })

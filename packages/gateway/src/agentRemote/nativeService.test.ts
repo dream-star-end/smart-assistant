@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { NativeFrame, NativeScope } from '@openclaude/protocol/agentRemoteNative'
 import { nativeExecutionHash } from '@openclaude/protocol/agentRemoteNative'
-import { fixture, uuid } from './fixtures/nativeFixture.js'
+import { fixture, syntheticDelivery, uuid } from './fixtures/nativeFixture.js'
 import { type NativeJournalEvent, nativeJournalEventHash } from './nativeJournal.js'
 import { NativeJournalService } from './nativeService.js'
 const executor = { hostInstanceId: 'h1', ledgerId: 'l1', grantId: 'g1' }
@@ -43,21 +43,50 @@ function evidence(
   }
   return { ...event, sha256: nativeJournalEventHash(payloadHash, event) }
 }
-function ack(s: NativeScope, receiptHash: string, operationId = 'op1'): NativeFrame {
+function ack(
+  s: NativeScope,
+  receiptHash: string | Extract<NativeFrame['body'], { kind: 'native.delivery.ack' }>,
+  operationId = 'op1',
+): NativeFrame {
   return {
     nativeProtocolVersion: 1,
     scope: s,
     sender: 'worker',
     operationId,
     sequence: 1,
-    body: {
-      kind: 'native.delivery.ack',
-      receiptHash,
-      nativeHeadRevision: 'head1',
-      nativeHeadHash: 'b'.repeat(64),
-      artifactManifestHash: 'c'.repeat(64),
-    },
+    body:
+      typeof receiptHash === 'string'
+        ? {
+            kind: 'native.delivery.ack',
+            receiptHash,
+            nativeHeadRevision: 'head1',
+            nativeHeadHash: 'b'.repeat(64),
+            artifactManifestHash: 'c'.repeat(64),
+          }
+        : receiptHash,
   }
+}
+async function commitSynthetic(
+  native: NativeJournalService,
+  scope: NativeScope,
+  row: import('./nativeJournal.js').NativeJournalRecord,
+) {
+  const { preparation, proof } = syntheticDelivery(row)
+  await native.prepareDelivery(
+    'u1',
+    scope,
+    row.request.operationId,
+    row.request.body.payloadHash,
+    preparation,
+  )
+  return native.commitDelivery(
+    'u1',
+    scope,
+    row.request.operationId,
+    row.request.body.payloadHash,
+    preparation.preparationHash,
+    proof,
+  )
 }
 async function admitted(f: Fixture) {
   const s = scope(f)
@@ -128,8 +157,13 @@ test('queued cancellation proves no grant; delivery remains separate and require
   assert.equal(cancelled.dispatch, undefined)
   assert.equal(cancelled.receipt!.body.code, 'not-started')
   await assert.rejects(native.grant('u1', s, 'op1', hash, executor), /native-not-startable/)
+  await assert.rejects(
+    native.acknowledge('u1', s, ack(s, cancelled.receipt!.sha256)),
+    /native-delivery-not-committed/,
+  )
+  const committed = await commitSynthetic(native, s, cancelled)
   assert.equal(
-    (await native.acknowledge('u1', s, ack(s, cancelled.receipt!.sha256))).state,
+    (await native.acknowledge('u1', s, ack(s, committed.deliveryAck!))).state,
     'cancelled',
   )
 })
@@ -161,11 +195,16 @@ test('final execution receipt seals its event prefix before Writer ACK; exact re
     native.acknowledge('u1', s, ack(s, '0'.repeat(64))),
     /native-delivery-mismatch/,
   )
-  const completed = await native.acknowledge('u1', s, ack(s, received.receipt!.sha256))
+  await assert.rejects(
+    native.acknowledge('u1', s, ack(s, received.receipt!.sha256)),
+    /native-delivery-not-committed/,
+  )
+  const committed = await commitSynthetic(native, s, received)
+  const completed = await native.acknowledge('u1', s, ack(s, committed.deliveryAck!))
   assert.equal(completed.state, 'completed')
   assert.deepEqual(await native.observe('u1', s, 'op1', hash, executor, event), completed)
 })
-test('new epoch does not replay old effects; old ledger receipt can coordinate then unblock new work', async (t) => {
+test('same Worker new epoch does not replay old effects; old ledger receipt and committed delivery unblock new work', async (t) => {
   const f = await fixture(t)
   const { s, native, hash } = await admitted(f)
   await native.grant('u1', s, 'op1', hash, executor)
@@ -192,7 +231,8 @@ test('new epoch does not replay old effects; old ledger receipt can coordinate t
     evidence(hash, 1, { kind: 'native.receipt', payloadHash: hash, status: 'completed' }),
   )
   assert.equal(observed.claim.epoch, 1)
-  await native.acknowledge('u1', renewed, ack(renewed, observed.receipt!.sha256))
+  const committed = await commitSynthetic(native, renewed, observed)
+  await native.acknowledge('u1', renewed, ack(renewed, committed.deliveryAck!))
   assert.equal(
     (
       await native.grant('u1', renewed, 'op2', second.request.body.payloadHash, {

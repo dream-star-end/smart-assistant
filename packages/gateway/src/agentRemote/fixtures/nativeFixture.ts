@@ -8,7 +8,15 @@ import type {
   AgentRemoteLeaseToken,
   AgentRemoteWorker,
 } from '@openclaude/protocol/agentRemote'
+import { agentRemoteContentHash, remoteCanonical } from '@openclaude/protocol/agentRemote'
 import { nativeExecutionHash } from '@openclaude/protocol/agentRemoteNative'
+import {
+  type NativeDeliveryPreparation,
+  type NativeDeliveryWriterProof,
+  nativeDeliveryCommitHash,
+  nativeDeliveryPreparationHash,
+  nativeMessageProjectionsHash,
+} from '@openclaude/protocol/agentRemoteNativeDelivery'
 import { SqliteAgentRemoteStore } from '../durableStore.js'
 import {
   type NativeJournalRecord,
@@ -131,13 +139,103 @@ export function receipt(record: NativeJournalRecord) {
   })
   record.receipt = { body, sha256: nativeReceiptHash(record.request.body.payloadHash, body) }
 }
-export function deliver(record: NativeJournalRecord) {
-  record.deliveryAck = {
-    kind: 'native.delivery.ack',
-    receiptHash: record.receipt!.sha256,
-    nativeHeadRevision: 'head1',
-    nativeHeadHash: 'b'.repeat(64),
-    artifactManifestHash: 'c'.repeat(64),
+/** Synthetic control/store state only: this helper is never Writer IO proof. */
+export function syntheticDelivery(record: NativeJournalRecord): {
+  preparation: NativeDeliveryPreparation
+  proof: NativeDeliveryWriterProof
+} {
+  const hash = agentRemoteContentHash(record.request.operationId)
+  const messageUuid = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`
+  const artifacts = new Map()
+  for (const event of record.events)
+    if (event.body.kind === 'native.artifacts')
+      for (const artifact of event.body.artifacts) artifacts.set(artifact.relativePath, artifact)
+  const manifest = [...artifacts.values()].sort((a, b) =>
+    a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0,
+  )
+  const artifactManifestHash = agentRemoteContentHash(
+    `agent-remote-native-artifacts-v1\n${remoteCanonical(manifest)}`,
+  )
+  const message = {
+    uuid: messageUuid,
+    target: { kind: 'main' as const },
+    projectionHash: 'b'.repeat(64),
+    parentUuid: null,
+    timestamp: '2026-11-01T20:00:00.000Z',
   }
-  record.state = 'completed'
+  const source = record.dispatch
+    ? {
+        kind: 'execution' as const,
+        ...record.dispatch,
+        environmentIncarnation: record.request.environmentIncarnation,
+        sealedSequence: record.events.length,
+        sealedEventHash: record.events.at(-1)!.sha256,
+        blobs: [],
+      }
+    : { kind: 'control.not-started' as const, receiptHash: record.receipt!.sha256 }
+  // grantId is dispatch authorization, never part of the sealed source identity.
+  const preparedSource =
+    source.kind === 'execution'
+      ? {
+          kind: source.kind,
+          hostInstanceId: source.hostInstanceId,
+          ledgerId: source.ledgerId,
+          environmentIncarnation: source.environmentIncarnation,
+          sealedSequence: source.sealedSequence,
+          sealedEventHash: source.sealedEventHash,
+          blobs: source.blobs,
+        }
+      : source
+  const semantic = {
+    version: 1 as const,
+    receiptHash: record.receipt!.sha256,
+    projectionVersion: 1 as const,
+    source: preparedSource,
+    artifactManifestHash,
+    artifactCount: manifest.length,
+    messages: [message],
+  }
+  const preparation = {
+    ...semantic,
+    preparationHash: nativeDeliveryPreparationHash(record.request.body.payloadHash, semantic),
+  }
+  const proof = {
+    nativeSessionId: record.request.nativeSessionId,
+    preparationHash: preparation.preparationHash,
+    artifactManifestHash,
+    main: { headUuid: messageUuid, headBytes: 100, prefixHash: 'c'.repeat(64) },
+    files: [
+      {
+        target: { kind: 'main' as const },
+        headBytes: 100,
+        prefixHash: 'c'.repeat(64),
+        projectionsHash: nativeMessageProjectionsHash(preparation.messages),
+      },
+    ],
+  }
+  return { preparation, proof }
+}
+export function deliver(record: NativeJournalRecord) {
+  const { preparation, proof } = syntheticDelivery(record)
+  record.deliveryPreparation = preparation
+  const body = {
+    version: 1 as const,
+    preparationHash: preparation.preparationHash,
+    receiptHash: record.receipt!.sha256,
+    proof,
+    ack: {
+      kind: 'native.delivery.ack' as const,
+      receiptHash: record.receipt!.sha256,
+      nativeHeadRevision: proof.main.headUuid,
+      nativeHeadHash: proof.main.prefixHash,
+      artifactManifestHash: preparation.artifactManifestHash,
+    },
+    committedAtMs: record.updatedAtMs,
+  }
+  record.deliveryCommit = {
+    ...body,
+    commitHash: nativeDeliveryCommitHash(record.request.body.payloadHash, body),
+  }
+  record.deliveryAck = structuredClone(record.deliveryCommit.ack)
+  record.state = record.receipt!.body.status
 }

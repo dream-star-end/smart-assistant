@@ -219,7 +219,7 @@ test('native terminal requires matching receipt and durable writer ACK; owner/ha
   )
   assert.equal((await f.store.transact('u1', (state) => state.nativeJournal)).length, 0)
 })
-test('v1 owned DB rejects before WAL mutation; v2 keeps explicit v1 metadata shape', async (t) => {
+test('v1 owned DB rejects before WAL mutation; v3 keeps explicit v1 metadata shape', async (t) => {
   const f = await fixture(t)
   const legacy = join(f.root, 'legacy.sqlite')
   writeFileSync(legacy, '', { mode: 0o600 })
@@ -233,7 +233,7 @@ test('v1 owned DB rejects before WAL mutation; v2 keeps explicit v1 metadata sha
   })
   const db = new Database(f.path, { readonly: true })
   t.after(() => db.close())
-  assert.equal(db.pragma('user_version', { simple: true }), 2)
+  assert.equal(db.pragma('user_version', { simple: true }), 3)
   const metadata = db
     .prepare('SELECT format_version,payload FROM agent_remote_principals')
     .get() as { format_version: number; payload: string }

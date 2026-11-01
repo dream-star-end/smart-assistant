@@ -98,7 +98,7 @@ const StateSchema = Type.Object(
   closed,
 )
 const APPLICATION_ID = 0x41524d31
-const FORMAT_VERSION = 2
+const FORMAT_VERSION = 3
 // The existing principal metadata shape remains v1; native rows are normalized.
 const METADATA_VERSION = 1
 const MAX_STATE_BYTES = 64 * 1024 * 1024
@@ -168,11 +168,12 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
       stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && (stat.mode & 0o077) === 0,
       'state-file-private',
     )
-    this.database = new Database(filename, { timeout: 5000 })
-    try {
+    // A rejected old-format WAL must remain untouched. A read-write SQLite
+    // connection can checkpoint it on close even before journal_mode is set.
+    const verifyDatabase = (candidate: Database.Database): void => {
       // Reject an unrelated DB before changing its journal mode or creating WAL files.
-      const initialVersion = this.database.pragma('user_version', { simple: true })
-      const initialApplication = this.database.pragma('application_id', { simple: true })
+      const initialVersion = candidate.pragma('user_version', { simple: true })
+      const initialApplication = candidate.pragma('application_id', { simple: true })
       requireRemote(
         initialVersion === 0 || initialVersion === 1 || initialVersion === FORMAT_VERSION,
         'state-format-version',
@@ -183,16 +184,27 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
             initialApplication === APPLICATION_ID),
         'state-application-id',
       )
-      // No online upgrade: an already-open v1 writer would not see native gates.
+      // No online upgrade: old writers do not know native/delivery gates.
+      // v2 is rejected above before WAL; v1 retains its explicit migration error.
       requireRemote(initialVersion !== 1, 'state-format-migration-required')
       if (initialVersion === 0) {
-        const existing = this.database
+        const existing = candidate
           .prepare(
             "SELECT count(*) AS count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
           )
           .get() as { count: number }
         requireRemote(existing.count === 0, 'state-existing-database')
       }
+    }
+    const probe = new Database(filename, { readonly: true, fileMustExist: true, timeout: 5000 })
+    try {
+      verifyDatabase(probe)
+    } finally {
+      probe.close()
+    }
+    this.database = new Database(filename, { timeout: 5000 })
+    try {
+      verifyDatabase(this.database)
       this.database.pragma('journal_mode = WAL')
       this.database.pragma('synchronous = FULL')
       this.database.pragma('foreign_keys = ON')
@@ -422,7 +434,14 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
                   remoteCanonical(old.record.events),
               'stored-event-mutation',
             )
-            for (const field of ['dispatch', 'effectiveInput', 'receipt', 'deliveryAck'] as const)
+            for (const field of [
+              'dispatch',
+              'effectiveInput',
+              'receipt',
+              'deliveryPreparation',
+              'deliveryCommit',
+              'deliveryAck',
+            ] as const)
               if (old.record[field])
                 requireRemote(
                   remoteCanonical(old.record[field]) === remoteCanonical(record[field]),

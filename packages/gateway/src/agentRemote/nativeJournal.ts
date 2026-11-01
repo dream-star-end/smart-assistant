@@ -17,6 +17,18 @@ import {
   verifyNativeBodySemantics,
   verifyNativeJson,
 } from '@openclaude/protocol/agentRemoteNative'
+import {
+  NATIVE_EXECUTION_RECORD_MAX_BYTES,
+  NATIVE_FINAL_EVENT_MAX_BYTES,
+  NATIVE_ORDINARY_EVENT_MAX_BYTES,
+  type NativeDeliveryBlob,
+  NativeDeliveryBlobSchema,
+  NativeDeliveryCommitSchema,
+  type NativeDeliveryPreparation,
+  NativeDeliveryPreparationSchema,
+  verifyNativeDeliveryCommit,
+  verifyNativeDeliveryPreparation,
+} from '@openclaude/protocol/agentRemoteNativeDelivery'
 /** Native records share the P2 principal transaction and fences. Execution
  * receipts and durable Writer delivery are deliberately different facts.
  */
@@ -90,6 +102,8 @@ export const NativeJournalRecordSchema = Type.Object(
         closed,
       ),
     ),
+    deliveryPreparation: Type.Optional(NativeDeliveryPreparationSchema),
+    deliveryCommit: Type.Optional(NativeDeliveryCommitSchema),
     deliveryAck: Type.Optional(NativeDeliveryAckSchema),
     createdAtMs: number,
     updatedAtMs: number,
@@ -123,6 +137,96 @@ export function nativeOperationEventKindAllowed(kind: string): boolean {
     'native.manifest',
   ].includes(kind)
 }
+const sameNativeEvidence = (a: unknown, b: unknown) => remoteCanonical(a) === remoteCanonical(b)
+export function verifyNativeDeliveryEvidence(
+  row: NativeJournalRecord,
+  preparation: NativeDeliveryPreparation,
+): void {
+  const source = preparation.source
+  if (source.kind === 'control.not-started') {
+    requireRemote(
+      !row.dispatch &&
+        row.events.length === 0 &&
+        row.receipt?.body.status === 'cancelled' &&
+        row.receipt.body.code === 'not-started' &&
+        source.receiptHash === row.receipt.sha256,
+      'native-delivery-source',
+    )
+  } else {
+    const last = row.events.at(-1)
+    requireRemote(
+      row.dispatch &&
+        source.hostInstanceId === row.dispatch.hostInstanceId &&
+        source.ledgerId === row.dispatch.ledgerId &&
+        source.environmentIncarnation === row.request.environmentIncarnation &&
+        last?.body.kind === 'native.receipt' &&
+        source.sealedSequence === row.events.length &&
+        source.sealedEventHash === last.sha256,
+      'native-delivery-source',
+    )
+    // Source blobs must be declared by the Host envelope, never invented by a
+    // Worker/model as a URL or a path. The source port also checks op ownership.
+    const declared = new Map<string, NativeDeliveryBlob>()
+    for (const event of row.events) {
+      const message =
+        event.body.kind === 'native.progress' || event.body.kind === 'native.receipt'
+          ? event.body.message
+          : undefined
+      const envelope = message && typeof message === 'object' ? message.nativeDelivery : undefined
+      if (
+        envelope &&
+        typeof envelope === 'object' &&
+        !Array.isArray(envelope) &&
+        'blobs' in envelope &&
+        Array.isArray(envelope.blobs)
+      )
+        for (const blob of envelope.blobs) {
+          validateRemote<NativeDeliveryBlob>(NativeDeliveryBlobSchema, blob)
+          const old = declared.get(blob.resourceId)
+          requireRemote(
+            !old || sameNativeEvidence(old, blob),
+            'native-delivery-source-blob-conflict',
+          )
+          declared.set(blob.resourceId, blob)
+        }
+    }
+    requireRemote(
+      sameNativeEvidence(
+        [...declared.values()].sort((a, b) =>
+          a.resourceId < b.resourceId ? -1 : a.resourceId > b.resourceId ? 1 : 0,
+        ),
+        [...source.blobs].sort((a, b) =>
+          a.resourceId < b.resourceId ? -1 : a.resourceId > b.resourceId ? 1 : 0,
+        ),
+      ),
+      'native-delivery-source-blobs',
+    )
+  }
+  const artifacts = new Map<
+    string,
+    import('@openclaude/protocol/agentRemoteNative').NativeArtifact
+  >()
+  for (const event of row.events)
+    if (event.body.kind === 'native.artifacts')
+      for (const artifact of event.body.artifacts) {
+        const previous = artifacts.get(artifact.relativePath)
+        requireRemote(
+          !previous || sameNativeEvidence(previous, artifact),
+          'native-delivery-artifact-conflict',
+        )
+        artifacts.set(artifact.relativePath, artifact)
+      }
+  const manifest = [...artifacts.values()].sort((a, b) =>
+    a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0,
+  )
+  requireRemote(
+    preparation.artifactCount === manifest.length &&
+      preparation.artifactManifestHash ===
+        agentRemoteContentHash(`agent-remote-native-artifacts-v1\n${remoteCanonical(manifest)}`),
+    'native-delivery-artifact-manifest',
+  )
+}
+
 export function verifyNativeJournalRecord(value: unknown): asserts value is NativeJournalRecord {
   validateRemote<NativeJournalRecord>(NativeJournalRecordSchema, value)
   verifyNativeJson(value.request)
@@ -137,10 +241,21 @@ export function verifyNativeJournalRecord(value: unknown): asserts value is Nati
     'native-stored-owner',
   )
   let finalEvent: typeof value.receipt | undefined
+  let ordinaryBytes = 0
   for (let index = 0; index < value.events.length; index++) {
     requireRemote(!finalEvent, 'native-stored-event-after-receipt')
     const { sha256, ...event } = value.events[index]!
     verifyNativeJson(event.body)
+    const eventBytes = Buffer.byteLength(remoteCanonical(value.events[index]), 'utf8')
+    if (event.body.kind === 'native.receipt' && event.body.status !== 'unknown') {
+      requireRemote(eventBytes <= NATIVE_FINAL_EVENT_MAX_BYTES, 'native-final-event-capacity')
+    } else {
+      ordinaryBytes += eventBytes
+      requireRemote(
+        ordinaryBytes <= NATIVE_ORDINARY_EVENT_MAX_BYTES && index < 9999,
+        'native-ordinary-event-capacity',
+      )
+    }
     if (event.body.kind === 'native.receipt') {
       requireRemote(event.body.payloadHash === payloadHash, 'native-stored-receipt')
       if (event.body.status !== 'unknown')
@@ -191,6 +306,33 @@ export function verifyNativeJournalRecord(value: unknown): asserts value is Nati
       'native-stored-receipt',
     )
   }
+  const { deliveryPreparation, deliveryCommit, deliveryAck, ...execution } = value
+  requireRemote(
+    Buffer.byteLength(remoteCanonical(execution), 'utf8') <= NATIVE_EXECUTION_RECORD_MAX_BYTES,
+    'native-execution-capacity',
+  )
+  if (deliveryPreparation) {
+    verifyNativeDeliveryPreparation(deliveryPreparation, payloadHash)
+    requireRemote(
+      value.receipt && deliveryPreparation.receiptHash === value.receipt.sha256,
+      'native-stored-preparation-receipt',
+    )
+    verifyNativeDeliveryEvidence(value, deliveryPreparation)
+  }
+  if (deliveryCommit) {
+    requireRemote(deliveryPreparation, 'native-stored-commit-without-prepare')
+    verifyNativeDeliveryCommit(
+      deliveryCommit,
+      payloadHash,
+      deliveryPreparation!,
+      value.request.nativeSessionId,
+    )
+    requireRemote(
+      deliveryAck && remoteCanonical(deliveryAck) === remoteCanonical(deliveryCommit.ack),
+      'native-stored-commit-without-ack',
+    )
+  }
+  if (deliveryAck) requireRemote(deliveryCommit, 'native-stored-delivery-without-commit')
   if (value.deliveryAck)
     requireRemote(
       value.receipt &&

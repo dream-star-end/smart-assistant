@@ -90,6 +90,11 @@
       "types": "./src/agentRemoteNative.ts",
       "openclaude-precompiled": "./dist/agentRemoteNative.js",
       "default": "./src/agentRemoteNative.ts"
+    },
+    "./agentRemoteNativeDelivery": {
+      "types": "./src/agentRemoteNativeDelivery.ts",
+      "openclaude-precompiled": "./dist/agentRemoteNativeDelivery.js",
+      "default": "./src/agentRemoteNativeDelivery.ts"
     }
   },
   "dependencies": {

@@ -52,7 +52,7 @@ export interface SessionFileLeaseIdentity {
 const leaseCapabilities = new WeakMap<object, { lease: Lease; key: string; identity: SessionFileLeaseIdentity }>()
 export function assertSessionFileLease(capability: SessionFileLeaseCapability): SessionFileLeaseIdentity {
   const value = capability && typeof capability === 'object' ? leaseCapabilities.get(capability) : undefined
-  check(value && value.lease.active && owned.getStore()?.get(value.key) === value.lease, 'CCB_TRANSCRIPT_LEASE_INVALID')
+  check(value?.lease.active && owned.getStore()?.get(value.key) === value.lease, 'CCB_TRANSCRIPT_LEASE_INVALID')
   if (value!.lease.failure) throw value!.lease.failure
   return value!.identity
 }
