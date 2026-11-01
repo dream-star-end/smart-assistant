@@ -111,6 +111,18 @@ export function nativeReceiptHash(requestHash: string, body: unknown): string {
     `agent-remote-native-receipt-v1\n${remoteCanonical({ requestHash, body })}`,
   )
 }
+/** Shared operation-event boundary for control and Host outboxes. Session
+ * bootstrap/manifest and operation commands never enter a result-event prefix. */
+export function nativeOperationEventKindAllowed(kind: string): boolean {
+  return ![
+    'native.execute',
+    'native.query',
+    'native.cancel',
+    'runtime.bootstrap',
+    'runtime.refresh',
+    'native.manifest',
+  ].includes(kind)
+}
 export function verifyNativeJournalRecord(value: unknown): asserts value is NativeJournalRecord {
   validateRemote<NativeJournalRecord>(NativeJournalRecordSchema, value)
   verifyNativeJson(value.request)
@@ -157,17 +169,7 @@ export function verifyNativeJournalRecord(value: unknown): asserts value is Nati
       event.sequence === index + 1 && sha256 === nativeJournalEventHash(payloadHash, event),
       'native-stored-event-hash',
     )
-    requireRemote(
-      ![
-        'native.execute',
-        'native.query',
-        'native.cancel',
-        'runtime.bootstrap',
-        'runtime.refresh',
-        'native.manifest',
-      ].includes(event.body.kind),
-      'native-stored-event-kind',
-    )
+    requireRemote(nativeOperationEventKindAllowed(event.body.kind), 'native-stored-event-kind')
   }
   requireRemote(!finalEvent || value.receipt, 'native-stored-receipt-event')
   if (value.receipt) {
