@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
 import { normalizeBoxAssistantContent, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { emitJsonString, memoPureBody } from "./boxPureMemo.js";
 
 export class BoxCallFingerprintError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxCallFingerprintError"; }
@@ -15,7 +16,10 @@ export class BoxCallFingerprintError extends Error {
 function updateStableJson(value: unknown, emit: (part: string) => void,
   depth = 0): void {
   if (depth > 64) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_DEEP");
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
+  if (typeof value === "string") {
+    emitJsonString(value, emit); return;
+  }
+  if (value === null || typeof value === "boolean") {
     emit(JSON.stringify(value)); return;
   }
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -62,6 +66,17 @@ export interface BoxCallFingerprint {
  * request adds the assistant tool_use and user tool_result pair to the
  * already-running CLI; neither message was part of its previous context. */
 export function deriveBoxContextHash(body: ProxyBody,
+  completedToolTail = false): string {
+  if (!Array.isArray(body.messages)
+    || (completedToolTail && body.messages.length < 2)) {
+    throw new BoxCallFingerprintError("BOX_CALL_CONTEXT_INVALID");
+  }
+  const ceiling = currentVerifiedProxyByteBudget().contextHash;
+  return memoPureBody(body, `ctx:${completedToolTail ? 1 : 0}:${ceiling}`, () =>
+    deriveBoxContextHashUncached(body, completedToolTail));
+}
+
+function deriveBoxContextHashUncached(body: ProxyBody,
   completedToolTail = false): string {
   if (!Array.isArray(body.messages)
     || (completedToolTail && body.messages.length < 2)) {
@@ -172,6 +187,12 @@ export function fingerprintOfPrepared(prepared: { fingerprint: BoxCallFingerprin
 }
 
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
+  const ceiling = currentVerifiedProxyByteBudget().contextHash;
+  return memoPureBody(body, `fp:${uid.toString()}:${ceiling}`, () =>
+    deriveBoxCallFingerprintUncached(uid, body));
+}
+
+function deriveBoxCallFingerprintUncached(uid: bigint, body: ProxyBody): BoxCallFingerprint {
   if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
   }
@@ -228,6 +249,12 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
  * The same transform is applied to the admitted streaming request and the
  * incoming non-streaming fallback before comparing their authenticated keys. */
 export function deriveBoxFallbackAlias(uid: bigint, body: ProxyBody): string {
+  const ceiling = currentVerifiedProxyByteBudget().contextHash;
+  return memoPureBody(body, `alias:${uid.toString()}:${ceiling}`, () =>
+    deriveBoxFallbackAliasUncached(uid, body));
+}
+
+function deriveBoxFallbackAliasUncached(uid: bigint, body: ProxyBody): string {
   const semantic = normalizeBoxSemanticBody(body);
   if (!Number.isSafeInteger(semantic.max_tokens) || semantic.max_tokens < 1) {
     throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");

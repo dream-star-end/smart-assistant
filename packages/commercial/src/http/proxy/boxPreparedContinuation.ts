@@ -8,6 +8,7 @@ import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
   strictBoxDocumentBlock } from "./boxCacheAnnotations.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, deriveBoxFallbackAlias,
   fingerprintOfPrepared, type BoxCallFingerprint } from "./boxCallFingerprint.js";
+import { emitJsonString, memoPureBody } from "./boxPureMemo.js";
 import { compileBoxToolCatalog, type BoxToolCatalog } from "./boxToolCatalog.js";
 
 export const PREPARED_CONTINUATION_VERSION = 1 as const;
@@ -112,17 +113,49 @@ export interface PreparedConsumption {
   readonly effectiveBody: ProxyBody | null;
 }
 
-function stableJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "string"
-    || (typeof value === "number" && Number.isFinite(value))) return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  if (!record(value)) return JSON.stringify(null);
-  return `{${Object.keys(value).sort().map((key) =>
-    `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+function writeStableJson(value: unknown, emit: (part: string) => void): void {
+  if (typeof value === "string") {
+    emitJsonString(value, emit);
+    return;
+  }
+  if (value === null || typeof value === "boolean"
+    || (typeof value === "number" && Number.isFinite(value))) {
+    emit(JSON.stringify(value));
+    return;
+  }
+  if (Array.isArray(value)) {
+    emit("[");
+    for (let index = 0; index < value.length; index += 1) {
+      if (index) emit(",");
+      if (!Object.hasOwn(value, index)) continue;
+      writeStableJson(value[index], emit);
+    }
+    emit("]");
+    return;
+  }
+  if (!record(value)) {
+    emit(JSON.stringify(null));
+    return;
+  }
+  const keys = Object.keys(value).sort();
+  emit("{");
+  for (let index = 0; index < keys.length; index += 1) {
+    if (index) emit(",");
+    const key = keys[index];
+    if (key === undefined) continue;
+    emit(JSON.stringify(key));
+    emit(":");
+    writeStableJson(value[key], emit);
+  }
+  emit("}");
 }
 
 /** Process-local raw boundary. This is not a persisted replay digest. */
 export function rawBoundarySha256(body: ProxyBody): string {
+  return memoPureBody(body, "raw-boundary", () => rawBoundarySha256Uncached(body));
+}
+
+function rawBoundarySha256Uncached(body: ProxyBody): string {
   const pinned = {
     model: body.model,
     stream: body.stream,
@@ -135,8 +168,9 @@ export function rawBoundarySha256(body: ProxyBody): string {
     output_config: body.output_config,
     metadata: body.metadata,
   };
-  return createHash("sha256").update("ocv5-prepared-raw-v1\0")
-    .update(stableJson(pinned)).digest("hex");
+  const hasher = createHash("sha256").update("ocv5-prepared-raw-v1\0");
+  writeStableJson(pinned, (part) => { hasher.update(part); });
+  return hasher.digest("hex");
 }
 
 export function projectAuthority(kind: unknown, authorityTurnId: unknown): AuthorityProjection {

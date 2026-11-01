@@ -173,3 +173,28 @@ test("missing identity, malformed metadata and excessive nesting fail closed", (
   deep.messages = [{ role: "user", content: value }];
   rejects(deep, "BOX_CALL_BODY_TOO_DEEP");
 });
+
+test("a repeated long payload hits the same digest and a real edit misses", () => {
+  const sample = body();
+  const payload = "A".repeat(2048);
+  sample.messages[0] = { role: "user", content: [{ type: "text", text: payload }] };
+  const first = deriveBoxContextHash(sample);
+  assert.equal(deriveBoxContextHash(sample), first);
+  sample.max_tokens = 64;
+  assert.notEqual(deriveBoxContextHash(sample), first);
+  const replaced = body();
+  replaced.messages = [{ role: "user", content: [{ type: "text", text: "B".repeat(2048) }] }];
+  assert.notEqual(deriveBoxContextHash(replaced), first);
+  const shared = body();
+  shared.messages[0] = { role: "user", content: [{ type: "text", text: "C".repeat(2048) }] };
+  const left = deriveBoxCallFingerprint(3n, shared);
+  const shifted = { ...shared, metadata: { ...shared.metadata, user_id:
+    JSON.stringify({ device_id: "device-a", oc_turn_key: "b".repeat(64) }) } } as ProxyBody;
+  assert.notEqual(deriveBoxCallFingerprint(3n, shifted).replayFingerprint, left.replayFingerprint);
+  const sparse = [{ type: "text", text: "visible" }] as Array<unknown>;
+  sparse.length = 2;
+  const invalid = body();
+  invalid.messages = sparse as ProxyBody["messages"];
+  assert.throws(() => deriveBoxContextHash(invalid), BoxCallFingerprintError);
+  assert.throws(() => deriveBoxContextHash(invalid), BoxCallFingerprintError);
+});
