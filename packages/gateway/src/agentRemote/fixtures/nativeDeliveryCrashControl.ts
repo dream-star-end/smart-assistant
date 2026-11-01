@@ -67,6 +67,7 @@ try {
       environmentId: 'e1',
     })
     const lease = await service.claim('u1', binding, 1000)
+    await service.pinNativeSession('u1', binding, lease, sid)
     const source = (n: number, type: 'user' | 'assistant' = 'user') => ({
       type,
       uuid: uuid(n),

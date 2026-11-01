@@ -24,6 +24,7 @@ import {
   nativeReceiptHash,
 } from '../nativeJournal.js'
 import { createAgentRemoteService } from '../service.js'
+import type { AgentRemoteState } from '../store.js'
 export const uuid = '12345678-1234-1234-1234-123456789abc'
 export interface NativeFixture {
   root: string
@@ -75,6 +76,7 @@ export async function fixture(t: test.TestContext): Promise<NativeFixture> {
   await service.registerEnvironment('u1', environment)
   const binding = await service.bind('u1', { sessionId: 's1', workerId: 'w1', environmentId: 'e1' })
   const lease = await service.claim('u1', binding, 1000)
+  await service.pinNativeSession('u1', binding, lease, uuid)
   function record(operationId = 'op1'): NativeJournalRecord {
     const identity = { binding, nativeSessionId: uuid, environmentIncarnation: 'boot1' }
     const semantic = {
@@ -215,7 +217,8 @@ export function syntheticDelivery(record: NativeJournalRecord): {
   }
   return { preparation, proof }
 }
-export function deliver(record: NativeJournalRecord) {
+export function deliver(record: NativeJournalRecord, state?: AgentRemoteState) {
+  const firstCommit = !record.deliveryCommit
   const { preparation, proof } = syntheticDelivery(record)
   record.deliveryPreparation = preparation
   const body = {
@@ -237,5 +240,9 @@ export function deliver(record: NativeJournalRecord) {
     commitHash: nativeDeliveryCommitHash(record.request.body.payloadHash, body),
   }
   record.deliveryAck = structuredClone(record.deliveryCommit.ack)
+  if (firstCommit && state)
+    state.sessions.find(
+      (session) => session.binding.sessionId === record.request.binding.sessionId,
+    )!.nativeDeliveryWatermark++
   record.state = record.receipt!.body.status
 }

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
   type AgentRemoteBinding,
   type AgentRemoteEnvironment,
@@ -21,7 +22,9 @@ import {
 } from '@openclaude/protocol/agentRemote'
 import {
   type NativeCheckpoint,
+  type NativeCheckpointCapture,
   type NativeCheckpointIdentity,
+  NativeCheckpointIdentitySchema,
   checkpointMatchesIdentity,
   verifyNativeCheckpoint,
 } from '@openclaude/protocol/agentRemoteState'
@@ -54,6 +57,19 @@ function equal(a: unknown, b: unknown): boolean {
 }
 function bounded(items: unknown[]): void {
   requireRemote(items.length < MAX_ITEMS, 'reference-capacity')
+}
+/** Stable native UUID per logical session. Cwd/version are captured separately;
+ * a native fork must use its own logical session rather than clear another ID. */
+export function pinAgentRemoteNativeSession(found: RemoteSession, nativeSessionId: string): void {
+  validateRemote<string>(NativeCheckpointIdentitySchema.properties.nativeSessionId, nativeSessionId)
+  requireRemote(
+    !found.nativeSessionId || found.nativeSessionId === nativeSessionId,
+    'native-session-mismatch',
+  )
+  found.nativeSessionId = nativeSessionId
+}
+function nativeCheckpointDirty(found: RemoteSession): boolean {
+  return found.nativeDeliveryWatermark !== found.nativeCheckpointWatermark
 }
 function unresolved(record: Pick<JournalRecord, 'state'>): boolean {
   return !remoteTerminal(record.state)
@@ -221,6 +237,12 @@ class AgentRemoteService {
       const previous = state.workers.find((item) => item.workerId === copy.workerId)
       if (previous && previous.workerInstanceId !== copy.workerInstanceId) {
         requireRemote(
+          !state.sessions.some(
+            (item) => item.binding.workerId === copy.workerId && nativeCheckpointDirty(item),
+          ),
+          'native-checkpoint-stale',
+        )
+        requireRemote(
           ![...state.journal, ...state.nativeJournal].some(
             (item) => unresolved(item) && item.request.binding.workerId === copy.workerId,
           ),
@@ -241,6 +263,13 @@ class AgentRemoteService {
       if (previous) {
         if (equal(previous, copy)) return
         requireRemote(copy.generation > previous.generation, 'environment-generation')
+        requireRemote(
+          !state.sessions.some(
+            (item) =>
+              item.binding.environmentId === copy.environmentId && nativeCheckpointDirty(item),
+          ),
+          'native-checkpoint-stale',
+        )
         requireRemote(
           ![...state.journal, ...state.nativeJournal].some(
             (item) => unresolved(item) && item.request.binding.environmentId === copy.environmentId,
@@ -278,6 +307,7 @@ class AgentRemoteService {
       validateRemote<AgentRemoteBinding>(BindingSchema, binding)
       resources(state, binding, now)
       if (previous && equal(previous.binding, binding)) return previous.binding
+      requireRemote(!previous || !nativeCheckpointDirty(previous), 'native-checkpoint-stale')
       requireRemote(
         ![...state.journal, ...state.nativeJournal].some(
           (item) => item.request.binding.sessionId === copy.sessionId && unresolved(item),
@@ -290,7 +320,12 @@ class AgentRemoteService {
         if (previous.lease) previous.lease.active = false
       } else {
         bounded(state.sessions)
-        state.sessions.push({ binding, epochWatermark: 0 })
+        state.sessions.push({
+          binding,
+          epochWatermark: 0,
+          nativeDeliveryWatermark: 0,
+          nativeCheckpointWatermark: 0,
+        })
       }
       return binding
     })
@@ -634,6 +669,62 @@ class AgentRemoteService {
       { operationKey: agentRemoteOperationKey(binding, operationId) },
     )
   }
+  /** Bootstrap calls this before any native recorder writes or model loading. */
+  async pinNativeSession(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    token: AgentRemoteLeaseToken,
+    nativeSessionId: string,
+  ): Promise<void> {
+    this.owner(principalId, binding.principalId)
+    binding = structuredClone(binding)
+    token = structuredClone(token)
+    return this.tx(principalId, (state, now) => {
+      pinAgentRemoteNativeSession(fence(state, binding, token, now), nativeSessionId)
+    })
+  }
+  /** Internal orchestrator only: capture before the lock-held fresh copy. The
+   * normal Writer may continue; publication CAS rejects a newly delivered result. */
+  async captureNativeCheckpoint(
+    principalId: string,
+    binding: AgentRemoteBinding,
+    token: AgentRemoteLeaseToken,
+    identity: NativeCheckpointIdentity,
+  ): Promise<NativeCheckpointCapture> {
+    this.owner(principalId, binding.principalId)
+    validateRemote<NativeCheckpointIdentity>(NativeCheckpointIdentitySchema, identity)
+    binding = structuredClone(binding)
+    token = structuredClone(token)
+    identity = structuredClone(identity)
+    return this.tx(principalId, (state, now) => {
+      const current = fence(state, binding, token, now)
+      requireRemote(
+        now > 0 &&
+          identity.principalId === principalId &&
+          identity.sessionId === binding.sessionId &&
+          identity.environmentId === binding.environmentId &&
+          identity.environmentGeneration === binding.environmentGeneration,
+        'checkpoint-binding',
+      )
+      requireRemote(
+        ![...state.journal, ...state.nativeJournal].some(
+          (row) => row.request.binding.sessionId === binding.sessionId && unresolved(row),
+        ),
+        'checkpoint-inflight',
+      )
+      pinAgentRemoteNativeSession(current, identity.nativeSessionId)
+      const capture: NativeCheckpointCapture = {
+        captureId: randomUUID(),
+        identity,
+        bindingRevision: binding.bindingRevision,
+        lease: token,
+        nativeDeliveryWatermark: current.nativeDeliveryWatermark,
+        createdAtMs: now,
+      }
+      current.nativeCheckpointCapture = capture
+      return capture
+    })
+  }
   /** Internal publication only: caller is the quiescent native checkpoint task,
    * holding the actual session writer lock through file fsync AND this commit.
    * Not a handler for a caller-supplied claim of quiescence.
@@ -665,7 +756,24 @@ class AgentRemoteService {
         ),
         'checkpoint-inflight',
       )
+      const capture = current.nativeCheckpointCapture
+      requireRemote(
+        capture &&
+          capture.captureId === checkpoint.checkpointCaptureId &&
+          capture.nativeDeliveryWatermark === checkpoint.nativeDeliveryWatermark &&
+          current.nativeDeliveryWatermark === capture.nativeDeliveryWatermark &&
+          capture.bindingRevision === binding.bindingRevision &&
+          equal(capture.lease, token) &&
+          checkpoint.createdAtMs >= capture.createdAtMs,
+        'checkpoint-capture-stale',
+      )
+      checkpointMatchesIdentity(checkpoint, capture.identity)
+      if (current.nativeCheckpoint?.checkpointCaptureId === capture.captureId) {
+        requireRemote(equal(current.nativeCheckpoint, checkpoint), 'checkpoint-capture-conflict')
+        return current.nativeCheckpoint
+      }
       current.nativeCheckpoint = checkpoint
+      current.nativeCheckpointWatermark = capture.nativeDeliveryWatermark
       return checkpoint
     })
   }
@@ -678,7 +786,9 @@ class AgentRemoteService {
     binding = structuredClone(binding)
     expected = structuredClone(expected)
     return this.tx(principalId, (state) => {
-      const checkpoint = session(state, binding).nativeCheckpoint
+      const current = session(state, binding)
+      requireRemote(!nativeCheckpointDirty(current), 'native-checkpoint-stale')
+      const checkpoint = current.nativeCheckpoint
       if (!checkpoint) return undefined
       verifyNativeCheckpoint(checkpoint)
       checkpointMatchesIdentity(checkpoint, expected)

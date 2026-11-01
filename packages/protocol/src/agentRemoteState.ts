@@ -1,6 +1,7 @@
 /** P2 native state references. These are not a second dispatch/tape authority. */
 import { type Static, Type } from '@sinclair/typebox'
 import {
+  LeaseSchema,
   agentRemoteContentHash,
   remoteCanonical,
   requireRemote,
@@ -16,7 +17,7 @@ const nativeId = Type.String({
 })
 export const NativeCheckpointSchema = Type.Object(
   {
-    schemaVersion: Type.Literal(1),
+    schemaVersion: Type.Literal(2),
     checkpointId: digest,
     principalId: id,
     sessionId: id,
@@ -27,6 +28,8 @@ export const NativeCheckpointSchema = Type.Object(
     environmentId: id,
     environmentGeneration: positive,
     bindingRevision: positive,
+    checkpointCaptureId: id,
+    nativeDeliveryWatermark: integer,
     // References must be supplied from the existing committed dispatch/tape owner.
     authority: Type.Object(
       { dispatchId: id, turnKey: id, tapeCursor: integer, nativeHeadUuid: id },
@@ -64,8 +67,23 @@ export const NativeCheckpointIdentitySchema = Type.Pick(
   closed,
 )
 export type NativeCheckpointIdentity = Static<typeof NativeCheckpointIdentitySchema>
+/** Trusted checkpoint orchestrator ticket, captured before copying any bytes.
+ * It does not itself prove a flush, process exit or snapshot content. */
+export const NativeCheckpointCaptureSchema = Type.Object(
+  {
+    captureId: id,
+    identity: NativeCheckpointIdentitySchema,
+    bindingRevision: positive,
+    lease: LeaseSchema,
+    nativeDeliveryWatermark: integer,
+    createdAtMs: positive,
+  },
+  closed,
+)
+export type NativeCheckpointCapture = Static<typeof NativeCheckpointCaptureSchema>
+
 export function nativeCheckpointId(value: Omit<NativeCheckpoint, 'checkpointId'>): string {
-  return agentRemoteContentHash(`agent-remote-native-checkpoint-v1\n${remoteCanonical(value)}`)
+  return agentRemoteContentHash(`agent-remote-native-checkpoint-v2\n${remoteCanonical(value)}`)
 }
 /** Native tool producers use only these layouts; transcripts remain Worker-owned.
  * Limits here describe filesystem names, never tool-output byte limits. */

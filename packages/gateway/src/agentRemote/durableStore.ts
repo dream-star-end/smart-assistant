@@ -24,7 +24,12 @@ import {
   requireRemote,
   validateRemote,
 } from '@openclaude/protocol/agentRemote'
-import { NativeCheckpointSchema } from '@openclaude/protocol/agentRemoteState'
+import {
+  NativeCheckpointCaptureSchema,
+  NativeCheckpointIdentitySchema,
+  NativeCheckpointSchema,
+  verifyNativeCheckpoint,
+} from '@openclaude/protocol/agentRemoteState'
 import { Type } from '@sinclair/typebox'
 import Database from 'better-sqlite3'
 import type {
@@ -53,6 +58,10 @@ const StateSchema = Type.Object(
         {
           binding: BindingSchema,
           epochWatermark: integer,
+          nativeSessionId: Type.Optional(NativeCheckpointIdentitySchema.properties.nativeSessionId),
+          nativeDeliveryWatermark: integer,
+          nativeCheckpointWatermark: integer,
+          nativeCheckpointCapture: Type.Optional(NativeCheckpointCaptureSchema),
           lease: Type.Optional(
             Type.Object(
               { ...LeaseSchema.properties, expiresAtMs: integer, active: Type.Boolean() },
@@ -98,7 +107,7 @@ const StateSchema = Type.Object(
   closed,
 )
 const APPLICATION_ID = 0x41524d31
-const FORMAT_VERSION = 3
+const FORMAT_VERSION = 4
 // The existing principal metadata shape remains v1; native rows are normalized.
 const METADATA_VERSION = 1
 const MAX_STATE_BYTES = 64 * 1024 * 1024
@@ -117,7 +126,43 @@ function validateState(principalId: string, value: unknown): asserts value is Ag
       ),
     'stored-principal-mismatch',
   )
-  for (const record of value.nativeJournal) verifyNativeJournalRecord(record)
+  for (const session of value.sessions) {
+    if (session.nativeCheckpoint) {
+      verifyNativeCheckpoint(session.nativeCheckpoint)
+      requireRemote(
+        session.nativeCheckpoint.nativeSessionId === session.nativeSessionId,
+        'stored-native-session-mismatch',
+      )
+    }
+    if (session.nativeCheckpointCapture)
+      requireRemote(
+        session.nativeCheckpointCapture.identity.nativeSessionId === session.nativeSessionId &&
+          session.nativeCheckpointCapture.identity.principalId === principalId &&
+          session.nativeCheckpointCapture.identity.sessionId === session.binding.sessionId &&
+          session.nativeCheckpointCapture.nativeDeliveryWatermark <=
+            session.nativeDeliveryWatermark,
+        'stored-native-capture',
+      )
+    requireRemote(
+      session.nativeCheckpointWatermark <= session.nativeDeliveryWatermark &&
+        (session.nativeCheckpointWatermark === 0 || session.nativeCheckpoint),
+      'stored-native-watermark',
+    )
+    if (session.nativeCheckpoint)
+      requireRemote(
+        session.nativeCheckpoint.nativeDeliveryWatermark === session.nativeCheckpointWatermark,
+        'stored-native-checkpoint-watermark',
+      )
+  }
+  for (const record of value.nativeJournal) {
+    verifyNativeJournalRecord(record)
+    requireRemote(
+      value.sessions.find(
+        (session) => session.binding.sessionId === record.request.binding.sessionId,
+      )?.nativeSessionId === record.request.nativeSessionId,
+      'stored-native-session-mismatch',
+    )
+  }
 }
 export class SqliteAgentRemoteStore implements AgentRemoteStore {
   readonly durability = 'durable' as const
@@ -461,6 +506,54 @@ export class SqliteAgentRemoteStore implements AgentRemoteStore {
           [...previousNative.keys()].every((key) => nativeKeys.has(key)),
           'stored-operation-deletion',
         )
+        const newCommits = new Map<string, number>()
+        for (const write of nativeWrites)
+          if (
+            write.record.deliveryCommit &&
+            !previousNative.get(write.key)?.record.deliveryCommit
+          ) {
+            const sessionId = write.record.request.binding.sessionId
+            newCommits.set(sessionId, (newCommits.get(sessionId) ?? 0) + 1)
+          }
+        for (const before of state.sessions)
+          requireRemote(
+            draft.sessions.some((after) => after.binding.sessionId === before.binding.sessionId),
+            'stored-native-session-deletion',
+          )
+        for (const after of draft.sessions) {
+          const before = state.sessions.find(
+            (item) => item.binding.sessionId === after.binding.sessionId,
+          )
+          if (before?.nativeSessionId)
+            requireRemote(
+              after.nativeSessionId === before.nativeSessionId,
+              'stored-native-session-identity',
+            )
+          requireRemote(
+            after.nativeDeliveryWatermark ===
+              (before?.nativeDeliveryWatermark ?? 0) +
+                (newCommits.get(after.binding.sessionId) ?? 0) &&
+              after.nativeCheckpointWatermark >= (before?.nativeCheckpointWatermark ?? 0),
+            'stored-native-watermark-transition',
+          )
+          if (
+            remoteCanonical(after.nativeCheckpoint ?? null) !==
+              remoteCanonical(before?.nativeCheckpoint ?? null) ||
+            after.nativeCheckpointWatermark !== (before?.nativeCheckpointWatermark ?? 0)
+          ) {
+            const capture = before?.nativeCheckpointCapture
+            requireRemote(
+              capture &&
+                after.nativeCheckpoint &&
+                after.nativeCheckpoint.checkpointCaptureId === capture.captureId &&
+                after.nativeCheckpoint.nativeDeliveryWatermark ===
+                  capture.nativeDeliveryWatermark &&
+                after.nativeDeliveryWatermark === capture.nativeDeliveryWatermark &&
+                remoteCanonical(after.nativeCheckpointCapture) === remoteCanonical(capture),
+              'stored-native-checkpoint-capture',
+            )
+          }
+        }
         if (!row || metadata !== row.payload || writes.length || nativeWrites.length) {
           requireRemote(revision < Number.MAX_SAFE_INTEGER, 'state-revision-exhausted')
           this.database

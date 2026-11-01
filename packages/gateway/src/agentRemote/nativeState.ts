@@ -156,6 +156,8 @@ function verifyTranscript(path: string, identity: NativeCheckpointIdentity, head
 export interface NativeCheckpointRequest {
   identity: NativeCheckpointIdentity
   bindingRevision: number
+  checkpointCaptureId: string
+  nativeDeliveryWatermark: number
   authority: NativeCheckpoint['authority']
   transcriptRelativePath: string
   createdAtMs: number
@@ -359,9 +361,11 @@ export class NativeStateRepository {
         request.authority.nativeHeadUuid,
       )
       const semantic: Omit<NativeCheckpoint, 'checkpointId'> = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         ...request.identity,
         bindingRevision: request.bindingRevision,
+        checkpointCaptureId: request.checkpointCaptureId,
+        nativeDeliveryWatermark: request.nativeDeliveryWatermark,
         authority: request.authority,
         createdAtMs: request.createdAtMs,
         transcriptRelativePath: request.transcriptRelativePath,
@@ -524,6 +528,8 @@ export class NativeStateRepository {
     const actualNames = this.filesFor({
       identity: expected,
       bindingRevision: manifest.bindingRevision,
+      checkpointCaptureId: manifest.checkpointCaptureId,
+      nativeDeliveryWatermark: manifest.nativeDeliveryWatermark,
       authority: manifest.authority,
       transcriptRelativePath: manifest.transcriptRelativePath,
       createdAtMs: manifest.createdAtMs,

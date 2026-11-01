@@ -73,30 +73,53 @@ try {
       line({ locked: true })
       setInterval(() => {}, 1000)
     } else if (mode === 'checkpoint') {
-      const manifest = await repo.checkpoint(config.request, async (value) => {
-        if (config.service) {
-          const store = new SqliteAgentRemoteStore(config.service.database)
-          try {
-            await createAgentRemoteService({
-              env: { OC_AGENT_REMOTE_ENABLED: '1' },
-              createStore: () => store,
-              clock: () => config.service.now,
-            })!.publishNativeCheckpoint('u1', config.service.binding, config.service.lease, value)
-          } finally {
-            store.close()
+      const store = config.service ? new SqliteAgentRemoteStore(config.service.database) : undefined
+      const service = store
+        ? createAgentRemoteService({
+            env: { OC_AGENT_REMOTE_ENABLED: '1' },
+            createStore: () => store,
+            clock: () => config.service.now,
+          })!
+        : undefined
+      try {
+        if (service) {
+          const capture =
+            config.service.capture ??
+            (await service.captureNativeCheckpoint(
+              'u1',
+              config.service.binding,
+              config.service.lease,
+              config.identity,
+            ))
+          config.request = {
+            ...config.request,
+            checkpointCaptureId: capture.captureId,
+            nativeDeliveryWatermark: capture.nativeDeliveryWatermark,
+            createdAtMs: Math.max(config.request.createdAtMs, capture.createdAtMs),
           }
         }
-        if (config.pointer) {
-          writeFileSync(config.pointer, JSON.stringify(value), { mode: 0o600 })
-          const fd = openSync(config.pointer, 'r')
-          try {
-            fsyncSync(fd)
-          } finally {
-            closeSync(fd)
+        const manifest = await repo.checkpoint(config.request, async (value) => {
+          if (service)
+            await service.publishNativeCheckpoint(
+              'u1',
+              config.service.binding,
+              config.service.lease,
+              value,
+            )
+          if (config.pointer) {
+            writeFileSync(config.pointer, JSON.stringify(value), { mode: 0o600 })
+            const fd = openSync(config.pointer, 'r')
+            try {
+              fsyncSync(fd)
+            } finally {
+              closeSync(fd)
+            }
           }
-        }
-      })
-      line({ checkpointId: manifest.checkpointId })
+        })
+        line({ checkpointId: manifest.checkpointId })
+      } finally {
+        store?.close()
+      }
     } else if (mode === 'restore') {
       await repo.restore(config.checkpointId, config.identity, async () => {
         if (config.fault === 'commit') throw new Error('injected-before-commit')

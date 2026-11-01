@@ -60,7 +60,9 @@ test('native rows survive reopen; receipt alone blocks all four shared mutation 
   )
   const relativePath = `projects/-workspace/${uuid}.jsonl`
   const semantic = {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
+    checkpointCaptureId: 'fixture-capture',
+    nativeDeliveryWatermark: 0,
     principalId: 'u1',
     sessionId: 's1',
     nativeSessionId: uuid,
@@ -83,16 +85,19 @@ test('native rows survive reopen; receipt alone blocks all four shared mutation 
     /checkpoint-inflight/,
   )
   await reopened.transact('u1', (state) => {
-    deliver(state.nativeJournal[0]!)
+    deliver(state.nativeJournal[0]!, state)
   })
-  await service.registerEnvironment('u1', { ...f.environment, generation: 2 })
+  await assert.rejects(
+    service.registerEnvironment('u1', { ...f.environment, generation: 2 }),
+    /native-checkpoint-stale/,
+  )
 })
 test('selection always includes native unresolved and requested terminal across both domains', async (t) => {
   const f = await fixture(t)
   await f.store.transact('u1', (state) => {
     const done = f.record('done')
     receipt(done)
-    deliver(done)
+    deliver(done, state)
     state.nativeJournal.push(done, f.record('active'))
   })
   assert.deepEqual(
@@ -174,7 +179,7 @@ test('native request, event prefix, receipt and terminal evidence are immutable 
     /stored-native-evidence-mutation|native-stored-receipt-event/,
   )
   await f.store.transact('u1', (state) => {
-    deliver(state.nativeJournal[0]!)
+    deliver(state.nativeJournal[0]!, state)
   })
   await assert.rejects(
     f.store.transact('u1', (state) => {
@@ -219,7 +224,7 @@ test('native terminal requires matching receipt and durable writer ACK; owner/ha
   )
   assert.equal((await f.store.transact('u1', (state) => state.nativeJournal)).length, 0)
 })
-test('v1 owned DB rejects before WAL mutation; v3 keeps explicit v1 metadata shape', async (t) => {
+test('v1 owned DB rejects before WAL mutation; v4 keeps explicit v1 metadata shape', async (t) => {
   const f = await fixture(t)
   const legacy = join(f.root, 'legacy.sqlite')
   writeFileSync(legacy, '', { mode: 0o600 })
@@ -233,7 +238,7 @@ test('v1 owned DB rejects before WAL mutation; v3 keeps explicit v1 metadata sha
   })
   const db = new Database(f.path, { readonly: true })
   t.after(() => db.close())
-  assert.equal(db.pragma('user_version', { simple: true }), 3)
+  assert.equal(db.pragma('user_version', { simple: true }), 4)
   const metadata = db
     .prepare('SELECT format_version,payload FROM agent_remote_principals')
     .get() as { format_version: number; payload: string }
@@ -276,7 +281,7 @@ test('unknown is an observation, never an immutable final receipt; later trusted
   await f.store.transact('u1', (state) => {
     const current = state.nativeJournal[0]!
     receipt(current)
-    deliver(current)
+    deliver(current, state)
   })
   assert.equal(await f.store.transact('u1', (state) => state.nativeJournal[0]!.state), 'completed')
 })

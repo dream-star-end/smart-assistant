@@ -34,7 +34,7 @@ import {
   nativeReceiptHash,
   verifyNativeDeliveryEvidence,
 } from './nativeJournal.js'
-import { requireAgentRemoteControlFence } from './service.js'
+import { pinAgentRemoteNativeSession, requireAgentRemoteControlFence } from './service.js'
 import type { AgentRemoteState, AgentRemoteStore } from './store.js'
 
 type Executor = { hostInstanceId: string; ledgerId: string; grantId: string }
@@ -107,6 +107,10 @@ export class NativeJournalService {
       (state) => {
         const now = this.now()
         this.fence(state, principalId, expected, now)
+        pinAgentRemoteNativeSession(
+          state.sessions.find((item) => item.binding.sessionId === expected.binding.sessionId)!,
+          expected.nativeSessionId,
+        )
         const key = nativeOperationKey(expected, request.operationId)
         const old = state.nativeJournal.find((row) => nativeJournalKey(row) === key)
         if (old) {
@@ -386,6 +390,16 @@ export class NativeJournalService {
           row.deliveryPreparation!,
           row.request.nativeSessionId,
         )
+        const session = state.sessions.find(
+          (item) => item.binding.sessionId === expected.binding.sessionId,
+        )!
+        requireRemote(
+          Number.isSafeInteger(session.nativeDeliveryWatermark) &&
+            session.nativeDeliveryWatermark >= 0 &&
+            session.nativeDeliveryWatermark < Number.MAX_SAFE_INTEGER,
+          'counter-exhausted',
+        )
+        session.nativeDeliveryWatermark++
         row.deliveryCommit = commit
         row.deliveryAck = structuredClone(commit.ack)
         row.state = row.receipt!.body.status

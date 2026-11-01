@@ -9,7 +9,10 @@ import type {
   AgentRemoteRequest,
   AgentRemoteWorker,
 } from '@openclaude/protocol/agentRemote'
-import type { NativeCheckpoint } from '@openclaude/protocol/agentRemoteState'
+import type {
+  NativeCheckpoint,
+  NativeCheckpointCapture,
+} from '@openclaude/protocol/agentRemoteState'
 import type { NativeJournalRecord } from './nativeJournal.js'
 
 export interface JournalRecord {
@@ -28,6 +31,10 @@ export interface RemoteSession {
   binding: AgentRemoteBinding
   lease?: AgentRemoteLeaseToken & { expiresAtMs: number; active: boolean }
   epochWatermark: number
+  nativeSessionId?: string
+  nativeDeliveryWatermark: number
+  nativeCheckpointWatermark: number
+  nativeCheckpointCapture?: NativeCheckpointCapture
   nativeCheckpoint?: NativeCheckpoint
 }
 export interface AgentRemoteState {
