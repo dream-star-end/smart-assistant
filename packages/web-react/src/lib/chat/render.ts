@@ -11,8 +11,10 @@
  *     后由组件本地 state 锁定，不被签名重渲覆盖。
  */
 import {
+  attachmentTotalLimitMessage,
   isDisplayableServerMessage,
   normalizeTurnErrorCode,
+  parseAttachmentTotalExceeded,
   turnErrorSemantics,
   WAIVED_TURN_ERROR_CODES,
 } from "@openclaude/protocol/browser";
@@ -896,6 +898,17 @@ export function errorPresentation(
   // durable live-frame journal 保留此前所有已展示过程。
   // 均非平台内部错误,不甩堆栈。dispatch_not_accepted 是 reconciler 对「容器 rejected tombstone」
   // 铸的精确码(MIN2),与 dispatch_lost 同免单文案。
+  const attachmentTotal = parseAttachmentTotalExceeded(code);
+  if (attachmentTotal) {
+    return {
+      code: "attachment_total_exceeded",
+      fixedMessage: true,
+      title: "附件超过上限",
+      message: attachmentTotalLimitMessage(attachmentTotal.totalBytes),
+      ...(ref ? { detail: `请求 ID：${ref}` } : {}),
+      waived: true,
+    };
+  }
   if (normalized === "dispatch_lost" || normalized === "dispatch_not_accepted") {
     return {
       code: normalized,

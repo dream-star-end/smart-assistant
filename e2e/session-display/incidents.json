@@ -9619,6 +9619,74 @@
           "assertion": "[ocv5-663-tape-job-terminals] PASS — failed tape jobs stop at 8/30, held jobs stay fenced and alerts share one daily job key"
         }
       ]
-    }
+    },
+  {
+    "id": "INC-20261101-UPLOAD-TOTAL-UX",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "uid4 一次发送 4 个 rar 加 1 个 docx，合计 345649213 字节，超过单条 300MiB。单文件都在 100MiB 以内，上传成功，发送时容器以「总附件超过 300MB 限制」拒绝。状态卡只显示笼统的「消息未开始处理…请重试」和 DISPATCH_NOT_ACCEPTED，用户重试 3 次，均未计费。修复：选附件时合计超限当场写明合计、上限和分几条，这一批不上传；容器拒绝把 ATTACHMENT_TOTAL_EXCEEDED 透传到状态卡，不再出现请重试和继续。300MiB 与 100MiB 上限保持原值，拒绝结果仍是 not_accepted。",
+    "rootFixCommit": "ae556ee5",
+    "coverageCommits": [
+      "b4fbbfc8",
+      "f8ca2a8c"
+    ],
+    "regressions": [
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "345649213 bytes formats as 330MB over 300MB in two messages"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "300MiB is within the total limit and one extra byte is over"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/protocol/src/__tests__/uploadLimits.test.ts",
+        "assertion": "attachment total failure code round-trips and rejects other codes"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "noteAttachmentTotalRejection stamps 330MB copy and a parseable code"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadTotalRejection.test.ts",
+        "assertion": "stamped attachment total code round-trips on the state response and is omitted when absent"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/commercial/src/__tests__/attachmentTotalFailure.test.ts",
+        "assertion": "rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+        "assertion": "errorPresentation attachment total says 330MB and does not ask to retry"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/chat/errorNotice.test.tsx",
+        "assertion": "附件合计超限状态卡说明 330MB 且没有继续按钮"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "附件合计超过 300MB 时整批不上传并提示分两条发送"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/web-react/src/components/composerAttach.test.tsx",
+        "assertion": "同一帧内第二批附件超过 300MB 时不再上传"
+      },
+      {
+        "layer": "browser",
+        "path": "packages/web-react/browser-tests/upload-total-limit.node-test.mjs",
+        "assertion": "附件合计超过 300MB 时不上传并提示分条发送"
+      }
+    ]
+  }
   ]
 }

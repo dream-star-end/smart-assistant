@@ -29,6 +29,7 @@ import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBack
 import { closeRefusedRecoveryChains } from '../db/refusedRecoveryCards.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import { type ProductFrictionEvent, recordProductFrictionEvent } from '../productFriction/events.js'
+import { rejectedDispatchFailureCode } from './attachmentTotalFailure.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   DISPATCH_OPEN_ALERT_AGE_MS,
@@ -530,10 +531,11 @@ export async function runReconcileTick(
       // absence inference. It can only be written from queued and is terminal
       // on the container, so keeping the Master row accepted for the generic
       // 90-minute stuck window only prolongs a split-brain visible state.
+      const failureCode = rejectedDispatchFailureCode(res)
       const terminal = await casToTerminal(deps.pool, {
         dispatchId: row.dispatchId,
         outcome: 'not_accepted',
-        failureCode: 'DISPATCH_NOT_ACCEPTED',
+        failureCode,
         clientNotified: false,
         fromStatuses: ['accepted'],
         now: now(),
@@ -543,7 +545,7 @@ export async function runReconcileTick(
         logTransition(deps, row, {
           to: 'terminal',
           outcome: 'not_accepted',
-          failureCode: 'DISPATCH_NOT_ACCEPTED',
+          failureCode,
           containerState: res.state,
         })
         await clearExitMark(deps, row)
@@ -1470,10 +1472,11 @@ async function resolveRejecting(
   }
   if (res.state === 'rejected') {
     // 显式 tombstone → not_accepted 终态(未通知,交 ③ 分支 fail-visible)。
+    const failureCode = rejectedDispatchFailureCode(res)
     const terminal = await casToTerminal(deps.pool, {
       dispatchId: row.dispatchId,
       outcome: 'not_accepted',
-      failureCode: 'DISPATCH_NOT_ACCEPTED',
+      failureCode,
       clientNotified: false,
       fromStatuses: ['rejecting'],
       now: nowMs,
@@ -1483,7 +1486,7 @@ async function resolveRejecting(
       logTransition(deps, row, {
         to: 'terminal',
         outcome: 'not_accepted',
-        failureCode: 'DISPATCH_NOT_ACCEPTED',
+        failureCode,
         containerState: res.state,
       })
       await clearExitMark(deps, row)

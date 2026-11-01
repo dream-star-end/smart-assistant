@@ -60,6 +60,7 @@ import {
   getDispatchContext,
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
+import { readUploadUserFailureCode } from './uploadTotalRejection.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
 import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, _helloTurnStatusResendPhase, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
 import type { Gateway } from './server.js'
@@ -499,6 +500,7 @@ export function handleWsConnection(
             ctx: dctx,
             sendReceipt: (row) => this._sendTurnDispatchReceipt(ws, dctx, row),
             dispatch: () => this._dispatchAdmittedClientTurn(frame),
+            userFailureCode: () => readUploadUserFailureCode(frame as object),
             onAdmitError: (err) => {
               // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
               this.log.error(

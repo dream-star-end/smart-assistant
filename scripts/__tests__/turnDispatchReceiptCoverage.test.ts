@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import ts from 'typescript'
-import { assertTurnDispatchReceiptCoverage } from '../lib/turnDispatchReceiptCoverage.js'
+import { assertRejectedDispatchFailureHelper, assertTurnDispatchReceiptCoverage } from '../lib/turnDispatchReceiptCoverage.js'
 
 const bridge = readFileSync(join(process.cwd(), 'packages/commercial/src/ws/userChatBridge.ts'), 'utf8')
 const receipt = readFileSync(join(process.cwd(), 'packages/commercial/src/ws/turnDispatchReceipt.ts'), 'utf8')
@@ -70,8 +70,44 @@ describe('extracted turn dispatch receipt source guard', () => {
   })
   it('rejects weakening a terminal rejection into a different recovery outcome', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
-      mutate(receipt, "outcome: 'not_accepted', failureCode: 'DISPATCH_NOT_ACCEPTED'",
-        "outcome: 'not_accepted', failureCode: 'OTHER_REJECTION'")), pattern)
+      mutate(receipt, "failureCode: rejectedDispatchFailureCode({ kind: 'ok', userFailureCode: receipt.userFailureCode })",
+        "failureCode: 'OTHER_REJECTION'")), pattern)
+  })
+  it('still accepts the historical terminal failure code literal', () => {
+    assert.doesNotThrow(() => assertTurnDispatchReceiptCoverage(bridge,
+      mutate(receipt, "failureCode: rejectedDispatchFailureCode({ kind: 'ok', userFailureCode: receipt.userFailureCode })",
+        "failureCode: 'DISPATCH_NOT_ACCEPTED'")))
+  })
+  it('rejects an attachment helper call that does not forward the receipt code', () => {
+    assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
+      mutate(receipt, "rejectedDispatchFailureCode({ kind: 'ok', userFailureCode: receipt.userFailureCode })",
+        "rejectedDispatchFailureCode({ kind: 'ok', userFailureCode: 'nope' })")), pattern)
+  })
+  it('accepts the production attachment-total failure helper', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.doesNotThrow(() => assertRejectedDispatchFailureHelper(helper))
+  })
+  it('rejects a helper that returns an arbitrary string', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      mutate(helper, "return 'DISPATCH_NOT_ACCEPTED'", "return 'OTHER_REJECTION'")), pattern)
+  })
+  it('rejects an attachment code that is not the parsed byte count', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      mutate(helper, 'attachmentTotalExceededFailureCode(parsed.totalBytes)',
+        'attachmentTotalExceededFailureCode(0)')), pattern)
+  })
+  it('rejects a historical return hidden after an unconditional return', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    const before = `export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n`
+    const after = `${before}  return attachmentTotalExceededFailureCode(parsed.totalBytes)\n`
+    assert.throws(() => assertRejectedDispatchFailureHelper(mutate(helper, before, after)), pattern)
+  })
+  it('rejects a local function shadowing the protocol helper', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      `${helper}\nfunction attachmentTotalExceededFailureCode(value: unknown): string { return String(value) }\n`), pattern)
   })
   it('rejects an enrichment fence that no longer stops a terminalized turn', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,

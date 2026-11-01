@@ -87,8 +87,23 @@ export function assertTurnDispatchReceiptCoverage(bridgeSource: string, receiptS
   }
   const fields = new Map(options.properties.filter(ts.isPropertyAssignment).map(property => [text(property.name), text(property.initializer)]))
   for (const [name, value] of [['dispatchId', 'rec.dispatchId'], ['outcome', "'not_accepted'"],
-    ['failureCode', "'DISPATCH_NOT_ACCEPTED'"], ['fromStatuses', "['admitted']"], ['expectedEpoch', 'rec.leaseEpoch']]) {
+    ['fromStatuses', "['admitted']"], ['expectedEpoch', 'rec.leaseEpoch']]) {
     if (fields.get(name) !== value) fail(`rejected receipts must retain terminal ${name}`)
+  }
+  // Historical rows keep the literal. The attachment-total helper is the only
+  // other accepted form, and only when it forwards this receipt's own code.
+  const failureCode = fields.get('failureCode')
+  const historicalFailureCode = "'DISPATCH_NOT_ACCEPTED'"
+  const attachmentFailureCode = "rejectedDispatchFailureCode({kind:'ok',userFailureCode:receipt.userFailureCode})"
+  if (failureCode !== historicalFailureCode && failureCode !== attachmentFailureCode) {
+    fail('rejected receipts must retain terminal failureCode')
+  }
+  if (failureCode === attachmentFailureCode) {
+    const imported = receipt.statements.some(node => ts.isImportDeclaration(node) &&
+      ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === '../dispatch/attachmentTotalFailure.js' &&
+      node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings) &&
+      node.importClause.namedBindings.elements.some(element => element.name.text === 'rejectedDispatchFailureCode' && !element.propertyName))
+    if (!imported) fail('attachment-total failure codes must come from the canonical helper')
   }
   const fence = handler.body.statements.find(statement => ts.isIfStatement(statement) &&
     ts.isPrefixUnaryExpression(statement.expression) && statement.expression.operator === ts.SyntaxKind.ExclamationToken &&
@@ -99,4 +114,68 @@ export function assertTurnDispatchReceiptCoverage(bridgeSource: string, receiptS
   const accepted = calls(handler.body, 'casAdmittedToAccepted')[0]
   if (!progress || !accepted || rejected.end > fence.getStart() || fence.end > progress.getStart() ||
     fence.end > accepted.getStart()) fail('rejection and enrichment fence must run before acceptance')
+}
+
+/** Reachable returns may only be DISPATCH_NOT_ACCEPTED or the parsed byte count.
+ * Dead returns and a local shadow of the protocol helper do not count. */
+export function assertRejectedDispatchFailureHelper(source: string): void {
+  const file = parse('attachmentTotalFailure.ts', source)
+  const imported = file.statements.some(node => ts.isImportDeclaration(node) &&
+    ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text === '@openclaude/protocol' &&
+    node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings) &&
+    ['attachmentTotalExceededFailureCode', 'parseAttachmentTotalExceeded'].every(name =>
+      node.importClause?.namedBindings && ts.isNamedImports(node.importClause.namedBindings) &&
+      node.importClause.namedBindings.elements.some(element => element.name.text === name && !element.propertyName)))
+  if (!imported) fail('attachment-total codes must be imported from protocol')
+  let shadow = false
+  function see(node: ts.Node): void {
+    if (ts.isFunctionDeclaration(node) && node.name &&
+      (node.name.text === 'attachmentTotalExceededFailureCode' || node.name.text === 'parseAttachmentTotalExceeded')) shadow = true
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+      (node.name.text === 'attachmentTotalExceededFailureCode' || node.name.text === 'parseAttachmentTotalExceeded')) shadow = true
+    ts.forEachChild(node, see)
+  }
+  see(file)
+  if (shadow) fail('protocol attachment helpers must not be shadowed')
+  const fn = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'rejectedDispatchFailureCode')
+  if (!fn || !ts.isFunctionDeclaration(fn) || !fn.body ||
+    !fn.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword)) {
+    fail('rejectedDispatchFailureCode must stay exported')
+  }
+  const reachable = reachableReturns(fn.body)
+  let sawHistorical = false
+  let sawAttachment = false
+  for (const statement of reachable.returns) {
+    const expr = statement.expression
+    if (expr && ts.isStringLiteral(expr) && expr.text === 'DISPATCH_NOT_ACCEPTED') {
+      sawHistorical = true
+      continue
+    }
+    if (expr && ts.isCallExpression(expr) && text(expr.expression) === 'attachmentTotalExceededFailureCode' &&
+      expr.arguments.length === 1 && text(expr.arguments[0]!) === 'parsed.totalBytes') {
+      sawAttachment = true
+      continue
+    }
+    fail('rejectedDispatchFailureCode must return only terminal codes')
+  }
+  if (!sawHistorical || !sawAttachment) fail('rejectedDispatchFailureCode must keep both terminal returns')
+}
+
+function reachableReturns(node: ts.Node): { returns: ts.ReturnStatement[]; always: boolean } {
+  if (ts.isBlock(node)) {
+    const returns: ts.ReturnStatement[] = []
+    for (const statement of node.statements) {
+      const part = reachableReturns(statement)
+      returns.push(...part.returns)
+      if (part.always) return { returns, always: true }
+    }
+    return { returns, always: false }
+  }
+  if (ts.isReturnStatement(node)) return { returns: [node], always: true }
+  if (ts.isIfStatement(node)) {
+    const thenPart = reachableReturns(node.thenStatement)
+    const elsePart = node.elseStatement ? reachableReturns(node.elseStatement) : { returns: [], always: false }
+    return { returns: [...thenPart.returns, ...elsePart.returns], always: thenPart.always && elsePart.always }
+  }
+  return { returns: [], always: false }
 }
