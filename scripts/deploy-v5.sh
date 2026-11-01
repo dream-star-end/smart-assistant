@@ -4133,9 +4133,12 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # check-v5-box-incident-proofs.ts stays named here so the deploy-gate ledger
+  # still sees it. The runner transpiles that file once before main()'s 120s
+  # deadline. Do not switch this back to npx tsx and do not raise LIMIT_MS.
   if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
       TEST_DATABASE_URL="$box_dsn" \
-      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha"); then
+      node scripts/run-v5-box-incident-proofs.mjs --expect-sha "$full_sha"); then
     echo "✗ pinned box incident proofs gate failed" >&2
     rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
