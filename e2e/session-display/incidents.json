@@ -9408,7 +9408,36 @@
         "assertion": "单个文件超过 1024MB 时不上传"
       }
     ]
+  },
+  {
+    "id": "INC-20261101-UPLOAD-SCAN-FREEZE",
+    "occurredAt": "2026-11-01",
+    "severity": "P1",
+    "symptom": "个人版PR1337引入每小时同步扫描用户卷与JSONL，master事件循环实测冻结204413ms，healthz超时、聊天桥断开并触发watch回切，遗留双egress混合状态。扫描改为异步目录和256KiB分块IO，自动清理需OC_UPLOAD_RETENTION_ENABLED=1显式开启，默认关闭；保留1GiB/2GiB/10GiB上传限额与不完整引用扫描禁止删除保护。",
+    "rootFixCommit": "f9aa97ce",
+    "coverageCommits": ["6e390db8"],
+    "regressions": [
+      {
+        "layer": "deploy-gate",
+        "path": "scripts/check-v5-upload-retention-proof.ts",
+        "assertion": "UPLOAD_RETENTION_HTTP_RESPONSIVE"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+        "assertion": "large JSONL directory scans keep heartbeat gaps below one second"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+        "assertion": "chunk-boundary references survive and failed or oversized reads fail closed"
+      },
+      {
+        "layer": "unit",
+        "path": "packages/gateway/src/__tests__/uploadRetentionAsync.test.ts",
+        "assertion": "retention is opt-in and its disabled scheduler and entry point do no filesystem scans"
+      }
+    ]
   }
-
   ]
 }

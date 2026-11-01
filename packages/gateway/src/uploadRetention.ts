@@ -1,24 +1,18 @@
 /**
  * Upload retention.
  *
- * Leftover chunk parts and session metas older than 24h are always removed.
+ * Automatic sweeps are disabled unless OC_UPLOAD_RETENTION_ENABLED=1.
+ * Enabled sweeps remove leftover chunk parts and session metas older than 24h.
  * Published files older than 30 days are removed only when a complete scan
  * shows no recent session still references them. A failed, truncated, or
  * partial scan does not delete published files. Archive chunks count.
  * The personal directory is shared, so the scan is not limited to user
  * id `default`.
  */
-import {
-  closeSync,
-  lstatSync,
-  openSync,
-  readdirSync,
-  readSync,
-  statSync,
-  unlinkSync,
-  constants as fsConstants,
-} from 'node:fs'
-import type { Dirent, Stats } from 'node:fs'
+import { constants as fsConstants } from 'node:fs'
+import { lstat, open, opendir, readdir, unlink } from 'node:fs/promises'
+import type { Stats } from 'node:fs'
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises'
 import { join } from 'node:path'
 import {
   UPLOAD_PART_MAX_AGE_MS,
@@ -35,6 +29,9 @@ const VOLUME_DIR = /^oc-(v3|v5)-data-u([1-9][0-9]{0,18})$/
 const MAX_JSONL_FILES = 20000
 const MAX_JSONL_BYTES = 32 * 1024 * 1024
 const MAX_WALK_DEPTH = 6
+const READ_CHUNK_BYTES = 256 * 1024
+// Longer than /api/media/ + 64 hex + dot + 32 extension characters.
+const REF_OVERLAP_BYTES = 256
 
 export interface AgedFile {
   name: string
@@ -66,87 +63,91 @@ export function collectMediaNames(text: string, into: Set<string>): void {
   }
 }
 
-function safeLstat(path: string): Stats | null {
+async function safeLstat(path: string): Promise<Stats | null> {
   try {
-    return lstatSync(path)
+    return await lstat(path)
   } catch {
     return null
   }
 }
 
-export function sweepStalePartsInDir(dir: string, now = Date.now()): number {
-  let names: string[] = []
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return 0
-  }
+export async function sweepStalePartsInDir(dir: string, now = Date.now()): Promise<number> {
   let removed = 0
-  for (const name of names) {
-    const st = safeLstat(join(dir, name))
-    if (!st?.isFile()) continue
-    if (!isStaleUploadPartName(name, now - st.mtimeMs)) continue
-    try {
-      unlinkSync(join(dir, name))
-      removed++
-    } catch {
-      /* raced with a writer */
+  try {
+    for await (const entry of await opendir(dir)) {
+      const path = join(dir, entry.name)
+      const st = await safeLstat(path)
+      if (!st?.isFile() || !isStaleUploadPartName(entry.name, now - st.mtimeMs)) continue
+      try {
+        await unlink(path)
+        removed++
+      } catch {
+        /* raced with a writer */
+      }
     }
+  } catch {
+    /* missing or unreadable directory */
   }
   return removed
 }
 
-function publishedAged(dir: string, now: number): AgedFile[] {
-  let names: string[] = []
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return []
-  }
+async function publishedAged(dir: string, now: number): Promise<AgedFile[]> {
   const out: AgedFile[] = []
-  for (const name of names) {
-    if (name.startsWith('.')) continue
-    if (!PUBLISHED_NAME.test(name)) continue
-    const st = safeLstat(join(dir, name))
-    if (!st?.isFile()) continue
-    out.push({ name, ageMs: now - st.mtimeMs })
+  try {
+    for await (const entry of await opendir(dir)) {
+      if (!PUBLISHED_NAME.test(entry.name)) continue
+      const st = await safeLstat(join(dir, entry.name))
+      if (st?.isFile()) out.push({ name: entry.name, ageMs: now - st.mtimeMs })
+    }
+  } catch {
+    /* missing or unreadable directory */
   }
   return out
 }
 
-export function readReachedSize(size: number, pull: () => number): boolean {
+export async function readReachedSize(size: number, pull: () => Promise<number>): Promise<boolean> {
   let off = 0
   while (off < size) {
-    const n = pull()
+    const n = await pull()
     if (n <= 0) return false
     off += n
   }
   return true
 }
 
-function readCapped(path: string): { text: string; complete: boolean } {
-  const st = safeLstat(path)
-  if (!st?.isFile()) return { text: '', complete: true }
-  if (st.size > MAX_JSONL_BYTES) return { text: '', complete: false }
-  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+async function readCapped(path: string, into: Set<string>): Promise<boolean> {
+  const st = await safeLstat(path)
+  if (!st?.isFile() || st.size > MAX_JSONL_BYTES) return false
+  let fd: Awaited<ReturnType<typeof open>> | undefined
+  let complete = false
   try {
-    const buf = Buffer.alloc(st.size)
+    const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
+    fd = handle
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.size > MAX_JSONL_BYTES) return false
+    const buf = Buffer.alloc(Math.min(READ_CHUNK_BYTES, opened.size))
     let off = 0
-    const complete = readReachedSize(st.size, () => {
-      const n = readSync(fd, buf, off, st.size - off, off)
-      if (n > 0) off += n
-      return n
+    let tail = ''
+    complete = await readReachedSize(opened.size, async () => {
+      const { bytesRead } = await handle.read(buf, 0, Math.min(buf.length, opened.size - off), off)
+      if (bytesRead <= 0) return 0
+      off += bytesRead
+      const text = tail + buf.toString('utf8', 0, bytesRead)
+      collectMediaNames(text, into)
+      tail = text.slice(-REF_OVERLAP_BYTES)
+      await yieldToEventLoop()
+      return bytesRead
     })
-    return { text: complete ? buf.toString('utf8') : '', complete }
   } catch {
-    return { text: '', complete: false }
+    complete = false
   } finally {
     try {
-      closeSync(fd)
+      await fd?.close()
     } catch {
-      /* already closed */
+      complete = false
     }
   }
+  return complete
 }
 
 /**
@@ -154,7 +155,7 @@ function readCapped(path: string): { text: string; complete: boolean } {
  * `generated` directories are skipped. Hitting the file cap or an oversized
  * file marks the scan incomplete.
  */
-export function scanJsonlTree(root: string, into: Set<string>): boolean {
+export async function scanJsonlTree(root: string, into: Set<string>): Promise<boolean> {
   let complete = true
   let visited = 0
   const stack: { dir: string; depth: number }[] = [{ dir: root, depth: 0 }]
@@ -165,27 +166,22 @@ export function scanJsonlTree(root: string, into: Set<string>): boolean {
       complete = false
       continue
     }
-    let entries: Dirent[] = []
     try {
-      entries = readdirSync(current.dir, { withFileTypes: true })
+      for await (const entry of await opendir(current.dir)) {
+        if (entry.isSymbolicLink()) continue
+        const path = join(current.dir, entry.name)
+        if (entry.isDirectory()) {
+          if (entry.name === 'uploads' || entry.name === 'generated') continue
+          stack.push({ dir: path, depth: current.depth + 1 })
+          continue
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+        visited++
+        if (visited > MAX_JSONL_FILES) return false
+        if (!await readCapped(path, into)) complete = false
+      }
     } catch {
       complete = false
-      continue
-    }
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue
-      const path = join(current.dir, entry.name)
-      if (entry.isDirectory()) {
-        if (entry.name === 'uploads' || entry.name === 'generated') continue
-        stack.push({ dir: path, depth: current.depth + 1 })
-        continue
-      }
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
-      visited++
-      if (visited > MAX_JSONL_FILES) return false
-      const read = readCapped(path)
-      if (!read.complete) complete = false
-      else collectMediaNames(read.text, into)
     }
   }
   return complete
@@ -204,7 +200,7 @@ export async function scanRefsForUploads(opts: {
   }, body => collectMediaNames(body, names))
   let jsonlOk = true
   for (const root of opts.jsonlRoots) {
-    if (!scanJsonlTree(root, names)) jsonlOk = false
+    if (!await scanJsonlTree(root, names)) jsonlOk = false
   }
   return { names, complete: dbOk && jsonlOk }
 }
@@ -225,8 +221,8 @@ export async function sweepUploadDir(opts: {
 }): Promise<{ parts: number; published: number; skippedAged: boolean }> {
   const now = opts.now ?? Date.now()
   let parts = 0
-  for (const dir of opts.sessionDirs) parts += sweepStalePartsInDir(dir, now)
-  const aged = publishedAged(opts.uploadsDir, now)
+  for (const dir of opts.sessionDirs) parts += await sweepStalePartsInDir(dir, now)
+  const aged = await publishedAged(opts.uploadsDir, now)
   const oldEnough = aged.filter((file) => file.ageMs >= UPLOAD_RETENTION_MS)
   if (oldEnough.length === 0) return { parts, published: 0, skippedAged: false }
   const refs = await scanRefsForUploads({
@@ -239,7 +235,7 @@ export async function sweepUploadDir(opts: {
   let published = 0
   for (const name of planAgedDeletes(oldEnough, refs.names, true)) {
     try {
-      unlinkSync(join(opts.uploadsDir, name))
+      await unlink(join(opts.uploadsDir, name))
       published++
     } catch {
       /* raced */
@@ -256,7 +252,23 @@ function volumeJsonlRoots(volumeData: string): string[] {
   return [volumeData, join(paths.home, 'agents')]
 }
 
+export function isUploadRetentionEnabled(): boolean {
+  return process.env.OC_UPLOAD_RETENTION_ENABLED === '1'
+}
+
+let retentionRunning = false
+
 export async function runUploadRetentionSweep(log?: { info?: (msg: string, ctx?: unknown) => void; warn?: (msg: string, ctx?: unknown, err?: unknown) => void }): Promise<void> {
+  if (!isUploadRetentionEnabled() || retentionRunning) return
+  retentionRunning = true
+  try {
+    await runEnabledSweep(log)
+  } finally {
+    retentionRunning = false
+  }
+}
+
+async function runEnabledSweep(log?: { info?: (msg: string, ctx?: unknown) => void; warn?: (msg: string, ctx?: unknown, err?: unknown) => void }): Promise<void> {
   const personalSessions = localSessions(paths.uploadsDir)
   try {
     const result = await sweepUploadDir({
@@ -274,7 +286,7 @@ export async function runUploadRetentionSweep(log?: { info?: (msg: string, ctx?:
   }
   let entries: string[] = []
   try {
-    entries = readdirSync('/var/lib/docker/volumes')
+    entries = await readdir('/var/lib/docker/volumes')
   } catch {
     return
   }
@@ -307,6 +319,10 @@ function localSessions(uploadsDir: string): string[] {
 
 export function startUploadRetention(log?: { info?: (msg: string, ctx?: unknown) => void; warn?: (msg: string, ctx?: unknown, err?: unknown) => void }): void {
   stopUploadRetention()
+  if (!isUploadRetentionEnabled()) {
+    log?.info?.('upload retention disabled', { enableWith: 'OC_UPLOAD_RETENTION_ENABLED=1' })
+    return
+  }
   const tick = () => {
     void runUploadRetentionSweep(log)
   }

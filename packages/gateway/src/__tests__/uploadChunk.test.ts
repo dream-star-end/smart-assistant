@@ -88,14 +88,14 @@ describe('upload retention decisions', () => {
     assert.deepEqual(planAgedDeletes([{ name, ageMs: UPLOAD_RETENTION_MS + 1 }], new Set(), false), [])
   })
 
-  it('deletes stale parts even when the reference scan is incomplete', () => {
+  it('deletes stale parts even when the reference scan is incomplete', async () => {
     const root = mkdtempSync(join(tmpdir(), 'upload-parts-'))
     const part = partFileName('a'.repeat(32), 0)
     writeFileSync(join(root, part), Buffer.from('stale'))
     const old = new Date(Date.now() - UPLOAD_PART_MAX_AGE_MS - 1000)
     utimesSync(join(root, part), old, old)
     writeFileSync(join(root, '.tmp-keep'), Buffer.from('tmp'))
-    const removed = sweepStalePartsInDir(root, Date.now())
+    const removed = await sweepStalePartsInDir(root, Date.now())
     assert.equal(removed, 1)
     assert.equal(statSync(join(root, '.tmp-keep')).isFile(), true)
     assert.throws(() => statSync(join(root, part)))
@@ -142,21 +142,21 @@ describe('remote part resume', () => {
 })
 
 describe('upload reference scan fails closed', () => {
-  it('a short read is incomplete', () => {
-    assert.equal(readReachedSize(4, () => 0), false)
-    assert.equal(readReachedSize(4, () => 4), true)
+  it('a short read is incomplete', async () => {
+    assert.equal(await readReachedSize(4, async () => 0), false)
+    assert.equal(await readReachedSize(4, async () => 4), true)
     let left = 4
-    assert.equal(readReachedSize(4, () => {
+    assert.equal(await readReachedSize(4, async () => {
       if (left <= 0) return 0
       left -= 1
       return 1
     }), true)
   })
 
-  it('a missing directory or a walk deeper than 6 levels is incomplete', () => {
+  it('a missing directory or a walk deeper than 6 levels is incomplete', async () => {
     const root = mkdtempSync(join(tmpdir(), 'upload-jsonl-'))
     const into = new Set<string>()
-    assert.equal(scanJsonlTree(join(root, 'missing'), into), false)
+    assert.equal(await scanJsonlTree(join(root, 'missing'), into), false)
     let dir = root
     for (let depth = 0; depth < 8; depth++) {
       dir = join(dir, `d${depth}`)
@@ -164,12 +164,12 @@ describe('upload reference scan fails closed', () => {
     }
     const name = `${'ab'.repeat(32)}.txt`
     writeFileSync(join(dir, 'note.jsonl'), `see /api/media/${name}\n`)
-    assert.equal(scanJsonlTree(root, into), false)
+    assert.equal(await scanJsonlTree(root, into), false)
     assert.equal(into.has(name), false)
     const shallow = mkdtempSync(join(tmpdir(), 'upload-jsonl-ok-'))
     writeFileSync(join(shallow, 'note.jsonl'), `see /api/media/${name}\n`)
     const seen = new Set<string>()
-    assert.equal(scanJsonlTree(shallow, seen), true)
+    assert.equal(await scanJsonlTree(shallow, seen), true)
     assert.equal(seen.has(name), true)
   })
 

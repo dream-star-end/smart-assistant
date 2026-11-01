@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const lib = readFileSync(join(root, 'scripts/v5-selfhost-master-release-lib.sh'), 'utf8');
+const isSerialGate = (id) => id.startsWith('C.box-') || id === 'C.upload-retention' || id === 'C.ccb-mcp';
 const q = (s) => `'${s.replaceAll("'", "'\\''")}'`;
 const fn = (name) => {
   const m = lib.match(new RegExp(`^${name}\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}`, 'm'));
@@ -26,7 +27,7 @@ function fixture(t, load = '0.00') {
   writeFileSync(join(dir, 'load'), `${load} 0 0 1/1 1\n`);
   for (const name of ['check-architecture.ts', 'v5-selfhost-watch-gate.sh', 'lib/gateTestDb.mjs',
     'check-v5-box-success-recovery.ts', 'check-v5-box-continuation.ts', 'check-v5-box-incident-proofs.ts',
-    'check-v5-box-longtask.ts']) {
+    'check-v5-box-longtask.ts', 'check-v5-upload-retention-proof.ts']) {
     writeFileSync(join(dir, 'staging/scripts', name), 'fixture\n');
   }
   return { dir, env: { PATH: `${join(dir, 'bin')}:${process.env.PATH}`, HOME: dir,
@@ -441,6 +442,7 @@ case "$*" in
   *check-v5-box-continuation.ts*) id=C.box-continuation ;;
   *check-v5-box-incident-proofs.ts*) id=C.box-incident-proofs ;;
   *check-v5-box-longtask.ts*) id=C.box-longtask ;;
+  *check-v5-upload-retention-proof.ts*) id=C.upload-retention ;;
   *check-v5-ccb-mcp-availability.ts*) id=C.ccb-mcp ;;
 esac
 printf 'start %s %s %s\\n' "$id" "$PWD" "$TMPDIR" >>"$EVENTS"
@@ -494,7 +496,7 @@ run_gates
 `;
 }
 
-test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
+test('production wiring: all 18 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
   const f = fixture(t);
   const r = run(f, wireFixture(f));
   assert.equal(r.status, 0, r.stderr);
@@ -503,16 +505,16 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
     'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
-    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'ccb-mcp'].map((id) => `C.${id}`);
+    'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'upload-retention', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
-  assert.deepEqual(queued, ['D', ...expected.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')]);
+  assert.deepEqual(queued, ['D', ...expected.filter((id) => !isSerialGate(id))]);
   const firstEnd = lines.findIndex((l) => l.startsWith('end '));
   assert.equal(lines.slice(0, firstEnd).filter((l) => l.startsWith('start ')).length, 3);
   const awaited = lines.indexOf('runtime-awaited');
   const box = lines.findIndex((l) => l.startsWith('start C.box-success-recovery '));
   assert.ok(awaited < box && lines.indexOf('idle box-gates') > awaited);
-  for (const id of expected.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp').concat('D')) {
+  for (const id of expected.filter((id) => !isSerialGate(id)).concat('D')) {
     assert.ok(lines.indexOf(`end ${id}`) < awaited, id);
   }
   let active = 0;
@@ -521,18 +523,22 @@ test('production wiring: all 17 C gates + D run pinned; C/D overlap; Box waits f
       const [, id, cwd, temp] = line.split(' ');
       assert.equal(cwd, join(f.dir, 'staging'));
       active++;
-      assert.ok(active <= (id.startsWith('C.box-') || id === 'C.ccb-mcp' ? 1 : 3));
+      assert.ok(active <= (isSerialGate(id) ? 1 : 3));
       assert.ok(temp.startsWith(join(f.dir, 'tmp')));
-      if (!id.startsWith('C.box-') && id !== 'C.ccb-mcp') assert.equal(temp, join(f.dir, 'tmp', id));
+      if (!isSerialGate(id)) assert.equal(temp, join(f.dir, 'tmp', id));
     }
     if (line.startsWith('end ')) active--;
   }
   assert.equal(active, 0);
   assert.ok(lines.indexOf('end C.box-longtask') < lines.indexOf('db-drop'));
-  assert.ok(lines.indexOf('db-drop') < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
+  const uploadStart = lines.findIndex((l) => l.startsWith('start C.upload-retention '));
+  const uploadEnd = lines.indexOf('end C.upload-retention');
+  assert.ok(lines.indexOf('db-drop') < uploadStart);
+  assert.ok(uploadStart < uploadEnd);
+  assert.ok(uploadEnd < lines.findIndex((l) => l.startsWith('start C.ccb-mcp ')));
   assert.equal(lines.at(-1), 'seal built');
   assert.equal(notes(f).frontendTscSec, '0.125');
-  for (const id of ids.filter((id) => !id.startsWith('C.box-') && id !== 'C.ccb-mcp')) {
+  for (const id of ids.filter((id) => !isSerialGate(id))) {
     assert.equal(notes(f)[`job.${id}.rc`], '0', id);
     assert.ok(existsSync(notes(f)[`job.${id}.log`]), id);
   }
@@ -573,11 +579,11 @@ for (const receipt of ['hit', 'wrong-sha']) {
     }
     const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 10 : 18);
+    assert.equal(ids.length, receipt === 'hit' ? 11 : 19);
     assert.equal(notes(f)['gateEvidence.box-longtask'], 'local');
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);
-    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.box-longtask', 'C.ccb-mcp']) {
+    for (const phase of ['C.box-success-recovery', 'C.box-continuation', 'C.box-incident-proofs', 'C.box-longtask', 'C.upload-retention', 'C.ccb-mcp']) {
       assert.ok(lines.findIndex((l) => l.startsWith(`start ${phase} `)) > awaited, phase);
     }
     assert.equal(lines.at(-1), 'seal built');
@@ -593,6 +599,19 @@ for (const badDonor of [false, true]) {
     assert.ok(!lines.some((l) => l.startsWith('start C.box-') || l.startsWith('seal ')), lines.join('\n'));
     if (badDonor) assert.ok(lines.includes('donor-rejected'));
     assert.equal(notes(f)[`job.${badDonor ? 'D' : 'C.architecture'}.rc`], '1');
+    assert.equal(lines.at(-1), 'cleanup');
+  });
+}
+
+for (const receipt of ['hit', 'miss']) {
+  test(`production wiring: upload retention proof failure blocks CCB and seal with receipt ${receipt}`, (t) => {
+    const f = fixture(t);
+    const r = run(f, wireFixture(f, 'C.upload-retention', receipt));
+    assert.equal(r.status, 73, r.stderr);
+    const lines = events(f);
+    assert.ok(lines.some((l) => l.startsWith('start C.upload-retention ')));
+    assert.ok(!lines.some((l) => l.startsWith('start C.ccb-mcp ') || l.startsWith('seal ')), lines.join('\n'));
+    assert.match(r.stderr, /pinned upload retention HTTP responsiveness proof failed/);
     assert.equal(lines.at(-1), 'cleanup');
   });
 }
