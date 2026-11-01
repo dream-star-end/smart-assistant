@@ -73,11 +73,13 @@ export function createNativeToolSession(config: NativeToolSessionOptions) {
       )
       return execution
     },
-    async beforeCall(request) {
+    async invoke(request, call) {
       const signal = context.abortController.signal
       assertLive(signal)
       await config.beforeToolCall(request, signal)
       assertLive(signal)
+      // No intervening Promise reaction between the last live check and effect.
+      return call()
     },
   }
   const waitExecutions = async () => {

@@ -4,5 +4,5 @@ export interface NativeToolLifecycle {
   /** Includes validation, permission, all pre/post hooks and tool.call. */
   track<T>(request: NativeToolInvocation, execute: () => Promise<T>): Promise<T>
   /** Recheck current durable fence immediately before the actual tool.call. */
-  beforeCall(request: NativeToolInvocation): Promise<void>
+  invoke<T>(request: NativeToolInvocation, call: () => Promise<T>): Promise<T>
 }

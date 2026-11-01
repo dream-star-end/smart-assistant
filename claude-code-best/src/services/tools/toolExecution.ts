@@ -1294,9 +1294,9 @@ async function checkPermissionsAndCallTool(
     const invokeToolCall = () => {
       const lifecycle = toolUseContext.nativeToolLifecycle
       return lifecycle
-        ? lifecycle.beforeCall({
+        ? lifecycle.invoke({
             toolUseId: toolUseID, name: tool.name, input: callInput,
-          }).then(callTool)
+          }, callTool)
         : callTool()
     }
     // Fast-path: skip wrapper entirely when skill-learning is disabled to

@@ -230,6 +230,34 @@ describe('native real runTools lifetime', () => {
     expect(order).toEqual(['dispatch', 'permission', 'guard:changed', 'call:changed'])
     await f.session.dispose()
   })
+  test('no microtask gap permits an effect to begin after the final live check was cancelled', async () => {
+    const order: string[] = []
+    let cancel: () => void = () => {
+      throw Error('fixture-not-ready')
+    }
+    const f = setup(
+      fixtureTool(async (_input, context) => {
+        order.push(context.abortController.signal.aborted ? 'effect-after-abort' : 'effect-live')
+        return { data: {} }
+      }),
+      {
+        beforeToolCall: async () => {
+          queueMicrotask(() =>
+            queueMicrotask(() => {
+              order.push('abort')
+              cancel()
+            }),
+          )
+        },
+      },
+    )
+    cancel = () => f.session.abort('scheduled-cancel')
+    const batch = f.batch()
+    batch.detach()
+    await batch.done
+    expect(order).toEqual(['effect-live', 'abort'])
+    await f.session.dispose()
+  })
   test('a late dispatch grant after disposal cannot reach validation, permission or effect', async () => {
     const entered = gate()
     const release = gate()
