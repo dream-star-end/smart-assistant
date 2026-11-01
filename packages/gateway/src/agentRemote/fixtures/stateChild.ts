@@ -61,7 +61,10 @@ try {
         'writer',
         process.argv[3]!,
       ])
-      const child = spawn(command.executable, command.args, { stdio: 'ignore', detached: true })
+      const child = spawn(command.executable, command.args, {
+        stdio: ['ignore', 'ignore', 'inherit'],
+        detached: true,
+      })
       line({ writerPid: child.pid })
       setInterval(() => {}, 1000)
     } else if (mode === 'writer') {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -85,15 +86,19 @@ function start(f: ReturnType<typeof fixture>, mode: string, extra: Record<string
     err += b
   })
   const done = once(child, 'close').then(([code, signal]) => ({ code, signal, out, err }))
-  return { child, done }
+  return { child, done, diagnostics: () => err }
 }
-async function waitFor(path: string) {
-  for (let i = 0; i < 200; i++) {
+async function waitFor(path: string, diagnostics: () => string) {
+  // Cold Node/tsx startup is not the lock assertion or a product latency budget.
+  // Keep a bounded startup allowance and retain child errors for diagnosis.
+  const deadline = Date.now() + 30000
+  while (Date.now() < deadline) {
     if (existsSync(path)) return
-    await delay(25)
+    await delay(50)
   }
-  throw new Error(`fixture-ready-timeout:${path}`)
+  throw new Error(`fixture-ready-timeout:${path}: ${diagnostics()}`)
 }
+
 async function checkpoint(f: ReturnType<typeof fixture>) {
   const result = await start(f, 'checkpoint').done
   assert.equal(result.code, 0, result.err)
@@ -109,11 +114,12 @@ test('actual Writer owns flock; parent SIGKILL cannot permit another writer or c
   const ready = join(f.root, 'writer-ready')
   const manager = start(f, 'manager', { ready })
   t.after(() => manager.child.kill('SIGKILL'))
-  await waitFor(ready)
+  await waitFor(ready, manager.diagnostics)
   const writerPid = Number(readFileSync(ready, 'utf8'))
+  let writerNeedsCleanup = true
   t.after(() => {
     try {
-      process.kill(writerPid, 'SIGKILL')
+      if (writerNeedsCleanup) process.kill(writerPid, 'SIGKILL')
     } catch {}
   })
   const managerExit = once(manager.child, 'exit')
@@ -130,9 +136,11 @@ test('actual Writer owns flock; parent SIGKILL cannot permit another writer or c
   assert.equal(contender.code, 1)
   assert.equal(existsSync(f.pointer), false)
   process.kill(writerPid, 'SIGKILL')
+  writerNeedsCleanup = false
   // Killing a real process is asynchronous; wait for the kernel lock, not a TTL.
   let acquired = false
-  for (let i = 0; i < 100; i++) {
+  const lockDeadline = Date.now() + 15000
+  while (Date.now() < lockDeadline) {
     const attempt = await start(f, 'checkpoint').done
     if (attempt.code === 0) {
       acquired = true
@@ -168,6 +176,8 @@ test('quiescent checkpoint restores the same native ID into fresh directories; c
     manifest.checkpointId,
     f.request.transcriptRelativePath,
   )
+  // Fault injection into our synthetic sealed object must also work as non-root.
+  chmodSync(objectFile, 0o600)
   writeFileSync(objectFile, 'corrupt')
   assert.throws(() => f.repo.read(manifest.checkpointId, f.identity), /checkpoint-file-corrupt/)
 })
