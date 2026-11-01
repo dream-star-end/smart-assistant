@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseOwner(t *testing.T) {
@@ -1148,5 +1149,32 @@ func TestReadCapRejectsGetAndStatButNotPut(t *testing.T) {
 	(&Handler{}).handleStat(statRec, statReq)
 	if statRec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("STAT status %d body %s", statRec.Code, statRec.Body.String())
+	}
+}
+
+func TestSweepStalePartsKeepsUploadParts(t *testing.T) {
+	dir := t.TempDir()
+	id := strings.Repeat("a", 32)
+	part := filepath.Join(dir, ".part-"+id+"-0")
+	if err := os.WriteFile(part, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, ".tmp-asm-"+strings.Repeat("b", 32))
+	if err := os.WriteFile(tmp, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(part, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tmp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	sweepStaleParts(dir)
+	if _, err := os.Stat(part); err != nil {
+		t.Fatalf("upload part was removed: %v", err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatalf("assemble temp still present: %v", err)
 	}
 }

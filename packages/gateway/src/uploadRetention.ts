@@ -3,8 +3,10 @@
  *
  * Leftover chunk parts and session metas older than 24h are always removed.
  * Published files older than 30 days are removed only when a complete scan
- * shows no recent session still references them. A failed or truncated scan
- * does not delete published files.
+ * shows no recent session still references them. A failed, truncated, or
+ * partial scan does not delete published files. Archive chunks count.
+ * The personal directory is shared, so the scan is not limited to user
+ * id `default`.
  */
 import {
   closeSync,
@@ -111,7 +113,7 @@ function publishedAged(dir: string, now: number): AgedFile[] {
   return out
 }
 
-async function readSessionRefs(dbPath: string, userId: string, sinceMs: number, into: Set<string>): Promise<boolean> {
+async function readSessionRefs(dbPath: string, userId: string | null, sinceMs: number, into: Set<string>): Promise<boolean> {
   try {
     const mod = (await import('better-sqlite3')) as { default: new (path: string, opts: { readonly: boolean; fileMustExist: boolean }) => {
       prepare: (sql: string) => { all: (...args: unknown[]) => { messages?: string }[] }
@@ -119,10 +121,22 @@ async function readSessionRefs(dbPath: string, userId: string, sinceMs: number, 
     } }
     const db = new mod.default(dbPath, { readonly: true, fileMustExist: true })
     try {
-      const rows = db.prepare(
-        `SELECT messages FROM client_sessions WHERE last_at >= ? AND deleted_at IS NULL AND messages LIKE '%/api/media/%' AND user_id = ?`,
-      ).all(sinceMs, userId)
-      for (const row of rows) collectMediaNames(String(row.messages ?? ''), into)
+      const hot = db.prepare(
+        `SELECT messages FROM client_sessions
+          WHERE last_at >= ? AND deleted_at IS NULL
+            AND (messages LIKE '%/api/media/%' OR messages LIKE '%/uploads/%')
+            AND (? IS NULL OR user_id = ?)`,
+      ).all(sinceMs, userId, userId)
+      for (const row of hot) collectMediaNames(String(row.messages ?? ''), into)
+      const archived = db.prepare(
+        `SELECT c.messages AS messages
+           FROM client_session_archive_chunks c
+           JOIN client_sessions s ON s.id = c.session_id AND s.user_id = c.user_id
+          WHERE s.last_at >= ? AND s.deleted_at IS NULL
+            AND (c.messages LIKE '%/api/media/%' OR c.messages LIKE '%/uploads/%')
+            AND (? IS NULL OR s.user_id = ?)`,
+      ).all(sinceMs, userId, userId)
+      for (const row of archived) collectMediaNames(String(row.messages ?? ''), into)
     } finally {
       db.close()
     }
@@ -130,6 +144,16 @@ async function readSessionRefs(dbPath: string, userId: string, sinceMs: number, 
   } catch {
     return false
   }
+}
+
+export function readReachedSize(size: number, pull: () => number): boolean {
+  let off = 0
+  while (off < size) {
+    const n = pull()
+    if (n <= 0) return false
+    off += n
+  }
+  return true
 }
 
 function readCapped(path: string): { text: string; complete: boolean } {
@@ -140,12 +164,12 @@ function readCapped(path: string): { text: string; complete: boolean } {
   try {
     const buf = Buffer.alloc(st.size)
     let off = 0
-    while (off < st.size) {
+    const complete = readReachedSize(st.size, () => {
       const n = readSync(fd, buf, off, st.size - off, off)
-      if (n <= 0) break
-      off += n
-    }
-    return { text: buf.subarray(0, off).toString('utf8'), complete: true }
+      if (n > 0) off += n
+      return n
+    })
+    return { text: complete ? buf.toString('utf8') : '', complete }
   } catch {
     return { text: '', complete: false }
   } finally {
@@ -169,11 +193,15 @@ export function scanJsonlTree(root: string, into: Set<string>): boolean {
   while (stack.length > 0) {
     const current = stack.pop()
     if (!current) break
-    if (current.depth > MAX_WALK_DEPTH) continue
+    if (current.depth > MAX_WALK_DEPTH) {
+      complete = false
+      continue
+    }
     let entries: Dirent[] = []
     try {
       entries = readdirSync(current.dir, { withFileTypes: true })
     } catch {
+      complete = false
       continue
     }
     for (const entry of entries) {
@@ -196,7 +224,7 @@ export function scanJsonlTree(root: string, into: Set<string>): boolean {
 }
 
 export async function scanRefsForUploads(opts: {
-  userId: string
+  userId: string | null
   sessionsDb: string
   sinceMs: number
   jsonlRoots: string[]
@@ -219,7 +247,7 @@ function userIdForVolume(entry: string): string | null {
 export async function sweepUploadDir(opts: {
   uploadsDir: string
   sessionDirs: string[]
-  userId: string
+  userId: string | null
   sessionsDb: string
   jsonlRoots: string[]
   now?: number
@@ -263,7 +291,7 @@ export async function runUploadRetentionSweep(log?: { info?: (msg: string, ctx?:
     const result = await sweepUploadDir({
       uploadsDir: paths.uploadsDir,
       sessionDirs: personalSessions,
-      userId: 'default',
+      userId: null,
       sessionsDb: paths.sessionsDb,
       jsonlRoots: personalJsonlRoots(),
     })

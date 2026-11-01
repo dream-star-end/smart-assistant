@@ -460,11 +460,19 @@ export async function handleMediaGet(
         }
         return
       }
+      const pullRemote = this.deps.commercial?.pullRemoteHostMedia
+      if (!pullRemote) {
+        if (!res.headersSent) {
+          res.writeHead(404)
+          res.end('not found')
+        }
+        return
+      }
       let buf: Buffer | null = null
       let hitPath: string | null = null
       for (const remotePath of remoteCandidates) {
         try {
-          const result = await this.deps.commercial.pullRemoteHostMedia({
+          const result = await pullRemote({
             hostUuid: mediaLocation.hostUuid,
             remotePath,
           })

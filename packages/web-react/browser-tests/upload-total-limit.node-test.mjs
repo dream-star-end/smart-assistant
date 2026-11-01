@@ -61,8 +61,9 @@ test("附件合计超过 2048MB 时不上传并提示分条发送", { timeout: 9
       picker.files = transfer.files;
       picker.dispatchEvent(new Event("change", { bubbles: true }));
     }, [
-      { name: "a.rar", size: 1100 * MIB },
-      { name: "b.rar", size: 1100 * MIB },
+      { name: "a.rar", size: 800 * MIB },
+      { name: "b.rar", size: 800 * MIB },
+      { name: "c.rar", size: 600 * MIB },
     ]);
     const notice = page.getByTestId("composer-upload-total-limit");
     await notice.waitFor();

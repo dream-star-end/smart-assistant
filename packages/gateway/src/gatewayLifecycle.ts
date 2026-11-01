@@ -10,6 +10,7 @@ import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
  */
 import { mkdirSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs'
 import { startUploadRetention, stopUploadRetention } from './uploadRetention.js'
+import type { LogContext } from './logger.js'
 import { createServer } from 'node:http'
 import { join, resolve } from 'node:path'
 import type { ChannelContext } from '@openclaude/plugin-sdk'
@@ -430,7 +431,14 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
     }
   }
   try {
-    startUploadRetention(this.log)
+    startUploadRetention({
+      info: (msg, ctx) => {
+        this.log.info(msg, ctx as LogContext | undefined)
+      },
+      warn: (msg, ctx, err) => {
+        this.log.warn(msg, ctx as LogContext | undefined, err)
+      },
+    })
   } catch (err) {
     this.log.warn('upload retention arm failed', undefined, err)
   }

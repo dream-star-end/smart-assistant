@@ -698,7 +698,10 @@ func sweepStaleParts(dir string) {
 	cutoff := time.Now().Add(-24 * time.Hour)
 	for _, ent := range entries {
 		name := ent.Name()
-		if !partNameRe.MatchString(name) && !asmTmpRe.MatchString(name) {
+		// Parts belong to a master-side meta. Deleting one older than 24h
+		// while a later chunk refreshed the meta leaves resume stuck.
+		// The master removes orphans. Only assemble temps are swept here.
+		if !asmTmpRe.MatchString(name) {
 			continue
 		}
 		info, err := ent.Info()

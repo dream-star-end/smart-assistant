@@ -22,7 +22,7 @@ import {
 } from 'node:fs'
 import type { Stats } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { UPLOAD_CHUNK_BYTES, uploadChunkLength } from '@openclaude/protocol'
+import { UPLOAD_CHUNK_BYTES, isStaleUploadPartName, uploadChunkLength } from '@openclaude/protocol'
 import { resolveOpenedPath } from './openedPath.js'
 
 export const UPLOAD_ID_RE = /^[a-f0-9]{32}$/
@@ -128,6 +128,47 @@ export function listReceived(dir: string, meta: UploadSessionMeta): number[] {
     out.push(index)
   }
   return out
+}
+
+export function confirmedReceived(meta: UploadSessionMeta, present: (index: number) => boolean): number[] {
+  const out: number[] = []
+  for (let index = 0; index < meta.chunkCount; index++) {
+    if (!meta.received.includes(index)) continue
+    if (!present(index)) continue
+    out.push(index)
+  }
+  return out
+}
+
+export function remotePartUploadId(name: string): string | null {
+  const match = /^\.part-([a-f0-9]{32})-\d+$/.exec(name)
+  return match ? match[1] : null
+}
+
+export function isOrphanRemotePart(name: string, liveIds: ReadonlySet<string>): boolean {
+  const id = remotePartUploadId(name)
+  if (!id) return false
+  return !liveIds.has(id)
+}
+
+/** Ids whose meta file is still inside the 24h resume window. Null if the directory cannot be read. */
+export function freshUploadIds(sessionDir: string, now = Date.now()): Set<string> | null {
+  let names: string[]
+  try {
+    names = readdirSync(sessionDir)
+  } catch {
+    return null
+  }
+  const live = new Set<string>()
+  for (const name of names) {
+    const match = /^\.upload-([a-f0-9]{32})\.json$/.exec(name)
+    if (!match) continue
+    const st = safeStat(join(sessionDir, name))
+    if (!st?.isFile()) continue
+    if (isStaleUploadPartName(name, now - st.mtimeMs)) continue
+    live.add(match[1])
+  }
+  return live
 }
 
 function listMetas(sessionDir: string): UploadSessionMeta[] {

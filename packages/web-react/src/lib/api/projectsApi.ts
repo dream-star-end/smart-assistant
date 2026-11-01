@@ -31,14 +31,7 @@ import {
   throwApi,
   jsonOrThrow,
 } from "./http";
-import {
-  MAX_UPLOAD_FILE_BYTES,
-  MAX_UPLOAD_SINGLE_BYTES,
-  UPLOAD_CHUNK_BYTES,
-  uploadChunkCount,
-  uploadChunkLength,
-  uploadFileLimitMessage,
-} from "@openclaude/protocol/browser";
+import { MAX_UPLOAD_SINGLE_BYTES } from "@openclaude/protocol/browser";
 
 /** 资产写接口回 `{ asset }`，早期契约回裸对象；两种都收。 */
 function unwrapProjectAsset(body: { asset?: ProjectAsset } & Partial<ProjectAsset>): ProjectAsset {
@@ -92,122 +85,6 @@ async function uploadOnce(
   }
 }
 
-async function uploadChunkedFile(a: AuthSession, file: File, opts?: UploadOpts): Promise<UploadResult> {
-  if (file.size > MAX_UPLOAD_FILE_BYTES) throw new Error(uploadFileLimitMessage(file.size));
-  const storageKey = `oc-upload:${file.name}:${file.size}:${file.lastModified}`;
-  const remember = (id: string) => {
-    if (typeof sessionStorage === "undefined") return;
-    try {
-      sessionStorage.setItem(storageKey, id);
-    } catch {
-      /* private mode */
-    }
-  };
-  const recall = (): string | null => {
-    if (typeof sessionStorage === "undefined") return null;
-    try {
-      return sessionStorage.getItem(storageKey);
-    } catch {
-      return null;
-    }
-  };
-  let uploadId = recall();
-  let chunkBytes = UPLOAD_CHUNK_BYTES;
-  let chunkCount = uploadChunkCount(file.size, chunkBytes);
-  let received = new Set<number>();
-  if (uploadId) {
-    const resumeId = uploadId;
-    try {
-      const res = await uploadOnce(a, opts, (t) =>
-        fetch(`/api/uploads/${resumeId}`, {
-          method: "GET",
-          credentials: "include",
-          headers: { Accept: "application/json", Authorization: `Bearer ${t}` },
-          signal: opts?.signal,
-        }),
-      );
-      const st = (await res.json()) as { size?: number; chunkBytes?: number; chunkCount?: number; received?: number[] };
-      if (st.size === file.size && Array.isArray(st.received) && st.chunkCount) {
-        chunkBytes = st.chunkBytes || chunkBytes;
-        chunkCount = st.chunkCount;
-        received = new Set(st.received);
-      } else {
-        uploadId = null;
-      }
-    } catch (err) {
-      const status = err instanceof ApiError ? err.status : 0;
-      if (status === 404) uploadId = null;
-      else throw err;
-    }
-  }
-  if (!uploadId) {
-    const res = await uploadOnce(a, opts, (t) =>
-      fetch("/api/uploads/init", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${t}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          filename: file.name || "file",
-          size: file.size,
-          mimeType: file.type || "application/octet-stream",
-        }),
-        signal: opts?.signal,
-      }),
-    );
-    const init = (await res.json()) as { uploadId: string; chunkBytes?: number; chunkCount?: number };
-    uploadId = init.uploadId;
-    chunkBytes = init.chunkBytes || chunkBytes;
-    chunkCount = init.chunkCount || chunkCount;
-    remember(uploadId);
-  }
-  const activeId = uploadId;
-  if (!activeId) throw new Error("upload init failed");
-  let sent = 0;
-  for (let index = 0; index < chunkCount; index++) {
-    const length = uploadChunkLength(file.size, index, chunkBytes);
-    if (received.has(index)) {
-      sent += length;
-      opts?.onProgress?.(sent, file.size);
-      continue;
-    }
-    const start = index * chunkBytes;
-    const body = file.slice(start, start + length);
-    await uploadOnce(a, opts, (t) =>
-      fetch(`/api/uploads/${activeId}/chunks/${index}`, {
-        method: "PUT",
-        credentials: "include",
-        headers: {
-          Authorization: `Bearer ${t}`,
-          "content-type": "application/octet-stream",
-        },
-        body,
-        signal: opts?.signal,
-      }),
-    );
-    sent += length;
-    opts?.onProgress?.(sent, file.size);
-  }
-  const done = await uploadOnce(a, opts, (t) =>
-    fetch(`/api/uploads/${activeId}/complete`, {
-      method: "POST",
-      credentials: "include",
-      headers: { Accept: "application/json", Authorization: `Bearer ${t}` },
-      signal: opts?.signal,
-    }),
-  );
-  if (typeof sessionStorage !== "undefined") {
-    try {
-      sessionStorage.removeItem(storageKey);
-    } catch {
-      /* ignore */
-    }
-  }
-  return (await done.json()) as UploadResult;
-}
 
 export const projectsApi = {
   // ── 聊天项目（侧栏 facade；绑定看板走 boardProjectId）──
@@ -428,7 +305,10 @@ export const projectsApi = {
     file: File,
     opts?: { maxRetries?: number; signal?: AbortSignal; onProgress?: (sent: number, total: number) => void },
   ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> {
-    if (file.size > MAX_UPLOAD_SINGLE_BYTES) return uploadChunkedFile(a, file, opts);
+    if (file.size > MAX_UPLOAD_SINGLE_BYTES) {
+      const { uploadChunkedFile } = await import("./uploadChunkClient");
+      return uploadChunkedFile(a, file, opts, uploadOnce);
+    }
     const maxRetries = opts?.maxRetries ?? 5;
     // The file belongs to the identity that started the upload. callWithRefresh
     // snapshots the epoch per call, so without this pin a 503 retry after a

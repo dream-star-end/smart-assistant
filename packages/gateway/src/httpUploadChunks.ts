@@ -39,7 +39,10 @@ import { resolveOpenedPath } from './openedPath.js'
 import {
   MAX_UPLOAD_CHUNK_COUNT,
   UPLOAD_ID_RE,
+  confirmedReceived,
   deleteSessionFiles,
+  freshUploadIds,
+  isOrphanRemotePart,
   listReceived,
   localSessionDir,
   markChunkReceived,
@@ -217,23 +220,38 @@ async function sweepRemoteAged(
   if (!placed.remote || usage.truncated || !Array.isArray(usage.files)) return usage.usedBytes
   const del = host.deps.commercial?.deleteRemoteHostUpload
   if (!del) return usage.usedBytes
+  let used = usage.usedBytes
+  const now = Date.now()
+  const live = freshUploadIds(placed.sessionDir, now)
+  if (live) {
+    for (const file of usage.files) {
+      if (!isOrphanRemotePart(file.name, live)) continue
+      try {
+        await del({
+          hostUuid: placed.remote.hostUuid,
+          remotePath: `${placed.remote.remoteUploadsDir}/${file.name}`,
+        })
+        used -= Number.isFinite(file.size) ? file.size : 0
+      } catch (err) {
+        host.log.warn('chunked upload: remote part delete failed', { name: file.name }, err)
+      }
+    }
+  }
   let refsComplete = false
   let names = new Set<string>()
   try {
     const refs = await scanRefsForUploads({
       userId,
       sessionsDb: paths.sessionsDb,
-      sinceMs: Date.now() - UPLOAD_RETENTION_MS,
+      sinceMs: now - UPLOAD_RETENTION_MS,
       jsonlRoots: [join(paths.home, 'agents')],
     })
     refsComplete = refs.complete
     names = refs.names
   } catch {
-    return usage.usedBytes
+    return Math.max(0, used)
   }
-  if (!refsComplete) return usage.usedBytes
-  let used = usage.usedBytes
-  const now = Date.now()
+  if (!refsComplete) return Math.max(0, used)
   for (const file of usage.files) {
     if (!PUBLISHED_NAME.test(file.name)) continue
     if (!shouldDeleteAgedUpload(now - file.mtimeMs, names.has(file.name))) continue
@@ -396,7 +414,33 @@ async function handleStatus(host: HttpMiscHandlersHost, req: IncomingMessage, re
   if (!placedReq) return
   const meta = loadOwned(host, res, placedReq.userId, placedReq.placed.sessionDir, uploadId)
   if (!meta) return
+  if (meta.remote) {
+    const names = await remotePartNames(host, meta)
+    if (names === null) {
+      host.sendError(res, 503, '暂时无法确认上传空间，请稍后重试')
+      return
+    }
+    const received = confirmedReceived(meta, (index) => names.has(partFileName(meta.uploadId, index)))
+    host.sendJson(res, 200, statusBody(meta, received))
+    return
+  }
   host.sendJson(res, 200, statusBody(meta, listReceived(placedReq.placed.sessionDir, meta)))
+}
+
+async function remotePartNames(host: HttpMiscHandlersHost, meta: UploadSessionMeta): Promise<Set<string> | null> {
+  if (!meta.remote) return new Set()
+  const sum = host.deps.commercial?.sumRemoteUploadUsage
+  if (!sum) return null
+  try {
+    const usage = await sum({
+      hostUuid: meta.remote.hostUuid,
+      remoteDir: meta.remote.remoteUploadsDir,
+    })
+    if (usage.truncated || !Array.isArray(usage.files)) return new Set()
+    return new Set(usage.files.map((file) => file.name))
+  } catch {
+    return null
+  }
 }
 
 async function pushRemotePart(host: HttpMiscHandlersHost, meta: UploadSessionMeta, index: number, body: Buffer): Promise<void> {
@@ -557,22 +601,44 @@ async function assembleLocal(
 
 async function assembleRemote(host: HttpMiscHandlersHost, res: ServerResponse, meta: UploadSessionMeta, placed: PlacedUpload): Promise<void> {
   if (!meta.remote) return
-  const received = listReceived(placed.sessionDir, meta)
-  if (received.length !== meta.chunkCount) {
-    host.sendJson(res, 409, { error: 'upload incomplete', code: 'upload_incomplete', received })
-    return
-  }
   const assemble = host.deps.commercial?.assembleRemoteHostUpload
   if (!assemble) {
     host.sendError(res, 503, '暂时无法确认上传空间，请稍后重试')
     return
   }
+  const onAgent = await remotePartNames(host, meta)
+  if (onAgent === null) {
+    host.sendError(res, 503, '暂时无法确认上传空间，请稍后重试')
+    return
+  }
   try {
+    const received: number[] = []
     for (let index = 0; index < meta.chunkCount; index++) {
-      if (meta.received.includes(index)) continue
-      const body = readFileSync(join(placed.sessionDir, partFileName(meta.uploadId, index)))
+      const name = partFileName(meta.uploadId, index)
+      if (onAgent.has(name)) {
+        received.push(index)
+        continue
+      }
+      let body: Buffer
+      try {
+        body = readFileSync(join(placed.sessionDir, name))
+      } catch {
+        host.sendJson(res, 409, { error: 'upload incomplete', code: 'upload_incomplete', received })
+        return
+      }
+      const expectLen = uploadChunkLength(meta.size, index, meta.chunkBytes)
+      if (body.length !== expectLen) {
+        host.sendJson(res, 409, { error: 'upload incomplete', code: 'upload_incomplete', received })
+        return
+      }
       await pushRemotePart(host, meta, index, body)
       markChunkReceived(placed.sessionDir, meta, index)
+      onAgent.add(name)
+      received.push(index)
+    }
+    if (received.length !== meta.chunkCount) {
+      host.sendJson(res, 409, { error: 'upload incomplete', code: 'upload_incomplete', received })
+      return
     }
     const assembled = await assemble({
       hostUuid: meta.remote.hostUuid,
