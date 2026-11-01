@@ -17,7 +17,9 @@ import { randomUUID } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 
 export const STUDIO_LEASE_SECONDS = 90
-export const STUDIO_AFFINITY_GRACE_SECONDS = 180
+// One hour, the same horizon as the Muse queue wait. The VM bridge is absent for
+// well under that between its scheduled restarts; 180s failed tasks as PROVIDER_OFFLINE.
+export const STUDIO_AFFINITY_GRACE_SECONDS = 3_600
 
 type Db = Pool | PoolClient
 

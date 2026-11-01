@@ -10,12 +10,17 @@
 //   - The ack is an execution barrier: the bridge only starts media-generation after the
 //     master answered 200 to the ack for this exact nonce. A dispatched job without an ack
 //     within ACK_TIMEOUT_MS is requeued with a fresh nonce, so a late ack for the old nonce
-//     gets 410 and the bridge drops it. At most one generation can therefore run per job.
+//     gets 410 and the bridge drops it. At most one generation runs for a given nonce.
+//   - A running job goes back on the queue (same id, new nonce, no charge) when the bridge
+//     says hello again, posts MUSE_BRIDGE_LOST, or stays silent for HEARTBEAT_LOST_MS.
+//     The previous generation stops on 410. After MAX_DISPATCH_ATTEMPTS the job fails.
+//     Queued jobs stay queued while the bridge is quiet, until the queue wait.
 //   - Credits are charged only for a job that succeeded, in the same transaction that records the
 //     success (MuseBilling.settle). Anything else — failure, cancel, timeout, lost bridge, restart —
 //     charges nothing.
 
 import { type Hash, createHash, randomUUID } from 'node:crypto'
+import { rmSync } from 'node:fs'
 import { access, appendFile, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -326,10 +331,7 @@ export class MuseBridgeHub {
     }
     this.clearWaiters()
     for (const a of [...this.active.values()]) {
-      if (a.state === 'dispatched') this.requeue(a)
-      else if (a.state === 'running') {
-        this.finish(a, fail('MUSE_BRIDGE_LOST', 'the bridge reconnected while the job was running'))
-      }
+      if (a.state === 'dispatched' || a.state === 'running') this.requeue(a, 'reconnect')
     }
     this.session = { id: randomUUID(), credentialId, version, lastSeen: this.now() }
     this.log.info('muse_bridge_hello', { credentialId, version })
@@ -464,6 +466,12 @@ export class MuseBridgeHub {
     const job = this.requireRunning(jobId, nonce)
     if (body.ok !== true) {
       const f = normalizeBridgeFailure(body)
+      // The bridge stopped this generation. Same job id, new nonce, no charge.
+      // requeue() leaves a job alone once billing has started to settle it.
+      if (f.code === 'MUSE_BRIDGE_LOST') {
+        this.requeue(job, 'bridge_lost')
+        return
+      }
       this.finish(job, {
         ok: false,
         status: f.code === 'MUSE_CANCELLED' ? 'cancelled' : 'failed',
@@ -633,7 +641,10 @@ export class MuseBridgeHub {
         'Muse media tools are not enabled for this account',
       )
     }
-    if (!this.bridgeOnline()) {
+    // Refuse only before the first hello. A session that has gone quiet (the VM process
+    // restarts on a schedule and dials back) still accepts work: the job waits until the
+    // bridge polls again, or until the queue wait. Failing it here dropped jobs across that gap.
+    if (!this.session) {
       throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
     }
     const version = this.session?.version ?? null
@@ -887,11 +898,8 @@ export class MuseBridgeHub {
 
   tick(): void {
     const now = this.now()
-    if (!this.bridgeOnline()) {
-      for (const job of [...this.queue]) {
-        this.finish(job, fail('MUSE_BRIDGE_OFFLINE', 'the Muse bridge disconnected'))
-      }
-    }
+    // A quiet bridge does not fail queued jobs. They wait out queueWaitMs (an hour in
+    // production). bridgeOnline() stays the signal the UI and studio affinity use.
     for (const a of [...this.active.values()]) {
       if (a.state === 'dispatched' && now - a.dispatchedAt > ACK_TIMEOUT_MS) {
         if (a.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
@@ -911,7 +919,7 @@ export class MuseBridgeHub {
         }
       } else if (a.state === 'running') {
         if (now - a.lastBeatAt > HEARTBEAT_LOST_MS) {
-          this.finish(a, fail('MUSE_BRIDGE_LOST', 'lost contact with the bridge during the job'))
+          this.requeue(a, 'heartbeat_lost')
         } else if (now > a.deadlineAt) {
           this.finish(a, fail('MUSE_TIMEOUT', 'the job exceeded its deadline', true))
         }
@@ -988,12 +996,31 @@ export class MuseBridgeHub {
     }
   }
 
-  private requeue(job: HubJob): void {
-    if (job.state !== 'dispatched') return
+  private requeue(job: HubJob, reason?: string): void {
+    if (job.state === 'done' || job.settling) return
+    if (job.state !== 'dispatched' && job.state !== 'running') return
+    if (job.dispatchCount >= MAX_DISPATCH_ATTEMPTS) {
+      this.finish(
+        job,
+        fail('MUSE_BRIDGE_LOST', 'lost contact with the bridge too many times', true),
+      )
+      return
+    }
+    const wasRunning = job.state === 'running'
     this.active.delete(job.id)
     job.state = 'queued'
     job.nonce = randomUUID()
+    job.uploads = new Map()
+    job.uploadBusy = false
+    // Drop a partial upload so the next generation does not append to it.
+    // Synchronous: a promise rm can delete the next generation's upload, which is
+    // created as soon as the bridge polls again.
+    if (wasRunning) rmSync(join(this.root, job.id), { recursive: true, force: true })
     this.queue.unshift(job)
+    this.wake(job)
+    if (reason) {
+      this.log.warn('muse_job_requeued', { jobId: job.id, attempt: job.dispatchCount, reason })
+    }
     this.pump()
   }
 
