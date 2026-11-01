@@ -994,7 +994,7 @@ class Bridge:
                          time.monotonic() - started)
             except JobError as e:
                 if self.stop.is_set():
-                    e = JobError("MUSE_BRIDGE_LOST", "bridge 正在停止")
+                    e = JobError("MUSE_BRIDGE_LOST", "bridge 正在停止", retryable=True)
                 body = e.result()
                 log.info("任务 %s 失败：%s（%s）%.0f 秒", jid, e.code, kind, time.monotonic() - started)
             if jid:

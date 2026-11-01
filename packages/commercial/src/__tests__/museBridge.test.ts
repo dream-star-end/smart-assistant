@@ -15,6 +15,7 @@ import { MuseBridgeHub, type MuseWireJob, deterministicMuseJobId } from '../muse
 import {
   INLINE_SOURCE_MAX_BYTES,
   MAX_DISPATCH_ATTEMPTS,
+  QUEUE_WAIT_MS,
   MUSE_LIMITS,
   MuseError,
   base64DecodedBytes,
@@ -466,17 +467,43 @@ describe('muse hub', () => {
     assert.notEqual(again.nonce, j.nonce)
   })
 
-  it('lost heartbeat and deadline fail the running job', async () => {
+  it('lost heartbeat requeues a running job and gives up only after five dispatches', async () => {
+    hub.stop()
+    hub = new MuseBridgeHub({
+      store,
+      stateRoot: root,
+      allowedUids: new Set(['3']),
+      rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+      cliTimeoutSec: { image: 120, video: 300 },
+      queueWaitMs: { image: 3_600_000, video: 3_600_000 },
+      now: () => clock.t,
+    })
     const a = await runningJob()
     // 61 s of silence is tolerated (relay-dropped heartbeats); 121 s is lost contact.
     clock.t += 61_000
     hub.checkSession((hub as any).session.id)
     hub.tick()
     assert.equal((await hub.view('3', a.id, 0))?.status, 'running', 'still running after 61 s')
-    clock.t += 60_000
+    for (let i = 0; i < 4; i++) {
+      clock.t += 121_000
+      hub.checkSession((hub as any).session.id)
+      hub.tick()
+      assert.notEqual((await hub.view('3', a.id, 0))?.status, 'failed', `alive after gap ${i + 1}`)
+      const again = (await hub.poll((hub as any).session.id, 50))!
+      assert.equal(again.id, a.id)
+      hub.heartbeat(again.id, again.nonce)
+    }
+    clock.t += 121_000
     hub.checkSession((hub as any).session.id)
     hub.tick()
-    assert.equal((await hub.view('3', a.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')
+    const lost = await hub.view('3', a.id, 0)
+    assert.equal(lost?.status, 'failed')
+    assert.equal(lost?.error?.code, 'MUSE_BRIDGE_LOST')
+    assert.equal(lost?.error?.retryable, true)
+    assert.equal(
+      store.finished.some(([, fin]) => fin.status === 'succeeded'),
+      false,
+    )
     const b = await runningJob()
     for (let i = 0; i < 20; i++) {
       clock.t += 10_000
@@ -489,7 +516,7 @@ describe('muse hub', () => {
     assert.equal(v?.error?.retryable, true)
   })
 
-  it('a new hello requeues a dispatched job but fails a running one', async () => {
+  it('a new hello requeues a dispatched job and a running one', async () => {
     const sid = await online()
     await hub.submit('3', null, { kind: 'image', prompt: 'x' })
     const d = (await hub.poll(sid, 50))!
@@ -498,9 +525,95 @@ describe('muse hub', () => {
     assert.equal(hub.checkSession('never-seen'), 'unknown')
     const again = (await hub.poll(sid2, 50))!
     assert.equal(again.id, d.id)
+    assert.notEqual(again.nonce, d.nonce)
     hub.heartbeat(again.id, again.nonce)
+    const sid3 = await online()
+    assert.equal((await hub.view('3', d.id, 0))?.status, 'queued')
+    const third = (await hub.poll(sid3, 50))!
+    assert.equal(third.id, d.id)
+    assert.notEqual(third.nonce, again.nonce)
+    assert.throws(
+      () => hub.heartbeat(again.id, again.nonce),
+      (e: MuseError) => e.status === 410,
+    )
+    assert.equal(store.finished.length, 0)
+  })
+
+  it('a quiet bridge keeps queued jobs and still accepts submissions', async () => {
     await online()
-    assert.equal((await hub.view('3', d.id, 0))?.error?.code, 'MUSE_BRIDGE_LOST')
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    clock.t += 61_000
+    hub.tick()
+    assert.equal((await hub.view('3', id, 0))?.status, 'queued')
+    const id2 = await hub.submit('3', null, { kind: 'image', prompt: 'y' })
+    assert.equal((await hub.view('3', id2, 0))?.status, 'queued')
+    clock.t += QUEUE_WAIT_MS + 1
+    hub.tick()
+    assert.equal((await hub.view('3', id, 0))?.error?.code, 'MUSE_BUSY')
+    assert.equal((await hub.view('3', id2, 0))?.error?.code, 'MUSE_BUSY')
+  })
+
+  it('a bridge stop requeues the same job, which can still succeed once', async () => {
+    const sid = await online()
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    const first = (await hub.poll(sid, 50))!
+    hub.heartbeat(first.id, first.nonce)
+    await hub.result(first.id, first.nonce, {
+      ok: false,
+      error_code: 'MUSE_BRIDGE_LOST',
+      error_message: 'bridge 正在停止',
+      retryable: false,
+    })
+    assert.equal((await hub.view('3', id, 0))?.status, 'queued')
+    assert.equal(store.finished.length, 0)
+    const again = (await hub.poll(sid, 50))!
+    assert.equal(again.id, id)
+    assert.notEqual(again.nonce, first.nonce)
+    hub.heartbeat(again.id, again.nonce)
+    await hub.putChunk(again.id, again.nonce, 0, 0, WEBP, sha(WEBP))
+    await hub.result(again.id, again.nonce, {
+      ok: true,
+      files: [
+        {
+          idx: 0,
+          filename: 'x.webp',
+          mime: 'image/webp',
+          bytes: WEBP.length,
+          sha256: sha(WEBP),
+          chunks: 1,
+        },
+      ],
+    })
+    assert.equal((await hub.view('3', id, 0))?.status, 'succeeded')
+    assert.equal(
+      store.finished.filter(([, fin]) => fin.status !== 'succeeded').length,
+      0,
+    )
+  })
+
+  it('gives up after five bridge-stop reports and still charges nothing', async () => {
+    const sid = await online()
+    const id = await hub.submit('3', null, { kind: 'image', prompt: 'x' })
+    for (let i = 0; i < 5; i++) {
+      const job = (await hub.poll(sid, 50))!
+      assert.equal(job.id, id)
+      hub.heartbeat(job.id, job.nonce)
+      await hub.result(job.id, job.nonce, {
+        ok: false,
+        error_code: 'MUSE_BRIDGE_LOST',
+        error_message: 'bridge 正在停止',
+        retryable: false,
+      })
+      if (i < 4) assert.equal((await hub.view('3', id, 0))?.status, 'queued', `alive after stop ${i + 1}`)
+    }
+    const v = await hub.view('3', id, 0)
+    assert.equal(v?.status, 'failed')
+    assert.equal(v?.error?.code, 'MUSE_BRIDGE_LOST')
+    assert.equal(v?.error?.retryable, true)
+    assert.equal(
+      store.finished.some(([, fin]) => fin.status === 'succeeded'),
+      false,
+    )
   })
 
   it('chunks: sequential, sha-checked, idempotent retry, size cap fails the job', async () => {
