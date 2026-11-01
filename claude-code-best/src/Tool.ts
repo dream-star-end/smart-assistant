@@ -181,6 +181,8 @@ export type ToolUseContext = {
      */
     allowBackgroundForkedSlashCommands?: boolean
   }
+  /** Trusted ToolHost lifecycle; undefined on the ordinary local path. */
+  nativeToolLifecycle?: import('./services/tools/nativeToolLifecycle.js').NativeToolLifecycle
   abortController: AbortController
   readFileState: FileStateCache
   getAppState(): AppState

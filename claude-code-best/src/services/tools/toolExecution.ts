@@ -551,7 +551,7 @@ function streamedCheckPermissionsAndCallTool(
   // Ideally the progress reporting and tool call reporting would
   // be via separate mechanisms.
   const stream = new Stream<MessageUpdateLazy>()
-  checkPermissionsAndCallTool(
+  const execute = () => checkPermissionsAndCallTool(
     tool,
     toolUseID,
     input,
@@ -599,6 +599,12 @@ function streamedCheckPermissionsAndCallTool(
       })
     },
   )
+  const execution = toolUseContext.nativeToolLifecycle
+    ? toolUseContext.nativeToolLifecycle.track(
+        { toolUseId: toolUseID, name: tool.name, input }, execute,
+      )
+    : execute()
+  execution
     .then(results => {
       for (const result of results) {
         stream.enqueue(result)
@@ -1268,7 +1274,7 @@ async function checkPermissionsAndCallTool(
     //
     // The invoke lambda is shared between the flag-on (wrapper) and flag-off
     // (direct) paths so that post-call processing is never duplicated.
-    const invokeToolCall = () =>
+    const callTool = () =>
       tool.call(
         callInput,
         {
@@ -1285,6 +1291,14 @@ async function checkPermissionsAndCallTool(
           })
         },
       )
+    const invokeToolCall = () => {
+      const lifecycle = toolUseContext.nativeToolLifecycle
+      return lifecycle
+        ? lifecycle.beforeCall({
+            toolUseId: toolUseID, name: tool.name, input: callInput,
+          }).then(callTool)
+        : callTool()
+    }
     // Fast-path: skip wrapper entirely when skill-learning is disabled to
     // avoid even the cached-import resolution on the hot path.
     const result = isSkillLearningEnabled()

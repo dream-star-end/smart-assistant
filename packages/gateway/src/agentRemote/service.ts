@@ -55,7 +55,7 @@ function equal(a: unknown, b: unknown): boolean {
 function bounded(items: unknown[]): void {
   requireRemote(items.length < MAX_ITEMS, 'reference-capacity')
 }
-function unresolved(record: JournalRecord): boolean {
+function unresolved(record: Pick<JournalRecord, 'state'>): boolean {
   return !remoteTerminal(record.state)
 }
 function session(state: AgentRemoteState, binding: AgentRemoteBinding): RemoteSession {
@@ -221,7 +221,7 @@ class AgentRemoteService {
       const previous = state.workers.find((item) => item.workerId === copy.workerId)
       if (previous && previous.workerInstanceId !== copy.workerInstanceId) {
         requireRemote(
-          !state.journal.some(
+          ![...state.journal, ...state.nativeJournal].some(
             (item) => unresolved(item) && item.request.binding.workerId === copy.workerId,
           ),
           'inflight-worker',
@@ -242,7 +242,7 @@ class AgentRemoteService {
         if (equal(previous, copy)) return
         requireRemote(copy.generation > previous.generation, 'environment-generation')
         requireRemote(
-          !state.journal.some(
+          ![...state.journal, ...state.nativeJournal].some(
             (item) => unresolved(item) && item.request.binding.environmentId === copy.environmentId,
           ),
           'inflight-environment',
@@ -279,7 +279,7 @@ class AgentRemoteService {
       resources(state, binding, now)
       if (previous && equal(previous.binding, binding)) return previous.binding
       requireRemote(
-        !state.journal.some(
+        ![...state.journal, ...state.nativeJournal].some(
           (item) => item.request.binding.sessionId === copy.sessionId && unresolved(item),
         ),
         'inflight-session',
@@ -660,7 +660,7 @@ class AgentRemoteService {
         'checkpoint-binding',
       )
       requireRemote(
-        !state.journal.some(
+        ![...state.journal, ...state.nativeJournal].some(
           (row) => row.request.binding.sessionId === binding.sessionId && unresolved(row),
         ),
         'checkpoint-inflight',
@@ -704,3 +704,6 @@ export function createAgentRemoteService(options: {
   )
   return new AgentRemoteService(store, options.clock ?? Date.now)
 }
+
+/** Internal shared control fence; not a transport handler or caller-asserted lease. */
+export { fence as requireAgentRemoteControlFence }

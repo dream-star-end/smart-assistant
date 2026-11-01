@@ -10,6 +10,7 @@ import type {
   AgentRemoteWorker,
 } from '@openclaude/protocol/agentRemote'
 import type { NativeCheckpoint } from '@openclaude/protocol/agentRemoteState'
+import type { NativeJournalRecord } from './nativeJournal.js'
 
 export interface JournalRecord {
   request: AgentRemoteRequest
@@ -34,6 +35,7 @@ export interface AgentRemoteState {
   environments: AgentRemoteEnvironment[]
   sessions: RemoteSession[]
   journal: JournalRecord[]
+  nativeJournal: NativeJournalRecord[]
 }
 /**
  * Trusted control-plane storage boundary. transact MUST serialize/atomically commit
@@ -69,6 +71,7 @@ export class VolatileAgentRemoteStore implements AgentRemoteStore {
         environments: [],
         sessions: [],
         journal: [],
+        nativeJournal: [],
       },
     )
     // No await between read, change and commit; single JS isolate reference only.
