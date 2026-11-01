@@ -41,6 +41,7 @@ import {
   safeMessageSignature,
 } from "../lib/chat/render";
 import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { collectAutomaticRecoveredSourceIds, recoveryFailureIsPresentedBelow } from "../lib/chat/recoveryFailureOutlet";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
@@ -2164,14 +2165,7 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
-  // Automatic children only. A manual 从断点继续 row must not hide 发送失败 by itself;
-  // that path already retires the card through manuallyContinuedSourceIds.
-  const automaticRecoveredSourceIds = new Set(
-    safeMessages
-      .filter((message) => isRecoveryControlUserTurn(message) && message._automaticRecovery === true)
-      .map((message) => message._recoveryOfClientMessageId)
-      .filter(isNonEmptyId),
-  );
+  const automaticRecoveredSourceIds = collectAutomaticRecoveredSourceIds(safeMessages);
   // OCV5-307: the user acted on a committed card by clicking 从断点继续. While
   // that manual continuation runs (or after it finished) the card is resolved,
   // not a live failure; leaving it up showed 任务执行失败 + 重新尝试 next to
@@ -2267,23 +2261,15 @@ export function MessageList({
   // card is no longer visible. Do not resurrect the old user's failed-send CTA.
   for (const sourceId of manuallyContinuedSourceIds) presentedErrorTurnIds.add(visibleErrorTurnId(sourceId));
   const renderableIds = new Set(renderableMessages.map((message) => message.id));
-  // The source's own error card is hidden on purpose once an automatic child
-  // exists. A later failure whose card was filtered out must still own the
-  // bubble, or the user loses the only 继续.
-  const unpresentedAutomaticFailureSources = new Set<string>();
-  for (const message of safeMessages) {
-    const failed = (message.role === "assistant" && !!message._errorCode) || message._turnStatusRecord === true;
-    if (!failed || typeof message._clientMessageId !== "string" || message._clientMessageId.length === 0) continue;
-    if (renderableIds.has(message.id)) continue;
-    if (automaticRecoveredSourceIds.has(message._clientMessageId)) continue;
-    const owner = visibleErrorTurnId(message._clientMessageId);
-    if (automaticRecoveredSourceIds.has(owner)) unpresentedAutomaticFailureSources.add(owner);
-  }
   const failureIsPresentedBelow = (message: ChatMessage): boolean =>
-    message.role === "user" && (
-      presentedErrorTurnIds.has(message.id) ||
-      (automaticRecoveredSourceIds.has(message.id) && !unpresentedAutomaticFailureSources.has(message.id))
-    );
+    recoveryFailureIsPresentedBelow({
+      message,
+      presentedErrorTurnIds,
+      automaticRecoveredSourceIds,
+      safeMessages,
+      renderableIds,
+      visibleErrorTurnId,
+    });
   const legacyArchivedRemaining = archive?.hasMore === undefined
     ? Math.max(
         0,
