@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 import { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
+import { MAX_UPLOAD_TOTAL } from '../httpUploadStatic.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-gw-upload-total-'))
 process.env.OPENCLAUDE_HOME = testHome
@@ -22,7 +23,8 @@ test('message attachment total includes bytes after the 2GiB cap is crossed', ()
   const gib = 1024 * mib
   const sizes = Array.from({ length: 5 }, () => gib)
   const firstOverPrefix = 3 * gib
-  assert.equal(2 * gib > 2 * gib, false)
+  assert.equal(2 * gib > MAX_UPLOAD_TOTAL, false)
+  assert.equal(2 * gib + 1 > MAX_UPLOAD_TOTAL, true)
   assert.equal(firstOverPrefix > 2 * gib, true)
   const total = messageAttachmentTotal(sizes)
   assert.equal(total, 5 * gib)
