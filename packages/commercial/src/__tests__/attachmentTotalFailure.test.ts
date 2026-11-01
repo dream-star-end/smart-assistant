@@ -5,21 +5,13 @@ import { rejectedDispatchFailureCode } from "../dispatch/attachmentTotalFailure.
 
 describe("attachment total failure code", () => {
   it("rejected dispatch keeps DISPATCH_NOT_ACCEPTED unless the attachment total code parses", () => {
-    assert.equal(
-      rejectedDispatchFailureCode({ kind: "ok", state: "rejected", outcome: "not_accepted" }),
-      "DISPATCH_NOT_ACCEPTED",
-    );
-    assert.equal(
-      rejectedDispatchFailureCode({ kind: "ok", userFailureCode: "PLEASE_RETRY" }),
-      "DISPATCH_NOT_ACCEPTED",
-    );
-    assert.equal(
-      rejectedDispatchFailureCode({ kind: "unreachable", detail: "down", userFailureCode: "ATTACHMENT_TOTAL_EXCEEDED:1" }),
-      "DISPATCH_NOT_ACCEPTED",
-    );
-    assert.equal(
-      rejectedDispatchFailureCode({ kind: "ok", userFailureCode: "ATTACHMENT_TOTAL_EXCEEDED:345649213" }),
-      "ATTACHMENT_TOTAL_EXCEEDED:345649213",
-    );
+    const plain = { kind: "ok", state: "rejected", outcome: "not_accepted" };
+    const foreign = { kind: "ok", userFailureCode: "PLEASE_RETRY" };
+    const unreachable = { kind: "unreachable", detail: "down", userFailureCode: "ATTACHMENT_TOTAL_EXCEEDED:1" };
+    const over = { kind: "ok", userFailureCode: "ATTACHMENT_TOTAL_EXCEEDED:345649213" };
+    assert.equal(rejectedDispatchFailureCode(plain), "DISPATCH_NOT_ACCEPTED");
+    assert.equal(rejectedDispatchFailureCode(foreign), "DISPATCH_NOT_ACCEPTED");
+    assert.equal(rejectedDispatchFailureCode(unreachable), "DISPATCH_NOT_ACCEPTED");
+    assert.equal(rejectedDispatchFailureCode(over), "ATTACHMENT_TOTAL_EXCEEDED:345649213");
   });
 });
