@@ -472,8 +472,8 @@ export function useComposerSend({
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
   // biome-ignore lint/correctness/useExhaustiveDependencies: deps verbatim from App() (OCV5-472); authRef is App useState setter/useRef passed in, stable
-  const uploadMedia = useCallback(async (file: File): Promise<MediaRef> => {
-    const r = await api.uploadFile(authRef.current, file);
+  const uploadMedia = useCallback(async (file: File, onProgress?: (sent: number, total: number) => void): Promise<MediaRef> => {
+    const r = await api.uploadFile(authRef.current, file, { onProgress });
     const mime = r.mimeType || file.type || "";
     const kind: MediaRef["kind"] = mime.startsWith("image/")
       ? "image"

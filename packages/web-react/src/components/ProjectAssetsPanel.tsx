@@ -141,9 +141,13 @@ export function ProjectAssetsPanel(props: {
 
 /** 上传态文案：多文件时带「第 N/M 个」进度，单文件只说「正在上传…」（PA-03）。 */
 export function uploadingLabel(progress: UploadProgress | null): string {
-  if (!progress || progress.total <= 1) return "正在上传…";
+  const pct =
+    progress?.totalBytes && progress.totalBytes > 0 && typeof progress.sentBytes === "number"
+      ? ` ${Math.min(100, Math.round((progress.sentBytes / progress.totalBytes) * 100))}%`
+      : "";
+  if (!progress || progress.total <= 1) return pct ? `正在上传…${pct}` : "正在上传…";
   const current = Math.min(progress.done + 1, progress.total);
-  return `正在上传 ${current}/${progress.total} 个文件…`;
+  return `正在上传 ${current}/${progress.total} 个文件…${pct}`;
 }
 
 function UploadDropzone({

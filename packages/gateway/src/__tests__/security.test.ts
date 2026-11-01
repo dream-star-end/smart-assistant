@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   FILE_ALLOWED_DIRS,
   FILE_BLOCKED_PATTERNS,
+  MAX_UPLOAD_FILE,
   MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL,
   isFileAllowed,
@@ -393,6 +394,11 @@ describe('T03: Upload size limits', () => {
   })
   it('single limit is less than total limit', () => {
     assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_TOTAL)
+  })
+  it('HTTP body stays 100MiB and the assembled file cap is 1GiB', () => {
+    assert.equal(MAX_UPLOAD_FILE, 1024 * 1024 * 1024)
+    assert.ok(MAX_UPLOAD_SINGLE < MAX_UPLOAD_FILE)
+    assert.ok(MAX_UPLOAD_FILE <= MAX_UPLOAD_TOTAL)
   })
 })
 

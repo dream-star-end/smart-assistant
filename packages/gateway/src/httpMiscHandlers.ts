@@ -24,8 +24,9 @@ import {
 import { readFile } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, join, resolve } from 'node:path'
-import { shouldServeInline } from '@openclaude/protocol'
+import { shouldServeInline, uploadQuotaExceeded, uploadQuotaMessage } from '@openclaude/protocol'
 import { resolveOpenedPath } from './openedPath.js'
+import { localSessionDir, remoteReservationRemainder, remoteSessionDir, sumUploadReservationBytes } from './uploadChunkStore.js'
 import { paths, readConfig, searchSessions, writeConfig } from '@openclaude/storage'
 import {
   ADVISOR_CONSULT_PARENT_REASON,
@@ -409,11 +410,56 @@ export async function handleMediaGet(
     //   - 命中前查 isFileBlocked(防 `.env` 等 deny-list)
     //   - active content 强制 attachment + filename
     //   - Content-Length 取 buffer.length(node-agent 已校 MaxFileSize)
-    if (mediaLocation.reason === 'remote-host' && this.deps.commercial?.pullRemoteHostMedia) {
+    if (mediaLocation.reason === 'remote-host' && (this.deps.commercial?.openRemoteHostMedia || this.deps.commercial?.pullRemoteHostMedia)) {
       const remoteCandidates = [
         `${mediaLocation.uploads}/${filename}`,
         `${mediaLocation.generated}/${filename}`,
       ]
+      const openRemote = this.deps.commercial?.openRemoteHostMedia
+      if (openRemote) {
+        for (const remotePath of remoteCandidates) {
+          try {
+            const outcome = await openRemote({
+              hostUuid: mediaLocation.hostUuid,
+              remotePath,
+              dest: res,
+              onReady: (info) => {
+                if (isFileBlocked(remotePath)) {
+                  this.log.warn('media: remote hit blocked by sensitive deny-list', { remotePath })
+                  res.writeHead(403)
+                  res.end('access denied')
+                  return false
+                }
+                const remoteContentType = mimeFor(remotePath)
+                const remoteHeaders: Record<string, string | number> = {
+                  'Content-Type': remoteContentType,
+                  'Content-Length': info.size,
+                  'Cache-Control': 'private, max-age=3600',
+                }
+                remoteHeaders['Content-Disposition'] =
+                  `${shouldServeInline(remoteContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(remotePath) || 'file')}"`
+                res.writeHead(200, remoteHeaders)
+                return true
+              },
+            })
+            if (outcome === 'missing') continue
+            return
+          } catch (err) {
+            this.log.error(
+              'media: remote-host pull failed',
+              { hostUuid: mediaLocation.hostUuid, remotePath, ...mediaLocation.logCtx },
+              err as Error,
+            )
+            if (!res.headersSent) this.sendError(res, 502, 'remote storage pull failed')
+            return
+          }
+        }
+        if (!res.headersSent) {
+          res.writeHead(404)
+          res.end('not found')
+        }
+        return
+      }
       let buf: Buffer | null = null
       let hitPath: string | null = null
       for (const remotePath of remoteCandidates) {
@@ -548,6 +594,7 @@ export async function handleMediaGet(
 
 /**
  * POST /api/uploads — streaming single-file upload (Plan B 2026-05-09).
+ * One HTTP body stays at 100MiB. A file up to 1GiB uses /api/uploads/init chunked upload.
  *
  * Body is the raw file bytes. Required headers:
  *   - Content-Type: claimed file MIME type (metadata only; all formats accepted)
@@ -564,6 +611,189 @@ export async function handleMediaGet(
  * on success atomically renames to `<digest>.<ext>`. If a file with the
  * same digest already exists, dedups (tmp removed, existing path returned).
  */
+export function publishOpenedUpload(opts: {
+  tmpFd: number
+  tmpPath: string
+  finalPath: string
+  isPerUser: boolean
+  userId: string
+  res: ServerResponse
+  log: HttpMiscHandlersHost['log']
+  sendError: HttpMiscHandlersHost['sendError']
+}): boolean {
+  const { tmpFd, tmpPath, finalPath, isPerUser, userId, res, log, sendError } = opts
+    // 5a. fd-based mode/owner prep — TOCTOU-safe.
+    //
+    //   • fchmod 0o644 unconditionally: tmp was opened 0o600; published
+    //     files need world-read (served via /api/media stream, but also
+    //     read by per-user docker container's agent uid). Behavior delta
+    //     vs old path-based code: personal mode previously inherited
+    //     createWriteStream default 0o666 - umask (~0o644 with default
+    //     umask 0o022); now explicit. Same end-state in 99% of cases.
+    //   • fchown to agent uid (1000:1000) only for per-user docker volumes.
+    //     Personal mode: same uid as master, chown would be no-op + risk
+    //     EPERM on non-root local dev → skip.
+    //
+    // Routed through `_uploadFsOps.*` for failure-injection in unit tests
+    // (see `__setUploadFsOpsForTests`). Failure here only affects our
+    // private tmp fd (still pre-link, single dirent), so cleanup unlinks
+    // the tmp and the finally closes the fd; no concurrent publisher's
+    // file can be touched.
+    try {
+      _uploadFsOps.fchmodSync(tmpFd, 0o644)
+      if (isPerUser) {
+        _uploadFsOps.fchownSync(tmpFd, 1000, 1000)
+      }
+    } catch (err) {
+      log.error(
+        'handleUpload: pre-publish fchmod/fchown failed',
+        {
+          tmpPath,
+          isPerUser,
+          userId,
+        },
+        err,
+      )
+      try {
+        unlinkSync(tmpPath)
+      } catch {}
+      sendError(res, 500, 'storage prep failed')
+      return false
+    }
+
+    // 5b. Atomic publish via no-overwrite hardlink. linkSync is atomic +
+    // fail-closed on EEXIST (race-free dedup signal). We verify post-link
+    // that finalPath actually points to OUR tmp inode (not an attacker-
+    // planted collision via parent-symlink swap on finalPath's side).
+    let eexistDedup = false
+    try {
+      _uploadFsOps.linkSync(tmpPath, finalPath)
+    } catch (err) {
+      const code = (err as { code?: string })?.code
+      if (code !== 'EEXIST') {
+        log.error('handleUpload: link failed', undefined, err)
+        try {
+          unlinkSync(tmpPath)
+        } catch {}
+        sendError(res, 500, 'storage write failed')
+        return false
+      }
+      // dedup hit: 既有 finalPath 是先前同 digest 上传 publish 出来的,owner 已
+      // 是 agent uid(per-user 模式)或 master uid(personal 模式)。语义正确。
+      eexistDedup = true
+    }
+
+    // 5c. Post-link verify: parent-symlink defense on finalPath's side,
+    // applied to BOTH the just-linked and EEXIST-dedup cases.
+    //
+    //   (i)   openSync(finalPath, O_RDONLY|O_NOFOLLOW) — last-component
+    //         symlink defense (matches openFileHardened).
+    //   (ii)  realpathSync(/proc/self/fd/<finalFd>) === finalPath — parent-
+    //         symlink race defense (parent swapped between our linkSync
+    //         and the open here, or between a prior publish and now).
+    //   (iii) fstat(tmpFd).dev/ino === fstat(finalFd).dev/ino — additional
+    //         proof for **new** publishes that the link landed on OUR
+    //         bytes. Skipped for dedup — by definition dedup means the
+    //         inode at finalPath is from a prior request, not our tmpFd.
+    //
+    // Why dedup also needs (i)+(ii) (Codex 2026-05-16 review fix): without
+    // them an attacker could parent-swap finalPath's dir to a controlled
+    // location with a pre-placed `<digest>.<ext>` → our linkSync sees
+    // EEXIST → we return 200 without ever validating the inode lives under
+    // the legitimate upload root. Read-path openFileHardened would later
+    // 404 the bogus URL, but we'd have lied to the client about success.
+    //
+    // Cleanup of finalPath on verify failure:
+    //   • new-link path: we just created this inode at finalPath → safe to
+    //     best-effort unlinkSync (residual race documented).
+    //   • dedup path: we don't own the inode (could be prior legitimate
+    //     publish OR attacker plant in attacker-controlled location). Do
+    //     NOT unlink — leave the artifact alone, fail closed.
+    let finalFd: number | null = null
+    try {
+      try {
+        finalFd = openSync(finalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+      } catch (err) {
+        log.error('handleUpload: post-link open failed', { finalPath, eexistDedup }, err)
+        if (!eexistDedup) {
+          try {
+            unlinkSync(finalPath)
+          } catch {}
+        }
+        try {
+          unlinkSync(tmpPath)
+        } catch {}
+        sendError(res, 500, 'storage publish verify failed')
+        return false
+      }
+      let finalReal: string
+      try {
+        finalReal = resolveOpenedPath(finalFd, finalPath)
+      } catch (err) {
+        log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
+        if (!eexistDedup) {
+          try {
+            unlinkSync(finalPath)
+          } catch {}
+        }
+        try {
+          unlinkSync(tmpPath)
+        } catch {}
+        sendError(res, 500, 'storage publish verify failed')
+        return false
+      }
+      if (finalReal !== finalPath) {
+        log.error('handleUpload: post-link parent swap detected', {
+          finalPath,
+          finalReal,
+          eexistDedup,
+        })
+        if (!eexistDedup) {
+          try {
+            unlinkSync(finalPath)
+          } catch {}
+        }
+        try {
+          unlinkSync(tmpPath)
+        } catch {}
+        sendError(res, 500, 'storage publish diverged')
+        return false
+      }
+      if (!eexistDedup) {
+        const tmpStat = fstatSync(tmpFd)
+        const finalStat = fstatSync(finalFd)
+        if (tmpStat.dev !== finalStat.dev || tmpStat.ino !== finalStat.ino) {
+          log.error('handleUpload: post-link inode mismatch', {
+            finalPath,
+            tmpDev: tmpStat.dev,
+            tmpIno: tmpStat.ino,
+            finalDev: finalStat.dev,
+            finalIno: finalStat.ino,
+          })
+          try {
+            unlinkSync(finalPath)
+          } catch {}
+          try {
+            unlinkSync(tmpPath)
+          } catch {}
+          sendError(res, 500, 'storage publish diverged')
+          return false
+        }
+      }
+    } finally {
+      if (finalFd !== null) {
+        try {
+          closeSync(finalFd)
+        } catch {}
+      }
+    }
+
+  try {
+    unlinkSync(tmpPath)
+  } catch {}
+  return true
+}
+
 export async function handleUpload(
   this: HttpMiscHandlersHost,
   req: IncomingMessage,
@@ -696,6 +926,47 @@ export async function handleUpload(
     this.sendError(res, 500, 'storage unavailable')
     req.destroy()
     return
+  }
+
+  const quotaSessionDir = remoteUpload
+    ? remoteSessionDir(paths.uploadsDir)
+    : localSessionDir(baseReal)
+  let quotaUsed = 0
+  if (remoteUpload) {
+    const sumRemote = this.deps.commercial?.sumRemoteUploadUsage
+    if (!sumRemote) {
+      this.sendError(res, 503, '暂时无法确认上传空间，请稍后重试')
+      req.destroy()
+      return
+    }
+    try {
+      const usage = await sumRemote({
+        hostUuid: remoteUpload.hostUuid,
+        remoteDir: remoteUpload.remoteUploadsDir,
+      })
+      quotaUsed = usage.usedBytes + remoteReservationRemainder(quotaSessionDir, {
+        hostUuid: remoteUpload.hostUuid,
+        remoteUploadsDir: remoteUpload.remoteUploadsDir,
+      })
+    } catch (err) {
+      this.log.warn('handleUpload: remote quota unavailable', { userId }, err)
+      this.sendError(res, 503, '暂时无法确认上传空间，请稍后重试')
+      req.destroy()
+      return
+    }
+  } else {
+    quotaUsed = sumUploadReservationBytes(baseReal, quotaSessionDir)
+  }
+  if (declared !== undefined) {
+    const declaredBytes = Number(declared)
+    if (uploadQuotaExceeded(quotaUsed, declaredBytes)) {
+      this.sendJson(res, 413, {
+        error: uploadQuotaMessage(quotaUsed, declaredBytes),
+        code: 'upload_quota_exceeded',
+      })
+      req.destroy()
+      return
+    }
   }
 
   // ── 4. Open .tmp fd-first + streaming write + sha256 ──
@@ -855,6 +1126,24 @@ export async function handleUpload(
         finish(false)
         return
       }
+      if (declared === undefined && uploadQuotaExceeded(quotaUsed, received)) {
+        exceededLimit = true
+        if (!res.headersSent) {
+          this.sendJson(res, 413, {
+            error: uploadQuotaMessage(quotaUsed, received),
+            code: 'upload_quota_exceeded',
+          })
+        }
+        try {
+          req.unpipe(ws)
+        } catch {}
+        cleanupTmp(new Error('upload exceeded quota'))
+        try {
+          req.destroy()
+        } catch {}
+        finish(false)
+        return
+      }
       hash.update(chunk)
     })
 
@@ -898,31 +1187,24 @@ export async function handleUpload(
     // remote node-agent's PUT is tmp+fsync+rename, so re-pushing the same
     // digest is safe and the bandwidth cost is bounded by MAX_UPLOAD_SINGLE.
     if (remoteUpload) {
-      let content: Buffer
-      try {
-        content = await readFile(tmpPath)
-      } catch (err) {
-        this.log.error(
-          'handleUpload: read local tmp for remote push failed',
-          {
-            tmpPath,
-            userId,
-          },
-          err,
-        )
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        this.sendError(res, 500, 'storage read failed')
-        return
-      }
       const remotePath = `${remoteUpload.remoteUploadsDir}/${finalName}`
+      const fromPath = this.deps.commercial?.pushRemoteHostUploadFromPath
       try {
-        await this.deps.commercial!.pushRemoteHostUpload!({
-          hostUuid: remoteUpload.hostUuid,
-          remotePath,
-          content,
-        })
+        if (fromPath) {
+          await fromPath({
+            hostUuid: remoteUpload.hostUuid,
+            remotePath,
+            localPath: tmpPath,
+            length: received,
+          })
+        } else {
+          const content = await readFile(tmpPath)
+          await this.deps.commercial!.pushRemoteHostUpload!({
+            hostUuid: remoteUpload.hostUuid,
+            remotePath,
+            content,
+          })
+        }
       } catch (err) {
         this.log.error(
           'handleUpload: push to remote host failed',
@@ -953,171 +1235,17 @@ export async function handleUpload(
       return
     }
 
-    // 5a. fd-based mode/owner prep — TOCTOU-safe.
-    //
-    //   • fchmod 0o644 unconditionally: tmp was opened 0o600; published
-    //     files need world-read (served via /api/media stream, but also
-    //     read by per-user docker container's agent uid). Behavior delta
-    //     vs old path-based code: personal mode previously inherited
-    //     createWriteStream default 0o666 - umask (~0o644 with default
-    //     umask 0o022); now explicit. Same end-state in 99% of cases.
-    //   • fchown to agent uid (1000:1000) only for per-user docker volumes.
-    //     Personal mode: same uid as master, chown would be no-op + risk
-    //     EPERM on non-root local dev → skip.
-    //
-    // Routed through `_uploadFsOps.*` for failure-injection in unit tests
-    // (see `__setUploadFsOpsForTests`). Failure here only affects our
-    // private tmp fd (still pre-link, single dirent), so cleanup unlinks
-    // the tmp and the finally closes the fd; no concurrent publisher's
-    // file can be touched.
-    try {
-      _uploadFsOps.fchmodSync(tmpFd, 0o644)
-      if (isPerUser) {
-        _uploadFsOps.fchownSync(tmpFd, 1000, 1000)
-      }
-    } catch (err) {
-      this.log.error(
-        'handleUpload: pre-publish fchmod/fchown failed',
-        {
-          tmpPath,
-          isPerUser,
-          userId,
-        },
-        err,
-      )
-      try {
-        unlinkSync(tmpPath)
-      } catch {}
-      this.sendError(res, 500, 'storage prep failed')
-      return
-    }
-
-    // 5b. Atomic publish via no-overwrite hardlink. linkSync is atomic +
-    // fail-closed on EEXIST (race-free dedup signal). We verify post-link
-    // that finalPath actually points to OUR tmp inode (not an attacker-
-    // planted collision via parent-symlink swap on finalPath's side).
-    let eexistDedup = false
-    try {
-      _uploadFsOps.linkSync(tmpPath, finalPath)
-    } catch (err) {
-      const code = (err as { code?: string })?.code
-      if (code !== 'EEXIST') {
-        this.log.error('handleUpload: link failed', undefined, err)
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        this.sendError(res, 500, 'storage write failed')
-        return
-      }
-      // dedup hit: 既有 finalPath 是先前同 digest 上传 publish 出来的,owner 已
-      // 是 agent uid(per-user 模式)或 master uid(personal 模式)。语义正确。
-      eexistDedup = true
-    }
-
-    // 5c. Post-link verify: parent-symlink defense on finalPath's side,
-    // applied to BOTH the just-linked and EEXIST-dedup cases.
-    //
-    //   (i)   openSync(finalPath, O_RDONLY|O_NOFOLLOW) — last-component
-    //         symlink defense (matches openFileHardened).
-    //   (ii)  realpathSync(/proc/self/fd/<finalFd>) === finalPath — parent-
-    //         symlink race defense (parent swapped between our linkSync
-    //         and the open here, or between a prior publish and now).
-    //   (iii) fstat(tmpFd).dev/ino === fstat(finalFd).dev/ino — additional
-    //         proof for **new** publishes that the link landed on OUR
-    //         bytes. Skipped for dedup — by definition dedup means the
-    //         inode at finalPath is from a prior request, not our tmpFd.
-    //
-    // Why dedup also needs (i)+(ii) (Codex 2026-05-16 review fix): without
-    // them an attacker could parent-swap finalPath's dir to a controlled
-    // location with a pre-placed `<digest>.<ext>` → our linkSync sees
-    // EEXIST → we return 200 without ever validating the inode lives under
-    // the legitimate upload root. Read-path openFileHardened would later
-    // 404 the bogus URL, but we'd have lied to the client about success.
-    //
-    // Cleanup of finalPath on verify failure:
-    //   • new-link path: we just created this inode at finalPath → safe to
-    //     best-effort unlinkSync (residual race documented).
-    //   • dedup path: we don't own the inode (could be prior legitimate
-    //     publish OR attacker plant in attacker-controlled location). Do
-    //     NOT unlink — leave the artifact alone, fail closed.
-    let finalFd: number | null = null
-    try {
-      try {
-        finalFd = openSync(finalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
-      } catch (err) {
-        this.log.error('handleUpload: post-link open failed', { finalPath, eexistDedup }, err)
-        if (!eexistDedup) {
-          try {
-            unlinkSync(finalPath)
-          } catch {}
-        }
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        this.sendError(res, 500, 'storage publish verify failed')
-        return
-      }
-      let finalReal: string
-      try {
-        finalReal = resolveOpenedPath(finalFd, finalPath)
-      } catch (err) {
-        this.log.error('handleUpload: post-link realpath failed', { finalPath, eexistDedup }, err)
-        if (!eexistDedup) {
-          try {
-            unlinkSync(finalPath)
-          } catch {}
-        }
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        this.sendError(res, 500, 'storage publish verify failed')
-        return
-      }
-      if (finalReal !== finalPath) {
-        this.log.error('handleUpload: post-link parent swap detected', {
-          finalPath,
-          finalReal,
-          eexistDedup,
-        })
-        if (!eexistDedup) {
-          try {
-            unlinkSync(finalPath)
-          } catch {}
-        }
-        try {
-          unlinkSync(tmpPath)
-        } catch {}
-        this.sendError(res, 500, 'storage publish diverged')
-        return
-      }
-      if (!eexistDedup) {
-        const tmpStat = fstatSync(tmpFd)
-        const finalStat = fstatSync(finalFd)
-        if (tmpStat.dev !== finalStat.dev || tmpStat.ino !== finalStat.ino) {
-          this.log.error('handleUpload: post-link inode mismatch', {
-            finalPath,
-            tmpDev: tmpStat.dev,
-            tmpIno: tmpStat.ino,
-            finalDev: finalStat.dev,
-            finalIno: finalStat.ino,
-          })
-          try {
-            unlinkSync(finalPath)
-          } catch {}
-          try {
-            unlinkSync(tmpPath)
-          } catch {}
-          this.sendError(res, 500, 'storage publish diverged')
-          return
-        }
-      }
-    } finally {
-      if (finalFd !== null) {
-        try {
-          closeSync(finalFd)
-        } catch {}
-      }
-    }
+    const published = publishOpenedUpload({
+      tmpFd,
+      tmpPath,
+      finalPath,
+      isPerUser,
+      userId,
+      res,
+      log: this.log,
+      sendError: (response, code, message) => this.sendError(response, code, message),
+    })
+    if (!published) return
 
     // Drop tmp dirent. The inode is kept alive by finalPath's hardlink (new
     // publish) or by the prior publisher's dirent (dedup). Our tmpFd stays

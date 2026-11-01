@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_UPLOAD_TOTAL_BYTES, attachmentTotalLimitMessage } from "@openclaude/protocol/browser";
+import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES, attachmentTotalLimitMessage, uploadFailureCanContinue, uploadFileLimitMessage } from "@openclaude/protocol/browser";
 import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
@@ -69,6 +69,8 @@ type Attach = {
   previewUrl?: string;
   /** 原始 File 对象：上传失败后仍持有，供「重试」原地重传（不必删 chip 重选文件）。 */
   file?: File;
+  /** 分片上传已发送字节，用于进度。 */
+  sentBytes?: number;
 };
 
 // 附件件数上限:与后端 gateway 帧准入共用 protocol 单一权威常量,消除历史上前端 8 / 后端 5
@@ -215,7 +217,7 @@ export function Composer({
   banner?: ReactNode;
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件入口禁用）。 */
-  onUpload?: (file: File) => Promise<MediaRef>;
+  onUpload?: (file: File, onProgress?: (sent: number, total: number) => void) => Promise<MediaRef>;
   /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
   getVoiceToken?: () => string | null;
   /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
@@ -470,6 +472,12 @@ export function Composer({
 
   const uploading = attachments.some((a) => a.status === "uploading");
   const attachFailed = attachments.some((a) => a.status === "error");
+  const failedAttaches = attachments.filter((a) => a.status === "error");
+  const hardFailed = failedAttaches.filter((a) => !uploadFailureCanContinue(a.error));
+  const attachFailTitle =
+    failedAttaches.length > 0 && hardFailed.length === failedAttaches.length
+      ? hardFailed[0]?.error || "有附件上传失败，请移除后再发送"
+      : "有附件上传失败，请重试或移除后再发送";
   const doneMedia = attachments
     .filter((a) => a.status === "done" && a.media)
     .map((a) => a.media as MediaRef);
@@ -569,7 +577,9 @@ export function Composer({
         prev.map((a) => (a.id === id ? { ...a, status: "uploading", error: undefined } : a)),
       );
       try {
-        const media = await onUpload(file);
+        const media = await onUpload(file, (sent, total) => {
+          apply((prev) => prev.map((a) => (a.id === id ? { ...a, sentBytes: sent, size: total || a.size } : a)));
+        });
         apply((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
       } catch (e) {
         apply((prev) =>
@@ -589,19 +599,27 @@ export function Composer({
       toast("未获取到所选文件,请重试", "info");
       return;
     }
-    const pickedBytes = picked.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
+    const oversized = picked.filter((file) => file.size > MAX_UPLOAD_FILE_BYTES);
+    const accepted = picked.filter((file) => !(file.size > MAX_UPLOAD_FILE_BYTES));
+    if (oversized.length > 0) {
+      const message = uploadFileLimitMessage(oversized[0].size);
+      setTotalLimitNotice(message);
+      toast(message, "info");
+    }
+    if (accepted.length === 0) return;
+    const pickedBytes = accepted.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
     if (attachBytesRef.current + pickedBytes > MAX_UPLOAD_TOTAL_BYTES) {
       const message = attachmentTotalLimitMessage(attachBytesRef.current + pickedBytes);
       setTotalLimitNotice(message);
       toast(message, "info");
       return;
     }
-    setTotalLimitNotice(null);
+    if (oversized.length === 0) setTotalLimitNotice(null);
     // 上限守卫前置:超出配额的文件**不上传**(此前 chip 有守卫但 onUpload 无条件执行 →
     // 超限文件白白上传后结果被丢弃),且截断有明确提示而非静默。
     const room = Math.max(0, MAX_ATTACH - attachCountRef.current);
-    const arr = picked.slice(0, room);
-    const dropped = picked.length - arr.length;
+    const arr = accepted.slice(0, room);
+    const dropped = accepted.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     attachCountRef.current += arr.length;
     attachBytesRef.current += arr.reduce((sum, file) => sum + finiteAttachmentBytes(file.size), 0);
@@ -1072,7 +1090,7 @@ export function Composer({
                   totalLimitMessage
                     ? totalLimitMessage
                     : attachFailed
-                      ? "有附件上传失败，请重试或移除后再发送"
+                      ? attachFailTitle
                       : uploading
                         ? "附件上传中"
                         : busy && !stopping
@@ -1238,13 +1256,26 @@ export function AttachChip({
         <span className={cn("max-w-[160px] whitespace-nowrap", a.status === "error" ? "text-danger" : "text-fg")}>
           {middleTruncate(a.name, 24)}
         </span>
+        {a.status === "uploading" && typeof a.sentBytes === "number" && a.size > 0 && (
+          <span className="text-caption text-faint tabular-nums">
+            {Math.min(100, Math.round((a.sentBytes / a.size) * 100))}%
+          </span>
+        )}
         {a.status === "error" && (
           <output className="text-caption text-danger">{a.error || "上传失败"}</output>
+        )}
+        {a.status === "uploading" && typeof a.sentBytes === "number" && a.size > 0 && (
+          <span className="relative mt-0.5 h-1 w-full overflow-hidden rounded bg-hover">
+            <span
+              className="absolute inset-y-0 left-0 bg-accent"
+              style={{ width: `${Math.min(100, Math.round((a.sentBytes / a.size) * 100))}%` }}
+            />
+          </span>
         )}
       </span>
       {/* 上传失败:就地「重试」按钮(复用原 File),触屏下加高到 44px(C-04)。
           替代原来「必须删除 chip 重新选文件」的痛点。 */}
-      {a.status === "error" && onRetry && (
+      {a.status === "error" && onRetry && uploadFailureCanContinue(a.error) && (
         <button
           type="button"
           onClick={onRetry}

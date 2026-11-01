@@ -1,6 +1,7 @@
 // OpenClaude — Attachments
 // Plan B (2026-05-09): 附件不再 base64 进 messages JSON。所有 image/audio/video/file
 // 走 POST /api/uploads → 服务端 sha256-named 落盘 → 拿到 url。message 里只存 url 引用。
+// 超过 100MB 的单个文件走 React 分片客户端。这里仍是单次 POST，正文不超过 100MB。
 // Text 仍按阈值二分:≤64KB 内联为 kind:'text'(走 buildMessageText),>64KB 重分类为
 // 'file' 同样上传。任何 _media[i].base64 字段都不应再产生。
 import { notifyAuthExpired, silentRefresh } from './api.js?v=501cba4f'

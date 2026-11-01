@@ -810,8 +810,13 @@ import {
   startSshControlMaster,
   stopSshControlMaster,
   putFile as nodeAgentPutFile,
+  putFileFromPath as nodeAgentPutFileFromPath,
   deleteFile as nodeAgentDeleteFile,
   getFile as nodeAgentGetFile,
+  statFile as nodeAgentStatFile,
+  assembleFiles as nodeAgentAssembleFiles,
+  usageForDir as nodeAgentUsageForDir,
+  streamFileTo as nodeAgentStreamFileTo,
 } from "./compute-pool/nodeAgentClient.js";
 import { createContainerService } from "./compute-pool/containerService.js";
 import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
@@ -1041,6 +1046,31 @@ export interface RegisterCommercialResult {
     hostUuid: string;
     remotePath: string;
   }) => Promise<Buffer | null>;
+  pushRemoteHostUploadFromPath?: (args: {
+    hostUuid: string;
+    remotePath: string;
+    localPath: string;
+    length: number;
+  }) => Promise<void>;
+  sumRemoteUploadUsage?: (args: {
+    hostUuid: string;
+    remoteDir: string;
+  }) => Promise<{ usedBytes: number; truncated: boolean; files: { name: string; size: number; mtimeMs: number }[] }>;
+  assembleRemoteHostUpload?: (args: {
+    hostUuid: string;
+    remoteDir: string;
+    uploadId: string;
+    count: number;
+    ext: string;
+    expectedSize: number;
+  }) => Promise<{ sha256: string; size: number }>;
+  deleteRemoteHostUpload?: (args: { hostUuid: string; remotePath: string }) => Promise<void>;
+  openRemoteHostMedia?: (args: {
+    hostUuid: string;
+    remotePath: string;
+    dest: NodeJS.WritableStream;
+    onReady: (info: { size: number }) => boolean;
+  }) => Promise<"ok" | "missing" | "rejected">;
   /**
    * P1.7 slice 7c — WeChat broker 入站入口。
    *
@@ -4299,6 +4329,81 @@ export async function registerCommercial(
     }
   };
 
+
+  const pushRemoteHostUploadFromPath = async (args: {
+    hostUuid: string;
+    remotePath: string;
+    localPath: string;
+    length: number;
+  }) => {
+    const target = await resolveServiceableHostTarget(args.hostUuid);
+    try {
+      await nodeAgentPutFileFromPath(
+        target,
+        args.remotePath,
+        args.localPath,
+        args.length,
+        0o644,
+        1000,
+        1000,
+      );
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+  const sumRemoteUploadUsage = async (args: { hostUuid: string; remoteDir: string }) => {
+    const target = await resolveServiceableHostTarget(args.hostUuid);
+    try {
+      return await nodeAgentUsageForDir(target, args.remoteDir);
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+  const assembleRemoteHostUpload = async (args: {
+    hostUuid: string;
+    remoteDir: string;
+    uploadId: string;
+    count: number;
+    ext: string;
+    expectedSize: number;
+  }) => {
+    const target = await resolveServiceableHostTarget(args.hostUuid);
+    try {
+      return await nodeAgentAssembleFiles(target, {
+        remoteDir: args.remoteDir,
+        uploadId: args.uploadId,
+        count: args.count,
+        ext: args.ext,
+        expectedSize: args.expectedSize,
+      });
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+  const deleteRemoteHostUpload = async (args: { hostUuid: string; remotePath: string }) => {
+    const target = await resolveServiceableHostTarget(args.hostUuid);
+    try {
+      await nodeAgentDeleteFile(target, args.remotePath);
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+  const openRemoteHostMedia = async (args: {
+    hostUuid: string;
+    remotePath: string;
+    dest: NodeJS.WritableStream;
+    onReady: (info: { size: number }) => boolean;
+  }) => {
+    const target = await resolveServiceableHostTarget(args.hostUuid);
+    try {
+      const st = await nodeAgentStatFile(target, args.remotePath, { hash: false });
+      if (!st.exists) return "missing" as const;
+      return await nodeAgentStreamFileTo(target, args.remotePath, args.dest, () => args.onReady({ size: st.size ?? 0 }));
+    } finally {
+      target.psk?.fill(0);
+    }
+  };
+
   // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //
   //   dockerEnsureRunning — WeChat / QQ inbound, container-local preview
@@ -7364,6 +7469,11 @@ export async function registerCommercial(
         target.psk?.fill(0);
       }
     },
+    pushRemoteHostUploadFromPath,
+    sumRemoteUploadUsage,
+    assembleRemoteHostUpload,
+    deleteRemoteHostUpload,
+    openRemoteHostMedia,
     // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
     // 任一失败 → healthz body.ok=false(HTTP 仍 200,monitor 消费 ok 字段自动告警),补上
     // "PG/Redis 宕机但 healthz 仍绿零告警"的盲区(2026-07-06 sessions.db 事故的同构面)。

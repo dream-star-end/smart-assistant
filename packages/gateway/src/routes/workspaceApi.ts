@@ -42,6 +42,7 @@ export interface WorkspaceApiRoutesIo {
   handleOAuthStart(req: IncomingMessage, res: ServerResponse): Promise<void>
   handleSearch(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void>
   handleUpload(req: IncomingMessage, res: ServerResponse): Promise<void>
+  handleChunkedUpload(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void>
   readBody: Gateway['readBody']
   sendInternalError(res: ServerResponse, err: unknown): void
   sendJson(res: ServerResponse, code: number, body: unknown): void
@@ -336,6 +337,38 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
   // path bloated `client_sessions.messages` JSON and triggered the 2026-05-08
   // event-loop stall incident. See feedback memo
   // v3_attachments_independent_channel.md.
+  predicateRoute(
+    'POST /api/uploads/init',
+    (req, url) => url.pathname === '/api/uploads/init' && req.method === 'POST',
+    (io, req, res, url) => {
+      io.handleChunkedUpload(req, res, url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  predicateRoute(
+    'PUT /api/uploads/:id/chunks/:index',
+    (req, url) => req.method === 'PUT' && /^\/api\/uploads\/[a-f0-9]{32}\/chunks\/\d+$/.test(url.pathname),
+    (io, req, res, url) => {
+      io.handleChunkedUpload(req, res, url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  predicateRoute(
+    'GET /api/uploads/:id',
+    (req, url) => req.method === 'GET' && /^\/api\/uploads\/[a-f0-9]{32}$/.test(url.pathname),
+    (io, req, res, url) => {
+      io.handleChunkedUpload(req, res, url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
+  predicateRoute(
+    'POST /api/uploads/:id/complete',
+    (req, url) => req.method === 'POST' && /^\/api\/uploads\/[a-f0-9]{32}\/complete$/.test(url.pathname),
+    (io, req, res, url) => {
+      io.handleChunkedUpload(req, res, url).catch((err) => io.sendInternalError(res, err))
+      return true
+    },
+  ),
   predicateRoute(
     'POST /api/uploads',
     (req, url) => url.pathname === '/api/uploads' && req.method === 'POST',
