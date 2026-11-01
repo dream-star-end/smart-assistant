@@ -244,6 +244,7 @@ function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   readOnly?: boolean
   systemHelpContextFile?: string
   promptPolicy?: PromptPrivacyPolicy
@@ -379,6 +380,7 @@ export async function buildCodexLaunchOverrides(
     ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => (projectSearchOn || name !== 'project_search') && (!ctx.readOnly || isAdvisorReadOnlyMcpTool(name)))
     : []
   const platformResult = await buildPromptContext({
+    catalog: ctx.catalog,
     promptPolicy: ctx.promptPolicy,
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),

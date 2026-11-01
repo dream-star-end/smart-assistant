@@ -608,6 +608,7 @@ export async function resolveTurnRuntime(
   model: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
   expectedEngine: 'ccb' | 'cursor' = 'ccb',
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort,
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
     const headers: TurnUpstreamHeaders = boxNativeDualHeaderTurn(authority, model, expectedEngine)
@@ -616,7 +617,7 @@ export async function resolveTurnRuntime(
     return { headers, descriptor: authority.executionDescriptor }
   }
   if (env[REQUIRE_AUTHORITY_ENV] !== '1') return {}
-  const client = getModelCatalogClient()
+  const client = catalog ?? getModelCatalogClient()
   // flag 已开却没装配 catalog = 半开拓扑。此时写空串会让本地 turn 不带任何票据
   // 进入 egress；宁可本地拒绝，也不能把“非托管”当成授权旁路。
   if (!client.configured) {
@@ -655,6 +656,7 @@ export class AdvisorExecutionLockError extends Error {
 
 export async function assertCcbAdvisorCatalogLock(input: {
   lock: AdvisorConsultExecution | undefined
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   model: string | undefined
   env?: NodeJS.ProcessEnv
 }): Promise<{ modelId: string; providerId: string; engine: 'ccb' }> {
@@ -662,7 +664,7 @@ export async function assertCcbAdvisorCatalogLock(input: {
   if (!lock || lock.engine !== 'ccb' || lock.profileVersion !== CCB_ADVISOR_PROFILE_VERSION) {
     throw new AdvisorExecutionLockError('ccb advisor requires a frozen model/provider/profile lock')
   }
-  const client = getModelCatalogClient()
+  const client = input.catalog ?? getModelCatalogClient()
   if (!client.configured) {
     throw new AdvisorExecutionLockError('ccb advisor catalog ticket unavailable')
   }
@@ -797,6 +799,7 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  runtime?: import('./gatewayRuntimeServices.js').GatewayRuntimeServices
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
   peerId?: string
   /** Stable, attempt-refreshed opaque help context. Never contains the master signing key. */

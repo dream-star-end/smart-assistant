@@ -252,6 +252,7 @@ export async function _triggerTask(this: CronTaskWebhookHost, taskId: string): P
   // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影。
   // 投影不可用 → 抛 → 由 _triggerTask 的调用方 .catch 记录(任务本次不执行,不回落 baked)。
   const _taskExec = await resolveLocalExecutionIfEnforced({
+    catalog: this.sessions.runtime?.catalog,
     agent,
     kind: 'synthetic',
     model: _taskRoute?.model,

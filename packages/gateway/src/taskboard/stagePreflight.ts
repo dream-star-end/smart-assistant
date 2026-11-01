@@ -47,6 +47,7 @@ const missingAgent = (id?: string | null): TaskboardStageIssue => ({
 
 /** Read-only: one authenticated identity/config read per batch, no admission or runner. */
 export function createTaskboardPreflight(deps: {
+  catalog?: import('../gatewayRuntimeServices.js').CatalogRuntimePort
   getAgentsConfig: () => Promise<AgentsConfig>
   defaultModel?: string | null
   getIdentityProjection?: typeof fetchIdentityCompatProjection
@@ -106,6 +107,7 @@ export function createTaskboardPreflight(deps: {
       const requestedModel = stage.model || agentDefault
       try {
         await (deps.resolveExecution ?? resolveLocalExecutionIfEnforced)({
+          ...(deps.catalog ? { catalog: deps.catalog } : {}),
           agent: requestedModel ? { ...agent, model: requestedModel } : agent,
           kind: 'turn',
           model: requestedModel,

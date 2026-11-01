@@ -172,6 +172,7 @@ export interface SessionSubmitHost {
   awaitResumeMapFlush: SessionManager['awaitResumeMapFlush']
   beginClientTurn: SessionManager['beginClientTurn']
   config: SessionManager['config']
+  runtime: SessionManager['runtime']
   endClientTurn: SessionManager['endClientTurn']
   finishIdleUnderLock: SessionManager['finishIdleUnderLock']
   getOrCreate: SessionManager['getOrCreate']
@@ -1795,6 +1796,7 @@ export async function _getOrCreateExclusive(
         )
     if (!isEngineEnabled(engineId)) throw new EngineNotEnabledError(engineId)
     const runner = createEngine(engineId, {
+      runtime: this.runtime,
       peerId: opts.peerId,
       sessionKey: opts.sessionKey,
       systemHelpContextFile: systemHelpContextFile(this, opts.sessionKey),
