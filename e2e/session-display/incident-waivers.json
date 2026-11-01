@@ -373,6 +373,12 @@
       "reason": "OCV5-652: durable retry for a confirmed terminal delegate's failed no-usage abandon POST. Latent recovery gap, reproduced by unit tests; the OCV5-651 live example completed naturally. No parent-dispatch bypass, waiver-age change, or live-state cleanup. Unproven child death remains protected and tracked; draft pending real Grok OD and steward.",
       "approvedBy": "user t1154u/t1155u, 2026-10-28 START OCV5-652: authorize smallest correct selfhost repair with regression tests and draft PR only; no reproduced live incident; DO NOT MERGE — 待真 Grok OD / 管家",
       "expiresAt": "2026-11-27"
+    },
+    {
+      "commit": "a1aef01c532d921fe83697bff8620d51c3e6d7d5",
+      "reason": "Muse jobs were failed when the VM bridge process restarted on its half-hour schedule. The fix requeues the same job id with a new nonce and still charges only on success. Locked by museBridge unit tests and the bridge stop test. proofPending is already at its ceiling, so this does not open a new incident id.",
+      "approvedBy": "user t1519u, 2026-11-01 grok-muse-bridge: fix jobs that fail across the Muse bridge reconnect; do not touch the VM; commercial release still needs a separate steward confirm",
+      "expiresAt": "2026-12-01"
     }
   ]
 }
