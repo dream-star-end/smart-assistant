@@ -9,7 +9,7 @@ const { build } = createRequire(import.meta.url)("esbuild");
 const { chromium } = createRequire(import.meta.url)("playwright-core");
 const MIB = 1024 * 1024;
 
-test("附件合计超过 300MB 时不上传并提示分条发送", { timeout: 90_000 }, async () => {
+test("附件合计超过 2048MB 时不上传并提示分条发送", { timeout: 90_000 }, async () => {
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL("./upload-total-limit-harness.tsx", import.meta.url))],
     bundle: true,
@@ -61,14 +61,14 @@ test("附件合计超过 300MB 时不上传并提示分条发送", { timeout: 90
       picker.files = transfer.files;
       picker.dispatchEvent(new Event("change", { bubbles: true }));
     }, [
-      { name: "a.rar", size: 160 * MIB },
-      { name: "b.rar", size: 160 * MIB },
+      { name: "a.rar", size: 1100 * MIB },
+      { name: "b.rar", size: 1100 * MIB },
     ]);
     const notice = page.getByTestId("composer-upload-total-limit");
     await notice.waitFor();
     const text = await notice.textContent();
-    assert.match(text ?? "", /320MB/);
-    assert.match(text ?? "", /300MB/);
+    assert.match(text ?? "", /2200MB/);
+    assert.match(text ?? "", /2048MB/);
     assert.match(text ?? "", /两条/);
     assert.equal((text ?? "").includes("请重试"), false);
     assert.equal(await page.getByTestId("uploads").textContent(), "0");
