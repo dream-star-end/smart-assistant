@@ -116,6 +116,9 @@ test('#1260: real StudioApp preserves form drafts while progress remains live', 
         let body
         if (url.pathname === '/api/studio/providers') body = PROVIDERS
         else if (url.pathname === PROJECT_PATH) body = aggregate
+        else if (url.pathname === '/api/public/models') body = {
+          models: [{ id: 'grok-build', display_name: 'grok-build', engine: 'grok', degraded: false }],
+        }
         if (body) return route.fulfill({
           status: 200, contentType: 'application/json', body: JSON.stringify(body),
         })
