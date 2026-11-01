@@ -158,4 +158,20 @@ describe("派发失败状态卡", () => {
     expect(within(card).getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
     expect(visibleText(card)).not.toContain("dispatch_lost");
   });
+
+  test("附件合计超限状态卡说明 330MB 且没有继续按钮", () => {
+    render(
+      <TurnStatusCard
+        msg={{ id: "t2", role: "assistant", text: "", ts: 1, _errorCode: "ATTACHMENT_TOTAL_EXCEEDED:345649213", _clientMessageId: "m2", _turnStatusRecord: true } as ChatMessage}
+        cb={{ onContinueInterrupted: vi.fn(), resolveInterruptedContinuation: () => ({ id: "m2", role: "user", text: "目标", ts: 0 } as ChatMessage) }}
+        currentTurn
+      />,
+    );
+    const card = screen.getByRole("status");
+    expect(card).toHaveTextContent("附件合计 330MB，超过 300MB 上限，请分两条发送");
+    expect(card).not.toHaveTextContent("请重试");
+    expect(within(card).queryByRole("button", { name: "继续" })).toBeNull();
+    expect(within(card).queryByRole("button", { name: "重试" })).toBeNull();
+    expect(within(card).queryByRole("button", { name: "重新尝试" })).toBeNull();
+  });
 });

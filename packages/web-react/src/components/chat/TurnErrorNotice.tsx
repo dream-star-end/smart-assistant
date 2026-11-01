@@ -6,6 +6,7 @@
  * 冻结的旧快照正文)由调用方作为 fixedBody 传入。动作按目录建议,执行入口由调用方给。
  */
 import type { ReactNode } from "react";
+import { parseAttachmentTotalExceeded } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../../lib/chat/model";
 import { errorPresentation } from "../../lib/chat/render";
 import { readUserError, type ErrorNoticeAction, type UserError } from "../../lib/chat/userErrorView";
@@ -66,12 +67,16 @@ export function TurnStatusCard({
   currentTurn: boolean;
 }) {
   const presented = errorPresentation(msg._errorCode, "", msg._errorDetail, true);
-  const retryTarget = msg._clientMessageId
+  const attachmentTotalBlocked = parseAttachmentTotalExceeded(msg._errorCode) !== null
+    || presented.code === "attachment_total_exceeded";
+  const retryTarget = !attachmentTotalBlocked && msg._clientMessageId
     ? cb.resolveRetryTarget?.(msg._clientMessageId)
     : undefined;
   const retry = retryTarget && cb.onRetrySend
     ? { label: "重试", onClick: () => cb.onRetrySend?.(retryTarget) }
-    : cb.onRegenerate ? { label: "重新尝试", onClick: cb.onRegenerate } : undefined;
+    : !attachmentTotalBlocked && cb.onRegenerate
+      ? { label: "重新尝试", onClick: cb.onRegenerate }
+      : undefined;
   const details = {
     code: msg._errorCode,
     requestId: msg.usage?.traceId,

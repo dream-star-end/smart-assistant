@@ -44,6 +44,7 @@ import {
   stripDispatchAuthorityField,
 } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
+import { noteAttachmentTotalRejection } from './uploadTotalRejection.js'
 import { parseCreditBudgetFen } from './creditExhaustion.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
@@ -966,7 +967,7 @@ export async function dispatchInbound(
         }
         totalMediaSize += byteLen
         if (totalMediaSize > MAX_UPLOAD_TOTAL) {
-          rejectFrame(`总附件超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制`, { totalMediaSize })
+          rejectFrame(noteAttachmentTotalRejection(frame, totalMediaSize), { totalMediaSize })
           return
         }
         const mime = m.mimeType || ''
@@ -1055,7 +1056,7 @@ export async function dispatchInbound(
           // /api/media URLs can't bypass the per-frame ceiling.
           totalMediaSize += stat.size
           if (totalMediaSize > MAX_UPLOAD_TOTAL) {
-            rejectFrame(`总附件超过 ${MAX_UPLOAD_TOTAL / 1024 / 1024}MB 限制`, { totalMediaSize })
+            rejectFrame(noteAttachmentTotalRejection(frame, totalMediaSize), { totalMediaSize })
             return
           }
           const mimeType = m.mimeType || mimeFor(realPath) || 'application/octet-stream'
