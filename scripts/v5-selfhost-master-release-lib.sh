@@ -1322,6 +1322,12 @@ build_master_release() {
     die "pinned Box long-task generations gate 失败"
   fi
   master_gate_db_drop
+  mlog "  upload retention HTTP responsiveness proof @ pinned staging"
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-upload-retention-proof.ts ); then
+    cleanup_master_staging
+    die "pinned upload retention HTTP responsiveness proof failed"
+  fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"
   master_gate_ccb_mcp() {
