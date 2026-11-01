@@ -7,7 +7,11 @@ import {
   requireRemote,
   validateRemote,
 } from './agentRemote.js'
-import { NativeDeliveryAckSchema, verifyNativeJson } from './agentRemoteNative.js'
+import {
+  NativeDeliveryAckSchema,
+  snapshotNativeTranscriptJson,
+  verifyNativeJson,
+} from './agentRemoteNative.js'
 const closed = { additionalProperties: false }
 const digest = Type.String({ pattern: '^[a-f0-9]{64}$' })
 const integer = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })
@@ -79,7 +83,7 @@ export const NativeDeliveryPreparationSchema = Type.Object(
     source: NativeDeliverySourceSchema,
     artifactManifestHash: digest,
     artifactCount: integer,
-    messages: Type.Array(NativeMessageProjectionSchema, { minItems: 1, maxItems: 10000 }),
+    messages: Type.Array(NativeMessageProjectionSchema, { maxItems: 10000 }),
   },
   closed,
 )
@@ -102,7 +106,7 @@ export const NativeDeliveryWriterProofSchema = Type.Object(
         },
         closed,
       ),
-      { minItems: 1, maxItems: 10000 },
+      { maxItems: 10000 },
     ),
   },
   closed,
@@ -232,4 +236,41 @@ export function verifyNativeDeliveryCommit(
         'native-delivery-proof-main',
       )
   }
+}
+
+// Only Writer envelope fields are excluded. UUID/type, source assistant identity
+// and the entire message body (including usage/stop_reason) remain semantic.
+const writerEnvelopeFields = new Set([
+  'parentUuid',
+  'logicalParentUuid',
+  'isSidechain',
+  'agentId',
+  'teamName',
+  'agentName',
+  'promptId',
+  'userType',
+  'entrypoint',
+  'cwd',
+  'sessionId',
+  'timestamp',
+  'version',
+  'gitBranch',
+  'slug',
+])
+export function nativeTranscriptMessageContent(value: unknown): Record<string, unknown> {
+  const snapshot = snapshotNativeTranscriptJson(value)
+  requireRemote(
+    snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot),
+    'native-transcript-message',
+  )
+  return Object.fromEntries(
+    Object.entries(snapshot as Record<string, unknown>).filter(
+      ([key]) => !writerEnvelopeFields.has(key),
+    ),
+  )
+}
+export function nativeTranscriptMessageHash(value: unknown): string {
+  return agentRemoteContentHash(
+    `agent-remote-native-message-v1\n${remoteCanonical(nativeTranscriptMessageContent(value))}`,
+  )
 }

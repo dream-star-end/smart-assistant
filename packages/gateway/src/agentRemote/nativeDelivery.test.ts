@@ -325,3 +325,49 @@ test('old control format with crash WAL rejects without checkpointing or deletin
   assert.deepEqual(readFileSync(filename), db)
   assert.deepEqual(readFileSync(`${filename}-wal`), wal)
 })
+
+test('a fully filtered native result commits no projections using the real Writer main boundary', async (t) => {
+  const { row, scope, native, preparation, proof } = await seed(t)
+  preparation.messages = []
+  rehash(preparation, row.request.body.payloadHash)
+  proof.preparationHash = preparation.preparationHash
+  proof.files = []
+  await native.prepareDelivery('u1', scope, 'op1', row.request.body.payloadHash, preparation)
+  const committed = await native.commitDelivery(
+    'u1',
+    scope,
+    'op1',
+    row.request.body.payloadHash,
+    preparation.preparationHash,
+    proof,
+  )
+  assert.equal(committed.state, 'completed')
+  assert.deepEqual(committed.deliveryCommit!.proof.files, [])
+  assert.equal(committed.deliveryAck!.nativeHeadRevision, proof.main.headUuid)
+})
+test('fork copies may share a UUID across distinct prepared files without merging their proofs', async (t) => {
+  const { row, scope, native, preparation, proof } = await seed(t)
+  const side = {
+    ...preparation.messages[0]!,
+    target: { kind: 'sidechain' as const, agentId: 'a0123456789abcdef' },
+  }
+  preparation.messages.push(side)
+  rehash(preparation, row.request.body.payloadHash)
+  proof.preparationHash = preparation.preparationHash
+  proof.files.push({
+    target: side.target,
+    headBytes: 200,
+    prefixHash: 'd'.repeat(64),
+    projectionsHash: nativeMessageProjectionsHash([side]),
+  })
+  await native.prepareDelivery('u1', scope, 'op1', row.request.body.payloadHash, preparation)
+  const committed = await native.commitDelivery(
+    'u1',
+    scope,
+    'op1',
+    row.request.body.payloadHash,
+    preparation.preparationHash,
+    proof,
+  )
+  assert.equal(committed.deliveryCommit!.proof.files.length, 2)
+})

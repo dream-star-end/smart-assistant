@@ -22,6 +22,8 @@ export interface NativeArtifactInstall {
   readonly nativeSessionId: string
   readonly nativeWriterLockPath: string
   readonly operationId: string
+  /** Trusted synchronous Writer fence; never a function received from JSON. */
+  readonly assertCurrentBinding?: () => undefined
   readonly artifacts: readonly NativeArtifact[]
   /** Authenticated bytes for this operation/descriptor; large files are streamed. */
   readonly openSource: (artifact: Readonly<NativeArtifact>) => AsyncIterable<Uint8Array>
@@ -126,6 +128,7 @@ export async function installNativeArtifacts(
   const writerLockPath = options.nativeWriterLockPath
   const operationId = options.operationId
   const openSource = options.openSource
+  const assertCurrentBinding = options.assertCurrentBinding
   requireRemote(
     /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(sessionId) &&
       identity.sessionId === sessionId,
@@ -159,6 +162,7 @@ export async function installNativeArtifacts(
     'native-artifact-binding',
   )
   const assertLive = () => {
+    requireRemote(assertCurrentBinding?.() === undefined, 'native-artifact-binding-guard')
     assertSessionFileLease(capability)
     assertNativeWriterLock(writerLockPath)
   }
@@ -177,6 +181,12 @@ export async function installNativeArtifacts(
     new Set(artifacts.map((artifact) => artifact.relativePath)).size === artifacts.length,
     'native-artifact-duplicate',
   )
+  if (!artifacts.length) {
+    if (identity.filePath !== boundTranscript)
+      await assertSessionFileAlias(capability, boundTranscript)
+    assertLive()
+    return { artifactManifestHash: nativeArtifactManifestHash(artifacts) }
+  }
   const key = `${sessionDirectory}\n${operationId}`
   requireRemote(!active.has(key), 'native-artifact-concurrent-install')
   active.add(key)
@@ -284,4 +294,72 @@ export async function installNativeArtifacts(
   } finally {
     active.delete(key)
   }
+}
+
+/** Readback only: the actual Writer derives these paths from its native session,
+ * holds that UUID flock and all transcript group locks through the final commit. */
+export async function verifyNativeArtifactSet(options: {
+  readonly projectsDirectory: string
+  readonly sessionDirectory: string
+  readonly nativeSessionId: string
+  readonly nativeWriterLockPath: string
+  readonly artifacts: readonly NativeArtifact[]
+}): Promise<{ artifactManifestHash: string }> {
+  const { projectsDirectory, sessionDirectory, nativeSessionId, nativeWriterLockPath } = options
+  const parts = relative(projectsDirectory, sessionDirectory).split('/')
+  requireRemote(
+    resolve(projectsDirectory) === projectsDirectory &&
+      resolve(sessionDirectory) === sessionDirectory &&
+      parts.length === 2 &&
+      /^[A-Za-z0-9_-]+$/.test(parts[0]!) &&
+      parts[1] === nativeSessionId &&
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(nativeSessionId) &&
+      resolve(nativeWriterLockPath) === nativeWriterLockPath &&
+      basename(nativeWriterLockPath) === `${nativeSessionId}.lock`,
+    'native-artifact-binding',
+  )
+  const artifacts = options.artifacts.map((artifact) => {
+    validateRemote<NativeArtifact>(NativeArtifactSchema, artifact)
+    requireRemote(
+      artifact.nativeSessionId === nativeSessionId &&
+        nativeToolArtifactPathAllowed(artifact.relativePath),
+      'native-artifact-path',
+    )
+    return Object.freeze({ ...artifact })
+  })
+  requireRemote(
+    new Set(artifacts.map((artifact) => artifact.relativePath)).size === artifacts.length,
+    'native-artifact-duplicate',
+  )
+  const seen = new Set<string>()
+  const inspect = async (path: string) => {
+    if (seen.has(path)) return
+    const stat = await lstat(path)
+    requireRemote(
+      stat.isDirectory() &&
+        !stat.isSymbolicLink() &&
+        stat.uid === process.getuid?.() &&
+        (stat.mode & 0o022) === 0 &&
+        (await realpath(path)) === path,
+      'native-artifact-directory',
+    )
+    seen.add(path)
+  }
+  assertNativeWriterLock(nativeWriterLockPath)
+  if (artifacts.length) {
+    await inspect(projectsDirectory)
+    await inspect(dirname(sessionDirectory))
+    await inspect(sessionDirectory)
+  }
+  for (const artifact of artifacts) {
+    assertNativeWriterLock(nativeWriterLockPath)
+    let parent = sessionDirectory
+    for (const component of artifact.relativePath.split('/').slice(0, -1)) {
+      parent = join(parent, component)
+      await inspect(parent)
+    }
+    await verifyInstalled(join(sessionDirectory, artifact.relativePath), artifact)
+  }
+  assertNativeWriterLock(nativeWriterLockPath)
+  return { artifactManifestHash: nativeArtifactManifestHash(artifacts) }
 }

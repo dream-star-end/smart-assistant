@@ -273,3 +273,45 @@ test('verified subagent/tool-result layouts are sealed; extra local native files
   assert.match(rejected.err, /checkpoint-path/)
   assert.equal(existsSync(g.pointer), false)
 })
+
+for (const delta of [-1, 0, 1])
+  test(`checkpoint final JSONL line limit delta=${delta} includes LF across the read boundary`, async (t) => {
+    const f = fixture(t)
+    const limit = 64 * 1024 * 1024
+    const empty = {
+      type: 'user',
+      uuid: 'head1',
+      sessionId: nativeSessionId,
+      message: { role: 'user', content: '' },
+    }
+    const envelope = Buffer.byteLength(JSON.stringify(empty))
+    const row = {
+      ...empty,
+      message: { role: 'user', content: 'x'.repeat(limit + delta - envelope) },
+    }
+    writeFileSync(f.transcript, `${JSON.stringify(row)}\n`, { mode: 0o600 })
+    const result = await start(f, 'checkpoint').done
+    if (delta <= 0) {
+      assert.equal(result.code, 0, result.err)
+      assert.ok(existsSync(f.pointer))
+    } else {
+      assert.notEqual(result.code, 0)
+      assert.match(result.err, /native-line-bound/)
+      assert.equal(existsSync(f.pointer), false)
+    }
+  })
+test('checkpoint rejects a later line BOM before publishing the native boundary', async (t) => {
+  const f = fixture(t)
+  const row = {
+    type: 'user',
+    uuid: 'head1',
+    sessionId: nativeSessionId,
+    message: { role: 'user', content: 'synthetic' },
+  }
+  writeFileSync(f.transcript, `${JSON.stringify(row)}\n\uFEFF${JSON.stringify(row)}\n`, {
+    mode: 0o600,
+  })
+  const result = await start(f, 'checkpoint').done
+  assert.notEqual(result.code, 0)
+  assert.equal(existsSync(f.pointer), false)
+})

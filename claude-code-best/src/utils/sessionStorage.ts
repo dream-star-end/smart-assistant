@@ -19,7 +19,7 @@ import {
   writeFile,
 } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
-import { basename, dirname, join } from 'path'
+import { basename, dirname, join, resolve } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -98,8 +98,14 @@ import { getSettings_DEPRECATED } from './settings/settings.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
 import { validateUuid } from './uuid.js'
-import { installNativeArtifacts, type NativeArtifactInstall } from '../../../packages/storage/src/nativeArtifactInstaller.js'
-import { replaceSessionFile, readSessionFile, withSessionFile, flushSessionFileIo, type SessionFileScope, type SessionReadHandle, SessionFileIntegrityError } from './sessionFileIo.js'
+import { installNativeArtifacts, verifyNativeArtifactSet, nativeArtifactManifestHash, type NativeArtifactInstall } from '../../../packages/storage/src/nativeArtifactInstaller.js'
+import { replaceSessionFile, readSessionFile, withSessionFile, withSessionFileGroupRead, flushSessionFileIo, type SessionFileScope, type SessionReadHandle, SessionFileIntegrityError } from './sessionFileIo.js'
+
+import { requireRemote, validateRemote } from '@openclaude/protocol/agentRemote'
+import { type NativeArtifact, NativeArtifactSchema, NATIVE_TRANSCRIPT_LINE_MAX_BYTES, snapshotNativeTranscriptJson } from '@openclaude/protocol/agentRemoteNative'
+import { type NativeDeliveryPreparation, type NativeDeliveryCommit, type NativeDeliveryWriterProof, type NativeMessageProjection, type NativeTranscriptTarget, nativeTranscriptMessageContent, nativeTranscriptMessageHash, nativeTranscriptTargetKey, verifyNativeDeliveryPreparation, verifyNativeDeliveryCommit } from '@openclaude/protocol/agentRemoteNativeDelivery'
+import { assertNativeWriterLock } from '../../../packages/storage/src/nativeWriterLock.js'
+import { readNativeTranscriptDelivery } from '../../../packages/storage/src/nativeTranscriptDelivery.js'
 
 // Cache MACRO.VERSION at module level to work around bun --define bug in async contexts
 // See: https://github.com/oven-sh/bun/issues/26168
@@ -554,6 +560,25 @@ function transcriptIoScope(filePath: string, hint?: string): SessionFileScope {
 }
 
 
+/** Prepared messages are already cleaned, frozen, pinned Host snapshots.
+ * Live tool/hook updates remain separate; recovery never cleans or runs them. */
+export interface NativeTranscriptDelivery {
+  readonly nativeSessionId: string
+  readonly operationId: string
+  readonly payloadHash: string
+  readonly preparation: NativeDeliveryPreparation
+  readonly nativeWriterLockPath: string
+  readonly artifacts: readonly NativeArtifact[]
+  readonly resolveMessage: (projection: Readonly<NativeMessageProjection>) => Promise<unknown>
+  readonly openArtifactSource: (artifact: Readonly<NativeArtifact>) => AsyncIterable<Uint8Array>
+  readonly commitProof: (proof: NativeDeliveryWriterProof) => Promise<NativeDeliveryCommit>
+}
+function transcriptMessageParents(message: Pick<Message, 'type'> & Record<string, unknown>, cursor: UUID | null): { parentUuid: UUID | null; logicalParentUuid?: UUID | null } {
+  const compact = isCompactBoundaryMessage(message as Message)
+  const source = message.type === 'user' && message.sourceToolAssistantUUID ? message.sourceToolAssistantUUID as UUID : cursor
+  return { parentUuid: compact ? null : source, logicalParentUuid: compact ? cursor : undefined }
+}
+
 type SessionPatch = import('./sessionFileIo.js').SessionFilePatch
 type SessionArtifactDependencies = readonly NativeArtifactInstall[]
 function snapshotArtifactDependencies(dependencies?: SessionArtifactDependencies): SessionArtifactDependencies | undefined {
@@ -764,6 +789,12 @@ class Project {
 
   private async appendToFile(filePath: string, data: string, scope?: SessionFileScope, aliases: readonly string[] = [], artifacts: SessionArtifactDependencies = []): Promise<void> {
     if (managedTranscriptIo()) {
+      let offset = 0
+      while (offset < data.length) {
+        const boundary = data.indexOf('\n', offset)
+        requireRemote(boundary >= 0 && Buffer.byteLength(data.slice(offset, boundary), 'utf8') <= NATIVE_TRANSCRIPT_LINE_MAX_BYTES, 'native-line-bound')
+        offset = boundary + 1
+      }
       await withSessionFile(filePath, scope ?? transcriptIoScope(filePath), true, async (file, patch) => {
         const identity = await file.stat()
         for (const alias of aliases) {
@@ -1243,22 +1274,9 @@ class Project {
       const slug = getPlanSlugCache().get(sessionId)
 
       for (const message of messages) {
-        const isCompactBoundary = isCompactBoundaryMessage(message)
-
-        // For tool_result messages, use the assistant message UUID from the message
-        // if available (set at creation time), otherwise fall back to sequential parent
-        let effectiveParentUuid = parentUuid
-        if (
-          message.type === 'user' &&
-          'sourceToolAssistantUUID' in message &&
-          message.sourceToolAssistantUUID
-        ) {
-          effectiveParentUuid = message.sourceToolAssistantUUID as UUID
-        }
-
+        const parents = transcriptMessageParents(message as typeof message & Record<string, unknown>, parentUuid)
         const transcriptMessage: TranscriptMessage = {
-          parentUuid: isCompactBoundary ? null : effectiveParentUuid,
-          logicalParentUuid: isCompactBoundary ? parentUuid : undefined,
+          ...parents,
           isSidechain,
           teamName: teamInfo?.teamName,
           agentName: teamInfo?.agentName,
@@ -1306,6 +1324,128 @@ class Project {
         const target = isSidechain && agentId ? getAgentTranscriptPath(asAgentId(agentId)) : this.sessionFile
         if (target) await this.flushQueuedWrites(this.writeQueueIdentity(target).key)
       }
+    })
+  }
+
+  async deliverNativeTranscript(options: NativeTranscriptDelivery): Promise<NativeDeliveryCommit> {
+    requireRemote(managedTranscriptIo() && !this.shouldSkipPersistence(), 'native-writer-managed-required')
+    verifyNativeDeliveryPreparation(options.preparation, options.payloadHash)
+    const preparation = structuredClone(options.preparation)
+    const { nativeSessionId, operationId, payloadHash, nativeWriterLockPath, resolveMessage, openArtifactSource, commitProof } = options
+    const originalCwd = getOriginalCwd()
+    const projectDirectory = getSessionProjectDir()
+    const mainPath = getTranscriptPath()
+    const sessionDirectory = join(dirname(mainPath), nativeSessionId)
+    const artifacts = options.artifacts.map(artifact => { validateRemote<NativeArtifact>(NativeArtifactSchema, artifact); return Object.freeze({ ...artifact }) })
+    requireRemote(new Set(artifacts.map(artifact => artifact.relativePath)).size === artifacts.length && nativeArtifactManifestHash(artifacts) === preparation.artifactManifestHash && artifacts.length === preparation.artifactCount, 'native-writer-artifact-manifest')
+    requireRemote(/^[A-Za-z0-9_.:-]{1,160}$/.test(operationId), 'native-writer-operation')
+    requireRemote(resolve(nativeWriterLockPath) === nativeWriterLockPath && basename(nativeWriterLockPath) === `${nativeSessionId}.lock`, 'native-writer-lock-binding')
+    const assertLive = (): undefined => {
+      requireRemote(getSessionId() === nativeSessionId && getOriginalCwd() === originalCwd && getSessionProjectDir() === projectDirectory, 'native-writer-session-changed')
+      assertNativeWriterLock(nativeWriterLockPath)
+      return undefined
+    }
+    assertLive()
+    const groups = new Map<string, { target: NativeTranscriptTarget; path: string; messages: NativeMessageProjection[] }>()
+    for (const message of preparation.messages) {
+      const key = nativeTranscriptTargetKey(message.target)
+      let group = groups.get(key)
+      if (!group) {
+        const path = message.target.kind === 'main' ? mainPath : getAgentTranscriptPath(asAgentId(message.target.agentId))
+        // Workflow subdirectories require a durable target-path binding; never
+        // recover a flat target into an ambient, ephemeral workflow mapping.
+        requireRemote(message.target.kind === 'main' || path === join(sessionDirectory, 'subagents', `agent-${message.target.agentId}.jsonl`), 'native-writer-target-binding')
+        group = { target: message.target, path, messages: [] }; groups.set(key, group)
+      }
+      group.messages.push(message)
+    }
+    const dependencies: NativeArtifactInstall[] = []
+    for (let index = 0; index < artifacts.length; index += 2048) dependencies.push(Object.freeze({ sessionDirectory, nativeSessionId, nativeWriterLockPath, operationId, artifacts: Object.freeze(artifacts.slice(index, index + 2048)), openSource: openArtifactSource, assertCurrentBinding: assertLive }))
+    if (!dependencies.length) dependencies.push(Object.freeze({ sessionDirectory, nativeSessionId, nativeWriterLockPath, operationId, artifacts: Object.freeze([]), openSource: openArtifactSource, assertCurrentBinding: assertLive }))
+    return this.trackWrite(async () => {
+      assertLive()
+      clearSessionMessagesCache()
+      const mainKey = this.writeQueueIdentity(mainPath).key
+      await this.flushQueuedWrites(mainKey)
+      if (this.sessionFile && this.sessionFile !== mainPath) {
+        await withSessionFile(mainPath, transcriptIoScope(mainPath), false, async file => {
+          const actual = await file.stat()
+          const old = await lstat(this.sessionFile!)
+          requireRemote(!old.isSymbolicLink() && old.dev === actual.dev && old.ino === actual.ino, 'native-writer-main-alias')
+        })
+        this.sessionFile = mainPath
+      }
+      const mainGroup = [...groups.values()].find(group => group.target.kind === 'main')
+      let mainReadback: Awaited<ReturnType<typeof readNativeTranscriptDelivery>> | undefined
+      try {
+        mainReadback = await withSessionFile(mainPath, transcriptIoScope(mainPath), false, file => readNativeTranscriptDelivery(file, nativeSessionId, { kind: 'main' }, mainGroup?.messages ?? [], false))
+        if (this.sessionFile === null) this.sessionFile = mainPath
+      } catch (error) {
+        if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error
+        requireRemote(mainGroup?.messages.length, 'native-writer-main-missing')
+      }
+      if (!mainGroup?.messages.length) requireRemote(mainReadback?.headUuid && mainReadback.transcriptRecords > 0, 'native-writer-main-head')
+      let dependenciesInstalled = false
+      for (const group of groups.values()) {
+        await this.flushQueuedWrites(this.writeQueueIdentity(group.path).key)
+        let existing = group.target.kind === 'main' ? mainReadback : undefined
+        if (group.target.kind !== 'main') try {
+          existing = await withSessionFile(group.path, transcriptIoScope(group.path), false, file => readNativeTranscriptDelivery(file, nativeSessionId, group.target, group.messages, false))
+        } catch (error) { if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error }
+        const found = existing?.foundCount ?? 0
+        const anchors = new Set(existing?.anchorUuids ?? [])
+        const assistantAnchors = new Set(existing?.assistantUuids ?? [])
+        for (const message of group.messages.slice(0, found)) anchors.add(message.uuid)
+        let hasMessages = (existing?.transcriptRecords ?? 0) > 0
+        for (let index = found; index < group.messages.length; index++) {
+          assertLive()
+          const projection = group.messages[index]!
+          const snapshot = snapshotNativeTranscriptJson(await resolveMessage(Object.freeze(structuredClone(projection))))
+          requireRemote(snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot), 'native-writer-message')
+          assertLive()
+          const source = snapshot as Record<string, unknown>
+          requireRemote(source.uuid === projection.uuid && source.timestamp === projection.timestamp && ['user','assistant','system','attachment'].includes(String(source.type)) && nativeTranscriptMessageHash(source) === projection.projectionHash, 'native-writer-message')
+          const message = { ...nativeTranscriptMessageContent(source), timestamp: projection.timestamp } as unknown as Transcript[number]
+          const cursor = index ? group.messages[index - 1]!.uuid : projection.logicalParentUuid !== undefined ? projection.logicalParentUuid : projection.parentUuid
+          const parents = transcriptMessageParents(message as typeof message & Record<string, unknown>, cursor as UUID | null)
+          requireRemote(parents.parentUuid === projection.parentUuid && parents.logicalParentUuid === projection.logicalParentUuid, 'native-writer-parent')
+          for (const anchor of [projection.parentUuid, projection.logicalParentUuid]) if (typeof anchor === 'string') requireRemote(anchors.has(anchor), 'native-writer-parent-missing')
+          if (group.target.kind === 'main' && projection.parentUuid === null && !isCompactBoundaryMessage(message)) requireRemote(!hasMessages, 'native-writer-root-conflict')
+          assertLive()
+          if (source.type === 'user' && source.sourceToolAssistantUUID) requireRemote(assistantAnchors.has(String(source.sourceToolAssistantUUID)), 'native-writer-source-parent')
+          const deps = !dependenciesInstalled && dependencies.length ? new Map([[projection.uuid, dependencies]]) : undefined
+          await this.insertMessageChain([message], group.target.kind === 'sidechain', group.target.kind === 'sidechain' ? group.target.agentId : undefined, cursor as UUID | null, undefined, true, deps)
+          if (deps) dependenciesInstalled = true
+          anchors.add(projection.uuid)
+          if (source.type === 'assistant') assistantAnchors.add(projection.uuid)
+          hasMessages = true
+        }
+      }
+      // A filtered REPL result may have no transcript messages. It still needs
+      // real artifact durability; a zero-byte managed patch uses the same lease.
+      if (!dependenciesInstalled && artifacts.length) await withSessionFile(mainPath, transcriptIoScope(mainPath), false, async (file, patch) => {
+        await patch((await file.stat()).size, Buffer.alloc(0), async capability => { for (const dependency of dependencies) await installNativeArtifacts(capability, dependency) })
+      })
+      const targets = [{ filePath: mainPath, scope: transcriptIoScope(mainPath) }, ...[...groups.values()].filter(group => group.target.kind !== 'main').map(group => ({ filePath: group.path, scope: transcriptIoScope(group.path) }))]
+      for (const target of targets) await this.flushQueuedWrites(this.writeQueueIdentity(target.filePath).key)
+      const groupsByPath = new Map([...groups.values()].map(group => [group.path, group]))
+      return withSessionFileGroupRead(targets, async files => {
+        assertLive()
+        const readbacks = new Map<string, Awaited<ReturnType<typeof readNativeTranscriptDelivery>>>()
+        for (const file of files) {
+          const group = groupsByPath.get(file.filePath)
+          readbacks.set(file.filePath, await readNativeTranscriptDelivery(file.file, nativeSessionId, group?.target ?? { kind: 'main' }, group?.messages ?? [], true))
+        }
+        const main = readbacks.get(mainPath)!
+        requireRemote(main.headUuid && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(main.headUuid), 'native-writer-main-head')
+        const manifest = await verifyNativeArtifactSet({ projectsDirectory: getProjectsDir(), sessionDirectory, nativeSessionId, nativeWriterLockPath, artifacts })
+        requireRemote(manifest.artifactManifestHash === preparation.artifactManifestHash, 'native-writer-artifact-manifest')
+        const proof: NativeDeliveryWriterProof = { nativeSessionId, preparationHash: preparation.preparationHash, artifactManifestHash: manifest.artifactManifestHash, main: { headUuid: main.headUuid, headBytes: main.headBytes, prefixHash: main.prefixHash }, files: [...groups.values()].map(group => { const readback = readbacks.get(group.path)!; return { target: group.target, headBytes: readback.headBytes, prefixHash: readback.prefixHash, projectionsHash: readback.projectionsHash } }) }
+        assertLive()
+        const commit = await commitProof(proof)
+        verifyNativeDeliveryCommit(commit, payloadHash, preparation, nativeSessionId)
+        return commit
+      })
     })
   }
 
@@ -1652,7 +1792,7 @@ const transcriptProducers = new Set<Promise<unknown>>()
 const sessionTaskTails = new Map<string, Promise<unknown>>()
 const sessionTaskContext = new AsyncLocalStorage<{ sid: string; key: string }>()
 let transcriptProducerFailure: unknown
-function serializeTranscriptTask<T>(produce: () => Promise<T>, targetSid?: string): Promise<T> {
+function serializeTranscriptTask<T>(produce: () => Promise<T>, targetSid?: string, retainFailure = true): Promise<T> {
   if (!managedTranscriptIo()) return produce()
   const sid = getSessionId()
   const key = JSON.stringify([getProjectsDir(), targetSid ?? sid])
@@ -1674,21 +1814,30 @@ function serializeTranscriptTask<T>(produce: () => Promise<T>, targetSid?: strin
   void pending.then(() => {
     if (sessionTaskTails.get(key) === pending) sessionTaskTails.delete(key)
   }, error => {
-    transcriptProducerFailure ??= error
+    if (retainFailure) transcriptProducerFailure ??= error
     if (sessionTaskTails.get(key) === pending) sessionTaskTails.delete(key)
   })
   return pending
 }
-function trackTranscriptProducer<T>(produce: () => Promise<T>): Promise<T> {
-  const pending = serializeTranscriptTask(produce)
+function trackTranscriptProducer<T>(produce: () => Promise<T>, retainFailure = true): Promise<T> {
+  const pending = serializeTranscriptTask(produce, undefined, retainFailure)
   if (!managedTranscriptIo()) return pending
   transcriptProducers.add(pending)
   void pending.then(() => { transcriptProducers.delete(pending) }, error => {
-    transcriptProducerFailure ??= error
+    if (retainFailure) transcriptProducerFailure ??= error
     transcriptProducers.delete(pending)
   })
   return pending
 }
+export function deliverNativeTranscript(options: NativeTranscriptDelivery): Promise<NativeDeliveryCommit> {
+  // Freeze mutable descriptor membership before waiting behind a prior producer.
+  verifyNativeDeliveryPreparation(options.preparation, options.payloadHash)
+  const snapshot = { ...options, preparation: structuredClone(options.preparation), artifacts: snapshotNativeTranscriptJson(options.artifacts) as NativeArtifact[] }
+  // Control reconnect/ACK loss is not an IO corruption marker. Actual managed
+  // queue failures still retain their own writeErrors and block ordinary flush.
+  return trackTranscriptProducer(() => getProject().deliverNativeTranscript(snapshot), false)
+}
+
 export function recordTranscript(
   messages: Message[], teamInfo?: TeamInfo, startingParentUuidHint?: UUID,
   allMessages?: readonly Message[], preserveMessageTimestamp = false,

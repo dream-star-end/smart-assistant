@@ -33,8 +33,7 @@ import {
   nativeSessionPathAllowed,
   verifyNativeCheckpoint,
 } from '@openclaude/protocol/agentRemoteState'
-
-import { assertNativeWriterLock } from '@openclaude/storage'
+import { assertNativeWriterLock, createNativeTranscriptLines } from '@openclaude/storage'
 export { assertNativeWriterLock }
 
 type Fingerprint = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }
@@ -130,34 +129,26 @@ function hashFile(path: string): { sha256: string; sizeBytes: number } {
 }
 function verifyTranscript(path: string, identity: NativeCheckpointIdentity, head: string): void {
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-  const decoder = new TextDecoder('utf-8', { fatal: true })
   const buffer = Buffer.alloc(65536)
-  let pending = ''
   let lastUuid = ''
   let records = 0
+  const lines = createNativeTranscriptLines((line) => {
+    if (!line.trim()) return
+    const value = JSON.parse(line)
+    requireRemote(
+      value && typeof value === 'object' && !Array.isArray(value),
+      'native-transcript-shape',
+    )
+    if (value.sessionId !== undefined)
+      requireRemote(value.sessionId === identity.nativeSessionId, 'native-session-mismatch')
+    if (typeof value.uuid === 'string') lastUuid = value.uuid
+    records++
+  })
   try {
     let bytes: number
-    while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
-      pending += decoder.decode(buffer.subarray(0, bytes), { stream: true })
-      requireRemote(Buffer.byteLength(pending, 'utf8') <= 64 * 1024 * 1024, 'native-line-bound')
-      let boundary: number
-      while ((boundary = pending.indexOf('\n')) >= 0) {
-        const line = pending.slice(0, boundary)
-        pending = pending.slice(boundary + 1)
-        if (!line.trim()) continue
-        const value = JSON.parse(line)
-        requireRemote(
-          value && typeof value === 'object' && !Array.isArray(value),
-          'native-transcript-shape',
-        )
-        if (value.sessionId !== undefined)
-          requireRemote(value.sessionId === identity.nativeSessionId, 'native-session-mismatch')
-        if (typeof value.uuid === 'string') lastUuid = value.uuid
-        records++
-      }
-    }
-    pending += decoder.decode()
-    requireRemote(!pending.trim() && records > 0 && lastUuid === head, 'native-boundary-mismatch')
+    while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0)
+      lines.push(buffer.subarray(0, bytes))
+    requireRemote(lines.complete() && records > 0 && lastUuid === head, 'native-boundary-mismatch')
   } finally {
     closeSync(descriptor)
   }

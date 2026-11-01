@@ -370,7 +370,12 @@ export const NativeFrameSchema = Type.Object(
 export type NativeFrame = Static<typeof NativeFrameSchema>
 export type NativeExecutionBody = Extract<NativeFrame['body'], { kind: 'native.execute' }>
 
-function boundedJson(value: unknown, depth = 0, budget = { nodes: 0 }): void {
+function boundedJson(
+  value: unknown,
+  depth = 0,
+  budget = { nodes: 0 },
+  omitOptionalUndefined = false,
+): void {
   requireRemote(depth <= 64 && ++budget.nodes <= 250000, 'native-json-bound')
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return
   if (typeof value === 'number') {
@@ -392,7 +397,7 @@ function boundedJson(value: unknown, depth = 0, budget = { nodes: 0 }): void {
         descriptor && !descriptor.get && !descriptor.set && descriptor.enumerable,
         'native-json-array',
       )
-      boundedJson(descriptor.value, depth + 1, budget)
+      boundedJson(descriptor.value, depth + 1, budget, omitOptionalUndefined)
     }
     return
   }
@@ -405,7 +410,8 @@ function boundedJson(value: unknown, depth = 0, budget = { nodes: 0 }): void {
       !descriptor.get && !descriptor.set && descriptor.enumerable,
       'native-json-property',
     )
-    boundedJson(descriptor.value, depth + 1, budget)
+    if (!(omitOptionalUndefined && descriptor.value === undefined))
+      boundedJson(descriptor.value, depth + 1, budget, omitOptionalUndefined)
   }
   requireRemote(Object.getOwnPropertySymbols(value).length === 0, 'native-json-symbol')
 }
@@ -458,6 +464,18 @@ export function nativeOperationKey(
     scope.binding.environmentGeneration,
     operationId,
   ])
+}
+/** Native JSONL/source snapshots are not wire frames. Optional object fields
+ * follow the actual Writer's JSON omission rules; arrays remain strict. */
+export const NATIVE_TRANSCRIPT_LINE_MAX_BYTES = 64 * 1024 * 1024
+export function snapshotNativeTranscriptJson(value: unknown): unknown {
+  boundedJson(value, 0, { nodes: 0 }, true)
+  const encoded = remoteCanonical(value)
+  requireRemote(
+    Buffer.byteLength(encoded, 'utf8') <= NATIVE_TRANSCRIPT_LINE_MAX_BYTES,
+    'native-line-bound',
+  )
+  return JSON.parse(encoded)
 }
 export function verifyNativeJson(value: unknown): void {
   boundedJson(value)

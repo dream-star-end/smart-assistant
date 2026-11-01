@@ -58,3 +58,5 @@ export * from './sessionUploadReferences.js'
 
 export * from './nativeWriterLock.js'
 export * from './nativeArtifactInstaller.js'
+
+export { createNativeTranscriptLines } from './nativeTranscriptLines.js'
