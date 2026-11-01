@@ -9237,6 +9237,7 @@
       "severity": "P1",
       "symptom": "商业版 uid1 发「hi」时，周额度已用尽的登录仍被选中。上游拒绝后自动恢复改发了「从断点继续」，原消息仍显示发送失败和继续。什么都没执行过时应原样重发用户原文；自动恢复成功接手后，原消息不再显示发送失败。",
       "rootFixCommit": "8c93a18b",
+      "coverageCommits": ["d5f09049"],
       "regressions": [
         {
           "layer": "browser",
