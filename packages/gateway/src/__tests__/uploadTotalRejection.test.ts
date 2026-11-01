@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
-import { noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
+import { messageAttachmentTotal, noteAttachmentTotalRejection, readUploadUserFailureCode } from '../uploadTotalRejection.js'
 
 const testHome = await mkdtemp(join(tmpdir(), 'oc-gw-upload-total-'))
 process.env.OPENCLAUDE_HOME = testHome
@@ -14,6 +14,22 @@ const { buildTurnDispatchStateResponse, inboxReject } = await import('../turnDis
 after(async () => {
   await closeSessionsDb()
   await rm(testHome, { recursive: true, force: true })
+})
+
+
+test('message attachment total includes bytes after the 300MiB cap is crossed', () => {
+  const mib = 1024 * 1024
+  const sizes = Array.from({ length: 8 }, () => 100 * mib)
+  const firstOverPrefix = 4 * 100 * mib
+  assert.equal(3 * 100 * mib > 300 * mib, false)
+  assert.equal(firstOverPrefix > 300 * mib, true)
+  const total = messageAttachmentTotal(sizes)
+  assert.equal(total, 800 * mib)
+  const message = noteAttachmentTotalRejection({}, total)
+  assert.match(message, /800MB/)
+  assert.match(message, /请分3条/)
+  assert.equal(message.includes('请重试'), false)
+  assert.equal(noteAttachmentTotalRejection({}, firstOverPrefix).includes('两条'), true)
 })
 
 test('noteAttachmentTotalRejection stamps 330MB copy and a parseable code', () => {

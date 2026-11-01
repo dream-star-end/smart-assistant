@@ -45,7 +45,7 @@ import {
   stripDispatchAuthorityField,
 } from '@openclaude/protocol'
 import { classifyRunError } from './errorClassify.js'
-import { noteAttachmentTotalRejection } from './uploadTotalRejection.js'
+import { messageAttachmentTotal, noteAttachmentTotalRejection } from './uploadTotalRejection.js'
 import { parseCreditBudgetFen } from './creditExhaustion.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
 import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
@@ -957,9 +957,12 @@ export async function dispatchInbound(
         rejectFrame(`附件数量超过 ${MAX_FILES_PER_FRAME} 个限制 (${media.length})`)
         return
       }
-      let totalMediaSize = 0
+      const attachmentSizes: number[] = []
+      let attachmentTotalOver = false
       // First pass — validate base64 (legacy) entries the same way as before so
       // old web bundles still get correct 4xx-style WS error frames.
+      // The total check happens after every attachment is counted. Rejecting at
+      // the first prefix that crosses 300MiB would name the wrong total.
       for (const m of media) {
         if (!m.base64) continue
         const rawLen = m.base64.length
@@ -971,11 +974,8 @@ export async function dispatchInbound(
           )
           return
         }
-        totalMediaSize += byteLen
-        if (totalMediaSize > MAX_UPLOAD_TOTAL) {
-          rejectFrame(noteAttachmentTotalRejection(frame, totalMediaSize), { totalMediaSize })
-          return
-        }
+        attachmentSizes.push(byteLen)
+        if (messageAttachmentTotal(attachmentSizes) > MAX_UPLOAD_TOTAL) attachmentTotalOver = true
         const mime = m.mimeType || ''
         if (mime && !isUploadMimeAllowed(mime)) {
           rejectFrame(`不支持的文件类型: ${mime}`, { mime })
@@ -1060,11 +1060,9 @@ export async function dispatchInbound(
           // Aggregate against MAX_UPLOAD_TOTAL — same budget the legacy base64
           // path uses, so a malicious frame referencing many already-uploaded
           // /api/media URLs can't bypass the per-frame ceiling.
-          totalMediaSize += stat.size
-          if (totalMediaSize > MAX_UPLOAD_TOTAL) {
-            rejectFrame(noteAttachmentTotalRejection(frame, totalMediaSize), { totalMediaSize })
-            return
-          }
+          attachmentSizes.push(stat.size)
+          if (messageAttachmentTotal(attachmentSizes) > MAX_UPLOAD_TOTAL) attachmentTotalOver = true
+          if (attachmentTotalOver) continue
           const mimeType = m.mimeType || mimeFor(realPath) || 'application/octet-stream'
           savedMedia.push({
             mediaIndex,
@@ -1079,6 +1077,7 @@ export async function dispatchInbound(
         // ── Legacy base64 path (compat window for old web bundles) ──
         let base64 = m.base64 ?? ''
         if (!base64) continue
+        if (attachmentTotalOver) continue
         const prefixMatch = base64.match(/^data:([^;]+);base64,(.*)$/)
         const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
         if (prefixMatch) base64 = prefixMatch[2]
@@ -1108,6 +1107,12 @@ export async function dispatchInbound(
         } catch (err) {
           this.log.warn('dispatchInbound failed to save upload', { kind: m.kind }, err)
         }
+      }
+
+      const totalMediaSize = messageAttachmentTotal(attachmentSizes)
+      if (totalMediaSize > MAX_UPLOAD_TOTAL) {
+        rejectFrame(noteAttachmentTotalRejection(frame, totalMediaSize), { totalMediaSize })
+        return
       }
 
       if (rawImageEdit !== undefined) {

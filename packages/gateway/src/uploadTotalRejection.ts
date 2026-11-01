@@ -4,6 +4,22 @@ import {
   parseAttachmentTotalExceeded,
 } from '@openclaude/protocol'
 
+
+/** Sum every attachment. Callers reject with this total, never with the prefix that first crossed the cap. */
+export function messageAttachmentTotal(sizes: readonly number[]): number {
+  let total = 0
+  for (const size of sizes) {
+    if (!Number.isFinite(size) || size < 0) {
+      throw new RangeError('attachment size must be a non-negative finite number')
+    }
+    total += size
+  }
+  if (!Number.isSafeInteger(Math.floor(total))) {
+    throw new RangeError('attachment total is not a safe integer')
+  }
+  return total
+}
+
 /** Stamp the frame the durable admission finally will read. Returns the user-facing reason. */
 export function noteAttachmentTotalRejection(frame: object, totalBytes: number): string {
   const message = attachmentTotalLimitMessage(totalBytes)
