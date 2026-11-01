@@ -150,6 +150,9 @@ test("an extended prefix stays canonical JSON after edits and key reordering", a
     assert.equal(JSON.stringify(await fresh.get(binding, second.reference)), JSON.stringify(grown));
     assert.deepEqual(await store.get(binding, second.reference), grown);
     prefix[0]!.n = 9;
+    const afterEdit = await store.get(binding, second.reference);
+    assert.equal((afterEdit[0] as { n: number }).n, 1);
+    assert.equal(prefix[0]!.n, 9);
     const edited = [...prefix, { role: "user", content: "after-edit" }];
     const third = await store.put(binding, edited);
     assert.equal(third.messages_sha256, sha(JSON.stringify(edited)));
@@ -169,5 +172,11 @@ test("an extended prefix stays canonical JSON after edits and key reordering", a
     assert.equal(store.bodyUtf8Bytes(binding, body), Buffer.byteLength(JSON.stringify(body)));
     const changed = { ...body, messages: edited };
     assert.equal(store.bodyUtf8Bytes(binding, changed), Buffer.byteLength(JSON.stringify(changed)));
+    const boxed: unknown[] = [Object(1)];
+    const boxedRef = await store.put(binding, boxed);
+    assert.equal(boxedRef.messages_sha256, sha(JSON.stringify(boxed)));
+    boxed[0] = Object(2);
+    const boxedNext = await store.put(binding, boxed);
+    assert.equal(boxedNext.messages_sha256, sha(JSON.stringify(boxed)));
   });
 });

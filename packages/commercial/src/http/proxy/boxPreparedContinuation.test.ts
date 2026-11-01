@@ -175,4 +175,16 @@ test("raw boundary bytes match the sorted stable JSON of the pinned body", () =>
   assert.equal(rawBoundarySha256(body), expect);
   const changed = { ...pinned, messages: [{ role: "user", content: "B".repeat(1500) }] } as ProxyBody;
   assert.notEqual(rawBoundarySha256(changed), expect);
+  const shared = [{ role: "user", content: "x" }];
+  const slotBody = (slot: unknown[]): ProxyBody => ({
+    model: "m", stream: false, max_tokens: 1, messages: shared, output_config: { slot },
+  }) as ProxyBody;
+  const sparse: unknown[] = ["a"];
+  sparse.length = 3;
+  sparse[2] = "c";
+  const missing = rawBoundarySha256(slotBody(sparse));
+  const explicit = rawBoundarySha256(slotBody(["a", undefined, "c"]));
+  const nonFinite = rawBoundarySha256(slotBody(["a", Number.NaN, "c"]));
+  assert.notEqual(missing, explicit);
+  assert.equal(explicit, nonFinite);
 });

@@ -289,8 +289,9 @@ export class FileBoxContextTransport implements BoxContextTransport {
         const hot = this.hot;
         if (hot && hot.key === key && hot.reference === reference
           && hot.sha256 === header.sha256 && hot.count === header.count
-          && hot.messages.length === header.count) {
-          return hot.messages.slice();
+          && hot.messages.length === header.count && hot.stamp) {
+          const stamp = jsonIdentityStamp(hot.messages);
+          if (stamp && stampsEqual(stamp, hot.stamp)) return hot.messages.slice();
         }
         const messages: unknown = JSON.parse(data.toString("utf8"));
         if (!Array.isArray(messages) || messages.length !== header.count) {

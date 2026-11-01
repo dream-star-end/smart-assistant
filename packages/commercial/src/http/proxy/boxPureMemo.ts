@@ -22,18 +22,10 @@ export type JsonStamp = {
 const byMessages = new WeakMap<readonly unknown[], Entry[]>();
 
 function pushStamp(value: unknown, parts: string[], longs: string[], depth: number,
-  sortKeys: boolean, strict: boolean): boolean {
-  if (depth > 64) {
-    if (strict) return false;
-    parts.push("?");
-    return true;
-  }
+  sortKeys: boolean): boolean {
+  if (depth > 64) return false;
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      if (strict) return false;
-      parts.push("?");
-      return true;
-    }
+    if (!Number.isFinite(value)) return false;
     parts.push(JSON.stringify(value));
     return true;
   }
@@ -52,25 +44,21 @@ function pushStamp(value: unknown, parts: string[], longs: string[], depth: numb
     return true;
   }
   if (Array.isArray(value)) {
+    if (typeof (value as { toJSON?: unknown }).toJSON === "function") return false;
     parts.push("[");
     for (let index = 0; index < value.length; index += 1) {
       if (index) parts.push(",");
-      if (!Object.hasOwn(value, index)) {
-        if (strict) return false;
-        parts.push("?");
-        continue;
-      }
-      if (!pushStamp(value[index], parts, longs, depth + 1, sortKeys, strict)) return false;
+      if (!Object.hasOwn(value, index)) return false;
+      if (!pushStamp(value[index], parts, longs, depth + 1, sortKeys)) return false;
     }
     parts.push("]");
     return true;
   }
-  if (!value || typeof value !== "object") {
-    if (strict) return false;
-    parts.push("?");
-    return true;
-  }
+  if (!value || typeof value !== "object") return false;
   const object = value as Record<string, unknown>;
+  if (typeof object.toJSON === "function") return false;
+  const proto = Object.getPrototypeOf(object);
+  if (proto !== Object.prototype && proto !== null) return false;
   const keys = Object.keys(object);
   if (sortKeys) keys.sort();
   parts.push("{");
@@ -80,7 +68,7 @@ function pushStamp(value: unknown, parts: string[], longs: string[], depth: numb
     if (key === undefined) continue;
     parts.push(JSON.stringify(key));
     parts.push(":");
-    if (!pushStamp(object[key], parts, longs, depth + 1, sortKeys, strict)) return false;
+    if (!pushStamp(object[key], parts, longs, depth + 1, sortKeys)) return false;
   }
   parts.push("}");
   return true;
@@ -103,7 +91,7 @@ export function stampsEqual(left: JsonStamp, right: JsonStamp): boolean {
 export function jsonIdentityStamp(value: unknown): JsonStamp | null {
   const parts: string[] = [];
   const longs: string[] = [];
-  if (!pushStamp(value, parts, longs, 0, false, true)) return null;
+  if (!pushStamp(value, parts, longs, 0, false)) return null;
   return { structural: parts.join(""), longs };
 }
 
@@ -121,7 +109,8 @@ export function memoPureBody<T>(body: object, kind: string, compute: () => T): T
   if (!Array.isArray(messages)) return compute();
   const parts: string[] = [];
   const longs: string[] = [];
-  pushStamp(body, parts, longs, 0, true, false);
+  // A lossy stamp would alias a hole, NaN, or toJSON value onto another body.
+  if (!pushStamp(body, parts, longs, 0, true)) return compute();
   const structural = parts.join("");
   const bucket = byMessages.get(messages);
   if (bucket) {

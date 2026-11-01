@@ -34,6 +34,9 @@ test("prefix identity follows insertion order and sees short-field edits", () =>
   const hole: unknown[] = ["a"];
   hole.length = 3;
   assert.equal(jsonIdentityStamp(hole), null);
+  assert.equal(jsonIdentityStamp([Object(1)]), null);
+  assert.equal(jsonIdentityStamp([new Date(0)]), null);
+  assert.equal(jsonIdentityStamp([{ toJSON() { return 1; } }]), null);
 });
 
 test("body byte length matches JSON.stringify when messages are supplied", () => {
