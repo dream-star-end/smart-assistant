@@ -427,3 +427,27 @@ test('non-EOF resource page must advance the UTF8 byte cursor', () => {
   }
   assert.throws(() => verify(frame(body, 'worker'), scope, 'worker'), /native-resource-cursor/)
 })
+
+test('provider tool IDs remain opaque and preserve long replay signatures independently of infrastructure IDs', () => {
+  for (const id of [`toolu_g4_${'a'.repeat(12000)}`, 'provider:opaque-工具-id']) {
+    const request = execute()
+    assert.equal(request.body.kind, 'native.execute')
+    if (request.body.kind !== 'native.execute') throw new Error('wrong fixture')
+    request.body.toolUse.id = id
+    const { payloadHash: _previousHash, ...semantic } = request.body
+    request.body.payloadHash = nativeExecutionHash(request.scope, request.operationId, semantic)
+    const replay = JSON.parse(JSON.stringify(request))
+    verify(replay, scope, 'worker')
+    assert.equal(replay.body.toolUse.id, id)
+    assert.equal(replay.body.payloadHash, request.body.payloadHash)
+  }
+  for (const id of ['', 7, '\ud800', 'a'.repeat(8 * 1024 * 1024)]) {
+    const invalid = execute()
+    if (invalid.body.kind !== 'native.execute') throw new Error('wrong fixture')
+    invalid.body.toolUse.id = id as string
+    assert.throws(() => verify(invalid, scope, 'worker'))
+  }
+  const bad = execute()
+  bad.operationId = 'bad/operation'
+  assert.throws(() => verify(bad, scope, 'worker'))
+})

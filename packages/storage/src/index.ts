@@ -55,3 +55,6 @@ export * from './contextEligibility.js'
 export * from './contextSource.js'
 
 export * from './sessionUploadReferences.js'
+
+export * from './nativeWriterLock.js'
+export * from './nativeArtifactInstaller.js'

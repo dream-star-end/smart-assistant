@@ -98,6 +98,7 @@ import { getSettings_DEPRECATED } from './settings/settings.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
 import type { ContentReplacementRecord } from './toolResultStorage.js'
 import { validateUuid } from './uuid.js'
+import { installNativeArtifacts, type NativeArtifactInstall } from '../../../packages/storage/src/nativeArtifactInstaller.js'
 import { replaceSessionFile, readSessionFile, withSessionFile, flushSessionFileIo, type SessionFileScope, type SessionReadHandle, SessionFileIntegrityError } from './sessionFileIo.js'
 
 // Cache MACRO.VERSION at module level to work around bun --define bug in async contexts
@@ -553,14 +554,37 @@ function transcriptIoScope(filePath: string, hint?: string): SessionFileScope {
 }
 
 
-type SessionPatch = (offset: number, target: Buffer) => Promise<void>
+type SessionPatch = import('./sessionFileIo.js').SessionFilePatch
+type SessionArtifactDependencies = readonly NativeArtifactInstall[]
+function snapshotArtifactDependencies(dependencies?: SessionArtifactDependencies): SessionArtifactDependencies | undefined {
+  return dependencies && Object.freeze(dependencies.map(dependency => Object.freeze({ ...dependency,
+    artifacts: Object.freeze(dependency.artifacts.map(artifact => Object.freeze({ ...artifact }))) })))
+}
+export type TranscriptArtifactDependencies = ReadonlyMap<string, SessionArtifactDependencies>
+function snapshotTranscriptArtifacts(messages: readonly Message[], dependencies?: TranscriptArtifactDependencies): TranscriptArtifactDependencies | undefined {
+  if (!dependencies?.size) return undefined
+  if (!managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_INTEGRITY_REQUIRED')
+  const ids = new Set(messages.map(message => message.uuid))
+  const snapshot = new Map<string, SessionArtifactDependencies>()
+  for (const [uuid, artifacts] of dependencies) {
+    if (!ids.has(uuid as UUID)) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ARTIFACT_MESSAGE')
+    snapshot.set(uuid, snapshotArtifactDependencies(artifacts)!)
+  }
+  return snapshot
+}
+function assertArtifactMessagesWillWrite(messages: readonly { uuid: string }[], dependencies?: TranscriptArtifactDependencies): void {
+  if (!dependencies?.size) return
+  const ids = new Set(messages.map(message => message.uuid))
+  for (const [uuid, artifacts] of dependencies) if (artifacts.length && !ids.has(uuid))
+    throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ARTIFACT_NOT_WRITTEN')
+}
 type SessionMutation = (file: SessionReadHandle, patch: SessionPatch) => Promise<void>
 type QueuedSessionWrite = {
   filePath: string
   scope?: SessionFileScope
   resolve: () => void
   reject: (error: unknown) => void
-} & ({ kind: 'entry'; entry: Entry | Record<string, unknown> } | { kind: 'mutation'; apply: SessionMutation })
+} & ({ kind: 'entry'; entry: Entry | Record<string, unknown>; artifacts?: SessionArtifactDependencies } | { kind: 'mutation'; apply: SessionMutation })
 
 class Project {
   // Minimal cache for current session only (not all sessions)
@@ -655,28 +679,30 @@ class Project {
     return e
   }
 
-  private enqueueWrite(filePath: string, entry: Entry | Record<string, unknown>): Promise<void> {
+  private enqueueWrite(filePath: string, entry: Entry | Record<string, unknown>, artifacts?: SessionArtifactDependencies): Promise<void> {
     const { key, scope } = this.writeQueueIdentity(filePath, entry)
     return new Promise<void>((resolve, reject) => {
       let queue = this.writeQueues.get(key)
       if (!queue) { queue = []; this.writeQueues.set(key, queue) }
-      queue.push({ kind: 'entry', filePath, scope, entry, resolve, reject })
+      queue.push({ kind: 'entry', filePath, scope, entry, artifacts, resolve, reject })
       this.scheduleDrain()
     })
   }
 
-  private async admitWrite(filePath: string, entry: Entry | Record<string, unknown>): Promise<void> {
+  private async admitWrite(filePath: string, entry: Entry | Record<string, unknown>, artifacts?: SessionArtifactDependencies): Promise<void> {
     const { key } = this.writeQueueIdentity(filePath, entry)
     while ((this.writeQueues.get(key)?.length ?? 0) >= 1000) await this.driveWriteQueues(key)
     // Admission can return before the batch commits; insertMessageChain and
     // public flush await the actual commit. Errors are retained until observed.
-    void this.enqueueWrite(filePath, entry).catch(error => { this.rememberWriteFailure(error, key) })
+    void this.enqueueWrite(filePath, entry, artifacts).catch(error => { this.rememberWriteFailure(error, key) })
   }
 
-  async appendExternalEntry(filePath: string, entry: Record<string, unknown>): Promise<void> {
+  async appendExternalEntry(filePath: string, entry: Record<string, unknown>, dependencies?: SessionArtifactDependencies): Promise<void> {
+    const artifacts = snapshotArtifactDependencies(dependencies)
+    if (artifacts?.length && !managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_INTEGRITY_REQUIRED')
     return this.trackWrite(async () => {
       const { key } = this.writeQueueIdentity(filePath, entry)
-      await this.admitWrite(filePath, entry)
+      await this.admitWrite(filePath, entry, artifacts)
       await this.flushQueuedWrites(key)
     }, filePath)
   }
@@ -736,7 +762,7 @@ class Project {
     }
   }
 
-  private async appendToFile(filePath: string, data: string, scope?: SessionFileScope, aliases: readonly string[] = []): Promise<void> {
+  private async appendToFile(filePath: string, data: string, scope?: SessionFileScope, aliases: readonly string[] = [], artifacts: SessionArtifactDependencies = []): Promise<void> {
     if (managedTranscriptIo()) {
       await withSessionFile(filePath, scope ?? transcriptIoScope(filePath), true, async (file, patch) => {
         const identity = await file.stat()
@@ -746,7 +772,9 @@ class Project {
             if (other.isSymbolicLink() || other.dev !== identity.dev || other.ino !== identity.ino) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ALIAS_DIVERGED')
           } catch (error) { if (!(error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')) throw error }
         }
-        await patch(identity.size, Buffer.from(data))
+        await patch(identity.size, Buffer.from(data), artifacts.length ? async capability => {
+          for (const dependency of artifacts) await installNativeArtifacts(capability, dependency)
+        } : undefined)
       })
       return
     }
@@ -767,7 +795,7 @@ class Project {
             first.resolve(); index++; continue
           }
           let content = ''; let bytes = 0
-          const chunk: QueuedSessionWrite[] = []
+          const chunk: Extract<QueuedSessionWrite, { kind: 'entry' }>[] = []
           while (index < batch.length) {
             const item = batch[index]!
             if (item.kind !== 'entry') break
@@ -776,7 +804,15 @@ class Project {
             if (content && bytes + size > this.MAX_CHUNK_BYTES) break
             content += line; bytes += size; chunk.push(item); index++
           }
-          await this.appendToFile(first.filePath, content, first.scope, [...new Set(chunk.map(item => item.filePath))])
+          const dependencies = chunk.flatMap(item => item.artifacts ?? [])
+          const names = new Map<string, string>()
+          for (const dependency of dependencies) for (const artifact of dependency.artifacts) {
+            const name = JSON.stringify([dependency.sessionDirectory, artifact.relativePath])
+            const identity = JSON.stringify([artifact.nativeSessionId, artifact.sha256, artifact.sizeBytes])
+            if (names.has(name) && names.get(name) !== identity) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ARTIFACT_CONFLICT')
+            names.set(name, identity)
+          }
+          await this.appendToFile(first.filePath, content, first.scope, [...new Set(chunk.map(item => item.filePath))], dependencies)
           for (const item of chunk) item.resolve()
         }
       } catch (error) {
@@ -1179,6 +1215,7 @@ class Project {
     startingParentUuid?: UUID | null,
     teamInfo?: { teamName?: string; agentName?: string },
     preserveMessageTimestamp = false,
+    artifactDependencies?: TranscriptArtifactDependencies,
   ) {
     return this.trackWrite(async () => {
       let parentUuid: UUID | null = startingParentUuid ?? null
@@ -1248,7 +1285,7 @@ class Project {
           gitBranch,
           slug,
         }
-        await this.appendEntry(transcriptMessage)
+        await this.appendEntry(transcriptMessage, undefined, artifactDependencies?.get(message.uuid))
         if (isChainParticipant(message)) {
           parentUuid = message.uuid
         }
@@ -1315,7 +1352,8 @@ class Project {
     })
   }
 
-  async appendEntry(entry: Entry, sessionId: UUID = getSessionId() as UUID) {
+  async appendEntry(entry: Entry, sessionId: UUID = getSessionId() as UUID, artifacts?: SessionArtifactDependencies) {
+    if (artifacts?.length && (!managedTranscriptIo() || this.shouldSkipPersistence())) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_INTEGRITY_REQUIRED')
     if (this.shouldSkipPersistence()) {
       return
     }
@@ -1327,6 +1365,7 @@ class Project {
     if (isCurrentSession) {
       // Buffer until materializeSessionFile runs (first user/assistant message).
       if (this.sessionFile === null) {
+        if (artifacts?.length) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_ARTIFACT_UNMATERIALIZED')
         this.pendingEntries.push(entry)
         return
       }
@@ -1394,7 +1433,7 @@ class Project {
       const targetFile = entry.agentId
         ? getAgentTranscriptPath(entry.agentId)
         : sessionFile
-      await this.admitWrite(targetFile, entry)
+      await this.admitWrite(targetFile, entry, artifacts)
     } else if (entry.type === 'marble-origami-commit') {
       // Always append. Commit order matters for restore (later commits may
       // reference earlier commits' summary messages), so these must be
@@ -1436,7 +1475,7 @@ class Project {
         const isNewUuid = !messageSet.has(entry.uuid)
         if (isAgentSidechain || isNewUuid) {
           // Enqueue write — appendToFile handles ENOENT by creating directories
-          await this.admitWrite(targetFile, entry)
+          await this.admitWrite(targetFile, entry, artifacts)
 
           if (!isAgentSidechain) {
             // messageSet is main-file-authoritative. Sidechain entries go to a
@@ -1653,12 +1692,14 @@ function trackTranscriptProducer<T>(produce: () => Promise<T>): Promise<T> {
 export function recordTranscript(
   messages: Message[], teamInfo?: TeamInfo, startingParentUuidHint?: UUID,
   allMessages?: readonly Message[], preserveMessageTimestamp = false,
+  artifactDependencies?: TranscriptArtifactDependencies,
 ): Promise<UUID | null> {
   // Freeze membership at admission, retaining object references for the
   // existing lazy usage/stop_reason updates while streaming.
   const slice = messages.slice()
   const allSlice = allMessages?.slice()
-  return trackTranscriptProducer(() => recordTranscriptImpl(slice, teamInfo, startingParentUuidHint, allSlice, preserveMessageTimestamp))
+  const artifacts = snapshotTranscriptArtifacts(slice, artifactDependencies)
+  return trackTranscriptProducer(() => recordTranscriptImpl(slice, teamInfo, startingParentUuidHint, allSlice, preserveMessageTimestamp, artifacts))
 }
 
 async function recordTranscriptImpl(
@@ -1667,6 +1708,7 @@ async function recordTranscriptImpl(
   startingParentUuidHint?: UUID,
   allMessages?: readonly Message[],
   preserveMessageTimestamp = false,
+  artifactDependencies?: TranscriptArtifactDependencies,
 ): Promise<UUID | null> {
   const cleanedMessages = cleanMessagesForLogging(messages, allMessages)
   const sessionId = getSessionId() as UUID
@@ -1686,6 +1728,7 @@ async function recordTranscriptImpl(
       seenNewMessage = true
     }
   }
+  assertArtifactMessagesWillWrite(newMessages, artifactDependencies)
   if (newMessages.length > 0) {
     await getProject().insertMessageChain(
       newMessages,
@@ -1694,6 +1737,7 @@ async function recordTranscriptImpl(
       startingParentUuid,
       teamInfo,
       preserveMessageTimestamp,
+      artifactDependencies,
     )
   }
   // Return the last ACTUALLY recorded chain-participant's UUID, OR the
@@ -1707,20 +1751,27 @@ async function recordTranscriptImpl(
 }
 
 export function recordSidechainTranscript(...args: Parameters<typeof recordSidechainTranscriptImpl>): Promise<void> {
-  const [messages, agentId, startingParentUuid] = args
+  const [messages, agentId, startingParentUuid, artifactDependencies] = args
   const slice = messages.slice()
-  return trackTranscriptProducer(() => recordSidechainTranscriptImpl(slice, agentId, startingParentUuid))
+  const artifacts = snapshotTranscriptArtifacts(slice, artifactDependencies)
+  return trackTranscriptProducer(() => recordSidechainTranscriptImpl(slice, agentId, startingParentUuid, artifacts))
 }
 async function recordSidechainTranscriptImpl(
   messages: Message[],
   agentId?: string,
   startingParentUuid?: UUID | null,
+  artifactDependencies?: TranscriptArtifactDependencies,
 ) {
+  const cleaned = cleanMessagesForLogging(messages)
+  assertArtifactMessagesWillWrite(cleaned, artifactDependencies)
   await getProject().insertMessageChain(
-    cleanMessagesForLogging(messages),
+    cleaned,
     true,
     agentId,
     startingParentUuid,
+    undefined,
+    false,
+    artifactDependencies,
   )
 }
 
@@ -2845,9 +2896,12 @@ export async function fetchLogs(limit?: number): Promise<LogOption[]> {
 export function appendEntryToFile(
   fullPath: string,
   entry: Record<string, unknown>,
+  dependencies?: SessionArtifactDependencies,
 ): void | Promise<void> {
+  const artifacts = snapshotArtifactDependencies(dependencies)
+  if (artifacts?.length && !managedTranscriptIo()) throw new SessionFileIntegrityError('CCB_TRANSCRIPT_INTEGRITY_REQUIRED')
   if (managedTranscriptIo()) {
-    const write = getProject().appendExternalEntry(fullPath, entry)
+    const write = getProject().appendExternalEntry(fullPath, entry, artifacts)
     void write.catch(() => {}) // flush/producer already records and reports this failure.
     return write
   }

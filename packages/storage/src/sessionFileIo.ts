@@ -40,6 +40,44 @@ interface Lease {
   pending: Promise<void> | null
   failure?: unknown
 }
+/** An opaque, process-local capability. It is valid only inside its actual
+ * withSessionFile mutation; a JSON claim or user-provided assert is insufficient. */
+export interface SessionFileLeaseCapability { readonly sessionFileLease: unique symbol }
+export interface SessionFileLeaseIdentity {
+  readonly projectsDir: string
+  readonly sessionId: string
+  readonly filePath: string
+  readonly stagingDirectory: string
+}
+const leaseCapabilities = new WeakMap<object, { lease: Lease; key: string; identity: SessionFileLeaseIdentity }>()
+export function assertSessionFileLease(capability: SessionFileLeaseCapability): SessionFileLeaseIdentity {
+  const value = capability && typeof capability === 'object' ? leaseCapabilities.get(capability) : undefined
+  check(value && value.lease.active && owned.getStore()?.get(value.key) === value.lease, 'CCB_TRANSCRIPT_LEASE_INVALID')
+  if (value!.lease.failure) throw value!.lease.failure
+  return value!.identity
+}
+/** Checks a trusted cwd alias against the inode already locked by this lease. */
+export async function assertSessionFileAlias(capability: SessionFileLeaseCapability, path: string): Promise<void> {
+  const identity = assertSessionFileLease(capability)
+  const rel = relative(identity.projectsDir, path)
+  check(path === resolve(path) && rel && !rel.startsWith('..') && !isAbsolute(rel), 'CCB_TRANSCRIPT_PATH_INVALID')
+  let parent = identity.projectsDir
+  for (const part of rel.split('/').slice(0, -1)) {
+    parent = join(parent, part)
+    const stat = await lstat(parent)
+    check(stat.isDirectory() && !stat.isSymbolicLink(), 'CCB_TRANSCRIPT_PATH_INVALID')
+  }
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    const stat = await file.stat()
+    const named = await lstat(path)
+    assertSessionFileLease(capability)
+    const lease = leaseCapabilities.get(capability)!.lease
+    check(stat.isFile() && stat.dev === lease.dev && stat.ino === lease.ino && stat.nlink > 0 && !named.isSymbolicLink() && named.dev === stat.dev && named.ino === stat.ino, 'CCB_TRANSCRIPT_ALIAS_DIVERGED')
+  } finally { await file.close() }
+}
+export type SessionFileDependency = (capability: SessionFileLeaseCapability) => Promise<void>
+export type SessionFilePatch = (offset: number, target: Buffer, beforePatch?: SessionFileDependency) => Promise<void>
 interface Intent {
   schema: 1
   dev: number
@@ -217,7 +255,8 @@ function useLeaseMutation(lease: Lease, apply: () => Promise<void>): Promise<voi
     void rejected.catch(() => {})
     return rejected
   }
-  const pending = apply()
+  // Register ownership before invoking a dependency that can synchronously reenter.
+  const pending = Promise.resolve().then(apply)
   lease.pending = pending
   const clear = () => { if (lease.pending === pending) lease.pending = null }
   void pending.then(clear, error => { lease.failure ??= error; clear() })
@@ -256,7 +295,8 @@ async function checkedPath(filePath: string, scope: SessionFileScope): Promise<{
   check(/^[A-Za-z0-9_.-]{1,160}$/.test(artifact), 'CCB_TRANSCRIPT_SCOPE_INVALID')
   return { path: join(parent, parts[parts.length - 1]!), root, key: sha(`${root}\n${scope.sessionId}\n${artifact}`) }
 }
-export async function withSessionFile<T>(filePath: string, scope: SessionFileScope, create: boolean, use: (file: SessionReadHandle, patch: (offset: number, target: Buffer) => Promise<void>, receipt: (value: SessionFileRestoreReceipt) => Promise<void>) => Promise<T>): Promise<T> {
+export async function withSessionFile<T>(filePath: string, scope: SessionFileScope, create: boolean, use: (file: SessionReadHandle, patch: SessionFilePatch, receipt: (value: SessionFileRestoreReceipt) => Promise<void>) => Promise<T>): Promise<T> {
+  scope = { ...scope }
   // Register admission synchronously: awaiting path IO before queuing can
   // let a later metadata/boundary operation overtake an earlier append.
   const rootHint = resolve(scope.projectsDir)
@@ -305,8 +345,15 @@ export async function withSessionFile<T>(filePath: string, scope: SessionFileSco
       lease.active = true
       const activeLease = lease
       const context = new Map<string, Lease>([[queueKey, activeLease]])
+      const capability = Object.freeze({}) as SessionFileLeaseCapability
+      leaseCapabilities.set(capability, { lease: activeLease, key: queueKey,
+        identity: Object.freeze({ projectsDir: p.root, sessionId: scope.sessionId,
+          filePath: p.path, stagingDirectory: join(dir, 'artifact-staging') }) })
       const result = await owned.run(context, () => use(file!,
-        (offset, target) => useLeaseMutation(activeLease, () => patchTail(activeLease, offset, target)),
+        (offset, target, beforePatch) => useLeaseMutation(activeLease, async () => {
+          if (beforePatch) { await beforePatch(capability); assertSessionFileLease(capability) }
+          await patchTail(activeLease, offset, target)
+        }),
         value => useLeaseMutation(activeLease, () => saveRestoreReceipt(activeLease, value))))
       if (activeLease.pending) await activeLease.pending
       if (activeLease.failure) throw activeLease.failure

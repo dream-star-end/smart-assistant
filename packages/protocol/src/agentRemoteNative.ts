@@ -10,6 +10,7 @@ import {
   requireRemote,
   validateRemote,
 } from './agentRemote.js'
+import { nativeToolArtifactPathAllowed } from './agentRemoteState.js'
 const closed = { additionalProperties: false }
 const id = Type.String({ minLength: 1, maxLength: 160, pattern: '^[A-Za-z0-9_.:-]+$' })
 const integer = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })
@@ -36,7 +37,13 @@ export const NativeScopeSchema = Type.Object(
 )
 export type NativeScope = Static<typeof NativeScopeSchema>
 export const NativeToolUseSchema = Type.Object(
-  { id, name: Type.String({ minLength: 1, maxLength: 256 }), input: object },
+  {
+    // Provider IDs include opaque Google replay signatures; only the complete
+    // frame budget bounds their size. Never hash or truncate replay identity.
+    id: Type.String({ minLength: 1, maxLength: NATIVE_FRAME_MAX_BYTES }),
+    name: Type.String({ minLength: 1, maxLength: 256 }),
+    input: object,
+  },
   closed,
 )
 export const NativeTaskRefSchema = Type.Object(
@@ -590,15 +597,7 @@ export function verifyNativeBodySemantics(
       requireRemote(artifact.nativeSessionId === scope.nativeSessionId, 'native-artifact-session')
       requireRemote(!names.has(artifact.relativePath), 'native-artifact-duplicate')
       names.add(artifact.relativePath)
-      requireRemote(
-        !artifact.relativePath.includes('\\') &&
-          !artifact.relativePath.includes('\0') &&
-          artifact.relativePath.startsWith('tool-results/') &&
-          !artifact.relativePath
-            .split('/')
-            .some((part) => !part || part === '.' || part === '..' || part.startsWith('.')),
-        'native-artifact-path',
-      )
+      requireRemote(nativeToolArtifactPathAllowed(artifact.relativePath), 'native-artifact-path')
     }
   }
 }
