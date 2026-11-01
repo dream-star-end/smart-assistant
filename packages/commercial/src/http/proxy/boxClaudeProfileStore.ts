@@ -23,6 +23,9 @@ export interface BoxProfileRow {
   cooldownUntil: Date | null;
   lastReason: string | null;
   healthUpdatedAt: Date | null;
+  /** Weekly window from migration 0309. Absent when that migration has not run. */
+  quota7d?: number | null;
+  quota7dResetsAt?: Date | null;
 }
 
 export interface BoxDiscoveredProfile {
@@ -42,14 +45,16 @@ interface RawRow { account_id: string; profile: string; enabled: boolean; is_def
   login_state: BoxProfileLoginState; projects_mode: BoxProfileProjectsMode;
   email_hint: string | null; account_fingerprint: string | null; org_type: string | null;
   last_seen_at: Date | null; utilization: number | null; cooldown_until: Date | null;
-  last_reason: string | null; health_updated_at: Date | null }
+  last_reason: string | null; health_updated_at: Date | null;
+  quota_7d?: number | null; quota_7d_resets_at?: Date | null }
 
 function map(row: RawRow): BoxProfileRow {
   return { accountId: BigInt(row.account_id), profile: row.profile, enabled: row.enabled,
     isDefault: row.is_default, loginState: row.login_state, projectsMode: row.projects_mode,
     emailHint: row.email_hint, accountFingerprint: row.account_fingerprint, orgType: row.org_type,
     lastSeenAt: row.last_seen_at, utilization: row.utilization, cooldownUntil: row.cooldown_until,
-    lastReason: row.last_reason, healthUpdatedAt: row.health_updated_at };
+    lastReason: row.last_reason, healthUpdatedAt: row.health_updated_at,
+    ...("quota_7d" in row ? { quota7d: row.quota_7d ?? null, quota7dResetsAt: row.quota_7d_resets_at ?? null } : {}) };
 }
 
 function missingTable(error: unknown): boolean {
@@ -62,18 +67,33 @@ export async function boxProfilesAvailable(): Promise<boolean> {
   return r.rows[0]?.t !== null && r.rows[0]?.t !== undefined;
 }
 
-export async function listBoxProfiles(accountIds?: readonly bigint[]): Promise<BoxProfileRow[]> {
+function missingColumn(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === "42703";
+}
+
+async function selectBoxProfiles(where: string, params: unknown[]): Promise<BoxProfileRow[]> {
+  const order = "ORDER BY account_id, profile";
+  const weekly = ", quota_7d::float8 AS quota_7d, quota_7d_resets_at";
   try {
-    const result = accountIds === undefined
-      ? await query<RawRow>(`SELECT ${COLUMNS} FROM box_claude_profiles ORDER BY account_id, profile`)
-      : await query<RawRow>(`SELECT ${COLUMNS} FROM box_claude_profiles
-          WHERE account_id = ANY($1::bigint[]) ORDER BY account_id, profile`,
-        [accountIds.map((id) => id.toString())]);
+    const result = await query<RawRow>(`SELECT ${COLUMNS}${weekly} FROM box_claude_profiles ${where} ${order}`, params);
+    return result.rows.map(map);
+  } catch (error) {
+    if (missingTable(error)) return [];
+    if (!missingColumn(error)) throw error;
+  }
+  // Personal databases that predate migration 0309 have no weekly columns.
+  try {
+    const result = await query<RawRow>(`SELECT ${COLUMNS} FROM box_claude_profiles ${where} ${order}`, params);
     return result.rows.map(map);
   } catch (error) {
     if (missingTable(error)) return [];
     throw error;
   }
+}
+
+export async function listBoxProfiles(accountIds?: readonly bigint[]): Promise<BoxProfileRow[]> {
+  if (accountIds === undefined) return selectBoxProfiles("", []);
+  return selectBoxProfiles("WHERE account_id = ANY($1::bigint[])", [accountIds.map((id) => id.toString())]);
 }
 
 /** Merge a discovery pass into the table. New logins arrive disabled, except

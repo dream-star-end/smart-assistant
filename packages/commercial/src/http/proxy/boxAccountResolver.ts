@@ -271,8 +271,9 @@ export class BoxAccountResolver {
     const last = this.chatLogins.get(`${uid}:${stickyKey}`);
     if (!profiles || !last || last.expires <= (this.deps.now ?? Date.now)()) return false;
     const rows = await profiles.list([last.accountId], "all");
+    const nowMs = (this.deps.now ?? Date.now)();
     const candidate = boxLoginCandidates({ accountId: last.accountId, weight: 1,
-      own: rows.filter((item) => item.accountId === last.accountId), health: profiles.health })
+      own: rows.filter((item) => item.accountId === last.accountId), health: profiles.health, nowMs })
       .find((c) => c.profile === last.profile);
     // Switched off, logged out or deselected: it cannot take the chat either.
     if (!candidate) return true;
@@ -314,7 +315,7 @@ export class BoxAccountResolver {
     const candidates: BoxProfileCandidate[] = [];
     for (const { row, weight } of selectable) {
       candidates.push(...boxLoginCandidates({ accountId: row.id, weight,
-        own: stored.filter((item) => item.accountId === row.id), health: profiles.health, skip }));
+        own: stored.filter((item) => item.accountId === row.id), health: profiles.health, skip, nowMs }));
     }
     for (const candidate of candidates) {
       candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)

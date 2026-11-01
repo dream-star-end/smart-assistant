@@ -391,3 +391,40 @@ test("a no-launch target (tool results for a live run) schedules no login and re
   assert.equal(typeof read.stdout, "string");
   await target.dispose?.();
 });
+
+test("a weekly-exhausted login is never chosen while another login can run", async () => {
+  const reset = new Date(now + 7 * 86_400_000);
+  const f = fixture([20n], [
+    stored(20n, "cc3", { quota7d: 1, quota7dResetsAt: reset, healthUpdatedAt: new Date(now) }),
+    stored(20n, "cc4", { healthUpdatedAt: new Date(now) }),
+  ]);
+  for (const uid of uids.slice(0, 8)) {
+    assert.equal((await f.launch(uid, { loginScope: "all" })).profile, "cc4");
+  }
+});
+
+test("a running chat leaves its login once that login's weekly quota is exhausted", async () => {
+  const f = fixture([20n], [
+    stored(20n, "cc3", { healthUpdatedAt: new Date(now) }),
+    stored(20n, "cc4", { healthUpdatedAt: new Date(now) }),
+  ]);
+  const first = await f.launch(7n, { loginScope: "all", stickyKey: "chat-week" });
+  assert.ok(first.profile === "cc3" || first.profile === "cc4");
+  const chosen = first.profile;
+  const other = chosen === "cc3" ? "cc4" : "cc3";
+  f.setRows([
+    stored(20n, chosen, { quota7d: 1, quota7dResetsAt: new Date(now + 7 * 86_400_000), healthUpdatedAt: new Date(now) }),
+    stored(20n, other, { healthUpdatedAt: new Date(now) }),
+  ]);
+  assert.equal((await f.launch(7n, { loginScope: "all", stickyKey: "chat-week" })).profile, other);
+});
+
+test("when every login is only weekly-exhausted the request still reaches one", async () => {
+  const reset = new Date(now + 7 * 86_400_000);
+  const f = fixture([20n], [
+    stored(20n, "cc3", { quota7d: 1, quota7dResetsAt: reset, healthUpdatedAt: new Date(now) }),
+    stored(20n, "cc4", { quota7d: 1, quota7dResetsAt: reset, healthUpdatedAt: new Date(now) }),
+  ]);
+  const out = await f.launch(7n, { loginScope: "all" });
+  assert.ok(out.profile === "cc3" || out.profile === "cc4");
+});
