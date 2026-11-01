@@ -28,7 +28,7 @@ export function startStudioOrchestrator(input: {
   /** OCV5-591 A2-1c-2: deliver a frame to this slot's connections of a user (userChatBridge). */
   push?: (userId: bigint, frame: unknown) => void
   /** OCV5-591 A2-1b-1: worst-case credits of one user-billed Grok call (catalog price). */
-  grokMaxCost?: () => Promise<bigint | null>
+  grokMaxCost?: (model?: string) => Promise<bigint | null>
   /** Settle a stored Grok answer again after a crash between answer and settle (idempotent). */
   grokResettle?: ExecuteDeps['grokResettle']
 }): { stop: () => Promise<void> } | undefined {

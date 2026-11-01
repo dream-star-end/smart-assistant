@@ -2568,7 +2568,7 @@ export async function registerCommercial(
             recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
           }),
           // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
-          grokMaxCost: () => grokRunMaxCost(studioGrokCatalog),
+          grokMaxCost: (model) => grokRunMaxCost(studioGrokCatalog, model),
           // A stored QA answer whose settle may not have happened is settled again (idempotent).
           grokResettle: (i) =>
             resettleGrokRun(

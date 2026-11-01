@@ -310,3 +310,23 @@ describe('makeGrokRunner (OCV5-591 A0)', () => {
     assert.equal(frames[0].status, 'success')
   })
 })
+
+describe('director model selection', () => {
+  it('refuses an unknown model before calling upstream', async () => {
+    const h = harness()
+    await assert.rejects(
+      () => h.run({ userId: 7n, containerId: null, requestId: 'director-model', prompt: 'plan', model: 'not-a-model' }),
+      (err: unknown) => err instanceof GrokRunError && err.code === 'GROK_VISION_MODEL_UNAVAILABLE',
+    )
+    assert.deepEqual(h.events, [])
+  })
+
+  it('refuses a model id with illegal characters', async () => {
+    const h = harness()
+    await assert.rejects(
+      () => h.run({ userId: 7n, containerId: null, requestId: 'director-bad', prompt: 'plan', model: 'bad model' }),
+      (err: unknown) => err instanceof GrokRunError && err.code === 'BAD_BODY',
+    )
+    assert.deepEqual(h.events, [])
+  })
+})

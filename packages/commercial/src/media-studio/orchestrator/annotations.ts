@@ -9,6 +9,7 @@ import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import type { AdvanceDeps } from './advance.js'
 import { executeAnnotation } from './annotate.js'
+import { reserveDirectorStep } from './directorBudget.js'
 
 export const MAX_ANNOTATIONS_PER_PROJECT = 500
 /** Interpret calls a project runs at once (plan §2.3); more wait their turn. */
@@ -210,13 +211,27 @@ export function makeAnnotationApi(
           `SELECT COUNT(*)::text AS n FROM studio_tasks WHERE project_id = $1 AND kind = 'interpret' AND status IN ('queued','leased')`,
           [a.project_id],
         )
-        await enqueueStudioTask(c, {
+        const held = await reserveDirectorStep(c, deps?.qa, a.project_id)
+        if (held === 'unpriced') {
+          throw new HttpError(503, 'DIRECTOR_UNPRICED', '导演模型暂时没法估价，稍后再发送这条批注。')
+        }
+        if (held === 'budget') {
+          throw new HttpError(409, 'STUDIO_BUDGET_EXCEEDED', '预算不够让导演看这条批注。调高预算后再发。')
+        }
+        const enq = await enqueueStudioTask(c, {
           projectId: a.project_id,
           kind: 'interpret',
           idempotencyKey: `interpret:${id}:${sent.rows[0].n}`,
-          payload: { annotationId: id },
+          payload: { annotationId: id, booked: '0' },
+          reservedCredits: held.est,
           runAfterSeconds: Number(inflight.rows[0]!.n) >= MAX_INTERPRET_INFLIGHT ? 15 : 0,
         })
+        if (!enq.created) {
+          await c.query(
+            'UPDATE studio_projects SET reserved_credits = GREATEST(0, reserved_credits - $2) WHERE id = $1',
+            [a.project_id, held.est.toString()],
+          )
+        }
         await appendStudioEvent(c, a.project_id, 'annotation.sent', {
           annotationId: id,
           message: '批注已交给导演 agent。',

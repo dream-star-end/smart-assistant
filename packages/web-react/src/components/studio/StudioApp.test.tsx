@@ -9,6 +9,9 @@ vi.mock('../../lib/api', () => ({
   bearerHeaders: () => ({ Authorization: 'Bearer token' }),
   assertAuthResponseCurrent: () => {},
   AuthEpochStaleError: class AuthEpochStaleError extends Error {},
+  api: {
+    getPublicModels: async () => ({ models: [], lockedModels: [] }),
+  },
 }))
 
 import { __resetStudioProbeCache } from '../../hooks/useStudioProviders'

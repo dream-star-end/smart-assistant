@@ -16,10 +16,13 @@ import {
   buildQaPrompt,
   contactSheet,
   criteriaFor,
+  bibleShotConflict,
   judgeQa,
   parseQa,
+  qaAttemptsFor,
   qaConfigFromEnv,
   qaGates,
+  qaReasonText,
 } from '../media-studio/orchestrator/qa.js'
 
 const verdict = (over: Partial<QaVerdict> = {}): QaVerdict => ({
@@ -351,5 +354,48 @@ describe('decide with QA (A2-1b-1)', () => {
     assert.deepEqual(kinds({ ...one, takes: [b('b1', 1, judged(false, 'handoff'))] }), [
       'project:awaiting_user',
     ])
+  })
+})
+
+describe('QA conflicts and autonomy caps', () => {
+  it('a dark bible against a bright shot is handed to the user before any redo', () => {
+    const msg = bibleShotConflict(
+      [{ descriptor: '深色背景，冷调' }],
+      { framing: '浅灰墙面', action: '窗边晨光里转身' },
+    )
+    assert.equal(typeof msg, 'string')
+    assert.match(msg!, /矛盾/)
+    assert.equal(
+      bibleShotConflict([{ descriptor: '深色背景' }], { framing: '夜景街道', action: '昏暗' }),
+      null,
+    )
+    assert.equal(bibleShotConflict([{ descriptor: '深色背景也有晨光' }], { action: '窗边' }), null)
+    assert.equal(bibleShotConflict([{ descriptor: '' }], { action: '晨光' }), null)
+    assert.equal(
+      bibleShotConflict([{ kind: 'character', descriptor: '深色西装的男子' }], { action: '窗边晨光' }),
+      null,
+    )
+    const kept = bibleShotConflict(
+      [
+        { kind: 'character', descriptor: '浅色衬衫' },
+        { kind: 'style', descriptor: '深色背景，冷调' },
+      ],
+      { framing: '浅灰墙面', action: '窗边晨光里转身' },
+    )
+    assert.equal(typeof kept, 'string')
+    assert.match(kept!, /矛盾/)
+  })
+
+  it('attempt caps default to 3 and follow the autonomy env', () => {
+    assert.equal(qaAttemptsFor('max', {}), 3)
+    assert.equal(qaAttemptsFor('confirm', {}), 3)
+    assert.equal(qaAttemptsFor('max', { OC_STUDIO_QA_ATTEMPTS_MAX: '5' }), 5)
+    assert.equal(qaAttemptsFor('confirm', { OC_STUDIO_QA_ATTEMPTS_CONFIRM: '1' }), 1)
+    assert.equal(qaAttemptsFor('max', { OC_STUDIO_QA_ATTEMPTS: '4' }), 4)
+    assert.equal(qaAttemptsFor('confirm', { OC_STUDIO_QA_ATTEMPTS_CONFIRM: '0' }), 3)
+    assert.equal(qaReasonText('retries_exhausted', 3), '自动重做了 2 次仍未通过')
+    assert.equal(qaReasonText('retries_exhausted', 5), '自动重做了 4 次仍未通过')
+    const none = { attempts: 0, bestScore: null }
+    assert.equal(judgeQa(verdict({ character: 0.5 }), ['character', 'scene', 'artifacts'], none, 1).reason, 'retries_exhausted')
   })
 })

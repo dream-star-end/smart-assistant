@@ -66,6 +66,8 @@ export interface ProjectPatch {
   targetSec?: number
   budgetCredits?: number
   autonomy?: string
+  /** null clears the choice; absent leaves it. Empty string is treated as clear. */
+  directorModel?: string | null
 }
 
 function validatePatch(input: Record<string, unknown>): ProjectPatch {
@@ -104,6 +106,15 @@ function validatePatch(input: Record<string, unknown>): ProjectPatch {
   if (input.autonomy !== undefined) {
     if (input.autonomy !== 'max' && input.autonomy !== 'confirm') throw bad('autonomy')
     out.autonomy = input.autonomy
+  }
+  if (input.directorModel !== undefined) {
+    if (input.directorModel === null || input.directorModel === '') out.directorModel = null
+    else if (
+      typeof input.directorModel !== 'string' ||
+      !/^[A-Za-z0-9._:-]{1,64}$/.test(input.directorModel)
+    )
+      throw bad('directorModel')
+    else out.directorModel = input.directorModel
   }
   return out
 }
@@ -192,8 +203,9 @@ export class StudioStore {
         throw new HttpError(409, 'STUDIO_PROJECT_LIMIT', 'too many studio projects')
       const id = randomUUID()
       const row = await client.query<ProjectRow>(
-        `INSERT INTO studio_projects(id, user_id, title, brief, aspect, target_sec, budget_credits, autonomy)
-         VALUES ($1, $2, $3, $4, COALESCE($5, '16:9'), COALESCE($6, 30), COALESCE($7, 2000), COALESCE($8, 'max'))
+        `INSERT INTO studio_projects(id, user_id, title, brief, aspect, target_sec, budget_credits, autonomy, settings)
+         VALUES ($1, $2, $3, $4, COALESCE($5, '16:9'), COALESCE($6, 30), COALESCE($7, 2000), COALESCE($8, 'max'),
+                 CASE WHEN $9::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('directorModel', $9::text) END)
          RETURNING ${PROJECT_COLUMNS}`,
         [
           id,
@@ -204,6 +216,7 @@ export class StudioStore {
           patch.targetSec ?? null,
           patch.budgetCredits ?? null,
           patch.autonomy ?? null,
+          patch.directorModel ?? null,
         ],
       )
       await appendStudioEvent(client, id, 'project.created')
@@ -363,7 +376,13 @@ export class StudioStore {
         `UPDATE studio_projects SET
            title=COALESCE($3, title), brief=COALESCE($4, brief), aspect=COALESCE($5, aspect),
            target_sec=COALESCE($6, target_sec), budget_credits=COALESCE($7, budget_credits),
-           autonomy=COALESCE($8, autonomy), rev=rev+1, updated_at=NOW()
+           autonomy=COALESCE($8, autonomy),
+           settings = CASE
+             WHEN $9::boolean IS NOT TRUE THEN settings
+             WHEN $10::text IS NULL THEN settings - 'directorModel'
+             ELSE settings || jsonb_build_object('directorModel', $10::text)
+           END,
+           rev=rev+1, updated_at=NOW()
          WHERE id=$1 AND user_id=$2 RETURNING ${PROJECT_COLUMNS}`,
         [
           id,
@@ -374,6 +393,8 @@ export class StudioStore {
           patch.targetSec ?? null,
           patch.budgetCredits ?? null,
           patch.autonomy ?? null,
+          patch.directorModel !== undefined,
+          patch.directorModel ?? null,
         ],
       )
       await appendStudioEvent(client, id, 'project.updated', { fields: Object.keys(patch) })

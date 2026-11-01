@@ -317,13 +317,25 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       const [task] = await claimStudioTasks(getPool(), { owner: 'planner', limit: 1, museOnline: false })
       assert.ok(task)
       let calls = 0
-      const billing = async () => { throw new Error('platform planner touched user billing') }
+      let settled = 0
       d.grok = makeGrokRunner({
         getPool, preCheckRedis: new InMemoryPreCheckRedis(), pricing: new PricingCache(),
         catalog: { assertFresh: async () => grokVisionSnapshot() }, loadUserModelAuthz: async () => PUBLIC_VISION_AUTHZ,
         pickAccountId: async () => 24n, freshToken: async () => Buffer.from('test-token'), recordStatus: async () => {},
-        preCheckWithCostFn: billing, startInflightJournalFn: billing, settleDurableCodexBillingFn: billing,
-        abortInflightJournalFn: billing, releasePreCheckFn: billing,
+        preCheckWithCostFn: (async (_r: unknown, input: { maxCost: bigint; userId: bigint; requestId: string }) => ({
+          maxCost: input.maxCost,
+          balance: 1000n,
+          capped: false,
+          originalMaxCost: input.maxCost,
+          reservation: { userId: String(input.userId), requestId: input.requestId },
+        })) as never,
+        startInflightJournalFn: (async () => true) as never,
+        settleDurableCodexBillingFn: (async () => {
+          settled += 1
+          return 'committed'
+        }) as never,
+        abortInflightJournalFn: (async () => true) as never,
+        releasePreCheckFn: (async () => {}) as never,
         requestFn: async (_url, init) => {
           calls++
           const isPlan = JSON.parse(init.body).stream === true
@@ -351,6 +363,7 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       })
       await executeTask(d, task, signal())
       assert.equal(calls, 2, 'one moderation and one planning request, no extra fallback request')
+      assert.equal(settled, 1, 'planning is billed to the user once; brief moderation stays platform-paid')
       const shots = await query('SELECT ordinal, spec FROM studio_shots WHERE project_id=$1 ORDER BY ordinal', [project.id])
       const assets = await query('SELECT kind, name, descriptor FROM studio_assets WHERE project_id=$1', [project.id])
       finalized.push({ shots: shots.rows, assets: assets.rows })
@@ -991,5 +1004,43 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
       [p.id],
     )
     assert.equal(ev.rows[0]!.n, '1')
+  })
+
+  test('a planning step that does not fit the budget resumes back to planning', async (t) => {
+    if (skip(t)) return
+    const userId = await user()
+    const project = await new StudioStore(getPool()).createProject(userId, {
+      brief: '红狐短片',
+      targetSec: 6,
+      budgetCredits: 10,
+    })
+    await query("UPDATE studio_projects SET status = 'planning' WHERE id = $1", [project.id])
+    const d = await deps(new FakeProvider('img', 'image'))
+    d.qa = { enabled: false, bibleCandidates: 1, maxCost: async () => 100n }
+    await advanceProject(d, project.id)
+    const paused = await query<{ status: string; resume: string | null; reason: string | null }>(
+      `SELECT status, settings->>'resumeTo' AS resume, settings->>'pausedReason' AS reason
+         FROM studio_projects WHERE id = $1`,
+      [project.id],
+    )
+    assert.deepEqual(paused.rows[0], { status: 'paused', resume: 'planning', reason: 'budget' })
+    const none = await query<{ n: string }>(
+      "SELECT COUNT(*)::text AS n FROM studio_tasks WHERE project_id = $1 AND kind = 'plan'",
+      [project.id],
+    )
+    assert.equal(none.rows[0]!.n, '0')
+    await query('UPDATE studio_projects SET budget_credits = 1000 WHERE id = $1', [project.id])
+    const resumed = await new StudioStore(getPool()).transition(userId, project.id, 'resume')
+    assert.equal(resumed.status, 'planning')
+    await advanceProject(d, project.id)
+    const plan = await query<{ status: string }>(
+      "SELECT status FROM studio_tasks WHERE project_id = $1 AND kind = 'plan'",
+      [project.id],
+    )
+    assert.deepEqual(
+      plan.rows.map((r) => r.status),
+      ['queued'],
+      '继续 returns to planning and the plan is queued',
+    )
   })
 })

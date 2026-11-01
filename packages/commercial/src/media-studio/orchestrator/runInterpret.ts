@@ -1,5 +1,6 @@
 // OCV5-591 A2-1b-2 — the interpret task (plan §2.2): the annotated frame (the box / point drawn on
-// it) and the project's shots, lines and system voices go to Grok (platform-paid); the answer is
+// it) and the project's shots, lines and system voices go to the director model the user
+// chose (default grok-build). The call is on the user's ledger at that model's price; the answer is
 // stored per request id before use, checked against the whitelist and this project, written onto
 // the annotation, and run straight away only for an autonomous project and a sure instruction.
 
@@ -21,6 +22,8 @@ import {
   buildInterpretPrompt,
   parseInterpretation,
 } from './interpret.js'
+import { bookDirectorCharge, resettleStored } from './directorCharge.js'
+import { directorModelOf } from './directorModel.js'
 import { withLease } from './lease.js'
 
 interface AnnotationRow {
@@ -188,7 +191,14 @@ async function context(
   }
 }
 
-export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise<void> {
+export async function runInterpret(
+  deps: ExecuteDeps,
+  task: StudioTask,
+  signal: AbortSignal,
+): Promise<void> {
+  // A lost lease aborts this signal. Leave the in-flight call unsettled so the
+  // next claim is the only one that bills.
+  signal.throwIfAborted()
   const annotationId = (task.payload as { annotationId?: unknown }).annotationId
   if (typeof annotationId !== 'string')
     throw new MediaProviderError('INVALID_TASK', false, 'interpret task has no annotation')
@@ -201,14 +211,22 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     )
   ).rows[0]
   if (!a || a.status !== 'sent' || a.interpretation) {
-    await withLease(deps.pool, task, (c) =>
-      finishStudioTask(c, task, { status: 'done', error: 'nothing to interpret' }),
+    const owner = await deps.pool.query<{ user_id: string }>(
+      'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+      [task.projectId],
     )
+    const userId = owner.rows[0] ? BigInt(owner.rows[0].user_id) : null
+    signal.throwIfAborted()
+    await withLease(deps.pool, task, async (c) => {
+      signal.throwIfAborted()
+      await bookDirectorCharge(deps.pool, task, c, userId)
+      await finishStudioTask(c, task, { status: 'done', error: 'nothing to interpret' })
+    })
     return
   }
   const p = (
-    await deps.pool.query<{ user_id: string; autonomy: 'max' | 'confirm' }>(
-      'SELECT user_id::text AS user_id, autonomy FROM studio_projects WHERE id = $1',
+    await deps.pool.query<{ user_id: string; autonomy: 'max' | 'confirm'; settings: Record<string, unknown> }>(
+      'SELECT user_id::text AS user_id, autonomy, settings FROM studio_projects WHERE id = $1',
       [task.projectId],
     )
   ).rows[0]
@@ -230,12 +248,17 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     : null
   const ctx = await context(deps, a, take)
 
-  const stored = await deps.pool.query<{ output: { text?: string; frameSha?: string | null } }>(
+  const stored = await deps.pool.query<{
+    output: { text?: string; frameSha?: string | null; usage?: unknown; requestId?: string }
+  }>(
     'SELECT output FROM studio_step_results WHERE request_id = $1',
     [task.execRequestId],
   )
   let answer = typeof stored.rows[0]?.output?.text === 'string' ? stored.rows[0].output.text : null
   let frameSha = stored.rows[0]?.output?.frameSha ?? a.frame_blob_sha
+  if (answer !== null) {
+    await resettleStored(deps, userId, stored.rows[0]?.output, 'INTERPRET_BILLING')
+  }
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError(
@@ -256,19 +279,25 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
         })
       ).sha
     }
+    signal.throwIfAborted()
     const res = await deps.grok({
       userId,
       containerId: null,
       requestId: task.execRequestId,
       attempt: Math.max(0, task.attempts - 1),
       prompt: buildInterpretPrompt(ctx, !!marked),
+      model: directorModelOf(p.settings),
       ...(marked
         ? { image: { mediaType: 'image/jpeg' as const, data: marked.toString('base64') } }
         : {}),
-      // Interpret is the platform's (orchestrator plan §4): never on the user's ledger.
-      billTo: 'platform',
+      // The user chose this model: their permission is checked and their ledger pays its price.
+      billTo: 'user',
       rateKey: `studio-interpret:${p.user_id}`,
+      signal,
       onResult: async (r) => {
+        // Persist only while we still hold the lease. A throw here abandons
+        // the journal, so the call is not settled.
+        signal.throwIfAborted()
         await deps.pool.query(
           `INSERT INTO studio_step_results(request_id, user_id, task_id, output)
            VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (request_id) DO NOTHING`,
@@ -276,7 +305,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
             task.execRequestId,
             p.user_id,
             task.id,
-            JSON.stringify({ text: r.text, model: r.model, frameSha }),
+            JSON.stringify({ text: r.text, model: r.model, frameSha, usage: r.usage, requestId: r.requestId }),
           ],
         )
       },
@@ -284,13 +313,17 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     answer = res.text
   }
 
+  signal.throwIfAborted()
+
   let interpretation: Interpretation
   try {
     interpretation = parseInterpretation(answer, ctx)
   } catch (err) {
     if (!(err instanceof InterpretParseError)) throw err
     if (task.attempts < 2) {
+      signal.throwIfAborted()
       await withLease(deps.pool, task, async (c) => {
+        signal.throwIfAborted()
         await c.query('DELETE FROM studio_step_results WHERE request_id = $1', [task.execRequestId])
         await retryStudioTask(c, task, { delaySeconds: 2, error: err.message })
       })
@@ -303,7 +336,9 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       explanation: 'agent 没看懂这条批注，可以换个说法再发一次。',
     }
   }
+  signal.throwIfAborted()
   await withLease(deps.pool, task, async (c) => {
+    signal.throwIfAborted()
     const wrote = await c.query(
       `UPDATE studio_annotations SET interpretation = $2::jsonb, frame_blob_sha = COALESCE(frame_blob_sha, $3)
         WHERE id = $1 AND status = 'sent' AND interpretation IS NULL`,
@@ -320,6 +355,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       })
       if (autoApply(interpretation, p.autonomy)) await executeAnnotation(c, task.projectId, a.id)
     }
+    await bookDirectorCharge(deps.pool, task, c, userId)
     await finishStudioTask(c, task, { status: 'done' })
   })
 }
@@ -356,6 +392,11 @@ export async function failInterpret(
         })
       }
     }
+    const owner = await c.query<{ user_id: string }>(
+      'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+      [task.projectId],
+    )
+    await bookDirectorCharge(deps.pool, task, c, owner.rows[0] ? BigInt(owner.rows[0].user_id) : null)
     await finishStudioTask(c, task, { status: 'failed', error: `${e.code}: ${e.message}` })
   })
 }

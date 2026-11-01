@@ -14,6 +14,8 @@ import { MediaProviderError, type MediaRequest, type MediaResult } from '../prov
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { bookTaskCharge, overBudget } from './budget.js'
+import { bookDirectorCharge, resettleStored } from './directorCharge.js'
+import { directorModelOf } from './directorModel.js'
 import { type ComposeRunnerLike, composePayload, failCompose, runCompose } from './compose.js'
 import { LeaseLostError, withLease } from './lease.js'
 import { buildModerationPrompt, moderationOutcome, parseModeration } from './moderation.js'
@@ -64,8 +66,9 @@ async function projectOf(pool: Pool, projectId: string) {
     autonomy: 'max' | 'confirm'
     budget_credits: string
     title: string
+    settings: Record<string, unknown>
   }>(
-    `SELECT user_id::text AS user_id, brief, aspect, target_sec, autonomy, budget_credits::text AS budget_credits, title
+    `SELECT user_id::text AS user_id, brief, aspect, target_sec, autonomy, budget_credits::text AS budget_credits, title, settings
        FROM studio_projects WHERE id = $1`,
     [projectId],
   )
@@ -167,6 +170,7 @@ async function moderateBrief(
           ? `需求未通过内容审核${m.reason ? `：${m.reason}` : ''}，不能制作。`
           : `需求可能不合规${m.reason ? `（${m.reason}）` : ''}，请修改后再开始。`,
     })
+    await bookDirectorCharge(deps.pool, task, c, BigInt(p.user_id))
   })
   return false
 }
@@ -175,7 +179,10 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
   signal.throwIfAborted()
   const p = await projectOf(deps.pool, task.projectId)
   if (!p) {
-    await finishStudioTask(deps.pool, task, { status: 'canceled', error: 'project gone' })
+    await withLease(deps.pool, task, async (c) => {
+      await bookDirectorCharge(deps.pool, task, c, null)
+      await finishStudioTask(c, task, { status: 'canceled', error: 'project gone' })
+    })
     return
   }
   const user = { id: p.user_id }
@@ -205,11 +212,14 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
   if (!(await moderateBrief(deps, task, p, signal))) return
 
   // A stored answer (an earlier attempt got it, then lost its lease) is reused, never re-asked.
-  const stored = await deps.pool.query<{ output: { text?: string } }>(
+  const stored = await deps.pool.query<{ output: { text?: string; usage?: unknown; requestId?: string } }>(
     'SELECT output FROM studio_step_results WHERE request_id = $1',
     [task.execRequestId],
   )
   let answer = typeof stored.rows[0]?.output?.text === 'string' ? stored.rows[0].output.text : null
+  if (answer !== null) {
+    await resettleStored(deps, BigInt(p.user_id), stored.rows[0]?.output, 'PLAN_BILLING')
+  }
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError('PLANNER_UNAVAILABLE', false, 'planner is not configured')
@@ -220,7 +230,9 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
       requestId: task.execRequestId,
       attempt: Math.max(0, task.attempts - 1),
       prompt: buildPlanPrompt(input),
-      billTo: 'platform',
+      model: directorModelOf(p.settings),
+      // The user chose this model: their permission is checked and their ledger pays its price.
+      billTo: 'user',
       signal,
       onDelta: async (delta) => {
         signal.throwIfAborted()
@@ -245,7 +257,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
             task.execRequestId,
             p.user_id,
             task.id,
-            JSON.stringify({ text: r.text, model: r.model }),
+            JSON.stringify({ text: r.text, model: r.model, usage: r.usage, requestId: r.requestId }),
           ],
         )
       },
@@ -261,7 +273,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
     await withLease(deps.pool, task, async (c) => {
       await c.query('DELETE FROM studio_step_results WHERE request_id = $1', [task.execRequestId])
       if (task.attempts < 2) {
-        // One more try with a fresh answer (a new attempt id bills nothing: the planner is platform-paid).
+        // One more try with a fresh answer. The failed attempt stays on the ledger and is booked when the task ends.
         await retryStudioTask(c, task, {
           delaySeconds: 2,
           error: `plan invalid: ${err.issues.join('; ')}`.slice(0, 500),
@@ -277,6 +289,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
       await appendStudioEvent(c, task.projectId, 'plan.failed', {
         message: '分镜方案没写好，可以改一下需求再开拍。',
       })
+      await bookDirectorCharge(deps.pool, task, c, BigInt(p.user_id))
     })
     return
   }
@@ -289,6 +302,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
       [task.projectId],
     )
     if (status.rows[0]?.status !== 'planning') {
+      await bookDirectorCharge(deps.pool, task, c, BigInt(p.user_id))
       await finishStudioTask(c, task, { status: 'canceled', error: 'project left planning' })
       return
     }
@@ -357,6 +371,7 @@ async function runPlan(deps: ExecuteDeps, task: StudioTask, signal: AbortSignal)
       estimateCredits: estimate.toString(),
       message: `分镜方案写好了：${plan.shots.length} 个镜头，预估 ${estimate} 积分${next === 'running' ? '，开始生成' : fits ? '，等你确认' : '，超出预算，等你调整'}。`,
     })
+    await bookDirectorCharge(deps.pool, task, c, BigInt(p.user_id))
     await finishStudioTask(c, task, { status: 'done' })
   })
 }
@@ -733,6 +748,18 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
         const booked = BigInt(String((task.payload as { booked?: unknown }).booked ?? '0'))
         await bookTaskCharge(c, task, booked, { release: true })
       }
+      if (task.kind === 'plan' || task.kind === 'interpret') {
+        const owner = await c.query<{ user_id: string }>(
+          'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+          [task.projectId],
+        )
+        await bookDirectorCharge(
+          deps.pool,
+          task,
+          c,
+          owner.rows[0] ? BigInt(owner.rows[0].user_id) : null,
+        )
+      }
       await finishStudioTask(c, task, { status: 'canceled', error: 'project is no longer active' })
     })
     return false
@@ -823,6 +850,16 @@ async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promi
       await appendStudioEvent(c, task.projectId, 'plan.failed', {
         message: '导演 agent 这次没能写出分镜方案，可以改一下需求或稍后再开拍。',
       })
+      const owner = await c.query<{ user_id: string }>(
+        'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+        [task.projectId],
+      )
+      await bookDirectorCharge(
+        deps.pool,
+        task,
+        c,
+        owner.rows[0] ? BigInt(owner.rows[0].user_id) : null,
+      )
     }
   })
 }
@@ -841,7 +878,7 @@ export async function executeTask(
     if (task.kind === 'gen') return await runGen(deps, task, signal)
     if (task.kind === 'compose') return await runCompose(deps, task)
     if (task.kind === 'qa') return await runQa(deps, task)
-    if (task.kind === 'interpret') return await runInterpret(deps, task)
+    if (task.kind === 'interpret') return await runInterpret(deps, task, signal)
     throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
   } catch (err) {
     // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.

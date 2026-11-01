@@ -29,7 +29,7 @@ import type { ComposeResult } from '../media-studio/compose/runner.js'
 import type { ComposeOp } from '../media-studio/compose/spec.js'
 import { type AdvanceDeps, advanceProject } from '../media-studio/orchestrator/advance.js'
 import type { ComposeRunnerLike } from '../media-studio/orchestrator/compose.js'
-import { type ExecuteDeps, executeTask } from '../media-studio/orchestrator/execute.js'
+import { type ExecuteDeps, LeaseLostError, executeTask } from '../media-studio/orchestrator/execute.js'
 import { makeOrchestratorApi } from '../media-studio/orchestrator/service.js'
 import type { ProviderRegistry } from '../media-studio/providers/registry.js'
 import type { MediaKind, MediaOp, MediaProvider } from '../media-studio/providers/types.js'
@@ -337,6 +337,71 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     assert.equal((await annotation(id)).interpretation?.execution?.state, 'running')
     assert.equal((await projectRow(s.p.id)).status, 'running')
   })
+
+  test('a lost lease aborts an in-flight interpret before it settles', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.video.id,
+      kind: 'text',
+      text: '尾巴应该是白色的',
+    })
+    await s.api.send(s.uid, id)
+    const [task] = await claimStudioTasks(getPool(), { owner: 'A', limit: 1, museOnline: false })
+    assert.ok(task)
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    s.exec.grok = async (input) => {
+      if (!input.signal) {
+        entered()
+        throw new Error('interpret dropped the abort signal')
+      }
+      const lost = new Promise<void>((resolve) => {
+        if (input.signal!.aborted) resolve()
+        else input.signal!.addEventListener('abort', () => resolve(), { once: true })
+      })
+      entered()
+      await lost
+      await input.onResult?.({
+        text: '{"op":null,"confidence":0,"explanation":"should not be stored"}',
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        model: 'grok-build',
+        requestId: input.requestId,
+      })
+      throw new Error('interpret settled after the lease was lost')
+    }
+    const ac = new AbortController()
+    const running = executeTask(s.exec, task, ac.signal)
+    await Promise.race([
+      started,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('interpret never called grok')), 5000),
+      ),
+    ])
+    ac.abort(new LeaseLostError())
+    await Promise.race([
+      assert.rejects(running, (err: unknown) => err instanceof LeaseLostError),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('interpret kept running after the lease was lost')), 5000),
+      ),
+    ])
+    assert.equal((await annotation(id)).interpretation, null)
+    const step = await query('SELECT 1 FROM studio_step_results WHERE task_id = $1', [task.id])
+    assert.equal(step.rowCount, 0)
+    const row = await query<{ status: string }>('SELECT status FROM studio_tasks WHERE id = $1', [
+      task.id,
+    ])
+    assert.equal(row.rows[0]!.status, 'leased')
+  })
+
   test('a sure instruction on an autonomous finished film runs at once: reopened, the change kept on the shot', async (t) => {
     if (skip(t)) return
     const s = await setup()
@@ -351,7 +416,8 @@ describe('studio annotations (OCV5-591 A2-1b-2)', () => {
     s.grok.answers.push(sure('regenerate_shot', { shotId: s.shot, promptDelta: '尾巴白色' }))
     const task = await runOne(s.exec)
     assert.equal(task.kind, 'interpret', 'interpret runs on a finished project')
-    assert.equal(s.grok.calls[0]!.billTo, 'platform')
+    assert.equal(s.grok.calls[0]!.billTo, 'user')
+    assert.equal(s.grok.calls[0]!.model, 'grok-build')
     assert.equal(s.grok.calls[0]!.image?.mediaType, 'image/jpeg', 'the marked frame is sent')
     const a = await annotation(id)
     assert.equal(a.interpretation?.op, 'regenerate_shot')

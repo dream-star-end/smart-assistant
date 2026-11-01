@@ -352,9 +352,15 @@ export interface GrokRunInput {
   prompt: string;
   image?: { mediaType: VisionMediaType; data: string };
   /**
-   * "user" (default): authorized model, precheck, journal, settle at the grok-build price.
-   * "platform": platform-paid master step (no precheck/journal/ledger). Only reachable from master
-   * code — the HTTP route always uses "user".
+   * Director model for plan, interpret, and visual QA. Absent means grok-build.
+   * The HTTP vision route does not accept this field; that route stays on grok-build.
+   */
+  model?: string;
+  /**
+   * "user" (default): authorized model, precheck, journal, settle at the selected model's price.
+   * "platform": platform-paid master step (no precheck/journal/ledger) that still checks the
+   * user's permission for the selected model. Only reachable from master code — the HTTP route
+   * always uses "user".
    */
   billTo?: "user" | "platform";
   /** Text-only callers may persist incremental previews; callbacks are awaited in stream order. */
@@ -386,10 +392,13 @@ export type GrokRunner = (input: GrokRunInput) => Promise<GrokRunResult>;
  * OCV5-591 A2-1b-1: the worst case of one user-billed run (the same estimate its precheck
  * reserves), for the media studio's project budget. null when the catalog cannot price it.
  */
-export async function grokRunMaxCost(catalog: GrokVisionCatalog): Promise<bigint | null> {
+export async function grokRunMaxCost(
+  catalog: GrokVisionCatalog,
+  model: string = GROK_VISION_MODEL,
+): Promise<bigint | null> {
   try {
     const snapshot = await catalog.assertFresh();
-    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(GROK_VISION_MODEL));
+    const pricing = snapshot.billingPricingFor(snapshot.aliasToCanonical(model));
     return pricing ? estimateMaxCost(PRECHECK_TOKEN_ESTIMATE, pricing) : null;
   } catch {
     return null;
@@ -452,7 +461,11 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
     } catch {
       throw new GrokRunError(503, "GROK_VISION_CATALOG_UNAVAILABLE", "model catalog unavailable");
     }
-    const canonical = snapshot.aliasToCanonical(GROK_VISION_MODEL);
+    const requested = typeof input.model === "string" ? input.model.trim() : "";
+    if (requested && !/^[A-Za-z0-9._:-]{1,64}$/.test(requested)) {
+      throw new GrokRunError(400, "BAD_BODY", "model id is invalid");
+    }
+    const canonical = snapshot.aliasToCanonical(requested || GROK_VISION_MODEL);
     let upstreamModel: string;
     try {
       const descriptor = snapshot.resolve(canonical);
@@ -467,16 +480,16 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       containerId !== null ? `vision:${userId}:${containerId}` : `studio:${userId}`,
     );
     let abandon: (reason: string) => Promise<void> = async () => {};
+    let scope: ReturnType<typeof scopeFromAuthz>;
+    try {
+      scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
+    } catch {
+      throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
+    }
+    if (!snapshot.canUseModel(scope, canonical)) {
+      throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "this model is not available to this user");
+    }
     if (billTo === "user") {
-      let scope: ReturnType<typeof scopeFromAuthz>;
-      try {
-        scope = scopeFromAuthz(userId, await deps.loadUserModelAuthz(userId, snapshot.securityEpoch));
-      } catch {
-        throw new GrokRunError(503, "GROK_VISION_AUTHZ_UNAVAILABLE", "model authorization unavailable");
-      }
-      if (!snapshot.canUseModel(scope, canonical)) {
-        throw new GrokRunError(403, "GROK_VISION_NOT_AUTHORIZED", "vision model is not available to this user");
-      }
       const pricing = snapshot.billingPricingFor(canonical);
       if (!pricing) {
         throw new GrokRunError(503, "GROK_VISION_PRICING_UNAVAILABLE", "vision model pricing unavailable");

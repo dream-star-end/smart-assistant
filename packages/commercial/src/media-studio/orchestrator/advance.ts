@@ -12,6 +12,7 @@ import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { type ShotRedo, settleAnnotations } from './annotate.js'
 import { reserveBudget } from './budget.js'
+import { reserveDirectorStep } from './directorBudget.js'
 import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
 import { type BibleEntry, biblePrompt, framePrompt, videoPrompt, withAvoid } from './prompts.js'
@@ -407,8 +408,9 @@ async function dispatchQa(
   projectId: string,
   takeId: string,
 ): Promise<'queued' | 'budget' | 'exists' | 'unpriced'> {
-  const est = deps.qa?.maxCost ? await deps.qa.maxCost().catch(() => null) : 0n
-  if (est === null) {
+  const held = await reserveDirectorStep(client, deps.qa, projectId)
+  if (held === 'budget') return 'budget'
+  if (held === 'unpriced') {
     const noted = await client.query(
       `UPDATE studio_projects SET settings = settings || '{"qaUnpricedNoted":true}'::jsonb
         WHERE id = $1 AND NOT (settings ? 'qaUnpricedNoted') RETURNING id`,
@@ -421,7 +423,7 @@ async function dispatchQa(
     }
     return 'unpriced'
   }
-  if (!(await reserveBudget(client, projectId, est))) return 'budget'
+  const est = held.est
   const r = await enqueueStudioTask(client, {
     projectId,
     kind: 'qa',
@@ -449,15 +451,57 @@ async function apply(
   const id = ctx.project.id
   for (const a of actions) {
     if (a.type === 'enqueue_plan') {
+      const held = await reserveDirectorStep(client, deps.qa, id)
+      if (held === 'unpriced') {
+        const noted = await client.query(
+          `UPDATE studio_projects SET settings = settings || '{"planUnpricedNoted":true}'::jsonb
+            WHERE id = $1 AND NOT (settings ? 'planUnpricedNoted') RETURNING id`,
+          [id],
+        )
+        if (noted.rowCount) {
+          await appendStudioEvent(client, id, 'plan.waiting', {
+            message: '分镜暂时没法估价（模型目录不可用），恢复后自动继续。',
+          })
+        }
+        continue
+      }
+      if (held === 'budget') {
+        // resumeTo is the status column before this update (planning). 继续
+        // reads it; without it the project resumes to running and decide()
+        // never enqueues the plan.
+        const paused = await client.query(
+          `UPDATE studio_projects
+              SET status = 'paused',
+                  settings = settings || jsonb_build_object('pausedReason', 'budget', 'resumeTo', status),
+                  rev = rev + 1, updated_at = NOW()
+            WHERE id = $1 AND status = 'planning'
+            RETURNING id`,
+          [id],
+        )
+        if (paused.rowCount) {
+          await appendStudioEvent(client, id, 'budget.exhausted', {
+            message: '预算不够下一步了，已暂停。调高预算后点“继续”。',
+          })
+        }
+        return
+      }
       const rev = await client.query<{ rev: number }>(
         'SELECT rev FROM studio_projects WHERE id = $1',
         [id],
       )
-      await enqueueStudioTask(client, {
+      const enq = await enqueueStudioTask(client, {
         projectId: id,
         kind: 'plan',
         idempotencyKey: `plan:${id}:${rev.rows[0]!.rev}`,
+        payload: { booked: '0' },
+        reservedCredits: held.est,
       })
+      if (!enq.created) {
+        await client.query(
+          'UPDATE studio_projects SET reserved_credits = GREATEST(0, reserved_credits - $2) WHERE id = $1',
+          [id, held.est.toString()],
+        )
+      }
     } else if (a.type === 'dispatch') {
       const r = await dispatchOne(client, deps, ctx, a.dispatch)
       if (r === 'budget') {

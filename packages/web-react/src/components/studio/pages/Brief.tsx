@@ -19,6 +19,7 @@ import {
 import { type ReactNode, useEffect, useState } from 'react'
 
 import { kindView } from '../../../hooks/useStudioProviders'
+import { api } from '../../../lib/api'
 import {
   type ProjectDraft,
   StudioApiError,
@@ -34,7 +35,7 @@ import type {
   StudioProject,
   StudioProjectView,
 } from '../../../lib/studio/types'
-import type { AuthSession } from '../../../lib/types'
+import type { AuthSession, PublicModel } from '../../../lib/types'
 import { useConfirm, useToast } from '../../ui'
 
 const ASPECTS: StudioAspect[] = ['16:9', '9:16', '1:1']
@@ -46,6 +47,38 @@ const PLAN_ROWS: Array<{ kind: MediaKind; label: string; icon: ReactNode }> = [
   { kind: 'voice', label: '配音', icon: <Mic size={14} /> },
   { kind: 'music', label: '音乐', icon: <Music size={14} /> },
 ]
+
+function DirectorModel(props: {
+  saving: boolean
+  current: string
+  models: PublicModel[]
+  onPick: (id: string) => void
+}) {
+  const ids = ['grok-build', ...props.models.map((m) => m.id)]
+  if (!ids.includes(props.current)) ids.push(props.current)
+  const options = [...new Set(ids)]
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="st-label">导演模型</div>
+      <div className="st-cap" style={{ margin: '6px 0 8px' }}>
+        分镜、批注理解和画面质检用这个模型，按它的价格从你的账户扣费。默认 grok-build。
+      </div>
+      <select
+        aria-label="导演模型"
+        disabled={props.saving}
+        value={props.current}
+        onChange={(e) => props.onPick(e.target.value)}
+        style={{ width: '100%', maxWidth: 360 }}
+      >
+        {options.map((id) => (
+          <option key={id} value={id}>
+            {id === 'grok-build' ? 'grok-build（默认）' : id}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
 
 function str(v: unknown): string {
   return typeof v === 'string' ? v : ''
@@ -168,10 +201,27 @@ export function BriefPage(props: {
   const [saving, setSaving] = useState(false)
   const [starting, setStarting] = useState(false)
   const [approving, setApproving] = useState(false)
+  const [grokModels, setGrokModels] = useState<PublicModel[]>([])
 
   useEffect(() => {
     if (!editing) setBriefText(project.brief)
   }, [project.brief, editing])
+  useEffect(() => {
+    let live = true
+    const load = api?.getPublicModels
+    if (typeof load !== 'function') return
+    void load
+      .call(api, auth)
+      .then((r) => {
+        if (live) setGrokModels(r.models.filter((m) => m.engine === 'grok' && m.degraded !== true))
+      })
+      .catch(() => {
+        if (live) setGrokModels([])
+      })
+    return () => {
+      live = false
+    }
+  }, [auth])
   useEffect(() => setBudget(project.budgetCredits), [project.budgetCredits])
 
   const save = async (patch: ProjectDraft): Promise<boolean> => {
@@ -502,6 +552,16 @@ export function BriefPage(props: {
               ))}
             </fieldset>
           </div>
+          <DirectorModel
+            saving={saving}
+            current={
+              typeof project.settings.directorModel === 'string' && project.settings.directorModel
+                ? project.settings.directorModel
+                : 'grok-build'
+            }
+            models={grokModels}
+            onPick={(id) => void save({ directorModel: id })}
+          />
           {!draft ? (
             <div className="st-cap" style={{ marginTop: 8 }}>
               已开拍，画幅和时长不能再改。
