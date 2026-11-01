@@ -92,6 +92,23 @@ describe('extracted turn dispatch receipt source guard', () => {
     assert.throws(() => assertRejectedDispatchFailureHelper(
       mutate(helper, "return 'DISPATCH_NOT_ACCEPTED'", "return 'OTHER_REJECTION'")), pattern)
   })
+  it('rejects an attachment code that is not the parsed byte count', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      mutate(helper, 'attachmentTotalExceededFailureCode(parsed.totalBytes)',
+        'attachmentTotalExceededFailureCode(0)')), pattern)
+  })
+  it('rejects a historical return hidden after an unconditional return', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    const before = `export function rejectedDispatchFailureCode(res: { kind: string; userFailureCode?: unknown }): string {\n`
+    const after = `${before}  return attachmentTotalExceededFailureCode(parsed.totalBytes)\n`
+    assert.throws(() => assertRejectedDispatchFailureHelper(mutate(helper, before, after)), pattern)
+  })
+  it('rejects a local function shadowing the protocol helper', () => {
+    const helper = readFileSync(join(process.cwd(), 'packages/commercial/src/dispatch/attachmentTotalFailure.ts'), 'utf8')
+    assert.throws(() => assertRejectedDispatchFailureHelper(
+      `${helper}\nfunction attachmentTotalExceededFailureCode(value: unknown): string { return String(value) }\n`), pattern)
+  })
   it('rejects an enrichment fence that no longer stops a terminalized turn', () => {
     assert.throws(() => assertTurnDispatchReceiptCoverage(bridge,
       mutate(receipt, 'if (!context.acceptEnrichmentReceipt(rec)) return true', 'context.acceptEnrichmentReceipt(rec)')), pattern)
