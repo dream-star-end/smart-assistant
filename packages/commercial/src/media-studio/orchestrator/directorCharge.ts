@@ -65,7 +65,9 @@ export async function bookDirectorCharge(
   await bookTaskCharge(client, task, charged, { release: true })
   if (await overBudget(client, task.projectId)) {
     const paused = await client.query(
-      `UPDATE studio_projects SET status = 'paused', settings = settings || '{"pausedReason":"budget"}'::jsonb,
+      `UPDATE studio_projects
+          SET status = 'paused',
+              settings = settings || jsonb_build_object('pausedReason', 'budget', 'resumeTo', status),
               rev = rev + 1
         WHERE id = $1 AND status IN ('running', 'planning', 'awaiting_user', 'composing')
         RETURNING id`,

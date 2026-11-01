@@ -191,7 +191,14 @@ async function context(
   }
 }
 
-export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise<void> {
+export async function runInterpret(
+  deps: ExecuteDeps,
+  task: StudioTask,
+  signal: AbortSignal,
+): Promise<void> {
+  // A lost lease aborts this signal. Leave the in-flight call unsettled so the
+  // next claim is the only one that bills.
+  signal.throwIfAborted()
   const annotationId = (task.payload as { annotationId?: unknown }).annotationId
   if (typeof annotationId !== 'string')
     throw new MediaProviderError('INVALID_TASK', false, 'interpret task has no annotation')
@@ -209,7 +216,9 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       [task.projectId],
     )
     const userId = owner.rows[0] ? BigInt(owner.rows[0].user_id) : null
+    signal.throwIfAborted()
     await withLease(deps.pool, task, async (c) => {
+      signal.throwIfAborted()
       await bookDirectorCharge(deps.pool, task, c, userId)
       await finishStudioTask(c, task, { status: 'done', error: 'nothing to interpret' })
     })
@@ -270,6 +279,7 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
         })
       ).sha
     }
+    signal.throwIfAborted()
     const res = await deps.grok({
       userId,
       containerId: null,
@@ -283,7 +293,11 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       // The user chose this model: their permission is checked and their ledger pays its price.
       billTo: 'user',
       rateKey: `studio-interpret:${p.user_id}`,
+      signal,
       onResult: async (r) => {
+        // Persist only while we still hold the lease. A throw here abandons
+        // the journal, so the call is not settled.
+        signal.throwIfAborted()
         await deps.pool.query(
           `INSERT INTO studio_step_results(request_id, user_id, task_id, output)
            VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (request_id) DO NOTHING`,
@@ -299,13 +313,17 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
     answer = res.text
   }
 
+  signal.throwIfAborted()
+
   let interpretation: Interpretation
   try {
     interpretation = parseInterpretation(answer, ctx)
   } catch (err) {
     if (!(err instanceof InterpretParseError)) throw err
     if (task.attempts < 2) {
+      signal.throwIfAborted()
       await withLease(deps.pool, task, async (c) => {
+        signal.throwIfAborted()
         await c.query('DELETE FROM studio_step_results WHERE request_id = $1', [task.execRequestId])
         await retryStudioTask(c, task, { delaySeconds: 2, error: err.message })
       })
@@ -318,7 +336,9 @@ export async function runInterpret(deps: ExecuteDeps, task: StudioTask): Promise
       explanation: 'agent 没看懂这条批注，可以换个说法再发一次。',
     }
   }
+  signal.throwIfAborted()
   await withLease(deps.pool, task, async (c) => {
+    signal.throwIfAborted()
     const wrote = await c.query(
       `UPDATE studio_annotations SET interpretation = $2::jsonb, frame_blob_sha = COALESCE(frame_blob_sha, $3)
         WHERE id = $1 AND status = 'sent' AND interpretation IS NULL`,

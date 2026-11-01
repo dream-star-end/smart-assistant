@@ -466,14 +466,23 @@ async function apply(
         continue
       }
       if (held === 'budget') {
-        await client.query(
-          `UPDATE studio_projects SET status = 'paused', settings = settings || '{"pausedReason":"budget"}'::jsonb,
-                  rev = rev + 1, updated_at = NOW() WHERE id = $1`,
+        // resumeTo is the status column before this update (planning). 继续
+        // reads it; without it the project resumes to running and decide()
+        // never enqueues the plan.
+        const paused = await client.query(
+          `UPDATE studio_projects
+              SET status = 'paused',
+                  settings = settings || jsonb_build_object('pausedReason', 'budget', 'resumeTo', status),
+                  rev = rev + 1, updated_at = NOW()
+            WHERE id = $1 AND status = 'planning'
+            RETURNING id`,
           [id],
         )
-        await appendStudioEvent(client, id, 'budget.exhausted', {
-          message: '预算不够下一步了，已暂停。调高预算后点“继续”。',
-        })
+        if (paused.rowCount) {
+          await appendStudioEvent(client, id, 'budget.exhausted', {
+            message: '预算不够下一步了，已暂停。调高预算后点“继续”。',
+          })
+        }
         return
       }
       const rev = await client.query<{ rev: number }>(

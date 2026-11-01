@@ -878,7 +878,7 @@ export async function executeTask(
     if (task.kind === 'gen') return await runGen(deps, task, signal)
     if (task.kind === 'compose') return await runCompose(deps, task)
     if (task.kind === 'qa') return await runQa(deps, task)
-    if (task.kind === 'interpret') return await runInterpret(deps, task)
+    if (task.kind === 'interpret') return await runInterpret(deps, task, signal)
     throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
   } catch (err) {
     // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.
