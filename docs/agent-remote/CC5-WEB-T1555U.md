@@ -183,3 +183,21 @@ pins both Python sources. Socket cleanup checks its original inode and UID.
 This-session research_review approved this connection adjustment. Existing
 restrict allows normal exec; no forwarding permission exception is requested.
 Python fixture counts describe local transport only, never actual SSH or chat.
+
+## Relay core checkpoint (11/02, transport adapter still missing)
+
+The privileged host relay runs on v5-dev under the revised direct-SSH topology.
+It exposes two distinct private Unix listeners: authenticated control/stream
+for the new execution container, and the fixed MCP tool endpoint for the stdio
+helper's local pump. open/admit join one host promise, including synchronous
+unknown startup; fresh signed admission precedes the user dispatch journal and
+original stdin write. Duplicate sequence/hash is ignored, conflict or gaps
+stop without replay. Root state, not the MCP caller, adds scope/native session/
+authority/lease/admission to the sole delivery; both host and container observe
+the original full tool_use. Receipt returns once, and stopped/expired admission
+never reopens. Independent stop remains callable after expiry and only returns
+positive when the actual host port proves absence. The future concrete SSH
+adapter must treat either host or helper-channel loss as a transport failure
+and invoke this stop, never translate SSH EOF into remoteStopped. It must also
+ready the helper before launching the original host. No concrete SSH adapter
+or fresh-container supervisor caller is claimed by this core checkpoint.
