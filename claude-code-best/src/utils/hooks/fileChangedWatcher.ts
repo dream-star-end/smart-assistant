@@ -27,7 +27,7 @@ function closeWatcher(value: FSWatcher): void {
   void closing.then(() => pendingCloses.delete(closing), error => {
     pendingCloses.delete(closing)
     closeFailures.push(error)
-    logForDebugging('FileChanged watcher close failed: ' + errorMessage(error), { level: 'error' })
+    logForDebugging(`FileChanged watcher close failed: ${errorMessage(error)}`, { level: 'error' })
   })
 }
 let notifyCallback: ((text: string, isError: boolean) => void) | null = null
@@ -215,6 +215,6 @@ export async function disposeFileChangedWatcher(): Promise<void> {
 }
 export function resetFileChangedWatcherForTesting(): void {
   void disposeFileChangedWatcher().catch(error => {
-    logForDebugging('FileChanged reset close failed: ' + errorMessage(error), { level: 'error' })
+    logForDebugging(`FileChanged reset close failed: ${errorMessage(error)}`, { level: 'error' })
   })
 }
