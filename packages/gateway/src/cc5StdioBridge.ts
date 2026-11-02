@@ -5,13 +5,17 @@ import { resolve } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
+import type { AuthorityKeyring } from '@openclaude/protocol'
 import {
   CC5_BRIDGE_MAX_FRAME_BYTES,
   CC5_RELAY_SOCKET,
   type Cc5BridgeBinding,
   cc5ControlRequest,
+  readCc5AuthorityKeyring,
   readCc5Binding,
 } from './cc5BridgePort.js'
+import { Cc5ToolObservation } from './cc5ToolObservation.js'
+import { runCc5ToolPump } from './cc5ToolPump.js'
 
 export async function runCc5StdioBridge(input: {
   binding: Readonly<Cc5BridgeBinding>
@@ -20,6 +24,8 @@ export async function runCc5StdioBridge(input: {
   stdout: Writable
   socketPath?: string
   signal?: AbortSignal
+  /** Production entry always supplies the supervisor-owned keyring. */
+  tools?: { keyring: AuthorityKeyring; executionRoot?: string }
 }): Promise<void> {
   const scope = {
     capability: input.binding.capability,
@@ -30,6 +36,9 @@ export async function runCc5StdioBridge(input: {
     sessionKey: input.sessionKey,
   }
   const socketPath = input.socketPath ?? CC5_RELAY_SOCKET
+  const observation = input.tools ? new Cc5ToolObservation(input.binding.operationId) : undefined
+  const toolAbort = new AbortController()
+  let toolRun: Promise<unknown> | undefined
   let seq = 0
   let userSeen = false
   let ready = false
@@ -44,6 +53,7 @@ export async function runCc5StdioBridge(input: {
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise
     stopping = true
+    toolAbort.abort()
     pending = []
     stopPromise = cc5ControlRequest('/stop', scope, socketPath)
       .then((result) => {
@@ -144,12 +154,31 @@ export async function runCc5StdioBridge(input: {
             return
           }
           ready = true
+          if (input.tools && observation) {
+            toolRun = runCc5ToolPump({
+              binding: input.binding,
+              sessionKey: input.sessionKey,
+              keyring: input.tools.keyring,
+              observation,
+              signal: toolAbort.signal,
+              socketPath,
+              executionRoot: input.tools.executionRoot,
+            }).catch(() => {
+              if (!stopping) fail('CC5_FIXED_TOOL_FAILED_OR_UNKNOWN')
+            })
+          }
           clearTimeout(readyTimer)
           for (const line of pending) req.write(line)
           pending = []
           pendingBytes = 0
           input.stdin.resume()
           res.on('data', (chunk: Buffer) => {
+            try {
+              observation?.ingest(chunk)
+            } catch {
+              fail('CC5_ORIGINAL_TOOL_OBSERVATION_INVALID')
+              return
+            }
             // Exact original authenticated host bytes. No screen scraping or replacement result.
             if (!input.stdout.write(chunk)) res.pause()
           })
@@ -205,6 +234,11 @@ export async function runCc5StdioBridge(input: {
       if (input.signal?.aborted) onAbort()
     })
   } finally {
+    toolAbort.abort()
+    try {
+      observation?.finish()
+    } catch {}
+    await toolRun
     clearTimeout(readyTimer)
     input.stdin.removeListener('data', onData)
     input.stdin.removeListener('end', onEnd)
@@ -221,6 +255,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     .then(() =>
       runCc5StdioBridge({
         binding: readCc5Binding(),
+        tools: { keyring: readCc5AuthorityKeyring() },
         sessionKey: process.argv[2] ?? '',
         stdin: process.stdin,
         stdout: process.stdout,

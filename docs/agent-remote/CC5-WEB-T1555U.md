@@ -125,3 +125,18 @@ evidence/cc5-interactive with UTC/runId/build/model/turn. The temporary one-tool
 profile lacks normal Box files/skills/browser/background/multimodal capabilities;
 record latency/behavior honestly, never call it full P3 or equivalent final UX.
 Full P3 must restore capabilities and pass real t1562u postrelease acceptance.
+
+## Child tool wiring checkpoint (11/02)
+
+The Node stdio child's production entry reads a separate root-owned RO
+`authority-public.json` from the same supervisor bind; no inherited environment
+or RPC field selects its signing keys. READY starts one `/tool/next` pump.
+Original stdout buffers are validated by the complete-tool observer, then
+forwarded unchanged. The pump verifies the signed delivery against its trusted
+admission, waits for that original tool_use, and executes the fixed command in
+this child's execution container. A single `/tool/result` returns the real
+terminal receipt; unknown result delivery never repeats the effect. The fixed
+persistent root is `/home/agent/.openclaude/.cc5-t1555u`, covered by the download
+blocklist. Direct raw transport fixtures may omit tools; the production main
+always loads the protected keyring and supplies the pump. This is not a model
+or browser acceptance result. Plan approved by this-session research_review.

@@ -12,11 +12,17 @@ import {
 import { request } from 'node:http'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CC5_TEST_MODEL_ID, canUseCc5TestModel } from '@openclaude/protocol'
+import {
+  type AuthorityKeyring,
+  CC5_TEST_MODEL_ID,
+  canUseCc5TestModel,
+  parseAuthorityKeyring,
+} from '@openclaude/protocol'
 import type { TurnModelAuthority } from './subprocessSpawnConfig.js'
 import type { SpawnOpts } from './terminalBackend.js'
 
 export const CC5_BINDING_FILE = '/run/oc/cc5-remote-t1555u/binding.json'
+export const CC5_AUTHORITY_KEYRING_FILE = '/run/oc/cc5-remote-t1555u/authority-public.json'
 export const CC5_RELAY_SOCKET = '/run/oc/cc5-remote-t1555u/relay.sock'
 export const CC5_BRIDGE_MAX_FRAME_BYTES = 8 * 1024 * 1024
 export interface Cc5BridgeBinding {
@@ -33,6 +39,32 @@ function requireCc5(value: unknown): asserts value {
   if (!value) throw new Error('CC5_BRIDGE_BINDING_INVALID')
 }
 
+/** No user/env path may select a supervisor-owned file. Errors never echo JSON. */
+function readSupervisorJson(path: string): unknown {
+  requireCc5(path === CC5_BINDING_FILE || path === CC5_AUTHORITY_KEYRING_FILE)
+  const dir = lstatSync(dirname(path))
+  requireCc5(dir.isDirectory() && dir.uid === 0 && (dir.mode & 0o027) === 0)
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const meta = fstatSync(fd)
+    const link = lstatSync(path)
+    requireCc5(
+      meta.isFile() &&
+        !link.isSymbolicLink() &&
+        meta.ino === link.ino &&
+        meta.dev === link.dev &&
+        meta.uid === 0 &&
+        meta.nlink === 1 &&
+        (meta.mode & 0o027) === 0 &&
+        meta.size > 0 &&
+        meta.size <= (path === CC5_BINDING_FILE ? 4096 : 16384),
+    )
+    return JSON.parse(readFileSync(fd, 'utf8'))
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /** Only the supervisor's root-owned read-only bind may select a relay. */
 export function readCc5Binding(
   path = CC5_BINDING_FILE,
@@ -40,40 +72,35 @@ export function readCc5Binding(
 ): Readonly<Cc5BridgeBinding> {
   try {
     requireCc5(path === CC5_BINDING_FILE)
-    const dir = lstatSync(dirname(path))
-    requireCc5(dir.isDirectory() && dir.uid === 0 && (dir.mode & 0o027) === 0)
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    try {
-      const meta = fstatSync(fd)
-      const link = lstatSync(path)
-      requireCc5(
-        meta.isFile() &&
-          !link.isSymbolicLink() &&
-          meta.ino === link.ino &&
-          meta.dev === link.dev &&
-          meta.uid === 0 &&
-          meta.nlink === 1 &&
-          (meta.mode & 0o027) === 0 &&
-          meta.size > 0 &&
-          meta.size <= 4096,
-      )
-      const b = JSON.parse(readFileSync(fd, 'utf8')) as Cc5BridgeBinding
-      requireCc5(
-        b.version === 1 &&
-          /^[1-9][0-9]*$/.test(b.uid) &&
-          /^[1-9][0-9]*$/.test(b.containerDbId) &&
-          /^[a-f0-9]{64}$/.test(b.dockerId) &&
-          /^[a-f0-9-]{36}$/.test(b.operationId) &&
-          /^[a-f0-9]{64}$/.test(b.capability) &&
-          Number.isSafeInteger(b.expiresAt) &&
-          b.expiresAt > now,
-      )
-      return Object.freeze(b)
-    } finally {
-      closeSync(fd)
-    }
+    const b = readSupervisorJson(path) as Cc5BridgeBinding
+    requireCc5(
+      b.version === 1 &&
+        /^[1-9][0-9]*$/.test(b.uid) &&
+        /^[1-9][0-9]*$/.test(b.containerDbId) &&
+        /^[a-f0-9]{64}$/.test(b.dockerId) &&
+        /^[a-f0-9-]{36}$/.test(b.operationId) &&
+        /^[a-f0-9]{64}$/.test(b.capability) &&
+        Number.isSafeInteger(b.expiresAt) &&
+        b.expiresAt > now,
+    )
+    return Object.freeze(b)
   } catch {
     throw new Error('CC5_BRIDGE_BINDING_INVALID')
+  }
+}
+
+export function readCc5AuthorityKeyring(): AuthorityKeyring {
+  try {
+    const value = readSupervisorJson(CC5_AUTHORITY_KEYRING_FILE) as {
+      version: number
+      keyring: string
+    }
+    requireCc5(value.version === 1 && typeof value.keyring === 'string')
+    const keys = parseAuthorityKeyring(value.keyring)
+    requireCc5(keys.size > 0)
+    return keys
+  } catch {
+    throw new Error('CC5_BRIDGE_AUTHORITY_KEYS_INVALID')
   }
 }
 
