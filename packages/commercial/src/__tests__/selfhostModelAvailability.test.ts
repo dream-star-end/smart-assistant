@@ -18,7 +18,7 @@ import { canUseModel } from "../billing/authzModels.js";
 const root = mkdtempSync(join(tmpdir(), "ocv5-713-models-"));
 mkdirSync(join(root, "deploy/v5-selfhost"), { recursive: true });
 const policyFile = join(root, "deploy/v5-selfhost/model-availability.json");
-function identity(flavor: "selfhost" | "commercial"): FlavorIdentity {
+function identity(flavor: "selfhost" | "commercial"): Extract<FlavorIdentity, { status: "ok" }> {
   return { status: "ok", flavor, manifestPath: join(root, "release-flavor.json"), manifest: {
     schema: 1, flavor, builder: flavor === "selfhost" ? "deploy-v5-selfhost.sh" : "deploy-v5.sh",
     sourceCommit: "a".repeat(40), expectedHosts: [], expectedRoots: [], expectedDbNames: [], guardGeneration: 1,
