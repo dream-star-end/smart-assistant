@@ -1,4 +1,4 @@
-import { type Cc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { isCc5ResumeId } from './engine/cc5ResumeId.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
@@ -845,7 +845,8 @@ export async function submit(
       ) === 'restart'
     if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || privacyChanged || serviceTierChanged) {
       try {
-        await session.runner.shutdown()
+        // A cold CC5 port is single-use: shutdown would revoke it before its first admission.
+        if (!isCc5ExecutionBackend(session.runner.executionBackend) || session.runner.isRunning) await session.runner.shutdown()
         if (privacyChanged) assertRunnerPromptPrivacyStopped(session.runner)
         // Delta tracker reset happens automatically on the next 'spawn' event
         // when SubprocessRunner auto-respawns on the next submit().
