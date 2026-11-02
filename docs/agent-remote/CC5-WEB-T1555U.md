@@ -1,203 +1,127 @@
-# t1555u / t1576u live personal-web cc5 test slice
+# CC5 native backend for the personal web chat
 
-Plan, not completion. User 10:16 approves a live personal frontend model entry,
-private CLI and fixed MCP. The steward must approve the exact release batch
-before the official personal train. No independent frontend or production DB
-hand edits. Full P3 libraries remain on the separate draft #1343 branch.
+This is the current contract for the narrow agent-remote web milestone. Earlier
+new-account/new-model checkpoints are superseded by the existing-account route
+below. This milestone does not complete the separate full P3 Worker/ToolHost split.
 
-Base: personal 9826fe9512f6c2e2a9479d2db7faa55dd4515ac2 (reconfirmed 11/02).
-New task worktree/branch: ocv5-agentremote-cc5-web-t1555u /
-feat/v5-selfhost-cc5-web-t1555u. Root alone edits; session children review read-only.
+## Account, model and scope
 
-## 1. Default-off server policy and exact model identity
+Use the owner's existing account through its normal login, including the personal
+UID3 account. Do not create another test identity, query credentials to impersonate
+login, or add a catalog model, price or grant. The selected model remains the active
+`box-claude-sonnet-5` canonical model with engine `ccb` and its existing price.
+The former `cc5-remote-t1555u` task-model entry is retired even when old flags or
+explicit grants exist.
 
-Add a pure protocol helper for cc5-remote-t1555u and the server-selected test UID.
-Require OC_SELFHOST_CC5_T1555U_ENABLED=1 and one strict positive numeric
-OC_SELFHOST_CC5_T1555U_TEST_UID; empty, all, lists, zero and malformed UIDs deny.
-No hardcoded user3/admin bypass. This is ANDed with catalog availability,
-visibility, grants, subscription and all normal execution authority checks.
+One new chat is selected by a signed `executionBackend` scope, not by its visible
+model name. The master binds the exact session, operation, runtime run, UID,
+container database ID and full Docker ID in the v2 root-owned binding. Normal
+model authority, leases, grants, plan limits and billing admission still apply.
+Other chats continue through their existing Sonnet/CCB path. Private account,
+email, session and operation identifiers belong only in private deployment metadata
+and evidence, never this public document.
 
-Use the same helper in catalog evaluateUse (including locked projections),
-legacy pricing/authz and grants. Explicit WS hard denial after canonicalization
-must occur before any slot/precheck/dispatch/usage/audit write; unknown aliases
-still fail normal catalog resolution. Grant writes for another UID fail before
-mutation, including staged entries. Invalid/default-off cc5 requests never fall
-into Cursor routing. Non-cc5 models retain their existing paths.
+The two existing master environment keys remain default OFF when absent:
 
-Register exact cc5 model ID as the existing cursor engine family; preserve
-normal authority/dispatch/external-usage accounting. Add a selfhost-only staged,
-disabled, hidden catalog/pricing row and the exact external audit CHECK member.
-No production grant/activation until test UID and new-container binding are
-known. Do not reuse/bypass synthetic evaluation overlays or fake authority.
+- `OC_SELFHOST_CC5_T1555U_ENABLED`
+- `OC_SELFHOST_CC5_T1555U_TEST_UID`
 
-Test pure UID/flag rules and real catalog/legacy/WS call sites: OFF denies all;
-ON allows only the configured trusted test UID plus normal grants. Ordinary
-user/admin, mis-grant/public visibility, alias, direct-engine and spoofed frame
-UID remain denied with zero precheck/dispatch/billing effect. No model calls.
+A configured UID is only an exact deployment restriction; it does not authorize a
+new identity or payment. The activation carrier uses an optional root-private
+request bound to the digest and scope of the existing v2 deployment metadata.
+Unconfigured instances make no two-key configuration writes. The real official
+publisher must own FD8; a caller-provided “lock held” flag is not proof. The carrier
+records the two keys' original presence/value before replacing the env atomically,
+preserves unrelated bytes, and selectively restores only a proven matching state.
+An uncertain write or failed restore holds before any old-master restart. A normal
+successful cutover closes its receipt using the existing saga/history evidence;
+it must not falsely block later ordinary releases. A killed publisher does not
+magically confer successor mutation authority on the survivor.
 
-## 2. Real Engine and credential-free remote interactive bridge
+## Implemented adapter and execution boundaries
 
-At cursor factory, identify cc5 unconditionally before CursorRoutingAdapter
-construction, validate policy/target and return Cc5InteractiveAdapter. Missing
-flag/UID/target/authority rejects, never falls back to Cursor/Box/login pools.
-CcbAdapter retains actual stream parsing, events, summary and external costMode.
+The concrete `Cc5SshHost`, privileged relay, Node stdio bridge, native CCB backend
+projection, runner/session integration, fixed MCP tool pump and v2 supervisor
+binding are implemented. They use pinned SSH22 exec stdio, not new TCP listeners,
+SSH forwarding permissions or a generic remote-command API. The original host/mod
+frame bytes are preserved. The helper must be ready before the native host starts.
+SSH EOF is a transport failure, not proof that the remote task stopped.
 
-Runner gets a trusted cc5 bridge port. A separate spawn-preparation branch before
-the old setup skips prepareBoxCc, provider auth, local learning/MCP prompt files,
-transcript restore/relocation and official CLI print argv. It spawns only a new
-Node stdio bridge with a credential-free allowlist env and a private control file.
-The original preparation branch stays unchanged; both share backend.spawn and
-existing stdout/session/drain/close handling. No patched runBoxCcBridge HTTP core.
+The separate native CCB factory avoids an import cycle and retains the normal
+Sonnet model identity. The dedicated bridge path skips the ordinary Box host,
+provider-login preparation and local transcript probing. Retry, reuse, stop and
+idle behavior are isolated by the signed backend. Unknown input/result delivery
+never resubmits a prompt or repeats a tool effect. A persisted native-session
+prefix prevents an automatic same-chat fallback after a master restart or flag
+rollback; use a new ordinary chat for a deliberate return to the normal backend.
 
-Every turn requires fresh signed/verified scope admission before writing its
-user frame. Reject advisor/readOnly/consult/hermetic/inline-delegate modes in
-this temporary fixed-write profile. Disable automatic phantom/transient/auth
-resubmit for this cc5 test model: dispatched/unknown never repeats a prompt.
-Renewal must branch to the cc5 trusted port before the existing cursor Sand
-check; normal master lease renewal remains, no CCB env-update frames.
+The fixed C profile permits only its pinned MCP operation; it disables ambient
+settings, builtins and slash commands. The real fixed command runs in the personal
+execution container and returns a process receipt. No arbitrary command/path is
+accepted. This narrow proof does not substitute for the full P3 execution-runtime
+ports or claim normal Box file/browser/background/multimodal capabilities.
 
-The stdio bridge connects only the configured task Unix socket. It forwards
-original host/mod frames verbatim, holds input until authenticated READY,
-serializes sequence+hash writes and refuses conflicting replay/late generation.
-Unknown delivery is a failure without resubmit. Interrupt uses the existing
-control frame. EOF/SIGTERM/connection loss closes admission and invokes a
-separate identity-checked remote stop; SSH EOF is not remote-exit proof.
-It never generates replacement assistant/result frames.
+Financial admission precedes host start because native startup can itself cause
+upstream effects. A dispatch is durably recorded before input reaches the host.
+Terminal delivery requires the actual native receipt, matching scope/digest and
+four safe token counters to be proven against the existing fenced Sonnet pricing.
+Unknown financial or transport acknowledgement remains pending and is not replayed.
+No new pricing or account pool is introduced by the backend.
 
-## 3. SSH22 relay, fixed MCP and new execution environment
+## Existing container, drain and retained data
 
-SSH keys stay at existing paths on the current Box. Task-only local Unix relay
-uses existing SSH22 to start the original five bridge sources and private
-2.1.316 CLI in an independent task tmux on cc5. Only credential-free fixed
-launch config crosses the relay, no arbitrary remote command/URL. The original
-bridge PID/token checks and prompt.submit(asUser:true) remain unchanged.
+A new binding is created during provision, after the real database row is assigned
+and before Docker create, then activated only after the guarded database commit.
+An existing container cannot obtain this binding merely because master env changes.
+There is no policy requiring a new user: the existing user's container can be
+recreated through the normal lifecycle.
 
-Approved C profile disables all builtins, ambient settings/MCP and slash
-commands, exposing only one stdio MCP tool. The tool accepts only fixed
-operationId; it preserves JSON-RPC id and _meta.claudecode/toolUseId separately.
-The operation is bound to trusted testUID/session/turn/nativeSession/toolUseId/
-operationId/full-container-ID/parameter hash. For this temporary test slice, the real fixed command runs as a child of the
-bridge in the NEW personal execution container, with an actual process receipt
-and terminal exit0; it does not claim to use execd. P0 execd proof remains
-separate, and full P3 must still supply its formal execution-runtime ports.
-This narrow substitution was independently plan-reviewed APPROVED by
-research_review (round 1/3); no arbitrary command/path is accepted.
-Dispatch is recorded once before effect; duplicates read a terminal receipt,
-post-dispatch disconnect is unknown and never retries. No native cc5 Bash/Read.
+After an official new runtime tuple, normal `ensureRunning` detects stale
+image/release/boot hash, performs the authenticated drain and rebuilds when safe.
+Busy or failed drain defers the rebuild. If only configuration changed and the
+tuple is unchanged, the existing authenticated administrator restart endpoint can
+request the same normal drain/rebuild after its current generation is checked.
+Do not replace this with a manual `docker rm` or create a token for the operation.
 
-Attach only a fresh test account's NEW Gateway container to the task relay
-through a narrow typed supervisor port after Tx1 assigned row.id, before local
-Docker create. Admit selfhost/local/exactUID/fresh row only; do not mutate or
-rebuild an existing container. A private per-container nonce directory (not
-shared per-UID SSH dirs) binds read-only to /run/oc/cc5-remote-t1555u. Opaque
-capability is a protected file, not env/log/model input. Root-owned 0750 directory
-and only the task socket 1000:1000/0600 allow Gateway access. No Docker socket,
-private SSH key or new public port enters the container. Missing/revoked/expired
-binding rejects; creation failure cleans only that prepared task binding.
-Include sensitive path in existing gateway file policy/security fixtures.
+The five persistent volumes are retained and reused:
+`oc-v5-data-u<uid>`, `oc-v5-proj-u<uid>`, `oc-v5-codex-u<uid>`,
+`oc-v5-userlocal-u<uid>` and `oc-v5-userconfig-u<uid>`. No Docker socket, private
+SSH key or new public port enters the execution container. The read-only per-
+container control bind carries the protected capability and authority public ring.
+Missing, revoked, expired or foreign-generation bindings fail closed.
 
-A dedicated test UID is not yet known. Existing official canary source references
-an account but does not prove numeric UID or a fresh task-owned container.
-Do not borrow user3, reuse old canary containers or infer identity from frame JSON.
-Record the steward-approved dedicated test UID before activation/real requests.
+## Release and acceptance status
 
-## 4. Validation, release and rollback
+Feature preparation, code review and offline tests do not prove a web rollout.
+Use the personal official lease/train, source/digest/CI gates, normal idle/drain
+boundary and official rollback. Follow the parent's actual batch order; a draft
+PR or prepared metadata does not authorize an early main merge or live activation.
+No commercial release is part of this personal milestone.
 
-Use fake stdio child and fixed in-process transport for meaningful READY,
-fragmented frame transparency, replay/unknown/late result, permission, stop and
-cleanup tests; Cursor selector/provider-auth traps must remain untouched by
-cc5. Real tiny MCP fixtures verify IDs/scope and once-only effects. No fake web
-API/reply and no real model before real chain is available. Run appropriate
-type/lint and required hosted CI, keeping unrelated/expired gates intact.
+For the first opt-in, register the official lease/train with
+`--release-policy user-impact-only`. Its guarded installation and reader drain
+must finish before the carrier may replace either key. A legacy publisher that
+has not prepared the guarded watch holds; use the controlled policy path rather
+than treating a registration example without this policy as activation-ready.
 
-Before train, CONTINUE must name exact PR/SHA, migration/activation scope, test
-UID/fresh container binding, disabled-by-default policy, UX limitations and
-last complete release rollback. Steward approval is the last release step.
-Rollback first disables the new catalog entry/route through official operations,
-then uses the official previous-release personal workflow; retain additive
-staged/disabled rows and audit/migration records, never hand-delete accounting.
-No commercial release, queue, host or branch changes.
+Before enabling the backend, verify the exact private request/metadata/profile,
+current official publisher, two-key receipt/recovery state and current container
+identity. Normal failure and official rollback must restore the matching key state
+before restarting the previous stack. An unresolved receipt blocks survivor or
+manual restore success; a successor must obtain real official ownership before
+reconciling it. Never restore an unrelated whole env backup or erase accounting.
 
-After official release, real personal web login/select/send/reply screenshots,
-same-window cc5 ps/pts/args and task tmux prompt+reply, actual execution container
-marker/hash/cwd/uid/pidns verification and cleanup are all mandatory. Save under
-evidence/cc5-interactive with UTC/runId/build/model/turn. The temporary one-tool
-profile lacks normal Box files/skills/browser/background/multimodal capabilities;
-record latency/behavior honestly, never call it full P3 or equivalent final UX.
-Full P3 must restore capabilities and pass real t1562u postrelease acceptance.
+Acceptance still requires the normal personal web login and exact scoped new chat,
+original native host/tool evidence, actual container command receipt, proved
+billing attribution and independent remote-stop proof. Preserve UTC, source/build,
+request and run evidence privately. A direct native TUI result is a separate
+milestone; it does not prove the complete web chain or mark the full P3 work DONE.
 
-## Child tool wiring checkpoint (11/02)
+## Superseded checkpoints
 
-The Node stdio child's production entry reads a separate root-owned RO
-`authority-public.json` from the same supervisor bind; no inherited environment
-or RPC field selects its signing keys. READY starts one `/tool/next` pump.
-Original stdout buffers are validated by the complete-tool observer, then
-forwarded unchanged. The pump verifies the signed delivery against its trusted
-admission, waits for that original tool_use, and executes the fixed command in
-this child's execution container. A single `/tool/result` returns the real
-terminal receipt; unknown result delivery never repeats the effect. The fixed
-persistent root is `/home/agent/.openclaude/.cc5-t1555u`, covered by the download
-blocklist. Direct raw transport fixtures may omit tools; the production main
-always loads the protected keyring and supplies the pump. This is not a model
-or browser acceptance result. Plan approved by this-session research_review.
-
-## Approved C profile controller (11/02)
-
-`cc5-host-controller.py` starts from the task-only controller already reviewed
-on P3 commit 24294c82b. Its original five installed sources remain byte-for-byte
-unchanged; this minimal branch carries the controller so it has no runtime
-source dependency on the unmerged P3 libraries. The fixed MCP source hash is
-pinned in this controller. A stopped task alone may atomically install the
-separate private cprofile; launch and evidence collection revalidate its exact
-files, owner, modes and hashes. Only private CLI 2.1.316 and the previously
-approved trusted work directory can launch. All builtins/settings/slash commands
-are disabled, strict MCP permits only the fixed roundtrip. Exact `/proc` argv
-preserves both empty arguments; ps text alone cannot prove them. The unrelated
-cc5-login remains under the original narrow metadata checks and is never
-captured. Sending TERM is not exit proof: the independent prove-stopped action
-requires the recorded host/Claude/observed descendant identities, run directory
-and both task tmux sessions to be absent. It never marks SSH EOF as stopped.
-No new TUI startup or real conversation has occurred for these fixtures.
-Plan and copy adjustment approved by this-session engine_inventory.
-
-## Steward 12:52 connection update: preserve restrict + from
-
-Generate a new task-only ed25519 key on v5-dev; only its public key is delivered
-to the steward. Connect directly from v5-dev to the steward-provided dedicated
-cc5 account. No old key, Box hop, OS Login/IAM, new TCP listener, firewall change
-or sshd mutation is used. Dedicated user/HOME/login/binary metadata is still
-pending. The current approved controller and original host contain /home/box
-constraints; do not deploy them under an unconfirmed identity or borrow login
-files. Freeze the confirmed profile and update candidate digests before install.
-
-To retain `restrict,from=...`, use ordinary SSH `-T` exec stdio rather than SSH
--R/-L/-D. One channel transports the original host's bytes. A separate pinned
-virtual-MCP helper listens only on its own cc5 AF_UNIX tool.sock and frames the
-one request/response over its SSH stdin/stdout. Its READY must precede launching
-the original host. Only v5's fixed local toolServer endpoint receives the RPC;
-no model operation executes in the helper. It preserves raw request/receipt
-bytes and typed RPC/native IDs, persists attempt before dispatch and never
-retries unknown delivery. The helper records its own PID/startTicks durably;
-independent stop proof also requires that process to have exited. The profile
-pins both Python sources. Socket cleanup checks its original inode and UID.
-This-session research_review approved this connection adjustment. Existing
-restrict allows normal exec; no forwarding permission exception is requested.
-Python fixture counts describe local transport only, never actual SSH or chat.
-
-## Relay core checkpoint (11/02, transport adapter still missing)
-
-The privileged host relay runs on v5-dev under the revised direct-SSH topology.
-It exposes two distinct private Unix listeners: authenticated control/stream
-for the new execution container, and the fixed MCP tool endpoint for the stdio
-helper's local pump. open/admit join one host promise, including synchronous
-unknown startup; fresh signed admission precedes the user dispatch journal and
-original stdin write. Duplicate sequence/hash is ignored, conflict or gaps
-stop without replay. Root state, not the MCP caller, adds scope/native session/
-authority/lease/admission to the sole delivery; both host and container observe
-the original full tool_use. Receipt returns once, and stopped/expired admission
-never reopens. Independent stop remains callable after expiry and only returns
-positive when the actual host port proves absence. The future concrete SSH
-adapter must treat either host or helper-channel loss as a transport failure
-and invoke this stop, never translate SSH EOF into remoteStopped. It must also
-ready the helper before launching the original host. No concrete SSH adapter
-or fresh-container supervisor caller is claimed by this core checkpoint.
+The earlier test slice proposed a fresh account, a hidden Cursor-family model and
+new pricing rows, and described the SSH adapter/supervisor as unfinished. Those
+requirements are superseded by this contract and are not deployment instructions.
+Their historical fixture results remain evidence of the old checkpoint only.
+The pinned-controller, original-frame, once-only-effect and independent-stop
+invariants remain applicable to the implemented native backend.

@@ -189,6 +189,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.sh"
 # shellcheck source=lib/v5-selfhost-rollback.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
@@ -1811,6 +1812,9 @@ egress_assert_no_orphan_listener() {
 }
 
 egress_slot_flip_then_master_restart() {
+  # The generic saga still calls restart after an extra-revert error. Fail closed
+  # here, before either service effect, unless the two-key receipt proves safety.
+  cc5_activation_restart_guard || return "$?"
   egress_slot_flip && systemctl restart "$V5_UNIT"
 }
 
@@ -1869,9 +1873,11 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   mkdir -p "$(dirname "$OC_HOTCFG_HISTORY")"
   if release_policy_enabled; then
     policy_adapter=release_policy_saga_adapter
-    extra_apply="release_policy_flip_live $(printf '%q' "$master_rel")"
-    extra_revert="release_policy_restore_live_before $(printf '%q' "$prev_arg")"
   fi
+  # Keep policy source hooks and the fixed two-key carrier in one compensated
+  # extra step. The generic saga marks it attempted before invoking the wrapper.
+  extra_apply="cc5_activation_extra_apply $(printf '%q' "$master_rel") $(printf '%q' "$prev_arg")"
+  extra_revert="cc5_activation_extra_revert $(printf '%q' "$prev_arg")"
   oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$BUILT_BUNDLE_REV" "$OC_HOTCFG_HISTORY" \
     "$RUNTIME_IMAGE" "$image_id" "$BUILT_RUNTIME_RELEASE" "$bundle_val" \
@@ -2082,6 +2088,10 @@ cmd_deploy() {
     local recovery_rc=0
     release_policy_recover_forward || recovery_rc=$?
     [[ "$recovery_rc" == 0 ]] || exit "$recovery_rc"
+    # Resume has no current cutover backup. The fixed index may locate only this
+    # same operation's original receipt; closure still verifies real history.
+    local CUTOVER_BACKUP=""
+    cc5_activation_finalize || { log "CC5 activation receipt unresolved after policy recovery; hold"; return 79; }
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
@@ -2299,6 +2309,10 @@ cutover_arm_survivor() { # <backup-dir>
   [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
   mkdir -p -- "$BREAKGLASS_ROOT"
   install -m 0755 "$src" "$BREAKGLASS_ROOT/cutover-survivor.sh" || return 1
+  install -m 0755 "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.py" "$BREAKGLASS_ROOT/cc5-activation.py" || return 1
+  # Preserve the existing installed live-backup recovery implementation.
+  # Its two official callers (this controller and the installed survivor) guard
+  # pending activation before invoking it; never replace it with worktree-only code.
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
   if [[ "$backup" == *"/pre-cutover-20260818-144626" ]]; then
@@ -2329,6 +2343,7 @@ cutover_backup_units_are_live_wd() { # <backup-dir>
 
 cutover_tier2_restore() { # <backup-dir>
   local backup="$1" restore
+  cc5_activation_restore_guard || return "$?"
   restore="/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh"
   [[ -d "$backup" ]] || { cutover_clog "二级失败:备份目录不存在 $backup"; return 1; }
   if ! cutover_backup_units_are_live_wd "$backup"; then
@@ -2348,6 +2363,10 @@ cutover_tier2_restore() { # <backup-dir>
 
 cutover_rollback_inplace() { # <failed-rel> <backup-dir>
   local backup="$2" raw prev
+  local CC5_ACTIVATION_COMPENSATING=1
+  # A post-saga cutover failure also reaches this path. Restore the two keys
+  # before switching/restarting the predecessor; UNKNOWN stops every fallback.
+  cc5_activation_revert || return "$?"
   cutover_clog "── 统一补偿出口 phase=${CUTOVER_PHASE:-?} ──"
   write_cutover_grace || true
   raw="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
@@ -3103,6 +3122,9 @@ cmd_cutover() {
   clear_stay_maintenance || cutover_clog "  ⚠ 撤销 stay 维护窗口失败(到期后看护自动忽略)"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  # Genuine saga/history is committed. Close the selected-key receipt before
+  # installing a predecessor watch on an official rollback.
+  cc5_activation_finalize || { cutover_clog "CC5 activation receipt unresolved; hold"; return 79; }
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
   fi

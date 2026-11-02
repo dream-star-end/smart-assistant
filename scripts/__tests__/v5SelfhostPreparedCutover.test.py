@@ -123,6 +123,7 @@ PY
         ''')
         self.h.script = self.h.script.replace('build_master_release() {', 'fixture_build_master_release() {')
         self.h.script += '\nsource ' + repr(str(ROOT / 'scripts/lib/v5-selfhost-model-policy.sh')) + '\n'
+        self.h.script += '\nsource ' + repr(str(ROOT / 'scripts/lib/v5-selfhost-cc5-activation.sh')) + '\n'
         self.h.script += '\n' + '\n'.join((deploy_functions, runtime_functions, master_functions))
         self.h.script += r'''
 export T SHA
@@ -146,6 +147,7 @@ oc_hotcfg__die() { echo "$*" >&2; return 1; }
 tsum_mark() { fixture_event "$1"; }
 release_policy_enabled() { return 1; }
 release_policy_guard_owner() { ! flock -n "$SELFHOST_DEPLOY_LOCK" true; }
+cc5_activation_py() { fixture_event "cc5-carrier:$1"; }
 fixture_seal_master() {
   local rel="$1" digest
   mkdir -p "$rel/deploy/v5-selfhost" "$rel/scripts/lib" "$rel/packages/commercial/src/billing"

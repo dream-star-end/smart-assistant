@@ -4,6 +4,32 @@
 # 成功提交后必须 --disarm。长期看护仍保持 dry/disabled,本脚本只覆盖本次窗口。
 set -euo pipefail
 
+# Installed recovery paths only observe this carrier. They cannot borrow a dead
+# publisher's lock or turn an uncertain env replacement into recovery success.
+cc5_activation_recovery_safe() {
+  local index=/opt/openclaude/cc5-t1555u/activation-index.json
+  local helper=/opt/openclaude/v5-selfhost-breakglass/cc5-activation.py
+  if [[ -f "$helper" && ! -L "$helper" ]]; then
+    python3 "$helper" guard
+    return "$?"
+  fi
+  # An old/unconfigured installation may have no helper. Only proven absence
+  # is safe; inaccessible or symlinked parents cannot masquerade as absence.
+  python3 - "$index" <<'CC5_ABSENCE'
+import os,pathlib,stat,sys
+p=pathlib.Path(sys.argv[1])
+try:
+    for parent in reversed(p.parents):
+        try: info=parent.lstat()
+        except FileNotFoundError: sys.exit(0)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022: sys.exit(75)
+    try: p.lstat()
+    except FileNotFoundError: sys.exit(0)
+except OSError: sys.exit(75)
+sys.exit(75)
+CC5_ABSENCE
+}
+
 SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
 SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 SURVIVOR_RESTORE="${SURVIVOR_RESTORE:-/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh}"
@@ -214,6 +240,7 @@ backup_units_are_live_wd() {
 
 do_restore() {
   local backup rc
+  cc5_activation_recovery_safe || { log "CC5 receipt unresolved; no restore or success"; return 75; }
   log "执行首次二级恢复"
   if [[ -n "$SURVIVOR_RESTORE_CMD" ]]; then
     # shellcheck disable=SC2086
@@ -241,6 +268,7 @@ do_restore() {
 }
 
 maybe_restore() {
+  cc5_activation_recovery_safe || { log "CC5 receipt unresolved; hold"; return 75; }
   release_policy_context_absent || { log "release-policy hold: no automatic restore or success"; return 75; }
   local phase
   if [[ -f "$SURVIVOR_COMMITTED" ]]; then
@@ -281,6 +309,7 @@ watch_loop() {
   for ((i = 0; i < SURVIVOR_MAX_LOOPS; i++)); do
     release_policy_context_absent || { log "release-policy hold: poll exits unresolved"; return 75; }
     if [[ -f "$SURVIVOR_COMMITTED" ]]; then
+      cc5_activation_recovery_safe || { log "CC5 receipt unresolved despite marker; hold"; return 75; }
       log "committed,解除监视"
       exit 0
     fi
