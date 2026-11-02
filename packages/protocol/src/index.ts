@@ -98,3 +98,6 @@ export type {
   G8ReplayVerdict,
   G8ReplayVerdictName,
 } from './g8ReplayJudge.js'
+
+export * from './cc5TestModel.js'
+export * from './cc5Backend.js'

@@ -119,6 +119,7 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 source "$RUNTIME_LIB"
 # Explicit per-train policy; legacy invocations keep the original default.
 source "$SCRIPT_DIR/lib/v5-selfhost-release-policy.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-host-memory.sh"
 MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
@@ -143,6 +144,7 @@ ROLLBACK_ORIG_PREV=""
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
 RELEASE_POLICY_RESUME=0
+RELEASE_POLICY_SAMPLER_RESTORE=0
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
 # Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
 # 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
@@ -189,6 +191,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-prewarm.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-runtime-build.sh"
 # shellcheck source=lib/v5-selfhost-env.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.sh"
 # shellcheck source=lib/v5-selfhost-rollback.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
@@ -269,8 +272,10 @@ cleanup_selfhost_deploy() {
     trap - EXIT
     exit 86
   fi
-  if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
-  if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
+  # Explicit sampler recovery keeps the existing application intent/phase intact.
+  # It must not resolve preparation-abort or restore an application pointer.
+  if [[ "$exit_rc" != 0 && "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" != 1 ]]; then release_policy_abort_unexposed || true; fi
+  if [[ "$exit_rc" != 0 && "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" != 1 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
     rollback_restore_prev_if_unchanged || true
   fi
   # 后台 runtime release 先收尾再释放锁/train;split prepare 子进程继承 artifact fd 9。
@@ -539,6 +544,9 @@ maybe_acquire_selfhost_deploy_lock() {
         return 0  # prepare first; selfhost_prepared_enter_flip owns the deploy lock later
       fi
       acquire_selfhost_deploy_lock
+      # Sampler-only recovery needs the same official lock/fencing, but never
+      # stops artifact prewarm or enters application preparation.
+      [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" == 1 ]] && return 0
       prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "预热未停净,拒绝发布"
       case "$MODE" in deploy|bootstrap|build-master-only) selfhost_prepare_lock ;; esac
       ;;
@@ -570,7 +578,10 @@ usage() {
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --resume-release-policy --lease-train=ID --target-sha=SHA
-                        仅核对/补齐同 operation 历史与验收;不切流、不重启,未知现场保持阻塞
+                        仅核对/补齐同 operation 历史与验收;不切应用流量、不重启 master/egress,
+                        finalizer 可补齐独立采样器;未知现场保持阻塞
+  --restore-host-memory 仅与上述 resume 同用:由原 operation 回执选择首次 snapshot,
+                        只恢复独立采样器;保留应用 hold,返回79,不继续 forward 或写成功
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
@@ -615,6 +626,7 @@ for arg in "$@"; do
     --force-npm-ci) FORCE_NPM_CI=1 ;;
     --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
+    --restore-host-memory) RELEASE_POLICY_SAMPLER_RESTORE=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
     --preflight|--bootstrap|--deploy|--prepare|--smoke|--status|--build-master-only|--prewarm-artifacts|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
@@ -637,6 +649,10 @@ done
 if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
   [[ "$MODE" == deploy && -n "$LEASE_TRAIN_ID" && -n "$LEASE_TARGET_SHA" && "$DRY" != 1 ]] \
     || die "--resume-release-policy requires --deploy --lease-train=<original> --target-sha=<original>; no dry-run"
+fi
+if [[ "$RELEASE_POLICY_SAMPLER_RESTORE" == 1 ]]; then
+  [[ "$RELEASE_POLICY_RESUME" == 1 ]] \
+    || die "--restore-host-memory requires --resume-release-policy and its original train/SHA; no snapshot path"
 fi
 [[ "$FORCE_ENV" == 1 && "$MODE" != "bootstrap" ]] && die "--force-env 只能与 --bootstrap 同用"
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
@@ -1811,6 +1827,9 @@ egress_assert_no_orphan_listener() {
 }
 
 egress_slot_flip_then_master_restart() {
+  # The generic saga still calls restart after an extra-revert error. Fail closed
+  # here, before either service effect, unless the two-key receipt proves safety.
+  cc5_activation_restart_guard || return "$?"
   egress_slot_flip && systemctl restart "$V5_UNIT"
 }
 
@@ -1869,9 +1888,11 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   mkdir -p "$(dirname "$OC_HOTCFG_HISTORY")"
   if release_policy_enabled; then
     policy_adapter=release_policy_saga_adapter
-    extra_apply="release_policy_flip_live $(printf '%q' "$master_rel")"
-    extra_revert="release_policy_restore_live_before $(printf '%q' "$prev_arg")"
   fi
+  # Keep policy source hooks and the fixed two-key carrier in one compensated
+  # extra step. The generic saga marks it attempted before invoking the wrapper.
+  extra_apply="cc5_activation_extra_apply $(printf '%q' "$master_rel") $(printf '%q' "$prev_arg")"
+  extra_revert="cc5_activation_extra_revert $(printf '%q' "$prev_arg")"
   oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$BUILT_BUNDLE_REV" "$OC_HOTCFG_HISTORY" \
     "$RUNTIME_IMAGE" "$image_id" "$BUILT_RUNTIME_RELEASE" "$bundle_val" \
@@ -1991,17 +2012,6 @@ cmd_bootstrap() {
 2) 联系维护者跑带 joint 的首次 bootstrap,或先手工写 env/网再 --deploy。"
 }
 
-explain_dirty_semantics() {
-  log "── 脏工作树三面语义 ──"
-  log "  master live     : git archive HEAD → 脏文件不会进线上进程 cwd"
-  log "  runtime-release : git archive HEAD → 脏文件不会进容器 bind"
-  if [[ "$PLATFORM_FROM_HEAD" == 1 ]]; then
-    log "  platform bundle : --platform-from-head → 也从已提交树 archive,不带脏"
-  else
-    log "  platform bundle : 默认拷工作树 → 未提交的 platform-runtime 会进全员容器"
-    log "                    要干净请加 --platform-from-head"
-  fi
-}
 
 # 发布前 Incident trailer 快检。放在 lease_train_begin 之后、构建之前:
 #   · 之后 —— 失败要经 EXIT trap 把本班 train 记 failed(worker 对同 target 不自动重发,
@@ -2080,8 +2090,16 @@ cmd_deploy() {
   local SELFHOST_SPLIT_PREPARED=0
   if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
     local recovery_rc=0
-    release_policy_recover_forward || recovery_rc=$?
+    if [[ "${RELEASE_POLICY_SAMPLER_RESTORE:-0}" == 1 ]]; then
+      release_policy_recover_host_memory || recovery_rc=$?
+    else
+      release_policy_recover_forward || recovery_rc=$?
+    fi
     [[ "$recovery_rc" == 0 ]] || exit "$recovery_rc"
+    # Resume has no current cutover backup. The fixed index may locate only this
+    # same operation's original receipt; closure still verifies real history.
+    local CUTOVER_BACKUP=""
+    cc5_activation_finalize || { log "CC5 activation receipt unresolved after policy recovery; hold"; return 79; }
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
@@ -2299,6 +2317,10 @@ cutover_arm_survivor() { # <backup-dir>
   [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
   mkdir -p -- "$BREAKGLASS_ROOT"
   install -m 0755 "$src" "$BREAKGLASS_ROOT/cutover-survivor.sh" || return 1
+  install -m 0755 "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.py" "$BREAKGLASS_ROOT/cc5-activation.py" || return 1
+  # Preserve the existing installed live-backup recovery implementation.
+  # Its two official callers (this controller and the installed survivor) guard
+  # pending activation before invoking it; never replace it with worktree-only code.
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script"; return 1; }
   if [[ "$backup" == *"/pre-cutover-20260818-144626" ]]; then
@@ -2329,6 +2351,7 @@ cutover_backup_units_are_live_wd() { # <backup-dir>
 
 cutover_tier2_restore() { # <backup-dir>
   local backup="$1" restore
+  cc5_activation_restore_guard || return "$?"
   restore="/opt/openclaude/v5-selfhost-breakglass/restore-worktree-units.sh"
   [[ -d "$backup" ]] || { cutover_clog "二级失败:备份目录不存在 $backup"; return 1; }
   if ! cutover_backup_units_are_live_wd "$backup"; then
@@ -2348,6 +2371,10 @@ cutover_tier2_restore() { # <backup-dir>
 
 cutover_rollback_inplace() { # <failed-rel> <backup-dir>
   local backup="$2" raw prev
+  local CC5_ACTIVATION_COMPENSATING=1
+  # A post-saga cutover failure also reaches this path. Restore the two keys
+  # before switching/restarting the predecessor; UNKNOWN stops every fallback.
+  cc5_activation_revert || return "$?"
   cutover_clog "── 统一补偿出口 phase=${CUTOVER_PHASE:-?} ──"
   write_cutover_grace || true
   raw="$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)"
@@ -3103,6 +3130,9 @@ cmd_cutover() {
   clear_stay_maintenance || cutover_clog "  ⚠ 撤销 stay 维护窗口失败(到期后看护自动忽略)"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  # Genuine saga/history is committed. Close the selected-key receipt before
+  # installing a predecessor watch on an official rollback.
+  cc5_activation_finalize || { cutover_clog "CC5 activation receipt unresolved; hold"; return 79; }
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
   fi

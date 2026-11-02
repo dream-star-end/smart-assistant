@@ -1501,6 +1501,9 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const ids = continuation.map((hit) => hit.requestId).filter((id): id is string => Boolean(id));
       const firstId = liveHits.find((hit) => hit.kind !== "live-continuation" && hit.status === 200)?.requestId;
       assert.equal(typeof firstId, "string");
+      // HTTP/native completion precedes billing COMMIT; await both exact requests before reading.
+      await waitForCommitted(admin, SCHEMA, firstId!);
+      await waitForCommitted(admin, SCHEMA, ids[0]!);
       const linked = await pool.query<{ request_id: string; state: string; owner: string | null; resume: string | null }>(
         `SELECT request_id, state, ctx->>'boxOwnerRequestId' AS owner, ctx->>'boxResumeRequestId' AS resume
            FROM request_finalize_journal WHERE request_id = $1 OR request_id = $2`,

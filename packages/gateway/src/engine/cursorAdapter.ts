@@ -2840,4 +2840,7 @@ export const _internals = {
   isBlockingOcMemoryDelegateCommand,
 }
 
-registerEngine('cursor', (opts) => new CursorRoutingAdapter(opts))
+registerEngine('cursor', (opts) => {
+  // Resolve this route before constructing any real credential-pool selector.
+  return new CursorRoutingAdapter(opts)
+})

@@ -26,6 +26,7 @@
 
 import { z } from "zod";
 import { randomBytes, createHash, randomInt } from "node:crypto";
+import type { PoolClient } from "pg";
 import { tx } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
@@ -197,6 +198,41 @@ export function isEmailDomainBlocked(
   return false;
 }
 
+/** Internal normal-registration core; register() owns validation, transaction and mail policy. */
+async function insertUnverifiedAccount(client: PoolClient, input: {
+  email: string;
+  passwordHash: string;
+  verificationHash: string;
+  expiresAtIso: string;
+  display_name?: string;
+  terms_version?: string;
+}): Promise<string> {
+  // INSERT user;email UNIQUE 约束撞了会抛 23505。
+  // credits 不带,默认 0。注册赠金已于 2026-07-07 下线;免费额度由 login/SSO/
+  // GET /api/me 调用 ensureFreeSubscription 发放期内桶 300,verifyEmail 不再发积分。
+  // v3 退役:新号直接 v5 原生(v5_migrated_at=NOW()+status=migrated,满足 0099
+  // consistency CHECK)。新号无 v3 数据,迁移是 no-op,故在建号时就置权威源,
+  // routeChannelForUser 恒返回 v5、v3MayServe 恒 false → 永不 provisioning v3 容器。
+  // 协议同意留证(0125):terms_version 有值 = 注册页勾选过,accepted_at 同刻落
+  // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
+  const ins = await client.query<{ id: string }>(
+    `INSERT INTO users(email, password_hash, display_name, v5_migrated_at, v5_migration_status,
+                       terms_version, terms_accepted_at)
+     VALUES ($1, $2, $3, NOW(), 'migrated',
+             $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END)
+     RETURNING id::text AS id`,
+    [input.email, input.passwordHash, input.display_name ?? null, input.terms_version ?? null],
+  );
+  const uid = ins.rows[0].id;
+  await client.query(
+    `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
+     VALUES ($1, $2, 'verify_email', $3)`,
+    [uid, input.verificationHash, input.expiresAtIso],
+  );
+  return uid;
+
+}
+
 export async function register(
   raw: unknown,
   deps: RegisterDeps,
@@ -270,29 +306,8 @@ export async function register(
   let userId: string;
   try {
     userId = await tx<string>(async (client) => {
-      // INSERT user;email UNIQUE 约束撞了会抛 23505。
-      // credits 不带,默认 0。注册赠金已于 2026-07-07 下线;免费额度由 login/SSO/
-      // GET /api/me 调用 ensureFreeSubscription 发放期内桶 300,verifyEmail 不再发积分。
-      // v3 退役:新号直接 v5 原生(v5_migrated_at=NOW()+status=migrated,满足 0099
-      // consistency CHECK)。新号无 v3 数据,迁移是 no-op,故在建号时就置权威源,
-      // routeChannelForUser 恒返回 v5、v3MayServe 恒 false → 永不 provisioning v3 容器。
-      // 协议同意留证(0125):terms_version 有值 = 注册页勾选过,accepted_at 同刻落
-      // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
-      const ins = await client.query<{ id: string }>(
-        `INSERT INTO users(email, password_hash, display_name, v5_migrated_at, v5_migration_status,
-                           terms_version, terms_accepted_at)
-         VALUES ($1, $2, $3, NOW(), 'migrated',
-                 $4, CASE WHEN $4::text IS NULL THEN NULL ELSE NOW() END)
-         RETURNING id::text AS id`,
-        [input.email, passwordHash, input.display_name ?? null, input.terms_version ?? null],
-      );
-      const uid = ins.rows[0].id;
-      await client.query(
-        `INSERT INTO email_verifications(user_id, token_hash, purpose, expires_at)
-         VALUES ($1, $2, 'verify_email', $3)`,
-        [uid, verify.hash, expiresAtIso],
-      );
-      return uid;
+      return insertUnverifiedAccount(client, { ...input, passwordHash,
+        verificationHash: verify.hash, expiresAtIso });
     });
   } catch (err) {
     // pg 唯一约束冲突

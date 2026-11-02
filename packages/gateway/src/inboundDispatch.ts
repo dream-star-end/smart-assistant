@@ -769,6 +769,7 @@ export async function dispatchInbound(
               canonicalModel: turnAuthority.canonicalModel,
               engine: turnAuthority.engine,
               source: 'bridge_signed' as const,
+              ...(turnAuthority.executionBackend ? { executionBackend: turnAuthority.executionBackend } : {}),
             },
           }
         : {}),
@@ -2310,6 +2311,7 @@ export async function dispatchInbound(
                   supportsVision: turnAuthority.supportsVision,
                   supportedEfforts: turnAuthority.supportedEfforts,
                   capabilityProfile: turnAuthority.capabilityProfile,
+                  executionBackend: turnAuthority.executionBackend,
                 }),
               },
             }

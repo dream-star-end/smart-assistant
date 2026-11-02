@@ -73,6 +73,32 @@ POLICY_PRESENCE
 }
 
 
+# CC5 activation mutation guard v1
+cc5_activation_recovery_safe() {
+  local index=/opt/openclaude/cc5-t1555u/activation-index.json
+  local helper=/opt/openclaude/v5-selfhost-breakglass/cc5-activation.py
+  if [[ -f "$helper" && ! -L "$helper" ]]; then
+    python3 "$helper" guard
+    return "$?"
+  fi
+  # An old/unconfigured installation may have no helper. Only proven absence
+  # is safe; inaccessible or symlinked parents cannot masquerade as absence.
+  python3 - "$index" <<'CC5_ABSENCE'
+import os,pathlib,stat,sys
+p=pathlib.Path(sys.argv[1])
+try:
+    for parent in reversed(p.parents):
+        try: info=parent.lstat()
+        except FileNotFoundError: sys.exit(0)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_mode&0o022: sys.exit(75)
+    try: p.lstat()
+    except FileNotFoundError: sys.exit(0)
+except OSError: sys.exit(75)
+sys.exit(75)
+CC5_ABSENCE
+}
+
+
 wlog() {
   local msg
   msg="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
@@ -1370,6 +1396,7 @@ EOF
 watch_policy_mutation() { # trusted local function
   local callback="$1" rc=0 policy_fd="" existing=0
   release_policy_context_absent || return 75
+  cc5_activation_recovery_safe || return 75
   if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then "$callback"; return $?; fi
   # Auto-recovery already owns fd8. Verify that exact open-file lock instead
   # of acquiring a different fd and deadlocking against the same invocation.
@@ -1391,7 +1418,7 @@ WATCH_OWNED
     exec {policy_fd}<>"$WATCH_LOCK" || return 75
     if ! flock -n "$policy_fd"; then exec {policy_fd}>&-; return 75; fi
   fi
-  if release_policy_context_absent; then "$callback" || rc=$?; else rc=75; fi
+  if release_policy_context_absent && cc5_activation_recovery_safe; then "$callback" || rc=$?; else rc=75; fi
   if [[ -n "$policy_fd" ]]; then exec {policy_fd}>&-; fi
   return "$rc"
 }

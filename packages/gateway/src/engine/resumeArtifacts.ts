@@ -1,3 +1,4 @@
+import { isCc5ResumeId } from './cc5ResumeId.js'
 /**
  * Engine-agnostic "is this native resume id still resumable on disk?" probe.
  *
@@ -222,6 +223,8 @@ export function probeResumeArtifact(
   resumeId: string,
   ctx: ResumeArtifactContext = {},
 ): ResumeArtifactProbe {
+  // Remote evidence is never inferred from a local Cursor store/JSONL.
+  if (isCc5ResumeId(resumeId)) return { exists: false }
   const { claudeConfigDir, codexHome, openclaudeHome } = resolveCtx(ctx)
   let r: ResumeArtifactProbe | 'unknown' | null
   switch (engine) {

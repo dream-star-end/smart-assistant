@@ -9,6 +9,7 @@
 import * as assert from 'node:assert/strict'
 import { sign as cryptoSign, generateKeyPairSync } from 'node:crypto'
 import { describe, it } from 'node:test'
+import { CC5_INTERACTIVE_BACKEND, CC5_NATIVE_MODEL, type Cc5ExecutionBackend } from '../cc5Backend.js'
 
 import {
   TURN_LEASE_TTL_MS,
@@ -110,6 +111,57 @@ function expectCode(fn: () => unknown, code: string): void {
   }
   assert.fail(`expected throw with code ${code}`)
 }
+
+describe('signed execution backend scope', () => {
+  const backend: Cc5ExecutionBackend = {
+    kind: CC5_INTERACTIVE_BACKEND,
+    sessionKey: 'agent:main:webchat:dm:new_chat_123',
+    operationId: '11111111-1111-4111-8111-111111111111',
+  }
+  function nativePayload(): ModelAuthorityPayload {
+    return makePayload({ engine: 'ccb', canonicalModel: CC5_NATIVE_MODEL, executionBackend: backend,
+      executionDescriptor: { capabilityProfile: { ccb: { capabilityZero: false,
+        supportsThinking: true, contextOwner: 'box-native-v1' } },
+        capabilitySchemaVersion: 1, contextWindow: 200000, supportsVision: true,
+        supportedEfforts: [] } })
+  }
+  it('roundtrips the existing Sonnet identity and context owner with its immutable backend', () => {
+    const payload = nativePayload()
+    const verified = verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW)
+    assert.deepEqual(verified, payload)
+    assert.equal(Object.isFrozen(verified.executionBackend), true)
+  })
+  it('absence preserves ordinary authority payloads without synthesizing a backend', () => {
+    const original = makePayload()
+    assert.deepEqual(verifyAuthority(signAuthorityEnvelope(original), keyring, NOW), original)
+    assert.equal('executionBackend' in verifyAuthority(signAuthorityEnvelope(original), keyring, NOW), false)
+  })
+  it('changing a valid session or operation after signing fails verification', () => {
+    const payload = nativePayload()
+    const envelope = JSON.parse(Buffer.from(signAuthorityEnvelope(payload), 'base64url').toString())
+    for (const change of [
+      { sessionKey: 'agent:main:webchat:dm:other_chat_123' },
+      { operationId: '22222222-2222-4222-8222-222222222222' },
+    ]) {
+      const forged = structuredClone(envelope)
+      Object.assign(forged.payload.executionBackend, change)
+      expectCode(() => verifyAuthority(Buffer.from(JSON.stringify(forged)).toString('base64url'), keyring, NOW), 'VerifyFail')
+    }
+  })
+  it('even valid signatures cannot authorize unknown shape, backend, model or engine', () => {
+    for (const change of [
+      { engine: 'cursor' }, { canonicalModel: 'cc5-remote-t1555u' },
+      { executionBackend: { ...backend, other: true } },
+      { executionBackend: { ...backend, kind: 'other-backend' } },
+      { executionBackend: { ...backend, sessionKey: 'agent:main:main' } },
+      { executionBackend: { ...backend, operationId: 'not-a-uuid' } },
+      { executionBackend: null },
+    ]) {
+      const payload = { ...nativePayload(), ...change } as ModelAuthorityPayload
+      expectCode(() => verifyAuthority(signAuthorityEnvelope(payload), keyring, NOW), 'BadShape')
+    }
+  })
+})
 
 // --- JCS ---------------------------------------------------------------------
 

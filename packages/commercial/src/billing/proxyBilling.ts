@@ -35,6 +35,7 @@
 import { readPoolOutcome, type PoolOutcome } from "../account-pool/policy/outcome.js";
 import { isBoxApiModel } from "@openclaude/protocol";
 import { unadmittedToolRolloverSql } from "./boxToolRolloverIdentity.js";
+import { REMOTE_NATIVE_BILLING_RECOVERY_VERSION } from "./remoteNativeBillingIdentity.js";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
@@ -389,6 +390,7 @@ export async function abortInflightJournal(
               ELSE '{}'::jsonb END,
             updated_at=NOW()
       WHERE request_id=$1
+        AND COALESCE(ctx->>'remoteNativeBillingRecovery', '') <> '${REMOTE_NATIVE_BILLING_RECOVERY_VERSION}'
         AND (COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'
           OR COALESCE(ctx->>'boxState', '') IN ('', 'prestart_stopped'))
         AND (${settlementClaimId === undefined

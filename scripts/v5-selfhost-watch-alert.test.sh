@@ -4,8 +4,8 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALERT="${ALERT_BIN_UNDER_TEST:-$DIR/v5-selfhost-watch-alert.sh}"
-WATCH="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
-for b in "$ALERT" "$WATCH"; do
+WATCH_SOURCE="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
+for b in "$ALERT" "$WATCH_SOURCE"; do
   case "$(readlink -f "$b")" in /opt/openclaude/v5-selfhost-watch/*) echo "REFUSE: 不测已安装副本" >&2; exit 2 ;; esac
 done
 
@@ -17,6 +17,13 @@ bad() { fail=$((fail + 1)); echo "FAIL $*"; }
 BASE="$(mktemp -d /tmp/v5-watch-alert.XXXXXX)"
 # 失败路径可能留下仍在睡的 psql 替身;收尾一并清掉。
 trap 'pkill -f "$BASE/" 2>/dev/null || true; rm -rf "$BASE"' EXIT
+# Alert fixtures model an unconfigured CC5 instance. Source the real watch,
+# then isolate only its fixed production CC5 absence dependency; the dedicated
+# activation suites exercise the actual guard's pending/root/reader behavior.
+WATCH="$BASE/watch-fixture.sh"
+printf '#!/usr/bin/env bash\nsource %q\ncc5_activation_recovery_safe() { return 0; }\nmain "$@"\n' \
+  "$WATCH_SOURCE" >"$WATCH"
+chmod 0700 "$WATCH"
 KEY="k3y-$(date +%s%N)-secret"
 # 库卡住的替身睡这么久。A18/A19 的时间上限按它推出(超时坏了就会等满它),
 # 不按空闲机器上的正常耗时推:门禁和运行时构建并跑时同样的拍会慢好几倍(OCV5-436)。
@@ -213,7 +220,7 @@ wsetup() {
   export WATCH_STUB_DISK_AVAIL_BYTES=$((100 * 1024 * 1024 * 1024)) WATCH_PG_BACKUP_STATUS="$C/no-pg-backup-status.json"
   unset WATCH_STUB_FAIL_LOUD || true
   mkdir -p "$C/run" "$C/inst" "$C/rel"
-  cp -- "$WATCH" "$WATCH_INSTALLED_BIN"
+  cp -- "$WATCH_SOURCE" "$WATCH_INSTALLED_BIN"
 }
 tick() { set +e; bash "$WATCH" --once >/dev/null 2>&1 </dev/null; TEC=$?; set -e; }
 events() { { jq -r .event "$C"/state/alert-dry/*.json 2>/dev/null || true; } | sort | tr '\n' ' '; }

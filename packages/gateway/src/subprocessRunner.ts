@@ -1,3 +1,4 @@
+import { CC5_NATIVE_MODEL, sameCc5ExecutionBackend } from '@openclaude/protocol'
 import { ccbDelegateMcpBudgetEnvironment } from './delegateMcpBudget.js'
 import { createCcbTranscriptRestoreSocket, type CcbTranscriptRestoreSocket } from './ccbTranscriptRestore.js'
 import { systemHelpEnvironment } from './systemHelpEnvironment.js'
@@ -334,6 +335,17 @@ export class SubprocessRunner extends EventEmitter {
 
   /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
   pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
+    if (this.opts.cc5BridgePort) {
+      if (descriptor?.canonicalModel !== CC5_NATIVE_MODEL || descriptor.contextOwner !== BOX_NATIVE_CONTEXT_OWNER ||
+          !descriptor.executionBackend ||
+          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.executionBackend) ||
+          !sameCc5ExecutionBackend(descriptor.executionBackend, this.opts.cc5BridgePort.executionBackend) ||
+          this.opts.cc5BridgePort.canonicalModel !== CC5_NATIVE_MODEL) {
+        throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+      }
+      return 'official-cc'
+    }
+    if (descriptor?.executionBackend || this.opts.executionBackend) throw new Error('CC5_BACKEND_TRANSPORT_REQUIRED')
     const next = applyBoxNativeHarness({
       model: this.opts.model,
       descriptor,
@@ -496,6 +508,9 @@ export class SubprocessRunner extends EventEmitter {
   private _startEpoch = 0
 
   async start(): Promise<void> {
+    if (this.opts.cc5BridgePort && !this.currentExecutionDescriptor) {
+      throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+    }
     if (this.proc) return
     const inflight = this._startPromise
     if (inflight) return inflight
@@ -550,6 +565,16 @@ export class SubprocessRunner extends EventEmitter {
     // is assigned would never bump _consecutiveCrashes, and the caller could
     // retry immediately and re-throw, burning CPU.
     try {
+    let proc: ReturnType<TerminalBackend['spawn']>
+    let spawnOpts: SpawnOpts
+    try {
+    if (this.opts.cc5BridgePort) {
+      spawnOpts = await this.opts.cc5BridgePort.prepare()
+      this._boundRepoBinding = null
+      this.spawnedUpstreamIsEgress = false
+      this.pendingOfficialSpawnEnv = null
+      this.spawnedOfficialHeaderFingerprint = undefined
+    } else {
     if (this.opts.boxResidentCc && !this.boxCcControlPath) {
       if (!this.opts.prepareBoxCc) {
         this.starting = false
@@ -785,9 +810,7 @@ export class SubprocessRunner extends EventEmitter {
       }
     }
 
-    let proc: ReturnType<TerminalBackend['spawn']>
-    try {
-      const spawnOpts: SpawnOpts = {
+      spawnOpts = {
           command,
           args,
           ccbBinaryDir: binaryDir,
@@ -915,6 +938,7 @@ export class SubprocessRunner extends EventEmitter {
         const env = spawnOpts.env as Record<string, string>
         env.ANTHROPIC_CUSTOM_HEADERS = _withTraceIdHeader(env.ANTHROPIC_CUSTOM_HEADERS ?? '', officialSpawnTrace)
       }
+    }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       if (epoch !== this._startEpoch) return
       timing.once('spawn_requested')
@@ -1100,6 +1124,7 @@ export class SubprocessRunner extends EventEmitter {
       // failed" crash. Record it so the gate fires on the next call.
       this.starting = false
       this._recordCrash({ startError: err instanceof Error ? err.message : String(err) })
+      if (this.opts.cc5BridgePort) await this.opts.cc5BridgePort.close()
       throw err
     }
 
@@ -1302,7 +1327,15 @@ export class SubprocessRunner extends EventEmitter {
       this.opts.authorityEngine ?? 'ccb',
     )
     turnTiming.once('runtime_resolved')
-    this.pinBoxNativeHarness(runtime.descriptor)
+    if (this.opts.cc5BridgePort) {
+      if (!authority || !turnKey || runtime.descriptor?.canonicalModel !== CC5_NATIVE_MODEL
+        || !runtime.descriptor.executionBackend
+        || !sameCc5ExecutionBackend(runtime.descriptor.executionBackend, this.opts.executionBackend)
+        || typeof userTextOrBlocks !== 'string' || this.readOnlyTurn || this.consultTurnBinding) {
+        throw new Error('CC5_TEST_AUTHORITY_REQUIRED')
+      }
+      this.pinBoxNativeHarness(runtime.descriptor)
+    } else this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
         lock: this.opts.advisorExecutionLock,
@@ -1366,11 +1399,21 @@ export class SubprocessRunner extends EventEmitter {
       : null
 
     turnTiming.once('recycle_complete')
+    // Admission durably reserves and marks possible remote effects BEFORE any
+    // local bridge /session/open can launch the native TUI.
+    if (this.opts.cc5BridgePort) {
+      try {
+        await this.opts.cc5BridgePort.admit({ authority: authority!, turnKey: turnKey!, model: this.opts.model! })
+      } catch (err) {
+        await this.shutdown()
+        throw err
+      }
+    }
     if (!this.proc) await this.start()
     turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
     this.delegateContextTraceId = turnTraceId
-    this.refreshDelegateContext(turnTraceId)
+    if (!this.opts.cc5BridgePort) this.refreshDelegateContext(turnTraceId)
     const envUpdateLine = envUpdateVars
       ? _buildUpdateEnvStdinLine({
           ...envUpdateVars,
@@ -1403,6 +1446,10 @@ export class SubprocessRunner extends EventEmitter {
    * live query and every subsequent `/v1/messages` call reads the new header.
    */
   async updateTurnLease(leaseEnvelope: string): Promise<void> {
+    if (this.opts.cc5BridgePort) {
+      await this.opts.cc5BridgePort.renew(leaseEnvelope)
+      return
+    }
     if (resolveCcbHarness(this.opts.harness) === 'official-cc') {
       if (
         this.opts.authorityEngine === 'cursor'
@@ -1496,6 +1543,7 @@ export class SubprocessRunner extends EventEmitter {
   async writeDelegateUserMessage(
     content: string,
   ): Promise<{ ok: boolean; processAlive: boolean; unknown?: boolean }> {
+    if (this.opts.cc5BridgePort) return { ok: false, processAlive: this.isRunning }
     const proc = this.proc
     if (!this.isInlinePushProcLive(proc) || !proc) return { ok: false, processAlive: false }
     const stdin = proc.stdin
@@ -1943,6 +1991,10 @@ export class SubprocessRunner extends EventEmitter {
 
   // 发送 interrupt control request — CCB 会中止当前 turn
   interrupt(): boolean {
+    if (this.opts.cc5BridgePort) {
+      void this.shutdown().catch(() => {}) // remote absence/finance owns unknown; never write a second input frame
+      return true
+    }
     if (!this.proc) return false
     try {
       const req = {
@@ -2095,6 +2147,11 @@ export class SubprocessRunner extends EventEmitter {
     this._startEpoch += 1
     this._startPromise = null
     this.starting = false
+    // Revoke first; remote proof and local shutdown proceed independently.
+    let remoteStopFailure: unknown
+    const remoteStop = this.opts.cc5BridgePort?.close().catch((error: unknown) => { remoteStopFailure = error })
+    try {
+    await (async () => {
     // Always clean up the session directory, even if there is no live process
     // (failed starts, already-exited runners, crash paths).
     if (!this.proc) {
@@ -2174,6 +2231,11 @@ export class SubprocessRunner extends EventEmitter {
     // Phase 5:本进程已死,清掉 ready binding。下次 start() 会按当时 repo state 重新评估。
     this._boundRepoBinding = null
     this.cleanupSessionDir()
+    })()
+    } finally {
+      await remoteStop
+    }
+    if (remoteStopFailure) throw new Error('CC5_REMOTE_STOP_UNPROVEN')
   }
 
   /** Capture-by-value barrier for the current process generation. */

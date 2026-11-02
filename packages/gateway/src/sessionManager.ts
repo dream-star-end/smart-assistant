@@ -1,6 +1,6 @@
 import type { PreheatPreparation } from './speculativePreheat.js'
 import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
-import { isBoxApiModel } from '@openclaude/protocol'
+import { type Cc5ExecutionBackend, isBoxApiModel } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -71,6 +71,7 @@ import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
 import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
+import './engine/ccbFactory.js'
 import { isBoxGptWebCatalogModel } from './engine/cursorBoxCc.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -1889,6 +1890,7 @@ export class SessionManager {
      *     catalog 判定,不许回落 baked)。
      */
     executionAuthority?: {
+      executionBackend?: Cc5ExecutionBackend
       canonicalModel: string
       engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'

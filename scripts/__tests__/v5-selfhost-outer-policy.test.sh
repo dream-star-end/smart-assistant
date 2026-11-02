@@ -73,6 +73,7 @@ export OC_HOTCFG_PLATFORM_ROOT="$WORK/platform" OC_HOTCFG_RELEASES_ROOT="$WORK/r
 export LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1
 source "$RUNTIME_LIB"
 source "$SCRIPT_DIR/lib/v5-selfhost-model-policy.sh"
+source "$SCRIPT_DIR/lib/v5-selfhost-cc5-activation.sh"
 for file in "$WORK/functions/"*.sh; do source "$file"; done
 
 # Transparent observer: exact Bash-declared real function body, name alone is
@@ -93,6 +94,8 @@ ARGS
 # Runtime/service/receipt boundaries, never saga/caller copies. Every mutation
 # intent is a fixture trace entry; no systemctl, SQL, network, model or deploy.
 trace() { printf '%s\n' "$*" >>"$OUTER_TRACE"; }
+# Root-private opt-in is absent in this policy-only fixture.
+cc5_activation_py() { trace "cc5-carrier:$1"; }
 log() { :; }; mlog() { :; }; die() { trace "UNEXPECTED_DIE:$*"; return 90; }
 source_commit() { printf '%040d\n' 0 | tr 0 2; }
 cutover_expected_source_commit() { source_commit; }
@@ -226,7 +229,7 @@ import json,sys
 c=json.load(open(sys.argv[1]));assert c['argc']==19 and c['arg19']=='release_policy_saga_adapter'
 assert c['liveBefore']==sys.argv[2],'outer flipped live before actual saga'
 assert c['master']==sys.argv[3] and c['previous']==sys.argv[2]
-assert c['extraApply'].startswith('release_policy_flip_live ') and c['extraRevert'].startswith('release_policy_restore_live_before ')
+assert c['extraApply'].startswith('cc5_activation_extra_apply ') and c['extraRevert'].startswith('cc5_activation_extra_revert ')
 CHECK_ARGS
   [[ "$(readlink -f "$MASTER_LIVE_LINK")" == "$DEPLOY_BUILT_RELEASE" ]]
   grep -qx "drain:$DEPLOY_BUILT_RELEASE" "$OUTER_TRACE"
