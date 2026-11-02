@@ -69,7 +69,7 @@ export function stripExcessMediaItems(
               // Keep the completed tool exchange valid when all its media
               // was removed. Pre-existing empty results are left unchanged.
               content: filtered.length > 0 ? filtered : [{
-                type: 'text',
+                type: 'text' as const,
                 text: '[Historical media removed to fit the request media limit. Re-read the source if needed.]',
               }],
             }
