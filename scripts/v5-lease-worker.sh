@@ -383,8 +383,14 @@ SQL
   if [[ -n "${INVOCATION_ID:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
     exec 8>&-
     local unit="oc-v5-lease-train-${id#tr-}"
+    # Keep the main deploy's existing signal/cleanup window. Once it exits,
+    # systemd must reap this train's remaining subtree even if its Python
+    # subreaper was SIGKILLed. Independent master/egress/survivor units are
+    # outside this cgroup. This does not promise phase cleanup while main lives.
     if ! systemd-run --quiet --collect --unit="$unit" --description="lease train $id → ${tip:0:12}" \
-         --property=KillMode=process --property=TimeoutStopSec=35min \
+         --property=KillMode=mixed --property=TimeoutStopSec=35min \
+         --property=ExitType=main --property=RemainAfterExit=no \
+         --property=SendSIGKILL=yes --property=FinalKillSignal=SIGKILL \
          --setenv=OC_V5_LEASE_TRAIN_ID="$id" --setenv=OC_V5_LEASE_DB="$LEASE_DB" \
          --setenv=HOME=/root --setenv=PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
          --property=StandardOutput="file:$logf" --property=StandardError="file:$logf" \

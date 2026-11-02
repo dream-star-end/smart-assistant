@@ -1,0 +1,58 @@
+name: V5 selfhost host-memory lifecycle
+
+on:
+  pull_request:
+    branches: [feat/v5-selfhost]
+    paths:
+      - scripts/v5-lease-worker.sh
+      - scripts/deploy-v5-selfhost.sh
+      - scripts/v5-selfhost-host-memory.py
+      - scripts/lib/v5-selfhost-host-memory*
+      - scripts/lib/v5-selfhost-release-policy.sh
+      - scripts/__tests__/v5_selfhost_*_test.py
+      - scripts/__tests__/v5SelfhostCanaryPrewarm.node-test.mjs
+      - deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service
+      - deploy/v5-selfhost/host-memory-action.json
+      - .github/workflows/v5-selfhost-host-memory.yml
+  push:
+    branches: [feat/v5-selfhost]
+    paths:
+      - scripts/v5-lease-worker.sh
+      - scripts/deploy-v5-selfhost.sh
+      - scripts/v5-selfhost-host-memory.py
+      - scripts/lib/v5-selfhost-host-memory*
+      - scripts/lib/v5-selfhost-release-policy.sh
+      - scripts/__tests__/v5_selfhost_*_test.py
+      - scripts/__tests__/v5SelfhostCanaryPrewarm.node-test.mjs
+      - deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service
+      - deploy/v5-selfhost/host-memory-action.json
+      - .github/workflows/v5-selfhost-host-memory.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: selfhost-host-memory-lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Fixture-only sampling, installation and owner-fencing checks
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 scripts/__tests__/v5_selfhost_host_memory_test.py -v
+          python3 scripts/__tests__/v5_selfhost_host_memory_install_test.py -v
+          python3 scripts/__tests__/v5_selfhost_host_memory_owner_test.py -v
+          python3 scripts/__tests__/v5_selfhost_train_cgroup_test.py -v
+      - name: Existing synthetic prewarm lifecycle regression
+        run: node --test scripts/__tests__/v5SelfhostCanaryPrewarm.node-test.mjs
+      - name: Unit and shell syntax checks without installation
+        run: |
+          systemd-analyze verify deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service
+          bash -n scripts/v5-lease-worker.sh scripts/deploy-v5-selfhost.sh scripts/lib/v5-selfhost-release-policy.sh scripts/lib/v5-selfhost-host-memory.sh

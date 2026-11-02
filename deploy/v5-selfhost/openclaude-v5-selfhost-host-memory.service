@@ -1,0 +1,45 @@
+[Unit]
+Description=V5 selfhost host memory and train cgroup sampler
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/
+ExecStart=/usr/bin/python3 -I -B /opt/openclaude/v5-selfhost-breakglass/host-memory/sampler.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+KillMode=control-group
+UMask=0077
+LogsDirectory=openclaude-v5-selfhost/host-memory
+LogsDirectoryMode=0700
+ReadWritePaths=/var/log/openclaude-v5-selfhost/host-memory
+ReadOnlyPaths=/proc /sys/fs/cgroup
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryAccounting=yes
+MemoryMax=64M
+CPUAccounting=yes
+CPUQuota=2%
+TasksMax=16
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=openclaude-v5-selfhost-host-memory
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
