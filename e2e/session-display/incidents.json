@@ -9770,7 +9770,7 @@
       "occurredAt": "2026-11-02",
       "severity": "P1",
       "symptom": "Box工具循环的外层历史从100张图增至102张时，通用媒体计数裁剪改写旧prefix，严格上下文hash拒绝合法续接。PR1350的非空占位未覆盖这个边界。Box从fresh起保持同一逻辑历史投影；服务端字节预算、owner/hash与一次工具结果领取不变。这里只证明外层协议与TEMP账务不变，不宣称原生上游任意图片数量都能完成。",
-      "rootFixCommit": "987e31cb5",
+      "rootFixCommit": "987e31cb",
       "regressions": [
         {
           "layer": "unit",
