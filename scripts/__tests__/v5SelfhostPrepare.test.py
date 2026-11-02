@@ -70,14 +70,14 @@ class Prepared(unittest.TestCase):
             'build_master_release() {',
             '  flock -n "$SELFHOST_DEPLOY_LOCK" true && echo deploy-free >>"$T/events" || echo deploy-busy >>"$T/events"',
             '  echo build >>"$T/events"; echo master >>"$T/gates"',
-            '  [[ "${FAIL_BUILD:-0}" == 0 ]] || die master-gate-failed',
             '  if [[ -n "${BUILD_BLOCK:-}" ]]; then touch "$T/build-ready"; fixture_wait "$BUILD_BLOCK"; fi',
-            '  BUILT_MASTER_RELEASE="$MASTER_RELEASES_ROOT/rel-test"; mkdir -p "$BUILT_MASTER_RELEASE"',
+            '  [[ "${FAIL_BUILD:-0}" == 0 ]] || die master-gate-failed',
+            '  BUILT_MASTER_RELEASE="$MASTER_RELEASES_ROOT/${FIXTURE_MASTER_NAME:-rel-test}"; mkdir -p "$BUILT_MASTER_RELEASE"',
             '  printf \'{"sourceCommit":"%s"}\\n\' "$1" >"$BUILT_MASTER_RELEASE/.complete"',
             '}',
             'build_runtime_release() {',
             '  echo runtime >>"$T/gates"; [[ "${FAIL_RUNTIME:-0}" == 0 ]] || die runtime-gate-failed',
-            '  BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-0123456789ab"; mkdir -p "$BUILT_RUNTIME_RELEASE"',
+            '  BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/${FIXTURE_RUNTIME_NAME:-rel-0123456789ab}"; mkdir -p "$BUILT_RUNTIME_RELEASE"',
             '  printf \'{"sourceCommit":"%s","digest":"e3b0c44298fc"}\\n\' "$1" >"$BUILT_RUNTIME_RELEASE/MANIFEST.json"',
             '}',
             fn('start_runtime_release_bg'), fn('await_runtime_release_bg'),
@@ -85,7 +85,7 @@ class Prepared(unittest.TestCase):
             'TMPDIR="$T"; RUNTIME_BG_PID=""; RUNTIME_BG_LOG=""; RUNTIME_BG_RESULT=""; RUNTIME_BG_RC=""',
             'build_platform_bundle() {',
             '  echo platform >>"$T/gates"; [[ "${FAIL_PLATFORM:-0}" == 0 ]] || die platform-gate-failed',
-            '  BUILT_BUNDLE_REV=0123456789ab; mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"',
+            '  BUILT_BUNDLE_REV="${FIXTURE_BUNDLE_REV:-0123456789ab}"; mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"',
             '  echo \'{"sourceCommit":"old-identical-content","digest":"e3b0c44298fc"}\' >"$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV/MANIFEST.json"',
             '}',
             'tsum_note() { printf "%s=%s\\n" "$1" "$2" >>"$T/notes"; }',
@@ -161,6 +161,23 @@ class Prepared(unittest.TestCase):
         (self.repo / 'source').write_text('B')
         self.git('commit', '-qam', 'B')
         self.git('push', '-q', 'origin', 'HEAD')
+
+    def advance_remote_only(self):
+        writer = self.t / 'remote-writer'
+        self.run_cmd('git', 'clone', '-q', '--branch', 'feat/v5-selfhost',
+                     str(self.t / 'origin'), str(writer))
+        for key, value in (('user.name', 'p4-test'), ('user.email', 'p4@example.invalid')):
+            self.run_cmd('git', '-C', str(writer), 'config', key, value)
+        (writer / 'source').write_text('remote-B')
+        self.run_cmd('git', '-C', str(writer), 'commit', '-qam', 'remote-B')
+        self.run_cmd('git', '-C', str(writer), 'push', '-q', 'origin', 'HEAD')
+        return self.run_cmd('git', '-C', str(writer), 'rev-parse', 'HEAD')
+
+    def prepare_unique(self, sha):
+        return self.bash(f'''FIXTURE_MASTER_NAME=rel-s3-{sha}
+FIXTURE_RUNTIME_NAME=rel-{sha[:12]}; FIXTURE_BUNDLE_REV={sha[:12]}
+selfhost_prepare_candidate {sha}
+''')
 
     def test_prepare_under_previous_flip_lock_then_flip_owns_lock(self):
         holder = self.spawn('''
@@ -543,26 +560,289 @@ selfhost_prepare_candidate "$SHA"
                 self.bash(flag + '=1; selfhost_prepare_candidate "$SHA"', ok=False)
                 self.assertFalse(self.receipt.exists())
 
-    def test_changed_tip_cannot_flip_or_gc_pin_forever(self):
+    def test_descendant_tip_keeps_old_receipt_flippable_and_gc_protected(self):
         self.prepare()
+        expected = self.receipt.read_bytes()
         self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.bash('''
+selfhost_prepared_enter_flip "$SHA"
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-test" ]]
+[[ "$SELFHOST_SPLIT_PREPARED" == 1 ]]
+touch "$T/flip-ready"
+''')
+        self.assertTrue((self.t / 'flip-ready').exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertFalse((self.t / 'gc').exists())
+        self.assertEqual(self.receipt.read_bytes(), expected)
+        self.assertFalse((self.receipt.parent / (target + '.json')).exists())
+        self.assertEqual(self.build_count(), 1)
+
+    def test_tip_advances_during_paused_build_seals_only_old_complete_sha(self):
+        process = self.spawn('''
+BUILD_BLOCK="$T/build-continue"
+selfhost_prepare_candidate "$SHA"
+''')
+        self.wait_event('build-ready')
+        self.assertFalse(self.receipt.exists())
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        (self.t / 'build-continue').touch()
+        self.finish(process)
+        self.assertEqual((self.t / 'gates').read_text().splitlines(), ['master', 'runtime', 'platform'])
+        self.assertEqual(json.loads(self.receipt.read_text())['sourceCommit'], self.sha)
+        self.assertFalse((self.receipt.parent / (target + '.json')).exists())
+        self.bash('selfhost_prepared_enter_flip "$SHA"')
+        self.assertEqual(self.build_count(), 1)
+
+    def test_tip_advance_cannot_publish_any_failed_or_unrun_gate(self):
+        for flag, reached in [('FAIL_BUILD', ['master']),
+                              ('FAIL_RUNTIME', ['master', 'runtime']),
+                              ('FAIL_PLATFORM', ['master', 'runtime', 'platform'])]:
+            with self.subTest(gate=flag):
+                self.git('reset', '-q', '--hard', self.sha)
+                self.git('push', '-q', '--force', 'origin', 'HEAD')
+                for name in ('build-ready', 'build-continue'):
+                    (self.t / name).unlink(missing_ok=True)
+                (self.t / 'gates').write_text('')
+                process = self.spawn(flag + '=1; BUILD_BLOCK="$T/build-continue"; '
+                                     'selfhost_prepare_candidate "$SHA"')
+                self.wait_event('build-ready')
+                self.advance()
+                (self.t / 'build-continue').touch()
+                self.finish(process, ok=False)
+                self.assertEqual((self.t / 'gates').read_text().splitlines(), reached)
+                self.assertFalse(self.receipt.exists())
+                self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+                self.assertFalse((self.t / 'live-write').exists())
+                self.assert_artifact_lock()
+
+    def test_new_sha_receipt_and_partial_artifacts_cannot_replace_old_gates(self):
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        expected = newer.read_bytes()
+        self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.receipt.write_bytes(expected)
+        self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        mixed = json.loads(expected)
+        mixed.update(sourceCommit=self.sha, sourceTree=self.git('rev-parse', self.sha + '^{tree}'))
+        self.receipt.write_text(json.dumps(mixed))
+        self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertFalse((self.t / 'live-write').exists())
+        self.assertEqual(newer.read_bytes(), expected)
+        self.assertEqual(self.build_count(), 1)
+
+    def test_old_completion_preserves_next_candidate_and_next_success_clears_covered(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        expected = newer.read_bytes()
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue(self.receipt.exists())
+        self.assertFalse((self.t / 'gc').exists())
+        self.bash('''selfhost_prepared_enter_flip "$SHA"
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-s3-$SHA" ]]
+selfhost_prepared_complete "$SHA" "$BUILT_MASTER_RELEASE"
+''')
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(newer.read_bytes(), expected)
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertFalse((self.t / 'gc').exists())
+        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
+        self.assertFalse(newer.exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+
+    def test_successful_descendant_consumes_abandoned_ancestor_receipt(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        self.assertTrue(self.receipt.exists())
+        self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(list(self.receipt.parent.glob('*.json')), [])
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+
+    def test_shallow_cutoff_refuses_ancestor_but_reuses_and_consumes_exact_tip(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        expected = newer.read_bytes()
+        shallow = self.repo / '.git/shallow'
+        shallow.write_text(target + '\n')
+        shallow_before = shallow.read_bytes()
+        self.assertEqual(self.git('rev-parse', '--is-shallow-repository'), 'true')
+        self.assertEqual(self.git('rev-list', target), target)
+        self.git('cat-file', '-e', self.sha + '^{commit}')
+        self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertFalse((self.t / 'live-write').exists())
+        result = self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertIn('GC deferred: prepared artifacts await flip', result.stdout)
+        self.assertFalse((self.t / 'gc').exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(newer.read_bytes(), expected)
+        self.prepare_unique(target)
+        self.assertEqual(newer.read_bytes(), expected)
+        self.assertEqual(self.build_count(), 2)
+        self.bash(f'''selfhost_prepared_enter_flip {target}
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-s3-{target}" ]]
+touch "$T/exact-flip"
+selfhost_prepared_complete {target} "$BUILT_MASTER_RELEASE"
+''')
+        self.assertTrue((self.t / 'exact-flip').exists())
+        self.assertFalse(newer.exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+        self.assertEqual(shallow.read_bytes(), shallow_before)
+
+    def test_shallow_boundary_below_candidate_allows_first_build_flip_and_gc(self):
+        boundary = None
+        for source in ('B', 'C', 'D', 'E'):
+            (self.repo / 'source').write_text(source)
+            self.git('commit', '-qam', source)
+            if source == 'B':
+                boundary = self.git('rev-parse', 'HEAD')
+        self.git('push', '-q', 'origin', 'HEAD')
+        target = self.git('rev-parse', 'HEAD')
+        shallow = self.repo / '.git/shallow'
+        shallow.write_text(boundary + '\n')
+        shallow_before = shallow.read_bytes()
+        self.assertEqual(self.git('rev-parse', '--is-shallow-repository'), 'true')
+        history = self.git('rev-list', target).splitlines()
+        self.assertEqual(len(history), 4)
+        self.assertEqual(history[-1], boundary)
+        self.assertNotIn(self.sha, history)
+        self.prepare_unique(target)
+        candidate = self.receipt.parent / (target + '.json')
+        expected = candidate.read_bytes()
+        self.assertEqual(json.loads(expected)['sourceCommit'], target)
+        self.assertEqual((self.t / 'gates').read_text().splitlines(),
+                         ['master', 'runtime', 'platform'])
+        self.prepare_unique(target)
+        self.assertEqual(candidate.read_bytes(), expected)
+        self.assertEqual(self.build_count(), 1)
+        self.bash(f'''selfhost_prepared_enter_flip {target}
+[[ "$BUILT_MASTER_RELEASE" == "$MASTER_RELEASES_ROOT/rel-s3-{target}" ]]
+touch "$T/exact-flip"
+selfhost_prepared_complete {target} "$BUILT_MASTER_RELEASE"
+''')
+        self.assertTrue((self.t / 'exact-flip').exists())
+        self.assertFalse(candidate.exists())
+        self.bash('selfhost_prepared_gc touch "$T/gc"')
+        self.assertTrue((self.t / 'gc').exists())
+        self.assertEqual(shallow.read_bytes(), shallow_before)
+
+    def test_history_query_failure_falls_back_to_exact_tip_receipts(self):
+        self.prepare_unique(self.sha)
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        self.prepare_unique(target)
+        newer = self.receipt.parent / (target + '.json')
+        old_bytes, new_bytes = self.receipt.read_bytes(), newer.read_bytes()
+        real_git = self.run_cmd('bash', '-c', 'command -v git')
+        wrapper_dir = self.t / 'git-bin'
+        wrapper_dir.mkdir()
+        wrapper = wrapper_dir / 'git'
+        wrapper.write_text('''#!/bin/bash
+if [[ "$FAIL_PREPARED_HISTORY" == shallow && "$3" == rev-parse && "$4" == --is-shallow-repository ]] \\
+    || [[ "$FAIL_PREPARED_HISTORY" == rev-list && "$3" == rev-list ]]; then
+  printf '%s\\n' "$3" >>"$HISTORY_QUERY_FAILURE_LOG"
+  exit 88
+fi
+''' + f'exec {real_git!r} "$@"\n')
+        wrapper.chmod(0o755)
+        self.env['PATH'] = str(wrapper_dir) + os.pathsep + self.env['PATH']
+        failures = self.t / 'history-query-failures'
+        self.env['HISTORY_QUERY_FAILURE_LOG'] = str(failures)
+        for command in ('shallow', 'rev-list'):
+            with self.subTest(command=command):
+                self.env['FAIL_PREPARED_HISTORY'] = command
+                failures.write_text('')
+                self.receipt.write_bytes(old_bytes)
+                newer.write_bytes(new_bytes)
+                (self.t / 'gc').unlink(missing_ok=True)
+                self.prepare_unique(target)
+                self.assertFalse(self.receipt.exists())
+                self.assertEqual(newer.read_bytes(), new_bytes)
+                self.assertEqual(self.build_count(), 2)
+                self.assertEqual(failures.read_text().splitlines(),
+                                 ['rev-parse' if command == 'shallow' else 'rev-list'])
+                self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+                self.assertFalse((self.t / 'live-write').exists())
+                self.receipt.write_bytes(old_bytes)
+                self.bash(f'selfhost_prepared_complete {target} "$MASTER_RELEASES_ROOT/rel-s3-{target}"')
+                self.assertFalse(newer.exists())
+                self.assertEqual(self.receipt.read_bytes(), old_bytes)
+                self.bash('selfhost_prepared_gc touch "$T/gc"')
+                self.assertFalse(self.receipt.exists())
+                self.assertTrue((self.t / 'gc').exists())
+
+    def test_missing_remote_tip_object_is_fetched_without_updating_refs(self):
+        self.prepare()
+        target = self.advance_remote_only()
+        absent = subprocess.run(['git', '-C', str(self.repo), 'cat-file', '-e', target + '^{commit}'],
+                                env=self.env, capture_output=True, timeout=5)
+        self.assertNotEqual(absent.returncode, 0)
+        refs = self.git('for-each-ref', '--format=%(refname) %(objectname)')
+        fetch_head = self.repo / '.git/FETCH_HEAD'
+        fetch_before = fetch_head.read_bytes() if fetch_head.exists() else None
+        self.bash('selfhost_prepared_enter_flip "$SHA"')
+        self.git('cat-file', '-e', target + '^{commit}')
+        self.assertEqual(self.git('for-each-ref', '--format=%(refname) %(objectname)'), refs)
+        self.assertEqual(fetch_head.read_bytes() if fetch_head.exists() else None, fetch_before)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.sha)
+
+    def test_remote_lookup_or_missing_object_fetch_failure_refuses_flip(self):
+        self.prepare()
+        expected = self.receipt.read_bytes()
+        self.advance_remote_only()
+        for command in ('ls-remote', 'fetch'):
+            with self.subTest(command=command):
+                self.bash('''
+git() {
+  [[ " $* " != *" ''' + command + ''' "* ]] || return 88
+  command git "$@"
+}
+selfhost_prepared_enter_flip "$SHA"
+touch "$T/live-write"
+''', ok=False)
+                self.assertFalse((self.t / 'live-write').exists())
+                self.assertEqual(self.receipt.read_bytes(), expected)
+                self.assert_artifact_lock()
+
+    def test_force_rewritten_remote_refuses_old_candidate_and_releases_gc_pin(self):
+        self.prepare()
+        self.git('checkout', '-q', '--orphan', 'rewritten')
+        self.git('rm', '-q', '-rf', '.')
+        (self.repo / 'source').write_text('unrelated')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'rewritten')
+        self.git('push', '-q', '--force', 'origin', 'HEAD:refs/heads/feat/v5-selfhost')
         self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
         self.assertFalse((self.t / 'live-write').exists())
         self.bash('selfhost_prepared_gc touch "$T/gc"')
         self.assertTrue((self.t / 'gc').exists())
         self.assertFalse(self.receipt.exists())
 
-    def test_tip_changes_during_build_no_receipt(self):
-        self.bash('''
-original=$(declare -f build_platform_bundle); eval "${original/build_platform_bundle/old_platform}"
-build_platform_bundle() {
-  old_platform "$1"
-  echo B >"$REPO_ROOT/source"; git -C "$REPO_ROOT" commit -qam B
-  git -C "$REPO_ROOT" push -q origin HEAD
-}
-selfhost_prepare_candidate "$SHA"
-''', ok=False)
-        self.assertFalse(self.receipt.exists())
+    def test_controller_change_after_prepare_still_refuses_ancestor_candidate(self):
+        self.prepare()
+        (self.repo / 'scripts').mkdir()
+        (self.repo / 'scripts/deploy-v5-selfhost.sh').write_text('# changed controller\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'changed controller')
+        self.git('push', '-q', 'origin', 'HEAD')
+        result = self.bash('selfhost_prepared_enter_flip "$SHA"; touch "$T/live-write"', ok=False)
+        self.assertIn('changes the build controller', result.stderr)
+        self.assertFalse((self.t / 'live-write').exists())
+        self.assertTrue(self.receipt.exists())
 
     def test_local_head_changes_reject(self):
         self.prepare()
@@ -682,11 +962,11 @@ selfhost_prepare_unlock
         self.receipt.symlink_to(self.repo / 'source')
         self.bash('selfhost_prepared_enter_flip "$SHA"', ok=False)
 
-    def test_real_deploy_orchestration_builds_before_lock_and_defers_live_setup(self):
+    def test_real_deploy_keeps_pinned_source_when_tip_advances_during_build(self):
         (self.t / 'env').write_text('')
         (self.t / 'live').symlink_to(self.repo)
         self.script += '\n' + fn('cmd_deploy') + '\n' + fn('cutover_expected_source_commit')
-        self.bash('''
+        process = self.spawn('''
 ALLOW_DIRTY=0; RELEASE_POLICY_RESUME=0; LEASE_TRAIN_ACTIVE=0; LEASE_TARGET_SHA="$SHA"
 V5_ENV="$T/env"; MASTER_LIVE_LINK="$T/live"
 preflight_common() { :; }; explain_dirty_semantics() { :; }
@@ -709,14 +989,27 @@ assert_env_key_drift() { die premature-live-write; }
 cmd_cutover() {
   ! flock -n "$SELFHOST_DEPLOY_LOCK" true
   [[ "$(cutover_expected_source_commit)" == "$SHA" ]]
+  [[ "$(source_commit)" != "$SHA" ]]
   [[ "$SELFHOST_SPLIT_PREPARED" == 1 ]]
   echo cutover >>"$T/events"
 }
 lease_train_finish() { echo "$1" >>"$T/events"; }
+BUILD_BLOCK="$T/build-continue"
 cmd_deploy
 ''')
+        self.wait_event('build-ready')
+        self.assertFalse(self.receipt.exists())
+        self.advance()
+        target = self.git('rev-parse', 'HEAD')
+        (self.t / 'build-continue').touch()
+        self.finish(process)
         self.assertEqual((self.t / 'events').read_text().splitlines(),
                          ['begin', 'deploy-free', 'build', 'bind', 'cutover', 'committed'])
+        receipt = json.loads(self.receipt.read_text())
+        for artifact, marker in (('master', '.complete'), ('runtime', 'MANIFEST.json')):
+            doc = json.loads((Path(receipt[artifact]['path']) / marker).read_text())
+            self.assertEqual(doc['sourceCommit'], self.sha)
+        self.assertFalse((self.receipt.parent / (target + '.json')).exists())
 
     def test_busy_prepare_cannot_hold_flip_lock_for_build_duration(self):
         self.prepare()
@@ -732,6 +1025,39 @@ flock -n "$SELFHOST_DEPLOY_LOCK" true
 ''')
         (self.t / 'artifact-release').touch()
         self.finish(holder)
+
+    def test_worker_settles_each_tip_only_after_its_own_committed_train(self):
+        # Run the original S3 assertions against this checkout's actual worker.
+        source = (ROOT / 'scripts/v5-lease-center-selftest.sh').read_text()
+        markers = ('echo "═══ T1 ', 'echo "═══ S3 ', 'echo "═══ T2 ',
+                   'echo "PASS=$PASS FAIL=$FAIL"')
+        for marker in markers:
+            self.assertEqual(source.count(marker), 1)
+        first, s3, following, footer = (source.index(marker) for marker in markers)
+        self.assertEqual([first, s3, following, footer], sorted([first, s3, following, footer]))
+        setup, replacements = re.subn(r'^SCRIPT_DIR=.*$',
+                                      f'SCRIPT_DIR={str(ROOT / "scripts")!r}',
+                                      source[:first], flags=re.M)
+        self.assertEqual(replacements, 1)
+        script = self.t / 'lease-s3-focused.sh'
+        script.write_text(setup + source[s3:following] + source[footer:])
+        process = subprocess.Popen(['bash', str(script)], env=self.env, close_fds=True,
+                                   start_new_session=True, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(self.reap_process, process)
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            process.terminate()  # Let the selftest's EXIT trap clean its private workers.
+            try:
+                stdout, stderr = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=10)
+            self.fail('lease S3 fixture timed out:\n' + stdout + stderr)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertIn('PASS=11 FAIL=0', stdout)
+        print(stdout, end='')
 
 
 if __name__ == '__main__':

@@ -26,12 +26,34 @@ selfhost_prepared_state() { # <action> <sha> [identity/paths...]
   python3 "$SCRIPT_DIR/lib/v5-selfhost-prepared.py" "$1" "$SELFHOST_PREPARED_ROOT" "${@:2}"
 }
 
-selfhost_prepare_assert_tip() { # <sha>; no ref update, live state or canonical checkout mutation
-  local sha="$1" tip
+selfhost_prepare_assert_tip() { # <sha> [prepared|flip]; no ref, live or checkout mutation
+  local sha="$1" phase="${2:-admission}" tip head
   tip="$(git -C "$REPO_ROOT" ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
     || die "cannot verify selfhost remote tip; prepared candidate refused"
-  [[ "$tip" == "$sha"$'\t'refs/heads/feat/v5-selfhost ]] \
-    || die "selfhost tip changed; discard prepared $sha and prepare the new tip"
+  [[ "$tip" =~ ^[0-9a-f]{40}$'\t'refs/heads/feat/v5-selfhost$ ]] \
+    || die "cannot verify selfhost remote tip; prepared candidate refused"
+  tip="${tip%%$'\t'*}"
+  if [[ "$phase" == prepared || "$phase" == flip ]]; then
+    # A newer merge queues for the next train. Fetch only its missing object;
+    # neither the checkout nor remote-tracking refs belong to this invocation.
+    if ! git -C "$REPO_ROOT" cat-file -e "$tip^{commit}" 2>/dev/null; then
+      git -C "$REPO_ROOT" fetch --no-tags --no-write-fetch-head origin "$tip" \
+        || die "cannot fetch selfhost tip object; prepared candidate refused"
+    fi
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$sha" "$tip" \
+      || die "prepared source is not an ancestor of selfhost tip; candidate refused"
+    [[ "$tip" == "$sha" ]] || log "  ✓ prepared source=$sha retained; newer tip=$tip waits for the next train"
+    if [[ "$phase" == flip ]]; then
+      head="$(source_commit)" || die "cannot verify canonical HEAD at flip"
+      # Unpushed/diverged local changes still cannot enter the release lane.
+      git -C "$REPO_ROOT" merge-base --is-ancestor "$sha" "$head" \
+        && git -C "$REPO_ROOT" merge-base --is-ancestor "$head" "$tip" \
+        || die "canonical HEAD is outside prepared source/remote tip history; flip refused"
+    fi
+  else
+    [[ "$tip" == "$sha" ]] \
+      || die "selfhost tip changed; prepare the new tip"
+  fi
   git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" \
     || die "prepared source object missing; fetch the selfhost tip first"
   # Ahead-of-HEAD preparation may use this controller only when its build/guard
@@ -88,7 +110,7 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
   # Validate after waiting for the artifact lock and before deleting any receipt:
   # a delayed request for an old SHA must not invalidate a newer ready candidate.
   selfhost_prepare_assert_tip "$sha"
-  selfhost_prepared_state prune "$sha" || die "cannot invalidate stale prepared receipts"
+  selfhost_prepared_state prune "$sha" "$REPO_ROOT" || die "cannot invalidate stale prepared receipts"
   selfhost_prepare_identity "$sha"
   if [[ -e "$SELFHOST_PREPARED_ROOT/$sha.json" ]]; then
     if selfhost_prepared_load "$sha"; then
@@ -112,7 +134,7 @@ selfhost_prepare_candidate() { # <sha>; default deploy and standalone prepare sh
   local SEED_CLI="$BUILT_MASTER_RELEASE/packages/commercial/agent-sandbox/platform-runtime/entrypoint/validatePlatformSeedCli.ts"
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
-  selfhost_prepare_assert_tip "$sha"
+  selfhost_prepare_assert_tip "$sha" prepared
   selfhost_prepared_receipt write "$sha" || die "cannot seal prepared receipt"
   selfhost_prepare_unlock
 }
@@ -122,9 +144,7 @@ selfhost_prepared_enter_flip() { # <sha>; no build/resource wait while deploy.lo
   tsum_mark A.flip-lock-wait 2>/dev/null || :
   acquire_selfhost_deploy_lock
   prewarm_quiesce "$SELFHOST_DEPLOY_LOCK" || die "prewarm did not stop; flip refused"
-  selfhost_prepare_assert_tip "$sha"
-  [[ "$(source_commit)" == "$sha" ]] \
-    || die "canonical HEAD changed; prepared candidate refused at flip"
+  selfhost_prepare_assert_tip "$sha" flip
   # Never hold deploy.lock waiting behind a long preparation: fail and retry later.
   selfhost_lock_py prepare "$SELFHOST_PREPARE_LOCK" "$SELFHOST_DEPLOY_LOCK_DIR"
   exec 9<>"$SELFHOST_PREPARE_LOCK"
@@ -152,13 +172,13 @@ cmd_prepare() {
 }
 
 # Keep the receipt across a pre-mutation/idle failure, so retry can repeat E1–G.
-# A successful flip consumes only its own master candidate, never a newer build.
+# A committed flip consumes its own candidate and covered ancestors, never newer builds.
 selfhost_prepared_complete() { # <sha> <master-release>
   (
     selfhost_lock_py prepare "$SELFHOST_PREPARE_LOCK" "$SELFHOST_DEPLOY_LOCK_DIR" || exit 1
     exec 9<>"$SELFHOST_PREPARE_LOCK"
-    flock -n 9 || exit 0  # next prepare/GC will prune the stale receipt
-    selfhost_prepared_state consume "$1" "$2"
+    flock -n 9 || exit 0  # a later committed flip will clear covered receipts
+    selfhost_prepared_state consume "$1" "$2" "$REPO_ROOT"
   )
 }
 
@@ -175,7 +195,7 @@ selfhost_prepared_gc() { # <command...>; subshell owns the GC artifact lock unti
       tip="$(git -C "$REPO_ROOT" ls-remote --exit-code origin refs/heads/feat/v5-selfhost)" \
         || { log "  GC deferred: remote tip unverifiable"; exit 0; }
       tip="${tip%%$'\t'*}"
-      selfhost_prepared_state prune "$tip" \
+      selfhost_prepared_state prune "$tip" "$REPO_ROOT" \
         || { log "  GC deferred: prepared state unreadable"; exit 0; }
       selfhost_prepared_state pending "$tip" || rc=$?
       [[ "$rc" == 1 ]] || { log "  GC deferred: prepared artifacts await flip"; exit 0; }
