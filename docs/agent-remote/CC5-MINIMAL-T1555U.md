@@ -1,3 +1,12 @@
+> 2026-11-02 10:26 CST: CODEX-START 10:16 supersedes the pending proposals
+> below. A (private pinned CLI) and C (MCP-only fixed tool) are approved. B is
+> changed to the live personal frontend, a default-off model with a hard
+> server-side test-UID gate. Do not build the independent PG/Redis/frontend
+> stack. Before the official personal train, submit exact scope, test visibility
+> and previous-release rollback in CONTINUE for steward batch approval.
+> The fixed-tool proof is a temporary test-only capability restriction; final
+> product must recover existing Box capabilities/UX and satisfy full P3 gates.
+
 # t1575u/t1576u: personal web to remote interactive cc5
 
 Status (2026-11-02 10:23 CST): preparation only; no real cc5 chat or web

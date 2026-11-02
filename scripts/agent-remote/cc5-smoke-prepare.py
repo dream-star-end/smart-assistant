@@ -20,6 +20,8 @@ import sys
 import time
 
 TASK = 'AGENT-REMOTE-T1555U'
+PINNED_CLI_SIZE = 328262000
+PINNED_CLI_SHA = 'fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824'
 PLUGIN = ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.ts', 'hooks/frames.ts')
 SOURCE_FILES = ('host.py',) + tuple('mod/oc-bridge/' + name for name in PLUGIN)
 
@@ -72,6 +74,89 @@ def check_sources(root, info):
     require(digest({name: actual['mod/oc-bridge/' + name] for name in PLUGIN}) == info['pluginDigest'],
             'installed-mod-digest-mismatch')
     return actual
+
+
+
+def cli_identity(path):
+    st = path.lstat()
+    require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and
+            st.st_mode & 0o777 == 0o500 and st.st_size == PINNED_CLI_SIZE, 'unsafe-private-cli')
+    return {'dev': st.st_dev, 'inode': st.st_ino, 'uid': st.st_uid, 'size': st.st_size,
+            'mode': stat.S_IMODE(st.st_mode), 'mtimeNs': st.st_mtime_ns, 'ctimeNs': st.st_ctime_ns}
+
+
+def hash_cli(path):
+    before = cli_identity(path)
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        first = stream.read(1024 * 1024)
+        require(first[:6] == b'\x7fELF\x02\x01' and first[18:20] == b'\x3e\x00', 'wrong-cli-elf')
+        h.update(first)
+        for piece in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(piece)
+    require(h.hexdigest() == PINNED_CLI_SHA and cli_identity(path) == before,
+            'private-cli-hash-or-identity-mismatch')
+    return before
+
+
+def claude_executable(root, info, full_hash=False):
+    selected = info.get('claudeExecutable', '/usr/bin/claude')
+    if selected == '/usr/bin/claude':
+        return selected
+    path = root / 'bin/claude-2.1.316'
+    require(selected == str(path), 'unexpected-cli-path')
+    identity = hash_cli(path) if full_hash else cli_identity(path)
+    require(identity == info.get('cliFileIdentity'), 'private-cli-identity-changed')
+    return selected
+
+
+def install_cli(root):
+    info = owner(root)
+    check_sources(root, info)
+    require(info.get('claudeExecutable', '/usr/bin/claude') == '/usr/bin/claude', 'private-cli-already-selected')
+    require(not (root / 'run').exists() and all(tmux(root, 'has-session', '-t', '=' + name).returncode != 0
+            for name in (info['session'], info['session'] + '-setup')), 'task-must-be-stopped-for-cli-install')
+    require(os.statvfs(root).f_bavail * os.statvfs(root).f_frsize > PINNED_CLI_SIZE + 1024 ** 3,
+            'insufficient-private-cli-disk')
+    directory = root / 'bin'
+    directory.mkdir(mode=0o700)
+    path = directory / 'claude-2.1.316'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    own = os.fstat(fd)
+    published = False
+    try:
+        count = 0
+        with os.fdopen(fd, 'wb') as out:
+            while True:
+                piece = sys.stdin.buffer.read(min(1024 * 1024, PINNED_CLI_SIZE + 1 - count))
+                if not piece:
+                    break
+                count += len(piece)
+                require(count <= PINNED_CLI_SIZE, 'private-cli-input-too-large')
+                out.write(piece)
+            require(count == PINNED_CLI_SIZE, 'private-cli-input-truncated')
+            out.flush()
+            os.fsync(out.fileno())
+        identity = hash_cli(path)
+        info.update({'claudeExecutable': str(path), 'cliFileIdentity': identity,
+                     'cliSha256': PINNED_CLI_SHA})
+        temp = root / 'OWNER.cli-install.json'
+        with temp.open('x', opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+            json.dump(info, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        temp.replace(root / 'OWNER.json')
+        published = True
+        print(json.dumps({'kind': 'private-pinned-cli-installed-no-chat', 'path': str(path),
+                          'sha256': PINNED_CLI_SHA, 'identity': identity, 'systemCliUnchanged': True}))
+    finally:
+        if not published:
+            current = path.lstat()
+            require((current.st_dev, current.st_ino) == (own.st_dev, own.st_ino),
+                    'partial-cli-identity-changed-no-cleanup')
+            path.unlink()
+            directory.rmdir()
 
 
 def package(run_id):
@@ -143,7 +228,7 @@ def host_identity(root, info):
     pid = int((root / 'run/host.pid').read_text())
     args, start = proc(pid)
     require(args[1:] == [str(root / 'install/host.py'), str(root / 'run'), info['session'],
-                         '/usr/bin/claude', '--permission-mode', 'default'], 'wrong-host-process')
+                         claude_executable(root, info), '--permission-mode', 'default'], 'wrong-host-process')
     return pid, start
 
 
@@ -156,10 +241,11 @@ def launch(root):
            'OC_BOX_MOD_FILES': json.dumps({name: base64.b64encode(files['mod/oc-bridge/' + name]).decode()
                                            for name in PLUGIN}),
            'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000'}
+    selected_cli = claude_executable(root, info, full_hash=True)
     os.chdir(info['cwd'])
     # fd0 is never read here: it belongs exclusively to the original host.
     os.execve(sys.executable, [sys.executable, str(root / 'install/host.py'), str(root / 'run'),
-                              info['session'], '/usr/bin/claude', '--permission-mode', 'default'], env)
+                              info['session'], selected_cli, '--permission-mode', 'default'], env)
 
 
 def workspace(root):
@@ -186,7 +272,7 @@ def trust_prepare(root):
     args = ['new-session', '-d', '-s', session, '-x', '200', '-y', '50', '-c', str(work), '--',
             'env', '-i', 'HOME=/home/box',
             'PATH=/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin', 'LANG=C.UTF-8',
-            'TERM=xterm-256color', 'DISABLE_AUTOUPDATER=1', '/usr/bin/claude',
+            'TERM=xterm-256color', 'DISABLE_AUTOUPDATER=1', claude_executable(root, info, full_hash=True),
             '--permission-mode', 'default', '--plugin-dir', str(root / 'install/mod/oc-bridge')]
     require(tmux(root, *args).returncode == 0, 'setup-launch-failed')
     identity = None
@@ -252,7 +338,7 @@ def inspect(root):
         require(not any(a in forbidden or a.startswith(tuple(x + '=' for x in forbidden))
                         or 'stream-json' in a for a in args), 'forbidden-claude-argv')
         # No arbitrary argv reaches evidence: allow only our known launch args or a CLI process title.
-        known = {'/usr/bin/claude', '/usr/bin/node', 'node', 'claude', '--permission-mode', 'default',
+        known = {claude_executable(root, info), '/usr/bin/claude', '/usr/bin/node', 'node', 'claude', '--permission-mode', 'default',
                  '--plugin-dir', str(root / 'run/mod/oc-bridge')}
         require(all(a in known for a in args), 'unknown-claude-argv-no-output')
         snapshot = subprocess.check_output(['ps', '-ww', '-o', 'pid,tty,args', '-p', str(pid)], text=True)
@@ -284,7 +370,7 @@ def snapshot(root):
     task_args, start = proc(pid)
     begun = datetime.now(timezone.utc).isoformat()
     clock = time.monotonic()
-    allowed = {'/usr/bin/claude', '/usr/bin/node', 'node', 'claude', '--permission-mode',
+    allowed = {claude_executable(root, info), '/usr/bin/claude', '/usr/bin/node', 'node', 'claude', '--permission-mode',
                'default', '--plugin-dir', str(root / 'run/mod/oc-bridge')}
 
     def safe_args(args):
@@ -397,10 +483,10 @@ if __name__ == '__main__':
         elif role == 'install':
             install()
         else:
-            require(role in ('launch', 'workspace', 'trust-prepare', 'inspect', 'snapshot', 'stop', 'cleanup'), 'unknown-role')
+            require(role in ('launch', 'workspace', 'trust-prepare', 'inspect', 'snapshot', 'install-cli', 'stop', 'cleanup'), 'unknown-role')
             root = task_root(sys.argv[2])
             {'launch': launch, 'workspace': workspace, 'trust-prepare': trust_prepare,
-             'inspect': inspect, 'snapshot': snapshot, 'stop': stop, 'cleanup': cleanup}[role](root)
+             'inspect': inspect, 'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup}[role](root)
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__
