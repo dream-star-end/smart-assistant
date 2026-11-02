@@ -25,7 +25,7 @@ import {
 import type { Cc5BridgeBinding } from './cc5BridgePort.js'
 
 export const CC5_FIXED_TOOL_NAME = 'mcp__ocbridge__roundtrip'
-const EXECUTION_ROOT = '/workspace/.cc5-t1555u'
+export const CC5_FIXED_EXECUTION_ROOT = '/home/agent/.openclaude/.cc5-t1555u'
 export interface Cc5ObservedTool {
   nativeSessionId: string
   toolUseId: string
@@ -204,7 +204,7 @@ export class Cc5FixedToolExecutor {
       connectionChallenge: string
       securityEpoch: number
     }>,
-    private readonly executionRoot = EXECUTION_ROOT,
+    private readonly executionRoot = CC5_FIXED_EXECUTION_ROOT,
   ) {
     this.admission = Object.freeze({ ...admission })
   }

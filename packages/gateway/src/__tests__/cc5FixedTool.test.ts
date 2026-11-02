@@ -16,7 +16,16 @@ import {
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
 import type { Cc5BridgeBinding } from '../cc5BridgePort.js'
-import { CC5_FIXED_TOOL_NAME, Cc5FixedToolExecutor, type Cc5ToolRequest } from '../cc5FixedTool.js'
+import {
+  CC5_FIXED_EXECUTION_ROOT,
+  CC5_FIXED_TOOL_NAME,
+  Cc5FixedToolExecutor,
+  type Cc5ToolRequest,
+} from '../cc5FixedTool.js'
+
+test('production fixed execution root uses the precreated persistent personal data volume', () => {
+  assert.equal(CC5_FIXED_EXECUTION_ROOT, '/home/agent/.openclaude/.cc5-t1555u')
+})
 
 function fixture() {
   const key = generateKeyPairSync('ed25519')
