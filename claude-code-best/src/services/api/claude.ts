@@ -1,4 +1,4 @@
-import { stripExcessMediaItems } from './mediaItems.js'
+import { prepareRequestMediaItems } from './mediaItems.js'
 export { stripExcessMediaItems } from './mediaItems.js'
 import type {
   BetaContentBlock,
@@ -1292,10 +1292,10 @@ async function* queryModel(
   }
 
   // Ordinary platform requests retain media until the final byte fitter can
-  // preserve it as files. Other providers and Box retain their existing policy.
+  // preserve it as files. Box keeps a stable logical history for its native CLI.
   if (!process.env.OPENCLAUDE_SESSION_KEY || getAPIProvider() !== 'firstParty' ||
     BOX_NATIVE_CONTEXT_MODELS.includes(options.model) || !toolSchemas.some(t => t.name === 'Read')) {
-    messagesForAPI = stripExcessMediaItems(messagesForAPI, API_MAX_MEDIA_PER_REQUEST)
+    messagesForAPI = prepareRequestMediaItems(messagesForAPI, API_MAX_MEDIA_PER_REQUEST, options.model)
   }
 
   // OpenAI-compatible provider: delegate to the OpenAI adapter layer

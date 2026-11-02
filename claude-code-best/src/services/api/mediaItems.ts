@@ -1,3 +1,4 @@
+import { BOX_NATIVE_CONTEXT_MODELS } from '../../utils/model/boxNativeRemoteContext.js'
 import type {
   BetaContentBlockParam,
   BetaImageBlockParam,
@@ -89,4 +90,19 @@ export function stripExcessMediaItems(
           message: { ...msg.message, content: stripped },
         }
   }) as (UserMessage | AssistantMessage)[]
+}
+
+/** Box's outer Messages body binds a live native invocation's logical history.
+ * Apply one projection from its first request onward: dropping an old image
+ * when a new tool result crosses the generic API count limit changes that
+ * invocation's prefix. The native CLI owns its actual API media projection;
+ * the Box transport and server byte budgets still apply to this full body. */
+export function prepareRequestMediaItems(
+  messages: (UserMessage | AssistantMessage)[],
+  limit: number,
+  model: string,
+): (UserMessage | AssistantMessage)[] {
+  return BOX_NATIVE_CONTEXT_MODELS.includes(model)
+    ? messages
+    : stripExcessMediaItems(messages, limit)
 }
