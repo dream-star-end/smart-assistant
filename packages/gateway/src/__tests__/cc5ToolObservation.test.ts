@@ -119,3 +119,26 @@ test('truncated or malformed original frames never yield an observation', async 
   const bad = new Cc5ToolObservation(f.operationId)
   assert.throws(() => bad.ingest(Buffer.from([0xff, 0x0a])))
 })
+
+test('a valid-looking first block cannot release a waiter before the entire original row is validated', async () => {
+  const f = fixture()
+  let authorized = false
+  const pending = f.observation.waitFor(f.request).then((value) => {
+    authorized = true
+    return value
+  })
+  const row = structuredClone(f.frame)
+  row.message.content.push({
+    type: 'tool_use',
+    id: 'toolu_second',
+    name: f.request.name,
+    input: f.request.arguments,
+  })
+  assert.throws(
+    () => f.observation.ingest(Buffer.from(`${JSON.stringify(row)}\n`)),
+    /OBSERVATION_INVALID/,
+  )
+  await assert.rejects(pending, /NOT_OBSERVED/)
+  assert.equal(authorized, false)
+  await assert.rejects(f.observation.waitFor(f.request), /NOT_OBSERVED/)
+})

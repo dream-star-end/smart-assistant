@@ -16,21 +16,35 @@ export class Cc5ToolObservation {
   constructor(private readonly operationId: string) {}
   ingest(bytes: Uint8Array): void {
     if (this.ended) rejectObservation()
-    this.buffer += this.decoder.decode(bytes, { stream: true })
-    if (Buffer.byteLength(this.buffer) > CC5_BRIDGE_MAX_FRAME_BYTES) rejectObservation()
-    let split: number
-    while ((split = this.buffer.indexOf('\n')) >= 0) {
-      const line = this.buffer.slice(0, split)
-      this.buffer = this.buffer.slice(split + 1)
-      if (line.trim()) this.observe(JSON.parse(line))
+    const previous = this.actual
+    try {
+      this.buffer += this.decoder.decode(bytes, { stream: true })
+      if (Buffer.byteLength(this.buffer) > CC5_BRIDGE_MAX_FRAME_BYTES) rejectObservation()
+      let split: number
+      while ((split = this.buffer.indexOf('\n')) >= 0) {
+        const line = this.buffer.slice(0, split)
+        this.buffer = this.buffer.slice(split + 1)
+        if (line.trim()) this.observe(JSON.parse(line))
+      }
+    } catch (error) {
+      this.ended = true
+      this.actual = undefined
+      this.events.emit('ended')
+      throw error
     }
+    // No waiter is released until all complete rows in this ingest have passed.
+    if (this.actual !== previous) this.events.emit('complete')
   }
   finish(): void {
     this.ended = true
-    const tail = this.decoder.decode()
-    if ((this.buffer + tail).trim()) rejectObservation()
-    this.events.emit('ended')
+    try {
+      const tail = this.decoder.decode()
+      if ((this.buffer + tail).trim()) rejectObservation()
+    } finally {
+      this.events.emit('ended')
+    }
   }
+
   private observe(frame: unknown): void {
     if (!frame || typeof frame !== 'object' || Array.isArray(frame)) rejectObservation()
     const value = frame as {
@@ -45,9 +59,12 @@ export class Cc5ToolObservation {
         (this.nativeId && this.nativeId !== value.session_id)
       )
         rejectObservation()
-      this.nativeId = value.session_id
     }
-    if (value.type !== 'assistant' || !Array.isArray(value.message?.content)) return
+    if (value.type !== 'assistant' || !Array.isArray(value.message?.content)) {
+      if (value.session_id) this.nativeId = value.session_id
+      return
+    }
+    let candidate: Cc5ObservedTool | undefined
     for (const block of value.message.content) {
       if (block.type !== 'tool_use') continue
       if (
@@ -75,9 +92,11 @@ export class Cc5ToolObservation {
       }
       if (this.actual && JSON.stringify(this.actual) !== JSON.stringify(observed))
         rejectObservation()
-      this.actual = Object.freeze(observed)
-      this.events.emit('complete')
+      if (candidate) rejectObservation()
+      candidate = observed
     }
+    if (value.session_id) this.nativeId = value.session_id
+    if (candidate && !this.actual) this.actual = Object.freeze(candidate)
   }
   waitFor(
     request: Pick<Cc5ToolRequest, 'nativeSessionId' | 'toolUseId' | 'name' | 'arguments'>,
