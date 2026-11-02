@@ -9835,12 +9835,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
-          "assertion": "Exact typed Box quota API diagnostic is quota_exhausted; generic rate limits and bare markers retain prior behavior"
+          "assertion": "preserves only the typed Box API quota failure on the wire and tape without automatic recovery"
         },
         {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
-          "assertion": "Manual quota checkpoint is admitted once under existing owner/latest/tape guards while automatic quota recovery is refused"
+          "assertion": "Box exhausted quota permits manual checkpoint or explicit empty reissue and refuses automatic admission"
         },
         {
           "layer": "deploy-gate",
