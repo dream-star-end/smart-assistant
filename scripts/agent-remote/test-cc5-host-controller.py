@@ -23,7 +23,8 @@ SCRIPT = Path(__file__).with_name('cc5-fixed-mcp.py').read_bytes()
 
 def packet():
     return {'version': 1, 'operationId': str(uuid4()), 'runId': str(uuid4()),
-            'script': base64.b64encode(SCRIPT).decode()}
+            'script': base64.b64encode(SCRIPT).decode(),
+            'socketScript': base64.b64encode(Path(__file__).with_name('cc5-mcp-socket.py').read_bytes()).decode()}
 
 
 class ProfileTests(unittest.TestCase):
@@ -157,6 +158,28 @@ class ProfileTests(unittest.TestCase):
                 if child.poll() is None:
                     child.terminate()
                     child.wait(timeout=3)
+
+    def test_independent_mcp_socket_process_must_also_exit_before_positive_stop_proof(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            info = self.installed(root)
+            profile = mod.check_profile(root)
+            child = Popen([sys.executable, '-c', 'import time; print("READY",flush=True); time.sleep(15)'], stdout=PIPE)
+            try:
+                self.assertEqual(child.stdout.readline(), b'READY\n')
+                identity = {'version': 1, 'root': str(root), 'runId': profile['runId'],
+                    'operationId': profile['operationId'], **mod.process_record(child.pid)}
+                (root / 'MCP-SOCKET.json').write_text(json.dumps(identity))
+                (root / 'MCP-SOCKET.json').chmod(0o600)
+                mod.write_lifecycle(root, info, {'host': {'pid': 2000000000, 'startTicks': '1'},
+                    'claude': None, 'descendants': []})
+                with self.assertRaisesRegex(RuntimeError, 'process-still-alive'): mod.prove_stopped(root)
+                child.terminate(); child.wait(timeout=3)
+                with redirect_stdout(io.StringIO()) as output: mod.prove_stopped(root)
+                self.assertEqual(json.loads(output.getvalue())['mcpSocketIdentity'], identity)
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                child.stdout.close()
 
     def test_cleanup_refuses_own_live_process_or_main_setup_session(self):
         for case in ('live', 'main', 'setup', 'stopped'):

@@ -159,3 +159,27 @@ requires the recorded host/Claude/observed descendant identities, run directory
 and both task tmux sessions to be absent. It never marks SSH EOF as stopped.
 No new TUI startup or real conversation has occurred for these fixtures.
 Plan and copy adjustment approved by this-session engine_inventory.
+
+## Steward 12:52 connection update: preserve restrict + from
+
+Generate a new task-only ed25519 key on v5-dev; only its public key is delivered
+to the steward. Connect directly from v5-dev to the steward-provided dedicated
+cc5 account. No old key, Box hop, OS Login/IAM, new TCP listener, firewall change
+or sshd mutation is used. Dedicated user/HOME/login/binary metadata is still
+pending. The current approved controller and original host contain /home/box
+constraints; do not deploy them under an unconfirmed identity or borrow login
+files. Freeze the confirmed profile and update candidate digests before install.
+
+To retain `restrict,from=...`, use ordinary SSH `-T` exec stdio rather than SSH
+-R/-L/-D. One channel transports the original host's bytes. A separate pinned
+virtual-MCP helper listens only on its own cc5 AF_UNIX tool.sock and frames the
+one request/response over its SSH stdin/stdout. Its READY must precede launching
+the original host. Only v5's fixed local toolServer endpoint receives the RPC;
+no model operation executes in the helper. It preserves raw request/receipt
+bytes and typed RPC/native IDs, persists attempt before dispatch and never
+retries unknown delivery. The helper records its own PID/startTicks durably;
+independent stop proof also requires that process to have exited. The profile
+pins both Python sources. Socket cleanup checks its original inode and UID.
+This-session research_review approved this connection adjustment. Existing
+restrict allows normal exec; no forwarding permission exception is requested.
+Python fixture counts describe local transport only, never actual SSH or chat.

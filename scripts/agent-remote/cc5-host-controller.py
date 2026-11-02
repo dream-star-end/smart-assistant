@@ -22,6 +22,7 @@ import time
 
 TASK = 'AGENT-REMOTE-T1555U'
 PINNED_MCP_SHA = '9738e246fc23dbf356335f4effacbbd12204180b981dd9996d62305f2fba2809'
+PINNED_SOCKET_SHA = '6507522620d6aaea8657a5bb061b6d110206c1f27a453d048e6e7d7b9a616fde'
 UUID = re.compile(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\Z')
 PINNED_CLI_SIZE = 328262000
 PINNED_CLI_SHA = 'fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824'
@@ -236,10 +237,10 @@ def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
-def profile_files(root, operation_id, run_id, script):
+def profile_files(root, operation_id, run_id, script, socket_script):
     require(UUID.fullmatch(operation_id) and UUID.fullmatch(run_id), 'bad-profile-identity')
-    require(sha(script) == PINNED_MCP_SHA, 'wrong-pinned-mcp-source')
-    return {'cc5-fixed-mcp.py': script,
+    require(sha(script) == PINNED_MCP_SHA and sha(socket_script) == PINNED_SOCKET_SHA, 'wrong-pinned-mcp-source')
+    return {'cc5-fixed-mcp.py': script, 'cc5-mcp-socket.py': socket_script,
             'client.json': canonical({'version': 1, 'operationId': operation_id, 'runId': run_id}),
             'mcp.json': canonical({'mcpServers': {'ocbridge': {'command': '/usr/bin/python3',
                          'args': ['-I', str(root / 'cprofile/cc5-fixed-mcp.py'), str(root)]}}})}
@@ -250,9 +251,11 @@ def package_profile(root_text, operation_id, run_id):
     require(repo.name == 'ocv5-agentremote-cc5-web-t1555u', 'requires-task-worktree')
     require(re.fullmatch(r'/home/box/oc-agentremote-t1555u-[a-z0-9-]{16,40}', root_text), 'bad-profile-root')
     script = (repo / 'scripts/agent-remote/cc5-fixed-mcp.py').read_bytes()
-    profile_files(Path(root_text), operation_id, run_id, script)
+    socket_script = (repo / 'scripts/agent-remote/cc5-mcp-socket.py').read_bytes()
+    profile_files(Path(root_text), operation_id, run_id, script, socket_script)
     print(json.dumps({'version': 1, 'operationId': operation_id, 'runId': run_id,
-                      'script': base64.b64encode(script).decode()}))
+                      'script': base64.b64encode(script).decode(),
+                      'socketScript': base64.b64encode(socket_script).decode()}))
 
 
 def check_profile(root):
@@ -265,7 +268,8 @@ def check_profile(root):
             info['version'] == 1 and info['task'] == TASK and info['root'] == str(root),
             'wrong-profile-manifest')
     script = read_private(directory / 'cc5-fixed-mcp.py')
-    files = profile_files(root, info['operationId'], info['runId'], script)
+    files = profile_files(root, info['operationId'], info['runId'], script,
+                          read_private(directory / 'cc5-mcp-socket.py'))
     require(all(stat.S_IMODE((directory / name).lstat().st_mode) == 0o400
                 for name in (*files, 'PROFILE.json')), 'unsafe-profile-file-mode')
     require(set(directory.iterdir()) == {directory / name for name in (*files, 'PROFILE.json')},
@@ -285,10 +289,11 @@ def install_profile(root):
     raw = sys.stdin.buffer.read(65537)
     require(len(raw) <= 65536, 'profile-packet-too-large')
     packet = json.loads(raw)
-    require(set(packet) == {'version', 'operationId', 'runId', 'script'} and packet['version'] == 1,
+    require(set(packet) == {'version', 'operationId', 'runId', 'script', 'socketScript'} and packet['version'] == 1,
             'wrong-profile-packet')
     files = profile_files(root, packet['operationId'], packet['runId'],
-                          base64.b64decode(packet['script'], validate=True))
+                          base64.b64decode(packet['script'], validate=True),
+                          base64.b64decode(packet['socketScript'], validate=True))
     directory = root / 'cprofile'
     require(not directory.exists() and not directory.is_symlink(), 'profile-already-exists')
     stage = root / 'cprofile.partial'
@@ -373,6 +378,11 @@ def write_lifecycle(root, info, processes):
         stream.flush()
         os.fsync(stream.fileno())
     stage.replace(path)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def prove_stopped(root, emit=True):
@@ -382,7 +392,16 @@ def prove_stopped(root, emit=True):
     record = json.loads(read_private(root / 'LIFECYCLE.json'))
     require(record['version'] == 1 and record['root'] == str(root) and record['session'] == info['session'],
             'wrong-lifecycle-record')
-    for item in [record['host'], record['claude'], *record['descendants']]:
+    additional = []
+    socket_record = None
+    if (root / 'MCP-SOCKET.json').exists():
+        socket_record = json.loads(read_private(root / 'MCP-SOCKET.json'))
+        profile = check_profile(root)
+        require(socket_record['version'] == 1 and socket_record['root'] == str(root) and
+                socket_record['runId'] == profile['runId'] and
+                socket_record['operationId'] == profile['operationId'], 'wrong-mcp-socket-record')
+        additional.append(socket_record)
+    for item in [record['host'], record['claude'], *record['descendants'], *additional]:
         if item is None:
             continue
         require(type(item['pid']) is int and item['pid'] > 1 and str(item['startTicks']).isdecimal(),
@@ -394,7 +413,8 @@ def prove_stopped(root, emit=True):
         require(ticks != item['startTicks'], 'recorded-task-process-still-alive')
     if emit:
         print(json.dumps({'kind': 'verified-task-runtime-absent', 'remoteStopped': True,
-                          'root': str(root), 'session': info['session'], 'processes': record}))
+                          'root': str(root), 'session': info['session'], 'processes': record,
+                          'mcpSocketIdentity': socket_record}))
 
 
 def proc(pid):
