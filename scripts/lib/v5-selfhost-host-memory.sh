@@ -26,10 +26,11 @@ host_memory_sampler_owner_action() { # <immutable release> <apply|restore>
   local rel="$1" action="$2"
   case "$action" in apply|restore) ;; *) return 79 ;; esac
   release_policy_require_owner || return 86
+  [[ "${LEASE_TARGET_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || return 79
   local child pid original_read original_write read_fd write_fd line
   local child_rc=0 owner_lost=0 protocol_error=0 received=0 requests=0
   coproc V5_HOST_MEMORY_JOB {
-    exec python3 "$rel/scripts/lib/v5-selfhost-host-memory-owner.py" "$rel" "$LEASE_TRAIN_ID" "$action"
+    exec python3 "$rel/scripts/lib/v5-selfhost-host-memory-owner.py" "$rel" "$LEASE_TRAIN_ID" "$action" "$LEASE_TARGET_SHA"
   }
   pid="${V5_HOST_MEMORY_JOB_PID:-}"
   original_read="${V5_HOST_MEMORY_JOB[0]:-}"
@@ -54,6 +55,9 @@ host_memory_sampler_owner_action() { # <immutable release> <apply|restore>
       RESULT\ *)
         received=$((received + 1))
         cutover_clog "  host-memory $action receipt: ${line#RESULT }"
+        if [[ "$line" == *'"restored":true'* ]]; then
+          cutover_clog "  host-memory: sampler restored; not OOM sampling acceptance; application acceptance is separate"
+        fi
         ;;
       ERROR\ *) cutover_clog "  host-memory installation not accepted: ${line#ERROR }" ;;
       *) protocol_error=1; break ;;

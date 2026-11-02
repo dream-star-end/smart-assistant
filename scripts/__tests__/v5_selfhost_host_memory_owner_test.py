@@ -38,6 +38,22 @@ class RecoveryRequired(InstallError):
         super().__init__("PRIVATE_RECOVERY_MESSAGE")
 
 class Installer:
+    def finalize(self, source_release, *, owner_check=None, operation_id=None, expected_source_sha=None):
+        path = Path(source_release) / "deploy/v5-selfhost/host-memory-action.json"
+        action = json.loads(path.read_text()) if path.exists() else {"action": "apply"}
+        if action["action"] == "restore":
+            owner_check()
+            snapshot_operation = action["snapshotOperationId"]
+            snapshot = self.snapshot_for_operation(snapshot_operation)
+            result = self.rollback(snapshot, owner_check=owner_check, operation_id=snapshot_operation)
+            result.update(action="restore", owner_operation_id=operation_id,
+                          snapshot_operation_id=snapshot_operation, snapshot_sha256="a" * 64,
+                          oom_sampling_accepted=False)
+            return result
+        result = self.apply(source_release, owner_check=owner_check, operation_id=operation_id)
+        result.update(action="apply", owner_operation_id=operation_id)
+        return result
+
     def apply(self, source_release=None, *, owner_check=None, operation_id=None):
         audit = Path(os.environ["FIXTURE_AUDIT"])
         data = {"source_release": str(source_release), "operation_id": operation_id,
@@ -127,12 +143,17 @@ class OwnerFixture(unittest.TestCase):
 
 
 class StdioOwnerTests(OwnerFixture):
-    def run_adapter(self, responses, mode="success", train=TRAIN, action=None):
+    def run_adapter(self, responses, mode="success", train=TRAIN, action=None,
+                    expected_sha=None, descriptor=None):
         candidate = self.candidate()
         adapter = candidate / "scripts/lib/v5-selfhost-host-memory-owner.py"
+        if descriptor is not None:
+            (candidate / "deploy/v5-selfhost/host-memory-action.json").write_text(json.dumps(descriptor))
         argv = [sys.executable, str(adapter), str(candidate), train]
-        if action is not None:
-            argv.append(action)
+        if action is not None or expected_sha is not None:
+            argv.append(action or "apply")
+        if expected_sha is not None:
+            argv.append(expected_sha)
         result = subprocess.run(argv,
                                 input=responses, env=self.environment(mode), cwd=self.root,
                                 capture_output=True, text=True, timeout=10)
@@ -146,7 +167,8 @@ class StdioOwnerTests(OwnerFixture):
         self.assertEqual(lines[:2], ["OWNER_CHECK", "OWNER_CHECK"])
         self.assertEqual(len(lines), 3)
         self.assertTrue(lines[2].startswith("RESULT "))
-        self.assertEqual(json.loads(lines[2][7:]), {"changed": True, "snapshot": None, "state": "verified"})
+        self.assertEqual(json.loads(lines[2][7:]), {"changed": True, "snapshot": None, "state": "verified",
+                                                  "action": "apply", "owner_operation_id": TRAIN})
         audit = self.audit()
         self.assertEqual(audit, {"source_release": str(candidate), "operation_id": TRAIN,
                                  "callback": "owner_check", "authorized_checks": 2})
@@ -270,10 +292,26 @@ class StdioOwnerTests(OwnerFixture):
                     self.root = previous
                     temporary.cleanup()
 
+    def test_normal_new_publish_restore_keeps_owner_and_snapshot_operations_distinct(self):
+        previous = "tr-previous-accepted"
+        result, _ = self.run_adapter("OWNER_OK\n" * 3, expected_sha="a" * 40,
+                                     descriptor={"schema": 1, "action": "restore",
+                                                 "snapshotOperationId": previous})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(next(line[7:] for line in result.stdout.splitlines() if line.startswith("RESULT ")))
+        self.assertEqual(receipt["owner_operation_id"], TRAIN)
+        self.assertEqual(receipt["snapshot_operation_id"], previous)
+        self.assertEqual(receipt["snapshot_sha256"], "a" * 64)
+        self.assertTrue(receipt["restored"])
+        self.assertFalse(receipt["oom_sampling_accepted"])
+        self.assertEqual(self.audit()["operation_id"], previous)
+
 
 class CoprocessWrapperTests(OwnerFixture):
-    def run_wrapper(self, mode="success", legacy=False, lose_owner=False, action="apply"):
+    def run_wrapper(self, mode="success", legacy=False, lose_owner=False, action="apply", descriptor=None):
         candidate = self.candidate()
+        if descriptor is not None:
+            (candidate / "deploy/v5-selfhost/host-memory-action.json").write_text(json.dumps(descriptor))
         binary = self.root / "fake-bin"
         binary.mkdir()
         (binary / "python3").symlink_to(sys.executable)
@@ -283,6 +321,7 @@ class CoprocessWrapperTests(OwnerFixture):
         script = r'''
 set -u
 LEASE_TRAIN_ID=tr-owner-fixture-001
+LEASE_TARGET_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 guard_calls=0
 release_policy_enabled() { [[ "$LEGACY" == 0 ]]; }
 release_policy_require_owner() {
@@ -348,6 +387,19 @@ exit "$rc"
         result = self.run_wrapper(action="restore", lose_owner=True)
         self.assertEqual(result.returncode, 86, result.stderr)
         self.assertFalse((self.root / "audit.json").exists())
+
+    @unittest.skipUnless(BASH4, "coproc requires Bash >=4; Mac system Bash 3 fixture skipped")
+    def test_real_coproc_new_publish_descriptor_restore_uses_current_owner(self):
+        previous = "tr-previous-accepted"
+        result = self.run_wrapper(descriptor={"schema": 1, "action": "restore",
+                                               "snapshotOperationId": previous})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.audit()["operation_id"], previous)
+        self.assertEqual((self.root / "guard-count").read_text().strip(), "4")
+        log = (self.root / "wrapper.log").read_text()
+        self.assertIn('"owner_operation_id":"' + TRAIN + '"', log)
+        self.assertIn('"snapshot_operation_id":"' + previous + '"', log)
+        self.assertIn("not OOM sampling acceptance", log)
 
 
 class OriginalFinalizerTests(OwnerFixture):

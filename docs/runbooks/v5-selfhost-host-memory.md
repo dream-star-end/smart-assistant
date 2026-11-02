@@ -2,7 +2,7 @@
 
 ## 状态和适用范围
 
-本文对应当前代码与 fixture，不是上线或验收完成记录。**尚未上线**；运行策略变更、启用/更新采样 unit，以及在宿主创建真实 synthetic unit 验证 SIGKILL/子孙回收，仍待用户针对具体方案批准。代码提交与正式发布已有任务授权，须在这些运行态批准到位并通过既有门禁后执行。
+本文对应当前代码与 fixture，不是上线或验收完成记录。**尚未上线**；运行策略、采样器安装/恢复及隔离synthetic验证必须在用户明确批准的目标与范围内执行，且不得中断用户任务。即使已有运行态批准，新代码仍须通过精确源码的独立审查、CI和既有正式门禁后才能执行。
 
 仅适用于个人版发布宿主 **v5-dev：38.55.252.217，hostname 必须为 `v3-dev-sg`**。不适用于 Aurora、kl-mirror、商业生产、其他 GCP VM 或账号池。连接沿已批准的专用 SSH 密钥与主机密钥检查进行；不新增权限，不访问 Secret Manager 或其他凭据。
 
@@ -33,6 +33,7 @@
 | --- | --- |
 | release 内源程序 | `scripts/v5-selfhost-host-memory.py` |
 | release 内 unit 模板 | `deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service` |
+| release 内版本化动作 | `deploy/v5-selfhost/host-memory-action.json` |
 | 独立安装程序 | `/opt/openclaude/v5-selfhost-breakglass/host-memory/sampler.py` |
 | 安装 unit | `/etc/systemd/system/openclaude-v5-selfhost-host-memory.service` |
 | JSONL 日志 | `/var/log/openclaude-v5-selfhost/host-memory/` |
@@ -93,7 +94,7 @@ unit仍为 **CPUQuota=2%**，约每墙钟秒20ms CPU额度；不提高限额，�
 2. 使用官方列车、原部署进程持有的锁、租约、fencing及intent barrier；不能另起控制器竞争，不清 barrier、不以环境变量或命令行标志代替owner。
 3. `release_policy_original_finalizer()`在应用进入committed、原有survivor/boot/watch步骤成功且watch核定相同后，才对包含采样器的新候选调用`host_memory_sampler_finalize()`。旧候选没有collector时保持旧行为。
 4. policy lane内由原部署进程启动private stdio adapter；每次`OWNER_CHECK`均由这个原进程重新执行现有`release_policy_require_owner`。只有精确`OWNER_OK`才能继续；EOF、超时、拒绝或协议异常不制造授权。
-5. `Installer.apply()`只接收**当前真实selfhost live release**的已审核程序与unit。它核验源、现状、drop-ins及回执，先持久化本操作首次snapshot和operation receipt，再原子替换文件、daemon-reload、enable/restart并核验active/enabled。文件替换与服务操作合起来不是一个事务。
+5. `Installer.finalize()`核定**当前真实selfhost live release**、`.complete`的完整source SHA及版本化动作，且每次写前重核源与descriptor未漂移。它先持久化新owner operation的action receipt，再二选一调用apply或恢复原snapshot。apply核验源、现状、drop-ins及回执，先保存本操作首次snapshot，再原子替换文件、daemon-reload、enable/restart并核验active/enabled。restore绝不先apply。文件替换与服务操作合起来不是一个事务。
 6. 同一`operation_id`重试必须使用相同来源及hash，复用首次snapshot，不把部分安装后的状态重新保存成“原状态”。receipt中的operation ID只是绑定身份，不是授权；状态或文件与expected不符时停止，不能换一个ID掩盖未知结果。
 
 不要手工运行apply、import后自行调用API、构造恒真owner回调、向adapter预喂`OWNER_OK`，或把CLI的fixture callback当正式owner。安装器默认CLI仅为只读plan；`--apply`/`--rollback`在无正式callback时拒绝写入。plan成功也不代表获准部署或已验收。
@@ -103,6 +104,7 @@ unit仍为 **CPUQuota=2%**，约每墙钟秒20ms CPU额度；不提高限额，�
 | 返回/记录 | 应如何解释 |
 | --- | --- |
 | hook成功且回执可核 | 安装流程完成；仍须核对采样日志、权限和真实运行限制，不能仅凭RESULT宣布OOM问题根治 |
+| 正常新列车descriptor restore核验成功 | 新应用仍须完成其原finalizer/门禁才可accepted；sampler仅恢复原snapshot状态，可能本应disabled/inactive。回执明确`restored=true`和`oom_sampling_accepted=false`，不冒称采样验收通过 |
 | 普通失败 `79` | 此finalizer阶段应用可能已经committed；**sampler未accepted**，按现有policy保持受控失败/hold，不能冒称整个应用已回退，也不能把旧collector仍在跑当新安装成功 |
 | owner失权 `86` | 原owner已不再有权继续；原样上抛，不转换成普通失败后继续写hold/补偿，不竞争租约或人工清barrier |
 | `RecoveryRequired`或结果未知 | 保存原snapshot/回执，先只读确认服务job、文件和enable/active状态，由正式owner恢复路径处理，不盲目重复systemctl或覆盖expected |
@@ -126,7 +128,33 @@ unit仍为 **CPUQuota=2%**，约每墙钟秒20ms CPU额度；不提高限额，�
 
 应用仍走官方个人版回退流程和当次封定的完整上一release。独立sampler的stable path、unit、enable/active状态和日志不随live symlink自动回退；不能把应用回退当成collector已撤销，也不能手删稳定文件或以临时systemctl命令代替受控恢复。
 
-当前代码新增了同operation的正式sampler-only恢复接入；**尚未在宿主执行或验收**。它不是自由选择旧snapshot、撤销任意已完成操作或回退应用的入口。批准后由官方协调流程使用以下命令形态；尖括号是原操作记录中必须核实并替换的占位，不能原样执行：
+### 成功归档后的撤销：新官方列车，旧snapshot数据
+
+默认版本化动作严格为`{"schema":1,"action":"apply"}`。若要撤销已成功安装的采样器，在新的受审候选中把同一文件改为以下形态，原ID必须来自已核实的sampler安装receipt：
+
+```json
+{"schema":1,"action":"restore","snapshotOperationId":"tr-original-sampler-operation"}
+```
+
+这是新候选Git SHA绑定的意图，不能在线改live文件或用临时环境/CLI开关替代。descriptor严格限制schema、键、动作和tr-ID，不接受任意snapshot路径、额外键或重复键；source symlink、source SHA不符及执行中漂移均拒绝。旧候选没有descriptor时兼容apply。
+
+新候选仍通过现有官方ride发车，使用完整新publisher tip SHA及`--release-policy user-impact-only`。例如以下仅是登记形态，须替换占位并遵守当前空闲/队列规则，不带`--allow-inflight`：
+
+```text
+scripts/oc-lease.sh register --resource deploy:selfhost --mode ride --sha <新候选完整40位SHA> --release-policy user-impact-only --callback none --uid <已核验的现有owner_uid> --owner <本任务标识>
+```
+
+不能改成manual/drive，也不重开旧resolved operation。现有register尚不支持drive；原policy binder继续验证官方worker、新train、冻结ride绑定、flock、SHA和nonce。当前新owner operation与`snapshotOperationId`必须不同；stdio始终向当前新owner询问权限。旧ID只用于固定state目录中只读解析首次snapshot及校验备份，不修改旧应用train或release-policy archive。
+
+新owner的`action-<sha256(新tr-ID)>.json`先冻结当前source SHA、source/descriptor散列和动作，再记录终态及文件/服务观察。恢复成功必须得到原状态精确核验，返回原snapshot ID、稳定snapshot摘要、`restored=true`和`oom_sampling_accepted=false`；不可缺证据仍报accepted。原sampler安装receipt会按恢复原语记为restored，这不等于重新打开旧应用发布操作。恢复中断时保留新action receipt和旧snapshot，当前新operation可经原官方forward恢复流程重试其已冻结动作；pending job、第三方内容/mode或终态漂移仍拒绝。
+
+snapshot摘要覆盖首次备份及before-state，排除后续变化的status字段，便于丢ACK重试对账。snapshot若原本没有程序/unit，恢复为不存在并保留日志；若原本有旧sampler，精确恢复其内容、权限和enable/active状态。安装后若已被其他操作更新，不能拿旧receipt覆盖新状态，应先核定最新合法恢复链。
+
+descriptor会随源码保留。日后要重新启用采样，须把同一文件明确改回apply，再走新的审查/CI/官方列车；不能依赖未说明的下一次发布意外重装。普通应用`--rollback`仍不自动撤销独立sampler。
+
+### 未解除hold的部分安装恢复
+
+同operation的sampler-only恢复接入仍用于未解除hold的部分安装；**尚未在宿主执行或验收**。它不替代上述成功归档后的新列车撤销，不是自由选择旧snapshot或回退应用的入口。批准后由官方协调流程使用以下命令形态；尖括号是原操作记录中必须核实并替换的占位，不能原样执行：
 
 ```text
 scripts/deploy-v5-selfhost.sh --deploy --resume-release-policy --restore-host-memory --lease-train=<原tr-ID> --target-sha=<原40位SHA>

@@ -17,10 +17,13 @@ OPERATION_ID = re.compile(r"tr-[A-Za-z0-9][A-Za-z0-9_-]{0,124}\Z")
 
 
 def main():
-    if len(sys.argv) not in (3, 4) or not OPERATION_ID.fullmatch(sys.argv[2]):
+    if len(sys.argv) not in (3, 4, 5) or not OPERATION_ID.fullmatch(sys.argv[2]):
         return 79
-    action = sys.argv[3] if len(sys.argv) == 4 else "apply"
+    action = sys.argv[3] if len(sys.argv) >= 4 else "apply"
     if action not in ("apply", "restore"):
+        return 79
+    expected_sha = sys.argv[4] if len(sys.argv) == 5 else None
+    if expected_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
         return 79
     helper = Path(__file__).with_name("v5-selfhost-host-memory-install.py")
     spec = importlib.util.spec_from_file_location("selfhost_host_memory_install", helper)
@@ -46,9 +49,13 @@ def main():
             if result.get("restored") is not True:
                 raise module.InstallError("Snapshot restore was not verified")
         else:
-            result = installer.apply(Path(sys.argv[1]), owner_check=owner_check,
-                                     operation_id=sys.argv[2])
-        safe = {key: result[key] for key in ("changed", "snapshot", "state", "restored") if key in result}
+            # The compatible 'apply' wire action finalizes the versioned
+            # candidate descriptor; that descriptor may explicitly restore.
+            result = installer.finalize(Path(sys.argv[1]), owner_check=owner_check,
+                                        operation_id=sys.argv[2], expected_source_sha=expected_sha)
+        safe = {key: result[key] for key in ("changed", "snapshot", "state", "restored", "action",
+                "owner_operation_id", "snapshot_operation_id", "snapshot_sha256", "oom_sampling_accepted")
+                if key in result}
         print("RESULT " + json.dumps(safe, separators=(",", ":")), flush=True)
         return 0
     except module.OwnershipRequired:

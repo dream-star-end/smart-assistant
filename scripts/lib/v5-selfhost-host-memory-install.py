@@ -34,6 +34,7 @@ UNIT_FILE = Path("/etc/systemd/system") / UNIT
 STATE_ROOT = Path("/var/lib/openclaude-v5-selfhost/host-memory-install")
 SOURCE_PROGRAM = Path("scripts/v5-selfhost-host-memory.py")
 SOURCE_UNIT = Path("deploy/v5-selfhost") / UNIT
+SOURCE_ACTION = Path("deploy/v5-selfhost/host-memory-action.json")
 SNAPSHOT_NAME = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{12}\Z")
 OPERATION_ID = re.compile(r"tr-[A-Za-z0-9][A-Za-z0-9_-]{0,124}\Z")
 # Effective configuration is checked through systemd as well: files can appear
@@ -217,6 +218,122 @@ class Installer:
         self._validate_unit(result["unit"])
         return resolved, result
 
+    def _action(self, source: Path) -> tuple[dict, str | None]:
+        path = source / SOURCE_ACTION
+        info = self._regular(path, absent_ok=True)
+        if info is None:
+            return {"schema": 1, "action": "apply"}, None
+        if info.st_size > 4096:
+            raise InstallError("Sampler action descriptor is oversized")
+        with path.open("rb") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise InstallError("Sampler action descriptor is oversized")
+        def unique(pairs):
+            value = dict(pairs)
+            if len(value) != len(pairs):
+                raise InstallError("Duplicate sampler action keys")
+            return value
+        try:
+            action = json.loads(raw, object_pairs_hook=unique)
+        except (ValueError, UnicodeError):
+            raise InstallError("Invalid sampler action descriptor") from None
+        if not isinstance(action, dict) or type(action.get("schema")) is not int or action["schema"] != 1:
+            raise InstallError("Invalid sampler action schema")
+        if action.get("action") == "apply" and set(action) == {"schema", "action"}:
+            return action, _sha(raw)
+        if (action.get("action") == "restore" and set(action) == {"schema", "action", "snapshotOperationId"}
+                and isinstance(action["snapshotOperationId"], str)
+                and OPERATION_ID.fullmatch(action["snapshotOperationId"])):
+            return action, _sha(raw)
+        raise InstallError("Unexpected sampler action or keys")
+
+    def _action_binding(self, source_release: Path, operation_id: str,
+                        expected_source_sha: str | None) -> tuple[Path, dict]:
+        self._receipt_path(operation_id)  # Validate identity, never grant authority.
+        source, blobs = self._source(source_release)
+        complete = source / ".complete"
+        info = self._regular(complete)
+        if info.st_size > 65536:
+            raise InstallError("Candidate manifest is oversized")
+        with complete.open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise InstallError("Candidate manifest is oversized")
+        manifest = json.loads(raw)
+        sha = manifest.get("sourceCommit") if isinstance(manifest, dict) else None
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise InstallError("Candidate source SHA is unavailable")
+        if expected_source_sha is not None and expected_source_sha != sha:
+            raise InstallError("Candidate source SHA differs from official train")
+        action, action_sha = self._action(source)
+        if action.get("snapshotOperationId") == operation_id:
+            raise InstallError("New publish restore must reference an earlier sampler operation")
+        return source, {"owner_operation_id": operation_id, "source_release": str(source),
+                        "source_commit": sha, "source_manifest_sha256": _sha(raw),
+                        "source_sha256": {k: _sha(v) for k, v in blobs.items()},
+                        "action": action, "action_sha256": action_sha}
+
+    def finalize(self, source_release: Path, *, owner_check: Callable | None = None,
+                 operation_id: str | None = None, expected_source_sha: str | None = None) -> dict:
+        """Execute the current candidate's frozen action under the new owner.
+
+        A restore references an earlier sampler receipt only. It neither claims
+        nor changes that earlier application's train, policy archive or owner.
+        """
+        self._check_owner(owner_check)
+        source, binding = self._action_binding(source_release, operation_id, expected_source_sha)
+        def fenced_owner():
+            self._check_owner(owner_check)
+            observed_source, observed_binding = self._action_binding(source, operation_id, expected_source_sha)
+            if observed_source != source or observed_binding != binding:
+                raise InstallError("Sampler action/source changed during finalization")
+        action_path = self._receipt_path(operation_id).with_name("action-" + _sha(operation_id.encode()) + ".json")
+        self._mkdir(self.path(STATE_ROOT), fenced_owner)
+        info = self._regular(action_path, absent_ok=True)
+        record = None
+        if info is not None:
+            if info.st_mode & 0o077:
+                raise InstallError("Sampler action receipt is not private")
+            record = json.loads(action_path.read_text())
+            if (not isinstance(record, dict) or record.get("schema") != 1
+                    or record.get("binding") != binding
+                    or record.get("status") not in ("prepared", "applied", "restored")):
+                raise InstallError("Original sampler action binding differs")
+            # The underlying install/restore receipt verifies current files and
+            # state. It may legitimately be 'restored' after an explicit held-
+            # operation recovery; do not freeze that recovery out with this
+            # action's older observation. Foreign drift still fails there.
+        else:
+            record = {"schema": 1, "binding": binding, "status": "prepared"}
+            self._receipt(action_path, record, fenced_owner, new=True)
+        action = binding["action"]["action"]
+        if action == "restore":
+            snapshot_operation = binding["action"]["snapshotOperationId"]
+            snapshot = self.snapshot_for_operation(snapshot_operation)
+            original = self._load_snapshot(snapshot)
+            # Only status evolves; the original before-state and backup hashes
+            # form a stable digest across apply/restore and lost-ACK retries.
+            snapshot_sha = _sha(json.dumps({k: v for k, v in original.items() if k != "status"},
+                                          sort_keys=True, separators=(",", ":")).encode())
+            result = self.rollback(snapshot, owner_check=fenced_owner, operation_id=snapshot_operation)
+            files, state = self._observed()
+            if (result.get("restored") is not True or files != original["previous_files"]
+                    or state != original["previous_state"]):
+                raise RecoveryRequired(snapshot, state)
+            result.update(action="restore", owner_operation_id=operation_id,
+                          snapshot_operation_id=snapshot_operation, snapshot_sha256=snapshot_sha,
+                          oom_sampling_accepted=False)
+        else:
+            result = self.apply(source, owner_check=fenced_owner, operation_id=operation_id)
+            files, state = self._observed()
+            result.update(action="apply", owner_operation_id=operation_id)
+        self._check_owner(fenced_owner)
+        record.update(status="restored" if action == "restore" else "applied",
+                      expected_files=files, expected_state=state, result=result)
+        self._receipt(action_path, record, fenced_owner)
+        return result
+
     def _state(self) -> dict:
         try:
             r = self.runner(["show", UNIT, "--no-pager",
@@ -269,6 +386,7 @@ class Installer:
         if previous_state["active_state"] == "failed":
             raise InstallError("Existing failed sampler needs separate recovery review")
         return {"source_release": str(source), "unit": UNIT,
+                "host_memory_action": self._action(source)[0],
                 "source_sha256": {k: _sha(v) for k, v in blobs.items()},
                 "previous_files": files, "previous_state": previous_state,
                 "program_directory_existed": self.path(PROGRAM.parent).exists()}

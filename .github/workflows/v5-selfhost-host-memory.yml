@@ -12,6 +12,7 @@ on:
       - scripts/__tests__/v5_selfhost_*_test.py
       - scripts/__tests__/v5SelfhostCanaryPrewarm.node-test.mjs
       - deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service
+      - deploy/v5-selfhost/host-memory-action.json
       - .github/workflows/v5-selfhost-host-memory.yml
   push:
     branches: [feat/v5-selfhost]
@@ -24,6 +25,7 @@ on:
       - scripts/__tests__/v5_selfhost_*_test.py
       - scripts/__tests__/v5SelfhostCanaryPrewarm.node-test.mjs
       - deploy/v5-selfhost/openclaude-v5-selfhost-host-memory.service
+      - deploy/v5-selfhost/host-memory-action.json
       - .github/workflows/v5-selfhost-host-memory.yml
   workflow_dispatch:
 

@@ -105,6 +105,7 @@ class InstallerTest(unittest.TestCase):
         self.unit_source.parent.mkdir(parents=True)
         self.program_source.write_text("print('sampler fixture')\n")
         self.unit_source.write_text(UNIT_TEXT)
+        (self.release / ".complete").write_text(json.dumps({"sourceCommit": "a" * 40}))
         self.installer.path(install.LIVE).symlink_to(self.release)
         self.installer.path(install.UNIT_FILE.parent).mkdir(parents=True)
         self.installer.path(install.PROGRAM.parent.parent).mkdir(parents=True)
@@ -668,6 +669,178 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(self.runner.mutations(), [])
         self.installer.rollback(Path(second["snapshot"]), owner_check=self.owner)
         self.assertEqual(self.runner.mutations(), [])
+
+
+class CandidateActionTests(unittest.TestCase):
+    setUp = InstallerTest.setUp
+    apply = InstallerTest.apply
+    owner = InstallerTest.owner
+
+    def next_candidate(self, action):
+        candidate = self.release.parent / "rel-restore-candidate"
+        (candidate / install.SOURCE_PROGRAM).parent.mkdir(parents=True)
+        (candidate / install.SOURCE_UNIT).parent.mkdir(parents=True)
+        (candidate / install.SOURCE_PROGRAM).write_bytes(self.program_source.read_bytes())
+        (candidate / install.SOURCE_UNIT).write_bytes(self.unit_source.read_bytes())
+        (candidate / ".complete").write_text(json.dumps({"sourceCommit": "b" * 40}))
+        (candidate / install.SOURCE_ACTION).write_text(json.dumps(action))
+        self.installer.path(install.LIVE).unlink()
+        self.installer.path(install.LIVE).symlink_to(candidate)
+        return candidate
+
+    def finalize(self, candidate=None, sha="a" * 40, owner=None):
+        return self.installer.finalize(candidate or self.release, owner_check=owner or self.owner,
+                                       operation_id=self.operation, expected_source_sha=sha)
+
+    def test_action_absent_is_compatible_apply_and_receipt_binds_current_owner(self):
+        result = self.finalize()
+        self.assertEqual(result["action"], "apply")
+        self.assertEqual(result["owner_operation_id"], self.operation)
+        action_path = self.installer._receipt_path(self.operation).with_name(
+            "action-" + install._sha(self.operation.encode()) + ".json")
+        record = json.loads(action_path.read_text())
+        self.assertEqual(record["binding"]["source_commit"], "a" * 40)
+        self.assertIsNone(record["binding"]["action_sha256"])
+        self.runner.calls.clear()
+        self.finalize()
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_new_publish_can_restore_accepted_old_snapshot_without_reopening_archive(self):
+        old_operation = self.operation
+        first = self.apply(owner_check=self.owner)
+        archive = self.root / "release-policy-original.resolved.json"
+        archive.write_text("immutable old accepted application archive")
+        candidate = self.next_candidate({"schema": 1, "action": "restore",
+                                         "snapshotOperationId": old_operation})
+        self.operation = "tr-new-publisher"
+        owner_ids = []
+        def current_owner():
+            owner_ids.append(self.operation)
+        self.runner.calls.clear()
+        result = self.finalize(candidate, "b" * 40, current_owner)
+        self.assertTrue(result["restored"])
+        self.assertEqual(result["action"], "restore")
+        self.assertEqual(result["owner_operation_id"], "tr-new-publisher")
+        self.assertEqual(result["snapshot_operation_id"], old_operation)
+        self.assertEqual(result["snapshot"], first["snapshot"])
+        self.assertRegex(result["snapshot_sha256"], r"^[0-9a-f]{64}$")
+        self.assertFalse(result["oom_sampling_accepted"])
+        self.assertEqual(set(owner_ids), {"tr-new-publisher"})
+        self.assertFalse(self.program.exists())
+        self.assertFalse(self.unit.exists())
+        self.assertFalse(self.runner.enabled)
+        self.assertEqual(self.runner.active, "inactive")
+        self.assertEqual(archive.read_text(), "immutable old accepted application archive")
+        self.assertNotIn("restart", [call[0] for call in self.runner.mutations()])
+        self.assertNotIn("enable", [call[0] for call in self.runner.mutations()])
+        self.runner.calls.clear()
+        again = self.finalize(candidate, "b" * 40, current_owner)
+        self.assertEqual(again["snapshot_sha256"], result["snapshot_sha256"])
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_action_schema_keys_duplicate_keys_and_operation_are_strict(self):
+        path = self.release / install.SOURCE_ACTION
+        cases = ("[]", '{"schema":true,"action":"apply"}',
+                 '{"schema":1,"action":"apply","snapshot":"/tmp/other"}',
+                 '{"schema":1,"action":"restore"}',
+                 '{"schema":1,"action":"restore","snapshotOperationId":"../../other"}',
+                 '{"schema":1,"action":"apply","action":"apply"}',
+                 json.dumps({"schema": 1, "action": "restore", "snapshotOperationId": self.operation}))
+        for raw in cases:
+            with self.subTest(raw=raw):
+                path.write_text(raw)
+                with self.assertRaises(install.InstallError):
+                    self.finalize()
+                self.assertEqual(self.runner.mutations(), [])
+                self.assertFalse(self.installer.path(install.STATE_ROOT).exists())
+
+    def test_action_symlink_and_wrong_candidate_sha_cannot_mutate(self):
+        path = self.release / install.SOURCE_ACTION
+        outside = self.root / "outside-action.json"
+        outside.write_text('{"schema":1,"action":"apply"}')
+        path.symlink_to(outside)
+        with self.assertRaises(install.InstallError):
+            self.finalize()
+        path.unlink()
+        with self.assertRaisesRegex(install.InstallError, "source SHA"):
+            self.finalize(sha="c" * 40)
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_action_change_during_install_stops_before_more_service_mutations(self):
+        path = self.release / install.SOURCE_ACTION
+        path.write_text('{"schema":1,"action":"apply"}')
+        self.runner.before_mutate = lambda argv: path.write_text(
+            '{"schema":1,"action":"restore","snapshotOperationId":"tr-earlier"}')
+        with self.assertRaises(install.RecoveryRequired):
+            self.finalize()
+        self.assertEqual([call[0] for call in self.runner.mutations()], ["daemon-reload"])
+        _, original = self.installer._load_receipt(self.operation)
+        self.assertEqual(original["status"], "applying")
+
+    def test_same_operation_action_cannot_change_after_acceptance(self):
+        self.finalize()
+        self.runner.calls.clear()
+        (self.release / install.SOURCE_ACTION).write_text(
+            '{"schema":1,"action":"restore","snapshotOperationId":"tr-earlier"}')
+        with self.assertRaisesRegex(install.InstallError, "binding differs"):
+            self.finalize()
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_held_apply_can_forward_after_explicit_same_operation_restore(self):
+        first = self.finalize()
+        self.installer.rollback(Path(first["snapshot"]), owner_check=self.owner,
+                                operation_id=self.operation)
+        self.assertFalse(self.program.exists())
+        again = self.finalize()
+        self.assertEqual(again["snapshot"], first["snapshot"])
+        self.assertEqual(again["action"], "apply")
+        self.assertTrue(self.runner.enabled)
+        self.assertEqual(self.runner.active, "active")
+
+    def test_missing_snapshot_or_foreign_state_never_returns_restored(self):
+        candidate = self.next_candidate({"schema": 1, "action": "restore",
+                                         "snapshotOperationId": "tr-not-installed"})
+        self.operation = "tr-new-publisher"
+        with self.assertRaises(install.InstallError):
+            self.finalize(candidate, "b" * 40)
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_restore_foreign_file_or_pending_job_refused_before_service_write(self):
+        old_operation = self.operation
+        self.apply(owner_check=self.owner)
+        candidate = self.next_candidate({"schema": 1, "action": "restore",
+                                         "snapshotOperationId": old_operation})
+        self.operation = "tr-new-publisher"
+        self.program.write_text("foreign sampler changes\n")
+        self.runner.calls.clear()
+        with self.assertRaises(install.RecoveryRequired):
+            self.finalize(candidate, "b" * 40)
+        self.assertEqual(self.runner.mutations(), [])
+        self.program.write_bytes(self.program_source.read_bytes())
+        self.runner.job = "42/start"
+        with self.assertRaises(install.InstallError):
+            self.finalize(candidate, "b" * 40)
+        self.assertEqual(self.runner.mutations(), [])
+
+    def test_interrupted_restore_resumes_only_same_new_owner_action(self):
+        old_operation = self.operation
+        self.apply(owner_check=self.owner)
+        candidate = self.next_candidate({"schema": 1, "action": "restore",
+                                         "snapshotOperationId": old_operation})
+        self.operation = "tr-new-publisher"
+        allowed = [True]
+        def owner():
+            if not allowed[0]:
+                raise install.OwnershipRequired("fixture lost new owner")
+        self.runner.before_mutate = lambda argv: allowed.__setitem__(0, False)
+        with self.assertRaises(install.OwnershipRequired):
+            self.finalize(candidate, "b" * 40, owner)
+        self.runner.before_mutate = None
+        allowed[0] = True
+        result = self.finalize(candidate, "b" * 40, owner)
+        self.assertTrue(result["restored"])
+        self.assertFalse(self.program.exists())
+        self.assertFalse(self.unit.exists())
 
 
 if __name__ == "__main__":
