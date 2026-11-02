@@ -140,3 +140,22 @@ persistent root is `/home/agent/.openclaude/.cc5-t1555u`, covered by the downloa
 blocklist. Direct raw transport fixtures may omit tools; the production main
 always loads the protected keyring and supplies the pump. This is not a model
 or browser acceptance result. Plan approved by this-session research_review.
+
+## Approved C profile controller (11/02)
+
+`cc5-host-controller.py` starts from the task-only controller already reviewed
+on P3 commit 24294c82b. Its original five installed sources remain byte-for-byte
+unchanged; this minimal branch carries the controller so it has no runtime
+source dependency on the unmerged P3 libraries. The fixed MCP source hash is
+pinned in this controller. A stopped task alone may atomically install the
+separate private cprofile; launch and evidence collection revalidate its exact
+files, owner, modes and hashes. Only private CLI 2.1.316 and the previously
+approved trusted work directory can launch. All builtins/settings/slash commands
+are disabled, strict MCP permits only the fixed roundtrip. Exact `/proc` argv
+preserves both empty arguments; ps text alone cannot prove them. The unrelated
+cc5-login remains under the original narrow metadata checks and is never
+captured. Sending TERM is not exit proof: the independent prove-stopped action
+requires the recorded host/Claude/observed descendant identities, run directory
+and both task tmux sessions to be absent. It never marks SSH EOF as stopped.
+No new TUI startup or real conversation has occurred for these fixtures.
+Plan and copy adjustment approved by this-session engine_inventory.
