@@ -56,7 +56,8 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import { OPENCLAUDE_CONTAINER_GATEWAY_PORT, serverFeatureContainerEnv } from "@openclaude/protocol";
+import type { Cc5FreshContainerRuntimePort, Cc5PreparedContainer } from "@openclaude/gateway/cc5-container-runtime";
+import { OPENCLAUDE_CONTAINER_GATEWAY_PORT, canUseCc5TestModel, serverFeatureContainerEnv } from "@openclaude/protocol";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
   RUNTIME_CHANNEL_LABEL_KEY,
@@ -1184,6 +1185,8 @@ export function readPlatformBundleOptionalFromEnv(): boolean {
  * 测试可以注入确定值便于断言。
  */
 export interface V3SupervisorDeps {
+  /** Personal test-only fresh container lane; omitted entirely while OFF. */
+  cc5?: Cc5FreshContainerRuntimePort;
   docker: Docker;
   pool: Pool;
   image: string;
@@ -2349,6 +2352,15 @@ async function retryCreateOnce(
  * saga 下占位行已在 Tx1 提交,只能翻 vanished 立墓碑(所有 active 行读者只认
  * state='active',vanished 行天然被忽略;IP / user-slot 随 partial-unique 立即释放)。
  */
+/** Revoke now, retain unknown on failure; never block existing Docker cleanup from running. */
+function beginCc5Release(deps: V3SupervisorDeps, rowId: number, dockerId?: string): Promise<void> {
+  let release: Promise<void>;
+  try { release = deps.cc5?.release(String(rowId), dockerId || undefined) ?? Promise.resolve(); }
+  catch { release = Promise.reject(new Error("CC5_REMOTE_EXIT_UNPROVED")); }
+  void release.catch(() => {});
+  return release;
+}
+
 async function compensateProvisionFailure(
   deps: V3SupervisorDeps,
   rowId: number,
@@ -2356,6 +2368,9 @@ async function compensateProvisionFailure(
   useRemote: boolean,
   hostId: string | undefined,
 ): Promise<void> {
+  const cc5Release = beginCc5Release(deps, rowId, createdDockerId).catch(() => {
+    console.error("[v3supervisor] cc5 remote exit unproved; own operation retained");
+  });
   // 1) 短事务翻 vanished(隐式单语句事务;不 connect() 长持,不 BEGIN)
   try {
     await deps.pool.query(
@@ -2382,6 +2397,7 @@ async function compensateProvisionFailure(
       /* swallow — orphanReconcile / NameConflict 自愈兜底 */
     }
   }
+  await cc5Release;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -2720,10 +2736,26 @@ export async function provisionV3Container(
   let boundCodexAccountId: bigint | null = null;
   // 实际打上的 bundle_rev label(在下方 runtimeLabels 组装处赋值)—— 中段块作用域外要读,故在此声明。
   let appliedBundleRev: string | undefined;
+  let cc5Prepared: Cc5PreparedContainer | null = null;
+  let cc5KeyringAssignment: string | undefined;
   let syntheticEvalOverlay: ReturnType<
     SyntheticEvalOverlayRuntime["resolvePrepared"]
   > = null;
   try {
+    if (canUseCc5TestModel(uid, process.env)) {
+      if (getRuntimeChannel() !== "v5" || useRemote || !deps.cc5 || !deps.modelAuthority?.required) {
+        throw new SupervisorError("InvalidArgument", "cc5 fresh local binding is unavailable");
+      }
+      const assignment = deps.modelAuthority.keyringEnvAssignment;
+      cc5KeyringAssignment = typeof assignment === "function" ? assignment() : assignment;
+      const prefix = "OC_MODEL_AUTHORITY_KEYRING=";
+      if (!cc5KeyringAssignment.startsWith(prefix)) {
+        throw new SupervisorError("InvalidArgument", "cc5 public authority keyring is unavailable");
+      }
+      cc5Prepared = await deps.cc5.prepare({ uid, containerDbId: String(row.id), local: true,
+        publicKeyring: cc5KeyringAssignment.slice(prefix.length) });
+      if (!cc5Prepared) throw new SupervisorError("InvalidArgument", "cc5 fresh binding refused");
+    }
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
 
     // hostGatewayIp:容器所在 host 的 docker bridge gateway IP(.1 of bridge_cidr)。
@@ -2967,9 +2999,10 @@ export async function provisionV3Container(
       // **现取**(函数形态):轮换步骤① 加了新公钥之后,新建容器必须立刻拿到含新钥的 ring,
       // 否则 census 永远收敛不到 100%,步骤②(切私钥前的 gate)过不去。
       const keyringAssignment = deps.modelAuthority.keyringEnvAssignment;
-      env.push(
-        typeof keyringAssignment === "function" ? keyringAssignment() : keyringAssignment,
-      );
+      env.push(cc5KeyringAssignment ?? (
+        typeof keyringAssignment === "function" ? keyringAssignment() : keyringAssignment
+      ));
+      if (cc5Prepared) env.push("OC_SELFHOST_CC5_T1555U_ENABLED=1", `OC_SELFHOST_CC5_T1555U_TEST_UID=${uid}`);
       if (!promptQueueEnabled) env.push(`OC_USER_ID=${String(uid)}`);
       if (deps.modelAuthority.required) env.push("OC_MODEL_AUTHORITY=1");
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)单向下发:容器内 gateway 的
@@ -3221,6 +3254,8 @@ export async function provisionV3Container(
       `${volumeNames.userLocal}:${V3_USER_LOCAL_MOUNT}:rw`,
       `${volumeNames.userConfig}:${V3_USER_CONFIG_MOUNT}:rw`,
     ];
+
+    if (cc5Prepared) binds.push(`${cc5Prepared.mountSource}:/run/oc/cc5-remote-t1555u:ro`);
 
     const cursorAuthMount = resolveV5CursorAuthMount({
       uid,
@@ -3605,6 +3640,7 @@ export async function provisionV3Container(
           createOpts,
         );
         createdDockerId = container.id;
+        if (cc5Prepared) await deps.cc5!.bindCreated(cc5Prepared, createdDockerId);
 
       try {
         await container.start();
@@ -3654,6 +3690,7 @@ export async function provisionV3Container(
         `provision row ${row.id} vanished before Tx2 commit (concurrent lifecycle action); retry`,
       );
     }
+    if (cc5Prepared) await deps.cc5!.activate(cc5Prepared, createdDockerId);
     if (syntheticEvalOverlay) {
       deps.syntheticEvalOverlay!.activatePrepared(
         syntheticEvalOverlay,
@@ -3758,6 +3795,27 @@ export async function markV3ContainerVanished(
  * host 路由 / missing 吞掉 / PartialV3Cleanup 聚合与历史 stopAndRemove 后半段一致。
  */
 export async function cleanupV3ContainerDocker(
+  deps: V3SupervisorDeps,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  timeoutSec: number,
+  dbHostUuid: string | null,
+): Promise<void> {
+  const cc5Release = beginCc5Release(deps, containerRow.id, containerRow.container_internal_id ?? undefined);
+  let dockerFailed = false;
+  let dockerError: unknown;
+  try { await cleanupV3DockerEffects(deps, containerRow, timeoutSec, dbHostUuid); }
+  catch (error) { dockerFailed = true; dockerError = error; }
+  let remoteFailed = false;
+  try { await cc5Release; }
+  catch {
+    remoteFailed = true;
+    console.error("[v3supervisor] cc5 remote exit unproved; own operation retained");
+  }
+  if (dockerFailed) throw dockerError;
+  if (remoteFailed) throw new SupervisorError("PartialV3Cleanup", "cc5 remote exit remains unproved");
+}
+
+async function cleanupV3DockerEffects(
   deps: V3SupervisorDeps,
   containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
   timeoutSec: number,

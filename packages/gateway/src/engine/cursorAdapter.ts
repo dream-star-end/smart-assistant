@@ -12,6 +12,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import {
   CURSOR_ENGINE_MODELS,
+  isCc5TestModel,
   DEFAULT_CURSOR_ENGINE_MODEL,
   type GoalStateSnapshot,
   type OutboundContentBlock,
@@ -41,6 +42,7 @@ import { buildPromptContext } from '../promptSlots.js'
 import { issueParentCallerToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
+import { Cc5InteractiveAdapter } from './cc5InteractiveAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
 import {
   CREDIT_EXHAUSTED_DETAIL,
@@ -2840,4 +2842,8 @@ export const _internals = {
   isBlockingOcMemoryDelegateCommand,
 }
 
-registerEngine('cursor', (opts) => new CursorRoutingAdapter(opts))
+registerEngine('cursor', (opts) => {
+  // Resolve this route before constructing any real credential-pool selector.
+  if (isCc5TestModel(opts.model)) return new Cc5InteractiveAdapter(opts)
+  return new CursorRoutingAdapter(opts)
+})

@@ -915,3 +915,48 @@ describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
     }
   });
 });
+
+describe('cc5 task test model server projection and execution policy', () => {
+  test('default-off and exact test UID override public/admin/grants, including aliases and locked rows', () => {
+    const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID'] as const;
+    const saved = keys.map((key) => process.env[key]);
+    try {
+      process.env.OC_SELFHOST_CC5_T1555U_TEST_UID = '314159';
+      const id = 'cc5-remote-t1555u';
+      for (const visibility of ['public', 'admin', 'hidden'] as const) {
+        const catalog = snap({
+          entries: [entry({ entryId: 99, modelId: id, engine: 'cursor', providerId: 'cursor' })],
+          pricing: [price(id, { visibility })], aliases: [['cc5-task-alias', 99]],
+        });
+        for (const flag of ['0', '1']) {
+          process.env.OC_SELFHOST_CC5_T1555U_ENABLED = flag;
+          for (const role of ['user', 'admin'] as const) {
+            for (const uid of [0, 3, 314158, 314159]) {
+              const scope = { uid, role, grantedModelIds: new Set([id]), userPlanTier: 100 };
+              const expected = flag === '1' && uid === 314159;
+              assert.equal(catalog.canUseModel(scope, id), expected);
+              assert.equal(catalog.canUseModel(scope, 'cc5-task-alias'), expected);
+              assert.deepEqual(catalog.listForUser(scope).map((row) => row.modelId), expected ? [id] : []);
+              if (!expected) assert.deepEqual(catalog.listLockedForUser(scope), []);
+            }
+          }
+        }
+        process.env.OC_SELFHOST_CC5_T1555U_ENABLED = '1';
+        if (visibility === 'hidden') {
+          assert.equal(catalog.canUseModel({ uid: 314159, role: 'admin', grantedModelIds: new Set() }, id), false);
+        }
+      }
+      const locked = snap({
+        entries: [entry({ entryId: 99, modelId: id, engine: 'cursor', providerId: 'cursor' })],
+        pricing: [price(id, { minPlanCode: 'lite', minPlanTier: 2 })],
+      });
+      for (const uid of [0, 3, 314159]) {
+        const scope = { uid, role: 'user' as const, grantedModelIds: new Set([id]), userPlanTier: 0 };
+        assert.equal(locked.canUseModel(scope, id), false);
+        assert.deepEqual(locked.listLockedForUser(scope).map((row) => row.modelId), uid === 314159 ? [id] : []);
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
+  });
+});

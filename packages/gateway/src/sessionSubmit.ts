@@ -1,3 +1,5 @@
+import { isCc5TestModel } from '@openclaude/protocol'
+import { isCc5ResumeId } from './engine/cc5ResumeId.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
@@ -1038,6 +1040,10 @@ export async function submit(
     }
     const spawnCwd = this._cursorWorkspacePathForSession(session)
     const liveNativeId = session.runner.nativeSessionId
+    if (isCc5TestModel(session.runner.model)
+      && (isCc5ResumeId(liveNativeId) || isCc5ResumeId(this._resumeMap.get(session.sessionKey)))) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const liveBoxId =
       session.providerTag === 'cursor' ? cursorSandBoxCcResumeInnerId(liveNativeId) : undefined
     const liveSandJsonlId =
@@ -1053,7 +1059,8 @@ export async function submit(
             : usableCursorResumeId({
                 workspacePath: spawnCwd,
                 liveId: liveNativeId,
-                mappedId: this._resumeMap.get(session.sessionKey),
+                mappedId: isCc5ResumeId(this._resumeMap.get(session.sessionKey))
+                  ? undefined : this._resumeMap.get(session.sessionKey),
               })
         : undefined
     let providerResumeId =
@@ -1783,6 +1790,9 @@ export async function _getOrCreateExclusive(
     //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
     //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
     //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
+    if (isCc5TestModel(executionModel) && isCc5ResumeId(this._resumeMap.get(opts.sessionKey))) {
+      throw new Error('CC5_TEST_REMOTE_RESUME_UNSUPPORTED')
+    }
     const hadSameProviderResume =
       Boolean(this._resumeMap.get(opts.sessionKey)) &&
       normalizeEngineTag(this._resumeMapProvider.get(opts.sessionKey)) === engineId
@@ -2802,6 +2812,7 @@ export function _resumeIdFor(
 ): string | undefined {
   const id = this._resumeMap.get(sessionKey)
   if (!id) return undefined
+  if (isCc5ResumeId(id)) return undefined
   let tag = normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
   // A false "no transcript" drop used to delete the provider and let the
   // live-session overlay save the same id back as implicit ccb. The Fast

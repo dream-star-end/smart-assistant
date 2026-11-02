@@ -3002,6 +3002,17 @@ cmd_cutover() {
       cutover_clog "  [dry-run] smoke 含 healthz + GET / oc-build == $expected_build + egress-health"
     else
       local joint_rc=0
+      # A sealed candidate owns the fixed bootstrap policy. Old releases have
+      # no policy and retain their original behavior. Never read a moving HEAD
+      # or accept arbitrary env keys/values here; the helper checks real fd8.
+      if [[ -e "$rel/deploy/v5-selfhost/cc5-bootstrap.json" || -L "$rel/deploy/v5-selfhost/cc5-bootstrap.json" ]]; then
+        release_policy_guard_owner || return 86
+        if ! python3 "$rel/scripts/lib/v5-selfhost-cc5-bootstrap.py" "$rel" "$head" "$$"; then
+          cutover_clog "cc5 bootstrap configuration refused; configuration is not automatically reverted with code"
+          cutover_compensate "cc5-bootstrap-config"
+          return $?
+        fi
+      fi
       activate_tuple_joint "$rel" "$prev_val" || joint_rc=$?
       if [[ "$joint_rc" != 0 ]]; then
         if release_policy_enabled; then

@@ -313,3 +313,31 @@ describe('canUseModel — min_plan_code Max floor', () => {
     )
   })
 })
+
+describe('cc5 default-off legacy visibility and execution backstop', () => {
+  test('never leaks publicly and never authorizes ordinary/admin identities by grant or public visibility', () => {
+    const keys = ['OC_SELFHOST_CC5_T1555U_ENABLED', 'OC_SELFHOST_CC5_T1555U_TEST_UID'] as const
+    const saved = keys.map(key => process.env[key])
+    try {
+      process.env.OC_SELFHOST_CC5_T1555U_TEST_UID = '314159'
+      for (const visibility of ['public', 'admin', 'hidden'] as const) {
+        const row = { ...grokPublic, model_id: 'cc5-remote-t1555u', visibility }
+        const pricing = makeCache([row])
+        assert.deepEqual(pricing.listPublic(), [])
+        for (const flag of ['0', '1']) {
+          process.env.OC_SELFHOST_CC5_T1555U_ENABLED = flag
+          for (const uid of [0, 3, 314158, 314159]) {
+            for (const role of ['user', 'admin'] as const) {
+              const scope = { uid, role, grantedModelIds: new Set([row.model_id]) }
+              const expected = flag === '1' && uid === 314159
+              assert.equal(canUseModel({ pricing }, { ...scope, modelId: row.model_id }), expected)
+              assert.deepEqual(pricing.listForUser(scope).map(p => p.id), expected ? [row.model_id] : [])
+            }
+          }
+        }
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i] })
+    }
+  })
+})

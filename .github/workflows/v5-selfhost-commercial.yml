@@ -154,6 +154,16 @@ jobs:
             "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
             npm run test:commercial:unit:gate
 
+      - name: Verify registration and the cc5 unverified account transaction in private PG
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test-mutex.sh commercial 'REQUIRE_TEST_DB=1 node --import tsx --test packages/commercial/src/__tests__/register.integ.test.ts' | tee cc5-registration-pg.tap
+          grep -Eq '^# pass [1-9][0-9]*$' cc5-registration-pg.tap
+          grep -qx '# fail 0' cc5-registration-pg.tap
+          grep -qx '# skipped 0' cc5-registration-pg.tap
+          grep -qx '# cancelled 0' cc5-registration-pg.tap
+
       - name: Automatic recovery presentation (targeted PG)
         shell: bash
         run: |

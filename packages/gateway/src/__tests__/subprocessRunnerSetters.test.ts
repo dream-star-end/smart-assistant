@@ -396,7 +396,9 @@ describe('SubprocessRunner.start() 可重入(预热 × submit 竞态,INC-2026082
       start: () => Promise<void>
       proc: unknown
       _startInternal: () => Promise<void>
+      opts: Record<string, unknown>
     }
+    runner.opts = {} // Constructor-equivalent no-cc5 fixture; keep the production start guard.
     runner.proc = null
     let count = 0
     let impl: () => Promise<void> = async () => {

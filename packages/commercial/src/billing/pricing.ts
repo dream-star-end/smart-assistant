@@ -19,7 +19,7 @@
  */
 
 import { Client } from "pg";
-import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, canUseCc5TestModel, isCc5TestModel, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
@@ -393,7 +393,7 @@ export class PricingCache {
    */
   listPublic(): PublicModel[] {
     return [...this.map.values()]
-      .filter((p) => p.enabled && p.visibility === "public" && !isBoxGptWebModel(p.model_id))
+      .filter((p) => p.enabled && p.visibility === "public" && !isBoxGptWebModel(p.model_id) && !isCc5TestModel(p.model_id))
       .sort((a, b) => a.sort_order - b.sort_order)
       .map(this.toPublicModel);
   }
@@ -425,6 +425,7 @@ export class PricingCache {
     return [...this.map.values()]
       .filter((p) => {
         if (!p.enabled) return false;
+        if (isCc5TestModel(p.model_id) && !canUseCc5TestModel(args.uid, process.env)) return false;
         if (isBoxGptWebModel(p.model_id)) {
           if (!isBoxGptWebOwnerUid(args.uid)) return false;
           if (!args.grantedModelIds.has(p.model_id)) return false;

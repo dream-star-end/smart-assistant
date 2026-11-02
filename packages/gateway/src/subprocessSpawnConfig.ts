@@ -797,6 +797,8 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  /** Trusted cc5-only transport. No user-selected URL, command or credentials. */
+  cc5BridgePort?: import('./cc5BridgePort.js').Cc5BridgePort
   /** Actual chat peer; sessionId below may be a delegated repository parent. */
   peerId?: string
   /** Stable, attempt-refreshed opaque help context. Never contains the master signing key. */

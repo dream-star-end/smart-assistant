@@ -837,7 +837,7 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
     const fn = source.slice(source.indexOf("async function resolveTurnExecution("));
     const body = fn.slice(0, fn.indexOf("\n}\n"));
-    assert.match(body, /auxModels: engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
+    assert.match(body, /auxModels: !isCc5TestModel\(canonicalModel\) && engineUsesAnthropicAuxModels\(descriptor\.engine\) \? platformAuxModels\(snapshot\) : \[\]/);
     assert.doesNotMatch(body, /descriptor\.engine === "ccb" \?/);
   });
 

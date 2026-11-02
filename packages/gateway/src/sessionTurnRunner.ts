@@ -1,3 +1,4 @@
+import { isCc5TestModel } from '@openclaude/protocol'
 import { getSystemHelpRelay } from './systemHelpRelay.js'
 import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from './masterTurnLease.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
@@ -2489,7 +2490,7 @@ export async function runOneTurnWithRetry(
   const retryStructuredBlocks: Array<Record<string, unknown>> = []
   let retryInput = userTextOrBlocks
   let contextOverflowRetryIndex = 0
-  const canRetry = (): boolean => retryState.attempt < retryState.max
+  const canRetry = (): boolean => !isCc5TestModel(session.runner.model) && retryState.attempt < retryState.max
   const emitRetryStatus = (code: string, delayMs = 0): boolean => {
     if (!canRetry()) return false
     retryState.attempt += 1
@@ -2560,6 +2561,8 @@ export async function runOneTurnWithRetry(
       // retry attempt while the timeout path is persisting its exact tape.
       throwIfLogicalTurnCancelled(logicalTurnSignal)
       const msg = err?.message ?? String(err)
+      // An admitted/unknown remote prompt is never submitted again automatically.
+      if (isCc5TestModel(session.runner.model)) throw err
 
       // Phantom turn: CCB 返回了不调模型的空 result(usage/cost/blocks 全为 0)。
       // 通常是 CCB 子进程长闲置后内部状态卡死,重启子进程能恢复。

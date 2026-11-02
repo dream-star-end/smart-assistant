@@ -190,6 +190,8 @@ import {
   type DispatchRequestContent,
   type SessionWorkspaceMode,
   BOX_GPT_WEB_BUSY_MESSAGE,
+  canUseCc5TestModel,
+  isCc5TestModel,
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
   type DurableCodexBilling,
@@ -838,7 +840,7 @@ async function resolveTurnExecution(
     //   egress modelAuthorityGate 以 "authority model mismatch" 403 拒掉(Agent 工具全灭)。
     // codex/grok/zcode 走各自 relay,不产生 `/v1/messages`,签 aux 只会白白撑大放行集合。
     // platformAuxModels 对"aux 不在 catalog active"fail-closed 抛 → 调用方拒帧。
-    auxModels: engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
+    auxModels: !isCc5TestModel(canonicalModel) && engineUsesAnthropicAuxModels(descriptor.engine) ? platformAuxModels(snapshot) : [],
     executionRevision: snapshot.executionRevision,
     securityEpoch: Number(snapshot.securityEpoch),
   };
@@ -3155,6 +3157,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         return reject("MODEL_AUTHORITY_UNAVAILABLE", "model catalog unavailable, retry shortly");
       }
       if (cleaned) return null;
+      if (isCc5TestModel(exec.canonicalModel) && !canUseCc5TestModel(uid, process.env)) {
+        return reject("UNAUTHORIZED_MODEL", "model not authorized for current user");
+      }
       const execIsCodex = exec.engine !== "ccb";
       if (!desktopAllowsEngine(!!endpoint.desktop, exec.engine)) {
         args.log?.info("user-chat-bridge: desktop rejects non-ccb engine", { engine: exec.engine });
@@ -3969,10 +3974,35 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         peer && typeof peer === "object"
           ? (peer as { id?: unknown }).id
           : undefined;
-      if (typeof peerId !== "string" || peerId.length === 0) return frameObj;
       const clientMessageId = isClientMessageId(frameObj.clientMessageId)
         ? frameObj.clientMessageId
         : null;
+      // A connection's grants checker may still allow an old alias. Fence the
+      // current canonical before model-switch/user/dispatch writes, not after.
+      let admissionCanonical = historyModel;
+      let cc5AdmissionError: string | null = null;
+      if (authorityDeps !== undefined && historyModel !== null) {
+        try {
+          admissionCanonical = (await authorityDeps.catalog.assertFresh()).aliasToCanonical(historyModel);
+        } catch {
+          cc5AdmissionError = "MODEL_AUTHORITY_UNAVAILABLE";
+        }
+      }
+      if (cc5AdmissionError === null && isCc5TestModel(admissionCanonical) &&
+          !canUseCc5TestModel(uid, process.env)) cc5AdmissionError = "UNAUTHORIZED_MODEL";
+      if (cc5AdmissionError !== null) {
+        if (pretrackedEnrichment) terminalizeEnrichmentDispatch(pretrackedEnrichment, cc5AdmissionError);
+        onReject?.(cc5AdmissionError);
+        if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+          sendErrorFrame(userWs, cc5AdmissionError, "model authorization unavailable", {
+            ...(typeof peerId === "string" ? { peerId } : {}),
+            ...(clientMessageId !== null ? { clientMessageId } : {}),
+          });
+        }
+        return null;
+      }
+      if (cleaned) return null;
+      if (typeof peerId !== "string" || peerId.length === 0) return frameObj;
       const frameContent = frameObj.content && typeof frameObj.content === "object"
         ? frameObj.content as { text?: unknown; replyTo?: unknown; recovery?: unknown }
         : null;
@@ -5606,9 +5636,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               lastSeenModelId = effectiveModel;
             }
             if (
-              modelCheckerHandle !== null &&
               effectiveModel !== null &&
-              !modelCheckerHandle.isAllowed(effectiveModel)
+              ((isCc5TestModel(effectiveModel) && !canUseCc5TestModel(uid, process.env)) ||
+               (modelCheckerHandle !== null && !modelCheckerHandle.isAllowed(effectiveModel)))
             ) {
               const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
               const peerId = peerObj && typeof peerObj === "object" && typeof peerObj.id === "string"
@@ -5868,7 +5898,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is unavailable for this account', cursorTurnIdentity);
               return;
             }
-            if (!isCursorCredentialMember(uid)) {
+            if (isCc5TestModel(modelCapture)
+              ? !canUseCc5TestModel(uid, process.env)
+              : !isCursorCredentialMember(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;

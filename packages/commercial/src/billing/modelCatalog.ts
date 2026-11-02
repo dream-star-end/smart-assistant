@@ -31,6 +31,8 @@ import { createHash } from "node:crypto";
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
+  canUseCc5TestModel,
+  isCc5TestModel,
   isBoxGptWebModel,
   isBoxGptWebOwnerUid,
   PLATFORM_REASONING_EFFORTS,
@@ -601,8 +603,9 @@ export class ModelCatalogSnapshot {
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
     const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
-    const cursorOk =
-      (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
+    const cc5Ok = !isCc5TestModel(canonical) || canUseCc5TestModel(scope.uid, process.env);
+    const cursorOk = cc5Ok &&
+      (entry?.engine !== "cursor" || isCc5TestModel(canonical) || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
     // credential uid). Anonymous is a placeholder identity: after subscribe
     // they get a real uid, and policy `all` accepts every real uid. Advertise
@@ -610,7 +613,7 @@ export class ModelCatalogSnapshot {
     // allow-list that does not contain the uid stays excluded. Execution
     // (`canUseModel` / `listForUser`) stays on strict `cursorOk`.
     const lockedCursorOk =
-      boxGptWebOwnerOk &&
+      cc5Ok && boxGptWebOwnerOk &&
       (cursorOk ||
         (entry?.engine === "cursor" &&
           scope.uid === 0 &&
@@ -625,7 +628,7 @@ export class ModelCatalogSnapshot {
         })
       : false;
     const visible =
-      pricing && boxGptWebOwnerOk
+      pricing && boxGptWebOwnerOk && cc5Ok
         ? pricing.visibility === "public" ||
           (pricing.visibility === "admin" &&
             (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||

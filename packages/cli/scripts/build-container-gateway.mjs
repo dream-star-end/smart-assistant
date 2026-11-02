@@ -33,6 +33,7 @@ process.chdir(repoRoot);
 const SKIP = new Set(["web", "web-react", "desktop"]);
 const MARKER = join(repoRoot, "packages/cli/dist/.precompiled-ok");
 const CLI_ENTRY = join(repoRoot, "packages/cli/dist/index.js");
+const CC5_BRIDGE_ENTRY = join(repoRoot, "packages/gateway/dist/cc5StdioBridge.js");
 const GATEWAY_CMD = join(repoRoot, "packages/cli/dist/commands/gateway.js");
 
 function pkgJson(dir) {
@@ -187,7 +188,7 @@ function verifyGraphLoads() {
       "--conditions=openclaude-precompiled",
       "--input-type=module",
       "-e",
-      `await import(${JSON.stringify(pathToFileURL(GATEWAY_CMD).href)});`,
+      `await import(${JSON.stringify(pathToFileURL(GATEWAY_CMD).href)}); const child = await import(${JSON.stringify(pathToFileURL(CC5_BRIDGE_ENTRY).href)}); if (typeof child.runCc5StdioBridge !== "function") throw new Error("cc5 child entry missing");`,
     ],
     { cwd: repoRoot, encoding: "utf8" },
   );
@@ -212,6 +213,9 @@ for (const pkg of pkgs) {
 mustExist(CLI_ENTRY);
 mustExist(join(repoRoot, "packages/gateway/dist/index.js"));
 mustExist(GATEWAY_CMD);
+mustExist(CC5_BRIDGE_ENTRY);
+const cc5Syntax = spawnSync(process.execPath, ["--check", CC5_BRIDGE_ENTRY], { encoding: "utf8" });
+if (cc5Syntax.status !== 0) throw new Error("build-container-gateway: cc5 child syntax check failed");
 
 const syntax = spawnSync(process.execPath, ["--check", CLI_ENTRY], { encoding: "utf8" });
 if (syntax.status !== 0) {
