@@ -119,6 +119,10 @@ async function ready(f) {
   assert.equal(summary(f).phases.at(-1).id, 'F.prewarm');
   assert.equal(summary(f).final, false);
 }
+function assertDrained(f) {
+  assert.ok(gone(pid(f, 'node')), 'prewarm Node must be reaped before deploy exits');
+  assert.ok(gone(pid(f, 'chrome')), 'detached Chrome must be reaped before deploy exits');
+}
 async function drained(f) {
   await until(() => gone(pid(f, 'node')) && gone(pid(f, 'chrome')));
 }
@@ -150,7 +154,7 @@ test('SIGKILL of prewarm Node fails and reaps a detached TERM-resistant Chrome',
   process.kill(pid(f, 'node'), 'SIGKILL');
   assert.deepEqual(await bounded(f), { code: 137, signal: null });
   failed(f, 137);
-  await drained(f);
+  assertDrained(f);
 });
 
 for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]]) {
@@ -160,7 +164,7 @@ for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130], ['SIGHUP', 129]
     f.p.kill(signal);
     setTimeout(() => { try { f.p.kill('SIGTERM'); } catch {} }, 100).unref();
     assert.deepEqual(await bounded(f), { code, signal: null });
-    await drained(f);
+    assertDrained(f);
     failed(f, code);
   });
 }
