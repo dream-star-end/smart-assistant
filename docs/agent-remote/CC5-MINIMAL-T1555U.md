@@ -1,124 +1,138 @@
-# t1575u: first real cc5 interactive round
+# t1575u/t1576u: personal web to remote interactive cc5
 
-Status: preparation only. The six-file ToolHost checkpoint is 07b4371ba.
-No cc5 model request, plugin installation, new TUI, or forwarding has run.
-Full QueryEngine, ports, supervisor, product isolation, and P3 gates remain open.
+Status (2026-11-02 10:23 CST): preparation only; no real cc5 chat or web
+acceptance. CODEX-START.md 09:28 approves the existing Box prompt.submit input.
+09:29 requires the real personal web frontend, not container/script-only chat.
+Full QueryEngine, ports, supervisor, isolation and P3 release gates remain open.
 
-The first proof uses the personal task's disposable execd container, one fixed
-operation, and the existing Box interactive host/mod core. It does not claim
-that the native tool pool or the existing Box HTTP exec transport is migrated.
+## Acceptance path
 
-## Approval boundary
+Real personal web test account selects a cc5 model, sends a unique prompt,
+actual API/WS/SessionManager/createEngine routes it to an independent interactive
+Claude TUI on cc5, and the real reply returns through that backend into the web.
+At least one file/command operation must occur in a new execution container.
+No showroom, fake API, copied expected reply, or script-rendered chat qualifies.
 
-CODEX-START.md 08:33 requires steward approval before cc5 installation or a
-new listener. CONTINUE.md's first section requests the task-only plugin/tap
-files and a reverse Unix socket, with exact cleanup scope. Do not execute that
-part until the steward replies. Existing SSH22 access has been verified with
-existing key and strict existing host-key verification; no SSH metadata changed.
-No new TCP listener or GCP firewall change is proposed on cc5.
+Use the actual web-react build and production Gateway/master composition in an
+independent test stack. The execd preparation container is not a product Gateway.
+Do not reuse existing user containers or production databases, env or credentials.
 
-## Data path
+## Approved and pending boundaries
 
-1. A unique prompt originates in the disposable test container. Record the
-   actual container ID and exact bytes before transport, not just a host string.
-2. Existing SSH connections carry it to `host.py` on cc5. Preserve the original
-   mod digest, token, Unix peer PID/descendant checks, and permission protocol.
-   Start an independent task tmux PTY and keep `cc5-login` intact.
-3. Input is `host stdin -> TAP -> $.prompt.submit(asUser:true)` in the actual
-   interactive UI. Replies are hook events over authenticated `bridge.sock`,
-   then host stdout. This is the existing Box TUI/mod core. The surrounding SSH
-   transport differs from the current Box HTTP exec transport. It is not
-   `tmux send-keys` or screen scraping; disclose that distinction to the steward
-   because 08:35's parenthesis says PTY/tmux typing. Do not fabricate equivalence.
-4. Allow only the exact task Bash request. It uses Python stdlib to POST only
-   `{operationId}` over the separate task `exec.sock`. Deny any other permission
-   request. The model gets no execd token, arbitrary shell proxy, or credential.
-5. Two SSH22 Unix forwards keep the existing keys on this Box:
-   Box `-L BoxTask.sock:V5DevProxy.sock`; Box `-R Cc5TaskExec.sock:BoxTask.sock`.
-   Do not forward the original bridge socket or weaken its local PID check.
-6. The v5-dev private Unix proxy submits one canned execd `/command`: write/read
-   a fresh marker, then hash/cwd/uid/PID namespace. It requires command ID,
-   actual terminal event, and exit code zero. Timeout after dispatch is unknown;
-   no second execution. A completed duplicate only reads the cached receipt.
-7. Link the original tool hook tool_use_id and exact Bash/operationId to the
-   proxy receipt and execd command ID. Independently inspect/exec only the full
-   task container ID and compare marker, SHA256, absolute cwd, uid, and pidns.
-   A direct local proxy request is plumbing evidence, never model-tool evidence.
-8. Return the real reply to the test container. Record it there and verify its
-   provenance against the original hook/result, not a copied expected string.
+- 09:12 approves the unchanged original host.py plus four plugin sources under
+  the task's box home; no sudo/system packages, new cc5 ports or firewall changes.
+  Only existing SSH22 and local Unix sockets; private task tmux, no cc5-login reuse.
+- 09:28 approves host.stdin -> TAP -> prompt.submit(asUser:true). Do not build a
+  physical typing adapter. Replies are authenticated hook events -> host stdout;
+  tmux provides the actual PTY and simultaneous pane evidence, not screen parsing.
+- The original five source hashes match personal live 9826fe951. Installation,
+  empty-input NOT_READY attempts, scoped empty-directory native trust preparation,
+  Unix echo and cleanup receipts are preparation evidence, not successful chat.
+- Current cc5 public package is 2.1.197; the task's existing Box pin is 2.1.316.
+  Static Mods markers differ. This is a compatibility hypothesis, not established
+  NOT_READY causality. Copying a private fixed CLI is separately pending in
+  CONTINUE A; no system CLI upgrade is authorized or performed.
+- A default-off model in an independent real personal test frontend, private
+  PG/Redis/master/Gateway, and the necessary loopback/network-only listeners are
+  pending in CONTINUE B. No frontend model has been added or stack started.
+- A task-only stdio MCP forwarder and trusted launch profile are pending in
+  CONTINUE C. They exceed the original five-source installation scope. The old
+  bridge does not enforce isolation by merely denying permission-ask requests.
 
-## Interactive evidence and cleanup
+## Independent web stack proposal (pending B)
 
-Before, throughout, and after the round, record timed `ps -o pid,tty,args`
-samples for Claude and check the flags and terminal. No print, output/input
-format, SDK, or headless Claude invocation is permitted. Stop on a forbidden
-process or trust/login/credits menu; do not answer account menus. Keep same-window
-ps and `tmux capture-pane` evidence showing the container prompt and actual reply.
-Only capture the new task TUI, never existing login chats. Filter host stderr:
-NOT_READY can contain raw pane tails, so unknown stderr must not enter logs.
-Evidence goes to local `evidence/cc5-interactive/`; no credentials or full env.
+Use task-labelled containers, a private network and fresh volumes. The master
+serves the actual SPA and same-origin API/WS at one random 127.0.0.1 host port.
+Gateway, PG5432, Redis6379, catalog/renew internal proxy and any execd endpoint
+stay inside that private Docker network, with no host publish. Existing Chromium
+on v5-dev can capture the page; a local browser, if needed, uses existing SSH22
+and one local loopback forward. Never expose cc5 TCP or change a firewall/proxy.
 
-After the result and evidence, SIGTERM only the task host with PID/argv identity
-checked, then await its task Claude/tmux exit. Closing stdin alone does not stop
-interactive host mode. Close both SSH forwards and remove only the task socket,
-plugin runtime directory, proxy, labelled container/network, and synthetic token.
-The existing login session, authentication directory, and user containers remain.
+Use selfhost migrations/manifest, new app/admin roles and authority keyring,
+real hashPassword and a new active/verified synthetic account. Log in through
+actual web /api/auth/login, not fabricated JWT/localStorage state. Only the test
+instance uses its own Turnstile/cookie/JWT configuration. Add a hidden cc5 model,
+default off, with an explicit grant only for that synthetic UID and the required
+engine access allowlist. Preserve model authority/catalog fencing and real turns.
+The master has no Docker socket/OC_RUNTIME_IMAGE; its endpoint resolver admits
+only the test UID and the new Gateway. Do not contact existing Box login pools.
 
-## v5-dev plumbing check, no model
+Pin existing cached runtime/Redis images and a separately size-checked PG digest.
+Do not pull/rebuild runtime. Check v5-dev free disk before build/start; below
+8,000,000,000 bytes stop and clean only task resources. TMPDIR stays in this WT.
 
-`OC_AGENT_REMOTE_CC5_SMOKE=1 bash scripts/agent-remote/cc5-smoke-environment.sh check`
+## Interactive transport and execution isolation (pending C)
 
-This command is restricted to the task worktree and fixed execd digest. It creates
-a constrained nobody container, read-only root, no capabilities or privilege
-gain, private task bridge network, and loopback-only execd. The Unix proxy directory
-is private under `/run/oc-v5-agentremote-t1555u-<operationId>` because the worktree
-path exceeds Unix socket limits. TMPDIR stays in the task worktree. The check
-rejects caller-supplied command fields, gets a real execd terminal receipt,
-checks the independent container result, then cleans its resources. `hold` keeps
-the fixture at most 30 minutes for the approved real round. Neither mode connects
-to cc5, starts Claude, or supplies a product production entrypoint.
+The cc5 branch must separate before Cursor credential selection/provider auth.
+Use an explicit credential-free trusted target, fixed default cc5 login and own
+reporter; never dummy Box tokens or cc2/cc3/cc4 fallback. Reuse the original
+READY/input/permission/event core through an injected execution transport for
+start/write/stop/abandon. The existing Box HTTP transport is not SSH merely
+because its execUrl changed. Keep private SSH keys at their existing local paths,
+never in v5-dev or test containers, and retain original Unix peer PID/token checks.
 
-The real round must use a fresh `hold` operation, never the `check` operation:
-the proxy can return a cached completed receipt. Before the prompt, assert no
-proxy receipt/proof file exists. Before stopping `hold`, explicitly perform the
-same full-container-ID independent verification; `hold` itself only keeps the
-fixture alive and does not execute `check`'s trailing verification. The current
-scripts provide the container half, not a completed cc5 controller/acceptance.
+Reuse the product Box virtual-MCP launch policy: empty builtin tool set,
+strict sole MCP config, empty ambient setting sources and no slash commands.
+Expose only one fixed operation alias. Its stdio component accepts no arbitrary
+command/URL/header/token: only the current operationId, through the separate
+exec.sock. A trusted launch profile is necessary: current Route B filters drop
+these flags, and existing box_virtual_mcp.py is hard-locked to /tmp. Adapt the
+minimal component to task home only after C approval; do not modify original mod.
+Native tools being allowed by the original CLI do not pass through an ask-only
+permission check. Prompt instructions or observed absence are not isolation.
 
-## Steward 09:12: installation and READY-only approved
+The task Unix proxy submits exactly one execd command that writes/reads a fresh
+marker and returns hash/cwd/uid/pidns. Require actual command ID and terminal
+execution_complete with integer exit0. A post-dispatch timeout is unknown; never
+retry the effect. Completed duplicates only read the same cached receipt. Link
+model tool_use_id, operationId, execd commandId and full execution container ID.
+Independently inspect/exec only that task container and compare all five fields.
+A local proxy invocation proves plumbing only; never replay its operation as the
+real model effect. A fresh operation has no preexisting receipt or proof file.
 
-The original host plus four original plugin sources exactly match personal live
-9826fe951. Install these five sources in the task's private `install` directory;
-the unmodified host generates the four runtime plugin copies and tap.py in `run`.
-This replaces the earlier in-memory host bootstrap plan and keeps protocol fd0
-untouched. No additional plugin/client/system package is installed. The helper
-`cc5-smoke-prepare.py` packages, validates, launches and stops through SSH22;
-its source stays in the v5-dev task tree, executed over SSH without installing
-another helper on cc5. All task paths are under box's home, no sudo.
+The old cc5-smoke-environment.sh check/hold remains a previous plumbing fixture.
+It publishes a loopback execd port, so it cannot implement B's network-only
+execd unchanged: update publish, endpoint discovery, readiness and proxy address
+together. hold expires after 30 minutes and does not independently verify its
+effect; verification must occur before cleanup. Do not run it as a web backend.
 
-READY-only uses a separate task tmux socket via TMUX_TMPDIR, an empty open input
-pipe and no prompt/resume/continue or permission-response frames. The controller
-must count the bytes it actually writes; the remote inspector does not invent
-that count. Unknown stderr/pane tails are discarded. Record task PTY/argv and
-stop only a revalidated host identity through pidfd, then check original login
-pane metadata and task runtime removal. Keep the fixed installation for the
-approved real round; after that, helper cleanup removes only this task root,
-refusing a live runtime/session. READY-only is not real-chat acceptance and does
-not prove the CLI made zero startup/background model requests.
+## Evidence collection
 
-The prompt.submit evidence question is still pending. Do not send the real user
-frame until the steward conveys that answer. The expired incident waiver stays
-unchanged; the steward will decide before P3 merge.
+Before, throughout and after the actual round collect task-identity-checked
+ps(pid/tty/args), same-window task tmux pane, real web model/reply PNGs, timing,
+container effect/receipt checks, request budget and cleanup. Claude must have
+its tmux pts and no print/input/output-format/stream-json/SDK/headless invocation.
+Stop the round on a forbidden process or account/credits menu; never answer
+usage credits. Never capture the existing cc5-login pane or full env/credentials.
 
-READY-only on the existing home cwd returned the original host's fixed
-NOT_READY dialog=trust. No user frame was written and the host cleaned its
-runtime; cc5-login retained its original PID/tty. Prepare trust only for an
-empty task-owned work directory in a separate native TUI with the unchanged
-plugin inactive (no OC_BRIDGE_DIR). Require private socket/session, stable
-pane/PID/startticks/pts and actual process cwd, exact displayed task path, and
-selected Yes-trust choice; only then send one Enter. Account/credits or unknown
-menus get no keys. Stop that setup TUI, then retry the unchanged original host
-in the task work directory. The CLI itself persists this scoped trust setting;
-the helper never reads/edits global auth/config to remove that metadata. This is
-configuration preparation under 09:12, not a real chat or a change to the host's
-runtime dialog guard. The real round remains pending the second decision.
+cc5-smoke-prepare.py snapshot is a read-only one-window collector. It verifies
+owner/source/host and separate outer-shell/Claude PID/startticks with actual
+ancestry and shared pts, validates the exact ps argv
+being emitted, captures only that task pane, and rechecks identity. Account or
+sensitive pane content fails without emitting raw output. Named native Claude
+processes are sampled; this does not prove absence of arbitrary SDK processes
+or continuous compliance. The caller must keep the process sampler running and
+stop/mark failure on violations; one snapshot is not a success claim. It is
+prepared source only and has not captured a live chat. Synthetic guard fixtures
+exercise refusal/no-output behavior without SSH, TUI, model or actual process ps.
+
+Write artifacts locally under evidence/cc5-interactive, tied to UTC/runId/build/
+model/turn. The unique frontend prompt and actual reply must both appear in the
+same-window TUI evidence. The steward checks all evidence before success is
+reported. Preserve failed attempts as failed attempts.
+
+## Cleanup and gates
+
+Revalidate the task host full argv/run dir/startticks and use pidfd SIGTERM;
+wait for the original host finally to stop its TUI and remove run. stdin EOF
+alone is insufficient. Check task PID/session/socket absence and unchanged old
+login metadata. Close only own SSH masters. After validation remove only task
+installation/MCP/private CLI, labelled containers/network/volumes and synthetic
+account/database/key files. Never read/delete global auth or native trust data
+manually. No production release is involved in the independent stack; any
+personal production change still uses official review/CI/personal train.
+
+Existing extreme recovery work is retained and paused. Real web minimal success
+is not P3 DONE: finish actual QueryEngine/ports/supervisor/full native I/O and
+recovery, official review/CI/train, then t1562u real postrelease acceptance.
+The expired 793c4f0b waiver remains untouched until the steward decides premerge.

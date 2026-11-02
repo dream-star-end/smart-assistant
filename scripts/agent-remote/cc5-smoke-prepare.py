@@ -6,6 +6,7 @@ Only unchanged host/plugin sources are installed on cc5. No dependency install.
 """
 import ast
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -124,9 +125,9 @@ def install():
     print(json.dumps({'kind': 'installed-only-no-chat', **info}))
 
 
-def tmux(root, *args):
+def tmux(root, *args, timeout=None):
     env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'TMUX_TMPDIR': str(root / 'tmux')}
-    return subprocess.run(['tmux', '-L', 'oc-box', *args], env=env, capture_output=True, text=True)
+    return subprocess.run(['tmux', '-L', 'oc-box', *args], env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def proc(pid):
@@ -264,6 +265,106 @@ def inspect(root):
     print(json.dumps(result))
 
 
+
+
+def native_process_identity(pid):
+    path = Path('/proc') / str(pid)
+    require(path.stat().st_uid == os.getuid(), 'snapshot-wrong-process-uid')
+    fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+    return {'pid': pid, 'ppid': int(fields[1]), 'pgrp': int(fields[2]),
+            'session': int(fields[3]), 'ttyNumber': int(fields[4]), 'startTicks': fields[19]}
+
+
+def snapshot(root):
+    """One bounded evidence window, not proof of continuous/SDK absence or chat success."""
+    info = owner(root)
+    check_sources(root, info)
+    host = host_identity(root, info)
+    pid = int((root / 'run/claude.pid').read_text())
+    task_args, start = proc(pid)
+    begun = datetime.now(timezone.utc).isoformat()
+    clock = time.monotonic()
+    allowed = {'/usr/bin/claude', '/usr/bin/node', 'node', 'claude', '--permission-mode',
+               'default', '--plugin-dir', str(root / 'run/mod/oc-bridge')}
+
+    def safe_args(args):
+        forbidden = ('-p', '--print', '--output-format', '--input-format', '--sdk', '--headless')
+        require(bool(args) and not any(a in forbidden or 'stream-json' in a or
+                a.startswith(tuple(x + '=' for x in forbidden)) for a in args),
+                'snapshot-forbidden-claude-argv-no-output')
+        require(all(a in allowed for a in args), 'snapshot-unknown-argv-no-output')
+
+    def pane_identity():
+        result = tmux(root, 'list-panes', '-t', '=' + info['session'],
+                      '-F', '#{pane_id} #{pane_pid} #{pane_tty}', timeout=2)
+        require(result.returncode == 0 and len(result.stdout.splitlines()) == 1,
+                'snapshot-task-pane-unavailable')
+        pane_id, pane_pid, tty = result.stdout.strip().split()
+        require(re.fullmatch(r'%[0-9]+', pane_id) and pane_pid.isdecimal() and
+                int(pane_pid) > 1 and re.fullmatch(r'/dev/pts/[0-9]+', tty),
+                'snapshot-task-pane-not-pts')
+        # Original host keeps an outer pane shell to write exit status; Claude
+        # is its descendant, not the pane PID. Freeze both and their actual ancestry.
+        chain = [native_process_identity(pid)]
+        require(chain[0]['startTicks'] == start and chain[0]['ttyNumber'] != 0,
+                'snapshot-task-process-without-tty')
+        while chain[-1]['pid'] != int(pane_pid):
+            parent = chain[-1]['ppid']
+            require(len(chain) < 8 and parent > 1 and
+                    parent not in {row['pid'] for row in chain}, 'snapshot-pane-not-ancestor')
+            chain.append(native_process_identity(parent))
+        require(all(row['ttyNumber'] == chain[0]['ttyNumber'] and
+                    row['session'] == chain[0]['session'] for row in chain),
+                'snapshot-pane-ancestry-tty-mismatch')
+        return {'paneId': pane_id, 'panePid': int(pane_pid), 'tty': tty, 'ancestry': chain}
+
+    safe_args(task_args)
+    identity = pane_identity()
+    # Enumerate names without exposing arbitrary process args or environments.
+    listing = subprocess.check_output(['ps', '-eo', 'pid=,tty=,comm='], text=True, timeout=2)
+    candidates = []
+    for row in listing.splitlines():
+        parts = row.split(None, 2)
+        if len(parts) == 3 and re.fullmatch(r'claude(?:[.-].*)?', parts[2], re.IGNORECASE):
+            candidates.append(int(parts[0]))
+    require(pid in candidates, 'snapshot-task-not-in-native-claude-list')
+    processes = []
+    for candidate in sorted(set(candidates)):
+        args, ticks = proc(candidate)
+        safe_args(args)
+        # Validate this exact ps text before it can be printed; do not trust an earlier argv.
+        row = subprocess.check_output(['ps', '-ww', '-o', 'pid=,tty=,args=', '-p', str(candidate)],
+                                      text=True, timeout=2).strip()
+        fields = row.split(None, 2)
+        require(len(fields) == 3 and fields[0] == str(candidate) and
+                re.fullmatch(r'pts/[0-9]+', fields[1]), 'snapshot-native-claude-without-pts')
+        safe_args(fields[2].split())
+        require(proc(candidate) == (args, ticks), 'snapshot-process-identity-changed')
+        if candidate == pid:
+            require('/dev/' + fields[1] == identity['tty'], 'snapshot-task-tty-changed')
+        processes.append({'pid': candidate, 'startTicks': ticks, 'ps': row})
+    captured = tmux(root, 'capture-pane', '-p', '-S', '-200', '-t', identity['paneId'], timeout=2)
+    require(captured.returncode == 0, 'snapshot-capture-failed')
+    pane = captured.stdout
+    lower = pane.lower()
+    require(not any(word in lower for word in ('usage credits', 'sign in', 'log in',
+            'authentication', 'api key', 'access token', 'oauth', 'authorization:')) and
+            not re.search(r'sk-(?:ant-|[A-Za-z0-9]{20})|eyJ[A-Za-z0-9_-]{20}', pane),
+            'snapshot-account-or-sensitive-pane-no-output')
+    require(pane_identity() == identity and proc(pid) == (task_args, start) and
+            host_identity(root, info) == host, 'snapshot-task-identity-changed')
+    elapsed = time.monotonic() - clock
+    require(elapsed <= 5, 'snapshot-window-exceeded')
+    print(json.dumps({'kind': 'single-interactive-evidence-window-not-web-acceptance',
+                      'beganUtc': begun, 'endedUtc': datetime.now(timezone.utc).isoformat(),
+                      'windowSeconds': elapsed, 'root': str(root), 'session': info['session'],
+                      'taskPid': pid, 'taskStartTicks': start, 'taskPaneId': identity['paneId'],
+                      'taskTty': identity['tty'], 'taskPaneProcessIdentity': identity, 'psColumns': 'pid tty args', 'claudeProcesses': processes,
+                      'paneText': pane,
+                      'scope': 'Recognizable native Claude process names in this window only; '
+                               'not continuous monitoring or proof of arbitrary SDK absence.'}))
+
+
 def stop(root):
     info = owner(root)
     if not (root / 'run').exists():
@@ -296,10 +397,10 @@ if __name__ == '__main__':
         elif role == 'install':
             install()
         else:
-            require(role in ('launch', 'workspace', 'trust-prepare', 'inspect', 'stop', 'cleanup'), 'unknown-role')
+            require(role in ('launch', 'workspace', 'trust-prepare', 'inspect', 'snapshot', 'stop', 'cleanup'), 'unknown-role')
             root = task_root(sys.argv[2])
             {'launch': launch, 'workspace': workspace, 'trust-prepare': trust_prepare,
-             'inspect': inspect, 'stop': stop, 'cleanup': cleanup}[role](root)
+             'inspect': inspect, 'snapshot': snapshot, 'stop': stop, 'cleanup': cleanup}[role](root)
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__
