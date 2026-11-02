@@ -77,7 +77,15 @@ function poolFixture(options: { role?: string; status?: string; auditFails?: boo
         }
       if (/FROM system_settings/.test(sql))
         return {
-          rows: [{ key: params[0], value: params[0] === 'allow_registration' ? false : [] }],
+          rows: [
+            {
+              key: params[0],
+              value: params[0] === 'allow_registration' ? false : [],
+              description: null,
+              updated_at: new Date(0),
+              updated_by: null,
+            },
+          ],
           rowCount: 1,
         }
       // Existing audit failure policy may enqueue its fixed security alert outside the rolled-back business tx.

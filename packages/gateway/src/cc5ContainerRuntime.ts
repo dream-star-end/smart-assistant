@@ -27,6 +27,8 @@ import type { Cc5BridgeBinding } from './cc5BridgePort.js'
 import { type Cc5InteractiveHostPort, Cc5Relay } from './cc5Relay.js'
 import { Cc5SshHost, type Cc5SshHostConfig } from './cc5SshHost.js'
 
+export { cc5ControlRequest, type Cc5BridgeBinding } from './cc5BridgePort.js'
+
 const REJECTED = 'CC5_FRESH_CONTAINER_BINDING_REJECTED'
 export const CC5_CONTAINER_MOUNT = '/run/oc/cc5-remote-t1555u'
 function requireRuntime(ok: unknown): asserts ok {

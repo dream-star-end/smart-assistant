@@ -63,12 +63,16 @@ function fixture(options: Record<string, unknown> = {}, deadlines: Record<string
     operationId: randomUUID(),
     privateKeyPath: key,
     knownHostsPath: known,
-    controllerPath: fileURLToPath(
-      new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
-    ),
+    controllerPath: join(root, 'controller.py'),
     // Short relative Unix path is only for this test; production config below remains absolute.
     toolSocketPath: join(root, 't.sock'),
   }
+  copyFileSync(
+    fileURLToPath(
+      new URL('../../../../scripts/agent-remote/cc5-host-controller.py', import.meta.url),
+    ),
+    config.controllerPath,
+  )
   // Linux sockaddr_un limit: use this worktree's private TMPDIR, shortened via /proc/self/cwd.
   // The full host path may exceed 100; preserve an absolute path through this process's cwd.
   config.toolSocketPath = `/proc/${process.pid}/cwd/${relative(process.cwd(), join(root, 't.sock'))}`

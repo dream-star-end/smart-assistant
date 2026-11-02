@@ -9,6 +9,11 @@ import { dirname, join, relative } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { test } from 'node:test'
 import {
+  type Cc5BridgeBinding,
+  cc5ControlRequest,
+  createCc5FreshContainerRuntime,
+} from '@openclaude/gateway/cc5-container-runtime'
+import {
   MODEL_AUTHORITY_VERSION,
   type ModelAuthorityPayload,
   type TurnLease,
@@ -17,8 +22,6 @@ import {
   encodeTurnLeaseEnvelope,
   turnLeaseSigningInput,
 } from '@openclaude/protocol'
-import { type Cc5BridgeBinding, cc5ControlRequest } from '../cc5BridgePort.js'
-import { createCc5FreshContainerRuntime } from '../cc5ContainerRuntime.js'
 
 const env = { OC_SELFHOST_CC5_T1555U_ENABLED: '1', OC_SELFHOST_CC5_T1555U_TEST_UID: '912' }
 function fixture(failStop = false) {
