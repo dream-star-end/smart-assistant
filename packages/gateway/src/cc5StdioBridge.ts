@@ -217,14 +217,18 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const controller = new AbortController()
   process.once('SIGTERM', () => controller.abort())
   process.once('SIGINT', () => controller.abort())
-  runCc5StdioBridge({
-    binding: readCc5Binding(),
-    sessionKey: process.argv[2] ?? '',
-    stdin: process.stdin,
-    stdout: process.stdout,
-    signal: controller.signal,
-  }).catch(() => {
-    process.stderr.write('CC5_INTERACTIVE_BRIDGE_FAILED\n')
-    process.exitCode = 1
-  })
+  Promise.resolve()
+    .then(() =>
+      runCc5StdioBridge({
+        binding: readCc5Binding(),
+        sessionKey: process.argv[2] ?? '',
+        stdin: process.stdin,
+        stdout: process.stdout,
+        signal: controller.signal,
+      }),
+    )
+    .catch(() => {
+      process.stderr.write('CC5_INTERACTIVE_BRIDGE_FAILED\n')
+      process.exitCode = 1
+    })
 }

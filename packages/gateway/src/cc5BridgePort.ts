@@ -1,6 +1,14 @@
 /** Task-only live-web transport. No CLI, provider credentials or remote shell here. */
 import { createHash } from 'node:crypto'
-import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
+import {
+  constants,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  statSync,
+} from 'node:fs'
 import { request } from 'node:http'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -30,38 +38,42 @@ export function readCc5Binding(
   path = CC5_BINDING_FILE,
   now = Date.now(),
 ): Readonly<Cc5BridgeBinding> {
-  requireCc5(path === CC5_BINDING_FILE)
-  const dir = lstatSync(dirname(path))
-  requireCc5(dir.isDirectory() && dir.uid === 0 && (dir.mode & 0o027) === 0)
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
-    const meta = fstatSync(fd)
-    const link = lstatSync(path)
-    requireCc5(
-      meta.isFile() &&
-        !link.isSymbolicLink() &&
-        meta.ino === link.ino &&
-        meta.dev === link.dev &&
-        meta.uid === 0 &&
-        meta.nlink === 1 &&
-        (meta.mode & 0o027) === 0 &&
-        meta.size > 0 &&
-        meta.size <= 4096,
-    )
-    const b = JSON.parse(readFileSync(fd, 'utf8')) as Cc5BridgeBinding
-    requireCc5(
-      b.version === 1 &&
-        /^[1-9][0-9]*$/.test(b.uid) &&
-        /^[1-9][0-9]*$/.test(b.containerDbId) &&
-        /^[a-f0-9]{64}$/.test(b.dockerId) &&
-        /^[a-f0-9-]{36}$/.test(b.operationId) &&
-        /^[a-f0-9]{64}$/.test(b.capability) &&
-        Number.isSafeInteger(b.expiresAt) &&
-        b.expiresAt > now,
-    )
-    return Object.freeze(b)
-  } finally {
-    closeSync(fd)
+    requireCc5(path === CC5_BINDING_FILE)
+    const dir = lstatSync(dirname(path))
+    requireCc5(dir.isDirectory() && dir.uid === 0 && (dir.mode & 0o027) === 0)
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    try {
+      const meta = fstatSync(fd)
+      const link = lstatSync(path)
+      requireCc5(
+        meta.isFile() &&
+          !link.isSymbolicLink() &&
+          meta.ino === link.ino &&
+          meta.dev === link.dev &&
+          meta.uid === 0 &&
+          meta.nlink === 1 &&
+          (meta.mode & 0o027) === 0 &&
+          meta.size > 0 &&
+          meta.size <= 4096,
+      )
+      const b = JSON.parse(readFileSync(fd, 'utf8')) as Cc5BridgeBinding
+      requireCc5(
+        b.version === 1 &&
+          /^[1-9][0-9]*$/.test(b.uid) &&
+          /^[1-9][0-9]*$/.test(b.containerDbId) &&
+          /^[a-f0-9]{64}$/.test(b.dockerId) &&
+          /^[a-f0-9-]{36}$/.test(b.operationId) &&
+          /^[a-f0-9]{64}$/.test(b.capability) &&
+          Number.isSafeInteger(b.expiresAt) &&
+          b.expiresAt > now,
+      )
+      return Object.freeze(b)
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    throw new Error('CC5_BRIDGE_BINDING_INVALID')
   }
 }
 
@@ -138,10 +150,16 @@ export class UnixCc5BridgePort implements Cc5BridgePort {
   }
   async prepare(): Promise<SpawnOpts> {
     requireCc5(!this.closed && this.binding.expiresAt > Date.now())
-    const entry = fileURLToPath(new URL('./cc5StdioBridge.js', import.meta.url))
+    const entry = fileURLToPath(new URL('../dist/cc5StdioBridge.js', import.meta.url))
+    try {
+      const meta = statSync(entry)
+      if (!meta.isFile() || meta.size === 0) throw new Error('empty')
+    } catch {
+      throw new Error('CC5_BRIDGE_MISSING')
+    }
     return {
       command: process.execPath,
-      args: [entry, this.sessionKey],
+      args: ['--conditions=openclaude-precompiled', entry, this.sessionKey],
       ccbBinaryDir: dirname(entry),
       subprocessCwd: dirname(entry),
       env: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' },
