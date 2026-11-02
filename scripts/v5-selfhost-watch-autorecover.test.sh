@@ -4,8 +4,8 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
-if [[ "$(readlink -f "$BIN")" == /opt/openclaude/v5-selfhost-watch/watch.sh ]]; then
+WATCH_SOURCE="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
+if [[ "$(readlink -f "$WATCH_SOURCE")" == /opt/openclaude/v5-selfhost-watch/watch.sh ]]; then
   echo "REFUSE: 不测已安装副本" >&2
   exit 2
 fi
@@ -17,6 +17,12 @@ bad() { fail=$((fail + 1)); echo "FAIL $*"; }
 
 BASE="$(mktemp -d "${TMPDIR:-/tmp}/v5-watch-autorecover.XXXXXX")"
 trap 'rm -rf "$BASE"' EXIT
+BIN="$BASE/watch-fixture.sh"
+# The test models CC5 absent/clear; the real recovery locks, probes and main
+# still execute. Installed-source hash checks below keep using WATCH_SOURCE.
+printf '#!/usr/bin/env bash\nsource %q\ncc5_activation_recovery_safe() { return 0; }\nmain "$@"\n' \
+  "$WATCH_SOURCE" >"$BIN"
+chmod 0700 "$BIN"
 
 RED='{"ok":false}'
 GREEN='{"ok":true,"deps":{"pg":"ok"}}'
@@ -34,7 +40,7 @@ setup() {
   export WATCH_STUB_UNIT_MASTER=active WATCH_STUB_UNIT_EGRESS=active WATCH_STUB_MASTER= WATCH_STUB_EGRESS=
   export WATCH_STUB_MASTER_BODY= WATCH_STUB_PG=ok WATCH_STUB_REDIS=ok WATCH_STUB_DOCKER=ok WATCH_STUB_JOURNAL=' ' WATCH_STUB_LOGTAIL=' '
   unset WATCH_STUB_FAIL_LOUD
-  cp -- "$BIN" "$WATCH_INSTALLED_BIN"
+  cp -- "$WATCH_SOURCE" "$WATCH_INSTALLED_BIN"
   printf '%s\n' "$GREEN" >"$C/master.json"
   printf '{"ok":true}\n' >"$C/egress.json"
   printf 'reason=tier1+tier2-failed\n' >"$WATCH_DISARM"
