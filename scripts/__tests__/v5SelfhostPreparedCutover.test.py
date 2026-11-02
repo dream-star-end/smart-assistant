@@ -122,6 +122,7 @@ PY
             canonicalize_prev_release write_cutover_grace dist_oc_build
         ''')
         self.h.script = self.h.script.replace('build_master_release() {', 'fixture_build_master_release() {')
+        self.h.script += '\nsource ' + repr(str(ROOT / 'scripts/lib/v5-selfhost-model-policy.sh')) + '\n'
         self.h.script += '\n' + '\n'.join((deploy_functions, runtime_functions, master_functions))
         self.h.script += r'''
 export T SHA
@@ -147,9 +148,13 @@ release_policy_enabled() { return 1; }
 release_policy_guard_owner() { ! flock -n "$SELFHOST_DEPLOY_LOCK" true; }
 fixture_seal_master() {
   local rel="$1" digest
+  mkdir -p "$rel/deploy/v5-selfhost" "$rel/scripts/lib" "$rel/packages/commercial/src/billing"
+  printf '%s\n' '{"grokEnabled":false}' >"$rel/deploy/v5-selfhost/model-availability.json"
+  cp "$SCRIPT_DIR/lib/selfhost-model-policy.mjs" "$rel/scripts/lib/selfhost-model-policy.mjs"
+  cp "$SCRIPT_DIR/../packages/commercial/src/billing/modelAvailability.ts" "$rel/packages/commercial/src/billing/modelAvailability.ts"
   digest="$(release_artifact_digest "$rel")"
   jq -cn --arg sha "$SHA" --arg digest "$digest" \
-    '{schemaVersion:2,sourceCommit:$sha,builtAt:"20261028-000000",metadataSha256:$digest,artifactSha256:$digest}' \
+    '{schemaVersion:2,sourceCommit:$sha,builtAt:"20261028-000000",metadataSha256:$digest,artifactSha256:$digest,modelAvailabilityPolicyGeneration:1}' \
     >"$rel/.complete"
 }
 build_master_release() { fixture_build_master_release "$@"; fixture_seal_master "$BUILT_MASTER_RELEASE"; }

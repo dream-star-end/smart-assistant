@@ -44,13 +44,53 @@ test('R2 real picker selects exact visible model (shared deployment helper)', as
   }
 })
 
-import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { copyFileSync, cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 // Synthetic HTTP/WS backend: validates the gate runner, not production auth/engine integration.
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 const { WebSocketServer } = createRequire(import.meta.url)('ws')
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url))
+const legacySource = join(repoRoot, 'scripts/__tests__/fixtures/model-policy/legacy-9826')
+const legacySha = '9826fe9512f6c2e2a9479d2db7faa55dd4515ac2'
+function legacyRunner(dir) {
+  const release = join(dir, 'legacy-release')
+  // Share the browser helpers, but retain the actual historical option/parser and entry scripts.
+  cpSync(join(repoRoot, 'scripts/lib'), join(release, 'scripts/lib'), {
+    recursive: true, filter: (path) => basename(path) !== 'selfhost-model-policy.mjs',
+  })
+  for (const [file, sha] of [
+    ['lib/user-contract.mjs', '5ca7dc45dbf863706589fda68024b8ef254b954aa20a0fb60b839ec6576fbabf'],
+    ['v5-user-contract-prewarm.mjs', 'ca71903e8e8a048caa7db16c03186e63d2d7e70afecc8b017778c2e26b5b0b9c'],
+    ['v5-user-contract-smoke.mjs', 'ad292d858bbf0dd28421af61d96c6ce65c2d5f78dd309a1c42c3cdfe9afa09f6'],
+  ]) {
+    const fixture = join(legacySource, 'scripts', `${file}.txt`)
+    assert.equal(createHash('sha256').update(readFileSync(fixture)).digest('hex'), sha)
+    copyFileSync(fixture, join(release, 'scripts', file))
+  }
+  symlinkSync(join(repoRoot, 'node_modules'), join(release, 'node_modules'), 'dir')
+  writeFileSync(join(release, 'package.json'), '{"type":"module"}')
+  writeFileSync(join(release, '.complete'), JSON.stringify({ sourceCommit: legacySha }))
+  // Static/digest rejection is exercised separately by the private-filesystem recovery proof.
+  // Here the real selector must bind the known recovery identity and choose the frozen child.
+  const selected = JSON.parse(execFileSync('bash', ['-c', String.raw`
+    set -euo pipefail
+    source "$MODEL_POLICY_LIB"
+    CUTOVER_ROLLBACK=1; ROLLBACK_MASTER="$TEST_RELEASE"; ROLLBACK_SHA="$TEST_SHA"
+    assert_master_release_static_gate() { [[ "$1" == "$TEST_RELEASE" && "$2" == "$TEST_SHA" ]]; }
+    model_policy_select_contract_runner "$TEST_RELEASE" rollback
+    jq -nc --arg directory "$MODEL_POLICY_CONTRACT_DIR" --arg models "$MODEL_POLICY_CONTRACT_MODELS" '{directory:$directory,models:$models}'
+  `], {
+    encoding: 'utf8', env: { ...process.env, SCRIPT_DIR: join(repoRoot, 'scripts'),
+      MODEL_POLICY_LIB: join(repoRoot, 'scripts/lib/v5-selfhost-model-policy.sh'),
+      TEST_RELEASE: release, TEST_SHA: legacySha },
+  }))
+  assert.equal(selected.directory, join(release, 'scripts'))
+  assert.equal(selected.models, 'gpt-6-luna,deepseek-v4-flash')
+  return { entry: join(selected.directory, 'v5-user-contract-smoke.mjs'), models: selected.models }
+}
 const fixtureHtml = (grokEnabled) => `<!doctype html><body><div id="app"><button id="login">登录</button></div>
 <script>
 const app=document.querySelector('#app');let model='glm-5.3',peer=0,ws;
@@ -58,9 +98,10 @@ document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="
 function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button>${grokEnabled ? '<button data-model-id="grok-build">grok-build</button>' : ''}<button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
 function bindModels(){for(const b of document.querySelectorAll('[data-model-id]'))b.onclick=()=>{model=b.dataset.modelId;document.querySelector('#model').textContent=model;document.querySelector('#menu').innerHTML='';};}
 </script>`
-for (const grokEnabled of [false, true])
+for (const artifact of [false, true, 'legacy'])
 for (const cost of ['dry', 'live'])
-  test(`R2 synthetic runner C1-C3 grok=${grokEnabled} ${cost} forwarding and timings`, async () => {
+  test(`R2 synthetic runner C1-C3 grok=${artifact} ${cost} forwarding and timings`, async () => {
+    const grokEnabled = artifact !== false
     const calls = []
     const server = createServer((req, res) => {
       res.setHeader(
@@ -108,10 +149,14 @@ for (const cost of ['dry', 'live'])
     writeFileSync(join(dir, 'password'), 'fixture-only', { mode: 0o600 })
     writeFileSync(join(dir, 'model-availability.json'), JSON.stringify({ grokEnabled }))
     try {
+      const runner = artifact === 'legacy' ? legacyRunner(dir) : {
+        entry: fileURLToPath(new URL('../../../scripts/v5-user-contract-smoke.mjs', import.meta.url)),
+        models: undefined,
+      }
       await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
       const child = spawn(
         process.execPath,
-        [fileURLToPath(new URL('../../../scripts/v5-user-contract-smoke.mjs', import.meta.url))],
+        [runner.entry],
         {
           env: {
             ...process.env,
@@ -120,7 +165,7 @@ for (const cost of ['dry', 'live'])
             V5_CONTRACT_COST: cost,
             V5_SELFHOST_MODEL_POLICY_FILE: join(dir, 'model-availability.json'),
             V5_CONTRACT_MODEL_ID: 'gpt-6-luna',
-            V5_CONTRACT_MODELS: undefined,
+            V5_CONTRACT_MODELS: runner.models,
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         },
@@ -135,8 +180,8 @@ for (const cost of ['dry', 'live'])
       assert.deepEqual(
         calls.map((f) => f.model),
         cost === 'dry' ? [] : [
-          grokEnabled ? 'grok-build' : 'gpt-6-luna',
-          grokEnabled ? 'grok-build' : 'gpt-6-luna',
+          artifact === true ? 'grok-build' : 'gpt-6-luna',
+          artifact === true ? 'grok-build' : 'gpt-6-luna',
           'deepseek-v4-flash', 'deepseek-v4-flash',
         ],
       )
@@ -153,7 +198,7 @@ for (const cost of ['dry', 'live'])
           'INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it',
         )
       }
-      console.log(`# synthetic-grok=${grokEnabled}-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
+      console.log(`# synthetic-grok=${artifact}-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
     } finally {
       for (const ws of wss.clients) ws.terminate()
       await new Promise((resolve) => wss.close(resolve))

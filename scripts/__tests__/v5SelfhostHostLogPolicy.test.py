@@ -260,13 +260,24 @@ class HostLogPolicyTest(unittest.TestCase):
         source = (REPO / "scripts/v5-selfhost-master-release-lib.sh").read_text()
         import re
         marker = re.search(r"^write_strong_release_marker_local\(\) \{[\s\S]*?^\}", source, re.M).group(0)
+        # This is a new model-policy-capable artifact. Keep that separate bundle
+        # valid so its admission cannot mask the missing host-log-policy proof.
+        for rel in ("deploy/v5-selfhost/model-availability.json",
+                    "scripts/lib/selfhost-model-policy.mjs",
+                    "packages/commercial/src/billing/modelAvailability.ts"):
+            target = self.bundle / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / rel, target)
         (self.bundle / ".complete").unlink()
         (self.bundle / FILES[1]).unlink()
-        script = 'source "$1";\n' + marker + '\nwrite_strong_release_marker_local "$2" ' + 'a'*40 + ' ' + 'a'*9 + ' 20261023-000000 2'
+        script = 'source "$1"; source "$3";\n' + marker + '\nwrite_strong_release_marker_local "$2" ' + 'a'*40 + ' ' + 'a'*9 + ' 20261023-000000 2'
         result = subprocess.run(["bash", "-c", script, "_",
                                  str(REPO / "scripts/lib/v5-selfhost-host-log-policy.sh"),
-                                 str(self.bundle)], capture_output=True, text=True, timeout=10)
+                                 str(self.bundle),
+                                 str(REPO / "scripts/lib/v5-selfhost-model-policy.sh")],
+                                capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn("host-log-policy: missing/invalid bundle component", result.stderr)
         self.assertFalse((self.bundle / ".complete").exists())
 
     def test_snapshot_captures_policy_before_original_bundle_changes(self):

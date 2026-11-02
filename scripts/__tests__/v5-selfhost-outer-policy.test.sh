@@ -3,6 +3,7 @@
 # The future author executes under normal train/test mutex. No production roots.
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODEL_POLICY_FIXTURE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-$SCRIPT_DIR/deploy-v5-selfhost.sh}"
 POLICY_SCRIPT="${POLICY_SCRIPT:-$SCRIPT_DIR/lib/v5-selfhost-release-policy.sh}"
 MASTER_SCRIPT="${MASTER_SCRIPT:-$SCRIPT_DIR/v5-selfhost-master-release-lib.sh}"
@@ -38,7 +39,7 @@ out=Path(sys.argv[1]);sources=list(map(Path,sys.argv[2:]))
 groups=[
  ['activate_tuple_joint','cmd_cutover','cutover_gate_against_release','cutover_clog','cutover_fail','cutover_persist_phase_or_compensate','selfhost_policy_get','gate_fail_policy','stay_window_sec','gate_fail_drill_armed'],
  ['survivor_state_phase','release_policy_enabled','release_policy_guard_owner','release_policy_flip_live','release_policy_restore_live_before','release_policy_rejected_phase','release_policy_bind_official_train_request','release_policy_context_present'],
- ['atomic_flip_live_symlink','write_prev_release_file'],
+ ['atomic_flip_live_symlink','write_prev_release_file','release_artifact_digest'],
  ['policy_drill_adapter']]
 manifest=[]
 for path,names in zip(sources,groups):
@@ -71,6 +72,7 @@ EXTRACT
 export OC_HOTCFG_PLATFORM_ROOT="$WORK/platform" OC_HOTCFG_RELEASES_ROOT="$WORK/runtime" OC_HOTCFG_ENV_FILE="$WORK/tuple.env" OC_HOTCFG_HISTORY="$WORK/history"
 export LOSSLESS_TURN_TAPE_RUNTIME_BATCHING=1
 source "$RUNTIME_LIB"
+source "$SCRIPT_DIR/lib/v5-selfhost-model-policy.sh"
 for file in "$WORK/functions/"*.sh; do source "$file"; done
 
 # Transparent observer: exact Bash-declared real function body, name alone is
@@ -180,6 +182,21 @@ setup_case() {
   DEPLOY_BUILT_RELEASE="$MASTER_RELEASES_ROOT/rel-new";OLD_REL="$MASTER_RELEASES_ROOT/rel-old"
   MASTER_LIVE_LINK="$OUTER_CASE_DIR/master-live";ln -s "$OLD_REL" "$MASTER_LIVE_LINK"
   for master in "$OLD_REL" "$DEPLOY_BUILT_RELEASE";do printf '{"capabilities":["lossless-turn-runtime-batch-v1"],"runtimeCapabilities":[]}\n' >"$master/deploy/v5/release-metadata.json";done
+  # These are current forward artifacts. Keep the real generation admission
+  # active, with complete policy files, rather than stubbing the new E1 guard.
+  for master in "$OLD_REL" "$DEPLOY_BUILT_RELEASE";do
+    for relative in deploy/v5-selfhost/model-availability.json scripts/lib/selfhost-model-policy.mjs packages/commercial/src/billing/modelAvailability.ts;do
+      mkdir -p "$(dirname "$master/$relative")"
+      cp "$MODEL_POLICY_FIXTURE_ROOT/$relative" "$master/$relative"
+    done
+    model_digest="$(release_artifact_digest "$master")"
+    model_metadata="$(sha256sum "$master/deploy/v5/release-metadata.json" | awk '{print $1}')"
+    model_source="$(source_commit)"
+    [[ "$master" != "$OLD_REL" ]] || model_source=1111111111111111111111111111111111111111
+    jq -cn --arg sha "$model_source" --arg artifact "$model_digest" --arg metadata "$model_metadata" \
+      '{schemaVersion:2,sourceCommit:$sha,builtAt:"20261102-000000",artifactSha256:$artifact,metadataSha256:$metadata,modelAvailabilityPolicyGeneration:1}' \
+      >"$master/.complete"
+  done
   mkdir -p "$OC_HOTCFG_PLATFORM_ROOT/bundles/p521-old" "$OC_HOTCFG_PLATFORM_ROOT/bundles/p521-new" "$WORK/units" "$WORK/backup"
   command rm -f "$OC_HOTCFG_PLATFORM_ROOT/current";ln -s bundles/p521-old "$OC_HOTCFG_PLATFORM_ROOT/current"
   V5_ENV="$OUTER_CASE_DIR/tuple.env";printf 'OC_RUNTIME_IMAGE=img:OLD\nOC_RUNTIME_IMAGE_ID=sha256:OLD\nOC_RUNTIME_RELEASE=/rel/OLD\nOC_PLATFORM_BUNDLE=\n' >"$V5_ENV"

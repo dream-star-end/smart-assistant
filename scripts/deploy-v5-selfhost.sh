@@ -239,9 +239,11 @@ user_contract_prewarm_cleanup() {
 }
 
 user_contract_prewarm() {
-  local rc=0 parent_pid="$BASHPID"
+  local rc=0 parent_pid="$BASHPID" entry="${1:-$SCRIPT_DIR/v5-user-contract-prewarm.mjs}" models="${2:-}"
+  local -a command=(node "$entry")
+  if [[ -n "$models" ]]; then command=(env "V5_CONTRACT_MODELS=$models" node "$entry"); fi
   python3 "$SCRIPT_DIR/lib/v5-selfhost-prewarm-process.py" "$parent_pid" \
-    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" &
+    "${command[@]}" &
   USER_CONTRACT_PREWARM_PID=$!
   wait "$USER_CONTRACT_PREWARM_PID" || rc=$?
   USER_CONTRACT_PREWARM_PID=""
@@ -1916,13 +1918,20 @@ assert_ssh_rule_before_drop() {
 }
 
 # Fail closed; the caller owns the existing compensation/exit path.
-user_contract_gate() { # <candidate release>
-  local rel="${1:-}"
-  local model_policy_file="${rel:-${REPO_ROOT:-$SCRIPT_DIR/..}}/deploy/v5-selfhost/model-availability.json"
+user_contract_node() { # <verified child entry> [legacy matrix]
+  if [[ -n "${2:-}" ]]; then V5_CONTRACT_MODELS="$2" node "$1"; else node "$1"; fi
+}
+
+user_contract_gate() { # <candidate release> [internal recovery context]
+  local rel="${1:-}" context="${2:-forward}" child_dir models model_policy_file
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
   tsum_mark F.prewarm 2>/dev/null || :
+  # CUTOVER_ROLLBACK is cleared at entry and set only by cmd_rollback after lineage validation.
+  if [[ "$context" == forward && "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then context=rollback; fi
+  model_policy_select_contract_runner "$rel" "$context" || return $?
+  child_dir="$MODEL_POLICY_CONTRACT_DIR"; models="$MODEL_POLICY_CONTRACT_MODELS"; model_policy_file="$MODEL_POLICY_FILE"
   # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
   # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
   # wait for relay_ready). OCV5-709: a killed Node/browser or incomplete prewarm
@@ -1930,13 +1939,13 @@ user_contract_gate() { # <candidate release>
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
-    user_contract_prewarm || return $?
+    user_contract_prewarm "$child_dir/v5-user-contract-prewarm.mjs" "$models" || return $?
   tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
     V5_SELFHOST_MODEL_POLICY_FILE="$model_policy_file" \
-    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+    user_contract_node "$child_dir/v5-user-contract-smoke.mjs" "$models" || return 1
   tsum_mark F.G1 2>/dev/null || :
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
   # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
@@ -2179,8 +2188,8 @@ cutover_fail() {
   return 1
 }
 
-cutover_smoke_against_release() { # <rel>
-  local rel="$1" hz i ok=0 html spa_ok=0 expected_build got_build
+cutover_smoke_against_release() { # <rel> [internal recovery context]
+  local rel="$1" context="${2:-forward}" hz i ok=0 html spa_ok=0 expected_build got_build
   local policy_rc=0
   host_log_policy_check_release "$rel" || policy_rc=$?
   if (( policy_rc != 0 )); then
@@ -2238,7 +2247,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate "$rel" || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
+  user_contract_gate "$rel" "$context" || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {
@@ -2804,6 +2813,9 @@ cmd_cutover() {
   tsum_mark E1 2>/dev/null || :
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
+  if [[ "${CUTOVER_ROLLBACK:-0}" != 1 ]]; then
+    model_policy_require_forward_release "$rel" || die "正向发布需要完整 generation 1 model policy。尚未改任何运行面。"
+  fi
   assert_master_release_tsx_selfcheck "$rel"
   if [[ "${SELFHOST_SPLIT_PREPARED:-0}" == 1 ]]; then
     # E1 has verified the sealed candidate before the first live setup write.
