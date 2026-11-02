@@ -69,6 +69,7 @@ export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
 export const SERVER_AUTHORED_PATH = '/internal/v3/server-authored-message'
 export const CCB_TRANSCRIPT_RESTORE_PATH = '/internal/v3/ccb-transcript-restore'
+export const COMPACTION_TIMELINE_PATH = '/internal/v3/compaction-timeline'
 export const TURN_TAPE_STATE_PATH = '/internal/v3/turn-tape-state'
 export const MEMORY_USAGE_PATH = '/internal/v3/memory-usage'
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
@@ -149,6 +150,12 @@ export interface InternalRouteEntry {
 }
 
 export const INTERNAL_ROUTES = [
+  {
+    path: COMPACTION_TIMELINE_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/compactionTimelineClient.ts', 'commercial/src/http/internalCompactionTimeline.ts'],
+  },
   // ── v5:delegate grok-route(forwarder 唯一放行例外;selfhost 门控挂载)──
   {
     path: DELEGATE_GROK_ROUTE_MINT_PATH,

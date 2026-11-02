@@ -2,6 +2,7 @@ import { type Cc5ExecutionBackend, isCc5ExecutionBackend, sameCc5ExecutionBacken
 import { isCc5ResumeId } from './engine/cc5ResumeId.js'
 import { cc5SessionBackend, assertFreshCc5Session } from './cc5SessionBackend.js'
 import { buildHistoricalContextPayload } from './historicalContextPayload.js'
+import { noteCompactionBoundary, prepareCompactionRecovery } from './compactionRecoveryRuntime.js'
 import { getSystemHelpRelay, systemHelpContextFile } from './systemHelpRelay.js'
 import { prepareRunnerPromptPrivacy, refreshRunnerPromptPrivacy, assertRunnerPromptPrivacyStopped, clearRunnerPromptPrivacy, type PromptPrivacyRunner } from './promptPrivacyRuntime.js'
 /**
@@ -182,6 +183,7 @@ export interface SessionSubmitHost {
   onCcbTaskNotification: SessionManager['onCcbTaskNotification']
   onCcbTaskNotificationDelivered: SessionManager['onCcbTaskNotificationDelivered']
   runOneTurnWithRetry: SessionManager['runOneTurnWithRetry']
+  readCompactionTasks: SessionManager['readCompactionTasks']
   scheduleIdleDrain: SessionManager['scheduleIdleDrain']
   sessions: SessionManager['sessions']
 }
@@ -1271,6 +1273,12 @@ export async function submit(
         log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)
       }
     }
+    // Only the first dispatch after an observed compaction carries the
+    // original-source recovery contract; preparing it never fails the turn.
+    if (!opts?.modelSwitchInternal && !isCcbSlashCommandPrompt(userTextOrBlocks)) {
+      session._compactionRecoverInput = await prepareCompactionRecovery(session, () => this.readCompactionTasks?.(session.sessionKey) ?? [])
+      assertSessionCurrent()
+    }
     // Auto-name session from first user turn
     if (session.turns === 0 && session.currentUserText) {
       const title = session.currentUserText.slice(0, 50).replace(/\s+/g, ' ').trim()
@@ -1382,6 +1390,7 @@ export async function submit(
     }
   } finally {
     closeHelpLogical?.()
+    session._compactionRecoverInput = undefined
     clearRunnerPromptPrivacy(session.runner)
     if (
       consumingModelSwitch &&
@@ -2442,6 +2451,7 @@ export async function finishIdleUnderLock(
       }
       session._idleRunning = true
       session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+      noteCompactionBoundary(session, 'box_idle_compact')
       try {
         assertIdleCurrent()
         const settled = await runBoxIdleTurn(privacyRunner, {

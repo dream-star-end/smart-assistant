@@ -1,4 +1,5 @@
 import { getSystemHelpRelay } from './systemHelpRelay.js'
+import { observeCompactionOriginal } from './compactionRecoveryRuntime.js'
 import { refreshTurnModelAuthorityLease, RenewTurnLeaseError } from './masterTurnLease.js'
 import type { UpstreamRetryHint } from '@openclaude/protocol'
 import { consumeUnusedPreheat } from './speculativePreheat.js'
@@ -551,6 +552,7 @@ export async function _runOneTurn(
       }
     }
     const handleEngineEvent = (e: EngineEvent) => {
+      observeCompactionOriginal(session, e, () => turn?.getPartialSnapshot())
       if (startupPhaseActive) {
         if (e.kind === 'turn_status') {
           // A successor phase owns the activity row from here on. Object
@@ -2529,7 +2531,7 @@ export async function runOneTurnWithRetry(
     try {
       await this._runOneTurn(
         session,
-        retryInput,
+        session._compactionRecoverInput?.(retryInput) ?? retryInput,
         onEvent,
         requestId,
         traceId,

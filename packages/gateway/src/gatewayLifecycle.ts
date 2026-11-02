@@ -1,5 +1,7 @@
 import { createTaskboardPreflight } from './taskboard/stagePreflight.js'
 import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
+import { startCompactionArchiveCleanup } from './compactionArchive.js'
+import { personalCompactionEnabled } from './compactionTasks.js'
 /**
  * Gateway lifecycle: start-up, shutdown, boot auto-resume, turn-dispatch inbox recovery, notifier and scheduler ticks
  *
@@ -113,6 +115,7 @@ export interface GatewayLifecycleHost {
   _skillShadowReporter: Gateway['_skillShadowReporter']
   _startTurnDispatchRecoveryLoop: Gateway['_startTurnDispatchRecoveryLoop']
   _stopEviction: Gateway['_stopEviction']
+  _stopCompactionArchiveCleanup: Gateway['_stopCompactionArchiveCleanup']
   _stopV3RetryDrainer: Gateway['_stopV3RetryDrainer']
   _sweepStalePendingPermissions: Gateway['_sweepStalePendingPermissions']
   _taskSchedulerTimer: Gateway['_taskSchedulerTimer']
@@ -910,6 +913,11 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       this.log.warn('pending permission sweep failed', undefined, err)
     }
   }, PENDING_PERMISSION_SWEEP_MS)
+  if (personalCompactionEnabled()) {
+    this._stopCompactionArchiveCleanup = startCompactionArchiveCleanup({}, (err) => {
+      this.log.warn('compaction original cleanup failed', undefined, err)
+    })
+  }
   // Check immediately on boot
   this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
@@ -980,6 +988,8 @@ export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Pr
     this._stopEviction?.()
   } catch {}
   this._stopEviction = null
+  this._stopCompactionArchiveCleanup?.()
+  this._stopCompactionArchiveCleanup = null
   try {
     await this._persistAndCloseDelegateJobs()
   } catch (err) {

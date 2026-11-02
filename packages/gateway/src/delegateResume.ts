@@ -8,7 +8,7 @@ import { identityCompatAgentIdsEqual, type IdentityCompatProjection } from '@ope
  * synchronous check-and-add so a second in-flight resume 409s before any
  * await. Taskboard's internal `input.sessionKey` is never registered here.
  */
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 
 export const DEFAULT_DELEGATE_RESUME_TTL_MS = 7 * 24 * 60 * 60_000
 export const DEFAULT_DELEGATE_RESUME_MAX_BINDINGS = 256
@@ -20,7 +20,20 @@ export type DelegateResumeBinding = {
   sourceAgent: string
   createdAt: number
   lastUsedAt: number
+  /** Personal: fresh task identity while this minted session is in flight. */
+  taskKey?: string
+  jobId?: string
 }
+
+/** Exact fresh-task identity. Real callers send no key, so this is derived. */
+export function delegateTaskKey(input: { goal: unknown; model?: unknown; reviewMode?: unknown }): string {
+  return createHash('sha256')
+    .update(JSON.stringify([String(input.goal).trim(), input.model ?? null, input.reviewMode ?? null]))
+    .digest('hex')
+}
+
+export const DELEGATE_TASK_IN_FLIGHT_MESSAGE =
+  '同一委派任务仍在运行,结果会由原来的调用返回;不要重复发起'
 
 export const DELEGATE_RESUME_OCCUPIED_MESSAGE =
   '该委派会话仍在运行或正在收尾,请用 delegate-wait 等待,不要重复 resume'
@@ -122,6 +135,8 @@ export class DelegateResumeRegistry {
     sourceAgent: string
     /** Client/request idempotency key. Same key + same resume session never dispatches twice. */
     idempotencyKey?: string
+    /** Personal: exact fresh-task identity; an in-flight match replays, never re-dispatches. */
+    taskKey?: string
     /** Successful authenticated projection; only changes pair semantics, never parent/key ownership. */
     identityProjection?: IdentityCompatProjection
   }): DelegateResumePreflight {
@@ -141,6 +156,20 @@ export class DelegateResumeRegistry {
       }
     }
     this.pruneAttempts()
+    // A fresh request repeating an in-flight task of the same parent/target/
+    // source (e.g. re-issued after a compaction) gets that task's handle back
+    // instead of a second dispatch and billing admission.
+    if (!resumeKey && input.taskKey && parentSessionKey) {
+      for (const binding of this.bindings.values()) {
+        if (binding.taskKey !== input.taskKey || this.reserved.get(binding.sessionKey) !== 'active' ||
+          binding.parentSessionKey !== parentSessionKey || binding.targetAgentId !== targetAgentId ||
+          binding.sourceAgent !== sourceAgent) continue
+        return {
+          ok: true, sessionKey: binding.sessionKey, minted: false, evictedKeys,
+          dispatchGranted: false, replay: true, ...(binding.jobId ? { jobId: binding.jobId } : {}),
+        }
+      }
+    }
     if (resumeKey && idempotencyKey) {
       const existing = this.attempts.get(attemptId(resumeKey, idempotencyKey))
       if (existing && this.reserved.has(resumeKey)) {
@@ -182,6 +211,7 @@ export class DelegateResumeRegistry {
       }
       this.reserved.set(resumeKey, 'active')
       binding.lastUsedAt = this.now()
+      binding.taskKey = undefined
       this.grantDispatch(resumeKey, idempotencyKey)
       return {
         ok: true,
@@ -228,6 +258,7 @@ export class DelegateResumeRegistry {
       sourceAgent,
       createdAt: ts,
       lastUsedAt: ts,
+      ...(input.taskKey ? { taskKey: input.taskKey } : {}),
     })
     this.reserved.set(sessionKey, 'active')
     this.grantDispatch(sessionKey, idempotencyKey)
@@ -295,6 +326,8 @@ export class DelegateResumeRegistry {
   }
 
   bindJob(sessionKey: string, idempotencyKey: string | undefined, jobId: string): void {
+    const binding = this.bindings.get(sessionKey)
+    if (binding) binding.jobId = jobId
     if (!idempotencyKey) return
     const id = attemptId(sessionKey, idempotencyKey)
     const existing = this.attempts.get(id)
