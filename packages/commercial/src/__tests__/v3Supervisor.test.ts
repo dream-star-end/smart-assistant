@@ -4739,7 +4739,7 @@ describe("cc5 fresh container supervisor boundary", () => {
       onCreateContainer: () => order.push("create"),
       onStartContainer: () => { order.push("start"); if (failure === "tx2") pool.rows[0]!.state = "vanished"; } });
     let getterCalls = 0;
-    const ring = "fixture-key:" + Buffer.alloc(32, 9).toString("base64url");
+    const ring = `fixture-key:${Buffer.alloc(32, 9).toString("base64url")}`;
     let handle: { mountSource: string; containerDbId: string };
     const deps = { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST,
       randomIp: () => "172.31.8.12", randomSecret: fixedSecret("a".repeat(64)),
@@ -4780,7 +4780,7 @@ describe("cc5 fresh container supervisor boundary", () => {
   });
   test("ordinary UID and OFF do not prepare, mount or activate cc5", async () => {
     for (const off of [false, true]) {
-      const f = setup(); if (off) delete process.env.OC_SELFHOST_CC5_T1555U_ENABLED;
+      const f = setup(); if (off) Reflect.deleteProperty(process.env, "OC_SELFHOST_CC5_T1555U_ENABLED");
       try {
         await provisionV3Container(f.deps, off ? 912 : 913);
         assert.deepEqual(f.order, ["create", "start"]);

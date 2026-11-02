@@ -3802,129 +3802,137 @@ export async function cleanupV3ContainerDocker(
 ): Promise<void> {
   const cc5Release = beginCc5Release(deps, containerRow.id, containerRow.container_internal_id ?? undefined);
   let dockerFailed = false;
-  try {
-    const callerHostUuid: string | null = containerRow.host_uuid ?? null;
-    // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
-    if (
-      callerHostUuid !== null
-      && dbHostUuid !== null
-      && callerHostUuid !== dbHostUuid
-    ) {
-      // eslint-disable-next-line no-console
-      console.warn("[v3supervisor.stopAndRemove] caller host_uuid != db host_uuid", {
-        containerId: containerRow.id,
-        callerHostUuid,
-        dbHostUuid,
-      });
-    }
-    const effectiveHostUuid: string | null = callerHostUuid ?? dbHostUuid;
+  let dockerError: unknown;
+  try { await cleanupV3DockerEffects(deps, containerRow, timeoutSec, dbHostUuid); }
+  catch (error) { dockerFailed = true; dockerError = error; }
+  let remoteFailed = false;
+  try { await cc5Release; }
+  catch {
+    remoteFailed = true;
+    console.error("[v3supervisor] cc5 remote exit unproved; own operation retained");
+  }
+  if (dockerFailed) throw dockerError;
+  if (remoteFailed) throw new SupervisorError("PartialV3Cleanup", "cc5 remote exit remains unproved");
+}
 
-    // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
-    //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
-    //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
-    //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
-    //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
-    //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
-    if (!containerRow.container_internal_id) return;
-    const cid = containerRow.container_internal_id;
-    // 多 host 系统标志:selfHostId 已配 + containerService 注入。
-    // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
-    const isMultiHost =
-      typeof deps.selfHostId === "string" && deps.containerService !== undefined;
-    // 安全 gate A:多 host 系统下 host 未知 → 不假设本地。
-    // 触发条件:UPDATE 0 行(row 已并发删 / id 错)且 caller 没传,
-    //         或 row 在 DB 里 host_uuid 就是 null(legacy row 跑在多 host 系统)。
-    // 默认本地 docker.remove 在跨 host 时是 noop(404),但语义上不对:
-    // 调用方期望"清这个容器",容器实际在远端,我们却往本地打。明确 skip + warn 比静默
-    // 好,出问题排障也能从日志看到 host_uuid 缺失。
-    if (effectiveHostUuid === null && isMultiHost) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
-        { containerId: containerRow.id, cid, rowFound: true },
-      );
-      return;
+async function cleanupV3DockerEffects(
+  deps: V3SupervisorDeps,
+  containerRow: { id: number; container_internal_id?: string | null; host_uuid?: string | null },
+  timeoutSec: number,
+  dbHostUuid: string | null,
+): Promise<void> {
+  const callerHostUuid: string | null = containerRow.host_uuid ?? null;
+  // caller vs DB 不一致 → 留诊断线索(理论不该发生,可能 row 被并发改 / 容器迁移)。
+  if (
+    callerHostUuid !== null
+    && dbHostUuid !== null
+    && callerHostUuid !== dbHostUuid
+  ) {
+    // eslint-disable-next-line no-console
+    console.warn("[v3supervisor.stopAndRemove] caller host_uuid != db host_uuid", {
+      containerId: containerRow.id,
+      callerHostUuid,
+      dbHostUuid,
+    });
+  }
+  const effectiveHostUuid: string | null = callerHostUuid ?? dbHostUuid;
+
+  // 2) 容器实际清理 best-effort;先 stop 再 remove,各自吞 missing。
+  //    R2 finding 加固:此后任何错都已经过了 DB UPDATE,意图已落库。
+  //    R3 finding 加固:stop 失败也仍然 try remove({force:true}) ——
+  //    force remove 通常能覆盖大部分 stop 失败 case(daemon 抖动、容器
+  //    死锁等),缩短"row vanished 但 docker 残骸还在"的窗口。
+  //    任一 stage 失败,记录,最后聚合抛 PartialV3Cleanup(含 stages)。
+  if (!containerRow.container_internal_id) return;
+  const cid = containerRow.container_internal_id;
+  // 多 host 系统标志:selfHostId 已配 + containerService 注入。
+  // 单机 legacy 模式下 (selfHostId 缺失) host_uuid 为 null 是正常的,允许走本地。
+  const isMultiHost =
+    typeof deps.selfHostId === "string" && deps.containerService !== undefined;
+  // 安全 gate A:多 host 系统下 host 未知 → 不假设本地。
+  // 触发条件:UPDATE 0 行(row 已并发删 / id 错)且 caller 没传,
+  //         或 row 在 DB 里 host_uuid 就是 null(legacy row 跑在多 host 系统)。
+  // 默认本地 docker.remove 在跨 host 时是 noop(404),但语义上不对:
+  // 调用方期望"清这个容器",容器实际在远端,我们却往本地打。明确 skip + warn 比静默
+  // 好,出问题排障也能从日志看到 host_uuid 缺失。
+  if (effectiveHostUuid === null && isMultiHost) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] host_uuid unknown in multi-host system, skipping docker cleanup",
+      { containerId: containerRow.id, cid, rowFound: true },
+    );
+    return;
+  }
+  // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
+  const isRemote =
+    typeof effectiveHostUuid === "string"
+    && typeof deps.selfHostId === "string"
+    && effectiveHostUuid !== deps.selfHostId;
+  // 安全 gate B:cross-host 但 containerService 缺失 → 不静默回退本地(会清错宿主)。
+  // 跟 v3orphanReconcile 已有 fail-safe gate 语义一致(containerService 未注入 → skip)。
+  if (isRemote && deps.containerService === undefined) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
+      { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
+    );
+    return;
+  }
+  const useRemote = isRemote;
+  const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
+  try {
+    if (useRemote) {
+      await deps.containerService!.stop(effectiveHostUuid!, cid, { timeoutSec });
+    } else {
+      await deps.docker.getContainer(cid).stop({ t: timeoutSec });
     }
-    // 决定走远端还是本地(只在 effectiveHostUuid 非 null 时区分)。
-    const isRemote =
-      typeof effectiveHostUuid === "string"
-      && typeof deps.selfHostId === "string"
-      && effectiveHostUuid !== deps.selfHostId;
-    // 安全 gate B:cross-host 但 containerService 缺失 → 不静默回退本地(会清错宿主)。
-    // 跟 v3orphanReconcile 已有 fail-safe gate 语义一致(containerService 未注入 → skip)。
-    if (isRemote && deps.containerService === undefined) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[v3supervisor.stopAndRemove] cross-host row but containerService missing, skipping docker cleanup",
-        { containerId: containerRow.id, cid, hostUuid: effectiveHostUuid },
-      );
-      return;
-    }
-    const useRemote = isRemote;
-    const failures: Array<{ stage: "stop" | "remove"; err: SupervisorError }> = [];
-    try {
-      if (useRemote) {
-        await deps.containerService!.stop(effectiveHostUuid!, cid, { timeoutSec });
-      } else {
-        await deps.docker.getContainer(cid).stop({ t: timeoutSec });
-      }
-    } catch (err) {
-      if (!isNotFound(err) && !isNotModified(err)) {
-        failures.push({ stage: "stop", err: wrapDockerError(err) });
-      }
-    }
-    // stop 失败后仍尝试 force remove;remove 成功 OR remove 404 (容器已不存在)
-    // 都视作清理完成(残骸已不在)。R4 finding:之前 remove 404 时只是不追加
-    // failure,但 stop 的 failure 还在,会误报 PartialV3Cleanup;实际上容器已没了,
-    // 应等同清理成功。
-    let containerCleared = false;
-    try {
-      if (useRemote) {
-        await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
-      } else {
-        await removeContainerSavingLogs(deps.docker.getContainer(cid), "stop_and_remove");
-      }
-      containerCleared = true;
-    } catch (err) {
-      if (isNotFound(err)) {
-        containerCleared = true; // 容器已不存在,清理目的达成
-      } else {
-        failures.push({ stage: "remove", err: wrapDockerError(err) });
-      }
-    }
-    // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
-    //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
-    //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
-    //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
-    //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
-    //     与 deleteRemoteCodexContainerAuth 注释一致。
-    if (!useRemote) {
-      try {
-        const codexContainerDir = readCodexContainerDirFromEnv();
-        await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
-      } catch {
-        /* swallow */
-      }
-    } else if (deps.deleteRemoteCodexAuth) {
-      try {
-        await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
-      } catch {
-        /* swallow */
-      }
-    }
-    // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
-    if (containerCleared && failures.every((f) => f.stage === "stop")) return;
-    if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
-  } catch (error) {
-    dockerFailed = true;
-    throw error;
-  } finally {
-    try { await cc5Release; }
-    catch {
-      console.error("[v3supervisor] cc5 remote exit unproved; own operation retained");
-      if (!dockerFailed) throw new SupervisorError("PartialV3Cleanup", "cc5 remote exit remains unproved");
+  } catch (err) {
+    if (!isNotFound(err) && !isNotModified(err)) {
+      failures.push({ stage: "stop", err: wrapDockerError(err) });
     }
   }
+  // stop 失败后仍尝试 force remove;remove 成功 OR remove 404 (容器已不存在)
+  // 都视作清理完成(残骸已不在)。R4 finding:之前 remove 404 时只是不追加
+  // failure,但 stop 的 failure 还在,会误报 PartialV3Cleanup;实际上容器已没了,
+  // 应等同清理成功。
+  let containerCleared = false;
+  try {
+    if (useRemote) {
+      await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
+    } else {
+      await removeContainerSavingLogs(deps.docker.getContainer(cid), "stop_and_remove");
+    }
+    containerCleared = true;
+  } catch (err) {
+    if (isNotFound(err)) {
+      containerCleared = true; // 容器已不存在,清理目的达成
+    } else {
+      failures.push({ stage: "remove", err: wrapDockerError(err) });
+    }
+  }
+  // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
+  //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
+  //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
+  //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
+  //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
+  //     与 deleteRemoteCodexContainerAuth 注释一致。
+  if (!useRemote) {
+    try {
+      const codexContainerDir = readCodexContainerDirFromEnv();
+      await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
+    } catch {
+      /* swallow */
+    }
+  } else if (deps.deleteRemoteCodexAuth) {
+    try {
+      await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
+    } catch {
+      /* swallow */
+    }
+  }
+  // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
+  if (containerCleared && failures.every((f) => f.stage === "stop")) return;
+  if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);
 }
 
 /**
