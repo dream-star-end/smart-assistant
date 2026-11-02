@@ -1,6 +1,8 @@
 /** P2 native state references. These are not a second dispatch/tape authority. */
 import { type Static, Type } from '@sinclair/typebox'
 import {
+  BindingSchema,
+  LeaseSchema,
   agentRemoteContentHash,
   remoteCanonical,
   requireRemote,
@@ -16,7 +18,7 @@ const nativeId = Type.String({
 })
 export const NativeCheckpointSchema = Type.Object(
   {
-    schemaVersion: Type.Literal(1),
+    schemaVersion: Type.Literal(3),
     checkpointId: digest,
     principalId: id,
     sessionId: id,
@@ -27,6 +29,9 @@ export const NativeCheckpointSchema = Type.Object(
     environmentId: id,
     environmentGeneration: positive,
     bindingRevision: positive,
+    checkpointCaptureId: id,
+    nativeDeliveryWatermark: integer,
+    nativeWriterGeneration: integer,
     // References must be supplied from the existing committed dispatch/tape owner.
     authority: Type.Object(
       { dispatchId: id, turnKey: id, tapeCursor: integer, nativeHeadUuid: id },
@@ -64,8 +69,78 @@ export const NativeCheckpointIdentitySchema = Type.Pick(
   closed,
 )
 export type NativeCheckpointIdentity = Static<typeof NativeCheckpointIdentitySchema>
+/** Trusted checkpoint orchestrator ticket, captured before copying any bytes.
+ * It does not itself prove a flush, process exit or snapshot content. */
+export const NativeRecoveryOwnerSchema = Type.Object(
+  { workerInstanceId: id, connectionId: id, challenge: digest },
+  closed,
+)
+export type NativeRecoveryOwner = Static<typeof NativeRecoveryOwnerSchema>
+export const NativeRecoveryTokenSchema = Type.Object(
+  { sessionId: id, permitId: id, generation: positive, owner: NativeRecoveryOwnerSchema },
+  closed,
+)
+export type NativeRecoveryToken = Static<typeof NativeRecoveryTokenSchema>
+export const NativeRecoveryPermitSchema = Type.Object(
+  {
+    token: NativeRecoveryTokenSchema,
+    requestId: id,
+    phase: Type.Union([Type.Literal('pending'), Type.Literal('completed')]),
+    sourceBinding: BindingSchema,
+    identity: NativeCheckpointIdentitySchema,
+    environmentIncarnation: id,
+    sourceWriterGeneration: integer,
+    createdAtMs: positive,
+    expiresAtMs: positive,
+    checkpointId: Type.Optional(digest),
+  },
+  closed,
+)
+export type NativeRecoveryPermit = Static<typeof NativeRecoveryPermitSchema>
+const checkpointCaptureFields = {
+  captureId: id,
+  identity: NativeCheckpointIdentitySchema,
+  bindingRevision: positive,
+  nativeDeliveryWatermark: integer,
+  nativeWriterGeneration: integer,
+  createdAtMs: positive,
+}
+export const NativeCheckpointCaptureSchema = Type.Union([
+  Type.Object({ ...checkpointCaptureFields, lease: LeaseSchema }, closed),
+  Type.Object({ ...checkpointCaptureFields, recovery: NativeRecoveryTokenSchema }, closed),
+])
+export type NativeCheckpointCapture = Static<typeof NativeCheckpointCaptureSchema>
+
 export function nativeCheckpointId(value: Omit<NativeCheckpoint, 'checkpointId'>): string {
-  return agentRemoteContentHash(`agent-remote-native-checkpoint-v1\n${remoteCanonical(value)}`)
+  return agentRemoteContentHash(`agent-remote-native-checkpoint-v3\n${remoteCanonical(value)}`)
+}
+/** Native tool producers use only these layouts; transcripts remain Worker-owned.
+ * Limits here describe filesystem names, never tool-output byte limits. */
+export function nativeToolArtifactPathAllowed(
+  path: string,
+  kind: 'file' | 'directory' = 'file',
+): boolean {
+  if (typeof path !== 'string' || path.includes('\\') || path.includes('\0')) return false
+  const parts = path.split('/')
+  if (
+    parts.some(
+      (part) => !part || part === '.' || part === '..' || part.startsWith('.') || part.length > 255,
+    )
+  )
+    return false
+  if (parts[0] !== 'tool-results') return false
+  const pdf = /^pdf-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
+  if (kind === 'directory') return parts.length === 1 || (parts.length === 2 && pdf.test(parts[1]!))
+  if (parts.length === 3) return pdf.test(parts[1]!) && /^page-[0-9]+\.jpg$/.test(parts[2]!)
+  if (parts.length !== 2) return false
+  const name = parts[1]!
+  if (/^[A-Za-z0-9_.:-]+\.(txt|json)$/.test(name)) return true
+  if (/^mcp-[A-Za-z0-9_-]+-[A-Za-z0-9_-]+-[0-9]+\.txt$/.test(name)) return true
+  const extension =
+    '(?:pdf|json|csv|txt|html|md|zip|docx|xlsx|pptx|doc|xls|mp3|wav|ogg|mp4|webm|png|jpg|gif|webp|svg|bin)'
+  return new RegExp(
+    `^(?:mcp-[A-Za-z0-9_-]+-blob-[0-9]+|mcp-resource-[0-9]+-[0-9]+|webfetch-[0-9]+)-[a-z0-9]{0,6}\\.${extension}$`,
+  ).test(name)
 }
 /** Exact allowed session subtree. No HOME/config/credential or global map copy. */
 export function nativeSessionPathAllowed(
@@ -81,18 +156,13 @@ export function nativeSessionPathAllowed(
     return false
   const parts = path.split('/')
   if (parts[0] !== 'projects' || !/^[A-Za-z0-9_-]+$/.test(parts[1] ?? '')) return false
-  if (kind === 'directory')
-    return (
-      parts[2] === nativeSessionId &&
-      (parts.length === 3 ||
-        (parts.length === 4 && ['subagents', 'tool-results'].includes(parts[3]!)))
-    )
-  if (parts.length === 3) return parts[2] === `${nativeSessionId}.jsonl`
-  if (parts.length !== 5 || parts[2] !== nativeSessionId) return false
-  if (parts[3] === 'subagents')
+  if (kind === 'file' && parts.length === 3) return parts[2] === `${nativeSessionId}.jsonl`
+  if (parts[2] !== nativeSessionId) return false
+  if (kind === 'directory' && parts.length === 3) return true
+  if (kind === 'directory' && parts.length === 4 && parts[3] === 'subagents') return true
+  if (kind === 'file' && parts.length === 5 && parts[3] === 'subagents')
     return /^agent-a(?:[A-Za-z0-9_-]{1,96}-)?[a-f0-9]{16}\.(jsonl|meta\.json)$/.test(parts[4]!)
-  if (parts[3] === 'tool-results') return /^toolu_[A-Za-z0-9_-]{1,128}\.(txt|json)$/.test(parts[4]!)
-  return false
+  return nativeToolArtifactPathAllowed(parts.slice(3).join('/'), kind)
 }
 export function verifyNativeCheckpoint(value: unknown): asserts value is NativeCheckpoint {
   validateRemote<NativeCheckpoint>(NativeCheckpointSchema, value)

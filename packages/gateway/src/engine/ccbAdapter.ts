@@ -1,3 +1,4 @@
+import { createGatewayRuntimeServices, type GatewayRuntimeServices } from '../gatewayRuntimeServices.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 /**
  * CcbAdapter — CCB(claude-code-best)底座的 EngineAdapter 实现。
@@ -431,14 +432,16 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   private _lastDroppedTailWarnAt = 0
 
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
+  private readonly runtime: GatewayRuntimeServices
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
+    this.runtime = createGatewayRuntimeServices(opts.runtime)
     // Hermetic one-shots (Auto-Dream, advisor) only run on CCB: the stock CLI
     // refuses them (OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC), so OC_CCB_OFFICIAL_CC
     // must not move them off CCB.
     this.harness = opts.hermeticNoTools ? 'ccb' : resolveCcbHarness(opts.harness)
     this.authorityEngine = opts.authorityEngine ?? 'ccb'
-    this.runner = runnerOverride ?? new SubprocessRunner({ ...opts, harness: this.harness })
+    this.runner = runnerOverride ?? new SubprocessRunner({ ...opts, runtime: this.runtime, harness: this.harness })
     // 常驻 stdout 路由(每 session 恰一个,替代旧 per-turn 'message' 闭包链)。
     // 'activity' 先于 parse emit —— 对位旧 handleMessage 里 timer.refresh() 在
     // parser.parse 之前的顺序,且对 parser 会忽略的消息(system init 等)同样计活。
@@ -589,6 +592,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       creditErrorEmitted: false,
     }
     ctx.creditGuard = new CreditBudgetGuard({
+      catalog: this.runtime.catalog,
       budgetFen: params.creditBudgetFen,
       modelId: () => this.model,
       // CCB egress settles at catalog price per request (proxyBilling); no
@@ -671,6 +675,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       if (stopped || this._activeTurn !== ctx) return
       try {
         const renewed = await refresh(turnKey, authority, {
+          renew: this.runtime.turnLease.renew,
           signal: controller.signal,
           onRetry: (err, failures) => {
             if (failures === 1 || failures % 10 === 0) {

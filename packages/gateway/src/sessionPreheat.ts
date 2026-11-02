@@ -1,7 +1,11 @@
-import { isHiddenSystemAgentId, parseSessionWorkspaceMode, type SessionWorkspaceMode } from '@openclaude/protocol'
+import {
+  type SessionWorkspaceMode,
+  isHiddenSystemAgentId,
+  parseSessionWorkspaceMode,
+} from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
-import { resolveLocalExecutionIfEnforced, localExecutionOverride } from './localExecution.js'
 import { resolveEngine } from './engine/registry.js'
+import { localExecutionOverride, resolveLocalExecutionIfEnforced } from './localExecution.js'
 import { _buildSafeCodexRouteOverride } from './routeOverrides.js'
 import type { PreheatPreparation } from './speculativePreheat.js'
 
@@ -39,13 +43,20 @@ export function validateEnginePreheatBody(parsed: unknown): EnginePreheatValidat
   }
   let modelId: string | undefined
   if (body.modelId !== undefined) {
-    if (typeof body.modelId !== 'string' || body.modelId.length === 0 || body.modelId.length > 128) {
+    if (
+      typeof body.modelId !== 'string' ||
+      body.modelId.length === 0 ||
+      body.modelId.length > 128
+    ) {
       return { ok: false, error: 'modelId invalid' }
     }
     modelId = body.modelId
   }
-  if (body.effortLevel !== undefined && body.effortLevel !== null &&
-    (typeof body.effortLevel !== 'string' || !/^[a-z]{1,16}$/.test(body.effortLevel))) {
+  if (
+    body.effortLevel !== undefined &&
+    body.effortLevel !== null &&
+    (typeof body.effortLevel !== 'string' || !/^[a-z]{1,16}$/.test(body.effortLevel))
+  ) {
     return { ok: false, error: 'effortLevel invalid' }
   }
   if (body.workspaceMode !== undefined && parseSessionWorkspaceMode(body.workspaceMode) === null) {
@@ -54,21 +65,39 @@ export function validateEnginePreheatBody(parsed: unknown): EnginePreheatValidat
   let codexRouteHint: { kind: 'official_oauth' } | undefined
   if (body.codexRouteHint !== undefined) {
     const hint = body.codexRouteHint
-    if (!hint || typeof hint !== 'object' || Array.isArray(hint) ||
-      Object.keys(hint).length !== 1 || (hint as { kind?: unknown }).kind !== 'official_oauth') {
+    if (
+      !hint ||
+      typeof hint !== 'object' ||
+      Array.isArray(hint) ||
+      Object.keys(hint).length !== 1 ||
+      (hint as { kind?: unknown }).kind !== 'official_oauth'
+    ) {
       return { ok: false, error: 'codexRouteHint invalid' }
     }
     codexRouteHint = { kind: 'official_oauth' }
   }
-  return { ok: true, payload: { sessionId, agentId, ...(modelId ? { modelId } : {}),
-    ...(codexRouteHint ? { codexRouteHint } : {}),
-    ...(body.effortLevel !== undefined ? { effortLevel: body.effortLevel as string | null } : {}),
-    ...(body.workspaceMode !== undefined ? { workspaceMode: body.workspaceMode as SessionWorkspaceMode } : {}) } }
+  return {
+    ok: true,
+    payload: {
+      sessionId,
+      agentId,
+      ...(modelId ? { modelId } : {}),
+      ...(codexRouteHint ? { codexRouteHint } : {}),
+      ...(body.effortLevel !== undefined ? { effortLevel: body.effortLevel as string | null } : {}),
+      ...(body.workspaceMode !== undefined
+        ? { workspaceMode: body.workspaceMode as SessionWorkspaceMode }
+        : {}),
+    },
+  }
 }
 
 export type SessionPreheatHost = {
-  log: { info: (msg: string, fields?: unknown) => void; warn: (msg: string, fields?: unknown, err?: unknown) => void }
+  log: {
+    info: (msg: string, fields?: unknown) => void
+    warn: (msg: string, fields?: unknown, err?: unknown) => void
+  }
   sessions: {
+    runtime?: import('./gatewayRuntimeServices.js').GatewayRuntimeServices
     getByKey: (key: string) => unknown
     getOrCreate: (opts: Record<string, unknown>) => Promise<unknown>
     preheatRunner: (session: unknown, preparation?: PreheatPreparation) => Promise<string>
@@ -82,7 +111,13 @@ export async function runSessionPreheat(
   host: SessionPreheatHost,
   sessId: string,
   userId: string,
-  row: { agentId?: string; modelId?: string; effortLevel?: string | null; workspaceMode?: SessionWorkspaceMode; codexRouteHint?: { kind: 'official_oauth' } },
+  row: {
+    agentId?: string
+    modelId?: string
+    effortLevel?: string | null
+    workspaceMode?: SessionWorkspaceMode
+    codexRouteHint?: { kind: 'official_oauth' }
+  },
 ): Promise<void> {
   const aid = row.agentId || 'main'
   if (isHiddenSystemAgentId(aid)) return
@@ -90,12 +125,15 @@ export async function runSessionPreheat(
   const cfg = await host._getAgentsConfig()
   const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
   const preExec = await resolveLocalExecutionIfEnforced({
+    catalog: host.sessions.runtime?.catalog,
     agent,
     kind: 'prewarm',
     ...(row.modelId ? { model: row.modelId } : {}),
     defaultModel: host.deps.config.defaults.model,
   })
-  const engine = preExec?.engine ?? resolveEngine(row.modelId ?? agent.model ?? host.deps.config.defaults.model, agent)
+  const engine =
+    preExec?.engine ??
+    resolveEngine(row.modelId ?? agent.model ?? host.deps.config.defaults.model, agent)
   let preparation: PreheatPreparation | undefined
   if (engine === 'codex') {
     if (!preExec || !row.codexRouteHint) {
@@ -103,12 +141,18 @@ export async function runSessionPreheat(
       return
     }
     const route = _buildSafeCodexRouteOverride({
-      agent, model: preExec.canonicalModel, authority: preExec,
-      rawRoute: row.codexRouteHint, officialRelayPort: host.deps.config.gateway?.port ?? 0,
+      agent,
+      model: preExec.canonicalModel,
+      authority: preExec,
+      rawRoute: row.codexRouteHint,
+      officialRelayPort: host.deps.config.gateway?.port ?? 0,
     })
     if (!route) return
-    preparation = { model: preExec.canonicalModel, codexRoute: route,
-      ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel ?? undefined } : {}) }
+    preparation = {
+      model: preExec.canonicalModel,
+      codexRoute: route,
+      ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel ?? undefined } : {}),
+    }
   }
   let session = host.sessions.getByKey(sessionKey)
   if (!session) {

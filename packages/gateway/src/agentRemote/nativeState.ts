@@ -33,6 +33,8 @@ import {
   nativeSessionPathAllowed,
   verifyNativeCheckpoint,
 } from '@openclaude/protocol/agentRemoteState'
+import { assertNativeWriterLock, createNativeTranscriptLines } from '@openclaude/storage'
+export { assertNativeWriterLock }
 
 type Fingerprint = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }
 const sameFile = (a: Fingerprint, b: Fingerprint) =>
@@ -125,59 +127,28 @@ function hashFile(path: string): { sha256: string; sizeBytes: number } {
   }
   return { sha256: hash.digest('hex'), sizeBytes }
 }
-/** The actual Node process must own the exclusive flock (not a TTL or JSON claim). */
-export function assertNativeWriterLock(path: string): void {
-  requireRemote(process.platform === 'linux', 'native-lock-platform')
-  const stat = lstatSync(path, { bigint: true })
-  requireRemote(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, 'native-lock-file')
-  const major = ((stat.dev & 0xfff00n) >> 8n) | ((stat.dev & 0xfffff00000000000n) >> 32n)
-  const minor = (stat.dev & 0xffn) | ((stat.dev & 0xffffff00000n) >> 12n)
-  const held = readFileSync('/proc/locks', 'utf8')
-    .split('\n')
-    .some((line) => {
-      const fields = line.trim().split(/\s+/)
-      if (fields[1] !== 'FLOCK' || fields[3] !== 'WRITE' || Number(fields[4]) !== process.pid)
-        return false
-      const identity = fields[5]?.split(':')
-      return (
-        identity?.length === 3 &&
-        BigInt(`0x${identity[0]}`) === major &&
-        BigInt(`0x${identity[1]}`) === minor &&
-        identity[2] === String(stat.ino)
-      )
-    })
-  requireRemote(held, 'native-lock-not-held')
-}
 function verifyTranscript(path: string, identity: NativeCheckpointIdentity, head: string): void {
   const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-  const decoder = new TextDecoder('utf-8', { fatal: true })
   const buffer = Buffer.alloc(65536)
-  let pending = ''
   let lastUuid = ''
   let records = 0
+  const lines = createNativeTranscriptLines((line) => {
+    if (!line.trim()) return
+    const value = JSON.parse(line)
+    requireRemote(
+      value && typeof value === 'object' && !Array.isArray(value),
+      'native-transcript-shape',
+    )
+    if (value.sessionId !== undefined)
+      requireRemote(value.sessionId === identity.nativeSessionId, 'native-session-mismatch')
+    if (typeof value.uuid === 'string') lastUuid = value.uuid
+    records++
+  })
   try {
     let bytes: number
-    while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
-      pending += decoder.decode(buffer.subarray(0, bytes), { stream: true })
-      requireRemote(Buffer.byteLength(pending, 'utf8') <= 64 * 1024 * 1024, 'native-line-bound')
-      let boundary: number
-      while ((boundary = pending.indexOf('\n')) >= 0) {
-        const line = pending.slice(0, boundary)
-        pending = pending.slice(boundary + 1)
-        if (!line.trim()) continue
-        const value = JSON.parse(line)
-        requireRemote(
-          value && typeof value === 'object' && !Array.isArray(value),
-          'native-transcript-shape',
-        )
-        if (value.sessionId !== undefined)
-          requireRemote(value.sessionId === identity.nativeSessionId, 'native-session-mismatch')
-        if (typeof value.uuid === 'string') lastUuid = value.uuid
-        records++
-      }
-    }
-    pending += decoder.decode()
-    requireRemote(!pending.trim() && records > 0 && lastUuid === head, 'native-boundary-mismatch')
+    while ((bytes = readSync(descriptor, buffer, 0, buffer.length, null)) > 0)
+      lines.push(buffer.subarray(0, bytes))
+    requireRemote(lines.complete() && records > 0 && lastUuid === head, 'native-boundary-mismatch')
   } finally {
     closeSync(descriptor)
   }
@@ -185,6 +156,9 @@ function verifyTranscript(path: string, identity: NativeCheckpointIdentity, head
 export interface NativeCheckpointRequest {
   identity: NativeCheckpointIdentity
   bindingRevision: number
+  checkpointCaptureId: string
+  nativeDeliveryWatermark: number
+  nativeWriterGeneration: number
   authority: NativeCheckpoint['authority']
   transcriptRelativePath: string
   createdAtMs: number
@@ -388,9 +362,12 @@ export class NativeStateRepository {
         request.authority.nativeHeadUuid,
       )
       const semantic: Omit<NativeCheckpoint, 'checkpointId'> = {
-        schemaVersion: 1,
+        schemaVersion: 3,
         ...request.identity,
         bindingRevision: request.bindingRevision,
+        checkpointCaptureId: request.checkpointCaptureId,
+        nativeDeliveryWatermark: request.nativeDeliveryWatermark,
+        nativeWriterGeneration: request.nativeWriterGeneration,
         authority: request.authority,
         createdAtMs: request.createdAtMs,
         transcriptRelativePath: request.transcriptRelativePath,
@@ -553,6 +530,9 @@ export class NativeStateRepository {
     const actualNames = this.filesFor({
       identity: expected,
       bindingRevision: manifest.bindingRevision,
+      checkpointCaptureId: manifest.checkpointCaptureId,
+      nativeDeliveryWatermark: manifest.nativeDeliveryWatermark,
+      nativeWriterGeneration: manifest.nativeWriterGeneration,
       authority: manifest.authority,
       transcriptRelativePath: manifest.transcriptRelativePath,
       createdAtMs: manifest.createdAtMs,

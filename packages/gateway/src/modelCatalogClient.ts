@@ -196,7 +196,19 @@ interface Snapshot {
   verifiedAt: number
 }
 
+/** Trusted transport selected by the composition root. It receives only the
+ * fixed catalog path and abort signal, never a container/provider credential. */
+export interface ModelCatalogTransport {
+  get(
+    path: string,
+    options: { signal: AbortSignal },
+  ): Promise<{
+    statusCode: number
+    body: AsyncIterable<Uint8Array>
+  }>
+}
 export interface ModelCatalogClientDeps {
+  transport?: ModelCatalogTransport
   env?: NodeJS.ProcessEnv
   fetcher?: typeof undiciRequest
   now?: () => number
@@ -224,6 +236,7 @@ export class ModelCatalogClient {
   private pricingUpgradeAttempted = false
 
   private readonly env: NodeJS.ProcessEnv
+  private readonly transport?: ModelCatalogTransport['get']
   private readonly fetcher: typeof undiciRequest
   private readonly now: () => number
   private readonly lkgPath: string
@@ -234,17 +247,19 @@ export class ModelCatalogClient {
   constructor(deps: ModelCatalogClientDeps = {}) {
     const sourceEnv = deps.env ?? process.env
     let resolvedEnv = sourceEnv
-    try {
-      const endpoint = resolveConnectorEndpoint(sourceEnv)
-      resolvedEnv = {
-        ...sourceEnv,
-        [ENV_MASTER_URL]: endpoint.masterBaseUrl,
-        [ENV_CONTAINER_TOKEN]: endpoint.containerToken,
+    this.transport = deps.transport?.get.bind(deps.transport)
+    if (!this.transport)
+      try {
+        const endpoint = resolveConnectorEndpoint(sourceEnv)
+        resolvedEnv = {
+          ...sourceEnv,
+          [ENV_MASTER_URL]: endpoint.masterBaseUrl,
+          [ENV_CONTAINER_TOKEN]: endpoint.containerToken,
+        }
+      } catch {
+        // Personal/non-container paths intentionally remain unconfigured. The caller
+        // still fails closed through `configured`/ModelCatalogUnavailableError.
       }
-    } catch {
-      // Personal/non-container paths intentionally remain unconfigured. The caller
-      // still fails closed through `configured`/ModelCatalogUnavailableError.
-    }
     this.env = resolvedEnv
     this.fetcher = deps.fetcher ?? undiciRequest
     this.now = deps.now ?? Date.now
@@ -256,7 +271,7 @@ export class ModelCatalogClient {
 
   /** 装配就绪?(env 不齐 = 个人版 / 非托管容器 → 调用方走本地既有判定,不经本客户端。) */
   get configured(): boolean {
-    return Boolean(this.env[ENV_MASTER_URL] && this.env[ENV_CONTAINER_TOKEN])
+    return Boolean(this.transport || (this.env[ENV_MASTER_URL] && this.env[ENV_CONTAINER_TOKEN]))
   }
 
   /**
@@ -464,17 +479,20 @@ export class ModelCatalogClient {
   }
 
   private async getJson(path: string): Promise<unknown> {
-    const base = (this.env[ENV_MASTER_URL] ?? '').replace(/\/+$/, '')
-    const bearer = this.env[ENV_CONTAINER_TOKEN] ?? ''
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), this.timeoutMs)
     try {
-      const res = await this.fetcher(`${base}${path}`, {
-        method: 'GET',
-        headers: { authorization: `Bearer ${bearer}` },
-        signal: controller.signal,
-      })
-      const text = await readBoundedText(res.body, MAX_BODY_BYTES)
+      const res = this.transport
+        ? await abortableCatalog(
+            this.transport(path, { signal: controller.signal }),
+            controller.signal,
+          )
+        : await this.fetcher(`${(this.env[ENV_MASTER_URL] ?? '').replace(/\/+$/, '')}${path}`, {
+            method: 'GET',
+            headers: { authorization: `Bearer ${this.env[ENV_CONTAINER_TOKEN] ?? ''}` },
+            signal: controller.signal,
+          })
+      const text = await readBoundedText(res.body, MAX_BODY_BYTES, controller.signal)
       if (res.statusCode !== 200) {
         throw new ModelCatalogUnavailableError(`master returned ${res.statusCode}`)
       }
@@ -791,17 +809,52 @@ function defaultLkgPath(env: NodeJS.ProcessEnv): string {
   return join(home, 'model-catalog-lkg.json')
 }
 
+function abortableCatalog<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error('catalog request aborted'))
+    signal.addEventListener('abort', aborted, { once: true })
+    pending.then(
+      (value) => {
+        signal.removeEventListener('abort', aborted)
+        if (signal.aborted) aborted()
+        else resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', aborted)
+        reject(error)
+      },
+    )
+    if (signal.aborted) aborted()
+  })
+}
 async function readBoundedText(
   body: { on: (ev: string, cb: (chunk: unknown) => void) => void } | AsyncIterable<Uint8Array>,
   maxBytes: number,
+  signal: AbortSignal,
 ): Promise<string> {
+  const iterator = (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
   const chunks: Buffer[] = []
   let total = 0
-  for await (const chunk of body as AsyncIterable<Uint8Array>) {
-    const buf = Buffer.from(chunk)
-    total += buf.length
-    if (total > maxBytes) throw new Error('catalog response too large')
-    chunks.push(buf)
+  let complete = false
+  try {
+    for (;;) {
+      const item = await abortableCatalog(Promise.resolve(iterator.next()), signal)
+      if (item.done) {
+        complete = true
+        break
+      }
+      const buf = Buffer.from(item.value)
+      total += buf.length
+      if (total > maxBytes) throw new Error('catalog response too large')
+      chunks.push(buf)
+    }
+    return Buffer.concat(chunks).toString('utf8')
+  } finally {
+    // A transport's stuck next()/return() cannot hold the caller's deadline.
+    // Still request cancellation and observe cleanup rejection without waiting.
+    if (!complete)
+      try {
+        void Promise.resolve(iterator.return?.()).catch(() => {})
+      } catch {}
   }
-  return Buffer.concat(chunks).toString('utf8')
 }

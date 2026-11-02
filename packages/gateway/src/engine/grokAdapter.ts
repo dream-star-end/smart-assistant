@@ -920,6 +920,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const input = promptText(params.input)
     try {
       const platform = await buildPromptContext({
+        catalog: this.opts.runtime?.catalog,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -1203,6 +1204,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined) return
     const fen = await runningCostFenForUsage({
+      catalog: this.opts.runtime?.catalog,
       modelId: this.currentModel,
       usage: {
         inputTokens: ctx.lastUsage.inputTokens,

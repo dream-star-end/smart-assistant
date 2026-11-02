@@ -1298,7 +1298,7 @@ export async function handleCollaborationConfig(
   }
   const catalogOptions = async () => {
     try {
-      const view = await getLocalCatalogView()
+      const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
       const proven = provenNow()
       return listProvenAdvisorModels({
         catalog: view.models,

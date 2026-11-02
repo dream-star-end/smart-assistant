@@ -242,6 +242,7 @@ export function stripBaselineRestrictions(text: string): string {
 }
 
 export interface PromptSlotContext {
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   /** Frozen by the submit lock; profile consent is independent of IUI switches. */
   promptPolicy?: PromptPrivacyPolicy
 
@@ -692,7 +693,7 @@ function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null
   if (ctx.delegateModelCatalog === null) return DELEGATE_MODEL_SECTION_UNAVAILABLE
   if (ctx.delegateModelCatalog) return renderDelegateModelSection(ctx.delegateModelCatalog)
   try {
-    const peek = getModelCatalogClient().peekView()
+    const peek = (ctx.catalog ?? getModelCatalogClient()).peekView()
     if (!peek) return DELEGATE_MODEL_SECTION_UNAVAILABLE
     return renderDelegateModelSection({
       models: peek.view.models,

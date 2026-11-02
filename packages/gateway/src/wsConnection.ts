@@ -855,6 +855,7 @@ export async function autoResumeFromHello(
           // → 不套 codex 真值表。投影拉不到 → 抛 → 下方既有 catch:跳过预热(不回落 baked),
           // 真正的 turn 到来时带 envelope 走 §2 判定。
           const preExec = await resolveLocalExecutionIfEnforced({
+            catalog: this.sessions.runtime?.catalog,
             agent,
             kind: 'prewarm',
             defaultModel: this.deps.config.defaults.model,

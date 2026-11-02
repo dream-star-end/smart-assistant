@@ -692,6 +692,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       // (归一 / 可用性 / engine 全取投影;拉不到 → 抛 → 本次 webhook 执行失败并记日志,
       // 不回落 baked)。flag 未开 → undefined,沿用上面的 baked 合成降级,零变化。
       const _whExec = await resolveLocalExecutionIfEnforced({
+        catalog: this.sessions.runtime?.catalog,
         agent,
         kind: 'synthetic',
         model: _whRoute?.model,
@@ -804,7 +805,7 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       },
     })
     this._taskboardPatrol = new PatrolEngine({
-      preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model })(stages),
+      preflightStages: (stages) => createTaskboardPreflight({ getAgentsConfig: () => this._getAgentsConfig(), defaultModel: this.deps.config.defaults.model, catalog: this.sessions.runtime.catalog })(stages),
       getDb: () => getTaskboardDb(),
       delegate: (input) => this._runTaskboardDelegate(input),
       log: (msg, extra) => this.log.info(msg, extra),
@@ -1192,6 +1193,7 @@ export async function bootAutoResume(this: GatewayLifecycleHost): Promise<void> 
     // 到来时会重新判定)。绝不回落 baked spawn。
     try {
       const preExec = await resolveLocalExecutionIfEnforced({
+        catalog: this.sessions.runtime?.catalog,
         agent,
         kind: 'prewarm',
         defaultModel: this.deps.config.defaults.model,

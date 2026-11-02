@@ -1,3 +1,5 @@
+import { createGatewayRuntimeServices } from '../gatewayRuntimeServices.js'
+import { RenewTurnLeaseError } from '../masterTurnLease.js'
 import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import { promptPrivacyFingerprint } from '../promptPrivacyPolicy.js'
 import { encodeUpstreamRetryHint, TURN_LEASE_RENEW_PATH, PLATFORM_PROMPT_SLOTS_PATH } from '@openclaude/protocol';
@@ -306,11 +308,11 @@ async function makeLeaseMasterFixture(t: TestContext, status: 403 | 409) {
   process.env.OPENCLAUDE_V3_MASTER_BASE_URL = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'test-token';
   process.env.OC_USER_ID = '1';
-  return { close, assertCalls: () => {
+  return { close, assertCalls: (expectedRenewals = 1) => {
     assert.equal(protocolError, undefined);
     assert.equal(identityReads, 1, 'submit must cross the normal authenticated identity gate');
     assert.equal(privacyReads, 1, 'submit must fetch the normal session-scoped privacy policy exactly once');
-    assert.equal(renewalRequests, 1, 'retry must reach the distinct lease endpoint exactly once');
+    assert.equal(renewalRequests, expectedRenewals, 'retry uses the selected lease transport');
   } };
 }
 
@@ -484,6 +486,110 @@ describe('long-task authority interruption keeps paid progress', () => {
       });
     }
   }
+  test('injected retry renewal without default HTTP transport preserves paid progress and ACK barrier', { timeout: 10_000 }, async (t) => {
+    const hasProgress = true;
+    let renewCalls = 0;
+    const captured = makeCapturingSink();
+    let entered!: () => void;
+    const sinkEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let acknowledge!: () => void;
+    const ack = new Promise<void>((resolve) => { acknowledge = resolve; });
+    captured.sink.persistOrQueue = async (payload) => {
+      captured.payloads.push(payload);
+      entered();
+      await ack;
+      return { ok: true };
+    };
+    setV3MasterSinkSingleton(captured.sink);
+    t.after(() => { setV3MasterSinkSingleton(null); });
+    const master = await makeLeaseMasterFixture(t, 403);
+    let submission: Promise<void> | undefined;
+    let session: AgentSession | undefined;
+    let runner: FakeCcbRunner | undefined;
+    const sm = new SessionManager(makeConfigStub(), {
+      ...createGatewayRuntimeServices(),
+      turnLease: { async renew(_turnKey, lease, options) {
+        renewCalls++;
+        assert.equal(lease, 'old-lease');
+        assert.equal(options?.signal, session?._externalTurnAbort?.signal);
+        throw new RenewTurnLeaseError(403, 'TURN_LEASE_REVOKED');
+      } },
+    });
+    let cleaning: Promise<void> | undefined;
+    const cleanup = () => cleaning ??= (async () => {
+      try {
+        await drainTurnTestCleanup((async () => {
+          acknowledge();
+          session?._externalTurnAbort?.abort(new Error('test cleanup'));
+          runner?.emitExit({ code: null, signal: 'SIGTERM', crashed: false });
+          await session?.runner.shutdown();
+          await submission?.catch(() => {}); // the phase/terminal awaits retain the actual failure
+          await sm.awaitPendingPersistence();
+        })());
+      } finally {
+        setV3MasterSinkSingleton(null);
+        await master.close();
+      }
+    })();
+    t.after(cleanup);
+    try {
+      (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+      runner = new FakeCcbRunner((r) => setImmediate(() => {
+        if (hasProgress) {
+          r.text('已完成前半部分');
+          r.thinking('此前分析');
+          r.toolPair('retained-step', 'Read', '已读取内容');
+          r.plan({ blockId: 'retained-plan', text: '继续后半部分', partial: false });
+        }
+        r.result({
+          is_error: true,
+          subtype: 'error_during_execution',
+          result: 'Selected model is at capacity. Please try a different model.',
+          errorClass: 'model_capacity',
+        });
+      }));
+      session = makeSession(runner, { channel: 'webchat', userId: '1' });
+      const events: SessionStreamEvent[] = [];
+      const authority = { authorityEnvelope: 'original', leaseEnvelope: 'old-lease', executionDescriptor: {} } as TurnModelAuthority;
+      let finished = false;
+      submission = sm.submit(session, '完成任务', (event) => events.push(event),
+        undefined, undefined, 'req-renewal-revoked', 'trace-renewal-revoked', undefined,
+        { modelAuthority: authority }).then(() => { finished = true; });
+      await waitForTurnTestStage(sinkEntered, submission, t, 'terminal persistence ACK barrier');
+      assert.equal(finished, false, 'submit remains pending until master ACK');
+      assert.equal(events.some((event) => event.kind === 'error'), false, 'terminal error waits for master ACK');
+      assert.equal(runner.submittedInputs.length, 1, 'revoked retry never resubmits the engine');
+      assert.equal(runner.traceId, 'trace-renewal-revoked');
+      assert.equal(runner.promptPolicyFingerprint,
+        promptPrivacyFingerprint({ schemaVersion: 1, profile: null }, session.peerId));
+      acknowledge();
+      await submission;
+      await sm.awaitPendingPersistence();
+      assert.equal(finished, true);
+      master.assertCalls(0);
+      assert.equal(renewCalls, 1);
+      assert.equal(captured.payloads.length, 1, 'all attempts share one terminal tape');
+      const payload = captured.payloads[0]!;
+      assert.ok(payload.turnIndex > 0);
+      assert.equal(payload.turnIndex, session.turns);
+      assert.equal(payload.usage?.turn, payload.turnIndex);
+      assert.equal(payload.status, 'crashed');
+      assert.equal(payload.errorCode, 'MODEL_AUTHORITY_EXPIRED');
+      assert.equal(payload.waiveReason, hasProgress ? undefined : 'platform_authority_expired');
+      assert.equal(payload.text, hasProgress ? '已完成前半部分' : '');
+      if (hasProgress) {
+        assert.equal(payload.thinkingText, '此前分析');
+        assert.equal(payload.tools?.[0]?.blockId, 'retained-step');
+        assert.equal(payload.structuredBlocks?.[0]?.blockId, 'retained-plan');
+      }
+      assert.ok(payload.runtimeEvents?.some((event) =>
+        (event.payload as { type?: string }).type === 'terminal_error'));
+      assert.equal(events.filter((event) => event.kind === 'error').length, 1);
+      assert.doesNotMatch(JSON.stringify(payload), /private authority detail|old-lease|TypeError/);
+    } finally {
+      await cleanup();
+    }
+  });
   test('successful retry refresh followed by synchronous submit failure rejects without hanging', { timeout: 10_000 }, async () => {
     const oldBase = process.env.OPENCLAUDE_V3_MASTER_BASE_URL;
     const oldToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;

@@ -2,6 +2,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   Gateway,
+  createGatewayRuntimeServices,
   log,
   makeV3WechatOutboundAdapter,
   makeV3QqbotOutboundAdapter,
@@ -235,6 +236,6 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     console.log('[cli] v3 qqbot outbound adapter wired (container mode)')
   }
 
-  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, webAssetsPool, channelFactories, commercial })
+  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, webAssetsPool, channelFactories, commercial, runtime: createGatewayRuntimeServices() })
   await gw.start()
 }

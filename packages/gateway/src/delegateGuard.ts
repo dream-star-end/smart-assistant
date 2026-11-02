@@ -173,7 +173,7 @@ export function _liveMainSessionForClient(this: DelegateGuardHost, sessionId: st
 export async function _catalogEngineForModel(this: DelegateGuardHost, modelId: string | undefined): Promise<string | undefined> {
   if (!modelId) return undefined
   try {
-    const view = await getLocalCatalogView()
+    const view = await (this.sessions.runtime?.catalog.getRoutingView() ?? getLocalCatalogView())
     const canonical = view.canonicalize(modelId)
     return view.models.find((row) => row.modelId === canonical || row.modelId === modelId)?.engine
   } catch {

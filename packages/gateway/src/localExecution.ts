@@ -6,22 +6,22 @@
  */
 import { join, resolve } from 'node:path'
 import {
-  isCodexEngineModel,
-  isGrokEngineModel,
-  isCursorEngineModel,
-  isZcodeEngineModel,
   isAntigravityEngineModel,
+  isCodexEngineModel,
+  isCursorEngineModel,
+  isGrokEngineModel,
+  isZcodeEngineModel,
 } from '@openclaude/protocol'
-import { isHostRoutableStaticModel } from './hostStaticProviders.js'
 import type { AgentDef } from '@openclaude/storage'
-import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
-import {
-  LocalExecutionRejected,
-  getLocalCatalogView,
-  type LocalCatalogView,
-} from './modelCatalogClient.js'
 import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
 import { ALLOWED_INBOUND_MODELS, assertKnownExplicitDelegateModel } from './delegatePolicy.js'
+import { isHostRoutableStaticModel } from './hostStaticProviders.js'
+import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthority.js'
+import {
+  type LocalCatalogView,
+  LocalExecutionRejected,
+  getLocalCatalogView,
+} from './modelCatalogClient.js'
 import type { LiveRunnerSessionView } from './server.js'
 
 /**
@@ -225,6 +225,7 @@ export function decideLocalExecution(args: {
  * 和 `submit(model)` —— 两处同源,避免 spawn 用 A、路由字段用 B。
  */
 export async function resolveLocalExecutionIfEnforced(args: {
+  catalog?: import('./gatewayRuntimeServices.js').CatalogRuntimePort
   agent: Pick<AgentDef, 'id' | 'model' | 'provider'>
   kind: LocalTurnKind
   model?: string
@@ -249,7 +250,7 @@ export async function resolveLocalExecutionIfEnforced(args: {
     assertKnownExplicitDelegateModel(explicitModel)
   }
   if (!isModelAuthorityRequired(env)) return undefined
-  const view = await getLocalCatalogView()
+  const view = await (args.catalog ? args.catalog.getRoutingView() : getLocalCatalogView())
   const liveSessionModel = args.resolveLiveSessionModel?.() ?? args.liveSessionModel
   const liveSessionSkipReason = args.resolveLiveSessionSkipReason?.() ?? args.liveSessionSkipReason
   return decideLocalExecution({ ...args, liveSessionModel, liveSessionSkipReason, view, env })

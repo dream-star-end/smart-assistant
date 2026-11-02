@@ -1948,6 +1948,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         fallback: 'node-tsx',
       })
       const platformResult = await buildPromptContext({
+        catalog: this.opts.runtime?.catalog,
         agentId: this.opts.agentId,
         sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
@@ -2362,6 +2363,7 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined || !ctx.usage) return
     const fen = await runningCostFenForUsage({
+      catalog: this.opts.runtime?.catalog,
       modelId: this.currentModel,
       usage: {
         inputTokens: ctx.usage.input_tokens ?? 0,

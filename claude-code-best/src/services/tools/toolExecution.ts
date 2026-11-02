@@ -132,6 +132,7 @@ import {
   runPreToolUseHooks,
 } from './toolHooks.js'
 import { isSkillLearningEnabled } from '../skillLearning/featureCheck.js'
+import { prepareNativeToolRoute, unavailableNativeToolUpdate, type PreparedNativeToolRoute } from './nativeToolRouting.js'
 
 // Cached import promise for the skill-learning wrapper — paid once, not per call.
 let _skillLearningWrapperCache:
@@ -369,6 +370,7 @@ export async function* runToolUse(
   assistantMessage: AssistantMessage,
   canUseTool: CanUseToolFn,
   toolUseContext: ToolUseContext,
+  preparedRoute?: PreparedNativeToolRoute,
 ): AsyncGenerator<MessageUpdateLazy, void> {
   const toolName = toolUse.name
   // OpenClaude CCB advisor hermetic profile only. Do not treat empty tools
@@ -383,6 +385,16 @@ export async function* runToolUse(
     if (!toolUseContext.abortController.signal.aborted) {
       toolUseContext.abortController.abort('advisor_hermetic_no_tools')
     }
+    return
+  }
+  // Redirect the WHOLE pipeline before lookup, validation, permission or hooks.
+  const route = preparedRoute ?? await prepareNativeToolRoute(toolUse, toolUseContext)
+  if (route?.owner === 'host') {
+    yield* route.execute({ block: toolUse, assistantMessage, context: toolUseContext })
+    return
+  }
+  if (route?.owner === 'unavailable') {
+    yield unavailableNativeToolUpdate(toolUse, assistantMessage)
     return
   }
   // First try to find in the available tools (what the model sees)
@@ -551,7 +563,7 @@ function streamedCheckPermissionsAndCallTool(
   // Ideally the progress reporting and tool call reporting would
   // be via separate mechanisms.
   const stream = new Stream<MessageUpdateLazy>()
-  checkPermissionsAndCallTool(
+  const execute = () => checkPermissionsAndCallTool(
     tool,
     toolUseID,
     input,
@@ -599,6 +611,13 @@ function streamedCheckPermissionsAndCallTool(
       })
     },
   )
+  const execution = toolUseContext.nativeToolLifecycle
+    ? toolUseContext.nativeToolLifecycle.track(
+        { toolUseId: toolUseID, name: tool.name, input },
+        toolUseContext.abortController.signal, execute,
+      )
+    : execute()
+  execution
     .then(results => {
       for (const result of results) {
         stream.enqueue(result)
@@ -1268,7 +1287,7 @@ async function checkPermissionsAndCallTool(
     //
     // The invoke lambda is shared between the flag-on (wrapper) and flag-off
     // (direct) paths so that post-call processing is never duplicated.
-    const invokeToolCall = () =>
+    const callTool = () =>
       tool.call(
         callInput,
         {
@@ -1285,6 +1304,14 @@ async function checkPermissionsAndCallTool(
           })
         },
       )
+    const invokeToolCall = () => {
+      const lifecycle = toolUseContext.nativeToolLifecycle
+      return lifecycle
+        ? lifecycle.invoke({
+            toolUseId: toolUseID, name: tool.name, input: callInput,
+          }, toolUseContext.abortController.signal, callTool)
+        : callTool()
+    }
     // Fast-path: skip wrapper entirely when skill-learning is disabled to
     // avoid even the cached-import resolution on the hot path.
     const result = isSkillLearningEnabled()

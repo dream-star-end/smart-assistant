@@ -76,6 +76,7 @@ export async function handleAgentMessage(this: AgentMessageHost, req: IncomingMe
   let _iaExec: LocalExecutionDecision | undefined
   try {
     _iaExec = await resolveLocalExecutionIfEnforced({
+      catalog: this.sessions.runtime?.catalog,
       agent: targetAgent,
       kind: 'synthetic',
       model: _iaRoute?.model,

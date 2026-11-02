@@ -1,3 +1,4 @@
+import { createGatewayRuntimeServices, type GatewayRuntimeServices } from './gatewayRuntimeServices.js'
 import type { PreheatPreparation } from './speculativePreheat.js'
 import { renderHistoricalContextJsonPrompt } from './historicalContextPrompt.js'
 import { isBoxApiModel } from '@openclaude/protocol'
@@ -1336,7 +1337,9 @@ export class SessionManager {
     this.resumeStore.path = path
   }
 
-  constructor(public config: OpenClaudeConfig) {
+  public readonly runtime: GatewayRuntimeServices
+  constructor(public config: OpenClaudeConfig, runtime?: GatewayRuntimeServices) {
+    this.runtime = createGatewayRuntimeServices(runtime)
     this._loadResumeMap()
   }
 
