@@ -115,7 +115,7 @@ describe("终态错误卡说人话", () => {
       resolveInterruptedContinuation: () => interruptedContinuationTarget(rows, error, "s-quota-empty")?.user,
     });
     expect(within(card).queryByRole("button", { name: "从断点继续" })).toBeNull();
-    fireEvent.click(within(card).getByRole("button", { name: "重试", exact: true }));
+    fireEvent.click(within(card).getByRole("button", { name: /^重试$/ }));
     expect(onRetrySend).toHaveBeenCalledWith(source);
     expect(onRegenerate).not.toHaveBeenCalled();
   });
@@ -136,7 +136,7 @@ describe("终态错误卡说人话", () => {
       resolveRetryTarget: () => source,
       resolveInterruptedContinuation: () => interruptedContinuationTarget(rows, error, "s-quota-tool")?.user,
     });
-    expect(within(card).queryByRole("button", { name: "重试", exact: true })).toBeNull();
+    expect(within(card).queryByRole("button", { name: /^重试$/ })).toBeNull();
     expect(within(card).queryByRole("button", { name: "重新尝试" })).toBeNull();
     fireEvent.click(within(card).getByRole("button", { name: "从断点继续" }));
     expect(onContinueInterrupted).toHaveBeenCalledWith(error);

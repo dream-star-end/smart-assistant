@@ -84,6 +84,13 @@ const SCENARIOS: readonly Scenario[] = [
     why: '429 透明自动续跑,遵守共享预算：首次加最多10次重试；5xx仍保留三次熔断',
   },
   {
+    code: 'quota_exhausted',
+    sample:
+      'API Error: 503 {"error":{"code":"BOX_UPSTREAM_QUOTA_EXHAUSTED","message":"quota exhausted"}}',
+    attempts: 1,
+    why: '明确耗尽的上游额度不会靠同轮自动重试恢复；保留用户手动重试或断点续接，自动恢复关闭',
+  },
+  {
     code: 'model_capacity',
     // OCV5-407: the real Codex text. It also says "try a different model",
     // which used to send it to model_not_available (no retry, red card).
