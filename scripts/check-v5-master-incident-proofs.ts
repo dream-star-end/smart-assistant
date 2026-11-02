@@ -11,6 +11,10 @@
  *   TEST_DATABASE_URL=postgres://…@127.0.0.1:…/…_test npx --no-install tsx scripts/check-v5-master-incident-proofs.ts
  */
 import { spawnSync } from 'node:child_process'
+import assert from 'node:assert/strict'
+import { scopeBoxExecToProfile } from '../packages/commercial/src/http/proxy/boxProfileExec.js'
+import { BoxProfileHealth } from '../packages/commercial/src/http/proxy/boxProfileHealth.js'
+import { isBoxLaunchRequest } from '../packages/commercial/src/http/proxy/boxClaudeProfile.js'
 
 type Proof = { incident: string; slug: string; file: string; db: boolean; cases: readonly string[] }
 
@@ -150,9 +154,48 @@ export function judge(proof: Proof, tap: string, status: number | null): string[
   return out
 }
 
-function main(): void {
+/** Real wrapper fault injection: no test-module import and no model/Box launch. */
+async function profileAttributionProof(): Promise<string> {
+  const nonce = 'a'.repeat(24)
+  const cwd = `/tmp/ocv5-289-run-${nonce}`
+  const rejected = '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n'
+  const bytes = Buffer.from(rejected)
+  const envelope = JSON.stringify({ offset: bytes.length, data: bytes.toString('base64') })
+  let launches = 0
+  let reads = 0
+  for (const kind of ['unknown', 'missing_nonce', 'raw_stdout', 'known_owner'] as const) {
+    const health = new BoxProfileHealth(() => 1_000)
+    if (kind === 'known_owner') health.noteRun(nonce, '7:a')
+    const request = { command: '/p', args: ['--read', ...(kind === 'missing_nonce' ? [] : [cwd]), '0', '65536'],
+      cwd: '/tmp', environment: {} }
+    const response = { stdout: kind === 'raw_stdout' ? rejected : envelope,
+      stderrBytes: 0, exitCode: 0 as const }
+    const seen: unknown[] = []
+    const chunks: string[] = []
+    const inner: Parameters<typeof scopeBoxExecToProfile>[0] = { run: async (input, opts) => {
+      if (isBoxLaunchRequest(input)) { launches++; throw new Error('proof must never launch a model') }
+      reads++
+      seen.push(input)
+      opts?.onStdout?.(response.stdout)
+      return response
+    } }
+    const exec = scopeBoxExecToProfile(inner, { key: '7:default', profile: 'default', health })
+    assert.equal(await exec.run(request, { timeoutMs: 1000, maxResponseBytes: 65_536,
+      onStdout: (chunk) => chunks.push(chunk) }), response)
+    assert.equal(seen[0], request, 'read command and byte offsets must pass through unchanged')
+    assert.deepEqual(chunks, [response.stdout], 'caller receives exact stdout')
+    assert.equal(health.get('7:default'), undefined, `${kind}: observer health must not be polluted`)
+    if (kind === 'known_owner') assert.equal(health.cooldownActive('7:a'), true)
+    else assert.equal(health.get('7:a'), undefined)
+  }
+  assert.equal(reads, 4, 'all real scopedExec fault injections must be reached')
+  assert.equal(launches, 0)
+  return '[inc-20261102-box-profile-observer-attribution] PASS — unknown observers never poison login health; known owners remain exact; zero launches'
+}
+
+async function main(): Promise<void> {
   const dsn = assertTestDsn(process.env.TEST_DATABASE_URL)
-  const lines: string[] = []
+  const lines: string[] = [await profileAttributionProof()]
   for (const proof of MASTER_INCIDENT_PROOFS) {
     const { DATABASE_URL: _db, NODE_OPTIONS: _opts, TEST_DATABASE_URL: _test, ...base } = process.env
     const env: NodeJS.ProcessEnv = proof.db ? { ...base, TEST_DATABASE_URL: dsn } : base
@@ -166,4 +209,7 @@ function main(): void {
   console.log(`[master-incident-proofs] PASS ${lines.length} cases`)
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main()
+if (import.meta.url === `file://${process.argv[1]}`) void main().catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})
