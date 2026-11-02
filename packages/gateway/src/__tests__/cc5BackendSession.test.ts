@@ -136,6 +136,27 @@ test('direct warm submit cannot drop the signed backend or substitute another op
   assert.equal(calls, 0)
 })
 
+test('initial CC5 privacy configuration preserves a cold port but still shuts down a warm runner', async () => {
+  for (const warm of [false, true]) {
+    const f = fixture()
+    const session = await f.sm.getOrCreate(f.remote)
+    const runner = runners.get(session.runner)!
+    // Real runners have no applied privacy fingerprint before their first spawn.
+    Object.defineProperty(runner, 'promptPolicyFingerprint', { value: undefined })
+    runner.isRunning = warm
+    let calls = 0
+    f.m.runOneTurnWithRetry = async () => {
+      assert.equal(runner.shutdowns, warm ? 1 : 0)
+      assert.equal(runner.isRunning, false)
+      calls++
+    }
+    await f.sm.submit(session, 'synthetic', () => {}, undefined, undefined,
+      undefined, undefined, undefined, { modelAuthority: f.authority })
+    assert.equal(calls, 1)
+    assert.equal(runner.shutdowns, warm ? 1 : 0)
+  }
+})
+
 test('native backend does not enter automatic retry or Box idle follow-ups under the normal Sonnet model', async () => {
   const f = fixture()
   const session = await f.sm.getOrCreate(f.remote)

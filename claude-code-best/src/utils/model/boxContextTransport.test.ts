@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
 import { APIConnectionTimeoutError } from '@anthropic-ai/sdk'
 import { sendWithBoxContextTransport } from './boxContextTransport.js'
+import { stripExcessMediaItems } from '../../services/api/mediaItems.js'
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 type Body = { model: string; max_tokens: number; metadata: { session_id: string }; messages: unknown[] }
@@ -186,4 +187,101 @@ test('nonstream fallback total deadline includes preparation and bounds every st
       expect(remaining).toBeGreaterThan(0)
       expect(remaining).toBeLessThan(5000)
     }, { timeoutMs: 5000 })
+})
+
+describe('media trimming preserves tool results', () => {
+  const image = (id: number) => ({ type: 'image', source: {
+    type: 'base64', media_type: 'image/png', data: Buffer.from(`image-${id}`).toString('base64'),
+  } })
+  const document = { type: 'document', source: {
+    type: 'base64', media_type: 'application/pdf', data: 'cGRm',
+  } }
+  const message = (content: unknown): any => ({ type: 'user', message: { role: 'user', content } })
+  const result = (id: string, content: unknown) => ({ type: 'tool_result', tool_use_id: id, content })
+  const tail = (count: number) => message(Array.from({ length: count }, (_, i) => image(i + 10)))
+  const removed = [{ type: 'text', text:
+    '[Historical media removed to fit the request media limit. Re-read the source if needed.]' }]
+  const contents = (messages: ReturnType<typeof stripExcessMediaItems>): any[] =>
+    messages.map(item => item.message!.content)
+
+  test('zero, 99 and exactly 100 media items retain the original request', () => {
+    for (const count of [0, 99, 100]) {
+      const messages = [message([result('toolu_keep', [
+        { type: 'text', text: 'keep every byte\nα' },
+        ...Array.from({ length: count }, (_, i) => image(i)),
+      ])])]
+      expect(stripExcessMediaItems(messages, 100)).toBe(messages)
+    }
+  })
+
+  test('101 items replace only the oldest emptied result and retain the latest 100', () => {
+    const newest = tail(100)
+    const messages = [message([result('toolu_old', [image(0)])]), newest]
+    const out = stripExcessMediaItems(messages, 100)
+    expect(contents(out)[0]).toEqual([result('toolu_old', removed)])
+    expect(out[1]).toBe(newest)
+    expect(messages[0].message.content[0].content).toEqual([image(0)])
+  })
+
+  test('two adjacent emptied image and document results keep their pairing and error fields', () => {
+    const first = { ...result('toolu_first', [image(0)]), is_error: true, marker: 'preserve' }
+    const second = result('toolu_second', [document])
+    const messages = [message([first, second]), tail(100)]
+    expect(contents(stripExcessMediaItems(messages, 100))[0]).toEqual([
+      { ...first, content: removed }, { ...second, content: removed },
+    ])
+  })
+
+  test('partial trimming preserves remaining media order and the document data', () => {
+    const remaining = [document, image(2)]
+    const messages = [message([result('toolu_partial', [image(0), ...remaining])]), tail(98)]
+    expect(contents(stripExcessMediaItems(messages, 100))[0]).toEqual([
+      result('toolu_partial', remaining),
+    ])
+  })
+
+  test('mixed text and media keeps exact text without inserting a replacement', () => {
+    const text = { type: 'text', text: 'source: /original file\nretain α\tbytes  ' }
+    const messages = [message([result('toolu_mixed', [image(0), text, document])]), tail(100)]
+    expect(contents(stripExcessMediaItems(messages, 100))[0]).toEqual([
+      result('toolu_mixed', [text]),
+    ])
+  })
+
+  test('top-level and nested media share the same budget without changing other blocks', () => {
+    const text = { type: 'text', text: 'keep this top-level text' }
+    const messages = [message([text, result('toolu_nested', [image(0)]), document]), tail(99)]
+    const out = stripExcessMediaItems(messages, 100)
+    expect(contents(out)[0]).toEqual([text, result('toolu_nested', removed), document])
+    expect(out[1]).toBe(messages[1])
+  })
+
+  test('frozen history is untouched and retries or replays do not accumulate replacements', () => {
+    const messages = [message([result('toolu_old', [image(0)])]), tail(100)]
+    const before = JSON.stringify(messages)
+    const freeze = (value: unknown): void => {
+      if (value && typeof value === 'object') {
+        for (const child of Object.values(value)) freeze(child)
+        Object.freeze(value)
+      }
+    }
+    freeze(messages)
+    const out = stripExcessMediaItems(messages, 100)
+    expect(stripExcessMediaItems(out, 100)).toBe(out)
+    expect(stripExcessMediaItems(messages, 100)).toEqual(out)
+    expect(JSON.stringify(messages)).toBe(before)
+  })
+
+  test('pre-existing empty results, strings and unknown blocks are not repaired or hidden', () => {
+    const empty = result('toolu_empty', [])
+    const string = result('toolu_string', 'actual upstream error')
+    const unknown = { type: 'unsupported', original: true }
+    const mixed = result('toolu_unknown', [image(0), unknown])
+    const messages = [message([empty, string, mixed]), tail(100)]
+    const out = contents(stripExcessMediaItems(messages, 100))[0]
+    expect(out).toEqual([empty, string, result('toolu_unknown', [unknown])])
+    expect(out[0]).toBe(empty)
+    expect(out[1]).toBe(string)
+    expect(out[2].content[0]).toBe(unknown)
+  })
 })
