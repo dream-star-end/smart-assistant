@@ -3,7 +3,7 @@ import { createUnattestedContainerRecycler } from "./ws/recycleUnattestedContain
 import { containerLinkEnabled } from "./ws/containerLinkPolicy.js";
 import { recoveryDecisionFrame } from './ws/recoveryPresentation.js';
 import { configurePluginCatalog } from './plugins/catalogPolicy.js';
-import { configureModelAvailability } from './billing/modelAvailability.js';
+import { configureModelAvailability, isModelAvailable } from './billing/modelAvailability.js';
 import { makeSystemRuntimeStatusRead } from './system-assistant/runtimeStatusRead.js'
 import { makeCcbTranscriptRestoreHandler, CCB_TRANSCRIPT_RESTORE_PATH } from './http/internalCcbTranscriptRestore.js';
 import { makeCcbTranscriptRestoreReader } from './db/ccbTranscriptRestoreReader.js';
@@ -1921,6 +1921,9 @@ export async function registerCommercial(
      */
     origin?: "bridge" | "delegate";
   }) => {
+    if (!isModelAvailable(modelId)) {
+      return { kind: "unavailable" as const, reason: "model temporarily unavailable" };
+    }
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
     // generic slot reaper, or Master restart cannot make a live route vanish

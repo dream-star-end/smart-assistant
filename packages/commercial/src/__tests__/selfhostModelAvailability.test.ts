@@ -1,10 +1,16 @@
+import ts from "typescript";
+import { runInNewContext } from "node:vm";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { hashSecret, type ContainerIdentityRepo } from "../auth/containerIdentity.js";
+import { makeGrokRelayHandler, GROK_RELAY_PREFIX } from "../http/internalGrokRelay.js";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { FlavorIdentity } from "../flavor/assertFlavor.js";
-import { configureModelAvailability, modelAvailableForIdentity } from "../billing/modelAvailability.js";
+import { configureModelAvailability, isModelAvailable, modelAvailableForIdentity } from "../billing/modelAvailability.js";
 import { ModelCatalogSnapshot, type ModelCatalogEntry, type ModelCatalogPricing } from "../billing/modelCatalog.js";
 import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { canUseModel } from "../billing/authzModels.js";
@@ -109,4 +115,61 @@ test("OCV5-713: missing or malformed release policy refuses startup", () => {
   }
   assert.throws(() => configureModelAvailability({ ...identity("selfhost"), manifestPath: "/nonexistent/flavor.json" }), /ENOENT/);
   configure(false);
+});
+
+
+test("OCV5-713: the actual shared allocator rejects local delegate before touching the pool", async () => {
+  configure(false);
+  const source = ts.createSourceFile("index.ts", readFileSync(new URL("../index.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  let allocator: ts.Expression | undefined;
+  function visit(node: ts.Node): void {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "allocateGrokRelayRoute") allocator = node.initializer;
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  assert.ok(allocator);
+  // Execute the real production arrow, stripping only TypeScript types. A missing
+  // early guard reaches one of these effect dependencies and makes the test fail.
+  const js = ts.transpileModule(`(${allocator.getText(source)})`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  let poolCalls = 0;
+  const unexpected = async () => { poolCalls++; throw new Error("paused model touched account pool"); };
+  const allocate = runInNewContext(js, { isModelAvailable, expireSettledGrokRouteLeases: unexpected,
+    listActiveGrokRouteLeases: unexpected, listEnabledGroupsForModel: unexpected, scheduler: { pick: unexpected } });
+  for (const modelId of ids.slice(0, 2)) {
+    const result = await allocate({ containerId: 11, userId: 42n, modelId, origin: "delegate" });
+    assert.equal(result.kind, "unavailable");
+  }
+  assert.equal(poolCalls, 0);
+});
+
+test("OCV5-713: a valid pre-existing relay route cannot read credentials or call upstream", async () => {
+  configure(false);
+  const secret = "b".repeat(64);
+  const routeToken = "a".repeat(64);
+  const ctx = { hostUuid: "test-host", boundIp: "172.30.0.11" };
+  const repo: ContainerIdentityRepo = { async findActiveByHostAndBoundIp() {
+    return { id: 11, user_id: 42, bound_ip: ctx.boundIp, host_uuid: ctx.hostUuid, secret_hash: hashSecret(secret) };
+  } };
+  let effects = 0;
+  const unexpected = async () => { effects++; throw new Error("paused relay touched upstream"); };
+  const handler = makeGrokRelayHandler({ identityRepo: repo,
+    resolveContext: async () => ({ modelId: "grok-build", accountId: 53n, slotId: "test-slot" }),
+    freshToken: unexpected, resolveDispatcher: unexpected, requestFn: unexpected as never,
+    recordStatus: unexpected,
+    renewSlot: () => { effects++; return true; },
+  });
+  const server = createServer((req, res) => { void handler(req, res, ctx); });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${routeToken}/v1/chat/completions`, {
+      method: "POST", headers: { authorization: `Bearer oc-v3.11.${secret}` }, body: "{}",
+    });
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).error.code, "GROK_MODEL_UNAVAILABLE");
+    assert.equal(effects, 0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

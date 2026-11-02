@@ -11,11 +11,14 @@ startup. False removes grok-build and grok-build-fast from the effective active
 catalog and legacy pricing availability. Anonymous, signed-in, admin and granted
 users cannot see or authorize them; aliases cannot issue an execution descriptor.
 Raw admin catalog records stay intact. Other products ignore this selfhost file.
-Existing user containers cannot bypass the master's authorization or egress gate.
+The shared allocator rejects browser and container-local delegate minting before
+any pool access. A valid old relay route is rejected before lease renewal, token
+loading or upstream access. Release cleanup remains available. Existing user
+containers cannot bypass these gates.
 
 The release C3 reads the same candidate release file. While false, it runs
 **gpt-6-luna (codex) + deepseek-v4-flash (ccb)**, each with the existing two-turn
-continuation and live-cost checks. Grok overrides and a leaked Grok catalog row
+continuation and live forwarding. Grok overrides and a leaked Grok catalog row
 fail C3. Two different engines remain mandatory. C1/C2, prewarm, G1/S1, budgets,
 inline-request checks and every other gate remain unchanged. True restores the
 original Grok+DeepSeek C3 matrix. This is not a skipped or automatically passing C3.
