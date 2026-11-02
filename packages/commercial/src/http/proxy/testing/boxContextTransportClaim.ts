@@ -132,5 +132,10 @@ export async function assertLegacyContextClaim(db: Db, body: ProxyBody, options:
     canonicalModel: body.model, canonicalBody: body, prepared }),
   (e: unknown) => e instanceof BoxDurableJournalError && e.code === "BOX_CALL_AMBIGUOUS");
   assert.equal(await beforeMoney(), money, "stage and claim do not debit or settle prior successful usage");
+  // This fixture already proved every table resolves to its own TEMP schema.
+  // Release only its seeded rows so a later proof can use the same account.
+  const removed = await db.query("DELETE FROM request_finalize_journal WHERE user_id=$1 AND request_id=ANY($2::text[])",
+    [uid.toString(), [owner, child]]);
+  assert.equal(removed.rowCount, 2, "only this proof's seeded owner and child are removed");
 }
 
