@@ -9771,7 +9771,7 @@
       "severity": "P1",
       "symptom": "商业 uid4 的流中首错被非流式回退 BOX_REPLAY_NOT_FOUND 覆盖，清理后无法定位原始拒绝。首错按精确运行身份有界持久化，只读回退保留原错误；成功或在途结果优先，歧义明确拒绝，不新增模型请求或重复结算。",
       "rootFixCommit": "4f1f8d23",
-      "coverageCommits": ["40cae4f8"],
+      "coverageCommits": ["40cae4f8", "8d10816b"],
       "regressions": [
         {
           "layer": "unit",
