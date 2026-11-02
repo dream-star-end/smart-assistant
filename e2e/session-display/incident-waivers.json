@@ -160,9 +160,9 @@
     },
     {
       "commit": "793c4f0b15928a59eaaedab3f8ba6194d1fb496a",
-      "reason": "The model-unavailable card said the model was retired, but the same code also covers an upstream at-capacity reply. Only the card copy changed; retry policy and classification are unchanged.",
-      "approvedBy": "user 2026-10-02 改下吧（模型不可用文案）",
-      "expiresAt": "2026-11-01"
+      "reason": "The model-unavailable card said the model was retired, but the same code also covers an upstream at-capacity reply. Only the card copy changed; retry policy and classification are unchanged. Renewal through 2026-11-09 gives the immutable, already-published copy-only commit a bounded seven-day window for the reviewed PR #1344 personal release and the next nightly sync; the expiry gate remains in force.",
+      "approvedBy": "user 2026-10-02 改下吧（模型不可用文案）; user 2026-11-02 11:12 CST card reply: renew this expired waiver, then review/merge PR #1344 and ship selfhost; approval recorded in /workspace/codex/prewarm-ship/CODEX-START.md (OCV5-710)",
+      "expiresAt": "2026-11-09"
     },
     {
       "commit": "ac5f476106a00b0d4d33fcf3f0773b1592fe1571",
