@@ -199,3 +199,53 @@ test("OCV5-496: exact-SHA approval skips only Go and keeps other verdicts", () =
   assert.doesNotMatch(smokeFailed, /经用户批准跳过|RUN .*stop-before-start/);
   assert.match(run(sha, sha, 0, 1, 1), /RUN \/s\/v5-stop-before-start-contract\.mjs\nrc=1/);
 });
+
+
+test("OCV5-713: one release policy withdraws Grok and restores the complete two-engine C3", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-713-policy-"));
+  const policy = join(dir, "policy.json");
+  const env = { V5_SELFHOST_MODEL_POLICY_FILE: policy, V5_CONTRACT_COST: "live" };
+  const available = [{ id: "gpt-6-luna", engine: "codex" }, catalog[1]];
+  writeFileSync(policy, JSON.stringify({ grokEnabled: false }));
+  const paused = parseOptions(env);
+  assert.deepEqual(paused.models, ["gpt-6-luna", "deepseek-v4-flash"]);
+  assert.equal(paused.cost, "live");
+  assert.deepEqual(engineMatrix(paused.models, available, paused), available);
+  assert.throws(() => engineMatrix(paused.models, [available[0]], paused), /catalog engine/);
+  assert.throws(() => engineMatrix([available[0].id], available, paused), /two distinct engines/);
+  assert.throws(() => engineMatrix(paused.models, [...available, catalog[0]], paused), /Withdrawn Grok/);
+  for (const id of ["grok-build", "grok-build-fast"]) {
+    assert.throws(() => parseOptions({ ...env, V5_CONTRACT_MODELS: `${id},deepseek-v4-flash` }), /Grok is withdrawn/);
+    assert.throws(() => parseOptions({ ...env, V5_CONTRACT_MODEL_ID: id }), /Grok is withdrawn/);
+  }
+  writeFileSync(policy, JSON.stringify({ grokEnabled: true }));
+  const restored = parseOptions(env);
+  assert.deepEqual(restored.models, ["grok-build", "deepseek-v4-flash"]);
+  assert.deepEqual(engineMatrix(restored.models, catalog, restored), catalog);
+  for (const value of [null, {}, { grokEnabled: "false" }, { grokEnabled: 0 }]) {
+    writeFileSync(policy, JSON.stringify(value));
+    assert.throws(() => parseOptions(env), /boolean grokEnabled/);
+  }
+  assert.throws(() => parseOptions({ V5_SELFHOST_MODEL_POLICY_FILE: join(dir, "missing") }));
+});
+
+test("OCV5-713: the gate pins candidate policy for prewarm and C3, not an ambient override", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-713-gate-"));
+  const pw = join(dir, "pw");
+  writeFileSync(pw, "x");
+  const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
+  const out = execFileSync("bash", ["-c", `${fn}
+    SCRIPT_DIR=/s; V5_PORT=1; V5_SELFHOST_MODEL_POLICY_FILE=/ambient-must-not-win
+    node(){ echo "RUN $1 policy=$V5_SELFHOST_MODEL_POLICY_FILE"; }
+    user_contract_gate /candidate; echo rc=$?
+  `], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.match(out, /prewarm\.mjs policy=\/candidate\/deploy\/v5-selfhost\/model-availability\.json/);
+  assert.match(out, /smoke\.mjs policy=\/candidate\/deploy\/v5-selfhost\/model-availability\.json/);
+  assert.match(out, /go-cache/);
+  assert.match(out, /stop-before-start/);
+  assert.match(out, /rc=0/);
+  const smoke = readFileSync(new URL("../v5-user-contract-smoke.mjs", import.meta.url), "utf8");
+  assert.match(smoke, /engineMatrix\(options.models, latest, \{ grokEnabled: options.grokEnabled \}\)/);
+  assert.match(smoke, /for \(const \{ id, engine \} of matrix\)/);
+  assert.match(smoke, /runContinuationTurns\(page, probe, \{ model: id, engine, catalog: latest, cost: options.cost \}\)/);
+});

@@ -51,15 +51,16 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const { WebSocketServer } = createRequire(import.meta.url)('ws')
-const fixtureHtml = `<!doctype html><body><div id="app"><button id="login">登录</button></div>
+const fixtureHtml = (grokEnabled) => `<!doctype html><body><div id="app"><button id="login">登录</button></div>
 <script>
 const app=document.querySelector('#app');let model='glm-5.3',peer=0,ws;
 document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="email"><input type="password"><button>登录</button></form>';document.querySelector('form').onsubmit=async(e)=>{e.preventDefault();if(localStorage.getItem('oc_auth_hint'))throw Error('unexpected hint');await fetch('/api/auth/login',{method:'POST',body:'{}'});localStorage.setItem('oc_auth_hint','1');await fetch('/api/public/models');ws=new WebSocket('ws://'+location.host+'/ws/user-chat-bridge');ws.onmessage=(e)=>{const f=JSON.parse(e.data);if(f.type==='outbound.message'){const row=document.createElement('div');row.dataset.testid='assistant-row';row.innerHTML='<div class="prose"></div>';row.firstChild.textContent=f.text;document.querySelector('#answer').append(row)}};app.innerHTML='<button id="new">新建会话</button><div id="chat"></div>';document.querySelector('#new').onclick=newSession;};};
-function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button><button data-model-id="grok-build">grok-build</button><button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
+function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button>${grokEnabled ? '<button data-model-id="grok-build">grok-build</button>' : ''}<button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
 function bindModels(){for(const b of document.querySelectorAll('[data-model-id]'))b.onclick=()=>{model=b.dataset.modelId;document.querySelector('#model').textContent=model;document.querySelector('#menu').innerHTML='';};}
 </script>`
+for (const grokEnabled of [false, true])
 for (const cost of ['dry', 'live'])
-  test(`R2 synthetic runner C1-C3 ${cost} forwarding and timings`, async () => {
+  test(`R2 synthetic runner C1-C3 grok=${grokEnabled} ${cost} forwarding and timings`, async () => {
     const calls = []
     const server = createServer((req, res) => {
       res.setHeader(
@@ -72,15 +73,15 @@ for (const cost of ['dry', 'live'])
         res.end(
           JSON.stringify({
             models: [
-              // Mirrors the smoke defaults the selfhost deploy gate uses: C2 gpt-6-luna, C3 grok-build + deepseek-v4-flash.
+              // The fixture follows each explicit release policy, including restoration.
               { id: 'gpt-6-luna', engine: 'codex' },
               { id: 'grok-build', engine: 'grok' },
               { id: 'deepseek-v4-flash', engine: 'ccb' },
-            ],
+            ].filter((model) => grokEnabled || model.engine !== 'grok'),
           }),
         )
       else if (req.url.startsWith('/api/')) res.end('{}')
-      else res.end(fixtureHtml)
+      else res.end(fixtureHtml(grokEnabled))
     })
     const wss = new WebSocketServer({ server })
     // Per-session memory like a real backend: the C3 continuation turn (OCV5-405) must
@@ -105,6 +106,7 @@ for (const cost of ['dry', 'live'])
     )
     const dir = mkdtempSync(join(tmpdir(), 'r2-contract-fixture-'))
     writeFileSync(join(dir, 'password'), 'fixture-only', { mode: 0o600 })
+    writeFileSync(join(dir, 'model-availability.json'), JSON.stringify({ grokEnabled }))
     try {
       await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
       const child = spawn(
@@ -116,6 +118,9 @@ for (const cost of ['dry', 'live'])
             V5_E2E_BASE: `http://127.0.0.1:${server.address().port}`,
             V5_CANARY_PASSWORD_FILE: join(dir, 'password'),
             V5_CONTRACT_COST: cost,
+            V5_SELFHOST_MODEL_POLICY_FILE: join(dir, 'model-availability.json'),
+            V5_CONTRACT_MODEL_ID: 'gpt-6-luna',
+            V5_CONTRACT_MODELS: undefined,
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         },
@@ -129,7 +134,11 @@ for (const cost of ['dry', 'live'])
       assert.match(output, /# timings_ms \[\d+,\d+,\d+\]/)
       assert.deepEqual(
         calls.map((f) => f.model),
-        cost === 'dry' ? [] : ['grok-build', 'grok-build', 'deepseek-v4-flash', 'deepseek-v4-flash'],
+        cost === 'dry' ? [] : [
+          grokEnabled ? 'grok-build' : 'gpt-6-luna',
+          grokEnabled ? 'grok-build' : 'gpt-6-luna',
+          'deepseek-v4-flash', 'deepseek-v4-flash',
+        ],
       )
       if (cost === 'live') {
         // Each model's two turns share one session; the two models use different sessions.
@@ -144,7 +153,7 @@ for (const cost of ['dry', 'live'])
           'INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it',
         )
       }
-      console.log(`# synthetic-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
+      console.log(`# synthetic-grok=${grokEnabled}-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
     } finally {
       for (const ws of wss.clients) ws.terminate()
       await new Promise((resolve) => wss.close(resolve))

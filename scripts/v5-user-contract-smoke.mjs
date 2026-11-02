@@ -61,7 +61,7 @@ try {
     // Responses can include anonymous then authenticated catalogs. The last
     // occurrence is the UI's newest view, not an invented model→engine table.
     const latest = [...new Map(catalog.map((m) => [m.id, m])).values()];
-    const matrix = engineMatrix(options.models, latest);
+    const matrix = engineMatrix(options.models, latest, { grokEnabled: options.grokEnabled });
     for (const { id, engine } of matrix) {
       await newSession(page);
       await selectJourneyModel(page, id);

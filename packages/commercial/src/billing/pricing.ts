@@ -19,6 +19,7 @@
  */
 
 import { Client } from "pg";
+import { isModelAvailable } from "./modelAvailability.js";
 import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
@@ -343,7 +344,8 @@ export class PricingCache {
    * 自动受益,避免逐个 caller 改且漂移。
    */
   get(modelId: string): ModelPricing | null {
-    return this.map.get(canonicalizeModelId(modelId)) ?? null;
+    const pricing = this.map.get(canonicalizeModelId(modelId)) ?? null;
+    return pricing && !isModelAvailable(pricing.model_id) ? { ...pricing, enabled: false } : pricing;
   }
 
   /** 测试用:直接注入 pricing(跳过 DB)。 */
@@ -393,7 +395,7 @@ export class PricingCache {
    */
   listPublic(): PublicModel[] {
     return [...this.map.values()]
-      .filter((p) => p.enabled && p.visibility === "public" && !isBoxGptWebModel(p.model_id))
+      .filter((p) => p.enabled && isModelAvailable(p.model_id) && p.visibility === "public" && !isBoxGptWebModel(p.model_id))
       .sort((a, b) => a.sort_order - b.sort_order)
       .map(this.toPublicModel);
   }
@@ -424,7 +426,7 @@ export class PricingCache {
   }): PublicModel[] {
     return [...this.map.values()]
       .filter((p) => {
-        if (!p.enabled) return false;
+        if (!p.enabled || !isModelAvailable(p.model_id)) return false;
         if (isBoxGptWebModel(p.model_id)) {
           if (!isBoxGptWebOwnerUid(args.uid)) return false;
           if (!args.grantedModelIds.has(p.model_id)) return false;
