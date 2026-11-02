@@ -16,7 +16,7 @@ priority: 9
 | Word/报告/公文 | `oc-docx`(Markdown/Quarto→docx,公式原生) | document-writing |
 | Excel/数据表 | `oc-xlsx` + openpyxl/pandas/duckdb | office-spreadsheet |
 | PDF | `oc-pdf`(Typst) / reportlab | office-pdf |
-| PPT 汇报 | `oc-slides --deck deck.json -o out.pptx` | research-slides |
+| PPT 汇报 | `oc-slides --deck deck.json -o /home/agent/.openclaude/generated/out.pptx` | research-slides |
 | PDF/PPTX/XLSX 交付检查 | `oc-artifact-qa inspect` + L0 `oc-artifact-qa deliver --input <文件>` | 对应文档 skill |
 | 配图/头图/语音 | `mmx image|speech` | minimax-media |
 | 读网页/长文档/Office 文件 | `oc-web extract <url>` / `oc-web parse <文件>` | web-context |
@@ -54,7 +54,7 @@ from datetime import datetime
 cal = Calendar(); ev = Event()
 ev.add("summary", "项目评审会"); ev.add("dtstart", datetime(2026,7,3,14,0)); ev.add("dtend", datetime(2026,7,3,15,0))
 cal.add_component(ev)
-open("/home/agent/.openclaude/邀请.ics","wb").write(cal.to_ical())
+open("/home/agent/.openclaude/generated/邀请.ics","wb").write(cal.to_ical())
 ```
 > 真正收发邮件需用户授权自己的邮箱(插件方向),当前仅生成草稿/附件/.ics,不代登录任何账号。
 
@@ -63,10 +63,10 @@ open("/home/agent/.openclaude/邀请.ics","wb").write(cal.to_ical())
 
 ## 交付纪律
 
-- **产文件、只打印 FINAL 绝对路径、单独成行**（如 `/home/agent/.openclaude/generated/周报.docx`）。禁止放进 fenced code，禁止发明 URL/端口。
+- 所有交付文件必须写入 `/home/agent/.openclaude/generated/<文件名>`；回复中必须逐个单独列出每个主要交付文件的完整 FINAL 绝对路径，每个路径单独成行（如 `/home/agent/.openclaude/generated/周报.docx` 和 `/home/agent/.openclaude/generated/周报.pdf`），同时交付 Word + PDF 时分别列出 `.docx` 与 `.pdf`，供独立预览和下载。禁止放进 fenced code，禁止发明 URL/端口。
 - 每个要交给用户的 office/pdf 必须先过 L0：`oc-artifact-qa deliver --input <文件>`。`VERDICT` 不是 PASS 就禁止打印该路径（GATE=shadow 时仍写 sidecar，enforce 时不得交付）。
 - PDF/PPTX/XLSX 必须再过对应 skill 的 `oc-artifact-qa inspect` 结构与渲染闭环;不能只验证扩展名或复述“已检查”。
-- ≥2 个交付文件先 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2`，只打印 zip 路径。
+- 仅当批量文件较多（例如 ≥5 个构件）或用户明确要求压缩包时，才可用 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2 ...` 额外附带汇总 `.zip` 路径；压缩包不能替代各主要文件的独立路径。
 - 一次任务尽量**闭环交付**(数据→分析→成品),必要时同时给 Word + PDF 两种格式。
 - 事实性内容(数字、人名、单位、日期、决策、责任人)**忠实于用户提供的信息**,缺失标"待明确",绝不臆造。
 - 合规:不代登录/爬取任何需要账号或付费墙的内容;不装/用 AGPL/GPL 传染性许可库。

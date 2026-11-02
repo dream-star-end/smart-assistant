@@ -1,6 +1,17 @@
 import * as assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
-import { buildAgentsSlot, selectPromptBlocks } from '../promptSlots.js'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { after, describe, it } from 'node:test'
+
+const home = mkdtempSync(join(tmpdir(), 'oc-engine-blocks-'))
+process.env.OPENCLAUDE_HOME = home
+for (const key of ['OPENCLAUDE_PLATFORM_PROMPTS_DIR', 'OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN']) {
+  delete process.env[key]
+}
+writeFileSync(join(home, 'agents.yaml'), 'agents:\n  - id: main\n  - id: researcher\n    displayName: Researcher\n    source: marketplace\n    model: fixture-model\n    provider: ccb\n')
+after(() => rmSync(home, { recursive: true, force: true }))
+const { buildAgentsSlot, selectPromptBlocks, _platformPromptFallbacks } = await import('../promptSlots.js')
 
 const text = [
   'head',
@@ -77,4 +88,56 @@ describe('engine / channel blocks in platform text (OCV5-382)', () => {
     }
     assert.doesNotMatch(slot.content, /<!-- oc-(engine|channel):/)
   })
+})
+
+
+describe('known platform CLI engines', () => {
+  for (const provider of ['grok', 'antigravity', 'zcode'] as const) {
+    it(`${provider} keeps common rules without another engine's tool instructions`, async () => {
+      assert.equal(selectPromptBlocks(text, provider, 'webchat'), 'head\n\n## Next\n')
+      const slot = await buildAgentsSlot({
+        agentId: 'main', provider,
+        sessionKey: 'agent:main:webchat:dm:rf-prompts',
+        delegateModelCatalog: false,
+      })
+      assert.doesNotMatch(slot.content, /AskUserQuestion|request_user_input|present_options|oc-memory delegate|<!-- oc-engine:/)
+      assert.match(slot.content, /# Platform capabilities/)
+      assert.match(slot.content, /## 需要用户决策时/)
+      assert.match(slot.content, /oc-lit/)
+      assert.match(slot.content, /Researcher/)
+      assert.match(slot.content, /\*\*同步\*\*: MCP `delegate_task`/)
+    })
+  }
+})
+
+describe('existing engines retain the pre-change assembled bytes', () => {
+  const before = JSON.parse(readFileSync(new URL('./fixtures/platform-engine-before.json', import.meta.url), 'utf8')) as {
+    baseCommit: string; outputs: Record<string, string>
+  }
+  // Captured by running buildAgentsSlot from baseCommit before the filtering change.
+  // Normalize only the deliberately replaced literature/OCR line, then compare every byte.
+  for (const provider of ['ccb', 'codex', 'cursor'] as const) {
+    it(`${provider} matches its frozen snapshot, apart from the literature/OCR line`, async () => {
+      const expected = before.outputs[provider]!
+      const oldLine = expected.split('\n').find(line => line.includes('scansci-pdf <子命令>'))!
+      const newLine = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+        .split('\n').find(line => line.includes('学术论文检索与元数据'))!
+      assert.ok(oldLine && newLine)
+      const slot = await buildAgentsSlot({
+        agentId: 'main', provider,
+        sessionKey: 'agent:main:webchat:dm:rf-prompts',
+        delegateModelCatalog: false,
+      })
+      assert.ok(slot.content.includes(newLine))
+      assert.deepEqual(Buffer.from(slot.content.replace(newLine, oldLine)), Buffer.from(expected))
+    })
+  }
+  for (const [provider, engine] of [['codex-native', 'codex'], ['claude-subscription', 'ccb']] as const) {
+    it(`${provider} still selects ${engine} rules`, async () => {
+      const context = { agentId: 'main', sessionKey: 'agent:main:webchat:dm:rf-prompts', delegateModelCatalog: false as const }
+      const alias = await buildAgentsSlot({ ...context, provider })
+      const primary = await buildAgentsSlot({ ...context, provider: engine })
+      assert.equal(alias.content, primary.content)
+    })
+  }
 })

@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { test } from 'node:test'
+
+const baseline = new URL('../../agent-sandbox/ccb-baseline/', import.meta.url)
+const read = (path: string) => readFileSync(new URL(path, baseline), 'utf8')
+
+test('ordinary user rules describe the current runtime without repository train rules', () => {
+  const claude = read('CLAUDE.md')
+  assert.doesNotMatch(
+    claude,
+    /## 效率契约|--with-dist|host cat|\*\*T[012]\*\*|完整列车|底层模型是 Claude|OpenClaude 商业版/,
+  )
+  assert.match(claude, /当前会话运行环境/)
+  assert.doesNotMatch(claude, /claudeai\.chat/)
+  assert.match(claude, /充值配额 → 平台管理员 \/ 平台官方渠道/)
+  for (const file of ['CLAUDE.md', 'AGENTS.md']) {
+    assert.doesNotMatch(read(file), /## 需要用户决策时|不看代码、不翻上下文也能拍板/)
+  }
+})
+
+test('system-info uses the current skill inventory and persistent memory paths', () => {
+  const skill = read('skills/system-info/SKILL.md')
+  assert.doesNotMatch(skill, /底层模型是 Claude|8 个内置技能|OpenClaude 商业版/)
+  assert.match(skill, /当前会话运行环境/)
+  assert.doesNotMatch(skill, /claudeai\.chat/)
+  assert.match(skill, /账号 \/ 账单 \/ 充值 \/ 订阅 → 平台管理员 \/ 平台官方渠道/)
+  assert.ok(skill.includes('/home/agent/.openclaude/skills/'))
+  assert.ok(skill.includes('/run/oc/claude-config/skills/'))
+  assert.ok(skill.includes('/home/agent/.openclaude/agents/<agentId>/memory/'))
+  assert.ok(skill.includes('/home/agent/.openclaude/agents/<agentId>/MEMORY.md'))
+  assert.ok(skill.includes('/home/agent/.openclaude/user.md'))
+  assert.doesNotMatch(skill, /find \/home\/agent\/\.openclaude\/agents -type f -path/)
+  assert.doesNotMatch(skill, /find \/run\/oc\/claude-config\/projects -type f -path/)
+  assert.match(skill, /OPENCLAUDE_AGENT_ID:-\$\{OC_AGENT_ID:-main\}/)
+  assert.match(skill, /find "\$d\/memory" -type f -name '\*\.md' -print/)
+  assert.match(skill, /find "\$d\/memory" -type f -name '\*\.md' -delete/)
+  assert.match(skill, /rm -f -- "\$d\/MEMORY\.md" "\/home\/agent\/\.openclaude\/user\.md"/)
+  assert.match(skill, /用户再次明确.*删除/)
+  assert.match(skill, /两步之间 AI 必须停下等用户确认/)
+})

@@ -80,7 +80,7 @@
 
 ## 网页/文档提取 · 论文下载 (CLI)
 
-读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 `oc-web extract <url>` / `oc-web parse <绝对路径>`;学术论文检索与下载 → `scansci-pdf <子命令>`(search/download/citation 等)。细节见 `skill_view("web-context")` 与 `skill_view("scansci-pdf")`。
+读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 `oc-web extract <url>` / `oc-web parse <绝对路径>`;学术论文检索与元数据 → `oc-lit`;引文核验 → `oc-cite`;PDF 解析与扫描件 OCR → `oc-ingest` / `oc-ocr`。细节见 `skill_view("web-context")`、`skill_view("oc-lit")` 与 `skill_view("oc-ingest")`。
 <!-- oc-baseline-restrict:start -->
 安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。
 <!-- oc-baseline-restrict:end -->

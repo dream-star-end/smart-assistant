@@ -137,9 +137,11 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 # L0 FAIL → 同一生成命令最多再跑 1 次（换输出文件名）；第二次仍 FAIL → 把 failures[].message 告诉用户，禁止再打印该路径
 ```
 
-只打印 FINAL 绝对路径，单独成行；禁止放进 fenced code；禁止发明 URL/端口/token。不要把 `.deliver.json` sidecar 当交付物。≥2 个交付文件先 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2`，只打印 zip 路径。
+所有交付给用户的文件必须写入 `/home/agent/.openclaude/generated/<文件名>`。回复中必须逐个单独列出每个主要交付文件的完整 FINAL 绝对路径，每个路径单独成行；同时交付 Word + PDF 时分别列出 `.docx` 与 `.pdf`，供独立预览和下载。禁止放进 fenced code；禁止发明 URL/端口/token。不要把 `.deliver.json` sidecar 当交付物。
 
-最终只交付清理后的 `.docx`（以及用户需要的源文件）。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
+仅当批量文件较多（例如 ≥5 个构件）或用户明确要求压缩包时，才可用 `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- f1 f2 ...` 额外附带汇总 `.zip` 路径；压缩包不能替代各主要文件的独立路径。
+
+Word 交付必须使用清理后的 `.docx`；同时交付 PDF 或用户需要的源文件时也逐个给出路径。不要把 QA PNG/JPEG 当正式附件，除非用户明确要求。
 
 ## 工具调用纪律
 

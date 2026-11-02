@@ -14,9 +14,9 @@ priority: 7
 报告、方案、合同、通知这类"结构化文档 → PDF",写 Markdown 再一条命令:
 
 ```bash
-oc-pdf report.md -o /home/agent/.openclaude/方案.pdf
+oc-pdf report.md -o /home/agent/.openclaude/generated/方案.pdf
 # 换字体(默认 Noto Serif CJK SC):
-oc-pdf --mainfont "Noto Sans CJK SC" notice.md -o notice.pdf
+oc-pdf --mainfont "Noto Sans CJK SC" notice.md -o /home/agent/.openclaude/generated/notice.pdf
 ```
 
 支持标题/列表/表格/代码/LaTeX 数学 `$...$`。同一份 Markdown 可分别产 Word(`oc-docx`)和 PDF(`oc-pdf`),交付两种格式。
@@ -31,7 +31,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 pdfmetrics.registerFont(TTFont("WQY", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", subfontIndex=0))
-c = canvas.Canvas("/home/agent/.openclaude/发票.pdf", pagesize=A4)
+c = canvas.Canvas("/home/agent/.openclaude/generated/发票.pdf", pagesize=A4)
 c.setFont("WQY", 20); c.drawString(72, 760, "收 据")
 c.setFont("WQY", 12); c.drawString(72, 720, "今收到:甲方  金额:¥1,000.00")
 c.showPage(); c.save()
@@ -49,7 +49,7 @@ from pypdf import PdfReader, PdfWriter
 w = PdfWriter()
 for f in ["a.pdf", "b.pdf"]:
     for p in PdfReader(f).pages: w.add_page(p)
-with open("/home/agent/.openclaude/合并.pdf", "wb") as fo: w.write(fo)
+with open("/home/agent/.openclaude/generated/合并.pdf", "wb") as fo: w.write(fo)
 ```
 
 ## 4. 解析已有 PDF + 按页码溯源
@@ -68,7 +68,7 @@ with pdfplumber.open("上传.pdf") as pdf:
 
 快速把整份 PDF/Office 文件转 Markdown 再理解,用 `oc-web parse <文件>`(markitdown)。总结时明确区分"原文页码支撑的事实"与"你的推断",不要臆造页码。
 
-> 扫描件/图片型 PDF 的 OCR(PaddleOCR/ocrmypdf)属 P1 增强,当前镜像未装;遇纯扫描件先如实告知用户"需要 OCR",不要编造内容。
+> 扫描件/图片型 PDF 直接调用容器内置 `oc-ocr` 自动识别，再用 `oc-ingest` 解析入库；详见 `skill_view("oc-ingest")`。按技能完成异步任务等待和结果读取，基于识别结果回答，不要编造内容。
 
 ## 5. 交付前验证:渲染后再交付
 
@@ -76,14 +76,14 @@ with pdfplumber.open("上传.pdf") as pdf:
 cat > qa-expect.json <<'JSON'
 {"kind":"pdf","requiredText":["文档标题","必须出现的关键文字"],"minPages":1}
 JSON
-oc-artifact-qa inspect --input out.pdf --out-dir out.pdf.qa --expect qa-expect.json
-oc-artifact-qa deliver --input out.pdf
+oc-artifact-qa inspect --input /home/agent/.openclaude/generated/out.pdf --out-dir out.pdf.qa --expect qa-expect.json
+oc-artifact-qa deliver --input /home/agent/.openclaude/generated/out.pdf
 ```
 
 查看 `out.pdf.qa/contact-sheets/` 或逐页 PNG,确认没有裁切、重叠、空白页、乱码和字体替换;
 发现问题就修源文件并重新生成到新的 QA 目录。`report.json` 的 `passed` 必须为 true,不能把
 “命令运行成功”或最终回复里的自述当验证。L0 `deliver` 的末行必须是 `PASS`，否则禁止打印路径。
-最终回复**只打印 FINAL 绝对路径、单独成行**；禁止 fenced code；禁止发明 URL。
+交付文件必须写入 `/home/agent/.openclaude/generated/<文件名>`，最终回复逐个列出各主要文件的完整 FINAL 绝对路径、每个路径单独成行；禁止 fenced code；禁止发明 URL。
 
 ## 工具调用纪律(重要)
 
