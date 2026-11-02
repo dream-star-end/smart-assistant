@@ -130,7 +130,7 @@ class ProfileTests(unittest.TestCase):
                 mod.stop(root)
                 self.assertEqual(json.loads(out.getvalue())['kind'], 'sent-term-to-verified-task-host')
                 send.assert_called_once()
-                close.assert_called_with(987)
+                close.assert_any_call(987)
             with self.assertRaisesRegex(RuntimeError, 'runtime-or-session-present'): mod.prove_stopped(root)
 
     def test_repeated_inspection_retains_a_real_live_old_descendant_and_blocks_relaunch(self):
@@ -177,6 +177,99 @@ class ProfileTests(unittest.TestCase):
                 child.terminate(); child.wait(timeout=3)
                 with redirect_stdout(io.StringIO()) as output: mod.prove_stopped(root)
                 self.assertEqual(json.loads(output.getvalue())['mcpSocketIdentity'], identity)
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                child.stdout.close()
+
+    def test_early_host_identity_stops_real_owned_python_even_without_host_pid_or_runtime(self):
+        for with_run in (False, True):
+            with self.subTest(with_run=with_run), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                info = self.installed(root)
+                if with_run: (root / 'run').mkdir()
+                child = Popen([sys.executable, '-c', 'import time; print("READY",flush=True); time.sleep(15)',
+                    'launch', str(root)], stdout=PIPE)
+                try:
+                    self.assertEqual(child.stdout.readline(), b'READY\n')
+                    args, ticks = mod.proc(child.pid)
+                    identity = {'pid': child.pid, 'startTicks': ticks}
+                    mod.write_lifecycle(root, info, {'host': identity, 'claude': None, 'descendants': [],
+                        'launchArgvHash': mod.sha(mod.canonical(args))})
+                    self.assertEqual(mod.host_identity(root, info), (child.pid, ticks))
+                    with redirect_stdout(io.StringIO()) as output: mod.stop(root)
+                    self.assertEqual(json.loads(output.getvalue())['kind'], 'sent-term-to-verified-task-host')
+                    child.wait(timeout=3)
+                    if with_run:
+                        with self.assertRaisesRegex(RuntimeError, 'runtime-or-session-present'): mod.prove_stopped(root)
+                        (root / 'run').rmdir()  # Fixture only, after waiting for actual child exit.
+                    with redirect_stdout(io.StringIO()): mod.prove_stopped(root)
+                finally:
+                    if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                    child.stdout.close()
+
+    def test_stop_before_any_launch_persists_a_terminal_marker_and_blocks_late_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.installed(root)
+            with redirect_stdout(io.StringIO()): mod.stop(root)
+            marker = (root / 'STOPPING.json').read_bytes()
+            with patch.object(mod.os, 'execve') as execute:
+                for entry in (mod.launch, mod.tool_socket):
+                    with self.assertRaisesRegex(RuntimeError, 'permanently-stopped'): entry(root)
+                execute.assert_not_called()
+            with redirect_stdout(io.StringIO()): mod.stop(root)
+            self.assertEqual((root / 'STOPPING.json').read_bytes(), marker)
+            with self.assertRaises(FileNotFoundError): mod.prove_stopped(root)
+
+    def test_control_lock_waits_for_real_pre_lifecycle_child_and_is_not_inheritable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.installed(root)
+            script = "import fcntl,os,sys; f=open(sys.argv[1],'w'); os.chmod(sys.argv[1],0o600); fcntl.flock(f,fcntl.LOCK_EX); print('LOCKED',flush=True); sys.stdin.readline()"
+            child = Popen([sys.executable, '-c', script, str(root / 'CONTROL.lock')], stdin=PIPE, stdout=PIPE)
+            try:
+                self.assertEqual(child.stdout.readline(), b'LOCKED\n')
+                # A separate process attempts the same real flock, releases only after our barrier.
+                waiter = Popen([sys.executable, '-c',
+                    "import fcntl,os,sys; f=os.open(sys.argv[1],os.O_RDWR|os.O_CLOEXEC); print('WAIT',flush=True); fcntl.flock(f,fcntl.LOCK_EX); print('ACQUIRED',flush=True)",
+                    str(root / 'CONTROL.lock')], stdout=PIPE)
+                self.assertEqual(waiter.stdout.readline(), b'WAIT\n')
+                self.assertIsNone(waiter.poll())
+                child.stdin.write(b'release\n'); child.stdin.flush(); child.wait(timeout=3)
+                self.assertEqual(waiter.stdout.readline(), b'ACQUIRED\n'); waiter.wait(timeout=3)
+                waiter.stdout.close()
+                with mod.control_lock(root):
+                    matches = [int(p.name) for p in Path('/proc/self/fd').iterdir()
+                        if p.exists() and p.resolve() == root / 'CONTROL.lock']
+                    self.assertEqual(len(matches), 1)
+                    self.assertFalse(os.get_inheritable(matches[0]))
+            finally:
+                if child.poll() is None: child.terminate(); child.wait(timeout=3)
+                child.stdin.close(); child.stdout.close()
+
+    def test_independent_socket_stop_rechecks_real_pid_identity_before_signalling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.installed(root)
+            profile = mod.check_profile(root)
+            path = root / 'cprofile/cc5-mcp-socket.py'
+            path.chmod(0o600)
+            path.write_text("import time; print('READY',flush=True); time.sleep(15)")
+            path.chmod(0o400)
+            child = Popen(['/usr/bin/python3', '-I', '-B', str(path), str(root)], stdout=PIPE)
+            try:
+                self.assertEqual(child.stdout.readline(), b'READY\n')
+                record = {'version': 1, 'root': str(root), 'runId': profile['runId'],
+                    'operationId': profile['operationId'], **mod.process_record(child.pid)}
+                target = root / 'MCP-SOCKET.json'
+                target.write_text(json.dumps({**record, 'startTicks': '1'})); target.chmod(0o600)
+                # This fixture deliberately runs ordinary Python in place of the pinned sidecar.
+                with patch.object(mod, 'check_profile', lambda _: profile), redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, 'wrong-stop-mcp-process'): mod.stop_socket(root)
+                    self.assertIsNone(child.poll())
+                    target.write_text(json.dumps(record))
+                    mod.stop_socket(root)
+                child.wait(timeout=3)
             finally:
                 if child.poll() is None: child.terminate(); child.wait(timeout=3)
                 child.stdout.close()

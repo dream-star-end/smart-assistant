@@ -7,7 +7,9 @@ is installed separately. No dependency install, credentials or non-TUI CLI use.
 """
 import ast
 import base64
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -357,11 +359,13 @@ def descendants_of(pid):
 def write_lifecycle(root, info, processes):
     path = root / 'LIFECYCLE.json'
     history = []
+    launch_hash = processes.get('launchArgvHash')
     if path.exists():
         previous = json.loads(read_private(path))
         require(previous['version'] == 1 and previous['root'] == str(root) and
                 previous['session'] == info['session'], 'wrong-previous-lifecycle-record')
         history = [previous['host'], previous['claude'], *previous['descendants']]
+        launch_hash = launch_hash or previous.get('launchArgvHash')
     observed = {}
     for item in [*history, *processes['descendants']]:
         if item is None:
@@ -369,7 +373,7 @@ def write_lifecycle(root, info, processes):
         require(type(item['pid']) is int and item['pid'] > 1 and str(item['startTicks']).isdecimal(),
                 'bad-previous-lifecycle-process')
         observed[(item['pid'], item['startTicks'])] = {'pid': item['pid'], 'startTicks': item['startTicks']}
-    processes = {**processes, 'descendants': list(observed.values())}
+    processes = {**processes, 'descendants': list(observed.values()), 'launchArgvHash': launch_hash}
     data = canonical({'version': 1, 'root': str(root), 'session': info['session'], **processes})
     stage = root / 'LIFECYCLE.partial'
     fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -428,14 +432,69 @@ def proc(pid):
 
 
 def host_identity(root, info):
-    pid = int((root / 'run/host.pid').read_text())
+    lifecycle = None
+    if (root / 'LIFECYCLE.json').exists():
+        lifecycle = json.loads(read_private(root / 'LIFECYCLE.json'))
+        require(lifecycle['version'] == 1 and lifecycle['root'] == str(root) and
+                lifecycle['session'] == info['session'], 'wrong-host-lifecycle')
+    if (root / 'run/host.pid').exists():
+        pid = int((root / 'run/host.pid').read_text())
+    else:
+        require(lifecycle is not None, 'missing-host-identity')
+        pid = lifecycle['host']['pid']
+    require(type(pid) is int and pid > 1, 'invalid-host-pid')
     args, start = proc(pid)
-    require(args[1:] == [str(root / 'install/host.py'), str(root / 'run'), info['session'],
-                         *profile_args(root, info)], 'wrong-host-process')
+    if lifecycle is not None:
+        require(lifecycle['host'] == {'pid': pid, 'startTicks': start}, 'host-start-identity-changed')
+    expected = [str(root / 'install/host.py'), str(root / 'run'), info['session'], *profile_args(root, info)]
+    native_host = args[1:] == expected
+    preexec = (lifecycle is not None and args[-2:] == ['launch', str(root)] and
+               lifecycle.get('launchArgvHash') == sha(canonical(args)))
+    require(native_host or preexec, 'wrong-host-process')
     return pid, start
 
 
+@contextmanager
+def control_lock(root):
+    owner(root)
+    fd = os.open(root / 'CONTROL.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_nlink == 1
+                and stat.S_IMODE(st.st_mode) == 0o600, 'unsafe-task-control-lock')
+        os.set_inheritable(fd, False)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # Also closed atomically on successful exec; never inherited by host/tmux.
+
+
+def mark_stopping(root):
+    profile = check_profile(root)
+    value = {'version': 1, 'root': str(root), 'operationId': profile['operationId'], 'runId': profile['runId']}
+    path = root / 'STOPPING.json'
+    if path.exists():
+        require(json.loads(read_private(path)) == value, 'wrong-task-stop-marker')
+        return
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(canonical(value))
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def launch(root):
+    with control_lock(root):
+        require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
+        launch_locked(root)
+
+
+def launch_locked(root):
     info = owner(root)
     if (root / 'LIFECYCLE.json').exists():
         prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
@@ -448,11 +507,27 @@ def launch(root):
            'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000'}
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
-    write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': []})
+    write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': [],
+                                'launchArgvHash': sha(canonical(proc(os.getpid())[0]))})
     os.chdir(info['cwd'])
     # fd0 is never read here: it belongs exclusively to the original host.
     os.execve(sys.executable, [sys.executable, str(root / 'install/host.py'), str(root / 'run'),
                               info['session'], *cli_args], env)
+
+
+def tool_socket(root):
+    with control_lock(root):
+        require(not (root / 'STOPPING.json').exists(), 'task-permanently-stopped')
+        tool_socket_locked(root)
+
+
+def tool_socket_locked(root):
+    info = owner(root)
+    check_sources(root, info)
+    profile_args(root, info)  # Includes all pinned profile contents/identity checks.
+    env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': str(root / 'tmp')}
+    script = str(root / 'cprofile/cc5-mcp-socket.py')
+    os.execve('/usr/bin/python3', ['/usr/bin/python3', '-I', '-B', script, str(root)], env)
 
 
 def workspace(root):
@@ -598,11 +673,53 @@ def snapshot(root):
 
 
 def stop(root):
+    with control_lock(root):
+        mark_stopping(root)
+        stop_locked(root)
+
+
+def stop_socket(root):
+    with control_lock(root):
+        mark_stopping(root)
+        path = root / 'MCP-SOCKET.json'
+        if not path.exists():
+            print(json.dumps({'kind': 'mcp-identity-not-published-not-exit-proof'}))
+            return
+        record = json.loads(read_private(path))
+        profile = check_profile(root)
+        require(record['version'] == 1 and record['root'] == str(root) and
+                record['runId'] == profile['runId'] and record['operationId'] == profile['operationId'],
+                'wrong-stop-mcp-identity')
+        pid, start = record['pid'], record['startTicks']
+        require(type(pid) is int and pid > 1 and isinstance(start, str) and start.isdecimal(),
+                'bad-stop-mcp-process')
+        try:
+            args, ticks = proc(pid)
+        except FileNotFoundError:
+            print(json.dumps({'kind': 'recorded-mcp-exited-needs-independent-proof'}))
+            return
+        require(ticks == start and args == ['/usr/bin/python3', '-I', '-B',
+                str(root / 'cprofile/cc5-mcp-socket.py'), str(root)], 'wrong-stop-mcp-process')
+        fd = os.pidfd_open(pid)
+        try:
+            require(proc(pid) == (args, start), 'mcp-process-identity-changed')
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+        finally:
+            os.close(fd)
+        print(json.dumps({'kind': 'sent-term-to-verified-mcp-socket', 'pid': pid, 'startTicks': start}))
+
+
+def stop_locked(root):
     info = owner(root)
-    if not (root / 'run').exists():
+    if not (root / 'run').exists() and not (root / 'LIFECYCLE.json').exists():
         print(json.dumps({'kind': 'already-stopped', 'runtimeAbsent': True}))
         return
-    pid, start = host_identity(root, info)
+    try:
+        pid, start = host_identity(root, info)
+    except FileNotFoundError:
+        require(not (root / 'run').exists(), 'dead-host-with-runtime-still-present')
+        print(json.dumps({'kind': 'recorded-host-exited-still-needs-independent-proof'}))
+        return
     claude_record = None
     descendants = []
     if (root / 'run/claude.pid').exists():
@@ -644,9 +761,9 @@ if __name__ == '__main__':
         elif role == 'package-profile':
             package_profile(sys.argv[2], sys.argv[3], sys.argv[4])
         else:
-            require(role in ('launch', 'workspace', 'inspect', 'snapshot', 'install-cli', 'install-profile', 'prove-stopped', 'stop', 'cleanup'), 'unknown-role')
+            require(role in ('launch', 'workspace', 'inspect', 'snapshot', 'install-cli', 'install-profile', 'tool-socket', 'stop-socket', 'prove-stopped', 'stop', 'cleanup'), 'unknown-role')
             root = task_root(sys.argv[2])
-            {'launch': launch, 'workspace': workspace, 'install-profile': install_profile, 'prove-stopped': prove_stopped,
+            {'launch': launch, 'workspace': workspace, 'install-profile': install_profile, 'tool-socket': tool_socket, 'stop-socket': stop_socket, 'prove-stopped': prove_stopped,
              'inspect': inspect, 'snapshot': snapshot, 'install-cli': install_cli, 'stop': stop, 'cleanup': cleanup}[role](root)
     except Exception as error:
         # No raw exception/argv/response could leak pane or credentials.
