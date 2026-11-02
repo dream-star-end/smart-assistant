@@ -194,6 +194,15 @@ export class Cc5Relay {
       requireRelay(!this.revoked)
       this.launchAttempted = true
       this.host = this.hostPort.start()
+      const stdin = this.host.stdin
+      const inputFailed = (): void => {
+        void this.stop().catch(() => {})
+      }
+      stdin.on('error', inputFailed)
+      stdin.once('close', () => {
+        inputFailed()
+        stdin.removeListener('error', inputFailed)
+      })
       this.host.stdout.on('data', (chunk: Buffer) => {
         if (this.revoked) return
         try {
@@ -405,7 +414,14 @@ export class Cc5Relay {
       await once(this.host.stdin, 'drain', { signal: this.abort.signal })
   }
   private deliver(): void {
-    if (!this.poll || !this.pending || this.pending.delivered) return
+    if (
+      this.revoked ||
+      !this.poll ||
+      !this.pending ||
+      this.pending.delivered ||
+      this.pending.response.destroyed
+    )
+      return
     const poll = this.poll
     this.poll = undefined
     clearTimeout(poll.timer)
@@ -439,6 +455,11 @@ export class Cc5Relay {
     )
     this.verify(this.admitted.authority, this.admitted.lease, true)
     this.toolBurned = true
+    // A lost MCP caller revokes this operation even before its original hook row arrives.
+    res.once('close', () => {
+      if (!res.writableFinished) void this.stop().catch(() => {})
+    })
+    requireRelay(!res.destroyed && !req.aborted)
     this.record('tool-attempt.json', { rpcId: body.rpcId, toolUseId: body.toolUseId })
     // RPC and original hook delivery are independent; either may arrive first.
     const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(10000)])
@@ -460,7 +481,7 @@ export class Cc5Relay {
       lease: this.admitted.lease,
     }
     await this.observation.waitFor(tool, this.abort.signal)
-    requireRelay(!this.revoked)
+    requireRelay(!this.revoked && !res.destroyed && !req.aborted)
     this.pending = {
       response: res,
       delivered: false,

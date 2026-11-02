@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { PassThrough } from 'node:stream'
+import { PassThrough, Writable } from 'node:stream'
 import { test } from 'node:test'
 import {
   MODEL_AUTHORITY_VERSION,
@@ -115,11 +115,22 @@ function fixture() {
   }
 }
 
-async function harness(f: ReturnType<typeof fixture>, failure: 'none' | 'start' | 'stop' = 'none') {
-  const input = new PassThrough()
-  const output = new PassThrough()
+async function harness(
+  f: ReturnType<typeof fixture>,
+  failure: 'none' | 'start' | 'stop' | 'stdin-error' = 'none',
+) {
   const written: Buffer[] = []
-  input.on('data', (b) => written.push(b))
+  const input =
+    failure === 'stdin-error'
+      ? new Writable({
+          write(chunk, _encoding, callback) {
+            written.push(Buffer.from(chunk))
+            queueMicrotask(() => callback(new Error('synthetic asynchronous EPIPE')))
+          },
+        })
+      : new PassThrough()
+  const output = new PassThrough()
+  if (failure !== 'stdin-error') input.on('data', (b) => written.push(b))
   let ready!: () => void
   const readyPromise = new Promise<void>((resolve) => {
     ready = resolve
@@ -461,6 +472,119 @@ test(
       assert.equal(h.counts().stops, 1)
       assert.equal(h.written.length, 0)
     } finally {
+      await h.close()
+      f.cleanup()
+    }
+  },
+)
+
+test(
+  'MCP disconnect while waiting for the original row revokes the attached real tool pump before effect',
+  { timeout: 15000 },
+  async () => {
+    const f = fixture()
+    const h = await harness(f)
+    const controller = new AbortController()
+    const stdin = new PassThrough()
+    const running = runCc5StdioBridge({
+      binding: f.binding,
+      sessionKey: f.request.sessionKey,
+      stdin,
+      stdout: new PassThrough(),
+      socketPath: h.socketPath,
+      signal: controller.signal,
+      tools: { keyring: f.keyring, executionRoot: f.root },
+    })
+    void running.catch(() => {})
+    let req: ReturnType<typeof request> | undefined
+    try {
+      const admission = h.admit()
+      h.ready()
+      await admission
+      stdin.write(
+        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'disconnect fixture' } })}\n`,
+      )
+      if (h.written.length === 0) await once(h.input, 'data')
+      req = request({ socketPath: h.toolSocket, path: '/roundtrip', method: 'POST' }, (res) =>
+        res.resume(),
+      )
+      req.on('error', () => {})
+      req.end(
+        JSON.stringify({
+          runId: h.runId,
+          operationId: f.binding.operationId,
+          rpcId: f.request.rpcId,
+          toolUseId: f.request.toolUseId,
+          name: f.request.name,
+          arguments: f.request.arguments,
+        }),
+      )
+      const deadline = Date.now() + 2000
+      while (!existsSync(join(f.root, 'relay-journal/tool-attempt.json')) && Date.now() < deadline)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      assert.ok(existsSync(join(f.root, 'relay-journal/tool-attempt.json')))
+      req.destroy()
+      await h.stopObserved
+      h.output.write(
+        `${JSON.stringify({
+          type: 'assistant',
+          session_id: f.request.nativeSessionId,
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                id: f.request.toolUseId,
+                name: f.request.name,
+                input: f.request.arguments,
+              },
+            ],
+          },
+        })}\n`,
+      )
+      await assert.rejects(running)
+      assert.equal(existsSync(join(f.root, f.binding.operationId)), false)
+      assert.equal(h.counts().stops, 1)
+    } finally {
+      req?.destroy()
+      controller.abort()
+      await running.catch(() => {})
+      await h.close()
+      f.cleanup()
+    }
+  },
+)
+
+test(
+  'an asynchronous host stdin EPIPE invokes independent stop instead of escaping as an unhandled error',
+  { timeout: 15000 },
+  async () => {
+    const f = fixture()
+    const h = await harness(f, 'stdin-error')
+    const controller = new AbortController()
+    const stdin = new PassThrough()
+    const running = runCc5StdioBridge({
+      binding: f.binding,
+      sessionKey: f.request.sessionKey,
+      stdin,
+      stdout: new PassThrough(),
+      socketPath: h.socketPath,
+      signal: controller.signal,
+    })
+    void running.catch(() => {})
+    try {
+      const admission = h.admit()
+      h.ready()
+      await admission
+      stdin.write(
+        `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'EPIPE fixture' } })}\n`,
+      )
+      await h.stopObserved
+      await assert.rejects(running)
+      assert.equal(h.written.length, 1)
+      assert.equal(h.counts().stops, 1)
+    } finally {
+      controller.abort()
+      await running.catch(() => {})
       await h.close()
       f.cleanup()
     }
