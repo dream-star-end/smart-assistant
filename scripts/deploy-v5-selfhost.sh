@@ -227,8 +227,33 @@ own_instance_present() {
   [[ -f "$V5_ENV" ]] || systemctl cat "$V5_UNIT" >/dev/null 2>&1
 }
 
+# The async wait lets signal traps run immediately. Drain prewarm before
+# recording the first failure or releasing this invocation's resources.
+USER_CONTRACT_PREWARM_PID=""
+user_contract_prewarm_cleanup() {
+  local pid="${USER_CONTRACT_PREWARM_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-prewarm-process.py" --stop "$pid" "$BASHPID"
+  wait "$pid" 2>/dev/null || :
+  USER_CONTRACT_PREWARM_PID=""
+}
+
+user_contract_prewarm() {
+  local rc=0 parent_pid="$BASHPID"
+  python3 "$SCRIPT_DIR/lib/v5-selfhost-prewarm-process.py" "$parent_pid" \
+    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" &
+  USER_CONTRACT_PREWARM_PID=$!
+  wait "$USER_CONTRACT_PREWARM_PID" || rc=$?
+  USER_CONTRACT_PREWARM_PID=""
+  return "$rc"
+}
+
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  trap '' HUP INT TERM
+  if declare -F user_contract_prewarm_cleanup >/dev/null 2>&1; then
+    user_contract_prewarm_cleanup
+  fi
   if [[ "${MODE:-}" == prewarm-artifacts ]]; then
     prewarm_cleanup_invocation "$exit_rc" || :
     return "$exit_rc"
@@ -264,6 +289,9 @@ cleanup_selfhost_deploy() {
   fi
 }
 trap cleanup_selfhost_deploy EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 selfhost_lock_holder_info() {
   local lock="$1" holder_path holder pids
@@ -1896,12 +1924,12 @@ user_contract_gate() { # <candidate release>
   tsum_mark F.prewarm 2>/dev/null || :
   # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
   # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
-  # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
+  # wait for relay_ready). OCV5-709: a killed Node/browser or incomplete prewarm
+  # must fail the gate before any paid contract turn is sent.
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" \
-    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
-    || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
+    user_contract_prewarm || return $?
   tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \

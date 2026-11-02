@@ -74,7 +74,11 @@ function shellFunction(name: string) {
   const start = source.indexOf(`${name}() {`);
   assert.ok(start >= 0);
   const end = source.indexOf("\n}\n", start);
-  return source.slice(start, end + 3);
+  const body = source.slice(start, end + 3);
+  // Process lifecycle is exercised separately with real child processes.
+  return name === "user_contract_gate"
+    ? body.replace("user_contract_prewarm || return $?", 'node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" || return $?')
+    : body;
 }
 test("deploy gate missing credential fails closed without executing node", () => {
   const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", "/nonexistent-r2-canary-password");
@@ -89,7 +93,7 @@ test("new gate is within forward smoke before smoked and absent from rollback", 
   assert.match(fn, /V5_CONTRACT_COST=live/);
   assert.match(fn, /node "\$SCRIPT_DIR\/v5-user-contract-smoke.mjs"/);
 });
-test("OCV5-429: canary prewarm runs before the smoke and never decides the verdict", () => {
+test("OCV5-709: prewarm runs before the smoke and every failure stops the gate", () => {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-429-"));
   const pw = join(dir, "pw");
   writeFileSync(pw, "x");
@@ -97,10 +101,14 @@ test("OCV5-429: canary prewarm runs before the smoke and never decides the verdi
   const run = (prewarmRc: number, smokeRc: number, goCacheRc = 0) => execFileSync("bash", ["-c",
     `${fn}\nSCRIPT_DIR=/s; V5_PORT=1; node(){ echo "RUN $1 $V5_CONTRACT_COST"; case "$1" in *prewarm*) return ${prewarmRc};; *go-cache*) return ${goCacheRc};; *) return ${smokeRc};; esac; }; user_contract_gate; echo rc=$?`,
   ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  const ok = run(1, 0);
+  const ok = run(0, 0);
   assert.match(ok, /RUN \/s\/v5-user-contract-prewarm\.mjs \nRUN \/s\/v5-user-contract-smoke\.mjs live\nRUN \/s\/v5-go-cache-contract\.mjs \nRUN \/s\/v5-stop-before-start-contract\.mjs \nrc=0/);
   assert.match(run(0, 1), /rc=1/);
-  assert.match(run(1, 1), /rc=1/);
+  for (const rc of [1, 137, 143]) {
+    const failed = run(rc, 0);
+    assert.match(failed, new RegExp(`rc=${rc}`));
+    assert.doesNotMatch(failed, /RUN .*smoke|RUN .*go-cache|RUN .*stop-before-start/);
+  }
 });
 test("OCV5-432: the go-cache check runs after a passing C1–C3 and decides the verdict", () => {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-432-"));
