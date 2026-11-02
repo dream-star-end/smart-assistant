@@ -7,7 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
-from subprocess import CompletedProcess, Popen
+from subprocess import CompletedProcess, PIPE, Popen
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -91,7 +91,8 @@ class ProfileTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): mod.profile_args(root, info)
 
     def test_proc_preserves_security_significant_empty_arguments_in_a_real_python_child(self):
-        child = Popen([sys.executable, '-c', 'import time; time.sleep(15)', '--tools', '', '--setting-sources', ''])
+        child = Popen([sys.executable, '-c', 'import time; print("READY", flush=True); time.sleep(15)', '--tools', '', '--setting-sources', ''], stdout=PIPE)
+        self.assertEqual(child.stdout.readline(), b'READY\n')
         try:
             args, start = mod.proc(child.pid)
             self.assertEqual(args[-4:], ['--tools', '', '--setting-sources', ''])
@@ -99,6 +100,7 @@ class ProfileTests(unittest.TestCase):
         finally:
             child.terminate()
             child.wait(timeout=3)
+            child.stdout.close()
 
     def test_host_identity_rejects_missing_extra_or_changed_flags(self):
         with tempfile.TemporaryDirectory() as temp:

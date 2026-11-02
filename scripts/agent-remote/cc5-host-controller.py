@@ -417,6 +417,8 @@ def host_identity(root, info):
 
 def launch(root):
     info = owner(root)
+    if (root / 'LIFECYCLE.json').exists():
+        prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
     files = check_sources(root, info)
     require(not (root / 'run').exists(), 'runtime-already-exists')
     env = {'HOME': '/home/box', 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
@@ -426,8 +428,6 @@ def launch(root):
            'OC_BOX_MOD_SHA256': info['pluginDigest'], 'OC_BOX_READY_MS': '20000'}
     claude_executable(root, info, full_hash=True)
     cli_args = profile_args(root, info)
-    if (root / 'LIFECYCLE.json').exists():
-        prove_stopped(root, emit=False)  # A new launch cannot erase an unproved old writer.
     write_lifecycle(root, info, {'host': process_record(os.getpid()), 'claude': None, 'descendants': []})
     os.chdir(info['cwd'])
     # fd0 is never read here: it belongs exclusively to the original host.
