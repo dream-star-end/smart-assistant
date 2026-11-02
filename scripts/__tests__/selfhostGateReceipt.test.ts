@@ -375,7 +375,7 @@ test('producer, train and policy agree; host gates remain local and parity cover
     assert.ok(jobFunction(queued[2]!).includes(gate.script))
   }
   for (const host of ['box-success-recovery', 'box-continuation', 'box-incident-proofs', 'ccb-mcp-availability',
-    'cursor-sand-inference', 'host-log-policy', 'architecture', 'web-react-production-build',
+    'cursor-sand-inference', 'host-log-policy', 'model-policy-recovery', 'architecture', 'web-react-production-build',
     'oc-memory-mcp-build', 'fix-trailers']) assert.ok(!data.gates.includes(host), host)
   const calls = runsIn(functionCommands(master, 'build_master_release'))
   for (const gate of manifest.gates.filter((g: { stage?: string }) => !g.stage)) {

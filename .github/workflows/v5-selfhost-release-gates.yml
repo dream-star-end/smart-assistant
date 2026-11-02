@@ -71,6 +71,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends python3 logrotate gzip ripgrep
       - name: Host log policy filesystem and real rotation gate
         run: bash scripts/v5-selfhost-host-log-policy.test.sh
+      - name: Versioned model policy and legacy recovery contract gate
+        run: bash scripts/v5-selfhost-model-policy.test.sh
       - name: Setup Bun
         id: bun
         uses: oven-sh/setup-bun@v2

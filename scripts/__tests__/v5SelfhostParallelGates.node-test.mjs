@@ -496,7 +496,7 @@ run_gates
 `;
 }
 
-test('production wiring: all 18 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
+test('production wiring: all 19 C gates + D run pinned; C/D overlap; Box waits for every job and runtime', (t) => {
   const f = fixture(t);
   const r = run(f, wireFixture(f));
   assert.equal(r.status, 0, r.stderr);
@@ -504,7 +504,7 @@ test('production wiring: all 18 C gates + D run pinned; C/D overlap; Box waits f
   const starts = lines.filter((l) => l.startsWith('start '));
   const ids = starts.map((l) => l.split(' ')[1]);
   const expected = ['session-rootfix', 'watch-gate', 'cursor-sand', 'delegate-billing', 'callback-ws',
-    'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'architecture',
+    'cron-submit', 'prompt-privacy', 'session-boundary', 'system-approval', 'system-executor', 'host-log-policy', 'model-policy', 'architecture',
     'box-success-recovery', 'box-continuation', 'box-incident-proofs', 'box-longtask', 'upload-retention', 'ccb-mcp'].map((id) => `C.${id}`);
   assert.deepEqual([...ids].sort(), [...expected, 'D'].sort());
   const queued = [...r.stderr.matchAll(/\[([^\]]+)\] 后台启动/g)].map((match) => match[1]);
@@ -577,9 +577,9 @@ for (const receipt of ['hit', 'wrong-sha']) {
       // Worker-local notes would be lost; final summary proves parent ownership.
       assert.equal(notes(f)[`gateEvidence.${gate}`], receipt === 'hit' ? 'merge-queue-receipt' : 'local');
     }
-    const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.architecture'];
+    const local = ['D', 'C.cursor-sand', 'C.session-boundary', 'C.host-log-policy', 'C.model-policy', 'C.architecture'];
     for (const phase of local) assert.ok(ids.includes(phase), phase);
-    assert.equal(ids.length, receipt === 'hit' ? 11 : 19);
+    assert.equal(ids.length, receipt === 'hit' ? 12 : 20);
     assert.equal(notes(f)['gateEvidence.box-longtask'], 'local');
     const awaited = lines.indexOf('runtime-awaited');
     for (const phase of local) assert.ok(lines.indexOf(`end ${phase}`) < awaited, phase);

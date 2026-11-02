@@ -28,6 +28,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { isModelAvailable } from "./modelAvailability.js";
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
@@ -413,7 +414,7 @@ export class ModelCatalogSnapshot {
     const byId = new Map<number, ModelCatalogEntry>();
     for (const e of args.entries) {
       byId.set(e.entryId, e);
-      if (e.state === "active") active.set(e.modelId, e);
+      if (e.state === "active" && isModelAvailable(e.modelId)) active.set(e.modelId, e);
     }
     this.activeByModel = active;
     this.byEntryId = byId;
@@ -446,7 +447,7 @@ export class ModelCatalogSnapshot {
     const aliases = [...this.aliases.entries()]
       .map(([alias, entryId]) => ({ alias, entry: this.byEntryId.get(entryId) }))
       .filter((a): a is { alias: string; entry: ModelCatalogEntry } =>
-        a.entry !== undefined && a.entry.state === "active",
+        a.entry !== undefined && this.activeByModel.get(a.entry.modelId) === a.entry,
       )
       .map((a) => ({ alias: a.alias, canonicalModel: a.entry.modelId }))
       .sort((a, b) => (a.alias < b.alias ? -1 : a.alias > b.alias ? 1 : 0));

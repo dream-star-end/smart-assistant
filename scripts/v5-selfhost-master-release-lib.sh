@@ -29,6 +29,7 @@ SURVIVOR_STATE="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.s
 SURVIVOR_COMMITTED="${SURVIVOR_COMMITTED:-/run/openclaude-v5-selfhost/cutover-survivor.committed}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-host-log-policy.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-model-policy.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-cutover-units.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-gate-receipts.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-selfhost-build-jobs.sh"
@@ -588,6 +589,7 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     return 1
   }
   host_log_policy_require_bundle "$root" || return $?
+  model_policy_require_bundle "$root" || return $?
   chown 0:0 -- "$root" || return 1
   chmod go-w -- "$root" || return 1
   read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$root")
@@ -619,7 +621,7 @@ write_strong_release_marker_local() { # <release-root> <full-sha> <short-sha> <b
     --arg artifactSha256 "$artifact_sha" \
     '{schemaVersion:$schemaVersion,sourceCommit:$sourceCommit,builtAt:$builtAt,
       metadataSha256:$metadataSha256,artifactSha256:$artifactSha256,
-      flavorGuardGeneration:1,hostLogPolicyGeneration:1}' >"$marker_tmp"; then
+      flavorGuardGeneration:1,hostLogPolicyGeneration:1,modelAvailabilityPolicyGeneration:1}' >"$marker_tmp"; then
     rm -f -- "$marker_tmp"
     return 1
   fi
@@ -1118,6 +1120,13 @@ build_master_release() {
       return 1
     fi
   }
+  master_job_model_policy() {
+    mlog "  model policy artifact/recovery gate @ pinned staging"
+    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-model-policy.test.sh ); then
+      mlog "pinned model policy artifact/recovery gate failed"
+      return 1
+    fi
+  }
   # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
   # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
   # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
@@ -1223,6 +1232,7 @@ build_master_release() {
     C.system-approval:master_job_system_approval:system-approval-fencing \
     C.system-executor:master_job_system_executor:system-executor-fencing \
     C.host-log-policy:master_job_host_log_policy \
+    C.model-policy:master_job_model_policy \
     C.architecture:master_job_architecture \
   ; do
     IFS=: read -r job_id job_fn gate_id <<<"$job"
@@ -1486,6 +1496,7 @@ assert_master_release_static_gate() { # <rel> [expected-full-sha]
   got="$(release_artifact_digest "$rel")"
   [[ "$got" == "$art" ]] || die "静态门: artifactSha256 复算不匹配 expected=$art got=$got"
   host_log_policy_generation "$rel" >/dev/null || die "静态门: host log policy generation/bundle 不合法"
+  model_policy_generation "$rel" >/dev/null || die "静态门: model policy generation/bundle 不合法"
   mlog "  ✓ 静态门通过 $rel sourceCommit=${commit:0:9} digest=${art:0:12}…"
 }
 
