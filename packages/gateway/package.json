@@ -9,6 +9,11 @@
       "types": "./src/index.ts",
       "openclaude-precompiled": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./cc5-container-runtime": {
+      "types": "./src/cc5ContainerRuntime.ts",
+      "openclaude-precompiled": "./dist/cc5ContainerRuntime.js",
+      "default": "./src/cc5ContainerRuntime.ts"
     }
   },
   "dependencies": {
